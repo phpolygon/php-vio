@@ -44,4 +44,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run build.yml --ref "v${{ steps.semantic.outputs.new_release_version }}"
+          gh workflow run build.yml --ref "${{ steps.semantic.outputs.new_release_version }}"
