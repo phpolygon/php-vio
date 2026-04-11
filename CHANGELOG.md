@@ -1,3 +1,10 @@
+## [1.0.6](https://github.com/phpolygon/php-vio/compare/1.0.5...1.0.6) (2026-04-11)
+
+
+### Bug Fixes
+
+* use MSVC-compatible visibility macros in stb implementation files ([0492ed4](https://github.com/phpolygon/php-vio/commit/0492ed47d80bf1ae82d7245d58a9427d6276f80d))
+
 ## [1.0.5](https://github.com/phpolygon/php-vio/compare/1.0.4...1.0.5) (2026-04-11)
 
 
