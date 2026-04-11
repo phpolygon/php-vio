@@ -1,3 +1,10 @@
+## [1.0.1](https://github.com/phpolygon/php-vio/compare/1.0.0...1.0.1) (2026-04-11)
+
+
+### Bug Fixes
+
+* conditional Metal/VMA compilation, Vulkan includes, Windows deps dir ([5c7c847](https://github.com/phpolygon/php-vio/commit/5c7c8477a8afea25c2fd4aea915f62402e9951b4))
+
 # 1.0.0 (2026-04-11)
 
 
