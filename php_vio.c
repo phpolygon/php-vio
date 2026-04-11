@@ -29,7 +29,12 @@
 #include "include/vio_plugin.h"
 #include "vendor/stb/stb_image.h"
 #include "vendor/stb/stb_image_write.h"
+#ifndef PHP_WIN32
 #include <pthread.h>
+#else
+#include <windows.h>
+#include <process.h>
+#endif
 
 #include <string.h>
 #include <stdlib.h>
@@ -3980,7 +3985,11 @@ typedef struct _vio_async_texture_load {
     int            failed;
 } vio_async_texture_load;
 
+#ifdef PHP_WIN32
+static unsigned __stdcall vio_texture_load_thread(void *arg)
+#else
 static void *vio_texture_load_thread(void *arg)
+#endif
 {
     vio_async_texture_load *load = (vio_async_texture_load *)arg;
     load->data = stbi_load(load->path, &load->width, &load->height, &load->channels, 4);
@@ -3988,7 +3997,11 @@ static void *vio_texture_load_thread(void *arg)
         load->failed = 1;
     }
     load->done = 1;
+#ifdef PHP_WIN32
+    return 0;
+#else
     return NULL;
+#endif
 }
 
 ZEND_FUNCTION(vio_texture_load_async)
@@ -4003,6 +4016,16 @@ ZEND_FUNCTION(vio_texture_load_async)
     vio_async_texture_load *load = ecalloc(1, sizeof(vio_async_texture_load));
     load->path = estrndup(path, path_len);
 
+#ifdef PHP_WIN32
+    HANDLE thread = (HANDLE)_beginthreadex(NULL, 0, vio_texture_load_thread, load, 0, NULL);
+    if (!thread) {
+        efree(load->path);
+        efree(load);
+        php_error_docref(NULL, E_WARNING, "Failed to create loading thread");
+        RETURN_FALSE;
+    }
+    CloseHandle(thread);
+#else
     pthread_t thread;
     if (pthread_create(&thread, NULL, vio_texture_load_thread, load) != 0) {
         efree(load->path);
@@ -4011,6 +4034,7 @@ ZEND_FUNCTION(vio_texture_load_async)
         RETURN_FALSE;
     }
     pthread_detach(thread);
+#endif
 
     /* Return as opaque resource */
     zend_resource *res = zend_register_resource(load, le_vio_async_load);
