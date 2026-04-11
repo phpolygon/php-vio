@@ -19,11 +19,17 @@ A PHP extension that brings GPU rendering, audio, video recording, streaming, an
 ## Requirements
 
 - PHP >= 8.4
-- [GLFW](https://www.glfw.org/) 3.4
-- [glslang](https://github.com/KhronosGroup/glslang)
-- [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)
-- [FFmpeg](https://ffmpeg.org/) (optional, for recording/streaming)
-- Vulkan SDK (optional, for Vulkan backend)
+
+All native libraries are optional — the extension compiles and runs without them, features are simply unavailable at runtime:
+
+| Library | Feature | Build Flag |
+|---------|---------|------------|
+| [GLFW](https://www.glfw.org/) 3.4 | Windowing, input, gamepad | `--with-glfw` |
+| [glslang](https://github.com/KhronosGroup/glslang) | GLSL to SPIR-V compilation | `--with-glslang` |
+| [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | Shader reflection & transpilation | `--with-spirv-cross` |
+| [Vulkan SDK](https://vulkan.lunarg.com/) | Vulkan backend | `--with-vulkan` |
+| [FFmpeg](https://ffmpeg.org/) | Video recording & streaming | `--with-ffmpeg` |
+| Metal (macOS framework) | Metal backend | `--with-metal` |
 
 ## Installation
 
