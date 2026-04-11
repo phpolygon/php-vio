@@ -1,3 +1,10 @@
+## [1.0.5](https://github.com/phpolygon/php-vio/compare/1.0.4...1.0.5) (2026-04-11)
+
+
+### Bug Fixes
+
+* correct include path for vio_plugin.h on Windows ([b86a787](https://github.com/phpolygon/php-vio/commit/b86a787c80cdd497cfb25793181f45754ee735eb))
+
 ## [1.0.4](https://github.com/phpolygon/php-vio/compare/1.0.3...1.0.4) (2026-04-11)
 
 
