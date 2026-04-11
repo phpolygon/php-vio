@@ -25,6 +25,7 @@ install-sh
 libtool
 ltmain.sh
 Makefile
+Makefile.fragments
 Makefile.global
 Makefile.objects
 missing

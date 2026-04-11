@@ -21,11 +21,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            php${PHP_VERSION}-dev \
             libglfw3-dev \
             glslang-dev \
             libvulkan-dev \
@@ -67,11 +71,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            php${PHP_VERSION}-dev \
             libglfw3-dev \
             glslang-dev \
             libvulkan-dev \
@@ -104,7 +112,7 @@ jobs:
 
   # ── macOS x86_64 ──────────────────────────────────────────────────
   macos-x86_64:
-    runs-on: macos-13
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -143,7 +151,7 @@ jobs:
 
   # ── macOS arm64 ───────────────────────────────────────────────────
   macos-arm64:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -190,6 +198,11 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
 
       - name: Setup PHP SDK
         id: php-sdk
