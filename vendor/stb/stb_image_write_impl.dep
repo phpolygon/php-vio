@@ -1,0 +1,3 @@
+vendor/stb/stb_image_write_impl.lo: \
+  /Users/hendrikmennen/Projekte/php-vio/vendor/stb/stb_image_write_impl.c \
+  /Users/hendrikmennen/Projekte/php-vio/vendor/stb/stb_image_write.h

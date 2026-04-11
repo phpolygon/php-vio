@@ -1,0 +1,6 @@
+src/vio_shader_reflect.lo: \
+  /Users/hendrikmennen/Projekte/php-vio/src/vio_shader_reflect.c \
+  config.h \
+  /Users/hendrikmennen/Projekte/php-vio/src/vio_shader_reflect.h \
+  /usr/local/include/spirv_cross/spirv_cross_c.h \
+  /usr/local/include/spirv_cross/spirv.h

@@ -1,0 +1,10 @@
+src/vio_shader_compiler.lo: \
+  /Users/hendrikmennen/Projekte/php-vio/src/vio_shader_compiler.c \
+  config.h \
+  /Users/hendrikmennen/Projekte/php-vio/src/vio_shader_compiler.h \
+  /usr/local/include/glslang/Include/glslang_c_interface.h \
+  /usr/local/include/glslang/Include/glslang_c_shader_types.h \
+  /usr/local/include/glslang/Include/visibility.h \
+  /usr/local/include/glslang/Public/resource_limits_c.h \
+  /usr/local/include/glslang/Public/../Include/glslang_c_interface.h \
+  /usr/local/include/glslang/Public/../Include/visibility.h

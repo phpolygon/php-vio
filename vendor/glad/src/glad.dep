@@ -1,0 +1,4 @@
+vendor/glad/src/glad.lo: \
+  /Users/hendrikmennen/Projekte/php-vio/vendor/glad/src/glad.c \
+  /Users/hendrikmennen/Projekte/php-vio/vendor/glad/include/glad/glad.h \
+  /Users/hendrikmennen/Projekte/php-vio/vendor/glad/include/KHR/khrplatform.h

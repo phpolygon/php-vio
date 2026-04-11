@@ -1,0 +1,5 @@
+src/vio_backend_null.lo: \
+  /Users/hendrikmennen/Projekte/php-vio/src/vio_backend_null.c config.h \
+  /Users/hendrikmennen/Projekte/php-vio/src/vio_backend_null.h \
+  /Users/hendrikmennen/Projekte/php-vio/src/../include/vio_backend.h \
+  /Users/hendrikmennen/Projekte/php-vio/src/../include/vio_types.h

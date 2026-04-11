@@ -1,0 +1,17 @@
+ARG_ENABLE("vio", "vio support", "no");
+
+if (PHP_VIO != "no") {
+    EXTENSION("vio",
+        "php_vio.c src\\vio_context.c src\\vio_backend_registry.c src\\vio_resource.c",
+        PHP_VIO_SHARED,
+        "/I" + configure_module_dirname + "\\include"
+    );
+
+    PHP_INSTALL_HEADERS("ext/vio",
+        "php_vio.h " +
+        "include/vio_backend.h " +
+        "include/vio_types.h " +
+        "include/vio_constants.h " +
+        "include/vio_plugin.h"
+    );
+}

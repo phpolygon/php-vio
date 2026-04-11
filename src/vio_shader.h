@@ -1,0 +1,36 @@
+/*
+ * php-vio - Shader management
+ */
+
+#ifndef VIO_SHADER_H
+#define VIO_SHADER_H
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "php.h"
+#include "../include/vio_types.h"
+
+typedef struct _vio_shader_object {
+    unsigned int      program;       /* GL program ID (0 if not OpenGL) */
+    vio_shader_format format;
+    uint32_t         *vert_spirv;    /* SPIR-V binary for vertex shader */
+    size_t            vert_spirv_size;
+    uint32_t         *frag_spirv;    /* SPIR-V binary for fragment shader */
+    size_t            frag_spirv_size;
+    int               valid;
+    zend_object       std;
+} vio_shader_object;
+
+extern zend_class_entry *vio_shader_ce;
+
+void vio_shader_register(void);
+
+static inline vio_shader_object *vio_shader_from_obj(zend_object *obj) {
+    return (vio_shader_object *)((char *)obj - XtOffsetOf(vio_shader_object, std));
+}
+
+#define Z_VIO_SHADER_P(zv) vio_shader_from_obj(Z_OBJ_P(zv))
+
+#endif /* VIO_SHADER_H */

@@ -1,0 +1,61 @@
+{
+    "name": "phpolygon/php-vio",
+    "type": "php-ext",
+    "description": "PHP extension for GPU rendering (OpenGL, Vulkan, Metal), audio, video recording, streaming, and input",
+    "license": "MIT",
+    "version": "0.1.0",
+    "keywords": [
+        "gpu",
+        "opengl",
+        "vulkan",
+        "metal",
+        "rendering",
+        "gamedev",
+        "audio",
+        "video",
+        "extension"
+    ],
+    "homepage": "https://github.com/phpolygon/php-vio",
+    "authors": [
+        {
+            "name": "Hendrik Mennen",
+            "role": "lead"
+        }
+    ],
+    "require": {
+        "php": ">=8.4"
+    },
+    "php-ext": {
+        "extension-name": "vio",
+        "configure-options": [
+            {
+                "name": "enable-vio",
+                "description": "Enable the VIO extension"
+            },
+            {
+                "name": "with-glfw",
+                "description": "Enable GLFW windowing support"
+            },
+            {
+                "name": "with-glslang",
+                "description": "Enable GLSL to SPIR-V compilation"
+            },
+            {
+                "name": "with-spirv-cross",
+                "description": "Enable SPIR-V reflection and transpilation"
+            },
+            {
+                "name": "with-vulkan",
+                "description": "Enable Vulkan backend"
+            },
+            {
+                "name": "with-ffmpeg",
+                "description": "Enable video recording and streaming"
+            },
+            {
+                "name": "with-metal",
+                "description": "Enable Metal backend (macOS only)"
+            }
+        ]
+    }
+}
