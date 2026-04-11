@@ -55,14 +55,16 @@ jobs:
 
       - name: Package binary
         run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
           strip modules/vio.so
-          tar czf vio-linux-x86_64-php${{ matrix.php }}.tar.gz \
-            -C modules vio.so
+          # PIE format: php_vio-{version}_php{phpver}-{arch}-{os}-{libc}.zip
+          cd modules
+          zip "../php_vio-${VERSION}_php${{ matrix.php }}-x86_64-linux-glibc.zip" vio.so
 
       - uses: actions/upload-artifact@v4
         with:
           name: vio-linux-x86_64-php${{ matrix.php }}
-          path: vio-linux-x86_64-php${{ matrix.php }}.tar.gz
+          path: php_vio-*_php${{ matrix.php }}-x86_64-linux-glibc.zip
 
   # ── Linux aarch64 ─────────────────────────────────────────────────
   linux-aarch64:
@@ -103,14 +105,15 @@ jobs:
 
       - name: Package binary
         run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
           strip modules/vio.so
-          tar czf vio-linux-aarch64-php${{ matrix.php }}.tar.gz \
-            -C modules vio.so
+          cd modules
+          zip "../php_vio-${VERSION}_php${{ matrix.php }}-arm64-linux-glibc.zip" vio.so
 
       - uses: actions/upload-artifact@v4
         with:
           name: vio-linux-aarch64-php${{ matrix.php }}
-          path: vio-linux-aarch64-php${{ matrix.php }}.tar.gz
+          path: php_vio-*_php${{ matrix.php }}-arm64-linux-glibc.zip
 
   # ── macOS x86_64 ──────────────────────────────────────────────────
   macos-x86_64:
@@ -145,14 +148,15 @@ jobs:
 
       - name: Package binary
         run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
           strip -x modules/vio.so
-          tar czf vio-macos-x86_64-php${{ matrix.php }}.tar.gz \
-            -C modules vio.so
+          cd modules
+          zip "../php_vio-${VERSION}_php${{ matrix.php }}-x86_64-darwin-bsdlibc.zip" vio.so
 
       - uses: actions/upload-artifact@v4
         with:
           name: vio-macos-x86_64-php${{ matrix.php }}
-          path: vio-macos-x86_64-php${{ matrix.php }}.tar.gz
+          path: php_vio-*_php${{ matrix.php }}-x86_64-darwin-bsdlibc.zip
 
   # ── macOS arm64 ───────────────────────────────────────────────────
   macos-arm64:
@@ -192,14 +196,15 @@ jobs:
 
       - name: Package binary
         run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
           strip -x modules/vio.so
-          tar czf vio-macos-arm64-php${{ matrix.php }}.tar.gz \
-            -C modules vio.so
+          cd modules
+          zip "../php_vio-${VERSION}_php${{ matrix.php }}-arm64-darwin-bsdlibc.zip" vio.so
 
       - uses: actions/upload-artifact@v4
         with:
           name: vio-macos-arm64-php${{ matrix.php }}
-          path: vio-macos-arm64-php${{ matrix.php }}.tar.gz
+          path: php_vio-*_php${{ matrix.php }}-arm64-darwin-bsdlibc.zip
 
   # ── Windows x64 ──────────────────────────────────────────────────
   windows-x64:
@@ -207,6 +212,7 @@ jobs:
     strategy:
       matrix:
         php: ['8.4', '8.5']
+        ts: ['nts', 'ts']
     steps:
       - uses: actions/checkout@v4
 
@@ -221,7 +227,7 @@ jobs:
         with:
           version: ${{ matrix.php }}
           arch: x64
-          ts: nts
+          ts: ${{ matrix.ts }}
 
       - name: Download dependencies
         shell: cmd
@@ -245,14 +251,17 @@ jobs:
       - name: Package binary
         shell: pwsh
         run: |
+          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "dev" }
           $dllPath = Get-ChildItem -Recurse -Filter "php_vio.dll" | Select-Object -First 1
           if (-not $dllPath) { $dllPath = Get-ChildItem -Recurse -Filter "vio.dll" | Select-Object -First 1 }
-          Compress-Archive -Path $dllPath.FullName -DestinationPath "vio-windows-x64-php${{ matrix.php }}.zip"
+          # PIE format: php_vio-{version}-{phpver}-{ts|nts}-{compiler}-{arch}.zip
+          $zipName = "php_vio-${version}-${{ matrix.php }}-${{ matrix.ts }}-vs17-x86_64.zip"
+          Compress-Archive -Path $dllPath.FullName -DestinationPath $zipName
 
       - uses: actions/upload-artifact@v4
         with:
-          name: vio-windows-x64-php${{ matrix.php }}
-          path: vio-windows-x64-php${{ matrix.php }}.zip
+          name: vio-windows-x64-php${{ matrix.php }}-${{ matrix.ts }}
+          path: php_vio-*-${{ matrix.php }}-${{ matrix.ts }}-vs17-x86_64.zip
 
   # ── Release ───────────────────────────────────────────────────────
   release:
