@@ -1,3 +1,0 @@
-vendor/miniaudio/miniaudio_impl.lo: \
-  /Users/hendrikmennen/Projekte/php-vio/vendor/miniaudio/miniaudio_impl.c \
-  /Users/hendrikmennen/Projekte/php-vio/vendor/miniaudio/miniaudio.h

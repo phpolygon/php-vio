@@ -28,6 +28,7 @@ Makefile
 Makefile.fragments
 Makefile.global
 Makefile.objects
+*.dep
 missing
 mkinstalldirs
 run-tests.php

@@ -1,3 +1,0 @@
-vendor/stb/stb_truetype_impl.lo: \
-  /Users/hendrikmennen/Projekte/php-vio/vendor/stb/stb_truetype_impl.c \
-  /Users/hendrikmennen/Projekte/php-vio/vendor/stb/stb_truetype.h

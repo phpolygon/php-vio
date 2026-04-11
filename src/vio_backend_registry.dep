@@ -1,5 +1,0 @@
-src/vio_backend_registry.lo: \
-  /Users/hendrikmennen/Projekte/php-vio/src/vio_backend_registry.c \
-  /Users/hendrikmennen/Projekte/php-vio/src/vio_backend_registry.h \
-  /Users/hendrikmennen/Projekte/php-vio/src/../include/vio_backend.h \
-  /Users/hendrikmennen/Projekte/php-vio/src/../include/vio_types.h

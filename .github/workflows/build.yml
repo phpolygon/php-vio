@@ -206,7 +206,7 @@ jobs:
 
       - name: Setup PHP SDK
         id: php-sdk
-        uses: php/setup-php-sdk@v0.10
+        uses: php/setup-php-sdk@v0.12
         with:
           version: ${{ env.PHP_VERSION }}
           arch: x64

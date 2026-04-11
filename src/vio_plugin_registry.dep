@@ -1,3 +1,0 @@
-src/vio_plugin_registry.lo: \
-  /Users/hendrikmennen/Projekte/php-vio/src/vio_plugin_registry.c \
-  include/vio_plugin.h
