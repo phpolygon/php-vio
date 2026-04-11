@@ -1,3 +1,10 @@
+## [1.1.3](https://github.com/phpolygon/php-vio/compare/1.1.2...1.1.3) (2026-04-11)
+
+
+### Bug Fixes
+
+* rename binaries inside ZIP to match asset name for PIE ([7fb6f7e](https://github.com/phpolygon/php-vio/commit/7fb6f7e16150e1c236fc1b77d3272f67926c2fd7))
+
 ## [1.1.2](https://github.com/phpolygon/php-vio/compare/1.1.1...1.1.2) (2026-04-11)
 
 
