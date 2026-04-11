@@ -6,8 +6,12 @@
  * The symbols remain accessible within this shared object but are not
  * exported to the dynamic linker.
  */
+#ifdef _MSC_VER
+#define STBTT_DEF
+#else
 #ifndef STBTT_DEF
 #define STBTT_DEF __attribute__((visibility("hidden")))
+#endif
 #endif
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
