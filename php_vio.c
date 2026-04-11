@@ -348,7 +348,7 @@ ZEND_FUNCTION(vio_begin)
 
 #ifdef HAVE_GLFW
     /* Sync 2D projection and viewport to current window size (handles resize + maximize) */
-    if (ctx->window) {
+    if (ctx->window && vio_gl.initialized) {
         int win_w, win_h;
         glfwGetWindowSize(ctx->window, &win_w, &win_h);
         int fb_w, fb_h;
@@ -368,7 +368,7 @@ ZEND_FUNCTION(vio_begin)
 
 #ifdef HAVE_GLFW
     /* Bind headless FBO before begin_frame so clear/draw go to offscreen target */
-    if (ctx->headless_fbo) {
+    if (ctx->headless_fbo && vio_gl.initialized) {
         glBindFramebuffer(GL_FRAMEBUFFER, ctx->headless_fbo);
         glViewport(0, 0, ctx->config.width, ctx->config.height);
     }
