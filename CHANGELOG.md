@@ -1,3 +1,10 @@
+## [1.0.4](https://github.com/phpolygon/php-vio/compare/1.0.3...1.0.4) (2026-04-11)
+
+
+### Bug Fixes
+
+* replace pthread with _beginthreadex on Windows for async texture loading ([7f22100](https://github.com/phpolygon/php-vio/commit/7f22100d6dc8b7f7cc6b42ca359eed9c76e386f2))
+
 ## [1.0.3](https://github.com/phpolygon/php-vio/compare/1.0.2...1.0.3) (2026-04-11)
 
 
