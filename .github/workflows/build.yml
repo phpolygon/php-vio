@@ -56,10 +56,10 @@ jobs:
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
+          BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-x86_64-linux-glibc"
           strip modules/vio.so
-          # PIE format: php_vio-{version}_php{phpver}-{arch}-{os}-{libc}.zip
-          cd modules
-          zip "../php_vio-${VERSION}_php${{ matrix.php }}-x86_64-linux-glibc.zip" vio.so
+          cp modules/vio.so "${BASENAME}.so"
+          zip "${BASENAME}.zip" "${BASENAME}.so"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -106,9 +106,10 @@ jobs:
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
+          BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-arm64-linux-glibc"
           strip modules/vio.so
-          cd modules
-          zip "../php_vio-${VERSION}_php${{ matrix.php }}-arm64-linux-glibc.zip" vio.so
+          cp modules/vio.so "${BASENAME}.so"
+          zip "${BASENAME}.zip" "${BASENAME}.so"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -149,9 +150,10 @@ jobs:
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
+          BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-x86_64-darwin-bsdlibc"
           strip -x modules/vio.so
-          cd modules
-          zip "../php_vio-${VERSION}_php${{ matrix.php }}-x86_64-darwin-bsdlibc.zip" vio.so
+          cp modules/vio.so "${BASENAME}.so"
+          zip "${BASENAME}.zip" "${BASENAME}.so"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -197,9 +199,10 @@ jobs:
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
+          BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-arm64-darwin-bsdlibc"
           strip -x modules/vio.so
-          cd modules
-          zip "../php_vio-${VERSION}_php${{ matrix.php }}-arm64-darwin-bsdlibc.zip" vio.so
+          cp modules/vio.so "${BASENAME}.so"
+          zip "${BASENAME}.zip" "${BASENAME}.so"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -254,9 +257,11 @@ jobs:
           $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "dev" }
           $dllPath = Get-ChildItem -Recurse -Filter "php_vio.dll" | Select-Object -First 1
           if (-not $dllPath) { $dllPath = Get-ChildItem -Recurse -Filter "vio.dll" | Select-Object -First 1 }
-          # PIE format: php_vio-{version}-{phpver}-{ts|nts}-{compiler}-{arch}.zip
-          $zipName = "php_vio-${version}-${{ matrix.php }}-${{ matrix.ts }}-vs17-x86_64.zip"
-          Compress-Archive -Path $dllPath.FullName -DestinationPath $zipName
+          # PIE expects DLL name inside ZIP to match asset name (with .dll extension)
+          $baseName = "php_vio-${version}-${{ matrix.php }}-${{ matrix.ts }}-vs17-x86_64"
+          $renamedDll = "$($dllPath.Directory)\${baseName}.dll"
+          Copy-Item $dllPath.FullName $renamedDll
+          Compress-Archive -Path $renamedDll -DestinationPath "${baseName}.zip"
 
       - uses: actions/upload-artifact@v4
         with:
