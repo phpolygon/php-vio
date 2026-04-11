@@ -214,6 +214,7 @@ jobs:
       - name: Download dependencies
         shell: cmd
         run: |
+          mkdir deps
           curl -sSL -o deps\glfw.zip https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.bin.WIN64.zip
           7z x deps\glfw.zip -odeps\glfw-extract
           xcopy /E /I deps\glfw-extract\glfw-3.4.bin.WIN64\include deps\include

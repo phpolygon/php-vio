@@ -132,6 +132,8 @@ if test "$PHP_VIO" != "no"; then
         PHP_EVAL_INCLINE($VULKAN_CFLAGS)
         PHP_EVAL_LIBLINE($VULKAN_LIBS, VIO_SHARED_LIBADD)
         AC_DEFINE(HAVE_VULKAN, 1, [Whether Vulkan is available])
+        VIO_HAS_VULKAN=yes
+        VIO_VULKAN_CFLAGS="$VULKAN_CFLAGS"
         AC_MSG_RESULT([Vulkan found via pkg-config])
       ], [
         dnl Try common paths
@@ -140,6 +142,8 @@ if test "$PHP_VIO" != "no"; then
             PHP_ADD_INCLUDE($dir/include)
             PHP_ADD_LIBRARY_WITH_PATH(vulkan, $dir/lib, VIO_SHARED_LIBADD)
             AC_DEFINE(HAVE_VULKAN, 1, [Whether Vulkan is available])
+            VIO_HAS_VULKAN=yes
+            VIO_VULKAN_CFLAGS="-I$dir/include"
             AC_MSG_RESULT([Vulkan found at $dir])
             break
           fi
@@ -151,6 +155,8 @@ if test "$PHP_VIO" != "no"; then
         PHP_ADD_INCLUDE($PHP_VULKAN/include)
         PHP_ADD_LIBRARY_WITH_PATH(vulkan, $PHP_VULKAN/lib, VIO_SHARED_LIBADD)
         AC_DEFINE(HAVE_VULKAN, 1, [Whether Vulkan is available])
+        VIO_HAS_VULKAN=yes
+        VIO_VULKAN_CFLAGS="-I$PHP_VULKAN/include"
       else
         AC_MSG_ERROR([Vulkan not found at $PHP_VULKAN])
       fi
@@ -201,6 +207,7 @@ if test "$PHP_VIO" != "no"; then
     case $host_os in
       darwin*)
         AC_DEFINE(HAVE_METAL, 1, [Whether Metal is available])
+        VIO_HAS_METAL=yes
         PHP_ADD_FRAMEWORK(Metal)
         PHP_ADD_FRAMEWORK(QuartzCore)
         AC_MSG_RESULT([Metal backend enabled])
@@ -267,6 +274,9 @@ if test "$PHP_VIO" != "no"; then
     $ext_shared,, -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DGL_SILENCE_DEPRECATION -I@ext_srcdir@/vendor/glad/include -I@ext_srcdir@/include -I@ext_srcdir@/vendor/vma -I@ext_srcdir@/vendor/miniaudio)
 
   PHP_SUBST(VIO_SHARED_LIBADD)
+  PHP_SUBST(VIO_HAS_VULKAN)
+  PHP_SUBST(VIO_HAS_METAL)
+  PHP_SUBST(VIO_VULKAN_CFLAGS)
 
   dnl ── Install public headers ──────────────────────────────────────
   PHP_INSTALL_HEADERS([ext/vio], [
