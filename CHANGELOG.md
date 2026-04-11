@@ -1,3 +1,10 @@
+## [1.0.3](https://github.com/phpolygon/php-vio/compare/1.0.2...1.0.3) (2026-04-11)
+
+
+### Bug Fixes
+
+* guard GL calls in vio_begin with vio_gl.initialized check ([49c12c0](https://github.com/phpolygon/php-vio/commit/49c12c09d5baca10cbcbca834c1072baaa2d4883))
+
 ## [1.0.2](https://github.com/phpolygon/php-vio/compare/1.0.1...1.0.2) (2026-04-11)
 
 
