@@ -211,7 +211,7 @@ if test "$PHP_VIO" != "no"; then
     esac
   fi
 
-  dnl ── macOS frameworks (needed by GLFW) ─────────────────────────
+  dnl ── Platform-specific libraries ──────────────────────────────
   case $host_os in
     darwin*)
       PHP_ADD_FRAMEWORK(Cocoa)
@@ -222,6 +222,14 @@ if test "$PHP_VIO" != "no"; then
       PHP_ADD_FRAMEWORK(CoreFoundation)
       dnl OpenGL framework NOT linked here - GLAD provides declarations,
       dnl functions are loaded via glfwGetProcAddress at runtime
+      ;;
+    linux*)
+      dnl dl needed by GLAD for runtime GL function loading
+      PHP_ADD_LIBRARY(dl, 1, VIO_SHARED_LIBADD)
+      dnl pthread needed by miniaudio and GLFW
+      PHP_ADD_LIBRARY(pthread, 1, VIO_SHARED_LIBADD)
+      dnl math library
+      PHP_ADD_LIBRARY(m, 1, VIO_SHARED_LIBADD)
       ;;
   esac
 

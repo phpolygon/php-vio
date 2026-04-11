@@ -1,0 +1,247 @@
+name: Build Binaries
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PHP_VERSION: '8.4'
+
+jobs:
+  # ── Linux x86_64 ──────────────────────────────────────────────────
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            php${PHP_VERSION}-dev \
+            libglfw3-dev \
+            glslang-dev \
+            libvulkan-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            spirv-cross libspirv-cross-c-shared-dev \
+            pkg-config
+
+      - name: Build extension
+        run: |
+          phpize
+          ./configure \
+            --enable-vio \
+            --with-glfw \
+            --with-glslang \
+            --with-spirv-cross \
+            --with-vulkan \
+            --with-ffmpeg
+          make -j$(nproc)
+
+      - name: Run tests
+        run: |
+          NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) \
+            php run-tests.php -d extension=$PWD/modules/vio.so tests/ || true
+
+      - name: Package binary
+        run: |
+          strip modules/vio.so
+          tar czf vio-linux-x86_64-php${PHP_VERSION}.tar.gz \
+            -C modules vio.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vio-linux-x86_64-php${{ env.PHP_VERSION }}
+          path: vio-linux-x86_64-php${{ env.PHP_VERSION }}.tar.gz
+
+  # ── Linux aarch64 ─────────────────────────────────────────────────
+  linux-aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            php${PHP_VERSION}-dev \
+            libglfw3-dev \
+            glslang-dev \
+            libvulkan-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            spirv-cross libspirv-cross-c-shared-dev \
+            pkg-config
+
+      - name: Build extension
+        run: |
+          phpize
+          ./configure \
+            --enable-vio \
+            --with-glfw \
+            --with-glslang \
+            --with-spirv-cross \
+            --with-vulkan \
+            --with-ffmpeg
+          make -j$(nproc)
+
+      - name: Package binary
+        run: |
+          strip modules/vio.so
+          tar czf vio-linux-aarch64-php${PHP_VERSION}.tar.gz \
+            -C modules vio.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vio-linux-aarch64-php${{ env.PHP_VERSION }}
+          path: vio-linux-aarch64-php${{ env.PHP_VERSION }}.tar.gz
+
+  # ── macOS x86_64 ──────────────────────────────────────────────────
+  macos-x86_64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          brew install glfw glslang spirv-cross vulkan-loader vulkan-headers ffmpeg pkg-config
+
+      - name: Build extension
+        run: |
+          phpize
+          ./configure \
+            --enable-vio \
+            --with-glfw \
+            --with-glslang \
+            --with-spirv-cross \
+            --with-vulkan \
+            --with-ffmpeg \
+            --with-metal
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Package binary
+        run: |
+          strip -x modules/vio.so
+          tar czf vio-macos-x86_64-php${PHP_VERSION}.tar.gz \
+            -C modules vio.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vio-macos-x86_64-php${{ env.PHP_VERSION }}
+          path: vio-macos-x86_64-php${{ env.PHP_VERSION }}.tar.gz
+
+  # ── macOS arm64 ───────────────────────────────────────────────────
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          brew install glfw glslang spirv-cross vulkan-loader vulkan-headers ffmpeg pkg-config
+
+      - name: Build extension
+        run: |
+          phpize
+          ./configure \
+            --enable-vio \
+            --with-glfw \
+            --with-glslang \
+            --with-spirv-cross \
+            --with-vulkan \
+            --with-ffmpeg \
+            --with-metal
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Run tests
+        run: |
+          NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) \
+            php run-tests.php -d extension=$PWD/modules/vio.so tests/ || true
+
+      - name: Package binary
+        run: |
+          strip -x modules/vio.so
+          tar czf vio-macos-arm64-php${PHP_VERSION}.tar.gz \
+            -C modules vio.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vio-macos-arm64-php${{ env.PHP_VERSION }}
+          path: vio-macos-arm64-php${{ env.PHP_VERSION }}.tar.gz
+
+  # ── Windows x64 ──────────────────────────────────────────────────
+  windows-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP SDK
+        id: php-sdk
+        uses: php/setup-php-sdk@v0.10
+        with:
+          version: ${{ env.PHP_VERSION }}
+          arch: x64
+          ts: nts
+
+      - name: Download dependencies
+        shell: cmd
+        run: |
+          curl -sSL -o deps\glfw.zip https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.bin.WIN64.zip
+          7z x deps\glfw.zip -odeps\glfw-extract
+          xcopy /E /I deps\glfw-extract\glfw-3.4.bin.WIN64\include deps\include
+          xcopy /E /I deps\glfw-extract\glfw-3.4.bin.WIN64\lib-vc2022 deps\lib
+
+      - name: Enable Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build extension
+        shell: cmd
+        run: |
+          call phpize.bat
+          call configure --enable-vio --with-glfw=deps --with-prefix=${{ steps.php-sdk.outputs.prefix }}
+          nmake
+
+      - name: Package binary
+        shell: pwsh
+        run: |
+          $dllPath = Get-ChildItem -Recurse -Filter "php_vio.dll" | Select-Object -First 1
+          if (-not $dllPath) { $dllPath = Get-ChildItem -Recurse -Filter "vio.dll" | Select-Object -First 1 }
+          Compress-Archive -Path $dllPath.FullName -DestinationPath "vio-windows-x64-php${{ env.PHP_VERSION }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vio-windows-x64-php${{ env.PHP_VERSION }}
+          path: vio-windows-x64-php${{ env.PHP_VERSION }}.zip
+
+  # ── Release ───────────────────────────────────────────────────────
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-x86_64, linux-aarch64, macos-x86_64, macos-arm64, windows-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*

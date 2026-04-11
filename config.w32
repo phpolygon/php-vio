@@ -1,11 +1,171 @@
+// config.w32 for extension vio (Windows)
+
 ARG_ENABLE("vio", "vio support", "no");
 
+ARG_WITH("glfw", "for GLFW support", "no");
+ARG_WITH("glslang", "for glslang (GLSL to SPIR-V compiler) support", "no");
+ARG_WITH("spirv-cross", "for SPIRV-Cross (shader reflection) support", "no");
+ARG_WITH("vulkan", "for Vulkan support", "no");
+ARG_WITH("ffmpeg", "for FFmpeg (video recording) support", "no");
+
 if (PHP_VIO != "no") {
+
+    // ── Core source files ─────────────────────────────────────────────
+    var vio_sources =
+        "php_vio.c " +
+        "src\\vio_context.c " +
+        "src\\vio_backend_registry.c " +
+        "src\\vio_resource.c " +
+        "src\\vio_window.c " +
+        "src\\vio_mesh.c " +
+        "src\\vio_input.c " +
+        "src\\vio_shader.c " +
+        "src\\vio_pipeline.c " +
+        "src\\vio_texture.c " +
+        "src\\vio_render_target.c " +
+        "src\\vio_cubemap.c " +
+        "src\\vio_buffer.c " +
+        "src\\vio_2d.c " +
+        "src\\vio_font.c " +
+        "src\\vio_shader_compiler.c " +
+        "src\\vio_shader_reflect.c " +
+        "src\\vio_audio.c " +
+        "src\\vio_recorder.c " +
+        "src\\vio_stream.c " +
+        "src\\vio_plugin_registry.c " +
+        "src\\vio_backend_null.c " +
+        "src\\backends\\opengl\\vio_opengl.c " +
+        "src\\backends\\vulkan\\vio_vulkan.c " +
+        "vendor\\glad\\src\\glad.c " +
+        "vendor\\stb\\stb_image_impl.c " +
+        "vendor\\stb\\stb_truetype_impl.c " +
+        "vendor\\stb\\stb_image_write_impl.c " +
+        "vendor\\miniaudio\\miniaudio_impl.c";
+
+    var vio_cflags =
+        "/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 " +
+        "/I" + configure_module_dirname + "\\vendor\\glad\\include " +
+        "/I" + configure_module_dirname + "\\include " +
+        "/I" + configure_module_dirname + "\\vendor\\vma " +
+        "/I" + configure_module_dirname + "\\vendor\\miniaudio " +
+        "/I" + configure_module_dirname + "\\vendor\\stb";
+
+    // ── GLFW detection ────────────────────────────────────────────────
+    if (PHP_GLFW != "no") {
+        if (PHP_GLFW == "yes") {
+            // Try default PHP deps directory
+            PHP_GLFW = PHP_PHP_BUILD;
+        }
+        if (CHECK_HEADER_ADD_INCLUDE("GLFW/glfw3.h", "CFLAGS_VIO", PHP_GLFW + "\\include")) {
+            if (CHECK_LIB("glfw3dll.lib", "vio", PHP_GLFW + "\\lib") ||
+                CHECK_LIB("glfw3.lib", "vio", PHP_GLFW + "\\lib")) {
+                AC_DEFINE("HAVE_GLFW", 1, "Whether GLFW is available");
+            } else {
+                WARNING("GLFW library not found, building without window support");
+            }
+        } else {
+            WARNING("GLFW headers not found at " + PHP_GLFW);
+        }
+    }
+
+    // ── glslang detection ─────────────────────────────────────────────
+    if (PHP_GLSLANG != "no") {
+        if (PHP_GLSLANG == "yes") {
+            PHP_GLSLANG = PHP_PHP_BUILD;
+        }
+        if (CHECK_HEADER_ADD_INCLUDE("glslang/Include/glslang_c_interface.h", "CFLAGS_VIO", PHP_GLSLANG + "\\include")) {
+            if (CHECK_LIB("glslang.lib", "vio", PHP_GLSLANG + "\\lib") &&
+                CHECK_LIB("SPIRV.lib", "vio", PHP_GLSLANG + "\\lib")) {
+                // Optional: glslang-default-resource-limits
+                CHECK_LIB("glslang-default-resource-limits.lib", "vio", PHP_GLSLANG + "\\lib");
+                AC_DEFINE("HAVE_GLSLANG", 1, "Whether glslang is available");
+            } else {
+                WARNING("glslang libraries not found");
+            }
+        }
+    }
+
+    // ── SPIRV-Cross detection ─────────────────────────────────────────
+    if (PHP_SPIRV_CROSS != "no") {
+        if (PHP_SPIRV_CROSS == "yes") {
+            PHP_SPIRV_CROSS = PHP_PHP_BUILD;
+        }
+        if (CHECK_HEADER_ADD_INCLUDE("spirv_cross/spirv_cross_c.h", "CFLAGS_VIO", PHP_SPIRV_CROSS + "\\include")) {
+            if (CHECK_LIB("spirv-cross-c.lib", "vio", PHP_SPIRV_CROSS + "\\lib")) {
+                // Link all spirv-cross components
+                CHECK_LIB("spirv-cross-glsl.lib", "vio", PHP_SPIRV_CROSS + "\\lib");
+                CHECK_LIB("spirv-cross-hlsl.lib", "vio", PHP_SPIRV_CROSS + "\\lib");
+                CHECK_LIB("spirv-cross-reflect.lib", "vio", PHP_SPIRV_CROSS + "\\lib");
+                CHECK_LIB("spirv-cross-core.lib", "vio", PHP_SPIRV_CROSS + "\\lib");
+                CHECK_LIB("spirv-cross-cpp.lib", "vio", PHP_SPIRV_CROSS + "\\lib");
+                AC_DEFINE("HAVE_SPIRV_CROSS", 1, "Whether SPIRV-Cross is available");
+            } else {
+                WARNING("SPIRV-Cross libraries not found");
+            }
+        }
+    }
+
+    // ── Vulkan detection ──────────────────────────────────────────────
+    if (PHP_VULKAN != "no") {
+        var vulkan_sdk = "";
+        if (PHP_VULKAN == "yes") {
+            // Use PHP deps dir; for Vulkan SDK pass explicit path:
+            //   --with-vulkan=C:\VulkanSDK\1.3.xxx
+            vulkan_sdk = PHP_PHP_BUILD;
+        } else {
+            vulkan_sdk = PHP_VULKAN;
+        }
+        if (CHECK_HEADER_ADD_INCLUDE("vulkan/vulkan.h", "CFLAGS_VIO", vulkan_sdk + "\\Include")) {
+            if (CHECK_LIB("vulkan-1.lib", "vio", vulkan_sdk + "\\Lib")) {
+                AC_DEFINE("HAVE_VULKAN", 1, "Whether Vulkan is available");
+            } else {
+                WARNING("Vulkan library not found");
+            }
+        } else {
+            // Try lowercase paths (non-SDK installs)
+            if (CHECK_HEADER_ADD_INCLUDE("vulkan/vulkan.h", "CFLAGS_VIO", vulkan_sdk + "\\include")) {
+                if (CHECK_LIB("vulkan-1.lib", "vio", vulkan_sdk + "\\lib")) {
+                    AC_DEFINE("HAVE_VULKAN", 1, "Whether Vulkan is available");
+                }
+            }
+        }
+    }
+
+    // ── FFmpeg detection ──────────────────────────────────────────────
+    if (PHP_FFMPEG != "no") {
+        if (PHP_FFMPEG == "yes") {
+            PHP_FFMPEG = PHP_PHP_BUILD;
+        }
+        if (CHECK_HEADER_ADD_INCLUDE("libavcodec/avcodec.h", "CFLAGS_VIO", PHP_FFMPEG + "\\include")) {
+            var ffmpeg_ok = true;
+            if (!CHECK_LIB("avcodec.lib", "vio", PHP_FFMPEG + "\\lib")) ffmpeg_ok = false;
+            if (!CHECK_LIB("avformat.lib", "vio", PHP_FFMPEG + "\\lib")) ffmpeg_ok = false;
+            if (!CHECK_LIB("avutil.lib", "vio", PHP_FFMPEG + "\\lib")) ffmpeg_ok = false;
+            if (!CHECK_LIB("swscale.lib", "vio", PHP_FFMPEG + "\\lib")) ffmpeg_ok = false;
+
+            if (ffmpeg_ok) {
+                AC_DEFINE("HAVE_FFMPEG", 1, "Whether FFmpeg is available");
+            } else {
+                WARNING("Some FFmpeg libraries not found, building without video recording");
+            }
+        }
+    }
+
+    // ── Windows system libraries ──────────────────────────────────────
+    // OpenGL32 needed by GLAD at runtime for wglGetProcAddress
+    CHECK_LIB("opengl32.lib", "vio");
+    CHECK_LIB("gdi32.lib", "vio");
+    CHECK_LIB("user32.lib", "vio");
+    CHECK_LIB("shell32.lib", "vio");
+    // ole32/winmm needed by miniaudio
+    CHECK_LIB("ole32.lib", "vio");
+    CHECK_LIB("winmm.lib", "vio");
+
+    // ── Register extension ────────────────────────────────────────────
     EXTENSION("vio",
-        "php_vio.c src\\vio_context.c src\\vio_backend_registry.c src\\vio_resource.c",
+        vio_sources,
         PHP_VIO_SHARED,
-        "/I" + configure_module_dirname + "\\include"
-    );
+        vio_cflags);
 
     PHP_INSTALL_HEADERS("ext/vio",
         "php_vio.h " +
@@ -14,4 +174,9 @@ if (PHP_VIO != "no") {
         "include/vio_constants.h " +
         "include/vio_plugin.h"
     );
+
+    // Note: Metal backend is macOS-only, not compiled on Windows
+    // Note: VMA C++ wrapper for Vulkan requires manual compilation step:
+    //   cl /c /std:c++14 /Ivendor\vma /Iinclude src\backends\vulkan\vio_vma_wrapper.cpp
+    //   Then add vio_vma_wrapper.obj to the link step
 }

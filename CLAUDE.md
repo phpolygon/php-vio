@@ -6,6 +6,8 @@ Eine PHP C-Extension die GPU-Rendering (OpenGL 4.1, Vulkan, Metal), Audio, Video
 
 ## Build
 
+### macOS (Homebrew)
+
 ```bash
 # PHP 8.5 (Homebrew)
 make clean; phpize --clean; phpize && \
@@ -19,6 +21,44 @@ make clean; /usr/local/Cellar/php@8.4/8.4.19/bin/phpize --clean
   --with-php-config=/usr/local/Cellar/php@8.4/8.4.19/bin/php-config && \
 make -j$(sysctl -n hw.ncpu)
 ```
+
+### Linux
+
+```bash
+# Dependencies (Ubuntu/Debian)
+sudo apt install php-dev libglfw3-dev glslang-dev libvulkan-dev \
+  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+  spirv-cross libspirv-cross-c-shared-dev
+
+# Build (kein --with-metal auf Linux)
+phpize && \
+./configure --enable-vio --with-glfw --with-glslang --with-spirv-cross --with-vulkan --with-ffmpeg && \
+make -j$(nproc)
+sudo make install
+```
+
+### Windows
+
+Benötigt PHP SDK + Visual Studio Build Tools. Dependencies (GLFW, Vulkan SDK, FFmpeg, glslang, SPIRV-Cross) als vorcompilierte Libs in `deps/` oder per `--with-*=C:\path`.
+
+```cmd
+:: PHP SDK einrichten (https://wiki.php.net/internals/windows/stepbystepbuild_sdk_2)
+cd C:\php-sdk\phpdev\vs17\x64\php-src\ext\vio
+
+:: Minimal-Build (nur OpenGL, kein Vulkan/FFmpeg)
+configure --enable-vio --with-glfw=C:\deps\glfw
+
+:: Voll-Build
+configure --enable-vio --with-glfw=C:\deps\glfw ^
+  --with-vulkan=C:\VulkanSDK\1.3.xxx ^
+  --with-glslang=C:\deps\glslang ^
+  --with-spirv-cross=C:\deps\spirv-cross ^
+  --with-ffmpeg=C:\deps\ffmpeg
+
+nmake
+```
+
+Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompiliert. Alle Backend-Sources sind in `#ifdef HAVE_*` Guards, daher kompiliert ein Build ohne bestimmte Dependencies problemlos — die Features sind dann einfach nicht verfügbar.
 
 ## Tests
 
