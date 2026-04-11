@@ -4,6 +4,11 @@
  */
 
 #include "php_vio.h"
+
+#if defined(ZTS) && defined(COMPILE_DL_VIO)
+ZEND_TSRMLS_CACHE_DEFINE()
+#endif
+
 #include "php_vio_arginfo.h"
 #include "src/vio_context.h"
 #include "src/vio_backend_registry.h"
@@ -4707,6 +4712,9 @@ PHP_MSHUTDOWN_FUNCTION(vio)
 
 PHP_RINIT_FUNCTION(vio)
 {
+#if defined(ZTS) && defined(COMPILE_DL_VIO)
+    ZEND_TSRMLS_CACHE_UPDATE();
+#endif
     return SUCCESS;
 }
 
