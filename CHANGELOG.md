@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/phpolygon/php-vio/compare/1.0.6...1.1.0) (2026-04-11)
+
+
+### Features
+
+* build binaries for PHP 8.4 and 8.5 ([06d8a5f](https://github.com/phpolygon/php-vio/commit/06d8a5ffceeb2909d7b7522a14e245f83147e879))
+
 ## [1.0.6](https://github.com/phpolygon/php-vio/compare/1.0.5...1.0.6) (2026-04-11)
 
 
