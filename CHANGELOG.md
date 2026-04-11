@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/phpolygon/php-vio/compare/1.1.0...1.1.1) (2026-04-11)
+
+
+### Bug Fixes
+
+* use PIE-compatible asset naming for pre-built binaries ([522f9ed](https://github.com/phpolygon/php-vio/commit/522f9ed91787097e020e10b415a93f298902fe91))
+
 # [1.1.0](https://github.com/phpolygon/php-vio/compare/1.0.6...1.1.0) (2026-04-11)
 
 
