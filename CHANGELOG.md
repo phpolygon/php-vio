@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/phpolygon/php-vio/compare/1.0.1...1.0.2) (2026-04-11)
+
+
+### Bug Fixes
+
+* avoid stb_truetype.h macro conflict with PHP headers on Windows ([98b620a](https://github.com/phpolygon/php-vio/commit/98b620a39e3de35d5da1da78a667dcfdf18f821a))
+
 ## [1.0.1](https://github.com/phpolygon/php-vio/compare/1.0.0...1.0.1) (2026-04-11)
 
 
