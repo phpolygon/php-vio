@@ -1,3 +1,10 @@
+## [1.1.2](https://github.com/phpolygon/php-vio/compare/1.1.1...1.1.2) (2026-04-11)
+
+
+### Bug Fixes
+
+* add TSRMLS cache for thread-safe (ZTS) PHP builds on Windows ([93f3831](https://github.com/phpolygon/php-vio/commit/93f3831da3538f7e9f10b047cd4cd012b11b2ae5))
+
 ## [1.1.1](https://github.com/phpolygon/php-vio/compare/1.1.0...1.1.1) (2026-04-11)
 
 
