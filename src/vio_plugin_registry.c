@@ -3,7 +3,7 @@
  * Plugin registry implementation
  */
 
-#include "include/vio_plugin.h"
+#include "../include/vio_plugin.h"
 #include <string.h>
 #include <stdio.h>
 
