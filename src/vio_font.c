@@ -6,6 +6,9 @@
 #include "config.h"
 #endif
 
+/* Include stb_truetype BEFORE php.h to avoid macro conflicts on Windows */
+#include "../vendor/stb/stb_truetype.h"
+
 #include "vio_font.h"
 
 #ifdef HAVE_GLFW
@@ -66,4 +69,16 @@ void vio_font_register(void)
     vio_font_handlers.offset   = XtOffsetOf(vio_font_object, std);
     vio_font_handlers.free_obj = vio_font_free_object;
     vio_font_handlers.clone_obj = NULL;
+}
+
+int vio_font_bake_bitmap(const unsigned char *data, int offset, float pixel_height,
+                         unsigned char *pixels, int pw, int ph,
+                         int first_char, int num_chars,
+                         vio_stbtt_bakedchar *chardata)
+{
+    /* vio_stbtt_bakedchar and stbtt_bakedchar have identical layout */
+    return stbtt_BakeFontBitmap(data, offset, pixel_height,
+                                pixels, pw, ph,
+                                first_char, num_chars,
+                                (stbtt_bakedchar *)chardata);
 }

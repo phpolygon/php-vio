@@ -2306,7 +2306,7 @@ ZEND_FUNCTION(vio_font)
 
     /* Bake font atlas bitmap */
     unsigned char *atlas_bitmap = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE);
-    int bake_result = stbtt_BakeFontBitmap(
+    int bake_result = vio_font_bake_bitmap(
         font->ttf_data, 0, font->font_size,
         atlas_bitmap, VIO_FONT_ATLAS_SIZE, VIO_FONT_ATLAS_SIZE,
         VIO_FONT_FIRST_CHAR, VIO_FONT_NUM_CHARS, font->char_data);
@@ -2393,7 +2393,7 @@ ZEND_FUNCTION(vio_text)
             continue;
         }
 
-        stbtt_bakedchar *b = &font->char_data[ch - VIO_FONT_FIRST_CHAR];
+        vio_stbtt_bakedchar *b = &font->char_data[ch - VIO_FONT_FIRST_CHAR];
 
         float px = fx + b->xoff;
         float py = fy + b->yoff;
@@ -2642,7 +2642,7 @@ ZEND_FUNCTION(vio_text_measure)
             continue;
         }
 
-        stbtt_bakedchar *b = &font->char_data[ch - VIO_FONT_FIRST_CHAR];
+        vio_stbtt_bakedchar *b = &font->char_data[ch - VIO_FONT_FIRST_CHAR];
         width += b->xadvance;
 
         float char_top = b->yoff;
