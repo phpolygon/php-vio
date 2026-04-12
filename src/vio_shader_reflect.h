@@ -20,6 +20,10 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
  * Returns malloc'd string (caller frees). NULL on failure. */
 char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_msg);
 
+/* Transpile SPIR-V to HLSL (target shader_model e.g. 50=SM5.0, 51=SM5.1).
+ * Returns malloc'd string (caller frees). NULL on failure. */
+char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_model, char **error_msg);
+
 /* Reflection info for a single resource */
 typedef struct _vio_reflect_resource {
     const char *name;

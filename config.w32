@@ -7,6 +7,8 @@ ARG_WITH("glslang", "for glslang (GLSL to SPIR-V compiler) support", "no");
 ARG_WITH("spirv-cross", "for SPIRV-Cross (shader reflection) support", "no");
 ARG_WITH("vulkan", "for Vulkan support", "no");
 ARG_WITH("ffmpeg", "for FFmpeg (video recording) support", "no");
+ARG_WITH("d3d11", "for Direct3D 11 support", "yes");
+ARG_WITH("d3d12", "for Direct3D 12 support", "yes");
 
 if (PHP_VIO != "no") {
 
@@ -36,6 +38,8 @@ if (PHP_VIO != "no") {
         "src\\vio_backend_null.c " +
         "src\\backends\\opengl\\vio_opengl.c " +
         "src\\backends\\vulkan\\vio_vulkan.c " +
+        "src\\backends\\d3d11\\vio_d3d11.c " +
+        "src\\backends\\d3d12\\vio_d3d12.c " +
         "vendor\\glad\\src\\glad.c " +
         "vendor\\stb\\stb_image_impl.c " +
         "vendor\\stb\\stb_truetype_impl.c " +
@@ -147,6 +151,32 @@ if (PHP_VIO != "no") {
                 AC_DEFINE("HAVE_FFMPEG", 1, "Whether FFmpeg is available");
             } else {
                 WARNING("Some FFmpeg libraries not found, building without video recording");
+            }
+        }
+    }
+
+    // ── Direct3D 11 detection ────────────────────────────────────────
+    if (PHP_D3D11 != "no") {
+        if (CHECK_HEADER_ADD_INCLUDE("d3d11.h", "CFLAGS_VIO")) {
+            if (CHECK_LIB("d3d11.lib", "vio") &&
+                CHECK_LIB("dxgi.lib", "vio") &&
+                CHECK_LIB("d3dcompiler.lib", "vio")) {
+                AC_DEFINE("HAVE_D3D11", 1, "Whether Direct3D 11 is available");
+            } else {
+                WARNING("Direct3D 11 libraries not found");
+            }
+        }
+    }
+
+    // ── Direct3D 12 detection ────────────────────────────────────────
+    if (PHP_D3D12 != "no") {
+        if (CHECK_HEADER_ADD_INCLUDE("d3d12.h", "CFLAGS_VIO")) {
+            if (CHECK_LIB("d3d12.lib", "vio") &&
+                CHECK_LIB("dxgi.lib", "vio") &&
+                CHECK_LIB("d3dcompiler.lib", "vio")) {
+                AC_DEFINE("HAVE_D3D12", 1, "Whether Direct3D 12 is available");
+            } else {
+                WARNING("Direct3D 12 libraries not found");
             }
         }
     }

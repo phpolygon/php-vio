@@ -248,7 +248,7 @@ jobs:
         shell: cmd
         run: |
           call phpize.bat
-          call configure --enable-vio --with-glfw=deps --with-prefix=${{ steps.php-sdk.outputs.prefix }}
+          call configure --enable-vio --with-glfw=deps --with-d3d11 --with-d3d12 --with-prefix=${{ steps.php-sdk.outputs.prefix }}
           nmake
 
       - name: Package binary
