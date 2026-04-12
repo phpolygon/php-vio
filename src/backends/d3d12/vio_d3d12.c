@@ -28,10 +28,14 @@
 #endif
 
 #include "vio_d3d12.h"
+#include "../vio_d3d_common.h"
 #include <string.h>
 #include <stdlib.h>
 
 vio_d3d12_state vio_d3d12 = {0};
+
+/* Currently bound pipeline (for vertex stride in draw calls) */
+static vio_d3d12_pipeline *d3d12_current_pipeline = NULL;
 
 /* Forward declarations */
 extern char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size,
@@ -40,6 +44,7 @@ extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
                                             size_t *out_size, char **error_msg);
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
+/* vio_format_to_dxgi, vio_format_byte_size, vio_usage_to_semantic from vio_d3d_common.h */
 
 static D3D12_PRIMITIVE_TOPOLOGY vio_topology_to_d3d12(vio_topology t)
 {
@@ -64,48 +69,6 @@ static D3D12_PRIMITIVE_TOPOLOGY_TYPE vio_topology_to_d3d12_type(vio_topology t)
         case VIO_LINE_STRIP:     return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
         case VIO_POINTS:         return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
         default:                 return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    }
-}
-
-static DXGI_FORMAT vio_format_to_dxgi(vio_format f)
-{
-    switch (f) {
-        case VIO_FLOAT1: return DXGI_FORMAT_R32_FLOAT;
-        case VIO_FLOAT2: return DXGI_FORMAT_R32G32_FLOAT;
-        case VIO_FLOAT3: return DXGI_FORMAT_R32G32B32_FLOAT;
-        case VIO_FLOAT4: return DXGI_FORMAT_R32G32B32A32_FLOAT;
-        case VIO_INT1:   return DXGI_FORMAT_R32_SINT;
-        case VIO_INT2:   return DXGI_FORMAT_R32G32_SINT;
-        case VIO_INT3:   return DXGI_FORMAT_R32G32B32_SINT;
-        case VIO_INT4:   return DXGI_FORMAT_R32G32B32A32_SINT;
-        case VIO_UINT1:  return DXGI_FORMAT_R32_UINT;
-        case VIO_UINT2:  return DXGI_FORMAT_R32G32_UINT;
-        case VIO_UINT3:  return DXGI_FORMAT_R32G32B32_UINT;
-        case VIO_UINT4:  return DXGI_FORMAT_R32G32B32A32_UINT;
-        default:         return DXGI_FORMAT_R32G32B32A32_FLOAT;
-    }
-}
-
-static UINT vio_format_byte_size(vio_format f)
-{
-    switch (f) {
-        case VIO_FLOAT1: case VIO_INT1: case VIO_UINT1: return 4;
-        case VIO_FLOAT2: case VIO_INT2: case VIO_UINT2: return 8;
-        case VIO_FLOAT3: case VIO_INT3: case VIO_UINT3: return 12;
-        case VIO_FLOAT4: case VIO_INT4: case VIO_UINT4: return 16;
-        default: return 16;
-    }
-}
-
-static const char *vio_usage_to_semantic(vio_usage u)
-{
-    switch (u) {
-        case VIO_POSITION: return "POSITION";
-        case VIO_COLOR:    return "COLOR";
-        case VIO_TEXCOORD: return "TEXCOORD";
-        case VIO_NORMAL:   return "NORMAL";
-        case VIO_TANGENT:  return "TANGENT";
-        default:           return "TEXCOORD";
     }
 }
 
@@ -156,10 +119,17 @@ static int d3d12_create_descriptor_heap(ID3D12DescriptorHeap **out, D3D12_DESCRI
     return 0;
 }
 
-/* Allocate a descriptor from the SRV heap, returns index */
+/* Allocate a descriptor from the SRV heap, returns index or UINT_MAX on overflow */
 static UINT d3d12_alloc_srv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE *out_cpu,
                                         D3D12_GPU_DESCRIPTOR_HANDLE *out_gpu)
 {
+    if (vio_d3d12.srv_heap.count >= vio_d3d12.srv_heap.capacity) {
+        php_error_docref(NULL, E_WARNING, "D3D12: SRV descriptor heap full (%u/%u)",
+                          vio_d3d12.srv_heap.count, vio_d3d12.srv_heap.capacity);
+        memset(out_cpu, 0, sizeof(*out_cpu));
+        memset(out_gpu, 0, sizeof(*out_gpu));
+        return UINT_MAX;
+    }
     UINT idx = vio_d3d12.srv_heap.count++;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_start;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_start;
@@ -359,7 +329,7 @@ static int d3d12_init(vio_config *cfg)
     hr = CreateDXGIFactory2(factory_flags, &IID_IDXGIFactory4, (void **)&vio_d3d12.factory);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create DXGI factory (0x%08lx)", hr);
-        return -1;
+        goto init_fail;
     }
 
     /* Select adapter (WARP for headless, hardware otherwise) */
@@ -368,7 +338,7 @@ static int d3d12_init(vio_config *cfg)
         hr = IDXGIFactory4_EnumWarpAdapter(vio_d3d12.factory, &IID_IDXGIAdapter1, (void **)&adapter);
         if (FAILED(hr)) {
             php_error_docref(NULL, E_WARNING, "D3D12: WARP adapter not available (0x%08lx)", hr);
-            return -1;
+            goto init_fail;
         }
     } else {
         /* Pick first hardware adapter that supports D3D12 */
@@ -396,7 +366,7 @@ static int d3d12_init(vio_config *cfg)
 
     if (!adapter) {
         php_error_docref(NULL, E_WARNING, "D3D12: No suitable adapter found");
-        return -1;
+        goto init_fail;
     }
 
     /* Create device */
@@ -405,7 +375,7 @@ static int d3d12_init(vio_config *cfg)
     IDXGIAdapter1_Release(adapter);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create device (0x%08lx)", hr);
-        return -1;
+        goto init_fail;
     }
 
     /* Create command queue */
@@ -419,7 +389,7 @@ static int d3d12_init(vio_config *cfg)
                                           (void **)&vio_d3d12.cmd_queue);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create command queue (0x%08lx)", hr);
-        return -1;
+        goto init_fail;
     }
 
     /* Create per-frame command allocators */
@@ -430,7 +400,7 @@ static int d3d12_init(vio_config *cfg)
                                                   (void **)&vio_d3d12.frames[i].cmd_allocator);
         if (FAILED(hr)) {
             php_error_docref(NULL, E_WARNING, "D3D12: Failed to create command allocator %u (0x%08lx)", i, hr);
-            return -1;
+            goto init_fail;
         }
     }
 
@@ -443,7 +413,7 @@ static int d3d12_init(vio_config *cfg)
                                          (void **)&vio_d3d12.cmd_list);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create command list (0x%08lx)", hr);
-        return -1;
+        goto init_fail;
     }
     /* Close it immediately — will be reset in begin_frame */
     ID3D12GraphicsCommandList_Close(vio_d3d12.cmd_list);
@@ -453,7 +423,7 @@ static int d3d12_init(vio_config *cfg)
                                    &IID_ID3D12Fence, (void **)&vio_d3d12.fence);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create fence (0x%08lx)", hr);
-        return -1;
+        goto init_fail;
     }
     vio_d3d12.fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     vio_d3d12.fence_value = 0;
@@ -463,7 +433,7 @@ static int d3d12_init(vio_config *cfg)
                                       D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                                       VIO_D3D12_FRAME_COUNT,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_NONE) != 0) {
-        return -1;
+        goto init_fail;
     }
     vio_d3d12.rtv_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -471,7 +441,7 @@ static int d3d12_init(vio_config *cfg)
     if (d3d12_create_descriptor_heap(&vio_d3d12.dsv_heap,
                                       D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_NONE) != 0) {
-        return -1;
+        goto init_fail;
     }
 
     /* GPU-visible SRV/CBV/UAV heap */
@@ -479,7 +449,7 @@ static int d3d12_init(vio_config *cfg)
                                       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                                       VIO_D3D12_MAX_SRV_DESCRIPTORS,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
-        return -1;
+        goto init_fail;
     }
     vio_d3d12.srv_heap.descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -488,12 +458,18 @@ static int d3d12_init(vio_config *cfg)
 
     /* Root signature */
     if (d3d12_create_root_signature() != 0) {
-        return -1;
+        goto init_fail;
     }
 
     vio_d3d12.vsync = cfg->vsync;
     vio_d3d12.initialized = 1;
     return 0;
+
+init_fail:
+    /* Clean up anything already created */
+    vio_d3d12.initialized = 1; /* allow shutdown to run */
+    d3d12_shutdown();
+    return -1;
 }
 
 static void d3d12_shutdown(void)
@@ -527,6 +503,7 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.factory)        IDXGIFactory4_Release(vio_d3d12.factory);
     if (vio_d3d12.device)         ID3D12Device_Release(vio_d3d12.device);
 
+    d3d12_current_pipeline = NULL;
     memset(&vio_d3d12, 0, sizeof(vio_d3d12));
 }
 
@@ -761,6 +738,7 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
 {
     vio_d3d12_pipeline *p = (vio_d3d12_pipeline *)pipeline_ptr;
     if (!p) return;
+    if (d3d12_current_pipeline == p) d3d12_current_pipeline = NULL;
     if (p->pso) ID3D12PipelineState_Release(p->pso);
     free(p);
 }
@@ -770,6 +748,7 @@ static void d3d12_bind_pipeline(void *pipeline_ptr)
     vio_d3d12_pipeline *p = (vio_d3d12_pipeline *)pipeline_ptr;
     if (!p) return;
 
+    d3d12_current_pipeline = p;
     ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list, p->pso);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(vio_d3d12.cmd_list,
                                                         vio_d3d12.root_signature);
@@ -953,9 +932,55 @@ static void *d3d12_create_texture(vio_texture_desc *desc)
                 ID3D12Resource_Unmap(tex->upload_resource, 0, NULL);
             }
 
-            /* TODO: Execute copy command (needs a separate command list or integrate into frame)
-             * For now, texture upload is deferred to the first frame that uses this texture.
-             * A proper implementation would use a dedicated upload command list here. */
+            /* Execute copy on a temporary command list */
+            ID3D12CommandAllocator *upload_alloc = NULL;
+            ID3D12GraphicsCommandList *upload_cmd = NULL;
+
+            hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device,
+                D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator,
+                (void **)&upload_alloc);
+            if (SUCCEEDED(hr)) {
+                hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT, upload_alloc, NULL,
+                    &IID_ID3D12GraphicsCommandList, (void **)&upload_cmd);
+            }
+            if (SUCCEEDED(hr)) {
+                D3D12_TEXTURE_COPY_LOCATION dst_loc = {0};
+                dst_loc.pResource = tex->resource;
+                dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst_loc.SubresourceIndex = 0;
+
+                D3D12_TEXTURE_COPY_LOCATION src_loc = {0};
+                src_loc.pResource = tex->upload_resource;
+                src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src_loc.PlacedFootprint = footprint;
+
+                ID3D12GraphicsCommandList_CopyTextureRegion(upload_cmd,
+                    &dst_loc, 0, 0, 0, &src_loc, NULL);
+
+                /* Transition: COPY_DEST -> PIXEL_SHADER_RESOURCE */
+                D3D12_RESOURCE_BARRIER barrier = {0};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = tex->resource;
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                ID3D12GraphicsCommandList_ResourceBarrier(upload_cmd, 1, &barrier);
+
+                ID3D12GraphicsCommandList_Close(upload_cmd);
+
+                ID3D12CommandList *lists[] = { (ID3D12CommandList *)upload_cmd };
+                ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+
+                /* Wait for upload to finish */
+                vio_d3d12_wait_for_gpu();
+            }
+            if (upload_cmd) ID3D12GraphicsCommandList_Release(upload_cmd);
+            if (upload_alloc) ID3D12CommandAllocator_Release(upload_alloc);
+
+            /* Release staging buffer — data is on the GPU now */
+            ID3D12Resource_Release(tex->upload_resource);
+            tex->upload_resource = NULL;
         }
     }
 
@@ -1164,7 +1189,7 @@ static void d3d12_draw(vio_draw_cmd *cmd)
         D3D12_VERTEX_BUFFER_VIEW vbv = {0};
         vbv.BufferLocation = vb->gpu_address;
         vbv.SizeInBytes = (UINT)vb->size;
-        vbv.StrideInBytes = (cmd->vertex_count > 0) ? (UINT)(vb->size / cmd->vertex_count) : 0;
+        vbv.StrideInBytes = d3d12_current_pipeline ? d3d12_current_pipeline->vertex_stride : 0;
         ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 1, &vbv);
     }
 
@@ -1186,7 +1211,7 @@ static void d3d12_draw_indexed(vio_draw_indexed_cmd *cmd)
         D3D12_VERTEX_BUFFER_VIEW vbv = {0};
         vbv.BufferLocation = vb->gpu_address;
         vbv.SizeInBytes = (UINT)vb->size;
-        vbv.StrideInBytes = (cmd->index_count > 0) ? (UINT)(vb->size / cmd->index_count) : 0;
+        vbv.StrideInBytes = d3d12_current_pipeline ? d3d12_current_pipeline->vertex_stride : 0;
         ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 1, &vbv);
     }
 
@@ -1256,7 +1281,7 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
 static int d3d12_supports_feature(vio_feature feature)
 {
     switch (feature) {
-        case VIO_FEATURE_COMPUTE:      return 1;
+        case VIO_FEATURE_COMPUTE:      return 0; /* TODO: not yet implemented */
         case VIO_FEATURE_TESSELLATION: return 1;
         case VIO_FEATURE_GEOMETRY:     return 1;
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */

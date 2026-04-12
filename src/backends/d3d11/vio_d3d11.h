@@ -19,9 +19,6 @@ typedef struct _vio_d3d11_shader {
     ID3DBlob *ps_blob;
     ID3D11VertexShader *vs;
     ID3D11PixelShader  *ps;
-    /* Reflection data for input layout creation */
-    const void *vs_bytecode;
-    size_t      vs_bytecode_size;
 } vio_d3d11_shader;
 
 /* Pipeline = input layout + state objects */

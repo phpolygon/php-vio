@@ -27,10 +27,14 @@
 #endif
 
 #include "vio_d3d11.h"
+#include "../vio_d3d_common.h"
 #include <string.h>
 #include <stdlib.h>
 
 vio_d3d11_state vio_d3d11 = {0};
+
+/* Currently bound pipeline (for vertex stride in draw calls) */
+static vio_d3d11_pipeline *d3d11_current_pipeline = NULL;
 
 /* Forward declarations for SPIRV-Cross HLSL transpilation (in vio_shader_reflect.c) */
 extern char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size,
@@ -40,6 +44,7 @@ extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
                                             size_t *out_size, char **error_msg);
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
+/* vio_format_to_dxgi, vio_format_byte_size, vio_usage_to_semantic from vio_d3d_common.h */
 
 static D3D11_PRIMITIVE_TOPOLOGY vio_topology_to_d3d11(vio_topology t)
 {
@@ -51,48 +56,6 @@ static D3D11_PRIMITIVE_TOPOLOGY vio_topology_to_d3d11(vio_topology t)
         case VIO_POINTS:         return D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
         case VIO_TRIANGLE_FAN:   return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; /* no native fan */
         default:                 return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    }
-}
-
-static DXGI_FORMAT vio_format_to_dxgi(vio_format f)
-{
-    switch (f) {
-        case VIO_FLOAT1: return DXGI_FORMAT_R32_FLOAT;
-        case VIO_FLOAT2: return DXGI_FORMAT_R32G32_FLOAT;
-        case VIO_FLOAT3: return DXGI_FORMAT_R32G32B32_FLOAT;
-        case VIO_FLOAT4: return DXGI_FORMAT_R32G32B32A32_FLOAT;
-        case VIO_INT1:   return DXGI_FORMAT_R32_SINT;
-        case VIO_INT2:   return DXGI_FORMAT_R32G32_SINT;
-        case VIO_INT3:   return DXGI_FORMAT_R32G32B32_SINT;
-        case VIO_INT4:   return DXGI_FORMAT_R32G32B32A32_SINT;
-        case VIO_UINT1:  return DXGI_FORMAT_R32_UINT;
-        case VIO_UINT2:  return DXGI_FORMAT_R32G32_UINT;
-        case VIO_UINT3:  return DXGI_FORMAT_R32G32B32_UINT;
-        case VIO_UINT4:  return DXGI_FORMAT_R32G32B32A32_UINT;
-        default:         return DXGI_FORMAT_R32G32B32A32_FLOAT;
-    }
-}
-
-static UINT vio_format_byte_size(vio_format f)
-{
-    switch (f) {
-        case VIO_FLOAT1: case VIO_INT1: case VIO_UINT1: return 4;
-        case VIO_FLOAT2: case VIO_INT2: case VIO_UINT2: return 8;
-        case VIO_FLOAT3: case VIO_INT3: case VIO_UINT3: return 12;
-        case VIO_FLOAT4: case VIO_INT4: case VIO_UINT4: return 16;
-        default: return 16;
-    }
-}
-
-static const char *vio_usage_to_semantic(vio_usage u)
-{
-    switch (u) {
-        case VIO_POSITION: return "POSITION";
-        case VIO_COLOR:    return "COLOR";
-        case VIO_TEXCOORD: return "TEXCOORD";
-        case VIO_NORMAL:   return "NORMAL";
-        case VIO_TANGENT:  return "TANGENT";
-        default:           return "TEXCOORD";
     }
 }
 
@@ -256,6 +219,7 @@ static void d3d11_shutdown(void)
         vio_d3d11.device = NULL;
     }
 
+    d3d11_current_pipeline = NULL;
     memset(&vio_d3d11, 0, sizeof(vio_d3d11));
 }
 
@@ -369,6 +333,9 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
 
     pipeline->vs = shader->vs;
     pipeline->ps = shader->ps;
+    /* AddRef so pipeline survives shader destruction */
+    if (pipeline->vs) ID3D11VertexShader_AddRef(pipeline->vs);
+    if (pipeline->ps) ID3D11PixelShader_AddRef(pipeline->ps);
     pipeline->topology = vio_topology_to_d3d11(desc->topology);
 
     /* Input layout from vertex attributes */
@@ -456,6 +423,9 @@ static void d3d11_destroy_pipeline(void *pipeline_ptr)
     vio_d3d11_pipeline *p = (vio_d3d11_pipeline *)pipeline_ptr;
     if (!p) return;
 
+    if (d3d11_current_pipeline == p) d3d11_current_pipeline = NULL;
+    if (p->vs)                 ID3D11VertexShader_Release(p->vs);
+    if (p->ps)                 ID3D11PixelShader_Release(p->ps);
     if (p->input_layout)       ID3D11InputLayout_Release(p->input_layout);
     if (p->rasterizer_state)   ID3D11RasterizerState_Release(p->rasterizer_state);
     if (p->depth_stencil_state) ID3D11DepthStencilState_Release(p->depth_stencil_state);
@@ -468,6 +438,7 @@ static void d3d11_bind_pipeline(void *pipeline_ptr)
     vio_d3d11_pipeline *p = (vio_d3d11_pipeline *)pipeline_ptr;
     if (!p) return;
 
+    d3d11_current_pipeline = p;
     ID3D11DeviceContext_IASetInputLayout(vio_d3d11.context, p->input_layout);
     ID3D11DeviceContext_IASetPrimitiveTopology(vio_d3d11.context, p->topology);
     ID3D11DeviceContext_VSSetShader(vio_d3d11.context, p->vs, NULL, 0);
@@ -820,13 +791,8 @@ static void d3d11_draw(vio_draw_cmd *cmd)
 
     vio_d3d11_buffer *vb = (vio_d3d11_buffer *)cmd->vertex_buffer;
     if (vb) {
-        UINT stride = 0;
+        UINT stride = d3d11_current_pipeline ? d3d11_current_pipeline->vertex_stride : 0;
         UINT offset = 0;
-
-        /* Get stride from currently bound pipeline if possible */
-        /* For now, use a default or the buffer size / vertex count */
-        stride = (cmd->vertex_count > 0) ? (UINT)(vb->size / cmd->vertex_count) : 0;
-
         ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 1,
                                                &vb->buffer, &stride, &offset);
     }
@@ -846,9 +812,8 @@ static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
     vio_d3d11_buffer *ib = (vio_d3d11_buffer *)cmd->index_buffer;
 
     if (vb) {
-        UINT stride = 0;
+        UINT stride = d3d11_current_pipeline ? d3d11_current_pipeline->vertex_stride : 0;
         UINT offset = 0;
-        stride = (cmd->index_count > 0) ? (UINT)(vb->size / cmd->index_count) : 0;
         ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 1,
                                                &vb->buffer, &stride, &offset);
     }
@@ -903,7 +868,7 @@ static void d3d11_dispatch_compute(vio_compute_cmd *cmd)
 static int d3d11_supports_feature(vio_feature feature)
 {
     switch (feature) {
-        case VIO_FEATURE_COMPUTE:      return 1; /* D3D11 supports compute shaders */
+        case VIO_FEATURE_COMPUTE:      return 0; /* TODO: not yet implemented */
         case VIO_FEATURE_TESSELLATION: return 1;
         case VIO_FEATURE_GEOMETRY:     return 1;
         case VIO_FEATURE_RAYTRACING:   return 0; /* No DXR in D3D11 */
