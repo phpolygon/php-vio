@@ -184,6 +184,8 @@ if (PHP_VIO != "no") {
     // ── Windows system libraries ──────────────────────────────────────
     // OpenGL32 needed by GLAD at runtime for wglGetProcAddress
     CHECK_LIB("opengl32.lib", "vio");
+    // dxguid needed for COM interface IDs (IID_ID3D11Device, etc.)
+    CHECK_LIB("dxguid.lib", "vio");
     CHECK_LIB("gdi32.lib", "vio");
     CHECK_LIB("user32.lib", "vio");
     CHECK_LIB("shell32.lib", "vio");

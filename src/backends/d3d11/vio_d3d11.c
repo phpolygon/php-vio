@@ -13,6 +13,8 @@
 
 #ifdef HAVE_D3D11
 
+#define COBJMACROS
+#define INITGUID
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
