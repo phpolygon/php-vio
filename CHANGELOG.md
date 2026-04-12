@@ -1,3 +1,10 @@
+## [1.1.4](https://github.com/phpolygon/php-vio/compare/1.1.3...1.1.4) (2026-04-12)
+
+
+### Bug Fixes
+
+* add bare DLL release assets for Windows and simplify Windows install docs ([9775de3](https://github.com/phpolygon/php-vio/commit/9775de314a6d7e71bc72708909be59e9bfa47a47))
+
 ## [1.1.3](https://github.com/phpolygon/php-vio/compare/1.1.2...1.1.3) (2026-04-11)
 
 
