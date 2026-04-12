@@ -61,9 +61,9 @@ const vio_backend *vio_find_backend(const char *name)
 
 const vio_backend *vio_get_auto_backend(void)
 {
-    /* Priority: vulkan > metal > opengl */
-    const char *priority[] = {"vulkan", "metal", "opengl"};
-    for (int p = 0; p < 3; p++) {
+    /* Priority: d3d12 > vulkan > d3d11 > metal > opengl */
+    const char *priority[] = {"d3d12", "vulkan", "d3d11", "metal", "opengl"};
+    for (int p = 0; p < 5; p++) {
         const vio_backend *b = vio_find_backend(priority[p]);
         if (b) {
             return b;

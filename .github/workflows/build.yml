@@ -56,6 +56,7 @@ jobs:
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
+          VERSION="${VERSION//\//-}"
           BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-x86_64-linux-glibc"
           strip modules/vio.so
           cp modules/vio.so "${BASENAME}.so"
@@ -106,6 +107,7 @@ jobs:
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
+          VERSION="${VERSION//\//-}"
           BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-arm64-linux-glibc"
           strip modules/vio.so
           cp modules/vio.so "${BASENAME}.so"
@@ -150,6 +152,7 @@ jobs:
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
+          VERSION="${VERSION//\//-}"
           BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-x86_64-darwin-bsdlibc"
           strip -x modules/vio.so
           cp modules/vio.so "${BASENAME}.so"
@@ -199,6 +202,7 @@ jobs:
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
+          VERSION="${VERSION//\//-}"
           BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-arm64-darwin-bsdlibc"
           strip -x modules/vio.so
           cp modules/vio.so "${BASENAME}.so"
@@ -248,13 +252,13 @@ jobs:
         shell: cmd
         run: |
           call phpize.bat
-          call configure --enable-vio --with-glfw=deps --with-prefix=${{ steps.php-sdk.outputs.prefix }}
+          call configure --enable-vio --with-glfw=deps --with-d3d11 --with-d3d12 --with-prefix=${{ steps.php-sdk.outputs.prefix }}
           nmake
 
       - name: Package binary
         shell: pwsh
         run: |
-          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "dev" }
+          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME -replace '/','-' } else { "dev" }
           $dllPath = Get-ChildItem -Recurse -Filter "php_vio.dll" | Select-Object -First 1
           if (-not $dllPath) { $dllPath = Get-ChildItem -Recurse -Filter "vio.dll" | Select-Object -First 1 }
           # PIE expects DLL name inside ZIP to match asset name (with .dll extension)

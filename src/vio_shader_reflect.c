@@ -102,6 +102,51 @@ char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_ms
     return output;
 }
 
+char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_model, char **error_msg)
+{
+    spvc_context ctx = NULL;
+    spvc_parsed_ir ir = NULL;
+    spvc_compiler compiler = NULL;
+    spvc_compiler_options options = NULL;
+    const char *result = NULL;
+    char *output = NULL;
+
+    if (spvc_context_create(&ctx) != SPVC_SUCCESS) {
+        if (error_msg) *error_msg = strdup("Failed to create SPIRV-Cross context");
+        return NULL;
+    }
+
+    size_t word_count = spirv_size / sizeof(uint32_t);
+
+    if (spvc_context_parse_spirv(ctx, spirv, word_count, &ir) != SPVC_SUCCESS) {
+        if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
+        spvc_context_destroy(ctx);
+        return NULL;
+    }
+
+    if (spvc_context_create_compiler(ctx, SPVC_BACKEND_HLSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &compiler) != SPVC_SUCCESS) {
+        if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
+        spvc_context_destroy(ctx);
+        return NULL;
+    }
+
+    spvc_compiler_create_compiler_options(compiler, &options);
+    spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL, shader_model);
+    spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT, SPVC_TRUE);
+    spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_COORD_COMPAT, SPVC_TRUE);
+    spvc_compiler_install_compiler_options(compiler, options);
+
+    if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS) {
+        if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
+        spvc_context_destroy(ctx);
+        return NULL;
+    }
+
+    output = strdup(result);
+    spvc_context_destroy(ctx);
+    return output;
+}
+
 /* ── Reflection ──────────────────────────────────────────────────── */
 
 static void copy_resources(spvc_compiler compiler, spvc_resources resources,
@@ -200,6 +245,13 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
 char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_msg)
 {
     (void)spirv; (void)spirv_size;
+    if (error_msg) *error_msg = strdup("spirv-cross not available (compile with --with-spirv-cross)");
+    return NULL;
+}
+
+char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_model, char **error_msg)
+{
+    (void)spirv; (void)spirv_size; (void)shader_model;
     if (error_msg) *error_msg = strdup("spirv-cross not available (compile with --with-spirv-cross)");
     return NULL;
 }

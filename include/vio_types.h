@@ -68,6 +68,7 @@ typedef enum _vio_shader_format {
     VIO_SHADER_GLSL      = 2,  /* GLSL -> SPIR-V -> cross-compile */
     VIO_SHADER_MSL       = 3,
     VIO_SHADER_GLSL_RAW  = 4,  /* GLSL -> compile directly (OpenGL only, no SPIR-V) */
+    VIO_SHADER_HLSL      = 5,  /* HLSL -> compile directly (D3D11/D3D12 only) */
 } vio_shader_format;
 
 /* ── Texture filter / wrap ────────────────────────────────────────── */

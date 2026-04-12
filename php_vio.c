@@ -56,6 +56,12 @@ int vio_opengl_setup_context(void);
 #ifdef HAVE_METAL
 #include "src/backends/metal/vio_metal.h"
 #endif
+#ifdef HAVE_D3D11
+#include "src/backends/d3d11/vio_d3d11.h"
+#endif
+#ifdef HAVE_D3D12
+#include "src/backends/d3d12/vio_d3d12.h"
+#endif
 
 ZEND_DECLARE_MODULE_GLOBALS(vio)
 
@@ -4677,6 +4683,12 @@ PHP_MINIT_FUNCTION(vio)
 #ifdef HAVE_METAL
     vio_backend_metal_register();
 #endif
+#ifdef HAVE_D3D11
+    vio_backend_d3d11_register();
+#endif
+#ifdef HAVE_D3D12
+    vio_backend_d3d12_register();
+#endif
     vio_resource_init();
     vio_context_register();
     vio_mesh_register();
@@ -4756,6 +4768,16 @@ PHP_MINFO_FUNCTION(vio)
     php_info_print_table_row(2, "Metal", "available");
 #else
     php_info_print_table_row(2, "Metal", "not available");
+#endif
+#ifdef HAVE_D3D11
+    php_info_print_table_row(2, "Direct3D 11", "available");
+#else
+    php_info_print_table_row(2, "Direct3D 11", "not available");
+#endif
+#ifdef HAVE_D3D12
+    php_info_print_table_row(2, "Direct3D 12", "available");
+#else
+    php_info_print_table_row(2, "Direct3D 12", "not available");
 #endif
 #ifdef HAVE_FFMPEG
     php_info_print_table_row(2, "FFmpeg (video recording)", "available");
