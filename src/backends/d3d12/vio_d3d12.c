@@ -310,6 +310,8 @@ static int d3d12_create_depth_buffer(int width, int height)
 
 /* ── Lifecycle ────────────────────────────────────────────────────── */
 
+static void d3d12_shutdown(void);
+
 static int d3d12_init(vio_config *cfg)
 {
     HRESULT hr;
