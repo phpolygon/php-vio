@@ -1,3 +1,18 @@
+# [1.2.0](https://github.com/phpolygon/php-vio/compare/1.1.4...1.2.0) (2026-04-12)
+
+
+### Bug Fixes
+
+* add COBJMACROS/INITGUID for Windows C compilation and link dxguid.lib ([478008c](https://github.com/phpolygon/php-vio/commit/478008cdba8572c9f0fdc682e74b70685043e16e))
+* add forward declaration for d3d12_shutdown (fixes C2371 on MSVC) ([abdb4e8](https://github.com/phpolygon/php-vio/commit/abdb4e857b253c5c42e670b37fde4cab347700b4))
+* address code review findings for D3D11/D3D12 backends ([ee15dae](https://github.com/phpolygon/php-vio/commit/ee15dae3737b92d2cc691acb1254708e4ad4b1b7))
+
+
+### Features
+
+* add DirectX 11 and DirectX 12 render backends ([e9341f6](https://github.com/phpolygon/php-vio/commit/e9341f6118c1e1b43dc34934e6c6e03c73e41988))
+* DirectX 11 and DirectX 12 render backends ([#1](https://github.com/phpolygon/php-vio/issues/1)) ([90927ee](https://github.com/phpolygon/php-vio/commit/90927ee03cd9f8007cf2c4b7e18238f98d68c7b6))
+
 ## [1.1.4](https://github.com/phpolygon/php-vio/compare/1.1.3...1.1.4) (2026-04-12)
 
 
