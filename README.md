@@ -74,18 +74,13 @@ make -j$(nproc)
 sudo make install
 ```
 
-### From Source (Windows)
+### Windows
 
-Requires [PHP SDK](https://wiki.php.net/internals/windows/stepbystepbuild_sdk_2) and Visual Studio Build Tools. Dependencies (GLFW, Vulkan SDK, FFmpeg, glslang, SPIRV-Cross) as pre-compiled libs.
+On Windows, no build toolchain is needed — PHP extensions are distributed as pre-compiled DLLs. Download the matching DLL from the [Releases](https://github.com/phpolygon/php-vio/releases) page (match your PHP version and thread-safety mode), then:
 
-```cmd
-configure --enable-vio --with-glfw=C:\deps\glfw ^
-  --with-vulkan=C:\VulkanSDK\1.3.xxx ^
-  --with-glslang=C:\deps\glslang ^
-  --with-spirv-cross=C:\deps\spirv-cross ^
-  --with-ffmpeg=C:\deps\ffmpeg
-nmake
-```
+1. Copy `php_vio.dll` into your PHP `ext\` directory
+2. Add `extension=vio` to your `php.ini`
+3. Restart PHP / your web server
 
 All backends use conditional compilation (`#ifdef HAVE_*`), so builds without certain dependencies compile fine — those features are simply unavailable at runtime.
 

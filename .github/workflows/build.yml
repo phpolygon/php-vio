@@ -262,11 +262,15 @@ jobs:
           $renamedDll = "$($dllPath.Directory)\${baseName}.dll"
           Copy-Item $dllPath.FullName $renamedDll
           Compress-Archive -Path $renamedDll -DestinationPath "${baseName}.zip"
+          # Also keep bare DLL for direct download (PIE can't unzip on Windows)
+          Copy-Item $renamedDll "${baseName}.dll"
 
       - uses: actions/upload-artifact@v4
         with:
           name: vio-windows-x64-php${{ matrix.php }}-${{ matrix.ts }}
-          path: php_vio-*-${{ matrix.php }}-${{ matrix.ts }}-vs17-x86_64.zip
+          path: |
+            php_vio-*-${{ matrix.php }}-${{ matrix.ts }}-vs17-x86_64.zip
+            php_vio-*-${{ matrix.php }}-${{ matrix.ts }}-vs17-x86_64.dll
 
   # ── Release ───────────────────────────────────────────────────────
   release:
