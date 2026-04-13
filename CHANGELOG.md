@@ -1,3 +1,10 @@
+## [1.2.5](https://github.com/phpolygon/php-vio/compare/1.2.4...1.2.5) (2026-04-13)
+
+
+### Bug Fixes
+
+* name binary vio.so inside release zips for PIE compatibility ([d725c7d](https://github.com/phpolygon/php-vio/commit/d725c7d922d25aa5c1d231ff5afd89bc200278e1))
+
 ## [1.2.1](https://github.com/phpolygon/php-vio/compare/1.2.0...1.2.1) (2026-04-13)
 
 
