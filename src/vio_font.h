@@ -22,9 +22,9 @@ typedef struct
    float xoff,yoff,xadvance;
 } vio_stbtt_bakedchar;
 
-#define VIO_FONT_ATLAS_SIZE 512
+#define VIO_FONT_ATLAS_SIZE 1024
 #define VIO_FONT_FIRST_CHAR 32
-#define VIO_FONT_NUM_CHARS  96
+#define VIO_FONT_NUM_CHARS  224
 
 typedef struct _vio_font_object {
     vio_stbtt_bakedchar char_data[VIO_FONT_NUM_CHARS];

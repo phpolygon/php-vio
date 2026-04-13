@@ -2357,6 +2357,43 @@ ZEND_FUNCTION(vio_font)
     RETURN_COPY_VALUE(&font_zval);
 }
 
+/**
+ * Decode one UTF-8 codepoint from `text` starting at position `*i`.
+ * Advances `*i` past the decoded sequence. Returns the codepoint,
+ * or 0 on invalid/incomplete sequences.
+ */
+static inline uint32_t vio_utf8_decode(const char *text, size_t text_len, size_t *i)
+{
+    unsigned char c = (unsigned char)text[*i];
+    uint32_t cp = 0;
+    int extra = 0;
+
+    if (c < 0x80) {
+        cp = c;
+    } else if ((c & 0xE0) == 0xC0) {
+        cp = c & 0x1F;
+        extra = 1;
+    } else if ((c & 0xF0) == 0xE0) {
+        cp = c & 0x0F;
+        extra = 2;
+    } else if ((c & 0xF8) == 0xF0) {
+        cp = c & 0x07;
+        extra = 3;
+    } else {
+        /* Invalid lead byte — skip */
+        return 0;
+    }
+
+    for (int j = 0; j < extra; j++) {
+        if (*i + 1 + j >= text_len) return 0;
+        unsigned char cont = (unsigned char)text[*i + 1 + j];
+        if ((cont & 0xC0) != 0x80) return 0;
+        cp = (cp << 6) | (cont & 0x3F);
+    }
+    *i += extra; /* caller already increments by 1 */
+    return cp;
+}
+
 ZEND_FUNCTION(vio_text)
 {
     zval *ctx_zval;
@@ -2402,14 +2439,14 @@ ZEND_FUNCTION(vio_text)
     float inv_w = 1.0f / (float)font->atlas_w;
     float inv_h = 1.0f / (float)font->atlas_h;
 
-    /* Generate quads for each character */
+    /* Generate quads for each character (UTF-8 aware) */
     for (size_t i = 0; i < text_len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        if (ch < VIO_FONT_FIRST_CHAR || ch >= VIO_FONT_FIRST_CHAR + VIO_FONT_NUM_CHARS) {
+        uint32_t cp = vio_utf8_decode(text, text_len, &i);
+        if (cp < (uint32_t)VIO_FONT_FIRST_CHAR || cp >= (uint32_t)(VIO_FONT_FIRST_CHAR + VIO_FONT_NUM_CHARS)) {
             continue;
         }
 
-        vio_stbtt_bakedchar *b = &font->char_data[ch - VIO_FONT_FIRST_CHAR];
+        vio_stbtt_bakedchar *b = &font->char_data[cp - VIO_FONT_FIRST_CHAR];
 
         float px = fx + b->xoff;
         float py = fy + b->yoff;
@@ -2653,12 +2690,12 @@ ZEND_FUNCTION(vio_text_measure)
     float min_y = 0.0f, max_y = 0.0f;
 
     for (size_t i = 0; i < text_len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        if (ch < VIO_FONT_FIRST_CHAR || ch >= VIO_FONT_FIRST_CHAR + VIO_FONT_NUM_CHARS) {
+        uint32_t cp = vio_utf8_decode(text, text_len, &i);
+        if (cp < (uint32_t)VIO_FONT_FIRST_CHAR || cp >= (uint32_t)(VIO_FONT_FIRST_CHAR + VIO_FONT_NUM_CHARS)) {
             continue;
         }
 
-        vio_stbtt_bakedchar *b = &font->char_data[ch - VIO_FONT_FIRST_CHAR];
+        vio_stbtt_bakedchar *b = &font->char_data[cp - VIO_FONT_FIRST_CHAR];
         width += b->xadvance;
 
         float char_top = b->yoff;
