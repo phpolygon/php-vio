@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/phpolygon/php-vio/compare/1.2.5...1.3.0) (2026-04-13)
+
+
+### Features
+
+* multi-range Unicode font atlas with hashmap glyph lookup ([d85b4c6](https://github.com/phpolygon/php-vio/commit/d85b4c673e93ceacb096c32b949b6aadcd098883))
+
 ## [1.2.5](https://github.com/phpolygon/php-vio/compare/1.2.4...1.2.5) (2026-04-13)
 
 
