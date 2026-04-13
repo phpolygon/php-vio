@@ -2317,30 +2317,22 @@ ZEND_FUNCTION(vio_font)
     vio_font_object *font = Z_VIO_FONT_P(&font_zval);
 
     font->font_size = (float)size;
-    font->ttf_data = emalloc(ZSTR_LEN(contents));
-    memcpy(font->ttf_data, ZSTR_VAL(contents), ZSTR_LEN(contents));
-
-    /* Bake font atlas bitmap */
-    unsigned char *atlas_bitmap = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE);
-    int bake_result = vio_font_bake_bitmap(
-        font->ttf_data, 0, font->font_size,
-        atlas_bitmap, VIO_FONT_ATLAS_SIZE, VIO_FONT_ATLAS_SIZE,
-        VIO_FONT_FIRST_CHAR, VIO_FONT_NUM_CHARS, font->char_data);
-
+    font->ttf_len = ZSTR_LEN(contents);
+    font->ttf_data = emalloc(font->ttf_len);
+    memcpy(font->ttf_data, ZSTR_VAL(contents), font->ttf_len);
     zend_string_release(contents);
 
-    if (bake_result <= 0) {
-        php_error_docref(NULL, E_WARNING, "Failed to bake font atlas (try smaller font size or fewer chars)");
-        efree(atlas_bitmap);
-        zval_ptr_dtor(&font_zval);
-        RETURN_FALSE;
-    }
+    /* Multi-range atlas packing (Latin, Cyrillic, Greek, CJK, Hangul, etc.) */
+    int atlas_size = VIO_FONT_ATLAS_SIZE;
+    unsigned char *atlas_bitmap = ecalloc(1, atlas_size * atlas_size);
+
+    vio_font_pack_atlas(font, atlas_bitmap, atlas_size);
 
 #ifdef HAVE_GLFW
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
         glGenTextures(1, &font->atlas_texture);
         glBindTexture(GL_TEXTURE_2D, font->atlas_texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, VIO_FONT_ATLAS_SIZE, VIO_FONT_ATLAS_SIZE,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, atlas_size, atlas_size,
             0, GL_RED, GL_UNSIGNED_BYTE, atlas_bitmap);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -2439,14 +2431,12 @@ ZEND_FUNCTION(vio_text)
     float inv_w = 1.0f / (float)font->atlas_w;
     float inv_h = 1.0f / (float)font->atlas_h;
 
-    /* Generate quads for each character (UTF-8 aware) */
+    /* Generate quads for each character (UTF-8 aware, hashmap lookup) */
     for (size_t i = 0; i < text_len; i++) {
         uint32_t cp = vio_utf8_decode(text, text_len, &i);
-        if (cp < (uint32_t)VIO_FONT_FIRST_CHAR || cp >= (uint32_t)(VIO_FONT_FIRST_CHAR + VIO_FONT_NUM_CHARS)) {
-            continue;
-        }
-
-        vio_stbtt_bakedchar *b = &font->char_data[cp - VIO_FONT_FIRST_CHAR];
+        zval *entry = zend_hash_index_find(&font->glyph_map, (zend_long)cp);
+        if (!entry) continue;
+        vio_stbtt_packedchar *b = (vio_stbtt_packedchar *)Z_STRVAL_P(entry);
 
         float px = fx + b->xoff;
         float py = fy + b->yoff;
@@ -2691,11 +2681,9 @@ ZEND_FUNCTION(vio_text_measure)
 
     for (size_t i = 0; i < text_len; i++) {
         uint32_t cp = vio_utf8_decode(text, text_len, &i);
-        if (cp < (uint32_t)VIO_FONT_FIRST_CHAR || cp >= (uint32_t)(VIO_FONT_FIRST_CHAR + VIO_FONT_NUM_CHARS)) {
-            continue;
-        }
-
-        vio_stbtt_bakedchar *b = &font->char_data[cp - VIO_FONT_FIRST_CHAR];
+        zval *entry = zend_hash_index_find(&font->glyph_map, (zend_long)cp);
+        if (!entry) continue;
+        vio_stbtt_packedchar *b = (vio_stbtt_packedchar *)Z_STRVAL_P(entry);
         width += b->xadvance;
 
         float char_top = b->yoff;
