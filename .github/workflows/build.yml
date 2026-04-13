@@ -60,7 +60,9 @@ jobs:
           BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-x86_64-linux-glibc"
           strip modules/vio.so
           cp modules/vio.so "${BASENAME}.so"
-          zip "${BASENAME}.zip" "${BASENAME}.so"
+          # PIE expects the extension name (vio.so) inside the zip
+          cp modules/vio.so vio.so
+          zip "${BASENAME}.zip" vio.so
 
       - uses: actions/upload-artifact@v4
         with:
@@ -111,7 +113,9 @@ jobs:
           BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-arm64-linux-glibc"
           strip modules/vio.so
           cp modules/vio.so "${BASENAME}.so"
-          zip "${BASENAME}.zip" "${BASENAME}.so"
+          # PIE expects the extension name (vio.so) inside the zip
+          cp modules/vio.so vio.so
+          zip "${BASENAME}.zip" vio.so
 
       - uses: actions/upload-artifact@v4
         with:
@@ -156,7 +160,9 @@ jobs:
           BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-x86_64-darwin-bsdlibc"
           strip -x modules/vio.so
           cp modules/vio.so "${BASENAME}.so"
-          zip "${BASENAME}.zip" "${BASENAME}.so"
+          # PIE expects the extension name (vio.so) inside the zip
+          cp modules/vio.so vio.so
+          zip "${BASENAME}.zip" vio.so
 
       - uses: actions/upload-artifact@v4
         with:
@@ -206,7 +212,9 @@ jobs:
           BASENAME="php_vio-${VERSION}_php${{ matrix.php }}-arm64-darwin-bsdlibc"
           strip -x modules/vio.so
           cp modules/vio.so "${BASENAME}.so"
-          zip "${BASENAME}.zip" "${BASENAME}.so"
+          # PIE expects the extension name (vio.so) inside the zip
+          cp modules/vio.so vio.so
+          zip "${BASENAME}.zip" vio.so
 
       - uses: actions/upload-artifact@v4
         with:
