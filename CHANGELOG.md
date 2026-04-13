@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/phpolygon/php-vio/compare/1.2.0...1.2.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* extend font atlas to Latin-1 and add UTF-8 text decoding ([665885e](https://github.com/phpolygon/php-vio/commit/665885ee9e80ec053f64e036e058e2df87ad8e96))
+
 # [1.2.0](https://github.com/phpolygon/php-vio/compare/1.1.4...1.2.0) (2026-04-12)
 
 
