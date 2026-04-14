@@ -47,7 +47,7 @@ static void vio_font_free_object(zend_object *obj)
     vio_font_object *font = vio_font_from_obj(obj);
 
 #ifdef HAVE_GLFW
-    if (font->atlas_texture) {
+    if (font->atlas_texture && glDeleteTextures) {
         glDeleteTextures(1, &font->atlas_texture);
         font->atlas_texture = 0;
     }

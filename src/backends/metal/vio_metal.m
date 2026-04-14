@@ -138,6 +138,7 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
         vio_mtl.metal_layer.device = vio_mtl.device;
         vio_mtl.metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         vio_mtl.metal_layer.framebufferOnly = NO; /* Need readable for screenshots */
+        vio_mtl.metal_layer.displaySyncEnabled = cfg->vsync ? YES : NO;
 
         /* Get framebuffer size */
         int fb_w, fb_h;

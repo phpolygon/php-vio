@@ -44,7 +44,7 @@ static void vio_texture_free_object(zend_object *obj)
     vio_texture_object *tex = vio_texture_from_obj(obj);
 
 #ifdef HAVE_GLFW
-    if (tex->texture_id && !tex->borrowed) {
+    if (tex->texture_id && !tex->borrowed && glDeleteTextures) {
         glDeleteTextures(1, &tex->texture_id);
         tex->texture_id = 0;
     }
