@@ -1,3 +1,10 @@
+## [1.5.3](https://github.com/phpolygon/php-vio/compare/1.5.2...1.5.3) (2026-04-14)
+
+
+### Bug Fixes
+
+* Metal flickering caused by AppKit layer redraw policy ([a5631e4](https://github.com/phpolygon/php-vio/commit/a5631e4c9b21665b2c2b23611ff04bec7b802002))
+
 ## [1.5.2](https://github.com/phpolygon/php-vio/compare/1.5.1...1.5.2) (2026-04-14)
 
 
