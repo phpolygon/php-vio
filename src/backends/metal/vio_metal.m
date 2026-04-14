@@ -141,6 +141,7 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
         vio_mtl.metal_layer.device = vio_mtl.device;
         vio_mtl.metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         vio_mtl.metal_layer.framebufferOnly = NO; /* Need readable for screenshots */
+        vio_mtl.metal_layer.opaque = YES;
         vio_mtl.vsync = cfg->vsync;
         vio_mtl.metal_layer.displaySyncEnabled = cfg->vsync ? YES : NO;
         if (!cfg->vsync) {
@@ -156,6 +157,7 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
         NSView *content_view = [ns_window contentView];
         [content_view setWantsLayer:YES];
         [content_view setLayer:vio_mtl.metal_layer];
+        [content_view setLayerContentsRedrawPolicy:NSViewLayerContentsRedrawNever];
 
         vio_mtl.width  = fb_w;
         vio_mtl.height = fb_h;
