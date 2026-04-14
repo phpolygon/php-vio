@@ -53,6 +53,7 @@ static id<MTLCommandBuffer> last_presented_cmd_buf = nil;
 typedef struct _vio_metal_2d {
     id<MTLRenderPipelineState> pipeline_shapes;
     id<MTLRenderPipelineState> pipeline_sprites;
+    id<MTLDepthStencilState>   depth_disabled;
     id<MTLSamplerState>        sampler;
     id<MTLBuffer>              vertex_buffer;
     int                        vb_capacity;
@@ -295,6 +296,12 @@ int vio_metal_2d_init(int width, int height)
         sampDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
         mtl_2d.sampler = [vio_mtl.device newSamplerStateWithDescriptor:sampDesc];
 
+        /* Depth-disabled state for 2D rendering */
+        MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+        dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
+        dsDesc.depthWriteEnabled = NO;
+        mtl_2d.depth_disabled = [vio_mtl.device newDepthStencilStateWithDescriptor:dsDesc];
+
         mtl_2d.vb_capacity = 0;
         mtl_2d.vertex_buffer = nil;
         mtl_2d.initialized = 1;
@@ -342,7 +349,7 @@ void vio_metal_2d_flush(vio_2d_state *state)
             options:MTLResourceStorageModeShared];
 
         /* Disable depth for 2D */
-        [vio_mtl.current_encoder setDepthStencilState:nil];
+        [vio_mtl.current_encoder setDepthStencilState:mtl_2d.depth_disabled];
 
         /* Bind vertex buffer and projection */
         [vio_mtl.current_encoder setVertexBuffer:mtl_2d.vertex_buffer offset:0 atIndex:0];
