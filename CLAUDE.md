@@ -72,7 +72,10 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 
 ### Backend-Dispatch (Vtable-Pattern)
 
-Alle GPU-Operationen gehen durch `vio_backend` Vtable in `include/vio_backend.h`. Backends registrieren sich in MINIT. Auto-Auswahl: Vulkan > Metal > OpenGL.
+Alle GPU-Operationen gehen durch `vio_backend` Vtable in `include/vio_backend.h`. Backends registrieren sich in MINIT. Auto-Auswahl ist plattformspezifisch:
+- macOS: Metal > OpenGL
+- Windows: D3D12 > D3D11 > Vulkan > OpenGL
+- Linux: Vulkan > OpenGL
 
 ```
 vio_create("opengl"|"vulkan"|"metal"|"null"|"auto", [...])
@@ -124,8 +127,8 @@ src/
   vio_pipeline.c            # Pipeline-Objekt
   vio_texture.c             # Texture-Objekt
   vio_buffer.c              # Buffer-Objekt
-  vio_2d.c                  # 2D-Batch-Renderer (z-sortiert, max 4096 Items)
-  vio_font.c                # Font-Atlas (stb_truetype, 512x512)
+  vio_2d.c                  # 2D-Batch-Renderer (z-sortiert, dynamisch wachsend)
+  vio_font.c                # Font-Atlas (stb_truetype, 4096x4096, Multi-Range Unicode via PackFontRanges, Glyph-Hashmap)
   vio_shader_compiler.c     # GLSL→SPIR-V (glslang)
   vio_shader_reflect.c      # SPIR-V Reflection (SPIRV-Cross)
   vio_audio.c               # Audio-Engine (miniaudio)
@@ -166,7 +169,7 @@ Vendored (kein Homebrew): GLAD, stb_image/truetype/write, VMA, miniaudio.
 
 ### Context & Frame
 ```php
-$ctx = vio_create("opengl", ["width" => 800, "height" => 600, "headless" => true]);
+$ctx = vio_create("auto", ["width" => 800, "height" => 600, "headless" => true]);
 vio_begin($ctx); vio_clear($ctx, 0.1, 0.1, 0.1); /* render... */ vio_end($ctx);
 vio_poll_events($ctx);
 vio_close($ctx); vio_destroy($ctx);
@@ -231,7 +234,7 @@ vio_stream_stop($stream);
 
 ### Headless / VRT
 ```php
-$ctx = vio_create("opengl", ["width" => 64, "height" => 64, "headless" => true]);
+$ctx = vio_create("auto", ["width" => 64, "height" => 64, "headless" => true]);
 $pixels = vio_read_pixels($ctx);           // RGBA string
 vio_save_screenshot($ctx, "shot.png");
 $diff = vio_compare_images("ref.png", "cur.png", ["threshold" => 0.01]);
@@ -262,6 +265,27 @@ $result = vio_texture_load_poll($h);  // null=laden, false=fehler, array=fertig
 // $result = ["width" => int, "height" => int, "data" => string]
 ```
 
+## Unicode Font Support
+
+The font system uses stbtt_PackFontRanges with 9 Unicode blocks:
+- Latin (U+0020-U+00FF), Latin Extended (U+0100-U+01FF)
+- Greek (U+0370-U+03FF), Cyrillic (U+0400-U+04FF)
+- Vietnamese (U+1E00-U+1EFF)
+- CJK Symbols + Hiragana/Katakana (U+3000-U+30FF)
+- CJK Unified Ideographs (U+4E00-U+9FFF)
+- Hangul Syllables (U+AC00-U+D7A3)
+- Fullwidth Forms (U+FF00-U+FFEF)
+
+Atlas size is 4096x4096. Glyphs are stored in a PHP HashTable (codepoint -> packedchar) for O(1) lookup. Fonts that don't contain glyphs for a range skip them automatically (no atlas space wasted). Space characters (zero visual size but non-zero xadvance) are correctly preserved.
+
+## PIE Installation
+
+Release zips contain `vio.so` (Linux/macOS) or `php_vio.dll` (Windows) as the filename inside the archive, matching what PIE expects.
+
+```bash
+pie install phpolygon/php-vio
+```
+
 ## Konventionen
 
 - **Sprache**: Code und Kommentare auf Englisch. Kommunikation auf Deutsch.
@@ -282,7 +306,6 @@ Extension ist in Laravel Herd (PHP 8.4) geladen:
 ## Bekannte Einschränkungen
 
 - `vio_read_pixels()` nur für OpenGL implementiert (Metal/Vulkan: stub)
-- Vulkan auf macOS braucht `VK_DRIVER_FILES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json` + `DYLD_LIBRARY_PATH=/usr/local/lib` (SIP blockiert letzteres in Subprozessen)
+- Vulkan auf macOS braucht `VK_DRIVER_FILES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json` + `DYLD_LIBRARY_PATH=/usr/local/lib` (SIP blockiert letzteres in Subprozessen). Auto-Auswahl vermeidet Vulkan auf macOS zugunsten von Metal.
 - VideoToolbox-Encoder kann in headless fehlschlagen → Fallback auf libx264
-- 2D Line-Rendering erzeugt auf manchen Configs keine sichtbaren Pixel (Rasterization)
 - `php_vio.c` ist monolithisch (~3200 Zeilen) — alle PHP-Funktionen in einer Datei
