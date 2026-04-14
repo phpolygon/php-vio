@@ -39,6 +39,8 @@ typedef struct _vio_metal_state {
     int                        height;
     float                      clear_r, clear_g, clear_b, clear_a;
     int                        initialized;
+    int                        vsync;
+    id<MTLTexture>             offscreen_texture; /* for vsync-off rendering */
     GLFWwindow                *glfw_window;
 } vio_metal_state;
 
@@ -139,7 +141,11 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
         vio_mtl.metal_layer.device = vio_mtl.device;
         vio_mtl.metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         vio_mtl.metal_layer.framebufferOnly = NO; /* Need readable for screenshots */
+        vio_mtl.vsync = cfg->vsync;
         vio_mtl.metal_layer.displaySyncEnabled = cfg->vsync ? YES : NO;
+        if (!cfg->vsync) {
+            vio_mtl.metal_layer.maximumDrawableCount = 3;
+        }
 
         /* Get framebuffer size */
         int fb_w, fb_h;
@@ -156,6 +162,16 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
 
         /* Create depth texture */
         create_depth_texture(fb_w, fb_h);
+
+        /* Create offscreen render target for vsync-off mode */
+        if (!cfg->vsync) {
+            MTLTextureDescriptor *offDesc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                width:fb_w height:fb_h mipmapped:NO];
+            offDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            offDesc.storageMode = MTLStorageModePrivate;
+            vio_mtl.offscreen_texture = [vio_mtl.device newTextureWithDescriptor:offDesc];
+        }
 
         /* Render pass descriptor template */
         vio_mtl.render_pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -579,6 +595,16 @@ static void metal_resize(int width, int height)
         vio_mtl.metal_layer.drawableSize = CGSizeMake(width, height);
         create_depth_texture(width, height);
         vio_mtl.render_pass_desc.depthAttachment.texture = vio_mtl.depth_texture;
+
+        /* Recreate offscreen texture for vsync-off mode */
+        if (!vio_mtl.vsync) {
+            MTLTextureDescriptor *offDesc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                width:width height:height mipmapped:NO];
+            offDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            offDesc.storageMode = MTLStorageModePrivate;
+            vio_mtl.offscreen_texture = [vio_mtl.device newTextureWithDescriptor:offDesc];
+        }
     }
 }
 
@@ -594,11 +620,19 @@ static void metal_begin_frame(void)
             metal_resize(fb_w, fb_h);
         }
 
-        vio_mtl.current_drawable = [vio_mtl.metal_layer nextDrawable];
-        if (!vio_mtl.current_drawable) return;
+        /* In vsync-off mode, render to offscreen texture to avoid nextDrawable blocking */
+        id<MTLTexture> target_texture;
+        if (!vio_mtl.vsync && vio_mtl.offscreen_texture) {
+            vio_mtl.current_drawable = nil;
+            target_texture = vio_mtl.offscreen_texture;
+        } else {
+            vio_mtl.current_drawable = [vio_mtl.metal_layer nextDrawable];
+            if (!vio_mtl.current_drawable) return;
+            target_texture = vio_mtl.current_drawable.texture;
+        }
 
         /* Configure color attachment */
-        vio_mtl.render_pass_desc.colorAttachments[0].texture = vio_mtl.current_drawable.texture;
+        vio_mtl.render_pass_desc.colorAttachments[0].texture = target_texture;
         vio_mtl.render_pass_desc.colorAttachments[0].loadAction = MTLLoadActionClear;
         vio_mtl.render_pass_desc.colorAttachments[0].storeAction = MTLStoreActionStore;
         vio_mtl.render_pass_desc.colorAttachments[0].clearColor =
@@ -636,8 +670,13 @@ static void metal_present(void)
         last_presented_texture = vio_mtl.current_drawable.texture;
         last_presented_cmd_buf = vio_mtl.current_cmd_buf;
 
-        [vio_mtl.current_cmd_buf presentDrawable:vio_mtl.current_drawable];
+        if (vio_mtl.current_drawable) {
+            [vio_mtl.current_cmd_buf presentDrawable:vio_mtl.current_drawable];
+        }
         [vio_mtl.current_cmd_buf commit];
+        if (!vio_mtl.vsync) {
+            [vio_mtl.current_cmd_buf waitUntilCompleted];
+        }
 
         vio_mtl.current_cmd_buf  = nil;
         vio_mtl.current_drawable = nil;
