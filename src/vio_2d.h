@@ -12,9 +12,9 @@
 #include "php.h"
 #include "../include/vio_types.h"
 
-/* Maximum batched 2D items per frame */
-#define VIO_2D_MAX_ITEMS     4096
-#define VIO_2D_MAX_VERTICES  (VIO_2D_MAX_ITEMS * 6)  /* 6 verts per quad */
+/* Initial capacity — grows dynamically as needed */
+#define VIO_2D_INITIAL_ITEMS     4096
+#define VIO_2D_INITIAL_VERTICES  (VIO_2D_INITIAL_ITEMS * 6)
 #define VIO_2D_CIRCLE_SEGS   32
 #define VIO_2D_MAX_TRANSFORM_STACK 32
 #define VIO_2D_MAX_SCISSOR_STACK   32
@@ -57,13 +57,16 @@ typedef struct _vio_2d_item {
 typedef struct _vio_2d_state {
     vio_2d_vertex  *vertices;
     int             vertex_count;
+    int             vertex_capacity;
     vio_2d_item    *items;
     int             item_count;
+    int             item_capacity;
     float           projection[16];
     unsigned int    shader_shapes;
     unsigned int    shader_sprites;
     unsigned int    vao;
     unsigned int    vbo;
+    int             vbo_capacity;     /* current GPU buffer size in vertices */
     int             initialized;
     int             width, height;
     int             fb_width, fb_height;  /* framebuffer pixels (for glScissor on HiDPI) */

@@ -107,8 +107,9 @@ int vio_font_pack_atlas(vio_font_object *font, unsigned char *atlas_bitmap, int 
         int count = vio_font_ranges[r].num_chars;
         for (int c = 0; c < count; c++) {
             stbtt_packedchar *pc = &range_chardata[r][c];
-            /* Skip glyphs that were not packed (zero-size) */
-            if (pc->x1 == pc->x0 && pc->y1 == pc->y0) continue;
+            /* Skip glyphs that were not packed (zero-size AND no advance, e.g. missing glyph).
+             * Keep zero-size glyphs with xadvance > 0 (e.g. space). */
+            if (pc->x1 == pc->x0 && pc->y1 == pc->y0 && pc->xadvance == 0.0f) continue;
             zend_long cp = (zend_long)(first + c);
             vio_stbtt_packedchar vpc;
             vpc.x0 = pc->x0; vpc.y0 = pc->y0;
