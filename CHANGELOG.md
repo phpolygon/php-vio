@@ -1,3 +1,15 @@
+# [1.4.0](https://github.com/phpolygon/php-vio/compare/1.3.0...1.4.0) (2026-04-14)
+
+
+### Bug Fixes
+
+* platform-specific backend auto-selection (Metal on macOS, Vulkan on Linux) ([c98400b](https://github.com/phpolygon/php-vio/commit/c98400ba4575faf3f9848cf211c497c12f042d3e))
+
+
+### Features
+
+* dynamic 2D batch buffer and space glyph fix ([abfd09b](https://github.com/phpolygon/php-vio/commit/abfd09b54f2a4e5982a36703b20b76ce72375e22))
+
 # [1.3.0](https://github.com/phpolygon/php-vio/compare/1.2.5...1.3.0) (2026-04-13)
 
 
