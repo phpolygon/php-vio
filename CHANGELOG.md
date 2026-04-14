@@ -1,3 +1,10 @@
+## [1.5.2](https://github.com/phpolygon/php-vio/compare/1.5.1...1.5.2) (2026-04-14)
+
+
+### Bug Fixes
+
+* Metal vsync-off uses offscreen rendering to avoid nextDrawable blocking ([a2be14b](https://github.com/phpolygon/php-vio/commit/a2be14b8b6690b51f41a595c1e56e2778dae55b7))
+
 ## [1.5.1](https://github.com/phpolygon/php-vio/compare/1.5.0...1.5.1) (2026-04-14)
 
 
