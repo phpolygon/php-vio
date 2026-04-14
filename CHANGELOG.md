@@ -1,3 +1,15 @@
+# [1.5.0](https://github.com/phpolygon/php-vio/compare/1.4.0...1.5.0) (2026-04-14)
+
+
+### Bug Fixes
+
+* guard GL texture cleanup and Metal vsync/readback ([1b4261b](https://github.com/phpolygon/php-vio/commit/1b4261bfc915e956353f1397dd9d39b7e1043a8d))
+
+
+### Features
+
+* implement Metal 2D rendering pipeline ([f265e3f](https://github.com/phpolygon/php-vio/commit/f265e3fa6c0a5168e476aeec69d9e863d8545048))
+
 # [1.4.0](https://github.com/phpolygon/php-vio/compare/1.3.0...1.4.0) (2026-04-14)
 
 
