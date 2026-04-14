@@ -1,3 +1,10 @@
+## [1.5.1](https://github.com/phpolygon/php-vio/compare/1.5.0...1.5.1) (2026-04-14)
+
+
+### Bug Fixes
+
+* use explicit depth-disabled state in Metal 2D flush ([a57d9da](https://github.com/phpolygon/php-vio/commit/a57d9da9c30aad2c0c9bcc93fec74a729846add5))
+
 # [1.5.0](https://github.com/phpolygon/php-vio/compare/1.4.0...1.5.0) (2026-04-14)
 
 
