@@ -15,6 +15,10 @@
 #include <glad/glad.h>
 #endif
 
+#ifdef HAVE_METAL
+#include "backends/metal/vio_metal.h"
+#endif
+
 zend_class_entry *vio_font_ce = NULL;
 static zend_object_handlers vio_font_handlers;
 
@@ -45,6 +49,12 @@ static void vio_font_free_object(zend_object *obj)
 #ifdef HAVE_GLFW
     if (font->atlas_texture) {
         glDeleteTextures(1, &font->atlas_texture);
+        font->atlas_texture = 0;
+    }
+#endif
+#ifdef HAVE_METAL
+    if (font->atlas_texture) {
+        vio_metal_delete_texture(font->atlas_texture);
         font->atlas_texture = 0;
     }
 #endif

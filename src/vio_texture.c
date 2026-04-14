@@ -12,6 +12,10 @@
 #include <glad/glad.h>
 #endif
 
+#ifdef HAVE_METAL
+#include "backends/metal/vio_metal.h"
+#endif
+
 zend_class_entry *vio_texture_ce = NULL;
 static zend_object_handlers vio_texture_handlers;
 
@@ -42,6 +46,12 @@ static void vio_texture_free_object(zend_object *obj)
 #ifdef HAVE_GLFW
     if (tex->texture_id && !tex->borrowed) {
         glDeleteTextures(1, &tex->texture_id);
+        tex->texture_id = 0;
+    }
+#endif
+#ifdef HAVE_METAL
+    if (tex->texture_id && !tex->borrowed) {
+        vio_metal_delete_texture(tex->texture_id);
         tex->texture_id = 0;
     }
 #endif

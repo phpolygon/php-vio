@@ -42,4 +42,54 @@ static const char *vio_2d_fragment_shader_sprites =
     "    FragColor = texture(uTexture, vTexCoord) * vColor;\n"
     "}\n";
 
+/* ── Metal Shading Language (MSL) equivalents ────────────────────── */
+
+#ifdef HAVE_METAL
+
+static const char *vio_2d_metal_shader_source =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct VertexIn {\n"
+    "    float2 position [[attribute(0)]];\n"
+    "    float2 texcoord [[attribute(1)]];\n"
+    "    float4 color    [[attribute(2)]];\n"
+    "};\n"
+    "\n"
+    "struct VertexOut {\n"
+    "    float4 position [[position]];\n"
+    "    float2 texcoord;\n"
+    "    float4 color;\n"
+    "};\n"
+    "\n"
+    "struct Uniforms {\n"
+    "    float4x4 projection;\n"
+    "};\n"
+    "\n"
+    "vertex VertexOut vio_2d_vertex_main(\n"
+    "    VertexIn in [[stage_in]],\n"
+    "    constant Uniforms &uniforms [[buffer(1)]])\n"
+    "{\n"
+    "    VertexOut out;\n"
+    "    out.position = uniforms.projection * float4(in.position, 0.0, 1.0);\n"
+    "    out.texcoord = in.texcoord;\n"
+    "    out.color = in.color;\n"
+    "    return out;\n"
+    "}\n"
+    "\n"
+    "fragment float4 vio_2d_fragment_shapes(VertexOut in [[stage_in]])\n"
+    "{\n"
+    "    return in.color;\n"
+    "}\n"
+    "\n"
+    "fragment float4 vio_2d_fragment_sprites(\n"
+    "    VertexOut in [[stage_in]],\n"
+    "    texture2d<float> tex [[texture(0)]],\n"
+    "    sampler s [[sampler(0)]])\n"
+    "{\n"
+    "    return tex.sample(s, in.texcoord) * in.color;\n"
+    "}\n";
+
+#endif /* HAVE_METAL */
+
 #endif /* VIO_SHADERS_2D_H */

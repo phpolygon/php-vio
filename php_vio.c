@@ -244,6 +244,13 @@ ZEND_FUNCTION(vio_create)
     /* Initialize 2D rendering system */
     vio_2d_init(&ctx->state_2d, ctx->config.width, ctx->config.height);
 
+#ifdef HAVE_METAL
+    /* Initialize Metal 2D pipeline (shaders, pipeline states) */
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        vio_metal_2d_init(ctx->config.width, ctx->config.height);
+    }
+#endif
+
     ctx->initialized = 1;
     RETURN_COPY_VALUE(&obj);
 }
@@ -375,6 +382,22 @@ ZEND_FUNCTION(vio_begin)
         }
         /* Always sync viewport and scissor scale to framebuffer size (Retina + resize) */
         glViewport(0, 0, fb_w, fb_h);
+        ctx->state_2d.fb_width = fb_w;
+        ctx->state_2d.fb_height = fb_h;
+    }
+#endif
+
+#ifdef HAVE_METAL
+    /* Sync 2D projection to current window size for Metal backend */
+    if (ctx->window && strcmp(ctx->backend->name, "metal") == 0) {
+        int win_w, win_h;
+        glfwGetWindowSize(ctx->window, &win_w, &win_h);
+        int fb_w, fb_h;
+        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+        if (win_w > 0 && win_h > 0 &&
+            (win_w != ctx->state_2d.width || win_h != ctx->state_2d.height)) {
+            vio_2d_set_size(&ctx->state_2d, win_w, win_h);
+        }
         ctx->state_2d.fb_width = fb_w;
         ctx->state_2d.fb_height = fb_h;
     }
@@ -1645,6 +1668,13 @@ ZEND_FUNCTION(vio_texture)
     }
 #endif
 
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        tex->texture_id = vio_metal_create_texture_rgba(w, h, pixels,
+            tex->filter != VIO_FILTER_NEAREST, tex->wrap == VIO_WRAP_CLAMP);
+    }
+#endif
+
     if (from_stbi) {
         stbi_image_free(pixels);
     }
@@ -2340,6 +2370,12 @@ ZEND_FUNCTION(vio_font)
         GLint swizzle[] = {GL_ONE, GL_ONE, GL_ONE, GL_RED};
         glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzle);
         glBindTexture(GL_TEXTURE_2D, 0);
+    }
+#endif
+
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        font->atlas_texture = vio_metal_create_font_atlas(atlas_size, atlas_size, atlas_bitmap);
     }
 #endif
 
@@ -3116,6 +3152,21 @@ ZEND_FUNCTION(vio_read_pixels)
     }
 #endif
 
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        size_t size = (size_t)w * h * 4;
+        zend_string *buf = zend_string_alloc(size, 0);
+        ZSTR_VAL(buf)[size] = '\0';
+
+        if (vio_metal_read_pixels(w, h, (unsigned char *)ZSTR_VAL(buf)) == 0) {
+            RETURN_NEW_STR(buf);
+        }
+        zend_string_release(buf);
+        php_error_docref(NULL, E_WARNING, "vio_read_pixels: Metal readback failed");
+        RETURN_FALSE;
+    }
+#endif
+
     php_error_docref(NULL, E_WARNING, "vio_read_pixels: unsupported backend");
     RETURN_FALSE;
 }
@@ -3167,6 +3218,12 @@ ZEND_FUNCTION(vio_save_screenshot)
         efree(pixels);
 
         RETURN_BOOL(ok);
+    }
+#endif
+
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        RETURN_BOOL(vio_metal_save_screenshot(path, w, h) == 0);
     }
 #endif
 

@@ -17,6 +17,10 @@
 #include "shaders/shaders_2d.h"
 #endif
 
+#ifdef HAVE_METAL
+#include "backends/metal/vio_metal.h"
+#endif
+
 /* ── Orthographic projection matrix ──────────────────────────────── */
 
 static void vio_2d_ortho(float *m, float left, float right, float bottom, float top)
@@ -295,11 +299,18 @@ void vio_2d_flush(vio_2d_state *state)
 {
     if (!state->initialized || state->item_count == 0) return;
 
+    /* Sort items by z-order, then texture (shared across all backends) */
+    qsort(state->items, state->item_count, sizeof(vio_2d_item), vio_2d_item_cmp);
+
+#ifdef HAVE_METAL
+    if (vio_metal_2d_is_active()) {
+        vio_metal_2d_flush(state);
+        return;
+    }
+#endif
+
 #ifdef HAVE_GLFW
     if (!vio_gl.initialized) return;
-
-    /* Sort items by z-order, then texture */
-    qsort(state->items, state->item_count, sizeof(vio_2d_item), vio_2d_item_cmp);
 
     /* Upload vertex data — grow GPU buffer if CPU buffer outgrew it */
     glBindBuffer(GL_ARRAY_BUFFER, state->vbo);
