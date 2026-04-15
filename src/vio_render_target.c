@@ -39,6 +39,7 @@ static zend_object *vio_render_target_create_object(zend_class_entry *ce)
     rt->d3d11_color_tex = NULL;
     rt->d3d11_depth_tex = NULL;
     rt->d3d11_depth_srv = NULL;
+    rt->d3d11_color_srv = NULL;
     rt->d3d12_color_resource = NULL;
     rt->d3d12_depth_resource = NULL;
     rt->d3d12_rtv_heap       = NULL;
@@ -82,6 +83,10 @@ static void vio_render_target_free_object(zend_object *obj)
         if (rt->d3d11_depth_srv) {
             ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)rt->d3d11_depth_srv);
             rt->d3d11_depth_srv = NULL;
+        }
+        if (rt->d3d11_color_srv) {
+            ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)rt->d3d11_color_srv);
+            rt->d3d11_color_srv = NULL;
         }
         if (rt->d3d11_rtv) {
             ID3D11RenderTargetView_Release((ID3D11RenderTargetView *)rt->d3d11_rtv);

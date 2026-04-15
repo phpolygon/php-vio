@@ -23,6 +23,7 @@ typedef struct _vio_render_target_object {
     void        *d3d11_color_tex;     /* ID3D11Texture2D* */
     void        *d3d11_depth_tex;     /* ID3D11Texture2D* */
     void        *d3d11_depth_srv;     /* ID3D11ShaderResourceView* (for shadow sampling) */
+    void        *d3d11_color_srv;    /* ID3D11ShaderResourceView* for color attachment */
 
     /* D3D12 (opaque pointers — actual types are ID3D12Resource* etc.) */
     void        *d3d12_color_resource;  /* ID3D12Resource* */
@@ -37,9 +38,12 @@ typedef struct _vio_render_target_object {
     int          valid;
     int          backend_type;        /* 0=none, 1=opengl, 2=d3d11, 3=d3d12 */
     int          d3d12_depth_is_srv;  /* 1 if depth resource is in SRV state (needs barrier to DEPTH_WRITE) */
+    int          d3d12_color_is_srv;  /* 1 if color resource is in SRV state (needs barrier to RENDER_TARGET) */
     /* D3D12 cached SRV for shadow map sampling (allocated once at RT creation) */
     uint64_t     d3d12_depth_srv_gpu; /* D3D12_GPU_DESCRIPTOR_HANDLE.ptr */
     uint64_t     d3d12_depth_srv_cpu; /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
+    uint64_t     d3d12_color_srv_gpu; /* D3D12_GPU_DESCRIPTOR_HANDLE.ptr */
+    uint64_t     d3d12_color_srv_cpu; /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
     zend_object  std;
 } vio_render_target_object;
 

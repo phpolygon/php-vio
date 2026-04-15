@@ -5093,6 +5093,10 @@ ZEND_FUNCTION(vio_render_target)
     if ((val = zend_hash_str_find(config_ht, "depth_only", sizeof("depth_only") - 1)) != NULL) {
         depth_only = zend_is_true(val);
     }
+    int hdr = 0;
+    if ((val = zend_hash_str_find(config_ht, "hdr", sizeof("hdr") - 1)) != NULL) {
+        hdr = zend_is_true(val);
+    }
 
     /* Create VioRenderTarget object */
     zval rt_zval;
@@ -5130,8 +5134,8 @@ ZEND_FUNCTION(vio_render_target)
             /* Color texture */
             glGenTextures(1, &rt->color_texture);
             glBindTexture(GL_TEXTURE_2D, rt->color_texture);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height,
-                0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glTexImage2D(GL_TEXTURE_2D, 0, hdr ? GL_RGBA16F : GL_RGBA8, width, height,
+                0, GL_RGBA, hdr ? GL_FLOAT : GL_UNSIGNED_BYTE, NULL);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -5214,7 +5218,7 @@ ZEND_FUNCTION(vio_render_target)
             color_desc.Height = height;
             color_desc.MipLevels = 1;
             color_desc.ArraySize = 1;
-            color_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            color_desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
             color_desc.SampleDesc.Count = 1;
             color_desc.Usage = D3D11_USAGE_DEFAULT;
             color_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -5245,6 +5249,17 @@ ZEND_FUNCTION(vio_render_target)
 
             rt->d3d11_rtv = rtv;
             rt->d3d11_color_tex = color_tex;
+
+            /* Create SRV for color texture (for sampling in post-process passes) */
+            {
+                ID3D11ShaderResourceView *color_srv = NULL;
+                D3D11_SHADER_RESOURCE_VIEW_DESC color_srv_desc = {0};
+                color_srv_desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+                color_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                color_srv_desc.Texture2D.MipLevels = 1;
+                ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)color_tex, &color_srv_desc, &color_srv);
+                rt->d3d11_color_srv = color_srv;
+            }
         }
 
         rt->backend_type = VIO_RT_BACKEND_D3D11;
@@ -5281,12 +5296,12 @@ ZEND_FUNCTION(vio_render_target)
             res_desc.Height = height;
             res_desc.DepthOrArraySize = 1;
             res_desc.MipLevels = 1;
-            res_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            res_desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
             res_desc.SampleDesc.Count = 1;
             res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
             D3D12_CLEAR_VALUE clear_val = {0};
-            clear_val.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            clear_val.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
 
             ID3D12Resource *color_res = NULL;
             hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props,
@@ -5397,6 +5412,27 @@ ZEND_FUNCTION(vio_render_target)
             rt->d3d12_depth_srv_cpu = srv_cpu.ptr;
         }
 
+        /* For color targets: pre-create SRV for color texture sampling */
+        if (!depth_only && rt->d3d12_color_resource && vio_d3d12.srv_heap.count < vio_d3d12.srv_heap.capacity) {
+            UINT color_srv_idx = vio_d3d12.srv_heap.count++;
+            D3D12_CPU_DESCRIPTOR_HANDLE color_srv_cpu;
+            D3D12_GPU_DESCRIPTOR_HANDLE color_srv_gpu;
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &color_srv_cpu);
+            ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &color_srv_gpu);
+            color_srv_cpu.ptr += color_srv_idx * vio_d3d12.srv_heap.descriptor_size;
+            color_srv_gpu.ptr += color_srv_idx * vio_d3d12.srv_heap.descriptor_size;
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC color_srv_desc = {0};
+            color_srv_desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+            color_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            color_srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            color_srv_desc.Texture2D.MipLevels = 1;
+            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, (ID3D12Resource *)rt->d3d12_color_resource, &color_srv_desc, color_srv_cpu);
+
+            rt->d3d12_color_srv_gpu = color_srv_gpu.ptr;
+            rt->d3d12_color_srv_cpu = color_srv_cpu.ptr;
+        }
+
         rt->backend_type = VIO_RT_BACKEND_D3D12;
     }
 #endif
@@ -5471,7 +5507,19 @@ ZEND_FUNCTION(vio_bind_render_target)
 
 #ifdef HAVE_D3D12
     if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized) {
-        /* Barrier: if depth resource was used as SRV last frame, transition back to DEPTH_WRITE */
+        /* Barrier: if color resource was used as SRV, transition back to RENDER_TARGET */
+        if (rt->d3d12_color_resource && rt->d3d12_color_is_srv) {
+            D3D12_RESOURCE_BARRIER barrier = {0};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = (ID3D12Resource *)rt->d3d12_color_resource;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+            rt->d3d12_color_is_srv = 0;
+        }
+
+        /* Barrier: if depth resource was used as SRV, transition back to DEPTH_WRITE */
         if (rt->d3d12_depth_resource && rt->d3d12_depth_is_srv) {
             D3D12_RESOURCE_BARRIER barrier = {0};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -5579,6 +5627,7 @@ ZEND_FUNCTION(vio_unbind_render_target)
         /* Barrier: transition shadow map depth from DEPTH_WRITE → SRV for sampling */
         if (vio_d3d12.current_bound_rt) {
             vio_render_target_object *bound_rt = (vio_render_target_object *)vio_d3d12.current_bound_rt;
+            /* Transition depth to SRV if depth-only target */
             if (bound_rt->d3d12_depth_resource && bound_rt->depth_only) {
                 D3D12_RESOURCE_BARRIER barrier = {0};
                 barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -5588,6 +5637,17 @@ ZEND_FUNCTION(vio_unbind_render_target)
                 barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                 ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
                 bound_rt->d3d12_depth_is_srv = 1;
+            }
+            /* Transition color to SRV if color target */
+            if (bound_rt->d3d12_color_resource && !bound_rt->depth_only) {
+                D3D12_RESOURCE_BARRIER barrier = {0};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = (ID3D12Resource *)bound_rt->d3d12_color_resource;
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+                bound_rt->d3d12_color_is_srv = 1;
             }
             vio_d3d12.current_bound_rt = NULL;
         }
@@ -5653,7 +5713,12 @@ ZEND_FUNCTION(vio_render_target_texture)
 #ifdef HAVE_D3D11
     /* For D3D11: create a backend texture wrapper with the SRV from the render target */
     if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
-        ID3D11ShaderResourceView *srv = rt->depth_only ? (ID3D11ShaderResourceView *)rt->d3d11_depth_srv : NULL;
+        ID3D11ShaderResourceView *srv = NULL;
+        if (rt->depth_only) {
+            srv = (ID3D11ShaderResourceView *)rt->d3d11_depth_srv;
+        } else if (rt->d3d11_color_srv) {
+            srv = (ID3D11ShaderResourceView *)rt->d3d11_color_srv;
+        }
         if (srv) {
             vio_d3d11_texture *d3d_tex = calloc(1, sizeof(vio_d3d11_texture));
             d3d_tex->texture = NULL;  /* owned by render target */
@@ -5662,27 +5727,37 @@ ZEND_FUNCTION(vio_render_target_texture)
             d3d_tex->width = rt->width;
             d3d_tex->height = rt->height;
 
-            /* Regular sampler for sampler2D + texture() (manual shadow comparison) */
-            D3D11_SAMPLER_DESC sampler_desc = {0};
-            sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-            sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
-            sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
-            sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
-            sampler_desc.MaxAnisotropy = 1;
-            sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
-            sampler_desc.BorderColor[0] = 1.0f;
-            sampler_desc.BorderColor[1] = 1.0f;
-            sampler_desc.BorderColor[2] = 1.0f;
-            sampler_desc.BorderColor[3] = 1.0f;
-            ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &d3d_tex->sampler);
-
-            /* Comparison sampler for sampler2DShadow + SampleCmp (hardware PCF) */
             if (rt->depth_only) {
+                /* Regular sampler for sampler2D + texture() (manual shadow comparison) */
+                D3D11_SAMPLER_DESC sampler_desc = {0};
+                sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+                sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
+                sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
+                sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+                sampler_desc.MaxAnisotropy = 1;
+                sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+                sampler_desc.BorderColor[0] = 1.0f;
+                sampler_desc.BorderColor[1] = 1.0f;
+                sampler_desc.BorderColor[2] = 1.0f;
+                sampler_desc.BorderColor[3] = 1.0f;
+                ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &d3d_tex->sampler);
+
+                /* Comparison sampler for sampler2DShadow + SampleCmp (hardware PCF) */
                 D3D11_SAMPLER_DESC cmp_desc = sampler_desc;
                 cmp_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
                 cmp_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
                 ID3D11Device_CreateSamplerState(vio_d3d11.device, &cmp_desc, &d3d_tex->sampler_cmp);
                 d3d_tex->is_depth = 1;
+            } else {
+                /* Linear clamp sampler for color texture sampling */
+                D3D11_SAMPLER_DESC sampler_desc = {0};
+                sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+                sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+                sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+                sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+                sampler_desc.MaxAnisotropy = 1;
+                sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+                ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &d3d_tex->sampler);
             }
 
             tex->backend_texture = d3d_tex;
@@ -5692,14 +5767,24 @@ ZEND_FUNCTION(vio_render_target_texture)
 
 #ifdef HAVE_D3D12
     /* For D3D12: use pre-created SRV from render target (allocated once at RT creation) */
-    if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized && rt->depth_only && rt->d3d12_depth_srv_gpu) {
-        vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
-        d3d_tex->resource = NULL; /* owned by render target, don't release */
-        d3d_tex->width = rt->width;
-        d3d_tex->height = rt->height;
-        d3d_tex->srv_gpu.ptr = rt->d3d12_depth_srv_gpu;
-        d3d_tex->srv_cpu.ptr = rt->d3d12_depth_srv_cpu;
-        tex->backend_texture = d3d_tex;
+    if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized) {
+        if (rt->depth_only && rt->d3d12_depth_srv_gpu) {
+            vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
+            d3d_tex->resource = NULL; /* owned by render target, don't release */
+            d3d_tex->width = rt->width;
+            d3d_tex->height = rt->height;
+            d3d_tex->srv_gpu.ptr = rt->d3d12_depth_srv_gpu;
+            d3d_tex->srv_cpu.ptr = rt->d3d12_depth_srv_cpu;
+            tex->backend_texture = d3d_tex;
+        } else if (!rt->depth_only && rt->d3d12_color_srv_gpu) {
+            vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
+            d3d_tex->resource = NULL; /* owned by render target, don't release */
+            d3d_tex->width = rt->width;
+            d3d_tex->height = rt->height;
+            d3d_tex->srv_gpu.ptr = rt->d3d12_color_srv_gpu;
+            d3d_tex->srv_cpu.ptr = rt->d3d12_color_srv_cpu;
+            tex->backend_texture = d3d_tex;
+        }
     }
 #endif
 
