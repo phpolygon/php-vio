@@ -51,8 +51,8 @@ uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
     glslang_input_t input = {0};
     input.language                          = GLSLANG_SOURCE_GLSL;
     input.stage                             = stage;
-    input.client                            = GLSLANG_CLIENT_OPENGL;
-    input.client_version                    = GLSLANG_TARGET_OPENGL_450;
+    input.client                            = GLSLANG_CLIENT_VULKAN;
+    input.client_version                    = GLSLANG_TARGET_VULKAN_1_0;
     input.target_language                   = GLSLANG_TARGET_SPV;
     input.target_language_version           = GLSLANG_TARGET_SPV_1_0;
     input.code                              = source;
@@ -70,9 +70,11 @@ uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
     }
 
     /* Auto-assign locations for uniforms and varyings without explicit layout(location=N).
-     * This allows OpenGL-style GLSL (no explicit locations) to compile to SPIR-V. */
+     * VULKAN_RULES_RELAXED wraps standalone uniforms into a default UBO (required for D3D cbuffer).
+     * This allows OpenGL-style GLSL (no explicit locations/blocks) to compile to SPIR-V. */
     glslang_shader_set_options(shader, GLSLANG_SHADER_AUTO_MAP_LOCATIONS
-                                     | GLSLANG_SHADER_AUTO_MAP_BINDINGS);
+                                     | GLSLANG_SHADER_AUTO_MAP_BINDINGS
+                                     | GLSLANG_SHADER_VULKAN_RULES_RELAXED);
 
     if (!glslang_shader_preprocess(shader, &input)) {
         if (error_msg) {

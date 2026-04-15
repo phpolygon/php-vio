@@ -1157,6 +1157,30 @@ ZEND_FUNCTION(vio_draw)
 
     /* Backend draw (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0) {
+        /* Flush uniform cbuffer before drawing */
+        if (ctx->bound_shader_object) {
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
+                ctx->backend->update_buffer(sh->cbuffer_backend,
+                    sh->cbuffer_data, sh->cbuffer_total_size);
+                sh->cbuffer_dirty = 0;
+            }
+            /* Bind constant buffer to slot b0 */
+#ifdef HAVE_D3D11
+            if (strcmp(ctx->backend->name, "d3d11") == 0 && sh->cbuffer_backend && vio_d3d11.initialized) {
+                vio_d3d11_buffer *cb = (vio_d3d11_buffer *)sh->cbuffer_backend;
+                ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
+                ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
+            }
+#endif
+#ifdef HAVE_D3D12
+            if (strcmp(ctx->backend->name, "d3d12") == 0 && sh->cbuffer_backend && vio_d3d12.initialized) {
+                vio_d3d12_buffer *cb = (vio_d3d12_buffer *)sh->cbuffer_backend;
+                ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+                    vio_d3d12.cmd_list, 0, cb->gpu_address);
+            }
+#endif
+        }
         if (mesh->index_count > 0 && mesh->backend_ib && ctx->backend->draw_indexed) {
             vio_draw_indexed_cmd cmd = {0};
             cmd.vertex_buffer = mesh->backend_vb;
@@ -1359,6 +1383,25 @@ ZEND_FUNCTION(vio_shader)
             php_error_docref(NULL, E_WARNING, "Backend shader compilation failed");
             zval_ptr_dtor(&shader_zval);
             RETURN_FALSE;
+        }
+
+        /* Extract uniform offsets from SPIRV for constant buffer mapping */
+        if (shader->vert_spirv) {
+            shader->uniform_count = vio_spirv_get_uniform_offsets(
+                shader->vert_spirv, shader->vert_spirv_size,
+                shader->uniforms, VIO_MAX_UNIFORMS,
+                &shader->cbuffer_total_size);
+            memset(shader->cbuffer_data, 0, sizeof(shader->cbuffer_data));
+
+            /* Create backend constant buffer */
+            if (shader->cbuffer_total_size > 0 && ctx->backend->create_buffer) {
+                vio_buffer_desc cb_desc = {0};
+                cb_desc.type = VIO_BUFFER_UNIFORM;
+                cb_desc.data = NULL;
+                cb_desc.size = shader->cbuffer_total_size;
+                cb_desc.binding = 0;
+                shader->cbuffer_backend = ctx->backend->create_buffer(&cb_desc);
+            }
         }
     }
 
@@ -1580,6 +1623,7 @@ ZEND_FUNCTION(vio_pipeline)
 
     /* Store backend shader reference for lazy pipeline creation */
     pipe->backend_shader = shader->backend_shader;
+    pipe->shader_ref = shader;
 
     /* Create backend pipeline (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0 &&
@@ -1654,8 +1698,9 @@ ZEND_FUNCTION(vio_bind_pipeline)
         return;
     }
 
-    /* Track bound shader in context for vio_draw() */
+    /* Track bound shader in context for vio_draw() and uniform cbuffer */
     ctx->bound_shader_program = pipe->shader_program;
+    ctx->bound_shader_object = pipe->shader_ref;
 
 #ifdef HAVE_GLFW
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
@@ -2101,54 +2146,56 @@ ZEND_FUNCTION(vio_set_uniform)
     }
 #endif
 
-    /* Backend uniform setting (D3D11/D3D12/Vulkan) */
-    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->set_uniform) {
-        if (Z_TYPE_P(value_zval) == IS_LONG) {
-            int v = (int)Z_LVAL_P(value_zval);
-            ctx->backend->set_uniform(name, &v, 1, VIO_UNIFORM_INT);
-        } else if (Z_TYPE_P(value_zval) == IS_DOUBLE) {
-            float v = (float)Z_DVAL_P(value_zval);
-            ctx->backend->set_uniform(name, &v, 1, VIO_UNIFORM_FLOAT);
-        } else if (Z_TYPE_P(value_zval) == IS_ARRAY) {
-            HashTable *ht = Z_ARRVAL_P(value_zval);
-            int count = zend_hash_num_elements(ht);
-            if (count <= 0) goto uniform_done;
+    /* Backend uniform setting: write into shader's cbuffer_data at correct offset */
+    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->bound_shader_object) {
+        vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
 
-            float vals[16];
-            int i = 0;
+        /* Find uniform by name */
+        for (int u = 0; u < sh->uniform_count; u++) {
+            if (strcmp(sh->uniforms[u].name, name) != 0) continue;
 
-            /* Check if nested array (matrix) */
-            zval *first = zend_hash_index_find(ht, 0);
-            if (first && Z_TYPE_P(first) == IS_ARRAY) {
-                zval *row;
-                ZEND_HASH_FOREACH_VAL(ht, row) {
-                    if (Z_TYPE_P(row) == IS_ARRAY) {
-                        zval *elem;
-                        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(row), elem) {
-                            if (i < 16) vals[i++] = (float)zval_get_double(elem);
-                        } ZEND_HASH_FOREACH_END();
-                    }
-                } ZEND_HASH_FOREACH_END();
-            } else {
-                zval *elem;
-                ZEND_HASH_FOREACH_VAL(ht, elem) {
-                    if (i < 16) vals[i++] = (float)zval_get_double(elem);
-                } ZEND_HASH_FOREACH_END();
+            int offset = sh->uniforms[u].offset;
+            int max_size = sh->uniforms[u].size;
+            if (offset < 0 || offset + max_size > VIO_CBUFFER_SIZE) break;
+
+            unsigned char *dst = sh->cbuffer_data + offset;
+
+            if (Z_TYPE_P(value_zval) == IS_LONG) {
+                int v = (int)Z_LVAL_P(value_zval);
+                if (max_size >= (int)sizeof(int)) memcpy(dst, &v, sizeof(int));
+            } else if (Z_TYPE_P(value_zval) == IS_DOUBLE) {
+                float v = (float)Z_DVAL_P(value_zval);
+                if (max_size >= (int)sizeof(float)) memcpy(dst, &v, sizeof(float));
+            } else if (Z_TYPE_P(value_zval) == IS_ARRAY) {
+                float vals[16];
+                int i = 0;
+                HashTable *ht = Z_ARRVAL_P(value_zval);
+                zval *first = zend_hash_index_find(ht, 0);
+                if (first && Z_TYPE_P(first) == IS_ARRAY) {
+                    zval *row;
+                    ZEND_HASH_FOREACH_VAL(ht, row) {
+                        if (Z_TYPE_P(row) == IS_ARRAY) {
+                            zval *elem;
+                            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(row), elem) {
+                                if (i < 16) vals[i++] = (float)zval_get_double(elem);
+                            } ZEND_HASH_FOREACH_END();
+                        }
+                    } ZEND_HASH_FOREACH_END();
+                } else {
+                    zval *elem;
+                    ZEND_HASH_FOREACH_VAL(ht, elem) {
+                        if (i < 16) vals[i++] = (float)zval_get_double(elem);
+                    } ZEND_HASH_FOREACH_END();
+                }
+                int copy_size = (int)(i * sizeof(float));
+                if (copy_size > max_size) copy_size = max_size;
+                memcpy(dst, vals, copy_size);
             }
 
-            int type;
-            switch (i) {
-                case 2:  type = VIO_UNIFORM_VEC2; break;
-                case 3:  type = VIO_UNIFORM_VEC3; break;
-                case 4:  type = VIO_UNIFORM_VEC4; break;
-                case 9:  type = VIO_UNIFORM_MAT3; break;
-                case 16: type = VIO_UNIFORM_MAT4; break;
-                default: goto uniform_done;
-            }
-            ctx->backend->set_uniform(name, vals, 1, type);
+            sh->cbuffer_dirty = 1;
+            break;
         }
     }
-uniform_done: ;
 }
 
 /* ── Phase 5: 2D API functions ───────────────────────────────────── */

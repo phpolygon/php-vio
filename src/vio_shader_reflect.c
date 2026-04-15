@@ -7,6 +7,7 @@
 #endif
 
 #include "../php_vio.h"
+#include "vio_shader.h"
 #include "vio_shader_reflect.h"
 #include <string.h>
 #include <stdlib.h>
@@ -268,6 +269,88 @@ void vio_reflect_free(vio_reflect_result *result)
     free(result->textures);
     free(result->ubos);
     memset(result, 0, sizeof(vio_reflect_result));
+}
+
+int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
+                                   vio_uniform_entry *entries, int max_entries,
+                                   int *total_size)
+{
+    spvc_context ctx = NULL;
+    spvc_parsed_ir ir = NULL;
+    spvc_compiler compiler = NULL;
+    spvc_resources resources = NULL;
+    int count = 0;
+
+    *total_size = 0;
+
+    if (spvc_context_create(&ctx) != SPVC_SUCCESS) return 0;
+
+    size_t word_count = spirv_size / sizeof(uint32_t);
+    if (spvc_context_parse_spirv(ctx, spirv, word_count, &ir) != SPVC_SUCCESS) {
+        spvc_context_destroy(ctx);
+        return 0;
+    }
+
+    if (spvc_context_create_compiler(ctx, SPVC_BACKEND_HLSL, ir,
+            SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &compiler) != SPVC_SUCCESS) {
+        spvc_context_destroy(ctx);
+        return 0;
+    }
+
+    if (spvc_compiler_create_shader_resources(compiler, &resources) != SPVC_SUCCESS) {
+        spvc_context_destroy(ctx);
+        return 0;
+    }
+
+    /* Get uniform buffers (cbuffer _Global in HLSL) */
+    const spvc_reflected_resource *ubos;
+    size_t ubo_count;
+    spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER,
+                                              &ubos, &ubo_count);
+
+    /* Also check push constants (used by OpenGL-style uniforms) */
+    const spvc_reflected_resource *push_constants;
+    size_t push_count;
+    spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_PUSH_CONSTANT,
+                                              &push_constants, &push_count);
+
+    /* Process the first UBO or push constant block */
+    spvc_type_id type_id = 0;
+    if (ubo_count > 0) {
+        type_id = ubos[0].base_type_id;
+    } else if (push_count > 0) {
+        type_id = push_constants[0].base_type_id;
+    }
+
+    if (type_id) {
+        spvc_type type = spvc_compiler_get_type_handle(compiler, type_id);
+        unsigned int member_count = spvc_type_get_num_member_types(type);
+
+        for (unsigned int i = 0; i < member_count && count < max_entries; i++) {
+            const char *name = spvc_compiler_get_member_name(compiler, type_id, i);
+            unsigned int offset = 0;
+            size_t member_size = 0;
+            spvc_compiler_type_struct_member_offset(compiler, type, i, &offset);
+            spvc_compiler_get_declared_struct_member_size(compiler, type, i, &member_size);
+
+            if (name && name[0]) {
+                strncpy(entries[count].name, name, sizeof(entries[count].name) - 1);
+                entries[count].name[sizeof(entries[count].name) - 1] = '\0';
+                entries[count].offset = (int)offset;
+                entries[count].size = (int)member_size;
+                count++;
+
+                int end = (int)(offset + member_size);
+                if (end > *total_size) *total_size = end;
+            }
+        }
+    }
+
+    /* Align total size to 16 bytes (D3D11 CB requirement) */
+    *total_size = (*total_size + 15) & ~15;
+
+    spvc_context_destroy(ctx);
+    return count;
 }
 
 #else /* !HAVE_SPIRV_CROSS */

@@ -16,6 +16,7 @@ typedef struct _vio_pipeline_object {
     unsigned int   shader_program;   /* GL program (copied, not owned) */
     void          *backend_pipeline; /* Backend-specific pipeline (D3D11/D3D12/Vulkan) */
     void          *backend_shader;   /* Backend shader ref (for pipeline creation) */
+    void          *shader_ref;       /* vio_shader_object* (for uniform cbuffer) */
     vio_topology   topology;
     vio_cull_mode  cull_mode;
     int            depth_test;

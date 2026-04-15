@@ -12,6 +12,15 @@
 #include "php.h"
 #include "../include/vio_types.h"
 
+#define VIO_MAX_UNIFORMS 64
+#define VIO_CBUFFER_SIZE 4096
+
+typedef struct _vio_uniform_entry {
+    char    name[64];
+    int     offset;    /* byte offset in cbuffer */
+    int     size;      /* size in bytes */
+} vio_uniform_entry;
+
 typedef struct _vio_shader_object {
     unsigned int      program;       /* GL program ID (0 if not OpenGL) */
     vio_shader_format format;
@@ -20,6 +29,13 @@ typedef struct _vio_shader_object {
     uint32_t         *frag_spirv;    /* SPIR-V binary for fragment shader */
     size_t            frag_spirv_size;
     void             *backend_shader; /* Backend-specific compiled shader (D3D11/D3D12/Vulkan) */
+    /* Uniform buffer for D3D constant buffer mapping */
+    unsigned char     cbuffer_data[VIO_CBUFFER_SIZE];
+    vio_uniform_entry uniforms[VIO_MAX_UNIFORMS];
+    int               uniform_count;
+    int               cbuffer_total_size;
+    void             *cbuffer_backend;  /* Backend constant buffer */
+    int               cbuffer_dirty;    /* 1 if data changed since last upload */
     int               valid;
     zend_object       std;
 } vio_shader_object;

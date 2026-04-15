@@ -29,6 +29,7 @@ typedef struct _vio_context_object {
     int                in_frame;         /* 1 between begin/end */
     /* Currently bound pipeline shader (0 = use default) */
     unsigned int       bound_shader_program;
+    void              *bound_shader_object;  /* vio_shader_object* for uniform cbuffer */
     /* Headless FBO (OpenGL) */
     unsigned int       headless_fbo;
     unsigned int       headless_color_rb;

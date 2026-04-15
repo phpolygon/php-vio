@@ -52,4 +52,15 @@ int  vio_spirv_reflect(const uint32_t *spirv, size_t spirv_size,
 
 void vio_reflect_free(vio_reflect_result *result);
 
+/* Forward declaration for vio_uniform_entry (defined in vio_shader.h) */
+struct _vio_uniform_entry;
+typedef struct _vio_uniform_entry vio_uniform_entry;
+
+/* Extract uniform member offsets from a SPIR-V module's UBO/push constant block.
+ * Fills entries[] with name/offset/size. Returns number of entries found.
+ * total_size is set to the aligned total size of the constant buffer. */
+int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
+                                   vio_uniform_entry *entries, int max_entries,
+                                   int *total_size);
+
 #endif /* VIO_SHADER_REFLECT_H */
