@@ -217,6 +217,11 @@ static void opengl_present(void)
     /* Swap is handled by the window system (vio_end -> vio_window_swap_buffers) */
 }
 
+static void opengl_gpu_flush(void)
+{
+    glFinish();
+}
+
 static void opengl_clear(float r, float g, float b, float a)
 {
     vio_gl.clear_r = r;
@@ -268,6 +273,7 @@ static const vio_backend opengl_backend = {
     .draw_indexed      = opengl_draw_indexed,
     .present           = opengl_present,
     .clear             = opengl_clear,
+    .gpu_flush         = opengl_gpu_flush,
     .dispatch_compute  = opengl_dispatch_compute,
     .supports_feature  = opengl_supports_feature,
 };

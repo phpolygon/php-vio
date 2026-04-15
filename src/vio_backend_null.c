@@ -158,6 +158,7 @@ static const vio_backend null_backend = {
     .draw_indexed      = null_draw_indexed,
     .present           = null_present,
     .clear             = null_clear,
+    .gpu_flush         = NULL,
     .dispatch_compute  = null_dispatch_compute,
     .supports_feature  = null_supports_feature,
 };

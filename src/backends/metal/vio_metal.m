@@ -144,9 +144,9 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
         vio_mtl.metal_layer.opaque = YES;
         vio_mtl.vsync = cfg->vsync;
         vio_mtl.metal_layer.displaySyncEnabled = cfg->vsync ? YES : NO;
-        if (!cfg->vsync) {
-            vio_mtl.metal_layer.maximumDrawableCount = 3;
-        }
+        /* Use 3 drawables to avoid nextDrawable returning nil when PHP's GC
+           causes occasional frame time spikes. Default of 2 is too tight. */
+        vio_mtl.metal_layer.maximumDrawableCount = 3;
 
         /* Get framebuffer size */
         int fb_w, fb_h;
@@ -622,7 +622,9 @@ static void metal_begin_frame(void)
             metal_resize(fb_w, fb_h);
         }
 
-        /* In vsync-off mode, render to offscreen texture to avoid nextDrawable blocking */
+        /* In vsync-off mode, render to offscreen texture to avoid display-rate
+           throttling from nextDrawable. This gives accurate GPU-only frame timing
+           for benchmarks. In vsync mode, render directly to the drawable. */
         id<MTLTexture> target_texture;
         if (!vio_mtl.vsync && vio_mtl.offscreen_texture) {
             vio_mtl.current_drawable = nil;
@@ -666,22 +668,35 @@ static void metal_end_frame(void)
 static void metal_present(void)
 {
     @autoreleasepool {
-        if (!vio_mtl.current_cmd_buf || !vio_mtl.current_drawable) return;
-
-        /* Keep reference for read_pixels/screenshot (before present releases drawable) */
-        last_presented_texture = vio_mtl.current_drawable.texture;
-        last_presented_cmd_buf = vio_mtl.current_cmd_buf;
+        if (!vio_mtl.current_cmd_buf) return;
 
         if (vio_mtl.current_drawable) {
+            /* Vsync path: present drawable to screen */
+            last_presented_texture = vio_mtl.current_drawable.texture;
+            last_presented_cmd_buf = vio_mtl.current_cmd_buf;
+
             [vio_mtl.current_cmd_buf presentDrawable:vio_mtl.current_drawable];
-        }
-        [vio_mtl.current_cmd_buf commit];
-        if (!vio_mtl.vsync) {
-            [vio_mtl.current_cmd_buf waitUntilCompleted];
+            [vio_mtl.current_cmd_buf commit];
+        } else {
+            /* Vsync-off/offscreen path: commit without presenting.
+               Use vio_gpu_flush() afterwards for accurate timing. */
+            last_presented_texture = vio_mtl.offscreen_texture;
+            last_presented_cmd_buf = vio_mtl.current_cmd_buf;
+
+            [vio_mtl.current_cmd_buf commit];
         }
 
         vio_mtl.current_cmd_buf  = nil;
         vio_mtl.current_drawable = nil;
+    }
+}
+
+static void metal_gpu_flush(void)
+{
+    @autoreleasepool {
+        if (last_presented_cmd_buf) {
+            [last_presented_cmd_buf waitUntilCompleted];
+        }
     }
 }
 
@@ -736,6 +751,7 @@ static const vio_backend metal_backend = {
     .draw_indexed      = metal_draw_indexed,
     .present           = metal_present,
     .clear             = metal_clear,
+    .gpu_flush         = metal_gpu_flush,
     .dispatch_compute  = metal_dispatch_compute,
     .supports_feature  = metal_supports_feature,
 };

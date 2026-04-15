@@ -458,6 +458,26 @@ ZEND_FUNCTION(vio_end)
     ctx->in_frame = 0;
 }
 
+ZEND_FUNCTION(vio_gpu_flush)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        return;
+    }
+
+    if (ctx->backend->gpu_flush) {
+        ctx->backend->gpu_flush();
+    }
+}
+
 ZEND_FUNCTION(vio_clear)
 {
     zval *ctx_zval;

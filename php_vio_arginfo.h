@@ -30,6 +30,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_end, 0, 1, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_gpu_flush, 0, 1, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_clear, 0, 1, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, r, IS_DOUBLE, 0, "0.1")
@@ -523,6 +527,7 @@ ZEND_FUNCTION(vio_close);
 ZEND_FUNCTION(vio_poll_events);
 ZEND_FUNCTION(vio_begin);
 ZEND_FUNCTION(vio_end);
+ZEND_FUNCTION(vio_gpu_flush);
 ZEND_FUNCTION(vio_clear);
 ZEND_FUNCTION(vio_key_pressed);
 ZEND_FUNCTION(vio_key_just_pressed);
@@ -624,6 +629,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_poll_events, arginfo_vio_poll_events)
 	ZEND_FE(vio_begin, arginfo_vio_begin)
 	ZEND_FE(vio_end, arginfo_vio_end)
+	ZEND_FE(vio_gpu_flush, arginfo_vio_gpu_flush)
 	ZEND_FE(vio_clear, arginfo_vio_clear)
 	ZEND_FE(vio_key_pressed, arginfo_vio_key_pressed)
 	ZEND_FE(vio_key_just_pressed, arginfo_vio_key_just_pressed)

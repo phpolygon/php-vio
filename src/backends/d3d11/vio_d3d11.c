@@ -903,6 +903,7 @@ static const vio_backend d3d11_backend = {
     .draw_indexed      = d3d11_draw_indexed,
     .present           = d3d11_present,
     .clear             = d3d11_clear,
+    .gpu_flush         = NULL,
     .dispatch_compute  = d3d11_dispatch_compute,
     .supports_feature  = d3d11_supports_feature,
 };
