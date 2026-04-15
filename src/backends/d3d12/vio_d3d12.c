@@ -493,7 +493,7 @@ static int d3d12_init(vio_config *cfg)
      * Each draw call allocates a 256-byte-aligned slice for its cbuffer data.
      * Reset offset to 0 at begin_frame. */
     {
-        UINT heap_size = 4 * 1024 * 1024; /* 4MB = ~2600 draws per frame */
+        UINT heap_size = 2 * 1024 * 1024; /* Start small (2MB), grows dynamically */
         D3D12_HEAP_PROPERTIES hp = {0};
         hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC rd = {0};
@@ -1281,6 +1281,39 @@ static void d3d12_begin_frame(void)
     vio_d3d12.current_rt_width = vio_d3d12.width;
     vio_d3d12.current_rt_height = vio_d3d12.height;
     vio_d3d12.current_has_rtv = 1;
+
+    /* Grow cbuffer heap if last frame used >75% of capacity */
+    if (vio_d3d12.cbuffer_heap_offset > vio_d3d12.cbuffer_heap_capacity * 3 / 4) {
+        UINT new_size = vio_d3d12.cbuffer_heap_capacity * 2;
+        if (new_size > 256 * 1024 * 1024) new_size = 256 * 1024 * 1024; /* cap at 256MB */
+
+        /* Release old heap (GPU is idle after wait_for_frame above) */
+        if (vio_d3d12.cbuffer_heap) {
+            ID3D12Resource_Unmap(vio_d3d12.cbuffer_heap, 0, NULL);
+            ID3D12Resource_Release(vio_d3d12.cbuffer_heap);
+            vio_d3d12.cbuffer_heap = NULL;
+            vio_d3d12.cbuffer_heap_mapped = NULL;
+        }
+
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = new_size;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        if (SUCCEEDED(ID3D12Device_CreateCommittedResource(vio_d3d12.device,
+                &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                NULL, &IID_ID3D12Resource, (void **)&vio_d3d12.cbuffer_heap))) {
+            vio_d3d12.cbuffer_heap_gpu = ID3D12Resource_GetGPUVirtualAddress(vio_d3d12.cbuffer_heap);
+            vio_d3d12.cbuffer_heap_capacity = new_size;
+            D3D12_RANGE rr = {0, 0};
+            ID3D12Resource_Map(vio_d3d12.cbuffer_heap, 0, &rr, (void **)&vio_d3d12.cbuffer_heap_mapped);
+            php_error_docref(NULL, E_NOTICE, "D3D12: cbuffer heap grown to %u MB", new_size / (1024*1024));
+        }
+    }
 
     /* Reset per-frame allocators */
     vio_d3d12.cbuffer_heap_offset = 0;
