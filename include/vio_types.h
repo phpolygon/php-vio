@@ -103,6 +103,18 @@ typedef enum _vio_buffer_type {
     VIO_BUFFER_STORAGE = 3,
 } vio_buffer_type;
 
+/* ── Uniform types (for set_uniform vtable) ──────────────────────── */
+
+typedef enum _vio_uniform_type {
+    VIO_UNIFORM_INT     = 0,
+    VIO_UNIFORM_FLOAT   = 1,
+    VIO_UNIFORM_VEC2    = 2,
+    VIO_UNIFORM_VEC3    = 3,
+    VIO_UNIFORM_VEC4    = 4,
+    VIO_UNIFORM_MAT3    = 5,
+    VIO_UNIFORM_MAT4    = 6,
+} vio_uniform_type;
+
 /* ── Feature flags ────────────────────────────────────────────────── */
 
 typedef enum _vio_feature {

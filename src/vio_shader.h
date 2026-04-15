@@ -19,6 +19,7 @@ typedef struct _vio_shader_object {
     size_t            vert_spirv_size;
     uint32_t         *frag_spirv;    /* SPIR-V binary for fragment shader */
     size_t            frag_spirv_size;
+    void             *backend_shader; /* Backend-specific compiled shader (D3D11/D3D12/Vulkan) */
     int               valid;
     zend_object       std;
 } vio_shader_object;

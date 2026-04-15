@@ -56,6 +56,11 @@ int vio_opengl_setup_context(void);
 #ifdef HAVE_METAL
 #include "src/backends/metal/vio_metal.h"
 #endif
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
+#ifndef COBJMACROS
+#define COBJMACROS
+#endif
+#endif
 #ifdef HAVE_D3D11
 #include "src/backends/d3d11/vio_d3d11.h"
 #endif
@@ -228,6 +233,36 @@ ZEND_FUNCTION(vio_create)
         /* Metal: create device, command queue, CAMetalLayer */
         if (strcmp(ctx->backend->name, "metal") == 0) {
             if (vio_metal_setup_context(ctx->window, &ctx->config) != 0) {
+                vio_window_destroy(ctx->window);
+                ctx->window = NULL;
+                if (ctx->backend->shutdown) {
+                    ctx->backend->shutdown();
+                }
+                zval_ptr_dtor(&obj);
+                RETURN_FALSE;
+            }
+        }
+#endif
+
+#ifdef HAVE_D3D11
+        /* D3D11: set GLFW window handle and create swapchain */
+        if (strcmp(ctx->backend->name, "d3d11") == 0) {
+            if (vio_d3d11_setup_context(ctx->window, &ctx->config) != 0) {
+                vio_window_destroy(ctx->window);
+                ctx->window = NULL;
+                if (ctx->backend->shutdown) {
+                    ctx->backend->shutdown();
+                }
+                zval_ptr_dtor(&obj);
+                RETURN_FALSE;
+            }
+        }
+#endif
+
+#ifdef HAVE_D3D12
+        /* D3D12: set GLFW window handle and create swapchain */
+        if (strcmp(ctx->backend->name, "d3d12") == 0) {
+            if (vio_d3d12_setup_context(ctx->window, &ctx->config) != 0) {
                 vio_window_destroy(ctx->window);
                 ctx->window = NULL;
                 if (ctx->backend->shutdown) {
@@ -1047,6 +1082,25 @@ ZEND_FUNCTION(vio_mesh)
     } /* end if opengl */
 #endif
 
+    /* Backend buffer creation (D3D11/D3D12/Vulkan) */
+    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->create_buffer) {
+        /* Vertex buffer */
+        vio_buffer_desc vb_desc = {0};
+        vb_desc.type = VIO_BUFFER_VERTEX;
+        vb_desc.data = data;
+        vb_desc.size = sizeof(float) * vertex_data_count;
+        mesh->backend_vb = ctx->backend->create_buffer(&vb_desc);
+
+        /* Index buffer */
+        if (indices && index_count > 0) {
+            vio_buffer_desc ib_desc = {0};
+            ib_desc.type = VIO_BUFFER_INDEX;
+            ib_desc.data = indices;
+            ib_desc.size = sizeof(unsigned int) * index_count;
+            mesh->backend_ib = ctx->backend->create_buffer(&ib_desc);
+        }
+    }
+
     efree(data);
     if (indices) {
         efree(indices);
@@ -1100,6 +1154,27 @@ ZEND_FUNCTION(vio_draw)
         }
     }
 #endif
+
+    /* Backend draw (D3D11/D3D12/Vulkan) */
+    if (strcmp(ctx->backend->name, "opengl") != 0) {
+        if (mesh->index_count > 0 && mesh->backend_ib && ctx->backend->draw_indexed) {
+            vio_draw_indexed_cmd cmd = {0};
+            cmd.vertex_buffer = mesh->backend_vb;
+            cmd.index_buffer = mesh->backend_ib;
+            cmd.index_count = mesh->index_count;
+            cmd.first_index = 0;
+            cmd.vertex_offset = 0;
+            cmd.instance_count = 1;
+            ctx->backend->draw_indexed(&cmd);
+        } else if (mesh->backend_vb && ctx->backend->draw) {
+            vio_draw_cmd cmd = {0};
+            cmd.vertex_buffer = mesh->backend_vb;
+            cmd.vertex_count = mesh->vertex_count;
+            cmd.first_vertex = 0;
+            cmd.instance_count = 1;
+            ctx->backend->draw(&cmd);
+        }
+    }
 }
 
 /* ── Phase 4: Shader / Pipeline / Texture / Buffer functions ──────── */
@@ -1246,6 +1321,46 @@ ZEND_FUNCTION(vio_shader)
         }
     }
 #endif
+
+    /* --- For D3D/Vulkan backends: use backend compile_shader --- */
+    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->compile_shader) {
+        /* Ensure SPIR-V is available (compile from GLSL if needed) */
+        if (!shader->vert_spirv && (format == VIO_SHADER_GLSL_RAW || format == VIO_SHADER_GLSL)) {
+            char *error_msg = NULL;
+            shader->vert_spirv = vio_compile_glsl_to_spirv(
+                Z_STRVAL_P(vert_zval), 0, &shader->vert_spirv_size, &error_msg);
+            if (!shader->vert_spirv) {
+                php_error_docref(NULL, E_WARNING, "VS GLSL->SPIR-V failed: %s", error_msg ? error_msg : "unknown");
+                free(error_msg);
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
+
+            shader->frag_spirv = vio_compile_glsl_to_spirv(
+                Z_STRVAL_P(frag_zval), 1, &shader->frag_spirv_size, &error_msg);
+            if (!shader->frag_spirv) {
+                php_error_docref(NULL, E_WARNING, "FS GLSL->SPIR-V failed: %s", error_msg ? error_msg : "unknown");
+                free(error_msg);
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
+        }
+
+        /* Pass SPIR-V data to backend (it will transpile to HLSL/MSL as needed) */
+        vio_shader_desc desc = {0};
+        desc.format = VIO_SHADER_GLSL; /* Backend expects SPIRV data when format=GLSL */
+        desc.vertex_data = shader->vert_spirv;
+        desc.vertex_size = shader->vert_spirv_size;
+        desc.fragment_data = shader->frag_spirv;
+        desc.fragment_size = shader->frag_spirv_size;
+
+        shader->backend_shader = ctx->backend->compile_shader(&desc);
+        if (!shader->backend_shader) {
+            php_error_docref(NULL, E_WARNING, "Backend shader compilation failed");
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
+    }
 
     shader->valid = 1;
     RETURN_COPY_VALUE(&shader_zval);
@@ -1463,6 +1578,55 @@ ZEND_FUNCTION(vio_pipeline)
         pipe->blend = (vio_blend_mode)zval_get_long(val);
     }
 
+    /* Store backend shader reference for lazy pipeline creation */
+    pipe->backend_shader = shader->backend_shader;
+
+    /* Create backend pipeline (D3D11/D3D12/Vulkan) */
+    if (strcmp(ctx->backend->name, "opengl") != 0 &&
+        shader->backend_shader && ctx->backend->create_pipeline) {
+
+        /* Build vertex layout from shader SPIR-V reflection */
+        vio_vertex_attrib layout[16];
+        int attrib_count = 0;
+
+        if (shader->vert_spirv && shader->vert_spirv_size > 0) {
+            vio_reflect_result reflect = {0};
+            char *err = NULL;
+            if (vio_spirv_reflect(shader->vert_spirv, shader->vert_spirv_size, &reflect, &err) == 0) {
+                for (int i = 0; i < reflect.input_count && i < 16; i++) {
+                    layout[attrib_count].location = reflect.inputs[i].location;
+                    /* Default to VIO_FLOAT3 — reflection doesn't give component count directly,
+                     * but the D3D backend uses the shader blob for input layout creation anyway */
+                    layout[attrib_count].format = VIO_FLOAT3;
+                    /* SPIRV-Cross maps all GLSL inputs to TEXCOORD{location} in HLSL */
+                    layout[attrib_count].usage = VIO_TEXCOORD;
+                    attrib_count++;
+                }
+                vio_reflect_free(&reflect);
+            }
+            if (err) free(err);
+        }
+
+        /* Fallback: at least position attribute */
+        if (attrib_count == 0) {
+            layout[0].location = 0;
+            layout[0].format = VIO_FLOAT3;
+            layout[0].usage = VIO_TEXCOORD;
+            attrib_count = 1;
+        }
+
+        vio_pipeline_desc desc = {0};
+        desc.shader = shader->backend_shader;
+        desc.vertex_layout = layout;
+        desc.vertex_attrib_count = attrib_count;
+        desc.topology = pipe->topology;
+        desc.cull_mode = pipe->cull_mode;
+        desc.depth_test = pipe->depth_test;
+        desc.blend = pipe->blend;
+
+        pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
+    }
+
     pipe->valid = 1;
     RETURN_COPY_VALUE(&pipe_zval);
 }
@@ -1541,6 +1705,12 @@ ZEND_FUNCTION(vio_bind_pipeline)
         }
     }
 #endif
+
+    /* Backend pipeline binding (D3D11/D3D12/Vulkan) */
+    if (strcmp(ctx->backend->name, "opengl") != 0 &&
+        pipe->backend_pipeline && ctx->backend->bind_pipeline) {
+        ctx->backend->bind_pipeline(pipe->backend_pipeline);
+    }
 }
 
 ZEND_FUNCTION(vio_texture)
@@ -1645,6 +1815,21 @@ ZEND_FUNCTION(vio_texture)
     }
 #endif
 
+    /* Backend texture creation (D3D11/D3D12/Vulkan) */
+    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->create_texture) {
+        zval *mipmap_zval = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1);
+
+        vio_texture_desc desc = {0};
+        desc.data = pixels;
+        desc.data_size = (size_t)(w * h * channels);
+        desc.width = w;
+        desc.height = h;
+        desc.filter = tex->filter;
+        desc.wrap = tex->wrap;
+        desc.mipmaps = (mipmap_zval && zend_is_true(mipmap_zval)) ? 1 : 0;
+        tex->backend_texture = ctx->backend->create_texture(&desc);
+    }
+
     if (from_stbi) {
         stbi_image_free(pixels);
     }
@@ -1685,6 +1870,12 @@ ZEND_FUNCTION(vio_bind_texture)
         glBindTexture(GL_TEXTURE_2D, tex->texture_id);
     }
 #endif
+
+    /* Backend texture binding (D3D11/D3D12/Vulkan) */
+    if (strcmp(ctx->backend->name, "opengl") != 0 &&
+        tex->backend_texture && ctx->backend->bind_texture) {
+        ctx->backend->bind_texture(tex->backend_texture, (int)slot);
+    }
 }
 
 ZEND_FUNCTION(vio_uniform_buffer)
@@ -1745,6 +1936,17 @@ ZEND_FUNCTION(vio_uniform_buffer)
     }
 #endif
 
+    /* Backend uniform buffer creation */
+    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->create_buffer) {
+        vio_buffer_desc desc = {0};
+        desc.type = VIO_BUFFER_UNIFORM;
+        desc.data = init_data;
+        desc.size = size;
+        desc.binding = binding;
+        buf->backend_buffer = ctx->backend->create_buffer(&desc);
+        buf->backend = ctx->backend;
+    }
+
     buf->valid = 1;
     RETURN_COPY_VALUE(&buf_zval);
 }
@@ -1781,6 +1983,14 @@ ZEND_FUNCTION(vio_update_buffer)
         glBindBuffer(GL_UNIFORM_BUFFER, 0);
     }
 #endif
+
+    /* Backend buffer update */
+    if (buf->backend_buffer && buf->backend) {
+        const vio_backend *be = (const vio_backend *)buf->backend;
+        if (be->update_buffer) {
+            be->update_buffer(buf->backend_buffer, data, data_len);
+        }
+    }
 }
 
 ZEND_FUNCTION(vio_bind_buffer)
@@ -1890,6 +2100,55 @@ ZEND_FUNCTION(vio_set_uniform)
         }
     }
 #endif
+
+    /* Backend uniform setting (D3D11/D3D12/Vulkan) */
+    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->set_uniform) {
+        if (Z_TYPE_P(value_zval) == IS_LONG) {
+            int v = (int)Z_LVAL_P(value_zval);
+            ctx->backend->set_uniform(name, &v, 1, VIO_UNIFORM_INT);
+        } else if (Z_TYPE_P(value_zval) == IS_DOUBLE) {
+            float v = (float)Z_DVAL_P(value_zval);
+            ctx->backend->set_uniform(name, &v, 1, VIO_UNIFORM_FLOAT);
+        } else if (Z_TYPE_P(value_zval) == IS_ARRAY) {
+            HashTable *ht = Z_ARRVAL_P(value_zval);
+            int count = zend_hash_num_elements(ht);
+            if (count <= 0) goto uniform_done;
+
+            float vals[16];
+            int i = 0;
+
+            /* Check if nested array (matrix) */
+            zval *first = zend_hash_index_find(ht, 0);
+            if (first && Z_TYPE_P(first) == IS_ARRAY) {
+                zval *row;
+                ZEND_HASH_FOREACH_VAL(ht, row) {
+                    if (Z_TYPE_P(row) == IS_ARRAY) {
+                        zval *elem;
+                        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(row), elem) {
+                            if (i < 16) vals[i++] = (float)zval_get_double(elem);
+                        } ZEND_HASH_FOREACH_END();
+                    }
+                } ZEND_HASH_FOREACH_END();
+            } else {
+                zval *elem;
+                ZEND_HASH_FOREACH_VAL(ht, elem) {
+                    if (i < 16) vals[i++] = (float)zval_get_double(elem);
+                } ZEND_HASH_FOREACH_END();
+            }
+
+            int type;
+            switch (i) {
+                case 2:  type = VIO_UNIFORM_VEC2; break;
+                case 3:  type = VIO_UNIFORM_VEC3; break;
+                case 4:  type = VIO_UNIFORM_VEC4; break;
+                case 9:  type = VIO_UNIFORM_MAT3; break;
+                case 16: type = VIO_UNIFORM_MAT4; break;
+                default: goto uniform_done;
+            }
+            ctx->backend->set_uniform(name, vals, 1, type);
+        }
+    }
+uniform_done: ;
 }
 
 /* ── Phase 5: 2D API functions ───────────────────────────────────── */
@@ -4145,6 +4404,11 @@ ZEND_FUNCTION(vio_viewport)
         glViewport((GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h);
     }
 #endif
+
+    /* Backend viewport */
+    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->set_viewport) {
+        ctx->backend->set_viewport((int)x, (int)y, (int)w, (int)h);
+    }
 }
 
 ZEND_FUNCTION(vio_draw_3d)
@@ -4257,6 +4521,31 @@ ZEND_FUNCTION(vio_draw_instanced)
         glDeleteBuffers(1, &instance_vbo);
     }
 #endif
+
+    /* Backend instanced draw (D3D11/D3D12/Vulkan) */
+    if (strcmp(ctx->backend->name, "opengl") != 0 && mesh->backend_vb) {
+        size_t total_floats = (size_t)instance_count * 16;
+        size_t arr_count = zend_hash_num_elements(matrices_ht);
+        if (arr_count < total_floats) return;
+
+        /* TODO: instance matrix buffers for D3D need a different approach
+         * (per-instance vertex buffer or structured buffer).
+         * For now: draw with instance_count, matrices via uniform buffer. */
+        if (mesh->index_count > 0 && mesh->backend_ib && ctx->backend->draw_indexed) {
+            vio_draw_indexed_cmd cmd = {0};
+            cmd.vertex_buffer = mesh->backend_vb;
+            cmd.index_buffer = mesh->backend_ib;
+            cmd.index_count = mesh->index_count;
+            cmd.instance_count = (int)instance_count;
+            ctx->backend->draw_indexed(&cmd);
+        } else if (ctx->backend->draw) {
+            vio_draw_cmd cmd = {0};
+            cmd.vertex_buffer = mesh->backend_vb;
+            cmd.vertex_count = mesh->vertex_count;
+            cmd.instance_count = (int)instance_count;
+            ctx->backend->draw(&cmd);
+        }
+    }
 }
 
 ZEND_FUNCTION(vio_render_target)
@@ -4347,6 +4636,229 @@ ZEND_FUNCTION(vio_render_target)
             zval_ptr_dtor(&rt_zval);
             RETURN_FALSE;
         }
+
+        rt->backend_type = VIO_RT_BACKEND_OPENGL;
+    }
+#endif
+
+#ifdef HAVE_D3D11
+    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+        HRESULT hr;
+
+        /* Depth texture */
+        D3D11_TEXTURE2D_DESC depth_desc = {0};
+        depth_desc.Width = width;
+        depth_desc.Height = height;
+        depth_desc.MipLevels = 1;
+        depth_desc.ArraySize = 1;
+        depth_desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+        depth_desc.SampleDesc.Count = 1;
+        depth_desc.Usage = D3D11_USAGE_DEFAULT;
+        depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+
+        ID3D11Texture2D *depth_tex = NULL;
+        hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &depth_desc, NULL, &depth_tex);
+        if (FAILED(hr)) {
+            php_error_docref(NULL, E_WARNING, "D3D11: Failed to create depth texture (0x%08lx)", hr);
+            zval_ptr_dtor(&rt_zval);
+            RETURN_FALSE;
+        }
+
+        /* DSV */
+        D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
+        dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+
+        ID3D11DepthStencilView *dsv = NULL;
+        hr = ID3D11Device_CreateDepthStencilView(vio_d3d11.device, (ID3D11Resource *)depth_tex,
+                                                  &dsv_desc, &dsv);
+        if (FAILED(hr)) {
+            ID3D11Texture2D_Release(depth_tex);
+            php_error_docref(NULL, E_WARNING, "D3D11: Failed to create DSV (0x%08lx)", hr);
+            zval_ptr_dtor(&rt_zval);
+            RETURN_FALSE;
+        }
+
+        /* SRV for depth (for shadow map sampling) */
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+        srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = 1;
+
+        ID3D11ShaderResourceView *depth_srv = NULL;
+        ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)depth_tex,
+                                               &srv_desc, &depth_srv);
+
+        rt->d3d11_dsv = dsv;
+        rt->d3d11_depth_tex = depth_tex;
+        rt->d3d11_depth_srv = depth_srv;
+
+        if (!depth_only) {
+            /* Color texture */
+            D3D11_TEXTURE2D_DESC color_desc = {0};
+            color_desc.Width = width;
+            color_desc.Height = height;
+            color_desc.MipLevels = 1;
+            color_desc.ArraySize = 1;
+            color_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            color_desc.SampleDesc.Count = 1;
+            color_desc.Usage = D3D11_USAGE_DEFAULT;
+            color_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+            ID3D11Texture2D *color_tex = NULL;
+            hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &color_desc, NULL, &color_tex);
+            if (FAILED(hr)) {
+                ID3D11DepthStencilView_Release(dsv);
+                ID3D11Texture2D_Release(depth_tex);
+                if (depth_srv) ID3D11ShaderResourceView_Release(depth_srv);
+                php_error_docref(NULL, E_WARNING, "D3D11: Failed to create color texture (0x%08lx)", hr);
+                zval_ptr_dtor(&rt_zval);
+                RETURN_FALSE;
+            }
+
+            ID3D11RenderTargetView *rtv = NULL;
+            hr = ID3D11Device_CreateRenderTargetView(vio_d3d11.device, (ID3D11Resource *)color_tex,
+                                                      NULL, &rtv);
+            if (FAILED(hr)) {
+                ID3D11Texture2D_Release(color_tex);
+                ID3D11DepthStencilView_Release(dsv);
+                ID3D11Texture2D_Release(depth_tex);
+                if (depth_srv) ID3D11ShaderResourceView_Release(depth_srv);
+                php_error_docref(NULL, E_WARNING, "D3D11: Failed to create RTV (0x%08lx)", hr);
+                zval_ptr_dtor(&rt_zval);
+                RETURN_FALSE;
+            }
+
+            rt->d3d11_rtv = rtv;
+            rt->d3d11_color_tex = color_tex;
+        }
+
+        rt->backend_type = VIO_RT_BACKEND_D3D11;
+    }
+#endif
+
+#ifdef HAVE_D3D12
+    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+        HRESULT hr;
+
+        /* Create dedicated RTV descriptor heap (1 descriptor) */
+        if (!depth_only) {
+            D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {0};
+            rtv_heap_desc.NumDescriptors = 1;
+            rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+
+            ID3D12DescriptorHeap *rtv_heap = NULL;
+            hr = ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &rtv_heap_desc,
+                                                    &IID_ID3D12DescriptorHeap, (void **)&rtv_heap);
+            if (FAILED(hr)) {
+                php_error_docref(NULL, E_WARNING, "D3D12: Failed to create RTV heap (0x%08lx)", hr);
+                zval_ptr_dtor(&rt_zval);
+                RETURN_FALSE;
+            }
+            rt->d3d12_rtv_heap = rtv_heap;
+
+            /* Color resource */
+            D3D12_HEAP_PROPERTIES heap_props = {0};
+            heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+            D3D12_RESOURCE_DESC res_desc = {0};
+            res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            res_desc.Width = width;
+            res_desc.Height = height;
+            res_desc.DepthOrArraySize = 1;
+            res_desc.MipLevels = 1;
+            res_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            res_desc.SampleDesc.Count = 1;
+            res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+            D3D12_CLEAR_VALUE clear_val = {0};
+            clear_val.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+            ID3D12Resource *color_res = NULL;
+            hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props,
+                D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                &clear_val, &IID_ID3D12Resource, (void **)&color_res);
+            if (FAILED(hr)) {
+                ID3D12DescriptorHeap_Release(rtv_heap);
+                php_error_docref(NULL, E_WARNING, "D3D12: Failed to create color resource (0x%08lx)", hr);
+                zval_ptr_dtor(&rt_zval);
+                RETURN_FALSE;
+            }
+            rt->d3d12_color_resource = color_res;
+
+            /* Create RTV */
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtv_heap, &rtv_handle);
+            ID3D12Device_CreateRenderTargetView(vio_d3d12.device, color_res, NULL, rtv_handle);
+        }
+
+        /* DSV descriptor heap */
+        D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc = {0};
+        dsv_heap_desc.NumDescriptors = 1;
+        dsv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+
+        ID3D12DescriptorHeap *dsv_heap = NULL;
+        hr = ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &dsv_heap_desc,
+                                                &IID_ID3D12DescriptorHeap, (void **)&dsv_heap);
+        if (FAILED(hr)) {
+            if (rt->d3d12_color_resource) {
+                ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
+                rt->d3d12_color_resource = NULL;
+            }
+            if (rt->d3d12_rtv_heap) {
+                ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap);
+                rt->d3d12_rtv_heap = NULL;
+            }
+            php_error_docref(NULL, E_WARNING, "D3D12: Failed to create DSV heap (0x%08lx)", hr);
+            zval_ptr_dtor(&rt_zval);
+            RETURN_FALSE;
+        }
+        rt->d3d12_dsv_heap = dsv_heap;
+
+        /* Depth resource */
+        D3D12_HEAP_PROPERTIES depth_heap_props = {0};
+        depth_heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC depth_res_desc = {0};
+        depth_res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        depth_res_desc.Width = width;
+        depth_res_desc.Height = height;
+        depth_res_desc.DepthOrArraySize = 1;
+        depth_res_desc.MipLevels = 1;
+        depth_res_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        depth_res_desc.SampleDesc.Count = 1;
+        depth_res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+        D3D12_CLEAR_VALUE depth_clear = {0};
+        depth_clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        depth_clear.DepthStencil.Depth = 1.0f;
+
+        ID3D12Resource *depth_res = NULL;
+        hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &depth_heap_props,
+            D3D12_HEAP_FLAG_NONE, &depth_res_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            &depth_clear, &IID_ID3D12Resource, (void **)&depth_res);
+        if (FAILED(hr)) {
+            ID3D12DescriptorHeap_Release(dsv_heap);
+            if (rt->d3d12_color_resource) {
+                ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
+                rt->d3d12_color_resource = NULL;
+            }
+            if (rt->d3d12_rtv_heap) {
+                ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap);
+                rt->d3d12_rtv_heap = NULL;
+            }
+            php_error_docref(NULL, E_WARNING, "D3D12: Failed to create depth resource (0x%08lx)", hr);
+            zval_ptr_dtor(&rt_zval);
+            RETURN_FALSE;
+        }
+        rt->d3d12_depth_resource = depth_res;
+
+        /* Create DSV */
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsv_heap, &dsv_handle);
+        ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, NULL, dsv_handle);
+
+        rt->backend_type = VIO_RT_BACKEND_D3D12;
     }
 #endif
 
@@ -4378,9 +4890,67 @@ ZEND_FUNCTION(vio_bind_render_target)
     }
 
 #ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
+    if (rt->backend_type == VIO_RT_BACKEND_OPENGL && vio_gl.initialized) {
         glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
         glViewport(0, 0, rt->width, rt->height);
+    }
+#endif
+
+#ifdef HAVE_D3D11
+    if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
+        ID3D11RenderTargetView *rtv = (ID3D11RenderTargetView *)rt->d3d11_rtv;
+        ID3D11DepthStencilView *dsv = (ID3D11DepthStencilView *)rt->d3d11_dsv;
+
+        if (rt->depth_only) {
+            ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 0, NULL, dsv);
+            vio_d3d11.current_rtv = NULL;
+        } else {
+            ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 1, &rtv, dsv);
+            vio_d3d11.current_rtv = rtv;
+        }
+        vio_d3d11.current_dsv = dsv;
+        vio_d3d11.current_rt_width = rt->width;
+        vio_d3d11.current_rt_height = rt->height;
+
+        D3D11_VIEWPORT vp = {0};
+        vp.Width = (float)rt->width;
+        vp.Height = (float)rt->height;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
+    }
+#endif
+
+#ifdef HAVE_D3D12
+    if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized) {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            (ID3D12DescriptorHeap *)rt->d3d12_dsv_heap, &dsv_handle);
+
+        if (rt->depth_only) {
+            ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 0, NULL, FALSE, &dsv_handle);
+            vio_d3d12.current_has_rtv = 0;
+        } else {
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+                (ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &rtv_handle);
+            ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
+            vio_d3d12.current_rtv = rtv_handle;
+            vio_d3d12.current_has_rtv = 1;
+        }
+        vio_d3d12.current_dsv = dsv_handle;
+        vio_d3d12.current_rt_width = rt->width;
+        vio_d3d12.current_rt_height = rt->height;
+
+        D3D12_VIEWPORT vp = {0};
+        vp.Width = (float)rt->width;
+        vp.Height = (float)rt->height;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, 1, &vp);
+
+        D3D12_RECT scissor = {0, 0, rt->width, rt->height};
+        ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
     }
 #endif
 }
@@ -4414,6 +4984,54 @@ ZEND_FUNCTION(vio_unbind_render_target)
                 glViewport(0, 0, fb_w, fb_h);
             }
         }
+    }
+#endif
+
+#ifdef HAVE_D3D11
+    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+        /* Restore main backbuffer RTV + DSV */
+        vio_d3d11.current_rtv = vio_d3d11.rtv;
+        vio_d3d11.current_dsv = vio_d3d11.dsv;
+        vio_d3d11.current_rt_width = vio_d3d11.width;
+        vio_d3d11.current_rt_height = vio_d3d11.height;
+
+        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 1,
+                                               &vio_d3d11.rtv, vio_d3d11.dsv);
+
+        D3D11_VIEWPORT vp = {0};
+        vp.Width = (float)vio_d3d11.width;
+        vp.Height = (float)vio_d3d11.height;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
+    }
+#endif
+
+#ifdef HAVE_D3D12
+    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+        /* Restore main swapchain render target */
+        vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
+
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.dsv_heap, &dsv_handle);
+        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1,
+                                                      &frame->rtv_handle, FALSE, &dsv_handle);
+
+        vio_d3d12.current_rtv = frame->rtv_handle;
+        vio_d3d12.current_dsv = dsv_handle;
+        vio_d3d12.current_rt_width = vio_d3d12.width;
+        vio_d3d12.current_rt_height = vio_d3d12.height;
+        vio_d3d12.current_has_rtv = 1;
+
+        D3D12_VIEWPORT vp = {0};
+        vp.Width = (float)vio_d3d12.width;
+        vp.Height = (float)vio_d3d12.height;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, 1, &vp);
+
+        D3D12_RECT scissor = {0, 0, vio_d3d12.width, vio_d3d12.height};
+        ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
     }
 #endif
 }

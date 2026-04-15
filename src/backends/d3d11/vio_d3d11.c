@@ -345,7 +345,7 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
         UINT offset = 0;
         for (int i = 0; i < desc->vertex_attrib_count; i++) {
             elements[i].SemanticName = vio_usage_to_semantic(desc->vertex_layout[i].usage);
-            elements[i].SemanticIndex = 0;
+            elements[i].SemanticIndex = desc->vertex_layout[i].location;
             elements[i].Format = vio_format_to_dxgi(desc->vertex_layout[i].format);
             elements[i].InputSlot = 0;
             elements[i].AlignedByteOffset = offset;
@@ -643,45 +643,64 @@ static void *d3d11_compile_shader(vio_shader_desc *desc)
     char *allocated_vs = NULL;
     char *allocated_ps = NULL;
 
-    if (desc->format == VIO_SHADER_GLSL || desc->format == VIO_SHADER_AUTO) {
-        /* GLSL -> SPIR-V -> HLSL pipeline */
+    if (desc->format == VIO_SHADER_GLSL || desc->format == VIO_SHADER_GLSL_RAW || desc->format == VIO_SHADER_AUTO) {
+        /* GLSL/SPIR-V -> HLSL pipeline */
         char *err = NULL;
+        uint32_t *vs_spirv = NULL;
+        uint32_t *ps_spirv = NULL;
         size_t vs_spirv_size = 0, ps_spirv_size = 0;
+        int free_vs_spirv = 0, free_ps_spirv = 0;
 
-        /* Compile vertex shader: GLSL -> SPIR-V */
-        uint32_t *vs_spirv = vio_compile_glsl_to_spirv(
-            (const char *)desc->vertex_data, 0 /* vertex */, &vs_spirv_size, &err);
-        if (!vs_spirv) {
-            php_error_docref(NULL, E_WARNING, "D3D11: VS GLSL->SPIR-V failed: %s", err ? err : "unknown");
-            if (err) free(err);
-            free(shader);
-            return NULL;
+        /* Check if data is already SPIR-V (magic number 0x07230203) */
+        int vs_is_spirv = (desc->vertex_size >= 4 &&
+            *(const uint32_t *)desc->vertex_data == 0x07230203);
+        int ps_is_spirv = (desc->fragment_size >= 4 &&
+            *(const uint32_t *)desc->fragment_data == 0x07230203);
+
+        if (vs_is_spirv) {
+            vs_spirv = (uint32_t *)desc->vertex_data;
+            vs_spirv_size = desc->vertex_size;
+        } else {
+            vs_spirv = vio_compile_glsl_to_spirv(
+                (const char *)desc->vertex_data, 0, &vs_spirv_size, &err);
+            if (!vs_spirv) {
+                php_error_docref(NULL, E_WARNING, "D3D11: VS GLSL->SPIR-V failed: %s", err ? err : "unknown");
+                if (err) free(err);
+                free(shader);
+                return NULL;
+            }
+            free_vs_spirv = 1;
         }
 
-        /* Compile fragment shader: GLSL -> SPIR-V */
-        uint32_t *ps_spirv = vio_compile_glsl_to_spirv(
-            (const char *)desc->fragment_data, 1 /* fragment */, &ps_spirv_size, &err);
-        if (!ps_spirv) {
-            php_error_docref(NULL, E_WARNING, "D3D11: PS GLSL->SPIR-V failed: %s", err ? err : "unknown");
-            if (err) free(err);
-            free(vs_spirv);
-            free(shader);
-            return NULL;
+        if (ps_is_spirv) {
+            ps_spirv = (uint32_t *)desc->fragment_data;
+            ps_spirv_size = desc->fragment_size;
+        } else {
+            ps_spirv = vio_compile_glsl_to_spirv(
+                (const char *)desc->fragment_data, 1, &ps_spirv_size, &err);
+            if (!ps_spirv) {
+                php_error_docref(NULL, E_WARNING, "D3D11: PS GLSL->SPIR-V failed: %s", err ? err : "unknown");
+                if (err) free(err);
+                if (free_vs_spirv) free(vs_spirv);
+                free(shader);
+                return NULL;
+            }
+            free_ps_spirv = 1;
         }
 
         /* SPIR-V -> HLSL (Shader Model 5.0) */
         allocated_vs = vio_spirv_to_hlsl(vs_spirv, vs_spirv_size, 50, &err);
-        free(vs_spirv);
+        if (free_vs_spirv) free(vs_spirv);
         if (!allocated_vs) {
             php_error_docref(NULL, E_WARNING, "D3D11: VS SPIR-V->HLSL failed: %s", err ? err : "unknown");
             if (err) free(err);
-            free(ps_spirv);
+            if (free_ps_spirv) free(ps_spirv);
             free(shader);
             return NULL;
         }
 
         allocated_ps = vio_spirv_to_hlsl(ps_spirv, ps_spirv_size, 50, &err);
-        free(ps_spirv);
+        if (free_ps_spirv) free(ps_spirv);
         if (!allocated_ps) {
             php_error_docref(NULL, E_WARNING, "D3D11: PS SPIR-V->HLSL failed: %s", err ? err : "unknown");
             if (err) free(err);
@@ -768,6 +787,12 @@ static void d3d11_destroy_shader(void *shader_ptr)
 
 static void d3d11_begin_frame(void)
 {
+    /* Reset to backbuffer */
+    vio_d3d11.current_rtv = vio_d3d11.rtv;
+    vio_d3d11.current_dsv = vio_d3d11.dsv;
+    vio_d3d11.current_rt_width = vio_d3d11.width;
+    vio_d3d11.current_rt_height = vio_d3d11.height;
+
     /* Set render target and viewport */
     ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 1,
                                            &vio_d3d11.rtv, vio_d3d11.dsv);
@@ -840,11 +865,11 @@ static void d3d11_present(void)
 static void d3d11_clear(float r, float g, float b, float a)
 {
     float color[4] = {r, g, b, a};
-    if (vio_d3d11.rtv) {
-        ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, vio_d3d11.rtv, color);
+    if (vio_d3d11.current_rtv) {
+        ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, vio_d3d11.current_rtv, color);
     }
-    if (vio_d3d11.dsv) {
-        ID3D11DeviceContext_ClearDepthStencilView(vio_d3d11.context, vio_d3d11.dsv,
+    if (vio_d3d11.current_dsv) {
+        ID3D11DeviceContext_ClearDepthStencilView(vio_d3d11.context, vio_d3d11.current_dsv,
                                                    D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
                                                    1.0f, 0);
     }
@@ -877,6 +902,93 @@ static int d3d11_supports_feature(vio_feature feature)
     }
 }
 
+/* ── State binding ────────────────────────────────────────────────── */
+
+static void d3d11_set_uniform(const char *name, const void *data, int count, int type)
+{
+    /*
+     * D3D11 uniform strategy: create/reuse per-name constant buffers.
+     * HLSL transpiled from GLSL via SPIRV-Cross maps uniforms to:
+     *   cbuffer _Global { ... }  at register(b0)
+     * We maintain a single "global" constant buffer that gets updated
+     * with individual uniform values packed sequentially.
+     *
+     * For now: use root constant approach — pack all uniforms into a
+     * single dynamic constant buffer at b0, updated each frame.
+     */
+
+    /* Size in bytes based on type */
+    size_t data_size;
+    switch (type) {
+        case VIO_UNIFORM_INT:   data_size = sizeof(int) * count; break;
+        case VIO_UNIFORM_FLOAT: data_size = sizeof(float) * count; break;
+        case VIO_UNIFORM_VEC2:  data_size = sizeof(float) * 2 * count; break;
+        case VIO_UNIFORM_VEC3:  data_size = sizeof(float) * 3 * count; break;
+        case VIO_UNIFORM_VEC4:  data_size = sizeof(float) * 4 * count; break;
+        case VIO_UNIFORM_MAT3:  data_size = sizeof(float) * 9 * count; break;
+        case VIO_UNIFORM_MAT4:  data_size = sizeof(float) * 16 * count; break;
+        default: return;
+    }
+
+    /* Create a temporary constant buffer, update, bind to b0 */
+    /* TODO: use a persistent per-shader constant buffer with offset tracking */
+    D3D11_BUFFER_DESC cb_desc = {0};
+    cb_desc.ByteWidth = (UINT)((data_size + 15) & ~15); /* 16-byte align */
+    cb_desc.Usage = D3D11_USAGE_DEFAULT;
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+    D3D11_SUBRESOURCE_DATA init_data = {0};
+    init_data.pSysMem = data;
+
+    ID3D11Buffer *cb = NULL;
+    HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &cb_desc, &init_data, &cb);
+    if (FAILED(hr)) return;
+
+    ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb);
+    ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb);
+    ID3D11Buffer_Release(cb);
+}
+
+static void d3d11_bind_texture(void *texture, int slot)
+{
+    if (!texture) return;
+    vio_d3d11_texture *tex = (vio_d3d11_texture *)texture;
+
+    if (tex->srv) {
+        ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, (UINT)slot, 1, &tex->srv);
+    }
+    if (tex->sampler) {
+        ID3D11DeviceContext_PSSetSamplers(vio_d3d11.context, (UINT)slot, 1, &tex->sampler);
+    }
+}
+
+static void d3d11_set_viewport(int x, int y, int width, int height)
+{
+    D3D11_VIEWPORT vp = {0};
+    vp.TopLeftX = (float)x;
+    vp.TopLeftY = (float)y;
+    vp.Width = (float)width;
+    vp.Height = (float)height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
+}
+
+/* ── Setup context (called from vio_create after window creation) ── */
+
+int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg)
+{
+    vio_d3d11.glfw_window = glfw_window;
+
+    /* Create surface (swapchain + render targets) */
+    void *surface = d3d11_create_surface(cfg);
+    if (!surface) {
+        return -1;
+    }
+
+    return 0;
+}
+
 /* ── Backend registration ─────────────────────────────────────────── */
 
 static const vio_backend d3d11_backend = {
@@ -903,6 +1015,9 @@ static const vio_backend d3d11_backend = {
     .draw_indexed      = d3d11_draw_indexed,
     .present           = d3d11_present,
     .clear             = d3d11_clear,
+    .set_uniform       = d3d11_set_uniform,
+    .bind_texture      = d3d11_bind_texture,
+    .set_viewport      = d3d11_set_viewport,
     .dispatch_compute  = d3d11_dispatch_compute,
     .supports_feature  = d3d11_supports_feature,
 };

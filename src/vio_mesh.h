@@ -16,6 +16,8 @@ typedef struct _vio_mesh_object {
     unsigned int vao;
     unsigned int vbo;
     unsigned int ebo;
+    void        *backend_vb;      /* Backend vertex buffer (D3D11/D3D12/Vulkan) */
+    void        *backend_ib;      /* Backend index buffer (D3D11/D3D12/Vulkan) */
     int          vertex_count;
     int          index_count;
     int          has_colors;      /* 1 if vertex data includes colors */

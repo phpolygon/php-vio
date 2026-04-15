@@ -19,7 +19,9 @@ static zend_object *vio_buffer_create_object(zend_class_entry *ce)
 {
     vio_buffer_object *buf = zend_object_alloc(sizeof(vio_buffer_object), ce);
 
-    buf->buffer_id = 0;
+    buf->buffer_id      = 0;
+    buf->backend_buffer = NULL;
+    buf->backend        = NULL;
     buf->type      = VIO_BUFFER_UNIFORM;
     buf->size      = 0;
     buf->binding   = 0;

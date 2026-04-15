@@ -19,7 +19,8 @@ static zend_object *vio_texture_create_object(zend_class_entry *ce)
 {
     vio_texture_object *tex = zend_object_alloc(sizeof(vio_texture_object), ce);
 
-    tex->texture_id = 0;
+    tex->texture_id      = 0;
+    tex->backend_texture = NULL;
     tex->width      = 0;
     tex->height     = 0;
     tex->channels   = 0;

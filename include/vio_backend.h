@@ -49,6 +49,11 @@ typedef struct _vio_backend {
     void  (*present)(void);
     void  (*clear)(float r, float g, float b, float a);
 
+    /* State binding */
+    void  (*set_uniform)(const char *name, const void *data, int count, int type);
+    void  (*bind_texture)(void *texture, int slot);
+    void  (*set_viewport)(int x, int y, int width, int height);
+
     /* Compute (optional) */
     void  (*dispatch_compute)(vio_compute_cmd *cmd);
 

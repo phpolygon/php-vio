@@ -14,6 +14,7 @@
 
 typedef struct _vio_texture_object {
     unsigned int texture_id;    /* GL texture ID */
+    void        *backend_texture; /* Backend texture (D3D11/D3D12/Vulkan) */
     int          width;
     int          height;
     int          channels;

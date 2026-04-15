@@ -66,6 +66,12 @@ typedef struct _vio_d3d11_state {
     ID3D11DepthStencilView *dsv;
     ID3D11Texture2D        *depth_buffer;
 
+    /* Currently bound render target (NULL = backbuffer) */
+    ID3D11RenderTargetView *current_rtv;
+    ID3D11DepthStencilView *current_dsv;
+    int current_rt_width;
+    int current_rt_height;
+
     /* State */
     int   initialized;
     float clear_r, clear_g, clear_b, clear_a;

@@ -97,6 +97,13 @@ typedef struct _vio_d3d12_state {
     /* Root signature (shared across all pipelines) */
     ID3D12RootSignature       *root_signature;
 
+    /* Currently bound render target (NULL = backbuffer) */
+    D3D12_CPU_DESCRIPTOR_HANDLE current_rtv;
+    D3D12_CPU_DESCRIPTOR_HANDLE current_dsv;
+    int current_rt_width;
+    int current_rt_height;
+    int current_has_rtv;  /* 0 = depth-only when offscreen */
+
     /* State */
     int   initialized;
     float clear_r, clear_g, clear_b, clear_a;

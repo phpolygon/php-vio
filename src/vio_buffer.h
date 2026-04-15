@@ -13,12 +13,14 @@
 #include "../include/vio_types.h"
 
 typedef struct _vio_buffer_object {
-    unsigned int    buffer_id;     /* GL buffer ID */
-    vio_buffer_type type;
-    size_t          size;
-    int             binding;       /* UBO binding point */
-    int             valid;
-    zend_object     std;
+    unsigned int        buffer_id;     /* GL buffer ID */
+    void               *backend_buffer; /* Backend buffer (D3D11/D3D12/Vulkan) */
+    const void         *backend;       /* vio_backend pointer for update_buffer */
+    vio_buffer_type     type;
+    size_t              size;
+    int                 binding;       /* UBO binding point */
+    int                 valid;
+    zend_object         std;
 } vio_buffer_object;
 
 extern zend_class_entry *vio_buffer_ce;

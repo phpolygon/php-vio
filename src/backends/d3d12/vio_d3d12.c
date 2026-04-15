@@ -651,7 +651,7 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
         UINT offset = 0;
         for (int i = 0; i < desc->vertex_attrib_count; i++) {
             elements[i].SemanticName = vio_usage_to_semantic(desc->vertex_layout[i].usage);
-            elements[i].SemanticIndex = 0;
+            elements[i].SemanticIndex = desc->vertex_layout[i].location;
             elements[i].Format = vio_format_to_dxgi(desc->vertex_layout[i].format);
             elements[i].InputSlot = 0;
             elements[i].AlignedByteOffset = offset;
@@ -1023,42 +1023,63 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
     char *allocated_vs = NULL;
     char *allocated_ps = NULL;
 
-    if (desc->format == VIO_SHADER_GLSL || desc->format == VIO_SHADER_AUTO) {
+    if (desc->format == VIO_SHADER_GLSL || desc->format == VIO_SHADER_GLSL_RAW || desc->format == VIO_SHADER_AUTO) {
         char *err = NULL;
+        uint32_t *vs_spirv = NULL;
+        uint32_t *ps_spirv = NULL;
         size_t vs_spirv_size = 0, ps_spirv_size = 0;
+        int free_vs_spirv = 0, free_ps_spirv = 0;
 
-        uint32_t *vs_spirv = vio_compile_glsl_to_spirv(
-            (const char *)desc->vertex_data, 0, &vs_spirv_size, &err);
-        if (!vs_spirv) {
-            php_error_docref(NULL, E_WARNING, "D3D12: VS GLSL->SPIR-V failed: %s", err ? err : "unknown");
-            if (err) free(err);
-            free(shader);
-            return NULL;
+        /* Check if data is already SPIR-V */
+        int vs_is_spirv = (desc->vertex_size >= 4 &&
+            *(const uint32_t *)desc->vertex_data == 0x07230203);
+        int ps_is_spirv = (desc->fragment_size >= 4 &&
+            *(const uint32_t *)desc->fragment_data == 0x07230203);
+
+        if (vs_is_spirv) {
+            vs_spirv = (uint32_t *)desc->vertex_data;
+            vs_spirv_size = desc->vertex_size;
+        } else {
+            vs_spirv = vio_compile_glsl_to_spirv(
+                (const char *)desc->vertex_data, 0, &vs_spirv_size, &err);
+            if (!vs_spirv) {
+                php_error_docref(NULL, E_WARNING, "D3D12: VS GLSL->SPIR-V failed: %s", err ? err : "unknown");
+                if (err) free(err);
+                free(shader);
+                return NULL;
+            }
+            free_vs_spirv = 1;
         }
 
-        uint32_t *ps_spirv = vio_compile_glsl_to_spirv(
-            (const char *)desc->fragment_data, 1, &ps_spirv_size, &err);
-        if (!ps_spirv) {
-            php_error_docref(NULL, E_WARNING, "D3D12: PS GLSL->SPIR-V failed: %s", err ? err : "unknown");
-            if (err) free(err);
-            free(vs_spirv);
-            free(shader);
-            return NULL;
+        if (ps_is_spirv) {
+            ps_spirv = (uint32_t *)desc->fragment_data;
+            ps_spirv_size = desc->fragment_size;
+        } else {
+            ps_spirv = vio_compile_glsl_to_spirv(
+                (const char *)desc->fragment_data, 1, &ps_spirv_size, &err);
+            if (!ps_spirv) {
+                php_error_docref(NULL, E_WARNING, "D3D12: PS GLSL->SPIR-V failed: %s", err ? err : "unknown");
+                if (err) free(err);
+                if (free_vs_spirv) free(vs_spirv);
+                free(shader);
+                return NULL;
+            }
+            free_ps_spirv = 1;
         }
 
         /* SPIR-V -> HLSL SM 5.1 (D3D12 needs register spaces) */
         allocated_vs = vio_spirv_to_hlsl(vs_spirv, vs_spirv_size, 51, &err);
-        free(vs_spirv);
+        if (free_vs_spirv) free(vs_spirv);
         if (!allocated_vs) {
             php_error_docref(NULL, E_WARNING, "D3D12: VS SPIR-V->HLSL failed: %s", err ? err : "unknown");
             if (err) free(err);
-            free(ps_spirv);
+            if (free_ps_spirv) free(ps_spirv);
             free(shader);
             return NULL;
         }
 
         allocated_ps = vio_spirv_to_hlsl(ps_spirv, ps_spirv_size, 51, &err);
-        free(ps_spirv);
+        if (free_ps_spirv) free(ps_spirv);
         if (!allocated_ps) {
             php_error_docref(NULL, E_WARNING, "D3D12: PS SPIR-V->HLSL failed: %s", err ? err : "unknown");
             if (err) free(err);
@@ -1149,6 +1170,13 @@ static void d3d12_begin_frame(void)
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.dsv_heap, &dsv_handle);
     ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1,
                                                   &frame->rtv_handle, FALSE, &dsv_handle);
+
+    /* Track current render target */
+    vio_d3d12.current_rtv = frame->rtv_handle;
+    vio_d3d12.current_dsv = dsv_handle;
+    vio_d3d12.current_rt_width = vio_d3d12.width;
+    vio_d3d12.current_rt_height = vio_d3d12.height;
+    vio_d3d12.current_has_rtv = 1;
 
     /* Set viewport and scissor */
     D3D12_VIEWPORT vp = {0};
@@ -1250,17 +1278,17 @@ static void d3d12_present(void)
 
 static void d3d12_clear(float r, float g, float b, float a)
 {
-    vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
     float color[4] = {r, g, b, a};
 
-    ID3D12GraphicsCommandList_ClearRenderTargetView(vio_d3d12.cmd_list,
-                                                     frame->rtv_handle,
-                                                     color, 0, NULL);
+    /* Clear whichever render target is currently bound */
+    if (vio_d3d12.current_has_rtv) {
+        ID3D12GraphicsCommandList_ClearRenderTargetView(vio_d3d12.cmd_list,
+                                                         vio_d3d12.current_rtv,
+                                                         color, 0, NULL);
+    }
 
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
-    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.dsv_heap, &dsv_handle);
     ID3D12GraphicsCommandList_ClearDepthStencilView(vio_d3d12.cmd_list,
-                                                     dsv_handle,
+                                                     vio_d3d12.current_dsv,
                                                      D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                                                      1.0f, 0, 0, NULL);
 }
@@ -1292,6 +1320,75 @@ static int d3d12_supports_feature(vio_feature feature)
     }
 }
 
+/* ── State binding ────────────────────────────────────────────────── */
+
+static void d3d12_set_uniform(const char *name, const void *data, int count, int type)
+{
+    /* D3D12: uniforms are mapped to root constants or CBV descriptors.
+     * SPIRV-Cross transpiles GLSL uniforms into a cbuffer at register(b0).
+     * Use SetGraphicsRoot32BitConstants for small uniform data. */
+
+    size_t float_count;
+    switch (type) {
+        case VIO_UNIFORM_INT:   float_count = 1 * count; break;
+        case VIO_UNIFORM_FLOAT: float_count = 1 * count; break;
+        case VIO_UNIFORM_VEC2:  float_count = 2 * count; break;
+        case VIO_UNIFORM_VEC3:  float_count = 3 * count; break;
+        case VIO_UNIFORM_VEC4:  float_count = 4 * count; break;
+        case VIO_UNIFORM_MAT3:  float_count = 9 * count; break;
+        case VIO_UNIFORM_MAT4:  float_count = 16 * count; break;
+        default: return;
+    }
+
+    /* Root parameter 0 = 32-bit constants (set in root signature creation) */
+    if (float_count > 0 && float_count <= 64) {
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
+            vio_d3d12.cmd_list, 0, (UINT)float_count, data, 0);
+    }
+}
+
+static void d3d12_bind_texture(void *texture, int slot)
+{
+    if (!texture) return;
+    vio_d3d12_texture *tex = (vio_d3d12_texture *)texture;
+
+    /* Bind SRV descriptor table at root parameter 1 */
+    if (tex->srv_gpu.ptr) {
+        ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(
+            vio_d3d12.cmd_list, 1, tex->srv_gpu);
+    }
+}
+
+static void d3d12_set_viewport(int x, int y, int width, int height)
+{
+    D3D12_VIEWPORT vp = {0};
+    vp.TopLeftX = (float)x;
+    vp.TopLeftY = (float)y;
+    vp.Width = (float)width;
+    vp.Height = (float)height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, 1, &vp);
+
+    D3D12_RECT scissor = {x, y, x + width, y + height};
+    ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
+}
+
+/* ── Setup context (called from vio_create after window creation) ── */
+
+int vio_d3d12_setup_context(void *glfw_window, vio_config *cfg)
+{
+    vio_d3d12.glfw_window = glfw_window;
+
+    /* Create surface (swapchain + render targets + depth buffer) */
+    void *surface = d3d12_create_surface(cfg);
+    if (!surface) {
+        return -1;
+    }
+
+    return 0;
+}
+
 /* ── Backend registration ─────────────────────────────────────────── */
 
 static const vio_backend d3d12_backend = {
@@ -1318,6 +1415,9 @@ static const vio_backend d3d12_backend = {
     .draw_indexed      = d3d12_draw_indexed,
     .present           = d3d12_present,
     .clear             = d3d12_clear,
+    .set_uniform       = d3d12_set_uniform,
+    .bind_texture      = d3d12_bind_texture,
+    .set_viewport      = d3d12_set_viewport,
     .dispatch_compute  = d3d12_dispatch_compute,
     .supports_feature  = d3d12_supports_feature,
 };

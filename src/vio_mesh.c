@@ -22,6 +22,8 @@ static zend_object *vio_mesh_create_object(zend_class_entry *ce)
     mesh->vao          = 0;
     mesh->vbo          = 0;
     mesh->ebo          = 0;
+    mesh->backend_vb   = NULL;
+    mesh->backend_ib   = NULL;
     mesh->vertex_count = 0;
     mesh->index_count  = 0;
     mesh->has_colors   = 0;

@@ -6,6 +6,7 @@
 #include "config.h"
 #endif
 
+#include "../php_vio.h"
 #include "vio_shader_reflect.h"
 #include <string.h>
 #include <stdlib.h>
@@ -135,6 +136,42 @@ char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_mod
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT, SPVC_TRUE);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_COORD_COMPAT, SPVC_TRUE);
     spvc_compiler_install_compiler_options(compiler, options);
+
+    /* Remap combined image-samplers to avoid overlapping register semantics.
+     * GLSL uses combined sampler2D; HLSL needs separate texture (t) and sampler (s)
+     * registers. Shift sampler bindings to avoid collision with texture bindings. */
+    spvc_resources resources = NULL;
+    spvc_compiler_create_shader_resources(compiler, &resources);
+    if (resources) {
+        const spvc_reflected_resource *sampled_images;
+        size_t sampled_count;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+                                                   &sampled_images, &sampled_count);
+        /* Assign unique texture (t) and sampler (s) registers per combined image-sampler */
+        for (size_t i = 0; i < sampled_count; i++) {
+            spvc_compiler_set_decoration(compiler, sampled_images[i].id,
+                                          SpvDecorationBinding, (unsigned int)i);
+        }
+
+        /* Also handle separate images and samplers */
+        const spvc_reflected_resource *sep_images;
+        size_t sep_image_count;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
+                                                   &sep_images, &sep_image_count);
+        for (size_t i = 0; i < sep_image_count; i++) {
+            spvc_compiler_set_decoration(compiler, sep_images[i].id,
+                                          SpvDecorationBinding, (unsigned int)(sampled_count + i));
+        }
+
+        const spvc_reflected_resource *sep_samplers;
+        size_t sep_sampler_count;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
+                                                   &sep_samplers, &sep_sampler_count);
+        for (size_t i = 0; i < sep_sampler_count; i++) {
+            spvc_compiler_set_decoration(compiler, sep_samplers[i].id,
+                                          SpvDecorationBinding, (unsigned int)(sampled_count + sep_image_count + i));
+        }
+    }
 
     if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS) {
         if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
