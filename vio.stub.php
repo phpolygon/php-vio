@@ -599,10 +599,11 @@ function vio_draw_3d(VioContext $context): void {}
 /**
  * Draw a mesh multiple times using GPU instancing.
  *
- * @param float[] $matrices Flat array of 4x4 model matrices (16 floats per instance)
+ * @param array|string $matrices Flat array of 4x4 model matrices (16 floats per instance),
+ *                               or packed binary string (pack('f*', ...)) for zero-copy fast path
  * @param int $instanceCount Number of instances to draw
  */
-function vio_draw_instanced(VioContext $context, VioMesh $mesh, array $matrices, int $instanceCount): void {}
+function vio_draw_instanced(VioContext $context, VioMesh $mesh, array|string $matrices, int $instanceCount): void {}
 
 /**
  * Create an offscreen render target (FBO).

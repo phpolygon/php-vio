@@ -4635,17 +4635,72 @@ ZEND_FUNCTION(vio_draw_3d)
 #endif
 }
 
+/* Helper: convert PHP array|string matrices to float buffer.
+ * Returns mat_data (caller frees with efree, or NULL if string was used).
+ * Sets *out_data to the float pointer and *out_size to byte count. */
+static int vio_resolve_instance_data(zval *matrices_zval, zend_long instance_count,
+                                      const float **out_data, size_t *out_size,
+                                      float **out_allocated)
+{
+    size_t total_floats = (size_t)instance_count * 16;
+    size_t byte_size = total_floats * sizeof(float);
+
+    *out_allocated = NULL;
+
+    if (Z_TYPE_P(matrices_zval) == IS_STRING) {
+        /* Fast path: packed binary float data — zero iteration */
+        zend_string *str = Z_STR_P(matrices_zval);
+        if (ZSTR_LEN(str) < byte_size) {
+            php_error_docref(NULL, E_WARNING,
+                "matrices string has %zu bytes, need %zu (%ld instances * 64)",
+                ZSTR_LEN(str), byte_size, (long)instance_count);
+            return -1;
+        }
+        *out_data = (const float *)ZSTR_VAL(str);
+        *out_size = byte_size;
+        return 0;
+    }
+
+    if (Z_TYPE_P(matrices_zval) == IS_ARRAY) {
+        /* Slow path: PHP array of floats — iterate and convert */
+        HashTable *ht = Z_ARRVAL_P(matrices_zval);
+        size_t arr_count = zend_hash_num_elements(ht);
+        if (arr_count < total_floats) {
+            php_error_docref(NULL, E_WARNING,
+                "matrices array has %zu elements, need %zu (%ld instances * 16)",
+                arr_count, total_floats, (long)instance_count);
+            return -1;
+        }
+
+        float *mat_data = emalloc(byte_size);
+        zval *val;
+        size_t i = 0;
+        ZEND_HASH_FOREACH_VAL(ht, val) {
+            if (i >= total_floats) break;
+            mat_data[i++] = (float)zval_get_double(val);
+        } ZEND_HASH_FOREACH_END();
+
+        *out_data = mat_data;
+        *out_size = byte_size;
+        *out_allocated = mat_data;
+        return 0;
+    }
+
+    php_error_docref(NULL, E_WARNING, "matrices must be array or packed string");
+    return -1;
+}
+
 ZEND_FUNCTION(vio_draw_instanced)
 {
     zval *ctx_zval;
     zval *mesh_zval;
-    HashTable *matrices_ht;
+    zval *matrices_zval;
     zend_long instance_count;
 
     ZEND_PARSE_PARAMETERS_START(4, 4)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_OBJECT_OF_CLASS(mesh_zval, vio_mesh_ce)
-        Z_PARAM_ARRAY_HT(matrices_ht)
+        Z_PARAM_ZVAL(matrices_zval)
         Z_PARAM_LONG(instance_count)
     ZEND_PARSE_PARAMETERS_END();
 
@@ -4661,34 +4716,24 @@ ZEND_FUNCTION(vio_draw_instanced)
         return;
     }
 
+    /* Resolve matrix data (fast binary or slow array path) */
+    const float *mat_data = NULL;
+    size_t mat_size = 0;
+    float *allocated = NULL;
+
+    if (vio_resolve_instance_data(matrices_zval, instance_count, &mat_data, &mat_size, &allocated) != 0) {
+        return;
+    }
+
 #ifdef HAVE_GLFW
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        /* Convert PHP array of floats to C float array (16 floats per instance) */
         size_t total_floats = (size_t)instance_count * 16;
-        size_t arr_count = zend_hash_num_elements(matrices_ht);
-
-        if (arr_count < total_floats) {
-            php_error_docref(NULL, E_WARNING,
-                "matrices array has %zu elements, need %zu (%ld instances * 16)",
-                arr_count, total_floats, (long)instance_count);
-            return;
-        }
-
-        float *mat_data = emalloc(sizeof(float) * total_floats);
-        zval *val;
-        size_t i = 0;
-        ZEND_HASH_FOREACH_VAL(matrices_ht, val) {
-            if (i >= total_floats) break;
-            mat_data[i++] = (float)zval_get_double(val);
-        } ZEND_HASH_FOREACH_END();
 
         /* Create instance VBO with model matrices */
         unsigned int instance_vbo;
         glGenBuffers(1, &instance_vbo);
         glBindBuffer(GL_ARRAY_BUFFER, instance_vbo);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(float) * total_floats, mat_data, GL_STREAM_DRAW);
-
-        efree(mat_data);
+        glBufferData(GL_ARRAY_BUFFER, mat_size, mat_data, GL_STREAM_DRAW);
 
         /* Bind mesh VAO and set up instance attribute pointers (locations 3-6 for mat4) */
         glBindVertexArray(mesh->vao);
@@ -4723,38 +4768,46 @@ ZEND_FUNCTION(vio_draw_instanced)
 
     /* Backend instanced draw (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0 && mesh->backend_vb) {
-        size_t total_floats = (size_t)instance_count * 16;
-        size_t arr_count = zend_hash_num_elements(matrices_ht);
-        if (arr_count < total_floats) return;
-
-        /* Convert PHP array to float array */
-        float *mat_data = emalloc(sizeof(float) * total_floats);
-        {
-            zval *val;
-            size_t idx = 0;
-            ZEND_HASH_FOREACH_VAL(matrices_ht, val) {
-                if (idx >= total_floats) break;
-                mat_data[idx++] = (float)zval_get_double(val);
-            } ZEND_HASH_FOREACH_END();
-        }
 
 #ifdef HAVE_D3D11
         if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
-            /* Create temporary instance buffer (4 x vec4 per instance = 64 bytes) */
-            D3D11_BUFFER_DESC bd = {0};
-            bd.ByteWidth = (UINT)(sizeof(float) * total_floats);
-            bd.Usage = D3D11_USAGE_DEFAULT;
-            bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+            UINT byte_size = (UINT)mat_size;
 
-            D3D11_SUBRESOURCE_DATA init = {0};
-            init.pSysMem = mat_data;
+            /* Reuse persistent DYNAMIC instance buffer (avoids CreateBuffer per frame) */
+            static ID3D11Buffer *s_instance_buf = NULL;
+            static UINT s_instance_buf_capacity = 0;
 
-            ID3D11Buffer *instance_buf = NULL;
-            HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &bd, &init, &instance_buf);
-            if (SUCCEEDED(hr) && instance_buf) {
+            if (!s_instance_buf || s_instance_buf_capacity < byte_size) {
+                if (s_instance_buf) {
+                    ID3D11Buffer_Release(s_instance_buf);
+                    s_instance_buf = NULL;
+                }
+
+                D3D11_BUFFER_DESC bd = {0};
+                bd.ByteWidth = byte_size;
+                bd.Usage = D3D11_USAGE_DYNAMIC;
+                bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+                HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &bd, NULL, &s_instance_buf);
+                if (FAILED(hr)) {
+                    if (allocated) efree(allocated);
+                    return;
+                }
+                s_instance_buf_capacity = byte_size;
+            }
+
+            /* Upload via Map/Unmap WRITE_DISCARD */
+            D3D11_MAPPED_SUBRESOURCE mapped = {0};
+            HRESULT hr = ID3D11DeviceContext_Map(vio_d3d11.context,
+                (ID3D11Resource *)s_instance_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+            if (SUCCEEDED(hr)) {
+                memcpy(mapped.pData, mat_data, byte_size);
+                ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)s_instance_buf, 0);
+
                 /* Bind mesh VB to slot 0, instance VB to slot 1 */
                 vio_d3d11_buffer *vb = (vio_d3d11_buffer *)mesh->backend_vb;
-                ID3D11Buffer *buffers[2] = { vb->buffer, instance_buf };
+                ID3D11Buffer *buffers[2] = { vb->buffer, s_instance_buf };
                 UINT strides[2] = { (UINT)mesh->stride, 64 };  /* 64 = sizeof(mat4) */
                 UINT offsets[2] = { 0, 0 };
                 ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 2, buffers, strides, offsets);
@@ -4793,8 +4846,6 @@ ZEND_FUNCTION(vio_draw_instanced)
                     ID3D11DeviceContext_DrawInstanced(vio_d3d11.context,
                         mesh->vertex_count, (UINT)instance_count, 0, 0);
                 }
-
-                ID3D11Buffer_Release(instance_buf);
             }
         } else
 #endif
@@ -4818,8 +4869,9 @@ ZEND_FUNCTION(vio_draw_instanced)
             }
         }
 
-        efree(mat_data);
     }
+
+    if (allocated) efree(allocated);
 }
 
 ZEND_FUNCTION(vio_render_target)
