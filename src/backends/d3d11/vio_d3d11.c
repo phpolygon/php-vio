@@ -196,6 +196,15 @@ static void d3d11_shutdown(void)
         ID3D11DeviceContext_Flush(vio_d3d11.context);
     }
 
+    /* Release cached constant buffers */
+    for (int i = 0; i < VIO_D3D11_CB_CACHE_SLOTS; i++) {
+        if (vio_d3d11.cb_cache[i].buffer) {
+            ID3D11Buffer_Release(vio_d3d11.cb_cache[i].buffer);
+            vio_d3d11.cb_cache[i].buffer = NULL;
+            vio_d3d11.cb_cache[i].capacity = 0;
+        }
+    }
+
     d3d11_release_views();
 
     if (vio_d3d11.swapchain) {
@@ -403,6 +412,9 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
     }
     raster_desc.FrontCounterClockwise = TRUE;  /* Match OpenGL/Vulkan winding */
     raster_desc.DepthClipEnable = TRUE;
+    raster_desc.DepthBias = (INT)desc->depth_bias;
+    raster_desc.SlopeScaledDepthBias = desc->slope_scaled_depth_bias;
+    raster_desc.DepthBiasClamp = 0.0f;
 
     ID3D11Device_CreateRasterizerState(vio_d3d11.device, &raster_desc,
                                         &pipeline->rasterizer_state);
@@ -411,7 +423,9 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
     D3D11_DEPTH_STENCIL_DESC ds_desc = {0};
     ds_desc.DepthEnable = desc->depth_test ? TRUE : FALSE;
     ds_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-    ds_desc.DepthFunc = D3D11_COMPARISON_LESS;
+    ds_desc.DepthFunc = (desc->depth_func == VIO_DEPTH_LEQUAL)
+        ? D3D11_COMPARISON_LESS_EQUAL
+        : D3D11_COMPARISON_LESS;
 
     ID3D11Device_CreateDepthStencilState(vio_d3d11.device, &ds_desc,
                                           &pipeline->depth_stencil_state);
@@ -649,6 +663,7 @@ static void d3d11_destroy_texture(void *texture_ptr)
     vio_d3d11_texture *tex = (vio_d3d11_texture *)texture_ptr;
     if (!tex) return;
 
+    if (tex->sampler_cmp) ID3D11SamplerState_Release(tex->sampler_cmp);
     if (tex->sampler) ID3D11SamplerState_Release(tex->sampler);
     if (tex->srv) ID3D11ShaderResourceView_Release(tex->srv);
     if (tex->texture) ID3D11Texture2D_Release(tex->texture);
@@ -933,17 +948,6 @@ static int d3d11_supports_feature(vio_feature feature)
 
 static void d3d11_set_uniform(const char *name, const void *data, int count, int type)
 {
-    /*
-     * D3D11 uniform strategy: create/reuse per-name constant buffers.
-     * HLSL transpiled from GLSL via SPIRV-Cross maps uniforms to:
-     *   cbuffer _Global { ... }  at register(b0)
-     * We maintain a single "global" constant buffer that gets updated
-     * with individual uniform values packed sequentially.
-     *
-     * For now: use root constant approach — pack all uniforms into a
-     * single dynamic constant buffer at b0, updated each frame.
-     */
-
     /* Size in bytes based on type */
     size_t data_size;
     switch (type) {
@@ -957,23 +961,43 @@ static void d3d11_set_uniform(const char *name, const void *data, int count, int
         default: return;
     }
 
-    /* Create a temporary constant buffer, update, bind to b0 */
-    /* TODO: use a persistent per-shader constant buffer with offset tracking */
-    D3D11_BUFFER_DESC cb_desc = {0};
-    cb_desc.ByteWidth = (UINT)((data_size + 15) & ~15); /* 16-byte align */
-    cb_desc.Usage = D3D11_USAGE_DEFAULT;
-    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    UINT aligned_size = (UINT)((data_size + 15) & ~15); /* 16-byte align */
 
-    D3D11_SUBRESOURCE_DATA init_data = {0};
-    init_data.pSysMem = data;
+    /* Use cached dynamic constant buffer at slot 0 to avoid per-call CreateBuffer */
+    vio_d3d11_cb_cache_entry *entry = &vio_d3d11.cb_cache[0];
 
-    ID3D11Buffer *cb = NULL;
-    HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &cb_desc, &init_data, &cb);
+    if (!entry->buffer || entry->capacity < aligned_size) {
+        /* Need a bigger buffer — release old one and create new */
+        if (entry->buffer) {
+            ID3D11Buffer_Release(entry->buffer);
+            entry->buffer = NULL;
+        }
+
+        D3D11_BUFFER_DESC cb_desc = {0};
+        cb_desc.ByteWidth = aligned_size;
+        cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+        cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+        HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &cb_desc, NULL, &entry->buffer);
+        if (FAILED(hr)) return;
+
+        entry->capacity = aligned_size;
+    }
+
+    /* Update via Map/Unmap (WRITE_DISCARD) */
+    D3D11_MAPPED_SUBRESOURCE mapped = {0};
+    HRESULT hr = ID3D11DeviceContext_Map(vio_d3d11.context,
+                                          (ID3D11Resource *)entry->buffer,
+                                          0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (FAILED(hr)) return;
 
-    ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb);
-    ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb);
-    ID3D11Buffer_Release(cb);
+    memcpy(mapped.pData, data, data_size);
+    ID3D11DeviceContext_Unmap(vio_d3d11.context,
+                              (ID3D11Resource *)entry->buffer, 0);
+
+    ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &entry->buffer);
+    ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &entry->buffer);
 }
 
 static void d3d11_bind_texture(void *texture, int slot)
@@ -984,6 +1008,8 @@ static void d3d11_bind_texture(void *texture, int slot)
     if (tex->srv) {
         ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, (UINT)slot, 1, &tex->srv);
     }
+    /* Bind regular sampler by default.
+     * Comparison sampler is bound via d3d11_bind_texture_cmp (for sampler2DShadow). */
     if (tex->sampler) {
         ID3D11DeviceContext_PSSetSamplers(vio_d3d11.context, (UINT)slot, 1, &tex->sampler);
     }

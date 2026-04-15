@@ -45,10 +45,20 @@ typedef struct _vio_d3d11_buffer {
 typedef struct _vio_d3d11_texture {
     ID3D11Texture2D          *texture;
     ID3D11ShaderResourceView *srv;
-    ID3D11SamplerState       *sampler;
+    ID3D11SamplerState       *sampler;       /* regular sampler (Sample) */
+    ID3D11SamplerState       *sampler_cmp;   /* comparison sampler (SampleCmp), NULL if n/a */
     int width;
     int height;
+    int is_depth;                             /* 1 if this is a depth texture */
 } vio_d3d11_texture;
+
+/* Cached constant buffer for set_uniform (avoids per-call CreateBuffer) */
+#define VIO_D3D11_CB_CACHE_SLOTS 8
+
+typedef struct _vio_d3d11_cb_cache_entry {
+    ID3D11Buffer *buffer;
+    UINT          capacity;   /* allocated ByteWidth */
+} vio_d3d11_cb_cache_entry;
 
 /* Global D3D11 state */
 typedef struct _vio_d3d11_state {
@@ -77,6 +87,9 @@ typedef struct _vio_d3d11_state {
     float clear_r, clear_g, clear_b, clear_a;
     int   width, height;
     int   vsync;
+
+    /* Constant buffer cache for set_uniform (per-slot, reused across frames) */
+    vio_d3d11_cb_cache_entry cb_cache[VIO_D3D11_CB_CACHE_SLOTS];
 
     /* Debug */
     ID3D11Debug *debug_interface;

@@ -136,6 +136,9 @@ char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_mod
     spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL, shader_model);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT, SPVC_TRUE);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_COORD_COMPAT, SPVC_TRUE);
+    /* Map OpenGL clip space z [-1,1] to D3D11 clip space z [0,1]:
+     * Emits gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5 */
+    spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_FIXUP_DEPTH_CONVENTION, SPVC_TRUE);
     spvc_compiler_install_compiler_options(compiler, options);
 
     /* Remap combined image-samplers to avoid overlapping register semantics.
@@ -214,6 +217,15 @@ static void copy_resources(spvc_compiler compiler, spvc_resources resources,
         /* Extract vector size from type (1=float, 2=vec2, 3=vec3, 4=vec4) */
         spvc_type type_handle = spvc_compiler_get_type_handle(compiler, list[i].type_id);
         (*out)[i].vecsize = type_handle ? spvc_type_get_vector_size(type_handle) : 3;
+
+        /* Detect depth image (sampler2DShadow → Depth=1 in SPIR-V) */
+        (*out)[i].is_depth = 0;
+        if (type == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE && type_handle) {
+            spvc_type image_type = spvc_compiler_get_type_handle(compiler, spvc_type_get_base_type_id(type_handle));
+            if (image_type && spvc_type_get_image_is_depth(image_type)) {
+                (*out)[i].is_depth = 1;
+            }
+        }
     }
 }
 

@@ -46,6 +46,7 @@ typedef struct _vio_shader_object {
     int               frag_cbuffer_dirty;
     /* Sampler binding map: sampler_names[i] -> hlsl register i */
     char              sampler_names[VIO_MAX_SAMPLERS][64];
+    int               sampler_is_depth[VIO_MAX_SAMPLERS]; /* 1 if sampler2DShadow */
     int               sampler_count;
     /* Runtime GL-slot to HLSL-binding remap: gl_to_hlsl[gl_slot] = hlsl_binding (-1 = unmapped) */
     int               gl_to_hlsl_sampler[16];

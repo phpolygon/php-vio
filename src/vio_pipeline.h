@@ -20,7 +20,10 @@ typedef struct _vio_pipeline_object {
     vio_topology   topology;
     vio_cull_mode  cull_mode;
     int            depth_test;
+    vio_depth_func depth_func;
     vio_blend_mode blend;
+    float          depth_bias;
+    float          slope_scaled_depth_bias;
     int            valid;
     zend_object    std;
 } vio_pipeline_object;

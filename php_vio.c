@@ -1454,6 +1454,7 @@ ZEND_FUNCTION(vio_shader)
                     for (int s = 0; s < shader->sampler_count; s++) {
                         strncpy(shader->sampler_names[s], frag_reflect.textures[s].name,
                                 sizeof(shader->sampler_names[s]) - 1);
+                        shader->sampler_is_depth[s] = frag_reflect.textures[s].is_depth ? 1 : 0;
                     }
                     vio_reflect_free(&frag_reflect);
                 }
@@ -1676,8 +1677,17 @@ ZEND_FUNCTION(vio_pipeline)
     if ((val = zend_hash_str_find(config_ht, "depth_test", sizeof("depth_test") - 1)) != NULL) {
         pipe->depth_test = zend_is_true(val);
     }
+    if ((val = zend_hash_str_find(config_ht, "depth_func", sizeof("depth_func") - 1)) != NULL) {
+        pipe->depth_func = (vio_depth_func)zval_get_long(val);
+    }
     if ((val = zend_hash_str_find(config_ht, "blend", sizeof("blend") - 1)) != NULL) {
         pipe->blend = (vio_blend_mode)zval_get_long(val);
+    }
+    if ((val = zend_hash_str_find(config_ht, "depth_bias", sizeof("depth_bias") - 1)) != NULL) {
+        pipe->depth_bias = (float)zval_get_double(val);
+    }
+    if ((val = zend_hash_str_find(config_ht, "slope_scaled_depth_bias", sizeof("slope_scaled_depth_bias") - 1)) != NULL) {
+        pipe->slope_scaled_depth_bias = (float)zval_get_double(val);
     }
 
     /* Store backend shader reference for lazy pipeline creation */
@@ -1726,7 +1736,10 @@ ZEND_FUNCTION(vio_pipeline)
         desc.topology = pipe->topology;
         desc.cull_mode = pipe->cull_mode;
         desc.depth_test = pipe->depth_test;
+        desc.depth_func = pipe->depth_func;
         desc.blend = pipe->blend;
+        desc.depth_bias = pipe->depth_bias;
+        desc.slope_scaled_depth_bias = pipe->slope_scaled_depth_bias;
 
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
     }
@@ -1790,8 +1803,17 @@ ZEND_FUNCTION(vio_bind_pipeline)
         /* Depth test */
         if (pipe->depth_test) {
             glEnable(GL_DEPTH_TEST);
+            glDepthFunc(pipe->depth_func == VIO_DEPTH_LEQUAL ? GL_LEQUAL : GL_LESS);
         } else {
             glDisable(GL_DEPTH_TEST);
+        }
+
+        /* Depth bias (polygon offset for shadow mapping) */
+        if (pipe->depth_bias != 0.0f || pipe->slope_scaled_depth_bias != 0.0f) {
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(pipe->slope_scaled_depth_bias, pipe->depth_bias);
+        } else {
+            glDisable(GL_POLYGON_OFFSET_FILL);
         }
 
         /* Blend */
@@ -1980,14 +2002,29 @@ ZEND_FUNCTION(vio_bind_texture)
     if (strcmp(ctx->backend->name, "opengl") != 0 &&
         tex->backend_texture && ctx->backend->bind_texture) {
         int hlsl_slot = (int)slot;
+        int shader_wants_depth = 0;
         /* Remap GL texture unit to HLSL register using sampler map */
         if (ctx->bound_shader_object) {
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
             if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
-                hlsl_slot = sh->gl_to_hlsl_sampler[slot];
+                int sampler_idx = sh->gl_to_hlsl_sampler[slot];
+                hlsl_slot = sampler_idx;
+                if (sampler_idx >= 0 && sampler_idx < sh->sampler_count) {
+                    shader_wants_depth = sh->sampler_is_depth[sampler_idx];
+                }
             }
         }
         ctx->backend->bind_texture(tex->backend_texture, hlsl_slot);
+
+#ifdef HAVE_D3D11
+        /* If the shader uses sampler2DShadow, bind the comparison sampler instead */
+        if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized && shader_wants_depth) {
+            vio_d3d11_texture *d3d_tex = (vio_d3d11_texture *)tex->backend_texture;
+            if (d3d_tex->sampler_cmp) {
+                ID3D11DeviceContext_PSSetSamplers(vio_d3d11.context, (UINT)hlsl_slot, 1, &d3d_tex->sampler_cmp);
+            }
+        }
+#endif
     }
 }
 
@@ -2137,6 +2174,17 @@ ZEND_FUNCTION(vio_bind_buffer)
 #ifdef HAVE_GLFW
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
         glBindBufferBase(GL_UNIFORM_BUFFER, bind_point, buf->buffer_id);
+    }
+#endif
+
+#ifdef HAVE_D3D11
+    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized && buf->backend_buffer) {
+        vio_d3d11_buffer *d3d_buf = (vio_d3d11_buffer *)buf->backend_buffer;
+        if (d3d_buf->buffer) {
+            UINT slot = (UINT)bind_point;
+            ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, slot, 1, &d3d_buf->buffer);
+            ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, slot, 1, &d3d_buf->buffer);
+        }
     }
 #endif
 }
@@ -5314,17 +5362,12 @@ ZEND_FUNCTION(vio_render_target_texture)
             d3d_tex->width = rt->width;
             d3d_tex->height = rt->height;
 
-            /* Create comparison sampler for depth textures (sampler2DShadow) */
+            /* Regular sampler for sampler2D + texture() (manual shadow comparison) */
             D3D11_SAMPLER_DESC sampler_desc = {0};
-            if (rt->depth_only) {
-                sampler_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
-                sampler_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
-            } else {
-                sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-            }
-            sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-            sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-            sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+            sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
+            sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
+            sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
             sampler_desc.MaxAnisotropy = 1;
             sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
             sampler_desc.BorderColor[0] = 1.0f;
@@ -5332,6 +5375,15 @@ ZEND_FUNCTION(vio_render_target_texture)
             sampler_desc.BorderColor[2] = 1.0f;
             sampler_desc.BorderColor[3] = 1.0f;
             ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &d3d_tex->sampler);
+
+            /* Comparison sampler for sampler2DShadow + SampleCmp (hardware PCF) */
+            if (rt->depth_only) {
+                D3D11_SAMPLER_DESC cmp_desc = sampler_desc;
+                cmp_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+                cmp_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+                ID3D11Device_CreateSamplerState(vio_d3d11.device, &cmp_desc, &d3d_tex->sampler_cmp);
+                d3d_tex->is_depth = 1;
+            }
 
             tex->backend_texture = d3d_tex;
         }

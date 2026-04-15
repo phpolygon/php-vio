@@ -685,11 +685,16 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     }
     pso_desc.RasterizerState.FrontCounterClockwise = TRUE;
     pso_desc.RasterizerState.DepthClipEnable = TRUE;
+    pso_desc.RasterizerState.DepthBias = (INT)desc->depth_bias;
+    pso_desc.RasterizerState.SlopeScaledDepthBias = desc->slope_scaled_depth_bias;
+    pso_desc.RasterizerState.DepthBiasClamp = 0.0f;
 
     /* Depth-stencil */
     pso_desc.DepthStencilState.DepthEnable = desc->depth_test ? TRUE : FALSE;
     pso_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pso_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pso_desc.DepthStencilState.DepthFunc = (desc->depth_func == VIO_DEPTH_LEQUAL)
+        ? D3D12_COMPARISON_FUNC_LESS_EQUAL
+        : D3D12_COMPARISON_FUNC_LESS;
     pso_desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 
     /* Blend */

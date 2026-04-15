@@ -168,7 +168,10 @@ typedef struct _vio_pipeline_desc {
     vio_topology     topology;
     vio_cull_mode    cull_mode;
     int              depth_test;
+    vio_depth_func   depth_func;    /* VIO_DEPTH_LESS (default 0) or VIO_DEPTH_LEQUAL */
     vio_blend_mode   blend;
+    float            depth_bias;             /* constant depth bias (shadow mapping) */
+    float            slope_scaled_depth_bias; /* slope-scaled bias (shadow mapping) */
 } vio_pipeline_desc;
 
 typedef struct _vio_buffer_desc {
