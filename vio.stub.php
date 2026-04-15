@@ -91,6 +91,12 @@ function vio_mouse_button(VioContext $context, int $button): bool {}
 function vio_mouse_scroll(VioContext $context): array {}
 
 /**
+ * Set cursor mode: VIO_CURSOR_NORMAL (0), VIO_CURSOR_DISABLED (1), VIO_CURSOR_HIDDEN (2).
+ * Disabled mode hides the cursor, confines it, and enables raw mouse motion for FPS controls.
+ */
+function vio_set_cursor_mode(VioContext $context, int $mode): void {}
+
+/**
  * Register a callback for key events.
  *
  * @param callable(int $key, int $action, int $mods): void $callback

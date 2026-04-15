@@ -55,6 +55,11 @@ ZEND_END_ARG_INFO()
 #define arginfo_vio_mouse_delta arginfo_vio_mouse_position
 #define arginfo_vio_mouse_scroll arginfo_vio_mouse_position
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor_mode, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, mode, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_mouse_button, 0, 2, _IS_BOOL, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, button, IS_LONG, 0)
@@ -531,6 +536,7 @@ ZEND_FUNCTION(vio_mouse_position);
 ZEND_FUNCTION(vio_mouse_delta);
 ZEND_FUNCTION(vio_mouse_button);
 ZEND_FUNCTION(vio_mouse_scroll);
+ZEND_FUNCTION(vio_set_cursor_mode);
 ZEND_FUNCTION(vio_on_key);
 ZEND_FUNCTION(vio_on_resize);
 ZEND_FUNCTION(vio_on_char);
@@ -632,6 +638,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_mouse_delta, arginfo_vio_mouse_delta)
 	ZEND_FE(vio_mouse_button, arginfo_vio_mouse_button)
 	ZEND_FE(vio_mouse_scroll, arginfo_vio_mouse_scroll)
+	ZEND_FE(vio_set_cursor_mode, arginfo_vio_set_cursor_mode)
 	ZEND_FE(vio_on_key, arginfo_vio_on_key)
 	ZEND_FE(vio_on_resize, arginfo_vio_on_resize)
 	ZEND_FE(vio_on_char, arginfo_vio_on_char)

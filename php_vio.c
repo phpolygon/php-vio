@@ -601,6 +601,36 @@ ZEND_FUNCTION(vio_mouse_scroll)
     add_next_index_double(return_value, ctx->input.scroll_y);
 }
 
+ZEND_FUNCTION(vio_set_cursor_mode)
+{
+    zval *ctx_zval;
+    zend_long mode;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(mode)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+#ifdef HAVE_GLFW
+    if (ctx->window) {
+        int glfw_mode;
+        switch (mode) {
+            case 1:  glfw_mode = GLFW_CURSOR_DISABLED; break;  /* VIO_CURSOR_DISABLED */
+            case 2:  glfw_mode = GLFW_CURSOR_HIDDEN; break;    /* VIO_CURSOR_HIDDEN */
+            default: glfw_mode = GLFW_CURSOR_NORMAL; break;    /* VIO_CURSOR_NORMAL */
+        }
+        glfwSetInputMode(ctx->window, GLFW_CURSOR, glfw_mode);
+
+        /* When switching to disabled mode, enable raw mouse motion if available */
+        if (mode == 1 && glfwRawMouseMotionSupported()) {
+            glfwSetInputMode(ctx->window, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
+        }
+    }
+#endif
+}
+
 ZEND_FUNCTION(vio_on_key)
 {
     zval *ctx_zval;
@@ -1413,6 +1443,7 @@ ZEND_FUNCTION(vio_shader)
                 shader->uniforms, VIO_MAX_UNIFORMS,
                 &shader->cbuffer_total_size);
             memset(shader->cbuffer_data, 0, sizeof(shader->cbuffer_data));
+
 
             /* Create backend constant buffer for vertex stage */
             if (shader->cbuffer_total_size > 0 && ctx->backend->create_buffer) {
@@ -2336,9 +2367,20 @@ ZEND_FUNCTION(vio_set_uniform)
                         if (i < 16) vals[i++] = (float)zval_get_double(elem);
                     } ZEND_HASH_FOREACH_END();
                 }
-                int copy_size = (int)(i * sizeof(float));
-                if (copy_size > max_size) copy_size = max_size;
-                memcpy(dst, vals, copy_size);
+                /* mat3 special case: HLSL cbuffer pads each row to 16 bytes.
+                 * 9 floats (36 bytes) must become 12 floats (48 bytes) with
+                 * 4-byte padding after every 3 floats. */
+                if (i == 9 && max_size >= 48) {
+                    float padded[12];
+                    padded[0]  = vals[0]; padded[1]  = vals[1]; padded[2]  = vals[2]; padded[3]  = 0.0f;
+                    padded[4]  = vals[3]; padded[5]  = vals[4]; padded[6]  = vals[5]; padded[7]  = 0.0f;
+                    padded[8]  = vals[6]; padded[9]  = vals[7]; padded[10] = vals[8]; padded[11] = 0.0f;
+                    memcpy(dst, padded, 48);
+                } else {
+                    int copy_size = (int)(i * sizeof(float));
+                    if (copy_size > max_size) copy_size = max_size;
+                    memcpy(dst, vals, copy_size);
+                }
             }
 
             if (is_frag) {
@@ -4206,6 +4248,11 @@ static void vio_register_constants(int module_number)
     /* Depth function */
     REGISTER_LONG_CONSTANT("VIO_DEPTH_LESS", VIO_DEPTH_LESS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_DEPTH_LEQUAL", VIO_DEPTH_LEQUAL, CONST_CS | CONST_PERSISTENT);
+
+    /* Cursor mode */
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_NORMAL", 0, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_DISABLED", 1, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_HIDDEN", 2, CONST_CS | CONST_PERSISTENT);
 
     /* Shader format */
     REGISTER_LONG_CONSTANT("VIO_SHADER_AUTO", VIO_SHADER_AUTO, CONST_CS | CONST_PERSISTENT);

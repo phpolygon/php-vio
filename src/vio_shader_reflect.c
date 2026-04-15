@@ -342,6 +342,7 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
         spvc_type type = spvc_compiler_get_type_handle(compiler, type_id);
         unsigned int member_count = spvc_type_get_num_member_types(type);
 
+
         for (unsigned int i = 0; i < member_count && count < max_entries; i++) {
             const char *name = spvc_compiler_get_member_name(compiler, type_id, i);
             unsigned int base_offset = 0;
