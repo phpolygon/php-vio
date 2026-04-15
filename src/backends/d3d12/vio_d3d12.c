@@ -148,29 +148,32 @@ static int d3d12_create_root_signature(void)
 {
     /*
      * Root signature layout:
-     *   [0] CBV (b0) — per-frame constants
-     *   [1] CBV (b1) — per-object constants
+     *   [0] CBV (b0) — vertex stage constants (model, view, projection, etc.)
+     *   [1] CBV (b0) — pixel stage constants (lights, material, etc.)
      *   [2] Descriptor table: SRV (t0..t8) — textures
-     *   [3] Descriptor table: Sampler (s0..s8)
+     *   Static samplers: s0 (linear wrap), s1 (comparison for shadow)
+     *
+     * VS and PS each have their own cbuffer at b0 (different data, same register).
+     * Separate root params with per-stage visibility allow independent binding.
      */
-    D3D12_ROOT_PARAMETER params[4] = {0};
+    D3D12_ROOT_PARAMETER params[3] = {0};
 
-    /* CBV b0 */
+    /* [0] CBV b0 — vertex shader only */
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].Descriptor.RegisterSpace = 0;
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
-    /* CBV b1 */
+    /* [1] CBV b0 — pixel shader only */
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[1].Descriptor.ShaderRegister = 1;
+    params[1].Descriptor.ShaderRegister = 0;
     params[1].Descriptor.RegisterSpace = 0;
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    /* SRV table t0-t8 */
+    /* [2] SRV table t0-t7 (regular textures at t0-t3, shadow at t4-t7) */
     D3D12_DESCRIPTOR_RANGE srv_range = {0};
     srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srv_range.NumDescriptors = 8;
+    srv_range.NumDescriptors = 8; /* t0-t7 */
     srv_range.BaseShaderRegister = 0;
     srv_range.RegisterSpace = 0;
     srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -180,23 +183,42 @@ static int d3d12_create_root_signature(void)
     params[2].DescriptorTable.pDescriptorRanges = &srv_range;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    /* Static sampler instead of sampler table (simpler) */
-    D3D12_STATIC_SAMPLER_DESC static_sampler = {0};
-    static_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    static_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    static_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    static_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    static_sampler.MaxAnisotropy = 1;
-    static_sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    static_sampler.ShaderRegister = 0;
-    static_sampler.RegisterSpace = 0;
-    static_sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    /* Static samplers: s0-s3 = regular, s4-s7 = comparison.
+     * SPIRV-Cross assigns shadow samplers to s4+ and regular to s0+. */
+    D3D12_STATIC_SAMPLER_DESC static_samplers[8] = {0};
+
+    /* s0-s3: Regular linear wrap (general textures) */
+    for (int s = 0; s < 4; s++) {
+        static_samplers[s].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        static_samplers[s].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        static_samplers[s].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        static_samplers[s].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        static_samplers[s].MaxAnisotropy = 1;
+        static_samplers[s].MaxLOD = D3D12_FLOAT32_MAX;
+        static_samplers[s].ShaderRegister = s;
+        static_samplers[s].RegisterSpace = 0;
+        static_samplers[s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+
+    /* s4-s7: Comparison samplers (shadow maps with sampler2DShadow) */
+    for (int s = 4; s < 8; s++) {
+        static_samplers[s].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        static_samplers[s].AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        static_samplers[s].AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        static_samplers[s].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        static_samplers[s].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        static_samplers[s].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        static_samplers[s].MaxLOD = D3D12_FLOAT32_MAX;
+        static_samplers[s].ShaderRegister = s;
+        static_samplers[s].RegisterSpace = 0;
+        static_samplers[s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
 
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-    rs_desc.NumParameters = 3; /* CBV0, CBV1, SRV table */
+    rs_desc.NumParameters = 3; /* VS CBV, PS CBV, SRV table */
     rs_desc.pParameters = params;
-    rs_desc.NumStaticSamplers = 1;
-    rs_desc.pStaticSamplers = &static_sampler;
+    rs_desc.NumStaticSamplers = 8;
+    rs_desc.pStaticSamplers = static_samplers;
     rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     ID3DBlob *signature_blob = NULL;
@@ -457,10 +479,63 @@ static int d3d12_init(vio_config *cfg)
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     vio_d3d12.srv_heap.capacity = VIO_D3D12_MAX_SRV_DESCRIPTORS;
     vio_d3d12.srv_heap.count = 0;
+    /* Reserve first 64 slots for static SRVs (textures, render target SRVs).
+     * Per-frame SRV allocations start after these. */
+    vio_d3d12.srv_frame_base = 64;
+    vio_d3d12.srv_frame_offset = 64;
 
     /* Root signature */
     if (d3d12_create_root_signature() != 0) {
         goto init_fail;
+    }
+
+    /* Per-frame linear cbuffer allocator: 1MB UPLOAD heap, persistently mapped.
+     * Each draw call allocates a 256-byte-aligned slice for its cbuffer data.
+     * Reset offset to 0 at begin_frame. */
+    {
+        UINT heap_size = 4 * 1024 * 1024; /* 4MB = ~2600 draws per frame */
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = heap_size;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (SUCCEEDED(ID3D12Device_CreateCommittedResource(vio_d3d12.device,
+                &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                NULL, &IID_ID3D12Resource, (void **)&vio_d3d12.cbuffer_heap))) {
+            vio_d3d12.cbuffer_heap_gpu = ID3D12Resource_GetGPUVirtualAddress(vio_d3d12.cbuffer_heap);
+            vio_d3d12.cbuffer_heap_capacity = heap_size;
+            vio_d3d12.cbuffer_heap_offset = 0;
+            /* Persistently map (never unmap — valid for UPLOAD heaps in D3D12) */
+            D3D12_RANGE rr = {0, 0};
+            ID3D12Resource_Map(vio_d3d12.cbuffer_heap, 0, &rr, (void **)&vio_d3d12.cbuffer_heap_mapped);
+        }
+    }
+
+    /* Identity instance buffer (single mat4 identity for non-instanced draws on slot 1) */
+    {
+        float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = sizeof(identity);
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (SUCCEEDED(ID3D12Device_CreateCommittedResource(vio_d3d12.device,
+                &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                NULL, &IID_ID3D12Resource, (void **)&vio_d3d12.identity_instance_buf))) {
+            vio_d3d12.identity_instance_gpu = ID3D12Resource_GetGPUVirtualAddress(vio_d3d12.identity_instance_buf);
+            void *mapped = NULL;
+            D3D12_RANGE rr = {0, 0};
+            if (SUCCEEDED(ID3D12Resource_Map(vio_d3d12.identity_instance_buf, 0, &rr, &mapped))) {
+                memcpy(mapped, identity, sizeof(identity));
+                ID3D12Resource_Unmap(vio_d3d12.identity_instance_buf, 0, NULL);
+            }
+        }
     }
 
     vio_d3d12.vsync = cfg->vsync;
@@ -482,6 +557,18 @@ static void d3d12_shutdown(void)
     vio_d3d12_wait_for_gpu();
 
     d3d12_release_render_targets();
+
+    if (vio_d3d12.cbuffer_heap) {
+        ID3D12Resource_Unmap(vio_d3d12.cbuffer_heap, 0, NULL);
+        ID3D12Resource_Release(vio_d3d12.cbuffer_heap);
+        vio_d3d12.cbuffer_heap = NULL;
+        vio_d3d12.cbuffer_heap_mapped = NULL;
+    }
+
+    if (vio_d3d12.identity_instance_buf) {
+        ID3D12Resource_Release(vio_d3d12.identity_instance_buf);
+        vio_d3d12.identity_instance_buf = NULL;
+    }
 
     if (vio_d3d12.depth_buffer) {
         ID3D12Resource_Release(vio_d3d12.depth_buffer);
@@ -648,17 +735,29 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     UINT vertex_stride = 0;
     if (desc->vertex_attrib_count > 0 && desc->vertex_layout) {
         elements = calloc(desc->vertex_attrib_count, sizeof(D3D12_INPUT_ELEMENT_DESC));
-        UINT offset = 0;
+        UINT vertex_offset = 0;
         for (int i = 0; i < desc->vertex_attrib_count; i++) {
+            int loc = desc->vertex_layout[i].location;
             elements[i].SemanticName = vio_usage_to_semantic(desc->vertex_layout[i].usage);
-            elements[i].SemanticIndex = desc->vertex_layout[i].location;
+            elements[i].SemanticIndex = loc;
             elements[i].Format = vio_format_to_dxgi(desc->vertex_layout[i].format);
-            elements[i].InputSlot = 0;
-            elements[i].AlignedByteOffset = offset;
-            elements[i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-            offset += vio_format_byte_size(desc->vertex_layout[i].format);
+
+            if (loc >= 3 && loc <= 6) {
+                /* Per-instance attribute (mat4 columns) — InputSlot 1 */
+                elements[i].InputSlot = 1;
+                elements[i].AlignedByteOffset = (loc - 3) * 16;
+                elements[i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+                elements[i].InstanceDataStepRate = 1;
+            } else {
+                /* Per-vertex attribute — InputSlot 0 */
+                elements[i].InputSlot = 0;
+                elements[i].AlignedByteOffset = vertex_offset;
+                elements[i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+                elements[i].InstanceDataStepRate = 0;
+                vertex_offset += vio_format_byte_size(desc->vertex_layout[i].format);
+            }
         }
-        vertex_stride = offset;
+        vertex_stride = vertex_offset;
     }
     pipeline->vertex_stride = vertex_stride;
 
@@ -1072,7 +1171,7 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
             free_ps_spirv = 1;
         }
 
-        /* SPIR-V -> HLSL SM 5.1 (D3D12 needs register spaces) */
+        /* SPIR-V -> HLSL SM 5.1 */
         allocated_vs = vio_spirv_to_hlsl(vs_spirv, vs_spirv_size, 51, &err);
         if (free_vs_spirv) free(vs_spirv);
         if (!allocated_vs) {
@@ -1183,6 +1282,11 @@ static void d3d12_begin_frame(void)
     vio_d3d12.current_rt_height = vio_d3d12.height;
     vio_d3d12.current_has_rtv = 1;
 
+    /* Reset per-frame allocators */
+    vio_d3d12.cbuffer_heap_offset = 0;
+    vio_d3d12.srv_frame_offset = vio_d3d12.srv_frame_base; /* skip static SRVs */
+    memset(vio_d3d12.pending_srv_valid, 0, sizeof(vio_d3d12.pending_srv_valid));
+
     /* Set viewport and scissor */
     D3D12_VIEWPORT vp = {0};
     vp.Width = (float)vio_d3d12.width;
@@ -1221,12 +1325,21 @@ static void d3d12_draw(vio_draw_cmd *cmd)
 
     vio_d3d12_buffer *vb = (vio_d3d12_buffer *)cmd->vertex_buffer;
     if (vb) {
-        D3D12_VERTEX_BUFFER_VIEW vbv = {0};
-        vbv.BufferLocation = vb->gpu_address;
-        vbv.SizeInBytes = (UINT)vb->size;
-        vbv.StrideInBytes = d3d12_current_pipeline ? d3d12_current_pipeline->vertex_stride : 0;
-        ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 1, &vbv);
+        UINT stride = cmd->vertex_stride > 0 ? (UINT)cmd->vertex_stride
+                    : (d3d12_current_pipeline ? d3d12_current_pipeline->vertex_stride : 0);
+        D3D12_VERTEX_BUFFER_VIEW vbvs[2];
+        /* Slot 0: mesh vertex data */
+        vbvs[0].BufferLocation = vb->gpu_address;
+        vbvs[0].SizeInBytes = (UINT)vb->size;
+        vbvs[0].StrideInBytes = stride;
+        /* Slot 1: identity instance buffer (non-instanced draws) */
+        vbvs[1].BufferLocation = vio_d3d12.identity_instance_gpu;
+        vbvs[1].SizeInBytes = 64;
+        vbvs[1].StrideInBytes = 64;
+        ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 2, vbvs);
     }
+
+    vio_d3d12_flush_srv_table();
 
     UINT instance_count = cmd->instance_count > 0 ? cmd->instance_count : 1;
     ID3D12GraphicsCommandList_DrawInstanced(vio_d3d12.cmd_list,
@@ -1243,11 +1356,16 @@ static void d3d12_draw_indexed(vio_draw_indexed_cmd *cmd)
     vio_d3d12_buffer *ib = (vio_d3d12_buffer *)cmd->index_buffer;
 
     if (vb) {
-        D3D12_VERTEX_BUFFER_VIEW vbv = {0};
-        vbv.BufferLocation = vb->gpu_address;
-        vbv.SizeInBytes = (UINT)vb->size;
-        vbv.StrideInBytes = d3d12_current_pipeline ? d3d12_current_pipeline->vertex_stride : 0;
-        ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 1, &vbv);
+        UINT stride = cmd->vertex_stride > 0 ? (UINT)cmd->vertex_stride
+                    : (d3d12_current_pipeline ? d3d12_current_pipeline->vertex_stride : 0);
+        D3D12_VERTEX_BUFFER_VIEW vbvs[2];
+        vbvs[0].BufferLocation = vb->gpu_address;
+        vbvs[0].SizeInBytes = (UINT)vb->size;
+        vbvs[0].StrideInBytes = stride;
+        vbvs[1].BufferLocation = vio_d3d12.identity_instance_gpu;
+        vbvs[1].SizeInBytes = 64;
+        vbvs[1].StrideInBytes = 64;
+        ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 2, vbvs);
     }
 
     if (ib) {
@@ -1257,6 +1375,8 @@ static void d3d12_draw_indexed(vio_draw_indexed_cmd *cmd)
         ibv.Format = DXGI_FORMAT_R32_UINT;
         ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
     }
+
+    vio_d3d12_flush_srv_table();
 
     UINT instance_count = cmd->instance_count > 0 ? cmd->instance_count : 1;
     ID3D12GraphicsCommandList_DrawIndexedInstanced(vio_d3d12.cmd_list,
@@ -1329,10 +1449,8 @@ static int d3d12_supports_feature(vio_feature feature)
 
 static void d3d12_set_uniform(const char *name, const void *data, int count, int type)
 {
-    /* D3D12: uniforms are mapped to root constants or CBV descriptors.
-     * SPIRV-Cross transpiles GLSL uniforms into a cbuffer at register(b0).
-     * Use SetGraphicsRoot32BitConstants for small uniform data. */
-
+    /* Fallback: push small uniform data as root 32-bit constants to VS (root param 0).
+     * This only works for shaders with small cbuffers. The cbuffer system is preferred. */
     size_t float_count;
     switch (type) {
         case VIO_UNIFORM_INT:   float_count = 1 * count; break;
@@ -1344,24 +1462,65 @@ static void d3d12_set_uniform(const char *name, const void *data, int count, int
         case VIO_UNIFORM_MAT4:  float_count = 16 * count; break;
         default: return;
     }
-
-    /* Root parameter 0 = 32-bit constants (set in root signature creation) */
-    if (float_count > 0 && float_count <= 64) {
-        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(
-            vio_d3d12.cmd_list, 0, (UINT)float_count, data, 0);
-    }
+    (void)name; (void)float_count; (void)data;
 }
 
 static void d3d12_bind_texture(void *texture, int slot)
 {
-    if (!texture) return;
+    if (!texture || slot < 0 || slot >= 8) return;
     vio_d3d12_texture *tex = (vio_d3d12_texture *)texture;
 
-    /* Bind SRV descriptor table at root parameter 1 */
-    if (tex->srv_gpu.ptr) {
-        ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(
-            vio_d3d12.cmd_list, 1, tex->srv_gpu);
+    /* Store pending binding — flushed before draw via d3d12_flush_srv_table() */
+    vio_d3d12.pending_srvs[slot] = tex->srv_cpu;
+    vio_d3d12.pending_srv_valid[slot] = 1;
+}
+
+/* Flush pending texture bindings into a contiguous SRV descriptor block */
+void vio_d3d12_flush_srv_table(void)
+{
+    int any_bound = 0;
+    for (int i = 0; i < 8; i++) {
+        if (vio_d3d12.pending_srv_valid[i]) { any_bound = 1; break; }
     }
+    if (!any_bound) return; /* no textures — skip descriptor table binding entirely */
+
+    /* Allocate 8 contiguous descriptors from the SRV heap */
+    UINT base_idx = vio_d3d12.srv_frame_offset;
+    if (base_idx + 8 > vio_d3d12.srv_heap.capacity) return; /* out of space */
+    vio_d3d12.srv_frame_offset += 8;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dst_cpu;
+    D3D12_GPU_DESCRIPTOR_HANDLE dst_gpu;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &dst_cpu);
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &dst_gpu);
+    dst_cpu.ptr += base_idx * vio_d3d12.srv_heap.descriptor_size;
+    dst_gpu.ptr += base_idx * vio_d3d12.srv_heap.descriptor_size;
+
+    /* Create null SRV for all 8 slots first, then overwrite bound ones */
+    for (int i = 0; i < 8; i++) {
+        D3D12_CPU_DESCRIPTOR_HANDLE slot_cpu = dst_cpu;
+        slot_cpu.ptr += i * vio_d3d12.srv_heap.descriptor_size;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC null_srv = {0};
+        null_srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        null_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        null_srv.Texture2D.MipLevels = 1;
+        ID3D12Device_CreateShaderResourceView(vio_d3d12.device, NULL, &null_srv, slot_cpu);
+    }
+
+    /* Overwrite bound slots with actual texture SRVs */
+    for (int i = 0; i < 8; i++) {
+        if (vio_d3d12.pending_srv_valid[i] && vio_d3d12.pending_srvs[i].ptr) {
+            D3D12_CPU_DESCRIPTOR_HANDLE slot_cpu = dst_cpu;
+            slot_cpu.ptr += i * vio_d3d12.srv_heap.descriptor_size;
+            ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1,
+                slot_cpu, vio_d3d12.pending_srvs[i],
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+    }
+
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, 2, dst_gpu);
 }
 
 static void d3d12_set_viewport(int x, int y, int width, int height)

@@ -151,10 +151,27 @@ char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_mod
         size_t sampled_count;
         spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
                                                    &sampled_images, &sampled_count);
-        /* Assign unique texture (t) and sampler (s) registers per combined image-sampler */
+        /* Assign unique texture (t) and sampler (s) registers per combined image-sampler.
+         * For SM 5.1 (D3D12): depth/shadow samplers get registers 4+ so they map to
+         * comparison static samplers in the root signature. Regular samplers get 0+. */
+        unsigned int regular_idx = 0;
+        unsigned int shadow_idx = 4; /* offset for comparison static samplers */
         for (size_t i = 0; i < sampled_count; i++) {
+            /* Check if this is a depth sampler (sampler2DShadow) */
+            int is_depth_sampler = 0;
+            if (shader_model >= 51) {
+                spvc_type sampled_type = spvc_compiler_get_type_handle(compiler, sampled_images[i].type_id);
+                if (sampled_type) {
+                    spvc_type img_type = spvc_compiler_get_type_handle(compiler,
+                        spvc_type_get_base_type_id(sampled_type));
+                    if (img_type && spvc_type_get_image_is_depth(img_type)) {
+                        is_depth_sampler = 1;
+                    }
+                }
+            }
+            unsigned int binding = is_depth_sampler ? shadow_idx++ : regular_idx++;
             spvc_compiler_set_decoration(compiler, sampled_images[i].id,
-                                          SpvDecorationBinding, (unsigned int)i);
+                                          SpvDecorationBinding, binding);
         }
 
         /* Also handle separate images and samplers */

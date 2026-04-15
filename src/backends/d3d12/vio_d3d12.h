@@ -14,7 +14,7 @@
 #include <d3dcompiler.h>
 
 #define VIO_D3D12_FRAME_COUNT 2
-#define VIO_D3D12_MAX_SRV_DESCRIPTORS 1024
+#define VIO_D3D12_MAX_SRV_DESCRIPTORS 32768
 
 /* Compiled shader pair (vertex + pixel) */
 typedef struct _vio_d3d12_shader {
@@ -103,6 +103,26 @@ typedef struct _vio_d3d12_state {
     int current_rt_width;
     int current_rt_height;
     int current_has_rtv;  /* 0 = depth-only when offscreen */
+    void *current_bound_rt; /* vio_render_target_object* for barrier tracking */
+
+    /* Pending texture bindings (flushed before each draw into a contiguous SRV block) */
+    D3D12_CPU_DESCRIPTOR_HANDLE pending_srvs[8]; /* CPU handles of bound textures */
+    int                          pending_srv_valid[8]; /* 1 if slot has a texture */
+
+    /* Per-frame linear SRV descriptor allocator (contiguous blocks for descriptor tables) */
+    UINT                       srv_frame_offset; /* current allocation offset in srv_heap */
+    UINT                       srv_frame_base;   /* first index reserved for per-frame allocs */
+
+    /* Per-frame linear cbuffer allocator (avoids overwriting between draw calls) */
+    ID3D12Resource            *cbuffer_heap;          /* large UPLOAD heap */
+    D3D12_GPU_VIRTUAL_ADDRESS  cbuffer_heap_gpu;
+    unsigned char             *cbuffer_heap_mapped;    /* persistently mapped */
+    UINT                       cbuffer_heap_offset;    /* current allocation offset */
+    UINT                       cbuffer_heap_capacity;  /* total size */
+
+    /* Dummy identity instance buffer (bound to slot 1 for non-instanced draws) */
+    ID3D12Resource            *identity_instance_buf;
+    D3D12_GPU_VIRTUAL_ADDRESS  identity_instance_gpu;
 
     /* State */
     int   initialized;
@@ -124,6 +144,9 @@ void vio_backend_d3d12_register(void);
 
 /* Called after GLFW window creation to set up D3D12 */
 int vio_d3d12_setup_context(void *glfw_window, vio_config *cfg);
+
+/* Flush pending texture bindings into a contiguous SRV block (call before draw) */
+void vio_d3d12_flush_srv_table(void);
 
 /* Waits for GPU to finish all pending work */
 void vio_d3d12_wait_for_gpu(void);

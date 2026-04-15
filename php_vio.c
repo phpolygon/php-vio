@@ -1223,10 +1223,34 @@ ZEND_FUNCTION(vio_draw)
             }
 #endif
 #ifdef HAVE_D3D12
-            if (strcmp(ctx->backend->name, "d3d12") == 0 && sh->cbuffer_backend && vio_d3d12.initialized) {
-                vio_d3d12_buffer *cb = (vio_d3d12_buffer *)sh->cbuffer_backend;
-                ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
-                    vio_d3d12.cmd_list, 0, cb->gpu_address);
+            if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+                /* Allocate per-draw cbuffer slices from the linear allocator.
+                 * Each draw gets its own 256-byte-aligned slice so previous
+                 * draw data isn't overwritten (D3D12 has no buffer renaming). */
+                if (sh->cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
+                    UINT aligned = (sh->cbuffer_total_size + 255) & ~255;
+                    UINT offset = vio_d3d12.cbuffer_heap_offset;
+                    if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
+                        memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
+                               sh->cbuffer_data, sh->cbuffer_total_size);
+                        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+                            vio_d3d12.cmd_list, 0,
+                            vio_d3d12.cbuffer_heap_gpu + offset);
+                        vio_d3d12.cbuffer_heap_offset = offset + aligned;
+                    }
+                }
+                if (sh->frag_cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
+                    UINT aligned = (sh->frag_cbuffer_total_size + 255) & ~255;
+                    UINT offset = vio_d3d12.cbuffer_heap_offset;
+                    if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
+                        memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
+                               sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+                            vio_d3d12.cmd_list, 1,
+                            vio_d3d12.cbuffer_heap_gpu + offset);
+                        vio_d3d12.cbuffer_heap_offset = offset + aligned;
+                    }
+                }
             }
 #endif
         }
@@ -2045,6 +2069,14 @@ ZEND_FUNCTION(vio_bind_texture)
                 }
             }
         }
+        /* D3D12: depth/shadow samplers are remapped to registers 4+ by SPIRV-Cross.
+         * The reflection-based hlsl_slot doesn't account for this, so add the offset. */
+#ifdef HAVE_D3D12
+        if (strcmp(ctx->backend->name, "d3d12") == 0 && shader_wants_depth) {
+            hlsl_slot += 4;
+        }
+#endif
+
         ctx->backend->bind_texture(tex->backend_texture, hlsl_slot);
 
 #ifdef HAVE_D3D11
@@ -4896,6 +4928,115 @@ ZEND_FUNCTION(vio_draw_instanced)
             }
         } else
 #endif
+#ifdef HAVE_D3D12
+        if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+            UINT byte_size = (UINT)mat_size;
+
+            /* Persistent UPLOAD heap instance buffer */
+            static ID3D12Resource *s_d3d12_instance_buf = NULL;
+            static UINT s_d3d12_instance_capacity = 0;
+            static D3D12_GPU_VIRTUAL_ADDRESS s_d3d12_instance_gpu = 0;
+
+            if (!s_d3d12_instance_buf || s_d3d12_instance_capacity < byte_size) {
+                if (s_d3d12_instance_buf) {
+                    ID3D12Resource_Release(s_d3d12_instance_buf);
+                    s_d3d12_instance_buf = NULL;
+                }
+                D3D12_HEAP_PROPERTIES heap_props = {0};
+                heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+                D3D12_RESOURCE_DESC res_desc = {0};
+                res_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                res_desc.Width = byte_size;
+                res_desc.Height = 1;
+                res_desc.DepthOrArraySize = 1;
+                res_desc.MipLevels = 1;
+                res_desc.SampleDesc.Count = 1;
+                res_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+                HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device,
+                    &heap_props, D3D12_HEAP_FLAG_NONE, &res_desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                    &IID_ID3D12Resource, (void **)&s_d3d12_instance_buf);
+                if (FAILED(hr)) { if (allocated) efree(allocated); return; }
+                s_d3d12_instance_capacity = byte_size;
+                s_d3d12_instance_gpu = ID3D12Resource_GetGPUVirtualAddress(s_d3d12_instance_buf);
+            }
+
+            /* Upload */
+            void *mapped = NULL;
+            D3D12_RANGE read_range = {0, 0};
+            if (SUCCEEDED(ID3D12Resource_Map(s_d3d12_instance_buf, 0, &read_range, &mapped))) {
+                memcpy(mapped, mat_data, byte_size);
+                ID3D12Resource_Unmap(s_d3d12_instance_buf, 0, NULL);
+            }
+
+            /* Flush cbuffers */
+            if (ctx->bound_shader_object) {
+                vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+                if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
+                    ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size);
+                    sh->cbuffer_dirty = 0;
+                }
+                if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
+                    ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                    sh->frag_cbuffer_dirty = 0;
+                }
+                /* Allocate per-draw cbuffer slices from linear allocator */
+                if (sh->cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
+                    UINT aligned = (sh->cbuffer_total_size + 255) & ~255;
+                    UINT offset = vio_d3d12.cbuffer_heap_offset;
+                    if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
+                        memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
+                               sh->cbuffer_data, sh->cbuffer_total_size);
+                        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+                            vio_d3d12.cmd_list, 0,
+                            vio_d3d12.cbuffer_heap_gpu + offset);
+                        vio_d3d12.cbuffer_heap_offset = offset + aligned;
+                    }
+                }
+                if (sh->frag_cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
+                    UINT aligned = (sh->frag_cbuffer_total_size + 255) & ~255;
+                    UINT offset = vio_d3d12.cbuffer_heap_offset;
+                    if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
+                        memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
+                               sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+                            vio_d3d12.cmd_list, 1,
+                            vio_d3d12.cbuffer_heap_gpu + offset);
+                        vio_d3d12.cbuffer_heap_offset = offset + aligned;
+                    }
+                }
+            }
+
+            /* Bind vertex buffers: slot 0 = mesh, slot 1 = instances */
+            vio_d3d12_buffer *vb = (vio_d3d12_buffer *)mesh->backend_vb;
+            D3D12_VERTEX_BUFFER_VIEW vbvs[2];
+            vbvs[0].BufferLocation = vb->gpu_address;
+            vbvs[0].SizeInBytes = (UINT)vb->size;
+            vbvs[0].StrideInBytes = (UINT)mesh->stride;
+            vbvs[1].BufferLocation = s_d3d12_instance_gpu;
+            vbvs[1].SizeInBytes = byte_size;
+            vbvs[1].StrideInBytes = 64; /* sizeof(mat4) */
+            ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 2, vbvs);
+
+            /* Draw */
+            if (mesh->index_count > 0 && mesh->backend_ib) {
+                vio_d3d12_buffer *ib = (vio_d3d12_buffer *)mesh->backend_ib;
+                D3D12_INDEX_BUFFER_VIEW ibv = {0};
+                ibv.BufferLocation = ib->gpu_address;
+                ibv.SizeInBytes = (UINT)ib->size;
+                ibv.Format = DXGI_FORMAT_R32_UINT;
+                ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
+                vio_d3d12_flush_srv_table();
+                ID3D12GraphicsCommandList_DrawIndexedInstanced(vio_d3d12.cmd_list,
+                    mesh->index_count, (UINT)instance_count, 0, 0, 0);
+            } else {
+                vio_d3d12_flush_srv_table();
+                ID3D12GraphicsCommandList_DrawInstanced(vio_d3d12.cmd_list,
+                    mesh->vertex_count, (UINT)instance_count, 0, 0);
+            }
+        } else
+#endif
         {
             /* Fallback for other backends */
             if (mesh->index_count > 0 && mesh->backend_ib && ctx->backend->draw_indexed) {
@@ -5198,7 +5339,7 @@ ZEND_FUNCTION(vio_render_target)
         depth_res_desc.Height = height;
         depth_res_desc.DepthOrArraySize = 1;
         depth_res_desc.MipLevels = 1;
-        depth_res_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        depth_res_desc.Format = depth_only ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_D24_UNORM_S8_UINT;
         depth_res_desc.SampleDesc.Count = 1;
         depth_res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
 
@@ -5226,10 +5367,35 @@ ZEND_FUNCTION(vio_render_target)
         }
         rt->d3d12_depth_resource = depth_res;
 
-        /* Create DSV */
+        /* Create DSV (explicit format for typeless resources) */
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsv_view_desc = {0};
+        dsv_view_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dsv_view_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
         D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
         ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsv_heap, &dsv_handle);
-        ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, NULL, dsv_handle);
+        ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res,
+            depth_only ? &dsv_view_desc : NULL, dsv_handle);
+
+        /* For depth-only targets: pre-create SRV for shadow map sampling */
+        if (depth_only && vio_d3d12.srv_heap.count < vio_d3d12.srv_heap.capacity) {
+            UINT srv_idx = vio_d3d12.srv_heap.count++;
+            D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
+            D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu;
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &srv_cpu);
+            ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &srv_gpu);
+            srv_cpu.ptr += srv_idx * vio_d3d12.srv_heap.descriptor_size;
+            srv_gpu.ptr += srv_idx * vio_d3d12.srv_heap.descriptor_size;
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+            srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv_desc.Texture2D.MipLevels = 1;
+            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, depth_res, &srv_desc, srv_cpu);
+
+            rt->d3d12_depth_srv_gpu = srv_gpu.ptr;
+            rt->d3d12_depth_srv_cpu = srv_cpu.ptr;
+        }
 
         rt->backend_type = VIO_RT_BACKEND_D3D12;
     }
@@ -5305,6 +5471,18 @@ ZEND_FUNCTION(vio_bind_render_target)
 
 #ifdef HAVE_D3D12
     if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized) {
+        /* Barrier: if depth resource was used as SRV last frame, transition back to DEPTH_WRITE */
+        if (rt->d3d12_depth_resource && rt->d3d12_depth_is_srv) {
+            D3D12_RESOURCE_BARRIER barrier = {0};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = (ID3D12Resource *)rt->d3d12_depth_resource;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+            rt->d3d12_depth_is_srv = 0;
+        }
+
         D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
         ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
             (ID3D12DescriptorHeap *)rt->d3d12_dsv_heap, &dsv_handle);
@@ -5333,6 +5511,8 @@ ZEND_FUNCTION(vio_bind_render_target)
 
         D3D12_RECT scissor = {0, 0, rt->width, rt->height};
         ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
+
+        vio_d3d12.current_bound_rt = rt;
     }
 #endif
 }
@@ -5391,6 +5571,27 @@ ZEND_FUNCTION(vio_unbind_render_target)
 
 #ifdef HAVE_D3D12
     if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+        /* Barrier: transition the offscreen depth resource to SRV for shadow sampling.
+         * We find the currently bound RT's depth resource from the DSV heap.
+         * Since we track the RT object via current_dsv, and the depth_resource is stored
+         * on the render target object, we use a flag approach:
+         * If the render target was depth-only, its depth resource needs the barrier. */
+        /* Barrier: transition shadow map depth from DEPTH_WRITE → SRV for sampling */
+        if (vio_d3d12.current_bound_rt) {
+            vio_render_target_object *bound_rt = (vio_render_target_object *)vio_d3d12.current_bound_rt;
+            if (bound_rt->d3d12_depth_resource && bound_rt->depth_only) {
+                D3D12_RESOURCE_BARRIER barrier = {0};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = (ID3D12Resource *)bound_rt->d3d12_depth_resource;
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+                bound_rt->d3d12_depth_is_srv = 1;
+            }
+            vio_d3d12.current_bound_rt = NULL;
+        }
+
         /* Restore main swapchain render target */
         vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
 
@@ -5486,6 +5687,19 @@ ZEND_FUNCTION(vio_render_target_texture)
 
             tex->backend_texture = d3d_tex;
         }
+    }
+#endif
+
+#ifdef HAVE_D3D12
+    /* For D3D12: use pre-created SRV from render target (allocated once at RT creation) */
+    if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized && rt->depth_only && rt->d3d12_depth_srv_gpu) {
+        vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
+        d3d_tex->resource = NULL; /* owned by render target, don't release */
+        d3d_tex->width = rt->width;
+        d3d_tex->height = rt->height;
+        d3d_tex->srv_gpu.ptr = rt->d3d12_depth_srv_gpu;
+        d3d_tex->srv_cpu.ptr = rt->d3d12_depth_srv_cpu;
+        tex->backend_texture = d3d_tex;
     }
 #endif
 
