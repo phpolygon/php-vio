@@ -31,6 +31,7 @@ typedef struct _vio_reflect_resource {
     unsigned int set;
     unsigned int binding;
     unsigned int location;
+    unsigned int vecsize;   /* component count: 1=float, 2=vec2, 3=vec3, 4=vec4/mat4 */
 } vio_reflect_resource;
 
 /* Reflection result */

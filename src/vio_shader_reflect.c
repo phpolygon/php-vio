@@ -210,6 +210,10 @@ static void copy_resources(spvc_compiler compiler, spvc_resources resources,
         (*out)[i].set      = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet);
         (*out)[i].binding  = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
         (*out)[i].location = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationLocation);
+
+        /* Extract vector size from type (1=float, 2=vec2, 3=vec3, 4=vec4) */
+        spvc_type type_handle = spvc_compiler_get_type_handle(compiler, list[i].type_id);
+        (*out)[i].vecsize = type_handle ? spvc_type_get_vector_size(type_handle) : 3;
     }
 }
 
@@ -328,20 +332,69 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
 
         for (unsigned int i = 0; i < member_count && count < max_entries; i++) {
             const char *name = spvc_compiler_get_member_name(compiler, type_id, i);
-            unsigned int offset = 0;
+            unsigned int base_offset = 0;
             size_t member_size = 0;
-            spvc_compiler_type_struct_member_offset(compiler, type, i, &offset);
+            spvc_compiler_type_struct_member_offset(compiler, type, i, &base_offset);
             spvc_compiler_get_declared_struct_member_size(compiler, type, i, &member_size);
 
-            if (name && name[0]) {
+            if (!name || !name[0]) continue;
+
+            /* Check if this member is a struct array (e.g. DirLight u_dir_lights[16]) */
+            spvc_type_id member_type_id = spvc_type_get_member_type(type, i);
+            spvc_type member_type = spvc_compiler_get_type_handle(compiler, member_type_id);
+            unsigned int num_array_dims = spvc_type_get_num_array_dimensions(member_type);
+
+            /* For array-of-struct, get the element (struct) type via parent_type */
+            spvc_type_id elem_type_id = 0;
+            spvc_type elem_type = NULL;
+            unsigned int num_struct_members = 0;
+
+            if (num_array_dims > 0) {
+                elem_type_id = spvc_type_get_base_type_id(member_type);
+                if (elem_type_id) {
+                    elem_type = spvc_compiler_get_type_handle(compiler, elem_type_id);
+                    num_struct_members = spvc_type_get_num_member_types(elem_type);
+                }
+            }
+
+            if (num_array_dims > 0 && num_struct_members > 0 && elem_type) {
+                /* Struct array: flatten to name[idx].field entries */
+                unsigned int array_size = spvc_type_get_array_dimension(member_type, 0);
+                unsigned int array_stride = 0;
+                spvc_compiler_type_struct_member_array_stride(compiler, type, i, &array_stride);
+
+                if (array_stride == 0 && array_size > 1) {
+                    array_stride = (unsigned int)(member_size / array_size);
+                }
+
+                for (unsigned int ai = 0; ai < array_size && count < max_entries; ai++) {
+                    for (unsigned int si = 0; si < num_struct_members && count < max_entries; si++) {
+                        const char *field = spvc_compiler_get_member_name(compiler, elem_type_id, si);
+                        unsigned int field_offset = 0;
+                        size_t field_size = 0;
+                        spvc_compiler_type_struct_member_offset(compiler, elem_type, si, &field_offset);
+                        spvc_compiler_get_declared_struct_member_size(compiler, elem_type, si, &field_size);
+
+                        if (field && field[0]) {
+                            snprintf(entries[count].name, sizeof(entries[count].name),
+                                     "%s[%u].%s", name, ai, field);
+                            entries[count].offset = (int)(base_offset + ai * array_stride + field_offset);
+                            entries[count].size = (int)field_size;
+                            int end = entries[count].offset + (int)field_size;
+                            if (end > *total_size) *total_size = end;
+                            count++;
+                        }
+                    }
+                }
+            } else {
+                /* Simple scalar/vector/matrix member */
                 strncpy(entries[count].name, name, sizeof(entries[count].name) - 1);
                 entries[count].name[sizeof(entries[count].name) - 1] = '\0';
-                entries[count].offset = (int)offset;
+                entries[count].offset = (int)base_offset;
                 entries[count].size = (int)member_size;
-                count++;
-
-                int end = (int)(offset + member_size);
+                int end = (int)(base_offset + member_size);
                 if (end > *total_size) *total_size = end;
+                count++;
             }
         }
     }

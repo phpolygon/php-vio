@@ -202,6 +202,7 @@ typedef struct _vio_draw_cmd {
     int   vertex_count;
     int   first_vertex;
     int   instance_count;
+    int   vertex_stride;    /* mesh stride in bytes (overrides pipeline stride if > 0) */
 } vio_draw_cmd;
 
 typedef struct _vio_draw_indexed_cmd {
@@ -212,6 +213,7 @@ typedef struct _vio_draw_indexed_cmd {
     int   first_index;
     int   vertex_offset;
     int   instance_count;
+    int   vertex_stride;    /* mesh stride in bytes (overrides pipeline stride if > 0) */
 } vio_draw_indexed_cmd;
 
 typedef struct _vio_compute_cmd {

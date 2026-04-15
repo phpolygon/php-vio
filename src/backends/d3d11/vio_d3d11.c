@@ -338,25 +338,50 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
     if (pipeline->ps) ID3D11PixelShader_AddRef(pipeline->ps);
     pipeline->topology = vio_topology_to_d3d11(desc->topology);
 
-    /* Input layout from vertex attributes */
+    /* Input layout from vertex attributes.
+     * Separate per-vertex (slot 0, locations 0-2) from per-instance (slot 1, locations 3-6). */
     if (desc->vertex_attrib_count > 0 && desc->vertex_layout) {
-        D3D11_INPUT_ELEMENT_DESC *elements = calloc(desc->vertex_attrib_count,
-                                                     sizeof(D3D11_INPUT_ELEMENT_DESC));
-        UINT offset = 0;
+        /* Count per-vertex vs per-instance attributes */
+        int per_vertex_count = 0;
+        int per_instance_count = 0;
         for (int i = 0; i < desc->vertex_attrib_count; i++) {
-            elements[i].SemanticName = vio_usage_to_semantic(desc->vertex_layout[i].usage);
-            elements[i].SemanticIndex = desc->vertex_layout[i].location;
-            elements[i].Format = vio_format_to_dxgi(desc->vertex_layout[i].format);
-            elements[i].InputSlot = 0;
-            elements[i].AlignedByteOffset = offset;
-            elements[i].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
-            elements[i].InstanceDataStepRate = 0;
-            offset += vio_format_byte_size(desc->vertex_layout[i].format);
+            if (desc->vertex_layout[i].location >= 3 && desc->vertex_layout[i].location <= 6)
+                per_instance_count++;
+            else
+                per_vertex_count++;
         }
-        pipeline->vertex_stride = offset;
+
+        int total_elements = desc->vertex_attrib_count;
+        D3D11_INPUT_ELEMENT_DESC *elements = calloc(total_elements,
+                                                     sizeof(D3D11_INPUT_ELEMENT_DESC));
+        UINT vertex_offset = 0;
+        UINT instance_offset = 0;
+
+        for (int i = 0; i < desc->vertex_attrib_count; i++) {
+            int loc = desc->vertex_layout[i].location;
+            elements[i].SemanticName = vio_usage_to_semantic(desc->vertex_layout[i].usage);
+            elements[i].SemanticIndex = loc;
+            elements[i].Format = vio_format_to_dxgi(desc->vertex_layout[i].format);
+
+            if (loc >= 3 && loc <= 6) {
+                /* Per-instance attribute (mat4 columns) — InputSlot 1 */
+                elements[i].InputSlot = 1;
+                elements[i].AlignedByteOffset = (loc - 3) * 16;  /* 4 floats per column */
+                elements[i].InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
+                elements[i].InstanceDataStepRate = 1;
+            } else {
+                /* Per-vertex attribute — InputSlot 0 */
+                elements[i].InputSlot = 0;
+                elements[i].AlignedByteOffset = vertex_offset;
+                elements[i].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+                elements[i].InstanceDataStepRate = 0;
+                vertex_offset += vio_format_byte_size(desc->vertex_layout[i].format);
+            }
+        }
+        pipeline->vertex_stride = vertex_offset;
 
         hr = ID3D11Device_CreateInputLayout(vio_d3d11.device,
-                                             elements, desc->vertex_attrib_count,
+                                             elements, total_elements,
                                              ID3D10Blob_GetBufferPointer(shader->vs_blob),
                                              ID3D10Blob_GetBufferSize(shader->vs_blob),
                                              &pipeline->input_layout);
@@ -816,7 +841,8 @@ static void d3d11_draw(vio_draw_cmd *cmd)
 
     vio_d3d11_buffer *vb = (vio_d3d11_buffer *)cmd->vertex_buffer;
     if (vb) {
-        UINT stride = d3d11_current_pipeline ? d3d11_current_pipeline->vertex_stride : 0;
+        UINT stride = cmd->vertex_stride > 0 ? (UINT)cmd->vertex_stride
+                    : (d3d11_current_pipeline ? d3d11_current_pipeline->vertex_stride : 0);
         UINT offset = 0;
         ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 1,
                                                &vb->buffer, &stride, &offset);
@@ -837,7 +863,8 @@ static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
     vio_d3d11_buffer *ib = (vio_d3d11_buffer *)cmd->index_buffer;
 
     if (vb) {
-        UINT stride = d3d11_current_pipeline ? d3d11_current_pipeline->vertex_stride : 0;
+        UINT stride = cmd->vertex_stride > 0 ? (UINT)cmd->vertex_stride
+                    : (d3d11_current_pipeline ? d3d11_current_pipeline->vertex_stride : 0);
         UINT offset = 0;
         ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 1,
                                                &vb->buffer, &stride, &offset);

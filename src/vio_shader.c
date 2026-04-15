@@ -20,13 +20,11 @@ static zend_object *vio_shader_create_object(zend_class_entry *ce)
 {
     vio_shader_object *shader = zend_object_alloc(sizeof(vio_shader_object), ce);
 
-    shader->program         = 0;
-    shader->format          = VIO_SHADER_AUTO;
-    shader->vert_spirv      = NULL;
-    shader->vert_spirv_size = 0;
-    shader->frag_spirv      = NULL;
-    shader->frag_spirv_size = 0;
-    shader->valid           = 0;
+    /* Zero everything before std (which is at the end of the struct) */
+    memset(shader, 0, XtOffsetOf(vio_shader_object, std));
+
+    shader->format = VIO_SHADER_AUTO;
+    for (int i = 0; i < 16; i++) shader->gl_to_hlsl_sampler[i] = -1;
 
     zend_object_std_init(&shader->std, ce);
     object_properties_init(&shader->std, ce);
@@ -54,6 +52,9 @@ static void vio_shader_free_object(zend_object *obj)
         free(shader->frag_spirv);
         shader->frag_spirv = NULL;
     }
+
+    /* Backend cbuffers are owned by the backend — no free needed here
+     * (they are D3D11 COM objects released on context teardown) */
 
     zend_object_std_dtor(&shader->std);
 }

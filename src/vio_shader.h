@@ -12,8 +12,9 @@
 #include "php.h"
 #include "../include/vio_types.h"
 
-#define VIO_MAX_UNIFORMS 64
+#define VIO_MAX_UNIFORMS 256
 #define VIO_CBUFFER_SIZE 4096
+#define VIO_MAX_SAMPLERS 16
 
 typedef struct _vio_uniform_entry {
     char    name[64];
@@ -29,13 +30,25 @@ typedef struct _vio_shader_object {
     uint32_t         *frag_spirv;    /* SPIR-V binary for fragment shader */
     size_t            frag_spirv_size;
     void             *backend_shader; /* Backend-specific compiled shader (D3D11/D3D12/Vulkan) */
-    /* Uniform buffer for D3D constant buffer mapping */
+    /* Uniform buffer for D3D constant buffer mapping — vertex stage */
     unsigned char     cbuffer_data[VIO_CBUFFER_SIZE];
     vio_uniform_entry uniforms[VIO_MAX_UNIFORMS];
     int               uniform_count;
     int               cbuffer_total_size;
-    void             *cbuffer_backend;  /* Backend constant buffer */
+    void             *cbuffer_backend;  /* Backend constant buffer (vertex) */
     int               cbuffer_dirty;    /* 1 if data changed since last upload */
+    /* Fragment stage constant buffer */
+    unsigned char     frag_cbuffer_data[VIO_CBUFFER_SIZE];
+    vio_uniform_entry frag_uniforms[VIO_MAX_UNIFORMS];
+    int               frag_uniform_count;
+    int               frag_cbuffer_total_size;
+    void             *frag_cbuffer_backend;
+    int               frag_cbuffer_dirty;
+    /* Sampler binding map: sampler_names[i] -> hlsl register i */
+    char              sampler_names[VIO_MAX_SAMPLERS][64];
+    int               sampler_count;
+    /* Runtime GL-slot to HLSL-binding remap: gl_to_hlsl[gl_slot] = hlsl_binding (-1 = unmapped) */
+    int               gl_to_hlsl_sampler[16];
     int               valid;
     zend_object       std;
 } vio_shader_object;

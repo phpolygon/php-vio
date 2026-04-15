@@ -1157,20 +1157,39 @@ ZEND_FUNCTION(vio_draw)
 
     /* Backend draw (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0) {
-        /* Flush uniform cbuffer before drawing */
+        /* Flush uniform cbuffers before drawing */
         if (ctx->bound_shader_object) {
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+
+            /* Upload vertex cbuffer */
             if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
                 ctx->backend->update_buffer(sh->cbuffer_backend,
                     sh->cbuffer_data, sh->cbuffer_total_size);
                 sh->cbuffer_dirty = 0;
             }
-            /* Bind constant buffer to slot b0 */
+            /* Upload fragment cbuffer */
+            if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
+                ctx->backend->update_buffer(sh->frag_cbuffer_backend,
+                    sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                sh->frag_cbuffer_dirty = 0;
+            }
+
 #ifdef HAVE_D3D11
-            if (strcmp(ctx->backend->name, "d3d11") == 0 && sh->cbuffer_backend && vio_d3d11.initialized) {
-                vio_d3d11_buffer *cb = (vio_d3d11_buffer *)sh->cbuffer_backend;
-                ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
-                ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
+            if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+                /* Bind vertex cbuffer to VS slot b0 */
+                if (sh->cbuffer_backend) {
+                    vio_d3d11_buffer *cb = (vio_d3d11_buffer *)sh->cbuffer_backend;
+                    ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
+                    /* Also bind to PS b0 if no separate fragment cbuffer */
+                    if (!sh->frag_cbuffer_backend) {
+                        ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
+                    }
+                }
+                /* Bind fragment cbuffer to PS slot b0 */
+                if (sh->frag_cbuffer_backend) {
+                    vio_d3d11_buffer *fcb = (vio_d3d11_buffer *)sh->frag_cbuffer_backend;
+                    ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &fcb->buffer);
+                }
             }
 #endif
 #ifdef HAVE_D3D12
@@ -1189,6 +1208,7 @@ ZEND_FUNCTION(vio_draw)
             cmd.first_index = 0;
             cmd.vertex_offset = 0;
             cmd.instance_count = 1;
+            cmd.vertex_stride = mesh->stride;
             ctx->backend->draw_indexed(&cmd);
         } else if (mesh->backend_vb && ctx->backend->draw) {
             vio_draw_cmd cmd = {0};
@@ -1196,6 +1216,7 @@ ZEND_FUNCTION(vio_draw)
             cmd.vertex_count = mesh->vertex_count;
             cmd.first_vertex = 0;
             cmd.instance_count = 1;
+            cmd.vertex_stride = mesh->stride;
             ctx->backend->draw(&cmd);
         }
     }
@@ -1393,7 +1414,7 @@ ZEND_FUNCTION(vio_shader)
                 &shader->cbuffer_total_size);
             memset(shader->cbuffer_data, 0, sizeof(shader->cbuffer_data));
 
-            /* Create backend constant buffer */
+            /* Create backend constant buffer for vertex stage */
             if (shader->cbuffer_total_size > 0 && ctx->backend->create_buffer) {
                 vio_buffer_desc cb_desc = {0};
                 cb_desc.type = VIO_BUFFER_UNIFORM;
@@ -1401,6 +1422,44 @@ ZEND_FUNCTION(vio_shader)
                 cb_desc.size = shader->cbuffer_total_size;
                 cb_desc.binding = 0;
                 shader->cbuffer_backend = ctx->backend->create_buffer(&cb_desc);
+            }
+        }
+
+        /* Extract fragment shader uniforms */
+        if (shader->frag_spirv) {
+            shader->frag_uniform_count = vio_spirv_get_uniform_offsets(
+                shader->frag_spirv, shader->frag_spirv_size,
+                shader->frag_uniforms, VIO_MAX_UNIFORMS,
+                &shader->frag_cbuffer_total_size);
+            memset(shader->frag_cbuffer_data, 0, sizeof(shader->frag_cbuffer_data));
+
+            /* Create backend constant buffer for fragment stage */
+            if (shader->frag_cbuffer_total_size > 0 && ctx->backend->create_buffer) {
+                vio_buffer_desc cb_desc = {0};
+                cb_desc.type = VIO_BUFFER_UNIFORM;
+                cb_desc.data = NULL;
+                cb_desc.size = shader->frag_cbuffer_total_size;
+                cb_desc.binding = 0;
+                shader->frag_cbuffer_backend = ctx->backend->create_buffer(&cb_desc);
+            }
+
+            /* Extract sampler names from fragment SPIRV for GL->HLSL slot remapping.
+             * HLSL binding = index in sampled_images list (matches vio_spirv_to_hlsl). */
+            {
+                vio_reflect_result frag_reflect = {0};
+                char *err = NULL;
+                if (vio_spirv_reflect(shader->frag_spirv, shader->frag_spirv_size, &frag_reflect, &err) == 0) {
+                    shader->sampler_count = frag_reflect.texture_count < VIO_MAX_SAMPLERS
+                                          ? frag_reflect.texture_count : VIO_MAX_SAMPLERS;
+                    for (int s = 0; s < shader->sampler_count; s++) {
+                        strncpy(shader->sampler_names[s], frag_reflect.textures[s].name,
+                                sizeof(shader->sampler_names[s]) - 1);
+                    }
+                    vio_reflect_free(&frag_reflect);
+                }
+                if (err) free(err);
+                /* Init remap table to identity (no remapping) */
+                for (int s = 0; s < 16; s++) shader->gl_to_hlsl_sampler[s] = -1;
             }
         }
     }
@@ -1639,9 +1698,10 @@ ZEND_FUNCTION(vio_pipeline)
             if (vio_spirv_reflect(shader->vert_spirv, shader->vert_spirv_size, &reflect, &err) == 0) {
                 for (int i = 0; i < reflect.input_count && i < 16; i++) {
                     layout[attrib_count].location = reflect.inputs[i].location;
-                    /* Default to VIO_FLOAT3 — reflection doesn't give component count directly,
-                     * but the D3D backend uses the shader blob for input layout creation anyway */
-                    layout[attrib_count].format = VIO_FLOAT3;
+                    /* Map SPIRV vecsize to VIO format (enum values match: 1=FLOAT1..4=FLOAT4) */
+                    unsigned int vs = reflect.inputs[i].vecsize;
+                    if (vs < 1 || vs > 4) vs = 3;
+                    layout[attrib_count].format = (vio_format)vs;
                     /* SPIRV-Cross maps all GLSL inputs to TEXCOORD{location} in HLSL */
                     layout[attrib_count].usage = VIO_TEXCOORD;
                     attrib_count++;
@@ -1919,7 +1979,15 @@ ZEND_FUNCTION(vio_bind_texture)
     /* Backend texture binding (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0 &&
         tex->backend_texture && ctx->backend->bind_texture) {
-        ctx->backend->bind_texture(tex->backend_texture, (int)slot);
+        int hlsl_slot = (int)slot;
+        /* Remap GL texture unit to HLSL register using sampler map */
+        if (ctx->bound_shader_object) {
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
+                hlsl_slot = sh->gl_to_hlsl_sampler[slot];
+            }
+        }
+        ctx->backend->bind_texture(tex->backend_texture, hlsl_slot);
     }
 }
 
@@ -2150,16 +2218,49 @@ ZEND_FUNCTION(vio_set_uniform)
     if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->bound_shader_object) {
         vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
 
-        /* Find uniform by name */
+        /* Check if this is a sampler uniform (int value = GL texture unit).
+         * Build GL-slot -> HLSL-binding remap for vio_bind_texture. */
+        if (Z_TYPE_P(value_zval) == IS_LONG) {
+            int gl_slot = (int)Z_LVAL_P(value_zval);
+            for (int s = 0; s < sh->sampler_count; s++) {
+                if (strcmp(sh->sampler_names[s], name) == 0) {
+                    if (gl_slot >= 0 && gl_slot < 16) {
+                        sh->gl_to_hlsl_sampler[gl_slot] = s;  /* HLSL binding = index */
+                    }
+                    break;
+                }
+            }
+        }
+
+        /* Search both vertex and fragment uniform arrays */
+        unsigned char *dst = NULL;
+        int max_size = 0;
+        int is_frag = 0;
+
         for (int u = 0; u < sh->uniform_count; u++) {
             if (strcmp(sh->uniforms[u].name, name) != 0) continue;
-
             int offset = sh->uniforms[u].offset;
-            int max_size = sh->uniforms[u].size;
-            if (offset < 0 || offset + max_size > VIO_CBUFFER_SIZE) break;
+            max_size = sh->uniforms[u].size;
+            if (offset >= 0 && offset + max_size <= VIO_CBUFFER_SIZE) {
+                dst = sh->cbuffer_data + offset;
+            }
+            break;
+        }
 
-            unsigned char *dst = sh->cbuffer_data + offset;
+        if (!dst) {
+            for (int u = 0; u < sh->frag_uniform_count; u++) {
+                if (strcmp(sh->frag_uniforms[u].name, name) != 0) continue;
+                int offset = sh->frag_uniforms[u].offset;
+                max_size = sh->frag_uniforms[u].size;
+                if (offset >= 0 && offset + max_size <= VIO_CBUFFER_SIZE) {
+                    dst = sh->frag_cbuffer_data + offset;
+                    is_frag = 1;
+                }
+                break;
+            }
+        }
 
+        if (dst) {
             if (Z_TYPE_P(value_zval) == IS_LONG) {
                 int v = (int)Z_LVAL_P(value_zval);
                 if (max_size >= (int)sizeof(int)) memcpy(dst, &v, sizeof(int));
@@ -2192,8 +2293,11 @@ ZEND_FUNCTION(vio_set_uniform)
                 memcpy(dst, vals, copy_size);
             }
 
-            sh->cbuffer_dirty = 1;
-            break;
+            if (is_frag) {
+                sh->frag_cbuffer_dirty = 1;
+            } else {
+                sh->cbuffer_dirty = 1;
+            }
         }
     }
 }
@@ -4575,23 +4679,98 @@ ZEND_FUNCTION(vio_draw_instanced)
         size_t arr_count = zend_hash_num_elements(matrices_ht);
         if (arr_count < total_floats) return;
 
-        /* TODO: instance matrix buffers for D3D need a different approach
-         * (per-instance vertex buffer or structured buffer).
-         * For now: draw with instance_count, matrices via uniform buffer. */
-        if (mesh->index_count > 0 && mesh->backend_ib && ctx->backend->draw_indexed) {
-            vio_draw_indexed_cmd cmd = {0};
-            cmd.vertex_buffer = mesh->backend_vb;
-            cmd.index_buffer = mesh->backend_ib;
-            cmd.index_count = mesh->index_count;
-            cmd.instance_count = (int)instance_count;
-            ctx->backend->draw_indexed(&cmd);
-        } else if (ctx->backend->draw) {
-            vio_draw_cmd cmd = {0};
-            cmd.vertex_buffer = mesh->backend_vb;
-            cmd.vertex_count = mesh->vertex_count;
-            cmd.instance_count = (int)instance_count;
-            ctx->backend->draw(&cmd);
+        /* Convert PHP array to float array */
+        float *mat_data = emalloc(sizeof(float) * total_floats);
+        {
+            zval *val;
+            size_t idx = 0;
+            ZEND_HASH_FOREACH_VAL(matrices_ht, val) {
+                if (idx >= total_floats) break;
+                mat_data[idx++] = (float)zval_get_double(val);
+            } ZEND_HASH_FOREACH_END();
         }
+
+#ifdef HAVE_D3D11
+        if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+            /* Create temporary instance buffer (4 x vec4 per instance = 64 bytes) */
+            D3D11_BUFFER_DESC bd = {0};
+            bd.ByteWidth = (UINT)(sizeof(float) * total_floats);
+            bd.Usage = D3D11_USAGE_DEFAULT;
+            bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+
+            D3D11_SUBRESOURCE_DATA init = {0};
+            init.pSysMem = mat_data;
+
+            ID3D11Buffer *instance_buf = NULL;
+            HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &bd, &init, &instance_buf);
+            if (SUCCEEDED(hr) && instance_buf) {
+                /* Bind mesh VB to slot 0, instance VB to slot 1 */
+                vio_d3d11_buffer *vb = (vio_d3d11_buffer *)mesh->backend_vb;
+                ID3D11Buffer *buffers[2] = { vb->buffer, instance_buf };
+                UINT strides[2] = { (UINT)mesh->stride, 64 };  /* 64 = sizeof(mat4) */
+                UINT offsets[2] = { 0, 0 };
+                ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 2, buffers, strides, offsets);
+
+                /* Flush cbuffers */
+                if (ctx->bound_shader_object) {
+                    vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+                    if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
+                        ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size);
+                        sh->cbuffer_dirty = 0;
+                    }
+                    if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
+                        ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                        sh->frag_cbuffer_dirty = 0;
+                    }
+                    if (sh->cbuffer_backend) {
+                        vio_d3d11_buffer *cb = (vio_d3d11_buffer *)sh->cbuffer_backend;
+                        ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
+                        if (!sh->frag_cbuffer_backend)
+                            ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
+                    }
+                    if (sh->frag_cbuffer_backend) {
+                        vio_d3d11_buffer *fcb = (vio_d3d11_buffer *)sh->frag_cbuffer_backend;
+                        ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &fcb->buffer);
+                    }
+                }
+
+                /* Draw */
+                if (mesh->index_count > 0 && mesh->backend_ib) {
+                    vio_d3d11_buffer *ib = (vio_d3d11_buffer *)mesh->backend_ib;
+                    ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
+                                                         DXGI_FORMAT_R32_UINT, 0);
+                    ID3D11DeviceContext_DrawIndexedInstanced(vio_d3d11.context,
+                        mesh->index_count, (UINT)instance_count, 0, 0, 0);
+                } else {
+                    ID3D11DeviceContext_DrawInstanced(vio_d3d11.context,
+                        mesh->vertex_count, (UINT)instance_count, 0, 0);
+                }
+
+                ID3D11Buffer_Release(instance_buf);
+            }
+        } else
+#endif
+        {
+            /* Fallback for other backends */
+            if (mesh->index_count > 0 && mesh->backend_ib && ctx->backend->draw_indexed) {
+                vio_draw_indexed_cmd cmd = {0};
+                cmd.vertex_buffer = mesh->backend_vb;
+                cmd.index_buffer = mesh->backend_ib;
+                cmd.index_count = mesh->index_count;
+                cmd.instance_count = (int)instance_count;
+                cmd.vertex_stride = mesh->stride;
+                ctx->backend->draw_indexed(&cmd);
+            } else if (ctx->backend->draw) {
+                vio_draw_cmd cmd = {0};
+                cmd.vertex_buffer = mesh->backend_vb;
+                cmd.vertex_count = mesh->vertex_count;
+                cmd.instance_count = (int)instance_count;
+                cmd.vertex_stride = mesh->stride;
+                ctx->backend->draw(&cmd);
+            }
+        }
+
+        efree(mat_data);
     }
 }
 
@@ -4948,6 +5127,15 @@ ZEND_FUNCTION(vio_bind_render_target)
         ID3D11RenderTargetView *rtv = (ID3D11RenderTargetView *)rt->d3d11_rtv;
         ID3D11DepthStencilView *dsv = (ID3D11DepthStencilView *)rt->d3d11_dsv;
 
+        /* Unbind any SRVs that reference this render target's textures to avoid
+         * D3D11 resource hazard (can't be SRV and DSV/RTV simultaneously) */
+        if (rt->depth_only && rt->d3d11_depth_srv) {
+            ID3D11ShaderResourceView *null_srv = NULL;
+            for (UINT s = 0; s < 8; s++) {
+                ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, s, 1, &null_srv);
+            }
+        }
+
         if (rt->depth_only) {
             ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 0, NULL, dsv);
             vio_d3d11.current_rtv = NULL;
@@ -5113,6 +5301,42 @@ ZEND_FUNCTION(vio_render_target_texture)
     tex->texture_id = rt->depth_only ? rt->depth_texture : rt->color_texture;
     tex->valid    = 1;
     tex->borrowed = 1;  /* GL resource owned by render target, don't double-delete */
+
+#ifdef HAVE_D3D11
+    /* For D3D11: create a backend texture wrapper with the SRV from the render target */
+    if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
+        ID3D11ShaderResourceView *srv = rt->depth_only ? (ID3D11ShaderResourceView *)rt->d3d11_depth_srv : NULL;
+        if (srv) {
+            vio_d3d11_texture *d3d_tex = calloc(1, sizeof(vio_d3d11_texture));
+            d3d_tex->texture = NULL;  /* owned by render target */
+            d3d_tex->srv = srv;
+            ID3D11ShaderResourceView_AddRef(srv);  /* prevent premature release */
+            d3d_tex->width = rt->width;
+            d3d_tex->height = rt->height;
+
+            /* Create comparison sampler for depth textures (sampler2DShadow) */
+            D3D11_SAMPLER_DESC sampler_desc = {0};
+            if (rt->depth_only) {
+                sampler_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+                sampler_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+            } else {
+                sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            }
+            sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sampler_desc.MaxAnisotropy = 1;
+            sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+            sampler_desc.BorderColor[0] = 1.0f;
+            sampler_desc.BorderColor[1] = 1.0f;
+            sampler_desc.BorderColor[2] = 1.0f;
+            sampler_desc.BorderColor[3] = 1.0f;
+            ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &d3d_tex->sampler);
+
+            tex->backend_texture = d3d_tex;
+        }
+    }
+#endif
 
     RETURN_COPY_VALUE(&tex_zval);
 }
