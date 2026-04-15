@@ -1,3 +1,10 @@
+# [1.6.0](https://github.com/phpolygon/php-vio/compare/1.5.3...1.6.0) (2026-04-15)
+
+
+### Features
+
+* add vio_gpu_flush() and fix Metal drawable management ([d7e1e0c](https://github.com/phpolygon/php-vio/commit/d7e1e0c00d9f8d90ad6f1c89df017ee36b38ddb8))
+
 ## [1.5.3](https://github.com/phpolygon/php-vio/compare/1.5.2...1.5.3) (2026-04-14)
 
 
