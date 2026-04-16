@@ -1,3 +1,10 @@
+## [1.8.8](https://github.com/phpolygon/php-vio/compare/1.8.7...1.8.8) (2026-04-16)
+
+
+### Bug Fixes
+
+* revert PHP_GLOBAL_OBJS (doesn't work for .lo targets), keep MSL lib fix ([5c2efde](https://github.com/phpolygon/php-vio/commit/5c2efdebb608d07507440b70557c18685ca31279))
+
 ## [1.8.7](https://github.com/phpolygon/php-vio/compare/1.8.6...1.8.7) (2026-04-16)
 
 
