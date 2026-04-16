@@ -2,13 +2,9 @@
  * php-vio - Metal Backend implementation (macOS)
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
+#include "php.h"
 
 #ifdef HAVE_METAL
-
-#include "php.h"
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
