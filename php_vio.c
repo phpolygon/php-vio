@@ -3668,6 +3668,78 @@ ZEND_FUNCTION(vio_read_pixels)
     }
 #endif
 
+#ifdef HAVE_D3D11
+    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+        /* Flush all pending GPU commands before readback */
+        ID3D11DeviceContext_Flush(vio_d3d11.context);
+
+        /* Get the texture behind the current RTV (not GetBuffer — FLIP_DISCARD rotates) */
+        ID3D11Texture2D *back_buf = NULL;
+        if (vio_d3d11.current_rtv) {
+            ID3D11Resource *rtv_res = NULL;
+            ID3D11RenderTargetView_GetResource(vio_d3d11.current_rtv, &rtv_res);
+            if (rtv_res) {
+                ID3D11Resource_QueryInterface(rtv_res, &IID_ID3D11Texture2D, (void **)&back_buf);
+                ID3D11Resource_Release(rtv_res);
+            }
+        }
+        if (!back_buf) {
+            php_error_docref(NULL, E_WARNING, "vio_read_pixels: Failed to get RTV texture");
+            RETURN_FALSE;
+        }
+
+        HRESULT hr;
+        D3D11_TEXTURE2D_DESC bb_desc;
+        ID3D11Texture2D_GetDesc(back_buf, &bb_desc);
+
+        /* Create staging texture */
+        D3D11_TEXTURE2D_DESC staging_desc = bb_desc;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging_desc.MiscFlags = 0;
+
+        ID3D11Texture2D *staging = NULL;
+        hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &staging_desc, NULL, &staging);
+        if (FAILED(hr)) {
+            ID3D11Texture2D_Release(back_buf);
+            php_error_docref(NULL, E_WARNING, "vio_read_pixels: Failed to create staging texture");
+            RETURN_FALSE;
+        }
+
+        ID3D11DeviceContext_CopyResource(vio_d3d11.context,
+                                          (ID3D11Resource *)staging,
+                                          (ID3D11Resource *)back_buf);
+        ID3D11Texture2D_Release(back_buf);
+
+        D3D11_MAPPED_SUBRESOURCE mapped = {0};
+        hr = ID3D11DeviceContext_Map(vio_d3d11.context, (ID3D11Resource *)staging,
+                                      0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) {
+            ID3D11Texture2D_Release(staging);
+            php_error_docref(NULL, E_WARNING, "vio_read_pixels: Failed to map staging texture");
+            RETURN_FALSE;
+        }
+
+        w = (int)bb_desc.Width;
+        h = (int)bb_desc.Height;
+        size_t out_size = (size_t)w * h * 4;
+        zend_string *buf = zend_string_alloc(out_size, 0);
+        unsigned char *dst = (unsigned char *)ZSTR_VAL(buf);
+        unsigned char *src = (unsigned char *)mapped.pData;
+
+        for (int y = 0; y < h; y++) {
+            memcpy(dst + y * w * 4, src + y * mapped.RowPitch, w * 4);
+        }
+        ZSTR_VAL(buf)[out_size] = '\0';
+
+        ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)staging, 0);
+        ID3D11Texture2D_Release(staging);
+
+        RETURN_NEW_STR(buf);
+    }
+#endif
+
     php_error_docref(NULL, E_WARNING, "vio_read_pixels: unsupported backend");
     RETURN_FALSE;
 }
@@ -5521,13 +5593,12 @@ ZEND_FUNCTION(vio_bind_render_target)
         ID3D11RenderTargetView *rtv = (ID3D11RenderTargetView *)rt->d3d11_rtv;
         ID3D11DepthStencilView *dsv = (ID3D11DepthStencilView *)rt->d3d11_dsv;
 
-        /* Unbind any SRVs that reference this render target's textures to avoid
-         * D3D11 resource hazard (can't be SRV and DSV/RTV simultaneously) */
-        if (rt->depth_only && rt->d3d11_depth_srv) {
-            ID3D11ShaderResourceView *null_srv = NULL;
-            for (UINT s = 0; s < 8; s++) {
-                ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, s, 1, &null_srv);
-            }
+        /* Unbind all SRVs to avoid D3D11 resource hazard — a resource cannot be
+         * bound as SRV and RTV/DSV simultaneously. This is critical for post-process
+         * passes that read from one render target while writing to another. */
+        {
+            ID3D11ShaderResourceView *null_srvs[8] = {NULL};
+            ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, 0, 8, null_srvs);
         }
 
         if (rt->depth_only) {
@@ -5983,6 +6054,137 @@ ZEND_FUNCTION(vio_cubemap)
     }
 #endif
 
+#ifdef HAVE_D3D11
+    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+        int res_w = 0, res_h = 0;
+        unsigned char *face_data[6] = {NULL};
+        int face_allocated[6] = {0};
+
+        if (faces_zval && Z_TYPE_P(faces_zval) == IS_ARRAY) {
+            HashTable *faces_ht = Z_ARRVAL_P(faces_zval);
+            if (zend_hash_num_elements(faces_ht) != 6) {
+                php_error_docref(NULL, E_WARNING, "cubemap 'faces' must have exactly 6 entries");
+                zval_ptr_dtor(&cm_zval);
+                RETURN_FALSE;
+            }
+            int face_idx = 0;
+            zval *face_path;
+            ZEND_HASH_FOREACH_VAL(faces_ht, face_path) {
+                if (Z_TYPE_P(face_path) != IS_STRING) goto d3d11_cm_fail;
+                int w, h, ch;
+                face_data[face_idx] = stbi_load(Z_STRVAL_P(face_path), &w, &h, &ch, 4);
+                if (!face_data[face_idx]) goto d3d11_cm_fail;
+                face_allocated[face_idx] = 1;
+                if (face_idx == 0) { res_w = w; res_h = h; }
+                face_idx++;
+            } ZEND_HASH_FOREACH_END();
+        } else if (pixels_zval && Z_TYPE_P(pixels_zval) == IS_ARRAY) {
+            HashTable *pixels_ht = Z_ARRVAL_P(pixels_zval);
+            zval *w_zval = zend_hash_str_find(config_ht, "width", sizeof("width") - 1);
+            zval *h_zval = zend_hash_str_find(config_ht, "height", sizeof("height") - 1);
+            if (!w_zval || !h_zval || zend_hash_num_elements(pixels_ht) != 6) goto d3d11_cm_fail;
+            res_w = (int)zval_get_long(w_zval);
+            res_h = (int)zval_get_long(h_zval);
+            size_t face_size = (size_t)res_w * res_h * 4;
+            int face_idx = 0;
+            zval *face_arr;
+            ZEND_HASH_FOREACH_VAL(pixels_ht, face_arr) {
+                if (Z_TYPE_P(face_arr) != IS_ARRAY) goto d3d11_cm_fail;
+                face_data[face_idx] = emalloc(face_size);
+                face_allocated[face_idx] = 2;
+                size_t j = 0;
+                zval *pv;
+                ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(face_arr), pv) {
+                    if (j >= face_size) break;
+                    face_data[face_idx][j++] = (unsigned char)zval_get_long(pv);
+                } ZEND_HASH_FOREACH_END();
+                while (j < face_size) face_data[face_idx][j++] = 0;
+                face_idx++;
+            } ZEND_HASH_FOREACH_END();
+        } else {
+            goto d3d11_cm_fail;
+        }
+
+        cm->resolution = res_w;
+
+        D3D11_TEXTURE2D_DESC tex_desc = {0};
+        tex_desc.Width = res_w;
+        tex_desc.Height = res_h;
+        tex_desc.MipLevels = 1;
+        tex_desc.ArraySize = 6;
+        tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        tex_desc.SampleDesc.Count = 1;
+        tex_desc.Usage = D3D11_USAGE_DEFAULT;
+        tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        tex_desc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+
+        D3D11_SUBRESOURCE_DATA init_data[6];
+        for (int i = 0; i < 6; i++) {
+            init_data[i].pSysMem = face_data[i];
+            init_data[i].SysMemPitch = res_w * 4;
+            init_data[i].SysMemSlicePitch = 0;
+        }
+
+        ID3D11Texture2D *tex = NULL;
+        HRESULT hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &tex_desc, init_data, &tex);
+
+        for (int i = 0; i < 6; i++) {
+            if (face_allocated[i] == 1 && face_data[i]) stbi_image_free(face_data[i]);
+            else if (face_allocated[i] == 2 && face_data[i]) efree(face_data[i]);
+        }
+
+        if (FAILED(hr)) {
+            php_error_docref(NULL, E_WARNING, "D3D11: Failed to create cubemap texture (0x%08lx)", hr);
+            zval_ptr_dtor(&cm_zval);
+            RETURN_FALSE;
+        }
+
+        cm->d3d11_texture = tex;
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+        srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+        srv_desc.TextureCube.MostDetailedMip = 0;
+        srv_desc.TextureCube.MipLevels = 1;
+
+        ID3D11ShaderResourceView *srv = NULL;
+        hr = ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)tex, &srv_desc, &srv);
+        if (FAILED(hr)) {
+            php_error_docref(NULL, E_WARNING, "D3D11: Failed to create cubemap SRV (0x%08lx)", hr);
+            ID3D11Texture2D_Release(tex);
+            cm->d3d11_texture = NULL;
+            zval_ptr_dtor(&cm_zval);
+            RETURN_FALSE;
+        }
+        cm->d3d11_srv = srv;
+
+        D3D11_SAMPLER_DESC sampler_desc = {0};
+        sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.MaxAnisotropy = 1;
+        sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+
+        ID3D11SamplerState *sampler = NULL;
+        ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &sampler);
+        cm->d3d11_sampler = sampler;
+
+        cm->backend_type = 2; /* D3D11 */
+
+        if (0) {
+d3d11_cm_fail:
+            for (int i = 0; i < 6; i++) {
+                if (face_allocated[i] == 1 && face_data[i]) stbi_image_free(face_data[i]);
+                else if (face_allocated[i] == 2 && face_data[i]) efree(face_data[i]);
+            }
+            php_error_docref(NULL, E_WARNING, "D3D11: cubemap creation failed");
+            zval_ptr_dtor(&cm_zval);
+            RETURN_FALSE;
+        }
+    }
+#endif
+
     cm->valid = 1;
     RETURN_COPY_VALUE(&cm_zval);
 }
@@ -6017,6 +6219,40 @@ ZEND_FUNCTION(vio_bind_cubemap)
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
         glActiveTexture(GL_TEXTURE0 + (GLenum)slot);
         glBindTexture(GL_TEXTURE_CUBE_MAP, cm->texture_id);
+    }
+#endif
+
+#ifdef HAVE_D3D11
+    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized &&
+        cm->d3d11_srv && cm->d3d11_sampler) {
+        int hlsl_slot = (int)slot;
+        if (ctx->bound_shader_object) {
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
+                hlsl_slot = sh->gl_to_hlsl_sampler[slot];
+            }
+        }
+        ID3D11ShaderResourceView *srv = (ID3D11ShaderResourceView *)cm->d3d11_srv;
+        ID3D11SamplerState *sampler = (ID3D11SamplerState *)cm->d3d11_sampler;
+        ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, (UINT)hlsl_slot, 1, &srv);
+        ID3D11DeviceContext_PSSetSamplers(vio_d3d11.context, (UINT)hlsl_slot, 1, &sampler);
+    }
+#endif
+
+#ifdef HAVE_D3D12
+    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized &&
+        cm->d3d12_srv_gpu) {
+        int hlsl_slot = (int)slot;
+        if (ctx->bound_shader_object) {
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
+                hlsl_slot = sh->gl_to_hlsl_sampler[slot];
+            }
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
+        srv_cpu.ptr = cm->d3d12_srv_cpu;
+        vio_d3d12.pending_srvs[hlsl_slot] = srv_cpu;
+        vio_d3d12.pending_srv_valid[hlsl_slot] = 1;
     }
 #endif
 }

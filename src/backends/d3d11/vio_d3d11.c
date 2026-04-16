@@ -868,6 +868,7 @@ static void d3d11_draw(vio_draw_cmd *cmd)
                                       cmd->vertex_count,
                                       instance_count,
                                       cmd->first_vertex, 0);
+
 }
 
 static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
