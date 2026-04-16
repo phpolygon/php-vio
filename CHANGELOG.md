@@ -1,3 +1,10 @@
+## [1.8.2](https://github.com/phpolygon/php-vio/compare/1.8.1...1.8.2) (2026-04-16)
+
+
+### Bug Fixes
+
+* regenerate GLAD with core GL 4.1 only (no vendor extensions) ([584a36e](https://github.com/phpolygon/php-vio/commit/584a36eb4031b8c6a2dcaefc1547840333417bfe))
+
 ## [1.8.1](https://github.com/phpolygon/php-vio/compare/1.8.0...1.8.1) (2026-04-16)
 
 
