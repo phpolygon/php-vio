@@ -17,11 +17,8 @@ ifeq ($(VIO_HAS_METAL),yes)
 $(builddir)/src/backends/metal/vio_metal.lo: $(srcdir)/src/backends/metal/vio_metal.m
 	@mkdir -p $(builddir)/src/backends/metal
 	$(LIBTOOL) --tag=CC --mode=compile $(CC) -x objective-c \
-		$(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS) \
-		-I$(top_srcdir) -I$(top_builddir) \
-		-I$(srcdir)/include -I. \
+		$(CFLAGS) $(EXTRA_CFLAGS) \
 		$(INCLUDES) \
-		-DHAVE_CONFIG_H -fPIC -O2 \
 		-fobjc-arc \
 		-c $(srcdir)/src/backends/metal/vio_metal.m \
 		-o $(builddir)/src/backends/metal/vio_metal.lo
