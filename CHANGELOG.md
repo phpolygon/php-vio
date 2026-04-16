@@ -1,3 +1,10 @@
+## [1.8.3](https://github.com/phpolygon/php-vio/compare/1.8.2...1.8.3) (2026-04-16)
+
+
+### Bug Fixes
+
+* add missing VIO_2D_MAX_VERTICES constant for D3D vertex buffers ([76c7e05](https://github.com/phpolygon/php-vio/commit/76c7e05356f66ae1bb68d2b23adffadbc30439aa))
+
 ## [1.8.2](https://github.com/phpolygon/php-vio/compare/1.8.1...1.8.2) (2026-04-16)
 
 
