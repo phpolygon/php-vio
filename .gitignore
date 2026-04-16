@@ -40,6 +40,21 @@ run-tests.php
 *.swo
 *~
 
+# Windows build artifacts (MSVC)
+x64/
+x86/
+*.dll
+*.exp
+*.lib
+*.obj
+*.idb
+*.pdb
+*.res
+*.manifest
+config.nice.bat
+configure.bat
+configure.js
+
 # OS
 .DS_Store
 Thumbs.db
