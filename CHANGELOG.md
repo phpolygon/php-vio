@@ -1,3 +1,10 @@
+## [1.8.1](https://github.com/phpolygon/php-vio/compare/1.8.0...1.8.1) (2026-04-16)
+
+
+### Bug Fixes
+
+* remove Windows build artifacts from repository ([8c04af2](https://github.com/phpolygon/php-vio/commit/8c04af21112190b2ff73d73b0c1d7c2d20596f3a))
+
 # [1.7.0](https://github.com/phpolygon/php-vio/compare/1.6.0...1.7.0) (2026-04-16)
 
 
