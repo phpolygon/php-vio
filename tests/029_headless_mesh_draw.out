@@ -1,0 +1,38 @@
+bool(true)
+[vio] SPIRV-Cross output (first 500 chars):
+#version 410
+#ifdef GL_ARB_shading_language_420pack
+#extension GL_ARB_shading_language_420pack : require
+#endif
+
+layout(location = 0) in vec3 aPos;
+#ifdef GL_ARB_shader_draw_parameters
+#define SPIRV_Cross_BaseInstance gl_BaseInstanceARB
+#else
+uniform int SPIRV_Cross_BaseInstance;
+#endif
+
+void main()
+{
+    gl_Position = vec4(aPos, 1.0);
+}
+
+
+---
+[vio] SPIRV-Cross output (first 500 chars):
+#version 410
+#ifdef GL_ARB_shading_language_420pack
+#extension GL_ARB_shading_language_420pack : require
+#endif
+
+layout(location = 0) out vec4 FragColor;
+
+void main()
+{
+    FragColor = vec4(1.0);
+}
+
+
+---
+bool(true)
+OK

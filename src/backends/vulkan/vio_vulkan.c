@@ -887,6 +887,7 @@ static const vio_backend vulkan_backend = {
     .draw_indexed      = vulkan_draw_indexed,
     .present           = vulkan_present,
     .clear             = vulkan_clear,
+    .gpu_flush         = NULL,
     .dispatch_compute  = vulkan_dispatch_compute,
     .supports_feature  = vulkan_supports_feature,
 };

@@ -1,0 +1,15 @@
+001+ Warning: vio_font(/Library/Fonts/Arial Unicode.ttf): Failed to open stream: No such file or directory in D:\PhpstormProjects\php-vio\tests\030_font_text.php on line 6
+002+ 
+003+ Warning: vio_font(): Failed to open font file: /Library/Fonts/Arial Unicode.ttf in D:\PhpstormProjects\php-vio\tests\030_font_text.php on line 6
+004+ bool(false)
+     bool(true)
+002- bool(true)
+003- text rendered: yes
+004- bool(true)
+005- OK
+006+ 
+007+ Fatal error: Uncaught TypeError: vio_text(): Argument #2 ($font) must be of type VioFont, false given in D:\PhpstormProjects\php-vio\tests\030_font_text.php:16
+008+ Stack trace:
+009+ #0 D:\PhpstormProjects\php-vio\tests\030_font_text.php(16): vio_text(Object(VioContext), false, 'Hi', 10.0, 10.0, Array)
+010+ #1 {main}
+011+   thrown in D:\PhpstormProjects\php-vio\tests\030_font_text.php on line 16

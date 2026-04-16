@@ -61,9 +61,22 @@ const vio_backend *vio_find_backend(const char *name)
 
 const vio_backend *vio_get_auto_backend(void)
 {
-    /* Priority: d3d12 > vulkan > d3d11 > metal > opengl */
-    const char *priority[] = {"d3d12", "vulkan", "d3d11", "metal", "opengl"};
-    for (int p = 0; p < 5; p++) {
+    /* Platform-specific priority:
+     * macOS:   metal > opengl (Vulkan via MoltenVK is opt-in, not auto)
+     * Windows: d3d12 > d3d11 > vulkan > opengl
+     * Linux:   vulkan > opengl
+     */
+#ifdef __APPLE__
+    const char *priority[] = {"metal", "opengl"};
+    int priority_count = 2;
+#elif defined(_WIN32)
+    const char *priority[] = {"d3d12", "d3d11", "vulkan", "opengl"};
+    int priority_count = 4;
+#else
+    const char *priority[] = {"vulkan", "opengl"};
+    int priority_count = 2;
+#endif
+    for (int p = 0; p < priority_count; p++) {
         const vio_backend *b = vio_find_backend(priority[p]);
         if (b) {
             return b;

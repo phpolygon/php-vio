@@ -33,6 +33,10 @@
 #include "backends/d3d12/vio_d3d12.h"
 #endif
 
+#ifdef HAVE_METAL
+#include "backends/metal/vio_metal.h"
+#endif
+
 /* ── Orthographic projection matrix ──────────────────────────────── */
 
 static void vio_2d_ortho(float *m, float left, float right, float bottom, float top)
@@ -182,8 +186,10 @@ int vio_2d_init(vio_2d_state *state, int width, int height)
 {
     memset(state, 0, sizeof(vio_2d_state));
 
-    state->vertices = emalloc(sizeof(vio_2d_vertex) * VIO_2D_MAX_VERTICES);
-    state->items    = emalloc(sizeof(vio_2d_item) * VIO_2D_MAX_ITEMS);
+    state->vertex_capacity = VIO_2D_INITIAL_VERTICES;
+    state->item_capacity   = VIO_2D_INITIAL_ITEMS;
+    state->vertices = emalloc(sizeof(vio_2d_vertex) * state->vertex_capacity);
+    state->items    = emalloc(sizeof(vio_2d_item) * state->item_capacity);
     state->width    = width;
     state->height   = height;
     state->fb_width  = width;
@@ -211,8 +217,9 @@ int vio_2d_init(vio_2d_state *state, int width, int height)
 
         glBindVertexArray(state->vao);
         glBindBuffer(GL_ARRAY_BUFFER, state->vbo);
+        state->vbo_capacity = state->vertex_capacity;
         glBufferData(GL_ARRAY_BUFFER,
-            sizeof(vio_2d_vertex) * VIO_2D_MAX_VERTICES, NULL, GL_DYNAMIC_DRAW);
+            sizeof(vio_2d_vertex) * state->vbo_capacity, NULL, GL_DYNAMIC_DRAW);
 
         /* Position: location 0, vec2 */
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(vio_2d_vertex),
@@ -314,8 +321,11 @@ void vio_2d_set_size(vio_2d_state *state, int width, int height)
 int vio_2d_push_vertices(vio_2d_state *state, const vio_2d_vertex *verts, int count)
 {
     if (!state->initialized) return -1;
-    if (state->vertex_count + count > VIO_2D_MAX_VERTICES) {
-        return -1;
+    /* Grow buffer if needed */
+    while (state->vertex_count + count > state->vertex_capacity) {
+        int new_cap = state->vertex_capacity * 2;
+        state->vertices = erealloc(state->vertices, sizeof(vio_2d_vertex) * new_cap);
+        state->vertex_capacity = new_cap;
     }
     int start = state->vertex_count;
     memcpy(&state->vertices[start], verts, sizeof(vio_2d_vertex) * count);
@@ -327,7 +337,13 @@ void vio_2d_push_item(vio_2d_state *state, vio_2d_item_type type, float z,
                        unsigned int texture_id, void *backend_texture,
                        int vert_start, int vert_count)
 {
-    if (!state->initialized || state->item_count >= VIO_2D_MAX_ITEMS) return;
+    if (!state->initialized) return;
+    /* Grow buffer if needed */
+    if (state->item_count >= state->item_capacity) {
+        int new_cap = state->item_capacity * 2;
+        state->items = erealloc(state->items, sizeof(vio_2d_item) * new_cap);
+        state->item_capacity = new_cap;
+    }
 
     vio_2d_item *item = &state->items[state->item_count++];
     item->type            = type;
@@ -343,13 +359,25 @@ void vio_2d_flush(vio_2d_state *state)
 {
     if (!state->initialized || state->item_count == 0) return;
 
-    /* Sort items by z-order, then texture */
+    /* Sort items by z-order, then texture (shared across all backends) */
     qsort(state->items, state->item_count, sizeof(vio_2d_item), vio_2d_item_cmp);
+
+#ifdef HAVE_METAL
+    if (vio_metal_2d_is_active()) {
+        vio_metal_2d_flush(state);
+        return;
+    }
+#endif
 
 #ifdef HAVE_GLFW
     if (state->backend == VIO_2D_BACKEND_OPENGL && vio_gl.initialized) {
-        /* Upload vertex data */
+        /* Upload vertex data — grow GPU buffer if CPU buffer outgrew it */
         glBindBuffer(GL_ARRAY_BUFFER, state->vbo);
+        if (state->vertex_count > state->vbo_capacity) {
+            state->vbo_capacity = state->vertex_capacity;
+            glBufferData(GL_ARRAY_BUFFER,
+                sizeof(vio_2d_vertex) * state->vbo_capacity, NULL, GL_DYNAMIC_DRAW);
+        }
         glBufferSubData(GL_ARRAY_BUFFER, 0,
             sizeof(vio_2d_vertex) * state->vertex_count, state->vertices);
 

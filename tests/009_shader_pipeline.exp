@@ -1,0 +1,10 @@
+bool(true)
+bool(true)
+bind_pipeline ok
+
+Warning: vio_pipeline(): vio_pipeline requires 'shader' (VioShader object) in %s on line %d
+bool(false)
+
+Warning: vio_shader(): vio_shader requires 'vertex' string in %s on line %d
+bool(false)
+OK

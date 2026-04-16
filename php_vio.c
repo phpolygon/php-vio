@@ -279,6 +279,13 @@ ZEND_FUNCTION(vio_create)
     /* Initialize 2D rendering system */
     vio_2d_init(&ctx->state_2d, ctx->config.width, ctx->config.height);
 
+#ifdef HAVE_METAL
+    /* Initialize Metal 2D pipeline (shaders, pipeline states) */
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        vio_metal_2d_init(ctx->config.width, ctx->config.height);
+    }
+#endif
+
     ctx->initialized = 1;
     RETURN_COPY_VALUE(&obj);
 }
@@ -415,6 +422,22 @@ ZEND_FUNCTION(vio_begin)
     }
 #endif
 
+#ifdef HAVE_METAL
+    /* Sync 2D projection to current window size for Metal backend */
+    if (ctx->window && strcmp(ctx->backend->name, "metal") == 0) {
+        int win_w, win_h;
+        glfwGetWindowSize(ctx->window, &win_w, &win_h);
+        int fb_w, fb_h;
+        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+        if (win_w > 0 && win_h > 0 &&
+            (win_w != ctx->state_2d.width || win_h != ctx->state_2d.height)) {
+            vio_2d_set_size(&ctx->state_2d, win_w, win_h);
+        }
+        ctx->state_2d.fb_width = fb_w;
+        ctx->state_2d.fb_height = fb_h;
+    }
+#endif
+
     vio_2d_begin(&ctx->state_2d);
 
 #ifdef HAVE_GLFW
@@ -468,6 +491,26 @@ ZEND_FUNCTION(vio_end)
 #endif
 
     ctx->in_frame = 0;
+}
+
+ZEND_FUNCTION(vio_gpu_flush)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        return;
+    }
+
+    if (ctx->backend->gpu_flush) {
+        ctx->backend->gpu_flush();
+    }
 }
 
 ZEND_FUNCTION(vio_clear)
@@ -2011,6 +2054,13 @@ ZEND_FUNCTION(vio_texture)
         tex->backend_texture = ctx->backend->create_texture(&desc);
     }
 
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        tex->texture_id = vio_metal_create_texture_rgba(w, h, pixels,
+            tex->filter != VIO_FILTER_NEAREST, tex->wrap == VIO_WRAP_CLAMP);
+    }
+#endif
+
     if (from_stbi) {
         stbi_image_free(pixels);
     }
@@ -2848,30 +2898,22 @@ ZEND_FUNCTION(vio_font)
     vio_font_object *font = Z_VIO_FONT_P(&font_zval);
 
     font->font_size = (float)size;
-    font->ttf_data = emalloc(ZSTR_LEN(contents));
-    memcpy(font->ttf_data, ZSTR_VAL(contents), ZSTR_LEN(contents));
-
-    /* Bake font atlas bitmap */
-    unsigned char *atlas_bitmap = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE);
-    int bake_result = vio_font_bake_bitmap(
-        font->ttf_data, 0, font->font_size,
-        atlas_bitmap, VIO_FONT_ATLAS_SIZE, VIO_FONT_ATLAS_SIZE,
-        VIO_FONT_FIRST_CHAR, VIO_FONT_NUM_CHARS, font->char_data);
-
+    font->ttf_len = ZSTR_LEN(contents);
+    font->ttf_data = emalloc(font->ttf_len);
+    memcpy(font->ttf_data, ZSTR_VAL(contents), font->ttf_len);
     zend_string_release(contents);
 
-    if (bake_result <= 0) {
-        php_error_docref(NULL, E_WARNING, "Failed to bake font atlas (try smaller font size or fewer chars)");
-        efree(atlas_bitmap);
-        zval_ptr_dtor(&font_zval);
-        RETURN_FALSE;
-    }
+    /* Multi-range atlas packing (Latin, Cyrillic, Greek, CJK, Hangul, etc.) */
+    int atlas_size = VIO_FONT_ATLAS_SIZE;
+    unsigned char *atlas_bitmap = ecalloc(1, atlas_size * atlas_size);
+
+    vio_font_pack_atlas(font, atlas_bitmap, atlas_size);
 
 #ifdef HAVE_GLFW
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
         glGenTextures(1, &font->atlas_texture);
         glBindTexture(GL_TEXTURE_2D, font->atlas_texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, VIO_FONT_ATLAS_SIZE, VIO_FONT_ATLAS_SIZE,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, atlas_size, atlas_size,
             0, GL_RED, GL_UNSIGNED_BYTE, atlas_bitmap);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -2928,10 +2970,53 @@ ZEND_FUNCTION(vio_font)
     }
 #endif
 
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        font->atlas_texture = vio_metal_create_font_atlas(atlas_size, atlas_size, atlas_bitmap);
+    }
+#endif
+
     efree(atlas_bitmap);
 
     font->valid = 1;
     RETURN_COPY_VALUE(&font_zval);
+}
+
+/**
+ * Decode one UTF-8 codepoint from `text` starting at position `*i`.
+ * Advances `*i` past the decoded sequence. Returns the codepoint,
+ * or 0 on invalid/incomplete sequences.
+ */
+static inline uint32_t vio_utf8_decode(const char *text, size_t text_len, size_t *i)
+{
+    unsigned char c = (unsigned char)text[*i];
+    uint32_t cp = 0;
+    int extra = 0;
+
+    if (c < 0x80) {
+        cp = c;
+    } else if ((c & 0xE0) == 0xC0) {
+        cp = c & 0x1F;
+        extra = 1;
+    } else if ((c & 0xF0) == 0xE0) {
+        cp = c & 0x0F;
+        extra = 2;
+    } else if ((c & 0xF8) == 0xF0) {
+        cp = c & 0x07;
+        extra = 3;
+    } else {
+        /* Invalid lead byte — skip */
+        return 0;
+    }
+
+    for (int j = 0; j < extra; j++) {
+        if (*i + 1 + j >= text_len) return 0;
+        unsigned char cont = (unsigned char)text[*i + 1 + j];
+        if ((cont & 0xC0) != 0x80) return 0;
+        cp = (cp << 6) | (cont & 0x3F);
+    }
+    *i += extra; /* caller already increments by 1 */
+    return cp;
 }
 
 ZEND_FUNCTION(vio_text)
@@ -2979,14 +3064,12 @@ ZEND_FUNCTION(vio_text)
     float inv_w = 1.0f / (float)font->atlas_w;
     float inv_h = 1.0f / (float)font->atlas_h;
 
-    /* Generate quads for each character */
+    /* Generate quads for each character (UTF-8 aware, hashmap lookup) */
     for (size_t i = 0; i < text_len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        if (ch < VIO_FONT_FIRST_CHAR || ch >= VIO_FONT_FIRST_CHAR + VIO_FONT_NUM_CHARS) {
-            continue;
-        }
-
-        vio_stbtt_bakedchar *b = &font->char_data[ch - VIO_FONT_FIRST_CHAR];
+        uint32_t cp = vio_utf8_decode(text, text_len, &i);
+        zval *entry = zend_hash_index_find(&font->glyph_map, (zend_long)cp);
+        if (!entry) continue;
+        vio_stbtt_packedchar *b = (vio_stbtt_packedchar *)Z_STRVAL_P(entry);
 
         float px = fx + b->xoff;
         float py = fy + b->yoff;
@@ -3230,12 +3313,10 @@ ZEND_FUNCTION(vio_text_measure)
     float min_y = 0.0f, max_y = 0.0f;
 
     for (size_t i = 0; i < text_len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        if (ch < VIO_FONT_FIRST_CHAR || ch >= VIO_FONT_FIRST_CHAR + VIO_FONT_NUM_CHARS) {
-            continue;
-        }
-
-        vio_stbtt_bakedchar *b = &font->char_data[ch - VIO_FONT_FIRST_CHAR];
+        uint32_t cp = vio_utf8_decode(text, text_len, &i);
+        zval *entry = zend_hash_index_find(&font->glyph_map, (zend_long)cp);
+        if (!entry) continue;
+        vio_stbtt_packedchar *b = (vio_stbtt_packedchar *)Z_STRVAL_P(entry);
         width += b->xadvance;
 
         float char_top = b->yoff;
@@ -3740,6 +3821,21 @@ ZEND_FUNCTION(vio_read_pixels)
     }
 #endif
 
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        size_t size = (size_t)w * h * 4;
+        zend_string *buf = zend_string_alloc(size, 0);
+        ZSTR_VAL(buf)[size] = '\0';
+
+        if (vio_metal_read_pixels(w, h, (unsigned char *)ZSTR_VAL(buf)) == 0) {
+            RETURN_NEW_STR(buf);
+        }
+        zend_string_release(buf);
+        php_error_docref(NULL, E_WARNING, "vio_read_pixels: Metal readback failed");
+        RETURN_FALSE;
+    }
+#endif
+
     php_error_docref(NULL, E_WARNING, "vio_read_pixels: unsupported backend");
     RETURN_FALSE;
 }
@@ -3791,6 +3887,12 @@ ZEND_FUNCTION(vio_save_screenshot)
         efree(pixels);
 
         RETURN_BOOL(ok);
+    }
+#endif
+
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        RETURN_BOOL(vio_metal_save_screenshot(path, w, h) == 0);
     }
 #endif
 

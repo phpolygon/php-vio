@@ -48,6 +48,7 @@ typedef struct _vio_backend {
     void  (*draw_indexed)(vio_draw_indexed_cmd *cmd);
     void  (*present)(void);
     void  (*clear)(float r, float g, float b, float a);
+    void  (*gpu_flush)(void);  /* Block until all GPU work is complete (like glFinish) */
 
     /* State binding */
     void  (*set_uniform)(const char *name, const void *data, int count, int type);

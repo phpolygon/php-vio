@@ -1072,6 +1072,7 @@ static const vio_backend d3d11_backend = {
     .set_uniform       = d3d11_set_uniform,
     .bind_texture      = d3d11_bind_texture,
     .set_viewport      = d3d11_set_viewport,
+    .gpu_flush         = NULL,
     .dispatch_compute  = d3d11_dispatch_compute,
     .supports_feature  = d3d11_supports_feature,
 };

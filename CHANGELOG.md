@@ -1,3 +1,76 @@
+# [1.6.0](https://github.com/phpolygon/php-vio/compare/1.5.3...1.6.0) (2026-04-15)
+
+
+### Features
+
+* add vio_gpu_flush() and fix Metal drawable management ([d7e1e0c](https://github.com/phpolygon/php-vio/commit/d7e1e0c00d9f8d90ad6f1c89df017ee36b38ddb8))
+
+## [1.5.3](https://github.com/phpolygon/php-vio/compare/1.5.2...1.5.3) (2026-04-14)
+
+
+### Bug Fixes
+
+* Metal flickering caused by AppKit layer redraw policy ([a5631e4](https://github.com/phpolygon/php-vio/commit/a5631e4c9b21665b2c2b23611ff04bec7b802002))
+
+## [1.5.2](https://github.com/phpolygon/php-vio/compare/1.5.1...1.5.2) (2026-04-14)
+
+
+### Bug Fixes
+
+* Metal vsync-off uses offscreen rendering to avoid nextDrawable blocking ([a2be14b](https://github.com/phpolygon/php-vio/commit/a2be14b8b6690b51f41a595c1e56e2778dae55b7))
+
+## [1.5.1](https://github.com/phpolygon/php-vio/compare/1.5.0...1.5.1) (2026-04-14)
+
+
+### Bug Fixes
+
+* use explicit depth-disabled state in Metal 2D flush ([a57d9da](https://github.com/phpolygon/php-vio/commit/a57d9da9c30aad2c0c9bcc93fec74a729846add5))
+
+# [1.5.0](https://github.com/phpolygon/php-vio/compare/1.4.0...1.5.0) (2026-04-14)
+
+
+### Bug Fixes
+
+* guard GL texture cleanup and Metal vsync/readback ([1b4261b](https://github.com/phpolygon/php-vio/commit/1b4261bfc915e956353f1397dd9d39b7e1043a8d))
+
+
+### Features
+
+* implement Metal 2D rendering pipeline ([f265e3f](https://github.com/phpolygon/php-vio/commit/f265e3fa6c0a5168e476aeec69d9e863d8545048))
+
+# [1.4.0](https://github.com/phpolygon/php-vio/compare/1.3.0...1.4.0) (2026-04-14)
+
+
+### Bug Fixes
+
+* platform-specific backend auto-selection (Metal on macOS, Vulkan on Linux) ([c98400b](https://github.com/phpolygon/php-vio/commit/c98400ba4575faf3f9848cf211c497c12f042d3e))
+
+
+### Features
+
+* dynamic 2D batch buffer and space glyph fix ([abfd09b](https://github.com/phpolygon/php-vio/commit/abfd09b54f2a4e5982a36703b20b76ce72375e22))
+
+# [1.3.0](https://github.com/phpolygon/php-vio/compare/1.2.5...1.3.0) (2026-04-13)
+
+
+### Features
+
+* multi-range Unicode font atlas with hashmap glyph lookup ([d85b4c6](https://github.com/phpolygon/php-vio/commit/d85b4c673e93ceacb096c32b949b6aadcd098883))
+
+## [1.2.5](https://github.com/phpolygon/php-vio/compare/1.2.4...1.2.5) (2026-04-13)
+
+
+### Bug Fixes
+
+* name binary vio.so inside release zips for PIE compatibility ([d725c7d](https://github.com/phpolygon/php-vio/commit/d725c7d922d25aa5c1d231ff5afd89bc200278e1))
+
+## [1.2.1](https://github.com/phpolygon/php-vio/compare/1.2.0...1.2.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* extend font atlas to Latin-1 and add UTF-8 text decoding ([665885e](https://github.com/phpolygon/php-vio/commit/665885ee9e80ec053f64e036e058e2df87ad8e96))
+
 # [1.2.0](https://github.com/phpolygon/php-vio/compare/1.1.4...1.2.0) (2026-04-12)
 
 

@@ -1,0 +1,25 @@
+
+---- EXPECTED OUTPUT
+bool(true)
+bool(true)
+bind_pipeline ok
+
+Warning: vio_pipeline(): vio_pipeline requires 'shader' (VioShader object) in %s on line %d
+bool(false)
+
+Warning: vio_shader(): vio_shader requires 'vertex' string in %s on line %d
+bool(false)
+OK
+---- ACTUAL OUTPUT
+Warning: vio_shader(): Backend shader compilation failed in D:\PhpstormProjects\php-vio\tests\009_shader_pipeline.php on line 7
+bool(false)
+
+Warning: vio_pipeline(): vio_pipeline requires 'shader' (VioShader object) in D:\PhpstormProjects\php-vio\tests\009_shader_pipeline.php on line 15
+bool(false)
+
+Fatal error: Uncaught TypeError: vio_bind_pipeline(): Argument #2 ($pipeline) must be of type VioPipeline, false given in D:\PhpstormProjects\php-vio\tests\009_shader_pipeline.php:26
+Stack trace:
+#0 D:\PhpstormProjects\php-vio\tests\009_shader_pipeline.php(26): vio_bind_pipeline(Object(VioContext), false)
+#1 {main}
+  thrown in D:\PhpstormProjects\php-vio\tests\009_shader_pipeline.php on line 26
+---- FAILED

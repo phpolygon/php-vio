@@ -143,7 +143,26 @@ Full API documentation: see [vio.stub.php](vio.stub.php)
 | Vulkan | Experimental | macOS (MoltenVK), Linux, Windows |
 | Null | Stable | All (for unit testing) |
 
-Backend auto-selection priority: Vulkan > Metal > OpenGL > Null
+Backend auto-selection: Metal (macOS) > Vulkan (Linux/Windows) > OpenGL > Null
+
+## Performance: Metal vs OpenGL
+
+Benchmarked on Apple M2 Pro (macOS 26.4, 1280x720, VSync off). Measures draw + flush time only (excludes present/VSync wait).
+
+| Scenario | Metal (median) | OpenGL (median) | Delta |
+|----------|---------------|----------------|-------|
+| 500 rects | 192 us | 179 us | +7% |
+| 200 rects + 200 rounded rects + 50 text | 323 us | 313 us | +3% |
+| 1000 rects + 100 text | **301 us** | 374 us | **-20%** |
+
+**Tail latency (frame time consistency):**
+
+| Percentile | Metal | OpenGL |
+|------------|-------|--------|
+| p95 | 306-601 us | 437-754 us |
+| p99 | 375-674 us | 907-953 us |
+
+Metal is slightly slower on simple scenes due to command encoding overhead, but **20% faster on heavy scenes** (1000+ draw calls with text). More importantly, Metal delivers **30-40% better tail latency** — fewer frame time spikes and more consistent rendering.
 
 ## Testing
 

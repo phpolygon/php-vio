@@ -1,0 +1,14 @@
+bool(true)
+bool(true)
+int(2)
+aPos
+aTexCoord
+int(1)
+int(0)
+int(0)
+int(1)
+uTexture
+
+Warning: vio_shader(): Vertex shader compilation failed: %A in %s on line %d
+bool(false)
+OK

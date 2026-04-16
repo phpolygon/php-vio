@@ -1,0 +1,10 @@
+001- bool(true)
+002- frame OK
+003- multi-frame OK
+004- bool(true)
+005- bool(true)
+006- bool(true)
+007- bool(true)
+008- OK
+001+ Warning: vio_create(): Backend "metal" is not available in D:\PhpstormProjects\php-vio\tests\037_metal_gpu_context.php on line 2
+002+ SKIP: Metal context unavailable

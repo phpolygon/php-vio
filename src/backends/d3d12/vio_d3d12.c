@@ -1615,6 +1615,7 @@ static const vio_backend d3d12_backend = {
     .set_uniform       = d3d12_set_uniform,
     .bind_texture      = d3d12_bind_texture,
     .set_viewport      = d3d12_set_viewport,
+    .gpu_flush         = NULL,
     .dispatch_compute  = d3d12_dispatch_compute,
     .supports_feature  = d3d12_supports_feature,
 };

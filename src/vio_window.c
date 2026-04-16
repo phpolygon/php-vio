@@ -64,7 +64,7 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
 #endif
     } else {
-        /* Vulkan/Metal/other - no GL context */
+        /* Vulkan/other - no GL context */
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     }
 
