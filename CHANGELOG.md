@@ -1,3 +1,10 @@
+## [1.8.9](https://github.com/phpolygon/php-vio/compare/1.8.8...1.8.9) (2026-04-16)
+
+
+### Bug Fixes
+
+* include php.h before HAVE_METAL check in Metal backend ([da3b794](https://github.com/phpolygon/php-vio/commit/da3b7946b7cba50dc20778062bbfa9abd364de8a))
+
 ## [1.8.8](https://github.com/phpolygon/php-vio/compare/1.8.7...1.8.8) (2026-04-16)
 
 
