@@ -1,3 +1,10 @@
+## [1.8.10](https://github.com/phpolygon/php-vio/compare/1.8.9...1.8.10) (2026-04-16)
+
+
+### Bug Fixes
+
+* include config.h unconditionally in VMA wrapper ([064a108](https://github.com/phpolygon/php-vio/commit/064a108a73da7dcf886a49c5c23a661bd26030f6))
+
 ## [1.8.9](https://github.com/phpolygon/php-vio/compare/1.8.8...1.8.9) (2026-04-16)
 
 
