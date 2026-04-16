@@ -100,6 +100,7 @@ if (PHP_VIO != "no") {
             if (CHECK_LIB("spirv-cross-c.lib", "vio", PHP_SPIRV_CROSS + "\\lib")) {
                 // Link all spirv-cross components
                 CHECK_LIB("spirv-cross-glsl.lib", "vio", PHP_SPIRV_CROSS + "\\lib");
+                CHECK_LIB("spirv-cross-msl.lib", "vio", PHP_SPIRV_CROSS + "\\lib");
                 CHECK_LIB("spirv-cross-hlsl.lib", "vio", PHP_SPIRV_CROSS + "\\lib");
                 CHECK_LIB("spirv-cross-reflect.lib", "vio", PHP_SPIRV_CROSS + "\\lib");
                 CHECK_LIB("spirv-cross-core.lib", "vio", PHP_SPIRV_CROSS + "\\lib");
