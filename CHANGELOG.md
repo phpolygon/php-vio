@@ -1,3 +1,10 @@
+## [1.8.6](https://github.com/phpolygon/php-vio/compare/1.8.5...1.8.6) (2026-04-16)
+
+
+### Bug Fixes
+
+* include Metal object in static builds via PHP_GLOBAL_OBJS ([67c5407](https://github.com/phpolygon/php-vio/commit/67c5407397deee464b8e6763825bf1a52d7fa2c9))
+
 ## [1.8.5](https://github.com/phpolygon/php-vio/compare/1.8.4...1.8.5) (2026-04-16)
 
 
