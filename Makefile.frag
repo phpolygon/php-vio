@@ -24,5 +24,4 @@ $(builddir)/src/backends/metal/vio_metal.lo: $(srcdir)/src/backends/metal/vio_me
 		-o $(builddir)/src/backends/metal/vio_metal.lo
 
 shared_objects_vio += src/backends/metal/vio_metal.lo
-PHP_GLOBAL_OBJS += ext/vio/src/backends/metal/vio_metal.lo
 endif
