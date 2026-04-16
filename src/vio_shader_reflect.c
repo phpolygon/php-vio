@@ -473,4 +473,13 @@ void vio_reflect_free(vio_reflect_result *result) {
     memset(result, 0, sizeof(vio_reflect_result));
 }
 
+int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
+                                   vio_uniform_entry *entries, int max_entries,
+                                   int *total_size)
+{
+    (void)spirv; (void)spirv_size; (void)entries; (void)max_entries;
+    if (total_size) *total_size = 0;
+    return 0;
+}
+
 #endif /* HAVE_SPIRV_CROSS */
