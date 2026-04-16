@@ -15,6 +15,7 @@
 /* Initial capacity — grows dynamically as needed */
 #define VIO_2D_INITIAL_ITEMS     4096
 #define VIO_2D_INITIAL_VERTICES  (VIO_2D_INITIAL_ITEMS * 6)
+#define VIO_2D_MAX_VERTICES      (65536 * 6)  /* Fixed max for D3D vertex buffers */
 #define VIO_2D_CIRCLE_SEGS   32
 #define VIO_2D_MAX_TRANSFORM_STACK 32
 #define VIO_2D_MAX_SCISSOR_STACK   32
