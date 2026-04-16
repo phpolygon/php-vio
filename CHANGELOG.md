@@ -1,3 +1,10 @@
+## [1.8.4](https://github.com/phpolygon/php-vio/compare/1.8.3...1.8.4) (2026-04-16)
+
+
+### Bug Fixes
+
+* add vio_spirv_get_uniform_offsets stub when SPIRV-Cross unavailable ([ef8254f](https://github.com/phpolygon/php-vio/commit/ef8254f3981ba3b16e0f1384aa91d4fca401069b)), closes [#else](https://github.com/phpolygon/php-vio/issues/else)
+
 ## [1.8.3](https://github.com/phpolygon/php-vio/compare/1.8.2...1.8.3) (2026-04-16)
 
 
