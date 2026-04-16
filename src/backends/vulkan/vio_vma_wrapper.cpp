@@ -5,9 +5,7 @@
  * This file is compiled separately via Makefile.frag
  */
 
-#ifdef HAVE_CONFIG_H
 #include "config.h"
-#endif
 
 #ifdef HAVE_VULKAN
 
