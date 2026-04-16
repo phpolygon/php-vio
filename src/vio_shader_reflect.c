@@ -201,6 +201,7 @@ char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_mod
     }
 
     output = strdup(result);
+
     spvc_context_destroy(ctx);
     return output;
 }

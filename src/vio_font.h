@@ -28,7 +28,8 @@ typedef struct
 
 typedef struct _vio_font_object {
     vio_stbtt_bakedchar char_data[VIO_FONT_NUM_CHARS];
-    unsigned int       atlas_texture;  /* GL texture */
+    unsigned int       atlas_texture;          /* GL texture */
+    void              *atlas_backend_texture;   /* D3D11/D3D12 backend texture */
     float              font_size;
     int                atlas_w, atlas_h;
     unsigned char     *ttf_data;       /* raw TTF file data */

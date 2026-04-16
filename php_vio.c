@@ -1487,7 +1487,6 @@ ZEND_FUNCTION(vio_shader)
                 shader->frag_uniforms, VIO_MAX_UNIFORMS,
                 &shader->frag_cbuffer_total_size);
             memset(shader->frag_cbuffer_data, 0, sizeof(shader->frag_cbuffer_data));
-
             /* Create backend constant buffer for fragment stage */
             if (shader->frag_cbuffer_total_size > 0 && ctx->backend->create_buffer) {
                 vio_buffer_desc cb_desc = {0};
@@ -2522,7 +2521,7 @@ ZEND_FUNCTION(vio_rect)
             {r0x,r0y, 0,0, cr,cg,cb,ca}, {r2x,r2y, 0,0, cr,cg,cb,ca}, {r3x,r3y, 0,0, cr,cg,cb,ca},
         };
         int start = vio_2d_push_vertices(&ctx->state_2d, verts, 24);
-        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_RECT_OUTLINE, z, 0, start, 24);
+        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_RECT_OUTLINE, z, 0, NULL, start, 24);
     } else {
         /* 6 vertices for 2 triangles */
         vio_2d_vertex verts[6] = {
@@ -2534,7 +2533,7 @@ ZEND_FUNCTION(vio_rect)
             {p3x, p3y, 0, 0, cr, cg, cb, ca},
         };
         int start = vio_2d_push_vertices(&ctx->state_2d, verts, 6);
-        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_RECT, z, 0, start, 6);
+        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_RECT, z, 0, NULL, start, 6);
     }
 }
 
@@ -2619,7 +2618,7 @@ ZEND_FUNCTION(vio_circle)
             verts[vi++] = (vio_2d_vertex){ox2, oy2, 0, 0, cr, cg, cb, ca};
         }
         int start = vio_2d_push_vertices(&ctx->state_2d, verts, vi);
-        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_CIRCLE_OUTLINE, z, 0, start, vi);
+        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_CIRCLE_OUTLINE, z, 0, NULL, start, vi);
         efree(verts);
     } else {
         /* Triangle fan as individual triangles */
@@ -2639,7 +2638,7 @@ ZEND_FUNCTION(vio_circle)
             verts[i * 3 + 2] = (vio_2d_vertex){p2x, p2y, 0, 0, cr, cg, cb, ca};
         }
         int start = vio_2d_push_vertices(&ctx->state_2d, verts, tri_count * 3);
-        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_CIRCLE, z, 0, start, tri_count * 3);
+        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_CIRCLE, z, 0, NULL, start, tri_count * 3);
         efree(verts);
     }
 }
@@ -2710,7 +2709,7 @@ ZEND_FUNCTION(vio_line)
         {p3x, p3y, 0, 0, cr, cg, cb, ca},
     };
     int start = vio_2d_push_vertices(&ctx->state_2d, verts, 6);
-    if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_LINE, z, 0, start, 6);
+    if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_LINE, z, 0, NULL, start, 6);
 }
 
 ZEND_FUNCTION(vio_sprite)
@@ -2805,7 +2804,7 @@ ZEND_FUNCTION(vio_sprite)
         {p3x, p3y, u0, v1, cr, cg, cb, ca},
     };
     int start = vio_2d_push_vertices(&ctx->state_2d, verts, 6);
-    if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_SPRITE, z, tex->texture_id, start, 6);
+    if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_SPRITE, z, tex->texture_id, tex->backend_texture, start, 6);
 }
 
 ZEND_FUNCTION(vio_font)
@@ -2880,6 +2879,52 @@ ZEND_FUNCTION(vio_font)
         GLint swizzle[] = {GL_ONE, GL_ONE, GL_ONE, GL_RED};
         glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzle);
         glBindTexture(GL_TEXTURE_2D, 0);
+    }
+#endif
+
+#ifdef HAVE_D3D11
+    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+        /* Convert R8 atlas to R8G8B8A8 with white RGB and alpha from bitmap.
+         * HLSL shader samples .a, so the glyph coverage goes into alpha. */
+        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
+        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
+            rgba[p * 4 + 0] = 255;
+            rgba[p * 4 + 1] = 255;
+            rgba[p * 4 + 2] = 255;
+            rgba[p * 4 + 3] = atlas_bitmap[p];
+        }
+
+        vio_texture_desc desc = {0};
+        desc.width  = VIO_FONT_ATLAS_SIZE;
+        desc.height = VIO_FONT_ATLAS_SIZE;
+        desc.data   = rgba;
+        desc.filter = VIO_FILTER_LINEAR;
+        desc.wrap   = VIO_WRAP_CLAMP;
+        desc.mipmaps = 0;
+        font->atlas_backend_texture = ctx->backend->create_texture(&desc);
+        efree(rgba);
+    }
+#endif
+
+#ifdef HAVE_D3D12
+    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
+        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
+            rgba[p * 4 + 0] = 255;
+            rgba[p * 4 + 1] = 255;
+            rgba[p * 4 + 2] = 255;
+            rgba[p * 4 + 3] = atlas_bitmap[p];
+        }
+
+        vio_texture_desc desc = {0};
+        desc.width  = VIO_FONT_ATLAS_SIZE;
+        desc.height = VIO_FONT_ATLAS_SIZE;
+        desc.data   = rgba;
+        desc.filter = VIO_FILTER_LINEAR;
+        desc.wrap   = VIO_WRAP_CLAMP;
+        desc.mipmaps = 0;
+        font->atlas_backend_texture = ctx->backend->create_texture(&desc);
+        efree(rgba);
     }
 #endif
 
@@ -2972,7 +3017,7 @@ ZEND_FUNCTION(vio_text)
             {g3x, g3y, u0, v1, cr, cg, cb, ca},
         };
         int start = vio_2d_push_vertices(&ctx->state_2d, verts, 6);
-        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_TEXT, z, font->atlas_texture, start, 6);
+        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_TEXT, z, font->atlas_texture, font->atlas_backend_texture, start, 6);
 
         fx += b->xadvance;
     }
@@ -3108,7 +3153,7 @@ ZEND_FUNCTION(vio_rounded_rect)
         }
 
         int start = vio_2d_push_vertices(&ctx->state_2d, verts, vi);
-        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_ROUNDED_RECT_OUTLINE, z, 0, start, vi);
+        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_ROUNDED_RECT_OUTLINE, z, 0, NULL, start, vi);
         efree(inner); efree(outer); efree(verts);
     } else {
         /* Filled: triangle fan from center */
@@ -3155,7 +3200,7 @@ ZEND_FUNCTION(vio_rounded_rect)
         }
 
         int start = vio_2d_push_vertices(&ctx->state_2d, verts, vi);
-        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_ROUNDED_RECT, z, 0, start, vi);
+        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_ROUNDED_RECT, z, 0, NULL, start, vi);
 
         efree(perim);
         efree(verts);

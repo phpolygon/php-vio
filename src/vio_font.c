@@ -10,6 +10,7 @@
 #include "../vendor/stb/stb_truetype.h"
 
 #include "vio_font.h"
+#include "../include/vio_backend.h"
 
 #ifdef HAVE_GLFW
 #include <glad/glad.h>
@@ -22,12 +23,13 @@ static zend_object *vio_font_create_object(zend_class_entry *ce)
 {
     vio_font_object *font = zend_object_alloc(sizeof(vio_font_object), ce);
 
-    font->atlas_texture = 0;
-    font->font_size     = 16.0f;
-    font->atlas_w       = VIO_FONT_ATLAS_SIZE;
-    font->atlas_h       = VIO_FONT_ATLAS_SIZE;
-    font->ttf_data      = NULL;
-    font->valid         = 0;
+    font->atlas_texture         = 0;
+    font->atlas_backend_texture = NULL;
+    font->font_size             = 16.0f;
+    font->atlas_w               = VIO_FONT_ATLAS_SIZE;
+    font->atlas_h               = VIO_FONT_ATLAS_SIZE;
+    font->ttf_data              = NULL;
+    font->valid                 = 0;
     memset(font->char_data, 0, sizeof(font->char_data));
 
     zend_object_std_init(&font->std, ce);
@@ -47,6 +49,20 @@ static void vio_font_free_object(zend_object *obj)
         font->atlas_texture = 0;
     }
 #endif
+
+    if (font->atlas_backend_texture) {
+        const vio_backend *b = NULL;
+#ifdef HAVE_D3D11
+        b = vio_find_backend("d3d11");
+#endif
+#ifdef HAVE_D3D12
+        if (!b) b = vio_find_backend("d3d12");
+#endif
+        if (b && b->destroy_texture) {
+            b->destroy_texture(font->atlas_backend_texture);
+        }
+        font->atlas_backend_texture = NULL;
+    }
 
     if (font->ttf_data) {
         efree(font->ttf_data);
