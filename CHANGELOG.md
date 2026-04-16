@@ -1,3 +1,24 @@
+# [1.7.0](https://github.com/phpolygon/php-vio/compare/1.6.0...1.7.0) (2026-04-16)
+
+
+### Features
+
+* D3D11 correctness — depth convention fixup, shadow sampling, pipeline enhancements ([de5b26c](https://github.com/phpolygon/php-vio/commit/de5b26c7b0e1d314656eaf2c15e13ebe41e9e1d3))
+* D3D11 cubemap support, read_pixels, and SRV unbind fix ([7eafda4](https://github.com/phpolygon/php-vio/commit/7eafda400c38b5d1ca271b55f1ed9e8680e383fd))
+* D3D11 fragment cbuffers, struct array uniforms, instancing, shadow maps ([96b3659](https://github.com/phpolygon/php-vio/commit/96b36597f242ffeb27cafab63650ad0dc9e323a1))
+* D3D11/D3D12 2D rendering + font atlas support ([e872cd0](https://github.com/phpolygon/php-vio/commit/e872cd0a02ab684cd0de929dacf3bb99de2ffc95))
+* D3D11/D3D12 rendering pipeline — vtable wiring, shader transpilation, render targets ([e243e6f](https://github.com/phpolygon/php-vio/commit/e243e6f7dee2d47a8f11a8cf88d9fe708fe2ba82))
+* D3D12 backend — full feature parity with D3D11 ([686dcb8](https://github.com/phpolygon/php-vio/commit/686dcb81409bf687dbd0d7c871a59608f0595a75))
+* D3D12 dynamic cbuffer heap with auto-growth ([2b6d8a0](https://github.com/phpolygon/php-vio/commit/2b6d8a03041b21a76a2f132dc28d6c18b92aae45))
+* HDR render target support + color texture SRV infrastructure ([6a16613](https://github.com/phpolygon/php-vio/commit/6a166137177232b8fa3710386f8fb4dab0c9b5e8))
+* uniform cbuffer pipeline for D3D — SPIRV reflection + constant buffer upload ([1f43f98](https://github.com/phpolygon/php-vio/commit/1f43f987e2bc7a5ee97390e77c283f6f4c478038))
+* vio_set_cursor_mode + mat3 cbuffer padding fix ([267d586](https://github.com/phpolygon/php-vio/commit/267d586a8acd5a4006a1a30702aa873b6da9b6c9))
+
+
+### Performance Improvements
+
+* vio_draw_instanced accepts packed binary string for zero-copy instancing ([f106f8c](https://github.com/phpolygon/php-vio/commit/f106f8c3e2ab74194ab1d2a9c38ac2a4b646badd))
+
 # [1.6.0](https://github.com/phpolygon/php-vio/compare/1.5.3...1.6.0) (2026-04-15)
 
 
