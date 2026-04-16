@@ -1,3 +1,10 @@
+## [1.8.7](https://github.com/phpolygon/php-vio/compare/1.8.6...1.8.7) (2026-04-16)
+
+
+### Bug Fixes
+
+* add missing spirv-cross-msl.lib to Windows config.w32 ([d25a03f](https://github.com/phpolygon/php-vio/commit/d25a03f45afdd51259a9b293d6af197bd2394a9f))
+
 ## [1.8.6](https://github.com/phpolygon/php-vio/compare/1.8.5...1.8.6) (2026-04-16)
 
 
