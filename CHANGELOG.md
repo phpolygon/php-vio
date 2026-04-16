@@ -1,3 +1,10 @@
+## [1.8.5](https://github.com/phpolygon/php-vio/compare/1.8.4...1.8.5) (2026-04-16)
+
+
+### Bug Fixes
+
+* use correct PHP CFLAGS in Metal Makefile.frag rule ([3739e47](https://github.com/phpolygon/php-vio/commit/3739e47131b8ba1ffbcd97cad3b49ac2d788d5a5))
+
 ## [1.8.4](https://github.com/phpolygon/php-vio/compare/1.8.3...1.8.4) (2026-04-16)
 
 
