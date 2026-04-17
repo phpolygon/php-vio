@@ -438,6 +438,23 @@ ZEND_FUNCTION(vio_begin)
     }
 #endif
 
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
+    /* Sync 2D projection to current window size for D3D backends */
+    if (ctx->window && (strcmp(ctx->backend->name, "d3d11") == 0
+                     || strcmp(ctx->backend->name, "d3d12") == 0)) {
+        int win_w, win_h;
+        glfwGetWindowSize(ctx->window, &win_w, &win_h);
+        int fb_w, fb_h;
+        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+        if (win_w > 0 && win_h > 0 &&
+            (win_w != ctx->state_2d.width || win_h != ctx->state_2d.height)) {
+            vio_2d_set_size(&ctx->state_2d, win_w, win_h);
+        }
+        ctx->state_2d.fb_width = fb_w;
+        ctx->state_2d.fb_height = fb_h;
+    }
+#endif
+
     vio_2d_begin(&ctx->state_2d);
 
 #ifdef HAVE_GLFW
