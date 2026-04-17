@@ -438,7 +438,7 @@ ZEND_FUNCTION(vio_begin)
     }
 #endif
 
-#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
+#if (defined(HAVE_D3D11) || defined(HAVE_D3D12)) && defined(HAVE_GLFW)
     /* Sync 2D projection to current window size for D3D backends */
     if (ctx->window && (strcmp(ctx->backend->name, "d3d11") == 0
                      || strcmp(ctx->backend->name, "d3d12") == 0)) {
