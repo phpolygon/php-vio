@@ -95,6 +95,13 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
         }
     }
 
+    /* Ensure the window is visible for non-headless contexts.
+     * GLFW_NO_API on Windows can leave the window hidden even when
+     * GLFW_VISIBLE defaults to GLFW_TRUE. */
+    if (!cfg->headless) {
+        glfwShowWindow(window);
+    }
+
     return window;
 }
 
