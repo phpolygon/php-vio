@@ -1,3 +1,10 @@
+## [1.8.14](https://github.com/phpolygon/php-vio/compare/v1.8.13...v1.8.14) (2026-04-18)
+
+
+### Bug Fixes
+
+* **vulkan:** gate portability enumeration behind __APPLE__ ([219d5df](https://github.com/phpolygon/php-vio/commit/219d5df3572bac0ae58a28fe31cf5df9255e999a))
+
 ## [1.8.13](https://github.com/phpolygon/php-vio/compare/v1.8.12...1.8.13) (2026-04-18)
 
 

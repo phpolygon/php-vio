@@ -14,7 +14,7 @@
 #include "php_ini.h"
 #include "ext/standard/info.h"
 
-#define PHP_VIO_VERSION "1.8.13"
+#define PHP_VIO_VERSION "1.8.14"
 #define PHP_VIO_EXTNAME "vio"
 
 extern zend_module_entry vio_module_entry;
