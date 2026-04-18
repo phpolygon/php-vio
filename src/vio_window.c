@@ -100,6 +100,11 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
      * GLFW_VISIBLE defaults to GLFW_TRUE. */
     if (!cfg->headless) {
         glfwShowWindow(window);
+        /* Pump events so WM_SHOWWINDOW/WM_PAINT propagate to DWM before the
+         * backend creates the swapchain. Without this, DXGI FLIP_DISCARD
+         * swapchains see the HWND as occluded and Present() silently returns
+         * DXGI_STATUS_OCCLUDED — no vsync, no composition, blank screen. */
+        glfwPollEvents();
     }
 
     return window;

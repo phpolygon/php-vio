@@ -2,10 +2,8 @@
 
 ARG_ENABLE("vio", "vio support", "no");
 
-ARG_WITH("glfw", "for GLFW support", "no");
 ARG_WITH("glslang", "for glslang (GLSL to SPIR-V compiler) support", "no");
 ARG_WITH("spirv-cross", "for SPIRV-Cross (shader reflection) support", "no");
-ARG_WITH("vulkan", "for Vulkan support", "no");
 ARG_WITH("ffmpeg", "for FFmpeg (video recording) support", "no");
 ARG_WITH("d3d11", "for Direct3D 11 support", "yes");
 ARG_WITH("d3d12", "for Direct3D 12 support", "yes");
@@ -56,22 +54,16 @@ if (PHP_VIO != "no") {
         "/I" + configure_module_dirname + "\\vendor\\miniaudio " +
         "/I" + configure_module_dirname + "\\vendor\\stb";
 
-    // ── GLFW detection ────────────────────────────────────────────────
-    if (PHP_GLFW != "no") {
-        if (PHP_GLFW == "yes") {
-            // Try default PHP deps directory
-            PHP_GLFW = PHP_PHP_BUILD;
-        }
-        if (CHECK_HEADER_ADD_INCLUDE("GLFW/glfw3.h", "CFLAGS_VIO", PHP_GLFW + "\\include")) {
-            if (CHECK_LIB("glfw3dll.lib", "vio", PHP_GLFW + "\\lib") ||
-                CHECK_LIB("glfw3.lib", "vio", PHP_GLFW + "\\lib")) {
-                AC_DEFINE("HAVE_GLFW", 1, "Whether GLFW is available");
-            } else {
-                WARNING("GLFW library not found, building without window support");
-            }
+    // ── GLFW detection (always check buildroot on Windows) ──────────
+    if (CHECK_HEADER_ADD_INCLUDE("GLFW/glfw3.h", "CFLAGS_VIO", PHP_PHP_BUILD + "\\include")) {
+        if (CHECK_LIB("glfw3dll.lib", "vio", PHP_PHP_BUILD + "\\lib") ||
+            CHECK_LIB("glfw3.lib", "vio", PHP_PHP_BUILD + "\\lib")) {
+            AC_DEFINE("HAVE_GLFW", 1, "Whether GLFW is available");
         } else {
-            WARNING("GLFW headers not found at " + PHP_GLFW);
+            WARNING("GLFW library not found in " + PHP_PHP_BUILD + "\\lib");
         }
+    } else {
+        WARNING("GLFW headers not found in " + PHP_PHP_BUILD + "\\include");
     }
 
     // ── glslang detection ─────────────────────────────────────────────
@@ -112,30 +104,15 @@ if (PHP_VIO != "no") {
         }
     }
 
-    // ── Vulkan detection ──────────────────────────────────────────────
-    if (PHP_VULKAN != "no") {
-        var vulkan_sdk = "";
-        if (PHP_VULKAN == "yes") {
-            // Use PHP deps dir; for Vulkan SDK pass explicit path:
-            //   --with-vulkan=C:\VulkanSDK\1.3.xxx
-            vulkan_sdk = PHP_PHP_BUILD;
+    // ── Vulkan detection (always check buildroot on Windows) ────────
+    if (CHECK_HEADER_ADD_INCLUDE("vulkan/vulkan.h", "CFLAGS_VIO", PHP_PHP_BUILD + "\\include")) {
+        if (CHECK_LIB("vulkan-1.lib", "vio", PHP_PHP_BUILD + "\\lib")) {
+            AC_DEFINE("HAVE_VULKAN", 1, "Whether Vulkan is available");
         } else {
-            vulkan_sdk = PHP_VULKAN;
+            WARNING("Vulkan library not found in " + PHP_PHP_BUILD + "\\lib");
         }
-        if (CHECK_HEADER_ADD_INCLUDE("vulkan/vulkan.h", "CFLAGS_VIO", vulkan_sdk + "\\Include")) {
-            if (CHECK_LIB("vulkan-1.lib", "vio", vulkan_sdk + "\\Lib")) {
-                AC_DEFINE("HAVE_VULKAN", 1, "Whether Vulkan is available");
-            } else {
-                WARNING("Vulkan library not found");
-            }
-        } else {
-            // Try lowercase paths (non-SDK installs)
-            if (CHECK_HEADER_ADD_INCLUDE("vulkan/vulkan.h", "CFLAGS_VIO", vulkan_sdk + "\\include")) {
-                if (CHECK_LIB("vulkan-1.lib", "vio", vulkan_sdk + "\\lib")) {
-                    AC_DEFINE("HAVE_VULKAN", 1, "Whether Vulkan is available");
-                }
-            }
-        }
+    } else {
+        WARNING("Vulkan headers not found in " + PHP_PHP_BUILD + "\\include");
     }
 
     // ── FFmpeg detection ──────────────────────────────────────────────
