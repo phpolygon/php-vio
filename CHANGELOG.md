@@ -1,3 +1,10 @@
+## [1.8.15](https://github.com/phpolygon/php-vio/compare/v1.8.14...v1.8.15) (2026-04-18)
+
+
+### Bug Fixes
+
+* **ci:** use v-prefixed ref when triggering build workflow ([4d9343e](https://github.com/phpolygon/php-vio/commit/4d9343ed8bccc34f605eb8c8f7cac786e3f34588))
+
 ## [1.8.14](https://github.com/phpolygon/php-vio/compare/v1.8.13...v1.8.14) (2026-04-18)
 
 
