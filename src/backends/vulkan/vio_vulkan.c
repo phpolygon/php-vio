@@ -94,8 +94,10 @@ static int create_instance(int debug)
     if (debug) {
         extra_exts[extra_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     }
-    /* MoltenVK portability */
+#ifdef __APPLE__
+    /* MoltenVK requires the portability enumeration extension + flag */
     extra_exts[extra_count++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+#endif
 
     uint32_t total_ext_count = ext_count + extra_count;
     const char **all_extensions = malloc(total_ext_count * sizeof(const char *));
@@ -107,7 +109,9 @@ static int create_instance(int debug)
     create_info.pApplicationInfo        = &app_info;
     create_info.enabledExtensionCount   = total_ext_count;
     create_info.ppEnabledExtensionNames = all_extensions;
+#ifdef __APPLE__
     create_info.flags                   = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
 
     const char *validation_layer = "VK_LAYER_KHRONOS_validation";
     if (debug) {
