@@ -1,3 +1,10 @@
+## [1.8.13](https://github.com/phpolygon/php-vio/compare/v1.8.12...1.8.13) (2026-04-18)
+
+
+### Bug Fixes
+
+* **windows:** D3D/Vulkan window visibility + GLFW detection ([4d7c53e](https://github.com/phpolygon/php-vio/commit/4d7c53e0059da6f3d3023eecc793917545502e49))
+
 ## [1.8.10](https://github.com/phpolygon/php-vio/compare/1.8.9...1.8.10) (2026-04-16)
 
 
