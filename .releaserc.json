@@ -1,6 +1,6 @@
 {
   "branches": ["main"],
-  "tagFormat": "${version}",
+  "tagFormat": "v${version}",
   "plugins": [
     "@semantic-release/commit-analyzer",
     "@semantic-release/release-notes-generator",
@@ -8,10 +8,10 @@
       "changelogFile": "CHANGELOG.md"
     }],
     ["@semantic-release/exec", {
-      "prepareCmd": "sed -i 's/\"version\": \".*\"/\"version\": \"${nextRelease.version}\"/' composer.json || true"
+      "prepareCmd": "sed -i 's/\"version\": \".*\"/\"version\": \"${nextRelease.version}\"/' composer.json && sed -i 's/#define PHP_VIO_VERSION \".*\"/#define PHP_VIO_VERSION \"${nextRelease.version}\"/' php_vio.h"
     }],
     ["@semantic-release/git", {
-      "assets": ["CHANGELOG.md", "composer.json"],
+      "assets": ["CHANGELOG.md", "composer.json", "php_vio.h"],
       "message": "chore(release): v${nextRelease.version}\n\n${nextRelease.notes}"
     }],
     "@semantic-release/github"
