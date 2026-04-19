@@ -1482,20 +1482,44 @@ static int d3d12_supports_feature(vio_feature feature)
 
 static void d3d12_set_uniform(const char *name, const void *data, int count, int type)
 {
-    /* Fallback: push small uniform data as root 32-bit constants to VS (root param 0).
-     * This only works for shaders with small cbuffers. The cbuffer system is preferred. */
-    size_t float_count;
+    /* Pushes the uniform value into the per-frame cbuffer heap and binds its GPU-virtual
+     * address as a root CBV (b0) for both VS (root param 0) and PS (root param 1).
+     *
+     * The root signature declares b0 per stage, so SPIRV-Cross places the combined UBO
+     * at b0 for both. We mirror the same slice into VS and PS. This is a convenience
+     * fallback for simple `vio_set_uniform()` usage; larger uniform data should go
+     * through `vio_uniform_buffer()` + `vio_bind_buffer()`. */
+    if (!vio_d3d12.cmd_list || !vio_d3d12.cbuffer_heap || !vio_d3d12.cbuffer_heap_mapped) return;
+
+    size_t data_size;
     switch (type) {
-        case VIO_UNIFORM_INT:   float_count = 1 * count; break;
-        case VIO_UNIFORM_FLOAT: float_count = 1 * count; break;
-        case VIO_UNIFORM_VEC2:  float_count = 2 * count; break;
-        case VIO_UNIFORM_VEC3:  float_count = 3 * count; break;
-        case VIO_UNIFORM_VEC4:  float_count = 4 * count; break;
-        case VIO_UNIFORM_MAT3:  float_count = 9 * count; break;
-        case VIO_UNIFORM_MAT4:  float_count = 16 * count; break;
+        case VIO_UNIFORM_INT:   data_size = sizeof(int)   *  1 * count; break;
+        case VIO_UNIFORM_FLOAT: data_size = sizeof(float) *  1 * count; break;
+        case VIO_UNIFORM_VEC2:  data_size = sizeof(float) *  2 * count; break;
+        case VIO_UNIFORM_VEC3:  data_size = sizeof(float) *  3 * count; break;
+        case VIO_UNIFORM_VEC4:  data_size = sizeof(float) *  4 * count; break;
+        case VIO_UNIFORM_MAT3:  data_size = sizeof(float) *  9 * count; break;
+        case VIO_UNIFORM_MAT4:  data_size = sizeof(float) * 16 * count; break;
         default: return;
     }
-    (void)name; (void)float_count; (void)data;
+
+    /* CBV must be 256-byte aligned */
+    UINT aligned_size = (UINT)((data_size + 255) & ~255u);
+    if (vio_d3d12.cbuffer_heap_offset + aligned_size > vio_d3d12.cbuffer_heap_capacity) {
+        /* Frame ran out of cbuffer space — heap will grow at next begin_frame */
+        return;
+    }
+
+    UINT offset = vio_d3d12.cbuffer_heap_offset;
+    vio_d3d12.cbuffer_heap_offset += aligned_size;
+
+    memcpy(vio_d3d12.cbuffer_heap_mapped + offset, data, data_size);
+
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_addr = vio_d3d12.cbuffer_heap_gpu + offset;
+    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(vio_d3d12.cmd_list, 0, gpu_addr);
+    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(vio_d3d12.cmd_list, 1, gpu_addr);
+
+    (void)name;
 }
 
 static void d3d12_bind_texture(void *texture, int slot)
@@ -1615,7 +1639,7 @@ static const vio_backend d3d12_backend = {
     .set_uniform       = d3d12_set_uniform,
     .bind_texture      = d3d12_bind_texture,
     .set_viewport      = d3d12_set_viewport,
-    .gpu_flush         = NULL,
+    .gpu_flush         = vio_d3d12_wait_for_gpu,
     .dispatch_compute  = d3d12_dispatch_compute,
     .supports_feature  = d3d12_supports_feature,
 };

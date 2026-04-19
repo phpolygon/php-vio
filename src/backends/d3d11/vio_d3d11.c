@@ -1016,6 +1016,32 @@ static void d3d11_bind_texture(void *texture, int slot)
     }
 }
 
+/* Block until the GPU has finished all submitted work (analogue of glFinish).
+ * D3D11 is immediate-mode with an implicit command queue; Flush submits,
+ * and an event query pins execution until the GPU drains. */
+static void d3d11_gpu_flush(void)
+{
+    if (!vio_d3d11.context || !vio_d3d11.device) return;
+
+    D3D11_QUERY_DESC qd = {0};
+    qd.Query = D3D11_QUERY_EVENT;
+    ID3D11Query *query = NULL;
+    if (FAILED(ID3D11Device_CreateQuery(vio_d3d11.device, &qd, &query)) || !query) {
+        ID3D11DeviceContext_Flush(vio_d3d11.context);
+        return;
+    }
+
+    ID3D11DeviceContext_End(vio_d3d11.context, (ID3D11Asynchronous *)query);
+    ID3D11DeviceContext_Flush(vio_d3d11.context);
+
+    BOOL done = FALSE;
+    while (ID3D11DeviceContext_GetData(vio_d3d11.context, (ID3D11Asynchronous *)query,
+                                       &done, sizeof(done), 0) != S_OK) {
+        /* spin — typical drain is microseconds */
+    }
+    ID3D11Query_Release(query);
+}
+
 static void d3d11_set_viewport(int x, int y, int width, int height)
 {
     D3D11_VIEWPORT vp = {0};
@@ -1072,7 +1098,7 @@ static const vio_backend d3d11_backend = {
     .set_uniform       = d3d11_set_uniform,
     .bind_texture      = d3d11_bind_texture,
     .set_viewport      = d3d11_set_viewport,
-    .gpu_flush         = NULL,
+    .gpu_flush         = d3d11_gpu_flush,
     .dispatch_compute  = d3d11_dispatch_compute,
     .supports_feature  = d3d11_supports_feature,
 };

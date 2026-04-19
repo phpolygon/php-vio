@@ -2316,6 +2316,22 @@ ZEND_FUNCTION(vio_bind_buffer)
         }
     }
 #endif
+
+#ifdef HAVE_D3D12
+    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized && buf->backend_buffer) {
+        vio_d3d12_buffer *d3d_buf = (vio_d3d12_buffer *)buf->backend_buffer;
+        if (d3d_buf->resource && d3d_buf->gpu_address && vio_d3d12.cmd_list) {
+            /* Root signature declares b0 per stage at params 0 (VS) and 1 (PS).
+             * Other binding points aren't in the root sig — ignore them silently. */
+            if (bind_point == 0) {
+                ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+                    vio_d3d12.cmd_list, 0, d3d_buf->gpu_address);
+                ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+                    vio_d3d12.cmd_list, 1, d3d_buf->gpu_address);
+            }
+        }
+    }
+#endif
 }
 
 ZEND_FUNCTION(vio_set_uniform)
@@ -3838,6 +3854,139 @@ ZEND_FUNCTION(vio_read_pixels)
     }
 #endif
 
+#ifdef HAVE_D3D12
+    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+        /* Wait for any in-flight GPU work to complete.
+         * Assumes read_pixels is called after vio_end() — the current frame's
+         * render target is in PRESENT state. */
+        vio_d3d12_wait_for_gpu();
+
+        ID3D12Resource *src = vio_d3d12.frames[vio_d3d12.frame_index].render_target;
+        if (!src) {
+            php_error_docref(NULL, E_WARNING, "vio_read_pixels: no D3D12 render target");
+            RETURN_FALSE;
+        }
+
+        D3D12_RESOURCE_DESC src_desc;
+        ID3D12Resource_GetDesc(src, &src_desc);
+        w = (int)src_desc.Width;
+        h = (int)src_desc.Height;
+
+        /* Get required layout of a readback copy */
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {0};
+        UINT num_rows = 0;
+        UINT64 row_size = 0, total_bytes = 0;
+        ID3D12Device_GetCopyableFootprints(vio_d3d12.device, &src_desc, 0, 1, 0,
+                                            &footprint, &num_rows, &row_size, &total_bytes);
+
+        /* Create readback buffer */
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rb_desc = {0};
+        rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rb_desc.Width = total_bytes;
+        rb_desc.Height = 1;
+        rb_desc.DepthOrArraySize = 1;
+        rb_desc.MipLevels = 1;
+        rb_desc.SampleDesc.Count = 1;
+        rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        ID3D12Resource *readback = NULL;
+        HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp,
+            D3D12_HEAP_FLAG_NONE, &rb_desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void **)&readback);
+        if (FAILED(hr) || !readback) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_read_pixels: Failed to create readback buffer (0x%08lx)", hr);
+            RETURN_FALSE;
+        }
+
+        /* Transient command allocator + list — don't interfere with frame cmd_list */
+        ID3D12CommandAllocator *alloc = NULL;
+        hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device,
+            D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc);
+        if (FAILED(hr)) {
+            ID3D12Resource_Release(readback);
+            RETURN_FALSE;
+        }
+
+        ID3D12GraphicsCommandList *list = NULL;
+        hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+            &IID_ID3D12GraphicsCommandList, (void **)&list);
+        if (FAILED(hr)) {
+            ID3D12CommandAllocator_Release(alloc);
+            ID3D12Resource_Release(readback);
+            RETURN_FALSE;
+        }
+
+        /* Transition RT: PRESENT -> COPY_SOURCE */
+        D3D12_RESOURCE_BARRIER barrier = {0};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = src;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+
+        /* Copy RT into readback buffer using placed footprint */
+        D3D12_TEXTURE_COPY_LOCATION src_loc = {0};
+        src_loc.pResource = src;
+        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src_loc.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION dst_loc = {0};
+        dst_loc.pResource = readback;
+        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst_loc.PlacedFootprint = footprint;
+
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst_loc, 0, 0, 0,
+                                                     &src_loc, NULL);
+
+        /* Transition back: COPY_SOURCE -> PRESENT */
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+
+        ID3D12GraphicsCommandList_Close(list);
+        ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+
+        /* Wait for copy to finish */
+        vio_d3d12_wait_for_gpu();
+
+        /* Map readback buffer and copy rows out (RowPitch may include padding) */
+        D3D12_RANGE read_range = {0, (SIZE_T)total_bytes};
+        void *mapped_ptr = NULL;
+        hr = ID3D12Resource_Map(readback, 0, &read_range, &mapped_ptr);
+        if (FAILED(hr) || !mapped_ptr) {
+            ID3D12GraphicsCommandList_Release(list);
+            ID3D12CommandAllocator_Release(alloc);
+            ID3D12Resource_Release(readback);
+            php_error_docref(NULL, E_WARNING, "vio_read_pixels: Failed to map readback buffer");
+            RETURN_FALSE;
+        }
+
+        size_t out_size = (size_t)w * h * 4;
+        zend_string *buf = zend_string_alloc(out_size, 0);
+        unsigned char *dst = (unsigned char *)ZSTR_VAL(buf);
+        const unsigned char *srcp = (const unsigned char *)mapped_ptr;
+        for (int y = 0; y < h; y++) {
+            memcpy(dst + (size_t)y * w * 4,
+                   srcp + (size_t)y * footprint.Footprint.RowPitch,
+                   (size_t)w * 4);
+        }
+        ZSTR_VAL(buf)[out_size] = '\0';
+
+        ID3D12Resource_Unmap(readback, 0, NULL);
+        ID3D12GraphicsCommandList_Release(list);
+        ID3D12CommandAllocator_Release(alloc);
+        ID3D12Resource_Release(readback);
+
+        RETURN_NEW_STR(buf);
+    }
+#endif
+
 #ifdef HAVE_METAL
     if (strcmp(ctx->backend->name, "metal") == 0) {
         size_t size = (size_t)w * h * 4;
@@ -3910,6 +4059,39 @@ ZEND_FUNCTION(vio_save_screenshot)
 #ifdef HAVE_METAL
     if (strcmp(ctx->backend->name, "metal") == 0) {
         RETURN_BOOL(vio_metal_save_screenshot(path, w, h) == 0);
+    }
+#endif
+
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
+    {
+        /* Fallback for D3D backends: delegate to vio_read_pixels and write PNG.
+         * Calls vio_read_pixels() via the Zend API to avoid duplicating the readback
+         * logic for D3D11/D3D12. */
+        int is_d3d = 0;
+#ifdef HAVE_D3D11
+        if (strcmp(ctx->backend->name, "d3d11") == 0) is_d3d = 1;
+#endif
+#ifdef HAVE_D3D12
+        if (strcmp(ctx->backend->name, "d3d12") == 0) is_d3d = 1;
+#endif
+        if (is_d3d) {
+            zval retval, func_name, args[1];
+            ZVAL_UNDEF(&retval);
+            ZVAL_STRING(&func_name, "vio_read_pixels");
+            ZVAL_COPY(&args[0], ctx_zval);
+
+            int rc = call_user_function(NULL, NULL, &func_name, &retval, 1, args);
+            int ok = 0;
+            if (rc == SUCCESS && Z_TYPE(retval) == IS_STRING) {
+                const unsigned char *pixels = (const unsigned char *)Z_STRVAL(retval);
+                ok = stbi_write_png(path, w, h, 4, pixels, w * 4);
+            }
+
+            zval_ptr_dtor(&func_name);
+            zval_ptr_dtor(&args[0]);
+            zval_ptr_dtor(&retval);
+            RETURN_BOOL(ok);
+        }
     }
 #endif
 
