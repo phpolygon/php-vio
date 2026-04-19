@@ -82,6 +82,22 @@ typedef struct _vio_d3d11_state {
     int current_rt_width;
     int current_rt_height;
 
+    /* Identity instance buffer bound to input slot 1 for non-instanced draws.
+     * SPIRV-Cross generates HLSL where `layout(location=3..6) vec4` attributes
+     * are treated as per-instance data in slot 1. For non-instanced draws the
+     * shader still reads from slot 1; without this fallback the reads return
+     * undefined memory and the geometry renders at garbage positions
+     * (typically off-screen or collapsed to the origin). */
+    ID3D11Buffer *identity_instance_buf;
+
+    /* Persistent readback staging for vio_read_pixels.
+     * FLIP_DISCARD swapchains lose backbuffer content after Present(), so
+     * end_frame() eagerly copies the rendered backbuffer into this staging
+     * texture. vio_read_pixels maps from here instead of the live RTV. */
+    ID3D11Texture2D *readback_staging;
+    UINT             readback_w;
+    UINT             readback_h;
+
     /* State */
     int   initialized;
     float clear_r, clear_g, clear_b, clear_a;

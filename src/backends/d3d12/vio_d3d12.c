@@ -1430,6 +1430,11 @@ static void d3d12_present(void)
     vio_d3d12.frames[vio_d3d12.frame_index].fence_value = vio_d3d12.fence_value;
     ID3D12CommandQueue_Signal(vio_d3d12.cmd_queue, vio_d3d12.fence, vio_d3d12.fence_value);
 
+    /* Record which buffer we just presented BEFORE rotating to the next one.
+     * vio_read_pixels uses this to read the last-rendered frame instead of
+     * the freshly-rotated (discarded) upcoming backbuffer. */
+    vio_d3d12.last_presented_frame_idx = vio_d3d12.frame_index;
+
     /* Move to next frame */
     vio_d3d12.frame_index = IDXGISwapChain3_GetCurrentBackBufferIndex(vio_d3d12.swapchain);
 }

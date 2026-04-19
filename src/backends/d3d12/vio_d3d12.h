@@ -77,6 +77,12 @@ typedef struct _vio_d3d12_state {
     IDXGIFactory4             *factory;
     UINT                       frame_index;
 
+    /* Index of the most recently presented backbuffer. frame_index is
+     * updated to the NEXT buffer right after Present(), so code paths
+     * that want to read the just-rendered frame (vio_read_pixels) must
+     * use this instead. Initialised to 0 before any Present happens. */
+    UINT                       last_presented_frame_idx;
+
     /* Descriptor heaps */
     ID3D12DescriptorHeap      *rtv_heap;
     UINT                       rtv_descriptor_size;

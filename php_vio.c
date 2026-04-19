@@ -3784,59 +3784,71 @@ ZEND_FUNCTION(vio_read_pixels)
 
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
-        /* Flush all pending GPU commands before readback */
-        ID3D11DeviceContext_Flush(vio_d3d11.context);
+        /* d3d11_end_frame copies the rendered backbuffer into
+         * vio_d3d11.readback_staging. Reading from staging avoids the
+         * FLIP_DISCARD race where the live RTV has undefined content
+         * after Present().
+         *
+         * If end_frame hasn't run yet (pre-first-end call from headless
+         * tests that read before any vio_end), fall back to a one-shot
+         * copy from the live RTV — still valid at that point. */
+        ID3D11Texture2D *staging = vio_d3d11.readback_staging;
+        ID3D11Texture2D *one_shot = NULL;
 
-        /* Get the texture behind the current RTV (not GetBuffer — FLIP_DISCARD rotates) */
-        ID3D11Texture2D *back_buf = NULL;
-        if (vio_d3d11.current_rtv) {
-            ID3D11Resource *rtv_res = NULL;
-            ID3D11RenderTargetView_GetResource(vio_d3d11.current_rtv, &rtv_res);
-            if (rtv_res) {
-                ID3D11Resource_QueryInterface(rtv_res, &IID_ID3D11Texture2D, (void **)&back_buf);
-                ID3D11Resource_Release(rtv_res);
+        if (!staging) {
+            ID3D11DeviceContext_Flush(vio_d3d11.context);
+
+            ID3D11Texture2D *back_buf = NULL;
+            if (vio_d3d11.current_rtv) {
+                ID3D11Resource *rtv_res = NULL;
+                ID3D11RenderTargetView_GetResource(vio_d3d11.current_rtv, &rtv_res);
+                if (rtv_res) {
+                    ID3D11Resource_QueryInterface(rtv_res, &IID_ID3D11Texture2D, (void **)&back_buf);
+                    ID3D11Resource_Release(rtv_res);
+                }
             }
-        }
-        if (!back_buf) {
-            php_error_docref(NULL, E_WARNING, "vio_read_pixels: Failed to get RTV texture");
-            RETURN_FALSE;
-        }
+            if (!back_buf) {
+                php_error_docref(NULL, E_WARNING, "vio_read_pixels: Failed to get RTV texture");
+                RETURN_FALSE;
+            }
 
-        HRESULT hr;
-        D3D11_TEXTURE2D_DESC bb_desc;
-        ID3D11Texture2D_GetDesc(back_buf, &bb_desc);
+            D3D11_TEXTURE2D_DESC bb_desc;
+            ID3D11Texture2D_GetDesc(back_buf, &bb_desc);
 
-        /* Create staging texture */
-        D3D11_TEXTURE2D_DESC staging_desc = bb_desc;
-        staging_desc.Usage = D3D11_USAGE_STAGING;
-        staging_desc.BindFlags = 0;
-        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        staging_desc.MiscFlags = 0;
+            D3D11_TEXTURE2D_DESC staging_desc = bb_desc;
+            staging_desc.Usage = D3D11_USAGE_STAGING;
+            staging_desc.BindFlags = 0;
+            staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            staging_desc.MiscFlags = 0;
 
-        ID3D11Texture2D *staging = NULL;
-        hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &staging_desc, NULL, &staging);
-        if (FAILED(hr)) {
+            HRESULT hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &staging_desc, NULL, &one_shot);
+            if (FAILED(hr)) {
+                ID3D11Texture2D_Release(back_buf);
+                php_error_docref(NULL, E_WARNING, "vio_read_pixels: Failed to create staging texture");
+                RETURN_FALSE;
+            }
+
+            ID3D11DeviceContext_CopyResource(vio_d3d11.context,
+                                              (ID3D11Resource *)one_shot,
+                                              (ID3D11Resource *)back_buf);
             ID3D11Texture2D_Release(back_buf);
-            php_error_docref(NULL, E_WARNING, "vio_read_pixels: Failed to create staging texture");
-            RETURN_FALSE;
+            staging = one_shot;
         }
 
-        ID3D11DeviceContext_CopyResource(vio_d3d11.context,
-                                          (ID3D11Resource *)staging,
-                                          (ID3D11Resource *)back_buf);
-        ID3D11Texture2D_Release(back_buf);
+        D3D11_TEXTURE2D_DESC st_desc;
+        ID3D11Texture2D_GetDesc(staging, &st_desc);
 
         D3D11_MAPPED_SUBRESOURCE mapped = {0};
-        hr = ID3D11DeviceContext_Map(vio_d3d11.context, (ID3D11Resource *)staging,
-                                      0, D3D11_MAP_READ, 0, &mapped);
+        HRESULT hr = ID3D11DeviceContext_Map(vio_d3d11.context, (ID3D11Resource *)staging,
+                                              0, D3D11_MAP_READ, 0, &mapped);
         if (FAILED(hr)) {
-            ID3D11Texture2D_Release(staging);
+            if (one_shot) ID3D11Texture2D_Release(one_shot);
             php_error_docref(NULL, E_WARNING, "vio_read_pixels: Failed to map staging texture");
             RETURN_FALSE;
         }
 
-        w = (int)bb_desc.Width;
-        h = (int)bb_desc.Height;
+        w = (int)st_desc.Width;
+        h = (int)st_desc.Height;
         size_t out_size = (size_t)w * h * 4;
         zend_string *buf = zend_string_alloc(out_size, 0);
         unsigned char *dst = (unsigned char *)ZSTR_VAL(buf);
@@ -3848,7 +3860,7 @@ ZEND_FUNCTION(vio_read_pixels)
         ZSTR_VAL(buf)[out_size] = '\0';
 
         ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)staging, 0);
-        ID3D11Texture2D_Release(staging);
+        if (one_shot) ID3D11Texture2D_Release(one_shot);
 
         RETURN_NEW_STR(buf);
     }
@@ -3856,12 +3868,16 @@ ZEND_FUNCTION(vio_read_pixels)
 
 #ifdef HAVE_D3D12
     if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
-        /* Wait for any in-flight GPU work to complete.
-         * Assumes read_pixels is called after vio_end() — the current frame's
-         * render target is in PRESENT state. */
+        /* Wait for any in-flight GPU work to complete. */
         vio_d3d12_wait_for_gpu();
 
-        ID3D12Resource *src = vio_d3d12.frames[vio_d3d12.frame_index].render_target;
+        /* After Present(), frame_index has rotated to the NEXT backbuffer
+         * (whose contents are undefined with FLIP_DISCARD). We want the
+         * just-rendered frame — d3d12_present() stashes that index in
+         * last_presented_frame_idx. Before the very first Present, both
+         * indices are 0 so reading from frame_index is also correct. */
+        UINT read_idx = vio_d3d12.last_presented_frame_idx;
+        ID3D12Resource *src = vio_d3d12.frames[read_idx].render_target;
         if (!src) {
             php_error_docref(NULL, E_WARNING, "vio_read_pixels: no D3D12 render target");
             RETURN_FALSE;

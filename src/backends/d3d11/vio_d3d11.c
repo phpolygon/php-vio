@@ -127,6 +127,13 @@ static void d3d11_release_views(void)
         ID3D11Texture2D_Release(vio_d3d11.depth_buffer);
         vio_d3d11.depth_buffer = NULL;
     }
+    /* Staging must be recreated at the new size after a swapchain resize. */
+    if (vio_d3d11.readback_staging) {
+        ID3D11Texture2D_Release(vio_d3d11.readback_staging);
+        vio_d3d11.readback_staging = NULL;
+        vio_d3d11.readback_w = 0;
+        vio_d3d11.readback_h = 0;
+    }
 }
 
 /* ── Lifecycle ────────────────────────────────────────────────────── */
@@ -181,6 +188,26 @@ static int d3d11_init(vio_config *cfg)
         return -1;
     }
 
+    /* Identity 4x4 matrix used as a dummy per-instance vertex buffer for
+     * non-instanced draws. SPIRV-Cross'ed shaders reference vertex slot 1
+     * for mat4 instance columns (locations 3..6); binding this buffer to
+     * slot 1 makes the shader read identity for those attributes. */
+    {
+        const float identity[16] = {
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f,
+        };
+        D3D11_BUFFER_DESC ib_desc = {0};
+        ib_desc.ByteWidth = sizeof(identity);
+        ib_desc.Usage = D3D11_USAGE_IMMUTABLE;
+        ib_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA ib_data = { .pSysMem = identity };
+        ID3D11Device_CreateBuffer(vio_d3d11.device, &ib_desc, &ib_data,
+                                   &vio_d3d11.identity_instance_buf);
+    }
+
     vio_d3d11.vsync = cfg->vsync;
     vio_d3d11.initialized = 1;
     return 0;
@@ -194,6 +221,11 @@ static void d3d11_shutdown(void)
     if (vio_d3d11.context) {
         ID3D11DeviceContext_ClearState(vio_d3d11.context);
         ID3D11DeviceContext_Flush(vio_d3d11.context);
+    }
+
+    if (vio_d3d11.identity_instance_buf) {
+        ID3D11Buffer_Release(vio_d3d11.identity_instance_buf);
+        vio_d3d11.identity_instance_buf = NULL;
     }
 
     /* Release cached constant buffers */
@@ -845,9 +877,72 @@ static void d3d11_begin_frame(void)
     ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
 }
 
+/* Copy the current backbuffer into the persistent readback staging texture.
+ * Must be called at end of frame (before Present) so vio_read_pixels returns
+ * the rendered content even after FLIP_DISCARD discards the source. */
+static void d3d11_update_readback_staging(void)
+{
+    if (!vio_d3d11.context || !vio_d3d11.current_rtv) return;
+
+    ID3D11Resource *rtv_res = NULL;
+    ID3D11RenderTargetView_GetResource(vio_d3d11.current_rtv, &rtv_res);
+    if (!rtv_res) return;
+
+    ID3D11Texture2D *bb_tex = NULL;
+    ID3D11Resource_QueryInterface(rtv_res, &IID_ID3D11Texture2D, (void **)&bb_tex);
+    ID3D11Resource_Release(rtv_res);
+    if (!bb_tex) return;
+
+    D3D11_TEXTURE2D_DESC bb_desc;
+    ID3D11Texture2D_GetDesc(bb_tex, &bb_desc);
+
+    /* Lazy-create or resize the staging texture to match the current backbuffer. */
+    if (!vio_d3d11.readback_staging ||
+        vio_d3d11.readback_w != bb_desc.Width ||
+        vio_d3d11.readback_h != bb_desc.Height) {
+        if (vio_d3d11.readback_staging) {
+            ID3D11Texture2D_Release(vio_d3d11.readback_staging);
+            vio_d3d11.readback_staging = NULL;
+        }
+        D3D11_TEXTURE2D_DESC st_desc = bb_desc;
+        st_desc.Usage = D3D11_USAGE_STAGING;
+        st_desc.BindFlags = 0;
+        st_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        st_desc.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(vio_d3d11.device, &st_desc, NULL,
+                                                 &vio_d3d11.readback_staging))) {
+            ID3D11Texture2D_Release(bb_tex);
+            return;
+        }
+        vio_d3d11.readback_w = bb_desc.Width;
+        vio_d3d11.readback_h = bb_desc.Height;
+    }
+
+    ID3D11DeviceContext_CopyResource(vio_d3d11.context,
+                                     (ID3D11Resource *)vio_d3d11.readback_staging,
+                                     (ID3D11Resource *)bb_tex);
+    ID3D11Texture2D_Release(bb_tex);
+}
+
 static void d3d11_end_frame(void)
 {
-    /* D3D11 is immediate mode — nothing to finalize */
+    /* Mirror the just-rendered backbuffer into readback staging — before
+     * the caller's Present() / swap rotates FLIP_DISCARD buffers. */
+    d3d11_update_readback_staging();
+}
+
+/* Bind mesh vertex buffer to slot 0 and the identity instance buffer to
+ * slot 1. The second slot is required by SPIRV-Cross'ed shaders that declare
+ * `layout(location=3..6) vec4 a_instance_colN` — without a buffer at slot 1
+ * the D3D11 runtime reads undefined memory and draws go invisible. */
+static void d3d11_bind_vertex_slots(ID3D11Buffer *mesh_vb, UINT mesh_stride)
+{
+    ID3D11Buffer *buffers[2] = { mesh_vb, vio_d3d11.identity_instance_buf };
+    UINT strides[2] = { mesh_stride, 64 }; /* identity is one 64-byte mat4 */
+    UINT offsets[2] = { 0, 0 };
+    UINT slot_count = vio_d3d11.identity_instance_buf ? 2 : 1;
+    ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, slot_count,
+                                           buffers, strides, offsets);
 }
 
 static void d3d11_draw(vio_draw_cmd *cmd)
@@ -858,9 +953,7 @@ static void d3d11_draw(vio_draw_cmd *cmd)
     if (vb) {
         UINT stride = cmd->vertex_stride > 0 ? (UINT)cmd->vertex_stride
                     : (d3d11_current_pipeline ? d3d11_current_pipeline->vertex_stride : 0);
-        UINT offset = 0;
-        ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 1,
-                                               &vb->buffer, &stride, &offset);
+        d3d11_bind_vertex_slots(vb->buffer, stride);
     }
 
     UINT instance_count = cmd->instance_count > 0 ? cmd->instance_count : 1;
@@ -868,7 +961,6 @@ static void d3d11_draw(vio_draw_cmd *cmd)
                                       cmd->vertex_count,
                                       instance_count,
                                       cmd->first_vertex, 0);
-
 }
 
 static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
@@ -881,9 +973,7 @@ static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
     if (vb) {
         UINT stride = cmd->vertex_stride > 0 ? (UINT)cmd->vertex_stride
                     : (d3d11_current_pipeline ? d3d11_current_pipeline->vertex_stride : 0);
-        UINT offset = 0;
-        ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 1,
-                                               &vb->buffer, &stride, &offset);
+        d3d11_bind_vertex_slots(vb->buffer, stride);
     }
 
     if (ib) {
