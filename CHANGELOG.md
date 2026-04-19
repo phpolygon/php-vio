@@ -1,3 +1,15 @@
+# [1.9.0](https://github.com/phpolygon/php-vio/compare/v1.8.15...v1.9.0) (2026-04-19)
+
+
+### Bug Fixes
+
+* **d3d:** read_pixels survives Present + D3D11 non-instanced draws render ([989f979](https://github.com/phpolygon/php-vio/commit/989f979f94ae2a0899fa8c1634b9143bf38fa302))
+
+
+### Features
+
+* **d3d:** complete D3D11/D3D12 backend integration ([16ae78a](https://github.com/phpolygon/php-vio/commit/16ae78a94e45aec7e79469ea0f74d1b8f86cd854)), closes [#include](https://github.com/phpolygon/php-vio/issues/include)
+
 ## [1.8.15](https://github.com/phpolygon/php-vio/compare/v1.8.14...v1.8.15) (2026-04-18)
 
 
