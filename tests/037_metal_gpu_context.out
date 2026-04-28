@@ -1,2 +1,0 @@
-Warning: vio_create(): Backend "metal" is not available in D:\PhpstormProjects\php-vio\tests\037_metal_gpu_context.php on line 2
-SKIP: Metal context unavailable

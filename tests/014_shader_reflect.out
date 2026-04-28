@@ -1,8 +1,0 @@
-Warning: vio_shader(): Backend shader compilation failed in D:\PhpstormProjects\php-vio\tests\014_shader_reflect.php on line 15
-bool(false)
-
-Fatal error: Uncaught TypeError: vio_shader_reflect(): Argument #1 ($shader) must be of type VioShader, false given in D:\PhpstormProjects\php-vio\tests\014_shader_reflect.php:22
-Stack trace:
-#0 D:\PhpstormProjects\php-vio\tests\014_shader_reflect.php(22): vio_shader_reflect(false)
-#1 {main}
-  thrown in D:\PhpstormProjects\php-vio\tests\014_shader_reflect.php on line 22
