@@ -113,6 +113,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_window_size, 0, 1, IS_ARRAY,
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_native_window_handle, 0, 1, IS_LONG, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_framebuffer_size, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
@@ -552,6 +556,7 @@ ZEND_FUNCTION(vio_set_borderless);
 ZEND_FUNCTION(vio_set_windowed);
 ZEND_FUNCTION(vio_set_fullscreen);
 ZEND_FUNCTION(vio_window_size);
+ZEND_FUNCTION(vio_native_window_handle);
 ZEND_FUNCTION(vio_framebuffer_size);
 ZEND_FUNCTION(vio_content_scale);
 ZEND_FUNCTION(vio_pixel_ratio);
@@ -655,6 +660,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_set_windowed, arginfo_vio_set_windowed)
 	ZEND_FE(vio_set_fullscreen, arginfo_vio_set_fullscreen)
 	ZEND_FE(vio_window_size, arginfo_vio_window_size)
+	ZEND_FE(vio_native_window_handle, arginfo_vio_native_window_handle)
 	ZEND_FE(vio_framebuffer_size, arginfo_vio_framebuffer_size)
 	ZEND_FE(vio_content_scale, arginfo_vio_content_scale)
 	ZEND_FE(vio_pixel_ratio, arginfo_vio_pixel_ratio)

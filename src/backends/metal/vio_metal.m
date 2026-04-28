@@ -2,6 +2,10 @@
  * php-vio - Metal Backend implementation (macOS)
  */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include "php.h"
 
 #ifdef HAVE_METAL
@@ -704,7 +708,176 @@ static void metal_clear(float r, float g, float b, float a)
     vio_mtl.clear_a = a;
 }
 
-/* ── Stub implementations for not-yet-implemented operations ─────── */
+/* ── Shader compilation: SPIR-V → MSL → MTLLibrary ────────────────── */
+
+extern char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
+                              char **error_msg);
+extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
+                                            size_t *out_size, char **error_msg);
+
+/* ARC does not track strong references stored in C structs, so we keep
+ * Metal objects as opaque `void *` and bridge across this boundary
+ * manually with __bridge_retained / CFRelease. */
+typedef struct _vio_metal_shader {
+    void *vert_fn;  /* id<MTLFunction>, +1 retained */
+    void *frag_fn;  /* id<MTLFunction>, +1 retained */
+} vio_metal_shader;
+
+static id<MTLFunction> metal_build_function(const char *msl, char **error_out)
+{
+    @autoreleasepool {
+        NSString *src = [NSString stringWithUTF8String:msl];
+        NSError *err = nil;
+        MTLCompileOptions *opts = [MTLCompileOptions new];
+        opts.languageVersion = MTLLanguageVersion2_0;
+        id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:src options:opts error:&err];
+        if (!lib) {
+            if (error_out) {
+                NSString *msg = err ? [err localizedDescription] : @"unknown MSL compile error";
+                *error_out = strdup([msg UTF8String]);
+            }
+            return nil;
+        }
+        /* SPIRV-Cross emits the entry point as `main0` (it cannot use `main` in MSL) */
+        id<MTLFunction> fn = [lib newFunctionWithName:@"main0"];
+        if (!fn) {
+            fn = [lib newFunctionWithName:@"main"];
+        }
+        if (!fn && error_out) {
+            *error_out = strdup("MSL entry point 'main0' not found");
+        }
+        /* Library is retained transitively by the function; we don't keep
+         * a separate strong reference here — caller stores `fn`. */
+        (void)lib;
+        return fn;
+    }
+}
+
+static void *metal_compile_shader(vio_shader_desc *desc)
+{
+    if (!desc || !desc->vertex_data || !desc->fragment_data) {
+        php_error_docref(NULL, E_WARNING, "Metal: compile_shader called with NULL data");
+        return NULL;
+    }
+    if (!vio_mtl.device) {
+        php_error_docref(NULL, E_WARNING, "Metal: device not initialized");
+        return NULL;
+    }
+
+    char *err = NULL;
+    uint32_t *vs_spirv = NULL;
+    uint32_t *fs_spirv = NULL;
+    size_t vs_size = 0, fs_size = 0;
+    int vs_owned = 0, fs_owned = 0;
+
+    /* Detect SPIR-V magic 0x07230203 vs raw GLSL source */
+    int vs_is_spirv = (desc->vertex_size >= 4 &&
+        *(const uint32_t *)desc->vertex_data == 0x07230203);
+    int fs_is_spirv = (desc->fragment_size >= 4 &&
+        *(const uint32_t *)desc->fragment_data == 0x07230203);
+
+    if (vs_is_spirv) {
+        vs_spirv = (uint32_t *)desc->vertex_data;
+        vs_size  = desc->vertex_size;
+    } else {
+        vs_spirv = vio_compile_glsl_to_spirv(
+            (const char *)desc->vertex_data, 0, &vs_size, &err);
+        if (!vs_spirv) {
+            php_error_docref(NULL, E_WARNING, "Metal: VS GLSL→SPIR-V failed: %s",
+                err ? err : "unknown");
+            free(err);
+            return NULL;
+        }
+        vs_owned = 1;
+    }
+
+    if (fs_is_spirv) {
+        fs_spirv = (uint32_t *)desc->fragment_data;
+        fs_size  = desc->fragment_size;
+    } else {
+        fs_spirv = vio_compile_glsl_to_spirv(
+            (const char *)desc->fragment_data, 1, &fs_size, &err);
+        if (!fs_spirv) {
+            php_error_docref(NULL, E_WARNING, "Metal: FS GLSL→SPIR-V failed: %s",
+                err ? err : "unknown");
+            free(err);
+            if (vs_owned) free(vs_spirv);
+            return NULL;
+        }
+        fs_owned = 1;
+    }
+
+    char *vs_msl = vio_spirv_to_msl(vs_spirv, vs_size, &err);
+    if (vs_owned) free(vs_spirv);
+    if (!vs_msl) {
+        php_error_docref(NULL, E_WARNING, "Metal: VS SPIR-V→MSL failed: %s",
+            err ? err : "unknown");
+        free(err);
+        if (fs_owned) free(fs_spirv);
+        return NULL;
+    }
+
+    char *fs_msl = vio_spirv_to_msl(fs_spirv, fs_size, &err);
+    if (fs_owned) free(fs_spirv);
+    if (!fs_msl) {
+        php_error_docref(NULL, E_WARNING, "Metal: FS SPIR-V→MSL failed: %s",
+            err ? err : "unknown");
+        free(err);
+        free(vs_msl);
+        return NULL;
+    }
+
+    id<MTLFunction> vfn = metal_build_function(vs_msl, &err);
+    free(vs_msl);
+    if (!vfn) {
+        php_error_docref(NULL, E_WARNING, "Metal: VS MSL→MTLFunction failed: %s",
+            err ? err : "unknown");
+        free(err);
+        free(fs_msl);
+        return NULL;
+    }
+
+    id<MTLFunction> ffn = metal_build_function(fs_msl, &err);
+    free(fs_msl);
+    if (!ffn) {
+        php_error_docref(NULL, E_WARNING, "Metal: FS MSL→MTLFunction failed: %s",
+            err ? err : "unknown");
+        free(err);
+        return NULL;
+    }
+
+    vio_metal_shader *sh = calloc(1, sizeof(vio_metal_shader));
+    if (!sh) return NULL;
+    sh->vert_fn = (void *)CFBridgingRetain(vfn);
+    sh->frag_fn = (void *)CFBridgingRetain(ffn);
+    return sh;
+}
+
+static void metal_destroy_shader(void *s)
+{
+    if (!s) return;
+    vio_metal_shader *sh = (vio_metal_shader *)s;
+    if (sh->vert_fn) { CFRelease((CFTypeRef)sh->vert_fn); sh->vert_fn = NULL; }
+    if (sh->frag_fn) { CFRelease((CFTypeRef)sh->frag_fn); sh->frag_fn = NULL; }
+    free(sh);
+}
+
+/* ── 3D pipeline / buffer / texture / draw: not yet wired ─────────
+ *
+ * Returning NULL/no-op causes vio_pipeline()/vio_mesh()/vio_texture()/
+ * vio_draw() to fail gracefully (the PHP-level wrappers check for false).
+ * Implementing these requires:
+ *   - MTLRenderPipelineState cache keyed by (shader, vertex layout, blend,
+ *     depth, cull, topology) — pipeline state in Metal is monolithic
+ *   - Vertex descriptor inferred from vio_vertex_attrib[] OR from SPIR-V
+ *     reflection, mapping locations 0..N to attribute indices
+ *   - MTLBuffer for vertex/index/uniform with per-frame ring allocator
+ *   - MTLTexture creation with format mapping (RGBA8/Depth32F/etc.) plus
+ *     MTLSamplerState cached by filter/wrap combinations
+ *   - draw/draw_indexed encoding cbuffer→setVertexBytes/setFragmentBytes,
+ *     binding textures+samplers, then drawPrimitives:
+ * Until those land, projects on macOS must run with vioBackend='opengl'.
+ */
 
 static void *metal_create_pipeline(vio_pipeline_desc *desc) { (void)desc; return NULL; }
 static void  metal_destroy_pipeline(void *p) { (void)p; }
@@ -714,8 +887,6 @@ static void  metal_update_buffer(void *buf, const void *data, size_t size) { (vo
 static void  metal_destroy_buffer(void *buf) { (void)buf; }
 static void *metal_create_texture(vio_texture_desc *desc) { (void)desc; return NULL; }
 static void  metal_destroy_texture(void *tex) { (void)tex; }
-static void *metal_compile_shader(vio_shader_desc *desc) { (void)desc; return NULL; }
-static void  metal_destroy_shader(void *s) { (void)s; }
 static void  metal_draw(vio_draw_cmd *cmd) { (void)cmd; }
 static void  metal_draw_indexed(vio_draw_indexed_cmd *cmd) { (void)cmd; }
 static void  metal_dispatch_compute(vio_compute_cmd *cmd) { (void)cmd; }

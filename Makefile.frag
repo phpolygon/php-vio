@@ -19,6 +19,8 @@ $(builddir)/src/backends/metal/vio_metal.lo: $(srcdir)/src/backends/metal/vio_me
 	$(LIBTOOL) --tag=CC --mode=compile $(CC) -x objective-c \
 		$(CFLAGS) $(EXTRA_CFLAGS) \
 		$(INCLUDES) \
+		-I$(builddir) -I$(srcdir)/include \
+		-DHAVE_CONFIG_H \
 		-fobjc-arc \
 		-c $(srcdir)/src/backends/metal/vio_metal.m \
 		-o $(builddir)/src/backends/metal/vio_metal.lo

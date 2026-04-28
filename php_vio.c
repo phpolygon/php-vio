@@ -898,6 +898,62 @@ ZEND_FUNCTION(vio_window_size)
     add_next_index_long(return_value, ctx->config.height > 0 ? ctx->config.height : 600);
 }
 
+#ifdef HAVE_GLFW
+/* Pull in native handle accessors from GLFW. We define platform macros
+ * conditionally so this compiles on every host: only the matching
+ * accessor (Cocoa on macOS, Win32 on Windows, X11 on Linux) is exposed. */
+#if defined(__APPLE__)
+#  define GLFW_EXPOSE_NATIVE_COCOA
+#elif defined(_WIN32)
+#  define GLFW_EXPOSE_NATIVE_WIN32
+#elif defined(__linux__)
+#  define GLFW_EXPOSE_NATIVE_X11
+#endif
+#include <GLFW/glfw3native.h>
+#endif
+
+/*
+ * vio_native_window_handle($ctx): int
+ *
+ * Returns the platform-native window handle as an integer:
+ *   - macOS:   NSWindow* cast to uintptr_t (suitable for php-metal's
+ *              Metal\CAMetalLayer::createFromWindow($handle, $device)).
+ *   - Windows: HWND cast to uintptr_t.
+ *   - Linux:   Window XID cast to uintptr_t.
+ *
+ * Returns 0 if no window exists, glfw isn't available, or the platform
+ * isn't supported. Lets PHP code reuse vio's GLFW window with native
+ * graphics SDKs (php-metal, php-d3d11, ...) that bypass the vio
+ * rendering pipeline.
+ */
+ZEND_FUNCTION(vio_native_window_handle)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->window) {
+        RETURN_LONG(0);
+    }
+
+#ifdef HAVE_GLFW
+#  if defined(__APPLE__)
+    RETURN_LONG((zend_long)(uintptr_t)glfwGetCocoaWindow(ctx->window));
+#  elif defined(_WIN32)
+    RETURN_LONG((zend_long)(uintptr_t)glfwGetWin32Window(ctx->window));
+#  elif defined(__linux__)
+    RETURN_LONG((zend_long)(uintptr_t)glfwGetX11Window(ctx->window));
+#  else
+    RETURN_LONG(0);
+#  endif
+#else
+    RETURN_LONG(0);
+#endif
+}
+
 ZEND_FUNCTION(vio_framebuffer_size)
 {
     zval *ctx_zval;

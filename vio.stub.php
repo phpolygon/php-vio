@@ -155,6 +155,16 @@ function vio_set_fullscreen(VioContext $context): void {}
 function vio_window_size(VioContext $context): array {}
 
 /**
+ * Returns the platform-native window handle as an integer:
+ *   - macOS:   NSWindow* — pass to Metal\CAMetalLayer::createFromWindow().
+ *   - Windows: HWND.
+ *   - Linux:   X11 Window XID.
+ *
+ * Returns 0 if no window exists or the platform is unsupported.
+ */
+function vio_native_window_handle(VioContext $context): int {}
+
+/**
  * Get the framebuffer size in pixels.
  *
  * @return array{0: int, 1: int}
