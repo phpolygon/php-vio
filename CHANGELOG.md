@@ -1,3 +1,10 @@
+# [1.10.0](https://github.com/phpolygon/php-vio/compare/v1.9.0...v1.10.0) (2026-04-28)
+
+
+### Features
+
+* **metal:** SPIR-V→MSL shader pipeline + native window handle accessor ([2f54517](https://github.com/phpolygon/php-vio/commit/2f54517d2e0c0e016e434be860bad5c47b71ce34))
+
 # [1.9.0](https://github.com/phpolygon/php-vio/compare/v1.8.15...v1.9.0) (2026-04-19)
 
 
