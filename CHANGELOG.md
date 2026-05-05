@@ -1,3 +1,10 @@
+## [1.10.1](https://github.com/phpolygon/php-vio/compare/v1.10.0...v1.10.1) (2026-05-05)
+
+
+### Bug Fixes
+
+* **windows:** per-monitor DPI v2 awareness and multi-monitor support ([fce72c4](https://github.com/phpolygon/php-vio/commit/fce72c40844cadf6844002d24757786597b8dbe1))
+
 # [1.10.0](https://github.com/phpolygon/php-vio/compare/v1.9.0...v1.10.0) (2026-04-28)
 
 
