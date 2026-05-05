@@ -19,9 +19,10 @@ typedef struct _vio_context_object {
     const vio_backend *backend;
     vio_config         config;
     void              *surface;
-#ifdef HAVE_GLFW
-    GLFWwindow        *window;
-#endif
+    /* GLFWwindow* — typed as void* so this header doesn't depend on
+     * HAVE_GLFW being visible to every translation unit that includes it.
+     * Only translation units that actually drive GLFW need the cast. */
+    void              *window;
     vio_input_state    input;
     vio_2d_state       state_2d;
     int                initialized;
