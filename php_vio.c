@@ -405,52 +405,70 @@ ZEND_FUNCTION(vio_begin)
     vio_input_update(&ctx->input);
 
 #ifdef HAVE_GLFW
-    /* Sync 2D projection and viewport to current window size (handles resize + maximize) */
+    /* Sync 2D projection and viewport to current window size.
+     * Projection (state_2d.width/height) is in LOGICAL coords: framebuffer/scale.
+     * Viewport (state_2d.fb_width/height) is in PHYSICAL pixels.
+     * This decouples layout from monitor DPI: a 1280x720 game renders sharp
+     * at native 4K on a 300%-scale monitor without changing layout constants. */
     if (ctx->window && vio_gl.initialized) {
-        int win_w, win_h;
-        glfwGetWindowSize(ctx->window, &win_w, &win_h);
         int fb_w, fb_h;
+        float sx = 1.0f, sy = 1.0f;
         glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        if (win_w > 0 && win_h > 0 &&
-            (win_w != ctx->state_2d.width || win_h != ctx->state_2d.height)) {
-            vio_2d_set_size(&ctx->state_2d, win_w, win_h);
+        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        if (sx <= 0.0f) sx = 1.0f;
+        if (sy <= 0.0f) sy = 1.0f;
+        int logical_w = (int)((float)fb_w / sx + 0.5f);
+        int logical_h = (int)((float)fb_h / sy + 0.5f);
+        if (logical_w > 0 && logical_h > 0 &&
+            (logical_w != ctx->state_2d.width || logical_h != ctx->state_2d.height)) {
+            vio_2d_set_size(&ctx->state_2d, logical_w, logical_h);
         }
-        /* Always sync viewport and scissor scale to framebuffer size (Retina + resize) */
         glViewport(0, 0, fb_w, fb_h);
-        ctx->state_2d.fb_width = fb_w;
+        ctx->state_2d.fb_width  = fb_w;
         ctx->state_2d.fb_height = fb_h;
     }
 #endif
 
 #ifdef HAVE_METAL
-    /* Sync 2D projection to current window size for Metal backend */
     if (ctx->window && strcmp(ctx->backend->name, "metal") == 0) {
-        int win_w, win_h;
-        glfwGetWindowSize(ctx->window, &win_w, &win_h);
         int fb_w, fb_h;
+        float sx = 1.0f, sy = 1.0f;
         glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        if (win_w > 0 && win_h > 0 &&
-            (win_w != ctx->state_2d.width || win_h != ctx->state_2d.height)) {
-            vio_2d_set_size(&ctx->state_2d, win_w, win_h);
+        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        if (sx <= 0.0f) sx = 1.0f;
+        if (sy <= 0.0f) sy = 1.0f;
+        int logical_w = (int)((float)fb_w / sx + 0.5f);
+        int logical_h = (int)((float)fb_h / sy + 0.5f);
+        if (logical_w > 0 && logical_h > 0 &&
+            (logical_w != ctx->state_2d.width || logical_h != ctx->state_2d.height)) {
+            vio_2d_set_size(&ctx->state_2d, logical_w, logical_h);
         }
-        ctx->state_2d.fb_width = fb_w;
+        ctx->state_2d.fb_width  = fb_w;
         ctx->state_2d.fb_height = fb_h;
     }
 #endif
 
 #if (defined(HAVE_D3D11) || defined(HAVE_D3D12)) && defined(HAVE_GLFW)
-    /* Sync 2D projection to current window size for D3D backends */
     if (ctx->window && (strcmp(ctx->backend->name, "d3d11") == 0
                      || strcmp(ctx->backend->name, "d3d12") == 0)) {
-        int win_w, win_h;
-        glfwGetWindowSize(ctx->window, &win_w, &win_h);
         int fb_w, fb_h;
+        float sx = 1.0f, sy = 1.0f;
         glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        if (win_w > 0 && win_h > 0 &&
-            (win_w != ctx->state_2d.width || win_h != ctx->state_2d.height)) {
-            vio_2d_set_size(&ctx->state_2d, win_w, win_h);
+        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        if (sx <= 0.0f) sx = 1.0f;
+        if (sy <= 0.0f) sy = 1.0f;
+        int logical_w = (int)((float)fb_w / sx + 0.5f);
+        int logical_h = (int)((float)fb_h / sy + 0.5f);
+        /* Resize swapchain buffers when framebuffer size changed.
+         * The backend resize functions are idempotent (early-return on same size). */
+        if (fb_w > 0 && fb_h > 0 && ctx->backend->resize) {
+            ctx->backend->resize(fb_w, fb_h);
         }
-        ctx->state_2d.fb_width = fb_w;
+        if (logical_w > 0 && logical_h > 0 &&
+            (logical_w != ctx->state_2d.width || logical_h != ctx->state_2d.height)) {
+            vio_2d_set_size(&ctx->state_2d, logical_w, logical_h);
+        }
+        ctx->state_2d.fb_width  = fb_w;
         ctx->state_2d.fb_height = fb_h;
     }
 #endif
@@ -602,6 +620,36 @@ ZEND_FUNCTION(vio_key_released)
     RETURN_FALSE;
 }
 
+/* GLFW reports cursor position in screen coordinates. With per-monitor
+ * V2 DPI awareness on Windows, screen coords equal physical pixels, while
+ * the game's UI works in logical coordinates (vio_window_size).
+ * Divide by content scale so mouse positions match the logical layout. */
+static double vio_input_logical_scale_x(vio_context_object *ctx)
+{
+#ifdef HAVE_GLFW
+    if (ctx && ctx->window) {
+        float sx = 1.0f, sy = 1.0f;
+        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        if (sx > 0.0f) return (double)sx;
+    }
+#endif
+    (void)ctx;
+    return 1.0;
+}
+
+static double vio_input_logical_scale_y(vio_context_object *ctx)
+{
+#ifdef HAVE_GLFW
+    if (ctx && ctx->window) {
+        float sx = 1.0f, sy = 1.0f;
+        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        if (sy > 0.0f) return (double)sy;
+    }
+#endif
+    (void)ctx;
+    return 1.0;
+}
+
 ZEND_FUNCTION(vio_mouse_position)
 {
     zval *ctx_zval;
@@ -611,9 +659,11 @@ ZEND_FUNCTION(vio_mouse_position)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    double sx = vio_input_logical_scale_x(ctx);
+    double sy = vio_input_logical_scale_y(ctx);
     array_init(return_value);
-    add_next_index_double(return_value, ctx->input.mouse_x);
-    add_next_index_double(return_value, ctx->input.mouse_y);
+    add_next_index_double(return_value, ctx->input.mouse_x / sx);
+    add_next_index_double(return_value, ctx->input.mouse_y / sy);
 }
 
 ZEND_FUNCTION(vio_mouse_delta)
@@ -625,9 +675,11 @@ ZEND_FUNCTION(vio_mouse_delta)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    double sx = vio_input_logical_scale_x(ctx);
+    double sy = vio_input_logical_scale_y(ctx);
     array_init(return_value);
-    add_next_index_double(return_value, ctx->input.mouse_x - ctx->input.mouse_prev_x);
-    add_next_index_double(return_value, ctx->input.mouse_y - ctx->input.mouse_prev_y);
+    add_next_index_double(return_value, (ctx->input.mouse_x - ctx->input.mouse_prev_x) / sx);
+    add_next_index_double(return_value, (ctx->input.mouse_y - ctx->input.mouse_prev_y) / sy);
 }
 
 ZEND_FUNCTION(vio_mouse_button)
@@ -887,10 +939,25 @@ ZEND_FUNCTION(vio_window_size)
     array_init(return_value);
 #ifdef HAVE_GLFW
     if (ctx->window) {
-        int w = 0, h = 0;
-        glfwGetWindowSize(ctx->window, &w, &h);
-        add_next_index_long(return_value, w);
-        add_next_index_long(return_value, h);
+        /* Return the LOGICAL window size (framebuffer divided by content
+         * scale). This gives a DPI-independent layout space across platforms:
+         *   - macOS retina: glfwGetWindowSize is already logical, but
+         *     fb/scale yields the same value (e.g. 1600/2 = 800).
+         *   - Windows V2-DPI-aware: glfwGetWindowSize returns physical
+         *     pixels; fb/scale recovers the logical size (e.g. 3840/3 = 1280).
+         *   - DPI-unaware/100% scale: fb/scale equals window size.
+         * Games can keep using fixed pixel constants for layout regardless
+         * of monitor DPI, while rendering happens at native physical resolution. */
+        int fb_w = 0, fb_h = 0;
+        float sx = 1.0f, sy = 1.0f;
+        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        if (sx <= 0.0f) sx = 1.0f;
+        if (sy <= 0.0f) sy = 1.0f;
+        int logical_w = (int)((float)fb_w / sx + 0.5f);
+        int logical_h = (int)((float)fb_h / sy + 0.5f);
+        add_next_index_long(return_value, logical_w);
+        add_next_index_long(return_value, logical_h);
         return;
     }
 #endif
