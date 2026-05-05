@@ -1,3 +1,10 @@
+## [1.10.2](https://github.com/phpolygon/php-vio/compare/v1.10.1...v1.10.2) (2026-05-05)
+
+
+### Bug Fixes
+
+* **windows:** accept --with-glfw=DIR and --with-vulkan=DIR in config.w32 ([aa64bdd](https://github.com/phpolygon/php-vio/commit/aa64bdd62b709c7961be79f947d4c560f6361693))
+
 ## [1.10.1](https://github.com/phpolygon/php-vio/compare/v1.10.0...v1.10.1) (2026-05-05)
 
 
