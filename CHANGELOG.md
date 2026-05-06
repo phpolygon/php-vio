@@ -1,3 +1,10 @@
+## [1.10.4](https://github.com/phpolygon/php-vio/compare/v1.10.3...v1.10.4) (2026-05-06)
+
+
+### Bug Fixes
+
+* **d3d12:** full GPU sync before cbuffer heap reallocation ([4166a7a](https://github.com/phpolygon/php-vio/commit/4166a7a9c808e799e5953883fa6d392493321e62))
+
 ## [1.10.2](https://github.com/phpolygon/php-vio/compare/v1.10.1...v1.10.2) (2026-05-05)
 
 
