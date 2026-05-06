@@ -489,11 +489,17 @@ static int d3d12_init(vio_config *cfg)
         goto init_fail;
     }
 
-    /* Per-frame linear cbuffer allocator: 1MB UPLOAD heap, persistently mapped.
+    /* Per-frame linear cbuffer allocator: persistently mapped UPLOAD heap.
      * Each draw call allocates a 256-byte-aligned slice for its cbuffer data.
-     * Reset offset to 0 at begin_frame. */
+     * Reset offset to 0 at begin_frame.
+     *
+     * Sized generously (16MB) so the dynamic-grow path is rarely hit. Growing
+     * the heap mid-execution requires a full GPU sync (see d3d12_begin_frame)
+     * because root CBV lifetime is NOT tracked by the runtime — releasing
+     * the old heap while another frame in flight references it via GPU VA
+     * causes use-after-free flicker. */
     {
-        UINT heap_size = 2 * 1024 * 1024; /* Start small (2MB), grows dynamically */
+        UINT heap_size = 16 * 1024 * 1024; /* 16MB — covers heavy 2D scenes */
         D3D12_HEAP_PROPERTIES hp = {0};
         hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC rd = {0};
@@ -1287,7 +1293,18 @@ static void d3d12_begin_frame(void)
         UINT new_size = vio_d3d12.cbuffer_heap_capacity * 2;
         if (new_size > 256 * 1024 * 1024) new_size = 256 * 1024 * 1024; /* cap at 256MB */
 
-        /* Release old heap (GPU is idle after wait_for_frame above) */
+        /* Full GPU sync before releasing the old heap.
+         *
+         * d3d12_wait_for_frame() above only waited for THIS frame slot's
+         * previous use. With FRAME_COUNT=2 the OTHER frame's command list
+         * is still in flight and references the old heap via root CBV
+         * (SetGraphicsRootConstantBufferView with raw GPU virtual address).
+         * The runtime does NOT track resources used via root descriptors —
+         * Releasing the resource while the GPU still reads its VA is
+         * undefined behaviour and produces a complete-frame flicker. */
+        vio_d3d12_wait_for_gpu();
+
+        /* Release old heap (now safe — all GPU work has completed) */
         if (vio_d3d12.cbuffer_heap) {
             ID3D12Resource_Unmap(vio_d3d12.cbuffer_heap, 0, NULL);
             ID3D12Resource_Release(vio_d3d12.cbuffer_heap);
