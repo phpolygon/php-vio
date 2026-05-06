@@ -620,13 +620,17 @@ ZEND_FUNCTION(vio_key_released)
     RETURN_FALSE;
 }
 
-/* GLFW reports cursor position in screen coordinates. With per-monitor
- * V2 DPI awareness on Windows, screen coords equal physical pixels, while
- * the game's UI works in logical coordinates (vio_window_size).
- * Divide by content scale so mouse positions match the logical layout. */
+/* GLFW's cursor-position contract is platform-dependent:
+ *   Windows (DPI-aware): glfwGetCursorPos returns physical pixels, so we
+ *     divide by content scale to recover logical coords matching the layout.
+ *   macOS: glfwGetCursorPos returns points (logical coords) regardless of
+ *     Retina scale; dividing again would halve mouse positions on 2x displays.
+ *   Linux (X11/Wayland): GLFW reports the same units as the window size, so
+ *     no scaling is needed for the logical layout.
+ * Only Windows needs the division. */
 static double vio_input_logical_scale_x(vio_context_object *ctx)
 {
-#ifdef HAVE_GLFW
+#if defined(HAVE_GLFW) && defined(_WIN32)
     if (ctx && ctx->window) {
         float sx = 1.0f, sy = 1.0f;
         glfwGetWindowContentScale(ctx->window, &sx, &sy);
@@ -639,7 +643,7 @@ static double vio_input_logical_scale_x(vio_context_object *ctx)
 
 static double vio_input_logical_scale_y(vio_context_object *ctx)
 {
-#ifdef HAVE_GLFW
+#if defined(HAVE_GLFW) && defined(_WIN32)
     if (ctx && ctx->window) {
         float sx = 1.0f, sy = 1.0f;
         glfwGetWindowContentScale(ctx->window, &sx, &sy);
