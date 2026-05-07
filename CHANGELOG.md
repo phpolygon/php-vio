@@ -1,3 +1,10 @@
+## [1.10.7](https://github.com/phpolygon/php-vio/compare/v1.10.6...v1.10.7) (2026-05-07)
+
+
+### Bug Fixes
+
+* **d3d12:** dynamic SRV-heap partition (no fixed static-slot reservation) ([122e2e5](https://github.com/phpolygon/php-vio/commit/122e2e556ff5a147e62e630e8162b2e98541d3fc)), closes [#65](https://github.com/phpolygon/php-vio/issues/65)
+
 ## [1.10.6](https://github.com/phpolygon/php-vio/compare/v1.10.5...v1.10.6) (2026-05-07)
 
 
