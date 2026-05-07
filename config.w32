@@ -83,6 +83,10 @@ if (PHP_VIO != "no") {
                 CHECK_LIB("SPIRV.lib", "vio", PHP_GLSLANG + "\\lib")) {
                 // Optional: glslang-default-resource-limits
                 CHECK_LIB("glslang-default-resource-limits.lib", "vio", PHP_GLSLANG + "\\lib");
+                // Required by glslang.lib(SpvTools.obj) on recent glslang builds:
+                // pulls in spvtools::Optimizer symbols to resolve link-time refs.
+                CHECK_LIB("SPIRV-Tools.lib", "vio", PHP_GLSLANG + "\\lib");
+                CHECK_LIB("SPIRV-Tools-opt.lib", "vio", PHP_GLSLANG + "\\lib");
                 AC_DEFINE("HAVE_GLSLANG", 1, "Whether glslang is available");
             } else {
                 WARNING("glslang libraries not found");
@@ -119,6 +123,15 @@ if (PHP_VIO != "no") {
         if (CHECK_HEADER_ADD_INCLUDE("vulkan/vulkan.h", "CFLAGS_VIO", PHP_VULKAN + "\\include")) {
             if (CHECK_LIB("vulkan-1.lib", "vio", PHP_VULKAN + "\\lib")) {
                 AC_DEFINE("HAVE_VULKAN", 1, "Whether Vulkan is available");
+                // The VMA wrapper guards its body with `#ifdef HAVE_VULKAN`, but it
+                // does not include php.h / config.h, so it never sees the AC_DEFINE.
+                // Pass the define explicitly so the wrapper's body is actually emitted.
+                ADD_FLAG("CFLAGS_VIO", "/DHAVE_VULKAN=1");
+                // VMA C++ wrapper provides vio_vma_create/destroy/create_image/destroy_image
+                // referenced by vio_vulkan.c. The wrapper itself does `#define VMA_IMPLEMENTATION`,
+                // so vendor/vma/vma_impl.cpp must NOT be added too — it would duplicate every
+                // VMA symbol and trigger LNK2005. (On Unix only Makefile.frag compiles the wrapper.)
+                vio_sources += " src\\backends\\vulkan\\vio_vma_wrapper.cpp";
             } else {
                 WARNING("Vulkan library not found in " + PHP_VULKAN + "\\lib");
             }
@@ -199,8 +212,7 @@ if (PHP_VIO != "no") {
         "include/vio_plugin.h"
     );
 
-    // Note: Metal backend is macOS-only, not compiled on Windows
-    // Note: VMA C++ wrapper for Vulkan requires manual compilation step:
-    //   cl /c /std:c++14 /Ivendor\vma /Iinclude src\backends\vulkan\vio_vma_wrapper.cpp
-    //   Then add vio_vma_wrapper.obj to the link step
+    // Note: Metal backend is macOS-only, not compiled on Windows.
+    // Note: VMA C++ wrapper is now appended to vio_sources from the Vulkan
+    //   detection block above when --with-vulkan is enabled.
 }

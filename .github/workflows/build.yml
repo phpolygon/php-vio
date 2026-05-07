@@ -244,7 +244,7 @@ jobs:
           arch: x64
           ts: ${{ matrix.ts }}
 
-      - name: Download dependencies
+      - name: Download GLFW
         shell: cmd
         run: |
           mkdir deps
@@ -253,14 +253,55 @@ jobs:
           xcopy /E /I deps\glfw-extract\glfw-3.4.bin.WIN64\include deps\include
           xcopy /E /I deps\glfw-extract\glfw-3.4.bin.WIN64\lib-vc2022 deps\lib
 
+      # Vulkan SDK (LunarG) bundles vulkan-1.lib, glslang.lib + SPIRV-Tools*.lib +
+      # spirv-cross-c.lib and matching headers. One install, four --with-* covered.
+      - name: Setup Vulkan SDK (vulkan + glslang + SPIRV-Cross + SPIRV-Tools)
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: 1.3.296.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, SPIRV-Cross, SPIRV-Tools, SPIRV-Reflect
+          vulkan-use-cache: true
+
+      - name: Merge Vulkan SDK into deps/
+        shell: pwsh
+        run: |
+          # VULKAN_SDK is set by humbletim/setup-vulkan-sdk
+          if (-not $env:VULKAN_SDK) { throw "VULKAN_SDK not set" }
+          Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
+          # SDK uses Include/Lib (case-insensitive on Windows; copy preserving case-folding)
+          Copy-Item -Recurse -Force "$env:VULKAN_SDK\Include\*" deps\include\
+          Copy-Item -Recurse -Force "$env:VULKAN_SDK\Lib\*"     deps\lib\
+
+      - name: Download FFmpeg (BtbN prebuilt, GPL-shared)
+        shell: pwsh
+        run: |
+          $url  = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip'
+          $zip  = "deps\ffmpeg.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath deps\ffmpeg-extract -Force
+          $root = (Get-ChildItem deps\ffmpeg-extract -Directory | Select-Object -First 1).FullName
+          Copy-Item -Recurse -Force "$root\include\*" deps\include\
+          Copy-Item -Recurse -Force "$root\lib\*"     deps\lib\
+          New-Item -ItemType Directory -Force -Path deps\bin | Out-Null
+          Copy-Item -Force "$root\bin\*.dll"          deps\bin\
+
       - name: Enable Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build extension
+      - name: Build extension (full: vulkan + glslang + spirv-cross + ffmpeg + d3d11/12)
         shell: cmd
         run: |
           call phpize.bat
-          call configure --enable-vio --with-glfw=deps --with-d3d11 --with-d3d12 --with-prefix=${{ steps.php-sdk.outputs.prefix }}
+          call configure ^
+            --enable-vio ^
+            --with-glfw=deps ^
+            --with-vulkan=deps ^
+            --with-glslang=deps ^
+            --with-spirv-cross=deps ^
+            --with-ffmpeg=deps ^
+            --with-d3d11=yes ^
+            --with-d3d12=yes ^
+            --with-prefix=${{ steps.php-sdk.outputs.prefix }}
           nmake
 
       - name: Package binary
