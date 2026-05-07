@@ -1,3 +1,10 @@
+## [1.10.5](https://github.com/phpolygon/php-vio/compare/v1.10.4...v1.10.5) (2026-05-07)
+
+
+### Bug Fixes
+
+* **ci:** quote windows-x64 build step name to satisfy YAML parser ([753d840](https://github.com/phpolygon/php-vio/commit/753d8406bac2c1cc01c0862f4a6db8075d9e32b1))
+
 ## [1.10.4](https://github.com/phpolygon/php-vio/compare/v1.10.3...v1.10.4) (2026-05-06)
 
 
