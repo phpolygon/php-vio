@@ -115,9 +115,15 @@ typedef struct _vio_d3d12_state {
     D3D12_CPU_DESCRIPTOR_HANDLE pending_srvs[8]; /* CPU handles of bound textures */
     int                          pending_srv_valid[8]; /* 1 if slot has a texture */
 
-    /* Per-frame linear SRV descriptor allocator (contiguous blocks for descriptor tables) */
-    UINT                       srv_frame_offset; /* current allocation offset in srv_heap */
-    UINT                       srv_frame_base;   /* first index reserved for per-frame allocs */
+    /* Per-frame linear SRV descriptor allocator (contiguous blocks for descriptor tables).
+     *
+     * Partitioned into VIO_D3D12_FRAME_COUNT non-overlapping regions so the CPU
+     * can write descriptors for the next frame without stomping descriptors that
+     * the previous frame's command list still references via the bound SRV table. */
+    UINT                       srv_frame_offset;        /* current allocation offset in srv_heap */
+    UINT                       srv_frame_base;          /* base of THIS frame's region (= static_count + frame_index * srv_frame_capacity) */
+    UINT                       srv_static_count;        /* descriptors reserved for static SRVs (textures, render targets) */
+    UINT                       srv_frame_capacity;      /* descriptors per frame slot */
 
     /* Per-frame linear cbuffer allocator (avoids overwriting between draw calls) */
     ID3D12Resource            *cbuffer_heap;          /* large UPLOAD heap */

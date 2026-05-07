@@ -576,8 +576,12 @@ void vio_2d_flush(vio_2d_state *state)
         vio_2d_d3d12_state *d3d = (vio_2d_d3d12_state *)state->d3d_state;
         ID3D12GraphicsCommandList *cl = vio_d3d12.cmd_list;
 
-        /* Upload vertex data (persistently mapped) */
-        memcpy(d3d->vbo_mapped, state->vertices, sizeof(vio_2d_vertex) * state->vertex_count);
+        /* Upload vertex data into THIS frame's slice of the persistently-mapped
+         * UPLOAD VBO. The resource holds VIO_D3D12_FRAME_COUNT slices; we pick
+         * the one indexed by the current backbuffer to avoid stomping vertices
+         * still in flight on the GPU from the previous frame. */
+        UINT vbo_slice_off = vio_d3d12.frame_index * d3d->vbo_slice_size;
+        memcpy(d3d->vbo_mapped + vbo_slice_off, state->vertices, sizeof(vio_2d_vertex) * state->vertex_count);
 
         /* Upload projection matrix via cbuffer heap */
         UINT cb_aligned = (sizeof(float) * 16 + 255) & ~255;
@@ -597,9 +601,9 @@ void vio_2d_flush(vio_2d_state *state)
         ID3D12DescriptorHeap *heaps[] = { vio_d3d12.srv_heap.heap };
         ID3D12GraphicsCommandList_SetDescriptorHeaps(cl, 1, heaps);
 
-        /* Bind vertex buffer */
+        /* Bind vertex buffer at the current frame's slice */
         D3D12_VERTEX_BUFFER_VIEW vbv = {0};
-        vbv.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(d3d->vbo);
+        vbv.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(d3d->vbo) + vbo_slice_off;
         vbv.SizeInBytes = sizeof(vio_2d_vertex) * state->vertex_count;
         vbv.StrideInBytes = sizeof(vio_2d_vertex);
         ID3D12GraphicsCommandList_IASetVertexBuffers(cl, 0, 1, &vbv);

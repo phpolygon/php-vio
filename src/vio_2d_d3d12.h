@@ -14,8 +14,9 @@ typedef struct _vio_2d_d3d12_state {
     ID3D12PipelineState *pso_shapes;
     ID3D12PipelineState *pso_sprites;
     ID3D12Resource      *vbo;
-    unsigned char       *vbo_mapped;     /* persistently mapped */
-    UINT                 vbo_size;
+    unsigned char       *vbo_mapped;     /* persistently mapped, sized for FRAME_COUNT slices */
+    UINT                 vbo_size;       /* total bytes (slice * VIO_D3D12_FRAME_COUNT) */
+    UINT                 vbo_slice_size; /* per-frame slice in bytes */
     D3D12_VERTEX_BUFFER_VIEW vbv;
 } vio_2d_d3d12_state;
 
