@@ -1,3 +1,10 @@
+## [1.10.9](https://github.com/phpolygon/php-vio/compare/v1.10.8...v1.10.9) (2026-05-07)
+
+
+### Bug Fixes
+
+* **2d:** apply current transform to pushed scissor rects ([56a9b3f](https://github.com/phpolygon/php-vio/commit/56a9b3ffae385b244e48ef3a047b8630e1494e77))
+
 ## [1.10.8](https://github.com/phpolygon/php-vio/compare/v1.10.7...v1.10.8) (2026-05-07)
 
 
