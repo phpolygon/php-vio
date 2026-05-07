@@ -1,3 +1,10 @@
+## [1.10.8](https://github.com/phpolygon/php-vio/compare/v1.10.7...v1.10.8) (2026-05-07)
+
+
+### Bug Fixes
+
+* **d3d12:** allocate static SRV descriptors from top of heap (downward) ([61e42a7](https://github.com/phpolygon/php-vio/commit/61e42a7aec07ef3588722ff7da75d00ddd4372de))
+
 ## [1.10.7](https://github.com/phpolygon/php-vio/compare/v1.10.6...v1.10.7) (2026-05-07)
 
 
