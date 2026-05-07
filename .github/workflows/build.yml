@@ -341,3 +341,21 @@ jobs:
         with:
           generate_release_notes: true
           files: artifacts/*
+
+      # Tell hmennen90/static-php-cli to rebuild micro.sfx so the bundled
+      # PHP picks up this php-vio release. Requires a fine-grained PAT
+      # stored as repo secret STATIC_PHP_CLI_DISPATCH_PAT with permission
+      # `actions: write` on hmennen90/static-php-cli. Without the secret
+      # this step warns and exits 0 — the release itself still succeeds.
+      - name: Trigger static-php-cli rebuild
+        env:
+          GH_TOKEN: ${{ secrets.STATIC_PHP_CLI_DISPATCH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::STATIC_PHP_CLI_DISPATCH_PAT not configured — skipping downstream rebuild trigger"
+            exit 0
+          fi
+          gh api -X POST /repos/hmennen90/static-php-cli/dispatches \
+            -f event_type=php-vio-released \
+            -F "client_payload[version]=${GITHUB_REF_NAME}" \
+            -F "client_payload[source_run]=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
