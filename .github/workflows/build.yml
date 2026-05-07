@@ -288,7 +288,7 @@ jobs:
       - name: Enable Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build extension (full: vulkan + glslang + spirv-cross + ffmpeg + d3d11/12)
+      - name: "Build extension (full — vulkan + glslang + spirv-cross + ffmpeg + d3d11/12)"
         shell: cmd
         run: |
           call phpize.bat
