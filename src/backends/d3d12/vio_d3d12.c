@@ -119,7 +119,15 @@ static int d3d12_create_descriptor_heap(ID3D12DescriptorHeap **out, D3D12_DESCRI
     return 0;
 }
 
-/* Allocate a descriptor from the SRV heap, returns index or UINT_MAX on overflow */
+/* Allocate a descriptor from the SRV heap, returns index or UINT_MAX on overflow.
+ *
+ * Static SRVs grow DOWNWARD from the top of the heap (index = capacity-1, then
+ * capacity-2, …). The per-frame allocator (see d3d12_begin_frame /
+ * vio_d3d12_flush_srv_table) grows UPWARD from index 0. The two regions never
+ * overlap until the heap is full, so a texture created mid-frame can never
+ * land in any frame's per-frame region — fixing the previous bug where lazy
+ * texture loads (e.g. menu icons) had their freshly-created SRVs immediately
+ * stomped by flush_srv_table's null-init sweep on the very next bound draw. */
 static UINT d3d12_alloc_srv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE *out_cpu,
                                         D3D12_GPU_DESCRIPTOR_HANDLE *out_gpu)
 {
@@ -130,10 +138,11 @@ static UINT d3d12_alloc_srv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE *out_cpu,
         memset(out_gpu, 0, sizeof(*out_gpu));
         return UINT_MAX;
     }
-    UINT idx = vio_d3d12.srv_heap.count++;
+    UINT idx = vio_d3d12.srv_heap.capacity - 1 - vio_d3d12.srv_heap.count;
+    vio_d3d12.srv_heap.count++;
+
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_start;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_start;
-
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &cpu_start);
     ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &gpu_start);
 
@@ -1336,24 +1345,18 @@ static void d3d12_begin_frame(void)
 
     /* Reset per-frame allocators.
      *
-     * Snapshot the current static SRV count and partition the remaining heap
-     * across frame slots. A previous design used a fixed reservation (first 64
-     * slots = static, the rest split per-frame), but the game routinely
-     * exceeds 64 textures (fonts × sizes, sprites, language flags, render
-     * targets), at which point static allocations spilled into the per-frame
-     * region and got stomped each frame — visible as wrong-glyph corruption
-     * on D3D12 only.
-     *
-     * Mid-frame static-SRV creation can still race the current frame's
-     * per-frame writes; in practice static allocations happen at startup or
-     * at lazy-load boundaries (e.g. menu open) and only produce a one-frame
-     * transient before the next begin_frame snapshot stabilises the layout. */
+     * Static SRVs occupy [capacity - srv_heap.count, capacity), growing
+     * downward as more textures load. The per-frame regions live in
+     * [0, capacity - srv_heap.count), split into VIO_D3D12_FRAME_COUNT
+     * equal slices indexed by frame_index. The two regions never overlap
+     * (until the heap is genuinely full), so a texture created mid-frame
+     * gets a high-index SRV that's outside every frame's per-frame slice
+     * and is therefore safe from the null-init sweep in flush_srv_table. */
     vio_d3d12.cbuffer_heap_offset = 0;
-    UINT static_top = vio_d3d12.srv_heap.count;
-    UINT remaining  = (vio_d3d12.srv_heap.capacity > static_top)
-                       ? (vio_d3d12.srv_heap.capacity - static_top) : 0;
-    vio_d3d12.srv_frame_capacity = remaining / VIO_D3D12_FRAME_COUNT;
-    vio_d3d12.srv_frame_base     = static_top + vio_d3d12.frame_index * vio_d3d12.srv_frame_capacity;
+    UINT perframe_total = (vio_d3d12.srv_heap.capacity > vio_d3d12.srv_heap.count)
+                           ? (vio_d3d12.srv_heap.capacity - vio_d3d12.srv_heap.count) : 0;
+    vio_d3d12.srv_frame_capacity = perframe_total / VIO_D3D12_FRAME_COUNT;
+    vio_d3d12.srv_frame_base     = vio_d3d12.frame_index * vio_d3d12.srv_frame_capacity;
     vio_d3d12.srv_frame_offset   = vio_d3d12.srv_frame_base;
     memset(vio_d3d12.pending_srv_valid, 0, sizeof(vio_d3d12.pending_srv_valid));
 
