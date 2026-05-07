@@ -117,13 +117,17 @@ typedef struct _vio_d3d12_state {
 
     /* Per-frame linear SRV descriptor allocator (contiguous blocks for descriptor tables).
      *
-     * Partitioned into VIO_D3D12_FRAME_COUNT non-overlapping regions so the CPU
-     * can write descriptors for the next frame without stomping descriptors that
-     * the previous frame's command list still references via the bound SRV table. */
+     * The descriptor heap is split each begin_frame: indices [0, srv_heap.count)
+     * are static SRVs (one per texture/render-target/cubemap, monotonically
+     * appended via d3d12_alloc_srv_descriptor); the remainder is partitioned
+     * into VIO_D3D12_FRAME_COUNT equal regions, one per in-flight frame slot.
+     * Per-frame writes never touch indices below srv_heap.count, so they can
+     * never overwrite a static SRV — even when the game loads enough textures
+     * (fonts × sizes, sprites, language flags, etc.) to push the static count
+     * past any compile-time reservation. */
     UINT                       srv_frame_offset;        /* current allocation offset in srv_heap */
-    UINT                       srv_frame_base;          /* base of THIS frame's region (= static_count + frame_index * srv_frame_capacity) */
-    UINT                       srv_static_count;        /* descriptors reserved for static SRVs (textures, render targets) */
-    UINT                       srv_frame_capacity;      /* descriptors per frame slot */
+    UINT                       srv_frame_base;          /* base of THIS frame's region (recomputed each begin_frame) */
+    UINT                       srv_frame_capacity;      /* descriptors per frame slot (recomputed each begin_frame) */
 
     /* Per-frame linear cbuffer allocator (avoids overwriting between draw calls) */
     ID3D12Resource            *cbuffer_heap;          /* large UPLOAD heap */

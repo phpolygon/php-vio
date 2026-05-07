@@ -479,16 +479,12 @@ static int d3d12_init(vio_config *cfg)
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     vio_d3d12.srv_heap.capacity = VIO_D3D12_MAX_SRV_DESCRIPTORS;
     vio_d3d12.srv_heap.count = 0;
-    /* Reserve first 64 slots for static SRVs (textures, render target SRVs).
-     * The remaining heap is split into VIO_D3D12_FRAME_COUNT equal regions so
-     * each in-flight frame writes into its own range — without this partitioning
-     * the CPU writes for frame N+1 stomp descriptors that frame N's command list
-     * is still reading via SetGraphicsRootDescriptorTable, producing torn texture
-     * samples (wrong glyphs / wrong sprites) and frame-wide flicker. */
-    vio_d3d12.srv_static_count = 64;
-    vio_d3d12.srv_frame_capacity = (VIO_D3D12_MAX_SRV_DESCRIPTORS - vio_d3d12.srv_static_count) / VIO_D3D12_FRAME_COUNT;
-    vio_d3d12.srv_frame_base = vio_d3d12.srv_static_count; /* set properly each begin_frame */
-    vio_d3d12.srv_frame_offset = vio_d3d12.srv_frame_base;
+    /* Per-frame allocator partitions itself dynamically against srv_heap.count
+     * each begin_frame, so static SRVs (textures, render targets) can grow
+     * arbitrarily without colliding with per-frame descriptor writes. */
+    vio_d3d12.srv_frame_capacity = 0;
+    vio_d3d12.srv_frame_base = 0;
+    vio_d3d12.srv_frame_offset = 0;
 
     /* Root signature */
     if (d3d12_create_root_signature() != 0) {
@@ -1340,13 +1336,25 @@ static void d3d12_begin_frame(void)
 
     /* Reset per-frame allocators.
      *
-     * SRV heap is partitioned by frame_index so descriptors for the previous
-     * frame remain valid until d3d12_wait_for_frame() above has confirmed
-     * that frame slot is no longer in use. */
+     * Snapshot the current static SRV count and partition the remaining heap
+     * across frame slots. A previous design used a fixed reservation (first 64
+     * slots = static, the rest split per-frame), but the game routinely
+     * exceeds 64 textures (fonts × sizes, sprites, language flags, render
+     * targets), at which point static allocations spilled into the per-frame
+     * region and got stomped each frame — visible as wrong-glyph corruption
+     * on D3D12 only.
+     *
+     * Mid-frame static-SRV creation can still race the current frame's
+     * per-frame writes; in practice static allocations happen at startup or
+     * at lazy-load boundaries (e.g. menu open) and only produce a one-frame
+     * transient before the next begin_frame snapshot stabilises the layout. */
     vio_d3d12.cbuffer_heap_offset = 0;
-    vio_d3d12.srv_frame_base = vio_d3d12.srv_static_count
-                              + vio_d3d12.frame_index * vio_d3d12.srv_frame_capacity;
-    vio_d3d12.srv_frame_offset = vio_d3d12.srv_frame_base;
+    UINT static_top = vio_d3d12.srv_heap.count;
+    UINT remaining  = (vio_d3d12.srv_heap.capacity > static_top)
+                       ? (vio_d3d12.srv_heap.capacity - static_top) : 0;
+    vio_d3d12.srv_frame_capacity = remaining / VIO_D3D12_FRAME_COUNT;
+    vio_d3d12.srv_frame_base     = static_top + vio_d3d12.frame_index * vio_d3d12.srv_frame_capacity;
+    vio_d3d12.srv_frame_offset   = vio_d3d12.srv_frame_base;
     memset(vio_d3d12.pending_srv_valid, 0, sizeof(vio_d3d12.pending_srv_valid));
 
     /* Set viewport and scissor */
