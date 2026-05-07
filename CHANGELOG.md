@@ -1,3 +1,11 @@
+## [1.10.6](https://github.com/phpolygon/php-vio/compare/v1.10.5...v1.10.6) (2026-05-07)
+
+
+### Bug Fixes
+
+* **ci:** bump humbletim/setup-vulkan-sdk v1.2.0 → v1.2.1 ([1d49af1](https://github.com/phpolygon/php-vio/commit/1d49af1136b7ced11a73476c7006ba2c6722177b))
+* **d3d12:** per-frame slicing for 2D VBO and SRV descriptor heap ([89c5b88](https://github.com/phpolygon/php-vio/commit/89c5b883c1a01c4058ede12dd2f2209ba409cf67))
+
 ## [1.10.5](https://github.com/phpolygon/php-vio/compare/v1.10.4...v1.10.5) (2026-05-07)
 
 
