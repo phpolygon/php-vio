@@ -134,6 +134,24 @@ void vio_2d_push_scissor(vio_2d_state *state, float x, float y, float w, float h
         return;
     }
 
+    /* Apply current 2D transform to the scissor rect so the rect is stored
+     * in the same coordinate space as the (transformed) vertex stream.
+     * Without this, callers who push a scissor inside a `pushTransform(scale)`
+     * (e.g. games that map a logical UI grid onto an HiDPI / 4K framebuffer)
+     * see scrollable-list scissors clip at logical-coord pixels instead of
+     * the actual on-screen rectangle. Transform the top-left and bottom-right
+     * corners separately to handle scale + translate (the only affine forms
+     * the 2D path emits today). */
+    if (state->transform_depth > 0) {
+        float x0 = x,     y0 = y;
+        float x1 = x + w, y1 = y + h;
+        vio_2d_apply_transform(state, &x0, &y0);
+        vio_2d_apply_transform(state, &x1, &y1);
+        x = x0; y = y0;
+        w = x1 - x0;
+        h = y1 - y0;
+    }
+
     vio_2d_scissor_rect rect = {x, y, w, h, 1};
 
     /* Intersect with parent scissor if any */
