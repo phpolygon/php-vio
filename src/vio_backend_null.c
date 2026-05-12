@@ -82,15 +82,22 @@ static void null_destroy_texture(void *texture)
     (void)texture;
 }
 
+/* Sentinel pointer returned by the null backend's compile_shader. The vio
+ * frontend treats a NULL return as compile-failure, but the null backend is
+ * meant for tests and stubs where the call should appear to succeed without
+ * touching a GPU. Pointer value is intentionally non-zero, non-aligned to a
+ * real heap address (0x1) so any accidental dereference faults immediately. */
+static char vio_null_shader_sentinel;
+
 static void *null_compile_shader(vio_shader_desc *desc)
 {
     (void)desc;
-    return NULL;
+    return &vio_null_shader_sentinel;
 }
 
 static void null_destroy_shader(void *shader)
 {
-    (void)shader;
+    (void)shader; /* sentinel — nothing to free */
 }
 
 static void null_begin_frame(void)

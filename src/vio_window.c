@@ -135,8 +135,15 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
      * Combined with per-monitor DPI awareness this means: a request for
      * 1280x720 on a 4K@200% display creates a 2560x1440 physical window,
      * glfwGetWindowSize() returns 1280x720 (logical, layout-stable), and
-     * glfwGetFramebufferSize() returns 2560x1440 (physical, sharp render). */
-    glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+     * glfwGetFramebufferSize() returns 2560x1440 (physical, sharp render).
+     *
+     * Headless contexts skip the auto-scale — they render to a hidden FBO
+     * at the requested pixel dimensions, so DPI awareness only introduces
+     * unwanted asymmetric scaling (which is why headless callers asking for
+     * 64×48 used to get 120×48 on a 1.875× display). */
+    if (!cfg->headless) {
+        glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+    }
 
     if (backend_name && strcmp(backend_name, "opengl") == 0) {
         /* OpenGL 4.1 Core Profile */

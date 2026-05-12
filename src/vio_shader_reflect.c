@@ -60,7 +60,12 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
         return NULL;
     }
 
-    fprintf(stderr, "[vio] SPIRV-Cross output (first 500 chars):\n%.500s\n---\n", result);
+    /* Stray debug print: emits to stderr on every shader compile. Gated
+     * behind VIO_DEBUG_SPIRV so production / tests don't get spammed and
+     * shader-related .phpt tests can match their --EXPECT block. */
+    if (getenv("VIO_DEBUG_SPIRV")) {
+        fprintf(stderr, "[vio] SPIRV-Cross output (first 500 chars):\n%.500s\n---\n", result);
+    }
     output = strdup(result);
     spvc_context_destroy(ctx);
     return output;

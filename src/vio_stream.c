@@ -86,6 +86,11 @@ int vio_stream_init(vio_stream_object *st, const char *url,
                     int width, int height, int fps, int bitrate,
                     const char *codec_name, const char *format_name)
 {
+    /* Quiet ffmpeg / libx264 — mirrors vio_recorder. Encoder open + close
+     * normally print codec parameters and stats to stderr, which spams
+     * production output and breaks shape-based test assertions. */
+    av_log_set_level(AV_LOG_ERROR);
+
     st->width   = width;
     st->height  = height;
     st->fps     = fps;

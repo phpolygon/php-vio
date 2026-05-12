@@ -91,6 +91,13 @@ int vio_recorder_init(vio_recorder_object *rec, const char *path,
     rec->height = height;
     rec->fps    = fps;
 
+    /* Quiet ffmpeg / libx264 by default. They emit codec parameters and
+     * stats to stderr on every encoder open, which floods test output and
+     * spams production runs. Callers can re-enable via av_log_set_level()
+     * if they want the diagnostic; setting it to AV_LOG_ERROR keeps real
+     * encoder failures visible. */
+    av_log_set_level(AV_LOG_ERROR);
+
     /* Output format context */
     int ret = avformat_alloc_output_context2(&rec->fmt_ctx, NULL, NULL, path);
     if (ret < 0 || !rec->fmt_ctx) {
