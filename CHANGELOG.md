@@ -1,3 +1,16 @@
+# [1.11.0](https://github.com/phpolygon/php-vio/compare/v1.10.9...v1.11.0) (2026-05-12)
+
+
+### Bug Fixes
+
+* **context:** always free vio_2d / input state, not just when ctx is initialized ([3b5b66d](https://github.com/phpolygon/php-vio/commit/3b5b66d22ad3bdcaf6aa62ca5ffd1ebd82e13086))
+* **render_target:** cache backend-texture wrapper + validate vio_texture data ([2d19696](https://github.com/phpolygon/php-vio/commit/2d19696e42d49fdbfa57f34962fb71da260e8e2d))
+
+
+### Features
+
+* **d3d12:** InfoQueue drain, staging-heap SRV, in-frame guard ([a070a2c](https://github.com/phpolygon/php-vio/commit/a070a2ca20149f9302250484bb1f0f3fb2c27ab9))
+
 ## [1.10.9](https://github.com/phpolygon/php-vio/compare/v1.10.8...v1.10.9) (2026-05-07)
 
 
