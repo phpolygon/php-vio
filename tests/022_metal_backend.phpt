@@ -1,5 +1,10 @@
 --TEST--
 Metal backend registration
+--SKIPIF--
+<?php
+// Metal is only compiled in on macOS builds.
+if (!in_array('metal', vio_backends(), true)) die('skip Metal backend not compiled in');
+?>
 --EXTENSIONS--
 vio
 --FILE--

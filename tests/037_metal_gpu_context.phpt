@@ -1,5 +1,9 @@
 --TEST--
 Metal backend: headless context creation, frame lifecycle, input
+--SKIPIF--
+<?php
+if (!in_array('metal', vio_backends(), true)) die('skip Metal backend not compiled in');
+?>
 --EXTENSIONS--
 vio
 --FILE--
