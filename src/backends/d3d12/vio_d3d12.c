@@ -37,6 +37,47 @@ vio_d3d12_state vio_d3d12 = {0};
 /* Currently bound pipeline (for vertex stride in draw calls) */
 static vio_d3d12_pipeline *d3d12_current_pipeline = NULL;
 
+/* Pull pending validation messages out of the D3D12 InfoQueue and forward them
+ * to PHP's error log. No-op when the debug layer is not active. Called after
+ * any operation that might have triggered validation errors (resource creation
+ * failures, present(), etc.) so the underlying cause shows up next to the
+ * symptomatic failure rather than scrolling past in the Windows event log. */
+static void d3d12_drain_info_queue(const char *context)
+{
+    if (!vio_d3d12.device) return;
+
+    ID3D12InfoQueue *iq = NULL;
+    HRESULT hr = ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12InfoQueue, (void **)&iq);
+    if (FAILED(hr) || !iq) {
+        return; /* debug layer not enabled */
+    }
+
+    UINT64 count = ID3D12InfoQueue_GetNumStoredMessagesAllowedByRetrievalFilter(iq);
+    for (UINT64 i = 0; i < count; i++) {
+        SIZE_T size = 0;
+        ID3D12InfoQueue_GetMessage(iq, i, NULL, &size);
+        if (size == 0) continue;
+        D3D12_MESSAGE *msg = (D3D12_MESSAGE *)malloc(size);
+        if (!msg) continue;
+        if (SUCCEEDED(ID3D12InfoQueue_GetMessage(iq, i, msg, &size))) {
+            const char *sev = "INFO";
+            switch (msg->Severity) {
+                case D3D12_MESSAGE_SEVERITY_CORRUPTION: sev = "CORRUPTION"; break;
+                case D3D12_MESSAGE_SEVERITY_ERROR:      sev = "ERROR";      break;
+                case D3D12_MESSAGE_SEVERITY_WARNING:    sev = "WARNING";    break;
+                case D3D12_MESSAGE_SEVERITY_INFO:       sev = "INFO";       break;
+                case D3D12_MESSAGE_SEVERITY_MESSAGE:    sev = "MESSAGE";    break;
+            }
+            php_error_docref(NULL, E_WARNING, "D3D12[%s] [%s] id=%d: %s",
+                             context ? context : "?", sev, (int)msg->ID,
+                             msg->pDescription ? msg->pDescription : "");
+        }
+        free(msg);
+    }
+    ID3D12InfoQueue_ClearStoredMessages(iq);
+    ID3D12InfoQueue_Release(iq);
+}
+
 /* Forward declarations */
 extern char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size,
                                 int shader_model, char **error_msg);
@@ -141,12 +182,17 @@ static UINT d3d12_alloc_srv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE *out_cpu,
     UINT idx = vio_d3d12.srv_heap.capacity - 1 - vio_d3d12.srv_heap.count;
     vio_d3d12.srv_heap.count++;
 
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu_start;
+    /* CPU handle into the staging (non-shader-visible) heap — this is the one
+     * CreateShaderResourceView writes to and that flush_srv_table reads from.
+     * The GPU handle points at the matching slot in the shader-visible heap
+     * so callers that want to bind without per-frame copying still have a
+     * valid GPU descriptor at the same index. */
+    D3D12_CPU_DESCRIPTOR_HANDLE staging_start;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_start;
-    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &cpu_start);
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &staging_start);
     ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &gpu_start);
 
-    out_cpu->ptr = cpu_start.ptr + (SIZE_T)(idx * vio_d3d12.srv_heap.descriptor_size);
+    out_cpu->ptr = staging_start.ptr + (SIZE_T)(idx * vio_d3d12.srv_heap.descriptor_size);
     out_gpu->ptr = gpu_start.ptr + (UINT64)(idx * vio_d3d12.srv_heap.descriptor_size);
     return idx;
 }
@@ -488,6 +534,16 @@ static int d3d12_init(vio_config *cfg)
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     vio_d3d12.srv_heap.capacity = VIO_D3D12_MAX_SRV_DESCRIPTORS;
     vio_d3d12.srv_heap.count = 0;
+
+    /* CPU-only staging mirror — texture SRVs live here so they can serve as
+     * the source of CopyDescriptorsSimple into the per-frame shader-visible
+     * region. Same capacity as srv_heap so we can use matching indices. */
+    if (d3d12_create_descriptor_heap(&vio_d3d12.srv_staging_heap,
+                                      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                      VIO_D3D12_MAX_SRV_DESCRIPTORS,
+                                      D3D12_DESCRIPTOR_HEAP_FLAG_NONE) != 0) {
+        goto init_fail;
+    }
     /* Per-frame allocator partitions itself dynamically against srv_heap.count
      * each begin_frame, so static SRVs (textures, render targets) can grow
      * arbitrarily without colliding with per-frame descriptor writes. */
@@ -604,6 +660,7 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.rtv_heap)       ID3D12DescriptorHeap_Release(vio_d3d12.rtv_heap);
     if (vio_d3d12.dsv_heap)       ID3D12DescriptorHeap_Release(vio_d3d12.dsv_heap);
     if (vio_d3d12.srv_heap.heap)  ID3D12DescriptorHeap_Release(vio_d3d12.srv_heap.heap);
+    if (vio_d3d12.srv_staging_heap) ID3D12DescriptorHeap_Release(vio_d3d12.srv_staging_heap);
     if (vio_d3d12.swapchain)      IDXGISwapChain3_Release(vio_d3d12.swapchain);
     if (vio_d3d12.cmd_queue)      ID3D12CommandQueue_Release(vio_d3d12.cmd_queue);
     if (vio_d3d12.factory)        IDXGIFactory4_Release(vio_d3d12.factory);
@@ -849,6 +906,7 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
                                                            (void **)&pipeline->pso);
     if (elements) free(elements);
     if (FAILED(hr)) {
+        d3d12_drain_info_queue("create_pso_fail");
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create PSO (0x%08lx)", hr);
         free(pipeline);
         return NULL;
@@ -930,7 +988,10 @@ static void *d3d12_create_buffer(vio_buffer_desc *desc)
                                                        &IID_ID3D12Resource,
                                                        (void **)&buf->resource);
     if (FAILED(hr)) {
-        php_error_docref(NULL, E_WARNING, "D3D12: Failed to create buffer (0x%08lx)", hr);
+        HRESULT removed = ID3D12Device_GetDeviceRemovedReason(vio_d3d12.device);
+        php_error_docref(NULL, E_WARNING, "D3D12: Failed to create buffer (0x%08lx) size=%llu type=%d device_removed_reason=0x%08lx",
+                         hr, (unsigned long long)desc->size, desc->type, removed);
+        d3d12_drain_info_queue("create_buffer");
         free(buf);
         return NULL;
     }
@@ -1270,8 +1331,17 @@ static void d3d12_begin_frame(void)
 {
     vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
 
+    /* Drain any validation messages from the last frame so the warning that
+     * actually killed the GPU (badly-formed command, resource-state mismatch
+     * etc.) shows up next to the symptomatic crash rather than the Windows
+     * event log. Drain on every frame; the InfoQueue normally only fills up
+     * on real errors, so the spam stays bounded in practice. */
+    d3d12_drain_info_queue("begin_frame");
+
     /* Wait for this frame's previous work to complete */
     d3d12_wait_for_frame(vio_d3d12.frame_index);
+
+    vio_d3d12.in_frame = 1;
 
     /* Reset command allocator and command list */
     ID3D12CommandAllocator_Reset(frame->cmd_allocator);
@@ -1387,6 +1457,7 @@ static void d3d12_end_frame(void)
 
     /* Close and execute command list */
     ID3D12GraphicsCommandList_Close(vio_d3d12.cmd_list);
+    vio_d3d12.in_frame = 0;
 
     ID3D12CommandList *cmd_lists[] = { (ID3D12CommandList *)vio_d3d12.cmd_list };
     ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, cmd_lists);
@@ -1463,7 +1534,13 @@ static void d3d12_present(void)
 {
     if (!vio_d3d12.swapchain) return;
 
-    IDXGISwapChain3_Present(vio_d3d12.swapchain, vio_d3d12.vsync ? 1 : 0, 0);
+    HRESULT hr = IDXGISwapChain3_Present(vio_d3d12.swapchain, vio_d3d12.vsync ? 1 : 0, 0);
+    if (FAILED(hr)) {
+        HRESULT removed = ID3D12Device_GetDeviceRemovedReason(vio_d3d12.device);
+        php_error_docref(NULL, E_WARNING, "D3D12: Present failed (0x%08lx) device_removed=0x%08lx",
+                         hr, removed);
+        d3d12_drain_info_queue("present_fail");
+    }
 
     /* Signal fence for current frame */
     vio_d3d12.fence_value++;
@@ -1630,6 +1707,15 @@ void vio_d3d12_flush_srv_table(void)
 
 static void d3d12_set_viewport(int x, int y, int width, int height)
 {
+    /* D3D11 callers issue vio_viewport() before vio_begin() to set the render
+     * target binding state — D3D12 has no equivalent need (RSSetViewports is
+     * a command-list op, not a device state). When called outside a frame we
+     * simply skip; vio_begin → d3d12_begin_frame is followed by a second
+     * viewport call which records onto the now-open command list. */
+    if (!vio_d3d12.in_frame || !vio_d3d12.cmd_list) {
+        return;
+    }
+
     D3D12_VIEWPORT vp = {0};
     vp.TopLeftX = (float)x;
     vp.TopLeftY = (float)y;

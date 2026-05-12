@@ -87,7 +87,13 @@ typedef struct _vio_d3d12_state {
     ID3D12DescriptorHeap      *rtv_heap;
     UINT                       rtv_descriptor_size;
     ID3D12DescriptorHeap      *dsv_heap;
-    vio_d3d12_descriptor_heap  srv_heap;  /* GPU-visible CBV/SRV/UAV */
+    vio_d3d12_descriptor_heap  srv_heap;          /* GPU-visible CBV/SRV/UAV */
+    ID3D12DescriptorHeap      *srv_staging_heap;  /* CPU-only staging mirror for srv_heap. D3D12
+                                                   * forbids CopyDescriptorsSimple from reading a
+                                                   * shader-visible heap (CPU write-only); static
+                                                   * texture SRVs live here so they can be the
+                                                   * source operand when flush_srv_table mirrors
+                                                   * them into the per-frame shader-visible region. */
 
     /* Depth buffer */
     ID3D12Resource            *depth_buffer;
@@ -142,6 +148,12 @@ typedef struct _vio_d3d12_state {
 
     /* State */
     int   initialized;
+    int   in_frame;     /* 1 between begin_frame() and end_frame(); cmd_list is
+                         * only safe to record into while this is set. Higher-
+                         * level code (VioRenderer2D, etc.) issues some calls
+                         * before begin_frame() to satisfy D3D11 semantics —
+                         * those become no-ops for D3D12 instead of recording
+                         * onto a closed command list. */
     float clear_r, clear_g, clear_b, clear_a;
     int   width, height;
     int   vsync;
