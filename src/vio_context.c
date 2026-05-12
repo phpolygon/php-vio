@@ -34,6 +34,9 @@ static void vio_context_free_object(zend_object *obj)
 {
     vio_context_object *ctx = vio_context_from_obj(obj);
 
+    /* Backend / surface / window cleanup runs only when the ctx is still
+     * initialised — vio_destroy may have already run these, in which case
+     * ctx->initialized is 0 and they would double-free. */
     if (ctx->initialized && ctx->backend) {
         if (ctx->surface && ctx->backend->destroy_surface) {
             ctx->backend->destroy_surface(ctx->surface);
@@ -41,8 +44,6 @@ static void vio_context_free_object(zend_object *obj)
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }
-    vio_input_shutdown(&ctx->input);
-        vio_2d_shutdown(&ctx->state_2d);
 #ifdef HAVE_GLFW
         if (ctx->window) {
             vio_window_destroy(ctx->window);
@@ -51,6 +52,14 @@ static void vio_context_free_object(zend_object *obj)
 #endif
         ctx->initialized = 0;
     }
+
+    /* Per-ctx PHP-heap buffers (2D vertex/item arrays, input callbacks)
+     * are allocated unconditionally in vio_create and must be freed on
+     * every destruction path. Previously these were inside the
+     * initialised-only block, so calling vio_destroy() before PHP's GC
+     * fired the free handler would skip them and leak ~1 MiB per ctx. */
+    vio_input_shutdown(&ctx->input);
+    vio_2d_shutdown(&ctx->state_2d);
 
     zend_object_std_dtor(&ctx->std);
 }
