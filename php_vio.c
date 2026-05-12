@@ -2137,6 +2137,30 @@ ZEND_FUNCTION(vio_texture)
         w = (int)zval_get_long(width_zval);
         h = (int)zval_get_long(height_zval);
         channels = 4;
+
+        /* Reject non-positive dimensions outright. Previously these were
+         * silently accepted and the resulting "texture" had garbage on the
+         * GPU (or read past the data buffer for w*h*4 bytes). */
+        if (w <= 0 || h <= 0) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_texture: width/height must be positive (got %dx%d)", w, h);
+            zval_ptr_dtor(&tex_zval);
+            RETURN_FALSE;
+        }
+
+        /* Verify the data buffer is large enough for w*h RGBA bytes.
+         * Without this the backend uploaded uninitialised memory past
+         * the end of the PHP string (visible as garbage texture content
+         * in production, an out-of-bounds read under valgrind/ASAN). */
+        size_t need = (size_t)w * (size_t)h * 4u;
+        if (Z_STRLEN_P(data_zval) < need) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_texture: data is %zu bytes but %dx%d RGBA needs %zu",
+                Z_STRLEN_P(data_zval), w, h, need);
+            zval_ptr_dtor(&tex_zval);
+            RETURN_FALSE;
+        }
+
         pixels = (unsigned char *)Z_STRVAL_P(data_zval);
     } else {
         php_error_docref(NULL, E_WARNING, "vio_texture requires 'file' or 'data'+'width'+'height'");
@@ -5952,46 +5976,53 @@ ZEND_FUNCTION(vio_render_target)
         ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res,
             depth_only ? &dsv_view_desc : NULL, dsv_handle);
 
-        /* For depth-only targets: pre-create SRV for shadow map sampling */
+        /* For depth-only targets: pre-create SRV for shadow map sampling.
+         * SRV must live in the staging (non-shader-visible) heap so it can
+         * serve as the source operand of CopyDescriptorsSimple inside
+         * vio_d3d12_flush_srv_table. The GPU handle still indexes into the
+         * matching slot of the shader-visible heap. */
         if (depth_only && vio_d3d12.srv_heap.count < vio_d3d12.srv_heap.capacity) {
-            UINT srv_idx = vio_d3d12.srv_heap.count++;
-            D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
+            UINT srv_idx = vio_d3d12.srv_heap.capacity - 1 - vio_d3d12.srv_heap.count;
+            vio_d3d12.srv_heap.count++;
+            D3D12_CPU_DESCRIPTOR_HANDLE staging_cpu;
             D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu;
-            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &srv_cpu);
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &staging_cpu);
             ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &srv_gpu);
-            srv_cpu.ptr += srv_idx * vio_d3d12.srv_heap.descriptor_size;
-            srv_gpu.ptr += srv_idx * vio_d3d12.srv_heap.descriptor_size;
+            staging_cpu.ptr += srv_idx * vio_d3d12.srv_heap.descriptor_size;
+            srv_gpu.ptr     += srv_idx * vio_d3d12.srv_heap.descriptor_size;
 
             D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
             srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
             srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv_desc.Texture2D.MipLevels = 1;
-            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, depth_res, &srv_desc, srv_cpu);
+            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, depth_res, &srv_desc, staging_cpu);
 
             rt->d3d12_depth_srv_gpu = srv_gpu.ptr;
-            rt->d3d12_depth_srv_cpu = srv_cpu.ptr;
+            rt->d3d12_depth_srv_cpu = staging_cpu.ptr;
         }
 
-        /* For color targets: pre-create SRV for color texture sampling */
+        /* For color targets: pre-create SRV for color texture sampling.
+         * Same staging-heap pattern as the depth-only branch above. */
         if (!depth_only && rt->d3d12_color_resource && vio_d3d12.srv_heap.count < vio_d3d12.srv_heap.capacity) {
-            UINT color_srv_idx = vio_d3d12.srv_heap.count++;
-            D3D12_CPU_DESCRIPTOR_HANDLE color_srv_cpu;
+            UINT color_srv_idx = vio_d3d12.srv_heap.capacity - 1 - vio_d3d12.srv_heap.count;
+            vio_d3d12.srv_heap.count++;
+            D3D12_CPU_DESCRIPTOR_HANDLE color_staging_cpu;
             D3D12_GPU_DESCRIPTOR_HANDLE color_srv_gpu;
-            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &color_srv_cpu);
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &color_staging_cpu);
             ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &color_srv_gpu);
-            color_srv_cpu.ptr += color_srv_idx * vio_d3d12.srv_heap.descriptor_size;
-            color_srv_gpu.ptr += color_srv_idx * vio_d3d12.srv_heap.descriptor_size;
+            color_staging_cpu.ptr += color_srv_idx * vio_d3d12.srv_heap.descriptor_size;
+            color_srv_gpu.ptr     += color_srv_idx * vio_d3d12.srv_heap.descriptor_size;
 
             D3D12_SHADER_RESOURCE_VIEW_DESC color_srv_desc = {0};
             color_srv_desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
             color_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             color_srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             color_srv_desc.Texture2D.MipLevels = 1;
-            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, (ID3D12Resource *)rt->d3d12_color_resource, &color_srv_desc, color_srv_cpu);
+            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, (ID3D12Resource *)rt->d3d12_color_resource, &color_srv_desc, color_staging_cpu);
 
             rt->d3d12_color_srv_gpu = color_srv_gpu.ptr;
-            rt->d3d12_color_srv_cpu = color_srv_cpu.ptr;
+            rt->d3d12_color_srv_cpu = color_staging_cpu.ptr;
         }
 
         rt->backend_type = VIO_RT_BACKEND_D3D12;
@@ -6271,79 +6302,109 @@ ZEND_FUNCTION(vio_render_target_texture)
     tex->borrowed = 1;  /* GL resource owned by render target, don't double-delete */
 
 #ifdef HAVE_D3D11
-    /* For D3D11: create a backend texture wrapper with the SRV from the render target */
+    /* For D3D11: hand out a cached backend-texture wrapper owned by the
+     * render target. Building a fresh wrapper on every call was the
+     * original implementation but it leaked one vio_d3d11_texture, one
+     * sampler state and one SRV AddRef per frame whenever the offscreen
+     * blit path queried the texture — within a few frames the renderer
+     * starved D3D11's sampler-state pool (cap: 4096) and the third
+     * vio_render_target_texture call started returning garbage SRV
+     * handles, which crashed the next sampler bind. */
     if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
-        ID3D11ShaderResourceView *srv = NULL;
-        if (rt->depth_only) {
-            srv = (ID3D11ShaderResourceView *)rt->d3d11_depth_srv;
-        } else if (rt->d3d11_color_srv) {
-            srv = (ID3D11ShaderResourceView *)rt->d3d11_color_srv;
-        }
-        if (srv) {
-            vio_d3d11_texture *d3d_tex = calloc(1, sizeof(vio_d3d11_texture));
-            d3d_tex->texture = NULL;  /* owned by render target */
-            d3d_tex->srv = srv;
-            ID3D11ShaderResourceView_AddRef(srv);  /* prevent premature release */
-            d3d_tex->width = rt->width;
-            d3d_tex->height = rt->height;
+        vio_d3d11_texture **cache_slot = rt->depth_only
+            ? (vio_d3d11_texture **)&rt->d3d11_depth_backend_texture
+            : (vio_d3d11_texture **)&rt->d3d11_color_backend_texture;
 
-            if (rt->depth_only) {
-                /* Regular sampler for sampler2D + texture() (manual shadow comparison) */
-                D3D11_SAMPLER_DESC sampler_desc = {0};
-                sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-                sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
-                sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
-                sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
-                sampler_desc.MaxAnisotropy = 1;
-                sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
-                sampler_desc.BorderColor[0] = 1.0f;
-                sampler_desc.BorderColor[1] = 1.0f;
-                sampler_desc.BorderColor[2] = 1.0f;
-                sampler_desc.BorderColor[3] = 1.0f;
-                ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &d3d_tex->sampler);
+        if (*cache_slot == NULL) {
+            ID3D11ShaderResourceView *srv = rt->depth_only
+                ? (ID3D11ShaderResourceView *)rt->d3d11_depth_srv
+                : (ID3D11ShaderResourceView *)rt->d3d11_color_srv;
+            if (srv) {
+                vio_d3d11_texture *d3d_tex = calloc(1, sizeof(vio_d3d11_texture));
+                d3d_tex->texture = NULL;  /* owned by render target */
+                d3d_tex->srv = srv;       /* borrowed — RT owns the lifetime */
+                d3d_tex->width = rt->width;
+                d3d_tex->height = rt->height;
 
-                /* Comparison sampler for sampler2DShadow + SampleCmp (hardware PCF) */
-                D3D11_SAMPLER_DESC cmp_desc = sampler_desc;
-                cmp_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
-                cmp_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
-                ID3D11Device_CreateSamplerState(vio_d3d11.device, &cmp_desc, &d3d_tex->sampler_cmp);
-                d3d_tex->is_depth = 1;
-            } else {
-                /* Linear clamp sampler for color texture sampling */
-                D3D11_SAMPLER_DESC sampler_desc = {0};
-                sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-                sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-                sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-                sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-                sampler_desc.MaxAnisotropy = 1;
-                sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
-                ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &d3d_tex->sampler);
+                if (rt->depth_only) {
+                    /* Regular sampler for sampler2D + texture() (manual shadow comparison) */
+                    D3D11_SAMPLER_DESC sampler_desc = {0};
+                    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+                    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
+                    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
+                    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+                    sampler_desc.MaxAnisotropy = 1;
+                    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+                    sampler_desc.BorderColor[0] = 1.0f;
+                    sampler_desc.BorderColor[1] = 1.0f;
+                    sampler_desc.BorderColor[2] = 1.0f;
+                    sampler_desc.BorderColor[3] = 1.0f;
+                    ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &d3d_tex->sampler);
+
+                    /* Comparison sampler for sampler2DShadow + SampleCmp (hardware PCF) */
+                    D3D11_SAMPLER_DESC cmp_desc = sampler_desc;
+                    cmp_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+                    cmp_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+                    ID3D11Device_CreateSamplerState(vio_d3d11.device, &cmp_desc, &d3d_tex->sampler_cmp);
+                    d3d_tex->is_depth = 1;
+                } else {
+                    /* Linear clamp sampler for color texture sampling */
+                    D3D11_SAMPLER_DESC sampler_desc = {0};
+                    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+                    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+                    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+                    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+                    sampler_desc.MaxAnisotropy = 1;
+                    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+                    ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &d3d_tex->sampler);
+                }
+
+                *cache_slot = d3d_tex;
             }
+        }
 
-            tex->backend_texture = d3d_tex;
+        if (*cache_slot != NULL) {
+            tex->backend_texture = *cache_slot;
+            tex->borrowed = 1; /* the cache slot owns the wrapper; don't free in tex dtor */
         }
     }
 #endif
 
 #ifdef HAVE_D3D12
     /* For D3D12: use pre-created SRV from render target (allocated once at RT creation) */
+    /* Same cache-the-wrapper rationale as the D3D11 branch above: building
+     * a fresh vio_d3d12_texture every frame leaks the struct and inflates
+     * the descriptor-table churn. The wrapper has no heap-owned resources
+     * here (the SRV descriptors are owned by the RT), so the cached
+     * wrapper is freed in the RT's free handler alongside its descriptors. */
     if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized) {
-        if (rt->depth_only && rt->d3d12_depth_srv_gpu) {
-            vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
-            d3d_tex->resource = NULL; /* owned by render target, don't release */
-            d3d_tex->width = rt->width;
-            d3d_tex->height = rt->height;
-            d3d_tex->srv_gpu.ptr = rt->d3d12_depth_srv_gpu;
-            d3d_tex->srv_cpu.ptr = rt->d3d12_depth_srv_cpu;
-            tex->backend_texture = d3d_tex;
-        } else if (!rt->depth_only && rt->d3d12_color_srv_gpu) {
-            vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
-            d3d_tex->resource = NULL; /* owned by render target, don't release */
-            d3d_tex->width = rt->width;
-            d3d_tex->height = rt->height;
-            d3d_tex->srv_gpu.ptr = rt->d3d12_color_srv_gpu;
-            d3d_tex->srv_cpu.ptr = rt->d3d12_color_srv_cpu;
-            tex->backend_texture = d3d_tex;
+        vio_d3d12_texture **cache_slot = rt->depth_only
+            ? (vio_d3d12_texture **)&rt->d3d12_depth_backend_texture
+            : (vio_d3d12_texture **)&rt->d3d12_color_backend_texture;
+
+        if (*cache_slot == NULL) {
+            if (rt->depth_only && rt->d3d12_depth_srv_gpu) {
+                vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
+                d3d_tex->resource = NULL;
+                d3d_tex->width = rt->width;
+                d3d_tex->height = rt->height;
+                d3d_tex->srv_gpu.ptr = rt->d3d12_depth_srv_gpu;
+                d3d_tex->srv_cpu.ptr = rt->d3d12_depth_srv_cpu;
+                *cache_slot = d3d_tex;
+            } else if (!rt->depth_only && rt->d3d12_color_srv_gpu) {
+                vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
+                d3d_tex->resource = NULL;
+                d3d_tex->width = rt->width;
+                d3d_tex->height = rt->height;
+                d3d_tex->srv_gpu.ptr = rt->d3d12_color_srv_gpu;
+                d3d_tex->srv_cpu.ptr = rt->d3d12_color_srv_cpu;
+                *cache_slot = d3d_tex;
+            }
+        }
+
+        if (*cache_slot != NULL) {
+            tex->backend_texture = *cache_slot;
+            tex->borrowed = 1;
         }
     }
 #endif

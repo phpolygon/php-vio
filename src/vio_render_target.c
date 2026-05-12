@@ -15,6 +15,7 @@
 #ifdef HAVE_D3D11
 #define COBJMACROS
 #include <d3d11.h>
+#include "backends/d3d11/vio_d3d11.h"
 #endif
 
 #ifdef HAVE_D3D12
@@ -22,6 +23,7 @@
 #define COBJMACROS
 #endif
 #include <d3d12.h>
+#include "backends/d3d12/vio_d3d12.h"
 #endif
 
 zend_class_entry *vio_render_target_ce = NULL;
@@ -40,10 +42,14 @@ static zend_object *vio_render_target_create_object(zend_class_entry *ce)
     rt->d3d11_depth_tex = NULL;
     rt->d3d11_depth_srv = NULL;
     rt->d3d11_color_srv = NULL;
+    rt->d3d11_color_backend_texture = NULL;
+    rt->d3d11_depth_backend_texture = NULL;
     rt->d3d12_color_resource = NULL;
     rt->d3d12_depth_resource = NULL;
     rt->d3d12_rtv_heap       = NULL;
     rt->d3d12_dsv_heap       = NULL;
+    rt->d3d12_color_backend_texture = NULL;
+    rt->d3d12_depth_backend_texture = NULL;
     rt->width         = 0;
     rt->height        = 0;
     rt->depth_only    = 0;
@@ -80,6 +86,22 @@ static void vio_render_target_free_object(zend_object *obj)
 
 #ifdef HAVE_D3D11
     if (rt->backend_type == VIO_RT_BACKEND_D3D11) {
+        /* Drop cached backend-texture wrappers first. They borrow the RT's
+         * SRV (no extra AddRef), so we only release the samplers + the
+         * vio_d3d11_texture struct itself. The actual SRV release happens
+         * a few lines below as part of the regular RT teardown. */
+        for (int i = 0; i < 2; i++) {
+            vio_d3d11_texture **slot = i == 0
+                ? (vio_d3d11_texture **)&rt->d3d11_color_backend_texture
+                : (vio_d3d11_texture **)&rt->d3d11_depth_backend_texture;
+            vio_d3d11_texture *bt = *slot;
+            if (bt) {
+                if (bt->sampler)     ID3D11SamplerState_Release(bt->sampler);
+                if (bt->sampler_cmp) ID3D11SamplerState_Release(bt->sampler_cmp);
+                free(bt);
+                *slot = NULL;
+            }
+        }
         if (rt->d3d11_depth_srv) {
             ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)rt->d3d11_depth_srv);
             rt->d3d11_depth_srv = NULL;
@@ -109,6 +131,14 @@ static void vio_render_target_free_object(zend_object *obj)
 
 #ifdef HAVE_D3D12
     if (rt->backend_type == VIO_RT_BACKEND_D3D12) {
+        /* Cached backend-texture wrappers — descriptors are borrowed from
+         * the RT's heap, so we just free the wrapper struct itself. */
+        for (int i = 0; i < 2; i++) {
+            vio_d3d12_texture **slot = i == 0
+                ? (vio_d3d12_texture **)&rt->d3d12_color_backend_texture
+                : (vio_d3d12_texture **)&rt->d3d12_depth_backend_texture;
+            if (*slot) { free(*slot); *slot = NULL; }
+        }
         if (rt->d3d12_color_resource) {
             ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
             rt->d3d12_color_resource = NULL;

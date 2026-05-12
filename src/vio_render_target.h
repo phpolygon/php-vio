@@ -24,6 +24,15 @@ typedef struct _vio_render_target_object {
     void        *d3d11_depth_tex;     /* ID3D11Texture2D* */
     void        *d3d11_depth_srv;     /* ID3D11ShaderResourceView* (for shadow sampling) */
     void        *d3d11_color_srv;    /* ID3D11ShaderResourceView* for color attachment */
+    /* Cached vio_d3d11_texture wrapper used by vio_render_target_texture().
+     * Built lazily on the first call and reused on every subsequent one so
+     * each frame's offscreen-blit doesn't leak a vio_d3d11_texture struct
+     * plus a fresh AddRef on the SRV plus a fresh CreateSamplerState (D3D11
+     * caps the sampler pool at 4096, and AddRef without a matching Release
+     * accumulates indefinitely). Cleared with the rest of the RT's D3D11
+     * resources in the free handler. */
+    void        *d3d11_color_backend_texture; /* vio_d3d11_texture* */
+    void        *d3d11_depth_backend_texture; /* vio_d3d11_texture* */
 
     /* D3D12 (opaque pointers — actual types are ID3D12Resource* etc.) */
     void        *d3d12_color_resource;  /* ID3D12Resource* */
@@ -44,6 +53,9 @@ typedef struct _vio_render_target_object {
     uint64_t     d3d12_depth_srv_cpu; /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
     uint64_t     d3d12_color_srv_gpu; /* D3D12_GPU_DESCRIPTOR_HANDLE.ptr */
     uint64_t     d3d12_color_srv_cpu; /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
+    /* Cached vio_d3d12_texture wrapper, same lifecycle as the D3D11 pair. */
+    void        *d3d12_color_backend_texture; /* vio_d3d12_texture* */
+    void        *d3d12_depth_backend_texture; /* vio_d3d12_texture* */
     zend_object  std;
 } vio_render_target_object;
 
