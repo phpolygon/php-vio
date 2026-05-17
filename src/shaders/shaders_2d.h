@@ -1,6 +1,6 @@
 /*
  * php-vio - 2D embedded shaders
- * OpenGL 4.1 Core Profile GLSL 410
+ * OpenGL 3.3 Core Profile GLSL 330 (works on every supported context)
  */
 
 #ifndef VIO_SHADERS_2D_H
@@ -8,7 +8,7 @@
 
 /* Shape shader: position + color, with orthographic projection uniform */
 static const char *vio_2d_vertex_shader =
-    "#version 410 core\n"
+    "#version 330 core\n"
     "layout(location = 0) in vec2 aPosition;\n"
     "layout(location = 1) in vec2 aTexCoord;\n"
     "layout(location = 2) in vec4 aColor;\n"
@@ -23,7 +23,7 @@ static const char *vio_2d_vertex_shader =
 
 /* Shape fragment shader: just outputs vertex color */
 static const char *vio_2d_fragment_shader_shapes =
-    "#version 410 core\n"
+    "#version 330 core\n"
     "in vec2 vTexCoord;\n"
     "in vec4 vColor;\n"
     "out vec4 FragColor;\n"
@@ -33,7 +33,7 @@ static const char *vio_2d_fragment_shader_shapes =
 
 /* Sprite/text fragment shader: samples texture * vertex color */
 static const char *vio_2d_fragment_shader_sprites =
-    "#version 410 core\n"
+    "#version 330 core\n"
     "in vec2 vTexCoord;\n"
     "in vec4 vColor;\n"
     "out vec4 FragColor;\n"

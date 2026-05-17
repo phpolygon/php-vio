@@ -1574,10 +1574,12 @@ ZEND_FUNCTION(vio_shader)
                 RETURN_FALSE;
             }
         } else {
-            /* Transpile SPIR-V to GLSL 410 */
+            /* Transpile SPIR-V to GLSL matching the runtime context version
+             * (e.g. 330 on HD 3000, 410 on macOS, 460 on modern Linux). */
+            int glsl_version = vio_opengl_get_glsl_version();
             char *error_msg = NULL;
 
-            char *vert_glsl = vio_spirv_to_glsl(shader->vert_spirv, shader->vert_spirv_size, 410, &error_msg);
+            char *vert_glsl = vio_spirv_to_glsl(shader->vert_spirv, shader->vert_spirv_size, glsl_version, &error_msg);
             if (!vert_glsl) {
                 php_error_docref(NULL, E_WARNING, "Vertex SPIR-V to GLSL transpilation failed: %s",
                     error_msg ? error_msg : "unknown error");
@@ -1586,7 +1588,7 @@ ZEND_FUNCTION(vio_shader)
                 RETURN_FALSE;
             }
 
-            char *frag_glsl = vio_spirv_to_glsl(shader->frag_spirv, shader->frag_spirv_size, 410, &error_msg);
+            char *frag_glsl = vio_spirv_to_glsl(shader->frag_spirv, shader->frag_spirv_size, glsl_version, &error_msg);
             if (!frag_glsl) {
                 php_error_docref(NULL, E_WARNING, "Fragment SPIR-V to GLSL transpilation failed: %s",
                     error_msg ? error_msg : "unknown error");

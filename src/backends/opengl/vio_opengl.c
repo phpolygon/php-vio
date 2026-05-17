@@ -1,5 +1,10 @@
 /*
- * php-vio - OpenGL 4.1 Core Backend implementation
+ * php-vio - OpenGL Core Backend implementation
+ *
+ * Floor target: GL 3.3 Core / GLSL 330. The window system tries a context
+ * ladder (see vio_window.c) and we use whatever it negotiated — the runtime
+ * GLSL version is what we ask SPIRV-Cross to emit, so on a 4.1 context we
+ * still get 410, on 3.3 we get 330, and the shader sources work either way.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -285,11 +290,27 @@ void vio_backend_opengl_register(void)
 
 /* ── OpenGL context setup (called after window creation) ──────────── */
 
+int vio_opengl_get_glsl_version(void)
+{
+    return vio_gl.glsl_version > 0 ? vio_gl.glsl_version : 330;
+}
+
 int vio_opengl_setup_context(void)
 {
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         php_error_docref(NULL, E_WARNING, "Failed to initialize GLAD");
         return -1;
+    }
+
+    /* Detect what we actually got. The window system negotiates the highest
+     * available core context (4.6 → 3.3 ladder), so the numbers reflect the
+     * GPU+driver cap, not what we asked for. */
+    glGetIntegerv(GL_MAJOR_VERSION, &vio_gl.gl_major);
+    glGetIntegerv(GL_MINOR_VERSION, &vio_gl.gl_minor);
+    vio_gl.glsl_version = vio_gl.gl_major * 100 + vio_gl.gl_minor * 10;
+    if (vio_gl.glsl_version < 330) {
+        /* Shouldn't happen — the ladder floor is 3.3 — but stay safe. */
+        vio_gl.glsl_version = 330;
     }
 
     glEnable(GL_DEPTH_TEST);

@@ -90,9 +90,17 @@ if test "$PHP_VIO" != "no"; then
     for dir in $GLSLANG_SEARCH_DIRS; do
       if test -f "$dir/include/glslang/Include/glslang_c_interface.h"; then
         PHP_ADD_INCLUDE($dir/include)
-        PHP_ADD_LIBRARY_WITH_PATH(glslang, $dir/lib, VIO_SHARED_LIBADD)
-        PHP_ADD_LIBRARY_WITH_PATH(glslang-default-resource-limits, $dir/lib, VIO_SHARED_LIBADD)
+        dnl LIFO: last call ends up first on the link line. glslang depends
+        dnl on libSPIRV (codegen) which on Linux statically references libSPIRV-Tools
+        dnl (spvContextCreate etc). macOS' ld64 finds those by rescanning; GNU ld
+        dnl needs them explicit. SPIRV-Tools is a pure provider, so it goes last.
+        if test -f "$dir/lib/libSPIRV-Tools.a" -o -f "$dir/lib/x86_64-linux-gnu/libSPIRV-Tools.a"; then
+          PHP_ADD_LIBRARY_WITH_PATH(SPIRV-Tools-opt, $dir/lib, VIO_SHARED_LIBADD)
+          PHP_ADD_LIBRARY_WITH_PATH(SPIRV-Tools, $dir/lib, VIO_SHARED_LIBADD)
+        fi
         PHP_ADD_LIBRARY_WITH_PATH(SPIRV, $dir/lib, VIO_SHARED_LIBADD)
+        PHP_ADD_LIBRARY_WITH_PATH(glslang-default-resource-limits, $dir/lib, VIO_SHARED_LIBADD)
+        PHP_ADD_LIBRARY_WITH_PATH(glslang, $dir/lib, VIO_SHARED_LIBADD)
         AC_DEFINE(HAVE_GLSLANG, 1, [Whether glslang is available])
         AC_MSG_RESULT([glslang found at $dir])
         break
@@ -109,14 +117,20 @@ if test "$PHP_VIO" != "no"; then
     for dir in $SPVC_SEARCH_DIRS; do
       if test -f "$dir/include/spirv_cross/spirv_cross_c.h"; then
         PHP_ADD_INCLUDE($dir/include)
-        dnl Link static libraries for spirv-cross
-        PHP_ADD_LIBRARY_WITH_PATH(spirv-cross-c, $dir/lib, VIO_SHARED_LIBADD)
+        dnl Link static libraries for spirv-cross.
+        dnl PHP_ADD_LIBRARY_WITH_PATH prepends, so the LAST call ends up as
+        dnl the FIRST -l flag on the linker line. For GNU ld this matters:
+        dnl libspirv-cross-c.a references symbols defined in -reflect / -glsl
+        dnl / -msl / -hlsl, so it has to come first. The core/cpp libs are
+        dnl pure providers and go last. macOS ld64 scans libraries multiple
+        dnl times and would link with any order, but GNU ld would not.
+        PHP_ADD_LIBRARY_WITH_PATH(spirv-cross-cpp, $dir/lib, VIO_SHARED_LIBADD)
+        PHP_ADD_LIBRARY_WITH_PATH(spirv-cross-core, $dir/lib, VIO_SHARED_LIBADD)
         PHP_ADD_LIBRARY_WITH_PATH(spirv-cross-glsl, $dir/lib, VIO_SHARED_LIBADD)
         PHP_ADD_LIBRARY_WITH_PATH(spirv-cross-msl, $dir/lib, VIO_SHARED_LIBADD)
         PHP_ADD_LIBRARY_WITH_PATH(spirv-cross-hlsl, $dir/lib, VIO_SHARED_LIBADD)
         PHP_ADD_LIBRARY_WITH_PATH(spirv-cross-reflect, $dir/lib, VIO_SHARED_LIBADD)
-        PHP_ADD_LIBRARY_WITH_PATH(spirv-cross-core, $dir/lib, VIO_SHARED_LIBADD)
-        PHP_ADD_LIBRARY_WITH_PATH(spirv-cross-cpp, $dir/lib, VIO_SHARED_LIBADD)
+        PHP_ADD_LIBRARY_WITH_PATH(spirv-cross-c, $dir/lib, VIO_SHARED_LIBADD)
         AC_DEFINE(HAVE_SPIRV_CROSS, 1, [Whether SPIRV-Cross is available])
         AC_MSG_RESULT([SPIRV-Cross found at $dir])
         break
@@ -299,6 +313,37 @@ if test "$PHP_VIO" != "no"; then
   dnl ── C++ linker (needed for glslang/spirv-cross/VMA static libs) ─
   PHP_REQUIRE_CXX()
   PHP_ADD_LIBRARY(stdc++, 1, VIO_SHARED_LIBADD)
+
+  dnl ── Static-lib cross-reference workaround (Linux) ──────────────
+  dnl SPIRV-Tools contains C++ "vague linkage" vtables (e.g. Timer)
+  dnl that GNU ld only pulls in when explicitly referenced. With -l
+  dnl flags the linker decides those .o's are "unused" and drops them,
+  dnl leaving the vtables undefined for any consumer that does pull
+  dnl them via the C++ ABI later (SPIRV-Tools-opt). The clean fix
+  dnl would be -Wl,--whole-archive, but libtool strips that flag.
+  dnl Workaround: pass the .a files as absolute paths — libtool passes
+  dnl them through as object files, which forces all .o's in the
+  dnl archive into the link. Apple ld64 doesn't have this problem
+  dnl (vague linkage symbols are kept by default), so it's Linux-only.
+  case $host_os in
+    linux*)
+      if test "$PHP_GLSLANG" != "no"; then
+        for dir in $GLSLANG_SEARCH_DIRS; do
+          if test -f "$dir/include/glslang/Include/glslang_c_interface.h"; then
+            for lib_dir in $dir/lib $dir/lib/x86_64-linux-gnu $dir/lib64; do
+              if test -f "$lib_dir/libSPIRV-Tools.a"; then
+                VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD $lib_dir/libSPIRV-Tools.a"
+                test -f "$lib_dir/libSPIRV-Tools-opt.a" && \
+                  VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD $lib_dir/libSPIRV-Tools-opt.a"
+                break
+              fi
+            done
+            break
+          fi
+        done
+      fi
+      ;;
+  esac
 
   dnl ── VMA C++ wrapper object (compiled via Makefile.frag rule) ──
   PHP_ADD_MAKEFILE_FRAGMENT

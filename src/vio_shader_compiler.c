@@ -56,7 +56,7 @@ uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
     input.target_language                   = GLSLANG_TARGET_SPV;
     input.target_language_version           = GLSLANG_TARGET_SPV_1_0;
     input.code                              = source;
-    input.default_version                   = 410;
+    input.default_version                   = 330;
     input.default_profile                   = GLSLANG_CORE_PROFILE;
     input.force_default_version_and_profile = 0;
     input.forward_compatible                = 0;

@@ -145,17 +145,10 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
         glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
     }
 
-    if (backend_name && strcmp(backend_name, "opengl") == 0) {
-        /* OpenGL 4.1 Core Profile */
-        glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
-        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-#ifdef __APPLE__
-        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
-#endif
-    } else {
-        /* Vulkan/other - no GL context */
+    int is_opengl = (backend_name && strcmp(backend_name, "opengl") == 0);
+
+    if (!is_opengl) {
+        /* Vulkan/Metal/D3D — no GL context */
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     }
 
@@ -171,10 +164,67 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
     int height = cfg->height > 0 ? cfg->height : 600;
     const char *title = cfg->title ? cfg->title : "php-vio";
 
-    GLFWwindow *window = glfwCreateWindow(width, height, title, NULL, NULL);
-    if (!window) {
-        php_error_docref(NULL, E_WARNING, "Failed to create GLFW window");
-        return NULL;
+    GLFWwindow *window = NULL;
+
+    if (is_opengl) {
+        /* OpenGL context ladder: try newest → oldest core profile until one
+         * succeeds. Floor is GL 3.3 (Sandy Bridge / HD 3000 / Mesa cap).
+         * Apple caps at 4.1 so we skip the higher rungs there. */
+        static const int gl_ladder_desktop[][2] = {
+            {4, 6}, {4, 5}, {4, 3}, {4, 1}, {3, 3}
+        };
+#ifdef __APPLE__
+        static const int gl_ladder_apple[][2] = { {4, 1}, {3, 3} };
+        const int (*ladder)[2] = gl_ladder_apple;
+        size_t ladder_n = sizeof(gl_ladder_apple) / sizeof(gl_ladder_apple[0]);
+#else
+        const int (*ladder)[2] = gl_ladder_desktop;
+        size_t ladder_n = sizeof(gl_ladder_desktop) / sizeof(gl_ladder_desktop[0]);
+#endif
+        /* Silence the GLFW error callback during the probe — every ladder
+         * step except the successful one produces an "EGL: failed to create
+         * context" warning that the user shouldn't see, since the fallback
+         * is expected. We restore the callback after the loop. */
+        GLFWerrorfun prev_cb = glfwSetErrorCallback(NULL);
+
+        for (size_t i = 0; i < ladder_n && !window; i++) {
+            /* Hints reset between attempts so a previous CONTEXT_VERSION
+             * doesn't leak into the next try. Hints set before this branch
+             * (RESIZABLE, SCALE_TO_MONITOR, VISIBLE, SAMPLES) need to be
+             * re-applied. */
+            glfwDefaultWindowHints();
+            glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+            if (!cfg->headless) {
+                glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+            }
+            if (cfg->samples > 0) {
+                glfwWindowHint(GLFW_SAMPLES, cfg->samples);
+            }
+            glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+
+            glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, ladder[i][0]);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, ladder[i][1]);
+            glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+#endif
+            window = glfwCreateWindow(width, height, title, NULL, NULL);
+        }
+
+        glfwSetErrorCallback(prev_cb);
+
+        if (!window) {
+            php_error_docref(NULL, E_WARNING,
+                "Failed to create GLFW window: no OpenGL context >= 3.3 Core available");
+            return NULL;
+        }
+    } else {
+        window = glfwCreateWindow(width, height, title, NULL, NULL);
+        if (!window) {
+            php_error_docref(NULL, E_WARNING, "Failed to create GLFW window");
+            return NULL;
+        }
     }
 
 #ifdef _WIN32

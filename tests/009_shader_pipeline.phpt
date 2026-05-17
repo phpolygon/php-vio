@@ -7,8 +7,8 @@ vio
 $ctx = vio_create('null');
 
 // Create shader (SPIR-V compatible GLSL with explicit locations)
-$vert = "#version 410 core\nlayout(location=0) in vec3 aPos;\nvoid main() { gl_Position = vec4(aPos, 1.0); }";
-$frag = "#version 410 core\nlayout(location=0) out vec4 FragColor;\nvoid main() { FragColor = vec4(1.0); }";
+$vert = "#version 330 core\nlayout(location=0) in vec3 aPos;\nvoid main() { gl_Position = vec4(aPos, 1.0); }";
+$frag = "#version 330 core\nlayout(location=0) out vec4 FragColor;\nvoid main() { FragColor = vec4(1.0); }";
 $shader = vio_shader($ctx, [
     'vertex'   => $vert,
     'fragment' => $frag,
