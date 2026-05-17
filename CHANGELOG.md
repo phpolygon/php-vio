@@ -1,3 +1,10 @@
+# [1.12.0](https://github.com/phpolygon/php-vio/compare/v1.11.0...v1.12.0) (2026-05-17)
+
+
+### Features
+
+* **opengl:** runtime context-version detection with 4.6→3.3 ladder ([2accb4f](https://github.com/phpolygon/php-vio/commit/2accb4fbf8271463311b47e33b472f7a33df2b16)), closes [#version](https://github.com/phpolygon/php-vio/issues/version) [#version](https://github.com/phpolygon/php-vio/issues/version)
+
 # [1.11.0](https://github.com/phpolygon/php-vio/compare/v1.10.9...v1.11.0) (2026-05-12)
 
 
