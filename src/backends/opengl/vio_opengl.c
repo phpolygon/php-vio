@@ -28,6 +28,7 @@
 #include "../../vio_font.h"
 #include "../../vio_pipeline.h"
 #include "../../vio_texture.h"
+#include "../../vio_buffer.h"
 
 vio_opengl_state vio_gl = {0};
 
@@ -427,6 +428,42 @@ static void opengl_set_uniform(const char *name, const void *data, int count, in
     }
 }
 
+static int opengl_create_uniform_buffer(void *buf_obj, int size, const void *initial_data, int binding)
+{
+    vio_buffer_object *buf = (vio_buffer_object *)buf_obj;
+    if (!vio_gl.initialized) return -1;
+
+    glGenBuffers(1, &buf->buffer_id);
+    glBindBuffer(GL_UNIFORM_BUFFER, buf->buffer_id);
+    glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)size, initial_data, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_UNIFORM_BUFFER, (GLuint)binding, buf->buffer_id);
+    glBindBuffer(GL_UNIFORM_BUFFER, 0);
+    return 0;
+}
+
+static void opengl_update_uniform_buffer(void *buf_obj, const void *data, int size, int offset)
+{
+    vio_buffer_object *buf = (vio_buffer_object *)buf_obj;
+    if (!buf || !buf->buffer_id) return;
+    glBindBuffer(GL_UNIFORM_BUFFER, buf->buffer_id);
+    glBufferSubData(GL_UNIFORM_BUFFER, (GLintptr)offset, (GLsizeiptr)size, data);
+    glBindBuffer(GL_UNIFORM_BUFFER, 0);
+}
+
+static void opengl_bind_uniform_buffer(void *buf_obj, int binding)
+{
+    vio_buffer_object *buf = (vio_buffer_object *)buf_obj;
+    if (!buf || !buf->buffer_id || !vio_gl.initialized) return;
+    glBindBufferBase(GL_UNIFORM_BUFFER, (GLuint)binding, buf->buffer_id);
+}
+
+static void opengl_bind_texture_id(unsigned int texture_id, int slot)
+{
+    if (!vio_gl.initialized) return;
+    glActiveTexture(GL_TEXTURE0 + (GLenum)slot);
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+}
+
 static void opengl_draw_mesh(void *mesh_obj)
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
@@ -784,6 +821,10 @@ static const vio_backend opengl_backend = {
     .upload_texture_2d     = opengl_upload_texture_2d,
     .draw_mesh             = opengl_draw_mesh,
     .draw_mesh_instanced   = opengl_draw_mesh_instanced,
+    .create_uniform_buffer = opengl_create_uniform_buffer,
+    .update_uniform_buffer = opengl_update_uniform_buffer,
+    .bind_uniform_buffer   = opengl_bind_uniform_buffer,
+    .bind_texture_id       = opengl_bind_texture_id,
 };
 
 void vio_backend_opengl_register(void)

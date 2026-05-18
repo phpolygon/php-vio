@@ -2124,12 +2124,9 @@ ZEND_FUNCTION(vio_bind_texture)
         return;
     }
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        glActiveTexture(GL_TEXTURE0 + (GLenum)slot);
-        glBindTexture(GL_TEXTURE_2D, tex->texture_id);
+    if (ctx->backend->bind_texture_id) {
+        ctx->backend->bind_texture_id(tex->texture_id, (int)slot);
     }
-#endif
 
     /* Backend texture binding (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0 &&
@@ -2217,25 +2214,16 @@ ZEND_FUNCTION(vio_uniform_buffer)
         init_data = Z_STRVAL_P(data_zval);
     }
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        glGenBuffers(1, &buf->buffer_id);
-        glBindBuffer(GL_UNIFORM_BUFFER, buf->buffer_id);
-        glBufferData(GL_UNIFORM_BUFFER, size, init_data, GL_DYNAMIC_DRAW);
-        glBindBufferBase(GL_UNIFORM_BUFFER, binding, buf->buffer_id);
-        glBindBuffer(GL_UNIFORM_BUFFER, 0);
-    }
-#endif
-
-    /* Backend uniform buffer creation */
-    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->create_buffer) {
+    buf->backend = ctx->backend;
+    if (ctx->backend->create_uniform_buffer) {
+        ctx->backend->create_uniform_buffer(buf, (int)size, init_data, binding);
+    } else if (ctx->backend->create_buffer) {
         vio_buffer_desc desc = {0};
         desc.type = VIO_BUFFER_UNIFORM;
         desc.data = init_data;
         desc.size = size;
         desc.binding = binding;
         buf->backend_buffer = ctx->backend->create_buffer(&desc);
-        buf->backend = ctx->backend;
     }
 
     buf->valid = 1;
@@ -2267,15 +2255,14 @@ ZEND_FUNCTION(vio_update_buffer)
         return;
     }
 
-#ifdef HAVE_GLFW
-    if (buf->buffer_id) {
-        glBindBuffer(GL_UNIFORM_BUFFER, buf->buffer_id);
-        glBufferSubData(GL_UNIFORM_BUFFER, offset, data_len, data);
-        glBindBuffer(GL_UNIFORM_BUFFER, 0);
+    /* OpenGL stores its handle in buf->buffer_id and goes through
+     * update_uniform_buffer; D3D / Vulkan use the backend handle path. */
+    if (buf->backend) {
+        const vio_backend *be = (const vio_backend *)buf->backend;
+        if (be->update_uniform_buffer && buf->buffer_id) {
+            be->update_uniform_buffer(buf, data, (int)data_len, (int)offset);
+        }
     }
-#endif
-
-    /* Backend buffer update */
     if (buf->backend_buffer && buf->backend) {
         const vio_backend *be = (const vio_backend *)buf->backend;
         if (be->update_buffer) {
@@ -2312,11 +2299,9 @@ ZEND_FUNCTION(vio_bind_buffer)
 
     int bind_point = (binding >= 0) ? (int)binding : buf->binding;
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        glBindBufferBase(GL_UNIFORM_BUFFER, bind_point, buf->buffer_id);
+    if (ctx->backend->bind_uniform_buffer && buf->buffer_id) {
+        ctx->backend->bind_uniform_buffer(buf, bind_point);
     }
-#endif
 
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized && buf->backend_buffer) {

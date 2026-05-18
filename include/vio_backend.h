@@ -130,6 +130,19 @@ typedef struct _vio_backend {
     void  (*draw_mesh_instanced)(void *mesh_obj,
                                  const float *matrices_4x4, int instance_count);
 
+    /* OpenGL-side uniform-buffer lifecycle. Writes / reads buf_obj->buffer_id
+     * directly. D3D11 / D3D12 / Vulkan keep using create_buffer(desc) ->
+     * backend_buffer and update_buffer(backend_buffer, ...). NULL on non-GL
+     * backends. */
+    int   (*create_uniform_buffer)(void *buf_obj, int size, const void *initial_data, int binding);
+    void  (*update_uniform_buffer)(void *buf_obj, const void *data, int size, int offset);
+    void  (*bind_uniform_buffer)(void *buf_obj, int binding);
+
+    /* OpenGL-side texture bind by raw GL handle. D3D / Vulkan / Metal use the
+     * existing bind_texture(opaque_handle, slot) slot with a backend wrapper
+     * instead. */
+    void  (*bind_texture_id)(unsigned int texture_id, int slot);
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);
