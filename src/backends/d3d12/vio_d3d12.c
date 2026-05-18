@@ -1193,6 +1193,62 @@ static void d3d12_destroy_texture(void *texture_ptr)
     free(tex);
 }
 
+/* Object destructors invoked from Zend free_object handlers; mirror the
+ * destroy_mesh / destroy_cubemap slots in the vtable. */
+
+#include "../../vio_cubemap.h"
+#include "../../vio_font.h"
+#include "../../vio_render_target.h"
+
+static void d3d12_destroy_cubemap(void *cm_ptr)
+{
+    vio_cubemap_object *cm = (vio_cubemap_object *)cm_ptr;
+    if (cm->d3d12_resource) {
+        ID3D12Resource_Release((ID3D12Resource *)cm->d3d12_resource);
+        cm->d3d12_resource = NULL;
+    }
+}
+
+static void d3d12_destroy_font_atlas(void *font_ptr)
+{
+    vio_font_object *font = (vio_font_object *)font_ptr;
+    if (font->atlas_backend_texture) {
+        d3d12_destroy_texture(font->atlas_backend_texture);
+        font->atlas_backend_texture = NULL;
+    }
+}
+
+static void d3d12_destroy_render_target(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (rt->backend_type != VIO_RT_BACKEND_D3D12) return;
+
+    /* Cached backend-texture wrappers — descriptors are borrowed from the
+     * RT's heap, so we just free the wrapper struct itself. */
+    for (int i = 0; i < 2; i++) {
+        vio_d3d12_texture **slot = i == 0
+            ? (vio_d3d12_texture **)&rt->d3d12_color_backend_texture
+            : (vio_d3d12_texture **)&rt->d3d12_depth_backend_texture;
+        if (*slot) { free(*slot); *slot = NULL; }
+    }
+    if (rt->d3d12_color_resource) {
+        ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
+        rt->d3d12_color_resource = NULL;
+    }
+    if (rt->d3d12_depth_resource) {
+        ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_depth_resource);
+        rt->d3d12_depth_resource = NULL;
+    }
+    if (rt->d3d12_rtv_heap) {
+        ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap);
+        rt->d3d12_rtv_heap = NULL;
+    }
+    if (rt->d3d12_dsv_heap) {
+        ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_dsv_heap);
+        rt->d3d12_dsv_heap = NULL;
+    }
+}
+
 /* ── Shaders ──────────────────────────────────────────────────────── */
 
 static void *d3d12_compile_shader(vio_shader_desc *desc)
@@ -1777,6 +1833,9 @@ static const vio_backend d3d12_backend = {
     .gpu_flush         = vio_d3d12_wait_for_gpu,
     .dispatch_compute  = d3d12_dispatch_compute,
     .supports_feature  = d3d12_supports_feature,
+    .destroy_cubemap   = d3d12_destroy_cubemap,
+    .destroy_font_atlas = d3d12_destroy_font_atlas,
+    .destroy_render_target = d3d12_destroy_render_target,
 };
 
 void vio_backend_d3d12_register(void)

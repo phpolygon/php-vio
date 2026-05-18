@@ -1250,6 +1250,7 @@ ZEND_FUNCTION(vio_mesh)
     mesh->index_count  = index_count;
     mesh->has_colors   = has_colors;
     mesh->stride       = floats_per_vertex * sizeof(float);
+    mesh->backend      = ctx->backend;
 
 #ifdef HAVE_GLFW
     /* Create OpenGL objects (only if OpenGL backend is active) */
@@ -3084,6 +3085,7 @@ ZEND_FUNCTION(vio_font)
     vio_font_object *font = Z_VIO_FONT_P(&font_zval);
 
     font->font_size = (float)size;
+    font->backend   = ctx->backend;
     font->ttf_len = ZSTR_LEN(contents);
     font->ttf_data = emalloc(font->ttf_len);
     memcpy(font->ttf_data, ZSTR_VAL(contents), font->ttf_len);
@@ -5693,6 +5695,7 @@ ZEND_FUNCTION(vio_render_target)
     rt->width      = width;
     rt->height     = height;
     rt->depth_only = depth_only;
+    rt->backend    = ctx->backend;
 
 #ifdef HAVE_GLFW
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
@@ -6438,6 +6441,7 @@ ZEND_FUNCTION(vio_cubemap)
     zval cm_zval;
     object_init_ex(&cm_zval, vio_cubemap_ce);
     vio_cubemap_object *cm = Z_VIO_CUBEMAP_P(&cm_zval);
+    cm->backend = ctx->backend;
 
 #ifdef HAVE_GLFW
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {

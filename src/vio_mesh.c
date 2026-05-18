@@ -7,10 +7,7 @@
 #endif
 
 #include "vio_mesh.h"
-
-#ifdef HAVE_GLFW
-#include <glad/glad.h>
-#endif
+#include "../include/vio_backend.h"
 
 zend_class_entry *vio_mesh_ce = NULL;
 static zend_object_handlers vio_mesh_handlers;
@@ -28,6 +25,7 @@ static zend_object *vio_mesh_create_object(zend_class_entry *ce)
     mesh->index_count  = 0;
     mesh->has_colors   = 0;
     mesh->stride       = 0;
+    mesh->backend      = NULL;
 
     zend_object_std_init(&mesh->std, ce);
     object_properties_init(&mesh->std, ce);
@@ -40,17 +38,9 @@ static void vio_mesh_free_object(zend_object *obj)
 {
     vio_mesh_object *mesh = vio_mesh_from_obj(obj);
 
-#ifdef HAVE_GLFW
-    if (mesh->ebo) {
-        glDeleteBuffers(1, &mesh->ebo);
+    if (mesh->backend && mesh->backend->destroy_mesh) {
+        mesh->backend->destroy_mesh(mesh);
     }
-    if (mesh->vbo) {
-        glDeleteBuffers(1, &mesh->vbo);
-    }
-    if (mesh->vao) {
-        glDeleteVertexArrays(1, &mesh->vao);
-    }
-#endif
 
     zend_object_std_dtor(&mesh->std);
 }

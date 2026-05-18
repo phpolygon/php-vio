@@ -22,6 +22,10 @@
 #include "vio_opengl.h"
 #include "../../shaders/default_shaders.h"
 #include "../../vio_window.h"
+#include "../../vio_mesh.h"
+#include "../../vio_render_target.h"
+#include "../../vio_cubemap.h"
+#include "../../vio_font.h"
 
 vio_opengl_state vio_gl = {0};
 
@@ -250,6 +254,55 @@ static inline int gl_ge(int major, int minor)
            (vio_gl.gl_major == major && vio_gl.gl_minor >= minor);
 }
 
+/* ── Object destructors (vio_*_object → glDelete* of owned handles) ── */
+
+static void opengl_destroy_mesh(void *mesh_ptr)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_ptr;
+    if (mesh->ebo) { glDeleteBuffers(1, &mesh->ebo); mesh->ebo = 0; }
+    if (mesh->vbo) { glDeleteBuffers(1, &mesh->vbo); mesh->vbo = 0; }
+    if (mesh->vao) { glDeleteVertexArrays(1, &mesh->vao); mesh->vao = 0; }
+}
+
+static void opengl_destroy_cubemap(void *cm_ptr)
+{
+    vio_cubemap_object *cm = (vio_cubemap_object *)cm_ptr;
+    if (cm->texture_id) {
+        glDeleteTextures(1, &cm->texture_id);
+        cm->texture_id = 0;
+    }
+}
+
+static void opengl_destroy_font_atlas(void *font_ptr)
+{
+    vio_font_object *font = (vio_font_object *)font_ptr;
+    if (font->atlas_texture && glDeleteTextures) {
+        glDeleteTextures(1, &font->atlas_texture);
+        font->atlas_texture = 0;
+    }
+}
+
+static void opengl_destroy_render_target(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    /* Only act on RTs created by OpenGL — guarding by backend_type avoids
+     * mangling a struct that happens to share the slot with a D3D RT in
+     * cross-backend tests. */
+    if (rt->backend_type != VIO_RT_BACKEND_OPENGL) return;
+    if (rt->fbo) {
+        glDeleteFramebuffers(1, &rt->fbo);
+        rt->fbo = 0;
+    }
+    if (rt->color_texture) {
+        glDeleteTextures(1, &rt->color_texture);
+        rt->color_texture = 0;
+    }
+    if (rt->depth_texture) {
+        glDeleteTextures(1, &rt->depth_texture);
+        rt->depth_texture = 0;
+    }
+}
+
 static int opengl_supports_feature(vio_feature feature)
 {
     switch (feature) {
@@ -296,6 +349,10 @@ static const vio_backend opengl_backend = {
     .gpu_flush         = opengl_gpu_flush,
     .dispatch_compute  = opengl_dispatch_compute,
     .supports_feature  = opengl_supports_feature,
+    .destroy_mesh       = opengl_destroy_mesh,
+    .destroy_cubemap    = opengl_destroy_cubemap,
+    .destroy_font_atlas = opengl_destroy_font_atlas,
+    .destroy_render_target = opengl_destroy_render_target,
 };
 
 void vio_backend_opengl_register(void)

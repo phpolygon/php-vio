@@ -52,15 +52,18 @@ static const vio_font_range_def vio_font_ranges[VIO_FONT_NUM_RANGES] = {
     { 0xFF00,   240 },  /* Fullwidth Forms: U+FF00..U+FFEF */
 };
 
+struct _vio_backend;
+
 typedef struct _vio_font_object {
     HashTable          glyph_map;     /* codepoint (zend_long) -> vio_stbtt_packedchar */
-    unsigned int       atlas_texture;          /* GL texture */
+    unsigned int       atlas_texture;          /* GL texture / Metal handle */
     void              *atlas_backend_texture;   /* D3D11/D3D12 backend texture */
     float              font_size;
     int                atlas_w, atlas_h;
     unsigned char     *ttf_data;      /* raw TTF file data */
     size_t             ttf_len;       /* TTF data length */
     int                valid;
+    const struct _vio_backend *backend;  /* Backend that owns the atlas */
     zend_object        std;
 } vio_font_object;
 

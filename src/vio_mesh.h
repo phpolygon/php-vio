@@ -12,6 +12,8 @@
 #include "php.h"
 #include "../include/vio_types.h"
 
+struct _vio_backend;
+
 typedef struct _vio_mesh_object {
     unsigned int vao;
     unsigned int vbo;
@@ -22,6 +24,7 @@ typedef struct _vio_mesh_object {
     int          index_count;
     int          has_colors;      /* 1 if vertex data includes colors */
     int          stride;          /* bytes per vertex */
+    const struct _vio_backend *backend;  /* Backend that owns vao/vbo/ebo / backend_vb / backend_ib */
     zend_object  std;
 } vio_mesh_object;
 

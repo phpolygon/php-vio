@@ -11,6 +11,8 @@
 
 #include "php.h"
 
+struct _vio_backend;
+
 typedef struct _vio_render_target_object {
     /* OpenGL */
     unsigned int fbo;
@@ -56,6 +58,8 @@ typedef struct _vio_render_target_object {
     /* Cached vio_d3d12_texture wrapper, same lifecycle as the D3D11 pair. */
     void        *d3d12_color_backend_texture; /* vio_d3d12_texture* */
     void        *d3d12_depth_backend_texture; /* vio_d3d12_texture* */
+
+    const struct _vio_backend *backend;  /* Backend that owns the resources above */
     zend_object  std;
 } vio_render_target_object;
 
