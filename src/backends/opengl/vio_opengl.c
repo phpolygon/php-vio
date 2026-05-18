@@ -380,6 +380,30 @@ static void opengl_unbind_render_target(unsigned int default_fbo, int width, int
     }
 }
 
+static int opengl_read_pixels(unsigned int fbo, int width, int height, void *out_rgba)
+{
+    if (!vio_gl.initialized || width <= 0 || height <= 0) return -1;
+
+    if (fbo) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    }
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba);
+
+    /* OpenGL returns bottom-up; flip in place so callers always see top-down. */
+    int stride = width * 4;
+    unsigned char *data = (unsigned char *)out_rgba;
+    unsigned char *tmp = (unsigned char *)emalloc(stride);
+    for (int y = 0; y < height / 2; y++) {
+        unsigned char *top = data + y * stride;
+        unsigned char *bot = data + (height - 1 - y) * stride;
+        memcpy(tmp, top, stride);
+        memcpy(top, bot, stride);
+        memcpy(bot, tmp, stride);
+    }
+    efree(tmp);
+    return 0;
+}
+
 /* Linear scan over the cached extension list. List is small (typically 200-400
  * entries) and queried a handful of times at context setup; not worth a hash. */
 static int gl_has_ext(const char *name)
@@ -455,6 +479,7 @@ static const vio_backend opengl_backend = {
     .create_render_target  = opengl_create_render_target,
     .bind_render_target    = opengl_bind_render_target,
     .unbind_render_target  = opengl_unbind_render_target,
+    .read_pixels           = opengl_read_pixels,
 };
 
 void vio_backend_opengl_register(void)
