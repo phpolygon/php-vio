@@ -2087,45 +2087,15 @@ ZEND_FUNCTION(vio_texture)
     tex->height   = h;
     tex->channels = channels;
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        glGenTextures(1, &tex->texture_id);
-        glBindTexture(GL_TEXTURE_2D, tex->texture_id);
+    zval *mipmap_zval = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1);
+    int mipmaps = (mipmap_zval && zend_is_true(mipmap_zval)) ? 1 : 0;
 
-        /* Wrap mode */
-        GLint gl_wrap;
-        switch (tex->wrap) {
-            case VIO_WRAP_CLAMP:  gl_wrap = GL_CLAMP_TO_EDGE; break;
-            case VIO_WRAP_MIRROR: gl_wrap = GL_MIRRORED_REPEAT; break;
-            default:              gl_wrap = GL_REPEAT; break;
-        }
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gl_wrap);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gl_wrap);
-
-        /* Filter mode */
-        GLint gl_filter = (tex->filter == VIO_FILTER_NEAREST) ? GL_NEAREST : GL_LINEAR;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter);
-
-        /* Upload pixel data */
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-
-        /* Generate mipmaps if requested */
-        zval *mipmap_zval = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1);
-        if (mipmap_zval && zend_is_true(mipmap_zval)) {
-            glGenerateMipmap(GL_TEXTURE_2D);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                (tex->filter == VIO_FILTER_NEAREST) ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR);
-        }
-
-        glBindTexture(GL_TEXTURE_2D, 0);
-    }
-#endif
-
-    /* Backend texture creation (D3D11/D3D12/Vulkan) */
-    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->create_texture) {
-        zval *mipmap_zval = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1);
-
+    if (ctx->backend->upload_texture_2d) {
+        /* OpenGL writes texture_id directly into tex_obj */
+        ctx->backend->upload_texture_2d(tex, pixels, w, h, channels,
+                                        (int)tex->filter, (int)tex->wrap, mipmaps);
+    } else if (ctx->backend->create_texture) {
+        /* D3D11/D3D12/Vulkan return an opaque backend handle */
         vio_texture_desc desc = {0};
         desc.data = pixels;
         desc.data_size = (size_t)(w * h * channels);
@@ -2133,7 +2103,7 @@ ZEND_FUNCTION(vio_texture)
         desc.height = h;
         desc.filter = tex->filter;
         desc.wrap = tex->wrap;
-        desc.mipmaps = (mipmap_zval && zend_is_true(mipmap_zval)) ? 1 : 0;
+        desc.mipmaps = mipmaps;
         tex->backend_texture = ctx->backend->create_texture(&desc);
     }
 

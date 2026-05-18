@@ -107,6 +107,15 @@ typedef struct _vio_backend {
                          const struct _vio_mesh_attrib *layout, int layout_count,
                          const unsigned int *indices, int index_count);
 
+    /* Upload a 2D RGBA8 texture into the given vio_texture_object. OpenGL
+     * writes tex_obj->texture_id; other backends keep using the existing
+     * create_texture(desc) → backend_texture path and leave this NULL.
+     * filter / wrap are the vio_filter / vio_wrap enums; mipmaps=1 generates
+     * a mipchain. Returns 0 on success. */
+    int   (*upload_texture_2d)(void *tex_obj,
+                               const void *pixels, int width, int height, int channels,
+                               int filter, int wrap, int mipmaps);
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);

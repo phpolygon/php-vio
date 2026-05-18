@@ -27,6 +27,7 @@
 #include "../../vio_cubemap.h"
 #include "../../vio_font.h"
 #include "../../vio_pipeline.h"
+#include "../../vio_texture.h"
 
 vio_opengl_state vio_gl = {0};
 
@@ -387,6 +388,43 @@ static void opengl_unbind_render_target(unsigned int default_fbo, int width, int
     }
 }
 
+static int opengl_upload_texture_2d(void *tex_obj,
+                                    const void *pixels, int width, int height, int channels,
+                                    int filter, int wrap, int mipmaps)
+{
+    (void)channels;  /* always uploaded as RGBA — stbi already expanded */
+    vio_texture_object *tex = (vio_texture_object *)tex_obj;
+    if (!vio_gl.initialized) return -1;
+
+    glGenTextures(1, &tex->texture_id);
+    glBindTexture(GL_TEXTURE_2D, tex->texture_id);
+
+    GLint gl_wrap;
+    switch (wrap) {
+        case VIO_WRAP_CLAMP:  gl_wrap = GL_CLAMP_TO_EDGE; break;
+        case VIO_WRAP_MIRROR: gl_wrap = GL_MIRRORED_REPEAT; break;
+        default:              gl_wrap = GL_REPEAT; break;
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gl_wrap);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gl_wrap);
+
+    GLint gl_filter = (filter == VIO_FILTER_NEAREST) ? GL_NEAREST : GL_LINEAR;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+    if (mipmaps) {
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+            (filter == VIO_FILTER_NEAREST) ? GL_NEAREST_MIPMAP_NEAREST
+                                           : GL_LINEAR_MIPMAP_LINEAR);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return 0;
+}
+
 static int opengl_create_mesh(void *mesh_obj,
                               const void *vertex_data, int vertex_data_size,
                               int stride,
@@ -630,6 +668,7 @@ static const vio_backend opengl_backend = {
     .teardown_headless     = opengl_teardown_headless,
     .bind_pipeline_state   = opengl_bind_pipeline_state,
     .create_mesh           = opengl_create_mesh,
+    .upload_texture_2d     = opengl_upload_texture_2d,
 };
 
 void vio_backend_opengl_register(void)
