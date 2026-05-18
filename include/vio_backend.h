@@ -41,6 +41,16 @@ typedef struct _vio_backend {
     void *(*compile_shader)(vio_shader_desc *desc);
     void  (*destroy_shader)(void *shader);
 
+    /* Object destructors — invoked from Zend free_object handlers. Each takes
+     * the full vio_*_object pointer (cast to void *) so the backend can free
+     * whichever fields it populated. All four are optional: NULL = no-op,
+     * caller must guard. Backends without a meaningful destructor leave the
+     * slot NULL rather than registering a stub. */
+    void  (*destroy_mesh)(void *mesh);            /* vio_mesh_object * */
+    void  (*destroy_render_target)(void *rt);     /* vio_render_target_object * */
+    void  (*destroy_cubemap)(void *cm);           /* vio_cubemap_object * */
+    void  (*destroy_font_atlas)(void *font);      /* vio_font_object * */
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);

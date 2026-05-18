@@ -7,22 +7,7 @@
 #endif
 
 #include "vio_cubemap.h"
-
-#ifdef HAVE_GLFW
-#include <glad/glad.h>
-#endif
-
-#ifdef HAVE_D3D11
-#define COBJMACROS
-#include <d3d11.h>
-#endif
-
-#ifdef HAVE_D3D12
-#ifndef COBJMACROS
-#define COBJMACROS
-#endif
-#include <d3d12.h>
-#endif
+#include "../include/vio_backend.h"
 
 zend_class_entry *vio_cubemap_ce = NULL;
 static zend_object_handlers vio_cubemap_handlers;
@@ -41,6 +26,7 @@ static zend_object *vio_cubemap_create_object(zend_class_entry *ce)
     cm->backend_type  = 0;
     cm->resolution    = 0;
     cm->valid         = 0;
+    cm->backend       = NULL;
 
     zend_object_std_init(&cm->std, ce);
     object_properties_init(&cm->std, ce);
@@ -53,34 +39,9 @@ static void vio_cubemap_free_object(zend_object *obj)
 {
     vio_cubemap_object *cm = vio_cubemap_from_obj(obj);
 
-#ifdef HAVE_GLFW
-    if (cm->texture_id) {
-        glDeleteTextures(1, &cm->texture_id);
-        cm->texture_id = 0;
+    if (cm->backend && cm->backend->destroy_cubemap) {
+        cm->backend->destroy_cubemap(cm);
     }
-#endif
-
-#ifdef HAVE_D3D11
-    if (cm->d3d11_sampler) {
-        ID3D11SamplerState_Release((ID3D11SamplerState *)cm->d3d11_sampler);
-        cm->d3d11_sampler = NULL;
-    }
-    if (cm->d3d11_srv) {
-        ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)cm->d3d11_srv);
-        cm->d3d11_srv = NULL;
-    }
-    if (cm->d3d11_texture) {
-        ID3D11Texture2D_Release((ID3D11Texture2D *)cm->d3d11_texture);
-        cm->d3d11_texture = NULL;
-    }
-#endif
-
-#ifdef HAVE_D3D12
-    if (cm->d3d12_resource) {
-        ID3D12Resource_Release((ID3D12Resource *)cm->d3d12_resource);
-        cm->d3d12_resource = NULL;
-    }
-#endif
 
     zend_object_std_dtor(&cm->std);
 }

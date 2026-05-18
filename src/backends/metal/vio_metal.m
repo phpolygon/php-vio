@@ -903,6 +903,19 @@ static int metal_supports_feature(vio_feature f)
     }
 }
 
+/* ── Object destructors ─────────────────────────────────────────── */
+
+#include "../../vio_font.h"
+
+static void metal_destroy_font_atlas(void *font_ptr)
+{
+    vio_font_object *font = (vio_font_object *)font_ptr;
+    if (font->atlas_texture) {
+        vio_metal_delete_texture(font->atlas_texture);
+        font->atlas_texture = 0;
+    }
+}
+
 /* ── Backend registration ────────────────────────────────────────── */
 
 static const vio_backend metal_backend = {
@@ -932,6 +945,7 @@ static const vio_backend metal_backend = {
     .gpu_flush         = metal_gpu_flush,
     .dispatch_compute  = metal_dispatch_compute,
     .supports_feature  = metal_supports_feature,
+    .destroy_font_atlas = metal_destroy_font_atlas,
 };
 
 void vio_backend_metal_register(void)

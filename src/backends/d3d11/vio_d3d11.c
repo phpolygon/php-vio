@@ -702,6 +702,88 @@ static void d3d11_destroy_texture(void *texture_ptr)
     free(tex);
 }
 
+/* Object destructors invoked from Zend free_object handlers; mirror the
+ * destroy_mesh / destroy_cubemap slots in the vtable. Each takes the full
+ * Zend object pointer so the backend can free whichever D3D11 fields it
+ * populated. */
+
+#include "../../vio_cubemap.h"
+#include "../../vio_font.h"
+#include "../../vio_render_target.h"
+
+static void d3d11_destroy_cubemap(void *cm_ptr)
+{
+    vio_cubemap_object *cm = (vio_cubemap_object *)cm_ptr;
+    if (cm->d3d11_sampler) {
+        ID3D11SamplerState_Release((ID3D11SamplerState *)cm->d3d11_sampler);
+        cm->d3d11_sampler = NULL;
+    }
+    if (cm->d3d11_srv) {
+        ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)cm->d3d11_srv);
+        cm->d3d11_srv = NULL;
+    }
+    if (cm->d3d11_texture) {
+        ID3D11Texture2D_Release((ID3D11Texture2D *)cm->d3d11_texture);
+        cm->d3d11_texture = NULL;
+    }
+}
+
+static void d3d11_destroy_font_atlas(void *font_ptr)
+{
+    vio_font_object *font = (vio_font_object *)font_ptr;
+    if (font->atlas_backend_texture) {
+        d3d11_destroy_texture(font->atlas_backend_texture);
+        font->atlas_backend_texture = NULL;
+    }
+}
+
+static void d3d11_destroy_render_target(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (rt->backend_type != VIO_RT_BACKEND_D3D11) return;
+
+    /* Drop cached backend-texture wrappers first. They borrow the RT's SRV
+     * (no extra AddRef), so we only release the samplers + the
+     * vio_d3d11_texture struct itself. The actual SRV release happens a
+     * few lines below as part of the regular RT teardown. */
+    for (int i = 0; i < 2; i++) {
+        vio_d3d11_texture **slot = i == 0
+            ? (vio_d3d11_texture **)&rt->d3d11_color_backend_texture
+            : (vio_d3d11_texture **)&rt->d3d11_depth_backend_texture;
+        vio_d3d11_texture *bt = *slot;
+        if (bt) {
+            if (bt->sampler)     ID3D11SamplerState_Release(bt->sampler);
+            if (bt->sampler_cmp) ID3D11SamplerState_Release(bt->sampler_cmp);
+            free(bt);
+            *slot = NULL;
+        }
+    }
+    if (rt->d3d11_depth_srv) {
+        ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)rt->d3d11_depth_srv);
+        rt->d3d11_depth_srv = NULL;
+    }
+    if (rt->d3d11_color_srv) {
+        ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)rt->d3d11_color_srv);
+        rt->d3d11_color_srv = NULL;
+    }
+    if (rt->d3d11_rtv) {
+        ID3D11RenderTargetView_Release((ID3D11RenderTargetView *)rt->d3d11_rtv);
+        rt->d3d11_rtv = NULL;
+    }
+    if (rt->d3d11_dsv) {
+        ID3D11DepthStencilView_Release((ID3D11DepthStencilView *)rt->d3d11_dsv);
+        rt->d3d11_dsv = NULL;
+    }
+    if (rt->d3d11_color_tex) {
+        ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_color_tex);
+        rt->d3d11_color_tex = NULL;
+    }
+    if (rt->d3d11_depth_tex) {
+        ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_depth_tex);
+        rt->d3d11_depth_tex = NULL;
+    }
+}
+
 /* ── Shaders ──────────────────────────────────────────────────────── */
 
 static void *d3d11_compile_shader(vio_shader_desc *desc)
@@ -1192,6 +1274,9 @@ static const vio_backend d3d11_backend = {
     .gpu_flush         = d3d11_gpu_flush,
     .dispatch_compute  = d3d11_dispatch_compute,
     .supports_feature  = d3d11_supports_feature,
+    .destroy_cubemap   = d3d11_destroy_cubemap,
+    .destroy_font_atlas = d3d11_destroy_font_atlas,
+    .destroy_render_target = d3d11_destroy_render_target,
 };
 
 void vio_backend_d3d11_register(void)

@@ -12,14 +12,6 @@
 #include "vio_font.h"
 #include "../include/vio_backend.h"
 
-#ifdef HAVE_GLFW
-#include <glad/glad.h>
-#endif
-
-#ifdef HAVE_METAL
-#include "backends/metal/vio_metal.h"
-#endif
-
 zend_class_entry *vio_font_ce = NULL;
 static zend_object_handlers vio_font_handlers;
 
@@ -35,6 +27,7 @@ static zend_object *vio_font_create_object(zend_class_entry *ce)
     font->ttf_data              = NULL;
     font->ttf_len               = 0;
     font->valid                 = 0;
+    font->backend               = NULL;
     zend_hash_init(&font->glyph_map, 512, NULL, NULL, 0);
 
     zend_object_std_init(&font->std, ce);
@@ -48,34 +41,11 @@ static void vio_font_free_object(zend_object *obj)
 {
     vio_font_object *font = vio_font_from_obj(obj);
 
-#ifdef HAVE_GLFW
-    if (font->atlas_texture && glDeleteTextures) {
-        glDeleteTextures(1, &font->atlas_texture);
-        font->atlas_texture = 0;
+    if (font->backend && font->backend->destroy_font_atlas) {
+        font->backend->destroy_font_atlas(font);
     }
-#endif
-#ifdef HAVE_METAL
-    if (font->atlas_texture) {
-        vio_metal_delete_texture(font->atlas_texture);
-        font->atlas_texture = 0;
-    }
-#endif
 
     zend_hash_destroy(&font->glyph_map);
-
-    if (font->atlas_backend_texture) {
-        const vio_backend *b = NULL;
-#ifdef HAVE_D3D11
-        b = vio_find_backend("d3d11");
-#endif
-#ifdef HAVE_D3D12
-        if (!b) b = vio_find_backend("d3d12");
-#endif
-        if (b && b->destroy_texture) {
-            b->destroy_texture(font->atlas_backend_texture);
-        }
-        font->atlas_backend_texture = NULL;
-    }
 
     if (font->ttf_data) {
         efree(font->ttf_data);

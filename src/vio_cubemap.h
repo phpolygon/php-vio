@@ -11,6 +11,8 @@
 
 #include "php.h"
 
+struct _vio_backend;
+
 typedef struct _vio_cubemap_object {
     unsigned int texture_id;    /* GL cubemap texture ID */
     void        *d3d11_texture; /* ID3D11Texture2D* (ArraySize=6) */
@@ -22,6 +24,7 @@ typedef struct _vio_cubemap_object {
     int          backend_type;  /* 0=none, 1=opengl, 2=d3d11, 3=d3d12 */
     int          resolution;
     int          valid;
+    const struct _vio_backend *backend;  /* Backend that owns texture_id / d3d11_* / d3d12_* */
     zend_object  std;
 } vio_cubemap_object;
 
