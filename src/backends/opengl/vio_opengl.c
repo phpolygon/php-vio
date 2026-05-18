@@ -388,6 +388,45 @@ static void opengl_unbind_render_target(unsigned int default_fbo, int width, int
     }
 }
 
+static void opengl_set_uniform(const char *name, const void *data, int count, int type)
+{
+    if (!vio_gl.initialized) return;
+
+    /* glUniform* operates on the currently bound program; glGetUniformLocation
+     * needs an explicit program ID. Pull it from GL state — set by the most
+     * recent bind_pipeline_state -> glUseProgram. */
+    GLint program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    if (program <= 0) return;
+
+    GLint loc = glGetUniformLocation((GLuint)program, name);
+    if (loc < 0) return;  /* silently drop unknown uniforms — matches old behavior */
+
+    switch (type) {
+        case VIO_UNIFORM_INT:
+            glUniform1i(loc, *(const GLint *)data);
+            break;
+        case VIO_UNIFORM_FLOAT:
+            glUniform1f(loc, *(const GLfloat *)data);
+            break;
+        case VIO_UNIFORM_VEC2:
+            glUniform2fv(loc, count, (const GLfloat *)data);
+            break;
+        case VIO_UNIFORM_VEC3:
+            glUniform3fv(loc, count, (const GLfloat *)data);
+            break;
+        case VIO_UNIFORM_VEC4:
+            glUniform4fv(loc, count, (const GLfloat *)data);
+            break;
+        case VIO_UNIFORM_MAT3:
+            glUniformMatrix3fv(loc, count, GL_FALSE, (const GLfloat *)data);
+            break;
+        case VIO_UNIFORM_MAT4:
+            glUniformMatrix4fv(loc, count, GL_FALSE, (const GLfloat *)data);
+            break;
+    }
+}
+
 static int opengl_upload_texture_2d(void *tex_obj,
                                     const void *pixels, int width, int height, int channels,
                                     int filter, int wrap, int mipmaps)
@@ -656,6 +695,7 @@ static const vio_backend opengl_backend = {
     .dispatch_compute  = opengl_dispatch_compute,
     .supports_feature  = opengl_supports_feature,
     .set_viewport      = opengl_set_viewport,
+    .set_uniform       = opengl_set_uniform,
     .destroy_mesh          = opengl_destroy_mesh,
     .destroy_cubemap       = opengl_destroy_cubemap,
     .destroy_font_atlas    = opengl_destroy_font_atlas,
