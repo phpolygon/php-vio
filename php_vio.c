@@ -406,7 +406,9 @@ ZEND_FUNCTION(vio_begin)
             (logical_w != ctx->state_2d.width || logical_h != ctx->state_2d.height)) {
             vio_2d_set_size(&ctx->state_2d, logical_w, logical_h);
         }
-        glViewport(0, 0, fb_w, fb_h);
+        if (ctx->backend->set_viewport) {
+            ctx->backend->set_viewport(0, 0, fb_w, fb_h);
+        }
         ctx->state_2d.fb_width  = fb_w;
         ctx->state_2d.fb_height = fb_h;
     }
@@ -5031,14 +5033,12 @@ ZEND_FUNCTION(vio_draw_3d)
         return;
     }
 
-    /* 3D draws are issued inline via vio_draw / vio_draw_instanced.
-     * This function serves as a flush/sync point - ensure all GL state is clean. */
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        glBindVertexArray(0);
-        glUseProgram(0);
+    /* 3D draws are issued inline via vio_draw / vio_draw_instanced. This
+     * function serves as a flush/sync point — reset bound VAO/program so
+     * the 2D batcher (or a subsequent RT switch) starts from a clean slate. */
+    if (ctx->backend->flush_draw_state) {
+        ctx->backend->flush_draw_state();
     }
-#endif
 }
 
 /* Helper: convert PHP array|string matrices to float buffer.
@@ -6100,127 +6100,104 @@ ZEND_FUNCTION(vio_cubemap)
     vio_cubemap_object *cm = Z_VIO_CUBEMAP_P(&cm_zval);
     cm->backend = ctx->backend;
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        glGenTextures(1, &cm->texture_id);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, cm->texture_id);
+    /* OpenGL goes through the vtable; D3D11/D3D12 stay inline below. */
+    if (ctx->backend->upload_cubemap && strcmp(ctx->backend->name, "opengl") == 0) {
+        /* Marshal source data: 6 RGBA8 buffers of (face_w, face_h). The
+         * vtable assumes uniform face dimensions — file-based loads use
+         * the first face's size, pixel-based reads w/h from config. */
+        unsigned char *owned[6] = {NULL};
+        int  owned_kind[6] = {0};  /* 0=none, 1=stbi, 2=emalloc */
+        const void *faces[6] = {NULL};
+        int face_w = 0, face_h = 0;
+        int ok = 1;
 
         if (faces_zval && Z_TYPE_P(faces_zval) == IS_ARRAY) {
-            /* File-based: 6 image file paths (+X, -X, +Y, -Y, +Z, -Z) */
             HashTable *faces_ht = Z_ARRVAL_P(faces_zval);
             if (zend_hash_num_elements(faces_ht) != 6) {
                 php_error_docref(NULL, E_WARNING, "cubemap 'faces' must have exactly 6 entries");
-                glDeleteTextures(1, &cm->texture_id);
-                zval_ptr_dtor(&cm_zval);
-                RETURN_FALSE;
+                ok = 0;
             }
-
             int face_idx = 0;
             zval *face_path;
-            ZEND_HASH_FOREACH_VAL(faces_ht, face_path) {
+            if (ok) ZEND_HASH_FOREACH_VAL(faces_ht, face_path) {
                 if (Z_TYPE_P(face_path) != IS_STRING) {
                     php_error_docref(NULL, E_WARNING, "cubemap face %d must be a string path", face_idx);
-                    glDeleteTextures(1, &cm->texture_id);
-                    zval_ptr_dtor(&cm_zval);
-                    RETURN_FALSE;
+                    ok = 0;
+                    break;
                 }
-
-                int w, h, channels;
-                unsigned char *data = stbi_load(Z_STRVAL_P(face_path), &w, &h, &channels, 4);
+                int w, h, ch;
+                unsigned char *data = stbi_load(Z_STRVAL_P(face_path), &w, &h, &ch, 4);
                 if (!data) {
                     php_error_docref(NULL, E_WARNING, "Failed to load cubemap face %d: %s",
                         face_idx, stbi_failure_reason());
-                    glDeleteTextures(1, &cm->texture_id);
-                    zval_ptr_dtor(&cm_zval);
-                    RETURN_FALSE;
+                    ok = 0;
+                    break;
                 }
-
-                if (face_idx == 0) {
-                    cm->resolution = w;
-                }
-
-                glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face_idx, 0, GL_RGBA,
-                    w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-                stbi_image_free(data);
+                if (face_idx == 0) { face_w = w; face_h = h; cm->resolution = w; }
+                owned[face_idx] = data;
+                owned_kind[face_idx] = 1;
+                faces[face_idx] = data;
                 face_idx++;
             } ZEND_HASH_FOREACH_END();
-
         } else if (pixels_zval && Z_TYPE_P(pixels_zval) == IS_ARRAY) {
-            /* Procedural: 6 arrays of RGBA pixel data */
-            HashTable *pixels_ht = Z_ARRVAL_P(pixels_zval);
-
             zval *width_zval = zend_hash_str_find(config_ht, "width", sizeof("width") - 1);
             zval *height_zval = zend_hash_str_find(config_ht, "height", sizeof("height") - 1);
+            HashTable *pixels_ht = Z_ARRVAL_P(pixels_zval);
 
             if (!width_zval || !height_zval) {
                 php_error_docref(NULL, E_WARNING, "cubemap with 'pixels' requires 'width' and 'height'");
-                glDeleteTextures(1, &cm->texture_id);
-                zval_ptr_dtor(&cm_zval);
-                RETURN_FALSE;
-            }
-
-            int res_w = (int)zval_get_long(width_zval);
-            int res_h = (int)zval_get_long(height_zval);
-            cm->resolution = res_w;
-
-            if (zend_hash_num_elements(pixels_ht) != 6) {
+                ok = 0;
+            } else if (zend_hash_num_elements(pixels_ht) != 6) {
                 php_error_docref(NULL, E_WARNING, "cubemap 'pixels' must have exactly 6 face arrays");
-                glDeleteTextures(1, &cm->texture_id);
-                zval_ptr_dtor(&cm_zval);
-                RETURN_FALSE;
-            }
+                ok = 0;
+            } else {
+                face_w = (int)zval_get_long(width_zval);
+                face_h = (int)zval_get_long(height_zval);
+                cm->resolution = face_w;
+                size_t face_size = (size_t)face_w * (size_t)face_h * 4;
+                int face_idx = 0;
+                zval *face_arr;
+                ZEND_HASH_FOREACH_VAL(pixels_ht, face_arr) {
+                    if (Z_TYPE_P(face_arr) != IS_ARRAY) {
+                        php_error_docref(NULL, E_WARNING, "cubemap pixel face %d must be an array", face_idx);
+                        ok = 0;
+                        break;
+                    }
+                    unsigned char *buf = emalloc(face_size);
+                    size_t j = 0;
+                    zval *pixel_val;
+                    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(face_arr), pixel_val) {
+                        if (j >= face_size) break;
+                        buf[j++] = (unsigned char)zval_get_long(pixel_val);
+                    } ZEND_HASH_FOREACH_END();
+                    while (j < face_size) buf[j++] = 0;  /* zero-fill short faces */
 
-            size_t face_size = (size_t)res_w * (size_t)res_h * 4;
-            unsigned char *face_buf = emalloc(face_size);
-
-            int face_idx = 0;
-            zval *face_arr;
-            ZEND_HASH_FOREACH_VAL(pixels_ht, face_arr) {
-                if (Z_TYPE_P(face_arr) != IS_ARRAY) {
-                    php_error_docref(NULL, E_WARNING, "cubemap pixel face %d must be an array", face_idx);
-                    efree(face_buf);
-                    glDeleteTextures(1, &cm->texture_id);
-                    zval_ptr_dtor(&cm_zval);
-                    RETURN_FALSE;
-                }
-
-                HashTable *face_data_ht = Z_ARRVAL_P(face_arr);
-                size_t j = 0;
-                zval *pixel_val;
-                ZEND_HASH_FOREACH_VAL(face_data_ht, pixel_val) {
-                    if (j >= face_size) break;
-                    face_buf[j++] = (unsigned char)zval_get_long(pixel_val);
+                    owned[face_idx] = buf;
+                    owned_kind[face_idx] = 2;
+                    faces[face_idx] = buf;
+                    face_idx++;
                 } ZEND_HASH_FOREACH_END();
-
-                /* Zero-fill if data is short */
-                while (j < face_size) {
-                    face_buf[j++] = 0;
-                }
-
-                glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face_idx, 0, GL_RGBA,
-                    res_w, res_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, face_buf);
-                face_idx++;
-            } ZEND_HASH_FOREACH_END();
-
-            efree(face_buf);
-
+            }
         } else {
             php_error_docref(NULL, E_WARNING, "vio_cubemap requires 'faces' or 'pixels' array");
-            glDeleteTextures(1, &cm->texture_id);
+            ok = 0;
+        }
+
+        if (ok) {
+            ctx->backend->upload_cubemap(cm, face_w, face_h, faces);
+            cm->backend_type = 1;  /* VIO_CM_BACKEND_OPENGL — see vio_cubemap.h */
+        }
+
+        for (int i = 0; i < 6; i++) {
+            if (owned_kind[i] == 1) stbi_image_free(owned[i]);
+            else if (owned_kind[i] == 2) efree(owned[i]);
+        }
+
+        if (!ok) {
             zval_ptr_dtor(&cm_zval);
             RETURN_FALSE;
         }
-
-        /* Cubemap filtering */
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-
-        glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
     }
-#endif
 
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {

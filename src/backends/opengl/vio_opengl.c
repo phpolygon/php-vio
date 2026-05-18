@@ -471,6 +471,36 @@ static void opengl_bind_cubemap_id(unsigned int texture_id, int slot)
     glBindTexture(GL_TEXTURE_CUBE_MAP, texture_id);
 }
 
+static void opengl_flush_draw_state(void)
+{
+    if (!vio_gl.initialized) return;
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+static int opengl_upload_cubemap(void *cm_obj, int width, int height, const void *face_rgba[6])
+{
+    vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
+    if (!vio_gl.initialized) return -1;
+
+    glGenTextures(1, &cm->texture_id);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cm->texture_id);
+
+    for (int i = 0; i < 6; i++) {
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGBA,
+                     width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, face_rgba[i]);
+    }
+
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+    return 0;
+}
+
 static int opengl_upload_font_atlas(void *font_obj, int width, int height,
                                     const unsigned char *r8_data, int swizzle_red_to_alpha)
 {
@@ -855,6 +885,8 @@ static const vio_backend opengl_backend = {
     .bind_texture_id       = opengl_bind_texture_id,
     .bind_cubemap_id       = opengl_bind_cubemap_id,
     .upload_font_atlas     = opengl_upload_font_atlas,
+    .flush_draw_state      = opengl_flush_draw_state,
+    .upload_cubemap        = opengl_upload_cubemap,
 };
 
 void vio_backend_opengl_register(void)
