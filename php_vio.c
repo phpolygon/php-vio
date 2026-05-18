@@ -5697,57 +5697,15 @@ ZEND_FUNCTION(vio_render_target)
     rt->depth_only = depth_only;
     rt->backend    = ctx->backend;
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        glGenFramebuffers(1, &rt->fbo);
-        glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
-
-        /* Depth texture (always created) */
-        glGenTextures(1, &rt->depth_texture);
-        glBindTexture(GL_TEXTURE_2D, rt->depth_texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, width, height,
-            0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
-        float border_color[] = {1.0f, 1.0f, 1.0f, 1.0f};
-        glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border_color);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D,
-            rt->depth_texture, 0);
-
-        if (depth_only) {
-            /* No color attachment */
-            glDrawBuffer(GL_NONE);
-            glReadBuffer(GL_NONE);
-        } else {
-            /* Color texture */
-            glGenTextures(1, &rt->color_texture);
-            glBindTexture(GL_TEXTURE_2D, rt->color_texture);
-            glTexImage2D(GL_TEXTURE_2D, 0, hdr ? GL_RGBA16F : GL_RGBA8, width, height,
-                0, GL_RGBA, hdr ? GL_FLOAT : GL_UNSIGNED_BYTE, NULL);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                rt->color_texture, 0);
-        }
-
-        /* Verify completeness */
-        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glBindTexture(GL_TEXTURE_2D, 0);
-
-        if (status != GL_FRAMEBUFFER_COMPLETE) {
-            php_error_docref(NULL, E_WARNING, "Render target FBO is not complete (status: 0x%04x)", status);
+    /* OpenGL goes through the vtable; D3D11/D3D12 still inline below until
+     * their backends implement create_render_target. */
+    if (ctx->backend->create_render_target &&
+        strcmp(ctx->backend->name, "opengl") == 0) {
+        if (ctx->backend->create_render_target(rt, width, height, hdr, depth_only) != 0) {
             zval_ptr_dtor(&rt_zval);
             RETURN_FALSE;
         }
-
-        rt->backend_type = VIO_RT_BACKEND_OPENGL;
     }
-#endif
 
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
@@ -6061,12 +6019,10 @@ ZEND_FUNCTION(vio_bind_render_target)
         return;
     }
 
-#ifdef HAVE_GLFW
-    if (rt->backend_type == VIO_RT_BACKEND_OPENGL && vio_gl.initialized) {
-        glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
-        glViewport(0, 0, rt->width, rt->height);
+    if (ctx->backend->bind_render_target &&
+        rt->backend_type == VIO_RT_BACKEND_OPENGL) {
+        ctx->backend->bind_render_target(rt);
     }
-#endif
 
 #ifdef HAVE_D3D11
     if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
@@ -6176,22 +6132,22 @@ ZEND_FUNCTION(vio_unbind_render_target)
         return;
     }
 
+    if (ctx->backend->unbind_render_target &&
+        strcmp(ctx->backend->name, "opengl") == 0) {
+        /* For OpenGL the "default" target is the headless FBO when present;
+         * otherwise FBO 0 with the current window's framebuffer dimensions. */
+        unsigned int default_fbo = ctx->headless_fbo;
+        int w = ctx->config.width;
+        int h = ctx->config.height;
+        if (!default_fbo) {
 #ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0) {
-        /* Restore default framebuffer (or headless FBO if applicable) */
-        if (ctx->headless_fbo) {
-            glBindFramebuffer(GL_FRAMEBUFFER, ctx->headless_fbo);
-            glViewport(0, 0, ctx->config.width, ctx->config.height);
-        } else {
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
             if (ctx->window) {
-                int fb_w, fb_h;
-                glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-                glViewport(0, 0, fb_w, fb_h);
+                glfwGetFramebufferSize(ctx->window, &w, &h);
             }
-        }
-    }
 #endif
+        }
+        ctx->backend->unbind_render_target(default_fbo, w, h);
+    }
 
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {

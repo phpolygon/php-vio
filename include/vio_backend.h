@@ -51,6 +51,19 @@ typedef struct _vio_backend {
     void  (*destroy_cubemap)(void *cm);           /* vio_cubemap_object * */
     void  (*destroy_font_atlas)(void *font);      /* vio_font_object * */
 
+    /* Render-target lifecycle. create_render_target writes its handles into the
+     * supplied vio_render_target_object (fbo / d3d11_* / d3d12_* fields) and
+     * returns 0 on success, non-zero on failure. bind_render_target switches the
+     * active draw target to rt; unbind_render_target restores whatever default
+     * the backend considers current — for OpenGL the caller passes the headless
+     * FBO and its dimensions (0 / window-size for windowed contexts), other
+     * backends consult their own globals and may ignore those parameters. All
+     * three are optional NULL slots so a backend without RT support reports
+     * VIO_FEATURE_RENDER_TARGET=0 and the caller skips the call. */
+    int   (*create_render_target)(void *rt, int width, int height, int hdr, int depth_only);
+    void  (*bind_render_target)(void *rt);
+    void  (*unbind_render_target)(unsigned int default_fbo, int width, int height);
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);
