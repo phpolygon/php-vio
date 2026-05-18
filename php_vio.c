@@ -2390,26 +2390,24 @@ ZEND_FUNCTION(vio_set_uniform)
         return;
     }
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized && ctx->bound_shader_program) {
-        GLint loc = glGetUniformLocation(ctx->bound_shader_program, name);
-        if (loc < 0) {
-            return; /* silently ignore missing uniforms */
-        }
-
+    /* Marshal zval -> typed (data, count, type) once, then dispatch via the
+     * backend's set_uniform slot. OpenGL uses it to do the glGetUniformLocation
+     * + glUniform* dance; D3D/Vulkan/Metal also implement set_uniform but with
+     * different semantics (raw cbuffer slot 0), so the per-uniform cbuffer-data
+     * write below is the actual D3D path. The strcmp keeps the two from
+     * stepping on each other until set_uniform is fully unified. */
+    if (ctx->backend->set_uniform && strcmp(ctx->backend->name, "opengl") == 0) {
         if (Z_TYPE_P(value_zval) == IS_LONG) {
-            glUniform1i(loc, (GLint)Z_LVAL_P(value_zval));
+            int v = (int)Z_LVAL_P(value_zval);
+            ctx->backend->set_uniform(name, &v, 1, VIO_UNIFORM_INT);
         } else if (Z_TYPE_P(value_zval) == IS_DOUBLE) {
-            glUniform1f(loc, (GLfloat)Z_DVAL_P(value_zval));
+            float v = (float)Z_DVAL_P(value_zval);
+            ctx->backend->set_uniform(name, &v, 1, VIO_UNIFORM_FLOAT);
         } else if (Z_TYPE_P(value_zval) == IS_ARRAY) {
             HashTable *ht = Z_ARRVAL_P(value_zval);
-            int count = zend_hash_num_elements(ht);
-            if (count <= 0) return;
-
-            /* Check if first element is array (matrix) */
             zval *first = zend_hash_index_find(ht, 0);
             if (first && Z_TYPE_P(first) == IS_ARRAY) {
-                /* Matrix: array of 16 floats packed row/column major */
+                /* Nested array → matrix (3x3 or 4x4) */
                 float mat[16];
                 int i = 0;
                 zval *row;
@@ -2421,10 +2419,10 @@ ZEND_FUNCTION(vio_set_uniform)
                         } ZEND_HASH_FOREACH_END();
                     }
                 } ZEND_HASH_FOREACH_END();
-                if (i == 16) glUniformMatrix4fv(loc, 1, GL_FALSE, mat);
-                else if (i == 9) glUniformMatrix3fv(loc, 1, GL_FALSE, mat);
+                if (i == 16) ctx->backend->set_uniform(name, mat, 1, VIO_UNIFORM_MAT4);
+                else if (i == 9) ctx->backend->set_uniform(name, mat, 1, VIO_UNIFORM_MAT3);
             } else {
-                /* Flat array: vec2/3/4 or flat mat4 */
+                /* Flat array: vec2/3/4 or flat mat3/4 */
                 float vals[16];
                 int i = 0;
                 zval *elem;
@@ -2432,16 +2430,15 @@ ZEND_FUNCTION(vio_set_uniform)
                     if (i < 16) vals[i++] = (float)zval_get_double(elem);
                 } ZEND_HASH_FOREACH_END();
                 switch (i) {
-                    case 2:  glUniform2fv(loc, 1, vals); break;
-                    case 3:  glUniform3fv(loc, 1, vals); break;
-                    case 4:  glUniform4fv(loc, 1, vals); break;
-                    case 9:  glUniformMatrix3fv(loc, 1, GL_FALSE, vals); break;
-                    case 16: glUniformMatrix4fv(loc, 1, GL_FALSE, vals); break;
+                    case 2:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_VEC2); break;
+                    case 3:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_VEC3); break;
+                    case 4:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_VEC4); break;
+                    case 9:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_MAT3); break;
+                    case 16: ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_MAT4); break;
                 }
             }
         }
     }
-#endif
 
     /* Backend uniform setting: write into shader's cbuffer_data at correct offset */
     if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->bound_shader_object) {
