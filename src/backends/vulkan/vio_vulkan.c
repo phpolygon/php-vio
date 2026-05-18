@@ -863,6 +863,9 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_COMPUTE:      return 1;
         case VIO_FEATURE_TESSELLATION: return 1;
         case VIO_FEATURE_GEOMETRY:     return 1;
+        case VIO_FEATURE_3D_PIPELINE:  return 1;
+        case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
+        case VIO_FEATURE_MULTIVIEW:    return 0; /* VK_KHR_multiview not wired */
         default: return 0;
     }
 }

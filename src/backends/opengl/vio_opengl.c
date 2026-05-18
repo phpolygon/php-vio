@@ -240,15 +240,30 @@ static void opengl_dispatch_compute(vio_compute_cmd *cmd)
     (void)cmd;
 }
 
+/* True when the active context is at least the given GL version. The window
+ * system negotiates a 4.6 → 3.3 ladder and writes the result into vio_gl.
+ * Both fields are 0 until vio_opengl_setup_context() has run, in which case
+ * every check returns 0 — that's correct: no context, no capabilities. */
+static inline int gl_ge(int major, int minor)
+{
+    return (vio_gl.gl_major > major) ||
+           (vio_gl.gl_major == major && vio_gl.gl_minor >= minor);
+}
+
 static int opengl_supports_feature(vio_feature feature)
 {
     switch (feature) {
         case VIO_FEATURE_COMPUTE:
-            return 0; /* GL 4.1 doesn't have compute shaders (4.3+) */
+            return gl_ge(4, 3);
         case VIO_FEATURE_TESSELLATION:
-            return 1; /* GL 4.0+ */
+            return gl_ge(4, 0);
         case VIO_FEATURE_GEOMETRY:
-            return 1; /* GL 3.2+ */
+            return gl_ge(3, 2);   /* always true at the 3.3 floor */
+        case VIO_FEATURE_3D_PIPELINE:
+            return 1;             /* full 3D pipeline available on every GL we accept */
+        case VIO_FEATURE_RAYTRACING:
+        case VIO_FEATURE_MULTIVIEW:
+            return 0;             /* extension-only, not exposed via core GL */
         default:
             return 0;
     }
