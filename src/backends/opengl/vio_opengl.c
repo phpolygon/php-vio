@@ -311,6 +311,75 @@ static void opengl_destroy_render_target(void *rt_ptr)
     }
 }
 
+static int opengl_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!vio_gl.initialized) return -1;
+
+    glGenFramebuffers(1, &rt->fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+
+    /* Depth texture (always created — shadow-map use-case needs it as SRV) */
+    glGenTextures(1, &rt->depth_texture);
+    glBindTexture(GL_TEXTURE_2D, rt->depth_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, width, height,
+        0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+    float border_color[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border_color);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D,
+        rt->depth_texture, 0);
+
+    if (depth_only) {
+        glDrawBuffer(GL_NONE);
+        glReadBuffer(GL_NONE);
+    } else {
+        glGenTextures(1, &rt->color_texture);
+        glBindTexture(GL_TEXTURE_2D, rt->color_texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, hdr ? GL_RGBA16F : GL_RGBA8, width, height,
+            0, GL_RGBA, hdr ? GL_FLOAT : GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+            rt->color_texture, 0);
+    }
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        php_error_docref(NULL, E_WARNING,
+            "Render target FBO is not complete (status: 0x%04x)", status);
+        return -1;
+    }
+
+    rt->backend_type = VIO_RT_BACKEND_OPENGL;
+    return 0;
+}
+
+static void opengl_bind_render_target(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (rt->backend_type != VIO_RT_BACKEND_OPENGL || !vio_gl.initialized) return;
+    glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+    glViewport(0, 0, rt->width, rt->height);
+}
+
+static void opengl_unbind_render_target(unsigned int default_fbo, int width, int height)
+{
+    if (!vio_gl.initialized) return;
+    glBindFramebuffer(GL_FRAMEBUFFER, default_fbo);
+    if (width > 0 && height > 0) {
+        glViewport(0, 0, width, height);
+    }
+}
+
 /* Linear scan over the cached extension list. List is small (typically 200-400
  * entries) and queried a handful of times at context setup; not worth a hash. */
 static int gl_has_ext(const char *name)
@@ -379,10 +448,13 @@ static const vio_backend opengl_backend = {
     .gpu_flush         = opengl_gpu_flush,
     .dispatch_compute  = opengl_dispatch_compute,
     .supports_feature  = opengl_supports_feature,
-    .destroy_mesh       = opengl_destroy_mesh,
-    .destroy_cubemap    = opengl_destroy_cubemap,
-    .destroy_font_atlas = opengl_destroy_font_atlas,
+    .destroy_mesh          = opengl_destroy_mesh,
+    .destroy_cubemap       = opengl_destroy_cubemap,
+    .destroy_font_atlas    = opengl_destroy_font_atlas,
     .destroy_render_target = opengl_destroy_render_target,
+    .create_render_target  = opengl_create_render_target,
+    .bind_render_target    = opengl_bind_render_target,
+    .unbind_render_target  = opengl_unbind_render_target,
 };
 
 void vio_backend_opengl_register(void)
