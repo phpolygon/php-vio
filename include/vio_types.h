@@ -130,6 +130,37 @@ typedef enum _vio_feature {
      * vio_sprite, vio_text) are independent and may work even when this
      * flag is 0 (e.g. Metal currently has 2D wired but no 3D). */
     VIO_FEATURE_3D_PIPELINE  = 5,
+    /* Frame readback to RGBA on the CPU side. Used by vio_read_pixels,
+     * vio_save_screenshot, vio_recorder_capture, vio_stream_push. Returns
+     * 0 on backends where the readback path is stubbed (Vulkan, Metal). */
+    VIO_FEATURE_READ_PIXELS  = 6,
+    /* Hardware instancing — vio_draw_instanced. */
+    VIO_FEATURE_INSTANCED_DRAW = 7,
+    /* Offscreen render-target API (vio_render_target / vio_bind_render_target). */
+    VIO_FEATURE_RENDER_TARGET      = 8,
+    VIO_FEATURE_RENDER_TARGET_HDR  = 9,   /* 16F color attachment */
+    VIO_FEATURE_RENDER_TARGET_DEPTH = 10, /* depth-only RT (shadow maps) */
+    VIO_FEATURE_RENDER_TARGET_MSAA = 11,  /* multisampled RT */
+    /* Cubemap textures — vio_cubemap / vio_bind_cubemap. */
+    VIO_FEATURE_CUBEMAP            = 12,
+    /* Pipeline depth-bias state. GL's glPolygonOffset; D3D/Vulkan/Metal
+     * expose it via pipeline state. */
+    VIO_FEATURE_DEPTH_BIAS         = 13,
+    /* Scissor rectangle for 2D push/pop. */
+    VIO_FEATURE_SCISSOR            = 14,
+    /* GPU-side texture component swizzle (R8 → alpha for font atlases).
+     * Backends without it (D3D11/12) have to CPU-expand to RGBA8. */
+    VIO_FEATURE_TEXTURE_SWIZZLE    = 15,
+    /* Backend ships its own 2D-batch renderer (vio_2d_<backend>_*). The
+     * generic geo path in vio_2d.c is only invoked when this is 0. */
+    VIO_FEATURE_NATIVE_2D_BATCH    = 16,
+    /* OpenGL-specific feature flags filling out vio_gl_info(). All n/a for
+     * non-GL backends. */
+    VIO_FEATURE_DEBUG_OUTPUT       = 17,  /* GL 4.3 / KHR_debug */
+    VIO_FEATURE_DSA                = 18,  /* GL 4.5 / ARB_direct_state_access */
+    VIO_FEATURE_BUFFER_STORAGE     = 19,  /* GL 4.4 / ARB_buffer_storage */
+    VIO_FEATURE_TEXTURE_STORAGE    = 20,  /* GL 4.2 / ARB_texture_storage */
+    VIO_FEATURE_SEPARATE_SHADERS   = 21,  /* GL 4.1 / ARB_separate_shader_objects */
 } vio_feature;
 
 /* ── Input actions ────────────────────────────────────────────────── */

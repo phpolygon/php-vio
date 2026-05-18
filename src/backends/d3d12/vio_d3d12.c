@@ -1653,6 +1653,17 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
         case VIO_FEATURE_MULTIVIEW:    return 0;
         case VIO_FEATURE_3D_PIPELINE:  return 1;
+        case VIO_FEATURE_READ_PIXELS:  return 1;
+        case VIO_FEATURE_INSTANCED_DRAW: return 1;
+        case VIO_FEATURE_RENDER_TARGET:       return 1;
+        case VIO_FEATURE_RENDER_TARGET_HDR:   return 1;
+        case VIO_FEATURE_RENDER_TARGET_DEPTH: return 1;
+        case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1;
+        case VIO_FEATURE_CUBEMAP:      return 1;
+        case VIO_FEATURE_DEPTH_BIAS:   return 1; /* PSO rasterizer state */
+        case VIO_FEATURE_SCISSOR:      return 1;
+        case VIO_FEATURE_TEXTURE_SWIZZLE: return 0; /* needs CPU expansion */
+        case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* vio_2d_d3d12_* */
         default:                       return 0;
     }
 }
