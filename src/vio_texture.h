@@ -12,6 +12,8 @@
 #include "php.h"
 #include "../include/vio_types.h"
 
+struct _vio_backend;
+
 typedef struct _vio_texture_object {
     unsigned int texture_id;    /* GL texture ID */
     void        *backend_texture; /* Backend texture (D3D11/D3D12/Vulkan) */
@@ -22,6 +24,7 @@ typedef struct _vio_texture_object {
     vio_wrap     wrap;
     int          valid;
     int          borrowed;      /* 1 if texture_id is owned by another object (e.g. render target) */
+    const struct _vio_backend *backend;
     zend_object  std;
 } vio_texture_object;
 

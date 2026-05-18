@@ -22,6 +22,8 @@ typedef struct _vio_uniform_entry {
     int     size;      /* size in bytes */
 } vio_uniform_entry;
 
+struct _vio_backend;
+
 typedef struct _vio_shader_object {
     unsigned int      program;       /* GL program ID (0 if not OpenGL) */
     vio_shader_format format;
@@ -51,6 +53,7 @@ typedef struct _vio_shader_object {
     /* Runtime GL-slot to HLSL-binding remap: gl_to_hlsl[gl_slot] = hlsl_binding (-1 = unmapped) */
     int               gl_to_hlsl_sampler[16];
     int               valid;
+    const struct _vio_backend *backend;
     zend_object       std;
 } vio_shader_object;
 

@@ -29,6 +29,7 @@
 #include "../../vio_pipeline.h"
 #include "../../vio_texture.h"
 #include "../../vio_buffer.h"
+#include "../../vio_shader.h"
 
 vio_opengl_state vio_gl = {0};
 
@@ -272,6 +273,35 @@ static inline int gl_ge(int major, int minor)
 }
 
 /* ── Object destructors (vio_*_object → glDelete* of owned handles) ── */
+
+static void opengl_destroy_buffer_obj(void *buf_obj)
+{
+    vio_buffer_object *buf = (vio_buffer_object *)buf_obj;
+    if (buf->buffer_id) {
+        glDeleteBuffers(1, &buf->buffer_id);
+        buf->buffer_id = 0;
+    }
+}
+
+static void opengl_destroy_texture_obj(void *tex_obj)
+{
+    vio_texture_object *tex = (vio_texture_object *)tex_obj;
+    /* `borrowed` textures (e.g. render-target color/depth alias) are owned
+     * by another object and must not be deleted here. */
+    if (tex->texture_id && !tex->borrowed) {
+        glDeleteTextures(1, &tex->texture_id);
+        tex->texture_id = 0;
+    }
+}
+
+static void opengl_destroy_shader_obj(void *shader_obj)
+{
+    vio_shader_object *sh = (vio_shader_object *)shader_obj;
+    if (sh->program) {
+        glDeleteProgram(sh->program);
+        sh->program = 0;
+    }
+}
 
 static void opengl_destroy_mesh(void *mesh_ptr)
 {
@@ -864,6 +894,9 @@ static const vio_backend opengl_backend = {
     .supports_feature  = opengl_supports_feature,
     .set_viewport      = opengl_set_viewport,
     .set_uniform       = opengl_set_uniform,
+    .destroy_buffer_obj    = opengl_destroy_buffer_obj,
+    .destroy_texture_obj   = opengl_destroy_texture_obj,
+    .destroy_shader_obj    = opengl_destroy_shader_obj,
     .destroy_mesh          = opengl_destroy_mesh,
     .destroy_cubemap       = opengl_destroy_cubemap,
     .destroy_font_atlas    = opengl_destroy_font_atlas,

@@ -916,6 +916,16 @@ static int metal_supports_feature(vio_feature f)
 /* ── Object destructors ─────────────────────────────────────────── */
 
 #include "../../vio_font.h"
+#include "../../vio_texture.h"
+
+static void metal_destroy_texture_obj(void *tex_ptr)
+{
+    vio_texture_object *tex = (vio_texture_object *)tex_ptr;
+    if (tex->texture_id && !tex->borrowed) {
+        vio_metal_delete_texture(tex->texture_id);
+        tex->texture_id = 0;
+    }
+}
 
 static void metal_destroy_font_atlas(void *font_ptr)
 {
@@ -966,6 +976,7 @@ static const vio_backend metal_backend = {
     .supports_feature  = metal_supports_feature,
     .destroy_font_atlas = metal_destroy_font_atlas,
     .upload_font_atlas  = metal_upload_font_atlas,
+    .destroy_texture_obj = metal_destroy_texture_obj,
 };
 
 void vio_backend_metal_register(void)

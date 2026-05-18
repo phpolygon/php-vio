@@ -7,10 +7,7 @@
 #endif
 
 #include "vio_buffer.h"
-
-#ifdef HAVE_GLFW
-#include <glad/glad.h>
-#endif
+#include "../include/vio_backend.h"
 
 zend_class_entry *vio_buffer_ce = NULL;
 static zend_object_handlers vio_buffer_handlers;
@@ -38,12 +35,12 @@ static void vio_buffer_free_object(zend_object *obj)
 {
     vio_buffer_object *buf = vio_buffer_from_obj(obj);
 
-#ifdef HAVE_GLFW
-    if (buf->buffer_id) {
-        glDeleteBuffers(1, &buf->buffer_id);
-        buf->buffer_id = 0;
+    if (buf->backend) {
+        const vio_backend *be = (const vio_backend *)buf->backend;
+        if (be->destroy_buffer_obj) {
+            be->destroy_buffer_obj(buf);
+        }
     }
-#endif
 
     zend_object_std_dtor(&buf->std);
 }
