@@ -125,6 +125,8 @@ static void opengl_shutdown(void)
         vio_gl.extensions = NULL;
         vio_gl.extension_count = 0;
     }
+    if (vio_gl.renderer) { free(vio_gl.renderer); vio_gl.renderer = NULL; }
+    if (vio_gl.vendor)   { free(vio_gl.vendor);   vio_gl.vendor   = NULL; }
     vio_gl.initialized = 0;
 }
 
@@ -972,6 +974,21 @@ int vio_opengl_setup_context(void)
             }
             vio_gl.extension_count = num_ext;
         }
+    }
+
+    /* Cache renderer / vendor strings so vio_gl_info() doesn't have to call
+     * back into GL from php_vio.c (the audit gate forbids that). */
+    const GLubyte *r = glGetString(GL_RENDERER);
+    const GLubyte *v = glGetString(GL_VENDOR);
+    if (r) {
+        size_t rlen = strlen((const char *)r);
+        vio_gl.renderer = (char *)malloc(rlen + 1);
+        if (vio_gl.renderer) memcpy(vio_gl.renderer, r, rlen + 1);
+    }
+    if (v) {
+        size_t vlen = strlen((const char *)v);
+        vio_gl.vendor = (char *)malloc(vlen + 1);
+        if (vio_gl.vendor) memcpy(vio_gl.vendor, v, vlen + 1);
     }
 
     /* Fill the per-feature cache. Each capability is true when either the

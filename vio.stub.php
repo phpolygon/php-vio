@@ -668,3 +668,51 @@ function vio_bind_cubemap(VioContext $context, VioCubemap $cubemap, int $slot = 
  * Set the window size in screen coordinates.
  */
 function vio_set_window_size(VioContext $context, int $width, int $height): void {}
+
+/**
+ * Diagnostics for the OpenGL backend (issue #3 part 3).
+ *
+ * Returns an array describing the runtime OpenGL context — version,
+ * GLSL level, renderer/vendor strings, the extension list and a
+ * features map matching the VIO_FEATURE_* enum. Returns false on
+ * non-OpenGL backends or before vio_opengl_setup_context() has run.
+ *
+ * @return array{
+ *   version: string,
+ *   glsl: int,
+ *   renderer: string,
+ *   vendor: string,
+ *   profile: string,
+ *   extensions: string[],
+ *   features: array<string, bool>,
+ * }|false
+ */
+function vio_gl_info(VioContext $context): array|false {}
+
+/**
+ * Convenience alias for vio_render_target() with explicit option keys
+ * (issue #4). Returns an object interchangeable with the existing API.
+ */
+function vio_create_render_target(VioContext $context, int $width, int $height, array $options = []): VioRenderTarget|false {}
+
+/**
+ * Switch the active draw target. Pass null to restore the window default.
+ */
+function vio_set_render_target(VioContext $context, ?VioRenderTarget $target): void {}
+
+/**
+ * Explicit destroy — releases the GPU resources held by the render target
+ * immediately, rather than waiting for GC.
+ */
+function vio_destroy_render_target(VioRenderTarget $target): void {}
+
+/**
+ * Push the current render target onto a stack and switch to $target.
+ * Stack max depth is 8.
+ */
+function vio_push_render_target(VioContext $context, VioRenderTarget $target): void {}
+
+/**
+ * Pop the topmost render target off the stack and re-bind it.
+ */
+function vio_pop_render_target(VioContext $context): void {}

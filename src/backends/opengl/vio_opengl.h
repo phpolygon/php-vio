@@ -49,6 +49,11 @@ typedef struct _vio_opengl_state {
     /* Cached extension list. NULL until setup; freed in shutdown. */
     int          extension_count;
     char       **extensions;
+
+    /* Cached driver strings — captured once at setup so vio_gl_info can
+     * surface them without re-entering GL from php_vio.c. */
+    char        *renderer;
+    char        *vendor;
 } vio_opengl_state;
 
 extern vio_opengl_state vio_gl;

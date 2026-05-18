@@ -22,6 +22,8 @@ static zend_object *vio_context_create_object(zend_class_entry *ce)
     memset(&ctx->config, 0, sizeof(vio_config));
     vio_input_init(&ctx->input);
     memset(&ctx->state_2d, 0, sizeof(vio_2d_state));
+    ctx->rt_stack_depth = 0;
+    memset(ctx->rt_stack, 0, sizeof(ctx->rt_stack));
 
     zend_object_std_init(&ctx->std, ce);
     object_properties_init(&ctx->std, ce);
@@ -60,6 +62,16 @@ static void vio_context_free_object(zend_object *obj)
      * fired the free handler would skip them and leak ~1 MiB per ctx. */
     vio_input_shutdown(&ctx->input);
     vio_2d_shutdown(&ctx->state_2d);
+
+    /* Drain the render-target push/pop stack so any held zvals don't leak. */
+    for (int i = 0; i < ctx->rt_stack_depth; i++) {
+        zval *slot = (zval *)ctx->rt_stack[i];
+        if (slot) {
+            zval_ptr_dtor(slot);
+            efree(slot);
+        }
+    }
+    ctx->rt_stack_depth = 0;
 
     zend_object_std_dtor(&ctx->std);
 }
