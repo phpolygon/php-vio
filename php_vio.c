@@ -2002,66 +2002,13 @@ ZEND_FUNCTION(vio_bind_pipeline)
     ctx->bound_shader_program = pipe->shader_program;
     ctx->bound_shader_object = pipe->shader_ref;
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        glUseProgram(pipe->shader_program);
-
-        /* Apply pipeline state */
-        GLenum gl_topology;
-        switch (pipe->topology) {
-            case VIO_TRIANGLES:      gl_topology = GL_TRIANGLES; break;
-            case VIO_TRIANGLE_STRIP: gl_topology = GL_TRIANGLE_STRIP; break;
-            case VIO_TRIANGLE_FAN:   gl_topology = GL_TRIANGLE_FAN; break;
-            case VIO_LINES:          gl_topology = GL_LINES; break;
-            case VIO_LINE_STRIP:     gl_topology = GL_LINE_STRIP; break;
-            case VIO_POINTS:         gl_topology = GL_POINTS; break;
-            default:                 gl_topology = GL_TRIANGLES; break;
-        }
-        (void)gl_topology; /* stored in context for draw calls */
-
-        /* Cull mode */
-        if (pipe->cull_mode == VIO_CULL_NONE) {
-            glDisable(GL_CULL_FACE);
-        } else {
-            glEnable(GL_CULL_FACE);
-            glCullFace(pipe->cull_mode == VIO_CULL_BACK ? GL_BACK : GL_FRONT);
-        }
-
-        /* Depth test */
-        if (pipe->depth_test) {
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(pipe->depth_func == VIO_DEPTH_LEQUAL ? GL_LEQUAL : GL_LESS);
-        } else {
-            glDisable(GL_DEPTH_TEST);
-        }
-
-        /* Depth bias (polygon offset for shadow mapping) */
-        if (pipe->depth_bias != 0.0f || pipe->slope_scaled_depth_bias != 0.0f) {
-            glEnable(GL_POLYGON_OFFSET_FILL);
-            glPolygonOffset(pipe->slope_scaled_depth_bias, pipe->depth_bias);
-        } else {
-            glDisable(GL_POLYGON_OFFSET_FILL);
-        }
-
-        /* Blend */
-        switch (pipe->blend) {
-            case VIO_BLEND_NONE:
-                glDisable(GL_BLEND);
-                break;
-            case VIO_BLEND_ALPHA:
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                break;
-            case VIO_BLEND_ADDITIVE:
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-                break;
-        }
+    /* OpenGL: apply the pipeline's GL state (program, cull/depth/blend etc.) */
+    if (ctx->backend->bind_pipeline_state) {
+        ctx->backend->bind_pipeline_state(pipe);
     }
-#endif
 
-    /* Backend pipeline binding (D3D11/D3D12/Vulkan) */
-    if (strcmp(ctx->backend->name, "opengl") != 0 &&
+    /* D3D11/D3D12/Vulkan: dispatch the backend's own pipeline-bind */
+    if (!ctx->backend->bind_pipeline_state &&
         pipe->backend_pipeline && ctx->backend->bind_pipeline) {
         ctx->backend->bind_pipeline(pipe->backend_pipeline);
     }
