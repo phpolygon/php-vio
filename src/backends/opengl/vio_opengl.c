@@ -253,6 +253,12 @@ static void opengl_dispatch_compute(vio_compute_cmd *cmd)
     (void)cmd;
 }
 
+static void opengl_set_viewport(int x, int y, int width, int height)
+{
+    if (!vio_gl.initialized) return;
+    glViewport((GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height);
+}
+
 /* True when the active context is at least the given GL version. The window
  * system negotiates a 4.6 → 3.3 ladder and writes the result into vio_gl.
  * Both fields are 0 until vio_opengl_setup_context() has run, in which case
@@ -574,6 +580,7 @@ static const vio_backend opengl_backend = {
     .gpu_flush         = opengl_gpu_flush,
     .dispatch_compute  = opengl_dispatch_compute,
     .supports_feature  = opengl_supports_feature,
+    .set_viewport      = opengl_set_viewport,
     .destroy_mesh          = opengl_destroy_mesh,
     .destroy_cubemap       = opengl_destroy_cubemap,
     .destroy_font_atlas    = opengl_destroy_font_atlas,
