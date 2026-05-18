@@ -23,6 +23,32 @@ typedef struct _vio_opengl_state {
     int          gl_major;
     int          gl_minor;
     int          glsl_version;
+
+    /* Per-feature capability cache. Filled once in vio_opengl_setup_context()
+     * by combining a core-version check (gl_major / gl_minor) with an
+     * extension-list lookup. opengl_supports_feature() reads these directly
+     * so callers don't pay a query per call.
+     *
+     * Issue #3 part 2: each flag falls back to the equivalent ARB/KHR
+     * extension so drivers that ship the feature outside of a higher core
+     * version (typical on macOS 4.1 contexts with backports) still expose
+     * it. The flags reflect actual driver capability, not aspirational core
+     * level — a 3.3 context on a 4.6-capable driver only flips a flag if
+     * the driver also exports the matching extension. */
+    struct {
+        int has_compute_shader;          /* core 4.3 / GL_ARB_compute_shader */
+        int has_tessellation;            /* core 4.0 / GL_ARB_tessellation_shader */
+        int has_separate_shaders;        /* core 4.1 / GL_ARB_separate_shader_objects */
+        int has_debug_output;            /* core 4.3 / GL_KHR_debug */
+        int has_dsa;                     /* core 4.5 / GL_ARB_direct_state_access */
+        int has_buffer_storage;          /* core 4.4 / GL_ARB_buffer_storage */
+        int has_texture_storage;         /* core 4.2 / GL_ARB_texture_storage */
+        int has_texture_swizzle;         /* core 3.3 / GL_ARB_texture_swizzle */
+    } caps;
+
+    /* Cached extension list. NULL until setup; freed in shutdown. */
+    int          extension_count;
+    char       **extensions;
 } vio_opengl_state;
 
 extern vio_opengl_state vio_gl;

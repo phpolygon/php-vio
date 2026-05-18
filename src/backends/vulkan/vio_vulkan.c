@@ -866,6 +866,17 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_3D_PIPELINE:  return 1;
         case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
         case VIO_FEATURE_MULTIVIEW:    return 0; /* VK_KHR_multiview not wired */
+        case VIO_FEATURE_READ_PIXELS:  return 0; /* vkCmdCopyImageToBuffer path not wired */
+        case VIO_FEATURE_INSTANCED_DRAW: return 1;
+        case VIO_FEATURE_RENDER_TARGET:       return 0; /* offscreen pass not wired */
+        case VIO_FEATURE_RENDER_TARGET_HDR:   return 0;
+        case VIO_FEATURE_RENDER_TARGET_DEPTH: return 0;
+        case VIO_FEATURE_RENDER_TARGET_MSAA:  return 0;
+        case VIO_FEATURE_CUBEMAP:      return 0;
+        case VIO_FEATURE_DEPTH_BIAS:   return 1; /* pipeline rasterization state */
+        case VIO_FEATURE_SCISSOR:      return 1;
+        case VIO_FEATURE_TEXTURE_SWIZZLE: return 1; /* VkComponentMapping */
+        case VIO_FEATURE_NATIVE_2D_BATCH: return 0; /* no Vulkan 2D path */
         default: return 0;
     }
 }

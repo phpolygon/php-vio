@@ -113,6 +113,14 @@ static void opengl_shutdown(void)
         glDeleteProgram(vio_gl.default_shader_pos_only);
         vio_gl.default_shader_pos_only = 0;
     }
+    if (vio_gl.extensions) {
+        for (int i = 0; i < vio_gl.extension_count; i++) {
+            free(vio_gl.extensions[i]);
+        }
+        free(vio_gl.extensions);
+        vio_gl.extensions = NULL;
+        vio_gl.extension_count = 0;
+    }
     vio_gl.initialized = 0;
 }
 
@@ -303,22 +311,44 @@ static void opengl_destroy_render_target(void *rt_ptr)
     }
 }
 
+/* Linear scan over the cached extension list. List is small (typically 200-400
+ * entries) and queried a handful of times at context setup; not worth a hash. */
+static int gl_has_ext(const char *name)
+{
+    for (int i = 0; i < vio_gl.extension_count; i++) {
+        if (vio_gl.extensions[i] && strcmp(vio_gl.extensions[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int opengl_supports_feature(vio_feature feature)
 {
     switch (feature) {
-        case VIO_FEATURE_COMPUTE:
-            return gl_ge(4, 3);
-        case VIO_FEATURE_TESSELLATION:
-            return gl_ge(4, 0);
-        case VIO_FEATURE_GEOMETRY:
-            return gl_ge(3, 2);   /* always true at the 3.3 floor */
-        case VIO_FEATURE_3D_PIPELINE:
-            return 1;             /* full 3D pipeline available on every GL we accept */
+        case VIO_FEATURE_COMPUTE:        return vio_gl.caps.has_compute_shader;
+        case VIO_FEATURE_TESSELLATION:   return vio_gl.caps.has_tessellation;
+        case VIO_FEATURE_GEOMETRY:       return gl_ge(3, 2);   /* core in 3.3+ */
+        case VIO_FEATURE_3D_PIPELINE:    return 1;
         case VIO_FEATURE_RAYTRACING:
-        case VIO_FEATURE_MULTIVIEW:
-            return 0;             /* extension-only, not exposed via core GL */
-        default:
-            return 0;
+        case VIO_FEATURE_MULTIVIEW:      return 0;             /* not exposed via core GL */
+        case VIO_FEATURE_READ_PIXELS:    return 1;
+        case VIO_FEATURE_INSTANCED_DRAW: return 1;             /* core since 3.1 */
+        case VIO_FEATURE_RENDER_TARGET:        return 1;
+        case VIO_FEATURE_RENDER_TARGET_HDR:    return 1;       /* RGBA16F since 3.0 */
+        case VIO_FEATURE_RENDER_TARGET_DEPTH:  return 1;
+        case VIO_FEATURE_RENDER_TARGET_MSAA:   return 1;
+        case VIO_FEATURE_CUBEMAP:        return 1;
+        case VIO_FEATURE_DEPTH_BIAS:     return 1;
+        case VIO_FEATURE_SCISSOR:        return 1;
+        case VIO_FEATURE_TEXTURE_SWIZZLE: return vio_gl.caps.has_texture_swizzle;
+        case VIO_FEATURE_NATIVE_2D_BATCH: return 1;
+        case VIO_FEATURE_DEBUG_OUTPUT:   return vio_gl.caps.has_debug_output;
+        case VIO_FEATURE_DSA:            return vio_gl.caps.has_dsa;
+        case VIO_FEATURE_BUFFER_STORAGE: return vio_gl.caps.has_buffer_storage;
+        case VIO_FEATURE_TEXTURE_STORAGE:return vio_gl.caps.has_texture_storage;
+        case VIO_FEATURE_SEPARATE_SHADERS: return vio_gl.caps.has_separate_shaders;
+        default:                         return 0;
     }
 }
 
@@ -384,6 +414,39 @@ int vio_opengl_setup_context(void)
         /* Shouldn't happen — the ladder floor is 3.3 — but stay safe. */
         vio_gl.glsl_version = 330;
     }
+
+    /* Cache the extension list once. The legacy glGetString(GL_EXTENSIONS)
+     * returns NULL on core 3.2+ — use the indexed API. We strdup each name
+     * so the cache outlives whatever transient buffer the driver returned. */
+    GLint num_ext = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &num_ext);
+    if (num_ext > 0) {
+        vio_gl.extensions = (char **)calloc((size_t)num_ext, sizeof(char *));
+        if (vio_gl.extensions) {
+            for (GLint i = 0; i < num_ext; i++) {
+                const GLubyte *ext = glGetStringi(GL_EXTENSIONS, (GLuint)i);
+                if (ext) {
+                    size_t len = strlen((const char *)ext);
+                    vio_gl.extensions[i] = (char *)malloc(len + 1);
+                    if (vio_gl.extensions[i]) {
+                        memcpy(vio_gl.extensions[i], ext, len + 1);
+                    }
+                }
+            }
+            vio_gl.extension_count = num_ext;
+        }
+    }
+
+    /* Fill the per-feature cache. Each capability is true when either the
+     * core version covers it or the matching extension is present. */
+    vio_gl.caps.has_compute_shader   = gl_ge(4, 3) || gl_has_ext("GL_ARB_compute_shader");
+    vio_gl.caps.has_tessellation     = gl_ge(4, 0) || gl_has_ext("GL_ARB_tessellation_shader");
+    vio_gl.caps.has_separate_shaders = gl_ge(4, 1) || gl_has_ext("GL_ARB_separate_shader_objects");
+    vio_gl.caps.has_debug_output     = gl_ge(4, 3) || gl_has_ext("GL_KHR_debug");
+    vio_gl.caps.has_dsa              = gl_ge(4, 5) || gl_has_ext("GL_ARB_direct_state_access");
+    vio_gl.caps.has_buffer_storage   = gl_ge(4, 4) || gl_has_ext("GL_ARB_buffer_storage");
+    vio_gl.caps.has_texture_storage  = gl_ge(4, 2) || gl_has_ext("GL_ARB_texture_storage");
+    vio_gl.caps.has_texture_swizzle  = gl_ge(3, 3) || gl_has_ext("GL_ARB_texture_swizzle");
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);

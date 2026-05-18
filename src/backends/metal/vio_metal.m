@@ -898,6 +898,16 @@ static int metal_supports_feature(vio_feature f)
          * out (see comment above metal_create_pipeline). Flip to 1 once the
          * Metal 3D path is wired so vio_get_auto_backend can prefer Metal. */
         return 0;
+    case VIO_FEATURE_NATIVE_2D_BATCH:
+        /* Metal ships its own 2D-batch renderer (vio_metal_2d_*). */
+        return 1;
+    case VIO_FEATURE_SCISSOR:
+    case VIO_FEATURE_DEPTH_BIAS:
+        /* Pipeline state exposes both. */
+        return 1;
+    case VIO_FEATURE_TEXTURE_SWIZZLE:
+        /* MTLTextureSwizzleChannels on the texture descriptor. */
+        return 1;
     default:
         return 0;
     }
