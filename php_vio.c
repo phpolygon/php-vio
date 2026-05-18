@@ -3909,33 +3909,13 @@ ZEND_FUNCTION(vio_read_pixels)
     int w = ctx->config.width;
     int h = ctx->config.height;
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0) {
+    if (ctx->backend->read_pixels && strcmp(ctx->backend->name, "opengl") == 0) {
         size_t size = (size_t)w * h * 4;
         zend_string *buf = zend_string_alloc(size, 0);
-
-        if (ctx->headless_fbo) {
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->headless_fbo);
-        }
-        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, ZSTR_VAL(buf));
+        ctx->backend->read_pixels(ctx->headless_fbo, w, h, ZSTR_VAL(buf));
         ZSTR_VAL(buf)[size] = '\0';
-
-        /* Flip vertically (OpenGL reads bottom-up) */
-        int stride = w * 4;
-        unsigned char *tmp = emalloc(stride);
-        unsigned char *data = (unsigned char *)ZSTR_VAL(buf);
-        for (int y = 0; y < h / 2; y++) {
-            unsigned char *top = data + y * stride;
-            unsigned char *bot = data + (h - 1 - y) * stride;
-            memcpy(tmp, top, stride);
-            memcpy(top, bot, stride);
-            memcpy(bot, tmp, stride);
-        }
-        efree(tmp);
-
         RETURN_NEW_STR(buf);
     }
-#endif
 
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
@@ -4198,34 +4178,14 @@ ZEND_FUNCTION(vio_save_screenshot)
     int w = ctx->config.width;
     int h = ctx->config.height;
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0) {
+    if (ctx->backend->read_pixels && strcmp(ctx->backend->name, "opengl") == 0) {
         size_t size = (size_t)w * h * 4;
         unsigned char *pixels = emalloc(size);
-
-        if (ctx->headless_fbo) {
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->headless_fbo);
-        }
-        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-
-        /* Flip vertically */
-        int stride = w * 4;
-        unsigned char *tmp = emalloc(stride);
-        for (int y = 0; y < h / 2; y++) {
-            unsigned char *top = pixels + y * stride;
-            unsigned char *bot = pixels + (h - 1 - y) * stride;
-            memcpy(tmp, top, stride);
-            memcpy(top, bot, stride);
-            memcpy(bot, tmp, stride);
-        }
-        efree(tmp);
-
-        int ok = stbi_write_png(path, w, h, 4, pixels, stride);
+        ctx->backend->read_pixels(ctx->headless_fbo, w, h, pixels);
+        int ok = stbi_write_png(path, w, h, 4, pixels, w * 4);
         efree(pixels);
-
         RETURN_BOOL(ok);
     }
-#endif
 
 #ifdef HAVE_METAL
     if (strcmp(ctx->backend->name, "metal") == 0) {
@@ -4478,28 +4438,10 @@ ZEND_FUNCTION(vio_recorder_capture)
     int w = ctx->config.width;
     int h = ctx->config.height;
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0) {
+    if (ctx->backend->read_pixels && strcmp(ctx->backend->name, "opengl") == 0) {
         size_t size = (size_t)w * h * 4;
         unsigned char *pixels = emalloc(size);
-
-        if (ctx->headless_fbo) {
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->headless_fbo);
-        }
-        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-
-        /* Flip vertically */
-        int stride = w * 4;
-        unsigned char *tmp = emalloc(stride);
-        for (int y = 0; y < h / 2; y++) {
-            unsigned char *top = pixels + y * stride;
-            unsigned char *bot = pixels + (h - 1 - y) * stride;
-            memcpy(tmp, top, stride);
-            memcpy(top, bot, stride);
-            memcpy(bot, tmp, stride);
-        }
-        efree(tmp);
-
+        ctx->backend->read_pixels(ctx->headless_fbo, w, h, pixels);
         int ret = vio_recorder_write_rgba(rec, pixels);
         efree(pixels);
 
@@ -4509,7 +4451,6 @@ ZEND_FUNCTION(vio_recorder_capture)
         }
         RETURN_TRUE;
     }
-#endif
 
     php_error_docref(NULL, E_WARNING, "Capture not supported for this backend");
     RETURN_FALSE;
@@ -4611,28 +4552,10 @@ ZEND_FUNCTION(vio_stream_push)
     int w = ctx->config.width;
     int h = ctx->config.height;
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0) {
+    if (ctx->backend->read_pixels && strcmp(ctx->backend->name, "opengl") == 0) {
         size_t size = (size_t)w * h * 4;
         unsigned char *pixels = emalloc(size);
-
-        if (ctx->headless_fbo) {
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->headless_fbo);
-        }
-        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-
-        /* Flip vertically */
-        int stride = w * 4;
-        unsigned char *tmp = emalloc(stride);
-        for (int y = 0; y < h / 2; y++) {
-            unsigned char *top = pixels + y * stride;
-            unsigned char *bot = pixels + (h - 1 - y) * stride;
-            memcpy(tmp, top, stride);
-            memcpy(top, bot, stride);
-            memcpy(bot, tmp, stride);
-        }
-        efree(tmp);
-
+        ctx->backend->read_pixels(ctx->headless_fbo, w, h, pixels);
         int ret = vio_stream_write_rgba(st, pixels);
         efree(pixels);
 
@@ -4642,7 +4565,6 @@ ZEND_FUNCTION(vio_stream_push)
         }
         RETURN_TRUE;
     }
-#endif
 
     php_error_docref(NULL, E_WARNING, "Stream push not supported for this backend");
     RETURN_FALSE;

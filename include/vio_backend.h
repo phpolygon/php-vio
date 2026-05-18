@@ -64,6 +64,15 @@ typedef struct _vio_backend {
     void  (*bind_render_target)(void *rt);
     void  (*unbind_render_target)(unsigned int default_fbo, int width, int height);
 
+    /* CPU-side framebuffer readback. The output buffer is RGBA8 in
+     * top-down row order (regardless of the backend's native orientation)
+     * and must hold at least width*height*4 bytes. fbo is consulted only
+     * by OpenGL (caller passes ctx->headless_fbo or 0); other backends
+     * ignore it and read from whatever staging the backend maintains.
+     * Returns 0 on success, non-zero when the backend lacks readback
+     * support — guard via VIO_FEATURE_READ_PIXELS. */
+    int   (*read_pixels)(unsigned int fbo, int width, int height, void *out_rgba);
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);
