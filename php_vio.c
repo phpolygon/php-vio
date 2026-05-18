@@ -1464,6 +1464,40 @@ ZEND_FUNCTION(vio_shader)
         }
     }
 
+    /* GLSL #version sanity check (Issue #3 part 3): if the user's shader asks
+     * for a GLSL version higher than the runtime context provides, the driver
+     * would emit a cryptic shader-compile error inside vio_opengl_compile_*.
+     * Catch it up front. Only relevant for OpenGL backends with text GLSL. */
+#ifdef HAVE_GLFW
+    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized &&
+        (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW)) {
+        int runtime_glsl = vio_opengl_get_glsl_version();
+        const char *sources[2] = { Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval) };
+        const char *stages[2]  = { "vertex", "fragment" };
+        for (int s = 0; s < 2; s++) {
+            /* Skip whitespace, look for #version */
+            const char *p = sources[s];
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            if (strncmp(p, "#version", 8) == 0) {
+                p += 8;
+                while (*p == ' ' || *p == '\t') p++;
+                int req = 0;
+                while (*p >= '0' && *p <= '9') {
+                    req = req * 10 + (*p - '0');
+                    p++;
+                }
+                if (req > runtime_glsl) {
+                    php_error_docref(NULL, E_WARNING,
+                        "vio_shader: %s shader requires GLSL >= %d, but runtime context "
+                        "provides %d. Lower the #version directive or run on a newer GPU.",
+                        stages[s], req, runtime_glsl);
+                    RETURN_FALSE;
+                }
+            }
+        }
+    }
+#endif
+
     /* Create VioShader object */
     zval shader_zval;
     object_init_ex(&shader_zval, vio_shader_ce);
@@ -6428,6 +6462,241 @@ ZEND_FUNCTION(vio_set_window_size)
 
     ctx->config.width  = (int)width;
     ctx->config.height = (int)height;
+}
+
+/* ── OpenGL diagnostics (Issue #3 part 3) ─────────────────────────── */
+
+ZEND_FUNCTION(vio_gl_info)
+{
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend ||
+        strcmp(ctx->backend->name, "opengl") != 0) {
+        RETURN_FALSE;
+    }
+
+#ifdef HAVE_GLFW
+    if (!vio_gl.initialized) {
+        RETURN_FALSE;
+    }
+
+    array_init(return_value);
+
+    char version_buf[32];
+    snprintf(version_buf, sizeof(version_buf), "%d.%d", vio_gl.gl_major, vio_gl.gl_minor);
+    add_assoc_string(return_value, "version", version_buf);
+    add_assoc_long(return_value, "glsl", vio_gl.glsl_version);
+
+    add_assoc_string(return_value, "renderer", vio_gl.renderer ? vio_gl.renderer : "");
+    add_assoc_string(return_value, "vendor",   vio_gl.vendor   ? vio_gl.vendor   : "");
+    add_assoc_string(return_value, "profile",  "core");
+
+    zval extensions;
+    array_init(&extensions);
+    for (int i = 0; i < vio_gl.extension_count; i++) {
+        if (vio_gl.extensions[i]) {
+            add_next_index_string(&extensions, vio_gl.extensions[i]);
+        }
+    }
+    add_assoc_zval(return_value, "extensions", &extensions);
+
+    zval features;
+    array_init(&features);
+    add_assoc_bool(&features, "compute_shader",          vio_gl.caps.has_compute_shader);
+    add_assoc_bool(&features, "tessellation",            vio_gl.caps.has_tessellation);
+    add_assoc_bool(&features, "separate_shader_objects", vio_gl.caps.has_separate_shaders);
+    add_assoc_bool(&features, "debug_output",            vio_gl.caps.has_debug_output);
+    add_assoc_bool(&features, "dsa",                     vio_gl.caps.has_dsa);
+    add_assoc_bool(&features, "buffer_storage",          vio_gl.caps.has_buffer_storage);
+    add_assoc_bool(&features, "texture_storage",         vio_gl.caps.has_texture_storage);
+    add_assoc_bool(&features, "texture_swizzle",         vio_gl.caps.has_texture_swizzle);
+    add_assoc_zval(return_value, "features", &features);
+    return;
+#else
+    RETURN_FALSE;
+#endif
+}
+
+/* ── Render-target API surface (Issue #4) ─────────────────────────── */
+/* Convenience wrappers around vio_render_target / vio_bind_render_target /
+ * vio_unbind_render_target. The dispatcher functions live further up; these
+ * just re-marshal arguments and call them. */
+
+ZEND_FUNCTION(vio_create_render_target)
+{
+    zval *ctx_zval;
+    zend_long width, height;
+    HashTable *options = NULL;
+
+    ZEND_PARSE_PARAMETERS_START(3, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(width)
+        Z_PARAM_LONG(height)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(options)
+    ZEND_PARSE_PARAMETERS_END();
+
+    /* Marshal the explicit (w, h, options) form into the array-config form
+     * that vio_render_target() expects, then call it. */
+    zval config_arr;
+    array_init(&config_arr);
+    add_assoc_long(&config_arr, "width", width);
+    add_assoc_long(&config_arr, "height", height);
+    if (options) {
+        zval *v;
+        if ((v = zend_hash_str_find(options, "format", sizeof("format") - 1)) != NULL &&
+            Z_TYPE_P(v) == IS_STRING) {
+            if (strcmp(Z_STRVAL_P(v), "rgba16f") == 0) {
+                add_assoc_bool(&config_arr, "hdr", 1);
+            }
+        }
+        if ((v = zend_hash_str_find(options, "depth", sizeof("depth") - 1)) != NULL) {
+            /* depth=true means "include a depth attachment" → not depth_only.
+             * depth=false (or missing) leaves depth_only at default. */
+            if (!zend_is_true(v)) {
+                add_assoc_bool(&config_arr, "depth_only", 1);
+            }
+        }
+        /* samples > 1 not yet wired through the vtable — silently dropped. */
+    }
+
+    zval args[2];
+    ZVAL_COPY_VALUE(&args[0], ctx_zval);
+    ZVAL_COPY_VALUE(&args[1], &config_arr);
+
+    zval result;
+    zend_call_known_function(
+        zend_hash_str_find_ptr(EG(function_table), "vio_render_target", sizeof("vio_render_target") - 1),
+        NULL, NULL, &result, 2, args, NULL);
+    zval_ptr_dtor(&config_arr);
+
+    RETURN_COPY_VALUE(&result);
+}
+
+ZEND_FUNCTION(vio_set_render_target)
+{
+    zval *ctx_zval, *rt_zval;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS_OR_NULL(rt_zval, vio_render_target_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zval result;
+    if (rt_zval) {
+        zval args[2];
+        ZVAL_COPY_VALUE(&args[0], ctx_zval);
+        ZVAL_COPY_VALUE(&args[1], rt_zval);
+        zend_call_known_function(
+            zend_hash_str_find_ptr(EG(function_table), "vio_bind_render_target", sizeof("vio_bind_render_target") - 1),
+            NULL, NULL, &result, 2, args, NULL);
+    } else {
+        zval args[1];
+        ZVAL_COPY_VALUE(&args[0], ctx_zval);
+        zend_call_known_function(
+            zend_hash_str_find_ptr(EG(function_table), "vio_unbind_render_target", sizeof("vio_unbind_render_target") - 1),
+            NULL, NULL, &result, 1, args, NULL);
+    }
+    zval_ptr_dtor(&result);
+}
+
+ZEND_FUNCTION(vio_destroy_render_target)
+{
+    zval *rt_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    /* Walk through the same destruction path the GC would take eventually,
+     * but right now. The Zend object stays alive (we only release the GPU
+     * resources); subsequent binds emit a warning because rt->valid is 0. */
+    vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rt_zval);
+    if (rt->backend && rt->backend->destroy_render_target) {
+        rt->backend->destroy_render_target(rt);
+    }
+    rt->valid = 0;
+}
+
+ZEND_FUNCTION(vio_push_render_target)
+{
+    zval *ctx_zval, *rt_zval;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (ctx->rt_stack_depth >= (int)(sizeof(ctx->rt_stack) / sizeof(ctx->rt_stack[0]))) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_push_render_target: stack depth exceeded (max %d); replacing top",
+            (int)(sizeof(ctx->rt_stack) / sizeof(ctx->rt_stack[0])));
+        ctx->rt_stack_depth--;  /* replace top with new push */
+    }
+
+    /* Store a refcounted zval copy so the RT survives GC while on the stack. */
+    zval *slot = (zval *)emalloc(sizeof(zval));
+    ZVAL_COPY(slot, rt_zval);
+    ctx->rt_stack[ctx->rt_stack_depth++] = slot;
+
+    /* Bind the new target. */
+    zval args[2];
+    ZVAL_COPY_VALUE(&args[0], ctx_zval);
+    ZVAL_COPY_VALUE(&args[1], rt_zval);
+    zval result;
+    zend_call_known_function(
+        zend_hash_str_find_ptr(EG(function_table), "vio_bind_render_target", sizeof("vio_bind_render_target") - 1),
+        NULL, NULL, &result, 2, args, NULL);
+    zval_ptr_dtor(&result);
+}
+
+ZEND_FUNCTION(vio_pop_render_target)
+{
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (ctx->rt_stack_depth == 0) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_pop_render_target: stack is empty; restoring default target");
+        zval args[1];
+        ZVAL_COPY_VALUE(&args[0], ctx_zval);
+        zval result;
+        zend_call_known_function(
+            zend_hash_str_find_ptr(EG(function_table), "vio_unbind_render_target", sizeof("vio_unbind_render_target") - 1),
+            NULL, NULL, &result, 1, args, NULL);
+        zval_ptr_dtor(&result);
+        return;
+    }
+
+    /* Drop the top entry. */
+    zval *top = (zval *)ctx->rt_stack[--ctx->rt_stack_depth];
+    zval_ptr_dtor(top);
+    efree(top);
+
+    /* Re-bind whatever's underneath (or the default target if empty). */
+    zval args[2];
+    zval result;
+    if (ctx->rt_stack_depth > 0) {
+        zval *new_top = (zval *)ctx->rt_stack[ctx->rt_stack_depth - 1];
+        ZVAL_COPY_VALUE(&args[0], ctx_zval);
+        ZVAL_COPY_VALUE(&args[1], new_top);
+        zend_call_known_function(
+            zend_hash_str_find_ptr(EG(function_table), "vio_bind_render_target", sizeof("vio_bind_render_target") - 1),
+            NULL, NULL, &result, 2, args, NULL);
+    } else {
+        ZVAL_COPY_VALUE(&args[0], ctx_zval);
+        zend_call_known_function(
+            zend_hash_str_find_ptr(EG(function_table), "vio_unbind_render_target", sizeof("vio_unbind_render_target") - 1),
+            NULL, NULL, &result, 1, args, NULL);
+    }
+    zval_ptr_dtor(&result);
 }
 
 /* ── Module lifecycle ─────────────────────────────────────────────── */

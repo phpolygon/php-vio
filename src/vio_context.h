@@ -34,6 +34,12 @@ typedef struct _vio_context_object {
     /* Backend-supplied offscreen render surface (OpenGL = FBO handle; other
      * backends leave 0 and use the swapchain backbuffer directly). */
     unsigned int       headless_fbo;
+    /* Push/pop stack for vio_push_render_target / vio_pop_render_target
+     * (Issue #4). Stores zval references to VioRenderTarget objects (or
+     * NULL for "default target"); depth is capped to keep recursion
+     * limited and to bound memory. */
+    void              *rt_stack[8];   /* zval * — kept opaque to avoid php.h here */
+    int                rt_stack_depth;
     zend_object        std;
 } vio_context_object;
 
