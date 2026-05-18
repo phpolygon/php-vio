@@ -1,8 +1,38 @@
 # OpenGL als eigenständiges Backend — Refactor-Plan
 
-> **Status:** Implementations-Plan, Branch `feat/opengl-standalone-backend`
+> **Status:** ✅ **Implementiert** auf Branch `feat/opengl-standalone-backend` (22 Commits, 66/66 Tests grün, 0 funktionale GL-Calls außerhalb `src/backends/opengl/`).
 > **Schließt:** [#2](https://github.com/phpolygon/php-vio/issues/2), [#3](https://github.com/phpolygon/php-vio/issues/3), [#4](https://github.com/phpolygon/php-vio/issues/4)
 > **Vorlage:** `v2-architecture.md` §2.1, §8 Phase 1 + Phase 3 (OpenGL-spezifisch)
+>
+> ## Ist-Stand
+>
+> | Phase | Etappe | Commit | Status |
+> |-------|--------|--------|--------|
+> | A | 0 — Static-Build-Fix (#2) | `22f3008` | ✅ |
+> | B | 1 — Vtable-Destructors (mesh/cubemap/font/RT) | `88cdcd6` | ✅ |
+> | B | 2 — Capability-Enum + GL-Extension-Cache (#3 Part 2) | `c89b962` | ✅ |
+> | C | 3 — `vio_2d.c` → `vio_2d_opengl.c` Lift | `2675e7e` | ✅ |
+> | C | 4a — Render-Target-Lifecycle | `9524bec` | ✅ |
+> | C | 4c — `glReadPixels` | `6919afe` | ✅ |
+> | C | 4d — Headless-FBO-Lifecycle | `ab1f4c6` | ✅ |
+> | C | 4e — Pipeline-State-Binding | `95c4d95` | ✅ |
+> | C | 4f — `vio_viewport` | `ac5bdb7` | ✅ |
+> | C | 4g — Mesh-Create | `4218dc8` | ✅ |
+> | C | 4h — Texture-Upload | `bfde657` | ✅ |
+> | C | 4i — `vio_set_uniform` | `2810a0e` | ✅ |
+> | C | 4j — Draw + Draw-Instanced | `c9ff647` | ✅ |
+> | C | 4k — Uniform-Buffer + Bind-Texture | `9ea3e8c` | ✅ |
+> | C | 4l — Font-Atlas + Cubemap-Bind | `69ca927` | ✅ |
+> | C | 4m — Cubemap-Upload + Draw-State-Reset | `d49c2d6` | ✅ |
+> | C | 4n — Buffer/Texture/Shader-Destruktoren | `1925ee4` | ✅ |
+> | E | 6 — Audit-Gate-Test (`tests/070_*.phpt`) | `6a4d6a5` | ✅ |
+> | E | 7 — `vio_gl_info` + GLSL-Version-Check + RT-API (#3 Part 3, #4) | `87e5ee8` | ✅ |
+>
+> **Audit-Gate-Trend GL-Refs in `php_vio.c`:** 188 (Start) → 130 (Etappe 4d) → 108 (4e) → 68 (4i) → 26 (4l) → 4 (4m, alles in Kommentaren). **Funktional 0.**
+>
+> **Test-Stand:** 72 Tests (von 69 vor Branch-Start +3 neue: `070_audit_gate`, `071_gl_info_and_shader_version`, `072_render_target_api`); 66 pass / 6 skip (Windows-only + cross-backend) / 0 fail.
+>
+> **Nicht erledigt (Follow-up):** D3D11/D3D12 nutzen die neuen Vtable-Methoden noch nicht — ihre RT/Cubemap/State/ReadPixels-Pfade bleiben als `#ifdef HAVE_D3D11/12`-Blöcke in `php_vio.c`. Etappen 4a-4n sind dort daher *parallel* zur OpenGL-Vtable wirksam, nicht statt. Diese Lifts brauchen Windows-Verifikation und gehören in einen separaten Branch.
 
 ---
 
