@@ -60,6 +60,7 @@ tests/*.sh
 tests/*.diff
 tests/*.log
 tests/*.out
+tests/*.php
 tests/*.skip.php
 
 # Ad-hoc debug output

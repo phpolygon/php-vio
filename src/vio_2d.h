@@ -72,11 +72,6 @@ typedef struct _vio_2d_state {
     int             item_count;
     int             item_capacity;
     float           projection[16];
-    unsigned int    shader_shapes;
-    unsigned int    shader_sprites;
-    unsigned int    vao;
-    unsigned int    vbo;
-    int             vbo_capacity;     /* current GPU buffer size in vertices */
     int             initialized;
     vio_2d_backend  backend;
     int             width, height;
@@ -87,7 +82,8 @@ typedef struct _vio_2d_state {
     /* Scissor stack */
     vio_2d_scissor_rect scissor_stack[VIO_2D_MAX_SCISSOR_STACK];
     int                 scissor_depth;
-    /* D3D11/D3D12 state (opaque pointers to avoid header deps) */
+    /* Per-backend state (opaque pointers to avoid header deps) */
+    void           *opengl_state;
     void           *d3d_state;
 } vio_2d_state;
 
