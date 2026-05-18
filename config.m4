@@ -255,6 +255,11 @@ if test "$PHP_VIO" != "no"; then
   esac
 
   dnl ── Source files ────────────────────────────────────────────────
+  dnl Extra cflags shared by all vio sources. Defined as a shell var so the
+  dnl special-flag sources below (Metal, VMA) can reuse the same include set
+  dnl without drifting out of sync with the main PHP_NEW_EXTENSION call.
+  VIO_EXTRA_CFLAGS="-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DGL_SILENCE_DEPRECATION -I@ext_srcdir@/vendor/glad/include -I@ext_srcdir@/include -I@ext_srcdir@/vendor/vma -I@ext_srcdir@/vendor/miniaudio"
+
   PHP_NEW_EXTENSION(vio,
     php_vio.c \
     src/vio_context.c \
@@ -285,7 +290,53 @@ if test "$PHP_VIO" != "no"; then
     vendor/stb/stb_truetype_impl.c \
     vendor/stb/stb_image_write_impl.c \
     vendor/miniaudio/miniaudio_impl.c,
-    $ext_shared,, -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DGL_SILENCE_DEPRECATION -I@ext_srcdir@/vendor/glad/include -I@ext_srcdir@/include -I@ext_srcdir@/vendor/vma -I@ext_srcdir@/vendor/miniaudio)
+    $ext_shared,, $VIO_EXTRA_CFLAGS)
+
+  dnl ── Special-flag sources (Issue #2) ─────────────────────────────
+  dnl
+  dnl Metal (.m) and the VMA C++ wrapper (.cpp) used to live in
+  dnl Makefile.frag with custom compile rules that only fed
+  dnl `shared_objects_vio`. That broke static builds (e.g. via
+  dnl static-php-cli), where extension objects must land in
+  dnl PHP_GLOBAL_OBJS instead — the .lo's from Makefile.frag were
+  dnl orphaned and the final binary missed the Metal/VMA symbols.
+  dnl
+  dnl Routing them through PHP_ADD_SOURCES_X here makes the build
+  dnl machinery pick the correct target variable based on $ext_shared,
+  dnl exactly like PHP_NEW_EXTENSION does for the regular sources.
+  dnl PHP_ADD_SOURCES_X only handles .c/.cpp/.s/.S — for Metal we
+  dnl compile a .c shim that #include's vio_metal.m, with
+  dnl -x objective-c -fobjc-arc passed as per-source flags.
+
+  dnl Substitute @ext_srcdir@/@ext_builddir@ the same way PHP_NEW_EXTENSION
+  dnl does internally, so include paths in VIO_EXTRA_CFLAGS resolve.
+  VIO_EXTRA_CFLAGS_RESOLVED=$(echo "$VIO_EXTRA_CFLAGS" | $SED s#@ext_srcdir@#$ext_srcdir#g | $SED s#@ext_builddir@#$ext_builddir#g)
+
+  if test "$VIO_HAS_METAL" = "yes"; then
+    if test "$ext_shared" != "shared" && test "$ext_shared" != "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/backends/metal/vio_metal.c],
+        -x objective-c -fobjc-arc $VIO_EXTRA_CFLAGS_RESOLVED,
+        PHP_GLOBAL_OBJS)
+    fi
+    if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/backends/metal/vio_metal.c],
+        -x objective-c -fobjc-arc $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
+        shared_objects_vio, yes)
+    fi
+  fi
+
+  if test "$VIO_HAS_VULKAN" = "yes"; then
+    if test "$ext_shared" != "shared" && test "$ext_shared" != "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/backends/vulkan/vio_vma_wrapper.cpp],
+        -std=c++14 -DVMA_STATIC_VULKAN_FUNCTIONS=0 $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED,
+        PHP_GLOBAL_OBJS)
+    fi
+    if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/backends/vulkan/vio_vma_wrapper.cpp],
+        -std=c++14 -DVMA_STATIC_VULKAN_FUNCTIONS=0 $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
+        shared_objects_vio, yes)
+    fi
+  fi
 
   PHP_SUBST(VIO_SHARED_LIBADD)
   PHP_SUBST(VIO_HAS_VULKAN)
@@ -344,9 +395,5 @@ if test "$PHP_VIO" != "no"; then
       fi
       ;;
   esac
-
-  dnl ── VMA C++ wrapper object (compiled via Makefile.frag rule) ──
-  PHP_ADD_MAKEFILE_FRAGMENT
-
 
 fi
