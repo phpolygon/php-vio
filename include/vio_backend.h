@@ -116,6 +116,20 @@ typedef struct _vio_backend {
                                const void *pixels, int width, int height, int channels,
                                int filter, int wrap, int mipmaps);
 
+    /* Draw a mesh with the currently bound pipeline. For OpenGL this binds
+     * the mesh's VAO and issues glDrawArrays/glDrawElements; falls back to
+     * the default shader when no pipeline is bound. D3D / Vulkan / Metal
+     * leave it NULL — they use the cmd-based draw / draw_indexed slots
+     * with the vio_draw_cmd struct instead. */
+    void  (*draw_mesh)(void *mesh_obj);
+
+    /* Instanced version. matrices is instance_count * 16 floats (column-major
+     * mat4). OpenGL spins up a transient instance-VBO, binds it at
+     * locations 3..6 with attribute-divisor=1, draws, then tears the
+     * divisor binding back down. */
+    void  (*draw_mesh_instanced)(void *mesh_obj,
+                                 const float *matrices_4x4, int instance_count);
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);

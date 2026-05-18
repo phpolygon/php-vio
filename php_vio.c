@@ -1310,33 +1310,9 @@ ZEND_FUNCTION(vio_draw)
         return;
     }
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        /* Use pipeline-bound shader if available, otherwise fall back to defaults */
-        if (ctx->bound_shader_program) {
-            /* Pipeline already called glUseProgram; just bind VAO and draw */
-        } else {
-            unsigned int shader = mesh->has_colors
-                ? vio_gl.default_shader_program
-                : vio_gl.default_shader_pos_only;
-            glUseProgram(shader);
-        }
-
-        glBindVertexArray(mesh->vao);
-
-        if (mesh->index_count > 0) {
-            glDrawElements(GL_TRIANGLES, mesh->index_count, GL_UNSIGNED_INT, 0);
-        } else {
-            glDrawArrays(GL_TRIANGLES, 0, mesh->vertex_count);
-        }
-
-        glBindVertexArray(0);
-
-        if (!ctx->bound_shader_program) {
-            glUseProgram(0);
-        }
+    if (ctx->backend->draw_mesh) {
+        ctx->backend->draw_mesh(mesh);
     }
-#endif
 
     /* Backend draw (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0) {
@@ -5187,46 +5163,9 @@ ZEND_FUNCTION(vio_draw_instanced)
         return;
     }
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        size_t total_floats = (size_t)instance_count * 16;
-
-        /* Create instance VBO with model matrices */
-        unsigned int instance_vbo;
-        glGenBuffers(1, &instance_vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, instance_vbo);
-        glBufferData(GL_ARRAY_BUFFER, mat_size, mat_data, GL_STREAM_DRAW);
-
-        /* Bind mesh VAO and set up instance attribute pointers (locations 3-6 for mat4) */
-        glBindVertexArray(mesh->vao);
-
-        for (int col = 0; col < 4; col++) {
-            unsigned int loc = 3 + col;
-            glEnableVertexAttribArray(loc);
-            glVertexAttribPointer(loc, 4, GL_FLOAT, GL_FALSE,
-                sizeof(float) * 16, (void *)(sizeof(float) * 4 * col));
-            glVertexAttribDivisor(loc, 1);
-        }
-
-        /* Draw instanced */
-        if (mesh->index_count > 0) {
-            glDrawElementsInstanced(GL_TRIANGLES, mesh->index_count,
-                GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
-        } else {
-            glDrawArraysInstanced(GL_TRIANGLES, 0, mesh->vertex_count,
-                (GLsizei)instance_count);
-        }
-
-        /* Clean up instance attributes */
-        for (int col = 0; col < 4; col++) {
-            glVertexAttribDivisor(3 + col, 0);
-            glDisableVertexAttribArray(3 + col);
-        }
-
-        glBindVertexArray(0);
-        glDeleteBuffers(1, &instance_vbo);
+    if (ctx->backend->draw_mesh_instanced) {
+        ctx->backend->draw_mesh_instanced(mesh, mat_data, (int)instance_count);
     }
-#endif
 
     /* Backend instanced draw (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0 && mesh->backend_vb) {

@@ -427,6 +427,79 @@ static void opengl_set_uniform(const char *name, const void *data, int count, in
     }
 }
 
+static void opengl_draw_mesh(void *mesh_obj)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
+    if (!vio_gl.initialized) return;
+
+    /* If no pipeline bound a program, fall back to the built-in default
+     * (color-aware or pos-only depending on the mesh's vertex layout). */
+    GLint current_program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &current_program);
+    int used_default = 0;
+    if (current_program <= 0) {
+        GLuint fallback = mesh->has_colors
+            ? vio_gl.default_shader_program
+            : vio_gl.default_shader_pos_only;
+        glUseProgram(fallback);
+        used_default = 1;
+    }
+
+    glBindVertexArray(mesh->vao);
+    if (mesh->index_count > 0) {
+        glDrawElements(GL_TRIANGLES, mesh->index_count, GL_UNSIGNED_INT, 0);
+    } else {
+        glDrawArrays(GL_TRIANGLES, 0, mesh->vertex_count);
+    }
+    glBindVertexArray(0);
+
+    if (used_default) {
+        glUseProgram(0);
+    }
+}
+
+static void opengl_draw_mesh_instanced(void *mesh_obj,
+                                       const float *matrices, int instance_count)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
+    if (!vio_gl.initialized || instance_count <= 0) return;
+
+    /* Transient instance-VBO populated with the column-major mat4 stream. */
+    GLuint instance_vbo = 0;
+    glGenBuffers(1, &instance_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, instance_vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 (GLsizeiptr)((size_t)instance_count * 16 * sizeof(float)),
+                 matrices, GL_STREAM_DRAW);
+
+    /* Bind mesh VAO and wire the per-instance matrix attributes at locations
+     * 3..6 (one vec4 per column). Divisor=1 advances them per instance. */
+    glBindVertexArray(mesh->vao);
+    for (int col = 0; col < 4; col++) {
+        GLuint loc = (GLuint)(3 + col);
+        glEnableVertexAttribArray(loc);
+        glVertexAttribPointer(loc, 4, GL_FLOAT, GL_FALSE,
+                              sizeof(float) * 16,
+                              (void *)(uintptr_t)(sizeof(float) * 4 * col));
+        glVertexAttribDivisor(loc, 1);
+    }
+
+    if (mesh->index_count > 0) {
+        glDrawElementsInstanced(GL_TRIANGLES, mesh->index_count,
+                                GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
+    } else {
+        glDrawArraysInstanced(GL_TRIANGLES, 0, mesh->vertex_count,
+                              (GLsizei)instance_count);
+    }
+
+    for (int col = 0; col < 4; col++) {
+        glVertexAttribDivisor((GLuint)(3 + col), 0);
+        glDisableVertexAttribArray((GLuint)(3 + col));
+    }
+    glBindVertexArray(0);
+    glDeleteBuffers(1, &instance_vbo);
+}
+
 static int opengl_upload_texture_2d(void *tex_obj,
                                     const void *pixels, int width, int height, int channels,
                                     int filter, int wrap, int mipmaps)
@@ -709,6 +782,8 @@ static const vio_backend opengl_backend = {
     .bind_pipeline_state   = opengl_bind_pipeline_state,
     .create_mesh           = opengl_create_mesh,
     .upload_texture_2d     = opengl_upload_texture_2d,
+    .draw_mesh             = opengl_draw_mesh,
+    .draw_mesh_instanced   = opengl_draw_mesh_instanced,
 };
 
 void vio_backend_opengl_register(void)
