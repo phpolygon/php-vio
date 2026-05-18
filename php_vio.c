@@ -5118,14 +5118,7 @@ ZEND_FUNCTION(vio_viewport)
         return;
     }
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0) {
-        glViewport((GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h);
-    }
-#endif
-
-    /* Backend viewport */
-    if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->set_viewport) {
+    if (ctx->backend->set_viewport) {
         ctx->backend->set_viewport((int)x, (int)y, (int)w, (int)h);
     }
 }
