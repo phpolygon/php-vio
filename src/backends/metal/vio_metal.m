@@ -890,7 +890,18 @@ static void  metal_destroy_texture(void *tex) { (void)tex; }
 static void  metal_draw(vio_draw_cmd *cmd) { (void)cmd; }
 static void  metal_draw_indexed(vio_draw_indexed_cmd *cmd) { (void)cmd; }
 static void  metal_dispatch_compute(vio_compute_cmd *cmd) { (void)cmd; }
-static int   metal_supports_feature(vio_feature f) { (void)f; return 0; }
+static int metal_supports_feature(vio_feature f)
+{
+    switch (f) {
+    case VIO_FEATURE_3D_PIPELINE:
+        /* TODO(metal-3d): 3D pipeline / buffer / texture / draw are stubbed
+         * out (see comment above metal_create_pipeline). Flip to 1 once the
+         * Metal 3D path is wired so vio_get_auto_backend can prefer Metal. */
+        return 0;
+    default:
+        return 0;
+    }
+}
 
 /* ── Backend registration ────────────────────────────────────────── */
 

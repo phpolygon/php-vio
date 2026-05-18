@@ -1596,6 +1596,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_GEOMETRY:     return 1;
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
         case VIO_FEATURE_MULTIVIEW:    return 0;
+        case VIO_FEATURE_3D_PIPELINE:  return 1;
         default:                       return 0;
     }
 }

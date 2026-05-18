@@ -123,6 +123,13 @@ typedef enum _vio_feature {
     VIO_FEATURE_TESSELLATION = 2,
     VIO_FEATURE_GEOMETRY     = 3,
     VIO_FEATURE_MULTIVIEW    = 4,
+    /* Backend has a wired 3D draw pipeline (create_pipeline / create_buffer /
+     * create_texture / draw / draw_indexed all functional). Returns 0 when
+     * the backend's 3D path is stubbed out, so callers can pick a different
+     * backend instead of silently rendering black. 2D-only paths (vio_rect,
+     * vio_sprite, vio_text) are independent and may work even when this
+     * flag is 0 (e.g. Metal currently has 2D wired but no 3D). */
+    VIO_FEATURE_3D_PIPELINE  = 5,
 } vio_feature;
 
 /* ── Input actions ────────────────────────────────────────────────── */
