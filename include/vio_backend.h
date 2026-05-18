@@ -158,6 +158,19 @@ typedef struct _vio_backend {
     int   (*upload_font_atlas)(void *font_obj, int width, int height,
                                const unsigned char *r8_data, int swizzle_red_to_alpha);
 
+    /* Reset bound draw state (VAO / shader program / etc.) after a 3D pass
+     * so subsequent 2D batches or render-target switches start from a known
+     * baseline. OpenGL does glBindVertexArray(0) + glUseProgram(0); other
+     * backends manage this implicitly per draw and leave the slot NULL. */
+    void  (*flush_draw_state)(void);
+
+    /* Cubemap upload — six RGBA8 face buffers of the same dimensions. Writes
+     * cm->texture_id (OpenGL) or cm->d3d11_* / cm->d3d12_* (D3D). Returns 0
+     * on success. The caller marshals the source data (stbi_load or PHP
+     * arrays) into the face_rgba array up front. */
+    int   (*upload_cubemap)(void *cm_obj, int width, int height,
+                            const void *face_rgba[6]);
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);
