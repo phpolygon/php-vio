@@ -2937,20 +2937,9 @@ ZEND_FUNCTION(vio_font)
 
     vio_font_pack_atlas(font, atlas_bitmap, atlas_size);
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        glGenTextures(1, &font->atlas_texture);
-        glBindTexture(GL_TEXTURE_2D, font->atlas_texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, atlas_size, atlas_size,
-            0, GL_RED, GL_UNSIGNED_BYTE, atlas_bitmap);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        /* Swizzle: red channel -> alpha for proper text blending */
-        GLint swizzle[] = {GL_ONE, GL_ONE, GL_ONE, GL_RED};
-        glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzle);
-        glBindTexture(GL_TEXTURE_2D, 0);
+    if (ctx->backend->upload_font_atlas) {
+        ctx->backend->upload_font_atlas(font, atlas_size, atlas_size, atlas_bitmap, 1);
     }
-#endif
 
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
@@ -2995,12 +2984,6 @@ ZEND_FUNCTION(vio_font)
         desc.mipmaps = 0;
         font->atlas_backend_texture = ctx->backend->create_texture(&desc);
         efree(rgba);
-    }
-#endif
-
-#ifdef HAVE_METAL
-    if (strcmp(ctx->backend->name, "metal") == 0) {
-        font->atlas_texture = vio_metal_create_font_atlas(atlas_size, atlas_size, atlas_bitmap);
     }
 #endif
 
@@ -6400,12 +6383,9 @@ ZEND_FUNCTION(vio_bind_cubemap)
         return;
     }
 
-#ifdef HAVE_GLFW
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-        glActiveTexture(GL_TEXTURE0 + (GLenum)slot);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, cm->texture_id);
+    if (ctx->backend->bind_cubemap_id) {
+        ctx->backend->bind_cubemap_id(cm->texture_id, (int)slot);
     }
-#endif
 
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized &&

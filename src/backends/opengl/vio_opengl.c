@@ -464,6 +464,34 @@ static void opengl_bind_texture_id(unsigned int texture_id, int slot)
     glBindTexture(GL_TEXTURE_2D, texture_id);
 }
 
+static void opengl_bind_cubemap_id(unsigned int texture_id, int slot)
+{
+    if (!vio_gl.initialized) return;
+    glActiveTexture(GL_TEXTURE0 + (GLenum)slot);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, texture_id);
+}
+
+static int opengl_upload_font_atlas(void *font_obj, int width, int height,
+                                    const unsigned char *r8_data, int swizzle_red_to_alpha)
+{
+    vio_font_object *font = (vio_font_object *)font_obj;
+    if (!vio_gl.initialized) return -1;
+
+    glGenTextures(1, &font->atlas_texture);
+    glBindTexture(GL_TEXTURE_2D, font->atlas_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, width, height,
+                 0, GL_RED, GL_UNSIGNED_BYTE, r8_data);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    if (swizzle_red_to_alpha) {
+        /* Sample .a returns the R8 coverage — the shader expects alpha. */
+        GLint swizzle[] = {GL_ONE, GL_ONE, GL_ONE, GL_RED};
+        glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzle);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return 0;
+}
+
 static void opengl_draw_mesh(void *mesh_obj)
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
@@ -825,6 +853,8 @@ static const vio_backend opengl_backend = {
     .update_uniform_buffer = opengl_update_uniform_buffer,
     .bind_uniform_buffer   = opengl_bind_uniform_buffer,
     .bind_texture_id       = opengl_bind_texture_id,
+    .bind_cubemap_id       = opengl_bind_cubemap_id,
+    .upload_font_atlas     = opengl_upload_font_atlas,
 };
 
 void vio_backend_opengl_register(void)

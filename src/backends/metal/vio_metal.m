@@ -926,6 +926,15 @@ static void metal_destroy_font_atlas(void *font_ptr)
     }
 }
 
+static int metal_upload_font_atlas(void *font_obj, int width, int height,
+                                   const unsigned char *r8_data, int swizzle_red_to_alpha)
+{
+    (void)swizzle_red_to_alpha;  /* Metal's path handles channel mapping internally */
+    vio_font_object *font = (vio_font_object *)font_obj;
+    font->atlas_texture = vio_metal_create_font_atlas(width, height, r8_data);
+    return font->atlas_texture ? 0 : -1;
+}
+
 /* ── Backend registration ────────────────────────────────────────── */
 
 static const vio_backend metal_backend = {
@@ -956,6 +965,7 @@ static const vio_backend metal_backend = {
     .dispatch_compute  = metal_dispatch_compute,
     .supports_feature  = metal_supports_feature,
     .destroy_font_atlas = metal_destroy_font_atlas,
+    .upload_font_atlas  = metal_upload_font_atlas,
 };
 
 void vio_backend_metal_register(void)
