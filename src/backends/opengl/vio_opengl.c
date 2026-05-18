@@ -26,6 +26,7 @@
 #include "../../vio_render_target.h"
 #include "../../vio_cubemap.h"
 #include "../../vio_font.h"
+#include "../../vio_pipeline.h"
 
 vio_opengl_state vio_gl = {0};
 
@@ -380,6 +381,49 @@ static void opengl_unbind_render_target(unsigned int default_fbo, int width, int
     }
 }
 
+static void opengl_bind_pipeline_state(void *pipe_ptr)
+{
+    vio_pipeline_object *pipe = (vio_pipeline_object *)pipe_ptr;
+    if (!vio_gl.initialized || !pipe) return;
+
+    glUseProgram(pipe->shader_program);
+
+    if (pipe->cull_mode == VIO_CULL_NONE) {
+        glDisable(GL_CULL_FACE);
+    } else {
+        glEnable(GL_CULL_FACE);
+        glCullFace(pipe->cull_mode == VIO_CULL_BACK ? GL_BACK : GL_FRONT);
+    }
+
+    if (pipe->depth_test) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(pipe->depth_func == VIO_DEPTH_LEQUAL ? GL_LEQUAL : GL_LESS);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+    }
+
+    if (pipe->depth_bias != 0.0f || pipe->slope_scaled_depth_bias != 0.0f) {
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(pipe->slope_scaled_depth_bias, pipe->depth_bias);
+    } else {
+        glDisable(GL_POLYGON_OFFSET_FILL);
+    }
+
+    switch (pipe->blend) {
+        case VIO_BLEND_NONE:
+            glDisable(GL_BLEND);
+            break;
+        case VIO_BLEND_ALPHA:
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            break;
+        case VIO_BLEND_ADDITIVE:
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            break;
+    }
+}
+
 static unsigned int opengl_setup_headless(int width, int height)
 {
     if (!vio_gl.initialized) return 0;
@@ -540,6 +584,7 @@ static const vio_backend opengl_backend = {
     .read_pixels           = opengl_read_pixels,
     .setup_headless        = opengl_setup_headless,
     .teardown_headless     = opengl_teardown_headless,
+    .bind_pipeline_state   = opengl_bind_pipeline_state,
 };
 
 void vio_backend_opengl_register(void)

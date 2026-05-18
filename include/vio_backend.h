@@ -83,6 +83,15 @@ typedef struct _vio_backend {
     unsigned int (*setup_headless)(int width, int height);
     void  (*teardown_headless)(unsigned int fbo);
 
+    /* Configure draw-pipeline state for the next draw call. Takes the full
+     * vio_pipeline_object * (cast to void *) so the backend can read the
+     * topology / cull_mode / depth_test / depth_bias / blend / shader_program
+     * fields directly. OpenGL implements this; D3D11/D3D12/Vulkan/Metal pack
+     * their state into a backend_pipeline object at pipeline-creation time
+     * and rely on bind_pipeline(backend_pipeline) instead, so they leave
+     * this NULL. */
+    void  (*bind_pipeline_state)(void *pipe);
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);
