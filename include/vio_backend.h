@@ -143,6 +143,21 @@ typedef struct _vio_backend {
      * instead. */
     void  (*bind_texture_id)(unsigned int texture_id, int slot);
 
+    /* OpenGL-side cubemap bind (separate from the 2D-texture path because
+     * GL has distinct GL_TEXTURE_CUBE_MAP / GL_TEXTURE_2D bind targets).
+     * D3D / Vulkan / Metal handle cubemap binds via their bind_cubemap
+     * slot below. */
+    void  (*bind_cubemap_id)(unsigned int texture_id, int slot);
+
+    /* Upload a font atlas (R8 single-channel bitmap) into font_obj. OpenGL
+     * uses GL_RED + texture swizzle so the shader can sample .a; Metal calls
+     * its own create_font_atlas helper; D3D11/D3D12 use the
+     * upload_font_atlas-via-RGBA-expansion path that stays inline in
+     * php_vio.c (NULL slot for them). swizzle_red_to_alpha is a hint —
+     * backends without TEXTURE_SWIZZLE expand to RGBA on the CPU. */
+    int   (*upload_font_atlas)(void *font_obj, int width, int height,
+                               const unsigned char *r8_data, int swizzle_red_to_alpha);
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);
