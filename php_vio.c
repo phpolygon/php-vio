@@ -184,33 +184,20 @@ ZEND_FUNCTION(vio_create)
                 RETURN_FALSE;
             }
 
-            /* Headless: create FBO for offscreen rendering */
-            if (ctx->config.headless) {
-                int w = ctx->config.width;
-                int h = ctx->config.height;
-
-                glGenFramebuffers(1, &ctx->headless_fbo);
-                glBindFramebuffer(GL_FRAMEBUFFER, ctx->headless_fbo);
-
-                glGenRenderbuffers(1, &ctx->headless_color_rb);
-                glBindRenderbuffer(GL_RENDERBUFFER, ctx->headless_color_rb);
-                glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, w, h);
-                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, ctx->headless_color_rb);
-
-                glGenRenderbuffers(1, &ctx->headless_depth_rb);
-                glBindRenderbuffer(GL_RENDERBUFFER, ctx->headless_depth_rb);
-                glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
-                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, ctx->headless_depth_rb);
-
-                if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            /* Headless: ask the backend to set up its offscreen target. For
+             * OpenGL that means an FBO with RGBA8 + depth/stencil renderbuffers;
+             * other backends (D3D/Vulkan/Metal) keep the swapchain backbuffer
+             * offscreen by themselves and leave setup_headless NULL. */
+            if (ctx->config.headless && ctx->backend->setup_headless) {
+                ctx->headless_fbo = ctx->backend->setup_headless(
+                    ctx->config.width, ctx->config.height);
+                if (!ctx->headless_fbo) {
                     php_error_docref(NULL, E_WARNING, "Headless FBO is not complete");
-                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
                     vio_window_destroy(ctx->window);
                     ctx->window = NULL;
                     zval_ptr_dtor(&obj);
                     RETURN_FALSE;
                 }
-                /* Keep FBO bound for all subsequent rendering */
             }
         }
 
@@ -305,15 +292,11 @@ ZEND_FUNCTION(vio_destroy)
             ctx->backend->destroy_surface(ctx->surface);
             ctx->surface = NULL;
         }
-#ifdef HAVE_GLFW
-        /* Cleanup headless FBO before destroying GL context */
-        if (ctx->headless_fbo) {
-            glDeleteFramebuffers(1, &ctx->headless_fbo);
-            glDeleteRenderbuffers(1, &ctx->headless_color_rb);
-            glDeleteRenderbuffers(1, &ctx->headless_depth_rb);
+        /* Cleanup headless FBO before tearing down the backend context. */
+        if (ctx->headless_fbo && ctx->backend->teardown_headless) {
+            ctx->backend->teardown_headless(ctx->headless_fbo);
             ctx->headless_fbo = 0;
         }
-#endif
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }
@@ -475,13 +458,13 @@ ZEND_FUNCTION(vio_begin)
 
     vio_2d_begin(&ctx->state_2d);
 
-#ifdef HAVE_GLFW
-    /* Bind headless FBO before begin_frame so clear/draw go to offscreen target */
-    if (ctx->headless_fbo && vio_gl.initialized) {
-        glBindFramebuffer(GL_FRAMEBUFFER, ctx->headless_fbo);
-        glViewport(0, 0, ctx->config.width, ctx->config.height);
+    /* Bind headless FBO before begin_frame so clear/draw go to offscreen
+     * target. The unbind_render_target slot does exactly "bind default FBO
+     * and set viewport"; reusing it keeps the dispatch consistent. */
+    if (ctx->headless_fbo && ctx->backend->unbind_render_target) {
+        ctx->backend->unbind_render_target(ctx->headless_fbo,
+            ctx->config.width, ctx->config.height);
     }
-#endif
 
     if (ctx->backend->begin_frame) {
         ctx->backend->begin_frame();

@@ -31,10 +31,9 @@ typedef struct _vio_context_object {
     /* Currently bound pipeline shader (0 = use default) */
     unsigned int       bound_shader_program;
     void              *bound_shader_object;  /* vio_shader_object* for uniform cbuffer */
-    /* Headless FBO (OpenGL) */
+    /* Backend-supplied offscreen render surface (OpenGL = FBO handle; other
+     * backends leave 0 and use the swapchain backbuffer directly). */
     unsigned int       headless_fbo;
-    unsigned int       headless_color_rb;
-    unsigned int       headless_depth_rb;
     zend_object        std;
 } vio_context_object;
 
