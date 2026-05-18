@@ -387,6 +387,43 @@ static void opengl_unbind_render_target(unsigned int default_fbo, int width, int
     }
 }
 
+static int opengl_create_mesh(void *mesh_obj,
+                              const void *vertex_data, int vertex_data_size,
+                              int stride,
+                              const vio_mesh_attrib *layout, int layout_count,
+                              const unsigned int *indices, int index_count)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
+    if (!vio_gl.initialized) return -1;
+
+    glGenVertexArrays(1, &mesh->vao);
+    glGenBuffers(1, &mesh->vbo);
+
+    glBindVertexArray(mesh->vao);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertex_data_size, vertex_data, GL_STATIC_DRAW);
+
+    for (int i = 0; i < layout_count; i++) {
+        glVertexAttribPointer((GLuint)layout[i].location,
+                              (GLint)layout[i].components,
+                              GL_FLOAT, GL_FALSE,
+                              (GLsizei)stride,
+                              (void *)(intptr_t)layout[i].offset);
+        glEnableVertexAttribArray((GLuint)layout[i].location);
+    }
+
+    if (indices && index_count > 0) {
+        glGenBuffers(1, &mesh->ebo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh->ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     sizeof(unsigned int) * (size_t)index_count,
+                     indices, GL_STATIC_DRAW);
+    }
+
+    glBindVertexArray(0);
+    return 0;
+}
+
 static void opengl_bind_pipeline_state(void *pipe_ptr)
 {
     vio_pipeline_object *pipe = (vio_pipeline_object *)pipe_ptr;
@@ -592,6 +629,7 @@ static const vio_backend opengl_backend = {
     .setup_headless        = opengl_setup_headless,
     .teardown_headless     = opengl_teardown_headless,
     .bind_pipeline_state   = opengl_bind_pipeline_state,
+    .create_mesh           = opengl_create_mesh,
 };
 
 void vio_backend_opengl_register(void)

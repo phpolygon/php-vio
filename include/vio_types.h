@@ -199,6 +199,15 @@ typedef struct _vio_vertex_attrib {
     vio_usage  usage;
 } vio_vertex_attrib;
 
+/* Mesh-level per-attribute description used by the create_mesh vtable slot.
+ * Simpler than vio_vertex_attrib (no semantic usage), since mesh upload only
+ * needs to know where each float-N attribute sits in the vertex layout. */
+typedef struct _vio_mesh_attrib {
+    int location;     /* glsl `layout(location = N)` */
+    int components;   /* 1..4 floats */
+    int offset;       /* bytes into the vertex */
+} vio_mesh_attrib;
+
 typedef struct _vio_pipeline_desc {
     void            *shader;
     vio_vertex_attrib *vertex_layout;

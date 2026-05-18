@@ -1235,53 +1235,35 @@ ZEND_FUNCTION(vio_mesh)
     mesh->stride       = floats_per_vertex * sizeof(float);
     mesh->backend      = ctx->backend;
 
-#ifdef HAVE_GLFW
-    /* Create OpenGL objects (only if OpenGL backend is active) */
-    if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
-    glGenVertexArrays(1, &mesh->vao);
-    glGenBuffers(1, &mesh->vbo);
-
-    glBindVertexArray(mesh->vao);
-
-    glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * vertex_data_count, data, GL_STATIC_DRAW);
-
+    /* Normalize the layout into a backend-agnostic array so create_mesh can
+     * do one straight glVertexAttribPointer-loop without re-deriving the
+     * legacy "pos-only" / "pos+color" shapes inside the backend. */
+    vio_mesh_attrib normalized_layout[VIO_MAX_VERTEX_ATTRIBS];
+    int normalized_layout_count = 0;
     if (has_explicit_layout && parsed_layout_count > 0) {
-        /* Explicit dict-style layout: set up each attribute from the parsed layout */
         int offset = 0;
         for (int a = 0; a < parsed_layout_count; a++) {
-            glVertexAttribPointer(
-                parsed_layout[a].location,
-                parsed_layout[a].components,
-                GL_FLOAT,
-                GL_FALSE,
-                mesh->stride,
-                (void *)(intptr_t)(offset * sizeof(float))
-            );
-            glEnableVertexAttribArray(parsed_layout[a].location);
+            normalized_layout[a].location   = parsed_layout[a].location;
+            normalized_layout[a].components = parsed_layout[a].components;
+            normalized_layout[a].offset     = offset * (int)sizeof(float);
             offset += parsed_layout[a].components;
         }
+        normalized_layout_count = parsed_layout_count;
     } else if (has_colors && floats_per_vertex >= 7) {
-        /* Legacy: Position (location 0, vec3) + Color (location 1, vec4) */
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, mesh->stride, (void *)0);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, mesh->stride, (void *)(3 * sizeof(float)));
-        glEnableVertexAttribArray(1);
+        normalized_layout[0] = (vio_mesh_attrib){0, 3, 0};
+        normalized_layout[1] = (vio_mesh_attrib){1, 4, 3 * (int)sizeof(float)};
+        normalized_layout_count = 2;
     } else {
-        /* Legacy: Position only (location 0, vec3) */
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, mesh->stride, (void *)0);
-        glEnableVertexAttribArray(0);
+        normalized_layout[0] = (vio_mesh_attrib){0, 3, 0};
+        normalized_layout_count = 1;
     }
 
-    if (indices && index_count > 0) {
-        glGenBuffers(1, &mesh->ebo);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh->ebo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(unsigned int) * index_count, indices, GL_STATIC_DRAW);
+    if (ctx->backend->create_mesh) {
+        ctx->backend->create_mesh(mesh,
+            data, (int)(sizeof(float) * vertex_data_count), mesh->stride,
+            normalized_layout, normalized_layout_count,
+            indices, index_count);
     }
-
-    glBindVertexArray(0);
-    } /* end if opengl */
-#endif
 
     /* Backend buffer creation (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0 && ctx->backend->create_buffer) {

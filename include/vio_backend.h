@@ -92,6 +92,21 @@ typedef struct _vio_backend {
      * this NULL. */
     void  (*bind_pipeline_state)(void *pipe);
 
+    /* Per-vertex attribute description used by create_mesh. components is
+     * 1-4 (vec1..vec4 of float); offset is bytes into the vertex. */
+    /* (typedef lives in vio_types.h — vio_mesh_attrib) */
+
+    /* Upload a mesh's vertex (+ optional index) buffer and configure the
+     * vertex layout. Writes into mesh_obj (vio_mesh_object *): OpenGL fills
+     * vao / vbo / ebo; D3D11/D3D12/Vulkan fill backend_vb / backend_ib via
+     * the existing create_buffer slot, so they leave create_mesh NULL.
+     * Returns 0 on success. */
+    int   (*create_mesh)(void *mesh_obj,
+                         const void *vertex_data, int vertex_data_size,
+                         int stride,
+                         const struct _vio_mesh_attrib *layout, int layout_count,
+                         const unsigned int *indices, int index_count);
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);
