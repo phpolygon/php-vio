@@ -380,6 +380,64 @@ static void opengl_unbind_render_target(unsigned int default_fbo, int width, int
     }
 }
 
+static unsigned int opengl_setup_headless(int width, int height)
+{
+    if (!vio_gl.initialized) return 0;
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+
+    GLuint color_rb = 0;
+    glGenRenderbuffers(1, &color_rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, color_rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, color_rb);
+
+    GLuint depth_rb = 0;
+    glGenRenderbuffers(1, &depth_rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, depth_rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depth_rb);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteRenderbuffers(1, &color_rb);
+        glDeleteRenderbuffers(1, &depth_rb);
+        glDeleteFramebuffers(1, &fbo);
+        return 0;
+    }
+    /* Keep FBO bound — every subsequent draw goes here until a render-target
+     * binds something else. Matches the previous in-line behaviour. */
+    return fbo;
+}
+
+static void opengl_teardown_headless(unsigned int fbo)
+{
+    if (!fbo || !vio_gl.initialized) return;
+
+    /* Re-discover the attached renderbuffers via the FBO so we don't have
+     * to track them in vio_gl globals (which wouldn't survive a multi-context
+     * setup gracefully). */
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    GLint color_rb_int = 0, depth_rb_int = 0;
+    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &color_rb_int);
+    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &depth_rb_int);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    if (color_rb_int) {
+        GLuint rb = (GLuint)color_rb_int;
+        glDeleteRenderbuffers(1, &rb);
+    }
+    if (depth_rb_int) {
+        GLuint rb = (GLuint)depth_rb_int;
+        glDeleteRenderbuffers(1, &rb);
+    }
+    glDeleteFramebuffers(1, &fbo);
+}
+
 static int opengl_read_pixels(unsigned int fbo, int width, int height, void *out_rgba)
 {
     if (!vio_gl.initialized || width <= 0 || height <= 0) return -1;
@@ -480,6 +538,8 @@ static const vio_backend opengl_backend = {
     .bind_render_target    = opengl_bind_render_target,
     .unbind_render_target  = opengl_unbind_render_target,
     .read_pixels           = opengl_read_pixels,
+    .setup_headless        = opengl_setup_headless,
+    .teardown_headless     = opengl_teardown_headless,
 };
 
 void vio_backend_opengl_register(void)

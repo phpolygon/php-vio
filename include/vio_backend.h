@@ -73,6 +73,16 @@ typedef struct _vio_backend {
      * support — guard via VIO_FEATURE_READ_PIXELS. */
     int   (*read_pixels)(unsigned int fbo, int width, int height, void *out_rgba);
 
+    /* Headless render surface lifecycle. On OpenGL this builds an FBO with
+     * an RGBA8 color + DEPTH24_STENCIL8 attachments and returns its handle;
+     * other backends use the swapchain backbuffer as their offscreen target
+     * and may leave both slots NULL (caller skips the call). teardown_headless
+     * frees the FBO plus its attached renderbuffers — those are looked up
+     * via glGetFramebufferAttachmentParameteriv so the backend doesn't have
+     * to track them outside the FBO. Returns 0 from setup on failure. */
+    unsigned int (*setup_headless)(int width, int height);
+    void  (*teardown_headless)(unsigned int fbo);
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);
