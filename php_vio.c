@@ -1468,7 +1468,8 @@ ZEND_FUNCTION(vio_shader)
     zval shader_zval;
     object_init_ex(&shader_zval, vio_shader_ce);
     vio_shader_object *shader = Z_VIO_SHADER_P(&shader_zval);
-    shader->format = format;
+    shader->format  = format;
+    shader->backend = ctx->backend;
 
     /* --- SPIR-V input: store directly --- */
     if (format == VIO_SHADER_SPIRV) {
@@ -1995,6 +1996,7 @@ ZEND_FUNCTION(vio_texture)
     zval tex_zval;
     object_init_ex(&tex_zval, vio_texture_ce);
     vio_texture_object *tex = Z_VIO_TEXTURE_P(&tex_zval);
+    tex->backend = ctx->backend;
 
     /* Parse filter/wrap options */
     zval *val;
@@ -5951,6 +5953,7 @@ ZEND_FUNCTION(vio_render_target_texture)
     zval tex_zval;
     object_init_ex(&tex_zval, vio_texture_ce);
     vio_texture_object *tex = Z_VIO_TEXTURE_P(&tex_zval);
+    tex->backend = rt->backend;
 
     tex->width    = rt->width;
     tex->height   = rt->height;

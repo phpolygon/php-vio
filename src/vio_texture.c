@@ -7,14 +7,7 @@
 #endif
 
 #include "vio_texture.h"
-
-#ifdef HAVE_GLFW
-#include <glad/glad.h>
-#endif
-
-#ifdef HAVE_METAL
-#include "backends/metal/vio_metal.h"
-#endif
+#include "../include/vio_backend.h"
 
 zend_class_entry *vio_texture_ce = NULL;
 static zend_object_handlers vio_texture_handlers;
@@ -32,6 +25,7 @@ static zend_object *vio_texture_create_object(zend_class_entry *ce)
     tex->wrap       = VIO_WRAP_REPEAT;
     tex->valid      = 0;
     tex->borrowed   = 0;
+    tex->backend    = NULL;
 
     zend_object_std_init(&tex->std, ce);
     object_properties_init(&tex->std, ce);
@@ -44,18 +38,12 @@ static void vio_texture_free_object(zend_object *obj)
 {
     vio_texture_object *tex = vio_texture_from_obj(obj);
 
-#ifdef HAVE_GLFW
-    if (tex->texture_id && !tex->borrowed && glDeleteTextures) {
-        glDeleteTextures(1, &tex->texture_id);
-        tex->texture_id = 0;
+    if (tex->backend) {
+        const vio_backend *be = (const vio_backend *)tex->backend;
+        if (be->destroy_texture_obj) {
+            be->destroy_texture_obj(tex);
+        }
     }
-#endif
-#ifdef HAVE_METAL
-    if (tex->texture_id && !tex->borrowed) {
-        vio_metal_delete_texture(tex->texture_id);
-        tex->texture_id = 0;
-    }
-#endif
 
     zend_object_std_dtor(&tex->std);
 }

@@ -171,6 +171,16 @@ typedef struct _vio_backend {
     int   (*upload_cubemap)(void *cm_obj, int width, int height,
                             const void *face_rgba[6]);
 
+    /* Object-based destructors for the three remaining src/vio_*.c free_object
+     * handlers (parallel to destroy_mesh / destroy_render_target / etc.). The
+     * existing destroy_buffer / destroy_texture / destroy_shader slots above
+     * take an opaque backend wrapper handle — these take the full vio_*_object
+     * and let the backend free whichever of (texture_id / buffer_id / program)
+     * vs (backend_texture / backend_buffer / backend_shader) it actually used. */
+    void  (*destroy_buffer_obj)(void *buf_obj);     /* vio_buffer_object * */
+    void  (*destroy_texture_obj)(void *tex_obj);    /* vio_texture_object * */
+    void  (*destroy_shader_obj)(void *shader_obj);  /* vio_shader_object * */
+
     /* Drawing */
     void  (*begin_frame)(void);
     void  (*end_frame)(void);

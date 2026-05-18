@@ -7,11 +7,8 @@
 #endif
 
 #include "vio_shader.h"
+#include "../include/vio_backend.h"
 #include <stdlib.h>
-
-#ifdef HAVE_GLFW
-#include <glad/glad.h>
-#endif
 
 zend_class_entry *vio_shader_ce = NULL;
 static zend_object_handlers vio_shader_handlers;
@@ -37,12 +34,12 @@ static void vio_shader_free_object(zend_object *obj)
 {
     vio_shader_object *shader = vio_shader_from_obj(obj);
 
-#ifdef HAVE_GLFW
-    if (shader->program) {
-        glDeleteProgram(shader->program);
-        shader->program = 0;
+    if (shader->backend) {
+        const vio_backend *be = (const vio_backend *)shader->backend;
+        if (be->destroy_shader_obj) {
+            be->destroy_shader_obj(shader);
+        }
     }
-#endif
 
     if (shader->vert_spirv) {
         free(shader->vert_spirv);
