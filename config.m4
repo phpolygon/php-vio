@@ -284,6 +284,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_plugin_registry.c \
     src/vio_backend_null.c \
     src/backends/opengl/vio_opengl.c \
+    src/backends/opengl/vio_2d_opengl.c \
     src/backends/vulkan/vio_vulkan.c \
     vendor/glad/src/glad.c \
     vendor/stb/stb_image_impl.c \
