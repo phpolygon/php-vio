@@ -286,6 +286,45 @@ Release zips contain `vio.so` (Linux/macOS) or `php_vio.dll` (Windows) as the fi
 pie install phpolygon/php-vio
 ```
 
+## OpenGL-Feature-Ladder
+
+Welche `VIO_FEATURE_*`-Flags sicher `1` zurückgeben, hängt von der Core-Version
+des erhaltenen GL-Kontexts ab (Fenster verhandelt `4.6 → 3.3`-Ladder). Die
+Backend-Caps in `vio_gl.caps` werden einmal in `vio_opengl_setup_context()`
+befüllt — entweder weil die Core-Version das Feature deckt oder weil die
+ARB/KHR-Extension exportiert ist. `vio_gl_info($ctx)` legt die finale
+Auswertung pro Lauf offen.
+
+| Feature                       | Core ab  | Extension-Fallback                | Floor 3.3 |
+|-------------------------------|----------|------------------------------------|-----------|
+| `VIO_FEATURE_COMPUTE`         | 4.3      | `GL_ARB_compute_shader`            | 0         |
+| `VIO_FEATURE_TESSELLATION`    | 4.0      | `GL_ARB_tessellation_shader`       | 0         |
+| `VIO_FEATURE_GEOMETRY`        | 3.2      | —                                   | **1**     |
+| `VIO_FEATURE_SEPARATE_SHADERS`| 4.1      | `GL_ARB_separate_shader_objects`   | 0         |
+| `VIO_FEATURE_DEBUG_OUTPUT`    | 4.3      | `GL_KHR_debug`                     | 0         |
+| `VIO_FEATURE_DSA`             | 4.5      | `GL_ARB_direct_state_access`       | 0         |
+| `VIO_FEATURE_BUFFER_STORAGE`  | 4.4      | `GL_ARB_buffer_storage`            | 0         |
+| `VIO_FEATURE_TEXTURE_STORAGE` | 4.2      | `GL_ARB_texture_storage`           | 0         |
+| `VIO_FEATURE_TEXTURE_SWIZZLE` | 3.3      | `GL_ARB_texture_swizzle`           | **1**     |
+| `VIO_FEATURE_3D_PIPELINE`     | 3.3      | —                                   | **1**     |
+| `VIO_FEATURE_READ_PIXELS`     | 3.0      | —                                   | **1**     |
+| `VIO_FEATURE_INSTANCED_DRAW`  | 3.1      | —                                   | **1**     |
+| `VIO_FEATURE_RENDER_TARGET`   | 3.0      | —                                   | **1**     |
+| `VIO_FEATURE_RENDER_TARGET_HDR` | 3.0    | `GL_ARB_texture_float`             | **1**     |
+| `VIO_FEATURE_RENDER_TARGET_DEPTH` | 3.0  | —                                   | **1**     |
+| `VIO_FEATURE_RENDER_TARGET_MSAA` | 3.0   | —                                   | **1**     |
+| `VIO_FEATURE_CUBEMAP`         | 3.0      | —                                   | **1**     |
+| `VIO_FEATURE_DEPTH_BIAS`      | 3.0      | —                                   | **1**     |
+| `VIO_FEATURE_SCISSOR`         | 3.0      | —                                   | **1**     |
+| `VIO_FEATURE_NATIVE_2D_BATCH` | —        | —                                   | **1** (immer, vio_2d_opengl.c) |
+| `VIO_FEATURE_RAYTRACING`      | —        | nur via NV/EXT-Vendor-Ext           | 0         |
+| `VIO_FEATURE_MULTIVIEW`       | —        | `GL_OVR_multiview` (nicht gewired)  | 0         |
+
+**macOS-Hinweis:** Apple's Legacy-GL liefert maximal 4.1 Core. Compute /
+Tessellation / DSA / Buffer-Storage / Texture-Storage > 4.2 sind dort
+nie verfügbar; `gl_has_ext()` greift, falls Apple jemals den ARB-Pfad
+nachgeliefert hat (aktuell nicht).
+
 ## Konventionen
 
 - **Sprache**: Code und Kommentare auf Englisch. Kommunikation auf Deutsch.
