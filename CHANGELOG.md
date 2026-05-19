@@ -1,3 +1,12 @@
+# [1.13.0](https://github.com/phpolygon/php-vio/compare/v1.12.0...v1.13.0) (2026-05-19)
+
+
+### Features
+
+* **backends:** add VIO_FEATURE_3D_PIPELINE + version-aware OpenGL caps ([9ccf8fc](https://github.com/phpolygon/php-vio/commit/9ccf8fc13cce016b2639cde3870afba716884cfe))
+* **backends:** expand vio_feature with 16 capabilities + GL extension cache (Etappe 2) ([9d6b857](https://github.com/phpolygon/php-vio/commit/9d6b857bc7349044e823c9e57a9e9520418aa906)), closes [Issue-#3-part-2](https://github.com/Issue-/issues/3-part-2) [#3](https://github.com/phpolygon/php-vio/issues/3)
+* vio_gl_info + GLSL #version check + RT API surface (Etappe 7, closes [#3](https://github.com/phpolygon/php-vio/issues/3) [#4](https://github.com/phpolygon/php-vio/issues/4)) ([4d43201](https://github.com/phpolygon/php-vio/commit/4d432019627e5004bc8eb4bfbeaadc733f29ea1d)), closes [#version](https://github.com/phpolygon/php-vio/issues/version) [#version-mismatch](https://github.com/phpolygon/php-vio/issues/version-mismatch)
+
 # [1.12.0](https://github.com/phpolygon/php-vio/compare/v1.11.0...v1.12.0) (2026-05-17)
 
 
