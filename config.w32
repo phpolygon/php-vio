@@ -39,6 +39,7 @@ if (PHP_VIO != "no") {
         "src\\vio_plugin_registry.c " +
         "src\\vio_backend_null.c " +
         "src\\backends\\opengl\\vio_opengl.c " +
+        "src\\backends\\opengl\\vio_2d_opengl.c " +
         "src\\backends\\vulkan\\vio_vulkan.c " +
         "src\\backends\\d3d11\\vio_d3d11.c " +
         "src\\backends\\d3d12\\vio_d3d12.c " +
