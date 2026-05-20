@@ -5434,10 +5434,11 @@ ZEND_FUNCTION(vio_render_target)
     rt->depth_only = depth_only;
     rt->backend    = ctx->backend;
 
-    /* OpenGL goes through the vtable; D3D11/D3D12 still inline below until
-     * their backends implement create_render_target. */
+    /* OpenGL + Metal go through the vtable; D3D11/D3D12 still inline below
+     * until their backends implement create_render_target. */
     if (ctx->backend->create_render_target &&
-        strcmp(ctx->backend->name, "opengl") == 0) {
+        (strcmp(ctx->backend->name, "opengl") == 0 ||
+         strcmp(ctx->backend->name, "metal") == 0)) {
         if (ctx->backend->create_render_target(rt, width, height, hdr, depth_only) != 0) {
             zval_ptr_dtor(&rt_zval);
             RETURN_FALSE;
@@ -5757,7 +5758,8 @@ ZEND_FUNCTION(vio_bind_render_target)
     }
 
     if (ctx->backend->bind_render_target &&
-        rt->backend_type == VIO_RT_BACKEND_OPENGL) {
+        (rt->backend_type == VIO_RT_BACKEND_OPENGL ||
+         rt->backend_type == VIO_RT_BACKEND_METAL)) {
         ctx->backend->bind_render_target(rt);
     }
 
@@ -5884,6 +5886,20 @@ ZEND_FUNCTION(vio_unbind_render_target)
 #endif
         }
         ctx->backend->unbind_render_target(default_fbo, w, h);
+    }
+
+    if (ctx->backend->unbind_render_target &&
+        strcmp(ctx->backend->name, "metal") == 0) {
+        /* Metal manages its swapchain via CAMetalLayer internally; the
+         * default_fbo/width/height parameters are ignored on this backend. */
+        int w = ctx->config.width;
+        int h = ctx->config.height;
+#ifdef HAVE_GLFW
+        if (ctx->window) {
+            glfwGetFramebufferSize(ctx->window, &w, &h);
+        }
+#endif
+        ctx->backend->unbind_render_target(0, w, h);
     }
 
 #ifdef HAVE_D3D11
@@ -6103,6 +6119,20 @@ ZEND_FUNCTION(vio_render_target_texture)
 
         if (*cache_slot != NULL) {
             tex->backend_texture = *cache_slot;
+            tex->borrowed = 1;
+        }
+    }
+#endif
+
+#ifdef HAVE_METAL
+    /* For Metal: register the RT's MTLTexture into the texture registry so the
+     * 2D batch can bind it via texture_id, then store that id on the texture
+     * wrapper. The registry slot is cleared lazily by other deletes; the actual
+     * MTLTexture lifetime stays with the RT (CFBridgingRelease in destroy). */
+    if (rt->backend_type == VIO_RT_BACKEND_METAL) {
+        void *cf_tex = rt->depth_only ? rt->metal_depth_texture : rt->metal_color_texture;
+        if (cf_tex) {
+            tex->texture_id = vio_metal_register_external_texture(cf_tex);
             tex->borrowed = 1;
         }
     }

@@ -42,12 +42,19 @@ typedef struct _vio_render_target_object {
     void        *d3d12_rtv_heap;        /* ID3D12DescriptorHeap* (1 RTV) */
     void        *d3d12_dsv_heap;        /* ID3D12DescriptorHeap* (1 DSV) */
 
+    /* Metal (opaque pointers — actual types are id<MTLTexture> CFBridgeRetained).
+     * Stored as opaque void * so the public header doesn't pull in Metal
+     * headers. The Metal backend transitions ownership across this boundary
+     * via CFBridgingRetain / CFBridgingRelease. */
+    void        *metal_color_texture;   /* id<MTLTexture> (CFRetained) */
+    void        *metal_depth_texture;   /* id<MTLTexture> (CFRetained) */
+
     /* Common */
     int          width;
     int          height;
     int          depth_only;
     int          valid;
-    int          backend_type;        /* 0=none, 1=opengl, 2=d3d11, 3=d3d12 */
+    int          backend_type;        /* 0=none, 1=opengl, 2=d3d11, 3=d3d12, 4=metal */
     int          d3d12_depth_is_srv;  /* 1 if depth resource is in SRV state (needs barrier to DEPTH_WRITE) */
     int          d3d12_color_is_srv;  /* 1 if color resource is in SRV state (needs barrier to RENDER_TARGET) */
     /* D3D12 cached SRV for shadow map sampling (allocated once at RT creation) */
@@ -67,6 +74,7 @@ typedef struct _vio_render_target_object {
 #define VIO_RT_BACKEND_OPENGL 1
 #define VIO_RT_BACKEND_D3D11  2
 #define VIO_RT_BACKEND_D3D12  3
+#define VIO_RT_BACKEND_METAL  4
 
 extern zend_class_entry *vio_render_target_ce;
 

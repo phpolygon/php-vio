@@ -185,9 +185,9 @@ VIO_FEATURE_SEPARATE_SHADERS    = 21,
 |---|---|---|
 | `READ_PIXELS` | `vio_read_pixels`, `vio_save_screenshot`, `vio_recorder_capture`, `vio_stream_push` | Vulkan/Metal stub |
 | `INSTANCED_DRAW` | `vio_draw_instanced` | aktuell `strcmp` |
-| `RENDER_TARGET` | `vio_render_target`, `vio_bind_render_target`, neue API #4 | Vulkan/Metal stub |
+| `RENDER_TARGET` | `vio_render_target`, `vio_bind_render_target`, neue API #4 | Vulkan stub (Metal: wired via Vtable) |
 | `RENDER_TARGET_HDR` | `vio_render_target([..., "hdr" => true])` | braucht `RGBA16F` |
-| `RENDER_TARGET_DEPTH` | Depth-Only-RTs (Shadow Maps) | Metal stub |
+| `RENDER_TARGET_DEPTH` | Depth-Only-RTs (Shadow Maps) | Vulkan stub |
 | `RENDER_TARGET_MSAA` | `vio_render_target([..., "samples" => N])` | Backend-Probe |
 | `CUBEMAP` | `vio_cubemap`, `vio_bind_cubemap` | Metal stub |
 | `DEPTH_BIAS` | `vio_pipeline([..., "depth_bias" => ...])` | `glPolygonOffset` ist GL-Konzept |

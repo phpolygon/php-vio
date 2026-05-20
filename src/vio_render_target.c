@@ -33,6 +33,8 @@ static zend_object *vio_render_target_create_object(zend_class_entry *ce)
     rt->d3d12_dsv_heap       = NULL;
     rt->d3d12_color_backend_texture = NULL;
     rt->d3d12_depth_backend_texture = NULL;
+    rt->metal_color_texture = NULL;
+    rt->metal_depth_texture = NULL;
     rt->width         = 0;
     rt->height        = 0;
     rt->depth_only    = 0;

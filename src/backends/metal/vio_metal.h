@@ -67,6 +67,16 @@ unsigned int vio_metal_create_font_atlas(int width, int height,
  */
 void vio_metal_delete_texture(unsigned int texture_id);
 
+/*
+ * Register an externally-owned MTLTexture (passed as a CFBridgingRetain'd
+ * opaque pointer matching the metal_color_texture / metal_depth_texture
+ * slots on vio_render_target_object) into the texture registry so the 2D
+ * batch renderer can bind it via item->texture_id. The texture remains
+ * owned by the caller; the registry entry is cleared on
+ * vio_metal_delete_texture. Returns 0 on failure.
+ */
+unsigned int vio_metal_register_external_texture(void *cf_retained_texture);
+
 /* ── Metal pixel readback ────────────────────────────────────────── */
 
 /*

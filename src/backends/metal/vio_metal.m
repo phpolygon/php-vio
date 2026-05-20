@@ -20,6 +20,7 @@
 
 #include "vio_metal.h"
 #include "../../shaders/shaders_2d.h"
+#include "../../vio_render_target.h"
 
 /* stb_image_write for screenshot PNG export (implementation in stb_image_write_impl.c) */
 #include "../../../vendor/stb/stb_image_write.h"
@@ -49,6 +50,12 @@ static vio_metal_state vio_mtl = {0};
 /* Keep reference to last presented frame for read_pixels/screenshot */
 static id<MTLTexture>       last_presented_texture = nil;
 static id<MTLCommandBuffer> last_presented_cmd_buf = nil;
+
+/* Currently bound offscreen render target. When non-NULL, metal_begin_frame
+ * builds its MTLRenderPassDescriptor from the RT's textures instead of the
+ * swapchain drawable. Mirrors vio_d3d11.current_rtv. NULL means "draw to
+ * swapchain". */
+static vio_render_target_object *current_bound_rt = NULL;
 
 /* ── Metal 2D pipeline state ─────────────────────────────────────── */
 
@@ -508,6 +515,14 @@ void vio_metal_delete_texture(unsigned int texture_id)
     }
 }
 
+unsigned int vio_metal_register_external_texture(void *cf_retained_texture)
+{
+    if (!cf_retained_texture) return 0;
+    if (!vio_mtl.initialized) return 0;
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)cf_retained_texture;
+    return metal_register_texture(tex);
+}
+
 /* ── Metal pixel readback ────────────────────────────────────────── */
 
 int vio_metal_read_pixels(int width, int height, unsigned char *out_rgba)
@@ -610,6 +625,61 @@ static void metal_resize(int width, int height)
     }
 }
 
+/* Open a render-pass encoder against either the currently bound offscreen RT
+ * (current_bound_rt) or the swapchain drawable. Assumes cmd buffer exists.
+ * load_clear=1 uses Clear (and clear_r/g/b/a); 0 uses Load (preserves existing
+ * contents). Sets viewport + scissor to the target's dimensions. */
+static void metal_open_encoder(int load_clear)
+{
+    @autoreleasepool {
+        if (!vio_mtl.current_cmd_buf) return;
+
+        id<MTLTexture> color_target = nil;
+        id<MTLTexture> depth_target = vio_mtl.depth_texture; /* default swapchain depth */
+        int target_w = vio_mtl.width;
+        int target_h = vio_mtl.height;
+        int depth_only = 0;
+
+        if (current_bound_rt) {
+            color_target = (__bridge id<MTLTexture>)current_bound_rt->metal_color_texture;
+            depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_depth_texture;
+            target_w = current_bound_rt->width;
+            target_h = current_bound_rt->height;
+            depth_only = current_bound_rt->depth_only;
+        } else if (!vio_mtl.vsync && vio_mtl.offscreen_texture) {
+            color_target = vio_mtl.offscreen_texture;
+        } else if (vio_mtl.current_drawable) {
+            color_target = vio_mtl.current_drawable.texture;
+        }
+
+        MTLRenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
+
+        if (!depth_only && color_target) {
+            desc.colorAttachments[0].texture = color_target;
+            desc.colorAttachments[0].loadAction = load_clear ? MTLLoadActionClear : MTLLoadActionLoad;
+            desc.colorAttachments[0].storeAction = MTLStoreActionStore;
+            desc.colorAttachments[0].clearColor =
+                MTLClearColorMake(vio_mtl.clear_r, vio_mtl.clear_g, vio_mtl.clear_b, vio_mtl.clear_a);
+        }
+
+        if (depth_target) {
+            desc.depthAttachment.texture = depth_target;
+            desc.depthAttachment.loadAction = load_clear ? MTLLoadActionClear : MTLLoadActionLoad;
+            desc.depthAttachment.storeAction = depth_only ? MTLStoreActionStore : MTLStoreActionDontCare;
+            desc.depthAttachment.clearDepth = 1.0;
+        }
+
+        vio_mtl.current_encoder = [vio_mtl.current_cmd_buf
+            renderCommandEncoderWithDescriptor:desc];
+
+        MTLViewport viewport = {0, 0, (double)target_w, (double)target_h, 0.0, 1.0};
+        [vio_mtl.current_encoder setViewport:viewport];
+
+        MTLScissorRect scissor = {0, 0, (NSUInteger)target_w, (NSUInteger)target_h};
+        [vio_mtl.current_encoder setScissorRect:scissor];
+    }
+}
+
 static void metal_begin_frame(void)
 {
     @autoreleasepool {
@@ -622,36 +692,28 @@ static void metal_begin_frame(void)
             metal_resize(fb_w, fb_h);
         }
 
+        /* DO NOT reset current_bound_rt here. The persistent-bind contract
+         * mirrored from D3D11/D3D12 (vio_d3d11.current_rtv survives across
+         * frames) requires that an explicit vio_bind_render_target stays in
+         * effect until vio_unbind_render_target is called - otherwise
+         * Engine::warmRender's repeated beginFrame/endFrame loop would
+         * silently render to the swapchain on every frame after the first. */
+
         /* In vsync-off mode, render to offscreen texture to avoid display-rate
            throttling from nextDrawable. This gives accurate GPU-only frame timing
-           for benchmarks. In vsync mode, render directly to the drawable. */
-        id<MTLTexture> target_texture;
-        if (!vio_mtl.vsync && vio_mtl.offscreen_texture) {
+           for benchmarks. In vsync mode, render directly to the drawable.
+           Only fetch a drawable when no explicit RT is bound. */
+        if (current_bound_rt) {
             vio_mtl.current_drawable = nil;
-            target_texture = vio_mtl.offscreen_texture;
+        } else if (!vio_mtl.vsync && vio_mtl.offscreen_texture) {
+            vio_mtl.current_drawable = nil;
         } else {
             vio_mtl.current_drawable = [vio_mtl.metal_layer nextDrawable];
             if (!vio_mtl.current_drawable) return;
-            target_texture = vio_mtl.current_drawable.texture;
         }
 
-        /* Configure color attachment */
-        vio_mtl.render_pass_desc.colorAttachments[0].texture = target_texture;
-        vio_mtl.render_pass_desc.colorAttachments[0].loadAction = MTLLoadActionClear;
-        vio_mtl.render_pass_desc.colorAttachments[0].storeAction = MTLStoreActionStore;
-        vio_mtl.render_pass_desc.colorAttachments[0].clearColor =
-            MTLClearColorMake(vio_mtl.clear_r, vio_mtl.clear_g, vio_mtl.clear_b, vio_mtl.clear_a);
-
         vio_mtl.current_cmd_buf = [vio_mtl.command_queue commandBuffer];
-        vio_mtl.current_encoder = [vio_mtl.current_cmd_buf
-            renderCommandEncoderWithDescriptor:vio_mtl.render_pass_desc];
-
-        /* Set viewport */
-        MTLViewport viewport = {0, 0, (double)vio_mtl.width, (double)vio_mtl.height, 0.0, 1.0};
-        [vio_mtl.current_encoder setViewport:viewport];
-
-        MTLScissorRect scissor = {0, 0, (NSUInteger)vio_mtl.width, (NSUInteger)vio_mtl.height};
-        [vio_mtl.current_encoder setScissorRect:scissor];
+        metal_open_encoder(/*load_clear=*/1);
     }
 }
 
@@ -862,6 +924,143 @@ static void metal_destroy_shader(void *s)
     free(sh);
 }
 
+/* ── Render-target lifecycle ──────────────────────────────────────
+ *
+ * Offscreen MTLTexture-backed render target. Used by consumer code that
+ * wants to redirect a frame's draws into an offscreen color buffer (e.g.
+ * PHPolygon's Engine::warmRender pre-warming a splash texture without
+ * touching the swapchain). Independent of the 3D pipeline — the 2D batch
+ * renderer is what actually emits draws into the RT.
+ *
+ * Ownership: each MTLTexture is created with newTextureWithDescriptor:
+ * (+1 retain) and bridged into the RT object with CFBridgingRetain so the
+ * strong reference outlives this autoreleasepool. Released in destroy via
+ * CFBridgingRelease (which ARC drops on scope exit). */
+
+static int metal_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
+{
+    @autoreleasepool {
+        vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+        if (!vio_mtl.initialized || !vio_mtl.device) return -1;
+
+        /* Depth texture — always created (parallel to OpenGL's "always create
+         * depth attachment" pattern so shadow-map RTs work uniformly). */
+        MTLTextureDescriptor *depth_desc = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+            width:width height:height mipmapped:NO];
+        depth_desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        depth_desc.storageMode = MTLStorageModePrivate;
+
+        id<MTLTexture> depth_tex = [vio_mtl.device newTextureWithDescriptor:depth_desc];
+        if (!depth_tex) {
+            php_error_docref(NULL, E_WARNING,
+                "Metal: failed to create render-target depth texture (%dx%d)", width, height);
+            return -1;
+        }
+
+        id<MTLTexture> color_tex = nil;
+        if (!depth_only) {
+            MTLTextureDescriptor *color_desc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:(hdr ? MTLPixelFormatRGBA16Float
+                                                        : MTLPixelFormatBGRA8Unorm)
+                width:width height:height mipmapped:NO];
+            color_desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            color_desc.storageMode = MTLStorageModePrivate;
+
+            color_tex = [vio_mtl.device newTextureWithDescriptor:color_desc];
+            if (!color_tex) {
+                php_error_docref(NULL, E_WARNING,
+                    "Metal: failed to create render-target color texture (%dx%d, hdr=%d)",
+                    width, height, hdr);
+                return -1;
+            }
+        }
+
+        /* Bridge strong references into the RT's opaque void * slots. */
+        rt->metal_depth_texture = (void *)CFBridgingRetain(depth_tex);
+        rt->metal_color_texture = color_tex ? (void *)CFBridgingRetain(color_tex) : NULL;
+        rt->backend_type = VIO_RT_BACKEND_METAL;
+
+        return 0;
+    }
+}
+
+static void metal_bind_render_target(void *rt_ptr)
+{
+    @autoreleasepool {
+        vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+        if (rt->backend_type != VIO_RT_BACKEND_METAL || !vio_mtl.initialized) return;
+
+        current_bound_rt = rt;
+
+        /* If a frame is already in progress (caller bound mid-frame, e.g. 3D
+         * pipeline doing HDR + bloom passes), close the encoder and reopen on
+         * the new target with Load semantics so contents are preserved. The
+         * common bind-before-vio_begin case (Engine::warmRender on the 2D
+         * pipeline) skips this branch and lets metal_begin_frame pick up the
+         * stash naturally on the next vio_begin. */
+        if (vio_mtl.current_cmd_buf) {
+            if (vio_mtl.current_encoder) {
+                [vio_mtl.current_encoder endEncoding];
+                vio_mtl.current_encoder = nil;
+            }
+            metal_open_encoder(/*load_clear=*/0);
+        }
+    }
+}
+
+static void metal_unbind_render_target(unsigned int default_fbo, int width, int height)
+{
+    (void)default_fbo; (void)width; (void)height;
+    @autoreleasepool {
+        if (!vio_mtl.initialized) return;
+
+        /* State mutation must run regardless of frame state, otherwise the
+         * stash keeps a dangling pointer to a release()'d RT object and the
+         * next metal_begin_frame opens an encoder on freed Metal textures.
+         * Symptom: every-few-frames flicker after a warmRender pass. */
+        current_bound_rt = NULL;
+
+        /* Encoder swap is only meaningful inside an active frame. Outside one
+         * (the common case after warmRender, where vio_end already committed
+         * the cmd buffer), there's nothing to reopen — the next vio_begin
+         * will pick up the cleared stash and open on the swapchain. */
+        if (!vio_mtl.current_cmd_buf) return;
+
+        if (vio_mtl.current_encoder) {
+            [vio_mtl.current_encoder endEncoding];
+            vio_mtl.current_encoder = nil;
+        }
+
+        /* Restore swapchain — load existing contents so previously drawn
+         * geometry isn't wiped when the consumer bounces between RT and
+         * swapchain inside a single frame. current_bound_rt is already NULL
+         * from the early state-mutation at the top of this function. */
+        metal_open_encoder(/*load_clear=*/0);
+    }
+}
+
+static void metal_destroy_render_target(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (rt->backend_type != VIO_RT_BACKEND_METAL) return;
+
+    /* If this RT was bound at destroy time, drop the stash so begin_frame
+     * doesn't reach into a freed texture. */
+    if (current_bound_rt == rt) {
+        current_bound_rt = NULL;
+    }
+
+    if (rt->metal_color_texture) {
+        CFBridgingRelease(rt->metal_color_texture);
+        rt->metal_color_texture = NULL;
+    }
+    if (rt->metal_depth_texture) {
+        CFBridgingRelease(rt->metal_depth_texture);
+        rt->metal_depth_texture = NULL;
+    }
+}
+
 /* ── 3D pipeline / buffer / texture / draw: not yet wired ─────────
  *
  * Returning NULL/no-op causes vio_pipeline()/vio_mesh()/vio_texture()/
@@ -907,6 +1106,11 @@ static int metal_supports_feature(vio_feature f)
         return 1;
     case VIO_FEATURE_TEXTURE_SWIZZLE:
         /* MTLTextureSwizzleChannels on the texture descriptor. */
+        return 1;
+    case VIO_FEATURE_RENDER_TARGET:
+    case VIO_FEATURE_RENDER_TARGET_HDR:
+    case VIO_FEATURE_RENDER_TARGET_DEPTH:
+        /* MTLTexture-backed offscreen RTs via create/bind/unbind/destroy. */
         return 1;
     default:
         return 0;
@@ -977,6 +1181,10 @@ static const vio_backend metal_backend = {
     .destroy_font_atlas = metal_destroy_font_atlas,
     .upload_font_atlas  = metal_upload_font_atlas,
     .destroy_texture_obj = metal_destroy_texture_obj,
+    .create_render_target  = metal_create_render_target,
+    .bind_render_target    = metal_bind_render_target,
+    .unbind_render_target  = metal_unbind_render_target,
+    .destroy_render_target = metal_destroy_render_target,
 };
 
 void vio_backend_metal_register(void)
