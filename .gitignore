@@ -65,6 +65,7 @@ tests/*.skip.php
 
 # Ad-hoc debug output
 /debug.log
+/php_test_results_*.txt
 
 # OS
 .DS_Store

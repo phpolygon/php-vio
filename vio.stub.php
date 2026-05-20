@@ -690,6 +690,13 @@ function vio_set_window_size(VioContext $context, int $width, int $height): void
 function vio_gl_info(VioContext $context): array|false {}
 
 /**
+ * Query whether the context's backend supports a VIO_FEATURE_* capability.
+ * Returns false on backends that don't implement the feature, including
+ * unrecognized constants.
+ */
+function vio_supports_feature(VioContext $context, int $feature): bool {}
+
+/**
  * Convenience alias for vio_render_target() with explicit option keys
  * (issue #4). Returns an object interchangeable with the existing API.
  */
