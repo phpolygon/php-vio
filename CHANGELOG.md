@@ -1,3 +1,10 @@
+# [1.15.0](https://github.com/phpolygon/php-vio/compare/v1.14.0...v1.15.0) (2026-05-20)
+
+
+### Features
+
+* expose VIO_FEATURE_* constants + vio_supports_feature() to PHP ([9131c0c](https://github.com/phpolygon/php-vio/commit/9131c0caf0ffc9e57edbf55bfaafa019c62e7883))
+
 # [1.14.0](https://github.com/phpolygon/php-vio/compare/v1.13.0...v1.14.0) (2026-05-20)
 
 
