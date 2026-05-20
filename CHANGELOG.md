@@ -1,3 +1,10 @@
+# [1.14.0](https://github.com/phpolygon/php-vio/compare/v1.13.0...v1.14.0) (2026-05-20)
+
+
+### Features
+
+* **metal:** wire render-target binding through the backend vtable ([c708a67](https://github.com/phpolygon/php-vio/commit/c708a67a6dfd8616179dea83972f4681bbeba5d3))
+
 # [1.13.0](https://github.com/phpolygon/php-vio/compare/v1.12.0...v1.13.0) (2026-05-19)
 
 
