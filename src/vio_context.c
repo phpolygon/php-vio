@@ -43,6 +43,12 @@ static void vio_context_free_object(zend_object *obj)
         if (ctx->surface && ctx->backend->destroy_surface) {
             ctx->backend->destroy_surface(ctx->surface);
         }
+        /* Destroy the 2D renderer's backend resources while the backend device
+         * is still alive (Vulkan creates its 2D pipelines/buffer/layouts against
+         * vio_vk.device, which backend->shutdown() destroys). Idempotent, so the
+         * unconditional call below — needed when vio_destroy already ran the
+         * backend teardown — is a harmless no-op. */
+        vio_2d_shutdown(&ctx->state_2d);
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }

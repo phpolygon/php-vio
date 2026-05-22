@@ -36,6 +36,12 @@
 #include "backends/metal/vio_metal.h"
 #endif
 
+#ifdef HAVE_VULKAN
+#include <vulkan/vulkan.h>
+#include "vio_2d_vulkan.h"
+#include "backends/vulkan/vio_vulkan.h"
+#endif
+
 /* ── Orthographic projection matrix ──────────────────────────────── */
 
 static void vio_2d_ortho(float *m, float left, float right, float bottom, float top)
@@ -252,6 +258,18 @@ int vio_2d_init(vio_2d_state *state, int width, int height)
     }
 #endif
 
+#ifdef HAVE_VULKAN
+    if (state->backend == VIO_2D_BACKEND_NONE && vio_vk.initialized) {
+        vio_2d_vulkan_state *vk = calloc(1, sizeof(vio_2d_vulkan_state));
+        if (vk && vio_2d_vulkan_init(vk) == 0) {
+            state->vulkan_state = vk;
+            state->backend = VIO_2D_BACKEND_VULKAN;
+        } else {
+            free(vk);
+        }
+    }
+#endif
+
     state->initialized = 1;
     return 0;
 }
@@ -279,6 +297,14 @@ void vio_2d_shutdown(vio_2d_state *state)
     if (state->backend == VIO_2D_BACKEND_D3D12 && state->d3d_state) {
         vio_2d_d3d12_shutdown((vio_2d_d3d12_state *)state->d3d_state);
         free(state->d3d_state);
+    }
+#endif
+
+#ifdef HAVE_VULKAN
+    if (state->backend == VIO_2D_BACKEND_VULKAN && state->vulkan_state) {
+        vio_2d_vulkan_shutdown((vio_2d_vulkan_state *)state->vulkan_state);
+        free(state->vulkan_state);
+        state->vulkan_state = NULL;
     }
 #endif
 
@@ -575,6 +601,119 @@ void vio_2d_flush(vio_2d_state *state)
             /* Draw */
             ID3D12GraphicsCommandList_DrawInstanced(cl, (UINT)item->vertex_count, 1,
                                                      (UINT)item->vertex_start, 0);
+        }
+    }
+#endif
+
+#ifdef HAVE_VULKAN
+    if (state->backend == VIO_2D_BACKEND_VULKAN && state->vulkan_state
+            && vio_vk.initialized && vio_vk.in_frame) {
+        vio_2d_vulkan_state *vk = (vio_2d_vulkan_state *)state->vulkan_state;
+        VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+
+        /* Render area: the currently-bound target. Phase 1 only ever draws to
+         * the swapchain (offscreen RTs are Phase 3), so use the swapchain
+         * extent. Scissors are CLAMPED to this — Vulkan errors if a scissor
+         * exceeds the framebuffer (unlike D3D, which silently clamps). */
+        uint32_t ra_w = vio_vk.swapchain_extent.width;
+        uint32_t ra_h = vio_vk.swapchain_extent.height;
+        if (ra_w == 0 || ra_h == 0) return;
+
+        /* Upload vertices into THIS frame's slice of the persistently-mapped
+         * ring. The in_flight fence waited in vulkan_begin_frame guarantees the
+         * previous use of this slice has completed, so the memcpy is race-free.
+         * Clamp to the slice capacity (the CPU batch can grow past it). */
+        int vcount = state->vertex_count;
+        int max_verts = (int)(vk->vbo_slice_size / sizeof(vio_2d_vertex));
+        if (vcount > max_verts) {
+            php_error_docref(NULL, E_WARNING,
+                "Vulkan 2D: vertex batch %d exceeds slice capacity %d; clamping",
+                vcount, max_verts);
+            vcount = max_verts;
+        }
+        VkDeviceSize slice_off = (VkDeviceSize)vio_vk.current_frame * vk->vbo_slice_size;
+        if (vcount > 0) {
+            memcpy(vk->vbo_mapped + slice_off, state->vertices,
+                   sizeof(vio_2d_vertex) * (size_t)vcount);
+        }
+
+        /* Bind vertex buffer at the current frame's slice. */
+        VkDeviceSize vb_off = slice_off;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vk->vbo, &vb_off);
+
+        /* Projection mat4 via vertex-stage push constant (64 bytes). */
+        vkCmdPushConstants(cmd, vk->pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                           0, sizeof(float) * 16, state->projection);
+
+        /* Default scissor = full render area. */
+        VkRect2D full_scissor = {0};
+        full_scissor.offset = (VkOffset2D){0, 0};
+        full_scissor.extent = (VkExtent2D){ra_w, ra_h};
+        vkCmdSetScissor(cmd, 0, 1, &full_scissor);
+
+        VkPipeline current_pipeline = VK_NULL_HANDLE;
+        float sc_x = 0, sc_y = 0, sc_w = 0, sc_h = 0;
+        int   scissor_custom = 0;
+
+        for (int i = 0; i < state->item_count; i++) {
+            vio_2d_item *item = &state->items[i];
+
+            /* Phase 1: shapes only. Skip textured items (sprites/text) by TYPE
+             * — they need a bound combined-image-sampler descriptor (Phase 2),
+             * and binding a missing one would be a validation error. Type is the
+             * reliable signal here: on Vulkan a font atlas has texture_id == 0
+             * (that's the GL name) and backend_texture == NULL (the Vulkan
+             * texture path is a Phase-2 stub), so a handle-based check would
+             * miss text and draw glyph quads as solid color. */
+            if (item->type == VIO_2D_SPRITE || item->type == VIO_2D_TEXT) {
+                continue;
+            }
+
+            /* Defensive: skip items whose vertices fell outside the clamped
+             * slice so vkCmdDraw never reads past the uploaded region. */
+            if (item->vertex_start + item->vertex_count > vcount) {
+                continue;
+            }
+
+            /* Scissor (scale logical->framebuffer, then CLAMP to render area). */
+            if (item->scissor.enabled) {
+                if (item->scissor.x != sc_x || item->scissor.y != sc_y ||
+                    item->scissor.w != sc_w || item->scissor.h != sc_h || !scissor_custom) {
+                    sc_x = item->scissor.x; sc_y = item->scissor.y;
+                    sc_w = item->scissor.w; sc_h = item->scissor.h;
+                    float sx = (state->width  > 0) ? (float)state->fb_width  / (float)state->width  : 1.0f;
+                    float sy = (state->height > 0) ? (float)state->fb_height / (float)state->height : 1.0f;
+
+                    float fx0 = sc_x * sx,           fy0 = sc_y * sy;
+                    float fx1 = (sc_x + sc_w) * sx,  fy1 = (sc_y + sc_h) * sy;
+                    if (fx0 < 0) fx0 = 0; if (fy0 < 0) fy0 = 0;
+                    if (fx1 < fx0) fx1 = fx0; if (fy1 < fy0) fy1 = fy0;
+                    if (fx1 > (float)ra_w) fx1 = (float)ra_w;
+                    if (fy1 > (float)ra_h) fy1 = (float)ra_h;
+                    if (fx0 > (float)ra_w) fx0 = (float)ra_w;
+                    if (fy0 > (float)ra_h) fy0 = (float)ra_h;
+
+                    VkRect2D sr = {0};
+                    sr.offset.x      = (int32_t)fx0;
+                    sr.offset.y      = (int32_t)fy0;
+                    sr.extent.width  = (uint32_t)(fx1 - fx0);
+                    sr.extent.height = (uint32_t)(fy1 - fy0);
+                    vkCmdSetScissor(cmd, 0, 1, &sr);
+                    scissor_custom = 1;
+                }
+            } else if (scissor_custom) {
+                vkCmdSetScissor(cmd, 0, 1, &full_scissor);
+                scissor_custom = 0;
+            }
+
+            /* Pipeline on type-group change. Phase 1 only binds shapes. */
+            VkPipeline wanted = vk->pipeline_shapes;
+            if (wanted != current_pipeline) {
+                current_pipeline = wanted;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, current_pipeline);
+            }
+
+            vkCmdDraw(cmd, (uint32_t)item->vertex_count, 1, (uint32_t)item->vertex_start, 0);
         }
     }
 #endif

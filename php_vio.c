@@ -297,6 +297,14 @@ ZEND_FUNCTION(vio_destroy)
             ctx->backend->teardown_headless(ctx->headless_fbo);
             ctx->headless_fbo = 0;
         }
+        /* Tear down the 2D renderer's backend resources BEFORE the backend
+         * device is destroyed. The Vulkan 2D state (pipelines, buffer, layouts,
+         * shader modules) is created against vio_vk.device; vulkan_shutdown()
+         * destroys the device and zeroes vio_vk, so destroying these afterward
+         * would dereference a NULL device (crash) and leave child objects alive
+         * at vkDestroyDevice (validation error). vio_2d_shutdown is idempotent,
+         * so the free handler's later call is a no-op. */
+        vio_2d_shutdown(&ctx->state_2d);
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }

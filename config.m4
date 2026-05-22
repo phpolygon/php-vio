@@ -275,6 +275,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_cubemap.c \
     src/vio_buffer.c \
     src/vio_2d.c \
+    src/vio_2d_vulkan.c \
     src/vio_font.c \
     src/vio_shader_compiler.c \
     src/vio_shader_reflect.c \

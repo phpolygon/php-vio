@@ -315,9 +315,13 @@ static int create_swapchain(void)
     VkSurfaceFormatKHR *formats = malloc(fmt_count * sizeof(VkSurfaceFormatKHR));
     vkGetPhysicalDeviceSurfaceFormatsKHR(vio_vk.physical_device, vio_vk.surface, &fmt_count, formats);
 
+    /* Prefer B8G8R8A8_UNORM (linear) so vertex colors land in the swapchain
+     * identically to the other backends (D3D12 uses an UNORM target). An sRGB
+     * swapchain would gamma-encode the same colors and shift them brighter,
+     * making golden-image parity impossible. */
     VkSurfaceFormatKHR chosen_format = formats[0];
     for (uint32_t i = 0; i < fmt_count; i++) {
-        if (formats[i].format == VK_FORMAT_B8G8R8A8_SRGB &&
+        if (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM &&
             formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             chosen_format = formats[i];
             break;
@@ -646,16 +650,17 @@ int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
         return -1;
     }
 
-    /* 6. Render pass (need to know swapchain format first — pick B8G8R8A8_SRGB as default) */
-    /* We'll determine the actual format during swapchain creation, create render pass with it */
-    /* For now, query surface format to create render pass before swapchain */
+    /* 6. Render pass. The color format MUST match the swapchain format chosen
+     * in create_swapchain() (B8G8R8A8_UNORM preferred) so the framebuffers and
+     * the 2D pipelines are render-pass-compatible. */
     uint32_t fmt_count = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(vio_vk.physical_device, vio_vk.surface, &fmt_count, NULL);
     VkSurfaceFormatKHR *formats = malloc(fmt_count * sizeof(VkSurfaceFormatKHR));
     vkGetPhysicalDeviceSurfaceFormatsKHR(vio_vk.physical_device, vio_vk.surface, &fmt_count, formats);
     VkFormat color_format = formats[0].format;
     for (uint32_t i = 0; i < fmt_count; i++) {
-        if (formats[i].format == VK_FORMAT_B8G8R8A8_SRGB) {
+        if (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM &&
+            formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             color_format = formats[i].format;
             break;
         }
