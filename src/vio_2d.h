@@ -62,6 +62,7 @@ typedef enum _vio_2d_backend {
     VIO_2D_BACKEND_OPENGL = 1,
     VIO_2D_BACKEND_D3D11  = 2,
     VIO_2D_BACKEND_D3D12  = 3,
+    VIO_2D_BACKEND_VULKAN = 4,
 } vio_2d_backend;
 
 typedef struct _vio_2d_state {
@@ -85,6 +86,7 @@ typedef struct _vio_2d_state {
     /* Per-backend state (opaque pointers to avoid header deps) */
     void           *opengl_state;
     void           *d3d_state;
+    void           *vulkan_state;
 } vio_2d_state;
 
 /* Initialize 2D state (called once after GL context is ready) */

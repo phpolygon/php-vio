@@ -62,7 +62,15 @@ typedef struct _vio_vulkan_state {
     /* State */
     int                      initialized;
     int                      swapchain_needs_recreate;
+    int                      in_frame;          /* 1 while the command buffer is recording (begin_frame..end_frame) */
     float                    clear_r, clear_g, clear_b, clear_a;
+
+    /* Offscreen render-target binding (mirrors vio_d3d12). current_bound_rt is
+     * the vio_render_target_object* whose render pass is active, or NULL =
+     * swapchain. pending_bound_rt holds a target requested before vio_begin;
+     * vio_begin applies it once the command buffer / swapchain pass is open. */
+    void                    *current_bound_rt;
+    void                    *pending_bound_rt;
 
     /* Debug */
     VkDebugUtilsMessengerEXT debug_messenger;

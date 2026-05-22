@@ -792,6 +792,8 @@ static void vulkan_begin_frame(void)
     scissor.offset = (VkOffset2D){0, 0};
     scissor.extent = vio_vk.swapchain_extent;
     vkCmdSetScissor(f->cmd_buf, 0, 1, &scissor);
+
+    vio_vk.in_frame = 1;
 }
 
 static void vulkan_end_frame(void)
@@ -818,6 +820,8 @@ static void vulkan_end_frame(void)
     submit.pSignalSemaphores    = &f->render_finished;
 
     vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, f->in_flight);
+
+    vio_vk.in_frame = 0;
 }
 
 static void vulkan_present(void)
