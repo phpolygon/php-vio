@@ -33,12 +33,20 @@ typedef struct _vio_vulkan_texture {
     struct _vio_vulkan_texture *prev;
 } vio_vulkan_texture;
 
-/* Per-frame synchronization and command buffer resources */
+/* Per-frame synchronization and command buffer resources.
+ *
+ * NOTE: render_finished is intentionally NOT here. A binary semaphore signalled
+ * by the submit and waited by vkQueuePresentKHR must be tied to the SWAPCHAIN
+ * IMAGE, not the frame-in-flight: with FIFO present and (typically) 3 swapchain
+ * images vs 2 frames in flight, a per-frame render_finished gets reused for a
+ * present while a prior present that still references it (on a different,
+ * not-yet-reacquired image) is pending — illegal binary-semaphore reuse
+ * (VUID-vkQueueSubmit-pSignalSemaphores-00067). render_finished therefore lives
+ * in vio_vk.render_finished_per_image[], indexed by current_image_index. */
 typedef struct _vio_vk_frame {
     VkCommandPool   cmd_pool;
     VkCommandBuffer cmd_buf;
     VkSemaphore     image_available;
-    VkSemaphore     render_finished;
     VkFence         in_flight;
 } vio_vk_frame;
 
@@ -61,6 +69,16 @@ typedef struct _vio_vulkan_state {
     VkImage                 *swapchain_images;
     VkImageView             *swapchain_image_views;
     uint32_t                 swapchain_image_count;
+
+    /* render_finished semaphores, one PER SWAPCHAIN IMAGE (array sized
+     * swapchain_image_count). Signalled by the end-of-frame submit and waited by
+     * vkQueuePresentKHR, both indexed by current_image_index. Per-image (not
+     * per-frame-in-flight) so a given image's present always uses the same
+     * semaphore and that present must complete — the image re-acquired — before
+     * the semaphore is reused, which avoids VUID-vkQueueSubmit-pSignalSemaphores-
+     * 00067. Created in create_swapchain(), destroyed in cleanup_swapchain()
+     * (both recreate and shutdown wait the device idle first). */
+    VkSemaphore             *render_finished_per_image;
 
     /* Render pass & framebuffers */
     VkRenderPass             render_pass;

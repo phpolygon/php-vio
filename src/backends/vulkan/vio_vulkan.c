@@ -272,6 +272,20 @@ static int create_logical_device(void)
 
 static void cleanup_swapchain(void)
 {
+    /* render_finished semaphores are per swapchain image; tear them down with
+     * the rest of the swapchain. Callers (vio_vulkan_recreate_swapchain and
+     * vulkan_shutdown) vkDeviceWaitIdle first, so none is in use by a pending
+     * submit or present here. */
+    if (vio_vk.render_finished_per_image) {
+        for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
+            if (vio_vk.render_finished_per_image[i]) {
+                vkDestroySemaphore(vio_vk.device, vio_vk.render_finished_per_image[i], NULL);
+            }
+        }
+        free(vio_vk.render_finished_per_image);
+        vio_vk.render_finished_per_image = NULL;
+    }
+
     if (vio_vk.depth_view) { vkDestroyImageView(vio_vk.device, vio_vk.depth_view, NULL); vio_vk.depth_view = VK_NULL_HANDLE; }
     if (vio_vk.depth_image) {
         if (vio_vk.vma_allocator) {
@@ -482,6 +496,22 @@ static int create_swapchain(void)
         }
     }
 
+    /* Create one render_finished semaphore PER SWAPCHAIN IMAGE (see the field
+     * comment in vio_vulkan.h). Sized to swapchain_image_count, which may differ
+     * across recreates — cleanup_swapchain() destroys these, so the count is
+     * always re-derived here. */
+    vio_vk.render_finished_per_image =
+        malloc(vio_vk.swapchain_image_count * sizeof(VkSemaphore));
+    for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
+        VkSemaphoreCreateInfo sem_info = {0};
+        sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        if (vkCreateSemaphore(vio_vk.device, &sem_info, NULL,
+                              &vio_vk.render_finished_per_image[i]) != VK_SUCCESS) {
+            php_error_docref(NULL, E_WARNING, "Failed to create render_finished semaphore %u", i);
+            return -1;
+        }
+    }
+
     return 0;
 }
 
@@ -585,10 +615,13 @@ static int create_frame_resources(void)
             return -1;
         }
 
+        /* image_available stays per frame-in-flight: it is signalled by
+         * vkAcquireNextImageKHR and waited by this frame's submit, so it is
+         * never reused across an in-flight present (unlike render_finished,
+         * which lives per swapchain image in vio_vk.render_finished_per_image). */
         VkSemaphoreCreateInfo sem_info = {0};
         sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         vkCreateSemaphore(vio_vk.device, &sem_info, NULL, &f->image_available);
-        vkCreateSemaphore(vio_vk.device, &sem_info, NULL, &f->render_finished);
 
         VkFenceCreateInfo fence_info = {0};
         fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -604,7 +637,6 @@ static void destroy_frame_resources(void)
     for (int i = 0; i < VIO_VK_MAX_FRAMES_IN_FLIGHT; i++) {
         vio_vk_frame *f = &vio_vk.frames[i];
         if (f->in_flight) vkDestroyFence(vio_vk.device, f->in_flight, NULL);
-        if (f->render_finished) vkDestroySemaphore(vio_vk.device, f->render_finished, NULL);
         if (f->image_available) vkDestroySemaphore(vio_vk.device, f->image_available, NULL);
         if (f->cmd_pool) vkDestroyCommandPool(vio_vk.device, f->cmd_pool, NULL);
     }
@@ -1196,7 +1228,9 @@ static void vulkan_end_frame(void)
     submit.commandBufferCount   = 1;
     submit.pCommandBuffers      = &f->cmd_buf;
     submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores    = &f->render_finished;
+    /* Signal the render_finished tied to the swapchain IMAGE being rendered, not
+     * the frame-in-flight (avoids VUID-vkQueueSubmit-pSignalSemaphores-00067). */
+    submit.pSignalSemaphores    = &vio_vk.render_finished_per_image[vio_vk.current_image_index];
 
     vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, f->in_flight);
 
@@ -1207,12 +1241,15 @@ static void vulkan_present(void)
 {
     if (!vio_vk.initialized) return;
 
-    vio_vk_frame *f = &vio_vk.frames[vio_vk.current_frame];
-
+    /* No vio_vk_frame needed here: present waits on the per-image
+     * render_finished (indexed by current_image_index), and image rotation /
+     * current_frame advance use vio_vk fields directly. */
     VkPresentInfoKHR present_info = {0};
     present_info.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     present_info.waitSemaphoreCount = 1;
-    present_info.pWaitSemaphores    = &f->render_finished;
+    /* Wait on the render_finished tied to the image being presented (matches the
+     * submit in vulkan_end_frame), indexed by current_image_index. */
+    present_info.pWaitSemaphores    = &vio_vk.render_finished_per_image[vio_vk.current_image_index];
     present_info.swapchainCount     = 1;
     present_info.pSwapchains        = &vio_vk.swapchain;
     present_info.pImageIndices      = &vio_vk.current_image_index;
