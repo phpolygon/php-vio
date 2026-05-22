@@ -365,6 +365,13 @@ ZEND_FUNCTION(vio_poll_events)
 #endif
 }
 
+#ifdef HAVE_D3D12
+/* Defined further down (next to vio_bind_render_target); forward-declared here
+ * so vio_begin() can flush a render-target bind that was requested before the
+ * frame's command list was open. */
+static void d3d12_record_bind_render_target(vio_render_target_object *rt);
+#endif
+
 ZEND_FUNCTION(vio_begin)
 {
     zval *ctx_zval;
@@ -471,6 +478,23 @@ ZEND_FUNCTION(vio_begin)
     if (ctx->backend->begin_frame) {
         ctx->backend->begin_frame();
     }
+
+#ifdef HAVE_D3D12
+    /* Apply a render-target bind requested before vio_begin(): the command
+     * list is now open (begin_frame() reset it), so the deferred bind can
+     * finally be recorded. Without this, a pre-begin vio_bind_render_target on
+     * D3D12 is dropped and draws hit the swapchain instead of the offscreen
+     * target (the warm-render "bind then begin" order). */
+    if (vio_d3d12.initialized && vio_d3d12.pending_bound_rt
+            && strcmp(ctx->backend->name, "d3d12") == 0) {
+        vio_render_target_object *prt =
+            (vio_render_target_object *)vio_d3d12.pending_bound_rt;
+        vio_d3d12.pending_bound_rt = NULL;
+        if (prt->valid) {
+            d3d12_record_bind_render_target(prt);
+        }
+    }
+#endif
 
     ctx->in_frame = 1;
 }
@@ -5751,6 +5775,72 @@ ZEND_FUNCTION(vio_render_target)
     RETURN_COPY_VALUE(&rt_zval);
 }
 
+#ifdef HAVE_D3D12
+/* Record the D3D12 commands that make `rt` the active render target.
+ * Caller MUST ensure the command list is open (vio_d3d12.in_frame == 1) —
+ * every call here lands on vio_d3d12.cmd_list, which only accepts commands
+ * between d3d12_begin_frame()'s Reset() and d3d12_end_frame()'s Close().
+ * Out-of-frame binds are deferred via vio_d3d12.pending_bound_rt and applied
+ * from vio_begin(). */
+static void d3d12_record_bind_render_target(vio_render_target_object *rt)
+{
+    /* Barrier: if color resource was used as SRV, transition back to RENDER_TARGET */
+    if (rt->d3d12_color_resource && rt->d3d12_color_is_srv) {
+        D3D12_RESOURCE_BARRIER barrier = {0};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = (ID3D12Resource *)rt->d3d12_color_resource;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+        rt->d3d12_color_is_srv = 0;
+    }
+
+    /* Barrier: if depth resource was used as SRV, transition back to DEPTH_WRITE */
+    if (rt->d3d12_depth_resource && rt->d3d12_depth_is_srv) {
+        D3D12_RESOURCE_BARRIER barrier = {0};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = (ID3D12Resource *)rt->d3d12_depth_resource;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+        rt->d3d12_depth_is_srv = 0;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+        (ID3D12DescriptorHeap *)rt->d3d12_dsv_heap, &dsv_handle);
+
+    if (rt->depth_only) {
+        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 0, NULL, FALSE, &dsv_handle);
+        vio_d3d12.current_has_rtv = 0;
+    } else {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
+            (ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &rtv_handle);
+        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
+        vio_d3d12.current_rtv = rtv_handle;
+        vio_d3d12.current_has_rtv = 1;
+    }
+    vio_d3d12.current_dsv = dsv_handle;
+    vio_d3d12.current_rt_width = rt->width;
+    vio_d3d12.current_rt_height = rt->height;
+
+    D3D12_VIEWPORT vp = {0};
+    vp.Width = (float)rt->width;
+    vp.Height = (float)rt->height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, 1, &vp);
+
+    D3D12_RECT scissor = {0, 0, rt->width, rt->height};
+    ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
+
+    vio_d3d12.current_bound_rt = rt;
+}
+#endif
+
 ZEND_FUNCTION(vio_bind_render_target)
 {
     zval *ctx_zval;
@@ -5815,60 +5905,17 @@ ZEND_FUNCTION(vio_bind_render_target)
 
 #ifdef HAVE_D3D12
     if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized) {
-        /* Barrier: if color resource was used as SRV, transition back to RENDER_TARGET */
-        if (rt->d3d12_color_resource && rt->d3d12_color_is_srv) {
-            D3D12_RESOURCE_BARRIER barrier = {0};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = (ID3D12Resource *)rt->d3d12_color_resource;
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
-            rt->d3d12_color_is_srv = 0;
-        }
-
-        /* Barrier: if depth resource was used as SRV, transition back to DEPTH_WRITE */
-        if (rt->d3d12_depth_resource && rt->d3d12_depth_is_srv) {
-            D3D12_RESOURCE_BARRIER barrier = {0};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = (ID3D12Resource *)rt->d3d12_depth_resource;
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
-            rt->d3d12_depth_is_srv = 0;
-        }
-
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
-            (ID3D12DescriptorHeap *)rt->d3d12_dsv_heap, &dsv_handle);
-
-        if (rt->depth_only) {
-            ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 0, NULL, FALSE, &dsv_handle);
-            vio_d3d12.current_has_rtv = 0;
+        if (vio_d3d12.in_frame) {
+            d3d12_record_bind_render_target(rt);
         } else {
-            D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
-            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
-                (ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &rtv_handle);
-            ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
-            vio_d3d12.current_rtv = rtv_handle;
-            vio_d3d12.current_has_rtv = 1;
+            /* Called before vio_begin(): the command list is closed, so the
+             * bind cannot be recorded yet (the D3D12 debug layer would report
+             * "This API cannot be called on a closed command list" at the next
+             * begin_frame InfoQueue drain). Defer it — vio_begin() applies the
+             * pending bind once the frame's list is open. This is what makes
+             * the warm-render "bind then begin" order work on D3D12. */
+            vio_d3d12.pending_bound_rt = rt;
         }
-        vio_d3d12.current_dsv = dsv_handle;
-        vio_d3d12.current_rt_width = rt->width;
-        vio_d3d12.current_rt_height = rt->height;
-
-        D3D12_VIEWPORT vp = {0};
-        vp.Width = (float)rt->width;
-        vp.Height = (float)rt->height;
-        vp.MinDepth = 0.0f;
-        vp.MaxDepth = 1.0f;
-        ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, 1, &vp);
-
-        D3D12_RECT scissor = {0, 0, rt->width, rt->height};
-        ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
-
-        vio_d3d12.current_bound_rt = rt;
     }
 #endif
 }
@@ -5941,6 +5988,28 @@ ZEND_FUNCTION(vio_unbind_render_target)
 
 #ifdef HAVE_D3D12
     if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+        if (!vio_d3d12.in_frame) {
+            /* Command list is closed (vio_unbind_render_target called after
+             * vio_end — e.g. VioRenderer2D::endFrame / endOffscreenFrame in the
+             * warm-render path). Recording the restore-swapchain barrier +
+             * OMSetRenderTargets here would hit the closed list and surface as
+             * "This API cannot be called on a closed command list" at the next
+             * begin_frame drain. It's also unnecessary: the next
+             * d3d12_begin_frame() unconditionally rebinds the swapchain target.
+             * Just drop tracked + pending binding so stale state can't leak.
+             *
+             * NOTE: this skips the RENDER_TARGET->PIXEL_SHADER_RESOURCE barrier
+             * the in-frame path records, so the offscreen color stays in
+             * RENDER_TARGET state. That's correct for the only out-of-frame
+             * unbind caller (Engine::warmRender, which discards its offscreen
+             * target without ever sampling it). A render-to-texture caller that
+             * wants to SAMPLE the result must unbind while a frame is open so the
+             * SRV transition is recorded. */
+            vio_d3d12.pending_bound_rt = NULL;
+            vio_d3d12.current_bound_rt = NULL;
+            return;
+        }
+
         /* Barrier: transition the offscreen depth resource to SRV for shadow sampling.
          * We find the currently bound RT's depth resource from the DSV heap.
          * Since we track the RT object via current_dsv, and the depth_resource is stored

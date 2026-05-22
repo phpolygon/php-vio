@@ -116,6 +116,9 @@ typedef struct _vio_d3d12_state {
     int current_rt_height;
     int current_has_rtv;  /* 0 = depth-only when offscreen */
     void *current_bound_rt; /* vio_render_target_object* for barrier tracking */
+    void *pending_bound_rt; /* vio_render_target_object* requested via vio_bind_render_target
+                             * while the command list was closed (before vio_begin); applied
+                             * by vio_begin once the frame's command list is open. */
 
     /* Pending texture bindings (flushed before each draw into a contiguous SRV block) */
     D3D12_CPU_DESCRIPTOR_HANDLE pending_srvs[8]; /* CPU handles of bound textures */

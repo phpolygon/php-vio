@@ -1223,6 +1223,20 @@ static void d3d12_destroy_render_target(void *rt_ptr)
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (rt->backend_type != VIO_RT_BACKEND_D3D12) return;
 
+    /* Drop any dangling references to this target so a later bind/unbind/begin
+     * can't dereference freed memory if the RT is destroyed while still tracked
+     * (e.g. released without an intervening in-frame unbind). */
+    if (vio_d3d12.current_bound_rt == rt) vio_d3d12.current_bound_rt = NULL;
+    if (vio_d3d12.pending_bound_rt == rt) vio_d3d12.pending_bound_rt = NULL;
+
+    /* Ensure the GPU is finished with these resources before releasing them.
+     * An offscreen target rendered to in a present-skipped frame (warm-render
+     * path) has no Present to implicitly throttle the CPU, so its command list
+     * may still be in flight here — releasing now would be a use-after-free
+     * (device-removed / crash). wait_for_gpu() is a no-op once the queue/fence
+     * are gone (shutdown), and destroy is rare, so the stall is harmless. */
+    vio_d3d12_wait_for_gpu();
+
     /* Cached backend-texture wrappers — descriptors are borrowed from the
      * RT's heap, so we just free the wrapper struct itself. */
     for (int i = 0; i < 2; i++) {
@@ -1589,6 +1603,22 @@ static void d3d12_draw_indexed(vio_draw_indexed_cmd *cmd)
 static void d3d12_present(void)
 {
     if (!vio_d3d12.swapchain) return;
+
+    /* Offscreen render target still bound at end-of-frame (warm-render /
+     * render-to-texture): the frame's draws went to the offscreen target, not
+     * the swapchain backbuffer. Presenting here would flip an undrawn
+     * FLIP_DISCARD backbuffer (undefined contents) to the screen — the visible
+     * "pre-warm" flash. Skip the Present and the buffer rotation, but STILL
+     * signal the fence: end_frame already did ExecuteCommandLists, and the next
+     * d3d12_begin_frame()'s wait_for_frame() (which reuses this same frame_index
+     * since we didn't rotate) must see that work complete before it resets the
+     * allocator. Mirrors metal_present's offscreen (no-drawable) path. */
+    if (vio_d3d12.current_bound_rt) {
+        vio_d3d12.fence_value++;
+        vio_d3d12.frames[vio_d3d12.frame_index].fence_value = vio_d3d12.fence_value;
+        ID3D12CommandQueue_Signal(vio_d3d12.cmd_queue, vio_d3d12.fence, vio_d3d12.fence_value);
+        return;
+    }
 
     HRESULT hr = IDXGISwapChain3_Present(vio_d3d12.swapchain, vio_d3d12.vsync ? 1 : 0, 0);
     if (FAILED(hr)) {

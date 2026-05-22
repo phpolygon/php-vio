@@ -1074,6 +1074,18 @@ static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
 static void d3d11_present(void)
 {
     if (!vio_d3d11.swapchain) return;
+
+    /* Present only when the backbuffer RTV is the bound color target. Any other
+     * value of current_rtv means the frame's draws went somewhere other than
+     * the swapchain — an offscreen color target (warm-render / render-to-texture)
+     * or a depth-only pass (current_rtv == NULL) — and presenting would flip an
+     * undrawn backbuffer to the screen (the visible "pre-warm" flash). vio_d3d11.rtv
+     * is non-NULL whenever the swapchain exists, and d3d11_begin_frame re-syncs
+     * current_rtv = rtv every frame, so normal frames always present.
+     * vio_unbind_render_target restores current_rtv = rtv. Mirrors metal_present /
+     * d3d12_present offscreen handling. */
+    if (vio_d3d11.current_rtv != vio_d3d11.rtv) return;
+
     IDXGISwapChain1_Present(vio_d3d11.swapchain, vio_d3d11.vsync ? 1 : 0, 0);
 }
 
