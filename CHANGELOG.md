@@ -1,3 +1,10 @@
+## [1.15.1](https://github.com/phpolygon/php-vio/compare/v1.15.0...v1.15.1) (2026-05-22)
+
+
+### Bug Fixes
+
+* **d3d12:** offscreen warm-render no longer flashes or trips the command list ([42a9ebf](https://github.com/phpolygon/php-vio/commit/42a9ebfcbd00ef0111c1f8606a58f1d30b2c028c))
+
 # [1.15.0](https://github.com/phpolygon/php-vio/compare/v1.14.0...v1.15.0) (2026-05-20)
 
 
