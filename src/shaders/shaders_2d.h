@@ -91,6 +91,7 @@ static const char *vio_2d_vk_vs =
     "layout(location = 1) out vec4 vColor;\n"
     "void main() {\n"
     "    gl_Position = pc.uProjection * vec4(aPosition, 0.0, 1.0);\n"
+    "    gl_Position.y = -gl_Position.y; // Vulkan clip-space Y points down (NDC y=-1 at top); flip to match the GL/D3D-oriented 2D projection. CULL_MODE_NONE, so the winding flip is irrelevant.\n"
     "    vTexCoord = aTexCoord;\n"
     "    vColor = aColor;\n"
     "}\n";
