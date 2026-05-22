@@ -655,25 +655,29 @@ void vio_2d_flush(vio_2d_state *state)
         float sc_x = 0, sc_y = 0, sc_w = 0, sc_h = 0;
         int   scissor_custom = 0;
 
+        /* Cache the last bound texture -> descriptor set within this frame so a
+         * sorted run of items sharing one texture (the common glyph case)
+         * allocates / binds exactly one set. The batch is sorted by z then
+         * texture_id, so identical textures are adjacent. The sentinel is the
+         * address of a local — distinct from NULL and from any heap-allocated
+         * backend_texture, so the first textured item always allocates. */
+        static char     tex_sentinel;
+        void           *current_tex = &tex_sentinel;
+        VkDescriptorSet current_set = VK_NULL_HANDLE;
+
         for (int i = 0; i < state->item_count; i++) {
             vio_2d_item *item = &state->items[i];
-
-            /* Phase 1: shapes only. Skip textured items (sprites/text) by TYPE
-             * — they need a bound combined-image-sampler descriptor (Phase 2),
-             * and binding a missing one would be a validation error. Type is the
-             * reliable signal here: on Vulkan a font atlas has texture_id == 0
-             * (that's the GL name) and backend_texture == NULL (the Vulkan
-             * texture path is a Phase-2 stub), so a handle-based check would
-             * miss text and draw glyph quads as solid color. */
-            if (item->type == VIO_2D_SPRITE || item->type == VIO_2D_TEXT) {
-                continue;
-            }
 
             /* Defensive: skip items whose vertices fell outside the clamped
              * slice so vkCmdDraw never reads past the uploaded region. */
             if (item->vertex_start + item->vertex_count > vcount) {
                 continue;
             }
+
+            /* A textured item (sprite/glyph) needs a valid Vulkan backend
+             * texture. If it has none (e.g. a font atlas that failed to upload),
+             * skip it rather than sampling an unbound descriptor. */
+            int textured = (item->backend_texture != NULL);
 
             /* Scissor (scale logical->framebuffer, then CLAMP to render area). */
             if (item->scissor.enabled) {
@@ -706,11 +710,35 @@ void vio_2d_flush(vio_2d_state *state)
                 scissor_custom = 0;
             }
 
-            /* Pipeline on type-group change. Phase 1 only binds shapes. */
-            VkPipeline wanted = vk->pipeline_shapes;
+            /* Pipeline: sprites (samples the bound texture) for textured items,
+             * shapes (ignores the descriptor) otherwise. Both share the pipeline
+             * layout, so the descriptor set stays bound across a shapes draw —
+             * harmless because the shapes shader never samples binding 0. */
+            VkPipeline wanted = textured ? vk->pipeline_sprites : vk->pipeline_shapes;
             if (wanted != current_pipeline) {
                 current_pipeline = wanted;
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, current_pipeline);
+            }
+
+            /* Texture -> descriptor set. Allocate from this frame's pool on a
+             * texture change and cache it for the sorted run of same-texture
+             * items. On allocation failure (pool exhaustion) skip the draw. */
+            if (textured) {
+                if (item->backend_texture != current_tex) {
+                    current_tex = item->backend_texture;
+                    vio_vulkan_texture *vtex = (vio_vulkan_texture *)current_tex;
+                    current_set = vio_2d_vulkan_alloc_texture_set(
+                        vk, vio_vk.current_frame, vtex->view, vtex->sampler);
+                    if (current_set != VK_NULL_HANDLE) {
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                vk->pipeline_layout, 0, 1, &current_set, 0, NULL);
+                    }
+                }
+                if (current_set == VK_NULL_HANDLE) {
+                    /* Allocation failed for this texture — don't draw with an
+                     * unbound sampler (validation error / undefined sample). */
+                    continue;
+                }
             }
 
             vkCmdDraw(cmd, (uint32_t)item->vertex_count, 1, (uint32_t)item->vertex_start, 0);

@@ -28,6 +28,17 @@
 extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage /*0=vertex,1=fragment*/,
                                            size_t *out_size, char **error_msg);
 
+/* Sets per frame-in-flight pool. Generous so a frame touching many distinct
+ * textures (one set per distinct texture per frame) never exhausts the pool. */
+#define VIO_2D_VK_DESCRIPTORS_PER_POOL 1024
+
+/* Single active 2D state, set in init / cleared in shutdown. vulkan_begin_frame
+ * (a backend function with no context pointer) reaches the per-frame descriptor
+ * pools through this so it can reset them after the in_flight fence wait. There
+ * is effectively one rendering context, so a single pointer suffices; a second
+ * init would simply re-point it (and the first would already be shut down). */
+static vio_2d_vulkan_state *g_active_2d_vk = NULL;
+
 /* ── Compile a GLSL stage into a VkShaderModule ──────────────────── */
 
 static VkShaderModule vio_2d_vk_make_module(const char *glsl, int is_fragment)
@@ -256,7 +267,91 @@ int vio_2d_vulkan_init(vio_2d_vulkan_state *state)
         return -1;
     }
 
+    /* 6. Per-frame descriptor pools (one combined-image-sampler set per distinct
+     *    texture per frame). VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT is
+     *    deliberately NOT set: we never free individual sets, we vkResetDescriptorPool
+     *    the whole pool each frame, which is cheaper and the recommended pattern. */
+    VkDescriptorPoolSize pool_size = {0};
+    pool_size.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    pool_size.descriptorCount = VIO_2D_VK_DESCRIPTORS_PER_POOL;
+
+    VkDescriptorPoolCreateInfo pool_info = {0};
+    pool_info.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets       = VIO_2D_VK_DESCRIPTORS_PER_POOL;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes    = &pool_size;
+
+    for (int i = 0; i < VIO_VK_MAX_FRAMES_IN_FLIGHT; i++) {
+        if (vkCreateDescriptorPool(vio_vk.device, &pool_info, NULL, &state->desc_pools[i]) != VK_SUCCESS) {
+            php_error_docref(NULL, E_WARNING, "Vulkan 2D: failed to create descriptor pool %d", i);
+            vio_2d_vulkan_shutdown(state);
+            return -1;
+        }
+    }
+
+    g_active_2d_vk = state;
     return 0;
+}
+
+/* ── Per-frame descriptor pool reset (called from vulkan_begin_frame) ── */
+
+void vio_2d_vulkan_reset_frame_descriptors(uint32_t frame_index)
+{
+    vio_2d_vulkan_state *state = g_active_2d_vk;
+    if (!state || !vio_vk.device) return;
+    if (frame_index >= VIO_VK_MAX_FRAMES_IN_FLIGHT) return;
+    if (state->desc_pools[frame_index] != VK_NULL_HANDLE) {
+        /* Frees every set previously allocated from this pool in one shot.
+         * Safe: the in_flight fence for this frame was waited just before this
+         * call, so none of those sets is still referenced by the GPU. */
+        vkResetDescriptorPool(vio_vk.device, state->desc_pools[frame_index], 0);
+    }
+}
+
+/* ── Allocate + update a combined-image-sampler set for a texture ────── */
+
+VkDescriptorSet vio_2d_vulkan_alloc_texture_set(vio_2d_vulkan_state *state,
+                                                uint32_t frame_index,
+                                                VkImageView view, VkSampler sampler)
+{
+    if (!state || frame_index >= VIO_VK_MAX_FRAMES_IN_FLIGHT) return VK_NULL_HANDLE;
+    VkDescriptorPool pool = state->desc_pools[frame_index];
+    if (pool == VK_NULL_HANDLE || view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+
+    VkDescriptorSetAllocateInfo ai = {0};
+    ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool     = pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts        = &state->set_layout;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkResult r = vkAllocateDescriptorSets(vio_vk.device, &ai, &set);
+    if (r != VK_SUCCESS) {
+        /* VK_ERROR_OUT_OF_POOL_MEMORY / fragmentation: warn once and let the
+         * caller skip this textured draw rather than binding a stale set. */
+        php_error_docref(NULL, E_WARNING,
+            "Vulkan 2D: descriptor set allocation failed (VkResult %d); skipping textured draw", r);
+        return VK_NULL_HANDLE;
+    }
+
+    VkDescriptorImageInfo img = {0};
+    img.sampler     = sampler;
+    img.imageView   = view;
+    img.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet w = {0};
+    w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet          = set;
+    w.dstBinding      = 0;
+    w.dstArrayElement = 0;
+    w.descriptorCount = 1;
+    w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo      = &img;
+    vkUpdateDescriptorSets(vio_vk.device, 1, &w, 0, NULL);
+
+    return set;
 }
 
 /* ── Shutdown ────────────────────────────────────────────────────── */
@@ -264,6 +359,8 @@ int vio_2d_vulkan_init(vio_2d_vulkan_state *state)
 void vio_2d_vulkan_shutdown(vio_2d_vulkan_state *state)
 {
     if (!state) return;
+
+    if (g_active_2d_vk == state) g_active_2d_vk = NULL;
 
     /* If the device is already gone (vio_vk zeroed by a prior vulkan_shutdown),
      * there is nothing to destroy and every handle dangles — bail out. The
@@ -279,6 +376,12 @@ void vio_2d_vulkan_shutdown(vio_2d_vulkan_state *state)
      * in-use pipeline/buffer is a use-after-free the layers flag. (Cheap: only
      * runs once at context teardown.) */
     vkDeviceWaitIdle(vio_vk.device);
+
+    for (int i = 0; i < VIO_VK_MAX_FRAMES_IN_FLIGHT; i++) {
+        if (state->desc_pools[i]) {
+            vkDestroyDescriptorPool(vio_vk.device, state->desc_pools[i], NULL);
+        }
+    }
 
     if (state->vbo) {
         if (state->vbo_mapped) {

@@ -13,6 +13,26 @@
 
 #define VIO_VK_MAX_FRAMES_IN_FLIGHT 2
 
+/* Backend texture wrapper. Stored as the opaque backend_texture handle on
+ * vio_texture_object / vio_font_object->atlas_backend_texture. The image is
+ * VMA DEVICE_LOCAL (R8G8B8A8_UNORM), sampled in the 2D sprites pipeline via a
+ * combined image sampler descriptor (set 0, binding 0). */
+typedef struct _vio_vulkan_texture {
+    VkImage       image;
+    void         *allocation;   /* VmaAllocation (opaque) */
+    VkImageView   view;
+    VkSampler     sampler;
+    int           width;
+    int           height;
+    /* Intrusive doubly-linked list of all live textures, anchored on
+     * vio_vk.live_textures. vulkan_shutdown sweeps any survivors before
+     * vkDestroyDevice so a PHP texture/font object outliving vio_destroy()
+     * does not leave a VkImage alive at device destruction (a validation
+     * error). vulkan_destroy_texture unlinks itself. */
+    struct _vio_vulkan_texture *next;
+    struct _vio_vulkan_texture *prev;
+} vio_vulkan_texture;
+
 /* Per-frame synchronization and command buffer resources */
 typedef struct _vio_vk_frame {
     VkCommandPool   cmd_pool;
@@ -58,6 +78,10 @@ typedef struct _vio_vulkan_state {
 
     /* VMA allocator */
     void                    *vma_allocator; /* VmaAllocator, opaque from C */
+
+    /* Head of the intrusive list of live backend textures (see
+     * vio_vulkan_texture). Swept in vulkan_shutdown before vkDestroyDevice. */
+    struct _vio_vulkan_texture *live_textures;
 
     /* State */
     int                      initialized;
@@ -108,6 +132,12 @@ int  vio_vma_create_image(void *allocator, const VkImageCreateInfo *info,
                            VkMemoryPropertyFlags mem_props,
                            VkImage *out_image, void **out_allocation);
 void vio_vma_destroy_image(void *allocator, VkImage image, void *allocation);
+
+/* Reset the 2D descriptor-set pool for the given frame-in-flight. Implemented
+ * in vio_2d_vulkan.c; called from vulkan_begin_frame AFTER the in_flight fence
+ * has been waited (the sync point that makes reset of an in-flight pool safe).
+ * No-op when the 2D Vulkan state has not been initialised yet. */
+void vio_2d_vulkan_reset_frame_descriptors(uint32_t frame_index);
 
 #endif /* HAVE_VULKAN */
 #endif /* VIO_VULKAN_H */

@@ -18,6 +18,9 @@
 #endif
 
 #include "vio_vulkan.h"
+#include "../../vio_texture.h"
+#include "../../vio_font.h"
+#include "../../../include/vio_types.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -518,12 +521,25 @@ static int create_render_pass(VkFormat color_format)
     subpass.pColorAttachments       = &color_ref;
     subpass.pDepthStencilAttachment = &depth_ref;
 
+    /* External dependency. The source scope MUST cover the PRIOR frame's
+     * attachment writes (color store at COLOR_ATTACHMENT_OUTPUT, depth store at
+     * LATE_FRAGMENT_TESTS) so they complete before this frame's loadOp clears /
+     * layout transitions write the same attachments. Omitting LATE_FRAGMENT_TESTS
+     * + the WRITE access bits from the source leaves a depth WRITE_AFTER_WRITE
+     * hazard across consecutive frames that synchronization validation flags.
+     * Both EARLY and LATE fragment-test stages are listed for depth; color uses
+     * COLOR_ATTACHMENT_OUTPUT for both load and store. */
     VkSubpassDependency dep = {0};
     dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
     dep.dstSubpass    = 0;
-    dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dep.srcAccessMask = 0;
-    dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                      | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                      | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                      | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
     dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
     VkRenderPassCreateInfo rp_info = {0};
@@ -681,6 +697,10 @@ int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
 
 /* ── Backend vtable implementation ───────────────────────────────── */
 
+/* Forward decl: defined with the texture code below, used by vulkan_shutdown's
+ * live-texture sweep above it. */
+static void vulkan_release_texture_gpu(vio_vulkan_texture *tex, int wait);
+
 static int vulkan_init(vio_config *cfg)
 {
     (void)cfg;
@@ -693,6 +713,18 @@ static void vulkan_shutdown(void)
     if (!vio_vk.initialized) return;
 
     vkDeviceWaitIdle(vio_vk.device);
+
+    /* Sweep any backend textures whose owning PHP object outlived vio_destroy()
+     * (the Zend free handlers run during request shutdown, AFTER this). Without
+     * this their VkImage/VkImageView/VkSampler would still be alive at
+     * vkDestroyDevice — a VUID-vkDestroyDevice-device-05137 validation error.
+     * The GPU is already idle, so pass wait=0. The free handlers null their own
+     * backend_texture pointers afterwards, but since the device is gone by then
+     * GPU objects are gone, so the later vulkan_destroy_texture only frees the
+     * heap struct (its release step is a no-op on the now-NULL device). */
+    while (vio_vk.live_textures) {
+        vulkan_release_texture_gpu(vio_vk.live_textures, 0);
+    }
 
     destroy_frame_resources();
     cleanup_swapchain();
@@ -730,8 +762,343 @@ static void *vulkan_create_buffer(vio_buffer_desc *desc) { (void)desc; return NU
 static void vulkan_update_buffer(void *buf, const void *data, size_t size) { (void)buf; (void)data; (void)size; }
 static void vulkan_destroy_buffer(void *buf) { (void)buf; }
 
-static void *vulkan_create_texture(vio_texture_desc *desc) { (void)desc; return NULL; }
-static void vulkan_destroy_texture(void *tex) { (void)tex; }
+/* ── Texture creation ────────────────────────────────────────────────
+ *
+ * Uploads happen at vio_texture()/vio_font() time, which is OUTSIDE any frame
+ * (no swapchain command buffer is recording). We therefore allocate a transient
+ * one-time-submit command buffer, record the layout transitions + buffer-to-
+ * image copy, submit, and block on a transfer fence before tearing the staging
+ * resources down. This keeps the upload entirely off the per-frame command
+ * buffer so there is no cross-frame hazard.
+ */
+static void *vulkan_create_texture(vio_texture_desc *desc)
+{
+    if (!vio_vk.initialized || !vio_vk.device || desc->width <= 0 || desc->height <= 0) {
+        return NULL;
+    }
+
+    vio_vulkan_texture *tex = calloc(1, sizeof(vio_vulkan_texture));
+    if (!tex) return NULL;
+    tex->width  = desc->width;
+    tex->height = desc->height;
+
+    const VkFormat   fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    const VkDeviceSize img_bytes = (VkDeviceSize)desc->width * (VkDeviceSize)desc->height * 4u;
+
+    /* 1. DEVICE_LOCAL sampled image. */
+    VkImageCreateInfo img_info = {0};
+    img_info.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_info.imageType     = VK_IMAGE_TYPE_2D;
+    img_info.format        = fmt;
+    img_info.extent.width  = (uint32_t)desc->width;
+    img_info.extent.height = (uint32_t)desc->height;
+    img_info.extent.depth  = 1;
+    img_info.mipLevels     = 1;
+    img_info.arrayLayers   = 1;
+    img_info.samples       = VK_SAMPLE_COUNT_1_BIT;
+    img_info.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    img_info.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    img_info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+    img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (vio_vma_create_image(vio_vk.vma_allocator, &img_info,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                             &tex->image, &tex->allocation) != 0) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to create texture image (%dx%d)",
+                          desc->width, desc->height);
+        free(tex);
+        return NULL;
+    }
+
+    /* 2. Upload pixel data (if any) via a HOST_VISIBLE staging buffer + a
+     *    transient one-time-submit command buffer. */
+    if (desc->data && img_bytes > 0) {
+        VkBuffer staging = VK_NULL_HANDLE;
+        void    *staging_alloc = NULL;
+        if (vio_vma_create_buffer(vio_vk.vma_allocator, img_bytes,
+                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  &staging, &staging_alloc) != 0) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: failed to create texture staging buffer");
+            vio_vma_destroy_image(vio_vk.vma_allocator, tex->image, tex->allocation);
+            free(tex);
+            return NULL;
+        }
+
+        void *mapped = vio_vma_map(vio_vk.vma_allocator, staging_alloc);
+        if (mapped) {
+            memcpy(mapped, desc->data, (size_t)img_bytes);
+            vio_vma_unmap(vio_vk.vma_allocator, staging_alloc);
+        }
+
+        /* Transient command pool + one-time-submit buffer. */
+        VkCommandPool up_pool = VK_NULL_HANDLE;
+        VkCommandPoolCreateInfo pool_info = {0};
+        pool_info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pool_info.queueFamilyIndex = vio_vk.graphics_family;
+        vkCreateCommandPool(vio_vk.device, &pool_info, NULL, &up_pool);
+
+        VkCommandBuffer up_cmd = VK_NULL_HANDLE;
+        VkCommandBufferAllocateInfo cmd_alloc = {0};
+        cmd_alloc.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc.commandPool        = up_pool;
+        cmd_alloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_alloc.commandBufferCount = 1;
+        vkAllocateCommandBuffers(vio_vk.device, &cmd_alloc, &up_cmd);
+
+        VkCommandBufferBeginInfo begin = {0};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(up_cmd, &begin);
+
+        /* UNDEFINED -> TRANSFER_DST_OPTIMAL. */
+        VkImageMemoryBarrier to_dst = {0};
+        to_dst.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_dst.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+        to_dst.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.image               = tex->image;
+        to_dst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        to_dst.subresourceRange.levelCount = 1;
+        to_dst.subresourceRange.layerCount = 1;
+        to_dst.srcAccessMask       = 0;
+        to_dst.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(up_cmd,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &to_dst);
+
+        VkBufferImageCopy copy = {0};
+        copy.bufferOffset      = 0;
+        copy.bufferRowLength   = 0;   /* tightly packed */
+        copy.bufferImageHeight = 0;
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent.width  = (uint32_t)desc->width;
+        copy.imageExtent.height = (uint32_t)desc->height;
+        copy.imageExtent.depth  = 1;
+        vkCmdCopyBufferToImage(up_cmd, staging, tex->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+        /* TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL. */
+        VkImageMemoryBarrier to_read = {0};
+        to_read.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_read.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_read.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_read.image               = tex->image;
+        to_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        to_read.subresourceRange.levelCount = 1;
+        to_read.subresourceRange.layerCount = 1;
+        to_read.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_read.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(up_cmd,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &to_read);
+
+        vkEndCommandBuffer(up_cmd);
+
+        /* Submit + block on a transfer fence (upload is outside any frame, so a
+         * full queue stall here is acceptable and keeps lifetimes simple). */
+        VkFence up_fence = VK_NULL_HANDLE;
+        VkFenceCreateInfo fci = {0};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        vkCreateFence(vio_vk.device, &fci, NULL, &up_fence);
+
+        VkSubmitInfo submit = {0};
+        submit.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers    = &up_cmd;
+        vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, up_fence);
+        vkWaitForFences(vio_vk.device, 1, &up_fence, VK_TRUE, UINT64_MAX);
+
+        vkDestroyFence(vio_vk.device, up_fence, NULL);
+        vkDestroyCommandPool(vio_vk.device, up_pool, NULL); /* frees up_cmd */
+        vio_vma_destroy_buffer(vio_vk.vma_allocator, staging, staging_alloc);
+    } else {
+        /* No data: still transition UNDEFINED -> SHADER_READ_ONLY so the image
+         * is in a samplable layout (sampling it yields garbage, but the layout
+         * is valid and the layers stay quiet). */
+        VkCommandPool up_pool = VK_NULL_HANDLE;
+        VkCommandPoolCreateInfo pool_info = {0};
+        pool_info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pool_info.queueFamilyIndex = vio_vk.graphics_family;
+        vkCreateCommandPool(vio_vk.device, &pool_info, NULL, &up_pool);
+
+        VkCommandBuffer up_cmd = VK_NULL_HANDLE;
+        VkCommandBufferAllocateInfo cmd_alloc = {0};
+        cmd_alloc.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc.commandPool        = up_pool;
+        cmd_alloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_alloc.commandBufferCount = 1;
+        vkAllocateCommandBuffers(vio_vk.device, &cmd_alloc, &up_cmd);
+
+        VkCommandBufferBeginInfo begin = {0};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(up_cmd, &begin);
+
+        VkImageMemoryBarrier to_read = {0};
+        to_read.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_read.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+        to_read.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_read.image               = tex->image;
+        to_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        to_read.subresourceRange.levelCount = 1;
+        to_read.subresourceRange.layerCount = 1;
+        to_read.srcAccessMask       = 0;
+        to_read.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(up_cmd,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &to_read);
+
+        vkEndCommandBuffer(up_cmd);
+
+        VkFence up_fence = VK_NULL_HANDLE;
+        VkFenceCreateInfo fci = {0};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        vkCreateFence(vio_vk.device, &fci, NULL, &up_fence);
+
+        VkSubmitInfo submit = {0};
+        submit.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers    = &up_cmd;
+        vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, up_fence);
+        vkWaitForFences(vio_vk.device, 1, &up_fence, VK_TRUE, UINT64_MAX);
+
+        vkDestroyFence(vio_vk.device, up_fence, NULL);
+        vkDestroyCommandPool(vio_vk.device, up_pool, NULL);
+    }
+
+    /* 3. Image view. */
+    VkImageViewCreateInfo iv = {0};
+    iv.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    iv.image    = tex->image;
+    iv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    iv.format   = fmt;
+    iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    iv.subresourceRange.levelCount = 1;
+    iv.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(vio_vk.device, &iv, NULL, &tex->view) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to create texture image view");
+        vio_vma_destroy_image(vio_vk.vma_allocator, tex->image, tex->allocation);
+        free(tex);
+        return NULL;
+    }
+
+    /* 4. Sampler from desc->filter / desc->wrap. */
+    VkFilter             vk_filter = (desc->filter == VIO_FILTER_NEAREST)
+                                     ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    VkSamplerAddressMode vk_wrap;
+    switch (desc->wrap) {
+        case VIO_WRAP_CLAMP:  vk_wrap = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; break;
+        case VIO_WRAP_MIRROR: vk_wrap = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT; break;
+        case VIO_WRAP_REPEAT:
+        default:              vk_wrap = VK_SAMPLER_ADDRESS_MODE_REPEAT; break;
+    }
+
+    VkSamplerCreateInfo sci = {0};
+    sci.sType         = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sci.magFilter     = vk_filter;
+    sci.minFilter     = vk_filter;
+    sci.mipmapMode    = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU  = vk_wrap;
+    sci.addressModeV  = vk_wrap;
+    sci.addressModeW  = vk_wrap;
+    sci.maxLod        = 0.0f;
+    sci.borderColor   = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    /* anisotropyEnable left VK_FALSE: the samplerAnisotropy feature is not
+     * enabled on the device, so requesting it would be a validation error. */
+    if (vkCreateSampler(vio_vk.device, &sci, NULL, &tex->sampler) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to create texture sampler");
+        vkDestroyImageView(vio_vk.device, tex->view, NULL);
+        vio_vma_destroy_image(vio_vk.vma_allocator, tex->image, tex->allocation);
+        free(tex);
+        return NULL;
+    }
+
+    /* Register in the live-texture list so vulkan_shutdown can sweep it if its
+     * owning PHP object outlives vio_destroy(). */
+    tex->prev = NULL;
+    tex->next = vio_vk.live_textures;
+    if (vio_vk.live_textures) vio_vk.live_textures->prev = tex;
+    vio_vk.live_textures = tex;
+
+    return tex;
+}
+
+/* Release a texture's GPU objects, unlink it from the live list, and zero the
+ * handles so this is idempotent. Does NOT free the struct — the owning PHP
+ * object's free handler is always responsible for that, which keeps the two
+ * teardown paths (shutdown sweep vs. PHP GC, in either order) from double-
+ * freeing the heap struct. `wait` drains the GPU first (the image may be in an
+ * in-flight command buffer via a descriptor set); the shutdown sweep passes 0
+ * because it already did a single vkDeviceWaitIdle. No-op on a NULL device. */
+static void vulkan_release_texture_gpu(vio_vulkan_texture *tex, int wait)
+{
+    if (!tex) return;
+
+    /* Unlink from the live list (idempotent: NULL links + head check). */
+    if (tex->prev) tex->prev->next = tex->next;
+    else if (vio_vk.live_textures == tex) vio_vk.live_textures = tex->next;
+    if (tex->next) tex->next->prev = tex->prev;
+    tex->prev = tex->next = NULL;
+
+    if (vio_vk.device) {
+        if (wait) vkDeviceWaitIdle(vio_vk.device);
+        if (tex->sampler) vkDestroySampler(vio_vk.device, tex->sampler, NULL);
+        if (tex->view)    vkDestroyImageView(vio_vk.device, tex->view, NULL);
+        if (tex->image)   vio_vma_destroy_image(vio_vk.vma_allocator, tex->image, tex->allocation);
+    }
+    tex->sampler = VK_NULL_HANDLE;
+    tex->view    = VK_NULL_HANDLE;
+    tex->image   = VK_NULL_HANDLE;
+    tex->allocation = NULL;
+}
+
+static void vulkan_destroy_texture(void *texture_ptr)
+{
+    vio_vulkan_texture *tex = (vio_vulkan_texture *)texture_ptr;
+    if (!tex) return;
+    /* Wait: the texture may still be referenced by an in-flight command buffer.
+     * destroy is rare (texture/font GC or shutdown) so the stall is harmless.
+     * If the shutdown sweep already released the GPU objects this is a no-op. */
+    vulkan_release_texture_gpu(tex, 1);
+    free(tex);
+}
+
+/* Object destructors invoked from the Zend free_object handlers (vio_texture.c
+ * vio_texture_free_object -> destroy_texture_obj; vio_font.c
+ * vio_font_free_object -> destroy_font_atlas). Both unwrap the vio_vulkan_texture
+ * stored on the object and route to vulkan_destroy_texture so per-texture VMA
+ * allocations / image views / samplers are freed rather than leaked (a leak the
+ * validation layers report at vkDestroyDevice). */
+
+static void vulkan_destroy_texture_obj(void *tex_obj_ptr)
+{
+    vio_texture_object *tex_obj = (vio_texture_object *)tex_obj_ptr;
+    if (tex_obj->backend_texture) {
+        vulkan_destroy_texture(tex_obj->backend_texture);
+        tex_obj->backend_texture = NULL;
+    }
+}
+
+static void vulkan_destroy_font_atlas(void *font_ptr)
+{
+    vio_font_object *font = (vio_font_object *)font_ptr;
+    if (font->atlas_backend_texture) {
+        vulkan_destroy_texture(font->atlas_backend_texture);
+        font->atlas_backend_texture = NULL;
+    }
+}
 
 static void *vulkan_compile_shader(vio_shader_desc *desc) { (void)desc; return NULL; }
 static void vulkan_destroy_shader(void *shader) { (void)shader; }
@@ -744,6 +1111,13 @@ static void vulkan_begin_frame(void)
 
     /* Wait for this frame's previous work to finish */
     vkWaitForFences(vio_vk.device, 1, &f->in_flight, VK_TRUE, UINT64_MAX);
+
+    /* Reset this frame's 2D descriptor pool. SAFE only because the fence wait
+     * above guarantees the GPU has finished consuming the descriptor sets this
+     * pool handed out two frames ago — resetting an in-flight pool would be a
+     * use-after-free the sync-validation layer flags. No-op until the 2D Vulkan
+     * state is initialised. */
+    vio_2d_vulkan_reset_frame_descriptors(vio_vk.current_frame);
 
     /* Acquire next swapchain image */
     VkResult result = vkAcquireNextImageKHR(vio_vk.device, vio_vk.swapchain, UINT64_MAX,
@@ -885,7 +1259,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_DEPTH_BIAS:   return 1; /* pipeline rasterization state */
         case VIO_FEATURE_SCISSOR:      return 1;
         case VIO_FEATURE_TEXTURE_SWIZZLE: return 1; /* VkComponentMapping */
-        case VIO_FEATURE_NATIVE_2D_BATCH: return 0; /* no Vulkan 2D path */
+        case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* Vulkan 2D path (shapes/sprites/text) */
         default: return 0;
     }
 }
@@ -917,6 +1291,8 @@ static const vio_backend vulkan_backend = {
     .gpu_flush         = NULL,
     .dispatch_compute  = vulkan_dispatch_compute,
     .supports_feature  = vulkan_supports_feature,
+    .destroy_texture_obj = vulkan_destroy_texture_obj,
+    .destroy_font_atlas  = vulkan_destroy_font_atlas,
 };
 
 void vio_backend_vulkan_register(void)

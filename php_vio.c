@@ -3057,6 +3057,33 @@ ZEND_FUNCTION(vio_font)
     }
 #endif
 
+#ifdef HAVE_VULKAN
+    if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
+        /* Expand the R8 coverage atlas to RGBA8 (white RGB, coverage in alpha)
+         * so the single sprites pipeline serves both PNG sprites and glyphs:
+         * the sprite shader computes texture(uTexture, uv) * vColor, and a
+         * white-RGB / coverage-alpha texel multiplied by the vertex color
+         * tints the glyph and applies coverage as alpha — identical to D3D12. */
+        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
+        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
+            rgba[p * 4 + 0] = 255;
+            rgba[p * 4 + 1] = 255;
+            rgba[p * 4 + 2] = 255;
+            rgba[p * 4 + 3] = atlas_bitmap[p];
+        }
+
+        vio_texture_desc desc = {0};
+        desc.width  = VIO_FONT_ATLAS_SIZE;
+        desc.height = VIO_FONT_ATLAS_SIZE;
+        desc.data   = rgba;
+        desc.filter = VIO_FILTER_LINEAR;
+        desc.wrap   = VIO_WRAP_CLAMP;
+        desc.mipmaps = 0;
+        font->atlas_backend_texture = ctx->backend->create_texture(&desc);
+        efree(rgba);
+    }
+#endif
+
     efree(atlas_bitmap);
 
     font->valid = 1;
