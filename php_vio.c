@@ -521,7 +521,24 @@ ZEND_FUNCTION(vio_begin)
             (vio_render_target_object *)vio_vk.pending_bound_rt;
         vio_vk.pending_bound_rt = NULL;
         if (prt->valid && prt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.in_frame) {
-            vulkan_record_bind_render_target(prt);
+            /* Phase 4: vulkan_begin_frame set vio_vk.frame_is_offscreen=1 for this
+             * frame (pending_bound_rt was non-NULL at begin), and crucially did
+             * NOT begin the swapchain render pass and did NOT acquire a swapchain
+             * image. So begin the OFFSCREEN pass DIRECTLY (no preceding
+             * vkCmdEndRenderPass) — using the mid-frame switch
+             * vulkan_record_bind_render_target() here would call vkCmdEndRenderPass
+             * on a frame with no open pass (a validation error).
+             *
+             * The frame_is_offscreen guard keeps Phase 3's mid-frame switch path
+             * (vulkan_record_bind_render_target) for the hypothetical case where a
+             * pending bind coexists with an already-open swapchain pass; with the
+             * current flow that path is not reached from here (an in-frame bind
+             * records immediately in vio_bind_render_target, never via pending). */
+            if (vio_vk.frame_is_offscreen) {
+                vulkan_begin_offscreen_render_pass(prt);
+            } else {
+                vulkan_record_bind_render_target(prt);
+            }
         }
     }
 #endif

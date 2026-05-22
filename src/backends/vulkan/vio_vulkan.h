@@ -129,6 +129,18 @@ typedef struct _vio_vulkan_state {
     int                      initialized;
     int                      swapchain_needs_recreate;
     int                      in_frame;          /* 1 while the command buffer is recording (begin_frame..end_frame) */
+    /* Phase 4 — warm-render present-skip. Captured at vulkan_begin_frame: 1 when
+     * the frame is OFFSCREEN-ONLY (vio_vk.pending_bound_rt was set BEFORE
+     * begin_frame, i.e. the warm-render "bind then begin" order), 0 for a normal
+     * presented frame. An offscreen-only frame does NOT vkAcquireNextImageKHR and
+     * never begins the swapchain pass, so its end-of-frame submit signals/waits
+     * NO swapchain semaphores and vulkan_present skips vkQueuePresentKHR. Skipping
+     * present WITHOUT skipping the acquire would exhaust the swapchain (3 images)
+     * after a few acquires-without-present and hang vkAcquireNextImageKHR(...,
+     * UINT64_MAX); the two skips are therefore paired. Read by end_frame (chooses
+     * the zero-semaphore submit) and present (chooses the no-present path); the
+     * normal path (frame_is_offscreen==0) is byte-for-byte the pre-Phase-4 flow. */
+    int                      frame_is_offscreen;
     float                    clear_r, clear_g, clear_b, clear_a;
 
     /* Offscreen render-target binding (mirrors vio_d3d12). current_bound_rt is
@@ -211,6 +223,15 @@ void vulkan_destroy_render_target(void *rt);
  * set viewport/scissor to the RT extent -> vio_vk.current_bound_rt = rt. Caller
  * MUST ensure vio_vk.in_frame (a swapchain pass is open on the frame cmd buffer). */
 void vulkan_record_bind_render_target(void *rt);
+
+/* Phase 4 — begin the offscreen RT pass DIRECTLY (no preceding vkCmdEndRenderPass)
+ * on an OFFSCREEN-ONLY frame, where vulkan_begin_frame opened the command buffer
+ * but never began the swapchain pass (frame_is_offscreen==1). vkCmdBeginRenderPass
+ * (offscreen, CLEAR) -> RT-extent viewport/scissor -> vio_vk.current_bound_rt = rt.
+ * Caller MUST ensure vio_vk.in_frame and that NO render pass is currently open.
+ * (vulkan_record_bind_render_target is the mid-frame sibling that first ends the
+ * open swapchain/offscreen pass; both share the same begin logic internally.) */
+void vulkan_begin_offscreen_render_pass(void *rt);
 
 /* Record the mid-frame switch back to the swapchain: vkCmdEndRenderPass
  * (offscreen, which transitions its color to SHADER_READ_ONLY via finalLayout)

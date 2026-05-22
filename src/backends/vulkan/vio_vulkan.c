@@ -1482,10 +1482,11 @@ void vulkan_destroy_render_target(void *rt_ptr)
         return;
     }
 
-    /* An offscreen frame may still be in flight (Phase 4 present-skip is not
-     * implemented yet, but even with present ON a just-submitted frame's cmd
-     * buffer references this RT's framebuffer/images). Drain the GPU before
-     * destroying — releasing in-flight resources is a use-after-free. */
+    /* An offscreen frame may still be in flight: a present-skipped warm frame
+     * (Phase 4) has no vkQueuePresentKHR to implicitly throttle it, and even a
+     * normal frame's just-submitted cmd buffer references this RT's framebuffer/
+     * images. Drain the GPU before destroying — releasing in-flight resources is a
+     * use-after-free. (Bug #3 of the warm-render class; mirrors d3d12.) */
     vkDeviceWaitIdle(vio_vk.device);
 
     /* The cached sampling wrapper borrows color_view+sampler (RT-owned), so only
@@ -1526,19 +1527,15 @@ void vulkan_destroy_render_target(void *rt_ptr)
     }
 }
 
-void vulkan_record_bind_render_target(void *rt_ptr)
+/* Begin the offscreen RT pass (loadOp=CLEAR) on the open frame command buffer and
+ * set the RT-extent viewport/scissor + vio_vk.current_bound_rt. NO vkCmdEndRenderPass
+ * here — the caller is responsible for ensuring no pass is currently open (the
+ * offscreen-only frame, which never began the swapchain pass) OR for having ended
+ * the prior pass itself (the mid-frame switch in vulkan_record_bind_render_target).
+ * Caller has already validated rt + vio_vk.in_frame. */
+static void vulkan_record_begin_offscreen_pass(VkCommandBuffer cmd,
+                                                vio_render_target_object *rt)
 {
-    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
-    if (!rt || rt->backend_type != VIO_RT_BACKEND_VULKAN) return;
-    if (!vio_vk.in_frame || !rt->vulkan_render_pass || !rt->vulkan_framebuffer) return;
-
-    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
-
-    /* End whatever pass is currently open (the swapchain pass from begin_frame,
-     * or — if a prior bind already switched — that offscreen pass). Vulkan
-     * cannot switch render passes without ending the active one first. */
-    vkCmdEndRenderPass(cmd);
-
     /* Begin the offscreen pass (loadOp=CLEAR clears the color/depth). */
     VkClearValue clears[2];
     clears[0].color.float32[0] = vio_vk.clear_r;
@@ -1573,6 +1570,36 @@ void vulkan_record_bind_render_target(void *rt_ptr)
     vkCmdSetScissor(cmd, 0, 1, &sc);
 
     vio_vk.current_bound_rt = rt;
+}
+
+void vulkan_record_bind_render_target(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!rt || rt->backend_type != VIO_RT_BACKEND_VULKAN) return;
+    if (!vio_vk.in_frame || !rt->vulkan_render_pass || !rt->vulkan_framebuffer) return;
+
+    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+
+    /* End whatever pass is currently open (the swapchain pass from begin_frame,
+     * or — if a prior bind already switched — that offscreen pass). Vulkan
+     * cannot switch render passes without ending the active one first. */
+    vkCmdEndRenderPass(cmd);
+
+    vulkan_record_begin_offscreen_pass(cmd, rt);
+}
+
+/* Phase 4 — offscreen-only frame: begin the offscreen pass with NO preceding
+ * vkCmdEndRenderPass, because vulkan_begin_frame opened the command buffer but did
+ * NOT begin the swapchain pass (frame_is_offscreen==1, the warm-render bind-then-
+ * begin order). Driven from the deferred-bind block in vio_begin(). */
+void vulkan_begin_offscreen_render_pass(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!rt || rt->backend_type != VIO_RT_BACKEND_VULKAN) return;
+    if (!vio_vk.in_frame || !rt->vulkan_render_pass || !rt->vulkan_framebuffer) return;
+
+    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    vulkan_record_begin_offscreen_pass(cmd, rt);
 }
 
 /* Lazily create the loadOp=LOAD swapchain resume pass. Compatible with
@@ -1706,6 +1733,23 @@ static void vulkan_begin_frame(void)
 
     vio_vk_frame *f = &vio_vk.frames[vio_vk.current_frame];
 
+    /* Phase 4 — OFFSCREEN-ONLY frame detection. vio_vk.pending_bound_rt is set ONLY
+     * by an out-of-frame vio_bind_render_target (the warm-render "bind BEFORE
+     * vio_begin" order), and vio_begin calls begin_frame() before applying that
+     * pending bind. So a non-NULL pending_bound_rt here means this whole frame
+     * renders to an offscreen target and is never presented.
+     *
+     * For such a frame we MUST skip vkAcquireNextImageKHR: present is also skipped
+     * (vulkan_present), and acquiring without ever presenting would, after a few
+     * frames, exhaust the swapchain's images and make vkAcquireNextImageKHR(...,
+     * UINT64_MAX) block forever. We therefore acquire NOTHING, begin NO swapchain
+     * pass, and let the deferred-bind block in vio_begin open the offscreen pass.
+     *
+     * The normal path below (frame_is_offscreen==0) is byte-for-byte the
+     * pre-Phase-4 flow. */
+    int offscreen = (vio_vk.pending_bound_rt != NULL);
+    vio_vk.frame_is_offscreen = offscreen;
+
     /* Wait for this frame's previous work to finish */
     vkWaitForFences(vio_vk.device, 1, &f->in_flight, VK_TRUE, UINT64_MAX);
 
@@ -1715,6 +1759,26 @@ static void vulkan_begin_frame(void)
      * use-after-free the sync-validation layer flags. No-op until the 2D Vulkan
      * state is initialised. */
     vio_2d_vulkan_reset_frame_descriptors(vio_vk.current_frame);
+
+    if (offscreen) {
+        /* OFFSCREEN-ONLY: no acquire, no swapchain pass. Reset+begin the command
+         * buffer (same as the normal path) so the offscreen pass + 2D draws can
+         * record onto it, and reset the in_flight fence (the end-of-frame submit
+         * still signals it). current_image_index is intentionally NOT touched —
+         * no swapchain image participates in this frame. */
+        vkResetFences(vio_vk.device, 1, &f->in_flight);
+        vkResetCommandBuffer(f->cmd_buf, 0);
+
+        VkCommandBufferBeginInfo begin_info = {0};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        vkBeginCommandBuffer(f->cmd_buf, &begin_info);
+
+        /* No render pass is begun here; vio_begin's deferred-bind block calls
+         * vulkan_begin_offscreen_render_pass() to open the offscreen pass (which
+         * also sets the RT-extent viewport/scissor). */
+        vio_vk.in_frame = 1;
+        return;
+    }
 
     /* Acquire next swapchain image */
     VkResult result = vkAcquireNextImageKHR(vio_vk.device, vio_vk.swapchain, UINT64_MAX,
@@ -1778,6 +1842,44 @@ static void vulkan_end_frame(void)
 
     vio_vk_frame *f = &vio_vk.frames[vio_vk.current_frame];
 
+    if (vio_vk.frame_is_offscreen) {
+        /* Phase 4 — OFFSCREEN-ONLY frame: no swapchain image was acquired and the
+         * frame will not be presented, so NEITHER the per-frame image_available
+         * NOR the per-image render_finished semaphore participates. Submitting with
+         * waitSemaphoreCount=0 / signalSemaphoreCount=0 keeps both swapchain
+         * semaphores out of this frame entirely — there is no acquire to wait on
+         * and no present to signal for. (Signalling render_finished here without a
+         * matching present, or waiting image_available without an acquire, is
+         * exactly the binary-semaphore-desync hazard the sync layer flags.)
+         *
+         * The only open pass is the offscreen pass (begun in vio_begin's deferred
+         * block; the warm unbind happens AFTER vio_end so it never ran yet). End
+         * it only if it was actually opened (current_bound_rt set) — a deferred
+         * bind that no-op'd on an invalid RT would leave no pass open. */
+        if (vio_vk.current_bound_rt) {
+            vkCmdEndRenderPass(f->cmd_buf);
+        }
+        vkEndCommandBuffer(f->cmd_buf);
+
+        VkSubmitInfo submit = {0};
+        submit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.waitSemaphoreCount   = 0;
+        submit.pWaitSemaphores      = NULL;
+        submit.pWaitDstStageMask    = NULL;
+        submit.commandBufferCount   = 1;
+        submit.pCommandBuffers      = &f->cmd_buf;
+        submit.signalSemaphoreCount = 0;
+        submit.pSignalSemaphores    = NULL;
+
+        /* Submit on the in_flight fence: vulkan_begin_frame waits it before reusing
+         * this frame's command buffer / descriptor pool / VBO slice, and
+         * vulkan_destroy_render_target's vkDeviceWaitIdle (4c) also gates on it. */
+        vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, f->in_flight);
+
+        vio_vk.in_frame = 0;
+        return;
+    }
+
     /* End render pass and command buffer */
     vkCmdEndRenderPass(f->cmd_buf);
     vkEndCommandBuffer(f->cmd_buf);
@@ -1805,6 +1907,18 @@ static void vulkan_end_frame(void)
 static void vulkan_present(void)
 {
     if (!vio_vk.initialized) return;
+
+    if (vio_vk.frame_is_offscreen) {
+        /* Phase 4 — OFFSCREEN-ONLY frame: nothing was acquired and the swapchain
+         * image was never drawn, so presenting it would flip an undrawn/cleared
+         * backbuffer (the splash "flash"). Skip vkQueuePresentKHR and the swapchain
+         * entirely. We still advance current_frame so the frame-in-flight ring
+         * rotates (the in_flight fence was submitted in vulkan_end_frame), and clear
+         * frame_is_offscreen so a subsequent NORMAL frame takes the present path. */
+        vio_vk.frame_is_offscreen = 0;
+        vio_vk.current_frame = (vio_vk.current_frame + 1) % VIO_VK_MAX_FRAMES_IN_FLIGHT;
+        return;
+    }
 
     /* No vio_vk_frame needed here: present waits on the per-image
      * render_finished (indexed by current_image_index), and image rotation /
