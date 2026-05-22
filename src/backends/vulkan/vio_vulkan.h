@@ -84,6 +84,16 @@ typedef struct _vio_vulkan_state {
     VkRenderPass             render_pass;
     VkFramebuffer           *framebuffers;
 
+    /* Swapchain "resume" render pass — render-pass-compatible with render_pass
+     * (identical attachment formats/samples) but with color/depth loadOp=LOAD and
+     * initialLayout matching what the primary pass leaves behind (color
+     * PRESENT_SRC_KHR, depth DEPTH_STENCIL_ATTACHMENT_OPTIMAL). Used by
+     * vio_unbind_render_target to re-open the swapchain pass mid-frame WITHOUT
+     * clearing prior swapchain draws after an offscreen pass ran. Created lazily
+     * on first mid-frame unbind, destroyed in vulkan_shutdown. NULL until then,
+     * so a normal frame (no offscreen RT) never touches it. */
+    VkRenderPass             swapchain_resume_render_pass;
+
     /* Depth buffer */
     VkImage                  depth_image;
     VkDeviceMemory           depth_memory;
@@ -100,6 +110,20 @@ typedef struct _vio_vulkan_state {
     /* Head of the intrusive list of live backend textures (see
      * vio_vulkan_texture). Swept in vulkan_shutdown before vkDestroyDevice. */
     struct _vio_vulkan_texture *live_textures;
+
+    /* Live offscreen render targets (vio_render_target_object*), tracked the
+     * same way as live_textures and for the same reason: vio_destroy() runs
+     * vulkan_shutdown (+ vkDestroyDevice) while PHP VioRenderTarget objects are
+     * still alive (their Zend free handlers run later, at request shutdown).
+     * Without a sweep their VkImage/View/RenderPass/Framebuffer/Sampler would
+     * still be alive at vkDestroyDevice — a VUID-vkDestroyDevice-device-05137
+     * leak. The sweep frees each survivor's GPU objects (device still alive)
+     * before vkDestroyDevice; the later free handler then no-ops (device gone).
+     * Stored as a malloc'd growable array of opaque RT pointers (the public RT
+     * struct has no room for intrusive links). */
+    void                   **live_render_targets;
+    uint32_t                 live_rt_count;
+    uint32_t                 live_rt_capacity;
 
     /* State */
     int                      initialized;
@@ -156,6 +180,44 @@ void vio_vma_destroy_image(void *allocator, VkImage image, void *allocation);
  * has been waited (the sync point that makes reset of an in-flight pool safe).
  * No-op when the 2D Vulkan state has not been initialised yet. */
 void vio_2d_vulkan_reset_frame_descriptors(uint32_t frame_index);
+
+/* ── Offscreen render-target operations (Phase 3) ─────────────────────
+ *
+ * These are invoked from php_vio.c (the vio_render_target / vio_bind_render_target
+ * / vio_unbind_render_target / vio_render_target dispatchers) and operate on a
+ * vio_render_target_object* passed as void* to avoid a header dependency on
+ * vio_render_target.h here. The implementations live in vio_vulkan.c. */
+
+/* Register / unregister an RT in vio_vk.live_render_targets. Registration
+ * happens at the end of a successful vulkan_create_render_target; unregistration
+ * at the start of vulkan_destroy_render_target (idempotent — safe if absent). */
+void vulkan_rt_track(void *rt);
+void vulkan_rt_untrack(void *rt);
+
+/* Create the per-target Vulkan resources (color image+view+alloc, optional
+ * depth, a render-pass-compatible VkRenderPass, framebuffer, sampler) and store
+ * them on the vio_render_target_object. Returns 0 on success, non-zero on
+ * failure (caller discards the RT object). */
+int  vulkan_create_render_target(void *rt, int width, int height, int hdr, int depth_only);
+
+/* Destroy a render target's Vulkan resources. vkDeviceWaitIdle first (an
+ * offscreen frame may still be in flight), then destroy fb/rp/views/images/
+ * sampler and null the fields + any vio_vk.current/pending_bound_rt that point
+ * at this RT. Safe to call with a NULL device (no-op). */
+void vulkan_destroy_render_target(void *rt);
+
+/* Record the mid-frame switch from the swapchain pass to the offscreen RT pass:
+ * vkCmdEndRenderPass (swapchain) -> vkCmdBeginRenderPass (offscreen, CLEAR) ->
+ * set viewport/scissor to the RT extent -> vio_vk.current_bound_rt = rt. Caller
+ * MUST ensure vio_vk.in_frame (a swapchain pass is open on the frame cmd buffer). */
+void vulkan_record_bind_render_target(void *rt);
+
+/* Record the mid-frame switch back to the swapchain: vkCmdEndRenderPass
+ * (offscreen, which transitions its color to SHADER_READ_ONLY via finalLayout)
+ * -> begin the loadOp=LOAD swapchain resume pass (created lazily) -> restore the
+ * swapchain viewport/scissor -> vio_vk.current_bound_rt = NULL. Caller MUST
+ * ensure vio_vk.in_frame and that current_bound_rt is set. */
+void vulkan_record_unbind_render_target(void);
 
 #endif /* HAVE_VULKAN */
 #endif /* VIO_VULKAN_H */

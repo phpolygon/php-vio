@@ -20,6 +20,7 @@
 #include "vio_vulkan.h"
 #include "../../vio_texture.h"
 #include "../../vio_font.h"
+#include "../../vio_render_target.h"
 #include "../../../include/vio_types.h"
 #include <string.h>
 #include <stdlib.h>
@@ -758,9 +759,28 @@ static void vulkan_shutdown(void)
         vulkan_release_texture_gpu(vio_vk.live_textures, 0);
     }
 
+    /* Sweep any offscreen render targets whose PHP object outlived vio_destroy()
+     * for the same reason (see vio_vk.live_render_targets). The device is still
+     * alive here, so vulkan_destroy_render_target frees their GPU objects;
+     * swap-remove keeps shrinking the list, so destroy index 0 until empty. The
+     * later RT free handler then no-ops (device gone) and just frees the cached
+     * wrapper struct. */
+    while (vio_vk.live_rt_count > 0) {
+        vulkan_destroy_render_target(vio_vk.live_render_targets[0]);
+    }
+    if (vio_vk.live_render_targets) {
+        free(vio_vk.live_render_targets);
+        vio_vk.live_render_targets = NULL;
+        vio_vk.live_rt_capacity = 0;
+    }
+
     destroy_frame_resources();
     cleanup_swapchain();
 
+    if (vio_vk.swapchain_resume_render_pass) {
+        vkDestroyRenderPass(vio_vk.device, vio_vk.swapchain_resume_render_pass, NULL);
+        vio_vk.swapchain_resume_render_pass = VK_NULL_HANDLE;
+    }
     if (vio_vk.render_pass) vkDestroyRenderPass(vio_vk.device, vio_vk.render_pass, NULL);
     if (vio_vk.vma_allocator) vio_vma_destroy(vio_vk.vma_allocator);
     if (vio_vk.device) vkDestroyDevice(vio_vk.device, NULL);
@@ -1132,6 +1152,551 @@ static void vulkan_destroy_font_atlas(void *font_ptr)
     }
 }
 
+/* ── Offscreen render targets (Phase 3) ───────────────────────────────
+ *
+ * Each render target owns: a DEVICE_LOCAL color VkImage (B8G8R8A8_UNORM,
+ * COLOR_ATTACHMENT|SAMPLED|TRANSFER_SRC) + view; an optional depth image+view;
+ * a VkRenderPass that is RENDER-PASS-COMPATIBLE with vio_vk.render_pass (same
+ * attachment formats and sample counts, same subpass references) so the Phase-1
+ * 2D pipelines — built against vio_vk.render_pass — bind unchanged inside the
+ * offscreen pass (Vulkan spec §8.2 Render Pass Compatibility: only formats,
+ * samples, and references must match; loadOp/storeOp/initial/finalLayout do
+ * not). The offscreen pass uses color loadOp=CLEAR, initialLayout=UNDEFINED,
+ * finalLayout=SHADER_READ_ONLY_OPTIMAL — so vkCmdEndRenderPass leaves the color
+ * image directly samplable with no extra barrier. A VkFramebuffer at the RT
+ * extent + a VkSampler complete the set; sampling reuses the per-frame 2D
+ * descriptor pool ring (vio_render_target_texture wraps the color view+sampler
+ * in a vio_vulkan_texture so the existing vio_2d_flush textured path handles it).
+ */
+
+/* Render-pass-compatible offscreen pass. color_format/depth_format MUST equal
+ * the swapchain pass's (B8G8R8A8_UNORM + find_depth_format()). */
+static VkRenderPass vulkan_create_rt_render_pass(int with_depth)
+{
+    VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat depth_format = find_depth_format();
+
+    VkAttachmentDescription attachments[2] = {0};
+    /* Color: clear at load, store at end, end up SHADER_READ_ONLY so the
+     * unbind needs no separate layout barrier before sampling. */
+    attachments[0].format         = color_format;
+    attachments[0].samples        = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[0].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[0].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    /* Depth (only referenced when with_depth). */
+    attachments[1].format         = depth_format;
+    attachments[1].samples        = VK_SAMPLE_COUNT_1_BIT;
+    attachments[1].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[1].storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference color_ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference depth_ref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+
+    VkSubpassDescription subpass = {0};
+    subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount    = 1;
+    subpass.pColorAttachments       = &color_ref;
+    subpass.pDepthStencilAttachment = with_depth ? &depth_ref : NULL;
+
+    /* RENDER-PASS COMPATIBILITY: this validation layer compares the FULL subpass
+     * dependency array (count + every field) under VUID-vkCmdDraw-renderPass-
+     * 02684 — not just attachment formats/samples/references. So the offscreen
+     * pass's dependency must be BYTE-IDENTICAL to vio_vk.render_pass's single
+     * dependency for the shared 2D pipelines (built against render_pass) to bind
+     * here. We therefore replicate exactly the swapchain pass's EXTERNAL->0
+     * dependency (see create_render_pass). It also correctly orders this pass's
+     * loadOp clear / attachment writes after any prior frame's attachment writes;
+     * the render-to-texture write->sample visibility (Frame A color store ->
+     * Frame B fragment-shader read) is provided by the SHADER_READ_ONLY_OPTIMAL
+     * finalLayout transition plus the cross-submit semaphore/fence ordering. */
+    VkSubpassDependency dep = {0};
+    dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass    = 0;
+    dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                      | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                      | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                      | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                      | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo rp_info = {0};
+    rp_info.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rp_info.attachmentCount = with_depth ? 2 : 1;
+    rp_info.pAttachments    = attachments;
+    rp_info.subpassCount    = 1;
+    rp_info.pSubpasses      = &subpass;
+    rp_info.dependencyCount = 1;
+    rp_info.pDependencies   = &dep;
+
+    VkRenderPass rp = VK_NULL_HANDLE;
+    if (vkCreateRenderPass(vio_vk.device, &rp_info, NULL, &rp) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to create offscreen render pass");
+        return VK_NULL_HANDLE;
+    }
+    return rp;
+}
+
+/* ── Live render-target tracking (mirrors the live-texture sweep) ────── */
+
+void vulkan_rt_track(void *rt)
+{
+    if (!rt) return;
+    /* Avoid double-registration. */
+    for (uint32_t i = 0; i < vio_vk.live_rt_count; i++) {
+        if (vio_vk.live_render_targets[i] == rt) return;
+    }
+    if (vio_vk.live_rt_count == vio_vk.live_rt_capacity) {
+        uint32_t cap = vio_vk.live_rt_capacity ? vio_vk.live_rt_capacity * 2 : 8;
+        void **grown = realloc(vio_vk.live_render_targets, cap * sizeof(void *));
+        if (!grown) return; /* tracking is best-effort; OOM here just risks the leak msg */
+        vio_vk.live_render_targets = grown;
+        vio_vk.live_rt_capacity = cap;
+    }
+    vio_vk.live_render_targets[vio_vk.live_rt_count++] = rt;
+}
+
+void vulkan_rt_untrack(void *rt)
+{
+    if (!rt || !vio_vk.live_render_targets) return;
+    for (uint32_t i = 0; i < vio_vk.live_rt_count; i++) {
+        if (vio_vk.live_render_targets[i] == rt) {
+            /* Swap-remove. */
+            vio_vk.live_render_targets[i] = vio_vk.live_render_targets[vio_vk.live_rt_count - 1];
+            vio_vk.live_rt_count--;
+            return;
+        }
+    }
+}
+
+int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
+{
+    (void)hdr; /* HDR offscreen (R16G16B16A16_SFLOAT) is Phase 5; keep UNORM for now. */
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!vio_vk.initialized || !vio_vk.device || width <= 0 || height <= 0) {
+        return -1;
+    }
+
+    const VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+    const int with_depth = !depth_only;
+
+    VkImage      color_image = VK_NULL_HANDLE;
+    void        *color_alloc = NULL;
+    VkImageView  color_view  = VK_NULL_HANDLE;
+    VkImage      depth_image = VK_NULL_HANDLE;
+    void        *depth_alloc = NULL;
+    VkImageView  depth_view  = VK_NULL_HANDLE;
+    VkRenderPass rp          = VK_NULL_HANDLE;
+    VkFramebuffer fb         = VK_NULL_HANDLE;
+    VkSampler    sampler     = VK_NULL_HANDLE;
+
+    /* 1. Color image: COLOR_ATTACHMENT (render into) | SAMPLED (read back) |
+     *    TRANSFER_SRC (readback / blit later). depth_only skips this. */
+    if (!depth_only) {
+        VkImageCreateInfo ci = {0};
+        ci.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ci.imageType     = VK_IMAGE_TYPE_2D;
+        ci.format        = color_format;
+        ci.extent.width  = (uint32_t)width;
+        ci.extent.height = (uint32_t)height;
+        ci.extent.depth  = 1;
+        ci.mipLevels     = 1;
+        ci.arrayLayers   = 1;
+        ci.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                         | VK_IMAGE_USAGE_SAMPLED_BIT
+                         | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ci.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vio_vma_create_image(vio_vk.vma_allocator, &ci,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                 &color_image, &color_alloc) != 0) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: RT color image create failed (%dx%d)", width, height);
+            goto fail;
+        }
+
+        VkImageViewCreateInfo iv = {0};
+        iv.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        iv.image    = color_image;
+        iv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        iv.format   = color_format;
+        iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        iv.subresourceRange.levelCount = 1;
+        iv.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(vio_vk.device, &iv, NULL, &color_view) != VK_SUCCESS) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: RT color view create failed");
+            goto fail;
+        }
+    }
+
+    /* 2. Depth image (only when !depth_only — depth_only color-less targets are
+     *    a shadow-map case not exercised by the 2D path, but supported here). */
+    if (with_depth) {
+        VkFormat depth_format = find_depth_format();
+        VkImageCreateInfo ci = {0};
+        ci.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ci.imageType     = VK_IMAGE_TYPE_2D;
+        ci.format        = depth_format;
+        ci.extent.width  = (uint32_t)width;
+        ci.extent.height = (uint32_t)height;
+        ci.extent.depth  = 1;
+        ci.mipLevels     = 1;
+        ci.arrayLayers   = 1;
+        ci.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage         = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        ci.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vio_vma_create_image(vio_vk.vma_allocator, &ci,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                 &depth_image, &depth_alloc) != 0) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: RT depth image create failed");
+            goto fail;
+        }
+
+        VkImageViewCreateInfo iv = {0};
+        iv.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        iv.image    = depth_image;
+        iv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        iv.format   = depth_format;
+        iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        iv.subresourceRange.levelCount = 1;
+        iv.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(vio_vk.device, &iv, NULL, &depth_view) != VK_SUCCESS) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: RT depth view create failed");
+            goto fail;
+        }
+    }
+
+    /* 3. Render pass (compatible with the swapchain 2D pipelines). */
+    rp = vulkan_create_rt_render_pass(with_depth);
+    if (rp == VK_NULL_HANDLE) goto fail;
+
+    /* 4. Framebuffer at the RT extent. */
+    {
+        VkImageView attachments[2];
+        uint32_t att_count = 0;
+        if (!depth_only) attachments[att_count++] = color_view;
+        if (with_depth)  attachments[att_count++] = depth_view;
+
+        VkFramebufferCreateInfo fb_info = {0};
+        fb_info.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fb_info.renderPass      = rp;
+        fb_info.attachmentCount = att_count;
+        fb_info.pAttachments    = attachments;
+        fb_info.width           = (uint32_t)width;
+        fb_info.height          = (uint32_t)height;
+        fb_info.layers          = 1;
+        if (vkCreateFramebuffer(vio_vk.device, &fb_info, NULL, &fb) != VK_SUCCESS) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: RT framebuffer create failed");
+            goto fail;
+        }
+    }
+
+    /* 5. Sampler for sampling the result (linear/clamp; matches the d3d11/d3d12
+     *    color RT sampler choice). Only meaningful for color targets. */
+    if (!depth_only) {
+        VkSamplerCreateInfo sci = {0};
+        sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sci.magFilter    = VK_FILTER_LINEAR;
+        sci.minFilter    = VK_FILTER_LINEAR;
+        sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod       = 0.0f;
+        sci.borderColor  = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        if (vkCreateSampler(vio_vk.device, &sci, NULL, &sampler) != VK_SUCCESS) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: RT sampler create failed");
+            goto fail;
+        }
+    }
+
+    /* Commit handles onto the RT object. */
+    rt->vulkan_color_image = color_image;
+    rt->vulkan_color_alloc = color_alloc;
+    rt->vulkan_color_view  = color_view;
+    rt->vulkan_depth_image = depth_image;
+    rt->vulkan_depth_alloc = depth_alloc;
+    rt->vulkan_depth_view  = depth_view;
+    rt->vulkan_render_pass = rp;
+    rt->vulkan_framebuffer = fb;
+    rt->vulkan_sampler     = sampler;
+    rt->vulkan_color_backend_texture = NULL; /* built lazily by vio_render_target_texture */
+
+    /* Track for the shutdown sweep so the RT's GPU objects are freed before
+     * vkDestroyDevice even if the PHP object outlives vio_destroy(). */
+    vulkan_rt_track(rt);
+    return 0;
+
+fail:
+    if (sampler)     vkDestroySampler(vio_vk.device, sampler, NULL);
+    if (fb)          vkDestroyFramebuffer(vio_vk.device, fb, NULL);
+    if (rp)          vkDestroyRenderPass(vio_vk.device, rp, NULL);
+    if (depth_view)  vkDestroyImageView(vio_vk.device, depth_view, NULL);
+    if (depth_image) vio_vma_destroy_image(vio_vk.vma_allocator, depth_image, depth_alloc);
+    if (color_view)  vkDestroyImageView(vio_vk.device, color_view, NULL);
+    if (color_image) vio_vma_destroy_image(vio_vk.vma_allocator, color_image, color_alloc);
+    return -1;
+}
+
+void vulkan_destroy_render_target(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!rt || rt->backend_type != VIO_RT_BACKEND_VULKAN) return;
+
+    /* Remove from the live-RT sweep list (idempotent if already gone, e.g. the
+     * shutdown sweep released it and the free handler is now finishing up). */
+    vulkan_rt_untrack(rt);
+
+    /* Drop any tracking references first so a later bind/unbind/begin can't
+     * dereference freed memory. */
+    if (vio_vk.current_bound_rt == rt) vio_vk.current_bound_rt = NULL;
+    if (vio_vk.pending_bound_rt == rt) vio_vk.pending_bound_rt = NULL;
+
+    if (!vio_vk.device) {
+        /* Device already gone (shutdown raced ahead). Just null the cached
+         * wrapper struct so the RT free handler doesn't leak heap memory. */
+        if (rt->vulkan_color_backend_texture) {
+            free(rt->vulkan_color_backend_texture);
+            rt->vulkan_color_backend_texture = NULL;
+        }
+        rt->vulkan_color_image = rt->vulkan_color_view = NULL;
+        rt->vulkan_color_alloc = NULL;
+        rt->vulkan_depth_image = rt->vulkan_depth_view = NULL;
+        rt->vulkan_depth_alloc = NULL;
+        rt->vulkan_render_pass = rt->vulkan_framebuffer = rt->vulkan_sampler = NULL;
+        return;
+    }
+
+    /* An offscreen frame may still be in flight (Phase 4 present-skip is not
+     * implemented yet, but even with present ON a just-submitted frame's cmd
+     * buffer references this RT's framebuffer/images). Drain the GPU before
+     * destroying — releasing in-flight resources is a use-after-free. */
+    vkDeviceWaitIdle(vio_vk.device);
+
+    /* The cached sampling wrapper borrows color_view+sampler (RT-owned), so only
+     * the struct itself is freed here. */
+    if (rt->vulkan_color_backend_texture) {
+        free(rt->vulkan_color_backend_texture);
+        rt->vulkan_color_backend_texture = NULL;
+    }
+    if (rt->vulkan_sampler) {
+        vkDestroySampler(vio_vk.device, (VkSampler)rt->vulkan_sampler, NULL);
+        rt->vulkan_sampler = NULL;
+    }
+    if (rt->vulkan_framebuffer) {
+        vkDestroyFramebuffer(vio_vk.device, (VkFramebuffer)rt->vulkan_framebuffer, NULL);
+        rt->vulkan_framebuffer = NULL;
+    }
+    if (rt->vulkan_render_pass) {
+        vkDestroyRenderPass(vio_vk.device, (VkRenderPass)rt->vulkan_render_pass, NULL);
+        rt->vulkan_render_pass = NULL;
+    }
+    if (rt->vulkan_color_view) {
+        vkDestroyImageView(vio_vk.device, (VkImageView)rt->vulkan_color_view, NULL);
+        rt->vulkan_color_view = NULL;
+    }
+    if (rt->vulkan_color_image) {
+        vio_vma_destroy_image(vio_vk.vma_allocator, (VkImage)rt->vulkan_color_image, rt->vulkan_color_alloc);
+        rt->vulkan_color_image = NULL;
+        rt->vulkan_color_alloc = NULL;
+    }
+    if (rt->vulkan_depth_view) {
+        vkDestroyImageView(vio_vk.device, (VkImageView)rt->vulkan_depth_view, NULL);
+        rt->vulkan_depth_view = NULL;
+    }
+    if (rt->vulkan_depth_image) {
+        vio_vma_destroy_image(vio_vk.vma_allocator, (VkImage)rt->vulkan_depth_image, rt->vulkan_depth_alloc);
+        rt->vulkan_depth_image = NULL;
+        rt->vulkan_depth_alloc = NULL;
+    }
+}
+
+void vulkan_record_bind_render_target(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!rt || rt->backend_type != VIO_RT_BACKEND_VULKAN) return;
+    if (!vio_vk.in_frame || !rt->vulkan_render_pass || !rt->vulkan_framebuffer) return;
+
+    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+
+    /* End whatever pass is currently open (the swapchain pass from begin_frame,
+     * or — if a prior bind already switched — that offscreen pass). Vulkan
+     * cannot switch render passes without ending the active one first. */
+    vkCmdEndRenderPass(cmd);
+
+    /* Begin the offscreen pass (loadOp=CLEAR clears the color/depth). */
+    VkClearValue clears[2];
+    clears[0].color.float32[0] = vio_vk.clear_r;
+    clears[0].color.float32[1] = vio_vk.clear_g;
+    clears[0].color.float32[2] = vio_vk.clear_b;
+    clears[0].color.float32[3] = vio_vk.clear_a;
+    clears[1].depthStencil.depth   = 1.0f;
+    clears[1].depthStencil.stencil = 0;
+
+    VkRenderPassBeginInfo rp_begin = {0};
+    rp_begin.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp_begin.renderPass        = (VkRenderPass)rt->vulkan_render_pass;
+    rp_begin.framebuffer       = (VkFramebuffer)rt->vulkan_framebuffer;
+    rp_begin.renderArea.offset = (VkOffset2D){0, 0};
+    rp_begin.renderArea.extent = (VkExtent2D){ (uint32_t)rt->width, (uint32_t)rt->height };
+    /* depth_only RTs have a single (depth) clear; color RTs clear color+depth. */
+    rp_begin.clearValueCount   = rt->depth_only ? 1 : 2;
+    rp_begin.pClearValues      = clears;
+    vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+    /* Viewport + scissor to the RT extent. */
+    VkViewport vp = {0};
+    vp.x = 0.0f; vp.y = 0.0f;
+    vp.width  = (float)rt->width;
+    vp.height = (float)rt->height;
+    vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+
+    VkRect2D sc = {0};
+    sc.offset = (VkOffset2D){0, 0};
+    sc.extent = (VkExtent2D){ (uint32_t)rt->width, (uint32_t)rt->height };
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+
+    vio_vk.current_bound_rt = rt;
+}
+
+/* Lazily create the loadOp=LOAD swapchain resume pass. Compatible with
+ * vio_vk.render_pass (same formats/samples), so the framebuffers built for
+ * render_pass are usable with it (framebuffer/render-pass compatibility follows
+ * the same §8.2 rule). */
+static VkRenderPass vulkan_get_swapchain_resume_pass(void)
+{
+    if (vio_vk.swapchain_resume_render_pass) return vio_vk.swapchain_resume_render_pass;
+
+    VkFormat depth_format = find_depth_format();
+
+    VkAttachmentDescription attachments[2] = {0};
+    /* Color: LOAD existing contents, keep them, end up PRESENT_SRC_KHR. The
+     * primary pass left the image in PRESENT_SRC_KHR (its finalLayout), so this
+     * pass's initialLayout matches — no implicit transition wipes the contents. */
+    attachments[0].format         = vio_vk.swapchain_format;
+    attachments[0].samples        = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[0].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout  = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    attachments[0].finalLayout    = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    /* Depth: the primary pass left it DEPTH_STENCIL_ATTACHMENT_OPTIMAL. LOAD it
+     * (contents are don't-care for the 2D path, which has depth test off, but
+     * LOAD + matching initialLayout avoids a clear and keeps the layout valid). */
+    attachments[1].format         = depth_format;
+    attachments[1].samples        = VK_SAMPLE_COUNT_1_BIT;
+    attachments[1].loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[1].storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    attachments[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference color_ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference depth_ref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+
+    VkSubpassDescription subpass = {0};
+    subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount    = 1;
+    subpass.pColorAttachments       = &color_ref;
+    subpass.pDepthStencilAttachment = &depth_ref;
+
+    /* RENDER-PASS COMPATIBILITY: like the offscreen pass, the resume pass binds
+     * the same 2D pipelines (built against vio_vk.render_pass), and this layer
+     * compares the full dependency array for compatibility. Replicate the
+     * swapchain pass's EXTERNAL->0 dependency BYTE-IDENTICALLY (see
+     * create_render_pass). It also orders this resume pass's color writes after
+     * the just-ended offscreen pass's attachment writes. */
+    VkSubpassDependency dep = {0};
+    dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass    = 0;
+    dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                      | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                      | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                      | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                      | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo rp_info = {0};
+    rp_info.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rp_info.attachmentCount = 2;
+    rp_info.pAttachments    = attachments;
+    rp_info.subpassCount    = 1;
+    rp_info.pSubpasses      = &subpass;
+    rp_info.dependencyCount = 1;
+    rp_info.pDependencies   = &dep;
+
+    VkRenderPass rp = VK_NULL_HANDLE;
+    if (vkCreateRenderPass(vio_vk.device, &rp_info, NULL, &rp) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to create swapchain resume render pass");
+        return VK_NULL_HANDLE;
+    }
+    vio_vk.swapchain_resume_render_pass = rp;
+    return rp;
+}
+
+void vulkan_record_unbind_render_target(void)
+{
+    if (!vio_vk.in_frame) return;
+    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+
+    /* End the offscreen pass. Its color finalLayout=SHADER_READ_ONLY_OPTIMAL is
+     * applied here, so the color image is immediately samplable — no extra
+     * barrier needed before vio_render_target_texture binds it. */
+    vkCmdEndRenderPass(cmd);
+    vio_vk.current_bound_rt = NULL;
+
+    /* Re-open the swapchain pass with loadOp=LOAD so prior swapchain draws (if
+     * any) survive and subsequent draws composite on top. */
+    VkRenderPass resume = vulkan_get_swapchain_resume_pass();
+    if (resume == VK_NULL_HANDLE) return;
+
+    VkRenderPassBeginInfo rp_begin = {0};
+    rp_begin.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp_begin.renderPass        = resume;
+    rp_begin.framebuffer       = vio_vk.framebuffers[vio_vk.current_image_index];
+    rp_begin.renderArea.offset = (VkOffset2D){0, 0};
+    rp_begin.renderArea.extent = vio_vk.swapchain_extent;
+    rp_begin.clearValueCount   = 0;   /* loadOp=LOAD: no clear values consumed */
+    rp_begin.pClearValues      = NULL;
+    vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+    /* Restore swapchain viewport/scissor. */
+    VkViewport vp = {0};
+    vp.x = 0.0f; vp.y = 0.0f;
+    vp.width  = (float)vio_vk.swapchain_extent.width;
+    vp.height = (float)vio_vk.swapchain_extent.height;
+    vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+
+    VkRect2D sc = {0};
+    sc.offset = (VkOffset2D){0, 0};
+    sc.extent = vio_vk.swapchain_extent;
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+}
+
 static void *vulkan_compile_shader(vio_shader_desc *desc) { (void)desc; return NULL; }
 static void vulkan_destroy_shader(void *shader) { (void)shader; }
 
@@ -1288,9 +1853,9 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_MULTIVIEW:    return 0; /* VK_KHR_multiview not wired */
         case VIO_FEATURE_READ_PIXELS:  return 0; /* vkCmdCopyImageToBuffer path not wired */
         case VIO_FEATURE_INSTANCED_DRAW: return 1;
-        case VIO_FEATURE_RENDER_TARGET:       return 0; /* offscreen pass not wired */
-        case VIO_FEATURE_RENDER_TARGET_HDR:   return 0;
-        case VIO_FEATURE_RENDER_TARGET_DEPTH: return 0;
+        case VIO_FEATURE_RENDER_TARGET:       return 1; /* offscreen RT + render-to-texture (Phase 3) */
+        case VIO_FEATURE_RENDER_TARGET_HDR:   return 0; /* R16G16B16A16_SFLOAT offscreen not wired yet (Phase 5) */
+        case VIO_FEATURE_RENDER_TARGET_DEPTH: return 0; /* depth-RT sampling descriptor not wired */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 0;
         case VIO_FEATURE_CUBEMAP:      return 0;
         case VIO_FEATURE_DEPTH_BIAS:   return 1; /* pipeline rasterization state */
@@ -1330,6 +1895,16 @@ static const vio_backend vulkan_backend = {
     .supports_feature  = vulkan_supports_feature,
     .destroy_texture_obj = vulkan_destroy_texture_obj,
     .destroy_font_atlas  = vulkan_destroy_font_atlas,
+    /* Offscreen render targets (Phase 3). create_render_target is invoked
+     * directly from the HAVE_VULKAN branch of ZEND_FUNCTION(vio_render_target)
+     * (the create dispatch gates the vtable call by backend name, like d3d12);
+     * destroy_render_target is the one the RT free handler calls via
+     * rt->backend->destroy_render_target. The mid-frame bind/unbind recording is
+     * driven from php_vio.c via vulkan_record_bind/unbind_render_target() (the
+     * in_frame-vs-pending decision lives there), so the bind/unbind vtable slots
+     * are intentionally left NULL — same as d3d11/d3d12. */
+    .create_render_target  = vulkan_create_render_target,
+    .destroy_render_target = vulkan_destroy_render_target,
 };
 
 void vio_backend_vulkan_register(void)

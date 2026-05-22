@@ -40,6 +40,7 @@
 #include <vulkan/vulkan.h>
 #include "vio_2d_vulkan.h"
 #include "backends/vulkan/vio_vulkan.h"
+#include "vio_render_target.h"   /* vio_render_target_object (bound-RT extent) */
 #endif
 
 /* ── Orthographic projection matrix ──────────────────────────────── */
@@ -611,12 +612,23 @@ void vio_2d_flush(vio_2d_state *state)
         vio_2d_vulkan_state *vk = (vio_2d_vulkan_state *)state->vulkan_state;
         VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
 
-        /* Render area: the currently-bound target. Phase 1 only ever draws to
-         * the swapchain (offscreen RTs are Phase 3), so use the swapchain
-         * extent. Scissors are CLAMPED to this — Vulkan errors if a scissor
-         * exceeds the framebuffer (unlike D3D, which silently clamps). */
+        /* Render area = the currently-bound target's extent. With no offscreen
+         * RT bound (the normal frame, current_bound_rt == NULL) this is exactly
+         * the swapchain extent as before — byte-identical to the pre-Phase-3
+         * path. When an offscreen RT is bound mid-frame (Phase 3), use its
+         * extent so the default scissor and the per-item scissor clamp match the
+         * offscreen framebuffer (Vulkan errors if a scissor exceeds the bound
+         * framebuffer, unlike D3D's silent clamp). */
         uint32_t ra_w = vio_vk.swapchain_extent.width;
         uint32_t ra_h = vio_vk.swapchain_extent.height;
+        if (vio_vk.current_bound_rt) {
+            vio_render_target_object *brt =
+                (vio_render_target_object *)vio_vk.current_bound_rt;
+            if (brt->width > 0 && brt->height > 0) {
+                ra_w = (uint32_t)brt->width;
+                ra_h = (uint32_t)brt->height;
+            }
+        }
         if (ra_w == 0 || ra_h == 0) return;
 
         /* Upload vertices into THIS frame's slice of the persistently-mapped
