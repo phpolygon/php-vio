@@ -4097,6 +4097,28 @@ ZEND_FUNCTION(vio_read_pixels)
     }
 #endif
 
+#ifdef HAVE_VULKAN
+    if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
+        /* vulkan_read_pixels reads back the last-rendered (just-presented)
+         * swapchain image — vio_vk.swapchain_images[current_image_index], the
+         * Vulkan analog of D3D12's last_presented_frame_idx — as TOP-DOWN
+         * RGBA8, swizzling the B8G8R8A8_UNORM swapchain to R,G,B,A so the bytes
+         * match the D3D12 R8G8B8A8_UNORM readback for an apples-to-apples
+         * golden compare. It honors the buffer row stride and the caller's w/h
+         * (writes only the overlapping region, never overruns). */
+        size_t size = (size_t)w * h * 4;
+        zend_string *buf = zend_string_alloc(size, 0);
+        ZSTR_VAL(buf)[size] = '\0';
+
+        if (vulkan_read_pixels(w, h, (unsigned char *)ZSTR_VAL(buf)) == 0) {
+            RETURN_NEW_STR(buf);
+        }
+        zend_string_release(buf);
+        php_error_docref(NULL, E_WARNING, "vio_read_pixels: Vulkan readback failed");
+        RETURN_FALSE;
+    }
+#endif
+
 #ifdef HAVE_METAL
     if (strcmp(ctx->backend->name, "metal") == 0) {
         size_t size = (size_t)w * h * 4;
@@ -4152,19 +4174,24 @@ ZEND_FUNCTION(vio_save_screenshot)
     }
 #endif
 
-#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12) || defined(HAVE_VULKAN)
     {
-        /* Fallback for D3D backends: delegate to vio_read_pixels and write PNG.
-         * Calls vio_read_pixels() via the Zend API to avoid duplicating the readback
-         * logic for D3D11/D3D12. */
-        int is_d3d = 0;
+        /* Fallback for backends whose readback lives in vio_read_pixels:
+         * delegate to it and write PNG, avoiding duplicate readback logic.
+         * vio_read_pixels returns TOP-DOWN RGBA8 for all of these (D3D11/D3D12
+         * R8G8B8A8_UNORM, Vulkan B8G8R8A8_UNORM swizzled to RGBA), which is
+         * exactly what stbi_write_png(..., 4, pixels, w*4) expects. */
+        int is_delegated = 0;
 #ifdef HAVE_D3D11
-        if (strcmp(ctx->backend->name, "d3d11") == 0) is_d3d = 1;
+        if (strcmp(ctx->backend->name, "d3d11") == 0) is_delegated = 1;
 #endif
 #ifdef HAVE_D3D12
-        if (strcmp(ctx->backend->name, "d3d12") == 0) is_d3d = 1;
+        if (strcmp(ctx->backend->name, "d3d12") == 0) is_delegated = 1;
 #endif
-        if (is_d3d) {
+#ifdef HAVE_VULKAN
+        if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) is_delegated = 1;
+#endif
+        if (is_delegated) {
             zval retval, func_name, args[1];
             ZVAL_UNDEF(&retval);
             ZVAL_STRING(&func_name, "vio_read_pixels");

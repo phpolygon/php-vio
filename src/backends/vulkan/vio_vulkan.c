@@ -388,7 +388,16 @@ static int create_swapchain(void)
     sc_info.imageColorSpace  = chosen_format.colorSpace;
     sc_info.imageExtent      = extent;
     sc_info.imageArrayLayers = 1;
+    /* COLOR_ATTACHMENT for rendering; TRANSFER_SRC so vio_read_pixels can
+     * vkCmdCopyImageToBuffer the last-rendered swapchain image (Phase 5).
+     * imageUsage must be a subset of caps.supportedUsageFlags (Vulkan spec
+     * §"Swapchain"); TRANSFER_SRC is virtually universal on desktop, but guard
+     * it so creation never fails on an exotic surface — read_pixels just
+     * degrades to unsupported there (and warns at copy time). */
     sc_info.imageUsage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+        sc_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
     sc_info.preTransform     = caps.currentTransform;
     sc_info.compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     sc_info.presentMode      = chosen_mode;
@@ -1956,6 +1965,287 @@ static void vulkan_clear(float r, float g, float b, float a)
 
 static void vulkan_dispatch_compute(vio_compute_cmd *cmd) { (void)cmd; }
 
+/* Phase 5 — CPU readback of the last-rendered swapchain image. See the header
+ * comment for the contract. Mirrors the D3D12 vio_read_pixels path: read the
+ * just-presented image, copy into a HOST_VISIBLE buffer honoring row stride,
+ * write TOP-DOWN RGBA8. The output byte order must match D3D12's
+ * R8G8B8A8_UNORM readback so a Vulkan-vs-D3D12 golden compare is meaningful;
+ * since the swapchain is B8G8R8A8_UNORM we swap the B/R bytes per pixel. */
+int vulkan_read_pixels(int width, int height, void *out_rgba)
+{
+    if (!vio_vk.initialized || !vio_vk.device || !out_rgba) return -1;
+    if (vio_vk.swapchain_image_count == 0 || !vio_vk.swapchain_images) return -1;
+
+    /* The swapchain must have been created with TRANSFER_SRC (added in
+     * create_swapchain when caps allow it); without it vkCmdCopyImageToBuffer
+     * is invalid. Bail cleanly rather than tripping the validation layer. */
+    if (!(vio_vk.swapchain_format == VK_FORMAT_B8G8R8A8_UNORM ||
+          vio_vk.swapchain_format == VK_FORMAT_R8G8B8A8_UNORM ||
+          vio_vk.swapchain_format == VK_FORMAT_B8G8R8A8_SRGB ||
+          vio_vk.swapchain_format == VK_FORMAT_R8G8B8A8_SRGB)) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_read_pixels: unsupported swapchain format %d for readback",
+            (int)vio_vk.swapchain_format);
+        return -1;
+    }
+
+    /* Ensure all rendering (the just-submitted frame) has completed on the GPU
+     * queue so the source image holds the final, fully-rendered pixels. */
+    vkDeviceWaitIdle(vio_vk.device);
+
+    /* Re-acquire a swapchain image to read from. This is REQUIRED for sync
+     * correctness, not just convenience: after vio_end the just-rendered image
+     * is in PRESENT_SRC_KHR and was last touched by vkQueuePresentKHR. The
+     * presentation engine's read of that image is NOT synchronized by
+     * vkDeviceWaitIdle (which only drains the device QUEUES, not the present
+     * engine), so transitioning it for a copy directly would be a
+     * WRITE_AFTER_PRESENT hazard (flagged by synchronization validation).
+     * vkAcquireNextImageKHR signals a semaphore once the presentation engine has
+     * released an image; waiting that semaphore in the readback submit
+     * establishes the present -> acquire -> copy dependency. The acquired image
+     * holds the most recent render of that buffer (the swapchain never clears
+     * presented images); with vsync/FIFO and a stable scene this is the same
+     * content as the just-presented frame — the Vulkan analog of D3D12's
+     * last_presented_frame_idx read. We MUST re-present the acquired image
+     * afterwards (an acquire without a matching present leaks acquired images
+     * and eventually hangs future acquires — the Phase 4 lesson). */
+    const uint32_t sw = vio_vk.swapchain_extent.width;
+    const uint32_t sh = vio_vk.swapchain_extent.height;
+    if (sw == 0 || sh == 0) return -1;
+
+    VkSemaphore acq_sem = VK_NULL_HANDLE;
+    VkSemaphoreCreateInfo sem_info = {0};
+    sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    vkCreateSemaphore(vio_vk.device, &sem_info, NULL, &acq_sem);
+
+    VkFence acq_fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo afci = {0};
+    afci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(vio_vk.device, &afci, NULL, &acq_fence);
+
+    uint32_t acq_idx = 0;
+    VkResult ar = vkAcquireNextImageKHR(vio_vk.device, vio_vk.swapchain, UINT64_MAX,
+                                        acq_sem, acq_fence, &acq_idx);
+    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+        /* OUT_OF_DATE (e.g. mid-resize) or error: nothing safe to read. */
+        vkDestroyFence(vio_vk.device, acq_fence, NULL);
+        vkDestroySemaphore(vio_vk.device, acq_sem, NULL);
+        php_error_docref(NULL, E_WARNING,
+            "vio_read_pixels: vkAcquireNextImageKHR failed (VkResult %d)", (int)ar);
+        return -1;
+    }
+    /* Wait the acquire fence so the presentation engine has demonstrably
+     * released this image before we touch it on the host/device side. */
+    vkWaitForFences(vio_vk.device, 1, &acq_fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(vio_vk.device, acq_fence, NULL);
+
+    if (acq_idx >= vio_vk.swapchain_image_count) acq_idx = 0;
+    VkImage src_image = vio_vk.swapchain_images[acq_idx];
+    /* Keep current_image_index consistent with the image we now own (acquired
+     * but not yet re-presented); the re-present at the end uses it. */
+    vio_vk.current_image_index = acq_idx;
+
+    /* Tightly-packed readback buffer: vkCmdCopyImageToBuffer with
+     * bufferRowLength=0 packs rows at width*4 with no padding (unlike D3D12's
+     * 256-byte-aligned footprint), so the row stride here is exactly sw*4. */
+    const VkDeviceSize row_bytes  = (VkDeviceSize)sw * 4;
+    const VkDeviceSize buf_bytes  = row_bytes * sh;
+
+    VkBuffer       rb_buf   = VK_NULL_HANDLE;
+    void          *rb_alloc = NULL;
+    if (vio_vma_create_buffer(vio_vk.vma_allocator, buf_bytes,
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              &rb_buf, &rb_alloc) != 0 || !rb_buf) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_read_pixels: failed to create Vulkan readback buffer");
+        return -1;
+    }
+
+    /* Transient one-time-submit command buffer (mirrors vulkan_create_texture).
+     * Does not touch the frame command buffer. */
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo pool_info = {0};
+    pool_info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_info.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pool_info.queueFamilyIndex = vio_vk.graphics_family;
+    if (vkCreateCommandPool(vio_vk.device, &pool_info, NULL, &pool) != VK_SUCCESS) {
+        vio_vma_destroy_buffer(vio_vk.vma_allocator, rb_buf, rb_alloc);
+        return -1;
+    }
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cmd_alloc = {0};
+    cmd_alloc.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmd_alloc.commandPool        = pool;
+    cmd_alloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_alloc.commandBufferCount = 1;
+    vkAllocateCommandBuffers(vio_vk.device, &cmd_alloc, &cmd);
+
+    VkCommandBufferBeginInfo begin = {0};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    /* PRESENT_SRC_KHR -> TRANSFER_SRC_OPTIMAL. The image was left in
+     * PRESENT_SRC_KHR by the swapchain render pass's finalLayout. */
+    VkImageMemoryBarrier to_src = {0};
+    to_src.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_src.oldLayout           = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    to_src.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_src.image               = src_image;
+    to_src.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    to_src.subresourceRange.levelCount = 1;
+    to_src.subresourceRange.layerCount = 1;
+    to_src.srcAccessMask       = 0;
+    to_src.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &to_src);
+
+    VkBufferImageCopy copy = {0};
+    copy.bufferOffset      = 0;
+    copy.bufferRowLength   = 0;  /* tightly packed -> row stride = width*4 */
+    copy.bufferImageHeight = 0;
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent.width  = sw;
+    copy.imageExtent.height = sh;
+    copy.imageExtent.depth  = 1;
+    vkCmdCopyImageToBuffer(cmd, src_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           rb_buf, 1, &copy);
+
+    /* TRANSFER_SRC_OPTIMAL -> PRESENT_SRC_KHR so the image is back in a
+     * presentable layout (the next acquire+pass would otherwise transition from
+     * an unexpected layout). */
+    VkImageMemoryBarrier to_present = {0};
+    to_present.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_present.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_present.newLayout           = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_present.image               = src_image;
+    to_present.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    to_present.subresourceRange.levelCount = 1;
+    to_present.subresourceRange.layerCount = 1;
+    to_present.srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    to_present.dstAccessMask       = 0;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, NULL, 0, NULL, 1, &to_present);
+
+    vkEndCommandBuffer(cmd);
+
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fci = {0};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(vio_vk.device, &fci, NULL, &fence);
+
+    /* Semaphore signalled by the readback submit and waited by the re-present,
+     * so the presentation engine does not read the image until the copy + the
+     * transition back to PRESENT_SRC_KHR have completed. */
+    VkSemaphore done_sem = VK_NULL_HANDLE;
+    vkCreateSemaphore(vio_vk.device, &sem_info, NULL, &done_sem);
+
+    /* Wait the acquire semaphore at TRANSFER (the stage of our first barrier +
+     * copy): the present -> acquire -> copy dependency that resolves the
+     * WRITE_AFTER_PRESENT hazard. */
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo submit = {0};
+    submit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.waitSemaphoreCount   = 1;
+    submit.pWaitSemaphores      = &acq_sem;
+    submit.pWaitDstStageMask    = &wait_stage;
+    submit.commandBufferCount   = 1;
+    submit.pCommandBuffers      = &cmd;
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores    = &done_sem;
+    vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, fence);
+    vkWaitForFences(vio_vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+
+    /* Map + copy out. The swapchain is B8G8R8A8_UNORM, so the buffer holds
+     * B,G,R,A per pixel; D3D12's readback is R8G8B8A8_UNORM (R,G,B,A). Swap the
+     * B/R bytes (index 0 <-> 2) so the output is R,G,B,A — identical to D3D12.
+     * If the surface fell back to an R8G8B8A8 format the order already matches,
+     * so we copy straight through. The copy is already top-down: image row 0 is
+     * the top of the framebuffer and the buffer received rows in order. */
+    void *mapped = vio_vma_map(vio_vk.vma_allocator, rb_alloc);
+    int rc = 0;
+    if (!mapped) {
+        php_error_docref(NULL, E_WARNING, "vio_read_pixels: failed to map Vulkan readback buffer");
+        rc = -1;
+    } else {
+        const int swizzle_br = (vio_vk.swapchain_format == VK_FORMAT_B8G8R8A8_UNORM ||
+                                vio_vk.swapchain_format == VK_FORMAT_B8G8R8A8_SRGB);
+        const unsigned char *srcp = (const unsigned char *)mapped;
+        unsigned char *dst = (unsigned char *)out_rgba;
+
+        /* Honor the caller's expected dimensions: only write the overlapping
+         * region so a width/height mismatch with the actual swapchain extent
+         * never overruns out_rgba (sized width*height*4 by the caller). */
+        const uint32_t copy_w = ((uint32_t)width  < sw) ? (uint32_t)width  : sw;
+        const uint32_t copy_h = ((uint32_t)height < sh) ? (uint32_t)height : sh;
+        const size_t   dst_stride = (size_t)width * 4;
+
+        for (uint32_t y = 0; y < copy_h; y++) {
+            const unsigned char *srow = srcp + (size_t)y * row_bytes;
+            unsigned char       *drow = dst  + (size_t)y * dst_stride;
+            if (swizzle_br) {
+                for (uint32_t x = 0; x < copy_w; x++) {
+                    const unsigned char *sp = srow + (size_t)x * 4;
+                    unsigned char       *dp = drow + (size_t)x * 4;
+                    dp[0] = sp[2]; /* R <- B */
+                    dp[1] = sp[1]; /* G       */
+                    dp[2] = sp[0]; /* B <- R */
+                    dp[3] = sp[3]; /* A       */
+                }
+            } else {
+                memcpy(drow, srow, (size_t)copy_w * 4);
+            }
+        }
+        vio_vma_unmap(vio_vk.vma_allocator, rb_alloc);
+    }
+
+    /* Re-present the acquired image to keep the acquire/present balance (every
+     * vkAcquireNextImageKHR must be matched by a present or the swapchain
+     * eventually has no acquirable images and the next acquire blocks forever).
+     * The image was transitioned back to PRESENT_SRC_KHR by the second barrier;
+     * the present waits on done_sem so it does not race the copy/transition.
+     * The image content is unchanged by the copy, so re-presenting it shows the
+     * same frame again — visually a no-op. */
+    VkPresentInfoKHR present_info = {0};
+    present_info.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores    = &done_sem;
+    present_info.swapchainCount     = 1;
+    present_info.pSwapchains        = &vio_vk.swapchain;
+    present_info.pImageIndices      = &acq_idx;
+    VkResult pr = vkQueuePresentKHR(vio_vk.present_queue, &present_info);
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
+        vio_vk.swapchain_needs_recreate = 1;
+    }
+    /* Make sure the present has been consumed before destroying done_sem /
+     * acq_sem (a semaphore destroyed while a pending present still references it
+     * is a use-after-free). vkDeviceWaitIdle does not wait on the present
+     * engine, but vkQueueWaitIdle on the present queue drains the queued present
+     * operation's semaphore wait. */
+    vkQueueWaitIdle(vio_vk.present_queue);
+
+    vkDestroySemaphore(vio_vk.device, done_sem, NULL);
+    vkDestroySemaphore(vio_vk.device, acq_sem, NULL);
+    vkDestroyFence(vio_vk.device, fence, NULL);
+    vkDestroyCommandPool(vio_vk.device, pool, NULL); /* frees cmd */
+    vio_vma_destroy_buffer(vio_vk.vma_allocator, rb_buf, rb_alloc);
+
+    return rc;
+}
+
 static int vulkan_supports_feature(vio_feature feature)
 {
     switch (feature) {
@@ -1965,7 +2255,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_3D_PIPELINE:  return 1;
         case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
         case VIO_FEATURE_MULTIVIEW:    return 0; /* VK_KHR_multiview not wired */
-        case VIO_FEATURE_READ_PIXELS:  return 0; /* vkCmdCopyImageToBuffer path not wired */
+        case VIO_FEATURE_READ_PIXELS:  return 1; /* vkCmdCopyImageToBuffer readback of the last-rendered swapchain image (Phase 5); requires the swapchain's TRANSFER_SRC usage added in create_swapchain */
         case VIO_FEATURE_INSTANCED_DRAW: return 1;
         case VIO_FEATURE_RENDER_TARGET:       return 1; /* offscreen RT + render-to-texture (Phase 3) */
         case VIO_FEATURE_RENDER_TARGET_HDR:   return 0; /* R16G16B16A16_SFLOAT offscreen not wired yet (Phase 5) */

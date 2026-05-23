@@ -240,5 +240,34 @@ void vulkan_begin_offscreen_render_pass(void *rt);
  * ensure vio_vk.in_frame and that current_bound_rt is set. */
 void vulkan_record_unbind_render_target(void);
 
+/* Phase 5 — read back the last-rendered swapchain image into a CPU buffer as
+ * TOP-DOWN RGBA8 (the Vulkan analog of D3D12's last_presented_frame_idx read).
+ *
+ * Implementation: vkDeviceWaitIdle (drain the device queues); RE-ACQUIRE a
+ * swapchain image (vkAcquireNextImageKHR) so the readback submit can wait on the
+ * acquire semaphore — this resolves the WRITE_AFTER_PRESENT sync hazard, since
+ * vkDeviceWaitIdle does NOT synchronize with the presentation engine and
+ * transitioning a just-presented image directly would race the present's read.
+ * The acquired image holds the most recent render of that buffer (the swapchain
+ * never clears presented images), so under vsync/FIFO with a stable scene this
+ * is the just-presented content. Then: a transient one-time-submit command
+ * buffer transitions the image PRESENT_SRC_KHR -> TRANSFER_SRC_OPTIMAL,
+ * vkCmdCopyImageToBuffer into a HOST_VISIBLE readback VkBuffer sized to the
+ * tightly-packed copy footprint, transitions back to PRESENT_SRC_KHR; the submit
+ * waits the acquire semaphore + signals a done semaphore; map + memcpy honoring
+ * the buffer row stride and SWIZZLE the swapchain's B8G8R8A8 byte order to
+ * R8G8B8A8 so the output matches the D3D12 R8G8B8A8_UNORM readback byte-for-byte
+ * (apples-to-apples golden compare); finally RE-PRESENT the acquired image
+ * (waiting the done semaphore) to keep the acquire/present balance — an acquire
+ * without a matching present eventually hangs future acquires (the Phase 4
+ * lesson) — and vkQueueWaitIdle the present queue before freeing the semaphores.
+ *
+ * `out_rgba` must point to at least width*height*4 bytes; width/height are the
+ * caller's expected dimensions (the actual swapchain extent is used for the copy
+ * and the lesser of the two is written per row/column, so a size mismatch never
+ * overruns). Returns 0 on success, non-zero on failure (out_rgba untouched on
+ * failure). Safe to call only when vio_vk.initialized and a frame has rendered. */
+int vulkan_read_pixels(int width, int height, void *out_rgba);
+
 #endif /* HAVE_VULKAN */
 #endif /* VIO_VULKAN_H */
