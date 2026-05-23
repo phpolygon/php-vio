@@ -1,3 +1,10 @@
+# [1.16.0](https://github.com/phpolygon/php-vio/compare/v1.15.1...v1.16.0) (2026-05-23)
+
+
+### Features
+
+* **vulkan:** full 2D + offscreen render backend (parity with d3d12) ([58653d9](https://github.com/phpolygon/php-vio/commit/58653d96331d8a867b43af6075ffb3416dd022c8))
+
 ## [1.15.1](https://github.com/phpolygon/php-vio/compare/v1.15.0...v1.15.1) (2026-05-22)
 
 
