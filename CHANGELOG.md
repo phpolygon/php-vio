@@ -1,3 +1,10 @@
+## [1.16.2](https://github.com/phpolygon/php-vio/compare/v1.16.1...v1.16.2) (2026-05-23)
+
+
+### Bug Fixes
+
+* **d3d12:** silence benign clear-value-mismatch perf hints (id 820/821) ([15d4a5f](https://github.com/phpolygon/php-vio/commit/15d4a5fd410f6a2d841c2e00c2bcc2e9fb0eecbb)), closes [#9](https://github.com/phpolygon/php-vio/issues/9)
+
 ## [1.16.1](https://github.com/phpolygon/php-vio/compare/v1.16.0...v1.16.1) (2026-05-23)
 
 
