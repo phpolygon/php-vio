@@ -49,12 +49,26 @@ typedef struct _vio_render_target_object {
     void        *metal_color_texture;   /* id<MTLTexture> (CFRetained) */
     void        *metal_depth_texture;   /* id<MTLTexture> (CFRetained) */
 
+    /* Vulkan (opaque — VkImage/VkImageView/VkRenderPass/VkFramebuffer/VkSampler
+     * handles + VmaAllocation, stored as void* so the public header stays free
+     * of Vulkan headers; 64-bit only). */
+    void        *vulkan_color_image;          /* VkImage */
+    void        *vulkan_color_alloc;          /* VmaAllocation */
+    void        *vulkan_color_view;           /* VkImageView */
+    void        *vulkan_depth_image;          /* VkImage */
+    void        *vulkan_depth_alloc;          /* VmaAllocation */
+    void        *vulkan_depth_view;           /* VkImageView */
+    void        *vulkan_render_pass;          /* VkRenderPass (compatible with the swapchain 2D pipelines) */
+    void        *vulkan_framebuffer;          /* VkFramebuffer */
+    void        *vulkan_sampler;              /* VkSampler for sampling the result */
+    void        *vulkan_color_backend_texture;/* vio_vulkan_texture* cached for vio_render_target_texture() */
+
     /* Common */
     int          width;
     int          height;
     int          depth_only;
     int          valid;
-    int          backend_type;        /* 0=none, 1=opengl, 2=d3d11, 3=d3d12, 4=metal */
+    int          backend_type;        /* 0=none, 1=opengl, 2=d3d11, 3=d3d12, 4=metal, 5=vulkan */
     int          d3d12_depth_is_srv;  /* 1 if depth resource is in SRV state (needs barrier to DEPTH_WRITE) */
     int          d3d12_color_is_srv;  /* 1 if color resource is in SRV state (needs barrier to RENDER_TARGET) */
     /* D3D12 cached SRV for shadow map sampling (allocated once at RT creation) */
@@ -75,6 +89,7 @@ typedef struct _vio_render_target_object {
 #define VIO_RT_BACKEND_D3D11  2
 #define VIO_RT_BACKEND_D3D12  3
 #define VIO_RT_BACKEND_METAL  4
+#define VIO_RT_BACKEND_VULKAN 5
 
 extern zend_class_entry *vio_render_target_ce;
 

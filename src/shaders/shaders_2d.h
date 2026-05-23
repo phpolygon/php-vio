@@ -68,6 +68,53 @@ static const char *vio_2d_hlsl_ps_sprites =
     "    return uTexture.Sample(uSampler, i.uv) * i.col;\n"
     "}\n";
 
+/* ── Vulkan GLSL variants (explicit bindings → SPIR-V) ───────────────
+ *
+ * The shared GLSL above relies on the glslang AUTO_MAP_BINDINGS +
+ * VULKAN_RULES_RELAXED path, which assigns binding numbers implicitly. For
+ * Vulkan that is fragile: a binding mismatch is a SILENT black screen, not a
+ * validation error. These variants pin the projection to a vertex-stage
+ * push constant (64-byte mat4) and the sprite sampler to set=0, binding=0 so
+ * the pipeline layout is deterministic and shared by both pipelines.
+ *
+ * NOTE: SPIR-V's clip space has Y pointing down (opposite of OpenGL). The
+ * orthographic projection produced by vio_2d_ortho already maps screen-space
+ * Y-down to NDC the same way it does for D3D, so no Y flip is needed here. */
+
+static const char *vio_2d_vk_vs =
+    "#version 450\n"
+    "layout(location = 0) in vec2 aPosition;\n"
+    "layout(location = 1) in vec2 aTexCoord;\n"
+    "layout(location = 2) in vec4 aColor;\n"
+    "layout(push_constant) uniform PushConstants { mat4 uProjection; } pc;\n"
+    "layout(location = 0) out vec2 vTexCoord;\n"
+    "layout(location = 1) out vec4 vColor;\n"
+    "void main() {\n"
+    "    gl_Position = pc.uProjection * vec4(aPosition, 0.0, 1.0);\n"
+    "    gl_Position.y = -gl_Position.y; // Vulkan clip-space Y points down (NDC y=-1 at top); flip to match the GL/D3D-oriented 2D projection. CULL_MODE_NONE, so the winding flip is irrelevant.\n"
+    "    vTexCoord = aTexCoord;\n"
+    "    vColor = aColor;\n"
+    "}\n";
+
+static const char *vio_2d_vk_fs_shapes =
+    "#version 450\n"
+    "layout(location = 0) in vec2 vTexCoord;\n"
+    "layout(location = 1) in vec4 vColor;\n"
+    "layout(location = 0) out vec4 FragColor;\n"
+    "void main() {\n"
+    "    FragColor = vColor;\n"
+    "}\n";
+
+static const char *vio_2d_vk_fs_sprites =
+    "#version 450\n"
+    "layout(location = 0) in vec2 vTexCoord;\n"
+    "layout(location = 1) in vec4 vColor;\n"
+    "layout(location = 0) out vec4 FragColor;\n"
+    "layout(set = 0, binding = 0) uniform sampler2D uTexture;\n"
+    "void main() {\n"
+    "    FragColor = texture(uTexture, vTexCoord) * vColor;\n"
+    "}\n";
+
 /* ── Metal Shading Language (MSL) equivalents ────────────────────── */
 
 #ifdef HAVE_METAL

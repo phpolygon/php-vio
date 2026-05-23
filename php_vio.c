@@ -297,6 +297,14 @@ ZEND_FUNCTION(vio_destroy)
             ctx->backend->teardown_headless(ctx->headless_fbo);
             ctx->headless_fbo = 0;
         }
+        /* Tear down the 2D renderer's backend resources BEFORE the backend
+         * device is destroyed. The Vulkan 2D state (pipelines, buffer, layouts,
+         * shader modules) is created against vio_vk.device; vulkan_shutdown()
+         * destroys the device and zeroes vio_vk, so destroying these afterward
+         * would dereference a NULL device (crash) and leave child objects alive
+         * at vkDestroyDevice (validation error). vio_2d_shutdown is idempotent,
+         * so the free handler's later call is a no-op. */
+        vio_2d_shutdown(&ctx->state_2d);
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }
@@ -492,6 +500,58 @@ ZEND_FUNCTION(vio_begin)
         vio_d3d12.pending_bound_rt = NULL;
         if (prt->valid) {
             d3d12_record_bind_render_target(prt);
+        }
+    }
+#endif
+
+#ifdef HAVE_VULKAN
+    /* Apply a render-target bind requested before vio_begin() (the warm-render
+     * "bind then begin" order). begin_frame() above opened the swapchain pass on
+     * this frame's command buffer, so the deferred switch can now be recorded.
+     *
+     * STRICT NO-OP on a normal frame: this block does nothing unless
+     * pending_bound_rt is non-NULL (set only by an out-of-frame
+     * vio_bind_render_target). On a plain shapes/text frame pending_bound_rt is
+     * NULL, the guard short-circuits, and the command stream is byte-identical to
+     * pre-Phase-3. The vio_vk.initialized + backend-name guard further ensures
+     * this never touches a non-Vulkan context. */
+    if (vio_vk.initialized && strcmp(ctx->backend->name, "vulkan") == 0
+            && vio_vk.pending_bound_rt) {
+        vio_render_target_object *prt =
+            (vio_render_target_object *)vio_vk.pending_bound_rt;
+        vio_vk.pending_bound_rt = NULL;
+        /* m1 — if the deferred RT is invalid or not a Vulkan target, the
+         * offscreen pass is never begun, yet vulkan_begin_frame already latched
+         * frame_is_offscreen=1 (it keys off pending_bound_rt being non-NULL at
+         * begin). The result is a silently-dropped frame: it acquires nothing,
+         * draws nothing, presents nothing (end_frame's "if (current_bound_rt)"
+         * no-ops the pass-end and the zero-semaphore submit is harmless; present
+         * skips). That is SAFE but invisible, so warn — a bound-then-invalidated
+         * RT eating a frame is almost always a caller bug. */
+        if (!(prt->valid && prt->backend_type == VIO_RT_BACKEND_VULKAN)) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_begin: pending Vulkan render target is invalid or not a Vulkan target; "
+                "this frame renders nothing and is not presented");
+        }
+        if (prt->valid && prt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.in_frame) {
+            /* Phase 4: vulkan_begin_frame set vio_vk.frame_is_offscreen=1 for this
+             * frame (pending_bound_rt was non-NULL at begin), and crucially did
+             * NOT begin the swapchain render pass and did NOT acquire a swapchain
+             * image. So begin the OFFSCREEN pass DIRECTLY (no preceding
+             * vkCmdEndRenderPass) — using the mid-frame switch
+             * vulkan_record_bind_render_target() here would call vkCmdEndRenderPass
+             * on a frame with no open pass (a validation error).
+             *
+             * The frame_is_offscreen guard keeps Phase 3's mid-frame switch path
+             * (vulkan_record_bind_render_target) for the hypothetical case where a
+             * pending bind coexists with an already-open swapchain pass; with the
+             * current flow that path is not reached from here (an in-frame bind
+             * records immediately in vio_bind_render_target, never via pending). */
+            if (vio_vk.frame_is_offscreen) {
+                vulkan_begin_offscreen_render_pass(prt);
+            } else {
+                vulkan_record_bind_render_target(prt);
+            }
         }
     }
 #endif
@@ -3049,6 +3109,33 @@ ZEND_FUNCTION(vio_font)
     }
 #endif
 
+#ifdef HAVE_VULKAN
+    if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
+        /* Expand the R8 coverage atlas to RGBA8 (white RGB, coverage in alpha)
+         * so the single sprites pipeline serves both PNG sprites and glyphs:
+         * the sprite shader computes texture(uTexture, uv) * vColor, and a
+         * white-RGB / coverage-alpha texel multiplied by the vertex color
+         * tints the glyph and applies coverage as alpha — identical to D3D12. */
+        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
+        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
+            rgba[p * 4 + 0] = 255;
+            rgba[p * 4 + 1] = 255;
+            rgba[p * 4 + 2] = 255;
+            rgba[p * 4 + 3] = atlas_bitmap[p];
+        }
+
+        vio_texture_desc desc = {0};
+        desc.width  = VIO_FONT_ATLAS_SIZE;
+        desc.height = VIO_FONT_ATLAS_SIZE;
+        desc.data   = rgba;
+        desc.filter = VIO_FILTER_LINEAR;
+        desc.wrap   = VIO_WRAP_CLAMP;
+        desc.mipmaps = 0;
+        font->atlas_backend_texture = ctx->backend->create_texture(&desc);
+        efree(rgba);
+    }
+#endif
+
     efree(atlas_bitmap);
 
     font->valid = 1;
@@ -4023,6 +4110,36 @@ ZEND_FUNCTION(vio_read_pixels)
     }
 #endif
 
+#ifdef HAVE_VULKAN
+    if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
+        /* vulkan_read_pixels RE-ACQUIRES a swapchain image (NOT
+         * swapchain_images[current_image_index] directly — that just-presented
+         * image is owned by the presentation engine and reading it would be a
+         * WRITE_AFTER_PRESENT sync hazard) and reads that image back as TOP-DOWN
+         * RGBA8, swizzling the B8G8R8A8_UNORM swapchain to R,G,B,A so the bytes
+         * match the D3D12 R8G8B8A8_UNORM readback for an apples-to-apples golden
+         * compare. It honors the buffer row stride and the caller's w/h (writes
+         * only the overlapping region, never overruns).
+         *
+         * m3 — INTENDED USE is stable/screenshot capture (golden tests, the
+         * splash screenshot). The re-acquired buffer holds the most-recent
+         * render of that swapchain image; with FIFO/vsync and a static scene
+         * that is the just-presented content, but for an ANIMATING scene with
+         * >=3 swapchain images the acquired buffer may be 1-2 frames stale.
+         * Call this after rendering a steady frame, not as a per-frame capture. */
+        size_t size = (size_t)w * h * 4;
+        zend_string *buf = zend_string_alloc(size, 0);
+        ZSTR_VAL(buf)[size] = '\0';
+
+        if (vulkan_read_pixels(w, h, (unsigned char *)ZSTR_VAL(buf)) == 0) {
+            RETURN_NEW_STR(buf);
+        }
+        zend_string_release(buf);
+        php_error_docref(NULL, E_WARNING, "vio_read_pixels: Vulkan readback failed");
+        RETURN_FALSE;
+    }
+#endif
+
 #ifdef HAVE_METAL
     if (strcmp(ctx->backend->name, "metal") == 0) {
         size_t size = (size_t)w * h * 4;
@@ -4078,19 +4195,24 @@ ZEND_FUNCTION(vio_save_screenshot)
     }
 #endif
 
-#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12) || defined(HAVE_VULKAN)
     {
-        /* Fallback for D3D backends: delegate to vio_read_pixels and write PNG.
-         * Calls vio_read_pixels() via the Zend API to avoid duplicating the readback
-         * logic for D3D11/D3D12. */
-        int is_d3d = 0;
+        /* Fallback for backends whose readback lives in vio_read_pixels:
+         * delegate to it and write PNG, avoiding duplicate readback logic.
+         * vio_read_pixels returns TOP-DOWN RGBA8 for all of these (D3D11/D3D12
+         * R8G8B8A8_UNORM, Vulkan B8G8R8A8_UNORM swizzled to RGBA), which is
+         * exactly what stbi_write_png(..., 4, pixels, w*4) expects. */
+        int is_delegated = 0;
 #ifdef HAVE_D3D11
-        if (strcmp(ctx->backend->name, "d3d11") == 0) is_d3d = 1;
+        if (strcmp(ctx->backend->name, "d3d11") == 0) is_delegated = 1;
 #endif
 #ifdef HAVE_D3D12
-        if (strcmp(ctx->backend->name, "d3d12") == 0) is_d3d = 1;
+        if (strcmp(ctx->backend->name, "d3d12") == 0) is_delegated = 1;
 #endif
-        if (is_d3d) {
+#ifdef HAVE_VULKAN
+        if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) is_delegated = 1;
+#endif
+        if (is_delegated) {
             zval retval, func_name, args[1];
             ZVAL_UNDEF(&retval);
             ZVAL_STRING(&func_name, "vio_read_pixels");
@@ -5771,6 +5893,19 @@ ZEND_FUNCTION(vio_render_target)
     }
 #endif
 
+#ifdef HAVE_VULKAN
+    if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
+        /* Parallel to the d3d12 inline block: create the per-target Vulkan
+         * resources (color image+view, optional depth, a render-pass-compatible
+         * VkRenderPass, framebuffer, sampler) and tag the backend type. */
+        if (vulkan_create_render_target(rt, width, height, hdr, depth_only) != 0) {
+            zval_ptr_dtor(&rt_zval);
+            RETURN_FALSE;
+        }
+        rt->backend_type = VIO_RT_BACKEND_VULKAN;
+    }
+#endif
+
     rt->valid = 1;
     RETURN_COPY_VALUE(&rt_zval);
 }
@@ -5915,6 +6050,25 @@ ZEND_FUNCTION(vio_bind_render_target)
              * pending bind once the frame's list is open. This is what makes
              * the warm-render "bind then begin" order work on D3D12. */
             vio_d3d12.pending_bound_rt = rt;
+        }
+    }
+#endif
+
+#ifdef HAVE_VULKAN
+    if (rt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.initialized) {
+        if (vio_vk.in_frame) {
+            /* A swapchain pass is open on this frame's command buffer: switch to
+             * the offscreen pass now (end swapchain pass -> begin offscreen pass
+             * -> RT-extent viewport/scissor -> current_bound_rt = rt). */
+            vulkan_record_bind_render_target(rt);
+        } else {
+            /* Called before vio_begin() (the warm-render "bind then begin"
+             * order): no command buffer is recording and no pass is open, so we
+             * cannot record the switch yet. Stash it; vio_begin() applies the
+             * pending bind once begin_frame() has opened the swapchain pass.
+             * Recording nothing here is the strict no-op the normal path relies
+             * on — only a non-NULL pending_bound_rt makes vio_begin act. */
+            vio_vk.pending_bound_rt = rt;
         }
     }
 #endif
@@ -6066,6 +6220,25 @@ ZEND_FUNCTION(vio_unbind_render_target)
 
         D3D12_RECT scissor = {0, 0, vio_d3d12.width, vio_d3d12.height};
         ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
+    }
+#endif
+
+#ifdef HAVE_VULKAN
+    if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
+        if (vio_vk.in_frame && vio_vk.current_bound_rt) {
+            /* In-frame unbind: end the offscreen pass (its finalLayout leaves the
+             * color image SHADER_READ_ONLY, so it's immediately samplable) and
+             * re-open the swapchain pass with loadOp=LOAD so prior swapchain
+             * draws survive and later draws composite on top. */
+            vulkan_record_unbind_render_target();
+        } else {
+            /* Out-of-frame unbind (warm-render "unbind after end"): the command
+             * buffer is already submitted, so there is nothing to record. Just
+             * drop the tracked / pending binding. Mirrors the d3d12 closed-list
+             * branch. */
+            vio_vk.pending_bound_rt = NULL;
+            vio_vk.current_bound_rt = NULL;
+        }
     }
 #endif
 }
@@ -6220,6 +6393,50 @@ ZEND_FUNCTION(vio_render_target_texture)
         if (cf_tex) {
             tex->texture_id = vio_metal_register_external_texture(cf_tex);
             tex->borrowed = 1;
+        }
+    }
+#endif
+
+#ifdef HAVE_VULKAN
+    /* For Vulkan: hand out a vio_vulkan_texture wrapper around the RT's color
+     * view + sampler, cached on the RT (built once, reused every call) — the
+     * same cache-the-wrapper rationale as the D3D11/D3D12 branches (a fresh
+     * wrapper per call would leak a struct per frame). The 2D flush textured
+     * path reads wrapper->view + wrapper->sampler and allocates a per-frame
+     * combined-image-sampler descriptor from the 2D pool ring, so no persistent
+     * descriptor set is needed here (the per-frame ring already handles the
+     * in-flight hazard correctly).
+     *
+     * The wrapper BORROWS the RT-owned view+sampler (it must NOT add itself to
+     * vio_vk.live_textures and must NOT free those handles), and the RT's free
+     * handler (vulkan_destroy_render_target) frees the cached struct. To stop
+     * the returned VioTexture's free handler from running vulkan_destroy_texture
+     * on the borrowed handles, we leave tex->backend = NULL (the texture free
+     * handler short-circuits when backend is NULL) and mark it borrowed. */
+    if (rt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.initialized && !rt->depth_only) {
+        vio_vulkan_texture **cache_slot =
+            (vio_vulkan_texture **)&rt->vulkan_color_backend_texture;
+
+        if (*cache_slot == NULL && rt->vulkan_color_view && rt->vulkan_sampler) {
+            vio_vulkan_texture *w = calloc(1, sizeof(vio_vulkan_texture));
+            if (w) {
+                w->image      = (VkImage)rt->vulkan_color_image; /* borrowed (RT-owned) */
+                w->allocation = NULL;                            /* RT owns the allocation */
+                w->view       = (VkImageView)rt->vulkan_color_view;   /* borrowed */
+                w->sampler    = (VkSampler)rt->vulkan_sampler;        /* borrowed */
+                w->width      = rt->width;
+                w->height     = rt->height;
+                /* NOT linked into vio_vk.live_textures: the shutdown sweep frees
+                 * GPU objects, but these are owned by the RT, not this wrapper. */
+                w->next = w->prev = NULL;
+                *cache_slot = w;
+            }
+        }
+
+        if (*cache_slot != NULL) {
+            tex->backend_texture = *cache_slot;
+            tex->backend         = NULL; /* prevent the tex dtor from freeing borrowed handles */
+            tex->borrowed        = 1;
         }
     }
 #endif

@@ -30,6 +30,7 @@ if (PHP_VIO != "no") {
         "src\\vio_2d.c " +
         "src\\vio_2d_d3d11.c " +
         "src\\vio_2d_d3d12.c " +
+        "src\\vio_2d_vulkan.c " +
         "src\\vio_font.c " +
         "src\\vio_shader_compiler.c " +
         "src\\vio_shader_reflect.c " +

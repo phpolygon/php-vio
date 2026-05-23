@@ -35,6 +35,16 @@ static zend_object *vio_render_target_create_object(zend_class_entry *ce)
     rt->d3d12_depth_backend_texture = NULL;
     rt->metal_color_texture = NULL;
     rt->metal_depth_texture = NULL;
+    rt->vulkan_color_image  = NULL;
+    rt->vulkan_color_alloc  = NULL;
+    rt->vulkan_color_view   = NULL;
+    rt->vulkan_depth_image  = NULL;
+    rt->vulkan_depth_alloc  = NULL;
+    rt->vulkan_depth_view   = NULL;
+    rt->vulkan_render_pass  = NULL;
+    rt->vulkan_framebuffer  = NULL;
+    rt->vulkan_sampler      = NULL;
+    rt->vulkan_color_backend_texture = NULL;
     rt->width         = 0;
     rt->height        = 0;
     rt->depth_only    = 0;
