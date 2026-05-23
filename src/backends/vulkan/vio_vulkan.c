@@ -277,6 +277,11 @@ static void cleanup_swapchain(void)
      * the rest of the swapchain. Callers (vio_vulkan_recreate_swapchain and
      * vulkan_shutdown) vkDeviceWaitIdle first, so none is in use by a pending
      * submit or present here. */
+    /* All per-image arrays below are calloc'd in create_swapchain, so a
+     * partially-built swapchain (cleanup_swapchain called from a create_swapchain
+     * failure path, M2) has VK_NULL_HANDLE in the not-yet-created slots; each
+     * destroy is guarded on non-NULL and vkDestroy* on NULL is a safe no-op, so
+     * this is correct whether the swapchain is fully or partially built. */
     if (vio_vk.render_finished_per_image) {
         for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
             if (vio_vk.render_finished_per_image[i]) {
@@ -299,7 +304,9 @@ static void cleanup_swapchain(void)
 
     if (vio_vk.framebuffers) {
         for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
-            vkDestroyFramebuffer(vio_vk.device, vio_vk.framebuffers[i], NULL);
+            if (vio_vk.framebuffers[i]) {
+                vkDestroyFramebuffer(vio_vk.device, vio_vk.framebuffers[i], NULL);
+            }
         }
         free(vio_vk.framebuffers);
         vio_vk.framebuffers = NULL;
@@ -307,7 +314,9 @@ static void cleanup_swapchain(void)
 
     if (vio_vk.swapchain_image_views) {
         for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
-            vkDestroyImageView(vio_vk.device, vio_vk.swapchain_image_views[i], NULL);
+            if (vio_vk.swapchain_image_views[i]) {
+                vkDestroyImageView(vio_vk.device, vio_vk.swapchain_image_views[i], NULL);
+            }
         }
         free(vio_vk.swapchain_image_views);
         vio_vk.swapchain_image_views = NULL;
@@ -320,6 +329,12 @@ static void cleanup_swapchain(void)
         vkDestroySwapchainKHR(vio_vk.device, vio_vk.swapchain, NULL);
         vio_vk.swapchain = VK_NULL_HANDLE;
     }
+
+    /* All per-image arrays are freed and the count's slots no longer exist;
+     * zero it so a later cleanup (e.g. shutdown after a failed create) does not
+     * iterate a stale count over NULL/freed arrays. create_swapchain re-derives
+     * the count via vkGetSwapchainImagesKHR. */
+    vio_vk.swapchain_image_count = 0;
 }
 
 static int create_swapchain(void)
@@ -426,8 +441,10 @@ static int create_swapchain(void)
     vio_vk.swapchain_images = malloc(vio_vk.swapchain_image_count * sizeof(VkImage));
     vkGetSwapchainImagesKHR(vio_vk.device, vio_vk.swapchain, &vio_vk.swapchain_image_count, vio_vk.swapchain_images);
 
-    /* Create image views */
-    vio_vk.swapchain_image_views = malloc(vio_vk.swapchain_image_count * sizeof(VkImageView));
+    /* Create image views. calloc so a partial loop leaves VK_NULL_HANDLE in the
+     * not-yet-created slots, making cleanup_swapchain() safe on a failure path
+     * (M2 — all-or-nothing creation). */
+    vio_vk.swapchain_image_views = calloc(vio_vk.swapchain_image_count, sizeof(VkImageView));
     for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
         VkImageViewCreateInfo iv_info = {0};
         iv_info.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -442,7 +459,7 @@ static int create_swapchain(void)
 
         if (vkCreateImageView(vio_vk.device, &iv_info, NULL, &vio_vk.swapchain_image_views[i]) != VK_SUCCESS) {
             php_error_docref(NULL, E_WARNING, "Failed to create swapchain image view %u", i);
-            return -1;
+            goto fail_cleanup;
         }
     }
 
@@ -466,7 +483,7 @@ static int create_swapchain(void)
                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                               &vio_vk.depth_image, &depth_alloc) != 0) {
         php_error_docref(NULL, E_WARNING, "Failed to create depth image");
-        return -1;
+        goto fail_cleanup;
     }
     vio_vk.depth_memory = (VkDeviceMemory)depth_alloc; /* Stores VMA allocation handle */
 
@@ -483,11 +500,11 @@ static int create_swapchain(void)
 
     if (vkCreateImageView(vio_vk.device, &depth_view_info, NULL, &vio_vk.depth_view) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Failed to create depth image view");
-        return -1;
+        goto fail_cleanup;
     }
 
-    /* Create framebuffers */
-    vio_vk.framebuffers = malloc(vio_vk.swapchain_image_count * sizeof(VkFramebuffer));
+    /* Create framebuffers (calloc — see image-views note above). */
+    vio_vk.framebuffers = calloc(vio_vk.swapchain_image_count, sizeof(VkFramebuffer));
     for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
         VkImageView attachments[] = { vio_vk.swapchain_image_views[i], vio_vk.depth_view };
 
@@ -502,7 +519,7 @@ static int create_swapchain(void)
 
         if (vkCreateFramebuffer(vio_vk.device, &fb_info, NULL, &vio_vk.framebuffers[i]) != VK_SUCCESS) {
             php_error_docref(NULL, E_WARNING, "Failed to create framebuffer %u", i);
-            return -1;
+            goto fail_cleanup;
         }
     }
 
@@ -511,18 +528,29 @@ static int create_swapchain(void)
      * across recreates — cleanup_swapchain() destroys these, so the count is
      * always re-derived here. */
     vio_vk.render_finished_per_image =
-        malloc(vio_vk.swapchain_image_count * sizeof(VkSemaphore));
+        calloc(vio_vk.swapchain_image_count, sizeof(VkSemaphore));
     for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
         VkSemaphoreCreateInfo sem_info = {0};
         sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         if (vkCreateSemaphore(vio_vk.device, &sem_info, NULL,
                               &vio_vk.render_finished_per_image[i]) != VK_SUCCESS) {
             php_error_docref(NULL, E_WARNING, "Failed to create render_finished semaphore %u", i);
-            return -1;
+            goto fail_cleanup;
         }
     }
 
     return 0;
+
+fail_cleanup:
+    /* M2 — all-or-nothing: tear down everything this call created so far so a
+     * partial swapchain is never left behind. cleanup_swapchain() guards every
+     * handle on non-NULL and the per-image arrays are calloc'd, so it correctly
+     * frees only what was created (including the just-created swapchain handle,
+     * image-view/framebuffer/semaphore arrays at whatever fill level, and the
+     * depth image/view). Callers (setup_context / recreate) see the -1 and do
+     * not proceed with half-built state. */
+    cleanup_swapchain();
+    return -1;
 }
 
 /* ── Render pass creation ────────────────────────────────────────── */
@@ -752,9 +780,26 @@ static int vulkan_init(vio_config *cfg)
 
 static void vulkan_shutdown(void)
 {
-    if (!vio_vk.initialized) return;
+    /* M1 — handle-based teardown, NOT gated on vio_vk.initialized.
+     *
+     * vio_vk.initialized is set ONLY at the very end of vio_vulkan_setup_context,
+     * so a mid-setup failure (e.g. device/VMA/render-pass/swapchain creation
+     * fails) returns -1 with initialized==0 while the instance/surface/device/
+     * VMA/render-pass it DID create are still live. php_vio.c then calls
+     * backend->shutdown() to unwind — if this early-returned on !initialized,
+     * all of those would leak (and the validation layers would flag the leaked
+     * VkInstance/VkDevice at process exit). Instead we destroy whatever handles
+     * are non-NULL, in the correct reverse-dependency order. Every step below is
+     * individually guarded, so this is correct for BOTH a fully-initialized
+     * teardown and a partial-setup unwind, and is idempotent (memset at the end
+     * + the setup_context memset at the start guarantee NULL handles on a second
+     * call). If nothing was ever created this is a no-op. */
+    if (!vio_vk.instance && !vio_vk.device) return;
 
-    vkDeviceWaitIdle(vio_vk.device);
+    /* Only touch the device/queues if a device exists. */
+    if (vio_vk.device) {
+        vkDeviceWaitIdle(vio_vk.device);
+    }
 
     /* Sweep any backend textures whose owning PHP object outlived vio_destroy()
      * (the Zend free handlers run during request shutdown, AFTER this). Without
@@ -763,7 +808,9 @@ static void vulkan_shutdown(void)
      * The GPU is already idle, so pass wait=0. The free handlers null their own
      * backend_texture pointers afterwards, but since the device is gone by then
      * GPU objects are gone, so the later vulkan_destroy_texture only frees the
-     * heap struct (its release step is a no-op on the now-NULL device). */
+     * heap struct (its release step is a no-op on the now-NULL device).
+     * (On a partial-setup unwind these lists are empty — no textures/RTs can
+     * have been created before setup completed — but the sweeps are safe.) */
     while (vio_vk.live_textures) {
         vulkan_release_texture_gpu(vio_vk.live_textures, 0);
     }
@@ -783,17 +830,25 @@ static void vulkan_shutdown(void)
         vio_vk.live_rt_capacity = 0;
     }
 
-    destroy_frame_resources();
-    cleanup_swapchain();
+    /* Frame resources, swapchain, render passes all require the device. On a
+     * partial unwind where device creation failed, these were never created
+     * (their handles are NULL) and these calls are guarded no-ops. */
+    if (vio_vk.device) {
+        destroy_frame_resources();
+        cleanup_swapchain();
 
-    if (vio_vk.swapchain_resume_render_pass) {
-        vkDestroyRenderPass(vio_vk.device, vio_vk.swapchain_resume_render_pass, NULL);
-        vio_vk.swapchain_resume_render_pass = VK_NULL_HANDLE;
+        if (vio_vk.swapchain_resume_render_pass) {
+            vkDestroyRenderPass(vio_vk.device, vio_vk.swapchain_resume_render_pass, NULL);
+            vio_vk.swapchain_resume_render_pass = VK_NULL_HANDLE;
+        }
+        if (vio_vk.render_pass) {
+            vkDestroyRenderPass(vio_vk.device, vio_vk.render_pass, NULL);
+            vio_vk.render_pass = VK_NULL_HANDLE;
+        }
     }
-    if (vio_vk.render_pass) vkDestroyRenderPass(vio_vk.device, vio_vk.render_pass, NULL);
-    if (vio_vk.vma_allocator) vio_vma_destroy(vio_vk.vma_allocator);
-    if (vio_vk.device) vkDestroyDevice(vio_vk.device, NULL);
-    if (vio_vk.surface) vkDestroySurfaceKHR(vio_vk.instance, vio_vk.surface, NULL);
+    if (vio_vk.vma_allocator) { vio_vma_destroy(vio_vk.vma_allocator); vio_vk.vma_allocator = NULL; }
+    if (vio_vk.device) { vkDestroyDevice(vio_vk.device, NULL); vio_vk.device = VK_NULL_HANDLE; }
+    if (vio_vk.surface) { vkDestroySurfaceKHR(vio_vk.instance, vio_vk.surface, NULL); vio_vk.surface = VK_NULL_HANDLE; }
 
     if (vio_vk.debug_messenger) {
         PFN_vkDestroyDebugUtilsMessengerEXT func =
@@ -823,14 +878,112 @@ static void *vulkan_create_buffer(vio_buffer_desc *desc) { (void)desc; return NU
 static void vulkan_update_buffer(void *buf, const void *data, size_t size) { (void)buf; (void)data; (void)size; }
 static void vulkan_destroy_buffer(void *buf) { (void)buf; }
 
+/* ── Transient one-time-submit command helpers ───────────────────────
+ *
+ * N1/N4 — factored out of vulkan_create_texture's two near-identical upload
+ * blocks. vulkan_begin_transient_commands creates a TRANSIENT command pool +
+ * primary command buffer and begins it ONE_TIME_SUBMIT; the caller records its
+ * (block-specific) barriers/copies; vulkan_submit_transient_commands ends,
+ * submits on a transfer fence, BLOCKS until complete, then destroys the fence
+ * and pool (which frees the command buffer). Every VkResult is checked (N4) so
+ * a host-OOM cannot silently submit a never-begun / never-ended command buffer.
+ *
+ * On a begin failure the pool (if any) is destroyed and *out_cmd is NULL. On a
+ * submit failure the device is drained (best-effort) and the pool destroyed so
+ * nothing is leaked. Both return 0 on success, -1 on failure.
+ *
+ * Used at vio_texture()/vio_font() time, which is OUTSIDE any frame (no
+ * swapchain command buffer is recording), so a full queue stall on the fence is
+ * acceptable and keeps lifetimes simple — the upload never touches the per-frame
+ * command buffer, so there is no cross-frame hazard. */
+static int vulkan_begin_transient_commands(VkCommandPool *out_pool, VkCommandBuffer *out_cmd)
+{
+    *out_pool = VK_NULL_HANDLE;
+    *out_cmd  = VK_NULL_HANDLE;
+
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo pool_info = {0};
+    pool_info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_info.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pool_info.queueFamilyIndex = vio_vk.graphics_family;
+    if (vkCreateCommandPool(vio_vk.device, &pool_info, NULL, &pool) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to create transient command pool");
+        return -1;
+    }
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cmd_alloc = {0};
+    cmd_alloc.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmd_alloc.commandPool        = pool;
+    cmd_alloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_alloc.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(vio_vk.device, &cmd_alloc, &cmd) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to allocate transient command buffer");
+        vkDestroyCommandPool(vio_vk.device, pool, NULL);
+        return -1;
+    }
+
+    VkCommandBufferBeginInfo begin = {0};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to begin transient command buffer");
+        vkDestroyCommandPool(vio_vk.device, pool, NULL); /* frees cmd */
+        return -1;
+    }
+
+    *out_pool = pool;
+    *out_cmd  = cmd;
+    return 0;
+}
+
+static int vulkan_submit_transient_commands(VkCommandPool pool, VkCommandBuffer cmd)
+{
+    int rc = 0;
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to end transient command buffer");
+        vkDestroyCommandPool(vio_vk.device, pool, NULL);
+        return -1;
+    }
+
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fci = {0};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(vio_vk.device, &fci, NULL, &fence) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to create transient fence");
+        vkDestroyCommandPool(vio_vk.device, pool, NULL);
+        return -1;
+    }
+
+    VkSubmitInfo submit = {0};
+    submit.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers    = &cmd;
+    if (vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, fence) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: failed to submit transient commands");
+        /* The submit did not take; do NOT wait the (never-signalled) fence.
+         * Best-effort drain so the cmd buffer is not in flight, then destroy. */
+        vkDeviceWaitIdle(vio_vk.device);
+        rc = -1;
+    } else {
+        vkWaitForFences(vio_vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    }
+
+    vkDestroyFence(vio_vk.device, fence, NULL);
+    vkDestroyCommandPool(vio_vk.device, pool, NULL); /* frees cmd */
+    return rc;
+}
+
 /* ── Texture creation ────────────────────────────────────────────────
  *
  * Uploads happen at vio_texture()/vio_font() time, which is OUTSIDE any frame
- * (no swapchain command buffer is recording). We therefore allocate a transient
- * one-time-submit command buffer, record the layout transitions + buffer-to-
- * image copy, submit, and block on a transfer fence before tearing the staging
- * resources down. This keeps the upload entirely off the per-frame command
- * buffer so there is no cross-frame hazard.
+ * (no swapchain command buffer is recording). We therefore use a transient
+ * one-time-submit command buffer (vulkan_begin/submit_transient_commands above)
+ * to record the layout transitions + buffer-to-image copy, submit, and block on
+ * a transfer fence before tearing the staging resources down. This keeps the
+ * upload entirely off the per-frame command buffer so there is no cross-frame
+ * hazard.
  */
 static void *vulkan_create_texture(vio_texture_desc *desc)
 {
@@ -872,7 +1025,11 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
     }
 
     /* 2. Upload pixel data (if any) via a HOST_VISIBLE staging buffer + a
-     *    transient one-time-submit command buffer. */
+     *    transient one-time-submit command buffer. The pool/cmd/fence boilerplate
+     *    and all VkResult checks (N4) live in vulkan_begin/submit_transient_commands
+     *    (N1 — was two near-identical ~55-line blocks); only the barrier+copy
+     *    recording, which genuinely differs between the data and no-data paths,
+     *    stays inline here. Behavior (barriers, layouts, stages) is unchanged. */
     if (desc->data && img_bytes > 0) {
         VkBuffer staging = VK_NULL_HANDLE;
         void    *staging_alloc = NULL;
@@ -892,26 +1049,14 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
             vio_vma_unmap(vio_vk.vma_allocator, staging_alloc);
         }
 
-        /* Transient command pool + one-time-submit buffer. */
-        VkCommandPool up_pool = VK_NULL_HANDLE;
-        VkCommandPoolCreateInfo pool_info = {0};
-        pool_info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        pool_info.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-        pool_info.queueFamilyIndex = vio_vk.graphics_family;
-        vkCreateCommandPool(vio_vk.device, &pool_info, NULL, &up_pool);
-
-        VkCommandBuffer up_cmd = VK_NULL_HANDLE;
-        VkCommandBufferAllocateInfo cmd_alloc = {0};
-        cmd_alloc.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc.commandPool        = up_pool;
-        cmd_alloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmd_alloc.commandBufferCount = 1;
-        vkAllocateCommandBuffers(vio_vk.device, &cmd_alloc, &up_cmd);
-
-        VkCommandBufferBeginInfo begin = {0};
-        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(up_cmd, &begin);
+        VkCommandPool   up_pool = VK_NULL_HANDLE;
+        VkCommandBuffer up_cmd  = VK_NULL_HANDLE;
+        if (vulkan_begin_transient_commands(&up_pool, &up_cmd) != 0) {
+            vio_vma_destroy_buffer(vio_vk.vma_allocator, staging, staging_alloc);
+            vio_vma_destroy_image(vio_vk.vma_allocator, tex->image, tex->allocation);
+            free(tex);
+            return NULL;
+        }
 
         /* UNDEFINED -> TRANSFER_DST_OPTIMAL. */
         VkImageMemoryBarrier to_dst = {0};
@@ -961,48 +1106,24 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, NULL, 0, NULL, 1, &to_read);
 
-        vkEndCommandBuffer(up_cmd);
-
-        /* Submit + block on a transfer fence (upload is outside any frame, so a
-         * full queue stall here is acceptable and keeps lifetimes simple). */
-        VkFence up_fence = VK_NULL_HANDLE;
-        VkFenceCreateInfo fci = {0};
-        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        vkCreateFence(vio_vk.device, &fci, NULL, &up_fence);
-
-        VkSubmitInfo submit = {0};
-        submit.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers    = &up_cmd;
-        vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, up_fence);
-        vkWaitForFences(vio_vk.device, 1, &up_fence, VK_TRUE, UINT64_MAX);
-
-        vkDestroyFence(vio_vk.device, up_fence, NULL);
-        vkDestroyCommandPool(vio_vk.device, up_pool, NULL); /* frees up_cmd */
+        if (vulkan_submit_transient_commands(up_pool, up_cmd) != 0) {
+            vio_vma_destroy_buffer(vio_vk.vma_allocator, staging, staging_alloc);
+            vio_vma_destroy_image(vio_vk.vma_allocator, tex->image, tex->allocation);
+            free(tex);
+            return NULL;
+        }
         vio_vma_destroy_buffer(vio_vk.vma_allocator, staging, staging_alloc);
     } else {
         /* No data: still transition UNDEFINED -> SHADER_READ_ONLY so the image
          * is in a samplable layout (sampling it yields garbage, but the layout
          * is valid and the layers stay quiet). */
-        VkCommandPool up_pool = VK_NULL_HANDLE;
-        VkCommandPoolCreateInfo pool_info = {0};
-        pool_info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        pool_info.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-        pool_info.queueFamilyIndex = vio_vk.graphics_family;
-        vkCreateCommandPool(vio_vk.device, &pool_info, NULL, &up_pool);
-
-        VkCommandBuffer up_cmd = VK_NULL_HANDLE;
-        VkCommandBufferAllocateInfo cmd_alloc = {0};
-        cmd_alloc.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc.commandPool        = up_pool;
-        cmd_alloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmd_alloc.commandBufferCount = 1;
-        vkAllocateCommandBuffers(vio_vk.device, &cmd_alloc, &up_cmd);
-
-        VkCommandBufferBeginInfo begin = {0};
-        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(up_cmd, &begin);
+        VkCommandPool   up_pool = VK_NULL_HANDLE;
+        VkCommandBuffer up_cmd  = VK_NULL_HANDLE;
+        if (vulkan_begin_transient_commands(&up_pool, &up_cmd) != 0) {
+            vio_vma_destroy_image(vio_vk.vma_allocator, tex->image, tex->allocation);
+            free(tex);
+            return NULL;
+        }
 
         VkImageMemoryBarrier to_read = {0};
         to_read.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1021,22 +1142,11 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, NULL, 0, NULL, 1, &to_read);
 
-        vkEndCommandBuffer(up_cmd);
-
-        VkFence up_fence = VK_NULL_HANDLE;
-        VkFenceCreateInfo fci = {0};
-        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        vkCreateFence(vio_vk.device, &fci, NULL, &up_fence);
-
-        VkSubmitInfo submit = {0};
-        submit.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers    = &up_cmd;
-        vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, up_fence);
-        vkWaitForFences(vio_vk.device, 1, &up_fence, VK_TRUE, UINT64_MAX);
-
-        vkDestroyFence(vio_vk.device, up_fence, NULL);
-        vkDestroyCommandPool(vio_vk.device, up_pool, NULL);
+        if (vulkan_submit_transient_commands(up_pool, up_cmd) != 0) {
+            vio_vma_destroy_image(vio_vk.vma_allocator, tex->image, tex->allocation);
+            free(tex);
+            return NULL;
+        }
     }
 
     /* 3. Image view. */
@@ -1758,6 +1868,10 @@ static void vulkan_begin_frame(void)
      * pre-Phase-4 flow. */
     int offscreen = (vio_vk.pending_bound_rt != NULL);
     vio_vk.frame_is_offscreen = offscreen;
+    /* B1 — assume not presentable until we successfully open the normal
+     * swapchain path below. An offscreen-only frame, or an aborted acquire,
+     * leaves this 0 so vulkan_present skips. */
+    vio_vk.frame_presentable = 0;
 
     /* Wait for this frame's previous work to finish */
     vkWaitForFences(vio_vk.device, 1, &f->in_flight, VK_TRUE, UINT64_MAX);
@@ -1794,9 +1908,52 @@ static void vulkan_begin_frame(void)
                                              f->image_available, VK_NULL_HANDLE,
                                              &vio_vk.current_image_index);
 
+    /* B1 — handle ALL non-SUCCESS acquire results, not just OUT_OF_DATE.
+     *
+     * OUT_OF_DATE / error: the swapchain is unusable and (for OUT_OF_DATE) no
+     * image was acquired and image_available was NOT signalled. We must NOT
+     * fall through to begin a command buffer / submit a wait on an unsignalled
+     * semaphore — that is the deadlock B1 describes. Recreate (best-effort) and
+     * leave a CLEAN not-in-frame state: in_frame stays 0, frame_is_offscreen is
+     * reset to 0 (it was latched above off pending_bound_rt and must not leak
+     * into the next frame's offscreen detection), frame_presentable stays 0.
+     * vio_end's end_frame() + present() then both early-out on these guards and
+     * the frame is cleanly skipped (the recreate already happened).
+     *
+     * SUBOPTIMAL_KHR: an image WAS acquired and image_available WAS signalled —
+     * the swapchain is just not optimally configured. It is legal to keep
+     * rendering with it this frame; flag it for recreation after present so the
+     * mismatch is corrected without dropping a frame mid-flight.
+     *
+     * Note vkAcquireNextImageKHR never returns VK_TIMEOUT/VK_NOT_READY here
+     * because the timeout is UINT64_MAX (a blocking wait); any other value is a
+     * hard error and is treated like OUT_OF_DATE (skip cleanly). */
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-        vio_vulkan_recreate_swapchain();
+        vio_vk.frame_is_offscreen = 0;
+        /* M2 — recreate is fallible; on failure flag a retry so we don't leave
+         * half-built state and so the next frame attempts recreation again. */
+        if (vio_vulkan_recreate_swapchain() != 0) {
+            php_error_docref(NULL, E_WARNING,
+                "Vulkan: swapchain recreation failed at acquire; will retry next frame");
+            vio_vk.swapchain_needs_recreate = 1;
+        }
         return;
+    }
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        /* Hard error from acquire (e.g. device lost, surface lost, OOM). The
+         * image_available semaphore is in an unknown/unsignalled state, so the
+         * frame cannot be safely submitted. Skip cleanly; let the next frame
+         * retry via the recreate flag. */
+        php_error_docref(NULL, E_WARNING,
+            "Vulkan: vkAcquireNextImageKHR failed (VkResult %d); skipping frame", (int)result);
+        vio_vk.frame_is_offscreen = 0;
+        vio_vk.swapchain_needs_recreate = 1;
+        return;
+    }
+    if (result == VK_SUBOPTIMAL_KHR) {
+        /* Image acquired and image_available signalled — proceed with this
+         * frame, but recreate afterwards (present consumes the flag). */
+        vio_vk.swapchain_needs_recreate = 1;
     }
 
     vkResetFences(vio_vk.device, 1, &f->in_flight);
@@ -1843,11 +2000,26 @@ static void vulkan_begin_frame(void)
     vkCmdSetScissor(f->cmd_buf, 0, 1, &scissor);
 
     vio_vk.in_frame = 1;
+    /* B1 — a normal swapchain frame is now fully opened (image acquired, command
+     * buffer begun, swapchain pass started): it is presentable. */
+    vio_vk.frame_presentable = 1;
 }
 
 static void vulkan_end_frame(void)
 {
     if (!vio_vk.initialized) return;
+
+    /* B1 — vio_end (php_vio.c) calls end_frame() then present() guarded only on
+     * the PHP-side ctx->in_frame, which vio_begin sets to 1 regardless of what
+     * begin_frame actually did. If begin_frame aborted (e.g. acquire returned
+     * OUT_OF_DATE and it recreated the swapchain without opening a pass), no
+     * command buffer was begun and no swapchain image was acquired this frame.
+     * Running the normal end_frame path here would vkCmdEndRenderPass /
+     * vkEndCommandBuffer a buffer that was never begun and submit a wait on an
+     * un-signalled image_available semaphore — a guaranteed deadlock / device
+     * loss. Mirror the same in_frame guard the PHP layer relies on: if this
+     * frame was never opened, there is nothing to end. */
+    if (!vio_vk.in_frame) return;
 
     vio_vk_frame *f = &vio_vk.frames[vio_vk.current_frame];
 
@@ -1917,6 +2089,20 @@ static void vulkan_present(void)
 {
     if (!vio_vk.initialized) return;
 
+    /* B1 — vulkan_end_frame clears in_frame before present runs, so present
+     * cannot key off in_frame; it keys off frame_presentable instead. An
+     * aborted begin_frame (acquire returned OUT_OF_DATE/error and the swapchain
+     * was recreated without opening a pass) leaves frame_presentable=0 and
+     * frame_is_offscreen=0 — and end_frame early-returned, so NO submit and NO
+     * fence reset happened this frame. Present must therefore do NOTHING: no
+     * vkQueuePresentKHR (current_image_index is stale / no semaphore was
+     * signalled) and NO current_frame advance (the in_flight fence was not
+     * submitted, so the ring must not rotate onto an out-of-sync slot). The
+     * recreate already happened in begin_frame; the next frame retries cleanly. */
+    if (!vio_vk.frame_presentable && !vio_vk.frame_is_offscreen) {
+        return;
+    }
+
     if (vio_vk.frame_is_offscreen) {
         /* Phase 4 — OFFSCREEN-ONLY frame: nothing was acquired and the swapchain
          * image was never drawn, so presenting it would flip an undrawn/cleared
@@ -1944,9 +2130,22 @@ static void vulkan_present(void)
 
     VkResult result = vkQueuePresentKHR(vio_vk.present_queue, &present_info);
 
+    /* This frame is done; clear presentable so a subsequent aborted frame's
+     * present() (which early-outs above) is not mistaken for presentable. */
+    vio_vk.frame_presentable = 0;
+
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || vio_vk.swapchain_needs_recreate) {
         vio_vk.swapchain_needs_recreate = 0;
-        vio_vulkan_recreate_swapchain();
+        /* M2 — recreate is fallible; on failure leave swapchain_needs_recreate=1
+         * so the next frame retries rather than rendering against half-built
+         * state. create_swapchain() is all-or-nothing (cleans up on any partial
+         * failure), so a failed recreate leaves NO swapchain at all and the next
+         * begin_frame's acquire returns OUT_OF_DATE -> recreate again. */
+        if (vio_vulkan_recreate_swapchain() != 0) {
+            php_error_docref(NULL, E_WARNING,
+                "Vulkan: swapchain recreation failed after present; will retry next frame");
+            vio_vk.swapchain_needs_recreate = 1;
+        }
     }
 
     vio_vk.current_frame = (vio_vk.current_frame + 1) % VIO_VK_MAX_FRAMES_IN_FLIGHT;
@@ -1965,12 +2164,18 @@ static void vulkan_clear(float r, float g, float b, float a)
 
 static void vulkan_dispatch_compute(vio_compute_cmd *cmd) { (void)cmd; }
 
-/* Phase 5 — CPU readback of the last-rendered swapchain image. See the header
- * comment for the contract. Mirrors the D3D12 vio_read_pixels path: read the
- * just-presented image, copy into a HOST_VISIBLE buffer honoring row stride,
- * write TOP-DOWN RGBA8. The output byte order must match D3D12's
- * R8G8B8A8_UNORM readback so a Vulkan-vs-D3D12 golden compare is meaningful;
- * since the swapchain is B8G8R8A8_UNORM we swap the B/R bytes per pixel. */
+/* Phase 5 — CPU readback of swapchain content. See the header comment for the
+ * full contract. NOTE: unlike D3D12 (which reads its last_presented buffer
+ * directly), this RE-ACQUIRES a swapchain image via vkAcquireNextImageKHR and
+ * reads that — required for sync correctness (the just-presented image is owned
+ * by the presentation engine, which vkDeviceWaitIdle does NOT synchronize; the
+ * re-acquire establishes the present->acquire->copy dependency the sync layer
+ * needs). The re-acquired buffer holds the most-recent render of that image
+ * (the swapchain never clears presented images); under FIFO/vsync with a stable
+ * scene that is the just-presented content. It then copies into a HOST_VISIBLE
+ * buffer honoring row stride and writes TOP-DOWN RGBA8. The output byte order
+ * matches D3D12's R8G8B8A8_UNORM readback (golden-compare parity); since the
+ * swapchain is B8G8R8A8_UNORM we swap the B/R bytes per pixel. */
 int vulkan_read_pixels(int width, int height, void *out_rgba)
 {
     if (!vio_vk.initialized || !vio_vk.device || !out_rgba) return -1;
@@ -2255,10 +2460,10 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_3D_PIPELINE:  return 1;
         case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
         case VIO_FEATURE_MULTIVIEW:    return 0; /* VK_KHR_multiview not wired */
-        case VIO_FEATURE_READ_PIXELS:  return 1; /* vkCmdCopyImageToBuffer readback of the last-rendered swapchain image (Phase 5); requires the swapchain's TRANSFER_SRC usage added in create_swapchain */
+        case VIO_FEATURE_READ_PIXELS:  return 1; /* vkCmdCopyImageToBuffer readback of a RE-ACQUIRED swapchain image (see vulkan_read_pixels); requires the swapchain's TRANSFER_SRC usage added in create_swapchain */
         case VIO_FEATURE_INSTANCED_DRAW: return 1;
         case VIO_FEATURE_RENDER_TARGET:       return 1; /* offscreen RT + render-to-texture (Phase 3) */
-        case VIO_FEATURE_RENDER_TARGET_HDR:   return 0; /* R16G16B16A16_SFLOAT offscreen not wired yet (Phase 5) */
+        case VIO_FEATURE_RENDER_TARGET_HDR:   return 0; /* R16G16B16A16_SFLOAT offscreen not wired (HDR deferred) */
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 0; /* depth-RT sampling descriptor not wired */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 0;
         case VIO_FEATURE_CUBEMAP:      return 0;

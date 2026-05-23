@@ -520,6 +520,19 @@ ZEND_FUNCTION(vio_begin)
         vio_render_target_object *prt =
             (vio_render_target_object *)vio_vk.pending_bound_rt;
         vio_vk.pending_bound_rt = NULL;
+        /* m1 — if the deferred RT is invalid or not a Vulkan target, the
+         * offscreen pass is never begun, yet vulkan_begin_frame already latched
+         * frame_is_offscreen=1 (it keys off pending_bound_rt being non-NULL at
+         * begin). The result is a silently-dropped frame: it acquires nothing,
+         * draws nothing, presents nothing (end_frame's "if (current_bound_rt)"
+         * no-ops the pass-end and the zero-semaphore submit is harmless; present
+         * skips). That is SAFE but invisible, so warn — a bound-then-invalidated
+         * RT eating a frame is almost always a caller bug. */
+        if (!(prt->valid && prt->backend_type == VIO_RT_BACKEND_VULKAN)) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_begin: pending Vulkan render target is invalid or not a Vulkan target; "
+                "this frame renders nothing and is not presented");
+        }
         if (prt->valid && prt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.in_frame) {
             /* Phase 4: vulkan_begin_frame set vio_vk.frame_is_offscreen=1 for this
              * frame (pending_bound_rt was non-NULL at begin), and crucially did
@@ -4099,13 +4112,21 @@ ZEND_FUNCTION(vio_read_pixels)
 
 #ifdef HAVE_VULKAN
     if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
-        /* vulkan_read_pixels reads back the last-rendered (just-presented)
-         * swapchain image — vio_vk.swapchain_images[current_image_index], the
-         * Vulkan analog of D3D12's last_presented_frame_idx — as TOP-DOWN
+        /* vulkan_read_pixels RE-ACQUIRES a swapchain image (NOT
+         * swapchain_images[current_image_index] directly — that just-presented
+         * image is owned by the presentation engine and reading it would be a
+         * WRITE_AFTER_PRESENT sync hazard) and reads that image back as TOP-DOWN
          * RGBA8, swizzling the B8G8R8A8_UNORM swapchain to R,G,B,A so the bytes
-         * match the D3D12 R8G8B8A8_UNORM readback for an apples-to-apples
-         * golden compare. It honors the buffer row stride and the caller's w/h
-         * (writes only the overlapping region, never overruns). */
+         * match the D3D12 R8G8B8A8_UNORM readback for an apples-to-apples golden
+         * compare. It honors the buffer row stride and the caller's w/h (writes
+         * only the overlapping region, never overruns).
+         *
+         * m3 — INTENDED USE is stable/screenshot capture (golden tests, the
+         * splash screenshot). The re-acquired buffer holds the most-recent
+         * render of that swapchain image; with FIFO/vsync and a static scene
+         * that is the just-presented content, but for an ANIMATING scene with
+         * >=3 swapchain images the acquired buffer may be 1-2 frames stale.
+         * Call this after rendering a steady frame, not as a per-frame capture. */
         size_t size = (size_t)w * h * 4;
         zend_string *buf = zend_string_alloc(size, 0);
         ZSTR_VAL(buf)[size] = '\0';

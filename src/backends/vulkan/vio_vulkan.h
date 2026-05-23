@@ -141,6 +141,15 @@ typedef struct _vio_vulkan_state {
      * the zero-semaphore submit) and present (chooses the no-present path); the
      * normal path (frame_is_offscreen==0) is byte-for-byte the pre-Phase-4 flow. */
     int                      frame_is_offscreen;
+    /* B1 — set by vulkan_begin_frame when it successfully opens a NORMAL
+     * (presentable) frame: a swapchain image was acquired, the command buffer
+     * begun and the swapchain render pass started. Stays 0 when begin_frame
+     * aborts (acquire returned OUT_OF_DATE/error and it recreated the swapchain
+     * without opening a pass) and 0 for an offscreen-only frame. vulkan_present
+     * presents ONLY when this is set, because vulkan_end_frame clears in_frame
+     * before present runs, so present cannot key off in_frame. Cleared by
+     * present (and by end_frame's early-out / offscreen path). */
+    int                      frame_presentable;
     float                    clear_r, clear_g, clear_b, clear_a;
 
     /* Offscreen render-target binding (mirrors vio_d3d12). current_bound_rt is
@@ -240,8 +249,15 @@ void vulkan_begin_offscreen_render_pass(void *rt);
  * ensure vio_vk.in_frame and that current_bound_rt is set. */
 void vulkan_record_unbind_render_target(void);
 
-/* Phase 5 — read back the last-rendered swapchain image into a CPU buffer as
- * TOP-DOWN RGBA8 (the Vulkan analog of D3D12's last_presented_frame_idx read).
+/* Phase 5 — read back swapchain content into a CPU buffer as TOP-DOWN RGBA8.
+ *
+ * CONTRACT / INTENDED USE: stable-frame / screenshot capture (golden-image
+ * tests, splash screenshot). This RE-ACQUIRES a swapchain image rather than
+ * reading the just-presented one directly (see below). The re-acquired buffer
+ * holds the most-recent render of that image; under FIFO/vsync with a STATIC
+ * scene that equals the just-presented frame, but for an ANIMATING scene with
+ * >=3 swapchain images it may be 1-2 frames STALE. Call it after rendering a
+ * steady frame; it is not a reliable per-frame live capture.
  *
  * Implementation: vkDeviceWaitIdle (drain the device queues); RE-ACQUIRE a
  * swapchain image (vkAcquireNextImageKHR) so the readback submit can wait on the
