@@ -457,6 +457,38 @@ static int d3d12_init(vio_config *cfg)
         goto init_fail;
     }
 
+    /* Silence two benign perf-HINT messages from the InfoQueue when the debug
+     * layer is active. vio is a generic renderer: it creates swapchain
+     * backbuffers and offscreen render targets WITHOUT an optimized
+     * D3D12_CLEAR_VALUE, because it cannot know the app's clear color at
+     * resource-creation time. The debug layer then emits these on every
+     * ClearRenderTargetView / ClearDepthStencilView whose color differs from
+     * the (absent / mismatched) optimized clear value:
+     *   id=820 CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE
+     *   id=821 CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE
+     * The clear still works correctly — these are pure perf hints — so we add a
+     * DENY *storage* filter for exactly these two IDs. The layer never queues
+     * them, so d3d12_drain_info_queue() never sees them. Every other message
+     * (all severities, every other ID — including the real validation errors
+     * the drain exists to surface) is unaffected and still stored + emitted. */
+    if (cfg->debug) {
+        ID3D12InfoQueue *iq = NULL;
+        if (SUCCEEDED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12InfoQueue,
+                                                   (void **)&iq)) && iq) {
+            D3D12_MESSAGE_ID deny_ids[] = {
+                D3D12_MESSAGE_ID_CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE,
+                D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE,
+            };
+            D3D12_INFO_QUEUE_FILTER filter = {0};
+            filter.DenyList.NumIDs = (UINT)(sizeof(deny_ids) / sizeof(deny_ids[0]));
+            filter.DenyList.pIDList = deny_ids;
+            /* AddStorageFilterEntries: do not store messages matching the deny
+             * list. No category/severity entries → only these exact IDs match. */
+            ID3D12InfoQueue_AddStorageFilterEntries(iq, &filter);
+            ID3D12InfoQueue_Release(iq);
+        }
+    }
+
     /* Create command queue */
     D3D12_COMMAND_QUEUE_DESC queue_desc = {0};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
