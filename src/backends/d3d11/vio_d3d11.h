@@ -82,6 +82,16 @@ typedef struct _vio_d3d11_state {
     int current_rt_width;
     int current_rt_height;
 
+    /* vio_render_target_object* requested via vio_bind_render_target while
+     * out of frame (before vio_begin — the warm-render "bind then begin"
+     * order). D3D11 is immediate-mode, so the bind COULD be applied at once,
+     * but d3d11_begin_frame() unconditionally resets current_rtv = rtv every
+     * frame and would clobber a pre-begin bind. Deferring it lets vio_begin()
+     * re-apply the bind AFTER begin_frame(), so the offscreen redirect
+     * survives. NULL on a normal frame (strict no-op). Mirrors
+     * vio_d3d12.pending_bound_rt. */
+    void *pending_bound_rt;
+
     /* Identity instance buffer bound to input slot 1 for non-instanced draws.
      * SPIRV-Cross generates HLSL where `layout(location=3..6) vec4` attributes
      * are treated as per-instance data in slot 1. For non-instanced draws the
