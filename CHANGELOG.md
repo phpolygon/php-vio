@@ -1,3 +1,10 @@
+## [1.16.1](https://github.com/phpolygon/php-vio/compare/v1.16.0...v1.16.1) (2026-05-23)
+
+
+### Bug Fixes
+
+* **d3d11:** warm-render offscreen no longer visible (deferred bind) ([19fb49a](https://github.com/phpolygon/php-vio/commit/19fb49a3654d7570a982b8da9ee036e78bc795a2)), closes [#8](https://github.com/phpolygon/php-vio/issues/8)
+
 # [1.16.0](https://github.com/phpolygon/php-vio/compare/v1.15.1...v1.16.0) (2026-05-23)
 
 
