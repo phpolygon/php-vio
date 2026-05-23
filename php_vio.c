@@ -380,6 +380,14 @@ ZEND_FUNCTION(vio_poll_events)
 static void d3d12_record_bind_render_target(vio_render_target_object *rt);
 #endif
 
+#ifdef HAVE_D3D11
+/* Defined further down (next to vio_bind_render_target); forward-declared here
+ * so vio_begin() can re-apply an offscreen render-target bind that was
+ * requested before the frame began (and would otherwise be clobbered by
+ * d3d11_begin_frame()'s current_rtv = rtv reset). */
+static void d3d11_apply_render_target_bind(vio_render_target_object *rt);
+#endif
+
 ZEND_FUNCTION(vio_begin)
 {
     zval *ctx_zval;
@@ -500,6 +508,33 @@ ZEND_FUNCTION(vio_begin)
         vio_d3d12.pending_bound_rt = NULL;
         if (prt->valid) {
             d3d12_record_bind_render_target(prt);
+        }
+    }
+#endif
+
+#ifdef HAVE_D3D11
+    /* Re-apply a render-target bind requested before vio_begin() (the
+     * warm-render "bind then begin" order). D3D11 is immediate-mode, so the
+     * bind was NOT recorded into any command list — instead it was deferred
+     * because d3d11_begin_frame() (called just above) unconditionally resets
+     * current_rtv = rtv and re-binds the backbuffer, which would clobber a
+     * pre-begin offscreen bind. Applying it HERE, after begin_frame(), makes
+     * the offscreen redirect survive so the frame's draws hit the offscreen
+     * target and d3d11_present() skips Present (current_rtv != rtv) — no
+     * visible warm-render flash.
+     *
+     * STRICT NO-OP on a normal frame: pending_bound_rt is NULL unless an
+     * out-of-frame vio_bind_render_target set it, so the guard short-circuits
+     * and the immediate-context state is identical to pre-fix. The
+     * vio_d3d11.initialized + backend-name guard ensures this never touches a
+     * non-D3D11 context. */
+    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized
+            && vio_d3d11.pending_bound_rt) {
+        vio_render_target_object *prt =
+            (vio_render_target_object *)vio_d3d11.pending_bound_rt;
+        vio_d3d11.pending_bound_rt = NULL;
+        if (prt->valid) {
+            d3d11_apply_render_target_bind(prt);
         }
     }
 #endif
@@ -5976,6 +6011,52 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt)
 }
 #endif
 
+#ifdef HAVE_D3D11
+/* Make `rt` the active D3D11 render target immediately on the (single,
+ * immediate) device context: unbind SRVs to clear any read-as-SRV hazard,
+ * OMSetRenderTargets to the offscreen RTV/DSV (or DSV-only for depth_only),
+ * track current_rtv/current_dsv/current_rt_width/height, and set the viewport
+ * to the RT extent. Caller MUST have verified rt->valid and
+ * rt->backend_type == VIO_RT_BACKEND_D3D11.
+ *
+ * Used in two places: (a) the in-frame / render-to-texture path, called
+ * directly from vio_bind_render_target while ctx->in_frame; and (b) the
+ * out-of-frame warm-render path, deferred via vio_d3d11.pending_bound_rt and
+ * re-applied from vio_begin() AFTER begin_frame() (which would otherwise reset
+ * current_rtv = rtv and clobber a pre-begin bind). */
+static void d3d11_apply_render_target_bind(vio_render_target_object *rt)
+{
+    ID3D11RenderTargetView *rtv = (ID3D11RenderTargetView *)rt->d3d11_rtv;
+    ID3D11DepthStencilView *dsv = (ID3D11DepthStencilView *)rt->d3d11_dsv;
+
+    /* Unbind all SRVs to avoid D3D11 resource hazard — a resource cannot be
+     * bound as SRV and RTV/DSV simultaneously. This is critical for post-process
+     * passes that read from one render target while writing to another. */
+    {
+        ID3D11ShaderResourceView *null_srvs[8] = {NULL};
+        ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, 0, 8, null_srvs);
+    }
+
+    if (rt->depth_only) {
+        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 0, NULL, dsv);
+        vio_d3d11.current_rtv = NULL;
+    } else {
+        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 1, &rtv, dsv);
+        vio_d3d11.current_rtv = rtv;
+    }
+    vio_d3d11.current_dsv = dsv;
+    vio_d3d11.current_rt_width = rt->width;
+    vio_d3d11.current_rt_height = rt->height;
+
+    D3D11_VIEWPORT vp = {0};
+    vp.Width = (float)rt->width;
+    vp.Height = (float)rt->height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
+}
+#endif
+
 ZEND_FUNCTION(vio_bind_render_target)
 {
     zval *ctx_zval;
@@ -6007,34 +6088,22 @@ ZEND_FUNCTION(vio_bind_render_target)
 
 #ifdef HAVE_D3D11
     if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
-        ID3D11RenderTargetView *rtv = (ID3D11RenderTargetView *)rt->d3d11_rtv;
-        ID3D11DepthStencilView *dsv = (ID3D11DepthStencilView *)rt->d3d11_dsv;
-
-        /* Unbind all SRVs to avoid D3D11 resource hazard — a resource cannot be
-         * bound as SRV and RTV/DSV simultaneously. This is critical for post-process
-         * passes that read from one render target while writing to another. */
-        {
-            ID3D11ShaderResourceView *null_srvs[8] = {NULL};
-            ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, 0, 8, null_srvs);
-        }
-
-        if (rt->depth_only) {
-            ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 0, NULL, dsv);
-            vio_d3d11.current_rtv = NULL;
+        if (ctx->in_frame) {
+            /* In-frame / render-to-texture path: apply the bind on the
+             * immediate context now, exactly as before. The current frame's
+             * draws will land on the offscreen target. */
+            d3d11_apply_render_target_bind(rt);
         } else {
-            ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 1, &rtv, dsv);
-            vio_d3d11.current_rtv = rtv;
+            /* Called before vio_begin() (the warm-render "bind then begin"
+             * order): applying now is pointless because d3d11_begin_frame()
+             * unconditionally resets current_rtv = rtv and re-binds the
+             * backbuffer at the start of the frame, clobbering this bind. Defer
+             * it — vio_begin() re-applies the pending bind AFTER begin_frame(),
+             * so the offscreen redirect survives. Storing the rt (not applying)
+             * is the strict no-op the normal path relies on; only a non-NULL
+             * pending_bound_rt makes vio_begin act. */
+            vio_d3d11.pending_bound_rt = rt;
         }
-        vio_d3d11.current_dsv = dsv;
-        vio_d3d11.current_rt_width = rt->width;
-        vio_d3d11.current_rt_height = rt->height;
-
-        D3D11_VIEWPORT vp = {0};
-        vp.Width = (float)rt->width;
-        vp.Height = (float)rt->height;
-        vp.MinDepth = 0.0f;
-        vp.MaxDepth = 1.0f;
-        ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
     }
 #endif
 
@@ -6122,6 +6191,15 @@ ZEND_FUNCTION(vio_unbind_render_target)
 
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+        /* Drop any deferred (pre-begin) bind. In the warm-render path the caller
+         * does vio_bind_render_target -> vio_begin -> ... -> vio_end ->
+         * vio_unbind_render_target. By the time we get here vio_begin() has
+         * already consumed the pending bind (cleared it to NULL), so this is
+         * normally a no-op. But if unbind is called WITHOUT an intervening
+         * vio_begin (a bind-then-unbind with no frame), clearing it here ensures
+         * a stale pending RT can't leak into a later, unrelated frame. */
+        vio_d3d11.pending_bound_rt = NULL;
+
         /* Restore main backbuffer RTV + DSV */
         vio_d3d11.current_rtv = vio_d3d11.rtv;
         vio_d3d11.current_dsv = vio_d3d11.dsv;
