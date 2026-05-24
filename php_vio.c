@@ -55,6 +55,7 @@ int vio_opengl_setup_context(void);
 #endif
 #ifdef HAVE_METAL
 #include "src/backends/metal/vio_metal.h"
+#include "src/backends/ios/vio_ios.h"
 #endif
 #if defined(HAVE_D3D11) || defined(HAVE_D3D12)
 #ifndef COBJMACROS
@@ -263,6 +264,25 @@ ZEND_FUNCTION(vio_create)
     }
 #endif
 
+#ifdef HAVE_IOS
+    /* iOS path: there is no GLFW window. The iOS backend creates a
+     * VioRenderView (UIView with CAMetalLayer) on the hosting Xcode
+     * wrapper's UIWindow, then delegates Metal init to the GLFW-agnostic
+     * vio_metal_setup_context_native(). UITouch events are routed into
+     * ctx->input by the same view. The null/headless backends do not
+     * need a render surface. */
+    if (strcmp(ctx->backend->name, "null") != 0) {
+        if (vio_ios_setup_context(ctx->config.width, ctx->config.height,
+                                  &ctx->config, &ctx->input) != 0) {
+            if (ctx->backend->shutdown) {
+                ctx->backend->shutdown();
+            }
+            zval_ptr_dtor(&obj);
+            RETURN_FALSE;
+        }
+    }
+#endif
+
     /* Initialize 2D rendering system */
     vio_2d_init(&ctx->state_2d, ctx->config.width, ctx->config.height);
 
@@ -305,6 +325,11 @@ ZEND_FUNCTION(vio_destroy)
             vio_window_destroy(ctx->window);
             ctx->window = NULL;
         }
+#endif
+#ifdef HAVE_IOS
+        /* Tear down the iOS render view; the Metal context is shut down
+         * via ctx->backend->shutdown above. */
+        vio_ios_shutdown_context();
 #endif
         ctx->initialized = 0;
     }

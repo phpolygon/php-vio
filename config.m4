@@ -48,7 +48,28 @@ PHP_ARG_WITH([vulkan],
   [yes],
   [no])
 
+PHP_ARG_WITH([ios],
+  [for iOS / iPadOS backend support],
+  [AS_HELP_STRING([--with-ios],
+    [Enable iOS / iPadOS backend - implies Metal, disables GLFW/Vulkan/D3D. iOS 14.0+ only.])],
+  [no],
+  [no])
+
 if test "$PHP_VIO" != "no"; then
+
+  dnl ── iOS target gate ────────────────────────────────────────────────
+  dnl iOS is incompatible with GLFW (no windowing), Vulkan (Apple platforms
+  dnl use Metal), and FFmpeg static linking. When --with-ios is on, we
+  dnl force those off before their detection blocks run, and Metal is
+  dnl forced on (it is the only viable GPU path).
+  if test "$PHP_IOS" = "yes"; then
+    PHP_GLFW=no
+    PHP_VULKAN=no
+    PHP_FFMPEG=no
+    PHP_METAL=yes
+    AC_DEFINE(HAVE_IOS, 1, [Whether the iOS backend is enabled])
+    AC_MSG_RESULT([iOS backend enabled - GLFW / Vulkan / FFmpeg disabled])
+  fi
 
   dnl ── GLFW detection ──────────────────────────────────────────────
   if test "$PHP_GLFW" != "no"; then
@@ -217,9 +238,13 @@ if test "$PHP_VIO" != "no"; then
   fi
 
   dnl ── Metal detection ────────────────────────────────────────────────
+  dnl Metal is available on both macOS and iOS. The host triplet from
+  dnl cross-compilers (e.g. arm64-apple-ios14.0) starts with "ios" rather
+  dnl than "darwin", so we accept both. On iOS the PHP_IOS guard already
+  dnl forced PHP_METAL=yes; on macOS it is auto-enabled.
   if test "$PHP_METAL" != "no"; then
     case $host_os in
-      darwin*)
+      darwin*|ios*)
         AC_DEFINE(HAVE_METAL, 1, [Whether Metal is available])
         VIO_HAS_METAL=yes
         PHP_ADD_FRAMEWORK(Metal)
@@ -227,22 +252,38 @@ if test "$PHP_VIO" != "no"; then
         AC_MSG_RESULT([Metal backend enabled])
         ;;
       *)
-        AC_MSG_WARN([Metal is only available on macOS, disabling])
+        AC_MSG_WARN([Metal is only available on Apple platforms, disabling])
         ;;
     esac
+  fi
+
+  dnl ── iOS-only framework additions ───────────────────────────────────
+  dnl UIKit + Foundation replace the Cocoa / IOKit set used on macOS.
+  if test "$PHP_IOS" = "yes"; then
+    PHP_ADD_FRAMEWORK(UIKit)
+    PHP_ADD_FRAMEWORK(Foundation)
+    PHP_ADD_FRAMEWORK(CoreGraphics)
+    PHP_ADD_FRAMEWORK(AudioToolbox)
+    PHP_ADD_FRAMEWORK(CoreAudio)
+    PHP_ADD_FRAMEWORK(AVFoundation)
+    VIO_HAS_IOS=yes
   fi
 
   dnl ── Platform-specific libraries ──────────────────────────────
   case $host_os in
     darwin*)
-      PHP_ADD_FRAMEWORK(Cocoa)
-      PHP_ADD_FRAMEWORK(IOKit)
-      PHP_ADD_FRAMEWORK(CoreVideo)
-      PHP_ADD_FRAMEWORK(AudioToolbox)
-      PHP_ADD_FRAMEWORK(CoreAudio)
-      PHP_ADD_FRAMEWORK(CoreFoundation)
-      dnl OpenGL framework NOT linked here - GLAD provides declarations,
-      dnl functions are loaded via glfwGetProcAddress at runtime
+      dnl Skip the macOS-only frameworks (Cocoa, IOKit) when building
+      dnl for iOS - those are not part of the iPhoneOS SDK.
+      if test "$PHP_IOS" != "yes"; then
+        PHP_ADD_FRAMEWORK(Cocoa)
+        PHP_ADD_FRAMEWORK(IOKit)
+        PHP_ADD_FRAMEWORK(CoreVideo)
+        PHP_ADD_FRAMEWORK(AudioToolbox)
+        PHP_ADD_FRAMEWORK(CoreAudio)
+        PHP_ADD_FRAMEWORK(CoreFoundation)
+        dnl OpenGL framework NOT linked here - GLAD provides declarations,
+        dnl functions are loaded via glfwGetProcAddress at runtime
+      fi
       ;;
     linux*)
       dnl dl needed by GLAD for runtime GL function loading
@@ -339,9 +380,28 @@ if test "$PHP_VIO" != "no"; then
     fi
   fi
 
+  dnl ── iOS backend source ─────────────────────────────────────────────
+  dnl Same .c shim pattern as Metal: PHP_ADD_SOURCES_X handles .c only,
+  dnl so vio_ios.c is an empty wrapper that #include's vio_ios.m. Both
+  dnl static (libphp.a for the Xcode wrapper) and shared paths supported,
+  dnl though in practice iOS only builds static.
+  if test "$VIO_HAS_IOS" = "yes"; then
+    if test "$ext_shared" != "shared" && test "$ext_shared" != "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/backends/ios/vio_ios.c],
+        -x objective-c -fobjc-arc $VIO_EXTRA_CFLAGS_RESOLVED,
+        PHP_GLOBAL_OBJS)
+    fi
+    if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/backends/ios/vio_ios.c],
+        -x objective-c -fobjc-arc $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
+        shared_objects_vio, yes)
+    fi
+  fi
+
   PHP_SUBST(VIO_SHARED_LIBADD)
   PHP_SUBST(VIO_HAS_VULKAN)
   PHP_SUBST(VIO_HAS_METAL)
+  PHP_SUBST(VIO_HAS_IOS)
   PHP_SUBST(VIO_VULKAN_CFLAGS)
 
   dnl ── Install public headers ──────────────────────────────────────
