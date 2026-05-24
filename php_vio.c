@@ -452,11 +452,19 @@ ZEND_FUNCTION(vio_begin)
         }
 #endif
 #ifdef HAVE_IOS
-        /* iOS: VioRenderView's contentScaleFactor is already baked into the
-         * framebuffer dimensions; sx / sy stay at 1.0 so logical == fb. */
+        /* iOS: keep the 2D design space at the configured logical size
+         * (the game draws in its own coordinate system, e.g. 1280x720;
+         * vio_metal_2d_init's projection stretches that across the whole
+         * framebuffer = fullscreen). Only refresh the PHYSICAL framebuffer
+         * dims, which drive the viewport/scissor and the touch-coordinate
+         * scale (vio_input_logical_scale_* = fb / design). Deliberately do
+         * NOT set have_size, so the vio_2d_set_size() below is skipped -
+         * resizing the design space to the physical resolution would shrink
+         * the game into a corner instead of filling the screen. */
         vio_ios_get_framebuffer_size(&fb_w, &fb_h);
         if (fb_w > 0 && fb_h > 0) {
-            have_size = 1;
+            ctx->state_2d.fb_width  = fb_w;
+            ctx->state_2d.fb_height = fb_h;
         }
 #endif
         if (have_size) {
@@ -781,8 +789,20 @@ ZEND_FUNCTION(vio_touch_get)
     if (idx < 0) RETURN_NULL();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    /* Touch coordinates arrive in framebuffer pixels. Scale them into the
+     * 2D design space the game draws in (state_2d.width/height) so touches
+     * line up with rendered UI: design = raw * design_size / framebuffer.
+     * On iOS the framebuffer is the physical screen (e.g. 2796) while the
+     * design space is the configured size (e.g. 1280); this maps a tap at
+     * the right edge to design-x 1280, not 2796. Falls back to the legacy
+     * 1/logical-scale when framebuffer dims are not yet known. */
     double sx = vio_input_logical_scale_x(ctx);
     double sy = vio_input_logical_scale_y(ctx);
+    double tsx = (ctx->state_2d.fb_width  > 0 && ctx->state_2d.width  > 0)
+        ? (double)ctx->state_2d.width  / (double)ctx->state_2d.fb_width  : (1.0 / sx);
+    double tsy = (ctx->state_2d.fb_height > 0 && ctx->state_2d.height > 0)
+        ? (double)ctx->state_2d.height / (double)ctx->state_2d.fb_height : (1.0 / sy);
 
     /* Walk active slots, count up to idx */
     int seen = -1;
@@ -793,11 +813,11 @@ ZEND_FUNCTION(vio_touch_get)
         if (seen == idx) {
             array_init(return_value);
             add_assoc_long(return_value,   "id",      (zend_long)t->id);
-            add_assoc_double(return_value, "x",       t->x / sx);
-            add_assoc_double(return_value, "y",       t->y / sy);
+            add_assoc_double(return_value, "x",       t->x * tsx);
+            add_assoc_double(return_value, "y",       t->y * tsy);
             add_assoc_long(return_value,   "phase",   (zend_long)t->phase);
-            add_assoc_double(return_value, "delta_x", (t->x - t->prev_x) / sx);
-            add_assoc_double(return_value, "delta_y", (t->y - t->prev_y) / sy);
+            add_assoc_double(return_value, "delta_x", (t->x - t->prev_x) * tsx);
+            add_assoc_double(return_value, "delta_y", (t->y - t->prev_y) * tsy);
             return;
         }
     }
