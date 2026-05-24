@@ -128,30 +128,49 @@
 
 static VioRenderView *vio_ios_view = nil;
 
-/* Try to find a foreground key UIWindow. iOS 13+ uses UIScene; if the
- * wrapper still uses the older AppDelegate-only model, we fall back to
- * the deprecated UIApplication.keyWindow. Returns nil if no window is
- * ready - caller must retry later (typically from viewDidAppear). */
-static UIWindow *vio_ios_find_key_window(void)
+/* Find a usable UIWindow to host the render layer. iOS 13+ uses UIScene.
+ *
+ * Window discovery happens in two passes because vio_create() is often
+ * called from viewDidAppear, when the scene is still transitioning and
+ * has not reached UISceneActivationStateForegroundActive yet:
+ *   pass 1 - prefer a ForegroundActive scene's key window (steady state)
+ *   pass 2 - accept ANY window scene that already owns a window, regardless
+ *            of activation state (covers the launch / foreground-inactive
+ *            window that exists but is not yet "active")
+ * Returns nil only when no window scene owns a window at all - the caller
+ * should then retry on a later run-loop tick. */
+static UIWindow *vio_ios_find_window_in_state(UISceneActivationState wantState, BOOL anyState)
 {
     UIApplication *app = [UIApplication sharedApplication];
-
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in app.connectedScenes) {
-            if (scene.activationState != UISceneActivationStateForegroundActive) continue;
-            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            UIWindowScene *ws = (UIWindowScene *)scene;
-            for (UIWindow *w in ws.windows) {
-                if (w.isKeyWindow) return w;
-            }
-            if (ws.windows.count > 0) return ws.windows.firstObject;
+    for (UIScene *scene in app.connectedScenes) {
+        if (!anyState && scene.activationState != wantState) continue;
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)scene;
+        for (UIWindow *w in ws.windows) {
+            if (w.isKeyWindow) return w;
         }
+        if (ws.windows.count > 0) return ws.windows.firstObject;
+    }
+    return nil;
+}
+
+static UIWindow *vio_ios_find_key_window(void)
+{
+    if (@available(iOS 13.0, *)) {
+        /* Pass 1: a fully-active scene's window. */
+        UIWindow *w = vio_ios_find_window_in_state(UISceneActivationStateForegroundActive, NO);
+        if (w) return w;
+        /* Pass 2: any scene that already has a window (launch transition). */
+        w = vio_ios_find_window_in_state(UISceneActivationStateForegroundActive, YES);
+        if (w) return w;
     }
 
     /* iOS 12 fallback - never compiled under our 14.0 baseline but kept
      * for safety in case the deployment target drops later. */
 #if !defined(__IPHONE_13_0) || __IPHONE_OS_VERSION_MIN_REQUIRED < __IPHONE_13_0
-    if (app.keyWindow) return app.keyWindow;
+    if ([UIApplication sharedApplication].keyWindow) {
+        return [UIApplication sharedApplication].keyWindow;
+    }
 #endif
     return nil;
 }
