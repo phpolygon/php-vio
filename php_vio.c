@@ -440,21 +440,37 @@ ZEND_FUNCTION(vio_begin)
 #endif
 
 #ifdef HAVE_METAL
-    if (ctx->window && strcmp(ctx->backend->name, "metal") == 0) {
-        int fb_w, fb_h;
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        int fb_w = 0, fb_h = 0;
         float sx = 1.0f, sy = 1.0f;
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        glfwGetWindowContentScale(ctx->window, &sx, &sy);
-        if (sx <= 0.0f) sx = 1.0f;
-        if (sy <= 0.0f) sy = 1.0f;
-        int logical_w = (int)((float)fb_w / sx + 0.5f);
-        int logical_h = (int)((float)fb_h / sy + 0.5f);
-        if (logical_w > 0 && logical_h > 0 &&
-            (logical_w != ctx->state_2d.width || logical_h != ctx->state_2d.height)) {
-            vio_2d_set_size(&ctx->state_2d, logical_w, logical_h);
+        int have_size = 0;
+#ifdef HAVE_GLFW
+        if (ctx->window) {
+            glfwGetFramebufferSize((GLFWwindow *)ctx->window, &fb_w, &fb_h);
+            glfwGetWindowContentScale((GLFWwindow *)ctx->window, &sx, &sy);
+            have_size = 1;
         }
-        ctx->state_2d.fb_width  = fb_w;
-        ctx->state_2d.fb_height = fb_h;
+#endif
+#ifdef HAVE_IOS
+        /* iOS: VioRenderView's contentScaleFactor is already baked into the
+         * framebuffer dimensions; sx / sy stay at 1.0 so logical == fb. */
+        vio_ios_get_framebuffer_size(&fb_w, &fb_h);
+        if (fb_w > 0 && fb_h > 0) {
+            have_size = 1;
+        }
+#endif
+        if (have_size) {
+            if (sx <= 0.0f) sx = 1.0f;
+            if (sy <= 0.0f) sy = 1.0f;
+            int logical_w = (int)((float)fb_w / sx + 0.5f);
+            int logical_h = (int)((float)fb_h / sy + 0.5f);
+            if (logical_w > 0 && logical_h > 0 &&
+                (logical_w != ctx->state_2d.width || logical_h != ctx->state_2d.height)) {
+                vio_2d_set_size(&ctx->state_2d, logical_w, logical_h);
+            }
+            ctx->state_2d.fb_width  = fb_w;
+            ctx->state_2d.fb_height = fb_h;
+        }
     }
 #endif
 
