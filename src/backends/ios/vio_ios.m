@@ -180,41 +180,67 @@ int vio_ios_setup_context(int width, int height, vio_config *cfg,
 {
     (void)width; (void)height; /* iOS sizes itself from screen + scene */
 
-    @autoreleasepool {
-        UIWindow *keyWindow = vio_ios_find_key_window();
-        if (!keyWindow) {
-            php_error_docref(NULL, E_WARNING,
-                "iOS: no key UIWindow available - call vio_create() after UIScene "
-                "activation (e.g. from viewDidAppear or a CADisplayLink callback)");
-            return -1;
+    /* All UIKit work (window lookup, view creation, addSubview) and the
+     * CAMetalLayer setup MUST run on the main thread - UIKit is not
+     * thread-safe. The game's PHP loop typically runs on a background
+     * thread so the main run loop stays free to composite and deliver
+     * touches, so dispatch the setup to main and block until it finishes.
+     * PHP error reporting is deferred to the caller's thread (php_error_docref
+     * touches PHP TLS that belongs to the calling thread, not main). */
+    __block int result = -1;
+    __block int no_window = 0;
+
+    void (^setup)(void) = ^{
+        @autoreleasepool {
+            UIWindow *keyWindow = vio_ios_find_key_window();
+            if (!keyWindow) {
+                no_window = 1;
+                result = -1;
+                return;
+            }
+
+            CGRect bounds = keyWindow.bounds;
+            vio_ios_view = [[VioRenderView alloc]
+                initWithFrame:bounds
+                inputState:(vio_input_state *)input_state];
+            vio_ios_view.autoresizingMask =
+                UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            [keyWindow addSubview:vio_ios_view];
+            /* Move the render view to the back so any UIKit chrome from the
+             * wrapper (status bar overlays, debug HUD) stays visible on top. */
+            [keyWindow sendSubviewToBack:vio_ios_view];
+
+            CGFloat scale = vio_ios_view.contentScaleFactor;
+            int fb_w = (int)(bounds.size.width  * scale);
+            int fb_h = (int)(bounds.size.height * scale);
+
+            CAMetalLayer *layer = (CAMetalLayer *)vio_ios_view.layer;
+            layer.contentsScale = scale;
+
+            if (vio_metal_setup_context_native((__bridge void *)layer, fb_w, fb_h, cfg) != 0) {
+                [vio_ios_view removeFromSuperview];
+                vio_ios_view = nil;
+                result = -1;
+                return;
+            }
+
+            result = 0;
         }
+    };
 
-        CGRect bounds = keyWindow.bounds;
-        vio_ios_view = [[VioRenderView alloc]
-            initWithFrame:bounds
-            inputState:(vio_input_state *)input_state];
-        vio_ios_view.autoresizingMask =
-            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [keyWindow addSubview:vio_ios_view];
-        /* Move the render view to the back so any UIKit chrome from the
-         * wrapper (status bar overlays, debug HUD) stays visible on top. */
-        [keyWindow sendSubviewToBack:vio_ios_view];
-
-        CGFloat scale = vio_ios_view.contentScaleFactor;
-        int fb_w = (int)(bounds.size.width  * scale);
-        int fb_h = (int)(bounds.size.height * scale);
-
-        CAMetalLayer *layer = (CAMetalLayer *)vio_ios_view.layer;
-        layer.contentsScale = scale;
-
-        if (vio_metal_setup_context_native((__bridge void *)layer, fb_w, fb_h, cfg) != 0) {
-            [vio_ios_view removeFromSuperview];
-            vio_ios_view = nil;
-            return -1;
-        }
-
-        return 0;
+    if ([NSThread isMainThread]) {
+        setup();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), setup);
     }
+
+    if (no_window) {
+        php_error_docref(NULL, E_WARNING,
+            "iOS: no key UIWindow available - call vio_create() after UIScene "
+            "activation (e.g. from viewDidAppear or a CADisplayLink callback)");
+    }
+
+    return result;
 }
 
 void vio_ios_shutdown_context(void)
