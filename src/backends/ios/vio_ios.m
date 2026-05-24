@@ -17,6 +17,15 @@
 #include "../metal/vio_metal.h"
 #include "../../vio_input.h"
 
+/* Framebuffer size in physical pixels, cached so the render thread can read
+ * it without touching UIKit. UIView.bounds is main-thread-only; the game's
+ * render loop (and vio_begin) runs on a background thread, so reading bounds
+ * there returns garbage/0. layoutSubviews (main thread) publishes the size
+ * here; vio_ios_get_framebuffer_size just reads it. Plain volatile ints - a
+ * torn read at worst costs one mis-sized frame, corrected the next. */
+static volatile int g_ios_fb_w = 0;
+static volatile int g_ios_fb_h = 0;
+
 /* ── VioRenderView ─────────────────────────────────────────────────
  *
  * UIView subclass that:
@@ -114,6 +123,8 @@
     int w = (int)(size.width  * scale);
     int h = (int)(size.height * scale);
     layer.drawableSize = CGSizeMake(w, h);
+    g_ios_fb_w = w;
+    g_ios_fb_h = h;
     vio_metal_handle_resize(w, h);
 }
 
@@ -217,6 +228,12 @@ int vio_ios_setup_context(int width, int height, vio_config *cfg,
             CAMetalLayer *layer = (CAMetalLayer *)vio_ios_view.layer;
             layer.contentsScale = scale;
 
+            /* Publish the initial size now; layoutSubviews refreshes it on
+             * rotation / resize. Without this the render thread would read
+             * 0x0 until the first layout pass. */
+            g_ios_fb_w = fb_w;
+            g_ios_fb_h = fb_h;
+
             if (vio_metal_setup_context_native((__bridge void *)layer, fb_w, fb_h, cfg) != 0) {
                 [vio_ios_view removeFromSuperview];
                 vio_ios_view = nil;
@@ -255,15 +272,10 @@ void vio_ios_shutdown_context(void)
 
 void vio_ios_get_framebuffer_size(int *out_w, int *out_h)
 {
-    if (!vio_ios_view) {
-        if (out_w) *out_w = 0;
-        if (out_h) *out_h = 0;
-        return;
-    }
-    CGFloat scale = vio_ios_view.contentScaleFactor;
-    CGSize size = vio_ios_view.bounds.size;
-    if (out_w) *out_w = (int)(size.width  * scale);
-    if (out_h) *out_h = (int)(size.height * scale);
+    /* Read the cached size published by layoutSubviews / setup on the main
+     * thread. Safe to call from the render thread (no UIKit access). */
+    if (out_w) *out_w = g_ios_fb_w;
+    if (out_h) *out_h = g_ios_fb_h;
 }
 
 #endif /* HAVE_IOS */

@@ -1182,6 +1182,17 @@ ZEND_FUNCTION(vio_framebuffer_size)
         return;
     }
 #endif
+#ifdef HAVE_IOS
+    {
+        int w = 0, h = 0;
+        vio_ios_get_framebuffer_size(&w, &h);
+        if (w > 0 && h > 0) {
+            add_next_index_long(return_value, w);
+            add_next_index_long(return_value, h);
+            return;
+        }
+    }
+#endif
     add_next_index_long(return_value, ctx->config.width > 0 ? ctx->config.width : 800);
     add_next_index_long(return_value, ctx->config.height > 0 ? ctx->config.height : 600);
 }
