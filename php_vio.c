@@ -702,6 +702,117 @@ ZEND_FUNCTION(vio_mouse_scroll)
     add_next_index_double(return_value, ctx->input.scroll_y);
 }
 
+ZEND_FUNCTION(vio_touch_count)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_LONG((zend_long)ctx->input.touch_count);
+}
+
+/*
+ * vio_touch_get(VioContext $ctx, int $idx): ?array
+ *
+ * Returns the touch at the *active* index $idx, where active touches are
+ * compacted to indices 0..touch_count-1 (inactive slots are skipped).
+ * Returns null when $idx is out of range.
+ *
+ * Touch positions are reported in logical (post-DPI) coordinates, matching
+ * the existing vio_mouse_position contract.
+ *
+ * Shape: ['id' => int, 'x' => float, 'y' => float, 'phase' => int,
+ *         'delta_x' => float, 'delta_y' => float]
+ */
+ZEND_FUNCTION(vio_touch_get)
+{
+    zval *ctx_zval;
+    zend_long idx;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(idx)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (idx < 0) RETURN_NULL();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    double sx = vio_input_logical_scale_x(ctx);
+    double sy = vio_input_logical_scale_y(ctx);
+
+    /* Walk active slots, count up to idx */
+    int seen = -1;
+    for (int i = 0; i < VIO_MAX_TOUCHES; i++) {
+        vio_touch *t = &ctx->input.touches[i];
+        if (t->id == 0) continue;
+        seen++;
+        if (seen == idx) {
+            array_init(return_value);
+            add_assoc_long(return_value,   "id",      (zend_long)t->id);
+            add_assoc_double(return_value, "x",       t->x / sx);
+            add_assoc_double(return_value, "y",       t->y / sy);
+            add_assoc_long(return_value,   "phase",   (zend_long)t->phase);
+            add_assoc_double(return_value, "delta_x", (t->x - t->prev_x) / sx);
+            add_assoc_double(return_value, "delta_y", (t->y - t->prev_y) / sy);
+            return;
+        }
+    }
+
+    RETURN_NULL();
+}
+
+/*
+ * vio_touch_inject(VioContext $ctx, int $id, int $phase, float $x, float $y): bool
+ *
+ * Synthetic touch injection for testing and headless replays. Backends
+ * push touches through C calls; this PHP entry-point lets test runners
+ * simulate the same path without a window.
+ *
+ * Coordinates are in framebuffer pixels (the same space that the GLFW
+ * cursor_pos callback uses). Tests in logical points should multiply by
+ * the content scale themselves.
+ *
+ * Returns true on success, false when the phase is invalid or the touch
+ * array is full (BEGAN with no free slot).
+ */
+ZEND_FUNCTION(vio_touch_inject)
+{
+    zval *ctx_zval;
+    zend_long id, phase;
+    double x = 0.0, y = 0.0;
+
+    ZEND_PARSE_PARAMETERS_START(3, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(id)
+        Z_PARAM_LONG(phase)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_DOUBLE(x)
+        Z_PARAM_DOUBLE(y)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    unsigned long long uid = (unsigned long long)id;
+
+    switch (phase) {
+        case VIO_TOUCH_BEGAN:
+            RETURN_BOOL(vio_input_touch_began(&ctx->input, uid, x, y) >= 0);
+        case VIO_TOUCH_MOVED:
+            vio_input_touch_moved(&ctx->input, uid, x, y);
+            RETURN_TRUE;
+        case VIO_TOUCH_ENDED:
+            vio_input_touch_ended(&ctx->input, uid);
+            RETURN_TRUE;
+        case VIO_TOUCH_CANCELLED:
+            vio_input_touch_cancelled(&ctx->input, uid);
+            RETURN_TRUE;
+        default:
+            RETURN_FALSE;
+    }
+}
+
 ZEND_FUNCTION(vio_set_cursor_mode)
 {
     zval *ctx_zval;

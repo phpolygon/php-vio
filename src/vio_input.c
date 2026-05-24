@@ -27,6 +27,16 @@ void vio_input_init(vio_input_state *state)
     state->has_resize_callback = 0;
     state->has_char_callback = 0;
     state->char_buffer_len = 0;
+    memset(state->touches, 0, sizeof(state->touches));
+    state->touch_count = 0;
+}
+
+static int vio_touch_find_slot(vio_input_state *state, unsigned long long id)
+{
+    for (int i = 0; i < VIO_MAX_TOUCHES; i++) {
+        if (state->touches[i].id == id) return i;
+    }
+    return -1;
 }
 
 void vio_input_update(vio_input_state *state)
@@ -39,6 +49,43 @@ void vio_input_update(vio_input_state *state)
     state->scroll_y = 0.0;
     /* Reset per-frame char buffer */
     state->char_buffer_len = 0;
+
+    /* Advance touch phases:
+     *   BEGAN  -> STATIONARY (consumer had one frame to see the edge)
+     *   MOVED  -> STATIONARY (next frame is stationary unless new move arrives)
+     *   ENDED, CANCELLED -> slot freed (id = 0, phase = INACTIVE)
+     * prev_x/prev_y are snapshotted so MOVED can report a delta. */
+    int active = 0;
+    for (int i = 0; i < VIO_MAX_TOUCHES; i++) {
+        vio_touch *t = &state->touches[i];
+        if (t->id == 0) continue;
+
+        switch (t->phase) {
+            case VIO_TOUCH_ENDED:
+            case VIO_TOUCH_CANCELLED:
+                t->id = 0;
+                t->phase = VIO_TOUCH_INACTIVE;
+                t->x = t->y = t->prev_x = t->prev_y = 0.0;
+                break;
+            case VIO_TOUCH_BEGAN:
+            case VIO_TOUCH_MOVED:
+                t->phase = VIO_TOUCH_STATIONARY;
+                t->prev_x = t->x;
+                t->prev_y = t->y;
+                active++;
+                break;
+            case VIO_TOUCH_STATIONARY:
+                t->prev_x = t->x;
+                t->prev_y = t->y;
+                active++;
+                break;
+            case VIO_TOUCH_INACTIVE:
+                /* Defensive: should not happen since id != 0 implies active */
+                t->id = 0;
+                break;
+        }
+    }
+    state->touch_count = active;
 }
 
 void vio_input_shutdown(vio_input_state *state)
@@ -193,3 +240,77 @@ void vio_input_install_callbacks(GLFWwindow *window, vio_input_state *state)
 }
 
 #endif /* HAVE_GLFW */
+
+/* ── Touch push API ─────────────────────────────────────────────────
+ *
+ * Implementation notes:
+ *   - The slot array is small (11) so linear search is fine.
+ *   - id==0 is the inactive-slot sentinel. Backends that hand us 0 get
+ *     remapped to 1, which is fine because real platform ids are pointers
+ *     or counters that never collide with 1 in practice.
+ *   - We do not deliver PHP callbacks here today. Touch is consumed by
+ *     polling vio_touch_count() / vio_touch_get() from PHP. A callback
+ *     model can be added later if we need touch-driven events. */
+
+static unsigned long long vio_touch_normalize_id(unsigned long long id)
+{
+    return id == 0 ? 1 : id;
+}
+
+int vio_input_touch_began(vio_input_state *state, unsigned long long id, double x, double y)
+{
+    id = vio_touch_normalize_id(id);
+
+    /* Reject duplicate id (already active). Backends should not call
+     * began twice without an ended in between, but be defensive. */
+    if (vio_touch_find_slot(state, id) >= 0) return -1;
+
+    for (int i = 0; i < VIO_MAX_TOUCHES; i++) {
+        if (state->touches[i].id == 0) {
+            state->touches[i].id     = id;
+            state->touches[i].x      = x;
+            state->touches[i].y      = y;
+            state->touches[i].prev_x = x;
+            state->touches[i].prev_y = y;
+            state->touches[i].phase  = VIO_TOUCH_BEGAN;
+            state->touch_count++;
+            return i;
+        }
+    }
+    return -1; /* Array full */
+}
+
+void vio_input_touch_moved(vio_input_state *state, unsigned long long id, double x, double y)
+{
+    id = vio_touch_normalize_id(id);
+
+    int idx = vio_touch_find_slot(state, id);
+    if (idx < 0) return;
+
+    /* Don't overwrite ENDED/CANCELLED that haven't been cleared yet — a
+     * stray move after end is a backend bug we silently swallow. */
+    if (state->touches[idx].phase == VIO_TOUCH_ENDED ||
+        state->touches[idx].phase == VIO_TOUCH_CANCELLED) {
+        return;
+    }
+
+    state->touches[idx].x     = x;
+    state->touches[idx].y     = y;
+    state->touches[idx].phase = VIO_TOUCH_MOVED;
+}
+
+void vio_input_touch_ended(vio_input_state *state, unsigned long long id)
+{
+    id = vio_touch_normalize_id(id);
+    int idx = vio_touch_find_slot(state, id);
+    if (idx < 0) return;
+    state->touches[idx].phase = VIO_TOUCH_ENDED;
+}
+
+void vio_input_touch_cancelled(vio_input_state *state, unsigned long long id)
+{
+    id = vio_touch_normalize_id(id);
+    int idx = vio_touch_find_slot(state, id);
+    if (idx < 0) return;
+    state->touches[idx].phase = VIO_TOUCH_CANCELLED;
+}

@@ -13,10 +13,12 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#ifdef HAVE_GLFW
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_COCOA
 #include <GLFW/glfw3native.h>
+#endif
 
 #include "vio_metal.h"
 #include "../../shaders/shaders_2d.h"
@@ -42,7 +44,13 @@ typedef struct _vio_metal_state {
     int                        initialized;
     int                        vsync;
     id<MTLTexture>             offscreen_texture; /* for vsync-off rendering */
+#ifdef HAVE_GLFW
+    /* When the backend was bootstrapped via vio_metal_setup_context() the
+     * GLFW window is polled each frame to discover resizes. Pure-native
+     * setups (iOS, headless) leave this NULL and call
+     * vio_metal_handle_resize() externally instead. */
     GLFWwindow                *glfw_window;
+#endif
 } vio_metal_state;
 
 static vio_metal_state vio_mtl = {0};
@@ -99,6 +107,9 @@ static unsigned int metal_register_texture(id<MTLTexture> tex)
     return 0; /* Registry full */
 }
 
+/* Forward declarations for helpers used before their definition. */
+static void metal_resize(int width, int height);
+
 /* ── Depth texture helper ────────────────────────────────────────── */
 
 static void create_depth_texture(int w, int h)
@@ -118,10 +129,14 @@ static void create_depth_texture(int w, int h)
 
 /* ── Setup / Teardown ────────────────────────────────────────────── */
 
-int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
+int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
+                                   vio_config *cfg)
 {
     @autoreleasepool {
-        vio_mtl.glfw_window = (GLFWwindow *)glfw_window;
+        if (!cf_metal_layer) {
+            php_error_docref(NULL, E_WARNING, "Metal: setup_context_native called with NULL layer");
+            return -1;
+        }
 
         /* Create Metal device */
         vio_mtl.device = MTLCreateSystemDefaultDevice();
@@ -137,14 +152,10 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
             return -1;
         }
 
-        /* Get NSWindow from GLFW and attach CAMetalLayer */
-        NSWindow *ns_window = (NSWindow *)glfwGetCocoaWindow(vio_mtl.glfw_window);
-        if (!ns_window) {
-            php_error_docref(NULL, E_WARNING, "Metal: failed to get Cocoa window");
-            return -1;
-        }
-
-        vio_mtl.metal_layer = [CAMetalLayer layer];
+        /* The layer is owned by the caller (NSView contentView on macOS,
+         * UIView on iOS). We configure it for our pixel format / sync mode
+         * and keep an ARC-strong reference for the context lifetime. */
+        vio_mtl.metal_layer = (__bridge CAMetalLayer *)cf_metal_layer;
         vio_mtl.metal_layer.device = vio_mtl.device;
         vio_mtl.metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         vio_mtl.metal_layer.framebufferOnly = NO; /* Need readable for screenshots */
@@ -154,29 +165,19 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
         /* Use 3 drawables to avoid nextDrawable returning nil when PHP's GC
            causes occasional frame time spikes. Default of 2 is too tight. */
         vio_mtl.metal_layer.maximumDrawableCount = 3;
+        vio_mtl.metal_layer.drawableSize = CGSizeMake(width, height);
 
-        /* Get framebuffer size */
-        int fb_w, fb_h;
-        glfwGetFramebufferSize(vio_mtl.glfw_window, &fb_w, &fb_h);
-        vio_mtl.metal_layer.drawableSize = CGSizeMake(fb_w, fb_h);
-
-        /* Replace content view's layer */
-        NSView *content_view = [ns_window contentView];
-        [content_view setWantsLayer:YES];
-        [content_view setLayer:vio_mtl.metal_layer];
-        [content_view setLayerContentsRedrawPolicy:NSViewLayerContentsRedrawNever];
-
-        vio_mtl.width  = fb_w;
-        vio_mtl.height = fb_h;
+        vio_mtl.width  = width;
+        vio_mtl.height = height;
 
         /* Create depth texture */
-        create_depth_texture(fb_w, fb_h);
+        create_depth_texture(width, height);
 
         /* Create offscreen render target for vsync-off mode */
         if (!cfg->vsync) {
             MTLTextureDescriptor *offDesc = [MTLTextureDescriptor
                 texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                width:fb_w height:fb_h mipmapped:NO];
+                width:width height:height mipmapped:NO];
             offDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             offDesc.storageMode = MTLStorageModePrivate;
             vio_mtl.offscreen_texture = [vio_mtl.device newTextureWithDescriptor:offDesc];
@@ -199,6 +200,55 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
 
     return 0;
 }
+
+void vio_metal_handle_resize(int width, int height)
+{
+    if (!vio_mtl.initialized) return;
+    if (width == vio_mtl.width && height == vio_mtl.height) return;
+    metal_resize(width, height);
+}
+
+#ifdef HAVE_GLFW
+int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
+{
+    @autoreleasepool {
+        GLFWwindow *win = (GLFWwindow *)glfw_window;
+        if (!win) {
+            php_error_docref(NULL, E_WARNING, "Metal: setup_context called with NULL GLFW window");
+            return -1;
+        }
+
+        /* Get NSWindow from GLFW */
+        NSWindow *ns_window = (NSWindow *)glfwGetCocoaWindow(win);
+        if (!ns_window) {
+            php_error_docref(NULL, E_WARNING, "Metal: failed to get Cocoa window");
+            return -1;
+        }
+
+        /* Create a CAMetalLayer and attach to the content view. The native
+         * setup function below configures it (device, pixel format, ...). */
+        CAMetalLayer *layer = [CAMetalLayer layer];
+        NSView *content_view = [ns_window contentView];
+        [content_view setWantsLayer:YES];
+        [content_view setLayer:layer];
+        [content_view setLayerContentsRedrawPolicy:NSViewLayerContentsRedrawNever];
+
+        int fb_w, fb_h;
+        glfwGetFramebufferSize(win, &fb_w, &fb_h);
+
+        if (vio_metal_setup_context_native((__bridge void *)layer, fb_w, fb_h, cfg) != 0) {
+            return -1;
+        }
+
+        /* Remember the GLFW window for pull-based resize polling in
+         * metal_begin_frame. iOS / headless setups skip this and push
+         * resizes through vio_metal_handle_resize() instead. */
+        vio_mtl.glfw_window = win;
+    }
+
+    return 0;
+}
+#endif /* HAVE_GLFW */
 
 void vio_metal_shutdown_context(void)
 {
@@ -685,12 +735,18 @@ static void metal_begin_frame(void)
     @autoreleasepool {
         if (!vio_mtl.initialized) return;
 
-        /* Check for resize */
-        int fb_w, fb_h;
-        glfwGetFramebufferSize(vio_mtl.glfw_window, &fb_w, &fb_h);
-        if (fb_w != vio_mtl.width || fb_h != vio_mtl.height) {
-            metal_resize(fb_w, fb_h);
+#ifdef HAVE_GLFW
+        /* GLFW path: poll the window for resize each frame. Native callers
+         * (iOS UIView) push resizes through vio_metal_handle_resize() and
+         * leave glfw_window NULL, so we skip the poll in that case. */
+        if (vio_mtl.glfw_window) {
+            int fb_w, fb_h;
+            glfwGetFramebufferSize(vio_mtl.glfw_window, &fb_w, &fb_h);
+            if (fb_w != vio_mtl.width || fb_h != vio_mtl.height) {
+                metal_resize(fb_w, fb_h);
+            }
         }
+#endif
 
         /* DO NOT reset current_bound_rt here. The persistent-bind contract
          * mirrored from D3D11/D3D12 (vio_d3d11.current_rtv survives across

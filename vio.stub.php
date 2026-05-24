@@ -91,6 +91,37 @@ function vio_mouse_button(VioContext $context, int $button): bool {}
 function vio_mouse_scroll(VioContext $context): array {}
 
 /**
+ * Number of active touches this frame. Always 0 on platforms without a
+ * touch surface (macOS, Linux, Windows desktop). Driven by platform
+ * backends on iOS / iPadOS, or by vio_touch_inject() for tests.
+ */
+function vio_touch_count(VioContext $context): int {}
+
+/**
+ * Return the active touch at compacted index $idx (0..vio_touch_count-1),
+ * or null when out of range. Active touches are returned in slot order
+ * with inactive slots skipped, so the index is stable within a single
+ * frame but NOT across frames - track touches by 'id' for that.
+ *
+ * Phase values: VIO_TOUCH_BEGAN (1), VIO_TOUCH_MOVED (2),
+ * VIO_TOUCH_STATIONARY (3), VIO_TOUCH_ENDED (4), VIO_TOUCH_CANCELLED (5).
+ *
+ * @return array{id: int, x: float, y: float, phase: int, delta_x: float, delta_y: float}|null
+ */
+function vio_touch_get(VioContext $context, int $index): ?array {}
+
+/**
+ * Inject a synthetic touch event. Used by tests and headless replays;
+ * production touch events come from the platform backend.
+ *
+ * Coordinates are in framebuffer pixels (same space as the cursor
+ * callback). Phase must be VIO_TOUCH_BEGAN / MOVED / ENDED / CANCELLED.
+ * Returns true on success; false when the touch array is full (BEGAN)
+ * or the phase is unknown.
+ */
+function vio_touch_inject(VioContext $context, int $id, int $phase, float $x = 0.0, float $y = 0.0): bool {}
+
+/**
  * Set cursor mode: VIO_CURSOR_NORMAL (0), VIO_CURSOR_DISABLED (1), VIO_CURSOR_HIDDEN (2).
  * Disabled mode hides the cursor, confines it, and enables raw mouse motion for FPS controls.
  */
