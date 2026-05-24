@@ -161,7 +161,11 @@ int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
         vio_mtl.metal_layer.framebufferOnly = NO; /* Need readable for screenshots */
         vio_mtl.metal_layer.opaque = YES;
         vio_mtl.vsync = cfg->vsync;
+#if TARGET_OS_OSX
+        /* displaySyncEnabled is a macOS-only CAMetalLayer property; on iOS
+         * vsync is governed by CADisplayLink in the host view. */
         vio_mtl.metal_layer.displaySyncEnabled = cfg->vsync ? YES : NO;
+#endif
         /* Use 3 drawables to avoid nextDrawable returning nil when PHP's GC
            causes occasional frame time spikes. Default of 2 is too tight. */
         vio_mtl.metal_layer.maximumDrawableCount = 3;
