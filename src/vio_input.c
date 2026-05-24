@@ -274,6 +274,13 @@ int vio_input_touch_began(vio_input_state *state, unsigned long long id, double 
             state->touches[i].prev_y = y;
             state->touches[i].phase  = VIO_TOUCH_BEGAN;
             state->touch_count++;
+            /* Touch -> mouse emulation: mirror the touch as the primary
+             * mouse button so desktop games that poll vio_mouse_position /
+             * vio_mouse_button work unchanged on touch devices. Single-touch
+             * model (last finger wins) - fine for pointer-style UIs. */
+            state->mouse_x = x;
+            state->mouse_y = y;
+            state->mouse_buttons[0] = 1;
             return i;
         }
     }
@@ -297,6 +304,10 @@ void vio_input_touch_moved(vio_input_state *state, unsigned long long id, double
     state->touches[idx].x     = x;
     state->touches[idx].y     = y;
     state->touches[idx].phase = VIO_TOUCH_MOVED;
+
+    /* Touch -> mouse emulation: drag moves the emulated cursor. */
+    state->mouse_x = x;
+    state->mouse_y = y;
 }
 
 void vio_input_touch_ended(vio_input_state *state, unsigned long long id)
@@ -305,6 +316,8 @@ void vio_input_touch_ended(vio_input_state *state, unsigned long long id)
     int idx = vio_touch_find_slot(state, id);
     if (idx < 0) return;
     state->touches[idx].phase = VIO_TOUCH_ENDED;
+    /* Touch -> mouse emulation: finger up = primary mouse button release. */
+    state->mouse_buttons[0] = 0;
 }
 
 void vio_input_touch_cancelled(vio_input_state *state, unsigned long long id)
@@ -313,4 +326,5 @@ void vio_input_touch_cancelled(vio_input_state *state, unsigned long long id)
     int idx = vio_touch_find_slot(state, id);
     if (idx < 0) return;
     state->touches[idx].phase = VIO_TOUCH_CANCELLED;
+    state->mouse_buttons[0] = 0;
 }

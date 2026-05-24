@@ -787,19 +787,12 @@ ZEND_FUNCTION(vio_touch_get)
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
-    /* Touch coordinates arrive in framebuffer pixels. Scale them into the
-     * 2D design space the game draws in (state_2d.width/height) so touches
-     * line up with rendered UI: design = raw * design_size / framebuffer.
-     * On iOS the framebuffer is the physical screen (e.g. 2796) while the
-     * design space is the configured size (e.g. 1280); this maps a tap at
-     * the right edge to design-x 1280, not 2796. Falls back to the legacy
-     * 1/logical-scale when framebuffer dims are not yet known. */
+    /* Touch coordinates are stored in logical window points (the iOS view
+     * delivers points; GLFW would deliver logical too), the same space as
+     * vio_mouse_position. Divide by the logical scale for parity with the
+     * mouse API (1.0 on iOS, content-scale on Win V2-DPI). */
     double sx = vio_input_logical_scale_x(ctx);
     double sy = vio_input_logical_scale_y(ctx);
-    double tsx = (ctx->state_2d.fb_width  > 0 && ctx->state_2d.width  > 0)
-        ? (double)ctx->state_2d.width  / (double)ctx->state_2d.fb_width  : (1.0 / sx);
-    double tsy = (ctx->state_2d.fb_height > 0 && ctx->state_2d.height > 0)
-        ? (double)ctx->state_2d.height / (double)ctx->state_2d.fb_height : (1.0 / sy);
 
     /* Walk active slots, count up to idx */
     int seen = -1;
@@ -810,11 +803,11 @@ ZEND_FUNCTION(vio_touch_get)
         if (seen == idx) {
             array_init(return_value);
             add_assoc_long(return_value,   "id",      (zend_long)t->id);
-            add_assoc_double(return_value, "x",       t->x * tsx);
-            add_assoc_double(return_value, "y",       t->y * tsy);
+            add_assoc_double(return_value, "x",       t->x / sx);
+            add_assoc_double(return_value, "y",       t->y / sy);
             add_assoc_long(return_value,   "phase",   (zend_long)t->phase);
-            add_assoc_double(return_value, "delta_x", (t->x - t->prev_x) * tsx);
-            add_assoc_double(return_value, "delta_y", (t->y - t->prev_y) * tsy);
+            add_assoc_double(return_value, "delta_x", (t->x - t->prev_x) / sx);
+            add_assoc_double(return_value, "delta_y", (t->y - t->prev_y) / sy);
             return;
         }
     }

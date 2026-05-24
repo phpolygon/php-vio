@@ -65,18 +65,18 @@ static volatile int g_ios_scale_x1000 = 1000;
  * to uintptr_t and then unsigned long long gives us a 64-bit stable id
  * that can never collide with another live finger.
  *
- * Coordinates are in framebuffer pixels (logical points * contentScale)
- * to match the GLFW cursor callback's behaviour. The PHP-facing
- * vio_touch_get() handles the scale-back to logical points the same way
- * vio_mouse_position does. */
+ * Coordinates are in LOGICAL points (UIView's native coordinate space),
+ * matching vio_window_size (= framebuffer / contentScale) and the space
+ * the engine letterboxes / hit-tests against. The same coords drive the
+ * touch->mouse emulation in vio_input, so a desktop game reading
+ * vio_mouse_position sees the finger as the cursor. */
 - (void)dispatchTouches:(NSSet<UITouch *> *)touches phase:(vio_touch_phase)phase {
     if (!self.inputState) return;
-    CGFloat scale = self.contentScaleFactor;
     for (UITouch *t in touches) {
         CGPoint p = [t locationInView:self];
         unsigned long long tid = (unsigned long long)(uintptr_t)t;
-        double x = (double)(p.x * scale);
-        double y = (double)(p.y * scale);
+        double x = (double)p.x;
+        double y = (double)p.y;
         switch (phase) {
             case VIO_TOUCH_BEGAN:
                 vio_input_touch_began(self.inputState, tid, x, y);
