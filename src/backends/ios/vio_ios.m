@@ -262,11 +262,22 @@ int vio_ios_setup_context(int width, int height, vio_config *cfg,
 
 void vio_ios_shutdown_context(void)
 {
-    @autoreleasepool {
-        if (vio_ios_view) {
-            [vio_ios_view removeFromSuperview];
-            vio_ios_view = nil;
+    /* removeFromSuperview is UIKit - main thread only. vio_destroy (which
+     * calls us) typically runs on the game's background thread, so hop to
+     * main. Without this iOS throws NSInternalInconsistencyException
+     * ("UI changes off the main thread") during teardown. */
+    void (^teardown)(void) = ^{
+        @autoreleasepool {
+            if (vio_ios_view) {
+                [vio_ios_view removeFromSuperview];
+                vio_ios_view = nil;
+            }
         }
+    };
+    if ([NSThread isMainThread]) {
+        teardown();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), teardown);
     }
 }
 
