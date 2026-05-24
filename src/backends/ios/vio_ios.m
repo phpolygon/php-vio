@@ -25,6 +25,9 @@
  * torn read at worst costs one mis-sized frame, corrected the next. */
 static volatile int g_ios_fb_w = 0;
 static volatile int g_ios_fb_h = 0;
+/* contentScaleFactor (physical px per logical pt) as an int x1000, so the
+ * render thread can read it without floats/UIKit. e.g. 3.0 -> 3000. */
+static volatile int g_ios_scale_x1000 = 1000;
 
 /* ── VioRenderView ─────────────────────────────────────────────────
  *
@@ -125,6 +128,7 @@ static volatile int g_ios_fb_h = 0;
     layer.drawableSize = CGSizeMake(w, h);
     g_ios_fb_w = w;
     g_ios_fb_h = h;
+    g_ios_scale_x1000 = (int)(scale * 1000.0 + 0.5);
     vio_metal_handle_resize(w, h);
 }
 
@@ -233,6 +237,7 @@ int vio_ios_setup_context(int width, int height, vio_config *cfg,
              * 0x0 until the first layout pass. */
             g_ios_fb_w = fb_w;
             g_ios_fb_h = fb_h;
+            g_ios_scale_x1000 = (int)(scale * 1000.0 + 0.5);
 
             if (vio_metal_setup_context_native((__bridge void *)layer, fb_w, fb_h, cfg) != 0) {
                 [vio_ios_view removeFromSuperview];
@@ -287,6 +292,12 @@ void vio_ios_get_framebuffer_size(int *out_w, int *out_h)
      * thread. Safe to call from the render thread (no UIKit access). */
     if (out_w) *out_w = g_ios_fb_w;
     if (out_h) *out_h = g_ios_fb_h;
+}
+
+float vio_ios_get_content_scale(void)
+{
+    /* physical px / logical pt (e.g. 3.0 on iPhone Pro). Render-thread safe. */
+    return (float)g_ios_scale_x1000 / 1000.0f;
 }
 
 #endif /* HAVE_IOS */

@@ -62,6 +62,13 @@ void vio_ios_shutdown_context(void);
  */
 void vio_ios_get_framebuffer_size(int *out_w, int *out_h);
 
+/*
+ * Content scale (physical pixels per logical point), e.g. 3.0 on an
+ * iPhone Pro. Used to derive the logical window size (framebuffer / scale)
+ * that the game lays out against. Render-thread safe (reads a cached value).
+ */
+float vio_ios_get_content_scale(void);
+
 #endif /* HAVE_IOS */
 
 #endif /* VIO_IOS_H */

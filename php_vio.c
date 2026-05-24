@@ -452,19 +452,16 @@ ZEND_FUNCTION(vio_begin)
         }
 #endif
 #ifdef HAVE_IOS
-        /* iOS: keep the 2D design space at the configured logical size
-         * (the game draws in its own coordinate system, e.g. 1280x720;
-         * vio_metal_2d_init's projection stretches that across the whole
-         * framebuffer = fullscreen). Only refresh the PHYSICAL framebuffer
-         * dims, which drive the viewport/scissor and the touch-coordinate
-         * scale (vio_input_logical_scale_* = fb / design). Deliberately do
-         * NOT set have_size, so the vio_2d_set_size() below is skipped -
-         * resizing the design space to the physical resolution would shrink
-         * the game into a corner instead of filling the screen. */
+        /* iOS: derive the LOGICAL window size (physical framebuffer / content
+         * scale), exactly like the GLFW retina path. The game lays out in
+         * logical points and queries vio_window_size for letterboxing; the 2D
+         * design space (state_2d.width/height) must match that logical size so
+         * the game's screen-space scissor/transform line up, while the
+         * viewport renders at full physical resolution for sharpness. */
         vio_ios_get_framebuffer_size(&fb_w, &fb_h);
         if (fb_w > 0 && fb_h > 0) {
-            ctx->state_2d.fb_width  = fb_w;
-            ctx->state_2d.fb_height = fb_h;
+            sx = sy = vio_ios_get_content_scale();
+            have_size = 1;
         }
 #endif
         if (have_size) {
@@ -1120,6 +1117,19 @@ ZEND_FUNCTION(vio_window_size)
         add_next_index_long(return_value, logical_w);
         add_next_index_long(return_value, logical_h);
         return;
+    }
+#endif
+#ifdef HAVE_IOS
+    {
+        int fb_w = 0, fb_h = 0;
+        vio_ios_get_framebuffer_size(&fb_w, &fb_h);
+        float scale = vio_ios_get_content_scale();
+        if (scale <= 0.0f) scale = 1.0f;
+        if (fb_w > 0 && fb_h > 0) {
+            add_next_index_long(return_value, (int)((float)fb_w / scale + 0.5f));
+            add_next_index_long(return_value, (int)((float)fb_h / scale + 0.5f));
+            return;
+        }
     }
 #endif
     add_next_index_long(return_value, ctx->config.width > 0 ? ctx->config.width : 800);
