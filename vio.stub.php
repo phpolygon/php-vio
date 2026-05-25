@@ -154,6 +154,22 @@ function vio_on_char(VioContext $context, callable $callback): void {}
 function vio_chars_typed(VioContext $context): string {}
 
 /**
+ * Number of on-screen-keyboard backspaces since the last call (read-and-clear).
+ * Non-zero only on iOS; 0 on desktop (physical Backspace uses the key API).
+ */
+function vio_ime_backspaces(VioContext $context): int {}
+
+/**
+ * Show the on-screen keyboard (iOS). No-op on desktop. Call on text-field focus.
+ */
+function vio_keyboard_show(VioContext $context): void {}
+
+/**
+ * Hide the on-screen keyboard (iOS). No-op on desktop. Call on text-field blur.
+ */
+function vio_keyboard_hide(VioContext $context): void {}
+
+/**
  * Toggle fullscreen mode.
  */
 function vio_toggle_fullscreen(VioContext $context): void {}

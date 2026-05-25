@@ -52,6 +52,14 @@ typedef struct _vio_input_state {
     int    has_char_callback;
     char   char_buffer[256];
     int    char_buffer_len;
+    /* iOS soft-keyboard input. The UIKeyInput view (UIKit main thread) enqueues
+     * typed codepoints / bumps the backspace counter; the render thread drains
+     * them in vio_poll_events (vio_input_drain_ime), feeding the same char path
+     * as the desktop GLFW callback. volatile: cross-thread, lock-free (human
+     * typing speed makes the race window negligible, matching the touch model). */
+    unsigned int  ime_codepoints[128];
+    volatile int  ime_cp_count;
+    volatile int  ime_backspaces;
 
     /* Touch points. Slots with id==0 are inactive. Indexing is not stable
      * across frames - iterate touch_count slots and skip inactive ones,
@@ -96,6 +104,21 @@ void vio_input_touch_ended(vio_input_state *state, unsigned long long id);
 /* Touch cancelled (system pre-empted - e.g. notification, multitasking gesture).
  * Behaves like ENDED but with cancellation semantics for the consumer. */
 void vio_input_touch_cancelled(vio_input_state *state, unsigned long long id);
+
+/* iOS soft-keyboard text entry (UIKit main thread enqueues; render thread
+ * drains). push_codepoint queues a typed Unicode codepoint; ime_backspace bumps
+ * the backspace counter. drain_ime (called each frame from vio_poll_events on
+ * the render thread) emits the queued codepoints through the normal char path
+ * (char buffer + on_char callback). take_ime_backspaces reads-and-clears the
+ * backspace count. */
+void vio_input_push_codepoint(vio_input_state *state, unsigned int codepoint);
+void vio_input_drain_ime(vio_input_state *state);
+void vio_input_ime_backspace(vio_input_state *state);
+int  vio_input_take_ime_backspaces(vio_input_state *state);
+
+/* Emit one typed codepoint into the per-frame char buffer + on_char callback.
+ * Shared by the GLFW char callback and the iOS IME drain. PHP/render thread. */
+void vio_input_emit_char(vio_input_state *state, unsigned int codepoint);
 
 #ifdef HAVE_GLFW
 #define GLFW_INCLUDE_NONE

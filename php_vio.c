@@ -388,6 +388,16 @@ ZEND_FUNCTION(vio_poll_events)
 #ifdef HAVE_GLFW
     vio_window_poll_events();
 #endif
+#ifdef HAVE_IOS
+    /* No OS event pump on iOS (UIKit drives that). Drain the soft-keyboard
+     * codepoints queued by the UIKeyInput view on the main thread, emitting
+     * them on this (render) thread through the normal char path - mirrors the
+     * GLFW char callback firing during glfwPollEvents. */
+    {
+        vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+        vio_input_drain_ime(&ctx->input);
+    }
+#endif
 }
 
 ZEND_FUNCTION(vio_begin)
@@ -977,6 +987,61 @@ ZEND_FUNCTION(vio_chars_typed)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
     RETURN_STRINGL(ctx->input.char_buffer, ctx->input.char_buffer_len);
+}
+
+/*
+ * vio_ime_backspaces(VioContext $ctx): int
+ *
+ * Number of soft-keyboard backspaces since the last call (read-and-clear).
+ * Non-zero only on iOS, where the on-screen keyboard's delete key feeds them
+ * in; 0 on desktop (physical Backspace flows through the key API instead).
+ */
+ZEND_FUNCTION(vio_ime_backspaces)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_LONG((zend_long) vio_input_take_ime_backspaces(&ctx->input));
+}
+
+/*
+ * vio_keyboard_show(VioContext $ctx): void
+ * vio_keyboard_hide(VioContext $ctx): void
+ *
+ * Show / hide the on-screen keyboard. No-op on desktop (physical keyboard);
+ * on iOS this toggles the render view's first-responder status. Call when a
+ * text field gains / loses focus.
+ */
+ZEND_FUNCTION(vio_keyboard_show)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    (void) ctx_zval;
+#ifdef HAVE_IOS
+    vio_ios_keyboard_show();
+#endif
+}
+
+ZEND_FUNCTION(vio_keyboard_hide)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    (void) ctx_zval;
+#ifdef HAVE_IOS
+    vio_ios_keyboard_hide();
+#endif
 }
 
 ZEND_FUNCTION(vio_toggle_fullscreen)

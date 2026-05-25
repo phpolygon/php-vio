@@ -37,7 +37,7 @@ static volatile int g_ios_scale_x1000 = 1000;
  *   - Notifies the Metal backend of size changes on rotation / multitasking
  */
 
-@interface VioRenderView : UIView
+@interface VioRenderView : UIView <UIKeyInput>
 @property (nonatomic, assign) vio_input_state *inputState;
 @end
 
@@ -114,6 +114,41 @@ static volatile int g_ios_scale_x1000 = 1000;
     (void)event;
     [self dispatchTouches:touches phase:VIO_TOUCH_CANCELLED];
 }
+
+/* ── UIKeyInput: soft keyboard ─────────────────────────────────────
+ *
+ * The engine draws its own text fields (vio, not native UITextField), so iOS
+ * has nothing to raise the on-screen keyboard. We make the render view a first
+ * responder that conforms to UIKeyInput; vio_ios_keyboard_show makes it become
+ * first responder (keyboard appears) and forwards typed text / backspaces into
+ * vio_input, where the engine's existing char + backspace handling picks them
+ * up. */
+- (BOOL)canBecomeFirstResponder { return YES; }
+
+- (BOOL)hasText { return YES; }
+
+- (void)insertText:(NSString *)text {
+    if (!self.inputState || text.length == 0) return;
+    /* UTF-32LE gives one uint32 per codepoint (no surrogate handling, no BOM),
+     * which we enqueue for the render thread to emit. */
+    NSData *u32 = [text dataUsingEncoding:NSUTF32LittleEndianStringEncoding];
+    if (!u32) return;
+    const uint32_t *cps = (const uint32_t *)u32.bytes;
+    NSUInteger count = u32.length / sizeof(uint32_t);
+    for (NSUInteger i = 0; i < count; i++) {
+        vio_input_push_codepoint(self.inputState, (unsigned int)cps[i]);
+    }
+}
+
+- (void)deleteBackward {
+    if (self.inputState) {
+        vio_input_ime_backspace(self.inputState);
+    }
+}
+
+/* No autocorrect/caps for a game text field. */
+- (UITextAutocorrectionType)autocorrectionType { return UITextAutocorrectionTypeNo; }
+- (UITextAutocapitalizationType)autocapitalizationType { return UITextAutocapitalizationTypeNone; }
 
 /* layoutSubviews fires on rotation, on entering / leaving split view,
  * on iPad Stage Manager resize. We forward the new framebuffer size to
@@ -298,6 +333,24 @@ float vio_ios_get_content_scale(void)
 {
     /* physical px / logical pt (e.g. 3.0 on iPhone Pro). Render-thread safe. */
     return (float)g_ios_scale_x1000 / 1000.0f;
+}
+
+/* Show/hide the on-screen keyboard by toggling the render view's first-
+ * responder status. UIKit work must run on the main thread; the engine calls
+ * these from the render thread on text-field focus changes, so we hop to main
+ * (async - no need to block the render thread, and avoids deadlock). */
+void vio_ios_keyboard_show(void)
+{
+    void (^show)(void) = ^{ if (vio_ios_view) { [vio_ios_view becomeFirstResponder]; } };
+    if ([NSThread isMainThread]) { show(); }
+    else { dispatch_async(dispatch_get_main_queue(), show); }
+}
+
+void vio_ios_keyboard_hide(void)
+{
+    void (^hide)(void) = ^{ if (vio_ios_view) { [vio_ios_view resignFirstResponder]; } };
+    if ([NSThread isMainThread]) { hide(); }
+    else { dispatch_async(dispatch_get_main_queue(), hide); }
 }
 
 #endif /* HAVE_IOS */

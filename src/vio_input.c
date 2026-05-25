@@ -27,6 +27,8 @@ void vio_input_init(vio_input_state *state)
     state->has_resize_callback = 0;
     state->has_char_callback = 0;
     state->char_buffer_len = 0;
+    state->ime_cp_count = 0;
+    state->ime_backspaces = 0;
     memset(state->touches, 0, sizeof(state->touches));
     state->touch_count = 0;
 }
@@ -107,6 +109,57 @@ void vio_input_shutdown(vio_input_state *state)
     }
 }
 
+/* UTF-8 encode a codepoint. Returns byte count (1-4) or 0 if out of range.
+ * Non-guarded: used by both the GLFW char callback and the iOS IME path. */
+static int vio_encode_utf8(unsigned int codepoint, char *out)
+{
+    if (codepoint <= 0x7F) {
+        out[0] = (char)codepoint;
+        return 1;
+    } else if (codepoint <= 0x7FF) {
+        out[0] = (char)(0xC0 | (codepoint >> 6));
+        out[1] = (char)(0x80 | (codepoint & 0x3F));
+        return 2;
+    } else if (codepoint <= 0xFFFF) {
+        out[0] = (char)(0xE0 | (codepoint >> 12));
+        out[1] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (codepoint & 0x3F));
+        return 3;
+    } else if (codepoint <= 0x10FFFF) {
+        out[0] = (char)(0xF0 | (codepoint >> 18));
+        out[1] = (char)(0x80 | ((codepoint >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (codepoint & 0x3F));
+        return 4;
+    }
+    return 0;
+}
+
+/* Emit one typed codepoint: append its UTF-8 to the per-frame char buffer and
+ * fire the on_char PHP callback. The single funnel both the desktop GLFW char
+ * callback and the iOS IME drain feed, so the engine's text handling is
+ * identical across platforms. Must run on the PHP/render thread (fires a PHP
+ * callback). */
+void vio_input_emit_char(vio_input_state *state, unsigned int codepoint)
+{
+    if (!state) return;
+
+    char encoded[4];
+    int len = vio_encode_utf8(codepoint, encoded);
+    if (len > 0 && state->char_buffer_len + len < (int)sizeof(state->char_buffer)) {
+        memcpy(state->char_buffer + state->char_buffer_len, encoded, (size_t)len);
+        state->char_buffer_len += len;
+    }
+
+    if (state->has_char_callback) {
+        zval retval, args[1];
+        ZVAL_LONG(&args[0], (zend_long)codepoint);
+        if (call_user_function(NULL, NULL, &state->on_char_callback, &retval, 1, args) == SUCCESS) {
+            zval_ptr_dtor(&retval);
+        }
+    }
+}
+
 #ifdef HAVE_GLFW
 
 static void glfw_key_callback(GLFWwindow *window, int key, int scancode, int action, int mods)
@@ -133,52 +186,11 @@ static void glfw_key_callback(GLFWwindow *window, int key, int scancode, int act
     }
 }
 
-static int vio_encode_utf8(unsigned int codepoint, char *out)
-{
-    if (codepoint <= 0x7F) {
-        out[0] = (char)codepoint;
-        return 1;
-    } else if (codepoint <= 0x7FF) {
-        out[0] = (char)(0xC0 | (codepoint >> 6));
-        out[1] = (char)(0x80 | (codepoint & 0x3F));
-        return 2;
-    } else if (codepoint <= 0xFFFF) {
-        out[0] = (char)(0xE0 | (codepoint >> 12));
-        out[1] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
-        out[2] = (char)(0x80 | (codepoint & 0x3F));
-        return 3;
-    } else if (codepoint <= 0x10FFFF) {
-        out[0] = (char)(0xF0 | (codepoint >> 18));
-        out[1] = (char)(0x80 | ((codepoint >> 12) & 0x3F));
-        out[2] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
-        out[3] = (char)(0x80 | (codepoint & 0x3F));
-        return 4;
-    }
-    return 0;
-}
-
 static void glfw_char_callback(GLFWwindow *window, unsigned int codepoint)
 {
     vio_input_state *state = (vio_input_state *)glfwGetWindowUserPointer(window);
     if (!state) return;
-
-    /* Append UTF-8 encoded codepoint to per-frame buffer */
-    char encoded[4];
-    int len = vio_encode_utf8(codepoint, encoded);
-    if (len > 0 && state->char_buffer_len + len < (int)sizeof(state->char_buffer)) {
-        memcpy(state->char_buffer + state->char_buffer_len, encoded, len);
-        state->char_buffer_len += len;
-    }
-
-    /* Fire PHP callback if registered */
-    if (state->has_char_callback) {
-        zval retval, args[1];
-        ZVAL_LONG(&args[0], (zend_long)codepoint);
-
-        if (call_user_function(NULL, NULL, &state->on_char_callback, &retval, 1, args) == SUCCESS) {
-            zval_ptr_dtor(&retval);
-        }
-    }
+    vio_input_emit_char(state, codepoint);
 }
 
 static void glfw_cursor_pos_callback(GLFWwindow *window, double xpos, double ypos)
@@ -327,4 +339,43 @@ void vio_input_touch_cancelled(vio_input_state *state, unsigned long long id)
     if (idx < 0) return;
     state->touches[idx].phase = VIO_TOUCH_CANCELLED;
     state->mouse_buttons[0] = 0;
+}
+
+/* ── iOS soft-keyboard text input ──────────────────────────────────
+ *
+ * The UIKeyInput view enqueues codepoints / backspaces from the UIKit main
+ * thread; the render thread drains them (vio_input_drain_ime, from
+ * vio_poll_events) through the normal char path. Lock-free volatile counters -
+ * see the struct comment. */
+void vio_input_push_codepoint(vio_input_state *state, unsigned int codepoint)
+{
+    if (!state) return;
+    int n = state->ime_cp_count;
+    if (n >= 0 && n < (int)(sizeof(state->ime_codepoints) / sizeof(state->ime_codepoints[0]))) {
+        state->ime_codepoints[n] = codepoint;
+        state->ime_cp_count = n + 1;
+    }
+}
+
+void vio_input_drain_ime(vio_input_state *state)
+{
+    if (!state) return;
+    int n = state->ime_cp_count;
+    state->ime_cp_count = 0;
+    for (int i = 0; i < n; i++) {
+        vio_input_emit_char(state, state->ime_codepoints[i]);
+    }
+}
+
+void vio_input_ime_backspace(vio_input_state *state)
+{
+    if (state) state->ime_backspaces++;
+}
+
+int vio_input_take_ime_backspaces(vio_input_state *state)
+{
+    if (!state) return 0;
+    int n = state->ime_backspaces;
+    state->ime_backspaces = 0;
+    return n;
 }

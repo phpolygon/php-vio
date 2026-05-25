@@ -105,6 +105,18 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_chars_typed, 0, 1, IS_STRING
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_ime_backspaces, 0, 1, IS_LONG, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_keyboard_show, 0, 1, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_keyboard_hide, 0, 1, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_toggle_fullscreen, 0, 1, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
@@ -604,6 +616,9 @@ ZEND_FUNCTION(vio_on_key);
 ZEND_FUNCTION(vio_on_resize);
 ZEND_FUNCTION(vio_on_char);
 ZEND_FUNCTION(vio_chars_typed);
+ZEND_FUNCTION(vio_ime_backspaces);
+ZEND_FUNCTION(vio_keyboard_show);
+ZEND_FUNCTION(vio_keyboard_hide);
 ZEND_FUNCTION(vio_toggle_fullscreen);
 ZEND_FUNCTION(vio_set_title);
 ZEND_FUNCTION(vio_set_borderless);
@@ -718,6 +733,9 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_on_resize, arginfo_vio_on_resize)
 	ZEND_FE(vio_on_char, arginfo_vio_on_char)
 	ZEND_FE(vio_chars_typed, arginfo_vio_chars_typed)
+	ZEND_FE(vio_ime_backspaces, arginfo_vio_ime_backspaces)
+	ZEND_FE(vio_keyboard_show, arginfo_vio_keyboard_show)
+	ZEND_FE(vio_keyboard_hide, arginfo_vio_keyboard_hide)
 	ZEND_FE(vio_toggle_fullscreen, arginfo_vio_toggle_fullscreen)
 	ZEND_FE(vio_set_title, arginfo_vio_set_title)
 	ZEND_FE(vio_set_borderless, arginfo_vio_set_borderless)

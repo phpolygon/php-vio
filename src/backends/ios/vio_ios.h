@@ -69,6 +69,16 @@ void vio_ios_get_framebuffer_size(int *out_w, int *out_h);
  */
 float vio_ios_get_content_scale(void);
 
+/*
+ * Show / hide the on-screen keyboard by toggling the render view's
+ * first-responder status. Call when a game text field gains / loses focus.
+ * Hops to the UIKit main thread internally; safe to call from the render
+ * thread. Typed text + backspaces arrive via vio_input_push_text /
+ * vio_input_ime_backspace.
+ */
+void vio_ios_keyboard_show(void);
+void vio_ios_keyboard_hide(void);
+
 #endif /* HAVE_IOS */
 
 #endif /* VIO_IOS_H */
