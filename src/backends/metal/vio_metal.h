@@ -11,11 +11,42 @@
 void vio_backend_metal_register(void);
 
 /*
- * Setup Metal context: create device, command queue, CAMetalLayer on GLFW window.
- * Called from vio_create() after window creation.
+ * Setup Metal context against an externally-provided CAMetalLayer.
+ *
+ * The caller owns the layer's parent view (NSView on macOS, UIView on iOS).
+ * This is the native entry-point used by all platforms. The Metal backend
+ * never touches AppKit, UIKit or GLFW directly - it only sees the layer
+ * and a starting framebuffer size.
+ *
+ *   cf_metal_layer  - CAMetalLayer* (passed as void to keep headers ObjC-free).
+ *                     Retained by the backend for the lifetime of the context.
+ *   width, height   - initial framebuffer size in pixels.
+ *   cfg             - config (only vsync is consumed today).
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
+                                   vio_config *cfg);
+
+#ifdef HAVE_GLFW
+/*
+ * GLFW convenience wrapper (macOS-only). Extracts NSWindow -> contentView,
+ * attaches a freshly-created CAMetalLayer, then delegates to
+ * vio_metal_setup_context_native(). Pulls framebuffer size via GLFW and
+ * registers GLFW for pull-based resize polling in metal_begin_frame.
+ *
  * Returns 0 on success, -1 on failure.
  */
 int vio_metal_setup_context(void *glfw_window, vio_config *cfg);
+#endif
+
+/*
+ * Push-based resize notification used by platforms without a polling-friendly
+ * windowing API (iOS UIView, AppKit-via-callback). The GLFW wrapper does not
+ * call this - it polls framebuffer size each frame. Safe to call between
+ * frames; not safe to call while an encoder is open.
+ */
+void vio_metal_handle_resize(int width, int height);
 
 /*
  * Shutdown Metal context and release all resources.

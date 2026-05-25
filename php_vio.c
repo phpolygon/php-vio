@@ -55,6 +55,7 @@ int vio_opengl_setup_context(void);
 #endif
 #ifdef HAVE_METAL
 #include "src/backends/metal/vio_metal.h"
+#include "src/backends/ios/vio_ios.h"
 #endif
 #if defined(HAVE_D3D11) || defined(HAVE_D3D12)
 #ifndef COBJMACROS
@@ -263,6 +264,25 @@ ZEND_FUNCTION(vio_create)
     }
 #endif
 
+#ifdef HAVE_IOS
+    /* iOS path: there is no GLFW window. The iOS backend creates a
+     * VioRenderView (UIView with CAMetalLayer) on the hosting Xcode
+     * wrapper's UIWindow, then delegates Metal init to the GLFW-agnostic
+     * vio_metal_setup_context_native(). UITouch events are routed into
+     * ctx->input by the same view. The null/headless backends do not
+     * need a render surface. */
+    if (strcmp(ctx->backend->name, "null") != 0) {
+        if (vio_ios_setup_context(ctx->config.width, ctx->config.height,
+                                  &ctx->config, &ctx->input) != 0) {
+            if (ctx->backend->shutdown) {
+                ctx->backend->shutdown();
+            }
+            zval_ptr_dtor(&obj);
+            RETURN_FALSE;
+        }
+    }
+#endif
+
     /* Initialize 2D rendering system */
     vio_2d_init(&ctx->state_2d, ctx->config.width, ctx->config.height);
 
@@ -313,6 +333,11 @@ ZEND_FUNCTION(vio_destroy)
             vio_window_destroy(ctx->window);
             ctx->window = NULL;
         }
+#endif
+#ifdef HAVE_IOS
+        /* Tear down the iOS render view; the Metal context is shut down
+         * via ctx->backend->shutdown above. */
+        vio_ios_shutdown_context();
 #endif
         ctx->initialized = 0;
     }
@@ -370,6 +395,16 @@ ZEND_FUNCTION(vio_poll_events)
 
 #ifdef HAVE_GLFW
     vio_window_poll_events();
+#endif
+#ifdef HAVE_IOS
+    /* No OS event pump on iOS (UIKit drives that). Drain the soft-keyboard
+     * codepoints queued by the UIKeyInput view on the main thread, emitting
+     * them on this (render) thread through the normal char path - mirrors the
+     * GLFW char callback firing during glfwPollEvents. */
+    {
+        vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+        vio_input_drain_ime(&ctx->input);
+    }
 #endif
 }
 
@@ -438,21 +473,42 @@ ZEND_FUNCTION(vio_begin)
 #endif
 
 #ifdef HAVE_METAL
-    if (ctx->window && strcmp(ctx->backend->name, "metal") == 0) {
-        int fb_w, fb_h;
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        int fb_w = 0, fb_h = 0;
         float sx = 1.0f, sy = 1.0f;
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        glfwGetWindowContentScale(ctx->window, &sx, &sy);
-        if (sx <= 0.0f) sx = 1.0f;
-        if (sy <= 0.0f) sy = 1.0f;
-        int logical_w = (int)((float)fb_w / sx + 0.5f);
-        int logical_h = (int)((float)fb_h / sy + 0.5f);
-        if (logical_w > 0 && logical_h > 0 &&
-            (logical_w != ctx->state_2d.width || logical_h != ctx->state_2d.height)) {
-            vio_2d_set_size(&ctx->state_2d, logical_w, logical_h);
+        int have_size = 0;
+#ifdef HAVE_GLFW
+        if (ctx->window) {
+            glfwGetFramebufferSize((GLFWwindow *)ctx->window, &fb_w, &fb_h);
+            glfwGetWindowContentScale((GLFWwindow *)ctx->window, &sx, &sy);
+            have_size = 1;
         }
-        ctx->state_2d.fb_width  = fb_w;
-        ctx->state_2d.fb_height = fb_h;
+#endif
+#ifdef HAVE_IOS
+        /* iOS: derive the LOGICAL window size (physical framebuffer / content
+         * scale), exactly like the GLFW retina path. The game lays out in
+         * logical points and queries vio_window_size for letterboxing; the 2D
+         * design space (state_2d.width/height) must match that logical size so
+         * the game's screen-space scissor/transform line up, while the
+         * viewport renders at full physical resolution for sharpness. */
+        vio_ios_get_framebuffer_size(&fb_w, &fb_h);
+        if (fb_w > 0 && fb_h > 0) {
+            sx = sy = vio_ios_get_content_scale();
+            have_size = 1;
+        }
+#endif
+        if (have_size) {
+            if (sx <= 0.0f) sx = 1.0f;
+            if (sy <= 0.0f) sy = 1.0f;
+            int logical_w = (int)((float)fb_w / sx + 0.5f);
+            int logical_h = (int)((float)fb_h / sy + 0.5f);
+            if (logical_w > 0 && logical_h > 0 &&
+                (logical_w != ctx->state_2d.width || logical_h != ctx->state_2d.height)) {
+                vio_2d_set_size(&ctx->state_2d, logical_w, logical_h);
+            }
+            ctx->state_2d.fb_width  = fb_w;
+            ctx->state_2d.fb_height = fb_h;
+        }
     }
 #endif
 
@@ -821,6 +877,122 @@ ZEND_FUNCTION(vio_mouse_scroll)
     add_next_index_double(return_value, ctx->input.scroll_y);
 }
 
+ZEND_FUNCTION(vio_touch_count)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_LONG((zend_long)ctx->input.touch_count);
+}
+
+/*
+ * vio_touch_get(VioContext $ctx, int $idx): ?array
+ *
+ * Returns the touch at the *active* index $idx, where active touches are
+ * compacted to indices 0..touch_count-1 (inactive slots are skipped).
+ * Returns null when $idx is out of range.
+ *
+ * Touch positions are reported in logical (post-DPI) coordinates, matching
+ * the existing vio_mouse_position contract.
+ *
+ * Shape: ['id' => int, 'x' => float, 'y' => float, 'phase' => int,
+ *         'delta_x' => float, 'delta_y' => float]
+ */
+ZEND_FUNCTION(vio_touch_get)
+{
+    zval *ctx_zval;
+    zend_long idx;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(idx)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (idx < 0) RETURN_NULL();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    /* Touch coordinates are stored in logical window points (the iOS view
+     * delivers points; GLFW would deliver logical too), the same space as
+     * vio_mouse_position. Divide by the logical scale for parity with the
+     * mouse API (1.0 on iOS, content-scale on Win V2-DPI). */
+    double sx = vio_input_logical_scale_x(ctx);
+    double sy = vio_input_logical_scale_y(ctx);
+
+    /* Walk active slots, count up to idx */
+    int seen = -1;
+    for (int i = 0; i < VIO_MAX_TOUCHES; i++) {
+        vio_touch *t = &ctx->input.touches[i];
+        if (t->id == 0) continue;
+        seen++;
+        if (seen == idx) {
+            array_init(return_value);
+            add_assoc_long(return_value,   "id",      (zend_long)t->id);
+            add_assoc_double(return_value, "x",       t->x / sx);
+            add_assoc_double(return_value, "y",       t->y / sy);
+            add_assoc_long(return_value,   "phase",   (zend_long)t->phase);
+            add_assoc_double(return_value, "delta_x", (t->x - t->prev_x) / sx);
+            add_assoc_double(return_value, "delta_y", (t->y - t->prev_y) / sy);
+            return;
+        }
+    }
+
+    RETURN_NULL();
+}
+
+/*
+ * vio_touch_inject(VioContext $ctx, int $id, int $phase, float $x, float $y): bool
+ *
+ * Synthetic touch injection for testing and headless replays. Backends
+ * push touches through C calls; this PHP entry-point lets test runners
+ * simulate the same path without a window.
+ *
+ * Coordinates are in framebuffer pixels (the same space that the GLFW
+ * cursor_pos callback uses). Tests in logical points should multiply by
+ * the content scale themselves.
+ *
+ * Returns true on success, false when the phase is invalid or the touch
+ * array is full (BEGAN with no free slot).
+ */
+ZEND_FUNCTION(vio_touch_inject)
+{
+    zval *ctx_zval;
+    zend_long id, phase;
+    double x = 0.0, y = 0.0;
+
+    ZEND_PARSE_PARAMETERS_START(3, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(id)
+        Z_PARAM_LONG(phase)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_DOUBLE(x)
+        Z_PARAM_DOUBLE(y)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    unsigned long long uid = (unsigned long long)id;
+
+    switch (phase) {
+        case VIO_TOUCH_BEGAN:
+            RETURN_BOOL(vio_input_touch_began(&ctx->input, uid, x, y) >= 0);
+        case VIO_TOUCH_MOVED:
+            vio_input_touch_moved(&ctx->input, uid, x, y);
+            RETURN_TRUE;
+        case VIO_TOUCH_ENDED:
+            vio_input_touch_ended(&ctx->input, uid);
+            RETURN_TRUE;
+        case VIO_TOUCH_CANCELLED:
+            vio_input_touch_cancelled(&ctx->input, uid);
+            RETURN_TRUE;
+        default:
+            RETURN_FALSE;
+    }
+}
+
 ZEND_FUNCTION(vio_set_cursor_mode)
 {
     zval *ctx_zval;
@@ -934,6 +1106,61 @@ ZEND_FUNCTION(vio_chars_typed)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
     RETURN_STRINGL(ctx->input.char_buffer, ctx->input.char_buffer_len);
+}
+
+/*
+ * vio_ime_backspaces(VioContext $ctx): int
+ *
+ * Number of soft-keyboard backspaces since the last call (read-and-clear).
+ * Non-zero only on iOS, where the on-screen keyboard's delete key feeds them
+ * in; 0 on desktop (physical Backspace flows through the key API instead).
+ */
+ZEND_FUNCTION(vio_ime_backspaces)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_LONG((zend_long) vio_input_take_ime_backspaces(&ctx->input));
+}
+
+/*
+ * vio_keyboard_show(VioContext $ctx): void
+ * vio_keyboard_hide(VioContext $ctx): void
+ *
+ * Show / hide the on-screen keyboard. No-op on desktop (physical keyboard);
+ * on iOS this toggles the render view's first-responder status. Call when a
+ * text field gains / loses focus.
+ */
+ZEND_FUNCTION(vio_keyboard_show)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    (void) ctx_zval;
+#ifdef HAVE_IOS
+    vio_ios_keyboard_show();
+#endif
+}
+
+ZEND_FUNCTION(vio_keyboard_hide)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    (void) ctx_zval;
+#ifdef HAVE_IOS
+    vio_ios_keyboard_hide();
+#endif
 }
 
 ZEND_FUNCTION(vio_toggle_fullscreen)
@@ -1069,6 +1296,19 @@ ZEND_FUNCTION(vio_window_size)
         return;
     }
 #endif
+#ifdef HAVE_IOS
+    {
+        int fb_w = 0, fb_h = 0;
+        vio_ios_get_framebuffer_size(&fb_w, &fb_h);
+        float scale = vio_ios_get_content_scale();
+        if (scale <= 0.0f) scale = 1.0f;
+        if (fb_w > 0 && fb_h > 0) {
+            add_next_index_long(return_value, (int)((float)fb_w / scale + 0.5f));
+            add_next_index_long(return_value, (int)((float)fb_h / scale + 0.5f));
+            return;
+        }
+    }
+#endif
     add_next_index_long(return_value, ctx->config.width > 0 ? ctx->config.width : 800);
     add_next_index_long(return_value, ctx->config.height > 0 ? ctx->config.height : 600);
 }
@@ -1147,6 +1387,17 @@ ZEND_FUNCTION(vio_framebuffer_size)
         add_next_index_long(return_value, w);
         add_next_index_long(return_value, h);
         return;
+    }
+#endif
+#ifdef HAVE_IOS
+    {
+        int w = 0, h = 0;
+        vio_ios_get_framebuffer_size(&w, &h);
+        if (w > 0 && h > 0) {
+            add_next_index_long(return_value, w);
+            add_next_index_long(return_value, h);
+            return;
+        }
     }
 #endif
     add_next_index_long(return_value, ctx->config.width > 0 ? ctx->config.width : 800);
