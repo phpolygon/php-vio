@@ -1,3 +1,25 @@
+# [1.17.0](https://github.com/phpolygon/php-vio/compare/v1.16.2...v1.17.0) (2026-05-25)
+
+
+### Bug Fixes
+
+* **ios:** expose logical window size (physical / content scale) ([6995dab](https://github.com/phpolygon/php-vio/commit/6995dabbb9af38cb588eef7f18dae5ebde4333d9))
+* **ios:** gate displaySyncEnabled behind TARGET_OS_OSX ([4be8803](https://github.com/phpolygon/php-vio/commit/4be880332e6918370fb9ec6ba6fe2915250da529))
+* **ios:** keep 2D design space at config size + scale touch to it ([77d9f2e](https://github.com/phpolygon/php-vio/commit/77d9f2e25220cd64056e5b08ec65557488fcc179))
+* **ios:** run shutdown_context teardown on the main thread ([c402e25](https://github.com/phpolygon/php-vio/commit/c402e252cd252ed14c27c3b854b5a9ea5dcd5645))
+* **ios:** thread-safe framebuffer size + report real size to PHP ([2efd219](https://github.com/phpolygon/php-vio/commit/2efd219e44952ddfecf9d92a84c3ace388c434d4))
+* **ios:** two-pass window discovery for launch-time vio_create ([55dd6a4](https://github.com/phpolygon/php-vio/commit/55dd6a40727ef0e22c475bbc995315adb84b61e0))
+* **ios:** unguarded GLFW calls in HAVE_METAL framebuffer-sync block ([5a16a3f](https://github.com/phpolygon/php-vio/commit/5a16a3fe929fdbded8aaee9ae460b736a7841614))
+
+
+### Features
+
+* **ios:** add iOS / iPadOS backend (UIView + UITouch + CAMetalLayer) ([82b5b9e](https://github.com/phpolygon/php-vio/commit/82b5b9e953d5f6db87c5334f73ecf9ce119cc069))
+* **ios:** decouple Metal backend from GLFW + add touch input API ([cbe2bbd](https://github.com/phpolygon/php-vio/commit/cbe2bbde42dc2741a008cb42534416f0d24c1d5e))
+* **ios:** on-screen keyboard support (UIKeyInput + text/backspace) ([1aad08e](https://github.com/phpolygon/php-vio/commit/1aad08e446c70c8b4cd7520ad9ed1b9f428c551f))
+* **ios:** run setup_context's UIKit work on the main thread ([5cb074f](https://github.com/phpolygon/php-vio/commit/5cb074fc5fdf3f050fe2d3e5779a8e6144220f23))
+* **ios:** touch->mouse emulation + logical touch coords ([bf3d943](https://github.com/phpolygon/php-vio/commit/bf3d943660f48e89a89d1f810ff8cb37fe5bc6df))
+
 ## [1.16.2](https://github.com/phpolygon/php-vio/compare/v1.16.1...v1.16.2) (2026-05-23)
 
 
