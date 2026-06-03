@@ -30,6 +30,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_cubemap.h"
 #include "src/vio_recorder.h"
 #include "src/vio_stream.h"
+#include "src/vio_thermal.h"
 #include "include/vio_constants.h"
 #include "include/vio_plugin.h"
 #include "vendor/stb/stb_image.h"
@@ -3898,6 +3899,12 @@ ZEND_FUNCTION(vio_backends)
             add_next_index_string(return_value, name);
         }
     }
+}
+
+ZEND_FUNCTION(vio_thermal_state)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_STRING(vio_get_thermal_state_str());
 }
 
 /* ── Audio functions ──────────────────────────────────────────────── */

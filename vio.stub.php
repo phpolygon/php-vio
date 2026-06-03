@@ -443,6 +443,15 @@ function vio_backend_count(): int {}
 function vio_backends(): array {}
 
 /**
+ * Read the host's thermal pressure level.
+ *
+ * On macOS / iOS this maps NSProcessInfo.thermalState to the string tokens
+ * "nominal", "fair", "serious", or "critical". On every other platform the
+ * function returns "unknown" so callers can fall back to their own metric.
+ */
+function vio_thermal_state(): string {}
+
+/**
  * Create a video recorder for capturing frames to a video file.
  *
  * @param array $config ['path' => string, 'fps' => int (default 30), 'codec' => string (optional)]

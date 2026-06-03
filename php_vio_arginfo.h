@@ -477,6 +477,9 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_backends, 0, 0, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_thermal_state, 0, 0, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
 /* ── Plugin functions ────────────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_plugins, 0, 0, IS_ARRAY, 0)
@@ -685,6 +688,7 @@ ZEND_FUNCTION(vio_gamepad_triggers);
 ZEND_FUNCTION(vio_backend_name);
 ZEND_FUNCTION(vio_backend_count);
 ZEND_FUNCTION(vio_backends);
+ZEND_FUNCTION(vio_thermal_state);
 ZEND_FUNCTION(vio_plugins);
 ZEND_FUNCTION(vio_plugin_info);
 ZEND_FUNCTION(vio_texture_load_async);
@@ -802,6 +806,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_backend_name, arginfo_vio_backend_name)
 	ZEND_FE(vio_backend_count, arginfo_vio_backend_count)
 	ZEND_FE(vio_backends, arginfo_vio_backends)
+	ZEND_FE(vio_thermal_state, arginfo_vio_thermal_state)
 	ZEND_FE(vio_plugins, arginfo_vio_plugins)
 	ZEND_FE(vio_plugin_info, arginfo_vio_plugin_info)
 	ZEND_FE(vio_texture_load_async, arginfo_vio_texture_load_async)
