@@ -2044,10 +2044,21 @@ ZEND_FUNCTION(vio_shader)
                 if (vio_spirv_reflect(shader->frag_spirv, shader->frag_spirv_size, &frag_reflect, &err) == 0) {
                     shader->sampler_count = frag_reflect.texture_count < VIO_MAX_SAMPLERS
                                           ? frag_reflect.texture_count : VIO_MAX_SAMPLERS;
+                    /* Recompute the HLSL t-register the cross-compiler assigned to each
+                     * sampler. The reflection list here is the SAME sampled_images list,
+                     * in the SAME order, that vio_spirv_to_hlsl walks when it assigns
+                     * SpvDecorationBinding (vio_shader_reflect.c): regular samplers get
+                     * 0,1,2..; depth/shadow samplers get 4,5,6.. So we can reproduce the
+                     * exact register by replaying that counter scheme. This is correct by
+                     * construction and replaces the fragile "reflection index + 4" guess. */
+                    int regular_reg = 0;
+                    int shadow_reg = 4;
                     for (int s = 0; s < shader->sampler_count; s++) {
                         strncpy(shader->sampler_names[s], frag_reflect.textures[s].name,
                                 sizeof(shader->sampler_names[s]) - 1);
-                        shader->sampler_is_depth[s] = frag_reflect.textures[s].is_depth ? 1 : 0;
+                        int is_depth = frag_reflect.textures[s].is_depth ? 1 : 0;
+                        shader->sampler_is_depth[s] = is_depth;
+                        shader->sampler_hlsl_reg[s] = is_depth ? shadow_reg++ : regular_reg++;
                     }
                     vio_reflect_free(&frag_reflect);
                 }
@@ -2286,6 +2297,16 @@ ZEND_FUNCTION(vio_pipeline)
     /* Store backend shader reference for lazy pipeline creation */
     pipe->backend_shader = shader->backend_shader;
     pipe->shader_ref = shader;
+
+    /* Hold a strong reference to the VioShader zend_object so the pipeline keeps
+     * its shader alive. vio_bind_pipeline assigns shader_ref to
+     * ctx->bound_shader_object, which vio_set_uniform / vio_draw later
+     * dereference; if the only PHP owner of the VioShader was a local that fell
+     * out of scope after vio_pipeline() returned, the object would be freed and
+     * those dereferences would walk freed memory (observed as a 0xC0000005 in
+     * the shadow-debug pass, whose shader was an unstored local). */
+    pipe->shader_obj = Z_OBJ_P(shader_zval);
+    GC_ADDREF(pipe->shader_obj);
 
     /* Create backend pipeline (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0 &&
@@ -2542,22 +2563,32 @@ ZEND_FUNCTION(vio_bind_texture)
         tex->backend_texture && ctx->backend->bind_texture) {
         int hlsl_slot = (int)slot;
         int shader_wants_depth = 0;
+        int sampler_idx = -1;
         /* Remap GL texture unit to HLSL register using sampler map */
         if (ctx->bound_shader_object) {
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
             if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
-                int sampler_idx = sh->gl_to_hlsl_sampler[slot];
+                sampler_idx = sh->gl_to_hlsl_sampler[slot];
                 hlsl_slot = sampler_idx;
                 if (sampler_idx >= 0 && sampler_idx < sh->sampler_count) {
                     shader_wants_depth = sh->sampler_is_depth[sampler_idx];
                 }
             }
         }
-        /* D3D12: depth/shadow samplers are remapped to registers 4+ by SPIRV-Cross.
-         * The reflection-based hlsl_slot doesn't account for this, so add the offset. */
+        /* D3D12: use the EXACT t-register the cross-compiler assigned to this
+         * sampler (sampler_hlsl_reg). Regular samplers land at 0,1,2..; depth/
+         * shadow samplers at 4,5,6.. The previous code used the reflection list
+         * index + a flat "+4" for depth samplers, which over-shot to slots >= 8
+         * (past the table) whenever regular textures preceded the shadow samplers
+         * in the reflection list — silently dropping the CSM cascades on D3D12.
+         * Using the recomputed register removes both the guesswork and the +4. */
 #ifdef HAVE_D3D12
-        if (strcmp(ctx->backend->name, "d3d12") == 0 && shader_wants_depth) {
-            hlsl_slot += 4;
+        if (strcmp(ctx->backend->name, "d3d12") == 0 && sampler_idx >= 0 &&
+            ctx->bound_shader_object) {
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            if (sampler_idx < sh->sampler_count) {
+                hlsl_slot = sh->sampler_hlsl_reg[sampler_idx];
+            }
         }
 #endif
 
@@ -6212,6 +6243,30 @@ ZEND_FUNCTION(vio_render_target)
  * from vio_begin(). */
 static void d3d12_record_bind_render_target(vio_render_target_object *rt)
 {
+    /* Barrier: transition the OUTGOING render target's depth back to a samplable
+     * state before we bind the new one. Without this, only the final
+     * vio_unbind_render_target transitions one target (the last-bound) to
+     * PIXEL_SHADER_RESOURCE — so when the engine renders multiple depth-only
+     * targets in sequence (e.g. the CSM cascade loop binds cascade 0, 1, 2 in
+     * turn with a single unbind afterwards), cascades 0 and 1 are left in
+     * DEPTH_WRITE and read back as NULL/garbage when the mesh pass samples them.
+     * Moving the DEPTH_WRITE->PIXEL_SHADER_RESOURCE transition here makes every
+     * previously-bound depth target samplable as soon as a new one is bound,
+     * regardless of how many targets the engine cycles through per unbind. */
+    if (vio_d3d12.current_bound_rt && vio_d3d12.current_bound_rt != rt) {
+        vio_render_target_object *prev = (vio_render_target_object *)vio_d3d12.current_bound_rt;
+        if (prev->d3d12_depth_resource && prev->depth_only && !prev->d3d12_depth_is_srv) {
+            D3D12_RESOURCE_BARRIER barrier = {0};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = (ID3D12Resource *)prev->d3d12_depth_resource;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+            prev->d3d12_depth_is_srv = 1;
+        }
+    }
+
     /* Barrier: if color resource was used as SRV, transition back to RENDER_TARGET */
     if (rt->d3d12_color_resource && rt->d3d12_color_is_srv) {
         D3D12_RESOURCE_BARRIER barrier = {0};
@@ -6508,8 +6563,10 @@ ZEND_FUNCTION(vio_unbind_render_target)
         /* Barrier: transition shadow map depth from DEPTH_WRITE → SRV for sampling */
         if (vio_d3d12.current_bound_rt) {
             vio_render_target_object *bound_rt = (vio_render_target_object *)vio_d3d12.current_bound_rt;
-            /* Transition depth to SRV if depth-only target */
-            if (bound_rt->d3d12_depth_resource && bound_rt->depth_only) {
+            /* Transition depth to SRV if depth-only target (skip if a subsequent
+             * bind already moved it to PIXEL_SHADER_RESOURCE — see the outgoing-RT
+             * transition in d3d12_record_bind_render_target). */
+            if (bound_rt->d3d12_depth_resource && bound_rt->depth_only && !bound_rt->d3d12_depth_is_srv) {
                 D3D12_RESOURCE_BARRIER barrier = {0};
                 barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                 barrier.Transition.pResource = (ID3D12Resource *)bound_rt->d3d12_depth_resource;

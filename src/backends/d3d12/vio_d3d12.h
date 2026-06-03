@@ -16,6 +16,14 @@
 #define VIO_D3D12_FRAME_COUNT 2
 #define VIO_D3D12_MAX_SRV_DESCRIPTORS 32768
 
+/* Size of the per-draw SRV descriptor table (root param [2], registers t0..tN-1).
+ * Must cover the highest texture register any shader binds. The mesh shader uses
+ * t0 (albedo) plus four sampler2DShadow at t4..t7 (SPIRV-Cross assigns depth
+ * samplers starting at register 4 — see vio_shader_reflect.c). Sized to 16 to
+ * leave headroom for shaders that combine several regular textures with the
+ * shadow registers, so no shadow SRV is ever dropped at bind time. */
+#define VIO_D3D12_SRV_TABLE_SIZE 16
+
 /* Compiled shader pair (vertex + pixel) */
 typedef struct _vio_d3d12_shader {
     ID3DBlob *vs_blob;
@@ -121,8 +129,8 @@ typedef struct _vio_d3d12_state {
                              * by vio_begin once the frame's command list is open. */
 
     /* Pending texture bindings (flushed before each draw into a contiguous SRV block) */
-    D3D12_CPU_DESCRIPTOR_HANDLE pending_srvs[8]; /* CPU handles of bound textures */
-    int                          pending_srv_valid[8]; /* 1 if slot has a texture */
+    D3D12_CPU_DESCRIPTOR_HANDLE pending_srvs[VIO_D3D12_SRV_TABLE_SIZE]; /* CPU handles of bound textures */
+    int                          pending_srv_valid[VIO_D3D12_SRV_TABLE_SIZE]; /* 1 if slot has a texture */
 
     /* Per-frame linear SRV descriptor allocator (contiguous blocks for descriptor tables).
      *

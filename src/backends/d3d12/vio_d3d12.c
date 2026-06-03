@@ -205,7 +205,7 @@ static int d3d12_create_root_signature(void)
      * Root signature layout:
      *   [0] CBV (b0) — vertex stage constants (model, view, projection, etc.)
      *   [1] CBV (b0) — pixel stage constants (lights, material, etc.)
-     *   [2] Descriptor table: SRV (t0..t8) — textures
+     *   [2] Descriptor table: SRV (t0..t15) — textures (regular t0-t3, shadow t4-t7)
      *   Static samplers: s0 (linear wrap), s1 (comparison for shadow)
      *
      * VS and PS each have their own cbuffer at b0 (different data, same register).
@@ -225,10 +225,13 @@ static int d3d12_create_root_signature(void)
     params[1].Descriptor.RegisterSpace = 0;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    /* [2] SRV table t0-t7 (regular textures at t0-t3, shadow at t4-t7) */
+    /* [2] SRV table t0..t(N-1). Regular textures occupy t0-t3, shadow/depth
+     * samplers t4-t7 (SPIRV-Cross assigns depth samplers from register 4 — see
+     * vio_shader_reflect.c). Sized to VIO_D3D12_SRV_TABLE_SIZE so high shadow
+     * registers are always covered by the table and never dropped at bind. */
     D3D12_DESCRIPTOR_RANGE srv_range = {0};
     srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srv_range.NumDescriptors = 8; /* t0-t7 */
+    srv_range.NumDescriptors = VIO_D3D12_SRV_TABLE_SIZE;
     srv_range.BaseShaderRegister = 0;
     srv_range.RegisterSpace = 0;
     srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1776,7 +1779,7 @@ static void d3d12_set_uniform(const char *name, const void *data, int count, int
 
 static void d3d12_bind_texture(void *texture, int slot)
 {
-    if (!texture || slot < 0 || slot >= 8) return;
+    if (!texture || slot < 0 || slot >= VIO_D3D12_SRV_TABLE_SIZE) return;
     vio_d3d12_texture *tex = (vio_d3d12_texture *)texture;
 
     /* Store pending binding — flushed before draw via d3d12_flush_srv_table() */
@@ -1788,18 +1791,18 @@ static void d3d12_bind_texture(void *texture, int slot)
 void vio_d3d12_flush_srv_table(void)
 {
     int any_bound = 0;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
         if (vio_d3d12.pending_srv_valid[i]) { any_bound = 1; break; }
     }
     if (!any_bound) return; /* no textures — skip descriptor table binding entirely */
 
-    /* Allocate 8 contiguous descriptors from THIS frame's region of the SRV heap.
-     * Bound the check by the region end (not the full heap) so we can't bleed
-     * into another frame's slice. */
+    /* Allocate VIO_D3D12_SRV_TABLE_SIZE contiguous descriptors from THIS frame's
+     * region of the SRV heap. Bound the check by the region end (not the full
+     * heap) so we can't bleed into another frame's slice. */
     UINT base_idx = vio_d3d12.srv_frame_offset;
     UINT region_end = vio_d3d12.srv_frame_base + vio_d3d12.srv_frame_capacity;
-    if (base_idx + 8 > region_end) return; /* out of space in this frame's region */
-    vio_d3d12.srv_frame_offset += 8;
+    if (base_idx + VIO_D3D12_SRV_TABLE_SIZE > region_end) return; /* out of space in this frame's region */
+    vio_d3d12.srv_frame_offset += VIO_D3D12_SRV_TABLE_SIZE;
 
     D3D12_CPU_DESCRIPTOR_HANDLE dst_cpu;
     D3D12_GPU_DESCRIPTOR_HANDLE dst_gpu;
@@ -1808,8 +1811,8 @@ void vio_d3d12_flush_srv_table(void)
     dst_cpu.ptr += base_idx * vio_d3d12.srv_heap.descriptor_size;
     dst_gpu.ptr += base_idx * vio_d3d12.srv_heap.descriptor_size;
 
-    /* Create null SRV for all 8 slots first, then overwrite bound ones */
-    for (int i = 0; i < 8; i++) {
+    /* Create null SRV for all slots first, then overwrite bound ones */
+    for (int i = 0; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
         D3D12_CPU_DESCRIPTOR_HANDLE slot_cpu = dst_cpu;
         slot_cpu.ptr += i * vio_d3d12.srv_heap.descriptor_size;
 
@@ -1822,7 +1825,7 @@ void vio_d3d12_flush_srv_table(void)
     }
 
     /* Overwrite bound slots with actual texture SRVs */
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
         if (vio_d3d12.pending_srv_valid[i] && vio_d3d12.pending_srvs[i].ptr) {
             D3D12_CPU_DESCRIPTOR_HANDLE slot_cpu = dst_cpu;
             slot_cpu.ptr += i * vio_d3d12.srv_heap.descriptor_size;

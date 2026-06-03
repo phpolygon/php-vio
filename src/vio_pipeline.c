@@ -16,6 +16,7 @@ static zend_object *vio_pipeline_create_object(zend_class_entry *ce)
     vio_pipeline_object *pipe = zend_object_alloc(sizeof(vio_pipeline_object), ce);
 
     pipe->shader_program = 0;
+    pipe->shader_obj     = NULL;
     pipe->topology       = VIO_TRIANGLES;
     pipe->cull_mode      = VIO_CULL_NONE;
     pipe->depth_test     = 1;
@@ -31,7 +32,19 @@ static zend_object *vio_pipeline_create_object(zend_class_entry *ce)
 
 static void vio_pipeline_free_object(zend_object *obj)
 {
-    /* Pipeline does not own the shader program - VioShader does */
+    vio_pipeline_object *pipe = vio_pipeline_from_obj(obj);
+
+    /* Pipeline does not own the GL shader program (VioShader does), but it DOES
+     * hold a strong reference to the VioShader zend_object so that shader_ref /
+     * backend_shader stay valid for the pipeline's whole lifetime. Release it
+     * here; without this a pipeline whose only PHP-side owner is the pipeline
+     * itself (the shader created inline and not stored separately) would read a
+     * freed vio_shader_object on the next bind → access violation. */
+    if (pipe->shader_obj) {
+        zend_object_release(pipe->shader_obj);
+        pipe->shader_obj = NULL;
+    }
+
     zend_object_std_dtor(&obj[0]);
 }
 

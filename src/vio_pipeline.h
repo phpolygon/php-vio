@@ -17,6 +17,10 @@ typedef struct _vio_pipeline_object {
     void          *backend_pipeline; /* Backend-specific pipeline (D3D11/D3D12/Vulkan) */
     void          *backend_shader;   /* Backend shader ref (for pipeline creation) */
     void          *shader_ref;       /* vio_shader_object* (for uniform cbuffer) */
+    zend_object   *shader_obj;       /* strong ref to the VioShader zend_object so
+                                        shader_ref / backend_shader can't dangle if
+                                        the PHP VioShader goes out of scope while the
+                                        pipeline is still alive (the pipeline owns it) */
     vio_topology   topology;
     vio_cull_mode  cull_mode;
     int            depth_test;
