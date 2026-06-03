@@ -190,5 +190,13 @@ void vio_d3d12_flush_srv_table(void);
 /* Waits for GPU to finish all pending work */
 void vio_d3d12_wait_for_gpu(void);
 
+/* Capture the composited backbuffer at its true (current swapchain) resolution
+ * as top-down RGBA8. Works both mid-frame (in_frame==1: flushes the open frame
+ * command list, copies the buffer being drawn THIS frame, then re-opens the
+ * frame so vio_end can complete normally) and after Present (in_frame==0: reads
+ * the last presented buffer). On success returns a malloc'd buffer the caller
+ * must free() and writes *out_w/*out_h/*out_size; returns NULL on failure. */
+unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size);
+
 #endif /* HAVE_D3D12 */
 #endif /* VIO_D3D12_H */

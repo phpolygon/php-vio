@@ -4299,136 +4299,23 @@ ZEND_FUNCTION(vio_read_pixels)
 
 #ifdef HAVE_D3D12
     if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
-        /* Wait for any in-flight GPU work to complete. */
-        vio_d3d12_wait_for_gpu();
-
-        /* After Present(), frame_index has rotated to the NEXT backbuffer
-         * (whose contents are undefined with FLIP_DISCARD). We want the
-         * just-rendered frame — d3d12_present() stashes that index in
-         * last_presented_frame_idx. Before the very first Present, both
-         * indices are 0 so reading from frame_index is also correct. */
-        UINT read_idx = vio_d3d12.last_presented_frame_idx;
-        ID3D12Resource *src = vio_d3d12.frames[read_idx].render_target;
-        if (!src) {
-            php_error_docref(NULL, E_WARNING, "vio_read_pixels: no D3D12 render target");
+        /* vio_d3d12_capture_frame handles BOTH the mid-frame case (screenshot
+         * taken after vio_draw_3d but before vio_end — it flushes/re-opens the
+         * live frame command list and reads the buffer being drawn this frame)
+         * and the post-present case (reads the last presented buffer). Size is
+         * taken from the live swapchain resource, so it tracks window resize. */
+        int cap_w = 0, cap_h = 0;
+        size_t cap_size = 0;
+        unsigned char *pixels = vio_d3d12_capture_frame(&cap_w, &cap_h, &cap_size);
+        if (!pixels) {
+            php_error_docref(NULL, E_WARNING, "vio_read_pixels: D3D12 capture failed");
             RETURN_FALSE;
         }
 
-        D3D12_RESOURCE_DESC src_desc;
-        ID3D12Resource_GetDesc(src, &src_desc);
-        w = (int)src_desc.Width;
-        h = (int)src_desc.Height;
-
-        /* Get required layout of a readback copy */
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {0};
-        UINT num_rows = 0;
-        UINT64 row_size = 0, total_bytes = 0;
-        ID3D12Device_GetCopyableFootprints(vio_d3d12.device, &src_desc, 0, 1, 0,
-                                            &footprint, &num_rows, &row_size, &total_bytes);
-
-        /* Create readback buffer */
-        D3D12_HEAP_PROPERTIES hp = {0};
-        hp.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC rb_desc = {0};
-        rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rb_desc.Width = total_bytes;
-        rb_desc.Height = 1;
-        rb_desc.DepthOrArraySize = 1;
-        rb_desc.MipLevels = 1;
-        rb_desc.SampleDesc.Count = 1;
-        rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-        ID3D12Resource *readback = NULL;
-        HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp,
-            D3D12_HEAP_FLAG_NONE, &rb_desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-            &IID_ID3D12Resource, (void **)&readback);
-        if (FAILED(hr) || !readback) {
-            php_error_docref(NULL, E_WARNING,
-                "vio_read_pixels: Failed to create readback buffer (0x%08lx)", hr);
-            RETURN_FALSE;
-        }
-
-        /* Transient command allocator + list — don't interfere with frame cmd_list */
-        ID3D12CommandAllocator *alloc = NULL;
-        hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device,
-            D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc);
-        if (FAILED(hr)) {
-            ID3D12Resource_Release(readback);
-            RETURN_FALSE;
-        }
-
-        ID3D12GraphicsCommandList *list = NULL;
-        hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0,
-            D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
-            &IID_ID3D12GraphicsCommandList, (void **)&list);
-        if (FAILED(hr)) {
-            ID3D12CommandAllocator_Release(alloc);
-            ID3D12Resource_Release(readback);
-            RETURN_FALSE;
-        }
-
-        /* Transition RT: PRESENT -> COPY_SOURCE */
-        D3D12_RESOURCE_BARRIER barrier = {0};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = src;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
-
-        /* Copy RT into readback buffer using placed footprint */
-        D3D12_TEXTURE_COPY_LOCATION src_loc = {0};
-        src_loc.pResource = src;
-        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src_loc.SubresourceIndex = 0;
-
-        D3D12_TEXTURE_COPY_LOCATION dst_loc = {0};
-        dst_loc.pResource = readback;
-        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst_loc.PlacedFootprint = footprint;
-
-        ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst_loc, 0, 0, 0,
-                                                     &src_loc, NULL);
-
-        /* Transition back: COPY_SOURCE -> PRESENT */
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
-
-        ID3D12GraphicsCommandList_Close(list);
-        ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
-
-        /* Wait for copy to finish */
-        vio_d3d12_wait_for_gpu();
-
-        /* Map readback buffer and copy rows out (RowPitch may include padding) */
-        D3D12_RANGE read_range = {0, (SIZE_T)total_bytes};
-        void *mapped_ptr = NULL;
-        hr = ID3D12Resource_Map(readback, 0, &read_range, &mapped_ptr);
-        if (FAILED(hr) || !mapped_ptr) {
-            ID3D12GraphicsCommandList_Release(list);
-            ID3D12CommandAllocator_Release(alloc);
-            ID3D12Resource_Release(readback);
-            php_error_docref(NULL, E_WARNING, "vio_read_pixels: Failed to map readback buffer");
-            RETURN_FALSE;
-        }
-
-        size_t out_size = (size_t)w * h * 4;
-        zend_string *buf = zend_string_alloc(out_size, 0);
-        unsigned char *dst = (unsigned char *)ZSTR_VAL(buf);
-        const unsigned char *srcp = (const unsigned char *)mapped_ptr;
-        for (int y = 0; y < h; y++) {
-            memcpy(dst + (size_t)y * w * 4,
-                   srcp + (size_t)y * footprint.Footprint.RowPitch,
-                   (size_t)w * 4);
-        }
-        ZSTR_VAL(buf)[out_size] = '\0';
-
-        ID3D12Resource_Unmap(readback, 0, NULL);
-        ID3D12GraphicsCommandList_Release(list);
-        ID3D12CommandAllocator_Release(alloc);
-        ID3D12Resource_Release(readback);
+        zend_string *buf = zend_string_alloc(cap_size, 0);
+        memcpy(ZSTR_VAL(buf), pixels, cap_size);
+        ZSTR_VAL(buf)[cap_size] = '\0';
+        free(pixels);
 
         RETURN_NEW_STR(buf);
     }
@@ -4519,7 +4406,28 @@ ZEND_FUNCTION(vio_save_screenshot)
     }
 #endif
 
-#if defined(HAVE_D3D11) || defined(HAVE_D3D12) || defined(HAVE_VULKAN)
+#ifdef HAVE_D3D12
+    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+        /* Capture directly so we use the TRUE captured dimensions for the PNG.
+         * The generic delegation path below writes with ctx->config.width/height
+         * (the creation size, e.g. 1280x720) which mismatches the real, possibly
+         * window-resized backbuffer (e.g. 3840x1080) — that wrote a clipped,
+         * row-stride-shifted image. vio_d3d12_capture_frame returns top-down
+         * RGBA8 at the live resolution. */
+        int cap_w = 0, cap_h = 0;
+        size_t cap_size = 0;
+        unsigned char *pixels = vio_d3d12_capture_frame(&cap_w, &cap_h, &cap_size);
+        if (!pixels) {
+            php_error_docref(NULL, E_WARNING, "vio_save_screenshot: D3D12 capture failed");
+            RETURN_FALSE;
+        }
+        int ok = stbi_write_png(path, cap_w, cap_h, 4, pixels, cap_w * 4);
+        free(pixels);
+        RETURN_BOOL(ok);
+    }
+#endif
+
+#if defined(HAVE_D3D11) || defined(HAVE_VULKAN)
     {
         /* Fallback for backends whose readback lives in vio_read_pixels:
          * delegate to it and write PNG, avoiding duplicate readback logic.
@@ -4530,9 +4438,7 @@ ZEND_FUNCTION(vio_save_screenshot)
 #ifdef HAVE_D3D11
         if (strcmp(ctx->backend->name, "d3d11") == 0) is_delegated = 1;
 #endif
-#ifdef HAVE_D3D12
-        if (strcmp(ctx->backend->name, "d3d12") == 0) is_delegated = 1;
-#endif
+        /* D3D12 handled above with the live capture dimensions. */
 #ifdef HAVE_VULKAN
         if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) is_delegated = 1;
 #endif

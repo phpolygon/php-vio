@@ -1677,6 +1677,198 @@ static void d3d12_present(void)
     vio_d3d12.frame_index = IDXGISwapChain3_GetCurrentBackBufferIndex(vio_d3d12.swapchain);
 }
 
+/* ── Frame capture (readback) ─────────────────────────────────────────
+ *
+ * vio_read_pixels' previous D3D12 path read frames[last_presented_frame_idx]
+ * and assumed it was in PRESENT state. That is only valid AFTER vio_end (the
+ * frame's command list is closed, executed and presented). The engine's
+ * shadow-debug screenshot, however, fires MID-FRAME (after vio_draw_3d, before
+ * vio_end): at that point the whole frame — 3D + shadow + 2D HUD — is still in
+ * ONE open, un-executed command list, the buffer being drawn is frames[
+ * frame_index] in RENDER_TARGET state, and last_presented_frame_idx points at
+ * the PREVIOUS frame's buffer (often still at the pre-resize creation size).
+ * That mismatch produced the "1280x720, white, no 3D scene" capture.
+ *
+ * This helper captures the correct buffer in BOTH states:
+ *  - in_frame: flush the live command list so this frame's draws land on the
+ *    GPU, copy frames[frame_index] (RENDER_TARGET) into a readback buffer, then
+ *    re-Reset and re-arm the frame command list so vio_end/d3d12_end_frame can
+ *    close→PRESENT→Present it normally.
+ *  - !in_frame: copy frames[last_presented_frame_idx] (PRESENT) as before.
+ * Size is taken from the source resource desc, so it always tracks the live
+ * (resized) swapchain dimensions.
+ */
+unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
+{
+    if (!vio_d3d12.initialized || !vio_d3d12.device) return NULL;
+
+    int mid_frame = vio_d3d12.in_frame;
+    UINT read_idx = mid_frame ? vio_d3d12.frame_index
+                              : vio_d3d12.last_presented_frame_idx;
+    vio_d3d12_frame *frame = &vio_d3d12.frames[read_idx];
+    ID3D12Resource *src = frame->render_target;
+    if (!src) return NULL;
+
+    /* The source's current resource state: a buffer being drawn this frame is
+     * RENDER_TARGET; a presented buffer is PRESENT. We transition to/from this
+     * known state so the runtime/GPU-based-validation stays happy. */
+    D3D12_RESOURCE_STATES src_state = mid_frame
+        ? D3D12_RESOURCE_STATE_RENDER_TARGET
+        : D3D12_RESOURCE_STATE_PRESENT;
+
+    D3D12_RESOURCE_DESC src_desc;
+    ID3D12Resource_GetDesc(src, &src_desc);
+    int w = (int)src_desc.Width;
+    int h = (int)src_desc.Height;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {0};
+    UINT num_rows = 0;
+    UINT64 row_size = 0, total_bytes = 0;
+    ID3D12Device_GetCopyableFootprints(vio_d3d12.device, &src_desc, 0, 1, 0,
+                                        &footprint, &num_rows, &row_size, &total_bytes);
+
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rb_desc = {0};
+    rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rb_desc.Width = total_bytes;
+    rb_desc.Height = 1;
+    rb_desc.DepthOrArraySize = 1;
+    rb_desc.MipLevels = 1;
+    rb_desc.SampleDesc.Count = 1;
+    rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource *readback = NULL;
+    HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp,
+        D3D12_HEAP_FLAG_NONE, &rb_desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+        &IID_ID3D12Resource, (void **)&readback);
+    if (FAILED(hr) || !readback) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_d3d12_capture_frame: readback buffer create failed (0x%08lx)", hr);
+        return NULL;
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION src_loc = {0};
+    src_loc.pResource = src;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_loc.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst_loc = {0};
+    dst_loc.pResource = readback;
+    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst_loc.PlacedFootprint = footprint;
+
+    D3D12_RESOURCE_BARRIER barrier = {0};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = src;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    if (mid_frame) {
+        /* Record the copy into the LIVE, still-open frame command list, then
+         * close+execute it so the frame's draws-so-far are actually on the GPU
+         * before we read back. */
+        barrier.Transition.StateBefore = src_state;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+
+        ID3D12GraphicsCommandList_CopyTextureRegion(vio_d3d12.cmd_list,
+                                                     &dst_loc, 0, 0, 0, &src_loc, NULL);
+
+        /* Restore the source to RENDER_TARGET so the re-opened frame continues
+         * drawing into it and d3d12_end_frame's RENDER_TARGET->PRESENT is valid. */
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter  = src_state;
+        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+
+        ID3D12GraphicsCommandList_Close(vio_d3d12.cmd_list);
+        ID3D12CommandList *lists[] = { (ID3D12CommandList *)vio_d3d12.cmd_list };
+        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+
+        /* Wait for the copy (and all preceding frame work) to finish. */
+        vio_d3d12_wait_for_gpu();
+
+        /* Re-open the frame command list so subsequent draws + vio_end work.
+         * Safe to Reset the allocator: we just waited for the GPU to drain it.
+         * Re-arm render target binding + viewport/scissor exactly as
+         * d3d12_begin_frame did; the RT is already in RENDER_TARGET state (we
+         * transitioned it back above) so no entry barrier is needed here. */
+        ID3D12CommandAllocator_Reset(frame->cmd_allocator);
+        ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
+        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1,
+            &vio_d3d12.current_rtv, FALSE, &vio_d3d12.current_dsv);
+        D3D12_VIEWPORT vp = {0, 0, (float)vio_d3d12.width, (float)vio_d3d12.height, 0.0f, 1.0f};
+        ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, 1, &vp);
+        D3D12_RECT sc = {0, 0, vio_d3d12.width, vio_d3d12.height};
+        ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &sc);
+    } else {
+        /* Post-present: use a transient command list so we don't disturb the
+         * frame's own list (which is closed/idle at this point). */
+        ID3D12CommandAllocator *alloc = NULL;
+        hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device,
+            D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc);
+        if (FAILED(hr)) { ID3D12Resource_Release(readback); return NULL; }
+
+        ID3D12GraphicsCommandList *list = NULL;
+        hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+            &IID_ID3D12GraphicsCommandList, (void **)&list);
+        if (FAILED(hr)) {
+            ID3D12CommandAllocator_Release(alloc);
+            ID3D12Resource_Release(readback);
+            return NULL;
+        }
+
+        barrier.Transition.StateBefore = src_state;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst_loc, 0, 0, 0, &src_loc, NULL);
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter  = src_state;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+
+        ID3D12GraphicsCommandList_Close(list);
+        ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        vio_d3d12_wait_for_gpu();
+
+        ID3D12GraphicsCommandList_Release(list);
+        ID3D12CommandAllocator_Release(alloc);
+    }
+
+    /* Map readback and copy rows out (RowPitch may include alignment padding). */
+    D3D12_RANGE read_range = {0, (SIZE_T)total_bytes};
+    void *mapped_ptr = NULL;
+    hr = ID3D12Resource_Map(readback, 0, &read_range, &mapped_ptr);
+    if (FAILED(hr) || !mapped_ptr) {
+        ID3D12Resource_Release(readback);
+        php_error_docref(NULL, E_WARNING, "vio_d3d12_capture_frame: map failed");
+        return NULL;
+    }
+
+    size_t sz = (size_t)w * h * 4;
+    unsigned char *out = (unsigned char *)malloc(sz);
+    if (!out) {
+        ID3D12Resource_Unmap(readback, 0, NULL);
+        ID3D12Resource_Release(readback);
+        return NULL;
+    }
+    const unsigned char *srcp = (const unsigned char *)mapped_ptr;
+    for (int y = 0; y < h; y++) {
+        memcpy(out + (size_t)y * w * 4,
+               srcp + (size_t)y * footprint.Footprint.RowPitch,
+               (size_t)w * 4);
+    }
+
+    ID3D12Resource_Unmap(readback, 0, NULL);
+    ID3D12Resource_Release(readback);
+
+    if (out_w)    *out_w = w;
+    if (out_h)    *out_h = h;
+    if (out_size) *out_size = sz;
+    return out;
+}
+
 static void d3d12_clear(float r, float g, float b, float a)
 {
     float color[4] = {r, g, b, a};
