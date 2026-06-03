@@ -322,6 +322,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_audio.c \
     src/vio_recorder.c \
     src/vio_stream.c \
+    src/vio_thermal.c \
     src/vio_plugin_registry.c \
     src/vio_backend_null.c \
     src/backends/opengl/vio_opengl.c \
