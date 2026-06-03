@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Allow release.yml to gate the semantic-release publish step on the
+  # full platform matrix compiling cleanly. The release job inside this
+  # workflow is gated on refs/tags/* so workflow_call invocations only
+  # validate compilation - the upload happens on the post-tag invocation.
+  workflow_call:
 
 permissions:
   contents: write

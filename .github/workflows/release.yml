@@ -10,7 +10,17 @@ permissions:
   actions: write
 
 jobs:
+  # Validate the full platform matrix compiles before allowing semantic-release
+  # to publish. A broken Windows / macOS / Linux build now blocks the release
+  # tag from ever being created, so we never end up with a "released" version
+  # that has no working binaries (see the v1.18.0 incident where the missing
+  # config.w32 entry produced a release without a Windows .dll).
+  build:
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+
   release:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +49,10 @@ jobs:
             echo "new_release_published=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # The pre-release build only validated compilation. After the tag
+      # exists, re-run build.yml against that tag so its release job
+      # (gated on refs/tags/*) uploads the actual platform binaries to
+      # the freshly-created GitHub release.
       - name: Trigger build workflow
         if: steps.semantic.outputs.new_release_published == 'true'
         env:
