@@ -1,3 +1,10 @@
+# [1.18.0](https://github.com/phpolygon/php-vio/compare/v1.17.0...v1.18.0) (2026-06-03)
+
+
+### Features
+
+* vio_thermal_state() bridge for NSProcessInfo.thermalState ([6038380](https://github.com/phpolygon/php-vio/commit/6038380612fc5d703485038ab27f1ff0d0113605))
+
 # [1.17.0](https://github.com/phpolygon/php-vio/compare/v1.16.2...v1.17.0) (2026-05-25)
 
 
