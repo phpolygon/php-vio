@@ -200,6 +200,10 @@ if (PHP_VIO != "no") {
     // ole32/winmm needed by miniaudio
     CHECK_LIB("ole32.lib", "vio");
     CHECK_LIB("winmm.lib", "vio");
+    // oleaut32 (BSTR/VARIANT) + wbemuuid (WMI interface IIDs) for the WMI
+    // thermal-sensor read in vio_thermal.c (MSAcpi_ThermalZoneTemperature).
+    CHECK_LIB("oleaut32.lib", "vio");
+    CHECK_LIB("wbemuuid.lib", "vio");
 
     // ── Register extension ────────────────────────────────────────────
     EXTENSION("vio",
