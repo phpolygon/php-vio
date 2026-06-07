@@ -1,3 +1,10 @@
+# [1.19.0](https://github.com/phpolygon/php-vio/compare/v1.18.0...v1.19.0) (2026-06-07)
+
+
+### Features
+
+* cross-platform thermal sensing + D3D12 swapchain resize fix ([0c5d847](https://github.com/phpolygon/php-vio/commit/0c5d847e6f1fadd02d5867f9c4a4192c92dbab0b))
+
 # [1.18.0](https://github.com/phpolygon/php-vio/compare/v1.17.0...v1.18.0) (2026-06-03)
 
 
