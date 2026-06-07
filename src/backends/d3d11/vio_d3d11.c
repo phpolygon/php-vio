@@ -335,7 +335,10 @@ static void d3d11_destroy_surface(void *surface)
 
 static void d3d11_resize(int width, int height)
 {
-    if (!vio_d3d11.swapchain || (width == vio_d3d11.width && height == vio_d3d11.height)) {
+    /* Skip no-op resizes, missing swapchain, and minimised (0x0) windows —
+     * ResizeBuffers to a zero dimension fails. */
+    if (!vio_d3d11.swapchain || width <= 0 || height <= 0 ||
+        (width == vio_d3d11.width && height == vio_d3d11.height)) {
         return;
     }
 

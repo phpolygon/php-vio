@@ -797,12 +797,50 @@ static void d3d12_destroy_surface(void *surface)
 
 static void d3d12_resize(int width, int height)
 {
-    if (!vio_d3d12.swapchain || (width == vio_d3d12.width && height == vio_d3d12.height)) {
+    /* Skip if nothing to do, no swapchain yet, or the window is minimised
+     * (0x0). ResizeBuffers to a zero dimension fails, and a minimised window
+     * has no client area to draw to — keep the last valid swapchain size and
+     * pick the change up again when the window is restored. */
+    if (!vio_d3d12.swapchain || width <= 0 || height <= 0 ||
+        (width == vio_d3d12.width && height == vio_d3d12.height)) {
         return;
     }
 
-    /* GPU must be idle before resize */
+    /* The window is being resized live (maximise / fullscreen / drag), so the
+     * resize MUST NOT run while a frame's command list is open and recording
+     * into the soon-to-be-released backbuffer. Callers (vio_begin) invoke this
+     * before begin_frame(), i.e. while in_frame==0 and the command list is in
+     * the Closed state. Bail out defensively if that contract is violated. */
+    if (vio_d3d12.in_frame) {
+        php_error_docref(NULL, E_WARNING,
+            "D3D12: resize requested mid-frame; ignoring to avoid releasing a "
+            "backbuffer the open command list still references");
+        return;
+    }
+
+    /* GPU must be idle before we release any backbuffer references. */
     vio_d3d12_wait_for_gpu();
+
+    /* CRITICAL for FLIP_DISCARD swapchains: IDXGISwapChain::ResizeBuffers fails
+     * with DXGI_ERROR_INVALID_CALL if ANY outstanding reference to a backbuffer
+     * remains. d3d12_release_render_targets() drops our COM refs, but the
+     * command list recorded last frame (OMSetRenderTargets + the
+     * RENDER_TARGET->PRESENT barrier in end_frame) is Closed-but-not-Reset and
+     * still internally references frames[*].render_target. Reset it here against
+     * the current frame's allocator (safe now the GPU is idle) so those
+     * references are dropped. begin_frame() Resets it again next frame, so this
+     * leaves the list in the same Closed/clean state the rest of the code
+     * expects between frames.
+     *
+     * Without this, ResizeBuffers silently fails and the old (e.g. 16:9)
+     * backbuffer keeps being stretched onto the new (e.g. 32:9) client area —
+     * the exact maximise/fullscreen stretch this function exists to prevent. */
+    {
+        vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
+        ID3D12CommandAllocator_Reset(frame->cmd_allocator);
+        ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
+        ID3D12GraphicsCommandList_Close(vio_d3d12.cmd_list);
+    }
 
     d3d12_release_render_targets();
     if (vio_d3d12.depth_buffer) {
@@ -815,16 +853,37 @@ static void d3d12_resize(int width, int height)
                                                 width, height,
                                                 DXGI_FORMAT_R8G8B8A8_UNORM, 0);
     if (FAILED(hr)) {
-        php_error_docref(NULL, E_WARNING, "D3D12: Failed to resize buffers (0x%08lx)", hr);
+        HRESULT removed = ID3D12Device_GetDeviceRemovedReason(vio_d3d12.device);
+        php_error_docref(NULL, E_WARNING,
+            "D3D12: Failed to resize buffers to %dx%d (0x%08lx) device_removed=0x%08lx",
+            width, height, hr, removed);
+        d3d12_drain_info_queue("resize_fail");
+        /* Recreate RTVs/depth at the OLD size so the swapchain stays usable and
+         * the next frame doesn't draw into freed render targets. */
+        d3d12_create_render_targets();
+        d3d12_create_depth_buffer(vio_d3d12.width, vio_d3d12.height);
         return;
     }
 
     vio_d3d12.width = width;
     vio_d3d12.height = height;
     vio_d3d12.frame_index = IDXGISwapChain3_GetCurrentBackBufferIndex(vio_d3d12.swapchain);
+    vio_d3d12.last_presented_frame_idx = 0;
 
-    d3d12_create_render_targets();
-    d3d12_create_depth_buffer(width, height);
+    /* Cached backbuffer RTV/DSV handles and dimensions are now stale; the
+     * recreated handles below replace them, and begin_frame() rebinds them.
+     * Drop any cached "currently bound RT == backbuffer" tracking so the next
+     * frame transitions from the correct (recreated) resource. */
+    vio_d3d12.current_bound_rt = NULL;
+
+    if (d3d12_create_render_targets() != 0) {
+        php_error_docref(NULL, E_WARNING, "D3D12: failed to recreate render targets after resize");
+        return;
+    }
+    if (d3d12_create_depth_buffer(width, height) != 0) {
+        php_error_docref(NULL, E_WARNING, "D3D12: failed to recreate depth buffer after resize");
+        return;
+    }
 }
 
 /* ── Pipeline ─────────────────────────────────────────────────────── */
