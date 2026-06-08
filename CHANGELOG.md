@@ -1,3 +1,10 @@
+## [1.19.1](https://github.com/phpolygon/php-vio/compare/v1.19.0...v1.19.1) (2026-06-08)
+
+
+### Bug Fixes
+
+* **window:** exit real fullscreen on setWindowed and restore windowed geometry ([2368211](https://github.com/phpolygon/php-vio/commit/2368211eafc2513cd4302e15f8aea3d4acafe6da))
+
 # [1.19.0](https://github.com/phpolygon/php-vio/compare/v1.18.0...v1.19.0) (2026-06-07)
 
 
