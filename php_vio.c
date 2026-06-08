@@ -1221,6 +1221,16 @@ ZEND_FUNCTION(vio_set_borderless)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
 
+    /* Capture the current windowed rect (only when we're actually a normal
+     * window, not already fullscreen or maximized) so vio_set_windowed can
+     * return to it. */
+    if (glfwGetWindowMonitor(ctx->window) == NULL
+        && !glfwGetWindowAttrib(ctx->window, GLFW_MAXIMIZED)) {
+        glfwGetWindowPos(ctx->window, &ctx->saved_win_x, &ctx->saved_win_y);
+        glfwGetWindowSize(ctx->window, &ctx->saved_win_w, &ctx->saved_win_h);
+        ctx->has_saved_win_geometry = 1;
+    }
+
     glfwSetWindowAttrib(ctx->window, GLFW_DECORATED, GLFW_FALSE);
     glfwMaximizeWindow(ctx->window);
 #endif
@@ -1238,7 +1248,28 @@ ZEND_FUNCTION(vio_set_windowed)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
 
-    glfwRestoreWindow(ctx->window);
+    int rx = ctx->has_saved_win_geometry ? ctx->saved_win_x : 100;
+    int ry = ctx->has_saved_win_geometry ? ctx->saved_win_y : 100;
+    int rw = ctx->has_saved_win_geometry ? ctx->saved_win_w
+           : (ctx->config.width  > 0 ? ctx->config.width  : 1280);
+    int rh = ctx->has_saved_win_geometry ? ctx->saved_win_h
+           : (ctx->config.height > 0 ? ctx->config.height : 720);
+
+    if (glfwGetWindowMonitor(ctx->window) != NULL) {
+        /* Real (monitor) fullscreen — glfwRestoreWindow does NOT exit this.
+         * Detach the monitor to return to a windowed rect. Without this the
+         * window stays fullscreen and a follow-up glfwSetWindowSize merely
+         * switches the fullscreen video mode (the "back to windowed doesn't
+         * work" bug). */
+        glfwSetWindowMonitor(ctx->window, NULL, rx, ry, rw, rh, GLFW_DONT_CARE);
+    } else {
+        /* Borderless / maximized — un-maximize, then restore the saved rect. */
+        glfwRestoreWindow(ctx->window);
+        if (ctx->has_saved_win_geometry) {
+            glfwSetWindowSize(ctx->window, rw, rh);
+            glfwSetWindowPos(ctx->window, rx, ry);
+        }
+    }
     glfwSetWindowAttrib(ctx->window, GLFW_DECORATED, GLFW_TRUE);
 #endif
 }
@@ -1254,6 +1285,14 @@ ZEND_FUNCTION(vio_set_fullscreen)
 #ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
+
+    /* Capture the windowed rect before leaving it so the round-trip back to
+     * windowed lands at the same pos/size. */
+    if (glfwGetWindowMonitor(ctx->window) == NULL) {
+        glfwGetWindowPos(ctx->window, &ctx->saved_win_x, &ctx->saved_win_y);
+        glfwGetWindowSize(ctx->window, &ctx->saved_win_w, &ctx->saved_win_h);
+        ctx->has_saved_win_geometry = 1;
+    }
 
     GLFWmonitor *monitor = glfwGetPrimaryMonitor();
     const GLFWvidmode *mode = glfwGetVideoMode(monitor);

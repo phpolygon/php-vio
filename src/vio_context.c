@@ -24,6 +24,9 @@ static zend_object *vio_context_create_object(zend_class_entry *ce)
     memset(&ctx->state_2d, 0, sizeof(vio_2d_state));
     ctx->rt_stack_depth = 0;
     memset(ctx->rt_stack, 0, sizeof(ctx->rt_stack));
+    ctx->saved_win_x = ctx->saved_win_y = 0;
+    ctx->saved_win_w = ctx->saved_win_h = 0;
+    ctx->has_saved_win_geometry = 0;
 
     zend_object_std_init(&ctx->std, ce);
     object_properties_init(&ctx->std, ce);

@@ -40,6 +40,12 @@ typedef struct _vio_context_object {
      * limited and to bound memory. */
     void              *rt_stack[8];   /* zval * — kept opaque to avoid php.h here */
     int                rt_stack_depth;
+    /* Windowed-mode geometry captured before entering fullscreen/borderless so
+     * vio_set_windowed can restore the exact pos/size. glfwSetWindowMonitor()
+     * (real fullscreen) does not remember the prior windowed rect the way
+     * glfwRestoreWindow() does for a maximized window, so we track it here. */
+    int                saved_win_x, saved_win_y, saved_win_w, saved_win_h;
+    int                has_saved_win_geometry;
     zend_object        std;
 } vio_context_object;
 
