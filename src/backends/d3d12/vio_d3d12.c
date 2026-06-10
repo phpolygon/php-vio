@@ -49,6 +49,16 @@ static void d3d12_drain_info_queue(const char *context)
     ID3D12InfoQueue *iq = NULL;
     HRESULT hr = ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12InfoQueue, (void **)&iq);
     if (FAILED(hr) || !iq) {
+        /* One-shot note via the channel that actually surfaces (direct stderr),
+         * so "no messages" is never ambiguous: it means the debug layer / its
+         * InfoQueue is genuinely unavailable, not that the drain was skipped. */
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[d3d12] drain(%s): InfoQueue UNAVAILABLE (debug layer not active)\n",
+                    context ? context : "?");
+            fflush(stderr);
+        }
         return; /* debug layer not enabled */
     }
 
@@ -68,9 +78,13 @@ static void d3d12_drain_info_queue(const char *context)
                 case D3D12_MESSAGE_SEVERITY_INFO:       sev = "INFO";       break;
                 case D3D12_MESSAGE_SEVERITY_MESSAGE:    sev = "MESSAGE";    break;
             }
-            php_error_docref(NULL, E_WARNING, "D3D12[%s] [%s] id=%d: %s",
-                             context ? context : "?", sev, (int)msg->ID,
-                             msg->pDescription ? msg->pDescription : "");
+            /* Emit via DIRECT fprintf(stderr) — not php_error_docref — because the
+             * PHP error channel can be swallowed when called from inside a frame
+             * callback even with display_errors=stderr. fprintf reliably surfaces. */
+            fprintf(stderr, "D3D12[%s] [%s] id=%d: %s\n",
+                    context ? context : "?", sev, (int)msg->ID,
+                    msg->pDescription ? msg->pDescription : "");
+            fflush(stderr);
         }
         free(msg);
     }
@@ -402,7 +416,12 @@ static int d3d12_init(vio_config *cfg)
         if (SUCCEEDED(D3D12GetDebugInterface(&IID_ID3D12Debug, (void **)&debug_controller))) {
             ID3D12Debug_EnableDebugLayer(debug_controller);
             ID3D12Debug_Release(debug_controller);
+            fprintf(stderr, "[d3d12] debug layer: EnableDebugLayer OK\n");
+        } else {
+            fprintf(stderr, "[d3d12] debug layer: D3D12GetDebugInterface FAILED "
+                            "(Graphics Tools not registered / reboot needed?)\n");
         }
+        fflush(stderr);
         vio_d3d12.debug_enabled = 1;
     }
 
@@ -489,7 +508,11 @@ static int d3d12_init(vio_config *cfg)
              * list. No category/severity entries → only these exact IDs match. */
             ID3D12InfoQueue_AddStorageFilterEntries(iq, &filter);
             ID3D12InfoQueue_Release(iq);
+            fprintf(stderr, "[d3d12] InfoQueue available — validation messages will print to stderr\n");
+        } else {
+            fprintf(stderr, "[d3d12] InfoQueue UNAVAILABLE after device create — debug layer not live (reboot after Graphics Tools install?)\n");
         }
+        fflush(stderr);
     }
 
     /* Create command queue */

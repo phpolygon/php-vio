@@ -2382,6 +2382,25 @@ ZEND_FUNCTION(vio_pipeline)
             attrib_count = 1;
         }
 
+        /* Sort attributes by location ascending. The backend assigns each
+         * attribute's AlignedByteOffset incrementally in ARRAY order, which only
+         * matches the vertex buffer (attributes packed in increasing-location
+         * order) if the array is location-sorted. SPIRV-Cross does NOT guarantee
+         * reflection order == location order: e.g. postprocess.vert reflects
+         * a_uv(loc1) before a_position(loc0), producing offsets [uv@0, pos@8]
+         * instead of [pos@0, uv@12] — which fed a_position garbage and collapsed
+         * the fullscreen blit quad to a single point (black offscreen present,
+         * no FXAA/SSAO). Sorting here makes the offsets match the buffer. */
+        for (int a = 0; a < attrib_count - 1; a++) {
+            for (int b = 0; b < attrib_count - 1 - a; b++) {
+                if (layout[b].location > layout[b + 1].location) {
+                    vio_vertex_attrib tmp = layout[b];
+                    layout[b] = layout[b + 1];
+                    layout[b + 1] = tmp;
+                }
+            }
+        }
+
         vio_pipeline_desc desc = {0};
         desc.shader = shader->backend_shader;
         desc.vertex_layout = layout;
