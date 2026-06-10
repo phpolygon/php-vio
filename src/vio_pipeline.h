@@ -28,6 +28,10 @@ typedef struct _vio_pipeline_object {
     vio_blend_mode blend;
     float          depth_bias;
     float          slope_scaled_depth_bias;
+    int            hdr_output;        /* 1 => PSO output (RTV) format is FP16
+                                         (R16G16B16A16_FLOAT) to match an hdr=true
+                                         render target; 0 (default) => R8G8B8A8_UNORM.
+                                         D3D12-only this round; other backends ignore. */
     int            valid;
     zend_object    std;
 } vio_pipeline_object;

@@ -399,6 +399,9 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_save_screenshot, 0, 2, _IS_B
 	ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_gpu_info, 0, 0, MAY_BE_ARRAY|MAY_BE_FALSE)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_compare_images, 0, 2, MAY_BE_ARRAY|MAY_BE_FALSE)
 	ZEND_ARG_TYPE_INFO(0, reference, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO(0, current, IS_STRING, 0)
@@ -677,6 +680,7 @@ ZEND_FUNCTION(vio_inject_mouse_move);
 ZEND_FUNCTION(vio_inject_mouse_button);
 ZEND_FUNCTION(vio_read_pixels);
 ZEND_FUNCTION(vio_save_screenshot);
+ZEND_FUNCTION(vio_gpu_info);
 ZEND_FUNCTION(vio_compare_images);
 ZEND_FUNCTION(vio_save_diff_image);
 ZEND_FUNCTION(vio_gamepads);
@@ -795,6 +799,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_inject_mouse_button, arginfo_vio_inject_mouse_button)
 	ZEND_FE(vio_read_pixels, arginfo_vio_read_pixels)
 	ZEND_FE(vio_save_screenshot, arginfo_vio_save_screenshot)
+	ZEND_FE(vio_gpu_info, arginfo_vio_gpu_info)
 	ZEND_FE(vio_compare_images, arginfo_vio_compare_images)
 	ZEND_FE(vio_save_diff_image, arginfo_vio_save_diff_image)
 	ZEND_FE(vio_gamepads, arginfo_vio_gamepads)

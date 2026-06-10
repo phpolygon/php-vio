@@ -85,6 +85,13 @@ typedef struct _vio_d3d12_state {
     IDXGIFactory4             *factory;
     UINT                       frame_index;
 
+    /* Selected-adapter info, captured once at init from DXGI_ADAPTER_DESC1 of
+     * the adapter we actually created the device on. Read back by vio_gpu_info().
+     * gpu_name is UTF-8 (converted from the WCHAR Description); empty if unknown.
+     * vram_bytes = DedicatedVideoMemory; 0 if unknown (e.g. WARP/headless). */
+    char                       gpu_name[256];
+    uint64_t                   vram_bytes;
+
     /* Index of the most recently presented backbuffer. frame_index is
      * updated to the NEXT buffer right after Present(), so code paths
      * that want to read the just-rendered frame (vio_read_pixels) must

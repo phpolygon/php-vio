@@ -515,6 +515,23 @@ function vio_read_pixels(VioContext $context): string|false {}
 function vio_save_screenshot(VioContext $context, string $path): bool {}
 
 /**
+ * Query GPU and system memory information.
+ *
+ * Returns an associative array:
+ *   'name'       => string : GPU description (e.g. "NVIDIA GeForce RTX 3060"),
+ *                            '' if unknown (non-D3D12 backend, or not yet init).
+ *   'vram_bytes' => int    : dedicated video memory in bytes, 0 if unknown.
+ *   'ram_bytes'  => int    : total physical system RAM in bytes, 0 if unknown.
+ *
+ * GPU name/VRAM are only populated on the D3D12 backend after the device has
+ * been created (i.e. after a window/renderer exists). On every backend the
+ * 'ram_bytes' field is filled, so this call is useful everywhere.
+ *
+ * @return array|false false only on hard failure.
+ */
+function vio_gpu_info(): array|false {}
+
+/**
  * Compare two images pixel-by-pixel for visual regression testing.
  *
  * @param array|null $options ['threshold' => float] (0.0 = exact match, 1.0 = all different)

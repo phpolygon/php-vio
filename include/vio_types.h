@@ -219,6 +219,16 @@ typedef struct _vio_pipeline_desc {
     vio_blend_mode   blend;
     float            depth_bias;             /* constant depth bias (shadow mapping) */
     float            slope_scaled_depth_bias; /* slope-scaled bias (shadow mapping) */
+    int              hdr_output;             /* 1 => render-target output format is
+                                                FP16 (R16G16B16A16_FLOAT); 0 (default)
+                                                => R8G8B8A8_UNORM. A PSO's RTV format
+                                                must match the bound render target's
+                                                format on D3D12, so a pipeline drawing
+                                                into an hdr=true target must set this.
+                                                Honored by D3D12 only this round; the
+                                                other backends treat it as a no-op
+                                                (they derive the color format from the
+                                                bound target / render-pass instead). */
 } vio_pipeline_desc;
 
 typedef struct _vio_buffer_desc {

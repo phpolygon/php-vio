@@ -42,6 +42,13 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include <process.h>
 #endif
 
+/* Platform headers for vio_query_total_ram_bytes() (vio_gpu_info). */
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
+
 #include <string.h>
 #include <stdlib.h>
 
@@ -2332,6 +2339,14 @@ ZEND_FUNCTION(vio_pipeline)
     if ((val = zend_hash_str_find(config_ht, "slope_scaled_depth_bias", sizeof("slope_scaled_depth_bias") - 1)) != NULL) {
         pipe->slope_scaled_depth_bias = (float)zval_get_double(val);
     }
+    /* Optional 'hdr' flag: when true the PSO's render-target (RTV) format becomes
+     * FP16 (R16G16B16A16_FLOAT) instead of the default R8G8B8A8_UNORM. Needed when
+     * the pipeline draws into a vio_render_target created with 'hdr' => true, since
+     * D3D12 requires the PSO RTV format to match the bound target's format. Default
+     * 0 keeps every existing pipeline byte-for-byte at R8G8B8A8_UNORM. */
+    if ((val = zend_hash_str_find(config_ht, "hdr", sizeof("hdr") - 1)) != NULL) {
+        pipe->hdr_output = zend_is_true(val) ? 1 : 0;
+    }
 
     /* Store backend shader reference for lazy pipeline creation */
     pipe->backend_shader = shader->backend_shader;
@@ -2412,6 +2427,7 @@ ZEND_FUNCTION(vio_pipeline)
         desc.blend = pipe->blend;
         desc.depth_bias = pipe->depth_bias;
         desc.slope_scaled_depth_bias = pipe->slope_scaled_depth_bias;
+        desc.hdr_output = pipe->hdr_output;
 
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
     }
@@ -4523,6 +4539,66 @@ ZEND_FUNCTION(vio_save_screenshot)
 
     php_error_docref(NULL, E_WARNING, "vio_save_screenshot: unsupported backend");
     RETURN_FALSE;
+}
+
+/* ── GPU / system memory info ─────────────────────────────────────── */
+
+/* Total physical system RAM in bytes, backend-independent. Returns 0 if the
+ * platform query fails. Mirrors the per-OS ifdef structure used in
+ * src/vio_thermal.c (__APPLE__ / __linux__ / _WIN32). */
+static uint64_t vio_query_total_ram_bytes(void)
+{
+#if defined(_WIN32)
+    MEMORYSTATUSEX statex;
+    statex.dwLength = sizeof(statex);
+    if (GlobalMemoryStatusEx(&statex)) {
+        return (uint64_t)statex.ullTotalPhys;
+    }
+    return 0;
+#elif defined(__APPLE__)
+    uint64_t mem = 0;
+    size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0) {
+        return mem;
+    }
+    return 0;
+#elif defined(__linux__)
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page_size > 0) {
+        return (uint64_t)pages * (uint64_t)page_size;
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+ZEND_FUNCTION(vio_gpu_info)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    const char *gpu_name = "";
+    uint64_t    vram_bytes = 0;
+
+#ifdef HAVE_D3D12
+    /* GPU name + dedicated VRAM are only known on D3D12, and only once the
+     * device has been created at init (so the caller must invoke this after the
+     * window/renderer exists). Values were captured from the SELECTED adapter's
+     * DXGI_ADAPTER_DESC1 in d3d12_init. On other backends / before init they
+     * stay at the defaults above. */
+    if (vio_d3d12.initialized) {
+        gpu_name   = vio_d3d12.gpu_name;
+        vram_bytes = vio_d3d12.vram_bytes;
+    }
+#endif
+
+    uint64_t ram_bytes = vio_query_total_ram_bytes();
+
+    array_init(return_value);
+    add_assoc_string(return_value, "name", (char *)gpu_name);
+    add_assoc_long(return_value, "vram_bytes", (zend_long)vram_bytes);
+    add_assoc_long(return_value, "ram_bytes", (zend_long)ram_bytes);
 }
 
 /* ── Image comparison (VRT) ───────────────────────────────────────── */

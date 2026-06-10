@@ -470,6 +470,25 @@ static int d3d12_init(vio_config *cfg)
         goto init_fail;
     }
 
+    /* Capture the SELECTED adapter's description for vio_gpu_info(). This is the
+     * exact adapter we are about to create the device on, so we never need to
+     * re-enumerate later. Description is WCHAR[128]; convert to UTF-8. On WARP
+     * (headless) this still works but reports the software adapter name and a
+     * DedicatedVideoMemory of 0. */
+    {
+        DXGI_ADAPTER_DESC1 sel_desc;
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(adapter, &sel_desc))) {
+            vio_d3d12.vram_bytes = (uint64_t)sel_desc.DedicatedVideoMemory;
+            int n = WideCharToMultiByte(CP_UTF8, 0, sel_desc.Description, -1,
+                                        vio_d3d12.gpu_name, (int)sizeof(vio_d3d12.gpu_name),
+                                        NULL, NULL);
+            if (n <= 0) {
+                /* Conversion failed — leave name empty rather than garbage. */
+                vio_d3d12.gpu_name[0] = '\0';
+            }
+        }
+    }
+
     /* Create device */
     hr = D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0,
                             &IID_ID3D12Device, (void **)&vio_d3d12.device);
@@ -1010,9 +1029,16 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     /* Topology type */
     pso_desc.PrimitiveTopologyType = vio_topology_to_d3d12_type(desc->topology);
 
-    /* Render target format */
+    /* Render target format. Must match the format of the render target bound at
+     * draw time (D3D12 hard rule), else DrawIndexedInstanced is dropped with
+     * "render target format ... does not match that specified by the current
+     * pipeline state". Default is R8G8B8A8_UNORM (swapchain + every LDR offscreen
+     * target); desc->hdr_output selects R16G16B16A16_FLOAT to match a render
+     * target created with hdr=true (e.g. the SSAO G-buffer). */
     pso_desc.NumRenderTargets = 1;
-    pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pso_desc.RTVFormats[0] = desc->hdr_output
+        ? DXGI_FORMAT_R16G16B16A16_FLOAT
+        : DXGI_FORMAT_R8G8B8A8_UNORM;
 
     /* MSAA */
     pso_desc.SampleDesc.Count = 1;
