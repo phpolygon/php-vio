@@ -1,3 +1,10 @@
+# [1.20.0](https://github.com/phpolygon/php-vio/compare/v1.19.1...v1.20.0) (2026-06-10)
+
+
+### Features
+
+* **d3d12:** configurable RTV format + vio_gpu_info (GPU name/VRAM/RAM) ([400991c](https://github.com/phpolygon/php-vio/commit/400991c199ea603cad3606e9712c8ff283a2141f))
+
 ## [1.19.1](https://github.com/phpolygon/php-vio/compare/v1.19.0...v1.19.1) (2026-06-08)
 
 
