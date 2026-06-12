@@ -635,15 +635,22 @@ static int d3d12_init(vio_config *cfg)
 
     /* Per-frame linear cbuffer allocator: persistently mapped UPLOAD heap.
      * Each draw call allocates a 256-byte-aligned slice for its cbuffer data.
-     * Reset offset to 0 at begin_frame.
      *
-     * Sized generously (16MB) so the dynamic-grow path is rarely hit. Growing
-     * the heap mid-execution requires a full GPU sync (see d3d12_begin_frame)
-     * because root CBV lifetime is NOT tracked by the runtime — releasing
-     * the old heap while another frame in flight references it via GPU VA
-     * causes use-after-free flicker. */
+     * The heap is split into VIO_D3D12_FRAME_COUNT equal per-frame slices
+     * (begin_frame rebases the offset to this frame's slice). A single shared
+     * offset reset to 0 every frame would let frame N+1 overwrite the very
+     * addresses frame N's in-flight root CBVs still read — invisible while
+     * consecutive frames upload near-identical uniform sequences, but a sudden
+     * draw-count swing (look at the sky, look back down) shifts the layout and
+     * the overlap renders one frame of garbage lighting/transforms.
+     *
+     * Sized generously (32MB total = 16MB per slice at FRAME_COUNT 2) so the
+     * dynamic-grow path is rarely hit. Growing the heap mid-execution requires
+     * a full GPU sync (see d3d12_begin_frame) because root CBV lifetime is NOT
+     * tracked by the runtime — releasing the old heap while another frame in
+     * flight references it via GPU VA causes use-after-free flicker. */
     {
-        UINT heap_size = 16 * 1024 * 1024; /* 16MB — covers heavy 2D scenes */
+        UINT heap_size = 32 * 1024 * 1024; /* 32MB total, FRAME_COUNT slices */
         D3D12_HEAP_PROPERTIES hp = {0};
         hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC rd = {0};
@@ -657,6 +664,8 @@ static int d3d12_init(vio_config *cfg)
                 NULL, &IID_ID3D12Resource, (void **)&vio_d3d12.cbuffer_heap))) {
             vio_d3d12.cbuffer_heap_gpu = ID3D12Resource_GetGPUVirtualAddress(vio_d3d12.cbuffer_heap);
             vio_d3d12.cbuffer_heap_capacity = heap_size;
+            vio_d3d12.cbuffer_frame_base = 0;
+            vio_d3d12.cbuffer_frame_end = heap_size / VIO_D3D12_FRAME_COUNT;
             vio_d3d12.cbuffer_heap_offset = 0;
             /* Persistently map (never unmap — valid for UPLOAD heaps in D3D12) */
             D3D12_RANGE rr = {0, 0};
@@ -1582,8 +1591,10 @@ static void d3d12_begin_frame(void)
     vio_d3d12.current_rt_height = vio_d3d12.height;
     vio_d3d12.current_has_rtv = 1;
 
-    /* Grow cbuffer heap if last frame used >75% of capacity */
-    if (vio_d3d12.cbuffer_heap_offset > vio_d3d12.cbuffer_heap_capacity * 3 / 4) {
+    /* Grow cbuffer heap if last frame used >75% of its per-frame slice */
+    UINT cb_slice = vio_d3d12.cbuffer_heap_capacity / VIO_D3D12_FRAME_COUNT;
+    UINT cb_last_used = vio_d3d12.cbuffer_heap_offset - vio_d3d12.cbuffer_frame_base;
+    if (cb_last_used > cb_slice * 3 / 4) {
         UINT new_size = vio_d3d12.cbuffer_heap_capacity * 2;
         if (new_size > 256 * 1024 * 1024) new_size = 256 * 1024 * 1024; /* cap at 256MB */
 
@@ -1635,7 +1646,12 @@ static void d3d12_begin_frame(void)
      * (until the heap is genuinely full), so a texture created mid-frame
      * gets a high-index SRV that's outside every frame's per-frame slice
      * and is therefore safe from the null-init sweep in flush_srv_table. */
-    vio_d3d12.cbuffer_heap_offset = 0;
+    /* Rebase the cbuffer allocator into THIS frame's slice. The other frame
+     * in flight keeps reading its own slice — never overwritten from here. */
+    cb_slice = vio_d3d12.cbuffer_heap_capacity / VIO_D3D12_FRAME_COUNT;
+    vio_d3d12.cbuffer_frame_base = vio_d3d12.frame_index * cb_slice;
+    vio_d3d12.cbuffer_frame_end  = vio_d3d12.cbuffer_frame_base + cb_slice;
+    vio_d3d12.cbuffer_heap_offset = vio_d3d12.cbuffer_frame_base;
     UINT perframe_total = (vio_d3d12.srv_heap.capacity > vio_d3d12.srv_heap.count)
                            ? (vio_d3d12.srv_heap.capacity - vio_d3d12.srv_heap.count) : 0;
     vio_d3d12.srv_frame_capacity = perframe_total / VIO_D3D12_FRAME_COUNT;
@@ -2060,8 +2076,10 @@ static void d3d12_set_uniform(const char *name, const void *data, int count, int
 
     /* CBV must be 256-byte aligned */
     UINT aligned_size = (UINT)((data_size + 255) & ~255u);
-    if (vio_d3d12.cbuffer_heap_offset + aligned_size > vio_d3d12.cbuffer_heap_capacity) {
-        /* Frame ran out of cbuffer space — heap will grow at next begin_frame */
+    if (vio_d3d12.cbuffer_heap_offset + aligned_size > vio_d3d12.cbuffer_frame_end) {
+        /* This frame's slice ran out — heap will grow at next begin_frame.
+         * (Never spill past the slice: the bytes beyond it belong to the
+         * other in-flight frame.) */
         return;
     }
 

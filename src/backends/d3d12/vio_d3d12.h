@@ -153,12 +153,17 @@ typedef struct _vio_d3d12_state {
     UINT                       srv_frame_base;          /* base of THIS frame's region (recomputed each begin_frame) */
     UINT                       srv_frame_capacity;      /* descriptors per frame slot (recomputed each begin_frame) */
 
-    /* Per-frame linear cbuffer allocator (avoids overwriting between draw calls) */
+    /* Per-frame linear cbuffer allocator (avoids overwriting between draw calls).
+     * The heap is split into VIO_D3D12_FRAME_COUNT equal slices (like the SRV
+     * frame regions): frame N allocates ONLY inside its own slice, so the CPU
+     * never overwrites memory another in-flight frame still reads via root CBV. */
     ID3D12Resource            *cbuffer_heap;          /* large UPLOAD heap */
     D3D12_GPU_VIRTUAL_ADDRESS  cbuffer_heap_gpu;
     unsigned char             *cbuffer_heap_mapped;    /* persistently mapped */
     UINT                       cbuffer_heap_offset;    /* current allocation offset */
     UINT                       cbuffer_heap_capacity;  /* total size */
+    UINT                       cbuffer_frame_base;     /* base of THIS frame's slice */
+    UINT                       cbuffer_frame_end;      /* end of THIS frame's slice */
 
     /* Dummy identity instance buffer (bound to slot 1 for non-instanced draws) */
     ID3D12Resource            *identity_instance_buf;
