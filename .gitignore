@@ -70,3 +70,7 @@ tests/*.skip.php
 # OS
 .DS_Store
 Thumbs.db
+
+# Local build/diagnostic artifacts
+build_*.log
+x64/
