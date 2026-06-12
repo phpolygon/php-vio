@@ -1,3 +1,10 @@
+## [1.20.1](https://github.com/phpolygon/php-vio/compare/v1.20.0...v1.20.1) (2026-06-12)
+
+
+### Bug Fixes
+
+* **d3d12:** per-frame cbuffer heap race overwrote in-flight frame uniforms ([657cd23](https://github.com/phpolygon/php-vio/commit/657cd23db8e814baa25f647983cdc6ac2e3ef0a4))
+
 # [1.20.0](https://github.com/phpolygon/php-vio/compare/v1.19.1...v1.20.0) (2026-06-10)
 
 
