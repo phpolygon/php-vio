@@ -1,3 +1,10 @@
+# [1.21.0](https://github.com/phpolygon/php-vio/compare/v1.20.1...v1.21.0) (2026-06-15)
+
+
+### Features
+
+* **texture:** vio_texture_3d — 3D/volume textures across all backends ([#11](https://github.com/phpolygon/php-vio/issues/11)) ([4e234aa](https://github.com/phpolygon/php-vio/commit/4e234aa2d0d35dc6aac570b56806b1d27545e41d))
+
 ## [1.20.1](https://github.com/phpolygon/php-vio/compare/v1.20.0...v1.20.1) (2026-06-12)
 
 
