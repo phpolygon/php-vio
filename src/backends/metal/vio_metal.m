@@ -532,6 +532,38 @@ unsigned int vio_metal_create_texture_rgba(int width, int height,
     }
 }
 
+unsigned int vio_metal_create_texture_3d_rgba(int width, int height, int depth,
+    const unsigned char *pixels, int filter_linear, int wrap_clamp)
+{
+    (void)filter_linear; (void)wrap_clamp;  /* sampler state is separate in Metal */
+    @autoreleasepool {
+        if (!vio_mtl.initialized || !vio_mtl.device || width <= 0 || height <= 0 || depth <= 0) {
+            return 0;
+        }
+
+        MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+        desc.textureType = MTLTextureType3D;
+        desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+        desc.width  = width;
+        desc.height = height;
+        desc.depth  = depth;
+        desc.mipmapLevelCount = 1;
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModeShared;
+
+        id<MTLTexture> tex = [vio_mtl.device newTextureWithDescriptor:desc];
+        if (!tex) return 0;
+
+        MTLRegion region = MTLRegionMake3D(0, 0, 0, width, height, depth);
+        [tex replaceRegion:region mipmapLevel:0 slice:0
+               withBytes:pixels
+             bytesPerRow:width * 4
+           bytesPerImage:width * height * 4];
+
+        return metal_register_texture(tex);
+    }
+}
+
 unsigned int vio_metal_create_font_atlas(int width, int height,
     const unsigned char *bitmap)
 {
@@ -1166,6 +1198,10 @@ static int metal_supports_feature(vio_feature f)
         return 1;
     case VIO_FEATURE_TEXTURE_SWIZZLE:
         /* MTLTextureSwizzleChannels on the texture descriptor. */
+        return 1;
+    case VIO_FEATURE_TEXTURE_3D:
+        /* MTLTextureType3D creation works (vio_metal_create_texture_3d_rgba);
+         * sampling awaits the Metal 3D draw pipeline (VIO_FEATURE_3D_PIPELINE). */
         return 1;
     case VIO_FEATURE_RENDER_TARGET:
     case VIO_FEATURE_RENDER_TARGET_HDR:

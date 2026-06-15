@@ -503,6 +503,13 @@ static void opengl_bind_cubemap_id(unsigned int texture_id, int slot)
     glBindTexture(GL_TEXTURE_CUBE_MAP, texture_id);
 }
 
+static void opengl_bind_texture_3d_id(unsigned int texture_id, int slot)
+{
+    if (!vio_gl.initialized) return;
+    glActiveTexture(GL_TEXTURE0 + (GLenum)slot);
+    glBindTexture(GL_TEXTURE_3D, texture_id);
+}
+
 static void opengl_flush_draw_state(void)
 {
     if (!vio_gl.initialized) return;
@@ -661,6 +668,42 @@ static int opengl_upload_texture_2d(void *tex_obj,
     }
 
     glBindTexture(GL_TEXTURE_2D, 0);
+    return 0;
+}
+
+/* Upload an RGBA8 volume texture (Fieldtracing SDF). GL_TEXTURE_3D is core
+ * since GL 1.2, so this needs no extension guard on the 3.3+ floor. No mipmaps:
+ * the SDF trace samples a single LOD (coarse cones can be added later via an
+ * explicit mip parameter). */
+static int opengl_upload_texture_3d(void *tex_obj,
+                                    const void *pixels, int width, int height, int depth,
+                                    int channels, int filter, int wrap)
+{
+    (void)channels;  /* always RGBA8 */
+    vio_texture_object *tex = (vio_texture_object *)tex_obj;
+    if (!vio_gl.initialized) return -1;
+
+    glGenTextures(1, &tex->texture_id);
+    glBindTexture(GL_TEXTURE_3D, tex->texture_id);
+
+    GLint gl_wrap;
+    switch (wrap) {
+        case VIO_WRAP_CLAMP:  gl_wrap = GL_CLAMP_TO_EDGE; break;
+        case VIO_WRAP_MIRROR: gl_wrap = GL_MIRRORED_REPEAT; break;
+        default:              gl_wrap = GL_REPEAT; break;
+    }
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, gl_wrap);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, gl_wrap);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, gl_wrap);
+
+    GLint gl_filter = (filter == VIO_FILTER_NEAREST) ? GL_NEAREST : GL_LINEAR;
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, gl_filter);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, gl_filter);
+
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA, width, height, depth, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+    glBindTexture(GL_TEXTURE_3D, 0);
     return 0;
 }
 
@@ -863,6 +906,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_BUFFER_STORAGE: return vio_gl.caps.has_buffer_storage;
         case VIO_FEATURE_TEXTURE_STORAGE:return vio_gl.caps.has_texture_storage;
         case VIO_FEATURE_SEPARATE_SHADERS: return vio_gl.caps.has_separate_shaders;
+        case VIO_FEATURE_TEXTURE_3D:     return 1;  /* glTexImage3D core since GL 1.2 */
         default:                         return 0;
     }
 }
@@ -912,6 +956,8 @@ static const vio_backend opengl_backend = {
     .bind_pipeline_state   = opengl_bind_pipeline_state,
     .create_mesh           = opengl_create_mesh,
     .upload_texture_2d     = opengl_upload_texture_2d,
+    .upload_texture_3d     = opengl_upload_texture_3d,
+    .bind_texture_3d_id    = opengl_bind_texture_3d_id,
     .draw_mesh             = opengl_draw_mesh,
     .draw_mesh_instanced   = opengl_draw_mesh_instanced,
     .create_uniform_buffer = opengl_create_uniform_buffer,

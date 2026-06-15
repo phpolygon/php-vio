@@ -55,6 +55,7 @@ typedef struct _vio_d3d12_texture {
     D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu;
     int width;
     int height;
+    int depth;   /* > 0 for 3D / volume textures */
 } vio_d3d12_texture;
 
 /* Per-frame resources */
@@ -169,6 +170,23 @@ typedef struct _vio_d3d12_state {
     ID3D12Resource            *identity_instance_buf;
     D3D12_GPU_VIRTUAL_ADDRESS  identity_instance_gpu;
 
+    /* Per-frame linear instance-data allocator (vio_draw_instanced slot-1 VBV).
+     * Identical lifetime/sync semantics to the cbuffer heap above: a single
+     * shared static buffer let every instanced draw in a frame alias the SAME
+     * GPU VA, so at ExecuteCommandLists only the LAST-uploaded matrices survived
+     * (earlier district/terminal/particle batches rendered with the wrong
+     * instances -> invisible/displaced), and a mid-frame overflow Released the
+     * buffer out from under already-recorded draws -> GPU use-after-free ->
+     * intermittent DEVICE_REMOVED. Each draw now gets its own stable slice in
+     * THIS frame's region; the other in-flight frame reads its own region. */
+    ID3D12Resource            *instance_heap;          /* large UPLOAD heap */
+    D3D12_GPU_VIRTUAL_ADDRESS  instance_heap_gpu;
+    unsigned char             *instance_heap_mapped;    /* persistently mapped */
+    UINT                       instance_heap_offset;    /* current allocation offset */
+    UINT                       instance_heap_capacity;  /* total size */
+    UINT                       instance_frame_base;     /* base of THIS frame's slice */
+    UINT                       instance_frame_end;      /* end of THIS frame's slice */
+
     /* State */
     int   initialized;
     int   in_frame;     /* 1 between begin_frame() and end_frame(); cmd_list is
@@ -183,6 +201,10 @@ typedef struct _vio_d3d12_state {
 
     /* Debug */
     int   debug_enabled;
+    int   dred_enabled;   /* 1 if DRED auto-breadcrumbs/page-fault were FORCED_ON at init */
+    int   device_lost;    /* set once on first detected device-removed; gates all further
+                           * Present/record so we log the cause ONCE instead of spamming
+                           * "Present failed" every frame until the 64KB log fills up */
 
     /* Window reference */
     void *glfw_window;

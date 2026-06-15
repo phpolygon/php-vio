@@ -693,6 +693,76 @@ static void *d3d11_create_texture(vio_texture_desc *desc)
     return tex;
 }
 
+/* Create a 3D / volume texture (Fieldtracing SDF). Mirrors d3d11_create_texture
+ * but with a Texture3D resource + a TEXTURE3D SRV; the bind path (d3d11_bind_texture)
+ * is unchanged because it binds tex->srv / tex->sampler, which are dimension-agnostic. */
+static void *d3d11_create_texture_3d(vio_texture_desc *desc)
+{
+    if (desc->depth <= 0) return NULL;
+
+    vio_d3d11_texture *tex = calloc(1, sizeof(vio_d3d11_texture));
+    if (!tex) return NULL;
+
+    tex->width = desc->width;
+    tex->height = desc->height;
+    tex->depth = desc->depth;
+
+    D3D11_TEXTURE3D_DESC td = {0};
+    td.Width = desc->width;
+    td.Height = desc->height;
+    td.Depth = desc->depth;
+    td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA init_data = {0};
+    D3D11_SUBRESOURCE_DATA *init_ptr = NULL;
+    if (desc->data) {
+        init_data.pSysMem = desc->data;
+        init_data.SysMemPitch = (UINT)desc->width * 4;                       /* row pitch */
+        init_data.SysMemSlicePitch = (UINT)desc->width * (UINT)desc->height * 4; /* slice pitch */
+        init_ptr = &init_data;
+    }
+
+    HRESULT hr = ID3D11Device_CreateTexture3D(vio_d3d11.device, &td, init_ptr, &tex->texture3d);
+    if (FAILED(hr)) {
+        free(tex);
+        return NULL;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    srv_desc.Format = td.Format;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+    srv_desc.Texture3D.MipLevels = 1;
+
+    hr = ID3D11Device_CreateShaderResourceView(vio_d3d11.device,
+                                               (ID3D11Resource *)tex->texture3d,
+                                               &srv_desc, &tex->srv);
+    if (FAILED(hr)) {
+        ID3D11Texture3D_Release(tex->texture3d);
+        free(tex);
+        return NULL;
+    }
+
+    D3D11_SAMPLER_DESC sampler_desc = {0};
+    sampler_desc.Filter = (desc->filter == VIO_FILTER_NEAREST)
+        ? D3D11_FILTER_MIN_MAG_MIP_POINT
+        : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    D3D11_TEXTURE_ADDRESS_MODE am;
+    switch (desc->wrap) {
+        case VIO_WRAP_REPEAT: am = D3D11_TEXTURE_ADDRESS_WRAP; break;
+        case VIO_WRAP_MIRROR: am = D3D11_TEXTURE_ADDRESS_MIRROR; break;
+        default:              am = D3D11_TEXTURE_ADDRESS_CLAMP; break;
+    }
+    sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = am;
+    sampler_desc.MaxAnisotropy = 1;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &tex->sampler);
+
+    return tex;
+}
+
 static void d3d11_destroy_texture(void *texture_ptr)
 {
     vio_d3d11_texture *tex = (vio_d3d11_texture *)texture_ptr;
@@ -701,6 +771,7 @@ static void d3d11_destroy_texture(void *texture_ptr)
     if (tex->sampler_cmp) ID3D11SamplerState_Release(tex->sampler_cmp);
     if (tex->sampler) ID3D11SamplerState_Release(tex->sampler);
     if (tex->srv) ID3D11ShaderResourceView_Release(tex->srv);
+    if (tex->texture3d) ID3D11Texture3D_Release(tex->texture3d);
     if (tex->texture) ID3D11Texture2D_Release(tex->texture);
     free(tex);
 }
@@ -1140,6 +1211,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_SCISSOR:      return 1;
         case VIO_FEATURE_TEXTURE_SWIZZLE: return 0; /* needs CPU expansion */
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* vio_2d_d3d11_* */
+        case VIO_FEATURE_TEXTURE_3D:   return 1; /* ID3D11Texture3D */
         default:                       return 0;
     }
 }
@@ -1285,6 +1357,7 @@ static const vio_backend d3d11_backend = {
     .update_buffer     = d3d11_update_buffer,
     .destroy_buffer    = d3d11_destroy_buffer,
     .create_texture    = d3d11_create_texture,
+    .create_texture_3d = d3d11_create_texture_3d,
     .destroy_texture   = d3d11_destroy_texture,
     .compile_shader    = d3d11_compile_shader,
     .destroy_shader    = d3d11_destroy_shader,

@@ -116,6 +116,29 @@ typedef struct _vio_backend {
                                const void *pixels, int width, int height, int channels,
                                int filter, int wrap, int mipmaps);
 
+    /* Upload a 3D / volume RGBA8 texture (Fieldtracing SDF volume). OpenGL
+     * writes tex_obj->texture_id with a GL_TEXTURE_3D target. Backends that do
+     * not implement a 3D-texture path leave this NULL; vio_texture_3d then
+     * reports failure and VIO_FEATURE_TEXTURE_3D reads 0 (graceful fallback,
+     * same convention as the stubbed dispatch_compute slot). data is
+     * width*height*depth*4 bytes, Z-slices in ascending order. Returns 0 on
+     * success. */
+    int   (*upload_texture_3d)(void *tex_obj,
+                               const void *pixels, int width, int height, int depth,
+                               int channels, int filter, int wrap);
+
+    /* OpenGL-side bind of a 3D texture by raw GL handle (GL_TEXTURE_3D target).
+     * NULL on backends without a 3D-texture path. */
+    void  (*bind_texture_3d_id)(unsigned int texture_id, int slot);
+
+    /* Create a 3D / volume texture as an opaque backend handle (D3D11 / D3D12 /
+     * Vulkan / Metal). Mirrors create_texture(desc) but builds a 3D resource +
+     * a 3D shader-resource view, so the existing bind_texture(handle, slot) path
+     * binds it unchanged (the SRV / image-view encodes the dimension, so the
+     * shader samples it as a sampler3D). desc.depth must be > 0. OpenGL leaves
+     * this NULL and uses upload_texture_3d instead. Returns NULL on failure. */
+    void *(*create_texture_3d)(vio_texture_desc *desc);
+
     /* Draw a mesh with the currently bound pipeline. For OpenGL this binds
      * the mesh's VAO and issues glDrawArrays/glDrawElements; falls back to
      * the default shader when no pipeline is bound. D3D / Vulkan / Metal

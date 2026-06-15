@@ -87,6 +87,16 @@ unsigned int vio_metal_create_texture_rgba(int width, int height,
     const unsigned char *pixels, int filter_linear, int wrap_clamp);
 
 /*
+ * Create a 3D / volume RGBA8 texture (Fieldtracing SDF). pixels is
+ * width*height*depth*4 bytes, Z-slices ascending. Returns texture ID or 0.
+ * NOTE: the Metal 3D draw pipeline is still stubbed, so this texture cannot be
+ * sampled by a mesh shader yet — it is wired for forward-compatibility so the
+ * vio 3D-texture API is uniform across backends.
+ */
+unsigned int vio_metal_create_texture_3d_rgba(int width, int height, int depth,
+    const unsigned char *pixels, int filter_linear, int wrap_clamp);
+
+/*
  * Create a single-channel font atlas texture with swizzle (R -> alpha).
  * Returns texture ID or 0 on failure.
  */
