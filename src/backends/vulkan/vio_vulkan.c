@@ -995,18 +995,25 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
     if (!tex) return NULL;
     tex->width  = desc->width;
     tex->height = desc->height;
+    /* depth == 0 => ordinary 2D texture (unchanged path); > 0 => 3D / volume
+     * texture (Fieldtracing SDF). The only differences are the image type, the
+     * extent/copy depth and the view type — everything else is identical. */
+    const int vdepth = desc->depth > 0 ? desc->depth : 1;
+    const int is3d   = desc->depth > 0;
+    tex->depth = is3d ? vdepth : 0;
 
     const VkFormat   fmt = VK_FORMAT_R8G8B8A8_UNORM;
-    const VkDeviceSize img_bytes = (VkDeviceSize)desc->width * (VkDeviceSize)desc->height * 4u;
+    const VkDeviceSize img_bytes = (VkDeviceSize)desc->width * (VkDeviceSize)desc->height
+                                   * (VkDeviceSize)vdepth * 4u;
 
     /* 1. DEVICE_LOCAL sampled image. */
     VkImageCreateInfo img_info = {0};
     img_info.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    img_info.imageType     = VK_IMAGE_TYPE_2D;
+    img_info.imageType     = is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     img_info.format        = fmt;
     img_info.extent.width  = (uint32_t)desc->width;
     img_info.extent.height = (uint32_t)desc->height;
-    img_info.extent.depth  = 1;
+    img_info.extent.depth  = (uint32_t)vdepth;
     img_info.mipLevels     = 1;
     img_info.arrayLayers   = 1;
     img_info.samples       = VK_SAMPLE_COUNT_1_BIT;
@@ -1084,7 +1091,7 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
         copy.imageSubresource.layerCount = 1;
         copy.imageExtent.width  = (uint32_t)desc->width;
         copy.imageExtent.height = (uint32_t)desc->height;
-        copy.imageExtent.depth  = 1;
+        copy.imageExtent.depth  = (uint32_t)vdepth;
         vkCmdCopyBufferToImage(up_cmd, staging, tex->image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
@@ -1153,7 +1160,7 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
     VkImageViewCreateInfo iv = {0};
     iv.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     iv.image    = tex->image;
-    iv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    iv.viewType = is3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
     iv.format   = fmt;
     iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     iv.subresourceRange.levelCount = 1;
@@ -2471,6 +2478,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_SCISSOR:      return 1;
         case VIO_FEATURE_TEXTURE_SWIZZLE: return 1; /* VkComponentMapping */
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* Vulkan 2D path (shapes/sprites/text) */
+        case VIO_FEATURE_TEXTURE_3D:   return 1; /* VK_IMAGE_TYPE_3D */
         default: return 0;
     }
 }
@@ -2490,6 +2498,7 @@ static const vio_backend vulkan_backend = {
     .update_buffer     = vulkan_update_buffer,
     .destroy_buffer    = vulkan_destroy_buffer,
     .create_texture    = vulkan_create_texture,
+    .create_texture_3d = vulkan_create_texture,  /* depth-aware: desc->depth > 0 => 3D */
     .destroy_texture   = vulkan_destroy_texture,
     .compile_shader    = vulkan_compile_shader,
     .destroy_shader    = vulkan_destroy_shader,

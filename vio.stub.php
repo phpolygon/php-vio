@@ -396,6 +396,20 @@ function vio_bind_pipeline(VioContext $context, VioPipeline $pipeline): void {}
 function vio_texture(VioContext $context, array $config): VioTexture|false {}
 
 /**
+ * Create a 3D / volume texture from raw RGBA8 voxel data.
+ *
+ * Used by Fieldtracing to upload a baked Signed Distance Field volume. The data
+ * is width*height*depth*4 bytes, Z-slices in ascending order. All backends
+ * (OpenGL, D3D11, D3D12, Metal, Vulkan) report VIO_FEATURE_TEXTURE_3D and create
+ * one; a backend that ever lacks the upload path returns false. Bind it with
+ * vio_bind_texture() and sample it with a sampler3D.
+ *
+ * @param array $config ['data' => string, 'width' => int, 'height' => int, 'depth' => int], plus optional 'filter', 'wrap' (default CLAMP)
+ * @return VioTexture|false Texture object or false on failure / unsupported backend
+ */
+function vio_texture_3d(VioContext $context, array $config): VioTexture|false {}
+
+/**
  * Bind a texture to a texture slot.
  */
 function vio_bind_texture(VioContext $context, VioTexture $texture, int $slot = 0): void {}

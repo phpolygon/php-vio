@@ -19,6 +19,8 @@ typedef struct _vio_texture_object {
     void        *backend_texture; /* Backend texture (D3D11/D3D12/Vulkan) */
     int          width;
     int          height;
+    int          depth;         /* > 0 for 3D / volume textures (Fieldtracing SDF) */
+    int          is_3d;         /* 1 => bind via the GL_TEXTURE_3D path */
     int          channels;
     vio_filter   filter;
     vio_wrap     wrap;

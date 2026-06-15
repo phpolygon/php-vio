@@ -92,6 +92,183 @@ static void d3d12_drain_info_queue(const char *context)
     ID3D12InfoQueue_Release(iq);
 }
 
+/* Map a DRED auto-breadcrumb op enum to a short readable name. Covers the ops
+ * vio actually issues; anything else is printed by numeric value. */
+static const char *d3d12_dred_op_name(D3D12_AUTO_BREADCRUMB_OP op)
+{
+    switch (op) {
+        case D3D12_AUTO_BREADCRUMB_OP_SETMARKER:                 return "SetMarker";
+        case D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT:               return "BeginEvent";
+        case D3D12_AUTO_BREADCRUMB_OP_ENDEVENT:                 return "EndEvent";
+        case D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED:            return "DrawInstanced";
+        case D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED:     return "DrawIndexedInstanced";
+        case D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT:          return "ExecuteIndirect";
+        case D3D12_AUTO_BREADCRUMB_OP_DISPATCH:                 return "Dispatch";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION:         return "CopyBufferRegion";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION:        return "CopyTextureRegion";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE:             return "CopyResource";
+        case D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE:       return "ResolveSubresource";
+        case D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW:    return "ClearRenderTargetView";
+        case D3D12_AUTO_BREADCRUMB_OP_CLEARUNORDEREDACCESSVIEW: return "ClearUnorderedAccessView";
+        case D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW:    return "ClearDepthStencilView";
+        case D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER:          return "ResourceBarrier";
+        case D3D12_AUTO_BREADCRUMB_OP_EXECUTEBUNDLE:            return "ExecuteBundle";
+        case D3D12_AUTO_BREADCRUMB_OP_PRESENT:                  return "Present";
+        case D3D12_AUTO_BREADCRUMB_OP_DISPATCHRAYS:            return "DispatchRays";
+        default:                                                return "Op";
+    }
+}
+
+/* Dump DRED (Device Removed Extended Data) after a device-removed event:
+ * the GPU auto-breadcrumb history (last ops the GPU actually executed before
+ * it hung) and the page-fault VA (the address the GPU faulted on). This is the
+ * payload that tells us WHICH command/resource hung. Written via direct
+ * fprintf(stderr)+fflush so PHP notice-suppression can never swallow it.
+ *
+ * Safe to call even when DRED was not enabled or the device does not implement
+ * the interface — it just prints that DRED data is unavailable. */
+static void d3d12_dump_dred(const char *context)
+{
+    if (!vio_d3d12.device) return;
+
+    ID3D12DeviceRemovedExtendedData *dred = NULL;
+    HRESULT hr = ID3D12Device_QueryInterface(vio_d3d12.device,
+                     &IID_ID3D12DeviceRemovedExtendedData, (void **)&dred);
+    if (FAILED(hr) || !dred) {
+        fprintf(stderr, "D3D12-DRED[%s]: data UNAVAILABLE "
+                        "(DRED not enabled at init? set VIO_D3D12_DRED=1)\n",
+                context ? context : "?");
+        fflush(stderr);
+        return;
+    }
+
+    /* Auto-breadcrumbs: a linked list of command-list breadcrumb nodes, each
+     * with a ring of op markers. The LAST completed value vs the command count
+     * tells us where the GPU stopped — the first NOT-yet-completed op is the
+     * one that hung. */
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc = {0};
+    if (SUCCEEDED(ID3D12DeviceRemovedExtendedData_GetAutoBreadcrumbsOutput(dred, &bc))) {
+        const D3D12_AUTO_BREADCRUMB_NODE *node = bc.pHeadAutoBreadcrumbNode;
+        int node_idx = 0;
+        if (!node) {
+            fprintf(stderr, "D3D12-DRED[%s]: no breadcrumb nodes "
+                            "(GPU may not have started executing the failing list)\n",
+                    context ? context : "?");
+        }
+        while (node) {
+            UINT last_done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+            fprintf(stderr, "D3D12-DRED[%s]: breadcrumb node %d cmdlist='%ls' queue='%ls' "
+                            "ops=%u lastCompleted=%u%s\n",
+                    context ? context : "?", node_idx,
+                    node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"(unnamed)",
+                    node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"(unnamed)",
+                    node->BreadcrumbCount, last_done,
+                    (last_done < node->BreadcrumbCount) ? "  <-- HUNG HERE" : " (completed)");
+
+            /* Print a window of ops around the failure point so the dump stays
+             * readable: a few before lastCompleted through the first unfinished. */
+            UINT count = node->BreadcrumbCount;
+            UINT start = (last_done > 8) ? last_done - 8 : 0;
+            UINT end   = (last_done + 2 < count) ? last_done + 2 : count;
+            for (UINT i = start; i < end; i++) {
+                D3D12_AUTO_BREADCRUMB_OP op = node->pCommandHistory[i];
+                const char *mark = (i == last_done) ? "  >>> first NOT executed (suspected hang)"
+                                 : (i <  last_done) ? "      done"
+                                 :                    "      pending";
+                fprintf(stderr, "D3D12-DRED[%s]:     [%u] %s (op=%d)%s\n",
+                        context ? context : "?", i,
+                        d3d12_dred_op_name(op), (int)op, mark);
+            }
+            node = node->pNext;
+            node_idx++;
+            if (node_idx > 32) { /* guard against an unexpectedly long list */
+                fprintf(stderr, "D3D12-DRED[%s]: ... (more nodes truncated)\n",
+                        context ? context : "?");
+                break;
+            }
+        }
+    } else {
+        fprintf(stderr, "D3D12-DRED[%s]: GetAutoBreadcrumbsOutput failed\n",
+                context ? context : "?");
+    }
+
+    /* Page fault: the GPU virtual address the device faulted on, plus the lists
+     * of resource allocations (live and recently-freed) that occupied that VA.
+     * A VA that matches a RECENTLY-FREED allocation is the classic "used after
+     * free" — a resource released while still referenced by an in-flight list
+     * (exactly the root-CBV / RT-lifetime family of bugs). */
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf = {0};
+    if (SUCCEEDED(ID3D12DeviceRemovedExtendedData_GetPageFaultAllocationOutput(dred, &pf))) {
+        if (pf.PageFaultVA != 0) {
+            fprintf(stderr, "D3D12-DRED[%s]: PAGE FAULT VA = 0x%llx\n",
+                    context ? context : "?", (unsigned long long)pf.PageFaultVA);
+            const D3D12_DRED_ALLOCATION_NODE *an = pf.pHeadExistingAllocationNode;
+            int n = 0;
+            while (an && n < 32) {
+                fprintf(stderr, "D3D12-DRED[%s]:   existing alloc: '%ls' type=%d\n",
+                        context ? context : "?",
+                        an->ObjectNameW ? an->ObjectNameW : L"(unnamed)",
+                        (int)an->AllocationType);
+                an = an->pNext; n++;
+            }
+            an = pf.pHeadRecentFreedAllocationNode; n = 0;
+            while (an && n < 32) {
+                fprintf(stderr, "D3D12-DRED[%s]:   RECENTLY FREED alloc (use-after-free suspect): "
+                                "'%ls' type=%d\n",
+                        context ? context : "?",
+                        an->ObjectNameW ? an->ObjectNameW : L"(unnamed)",
+                        (int)an->AllocationType);
+                an = an->pNext; n++;
+            }
+        } else {
+            fprintf(stderr, "D3D12-DRED[%s]: no page fault recorded "
+                            "(hang was likely a long-running/infinite shader, not a bad VA)\n",
+                    context ? context : "?");
+        }
+    } else {
+        fprintf(stderr, "D3D12-DRED[%s]: GetPageFaultAllocationOutput failed\n",
+                context ? context : "?");
+    }
+
+    fflush(stderr);
+    ID3D12DeviceRemovedExtendedData_Release(dred);
+}
+
+/* Called from any path that detects a FAILED HRESULT which may be a device
+ * loss. Logs the removal reason + full DRED breadcrumbs/page-fault EXACTLY
+ * ONCE, then latches vio_d3d12.device_lost so subsequent frames stop trying to
+ * Present (which would just re-fail and spam the log until it fills up). */
+static void d3d12_handle_device_removed(const char *context, HRESULT present_hr)
+{
+    if (vio_d3d12.device_lost) return;   /* already reported once */
+    vio_d3d12.device_lost = 1;
+
+    HRESULT reason = vio_d3d12.device
+        ? ID3D12Device_GetDeviceRemovedReason(vio_d3d12.device)
+        : present_hr;
+
+    fprintf(stderr,
+        "\n==================== D3D12 DEVICE REMOVED ====================\n"
+        "D3D12[%s]: device removed. present_hr=0x%08lx GetDeviceRemovedReason=0x%08lx\n"
+        "  0x887A0006 = DXGI_ERROR_DEVICE_HUNG\n"
+        "  0x887A0005 = DXGI_ERROR_DEVICE_REMOVED\n"
+        "  0x887A0007 = DXGI_ERROR_DEVICE_RESET\n"
+        "  0x887A0020 = DXGI_ERROR_DRIVER_INTERNAL_ERROR\n",
+        context ? context : "?", (unsigned long)present_hr, (unsigned long)reason);
+    fflush(stderr);
+
+    /* Surface any pending validation messages first, then the DRED payload. */
+    d3d12_drain_info_queue(context);
+    d3d12_dump_dred(context);
+
+    fprintf(stderr,
+        "D3D12[%s]: rendering halted after first device-removal "
+        "(further Present calls suppressed to keep this log readable).\n"
+        "=============================================================\n\n",
+        context ? context : "?");
+    fflush(stderr);
+}
+
 /* Forward declarations */
 extern char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size,
                                 int shader_model, char **error_msg);
@@ -410,6 +587,45 @@ static int d3d12_init(vio_config *cfg)
 {
     HRESULT hr;
 
+    /* Enable DRED (Device Removed Extended Data) BEFORE device creation.
+     *
+     * DRED gives us, on a device-removed event, the GPU "auto-breadcrumbs"
+     * (the last render operations the GPU actually executed before it hung)
+     * and the page-fault virtual address (the resource the GPU faulted on).
+     * This is the only practical way to learn WHICH command/resource hung on
+     * an intermittent, non-reproducible DEVICE_HUNG in the field.
+     *
+     * Crucially, DRED does NOT require the debug layer or the "Graphics Tools"
+     * optional feature — ID3D12DeviceRemovedExtendedDataSettings is a
+     * pre-device global toggle that works on retail drivers. It does add a
+     * small per-command-list overhead (breadcrumb writes), so we only force it
+     * on when explicitly requested via the VIO_D3D12_DRED env var, OR whenever
+     * the debug layer is already on. Default: off (zero overhead). */
+    {
+        int dred_requested = 0;
+        const char *dred_env = getenv("VIO_D3D12_DRED");
+        if (dred_env && dred_env[0] && dred_env[0] != '0') dred_requested = 1;
+        if (cfg->debug) dred_requested = 1;
+
+        if (dred_requested) {
+            ID3D12DeviceRemovedExtendedDataSettings *dred_settings = NULL;
+            if (SUCCEEDED(D3D12GetDebugInterface(&IID_ID3D12DeviceRemovedExtendedDataSettings,
+                                                 (void **)&dred_settings)) && dred_settings) {
+                ID3D12DeviceRemovedExtendedDataSettings_SetAutoBreadcrumbsEnablement(
+                    dred_settings, D3D12_DRED_ENABLEMENT_FORCED_ON);
+                ID3D12DeviceRemovedExtendedDataSettings_SetPageFaultEnablement(
+                    dred_settings, D3D12_DRED_ENABLEMENT_FORCED_ON);
+                ID3D12DeviceRemovedExtendedDataSettings_Release(dred_settings);
+                vio_d3d12.dred_enabled = 1;
+                fprintf(stderr, "[d3d12] DRED: AutoBreadcrumbs + PageFault FORCED_ON\n");
+            } else {
+                fprintf(stderr, "[d3d12] DRED: settings interface UNAVAILABLE "
+                                "(very old SDK/OS?) — device-removed dumps will be reason-only\n");
+            }
+            fflush(stderr);
+        }
+    }
+
     /* Enable debug layer */
     if (cfg->debug) {
         ID3D12Debug *debug_controller = NULL;
@@ -673,6 +889,41 @@ static int d3d12_init(vio_config *cfg)
         }
     }
 
+    /* Per-frame linear instance-data allocator: persistently mapped UPLOAD heap.
+     * Mirrors the cbuffer heap exactly. Each vio_draw_instanced gets a 256-byte-
+     * aligned slice holding its mat4 instance array; vbvs[1] points at that
+     * slice's GPU VA. The heap is split into VIO_D3D12_FRAME_COUNT equal slices
+     * (begin_frame rebases the offset to this frame's slice) so the CPU never
+     * overwrites instance matrices another in-flight frame's command list still
+     * reads. Growing mid-execution requires a full GPU sync (see d3d12_begin_frame)
+     * because the slot-1 VBV references the heap via raw GPU VA, which the runtime
+     * does NOT track — releasing the old heap while a frame in flight reads it is
+     * use-after-free. Sized 32MB total = 16MB per slice at FRAME_COUNT 2:
+     * ~262k mat4 instances per frame before the grow path is hit. */
+    {
+        UINT heap_size = 32 * 1024 * 1024; /* 32MB total, FRAME_COUNT slices */
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = heap_size;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (SUCCEEDED(ID3D12Device_CreateCommittedResource(vio_d3d12.device,
+                &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                NULL, &IID_ID3D12Resource, (void **)&vio_d3d12.instance_heap))) {
+            vio_d3d12.instance_heap_gpu = ID3D12Resource_GetGPUVirtualAddress(vio_d3d12.instance_heap);
+            vio_d3d12.instance_heap_capacity = heap_size;
+            vio_d3d12.instance_frame_base = 0;
+            vio_d3d12.instance_frame_end = heap_size / VIO_D3D12_FRAME_COUNT;
+            vio_d3d12.instance_heap_offset = 0;
+            /* Persistently map (never unmap — valid for UPLOAD heaps in D3D12) */
+            D3D12_RANGE rr = {0, 0};
+            ID3D12Resource_Map(vio_d3d12.instance_heap, 0, &rr, (void **)&vio_d3d12.instance_heap_mapped);
+        }
+    }
+
     /* Identity instance buffer (single mat4 identity for non-instanced draws on slot 1) */
     {
         float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -722,6 +973,13 @@ static void d3d12_shutdown(void)
         ID3D12Resource_Release(vio_d3d12.cbuffer_heap);
         vio_d3d12.cbuffer_heap = NULL;
         vio_d3d12.cbuffer_heap_mapped = NULL;
+    }
+
+    if (vio_d3d12.instance_heap) {
+        ID3D12Resource_Unmap(vio_d3d12.instance_heap, 0, NULL);
+        ID3D12Resource_Release(vio_d3d12.instance_heap);
+        vio_d3d12.instance_heap = NULL;
+        vio_d3d12.instance_heap_mapped = NULL;
     }
 
     if (vio_d3d12.identity_instance_buf) {
@@ -1334,6 +1592,155 @@ static void *d3d12_create_texture(vio_texture_desc *desc)
     return tex;
 }
 
+/* Create a 3D / volume texture (Fieldtracing SDF). Mirrors d3d12_create_texture
+ * but with a TEXTURE3D resource, a per-slice upload copy (GetCopyableFootprints
+ * lays the subresource out as Depth slices of RowPitch*Height each), and a
+ * TEXTURE3D SRV. The bind path (d3d12_bind_texture) is unchanged — it binds the
+ * SRV descriptor, which is dimension-agnostic. */
+static void *d3d12_create_texture_3d(vio_texture_desc *desc)
+{
+    if (desc->depth <= 0) return NULL;
+
+    vio_d3d12_texture *tex = calloc(1, sizeof(vio_d3d12_texture));
+    if (!tex) return NULL;
+
+    tex->width = desc->width;
+    tex->height = desc->height;
+    tex->depth = desc->depth;
+
+    D3D12_HEAP_PROPERTIES heap_props = {0};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC res_desc = {0};
+    res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    res_desc.Width = desc->width;
+    res_desc.Height = desc->height;
+    res_desc.DepthOrArraySize = (UINT16)desc->depth;
+    res_desc.MipLevels = 1;
+    res_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    res_desc.SampleDesc.Count = 1;
+    res_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device,
+                                                       &heap_props,
+                                                       D3D12_HEAP_FLAG_NONE,
+                                                       &res_desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST,
+                                                       NULL,
+                                                       &IID_ID3D12Resource,
+                                                       (void **)&tex->resource);
+    if (FAILED(hr)) {
+        free(tex);
+        return NULL;
+    }
+
+    if (desc->data) {
+        UINT64 upload_size = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {0};
+        ID3D12Device_GetCopyableFootprints(vio_d3d12.device, &res_desc,
+                                            0, 1, 0, &footprint, NULL, NULL, &upload_size);
+
+        D3D12_HEAP_PROPERTIES upload_heap = {0};
+        upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        D3D12_RESOURCE_DESC upload_desc = {0};
+        upload_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        upload_desc.Width = upload_size;
+        upload_desc.Height = 1;
+        upload_desc.DepthOrArraySize = 1;
+        upload_desc.MipLevels = 1;
+        upload_desc.SampleDesc.Count = 1;
+        upload_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device,
+                                                   &upload_heap,
+                                                   D3D12_HEAP_FLAG_NONE,
+                                                   &upload_desc,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                   NULL,
+                                                   &IID_ID3D12Resource,
+                                                   (void **)&tex->upload_resource);
+        if (SUCCEEDED(hr)) {
+            void *mapped = NULL;
+            D3D12_RANGE read_range = {0, 0};
+            hr = ID3D12Resource_Map(tex->upload_resource, 0, &read_range, &mapped);
+            if (SUCCEEDED(hr)) {
+                const uint8_t *src = (const uint8_t *)desc->data;
+                uint8_t *dst = (uint8_t *)mapped + footprint.Offset;
+                UINT src_row_pitch   = (UINT)desc->width * 4;
+                UINT src_slice_pitch = src_row_pitch * (UINT)desc->height;
+                UINT dst_row_pitch   = footprint.Footprint.RowPitch;
+                UINT dst_slice_pitch = dst_row_pitch * (UINT)desc->height;
+                for (int z = 0; z < desc->depth; z++) {
+                    for (int row = 0; row < desc->height; row++) {
+                        memcpy(dst + (size_t)z * dst_slice_pitch + (size_t)row * dst_row_pitch,
+                               src + (size_t)z * src_slice_pitch + (size_t)row * src_row_pitch,
+                               src_row_pitch);
+                    }
+                }
+                ID3D12Resource_Unmap(tex->upload_resource, 0, NULL);
+            }
+
+            ID3D12CommandAllocator *upload_alloc = NULL;
+            ID3D12GraphicsCommandList *upload_cmd = NULL;
+
+            hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device,
+                D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator,
+                (void **)&upload_alloc);
+            if (SUCCEEDED(hr)) {
+                hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT, upload_alloc, NULL,
+                    &IID_ID3D12GraphicsCommandList, (void **)&upload_cmd);
+            }
+            if (SUCCEEDED(hr)) {
+                D3D12_TEXTURE_COPY_LOCATION dst_loc = {0};
+                dst_loc.pResource = tex->resource;
+                dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst_loc.SubresourceIndex = 0;
+
+                D3D12_TEXTURE_COPY_LOCATION src_loc = {0};
+                src_loc.pResource = tex->upload_resource;
+                src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src_loc.PlacedFootprint = footprint;   /* footprint covers all Depth slices */
+
+                ID3D12GraphicsCommandList_CopyTextureRegion(upload_cmd,
+                    &dst_loc, 0, 0, 0, &src_loc, NULL);
+
+                D3D12_RESOURCE_BARRIER barrier = {0};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = tex->resource;
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                ID3D12GraphicsCommandList_ResourceBarrier(upload_cmd, 1, &barrier);
+
+                ID3D12GraphicsCommandList_Close(upload_cmd);
+
+                ID3D12CommandList *lists[] = { (ID3D12CommandList *)upload_cmd };
+                ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+                vio_d3d12_wait_for_gpu();
+            }
+            if (upload_cmd) ID3D12GraphicsCommandList_Release(upload_cmd);
+            if (upload_alloc) ID3D12CommandAllocator_Release(upload_alloc);
+
+            ID3D12Resource_Release(tex->upload_resource);
+            tex->upload_resource = NULL;
+        }
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Texture3D.MipLevels = 1;
+
+    d3d12_alloc_srv_descriptor(&tex->srv_cpu, &tex->srv_gpu);
+    ID3D12Device_CreateShaderResourceView(vio_d3d12.device, tex->resource,
+                                           &srv_desc, tex->srv_cpu);
+
+    return tex;
+}
+
 static void d3d12_destroy_texture(void *texture_ptr)
 {
     vio_d3d12_texture *tex = (vio_d3d12_texture *)texture_ptr;
@@ -1553,6 +1960,22 @@ static void d3d12_begin_frame(void)
 {
     vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
 
+    /* If the device was already lost on a prior frame, do not touch the command
+     * list / allocator (Reset on a removed device fails and would re-crash).
+     * The loss was already logged once with full DRED context. */
+    if (vio_d3d12.device_lost) return;
+
+    /* A device can be lost asynchronously (TDR/hang) without a Present failing
+     * yet — catch it here too so the DRED dump fires from the actual frame that
+     * was in flight when the GPU hung, not one frame later. */
+    if (vio_d3d12.device) {
+        HRESULT dr = ID3D12Device_GetDeviceRemovedReason(vio_d3d12.device);
+        if (FAILED(dr)) {
+            d3d12_handle_device_removed("begin_frame", dr);
+            return;
+        }
+    }
+
     /* Drain any validation messages from the last frame so the warning that
      * actually killed the GPU (badly-formed command, resource-state mismatch
      * etc.) shows up next to the symptomatic crash rather than the Windows
@@ -1637,6 +2060,47 @@ static void d3d12_begin_frame(void)
         }
     }
 
+    /* Grow instance heap if last frame used >75% of its per-frame slice.
+     * Same sync discipline as the cbuffer grow above: the slot-1 VBV references
+     * this heap by raw GPU VA (untracked by the runtime), so the OTHER in-flight
+     * frame may still be reading the old heap. Full GPU sync BEFORE Release. */
+    {
+        UINT inst_slice = vio_d3d12.instance_heap_capacity / VIO_D3D12_FRAME_COUNT;
+        UINT inst_last_used = vio_d3d12.instance_heap_offset - vio_d3d12.instance_frame_base;
+        if (inst_slice > 0 && inst_last_used > inst_slice * 3 / 4) {
+            UINT new_size = vio_d3d12.instance_heap_capacity * 2;
+            if (new_size > 256 * 1024 * 1024) new_size = 256 * 1024 * 1024; /* cap at 256MB */
+
+            vio_d3d12_wait_for_gpu();
+
+            if (vio_d3d12.instance_heap) {
+                ID3D12Resource_Unmap(vio_d3d12.instance_heap, 0, NULL);
+                ID3D12Resource_Release(vio_d3d12.instance_heap);
+                vio_d3d12.instance_heap = NULL;
+                vio_d3d12.instance_heap_mapped = NULL;
+            }
+
+            D3D12_HEAP_PROPERTIES hp = {0};
+            hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC rd = {0};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = new_size;
+            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+            if (SUCCEEDED(ID3D12Device_CreateCommittedResource(vio_d3d12.device,
+                    &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                    NULL, &IID_ID3D12Resource, (void **)&vio_d3d12.instance_heap))) {
+                vio_d3d12.instance_heap_gpu = ID3D12Resource_GetGPUVirtualAddress(vio_d3d12.instance_heap);
+                vio_d3d12.instance_heap_capacity = new_size;
+                D3D12_RANGE rr = {0, 0};
+                ID3D12Resource_Map(vio_d3d12.instance_heap, 0, &rr, (void **)&vio_d3d12.instance_heap_mapped);
+                php_error_docref(NULL, E_NOTICE, "D3D12: instance heap grown to %u MB", new_size / (1024*1024));
+            }
+        }
+    }
+
     /* Reset per-frame allocators.
      *
      * Static SRVs occupy [capacity - srv_heap.count, capacity), growing
@@ -1652,6 +2116,11 @@ static void d3d12_begin_frame(void)
     vio_d3d12.cbuffer_frame_base = vio_d3d12.frame_index * cb_slice;
     vio_d3d12.cbuffer_frame_end  = vio_d3d12.cbuffer_frame_base + cb_slice;
     vio_d3d12.cbuffer_heap_offset = vio_d3d12.cbuffer_frame_base;
+    /* Rebase the instance allocator into THIS frame's slice (same as cbuffer). */
+    UINT inst_slice = vio_d3d12.instance_heap_capacity / VIO_D3D12_FRAME_COUNT;
+    vio_d3d12.instance_frame_base = vio_d3d12.frame_index * inst_slice;
+    vio_d3d12.instance_frame_end  = vio_d3d12.instance_frame_base + inst_slice;
+    vio_d3d12.instance_heap_offset = vio_d3d12.instance_frame_base;
     UINT perframe_total = (vio_d3d12.srv_heap.capacity > vio_d3d12.srv_heap.count)
                            ? (vio_d3d12.srv_heap.capacity - vio_d3d12.srv_heap.count) : 0;
     vio_d3d12.srv_frame_capacity = perframe_total / VIO_D3D12_FRAME_COUNT;
@@ -1673,6 +2142,12 @@ static void d3d12_begin_frame(void)
 
 static void d3d12_end_frame(void)
 {
+    /* begin_frame bailed (device lost, or it was never opened) — the command
+     * list is closed/stale, so there is nothing to transition, close or
+     * execute. Guarding here keeps a post-loss frame from recording onto a dead
+     * list. */
+    if (vio_d3d12.device_lost || !vio_d3d12.in_frame) return;
+
     vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
 
     /* Transition render target: RENDER_TARGET -> PRESENT */
@@ -1763,6 +2238,11 @@ static void d3d12_present(void)
 {
     if (!vio_d3d12.swapchain) return;
 
+    /* Once the device is lost, stop presenting entirely. The first loss already
+     * logged the reason + DRED breadcrumbs; continuing to Present would only
+     * re-fail every frame and bury that one useful dump under 64KB of spam. */
+    if (vio_d3d12.device_lost) return;
+
     /* Offscreen render target still bound at end-of-frame (warm-render /
      * render-to-texture): the frame's draws went to the offscreen target, not
      * the swapchain backbuffer. Presenting here would flip an undrawn
@@ -1781,10 +2261,10 @@ static void d3d12_present(void)
 
     HRESULT hr = IDXGISwapChain3_Present(vio_d3d12.swapchain, vio_d3d12.vsync ? 1 : 0, 0);
     if (FAILED(hr)) {
-        HRESULT removed = ID3D12Device_GetDeviceRemovedReason(vio_d3d12.device);
-        php_error_docref(NULL, E_WARNING, "D3D12: Present failed (0x%08lx) device_removed=0x%08lx",
-                         hr, removed);
-        d3d12_drain_info_queue("present_fail");
+        /* Log reason + DRED breadcrumbs/page-fault ONCE, then latch device_lost
+         * so we stop presenting (no per-frame spam). */
+        d3d12_handle_device_removed("present_fail", hr);
+        return;
     }
 
     /* Signal fence for current frame */
@@ -2045,6 +2525,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_SCISSOR:      return 1;
         case VIO_FEATURE_TEXTURE_SWIZZLE: return 0; /* needs CPU expansion */
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* vio_2d_d3d12_* */
+        case VIO_FEATURE_TEXTURE_3D:   return 1; /* TEXTURE3D resource + SRV */
         default:                       return 0;
     }
 }
@@ -2212,6 +2693,7 @@ static const vio_backend d3d12_backend = {
     .update_buffer     = d3d12_update_buffer,
     .destroy_buffer    = d3d12_destroy_buffer,
     .create_texture    = d3d12_create_texture,
+    .create_texture_3d = d3d12_create_texture_3d,
     .destroy_texture   = d3d12_destroy_texture,
     .compile_shader    = d3d12_compile_shader,
     .destroy_shader    = d3d12_destroy_shader,

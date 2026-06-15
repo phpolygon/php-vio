@@ -2602,6 +2602,140 @@ ZEND_FUNCTION(vio_texture)
     RETURN_COPY_VALUE(&tex_zval);
 }
 
+ZEND_FUNCTION(vio_texture_3d)
+{
+    zval *ctx_zval;
+    HashTable *config_ht;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(config_ht)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        RETURN_FALSE;
+    }
+
+    /* 3D textures are created via one of three backend paths: OpenGL writes a
+     * GL_TEXTURE_3D into texture_id (upload_texture_3d); D3D11/D3D12/Vulkan
+     * return an opaque handle (create_texture_3d); Metal uses its own id-based
+     * helper. A backend with none of these reports VIO_FEATURE_TEXTURE_3D = 0
+     * and fails here gracefully — callers fall back to the analytic / 2D-atlas
+     * trace path. */
+    int has_3d_path = (ctx->backend->upload_texture_3d != NULL)
+                   || (ctx->backend->create_texture_3d != NULL);
+#ifdef HAVE_METAL
+    if (ctx->backend->name && strcmp(ctx->backend->name, "metal") == 0) {
+        has_3d_path = 1;
+    }
+#endif
+    if (!has_3d_path) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_texture_3d: backend '%s' has no 3D-texture path",
+            ctx->backend->name ? ctx->backend->name : "?");
+        RETURN_FALSE;
+    }
+
+    zval *data_zval   = zend_hash_str_find(config_ht, "data", sizeof("data") - 1);
+    zval *width_zval  = zend_hash_str_find(config_ht, "width", sizeof("width") - 1);
+    zval *height_zval = zend_hash_str_find(config_ht, "height", sizeof("height") - 1);
+    zval *depth_zval  = zend_hash_str_find(config_ht, "depth", sizeof("depth") - 1);
+
+    if (!data_zval || Z_TYPE_P(data_zval) != IS_STRING || !width_zval || !height_zval || !depth_zval) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_texture_3d requires 'data'+'width'+'height'+'depth'");
+        RETURN_FALSE;
+    }
+
+    int w = (int)zval_get_long(width_zval);
+    int h = (int)zval_get_long(height_zval);
+    int d = (int)zval_get_long(depth_zval);
+    if (w <= 0 || h <= 0 || d <= 0) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_texture_3d: width/height/depth must be positive (got %dx%dx%d)", w, h, d);
+        RETURN_FALSE;
+    }
+
+    size_t need = (size_t)w * (size_t)h * (size_t)d * 4u;
+    if (Z_STRLEN_P(data_zval) < need) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_texture_3d: data is %zu bytes but %dx%dx%d RGBA needs %zu",
+            Z_STRLEN_P(data_zval), w, h, d, need);
+        RETURN_FALSE;
+    }
+
+    zval tex_zval;
+    object_init_ex(&tex_zval, vio_texture_ce);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(&tex_zval);
+    tex->backend = ctx->backend;
+
+    zval *val;
+    tex->filter = VIO_FILTER_LINEAR;  /* trilinear by default — SDF wants smooth */
+    tex->wrap   = VIO_WRAP_CLAMP;     /* sensible default for a bounded SDF volume */
+    if ((val = zend_hash_str_find(config_ht, "filter", sizeof("filter") - 1)) != NULL) {
+        tex->filter = (vio_filter)zval_get_long(val);
+    }
+    if ((val = zend_hash_str_find(config_ht, "wrap", sizeof("wrap") - 1)) != NULL) {
+        tex->wrap = (vio_wrap)zval_get_long(val);
+    }
+
+    tex->width    = w;
+    tex->height   = h;
+    tex->depth    = d;
+    tex->is_3d    = 1;
+    tex->channels = 4;
+
+    const unsigned char *pixels = (const unsigned char *)Z_STRVAL_P(data_zval);
+
+    if (ctx->backend->upload_texture_3d) {
+        /* OpenGL: writes a GL_TEXTURE_3D into tex->texture_id. */
+        int rc = ctx->backend->upload_texture_3d(
+            tex, pixels, w, h, d, 4, (int)tex->filter, (int)tex->wrap);
+        if (rc != 0) {
+            php_error_docref(NULL, E_WARNING, "vio_texture_3d: backend upload failed");
+            zval_ptr_dtor(&tex_zval);
+            RETURN_FALSE;
+        }
+    } else if (ctx->backend->create_texture_3d) {
+        /* D3D11 / D3D12 / Vulkan: opaque backend handle, bound via bind_texture. */
+        vio_texture_desc desc = {0};
+        desc.data      = pixels;
+        desc.data_size = need;
+        desc.width     = w;
+        desc.height    = h;
+        desc.depth     = d;
+        desc.filter    = tex->filter;
+        desc.wrap      = tex->wrap;
+        tex->backend_texture = ctx->backend->create_texture_3d(&desc);
+        if (!tex->backend_texture) {
+            php_error_docref(NULL, E_WARNING, "vio_texture_3d: backend create failed");
+            zval_ptr_dtor(&tex_zval);
+            RETURN_FALSE;
+        }
+    }
+#ifdef HAVE_METAL
+    else if (ctx->backend->name && strcmp(ctx->backend->name, "metal") == 0) {
+        tex->texture_id = vio_metal_create_texture_3d_rgba(
+            w, h, d, pixels, tex->filter != VIO_FILTER_NEAREST, tex->wrap == VIO_WRAP_CLAMP);
+        if (tex->texture_id == 0) {
+            php_error_docref(NULL, E_WARNING, "vio_texture_3d: metal create failed");
+            zval_ptr_dtor(&tex_zval);
+            RETURN_FALSE;
+        }
+    }
+#endif
+    else {
+        zval_ptr_dtor(&tex_zval);
+        RETURN_FALSE;
+    }
+
+    tex->valid = 1;
+    RETURN_COPY_VALUE(&tex_zval);
+}
+
 ZEND_FUNCTION(vio_bind_texture)
 {
     zval *ctx_zval;
@@ -2625,6 +2759,15 @@ ZEND_FUNCTION(vio_bind_texture)
     vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
     if (!tex->valid) {
         php_error_docref(NULL, E_WARNING, "Texture is not valid");
+        return;
+    }
+
+    if (tex->is_3d && tex->texture_id && ctx->backend->bind_texture_3d_id) {
+        /* OpenGL volume texture (Fieldtracing SDF): bind via the GL_TEXTURE_3D
+         * target. D3D11/D3D12/Vulkan volumes have texture_id == 0 and fall
+         * through to the opaque backend_texture path below (their SRV / image
+         * view already encodes the 3D dimension, so bind_texture works as-is). */
+        ctx->backend->bind_texture_3d_id(tex->texture_id, (int)slot);
         return;
     }
 
@@ -5220,6 +5363,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BUFFER_STORAGE", VIO_FEATURE_BUFFER_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_STORAGE", VIO_FEATURE_TEXTURE_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SEPARATE_SHADERS", VIO_FEATURE_SEPARATE_SHADERS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_3D", VIO_FEATURE_TEXTURE_3D, CONST_CS | CONST_PERSISTENT);
 
     /* Actions */
     REGISTER_LONG_CONSTANT("VIO_RELEASE", VIO_RELEASE, CONST_CS | CONST_PERSISTENT);
@@ -5785,42 +5929,36 @@ ZEND_FUNCTION(vio_draw_instanced)
         if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
             UINT byte_size = (UINT)mat_size;
 
-            /* Persistent UPLOAD heap instance buffer */
-            static ID3D12Resource *s_d3d12_instance_buf = NULL;
-            static UINT s_d3d12_instance_capacity = 0;
-            static D3D12_GPU_VIRTUAL_ADDRESS s_d3d12_instance_gpu = 0;
-
-            if (!s_d3d12_instance_buf || s_d3d12_instance_capacity < byte_size) {
-                if (s_d3d12_instance_buf) {
-                    ID3D12Resource_Release(s_d3d12_instance_buf);
-                    s_d3d12_instance_buf = NULL;
+            /* Per-draw instance slice from the persistently-mapped per-frame
+             * instance ring (vio_d3d12.instance_heap*). Mirrors the cbuffer
+             * heap exactly: each instanced draw in a frame gets its OWN stable
+             * 256-byte-aligned slice inside THIS frame's region, so the slot-1
+             * VBV GPU VA recorded now still points at THIS draw's matrices when
+             * the command list executes at Present. The previous code shared one
+             * function-static buffer across all instanced draws -> every draw
+             * aliased the same VA -> only the last upload survived (district
+             * buildings vanished/displaced) and a mid-frame overflow Released the
+             * buffer under already-recorded draws -> GPU use-after-free ->
+             * intermittent DEVICE_REMOVED. The ring NEVER frees mid-frame: an
+             * overflow just skips this draw (the grow happens at next
+             * begin_frame, after a full GPU sync). */
+            D3D12_GPU_VIRTUAL_ADDRESS instance_gpu = 0;
+            if (vio_d3d12.instance_heap_mapped && byte_size > 0) {
+                UINT aligned = (byte_size + 255u) & ~255u;
+                UINT offset = vio_d3d12.instance_heap_offset;
+                /* Never spill past this frame's slice — the bytes beyond it
+                 * belong to the other in-flight frame's instance data. */
+                if (offset + aligned <= vio_d3d12.instance_frame_end) {
+                    memcpy(vio_d3d12.instance_heap_mapped + offset, mat_data, byte_size);
+                    instance_gpu = vio_d3d12.instance_heap_gpu + offset;
+                    vio_d3d12.instance_heap_offset = offset + aligned;
                 }
-                D3D12_HEAP_PROPERTIES heap_props = {0};
-                heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
-                D3D12_RESOURCE_DESC res_desc = {0};
-                res_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-                res_desc.Width = byte_size;
-                res_desc.Height = 1;
-                res_desc.DepthOrArraySize = 1;
-                res_desc.MipLevels = 1;
-                res_desc.SampleDesc.Count = 1;
-                res_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-                HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device,
-                    &heap_props, D3D12_HEAP_FLAG_NONE, &res_desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                    &IID_ID3D12Resource, (void **)&s_d3d12_instance_buf);
-                if (FAILED(hr)) { if (allocated) efree(allocated); return; }
-                s_d3d12_instance_capacity = byte_size;
-                s_d3d12_instance_gpu = ID3D12Resource_GetGPUVirtualAddress(s_d3d12_instance_buf);
             }
-
-            /* Upload */
-            void *mapped = NULL;
-            D3D12_RANGE read_range = {0, 0};
-            if (SUCCEEDED(ID3D12Resource_Map(s_d3d12_instance_buf, 0, &read_range, &mapped))) {
-                memcpy(mapped, mat_data, byte_size);
-                ID3D12Resource_Unmap(s_d3d12_instance_buf, 0, NULL);
+            if (instance_gpu == 0) {
+                /* Slice exhausted (or heap unavailable): skip rather than draw
+                 * with another draw's matrices. Heap grows at next begin_frame. */
+                if (allocated) efree(allocated);
+                return;
             }
 
             /* Flush cbuffers */
@@ -5834,11 +5972,14 @@ ZEND_FUNCTION(vio_draw_instanced)
                     ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
                     sh->frag_cbuffer_dirty = 0;
                 }
-                /* Allocate per-draw cbuffer slices from linear allocator */
+                /* Allocate per-draw cbuffer slices from linear allocator.
+                 * Bound against THIS frame's slice end (cbuffer_frame_end), not
+                 * heap capacity — spilling past the slice would clobber the
+                 * other in-flight frame's root CBVs (same aliasing class). */
                 if (sh->cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
                     UINT aligned = (sh->cbuffer_total_size + 255) & ~255;
                     UINT offset = vio_d3d12.cbuffer_heap_offset;
-                    if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
+                    if (offset + aligned <= vio_d3d12.cbuffer_frame_end) {
                         memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
                                sh->cbuffer_data, sh->cbuffer_total_size);
                         ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
@@ -5850,7 +5991,7 @@ ZEND_FUNCTION(vio_draw_instanced)
                 if (sh->frag_cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
                     UINT aligned = (sh->frag_cbuffer_total_size + 255) & ~255;
                     UINT offset = vio_d3d12.cbuffer_heap_offset;
-                    if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
+                    if (offset + aligned <= vio_d3d12.cbuffer_frame_end) {
                         memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
                                sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
                         ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
@@ -5861,13 +6002,15 @@ ZEND_FUNCTION(vio_draw_instanced)
                 }
             }
 
-            /* Bind vertex buffers: slot 0 = mesh, slot 1 = instances */
+            /* Bind vertex buffers: slot 0 = mesh, slot 1 = instances.
+             * instance_gpu is this draw's OWN slice in the per-frame ring,
+             * stable until the command list executes at Present. */
             vio_d3d12_buffer *vb = (vio_d3d12_buffer *)mesh->backend_vb;
             D3D12_VERTEX_BUFFER_VIEW vbvs[2];
             vbvs[0].BufferLocation = vb->gpu_address;
             vbvs[0].SizeInBytes = (UINT)vb->size;
             vbvs[0].StrideInBytes = (UINT)mesh->stride;
-            vbvs[1].BufferLocation = s_d3d12_instance_gpu;
+            vbvs[1].BufferLocation = instance_gpu;
             vbvs[1].SizeInBytes = byte_size;
             vbvs[1].StrideInBytes = 64; /* sizeof(mat4) */
             ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 2, vbvs);

@@ -44,11 +44,13 @@ typedef struct _vio_d3d11_buffer {
 /* Texture wrapper */
 typedef struct _vio_d3d11_texture {
     ID3D11Texture2D          *texture;
+    ID3D11Texture3D          *texture3d;     /* set instead of texture for volume textures */
     ID3D11ShaderResourceView *srv;
     ID3D11SamplerState       *sampler;       /* regular sampler (Sample) */
     ID3D11SamplerState       *sampler_cmp;   /* comparison sampler (SampleCmp), NULL if n/a */
     int width;
     int height;
+    int depth;                                /* > 0 for 3D / volume textures */
     int is_depth;                             /* 1 if this is a depth texture */
 } vio_d3d11_texture;
 

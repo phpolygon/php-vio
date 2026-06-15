@@ -161,6 +161,14 @@ typedef enum _vio_feature {
     VIO_FEATURE_BUFFER_STORAGE     = 19,  /* GL 4.4 / ARB_buffer_storage */
     VIO_FEATURE_TEXTURE_STORAGE    = 20,  /* GL 4.2 / ARB_texture_storage */
     VIO_FEATURE_SEPARATE_SHADERS   = 21,  /* GL 4.1 / ARB_separate_shader_objects */
+    /* 3D / volume textures (vio_texture_3d / sampler3D). Used by Fieldtracing
+     * to store a baked Signed Distance Field volume on the GPU. Wired and
+     * reported (1) on all backends: GL (glTexImage3D, core since 1.2), D3D11/
+     * D3D12 (Texture3D), Metal (MTLTextureType3D), Vulkan (VK_IMAGE_TYPE_3D).
+     * A backend that ever lacks the upload path reports 0 and vio_texture_3d
+     * returns false there (graceful — the engine stays on the analytic trace
+     * path). */
+    VIO_FEATURE_TEXTURE_3D         = 22,
 } vio_feature;
 
 /* ── Input actions ────────────────────────────────────────────────── */
@@ -243,6 +251,8 @@ typedef struct _vio_texture_desc {
     size_t      data_size;
     int         width;
     int         height;
+    int         depth;     /* 0 (default) => 2D texture; > 0 => 3D / volume texture
+                              (data is width*height*depth*4 RGBA8, slices in +Z order) */
     vio_filter  filter;
     vio_wrap    wrap;
     int         mipmaps;

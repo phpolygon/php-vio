@@ -24,6 +24,7 @@ typedef struct _vio_vulkan_texture {
     VkSampler     sampler;
     int           width;
     int           height;
+    int           depth;        /* > 0 for 3D / volume textures */
     /* Intrusive doubly-linked list of all live textures, anchored on
      * vio_vk.live_textures. vulkan_shutdown sweeps any survivors before
      * vkDestroyDevice so a PHP texture/font object outliving vio_destroy()
