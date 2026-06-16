@@ -1,3 +1,10 @@
+## [1.21.1](https://github.com/phpolygon/php-vio/compare/v1.21.0...v1.21.1) (2026-06-16)
+
+
+### Bug Fixes
+
+* **d3d12:** raise shadow SRV register base so >4 regular samplers don't overlap ([#12](https://github.com/phpolygon/php-vio/issues/12)) ([89e0de0](https://github.com/phpolygon/php-vio/commit/89e0de0cd8a03247577eb44fdec2a1d380eb910e))
+
 # [1.21.0](https://github.com/phpolygon/php-vio/compare/v1.20.1...v1.21.0) (2026-06-15)
 
 
