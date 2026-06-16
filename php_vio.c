@@ -2097,8 +2097,9 @@ ZEND_FUNCTION(vio_shader)
                      * 0,1,2..; depth/shadow samplers get 4,5,6.. So we can reproduce the
                      * exact register by replaying that counter scheme. This is correct by
                      * construction and replaces the fragile "reflection index + 4" guess. */
+                    /* MUST match vio_shader_reflect.c: regular 0+, shadow 8+. */
                     int regular_reg = 0;
-                    int shadow_reg = 4;
+                    int shadow_reg = 8;
                     for (int s = 0; s < shader->sampler_count; s++) {
                         strncpy(shader->sampler_names[s], frag_reflect.textures[s].name,
                                 sizeof(shader->sampler_names[s]) - 1);

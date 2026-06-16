@@ -157,10 +157,14 @@ char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_mod
         spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
                                                    &sampled_images, &sampled_count);
         /* Assign unique texture (t) and sampler (s) registers per combined image-sampler.
-         * For SM 5.1 (D3D12): depth/shadow samplers get registers 4+ so they map to
-         * comparison static samplers in the root signature. Regular samplers get 0+. */
+         * For SM 5.1 (D3D12): depth/shadow samplers get registers 8+ so they map to
+         * comparison static samplers in the root signature. Regular samplers get 0+.
+         * The shadow base is 8 (not 4) so up to 8 regular samplers fit before the
+         * comparison range — the mesh shader uses 5 (albedo, ssao, sdf_ao, probe,
+         * environment cube). MUST stay in sync with the replay in php_vio.c and the
+         * root-signature static-sampler layout in vio_d3d12.c. */
         unsigned int regular_idx = 0;
-        unsigned int shadow_idx = 4; /* offset for comparison static samplers */
+        unsigned int shadow_idx = 8; /* offset for comparison static samplers */
         for (size_t i = 0; i < sampled_count; i++) {
             /* Check if this is a depth sampler (sampler2DShadow) */
             int is_depth_sampler = 0;
