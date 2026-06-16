@@ -416,8 +416,8 @@ static int d3d12_create_root_signature(void)
     params[1].Descriptor.RegisterSpace = 0;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    /* [2] SRV table t0..t(N-1). Regular textures occupy t0-t3, shadow/depth
-     * samplers t4-t7 (SPIRV-Cross assigns depth samplers from register 4 — see
+    /* [2] SRV table t0..t(N-1). Regular textures occupy t0-t7, shadow/depth
+     * samplers t8-t11 (SPIRV-Cross assigns depth samplers from register 8 — see
      * vio_shader_reflect.c). Sized to VIO_D3D12_SRV_TABLE_SIZE so high shadow
      * registers are always covered by the table and never dropped at bind. */
     D3D12_DESCRIPTOR_RANGE srv_range = {0};
@@ -432,12 +432,13 @@ static int d3d12_create_root_signature(void)
     params[2].DescriptorTable.pDescriptorRanges = &srv_range;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    /* Static samplers: s0-s3 = regular, s4-s7 = comparison.
-     * SPIRV-Cross assigns shadow samplers to s4+ and regular to s0+. */
-    D3D12_STATIC_SAMPLER_DESC static_samplers[8] = {0};
+    /* Static samplers: s0-s7 = regular, s8-s11 = comparison.
+     * SPIRV-Cross assigns shadow samplers to s8+ and regular to s0+ (see
+     * vio_shader_reflect.c — the base is 8 so up to 8 regular samplers fit). */
+    D3D12_STATIC_SAMPLER_DESC static_samplers[12] = {0};
 
-    /* s0-s3: Regular linear wrap (general textures) */
-    for (int s = 0; s < 4; s++) {
+    /* s0-s7: Regular linear wrap (general textures) */
+    for (int s = 0; s < 8; s++) {
         static_samplers[s].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         static_samplers[s].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         static_samplers[s].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -449,8 +450,8 @@ static int d3d12_create_root_signature(void)
         static_samplers[s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
 
-    /* s4-s7: Comparison samplers (shadow maps with sampler2DShadow) */
-    for (int s = 4; s < 8; s++) {
+    /* s8-s11: Comparison samplers (shadow maps with sampler2DShadow) */
+    for (int s = 8; s < 12; s++) {
         static_samplers[s].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
         static_samplers[s].AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
         static_samplers[s].AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
@@ -466,7 +467,7 @@ static int d3d12_create_root_signature(void)
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
     rs_desc.NumParameters = 3; /* VS CBV, PS CBV, SRV table */
     rs_desc.pParameters = params;
-    rs_desc.NumStaticSamplers = 8;
+    rs_desc.NumStaticSamplers = 12;
     rs_desc.pStaticSamplers = static_samplers;
     rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
