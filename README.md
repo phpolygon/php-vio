@@ -4,7 +4,7 @@ A PHP extension that brings GPU rendering, audio, video recording, streaming, an
 
 ## Features
 
-- **Multi-Backend GPU Rendering** — OpenGL 4.1, Vulkan (MoltenVK), Metal
+- **Multi-Backend GPU Rendering** — Direct3D 12, Direct3D 11, Metal, Vulkan (MoltenVK), OpenGL 4.1
 - **2D Batch Renderer** — Rects, circles, lines, sprites, text (z-sorted, up to 4096 items)
 - **3D Pipeline** — Meshes, shaders, pipelines, textures, uniform/storage buffers
 - **Shader Toolchain** — GLSL to SPIR-V compilation, reflection, cross-compilation
@@ -30,6 +30,8 @@ All native libraries are optional — the extension compiles and runs without th
 | [Vulkan SDK](https://vulkan.lunarg.com/) | Vulkan backend | `--with-vulkan` |
 | [FFmpeg](https://ffmpeg.org/) | Video recording & streaming | `--with-ffmpeg` |
 | Metal (macOS framework) | Metal backend | `--with-metal` |
+| Direct3D 11 (Windows SDK) | Direct3D 11 backend | `--with-d3d11` (Windows, on by default) |
+| Direct3D 12 (Windows SDK) | Direct3D 12 backend | `--with-d3d12` (Windows, on by default) |
 
 ## Installation
 
@@ -138,12 +140,20 @@ Full API documentation: see [vio.stub.php](vio.stub.php)
 
 | Backend | Status | Platforms |
 |---------|--------|-----------|
-| OpenGL 4.1 | Stable | macOS, Linux, Windows |
+| Direct3D 12 | Stable | Windows only |
+| Direct3D 11 | Stable | Windows only |
 | Metal | Stable | macOS only |
+| OpenGL 4.1 | Stable | macOS, Linux, Windows |
 | Vulkan | Experimental | macOS (MoltenVK), Linux, Windows |
 | Null | Stable | All (for unit testing) |
 
-Backend auto-selection: Metal (macOS) > Vulkan (Linux/Windows) > OpenGL > Null
+Backend auto-selection is platform-specific:
+
+- **Windows:** Direct3D 12 → Direct3D 11 → Vulkan → OpenGL
+- **macOS:** Metal → OpenGL  (Vulkan via MoltenVK is opt-in, not auto)
+- **Linux:** Vulkan → OpenGL
+
+`Null` is never auto-selected; request it explicitly with `vio_create("null")` for headless tests. Override auto-selection per call (`vio_create("d3d11")`) or globally via the `vio.default_backend` INI setting.
 
 ## Performance: Metal vs OpenGL
 
