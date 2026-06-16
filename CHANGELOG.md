@@ -1,3 +1,10 @@
+# [1.22.0](https://github.com/phpolygon/php-vio/compare/v1.21.1...v1.22.0) (2026-06-16)
+
+
+### Features
+
+* **input:** register VIO_TOUCH_* phase constants ([#14](https://github.com/phpolygon/php-vio/issues/14)) ([8245355](https://github.com/phpolygon/php-vio/commit/8245355f7384e73afe6245fbb3cf2a1056a6f1eb))
+
 ## [1.21.1](https://github.com/phpolygon/php-vio/compare/v1.21.0...v1.21.1) (2026-06-16)
 
 
