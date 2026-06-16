@@ -36,6 +36,10 @@ var_dump(VIO_FEATURE_COMPUTE);
 var_dump(defined('VIO_MOUSE_LEFT'));
 var_dump(VIO_MOUSE_LEFT);
 
+// Touch phase
+var_dump(defined('VIO_TOUCH_BEGAN'));
+var_dump(VIO_TOUCH_BEGAN);
+
 // Backend count (at least null + opengl)
 var_dump(vio_backend_count() >= 1);
 ?>
@@ -56,4 +60,6 @@ bool(true)
 int(0)
 bool(true)
 int(0)
+bool(true)
+int(1)
 bool(true)
