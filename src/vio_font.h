@@ -72,6 +72,43 @@ extern zend_class_entry *vio_font_ce;
 void vio_font_register(void);
 int vio_font_pack_atlas(vio_font_object *font, unsigned char *atlas_bitmap, int atlas_size);
 
+/* ── Thread-safe (Zend-free) atlas packing ───────────────────────────
+ *
+ * vio_font_pack_atlas() above both rasterizes the atlas AND populates the
+ * font's Zend glyph_map hashtable in one pass. That hashtable population uses
+ * the Zend memory manager (emalloc / ZVAL_STRINGL / zend_hash_*), which is
+ * per-request and NOT safe to touch from a worker thread.
+ *
+ * For async loading the work is split:
+ *   1. vio_font_pack_atlas_raw() runs on the worker thread. It rasterizes the
+ *      atlas into a caller-provided bitmap and writes the packed glyph metrics
+ *      into a flat, malloc-backed vio_font_packed_glyph array. It touches only
+ *      libc malloc + stb_truetype — no Zend, no GL.
+ *   2. vio_font_finalize_glyphs() runs on the render thread at poll time and
+ *      copies that flat array into the font's Zend glyph_map. */
+
+/* One packed glyph plus its codepoint — flat, Zend-free transport struct used
+ * to hand worker-thread pack results back to the render thread. */
+typedef struct {
+    int                  codepoint;
+    vio_stbtt_packedchar pc;
+} vio_font_packed_glyph;
+
+/* Rasterize the atlas for `font_size` from `ttf_data` into `atlas_bitmap`
+ * (atlas_size*atlas_size R8 bytes, caller-allocated). Allocates *out_glyphs
+ * with malloc() (caller frees with free()) and writes the packed glyph count
+ * into *out_count. Returns 1 on success, 0 on failure. Thread-safe: uses no
+ * Zend allocator and no GPU calls. */
+int vio_font_pack_atlas_raw(const unsigned char *ttf_data, float font_size,
+                            unsigned char *atlas_bitmap, int atlas_size,
+                            vio_font_packed_glyph **out_glyphs, int *out_count);
+
+/* Populate font->glyph_map from a flat packed-glyph array produced by
+ * vio_font_pack_atlas_raw(). Must run on the thread that owns the Zend heap
+ * (the render/request thread). */
+void vio_font_finalize_glyphs(vio_font_object *font,
+                              const vio_font_packed_glyph *glyphs, int count);
+
 static inline vio_font_object *vio_font_from_obj(zend_object *obj) {
     return (vio_font_object *)((char *)obj - XtOffsetOf(vio_font_object, std));
 }

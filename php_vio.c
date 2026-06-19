@@ -3542,6 +3542,99 @@ ZEND_FUNCTION(vio_sprite)
     if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_SPRITE, z, tex->texture_id, tex->backend_texture, start, 6);
 }
 
+/* Upload a freshly-packed R8 atlas bitmap into the font's GPU resource.
+ *
+ * MUST run on the render thread — every branch here issues GPU work (texture
+ * creation / atlas upload) against the currently-current GL / Metal / D3D /
+ * Vulkan context. Shared by the synchronous vio_font() path and the async
+ * completion path (vio_font_load_poll), so the backend-specific atlas handling
+ * stays in exactly one place.
+ *
+ * `backend` is passed explicitly (rather than read from a context) so the async
+ * path can use the backend captured at submit time. atlas_bitmap is the R8
+ * coverage atlas; it is not freed here (caller owns it). */
+static void vio_font_upload_atlas_to_gpu(vio_font_object *font,
+                                         const vio_backend *backend,
+                                         unsigned char *atlas_bitmap)
+{
+    if (backend && backend->upload_font_atlas) {
+        backend->upload_font_atlas(font, VIO_FONT_ATLAS_SIZE, VIO_FONT_ATLAS_SIZE, atlas_bitmap, 1);
+    }
+
+#ifdef HAVE_D3D11
+    if (backend && strcmp(backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+        /* Convert R8 atlas to R8G8B8A8 with white RGB and alpha from bitmap.
+         * HLSL shader samples .a, so the glyph coverage goes into alpha. */
+        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
+        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
+            rgba[p * 4 + 0] = 255;
+            rgba[p * 4 + 1] = 255;
+            rgba[p * 4 + 2] = 255;
+            rgba[p * 4 + 3] = atlas_bitmap[p];
+        }
+
+        vio_texture_desc desc = {0};
+        desc.width  = VIO_FONT_ATLAS_SIZE;
+        desc.height = VIO_FONT_ATLAS_SIZE;
+        desc.data   = rgba;
+        desc.filter = VIO_FILTER_LINEAR;
+        desc.wrap   = VIO_WRAP_CLAMP;
+        desc.mipmaps = 0;
+        font->atlas_backend_texture = backend->create_texture(&desc);
+        efree(rgba);
+    }
+#endif
+
+#ifdef HAVE_D3D12
+    if (backend && strcmp(backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
+        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
+            rgba[p * 4 + 0] = 255;
+            rgba[p * 4 + 1] = 255;
+            rgba[p * 4 + 2] = 255;
+            rgba[p * 4 + 3] = atlas_bitmap[p];
+        }
+
+        vio_texture_desc desc = {0};
+        desc.width  = VIO_FONT_ATLAS_SIZE;
+        desc.height = VIO_FONT_ATLAS_SIZE;
+        desc.data   = rgba;
+        desc.filter = VIO_FILTER_LINEAR;
+        desc.wrap   = VIO_WRAP_CLAMP;
+        desc.mipmaps = 0;
+        font->atlas_backend_texture = backend->create_texture(&desc);
+        efree(rgba);
+    }
+#endif
+
+#ifdef HAVE_VULKAN
+    if (backend && strcmp(backend->name, "vulkan") == 0 && vio_vk.initialized) {
+        /* Expand the R8 coverage atlas to RGBA8 (white RGB, coverage in alpha)
+         * so the single sprites pipeline serves both PNG sprites and glyphs:
+         * the sprite shader computes texture(uTexture, uv) * vColor, and a
+         * white-RGB / coverage-alpha texel multiplied by the vertex color
+         * tints the glyph and applies coverage as alpha — identical to D3D12. */
+        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
+        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
+            rgba[p * 4 + 0] = 255;
+            rgba[p * 4 + 1] = 255;
+            rgba[p * 4 + 2] = 255;
+            rgba[p * 4 + 3] = atlas_bitmap[p];
+        }
+
+        vio_texture_desc desc = {0};
+        desc.width  = VIO_FONT_ATLAS_SIZE;
+        desc.height = VIO_FONT_ATLAS_SIZE;
+        desc.data   = rgba;
+        desc.filter = VIO_FILTER_LINEAR;
+        desc.wrap   = VIO_WRAP_CLAMP;
+        desc.mipmaps = 0;
+        font->atlas_backend_texture = backend->create_texture(&desc);
+        efree(rgba);
+    }
+#endif
+}
+
 ZEND_FUNCTION(vio_font)
 {
     zval *ctx_zval;
@@ -3595,82 +3688,7 @@ ZEND_FUNCTION(vio_font)
 
     vio_font_pack_atlas(font, atlas_bitmap, atlas_size);
 
-    if (ctx->backend->upload_font_atlas) {
-        ctx->backend->upload_font_atlas(font, atlas_size, atlas_size, atlas_bitmap, 1);
-    }
-
-#ifdef HAVE_D3D11
-    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
-        /* Convert R8 atlas to R8G8B8A8 with white RGB and alpha from bitmap.
-         * HLSL shader samples .a, so the glyph coverage goes into alpha. */
-        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
-        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
-            rgba[p * 4 + 0] = 255;
-            rgba[p * 4 + 1] = 255;
-            rgba[p * 4 + 2] = 255;
-            rgba[p * 4 + 3] = atlas_bitmap[p];
-        }
-
-        vio_texture_desc desc = {0};
-        desc.width  = VIO_FONT_ATLAS_SIZE;
-        desc.height = VIO_FONT_ATLAS_SIZE;
-        desc.data   = rgba;
-        desc.filter = VIO_FILTER_LINEAR;
-        desc.wrap   = VIO_WRAP_CLAMP;
-        desc.mipmaps = 0;
-        font->atlas_backend_texture = ctx->backend->create_texture(&desc);
-        efree(rgba);
-    }
-#endif
-
-#ifdef HAVE_D3D12
-    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
-        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
-        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
-            rgba[p * 4 + 0] = 255;
-            rgba[p * 4 + 1] = 255;
-            rgba[p * 4 + 2] = 255;
-            rgba[p * 4 + 3] = atlas_bitmap[p];
-        }
-
-        vio_texture_desc desc = {0};
-        desc.width  = VIO_FONT_ATLAS_SIZE;
-        desc.height = VIO_FONT_ATLAS_SIZE;
-        desc.data   = rgba;
-        desc.filter = VIO_FILTER_LINEAR;
-        desc.wrap   = VIO_WRAP_CLAMP;
-        desc.mipmaps = 0;
-        font->atlas_backend_texture = ctx->backend->create_texture(&desc);
-        efree(rgba);
-    }
-#endif
-
-#ifdef HAVE_VULKAN
-    if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
-        /* Expand the R8 coverage atlas to RGBA8 (white RGB, coverage in alpha)
-         * so the single sprites pipeline serves both PNG sprites and glyphs:
-         * the sprite shader computes texture(uTexture, uv) * vColor, and a
-         * white-RGB / coverage-alpha texel multiplied by the vertex color
-         * tints the glyph and applies coverage as alpha — identical to D3D12. */
-        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
-        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
-            rgba[p * 4 + 0] = 255;
-            rgba[p * 4 + 1] = 255;
-            rgba[p * 4 + 2] = 255;
-            rgba[p * 4 + 3] = atlas_bitmap[p];
-        }
-
-        vio_texture_desc desc = {0};
-        desc.width  = VIO_FONT_ATLAS_SIZE;
-        desc.height = VIO_FONT_ATLAS_SIZE;
-        desc.data   = rgba;
-        desc.filter = VIO_FILTER_LINEAR;
-        desc.wrap   = VIO_WRAP_CLAMP;
-        desc.mipmaps = 0;
-        font->atlas_backend_texture = ctx->backend->create_texture(&desc);
-        efree(rgba);
-    }
-#endif
+    vio_font_upload_atlas_to_gpu(font, ctx->backend, atlas_bitmap);
 
     efree(atlas_bitmap);
 
@@ -5582,6 +5600,7 @@ typedef struct _vio_async_texture_load {
     int            channels;
     int            done;
     int            failed;
+    int            consumed;   /* poll already produced a result */
 } vio_async_texture_load;
 
 #ifdef PHP_WIN32
@@ -5654,12 +5673,26 @@ ZEND_FUNCTION(vio_texture_load_poll)
         RETURN_FALSE;
     }
 
+    /* A previous poll already consumed the result; report failure without
+     * touching the resource. */
+    if (load->consumed) {
+        RETURN_FALSE;
+    }
+
     if (!load->done) {
         RETURN_NULL(); /* Still loading */
     }
 
+    /* Mark consumed and free worker data eagerly rather than calling
+     * zend_list_delete() from inside the poll. Deleting the resource here frees
+     * it while the caller may still hold a PHP reference to the handle (e.g. in
+     * an array passed by reference); that dangling resource is then double-freed
+     * at request shutdown and corrupts the Zend heap. Letting PHP drop the last
+     * reference naturally — with the dtor guarded by the freed pointers — is the
+     * safe lifecycle. */
+    load->consumed = 1;
+
     if (load->failed) {
-        zend_list_delete(Z_RES_P(res_zval));
         RETURN_FALSE;
     }
 
@@ -5670,7 +5703,6 @@ ZEND_FUNCTION(vio_texture_load_poll)
     add_assoc_stringl(return_value, "data", (char *)load->data, load->width * load->height * 4);
     stbi_image_free(load->data);
     load->data = NULL;
-    zend_list_delete(Z_RES_P(res_zval));
 }
 
 static void vio_async_load_dtor(zend_resource *res)
@@ -5687,6 +5719,280 @@ static void vio_async_load_dtor(zend_resource *res)
         if (load->path) {
             efree(load->path);
         }
+        efree(load);
+    }
+}
+
+/* ── Async font loading ──────────────────────────────────────────────
+ *
+ * Mirrors the async texture lifecycle above. The expensive part of loading a
+ * large fallback font (e.g. the ~13 MB CJK NotoSansSC/KR) is rasterizing the
+ * 4096x4096 multi-range glyph atlas with stb_truetype — a pure-CPU pack over
+ * ~32k codepoints that previously froze the render thread for 20-25 s the
+ * first time a CJK glyph hit the fallback chain.
+ *
+ * The split, identical in spirit to the texture path (decode off-thread, GPU
+ * upload on the render thread at poll time):
+ *
+ *   Worker thread (vio_font_load_thread):
+ *     - raw fopen/fread of the TTF (NOT php_stream — php streams are
+ *       per-request and not thread-safe)
+ *     - vio_font_pack_atlas_raw(): rasterize the atlas bitmap + produce a flat,
+ *       malloc-backed glyph array. No Zend allocator, no GPU calls.
+ *
+ *   Render thread (vio_font_load_poll):
+ *     - build the VioFont object, copy the TTF into emalloc memory, populate
+ *       the Zend glyph_map via vio_font_finalize_glyphs()
+ *     - vio_font_upload_atlas_to_gpu(): upload the atlas against the current
+ *       GL / Metal / D3D / Vulkan context (must be the render thread)
+ *
+ * All worker-touched buffers use libc malloc/free so the worker never touches
+ * the Zend heap. The backend pointer is captured at submit time and reused at
+ * poll time. Until the poll succeeds the caller renders .notdef (the engine
+ * simply skips the not-yet-ready fallback font in its chain). */
+
+/* Cross-thread publication fences for the worker -> render-thread handoff.
+ * The worker writes the result fields then sets `done`; the render thread reads
+ * `done` then the result fields. A release fence on the producer paired with an
+ * acquire fence on the consumer guarantees the reader sees all the producer's
+ * writes once it observes done == 1. Falls back to a full compiler+memory
+ * barrier where C11 atomics are unavailable (older MSVC). */
+#if defined(__GNUC__) || defined(__clang__)
+#  define VIO_ATOMIC_THREAD_FENCE_RELEASE() __atomic_thread_fence(__ATOMIC_RELEASE)
+#  define VIO_ATOMIC_THREAD_FENCE_ACQUIRE() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#elif defined(PHP_WIN32)
+#  include <windows.h>
+#  define VIO_ATOMIC_THREAD_FENCE_RELEASE() MemoryBarrier()
+#  define VIO_ATOMIC_THREAD_FENCE_ACQUIRE() MemoryBarrier()
+#else
+#  define VIO_ATOMIC_THREAD_FENCE_RELEASE() do { } while (0)
+#  define VIO_ATOMIC_THREAD_FENCE_ACQUIRE() do { } while (0)
+#endif
+
+static int le_vio_async_font;
+
+typedef struct _vio_async_font_load {
+    char                    *path;          /* malloc */
+    float                    font_size;
+    const vio_backend       *backend;       /* captured at submit; render-thread use only */
+    unsigned char           *ttf_data;      /* malloc — raw TTF bytes */
+    size_t                   ttf_len;
+    unsigned char           *atlas_bitmap;  /* malloc — R8 coverage atlas */
+    vio_font_packed_glyph   *glyphs;        /* malloc — flat packed glyph array */
+    int                      glyph_count;
+    volatile int             done;          /* set last by the worker */
+    volatile int             failed;
+    int                      consumed;      /* poll already produced a result */
+} vio_async_font_load;
+
+#ifdef PHP_WIN32
+static unsigned __stdcall vio_font_load_thread(void *arg)
+#else
+static void *vio_font_load_thread(void *arg)
+#endif
+{
+    vio_async_font_load *load = (vio_async_font_load *)arg;
+
+    /* Read the whole TTF with libc stdio — thread-safe, unlike php_stream. */
+    FILE *fp = fopen(load->path, "rb");
+    if (fp) {
+        if (fseek(fp, 0, SEEK_END) == 0) {
+            long sz = ftell(fp);
+            if (sz > 0 && fseek(fp, 0, SEEK_SET) == 0) {
+                unsigned char *buf = (unsigned char *)malloc((size_t)sz);
+                if (buf && fread(buf, 1, (size_t)sz, fp) == (size_t)sz) {
+                    load->ttf_data = buf;
+                    load->ttf_len  = (size_t)sz;
+                } else {
+                    free(buf);
+                }
+            }
+        }
+        fclose(fp);
+    }
+
+    if (load->ttf_data) {
+        load->atlas_bitmap = (unsigned char *)calloc(1, (size_t)VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE);
+        if (load->atlas_bitmap) {
+            /* The pack return value is informational — stbtt_PackFontRanges
+             * returns 0 when *any* glyph overflowed the atlas, which is normal
+             * for large CJK fonts and which the synchronous vio_font() path
+             * also ignores. We only treat the load as failed when we couldn't
+             * allocate the glyph array at all (out_glyphs stays NULL), so a
+             * partially-packed atlas still produces a usable font. */
+            vio_font_pack_atlas_raw(load->ttf_data, load->font_size,
+                                    load->atlas_bitmap, VIO_FONT_ATLAS_SIZE,
+                                    &load->glyphs, &load->glyph_count);
+            if (!load->glyphs) {
+                load->failed = 1;
+            }
+        } else {
+            load->failed = 1;
+        }
+    } else {
+        load->failed = 1;
+    }
+
+    /* Release barrier: publish all the result writes (ttf_data, atlas_bitmap,
+     * glyphs, glyph_count, failed) BEFORE the render thread observes done == 1.
+     * Without this the compiler / CPU may make `done` visible while glyphs or
+     * atlas_bitmap still hold stale/NULL values, and the poll would then read a
+     * half-initialised struct — corrupting the Zend heap when it finalises the
+     * glyph map from a garbage pointer. (volatile alone orders the volatile
+     * stores but does not order the plain pointer stores against `done`.) */
+    VIO_ATOMIC_THREAD_FENCE_RELEASE();
+    load->done = 1;
+#ifdef PHP_WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+ZEND_FUNCTION(vio_font_load_async)
+{
+    zval *ctx_zval;
+    char *path;
+    size_t path_len;
+    double size = 24.0;
+
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STRING(path, path_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_DOUBLE(size)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        RETURN_FALSE;
+    }
+
+    vio_async_font_load *load = ecalloc(1, sizeof(vio_async_font_load));
+    /* path uses libc malloc — it is read on the worker thread */
+    load->path = (char *)malloc(path_len + 1);
+    if (!load->path) {
+        efree(load);
+        php_error_docref(NULL, E_WARNING, "Out of memory");
+        RETURN_FALSE;
+    }
+    memcpy(load->path, path, path_len);
+    load->path[path_len] = '\0';
+    load->font_size = (float)size;
+    load->backend   = ctx->backend;
+
+#ifdef PHP_WIN32
+    HANDLE thread = (HANDLE)_beginthreadex(NULL, 0, vio_font_load_thread, load, 0, NULL);
+    if (!thread) {
+        free(load->path);
+        efree(load);
+        php_error_docref(NULL, E_WARNING, "Failed to create font loading thread");
+        RETURN_FALSE;
+    }
+    CloseHandle(thread);
+#else
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, vio_font_load_thread, load) != 0) {
+        free(load->path);
+        efree(load);
+        php_error_docref(NULL, E_WARNING, "Failed to create font loading thread");
+        RETURN_FALSE;
+    }
+    pthread_detach(thread);
+#endif
+
+    zend_resource *res = zend_register_resource(load, le_vio_async_font);
+    RETURN_RES(res);
+}
+
+ZEND_FUNCTION(vio_font_load_poll)
+{
+    zval *res_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_RESOURCE(res_zval)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_async_font_load *load = (vio_async_font_load *)zend_fetch_resource(
+        Z_RES_P(res_zval), "vio_async_font", le_vio_async_font);
+    if (!load) {
+        RETURN_FALSE;
+    }
+
+    /* A previous poll already produced a result for this handle. Report failure
+     * (the result was returned once and the worker buffers are gone), but do
+     * NOT touch the resource — see the buffer-freeing note below. */
+    if (load->consumed) {
+        RETURN_FALSE;
+    }
+
+    if (!load->done) {
+        RETURN_NULL(); /* Still loading */
+    }
+
+    /* Acquire barrier paired with the worker's release fence: now that we have
+     * observed done == 1, this guarantees the result fields below (failed,
+     * ttf_data, atlas_bitmap, glyphs, glyph_count) reflect the worker's
+     * completed writes rather than stale values. */
+    VIO_ATOMIC_THREAD_FENCE_ACQUIRE();
+
+    /* Mark consumed and release the worker buffers eagerly here rather than via
+     * zend_list_delete(): deleting the resource from inside the poll frees it
+     * while the caller may still hold a PHP reference to the handle (e.g. in an
+     * array passed by reference), which leaves a dangling resource that is
+     * double-freed at request shutdown and corrupts the Zend heap. Instead we
+     * free the (libc-allocated) worker buffers now, flag the load consumed, and
+     * let the resource die naturally when PHP drops its last reference — the
+     * dtor then sees consumed and frees nothing. */
+    load->consumed = 1;
+
+    if (load->failed) {
+        if (load->ttf_data)     { free(load->ttf_data);     load->ttf_data = NULL; }
+        if (load->atlas_bitmap) { free(load->atlas_bitmap); load->atlas_bitmap = NULL; }
+        if (load->glyphs)       { free(load->glyphs);       load->glyphs = NULL; }
+        RETURN_FALSE;
+    }
+
+    /* Worker finished the CPU-only work. Build the VioFont on the render
+     * thread: copy the TTF into Zend memory, populate the glyph map, and
+     * upload the atlas to the GPU (current render context required). */
+    zval font_zval;
+    object_init_ex(&font_zval, vio_font_ce);
+    vio_font_object *font = Z_VIO_FONT_P(&font_zval);
+
+    font->font_size = load->font_size;
+    font->backend   = load->backend;
+    font->ttf_len   = load->ttf_len;
+    font->ttf_data  = emalloc(load->ttf_len);
+    memcpy(font->ttf_data, load->ttf_data, load->ttf_len);
+
+    vio_font_finalize_glyphs(font, load->glyphs, load->glyph_count);
+    vio_font_upload_atlas_to_gpu(font, load->backend, load->atlas_bitmap);
+
+    font->valid = 1;
+
+    /* Release the worker buffers now — they have been fully consumed. The
+     * resource itself stays alive until PHP releases the handle. */
+    if (load->ttf_data)     { free(load->ttf_data);     load->ttf_data = NULL; }
+    if (load->atlas_bitmap) { free(load->atlas_bitmap); load->atlas_bitmap = NULL; }
+    if (load->glyphs)       { free(load->glyphs);       load->glyphs = NULL; }
+
+    RETURN_COPY_VALUE(&font_zval);
+}
+
+static void vio_async_font_dtor(zend_resource *res)
+{
+    vio_async_font_load *load = (vio_async_font_load *)res->ptr;
+    if (load) {
+        /* If still loading, we can't safely free the worker buffers — wait. */
+        while (!load->done) {
+            usleep(1000);
+        }
+        if (load->ttf_data)     free(load->ttf_data);
+        if (load->atlas_bitmap) free(load->atlas_bitmap);
+        if (load->glyphs)       free(load->glyphs);
+        if (load->path)         free(load->path);
         efree(load);
     }
 }
@@ -7641,6 +7947,7 @@ PHP_MINIT_FUNCTION(vio)
 {
     REGISTER_INI_ENTRIES();
     le_vio_async_load = zend_register_list_destructors_ex(vio_async_load_dtor, NULL, "vio_async_load", module_number);
+    le_vio_async_font = zend_register_list_destructors_ex(vio_async_font_dtor, NULL, "vio_async_font", module_number);
     vio_plugin_registry_init();
     vio_backend_registry_init();
     vio_backend_null_register();
