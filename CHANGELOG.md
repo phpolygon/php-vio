@@ -1,3 +1,15 @@
+# [2.0.0](https://github.com/phpolygon/php-vio/compare/v1.23.0...v2.0.0) (2026-06-19)
+
+
+* chore!: drop PHP 8.4, require PHP 8.5 ([2c598ca](https://github.com/phpolygon/php-vio/commit/2c598cadfc8315ed4e1336166610cc20a908b8b9))
+
+
+### BREAKING CHANGES
+
+* PHP 8.4 is no longer supported.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
 # [1.23.0](https://github.com/phpolygon/php-vio/compare/v1.22.0...v1.23.0) (2026-06-19)
 
 
