@@ -18,7 +18,7 @@ A PHP extension that brings GPU rendering, audio, video recording, streaming, an
 
 ## Requirements
 
-- PHP >= 8.4
+- PHP >= 8.5
 
 All native libraries are optional — the extension compiles and runs without them, features are simply unavailable at runtime:
 
