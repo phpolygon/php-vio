@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        php: ['8.4', '8.5']
+        php: ['8.5']
     steps:
       - uses: actions/checkout@v4
 
@@ -79,7 +79,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     strategy:
       matrix:
-        php: ['8.4', '8.5']
+        php: ['8.5']
     steps:
       - uses: actions/checkout@v4
 
@@ -132,7 +132,7 @@ jobs:
     runs-on: macos-15
     strategy:
       matrix:
-        php: ['8.4', '8.5']
+        php: ['8.5']
     steps:
       - uses: actions/checkout@v4
 
@@ -179,7 +179,7 @@ jobs:
     runs-on: macos-15
     strategy:
       matrix:
-        php: ['8.4', '8.5']
+        php: ['8.5']
     steps:
       - uses: actions/checkout@v4
 
@@ -231,7 +231,7 @@ jobs:
     runs-on: windows-2022
     strategy:
       matrix:
-        php: ['8.4', '8.5']
+        php: ['8.5']
         ts: ['nts', 'ts']
     steps:
       - uses: actions/checkout@v4
