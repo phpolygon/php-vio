@@ -1,3 +1,10 @@
+# [1.23.0](https://github.com/phpolygon/php-vio/compare/v1.22.0...v1.23.0) (2026-06-19)
+
+
+### Features
+
+* **font:** async font loading on a background thread (vio_font_load_async) ([ff3a3b3](https://github.com/phpolygon/php-vio/commit/ff3a3b3d060a29026ad800d0e7bfd328cdfb496d))
+
 # [1.22.0](https://github.com/phpolygon/php-vio/compare/v1.21.1...v1.22.0) (2026-06-16)
 
 
