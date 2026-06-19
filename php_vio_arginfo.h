@@ -504,6 +504,16 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_vio_texture_load_poll, 0, 0, 1)
 	ZEND_ARG_INFO(0, handle)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_vio_font_load_async, 0, 0, 2)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, size, IS_DOUBLE, 0, "24.0")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_vio_font_load_poll, 0, 0, 1)
+	ZEND_ARG_INFO(0, handle)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_texture_size, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
 ZEND_END_ARG_INFO()
@@ -700,6 +710,8 @@ ZEND_FUNCTION(vio_plugins);
 ZEND_FUNCTION(vio_plugin_info);
 ZEND_FUNCTION(vio_texture_load_async);
 ZEND_FUNCTION(vio_texture_load_poll);
+ZEND_FUNCTION(vio_font_load_async);
+ZEND_FUNCTION(vio_font_load_poll);
 ZEND_FUNCTION(vio_texture_size);
 ZEND_FUNCTION(vio_viewport);
 ZEND_FUNCTION(vio_draw_3d);
@@ -820,6 +832,8 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_plugin_info, arginfo_vio_plugin_info)
 	ZEND_FE(vio_texture_load_async, arginfo_vio_texture_load_async)
 	ZEND_FE(vio_texture_load_poll, arginfo_vio_texture_load_poll)
+	ZEND_FE(vio_font_load_async, arginfo_vio_font_load_async)
+	ZEND_FE(vio_font_load_poll, arginfo_vio_font_load_poll)
 	ZEND_FE(vio_texture_size, arginfo_vio_texture_size)
 	ZEND_FE(vio_viewport, arginfo_vio_viewport)
 	ZEND_FE(vio_draw_3d, arginfo_vio_draw_3d)

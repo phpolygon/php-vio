@@ -682,6 +682,34 @@ function vio_texture_load_async(string $path): mixed {}
 function vio_texture_load_poll(mixed $handle): array|null|false {}
 
 /**
+ * Start loading a TTF/OTF font asynchronously in a background thread.
+ *
+ * The CPU-heavy work — reading the file and rasterizing the multi-range glyph
+ * atlas with stb_truetype — runs on a worker thread, so loading large fallback
+ * fonts (e.g. CJK NotoSansSC/KR, ~13 MB / ~32k glyphs) no longer stalls the
+ * render thread. The GPU upload is deferred to vio_font_load_poll(), which must
+ * be called on the render thread.
+ *
+ * @param string $path Path to the TTF/OTF file
+ * @param float  $size Pixel size to rasterize the atlas at
+ * @return resource|false Async load handle or false on failure
+ */
+function vio_font_load_async(VioContext $context, string $path, float $size = 24.0): mixed {}
+
+/**
+ * Poll an async font load for completion.
+ *
+ * Returns null while still loading, false on failure, or a ready-to-use VioFont
+ * once the worker has finished. The font's atlas is uploaded to the GPU inside
+ * this call, so it must run on the render thread (a current GL/Metal/D3D/Vulkan
+ * context). The returned VioFont is interchangeable with one from vio_font().
+ *
+ * @param resource $handle Handle from vio_font_load_async()
+ * @return VioFont|null|false The font, null if pending, false on failure
+ */
+function vio_font_load_poll(mixed $handle): VioFont|null|false {}
+
+/**
  * Get the dimensions of a texture.
  * @return array{0: int, 1: int}
  */

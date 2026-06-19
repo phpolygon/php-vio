@@ -70,8 +70,13 @@ void vio_font_register(void)
     vio_font_handlers.clone_obj = NULL;
 }
 
-int vio_font_pack_atlas(vio_font_object *font, unsigned char *atlas_bitmap, int atlas_size)
+int vio_font_pack_atlas_raw(const unsigned char *ttf_data, float font_size,
+                            unsigned char *atlas_bitmap, int atlas_size,
+                            vio_font_packed_glyph **out_glyphs, int *out_count)
 {
+    *out_glyphs = NULL;
+    *out_count  = 0;
+
     stbtt_pack_context spc;
     if (!stbtt_PackBegin(&spc, atlas_bitmap, atlas_size, atlas_size, 0, 1, NULL)) {
         return 0;
@@ -79,13 +84,22 @@ int vio_font_pack_atlas(vio_font_object *font, unsigned char *atlas_bitmap, int 
     stbtt_PackSetOversampling(&spc, 1, 1);
     stbtt_PackSetSkipMissingCodepoints(&spc, 1);
 
-    /* Build pack_range array + allocate chardata per range */
+    /* Build pack_range array + allocate chardata per range. This path may run
+     * on a worker thread, so it uses libc malloc/free (NOT emalloc/efree —
+     * the Zend allocator is per-request and not thread-safe). */
     stbtt_pack_range ranges[VIO_FONT_NUM_RANGES];
     stbtt_packedchar *range_chardata[VIO_FONT_NUM_RANGES];
+    int total_slots = 0;
 
     for (int r = 0; r < VIO_FONT_NUM_RANGES; r++) {
-        range_chardata[r] = ecalloc(vio_font_ranges[r].num_chars, sizeof(stbtt_packedchar));
-        ranges[r].font_size                       = font->font_size;
+        range_chardata[r] = (stbtt_packedchar *)calloc(vio_font_ranges[r].num_chars, sizeof(stbtt_packedchar));
+        if (!range_chardata[r]) {
+            for (int k = 0; k < r; k++) free(range_chardata[k]);
+            stbtt_PackEnd(&spc);
+            return 0;
+        }
+        total_slots += vio_font_ranges[r].num_chars;
+        ranges[r].font_size                       = font_size;
         ranges[r].first_unicode_codepoint_in_range = vio_font_ranges[r].first_codepoint;
         ranges[r].array_of_unicode_codepoints      = NULL;
         ranges[r].num_chars                        = vio_font_ranges[r].num_chars;
@@ -94,31 +108,65 @@ int vio_font_pack_atlas(vio_font_object *font, unsigned char *atlas_bitmap, int 
         ranges[r].v_oversample                     = 1;
     }
 
-    int pack_ok = stbtt_PackFontRanges(&spc, font->ttf_data, 0, ranges, VIO_FONT_NUM_RANGES);
+    int pack_ok = stbtt_PackFontRanges(&spc, (unsigned char *)ttf_data, 0, ranges, VIO_FONT_NUM_RANGES);
     stbtt_PackEnd(&spc);
 
-    /* Populate glyph hashmap from packed ranges */
-    for (int r = 0; r < VIO_FONT_NUM_RANGES; r++) {
-        int first = vio_font_ranges[r].first_codepoint;
-        int count = vio_font_ranges[r].num_chars;
-        for (int c = 0; c < count; c++) {
-            stbtt_packedchar *pc = &range_chardata[r][c];
-            /* Skip glyphs that were not packed (zero-size AND no advance, e.g. missing glyph).
-             * Keep zero-size glyphs with xadvance > 0 (e.g. space). */
-            if (pc->x1 == pc->x0 && pc->y1 == pc->y0 && pc->xadvance == 0.0f) continue;
-            zend_long cp = (zend_long)(first + c);
-            vio_stbtt_packedchar vpc;
-            vpc.x0 = pc->x0; vpc.y0 = pc->y0;
-            vpc.x1 = pc->x1; vpc.y1 = pc->y1;
-            vpc.xoff = pc->xoff; vpc.yoff = pc->yoff;
-            vpc.xadvance = pc->xadvance;
-            vpc.xoff2 = pc->xoff2; vpc.yoff2 = pc->yoff2;
-            zval zv;
-            ZVAL_STRINGL(&zv, (char *)&vpc, sizeof(vio_stbtt_packedchar));
-            zend_hash_index_update(&font->glyph_map, cp, &zv);
+    /* Collapse the per-range chardata into one flat array of (codepoint, pc)
+     * pairs, skipping unpacked glyphs. total_slots is the upper bound. */
+    vio_font_packed_glyph *glyphs = (vio_font_packed_glyph *)malloc((size_t)total_slots * sizeof(vio_font_packed_glyph));
+    int n = 0;
+    if (glyphs) {
+        for (int r = 0; r < VIO_FONT_NUM_RANGES; r++) {
+            int first = vio_font_ranges[r].first_codepoint;
+            int count = vio_font_ranges[r].num_chars;
+            for (int c = 0; c < count; c++) {
+                stbtt_packedchar *pc = &range_chardata[r][c];
+                /* Skip glyphs that were not packed (zero-size AND no advance,
+                 * e.g. missing glyph). Keep zero-size glyphs with xadvance > 0
+                 * (e.g. space). */
+                if (pc->x1 == pc->x0 && pc->y1 == pc->y0 && pc->xadvance == 0.0f) continue;
+                vio_font_packed_glyph *g = &glyphs[n++];
+                g->codepoint   = first + c;
+                g->pc.x0       = pc->x0; g->pc.y0 = pc->y0;
+                g->pc.x1       = pc->x1; g->pc.y1 = pc->y1;
+                g->pc.xoff     = pc->xoff; g->pc.yoff = pc->yoff;
+                g->pc.xadvance = pc->xadvance;
+                g->pc.xoff2    = pc->xoff2; g->pc.yoff2 = pc->yoff2;
+            }
         }
-        efree(range_chardata[r]);
     }
 
+    for (int r = 0; r < VIO_FONT_NUM_RANGES; r++) free(range_chardata[r]);
+
+    if (!glyphs) {
+        return 0;
+    }
+
+    *out_glyphs = glyphs;
+    *out_count  = n;
+    return pack_ok;
+}
+
+void vio_font_finalize_glyphs(vio_font_object *font,
+                              const vio_font_packed_glyph *glyphs, int count)
+{
+    for (int i = 0; i < count; i++) {
+        zend_long cp = (zend_long)glyphs[i].codepoint;
+        zval zv;
+        ZVAL_STRINGL(&zv, (char *)&glyphs[i].pc, sizeof(vio_stbtt_packedchar));
+        zend_hash_index_update(&font->glyph_map, cp, &zv);
+    }
+}
+
+int vio_font_pack_atlas(vio_font_object *font, unsigned char *atlas_bitmap, int atlas_size)
+{
+    vio_font_packed_glyph *glyphs = NULL;
+    int count = 0;
+    int pack_ok = vio_font_pack_atlas_raw(font->ttf_data, font->font_size,
+                                          atlas_bitmap, atlas_size, &glyphs, &count);
+    if (glyphs) {
+        vio_font_finalize_glyphs(font, glyphs, count);
+        free(glyphs);
+    }
     return pack_ok;
 }

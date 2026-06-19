@@ -126,6 +126,7 @@ vio_destroy($ctx);
 | 2D | `vio_rect`, `vio_circle`, `vio_line`, `vio_sprite`, `vio_text`, `vio_draw_2d` |
 | 3D | `vio_mesh`, `vio_shader`, `vio_pipeline`, `vio_bind_pipeline`, `vio_draw` |
 | Textures | `vio_texture`, `vio_bind_texture`, `vio_texture_load_async` |
+| Fonts | `vio_font`, `vio_text`, `vio_text_measure`, `vio_font_load_async` |
 | Buffers | `vio_uniform_buffer`, `vio_update_buffer` |
 | Audio | `vio_audio_load`, `vio_audio_play`, `vio_audio_pause`, `vio_audio_stop` |
 | Recording | `vio_recorder`, `vio_recorder_capture`, `vio_recorder_stop` |
