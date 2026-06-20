@@ -17,6 +17,7 @@ typedef struct _vio_2d_d3d11_state {
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps_shapes;
     ID3D11PixelShader       *ps_sprites;
+    ID3D11PixelShader       *ps_text;    /* R8 glyph atlas (samples .r as alpha) */
     ID3D11BlendState        *blend_state;
     ID3D11RasterizerState   *rasterizer_state;
     ID3D11DepthStencilState *depth_stencil_state;

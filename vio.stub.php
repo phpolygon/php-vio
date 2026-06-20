@@ -191,8 +191,10 @@ function vio_set_windowed(VioContext $context): void {}
 
 /**
  * Switch to exclusive fullscreen mode.
+ *
+ * @param int $monitor Monitor index (from vio_monitors); -1 = primary monitor.
  */
-function vio_set_fullscreen(VioContext $context): void {}
+function vio_set_fullscreen(VioContext $context, int $monitor = -1): void {}
 
 /**
  * Get the window size in screen coordinates.
@@ -224,6 +226,23 @@ function vio_framebuffer_size(VioContext $context): array {}
  * @return array{0: float, 1: float}
  */
 function vio_content_scale(VioContext $context): array {}
+
+/**
+ * Get information about the primary monitor: native video mode (physical
+ * pixels), work area (excludes the taskbar), content scale and name.
+ *
+ * @return array{width:int, height:int, refresh_rate:int, work_x:int, work_y:int, work_width:int, work_height:int, scale_x:float, scale_y:float, name:string}
+ */
+function vio_monitor_info(VioContext $context): array {}
+
+/**
+ * Enumerate all connected monitors. Each entry has its index (usable with
+ * vio_set_fullscreen), name, primary flag, virtual-desktop position, native
+ * video mode (physical pixels), work area, refresh rate and content scale.
+ *
+ * @return list<array{index:int, name:string, primary:bool, x:int, y:int, width:int, height:int, refresh_rate:int, work_x:int, work_y:int, work_width:int, work_height:int, scale_x:float, scale_y:float}>
+ */
+function vio_monitors(VioContext $context): array {}
 
 /**
  * Get the pixel ratio (framebuffer width / window width).

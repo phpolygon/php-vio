@@ -626,7 +626,7 @@ static void *d3d11_create_texture(vio_texture_desc *desc)
     td.Height = desc->height;
     td.MipLevels = desc->mipmaps ? 0 : 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.Format = desc->single_channel ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -639,7 +639,7 @@ static void *d3d11_create_texture(vio_texture_desc *desc)
     D3D11_SUBRESOURCE_DATA *init_ptr = NULL;
     if (desc->data) {
         init_data.pSysMem = desc->data;
-        init_data.SysMemPitch = desc->width * 4; /* RGBA */
+        init_data.SysMemPitch = desc->width * (desc->single_channel ? 1 : 4);
         init_ptr = desc->mipmaps ? NULL : &init_data; /* GenerateMips needs SRV first */
     }
 

@@ -1284,9 +1284,12 @@ ZEND_FUNCTION(vio_set_windowed)
 ZEND_FUNCTION(vio_set_fullscreen)
 {
     zval *ctx_zval;
+    zend_long monitor_index = -1; /* -1 = primary monitor (default) */
 
-    ZEND_PARSE_PARAMETERS_START(1, 1)
+    ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(monitor_index)
     ZEND_PARSE_PARAMETERS_END();
 
 #ifdef HAVE_GLFW
@@ -1301,10 +1304,24 @@ ZEND_FUNCTION(vio_set_fullscreen)
         ctx->has_saved_win_geometry = 1;
     }
 
-    GLFWmonitor *monitor = glfwGetPrimaryMonitor();
+    /* Pick the requested monitor by index; fall back to primary for -1 or an
+     * out-of-range index (e.g. a monitor that was unplugged since selection). */
+    GLFWmonitor *monitor = NULL;
+    if (monitor_index >= 0) {
+        int count = 0;
+        GLFWmonitor **mons = glfwGetMonitors(&count);
+        if (mons && monitor_index < count) {
+            monitor = mons[monitor_index];
+        }
+    }
+    if (!monitor) {
+        monitor = glfwGetPrimaryMonitor();
+    }
     const GLFWvidmode *mode = glfwGetVideoMode(monitor);
-    glfwSetWindowMonitor(ctx->window, monitor,
-        0, 0, mode->width, mode->height, mode->refreshRate);
+    if (mode) {
+        glfwSetWindowMonitor(ctx->window, monitor,
+            0, 0, mode->width, mode->height, mode->refreshRate);
+    }
 #endif
 }
 
@@ -1473,6 +1490,97 @@ ZEND_FUNCTION(vio_content_scale)
 #endif
     add_next_index_double(return_value, 1.0);
     add_next_index_double(return_value, 1.0);
+}
+
+ZEND_FUNCTION(vio_monitor_info)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    (void)ctx_zval; /* monitor info is window-independent; ctx just guards init */
+
+    array_init(return_value);
+#ifdef HAVE_GLFW
+    GLFWmonitor *monitor = glfwGetPrimaryMonitor();
+    if (monitor) {
+        const GLFWvidmode *mode = glfwGetVideoMode(monitor);
+        int wx = 0, wy = 0, ww = 0, wh = 0;
+        float sx = 1.0f, sy = 1.0f;
+        const char *name = glfwGetMonitorName(monitor);
+        glfwGetMonitorWorkarea(monitor, &wx, &wy, &ww, &wh);
+        glfwGetMonitorContentScale(monitor, &sx, &sy);
+        add_assoc_long(return_value, "width", mode ? mode->width : 0);
+        add_assoc_long(return_value, "height", mode ? mode->height : 0);
+        add_assoc_long(return_value, "refresh_rate", mode ? mode->refreshRate : 0);
+        add_assoc_long(return_value, "work_x", wx);
+        add_assoc_long(return_value, "work_y", wy);
+        add_assoc_long(return_value, "work_width", ww);
+        add_assoc_long(return_value, "work_height", wh);
+        add_assoc_double(return_value, "scale_x", (double)sx);
+        add_assoc_double(return_value, "scale_y", (double)sy);
+        add_assoc_string(return_value, "name", name ? name : "");
+        return;
+    }
+#endif
+    add_assoc_long(return_value, "width", 0);
+    add_assoc_long(return_value, "height", 0);
+    add_assoc_long(return_value, "refresh_rate", 0);
+    add_assoc_long(return_value, "work_x", 0);
+    add_assoc_long(return_value, "work_y", 0);
+    add_assoc_long(return_value, "work_width", 0);
+    add_assoc_long(return_value, "work_height", 0);
+    add_assoc_double(return_value, "scale_x", 1.0);
+    add_assoc_double(return_value, "scale_y", 1.0);
+    add_assoc_string(return_value, "name", "");
+}
+
+ZEND_FUNCTION(vio_monitors)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    (void)ctx_zval;
+
+    array_init(return_value);
+#ifdef HAVE_GLFW
+    int count = 0;
+    GLFWmonitor **mons = glfwGetMonitors(&count);
+    GLFWmonitor *primary = glfwGetPrimaryMonitor();
+    for (int i = 0; i < count; i++) {
+        GLFWmonitor *m = mons[i];
+        const GLFWvidmode *mode = glfwGetVideoMode(m);
+        int mx = 0, my = 0, wx = 0, wy = 0, ww = 0, wh = 0;
+        float sx = 1.0f, sy = 1.0f;
+        const char *name = glfwGetMonitorName(m);
+        glfwGetMonitorPos(m, &mx, &my);
+        glfwGetMonitorWorkarea(m, &wx, &wy, &ww, &wh);
+        glfwGetMonitorContentScale(m, &sx, &sy);
+
+        zval entry;
+        array_init(&entry);
+        add_assoc_long(&entry, "index", i);
+        add_assoc_string(&entry, "name", name ? name : "");
+        add_assoc_bool(&entry, "primary", m == primary);
+        add_assoc_long(&entry, "x", mx);
+        add_assoc_long(&entry, "y", my);
+        add_assoc_long(&entry, "width", mode ? mode->width : 0);
+        add_assoc_long(&entry, "height", mode ? mode->height : 0);
+        add_assoc_long(&entry, "refresh_rate", mode ? mode->refreshRate : 0);
+        add_assoc_long(&entry, "work_x", wx);
+        add_assoc_long(&entry, "work_y", wy);
+        add_assoc_long(&entry, "work_width", ww);
+        add_assoc_long(&entry, "work_height", wh);
+        add_assoc_double(&entry, "scale_x", (double)sx);
+        add_assoc_double(&entry, "scale_y", (double)sy);
+        add_next_index_zval(return_value, &entry);
+    }
+#endif
 }
 
 ZEND_FUNCTION(vio_pixel_ratio)
@@ -3558,79 +3666,57 @@ static void vio_font_upload_atlas_to_gpu(vio_font_object *font,
                                          unsigned char *atlas_bitmap)
 {
     if (backend && backend->upload_font_atlas) {
-        backend->upload_font_atlas(font, VIO_FONT_ATLAS_SIZE, VIO_FONT_ATLAS_SIZE, atlas_bitmap, 1);
+        backend->upload_font_atlas(font, font->atlas_w, font->atlas_h, atlas_bitmap, 1);
     }
 
 #ifdef HAVE_D3D11
     if (backend && strcmp(backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
-        /* Convert R8 atlas to R8G8B8A8 with white RGB and alpha from bitmap.
-         * HLSL shader samples .a, so the glyph coverage goes into alpha. */
-        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
-        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
-            rgba[p * 4 + 0] = 255;
-            rgba[p * 4 + 1] = 255;
-            rgba[p * 4 + 2] = 255;
-            rgba[p * 4 + 3] = atlas_bitmap[p];
-        }
-
+        /* Upload the R8 coverage atlas directly as a single-channel texture —
+         * no white-RGB/coverage-alpha RGBA8 expansion. ps_text samples .r as
+         * the glyph alpha, so the upload is 1/4 the size and skips the per-texel
+         * conversion loop. */
         vio_texture_desc desc = {0};
-        desc.width  = VIO_FONT_ATLAS_SIZE;
-        desc.height = VIO_FONT_ATLAS_SIZE;
-        desc.data   = rgba;
+        desc.width  = font->atlas_w;
+        desc.height = font->atlas_h;
+        desc.data   = atlas_bitmap;
         desc.filter = VIO_FILTER_LINEAR;
         desc.wrap   = VIO_WRAP_CLAMP;
         desc.mipmaps = 0;
+        desc.single_channel = 1;
         font->atlas_backend_texture = backend->create_texture(&desc);
-        efree(rgba);
     }
 #endif
 
 #ifdef HAVE_D3D12
     if (backend && strcmp(backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
-        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
-        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
-            rgba[p * 4 + 0] = 255;
-            rgba[p * 4 + 1] = 255;
-            rgba[p * 4 + 2] = 255;
-            rgba[p * 4 + 3] = atlas_bitmap[p];
-        }
-
+        /* R8 coverage atlas uploaded directly; the SRV swizzles it to
+         * (1,1,1,R) so the shared sprite pipeline renders glyphs unchanged. */
         vio_texture_desc desc = {0};
-        desc.width  = VIO_FONT_ATLAS_SIZE;
-        desc.height = VIO_FONT_ATLAS_SIZE;
-        desc.data   = rgba;
+        desc.width  = font->atlas_w;
+        desc.height = font->atlas_h;
+        desc.data   = atlas_bitmap;
         desc.filter = VIO_FILTER_LINEAR;
         desc.wrap   = VIO_WRAP_CLAMP;
         desc.mipmaps = 0;
+        desc.single_channel = 1;
         font->atlas_backend_texture = backend->create_texture(&desc);
-        efree(rgba);
     }
 #endif
 
 #ifdef HAVE_VULKAN
     if (backend && strcmp(backend->name, "vulkan") == 0 && vio_vk.initialized) {
-        /* Expand the R8 coverage atlas to RGBA8 (white RGB, coverage in alpha)
-         * so the single sprites pipeline serves both PNG sprites and glyphs:
-         * the sprite shader computes texture(uTexture, uv) * vColor, and a
-         * white-RGB / coverage-alpha texel multiplied by the vertex color
-         * tints the glyph and applies coverage as alpha — identical to D3D12. */
-        unsigned char *rgba = emalloc(VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE * 4);
-        for (int p = 0; p < VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE; p++) {
-            rgba[p * 4 + 0] = 255;
-            rgba[p * 4 + 1] = 255;
-            rgba[p * 4 + 2] = 255;
-            rgba[p * 4 + 3] = atlas_bitmap[p];
-        }
-
+        /* Upload the R8 coverage atlas directly; the image view swizzles it to
+         * (1,1,1,R) (white RGB, coverage in alpha) so the single sprites
+         * pipeline serves both PNG sprites and glyphs — no RGBA8 expansion. */
         vio_texture_desc desc = {0};
-        desc.width  = VIO_FONT_ATLAS_SIZE;
-        desc.height = VIO_FONT_ATLAS_SIZE;
-        desc.data   = rgba;
+        desc.width  = font->atlas_w;
+        desc.height = font->atlas_h;
+        desc.data   = atlas_bitmap;
         desc.filter = VIO_FILTER_LINEAR;
         desc.wrap   = VIO_WRAP_CLAMP;
         desc.mipmaps = 0;
+        desc.single_channel = 1;
         font->atlas_backend_texture = backend->create_texture(&desc);
-        efree(rgba);
     }
 #endif
 }
@@ -3682,15 +3768,23 @@ ZEND_FUNCTION(vio_font)
     memcpy(font->ttf_data, ZSTR_VAL(contents), font->ttf_len);
     zend_string_release(contents);
 
-    /* Multi-range atlas packing (Latin, Cyrillic, Greek, CJK, Hangul, etc.) */
-    int atlas_size = VIO_FONT_ATLAS_SIZE;
-    unsigned char *atlas_bitmap = ecalloc(1, atlas_size * atlas_size);
-
-    vio_font_pack_atlas(font, atlas_bitmap, atlas_size);
-
-    vio_font_upload_atlas_to_gpu(font, ctx->backend, atlas_bitmap);
-
-    efree(atlas_bitmap);
+    /* Multi-range atlas packing (Latin, Cyrillic, Greek, CJK, Hangul, etc.),
+     * dynamically sized to this font's actual glyph set (libc-allocated). */
+    unsigned char *atlas_bitmap = NULL;
+    int atlas_side = 0;
+    vio_font_packed_glyph *glyphs = NULL;
+    int glyph_count = 0;
+    vio_font_pack_atlas_dynamic(font->ttf_data, font->font_size,
+                                &atlas_bitmap, &atlas_side, &glyphs, &glyph_count);
+    if (atlas_bitmap) {
+        font->atlas_w = font->atlas_h = atlas_side;
+        if (glyphs) {
+            vio_font_finalize_glyphs(font, glyphs, glyph_count);
+            free(glyphs);
+        }
+        vio_font_upload_atlas_to_gpu(font, ctx->backend, atlas_bitmap);
+        free(atlas_bitmap);
+    }
 
     font->valid = 1;
     RETURN_COPY_VALUE(&font_zval);
@@ -5778,6 +5872,7 @@ typedef struct _vio_async_font_load {
     unsigned char           *ttf_data;      /* malloc — raw TTF bytes */
     size_t                   ttf_len;
     unsigned char           *atlas_bitmap;  /* malloc — R8 coverage atlas */
+    int                      atlas_side;     /* dynamic atlas dimension (square) */
     vio_font_packed_glyph   *glyphs;        /* malloc — flat packed glyph array */
     int                      glyph_count;
     volatile int             done;          /* set last by the worker */
@@ -5812,21 +5907,14 @@ static void *vio_font_load_thread(void *arg)
     }
 
     if (load->ttf_data) {
-        load->atlas_bitmap = (unsigned char *)calloc(1, (size_t)VIO_FONT_ATLAS_SIZE * VIO_FONT_ATLAS_SIZE);
-        if (load->atlas_bitmap) {
-            /* The pack return value is informational — stbtt_PackFontRanges
-             * returns 0 when *any* glyph overflowed the atlas, which is normal
-             * for large CJK fonts and which the synchronous vio_font() path
-             * also ignores. We only treat the load as failed when we couldn't
-             * allocate the glyph array at all (out_glyphs stays NULL), so a
-             * partially-packed atlas still produces a usable font. */
-            vio_font_pack_atlas_raw(load->ttf_data, load->font_size,
-                                    load->atlas_bitmap, VIO_FONT_ATLAS_SIZE,
+        /* Dynamically-sized atlas: the bitmap is malloc'd at the smallest size
+         * that fits this font's glyphs (down to ~512² for small Latin sizes vs
+         * the old fixed 4096²). A partially-packed atlas still produces a usable
+         * font, so only a NULL bitmap / glyph array counts as failure. */
+        vio_font_pack_atlas_dynamic(load->ttf_data, load->font_size,
+                                    &load->atlas_bitmap, &load->atlas_side,
                                     &load->glyphs, &load->glyph_count);
-            if (!load->glyphs) {
-                load->failed = 1;
-            }
-        } else {
+        if (!load->atlas_bitmap || !load->glyphs) {
             load->failed = 1;
         }
     } else {
@@ -5967,6 +6055,7 @@ ZEND_FUNCTION(vio_font_load_poll)
     font->ttf_data  = emalloc(load->ttf_len);
     memcpy(font->ttf_data, load->ttf_data, load->ttf_len);
 
+    font->atlas_w = font->atlas_h = load->atlas_side;
     vio_font_finalize_glyphs(font, load->glyphs, load->glyph_count);
     vio_font_upload_atlas_to_gpu(font, load->backend, load->atlas_bitmap);
 

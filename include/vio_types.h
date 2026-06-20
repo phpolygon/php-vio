@@ -256,6 +256,8 @@ typedef struct _vio_texture_desc {
     vio_filter  filter;
     vio_wrap    wrap;
     int         mipmaps;
+    int         single_channel; /* 1 => R8 (1 byte/px, e.g. font coverage atlas);
+                                   0 => RGBA8. data must match the chosen format. */
 } vio_texture_desc;
 
 typedef struct _vio_shader_desc {

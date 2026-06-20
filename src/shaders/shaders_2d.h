@@ -68,6 +68,18 @@ static const char *vio_2d_hlsl_ps_sprites =
     "    return uTexture.Sample(uSampler, i.uv) * i.col;\n"
     "}\n";
 
+/* Glyph atlas is an R8 coverage texture (single channel). Sample .r as alpha
+ * and take RGB straight from the vertex colour — the white-RGB/coverage-alpha
+ * RGBA8 expansion is no longer needed, so the atlas uploads at 1/4 the size. */
+static const char *vio_2d_hlsl_ps_text =
+    "Texture2D    uTexture : register(t0);\n"
+    "SamplerState uSampler : register(s0);\n"
+    "struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };\n"
+    "float4 main(PS_IN i) : SV_TARGET {\n"
+    "    float a = uTexture.Sample(uSampler, i.uv).r;\n"
+    "    return float4(i.col.rgb, i.col.a * a);\n"
+    "}\n";
+
 /* ── Vulkan GLSL variants (explicit bindings → SPIR-V) ───────────────
  *
  * The shared GLSL above relies on the glslang AUTO_MAP_BINDINGS +

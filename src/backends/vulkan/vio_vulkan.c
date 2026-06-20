@@ -1002,9 +1002,9 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
     const int is3d   = desc->depth > 0;
     tex->depth = is3d ? vdepth : 0;
 
-    const VkFormat   fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    const VkFormat   fmt = desc->single_channel ? VK_FORMAT_R8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
     const VkDeviceSize img_bytes = (VkDeviceSize)desc->width * (VkDeviceSize)desc->height
-                                   * (VkDeviceSize)vdepth * 4u;
+                                   * (VkDeviceSize)vdepth * (desc->single_channel ? 1u : 4u);
 
     /* 1. DEVICE_LOCAL sampled image. */
     VkImageCreateInfo img_info = {0};
@@ -1162,6 +1162,14 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
     iv.image    = tex->image;
     iv.viewType = is3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
     iv.format   = fmt;
+    if (desc->single_channel) {
+        /* R8 glyph atlas → present it to the shared sprite shader as
+         * (1,1,1,R): white RGB, coverage in alpha. No separate text shader. */
+        iv.components.r = VK_COMPONENT_SWIZZLE_ONE;
+        iv.components.g = VK_COMPONENT_SWIZZLE_ONE;
+        iv.components.b = VK_COMPONENT_SWIZZLE_ONE;
+        iv.components.a = VK_COMPONENT_SWIZZLE_R;
+    }
     iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     iv.subresourceRange.levelCount = 1;
     iv.subresourceRange.layerCount = 1;

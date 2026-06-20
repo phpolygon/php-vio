@@ -27,7 +27,7 @@ int vio_2d_d3d11_init(vio_2d_d3d11_state *state)
     memset(state, 0, sizeof(vio_2d_d3d11_state));
 
     /* ── Compile HLSL shaders ────────────────────────────────────── */
-    ID3DBlob *vs_blob = NULL, *ps_shapes_blob = NULL, *ps_sprites_blob = NULL;
+    ID3DBlob *vs_blob = NULL, *ps_shapes_blob = NULL, *ps_sprites_blob = NULL, *ps_text_blob = NULL;
     ID3DBlob *error_blob = NULL;
     UINT flags = 0;
     if (vio_d3d11.debug_enabled) {
@@ -64,6 +64,18 @@ int vio_2d_d3d11_init(vio_2d_d3d11_state *state)
         return -1;
     }
 
+    hr = D3DCompile(vio_2d_hlsl_ps_text, strlen(vio_2d_hlsl_ps_text), "vio_2d_ps_text",
+                     NULL, NULL, "main", "ps_5_0", flags, 0, &ps_text_blob, &error_blob);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "2D PS text compile failed: %s",
+                          error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
+        if (error_blob) ID3D10Blob_Release(error_blob);
+        ID3D10Blob_Release(vs_blob);
+        ID3D10Blob_Release(ps_shapes_blob);
+        ID3D10Blob_Release(ps_sprites_blob);
+        return -1;
+    }
+
     /* ── Create shader objects ───────────────────────────────────── */
     hr = ID3D11Device_CreateVertexShader(vio_d3d11.device,
         ID3D10Blob_GetBufferPointer(vs_blob), ID3D10Blob_GetBufferSize(vs_blob),
@@ -78,6 +90,11 @@ int vio_2d_d3d11_init(vio_2d_d3d11_state *state)
     hr = ID3D11Device_CreatePixelShader(vio_d3d11.device,
         ID3D10Blob_GetBufferPointer(ps_sprites_blob), ID3D10Blob_GetBufferSize(ps_sprites_blob),
         NULL, &state->ps_sprites);
+    if (FAILED(hr)) goto fail;
+
+    hr = ID3D11Device_CreatePixelShader(vio_d3d11.device,
+        ID3D10Blob_GetBufferPointer(ps_text_blob), ID3D10Blob_GetBufferSize(ps_text_blob),
+        NULL, &state->ps_text);
     if (FAILED(hr)) goto fail;
 
     /* ── Input layout (matches vio_2d_vertex) ────────────────────── */
@@ -160,6 +177,7 @@ int vio_2d_d3d11_init(vio_2d_d3d11_state *state)
     ID3D10Blob_Release(vs_blob);
     ID3D10Blob_Release(ps_shapes_blob);
     ID3D10Blob_Release(ps_sprites_blob);
+    ID3D10Blob_Release(ps_text_blob);
     return 0;
 
 fail:
@@ -167,6 +185,7 @@ fail:
     if (vs_blob) ID3D10Blob_Release(vs_blob);
     if (ps_shapes_blob) ID3D10Blob_Release(ps_shapes_blob);
     if (ps_sprites_blob) ID3D10Blob_Release(ps_sprites_blob);
+    if (ps_text_blob) ID3D10Blob_Release(ps_text_blob);
     vio_2d_d3d11_shutdown(state);
     return -1;
 }
@@ -180,6 +199,7 @@ void vio_2d_d3d11_shutdown(vio_2d_d3d11_state *state)
     if (state->input_layout)       ID3D11InputLayout_Release(state->input_layout);
     if (state->cb)                 ID3D11Buffer_Release(state->cb);
     if (state->vbo)                ID3D11Buffer_Release(state->vbo);
+    if (state->ps_text)            ID3D11PixelShader_Release(state->ps_text);
     if (state->ps_sprites)         ID3D11PixelShader_Release(state->ps_sprites);
     if (state->ps_shapes)          ID3D11PixelShader_Release(state->ps_shapes);
     if (state->vs)                 ID3D11VertexShader_Release(state->vs);

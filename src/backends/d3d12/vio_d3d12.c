@@ -1466,7 +1466,7 @@ static void *d3d12_create_texture(vio_texture_desc *desc)
     res_desc.Height = desc->height;
     res_desc.DepthOrArraySize = 1;
     res_desc.MipLevels = 1;
-    res_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    res_desc.Format = desc->single_channel ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     res_desc.SampleDesc.Count = 1;
     res_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
@@ -1518,7 +1518,7 @@ static void *d3d12_create_texture(vio_texture_desc *desc)
             if (SUCCEEDED(hr)) {
                 const uint8_t *src = (const uint8_t *)desc->data;
                 uint8_t *dst = (uint8_t *)mapped + footprint.Offset;
-                UINT src_pitch = desc->width * 4;
+                UINT src_pitch = desc->width * (desc->single_channel ? 1 : 4);
                 for (int row = 0; row < desc->height; row++) {
                     memcpy(dst + row * footprint.Footprint.RowPitch,
                            src + row * src_pitch,
@@ -1579,11 +1579,20 @@ static void *d3d12_create_texture(vio_texture_desc *desc)
         }
     }
 
-    /* Create SRV */
+    /* Create SRV. For an R8 glyph atlas, swizzle the single channel so the
+     * texture reads as (1,1,1,R) — white RGB, coverage in alpha — exactly what
+     * the shared sprite shader expects, so no separate text shader is needed
+     * (unlike D3D11, whose SRVs have no component mapping). */
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
-    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv_desc.Format = desc->single_channel ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Shader4ComponentMapping = desc->single_channel
+        ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+              D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1,
+              D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1,
+              D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1,
+              D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0)
+        : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv_desc.Texture2D.MipLevels = 1;
 
     d3d12_alloc_srv_descriptor(&tex->srv_cpu, &tex->srv_gpu);

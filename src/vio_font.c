@@ -158,6 +158,55 @@ void vio_font_finalize_glyphs(vio_font_object *font,
     }
 }
 
+int vio_font_pack_atlas_dynamic(const unsigned char *ttf_data, float font_size,
+                                unsigned char **out_bitmap, int *out_side,
+                                vio_font_packed_glyph **out_glyphs, int *out_count)
+{
+    *out_bitmap = NULL; *out_side = 0; *out_glyphs = NULL; *out_count = 0;
+
+    /* Decide the atlas size up front — we can NOT rely on stbtt_PackFontRanges'
+     * return value: it reports the (intentionally) skipped CJK/Hangul ranges as
+     * "missing", so it returns 0 even when every present glyph fit. Instead,
+     * cheaply detect whether this font even has CJK (two cmap lookups) and size
+     * accordingly. */
+    int side;
+    stbtt_fontinfo info;
+    int has_font = stbtt_InitFont(&info, ttf_data, stbtt_GetFontOffsetForIndex(ttf_data, 0));
+    int is_cjk = has_font && (stbtt_FindGlyphIndex(&info, 0x4E00) != 0   /* 一 */
+                           || stbtt_FindGlyphIndex(&info, 0xAC00) != 0); /* 가 */
+
+    if (!has_font || is_cjk) {
+        /* CJK / Hangul face (tens of thousands of glyphs) — keep the full
+         * atlas, exactly as before. */
+        side = VIO_FONT_ATLAS_SIZE;
+    } else {
+        /* Latin / Cyrillic / Greek / Vietnamese face: at most ~1.1k present
+         * glyphs. Their packed area is well under 1000·(size+2)² (≈800·size² in
+         * practice), so the smallest power-of-two meeting that bound holds them
+         * all with margin: 10px→512², 15-28px→1024², 32-48px→2048², 72px+→4096².
+         * No retry — the pack always fits, and PackFontRanges' return value is
+         * unreliable here anyway. */
+        double need = 1000.0 * (font_size + 2.0) * (font_size + 2.0);
+        side = 256;
+        while ((double)side * (double)side < need && side < VIO_FONT_ATLAS_SIZE) {
+            side <<= 1;
+        }
+    }
+
+    unsigned char *bmp = (unsigned char *)calloc(1, (size_t)side * (size_t)side);
+    if (!bmp) {
+        return 0;
+    }
+    vio_font_packed_glyph *glyphs = NULL;
+    int count = 0;
+    int ok = vio_font_pack_atlas_raw(ttf_data, font_size, bmp, side, &glyphs, &count);
+    *out_bitmap = bmp;
+    *out_side   = side;
+    *out_glyphs = glyphs;
+    *out_count  = count;
+    return (count > 0) ? 1 : ok;
+}
+
 int vio_font_pack_atlas(vio_font_object *font, unsigned char *atlas_bitmap, int atlas_size)
 {
     vio_font_packed_glyph *glyphs = NULL;

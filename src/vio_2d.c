@@ -472,9 +472,12 @@ void vio_2d_flush(vio_2d_state *state)
                 scissor_custom = 0;
             }
 
-            /* Select pixel shader */
-            ID3D11PixelShader *wanted_ps = (item->backend_texture)
-                ? d3d->ps_sprites : d3d->ps_shapes;
+            /* Select pixel shader. Glyphs (VIO_2D_TEXT) sample an R8 coverage
+             * atlas via ps_text; image sprites use ps_sprites; untextured
+             * shapes use ps_shapes. */
+            ID3D11PixelShader *wanted_ps = (item->type == VIO_2D_TEXT)
+                ? d3d->ps_text
+                : (item->backend_texture ? d3d->ps_sprites : d3d->ps_shapes);
             if (wanted_ps != current_ps) {
                 current_ps = wanted_ps;
                 ID3D11DeviceContext_PSSetShader(ctx, current_ps, NULL, 0);
