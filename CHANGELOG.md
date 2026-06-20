@@ -1,3 +1,10 @@
+## [2.0.1](https://github.com/phpolygon/php-vio/compare/v2.0.0...v2.0.1) (2026-06-20)
+
+
+### Performance Improvements
+
+* **font:** dynamic + R8 glyph atlas; feat: monitor enumeration ([e2fa0d8](https://github.com/phpolygon/php-vio/commit/e2fa0d86f86b7ac8cb85a3e3ace3c866bc591a78))
+
 # [2.0.0](https://github.com/phpolygon/php-vio/compare/v1.23.0...v2.0.0) (2026-06-19)
 
 
