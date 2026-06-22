@@ -69,24 +69,23 @@ probe("null", [
 /* Metal (macOS) — 3D stub, but RT + 2D-batch + swizzle implemented */
 $mtl = @vio_create("metal", ["width" => 16, "height" => 16, "headless" => true]);
 if ($mtl) {
-    var_dump(vio_supports_feature($mtl, VIO_FEATURE_3D_PIPELINE) === false);
-    var_dump(vio_supports_feature($mtl, VIO_FEATURE_NATIVE_2D_BATCH) === true);
-    var_dump(vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET) === true);
-    var_dump(vio_supports_feature($mtl, VIO_FEATURE_TEXTURE_SWIZZLE) === true);
+    // Fold the per-feature asserts into one line so the matched output has the
+    // same shape whether or not Metal is compiled in (it isn't on Linux /
+    // Windows). The --EXPECTF-- `metal: %s` then accepts OK or the skip line.
+    $ok = vio_supports_feature($mtl, VIO_FEATURE_3D_PIPELINE) === false
+       && vio_supports_feature($mtl, VIO_FEATURE_NATIVE_2D_BATCH) === true
+       && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET) === true
+       && vio_supports_feature($mtl, VIO_FEATURE_TEXTURE_SWIZZLE) === true;
     vio_destroy($mtl);
-    echo "metal: OK\n";
+    echo $ok ? "metal: OK\n" : "metal: FAIL\n";
 } else {
     echo "metal: skip (unavailable)\n";
 }
 
 echo "DONE\n";
 ?>
---EXPECT--
+--EXPECTF--
 opengl: OK
 null: OK
-bool(true)
-bool(true)
-bool(true)
-bool(true)
-metal: OK
+metal: %s
 DONE

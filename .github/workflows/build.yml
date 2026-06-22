@@ -73,6 +73,10 @@ jobs:
           # load" warnings and break the --EXPECT-- match.
           export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          # No sound card on CI runners -> ALSA spews "cannot find card" errors
+          # that pollute audio-test output. Route the default device to null so
+          # miniaudio opens it silently.
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
@@ -144,6 +148,10 @@ jobs:
           # load" warnings and break the --EXPECT-- match.
           export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          # No sound card on CI runners -> ALSA spews "cannot find card" errors
+          # that pollute audio-test output. Route the default device to null so
+          # miniaudio opens it silently.
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
