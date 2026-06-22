@@ -55,6 +55,10 @@ typedef struct _vio_shader_object {
     int               sampler_count;
     /* Runtime GL-slot to HLSL-binding remap: gl_to_hlsl[gl_slot] = hlsl_binding (-1 = unmapped) */
     int               gl_to_hlsl_sampler[16];
+    /* Lazily-built name -> (stage,offset,size) map for O(1) uniform lookup on the
+     * hot draw path (replaces a linear strcmp scan run for every uniform set).
+     * NULL until first use; freed in vio_shader_free_object. */
+    HashTable        *uniform_lookup;
     int               valid;
     const struct _vio_backend *backend;
     zend_object       std;

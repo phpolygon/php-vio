@@ -3361,26 +3361,45 @@ ZEND_FUNCTION(vio_storage_buffer_read)
     RETURN_STR(out);
 }
 
-ZEND_FUNCTION(vio_set_uniform)
+/* Lazily build a per-shader name -> packed (stage|offset|size) map, then do an
+ * O(1) lookup. Replaces the linear strcmp scan over every uniform that previously
+ * ran for EACH uniform set on the hot draw path. Encoding (non-zero on a hit):
+ *   bit48 present, bit40 is_frag, bits16..31 offset, bits0..15 size. The uniform
+ * tables are populated once at shader reflection and never change, so the map is
+ * safe to build once and reuse for the shader's lifetime. */
+static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
 {
-    zval *ctx_zval;
-    char *name;
-    size_t name_len;
-    zval *value_zval;
-
-    ZEND_PARSE_PARAMETERS_START(3, 3)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
-        Z_PARAM_STRING(name, name_len)
-        Z_PARAM_ZVAL(value_zval)
-    ZEND_PARSE_PARAMETERS_END();
-
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-
-    if (!ctx->initialized || !ctx->in_frame) {
-        php_error_docref(NULL, E_WARNING, "Must call vio_set_uniform between vio_begin and vio_end");
-        return;
+    if (!sh->uniform_lookup) {
+        ALLOC_HASHTABLE(sh->uniform_lookup);
+        zend_hash_init(sh->uniform_lookup,
+                       sh->uniform_count + sh->frag_uniform_count + 1, NULL, NULL, 0);
+        /* Vertex first so it wins on a name collision (add-if-absent), matching
+         * the original vertex-before-fragment scan order. */
+        for (int u = 0; u < sh->uniform_count; u++) {
+            zend_long enc = (1LL << 48)
+                | ((zend_long)(sh->uniforms[u].offset & 0xFFFF) << 16)
+                | (zend_long)(sh->uniforms[u].size & 0xFFFF);
+            zend_hash_str_add_ptr(sh->uniform_lookup, sh->uniforms[u].name,
+                                  strlen(sh->uniforms[u].name), (void *)(intptr_t)enc);
+        }
+        for (int u = 0; u < sh->frag_uniform_count; u++) {
+            zend_long enc = (1LL << 48) | (1LL << 40)
+                | ((zend_long)(sh->frag_uniforms[u].offset & 0xFFFF) << 16)
+                | (zend_long)(sh->frag_uniforms[u].size & 0xFFFF);
+            zend_hash_str_add_ptr(sh->uniform_lookup, sh->frag_uniforms[u].name,
+                                  strlen(sh->frag_uniforms[u].name), (void *)(intptr_t)enc);
+        }
     }
+    void *p = zend_hash_str_find_ptr(sh->uniform_lookup, name, strlen(name));
+    return p ? (zend_long)(intptr_t)p : 0;
+}
 
+/* Shared core for vio_set_uniform / vio_set_uniforms: marshal one (name, value)
+ * into the OpenGL set_uniform path and/or the bound shader's cbuffer at the
+ * reflected offset. Extracted so the single + batch entry points write
+ * byte-identical state. Caller guarantees ctx is initialized + in_frame. */
+static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *value_zval)
+{
     /* Marshal zval -> typed (data, count, type) once, then dispatch via the
      * backend's set_uniform slot. OpenGL uses it to do the glGetUniformLocation
      * + glUniform* dance; D3D/Vulkan/Metal also implement set_uniform but with
@@ -3449,31 +3468,19 @@ ZEND_FUNCTION(vio_set_uniform)
             }
         }
 
-        /* Search both vertex and fragment uniform arrays */
+        /* O(1) name -> (stage, offset, size) lookup (built once per shader),
+         * replacing the former linear strcmp scan over both uniform arrays. */
         unsigned char *dst = NULL;
         int max_size = 0;
         int is_frag = 0;
 
-        for (int u = 0; u < sh->uniform_count; u++) {
-            if (strcmp(sh->uniforms[u].name, name) != 0) continue;
-            int offset = sh->uniforms[u].offset;
-            max_size = sh->uniforms[u].size;
+        zend_long enc = vio_uniform_lookup(sh, name);
+        if (enc) {
+            is_frag = (int)((enc >> 40) & 0x1);
+            int offset = (int)((enc >> 16) & 0xFFFF);
+            max_size = (int)(enc & 0xFFFF);
             if (offset >= 0 && offset + max_size <= VIO_CBUFFER_SIZE) {
-                dst = sh->cbuffer_data + offset;
-            }
-            break;
-        }
-
-        if (!dst) {
-            for (int u = 0; u < sh->frag_uniform_count; u++) {
-                if (strcmp(sh->frag_uniforms[u].name, name) != 0) continue;
-                int offset = sh->frag_uniforms[u].offset;
-                max_size = sh->frag_uniforms[u].size;
-                if (offset >= 0 && offset + max_size <= VIO_CBUFFER_SIZE) {
-                    dst = sh->frag_cbuffer_data + offset;
-                    is_frag = 1;
-                }
-                break;
+                dst = (is_frag ? sh->frag_cbuffer_data : sh->cbuffer_data) + offset;
             }
         }
 
@@ -3528,6 +3535,60 @@ ZEND_FUNCTION(vio_set_uniform)
             }
         }
     }
+}
+
+ZEND_FUNCTION(vio_set_uniform)
+{
+    zval *ctx_zval;
+    char *name;
+    size_t name_len;
+    zval *value_zval;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STRING(name, name_len)
+        Z_PARAM_ZVAL(value_zval)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_set_uniform between vio_begin and vio_end");
+        return;
+    }
+
+    vio_apply_uniform(ctx, name, value_zval);
+}
+
+/* Batch form: one PHP->C crossing for an array of ['u_name' => value, ...].
+ * Each pair is applied through the exact same core as vio_set_uniform, so the
+ * cbuffer ends up byte-identical to issuing the calls individually — it just
+ * avoids the per-uniform Zend call + zend_parse_parameters overhead, which is
+ * the dominant cost on the hot draw path (material + per-draw uniforms). */
+ZEND_FUNCTION(vio_set_uniforms)
+{
+    zval *ctx_zval;
+    HashTable *pairs;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(pairs)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_set_uniforms between vio_begin and vio_end");
+        return;
+    }
+
+    zend_string *key;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(pairs, key, val) {
+        if (key != NULL) {
+            vio_apply_uniform(ctx, ZSTR_VAL(key), val);
+        }
+    } ZEND_HASH_FOREACH_END();
 }
 
 /* ── Phase 5: 2D API functions ───────────────────────────────────── */

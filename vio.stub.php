@@ -508,6 +508,14 @@ function vio_storage_buffer_read(VioContext $context, VioBuffer $buffer): string
 function vio_set_uniform(VioContext $context, string $name, int|float|array $value): void {}
 
 /**
+ * Batch form of vio_set_uniform: apply a map of ['u_name' => value, ...] in a
+ * single native call. Each value follows the same rules as vio_set_uniform
+ * (int, float, or float array for vec/mat). Avoids the per-uniform PHP->C call
+ * overhead on the hot draw path; the resulting cbuffer state is identical.
+ */
+function vio_set_uniforms(VioContext $context, array $uniforms): void {}
+
+/**
  * Get the name of the backend in use.
  */
 function vio_backend_name(VioContext $context): string {}

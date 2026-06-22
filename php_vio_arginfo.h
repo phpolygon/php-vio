@@ -275,6 +275,11 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_uniform, 0, 3, IS_VOID, 
 	ZEND_ARG_INFO(0, value)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_uniforms, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, uniforms, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 /* ── 2D API functions ────────────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_rect, 0, 5, IS_VOID, 0)
@@ -728,6 +733,7 @@ ZEND_FUNCTION(vio_compute_set_uniforms);
 ZEND_FUNCTION(vio_compute_dispatch);
 ZEND_FUNCTION(vio_storage_buffer_read);
 ZEND_FUNCTION(vio_set_uniform);
+ZEND_FUNCTION(vio_set_uniforms);
 ZEND_FUNCTION(vio_shader_reflect);
 ZEND_FUNCTION(vio_audio_load);
 ZEND_FUNCTION(vio_audio_play);
@@ -858,6 +864,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_compute_dispatch, arginfo_vio_compute_dispatch)
 	ZEND_FE(vio_storage_buffer_read, arginfo_vio_storage_buffer_read)
 	ZEND_FE(vio_set_uniform, arginfo_vio_set_uniform)
+	ZEND_FE(vio_set_uniforms, arginfo_vio_set_uniforms)
 	ZEND_FE(vio_shader_reflect, arginfo_vio_shader_reflect)
 	ZEND_FE(vio_audio_load, arginfo_vio_audio_load)
 	ZEND_FE(vio_audio_play, arginfo_vio_audio_play)

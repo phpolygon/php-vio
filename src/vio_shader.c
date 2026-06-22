@@ -50,6 +50,12 @@ static void vio_shader_free_object(zend_object *obj)
         shader->frag_spirv = NULL;
     }
 
+    if (shader->uniform_lookup) {
+        zend_hash_destroy(shader->uniform_lookup);
+        FREE_HASHTABLE(shader->uniform_lookup);
+        shader->uniform_lookup = NULL;
+    }
+
     /* Backend cbuffers are owned by the backend — no free needed here
      * (they are D3D11 COM objects released on context teardown) */
 
