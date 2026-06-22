@@ -59,12 +59,19 @@ jobs:
       # in the shared .so (tolerated at link, fatal at static link / load).
       - name: Smoke test — extension loads (eager symbol binding)
         run: |
-          LD_BIND_NOW=1 php -d extension_dir="$PWD/modules" -d extension=vio.so \
+          LD_BIND_NOW=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
             -r 'exit((int) !extension_loaded("vio"));'
 
       - name: Run tests
         run: |
-          NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS=tests/
+          # -n ignores the runner's system php.ini (which enables dozens of
+          # bundled extensions by short name); without it, redirecting
+          # extension_dir to modules/ floods every test with "Unable to load"
+          # warnings that break the --EXPECT-- match. TEST_PHP_ARGS is applied
+          # to each test's child process, so vio loads + ini stays clean.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
         run: |
@@ -121,12 +128,19 @@ jobs:
 
       - name: Smoke test — extension loads (eager symbol binding)
         run: |
-          LD_BIND_NOW=1 php -d extension_dir="$PWD/modules" -d extension=vio.so \
+          LD_BIND_NOW=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
             -r 'exit((int) !extension_loaded("vio"));'
 
       - name: Run tests
         run: |
-          NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS=tests/
+          # -n ignores the runner's system php.ini (which enables dozens of
+          # bundled extensions by short name); without it, redirecting
+          # extension_dir to modules/ floods every test with "Unable to load"
+          # warnings that break the --EXPECT-- match. TEST_PHP_ARGS is applied
+          # to each test's child process, so vio loads + ini stays clean.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
         run: |
@@ -177,12 +191,19 @@ jobs:
 
       - name: Smoke test — extension loads (eager symbol binding)
         run: |
-          DYLD_BIND_AT_LAUNCH=1 php -d extension_dir="$PWD/modules" -d extension=vio.so \
+          DYLD_BIND_AT_LAUNCH=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
             -r 'exit((int) !extension_loaded("vio"));'
 
       - name: Run tests
         run: |
-          NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS=tests/
+          # -n ignores the runner's system php.ini (which enables dozens of
+          # bundled extensions by short name); without it, redirecting
+          # extension_dir to modules/ floods every test with "Unable to load"
+          # warnings that break the --EXPECT-- match. TEST_PHP_ARGS is applied
+          # to each test's child process, so vio loads + ini stays clean.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
         run: |
@@ -233,12 +254,19 @@ jobs:
 
       - name: Smoke test — extension loads (eager symbol binding)
         run: |
-          DYLD_BIND_AT_LAUNCH=1 php -d extension_dir="$PWD/modules" -d extension=vio.so \
+          DYLD_BIND_AT_LAUNCH=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
             -r 'exit((int) !extension_loaded("vio"));'
 
       - name: Run tests
         run: |
-          NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS=tests/
+          # -n ignores the runner's system php.ini (which enables dozens of
+          # bundled extensions by short name); without it, redirecting
+          # extension_dir to modules/ floods every test with "Unable to load"
+          # warnings that break the --EXPECT-- match. TEST_PHP_ARGS is applied
+          # to each test's child process, so vio loads + ini stays clean.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
         run: |
