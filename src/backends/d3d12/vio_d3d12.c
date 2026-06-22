@@ -29,6 +29,7 @@
 
 #include "vio_d3d12.h"
 #include "../vio_d3d_common.h"
+#include "../../vio_shader_reflect.h"   /* vio_spirv_reflect — data-driven compute register mapping */
 #include <string.h>
 #include <stdlib.h>
 
@@ -274,6 +275,8 @@ extern char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size,
                                 int shader_model, char **error_msg);
 extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
                                             size_t *out_size, char **error_msg);
+extern uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
+                                                   size_t *out_size, char **error_msg);
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 /* vio_format_to_dxgi, vio_format_byte_size, vio_usage_to_semantic from vio_d3d_common.h */
@@ -1000,6 +1003,8 @@ static void d3d12_shutdown(void)
 
     if (vio_d3d12.cmd_list)       ID3D12GraphicsCommandList_Release(vio_d3d12.cmd_list);
     if (vio_d3d12.root_signature) ID3D12RootSignature_Release(vio_d3d12.root_signature);
+    if (vio_d3d12.compute_root_signature) ID3D12RootSignature_Release(vio_d3d12.compute_root_signature);
+    if (vio_d3d12.compute_srv_heap) ID3D12DescriptorHeap_Release(vio_d3d12.compute_srv_heap);
     if (vio_d3d12.fence)          ID3D12Fence_Release(vio_d3d12.fence);
     if (vio_d3d12.fence_event)    CloseHandle(vio_d3d12.fence_event);
     if (vio_d3d12.rtv_heap)       ID3D12DescriptorHeap_Release(vio_d3d12.rtv_heap);
@@ -1361,6 +1366,7 @@ static void *d3d12_create_buffer(vio_buffer_desc *desc)
     buf->type = desc->type;
     buf->size = desc->size;
     buf->binding = desc->binding;
+    buf->stride = desc->stride;
 
     D3D12_HEAP_PROPERTIES heap_props = {0};
     D3D12_RESOURCE_DESC res_desc = {0};
@@ -1381,9 +1387,25 @@ static void *d3d12_create_buffer(vio_buffer_desc *desc)
         /* CB size must be 256-byte aligned */
         res_desc.Width = (res_desc.Width + 255) & ~255;
     } else if (desc->type == VIO_BUFFER_STORAGE) {
-        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-        initial_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (desc->data) {
+            /* Compute SRV input: UPLOAD heap so the box bytes are CPU-writable
+             * (the data block below maps + memcpys them). Bound as a raw/SRV in
+             * dispatch_compute. UPLOAD buffers sit in GENERIC_READ, which already
+             * permits shader-resource reads, so no transition is needed. */
+            heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+            initial_state = D3D12_RESOURCE_STATE_GENERIC_READ;
+            /* NO ALLOW_UNORDERED_ACCESS: forbidden on UPLOAD heaps, and the input
+             * is read-only (raw SRV, which doesn't require the UAV flag). */
+        } else {
+            /* Compute UAV output: DEFAULT heap. Buffers have no layout, so the
+             * runtime always creates them in COMMON regardless of the requested
+             * state (it warns if you ask for UNORDERED_ACCESS); a buffer in
+             * COMMON is implicitly promoted to UNORDERED_ACCESS on first UAV
+             * access, so COMMON is the correct, warning-free initial state. */
+            heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+            initial_state = D3D12_RESOURCE_STATE_COMMON;
+            res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        }
     } else {
         /* Vertex/index: upload heap for simplicity (can optimize to default+staging later) */
         heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -1441,6 +1463,7 @@ static void d3d12_destroy_buffer(void *buffer_ptr)
 {
     vio_d3d12_buffer *buf = (vio_d3d12_buffer *)buffer_ptr;
     if (!buf) return;
+    if (buf->readback_resource) ID3D12Resource_Release(buf->readback_resource);
     if (buf->upload_resource) ID3D12Resource_Release(buf->upload_resource);
     if (buf->resource) ID3D12Resource_Release(buf->resource);
     free(buf);
@@ -2502,15 +2525,530 @@ static void d3d12_clear(float r, float g, float b, float a)
 
 /* ── Compute ──────────────────────────────────────────────────────── */
 
+/* Build a PER-PIPELINE compute root signature whose registers are DATA-DRIVEN
+ * from the reflected shader (no hardcoded t0/u0/b0):
+ *   [0] root CBV  b{cbv_register}     (Params constant block; omitted if < 0)
+ *   [1] SRV table t{srv_base_reg}..   (read-only storage buffers)
+ *   [2] UAV table u{uav_base_reg}..   (writeonly storage buffers)
+ * Always emits all three root parameters in fixed slots (0=CBV, 1=SRV, 2=UAV) so
+ * dispatch_compute can bind by index; if there is no UBO the CBV uses a benign
+ * unreferenced register (b0, space1) — a root CBV that the shader never reads is
+ * legal and triggers no validation error. ALL shader visibility, Flags = NONE
+ * (compute has no input-assembler). On success stores the root signature on the
+ * pipeline and returns 0. */
+static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
+{
+    /* SRV range: base register = the lowest readonly storage-buffer binding.
+     * NumDescriptors spans MAX so any t{base..base+MAX-1} is covered. */
+    D3D12_DESCRIPTOR_RANGE srv_range = {0};
+    srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srv_range.NumDescriptors = VIO_D3D12_COMPUTE_MAX_BINDINGS;
+    srv_range.BaseShaderRegister = (UINT)(cp->srv_base_reg >= 0 ? cp->srv_base_reg : 0);
+    srv_range.RegisterSpace = 0;
+    srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_DESCRIPTOR_RANGE uav_range = {0};
+    uav_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uav_range.NumDescriptors = VIO_D3D12_COMPUTE_MAX_BINDINGS;
+    uav_range.BaseShaderRegister = (UINT)(cp->uav_base_reg >= 0 ? cp->uav_base_reg : 0);
+    uav_range.RegisterSpace = 0;
+    uav_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER params[3] = {0};
+
+    /* [0] root CBV — the Params block, at its reflected register b{cbv_register}.
+     * With no UBO, park it at b0/space1 (never referenced -> no bind error). */
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = (UINT)(cp->cbv_register >= 0 ? cp->cbv_register : 0);
+    params[0].Descriptor.RegisterSpace = (cp->cbv_register >= 0 ? 0u : 1u);
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    /* [1] SRV table t{srv_base_reg}.. */
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &srv_range;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    /* [2] UAV table u{uav_base_reg}.. */
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable.NumDescriptorRanges = 1;
+    params[2].DescriptorTable.pDescriptorRanges = &uav_range;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
+    rs_desc.NumParameters = 3;
+    rs_desc.pParameters = params;
+    rs_desc.NumStaticSamplers = 0;
+    rs_desc.pStaticSamplers = NULL;
+    rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE; /* NO input-assembler flag */
+
+    ID3DBlob *sig = NULL, *err = NULL;
+    HRESULT hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D12: compute root signature serialize failed: %s",
+                         err ? (char *)ID3D10Blob_GetBufferPointer(err) : "unknown");
+        if (err) ID3D10Blob_Release(err);
+        return -1;
+    }
+    hr = ID3D12Device_CreateRootSignature(vio_d3d12.device, 0,
+                                          ID3D10Blob_GetBufferPointer(sig),
+                                          ID3D10Blob_GetBufferSize(sig),
+                                          &IID_ID3D12RootSignature,
+                                          (void **)&cp->root_signature);
+    ID3D10Blob_Release(sig);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D12: CreateRootSignature(compute) failed (0x%08lx)", hr);
+        return -1;
+    }
+    return 0;
+}
+
+/* Dedicated shader-visible CBV/SRV/UAV heap for compute dispatches. Layout per
+ * dispatch: [0..VIO_D3D12_COMPUTE_MAX_BINDINGS) SRVs, then the same many UAVs.
+ * Recreated lazily (small, fixed). Separate from the graphics srv_heap so the
+ * complex per-frame partitioning there is untouched. */
+static int d3d12_ensure_compute_srv_heap(void)
+{
+    if (vio_d3d12.compute_srv_heap) return 0;
+    if (d3d12_create_descriptor_heap(&vio_d3d12.compute_srv_heap,
+                                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                     VIO_D3D12_COMPUTE_MAX_BINDINGS * 2,
+                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+        return -1;
+    }
+    vio_d3d12.compute_srv_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(
+        vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return 0;
+}
+
+static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
+{
+    if (!vio_d3d12.device) return NULL;
+
+    /* GLSL compute source arrives in fragment_data (see vio_compute_pipeline).
+     * It may also already be SPIR-V. Compile to SPIR-V, then transpile to HLSL
+     * (SM 5.1) just like the vs/ps path, then D3DCompile as cs_5_1. */
+    const char *src = (const char *)desc->fragment_data;
+    if (!src && desc->vertex_data) src = (const char *)desc->vertex_data;
+    if (!src) {
+        php_error_docref(NULL, E_WARNING, "D3D12: compute pipeline missing source");
+        return NULL;
+    }
+    size_t src_size = desc->fragment_size ? desc->fragment_size : desc->vertex_size;
+
+    char *err = NULL;
+    uint32_t *spirv = NULL;
+    size_t spirv_size = 0;
+    int free_spirv = 0;
+
+    int is_spirv = (src_size >= 4 && *(const uint32_t *)src == 0x07230203);
+    if (is_spirv) {
+        spirv = (uint32_t *)src;
+        spirv_size = src_size;
+    } else {
+        spirv = vio_compile_glsl_compute_to_spirv(src, &spirv_size, &err);
+        if (!spirv) {
+            php_error_docref(NULL, E_WARNING, "D3D12: CS GLSL->SPIR-V failed: %s", err ? err : "unknown");
+            if (err) free(err);
+            return NULL;
+        }
+        free_spirv = 1;
+    }
+
+    /* ── DATA-DRIVEN register mapping ──────────────────────────────────────
+     * Reflect the SAME SPIR-V we are about to transpile. spirv-cross maps a
+     * GLSL `binding = N` straight to the HLSL register NUMBER N within each
+     * register file (UBO -> bN, readonly buffer -> tN, writeonly buffer -> uN),
+     * so the reflected `binding` IS the HLSL register. We resolve:
+     *   cbv_register = the Params UBO's binding (its b#); -1 if there is no UBO.
+     *   srv/uav table BASE register = the minimum storage-buffer binding. The
+     *     descriptor table maps heap-offset k -> register base+k, and at bind
+     *     time each buffer is placed at heap-offset (binding - base), so any
+     *     binding in [base, base+MAX) lands on its exact register. SRV vs UAV
+     *     classification comes from the vio_compute_bind_buffer access flag
+     *     (the PHP contract; reflection's NonWritable/NonReadable is not exposed
+     *     reliably through the SPIRV-Cross C API), so a single shared base over
+     *     all storage buffers is correct for both tables. */
+    int cbv_register = -1;
+    int storage_min_binding = -1;
+    {
+        vio_reflect_result refl;
+        char *rerr = NULL;
+        if (vio_spirv_reflect(spirv, spirv_size, &refl, &rerr) == 0) {
+            if (refl.ubo_count > 0) {
+                cbv_register = (int)refl.ubos[0].binding;
+                for (int i = 1; i < refl.ubo_count; i++) {
+                    if ((int)refl.ubos[i].binding < cbv_register) cbv_register = (int)refl.ubos[i].binding;
+                }
+            }
+            for (int i = 0; i < refl.storage_buffer_count; i++) {
+                int bnd = (int)refl.storage_buffers[i].binding;
+                if (storage_min_binding < 0 || bnd < storage_min_binding) storage_min_binding = bnd;
+            }
+            vio_reflect_free(&refl);
+        } else {
+            /* Reflection failure is non-fatal: fall back to register 0 bases and
+             * b0 CBV (the legacy pinned-binding layout still works for that). */
+            php_error_docref(NULL, E_WARNING, "D3D12: CS reflection failed (%s); using default registers",
+                             rerr ? rerr : "unknown");
+            if (rerr) free(rerr);
+        }
+    }
+    int srv_base_reg = storage_min_binding >= 0 ? storage_min_binding : 0;
+    int uav_base_reg = storage_min_binding >= 0 ? storage_min_binding : 0;
+
+    char *hlsl = vio_spirv_to_hlsl(spirv, spirv_size, 51, &err);
+    if (free_spirv) free(spirv);
+    if (!hlsl) {
+        php_error_docref(NULL, E_WARNING, "D3D12: CS SPIR-V->HLSL failed: %s", err ? err : "unknown");
+        if (err) free(err);
+        return NULL;
+    }
+
+    if (getenv("VIO_DUMP_CS_HLSL")) {
+        fprintf(stderr, "==== compute HLSL (CBV b%d, SRV table base t%d, UAV table base u%d) ====\n%s\n==== end ====\n",
+                cbv_register, srv_base_reg, uav_base_reg, hlsl);
+        fflush(stderr);
+    }
+
+    UINT compile_flags = 0;
+    if (vio_d3d12.debug_enabled) {
+        compile_flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+    }
+
+    vio_d3d12_compute_pipeline *cp = calloc(1, sizeof(vio_d3d12_compute_pipeline));
+    if (!cp) { free(hlsl); return NULL; }
+    cp->cbv_register = cbv_register;
+    cp->srv_base_reg = srv_base_reg;
+    cp->uav_base_reg = uav_base_reg;
+
+    /* Build the per-pipeline root signature from the reflected registers. */
+    if (d3d12_build_compute_root_signature(cp) != 0) {
+        free(cp);
+        free(hlsl);
+        return NULL;
+    }
+
+    ID3DBlob *error_blob = NULL;
+    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "cs_main", NULL, NULL,
+                            "main", "cs_5_1", compile_flags, 0, &cp->cs_blob, &error_blob);
+    free(hlsl);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D12: CS compile failed: %s",
+                         error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
+        if (error_blob) ID3D10Blob_Release(error_blob);
+        if (cp->root_signature) ID3D12RootSignature_Release(cp->root_signature);
+        free(cp);
+        return NULL;
+    }
+    if (error_blob) ID3D10Blob_Release(error_blob);
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {0};
+    pso_desc.pRootSignature = cp->root_signature;
+    pso_desc.CS.pShaderBytecode = ID3D10Blob_GetBufferPointer(cp->cs_blob);
+    pso_desc.CS.BytecodeLength = ID3D10Blob_GetBufferSize(cp->cs_blob);
+
+    hr = ID3D12Device_CreateComputePipelineState(vio_d3d12.device, &pso_desc,
+                                                 &IID_ID3D12PipelineState, (void **)&cp->pso);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D12: CreateComputePipelineState failed (0x%08lx)", hr);
+        d3d12_drain_info_queue("create_compute_pipeline");
+        if (cp->root_signature) ID3D12RootSignature_Release(cp->root_signature);
+        ID3D10Blob_Release(cp->cs_blob);
+        free(cp);
+        return NULL;
+    }
+
+    return cp;
+}
+
+static void d3d12_destroy_compute_pipeline(void *pipeline_ptr)
+{
+    vio_d3d12_compute_pipeline *cp = (vio_d3d12_compute_pipeline *)pipeline_ptr;
+    if (!cp) return;
+    /* The GPU may still reference this PSO if a dispatch is in flight. All vio
+     * compute dispatches are fully fenced (wait_for_gpu before returning), so by
+     * the time PHP drops the pipeline the GPU is idle — no extra wait needed. */
+    if (cp->params_buf) ID3D12Resource_Release(cp->params_buf);
+    if (cp->pso) ID3D12PipelineState_Release(cp->pso);
+    if (cp->root_signature) ID3D12RootSignature_Release(cp->root_signature);
+    if (cp->cs_blob) ID3D10Blob_Release(cp->cs_blob);
+    free(cp);
+}
+
+static void d3d12_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
+                                      int slot, int access, int element_count, int stride)
+{
+    vio_d3d12_compute_pipeline *cp = (vio_d3d12_compute_pipeline *)pipeline_ptr;
+    vio_d3d12_buffer *buf = (vio_d3d12_buffer *)backend_buffer;
+    if (!cp || !buf) return;
+
+    vio_d3d12_compute_binding b = {0};
+    b.buffer = buf;
+    b.slot = slot;
+    b.access = access;
+    b.element_count = element_count;
+    b.stride = stride > 0 ? stride : (buf->stride > 0 ? buf->stride : 4);
+
+    if (access == 1 /* VIO_COMPUTE_WRITE */) {
+        if (cp->uav_count < VIO_D3D12_COMPUTE_MAX_BINDINGS) cp->uavs[cp->uav_count++] = b;
+    } else {
+        if (cp->srv_count < VIO_D3D12_COMPUTE_MAX_BINDINGS) cp->srvs[cp->srv_count++] = b;
+    }
+}
+
+static void d3d12_compute_set_uniforms(void *pipeline_ptr, const void *data, int size)
+{
+    vio_d3d12_compute_pipeline *cp = (vio_d3d12_compute_pipeline *)pipeline_ptr;
+    if (!cp || !data || size <= 0) return;
+
+    size_t aligned = ((size_t)size + 255) & ~(size_t)255; /* CB 256-byte alignment */
+
+    if (!cp->params_buf || cp->params_capacity < aligned) {
+        if (cp->params_buf) { ID3D12Resource_Release(cp->params_buf); cp->params_buf = NULL; }
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = aligned;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp,
+            D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void **)&cp->params_buf);
+        if (FAILED(hr)) {
+            php_error_docref(NULL, E_WARNING, "D3D12: compute params buffer create failed (0x%08lx)", hr);
+            cp->params_buf = NULL;
+            return;
+        }
+        cp->params_capacity = aligned;
+    }
+
+    void *mapped = NULL;
+    D3D12_RANGE no_read = {0, 0};
+    if (SUCCEEDED(ID3D12Resource_Map(cp->params_buf, 0, &no_read, &mapped))) {
+        memcpy(mapped, data, (size_t)size);
+        ID3D12Resource_Unmap(cp->params_buf, 0, NULL);
+    }
+    cp->params_size = (size_t)size;
+}
+
 static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
 {
-    /* TODO: Implement compute pipeline + dispatch
-     * 1. Create compute PSO (separate from graphics PSO)
-     * 2. Bind UAVs via root signature
-     * 3. ID3D12GraphicsCommandList_Dispatch(cmd_list, x, y, z)
-     */
-    (void)cmd;
-    php_error_docref(NULL, E_NOTICE, "D3D12: Compute dispatch not yet implemented");
+    if (!cmd) return;
+    vio_d3d12_compute_pipeline *cp = (vio_d3d12_compute_pipeline *)cmd->pipeline;
+    if (!cp || !cp->pso) {
+        php_error_docref(NULL, E_WARNING, "D3D12: dispatch_compute with invalid pipeline");
+        return;
+    }
+    if (d3d12_ensure_compute_srv_heap() != 0) return;
+
+    /* Build the descriptor table contents in the compute heap. SRVs occupy heap
+     * indices [0, MAX); UAVs occupy [MAX, 2*MAX). Within each region a buffer
+     * bound at GLSL binding=slot is placed at heap-offset (slot - table_base_reg),
+     * because the root descriptor table maps heap-offset k -> register
+     * {table_base_reg + k}. So a readonly buffer at binding 0 (table base t0)
+     * lands at offset 0 -> t0, and a writeonly buffer at binding 1 (table base
+     * u1) lands at offset 0 -> u1 — fully data-driven from reflection, no
+     * hardcoded t0/u0. */
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_start;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_start;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &cpu_start);
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &gpu_start);
+    UINT dsz = vio_d3d12.compute_srv_descriptor_size;
+
+    const UINT SRV_BASE = 0;
+    const UINT UAV_BASE = VIO_D3D12_COMPUTE_MAX_BINDINGS;
+    const int  srv_reg_base = cp->srv_base_reg >= 0 ? cp->srv_base_reg : 0;
+    const int  uav_reg_base = cp->uav_base_reg >= 0 ? cp->uav_base_reg : 0;
+
+    /* SRVs. spirv-cross transpiles GLSL std430 `buffer { float x[]; }` to an HLSL
+     * ByteAddressBuffer (raw), NOT a StructuredBuffer — confirmed via the debug
+     * layer. So a stride of 4 (raw/default) builds a RAW view (R32_TYPELESS +
+     * FLAG_RAW, NumElements counted in 4-byte words). A stride > 4 builds a true
+     * structured view (StructuredBuffer<T> in HLSL). */
+    for (int i = 0; i < cp->srv_count; i++) {
+        vio_d3d12_compute_binding *b = &cp->srvs[i];
+        if (!b->buffer || !b->buffer->resource) continue;
+        int rel = b->slot - srv_reg_base;        /* heap-offset within the SRV region */
+        if (rel < 0 || rel >= VIO_D3D12_COMPUTE_MAX_BINDINGS) continue;
+        UINT idx = SRV_BASE + (UINT)rel;
+        int raw = (b->stride <= 4);
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Buffer.FirstElement = 0;
+        if (raw) {
+            sd.Format = DXGI_FORMAT_R32_TYPELESS;
+            sd.Buffer.NumElements = (UINT)(b->buffer->size / 4);
+            sd.Buffer.StructureByteStride = 0;
+            sd.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        } else {
+            sd.Format = DXGI_FORMAT_UNKNOWN;
+            sd.Buffer.NumElements = (UINT)b->element_count;
+            sd.Buffer.StructureByteStride = (UINT)b->stride;
+            sd.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu_start.ptr + (SIZE_T)idx * dsz };
+        ID3D12Device_CreateShaderResourceView(vio_d3d12.device, b->buffer->resource, &sd, h);
+    }
+
+    /* UAVs (same raw-vs-structured logic as SRVs). */
+    for (int i = 0; i < cp->uav_count; i++) {
+        vio_d3d12_compute_binding *b = &cp->uavs[i];
+        if (!b->buffer || !b->buffer->resource) continue;
+        int rel = b->slot - uav_reg_base;        /* heap-offset within the UAV region */
+        if (rel < 0 || rel >= VIO_D3D12_COMPUTE_MAX_BINDINGS) continue;
+        UINT idx = UAV_BASE + (UINT)rel;
+        int raw = (b->stride <= 4);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
+        ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer.FirstElement = 0;
+        ud.Buffer.CounterOffsetInBytes = 0;
+        if (raw) {
+            ud.Format = DXGI_FORMAT_R32_TYPELESS;
+            ud.Buffer.NumElements = (UINT)(b->buffer->size / 4);
+            ud.Buffer.StructureByteStride = 0;
+            ud.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        } else {
+            ud.Format = DXGI_FORMAT_UNKNOWN;
+            ud.Buffer.NumElements = (UINT)b->element_count;
+            ud.Buffer.StructureByteStride = (UINT)b->stride;
+            ud.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu_start.ptr + (SIZE_T)idx * dsz };
+        ID3D12Device_CreateUnorderedAccessView(vio_d3d12.device, b->buffer->resource, NULL, &ud, h);
+    }
+
+    /* Record onto a transient DIRECT command list. We never run inside an open
+     * graphics frame for the SDF bake (it happens behind the loading screen,
+     * outside vio_begin/vio_end), so a dedicated allocator/list keeps us fully
+     * decoupled from the frame command list and its state. */
+    ID3D12CommandAllocator *alloc = NULL;
+    HRESULT hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device,
+        D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (FAILED(hr)) { php_error_docref(NULL, E_WARNING, "D3D12: compute allocator failed"); return; }
+
+    ID3D12GraphicsCommandList *list = NULL;
+    hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, cp->pso,
+        &IID_ID3D12GraphicsCommandList, (void **)&list);
+    if (FAILED(hr)) {
+        ID3D12CommandAllocator_Release(alloc);
+        php_error_docref(NULL, E_WARNING, "D3D12: compute command list failed");
+        return;
+    }
+
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, cp->root_signature);
+    ID3D12GraphicsCommandList_SetPipelineState(list, cp->pso);
+    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.compute_srv_heap };
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
+
+    if (cp->params_buf) {
+        ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(list, 0,
+            ID3D12Resource_GetGPUVirtualAddress(cp->params_buf));
+    }
+    /* [1] SRV table base, [2] UAV table base */
+    D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = { gpu_start.ptr + (UINT64)SRV_BASE * dsz };
+    D3D12_GPU_DESCRIPTOR_HANDLE uav_gpu = { gpu_start.ptr + (UINT64)UAV_BASE * dsz };
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, srv_gpu);
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 2, uav_gpu);
+
+    int gx = cmd->group_count_x > 0 ? cmd->group_count_x : 1;
+    int gy = cmd->group_count_y > 0 ? cmd->group_count_y : 1;
+    int gz = cmd->group_count_z > 0 ? cmd->group_count_z : 1;
+    ID3D12GraphicsCommandList_Dispatch(list, (UINT)gx, (UINT)gy, (UINT)gz);
+
+    /* UAV barrier (ensure all writes complete) + transition each UAV output to
+     * COPY_SOURCE and copy into its READBACK staging buffer, so a later
+     * vio_storage_buffer_read just Maps the staging without re-running the GPU. */
+    for (int i = 0; i < cp->uav_count; i++) {
+        vio_d3d12_buffer *buf = cp->uavs[i].buffer;
+        if (!buf || !buf->resource) continue;
+
+        D3D12_RESOURCE_BARRIER uavb = {0};
+        uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uavb.UAV.pResource = buf->resource;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &uavb);
+
+        /* Lazily (re)create a READBACK staging buffer sized to the output. */
+        if (!buf->readback_resource || buf->readback_size < buf->size) {
+            if (buf->readback_resource) { ID3D12Resource_Release(buf->readback_resource); buf->readback_resource = NULL; }
+            D3D12_HEAP_PROPERTIES hp = {0};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd = {0};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = buf->size;
+            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            HRESULT rhr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp,
+                D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                &IID_ID3D12Resource, (void **)&buf->readback_resource);
+            if (FAILED(rhr)) {
+                php_error_docref(NULL, E_WARNING, "D3D12: compute readback buffer create failed (0x%08lx)", rhr);
+                buf->readback_resource = NULL;
+                continue;
+            }
+        }
+        buf->readback_size = buf->size;
+
+        /* STORAGE buffers live in UNORDERED_ACCESS; transition -> COPY_SOURCE,
+         * copy the whole buffer, then transition back so a subsequent dispatch
+         * (or another read) finds it in its declared UAV state again. */
+        D3D12_RESOURCE_BARRIER tb = {0};
+        tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        tb.Transition.pResource = buf->resource;
+        tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
+
+        ID3D12GraphicsCommandList_CopyBufferRegion(list, buf->readback_resource, 0,
+                                                   buf->resource, 0, buf->size);
+
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
+    }
+
+    ID3D12GraphicsCommandList_Close(list);
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    vio_d3d12_wait_for_gpu();
+
+    d3d12_drain_info_queue("dispatch_compute");
+
+    ID3D12GraphicsCommandList_Release(list);
+    ID3D12CommandAllocator_Release(alloc);
+}
+
+/* GPU->CPU readback. The output buffer's bytes were already copied into its
+ * READBACK staging buffer by dispatch_compute (fully fenced), so this just Maps
+ * and memcpys — no GPU re-run. Returns bytes written. */
+static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
+{
+    vio_d3d12_buffer *buf = (vio_d3d12_buffer *)backend_buffer;
+    if (!buf || !out || size == 0) return 0;
+    if (!buf->readback_resource) {
+        php_error_docref(NULL, E_WARNING,
+            "D3D12: read_buffer before any compute dispatch produced a readback");
+        return 0;
+    }
+
+    size_t n = size < buf->readback_size ? size : buf->readback_size;
+    D3D12_RANGE rr = { 0, (SIZE_T)n };
+    void *mapped = NULL;
+    HRESULT hr = ID3D12Resource_Map(buf->readback_resource, 0, &rr, &mapped);
+    if (FAILED(hr) || !mapped) {
+        php_error_docref(NULL, E_WARNING, "D3D12: read_buffer map failed (0x%08lx)", hr);
+        return 0;
+    }
+    memcpy(out, mapped, n);
+    D3D12_RANGE no_write = {0, 0};
+    ID3D12Resource_Unmap(buf->readback_resource, 0, &no_write);
+    return n;
 }
 
 /* ── Feature Query ────────────────────────────────────────────────── */
@@ -2518,7 +3056,7 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
 static int d3d12_supports_feature(vio_feature feature)
 {
     switch (feature) {
-        case VIO_FEATURE_COMPUTE:      return 0; /* TODO: not yet implemented */
+        case VIO_FEATURE_COMPUTE:      return 1; /* compute pipeline + dispatch + readback wired */
         case VIO_FEATURE_TESSELLATION: return 1;
         case VIO_FEATURE_GEOMETRY:     return 1;
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
@@ -2718,6 +3256,11 @@ static const vio_backend d3d12_backend = {
     .set_viewport      = d3d12_set_viewport,
     .gpu_flush         = vio_d3d12_wait_for_gpu,
     .dispatch_compute  = d3d12_dispatch_compute,
+    .create_compute_pipeline  = d3d12_create_compute_pipeline,
+    .destroy_compute_pipeline = d3d12_destroy_compute_pipeline,
+    .compute_bind_buffer      = d3d12_compute_bind_buffer,
+    .compute_set_uniforms     = d3d12_compute_set_uniforms,
+    .read_buffer              = d3d12_read_buffer,
     .supports_feature  = d3d12_supports_feature,
     .destroy_cubemap   = d3d12_destroy_cubemap,
     .destroy_font_atlas = d3d12_destroy_font_atlas,

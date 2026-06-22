@@ -16,6 +16,12 @@
  * Returns malloc'd string (caller frees). NULL on failure. */
 char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, char **error_msg);
 
+/* Transpile a COMPUTE SPIR-V module to GLSL (target version >= 430, clamped).
+ * Unlike vio_spirv_to_glsl(), keeps UBOs as std140 blocks and SSBOs as std430
+ * blocks with their explicit `binding =` qualifiers (required by the OpenGL
+ * compute primitive). Returns malloc'd string (caller frees). NULL on failure. */
+char *vio_spirv_to_glsl_compute(const uint32_t *spirv, size_t spirv_size, int version, char **error_msg);
+
 /* Transpile SPIR-V to MSL.
  * Returns malloc'd string (caller frees). NULL on failure. */
 char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_msg);
@@ -45,6 +51,10 @@ typedef struct _vio_reflect_result {
     int                   texture_count;
     vio_reflect_resource *ubos;
     int                   ubo_count;
+    vio_reflect_resource *storage_buffers;  /* SSBO / (RW)StructuredBuffer — compute */
+    int                   storage_buffer_count;
+    vio_reflect_resource *storage_images;   /* image2D/image3D — compute (deferred use) */
+    int                   storage_image_count;
 } vio_reflect_result;
 
 /* Reflect SPIR-V module. Returns 0 on success.

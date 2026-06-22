@@ -28,6 +28,7 @@
 
 #include "vio_d3d11.h"
 #include "../vio_d3d_common.h"
+#include "../../vio_shader_reflect.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -42,6 +43,9 @@ extern char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size,
 /* Forward declaration for GLSL -> SPIR-V (in vio_shader_compiler.c) */
 extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
                                             size_t *out_size, char **error_msg);
+/* Forward declaration for GLSL compute -> SPIR-V (in vio_shader_compiler.c) */
+extern uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
+                                                   size_t *out_size, char **error_msg);
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 /* vio_format_to_dxgi, vio_format_byte_size, vio_usage_to_semantic from vio_d3d_common.h */
@@ -534,6 +538,7 @@ static void *d3d11_create_buffer(vio_buffer_desc *desc)
     buf->type = desc->type;
     buf->size = desc->size;
     buf->binding = desc->binding;
+    buf->stride = desc->stride;
 
     D3D11_BUFFER_DESC bd = {0};
     bd.ByteWidth = (UINT)desc->size;
@@ -555,9 +560,23 @@ static void *d3d11_create_buffer(vio_buffer_desc *desc)
             bd.ByteWidth = (bd.ByteWidth + 15) & ~15;
             break;
         case VIO_BUFFER_STORAGE:
+            /* Data-driven raw vs structured view, mirroring the D3D12 path.
+             * spirv-cross transpiles GLSL `buffer { float x[]; }` to a (RW)Byte-
+             * AddressBuffer — a RAW view — NOT a StructuredBuffer. So stride <= 4
+             * (the default for the SDF baker) requests ALLOW_RAW_VIEWS and the
+             * SRV/UAV are built as BUFFEREX/BUFFER raw views in dispatch_compute.
+             * stride > 4 keeps the legacy structured view. Both bindable as SRV
+             * (input) and UAV (output) so one path covers read+write buffers. */
             bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-            bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-            bd.StructureByteStride = 4; /* TODO: derive from reflection */
+            if (desc->stride > 4) {
+                bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+                bd.StructureByteStride = (UINT)desc->stride;
+            } else {
+                /* Raw byte-address view: ByteWidth must be a multiple of 4. */
+                bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+                bd.ByteWidth = (bd.ByteWidth + 3u) & ~3u;
+                buf->size = bd.ByteWidth;
+            }
             break;
     }
 
@@ -607,6 +626,7 @@ static void d3d11_destroy_buffer(void *buffer_ptr)
     vio_d3d11_buffer *buf = (vio_d3d11_buffer *)buffer_ptr;
     if (!buf) return;
 
+    if (buf->readback_staging) ID3D11Buffer_Release(buf->readback_staging);
     if (buf->buffer) ID3D11Buffer_Release(buf->buffer);
     free(buf);
 }
@@ -1178,15 +1198,396 @@ static void d3d11_clear(float r, float g, float b, float a)
 
 /* ── Compute ──────────────────────────────────────────────────────── */
 
+/* Drain the D3D11 debug-layer info queue to stderr (debug builds only). Mirrors
+ * d3d12_drain_info_queue: used during compute bring-up to prove ZERO debug-layer
+ * ERROR/WARNING. Clears the queue after reading so each drain is incremental. */
+static void d3d11_drain_info_queue(const char *where)
+{
+    if (!vio_d3d11.debug_enabled || !vio_d3d11.device) return;
+    ID3D11InfoQueue *iq = NULL;
+    if (FAILED(ID3D11Device_QueryInterface(vio_d3d11.device, &IID_ID3D11InfoQueue, (void **)&iq)) || !iq)
+        return;
+    UINT64 n = ID3D11InfoQueue_GetNumStoredMessages(iq);
+    for (UINT64 i = 0; i < n; i++) {
+        SIZE_T len = 0;
+        if (FAILED(ID3D11InfoQueue_GetMessage(iq, i, NULL, &len)) || len == 0) continue;
+        D3D11_MESSAGE *msg = (D3D11_MESSAGE *)malloc(len);
+        if (!msg) continue;
+        if (SUCCEEDED(ID3D11InfoQueue_GetMessage(iq, i, msg, &len))) {
+            fprintf(stderr, "[D3D11 debug-layer @ %s] sev=%d id=%d: %.*s\n",
+                    where, (int)msg->Severity, (int)msg->ID,
+                    (int)msg->DescriptionByteLength, msg->pDescription);
+            fflush(stderr);
+        }
+        free(msg);
+    }
+    ID3D11InfoQueue_ClearStoredMessages(iq);
+    ID3D11InfoQueue_Release(iq);
+}
+
+/* Compile the GLSL compute source (or accept ready SPIR-V), transpile to HLSL
+ * SM5.0 and create an ID3D11ComputeShader. Register mapping is DATA-DRIVEN from
+ * SPIR-V reflection exactly like the D3D12 path: spirv-cross maps a GLSL
+ * `binding = N` straight to the HLSL register NUMBER N within each register file
+ * (UBO -> bN, readonly buffer -> tN, writeonly buffer -> uN). For D3D11 there is
+ * no root signature — we bind directly by register slot — so SRV/UAV registers
+ * equal their GLSL bindings and only the CBV register must be reflected. */
+static void *d3d11_create_compute_pipeline(vio_shader_desc *desc)
+{
+    if (!vio_d3d11.device) return NULL;
+
+    const char *src = (const char *)desc->fragment_data;
+    if (!src && desc->vertex_data) src = (const char *)desc->vertex_data;
+    if (!src) {
+        php_error_docref(NULL, E_WARNING, "D3D11: compute pipeline missing source");
+        return NULL;
+    }
+    size_t src_size = desc->fragment_size ? desc->fragment_size : desc->vertex_size;
+
+    char *err = NULL;
+    uint32_t *spirv = NULL;
+    size_t spirv_size = 0;
+    int free_spirv = 0;
+
+    int is_spirv = (src_size >= 4 && *(const uint32_t *)src == 0x07230203);
+    if (is_spirv) {
+        spirv = (uint32_t *)src;
+        spirv_size = src_size;
+    } else {
+        spirv = vio_compile_glsl_compute_to_spirv(src, &spirv_size, &err);
+        if (!spirv) {
+            php_error_docref(NULL, E_WARNING, "D3D11: CS GLSL->SPIR-V failed: %s", err ? err : "unknown");
+            if (err) free(err);
+            return NULL;
+        }
+        free_spirv = 1;
+    }
+
+    /* Reflect for the Params UBO register (the only one D3D11 can't derive from
+     * the bind slot). SRV/UAV registers == their GLSL bindings == the slots the
+     * PHP layer passes to compute_bind_buffer, so no table base is needed. */
+    int cbv_register = -1;
+    {
+        vio_reflect_result refl;
+        char *rerr = NULL;
+        if (vio_spirv_reflect(spirv, spirv_size, &refl, &rerr) == 0) {
+            if (refl.ubo_count > 0) {
+                cbv_register = (int)refl.ubos[0].binding;
+                for (int i = 1; i < refl.ubo_count; i++) {
+                    if ((int)refl.ubos[i].binding < cbv_register)
+                        cbv_register = (int)refl.ubos[i].binding;
+                }
+            }
+            vio_reflect_free(&refl);
+        } else {
+            php_error_docref(NULL, E_WARNING, "D3D11: CS reflection failed (%s); CBV at b0",
+                             rerr ? rerr : "unknown");
+            if (rerr) free(rerr);
+        }
+    }
+
+    char *hlsl = vio_spirv_to_hlsl(spirv, spirv_size, 50, &err);
+    if (free_spirv) free(spirv);
+    if (!hlsl) {
+        php_error_docref(NULL, E_WARNING, "D3D11: CS SPIR-V->HLSL failed: %s", err ? err : "unknown");
+        if (err) free(err);
+        return NULL;
+    }
+
+    if (getenv("VIO_DUMP_CS_HLSL")) {
+        fprintf(stderr, "==== D3D11 compute HLSL (CBV b%d) ====\n%s\n==== end ====\n",
+                cbv_register, hlsl);
+        fflush(stderr);
+    }
+
+    UINT compile_flags = 0;
+    if (vio_d3d11.debug_enabled) {
+        compile_flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+    }
+
+    vio_d3d11_compute_pipeline *cp = calloc(1, sizeof(vio_d3d11_compute_pipeline));
+    if (!cp) { free(hlsl); return NULL; }
+    cp->cbv_register = cbv_register;
+
+    ID3DBlob *error_blob = NULL;
+    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "cs_main", NULL, NULL,
+                            "main", "cs_5_0", compile_flags, 0, &cp->cs_blob, &error_blob);
+    free(hlsl);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D11: CS compile failed: %s",
+                         error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
+        if (error_blob) ID3D10Blob_Release(error_blob);
+        free(cp);
+        return NULL;
+    }
+    if (error_blob) ID3D10Blob_Release(error_blob);
+
+    hr = ID3D11Device_CreateComputeShader(vio_d3d11.device,
+            ID3D10Blob_GetBufferPointer(cp->cs_blob),
+            ID3D10Blob_GetBufferSize(cp->cs_blob),
+            NULL, &cp->cs);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D11: CreateComputeShader failed (0x%08lx)", hr);
+        ID3D10Blob_Release(cp->cs_blob);
+        free(cp);
+        return NULL;
+    }
+
+    return cp;
+}
+
+static void d3d11_destroy_compute_pipeline(void *pipeline_ptr)
+{
+    vio_d3d11_compute_pipeline *cp = (vio_d3d11_compute_pipeline *)pipeline_ptr;
+    if (!cp) return;
+    /* All vio compute dispatches Flush()+wait via the staging Map (read_buffer),
+     * but even an in-flight dispatch is safe: D3D11 defers resource destruction
+     * until the GPU no longer references it. */
+    if (cp->params_buf) ID3D11Buffer_Release(cp->params_buf);
+    if (cp->cs) ID3D11ComputeShader_Release(cp->cs);
+    if (cp->cs_blob) ID3D10Blob_Release(cp->cs_blob);
+    free(cp);
+}
+
+static void d3d11_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
+                                      int slot, int access, int element_count, int stride)
+{
+    vio_d3d11_compute_pipeline *cp = (vio_d3d11_compute_pipeline *)pipeline_ptr;
+    vio_d3d11_buffer *buf = (vio_d3d11_buffer *)backend_buffer;
+    if (!cp || !buf) return;
+
+    vio_d3d11_compute_binding b = {0};
+    b.buffer = buf;
+    b.slot = slot;
+    b.access = access;
+    b.element_count = element_count;
+    b.stride = stride > 0 ? stride : (buf->stride > 0 ? buf->stride : 4);
+
+    if (access == 1 /* VIO_COMPUTE_WRITE */) {
+        if (cp->uav_count < VIO_D3D11_COMPUTE_MAX_BINDINGS) cp->uavs[cp->uav_count++] = b;
+    } else {
+        if (cp->srv_count < VIO_D3D11_COMPUTE_MAX_BINDINGS) cp->srvs[cp->srv_count++] = b;
+    }
+}
+
+static void d3d11_compute_set_uniforms(void *pipeline_ptr, const void *data, int size)
+{
+    vio_d3d11_compute_pipeline *cp = (vio_d3d11_compute_pipeline *)pipeline_ptr;
+    if (!cp || !data || size <= 0) return;
+
+    /* Constant buffers must be a multiple of 16 bytes. A USAGE_DEFAULT CB updated
+     * via UpdateSubresource (the whole-buffer write is well-defined for DEFAULT
+     * buffers and avoids the MAP_WRITE_DISCARD partial-CB pitfall). */
+    UINT aligned = ((UINT)size + 15u) & ~15u;
+
+    if (!cp->params_buf || cp->params_capacity < aligned) {
+        if (cp->params_buf) { ID3D11Buffer_Release(cp->params_buf); cp->params_buf = NULL; }
+        D3D11_BUFFER_DESC bd = {0};
+        bd.ByteWidth = aligned;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = 0;
+        HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &bd, NULL, &cp->params_buf);
+        if (FAILED(hr)) {
+            php_error_docref(NULL, E_WARNING, "D3D11: compute params CB create failed (0x%08lx)", hr);
+            cp->params_buf = NULL;
+            return;
+        }
+        cp->params_capacity = aligned;
+    }
+
+    /* If the staged data is smaller than the aligned CB, pad into a temp so
+     * UpdateSubresource (which writes the whole resource with no box) is fed a
+     * full-width source — avoids reading past the caller's buffer. */
+    if ((UINT)size == aligned) {
+        ID3D11DeviceContext_UpdateSubresource(vio_d3d11.context,
+            (ID3D11Resource *)cp->params_buf, 0, NULL, data, 0, 0);
+    } else {
+        unsigned char *tmp = calloc(1, aligned);
+        if (!tmp) return;
+        memcpy(tmp, data, (size_t)size);
+        ID3D11DeviceContext_UpdateSubresource(vio_d3d11.context,
+            (ID3D11Resource *)cp->params_buf, 0, NULL, tmp, 0, 0);
+        free(tmp);
+    }
+}
+
+/* Build an SRV for a bound storage buffer (raw BUFFEREX when stride<=4, else a
+ * structured BUFFER view). Returns NULL on failure (caller skips the bind). */
+static ID3D11ShaderResourceView *d3d11_compute_make_srv(vio_d3d11_compute_binding *b)
+{
+    if (!b->buffer || !b->buffer->buffer) return NULL;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = {0};
+    int raw = (b->stride <= 4);
+    if (raw) {
+        sd.Format = DXGI_FORMAT_R32_TYPELESS;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+        sd.BufferEx.FirstElement = 0;
+        sd.BufferEx.NumElements = (UINT)(b->buffer->size / 4);
+        sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+    } else {
+        sd.Format = DXGI_FORMAT_UNKNOWN;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        sd.Buffer.FirstElement = 0;
+        sd.Buffer.NumElements = (UINT)b->element_count;
+    }
+    ID3D11ShaderResourceView *srv = NULL;
+    HRESULT hr = ID3D11Device_CreateShaderResourceView(vio_d3d11.device,
+        (ID3D11Resource *)b->buffer->buffer, &sd, &srv);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D11: compute SRV create failed (0x%08lx)", hr);
+        return NULL;
+    }
+    return srv;
+}
+
+/* Build a UAV for a bound storage buffer (raw when stride<=4, else structured). */
+static ID3D11UnorderedAccessView *d3d11_compute_make_uav(vio_d3d11_compute_binding *b)
+{
+    if (!b->buffer || !b->buffer->buffer) return NULL;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {0};
+    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.FirstElement = 0;
+    int raw = (b->stride <= 4);
+    if (raw) {
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.Buffer.NumElements = (UINT)(b->buffer->size / 4);
+        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+    } else {
+        ud.Format = DXGI_FORMAT_UNKNOWN;
+        ud.Buffer.NumElements = (UINT)b->element_count;
+        ud.Buffer.Flags = 0;
+    }
+    ID3D11UnorderedAccessView *uav = NULL;
+    HRESULT hr = ID3D11Device_CreateUnorderedAccessView(vio_d3d11.device,
+        (ID3D11Resource *)b->buffer->buffer, &ud, &uav);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D11: compute UAV create failed (0x%08lx)", hr);
+        return NULL;
+    }
+    return uav;
+}
+
 static void d3d11_dispatch_compute(vio_compute_cmd *cmd)
 {
-    /* TODO: Implement compute shader dispatch
-     * 1. Set compute shader (from pipeline)
-     * 2. Bind UAVs
-     * 3. ID3D11DeviceContext_Dispatch(context, x, y, z)
-     */
-    (void)cmd;
-    php_error_docref(NULL, E_NOTICE, "D3D11: Compute dispatch not yet implemented");
+    if (!cmd) return;
+    vio_d3d11_compute_pipeline *cp = (vio_d3d11_compute_pipeline *)cmd->pipeline;
+    if (!cp || !cp->cs) {
+        php_error_docref(NULL, E_WARNING, "D3D11: dispatch_compute with invalid pipeline");
+        return;
+    }
+
+    ID3D11DeviceContext *ctx = vio_d3d11.context;
+
+    /* Build SRV / UAV views for every recorded binding. Each is created at
+     * dispatch time and released immediately after Dispatch so no view outlives
+     * the call (the buffers themselves persist on the PHP-owned wrappers). */
+    ID3D11ShaderResourceView  *srvs[VIO_D3D11_COMPUTE_MAX_BINDINGS] = {0};
+    UINT                       srv_slots[VIO_D3D11_COMPUTE_MAX_BINDINGS] = {0};
+    int                        srv_n = 0;
+    ID3D11UnorderedAccessView *uavs[VIO_D3D11_COMPUTE_MAX_BINDINGS] = {0};
+    UINT                       uav_slots[VIO_D3D11_COMPUTE_MAX_BINDINGS] = {0};
+    int                        uav_n = 0;
+
+    ID3D11DeviceContext_CSSetShader(ctx, cp->cs, NULL, 0);
+
+    if (cp->params_buf && cp->cbv_register >= 0) {
+        ID3D11Buffer *cbs[1] = { cp->params_buf };
+        ID3D11DeviceContext_CSSetConstantBuffers(ctx, (UINT)cp->cbv_register, 1, cbs);
+    }
+
+    for (int i = 0; i < cp->srv_count; i++) {
+        ID3D11ShaderResourceView *srv = d3d11_compute_make_srv(&cp->srvs[i]);
+        if (!srv) continue;
+        srvs[srv_n] = srv;
+        srv_slots[srv_n] = (UINT)cp->srvs[i].slot;
+        ID3D11DeviceContext_CSSetShaderResources(ctx, (UINT)cp->srvs[i].slot, 1, &srv);
+        srv_n++;
+    }
+
+    for (int i = 0; i < cp->uav_count; i++) {
+        ID3D11UnorderedAccessView *uav = d3d11_compute_make_uav(&cp->uavs[i]);
+        if (!uav) continue;
+        uavs[uav_n] = uav;
+        uav_slots[uav_n] = (UINT)cp->uavs[i].slot;
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, (UINT)cp->uavs[i].slot, 1, &uav, NULL);
+        uav_n++;
+    }
+
+    UINT gx = cmd->group_count_x > 0 ? (UINT)cmd->group_count_x : 1;
+    UINT gy = cmd->group_count_y > 0 ? (UINT)cmd->group_count_y : 1;
+    UINT gz = cmd->group_count_z > 0 ? (UINT)cmd->group_count_z : 1;
+    ID3D11DeviceContext_Dispatch(ctx, gx, gy, gz);
+
+    /* Copy each UAV output into its staging buffer for later readback. The copy
+     * is ordered after Dispatch on the immediate context, so no explicit barrier
+     * is required (D3D11 inserts the dependency); read_buffer Maps with the
+     * implicit flush. */
+    for (int i = 0; i < cp->uav_count; i++) {
+        vio_d3d11_buffer *buf = cp->uavs[i].buffer;
+        if (!buf || !buf->buffer) continue;
+        if (!buf->readback_staging || buf->readback_size < buf->size) {
+            if (buf->readback_staging) { ID3D11Buffer_Release(buf->readback_staging); buf->readback_staging = NULL; }
+            D3D11_BUFFER_DESC sd = {0};
+            sd.ByteWidth = (UINT)buf->size;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.BindFlags = 0;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            sd.MiscFlags = 0;
+            HRESULT shr = ID3D11Device_CreateBuffer(vio_d3d11.device, &sd, NULL, &buf->readback_staging);
+            if (FAILED(shr)) {
+                php_error_docref(NULL, E_WARNING, "D3D11: compute staging buffer create failed (0x%08lx)", shr);
+                buf->readback_staging = NULL;
+                continue;
+            }
+            buf->readback_size = buf->size;
+        }
+        ID3D11DeviceContext_CopyResource(ctx,
+            (ID3D11Resource *)buf->readback_staging, (ID3D11Resource *)buf->buffer);
+    }
+
+    /* UNBIND UAVs and SRVs so they are not left bound to the CS stage — D3D11
+     * raises hazard warnings if a resource is later bound elsewhere (or rebound)
+     * while still attached as a UAV/SRV. Unbind each slot we touched. */
+    ID3D11UnorderedAccessView *null_uav = NULL;
+    for (int i = 0; i < uav_n; i++) {
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, uav_slots[i], 1, &null_uav, NULL);
+        ID3D11UnorderedAccessView_Release(uavs[i]);
+    }
+    ID3D11ShaderResourceView *null_srv = NULL;
+    for (int i = 0; i < srv_n; i++) {
+        ID3D11DeviceContext_CSSetShaderResources(ctx, srv_slots[i], 1, &null_srv);
+        ID3D11ShaderResourceView_Release(srvs[i]);
+    }
+    ID3D11DeviceContext_CSSetShader(ctx, NULL, NULL, 0);
+
+    d3d11_drain_info_queue("dispatch_compute");
+}
+
+/* GPU->CPU readback. The output buffer's bytes were copied into its STAGING
+ * buffer by dispatch_compute; Map(READ) flushes+waits, then memcpy out. Returns
+ * bytes written. */
+static size_t d3d11_read_buffer(void *backend_buffer, void *out, size_t size)
+{
+    vio_d3d11_buffer *buf = (vio_d3d11_buffer *)backend_buffer;
+    if (!buf || !out || size == 0) return 0;
+    if (!buf->readback_staging) {
+        php_error_docref(NULL, E_WARNING,
+            "D3D11: read_buffer before any compute dispatch produced a staging copy");
+        return 0;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {0};
+    HRESULT hr = ID3D11DeviceContext_Map(vio_d3d11.context,
+        (ID3D11Resource *)buf->readback_staging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr) || !mapped.pData) {
+        php_error_docref(NULL, E_WARNING, "D3D11: read_buffer map failed (0x%08lx)", hr);
+        return 0;
+    }
+    size_t n = size < buf->readback_size ? size : buf->readback_size;
+    memcpy(out, mapped.pData, n);
+    ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)buf->readback_staging, 0);
+    return n;
 }
 
 /* ── Feature Query ────────────────────────────────────────────────── */
@@ -1194,7 +1595,7 @@ static void d3d11_dispatch_compute(vio_compute_cmd *cmd)
 static int d3d11_supports_feature(vio_feature feature)
 {
     switch (feature) {
-        case VIO_FEATURE_COMPUTE:      return 0; /* TODO: not yet implemented */
+        case VIO_FEATURE_COMPUTE:      return 1; /* compute pipeline + dispatch + readback wired */
         case VIO_FEATURE_TESSELLATION: return 1;
         case VIO_FEATURE_GEOMETRY:     return 1;
         case VIO_FEATURE_RAYTRACING:   return 0; /* No DXR in D3D11 */
@@ -1372,6 +1773,11 @@ static const vio_backend d3d11_backend = {
     .set_viewport      = d3d11_set_viewport,
     .gpu_flush         = d3d11_gpu_flush,
     .dispatch_compute  = d3d11_dispatch_compute,
+    .create_compute_pipeline  = d3d11_create_compute_pipeline,
+    .destroy_compute_pipeline = d3d11_destroy_compute_pipeline,
+    .compute_bind_buffer      = d3d11_compute_bind_buffer,
+    .compute_set_uniforms     = d3d11_compute_set_uniforms,
+    .read_buffer              = d3d11_read_buffer,
     .supports_feature  = d3d11_supports_feature,
     .destroy_cubemap   = d3d11_destroy_cubemap,
     .destroy_font_atlas = d3d11_destroy_font_atlas,

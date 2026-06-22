@@ -39,7 +39,48 @@ typedef struct _vio_d3d11_buffer {
     vio_buffer_type type;
     size_t size;
     int binding;
+    int stride;                  /* structured element stride (bytes); <=4 => raw */
+    /* Compute readback: a STAGING (CPU-readable) copy of a UAV output buffer that
+     * dispatch_compute fills (CopyResource) after the dispatch, so
+     * vio_storage_buffer_read can Map+memcpy without re-running the GPU. Lazily
+     * created on first dispatch that writes this buffer. */
+    ID3D11Buffer *readback_staging;
+    size_t        readback_size; /* allocated bytes of readback_staging */
 } vio_d3d11_buffer;
+
+/* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */
+#define VIO_D3D11_COMPUTE_MAX_BINDINGS 8
+
+/* One recorded storage-buffer binding on a compute pipeline. */
+typedef struct _vio_d3d11_compute_binding {
+    struct _vio_d3d11_buffer *buffer;  /* the bound storage buffer */
+    int slot;                          /* shader register index (t# or u#) */
+    int access;                        /* 0 = READ (SRV), 1 = WRITE (UAV) */
+    int element_count;                 /* NumElements for the structured view */
+    int stride;                        /* StructureByteStride (<=4 => raw) */
+} vio_d3d11_compute_binding;
+
+/* Compute pipeline = compute shader + recorded bindings + params constant buffer.
+ *
+ * Unlike D3D12 there is no root signature: in D3D11 you bind directly by register
+ * slot (CSSetShaderResources / CSSetUnorderedAccessViews / CSSetConstantBuffers),
+ * and the HLSL register number IS the GLSL binding number (spirv-cross maps
+ * binding=N -> tN / uN / bN). The CBV register is read from SPIR-V reflection
+ * (the Params UBO binding) exactly like the D3D12 path. */
+typedef struct _vio_d3d11_compute_pipeline {
+    ID3DBlob           *cs_blob;
+    ID3D11ComputeShader *cs;
+    vio_d3d11_compute_binding srvs[VIO_D3D11_COMPUTE_MAX_BINDINGS];
+    int                 srv_count;
+    vio_d3d11_compute_binding uavs[VIO_D3D11_COMPUTE_MAX_BINDINGS];
+    int                 uav_count;
+    /* Reflected register: the Params UBO's HLSL register (b#); -1 if no UBO. */
+    int                 cbv_register;
+    /* Params constant block — a USAGE_DEFAULT CB, updated via UpdateSubresource
+     * in compute_set_uniforms and bound at cbv_register. */
+    ID3D11Buffer       *params_buf;
+    size_t              params_capacity; /* allocated bytes (16-aligned) */
+} vio_d3d11_compute_pipeline;
 
 /* Texture wrapper */
 typedef struct _vio_d3d11_texture {

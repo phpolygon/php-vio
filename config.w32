@@ -27,6 +27,7 @@ if (PHP_VIO != "no") {
         "src\\vio_render_target.c " +
         "src\\vio_cubemap.c " +
         "src\\vio_buffer.c " +
+        "src\\vio_compute_pipeline.c " +
         "src\\vio_2d.c " +
         "src\\vio_2d_d3d11.c " +
         "src\\vio_2d_d3d12.c " +

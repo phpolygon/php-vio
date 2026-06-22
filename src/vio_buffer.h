@@ -19,6 +19,8 @@ typedef struct _vio_buffer_object {
     vio_buffer_type     type;
     size_t              size;
     int                 binding;       /* UBO binding point */
+    int                 stride;        /* structured element stride (bytes) for
+                                          STORAGE buffers; 0 => raw/4. */
     int                 valid;
     zend_object         std;
 } vio_buffer_object;

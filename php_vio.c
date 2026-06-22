@@ -21,6 +21,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_pipeline.h"
 #include "src/vio_texture.h"
 #include "src/vio_buffer.h"
+#include "src/vio_compute_pipeline.h"
 #include "src/vio_2d.h"
 #include "src/vio_font.h"
 #include "src/vio_shader_compiler.h"
@@ -3097,6 +3098,269 @@ ZEND_FUNCTION(vio_bind_buffer)
 #endif
 }
 
+/* ── GPU compute primitive (backend-agnostic; M1 = D3D12) ─────────────
+ *
+ * Every vio_compute_* function feature-gates on
+ * ctx->backend->supports_feature(VIO_FEATURE_COMPUTE) plus the specific vtable
+ * hook it needs; when unsupported it emits an E_NOTICE and returns false/void
+ * so the PHP layer (GpuSdfBaker) silently falls back to the CPU path. */
+
+static int vio_compute_supported(vio_context_object *ctx)
+{
+    if (!ctx || !ctx->initialized || !ctx->backend) return 0;
+    if (!ctx->backend->supports_feature) return 0;
+    return ctx->backend->supports_feature(VIO_FEATURE_COMPUTE) ? 1 : 0;
+}
+
+ZEND_FUNCTION(vio_compute_pipeline)
+{
+    zval *ctx_zval;
+    HashTable *config_ht;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(config_ht)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!vio_compute_supported(ctx) || !ctx->backend->create_compute_pipeline) {
+        php_error_docref(NULL, E_NOTICE, "vio_compute_pipeline: compute not supported on this backend");
+        RETURN_FALSE;
+    }
+
+    zval *src_zval = zend_hash_str_find(config_ht, "source", sizeof("source") - 1);
+    if (!src_zval || Z_TYPE_P(src_zval) != IS_STRING) {
+        php_error_docref(NULL, E_WARNING, "vio_compute_pipeline requires 'source' (GLSL compute string)");
+        RETURN_FALSE;
+    }
+
+    /* Hand the GLSL compute source to the backend via the shader desc's
+     * fragment_data slot (the backend compiles GLSL->SPIR-V->HLSL->cs blob). */
+    vio_shader_desc desc = {0};
+    desc.fragment_data = Z_STRVAL_P(src_zval);
+    desc.fragment_size = Z_STRLEN_P(src_zval);
+    desc.format = VIO_SHADER_GLSL;
+
+    void *backend_pipeline = ctx->backend->create_compute_pipeline(&desc);
+    if (!backend_pipeline) {
+        php_error_docref(NULL, E_WARNING, "vio_compute_pipeline: backend compute pipeline creation failed");
+        RETURN_FALSE;
+    }
+
+    zval p_zval;
+    object_init_ex(&p_zval, vio_compute_pipeline_ce);
+    vio_compute_pipeline_object *p = Z_VIO_COMPUTE_PIPELINE_P(&p_zval);
+    p->backend = ctx->backend;
+    p->backend_pipeline = backend_pipeline;
+    p->valid = 1;
+
+    RETURN_COPY_VALUE(&p_zval);
+}
+
+ZEND_FUNCTION(vio_storage_buffer)
+{
+    zval *ctx_zval;
+    HashTable *config_ht;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(config_ht)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!vio_compute_supported(ctx) || !ctx->backend->create_buffer) {
+        php_error_docref(NULL, E_NOTICE, "vio_storage_buffer: compute not supported on this backend");
+        RETURN_FALSE;
+    }
+
+    /* 'data' (binary string -> SRV input) OR 'size' (zeroed UAV output). */
+    zval *data_zval = zend_hash_str_find(config_ht, "data", sizeof("data") - 1);
+    zval *size_zval = zend_hash_str_find(config_ht, "size", sizeof("size") - 1);
+
+    const void *init_data = NULL;
+    size_t size = 0;
+    if (data_zval && Z_TYPE_P(data_zval) == IS_STRING) {
+        init_data = Z_STRVAL_P(data_zval);
+        size = Z_STRLEN_P(data_zval);
+    } else if (size_zval) {
+        size = (size_t)zval_get_long(size_zval);
+    } else {
+        php_error_docref(NULL, E_WARNING, "vio_storage_buffer requires 'data' or 'size'");
+        RETURN_FALSE;
+    }
+    if (size == 0) {
+        php_error_docref(NULL, E_WARNING, "vio_storage_buffer: zero-length buffer");
+        RETURN_FALSE;
+    }
+
+    int stride = 0;
+    zval *stride_zval = zend_hash_str_find(config_ht, "stride", sizeof("stride") - 1);
+    if (stride_zval) stride = (int)zval_get_long(stride_zval);
+
+    vio_buffer_desc desc = {0};
+    desc.type = VIO_BUFFER_STORAGE;
+    desc.data = init_data;
+    desc.size = size;
+    desc.binding = 0;
+    desc.stride = stride;
+
+    void *backend_buffer = ctx->backend->create_buffer(&desc);
+    if (!backend_buffer) {
+        php_error_docref(NULL, E_WARNING, "vio_storage_buffer: backend buffer creation failed");
+        RETURN_FALSE;
+    }
+
+    zval buf_zval;
+    object_init_ex(&buf_zval, vio_buffer_ce);
+    vio_buffer_object *buf = Z_VIO_BUFFER_P(&buf_zval);
+    buf->type = VIO_BUFFER_STORAGE;
+    buf->size = size;
+    buf->binding = 0;
+    buf->stride = stride;
+    buf->backend = ctx->backend;
+    buf->backend_buffer = backend_buffer;
+    buf->valid = 1;
+
+    RETURN_COPY_VALUE(&buf_zval);
+}
+
+ZEND_FUNCTION(vio_compute_bind_buffer)
+{
+    zval *ctx_zval;
+    zval *pipe_zval;
+    zval *buf_zval;
+    zend_long slot;
+    zend_long access;
+
+    ZEND_PARSE_PARAMETERS_START(5, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_compute_pipeline_ce)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_buffer_ce)
+        Z_PARAM_LONG(slot)
+        Z_PARAM_LONG(access)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_compute_supported(ctx) || !ctx->backend->compute_bind_buffer) {
+        php_error_docref(NULL, E_NOTICE, "vio_compute_bind_buffer: compute not supported");
+        return;
+    }
+
+    vio_compute_pipeline_object *p = Z_VIO_COMPUTE_PIPELINE_P(pipe_zval);
+    vio_buffer_object *buf = Z_VIO_BUFFER_P(buf_zval);
+    if (!p->valid || !p->backend_pipeline || !buf->valid || !buf->backend_buffer) {
+        php_error_docref(NULL, E_WARNING, "vio_compute_bind_buffer: invalid pipeline or buffer");
+        return;
+    }
+
+    /* Structured-view element count = size / stride. A stride of 0 means the
+     * buffer holds raw 4-byte (float/uint) elements. The backend receives the
+     * same stride so its SRV/UAV StructureByteStride matches NumElements. */
+    int elem_stride = buf->stride > 0 ? buf->stride : 4;
+    int element_count = (int)(buf->size / (size_t)elem_stride);
+
+    ctx->backend->compute_bind_buffer(p->backend_pipeline, buf->backend_buffer,
+                                      (int)slot, (int)access, element_count, elem_stride);
+}
+
+ZEND_FUNCTION(vio_compute_set_uniforms)
+{
+    zval *ctx_zval;
+    zval *pipe_zval;
+    char *data;
+    size_t data_len;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_compute_pipeline_ce)
+        Z_PARAM_STRING(data, data_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_compute_supported(ctx) || !ctx->backend->compute_set_uniforms) {
+        php_error_docref(NULL, E_NOTICE, "vio_compute_set_uniforms: compute not supported");
+        return;
+    }
+
+    vio_compute_pipeline_object *p = Z_VIO_COMPUTE_PIPELINE_P(pipe_zval);
+    if (!p->valid || !p->backend_pipeline) {
+        php_error_docref(NULL, E_WARNING, "vio_compute_set_uniforms: invalid pipeline");
+        return;
+    }
+
+    ctx->backend->compute_set_uniforms(p->backend_pipeline, data, (int)data_len);
+}
+
+ZEND_FUNCTION(vio_compute_dispatch)
+{
+    zval *ctx_zval;
+    zval *pipe_zval;
+    zend_long gx, gy, gz;
+
+    ZEND_PARSE_PARAMETERS_START(5, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_compute_pipeline_ce)
+        Z_PARAM_LONG(gx)
+        Z_PARAM_LONG(gy)
+        Z_PARAM_LONG(gz)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_compute_supported(ctx) || !ctx->backend->dispatch_compute) {
+        php_error_docref(NULL, E_NOTICE, "vio_compute_dispatch: compute not supported");
+        return;
+    }
+
+    vio_compute_pipeline_object *p = Z_VIO_COMPUTE_PIPELINE_P(pipe_zval);
+    if (!p->valid || !p->backend_pipeline) {
+        php_error_docref(NULL, E_WARNING, "vio_compute_dispatch: invalid pipeline");
+        return;
+    }
+
+    vio_compute_cmd cmd = {0};
+    cmd.pipeline = p->backend_pipeline;
+    cmd.group_count_x = (int)gx;
+    cmd.group_count_y = (int)gy;
+    cmd.group_count_z = (int)gz;
+    ctx->backend->dispatch_compute(&cmd);
+}
+
+ZEND_FUNCTION(vio_storage_buffer_read)
+{
+    zval *ctx_zval;
+    zval *buf_zval;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_buffer_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_compute_supported(ctx) || !ctx->backend->read_buffer) {
+        php_error_docref(NULL, E_NOTICE, "vio_storage_buffer_read: compute not supported");
+        RETURN_FALSE;
+    }
+
+    vio_buffer_object *buf = Z_VIO_BUFFER_P(buf_zval);
+    if (!buf->valid || !buf->backend_buffer || buf->size == 0) {
+        php_error_docref(NULL, E_WARNING, "vio_storage_buffer_read: invalid buffer");
+        RETURN_FALSE;
+    }
+
+    zend_string *out = zend_string_alloc(buf->size, 0);
+    size_t n = ctx->backend->read_buffer(buf->backend_buffer, ZSTR_VAL(out), buf->size);
+    if (n == 0) {
+        zend_string_release(out);
+        RETURN_FALSE;
+    }
+    /* read_buffer may return fewer bytes than requested; trim. */
+    ZSTR_LEN(out) = n;
+    ZSTR_VAL(out)[n] = '\0';
+    RETURN_STR(out);
+}
+
 ZEND_FUNCTION(vio_set_uniform)
 {
     zval *ctx_zval;
@@ -5459,6 +5723,10 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_BUFFER_INDEX", VIO_BUFFER_INDEX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_BUFFER_UNIFORM", VIO_BUFFER_UNIFORM, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_BUFFER_STORAGE", VIO_BUFFER_STORAGE, CONST_CS | CONST_PERSISTENT);
+
+    /* Compute storage-buffer access (vio_compute_bind_buffer) */
+    REGISTER_LONG_CONSTANT("VIO_COMPUTE_READ", 0, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_COMPUTE_WRITE", 1, CONST_CS | CONST_PERSISTENT);
 
     /* Features */
     REGISTER_LONG_CONSTANT("VIO_FEATURE_COMPUTE", VIO_FEATURE_COMPUTE, CONST_CS | CONST_PERSISTENT);
@@ -8062,6 +8330,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_pipeline_register();
     vio_texture_register();
     vio_buffer_register();
+    vio_compute_pipeline_register();
     vio_font_register();
     vio_sound_register();
     vio_render_target_register();

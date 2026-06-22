@@ -24,4 +24,9 @@ void vio_shader_compiler_shutdown(void);
 uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
                                      size_t *out_size, char **error_msg);
 
+/* Compile a GLSL compute shader to SPIR-V (GLSLANG_STAGE_COMPUTE).
+ * Same ownership contract as vio_compile_glsl_to_spirv. */
+uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
+                                            size_t *out_size, char **error_msg);
+
 #endif /* VIO_SHADER_COMPILER_H */

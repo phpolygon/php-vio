@@ -71,6 +71,71 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
     return output;
 }
 
+/* Transpile a compute SPIR-V module to GLSL for the OpenGL backend.
+ *
+ * Distinct from vio_spirv_to_glsl(): the render path flattens UBOs to plain
+ * uniforms (EMIT_UNIFORM_BUFFER_AS_PLAIN_UNIFORMS) so it works on GL <= 4.2 /
+ * macOS 4.1. Compute requires GL >= 4.3, where real std140 UBO blocks and
+ * std430 SSBO blocks with explicit `binding =` qualifiers are available — and
+ * the compute primitive depends on them: the Params block must stay a UBO so it
+ * can be bound via glBindBufferBase(GL_UNIFORM_BUFFER, binding, ...), and the
+ * two SSBOs must keep their `layout(std430, binding=N) buffer` qualifiers so the
+ * SSBO binding points match the slots the PHP layer binds. So this variant emits
+ * version >= 430 and leaves UBOs/SSBOs as real interface blocks. */
+char *vio_spirv_to_glsl_compute(const uint32_t *spirv, size_t spirv_size, int version, char **error_msg)
+{
+    spvc_context ctx = NULL;
+    spvc_parsed_ir ir = NULL;
+    spvc_compiler compiler = NULL;
+    spvc_compiler_options options = NULL;
+    const char *result = NULL;
+    char *output = NULL;
+
+    if (version < 430) version = 430;
+
+    if (spvc_context_create(&ctx) != SPVC_SUCCESS) {
+        if (error_msg) *error_msg = strdup("Failed to create SPIRV-Cross context");
+        return NULL;
+    }
+
+    size_t word_count = spirv_size / sizeof(uint32_t);
+
+    if (spvc_context_parse_spirv(ctx, spirv, word_count, &ir) != SPVC_SUCCESS) {
+        if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
+        spvc_context_destroy(ctx);
+        return NULL;
+    }
+
+    if (spvc_context_create_compiler(ctx, SPVC_BACKEND_GLSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &compiler) != SPVC_SUCCESS) {
+        if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
+        spvc_context_destroy(ctx);
+        return NULL;
+    }
+
+    spvc_compiler_create_compiler_options(compiler, &options);
+    spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_GLSL_VERSION, (unsigned)version);
+    spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_GLSL_ES, SPVC_FALSE);
+    /* Keep UBOs as std140 blocks (NOT plain uniforms) and SSBOs as std430 blocks,
+     * preserving their explicit `binding =` qualifiers so the GL backend binds by
+     * the same slot the shader declares. */
+    spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_GLSL_EMIT_UNIFORM_BUFFER_AS_PLAIN_UNIFORMS, SPVC_FALSE);
+    spvc_compiler_install_compiler_options(compiler, options);
+
+    if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS) {
+        if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
+        spvc_context_destroy(ctx);
+        return NULL;
+    }
+
+    if (getenv("VIO_DUMP_CS_GLSL")) {
+        fprintf(stderr, "==== OpenGL compute GLSL ====\n%s\n==== end ====\n", result);
+        fflush(stderr);
+    }
+    output = strdup(result);
+    spvc_context_destroy(ctx);
+    return output;
+}
+
 char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_msg)
 {
     spvc_context ctx = NULL;
@@ -296,6 +361,8 @@ int vio_spirv_reflect(const uint32_t *spirv, size_t spirv_size,
     copy_resources(compiler, resources, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, &result->ubos, &result->ubo_count);
     copy_resources(compiler, resources, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, &result->textures, &result->texture_count);
     copy_resources(compiler, resources, SPVC_RESOURCE_TYPE_PUSH_CONSTANT, &result->uniforms, &result->uniform_count);
+    copy_resources(compiler, resources, SPVC_RESOURCE_TYPE_STORAGE_BUFFER, &result->storage_buffers, &result->storage_buffer_count);
+    copy_resources(compiler, resources, SPVC_RESOURCE_TYPE_STORAGE_IMAGE, &result->storage_images, &result->storage_image_count);
 
     spvc_context_destroy(ctx);
     return 0;
@@ -307,10 +374,14 @@ void vio_reflect_free(vio_reflect_result *result)
     for (int i = 0; i < result->uniform_count; i++) free((void *)result->uniforms[i].name);
     for (int i = 0; i < result->texture_count; i++) free((void *)result->textures[i].name);
     for (int i = 0; i < result->ubo_count; i++) free((void *)result->ubos[i].name);
+    for (int i = 0; i < result->storage_buffer_count; i++) free((void *)result->storage_buffers[i].name);
+    for (int i = 0; i < result->storage_image_count; i++) free((void *)result->storage_images[i].name);
     free(result->inputs);
     free(result->uniforms);
     free(result->textures);
     free(result->ubos);
+    free(result->storage_buffers);
+    free(result->storage_images);
     memset(result, 0, sizeof(vio_reflect_result));
 }
 
@@ -449,6 +520,13 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
 #else /* !HAVE_SPIRV_CROSS */
 
 char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, char **error_msg)
+{
+    (void)spirv; (void)spirv_size; (void)version;
+    if (error_msg) *error_msg = strdup("spirv-cross not available (compile with --with-spirv-cross)");
+    return NULL;
+}
+
+char *vio_spirv_to_glsl_compute(const uint32_t *spirv, size_t spirv_size, int version, char **error_msg)
 {
     (void)spirv; (void)spirv_size; (void)version;
     if (error_msg) *error_msg = strdup("spirv-cross not available (compile with --with-spirv-cross)");

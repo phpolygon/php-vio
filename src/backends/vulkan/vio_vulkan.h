@@ -112,6 +112,19 @@ typedef struct _vio_vulkan_state {
      * vio_vulkan_texture). Swept in vulkan_shutdown before vkDestroyDevice. */
     struct _vio_vulkan_texture *live_textures;
 
+    /* Heads of the intrusive lists of live compute storage buffers and compute
+     * pipelines (see vio_vulkan.c). Swept in vulkan_shutdown BEFORE
+     * vkDestroyDevice for the same reason as live_textures: the owning PHP
+     * VioBuffer / VioComputePipeline objects' Zend free handlers run at REQUEST
+     * shutdown, AFTER vio_destroy() has already destroyed the device — so without
+     * a pre-destroy sweep their VkBuffer/VkPipeline/etc. would still be alive at
+     * vkDestroyDevice (a VUID-vkDestroyDevice-device-05137 validation error and a
+     * real GPU leak). The sweep frees each survivor's GPU objects while the device
+     * is still alive; the later free handler then no-ops (handles already NULL).
+     * void* to avoid leaking the (file-local) struct types into this header. */
+    void                       *live_compute_buffers;
+    void                       *live_compute_pipelines;
+
     /* Live offscreen render targets (vio_render_target_object*), tracked the
      * same way as live_textures and for the same reason: vio_destroy() runs
      * vulkan_shutdown (+ vkDestroyDevice) while PHP VioRenderTarget objects are

@@ -244,6 +244,9 @@ typedef struct _vio_buffer_desc {
     const void     *data;
     size_t          size;
     int             binding;
+    int             stride;   /* element stride in bytes for STORAGE buffers
+                                 (StructuredBuffer StructureByteStride). 0 (default)
+                                 => treat as raw/4-byte elements. */
 } vio_buffer_desc;
 
 typedef struct _vio_texture_desc {

@@ -30,6 +30,8 @@
 #include "../../vio_texture.h"
 #include "../../vio_buffer.h"
 #include "../../vio_shader.h"
+#include "../../vio_shader_compiler.h"
+#include "../../vio_shader_reflect.h"
 
 vio_opengl_state vio_gl = {0};
 
@@ -163,10 +165,75 @@ static void opengl_bind_pipeline(void *pipeline)
     (void)pipeline;
 }
 
+/* ── Compute primitive: backend storage-buffer + pipeline structs ─────
+ *
+ * A storage buffer is a GL SSBO (GL_SHADER_STORAGE_BUFFER). The PHP layer's
+ * vio_storage_buffer() routes through create_buffer(VIO_BUFFER_STORAGE), so a
+ * STORAGE desc produces one of these handles; every other buffer type stays on
+ * the mesh/uniform paths and create_buffer returns NULL as before. */
+typedef struct _vio_opengl_compute_buffer {
+    GLuint  ssbo;
+    size_t  size;     /* bytes */
+    int     stride;   /* element stride (informational; raw float access in GL) */
+} vio_opengl_compute_buffer;
+
+#define VIO_GL_COMPUTE_MAX_BINDINGS 8
+
+typedef struct _vio_opengl_compute_binding {
+    vio_opengl_compute_buffer *buffer;
+    int slot;     /* GLSL SSBO binding point */
+    int access;   /* VIO_COMPUTE_READ (0) / VIO_COMPUTE_WRITE (1) */
+} vio_opengl_compute_binding;
+
+typedef struct _vio_opengl_compute_pipeline {
+    GLuint program;
+    GLuint ubo;              /* params UBO (lazily (re)created in set_uniforms) */
+    GLsizeiptr ubo_capacity; /* current UBO byte capacity */
+    int    params_binding;   /* reflected UBO binding point (GLSL binding = 2) */
+    vio_opengl_compute_binding bindings[VIO_GL_COMPUTE_MAX_BINDINGS];
+    int    binding_count;
+} vio_opengl_compute_pipeline;
+
+/* Drain glGetError() to stderr (bring-up aid). Loops because GL queues errors. */
+static void opengl_drain_gl_errors(const char *where)
+{
+    GLenum e;
+    while ((e = glGetError()) != GL_NO_ERROR) {
+        fprintf(stderr, "[OpenGL GL error @ %s] 0x%04x\n", where, (unsigned)e);
+        fflush(stderr);
+    }
+}
+
 static void *opengl_create_buffer(vio_buffer_desc *desc)
 {
-    (void)desc;
-    return NULL; /* Handled by mesh system */
+    if (!desc || desc->type != VIO_BUFFER_STORAGE) {
+        return NULL; /* non-storage buffers handled by the mesh/uniform systems */
+    }
+    if (!vio_gl.initialized || desc->size == 0) return NULL;
+
+    vio_opengl_compute_buffer *buf = calloc(1, sizeof(vio_opengl_compute_buffer));
+    if (!buf) return NULL;
+    buf->size   = desc->size;
+    buf->stride = desc->stride;
+
+    glGenBuffers(1, &buf->ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf->ssbo);
+    /* Input buffers carry `data` (read-once) -> STATIC_DRAW; output buffers are
+     * sized-and-zeroed (NULL data) and read back -> DYNAMIC_DRAW. Either way the
+     * store is initialised: when data is NULL we zero-fill so an output buffer
+     * that is never written keeps a deterministic 0 (not garbage). */
+    GLenum usage = desc->data ? GL_STATIC_DRAW : GL_DYNAMIC_DRAW;
+    if (desc->data) {
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)desc->size, desc->data, usage);
+    } else {
+        void *zeros = calloc(1, desc->size);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)desc->size, zeros, usage);
+        if (zeros) free(zeros);
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+    if (!buf->ssbo) { free(buf); return NULL; }
+    return buf;
 }
 
 static void opengl_update_buffer(void *buffer, const void *data, size_t size)
@@ -253,9 +320,229 @@ static void opengl_clear(float r, float g, float b, float a)
     vio_gl.clear_a = a;
 }
 
+/* ── Compute primitive: pipeline / bind / uniforms / dispatch / readback ──
+ *
+ * GLSL compute source -> SPIR-V (glslang) -> GLSL >=430 (spirv-cross, UBO/SSBO
+ * blocks preserved) -> GL_COMPUTE_SHADER program. Buffers bound via
+ * glBindBufferBase: SSBOs in the GL_SHADER_STORAGE_BUFFER binding namespace (so
+ * binding 0 and 1 don't collide), the params UBO in the GL_UNIFORM_BUFFER
+ * namespace at its reflected binding. SSBO/UBO blocks keep explicit `binding=N`
+ * qualifiers from the source, so no glShaderStorageBlockBinding/glUniformBlock-
+ * Binding fixup is needed; we apply it defensively only if reflection disagrees. */
+
+static void *opengl_create_compute_pipeline(vio_shader_desc *desc)
+{
+    if (!vio_gl.initialized || !vio_gl.caps.has_compute_shader) {
+        php_error_docref(NULL, E_WARNING, "OpenGL: compute requires GL >= 4.3");
+        return NULL;
+    }
+
+    const char *src = (const char *)desc->fragment_data;
+    if (!src && desc->vertex_data) src = (const char *)desc->vertex_data;
+    if (!src) {
+        php_error_docref(NULL, E_WARNING, "OpenGL: compute pipeline missing source");
+        return NULL;
+    }
+    size_t src_size = desc->fragment_size ? desc->fragment_size : desc->vertex_size;
+
+    char *err = NULL;
+    uint32_t *spirv = NULL;
+    size_t spirv_size = 0;
+    int free_spirv = 0;
+
+    int is_spirv = (src_size >= 4 && *(const uint32_t *)src == 0x07230203);
+    if (is_spirv) {
+        spirv = (uint32_t *)src;
+        spirv_size = src_size;
+    } else {
+        spirv = vio_compile_glsl_compute_to_spirv(src, &spirv_size, &err);
+        if (!spirv) {
+            php_error_docref(NULL, E_WARNING, "OpenGL: CS GLSL->SPIR-V failed: %s", err ? err : "unknown");
+            if (err) free(err);
+            return NULL;
+        }
+        free_spirv = 1;
+    }
+
+    /* Reflect the params UBO binding (GLSL binding = 2 in the canonical shader).
+     * Defaults to 0 if reflection is unavailable, matching the bind fallback. */
+    int params_binding = 0;
+    {
+        vio_reflect_result refl;
+        char *rerr = NULL;
+        if (vio_spirv_reflect(spirv, spirv_size, &refl, &rerr) == 0) {
+            if (refl.ubo_count > 0) {
+                params_binding = (int)refl.ubos[0].binding;
+                for (int i = 1; i < refl.ubo_count; i++) {
+                    if ((int)refl.ubos[i].binding < params_binding)
+                        params_binding = (int)refl.ubos[i].binding;
+                }
+            }
+            vio_reflect_free(&refl);
+        } else {
+            if (rerr) free(rerr);
+        }
+    }
+
+    /* Emit GLSL >= the active context version (>=430). spirv-cross keeps the
+     * std140 UBO + std430 SSBO blocks with explicit bindings. */
+    int glsl_version = vio_gl.glsl_version >= 430 ? vio_gl.glsl_version : 430;
+    char *glsl = vio_spirv_to_glsl_compute(spirv, spirv_size, glsl_version, &err);
+    if (free_spirv) free(spirv);
+    if (!glsl) {
+        php_error_docref(NULL, E_WARNING, "OpenGL: CS SPIR-V->GLSL failed: %s", err ? err : "unknown");
+        if (err) free(err);
+        return NULL;
+    }
+
+    GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+    const char *gsrc = glsl;
+    glShaderSource(shader, 1, &gsrc, NULL);
+    glCompileShader(shader);
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+        php_error_docref(NULL, E_WARNING, "OpenGL: compute shader compile failed: %s", log);
+        if (getenv("VIO_DUMP_CS_GLSL")) {
+            fprintf(stderr, "==== failed compute GLSL ====\n%s\n==== end ====\n", glsl);
+        }
+        free(glsl);
+        glDeleteShader(shader);
+        return NULL;
+    }
+    free(glsl);
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, shader);
+    glLinkProgram(program);
+    glDeleteShader(shader); /* flagged for deletion; freed when detached at link */
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetProgramInfoLog(program, sizeof(log), NULL, log);
+        php_error_docref(NULL, E_WARNING, "OpenGL: compute program link failed: %s", log);
+        glDeleteProgram(program);
+        return NULL;
+    }
+
+    vio_opengl_compute_pipeline *cp = calloc(1, sizeof(vio_opengl_compute_pipeline));
+    if (!cp) { glDeleteProgram(program); return NULL; }
+    cp->program = program;
+    cp->params_binding = params_binding;
+
+    /* Defensive: if the UBO block lost its explicit binding (older spirv-cross),
+     * pin it to params_binding so glBindBufferBase(GL_UNIFORM_BUFFER, ...) lands. */
+    GLuint blk = glGetUniformBlockIndex(program, "Params");
+    if (blk != GL_INVALID_INDEX) {
+        glUniformBlockBinding(program, blk, (GLuint)params_binding);
+    }
+
+    return cp;
+}
+
+static void opengl_destroy_compute_pipeline(void *pipeline_ptr)
+{
+    vio_opengl_compute_pipeline *cp = (vio_opengl_compute_pipeline *)pipeline_ptr;
+    if (!cp) return;
+    if (cp->ubo) glDeleteBuffers(1, &cp->ubo);
+    if (cp->program) glDeleteProgram(cp->program);
+    free(cp);
+}
+
+static void opengl_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
+                                       int slot, int access, int element_count, int stride)
+{
+    (void)element_count; (void)stride; /* raw float SSBO access — view metadata unused in GL */
+    vio_opengl_compute_pipeline *cp = (vio_opengl_compute_pipeline *)pipeline_ptr;
+    vio_opengl_compute_buffer *buf = (vio_opengl_compute_buffer *)backend_buffer;
+    if (!cp || !buf) return;
+    if (cp->binding_count >= VIO_GL_COMPUTE_MAX_BINDINGS) return;
+
+    vio_opengl_compute_binding *b = &cp->bindings[cp->binding_count++];
+    b->buffer = buf;
+    b->slot   = slot;
+    b->access = access;
+}
+
+static void opengl_compute_set_uniforms(void *pipeline_ptr, const void *data, int size)
+{
+    vio_opengl_compute_pipeline *cp = (vio_opengl_compute_pipeline *)pipeline_ptr;
+    if (!cp || !data || size <= 0 || !vio_gl.initialized) return;
+
+    if (!cp->ubo) {
+        glGenBuffers(1, &cp->ubo);
+        cp->ubo_capacity = 0;
+    }
+    glBindBuffer(GL_UNIFORM_BUFFER, cp->ubo);
+    if (cp->ubo_capacity < (GLsizeiptr)size) {
+        glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)size, data, GL_DYNAMIC_DRAW);
+        cp->ubo_capacity = (GLsizeiptr)size;
+    } else {
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)size, data);
+    }
+    glBindBuffer(GL_UNIFORM_BUFFER, 0);
+}
+
 static void opengl_dispatch_compute(vio_compute_cmd *cmd)
 {
-    (void)cmd;
+    if (!cmd || !vio_gl.initialized) return;
+    vio_opengl_compute_pipeline *cp = (vio_opengl_compute_pipeline *)cmd->pipeline;
+    if (!cp || !cp->program) {
+        php_error_docref(NULL, E_WARNING, "OpenGL: dispatch_compute with invalid pipeline");
+        return;
+    }
+
+    glUseProgram(cp->program);
+
+    /* SSBOs: GL_SHADER_STORAGE_BUFFER binding namespace, slot == GLSL binding. */
+    for (int i = 0; i < cp->binding_count; i++) {
+        vio_opengl_compute_binding *b = &cp->bindings[i];
+        if (!b->buffer || !b->buffer->ssbo) continue;
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)b->slot, b->buffer->ssbo);
+    }
+
+    /* Params UBO: separate GL_UNIFORM_BUFFER namespace, at its reflected binding. */
+    if (cp->ubo) {
+        glBindBufferBase(GL_UNIFORM_BUFFER, (GLuint)cp->params_binding, cp->ubo);
+    }
+
+    GLuint gx = cmd->group_count_x > 0 ? (GLuint)cmd->group_count_x : 1;
+    GLuint gy = cmd->group_count_y > 0 ? (GLuint)cmd->group_count_y : 1;
+    GLuint gz = cmd->group_count_z > 0 ? (GLuint)cmd->group_count_z : 1;
+    glDispatchCompute(gx, gy, gz);
+
+    /* Make SSBO writes visible to subsequent glGetBufferSubData / glMapBufferRange
+     * readback. Missing GL_SHADER_STORAGE_BARRIER_BIT yields stale data. */
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    /* Unbind so the SSBOs/UBO aren't left bound to these points. */
+    for (int i = 0; i < cp->binding_count; i++) {
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)cp->bindings[i].slot, 0);
+    }
+    if (cp->ubo) glBindBufferBase(GL_UNIFORM_BUFFER, (GLuint)cp->params_binding, 0);
+    glUseProgram(0);
+
+    if (vio_gl.caps.has_debug_output || getenv("VIO_GL_COMPUTE_DEBUG")) {
+        opengl_drain_gl_errors("dispatch_compute");
+    }
+}
+
+static size_t opengl_read_buffer(void *backend_buffer, void *out, size_t size)
+{
+    vio_opengl_compute_buffer *buf = (vio_opengl_compute_buffer *)backend_buffer;
+    if (!buf || !buf->ssbo || !out || size == 0 || !vio_gl.initialized) return 0;
+
+    size_t n = size < buf->size ? size : buf->size;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf->ssbo);
+    /* glGetBufferSubData blocks until prior GPU writes (made visible by the
+     * dispatch's glMemoryBarrier) complete, then copies into out. */
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)n, out);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+    if (getenv("VIO_GL_COMPUTE_DEBUG")) opengl_drain_gl_errors("read_buffer");
+    return n;
 }
 
 static void opengl_set_viewport(int x, int y, int width, int height)
@@ -282,6 +569,13 @@ static void opengl_destroy_buffer_obj(void *buf_obj)
     if (buf->buffer_id) {
         glDeleteBuffers(1, &buf->buffer_id);
         buf->buffer_id = 0;
+    }
+    /* STORAGE buffers (compute) live behind backend_buffer as a GL SSBO wrapper. */
+    if (buf->backend_buffer) {
+        vio_opengl_compute_buffer *cb = (vio_opengl_compute_buffer *)buf->backend_buffer;
+        if (cb->ssbo) glDeleteBuffers(1, &cb->ssbo);
+        free(cb);
+        buf->backend_buffer = NULL;
     }
 }
 
@@ -937,6 +1231,11 @@ static const vio_backend opengl_backend = {
     .clear             = opengl_clear,
     .gpu_flush         = opengl_gpu_flush,
     .dispatch_compute  = opengl_dispatch_compute,
+    .create_compute_pipeline  = opengl_create_compute_pipeline,
+    .destroy_compute_pipeline = opengl_destroy_compute_pipeline,
+    .compute_bind_buffer      = opengl_compute_bind_buffer,
+    .compute_set_uniforms     = opengl_compute_set_uniforms,
+    .read_buffer              = opengl_read_buffer,
     .supports_feature  = opengl_supports_feature,
     .set_viewport      = opengl_set_viewport,
     .set_uniform       = opengl_set_uniform,

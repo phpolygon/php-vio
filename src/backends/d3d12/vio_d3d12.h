@@ -44,8 +44,59 @@ typedef struct _vio_d3d12_buffer {
     vio_buffer_type  type;
     size_t           size;
     int              binding;
+    int              stride;           /* structured element stride (bytes); 0 => raw/4 */
     D3D12_GPU_VIRTUAL_ADDRESS gpu_address;
+    /* Compute readback: a READBACK-heap staging buffer the output (UAV) buffer's
+     * contents are copied into by dispatch_compute, so vio_storage_buffer_read
+     * can Map+memcpy without re-running the GPU. Lazily created on first read. */
+    ID3D12Resource  *readback_resource;
+    size_t           readback_size;    /* valid bytes currently in readback_resource */
 } vio_d3d12_buffer;
+
+/* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */
+#define VIO_D3D12_COMPUTE_MAX_BINDINGS 8
+
+/* One recorded storage-buffer binding on a compute pipeline. */
+typedef struct _vio_d3d12_compute_binding {
+    struct _vio_d3d12_buffer *buffer;  /* the bound storage buffer */
+    int slot;                          /* shader register index (t# or u#) */
+    int access;                        /* 0 = READ (SRV), 1 = WRITE (UAV) */
+    int element_count;                 /* NumElements for the structured view */
+    int stride;                        /* StructureByteStride */
+} vio_d3d12_compute_binding;
+
+/* Compute pipeline = compute PSO + cs blob + recorded bindings + params buffer.
+ *
+ * The root signature is PER-PIPELINE and DATA-DRIVEN from SPIR-V reflection: the
+ * CBV register (b#), the SRV table base register (t#) and the UAV table base
+ * register (u#) are read from the actual transpiled shader, NOT hardcoded. This
+ * is required because the canonical SDF shader uses DISTINCT GLSL bindings
+ * (boxes=0, dist=1, Params=2) which spirv-cross maps to t0 / u1 / b2 — a shared
+ * t0/u0/b0 root signature would mismatch the shader (debug-layer error 882). */
+typedef struct _vio_d3d12_compute_pipeline {
+    ID3D12PipelineState *pso;
+    ID3D12RootSignature *root_signature;  /* per-pipeline, built from reflection */
+    ID3DBlob            *cs_blob;
+    vio_d3d12_compute_binding srvs[VIO_D3D12_COMPUTE_MAX_BINDINGS];
+    int                 srv_count;
+    vio_d3d12_compute_binding uavs[VIO_D3D12_COMPUTE_MAX_BINDINGS];
+    int                 uav_count;
+    /* Reflected register layout (filled at pipeline creation):
+     *   cbv_register   — the Params UBO's HLSL register (b#); -1 if no UBO.
+     *   srv_base_reg   — lowest readonly  storage-buffer register (t#); table base.
+     *   uav_base_reg   — lowest writeonly storage-buffer register (u#); table base.
+     * The SRV/UAV descriptor ranges use these as BaseShaderRegister so a buffer
+     * bound at GLSL binding=slot lands on register t{slot}/u{slot}. */
+    int                 cbv_register;
+    int                 srv_base_reg;
+    int                 uav_base_reg;
+    /* Params constant block. An UPLOAD-heap buffer, persistently re-mapped by
+     * compute_set_uniforms (256-byte aligned per the CB requirement). Bound to
+     * the reflected cbv_register. */
+    ID3D12Resource     *params_buf;
+    size_t              params_capacity;  /* allocated bytes (256-aligned) */
+    size_t              params_size;      /* bytes actually staged */
+} vio_d3d12_compute_pipeline;
 
 /* Texture wrapper */
 typedef struct _vio_d3d12_texture {
@@ -124,6 +175,16 @@ typedef struct _vio_d3d12_state {
 
     /* Root signature (shared across all pipelines) */
     ID3D12RootSignature       *root_signature;
+
+    /* Compute root signature: [0] root CBV b0, [1] SRV table (t0..), [2] UAV
+     * table (u0..), ALL visibility, no input-assembler flag. Created lazily on
+     * first compute dispatch (so non-compute runs pay nothing), released at
+     * shutdown. Paired with a dedicated shader-visible CBV/SRV/UAV heap used
+     * solely by compute dispatches, kept fully separate from the graphics
+     * srv_heap and its per-frame partitioning. */
+    ID3D12RootSignature       *compute_root_signature;
+    ID3D12DescriptorHeap      *compute_srv_heap;     /* shader-visible, compute-only */
+    UINT                       compute_srv_descriptor_size;
 
     /* Currently bound render target (NULL = backbuffer) */
     D3D12_CPU_DESCRIPTOR_HANDLE current_rtv;

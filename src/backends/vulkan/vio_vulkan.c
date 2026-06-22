@@ -21,9 +21,13 @@
 #include "../../vio_texture.h"
 #include "../../vio_font.h"
 #include "../../vio_render_target.h"
+#include "../../vio_buffer.h"
+#include "../../vio_shader_compiler.h"
+#include "../../vio_shader_reflect.h"
 #include "../../../include/vio_types.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 vio_vulkan_state vio_vk = {0};
 
@@ -771,6 +775,17 @@ int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
  * live-texture sweep above it. */
 static void vulkan_release_texture_gpu(vio_vulkan_texture *tex, int wait);
 
+/* Forward decls: the compute GPU-release helpers, defined far below, are needed
+ * by vulkan_shutdown's pre-vkDestroyDevice sweep of live compute buffers/
+ * pipelines. They unlink the node + free its GPU objects but NOT the heap struct
+ * (the owning PHP object's free handler does that — see the texture pattern), so
+ * the sweep and PHP GC never double-free. The list-node types are file-local, so
+ * the forward decls use the concrete struct types declared just below. */
+struct _vio_vulkan_compute_buffer;
+struct _vio_vulkan_compute_pipeline;
+static void vulkan_release_compute_buffer_gpu(struct _vio_vulkan_compute_buffer *cb);
+static void vulkan_release_compute_pipeline_gpu(struct _vio_vulkan_compute_pipeline *cp);
+
 static int vulkan_init(vio_config *cfg)
 {
     (void)cfg;
@@ -827,7 +842,25 @@ static void vulkan_shutdown(void)
     if (vio_vk.live_render_targets) {
         free(vio_vk.live_render_targets);
         vio_vk.live_render_targets = NULL;
+        vio_vk.live_rt_count = 0;
         vio_vk.live_rt_capacity = 0;
+    }
+
+    /* Sweep any compute pipelines / storage buffers whose PHP object outlived
+     * vio_destroy() (their Zend free handlers run at request shutdown, after
+     * this). The device + VMA are still alive here, so each destroy frees the
+     * real GPU objects; the destroy also unlinks the node, so the loops shrink to
+     * empty. The later free handler then no-ops (backend_pipeline/backend_buffer
+     * already NULL on the PHP object, or the node already gone). Pipelines first
+     * (they own descriptor pools/sets that reference nothing of the buffers, but
+     * order does not matter — both are fully fenced and independent). */
+    while (vio_vk.live_compute_pipelines) {
+        vulkan_release_compute_pipeline_gpu(
+            (struct _vio_vulkan_compute_pipeline *)vio_vk.live_compute_pipelines);
+    }
+    while (vio_vk.live_compute_buffers) {
+        vulkan_release_compute_buffer_gpu(
+            (struct _vio_vulkan_compute_buffer *)vio_vk.live_compute_buffers);
     }
 
     /* Frame resources, swapchain, render passes all require the device. On a
@@ -874,9 +907,126 @@ static void *vulkan_create_pipeline(vio_pipeline_desc *desc) { (void)desc; retur
 static void vulkan_destroy_pipeline(void *p) { (void)p; }
 static void vulkan_bind_pipeline(void *p) { (void)p; }
 
-static void *vulkan_create_buffer(vio_buffer_desc *desc) { (void)desc; return NULL; }
+/* ── Compute storage buffer (VIO_BUFFER_STORAGE) ──────────────────────
+ *
+ * The compute primitive's only buffer type. Backs vio_storage_buffer(): an
+ * input buffer carries `data` (the packed box floats), an output buffer is
+ * sized-and-zeroed for the dispatch to write + read back. Both are HOST_VISIBLE
+ * | HOST_COHERENT VkBuffers with STORAGE_BUFFER usage (+ TRANSFER_DST so the
+ * initial seed/zero is a valid copy target conceptually; we seed by map, but
+ * keeping TRANSFER_SRC/DST makes a future staging path drop-in). Host-coherent
+ * means no manual flush/invalidate is needed: the GPU sees the seeded input and
+ * the host sees the dispatch's writes once the dispatch fence is signalled.
+ *
+ * Graphics buffers (vertex/index/uniform) are NOT handled here — they return
+ * NULL exactly as before (those paths are still stubbed in this backend), so
+ * this addition is compute-only and cannot perturb any existing behaviour. */
+typedef struct _vio_vulkan_compute_buffer {
+    VkBuffer       buffer;
+    void          *allocation;   /* VmaAllocation (opaque) */
+    VkDeviceSize   size;         /* bytes */
+    int            stride;       /* element stride (informational) */
+    /* Intrusive list (vio_vk.live_compute_buffers) so vulkan_shutdown can sweep
+     * survivors before vkDestroyDevice. */
+    struct _vio_vulkan_compute_buffer *next, *prev;
+} vio_vulkan_compute_buffer;
+
+static void *vulkan_create_buffer(vio_buffer_desc *desc)
+{
+    /* Only the compute storage path is implemented in this backend. Every other
+     * buffer type stays NULL (unchanged graphics behaviour). */
+    if (!desc || desc->type != VIO_BUFFER_STORAGE) return NULL;
+    if (!vio_vk.initialized || !vio_vk.vma_allocator || desc->size == 0) return NULL;
+
+    vio_vulkan_compute_buffer *buf = calloc(1, sizeof(vio_vulkan_compute_buffer));
+    if (!buf) return NULL;
+    buf->size   = (VkDeviceSize)desc->size;
+    buf->stride = desc->stride;
+
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vio_vma_create_buffer(vio_vk.vma_allocator, buf->size, usage,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              &buf->buffer, &buf->allocation) != 0 || !buf->buffer) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: storage buffer allocation failed");
+        free(buf);
+        return NULL;
+    }
+
+    /* Seed input buffers with `data`; zero output buffers (NULL data) so a cell
+     * that is never written keeps a deterministic 0 rather than garbage. The
+     * memory is HOST_VISIBLE|HOST_COHERENT, so a plain memcpy after map is
+     * visible to the GPU at submit with no explicit flush. */
+    void *mapped = vio_vma_map(vio_vk.vma_allocator, buf->allocation);
+    if (mapped) {
+        if (desc->data) {
+            memcpy(mapped, desc->data, (size_t)buf->size);
+        } else {
+            memset(mapped, 0, (size_t)buf->size);
+        }
+        vio_vma_unmap(vio_vk.vma_allocator, buf->allocation);
+    } else {
+        php_error_docref(NULL, E_WARNING, "Vulkan: storage buffer map (seed) failed");
+        vio_vma_destroy_buffer(vio_vk.vma_allocator, buf->buffer, buf->allocation);
+        free(buf);
+        return NULL;
+    }
+
+    /* Link into the live-compute-buffers list (head insert) so vulkan_shutdown
+     * can free it before vkDestroyDevice if the PHP object outlives vio_destroy(). */
+    buf->prev = NULL;
+    buf->next = (vio_vulkan_compute_buffer *)vio_vk.live_compute_buffers;
+    if (buf->next) buf->next->prev = buf;
+    vio_vk.live_compute_buffers = buf;
+
+    return buf;
+}
+
 static void vulkan_update_buffer(void *buf, const void *data, size_t size) { (void)buf; (void)data; (void)size; }
-static void vulkan_destroy_buffer(void *buf) { (void)buf; }
+
+/* Release a storage buffer's GPU object + unlink from the live list, zeroing the
+ * handle so this is idempotent. Does NOT free the struct (mirrors
+ * vulkan_release_texture_gpu): only the owning PHP VioBuffer's free handler frees
+ * the heap struct, so the shutdown sweep and the PHP GC — in either order — never
+ * double-free. No-op on a NULL device/allocator (handles already gone). */
+static void vulkan_release_compute_buffer_gpu(vio_vulkan_compute_buffer *cb)
+{
+    if (!cb) return;
+    if (cb->prev) cb->prev->next = cb->next;
+    else if (vio_vk.live_compute_buffers == cb) vio_vk.live_compute_buffers = cb->next;
+    if (cb->next) cb->next->prev = cb->prev;
+    cb->prev = cb->next = NULL;
+
+    if (cb->buffer && vio_vk.vma_allocator) {
+        vio_vma_destroy_buffer(vio_vk.vma_allocator, cb->buffer, cb->allocation);
+    }
+    cb->buffer     = VK_NULL_HANDLE;
+    cb->allocation = NULL;
+}
+
+/* Opaque-handle destroy path (parallel to destroy_texture). Releases GPU objects
+ * then frees the struct. Called by the shutdown sweep? NO — the sweep uses
+ * vulkan_release_compute_buffer_gpu (no struct free). This is called only when
+ * the struct itself should die (the VioBuffer free handler). */
+static void vulkan_destroy_buffer(void *buf)
+{
+    vio_vulkan_compute_buffer *cb = (vio_vulkan_compute_buffer *)buf;
+    if (!cb) return;
+    vulkan_release_compute_buffer_gpu(cb);
+    free(cb);
+}
+
+/* VioBuffer free-handler path: free the backend storage buffer behind
+ * buf_obj->backend_buffer (mirrors opengl_destroy_buffer_obj). */
+static void vulkan_destroy_buffer_obj(void *buf_obj)
+{
+    vio_buffer_object *bo = (vio_buffer_object *)buf_obj;
+    if (!bo || !bo->backend_buffer) return;
+    vulkan_destroy_buffer(bo->backend_buffer);
+    bo->backend_buffer = NULL;
+}
 
 /* ── Transient one-time-submit command helpers ───────────────────────
  *
@@ -2177,7 +2327,442 @@ static void vulkan_clear(float r, float g, float b, float a)
     vio_vk.clear_a = a;
 }
 
-static void vulkan_dispatch_compute(vio_compute_cmd *cmd) { (void)cmd; }
+/* ── GPU compute primitive ────────────────────────────────────────────
+ *
+ * Mirrors the D3D12/OpenGL compute contract. The canonical SDF shader (set 0:
+ * binding 0 = readonly SSBO Boxes, binding 1 = writeonly SSBO OutD, binding 2 =
+ * UBO Params) compiles GLSL->SPIR-V once (glslang, VULKAN client) and the
+ * SPIR-V is fed STRAIGHT to vkCreateShaderModule — no transpile, since Vulkan
+ * is SPIR-V's native target.
+ *
+ * Descriptor-set layout is a FIXED 3-binding layout matching the frozen
+ * contract: (0,1) STORAGE_BUFFER, (2) UNIFORM_BUFFER, all VK_SHADER_STAGE_
+ * COMPUTE_BIT. Bound buffers + the params UBO are recorded on the pipeline
+ * object and committed via vkUpdateDescriptorSets at dispatch (so re-dispatch
+ * with rebound buffers works). Each dispatch is a transient one-time-submit
+ * command buffer, fully fenced (vkWaitForFences) before returning — so by the
+ * time read_buffer or destroy runs, the GPU is idle and nothing is in flight. */
+
+#define VIO_VK_COMPUTE_MAX_BINDINGS 8
+
+typedef struct _vio_vk_compute_binding {
+    vio_vulkan_compute_buffer *buffer;
+    int slot;      /* descriptor-set binding number */
+    int access;    /* VIO_COMPUTE_READ (0) / VIO_COMPUTE_WRITE (1) */
+} vio_vk_compute_binding;
+
+typedef struct _vio_vulkan_compute_pipeline {
+    VkShaderModule        module;
+    VkDescriptorSetLayout set_layout;
+    VkPipelineLayout      pipeline_layout;
+    VkPipeline            pipeline;
+    VkDescriptorPool      desc_pool;
+    VkDescriptorSet       desc_set;
+
+    /* Params UBO (host-visible), lazily (re)created in set_uniforms. */
+    VkBuffer              params_buf;
+    void                 *params_alloc;
+    VkDeviceSize          params_capacity;
+    int                   params_set;     /* 1 once uniforms have been staged */
+    int                   params_binding; /* reflected UBO binding (canonical = 2) */
+
+    vio_vk_compute_binding bindings[VIO_VK_COMPUTE_MAX_BINDINGS];
+    int                    binding_count;
+
+    /* Intrusive list (vio_vk.live_compute_pipelines) for the shutdown sweep. */
+    struct _vio_vulkan_compute_pipeline *next, *prev;
+} vio_vulkan_compute_pipeline;
+
+static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
+{
+    if (!vio_vk.initialized || !vio_vk.device) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: compute pipeline before device init");
+        return NULL;
+    }
+
+    /* GLSL compute source arrives in fragment_data (see vio_compute_pipeline).
+     * It may also already be SPIR-V (0x07230203 magic). */
+    const char *src = (const char *)desc->fragment_data;
+    if (!src && desc->vertex_data) src = (const char *)desc->vertex_data;
+    if (!src) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: compute pipeline missing source");
+        return NULL;
+    }
+    size_t src_size = desc->fragment_size ? desc->fragment_size : desc->vertex_size;
+
+    char *err = NULL;
+    uint32_t *spirv = NULL;
+    size_t spirv_size = 0;
+    int free_spirv = 0;
+
+    int is_spirv = (src_size >= 4 && *(const uint32_t *)src == 0x07230203);
+    if (is_spirv) {
+        spirv = (uint32_t *)src;
+        spirv_size = src_size;
+    } else {
+        spirv = vio_compile_glsl_compute_to_spirv(src, &spirv_size, &err);
+        if (!spirv) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: CS GLSL->SPIR-V failed: %s", err ? err : "unknown");
+            if (err) free(err);
+            return NULL;
+        }
+        free_spirv = 1;
+    }
+
+    /* Reflect the params UBO binding (canonical = 2). Defaults to 2 if reflection
+     * is unavailable, matching the frozen contract's layout. */
+    int params_binding = 2;
+    {
+        vio_reflect_result refl;
+        char *rerr = NULL;
+        if (vio_spirv_reflect(spirv, spirv_size, &refl, &rerr) == 0) {
+            if (refl.ubo_count > 0) {
+                params_binding = (int)refl.ubos[0].binding;
+                for (int i = 1; i < refl.ubo_count; i++) {
+                    if ((int)refl.ubos[i].binding < params_binding)
+                        params_binding = (int)refl.ubos[i].binding;
+                }
+            }
+            vio_reflect_free(&refl);
+        } else {
+            if (rerr) free(rerr);
+        }
+    }
+
+    vio_vulkan_compute_pipeline *cp = calloc(1, sizeof(vio_vulkan_compute_pipeline));
+    if (!cp) { if (free_spirv) free(spirv); return NULL; }
+    cp->params_binding = params_binding;
+
+    /* Shader module straight from SPIR-V. */
+    VkShaderModuleCreateInfo smi = {0};
+    smi.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smi.codeSize = spirv_size;                /* size in BYTES */
+    smi.pCode    = spirv;                      /* uint32_t* */
+    VkResult vr = vkCreateShaderModule(vio_vk.device, &smi, NULL, &cp->module);
+    if (free_spirv) free(spirv);
+    if (vr != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: vkCreateShaderModule failed (VkResult %d)", vr);
+        free(cp);
+        return NULL;
+    }
+
+    /* Fixed 3-binding descriptor-set layout (the frozen contract). Binding the
+     * params UBO at its reflected binding keeps the layout matching the SPIR-V
+     * even if a future shader moves it. */
+    VkDescriptorSetLayoutBinding lb[3] = {0};
+    lb[0].binding         = 0;
+    lb[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    lb[0].descriptorCount = 1;
+    lb[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    lb[1].binding         = 1;
+    lb[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    lb[1].descriptorCount = 1;
+    lb[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    lb[2].binding         = (uint32_t)params_binding;
+    lb[2].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    lb[2].descriptorCount = 1;
+    lb[2].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dsli = {0};
+    dsli.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dsli.bindingCount = 3;
+    dsli.pBindings    = lb;
+    if (vkCreateDescriptorSetLayout(vio_vk.device, &dsli, NULL, &cp->set_layout) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: vkCreateDescriptorSetLayout failed");
+        vkDestroyShaderModule(vio_vk.device, cp->module, NULL);
+        free(cp);
+        return NULL;
+    }
+
+    VkPipelineLayoutCreateInfo pli = {0};
+    pli.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts    = &cp->set_layout;
+    if (vkCreatePipelineLayout(vio_vk.device, &pli, NULL, &cp->pipeline_layout) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: vkCreatePipelineLayout failed");
+        vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);
+        vkDestroyShaderModule(vio_vk.device, cp->module, NULL);
+        free(cp);
+        return NULL;
+    }
+
+    VkComputePipelineCreateInfo cpi = {0};
+    cpi.sType               = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpi.stage.sType         = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage         = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module        = cp->module;
+    cpi.stage.pName         = "main";
+    cpi.layout              = cp->pipeline_layout;
+    if (vkCreateComputePipelines(vio_vk.device, VK_NULL_HANDLE, 1, &cpi, NULL, &cp->pipeline) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: vkCreateComputePipelines failed");
+        vkDestroyPipelineLayout(vio_vk.device, cp->pipeline_layout, NULL);
+        vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);
+        vkDestroyShaderModule(vio_vk.device, cp->module, NULL);
+        free(cp);
+        return NULL;
+    }
+
+    /* Descriptor pool sized for one set (2 storage + 1 uniform). */
+    VkDescriptorPoolSize ps[2] = {0};
+    ps[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps[0].descriptorCount = 2;
+    ps[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    ps[1].descriptorCount = 1;
+    VkDescriptorPoolCreateInfo dpi = {0};
+    dpi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpi.maxSets       = 1;
+    dpi.poolSizeCount = 2;
+    dpi.pPoolSizes    = ps;
+    if (vkCreateDescriptorPool(vio_vk.device, &dpi, NULL, &cp->desc_pool) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: vkCreateDescriptorPool failed");
+        vkDestroyPipeline(vio_vk.device, cp->pipeline, NULL);
+        vkDestroyPipelineLayout(vio_vk.device, cp->pipeline_layout, NULL);
+        vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);
+        vkDestroyShaderModule(vio_vk.device, cp->module, NULL);
+        free(cp);
+        return NULL;
+    }
+
+    VkDescriptorSetAllocateInfo dsai = {0};
+    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool     = cp->desc_pool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts        = &cp->set_layout;
+    if (vkAllocateDescriptorSets(vio_vk.device, &dsai, &cp->desc_set) != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: vkAllocateDescriptorSets failed");
+        vkDestroyDescriptorPool(vio_vk.device, cp->desc_pool, NULL);
+        vkDestroyPipeline(vio_vk.device, cp->pipeline, NULL);
+        vkDestroyPipelineLayout(vio_vk.device, cp->pipeline_layout, NULL);
+        vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);
+        vkDestroyShaderModule(vio_vk.device, cp->module, NULL);
+        free(cp);
+        return NULL;
+    }
+
+    /* Link into the live-compute-pipelines list for the shutdown sweep. */
+    cp->prev = NULL;
+    cp->next = (vio_vulkan_compute_pipeline *)vio_vk.live_compute_pipelines;
+    if (cp->next) cp->next->prev = cp;
+    vio_vk.live_compute_pipelines = cp;
+
+    return cp;
+}
+
+/* Release a compute pipeline's GPU objects + unlink from the live list, zeroing
+ * handles so this is idempotent. Does NOT free the struct (mirrors
+ * vulkan_release_texture_gpu) — only the PHP VioComputePipeline free handler frees
+ * it, so the shutdown sweep and PHP GC (either order) never double-free. The
+ * VkDescriptorSet is freed implicitly with its pool (the pool lacks
+ * FREE_DESCRIPTOR_SET_BIT), so destroying desc_pool releases desc_set too. */
+static void vulkan_release_compute_pipeline_gpu(vio_vulkan_compute_pipeline *cp)
+{
+    if (!cp) return;
+    if (cp->prev) cp->prev->next = cp->next;
+    else if (vio_vk.live_compute_pipelines == cp) vio_vk.live_compute_pipelines = cp->next;
+    if (cp->next) cp->next->prev = cp->prev;
+    cp->prev = cp->next = NULL;
+
+    /* All dispatches are fully fenced (transient cmd buf + fence wait), so the GPU
+     * is idle w.r.t. this pipeline. Destroy in reverse-dependency order. */
+    if (vio_vk.device) {
+        if (cp->params_buf && vio_vk.vma_allocator)
+            vio_vma_destroy_buffer(vio_vk.vma_allocator, cp->params_buf, cp->params_alloc);
+        if (cp->desc_pool)       vkDestroyDescriptorPool(vio_vk.device, cp->desc_pool, NULL);
+        if (cp->pipeline)        vkDestroyPipeline(vio_vk.device, cp->pipeline, NULL);
+        if (cp->pipeline_layout) vkDestroyPipelineLayout(vio_vk.device, cp->pipeline_layout, NULL);
+        if (cp->set_layout)      vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);
+        if (cp->module)          vkDestroyShaderModule(vio_vk.device, cp->module, NULL);
+    }
+    cp->params_buf      = VK_NULL_HANDLE;
+    cp->params_alloc    = NULL;
+    cp->desc_pool       = VK_NULL_HANDLE;
+    cp->desc_set        = VK_NULL_HANDLE;
+    cp->pipeline        = VK_NULL_HANDLE;
+    cp->pipeline_layout = VK_NULL_HANDLE;
+    cp->set_layout      = VK_NULL_HANDLE;
+    cp->module          = VK_NULL_HANDLE;
+}
+
+static void vulkan_destroy_compute_pipeline(void *pipeline_ptr)
+{
+    vio_vulkan_compute_pipeline *cp = (vio_vulkan_compute_pipeline *)pipeline_ptr;
+    if (!cp) return;
+    vulkan_release_compute_pipeline_gpu(cp);
+    free(cp);
+}
+
+static void vulkan_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
+                                       int slot, int access, int element_count, int stride)
+{
+    (void)element_count; (void)stride; /* SSBO views are full-range; metadata unused */
+    vio_vulkan_compute_pipeline *cp = (vio_vulkan_compute_pipeline *)pipeline_ptr;
+    vio_vulkan_compute_buffer  *buf = (vio_vulkan_compute_buffer *)backend_buffer;
+    if (!cp || !buf) return;
+    if (cp->binding_count >= VIO_VK_COMPUTE_MAX_BINDINGS) return;
+
+    vio_vk_compute_binding *b = &cp->bindings[cp->binding_count++];
+    b->buffer = buf;
+    b->slot   = slot;
+    b->access = access;
+}
+
+static void vulkan_compute_set_uniforms(void *pipeline_ptr, const void *data, int size)
+{
+    vio_vulkan_compute_pipeline *cp = (vio_vulkan_compute_pipeline *)pipeline_ptr;
+    if (!cp || !data || size <= 0 || !vio_vk.initialized || !vio_vk.vma_allocator) return;
+
+    if (!cp->params_buf || cp->params_capacity < (VkDeviceSize)size) {
+        if (cp->params_buf) {
+            vio_vma_destroy_buffer(vio_vk.vma_allocator, cp->params_buf, cp->params_alloc);
+            cp->params_buf = VK_NULL_HANDLE;
+            cp->params_alloc = NULL;
+        }
+        if (vio_vma_create_buffer(vio_vk.vma_allocator, (VkDeviceSize)size,
+                                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  &cp->params_buf, &cp->params_alloc) != 0 || !cp->params_buf) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: compute params UBO create failed");
+            cp->params_buf = VK_NULL_HANDLE;
+            return;
+        }
+        cp->params_capacity = (VkDeviceSize)size;
+    }
+
+    void *mapped = vio_vma_map(vio_vk.vma_allocator, cp->params_alloc);
+    if (mapped) {
+        memcpy(mapped, data, (size_t)size);
+        vio_vma_unmap(vio_vk.vma_allocator, cp->params_alloc);
+        cp->params_set = 1;
+    } else {
+        php_error_docref(NULL, E_WARNING, "Vulkan: compute params UBO map failed");
+    }
+}
+
+static void vulkan_dispatch_compute(vio_compute_cmd *cmd)
+{
+    if (!cmd || !vio_vk.initialized || !vio_vk.device) return;
+    vio_vulkan_compute_pipeline *cp = (vio_vulkan_compute_pipeline *)cmd->pipeline;
+    if (!cp || !cp->pipeline) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: dispatch_compute with invalid pipeline");
+        return;
+    }
+
+    /* Commit the descriptor set: each bound storage buffer at its slot, plus the
+     * params UBO at its reflected binding. Build the writes for whatever is
+     * actually bound (every binding in the layout that has a resource). */
+    VkDescriptorBufferInfo binfos[VIO_VK_COMPUTE_MAX_BINDINGS];
+    VkWriteDescriptorSet   writes[VIO_VK_COMPUTE_MAX_BINDINGS + 1];
+    uint32_t write_count = 0;
+
+    for (int i = 0; i < cp->binding_count; i++) {
+        vio_vk_compute_binding *b = &cp->bindings[i];
+        if (!b->buffer || !b->buffer->buffer) continue;
+        binfos[write_count].buffer = b->buffer->buffer;
+        binfos[write_count].offset = 0;
+        binfos[write_count].range  = VK_WHOLE_SIZE;
+
+        VkWriteDescriptorSet *w = &writes[write_count];
+        memset(w, 0, sizeof(*w));
+        w->sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w->dstSet          = cp->desc_set;
+        w->dstBinding      = (uint32_t)b->slot;
+        w->dstArrayElement = 0;
+        w->descriptorCount = 1;
+        w->descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w->pBufferInfo     = &binfos[write_count];
+        write_count++;
+    }
+
+    VkDescriptorBufferInfo pinfo = {0};
+    if (cp->params_set && cp->params_buf) {
+        pinfo.buffer = cp->params_buf;
+        pinfo.offset = 0;
+        pinfo.range  = VK_WHOLE_SIZE;
+        VkWriteDescriptorSet *w = &writes[write_count];
+        memset(w, 0, sizeof(*w));
+        w->sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w->dstSet          = cp->desc_set;
+        w->dstBinding      = (uint32_t)cp->params_binding;
+        w->dstArrayElement = 0;
+        w->descriptorCount = 1;
+        w->descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w->pBufferInfo     = &pinfo;
+        write_count++;
+    }
+
+    if (write_count > 0) {
+        vkUpdateDescriptorSets(vio_vk.device, write_count, writes, 0, NULL);
+    }
+
+    /* Transient one-time-submit command buffer (does not touch the frame cmd
+     * buffer; compute runs outside any swapchain frame, like texture uploads). */
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cbuf = VK_NULL_HANDLE;
+    if (vulkan_begin_transient_commands(&pool, &cbuf) != 0) return;
+
+    vkCmdBindPipeline(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline);
+    vkCmdBindDescriptorSets(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout,
+                            0, 1, &cp->desc_set, 0, NULL);
+
+    uint32_t gx = cmd->group_count_x > 0 ? (uint32_t)cmd->group_count_x : 1;
+    uint32_t gy = cmd->group_count_y > 0 ? (uint32_t)cmd->group_count_y : 1;
+    uint32_t gz = cmd->group_count_z > 0 ? (uint32_t)cmd->group_count_z : 1;
+    vkCmdDispatch(cbuf, gx, gy, gz);
+
+    /* Make every WRITE storage buffer's shader writes visible to the host map in
+     * read_buffer. One barrier per writeonly buffer: SHADER_WRITE@COMPUTE ->
+     * HOST_READ@HOST. Read-only inputs need no post-dispatch barrier. */
+    VkBufferMemoryBarrier barriers[VIO_VK_COMPUTE_MAX_BINDINGS];
+    uint32_t bar_count = 0;
+    for (int i = 0; i < cp->binding_count; i++) {
+        vio_vk_compute_binding *b = &cp->bindings[i];
+        if (b->access != 1 /* VIO_COMPUTE_WRITE */) continue;
+        if (!b->buffer || !b->buffer->buffer) continue;
+        VkBufferMemoryBarrier *bm = &barriers[bar_count++];
+        memset(bm, 0, sizeof(*bm));
+        bm->sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bm->srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
+        bm->dstAccessMask       = VK_ACCESS_HOST_READ_BIT;
+        bm->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bm->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bm->buffer              = b->buffer->buffer;
+        bm->offset              = 0;
+        bm->size                = VK_WHOLE_SIZE;
+    }
+    if (bar_count > 0) {
+        vkCmdPipelineBarrier(cbuf,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 0, NULL, bar_count, barriers, 0, NULL);
+    }
+
+    /* End + submit on a fence + BLOCK until complete (fully synchronous). After
+     * this returns the dispatch is done and the host-coherent output memory holds
+     * the results, ready for read_buffer to map. */
+    vulkan_submit_transient_commands(pool, cbuf);
+}
+
+/* GPU->CPU readback of a storage buffer. The dispatch already fenced + ran the
+ * COMPUTE->HOST barrier, so the (HOST_VISIBLE|HOST_COHERENT) memory is current:
+ * map, memcpy, unmap. Host-coherent => no manual vkInvalidateMappedMemoryRanges
+ * is required (VMA picked coherent memory for our HOST_COHERENT request). */
+static size_t vulkan_read_buffer(void *backend_buffer, void *out, size_t size)
+{
+    vio_vulkan_compute_buffer *buf = (vio_vulkan_compute_buffer *)backend_buffer;
+    if (!buf || !buf->buffer || !out || size == 0 || !vio_vk.initialized || !vio_vk.vma_allocator)
+        return 0;
+
+    size_t n = size < (size_t)buf->size ? size : (size_t)buf->size;
+    void *mapped = vio_vma_map(vio_vk.vma_allocator, buf->allocation);
+    if (!mapped) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: read_buffer map failed");
+        return 0;
+    }
+    memcpy(out, mapped, n);
+    vio_vma_unmap(vio_vk.vma_allocator, buf->allocation);
+    return n;
+}
 
 /* Phase 5 — CPU readback of swapchain content. See the header comment for the
  * full contract. NOTE: unlike D3D12 (which reads its last_presented buffer
@@ -2518,8 +3103,17 @@ static const vio_backend vulkan_backend = {
     .clear             = vulkan_clear,
     .gpu_flush         = NULL,
     .dispatch_compute  = vulkan_dispatch_compute,
+    /* GPU compute primitive (SDF voxelization). The device's graphics queue
+     * family is compute-capable (the Vulkan spec guarantees any graphics-capable
+     * queue family also supports compute), so these run on vio_vk.graphics_queue. */
+    .create_compute_pipeline  = vulkan_create_compute_pipeline,
+    .destroy_compute_pipeline = vulkan_destroy_compute_pipeline,
+    .compute_bind_buffer      = vulkan_compute_bind_buffer,
+    .compute_set_uniforms     = vulkan_compute_set_uniforms,
+    .read_buffer              = vulkan_read_buffer,
     .supports_feature  = vulkan_supports_feature,
     .destroy_texture_obj = vulkan_destroy_texture_obj,
+    .destroy_buffer_obj  = vulkan_destroy_buffer_obj,
     .destroy_font_atlas  = vulkan_destroy_font_atlas,
     /* Offscreen render targets (Phase 3). create_render_target is invoked
      * directly from the HAVE_VULKAN branch of ZEND_FUNCTION(vio_render_target)

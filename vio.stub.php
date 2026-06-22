@@ -451,6 +451,55 @@ function vio_update_buffer(VioBuffer $buffer, string $data, int $offset = 0): vo
  */
 function vio_bind_buffer(VioContext $context, VioBuffer $buffer, int $binding = -1): void {}
 
+/* ── GPU compute primitive (M1: D3D12) ─────────────────────────────────
+ *
+ * Every vio_compute_* function returns false / no-ops (with an E_NOTICE) when
+ * the active backend does not report VIO_FEATURE_COMPUTE, so callers fall back
+ * to a CPU path silently.
+ */
+
+/**
+ * Create a GPU compute pipeline from a GLSL compute shader.
+ *
+ * @param array $config ['source' => string]  // GLSL `#version 450` compute source
+ * @return VioComputePipeline|false
+ */
+function vio_compute_pipeline(VioContext $context, array $config): VioComputePipeline|false {}
+
+/**
+ * Create a storage (UAV/SRV) buffer for compute.
+ *
+ * @param array $config ['size' => int]            // zeroed UAV output
+ *                       | ['data' => string]       // SRV input (binary)
+ *                       , optional ['stride' => int] // element stride (default 4)
+ * @return VioBuffer|false
+ */
+function vio_storage_buffer(VioContext $context, array $config): VioBuffer|false {}
+
+/**
+ * Bind a storage buffer to a compute pipeline slot.
+ *
+ * @param int $access VIO_COMPUTE_READ (SRV t#) or VIO_COMPUTE_WRITE (UAV u#)
+ */
+function vio_compute_bind_buffer(VioContext $context, VioComputePipeline $pipeline, VioBuffer $buffer, int $slot, int $access): void {}
+
+/**
+ * Stage the small params constant block (b0) for the next dispatch.
+ */
+function vio_compute_set_uniforms(VioContext $context, VioComputePipeline $pipeline, string $data): void {}
+
+/**
+ * Dispatch the compute pipeline (group counts). Blocks until the GPU finishes.
+ */
+function vio_compute_dispatch(VioContext $context, VioComputePipeline $pipeline, int $gx, int $gy, int $gz): void {}
+
+/**
+ * Read back a storage buffer's bytes (GPU -> CPU). Blocks on a fence.
+ *
+ * @return string|false Raw bytes, or false on failure / unsupported.
+ */
+function vio_storage_buffer_read(VioContext $context, VioBuffer $buffer): string|false {}
+
 /**
  * Set a uniform value on the currently bound pipeline shader.
  * Supports int, float, vec2/3/4 (flat array), mat3 (9 floats), mat4 (16 floats).

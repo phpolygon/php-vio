@@ -221,6 +221,40 @@ typedef struct _vio_backend {
     /* Compute (optional) */
     void  (*dispatch_compute)(vio_compute_cmd *cmd);
 
+    /* GPU compute primitive (optional; M1 = D3D12 only). All slots are NULL on
+     * backends without a compute path — the PHP vio_compute_* layer gates on
+     * supports_feature(VIO_FEATURE_COMPUTE) && the relevant slot != NULL and
+     * falls back to CPU silently when either is missing.
+     *
+     * Bound storage buffers + the params constant block are tracked ON the
+     * backend compute-pipeline object (compute_bind_buffer / compute_set_uniforms
+     * write into it), so dispatch_compute reads them back via cmd->pipeline and
+     * the vio_compute_cmd ABI never changes. */
+
+    /* Compile a GLSL compute shader + build the backend compute pipeline (PSO /
+     * program). desc->fragment_data carries the GLSL compute source as a NUL-
+     * terminated string (fragment_size its length); format is VIO_SHADER_GLSL.
+     * Returns an opaque backend compute-pipeline handle, or NULL on failure. */
+    void *(*create_compute_pipeline)(vio_shader_desc *desc);
+    void  (*destroy_compute_pipeline)(void *pipeline);
+
+    /* Record a storage-buffer binding on the compute pipeline. backend_buffer is
+     * the opaque handle from create_buffer(VIO_BUFFER_STORAGE); slot is the
+     * shader register index; access is VIO_COMPUTE_READ (SRV t#) or
+     * VIO_COMPUTE_WRITE (UAV u#). element_count / stride describe the structured
+     * view (NumElements / StructureByteStride). */
+    void  (*compute_bind_buffer)(void *pipeline, void *backend_buffer,
+                                 int slot, int access,
+                                 int element_count, int stride);
+
+    /* Stage the small params constant block (b0) onto the compute pipeline. */
+    void  (*compute_set_uniforms)(void *pipeline, const void *data, int size);
+
+    /* GPU -> CPU readback of a storage buffer. Blocks on a fence, then writes up
+     * to size bytes into out. Returns the number of bytes written, or 0 on
+     * failure / unsupported. */
+    size_t (*read_buffer)(void *backend_buffer, void *out, size_t size);
+
     /* Query */
     int   (*supports_feature)(vio_feature feature);
 } vio_backend;

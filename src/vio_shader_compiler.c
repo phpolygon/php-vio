@@ -38,15 +38,16 @@ void vio_shader_compiler_shutdown(void)
     }
 }
 
-uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
-                                     size_t *out_size, char **error_msg)
+/* Core compiler: GLSL source + an explicit glslang stage -> SPIR-V. Both the
+ * graphics (vertex/fragment) and compute public entry points funnel through
+ * here so the compile/link/emit logic lives in one place. */
+static uint32_t *vio_compile_stage_to_spirv(const char *source, glslang_stage_t stage,
+                                            size_t *out_size, char **error_msg)
 {
     if (!glslang_initialized) {
         if (error_msg) *error_msg = strdup("glslang not initialized");
         return NULL;
     }
-
-    glslang_stage_t stage = is_fragment ? GLSLANG_STAGE_FRAGMENT : GLSLANG_STAGE_VERTEX;
 
     glslang_input_t input = {0};
     input.language                          = GLSLANG_SOURCE_GLSL;
@@ -133,6 +134,20 @@ uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
     return spirv;
 }
 
+uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
+                                     size_t *out_size, char **error_msg)
+{
+    return vio_compile_stage_to_spirv(source,
+        is_fragment ? GLSLANG_STAGE_FRAGMENT : GLSLANG_STAGE_VERTEX,
+        out_size, error_msg);
+}
+
+uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
+                                            size_t *out_size, char **error_msg)
+{
+    return vio_compile_stage_to_spirv(source, GLSLANG_STAGE_COMPUTE, out_size, error_msg);
+}
+
 #else /* !HAVE_GLSLANG */
 
 int vio_shader_compiler_init(void) { return 0; }
@@ -142,6 +157,14 @@ uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
                                      size_t *out_size, char **error_msg)
 {
     (void)source; (void)is_fragment; (void)out_size;
+    if (error_msg) *error_msg = strdup("glslang not available (compile with --with-glslang)");
+    return NULL;
+}
+
+uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
+                                            size_t *out_size, char **error_msg)
+{
+    (void)source; (void)out_size;
     if (error_msg) *error_msg = strdup("glslang not available (compile with --with-glslang)");
     return NULL;
 }

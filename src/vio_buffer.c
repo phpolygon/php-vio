@@ -22,6 +22,7 @@ static zend_object *vio_buffer_create_object(zend_class_entry *ce)
     buf->type      = VIO_BUFFER_UNIFORM;
     buf->size      = 0;
     buf->binding   = 0;
+    buf->stride    = 0;
     buf->valid     = 0;
 
     zend_object_std_init(&buf->std, ce);
