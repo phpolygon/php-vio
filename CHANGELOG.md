@@ -1,3 +1,11 @@
+## [2.1.1](https://github.com/phpolygon/php-vio/compare/v2.1.0...v2.1.1) (2026-06-22)
+
+
+### Bug Fixes
+
+* **build:** compile vio_compute_pipeline.c + gate releases on load/test ([affc8b0](https://github.com/phpolygon/php-vio/commit/affc8b033a76275ea8953b7c0b264a1ffc744987))
+* **build:** link SPIRV-Tools on aarch64; make GPU tests skip without a context ([c9e69c3](https://github.com/phpolygon/php-vio/commit/c9e69c3c81ac2ef9e8b993ef3274109e3b976cb2))
+
 # [2.1.0](https://github.com/phpolygon/php-vio/compare/v2.0.1...v2.1.0) (2026-06-22)
 
 
