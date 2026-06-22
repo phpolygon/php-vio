@@ -311,6 +311,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_input.c \
     src/vio_shader.c \
     src/vio_pipeline.c \
+    src/vio_compute_pipeline.c \
     src/vio_texture.c \
     src/vio_render_target.c \
     src/vio_cubemap.c \

@@ -53,10 +53,18 @@ jobs:
             --with-ffmpeg
           make -j$(nproc)
 
+      # Loading the freshly built module with eager symbol binding is the
+      # gate that catches a "compiles but won't link/load" extension — e.g.
+      # a new src/*.c missing from config.m4, whose symbols stay undefined
+      # in the shared .so (tolerated at link, fatal at static link / load).
+      - name: Smoke test — extension loads (eager symbol binding)
+        run: |
+          LD_BIND_NOW=1 php -d extension_dir="$PWD/modules" -d extension=vio.so \
+            -r 'exit((int) !extension_loaded("vio"));'
+
       - name: Run tests
         run: |
-          NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) \
-            php run-tests.php -d extension=$PWD/modules/vio.so tests/ || true
+          NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS=tests/
 
       - name: Package binary
         run: |
@@ -111,6 +119,15 @@ jobs:
             --with-ffmpeg
           make -j$(nproc)
 
+      - name: Smoke test — extension loads (eager symbol binding)
+        run: |
+          LD_BIND_NOW=1 php -d extension_dir="$PWD/modules" -d extension=vio.so \
+            -r 'exit((int) !extension_loaded("vio"));'
+
+      - name: Run tests
+        run: |
+          NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS=tests/
+
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
@@ -157,6 +174,15 @@ jobs:
             --with-ffmpeg \
             --with-metal
           make -j$(sysctl -n hw.ncpu)
+
+      - name: Smoke test — extension loads (eager symbol binding)
+        run: |
+          DYLD_BIND_AT_LAUNCH=1 php -d extension_dir="$PWD/modules" -d extension=vio.so \
+            -r 'exit((int) !extension_loaded("vio"));'
+
+      - name: Run tests
+        run: |
+          NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS=tests/
 
       - name: Package binary
         run: |
@@ -205,10 +231,14 @@ jobs:
             --with-metal
           make -j$(sysctl -n hw.ncpu)
 
+      - name: Smoke test — extension loads (eager symbol binding)
+        run: |
+          DYLD_BIND_AT_LAUNCH=1 php -d extension_dir="$PWD/modules" -d extension=vio.so \
+            -r 'exit((int) !extension_loaded("vio"));'
+
       - name: Run tests
         run: |
-          NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) \
-            php run-tests.php -d extension=$PWD/modules/vio.so tests/ || true
+          NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS=tests/
 
       - name: Package binary
         run: |
