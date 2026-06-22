@@ -2,6 +2,10 @@
 vio_set_window_size changes context dimensions
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 // Windows enforces a minimum window client area (≈ 100×30 dpi-aware px)

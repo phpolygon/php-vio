@@ -2,6 +2,10 @@
 vio_render_target with MSAA samples > 1: probe + fallback on unsupported backends
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 $ctx = vio_create("opengl", ["width" => 64, "height" => 64, "headless" => true]);

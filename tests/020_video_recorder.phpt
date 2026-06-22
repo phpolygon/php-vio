@@ -2,6 +2,10 @@
 Video recorder API and VioRecorder class
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 // VioRecorder class exists

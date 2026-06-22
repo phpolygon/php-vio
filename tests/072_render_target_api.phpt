@@ -2,6 +2,7 @@
 vio_create_render_target / vio_set_render_target / push/pop (Issue #4)
 --SKIPIF--
 <?php
+require __DIR__ . '/skipif_gl.inc';
 if (!extension_loaded('vio')) die('skip vio not loaded');
 ?>
 --FILE--

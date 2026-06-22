@@ -2,6 +2,10 @@
 vio_render_target_texture: repeated calls on the same RT are stable and don't leak
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 // Regression test: vio_render_target_texture used to allocate a fresh

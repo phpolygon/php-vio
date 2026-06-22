@@ -39,6 +39,7 @@ jobs:
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             spirv-cross libspirv-cross-c-shared-dev \
+            xvfb libgl1-mesa-dri libglx-mesa0 \
             pkg-config
 
       - name: Build extension
@@ -62,16 +63,17 @@ jobs:
           LD_BIND_NOW=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
             -r 'exit((int) !extension_loaded("vio"));'
 
-      - name: Run tests
+      - name: Run tests (Xvfb + Mesa software GL)
         run: |
-          # -n ignores the runner's system php.ini (which enables dozens of
-          # bundled extensions by short name); without it, redirecting
-          # extension_dir to modules/ floods every test with "Unable to load"
-          # warnings that break the --EXPECT-- match. TEST_PHP_ARGS is applied
-          # to each test's child process, so vio loads + ini stays clean.
-          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
+          # vio's MINIT calls glfwInit(), which needs a display; the GPU tests
+          # need an OpenGL >= 3.3 context. Provide both headlessly via Xvfb +
+          # Mesa/llvmpipe (LIBGL_ALWAYS_SOFTWARE=1). -n keeps the child ini
+          # clean — the runner's system php.ini enables many extensions by
+          # short name, which would otherwise flood every test with "Unable to
+          # load" warnings and break the --EXPECT-- match.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
-          php -n run-tests.php -q --show-diff tests/
+          xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
         run: |
@@ -112,6 +114,7 @@ jobs:
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             spirv-cross libspirv-cross-c-shared-dev \
+            xvfb libgl1-mesa-dri libglx-mesa0 \
             pkg-config
 
       - name: Build extension
@@ -131,16 +134,17 @@ jobs:
           LD_BIND_NOW=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
             -r 'exit((int) !extension_loaded("vio"));'
 
-      - name: Run tests
+      - name: Run tests (Xvfb + Mesa software GL)
         run: |
-          # -n ignores the runner's system php.ini (which enables dozens of
-          # bundled extensions by short name); without it, redirecting
-          # extension_dir to modules/ floods every test with "Unable to load"
-          # warnings that break the --EXPECT-- match. TEST_PHP_ARGS is applied
-          # to each test's child process, so vio loads + ini stays clean.
-          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
+          # vio's MINIT calls glfwInit(), which needs a display; the GPU tests
+          # need an OpenGL >= 3.3 context. Provide both headlessly via Xvfb +
+          # Mesa/llvmpipe (LIBGL_ALWAYS_SOFTWARE=1). -n keeps the child ini
+          # clean — the runner's system php.ini enables many extensions by
+          # short name, which would otherwise flood every test with "Unable to
+          # load" warnings and break the --EXPECT-- match.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
-          php -n run-tests.php -q --show-diff tests/
+          xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
         run: |

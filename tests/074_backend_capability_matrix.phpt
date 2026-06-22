@@ -2,6 +2,7 @@
 Backend capability matrix: VIO_FEATURE_* returns the documented values per backend
 --SKIPIF--
 <?php
+require __DIR__ . '/skipif_gl.inc';
 if (!extension_loaded('vio')) die('skip vio not loaded');
 ?>
 --FILE--

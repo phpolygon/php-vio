@@ -2,6 +2,10 @@
 Window state: vio_set_title, fullscreen/borderless/windowed, cursor_mode, native_window_handle
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 $ctx = vio_create("opengl", ["width" => 256, "height" => 256, "headless" => true]);

@@ -2,6 +2,7 @@
 Async font loading API (vio_font_load_async / vio_font_load_poll)
 --SKIPIF--
 <?php
+require __DIR__ . '/skipif_gl.inc';
 $candidates = [
     '/Library/Fonts/Arial Unicode.ttf',                 // macOS
     '/System/Library/Fonts/Helvetica.ttc',              // macOS fallback
