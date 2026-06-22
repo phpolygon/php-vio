@@ -1,3 +1,15 @@
+# [2.1.0](https://github.com/phpolygon/php-vio/compare/v2.0.1...v2.1.0) (2026-06-22)
+
+
+### Features
+
+* **compute:** cross-backend GPU compute primitive (vio_compute_*) ([2732add](https://github.com/phpolygon/php-vio/commit/2732add16eaa683c5ddd6c1c0432485d0c5bcbfc))
+
+
+### Performance Improvements
+
+* **uniforms:** O(1) uniform lookup + batch vio_set_uniforms ([204d3ba](https://github.com/phpolygon/php-vio/commit/204d3ba3bc71b5dea339d6d06ec917faf78fa256)), closes [#1](https://github.com/phpolygon/php-vio/issues/1)
+
 ## [2.0.1](https://github.com/phpolygon/php-vio/compare/v2.0.0...v2.0.1) (2026-06-20)
 
 
