@@ -2,6 +2,10 @@
 2D transform and scissor stacks: push/pop pairing, nesting, draw safety
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 $ctx = vio_create("opengl", ["width" => 128, "height" => 128, "headless" => true]);

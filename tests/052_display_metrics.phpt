@@ -2,6 +2,10 @@
 Display metrics: vio_framebuffer_size, vio_content_scale, vio_pixel_ratio
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 $ctx = vio_create("opengl", ["width" => 200, "height" => 100, "headless" => true]);

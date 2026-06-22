@@ -115,7 +115,7 @@ if test "$PHP_VIO" != "no"; then
         dnl on libSPIRV (codegen) which on Linux statically references libSPIRV-Tools
         dnl (spvContextCreate etc). macOS' ld64 finds those by rescanning; GNU ld
         dnl needs them explicit. SPIRV-Tools is a pure provider, so it goes last.
-        if test -f "$dir/lib/libSPIRV-Tools.a" -o -f "$dir/lib/x86_64-linux-gnu/libSPIRV-Tools.a"; then
+        if test -f "$dir/lib/libSPIRV-Tools.a" -o -f "$dir/lib/x86_64-linux-gnu/libSPIRV-Tools.a" -o -f "$dir/lib/aarch64-linux-gnu/libSPIRV-Tools.a"; then
           PHP_ADD_LIBRARY_WITH_PATH(SPIRV-Tools-opt, $dir/lib, VIO_SHARED_LIBADD)
           PHP_ADD_LIBRARY_WITH_PATH(SPIRV-Tools, $dir/lib, VIO_SHARED_LIBADD)
         fi
@@ -311,6 +311,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_input.c \
     src/vio_shader.c \
     src/vio_pipeline.c \
+    src/vio_compute_pipeline.c \
     src/vio_texture.c \
     src/vio_render_target.c \
     src/vio_cubemap.c \
@@ -444,7 +445,7 @@ if test "$PHP_VIO" != "no"; then
       if test "$PHP_GLSLANG" != "no"; then
         for dir in $GLSLANG_SEARCH_DIRS; do
           if test -f "$dir/include/glslang/Include/glslang_c_interface.h"; then
-            for lib_dir in $dir/lib $dir/lib/x86_64-linux-gnu $dir/lib64; do
+            for lib_dir in $dir/lib $dir/lib/x86_64-linux-gnu $dir/lib/aarch64-linux-gnu $dir/lib64; do
               if test -f "$lib_dir/libSPIRV-Tools.a"; then
                 VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD $lib_dir/libSPIRV-Tools.a"
                 test -f "$lib_dir/libSPIRV-Tools-opt.a" && \

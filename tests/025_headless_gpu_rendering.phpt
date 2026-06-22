@@ -2,6 +2,10 @@
 Headless GPU rendering: clear, read_pixels, screenshot, image comparison
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 $ctx = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);

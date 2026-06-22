@@ -2,6 +2,7 @@
 vio_text_measure: returns width/height array, handles edge inputs
 --SKIPIF--
 <?php
+require __DIR__ . '/skipif_gl.inc';
 $candidates = [
     '/Library/Fonts/Arial Unicode.ttf',
     '/System/Library/Fonts/Helvetica.ttc',

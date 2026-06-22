@@ -39,6 +39,7 @@ jobs:
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             spirv-cross libspirv-cross-c-shared-dev \
+            xvfb libgl1-mesa-dri libglx-mesa0 \
             pkg-config
 
       - name: Build extension
@@ -53,10 +54,30 @@ jobs:
             --with-ffmpeg
           make -j$(nproc)
 
-      - name: Run tests
+      # Loading the freshly built module with eager symbol binding is the
+      # gate that catches a "compiles but won't link/load" extension — e.g.
+      # a new src/*.c missing from config.m4, whose symbols stay undefined
+      # in the shared .so (tolerated at link, fatal at static link / load).
+      - name: Smoke test — extension loads (eager symbol binding)
         run: |
-          NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) \
-            php run-tests.php -d extension=$PWD/modules/vio.so tests/ || true
+          LD_BIND_NOW=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
+            -r 'exit((int) !extension_loaded("vio"));'
+
+      - name: Run tests (Xvfb + Mesa software GL)
+        run: |
+          # vio's MINIT calls glfwInit(), which needs a display; the GPU tests
+          # need an OpenGL >= 3.3 context. Provide both headlessly via Xvfb +
+          # Mesa/llvmpipe (LIBGL_ALWAYS_SOFTWARE=1). -n keeps the child ini
+          # clean — the runner's system php.ini enables many extensions by
+          # short name, which would otherwise flood every test with "Unable to
+          # load" warnings and break the --EXPECT-- match.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          # No sound card on CI runners -> ALSA spews "cannot find card" errors
+          # that pollute audio-test output. Route the default device to null so
+          # miniaudio opens it silently.
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
         run: |
@@ -97,6 +118,7 @@ jobs:
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             spirv-cross libspirv-cross-c-shared-dev \
+            xvfb libgl1-mesa-dri libglx-mesa0 \
             pkg-config
 
       - name: Build extension
@@ -110,6 +132,27 @@ jobs:
             --with-vulkan \
             --with-ffmpeg
           make -j$(nproc)
+
+      - name: Smoke test — extension loads (eager symbol binding)
+        run: |
+          LD_BIND_NOW=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
+            -r 'exit((int) !extension_loaded("vio"));'
+
+      - name: Run tests (Xvfb + Mesa software GL)
+        run: |
+          # vio's MINIT calls glfwInit(), which needs a display; the GPU tests
+          # need an OpenGL >= 3.3 context. Provide both headlessly via Xvfb +
+          # Mesa/llvmpipe (LIBGL_ALWAYS_SOFTWARE=1). -n keeps the child ini
+          # clean — the runner's system php.ini enables many extensions by
+          # short name, which would otherwise flood every test with "Unable to
+          # load" warnings and break the --EXPECT-- match.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          # No sound card on CI runners -> ALSA spews "cannot find card" errors
+          # that pollute audio-test output. Route the default device to null so
+          # miniaudio opens it silently.
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
         run: |
@@ -158,6 +201,22 @@ jobs:
             --with-metal
           make -j$(sysctl -n hw.ncpu)
 
+      - name: Smoke test — extension loads (eager symbol binding)
+        run: |
+          DYLD_BIND_AT_LAUNCH=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
+            -r 'exit((int) !extension_loaded("vio"));'
+
+      - name: Run tests
+        run: |
+          # -n ignores the runner's system php.ini (which enables dozens of
+          # bundled extensions by short name); without it, redirecting
+          # extension_dir to modules/ floods every test with "Unable to load"
+          # warnings that break the --EXPECT-- match. TEST_PHP_ARGS is applied
+          # to each test's child process, so vio loads + ini stays clean.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          php -n run-tests.php -q --show-diff tests/
+
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
@@ -205,10 +264,21 @@ jobs:
             --with-metal
           make -j$(sysctl -n hw.ncpu)
 
+      - name: Smoke test — extension loads (eager symbol binding)
+        run: |
+          DYLD_BIND_AT_LAUNCH=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
+            -r 'exit((int) !extension_loaded("vio"));'
+
       - name: Run tests
         run: |
-          NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) \
-            php run-tests.php -d extension=$PWD/modules/vio.so tests/ || true
+          # -n ignores the runner's system php.ini (which enables dozens of
+          # bundled extensions by short name); without it, redirecting
+          # extension_dir to modules/ floods every test with "Unable to load"
+          # warnings that break the --EXPECT-- match. TEST_PHP_ARGS is applied
+          # to each test's child process, so vio loads + ini stays clean.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
         run: |

@@ -2,6 +2,10 @@
 Multiple contexts and resource isolation
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 // Create two headless contexts

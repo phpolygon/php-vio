@@ -2,6 +2,10 @@
 Headless mesh creation and draw call with real OpenGL context
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 $ctx = vio_create("opengl", ["width" => 32, "height" => 32, "headless" => true]);

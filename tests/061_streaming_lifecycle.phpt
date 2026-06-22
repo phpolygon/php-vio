@@ -2,6 +2,10 @@
 vio_stream lifecycle: create, push frame, stop — local MP4 output
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 $ctx = vio_create("opengl", ["width" => 32, "height" => 32, "headless" => true]);

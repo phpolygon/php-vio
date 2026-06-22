@@ -2,6 +2,10 @@
 Multi-context: independent frame lifecycles, no shared state crosstalk
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 // Two independent contexts must be able to interleave their frame

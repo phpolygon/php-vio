@@ -2,6 +2,10 @@
 Long-run memory tracking: 1000+ frame loop stays within fixed bound
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 // Stress-tests that the hot per-frame paths don't accumulate PHP-heap

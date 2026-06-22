@@ -2,6 +2,10 @@
 vio_bind_render_target: alternating binds, idempotence, resource-state tracking
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 $ctx = vio_create("opengl", ["width" => 64, "height" => 64, "headless" => true]);

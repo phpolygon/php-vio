@@ -2,6 +2,7 @@
 Font loading and text rendering with headless GPU context
 --SKIPIF--
 <?php
+require __DIR__ . '/skipif_gl.inc';
 // Locate a system font that's almost certainly present on the host.
 // Test was previously hard-coded to /Library/Fonts/Arial Unicode.ttf
 // which only exists on macOS.

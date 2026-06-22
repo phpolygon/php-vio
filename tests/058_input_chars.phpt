@@ -2,6 +2,10 @@
 Input: vio_chars_typed buffer + vio_on_char callback registration
 --EXTENSIONS--
 vio
+--SKIPIF--
+<?php
+require __DIR__ . '/skipif_gl.inc';
+?>
 --FILE--
 <?php
 $ctx = vio_create("opengl", ["width" => 64, "height" => 64, "headless" => true]);

@@ -2,6 +2,7 @@
 vio_gl_info diagnostics + GLSL #version mismatch detection (Issue #3 part 3)
 --SKIPIF--
 <?php
+require __DIR__ . '/skipif_gl.inc';
 if (!extension_loaded('vio')) die('skip vio not loaded');
 ?>
 --FILE--

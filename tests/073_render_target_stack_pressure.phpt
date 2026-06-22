@@ -2,6 +2,7 @@
 vio_push_render_target stack overflow + use-after-destroy hardening (Issue #4)
 --SKIPIF--
 <?php
+require __DIR__ . '/skipif_gl.inc';
 if (!extension_loaded('vio')) die('skip vio not loaded');
 ?>
 --FILE--
