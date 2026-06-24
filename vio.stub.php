@@ -193,8 +193,13 @@ function vio_set_windowed(VioContext $context): void {}
  * Switch to exclusive fullscreen mode.
  *
  * @param int $monitor Monitor index (from vio_monitors); -1 = primary monitor.
+ * @param int $width   Desired fullscreen width in pixels; 0 = the monitor's
+ *                     native mode. Should be a mode listed by vio_video_modes;
+ *                     GLFW falls back to the closest supported mode otherwise.
+ * @param int $height  Desired fullscreen height in pixels; 0 = native mode.
+ * @param int $refresh Desired refresh rate in Hz; 0 = let the mode decide.
  */
-function vio_set_fullscreen(VioContext $context, int $monitor = -1): void {}
+function vio_set_fullscreen(VioContext $context, int $monitor = -1, int $width = 0, int $height = 0, int $refresh = 0): void {}
 
 /**
  * Get the window size in screen coordinates.
@@ -243,6 +248,17 @@ function vio_monitor_info(VioContext $context): array {}
  * @return list<array{index:int, name:string, primary:bool, x:int, y:int, width:int, height:int, refresh_rate:int, work_x:int, work_y:int, work_width:int, work_height:int, scale_x:float, scale_y:float}>
  */
 function vio_monitors(VioContext $context): array {}
+
+/**
+ * Enumerate the video modes (resolutions + refresh rates) a monitor supports,
+ * for offering a fullscreen resolution picker. Duplicate (width, height,
+ * refresh) combinations are collapsed; modes are returned ascending. Pass a
+ * mode's width/height/refresh back into vio_set_fullscreen.
+ *
+ * @param int $monitor Monitor index (from vio_monitors); -1 = primary monitor.
+ * @return list<array{width:int, height:int, refresh_rate:int}>
+ */
+function vio_video_modes(VioContext $context, int $monitor = -1): array {}
 
 /**
  * Get the pixel ratio (framebuffer width / window width).

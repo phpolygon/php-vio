@@ -137,6 +137,9 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_fullscreen, 0, 1, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, monitor, IS_LONG, 0, "-1")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, width, IS_LONG, 0, "0")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, height, IS_LONG, 0, "0")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, refresh, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_window_size, 0, 1, IS_ARRAY, 0)
@@ -161,6 +164,11 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_monitors, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_video_modes, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, monitor, IS_LONG, 0, "-1")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_pixel_ratio, 0, 1, IS_DOUBLE, 0)
@@ -701,6 +709,7 @@ ZEND_FUNCTION(vio_framebuffer_size);
 ZEND_FUNCTION(vio_content_scale);
 ZEND_FUNCTION(vio_monitor_info);
 ZEND_FUNCTION(vio_monitors);
+ZEND_FUNCTION(vio_video_modes);
 ZEND_FUNCTION(vio_pixel_ratio);
 ZEND_FUNCTION(vio_mesh);
 ZEND_FUNCTION(vio_draw);
@@ -832,6 +841,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_content_scale, arginfo_vio_content_scale)
 	ZEND_FE(vio_monitor_info, arginfo_vio_monitor_info)
 	ZEND_FE(vio_monitors, arginfo_vio_monitors)
+	ZEND_FE(vio_video_modes, arginfo_vio_video_modes)
 	ZEND_FE(vio_pixel_ratio, arginfo_vio_pixel_ratio)
 	ZEND_FE(vio_mesh, arginfo_vio_mesh)
 	ZEND_FE(vio_draw, arginfo_vio_draw)

@@ -1286,11 +1286,17 @@ ZEND_FUNCTION(vio_set_fullscreen)
 {
     zval *ctx_zval;
     zend_long monitor_index = -1; /* -1 = primary monitor (default) */
+    zend_long req_w = 0;          /* 0 = use the monitor's native mode */
+    zend_long req_h = 0;
+    zend_long req_refresh = 0;    /* 0 = let the video mode decide */
 
-    ZEND_PARSE_PARAMETERS_START(1, 2)
+    ZEND_PARSE_PARAMETERS_START(1, 5)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_OPTIONAL
         Z_PARAM_LONG(monitor_index)
+        Z_PARAM_LONG(req_w)
+        Z_PARAM_LONG(req_h)
+        Z_PARAM_LONG(req_refresh)
     ZEND_PARSE_PARAMETERS_END();
 
 #ifdef HAVE_GLFW
@@ -1319,9 +1325,27 @@ ZEND_FUNCTION(vio_set_fullscreen)
         monitor = glfwGetPrimaryMonitor();
     }
     const GLFWvidmode *mode = glfwGetVideoMode(monitor);
-    if (mode) {
+
+    /* A caller-supplied resolution (req_w/req_h > 0) switches the display to
+     * that exclusive-fullscreen video mode instead of the native one. Callers
+     * are expected to pass a mode enumerated by vio_video_modes(); GLFW picks
+     * the closest supported mode if it does not match exactly. Otherwise we
+     * keep the native mode. Refresh falls back to the chosen mode's rate, then
+     * to GLFW_DONT_CARE. */
+    int out_w = (mode ? mode->width : 0);
+    int out_h = (mode ? mode->height : 0);
+    int out_refresh = (mode ? mode->refreshRate : GLFW_DONT_CARE);
+    if (req_w > 0 && req_h > 0) {
+        out_w = (int)req_w;
+        out_h = (int)req_h;
+        out_refresh = (req_refresh > 0) ? (int)req_refresh : GLFW_DONT_CARE;
+    } else if (req_refresh > 0) {
+        out_refresh = (int)req_refresh;
+    }
+
+    if (out_w > 0 && out_h > 0) {
         glfwSetWindowMonitor(ctx->window, monitor,
-            0, 0, mode->width, mode->height, mode->refreshRate);
+            0, 0, out_w, out_h, out_refresh);
     }
 #endif
 }
@@ -1579,6 +1603,61 @@ ZEND_FUNCTION(vio_monitors)
         add_assoc_long(&entry, "work_height", wh);
         add_assoc_double(&entry, "scale_x", (double)sx);
         add_assoc_double(&entry, "scale_y", (double)sy);
+        add_next_index_zval(return_value, &entry);
+    }
+#endif
+}
+
+ZEND_FUNCTION(vio_video_modes)
+{
+    zval *ctx_zval;
+    zend_long monitor_index = -1; /* -1 = primary monitor (default) */
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(monitor_index)
+    ZEND_PARSE_PARAMETERS_END();
+
+    (void)ctx_zval;
+
+    array_init(return_value);
+#ifdef HAVE_GLFW
+    /* Resolve the monitor the same way vio_set_fullscreen does. */
+    GLFWmonitor *monitor = NULL;
+    if (monitor_index >= 0) {
+        int mcount = 0;
+        GLFWmonitor **mons = glfwGetMonitors(&mcount);
+        if (mons && monitor_index < mcount) {
+            monitor = mons[monitor_index];
+        }
+    }
+    if (!monitor) {
+        monitor = glfwGetPrimaryMonitor();
+    }
+    if (!monitor) return;
+
+    int count = 0;
+    const GLFWvidmode *modes = glfwGetVideoModes(monitor, &count);
+    if (!modes) return;
+
+    /* GLFW returns modes sorted ascending and may list the same (width,height,
+     * refresh) several times for different bit depths. Collapse duplicates so
+     * the picker shows each resolution/refresh combination once. */
+    for (int i = 0; i < count; i++) {
+        const GLFWvidmode *m = &modes[i];
+        if (i > 0) {
+            const GLFWvidmode *p = &modes[i - 1];
+            if (p->width == m->width && p->height == m->height
+                && p->refreshRate == m->refreshRate) {
+                continue;
+            }
+        }
+        zval entry;
+        array_init(&entry);
+        add_assoc_long(&entry, "width", m->width);
+        add_assoc_long(&entry, "height", m->height);
+        add_assoc_long(&entry, "refresh_rate", m->refreshRate);
         add_next_index_zval(return_value, &entry);
     }
 #endif
