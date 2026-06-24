@@ -1,3 +1,10 @@
+# [2.2.0](https://github.com/phpolygon/php-vio/compare/v2.1.1...v2.2.0) (2026-06-24)
+
+
+### Features
+
+* **window:** selectable fullscreen resolution ([b257d33](https://github.com/phpolygon/php-vio/commit/b257d33feb8312612d5e07ae5d11a83aa0c37eec))
+
 ## [2.1.1](https://github.com/phpolygon/php-vio/compare/v2.1.0...v2.1.1) (2026-06-22)
 
 
