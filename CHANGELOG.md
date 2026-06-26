@@ -1,3 +1,10 @@
+# [2.3.0](https://github.com/phpolygon/php-vio/compare/v2.2.0...v2.3.0) (2026-06-26)
+
+
+### Features
+
+* **font:** devicePixelRatio scale for crisp HiDPI text ([f557eab](https://github.com/phpolygon/php-vio/commit/f557eabf99cbc08a6e9a87b5efbf5c7de05a81a0))
+
 # [2.2.0](https://github.com/phpolygon/php-vio/compare/v2.1.1...v2.2.0) (2026-06-24)
 
 
