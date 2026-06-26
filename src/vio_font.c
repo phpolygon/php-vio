@@ -22,6 +22,7 @@ static zend_object *vio_font_create_object(zend_class_entry *ce)
     font->atlas_texture         = 0;
     font->atlas_backend_texture = NULL;
     font->font_size             = 16.0f;
+    font->render_scale          = 1.0f;
     font->atlas_w               = VIO_FONT_ATLAS_SIZE;
     font->atlas_h               = VIO_FONT_ATLAS_SIZE;
     font->ttf_data              = NULL;

@@ -58,7 +58,8 @@ typedef struct _vio_font_object {
     HashTable          glyph_map;     /* codepoint (zend_long) -> vio_stbtt_packedchar */
     unsigned int       atlas_texture;          /* GL texture / Metal handle */
     void              *atlas_backend_texture;   /* D3D11/D3D12 backend texture */
-    float              font_size;
+    float              font_size;      /* atlas rasterization size (physical px) */
+    float              render_scale;   /* atlas-px -> logical-px divisor (devicePixelRatio) */
     int                atlas_w, atlas_h;
     unsigned char     *ttf_data;      /* raw TTF file data */
     size_t             ttf_len;       /* TTF data length */

@@ -337,9 +337,15 @@ function vio_sprite(VioContext $context, VioTexture $texture, ?array $options = 
 /**
  * Load a TTF font for text rendering.
  *
+ * The glyph atlas is rasterized at $size * $scale physical pixels, while every
+ * glyph metric (vio_text positions, vio_text_measure results) is reported in
+ * logical $size units. Pass $scale = devicePixelRatio (e.g. framebuffer/logical
+ * magnification) so text stays crisp when a transform magnifies it. $scale < 1
+ * is clamped to 1.0.
+ *
  * @return VioFont|false Font object or false on failure
  */
-function vio_font(VioContext $context, string $path, float $size = 24.0): VioFont|false {}
+function vio_font(VioContext $context, string $path, float $size = 24.0, float $scale = 1.0): VioFont|false {}
 
 /**
  * Draw text using a loaded font.
@@ -782,11 +788,13 @@ function vio_texture_load_poll(mixed $handle): array|null|false {}
  * render thread. The GPU upload is deferred to vio_font_load_poll(), which must
  * be called on the render thread.
  *
- * @param string $path Path to the TTF/OTF file
- * @param float  $size Pixel size to rasterize the atlas at
+ * @param string $path  Path to the TTF/OTF file
+ * @param float  $size  Logical pixel size the atlas represents
+ * @param float  $scale devicePixelRatio - atlas rasterized at $size * $scale,
+ *                      metrics reported in logical $size units (clamped to >= 1)
  * @return resource|false Async load handle or false on failure
  */
-function vio_font_load_async(VioContext $context, string $path, float $size = 24.0): mixed {}
+function vio_font_load_async(VioContext $context, string $path, float $size = 24.0, float $scale = 1.0): mixed {}
 
 /**
  * Poll an async font load for completion.

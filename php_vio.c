@@ -4131,12 +4131,14 @@ ZEND_FUNCTION(vio_font)
     char *path;
     size_t path_len;
     double size = 24.0;
+    double scale = 1.0;
 
-    ZEND_PARSE_PARAMETERS_START(2, 3)
+    ZEND_PARSE_PARAMETERS_START(2, 4)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_STRING(path, path_len)
         Z_PARAM_OPTIONAL
         Z_PARAM_DOUBLE(size)
+        Z_PARAM_DOUBLE(scale)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
@@ -4144,6 +4146,12 @@ ZEND_FUNCTION(vio_font)
         php_error_docref(NULL, E_WARNING, "Context is not initialized");
         RETURN_FALSE;
     }
+
+    /* devicePixelRatio: the atlas is rasterized at size*scale physical pixels
+     * but every glyph metric is reported back divided by render_scale, so the
+     * caller still positions text in logical (size) units while the texture
+     * carries enough detail to stay crisp when a transform magnifies it. */
+    if (scale < 1.0) scale = 1.0;
 
     /* Read TTF file */
     php_stream *stream = php_stream_open_wrapper(path, "rb", REPORT_ERRORS, NULL);
@@ -4165,7 +4173,8 @@ ZEND_FUNCTION(vio_font)
     object_init_ex(&font_zval, vio_font_ce);
     vio_font_object *font = Z_VIO_FONT_P(&font_zval);
 
-    font->font_size = (float)size;
+    font->render_scale = (float)scale;
+    font->font_size = (float)(size * scale);
     font->backend   = ctx->backend;
     font->ttf_len = ZSTR_LEN(contents);
     font->ttf_data = emalloc(font->ttf_len);
@@ -4275,6 +4284,10 @@ ZEND_FUNCTION(vio_text)
     float fx = (float)x, fy = (float)y;
     float inv_w = 1.0f / (float)font->atlas_w;
     float inv_h = 1.0f / (float)font->atlas_h;
+    /* devicePixelRatio: glyph metrics live in atlas (physical) pixels; divide
+     * them by render_scale so the quad occupies its logical size while sampling
+     * the higher-resolution atlas. inv_rs == 1.0 for the default scale=1 path. */
+    float inv_rs = (font->render_scale > 0.0f) ? (1.0f / font->render_scale) : 1.0f;
 
     /* Generate quads for each character (UTF-8 aware, hashmap lookup) */
     for (size_t i = 0; i < text_len; i++) {
@@ -4283,10 +4296,10 @@ ZEND_FUNCTION(vio_text)
         if (!entry) continue;
         vio_stbtt_packedchar *b = (vio_stbtt_packedchar *)Z_STRVAL_P(entry);
 
-        float px = fx + b->xoff;
-        float py = fy + b->yoff;
-        float pw = (float)(b->x1 - b->x0);
-        float ph = (float)(b->y1 - b->y0);
+        float px = fx + b->xoff * inv_rs;
+        float py = fy + b->yoff * inv_rs;
+        float pw = (float)(b->x1 - b->x0) * inv_rs;
+        float ph = (float)(b->y1 - b->y0) * inv_rs;
 
         float u0 = b->x0 * inv_w;
         float v0 = b->y0 * inv_h;
@@ -4314,7 +4327,7 @@ ZEND_FUNCTION(vio_text)
         int start = vio_2d_push_vertices(&ctx->state_2d, verts, 6);
         if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_TEXT, z, font->atlas_texture, font->atlas_backend_texture, start, 6);
 
-        fx += b->xadvance;
+        fx += b->xadvance * inv_rs;
     }
 }
 
@@ -4539,6 +4552,12 @@ ZEND_FUNCTION(vio_text_measure)
 
     float height = max_y - min_y;
     if (height < 0) height = 0;
+
+    /* devicePixelRatio: glyph advances/extents are in atlas (physical) pixels;
+     * report logical units so layout code is unaffected by the atlas scale. */
+    float inv_rs = (font->render_scale > 0.0f) ? (1.0f / font->render_scale) : 1.0f;
+    width  *= inv_rs;
+    height *= inv_rs;
 
     array_init(return_value);
     add_assoc_double(return_value, "width", (double)width);
@@ -6275,7 +6294,8 @@ static int le_vio_async_font;
 
 typedef struct _vio_async_font_load {
     char                    *path;          /* malloc */
-    float                    font_size;
+    float                    font_size;      /* atlas rasterization size (physical px) */
+    float                    render_scale;   /* atlas-px -> logical-px divisor */
     const vio_backend       *backend;       /* captured at submit; render-thread use only */
     unsigned char           *ttf_data;      /* malloc — raw TTF bytes */
     size_t                   ttf_len;
@@ -6351,12 +6371,14 @@ ZEND_FUNCTION(vio_font_load_async)
     char *path;
     size_t path_len;
     double size = 24.0;
+    double scale = 1.0;
 
-    ZEND_PARSE_PARAMETERS_START(2, 3)
+    ZEND_PARSE_PARAMETERS_START(2, 4)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_STRING(path, path_len)
         Z_PARAM_OPTIONAL
         Z_PARAM_DOUBLE(size)
+        Z_PARAM_DOUBLE(scale)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
@@ -6364,6 +6386,8 @@ ZEND_FUNCTION(vio_font_load_async)
         php_error_docref(NULL, E_WARNING, "Context is not initialized");
         RETURN_FALSE;
     }
+
+    if (scale < 1.0) scale = 1.0;
 
     vio_async_font_load *load = ecalloc(1, sizeof(vio_async_font_load));
     /* path uses libc malloc — it is read on the worker thread */
@@ -6375,7 +6399,8 @@ ZEND_FUNCTION(vio_font_load_async)
     }
     memcpy(load->path, path, path_len);
     load->path[path_len] = '\0';
-    load->font_size = (float)size;
+    load->render_scale = (float)scale;
+    load->font_size = (float)(size * scale);
     load->backend   = ctx->backend;
 
 #ifdef PHP_WIN32
@@ -6457,7 +6482,8 @@ ZEND_FUNCTION(vio_font_load_poll)
     object_init_ex(&font_zval, vio_font_ce);
     vio_font_object *font = Z_VIO_FONT_P(&font_zval);
 
-    font->font_size = load->font_size;
+    font->font_size    = load->font_size;
+    font->render_scale = load->render_scale;
     font->backend   = load->backend;
     font->ttf_len   = load->ttf_len;
     font->ttf_data  = emalloc(load->ttf_len);
