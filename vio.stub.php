@@ -538,6 +538,25 @@ function vio_set_uniform(VioContext $context, string $name, int|float|array $val
 function vio_set_uniforms(VioContext $context, array $uniforms): void {}
 
 /**
+ * Batched draw submission: record an ordered list of draws in a SINGLE PHP->C
+ * crossing. Each element of $draws is an associative array:
+ *
+ *   [
+ *     'mesh'     => VioMesh,                 // required
+ *     'pipeline' => VioPipeline,             // optional; bound only on change
+ *     'textures' => [ slot => VioTexture ],  // optional; GL slot => texture
+ *     'uniforms' => [ 'u_name' => value ],   // optional; per-draw uniform deltas
+ *   ]
+ *
+ * Records are applied strictly in array order, so the bound shader's sticky
+ * cbuffer ends up byte-identical to issuing vio_bind_pipeline / vio_bind_texture
+ * / vio_set_uniforms / vio_draw per draw. Must be called between vio_begin and
+ * vio_end. Collapses the per-draw FFI crossings (and per-call argument parsing)
+ * of a heavy opaque submit into one, which is the main CPU/submit bottleneck.
+ */
+function vio_submit_batch(VioContext $context, array $draws): void {}
+
+/**
  * Get the name of the backend in use.
  */
 function vio_backend_name(VioContext $context): string {}

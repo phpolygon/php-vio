@@ -1354,6 +1354,11 @@ static void d3d12_bind_pipeline(void *pipeline_ptr)
     /* Bind SRV heap */
     ID3D12DescriptorHeap *heaps[] = { vio_d3d12.srv_heap.heap };
     ID3D12GraphicsCommandList_SetDescriptorHeaps(vio_d3d12.cmd_list, 1, heaps);
+
+    /* SetGraphicsRootSignature / SetDescriptorHeaps may invalidate the root
+     * argument bound to param 2 (the SRV table), so force the next flush to
+     * rebuild + re-point rather than reuse the cached block. */
+    vio_d3d12.srv_table_bound = 0;
 }
 
 /* ── Resources: Buffers ───────────────────────────────────────────── */
@@ -2160,6 +2165,10 @@ static void d3d12_begin_frame(void)
     vio_d3d12.srv_frame_base     = vio_d3d12.frame_index * vio_d3d12.srv_frame_capacity;
     vio_d3d12.srv_frame_offset   = vio_d3d12.srv_frame_base;
     memset(vio_d3d12.pending_srv_valid, 0, sizeof(vio_d3d12.pending_srv_valid));
+    /* The per-frame SRV ring just rebased: last frame's cached descriptor block
+     * lives in (possibly) the other in-flight frame's region, so its GPU handle
+     * is stale. Force the first flush of THIS frame to rebuild. */
+    vio_d3d12.srv_table_bound = 0;
 
     /* Set viewport and scissor */
     D3D12_VIEWPORT vp = {0};
@@ -3143,6 +3152,39 @@ void vio_d3d12_flush_srv_table(void)
     }
     if (!any_bound) return; /* no textures — skip descriptor table binding entirely */
 
+    /* VIO_D3D12_NO_SRV_DEDUP=1 forces the per-draw rebuild (A/B diagnostic toggle,
+     * probed once). Both paths are pixel-identical; this isolates the dedup's win. */
+    static int s_dedup_disabled = -1;
+    if (s_dedup_disabled < 0) {
+        const char *e = getenv("VIO_D3D12_NO_SRV_DEDUP");
+        s_dedup_disabled = (e && e[0] == '1') ? 1 : 0;
+    }
+
+    /* DEDUP FAST-PATH: if a block was already built THIS frame for the exact same
+     * set of bound SRVs (and no begin_frame / pipeline bind invalidated it since),
+     * the cached block is still valid for the rest of the frame — the per-frame
+     * SRV ring only advances, so an earlier block is never overwritten, and a
+     * CopyDescriptorsSimple'd view stays valid as long as it views the same
+     * resource (same source CPU handle ptr). Re-point root param 2 at the cached
+     * GPU handle and skip the 16-descriptor rebuild. Content-based, so it is
+     * correct regardless of which caller populated pending_srvs (3D draw paths,
+     * instanced path, or the 2D batch renderer writing pending_srvs directly). */
+    if (!s_dedup_disabled && vio_d3d12.srv_table_bound) {
+        int same = 1;
+        for (int i = 0; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
+            if (vio_d3d12.pending_srv_valid[i] != vio_d3d12.srv_flushed_valid[i] ||
+                vio_d3d12.pending_srvs[i].ptr != vio_d3d12.srv_flushed[i].ptr) {
+                same = 0;
+                break;
+            }
+        }
+        if (same) {
+            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(
+                vio_d3d12.cmd_list, 2, vio_d3d12.srv_table_gpu);
+            return;
+        }
+    }
+
     /* Allocate VIO_D3D12_SRV_TABLE_SIZE contiguous descriptors from THIS frame's
      * region of the SRV heap. Bound the check by the region end (not the full
      * heap) so we can't bleed into another frame's slice. */
@@ -3183,6 +3225,14 @@ void vio_d3d12_flush_srv_table(void)
     }
 
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, 2, dst_gpu);
+
+    /* Cache this block + the texture set it was built from for the dedup
+     * fast-path above (valid until begin_frame rebases the ring or a pipeline
+     * bind resets root param 2). */
+    vio_d3d12.srv_table_gpu = dst_gpu;
+    memcpy(vio_d3d12.srv_flushed, vio_d3d12.pending_srvs, sizeof(vio_d3d12.srv_flushed));
+    memcpy(vio_d3d12.srv_flushed_valid, vio_d3d12.pending_srv_valid, sizeof(vio_d3d12.srv_flushed_valid));
+    vio_d3d12.srv_table_bound = 1;
 }
 
 static void d3d12_set_viewport(int x, int y, int width, int height)

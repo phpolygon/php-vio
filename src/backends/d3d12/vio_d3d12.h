@@ -215,6 +215,25 @@ typedef struct _vio_d3d12_state {
     UINT                       srv_frame_base;          /* base of THIS frame's region (recomputed each begin_frame) */
     UINT                       srv_frame_capacity;      /* descriptors per frame slot (recomputed each begin_frame) */
 
+    /* SRV-table flush dedup (Lever #1 amplifier).
+     *
+     * flush_srv_table builds a fresh 16-descriptor block + SetGraphicsRootDescriptorTable
+     * before EVERY draw. When the bound texture set is unchanged between draws (the common
+     * case in a material-sorted opaque batch) the previously-built block is still valid for
+     * the rest of THIS frame, so we re-point root param 2 at the cached GPU handle and skip
+     * the 16 CreateShaderResourceView (null) + up-to-16 CopyDescriptorsSimple rebuild.
+     *
+     * The dedup is CONTENT-based (compares pending_srvs against the last-flushed snapshot)
+     * so it is correct for every caller, including the 2D batch renderer which writes
+     * pending_srvs directly (bypassing d3d12_bind_texture). srv_table_bound is forced to 0
+     * at begin_frame (the per-frame ring rebases, so last frame's GPU handle is stale) and on
+     * d3d12_bind_pipeline (SetGraphicsRootSignature/SetDescriptorHeaps may reset root param 2).
+     */
+    D3D12_CPU_DESCRIPTOR_HANDLE srv_flushed[VIO_D3D12_SRV_TABLE_SIZE];   /* texture set baked into the cached block */
+    int                         srv_flushed_valid[VIO_D3D12_SRV_TABLE_SIZE];
+    D3D12_GPU_DESCRIPTOR_HANDLE srv_table_gpu;          /* GPU handle of the cached block (valid this frame) */
+    int                         srv_table_bound;         /* 1 => srv_table_gpu holds a valid block bound this frame */
+
     /* Per-frame linear cbuffer allocator (avoids overwriting between draw calls).
      * The heap is split into VIO_D3D12_FRAME_COUNT equal slices (like the SRV
      * frame regions): frame N allocates ONLY inside its own slice, so the CPU

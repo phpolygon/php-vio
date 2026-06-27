@@ -1899,24 +1899,14 @@ ZEND_FUNCTION(vio_mesh)
     RETURN_COPY_VALUE(&mesh_zval);
 }
 
-ZEND_FUNCTION(vio_draw)
+/* Shared draw core: record ONE mesh draw onto the open frame command list.
+ * Extracted from vio_draw so the single-draw entry point AND vio_submit_batch
+ * issue byte-identical GPU commands (the same per-draw cbuffer slice + root-CBV
+ * bind + draw_indexed path, on every backend). The bound pipeline's shader is
+ * read from ctx->bound_shader_object, so the caller MUST have bound a pipeline.
+ * Caller guarantees ctx is initialized + in_frame and mesh is non-NULL. */
+static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
 {
-    zval *ctx_zval;
-    zval *mesh_zval;
-
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
-        Z_PARAM_OBJECT_OF_CLASS(mesh_zval, vio_mesh_ce)
-    ZEND_PARSE_PARAMETERS_END();
-
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    vio_mesh_object *mesh = Z_VIO_MESH_P(mesh_zval);
-
-    if (!ctx->initialized || !ctx->in_frame) {
-        php_error_docref(NULL, E_WARNING, "Must call vio_draw between vio_begin and vio_end");
-        return;
-    }
-
     if (ctx->backend->draw_mesh) {
         ctx->backend->draw_mesh(mesh);
     }
@@ -2010,6 +2000,27 @@ ZEND_FUNCTION(vio_draw)
             ctx->backend->draw(&cmd);
         }
     }
+}
+
+ZEND_FUNCTION(vio_draw)
+{
+    zval *ctx_zval;
+    zval *mesh_zval;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(mesh_zval, vio_mesh_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_mesh_object *mesh = Z_VIO_MESH_P(mesh_zval);
+
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_draw between vio_begin and vio_end");
+        return;
+    }
+
+    vio_submit_one(ctx, mesh);
 }
 
 /* ── Phase 4: Shader / Pipeline / Texture / Buffer functions ──────── */
@@ -2925,32 +2936,13 @@ ZEND_FUNCTION(vio_texture_3d)
     RETURN_COPY_VALUE(&tex_zval);
 }
 
-ZEND_FUNCTION(vio_bind_texture)
+/* Shared core: bind ONE texture to a GL slot (remapped to the cross-compiler's
+ * HLSL t-register for the typed-register backends). Extracted from
+ * vio_bind_texture so vio_submit_batch binds textures through the EXACT same
+ * sampler remap + depth-sampler path. Caller guarantees ctx is initialized +
+ * in_frame and tex is valid. */
+static void vio_bind_texture_internal(vio_context_object *ctx, vio_texture_object *tex, zend_long slot)
 {
-    zval *ctx_zval;
-    zval *tex_zval;
-    zend_long slot = 0;
-
-    ZEND_PARSE_PARAMETERS_START(2, 3)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
-        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_LONG(slot)
-    ZEND_PARSE_PARAMETERS_END();
-
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-
-    if (!ctx->initialized || !ctx->in_frame) {
-        php_error_docref(NULL, E_WARNING, "Must call vio_bind_texture between vio_begin and vio_end");
-        return;
-    }
-
-    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
-    if (!tex->valid) {
-        php_error_docref(NULL, E_WARNING, "Texture is not valid");
-        return;
-    }
-
     if (tex->is_3d && tex->texture_id && ctx->backend->bind_texture_3d_id) {
         /* OpenGL volume texture (Fieldtracing SDF): bind via the GL_TEXTURE_3D
          * target. D3D11/D3D12/Vulkan volumes have texture_id == 0 and fall
@@ -3010,6 +3002,35 @@ ZEND_FUNCTION(vio_bind_texture)
         }
 #endif
     }
+}
+
+ZEND_FUNCTION(vio_bind_texture)
+{
+    zval *ctx_zval;
+    zval *tex_zval;
+    zend_long slot = 0;
+
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(slot)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_bind_texture between vio_begin and vio_end");
+        return;
+    }
+
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (!tex->valid) {
+        php_error_docref(NULL, E_WARNING, "Texture is not valid");
+        return;
+    }
+
+    vio_bind_texture_internal(ctx, tex, slot);
 }
 
 ZEND_FUNCTION(vio_uniform_buffer)
@@ -3667,6 +3688,133 @@ ZEND_FUNCTION(vio_set_uniforms)
         if (key != NULL) {
             vio_apply_uniform(ctx, ZSTR_VAL(key), val);
         }
+    } ZEND_HASH_FOREACH_END();
+}
+
+/* Batched draw submission: ONE PHP->C crossing for an ordered list of draws.
+ * Each element of $draws is an associative array describing one draw:
+ *
+ *   [
+ *     'mesh'     => VioMesh,                 // required
+ *     'pipeline' => VioPipeline,             // optional; bound only when it
+ *                                            //   differs from the previously
+ *                                            //   bound pipeline (state-change min)
+ *     'textures' => [ slot => VioTexture ],  // optional; GL slot => texture
+ *     'uniforms' => [ 'u_name' => value ],   // optional; per-draw + on-change
+ *                                            //   material uniform deltas
+ *   ]
+ *
+ * Records are processed STRICTLY in array order, so the bound shader's sticky
+ * cbuffer (frame globals + material + per-draw uniforms accumulate into
+ * sh->cbuffer_data, and each draw snapshots the current contents into its own
+ * 256-byte slice) ends up byte-identical to issuing vio_bind_pipeline /
+ * vio_bind_texture / vio_set_uniforms / vio_draw individually per draw. This
+ * collapses the 2N..3N FFI crossings of the per-draw path down to ONE and drops
+ * the per-call zend_parse_parameters plus the per-draw uniform-array rebuild,
+ * which is the dominant CPU cost on a heavy submit (hundreds of opaque meshes).
+ *
+ * LEVER #2 (future multithreaded recording): the per-record body below is a
+ * flat, index-addressable sequence whose only cross-record state is the in-order
+ * pipeline/texture/cbuffer accumulation. A threaded version would resolve each
+ * record's effective pipeline + texture + uniform state, partition the record
+ * index range across worker threads each recording into its OWN command list
+ * (own command allocator), then ExecuteCommandLists them in order. The only
+ * shared mutable D3D12 state is the per-frame linear cbuffer allocator
+ * (vio_d3d12.cbuffer_*) and the pending-SRV table — both would be sub-divided
+ * into per-thread sub-ranges (split THIS frame's cbuffer slice into T equal
+ * sub-slices). The thread-split point is the per-record loop body marked below. */
+ZEND_FUNCTION(vio_submit_batch)
+{
+    zval *ctx_zval;
+    HashTable *draws;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(draws)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_submit_batch between vio_begin and vio_end");
+        return;
+    }
+
+    /* Last backend pipeline bound BY this batch, so a sorted batch re-binds the
+     * PSO only on a real change. NULL = none bound here yet (the caller may have
+     * bound one before the batch — the opaque pass binds once, then its records
+     * omit 'pipeline' entirely). */
+    void *last_pipeline = NULL;
+
+    zval *rec;
+    ZEND_HASH_FOREACH_VAL(draws, rec) {
+        if (Z_TYPE_P(rec) != IS_ARRAY) {
+            continue;
+        }
+        HashTable *r = Z_ARRVAL_P(rec);
+
+        /* ---- per-record loop body (Lever #2 thread-split point) ------------ */
+
+        /* (1) Pipeline — bind only on change. Mirrors vio_bind_pipeline: update
+         *     the context's bound-shader tracking AND dispatch the backend bind. */
+        zval *pz = zend_hash_str_find(r, "pipeline", sizeof("pipeline") - 1);
+        if (pz && Z_TYPE_P(pz) == IS_OBJECT &&
+            instanceof_function(Z_OBJCE_P(pz), vio_pipeline_ce)) {
+            vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pz);
+            if (pipe->valid && pipe->backend_pipeline != last_pipeline) {
+                ctx->bound_shader_program = pipe->shader_program;
+                ctx->bound_shader_object = pipe->shader_ref;
+                if (ctx->backend->bind_pipeline_state) {
+                    ctx->backend->bind_pipeline_state(pipe);
+                } else if (pipe->backend_pipeline && ctx->backend->bind_pipeline) {
+                    ctx->backend->bind_pipeline(pipe->backend_pipeline);
+                }
+                last_pipeline = pipe->backend_pipeline;
+            }
+        }
+
+        /* (2) Textures — [ GL-slot => VioTexture ]. Sticky on the backend side
+         *     (pending SRVs persist until overwritten), so the caller includes
+         *     only the textures this draw changes. Same remap as vio_bind_texture
+         *     via the shared core. */
+        zval *tz = zend_hash_str_find(r, "textures", sizeof("textures") - 1);
+        if (tz && Z_TYPE_P(tz) == IS_ARRAY) {
+            zend_ulong slot;
+            zval *texv;
+            ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(tz), slot, texv) {
+                if (Z_TYPE_P(texv) == IS_OBJECT &&
+                    instanceof_function(Z_OBJCE_P(texv), vio_texture_ce)) {
+                    vio_texture_object *tex = Z_VIO_TEXTURE_P(texv);
+                    if (tex->valid) {
+                        vio_bind_texture_internal(ctx, tex, (zend_long)slot);
+                    }
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
+
+        /* (3) Uniforms — per-draw + on-change material deltas. Applied through
+         *     the SAME core as vio_set_uniforms, so the cbuffer bytes are
+         *     identical; only the changed offsets are touched (sticky cbuffer). */
+        zval *uz = zend_hash_str_find(r, "uniforms", sizeof("uniforms") - 1);
+        if (uz && Z_TYPE_P(uz) == IS_ARRAY) {
+            zend_string *ukey;
+            zval *uval;
+            ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(uz), ukey, uval) {
+                if (ukey != NULL) {
+                    vio_apply_uniform(ctx, ZSTR_VAL(ukey), uval);
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
+
+        /* (4) Draw — required 'mesh'. Records the per-draw cbuffer slice +
+         *     root-CBV bind + draw_indexed via the shared draw core. */
+        zval *mz = zend_hash_str_find(r, "mesh", sizeof("mesh") - 1);
+        if (mz && Z_TYPE_P(mz) == IS_OBJECT &&
+            instanceof_function(Z_OBJCE_P(mz), vio_mesh_ce)) {
+            vio_mesh_object *mesh = Z_VIO_MESH_P(mz);
+            vio_submit_one(ctx, mesh);
+        }
+        /* -------------------------------------------------------------------- */
     } ZEND_HASH_FOREACH_END();
 }
 
