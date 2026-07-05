@@ -34,11 +34,19 @@ PHP_ARG_WITH([ffmpeg],
   [yes],
   [no])
 
+dnl HarfBuzz is OPT-IN (default no), unlike the other libs which auto-detect.
+dnl A default of "yes" would opportunistically define HAVE_HARFBUZZ whenever the
+dnl headers merely happen to be present (e.g. a Homebrew harfbuzz on a macOS
+dnl runner), compiling the shaping code that references hb_* — but a consumer
+dnl that does not pass --with-harfbuzz (e.g. static-php-cli's micro link) never
+dnl adds -lharfbuzz, so those symbols end up undefined at link time. Requiring an
+dnl explicit --with-harfbuzz keeps shaping strictly opt-in; php-vio's own CI and
+dnl the documented build commands pass it, so release binaries still ship it.
 PHP_ARG_WITH([harfbuzz],
   [for HarfBuzz (text shaping) support],
   [AS_HELP_STRING([--with-harfbuzz@<:@=DIR@:>@],
-    [Path to HarfBuzz installation - enables complex-script shaping (Arabic, Thai, ...) and BiDi])],
-  [yes],
+    [Path to HarfBuzz installation - enables complex-script shaping (Arabic, Thai, ...) and BiDi. Opt-in: off unless requested.])],
+  [no],
   [no])
 
 PHP_ARG_WITH([metal],
