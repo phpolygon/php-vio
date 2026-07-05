@@ -350,7 +350,10 @@ function vio_font(VioContext $context, string $path, float $size = 24.0, float $
 /**
  * Draw text using a loaded font.
  *
- * @param array|null $options ['color' => int, 'z' => float]
+ * With HarfBuzz shaping enabled (VIO_HAS_SHAPING === 1), '\n' always starts a
+ * new line and 'max_width' turns on word wrapping.
+ *
+ * @param array|null $options ['color' => int, 'z' => float, 'max_width' => float, 'line_height' => float]
  */
 function vio_text(VioContext $context, VioFont $font, string $text, float $x, float $y, ?array $options = null): void {}
 
@@ -364,9 +367,13 @@ function vio_rounded_rect(VioContext $context, float $x, float $y, float $width,
 /**
  * Measure the dimensions of a text string without rendering it.
  *
- * @return array{width: float, height: float}|false
+ * Pass the same wrapping options as vio_text() ('max_width', 'line_height') to
+ * measure wrapped/multi-line text. 'lines' is only meaningful with shaping.
+ *
+ * @param array|null $options ['max_width' => float, 'line_height' => float]
+ * @return array{width: float, height: float, lines: int}|false
  */
-function vio_text_measure(VioFont $font, string $text): array|false {}
+function vio_text_measure(VioFont $font, string $text, ?array $options = null): array|false {}
 
 /**
  * Push a 2D affine transform matrix onto the stack.

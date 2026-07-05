@@ -11,13 +11,13 @@ Eine PHP C-Extension die GPU-Rendering (OpenGL 4.1, Vulkan, Metal), Audio, Video
 ```bash
 # PHP 8.5 (Homebrew)
 make clean; phpize --clean; phpize && \
-./configure --enable-vio --with-glfw --with-glslang --with-spirv-cross --with-vulkan --with-ffmpeg --with-metal && \
+./configure --enable-vio --with-glfw --with-glslang --with-spirv-cross --with-vulkan --with-ffmpeg --with-metal --with-harfbuzz && \
 make -j$(sysctl -n hw.ncpu)
 
 # PHP 8.4 (Laravel Herd)
 make clean; /usr/local/Cellar/php@8.4/8.4.19/bin/phpize --clean
 /usr/local/Cellar/php@8.4/8.4.19/bin/phpize && \
-./configure --enable-vio --with-glfw --with-glslang --with-spirv-cross --with-vulkan --with-ffmpeg --with-metal \
+./configure --enable-vio --with-glfw --with-glslang --with-spirv-cross --with-vulkan --with-ffmpeg --with-metal --with-harfbuzz \
   --with-php-config=/usr/local/Cellar/php@8.4/8.4.19/bin/php-config && \
 make -j$(sysctl -n hw.ncpu)
 ```
@@ -28,11 +28,11 @@ make -j$(sysctl -n hw.ncpu)
 # Dependencies (Ubuntu/Debian)
 sudo apt install php-dev libglfw3-dev glslang-dev libvulkan-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-  spirv-cross libspirv-cross-c-shared-dev
+  spirv-cross libspirv-cross-c-shared-dev libharfbuzz-dev
 
 # Build (kein --with-metal auf Linux)
 phpize && \
-./configure --enable-vio --with-glfw --with-glslang --with-spirv-cross --with-vulkan --with-ffmpeg && \
+./configure --enable-vio --with-glfw --with-glslang --with-spirv-cross --with-vulkan --with-ffmpeg --with-harfbuzz && \
 make -j$(nproc)
 sudo make install
 ```
@@ -53,7 +53,8 @@ configure --enable-vio --with-glfw=C:\deps\glfw ^
   --with-vulkan=C:\VulkanSDK\1.3.xxx ^
   --with-glslang=C:\deps\glslang ^
   --with-spirv-cross=C:\deps\spirv-cross ^
-  --with-ffmpeg=C:\deps\ffmpeg
+  --with-ffmpeg=C:\deps\ffmpeg ^
+  --with-harfbuzz=C:\vcpkg\installed\x64-windows
 
 nmake
 ```
@@ -129,6 +130,7 @@ src/
   vio_buffer.c              # Buffer-Objekt
   vio_2d.c                  # 2D-Batch-Renderer (z-sortiert, dynamisch wachsend)
   vio_font.c                # Font-Atlas (stb_truetype, 4096x4096, Multi-Range Unicode via PackFontRanges, Glyph-Hashmap)
+  vio_text_shape.c          # Text-Shaping (HarfBuzz + SheenBidi): glyph-index-Atlas, BiDi, RTL/Joining. Gated: HAVE_HARFBUZZ
   vio_shader_compiler.c     # GLSL→SPIR-V (glslang)
   vio_shader_reflect.c      # SPIR-V Reflection (SPIRV-Cross)
   vio_audio.c               # Audio-Engine (miniaudio)
@@ -147,9 +149,10 @@ src/
 
 vendor/
   glad/                     # OpenGL Loader
-  stb/                      # stb_image, stb_truetype, stb_image_write
+  stb/                      # stb_image, stb_truetype, stb_image_write, stb_rect_pack
   vma/                      # Vulkan Memory Allocator
   miniaudio/                # Audio-Engine
+  sheenbidi/                # SheenBidi (Unicode BiDi, Apache-2.0), UNITY-Build
 ```
 
 ### Dependencies (Homebrew)
@@ -162,8 +165,11 @@ vendor/
 | Vulkan Loader | Vulkan API | --with-vulkan |
 | FFmpeg | Video-Recording + Streaming | --with-ffmpeg |
 | Metal/QuartzCore | macOS GPU (Framework) | --with-metal |
+| HarfBuzz | Text-Shaping (Arabisch, Thai, Ligaturen) | --with-harfbuzz |
 
-Vendored (kein Homebrew): GLAD, stb_image/truetype/write, VMA, miniaudio.
+Vendored (kein Homebrew): GLAD, stb_image/truetype/write/rect_pack, VMA,
+miniaudio, **SheenBidi** (BiDi, Apache-2.0, `vendor/sheenbidi/`, UNITY-Build via
+`-DSB_CONFIG_UNITY`).
 
 ## PHP API (71 Funktionen)
 
@@ -278,6 +284,39 @@ The font system uses stbtt_PackFontRanges with 9 Unicode blocks:
 
 Atlas size is 4096x4096. Glyphs are stored in a PHP HashTable (codepoint -> packedchar) for O(1) lookup. Fonts that don't contain glyphs for a range skip them automatically (no atlas space wasted). Space characters (zero visual size but non-zero xadvance) are correctly preserved.
 
+## Text Shaping (HarfBuzz + SheenBidi)
+
+When built `--with-harfbuzz` (constant `VIO_HAS_SHAPING == 1`), **all** text goes
+through a full shaping pipeline instead of the legacy codepoint-per-glyph path —
+this is what makes Arabic (RTL + joining), Thai (clustering), and ligatures
+render correctly. Implementation: `src/vio_text_shape.c`.
+
+- **Atlas**: switches from codepoint-keyed to **glyph-index-keyed**. Every glyph
+  the font has (0..numGlyphs) is packed once at `vio_font()` creation via
+  `stb_rect_pack` + `stbtt_MakeGlyphBitmap`, then uploaded once — so the GPU
+  atlas handle is **stable for the font's life** (no runtime re-upload, no
+  destroy race on deferred backends). Glyph-index keying is required because
+  HarfBuzz emits glyphs (ligatures, positional forms) that no codepoint reaches.
+- **Pipeline** per string: SheenBidi resolves BiDi levels and returns runs in
+  *visual* order (`SBLine`) → each run is shaped by HarfBuzz with the
+  bidi-resolved direction (script/language guessed from content) → shaped glyphs
+  are emitted as `VIO_2D_TEXT` quads. Baseline convention matches the legacy path
+  (`y` is the baseline), so Latin stays pixel-stable.
+- Without HarfBuzz the whole subsystem compiles to nothing and text uses the
+  legacy path unchanged — `VIO_HAS_SHAPING == 0`.
+- **Line wrapping**: `vio_text` honors `'\n'` (hard break) always, and
+  `['max_width' => px]` enables greedy word wrap; `'line_height' => px` overrides
+  the natural leading. `vio_text_measure($font, $text, $opts)` takes the same
+  options and returns `['width','height','lines']` (widest line / total height /
+  line count). Break opportunities use a compact **UAX #14-lite** classifier
+  (`lb_class`/`lb_break_between` in vio_text_shape.c): whitespace for Latin,
+  between ideographs for **CJK** (with basic kinsoku — no break after opening /
+  before closing punctuation), and at **Thai** cluster boundaries (consonant/
+  leading-vowel starts a cluster; combining vowels/tones stay attached). Thai is
+  dictionary-free, so it breaks at clusters, not true word boundaries; a segment
+  wider than `max_width` still overflows (no mid-cluster/mid-word split).
+  Vertical text is out of scope.
+
 ## PIE Installation
 
 Release zips contain `vio.so` (Linux/macOS) or `php_vio.dll` (Windows) as the filename inside the archive, matching what PIE expects.
@@ -348,3 +387,12 @@ Extension ist in Laravel Herd (PHP 8.4) geladen:
 - Vulkan auf macOS braucht `VK_DRIVER_FILES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json` + `DYLD_LIBRARY_PATH=/usr/local/lib` (SIP blockiert letzteres in Subprozessen). Auto-Auswahl vermeidet Vulkan auf macOS zugunsten von Metal.
 - VideoToolbox-Encoder kann in headless fehlschlagen → Fallback auf libx264
 - `php_vio.c` ist monolithisch (~3200 Zeilen) — alle PHP-Funktionen in einer Datei
+- Text-Shaping braucht HarfBuzz (`--with-harfbuzz`); ohne es rendern Arabisch/
+  Thai/Ligaturen nicht (`VIO_HAS_SHAPING == 0`, Legacy-Codepoint-Pfad). Der
+  vcpkg-HarfBuzz (`harfbuzz[core,freetype]`) ist dynamisch — `harfbuzz.dll` +
+  Abhängigkeiten (`freetype.dll`, `brotli*`, `bz2`, `libpng`, `zlib`) müssen zur
+  Laufzeit neben `php.exe` liegen. Für ein self-contained `vio.dll` wäre
+  `harfbuzz[core]:x64-windows-static-md` (ohne FreeType, statisch, /MD) die
+  sauberere Deployment-Variante.
+- Shaping v1: nur einzeilig (kein Umbruch), horizontal. Zeilenumbruch + Vertikal
+  (CJK vertical) sind Folgearbeit.

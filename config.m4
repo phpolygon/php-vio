@@ -34,6 +34,13 @@ PHP_ARG_WITH([ffmpeg],
   [yes],
   [no])
 
+PHP_ARG_WITH([harfbuzz],
+  [for HarfBuzz (text shaping) support],
+  [AS_HELP_STRING([--with-harfbuzz@<:@=DIR@:>@],
+    [Path to HarfBuzz installation - enables complex-script shaping (Arabic, Thai, ...) and BiDi])],
+  [yes],
+  [no])
+
 PHP_ARG_WITH([metal],
   [for Metal (macOS GPU backend) support],
   [AS_HELP_STRING([--with-metal],
@@ -237,6 +244,49 @@ if test "$PHP_VIO" != "no"; then
     fi
   fi
 
+  dnl ── HarfBuzz detection ───────────────────────────────────────────
+  dnl Enables the shaping path (src/vio_text_shape.c). Without it the text
+  dnl pipeline falls back to the legacy codepoint-per-glyph path (#else in
+  dnl vio_text), so a build without HarfBuzz compiles and runs unchanged —
+  dnl the new complex scripts (Arabic, Thai, ...) are simply unavailable.
+  dnl SheenBidi (BiDi) is vendored and always compiled; it is only *used*
+  dnl inside the HAVE_HARFBUZZ path.
+  if test "$PHP_HARFBUZZ" != "no"; then
+    if test "$PHP_HARFBUZZ" = "yes"; then
+      dnl Try pkg-config first
+      PKG_CHECK_MODULES([HARFBUZZ], [harfbuzz], [
+        PHP_EVAL_INCLINE($HARFBUZZ_CFLAGS)
+        PHP_EVAL_LIBLINE($HARFBUZZ_LIBS, VIO_SHARED_LIBADD)
+        AC_DEFINE(HAVE_HARFBUZZ, 1, [Whether HarfBuzz is available])
+        AC_MSG_RESULT([HarfBuzz found via pkg-config])
+      ], [
+        dnl Try common paths (header lives under harfbuzz/hb.h)
+        for dir in /usr/local /usr /opt/homebrew; do
+          if test -f "$dir/include/harfbuzz/hb.h"; then
+            PHP_ADD_INCLUDE($dir/include/harfbuzz)
+            PHP_ADD_LIBRARY_WITH_PATH(harfbuzz, $dir/lib, VIO_SHARED_LIBADD)
+            AC_DEFINE(HAVE_HARFBUZZ, 1, [Whether HarfBuzz is available])
+            AC_MSG_RESULT([HarfBuzz found at $dir])
+            break
+          fi
+        done
+      ])
+    else
+      dnl Explicit path given
+      if test -f "$PHP_HARFBUZZ/include/harfbuzz/hb.h"; then
+        PHP_ADD_INCLUDE($PHP_HARFBUZZ/include/harfbuzz)
+        PHP_ADD_LIBRARY_WITH_PATH(harfbuzz, $PHP_HARFBUZZ/lib, VIO_SHARED_LIBADD)
+        AC_DEFINE(HAVE_HARFBUZZ, 1, [Whether HarfBuzz is available])
+      elif test -f "$PHP_HARFBUZZ/include/hb.h"; then
+        PHP_ADD_INCLUDE($PHP_HARFBUZZ/include)
+        PHP_ADD_LIBRARY_WITH_PATH(harfbuzz, $PHP_HARFBUZZ/lib, VIO_SHARED_LIBADD)
+        AC_DEFINE(HAVE_HARFBUZZ, 1, [Whether HarfBuzz is available])
+      else
+        AC_MSG_ERROR([HarfBuzz not found at $PHP_HARFBUZZ])
+      fi
+    fi
+  fi
+
   dnl ── Metal detection ────────────────────────────────────────────────
   dnl Metal is available on both macOS and iOS. The host triplet from
   dnl cross-compilers (e.g. arm64-apple-ios14.0) starts with "ios" rather
@@ -299,7 +349,10 @@ if test "$PHP_VIO" != "no"; then
   dnl Extra cflags shared by all vio sources. Defined as a shell var so the
   dnl special-flag sources below (Metal, VMA) can reuse the same include set
   dnl without drifting out of sync with the main PHP_NEW_EXTENSION call.
-  VIO_EXTRA_CFLAGS="-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DGL_SILENCE_DEPRECATION -I@ext_srcdir@/vendor/glad/include -I@ext_srcdir@/include -I@ext_srcdir@/vendor/vma -I@ext_srcdir@/vendor/miniaudio"
+  dnl SheenBidi is vendored and compiled as a single UNITY translation unit
+  dnl (Source/SheenBidi.c #include's every .c when SB_CONFIG_UNITY is set).
+  dnl Its includes need both Headers/ (<SheenBidi/...>) and Source/ (<API/...>).
+  VIO_EXTRA_CFLAGS="-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DGL_SILENCE_DEPRECATION -DSB_CONFIG_UNITY -I@ext_srcdir@/vendor/glad/include -I@ext_srcdir@/include -I@ext_srcdir@/vendor/vma -I@ext_srcdir@/vendor/miniaudio -I@ext_srcdir@/vendor/sheenbidi/Headers -I@ext_srcdir@/vendor/sheenbidi/Source"
 
   PHP_NEW_EXTENSION(vio,
     php_vio.c \
@@ -319,6 +372,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_2d.c \
     src/vio_2d_vulkan.c \
     src/vio_font.c \
+    src/vio_text_shape.c \
     src/vio_shader_compiler.c \
     src/vio_shader_reflect.c \
     src/vio_audio.c \
@@ -333,8 +387,10 @@ if test "$PHP_VIO" != "no"; then
     vendor/glad/src/glad.c \
     vendor/stb/stb_image_impl.c \
     vendor/stb/stb_truetype_impl.c \
+    vendor/stb/stb_rect_pack_impl.c \
     vendor/stb/stb_image_write_impl.c \
-    vendor/miniaudio/miniaudio_impl.c,
+    vendor/miniaudio/miniaudio_impl.c \
+    vendor/sheenbidi/Source/SheenBidi.c,
     $ext_shared,, $VIO_EXTRA_CFLAGS)
 
   dnl ── Special-flag sources (Issue #2) ─────────────────────────────
@@ -424,6 +480,7 @@ if test "$PHP_VIO" != "no"; then
   PHP_ADD_BUILD_DIR($ext_builddir/vendor/glad/src)
   PHP_ADD_BUILD_DIR($ext_builddir/vendor/stb)
   PHP_ADD_BUILD_DIR($ext_builddir/vendor/miniaudio)
+  PHP_ADD_BUILD_DIR($ext_builddir/vendor/sheenbidi/Source)
 
   dnl ── C++ linker (needed for glslang/spirv-cross/VMA static libs) ─
   PHP_REQUIRE_CXX()

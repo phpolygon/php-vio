@@ -24,6 +24,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_compute_pipeline.h"
 #include "src/vio_2d.h"
 #include "src/vio_font.h"
+#include "src/vio_text_shape.h"
 #include "src/vio_shader_compiler.h"
 #include "src/vio_shader_reflect.h"
 #include "src/vio_audio.h"
@@ -4213,9 +4214,9 @@ ZEND_FUNCTION(vio_sprite)
  * `backend` is passed explicitly (rather than read from a context) so the async
  * path can use the backend captured at submit time. atlas_bitmap is the R8
  * coverage atlas; it is not freed here (caller owns it). */
-static void vio_font_upload_atlas_to_gpu(vio_font_object *font,
-                                         const vio_backend *backend,
-                                         unsigned char *atlas_bitmap)
+void vio_font_upload_atlas_to_gpu(vio_font_object *font,
+                                  const vio_backend *backend,
+                                  unsigned char *atlas_bitmap)
 {
     if (backend && backend->upload_font_atlas) {
         backend->upload_font_atlas(font, font->atlas_w, font->atlas_h, atlas_bitmap, 1);
@@ -4329,22 +4330,33 @@ ZEND_FUNCTION(vio_font)
     memcpy(font->ttf_data, ZSTR_VAL(contents), font->ttf_len);
     zend_string_release(contents);
 
-    /* Multi-range atlas packing (Latin, Cyrillic, Greek, CJK, Hangul, etc.),
-     * dynamically sized to this font's actual glyph set (libc-allocated). */
-    unsigned char *atlas_bitmap = NULL;
-    int atlas_side = 0;
-    vio_font_packed_glyph *glyphs = NULL;
-    int glyph_count = 0;
-    vio_font_pack_atlas_dynamic(font->ttf_data, font->font_size,
-                                &atlas_bitmap, &atlas_side, &glyphs, &glyph_count);
-    if (atlas_bitmap) {
-        font->atlas_w = font->atlas_h = atlas_side;
-        if (glyphs) {
-            vio_font_finalize_glyphs(font, glyphs, glyph_count);
-            free(glyphs);
+    int shaping_active = 0;
+#ifdef HAVE_HARFBUZZ
+    /* Preferred path: build the glyph-index atlas + HarfBuzz font. This packs
+     * every glyph (by index) and uploads once, so the atlas handle is stable
+     * for the font's life. On success the legacy codepoint pack is skipped;
+     * all text then flows through the shaping pipeline (vio_text_shape.c). */
+    shaping_active = vio_text_shape_init_font(font);
+#endif
+
+    if (!shaping_active) {
+        /* Legacy path: multi-range atlas packing (Latin, Cyrillic, Greek, CJK,
+         * Hangul, ...), dynamically sized to this font's glyph set. */
+        unsigned char *atlas_bitmap = NULL;
+        int atlas_side = 0;
+        vio_font_packed_glyph *glyphs = NULL;
+        int glyph_count = 0;
+        vio_font_pack_atlas_dynamic(font->ttf_data, font->font_size,
+                                    &atlas_bitmap, &atlas_side, &glyphs, &glyph_count);
+        if (atlas_bitmap) {
+            font->atlas_w = font->atlas_h = atlas_side;
+            if (glyphs) {
+                vio_font_finalize_glyphs(font, glyphs, glyph_count);
+                free(glyphs);
+            }
+            vio_font_upload_atlas_to_gpu(font, ctx->backend, atlas_bitmap);
+            free(atlas_bitmap);
         }
-        vio_font_upload_atlas_to_gpu(font, ctx->backend, atlas_bitmap);
-        free(atlas_bitmap);
     }
 
     font->valid = 1;
@@ -4418,6 +4430,7 @@ ZEND_FUNCTION(vio_text)
 
     float cr = 1.0f, cg = 1.0f, cb = 1.0f, ca = 1.0f;
     float z = 0.0f;
+    float max_width = 0.0f, line_height = 0.0f;
 
     if (opts_ht) {
         zval *val;
@@ -4427,7 +4440,24 @@ ZEND_FUNCTION(vio_text)
         if ((val = zend_hash_str_find(opts_ht, "z", sizeof("z") - 1)) != NULL) {
             z = (float)zval_get_double(val);
         }
+        /* Wrapping: max_width (logical px, > 0 enables soft word wrap) and an
+         * optional line_height override (logical px). '\n' always hard-breaks. */
+        if ((val = zend_hash_str_find(opts_ht, "max_width", sizeof("max_width") - 1)) != NULL) {
+            max_width = (float)zval_get_double(val);
+        }
+        if ((val = zend_hash_str_find(opts_ht, "line_height", sizeof("line_height") - 1)) != NULL) {
+            line_height = (float)zval_get_double(val);
+        }
     }
+
+#ifdef HAVE_HARFBUZZ
+    if (vio_text_shape_available(font)) {
+        vio_text_shape_draw(ctx, font, text, text_len,
+                            (float)x, (float)y, z, cr, cg, cb, ca,
+                            max_width, line_height);
+        return;
+    }
+#endif
 
     float fx = (float)x, fy = (float)y;
     float inv_w = 1.0f / (float)font->atlas_w;
@@ -4670,10 +4700,13 @@ ZEND_FUNCTION(vio_text_measure)
     zval *font_zval;
     char *text;
     size_t text_len;
+    HashTable *opts_ht = NULL;
 
-    ZEND_PARSE_PARAMETERS_START(2, 2)
+    ZEND_PARSE_PARAMETERS_START(2, 3)
         Z_PARAM_OBJECT_OF_CLASS(font_zval, vio_font_ce)
         Z_PARAM_STRING(text, text_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts_ht)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_font_object *font = Z_VIO_FONT_P(font_zval);
@@ -4681,6 +4714,31 @@ ZEND_FUNCTION(vio_text_measure)
         php_error_docref(NULL, E_WARNING, "Font is not valid");
         RETURN_FALSE;
     }
+
+    float max_width = 0.0f, line_height = 0.0f;
+    if (opts_ht) {
+        zval *val;
+        if ((val = zend_hash_str_find(opts_ht, "max_width", sizeof("max_width") - 1)) != NULL) {
+            max_width = (float)zval_get_double(val);
+        }
+        if ((val = zend_hash_str_find(opts_ht, "line_height", sizeof("line_height") - 1)) != NULL) {
+            line_height = (float)zval_get_double(val);
+        }
+    }
+
+#ifdef HAVE_HARFBUZZ
+    if (vio_text_shape_available(font)) {
+        float w = 0.0f, h = 0.0f;
+        int lines = 0;
+        vio_text_shape_measure(font, text, text_len, max_width, line_height,
+                               &w, &h, &lines);
+        array_init(return_value);
+        add_assoc_double(return_value, "width", (double)w);
+        add_assoc_double(return_value, "height", (double)h);
+        add_assoc_long(return_value, "lines", (zend_long)lines);
+        return;
+    }
+#endif
 
     float width = 0.0f;
     float min_y = 0.0f, max_y = 0.0f;
@@ -6200,6 +6258,16 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_PLUGIN_TYPE_INPUT", VIO_PLUGIN_TYPE_INPUT, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_PLUGIN_TYPE_FILTER", VIO_PLUGIN_TYPE_FILTER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_PLUGIN_API_VERSION", VIO_PLUGIN_API_VERSION, CONST_CS | CONST_PERSISTENT);
+
+    /* 1 when the extension was built with HarfBuzz — complex-script shaping and
+     * BiDi (Arabic, Thai, ligatures, mixed LTR/RTL) are active for all fonts.
+     * 0 when built without it: text uses the legacy codepoint-per-glyph path,
+     * which cannot render those scripts. */
+#ifdef HAVE_HARFBUZZ
+    REGISTER_LONG_CONSTANT("VIO_HAS_SHAPING", 1, CONST_CS | CONST_PERSISTENT);
+#else
+    REGISTER_LONG_CONSTANT("VIO_HAS_SHAPING", 0, CONST_CS | CONST_PERSISTENT);
+#endif
 }
 
 /* ── Plugin functions ─────────────────────────────────────────────── */

@@ -65,6 +65,13 @@ typedef struct _vio_font_object {
     size_t             ttf_len;       /* TTF data length */
     int                valid;
     const struct _vio_backend *backend;  /* Backend that owns the atlas */
+#ifdef HAVE_HARFBUZZ
+    /* Text-shaping state (see vio_text_shape.c). When these are non-NULL the
+     * font uses the glyph-index atlas + HarfBuzz/SheenBidi path; glyph_map is
+     * then unused. Kept as void* so this header stays free of hb.h. */
+    void              *hb_font;      /* hb_font_t* */
+    void              *shape_atlas;  /* vio_shape_atlas* */
+#endif
     zend_object        std;
 } vio_font_object;
 
@@ -72,6 +79,13 @@ extern zend_class_entry *vio_font_ce;
 
 void vio_font_register(void);
 int vio_font_pack_atlas(vio_font_object *font, unsigned char *atlas_bitmap, int atlas_size);
+
+/* Upload an R8 atlas bitmap to the GPU for `font` via `backend`. Defined in
+ * php_vio.c (it reaches the backend-global state for the D3D/Vulkan direct-R8
+ * paths). Exposed so the shaping subsystem can upload its glyph-index atlas. */
+void vio_font_upload_atlas_to_gpu(vio_font_object *font,
+                                  const struct _vio_backend *backend,
+                                  unsigned char *atlas_bitmap);
 
 /* ── Thread-safe (Zend-free) atlas packing ───────────────────────────
  *

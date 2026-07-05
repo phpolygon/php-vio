@@ -39,6 +39,7 @@ jobs:
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             spirv-cross libspirv-cross-c-shared-dev \
+            libharfbuzz-dev \
             xvfb libgl1-mesa-dri libglx-mesa0 \
             pkg-config
 
@@ -51,7 +52,8 @@ jobs:
             --with-glslang \
             --with-spirv-cross \
             --with-vulkan \
-            --with-ffmpeg
+            --with-ffmpeg \
+            --with-harfbuzz
           make -j$(nproc)
 
       # Loading the freshly built module with eager symbol binding is the
@@ -118,6 +120,7 @@ jobs:
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             spirv-cross libspirv-cross-c-shared-dev \
+            libharfbuzz-dev \
             xvfb libgl1-mesa-dri libglx-mesa0 \
             pkg-config
 
@@ -130,7 +133,8 @@ jobs:
             --with-glslang \
             --with-spirv-cross \
             --with-vulkan \
-            --with-ffmpeg
+            --with-ffmpeg \
+            --with-harfbuzz
           make -j$(nproc)
 
       - name: Smoke test — extension loads (eager symbol binding)
@@ -186,7 +190,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install glfw glslang spirv-cross vulkan-loader vulkan-headers ffmpeg pkg-config
+          brew install glfw glslang spirv-cross vulkan-loader vulkan-headers ffmpeg harfbuzz pkg-config
 
       - name: Build extension
         run: |
@@ -198,7 +202,8 @@ jobs:
             --with-spirv-cross \
             --with-vulkan \
             --with-ffmpeg \
-            --with-metal
+            --with-metal \
+            --with-harfbuzz
           make -j$(sysctl -n hw.ncpu)
 
       - name: Smoke test — extension loads (eager symbol binding)
@@ -249,7 +254,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install glfw glslang spirv-cross vulkan-loader vulkan-headers ffmpeg pkg-config
+          brew install glfw glslang spirv-cross vulkan-loader vulkan-headers ffmpeg harfbuzz pkg-config
 
       - name: Build extension
         run: |
@@ -261,7 +266,8 @@ jobs:
             --with-spirv-cross \
             --with-vulkan \
             --with-ffmpeg \
-            --with-metal
+            --with-metal \
+            --with-harfbuzz
           make -j$(sysctl -n hw.ncpu)
 
       - name: Smoke test — extension loads (eager symbol binding)
@@ -360,6 +366,19 @@ jobs:
           New-Item -ItemType Directory -Force -Path deps\bin | Out-Null
           Copy-Item -Force "$root\bin\*.dll"          deps\bin\
 
+      # HarfBuzz for text shaping. vcpkg is preinstalled on windows runners.
+      # Only the import lib + headers are needed at link time; harfbuzz.dll (and
+      # its freetype/brotli/... chain) is a runtime dependency the consumer
+      # supplies, same model as the bundled-DLL-free ffmpeg artifacts.
+      - name: Download HarfBuzz (vcpkg) — text shaping
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install harfbuzz:x64-windows --clean-after-build
+          $hb = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          Copy-Item -Recurse -Force "$hb\include\harfbuzz" deps\include\harfbuzz
+          Copy-Item -Force "$hb\lib\harfbuzz.lib" deps\lib\
+          Copy-Item -Force "$hb\bin\*.dll" deps\bin\
+
       - name: Enable Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1
 
@@ -374,6 +393,7 @@ jobs:
             --with-glslang=deps ^
             --with-spirv-cross=deps ^
             --with-ffmpeg=deps ^
+            --with-harfbuzz=deps ^
             --with-d3d11=yes ^
             --with-d3d12=yes ^
             --with-prefix=${{ steps.php-sdk.outputs.prefix }}

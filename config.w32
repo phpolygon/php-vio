@@ -7,6 +7,7 @@ ARG_WITH("vulkan", "for Vulkan support (DIR or yes to use --with-php-build)", "y
 ARG_WITH("glslang", "for glslang (GLSL to SPIR-V compiler) support", "no");
 ARG_WITH("spirv-cross", "for SPIRV-Cross (shader reflection) support", "no");
 ARG_WITH("ffmpeg", "for FFmpeg (video recording) support", "no");
+ARG_WITH("harfbuzz", "for HarfBuzz (text shaping: Arabic, Thai, BiDi) support", "no");
 ARG_WITH("d3d11", "for Direct3D 11 support", "yes");
 ARG_WITH("d3d12", "for Direct3D 12 support", "yes");
 
@@ -33,6 +34,7 @@ if (PHP_VIO != "no") {
         "src\\vio_2d_d3d12.c " +
         "src\\vio_2d_vulkan.c " +
         "src\\vio_font.c " +
+        "src\\vio_text_shape.c " +
         "src\\vio_shader_compiler.c " +
         "src\\vio_shader_reflect.c " +
         "src\\vio_audio.c " +
@@ -49,16 +51,24 @@ if (PHP_VIO != "no") {
         "vendor\\glad\\src\\glad.c " +
         "vendor\\stb\\stb_image_impl.c " +
         "vendor\\stb\\stb_truetype_impl.c " +
+        "vendor\\stb\\stb_rect_pack_impl.c " +
         "vendor\\stb\\stb_image_write_impl.c " +
-        "vendor\\miniaudio\\miniaudio_impl.c";
+        "vendor\\miniaudio\\miniaudio_impl.c " +
+        "vendor\\sheenbidi\\Source\\SheenBidi.c";
 
+    // SheenBidi is vendored and compiled as a single UNITY translation unit
+    // (Source\SheenBidi.c #include's every .c when SB_CONFIG_UNITY is set).
+    // Its includes need both Headers\ (<SheenBidi/...>) and Source\ (<API/...>).
     var vio_cflags =
         "/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 " +
+        "/DSB_CONFIG_UNITY " +
         "/I" + configure_module_dirname + "\\vendor\\glad\\include " +
         "/I" + configure_module_dirname + "\\include " +
         "/I" + configure_module_dirname + "\\vendor\\vma " +
         "/I" + configure_module_dirname + "\\vendor\\miniaudio " +
-        "/I" + configure_module_dirname + "\\vendor\\stb";
+        "/I" + configure_module_dirname + "\\vendor\\stb " +
+        "/I" + configure_module_dirname + "\\vendor\\sheenbidi\\Headers " +
+        "/I" + configure_module_dirname + "\\vendor\\sheenbidi\\Source";
 
     // ── GLFW detection ─────────────────────────────────────────────
     if (PHP_GLFW != "no") {
@@ -161,6 +171,28 @@ if (PHP_VIO != "no") {
             } else {
                 WARNING("Some FFmpeg libraries not found, building without video recording");
             }
+        }
+    }
+
+    // ── HarfBuzz detection ────────────────────────────────────────────
+    // Enables src\vio_text_shape.c (complex-script shaping + BiDi). Without
+    // it the text path falls back to the legacy codepoint-per-glyph #else,
+    // so the build compiles and runs unchanged — the new scripts are just
+    // unavailable. SheenBidi (BiDi) is vendored and always compiled; it is
+    // only used inside the HAVE_HARFBUZZ path.
+    if (PHP_HARFBUZZ != "no") {
+        if (PHP_HARFBUZZ == "yes") {
+            PHP_HARFBUZZ = PHP_PHP_BUILD;
+        }
+        // HarfBuzz ships hb.h either directly under include\ or include\harfbuzz\.
+        if (CHECK_HEADER_ADD_INCLUDE("hb.h", "CFLAGS_VIO", PHP_HARFBUZZ + "\\include\\harfbuzz;" + PHP_HARFBUZZ + "\\include")) {
+            if (CHECK_LIB("harfbuzz.lib", "vio", PHP_HARFBUZZ + "\\lib")) {
+                AC_DEFINE("HAVE_HARFBUZZ", 1, "Whether HarfBuzz is available");
+            } else {
+                WARNING("HarfBuzz library not found in " + PHP_HARFBUZZ + "\\lib");
+            }
+        } else {
+            WARNING("HarfBuzz headers (hb.h) not found in " + PHP_HARFBUZZ + "\\include");
         }
     }
 

@@ -11,6 +11,7 @@
 
 #include "vio_font.h"
 #include "../include/vio_backend.h"
+#include "vio_text_shape.h"
 
 zend_class_entry *vio_font_ce = NULL;
 static zend_object_handlers vio_font_handlers;
@@ -29,6 +30,10 @@ static zend_object *vio_font_create_object(zend_class_entry *ce)
     font->ttf_len               = 0;
     font->valid                 = 0;
     font->backend               = NULL;
+#ifdef HAVE_HARFBUZZ
+    font->hb_font               = NULL;
+    font->shape_atlas           = NULL;
+#endif
     zend_hash_init(&font->glyph_map, 512, NULL, NULL, 0);
 
     zend_object_std_init(&font->std, ce);
@@ -45,6 +50,12 @@ static void vio_font_free_object(zend_object *obj)
     if (font->backend && font->backend->destroy_font_atlas) {
         font->backend->destroy_font_atlas(font);
     }
+
+#ifdef HAVE_HARFBUZZ
+    /* Tear down HarfBuzz + shaping atlas before freeing ttf_data — the
+     * HarfBuzz blob references those bytes read-only. */
+    vio_text_shape_free_font(font);
+#endif
 
     zend_hash_destroy(&font->glyph_map);
 
