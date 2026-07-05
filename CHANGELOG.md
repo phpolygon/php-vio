@@ -1,3 +1,11 @@
+# [2.4.0](https://github.com/phpolygon/php-vio/compare/v2.3.0...v2.4.0) (2026-07-05)
+
+
+### Features
+
+* **render:** batched draw submission + per-draw SRV-flush dedup (D3D12) ([27e906f](https://github.com/phpolygon/php-vio/commit/27e906fd3a2788571a513ab6c44b84369ef051f7))
+* **text:** HarfBuzz + SheenBidi shaping with BiDi and line wrapping ([fd6f835](https://github.com/phpolygon/php-vio/commit/fd6f835ecb470b84e6609578b79da57ad2fb8357)), closes [#14-lite](https://github.com/phpolygon/php-vio/issues/14-lite)
+
 # [2.3.0](https://github.com/phpolygon/php-vio/compare/v2.2.0...v2.3.0) (2026-06-26)
 
 
