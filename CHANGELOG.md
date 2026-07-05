@@ -1,3 +1,10 @@
+## [2.4.1](https://github.com/phpolygon/php-vio/compare/v2.4.0...v2.4.1) (2026-07-05)
+
+
+### Bug Fixes
+
+* **build:** make --with-harfbuzz opt-in (default no) to fix static builds ([60b7a97](https://github.com/phpolygon/php-vio/commit/60b7a977aef9dbdb73750addd21ce4f1409ca445))
+
 # [2.4.0](https://github.com/phpolygon/php-vio/compare/v2.3.0...v2.4.0) (2026-07-05)
 
 
