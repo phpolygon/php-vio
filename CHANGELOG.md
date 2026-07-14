@@ -1,3 +1,15 @@
+# [2.5.0](https://github.com/phpolygon/php-vio/compare/v2.4.3...v2.5.0) (2026-07-14)
+
+
+### Bug Fixes
+
+* **test:** normalise path separators so the GL audit gate works on Windows ([eeafd93](https://github.com/phpolygon/php-vio/commit/eeafd938401b5e6a12248815ee7fe6f43f11de10))
+
+
+### Features
+
+* **d3d12:** make the in-flight frame count configurable ([7c93276](https://github.com/phpolygon/php-vio/commit/7c93276524c9c51adcbb6529aca8be5a3ed6ec3e))
+
 ## [2.4.3](https://github.com/phpolygon/php-vio/compare/v2.4.2...v2.4.3) (2026-07-14)
 
 
