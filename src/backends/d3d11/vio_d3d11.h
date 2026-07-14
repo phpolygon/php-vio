@@ -179,11 +179,30 @@ typedef struct _vio_d3d11_state {
      * (typically off-screen or collapsed to the origin). */
     ID3D11Buffer *identity_instance_buf;
 
-    /* Persistent readback staging for vio_read_pixels.
-     * FLIP_DISCARD swapchains lose backbuffer content after Present(), so
-     * end_frame() eagerly copies the rendered backbuffer into this staging
-     * texture. vio_read_pixels maps from here instead of the live RTV. */
-    ID3D11Texture2D *readback_staging;
+    /* Readback path for vio_read_pixels.
+     *
+     * FLIP_DISCARD swapchains lose backbuffer content after Present(), and D3D11
+     * (unlike D3D12, which keeps last_presented_frame_idx) cannot address the
+     * previously presented buffer — GetBuffer(0) always hands back the *current*
+     * one. So end_frame() must mirror the rendered backbuffer somewhere before
+     * Present rotates it.
+     *
+     * CRITICAL: that per-frame mirror goes into readback_mirror, a GPU-LOCAL
+     * (D3D11_USAGE_DEFAULT) texture. It must NOT be a STAGING texture: staging
+     * lives in CPU-visible memory, so a per-frame CopyResource into it pushes the
+     * whole backbuffer across PCIe every frame. Measured on a 3840x1080 backbuffer
+     * (16.6 MB/frame) that cost 2.29 ms/frame — ~7 GB/s, i.e. the frame loop was
+     * bounded by the readback nobody asked for. Frame time scaled linearly with
+     * resolution (~0.55 ms/Mpx) while D3D12, which copies only on demand, stayed
+     * flat at ~0.35 ms.
+     *
+     * readback_staging (CPU-readable) is now filled ON DEMAND only, by
+     * vio_d3d11_resolve_readback(), which vio_read_pixels calls right before it
+     * maps. Semantics are unchanged — the pixels still come from the pre-Present
+     * frame — but a frame nobody reads costs one VRAM->VRAM blit instead of a
+     * PCIe transfer. */
+    ID3D11Texture2D *readback_mirror;   /* DEFAULT, GPU-local; written every end_frame */
+    ID3D11Texture2D *readback_staging;  /* STAGING, CPU-readable; filled on demand */
     UINT             readback_w;
     UINT             readback_h;
 
@@ -211,6 +230,16 @@ void vio_backend_d3d11_register(void);
 
 /* Called after GLFW window creation to set up D3D11 */
 int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg);
+
+/* Resolve the GPU-local per-frame mirror (readback_mirror) into the CPU-readable
+ * readback_staging texture, creating/resizing staging as needed. Call this
+ * immediately before mapping readback_staging.
+ *
+ * Returns 1 when readback_staging holds the pre-Present frame and is safe to Map,
+ * 0 when there is no mirror yet (no end_frame has run) — in that case the caller
+ * must fall back to a one-shot copy from the live RTV, which is still valid
+ * because nothing has been presented yet. */
+int vio_d3d11_resolve_readback(void);
 
 #endif /* HAVE_D3D11 */
 #endif /* VIO_D3D11_H */

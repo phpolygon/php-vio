@@ -5174,16 +5174,25 @@ ZEND_FUNCTION(vio_read_pixels)
 
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
-        /* d3d11_end_frame copies the rendered backbuffer into
-         * vio_d3d11.readback_staging. Reading from staging avoids the
-         * FLIP_DISCARD race where the live RTV has undefined content
-         * after Present().
+        /* d3d11_end_frame mirrors the rendered backbuffer into the GPU-local
+         * vio_d3d11.readback_mirror. Reading from that mirror avoids the
+         * FLIP_DISCARD race where the live RTV has undefined content after
+         * Present().
          *
-         * If end_frame hasn't run yet (pre-first-end call from headless
-         * tests that read before any vio_end), fall back to a one-shot
-         * copy from the live RTV — still valid at that point. */
-        ID3D11Texture2D *staging = vio_d3d11.readback_staging;
+         * vio_d3d11_resolve_readback() does the (PCIe-crossing) mirror->staging
+         * copy HERE, on demand — the per-frame path deliberately does not, so a
+         * frame nobody reads costs no CPU transfer.
+         *
+         * If no end_frame has run yet (pre-first-end call from headless tests
+         * that read before any vio_end), there is no mirror; fall back to a
+         * one-shot copy from the live RTV — still valid at that point, because
+         * nothing has been presented. */
+        ID3D11Texture2D *staging = NULL;
         ID3D11Texture2D *one_shot = NULL;
+
+        if (vio_d3d11_resolve_readback()) {
+            staging = vio_d3d11.readback_staging;
+        }
 
         if (!staging) {
             ID3D11DeviceContext_Flush(vio_d3d11.context);
