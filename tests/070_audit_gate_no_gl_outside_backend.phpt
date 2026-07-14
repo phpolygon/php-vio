@@ -20,7 +20,19 @@ if (!is_dir("$src_root/src/backends/opengl")) {
  * /gl[A-Z][a-zA-Z]+\(/ or /GL_[A-Z]/. False positives in comments are
  * stripped via a second pass. */
 
-$root = realpath(__DIR__ . '/..');
+/* Paths are normalised to forward slashes throughout.
+ *
+ * On Windows realpath() and SplFileInfo::getPathname() both return BACKSLASH
+ * paths ("D:\...\src\backends\opengl\vio_2d_opengl.c"), while the exempt lists
+ * below are built with "/" — so "$root/src/backends/opengl" came out as a
+ * MIXED-separator string that str_starts_with() could never match. Every exempt
+ * dir and file silently missed, the OpenGL backend's own ~7000 legitimate GL
+ * tokens were reported as violations, and the gate failed permanently on
+ * Windows — which is worse than a red test: a REAL leak would have drowned in
+ * the false positives. */
+function norm(string $p): string { return str_replace('\\', '/', $p); }
+
+$root = norm(realpath(__DIR__ . '/..'));
 $exempt_dirs = [
     "$root/src/backends/opengl",
     "$root/vendor",
@@ -52,7 +64,7 @@ $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root,
 
 foreach ($it as $file) {
     if (!$file->isFile()) continue;
-    $path = $file->getPathname();
+    $path = norm($file->getPathname());
     if (!preg_match('/\.(c|m|h|cpp)$/', $path)) continue;
     if (is_exempt($path, $exempt_dirs, $exempt_files)) continue;
 

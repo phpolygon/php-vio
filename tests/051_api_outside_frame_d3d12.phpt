@@ -20,6 +20,18 @@ vio
 // cannot be called on a closed command list" once per pre-begin call.
 // The debug layer also occasionally tripped TDR. After the fix the
 // affected calls early-return when in_frame is false.
+//
+// 'debug' => 1 is load-bearing: the debug layer is what SURFACES a closed-list
+// violation (as a "D3D12[...] [ERROR] id=547 ..." line on stderr), and the exact
+// output match below is what turns that into a failure. Do not drop it.
+//
+// The EXPECTF %A prefix absorbs only the backend's *informational* startup
+// preamble, which is environment-dependent and therefore cannot be hard-coded:
+// where the Graphics Tools are installed the backend prints "DRED: ... FORCED_ON
+// / EnableDebugLayer OK / InfoQueue available", where they are not it prints
+// "D3D12GetDebugInterface FAILED". Both are fine. A real id=547 error is drained
+// at the NEXT begin_frame and so lands BETWEEN the OK lines, where the exact
+// match still catches it — %A does not weaken the actual assertion.
 $ctx = @vio_create('d3d12', ['width' => 64, 'height' => 64, 'headless' => true, 'debug' => 1]);
 if (!$ctx instanceof VioContext) {
     echo "SKIP: WARP unavailable\n";
@@ -50,8 +62,8 @@ echo "frame 2 OK\n";
 vio_destroy($ctx);
 echo "OK\n";
 ?>
---EXPECT--
-viewport before-frame OK
+--EXPECTF--
+%Aviewport before-frame OK
 frame 1 OK
 viewport between-frames OK
 frame 2 OK
