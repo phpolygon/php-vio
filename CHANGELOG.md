@@ -1,3 +1,10 @@
+## [2.4.3](https://github.com/phpolygon/php-vio/compare/v2.4.2...v2.4.3) (2026-07-14)
+
+
+### Performance Improvements
+
+* **d3d11:** stop pushing every frame across PCIe for a readback nobody asked for ([c2cdf11](https://github.com/phpolygon/php-vio/commit/c2cdf11a03247c717cbf8eeb81097e0916583fc1))
+
 ## [2.4.2](https://github.com/phpolygon/php-vio/compare/v2.4.1...v2.4.2) (2026-07-14)
 
 
