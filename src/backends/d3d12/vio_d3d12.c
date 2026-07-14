@@ -45,23 +45,15 @@ static vio_d3d12_pipeline *d3d12_current_pipeline = NULL;
  * symptomatic failure rather than scrolling past in the Windows event log. */
 static void d3d12_drain_info_queue(const char *context)
 {
-    if (!vio_d3d12.device) return;
-
-    ID3D12InfoQueue *iq = NULL;
-    HRESULT hr = ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12InfoQueue, (void **)&iq);
-    if (FAILED(hr) || !iq) {
-        /* One-shot note via the channel that actually surfaces (direct stderr),
-         * so "no messages" is never ambiguous: it means the debug layer / its
-         * InfoQueue is genuinely unavailable, not that the drain was skipped. */
-        static int warned = 0;
-        if (!warned) {
-            warned = 1;
-            fprintf(stderr, "[d3d12] drain(%s): InfoQueue UNAVAILABLE (debug layer not active)\n",
-                    context ? context : "?");
-            fflush(stderr);
-        }
-        return; /* debug layer not enabled */
-    }
+    /* The InfoQueue is resolved ONCE, at init (vio_d3d12.info_queue), and is NULL
+     * whenever the debug layer is inactive — which is every release run.
+     *
+     * This used to QueryInterface(IID_ID3D12InfoQueue) on the device on every
+     * call. begin_frame() calls this every frame, so a release build paid a COM
+     * QI (that was guaranteed to FAIL) once per frame, forever, to learn
+     * something already known at startup. Now: one pointer test. */
+    ID3D12InfoQueue *iq = vio_d3d12.info_queue;
+    if (!iq) return;
 
     UINT64 count = ID3D12InfoQueue_GetNumStoredMessagesAllowedByRetrievalFilter(iq);
     for (UINT64 i = 0; i < count; i++) {
@@ -90,7 +82,8 @@ static void d3d12_drain_info_queue(const char *context)
         free(msg);
     }
     ID3D12InfoQueue_ClearStoredMessages(iq);
-    ID3D12InfoQueue_Release(iq);
+    /* No Release here — vio_d3d12.info_queue owns the reference for the device's
+     * lifetime and is released in d3d12_shutdown(). */
 }
 
 /* Map a DRED auto-breadcrumb op enum to a short readable name. Covers the ops
@@ -506,7 +499,7 @@ static int d3d12_create_render_targets(void)
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.rtv_heap, &rtv_handle);
 
-    for (UINT i = 0; i < VIO_D3D12_FRAME_COUNT; i++) {
+    for (UINT i = 0; i < vio_d3d12.frame_count; i++) {
         HRESULT hr = IDXGISwapChain3_GetBuffer(vio_d3d12.swapchain, i,
                                                 &IID_ID3D12Resource,
                                                 (void **)&vio_d3d12.frames[i].render_target);
@@ -527,7 +520,7 @@ static int d3d12_create_render_targets(void)
 
 static void d3d12_release_render_targets(void)
 {
-    for (UINT i = 0; i < VIO_D3D12_FRAME_COUNT; i++) {
+    for (UINT i = 0; i < vio_d3d12.frame_count; i++) {
         if (vio_d3d12.frames[i].render_target) {
             ID3D12Resource_Release(vio_d3d12.frames[i].render_target);
             vio_d3d12.frames[i].render_target = NULL;
@@ -590,6 +583,22 @@ static void d3d12_shutdown(void);
 static int d3d12_init(vio_config *cfg)
 {
     HRESULT hr;
+
+    /* Resolve the in-flight frame count FIRST: the heap slices divide by it, so a
+     * zero here would be a divide-by-zero rather than a wrong number. 0 (or any
+     * out-of-range value) means "use the default" — we never trust the caller to
+     * have clamped, because this arrives straight from a PHP array. */
+    {
+        int requested = cfg ? cfg->frame_count : 0;
+        if (requested <= 0) {
+            requested = VIO_D3D12_FRAME_COUNT_DEFAULT;
+        } else if (requested < VIO_D3D12_MIN_FRAME_COUNT) {
+            requested = VIO_D3D12_MIN_FRAME_COUNT;
+        } else if (requested > VIO_D3D12_MAX_FRAME_COUNT) {
+            requested = VIO_D3D12_MAX_FRAME_COUNT;
+        }
+        vio_d3d12.frame_count = (UINT)requested;
+    }
 
     /* Enable DRED (Device Removed Extended Data) BEFORE device creation.
      *
@@ -755,6 +764,11 @@ static int d3d12_init(vio_config *cfg)
      * (all severities, every other ID — including the real validation errors
      * the drain exists to surface) is unaffected and still stored + emitted. */
     if (cfg->debug) {
+        /* Resolve the InfoQueue ONCE and keep the reference for the device's
+         * lifetime (released in d3d12_shutdown). d3d12_drain_info_queue() reads
+         * vio_d3d12.info_queue directly, so the per-frame drain no longer does a
+         * QueryInterface. When debug is off, info_queue stays NULL and the drain
+         * is a single pointer test. */
         ID3D12InfoQueue *iq = NULL;
         if (SUCCEEDED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12InfoQueue,
                                                    (void **)&iq)) && iq) {
@@ -768,7 +782,7 @@ static int d3d12_init(vio_config *cfg)
             /* AddStorageFilterEntries: do not store messages matching the deny
              * list. No category/severity entries → only these exact IDs match. */
             ID3D12InfoQueue_AddStorageFilterEntries(iq, &filter);
-            ID3D12InfoQueue_Release(iq);
+            vio_d3d12.info_queue = iq;   /* keep the reference; do NOT Release */
             fprintf(stderr, "[d3d12] InfoQueue available — validation messages will print to stderr\n");
         } else {
             fprintf(stderr, "[d3d12] InfoQueue UNAVAILABLE after device create — debug layer not live (reboot after Graphics Tools install?)\n");
@@ -791,7 +805,7 @@ static int d3d12_init(vio_config *cfg)
     }
 
     /* Create per-frame command allocators */
-    for (UINT i = 0; i < VIO_D3D12_FRAME_COUNT; i++) {
+    for (UINT i = 0; i < vio_d3d12.frame_count; i++) {
         hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device,
                                                   D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                   &IID_ID3D12CommandAllocator,
@@ -829,7 +843,7 @@ static int d3d12_init(vio_config *cfg)
     /* Create descriptor heaps */
     if (d3d12_create_descriptor_heap(&vio_d3d12.rtv_heap,
                                       D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                                      VIO_D3D12_FRAME_COUNT,
+                                      vio_d3d12.frame_count,
                                       D3D12_DESCRIPTOR_HEAP_FLAG_NONE) != 0) {
         goto init_fail;
     }
@@ -878,7 +892,7 @@ static int d3d12_init(vio_config *cfg)
     /* Per-frame linear cbuffer allocator: persistently mapped UPLOAD heap.
      * Each draw call allocates a 256-byte-aligned slice for its cbuffer data.
      *
-     * The heap is split into VIO_D3D12_FRAME_COUNT equal per-frame slices
+     * The heap is split into vio_d3d12.frame_count equal per-frame slices
      * (begin_frame rebases the offset to this frame's slice). A single shared
      * offset reset to 0 every frame would let frame N+1 overwrite the very
      * addresses frame N's in-flight root CBVs still read — invisible while
@@ -907,7 +921,7 @@ static int d3d12_init(vio_config *cfg)
             vio_d3d12.cbuffer_heap_gpu = ID3D12Resource_GetGPUVirtualAddress(vio_d3d12.cbuffer_heap);
             vio_d3d12.cbuffer_heap_capacity = heap_size;
             vio_d3d12.cbuffer_frame_base = 0;
-            vio_d3d12.cbuffer_frame_end = heap_size / VIO_D3D12_FRAME_COUNT;
+            vio_d3d12.cbuffer_frame_end = heap_size / vio_d3d12.frame_count;
             vio_d3d12.cbuffer_heap_offset = 0;
             /* Persistently map (never unmap — valid for UPLOAD heaps in D3D12) */
             D3D12_RANGE rr = {0, 0};
@@ -918,7 +932,7 @@ static int d3d12_init(vio_config *cfg)
     /* Per-frame linear instance-data allocator: persistently mapped UPLOAD heap.
      * Mirrors the cbuffer heap exactly. Each vio_draw_instanced gets a 256-byte-
      * aligned slice holding its mat4 instance array; vbvs[1] points at that
-     * slice's GPU VA. The heap is split into VIO_D3D12_FRAME_COUNT equal slices
+     * slice's GPU VA. The heap is split into vio_d3d12.frame_count equal slices
      * (begin_frame rebases the offset to this frame's slice) so the CPU never
      * overwrites instance matrices another in-flight frame's command list still
      * reads. Growing mid-execution requires a full GPU sync (see d3d12_begin_frame)
@@ -942,7 +956,7 @@ static int d3d12_init(vio_config *cfg)
             vio_d3d12.instance_heap_gpu = ID3D12Resource_GetGPUVirtualAddress(vio_d3d12.instance_heap);
             vio_d3d12.instance_heap_capacity = heap_size;
             vio_d3d12.instance_frame_base = 0;
-            vio_d3d12.instance_frame_end = heap_size / VIO_D3D12_FRAME_COUNT;
+            vio_d3d12.instance_frame_end = heap_size / vio_d3d12.frame_count;
             vio_d3d12.instance_heap_offset = 0;
             /* Persistently map (never unmap — valid for UPLOAD heaps in D3D12) */
             D3D12_RANGE rr = {0, 0};
@@ -1017,7 +1031,7 @@ static void d3d12_shutdown(void)
         ID3D12Resource_Release(vio_d3d12.depth_buffer);
     }
 
-    for (UINT i = 0; i < VIO_D3D12_FRAME_COUNT; i++) {
+    for (UINT i = 0; i < vio_d3d12.frame_count; i++) {
         if (vio_d3d12.frames[i].cmd_allocator) {
             ID3D12CommandAllocator_Release(vio_d3d12.frames[i].cmd_allocator);
         }
@@ -1036,6 +1050,8 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.swapchain)      IDXGISwapChain3_Release(vio_d3d12.swapchain);
     if (vio_d3d12.cmd_queue)      ID3D12CommandQueue_Release(vio_d3d12.cmd_queue);
     if (vio_d3d12.factory)        IDXGIFactory4_Release(vio_d3d12.factory);
+    /* Cached debug-layer InfoQueue — must go before the device it was QI'd from. */
+    if (vio_d3d12.info_queue)     ID3D12InfoQueue_Release(vio_d3d12.info_queue);
     if (vio_d3d12.device)         ID3D12Device_Release(vio_d3d12.device);
 
     d3d12_current_pipeline = NULL;
@@ -1061,7 +1077,7 @@ static void *d3d12_create_surface(vio_config *cfg)
     sc_desc.Stereo = FALSE;
     sc_desc.SampleDesc.Count = 1;
     sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sc_desc.BufferCount = VIO_D3D12_FRAME_COUNT;
+    sc_desc.BufferCount = vio_d3d12.frame_count;
     sc_desc.Scaling = DXGI_SCALING_STRETCH;
     sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sc_desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
@@ -1203,7 +1219,7 @@ static void d3d12_resize(int width, int height)
      * DXGI_PRESENT_ALLOW_TEARING then fails with DXGI_ERROR_INVALID_CALL — i.e.
      * frames stop reaching the screen after the first window resize. */
     HRESULT hr = IDXGISwapChain3_ResizeBuffers(vio_d3d12.swapchain,
-                                                VIO_D3D12_FRAME_COUNT,
+                                                vio_d3d12.frame_count,
                                                 width, height,
                                                 DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 vio_d3d12.swapchain_flags);
@@ -2093,7 +2109,7 @@ static void d3d12_begin_frame(void)
     vio_d3d12.current_has_rtv = 1;
 
     /* Grow cbuffer heap if last frame used >75% of its per-frame slice */
-    UINT cb_slice = vio_d3d12.cbuffer_heap_capacity / VIO_D3D12_FRAME_COUNT;
+    UINT cb_slice = vio_d3d12.cbuffer_heap_capacity / vio_d3d12.frame_count;
     UINT cb_last_used = vio_d3d12.cbuffer_heap_offset - vio_d3d12.cbuffer_frame_base;
     if (cb_last_used > cb_slice * 3 / 4) {
         UINT new_size = vio_d3d12.cbuffer_heap_capacity * 2;
@@ -2143,7 +2159,7 @@ static void d3d12_begin_frame(void)
      * this heap by raw GPU VA (untracked by the runtime), so the OTHER in-flight
      * frame may still be reading the old heap. Full GPU sync BEFORE Release. */
     {
-        UINT inst_slice = vio_d3d12.instance_heap_capacity / VIO_D3D12_FRAME_COUNT;
+        UINT inst_slice = vio_d3d12.instance_heap_capacity / vio_d3d12.frame_count;
         UINT inst_last_used = vio_d3d12.instance_heap_offset - vio_d3d12.instance_frame_base;
         if (inst_slice > 0 && inst_last_used > inst_slice * 3 / 4) {
             UINT new_size = vio_d3d12.instance_heap_capacity * 2;
@@ -2183,25 +2199,25 @@ static void d3d12_begin_frame(void)
      *
      * Static SRVs occupy [capacity - srv_heap.count, capacity), growing
      * downward as more textures load. The per-frame regions live in
-     * [0, capacity - srv_heap.count), split into VIO_D3D12_FRAME_COUNT
+     * [0, capacity - srv_heap.count), split into vio_d3d12.frame_count
      * equal slices indexed by frame_index. The two regions never overlap
      * (until the heap is genuinely full), so a texture created mid-frame
      * gets a high-index SRV that's outside every frame's per-frame slice
      * and is therefore safe from the null-init sweep in flush_srv_table. */
     /* Rebase the cbuffer allocator into THIS frame's slice. The other frame
      * in flight keeps reading its own slice — never overwritten from here. */
-    cb_slice = vio_d3d12.cbuffer_heap_capacity / VIO_D3D12_FRAME_COUNT;
+    cb_slice = vio_d3d12.cbuffer_heap_capacity / vio_d3d12.frame_count;
     vio_d3d12.cbuffer_frame_base = vio_d3d12.frame_index * cb_slice;
     vio_d3d12.cbuffer_frame_end  = vio_d3d12.cbuffer_frame_base + cb_slice;
     vio_d3d12.cbuffer_heap_offset = vio_d3d12.cbuffer_frame_base;
     /* Rebase the instance allocator into THIS frame's slice (same as cbuffer). */
-    UINT inst_slice = vio_d3d12.instance_heap_capacity / VIO_D3D12_FRAME_COUNT;
+    UINT inst_slice = vio_d3d12.instance_heap_capacity / vio_d3d12.frame_count;
     vio_d3d12.instance_frame_base = vio_d3d12.frame_index * inst_slice;
     vio_d3d12.instance_frame_end  = vio_d3d12.instance_frame_base + inst_slice;
     vio_d3d12.instance_heap_offset = vio_d3d12.instance_frame_base;
     UINT perframe_total = (vio_d3d12.srv_heap.capacity > vio_d3d12.srv_heap.count)
                            ? (vio_d3d12.srv_heap.capacity - vio_d3d12.srv_heap.count) : 0;
-    vio_d3d12.srv_frame_capacity = perframe_total / VIO_D3D12_FRAME_COUNT;
+    vio_d3d12.srv_frame_capacity = perframe_total / vio_d3d12.frame_count;
     vio_d3d12.srv_frame_base     = vio_d3d12.frame_index * vio_d3d12.srv_frame_capacity;
     vio_d3d12.srv_frame_offset   = vio_d3d12.srv_frame_base;
     memset(vio_d3d12.pending_srv_valid, 0, sizeof(vio_d3d12.pending_srv_valid));

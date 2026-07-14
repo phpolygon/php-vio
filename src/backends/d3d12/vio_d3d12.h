@@ -24,7 +24,29 @@
 #define DXGI_PRESENT_ALLOW_TEARING 0x00000200UL
 #endif
 
-#define VIO_D3D12_FRAME_COUNT 2
+/* Backbuffers == in-flight frame slots: how many frames the CPU may run ahead of
+ * the GPU. begin_frame() waits on frames[frame_index].fence_value before it may
+ * Reset that slot's allocator, so this number IS the pipeline depth.
+ *
+ * At 2 the CPU blocks on the submit->present->fence round trip of the frame two
+ * back; with a cheap scene that latency — not the GPU work — becomes the
+ * frame-time floor. A third slot absorbs it.
+ *
+ * It is NOT hardcoded to 3, because the count also divides the per-frame SRV,
+ * constant-buffer and instance-heap slices: going 2 -> 3 shrinks every slice from
+ * 1/2 to 1/3 of its heap. A scene already close to a heap limit would start
+ * overflowing. So the default stays at the long-standing 2 (no silent regression
+ * for existing games) and a game opts in:
+ *
+ *     vio_create('d3d12', ['frame_count' => 3, ...]);
+ *
+ * Runtime value: vio_d3d12.frame_count (clamped to [MIN, MAX]). Everything
+ * downstream — swapchain BufferCount, ResizeBuffers, frames[], and the heap
+ * slices — reads that field, never a macro. The macro below only sizes the
+ * fixed-length frames[] array. */
+#define VIO_D3D12_MIN_FRAME_COUNT     2
+#define VIO_D3D12_MAX_FRAME_COUNT     3
+#define VIO_D3D12_FRAME_COUNT_DEFAULT 2
 #define VIO_D3D12_MAX_SRV_DESCRIPTORS 32768
 
 /* Size of the per-draw SRV descriptor table (root param [2], registers t0..tN-1).
@@ -172,6 +194,16 @@ typedef struct _vio_d3d12_state {
     int                        tearing_supported;  /* DXGI_FEATURE_PRESENT_ALLOW_TEARING */
     UINT                       swapchain_flags;    /* DXGI_SWAP_CHAIN_FLAG_* used at creation */
 
+    /* Debug-layer InfoQueue, resolved ONCE at init and owned for the device's
+     * lifetime (released in shutdown). NULL whenever the debug layer is inactive,
+     * i.e. in every release run.
+     *
+     * d3d12_drain_info_queue() runs on every begin_frame. It used to
+     * QueryInterface the device each call — a COM QI that, in a release build,
+     * failed every single frame to re-discover a fact already known at startup.
+     * Caching turns the per-frame cost into one pointer test. */
+    ID3D12InfoQueue           *info_queue;
+
     /* Selected-adapter info, captured once at init from DXGI_ADAPTER_DESC1 of
      * the adapter we actually created the device on. Read back by vio_gpu_info().
      * gpu_name is UTF-8 (converted from the WCHAR Description); empty if unknown.
@@ -206,7 +238,14 @@ typedef struct _vio_d3d12_state {
     UINT64                     fence_value;
 
     /* Per-frame resources */
-    vio_d3d12_frame            frames[VIO_D3D12_FRAME_COUNT];
+    /* Sized to the maximum; only the first frame_count slots are ever used. */
+    vio_d3d12_frame            frames[VIO_D3D12_MAX_FRAME_COUNT];
+
+    /* In-flight frame slots actually in use. Set once from vio_config::frame_count
+     * (clamped to [MIN, MAX]) and read by every downstream consumer — swapchain
+     * BufferCount, ResizeBuffers, the frames[] loops, and the per-frame heap
+     * slices. Never read the macro for these. */
+    UINT                       frame_count;
 
     /* Root signature (shared across all pipelines) */
     ID3D12RootSignature       *root_signature;
@@ -241,7 +280,7 @@ typedef struct _vio_d3d12_state {
      * The descriptor heap is split each begin_frame: indices [0, srv_heap.count)
      * are static SRVs (one per texture/render-target/cubemap, monotonically
      * appended via d3d12_alloc_srv_descriptor); the remainder is partitioned
-     * into VIO_D3D12_FRAME_COUNT equal regions, one per in-flight frame slot.
+     * into vio_d3d12.frame_count equal regions, one per in-flight frame slot.
      * Per-frame writes never touch indices below srv_heap.count, so they can
      * never overwrite a static SRV — even when the game loads enough textures
      * (fonts × sizes, sprites, language flags, etc.) to push the static count
@@ -270,7 +309,7 @@ typedef struct _vio_d3d12_state {
     int                         srv_table_bound;         /* 1 => srv_table_gpu holds a valid block bound this frame */
 
     /* Per-frame linear cbuffer allocator (avoids overwriting between draw calls).
-     * The heap is split into VIO_D3D12_FRAME_COUNT equal slices (like the SRV
+     * The heap is split into vio_d3d12.frame_count equal slices (like the SRV
      * frame regions): frame N allocates ONLY inside its own slice, so the CPU
      * never overwrites memory another in-flight frame still reads via root CBV. */
     ID3D12Resource            *cbuffer_heap;          /* large UPLOAD heap */

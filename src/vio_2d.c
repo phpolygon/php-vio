@@ -514,7 +514,7 @@ void vio_2d_flush(vio_2d_state *state)
         ID3D12GraphicsCommandList *cl = vio_d3d12.cmd_list;
 
         /* Upload vertex data into THIS frame's slice of the persistently-mapped
-         * UPLOAD VBO. The resource holds VIO_D3D12_FRAME_COUNT slices; we pick
+         * UPLOAD VBO. The resource holds vio_d3d12.frame_count slices; we pick
          * the one indexed by the current backbuffer to avoid stomping vertices
          * still in flight on the GPU from the previous frame. */
         UINT vbo_slice_off = vio_d3d12.frame_index * d3d->vbo_slice_size;

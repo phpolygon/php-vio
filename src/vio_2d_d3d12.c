@@ -18,7 +18,7 @@
 
 #include "vio_2d.h"
 #include "vio_2d_d3d12.h"
-#include "backends/d3d12/vio_d3d12.h" /* VIO_D3D12_FRAME_COUNT */
+#include "backends/d3d12/vio_d3d12.h" /* vio_d3d12_state / frame_count */
 #include "shaders/shaders_2d.h"
 
 static ID3D12PipelineState *vio_2d_d3d12_create_pso(
@@ -138,9 +138,13 @@ int vio_2d_d3d12_init(vio_2d_d3d12_state *state)
      * flicker when the vertex stream is mid-overwrite at present time.
      *
      * Allocate one slice per swapchain frame and pick the slice via
-     * vio_d3d12.frame_index in the per-frame upload (see vio_2d.c). */
+     * vio_d3d12.frame_index in the per-frame upload (see vio_2d.c).
+     *
+     * The slice count follows vio_d3d12.frame_count, which the game may raise to
+     * 3 — it must, or a third in-flight frame would index past the end of this
+     * buffer and read another frame's vertices. */
     state->vbo_slice_size = sizeof(vio_2d_vertex) * VIO_2D_MAX_VERTICES;
-    state->vbo_size = state->vbo_slice_size * VIO_D3D12_FRAME_COUNT;
+    state->vbo_size = state->vbo_slice_size * vio_d3d12.frame_count;
 
     D3D12_HEAP_PROPERTIES heap_props = {0};
     heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;

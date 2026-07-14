@@ -153,6 +153,11 @@ ZEND_FUNCTION(vio_create)
         if ((val = zend_hash_str_find(options_ht, "samples", sizeof("samples") - 1)) != NULL) {
             ctx->config.samples = (int)zval_get_long(val);
         }
+        /* Backbuffers / in-flight frames. Honoured by D3D12 (2 or 3, clamped there);
+         * ignored by the other backends. 0 or absent = backend default. */
+        if ((val = zend_hash_str_find(options_ht, "frame_count", sizeof("frame_count") - 1)) != NULL) {
+            ctx->config.frame_count = (int)zval_get_long(val);
+        }
         if ((val = zend_hash_str_find(options_ht, "debug", sizeof("debug") - 1)) != NULL) {
             ctx->config.debug = (int)zval_get_long(val);
         }
