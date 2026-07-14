@@ -67,7 +67,9 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-38 Tests, 37 bestehen, 1 skip (Vulkan wegen macOS SIP/DYLD_LIBRARY_PATH).
+88 Tests. Auf Windows (D3D11/D3D12): 84 bestehen, 4 skip. Skips sind
+plattform-/backend-bedingt (Vulkan auf macOS wegen SIP/DYLD_LIBRARY_PATH, WARP
+nicht verfügbar, o.ä.) — ein Skip ist kein Fehler, ein FAIL schon.
 
 ## Architektur
 
@@ -181,6 +183,51 @@ vio_poll_events($ctx);
 vio_close($ctx); vio_destroy($ctx);
 ```
 
+#### `vio_create()` Optionen
+
+| Key | Default | Wirkung |
+|-----|---------|---------|
+| `width` / `height` | — | Fenster- bzw. Framebuffer-Größe |
+| `title` | — | Fenstertitel |
+| `vsync` | php.ini `vio.vsync` | `false` = kein Sync-Interval. Siehe „Kein Frame-Cap" unten. |
+| `samples` | 0 | MSAA |
+| `debug` | 0 | Validation Layers / Debug Output |
+| `headless` | 0 | Offscreen, kein sichtbares Fenster |
+| `frame_count` | 2 (**nur D3D12**) | In-Flight-Frames, siehe unten |
+
+##### `frame_count` — Pipeline-Tiefe (D3D12)
+
+Wie viele Frames die CPU der GPU vorauslaufen darf. `begin_frame()` wartet auf
+`frames[frame_index].fence_value`, bevor es den Allocator dieses Slots resetten
+darf — die Zahl **ist** die Pipeline-Tiefe. Bei 2 blockiert die CPU auf dem
+Submit→Present→Fence-Roundtrip des übernächsten Frames; bei billiger Szene ist
+diese Latenz, nicht die GPU-Arbeit, der Frame-Zeit-Boden.
+
+```php
+$ctx = vio_create('d3d12', ['frame_count' => 3, ...]);   // 1490 -> 2402 fps @1920x1080
+```
+
+**Nicht blind auf 3 stellen.** Der Wert teilt auch die Per-Frame-Slices von
+SRV-, Constant- und Instance-Heap sowie den 2D-Vertex-Buffer: 2 → 3 verkleinert
+jede Slice von ½ auf ⅓ ihres Heaps. Eine Szene, die schon nah am Heap-Limit
+liegt, läuft dann über — still, und nur auf manchen Rechnern. Deshalb bleibt der
+Default bei 2; opt-in erst, wenn der eigene Headroom geprüft ist.
+
+Werte außerhalb `[2, 3]` werden geclamped (0/fehlend/negativ → Default). Andere
+Backends ignorieren die Option. Abgedeckt von `tests/071_d3d12_frame_count.phpt`.
+
+##### Kein Frame-Cap bei `vsync: false`
+
+vio ist mit `vsync: false` **nicht** auf die Bildwiederholrate gedeckelt — auf
+144 Hz gemessen: 3000–4500 fps, windowed wie borderless, D3D11 wie D3D12. Eine
+FLIP_DISCARD-Swapchain wird von DWM nicht gedrosselt; `Present(0,0)` blockiert
+nicht, DWM verwirft nur Frames, die es nicht anzeigt.
+
+`DXGI_ALLOW_TEARING` (seit v2.4.2 gesetzt) ändert daran **nichts** — es ist ein
+Korrektheits-Flag: ohne es greift **VRR (G-Sync/FreeSync) gar nicht**, und der
+Frame erreicht den Scanout erst am nächsten vblank. Wer künftig einen
+vermeintlichen Refresh-Cap meldet: erst messen, nicht zum Tearing-Flag greifen.
+
 ### Input
 ```php
 vio_key_pressed($ctx, VIO_KEY_W)        // bool
@@ -239,6 +286,19 @@ vio_stream_stop($stream);
 ```
 
 ### Headless / VRT
+
+> **D3D11-Readback ist seit v2.4.3 on-demand.** `end_frame()` spiegelt den
+> Backbuffer weiterhin jedes Frame (FLIP_DISCARD verwirft ihn beim Present, und
+> D3D11 kann — anders als D3D12 — den zuletzt präsentierten Buffer nicht mehr
+> adressieren), aber **GPU-lokal** (VRAM→VRAM). Die PCIe-Kopie in CPU-lesbaren
+> Speicher passiert erst in `vio_read_pixels()`.
+>
+> Vorher lief sie in *jedem* Frame — auch wenn nie jemand Pixel las. Auf einem
+> 3840×1080-Backbuffer waren das 16,6 MB/Frame über PCIe; echte Spielpanels
+> wurden dadurch um 23–57 % langsamer. Die Semantik ist unverändert:
+> `vio_read_pixels()` liefert weiterhin den Pre-Present-Frame. Aufrufer müssen
+> nichts umstellen.
+
 ```php
 $ctx = vio_create("auto", ["width" => 64, "height" => 64, "headless" => true]);
 $pixels = vio_read_pixels($ctx);           // RGBA string
@@ -373,6 +433,37 @@ nachgeliefert hat (aktuell nicht).
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`.
 - **Tests**: PHPT-Format, nummeriert (001–038), headless OpenGL für GPU-Tests.
 - **2D Farben**: ARGB als uint32 (0xAARRGGBB), z.B. `0xFF0000FF` = rot, alpha=FF.
+
+## Pläne & Roadmap
+
+Größere Umbauten werden vor der Umsetzung als `*-PLAN.md` im Wurzelverzeichnis
+festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
+
+- `OPENGL-REFACTOR-PLAN.md` — ✅ implementiert. OpenGL als echtes Backend hinter
+  der Vtable; erzwungen durch `tests/070_audit_gate_no_gl_outside_backend.php`
+  (kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`).
+- `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
+- `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
+- **`NATIVE-PLATFORM-PLAN.md` — 📋 Entwurf. GLFW-Ablöse.** GLFW von der
+  Pflicht-Dependency zu einer austauschbaren `vio_platform`-Vtable-Impl machen:
+  Phase 0 kapselt GLFW nach `src/platform/glfw/` (alle ~81 `glfw*`-Calls raus aus
+  `php_vio.c`) und führt einen Audit-Gate `073` ein (analog 070); die Phasen 1–3
+  ergänzen native Win32/Cocoa/X11-Layer hinter derselben Vtable. Präzedenzfall:
+  der iOS-Backend (`src/backends/ios/`) ist bereits die GLFW-agnostische
+  Window+Input-Hälfte. §9 des Plans: Verifikation via lokaler Multi-Plattform-
+  Matrix + CI-Parität.
+
+### Verifikation / CI
+
+- `.github/workflows/build.yml` — Tri-Platform Build+Test+Package (Linux
+  x86_64/arm64, macOS x86_64/arm64, Windows x64). Linux/macOS fahren die volle
+  Test-Suite; Linux headless via **Xvfb + Mesa-Software-GL** (`LIBGL_ALWAYS_SOFTWARE=1`).
+- `.github/workflows/ci-permutations.yml` — kompiliert + load-smoket
+  Dependency-Subsets (minimal / glfw-only / no-glfw-full / full) und beweist die
+  „kompiliert ohne jede Dependency"-Zusage von `config.m4`.
+- `docker/` — reproduziert den Linux-CI-Job lokal (`Dockerfile.linux` + `run.sh`);
+  `docker build -t php-vio-ci -f docker/Dockerfile.linux . && docker run --rm -v "$PWD":/src php-vio-ci`.
+  macOS/Windows sind nicht dockerbar → native Runner/Hosts (siehe `docker/README.md`).
 
 ## Herd-Integration
 
