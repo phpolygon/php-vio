@@ -1,3 +1,10 @@
+## [2.4.2](https://github.com/phpolygon/php-vio/compare/v2.4.1...v2.4.2) (2026-07-14)
+
+
+### Bug Fixes
+
+* **d3d:** honour the DXGI tearing contract on D3D11 and D3D12 ([751449f](https://github.com/phpolygon/php-vio/commit/751449fa48a667fe79d116d60b1e4d888d362d4f))
+
 ## [2.4.1](https://github.com/phpolygon/php-vio/compare/v2.4.0...v2.4.1) (2026-07-05)
 
 
