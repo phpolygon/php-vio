@@ -192,6 +192,28 @@ static int d3d11_init(vio_config *cfg)
         return -1;
     }
 
+    /* Probe DXGI_FEATURE_PRESENT_ALLOW_TEARING once. Requires IDXGIFactory5
+     * (Windows 10 1511+); on older DXGI the QI simply fails and we keep the
+     * vsync-throttled behaviour. Never assume the feature — a driver/OS without
+     * it will fail Present() outright if the flag is passed. */
+    {
+        IDXGIFactory5 *factory5 = NULL;
+        if (SUCCEEDED(IDXGIFactory2_QueryInterface(vio_d3d11.factory,
+                                                   &IID_IDXGIFactory5,
+                                                   (void **)&factory5))) {
+            BOOL allow_tearing = FALSE;
+            HRESULT thr = IDXGIFactory5_CheckFeatureSupport(
+                factory5,
+                DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                &allow_tearing,
+                sizeof(allow_tearing));
+            /* CheckFeatureSupport can succeed and still leave the out-param
+             * untouched on some drivers — require both. */
+            vio_d3d11.tearing_supported = (SUCCEEDED(thr) && allow_tearing) ? 1 : 0;
+            IDXGIFactory5_Release(factory5);
+        }
+    }
+
     /* Identity 4x4 matrix used as a dummy per-instance vertex buffer for
      * non-instanced draws. SPIRV-Cross'ed shaders reference vertex slot 1
      * for mat4 instance columns (locations 3..6); binding this buffer to
@@ -293,6 +315,16 @@ static void *d3d11_create_surface(vio_config *cfg)
     sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sc_desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
 
+    /* ALLOW_TEARING only when the factory reported support. Setting it blindly
+     * makes CreateSwapChainForHwnd fail with DXGI_ERROR_INVALID_CALL on systems
+     * that lack the feature. Cache the exact flag set: d3d11_resize() must pass
+     * the identical value to ResizeBuffers or the resize fails / the swapchain
+     * silently loses its tearing capability. */
+    vio_d3d11.swapchain_flags = vio_d3d11.tearing_supported
+        ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+        : 0u;
+    sc_desc.Flags = vio_d3d11.swapchain_flags;
+
     HRESULT hr = IDXGIFactory2_CreateSwapChainForHwnd(
         vio_d3d11.factory,
         (IUnknown *)vio_d3d11.device,
@@ -308,7 +340,14 @@ static void *d3d11_create_surface(vio_config *cfg)
         return NULL;
     }
 
-    /* Disable ALT+Enter fullscreen toggle */
+    /* Disable ALT+Enter fullscreen toggle. This is also a hard requirement for
+     * ALLOW_TEARING: DXGI's automatic alt-enter handler would call
+     * SetFullscreenState() behind our back, and a fullscreen-exclusive swapchain
+     * must never be presented with DXGI_PRESENT_ALLOW_TEARING (INVALID_CALL).
+     * With NO_ALT_ENTER set and no SetFullscreenState() call anywhere in this
+     * backend, the swapchain is windowed for its entire lifetime — vio's
+     * "fullscreen" (vio_set_fullscreen / vio_set_borderless in php_vio.c) is a
+     * GLFW window/monitor change, which DXGI still sees as windowed. */
     IDXGIFactory2_MakeWindowAssociation(vio_d3d11.factory, hwnd, DXGI_MWA_NO_ALT_ENTER);
 
     vio_d3d11.width = cfg->width;
@@ -350,11 +389,19 @@ static void d3d11_resize(int width, int height)
     ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 0, NULL, NULL);
     d3d11_release_views();
 
+    /* CRITICAL: the flag set passed here must be identical to the one the
+     * swapchain was created with (vio_d3d11.swapchain_flags). ResizeBuffers does
+     * not "keep" flags the way it keeps buffer count (0) and format (UNKNOWN) —
+     * it REPLACES them. Passing 0 here on a swapchain created with
+     * ALLOW_TEARING silently strips the tearing capability, and every subsequent
+     * Present() with DXGI_PRESENT_ALLOW_TEARING then fails with
+     * DXGI_ERROR_INVALID_CALL (frames stop reaching the screen after the first
+     * window resize / fullscreen toggle). */
     HRESULT hr = IDXGISwapChain1_ResizeBuffers(vio_d3d11.swapchain,
                                                 0,  /* keep buffer count */
                                                 width, height,
                                                 DXGI_FORMAT_UNKNOWN,  /* keep format */
-                                                0);
+                                                vio_d3d11.swapchain_flags);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D11: Failed to resize buffers (0x%08lx)", hr);
         return;
@@ -1180,7 +1227,37 @@ static void d3d11_present(void)
      * d3d12_present offscreen handling. */
     if (vio_d3d11.current_rtv != vio_d3d11.rtv) return;
 
-    IDXGISwapChain1_Present(vio_d3d11.swapchain, vio_d3d11.vsync ? 1 : 0, 0);
+    UINT sync_interval = vio_d3d11.vsync ? 1 : 0;
+
+    /* DXGI_PRESENT_ALLOW_TEARING is legal ONLY when all of these hold:
+     *   - the swapchain was created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+     *   - SyncInterval == 0 (with a non-zero interval DXGI fails the Present
+     *     with DXGI_ERROR_INVALID_CALL — this is an API violation, not a hint),
+     *   - the swapchain is windowed (guaranteed here: NO_ALT_ENTER is set and
+     *     this backend never calls SetFullscreenState).
+     * The flag is what lets VRR engage and hands the frame to scan-out without
+     * waiting for a vblank boundary. It does NOT raise throughput — SyncInterval=0
+     * already presents uncapped without it (measured). */
+    UINT present_flags = 0;
+    if (sync_interval == 0 &&
+        (vio_d3d11.swapchain_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
+        present_flags = DXGI_PRESENT_ALLOW_TEARING;
+    }
+
+    HRESULT hr = IDXGISwapChain1_Present(vio_d3d11.swapchain, sync_interval, present_flags);
+
+    /* DXGI_STATUS_OCCLUDED is a success code (window hidden/minimised) — not an
+     * error, the frame is simply dropped. Only genuine failures are reported,
+     * and only once, so a device-removed loop cannot spam the PHP error log. */
+    if (FAILED(hr) && !vio_d3d11.present_failed_once) {
+        vio_d3d11.present_failed_once = 1;
+        HRESULT removed = vio_d3d11.device
+            ? ID3D11Device_GetDeviceRemovedReason(vio_d3d11.device)
+            : S_OK;
+        php_error_docref(NULL, E_WARNING,
+            "D3D11: Present failed (0x%08lx) sync=%u flags=0x%08lx device_removed=0x%08lx",
+            hr, sync_interval, (unsigned long)present_flags, removed);
+    }
 }
 
 static void d3d11_clear(float r, float g, float b, float a)

@@ -653,6 +653,28 @@ static int d3d12_init(vio_config *cfg)
         goto init_fail;
     }
 
+    /* Probe DXGI_FEATURE_PRESENT_ALLOW_TEARING once. Requires IDXGIFactory5
+     * (Windows 10 1511+); on older DXGI the QI simply fails and we keep the
+     * vsync-throttled behaviour. Never assume the feature — a driver/OS without
+     * it will fail Present() outright if the flag is passed. */
+    {
+        IDXGIFactory5 *factory5 = NULL;
+        if (SUCCEEDED(IDXGIFactory4_QueryInterface(vio_d3d12.factory,
+                                                   &IID_IDXGIFactory5,
+                                                   (void **)&factory5))) {
+            BOOL allow_tearing = FALSE;
+            HRESULT thr = IDXGIFactory5_CheckFeatureSupport(
+                factory5,
+                DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                &allow_tearing,
+                sizeof(allow_tearing));
+            /* CheckFeatureSupport can succeed and still leave the out-param
+             * untouched on some drivers — require both. */
+            vio_d3d12.tearing_supported = (SUCCEEDED(thr) && allow_tearing) ? 1 : 0;
+            IDXGIFactory5_Release(factory5);
+        }
+    }
+
     /* Select adapter (WARP for headless, hardware otherwise) */
     IDXGIAdapter1 *adapter = NULL;
     if (cfg->headless) {
@@ -1044,6 +1066,16 @@ static void *d3d12_create_surface(vio_config *cfg)
     sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sc_desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
 
+    /* ALLOW_TEARING only when the factory reported support. Setting it blindly makes
+     * CreateSwapChainForHwnd fail with DXGI_ERROR_INVALID_CALL on systems that lack
+     * the feature. Cache the exact flag set: d3d12_resize() must pass the identical
+     * value to ResizeBuffers or the swapchain silently loses its tearing capability
+     * and every later Present with DXGI_PRESENT_ALLOW_TEARING fails. */
+    vio_d3d12.swapchain_flags = vio_d3d12.tearing_supported
+        ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+        : 0u;
+    sc_desc.Flags = vio_d3d12.swapchain_flags;
+
     IDXGISwapChain1 *swapchain1 = NULL;
     HRESULT hr = IDXGIFactory4_CreateSwapChainForHwnd(
         vio_d3d12.factory,
@@ -1163,10 +1195,18 @@ static void d3d12_resize(int width, int height)
         vio_d3d12.depth_buffer = NULL;
     }
 
+    /* CRITICAL: the flag set passed here must be identical to the one the swapchain
+     * was created with (vio_d3d12.swapchain_flags). ResizeBuffers does NOT preserve
+     * flags the way this call preserves BufferCount and Format — it REPLACES them.
+     * Passing 0 on a swapchain created with ALLOW_TEARING silently strips the
+     * tearing capability, and every subsequent Present() with
+     * DXGI_PRESENT_ALLOW_TEARING then fails with DXGI_ERROR_INVALID_CALL — i.e.
+     * frames stop reaching the screen after the first window resize. */
     HRESULT hr = IDXGISwapChain3_ResizeBuffers(vio_d3d12.swapchain,
                                                 VIO_D3D12_FRAME_COUNT,
                                                 width, height,
-                                                DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+                                                DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                vio_d3d12.swapchain_flags);
     if (FAILED(hr)) {
         HRESULT removed = ID3D12Device_GetDeviceRemovedReason(vio_d3d12.device);
         php_error_docref(NULL, E_WARNING,
@@ -2301,7 +2341,24 @@ static void d3d12_present(void)
         return;
     }
 
-    HRESULT hr = IDXGISwapChain3_Present(vio_d3d12.swapchain, vio_d3d12.vsync ? 1 : 0, 0);
+    UINT sync_interval = vio_d3d12.vsync ? 1 : 0;
+
+    /* DXGI_PRESENT_ALLOW_TEARING is legal ONLY when all of these hold:
+     *   - the swapchain was created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+     *   - SyncInterval == 0 (with a non-zero interval DXGI fails the Present with
+     *     DXGI_ERROR_INVALID_CALL — an API violation, not a hint),
+     *   - the swapchain is windowed (guaranteed here: NO_ALT_ENTER is set above and
+     *     this backend never calls SetFullscreenState).
+     * The flag is what lets VRR engage and hands the frame to scan-out without
+     * waiting for a vblank boundary. It does NOT raise throughput — SyncInterval=0
+     * already presents uncapped without it (measured). */
+    UINT present_flags = 0;
+    if (sync_interval == 0 &&
+        (vio_d3d12.swapchain_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
+        present_flags = DXGI_PRESENT_ALLOW_TEARING;
+    }
+
+    HRESULT hr = IDXGISwapChain3_Present(vio_d3d12.swapchain, sync_interval, present_flags);
     if (FAILED(hr)) {
         /* Log reason + DRED breadcrumbs/page-fault ONCE, then latch device_lost
          * so we stop presenting (no per-frame spam). */

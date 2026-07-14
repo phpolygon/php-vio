@@ -11,7 +11,18 @@
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
+/* dxgi1_5.h: IDXGIFactory5 + DXGI_FEATURE_PRESENT_ALLOW_TEARING, needed to
+ * query variable-refresh / uncapped-present support. Ships in every Windows 10
+ * SDK that also has d3d12.h, which config.w32 already requires. */
+#include <dxgi1_5.h>
 #include <d3dcompiler.h>
+
+/* Present flag is a #define in dxgi.h; guard for very old SDKs. The swapchain
+ * flag (DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING = 2048) is an enum member and comes
+ * from the same header generation as dxgi1_5.h, so it needs no fallback. */
+#ifndef DXGI_PRESENT_ALLOW_TEARING
+#define DXGI_PRESENT_ALLOW_TEARING 0x00000200UL
+#endif
 
 /* Compiled shader pair (vertex + pixel) */
 typedef struct _vio_d3d11_shader {
@@ -113,6 +124,31 @@ typedef struct _vio_d3d11_state {
     /* DXGI */
     IDXGISwapChain1        *swapchain;
     IDXGIFactory2          *factory;
+
+    /* Tearing support (DXGI flag contract + VRR).
+     *
+     * NOT a throughput fix. Measured on a 144Hz display: without these flags a
+     * windowed FLIP_DISCARD swapchain at SyncInterval=0 already presents at
+     * thousands of fps. DWM does not block Present(0,0) — it simply drops frames
+     * it never shows. Do not re-add a comment claiming otherwise.
+     *
+     * What the flags do buy:
+     *   - VRR (G-Sync / FreeSync) does not engage on a flip-model swapchain
+     *     without DXGI_PRESENT_ALLOW_TEARING; the display stays at a fixed rate.
+     *   - Scan-out latency: a tear-allowed present hands the frame to the display
+     *     immediately rather than at the next vblank boundary.
+     *
+     * Both halves are required and must agree:
+     *   - DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING at creation AND on every
+     *     ResizeBuffers (the flag set must match, or the resize strips it), and
+     *   - DXGI_PRESENT_ALLOW_TEARING in the Present() flags argument.
+     *
+     * tearing_supported is the IDXGIFactory5 CheckFeatureSupport result, cached
+     * once at init. swapchain_flags is the exact flag set the swapchain was
+     * created with — ResizeBuffers MUST be given this same value. */
+    int   tearing_supported;   /* DXGI_FEATURE_PRESENT_ALLOW_TEARING */
+    UINT  swapchain_flags;     /* DXGI_SWAP_CHAIN_FLAG_* used at creation */
+    int   present_failed_once; /* rate-limits the Present() failure warning */
 
     /* Render targets */
     ID3D11RenderTargetView *rtv;

@@ -20,6 +20,7 @@ cscript /nologo /e:jscript configure.js ^
   "--with-spirv-cross=C:\php-sdk\vio-build-deps" ^
   "--with-vulkan=C:\php-sdk\vio-build-deps" ^
   "--with-ffmpeg=C:\php-sdk\vio-build-deps" ^
+  "--with-harfbuzz=C:\vcpkg\installed\x64-windows" ^
   "--with-d3d11=yes" ^
   "--with-d3d12=yes"
 if errorlevel 1 ( echo CONFIGURE FAILED & exit /b 1 )

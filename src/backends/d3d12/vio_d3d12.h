@@ -11,7 +11,18 @@
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
+/* dxgi1_5.h: IDXGIFactory5 + DXGI_FEATURE_PRESENT_ALLOW_TEARING, needed to query
+ * variable-refresh / uncapped-present support. Ships in every Windows 10 SDK that
+ * also has d3d12.h, which config.w32 already requires. Mirrors the D3D11 backend. */
+#include <dxgi1_5.h>
 #include <d3dcompiler.h>
+
+/* Present flag is a #define in dxgi.h; guard for very old SDKs. The swapchain flag
+ * (DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING = 2048) is an enum member from the same
+ * header generation as dxgi1_5.h, so it needs no fallback. */
+#ifndef DXGI_PRESENT_ALLOW_TEARING
+#define DXGI_PRESENT_ALLOW_TEARING 0x00000200UL
+#endif
 
 #define VIO_D3D12_FRAME_COUNT 2
 #define VIO_D3D12_MAX_SRV_DESCRIPTORS 32768
@@ -136,6 +147,30 @@ typedef struct _vio_d3d12_state {
     IDXGISwapChain3           *swapchain;
     IDXGIFactory4             *factory;
     UINT                       frame_index;
+
+    /* Tearing support (DXGI flag contract + VRR). Same as the D3D11 backend.
+     *
+     * NOT a throughput fix. Measured on a 144Hz display: without these flags a
+     * windowed FLIP_DISCARD swapchain at SyncInterval=0 already presents at
+     * thousands of fps. DWM does not block Present(0,0) — it drops frames it never
+     * shows. Do not re-add a comment claiming otherwise.
+     *
+     * What the flags buy: VRR (G-Sync / FreeSync) does not engage on a flip-model
+     * swapchain without DXGI_PRESENT_ALLOW_TEARING, and a tear-allowed present
+     * reaches scan-out without waiting for a vblank boundary.
+     *
+     * Both halves are required and must agree:
+     *   - DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING at creation AND on every ResizeBuffers
+     *     (ResizeBuffers REPLACES the flag set — it does not keep it like it keeps
+     *     BufferCount/Format), and
+     *   - DXGI_PRESENT_ALLOW_TEARING in the Present() flags argument, only ever
+     *     with SyncInterval == 0.
+     *
+     * tearing_supported is the IDXGIFactory5 CheckFeatureSupport result, cached once
+     * at init. swapchain_flags is the exact flag set the swapchain was created with —
+     * ResizeBuffers MUST be given this same value. */
+    int                        tearing_supported;  /* DXGI_FEATURE_PRESENT_ALLOW_TEARING */
+    UINT                       swapchain_flags;    /* DXGI_SWAP_CHAIN_FLAG_* used at creation */
 
     /* Selected-adapter info, captured once at init from DXGI_ADAPTER_DESC1 of
      * the adapter we actually created the device on. Read back by vio_gpu_info().
