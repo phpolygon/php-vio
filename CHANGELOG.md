@@ -1,3 +1,11 @@
+## [2.7.1](https://github.com/phpolygon/php-vio/compare/v2.7.0...v2.7.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* **opengl:** guard font-atlas deletion against a dead GL context ([701d189](https://github.com/phpolygon/php-vio/commit/701d189dbf4d54f7b00281a7403f6d9913836dab))
+* **text:** free per-glyph atlas strings (ZVAL_PTR_DTOR on the shape-atlas hash) ([6d764ac](https://github.com/phpolygon/php-vio/commit/6d764ac76044aaaab6545bb735078817c1eac6ef))
+
 # [2.7.0](https://github.com/phpolygon/php-vio/compare/v2.6.1...v2.7.0) (2026-07-16)
 
 
