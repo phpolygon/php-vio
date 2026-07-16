@@ -98,7 +98,12 @@ int vio_text_shape_init_font(vio_font_object *font)
 
     vio_shape_atlas *a = (vio_shape_atlas *)ecalloc(1, sizeof(vio_shape_atlas));
     a->line_height = (float)(v_asc - v_desc + v_gap) * scale;
-    zend_hash_init(&a->glyphs, num_glyphs < 4096 ? num_glyphs : 4096, NULL, NULL, 0);
+    /* ZVAL_PTR_DTOR so zend_hash_destroy() in vio_text_shape_free_font() frees
+     * each per-glyph slot zend_string. With a NULL destructor those strings —
+     * one per glyph, ~65k for a CJK face — leak every time a font is freed,
+     * which accumulates whenever the GL context is recreated (VRT frame capture,
+     * graphics/display-mode changes). */
+    zend_hash_init(&a->glyphs, num_glyphs < 4096 ? num_glyphs : 4096, NULL, ZVAL_PTR_DTOR, 0);
 
     /* Rasterize every glyph the font has, keyed by glyph index — this is the
      * one layout that can hold HarfBuzz output (ligatures, positional forms)
