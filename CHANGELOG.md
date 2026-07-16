@@ -1,3 +1,10 @@
+## [2.6.1](https://github.com/phpolygon/php-vio/compare/v2.6.0...v2.6.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* **vulkan:** compile the VMA wrapper as C++17 (Linux aligned_alloc) ([55538d5](https://github.com/phpolygon/php-vio/commit/55538d5734fe216cacfd68208e240aabc21b3353))
+
 # [2.6.0](https://github.com/phpolygon/php-vio/compare/v2.5.0...v2.6.0) (2026-07-16)
 
 
