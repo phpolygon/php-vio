@@ -630,32 +630,53 @@ int vio_metal_read_pixels(int width, int height, unsigned char *out_rgba)
             [last_presented_cmd_buf waitUntilCompleted];
         }
 
-        id<MTLTexture> drawableTexture = last_presented_texture;
-        if (!drawableTexture) return -1;
+        id<MTLTexture> srcTexture = last_presented_texture;
+        if (!srcTexture) return -1;
 
-        int tw = (int)drawableTexture.width;
-        int th = (int)drawableTexture.height;
+        int tw = (int)srcTexture.width;
+        int th = (int)srcTexture.height;
         int use_w = (width < tw) ? width : tw;
         int use_h = (height < th) ? height : th;
+        if (use_w <= 0 || use_h <= 0) return -1;
 
-        /* Read BGRA from drawable texture */
-        unsigned char *bgra = emalloc(use_w * use_h * 4);
-        MTLRegion region = MTLRegionMake2D(0, 0, use_w, use_h);
-        [drawableTexture getBytes:bgra bytesPerRow:use_w * 4
-                      fromRegion:region mipmapLevel:0];
+        /* getBytes is invalid on MTLStorageModePrivate textures (the swapchain
+         * drawable and the headless offscreen texture are both Private), which
+         * returned garbage/uniform data and crashed the offscreen path. Blit the
+         * source into a Shared buffer first — the portable readback path across
+         * Apple Silicon and Intel — then copy out. */
+        NSUInteger bytesPerRow = (NSUInteger)use_w * 4;
+        NSUInteger bufLen = bytesPerRow * (NSUInteger)use_h;
+        id<MTLBuffer> staging = [vio_mtl.device newBufferWithLength:bufLen
+                                                            options:MTLResourceStorageModeShared];
+        if (!staging) return -1;
+
+        id<MTLCommandBuffer> cb = [vio_mtl.command_queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromTexture:srcTexture
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(use_w, use_h, 1)
+                     toBuffer:staging
+            destinationOffset:0
+       destinationBytesPerRow:bytesPerRow
+     destinationBytesPerImage:bufLen];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        const unsigned char *bgra = (const unsigned char *)[staging contents];
+        if (!bgra) return -1;
 
         /* Convert BGRA -> RGBA */
         for (int i = 0; i < use_w * use_h; i++) {
             int off = i * 4;
-            unsigned char b = bgra[off + 0];
-            unsigned char r = bgra[off + 2];
-            out_rgba[off + 0] = r;
+            out_rgba[off + 0] = bgra[off + 2]; /* R */
             out_rgba[off + 1] = bgra[off + 1]; /* G */
-            out_rgba[off + 2] = b;
+            out_rgba[off + 2] = bgra[off + 0]; /* B */
             out_rgba[off + 3] = bgra[off + 3]; /* A */
         }
 
-        efree(bgra);
         return 0;
     }
 }
