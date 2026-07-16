@@ -619,10 +619,19 @@ static void opengl_destroy_cubemap(void *cm_ptr)
 static void opengl_destroy_font_atlas(void *font_ptr)
 {
     vio_font_object *font = (vio_font_object *)font_ptr;
-    if (font->atlas_texture && glDeleteTextures) {
+    /* A VioFont (PHP object) can outlive the GL context it uploaded its atlas
+     * into: PHP frees fonts during GC, which for a create/destroy-per-frame
+     * consumer (e.g. VRT capture) runs AFTER vio_destroy has torn the context
+     * down. Destroying the context already freed every texture it owned, so
+     * calling glDeleteTextures now would either run with no current context
+     * (crash) or against a later context whose texture-id space has been reused
+     * (silent corruption) — the accumulating fault behind "Premature end of PHP
+     * process" after ~40 render cycles. Only touch the GL object while its
+     * context is live; otherwise just clear the stale id. */
+    if (font->atlas_texture && vio_gl.initialized && glDeleteTextures) {
         glDeleteTextures(1, &font->atlas_texture);
-        font->atlas_texture = 0;
     }
+    font->atlas_texture = 0;
 }
 
 static void opengl_destroy_render_target(void *rt_ptr)
