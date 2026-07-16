@@ -1,3 +1,15 @@
+# [2.6.0](https://github.com/phpolygon/php-vio/compare/v2.5.0...v2.6.0) (2026-07-16)
+
+
+### Bug Fixes
+
+* **metal:** correct headless pixel readback via blit to shared buffer ([8857006](https://github.com/phpolygon/php-vio/commit/885700670cbd2ccbe510042119ceae115523a11b))
+
+
+### Features
+
+* **window:** extend OpenGL context ladder down to GL 3.0 ([b8d39c5](https://github.com/phpolygon/php-vio/commit/b8d39c5220cc6d381a63b2dfdc991f8e85b2f1cf))
+
 # [2.5.0](https://github.com/phpolygon/php-vio/compare/v2.4.3...v2.5.0) (2026-07-14)
 
 
