@@ -437,12 +437,12 @@ if test "$PHP_VIO" != "no"; then
   if test "$VIO_HAS_VULKAN" = "yes"; then
     if test "$ext_shared" != "shared" && test "$ext_shared" != "yes"; then
       PHP_ADD_SOURCES_X($ext_dir, [src/backends/vulkan/vio_vma_wrapper.cpp],
-        -std=c++14 -DVMA_STATIC_VULKAN_FUNCTIONS=0 $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED,
+        -std=c++17 -DVMA_STATIC_VULKAN_FUNCTIONS=0 $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED,
         PHP_GLOBAL_OBJS)
     fi
     if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
       PHP_ADD_SOURCES_X($ext_dir, [src/backends/vulkan/vio_vma_wrapper.cpp],
-        -std=c++14 -DVMA_STATIC_VULKAN_FUNCTIONS=0 $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
+        -std=c++17 -DVMA_STATIC_VULKAN_FUNCTIONS=0 $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
         shared_objects_vio, yes)
     fi
   fi
