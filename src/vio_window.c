@@ -167,11 +167,19 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
     GLFWwindow *window = NULL;
 
     if (is_opengl) {
-        /* OpenGL context ladder: try newest → oldest core profile until one
-         * succeeds. Floor is GL 3.3 (Sandy Bridge / HD 3000 / Mesa cap).
-         * Apple caps at 4.1 so we skip the higher rungs there. */
+        /* OpenGL context ladder: try newest → oldest until one succeeds.
+         * Floor is GL 3.0 (Sandy Bridge / older Intel iGPUs / Mesa reporting
+         * 3.0–3.1). A core profile is requested from 3.2 up (the first version
+         * with the `core` keyword); 3.0/3.1 predate the core/compatibility split
+         * so no profile hint is set there.
+         *
+         * NOTE: obtaining a < 3.3 context only guarantees the 2D pipeline. For
+         * vio-3D on such a context the SPIRV-Cross GLSL output version
+         * (vio_spirv_to_glsl) must also be lowered to match; until then the 3D
+         * shaders assume >= 3.3. Apple caps at 4.1 so we skip the higher rungs
+         * there. */
         static const int gl_ladder_desktop[][2] = {
-            {4, 6}, {4, 5}, {4, 3}, {4, 1}, {3, 3}
+            {4, 6}, {4, 5}, {4, 3}, {4, 1}, {3, 3}, {3, 2}, {3, 1}, {3, 0}
         };
 #ifdef __APPLE__
         static const int gl_ladder_apple[][2] = { {4, 1}, {3, 3} };
@@ -205,10 +213,13 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
             glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
             glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, ladder[i][0]);
             glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, ladder[i][1]);
-            glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+            /* Core profile only from GL 3.2 (first version with the keyword). */
+            if (ladder[i][0] * 10 + ladder[i][1] >= 32) {
+                glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 #ifdef __APPLE__
-            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+                glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
 #endif
+            }
             window = glfwCreateWindow(width, height, title, NULL, NULL);
         }
 
@@ -216,7 +227,7 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
 
         if (!window) {
             php_error_docref(NULL, E_WARNING,
-                "Failed to create GLFW window: no OpenGL context >= 3.3 Core available");
+                "Failed to create GLFW window: no OpenGL context >= 3.0 available");
             return NULL;
         }
     } else {
