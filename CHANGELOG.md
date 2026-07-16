@@ -1,3 +1,10 @@
+# [2.7.0](https://github.com/phpolygon/php-vio/compare/v2.6.1...v2.7.0) (2026-07-16)
+
+
+### Features
+
+* **text:** add vio_font_has_glyph for reliable fallback coverage ([7fe20aa](https://github.com/phpolygon/php-vio/commit/7fe20aa8310ea448cb00edb877ae0d5d29d1a33d))
+
 ## [2.6.1](https://github.com/phpolygon/php-vio/compare/v2.6.0...v2.6.1) (2026-07-16)
 
 
