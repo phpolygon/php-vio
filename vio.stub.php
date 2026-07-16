@@ -376,6 +376,16 @@ function vio_rounded_rect(VioContext $context, float $x, float $y, float $width,
 function vio_text_measure(VioFont $font, string $text, ?array $options = null): array|false {}
 
 /**
+ * True if $font carries a real glyph for the given Unicode $codepoint.
+ *
+ * Reliable coverage detection for font-fallback routing. Unlike advance width
+ * (a font's .notdef box can measure non-zero on some FreeType builds), this
+ * reports actual glyph presence via the HarfBuzz nominal-glyph lookup, so a
+ * fallback chain never lets the primary font claim an uncovered codepoint.
+ */
+function vio_font_has_glyph(VioFont $font, int $codepoint): bool {}
+
+/**
  * Push a 2D affine transform matrix onto the stack.
  * Matrix layout: | a b e |  (a,b,c,d = 2x2 rotation/scale, e,f = translation)
  *                | c d f |

@@ -166,6 +166,17 @@ int vio_text_shape_available(const vio_font_object *font)
     return font->hb_font != NULL && font->shape_atlas != NULL;
 }
 
+int vio_text_shape_has_glyph(const vio_font_object *font, uint32_t codepoint)
+{
+    if (font == NULL || font->hb_font == NULL) {
+        return 0;
+    }
+    hb_codepoint_t glyph = 0;
+    /* Returns true iff the face maps this codepoint to a real (non-.notdef)
+     * glyph — advance width is deliberately not consulted. */
+    return hb_font_get_nominal_glyph((hb_font_t *)font->hb_font, codepoint, &glyph) ? 1 : 0;
+}
+
 /* Look up a glyph slot (always present after build; NULL only if the id somehow
  * exceeds numGlyphs). */
 static const vio_glyph_slot *shape_atlas_glyph(vio_shape_atlas *a, unsigned int gid)

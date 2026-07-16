@@ -4775,6 +4775,36 @@ ZEND_FUNCTION(vio_text_measure)
     add_assoc_double(return_value, "height", (double)height);
 }
 
+/* True iff `font` carries a real glyph for the given Unicode codepoint.
+ * Reliable coverage detection for fallback-chain routing: unlike advance width
+ * (a font's .notdef box can measure non-zero), this reports actual glyph
+ * presence, so callers never let a primary font claim an uncovered codepoint. */
+ZEND_FUNCTION(vio_font_has_glyph)
+{
+    zval *font_zval;
+    zend_long codepoint;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(font_zval, vio_font_ce)
+        Z_PARAM_LONG(codepoint)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_font_object *font = Z_VIO_FONT_P(font_zval);
+    if (!font->valid) {
+        RETURN_FALSE;
+    }
+
+#ifdef HAVE_HARFBUZZ
+    if (vio_text_shape_available(font)) {
+        RETURN_BOOL(vio_text_shape_has_glyph(font, (uint32_t)codepoint));
+    }
+#endif
+
+    /* Legacy stb path: glyph_map holds exactly the codepoints packed into the
+     * atlas, so presence there is coverage. */
+    RETURN_BOOL(zend_hash_index_find(&font->glyph_map, (zend_long)codepoint) != NULL);
+}
+
 /* ── Transform stack ─────────────────────────────────────────────── */
 
 ZEND_FUNCTION(vio_push_transform)

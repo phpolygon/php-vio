@@ -51,6 +51,13 @@ void vio_text_shape_free_font(vio_font_object *font);
 /* True if `font` has a live shaping/atlas state (init succeeded). */
 int  vio_text_shape_available(const vio_font_object *font);
 
+/* True if `font` actually carries a glyph for Unicode `codepoint` (HarfBuzz
+ * nominal-glyph lookup). This is real coverage detection: it must NOT be
+ * approximated by advance width, because a font's .notdef box has a positive
+ * advance on some FreeType builds, which makes width-based coverage claim
+ * uncovered codepoints for the primary font. */
+int  vio_text_shape_has_glyph(const vio_font_object *font, uint32_t codepoint);
+
 /* Shape `text` (UTF-8, `len` bytes) and push glyph quads into ctx->state_2d.
  * Origin (x, y) is in logical units, y is the baseline of the FIRST line.
  * Hard breaks ('\n') always start a new line; when max_width > 0 the text also
