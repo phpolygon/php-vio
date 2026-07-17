@@ -247,7 +247,18 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
         [content_view setLayerContentsRedrawPolicy:NSViewLayerContentsRedrawNever];
 
         int fb_w, fb_h;
-        glfwGetFramebufferSize(win, &fb_w, &fb_h);
+        if (cfg->headless) {
+            /* Headless renders into an offscreen texture that vio_read_pixels
+             * returns at the logical config size. On a Retina display the
+             * window's framebuffer is 2x (e.g. 2560x1440 for a 1280x720
+             * request), which would size the offscreen texture at 2x and make
+             * readback return only the top-left (logical-sized) quadrant. There
+             * is no display to match offscreen, so size it 1:1 with the request
+             * using the logical window size. */
+            glfwGetWindowSize(win, &fb_w, &fb_h);
+        } else {
+            glfwGetFramebufferSize(win, &fb_w, &fb_h);
+        }
 
         if (vio_metal_setup_context_native((__bridge void *)layer, fb_w, fb_h, cfg) != 0) {
             return -1;
@@ -255,8 +266,14 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
 
         /* Remember the GLFW window for pull-based resize polling in
          * metal_begin_frame. iOS / headless setups skip this and push
-         * resizes through vio_metal_handle_resize() instead. */
-        vio_mtl.glfw_window = win;
+         * resizes through vio_metal_handle_resize() instead.
+         *
+         * Headless renders to a fixed-size offscreen texture (sized 1:1 with the
+         * logical request above). Polling the window each frame would read the
+         * Retina framebuffer size and resize the offscreen back to 2x, so leave
+         * glfw_window NULL for headless — matching the "headless leaves this
+         * NULL" contract documented on the struct field. */
+        vio_mtl.glfw_window = cfg->headless ? NULL : win;
     }
 
     return 0;
