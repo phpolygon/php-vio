@@ -1,3 +1,10 @@
+## [2.7.3](https://github.com/phpolygon/php-vio/compare/v2.7.2...v2.7.3) (2026-07-17)
+
+
+### Bug Fixes
+
+* **metal:** headless viewport/scissor scale 1:1 (match logical offscreen) ([1d09b18](https://github.com/phpolygon/php-vio/commit/1d09b18948ec0b3368e98b27b3944e750fb6365b))
+
 ## [2.7.2](https://github.com/phpolygon/php-vio/compare/v2.7.1...v2.7.2) (2026-07-17)
 
 
