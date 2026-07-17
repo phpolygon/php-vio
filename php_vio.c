@@ -494,8 +494,19 @@ ZEND_FUNCTION(vio_begin)
         int have_size = 0;
 #ifdef HAVE_GLFW
         if (ctx->window) {
-            glfwGetFramebufferSize((GLFWwindow *)ctx->window, &fb_w, &fb_h);
-            glfwGetWindowContentScale((GLFWwindow *)ctx->window, &sx, &sy);
+            if (ctx->config.headless) {
+                /* Headless renders into a 1:1 offscreen texture (sized from the
+                 * logical window size, see vio_metal_setup_context). Use that
+                 * same logical size here so state_2d.width == fb_width and the
+                 * viewport/scissor scale stays 1 — otherwise the Retina
+                 * framebuffer (2x) would scale scissors to 2x screen positions
+                 * against a 1x target, clipping content at double coordinates. */
+                glfwGetWindowSize((GLFWwindow *)ctx->window, &fb_w, &fb_h);
+                sx = sy = 1.0f;
+            } else {
+                glfwGetFramebufferSize((GLFWwindow *)ctx->window, &fb_w, &fb_h);
+                glfwGetWindowContentScale((GLFWwindow *)ctx->window, &sx, &sy);
+            }
             have_size = 1;
         }
 #endif
