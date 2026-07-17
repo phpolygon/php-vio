@@ -238,6 +238,14 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
         }
     }
 
+    /* Never let a fullscreen window auto-minimize when it loses focus (e.g. the
+     * user presses Print Screen / opens the Windows snipping tool, or alt-tabs).
+     * GLFW iconifies an exclusive-fullscreen window on focus loss by default,
+     * which dropped players to the desktop and made screenshots impossible — they
+     * only worked in windowed/borderless. Set on the created window so it holds
+     * across every fullscreen entry (glfwSetWindowMonitor in vio_set_fullscreen). */
+    glfwSetWindowAttrib(window, GLFW_AUTO_ICONIFY, GLFW_FALSE);
+
 #ifdef _WIN32
     /* Place window on the monitor under the mouse cursor (multi-monitor UX) */
     vio_place_window_on_cursor_monitor(window);

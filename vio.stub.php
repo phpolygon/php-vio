@@ -202,6 +202,16 @@ function vio_set_windowed(VioContext $context): void {}
 function vio_set_fullscreen(VioContext $context, int $monitor = -1, int $width = 0, int $height = 0, int $refresh = 0): void {}
 
 /**
+ * Whether the window auto-minimizes when a fullscreen window loses focus.
+ *
+ * vio forces this OFF at window creation so pressing Print Screen, opening the
+ * snipping tool or alt-tabbing no longer drops fullscreen players to the
+ * desktop (screenshots previously only worked in windowed/borderless). Returns
+ * the GLFW default (true) when there is no window (null backend).
+ */
+function vio_get_auto_iconify(VioContext $context): bool {}
+
+/**
  * Get the window size in screen coordinates.
  *
  * @return array{0: int, 1: int}

@@ -1367,6 +1367,28 @@ ZEND_FUNCTION(vio_set_fullscreen)
 #endif
 }
 
+/* Report whether the window auto-minimizes when a fullscreen window loses focus.
+ * vio forces this OFF at window creation so Print Screen / the snipping tool /
+ * alt-tab no longer drops fullscreen players to the desktop; exposed so that
+ * behaviour is testable without a visible window and a real focus change. */
+ZEND_FUNCTION(vio_get_auto_iconify)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+#ifdef HAVE_GLFW
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (ctx->window) {
+        RETURN_BOOL(glfwGetWindowAttrib(ctx->window, GLFW_AUTO_ICONIFY) != 0);
+    }
+#endif
+    /* No GLFW window (null backend): report GLFW's default of "on". */
+    RETURN_TRUE;
+}
+
 ZEND_FUNCTION(vio_window_size)
 {
     zval *ctx_zval;
