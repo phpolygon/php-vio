@@ -1,3 +1,10 @@
+## [2.7.2](https://github.com/phpolygon/php-vio/compare/v2.7.1...v2.7.2) (2026-07-17)
+
+
+### Bug Fixes
+
+* **metal:** headless offscreen readback at 1:1 (no Retina 2x quadrant) ([0dd5ec2](https://github.com/phpolygon/php-vio/commit/0dd5ec2b21bdca4096ab27d24f1af933048d001a))
+
 ## [2.7.1](https://github.com/phpolygon/php-vio/compare/v2.7.0...v2.7.1) (2026-07-16)
 
 
