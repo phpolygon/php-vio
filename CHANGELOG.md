@@ -1,3 +1,10 @@
+## [2.7.4](https://github.com/phpolygon/php-vio/compare/v2.7.3...v2.7.4) (2026-07-17)
+
+
+### Bug Fixes
+
+* **window:** keep fullscreen windows from auto-minimizing on focus loss ([9b25227](https://github.com/phpolygon/php-vio/commit/9b25227c6215372ee5376a8b6dda452d4f01bd0a))
+
 ## [2.7.3](https://github.com/phpolygon/php-vio/compare/v2.7.2...v2.7.3) (2026-07-17)
 
 
