@@ -3072,6 +3072,11 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_SWIZZLE: return 1; /* VkComponentMapping */
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* Vulkan 2D path (shapes/sprites/text) */
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* VK_IMAGE_TYPE_3D */
+        /* Path B is a graphics-stage feature, but vio's Vulkan backend has no
+         * functional 3D graphics pipeline (vulkan_create_pipeline returns NULL,
+         * vulkan_draw* are stubs — 3D goes through the standalone php-vulkan
+         * backend, not vio). So there is no vertex stage to read the SSBO. */
+        case VIO_FEATURE_VERTEX_STORAGE: return 0;
         default: return 0;
     }
 }

@@ -1699,6 +1699,13 @@ static int metal_supports_feature(vio_feature f)
          * out (see comment above metal_create_pipeline). Flip to 1 once the
          * Metal 3D path is wired so vio_get_auto_backend can prefer Metal. */
         return 0;
+    case VIO_FEATURE_VERTEX_STORAGE:
+        /* Path B (vertex-stage SSBO for readback-free instancing) needs a 3D
+         * graphics pipeline, which vio-Metal does not have yet (see
+         * VIO_FEATURE_3D_PIPELINE). Report 0 so the engine stays on the
+         * readback path; wire the vtable's bind_storage_buffer /
+         * draw_instanced_from_storage together with the Metal 3D pipeline. */
+        return 0;
     case VIO_FEATURE_NATIVE_2D_BATCH:
         /* Metal ships its own 2D-batch renderer (vio_metal_2d_*). */
         return 1;

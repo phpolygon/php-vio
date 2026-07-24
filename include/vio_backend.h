@@ -255,6 +255,28 @@ typedef struct _vio_backend {
      * failure / unsupported. */
     size_t (*read_buffer)(void *backend_buffer, void *out, size_t size);
 
+    /* Graphics-stage storage buffers (optional; gated on VIO_FEATURE_VERTEX_STORAGE).
+     * Bind a compute-written storage buffer to the GRAPHICS pipeline so the
+     * VERTEX stage can read it (per-instance model matrices indexed by
+     * gl_InstanceIndex), eliminating the GPU->CPU readback. Both slots are NULL
+     * on backends without the primitive; the PHP layer gates on
+     * supports_feature(VIO_FEATURE_VERTEX_STORAGE) && slot != NULL. */
+
+    /* Bind backend_buffer (from create_buffer(VIO_BUFFER_STORAGE)) to the
+     * graphics pipeline at storage-buffer binding `binding`, readable from the
+     * vertex stage. access is VIO_COMPUTE_READ (read-only). element_count /
+     * stride describe the structured view (NumElements / StructureByteStride)
+     * so the D3D backends can build a matching SRV; OpenGL ignores them.
+     * Call between bind_pipeline and draw_instanced_from_storage. */
+    void  (*bind_storage_buffer)(void *backend_buffer, int binding, int access,
+                                 int element_count, int stride);
+
+    /* Instanced draw whose per-instance data comes from a previously bound
+     * storage buffer (bind_storage_buffer), NOT a per-instance vertex buffer.
+     * Draws instance_count instances of mesh_obj; the vertex shader indexes the
+     * bound buffer via gl_InstanceIndex. */
+    void  (*draw_instanced_from_storage)(void *mesh_obj, int instance_count);
+
     /* Query */
     int   (*supports_feature)(vio_feature feature);
 } vio_backend;

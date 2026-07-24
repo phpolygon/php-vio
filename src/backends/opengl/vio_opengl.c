@@ -937,6 +937,45 @@ static void opengl_draw_mesh_instanced(void *mesh_obj,
     glDeleteBuffers(1, &instance_vbo);
 }
 
+/* ── Graphics-stage storage buffers (Path B: readback-free instancing) ──── */
+
+/* Bind a storage buffer (SSBO) to the graphics pipeline so the vertex shader
+ * can read it via gl_InstanceIndex. binding is the GLSL `layout(std430,
+ * binding=N)` point. access/element_count/stride are unused on GL — an SSBO is
+ * bound whole and the shader's std430 layout defines interpretation. The
+ * binding persists until re-bound, so it survives across the following draw. */
+static void opengl_bind_storage_buffer(void *backend_buffer, int binding, int access,
+                                       int element_count, int stride)
+{
+    (void)access; (void)element_count; (void)stride;
+    if (!vio_gl.initialized || !backend_buffer) return;
+    vio_opengl_compute_buffer *buf = (vio_opengl_compute_buffer *)backend_buffer;
+    /* Make prior compute writes to this SSBO visible to the vertex-stage read
+     * that the following draw issues (compute -> graphics RAW hazard). */
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, buf->ssbo);
+}
+
+/* Instanced draw with per-instance data pulled from the bound SSBO (no instance
+ * VBO, no divisor attributes). The vertex shader indexes the buffer via
+ * gl_InstanceIndex. Mirrors opengl_draw_mesh_instanced minus the instance
+ * attribute wiring. */
+static void opengl_draw_instanced_from_storage(void *mesh_obj, int instance_count)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
+    if (!vio_gl.initialized || instance_count <= 0) return;
+
+    glBindVertexArray(mesh->vao);
+    if (mesh->index_count > 0) {
+        glDrawElementsInstanced(GL_TRIANGLES, mesh->index_count,
+                                GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
+    } else {
+        glDrawArraysInstanced(GL_TRIANGLES, 0, mesh->vertex_count,
+                              (GLsizei)instance_count);
+    }
+    glBindVertexArray(0);
+}
+
 static int opengl_upload_texture_2d(void *tex_obj,
                                     const void *pixels, int width, int height, int channels,
                                     int filter, int wrap, int mipmaps)
@@ -1210,6 +1249,10 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_STORAGE:return vio_gl.caps.has_texture_storage;
         case VIO_FEATURE_SEPARATE_SHADERS: return vio_gl.caps.has_separate_shaders;
         case VIO_FEATURE_TEXTURE_3D:     return 1;  /* glTexImage3D core since GL 1.2 */
+        /* SSBO read from the vertex stage needs GL 4.3 (SSBOs are core 4.3);
+         * has_compute_shader tracks exactly that tier. GL < 4.3 -> 0, callers
+         * stay on the readback path. */
+        case VIO_FEATURE_VERTEX_STORAGE: return vio_gl.caps.has_compute_shader;
         default:                         return 0;
     }
 }
@@ -1245,6 +1288,8 @@ static const vio_backend opengl_backend = {
     .compute_bind_buffer      = opengl_compute_bind_buffer,
     .compute_set_uniforms     = opengl_compute_set_uniforms,
     .read_buffer              = opengl_read_buffer,
+    .bind_storage_buffer          = opengl_bind_storage_buffer,
+    .draw_instanced_from_storage  = opengl_draw_instanced_from_storage,
     .supports_feature  = opengl_supports_feature,
     .set_viewport      = opengl_set_viewport,
     .set_uniform       = opengl_set_uniform,
