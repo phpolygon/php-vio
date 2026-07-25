@@ -2439,6 +2439,21 @@ ZEND_FUNCTION(vio_shader_reflect)
             }
             add_assoc_zval(&vert_arr, "uniforms", &uni_arr);
 
+            /* Storage buffers (SSBO / StructuredBuffer). Exposed so the engine
+             * can validate a vertex-stage SSBO binding for readback-free
+             * instancing (VIO_FEATURE_VERTEX_STORAGE). */
+            zval ssbo_arr;
+            array_init(&ssbo_arr);
+            for (int i = 0; i < result.storage_buffer_count; i++) {
+                zval item;
+                array_init(&item);
+                add_assoc_string(&item, "name", (char *)result.storage_buffers[i].name);
+                add_assoc_long(&item, "set", result.storage_buffers[i].set);
+                add_assoc_long(&item, "binding", result.storage_buffers[i].binding);
+                add_next_index_zval(&ssbo_arr, &item);
+            }
+            add_assoc_zval(&vert_arr, "storage_buffers", &ssbo_arr);
+
             add_assoc_zval(return_value, "vertex", &vert_arr);
             vio_reflect_free(&result);
         } else {
@@ -2506,6 +2521,19 @@ ZEND_FUNCTION(vio_shader_reflect)
                 add_next_index_zval(&uni_arr, &item);
             }
             add_assoc_zval(&frag_arr, "uniforms", &uni_arr);
+
+            /* Storage buffers (SSBO / StructuredBuffer) — same as vertex stage. */
+            zval ssbo_arr;
+            array_init(&ssbo_arr);
+            for (int i = 0; i < result.storage_buffer_count; i++) {
+                zval item;
+                array_init(&item);
+                add_assoc_string(&item, "name", (char *)result.storage_buffers[i].name);
+                add_assoc_long(&item, "set", result.storage_buffers[i].set);
+                add_assoc_long(&item, "binding", result.storage_buffers[i].binding);
+                add_next_index_zval(&ssbo_arr, &item);
+            }
+            add_assoc_zval(&frag_arr, "storage_buffers", &ssbo_arr);
 
             add_assoc_zval(return_value, "fragment", &frag_arr);
             vio_reflect_free(&result);
@@ -3498,6 +3526,86 @@ ZEND_FUNCTION(vio_storage_buffer_read)
     ZSTR_LEN(out) = n;
     ZSTR_VAL(out)[n] = '\0';
     RETURN_STR(out);
+}
+
+/* ── Graphics-stage storage buffers (Path B: readback-free instancing) ────
+ *
+ * Bind a compute-written storage buffer to the GRAPHICS pipeline so a vertex
+ * shader reads per-instance data via gl_InstanceIndex — no GPU->CPU readback.
+ * Both functions feature-gate on supports_feature(VIO_FEATURE_VERTEX_STORAGE)
+ * plus the specific vtable hook; when unsupported they emit an E_NOTICE and
+ * return void so the PHP layer silently falls back to the readback path. */
+
+static int vio_vertex_storage_supported(vio_context_object *ctx)
+{
+    if (!ctx || !ctx->initialized || !ctx->backend) return 0;
+    if (!ctx->backend->supports_feature) return 0;
+    return ctx->backend->supports_feature(VIO_FEATURE_VERTEX_STORAGE) ? 1 : 0;
+}
+
+ZEND_FUNCTION(vio_bind_storage_buffer)
+{
+    zval *ctx_zval;
+    zval *buf_zval;
+    zend_long binding;
+    zend_long access;
+
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_buffer_ce)
+        Z_PARAM_LONG(binding)
+        Z_PARAM_LONG(access)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_vertex_storage_supported(ctx) || !ctx->backend->bind_storage_buffer) {
+        php_error_docref(NULL, E_NOTICE, "vio_bind_storage_buffer: vertex storage not supported on this backend");
+        return;
+    }
+
+    vio_buffer_object *buf = Z_VIO_BUFFER_P(buf_zval);
+    if (!buf->valid || !buf->backend_buffer) {
+        php_error_docref(NULL, E_WARNING, "vio_bind_storage_buffer: invalid buffer");
+        return;
+    }
+
+    /* Structured-view element count = size / stride (stride 0 => raw 4-byte
+     * elements). Mirrors vio_compute_bind_buffer so the D3D SRV matches. */
+    int elem_stride = buf->stride > 0 ? buf->stride : 4;
+    int element_count = (int)(buf->size / (size_t)elem_stride);
+
+    ctx->backend->bind_storage_buffer(buf->backend_buffer, (int)binding, (int)access,
+                                      element_count, elem_stride);
+}
+
+ZEND_FUNCTION(vio_draw_instanced_from_buffer)
+{
+    zval *ctx_zval;
+    zval *mesh_zval;
+    zend_long instance_count;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(mesh_zval, vio_mesh_ce)
+        Z_PARAM_LONG(instance_count)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_mesh_object *mesh = Z_VIO_MESH_P(mesh_zval);
+
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_draw_instanced_from_buffer between vio_begin and vio_end");
+        return;
+    }
+    if (instance_count <= 0) {
+        return;
+    }
+    if (!vio_vertex_storage_supported(ctx) || !ctx->backend->draw_instanced_from_storage) {
+        php_error_docref(NULL, E_NOTICE, "vio_draw_instanced_from_buffer: vertex storage not supported on this backend");
+        return;
+    }
+
+    ctx->backend->draw_instanced_from_storage(mesh, (int)instance_count);
 }
 
 /* Lazily build a per-shader name -> packed (stage|offset|size) map, then do an
@@ -6194,6 +6302,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_STORAGE", VIO_FEATURE_TEXTURE_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SEPARATE_SHADERS", VIO_FEATURE_SEPARATE_SHADERS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_3D", VIO_FEATURE_TEXTURE_3D, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_STORAGE", VIO_FEATURE_VERTEX_STORAGE, CONST_CS | CONST_PERSISTENT);
 
     /* Actions */
     REGISTER_LONG_CONSTANT("VIO_RELEASE", VIO_RELEASE, CONST_CS | CONST_PERSISTENT);

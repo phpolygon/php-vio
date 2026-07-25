@@ -399,6 +399,32 @@ jobs:
             --with-prefix=${{ steps.php-sdk.outputs.prefix }}
           nmake
 
+      # Run the Path B vertex-storage tests on the native Windows backends
+      # (D3D11/D3D12 via WARP). Only the NTS variant: shivammathur/setup-php
+      # provides an NTS php on PATH, which matches the NTS DLL's ABI. The
+      # extension links glfw3 / harfbuzz(+freetype,brotli,...) / ffmpeg /
+      # vulkan-1, so their runtime DLLs must be discoverable before php can
+      # load php_vio.dll — assemble them onto PATH, smoke-load, then test.
+      - name: Run vertex-storage tests (D3D via WARP)
+        if: matrix.ts == 'nts'
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Recurse -Filter php_vio.dll | Select-Object -First 1
+          if (-not $dll) { throw "php_vio.dll not found after build" }
+          $dllDir = $dll.Directory.FullName
+          $vkBin = if ($env:VULKAN_SDK) { "$env:VULKAN_SDK\Bin" } else { "" }
+          $env:PATH = "$PWD\deps\bin;$PWD\deps\lib;$vkBin;$env:PATH"
+          # Smoke: the extension loads with the full runtime DLL chain present.
+          php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r 'exit((int)!extension_loaded("vio"));'
+          if ($LASTEXITCODE -ne 0) { throw "vio failed to load (runtime DLL chain incomplete)" }
+          $env:NO_INTERACTION = "1"
+          $env:REPORT_EXIT_STATUS = "1"
+          $env:TEST_PHP_ARGS = "-n -d extension_dir=$dllDir -d extension=php_vio.dll"
+          php -n run-tests.php -q --show-diff `
+            tests/086_vertex_storage.phpt `
+            tests/087_vertex_storage_render.phpt `
+            tests/088_vertex_storage_render_native.phpt
+
       - name: Package binary
         shell: pwsh
         run: |

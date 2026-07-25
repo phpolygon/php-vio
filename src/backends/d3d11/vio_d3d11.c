@@ -856,6 +856,7 @@ static void d3d11_destroy_texture(void *texture_ptr)
 #include "../../vio_cubemap.h"
 #include "../../vio_font.h"
 #include "../../vio_render_target.h"
+#include "../../vio_mesh.h"  /* vio_mesh_object — draw_instanced_from_storage reads mesh->backend_vb/stride/index_count */
 
 static void d3d11_destroy_cubemap(void *cm_ptr)
 {
@@ -1261,6 +1262,103 @@ static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
                                              instance_count,
                                              cmd->first_index,
                                              cmd->vertex_offset, 0);
+}
+
+/* ── Graphics-stage storage buffers (Path B: readback-free instancing) ──── */
+
+/* SRV for the currently bound vertex-stage storage buffer + the register it
+ * was bound to, so draw_instanced_from_storage can leave it bound and the next
+ * bind (or teardown) can release it. Immediate context; single binding at a
+ * time is enough for the instance-matrix use case. */
+static ID3D11ShaderResourceView *s_vs_storage_srv = NULL;
+static int s_vs_storage_slot = -1;
+
+static void d3d11_release_vs_storage_srv(void)
+{
+    if (s_vs_storage_srv) {
+        /* Unbind first so the runtime drops its reference to the SRV. */
+        ID3D11ShaderResourceView *nullsrv = NULL;
+        if (s_vs_storage_slot >= 0) {
+            ID3D11DeviceContext_VSSetShaderResources(vio_d3d11.context,
+                (UINT)s_vs_storage_slot, 1, &nullsrv);
+        }
+        ID3D11ShaderResourceView_Release(s_vs_storage_srv);
+        s_vs_storage_srv = NULL;
+        s_vs_storage_slot = -1;
+    }
+}
+
+/* Bind a storage buffer to the vertex stage as an SRV at register t{binding}.
+ * SPIRV-Cross maps a `layout(std430, binding=N) readonly buffer` in the VS to
+ * an HLSL ByteAddressBuffer/StructuredBuffer at register(tN) — a RAW view when
+ * the buffer stride is <= 4 (the flat-float compute output), otherwise a
+ * structured view. VS and PS t-registers are independent, so this never clashes
+ * with pixel-stage material textures. */
+static void d3d11_bind_storage_buffer(void *backend_buffer, int binding, int access,
+                                      int element_count, int stride)
+{
+    (void)access;
+    if (!vio_d3d11.initialized || !backend_buffer) return;
+    vio_d3d11_buffer *buf = (vio_d3d11_buffer *)backend_buffer;
+    if (!buf->buffer) return;
+
+    d3d11_release_vs_storage_srv();
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = {0};
+    int raw = (stride <= 4);
+    if (raw) {
+        sd.Format = DXGI_FORMAT_R32_TYPELESS;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+        sd.BufferEx.FirstElement = 0;
+        sd.BufferEx.NumElements = (UINT)(buf->size / 4);
+        sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+    } else {
+        sd.Format = DXGI_FORMAT_UNKNOWN;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        sd.Buffer.FirstElement = 0;
+        sd.Buffer.NumElements = (UINT)element_count;
+    }
+
+    ID3D11ShaderResourceView *srv = NULL;
+    HRESULT hr = ID3D11Device_CreateShaderResourceView(vio_d3d11.device,
+        (ID3D11Resource *)buf->buffer, &sd, &srv);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D11: vertex storage SRV create failed (0x%08lx)", hr);
+        return;
+    }
+
+    ID3D11DeviceContext_VSSetShaderResources(vio_d3d11.context, (UINT)binding, 1, &srv);
+    s_vs_storage_srv = srv;
+    s_vs_storage_slot = binding;
+}
+
+/* Instanced draw whose per-instance data comes from the bound storage buffer
+ * (SV_InstanceID -> gl_InstanceIndex). Binds only the mesh vertex buffer; the
+ * from-storage VS declares no location 3..6 instance attributes, so slot 1 is
+ * unused (the shared identity buffer bound by d3d11_bind_vertex_slots is
+ * harmless). Cbuffer flushing is done by the caller (vio_draw_instanced_from_buffer). */
+static void d3d11_draw_instanced_from_storage(void *mesh_obj, int instance_count)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
+    if (!vio_d3d11.initialized || !mesh || instance_count <= 0) return;
+
+    vio_d3d11_buffer *vb = (vio_d3d11_buffer *)mesh->backend_vb;
+    if (!vb) return;
+    d3d11_bind_vertex_slots(vb->buffer, (UINT)mesh->stride);
+
+    if (mesh->index_count > 0 && mesh->backend_ib) {
+        vio_d3d11_buffer *ib = (vio_d3d11_buffer *)mesh->backend_ib;
+        ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
+                                             DXGI_FORMAT_R32_UINT, 0);
+        ID3D11DeviceContext_DrawIndexedInstanced(vio_d3d11.context,
+            (UINT)mesh->index_count, (UINT)instance_count, 0, 0, 0);
+    } else {
+        ID3D11DeviceContext_DrawInstanced(vio_d3d11.context,
+            (UINT)mesh->vertex_count, (UINT)instance_count, 0, 0);
+    }
+
+    /* Release the SRV now that the draw is recorded (immediate context). */
+    d3d11_release_vs_storage_srv();
 }
 
 static void d3d11_present(void)
@@ -1741,6 +1839,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_SWIZZLE: return 0; /* needs CPU expansion */
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* vio_2d_d3d11_* */
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* ID3D11Texture3D */
+        case VIO_FEATURE_VERTEX_STORAGE: return 1; /* SM5 reads SRV/StructuredBuffer in the VS */
         default:                       return 0;
     }
 }
@@ -1906,6 +2005,8 @@ static const vio_backend d3d11_backend = {
     .compute_bind_buffer      = d3d11_compute_bind_buffer,
     .compute_set_uniforms     = d3d11_compute_set_uniforms,
     .read_buffer              = d3d11_read_buffer,
+    .bind_storage_buffer          = d3d11_bind_storage_buffer,
+    .draw_instanced_from_storage  = d3d11_draw_instanced_from_storage,
     .supports_feature  = d3d11_supports_feature,
     .destroy_cubemap   = d3d11_destroy_cubemap,
     .destroy_font_atlas = d3d11_destroy_font_atlas,

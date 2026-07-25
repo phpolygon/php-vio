@@ -550,6 +550,24 @@ function vio_compute_dispatch(VioContext $context, VioComputePipeline $pipeline,
 function vio_storage_buffer_read(VioContext $context, VioBuffer $buffer): string|false {}
 
 /**
+ * Bind a compute-written storage buffer to the GRAPHICS pipeline so the vertex
+ * stage can read it (per-instance model matrices via gl_InstanceIndex) — no
+ * GPU->CPU readback. Call between vio_bind_pipeline and
+ * vio_draw_instanced_from_buffer. $access is VIO_COMPUTE_READ (read-only).
+ * No-op (E_NOTICE) when the backend lacks VIO_FEATURE_VERTEX_STORAGE.
+ */
+function vio_bind_storage_buffer(VioContext $context, VioBuffer $buffer, int $binding, int $access): void {}
+
+/**
+ * Instanced draw whose per-instance data comes from a storage buffer bound via
+ * vio_bind_storage_buffer, not a per-instance CPU buffer. The vertex shader
+ * indexes the bound buffer via gl_InstanceIndex. Eliminates the readback that
+ * vio_draw_instanced(...) + vio_storage_buffer_read(...) would otherwise need.
+ * No-op (E_NOTICE) when the backend lacks VIO_FEATURE_VERTEX_STORAGE.
+ */
+function vio_draw_instanced_from_buffer(VioContext $context, VioMesh $mesh, int $instanceCount): void {}
+
+/**
  * Set a uniform value on the currently bound pipeline shader.
  * Supports int, float, vec2/3/4 (flat array), mat3 (9 floats), mat4 (16 floats).
  * Silently ignores uniforms not found in the shader.

@@ -169,6 +169,15 @@ typedef enum _vio_feature {
      * returns false there (graceful — the engine stays on the analytic trace
      * path). */
     VIO_FEATURE_TEXTURE_3D         = 22,
+    /* A storage buffer (SSBO / StructuredBuffer SRV) can be bound to the
+     * GRAPHICS pipeline and read from the VERTEX stage — the primitive that
+     * lets a vertex shader pull per-instance data via gl_InstanceIndex from a
+     * compute-written buffer, with no GPU->CPU readback. Requires the vertex
+     * stage to support storage-buffer reads: core everywhere on D3D11 (SM5
+     * SRV-in-VS), D3D12, Vulkan and Metal; on OpenGL only from 4.3 (SSBOs are
+     * core 4.3), so GL < 4.3 reports 0 and callers stay on the readback path.
+     * Value 30 (leaves 23-29 free for unrelated features). */
+    VIO_FEATURE_VERTEX_STORAGE     = 30,
 } vio_feature;
 
 /* ── Input actions ────────────────────────────────────────────────── */

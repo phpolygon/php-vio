@@ -397,8 +397,15 @@ static int d3d12_create_root_signature(void)
      *
      * VS and PS each have their own cbuffer at b0 (different data, same register).
      * Separate root params with per-stage visibility allow independent binding.
+     *
+     *   [3] SRV (t0) — VERTEX visibility: a storage buffer the vertex shader
+     *       reads per-instance (Path B, VIO_FEATURE_VERTEX_STORAGE). Overlaps
+     *       the PS SRV table at t0 but with different (VERTEX vs PIXEL)
+     *       visibility, which D3D12 permits. A root SRV (raw/structured buffer)
+     *       set via SetGraphicsRootShaderResourceView; unused by shaders that
+     *       don't declare the SSBO, so normal draws leave it unset.
      */
-    D3D12_ROOT_PARAMETER params[3] = {0};
+    D3D12_ROOT_PARAMETER params[4] = {0};
 
     /* [0] CBV b0 — vertex shader only */
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -427,6 +434,12 @@ static int d3d12_create_root_signature(void)
     params[2].DescriptorTable.NumDescriptorRanges = 1;
     params[2].DescriptorTable.pDescriptorRanges = &srv_range;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    /* [3] Root SRV t0 — vertex-stage storage buffer (Path B). */
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[3].Descriptor.ShaderRegister = 0;
+    params[3].Descriptor.RegisterSpace = 0;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
     /* Static samplers: s0-s7 = regular, s8-s11 = comparison.
      * SPIRV-Cross assigns shadow samplers to s8+ and regular to s0+ (see
@@ -461,7 +474,7 @@ static int d3d12_create_root_signature(void)
     }
 
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-    rs_desc.NumParameters = 3; /* VS CBV, PS CBV, SRV table */
+    rs_desc.NumParameters = 4; /* VS CBV, PS CBV, PS SRV table, VS storage SRV */
     rs_desc.pParameters = params;
     rs_desc.NumStaticSamplers = 12;
     rs_desc.pStaticSamplers = static_samplers;
@@ -1852,6 +1865,7 @@ static void d3d12_destroy_texture(void *texture_ptr)
 #include "../../vio_cubemap.h"
 #include "../../vio_font.h"
 #include "../../vio_render_target.h"
+#include "../../vio_mesh.h"  /* vio_mesh_object — draw_instanced_from_storage reads mesh->backend_vb/stride/index_count */
 
 static void d3d12_destroy_cubemap(void *cm_ptr)
 {
@@ -3156,7 +3170,61 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_SWIZZLE: return 0; /* needs CPU expansion */
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* vio_2d_d3d12_* */
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* TEXTURE3D resource + SRV */
+        case VIO_FEATURE_VERTEX_STORAGE: return 1; /* VS-visible root SRV in the shared root signature */
         default:                       return 0;
+    }
+}
+
+/* ── Graphics-stage storage buffers (Path B: readback-free instancing) ──── */
+
+/* Bind a storage buffer to the vertex stage as root SRV param [3] (register t0,
+ * VERTEX visibility). No explicit resource barrier: the compute UAV output lives
+ * in / decays to COMMON after its (fenced, transient-list) dispatch, and a D3D12
+ * buffer in COMMON is implicitly promoted to a shader-resource state on the
+ * vertex-stage read — so the root SRV set here is sufficient. */
+static void d3d12_bind_storage_buffer(void *backend_buffer, int binding, int access,
+                                      int element_count, int stride)
+{
+    (void)binding; (void)access; (void)element_count; (void)stride;
+    if (!vio_d3d12.initialized || !vio_d3d12.cmd_list || !backend_buffer) return;
+    vio_d3d12_buffer *buf = (vio_d3d12_buffer *)backend_buffer;
+    if (!buf->resource || !buf->gpu_address) return;
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(vio_d3d12.cmd_list, 3, buf->gpu_address);
+}
+
+/* Instanced draw pulling per-instance data from the bound storage buffer
+ * (SV_InstanceID -> gl_InstanceIndex). Binds only the mesh vertex buffer (slot
+ * 0) plus the shared identity buffer (slot 1, harmless — the from-storage VS
+ * declares no location 3..6 attributes). Cbuffer flushing is the caller's job. */
+static void d3d12_draw_instanced_from_storage(void *mesh_obj, int instance_count)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
+    if (!vio_d3d12.initialized || !vio_d3d12.cmd_list || !mesh || instance_count <= 0) return;
+
+    vio_d3d12_buffer *vb = (vio_d3d12_buffer *)mesh->backend_vb;
+    if (!vb) return;
+
+    D3D12_VERTEX_BUFFER_VIEW vbvs[2];
+    vbvs[0].BufferLocation = vb->gpu_address;
+    vbvs[0].SizeInBytes = (UINT)vb->size;
+    vbvs[0].StrideInBytes = (UINT)mesh->stride;
+    vbvs[1].BufferLocation = vio_d3d12.identity_instance_gpu;
+    vbvs[1].SizeInBytes = 64;
+    vbvs[1].StrideInBytes = 64;
+    ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 2, vbvs);
+
+    if (mesh->index_count > 0 && mesh->backend_ib) {
+        vio_d3d12_buffer *ib = (vio_d3d12_buffer *)mesh->backend_ib;
+        D3D12_INDEX_BUFFER_VIEW ibv = {0};
+        ibv.BufferLocation = ib->gpu_address;
+        ibv.SizeInBytes = (UINT)ib->size;
+        ibv.Format = DXGI_FORMAT_R32_UINT;
+        ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
+        ID3D12GraphicsCommandList_DrawIndexedInstanced(vio_d3d12.cmd_list,
+            (UINT)mesh->index_count, (UINT)instance_count, 0, 0, 0);
+    } else {
+        ID3D12GraphicsCommandList_DrawInstanced(vio_d3d12.cmd_list,
+            (UINT)mesh->vertex_count, (UINT)instance_count, 0, 0);
     }
 }
 
@@ -3384,6 +3452,8 @@ static const vio_backend d3d12_backend = {
     .compute_bind_buffer      = d3d12_compute_bind_buffer,
     .compute_set_uniforms     = d3d12_compute_set_uniforms,
     .read_buffer              = d3d12_read_buffer,
+    .bind_storage_buffer          = d3d12_bind_storage_buffer,
+    .draw_instanced_from_storage  = d3d12_draw_instanced_from_storage,
     .supports_feature  = d3d12_supports_feature,
     .destroy_cubemap   = d3d12_destroy_cubemap,
     .destroy_font_atlas = d3d12_destroy_font_atlas,
