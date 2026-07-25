@@ -1,3 +1,10 @@
+# [2.8.0](https://github.com/phpolygon/php-vio/compare/v2.7.4...v2.8.0) (2026-07-25)
+
+
+### Features
+
+* **compute:** vertex-stage storage buffers for readback-free instancing ([80d89c2](https://github.com/phpolygon/php-vio/commit/80d89c29e169a5f4f2c32186ac6d86ff1ee2459b))
+
 ## [2.7.4](https://github.com/phpolygon/php-vio/compare/v2.7.3...v2.7.4) (2026-07-17)
 
 
