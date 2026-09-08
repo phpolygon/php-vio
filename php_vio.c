@@ -2848,8 +2848,27 @@ ZEND_FUNCTION(vio_texture)
     unsigned char *pixels = NULL;
     int w = 0, h = 0, channels = 0;
     int from_stbi = 0;
+    int zero_filled = 0;
 
-    if (file_zval && Z_TYPE_P(file_zval) == IS_STRING) {
+    /* 'storage' => true: the texture doubles as a compute storage image
+     * (image2D). Such textures are typically written by a kernel first, so
+     * 'data' may be omitted — the backend then starts from zeroed pixels. */
+    zval *storage_zval = zend_hash_str_find(config_ht, "storage", sizeof("storage") - 1);
+    int storage = (storage_zval && zend_is_true(storage_zval)) ? 1 : 0;
+    if (storage && !(file_zval && Z_TYPE_P(file_zval) == IS_STRING) &&
+        !(data_zval && Z_TYPE_P(data_zval) == IS_STRING) && width_zval && height_zval) {
+        w = (int)zval_get_long(width_zval);
+        h = (int)zval_get_long(height_zval);
+        if (w <= 0 || h <= 0) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_texture: width/height must be positive (got %dx%d)", w, h);
+            zval_ptr_dtor(&tex_zval);
+            RETURN_FALSE;
+        }
+        pixels = (unsigned char *)ecalloc((size_t)w * (size_t)h, 4);
+        channels = 4;
+        zero_filled = 1;
+    } else if (file_zval && Z_TYPE_P(file_zval) == IS_STRING) {
         /* Load from file using stb_image */
         pixels = stbi_load(Z_STRVAL_P(file_zval), &w, &h, &channels, 4);
         if (!pixels) {
@@ -2898,6 +2917,7 @@ ZEND_FUNCTION(vio_texture)
     tex->width    = w;
     tex->height   = h;
     tex->channels = channels;
+    tex->storage  = storage;
 
     zval *mipmap_zval = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1);
     int mipmaps = (mipmap_zval && zend_is_true(mipmap_zval)) ? 1 : 0;
@@ -2916,6 +2936,7 @@ ZEND_FUNCTION(vio_texture)
         desc.filter = tex->filter;
         desc.wrap = tex->wrap;
         desc.mipmaps = mipmaps;
+        desc.storage = storage;
         tex->backend_texture = ctx->backend->create_texture(&desc);
     }
 
@@ -2929,6 +2950,8 @@ ZEND_FUNCTION(vio_texture)
 
     if (from_stbi) {
         stbi_image_free(pixels);
+    } else if (zero_filled) {
+        efree(pixels);
     }
 
     tex->valid = 1;
@@ -2977,9 +3000,13 @@ ZEND_FUNCTION(vio_texture_3d)
     zval *height_zval = zend_hash_str_find(config_ht, "height", sizeof("height") - 1);
     zval *depth_zval  = zend_hash_str_find(config_ht, "depth", sizeof("depth") - 1);
 
-    if (!data_zval || Z_TYPE_P(data_zval) != IS_STRING || !width_zval || !height_zval || !depth_zval) {
+    zval *storage3_zval = zend_hash_str_find(config_ht, "storage", sizeof("storage") - 1);
+    int storage = (storage3_zval && zend_is_true(storage3_zval)) ? 1 : 0;
+    int has_data = data_zval && Z_TYPE_P(data_zval) == IS_STRING;
+
+    if ((!has_data && !storage) || !width_zval || !height_zval || !depth_zval) {
         php_error_docref(NULL, E_WARNING,
-            "vio_texture_3d requires 'data'+'width'+'height'+'depth'");
+            "vio_texture_3d requires 'data'+'width'+'height'+'depth' ('data' optional with 'storage' => true)");
         RETURN_FALSE;
     }
 
@@ -2993,7 +3020,7 @@ ZEND_FUNCTION(vio_texture_3d)
     }
 
     size_t need = (size_t)w * (size_t)h * (size_t)d * 4u;
-    if (Z_STRLEN_P(data_zval) < need) {
+    if (has_data && Z_STRLEN_P(data_zval) < need) {
         php_error_docref(NULL, E_WARNING,
             "vio_texture_3d: data is %zu bytes but %dx%dx%d RGBA needs %zu",
             Z_STRLEN_P(data_zval), w, h, d, need);
@@ -3020,8 +3047,11 @@ ZEND_FUNCTION(vio_texture_3d)
     tex->depth    = d;
     tex->is_3d    = 1;
     tex->channels = 4;
+    tex->storage  = storage;
 
-    const unsigned char *pixels = (const unsigned char *)Z_STRVAL_P(data_zval);
+    /* Storage volumes without 'data' start zeroed (a kernel fills them). */
+    unsigned char *zero3 = has_data ? NULL : (unsigned char *)ecalloc((size_t)w * (size_t)h * (size_t)d, 4);
+    const unsigned char *pixels = has_data ? (const unsigned char *)Z_STRVAL_P(data_zval) : zero3;
 
     if (ctx->backend->upload_texture_3d) {
         /* OpenGL: writes a GL_TEXTURE_3D into tex->texture_id. */
@@ -3029,6 +3059,7 @@ ZEND_FUNCTION(vio_texture_3d)
             tex, pixels, w, h, d, 4, (int)tex->filter, (int)tex->wrap);
         if (rc != 0) {
             php_error_docref(NULL, E_WARNING, "vio_texture_3d: backend upload failed");
+            if (zero3) efree(zero3);
             zval_ptr_dtor(&tex_zval);
             RETURN_FALSE;
         }
@@ -3042,17 +3073,21 @@ ZEND_FUNCTION(vio_texture_3d)
         desc.depth     = d;
         desc.filter    = tex->filter;
         desc.wrap      = tex->wrap;
+        desc.storage   = storage;
         tex->backend_texture = ctx->backend->create_texture_3d(&desc);
         if (!tex->backend_texture) {
             php_error_docref(NULL, E_WARNING, "vio_texture_3d: backend create failed");
+            if (zero3) efree(zero3);
             zval_ptr_dtor(&tex_zval);
             RETURN_FALSE;
         }
     }
     else {
+        if (zero3) efree(zero3);
         zval_ptr_dtor(&tex_zval);
         RETURN_FALSE;
     }
+    if (zero3) efree(zero3);
 
     tex->valid = 1;
     RETURN_COPY_VALUE(&tex_zval);
@@ -3554,6 +3589,48 @@ ZEND_FUNCTION(vio_compute_bind_buffer)
 
     ctx->backend->compute_bind_buffer(p->backend_pipeline, buf->backend_buffer,
                                       (int)slot, (int)access, element_count, elem_stride);
+}
+
+ZEND_FUNCTION(vio_compute_bind_image)
+{
+    zval *ctx_zval;
+    zval *pipe_zval;
+    zval *tex_zval;
+    zend_long slot;
+    zend_long access;
+
+    ZEND_PARSE_PARAMETERS_START(5, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_compute_pipeline_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+        Z_PARAM_LONG(slot)
+        Z_PARAM_LONG(access)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_compute_supported(ctx) || !ctx->backend->compute_bind_image ||
+        !ctx->backend->supports_feature || !ctx->backend->supports_feature(VIO_FEATURE_STORAGE_IMAGE)) {
+        php_error_docref(NULL, E_NOTICE, "vio_compute_bind_image: storage images not supported on this backend");
+        return;
+    }
+
+    vio_compute_pipeline_object *p = Z_VIO_COMPUTE_PIPELINE_P(pipe_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (!p->valid || !p->backend_pipeline || !tex->valid) {
+        php_error_docref(NULL, E_WARNING, "vio_compute_bind_image: invalid pipeline or texture");
+        return;
+    }
+    if (!tex->storage) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_compute_bind_image: texture was not created with 'storage' => true");
+        return;
+    }
+    if (slot < 0 || slot > 30) {
+        php_error_docref(NULL, E_WARNING, "vio_compute_bind_image: slot must be 0..30");
+        return;
+    }
+
+    ctx->backend->compute_bind_image(p->backend_pipeline, tex, (int)slot, (int)access);
 }
 
 ZEND_FUNCTION(vio_compute_set_uniforms)
@@ -6524,6 +6601,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_3D", VIO_FEATURE_TEXTURE_3D, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_CUBE", VIO_FEATURE_RENDER_TARGET_CUBE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MIPMAP_GEN", VIO_FEATURE_MIPMAP_GEN, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_MRT", VIO_FEATURE_MRT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_STORAGE_IMAGE", VIO_FEATURE_STORAGE_IMAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_STORAGE", VIO_FEATURE_VERTEX_STORAGE, CONST_CS | CONST_PERSISTENT);
 
     /* Actions */

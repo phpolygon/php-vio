@@ -26,6 +26,7 @@ typedef struct _vio_texture_object {
     vio_wrap     wrap;
     int          valid;
     int          borrowed;      /* 1 if texture_id is owned by another object (e.g. render target) */
+    int          storage;       /* 1 => created with 'storage' => true (compute image2D/3D target) */
     const struct _vio_backend *backend;
     zend_object  std;
 } vio_texture_object;

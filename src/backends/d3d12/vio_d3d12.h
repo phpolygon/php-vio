@@ -114,6 +114,10 @@ typedef struct _vio_d3d12_compute_pipeline {
     int                 srv_count;
     vio_d3d12_compute_binding uavs[VIO_D3D12_COMPUTE_MAX_BINDINGS];
     int                 uav_count;
+    /* Storage images (RWTexture2D/3D): a texture UAV descriptor is written into
+     * the UAV table region at (slot - uav_base_reg) at dispatch time. */
+    struct { struct _vio_d3d12_texture *tex; int slot; int access; } images[VIO_D3D12_COMPUTE_MAX_BINDINGS];
+    int                 image_count;
     /* Reflected register layout (filled at pipeline creation):
      *   cbv_register   — the Params UBO's HLSL register (b#); -1 if no UBO.
      *   srv_base_reg   — lowest readonly  storage-buffer register (t#); table base.

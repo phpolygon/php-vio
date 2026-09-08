@@ -192,6 +192,9 @@ typedef struct _vio_opengl_compute_pipeline {
     int    params_binding;   /* reflected UBO binding point (GLSL binding = 2) */
     vio_opengl_compute_binding bindings[VIO_GL_COMPUTE_MAX_BINDINGS];
     int    binding_count;
+    /* Storage images: GL image unit == GLSL binding (glBindImageTexture). */
+    struct { GLuint texture; GLboolean layered; int slot; int access; } images[VIO_GL_COMPUTE_MAX_BINDINGS];
+    int    image_count;
 } vio_opengl_compute_pipeline;
 
 /* Drain glGetError() to stderr (bring-up aid). Loops because GL queues errors. */
@@ -479,6 +482,25 @@ static void opengl_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
     b->access = access;
 }
 
+static void opengl_compute_bind_image(void *pipeline_ptr, void *tex_obj, int slot, int access)
+{
+    vio_opengl_compute_pipeline *cp = (vio_opengl_compute_pipeline *)pipeline_ptr;
+    vio_texture_object *t = (vio_texture_object *)tex_obj;
+    if (!cp || !t || !t->texture_id) return;
+    for (int i = 0; i < cp->image_count; i++) {
+        if (cp->images[i].slot == slot) {
+            cp->images[i].texture = t->texture_id; cp->images[i].layered = t->is_3d ? GL_TRUE : GL_FALSE;
+            cp->images[i].access = access; return;
+        }
+    }
+    if (cp->image_count >= VIO_GL_COMPUTE_MAX_BINDINGS) return;
+    cp->images[cp->image_count].texture = t->texture_id;
+    cp->images[cp->image_count].layered = t->is_3d ? GL_TRUE : GL_FALSE;
+    cp->images[cp->image_count].slot    = slot;
+    cp->images[cp->image_count].access  = access;
+    cp->image_count++;
+}
+
 static void opengl_compute_set_uniforms(void *pipeline_ptr, const void *data, int size)
 {
     vio_opengl_compute_pipeline *cp = (vio_opengl_compute_pipeline *)pipeline_ptr;
@@ -521,14 +543,28 @@ static void opengl_dispatch_compute(vio_compute_cmd *cmd)
         glBindBufferBase(GL_UNIFORM_BUFFER, (GLuint)cp->params_binding, cp->ubo);
     }
 
+    /* Storage images: image unit == GLSL binding. The textures were created
+     * with a sized RGBA8 internal format (required for image load/store). */
+    for (int i = 0; i < cp->image_count; i++) {
+        if (!cp->images[i].texture) continue;
+        glBindImageTexture((GLuint)cp->images[i].slot, cp->images[i].texture, 0,
+                           cp->images[i].layered, 0,
+                           cp->images[i].access == 1 ? GL_WRITE_ONLY : GL_READ_ONLY, GL_RGBA8);
+    }
+
     GLuint gx = cmd->group_count_x > 0 ? (GLuint)cmd->group_count_x : 1;
     GLuint gy = cmd->group_count_y > 0 ? (GLuint)cmd->group_count_y : 1;
     GLuint gz = cmd->group_count_z > 0 ? (GLuint)cmd->group_count_z : 1;
     glDispatchCompute(gx, gy, gz);
 
     /* Make SSBO writes visible to subsequent glGetBufferSubData / glMapBufferRange
-     * readback. Missing GL_SHADER_STORAGE_BARRIER_BIT yields stale data. */
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+     * readback, and image writes to later texture fetches. Missing barrier
+     * bits yield stale data. */
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT |
+                    GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    for (int i = 0; i < cp->image_count; i++) {
+        glBindImageTexture((GLuint)cp->images[i].slot, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+    }
 
     /* Unbind so the SSBOs/UBO aren't left bound to these points. */
     for (int i = 0; i < cp->binding_count; i++) {
@@ -1231,7 +1267,9 @@ static int opengl_upload_texture_2d(void *tex_obj,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter);
 
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    /* Sized internal format: image load/store (storage images) rejects the
+     * unsized GL_RGBA; RGBA8 is what every backend stores anyway. */
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 
     if (mipmaps) {
         glGenerateMipmap(GL_TEXTURE_2D);
@@ -1273,7 +1311,7 @@ static int opengl_upload_texture_3d(void *tex_obj,
     glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, gl_filter);
     glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, gl_filter);
 
-    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA, width, height, depth, 0,
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, width, height, depth, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 
     glBindTexture(GL_TEXTURE_3D, 0);
@@ -1514,6 +1552,8 @@ static int opengl_supports_feature(vio_feature feature)
          * has_compute_shader tracks exactly that tier. GL < 4.3 -> 0, callers
          * stay on the readback path. */
         case VIO_FEATURE_VERTEX_STORAGE: return vio_gl.caps.has_compute_shader;
+        case VIO_FEATURE_STORAGE_IMAGE:  return vio_gl.caps.has_compute_shader; /* image load/store is 4.2, compute 4.3 */
+        case VIO_FEATURE_MRT:            return 1;  /* glDrawBuffers, core since 3.0 */
         default:                         return 0;
     }
 }
@@ -1547,6 +1587,7 @@ static const vio_backend opengl_backend = {
     .create_compute_pipeline  = opengl_create_compute_pipeline,
     .destroy_compute_pipeline = opengl_destroy_compute_pipeline,
     .compute_bind_buffer      = opengl_compute_bind_buffer,
+    .compute_bind_image       = opengl_compute_bind_image,
     .compute_set_uniforms     = opengl_compute_set_uniforms,
     .read_buffer              = opengl_read_buffer,
     .bind_storage_buffer          = opengl_bind_storage_buffer,

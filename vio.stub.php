@@ -533,6 +533,15 @@ function vio_storage_buffer(VioContext $context, array $config): VioBuffer|false
 function vio_compute_bind_buffer(VioContext $context, VioComputePipeline $pipeline, VioBuffer $buffer, int $slot, int $access): void {}
 
 /**
+ * Bind a storage image (a VioTexture created with 'storage' => true) to a
+ * compute pipeline slot — GLSL `layout(binding = $slot, rgba8) uniform image2D`
+ * (or image3D for vio_texture_3d). Requires VIO_FEATURE_STORAGE_IMAGE.
+ *
+ * @param int $access VIO_COMPUTE_READ or VIO_COMPUTE_WRITE
+ */
+function vio_compute_bind_image(VioContext $context, VioComputePipeline $pipeline, VioTexture $texture, int $slot, int $access): void {}
+
+/**
  * Stage the small params constant block (b0) for the next dispatch.
  */
 function vio_compute_set_uniforms(VioContext $context, VioComputePipeline $pipeline, string $data): void {}

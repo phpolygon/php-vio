@@ -1623,6 +1623,7 @@ static void *d3d12_create_texture(vio_texture_desc *desc)
     res_desc.Format = desc->single_channel ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     res_desc.SampleDesc.Count = 1;
     res_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (desc->storage) res_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
     HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device,
                                                        &heap_props,
@@ -1784,6 +1785,7 @@ static void *d3d12_create_texture_3d(vio_texture_desc *desc)
     res_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     res_desc.SampleDesc.Count = 1;
     res_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (desc->storage) res_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
     HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device,
                                                        &heap_props,
@@ -2841,6 +2843,11 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
                 int bnd = (int)refl.storage_buffers[i].binding;
                 if (storage_min_binding < 0 || bnd < storage_min_binding) storage_min_binding = bnd;
             }
+            /* Storage images share the UAV table (RWTexture2D/3D at u{binding}). */
+            for (int i = 0; i < refl.storage_image_count; i++) {
+                int bnd = (int)refl.storage_images[i].binding;
+                if (storage_min_binding < 0 || bnd < storage_min_binding) storage_min_binding = bnd;
+            }
             vio_reflect_free(&refl);
         } else {
             /* Reflection failure is non-fatal: fall back to register 0 bases and
@@ -2990,6 +2997,22 @@ static void d3d12_compute_set_uniforms(void *pipeline_ptr, const void *data, int
     cp->params_size = (size_t)size;
 }
 
+static void d3d12_compute_bind_image(void *pipeline_ptr, void *tex_obj, int slot, int access)
+{
+    vio_d3d12_compute_pipeline *cp = (vio_d3d12_compute_pipeline *)pipeline_ptr;
+    vio_texture_object *t = (vio_texture_object *)tex_obj;
+    vio_d3d12_texture *dt = t ? (vio_d3d12_texture *)t->backend_texture : NULL;
+    if (!cp || !dt || !dt->resource) return;
+    for (int i = 0; i < cp->image_count; i++) {
+        if (cp->images[i].slot == slot) { cp->images[i].tex = dt; cp->images[i].access = access; return; }
+    }
+    if (cp->image_count >= VIO_D3D12_COMPUTE_MAX_BINDINGS) return;
+    cp->images[cp->image_count].tex    = dt;
+    cp->images[cp->image_count].slot   = slot;
+    cp->images[cp->image_count].access = access;
+    cp->image_count++;
+}
+
 static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
 {
     if (!cmd) return;
@@ -3077,6 +3100,33 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
         ID3D12Device_CreateUnorderedAccessView(vio_d3d12.device, b->buffer->resource, NULL, &ud, h);
     }
 
+    /* Storage images: texture UAV descriptors in the same UAV region (a
+     * RWTexture2D/3D at GLSL binding=slot lands on u{slot} exactly like a
+     * buffer). The texture resource is in PIXEL_SHADER_RESOURCE after its
+     * upload; it is transitioned to UNORDERED_ACCESS for the dispatch and back
+     * afterwards (see below) so sampling it in a later pass needs no caller
+     * barrier. */
+    for (int i = 0; i < cp->image_count; i++) {
+        vio_d3d12_texture *dt = cp->images[i].tex;
+        if (!dt || !dt->resource) continue;
+        int rel = cp->images[i].slot - uav_reg_base;
+        if (rel < 0 || rel >= VIO_D3D12_COMPUTE_MAX_BINDINGS) continue;
+        UINT idx = UAV_BASE + (UINT)rel;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
+        ud.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (dt->depth > 0) {
+            ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            ud.Texture3D.MipSlice = 0;
+            ud.Texture3D.FirstWSlice = 0;
+            ud.Texture3D.WSize = (UINT)dt->depth;
+        } else {
+            ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            ud.Texture2D.MipSlice = 0;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu_start.ptr + (SIZE_T)idx * dsz };
+        ID3D12Device_CreateUnorderedAccessView(vio_d3d12.device, dt->resource, NULL, &ud, h);
+    }
+
     /* Record onto a transient DIRECT command list. We never run inside an open
      * graphics frame for the SDF bake (it happens behind the loading screen,
      * outside vio_begin/vio_end), so a dedicated allocator/list keeps us fully
@@ -3111,10 +3161,36 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, srv_gpu);
     ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 2, uav_gpu);
 
+    /* Storage images: PIXEL_SHADER_RESOURCE -> UNORDERED_ACCESS for the dispatch. */
+    for (int i = 0; i < cp->image_count; i++) {
+        vio_d3d12_texture *dt = cp->images[i].tex;
+        if (!dt || !dt->resource) continue;
+        D3D12_RESOURCE_BARRIER ib = {0};
+        ib.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        ib.Transition.pResource = dt->resource;
+        ib.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ib.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        ib.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &ib);
+    }
+
     int gx = cmd->group_count_x > 0 ? cmd->group_count_x : 1;
     int gy = cmd->group_count_y > 0 ? cmd->group_count_y : 1;
     int gz = cmd->group_count_z > 0 ? cmd->group_count_z : 1;
     ID3D12GraphicsCommandList_Dispatch(list, (UINT)gx, (UINT)gy, (UINT)gz);
+
+    /* ...and back to PIXEL_SHADER_RESOURCE so the texture samples as before. */
+    for (int i = 0; i < cp->image_count; i++) {
+        vio_d3d12_texture *dt = cp->images[i].tex;
+        if (!dt || !dt->resource) continue;
+        D3D12_RESOURCE_BARRIER ib = {0};
+        ib.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        ib.Transition.pResource = dt->resource;
+        ib.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ib.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ib.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &ib);
+    }
 
     /* UAV barrier (ensure all writes complete) + transition each UAV output to
      * COPY_SOURCE and copy into its READBACK staging buffer, so a later
@@ -3231,6 +3307,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* vio_2d_d3d12_* */
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* TEXTURE3D resource + SRV */
         case VIO_FEATURE_VERTEX_STORAGE: return 1; /* VS-visible root SRV in the shared root signature */
+        case VIO_FEATURE_STORAGE_IMAGE:  return 1; /* texture UAV in the compute UAV table */
         default:                       return 0;
     }
 }
@@ -3510,6 +3587,7 @@ static const vio_backend d3d12_backend = {
     .create_compute_pipeline  = d3d12_create_compute_pipeline,
     .destroy_compute_pipeline = d3d12_destroy_compute_pipeline,
     .compute_bind_buffer      = d3d12_compute_bind_buffer,
+    .compute_bind_image       = d3d12_compute_bind_image,
     .compute_set_uniforms     = d3d12_compute_set_uniforms,
     .read_buffer              = d3d12_read_buffer,
     .bind_storage_buffer          = d3d12_bind_storage_buffer,

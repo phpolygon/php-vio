@@ -190,6 +190,13 @@ typedef enum _vio_feature {
     VIO_FEATURE_RENDER_TARGET_CUBE = 23,
     /* vio_generate_mipmaps() on textures / cubemaps / render targets. */
     VIO_FEATURE_MIPMAP_GEN         = 24,
+    /* Multiple render targets: vio_render_target(['attachments' => [...]]) with
+     * up to VIO_MAX_COLOR_ATTACHMENTS colour attachments, fragment
+     * layout(location = n) out. */
+    VIO_FEATURE_MRT                = 25,
+    /* Compute storage images: vio_texture(['storage' => true]) +
+     * vio_compute_bind_image() (GLSL image2D / image3D). */
+    VIO_FEATURE_STORAGE_IMAGE      = 26,
     /* A storage buffer (SSBO / StructuredBuffer SRV) can be bound to the
      * GRAPHICS pipeline and read from the VERTEX stage — the primitive that
      * lets a vertex shader pull per-instance data via gl_InstanceIndex from a
@@ -298,6 +305,9 @@ typedef struct _vio_texture_desc {
     int         mipmaps;
     int         single_channel; /* 1 => R8 (1 byte/px, e.g. font coverage atlas);
                                    0 => RGBA8. data must match the chosen format. */
+    int         storage;        /* 1 => usable as a compute storage image
+                                   (image2D / image3D): Metal ShaderWrite usage,
+                                   D3D UAV, GL image unit. Sampling still works. */
 } vio_texture_desc;
 
 typedef struct _vio_shader_desc {

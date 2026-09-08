@@ -735,6 +735,7 @@ static void *d3d11_create_texture(vio_texture_desc *desc)
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (desc->storage) td.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
     if (desc->mipmaps) {
         td.BindFlags |= D3D11_BIND_RENDER_TARGET;
         td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
@@ -777,6 +778,16 @@ static void *d3d11_create_texture(vio_texture_desc *desc)
                                               0, NULL, desc->data,
                                               desc->width * 4, 0);
         ID3D11DeviceContext_GenerateMips(vio_d3d11.context, tex->srv);
+    }
+
+    /* Storage image: UAV on mip 0 for compute image2D access (RWTexture2D). */
+    if (desc->storage) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {0};
+        uav_desc.Format = td.Format;
+        uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        uav_desc.Texture2D.MipSlice = 0;
+        ID3D11Device_CreateUnorderedAccessView(vio_d3d11.device, (ID3D11Resource *)tex->texture,
+                                               &uav_desc, &tex->uav);
     }
 
     /* Sampler */
@@ -833,6 +844,7 @@ static void *d3d11_create_texture_3d(vio_texture_desc *desc)
     td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (desc->storage) td.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
 
     D3D11_SUBRESOURCE_DATA init_data = {0};
     D3D11_SUBRESOURCE_DATA *init_ptr = NULL;
@@ -853,6 +865,16 @@ static void *d3d11_create_texture_3d(vio_texture_desc *desc)
     srv_desc.Format = td.Format;
     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
     srv_desc.Texture3D.MipLevels = 1;
+    if (desc->storage) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {0};
+        uav_desc.Format = td.Format;
+        uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D;
+        uav_desc.Texture3D.MipSlice = 0;
+        uav_desc.Texture3D.FirstWSlice = 0;
+        uav_desc.Texture3D.WSize = (UINT)desc->depth;
+        ID3D11Device_CreateUnorderedAccessView(vio_d3d11.device, (ID3D11Resource *)tex->texture3d,
+                                               &uav_desc, &tex->uav);
+    }
 
     hr = ID3D11Device_CreateShaderResourceView(vio_d3d11.device,
                                                (ID3D11Resource *)tex->texture3d,
@@ -888,6 +910,7 @@ static void d3d11_destroy_texture(void *texture_ptr)
 
     if (tex->sampler_cmp) ID3D11SamplerState_Release(tex->sampler_cmp);
     if (tex->sampler) ID3D11SamplerState_Release(tex->sampler);
+    if (tex->uav) ID3D11UnorderedAccessView_Release(tex->uav);
     if (tex->srv) ID3D11ShaderResourceView_Release(tex->srv);
     if (tex->texture3d) ID3D11Texture3D_Release(tex->texture3d);
     if (tex->texture) ID3D11Texture2D_Release(tex->texture);
@@ -1740,6 +1763,22 @@ static ID3D11UnorderedAccessView *d3d11_compute_make_uav(vio_d3d11_compute_bindi
     return uav;
 }
 
+static void d3d11_compute_bind_image(void *pipeline_ptr, void *tex_obj, int slot, int access)
+{
+    vio_d3d11_compute_pipeline *cp = (vio_d3d11_compute_pipeline *)pipeline_ptr;
+    vio_texture_object *t = (vio_texture_object *)tex_obj;
+    vio_d3d11_texture *dt = t ? (vio_d3d11_texture *)t->backend_texture : NULL;
+    if (!cp || !dt || !dt->uav) return;
+    for (int i = 0; i < cp->image_count; i++) {
+        if (cp->images[i].slot == slot) { cp->images[i].tex = dt; cp->images[i].access = access; return; }
+    }
+    if (cp->image_count >= VIO_D3D11_COMPUTE_MAX_BINDINGS) return;
+    cp->images[cp->image_count].tex    = dt;
+    cp->images[cp->image_count].slot   = slot;
+    cp->images[cp->image_count].access = access;
+    cp->image_count++;
+}
+
 static void d3d11_dispatch_compute(vio_compute_cmd *cmd)
 {
     if (!cmd) return;
@@ -1786,6 +1825,21 @@ static void d3d11_dispatch_compute(vio_compute_cmd *cmd)
         uav_n++;
     }
 
+    /* Storage images: spirv-cross emits every GLSL image as RWTexture2D/3D at
+     * u{binding}, so read-only and write-only images both go through the UAV
+     * slot. The texture's own UAV is borrowed (not released below). */
+    UINT image_slots[VIO_D3D11_COMPUTE_MAX_BINDINGS] = {0};
+    int  image_n = 0;
+    for (int i = 0; i < cp->image_count; i++) {
+        vio_d3d11_texture *dt = cp->images[i].tex;
+        if (!dt || !dt->uav) continue;
+        /* A texture still bound as PS SRV cannot become a UAV — clear the PS slots. */
+        ID3D11ShaderResourceView *null_ps[8] = {NULL};
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 8, null_ps);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, (UINT)cp->images[i].slot, 1, &dt->uav, NULL);
+        image_slots[image_n++] = (UINT)cp->images[i].slot;
+    }
+
     UINT gx = cmd->group_count_x > 0 ? (UINT)cmd->group_count_x : 1;
     UINT gy = cmd->group_count_y > 0 ? (UINT)cmd->group_count_y : 1;
     UINT gz = cmd->group_count_z > 0 ? (UINT)cmd->group_count_z : 1;
@@ -1825,6 +1879,9 @@ static void d3d11_dispatch_compute(vio_compute_cmd *cmd)
     for (int i = 0; i < uav_n; i++) {
         ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, uav_slots[i], 1, &null_uav, NULL);
         ID3D11UnorderedAccessView_Release(uavs[i]);
+    }
+    for (int i = 0; i < image_n; i++) {
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, image_slots[i], 1, &null_uav, NULL);
     }
     ID3D11ShaderResourceView *null_srv = NULL;
     for (int i = 0; i < srv_n; i++) {
@@ -1886,6 +1943,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* vio_2d_d3d11_* */
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* ID3D11Texture3D */
         case VIO_FEATURE_VERTEX_STORAGE: return 1; /* SM5 reads SRV/StructuredBuffer in the VS */
+        case VIO_FEATURE_STORAGE_IMAGE:  return 1; /* RWTexture2D/3D UAV on storage textures */
         default:                       return 0;
     }
 }
@@ -2049,6 +2107,7 @@ static const vio_backend d3d11_backend = {
     .create_compute_pipeline  = d3d11_create_compute_pipeline,
     .destroy_compute_pipeline = d3d11_destroy_compute_pipeline,
     .compute_bind_buffer      = d3d11_compute_bind_buffer,
+    .compute_bind_image       = d3d11_compute_bind_image,
     .compute_set_uniforms     = d3d11_compute_set_uniforms,
     .read_buffer              = d3d11_read_buffer,
     .bind_storage_buffer          = d3d11_bind_storage_buffer,

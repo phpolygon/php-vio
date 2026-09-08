@@ -85,6 +85,9 @@ typedef struct _vio_d3d11_compute_pipeline {
     int                 srv_count;
     vio_d3d11_compute_binding uavs[VIO_D3D11_COMPUTE_MAX_BINDINGS];
     int                 uav_count;
+    /* Storage images (RWTexture2D/3D): bound as UAV u{slot} at dispatch. */
+    struct { struct _vio_d3d11_texture *tex; int slot; int access; } images[VIO_D3D11_COMPUTE_MAX_BINDINGS];
+    int                 image_count;
     /* Reflected register: the Params UBO's HLSL register (b#); -1 if no UBO. */
     int                 cbv_register;
     /* Params constant block — a USAGE_DEFAULT CB, updated via UpdateSubresource
@@ -98,6 +101,7 @@ typedef struct _vio_d3d11_texture {
     ID3D11Texture2D          *texture;
     ID3D11Texture3D          *texture3d;     /* set instead of texture for volume textures */
     ID3D11ShaderResourceView *srv;
+    ID3D11UnorderedAccessView *uav;          /* storage image (desc.storage): RWTexture2D/3D u# */
     ID3D11SamplerState       *sampler;       /* regular sampler (Sample) */
     ID3D11SamplerState       *sampler_cmp;   /* comparison sampler (SampleCmp), NULL if n/a */
     int width;

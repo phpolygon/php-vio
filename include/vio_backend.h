@@ -279,6 +279,13 @@ typedef struct _vio_backend {
     /* Stage the small params constant block (b0) onto the compute pipeline. */
     void  (*compute_set_uniforms)(void *pipeline, const void *data, int size);
 
+    /* Record a storage-image binding (GLSL `layout(binding = slot, rgba8)
+     * uniform image2D/image3D`) on the compute pipeline. tex_obj is the
+     * vio_texture_object created with desc.storage = 1; slot is the GLSL
+     * binding (== MSL texture index / D3D u# register / GL image unit); access
+     * is VIO_COMPUTE_READ or VIO_COMPUTE_WRITE. Optional. */
+    void  (*compute_bind_image)(void *pipeline, void *tex_obj, int slot, int access);
+
     /* GPU -> CPU readback of a storage buffer. Blocks on a fence, then writes up
      * to size bytes into out. Returns the number of bytes written, or 0 on
      * failure / unsupported. */

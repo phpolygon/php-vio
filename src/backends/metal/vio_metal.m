@@ -2234,7 +2234,7 @@ static void *metal_create_texture(vio_texture_desc *desc)
         MTLTextureDescriptor *td = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:fmt
             width:desc->width height:desc->height mipmapped:desc->mipmaps ? YES : NO];
-        td.usage = MTLTextureUsageShaderRead;
+        td.usage = MTLTextureUsageShaderRead | (desc->storage ? MTLTextureUsageShaderWrite : 0);
         td.storageMode = metal_cpu_texture_storage();
         if (desc->single_channel) {
             /* R8 coverage atlas sampled as (1,1,1,R), same as vio_metal_create_font_atlas. */
@@ -2275,7 +2275,7 @@ static void *metal_create_texture_3d(vio_texture_desc *desc)
         td.height = desc->height;
         td.depth  = desc->depth;
         td.mipmapLevelCount = 1;
-        td.usage = MTLTextureUsageShaderRead;
+        td.usage = MTLTextureUsageShaderRead | (desc->storage ? MTLTextureUsageShaderWrite : 0);
         td.storageMode = metal_cpu_texture_storage();
         id<MTLTexture> tex = [vio_mtl.device newTextureWithDescriptor:td];
         if (!tex) return NULL;
@@ -3238,6 +3238,15 @@ typedef struct _vio_metal_compute_pipeline {
 
     vio_metal_compute_binding bindings[VIO_METAL_COMPUTE_MAX_BINDINGS];
     int                       binding_count;
+
+    /* Storage images (GLSL image2D / image3D): MSL texture index == GLSL
+     * binding, pinned by the same explicit remap as the buffers. */
+    struct { vio_metal_texture *tex; int slot; int access; } images[VIO_METAL_COMPUTE_MAX_BINDINGS];
+    int                       image_count;
+
+    /* local_size_{x,y,z} reflected from the SPIR-V ExecutionMode so 2D/3D
+     * kernels dispatch with the right threadsPerThreadgroup (0 => 64,1,1). */
+    unsigned                  local_size[3];
 } vio_metal_compute_pipeline;
 
 #ifdef HAVE_SPIRV_CROSS
@@ -3247,7 +3256,8 @@ typedef struct _vio_metal_compute_pipeline {
  * On success *params_index_out receives the MSL buffer index of the Params UBO
  * (the explicit binding we installed for it, canonical 2). */
 static char *metal_cs_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
-                                   int *params_index_out, char **error_msg)
+                                   int *params_index_out, unsigned local_size_out[3],
+                                   char **error_msg)
 {
     spvc_context  ctx = NULL;
     spvc_parsed_ir ir = NULL;
@@ -3277,12 +3287,21 @@ static char *metal_cs_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
         return NULL;
     }
 
-    /* Install explicit MSL resource bindings for (set 0, binding 0/1/2) ->
-     * msl_buffer 0/1/2. This removes the dependency on SPIRV-Cross's automatic
-     * buffer-index assignment entirely: whatever the shader declares at GLSL
-     * binding N (N in {0,1,2}) is emitted as [[buffer(N)]]. We bind the params
-     * UBO at index 2 to match the frozen contract. */
-    for (unsigned b = 0; b < 3; b++) {
+    if (local_size_out) {
+        for (unsigned i = 0; i < 3; i++) {
+            local_size_out[i] = spvc_compiler_get_execution_mode_argument_by_index(
+                compiler, SpvExecutionModeLocalSize, i);
+        }
+    }
+
+    /* Install explicit MSL resource bindings for (set 0, binding N) ->
+     * msl_buffer N / msl_texture N. This removes the dependency on SPIRV-Cross's
+     * automatic index assignment entirely: whatever the shader declares at GLSL
+     * binding N is emitted as [[buffer(N)]] (SSBO/UBO) or [[texture(N)]]
+     * (storage image). The params UBO keeps its canonical index 2. Buffers and
+     * textures live in separate Metal tables, so a buffer and an image at the
+     * same binding never collide. */
+    for (unsigned b = 0; b < 31; b++) {
         spvc_msl_resource_binding rb;
         spvc_msl_resource_binding_init(&rb);
         rb.stage       = SpvExecutionModelGLCompute;
@@ -3380,7 +3399,8 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
     }
 
     int params_index = 2;
-    char *msl = metal_cs_spirv_to_msl(spirv, spirv_size, &params_index, &err);
+    unsigned local_size[3] = {0, 0, 0};
+    char *msl = metal_cs_spirv_to_msl(spirv, spirv_size, &params_index, local_size, &err);
     if (free_spirv) free(spirv);
     if (!msl) {
         php_error_docref(NULL, E_WARNING, "Metal: CS SPIR-V->MSL failed: %s",
@@ -3428,6 +3448,7 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
         }
         cp->pso          = (void *)CFBridgingRetain(pso);
         cp->params_index = params_index;
+        memcpy(cp->local_size, local_size, sizeof(local_size));
     }
 
     return cp;
@@ -3460,6 +3481,23 @@ static void metal_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
     b->buffer = buf;
     b->slot   = slot;     /* GLSL binding == MSL [[buffer(slot)]] (explicit remap) */
     b->access = access;
+}
+
+static void metal_compute_bind_image(void *pipeline_ptr, void *tex_obj, int slot, int access)
+{
+    vio_metal_compute_pipeline *cp = (vio_metal_compute_pipeline *)pipeline_ptr;
+    vio_texture_object *t = (vio_texture_object *)tex_obj;
+    vio_metal_texture *mt = t ? (vio_metal_texture *)t->backend_texture : NULL;
+    if (!cp || !mt || !mt->tex) return;
+    /* Re-binding a slot replaces the previous image (sticky like the buffers). */
+    for (int i = 0; i < cp->image_count; i++) {
+        if (cp->images[i].slot == slot) { cp->images[i].tex = mt; cp->images[i].access = access; return; }
+    }
+    if (cp->image_count >= VIO_METAL_COMPUTE_MAX_BINDINGS) return;
+    cp->images[cp->image_count].tex    = mt;
+    cp->images[cp->image_count].slot   = slot;
+    cp->images[cp->image_count].access = access;
+    cp->image_count++;
 }
 
 static void metal_compute_set_uniforms(void *pipeline_ptr, const void *data, int size)
@@ -3524,15 +3562,25 @@ static void metal_dispatch_compute(vio_compute_cmd *cmd)
             [enc setBuffer:pb offset:0 atIndex:(NSUInteger)cp->params_index];
         }
 
-        /* Threadgroups along X (the shader is 1D: local_size_x = 64, with a
-         * gid >= total bounds guard that stays valid for the overshoot from
-         * ceil-division). group_count_x already carries ceil(total/64) from the
-         * PHP wrapper. threadsPerThreadgroup must match local_size (64,1,1). */
+        /* Storage images at their MSL texture index (== GLSL binding). */
+        for (int i = 0; i < cp->image_count; i++) {
+            vio_metal_texture *mt = cp->images[i].tex;
+            if (!mt || !mt->tex) continue;
+            [enc setTexture:(__bridge id<MTLTexture>)mt->tex atIndex:(NSUInteger)cp->images[i].slot];
+        }
+
+        /* threadsPerThreadgroup = the kernel's local_size (reflected from the
+         * SPIR-V ExecutionMode at pipeline creation), so 2D/3D kernels dispatch
+         * correctly; group_count_* is the threadgroup grid the caller computed
+         * (ceil(total / local_size)). Legacy 1D kernels without the reflection
+         * fall back to the old (64,1,1) contract. */
         NSUInteger gx = cmd->group_count_x > 0 ? (NSUInteger)cmd->group_count_x : 1;
         NSUInteger gy = cmd->group_count_y > 0 ? (NSUInteger)cmd->group_count_y : 1;
         NSUInteger gz = cmd->group_count_z > 0 ? (NSUInteger)cmd->group_count_z : 1;
         MTLSize groups  = MTLSizeMake(gx, gy, gz);
-        MTLSize tpt     = MTLSizeMake(64, 1, 1);
+        MTLSize tpt     = MTLSizeMake(cp->local_size[0] ? cp->local_size[0] : 64,
+                                      cp->local_size[1] ? cp->local_size[1] : 1,
+                                      cp->local_size[2] ? cp->local_size[2] : 1);
         [enc dispatchThreadgroups:groups threadsPerThreadgroup:tpt];
 
         [enc endEncoding];
@@ -3570,6 +3618,7 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_COMPUTE:
     case VIO_FEATURE_3D_PIPELINE:
     case VIO_FEATURE_VERTEX_STORAGE:
+    case VIO_FEATURE_STORAGE_IMAGE:
 #ifdef HAVE_SPIRV_CROSS
         /* Every shader stage reaches the GPU through GLSL -> SPIR-V -> MSL, so
          * compute, the 3D draw pipeline and the vertex-stage SSBO path (Path B)
@@ -3726,6 +3775,7 @@ static const vio_backend metal_backend = {
     .destroy_compute_pipeline = metal_destroy_compute_pipeline,
     .compute_bind_buffer      = metal_compute_bind_buffer,
     .compute_set_uniforms     = metal_compute_set_uniforms,
+    .compute_bind_image       = metal_compute_bind_image,
     .read_buffer              = metal_read_buffer,
 };
 
