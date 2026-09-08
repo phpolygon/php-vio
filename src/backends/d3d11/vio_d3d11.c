@@ -978,6 +978,21 @@ static void d3d11_destroy_render_target(void *rt_ptr)
         ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)rt->d3d11_depth_srv);
         rt->d3d11_depth_srv = NULL;
     }
+    /* MRT attachments 1..n (index 0 is released through the scalars below). */
+    for (int i = 1; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
+        vio_d3d11_texture *bt = (vio_d3d11_texture *)rt->d3d11_color_backend_textures[i];
+        if (bt) {
+            if (bt->sampler)     ID3D11SamplerState_Release(bt->sampler);
+            if (bt->sampler_cmp) ID3D11SamplerState_Release(bt->sampler_cmp);
+            free(bt);
+            rt->d3d11_color_backend_textures[i] = NULL;
+        }
+        if (rt->d3d11_color_srvs[i]) { ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)rt->d3d11_color_srvs[i]); rt->d3d11_color_srvs[i] = NULL; }
+        if (rt->d3d11_rtvs[i])       { ID3D11RenderTargetView_Release((ID3D11RenderTargetView *)rt->d3d11_rtvs[i]);       rt->d3d11_rtvs[i] = NULL; }
+        if (rt->d3d11_color_texs[i]) { ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_color_texs[i]);               rt->d3d11_color_texs[i] = NULL; }
+    }
+    rt->d3d11_color_backend_textures[0] = NULL;
+    rt->d3d11_color_srvs[0] = NULL; rt->d3d11_rtvs[0] = NULL; rt->d3d11_color_texs[0] = NULL;
     if (rt->d3d11_color_srv) {
         ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)rt->d3d11_color_srv);
         rt->d3d11_color_srv = NULL;
@@ -1159,6 +1174,8 @@ static void d3d11_begin_frame(void)
 {
     /* Reset to backbuffer */
     vio_d3d11.current_rtv = vio_d3d11.rtv;
+    vio_d3d11.current_rtvs[0] = vio_d3d11.rtv;
+    vio_d3d11.current_rtv_count = 1;
     vio_d3d11.current_dsv = vio_d3d11.dsv;
     vio_d3d11.current_rt_width = vio_d3d11.width;
     vio_d3d11.current_rt_height = vio_d3d11.height;
@@ -1483,6 +1500,12 @@ static void d3d11_clear(float r, float g, float b, float a)
     float color[4] = {r, g, b, a};
     if (vio_d3d11.current_rtv) {
         ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, vio_d3d11.current_rtv, color);
+        /* MRT: attachments 1..n share the clear colour. */
+        for (int i = 1; i < vio_d3d11.current_rtv_count && i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
+            if (vio_d3d11.current_rtvs[i]) {
+                ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, vio_d3d11.current_rtvs[i], color);
+            }
+        }
     }
     if (vio_d3d11.current_dsv) {
         ID3D11DeviceContext_ClearDepthStencilView(vio_d3d11.context, vio_d3d11.current_dsv,
@@ -1944,6 +1967,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* ID3D11Texture3D */
         case VIO_FEATURE_VERTEX_STORAGE: return 1; /* SM5 reads SRV/StructuredBuffer in the VS */
         case VIO_FEATURE_STORAGE_IMAGE:  return 1; /* RWTexture2D/3D UAV on storage textures */
+        case VIO_FEATURE_MRT:            return 1; /* OMSetRenderTargets with up to 4 RTVs */
         default:                       return 0;
     }
 }

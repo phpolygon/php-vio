@@ -688,6 +688,22 @@ static void opengl_destroy_font_atlas(void *font_ptr)
     font->atlas_texture = 0;
 }
 
+/* GL storage triple for a vio_pixel_format colour attachment. */
+static void opengl_color_format(int fmt, GLint *internal, GLenum *base, GLenum *type)
+{
+    switch (fmt) {
+        case VIO_FORMAT_RGBA16F:    *internal = GL_RGBA16F;        *base = GL_RGBA; *type = GL_FLOAT; break;
+        case VIO_FORMAT_RGBA32F:    *internal = GL_RGBA32F;        *base = GL_RGBA; *type = GL_FLOAT; break;
+        case VIO_FORMAT_R11G11B10F: *internal = GL_R11F_G11F_B10F; *base = GL_RGB;  *type = GL_FLOAT; break;
+        case VIO_FORMAT_RG16F:      *internal = GL_RG16F;          *base = GL_RG;   *type = GL_FLOAT; break;
+        case VIO_FORMAT_R16F:       *internal = GL_R16F;           *base = GL_RED;  *type = GL_FLOAT; break;
+        case VIO_FORMAT_R32F:       *internal = GL_R32F;           *base = GL_RED;  *type = GL_FLOAT; break;
+        case VIO_FORMAT_R8:         *internal = GL_R8;             *base = GL_RED;  *type = GL_UNSIGNED_BYTE; break;
+        case VIO_FORMAT_RGBA8:
+        default:                    *internal = GL_RGBA8;          *base = GL_RGBA; *type = GL_UNSIGNED_BYTE; break;
+    }
+}
+
 static void opengl_destroy_render_target(void *rt_ptr)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
@@ -702,6 +718,14 @@ static void opengl_destroy_render_target(void *rt_ptr)
     if (rt->color_texture) {
         glDeleteTextures(1, &rt->color_texture);
         rt->color_texture = 0;
+        rt->color_textures[0] = 0;
+    }
+    /* MRT attachments 1..n (index 0 is the scalar above). */
+    for (int i = 1; i < rt->attachment_count && i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
+        if (rt->color_textures[i]) {
+            glDeleteTextures(1, &rt->color_textures[i]);
+            rt->color_textures[i] = 0;
+        }
     }
     if (rt->depth_texture) {
         glDeleteTextures(1, &rt->depth_texture);
@@ -723,13 +747,17 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
          * bind_render_target_face can target level > 0 before any
          * glGenerateMipmap. */
         if (rt->mip_levels < 1) rt->mip_levels = 1;
+        GLint cube_internal; GLenum cube_base, cube_type;
+        opengl_color_format(rt->attachment_count > 0 ? rt->formats[0] : (hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8),
+                            &cube_internal, &cube_base, &cube_type);
         glGenTextures(1, &rt->color_texture);
+        rt->color_textures[0] = rt->color_texture;
         glBindTexture(GL_TEXTURE_CUBE_MAP, rt->color_texture);
         for (int level = 0; level < rt->mip_levels; level++) {
             int dim = width >> level; if (dim < 1) dim = 1;
             for (int f = 0; f < 6; f++) {
-                glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, level, hdr ? GL_RGBA16F : GL_RGBA8,
-                             dim, dim, 0, GL_RGBA, hdr ? GL_FLOAT : GL_UNSIGNED_BYTE, NULL);
+                glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, level, cube_internal,
+                             dim, dim, 0, cube_base, cube_type, NULL);
             }
         }
         glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER,
@@ -793,16 +821,32 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
         glDrawBuffer(GL_NONE);
         glReadBuffer(GL_NONE);
     } else {
-        glGenTextures(1, &rt->color_texture);
-        glBindTexture(GL_TEXTURE_2D, rt->color_texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, hdr ? GL_RGBA16F : GL_RGBA8, width, height,
-            0, GL_RGBA, hdr ? GL_FLOAT : GL_UNSIGNED_BYTE, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-            rt->color_texture, 0);
+        /* One colour texture per attachment (MRT: 'attachments' => [...]).
+         * The legacy single target arrives as attachment_count == 1 with
+         * formats[0] derived from 'hdr'. */
+        int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+        if (n > VIO_MAX_COLOR_ATTACHMENTS) n = VIO_MAX_COLOR_ATTACHMENTS;
+        GLenum draw_bufs[VIO_MAX_COLOR_ATTACHMENTS];
+        for (int i = 0; i < n; i++) {
+            int fmt = rt->attachment_count > 0 ? rt->formats[i] : (hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8);
+            GLint internal; GLenum base, type;
+            opengl_color_format(fmt, &internal, &base, &type);
+            GLuint tex = 0;
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, internal, width, height, 0, base, type, NULL);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, tex, 0);
+            rt->color_textures[i] = tex;
+            draw_bufs[i] = GL_COLOR_ATTACHMENT0 + (GLenum)i;
+        }
+        rt->color_texture = rt->color_textures[0];
+        rt->attachment_count = n;
+        /* FBO state: which colour attachments fragment outputs 0..n-1 write. */
+        glDrawBuffers(n, draw_bufs);
     }
 
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
@@ -874,16 +918,18 @@ static int opengl_render_target_cubemap(void *rt_ptr, void *cm_obj)
     return 0;
 }
 
-static int opengl_read_render_target(void *rt_ptr, int face, void *out_rgba)
+static int opengl_read_render_target(void *rt_ptr, int face, int attachment, void *out_rgba)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (!rt || rt->backend_type != VIO_RT_BACKEND_OPENGL || !vio_gl.initialized || !rt->fbo) return -1;
+    if (attachment < 0 || attachment >= (rt->attachment_count > 0 ? rt->attachment_count : 1)) return -1;
     int w = rt->width, h = rt->height;
     unsigned char *out = (unsigned char *)out_rgba;
 
     GLint prev_fbo = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+    if (!rt->depth_only) glReadBuffer(GL_COLOR_ATTACHMENT0 + (GLenum)attachment);
     if (rt->is_cube) {
         int f = face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -904,7 +950,8 @@ static int opengl_read_render_target(void *rt_ptr, int face, void *out_rgba)
         }
         efree(depth);
     } else {
-        /* GL clamps + quantises RGBA16F to UNSIGNED_BYTE for us. */
+        /* GL clamps + quantises float formats to UNSIGNED_BYTE for us; the
+         * missing channels of R/RG formats read back as 0 (G/B) and 1 (A). */
         glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out);
         int stride = w * 4;
         unsigned char *tmp = (unsigned char *)emalloc(stride);
@@ -921,6 +968,7 @@ static int opengl_read_render_target(void *rt_ptr, int face, void *out_rgba)
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                GL_TEXTURE_CUBE_MAP_POSITIVE_X + bf, rt->color_texture, rt->bound_level);
     }
+    if (!rt->depth_only) glReadBuffer(GL_COLOR_ATTACHMENT0);
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
     return 0;
 }

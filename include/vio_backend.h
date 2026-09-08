@@ -79,8 +79,10 @@ typedef struct _vio_backend {
      * targets, -1 otherwise) as top-down RGBA8, width*height*4 bytes. HDR
      * targets are clamped to 8 bit; depth-only targets return the depth as a
      * grey ramp (R=G=B=depth*255, A=255). Safe mid-frame (backends flush).
+     * attachment selects the colour attachment of an MRT target (0 otherwise).
+     * Every colour format is converted to RGBA8 (vio_rt_convert_to_rgba8).
      * Returns 0 on success. NULL => vio_read_render_target unsupported. */
-    int   (*read_render_target)(void *rt, int face, void *out_rgba);
+    int   (*read_render_target)(void *rt, int face, int attachment, void *out_rgba);
 
     /* Sub-region upload into an existing 2D texture (vio_texture_update).
      * pixels is w*h*channels bytes (channels as the texture was created with),

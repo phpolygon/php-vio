@@ -159,8 +159,12 @@ typedef struct _vio_d3d11_state {
     ID3D11DepthStencilView *dsv;
     ID3D11Texture2D        *depth_buffer;
 
-    /* Currently bound render target (NULL = backbuffer) */
+    /* Currently bound render target (NULL = backbuffer). current_rtv is
+     * attachment 0; MRT targets fill current_rtvs[1..count-1] as well so
+     * d3d11_clear can clear every attachment. */
     ID3D11RenderTargetView *current_rtv;
+    ID3D11RenderTargetView *current_rtvs[VIO_MAX_COLOR_ATTACHMENTS];
+    int                     current_rtv_count;
     ID3D11DepthStencilView *current_dsv;
     int current_rt_width;
     int current_rt_height;

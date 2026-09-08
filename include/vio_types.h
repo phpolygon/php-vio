@@ -6,6 +6,9 @@
 #ifndef VIO_TYPES_H
 #define VIO_TYPES_H
 
+/* Maximum colour attachments of one render target (MRT). */
+#define VIO_MAX_COLOR_ATTACHMENTS 4
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -281,6 +284,12 @@ typedef struct _vio_pipeline_desc {
                                                 other backends treat it as a no-op
                                                 (they derive the color format from the
                                                 bound target / render-pass instead). */
+    int              color_count;            /* MRT: number of colour outputs the PSO
+                                                writes (0 => legacy single target from
+                                                hdr_output). D3D12 needs the formats at
+                                                PSO creation; Metal/GL/D3D11 derive them
+                                                from the bound render target. */
+    int              color_formats[VIO_MAX_COLOR_ATTACHMENTS]; /* vio_pixel_format */
 } vio_pipeline_desc;
 
 typedef struct _vio_buffer_desc {
@@ -292,6 +301,20 @@ typedef struct _vio_buffer_desc {
                                  (StructuredBuffer StructureByteStride). 0 (default)
                                  => treat as raw/4-byte elements. */
 } vio_buffer_desc;
+
+/* Colour attachment formats for render targets (vio_render_target
+ * 'attachments' => [...]) and D3D12 PSO output formats. RGBA8 is the default
+ * and the swapchain format; RGBA16F is what the legacy 'hdr' => true selects. */
+typedef enum {
+    VIO_FORMAT_RGBA8      = 0,
+    VIO_FORMAT_RGBA16F    = 1,
+    VIO_FORMAT_RGBA32F    = 2,
+    VIO_FORMAT_R11G11B10F = 3,
+    VIO_FORMAT_RG16F      = 4,
+    VIO_FORMAT_R16F       = 5,
+    VIO_FORMAT_R32F       = 6,
+    VIO_FORMAT_R8         = 7,
+} vio_pixel_format;
 
 typedef struct _vio_texture_desc {
     const void *data;

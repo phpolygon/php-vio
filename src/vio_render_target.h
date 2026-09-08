@@ -10,6 +10,8 @@
 #endif
 
 #include "php.h"
+#include <stdint.h>
+#include "../include/vio_types.h"
 
 struct _vio_backend;
 
@@ -72,6 +74,28 @@ typedef struct _vio_render_target_object {
     void        *vulkan_sampler;              /* VkSampler for sampling the result */
     void        *vulkan_color_backend_texture;/* vio_vulkan_texture* cached for vio_render_target_texture() */
 
+    /* Multiple render targets (VIO_FEATURE_MRT). attachment_count is 1 for a
+     * classic target; formats[i] is the vio_pixel_format of colour attachment
+     * i. The per-backend *_s arrays hold ALL attachments — index 0 duplicates
+     * the legacy scalar field above it (color_texture, metal_color_texture,
+     * d3d11_rtv, d3d12_color_resource, ...), so single-target code keeps
+     * using the scalar and MRT code loops over the array. Destructors release
+     * index 0 through the scalar and indices >= 1 through the array. */
+    int          attachment_count;
+    int          formats[VIO_MAX_COLOR_ATTACHMENTS];
+    unsigned int color_textures[VIO_MAX_COLOR_ATTACHMENTS];              /* GL */
+    void        *metal_color_textures[VIO_MAX_COLOR_ATTACHMENTS];        /* id<MTLTexture> */
+    void        *metal_msaa_color_textures[VIO_MAX_COLOR_ATTACHMENTS];   /* id<MTLTexture> 2DMultisample */
+    void        *metal_color_backend_textures[VIO_MAX_COLOR_ATTACHMENTS];/* vio_metal_texture* wrappers */
+    void        *d3d11_rtvs[VIO_MAX_COLOR_ATTACHMENTS];                  /* ID3D11RenderTargetView* */
+    void        *d3d11_color_texs[VIO_MAX_COLOR_ATTACHMENTS];            /* ID3D11Texture2D* */
+    void        *d3d11_color_srvs[VIO_MAX_COLOR_ATTACHMENTS];            /* ID3D11ShaderResourceView* */
+    void        *d3d11_color_backend_textures[VIO_MAX_COLOR_ATTACHMENTS];/* vio_d3d11_texture* */
+    void        *d3d12_color_resources[VIO_MAX_COLOR_ATTACHMENTS];       /* ID3D12Resource* */
+    uint64_t     d3d12_color_srv_gpus[VIO_MAX_COLOR_ATTACHMENTS];
+    uint64_t     d3d12_color_srv_cpus[VIO_MAX_COLOR_ATTACHMENTS];
+    void        *d3d12_color_backend_textures[VIO_MAX_COLOR_ATTACHMENTS];/* vio_d3d12_texture* */
+
     /* Common */
     int          width;
     int          height;
@@ -105,6 +129,17 @@ typedef struct _vio_render_target_object {
 #define VIO_RT_BACKEND_D3D12  3
 #define VIO_RT_BACKEND_METAL  4
 #define VIO_RT_BACKEND_VULKAN 5
+
+/* Bytes per pixel of a vio_pixel_format as stored by the GPU backends
+ * (RGBA8 = 4, RGBA16F = 8, RGBA32F = 16, R11G11B10F = 4, RG16F = 4, R16F = 2,
+ * R32F = 4, R8 = 1). */
+int  vio_rt_format_bpp(int format);
+
+/* Convert w*h pixels of `format` (row pitch src_pitch bytes) into top-down
+ * RGBA8. Floats are clamped to [0,1]; missing channels read 0 (G/B) and 1 (A).
+ * bgra = 1 for 8-bit sources stored B,G,R,A (Metal's BGRA8Unorm targets). */
+void vio_rt_convert_to_rgba8(int format, int bgra, const void *src, size_t src_pitch,
+                             int w, int h, unsigned char *out);
 
 extern zend_class_entry *vio_render_target_ce;
 

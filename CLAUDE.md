@@ -5,7 +5,7 @@
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
 für die PHPolygon Game Engine. Aktuell **v2.8.0**, 134 PHP-Funktionen, 13 Zend-Klassen,
-6 Backends, 92 PHPT-Tests. Releases laufen über semantic-release
+6 Backends, 97 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
 ## Build
@@ -91,11 +91,12 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-95 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+97 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
+| `tests/render3d/096–097` | Storage-Images + 2D-Dispatch (API-Roadmap R2/R7), Multiple Render Targets (R1) |
 | `tests/core/` | Laden, Konstanten, Null-Backend, Context-Lifecycle, Plugins, Audit-Gate 070, Capability-Matrix 074, Perf/Memory-Gates |
 | `tests/backends/` | Backend-Registrierung + GPU-Kontexte (OpenGL/Vulkan/Metal/D3D11/D3D12), Cross-Backend-Parity 067, Metal-3D 089, Uniform-Layout Struct-Arrays 094, Texture-Bind-Reihenfolge 095, D3D-Spezifika |
 | `tests/render3d/` | Mesh/Shader/Pipeline/Texturen/Buffer/RT/Cubemap/Compute/Vertex-Storage, headless GL |
@@ -153,6 +154,12 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | `vio_read_render_target` | ✅ | ✅ | ❌ (Follow-up) | ❌ | ✅ |
 | `vio_texture_update` | ✅ | ✅ | ❌ (Follow-up) | ❌ | ✅ |
 | `depth_write` / `color_mask` / Blend-Modi | ✅ | ✅ | ✅ | — | ✅ |
+| MRT (`'attachments' => [VIO_FORMAT_*…]`, bis 4) | ✅ | ✅† | ✅† | ❌ | ✅ |
+| Storage-Images (`'storage' => true` + `vio_compute_bind_image`) | ✅ (wenn Compute) | ✅† | ✅† | ❌ | ✅ |
+| Compute-`local_size` aus Reflection (2D/3D-Dispatch) | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+† D3D11/D3D12: implementiert, aber ohne Windows-Build hier nur blind editiert — Windows-CI
+(WARP) ist der Beleg (`tests/render3d/096`, `097`).
 
 \* OpenGL/D3D melden `RENDER_TARGET_MSAA = 1`, ignorieren `samples` aber (alle RTs
 single-sampled); D3D meldet auch `TESSELLATION`/`GEOMETRY = 1` ohne Hull/Geometry-Stage.
@@ -446,6 +453,15 @@ $envCube = vio_render_target_cubemap($env);       // samplerCube, textureLod(dir
 // Readback eines RTs (auch mid-frame): Farbe, HDR (auf 8 Bit), Depth-only (Grau-Rampe), Cube-Face
 $rgba = vio_read_render_target($rt);  $face = vio_read_render_target($env, 3);
 
+// Multiple Render Targets (G-Buffer): bis 4 Farb-Attachments, Fragment layout(location = i) out
+$gb = vio_render_target($ctx, ["width" => $w, "height" => $h,
+        "attachments" => [VIO_FORMAT_RGBA8, VIO_FORMAT_RGBA16F, VIO_FORMAT_RG16F]]);
+$gbPipe = vio_pipeline($ctx, ["shader" => $s, "attachments" => [VIO_FORMAT_RGBA8, VIO_FORMAT_RGBA16F, VIO_FORMAT_RG16F]]); // Formate nur für D3D12-PSO nötig
+vio_bind_render_target($ctx, $gb); /* ... */ vio_unbind_render_target($ctx);
+$normals = vio_render_target_texture($gb, 1);          // Attachment-Index
+$rg      = vio_read_render_target($gb, -1, 2);          // (rt, face, attachment) → immer RGBA8
+// Formate: VIO_FORMAT_RGBA8, RGBA16F, RGBA32F, R11G11B10F, RG16F, R16F, R32F, R8
+
 // Pipeline-State
 vio_pipeline($ctx, ["shader" => $s, "depth_test" => true, "depth_write" => false,   // Sky / Transparenz
                     "blend" => VIO_BLEND_PREMULTIPLIED, "color_mask" => VIO_COLOR_RGB]);
@@ -462,6 +478,12 @@ vio_compute_bind_buffer($ctx, $cp, $out, 1, VIO_COMPUTE_WRITE);
 vio_compute_set_uniforms($ctx, $cp, pack("i4f4", ...));                     // Params-UBO (binding 2)
 vio_compute_dispatch($ctx, $cp, $gx, $gy, $gz);                             // synchron
 $bytes = vio_storage_buffer_read($ctx, $out);                               // GPU→CPU
+
+// Storage-Images (image2D / image3D): Kernel schreibt in eine Textur, Render-Pass sampelt sie
+$img = vio_texture($ctx, ["width" => $w, "height" => $h, "storage" => true]);  // 'data' optional (nullinitialisiert)
+vio_compute_bind_image($ctx, $cp, $img, 0, VIO_COMPUTE_WRITE);   // layout(binding = 0, rgba8) uniform image2D
+vio_compute_dispatch($ctx, $cp, ceil($w / 8), ceil($h / 8), 1);   // local_size kommt aus der Reflection (2D/3D-Kernel)
+vio_bind_texture($ctx, $img, 0);                                  // danach normal sampeln
 
 // "Path B": Vertex-Stage liest den Storage Buffer direkt (kein Readback), v2.8.0
 if (vio_supports_feature($ctx, VIO_FEATURE_VERTEX_STORAGE)) {
@@ -676,7 +698,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 094), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 098), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -698,9 +720,9 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   `color_mask`/Blend-Modi, `vio_read_render_target`, konsistente Headless-Größen,
   Pipeline-Destruktor); Phase 2 portiert die GPU-Environment-Cubemap nach `VioRenderer3D`;
   Phase 3 entfernt ext-metal aus PHPolygon; Phase 4 archiviert das Repo.
-- **`API-ROADMAP.md` — 📋 Implementierungsplan.** Features, die kein Backend exponiert,
-  obwohl alle nativ können: MRT, Storage-Images, Stencil, uint16-Indices/Texture-Arrays/
-  Kompression, GPU-Timestamps, Indirect Draw, Dispatch-Geometrie, Pipeline-Cache; gated:
+- **`API-ROADMAP.md` — 🚧 R1 MRT, R2 Storage-Images, R7 Dispatch-Geometrie umgesetzt**
+  (2.10-Paket, Tests 096/097); offen: R3 Stencil, R4 uint16-Indices/Texture-Arrays/
+  Kompression, R5 GPU-Timestamps, R6 Indirect Draw, R7-Async, R8 Pipeline-Cache; gated:
   Mesh-Shader/Ray-Tracing/Upscaling. Immer für Metal+GL+D3D11+D3D12 gleichzeitig.
 - Metal-3D-Pipeline: ✅ implementiert, Feature-Parität mit D3D11/D3D12 (siehe
   „Metal-3D-Pipeline" oben). PHPolygons Standalone-`MetalRenderer3D` (ext-metal /

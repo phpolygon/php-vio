@@ -53,6 +53,7 @@ probe("opengl", [
     VIO_FEATURE_NATIVE_2D_BATCH    => 1,
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,
     VIO_FEATURE_MIPMAP_GEN         => 1,
+    VIO_FEATURE_MRT                => 1,
     VIO_FEATURE_RAYTRACING         => 0,
     VIO_FEATURE_MULTIVIEW          => 0,
 ]);
@@ -80,6 +81,8 @@ if ($mtl) {
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET_MSAA) === true
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET_CUBE) === true
        && vio_supports_feature($mtl, VIO_FEATURE_MIPMAP_GEN) === true
+       && vio_supports_feature($mtl, VIO_FEATURE_MRT) === true
+       && vio_supports_feature($mtl, VIO_FEATURE_STORAGE_IMAGE) === vio_supports_feature($mtl, VIO_FEATURE_COMPUTE)
        && vio_supports_feature($mtl, VIO_FEATURE_NATIVE_2D_BATCH) === true
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET) === true
        && vio_supports_feature($mtl, VIO_FEATURE_TEXTURE_SWIZZLE) === true;

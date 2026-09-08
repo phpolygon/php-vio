@@ -37,6 +37,11 @@ typedef struct _vio_pipeline_object {
                                          (R16G16B16A16_FLOAT) to match an hdr=true
                                          render target; 0 (default) => R8G8B8A8_UNORM.
                                          D3D12-only this round; other backends ignore. */
+    int            color_count;       /* 'attachments' => [...]: MRT output formats the
+                                         D3D12 PSO is built with (0 => single target from
+                                         hdr_output). Other backends derive them from the
+                                         bound render target. */
+    int            color_formats[4];  /* vio_pixel_format, VIO_MAX_COLOR_ATTACHMENTS */
     int            valid;
     zend_object    std;
 } vio_pipeline_object;

@@ -78,6 +78,9 @@ int vio_opengl_setup_context(void);
 #ifdef HAVE_D3D12
 #include "src/backends/d3d12/vio_d3d12.h"
 #endif
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
+#include "src/backends/vio_d3d_common.h"
+#endif
 
 ZEND_DECLARE_MODULE_GLOBALS(vio)
 
@@ -2666,6 +2669,18 @@ ZEND_FUNCTION(vio_pipeline)
     if ((val = zend_hash_str_find(config_ht, "hdr", sizeof("hdr") - 1)) != NULL) {
         pipe->hdr_output = zend_is_true(val) ? 1 : 0;
     }
+    /* MRT: 'attachments' => [VIO_FORMAT_*, ...] declares the colour outputs the
+     * pipeline writes. Only D3D12 needs it (PSO RTV formats are immutable
+     * there); Metal / GL / D3D11 derive the layout from the bound target. */
+    if ((val = zend_hash_str_find(config_ht, "attachments", sizeof("attachments") - 1)) != NULL &&
+        Z_TYPE_P(val) == IS_ARRAY) {
+        zval *fz;
+        pipe->color_count = 0;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(val), fz) {
+            if (pipe->color_count >= VIO_MAX_COLOR_ATTACHMENTS) break;
+            pipe->color_formats[pipe->color_count++] = (int)zval_get_long(fz);
+        } ZEND_HASH_FOREACH_END();
+    }
 
     /* Store backend shader reference for lazy pipeline creation */
     pipe->backend_shader = shader->backend_shader;
@@ -2750,6 +2765,8 @@ ZEND_FUNCTION(vio_pipeline)
         desc.depth_bias = pipe->depth_bias;
         desc.slope_scaled_depth_bias = pipe->slope_scaled_depth_bias;
         desc.hdr_output = pipe->hdr_output;
+        desc.color_count = pipe->color_count;
+        memcpy(desc.color_formats, pipe->color_formats, sizeof(desc.color_formats));
 
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
     }
@@ -6602,6 +6619,14 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_CUBE", VIO_FEATURE_RENDER_TARGET_CUBE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MIPMAP_GEN", VIO_FEATURE_MIPMAP_GEN, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MRT", VIO_FEATURE_MRT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_RGBA8", VIO_FORMAT_RGBA8, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_RGBA16F", VIO_FORMAT_RGBA16F, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_RGBA32F", VIO_FORMAT_RGBA32F, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_R11G11B10F", VIO_FORMAT_R11G11B10F, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_RG16F", VIO_FORMAT_RG16F, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_R16F", VIO_FORMAT_R16F, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_R32F", VIO_FORMAT_R32F, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_R8", VIO_FORMAT_R8, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STORAGE_IMAGE", VIO_FEATURE_STORAGE_IMAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_STORAGE", VIO_FEATURE_VERTEX_STORAGE, CONST_CS | CONST_PERSISTENT);
 
@@ -7652,6 +7677,39 @@ ZEND_FUNCTION(vio_render_target)
     if ((val = zend_hash_str_find(config_ht, "hdr", sizeof("hdr") - 1)) != NULL) {
         hdr = zend_is_true(val);
     }
+    /* Colour attachments. 'attachments' => [VIO_FORMAT_*, ...] (1..4) enables
+     * MRT — fragment layout(location = i) out writes attachment i. Without it
+     * the classic single target is used, RGBA8 or RGBA16F via 'hdr'. */
+    int attachment_count = 1;
+    int formats[VIO_MAX_COLOR_ATTACHMENTS] = { hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8, 0, 0, 0 };
+    if ((val = zend_hash_str_find(config_ht, "attachments", sizeof("attachments") - 1)) != NULL &&
+        Z_TYPE_P(val) == IS_ARRAY) {
+        int n = 0;
+        zval *fz;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(val), fz) {
+            zend_long f = zval_get_long(fz);
+            if (n >= VIO_MAX_COLOR_ATTACHMENTS) {
+                php_error_docref(NULL, E_WARNING, "vio_render_target: at most %d attachments", VIO_MAX_COLOR_ATTACHMENTS);
+                RETURN_FALSE;
+            }
+            if (f < VIO_FORMAT_RGBA8 || f > VIO_FORMAT_R8) {
+                php_error_docref(NULL, E_WARNING, "vio_render_target: unknown attachment format %ld", (long)f);
+                RETURN_FALSE;
+            }
+            formats[n++] = (int)f;
+        } ZEND_HASH_FOREACH_END();
+        if (n == 0) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'attachments' must not be empty");
+            RETURN_FALSE;
+        }
+        attachment_count = n;
+        hdr = (formats[0] == VIO_FORMAT_RGBA16F);
+        if (n > 1 && (!ctx->backend->supports_feature || !ctx->backend->supports_feature(VIO_FEATURE_MRT))) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_render_target: multiple render targets are not supported on backend '%s'", ctx->backend->name);
+            RETURN_FALSE;
+        }
+    }
     /* MSAA sample count. Backends that implement it (Metal) clamp to a
      * supported power of two and write the effective count back into
      * rt->samples; the others ignore it and render single-sampled. */
@@ -7682,6 +7740,10 @@ ZEND_FUNCTION(vio_render_target)
             php_error_docref(NULL, E_WARNING, "vio_render_target: cube targets cannot be depth_only");
             RETURN_FALSE;
         }
+        if (attachment_count > 1) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: cube targets support a single attachment");
+            RETURN_FALSE;
+        }
         if ((val = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1)) != NULL && zend_is_true(val)) {
             mip_levels = 1;
             for (int d = width; d > 1; d >>= 1) mip_levels++;
@@ -7708,6 +7770,8 @@ ZEND_FUNCTION(vio_render_target)
     rt->is_cube    = is_cube;
     rt->mip_levels = mip_levels;
     rt->backend    = ctx->backend;
+    rt->attachment_count = attachment_count;
+    memcpy(rt->formats, formats, sizeof(formats));
 
     /* OpenGL + Metal go through the vtable; D3D11/D3D12 still inline below
      * until their backends implement create_render_target. */
@@ -7773,54 +7837,55 @@ ZEND_FUNCTION(vio_render_target)
         rt->d3d11_depth_srv = depth_srv;
 
         if (!depth_only) {
-            /* Color texture */
-            D3D11_TEXTURE2D_DESC color_desc = {0};
-            color_desc.Width = width;
-            color_desc.Height = height;
-            color_desc.MipLevels = 1;
-            color_desc.ArraySize = 1;
-            color_desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
-            color_desc.SampleDesc.Count = 1;
-            color_desc.Usage = D3D11_USAGE_DEFAULT;
-            color_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            /* One colour texture + RTV + SRV per attachment (MRT). Index 0 also
+             * fills the legacy scalar slots. */
+            for (int ai = 0; ai < attachment_count; ai++) {
+                DXGI_FORMAT dxfmt = vio_pixel_format_to_dxgi(formats[ai]);
+                D3D11_TEXTURE2D_DESC color_desc = {0};
+                color_desc.Width = width;
+                color_desc.Height = height;
+                color_desc.MipLevels = 1;
+                color_desc.ArraySize = 1;
+                color_desc.Format = dxfmt;
+                color_desc.SampleDesc.Count = 1;
+                color_desc.Usage = D3D11_USAGE_DEFAULT;
+                color_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
-            ID3D11Texture2D *color_tex = NULL;
-            hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &color_desc, NULL, &color_tex);
-            if (FAILED(hr)) {
-                ID3D11DepthStencilView_Release(dsv);
-                ID3D11Texture2D_Release(depth_tex);
-                if (depth_srv) ID3D11ShaderResourceView_Release(depth_srv);
-                php_error_docref(NULL, E_WARNING, "D3D11: Failed to create color texture (0x%08lx)", hr);
-                zval_ptr_dtor(&rt_zval);
-                RETURN_FALSE;
-            }
+                ID3D11Texture2D *color_tex = NULL;
+                hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &color_desc, NULL, &color_tex);
+                if (FAILED(hr)) {
+                    php_error_docref(NULL, E_WARNING, "D3D11: Failed to create color texture %d (0x%08lx)", ai, hr);
+                    rt->backend_type = VIO_RT_BACKEND_D3D11;   /* let the free handler release what exists */
+                    zval_ptr_dtor(&rt_zval);
+                    RETURN_FALSE;
+                }
 
-            ID3D11RenderTargetView *rtv = NULL;
-            hr = ID3D11Device_CreateRenderTargetView(vio_d3d11.device, (ID3D11Resource *)color_tex,
-                                                      NULL, &rtv);
-            if (FAILED(hr)) {
-                ID3D11Texture2D_Release(color_tex);
-                ID3D11DepthStencilView_Release(dsv);
-                ID3D11Texture2D_Release(depth_tex);
-                if (depth_srv) ID3D11ShaderResourceView_Release(depth_srv);
-                php_error_docref(NULL, E_WARNING, "D3D11: Failed to create RTV (0x%08lx)", hr);
-                zval_ptr_dtor(&rt_zval);
-                RETURN_FALSE;
-            }
+                ID3D11RenderTargetView *rtv = NULL;
+                hr = ID3D11Device_CreateRenderTargetView(vio_d3d11.device, (ID3D11Resource *)color_tex,
+                                                          NULL, &rtv);
+                if (FAILED(hr)) {
+                    ID3D11Texture2D_Release(color_tex);
+                    php_error_docref(NULL, E_WARNING, "D3D11: Failed to create RTV %d (0x%08lx)", ai, hr);
+                    rt->backend_type = VIO_RT_BACKEND_D3D11;
+                    zval_ptr_dtor(&rt_zval);
+                    RETURN_FALSE;
+                }
 
-            rt->d3d11_rtv = rtv;
-            rt->d3d11_color_tex = color_tex;
-
-            /* Create SRV for color texture (for sampling in post-process passes) */
-            {
+                /* SRV for sampling the attachment in later passes */
                 ID3D11ShaderResourceView *color_srv = NULL;
                 D3D11_SHADER_RESOURCE_VIEW_DESC color_srv_desc = {0};
-                color_srv_desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+                color_srv_desc.Format = dxfmt;
                 color_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
                 color_srv_desc.Texture2D.MipLevels = 1;
                 ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)color_tex, &color_srv_desc, &color_srv);
-                rt->d3d11_color_srv = color_srv;
+
+                rt->d3d11_rtvs[ai]       = rtv;
+                rt->d3d11_color_texs[ai] = color_tex;
+                rt->d3d11_color_srvs[ai] = color_srv;
             }
+            rt->d3d11_rtv       = rt->d3d11_rtvs[0];
+            rt->d3d11_color_tex = rt->d3d11_color_texs[0];
+            rt->d3d11_color_srv = rt->d3d11_color_srvs[0];
         }
 
         rt->backend_type = VIO_RT_BACKEND_D3D11;
@@ -7831,10 +7896,10 @@ ZEND_FUNCTION(vio_render_target)
     if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
         HRESULT hr;
 
-        /* Create dedicated RTV descriptor heap (1 descriptor) */
+        /* Create dedicated RTV descriptor heap (one descriptor per attachment) */
         if (!depth_only) {
             D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {0};
-            rtv_heap_desc.NumDescriptors = 1;
+            rtv_heap_desc.NumDescriptors = (UINT)attachment_count;
             rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 
             ID3D12DescriptorHeap *rtv_heap = NULL;
@@ -7847,39 +7912,43 @@ ZEND_FUNCTION(vio_render_target)
             }
             rt->d3d12_rtv_heap = rtv_heap;
 
-            /* Color resource */
-            D3D12_HEAP_PROPERTIES heap_props = {0};
-            heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-            D3D12_RESOURCE_DESC res_desc = {0};
-            res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            res_desc.Width = width;
-            res_desc.Height = height;
-            res_desc.DepthOrArraySize = 1;
-            res_desc.MipLevels = 1;
-            res_desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
-            res_desc.SampleDesc.Count = 1;
-            res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-
-            D3D12_CLEAR_VALUE clear_val = {0};
-            clear_val.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
-
-            ID3D12Resource *color_res = NULL;
-            hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props,
-                D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                &clear_val, &IID_ID3D12Resource, (void **)&color_res);
-            if (FAILED(hr)) {
-                ID3D12DescriptorHeap_Release(rtv_heap);
-                php_error_docref(NULL, E_WARNING, "D3D12: Failed to create color resource (0x%08lx)", hr);
-                zval_ptr_dtor(&rt_zval);
-                RETURN_FALSE;
-            }
-            rt->d3d12_color_resource = color_res;
-
-            /* Create RTV */
+            /* Colour resources: one per attachment, RTV i at heap slot i. */
             D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
             ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtv_heap, &rtv_handle);
-            ID3D12Device_CreateRenderTargetView(vio_d3d12.device, color_res, NULL, rtv_handle);
+            for (int ai = 0; ai < attachment_count; ai++) {
+                DXGI_FORMAT dxfmt = vio_pixel_format_to_dxgi(formats[ai]);
+                D3D12_HEAP_PROPERTIES heap_props = {0};
+                heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+                D3D12_RESOURCE_DESC res_desc = {0};
+                res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                res_desc.Width = width;
+                res_desc.Height = height;
+                res_desc.DepthOrArraySize = 1;
+                res_desc.MipLevels = 1;
+                res_desc.Format = dxfmt;
+                res_desc.SampleDesc.Count = 1;
+                res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+                D3D12_CLEAR_VALUE clear_val = {0};
+                clear_val.Format = dxfmt;
+
+                ID3D12Resource *color_res = NULL;
+                hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props,
+                    D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    &clear_val, &IID_ID3D12Resource, (void **)&color_res);
+                if (FAILED(hr)) {
+                    php_error_docref(NULL, E_WARNING, "D3D12: Failed to create color resource %d (0x%08lx)", ai, hr);
+                    rt->backend_type = VIO_RT_BACKEND_D3D12;   /* free handler releases what exists */
+                    zval_ptr_dtor(&rt_zval);
+                    RETURN_FALSE;
+                }
+                rt->d3d12_color_resources[ai] = color_res;
+
+                D3D12_CPU_DESCRIPTOR_HANDLE h = { rtv_handle.ptr + (SIZE_T)ai * vio_d3d12.rtv_descriptor_size };
+                ID3D12Device_CreateRenderTargetView(vio_d3d12.device, color_res, NULL, h);
+            }
+            rt->d3d12_color_resource = rt->d3d12_color_resources[0];
         }
 
         /* DSV descriptor heap */
@@ -7978,9 +8047,10 @@ ZEND_FUNCTION(vio_render_target)
             rt->d3d12_depth_srv_cpu = staging_cpu.ptr;
         }
 
-        /* For color targets: pre-create SRV for color texture sampling.
+        /* For color targets: pre-create one SRV per attachment for sampling.
          * Same staging-heap pattern as the depth-only branch above. */
-        if (!depth_only && rt->d3d12_color_resource && vio_d3d12.srv_heap.count < vio_d3d12.srv_heap.capacity) {
+        for (int ai = 0; !depth_only && ai < attachment_count; ai++) {
+            if (!rt->d3d12_color_resources[ai] || vio_d3d12.srv_heap.count >= vio_d3d12.srv_heap.capacity) break;
             UINT color_srv_idx = vio_d3d12.srv_heap.capacity - 1 - vio_d3d12.srv_heap.count;
             vio_d3d12.srv_heap.count++;
             D3D12_CPU_DESCRIPTOR_HANDLE color_staging_cpu;
@@ -7991,14 +8061,18 @@ ZEND_FUNCTION(vio_render_target)
             color_srv_gpu.ptr     += color_srv_idx * vio_d3d12.srv_heap.descriptor_size;
 
             D3D12_SHADER_RESOURCE_VIEW_DESC color_srv_desc = {0};
-            color_srv_desc.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+            color_srv_desc.Format = vio_pixel_format_to_dxgi(formats[ai]);
             color_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             color_srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             color_srv_desc.Texture2D.MipLevels = 1;
-            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, (ID3D12Resource *)rt->d3d12_color_resource, &color_srv_desc, color_staging_cpu);
+            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, (ID3D12Resource *)rt->d3d12_color_resources[ai], &color_srv_desc, color_staging_cpu);
 
-            rt->d3d12_color_srv_gpu = color_srv_gpu.ptr;
-            rt->d3d12_color_srv_cpu = color_staging_cpu.ptr;
+            rt->d3d12_color_srv_gpus[ai] = color_srv_gpu.ptr;
+            rt->d3d12_color_srv_cpus[ai] = color_staging_cpu.ptr;
+            if (ai == 0) {
+                rt->d3d12_color_srv_gpu = color_srv_gpu.ptr;
+                rt->d3d12_color_srv_cpu = color_staging_cpu.ptr;
+            }
         }
 
         rt->backend_type = VIO_RT_BACKEND_D3D12;
@@ -8055,15 +8129,22 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt)
         }
     }
 
-    /* Barrier: if color resource was used as SRV, transition back to RENDER_TARGET */
+    /* Barrier: if the colour resources were used as SRVs, transition every
+     * attachment back to RENDER_TARGET (one flag covers the whole MRT set). */
     if (rt->d3d12_color_resource && rt->d3d12_color_is_srv) {
-        D3D12_RESOURCE_BARRIER barrier = {0};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = (ID3D12Resource *)rt->d3d12_color_resource;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+        int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+        for (int ai = 0; ai < n && ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
+            ID3D12Resource *res = ai == 0 ? (ID3D12Resource *)rt->d3d12_color_resource
+                                          : (ID3D12Resource *)rt->d3d12_color_resources[ai];
+            if (!res) continue;
+            D3D12_RESOURCE_BARRIER barrier = {0};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = res;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+        }
         rt->d3d12_color_is_srv = 0;
     }
 
@@ -8086,12 +8167,22 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt)
     if (rt->depth_only) {
         ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 0, NULL, FALSE, &dsv_handle);
         vio_d3d12.current_has_rtv = 0;
+        vio_d3d12.current_rtv_count = 0;
     } else {
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+        /* RTV i lives at heap slot i (see vio_render_target). */
+        int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+        if (n > VIO_MAX_COLOR_ATTACHMENTS) n = VIO_MAX_COLOR_ATTACHMENTS;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv_handles[VIO_MAX_COLOR_ATTACHMENTS];
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv_base;
         ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
-            (ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &rtv_handle);
-        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
-        vio_d3d12.current_rtv = rtv_handle;
+            (ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &rtv_base);
+        for (int ai = 0; ai < n; ai++) {
+            rtv_handles[ai].ptr = rtv_base.ptr + (SIZE_T)ai * vio_d3d12.rtv_descriptor_size;
+            vio_d3d12.current_rtvs[ai] = rtv_handles[ai];
+        }
+        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, (UINT)n, rtv_handles, FALSE, &dsv_handle);
+        vio_d3d12.current_rtv = rtv_handles[0];
+        vio_d3d12.current_rtv_count = n;
         vio_d3d12.current_has_rtv = 1;
     }
     vio_d3d12.current_dsv = dsv_handle;
@@ -8141,9 +8232,17 @@ static void d3d11_apply_render_target_bind(vio_render_target_object *rt)
     if (rt->depth_only) {
         ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 0, NULL, dsv);
         vio_d3d11.current_rtv = NULL;
+        vio_d3d11.current_rtv_count = 0;
     } else {
-        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 1, &rtv, dsv);
+        /* All colour attachments at once (MRT); index 0 == rtv. */
+        int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+        if (n > VIO_MAX_COLOR_ATTACHMENTS) n = VIO_MAX_COLOR_ATTACHMENTS;
+        ID3D11RenderTargetView *rtvs[VIO_MAX_COLOR_ATTACHMENTS] = { rtv, NULL, NULL, NULL };
+        for (int ai = 1; ai < n; ai++) rtvs[ai] = (ID3D11RenderTargetView *)rt->d3d11_rtvs[ai];
+        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, (UINT)n, rtvs, dsv);
         vio_d3d11.current_rtv = rtv;
+        for (int ai = 0; ai < n; ai++) vio_d3d11.current_rtvs[ai] = rtvs[ai];
+        vio_d3d11.current_rtv_count = n;
     }
     vio_d3d11.current_dsv = dsv;
     vio_d3d11.current_rt_width = rt->width;
@@ -8390,15 +8489,21 @@ ZEND_FUNCTION(vio_unbind_render_target)
                 ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
                 bound_rt->d3d12_depth_is_srv = 1;
             }
-            /* Transition color to SRV if color target */
+            /* Transition every colour attachment to SRV if color target */
             if (bound_rt->d3d12_color_resource && !bound_rt->depth_only) {
-                D3D12_RESOURCE_BARRIER barrier = {0};
-                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                barrier.Transition.pResource = (ID3D12Resource *)bound_rt->d3d12_color_resource;
-                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+                int n = bound_rt->attachment_count > 0 ? bound_rt->attachment_count : 1;
+                for (int ai = 0; ai < n && ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
+                    ID3D12Resource *res = ai == 0 ? (ID3D12Resource *)bound_rt->d3d12_color_resource
+                                                  : (ID3D12Resource *)bound_rt->d3d12_color_resources[ai];
+                    if (!res) continue;
+                    D3D12_RESOURCE_BARRIER barrier = {0};
+                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    barrier.Transition.pResource = res;
+                    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+                }
                 bound_rt->d3d12_color_is_srv = 1;
             }
             vio_d3d12.current_bound_rt = NULL;
@@ -8604,11 +8709,13 @@ ZEND_FUNCTION(vio_read_render_target)
 {
     zval *rt_zval;
     zend_long face = -1;
+    zend_long attachment = 0;
 
-    ZEND_PARSE_PARAMETERS_START(1, 2)
+    ZEND_PARSE_PARAMETERS_START(1, 3)
         Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
         Z_PARAM_OPTIONAL
         Z_PARAM_LONG(face)
+        Z_PARAM_LONG(attachment)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rt_zval);
@@ -8620,13 +8727,18 @@ ZEND_FUNCTION(vio_read_render_target)
         php_error_docref(NULL, E_WARNING, "vio_read_render_target: face must be 0..5 on a cube render target");
         RETURN_FALSE;
     }
+    int rt_attachments = rt->attachment_count > 0 ? rt->attachment_count : 1;
+    if (attachment < 0 || attachment >= rt_attachments) {
+        php_error_docref(NULL, E_WARNING, "vio_read_render_target: attachment must be 0..%d", rt_attachments - 1);
+        RETURN_FALSE;
+    }
 
     size_t size = (size_t)rt->width * rt->height * 4;
     zend_string *buf = zend_string_alloc(size, 0);
     ZSTR_VAL(buf)[size] = '\0';
 
     if (rt->backend->read_render_target) {
-        if (rt->backend->read_render_target(rt, (int)face, ZSTR_VAL(buf)) == 0) {
+        if (rt->backend->read_render_target(rt, (int)face, (int)attachment, ZSTR_VAL(buf)) == 0) {
             RETURN_NEW_STR(buf);
         }
         zend_string_release(buf);
@@ -8637,7 +8749,8 @@ ZEND_FUNCTION(vio_read_render_target)
 #ifdef HAVE_D3D11
     if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
         ID3D11Texture2D *src = rt->depth_only ? (ID3D11Texture2D *)rt->d3d11_depth_tex
-                                              : (ID3D11Texture2D *)rt->d3d11_color_tex;
+                             : (attachment == 0 ? (ID3D11Texture2D *)rt->d3d11_color_tex
+                                                : (ID3D11Texture2D *)rt->d3d11_color_texs[attachment]);
         if (!src) { zend_string_release(buf); RETURN_FALSE; }
         D3D11_TEXTURE2D_DESC sd;
         ID3D11Texture2D_GetDesc(src, &sd);
@@ -8653,22 +8766,20 @@ ZEND_FUNCTION(vio_read_render_target)
         }
         unsigned char *out = (unsigned char *)ZSTR_VAL(buf);
         int w = rt->width, h = rt->height;
-        for (int y = 0; y < h; y++) {
-            const unsigned char *row = (const unsigned char *)m.pData + (size_t)y * m.RowPitch;
-            unsigned char *dst = out + (size_t)y * w * 4;
-            if (rt->depth_only) {
+        if (rt->depth_only) {
+            for (int y = 0; y < h; y++) {
+                const unsigned char *row = (const unsigned char *)m.pData + (size_t)y * m.RowPitch;
+                unsigned char *dst = out + (size_t)y * w * 4;
                 /* R24G8_TYPELESS: low 24 bits = depth */
                 for (int x = 0; x < w; x++) {
                     uint32_t v = *(const uint32_t *)(row + x * 4) & 0x00FFFFFFu;
                     unsigned char g = (unsigned char)((v * 255ULL) / 0x00FFFFFFu);
                     dst[x*4+0] = dst[x*4+1] = dst[x*4+2] = g; dst[x*4+3] = 255;
                 }
-            } else if (sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-                const uint16_t *hp = (const uint16_t *)row;
-                for (int x = 0; x < w * 4; x++) dst[x] = vio_unit_to_byte(vio_half_to_float(hp[x]));
-            } else {
-                memcpy(dst, row, (size_t)w * 4);
             }
+        } else {
+            /* Shared converter: any attachment format -> RGBA8. */
+            vio_rt_convert_to_rgba8(rt->formats[attachment], 0, m.pData, (size_t)m.RowPitch, w, h, out);
         }
         ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)staging, 0);
         ID3D11Texture2D_Release(staging);
@@ -8684,9 +8795,12 @@ ZEND_FUNCTION(vio_read_render_target)
 ZEND_FUNCTION(vio_render_target_texture)
 {
     zval *rt_zval;
+    zend_long attachment = 0;
 
-    ZEND_PARSE_PARAMETERS_START(1, 1)
+    ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(attachment)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rt_zval);
@@ -8695,6 +8809,12 @@ ZEND_FUNCTION(vio_render_target_texture)
         php_error_docref(NULL, E_WARNING, "Render target is not valid");
         RETURN_FALSE;
     }
+    int rt_attachments = rt->attachment_count > 0 ? rt->attachment_count : 1;
+    if (attachment < 0 || attachment >= rt_attachments || (rt->depth_only && attachment != 0)) {
+        php_error_docref(NULL, E_WARNING, "vio_render_target_texture: attachment must be 0..%d", rt_attachments - 1);
+        RETURN_FALSE;
+    }
+    int att = (int)attachment;   /* MRT colour attachment index (0 == the legacy scalar fields) */
 
     /* Create a VioTexture that references the render target's depth or color texture */
     zval tex_zval;
@@ -8709,7 +8829,7 @@ ZEND_FUNCTION(vio_render_target_texture)
     tex->wrap     = VIO_WRAP_CLAMP;
 
     /* Return depth texture for depth-only targets, color texture otherwise */
-    tex->texture_id = rt->depth_only ? rt->depth_texture : rt->color_texture;
+    tex->texture_id = rt->depth_only ? rt->depth_texture : (att == 0 ? rt->color_texture : rt->color_textures[att]);
     tex->valid    = 1;
     tex->borrowed = 1;  /* GL resource owned by render target, don't double-delete */
 
@@ -8725,12 +8845,14 @@ ZEND_FUNCTION(vio_render_target_texture)
     if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
         vio_d3d11_texture **cache_slot = rt->depth_only
             ? (vio_d3d11_texture **)&rt->d3d11_depth_backend_texture
-            : (vio_d3d11_texture **)&rt->d3d11_color_backend_texture;
+            : (att == 0 ? (vio_d3d11_texture **)&rt->d3d11_color_backend_texture
+                        : (vio_d3d11_texture **)&rt->d3d11_color_backend_textures[att]);
 
         if (*cache_slot == NULL) {
             ID3D11ShaderResourceView *srv = rt->depth_only
                 ? (ID3D11ShaderResourceView *)rt->d3d11_depth_srv
-                : (ID3D11ShaderResourceView *)rt->d3d11_color_srv;
+                : (att == 0 ? (ID3D11ShaderResourceView *)rt->d3d11_color_srv
+                            : (ID3D11ShaderResourceView *)rt->d3d11_color_srvs[att]);
             if (srv) {
                 vio_d3d11_texture *d3d_tex = calloc(1, sizeof(vio_d3d11_texture));
                 d3d_tex->texture = NULL;  /* owned by render target */
@@ -8792,7 +8914,10 @@ ZEND_FUNCTION(vio_render_target_texture)
     if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized) {
         vio_d3d12_texture **cache_slot = rt->depth_only
             ? (vio_d3d12_texture **)&rt->d3d12_depth_backend_texture
-            : (vio_d3d12_texture **)&rt->d3d12_color_backend_texture;
+            : (att == 0 ? (vio_d3d12_texture **)&rt->d3d12_color_backend_texture
+                        : (vio_d3d12_texture **)&rt->d3d12_color_backend_textures[att]);
+        uint64_t color_srv_gpu = att == 0 ? rt->d3d12_color_srv_gpu : rt->d3d12_color_srv_gpus[att];
+        uint64_t color_srv_cpu = att == 0 ? rt->d3d12_color_srv_cpu : rt->d3d12_color_srv_cpus[att];
 
         if (*cache_slot == NULL) {
             if (rt->depth_only && rt->d3d12_depth_srv_gpu) {
@@ -8803,13 +8928,13 @@ ZEND_FUNCTION(vio_render_target_texture)
                 d3d_tex->srv_gpu.ptr = rt->d3d12_depth_srv_gpu;
                 d3d_tex->srv_cpu.ptr = rt->d3d12_depth_srv_cpu;
                 *cache_slot = d3d_tex;
-            } else if (!rt->depth_only && rt->d3d12_color_srv_gpu) {
+            } else if (!rt->depth_only && color_srv_gpu) {
                 vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
                 d3d_tex->resource = NULL;
                 d3d_tex->width = rt->width;
                 d3d_tex->height = rt->height;
-                d3d_tex->srv_gpu.ptr = rt->d3d12_color_srv_gpu;
-                d3d_tex->srv_cpu.ptr = rt->d3d12_color_srv_cpu;
+                d3d_tex->srv_gpu.ptr = color_srv_gpu;
+                d3d_tex->srv_cpu.ptr = color_srv_cpu;
                 *cache_slot = d3d_tex;
             }
         }
@@ -8827,7 +8952,8 @@ ZEND_FUNCTION(vio_render_target_texture)
      * wrapper. The registry slot is cleared lazily by other deletes; the actual
      * MTLTexture lifetime stays with the RT (CFBridgingRelease in destroy). */
     if (rt->backend_type == VIO_RT_BACKEND_METAL) {
-        void *cf_tex = rt->depth_only ? rt->metal_depth_texture : rt->metal_color_texture;
+        void *cf_tex = rt->depth_only ? rt->metal_depth_texture
+                     : (att == 0 ? rt->metal_color_texture : rt->metal_color_textures[att]);
         if (cf_tex) {
             tex->texture_id = vio_metal_register_external_texture(cf_tex);
             tex->borrowed = 1;
@@ -8835,7 +8961,8 @@ ZEND_FUNCTION(vio_render_target_texture)
             /* 3D sampling path: cached wrapper owned by the RT, built once
              * (same rationale as the D3D11 cache — a wrapper per call leaked). */
             void **cache_slot = rt->depth_only ? &rt->metal_depth_backend_texture
-                                               : &rt->metal_color_backend_texture;
+                              : (att == 0 ? &rt->metal_color_backend_texture
+                                          : &rt->metal_color_backend_textures[att]);
             if (*cache_slot == NULL) {
                 *cache_slot = vio_metal_wrap_rt_texture(cf_tex, rt->depth_only);
             }

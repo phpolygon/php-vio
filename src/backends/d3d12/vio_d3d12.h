@@ -264,8 +264,12 @@ typedef struct _vio_d3d12_state {
     ID3D12DescriptorHeap      *compute_srv_heap;     /* shader-visible, compute-only */
     UINT                       compute_srv_descriptor_size;
 
-    /* Currently bound render target (NULL = backbuffer) */
+    /* Currently bound render target (NULL = backbuffer). current_rtv is
+     * attachment 0; MRT targets fill current_rtvs[1..count-1] as well so
+     * d3d12_clear can clear every attachment. */
     D3D12_CPU_DESCRIPTOR_HANDLE current_rtv;
+    D3D12_CPU_DESCRIPTOR_HANDLE current_rtvs[VIO_MAX_COLOR_ATTACHMENTS];
+    int                         current_rtv_count;
     D3D12_CPU_DESCRIPTOR_HANDLE current_dsv;
     int current_rt_width;
     int current_rt_height;

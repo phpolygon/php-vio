@@ -1,6 +1,6 @@
 # API-ROADMAP — vio-API über den GL-3.3-Kern hinaus (alle Backends)
 
-Status: 📋 Implementierungsplan (2026-09-08). Ergänzt `METALGPU-REPLACEMENT-PLAN.md`
+Status: 🚧 R1, R2, R7 umgesetzt (2026-09-08, php-vio 2.10-Paket); R3–R9 offen. Ergänzt `METALGPU-REPLACEMENT-PLAN.md`
 (dessen Phase 1 zuerst läuft — Cube-RT, `depth_write`, RT-Readback, Headless-Größen,
 Pipeline-Destruktor). Diese Roadmap enthält die Features, die **kein** vio-Backend heute
 exponiert, obwohl Metal, D3D11/12, Vulkan und (meist) OpenGL sie nativ können.
@@ -16,11 +16,21 @@ Grundregeln
   `strcmp(ctx->backend->name, …)`-Vorkommen in `php_vio.c` zählt und einfriert).
 - Reihenfolge nach PHPolygon-Nutzen. Aufwände sind Netto-Implementierung inkl. Tests.
 
-Nächste freie Testnummer: 093 (090–092 sind für den Replacement-Plan reserviert).
+Nächste freie Testnummer: 098 (090–093 Replacement-Plan, 094/095 Metal-Regressionen,
+096 Storage-Images, 097 MRT).
 
 ---
 
-## R1 — Multiple Render Targets (MRT)   ~2 Tage
+## R1 — Multiple Render Targets (MRT)   ~2 Tage   ✅ umgesetzt
+
+Stand: `vio_render_target(['attachments' => [VIO_FORMAT_*…]])` (1–4), `vio_render_target_texture($rt, $i)`,
+`vio_read_render_target($rt, $face, $i)`, `vio_pipeline(['attachments' => […]])` (nur D3D12 braucht es),
+`VIO_FEATURE_MRT`, Test `097_mrt`. Metal + OpenGL auf Hardware verifiziert; D3D11/D3D12 blind
+(Windows-CI). Formate: RGBA8, RGBA16F, RGBA32F, R11G11B10F, RG16F, R16F, R32F, R8 — Readback über
+den gemeinsamen Konverter `vio_rt_convert_to_rgba8()`. Cube-RTs bleiben Single-Attachment; die
+`depth`-Option entfällt (Depth wird wie bisher immer angelegt). D3D12-`vio_read_render_target` ist
+weiterhin Follow-up. Abweichung vom Entwurf: kein `create_render_target_ex` — die Backends lesen
+`rt->attachment_count/formats` direkt aus dem Objekt.
 
 Nutzen: echter G-Buffer für SSAO/SSR (heute mehrere Pässe), Deferred Lighting.
 
@@ -39,7 +49,13 @@ $albedo = vio_render_target_texture($gb, 0); // 2. Parameter: Attachment-Index (
 - Pipeline-Variante (Metal PSO / D3D12 PSO) muss die Attachment-Formate kennen → Schlüssel um Format-Tupel erweitern; GL/D3D11 binden zur Laufzeit.
 - Test `093_mrt.phpt`: 3 Attachments verschieden beschreiben, jedes per `vio_read_render_target($rt, i)` prüfen.
 
-## R2 — Storage-Images (image2D / image3D)   ~2 Tage
+## R2 — Storage-Images (image2D / image3D)   ~2 Tage   ✅ umgesetzt
+
+Stand: `vio_texture(['storage' => true])` / `vio_texture_3d([... 'storage' => true])` (`data` optional →
+nullinitialisiert), `vio_compute_bind_image($ctx, $cp, $tex, $slot, $access)`, `VIO_FEATURE_STORAGE_IMAGE`,
+Test `096_storage_image`. Nur RGBA8 (`layout(rgba8)`); kein `format`-Parameter. Metal verifiziert,
+GL läuft auf Linux-CI (Mesa 4.5), D3D11/D3D12 blind. Alle GL-Texturen nutzen jetzt das sized
+`GL_RGBA8` (Voraussetzung für Image-Load/Store). Vulkan: Flag 0.
 
 Nutzen: GPU-Partikel, Post-FX in Compute (Blur/Tonemap), SDF-Bake direkt in eine 3D-Textur.
 
@@ -94,7 +110,11 @@ vio_draw_indexed_indirect($ctx, $mesh, $args, $offset, $drawCount);
 - Metal `drawIndexedPrimitives:indirectBuffer:` (Multi-Draw per Loop oder ICB), D3D12 `ExecuteIndirect` (Command Signature), D3D11 `DrawIndexedInstancedIndirect` (Loop), GL `glMultiDrawElementsIndirect` (4.3) / `glDrawElementsIndirect` (4.0), Vulkan `vkCmdDrawIndexedIndirect`.
 - `VIO_FEATURE_INDIRECT_DRAW = 29`. Test `099_indirect_draw.phpt` (Compute füllt Args, 4 Quads).
 
-## R7 — Compute-Dispatch-Geometrie + Async   ~½ Tag
+## R7 — Compute-Dispatch-Geometrie + Async   ~½ Tag   ✅ Geometrie umgesetzt, Async offen
+
+Stand: Metal liest `local_size` aus der SPIR-V-ExecutionMode (`metal_cs_spirv_to_msl`) und dispatcht
+damit statt (64,1,1); GL/D3D waren bereits implizit korrekt. Der optionale Async-Dispatch im
+Frame-Command-Buffer ist **nicht** umgesetzt (alle Dispatches bleiben synchron).
 
 - `local_size` aus der Reflection lesen statt `(64,1,1)` festzuverdrahten (Metal `threadsPerThreadgroup`; GL/D3D implizit). Erlaubt 2D/3D-Kernel (R2 braucht das).
 - Optional `vio_compute_dispatch(…, ['async'=>true])` + `vio_compute_wait($cp)`: Dispatch im Frame-Command-Buffer statt eigenem synchronem Buffer (Metal: gleicher `MTLCommandBuffer`, Compute-Encoder zwischen den Render-Encodern; D3D12: gleiche Command-List + UAV-Barrier).

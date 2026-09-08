@@ -445,7 +445,11 @@ function vio_shader_reflect(VioShader $shader): array|false {}
 /**
  * Create a rendering pipeline with shader and state configuration.
  *
- * @param array $config ['shader' => VioShader, 'topology' => int, 'cull_mode' => int, 'depth_test' => bool, 'blend' => int]
+ * @param array $config ['shader' => VioShader, 'topology' => int, 'cull_mode' => int, 'depth_test' => bool,
+ *                      'depth_func' => int, 'depth_write' => bool, 'blend' => int, 'color_mask' => int,
+ *                      'depth_bias' => float, 'slope_scaled_depth_bias' => float, 'hdr' => bool,
+ *                      'attachments' => int[]]  // MRT output formats (VIO_FORMAT_*) — only D3D12 needs them
+ *                                               //   (PSO RTV formats); must match the bound render target
  * @return VioPipeline|false Pipeline object or false on failure
  */
 function vio_pipeline(VioContext $context, array $config): VioPipeline|false {}
@@ -918,7 +922,10 @@ function vio_draw_instanced(VioContext $context, VioMesh $mesh, array|string $ma
 /**
  * Create an offscreen render target (FBO).
  *
- * @param array $config ['width' => int, 'height' => int, 'depth_only' => bool]
+ * @param array $config ['width' => int, 'height' => int, 'depth_only' => bool, 'hdr' => bool,
+ *                      'samples' => int, 'cube' => bool, 'size' => int, 'mipmaps' => bool,
+ *                      'attachments' => int[]]  // MRT: 1..4 VIO_FORMAT_* colour attachments
+ *                                               //      (fragment layout(location = i) out); needs VIO_FEATURE_MRT
  * @return VioRenderTarget|false Render target or false on failure
  */
 function vio_render_target(VioContext $context, array $config): VioRenderTarget|false {}
@@ -940,7 +947,7 @@ function vio_unbind_render_target(VioContext $context): void {}
  *
  * @return VioTexture|false Texture object or false on failure
  */
-function vio_render_target_texture(VioRenderTarget $target): VioTexture|false {}
+function vio_render_target_texture(VioRenderTarget $target, int $attachment = 0): VioTexture|false {}
 
 /**
  * Cube render target ('cube' => true) colour attachment as a bindable cubemap.
@@ -953,7 +960,7 @@ function vio_render_target_cubemap(VioRenderTarget $target): VioCubemap|false {}
  * Depth-only targets return depth as a grey ramp; cube targets read one face.
  * Works inside a frame.
  */
-function vio_read_render_target(VioRenderTarget $target, int $face = -1): string|false {}
+function vio_read_render_target(VioRenderTarget $target, int $face = -1, int $attachment = 0): string|false {}
 
 /**
  * Build the full mip chain of a texture, cubemap or render-target colour

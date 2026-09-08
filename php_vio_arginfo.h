@@ -667,6 +667,7 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_read_render_target, 0, 1, MAY_BE_STRING|MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, target, VioRenderTarget, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, face, IS_LONG, 0, "-1")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, attachment, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_render_target_cubemap, 0, 1, VioCubemap, MAY_BE_FALSE)
@@ -680,6 +681,7 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_render_target_texture, 0, 1, VioTexture, MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, target, VioRenderTarget, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, attachment, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_cubemap, 0, 2, VioCubemap, MAY_BE_FALSE)

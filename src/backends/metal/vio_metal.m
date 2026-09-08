@@ -94,7 +94,9 @@ static int current_bound_level = 0;
  * batch keeps one (shapes, sprites) pair per (format, samples) it has drawn
  * into: swapchain BGRA8x1, HDR RTs, MSAA RTs. Index 0 is built eagerly. */
 typedef struct _vio_metal_2d_variant {
-    int                        pixel_format;  /* MTLPixelFormat */
+    int                        pixel_format;  /* MTLPixelFormat of attachment 0 */
+    int                        extra_fmts[VIO_MAX_COLOR_ATTACHMENTS - 1]; /* MRT attachments 1..n (unwritten, mask none) */
+    int                        color_count;
     int                        samples;
     int                        has_depth;     /* 0 on cube-RT mip levels > 0 (no depth attachment) */
     id<MTLRenderPipelineState> shapes;
@@ -151,7 +153,17 @@ static unsigned int metal_register_texture(id<MTLTexture> tex)
 static void metal_resize(int width, int height);
 static void metal_open_encoder(int load_clear);
 static id<MTLTexture> metal_current_color_texture(void);
-static void metal_current_target_format(MTLPixelFormat *color_fmt, int *has_color, int *samples, int *has_depth);
+/* Colour layout of whatever the open encoder renders into: every attachment's
+ * pixel format (count 0 for depth-only targets), sample count, depth presence. */
+typedef struct _vio_metal_target_desc {
+    MTLPixelFormat fmts[VIO_MAX_COLOR_ATTACHMENTS];
+    int            count;      /* colour attachments; 0 => depth-only */
+    int            samples;
+    int            has_depth;
+} vio_metal_target_desc;
+static void metal_current_target(vio_metal_target_desc *t);
+static MTLPixelFormat metal_pixel_format(int vio_fmt);
+static int metal_rt_attachment_count(const vio_render_target_object *rt);
 static void metal_destroy_texture(void *texture);
 static void metal_ring_begin_frame(void);
 static void metal_ring_end_frame(id<MTLCommandBuffer> cb);
@@ -456,14 +468,19 @@ void vio_metal_shutdown_context(void)
 /* Find or build the (shapes, sprites) PSO pair for a target format + sample
  * count. Returns NULL (after a warning) when Metal rejects the descriptor or
  * the small cache is full. */
-static vio_metal_2d_variant *metal_2d_variant(MTLPixelFormat fmt, int samples, int has_depth)
+static vio_metal_2d_variant *metal_2d_variant(const vio_metal_target_desc *t)
 {
-    if (samples < 1) samples = 1;
+    MTLPixelFormat fmt = t->fmts[0];
+    int samples = t->samples < 1 ? 1 : t->samples;
+    int has_depth = t->has_depth;
+    int count = t->count < 1 ? 1 : t->count;
     for (int i = 0; i < mtl_2d.variant_count; i++) {
-        if (mtl_2d.variants[i].pixel_format == (int)fmt && mtl_2d.variants[i].samples == samples &&
-            mtl_2d.variants[i].has_depth == has_depth) {
-            return &mtl_2d.variants[i];
-        }
+        vio_metal_2d_variant *v = &mtl_2d.variants[i];
+        if (v->pixel_format != (int)fmt || v->samples != samples || v->has_depth != has_depth ||
+            v->color_count != count) continue;
+        int same = 1;
+        for (int k = 1; k < count; k++) if (v->extra_fmts[k - 1] != (int)t->fmts[k]) { same = 0; break; }
+        if (same) return v;
     }
     if (mtl_2d.variant_count >= VIO_METAL_2D_VARIANTS || !mtl_2d.vertex_fn) {
         php_error_docref(NULL, E_WARNING, "Metal 2D: no pipeline variant for format %d x%d samples",
@@ -484,6 +501,13 @@ static vio_metal_2d_variant *metal_2d_variant(MTLPixelFormat fmt, int samples, i
         pipeDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
         pipeDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
         pipeDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        /* MRT target: Metal requires every pass attachment to appear in the PSO
+         * with a matching format; the 2D shaders only write output 0, so the
+         * others are declared with an empty write mask. */
+        for (int k = 1; k < count; k++) {
+            pipeDesc.colorAttachments[k].pixelFormat = t->fmts[k];
+            pipeDesc.colorAttachments[k].writeMask = MTLColorWriteMaskNone;
+        }
         pipeDesc.depthAttachmentPixelFormat = has_depth ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
 
         id<MTLRenderPipelineState> shapes =
@@ -504,6 +528,8 @@ static vio_metal_2d_variant *metal_2d_variant(MTLPixelFormat fmt, int samples, i
 
         vio_metal_2d_variant *v = &mtl_2d.variants[mtl_2d.variant_count++];
         v->pixel_format = (int)fmt;
+        v->color_count  = count;
+        for (int k = 1; k < count; k++) v->extra_fmts[k - 1] = (int)t->fmts[k];
         v->samples      = samples;
         v->has_depth    = has_depth;
         v->shapes       = shapes;
@@ -565,7 +591,8 @@ int vio_metal_2d_init(int width, int height)
 
         /* Swapchain variant (BGRA8, single sample) is built eagerly so a
          * failure surfaces at init, not at the first flush. */
-        vio_metal_2d_variant *v0 = metal_2d_variant(MTLPixelFormatBGRA8Unorm, 1, 1);
+        vio_metal_target_desc swap = { { MTLPixelFormatBGRA8Unorm, 0, 0, 0 }, 1, 1, 1 };
+        vio_metal_2d_variant *v0 = metal_2d_variant(&swap);
         if (!v0) {
             return -1;
         }
@@ -644,11 +671,10 @@ void vio_metal_2d_flush(vio_2d_state *state)
         [vio_mtl.current_encoder setVertexBuffer:projBuf offset:0 atIndex:1];
 
         /* PSO pair matching the bound target (swapchain / HDR RT / MSAA RT). */
-        MTLPixelFormat target_fmt;
-        int target_has_color, target_samples, target_has_depth;
-        metal_current_target_format(&target_fmt, &target_has_color, &target_samples, &target_has_depth);
-        if (!target_has_color) return;  /* depth-only RT: 2D has nothing to write */
-        vio_metal_2d_variant *variant = metal_2d_variant(target_fmt, target_samples, target_has_depth);
+        vio_metal_target_desc target;
+        metal_current_target(&target);
+        if (target.count == 0) return;  /* depth-only RT: 2D has nothing to write */
+        vio_metal_2d_variant *variant = metal_2d_variant(&target);
         if (!variant) return;
 
         /* Track current state to minimize redundant calls */
@@ -1009,20 +1035,36 @@ static void metal_open_encoder(int load_clear)
     @autoreleasepool {
         if (!vio_mtl.current_cmd_buf) return;
 
-        id<MTLTexture> color_target = nil;
         id<MTLTexture> depth_target = vio_mtl.depth_texture; /* default swapchain depth */
         int target_w = vio_mtl.width;
         int target_h = vio_mtl.height;
-        int depth_only = 0;
 
-        color_target = metal_current_color_texture();
-        id<MTLTexture> resolve_target = nil;
+        /* Colour attachments (one for the swapchain / classic RT, up to
+         * VIO_MAX_COLOR_ATTACHMENTS for an MRT target) plus their MSAA resolve
+         * partners. */
+        id<MTLTexture> color_targets[VIO_MAX_COLOR_ATTACHMENTS]  = {nil, nil, nil, nil};
+        id<MTLTexture> resolve_targets[VIO_MAX_COLOR_ATTACHMENTS] = {nil, nil, nil, nil};
+        int n_color = 0;
         NSUInteger cube_slice = 0, cube_level = 0;
         if (current_bound_rt) {
             depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_depth_texture;
             target_w = current_bound_rt->width;
             target_h = current_bound_rt->height;
-            depth_only = current_bound_rt->depth_only;
+            if (!current_bound_rt->depth_only) {
+                n_color = metal_rt_attachment_count(current_bound_rt);
+                for (int i = 0; i < n_color; i++) {
+                    id<MTLTexture> c = i == 0 ? metal_current_color_texture()
+                                              : (__bridge id<MTLTexture>)current_bound_rt->metal_color_textures[i];
+                    if (current_bound_rt->samples > 1) {
+                        /* MSAA: render into the multisample pair, resolve into the
+                         * single-sample colour texture at every pass end. */
+                        resolve_targets[i] = c;
+                        color_targets[i] = (__bridge id<MTLTexture>)current_bound_rt->metal_msaa_color_textures[i];
+                    } else {
+                        color_targets[i] = c;
+                    }
+                }
+            }
             if (current_bound_rt->is_cube) {
                 cube_slice = (NSUInteger)(current_bound_face >= 0 ? current_bound_face : 0);
                 cube_level = (NSUInteger)current_bound_level;
@@ -1032,37 +1074,42 @@ static void metal_open_encoder(int load_clear)
                 if (cube_level > 0) depth_target = nil;
             }
             if (current_bound_rt->samples > 1) {
-                /* MSAA: render into the multisample pair, resolve into the
-                 * single-sample colour texture at every pass end. */
-                resolve_target = color_target;
-                color_target = (__bridge id<MTLTexture>)current_bound_rt->metal_msaa_color_texture;
                 depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_msaa_depth_texture;
             }
-        } else if (vio_mtl.samples > 1 && vio_mtl.msaa_color && color_target) {
-            /* Swapchain MSAA (vio_create 'samples'): same scheme, resolving into
-             * the drawable / vsync-off offscreen texture. */
-            resolve_target = color_target;
-            color_target = vio_mtl.msaa_color;
-            depth_target = vio_mtl.msaa_depth;
+        } else {
+            id<MTLTexture> color_target = metal_current_color_texture();
+            if (color_target) {
+                n_color = 1;
+                if (vio_mtl.samples > 1 && vio_mtl.msaa_color) {
+                    /* Swapchain MSAA (vio_create 'samples'): same scheme, resolving into
+                     * the drawable / vsync-off offscreen texture. */
+                    resolve_targets[0] = color_target;
+                    color_targets[0] = vio_mtl.msaa_color;
+                    depth_target = vio_mtl.msaa_depth;
+                } else {
+                    color_targets[0] = color_target;
+                }
+            }
         }
 
         MTLRenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
 
-        if (!depth_only && color_target) {
-            desc.colorAttachments[0].texture = color_target;
-            desc.colorAttachments[0].slice = cube_slice;
-            desc.colorAttachments[0].level = cube_level;
-            desc.colorAttachments[0].loadAction = load_clear ? MTLLoadActionClear : MTLLoadActionLoad;
-            if (resolve_target) {
-                desc.colorAttachments[0].resolveTexture = resolve_target;
+        for (int i = 0; i < n_color; i++) {
+            if (!color_targets[i]) continue;
+            MTLRenderPassColorAttachmentDescriptor *ca = desc.colorAttachments[i];
+            ca.texture = color_targets[i];
+            ca.slice = cube_slice;
+            ca.level = cube_level;
+            ca.loadAction = load_clear ? MTLLoadActionClear : MTLLoadActionLoad;
+            if (resolve_targets[i]) {
+                ca.resolveTexture = resolve_targets[i];
                 /* Keep the MSAA contents too, so a reopened pass (RT bind /
                  * unbind / eager clear / mid-frame readback) can Load them. */
-                desc.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+                ca.storeAction = MTLStoreActionStoreAndMultisampleResolve;
             } else {
-                desc.colorAttachments[0].storeAction = MTLStoreActionStore;
+                ca.storeAction = MTLStoreActionStore;
             }
-            desc.colorAttachments[0].clearColor =
-                MTLClearColorMake(vio_mtl.clear_r, vio_mtl.clear_g, vio_mtl.clear_b, vio_mtl.clear_a);
+            ca.clearColor = MTLClearColorMake(vio_mtl.clear_r, vio_mtl.clear_g, vio_mtl.clear_b, vio_mtl.clear_a);
         }
 
         if (depth_target) {
@@ -1639,27 +1686,71 @@ static void *metal_compile_shader(vio_shader_desc *desc)
 /* Give a freshly created RT defined contents (colour 0, depth 1.0) with one
  * empty Clear pass per slice, so a target that is bound and drawn into without
  * an explicit vio_clear still depth-tests (Private textures start undefined). */
+/* Number of colour attachments of an RT (1 for the classic single target). */
+static int metal_rt_attachment_count(const vio_render_target_object *rt)
+{
+    int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+    return n > VIO_MAX_COLOR_ATTACHMENTS ? VIO_MAX_COLOR_ATTACHMENTS : n;
+}
+
+/* MTLPixelFormat of a vio_pixel_format colour attachment. RGBA8 maps to
+ * BGRA8Unorm like the swapchain (readback swizzles it back). */
+static MTLPixelFormat metal_pixel_format(int vio_fmt)
+{
+    switch (vio_fmt) {
+        case VIO_FORMAT_RGBA16F:    return MTLPixelFormatRGBA16Float;
+        case VIO_FORMAT_RGBA32F:    return MTLPixelFormatRGBA32Float;
+        case VIO_FORMAT_R11G11B10F: return MTLPixelFormatRG11B10Float;
+        case VIO_FORMAT_RG16F:      return MTLPixelFormatRG16Float;
+        case VIO_FORMAT_R16F:       return MTLPixelFormatR16Float;
+        case VIO_FORMAT_R32F:       return MTLPixelFormatR32Float;
+        case VIO_FORMAT_R8:         return MTLPixelFormatR8Unorm;
+        case VIO_FORMAT_RGBA8:
+        default:                    return MTLPixelFormatBGRA8Unorm;
+    }
+}
+
+/* vio_pixel_format of an MTLTexture (for the shared RGBA8 readback converter). */
+static int metal_vio_format(MTLPixelFormat f, int *bgra)
+{
+    *bgra = 0;
+    switch (f) {
+        case MTLPixelFormatBGRA8Unorm:  *bgra = 1; return VIO_FORMAT_RGBA8;
+        case MTLPixelFormatRGBA8Unorm:  return VIO_FORMAT_RGBA8;
+        case MTLPixelFormatRGBA16Float: return VIO_FORMAT_RGBA16F;
+        case MTLPixelFormatRGBA32Float: return VIO_FORMAT_RGBA32F;
+        case MTLPixelFormatRG11B10Float:return VIO_FORMAT_R11G11B10F;
+        case MTLPixelFormatRG16Float:   return VIO_FORMAT_RG16F;
+        case MTLPixelFormatR16Float:    return VIO_FORMAT_R16F;
+        case MTLPixelFormatR32Float:    return VIO_FORMAT_R32F;
+        case MTLPixelFormatR8Unorm:     return VIO_FORMAT_R8;
+        default:                        return -1;
+    }
+}
+
 static void metal_rt_initial_clear(vio_render_target_object *rt)
 {
-    id<MTLTexture> color = rt->metal_color_texture ? (__bridge id<MTLTexture>)rt->metal_color_texture : nil;
-    id<MTLTexture> msaa  = rt->metal_msaa_color_texture ? (__bridge id<MTLTexture>)rt->metal_msaa_color_texture : nil;
+    int n_color = rt->depth_only ? 0 : metal_rt_attachment_count(rt);
     id<MTLTexture> depth = rt->metal_depth_texture ? (__bridge id<MTLTexture>)rt->metal_depth_texture
                          : (rt->metal_msaa_depth_texture ? (__bridge id<MTLTexture>)rt->metal_msaa_depth_texture : nil);
-    if (!color && !depth) return;
+    if (!rt->metal_color_texture && !depth) return;
     id<MTLCommandBuffer> cb = metal_new_command_buffer();
     int slices = rt->is_cube ? 6 : 1;
     for (int s = 0; s < slices; s++) {
         MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
-        if (color) {
-            d.colorAttachments[0].texture = msaa ? msaa : color;
-            d.colorAttachments[0].slice = (NSUInteger)s;
-            d.colorAttachments[0].loadAction = MTLLoadActionClear;
-            d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        for (int i = 0; i < n_color; i++) {
+            id<MTLTexture> color = rt->metal_color_textures[i] ? (__bridge id<MTLTexture>)rt->metal_color_textures[i] : nil;
+            id<MTLTexture> msaa  = rt->metal_msaa_color_textures[i] ? (__bridge id<MTLTexture>)rt->metal_msaa_color_textures[i] : nil;
+            if (!color) continue;
+            d.colorAttachments[i].texture = msaa ? msaa : color;
+            d.colorAttachments[i].slice = (NSUInteger)s;
+            d.colorAttachments[i].loadAction = MTLLoadActionClear;
+            d.colorAttachments[i].clearColor = MTLClearColorMake(0, 0, 0, 0);
             if (msaa) {
-                d.colorAttachments[0].resolveTexture = color;
-                d.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+                d.colorAttachments[i].resolveTexture = color;
+                d.colorAttachments[i].storeAction = MTLStoreActionStoreAndMultisampleResolve;
             } else {
-                d.colorAttachments[0].storeAction = MTLStoreActionStore;
+                d.colorAttachments[i].storeAction = MTLStoreActionStore;
             }
         }
         if (depth) {
@@ -1706,7 +1797,12 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
         int samples = (depth_only || rt->is_cube) ? 1 : metal_clamp_sample_count(rt->samples);
         rt->samples = samples;
 
-        MTLPixelFormat color_fmt = hdr ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+        int n_color = metal_rt_attachment_count(rt);
+        if (rt->attachment_count <= 0) {
+            rt->attachment_count = 1;
+            rt->formats[0] = hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8;
+        }
+        MTLPixelFormat color_fmt = metal_pixel_format(rt->formats[0]);
 
         if (rt->is_cube) {
             /* Cubemap colour attachment: one MTLTextureTypeCube with the full
@@ -1733,6 +1829,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             }
             rt->mip_levels = (int)cube.mipmapLevelCount;
             rt->metal_color_texture = (void *)CFBridgingRetain(cube);
+            rt->metal_color_textures[0] = rt->metal_color_texture;
             rt->metal_depth_texture = (void *)CFBridgingRetain(cube_depth);
             rt->backend_type = VIO_RT_BACKEND_METAL;
             metal_rt_initial_clear(rt);
@@ -1759,44 +1856,49 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             return -1;
         }
 
-        id<MTLTexture> color_tex = nil;
-        id<MTLTexture> msaa_color = nil;
+        /* One colour texture per attachment (MRT), each with its MSAA partner
+         * when samples > 1. Index 0 also lands in the legacy scalar fields. */
         if (!depth_only) {
-            MTLTextureDescriptor *color_desc = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:color_fmt
-                width:width height:height mipmapped:NO];
-            color_desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            color_desc.storageMode = MTLStorageModePrivate;
-
-            color_tex = [vio_mtl.device newTextureWithDescriptor:color_desc];
-            if (!color_tex) {
-                php_error_docref(NULL, E_WARNING,
-                    "Metal: failed to create render-target color texture (%dx%d, hdr=%d)",
-                    width, height, hdr);
-                return -1;
-            }
-            if (samples > 1) {
-                MTLTextureDescriptor *ms_desc = [MTLTextureDescriptor
-                    texture2DDescriptorWithPixelFormat:color_fmt
+            for (int i = 0; i < n_color; i++) {
+                MTLPixelFormat fmt_i = metal_pixel_format(rt->formats[i]);
+                MTLTextureDescriptor *color_desc = [MTLTextureDescriptor
+                    texture2DDescriptorWithPixelFormat:fmt_i
                     width:width height:height mipmapped:NO];
-                ms_desc.textureType = MTLTextureType2DMultisample;
-                ms_desc.sampleCount = (NSUInteger)samples;
-                ms_desc.usage = MTLTextureUsageRenderTarget;
-                ms_desc.storageMode = MTLStorageModePrivate;
-                msaa_color = [vio_mtl.device newTextureWithDescriptor:ms_desc];
-                if (!msaa_color) {
+                color_desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                color_desc.storageMode = MTLStorageModePrivate;
+
+                id<MTLTexture> color_tex = [vio_mtl.device newTextureWithDescriptor:color_desc];
+                if (!color_tex) {
                     php_error_docref(NULL, E_WARNING,
-                        "Metal: failed to create %dx MSAA render-target texture (%dx%d)",
-                        samples, width, height);
+                        "Metal: failed to create render-target color texture %d (%dx%d, format %d)",
+                        i, width, height, rt->formats[i]);
                     return -1;
+                }
+                rt->metal_color_textures[i] = (void *)CFBridgingRetain(color_tex);
+                if (samples > 1) {
+                    MTLTextureDescriptor *ms_desc = [MTLTextureDescriptor
+                        texture2DDescriptorWithPixelFormat:fmt_i
+                        width:width height:height mipmapped:NO];
+                    ms_desc.textureType = MTLTextureType2DMultisample;
+                    ms_desc.sampleCount = (NSUInteger)samples;
+                    ms_desc.usage = MTLTextureUsageRenderTarget;
+                    ms_desc.storageMode = MTLStorageModePrivate;
+                    id<MTLTexture> msaa_color = [vio_mtl.device newTextureWithDescriptor:ms_desc];
+                    if (!msaa_color) {
+                        php_error_docref(NULL, E_WARNING,
+                            "Metal: failed to create %dx MSAA render-target texture (%dx%d)",
+                            samples, width, height);
+                        return -1;
+                    }
+                    rt->metal_msaa_color_textures[i] = (void *)CFBridgingRetain(msaa_color);
                 }
             }
         }
 
-        /* Bridge strong references into the RT's opaque void * slots. */
-        rt->metal_color_texture = color_tex ? (void *)CFBridgingRetain(color_tex) : NULL;
+        /* Index 0 doubles as the legacy scalar slot. */
+        rt->metal_color_texture = rt->metal_color_textures[0];
         if (samples > 1) {
-            rt->metal_msaa_color_texture = msaa_color ? (void *)CFBridgingRetain(msaa_color) : NULL;
+            rt->metal_msaa_color_texture = rt->metal_msaa_color_textures[0];
             rt->metal_msaa_depth_texture = (void *)CFBridgingRetain(depth_tex);
             rt->metal_depth_texture = NULL;  /* no single-sample depth to sample */
         } else {
@@ -1895,6 +1997,15 @@ static void metal_destroy_render_target(void *rt_ptr)
         current_bound_rt = NULL;
     }
 
+    /* MRT attachments 1..n; index 0 is released through the scalar below. */
+    for (int i = 1; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
+        if (rt->metal_color_textures[i])         { CFBridgingRelease(rt->metal_color_textures[i]);         rt->metal_color_textures[i] = NULL; }
+        if (rt->metal_msaa_color_textures[i])    { CFBridgingRelease(rt->metal_msaa_color_textures[i]);    rt->metal_msaa_color_textures[i] = NULL; }
+        if (rt->metal_color_backend_textures[i]) { metal_destroy_texture(rt->metal_color_backend_textures[i]); rt->metal_color_backend_textures[i] = NULL; }
+    }
+    rt->metal_color_textures[0] = NULL;
+    rt->metal_msaa_color_textures[0] = NULL;
+    rt->metal_color_backend_textures[0] = NULL;
     if (rt->metal_color_texture) {
         CFBridgingRelease(rt->metal_color_texture);
         rt->metal_color_texture = NULL;
@@ -2331,7 +2442,8 @@ void *vio_metal_wrap_rt_texture(void *cf_retained_texture, int depth_only)
 #define VIO_METAL_PSO_VARIANTS 8
 
 typedef struct _vio_metal_pso_variant {
-    int   color_fmt;   /* MTLPixelFormat; MTLPixelFormatInvalid for depth-only targets */
+    int   color_fmts[VIO_MAX_COLOR_ATTACHMENTS]; /* MTLPixelFormat per attachment */
+    int   color_count; /* 0 for depth-only targets */
     int   stride;      /* mesh vertex stride baked into the vertex descriptor */
     int   samples;     /* raster sample count of the target (1 or the RT's MSAA count) */
     int   has_depth;   /* 0 when the target has no depth attachment (cube-RT mip > 0) */
@@ -2467,41 +2579,45 @@ void vio_metal_set_shader_cbuffers(void *vs_cbuffer, void *fs_cbuffer)
 
 /* Color format of whatever the open encoder renders into. has_color = 0 for a
  * depth-only RT (no color attachment => PSO without fragment output). */
-static void metal_current_target_format(MTLPixelFormat *color_fmt, int *has_color, int *samples, int *has_depth)
+static void metal_current_target(vio_metal_target_desc *t)
 {
-    *samples = 1;
-    *has_depth = 1;
+    memset(t, 0, sizeof(*t));
+    t->samples = 1;
+    t->has_depth = 1;
     if (current_bound_rt) {
-        if (current_bound_rt->is_cube && current_bound_level > 0) *has_depth = 0;
-        if (current_bound_rt->samples > 1) *samples = current_bound_rt->samples;
+        if (current_bound_rt->is_cube && current_bound_level > 0) t->has_depth = 0;
+        if (current_bound_rt->samples > 1) t->samples = current_bound_rt->samples;
         if (current_bound_rt->depth_only || !current_bound_rt->metal_color_texture) {
-            *color_fmt = MTLPixelFormatInvalid;
-            *has_color = 0;
+            t->count = 0;
             return;
         }
-        id<MTLTexture> t = (__bridge id<MTLTexture>)current_bound_rt->metal_color_texture;
-        *color_fmt = t.pixelFormat;
-        *has_color = 1;
+        t->count = metal_rt_attachment_count(current_bound_rt);
+        for (int i = 0; i < t->count; i++) {
+            id<MTLTexture> tex = (__bridge id<MTLTexture>)current_bound_rt->metal_color_textures[i];
+            t->fmts[i] = tex ? tex.pixelFormat : MTLPixelFormatInvalid;
+        }
         return;
     }
-    *color_fmt = MTLPixelFormatBGRA8Unorm;
-    *has_color = 1;
-    if (vio_mtl.samples > 1 && vio_mtl.msaa_color) *samples = vio_mtl.samples;
+    t->fmts[0] = MTLPixelFormatBGRA8Unorm;
+    t->count = 1;
+    if (vio_mtl.samples > 1 && vio_mtl.msaa_color) t->samples = vio_mtl.samples;
 }
 
-/* Find or build the PSO variant for (target color format, mesh stride). */
-static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, MTLPixelFormat color_fmt,
-                                                     int has_color, int stride, int samples, int has_depth)
+/* Find or build the PSO variant for (target colour formats, mesh stride, samples, depth). */
+static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, const vio_metal_target_desc *t, int stride)
 {
     vio_metal_shader *sh = p->shader;
     if (stride <= 0 || stride < sh->vertex_stride) stride = sh->vertex_stride;
-    if (samples < 1) samples = 1;
+    int samples = t->samples < 1 ? 1 : t->samples;
+    int has_depth = t->has_depth;
+    int has_color = t->count > 0;
 
     for (int i = 0; i < p->variant_count; i++) {
-        if (p->variants[i].color_fmt == (int)color_fmt && p->variants[i].stride == stride &&
-            p->variants[i].samples == samples && p->variants[i].has_depth == has_depth) {
-            return (__bridge id<MTLRenderPipelineState>)p->variants[i].pso;
-        }
+        vio_metal_pso_variant *v = &p->variants[i];
+        if (v->color_count != t->count || v->stride != stride || v->samples != samples || v->has_depth != has_depth) continue;
+        int same = 1;
+        for (int k = 0; k < t->count; k++) if (v->color_fmts[k] != (int)t->fmts[k]) { same = 0; break; }
+        if (same) return (__bridge id<MTLRenderPipelineState>)v->pso;
     }
     if (p->variant_count >= VIO_METAL_PSO_VARIANTS) {
         php_error_docref(NULL, E_WARNING,
@@ -2570,9 +2686,10 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, MTLP
             d.vertexDescriptor = vd;
         }
 
-        if (has_color) {
-            MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[0];
-            ca.pixelFormat = color_fmt;
+        for (int att = 0; att < t->count; att++) {
+            /* Same blend / write-mask state on every attachment (MRT). */
+            MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[att];
+            ca.pixelFormat = t->fmts[att];
             MTLColorWriteMask wm = MTLColorWriteMaskNone;
             if (p->color_mask & VIO_COLOR_R) wm |= MTLColorWriteMaskRed;
             if (p->color_mask & VIO_COLOR_G) wm |= MTLColorWriteMaskGreen;
@@ -2641,7 +2758,8 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, MTLP
             return nil;
         }
         vio_metal_pso_variant *v = &p->variants[p->variant_count++];
-        v->color_fmt = (int)color_fmt;
+        v->color_count = t->count;
+        for (int k = 0; k < t->count; k++) v->color_fmts[k] = (int)t->fmts[k];
         v->stride    = stride;
         v->samples   = samples;
         v->has_depth = has_depth;
@@ -2658,11 +2776,11 @@ static int metal_prepare_draw(int stride)
     vio_metal_pipeline *p = metal_current_pipeline;
     if (!p || !p->shader || !vio_mtl.current_encoder) return 0;
 
-    MTLPixelFormat fmt;
-    int has_color, samples, has_depth;
-    metal_current_target_format(&fmt, &has_color, &samples, &has_depth);
+    vio_metal_target_desc target;
+    metal_current_target(&target);
+    int has_depth = target.has_depth;
 
-    id<MTLRenderPipelineState> pso = metal_pipeline_pso(p, fmt, has_color, stride, samples, has_depth);
+    id<MTLRenderPipelineState> pso = metal_pipeline_pso(p, &target, stride);
     if (!pso) return 0;
 
     id<MTLRenderCommandEncoder> enc = vio_mtl.current_encoder;
@@ -2959,14 +3077,15 @@ static void metal_flush_for_readback(void)
 
 /* vio_read_render_target: blit one slice of the RT's (resolved) colour or
  * depth texture into a Shared buffer and convert to top-down RGBA8. */
-static int metal_read_render_target(void *rt_ptr, int face, void *out_rgba)
+static int metal_read_render_target(void *rt_ptr, int face, int attachment, void *out_rgba)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (!rt || rt->backend_type != VIO_RT_BACKEND_METAL || !vio_mtl.device) return -1;
+    if (attachment < 0 || attachment >= metal_rt_attachment_count(rt)) return -1;
     @autoreleasepool {
         id<MTLTexture> src = rt->depth_only
             ? (__bridge id<MTLTexture>)rt->metal_depth_texture
-            : (__bridge id<MTLTexture>)rt->metal_color_texture;   /* resolve texture when MSAA */
+            : (__bridge id<MTLTexture>)rt->metal_color_textures[attachment];   /* resolve texture when MSAA */
         if (!src) return -1;
         NSUInteger slice = 0;
         if (rt->is_cube) slice = (NSUInteger)(face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0));
@@ -2975,7 +3094,10 @@ static int metal_read_render_target(void *rt_ptr, int face, void *out_rgba)
 
         int w = rt->width, h = rt->height;
         MTLPixelFormat fmt = src.pixelFormat;
-        NSUInteger bpp = (fmt == MTLPixelFormatRGBA16Float) ? 8 : 4;   /* BGRA8 / Depth32Float = 4 */
+        int bgra = 0;
+        int vfmt = (fmt == MTLPixelFormatDepth32Float) ? -1 : metal_vio_format(fmt, &bgra);
+        if (vfmt < -1) return -1;
+        NSUInteger bpp = (fmt == MTLPixelFormatDepth32Float) ? 4 : (NSUInteger)vio_rt_format_bpp(vfmt);
         NSUInteger bpr = (NSUInteger)w * bpp;
         id<MTLBuffer> staging = [vio_mtl.device newBufferWithLength:bpr * h options:MTLResourceStorageModeShared];
         if (!staging) return -1;
@@ -2999,20 +3121,9 @@ static int metal_read_render_target(void *rt_ptr, int face, void *out_rgba)
                 unsigned char g = metal_unit_to_byte(d[i]);
                 out[i*4+0] = out[i*4+1] = out[i*4+2] = g; out[i*4+3] = 255;
             }
-        } else if (fmt == MTLPixelFormatRGBA16Float) {
-            const uint16_t *hp = (const uint16_t *)s;
-            for (size_t i = 0; i < n; i++) {
-                out[i*4+0] = metal_unit_to_byte(metal_half_to_float(hp[i*4+0]));
-                out[i*4+1] = metal_unit_to_byte(metal_half_to_float(hp[i*4+1]));
-                out[i*4+2] = metal_unit_to_byte(metal_half_to_float(hp[i*4+2]));
-                out[i*4+3] = metal_unit_to_byte(metal_half_to_float(hp[i*4+3]));
-            }
-        } else if (fmt == MTLPixelFormatRGBA8Unorm) {
-            memcpy(out, s, n * 4);
-        } else {  /* BGRA8Unorm */
-            for (size_t i = 0; i < n; i++) {
-                out[i*4+0] = s[i*4+2]; out[i*4+1] = s[i*4+1]; out[i*4+2] = s[i*4+0]; out[i*4+3] = s[i*4+3];
-            }
+        } else {
+            /* Shared converter: every colour format -> RGBA8 (BGRA swizzled). */
+            vio_rt_convert_to_rgba8(vfmt, bgra, s, (size_t)bpr, w, h, out);
         }
     }
     return 0;
@@ -3657,6 +3768,7 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_RENDER_TARGET_MSAA:
     case VIO_FEATURE_RENDER_TARGET_CUBE:
     case VIO_FEATURE_MIPMAP_GEN:
+    case VIO_FEATURE_MRT:
         /* MTLTexture-backed offscreen RTs via create/bind/unbind/destroy;
          * MSAA colour targets render into a 2DMultisample pair and resolve
          * at every pass end (`samples` on vio_render_target). */

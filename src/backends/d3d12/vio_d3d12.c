@@ -1409,10 +1409,18 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
      * pipeline state". Default is R8G8B8A8_UNORM (swapchain + every LDR offscreen
      * target); desc->hdr_output selects R16G16B16A16_FLOAT to match a render
      * target created with hdr=true (e.g. the SSAO G-buffer). */
-    pso_desc.NumRenderTargets = 1;
-    pso_desc.RTVFormats[0] = desc->hdr_output
-        ? DXGI_FORMAT_R16G16B16A16_FLOAT
-        : DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (desc->color_count > 0) {
+        /* MRT: vio_pipeline(['attachments' => [...]]) declares the formats of
+         * the target this pipeline draws into (must equal the RT's list). */
+        int n = desc->color_count > VIO_MAX_COLOR_ATTACHMENTS ? VIO_MAX_COLOR_ATTACHMENTS : desc->color_count;
+        pso_desc.NumRenderTargets = (UINT)n;
+        for (int i = 0; i < n; i++) pso_desc.RTVFormats[i] = vio_pixel_format_to_dxgi(desc->color_formats[i]);
+    } else {
+        pso_desc.NumRenderTargets = 1;
+        pso_desc.RTVFormats[0] = desc->hdr_output
+            ? DXGI_FORMAT_R16G16B16A16_FLOAT
+            : DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
 
     /* MSAA */
     pso_desc.SampleDesc.Count = 1;
@@ -1971,6 +1979,16 @@ static void d3d12_destroy_render_target(void *rt_ptr)
             : (vio_d3d12_texture **)&rt->d3d12_depth_backend_texture;
         if (*slot) { free(*slot); *slot = NULL; }
     }
+    /* MRT attachments 1..n (index 0 is the scalar below). */
+    for (int i = 1; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
+        if (rt->d3d12_color_backend_textures[i]) { free(rt->d3d12_color_backend_textures[i]); rt->d3d12_color_backend_textures[i] = NULL; }
+        if (rt->d3d12_color_resources[i]) {
+            ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resources[i]);
+            rt->d3d12_color_resources[i] = NULL;
+        }
+    }
+    rt->d3d12_color_backend_textures[0] = NULL;
+    rt->d3d12_color_resources[0] = NULL;
     if (rt->d3d12_color_resource) {
         ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
         rt->d3d12_color_resource = NULL;
@@ -2179,6 +2197,8 @@ static void d3d12_begin_frame(void)
 
     /* Track current render target */
     vio_d3d12.current_rtv = frame->rtv_handle;
+    vio_d3d12.current_rtvs[0] = frame->rtv_handle;
+    vio_d3d12.current_rtv_count = 1;
     vio_d3d12.current_dsv = dsv_handle;
     vio_d3d12.current_rt_width = vio_d3d12.width;
     vio_d3d12.current_rt_height = vio_d3d12.height;
@@ -2668,11 +2688,16 @@ static void d3d12_clear(float r, float g, float b, float a)
 {
     float color[4] = {r, g, b, a};
 
-    /* Clear whichever render target is currently bound */
+    /* Clear whichever render target is currently bound (every MRT attachment) */
     if (vio_d3d12.current_has_rtv) {
         ID3D12GraphicsCommandList_ClearRenderTargetView(vio_d3d12.cmd_list,
                                                          vio_d3d12.current_rtv,
                                                          color, 0, NULL);
+        for (int i = 1; i < vio_d3d12.current_rtv_count && i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
+            ID3D12GraphicsCommandList_ClearRenderTargetView(vio_d3d12.cmd_list,
+                                                             vio_d3d12.current_rtvs[i],
+                                                             color, 0, NULL);
+        }
     }
 
     ID3D12GraphicsCommandList_ClearDepthStencilView(vio_d3d12.cmd_list,
@@ -3308,6 +3333,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* TEXTURE3D resource + SRV */
         case VIO_FEATURE_VERTEX_STORAGE: return 1; /* VS-visible root SRV in the shared root signature */
         case VIO_FEATURE_STORAGE_IMAGE:  return 1; /* texture UAV in the compute UAV table */
+        case VIO_FEATURE_MRT:            return 1; /* per-RT RTV heap with up to 4 descriptors, PSO 'attachments' */
         default:                       return 0;
     }
 }
