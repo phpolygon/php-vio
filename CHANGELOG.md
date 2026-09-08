@@ -1,3 +1,26 @@
+# [2.9.0](https://github.com/phpolygon/php-vio/compare/v2.8.0...v2.9.0) (2026-09-08)
+
+
+### Bug Fixes
+
+* **d3d12:** include vio_texture.h for the storage-image bind ([4eeb7fa](https://github.com/phpolygon/php-vio/commit/4eeb7fa55e35fec55217cd78e2036a1d5c3cb6a6))
+* **d3d:** defined initial render-target contents; test expectations for D3D12/WARP ([757cc76](https://github.com/phpolygon/php-vio/commit/757cc76de45cf4d6e9ca551d7f60b8700ca0bd9d))
+* **d3d:** draw-time texture/cubemap resolution on D3D11/D3D12, D3D12 cubemap upload + render-target readback ([2008331](https://github.com/phpolygon/php-vio/commit/20083318354d24c27beacfec00fba62f9f21a8c5))
+* **d3d:** latch vio_clear before vio_begin; make D3D12 follow-ups skip cleanly on Windows CI ([1d98d68](https://github.com/phpolygon/php-vio/commit/1d98d685fb38d1c846a5512f1577a0da2197e6c7))
+* **metal:** resolve texture binds at draw time; patch SPIRV-Cross struct-array stride ([b8ba9f3](https://github.com/phpolygon/php-vio/commit/b8ba9f38b55cc163784e7f06774b7cce21208837))
+
+
+### Features
+
+* **api:** vio_texture_update, pipeline destructor, 1:1 headless metrics; fix flat mesh layouts on OpenGL ([2d085d8](https://github.com/phpolygon/php-vio/commit/2d085d80a6d2c9f76b9010045f0f753fc9d24a0b))
+* **compute:** async dispatch inside the frame + vio_compute_wait ([2575141](https://github.com/phpolygon/php-vio/commit/2575141ece72d2a53c2f5daed1fac5fe0992f9b3))
+* **compute:** storage images (image2D/image3D) and reflected dispatch geometry ([645cc31](https://github.com/phpolygon/php-vio/commit/645cc31dbda903d95556716262608311c9d9c6d7))
+* **metal:** wire the 3D pipeline with D3D11/D3D12 parity ([e0ba90a](https://github.com/phpolygon/php-vio/commit/e0ba90aabeef3363cfd96b51c06aa119462af52c))
+* **pipeline:** depth_write, color_mask and premultiplied/multiply/screen/min/max blend modes ([e7fb2f7](https://github.com/phpolygon/php-vio/commit/e7fb2f75b48b9121845b7051f4fc5195da6cd931))
+* **rt:** cubemap render targets, per-face binds and vio_generate_mipmaps ([7d1fcaa](https://github.com/phpolygon/php-vio/commit/7d1fcaaddd243e496f60601e32f381830ceb6816))
+* **rt:** multiple render targets (up to 4 colour attachments, 8 formats) ([3b30024](https://github.com/phpolygon/php-vio/commit/3b30024ddfaf431cf041f4954e374373dea1ad12))
+* **rt:** vio_read_render_target + eager vio_clear on OpenGL + defined initial RT contents ([ecf94b0](https://github.com/phpolygon/php-vio/commit/ecf94b0223f61e6b7f8f618c5d8e436c21f6e6f2))
+
 # [2.8.0](https://github.com/phpolygon/php-vio/compare/v2.7.4...v2.8.0) (2026-07-25)
 
 
