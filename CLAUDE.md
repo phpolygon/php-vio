@@ -18,6 +18,14 @@ der Build braucht die passende Homebrew-Formel (`php` = 8.5, API 20250925 wie He
 Homebrew-Formel** und wird aus `.deps/SPIRV-Cross` per cmake nach `/opt/homebrew`
 installiert (Rezept in `Makefile.macos`, untracked).
 
+**SPIRV-Cross braucht den Patch `deps-patches/spirv-cross-msl-struct-array-stride.patch`**
+(Basis-Commit in `deps-patches/spirv-cross-base-commit.txt`, upstream `main` Stand
+2026-09-07). Ohne ihn legt der MSL-Backend Struct-Arrays im Default-Uniform-Block
+(`uniform SpotLight u_spot_lights[4]` — std140-Stride 64, gepackte MSL-Größe 52) mit
+falschem Element-Stride oder 48 Byte zu viel Padding an; **alle Uniforms hinter dem
+Array werden auf Metal verschoben gelesen**. Regression: `tests/backends/094`.
+Anwenden: `git -C .deps/SPIRV-Cross apply ../../deps-patches/spirv-cross-msl-struct-array-stride.patch`.
+
 ```bash
 brew install php glfw glslang ffmpeg harfbuzz vulkan-loader vulkan-headers molten-vk cmake
 
@@ -83,13 +91,13 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-93 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+95 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
 | `tests/core/` | Laden, Konstanten, Null-Backend, Context-Lifecycle, Plugins, Audit-Gate 070, Capability-Matrix 074, Perf/Memory-Gates |
-| `tests/backends/` | Backend-Registrierung + GPU-Kontexte (OpenGL/Vulkan/Metal/D3D11/D3D12), Cross-Backend-Parity 067, Metal-3D 089, D3D-Spezifika |
+| `tests/backends/` | Backend-Registrierung + GPU-Kontexte (OpenGL/Vulkan/Metal/D3D11/D3D12), Cross-Backend-Parity 067, Metal-3D 089, Uniform-Layout Struct-Arrays 094, Texture-Bind-Reihenfolge 095, D3D-Spezifika |
 | `tests/render3d/` | Mesh/Shader/Pipeline/Texturen/Buffer/RT/Cubemap/Compute/Vertex-Storage, headless GL |
 | `tests/render2d/` | Shapes, Sprites, Fonts, Text-Shaping/-Wrapping, 2D-State-Stacks |
 | `tests/input/` | Keyboard/Mouse/Gamepad/Touch/IME, Injection |
@@ -173,6 +181,18 @@ Metal, Geometry-/Tessellation-Shader gibt es in Metal nicht (`VIO_FEATURE_GEOMET
   gesampelt). `vio_create_render_target` reicht `samples` ebenfalls durch.
 - **`vio_clear` ist eager** wie auf D3D11: im Frame wird der Pass mit Clear-Actions neu
   geöffnet (Swapchain oder gebundenes RT); vor `vio_begin` wird die Farbe gelatcht.
+- **Texturen werden erst beim Draw gebunden**: `vio_bind_texture`/`vio_bind_cubemap`
+  merken sich pro GL-Unit nur das Objekt (`ctx->pending_tex_*`, pro Frame geleert);
+  `vio_flush_pending_textures()` löst die Unit beim Draw über die Sampler-Map des
+  *dann* gebundenen Shaders in den `[[texture(n)]]`-Index auf. Damit sind — wie auf
+  OpenGL/D3D — „bind vor `vio_set_uniform('u_tex', unit)`" und „bind unter anderer
+  Pipeline" korrekt (Test 095). Ein GL-Unit darf dabei nur **einen** Sampler
+  tragen; PHPolygon nutzt 0 Albedo, 1 SSAO, 2 SDF-AO, 3–5 Probe-3D, 6/8/9 CSM,
+  7 Legacy-Shadow, 10 Environment-Cube.
+- **Render-Target-Orientierung**: ein RT, das mit GL-UVs gesampelt wird, ist auf Metal
+  V-gespiegelt (Zeile 0 = NDC-oben, wie D3D; Test 089). Engines flippen Clip-Y für
+  Shadow-Map-Lookups/Cube-Face-Captures auf Metal genau wie auf D3D
+  (PHPolygon `BackendConventions::flipRenderTargetClipY()`).
 - Shadow-Map-Wrapper (`vio_render_target_texture` eines Depth-only-RT) sampeln mit
   Border = Opaque White + Compare-Sampler, wie der D3D11-Wrapper.
 - **Swapchain-MSAA**: `vio_create(['samples' => 4])` rendert in ein 2DMultisample-Paar
@@ -735,6 +755,9 @@ gegen die Homebrew-Formel mit identischer Modul-API und das `.so` dann in Herd e
 - `php_vio.c` ist monolithisch (~9000 Zeilen) — alle PHP-Funktionen in einer Datei
 - SPIRV-Cross hat keine Homebrew-Formel; ohne `--with-spirv-cross` kann Metal kein
   GLSL→MSL übersetzen und jeder Shader scheitert (`Makefile.macos` baut es aus `.deps/`).
+- Ungepatchtes SPIRV-Cross (auch Homebrew/CI) hat den Struct-Array-Stride-Bug im
+  MSL-Backend (siehe Build → `deps-patches/`); Test 094 schlägt dort fehl. Fix ist
+  noch nicht upstream.
 - Text-Shaping braucht HarfBuzz (`--with-harfbuzz`); ohne es rendern Arabisch/
   Thai/Ligaturen nicht (`VIO_HAS_SHAPING == 0`, Legacy-Codepoint-Pfad). Der
   vcpkg-HarfBuzz (`harfbuzz[core,freetype]`) ist dynamisch — `harfbuzz.dll` +

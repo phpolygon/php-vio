@@ -31,6 +31,13 @@ typedef struct _vio_context_object {
     /* Currently bound pipeline shader (0 = use default) */
     unsigned int       bound_shader_program;
     void              *bound_shader_object;  /* vio_shader_object* for uniform cbuffer */
+    /* Metal: last object bound per GL texture unit. Resolved against the
+     * shader bound AT DRAW TIME (vio_flush_pending_textures), so vio_bind_texture
+     * may precede vio_set_uniform('u_sampler', unit) and pipeline switches, the
+     * way it does on OpenGL/D3D. Raw pointers — cleared by vio_begin/vio_end,
+     * valid within one frame only. */
+    void              *pending_tex_obj[16];
+    int                pending_tex_kind[16];  /* 0 none, 1 VioTexture, 2 VioCubemap */
     /* Backend-supplied offscreen render surface (OpenGL = FBO handle; other
      * backends leave 0 and use the swapchain backbuffer directly). */
     unsigned int       headless_fbo;

@@ -680,6 +680,8 @@ ZEND_FUNCTION(vio_begin)
     }
 #endif
 
+    memset(ctx->pending_tex_kind, 0, sizeof(ctx->pending_tex_kind));
+    memset(ctx->pending_tex_obj, 0, sizeof(ctx->pending_tex_obj));
     ctx->in_frame = 1;
 }
 
@@ -718,6 +720,8 @@ ZEND_FUNCTION(vio_end)
     }
 #endif
 
+    memset(ctx->pending_tex_kind, 0, sizeof(ctx->pending_tex_kind));
+    memset(ctx->pending_tex_obj, 0, sizeof(ctx->pending_tex_obj));
     ctx->in_frame = 0;
 }
 
@@ -1980,8 +1984,11 @@ ZEND_FUNCTION(vio_mesh)
  * bind + draw_indexed path, on every backend). The bound pipeline's shader is
  * read from ctx->bound_shader_object, so the caller MUST have bound a pipeline.
  * Caller guarantees ctx is initialized + in_frame and mesh is non-NULL. */
+static void vio_flush_pending_textures(vio_context_object *ctx);
+
 static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
 {
+    vio_flush_pending_textures(ctx);
     if (ctx->backend->draw_mesh) {
         ctx->backend->draw_mesh(mesh);
     }
@@ -3056,8 +3063,70 @@ ZEND_FUNCTION(vio_texture_3d)
  * vio_bind_texture so vio_submit_batch binds textures through the EXACT same
  * sampler remap + depth-sampler path. Caller guarantees ctx is initialized +
  * in_frame and tex is valid. */
+/* GL texture unit -> backend sampler register of the bound shader (index into
+ * the fragment stage's sampled-image list, which is what D3D11 and Metal bind
+ * by). Falls back to the unit itself when the shader never named that unit. */
+static int vio_resolve_sampler_slot(vio_context_object *ctx, zend_long slot, int *sampler_idx_out, int *wants_depth)
+{
+    int hlsl_slot = (int)slot;
+    int sampler_idx = -1;
+    *wants_depth = 0;
+    if (ctx->bound_shader_object) {
+        vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+        if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
+            sampler_idx = sh->gl_to_hlsl_sampler[slot];
+            hlsl_slot = sampler_idx;
+            if (sampler_idx < sh->sampler_count) {
+                *wants_depth = sh->sampler_is_depth[sampler_idx];
+            }
+        }
+    }
+    if (sampler_idx_out) *sampler_idx_out = sampler_idx;
+    return hlsl_slot;
+}
+
+#ifdef HAVE_METAL
+/* Metal binds textures straight into the open encoder, so a bind issued before
+ * vio_set_uniform('u_tex', unit) — or while a different pipeline was bound —
+ * would land on the wrong [[texture(n)]]. Record per GL unit here and resolve
+ * against the shader that is bound when the draw is recorded. */
+static void vio_pending_texture_set(vio_context_object *ctx, zend_long slot, int kind, void *obj)
+{
+    if (slot < 0 || slot >= 16) return;
+    ctx->pending_tex_obj[slot] = obj;
+    ctx->pending_tex_kind[slot] = kind;
+}
+
+static void vio_flush_pending_textures(vio_context_object *ctx)
+{
+    if (strcmp(ctx->backend->name, "metal") != 0) return;
+    for (int slot = 0; slot < 16; slot++) {
+        int kind = ctx->pending_tex_kind[slot];
+        if (!kind || !ctx->pending_tex_obj[slot]) continue;
+        int wants_depth = 0;
+        int msl_slot = vio_resolve_sampler_slot(ctx, slot, NULL, &wants_depth);
+        if (kind == 1) {
+            vio_texture_object *tex = (vio_texture_object *)ctx->pending_tex_obj[slot];
+            if (tex->backend_texture && ctx->backend->bind_texture) {
+                ctx->backend->bind_texture(tex->backend_texture, msl_slot);
+            }
+        } else if (kind == 2) {
+            vio_metal_bind_cubemap(ctx->pending_tex_obj[slot], msl_slot);
+        }
+    }
+}
+#else
+static void vio_flush_pending_textures(vio_context_object *ctx) { (void)ctx; }
+#endif
+
 static void vio_bind_texture_internal(vio_context_object *ctx, vio_texture_object *tex, zend_long slot)
 {
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        vio_pending_texture_set(ctx, slot, 1, tex);
+        return;
+    }
+#endif
     if (tex->is_3d && tex->texture_id && ctx->backend->bind_texture_3d_id) {
         /* OpenGL volume texture (Fieldtracing SDF): bind via the GL_TEXTURE_3D
          * target. D3D11/D3D12/Vulkan volumes have texture_id == 0 and fall
@@ -3659,6 +3728,8 @@ ZEND_FUNCTION(vio_draw_instanced_from_buffer)
         php_error_docref(NULL, E_NOTICE, "vio_draw_instanced_from_buffer: vertex storage not supported on this backend");
         return;
     }
+
+    vio_flush_pending_textures(ctx);
 
     /* Push pending vio_set_uniform writes to the backend cbuffers, the same way
      * vio_draw / vio_draw_instanced do before recording their draw. */
@@ -7438,6 +7509,7 @@ ZEND_FUNCTION(vio_draw_instanced)
                 }
             }
             /* Matrices go into this draw's own per-frame ring slice. */
+            vio_flush_pending_textures(ctx);
             vio_metal_draw_instanced(mesh, mat_data, (int)instance_count);
         } else
 #endif
@@ -9077,14 +9149,8 @@ ZEND_FUNCTION(vio_bind_cubemap)
 
 #ifdef HAVE_METAL
     if (strcmp(ctx->backend->name, "metal") == 0 && cm->metal_texture) {
-        int msl_slot = (int)slot;
-        if (ctx->bound_shader_object) {
-            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
-                msl_slot = sh->gl_to_hlsl_sampler[slot];
-            }
-        }
-        vio_metal_bind_cubemap(cm, msl_slot);
+        /* Resolved at draw time, see vio_flush_pending_textures. */
+        vio_pending_texture_set(ctx, slot, 2, cm);
     }
 #endif
 }
