@@ -30,6 +30,7 @@
 #include "vio_d3d12.h"
 #include "../vio_d3d_common.h"
 #include "../../vio_shader_reflect.h"   /* vio_spirv_reflect — data-driven compute register mapping */
+#include "../../vio_texture.h"          /* vio_texture_object — storage-image binds */
 #include <string.h>
 #include <stdlib.h>
 
