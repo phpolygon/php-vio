@@ -144,14 +144,14 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Native 2D-Batch | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Render Target (Basis) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Render Target HDR / Depth-only / MSAA | ✅/✅/✅* | ✅/✅/✅* | ✅/✅/✅* | ❌/❌/❌ | ✅/✅/✅ |
-| Cubemap | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Cubemap | ✅ | ✅ | ✅† (seit 2.9: Upload war vorher nicht implementiert) | ❌ | ✅ |
 | Compute (`vio_compute_*`) | ✅ (GL ≥ 4.3 → auf macOS nie) | ✅ | ✅ | ✅ | ✅ |
 | Vertex-Storage (`vio_draw_instanced_from_buffer`) | ✅ (wenn Compute) | ✅ | ✅ | ❌ | ✅ |
 | Texture 3D | ✅ | ✅ | ✅ | ✅ | ✅ |
 | read_pixels | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Texture Swizzle | ✅ (3.3+) | ❌ (CPU-Expand) | ❌ (CPU-Expand) | ✅ | ✅ |
 | Cubemap-RT + `vio_generate_mipmaps` | ✅ | ❌ (Follow-up) | ❌ (Follow-up) | ❌ | ✅ |
-| `vio_read_render_target` | ✅ | ✅ | ❌ (Follow-up) | ❌ | ✅ |
+| `vio_read_render_target` | ✅ | ✅ | ✅† | ❌ | ✅ |
 | `vio_texture_update` | ✅ | ✅ | ❌ (Follow-up) | ❌ | ✅ |
 | `depth_write` / `color_mask` / Blend-Modi | ✅ | ✅ | ✅ | — | ✅ |
 | MRT (`'attachments' => [VIO_FORMAT_*…]`, bis 4) | ✅ | ✅† | ✅† | ❌ | ✅ |
@@ -189,12 +189,12 @@ Metal, Geometry-/Tessellation-Shader gibt es in Metal nicht (`VIO_FEATURE_GEOMET
   gesampelt). `vio_create_render_target` reicht `samples` ebenfalls durch.
 - **`vio_clear` ist eager** wie auf D3D11: im Frame wird der Pass mit Clear-Actions neu
   geöffnet (Swapchain oder gebundenes RT); vor `vio_begin` wird die Farbe gelatcht.
-- **Texturen werden erst beim Draw gebunden**: `vio_bind_texture`/`vio_bind_cubemap`
-  merken sich pro GL-Unit nur das Objekt (`ctx->pending_tex_*`, pro Frame geleert);
-  `vio_flush_pending_textures()` löst die Unit beim Draw über die Sampler-Map des
-  *dann* gebundenen Shaders in den `[[texture(n)]]`-Index auf. Damit sind — wie auf
-  OpenGL/D3D — „bind vor `vio_set_uniform('u_tex', unit)`" und „bind unter anderer
-  Pipeline" korrekt (Test 095). Ein GL-Unit darf dabei nur **einen** Sampler
+- **Texturen werden erst beim Draw gebunden** (gilt für alle Typed-Register-Backends:
+  Metal, D3D11, D3D12): `vio_bind_texture`/`vio_bind_cubemap` merken sich pro GL-Unit
+  nur das Objekt (`ctx->pending_tex_*`, pro Frame geleert); `vio_flush_pending_textures()`
+  löst die Unit beim Draw über die Sampler-Map des *dann* gebundenen Shaders in den
+  `[[texture(n)]]`- bzw. `t#`-Index auf. Damit sind — wie auf OpenGL — „bind vor
+  `vio_set_uniform('u_tex', unit)`" und „bind unter anderer Pipeline" korrekt (Test 095). Ein GL-Unit darf dabei nur **einen** Sampler
   tragen; PHPolygon nutzt 0 Albedo, 1 SSAO, 2 SDF-AO, 3–5 Probe-3D, 6/8/9 CSM,
   7 Legacy-Shadow, 10 Environment-Cube.
 - **Render-Target-Orientierung**: ein RT, das mit GL-UVs gesampelt wird, ist auf Metal

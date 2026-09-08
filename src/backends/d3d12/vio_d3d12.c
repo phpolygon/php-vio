@@ -38,6 +38,7 @@ vio_d3d12_state vio_d3d12 = {0};
 
 /* Currently bound pipeline (for vertex stride in draw calls) */
 static vio_d3d12_pipeline *d3d12_current_pipeline = NULL;
+static void d3d12_compute_wait(void);   /* defined with the compute path; used by the readback helper */
 
 /* Pull pending validation messages out of the D3D12 InfoQueue and forward them
  * to PHP's error log. No-op when the debug layer is not active. Called after
@@ -1935,6 +1936,272 @@ static void d3d12_destroy_texture(void *texture_ptr)
 #include "../../vio_render_target.h"
 #include "../../vio_mesh.h"  /* vio_mesh_object — draw_instanced_from_storage reads mesh->backend_vb/stride/index_count */
 
+/* Cubemap upload: a 6-slice Texture2D array (RGBA8, one mip), the six faces
+ * copied through one upload buffer, then a TEXTURECUBE SRV in the staging heap
+ * (same allocator as 2D textures). Face order +X,-X,+Y,-Y,+Z,-Z == slices 0..5. */
+static int d3d12_upload_cubemap(void *cm_obj, int width, int height, const void *face_rgba[6])
+{
+    vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
+    if (!cm || !vio_d3d12.device || width <= 0 || height != width) return -1;
+
+    D3D12_HEAP_PROPERTIES heap_props = {0};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC res_desc = {0};
+    res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    res_desc.Width = (UINT64)width;
+    res_desc.Height = (UINT)height;
+    res_desc.DepthOrArraySize = 6;
+    res_desc.MipLevels = 1;
+    res_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    res_desc.SampleDesc.Count = 1;
+    res_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    ID3D12Resource *res = NULL;
+    HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props, D3D12_HEAP_FLAG_NONE,
+        &res_desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&res);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D12: cubemap resource creation failed (0x%08lx)", hr);
+        return -1;
+    }
+
+    /* One upload buffer holding all six faces at their copyable footprints. */
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[6];
+    UINT64 upload_size = 0;
+    ID3D12Device_GetCopyableFootprints(vio_d3d12.device, &res_desc, 0, 6, 0, fp, NULL, NULL, &upload_size);
+
+    D3D12_HEAP_PROPERTIES upload_heap = {0};
+    upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC upload_desc = {0};
+    upload_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    upload_desc.Width = upload_size;
+    upload_desc.Height = 1;
+    upload_desc.DepthOrArraySize = 1;
+    upload_desc.MipLevels = 1;
+    upload_desc.SampleDesc.Count = 1;
+    upload_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource *upload = NULL;
+    hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &upload_heap, D3D12_HEAP_FLAG_NONE,
+        &upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void **)&upload);
+    if (FAILED(hr)) {
+        ID3D12Resource_Release(res);
+        php_error_docref(NULL, E_WARNING, "D3D12: cubemap upload buffer failed (0x%08lx)", hr);
+        return -1;
+    }
+
+    void *mapped = NULL;
+    D3D12_RANGE none = {0, 0};
+    if (SUCCEEDED(ID3D12Resource_Map(upload, 0, &none, &mapped)) && mapped) {
+        for (int f = 0; f < 6; f++) {
+            if (!face_rgba[f]) continue;
+            const uint8_t *src = (const uint8_t *)face_rgba[f];
+            uint8_t *dst = (uint8_t *)mapped + fp[f].Offset;
+            for (int row = 0; row < height; row++) {
+                memcpy(dst + (size_t)row * fp[f].Footprint.RowPitch, src + (size_t)row * width * 4, (size_t)width * 4);
+            }
+        }
+        ID3D12Resource_Unmap(upload, 0, NULL);
+    }
+
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                             &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr)) {
+        hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                            &IID_ID3D12GraphicsCommandList, (void **)&list);
+    }
+    if (SUCCEEDED(hr)) {
+        for (int f = 0; f < 6; f++) {
+            D3D12_TEXTURE_COPY_LOCATION dst_loc = {0};
+            dst_loc.pResource = res;
+            dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst_loc.SubresourceIndex = (UINT)f;
+            D3D12_TEXTURE_COPY_LOCATION src_loc = {0};
+            src_loc.pResource = upload;
+            src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src_loc.PlacedFootprint = fp[f];
+            ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst_loc, 0, 0, 0, &src_loc, NULL);
+        }
+        D3D12_RESOURCE_BARRIER barrier = {0};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = res;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+        ID3D12GraphicsCommandList_Close(list);
+        ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        vio_d3d12_wait_for_gpu();
+    }
+    if (list)  ID3D12GraphicsCommandList_Release(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    ID3D12Resource_Release(upload);
+    if (FAILED(hr)) {
+        ID3D12Resource_Release(res);
+        php_error_docref(NULL, E_WARNING, "D3D12: cubemap upload command list failed (0x%08lx)", hr);
+        return -1;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.TextureCube.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
+    D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu;
+    d3d12_alloc_srv_descriptor(&srv_cpu, &srv_gpu);
+    ID3D12Device_CreateShaderResourceView(vio_d3d12.device, res, &srv_desc, srv_cpu);
+
+    cm->d3d12_resource = res;
+    cm->d3d12_srv_cpu  = srv_cpu.ptr;
+    cm->d3d12_srv_gpu  = srv_gpu.ptr;
+    cm->resolution     = width;
+    cm->mipmaps        = 0;   /* single mip on D3D12 */
+    cm->backend_type   = 3;
+    return 0;
+}
+
+/* Copy one subresource of a texture into CPU memory (row pitch = out_pitch).
+ * Mid-frame the copy is recorded on the live frame list which is then
+ * executed, waited on and reopened (the vio_d3d12_capture_frame pattern);
+ * otherwise a transient list is used. The resource is returned to `state`. */
+static unsigned char *d3d12_readback_subresource(ID3D12Resource *src, UINT subresource,
+                                                 D3D12_RESOURCE_STATES state, UINT *out_pitch)
+{
+    D3D12_RESOURCE_DESC sd;
+    ID3D12Resource_GetDesc(src, &sd);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {0};
+    UINT64 total = 0;
+    ID3D12Device_GetCopyableFootprints(vio_d3d12.device, &sd, subresource, 1, 0, &fp, NULL, NULL, &total);
+
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rb = {0};
+    rb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rb.Width = total; rb.Height = 1; rb.DepthOrArraySize = 1; rb.MipLevels = 1;
+    rb.SampleDesc.Count = 1;
+    rb.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource *readback = NULL;
+    if (FAILED(ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rb,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&readback)) || !readback) {
+        return NULL;
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION src_loc = {0};
+    src_loc.pResource = src;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_loc.SubresourceIndex = subresource;
+    D3D12_TEXTURE_COPY_LOCATION dst_loc = {0};
+    dst_loc.pResource = readback;
+    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst_loc.PlacedFootprint = fp;
+    D3D12_RESOURCE_BARRIER barrier = {0};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = src;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    if (vio_d3d12.in_frame && vio_d3d12.cmd_list) {
+        ID3D12GraphicsCommandList *list = vio_d3d12.cmd_list;
+        barrier.Transition.StateBefore = state;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst_loc, 0, 0, 0, &src_loc, NULL);
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter  = state;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+        /* Execute + wait + reopen with the bound target / pipeline re-armed. */
+        vio_d3d12.compute_async_pending = 1;
+        d3d12_compute_wait();
+    } else {
+        ID3D12CommandAllocator *alloc = NULL;
+        ID3D12GraphicsCommandList *list = NULL;
+        HRESULT hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                         &IID_ID3D12CommandAllocator, (void **)&alloc);
+        if (SUCCEEDED(hr)) {
+            hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                                &IID_ID3D12GraphicsCommandList, (void **)&list);
+        }
+        if (FAILED(hr)) {
+            if (alloc) ID3D12CommandAllocator_Release(alloc);
+            ID3D12Resource_Release(readback);
+            return NULL;
+        }
+        barrier.Transition.StateBefore = state;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst_loc, 0, 0, 0, &src_loc, NULL);
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter  = state;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+        ID3D12GraphicsCommandList_Close(list);
+        ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        vio_d3d12_wait_for_gpu();
+        ID3D12GraphicsCommandList_Release(list);
+        ID3D12CommandAllocator_Release(alloc);
+    }
+
+    D3D12_RANGE rr = {0, (SIZE_T)total};
+    void *mapped = NULL;
+    if (FAILED(ID3D12Resource_Map(readback, 0, &rr, &mapped)) || !mapped) {
+        ID3D12Resource_Release(readback);
+        return NULL;
+    }
+    unsigned char *out = (unsigned char *)malloc((size_t)total);
+    if (out) memcpy(out, mapped, (size_t)total);
+    ID3D12Resource_Unmap(readback, 0, NULL);
+    ID3D12Resource_Release(readback);
+    if (out_pitch) *out_pitch = fp.Footprint.RowPitch;
+    return out;
+}
+
+/* vio_read_render_target on D3D12: colour attachment (any vio_pixel_format,
+ * converted to RGBA8 by the shared converter) or the depth buffer
+ * (R24G8_TYPELESS -> grey ramp). Cube targets are not available on D3D12. */
+static int d3d12_read_render_target(void *rt_ptr, int face, int attachment, void *out_rgba)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    (void)face;
+    if (!rt || rt->backend_type != VIO_RT_BACKEND_D3D12 || !vio_d3d12.device) return -1;
+    int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+    if (attachment < 0 || attachment >= n) return -1;
+
+    ID3D12Resource *src;
+    D3D12_RESOURCE_STATES state;
+    if (rt->depth_only) {
+        src = (ID3D12Resource *)rt->d3d12_depth_resource;
+        state = rt->d3d12_depth_is_srv ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    } else {
+        src = attachment == 0 ? (ID3D12Resource *)rt->d3d12_color_resource
+                              : (ID3D12Resource *)rt->d3d12_color_resources[attachment];
+        state = rt->d3d12_color_is_srv ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    if (!src) return -1;
+
+    UINT pitch = 0;
+    unsigned char *raw = d3d12_readback_subresource(src, 0, state, &pitch);
+    if (!raw) return -1;
+    int w = rt->width, h = rt->height;
+    unsigned char *out = (unsigned char *)out_rgba;
+    if (rt->depth_only) {
+        for (int y = 0; y < h; y++) {
+            const unsigned char *row = raw + (size_t)y * pitch;
+            unsigned char *dst = out + (size_t)y * w * 4;
+            for (int x = 0; x < w; x++) {
+                uint32_t v; memcpy(&v, row + x * 4, 4); v &= 0x00FFFFFFu;
+                unsigned char g = (unsigned char)((v * 255ULL) / 0x00FFFFFFu);
+                dst[x*4+0] = dst[x*4+1] = dst[x*4+2] = g; dst[x*4+3] = 255;
+            }
+        }
+    } else {
+        vio_rt_convert_to_rgba8(rt->formats[attachment], 0, raw, (size_t)pitch, w, h, out);
+    }
+    free(raw);
+    return 0;
+}
+
 static void d3d12_destroy_cubemap(void *cm_ptr)
 {
     vio_cubemap_object *cm = (vio_cubemap_object *)cm_ptr;
@@ -3716,6 +3983,8 @@ static const vio_backend d3d12_backend = {
     .draw_instanced_from_storage  = d3d12_draw_instanced_from_storage,
     .supports_feature  = d3d12_supports_feature,
     .destroy_cubemap   = d3d12_destroy_cubemap,
+    .upload_cubemap    = d3d12_upload_cubemap,
+    .read_render_target = d3d12_read_render_target,
     .destroy_font_atlas = d3d12_destroy_font_atlas,
     .destroy_render_target = d3d12_destroy_render_target,
 };

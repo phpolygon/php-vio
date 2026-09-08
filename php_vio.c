@@ -3137,11 +3137,16 @@ static int vio_resolve_sampler_slot(vio_context_object *ctx, zend_long slot, int
     return hlsl_slot;
 }
 
-#ifdef HAVE_METAL
-/* Metal binds textures straight into the open encoder, so a bind issued before
- * vio_set_uniform('u_tex', unit) — or while a different pipeline was bound —
- * would land on the wrong [[texture(n)]]. Record per GL unit here and resolve
- * against the shader that is bound when the draw is recorded. */
+static void vio_bind_texture_now(vio_context_object *ctx, vio_texture_object *tex, zend_long slot);
+static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm, zend_long slot);
+
+/* The typed-register backends (D3D11 / D3D12 / Metal / Vulkan) translate the GL
+ * texture unit into a shader register through the BOUND shader's sampler map.
+ * Engines bind first and set the sampler uniform afterwards — or bind while a
+ * different pipeline is still current — so the translation must happen when the
+ * draw is recorded, not when vio_bind_texture is called. Record per GL unit here
+ * (OpenGL binds by unit and needs none of this); vio_flush_pending_textures()
+ * resolves the table right before every draw. */
 static void vio_pending_texture_set(vio_context_object *ctx, zend_long slot, int kind, void *obj)
 {
     if (slot < 0 || slot >= 16) return;
@@ -3151,34 +3156,33 @@ static void vio_pending_texture_set(vio_context_object *ctx, zend_long slot, int
 
 static void vio_flush_pending_textures(vio_context_object *ctx)
 {
-    if (strcmp(ctx->backend->name, "metal") != 0) return;
+    if (strcmp(ctx->backend->name, "opengl") == 0) return;
     for (int slot = 0; slot < 16; slot++) {
         int kind = ctx->pending_tex_kind[slot];
         if (!kind || !ctx->pending_tex_obj[slot]) continue;
-        int wants_depth = 0;
-        int msl_slot = vio_resolve_sampler_slot(ctx, slot, NULL, &wants_depth);
         if (kind == 1) {
-            vio_texture_object *tex = (vio_texture_object *)ctx->pending_tex_obj[slot];
-            if (tex->backend_texture && ctx->backend->bind_texture) {
-                ctx->backend->bind_texture(tex->backend_texture, msl_slot);
-            }
+            vio_bind_texture_now(ctx, (vio_texture_object *)ctx->pending_tex_obj[slot], slot);
         } else if (kind == 2) {
-            vio_metal_bind_cubemap(ctx->pending_tex_obj[slot], msl_slot);
+            vio_bind_cubemap_now(ctx, (vio_cubemap_object *)ctx->pending_tex_obj[slot], slot);
         }
     }
 }
-#else
-static void vio_flush_pending_textures(vio_context_object *ctx) { (void)ctx; }
-#endif
 
+/* Record a texture bind; OpenGL applies it immediately (unit-addressed). */
 static void vio_bind_texture_internal(vio_context_object *ctx, vio_texture_object *tex, zend_long slot)
 {
-#ifdef HAVE_METAL
-    if (strcmp(ctx->backend->name, "metal") == 0) {
+    if (strcmp(ctx->backend->name, "opengl") != 0) {
         vio_pending_texture_set(ctx, slot, 1, tex);
         return;
     }
-#endif
+    vio_bind_texture_now(ctx, tex, slot);
+}
+
+/* Apply one texture bind to the backend right now (resolved against the shader
+ * that is bound at this moment). */
+static void vio_bind_texture_now(vio_context_object *ctx, vio_texture_object *tex, zend_long slot)
+{
+
     if (tex->is_3d && tex->texture_id && ctx->backend->bind_texture_3d_id) {
         /* OpenGL volume texture (Fieldtracing SDF): bind via the GL_TEXTURE_3D
          * target. D3D11/D3D12/Vulkan volumes have texture_id == 0 and fall
@@ -7423,6 +7427,7 @@ ZEND_FUNCTION(vio_draw_instanced)
     if (instance_count <= 0) {
         return;
     }
+    vio_flush_pending_textures(ctx);
 
     /* Resolve matrix data (fast binary or slow array path) */
     const float *mat_data = NULL;
@@ -7643,7 +7648,6 @@ ZEND_FUNCTION(vio_draw_instanced)
                 }
             }
             /* Matrices go into this draw's own per-frame ring slice. */
-            vio_flush_pending_textures(ctx);
             vio_metal_draw_instanced(mesh, mat_data, (int)instance_count);
         } else
 #endif
@@ -9080,10 +9084,11 @@ ZEND_FUNCTION(vio_cubemap)
         cm->mipmaps = (mm && zend_is_true(mm)) ? 1 : 0;
     }
 
-    /* OpenGL + Metal go through the vtable; D3D11/D3D12 stay inline below. */
+    /* OpenGL, Metal and D3D12 go through the vtable; D3D11 stays inline below. */
     int cm_is_metal = strcmp(ctx->backend->name, "metal") == 0;
     if (ctx->backend->upload_cubemap &&
-        (strcmp(ctx->backend->name, "opengl") == 0 || cm_is_metal)) {
+        (strcmp(ctx->backend->name, "opengl") == 0 || cm_is_metal ||
+         strcmp(ctx->backend->name, "d3d12") == 0)) {
         /* Marshal source data: 6 RGBA8 buffers of (face_w, face_h). The
          * vtable assumes uniform face dimensions — file-based loads use
          * the first face's size, pixel-based reads w/h from config. */
@@ -9345,10 +9350,19 @@ ZEND_FUNCTION(vio_bind_cubemap)
         return;
     }
 
-    if (ctx->backend->bind_cubemap_id) {
-        ctx->backend->bind_cubemap_id(cm->texture_id, (int)slot);
+    if (strcmp(ctx->backend->name, "opengl") == 0) {
+        if (ctx->backend->bind_cubemap_id) {
+            ctx->backend->bind_cubemap_id(cm->texture_id, (int)slot);
+        }
+        return;
     }
+    /* Typed-register backends: resolved at draw time, see vio_flush_pending_textures. */
+    vio_pending_texture_set(ctx, slot, 2, cm);
+}
 
+static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm, zend_long slot)
+{
+    (void)ctx; (void)cm; (void)slot;
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized &&
         cm->d3d11_srv && cm->d3d11_sampler) {
@@ -9376,6 +9390,15 @@ ZEND_FUNCTION(vio_bind_cubemap)
                 hlsl_slot = sh->gl_to_hlsl_sampler[slot];
             }
         }
+        if (ctx->bound_shader_object) {
+            /* Same register recomputation as vio_bind_texture_now (regular 0.., shadow 8..). */
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0 &&
+                sh->gl_to_hlsl_sampler[slot] < sh->sampler_count) {
+                hlsl_slot = sh->sampler_hlsl_reg[sh->gl_to_hlsl_sampler[slot]];
+            }
+        }
+        if (hlsl_slot < 0 || hlsl_slot >= VIO_D3D12_SRV_TABLE_SIZE) return;
         D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
         srv_cpu.ptr = cm->d3d12_srv_cpu;
         vio_d3d12.pending_srvs[hlsl_slot] = srv_cpu;
@@ -9385,8 +9408,14 @@ ZEND_FUNCTION(vio_bind_cubemap)
 
 #ifdef HAVE_METAL
     if (strcmp(ctx->backend->name, "metal") == 0 && cm->metal_texture) {
-        /* Resolved at draw time, see vio_flush_pending_textures. */
-        vio_pending_texture_set(ctx, slot, 2, cm);
+        int msl_slot = (int)slot;
+        if (ctx->bound_shader_object) {
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
+                msl_slot = sh->gl_to_hlsl_sampler[slot];
+            }
+        }
+        vio_metal_bind_cubemap(cm, msl_slot);
     }
 #endif
 }
