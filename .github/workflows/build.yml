@@ -421,9 +421,9 @@ jobs:
           $env:REPORT_EXIT_STATUS = "1"
           $env:TEST_PHP_ARGS = "-n -d extension_dir=$dllDir -d extension=php_vio.dll"
           php -n run-tests.php -q --show-diff `
-            tests/086_vertex_storage.phpt `
-            tests/087_vertex_storage_render.phpt `
-            tests/088_vertex_storage_render_native.phpt
+            tests/render3d/086_vertex_storage.phpt `
+            tests/render3d/087_vertex_storage_render.phpt `
+            tests/render3d/088_vertex_storage_render_native.phpt
 
       - name: Package binary
         shell: pwsh
