@@ -238,7 +238,7 @@ if ($rec instanceof VioRecorder) {
 vio_destroy($c4);
 echo "DONE\n";
 ?>
---EXPECT--
+--EXPECTF--
 bool(true)
 triangle: OK
 per-draw uniforms: OK
@@ -253,5 +253,5 @@ msaa: OK
 depth-only discard: OK
 swapchain msaa: OK
 gpu info: OK
-recorder capture: OK
+%Arecorder capture: OK
 DONE

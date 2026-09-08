@@ -42,12 +42,14 @@ $H = 256;
 $expected = [0xFF, 0x80, 0x40, 0xFF]; // 1.0, 0.5, 0.25, 1.0 → R/G/B/A bytes
 
 $pixel_checks = 0;
+$tested = 0;
 foreach ($available as $backend) {
     $ctx = @vio_create($backend, ['width' => $W, 'height' => $H, 'headless' => true]);
     if (!$ctx instanceof VioContext) {
         echo "$backend: skip (no context)\n";
         continue;
     }
+    $tested++;
 
     // Clear both before AND after begin — covers all three timing
     // conventions in one call sequence.
@@ -77,10 +79,12 @@ foreach ($available as $backend) {
     vio_destroy($ctx);
 }
 
-// At least two backends must agree on the clear colour for this to be
-// considered passing cross-backend parity. If only one backend works,
-// the test degrades to "current platform reports parity" which is fine.
-var_dump($pixel_checks >= 2);
+// Every backend that could open a context must report the clear colour, and
+// at least one must have been tested. Two or more agreeing backends is the
+// real cross-backend parity check; with a single one (macOS CI runners have
+// Metal but no headless OpenGL >= 3.3) the test degrades to "current platform
+// reports parity", which is fine.
+var_dump($tested >= 1 && $pixel_checks === $tested);
 echo "OK\n";
 ?>
 --EXPECTF--

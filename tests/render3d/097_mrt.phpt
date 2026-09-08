@@ -14,11 +14,15 @@ require __DIR__ . '/../skipif_gl.inc';
 ?>
 --FILE--
 <?php
-$backends = ['auto'];
-foreach (['metal', 'opengl'] as $extra) {
-    $probe = @vio_create($extra, ['width' => 4, 'height' => 4, 'headless' => true]);
-    if ($probe) { vio_destroy($probe); $backends[] = $extra; }
+// 'auto' may resolve to a backend that cannot open a context on this host (e.g.
+// Vulkan without an ICD on Linux CI): probe every candidate quietly and only keep
+// the ones that come up.
+$backends = [];
+foreach (['auto', 'metal', 'opengl'] as $candidate) {
+    $probe = @vio_create($candidate, ['width' => 4, 'height' => 4, 'headless' => true]);
+    if ($probe) { vio_destroy($probe); $backends[] = $candidate; }
 }
+if (!$backends) { echo "none: skipped\n"; }
 
 $vs = "#version 330 core\nlayout(location=0) in vec3 aPos;\nlayout(location=1) in vec2 aUv;\nout vec2 vUv;\nvoid main(){ vUv = aUv; gl_Position = vec4(aPos, 1.0); }";
 $fsMrt = <<<'GLSL'
@@ -37,8 +41,8 @@ $fsBlit = "#version 330 core\nin vec2 vUv;\nuniform sampler2D u_tex;\nlayout(loc
 
 $W = 8;
 foreach ($backends as $be) {
-    $ctx = vio_create($be, ['width' => $W, 'height' => $W, 'headless' => true, 'vsync' => false]);
-    if (!$ctx) { echo "$be: create failed\n"; continue; }
+    $ctx = @vio_create($be, ['width' => $W, 'height' => $W, 'headless' => true, 'vsync' => false]);
+    if (!$ctx) { echo "$be: skipped\n"; continue; }
     $name = vio_backend_name($ctx);
     if (!vio_supports_feature($ctx, VIO_FEATURE_3D_PIPELINE) || !vio_supports_feature($ctx, VIO_FEATURE_READ_PIXELS)
         || !vio_supports_feature($ctx, VIO_FEATURE_MRT)) {

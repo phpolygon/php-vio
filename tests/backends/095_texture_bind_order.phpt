@@ -20,11 +20,15 @@ require __DIR__ . '/../skipif_gl.inc';
 ?>
 --FILE--
 <?php
-$backends = ['auto'];
-foreach (['metal', 'opengl'] as $extra) {
-    $probe = @vio_create($extra, ['width' => 4, 'height' => 4, 'headless' => true]);
-    if ($probe) { vio_destroy($probe); $backends[] = $extra; }
+// 'auto' may resolve to a backend that cannot open a context on this host (e.g.
+// Vulkan without an ICD on Linux CI): probe every candidate quietly and only keep
+// the ones that come up.
+$backends = [];
+foreach (['auto', 'metal', 'opengl'] as $candidate) {
+    $probe = @vio_create($candidate, ['width' => 4, 'height' => 4, 'headless' => true]);
+    if ($probe) { vio_destroy($probe); $backends[] = $candidate; }
 }
+if (!$backends) { echo "none: skipped\n"; }
 
 $vs = "#version 330 core\nlayout(location=0) in vec3 aPos;\nvoid main(){ gl_Position = vec4(aPos, 1.0); }";
 // Two 2D samplers + a cube, deliberately declared in an order that differs from
@@ -48,8 +52,8 @@ $solid = fn(int $r, int $g, int $b) => str_repeat(pack('C4', $r, $g, $b, 255), 1
 $face = fn(int $r, int $g, int $b) => array_merge(...array_fill(0, 16, [$r, $g, $b, 255]));
 
 foreach ($backends as $be) {
-    $ctx = vio_create($be, ['width' => 8, 'height' => 8, 'headless' => true, 'vsync' => false]);
-    if (!$ctx) { echo "$be: create failed\n"; continue; }
+    $ctx = @vio_create($be, ['width' => 8, 'height' => 8, 'headless' => true, 'vsync' => false]);
+    if (!$ctx) { echo "$be: skipped\n"; continue; }
     $name = vio_backend_name($ctx);
     if (!vio_supports_feature($ctx, VIO_FEATURE_3D_PIPELINE) || !vio_supports_feature($ctx, VIO_FEATURE_READ_PIXELS)
         || !vio_supports_feature($ctx, VIO_FEATURE_CUBEMAP)) {
