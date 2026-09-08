@@ -1636,6 +1636,44 @@ static void *metal_compile_shader(vio_shader_desc *desc)
  * strong reference outlives this autoreleasepool. Released in destroy via
  * CFBridgingRelease (which ARC drops on scope exit). */
 
+/* Give a freshly created RT defined contents (colour 0, depth 1.0) with one
+ * empty Clear pass per slice, so a target that is bound and drawn into without
+ * an explicit vio_clear still depth-tests (Private textures start undefined). */
+static void metal_rt_initial_clear(vio_render_target_object *rt)
+{
+    id<MTLTexture> color = rt->metal_color_texture ? (__bridge id<MTLTexture>)rt->metal_color_texture : nil;
+    id<MTLTexture> msaa  = rt->metal_msaa_color_texture ? (__bridge id<MTLTexture>)rt->metal_msaa_color_texture : nil;
+    id<MTLTexture> depth = rt->metal_depth_texture ? (__bridge id<MTLTexture>)rt->metal_depth_texture
+                         : (rt->metal_msaa_depth_texture ? (__bridge id<MTLTexture>)rt->metal_msaa_depth_texture : nil);
+    if (!color && !depth) return;
+    id<MTLCommandBuffer> cb = metal_new_command_buffer();
+    int slices = rt->is_cube ? 6 : 1;
+    for (int s = 0; s < slices; s++) {
+        MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (color) {
+            d.colorAttachments[0].texture = msaa ? msaa : color;
+            d.colorAttachments[0].slice = (NSUInteger)s;
+            d.colorAttachments[0].loadAction = MTLLoadActionClear;
+            d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+            if (msaa) {
+                d.colorAttachments[0].resolveTexture = color;
+                d.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+            } else {
+                d.colorAttachments[0].storeAction = MTLStoreActionStore;
+            }
+        }
+        if (depth) {
+            d.depthAttachment.texture = depth;
+            d.depthAttachment.loadAction = MTLLoadActionClear;
+            d.depthAttachment.storeAction = MTLStoreActionStore;
+            d.depthAttachment.clearDepth = 1.0;
+        }
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:d];
+        [enc endEncoding];
+    }
+    [cb commit];
+}
+
 /* Largest sample count <= requested that the device supports (1 when MSAA is
  * off or the request is nonsense). Metal requires the exact count to be
  * supported, so walk down 8 -> 4 -> 2. */
@@ -1697,6 +1735,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             rt->metal_color_texture = (void *)CFBridgingRetain(cube);
             rt->metal_depth_texture = (void *)CFBridgingRetain(cube_depth);
             rt->backend_type = VIO_RT_BACKEND_METAL;
+            metal_rt_initial_clear(rt);
             return 0;
         }
 
@@ -1764,6 +1803,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             rt->metal_depth_texture = (void *)CFBridgingRetain(depth_tex);
         }
         rt->backend_type = VIO_RT_BACKEND_METAL;
+        metal_rt_initial_clear(rt);
 
         return 0;
     }
@@ -2873,6 +2913,111 @@ static int metal_render_target_cubemap(void *rt_ptr, void *cm_obj)
     return 0;
 }
 
+/* half -> float for RGBA16F readback. */
+static float metal_half_to_float(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) { bits = sign; }
+        else {  /* subnormal */
+            exp = 127 - 15 + 1;
+            while (!(mant & 0x400)) { mant <<= 1; exp--; }
+            mant &= 0x3FF;
+            bits = sign | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000 | (mant << 13);
+    } else {
+        bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float f; memcpy(&f, &bits, 4); return f;
+}
+
+static inline unsigned char metal_unit_to_byte(float v)
+{
+    if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+    return (unsigned char)(v * 255.0f + 0.5f);
+}
+
+/* Flush everything recorded so far so a readback sees this frame's draws,
+ * then continue the frame on a fresh command buffer (Load semantics). */
+static void metal_flush_for_readback(void)
+{
+    if (!vio_mtl.current_cmd_buf) return;
+    if (vio_mtl.current_encoder) {
+        [vio_mtl.current_encoder endEncoding];
+        vio_mtl.current_encoder = nil;
+    }
+    [vio_mtl.current_cmd_buf commit];
+    [vio_mtl.current_cmd_buf waitUntilCompleted];
+    vio_mtl.current_cmd_buf = metal_new_command_buffer();
+    metal_open_encoder(/*load_clear=*/0);
+}
+
+/* vio_read_render_target: blit one slice of the RT's (resolved) colour or
+ * depth texture into a Shared buffer and convert to top-down RGBA8. */
+static int metal_read_render_target(void *rt_ptr, int face, void *out_rgba)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!rt || rt->backend_type != VIO_RT_BACKEND_METAL || !vio_mtl.device) return -1;
+    @autoreleasepool {
+        id<MTLTexture> src = rt->depth_only
+            ? (__bridge id<MTLTexture>)rt->metal_depth_texture
+            : (__bridge id<MTLTexture>)rt->metal_color_texture;   /* resolve texture when MSAA */
+        if (!src) return -1;
+        NSUInteger slice = 0;
+        if (rt->is_cube) slice = (NSUInteger)(face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0));
+
+        metal_flush_for_readback();
+
+        int w = rt->width, h = rt->height;
+        MTLPixelFormat fmt = src.pixelFormat;
+        NSUInteger bpp = (fmt == MTLPixelFormatRGBA16Float) ? 8 : 4;   /* BGRA8 / Depth32Float = 4 */
+        NSUInteger bpr = (NSUInteger)w * bpp;
+        id<MTLBuffer> staging = [vio_mtl.device newBufferWithLength:bpr * h options:MTLResourceStorageModeShared];
+        if (!staging) return -1;
+
+        id<MTLCommandBuffer> cb = metal_new_command_buffer();
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromTexture:src sourceSlice:slice sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                     toBuffer:staging destinationOffset:0
+       destinationBytesPerRow:bpr destinationBytesPerImage:bpr * h];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        const unsigned char *s = (const unsigned char *)[staging contents];
+        unsigned char *out = (unsigned char *)out_rgba;
+        size_t n = (size_t)w * h;
+        if (fmt == MTLPixelFormatDepth32Float) {
+            const float *d = (const float *)s;
+            for (size_t i = 0; i < n; i++) {
+                unsigned char g = metal_unit_to_byte(d[i]);
+                out[i*4+0] = out[i*4+1] = out[i*4+2] = g; out[i*4+3] = 255;
+            }
+        } else if (fmt == MTLPixelFormatRGBA16Float) {
+            const uint16_t *hp = (const uint16_t *)s;
+            for (size_t i = 0; i < n; i++) {
+                out[i*4+0] = metal_unit_to_byte(metal_half_to_float(hp[i*4+0]));
+                out[i*4+1] = metal_unit_to_byte(metal_half_to_float(hp[i*4+1]));
+                out[i*4+2] = metal_unit_to_byte(metal_half_to_float(hp[i*4+2]));
+                out[i*4+3] = metal_unit_to_byte(metal_half_to_float(hp[i*4+3]));
+            }
+        } else if (fmt == MTLPixelFormatRGBA8Unorm) {
+            memcpy(out, s, n * 4);
+        } else {  /* BGRA8Unorm */
+            for (size_t i = 0; i < n; i++) {
+                out[i*4+0] = s[i*4+2]; out[i*4+1] = s[i*4+1]; out[i*4+2] = s[i*4+0]; out[i*4+3] = s[i*4+3];
+            }
+        }
+    }
+    return 0;
+}
+
 /* Build the mip chain of an RT colour texture / texture / cubemap. Inside a
  * frame the open pass is closed first so the blit is ordered after the draws
  * that produced level 0, then reopened with Load. */
@@ -3542,6 +3687,7 @@ static const vio_backend metal_backend = {
     .destroy_cubemap   = metal_destroy_cubemap,
     .bind_render_target_face = metal_bind_render_target_face,
     .render_target_cubemap   = metal_render_target_cubemap,
+    .read_render_target      = metal_read_render_target,
     .generate_mipmaps        = metal_generate_mipmaps,
     /* Path B: vertex-stage SSBO bound at its pinned MSL index, drawn with
      * instance_count instances and no per-instance vertex buffer. */

@@ -424,7 +424,9 @@ jobs:
             tests/render3d/086_vertex_storage.phpt `
             tests/render3d/087_vertex_storage_render.phpt `
             tests/render3d/088_vertex_storage_render_native.phpt `
-            tests/render3d/090_cubemap_render_target.phpt
+            tests/render3d/090_cubemap_render_target.phpt `
+            tests/render3d/091_pipeline_state.phpt `
+            tests/render3d/092_render_target_readback.phpt
 
       - name: Package binary
         shell: pwsh

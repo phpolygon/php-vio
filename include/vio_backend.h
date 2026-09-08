@@ -75,6 +75,13 @@ typedef struct _vio_backend {
      * the RT keeps ownership; the backend may take its own reference). */
     int   (*render_target_cubemap)(void *rt, void *cm_obj);
 
+    /* CPU readback of a render target's colour attachment (face 0..5 for cube
+     * targets, -1 otherwise) as top-down RGBA8, width*height*4 bytes. HDR
+     * targets are clamped to 8 bit; depth-only targets return the depth as a
+     * grey ramp (R=G=B=depth*255, A=255). Safe mid-frame (backends flush).
+     * Returns 0 on success. NULL => vio_read_render_target unsupported. */
+    int   (*read_render_target)(void *rt, int face, void *out_rgba);
+
     /* Build the full mip chain of a texture-like object. kind: 0 =
      * vio_render_target_object (colour), 1 = vio_texture_object, 2 =
      * vio_cubemap_object. Safe mid-frame (backends close/reopen their pass).

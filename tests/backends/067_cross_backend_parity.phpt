@@ -13,9 +13,9 @@ vio
 // Backend clear-call timing inconsistency documented here so it doesn't
 // drift back to causing renderer bugs:
 //
-//   OpenGL:  vio_clear is deferred — only stores the colour. The actual
-//            glClear runs in opengl_begin_frame. Calling vio_clear after
-//            vio_begin therefore does NOT clear the current frame.
+//   OpenGL:  before vio_begin the colour is latched and applied by
+//            opengl_begin_frame; INSIDE a frame vio_clear is eager and clears
+//            the bound framebuffer (swapchain / headless FBO / render target).
 //   D3D11:   vio_clear runs eagerly on the immediate context. Works in
 //            either order (before or after vio_begin).
 //   D3D12:   vio_clear records a ClearRenderTargetView command on the

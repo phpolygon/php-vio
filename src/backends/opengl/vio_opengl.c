@@ -284,12 +284,14 @@ static void opengl_begin_frame(void)
 {
     glClearColor(vio_gl.clear_r, vio_gl.clear_g, vio_gl.clear_b, vio_gl.clear_a);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    vio_gl.in_frame = 1;
 }
 
 static void opengl_end_frame(void)
 {
     /* Flush any pending GL commands */
     glFlush();
+    vio_gl.in_frame = 0;
 }
 
 static void opengl_draw(vio_draw_cmd *cmd)
@@ -318,6 +320,17 @@ static void opengl_clear(float r, float g, float b, float a)
     vio_gl.clear_g = g;
     vio_gl.clear_b = b;
     vio_gl.clear_a = a;
+
+    /* Eager inside a frame (D3D11 / Metal semantics): clears whatever
+     * framebuffer is bound right now — the swapchain / headless FBO or a bound
+     * render target. Before vio_begin the colour is latched for begin_frame.
+     * Previously the in-frame call was a no-op, which left render targets that
+     * were bound and "cleared" mid-frame with undefined depth. */
+    if (vio_gl.initialized && vio_gl.in_frame) {
+        glClearColor(r, g, b, a);
+        glDepthMask(GL_TRUE);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    }
 }
 
 /* ── Compute primitive: pipeline / bind / uniforms / dispatch / readback ──
@@ -702,6 +715,18 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, rt->depth_texture, 0);
 
         GLenum cube_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (cube_status == GL_FRAMEBUFFER_COMPLETE) {
+            /* Defined initial contents: every face cleared, depth at 1.0. */
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glDepthMask(GL_TRUE);
+            for (int f = 0; f < 6; f++) {
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, rt->color_texture, 0);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            }
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_CUBE_MAP_POSITIVE_X, rt->color_texture, 0);
+        }
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -745,6 +770,13 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
     }
 
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status == GL_FRAMEBUFFER_COMPLETE) {
+        /* Defined initial contents (depth 1.0, colour 0) so a target that is
+         * bound and drawn into without an explicit clear still depth-tests. */
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glDepthMask(GL_TRUE);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
 
@@ -803,6 +835,57 @@ static int opengl_render_target_cubemap(void *rt_ptr, void *cm_obj)
     cm->borrowed     = 1;
     cm->resolution   = rt->width;
     cm->backend_type = 1;
+    return 0;
+}
+
+static int opengl_read_render_target(void *rt_ptr, int face, void *out_rgba)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!rt || rt->backend_type != VIO_RT_BACKEND_OPENGL || !vio_gl.initialized || !rt->fbo) return -1;
+    int w = rt->width, h = rt->height;
+    unsigned char *out = (unsigned char *)out_rgba;
+
+    GLint prev_fbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+    if (rt->is_cube) {
+        int f = face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, rt->color_texture, 0);
+    }
+
+    if (rt->depth_only) {
+        float *depth = (float *)emalloc((size_t)w * h * sizeof(float));
+        glReadPixels(0, 0, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, depth);
+        for (int y = 0; y < h; y++) {
+            const float *row = depth + (size_t)(h - 1 - y) * w;   /* flip to top-down */
+            unsigned char *dst = out + (size_t)y * w * 4;
+            for (int x = 0; x < w; x++) {
+                float d = row[x]; if (d < 0.0f) d = 0.0f; if (d > 1.0f) d = 1.0f;
+                unsigned char g = (unsigned char)(d * 255.0f + 0.5f);
+                dst[x*4+0] = dst[x*4+1] = dst[x*4+2] = g; dst[x*4+3] = 255;
+            }
+        }
+        efree(depth);
+    } else {
+        /* GL clamps + quantises RGBA16F to UNSIGNED_BYTE for us. */
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out);
+        int stride = w * 4;
+        unsigned char *tmp = (unsigned char *)emalloc(stride);
+        for (int y = 0; y < h / 2; y++) {
+            unsigned char *top = out + y * stride, *bot = out + (h - 1 - y) * stride;
+            memcpy(tmp, top, stride); memcpy(top, bot, stride); memcpy(bot, tmp, stride);
+        }
+        efree(tmp);
+    }
+
+    if (rt->is_cube) {
+        /* Restore the attachment the RT had bound before the read. */
+        int bf = rt->bound_face >= 0 ? rt->bound_face : 0;
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_CUBE_MAP_POSITIVE_X + bf, rt->color_texture, rt->bound_level);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
     return 0;
 }
 
@@ -1467,6 +1550,7 @@ static const vio_backend opengl_backend = {
     .unbind_render_target  = opengl_unbind_render_target,
     .bind_render_target_face = opengl_bind_render_target_face,
     .render_target_cubemap   = opengl_render_target_cubemap,
+    .read_render_target      = opengl_read_render_target,
     .generate_mipmaps        = opengl_generate_mipmaps,
     .read_pixels           = opengl_read_pixels,
     .setup_headless        = opengl_setup_headless,

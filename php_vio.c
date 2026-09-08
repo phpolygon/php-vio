@@ -8344,6 +8344,105 @@ ZEND_FUNCTION(vio_render_target_cubemap)
     RETURN_COPY_VALUE(&cm_zval);
 }
 
+/* CPU readback of a render target (colour, or depth as a grey ramp for
+ * depth-only targets) — top-down RGBA8, width*height*4 bytes. Works mid-frame.
+ * Backends route through the read_render_target slot; D3D11 reads its inline
+ * RT resources here. */
+#ifdef HAVE_D3D11
+static float vio_half_to_float(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16, exp = (h >> 10) & 0x1F, mant = h & 0x3FF, bits;
+    if (exp == 0) {
+        if (mant == 0) bits = sign;
+        else { exp = 127 - 15 + 1; while (!(mant & 0x400)) { mant <<= 1; exp--; } mant &= 0x3FF; bits = sign | (exp << 23) | (mant << 13); }
+    } else if (exp == 31) bits = sign | 0x7F800000 | (mant << 13);
+    else bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    float f; memcpy(&f, &bits, 4); return f;
+}
+static unsigned char vio_unit_to_byte(float v) { if (v < 0) v = 0; if (v > 1) v = 1; return (unsigned char)(v * 255.0f + 0.5f); }
+#endif
+
+ZEND_FUNCTION(vio_read_render_target)
+{
+    zval *rt_zval;
+    zend_long face = -1;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(face)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rt_zval);
+    if (!rt->valid || !rt->backend) {
+        php_error_docref(NULL, E_WARNING, "vio_read_render_target: render target is not valid");
+        RETURN_FALSE;
+    }
+    if (face >= 0 && (!rt->is_cube || face > 5)) {
+        php_error_docref(NULL, E_WARNING, "vio_read_render_target: face must be 0..5 on a cube render target");
+        RETURN_FALSE;
+    }
+
+    size_t size = (size_t)rt->width * rt->height * 4;
+    zend_string *buf = zend_string_alloc(size, 0);
+    ZSTR_VAL(buf)[size] = '\0';
+
+    if (rt->backend->read_render_target) {
+        if (rt->backend->read_render_target(rt, (int)face, ZSTR_VAL(buf)) == 0) {
+            RETURN_NEW_STR(buf);
+        }
+        zend_string_release(buf);
+        php_error_docref(NULL, E_WARNING, "vio_read_render_target: readback failed");
+        RETURN_FALSE;
+    }
+
+#ifdef HAVE_D3D11
+    if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
+        ID3D11Texture2D *src = rt->depth_only ? (ID3D11Texture2D *)rt->d3d11_depth_tex
+                                              : (ID3D11Texture2D *)rt->d3d11_color_tex;
+        if (!src) { zend_string_release(buf); RETURN_FALSE; }
+        D3D11_TEXTURE2D_DESC sd;
+        ID3D11Texture2D_GetDesc(src, &sd);
+        sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+        ID3D11Texture2D *staging = NULL;
+        if (FAILED(ID3D11Device_CreateTexture2D(vio_d3d11.device, &sd, NULL, &staging))) {
+            zend_string_release(buf); RETURN_FALSE;
+        }
+        ID3D11DeviceContext_CopyResource(vio_d3d11.context, (ID3D11Resource *)staging, (ID3D11Resource *)src);
+        D3D11_MAPPED_SUBRESOURCE m = {0};
+        if (FAILED(ID3D11DeviceContext_Map(vio_d3d11.context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m))) {
+            ID3D11Texture2D_Release(staging); zend_string_release(buf); RETURN_FALSE;
+        }
+        unsigned char *out = (unsigned char *)ZSTR_VAL(buf);
+        int w = rt->width, h = rt->height;
+        for (int y = 0; y < h; y++) {
+            const unsigned char *row = (const unsigned char *)m.pData + (size_t)y * m.RowPitch;
+            unsigned char *dst = out + (size_t)y * w * 4;
+            if (rt->depth_only) {
+                /* R24G8_TYPELESS: low 24 bits = depth */
+                for (int x = 0; x < w; x++) {
+                    uint32_t v = *(const uint32_t *)(row + x * 4) & 0x00FFFFFFu;
+                    unsigned char g = (unsigned char)((v * 255ULL) / 0x00FFFFFFu);
+                    dst[x*4+0] = dst[x*4+1] = dst[x*4+2] = g; dst[x*4+3] = 255;
+                }
+            } else if (sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                const uint16_t *hp = (const uint16_t *)row;
+                for (int x = 0; x < w * 4; x++) dst[x] = vio_unit_to_byte(vio_half_to_float(hp[x]));
+            } else {
+                memcpy(dst, row, (size_t)w * 4);
+            }
+        }
+        ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)staging, 0);
+        ID3D11Texture2D_Release(staging);
+        RETURN_NEW_STR(buf);
+    }
+#endif
+
+    zend_string_release(buf);
+    php_error_docref(NULL, E_WARNING, "vio_read_render_target: not supported on backend '%s'", rt->backend->name);
+    RETURN_FALSE;
+}
+
 ZEND_FUNCTION(vio_render_target_texture)
 {
     zval *rt_zval;

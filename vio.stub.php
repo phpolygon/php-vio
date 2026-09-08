@@ -934,6 +934,13 @@ function vio_render_target_texture(VioRenderTarget $target): VioTexture|false {}
 function vio_render_target_cubemap(VioRenderTarget $target): VioCubemap|false {}
 
 /**
+ * CPU readback of a render target as top-down RGBA8 (width*height*4 bytes).
+ * Depth-only targets return depth as a grey ramp; cube targets read one face.
+ * Works inside a frame.
+ */
+function vio_read_render_target(VioRenderTarget $target, int $face = -1): string|false {}
+
+/**
  * Build the full mip chain of a texture, cubemap or render-target colour
  * attachment created with 'mipmaps' => true. Gated on VIO_FEATURE_MIPMAP_GEN.
  */
