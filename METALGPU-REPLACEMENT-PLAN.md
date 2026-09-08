@@ -33,7 +33,13 @@ Fieldtracing, Color-Grading). Der Metal-Renderer ist der ältere, kleinere Pfad.
 
 ---
 
-## 1. Phase 1 — vio-API-Erweiterungen (alle Backends, Metal zuerst)
+## 1. Phase 1 — vio-API-Erweiterungen (alle Backends, Metal zuerst) — ✅ umgesetzt (2026-09-08, Tests 090–093)
+
+Abweichung vom Plan: die D3D11/D3D12-Render-Target-Pfade liegen inline in `php_vio.c` und
+konnten hier nicht kompiliert werden — Cube-RT (beide), `vio_read_render_target` (D3D12) und
+`vio_texture_update` (D3D12) sind dort Follow-ups mit `VIO_FEATURE_* = 0`. Pipeline-State
+(1.2) ist auf allen vier Backends drin. Zusätzlich: eager `vio_clear` auf OpenGL, definierte
+Initialinhalte neuer RTs (GL/Metal).
 
 Prinzip: jede Erweiterung wird für **Metal, OpenGL, D3D11, D3D12** gleichzeitig
 implementiert (Vulkan: Stub + `VIO_FEATURE_* = 0`), damit die Feature-Matrix nicht

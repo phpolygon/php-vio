@@ -12,9 +12,12 @@
 #include "php.h"
 #include "../include/vio_types.h"
 
+struct _vio_backend;
+
 typedef struct _vio_pipeline_object {
     unsigned int   shader_program;   /* GL program (copied, not owned) */
     void          *backend_pipeline; /* Backend-specific pipeline (D3D11/D3D12/Vulkan) */
+    const struct _vio_backend *backend; /* owner of backend_pipeline — destroy_pipeline on free */
     void          *backend_shader;   /* Backend shader ref (for pipeline creation) */
     void          *shader_ref;       /* vio_shader_object* (for uniform cbuffer) */
     zend_object   *shader_obj;       /* strong ref to the VioShader zend_object so

@@ -7,6 +7,7 @@
 #endif
 
 #include "vio_pipeline.h"
+#include "../include/vio_backend.h"
 
 zend_class_entry *vio_pipeline_ce = NULL;
 static zend_object_handlers vio_pipeline_handlers;
@@ -17,6 +18,10 @@ static zend_object *vio_pipeline_create_object(zend_class_entry *ce)
 
     pipe->shader_program = 0;
     pipe->shader_obj     = NULL;
+    pipe->backend_pipeline = NULL;
+    pipe->backend_shader   = NULL;
+    pipe->shader_ref       = NULL;
+    pipe->backend          = NULL;
     pipe->topology       = VIO_TRIANGLES;
     pipe->cull_mode      = VIO_CULL_NONE;
     pipe->depth_test     = 1;
@@ -42,6 +47,14 @@ static void vio_pipeline_free_object(zend_object *obj)
      * here; without this a pipeline whose only PHP-side owner is the pipeline
      * itself (the shader created inline and not stored separately) would read a
      * freed vio_shader_object on the next bind → access violation. */
+    /* Backend PSO / state objects: released through the owning backend's
+     * destroy_pipeline (Metal / D3D11 / D3D12 hold real GPU objects; OpenGL
+     * has none). Backends guard against destroying the currently bound one. */
+    if (pipe->backend_pipeline && pipe->backend && pipe->backend->destroy_pipeline) {
+        pipe->backend->destroy_pipeline(pipe->backend_pipeline);
+        pipe->backend_pipeline = NULL;
+    }
+
     if (pipe->shader_obj) {
         zend_object_release(pipe->shader_obj);
         pipe->shader_obj = NULL;

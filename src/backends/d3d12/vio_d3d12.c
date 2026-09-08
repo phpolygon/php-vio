@@ -1432,12 +1432,37 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     return pipeline;
 }
 
+/* PSOs freed while a frame is recording may still be referenced by that
+ * frame's command list. Park them in the slot of the frame being recorded and
+ * release them when d3d12_begin_frame has waited for that slot's fence (i.e.
+ * the GPU is provably done with the list that used them). */
+#define VIO_D3D12_PENDING_PSO_MAX 64
+static ID3D12PipelineState *d3d12_pending_pso[3][VIO_D3D12_PENDING_PSO_MAX];
+static int                  d3d12_pending_pso_count[3];
+
+static void d3d12_release_pending_psos(UINT slot)
+{
+    if (slot >= 3) return;
+    for (int i = 0; i < d3d12_pending_pso_count[slot]; i++) {
+        if (d3d12_pending_pso[slot][i]) ID3D12PipelineState_Release(d3d12_pending_pso[slot][i]);
+        d3d12_pending_pso[slot][i] = NULL;
+    }
+    d3d12_pending_pso_count[slot] = 0;
+}
+
 static void d3d12_destroy_pipeline(void *pipeline_ptr)
 {
     vio_d3d12_pipeline *p = (vio_d3d12_pipeline *)pipeline_ptr;
     if (!p) return;
     if (d3d12_current_pipeline == p) d3d12_current_pipeline = NULL;
-    if (p->pso) ID3D12PipelineState_Release(p->pso);
+    if (p->pso) {
+        UINT slot = vio_d3d12.frame_index < 3 ? vio_d3d12.frame_index : 0;
+        if (vio_d3d12.in_frame && d3d12_pending_pso_count[slot] < VIO_D3D12_PENDING_PSO_MAX) {
+            d3d12_pending_pso[slot][d3d12_pending_pso_count[slot]++] = p->pso;
+        } else {
+            ID3D12PipelineState_Release(p->pso);
+        }
+    }
     free(p);
 }
 
@@ -2125,6 +2150,9 @@ static void d3d12_begin_frame(void)
 
     /* Wait for this frame's previous work to complete */
     d3d12_wait_for_frame(vio_d3d12.frame_index);
+    /* This slot's previous command list has retired: PSOs parked while it was
+     * recording can go now (see d3d12_destroy_pipeline). */
+    d3d12_release_pending_psos(vio_d3d12.frame_index);
 
     vio_d3d12.in_frame = 1;
 

@@ -469,8 +469,15 @@ ZEND_FUNCTION(vio_begin)
     if (ctx->window && vio_gl.initialized) {
         int fb_w, fb_h;
         float sx = 1.0f, sy = 1.0f;
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        if (ctx->config.headless && ctx->headless_fbo) {
+            /* The headless FBO is config-sized (1:1); the hidden window's
+             * Retina framebuffer must not drive viewport / 2D projection. */
+            fb_w = ctx->config.width;
+            fb_h = ctx->config.height;
+        } else {
+            glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+            glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        }
         if (sx <= 0.0f) sx = 1.0f;
         if (sy <= 0.0f) sy = 1.0f;
         int logical_w = (int)((float)fb_w / sx + 0.5f);
@@ -1413,6 +1420,11 @@ ZEND_FUNCTION(vio_window_size)
          * of monitor DPI, while rendering happens at native physical resolution. */
         int fb_w = 0, fb_h = 0;
         float sx = 1.0f, sy = 1.0f;
+        if (ctx->config.headless) {
+            add_next_index_long(return_value, ctx->config.width);
+            add_next_index_long(return_value, ctx->config.height);
+            return;
+        }
         glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
         glfwGetWindowContentScale(ctx->window, &sx, &sy);
         if (sx <= 0.0f) sx = 1.0f;
@@ -1508,6 +1520,15 @@ ZEND_FUNCTION(vio_framebuffer_size)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
     array_init(return_value);
+    /* Headless contexts render into a target sized 1:1 with the requested
+     * (logical) size on every backend, whatever the hidden window's Retina
+     * framebuffer says — report THAT size, so callers' viewports and readback
+     * buffers match the pixels they get. */
+    if (ctx->config.headless) {
+        add_next_index_long(return_value, ctx->config.width > 0 ? ctx->config.width : 800);
+        add_next_index_long(return_value, ctx->config.height > 0 ? ctx->config.height : 600);
+        return;
+    }
 #ifdef HAVE_GLFW
     if (ctx->window) {
         int w = 0, h = 0;
@@ -1544,7 +1565,9 @@ ZEND_FUNCTION(vio_content_scale)
 
     array_init(return_value);
 #ifdef HAVE_GLFW
-    if (ctx->window) {
+    /* Headless: the offscreen target is 1:1 with the logical size (see
+     * vio_framebuffer_size), so the effective content scale is 1. */
+    if (ctx->window && !ctx->config.headless) {
         float sx = 1.0f, sy = 1.0f;
         glfwGetWindowContentScale(ctx->window, &sx, &sy);
         add_next_index_double(return_value, (double)sx);
@@ -1713,7 +1736,7 @@ ZEND_FUNCTION(vio_pixel_ratio)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
 #ifdef HAVE_GLFW
-    if (ctx->window) {
+    if (ctx->window && !ctx->config.headless) {   /* headless targets are 1:1, see vio_framebuffer_size */
         int fb_w = 0, win_w = 0, fb_h = 0, win_h = 0;
         glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
         glfwGetWindowSize(ctx->window, &win_w, &win_h);
@@ -1824,17 +1847,30 @@ ZEND_FUNCTION(vio_mesh)
                 floats_per_vertex += components;
             } ZEND_HASH_FOREACH_END();
         } else {
-            /* Old flat-style layout: [VIO_FLOAT3, VIO_FLOAT4, ...] */
+            /* Old flat-style layout: [VIO_FLOAT3, VIO_FLOAT4, ...] — attributes at
+             * sequential locations 0, 1, 2... It is an explicit layout too: the
+             * backend must receive EVERY attribute, not just position (OpenGL
+             * used to get a position-only layout here, so a [FLOAT3, FLOAT2]
+             * mesh sampled with constant UVs; Metal/D3D derive the layout from
+             * shader reflection and were unaffected). */
+            has_explicit_layout = 1;
             floats_per_vertex = 0;
             zval *elem;
             ZEND_HASH_FOREACH_VAL(layout_ht, elem) {
                 int fmt = (int)zval_get_long(elem);
+                int components;
                 switch (fmt) {
-                    case VIO_FLOAT1: floats_per_vertex += 1; break;
-                    case VIO_FLOAT2: floats_per_vertex += 2; break;
-                    case VIO_FLOAT3: floats_per_vertex += 3; break;
-                    case VIO_FLOAT4: floats_per_vertex += 4; break;
-                    default: floats_per_vertex += 3; break;
+                    case VIO_FLOAT1: components = 1; break;
+                    case VIO_FLOAT2: components = 2; break;
+                    case VIO_FLOAT3: components = 3; break;
+                    case VIO_FLOAT4: components = 4; break;
+                    default: components = 3; break;
+                }
+                floats_per_vertex += components;
+                if (parsed_layout_count < VIO_MAX_VERTEX_ATTRIBS) {
+                    parsed_layout[parsed_layout_count].location = parsed_layout_count;
+                    parsed_layout[parsed_layout_count].components = components;
+                    parsed_layout_count++;
                 }
             } ZEND_HASH_FOREACH_END();
 
@@ -2627,6 +2663,7 @@ ZEND_FUNCTION(vio_pipeline)
     /* Store backend shader reference for lazy pipeline creation */
     pipe->backend_shader = shader->backend_shader;
     pipe->shader_ref = shader;
+    pipe->backend = ctx->backend;
 
     /* Hold a strong reference to the VioShader zend_object so the pipeline keeps
      * its shader alive. vio_bind_pipeline assigns shader_ref to
@@ -8342,6 +8379,56 @@ ZEND_FUNCTION(vio_render_target_cubemap)
     }
     cm->valid = 1;
     RETURN_COPY_VALUE(&cm_zval);
+}
+
+/* Sub-region upload into an existing 2D texture (streaming / video / atlas
+ * updates without re-creating the texture). pixels is w*h*channels bytes,
+ * top-down, tightly packed; x/y/w/h default to the whole texture. */
+ZEND_FUNCTION(vio_texture_update)
+{
+    zval *ctx_zval, *tex_zval;
+    char *data; size_t data_len;
+    zend_long x = 0, y = 0, w = 0, h = 0;
+
+    ZEND_PARSE_PARAMETERS_START(3, 7)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+        Z_PARAM_STRING(data, data_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(x)
+        Z_PARAM_LONG(y)
+        Z_PARAM_LONG(w)
+        Z_PARAM_LONG(h)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (!ctx->initialized || !tex->valid) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_update: context or texture not valid");
+        RETURN_FALSE;
+    }
+    if (tex->borrowed || tex->is_3d) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_update: render-target and 3D textures cannot be updated");
+        RETURN_FALSE;
+    }
+    if (w <= 0) w = tex->width - x;
+    if (h <= 0) h = tex->height - y;
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > tex->width || y + h > tex->height) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_update: region %ld,%ld %ldx%ld exceeds texture %dx%d",
+                         (long)x, (long)y, (long)w, (long)h, tex->width, tex->height);
+        RETURN_FALSE;
+    }
+    int bpp = tex->channels == 1 ? 1 : 4;
+    if (data_len < (size_t)(w * h * bpp)) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_update: data is %zu bytes but the region needs %zu",
+                         data_len, (size_t)(w * h * bpp));
+        RETURN_FALSE;
+    }
+    if (!ctx->backend->update_texture) {
+        php_error_docref(NULL, E_NOTICE, "vio_texture_update: not supported on backend '%s'", ctx->backend->name);
+        RETURN_FALSE;
+    }
+    RETURN_BOOL(ctx->backend->update_texture(tex, data, (int)x, (int)y, (int)w, (int)h) == 0);
 }
 
 /* CPU readback of a render target (colour, or depth as a grey ramp for

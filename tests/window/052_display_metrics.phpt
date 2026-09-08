@@ -44,10 +44,24 @@ $expected_h = (int)round(100 * $cs[1]);
 var_dump(abs($fb[0] - $expected_w) <= 2);
 var_dump(abs($fb[1] - $expected_h) <= 2);
 
+// Headless contract: the offscreen target is 1:1 with the request on every
+// platform (no Retina 2x), so the metrics say so — viewports and readback
+// buffers computed from them match the pixels vio_read_pixels returns.
+var_dump($fb === [200, 100]);
+var_dump($cs === [1.0, 1.0]);
+var_dump($pr === 1.0);
+var_dump(vio_window_size($ctx) === [200, 100]);
+var_dump(strlen(vio_read_pixels($ctx)) === 200 * 100 * 4);
+
 vio_destroy($ctx);
 echo "OK\n";
 ?>
 --EXPECT--
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
 bool(true)
 bool(true)
 bool(true)

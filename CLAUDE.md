@@ -87,6 +87,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
 | `tests/core/` | Laden, Konstanten, Null-Backend, Context-Lifecycle, Plugins, Audit-Gate 070, Capability-Matrix 074, Perf/Memory-Gates |
 | `tests/backends/` | Backend-Registrierung + GPU-Kontexte (OpenGL/Vulkan/Metal/D3D11/D3D12), Cross-Backend-Parity 067, Metal-3D 089, D3D-Spezifika |
 | `tests/render3d/` | Mesh/Shader/Pipeline/Texturen/Buffer/RT/Cubemap/Compute/Vertex-Storage, headless GL |
@@ -140,6 +141,10 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Texture 3D | ✅ | ✅ | ✅ | ✅ | ✅ |
 | read_pixels | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Texture Swizzle | ✅ (3.3+) | ❌ (CPU-Expand) | ❌ (CPU-Expand) | ✅ | ✅ |
+| Cubemap-RT + `vio_generate_mipmaps` | ✅ | ❌ (Follow-up) | ❌ (Follow-up) | ❌ | ✅ |
+| `vio_read_render_target` | ✅ | ✅ | ❌ (Follow-up) | ❌ | ✅ |
+| `vio_texture_update` | ✅ | ✅ | ❌ (Follow-up) | ❌ | ✅ |
+| `depth_write` / `color_mask` / Blend-Modi | ✅ | ✅ | ✅ | — | ✅ |
 
 \* OpenGL/D3D melden `RENDER_TARGET_MSAA = 1`, ignorieren `samples` aber (alle RTs
 single-sampled); D3D meldet auch `TESSELLATION`/`GEOMETRY = 1` ohne Hull/Geometry-Stage.
@@ -408,8 +413,23 @@ $tex = vio_render_target_texture($rt);     // als Textur weiterverwenden
 // Alternativ: vio_create_render_target($ctx, $w, $h, $opts) / vio_set_render_target($ctx, $rt|null) / vio_destroy_render_target($rt)
 
 // Cubemaps
-$cm = vio_cubemap($ctx, ["faces" => [$px, $nx, $py, $ny, $pz, $nz]]);   // Pfade oder RGBA-Strings
+$cm = vio_cubemap($ctx, ["faces" => [$px, $nx, $py, $ny, $pz, $nz], "mipmaps" => true]);   // Pfade oder RGBA-Strings
 vio_bind_cubemap($ctx, $cm, 0);
+
+// Cubemap-Render-Target (Environment-Probe): 6 Faces rendern, Mips bauen, per textureLod sampeln
+$env = vio_render_target($ctx, ["cube" => true, "size" => 256, "mipmaps" => true]);
+for ($f = 0; $f < 6; $f++) { vio_bind_render_target($ctx, $env, $f); /* Sky-Pass */ }
+vio_unbind_render_target($ctx);
+vio_generate_mipmaps($ctx, $env);                 // auch für VioTexture / VioCubemap
+$envCube = vio_render_target_cubemap($env);       // samplerCube, textureLod(dir, roughness * mipMax)
+
+// Readback eines RTs (auch mid-frame): Farbe, HDR (auf 8 Bit), Depth-only (Grau-Rampe), Cube-Face
+$rgba = vio_read_render_target($rt);  $face = vio_read_render_target($env, 3);
+
+// Pipeline-State
+vio_pipeline($ctx, ["shader" => $s, "depth_test" => true, "depth_write" => false,   // Sky / Transparenz
+                    "blend" => VIO_BLEND_PREMULTIPLIED, "color_mask" => VIO_COLOR_RGB]);
+// blend: NONE, ALPHA, ADDITIVE, PREMULTIPLIED, MULTIPLY, SCREEN, MIN, MAX; color_mask: VIO_COLOR_R|G|B|A
 ```
 
 ### Compute & Storage Buffers
@@ -457,6 +477,7 @@ $tex = vio_texture($ctx, ["file" => "image.png"]);
 $tex = vio_texture($ctx, ["data" => $rgba, "width" => 64, "height" => 64]);
 $vol = vio_texture_3d($ctx, ["data" => $rgba, "width" => 32, "height" => 32, "depth" => 32]); // sampler3D (SDF-Volumen)
 vio_bind_texture($ctx, $tex, 0); vio_texture_size($tex);
+vio_texture_update($ctx, $tex, $rgbaRegion, $x, $y, $w, $h);   // Sub-Region-Upload (Streaming/Video), ohne Region = ganze Textur
 
 $buf = vio_uniform_buffer($ctx, ["size" => 64, "binding" => 0]);
 vio_update_buffer($buf, pack("f4", 1.0, 0.0, 0.0, 1.0));
@@ -635,7 +656,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 090), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 094), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -700,9 +721,15 @@ gegen die Homebrew-Formel mit identischer Modul-API und das `.so` dann in Herd e
 - Metal: max. 8 PSO-Varianten (Zielformat × Mesh-Stride × Samples) pro Pipeline und 8
   2D-Varianten; Texturen sind `MTLStorageModeShared` (Apple Silicon); kein Geometry-/
   Tessellation-Stage (Metal-Limitierung).
-- `vio_clear` ist backend-abhängig getimt (siehe `tests/backends/067`): OpenGL latcht die
-  Farbe für den nächsten Frame-Start, D3D11/D3D12/Metal clearen im Frame sofort. Portabel:
-  vor `vio_begin` setzen (und ggf. danach noch einmal).
+- `vio_clear`: vor `vio_begin` wird die Farbe gelatcht und beim Frame-Start angewendet; **im
+  Frame cleart jedes Backend sofort** das gebundene Ziel (Swapchain oder RT) — OpenGL seit
+  Phase 1 des Replacement-Plans wie D3D11/D3D12/Metal. Neue RTs starten mit Depth 1.0 /
+  Farbe 0 (GL, Metal), damit „bind + draw ohne clear" depth-testet.
+- **Headless-Größen** sind 1:1: `vio_framebuffer_size`/`vio_window_size` = Config-Größe,
+  `vio_content_scale`/`vio_pixel_ratio` = 1 — unabhängig vom Retina-Faktor des versteckten
+  GLFW-Fensters; Viewport/2D-Projektion in `vio_begin` folgen dem.
+- Pipelines geben ihre Backend-Objekte im Free-Handler frei (`destroy_pipeline`; D3D12 parkt
+  PSOs bis zum Fence des aufzeichnenden Frames).
 - Vulkan auf macOS braucht `VK_DRIVER_FILES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json` + `DYLD_LIBRARY_PATH=/usr/local/lib` (SIP blockiert letzteres in Subprozessen). Auto-Auswahl vermeidet Vulkan auf macOS zugunsten von Metal.
 - VideoToolbox-Encoder kann in headless fehlschlagen → Fallback auf libx264
 - `php_vio.c` ist monolithisch (~9000 Zeilen) — alle PHP-Funktionen in einer Datei

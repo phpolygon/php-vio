@@ -3018,6 +3018,22 @@ static int metal_read_render_target(void *rt_ptr, int face, void *out_rgba)
     return 0;
 }
 
+static int metal_update_texture(void *tex_obj, const void *pixels, int x, int y, int w, int h)
+{
+    vio_texture_object *t = (vio_texture_object *)tex_obj;
+    vio_metal_texture *mt = t ? (vio_metal_texture *)t->backend_texture : NULL;
+    if (!mt || !mt->tex || t->is_3d) return -1;
+    @autoreleasepool {
+        id<MTLTexture> tex = (__bridge id<MTLTexture>)mt->tex;
+        NSUInteger bpp = (tex.pixelFormat == MTLPixelFormatR8Unorm) ? 1 : 4;
+        /* Shared / Managed textures accept replaceRegion at any time; the GPU
+         * sees the new bytes at the next command-buffer commit. */
+        [tex replaceRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0
+                 withBytes:pixels bytesPerRow:(NSUInteger)w * bpp];
+    }
+    return 0;
+}
+
 /* Build the mip chain of an RT colour texture / texture / cubemap. Inside a
  * frame the open pass is closed first so the blit is ordered after the draws
  * that produced level 0, then reopened with Load. */
@@ -3688,6 +3704,7 @@ static const vio_backend metal_backend = {
     .bind_render_target_face = metal_bind_render_target_face,
     .render_target_cubemap   = metal_render_target_cubemap,
     .read_render_target      = metal_read_render_target,
+    .update_texture          = metal_update_texture,
     .generate_mipmaps        = metal_generate_mipmaps,
     /* Path B: vertex-stage SSBO bound at its pinned MSL index, drawn with
      * instance_count instances and no per-instance vertex buffer. */

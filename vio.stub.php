@@ -879,6 +879,12 @@ function vio_font_load_poll(mixed $handle): VioFont|null|false {}
  */
 function vio_texture_size(VioTexture $texture): array {}
 
+/**
+ * Upload a sub-region (default: whole texture) into an existing 2D texture.
+ * $data is width*height*channels bytes, top-down, tightly packed.
+ */
+function vio_texture_update(VioContext $context, VioTexture $texture, string $data, int $x = 0, int $y = 0, int $width = 0, int $height = 0): bool {}
+
 /* ── 3D: Render targets, cubemaps, instancing, viewport ──────────── */
 
 /**

@@ -889,6 +889,22 @@ static int opengl_read_render_target(void *rt_ptr, int face, void *out_rgba)
     return 0;
 }
 
+static int opengl_update_texture(void *tex_obj, const void *pixels, int x, int y, int w, int h)
+{
+    vio_texture_object *t = (vio_texture_object *)tex_obj;
+    if (!vio_gl.initialized || !t || !t->texture_id || t->is_3d) return -1;
+    glBindTexture(GL_TEXTURE_2D, t->texture_id);
+    /* upload_texture_2d stores data row 0 at GL row 0 (no flip), and the 2D /
+     * 3D paths sample it that way — so a sub-region upload is a plain
+     * glTexSubImage2D at the caller's (x, y). */
+    GLenum fmt = t->channels == 1 ? GL_RED : GL_RGBA;
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, fmt, GL_UNSIGNED_BYTE, pixels);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return 0;
+}
+
 static int opengl_generate_mipmaps(void *obj, int kind)
 {
     if (!obj || !vio_gl.initialized) return -1;
@@ -1551,6 +1567,7 @@ static const vio_backend opengl_backend = {
     .bind_render_target_face = opengl_bind_render_target_face,
     .render_target_cubemap   = opengl_render_target_cubemap,
     .read_render_target      = opengl_read_render_target,
+    .update_texture          = opengl_update_texture,
     .generate_mipmaps        = opengl_generate_mipmaps,
     .read_pixels           = opengl_read_pixels,
     .setup_headless        = opengl_setup_headless,

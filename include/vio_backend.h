@@ -82,6 +82,11 @@ typedef struct _vio_backend {
      * Returns 0 on success. NULL => vio_read_render_target unsupported. */
     int   (*read_render_target)(void *rt, int face, void *out_rgba);
 
+    /* Sub-region upload into an existing 2D texture (vio_texture_update).
+     * pixels is w*h*channels bytes (channels as the texture was created with),
+     * tightly packed, top-down. Returns 0 on success. NULL => unsupported. */
+    int   (*update_texture)(void *tex_obj, const void *pixels, int x, int y, int w, int h);
+
     /* Build the full mip chain of a texture-like object. kind: 0 =
      * vio_render_target_object (colour), 1 = vio_texture_object, 2 =
      * vio_cubemap_object. Safe mid-frame (backends close/reopen their pass).

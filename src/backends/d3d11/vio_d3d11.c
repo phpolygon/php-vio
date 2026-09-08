@@ -28,6 +28,7 @@
 
 #include "vio_d3d11.h"
 #include "../vio_d3d_common.h"
+#include "../../vio_texture.h"
 #include "../../vio_shader_reflect.h"
 #include <string.h>
 #include <stdlib.h>
@@ -800,6 +801,19 @@ static void *d3d11_create_texture(vio_texture_desc *desc)
 /* Create a 3D / volume texture (Fieldtracing SDF). Mirrors d3d11_create_texture
  * but with a Texture3D resource + a TEXTURE3D SRV; the bind path (d3d11_bind_texture)
  * is unchanged because it binds tex->srv / tex->sampler, which are dimension-agnostic. */
+/* vio_texture_update: sub-rectangle upload into a DEFAULT-usage 2D texture. */
+static int d3d11_update_texture(void *tex_obj, const void *pixels, int x, int y, int w, int h)
+{
+    vio_texture_object *t = (vio_texture_object *)tex_obj;
+    vio_d3d11_texture *dt = t ? (vio_d3d11_texture *)t->backend_texture : NULL;
+    if (!dt || !dt->texture || !vio_d3d11.context) return -1;
+    D3D11_BOX box = { (UINT)x, (UINT)y, 0, (UINT)(x + w), (UINT)(y + h), 1 };
+    UINT bpp = (t->channels == 1) ? 1 : 4;
+    ID3D11DeviceContext_UpdateSubresource(vio_d3d11.context, (ID3D11Resource *)dt->texture, 0, &box,
+                                          pixels, (UINT)w * bpp, 0);
+    return 0;
+}
+
 static void *d3d11_create_texture_3d(vio_texture_desc *desc)
 {
     if (desc->depth <= 0) return NULL;
@@ -2043,6 +2057,7 @@ static const vio_backend d3d11_backend = {
     .destroy_cubemap   = d3d11_destroy_cubemap,
     .destroy_font_atlas = d3d11_destroy_font_atlas,
     .destroy_render_target = d3d11_destroy_render_target,
+    .update_texture    = d3d11_update_texture,
 };
 
 void vio_backend_d3d11_register(void)
