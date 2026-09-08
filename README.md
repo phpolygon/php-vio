@@ -182,7 +182,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) \
   php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-38 tests included, covering headless rendering, 2D/3D pipelines, shaders, audio, input, and visual regression testing.
+93 PHPT tests, grouped by topic under `tests/` (`core/`, `backends/`, `render3d/`, `render2d/`, `input/`, `window/`, `media/`) — headless rendering with pixel verification, 2D/3D pipelines, shaders, compute, audio, input, and the per-backend capability matrix. `run-tests.php` recurses into the folders; pass a single folder to run one area.
 
 ## License
 
