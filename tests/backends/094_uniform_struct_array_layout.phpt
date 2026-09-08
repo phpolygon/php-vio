@@ -16,6 +16,10 @@ vio
 --SKIPIF--
 <?php
 require __DIR__ . '/../skipif_gl.inc';
+/* The Metal path needs the SPIRV-Cross fix from deps-patches/ (upstream PR
+ * KhronosGroup/SPIRV-Cross#2678). CI builds against the unpatched Homebrew
+ * formula and sets this to skip until the fix ships. */
+if (getenv('VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST')) die('skip SPIRV-Cross without the struct-array stride fix (VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST)');
 ?>
 --FILE--
 <?php

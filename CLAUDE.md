@@ -786,8 +786,9 @@ gegen die Homebrew-Formel mit identischer Modul-API und das `.so` dann in Herd e
 - SPIRV-Cross hat keine Homebrew-Formel; ohne `--with-spirv-cross` kann Metal kein
   GLSL→MSL übersetzen und jeder Shader scheitert (`Makefile.macos` baut es aus `.deps/`).
 - Ungepatchtes SPIRV-Cross (auch Homebrew/CI) hat den Struct-Array-Stride-Bug im
-  MSL-Backend (siehe Build → `deps-patches/`); Test 094 schlägt dort fehl. Fix ist
-  noch nicht upstream.
+  MSL-Backend (siehe Build → `deps-patches/`); Test 094 schlägt dort fehl. Upstream-PR:
+  KhronosGroup/SPIRV-Cross#2678. Bis zum Merge setzen die macOS-CI-Jobs
+  `VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST=1` (Test 094 skippt) — nach dem Merge Env + SKIPIF entfernen.
 - Text-Shaping braucht HarfBuzz (`--with-harfbuzz`); ohne es rendern Arabisch/
   Thai/Ligaturen nicht (`VIO_HAS_SHAPING == 0`, Legacy-Codepoint-Pfad). Der
   vcpkg-HarfBuzz (`harfbuzz[core,freetype]`) ist dynamisch — `harfbuzz.dll` +
