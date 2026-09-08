@@ -672,7 +672,7 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   (kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`).
 - `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
 - `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
-- **`METALGPU-REPLACEMENT-PLAN.md` — 📋 Entwurf.** php-metal-gpu (`ext-metal`) und
+- **`METALGPU-REPLACEMENT-PLAN.md` — 🚧 Phasen 1–3 umgesetzt.** php-metal-gpu (`ext-metal`) und
   PHPolygons Standalone-`MetalRenderer3D` durch vio-Metal ersetzen. Phase 1 erweitert die
   vio-API auf allen Backends (Cubemap-Render-Target + `vio_generate_mipmaps`, `depth_write`/
   `color_mask`/Blend-Modi, `vio_read_render_target`, konsistente Headless-Größen,

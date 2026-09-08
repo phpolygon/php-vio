@@ -1,6 +1,6 @@
 # METALGPU-REPLACEMENT-PLAN — php-metal-gpu durch vio-Metal ersetzen
 
-Status: 📋 Entwurf (2026-09-08). Ziel: PHPolygon braucht auf macOS **nur noch php-vio**;
+Status: 🚧 Phasen 1–3 umgesetzt (2026-09-08), Phase 4 (Repo stilllegen) offen. Ziel: PHPolygon braucht auf macOS **nur noch php-vio**;
 die Standalone-Extension `php-metal-gpu` (`ext-metal`, ~5.5k Zeilen C) und PHPolygons
 Standalone-Renderer `MetalRenderer3D` (+ `MetalCubemapTarget`, `MetalOffscreenTarget`,
 `MetalFxaaPass`, ~2.1k Zeilen PHP, eigene MSL-Shader) werden entfernt.
@@ -132,7 +132,16 @@ Windows → D3D12/WARP). `.github/workflows/build.yml` Windows-Liste um 090–09
 
 ---
 
-## 2. Phase 2 — PHPolygon: Environment-Cubemap auf vio portieren
+## 2. Phase 2 — PHPolygon: Environment-Cubemap auf vio portieren — ✅ umgesetzt
+
+`VioEnvironmentCubemap` (128², 8 Mips, Sky-Hash-Cache) + `VioRenderer3D::updateEnvironmentCubemap()`
+(6 Face-Pässe über die bestehenden Sky-Layer-Shader mit face-spezifischem inv-VP, LDR),
+als Fallback für `u_environment_map`, wenn kein `reflection_probe` registriert ist;
+`u_env_mip_max` + `textureLod` im Mesh-Shader. `renderToImage()` rendert direkt ins
+Caller-RT (Offscreen-Pipeline aus, RT nach Bind gecleart, RT nach Shadow/SSAO neu
+gebunden) und liest per `vio_read_render_target`. `VioRenderToImageTest` prüft jetzt
+Geometrie in der Bildmitte (grün auf Metal). Offen: Material-IBL per Roughness-LOD
+(der Metal-Renderer hatte es, `VioRenderer3D` nutzt die Cube heute nur fürs Wasser).
 
 - `VioRenderer3D::updateEnvironmentCubemap(SetSky)`: Port von
   `MetalRenderer3D::updateEnvironmentCubemap` auf die neue API (6 × `bind face` +
@@ -155,7 +164,11 @@ der eine Fehler ist genau `renderToImage`).
 
 ---
 
-## 3. Phase 3 — PHPolygon: ext-metal entfernen
+## 3. Phase 3 — PHPolygon: ext-metal entfernen — ✅ umgesetzt (uncommitted im PHPolygon-Arbeitsverzeichnis)
+
+Entfernt: 4 Klassen, 3 MSL-Shader + `mesh3d.metallib`, Stub, PHPStan-Eintrag, 2 Tests + Snapshot,
+5 Beispiele, CI-Step, composer-`suggest`; `Engine`/`EngineConfig` mappen `'metal'` auf vio.
+PHPolygon-Suite: 1649 Tests grün; PHPStan: nur der vorbestehende Befund `Engine.php:1610`.
 
 Löschen:
 - `src/Rendering/MetalRenderer3D.php`, `MetalCubemapTarget.php`, `MetalOffscreenTarget.php`,
