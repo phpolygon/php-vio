@@ -2740,6 +2740,16 @@ ZEND_FUNCTION(vio_bind_pipeline)
         pipe->backend_pipeline && ctx->backend->bind_pipeline) {
         ctx->backend->bind_pipeline(pipe->backend_pipeline);
     }
+
+#ifdef HAVE_METAL
+    /* Metal has no buffer renaming, so the backend re-uploads the shader's
+     * cbuffer shadow into a fresh ring slice on EVERY draw (like the D3D12
+     * per-draw cbuffer heap). Tell it which cbuffers belong to this pipeline. */
+    if (strcmp(ctx->backend->name, "metal") == 0 && pipe->shader_ref) {
+        vio_shader_object *msh = (vio_shader_object *)pipe->shader_ref;
+        vio_metal_set_shader_cbuffers(msh->cbuffer_backend, msh->frag_cbuffer_backend);
+    }
+#endif
 }
 
 ZEND_FUNCTION(vio_texture)
@@ -2855,9 +2865,10 @@ ZEND_FUNCTION(vio_texture)
     }
 
 #ifdef HAVE_METAL
-    if (strcmp(ctx->backend->name, "metal") == 0) {
-        tex->texture_id = vio_metal_create_texture_rgba(w, h, pixels,
-            tex->filter != VIO_FILTER_NEAREST, tex->wrap == VIO_WRAP_CLAMP);
+    /* Metal: create_texture already registered the MTLTexture in the 2D texture
+     * registry — mirror that id so vio_sprite can bind it by texture_id. */
+    if (strcmp(ctx->backend->name, "metal") == 0 && tex->backend_texture) {
+        tex->texture_id = vio_metal_texture_registry_id(tex->backend_texture);
     }
 #endif
 
@@ -2983,17 +2994,6 @@ ZEND_FUNCTION(vio_texture_3d)
             RETURN_FALSE;
         }
     }
-#ifdef HAVE_METAL
-    else if (ctx->backend->name && strcmp(ctx->backend->name, "metal") == 0) {
-        tex->texture_id = vio_metal_create_texture_3d_rgba(
-            w, h, d, pixels, tex->filter != VIO_FILTER_NEAREST, tex->wrap == VIO_WRAP_CLAMP);
-        if (tex->texture_id == 0) {
-            php_error_docref(NULL, E_WARNING, "vio_texture_3d: metal create failed");
-            zval_ptr_dtor(&tex_zval);
-            RETURN_FALSE;
-        }
-    }
-#endif
     else {
         zval_ptr_dtor(&tex_zval);
         RETURN_FALSE;
@@ -3261,6 +3261,13 @@ ZEND_FUNCTION(vio_bind_buffer)
                     vio_d3d12.cmd_list, 1, d3d_buf->gpu_address);
             }
         }
+    }
+#endif
+
+#ifdef HAVE_METAL
+    /* Metal: resolve the GLSL binding through the bound shader's MSL tables. */
+    if (strcmp(ctx->backend->name, "metal") == 0 && buf->backend_buffer) {
+        vio_metal_bind_uniform_buffer(buf->backend_buffer, bind_point);
     }
 #endif
 }
@@ -3603,6 +3610,20 @@ ZEND_FUNCTION(vio_draw_instanced_from_buffer)
     if (!vio_vertex_storage_supported(ctx) || !ctx->backend->draw_instanced_from_storage) {
         php_error_docref(NULL, E_NOTICE, "vio_draw_instanced_from_buffer: vertex storage not supported on this backend");
         return;
+    }
+
+    /* Push pending vio_set_uniform writes to the backend cbuffers, the same way
+     * vio_draw / vio_draw_instanced do before recording their draw. */
+    if (ctx->bound_shader_object) {
+        vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+        if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
+            ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size);
+            sh->cbuffer_dirty = 0;
+        }
+        if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
+            ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+            sh->frag_cbuffer_dirty = 0;
+        }
     }
 
     ctx->backend->draw_instanced_from_storage(mesh, (int)instance_count);
@@ -5322,6 +5343,72 @@ ZEND_FUNCTION(vio_inject_mouse_button)
 
 /* ── Headless / Screenshot functions ──────────────────────────────── */
 
+/* Fill out (w*h*4 bytes, top-down RGBA8) with the current frame on ANY backend —
+ * the shared source for vio_recorder_capture / vio_stream_push, which used to
+ * work on OpenGL only. Backends whose native readback has its own size (D3D11
+ * staging, D3D12 capture) are cropped/padded to (w, h); rows outside the source
+ * stay black. Returns 0 on success. */
+static int vio_capture_rgba(vio_context_object *ctx, int w, int h, unsigned char *out)
+{
+    size_t size = (size_t)w * h * 4;
+    if (!ctx || !ctx->backend || !out || w <= 0 || h <= 0) return -1;
+
+    if (strcmp(ctx->backend->name, "opengl") == 0) {
+        if (!ctx->backend->read_pixels) return -1;
+        return ctx->backend->read_pixels(ctx->headless_fbo, w, h, out);
+    }
+
+#ifdef HAVE_D3D11
+    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+        if (!vio_d3d11_resolve_readback() || !vio_d3d11.readback_staging) return -1;
+        D3D11_TEXTURE2D_DESC st_desc;
+        ID3D11Texture2D_GetDesc(vio_d3d11.readback_staging, &st_desc);
+        D3D11_MAPPED_SUBRESOURCE mapped = {0};
+        if (FAILED(ID3D11DeviceContext_Map(vio_d3d11.context, (ID3D11Resource *)vio_d3d11.readback_staging,
+                                           0, D3D11_MAP_READ, 0, &mapped))) return -1;
+        memset(out, 0, size);
+        int cw = (int)st_desc.Width < w ? (int)st_desc.Width : w;
+        int ch = (int)st_desc.Height < h ? (int)st_desc.Height : h;
+        for (int y = 0; y < ch; y++) {
+            memcpy(out + (size_t)y * w * 4, (unsigned char *)mapped.pData + (size_t)y * mapped.RowPitch, (size_t)cw * 4);
+        }
+        ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)vio_d3d11.readback_staging, 0);
+        return 0;
+    }
+#endif
+#ifdef HAVE_D3D12
+    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+        int cap_w = 0, cap_h = 0;
+        size_t cap_size = 0;
+        unsigned char *pixels = vio_d3d12_capture_frame(&cap_w, &cap_h, &cap_size);
+        if (!pixels) return -1;
+        memset(out, 0, size);
+        int cw = cap_w < w ? cap_w : w;
+        int ch = cap_h < h ? cap_h : h;
+        for (int y = 0; y < ch; y++) {
+            memcpy(out + (size_t)y * w * 4, pixels + (size_t)y * cap_w * 4, (size_t)cw * 4);
+        }
+        free(pixels);
+        return 0;
+    }
+#endif
+#ifdef HAVE_VULKAN
+    if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
+        return vulkan_read_pixels(w, h, out);
+    }
+#endif
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0) {
+        return vio_metal_read_pixels(w, h, out);
+    }
+#endif
+    /* Generic vtable slot (future backends). */
+    if (ctx->backend->read_pixels) {
+        return ctx->backend->read_pixels(ctx->headless_fbo, w, h, out);
+    }
+    return -1;
+}
+
 ZEND_FUNCTION(vio_read_pixels)
 {
     zval *ctx_zval;
@@ -5662,6 +5749,11 @@ ZEND_FUNCTION(vio_gpu_info)
         vram_bytes = vio_d3d12.vram_bytes;
     }
 #endif
+#ifdef HAVE_METAL
+    /* Metal: MTLDevice.name + recommendedMaxWorkingSetSize (unified memory has
+     * no dedicated VRAM). Set once setup_context has created the device. */
+    vio_metal_gpu_info(&gpu_name, &vram_bytes);
+#endif
 
     uint64_t ram_bytes = vio_query_total_ram_bytes();
 
@@ -5879,22 +5971,21 @@ ZEND_FUNCTION(vio_recorder_capture)
     int w = ctx->config.width;
     int h = ctx->config.height;
 
-    if (ctx->backend->read_pixels && strcmp(ctx->backend->name, "opengl") == 0) {
-        size_t size = (size_t)w * h * 4;
-        unsigned char *pixels = emalloc(size);
-        ctx->backend->read_pixels(ctx->headless_fbo, w, h, pixels);
-        int ret = vio_recorder_write_rgba(rec, pixels);
+    size_t size = (size_t)w * h * 4;
+    unsigned char *pixels = emalloc(size);
+    if (vio_capture_rgba(ctx, w, h, pixels) != 0) {
         efree(pixels);
-
-        if (ret < 0) {
-            php_error_docref(NULL, E_WARNING, "Failed to encode frame (error %d)", ret);
-            RETURN_FALSE;
-        }
-        RETURN_TRUE;
+        php_error_docref(NULL, E_WARNING, "Capture not supported for this backend");
+        RETURN_FALSE;
     }
+    int ret = vio_recorder_write_rgba(rec, pixels);
+    efree(pixels);
 
-    php_error_docref(NULL, E_WARNING, "Capture not supported for this backend");
-    RETURN_FALSE;
+    if (ret < 0) {
+        php_error_docref(NULL, E_WARNING, "Failed to encode frame (error %d)", ret);
+        RETURN_FALSE;
+    }
+    RETURN_TRUE;
 }
 
 ZEND_FUNCTION(vio_recorder_stop)
@@ -5993,22 +6084,21 @@ ZEND_FUNCTION(vio_stream_push)
     int w = ctx->config.width;
     int h = ctx->config.height;
 
-    if (ctx->backend->read_pixels && strcmp(ctx->backend->name, "opengl") == 0) {
-        size_t size = (size_t)w * h * 4;
-        unsigned char *pixels = emalloc(size);
-        ctx->backend->read_pixels(ctx->headless_fbo, w, h, pixels);
-        int ret = vio_stream_write_rgba(st, pixels);
+    size_t size = (size_t)w * h * 4;
+    unsigned char *pixels = emalloc(size);
+    if (vio_capture_rgba(ctx, w, h, pixels) != 0) {
         efree(pixels);
-
-        if (ret < 0) {
-            php_error_docref(NULL, E_WARNING, "Failed to encode/send frame (error %d)", ret);
-            RETURN_FALSE;
-        }
-        RETURN_TRUE;
+        php_error_docref(NULL, E_WARNING, "Stream push not supported for this backend");
+        RETURN_FALSE;
     }
+    int ret = vio_stream_write_rgba(st, pixels);
+    efree(pixels);
 
-    php_error_docref(NULL, E_WARNING, "Stream push not supported for this backend");
-    RETURN_FALSE;
+    if (ret < 0) {
+        php_error_docref(NULL, E_WARNING, "Failed to encode/send frame (error %d)", ret);
+        RETURN_FALSE;
+    }
+    RETURN_TRUE;
 }
 
 ZEND_FUNCTION(vio_stream_stop)
@@ -7272,6 +7362,24 @@ ZEND_FUNCTION(vio_draw_instanced)
             }
         } else
 #endif
+#ifdef HAVE_METAL
+        if (strcmp(ctx->backend->name, "metal") == 0) {
+            /* Flush dirty cbuffer shadows; the backend uploads them per draw. */
+            if (ctx->bound_shader_object) {
+                vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+                if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
+                    ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size);
+                    sh->cbuffer_dirty = 0;
+                }
+                if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
+                    ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                    sh->frag_cbuffer_dirty = 0;
+                }
+            }
+            /* Matrices go into this draw's own per-frame ring slice. */
+            vio_metal_draw_instanced(mesh, mat_data, (int)instance_count);
+        } else
+#endif
         {
             /* Fallback for other backends */
             if (mesh->index_count > 0 && mesh->backend_ib && ctx->backend->draw_indexed) {
@@ -7332,6 +7440,15 @@ ZEND_FUNCTION(vio_render_target)
     if ((val = zend_hash_str_find(config_ht, "hdr", sizeof("hdr") - 1)) != NULL) {
         hdr = zend_is_true(val);
     }
+    /* MSAA sample count. Backends that implement it (Metal) clamp to a
+     * supported power of two and write the effective count back into
+     * rt->samples; the others ignore it and render single-sampled. */
+    int samples = 1;
+    if ((val = zend_hash_str_find(config_ht, "samples", sizeof("samples") - 1)) != NULL) {
+        zend_long s = zval_get_long(val);
+        if (s > 8) s = 8;
+        samples = s < 1 ? 1 : (int)s;
+    }
 
     /* Create VioRenderTarget object */
     zval rt_zval;
@@ -7341,6 +7458,7 @@ ZEND_FUNCTION(vio_render_target)
     rt->width      = width;
     rt->height     = height;
     rt->depth_only = depth_only;
+    rt->samples    = samples;
     rt->backend    = ctx->backend;
 
     /* OpenGL + Metal go through the vtable; D3D11/D3D12 still inline below
@@ -8208,6 +8326,15 @@ ZEND_FUNCTION(vio_render_target_texture)
         if (cf_tex) {
             tex->texture_id = vio_metal_register_external_texture(cf_tex);
             tex->borrowed = 1;
+
+            /* 3D sampling path: cached wrapper owned by the RT, built once
+             * (same rationale as the D3D11 cache — a wrapper per call leaked). */
+            void **cache_slot = rt->depth_only ? &rt->metal_depth_backend_texture
+                                               : &rt->metal_color_backend_texture;
+            if (*cache_slot == NULL) {
+                *cache_slot = vio_metal_wrap_rt_texture(cf_tex, rt->depth_only);
+            }
+            tex->backend_texture = *cache_slot;
         }
     }
 #endif
@@ -8285,8 +8412,10 @@ ZEND_FUNCTION(vio_cubemap)
     vio_cubemap_object *cm = Z_VIO_CUBEMAP_P(&cm_zval);
     cm->backend = ctx->backend;
 
-    /* OpenGL goes through the vtable; D3D11/D3D12 stay inline below. */
-    if (ctx->backend->upload_cubemap && strcmp(ctx->backend->name, "opengl") == 0) {
+    /* OpenGL + Metal go through the vtable; D3D11/D3D12 stay inline below. */
+    int cm_is_metal = strcmp(ctx->backend->name, "metal") == 0;
+    if (ctx->backend->upload_cubemap &&
+        (strcmp(ctx->backend->name, "opengl") == 0 || cm_is_metal)) {
         /* Marshal source data: 6 RGBA8 buffers of (face_w, face_h). The
          * vtable assumes uniform face dimensions — file-based loads use
          * the first face's size, pixel-based reads w/h from config. */
@@ -8369,8 +8498,11 @@ ZEND_FUNCTION(vio_cubemap)
         }
 
         if (ok) {
-            ctx->backend->upload_cubemap(cm, face_w, face_h, faces);
-            cm->backend_type = 1;  /* VIO_CM_BACKEND_OPENGL — see vio_cubemap.h */
+            if (ctx->backend->upload_cubemap(cm, face_w, face_h, faces) != 0) {
+                ok = 0;
+            } else if (!cm_is_metal) {
+                cm->backend_type = 1;  /* VIO_CM_BACKEND_OPENGL — Metal sets 4 itself; see vio_cubemap.h */
+            }
         }
 
         for (int i = 0; i < 6; i++) {
@@ -8582,6 +8714,19 @@ ZEND_FUNCTION(vio_bind_cubemap)
         vio_d3d12.pending_srv_valid[hlsl_slot] = 1;
     }
 #endif
+
+#ifdef HAVE_METAL
+    if (strcmp(ctx->backend->name, "metal") == 0 && cm->metal_texture) {
+        int msl_slot = (int)slot;
+        if (ctx->bound_shader_object) {
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
+                msl_slot = sh->gl_to_hlsl_sampler[slot];
+            }
+        }
+        vio_metal_bind_cubemap(cm, msl_slot);
+    }
+#endif
 }
 
 ZEND_FUNCTION(vio_set_window_size)
@@ -8728,7 +8873,9 @@ ZEND_FUNCTION(vio_create_render_target)
                 add_assoc_bool(&config_arr, "depth_only", 1);
             }
         }
-        /* samples > 1 not yet wired through the vtable — silently dropped. */
+        if ((v = zend_hash_str_find(options, "samples", sizeof("samples") - 1)) != NULL) {
+            add_assoc_long(&config_arr, "samples", zval_get_long(v));
+        }
     }
 
     zval args[2];

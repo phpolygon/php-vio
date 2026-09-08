@@ -21,7 +21,9 @@ typedef struct _vio_cubemap_object {
     void        *d3d12_resource;  /* ID3D12Resource* (DepthOrArraySize=6) */
     uint64_t     d3d12_srv_gpu;   /* D3D12_GPU_DESCRIPTOR_HANDLE.ptr */
     uint64_t     d3d12_srv_cpu;   /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
-    int          backend_type;  /* 0=none, 1=opengl, 2=d3d11, 3=d3d12 */
+    void        *metal_texture; /* id<MTLTexture> (CFRetained), MTLTextureTypeCube */
+    void        *metal_sampler; /* id<MTLSamplerState> (CFRetained) */
+    int          backend_type;  /* 0=none, 1=opengl, 2=d3d11, 3=d3d12, 4=metal */
     int          resolution;
     int          valid;
     const struct _vio_backend *backend;  /* Backend that owns texture_id / d3d11_* / d3d12_* */

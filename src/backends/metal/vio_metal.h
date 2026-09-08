@@ -118,6 +118,59 @@ void vio_metal_delete_texture(unsigned int texture_id);
  */
 unsigned int vio_metal_register_external_texture(void *cf_retained_texture);
 
+/* ── Metal 3D pipeline glue (called from php_vio.c) ───────────────── */
+
+/*
+ * Registry id of a texture created through the backend's create_texture /
+ * create_texture_3d slot, so vio_texture can mirror it into tex->texture_id
+ * for the 2D sprite path. 0 when the texture is not registered (volumes).
+ */
+unsigned int vio_metal_texture_registry_id(void *backend_texture);
+
+/*
+ * Stage the bound shader's default-block cbuffers (vio_shader_object's
+ * cbuffer_backend / frag_cbuffer_backend). Every subsequent draw uploads their
+ * CPU shadow into a fresh per-frame ring slice — Metal has no buffer renaming,
+ * so this is the D3D12-style per-draw linear allocation. Called from
+ * vio_bind_pipeline; either pointer may be NULL.
+ */
+void vio_metal_set_shader_cbuffers(void *vs_cbuffer, void *fs_cbuffer);
+
+/*
+ * Bind a user uniform buffer (vio_uniform_buffer, backend_buffer handle) at the
+ * GLSL `binding` of the currently bound pipeline's shader, on every stage that
+ * declares it.
+ */
+void vio_metal_bind_uniform_buffer(void *backend_buffer, int binding);
+
+/*
+ * Instanced draw with CPU-supplied matrices: instance_count * 16 floats
+ * (column-major mat4) copied into this draw's own ring slice and bound as the
+ * per-instance attribute buffer (locations 3..6). Mesh is a vio_mesh_object *.
+ */
+void vio_metal_draw_instanced(void *mesh_obj, const float *matrices_4x4, int instance_count);
+
+/*
+ * Bind a vio_cubemap_object (uploaded via the upload_cubemap slot) to the
+ * fragment sampler slot — same slot semantics as bind_texture.
+ */
+void vio_metal_bind_cubemap(void *cubemap_obj, int slot);
+
+/*
+ * Wrap a render target's MTLTexture (the CFBridgeRetained metal_color_texture /
+ * metal_depth_texture slot) into a backend texture handle usable with
+ * bind_texture, so a 3D shader can sample the RT. The wrapper retains the
+ * texture itself; free it with the backend's destroy_texture (the RT does this
+ * for the wrappers it caches in metal_*_backend_texture).
+ */
+void *vio_metal_wrap_rt_texture(void *cf_retained_texture, int depth_only);
+
+/*
+ * GPU name + recommended working-set size (VRAM analogue) of the Metal device,
+ * for vio_gpu_info(). Leaves the outputs untouched before setup_context.
+ */
+void vio_metal_gpu_info(const char **name, uint64_t *vram_bytes);
+
 /* ── Metal pixel readback ────────────────────────────────────────── */
 
 /*

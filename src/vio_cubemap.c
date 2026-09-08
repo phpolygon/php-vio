@@ -23,6 +23,8 @@ static zend_object *vio_cubemap_create_object(zend_class_entry *ce)
     cm->d3d12_resource  = NULL;
     cm->d3d12_srv_gpu   = 0;
     cm->d3d12_srv_cpu   = 0;
+    cm->metal_texture = NULL;
+    cm->metal_sampler = NULL;
     cm->backend_type  = 0;
     cm->resolution    = 0;
     cm->valid         = 0;

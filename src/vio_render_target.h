@@ -48,6 +48,15 @@ typedef struct _vio_render_target_object {
      * via CFBridgingRetain / CFBridgingRelease. */
     void        *metal_color_texture;   /* id<MTLTexture> (CFRetained) */
     void        *metal_depth_texture;   /* id<MTLTexture> (CFRetained) */
+    /* Cached vio_metal_texture wrappers handed out by vio_render_target_texture()
+     * so a 3D shader can sample the RT (same cache-the-wrapper lifecycle as the
+     * D3D11 pair; freed in metal_destroy_render_target). */
+    void        *metal_color_backend_texture; /* vio_metal_texture* */
+    void        *metal_depth_backend_texture; /* vio_metal_texture* */
+    /* MSAA (samples > 1): the multisample attachments actually rendered into;
+     * metal_color_texture is then the single-sample RESOLVE texture. */
+    void        *metal_msaa_color_texture; /* id<MTLTexture> 2DMultisample (CFRetained) */
+    void        *metal_msaa_depth_texture; /* id<MTLTexture> 2DMultisample (CFRetained) */
 
     /* Vulkan (opaque — VkImage/VkImageView/VkRenderPass/VkFramebuffer/VkSampler
      * handles + VmaAllocation, stored as void* so the public header stays free
@@ -67,6 +76,8 @@ typedef struct _vio_render_target_object {
     int          width;
     int          height;
     int          depth_only;
+    int          samples;             /* requested by vio_render_target(); backends clamp to what
+                                         they support and write the effective count back (1 = off) */
     int          valid;
     int          backend_type;        /* 0=none, 1=opengl, 2=d3d11, 3=d3d12, 4=metal, 5=vulkan */
     int          d3d12_depth_is_srv;  /* 1 if depth resource is in SRV state (needs barrier to DEPTH_WRITE) */
