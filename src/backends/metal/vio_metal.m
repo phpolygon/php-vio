@@ -2307,6 +2307,7 @@ typedef struct _vio_metal_pipeline {
     MTLPrimitiveType primitive;
     MTLCullMode      cull;
     vio_blend_mode   blend;
+    int              color_mask;    /* VIO_COLOR_* bits */
     float            depth_bias;
     float            slope_scaled_depth_bias;
     vio_metal_pso_variant variants[VIO_METAL_PSO_VARIANTS];
@@ -2372,6 +2373,7 @@ static void *metal_create_pipeline(vio_pipeline_desc *desc)
             default:             p->cull = MTLCullModeNone;  break;
         }
         p->blend = desc->blend;
+        p->color_mask = desc->color_mask ? desc->color_mask : VIO_COLOR_RGBA;
         p->depth_bias = desc->depth_bias;
         p->slope_scaled_depth_bias = desc->slope_scaled_depth_bias;
 
@@ -2379,11 +2381,10 @@ static void *metal_create_pipeline(vio_pipeline_desc *desc)
         if (desc->depth_test) {
             ds.depthCompareFunction = (desc->depth_func == VIO_DEPTH_LEQUAL)
                 ? MTLCompareFunctionLessEqual : MTLCompareFunctionLess;
-            ds.depthWriteEnabled = YES;
         } else {
             ds.depthCompareFunction = MTLCompareFunctionAlways;
-            ds.depthWriteEnabled = NO;
         }
+        ds.depthWriteEnabled = (desc->depth_test && desc->depth_write) ? YES : NO;
         id<MTLDepthStencilState> dss = [vio_mtl.device newDepthStencilStateWithDescriptor:ds];
         p->depth_state = dss ? (void *)CFBridgingRetain(dss) : NULL;
 
@@ -2532,22 +2533,62 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, MTLP
         if (has_color) {
             MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[0];
             ca.pixelFormat = color_fmt;
-            if (p->blend == VIO_BLEND_ALPHA) {
+            MTLColorWriteMask wm = MTLColorWriteMaskNone;
+            if (p->color_mask & VIO_COLOR_R) wm |= MTLColorWriteMaskRed;
+            if (p->color_mask & VIO_COLOR_G) wm |= MTLColorWriteMaskGreen;
+            if (p->color_mask & VIO_COLOR_B) wm |= MTLColorWriteMaskBlue;
+            if (p->color_mask & VIO_COLOR_A) wm |= MTLColorWriteMaskAlpha;
+            ca.writeMask = wm;
+            if (p->blend != VIO_BLEND_NONE) {
                 ca.blendingEnabled = YES;
                 ca.rgbBlendOperation = MTLBlendOperationAdd;
                 ca.alphaBlendOperation = MTLBlendOperationAdd;
-                ca.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-                ca.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-                ca.sourceAlphaBlendFactor = MTLBlendFactorOne;
-                ca.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-            } else if (p->blend == VIO_BLEND_ADDITIVE) {
-                ca.blendingEnabled = YES;
-                ca.rgbBlendOperation = MTLBlendOperationAdd;
-                ca.alphaBlendOperation = MTLBlendOperationAdd;
-                ca.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-                ca.destinationRGBBlendFactor = MTLBlendFactorOne;
-                ca.sourceAlphaBlendFactor = MTLBlendFactorOne;
-                ca.destinationAlphaBlendFactor = MTLBlendFactorOne;
+            }
+            switch (p->blend) {
+                case VIO_BLEND_ALPHA:
+                    ca.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+                    ca.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                    ca.sourceAlphaBlendFactor = MTLBlendFactorOne;
+                    ca.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                    break;
+                case VIO_BLEND_ADDITIVE:
+                    ca.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+                    ca.destinationRGBBlendFactor = MTLBlendFactorOne;
+                    ca.sourceAlphaBlendFactor = MTLBlendFactorOne;
+                    ca.destinationAlphaBlendFactor = MTLBlendFactorOne;
+                    break;
+                case VIO_BLEND_PREMULTIPLIED:
+                    ca.sourceRGBBlendFactor = MTLBlendFactorOne;
+                    ca.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                    ca.sourceAlphaBlendFactor = MTLBlendFactorOne;
+                    ca.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                    break;
+                case VIO_BLEND_MULTIPLY:
+                    ca.sourceRGBBlendFactor = MTLBlendFactorDestinationColor;
+                    ca.destinationRGBBlendFactor = MTLBlendFactorZero;
+                    ca.sourceAlphaBlendFactor = MTLBlendFactorDestinationAlpha;
+                    ca.destinationAlphaBlendFactor = MTLBlendFactorZero;
+                    break;
+                case VIO_BLEND_SCREEN:
+                    ca.sourceRGBBlendFactor = MTLBlendFactorOne;
+                    ca.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceColor;
+                    ca.sourceAlphaBlendFactor = MTLBlendFactorOne;
+                    ca.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                    break;
+                case VIO_BLEND_MIN:
+                    ca.rgbBlendOperation = MTLBlendOperationMin;
+                    ca.alphaBlendOperation = MTLBlendOperationMin;
+                    ca.sourceRGBBlendFactor = ca.destinationRGBBlendFactor = MTLBlendFactorOne;
+                    ca.sourceAlphaBlendFactor = ca.destinationAlphaBlendFactor = MTLBlendFactorOne;
+                    break;
+                case VIO_BLEND_MAX:
+                    ca.rgbBlendOperation = MTLBlendOperationMax;
+                    ca.alphaBlendOperation = MTLBlendOperationMax;
+                    ca.sourceRGBBlendFactor = ca.destinationRGBBlendFactor = MTLBlendFactorOne;
+                    ca.sourceAlphaBlendFactor = ca.destinationAlphaBlendFactor = MTLBlendFactorOne;
+                    break;
+                default:
+                    break;
             }
         }
         d.depthAttachmentPixelFormat = has_depth ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;

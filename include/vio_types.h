@@ -55,10 +55,24 @@ typedef enum _vio_depth_func {
 /* ── Blend mode ───────────────────────────────────────────────────── */
 
 typedef enum _vio_blend_mode {
-    VIO_BLEND_NONE     = 0,
-    VIO_BLEND_ALPHA    = 1,
-    VIO_BLEND_ADDITIVE = 2,
+    VIO_BLEND_NONE          = 0,
+    VIO_BLEND_ALPHA         = 1,   /* src.a, 1-src.a */
+    VIO_BLEND_ADDITIVE      = 2,   /* src.a, 1 */
+    VIO_BLEND_PREMULTIPLIED = 3,   /* 1, 1-src.a (premultiplied alpha) */
+    VIO_BLEND_MULTIPLY      = 4,   /* dst.rgb * src.rgb */
+    VIO_BLEND_SCREEN        = 5,   /* 1, 1-src.rgb */
+    VIO_BLEND_MIN           = 6,   /* min(src, dst) */
+    VIO_BLEND_MAX           = 7,   /* max(src, dst) */
 } vio_blend_mode;
+
+/* ── Colour write mask (pipeline 'color_mask', bit flags) ─────────── */
+
+#define VIO_COLOR_R    1
+#define VIO_COLOR_G    2
+#define VIO_COLOR_B    4
+#define VIO_COLOR_A    8
+#define VIO_COLOR_RGB  7
+#define VIO_COLOR_RGBA 15
 
 /* ── Shader format ────────────────────────────────────────────────── */
 
@@ -245,6 +259,9 @@ typedef struct _vio_pipeline_desc {
     int              depth_test;
     vio_depth_func   depth_func;    /* VIO_DEPTH_LESS (default 0) or VIO_DEPTH_LEQUAL */
     vio_blend_mode   blend;
+    int              depth_write;            /* 1 (default) => depth test writes; 0 => test only
+                                                (sky, transparent geometry) */
+    int              color_mask;             /* VIO_COLOR_* bits, default VIO_COLOR_RGBA */
     float            depth_bias;             /* constant depth bias (shadow mapping) */
     float            slope_scaled_depth_bias; /* slope-scaled bias (shadow mapping) */
     int              hdr_output;             /* 1 => render-target output format is

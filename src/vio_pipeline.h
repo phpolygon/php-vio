@@ -26,6 +26,8 @@ typedef struct _vio_pipeline_object {
     int            depth_test;
     vio_depth_func depth_func;
     vio_blend_mode blend;
+    int            depth_write;      /* depth writes on (default 1) — independent of depth_test */
+    int            color_mask;       /* VIO_COLOR_* bits (default VIO_COLOR_RGBA) */
     float          depth_bias;
     float          slope_scaled_depth_bias;
     int            hdr_output;        /* 1 => PSO output (RTV) format is FP16

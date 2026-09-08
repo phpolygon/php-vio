@@ -2600,6 +2600,15 @@ ZEND_FUNCTION(vio_pipeline)
     if ((val = zend_hash_str_find(config_ht, "blend", sizeof("blend") - 1)) != NULL) {
         pipe->blend = (vio_blend_mode)zval_get_long(val);
     }
+    /* depth_write: keep testing against depth but don't write it (sky domes,
+     * sorted transparency). color_mask: VIO_COLOR_* bits, e.g. VIO_COLOR_RGB
+     * leaves the destination alpha untouched. */
+    if ((val = zend_hash_str_find(config_ht, "depth_write", sizeof("depth_write") - 1)) != NULL) {
+        pipe->depth_write = zend_is_true(val);
+    }
+    if ((val = zend_hash_str_find(config_ht, "color_mask", sizeof("color_mask") - 1)) != NULL) {
+        pipe->color_mask = (int)(zval_get_long(val) & VIO_COLOR_RGBA);
+    }
     if ((val = zend_hash_str_find(config_ht, "depth_bias", sizeof("depth_bias") - 1)) != NULL) {
         pipe->depth_bias = (float)zval_get_double(val);
     }
@@ -2692,6 +2701,8 @@ ZEND_FUNCTION(vio_pipeline)
         desc.depth_test = pipe->depth_test;
         desc.depth_func = pipe->depth_func;
         desc.blend = pipe->blend;
+        desc.depth_write = pipe->depth_write;
+        desc.color_mask = pipe->color_mask;
         desc.depth_bias = pipe->depth_bias;
         desc.slope_scaled_depth_bias = pipe->slope_scaled_depth_bias;
         desc.hdr_output = pipe->hdr_output;
@@ -6318,6 +6329,17 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_BLEND_NONE", VIO_BLEND_NONE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_BLEND_ALPHA", VIO_BLEND_ALPHA, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_BLEND_ADDITIVE", VIO_BLEND_ADDITIVE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_BLEND_PREMULTIPLIED", VIO_BLEND_PREMULTIPLIED, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_BLEND_MULTIPLY", VIO_BLEND_MULTIPLY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_BLEND_SCREEN", VIO_BLEND_SCREEN, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_BLEND_MIN", VIO_BLEND_MIN, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_BLEND_MAX", VIO_BLEND_MAX, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_COLOR_R", VIO_COLOR_R, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_COLOR_G", VIO_COLOR_G, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_COLOR_B", VIO_COLOR_B, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_COLOR_A", VIO_COLOR_A, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_COLOR_RGB", VIO_COLOR_RGB, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_COLOR_RGBA", VIO_COLOR_RGBA, CONST_CS | CONST_PERSISTENT);
 
     /* Depth function */
     REGISTER_LONG_CONSTANT("VIO_DEPTH_LESS", VIO_DEPTH_LESS, CONST_CS | CONST_PERSISTENT);

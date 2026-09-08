@@ -20,6 +20,8 @@ static zend_object *vio_pipeline_create_object(zend_class_entry *ce)
     pipe->topology       = VIO_TRIANGLES;
     pipe->cull_mode      = VIO_CULL_NONE;
     pipe->depth_test     = 1;
+    pipe->depth_write    = 1;
+    pipe->color_mask     = VIO_COLOR_RGBA;
     pipe->blend          = VIO_BLEND_ALPHA;
     pipe->valid          = 0;
 

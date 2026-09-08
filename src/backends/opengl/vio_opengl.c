@@ -1238,6 +1238,11 @@ static void opengl_bind_pipeline_state(void *pipe_ptr)
     } else {
         glDisable(GL_DEPTH_TEST);
     }
+    glDepthMask(pipe->depth_write ? GL_TRUE : GL_FALSE);
+    glColorMask((pipe->color_mask & VIO_COLOR_R) ? GL_TRUE : GL_FALSE,
+                (pipe->color_mask & VIO_COLOR_G) ? GL_TRUE : GL_FALSE,
+                (pipe->color_mask & VIO_COLOR_B) ? GL_TRUE : GL_FALSE,
+                (pipe->color_mask & VIO_COLOR_A) ? GL_TRUE : GL_FALSE);
 
     if (pipe->depth_bias != 0.0f || pipe->slope_scaled_depth_bias != 0.0f) {
         glEnable(GL_POLYGON_OFFSET_FILL);
@@ -1246,17 +1251,40 @@ static void opengl_bind_pipeline_state(void *pipe_ptr)
         glDisable(GL_POLYGON_OFFSET_FILL);
     }
 
+    glBlendEquation(GL_FUNC_ADD);
     switch (pipe->blend) {
         case VIO_BLEND_NONE:
             glDisable(GL_BLEND);
             break;
         case VIO_BLEND_ALPHA:
             glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
             break;
         case VIO_BLEND_ADDITIVE:
             glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ONE, GL_ONE);
+            break;
+        case VIO_BLEND_PREMULTIPLIED:
+            glEnable(GL_BLEND);
+            glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            break;
+        case VIO_BLEND_MULTIPLY:
+            glEnable(GL_BLEND);
+            glBlendFuncSeparate(GL_DST_COLOR, GL_ZERO, GL_DST_ALPHA, GL_ZERO);
+            break;
+        case VIO_BLEND_SCREEN:
+            glEnable(GL_BLEND);
+            glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_COLOR, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            break;
+        case VIO_BLEND_MIN:
+            glEnable(GL_BLEND);
+            glBlendEquation(GL_MIN);
+            glBlendFunc(GL_ONE, GL_ONE);
+            break;
+        case VIO_BLEND_MAX:
+            glEnable(GL_BLEND);
+            glBlendEquation(GL_MAX);
+            glBlendFunc(GL_ONE, GL_ONE);
             break;
     }
 }

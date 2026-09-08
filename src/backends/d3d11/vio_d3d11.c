@@ -513,7 +513,8 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
     /* Depth-stencil state */
     D3D11_DEPTH_STENCIL_DESC ds_desc = {0};
     ds_desc.DepthEnable = desc->depth_test ? TRUE : FALSE;
-    ds_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    ds_desc.DepthWriteMask = (desc->depth_test && desc->depth_write) ? D3D11_DEPTH_WRITE_MASK_ALL
+                                                                       : D3D11_DEPTH_WRITE_MASK_ZERO;
     ds_desc.DepthFunc = (desc->depth_func == VIO_DEPTH_LEQUAL)
         ? D3D11_COMPARISON_LESS_EQUAL
         : D3D11_COMPARISON_LESS;
@@ -523,9 +524,40 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
 
     /* Blend state */
     D3D11_BLEND_DESC blend_desc = {0};
-    blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    {
+        int cm = desc->color_mask ? desc->color_mask : VIO_COLOR_RGBA;
+        UINT8 wm = 0;
+        if (cm & VIO_COLOR_R) wm |= D3D11_COLOR_WRITE_ENABLE_RED;
+        if (cm & VIO_COLOR_G) wm |= D3D11_COLOR_WRITE_ENABLE_GREEN;
+        if (cm & VIO_COLOR_B) wm |= D3D11_COLOR_WRITE_ENABLE_BLUE;
+        if (cm & VIO_COLOR_A) wm |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
+        blend_desc.RenderTarget[0].RenderTargetWriteMask = wm;
+    }
 
-    if (desc->blend == VIO_BLEND_ALPHA) {
+    if (desc->blend == VIO_BLEND_PREMULTIPLIED || desc->blend == VIO_BLEND_MULTIPLY ||
+        desc->blend == VIO_BLEND_SCREEN || desc->blend == VIO_BLEND_MIN || desc->blend == VIO_BLEND_MAX) {
+        D3D11_RENDER_TARGET_BLEND_DESC *b = &blend_desc.RenderTarget[0];
+        b->BlendEnable = TRUE;
+        b->BlendOp = b->BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        switch (desc->blend) {
+            case VIO_BLEND_PREMULTIPLIED:
+                b->SrcBlend = D3D11_BLEND_ONE;       b->DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+                b->SrcBlendAlpha = D3D11_BLEND_ONE;  b->DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; break;
+            case VIO_BLEND_MULTIPLY:
+                b->SrcBlend = D3D11_BLEND_DEST_COLOR; b->DestBlend = D3D11_BLEND_ZERO;
+                b->SrcBlendAlpha = D3D11_BLEND_DEST_ALPHA; b->DestBlendAlpha = D3D11_BLEND_ZERO; break;
+            case VIO_BLEND_SCREEN:
+                b->SrcBlend = D3D11_BLEND_ONE;       b->DestBlend = D3D11_BLEND_INV_SRC_COLOR;
+                b->SrcBlendAlpha = D3D11_BLEND_ONE;  b->DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; break;
+            case VIO_BLEND_MIN:
+                b->BlendOp = b->BlendOpAlpha = D3D11_BLEND_OP_MIN;
+                b->SrcBlend = b->DestBlend = b->SrcBlendAlpha = b->DestBlendAlpha = D3D11_BLEND_ONE; break;
+            case VIO_BLEND_MAX:
+                b->BlendOp = b->BlendOpAlpha = D3D11_BLEND_OP_MAX;
+                b->SrcBlend = b->DestBlend = b->SrcBlendAlpha = b->DestBlendAlpha = D3D11_BLEND_ONE; break;
+            default: break;
+        }
+    } else if (desc->blend == VIO_BLEND_ALPHA) {
         blend_desc.RenderTarget[0].BlendEnable = TRUE;
         blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
         blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
