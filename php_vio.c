@@ -6392,6 +6392,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_STORAGE", VIO_FEATURE_TEXTURE_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SEPARATE_SHADERS", VIO_FEATURE_SEPARATE_SHADERS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_3D", VIO_FEATURE_TEXTURE_3D, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_CUBE", VIO_FEATURE_RENDER_TARGET_CUBE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_MIPMAP_GEN", VIO_FEATURE_MIPMAP_GEN, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_STORAGE", VIO_FEATURE_VERTEX_STORAGE, CONST_CS | CONST_PERSISTENT);
 
     /* Actions */
@@ -7449,6 +7451,40 @@ ZEND_FUNCTION(vio_render_target)
         if (s > 8) s = 8;
         samples = s < 1 ? 1 : (int)s;
     }
+    /* Cubemap render target: 'cube' => true, square faces of 'size' (or width)
+     * pixels, optional full mip chain ('mipmaps' => true) for textureLod
+     * roughness sampling. Bind one face at a time via
+     * vio_bind_render_target($ctx, $rt, $face). */
+    int is_cube = 0, mip_levels = 1;
+    if ((val = zend_hash_str_find(config_ht, "cube", sizeof("cube") - 1)) != NULL) {
+        is_cube = zend_is_true(val);
+    }
+    if (is_cube) {
+        if ((val = zend_hash_str_find(config_ht, "size", sizeof("size") - 1)) != NULL) {
+            width = (int)zval_get_long(val);
+        }
+        height = width;
+        if (width < 1) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: cube 'size' must be >= 1");
+            RETURN_FALSE;
+        }
+        if (depth_only) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: cube targets cannot be depth_only");
+            RETURN_FALSE;
+        }
+        if ((val = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1)) != NULL && zend_is_true(val)) {
+            mip_levels = 1;
+            for (int d = width; d > 1; d >>= 1) mip_levels++;
+        }
+        if (!ctx->backend->supports_feature ||
+            !ctx->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_CUBE) ||
+            !ctx->backend->bind_render_target_face) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_render_target: cube render targets are not supported on backend '%s'",
+                ctx->backend->name);
+            RETURN_FALSE;
+        }
+    }
 
     /* Create VioRenderTarget object */
     zval rt_zval;
@@ -7459,6 +7495,8 @@ ZEND_FUNCTION(vio_render_target)
     rt->height     = height;
     rt->depth_only = depth_only;
     rt->samples    = samples;
+    rt->is_cube    = is_cube;
+    rt->mip_levels = mip_levels;
     rt->backend    = ctx->backend;
 
     /* OpenGL + Metal go through the vtable; D3D11/D3D12 still inline below
@@ -7914,10 +7952,15 @@ ZEND_FUNCTION(vio_bind_render_target)
 {
     zval *ctx_zval;
     zval *rt_zval;
+    zend_long face = -1;
+    zend_long level = 0;
 
-    ZEND_PARSE_PARAMETERS_START(2, 2)
+    ZEND_PARSE_PARAMETERS_START(2, 4)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(face)
+        Z_PARAM_LONG(level)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
@@ -7930,6 +7973,27 @@ ZEND_FUNCTION(vio_bind_render_target)
     vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rt_zval);
     if (!rt->valid) {
         php_error_docref(NULL, E_WARNING, "Render target is not valid");
+        return;
+    }
+
+    /* Cube RT face bind (vio_render_target(['cube' => true])). face 0..5 =
+     * +X,-X,+Y,-Y,+Z,-Z; level selects the mip level. Same persistent-bind
+     * semantics as a plain bind. */
+    if (face >= 0) {
+        if (!rt->is_cube) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: 'face' requires a cube render target");
+            return;
+        }
+        if (face > 5 || level < 0 || level >= rt->mip_levels) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: face must be 0..5 and level 0..%d",
+                             rt->mip_levels - 1);
+            return;
+        }
+        if (!ctx->backend->bind_render_target_face ||
+            ctx->backend->bind_render_target_face(rt, (int)face, (int)level) != 0) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: face bind failed on backend '%s'",
+                             ctx->backend->name);
+        }
         return;
     }
 
@@ -8176,6 +8240,88 @@ ZEND_FUNCTION(vio_unbind_render_target)
 #endif
 }
 
+/* Build the full mip chain of a VioTexture, VioCubemap or a render target's
+ * colour attachment. Gated on VIO_FEATURE_MIPMAP_GEN. Textures / cubemaps must
+ * have been created with 'mipmaps' => true (otherwise there is no mip storage
+ * and the call is a no-op returning true). Safe inside a frame. */
+ZEND_FUNCTION(vio_generate_mipmaps)
+{
+    zval *ctx_zval;
+    zval *obj_zval;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(obj_zval)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        RETURN_FALSE;
+    }
+    if (!ctx->backend->generate_mipmaps || !ctx->backend->supports_feature ||
+        !ctx->backend->supports_feature(VIO_FEATURE_MIPMAP_GEN)) {
+        php_error_docref(NULL, E_NOTICE, "vio_generate_mipmaps: not supported on backend '%s'", ctx->backend->name);
+        RETURN_FALSE;
+    }
+
+    void *obj = NULL;
+    int kind = -1;
+    if (instanceof_function(Z_OBJCE_P(obj_zval), vio_render_target_ce)) {
+        vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(obj_zval);
+        if (!rt->valid || rt->depth_only) RETURN_FALSE;
+        obj = rt; kind = 0;
+    } else if (instanceof_function(Z_OBJCE_P(obj_zval), vio_texture_ce)) {
+        vio_texture_object *t = Z_VIO_TEXTURE_P(obj_zval);
+        if (!t->valid) RETURN_FALSE;
+        obj = t; kind = 1;
+    } else if (instanceof_function(Z_OBJCE_P(obj_zval), vio_cubemap_ce)) {
+        vio_cubemap_object *cm = Z_VIO_CUBEMAP_P(obj_zval);
+        if (!cm->valid) RETURN_FALSE;
+        obj = cm; kind = 2;
+    } else {
+        zend_argument_type_error(2, "must be of type VioRenderTarget|VioTexture|VioCubemap, %s given",
+                                 ZSTR_VAL(Z_OBJCE_P(obj_zval)->name));
+        RETURN_THROWS();
+    }
+
+    RETURN_BOOL(ctx->backend->generate_mipmaps(obj, kind) == 0);
+}
+
+/* The cube render target's colour texture as a bindable VioCubemap (borrowed:
+ * the RT keeps ownership; the cubemap object holds at most its own reference
+ * on backends with refcounted textures). Cached on the RT object? No — the
+ * wrapper is cheap (no GPU allocation) and the caller typically keeps it. */
+ZEND_FUNCTION(vio_render_target_cubemap)
+{
+    zval *rt_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rt_zval);
+    if (!rt->valid || !rt->is_cube) {
+        php_error_docref(NULL, E_WARNING, "vio_render_target_cubemap: not a valid cube render target");
+        RETURN_FALSE;
+    }
+    if (!rt->backend || !rt->backend->render_target_cubemap) {
+        php_error_docref(NULL, E_WARNING, "vio_render_target_cubemap: not supported on this backend");
+        RETURN_FALSE;
+    }
+
+    zval cm_zval;
+    object_init_ex(&cm_zval, vio_cubemap_ce);
+    vio_cubemap_object *cm = Z_VIO_CUBEMAP_P(&cm_zval);
+    cm->backend = rt->backend;
+    if (rt->backend->render_target_cubemap(rt, cm) != 0) {
+        zval_ptr_dtor(&cm_zval);
+        RETURN_FALSE;
+    }
+    cm->valid = 1;
+    RETURN_COPY_VALUE(&cm_zval);
+}
+
 ZEND_FUNCTION(vio_render_target_texture)
 {
     zval *rt_zval;
@@ -8411,6 +8557,12 @@ ZEND_FUNCTION(vio_cubemap)
     object_init_ex(&cm_zval, vio_cubemap_ce);
     vio_cubemap_object *cm = Z_VIO_CUBEMAP_P(&cm_zval);
     cm->backend = ctx->backend;
+    {
+        /* 'mipmaps' => true builds the full chain at upload (trilinear sampler,
+         * textureLod usable). Honoured by the vtable path (OpenGL / Metal). */
+        zval *mm = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1);
+        cm->mipmaps = (mm && zend_is_true(mm)) ? 1 : 0;
+    }
 
     /* OpenGL + Metal go through the vtable; D3D11/D3D12 stay inline below. */
     int cm_is_metal = strcmp(ctx->backend->name, "metal") == 0;

@@ -64,6 +64,23 @@ typedef struct _vio_backend {
     void  (*bind_render_target)(void *rt);
     void  (*unbind_render_target)(unsigned int default_fbo, int width, int height);
 
+    /* Cubemap render targets (rt->is_cube, created through create_render_target
+     * with rt->is_cube / rt->mip_levels pre-set by the caller). Binds face
+     * 0..5 at mip `level` as the colour attachment; a level > 0 target renders
+     * without depth (the shared depth texture only matches level 0). Returns 0
+     * on success. NULL => VIO_FEATURE_RENDER_TARGET_CUBE is 0. */
+    int   (*bind_render_target_face)(void *rt, int face, int level);
+
+    /* Hand out the RT's cube colour texture as a vio_cubemap_object (borrowed:
+     * the RT keeps ownership; the backend may take its own reference). */
+    int   (*render_target_cubemap)(void *rt, void *cm_obj);
+
+    /* Build the full mip chain of a texture-like object. kind: 0 =
+     * vio_render_target_object (colour), 1 = vio_texture_object, 2 =
+     * vio_cubemap_object. Safe mid-frame (backends close/reopen their pass).
+     * Returns 0 on success. NULL => VIO_FEATURE_MIPMAP_GEN is 0. */
+    int   (*generate_mipmaps)(void *obj, int kind);
+
     /* CPU-side framebuffer readback. The output buffer is RGBA8 in
      * top-down row order (regardless of the backend's native orientation)
      * and must hold at least width*height*4 bytes. fbo is consulted only

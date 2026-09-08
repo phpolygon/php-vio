@@ -82,6 +82,9 @@ static id<MTLCommandBuffer> last_presented_cmd_buf = nil;
  * swapchain drawable. Mirrors vio_d3d11.current_rtv. NULL means "draw to
  * swapchain". */
 static vio_render_target_object *current_bound_rt = NULL;
+/* Cube RT: face / mip level bound as the colour attachment (-1 = not a face bind). */
+static int current_bound_face  = -1;
+static int current_bound_level = 0;
 
 /* ── Metal 2D pipeline state ─────────────────────────────────────── */
 
@@ -93,6 +96,7 @@ static vio_render_target_object *current_bound_rt = NULL;
 typedef struct _vio_metal_2d_variant {
     int                        pixel_format;  /* MTLPixelFormat */
     int                        samples;
+    int                        has_depth;     /* 0 on cube-RT mip levels > 0 (no depth attachment) */
     id<MTLRenderPipelineState> shapes;
     id<MTLRenderPipelineState> sprites;
 } vio_metal_2d_variant;
@@ -147,7 +151,7 @@ static unsigned int metal_register_texture(id<MTLTexture> tex)
 static void metal_resize(int width, int height);
 static void metal_open_encoder(int load_clear);
 static id<MTLTexture> metal_current_color_texture(void);
-static void metal_current_target_format(MTLPixelFormat *color_fmt, int *has_color, int *samples);
+static void metal_current_target_format(MTLPixelFormat *color_fmt, int *has_color, int *samples, int *has_depth);
 static void metal_destroy_texture(void *texture);
 static void metal_ring_begin_frame(void);
 static void metal_ring_end_frame(id<MTLCommandBuffer> cb);
@@ -452,11 +456,12 @@ void vio_metal_shutdown_context(void)
 /* Find or build the (shapes, sprites) PSO pair for a target format + sample
  * count. Returns NULL (after a warning) when Metal rejects the descriptor or
  * the small cache is full. */
-static vio_metal_2d_variant *metal_2d_variant(MTLPixelFormat fmt, int samples)
+static vio_metal_2d_variant *metal_2d_variant(MTLPixelFormat fmt, int samples, int has_depth)
 {
     if (samples < 1) samples = 1;
     for (int i = 0; i < mtl_2d.variant_count; i++) {
-        if (mtl_2d.variants[i].pixel_format == (int)fmt && mtl_2d.variants[i].samples == samples) {
+        if (mtl_2d.variants[i].pixel_format == (int)fmt && mtl_2d.variants[i].samples == samples &&
+            mtl_2d.variants[i].has_depth == has_depth) {
             return &mtl_2d.variants[i];
         }
     }
@@ -479,7 +484,7 @@ static vio_metal_2d_variant *metal_2d_variant(MTLPixelFormat fmt, int samples)
         pipeDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
         pipeDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
         pipeDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-        pipeDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        pipeDesc.depthAttachmentPixelFormat = has_depth ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
 
         id<MTLRenderPipelineState> shapes =
             [vio_mtl.device newRenderPipelineStateWithDescriptor:pipeDesc error:&error];
@@ -500,6 +505,7 @@ static vio_metal_2d_variant *metal_2d_variant(MTLPixelFormat fmt, int samples)
         vio_metal_2d_variant *v = &mtl_2d.variants[mtl_2d.variant_count++];
         v->pixel_format = (int)fmt;
         v->samples      = samples;
+        v->has_depth    = has_depth;
         v->shapes       = shapes;
         v->sprites      = sprites;
         return v;
@@ -559,7 +565,7 @@ int vio_metal_2d_init(int width, int height)
 
         /* Swapchain variant (BGRA8, single sample) is built eagerly so a
          * failure surfaces at init, not at the first flush. */
-        vio_metal_2d_variant *v0 = metal_2d_variant(MTLPixelFormatBGRA8Unorm, 1);
+        vio_metal_2d_variant *v0 = metal_2d_variant(MTLPixelFormatBGRA8Unorm, 1, 1);
         if (!v0) {
             return -1;
         }
@@ -639,10 +645,10 @@ void vio_metal_2d_flush(vio_2d_state *state)
 
         /* PSO pair matching the bound target (swapchain / HDR RT / MSAA RT). */
         MTLPixelFormat target_fmt;
-        int target_has_color, target_samples;
-        metal_current_target_format(&target_fmt, &target_has_color, &target_samples);
+        int target_has_color, target_samples, target_has_depth;
+        metal_current_target_format(&target_fmt, &target_has_color, &target_samples, &target_has_depth);
         if (!target_has_color) return;  /* depth-only RT: 2D has nothing to write */
-        vio_metal_2d_variant *variant = metal_2d_variant(target_fmt, target_samples);
+        vio_metal_2d_variant *variant = metal_2d_variant(target_fmt, target_samples, target_has_depth);
         if (!variant) return;
 
         /* Track current state to minimize redundant calls */
@@ -1011,11 +1017,20 @@ static void metal_open_encoder(int load_clear)
 
         color_target = metal_current_color_texture();
         id<MTLTexture> resolve_target = nil;
+        NSUInteger cube_slice = 0, cube_level = 0;
         if (current_bound_rt) {
             depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_depth_texture;
             target_w = current_bound_rt->width;
             target_h = current_bound_rt->height;
             depth_only = current_bound_rt->depth_only;
+            if (current_bound_rt->is_cube) {
+                cube_slice = (NSUInteger)(current_bound_face >= 0 ? current_bound_face : 0);
+                cube_level = (NSUInteger)current_bound_level;
+                target_w >>= cube_level; if (target_w < 1) target_w = 1;
+                target_h >>= cube_level; if (target_h < 1) target_h = 1;
+                /* The shared depth texture only matches level 0. */
+                if (cube_level > 0) depth_target = nil;
+            }
             if (current_bound_rt->samples > 1) {
                 /* MSAA: render into the multisample pair, resolve into the
                  * single-sample colour texture at every pass end. */
@@ -1035,6 +1050,8 @@ static void metal_open_encoder(int load_clear)
 
         if (!depth_only && color_target) {
             desc.colorAttachments[0].texture = color_target;
+            desc.colorAttachments[0].slice = cube_slice;
+            desc.colorAttachments[0].level = cube_level;
             desc.colorAttachments[0].loadAction = load_clear ? MTLLoadActionClear : MTLLoadActionLoad;
             if (resolve_target) {
                 desc.colorAttachments[0].resolveTexture = resolve_target;
@@ -1191,6 +1208,7 @@ extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
 #include "../../vio_mesh.h"
 #include "../../vio_shader.h"
 #include "../../vio_cubemap.h"
+#include "../../vio_texture.h"
 
 /* Vertex-buffer indices reserved for [[stage_in]] data. Every shader resource
  * (UBO / SSBO / push constant) is renumbered to MSL buffer index 0..N-1 at
@@ -1647,10 +1665,40 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
          * pair and resolve into the plain textures every pass end
          * (StoreAndMultisampleResolve), so metal_color_texture stays the one
          * thing wrappers / the 2D registry / readback see. */
-        int samples = depth_only ? 1 : metal_clamp_sample_count(rt->samples);
+        int samples = (depth_only || rt->is_cube) ? 1 : metal_clamp_sample_count(rt->samples);
         rt->samples = samples;
 
         MTLPixelFormat color_fmt = hdr ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+
+        if (rt->is_cube) {
+            /* Cubemap colour attachment: one MTLTextureTypeCube with the full
+             * mip chain when requested (generate_mipmaps fills it), plus ONE
+             * shared 2D depth texture at face size — faces are rendered one at
+             * a time (bind_render_target_face selects the slice). */
+            if (rt->mip_levels < 1) rt->mip_levels = 1;
+            MTLTextureDescriptor *cd = [MTLTextureDescriptor
+                textureCubeDescriptorWithPixelFormat:color_fmt size:(NSUInteger)width
+                                           mipmapped:(rt->mip_levels > 1 ? YES : NO)];
+            cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            cd.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> cube = [vio_mtl.device newTextureWithDescriptor:cd];
+            MTLTextureDescriptor *dd = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                width:width height:width mipmapped:NO];
+            dd.usage = MTLTextureUsageRenderTarget;
+            dd.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> cube_depth = [vio_mtl.device newTextureWithDescriptor:dd];
+            if (!cube || !cube_depth) {
+                php_error_docref(NULL, E_WARNING, "Metal: failed to create cube render target (%d, %d mips)",
+                                 width, rt->mip_levels);
+                return -1;
+            }
+            rt->mip_levels = (int)cube.mipmapLevelCount;
+            rt->metal_color_texture = (void *)CFBridgingRetain(cube);
+            rt->metal_depth_texture = (void *)CFBridgingRetain(cube_depth);
+            rt->backend_type = VIO_RT_BACKEND_METAL;
+            return 0;
+        }
 
         /* Depth texture — always created (parallel to OpenGL's "always create
          * depth attachment" pattern so shadow-map RTs work uniformly). */
@@ -1721,13 +1769,16 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
     }
 }
 
-static void metal_bind_render_target(void *rt_ptr)
+static void metal_bind_render_target_at(vio_render_target_object *rt, int face, int level)
 {
     @autoreleasepool {
-        vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
         if (rt->backend_type != VIO_RT_BACKEND_METAL || !vio_mtl.initialized) return;
 
-        current_bound_rt = rt;
+        current_bound_rt    = rt;
+        current_bound_face  = face;
+        current_bound_level = level;
+        rt->bound_face  = face;
+        rt->bound_level = level;
 
         /* If a frame is already in progress (caller bound mid-frame, e.g. 3D
          * pipeline doing HDR + bloom passes), close the encoder and reopen on
@@ -1745,6 +1796,21 @@ static void metal_bind_render_target(void *rt_ptr)
     }
 }
 
+static void metal_bind_render_target(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    /* A cube RT bound without an explicit face renders into +X, level 0. */
+    metal_bind_render_target_at(rt, rt->is_cube ? 0 : -1, 0);
+}
+
+static int metal_bind_render_target_face(void *rt_ptr, int face, int level)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!rt || !rt->is_cube || face < 0 || face > 5 || level < 0 || level >= rt->mip_levels) return -1;
+    metal_bind_render_target_at(rt, face, level);
+    return 0;
+}
+
 static void metal_unbind_render_target(unsigned int default_fbo, int width, int height)
 {
     (void)default_fbo; (void)width; (void)height;
@@ -1755,7 +1821,9 @@ static void metal_unbind_render_target(unsigned int default_fbo, int width, int 
          * stash keeps a dangling pointer to a release()'d RT object and the
          * next metal_begin_frame opens an encoder on freed Metal textures.
          * Symptom: every-few-frames flicker after a warmRender pass. */
-        current_bound_rt = NULL;
+        current_bound_rt    = NULL;
+        current_bound_face  = -1;
+        current_bound_level = 0;
 
         /* Encoder swap is only meaningful inside an active frame. Outside one
          * (the common case after warmRender, where vio_end already committed
@@ -2226,6 +2294,7 @@ typedef struct _vio_metal_pso_variant {
     int   color_fmt;   /* MTLPixelFormat; MTLPixelFormatInvalid for depth-only targets */
     int   stride;      /* mesh vertex stride baked into the vertex descriptor */
     int   samples;     /* raster sample count of the target (1 or the RT's MSAA count) */
+    int   has_depth;   /* 0 when the target has no depth attachment (cube-RT mip > 0) */
     void *pso;         /* id<MTLRenderPipelineState>, +1 retained */
 } vio_metal_pso_variant;
 
@@ -2357,10 +2426,12 @@ void vio_metal_set_shader_cbuffers(void *vs_cbuffer, void *fs_cbuffer)
 
 /* Color format of whatever the open encoder renders into. has_color = 0 for a
  * depth-only RT (no color attachment => PSO without fragment output). */
-static void metal_current_target_format(MTLPixelFormat *color_fmt, int *has_color, int *samples)
+static void metal_current_target_format(MTLPixelFormat *color_fmt, int *has_color, int *samples, int *has_depth)
 {
     *samples = 1;
+    *has_depth = 1;
     if (current_bound_rt) {
+        if (current_bound_rt->is_cube && current_bound_level > 0) *has_depth = 0;
         if (current_bound_rt->samples > 1) *samples = current_bound_rt->samples;
         if (current_bound_rt->depth_only || !current_bound_rt->metal_color_texture) {
             *color_fmt = MTLPixelFormatInvalid;
@@ -2379,7 +2450,7 @@ static void metal_current_target_format(MTLPixelFormat *color_fmt, int *has_colo
 
 /* Find or build the PSO variant for (target color format, mesh stride). */
 static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, MTLPixelFormat color_fmt,
-                                                     int has_color, int stride, int samples)
+                                                     int has_color, int stride, int samples, int has_depth)
 {
     vio_metal_shader *sh = p->shader;
     if (stride <= 0 || stride < sh->vertex_stride) stride = sh->vertex_stride;
@@ -2387,7 +2458,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, MTLP
 
     for (int i = 0; i < p->variant_count; i++) {
         if (p->variants[i].color_fmt == (int)color_fmt && p->variants[i].stride == stride &&
-            p->variants[i].samples == samples) {
+            p->variants[i].samples == samples && p->variants[i].has_depth == has_depth) {
             return (__bridge id<MTLRenderPipelineState>)p->variants[i].pso;
         }
     }
@@ -2479,7 +2550,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, MTLP
                 ca.destinationAlphaBlendFactor = MTLBlendFactorOne;
             }
         }
-        d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        d.depthAttachmentPixelFormat = has_depth ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
 
         NSError *err = nil;
         id<MTLRenderPipelineState> pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:d error:&err];
@@ -2492,6 +2563,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, MTLP
         v->color_fmt = (int)color_fmt;
         v->stride    = stride;
         v->samples   = samples;
+        v->has_depth = has_depth;
         v->pso       = (void *)CFBridgingRetain(pso);
         return pso;
     }
@@ -2506,15 +2578,20 @@ static int metal_prepare_draw(int stride)
     if (!p || !p->shader || !vio_mtl.current_encoder) return 0;
 
     MTLPixelFormat fmt;
-    int has_color, samples;
-    metal_current_target_format(&fmt, &has_color, &samples);
+    int has_color, samples, has_depth;
+    metal_current_target_format(&fmt, &has_color, &samples, &has_depth);
 
-    id<MTLRenderPipelineState> pso = metal_pipeline_pso(p, fmt, has_color, stride, samples);
+    id<MTLRenderPipelineState> pso = metal_pipeline_pso(p, fmt, has_color, stride, samples, has_depth);
     if (!pso) return 0;
 
     id<MTLRenderCommandEncoder> enc = vio_mtl.current_encoder;
     [enc setRenderPipelineState:pso];
-    if (p->depth_state) [enc setDepthStencilState:(__bridge id<MTLDepthStencilState>)p->depth_state];
+    if (!has_depth) {
+        /* No depth attachment on this target: a depth-writing state is invalid. */
+        [enc setDepthStencilState:mtl_2d.depth_disabled];
+    } else if (p->depth_state) {
+        [enc setDepthStencilState:(__bridge id<MTLDepthStencilState>)p->depth_state];
+    }
     [enc setCullMode:p->cull];
     [enc setFrontFacingWinding:MTLWindingCounterClockwise];  /* match GL / D3D FrontCounterClockwise */
     [enc setDepthBias:p->depth_bias slopeScale:p->slope_scaled_depth_bias clamp:0.0f];
@@ -2705,7 +2782,8 @@ static int metal_upload_cubemap(void *cm_obj, int width, int height, const void 
     }
     @autoreleasepool {
         MTLTextureDescriptor *td = [MTLTextureDescriptor
-            textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm size:(NSUInteger)width mipmapped:NO];
+            textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm size:(NSUInteger)width
+                                       mipmapped:(cm->mipmaps ? YES : NO)];
         td.usage = MTLTextureUsageShaderRead;
         td.storageMode = metal_cpu_texture_storage();
         id<MTLTexture> tex = [vio_mtl.device newTextureWithDescriptor:td];
@@ -2719,10 +2797,90 @@ static int metal_upload_cubemap(void *cm_obj, int width, int height, const void 
                    bytesPerRow:(NSUInteger)width * 4
                  bytesPerImage:(NSUInteger)width * height * 4];
         }
-        id<MTLSamplerState> s = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, 0, 0);
+        if (cm->mipmaps && tex.mipmapLevelCount > 1) {
+            id<MTLCommandBuffer> cb = metal_new_command_buffer();
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit generateMipmapsForTexture:tex];
+            [blit endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+        id<MTLSamplerState> s = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, cm->mipmaps ? 1 : 0, 0);
         cm->metal_texture = (void *)CFBridgingRetain(tex);
         cm->metal_sampler = s ? (void *)CFBridgingRetain(s) : NULL;
         cm->backend_type  = 4;  /* VIO_CM_BACKEND_METAL — see vio_cubemap.h */
+    }
+    return 0;
+}
+
+/* vio_render_target_cubemap: wrap the cube RT's colour texture. The wrapper
+ * takes its own +1 so RT and cubemap can be released in either order. */
+static int metal_render_target_cubemap(void *rt_ptr, void *cm_obj)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
+    if (!rt || !cm || !rt->is_cube || !rt->metal_color_texture || !vio_mtl.device) return -1;
+    @autoreleasepool {
+        id<MTLSamplerState> s = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, rt->mip_levels > 1 ? 1 : 0, 0);
+        cm->metal_texture = (void *)CFRetain((CFTypeRef)rt->metal_color_texture);
+        cm->metal_sampler = s ? (void *)CFBridgingRetain(s) : NULL;
+        cm->mipmaps       = rt->mip_levels > 1;
+        cm->borrowed      = 1;
+        cm->resolution    = rt->width;
+        cm->backend_type  = 4;
+    }
+    return 0;
+}
+
+/* Build the mip chain of an RT colour texture / texture / cubemap. Inside a
+ * frame the open pass is closed first so the blit is ordered after the draws
+ * that produced level 0, then reopened with Load. */
+static int metal_generate_mipmaps(void *obj, int kind)
+{
+    if (!obj || !vio_mtl.device) return -1;
+    @autoreleasepool {
+        id<MTLTexture> tex = nil;
+        switch (kind) {
+            case 0: {
+                vio_render_target_object *rt = (vio_render_target_object *)obj;
+                if (rt->backend_type != VIO_RT_BACKEND_METAL || !rt->metal_color_texture) return -1;
+                tex = (__bridge id<MTLTexture>)rt->metal_color_texture;
+                break;
+            }
+            case 1: {
+                vio_texture_object *t = (vio_texture_object *)obj;
+                vio_metal_texture *mt = (vio_metal_texture *)t->backend_texture;
+                if (!mt || !mt->tex) return -1;
+                tex = (__bridge id<MTLTexture>)mt->tex;
+                break;
+            }
+            case 2: {
+                vio_cubemap_object *cm = (vio_cubemap_object *)obj;
+                if (!cm->metal_texture) return -1;
+                tex = (__bridge id<MTLTexture>)cm->metal_texture;
+                break;
+            }
+            default: return -1;
+        }
+        if (tex.mipmapLevelCount <= 1) return 0;  /* nothing to build */
+
+        if (vio_mtl.current_cmd_buf) {
+            if (vio_mtl.current_encoder) {
+                [vio_mtl.current_encoder endEncoding];
+                vio_mtl.current_encoder = nil;
+            }
+            id<MTLBlitCommandEncoder> blit = [vio_mtl.current_cmd_buf blitCommandEncoder];
+            [blit generateMipmapsForTexture:tex];
+            [blit endEncoding];
+            metal_open_encoder(/*load_clear=*/0);
+        } else {
+            id<MTLCommandBuffer> cb = metal_new_command_buffer();
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit generateMipmapsForTexture:tex];
+            [blit endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
     }
     return 0;
 }
@@ -3246,6 +3404,8 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_RENDER_TARGET_HDR:
     case VIO_FEATURE_RENDER_TARGET_DEPTH:
     case VIO_FEATURE_RENDER_TARGET_MSAA:
+    case VIO_FEATURE_RENDER_TARGET_CUBE:
+    case VIO_FEATURE_MIPMAP_GEN:
         /* MTLTexture-backed offscreen RTs via create/bind/unbind/destroy;
          * MSAA colour targets render into a 2DMultisample pair and resolve
          * at every pass end (`samples` on vio_render_target). */
@@ -3339,6 +3499,9 @@ static const vio_backend metal_backend = {
     .destroy_shader_obj = metal_destroy_shader_obj,
     .upload_cubemap    = metal_upload_cubemap,
     .destroy_cubemap   = metal_destroy_cubemap,
+    .bind_render_target_face = metal_bind_render_target_face,
+    .render_target_cubemap   = metal_render_target_cubemap,
+    .generate_mipmaps        = metal_generate_mipmaps,
     /* Path B: vertex-stage SSBO bound at its pinned MSL index, drawn with
      * instance_count instances and no per-instance vertex buffer. */
     .bind_storage_buffer         = metal_bind_storage_buffer,

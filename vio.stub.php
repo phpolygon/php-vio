@@ -911,7 +911,7 @@ function vio_render_target(VioContext $context, array $config): VioRenderTarget|
 /**
  * Bind a render target for subsequent draw calls (redirects rendering to FBO).
  */
-function vio_bind_render_target(VioContext $context, VioRenderTarget $target): void {}
+function vio_bind_render_target(VioContext $context, VioRenderTarget $target, int $face = -1, int $level = 0): void {}
 
 /**
  * Unbind the current render target, restoring the default framebuffer.
@@ -926,6 +926,18 @@ function vio_unbind_render_target(VioContext $context): void {}
  * @return VioTexture|false Texture object or false on failure
  */
 function vio_render_target_texture(VioRenderTarget $target): VioTexture|false {}
+
+/**
+ * Cube render target ('cube' => true) colour attachment as a bindable cubemap.
+ * Borrowed: the render target owns the texture.
+ */
+function vio_render_target_cubemap(VioRenderTarget $target): VioCubemap|false {}
+
+/**
+ * Build the full mip chain of a texture, cubemap or render-target colour
+ * attachment created with 'mipmaps' => true. Gated on VIO_FEATURE_MIPMAP_GEN.
+ */
+function vio_generate_mipmaps(VioContext $context, VioRenderTarget|VioTexture|VioCubemap $object): bool {}
 
 /**
  * Create a cubemap texture from 6 face images or raw pixel data.

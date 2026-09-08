@@ -76,6 +76,10 @@ typedef struct _vio_render_target_object {
     int          width;
     int          height;
     int          depth_only;
+    int          is_cube;             /* 1 => colour attachment is a cubemap (width == height == face size) */
+    int          mip_levels;          /* 1, or floor(log2(size)) + 1 when created with 'mipmaps' */
+    int          bound_face;          /* cube: face currently bound as colour attachment (-1 = none) */
+    int          bound_level;         /* cube: mip level currently bound */
     int          samples;             /* requested by vio_render_target(); backends clamp to what
                                          they support and write the effective count back (1 = off) */
     int          valid;

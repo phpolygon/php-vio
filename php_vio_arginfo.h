@@ -638,10 +638,21 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bind_render_target, 0, 2, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_OBJ_INFO(0, target, VioRenderTarget, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, face, IS_LONG, 0, "-1")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, level, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_unbind_render_target, 0, 1, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_render_target_cubemap, 0, 1, VioCubemap, MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, target, VioRenderTarget, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_generate_mipmaps, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, object, VioRenderTarget|VioTexture|VioCubemap, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_render_target_texture, 0, 1, VioTexture, MAY_BE_FALSE)
@@ -826,6 +837,8 @@ ZEND_FUNCTION(vio_render_target);
 ZEND_FUNCTION(vio_bind_render_target);
 ZEND_FUNCTION(vio_unbind_render_target);
 ZEND_FUNCTION(vio_render_target_texture);
+ZEND_FUNCTION(vio_render_target_cubemap);
+ZEND_FUNCTION(vio_generate_mipmaps);
 ZEND_FUNCTION(vio_cubemap);
 ZEND_FUNCTION(vio_bind_cubemap);
 ZEND_FUNCTION(vio_set_window_size);
@@ -963,6 +976,8 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_bind_render_target, arginfo_vio_bind_render_target)
 	ZEND_FE(vio_unbind_render_target, arginfo_vio_unbind_render_target)
 	ZEND_FE(vio_render_target_texture, arginfo_vio_render_target_texture)
+	ZEND_FE(vio_render_target_cubemap, arginfo_vio_render_target_cubemap)
+	ZEND_FE(vio_generate_mipmaps, arginfo_vio_generate_mipmaps)
 	ZEND_FE(vio_cubemap, arginfo_vio_cubemap)
 	ZEND_FE(vio_bind_cubemap, arginfo_vio_bind_cubemap)
 	ZEND_FE(vio_set_window_size, arginfo_vio_set_window_size)

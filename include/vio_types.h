@@ -169,6 +169,13 @@ typedef enum _vio_feature {
      * returns false there (graceful — the engine stays on the analytic trace
      * path). */
     VIO_FEATURE_TEXTURE_3D         = 22,
+    /* Cubemap render targets: vio_render_target(['cube' => true]) + per-face
+     * bind (vio_bind_render_target($ctx, $rt, $face)) + vio_render_target_cubemap.
+     * The environment-probe path (render the sky into 6 faces, sample with
+     * textureLod by roughness). 0 on backends without the face-attach path. */
+    VIO_FEATURE_RENDER_TARGET_CUBE = 23,
+    /* vio_generate_mipmaps() on textures / cubemaps / render targets. */
+    VIO_FEATURE_MIPMAP_GEN         = 24,
     /* A storage buffer (SSBO / StructuredBuffer SRV) can be bound to the
      * GRAPHICS pipeline and read from the VERTEX stage — the primitive that
      * lets a vertex shader pull per-instance data via gl_InstanceIndex from a

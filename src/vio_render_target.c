@@ -53,6 +53,10 @@ static zend_object *vio_render_target_create_object(zend_class_entry *ce)
     rt->height        = 0;
     rt->depth_only    = 0;
     rt->samples       = 1;
+    rt->is_cube       = 0;
+    rt->mip_levels    = 1;
+    rt->bound_face    = -1;
+    rt->bound_level   = 0;
     rt->valid         = 0;
     rt->backend_type  = VIO_RT_BACKEND_NONE;
     rt->backend       = NULL;
