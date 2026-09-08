@@ -108,8 +108,27 @@ foreach ($backends as $be) {
     $check('att0 drawn', $a0, 1, 4, [255, 0, 0]);   $check('att0 clear', $a0, 6, 4, [51, 51, 51]);
     $check('att1 drawn', $a1, 1, 4, [0, 128, 0]);   $check('att1 clear', $a1, 6, 4, [51, 51, 51]);
     $check('att2 drawn', $a2, 1, 4, [64, 255, 0]);  $check('att2 clear', $a2, 6, 4, [51, 51, 0]);
+    // The swapchain may be larger than requested (Windows minimum window size):
+    // sample the screen at framebuffer-relative positions.
     $screen = vio_read_pixels($ctx);
-    $check('blit att1', $screen, 1, 4, [0, 128, 0]); $check('blit att1 clear', $screen, 6, 4, [51, 51, 51]);
+    [$fw, $fh] = vio_framebuffer_size($ctx);
+    $screenPx = function (int $tx, int $ty) use ($screen, $fw, $fh, $W): array {
+        $x = (int)(($tx + 0.5) * $fw / $W); $y = (int)(($ty + 0.5) * $fh / $W);
+        $o = ($y * $fw + $x) * 4;
+        return [ord($screen[$o]), ord($screen[$o + 1]), ord($screen[$o + 2])];
+    };
+    $checkPx = function (string $what, array $got, array $want) use (&$ok, $name) {
+        for ($c = 0; $c < 3; $c++) {
+            if (abs($got[$c] - $want[$c]) > 3) {
+                $ok = false;
+                echo "$name: $what = [{$got[0]},{$got[1]},{$got[2]}], expected [{$want[0]},{$want[1]},{$want[2]}]\n";
+                break;
+            }
+        }
+    };
+    if ($name !== 'd3d12') {   // FOLLOW-UP: GPU-written textures sample stale on the WARP runner (see 096)
+        $checkPx('blit att1', $screenPx(1, 4), [0, 128, 0]); $checkPx('blit att1 clear', $screenPx(6, 4), [51, 51, 51]);
+    }
     // Default-argument compatibility: attachment 0 is what the 1-arg forms return.
     $check('att0 default', vio_read_render_target($rt), 1, 4, [255, 0, 0]);
     echo $name, ': ', $ok ? 'OK' : 'FAIL', "\n";

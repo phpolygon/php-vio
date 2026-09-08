@@ -1,0 +1,17 @@
+
+---- EXPECTED OUTPUT
+set_title OK
+cursor_mode OK
+fullscreen 2× OK
+borderless 2× OK
+windowed 2× OK
+transitions OK
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+OK
+---- ACTUAL OUTPUT
+set_title OK
+cursor_mode OK
+---- FAILED

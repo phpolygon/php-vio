@@ -87,7 +87,8 @@ foreach ($backends as $be) {
     vio_end($ctx);
 
     $px = vio_read_pixels($ctx);
-    $o = (8 * $W + 8) * 4;
+    [$fw, $fh] = vio_framebuffer_size($ctx);       /* swapchain may exceed 16x16 (Windows minimum size) */
+    $o = ((int)($fh / 2) * $fw + (int)($fw / 2)) * 4;
     if (ord($px[$o]) > 3 || ord($px[$o + 1]) < 250) { $ok = false; echo "$name: frame-1 sample = [", ord($px[$o]), ",", ord($px[$o+1]), "]\n"; }
     $data = vio_storage_buffer_read($ctx, $buf);      // implicit wait on the async dispatch
     $vals = array_values(unpack('f*', $data));

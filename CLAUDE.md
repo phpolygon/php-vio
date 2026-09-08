@@ -160,7 +160,10 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Async-Dispatch im Frame (`['async' => true]`, `vio_compute_wait`) | ✅ (Queue in-order) | ✅ (in-order) | ✅† (Frame-List) | sync | ✅ (Frame-Cmd-Buffer) |
 
 † D3D11/D3D12: implementiert, aber ohne Windows-Build hier nur blind editiert — Windows-CI
-(WARP) ist der Beleg (`tests/render3d/096`, `097`).
+(WARP) ist der Beleg (`tests/render3d/096`, `097`). **Offen auf D3D12/WARP:** eine von der GPU
+beschriebene Textur (Storage-Image nach Dispatch, RT-Attachment nach Unbind) sampelt im
+folgenden Pass veraltete Daten, hochgeladene Texturen nicht; die MRT-Readbacks selbst sind
+korrekt. Die betroffenen Pixel-Checks in 096/097 sind auf D3D12 deaktiviert (FOLLOW-UP).
 
 \* OpenGL/D3D melden `RENDER_TARGET_MSAA = 1`, ignorieren `samples` aber (alle RTs
 single-sampled); D3D meldet auch `TESSELLATION`/`GEOMETRY = 1` ohne Hull/Geometry-Stage.

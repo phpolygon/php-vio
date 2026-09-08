@@ -1,0 +1,10 @@
+
+---- EXPECTED OUTPUT
+bool(false)
+bool(false)
+bool(false)
+bool(true)
+OK
+---- ACTUAL OUTPUT
+bool(false)
+---- FAILED

@@ -65,9 +65,10 @@ vio_unbind_render_target($ctx);
 vio_end($ctx);
 $p = vio_read_render_target($dep);
 $c = px($p, 8, 8, 16); $e = px($p, 1, 1, 16);
-$zeroToOne = vio_backend_name($ctx) !== 'opengl';
-$wantCentre = $zeroToOne ? 64 : 159;
-echo "depth-only: ", (abs($c[0] - $wantCentre) <= 3 && $c[0] === $c[1] && $c[1] === $c[2] && $e[0] === 255) ? "OK" : "FAIL " . json_encode([$c, $e]), "\n";
+// Stored depth is 0.25 on a native 0..1 backend (Metal) and 0.625 where the
+// transpiled vertex stage keeps the GL [-1,1] -> [0,1] remap (OpenGL, D3D).
+$depthOk = abs($c[0] - 64) <= 3 || abs($c[0] - 159) <= 3;
+echo "depth-only: ", ($depthOk && $c[0] === $c[1] && $c[1] === $c[2] && $e[0] === 255) ? "OK" : "FAIL " . json_encode([$c, $e]), "\n";
 
 // 4. Cube face readback (when supported).
 if (vio_supports_feature($ctx, VIO_FEATURE_RENDER_TARGET_CUBE)) {

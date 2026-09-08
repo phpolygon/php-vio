@@ -7922,6 +7922,17 @@ ZEND_FUNCTION(vio_render_target)
             rt->d3d11_color_srv = rt->d3d11_color_srvs[0];
         }
 
+        /* Defined initial contents (colour 0, depth 1.0) like GL / Metal, so a
+         * target that is bound and drawn into without an explicit clear still
+         * depth-tests. */
+        {
+            float zero[4] = {0, 0, 0, 0};
+            for (int ai = 0; ai < attachment_count && !depth_only; ai++) {
+                if (rt->d3d11_rtvs[ai]) ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, (ID3D11RenderTargetView *)rt->d3d11_rtvs[ai], zero);
+            }
+            ID3D11DeviceContext_ClearDepthStencilView(vio_d3d11.context, dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+        }
+
         rt->backend_type = VIO_RT_BACKEND_D3D11;
     }
 #endif
@@ -8107,6 +8118,39 @@ ZEND_FUNCTION(vio_render_target)
                 rt->d3d12_color_srv_gpu = color_srv_gpu.ptr;
                 rt->d3d12_color_srv_cpu = color_staging_cpu.ptr;
             }
+        }
+
+        /* Defined initial contents (colour 0, depth 1.0) like GL / Metal: the
+         * resources sit in RENDER_TARGET / DEPTH_WRITE right after creation, so
+         * a transient list can clear them without barriers. */
+        {
+            ID3D12CommandAllocator *alloc = NULL;
+            ID3D12GraphicsCommandList *list = NULL;
+            hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                     &IID_ID3D12CommandAllocator, (void **)&alloc);
+            if (SUCCEEDED(hr)) {
+                hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                                    &IID_ID3D12GraphicsCommandList, (void **)&list);
+            }
+            if (SUCCEEDED(hr)) {
+                float zero[4] = {0, 0, 0, 0};
+                if (!depth_only && rt->d3d12_rtv_heap) {
+                    D3D12_CPU_DESCRIPTOR_HANDLE rtv0;
+                    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &rtv0);
+                    for (int ai = 0; ai < attachment_count; ai++) {
+                        D3D12_CPU_DESCRIPTOR_HANDLE h = { rtv0.ptr + (SIZE_T)ai * vio_d3d12.rtv_descriptor_size };
+                        ID3D12GraphicsCommandList_ClearRenderTargetView(list, h, zero, 0, NULL);
+                    }
+                }
+                ID3D12GraphicsCommandList_ClearDepthStencilView(list, dsv_handle,
+                    D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+                ID3D12GraphicsCommandList_Close(list);
+                ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+                ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+                vio_d3d12_wait_for_gpu();
+            }
+            if (list)  ID3D12GraphicsCommandList_Release(list);
+            if (alloc) ID3D12CommandAllocator_Release(alloc);
         }
 
         rt->backend_type = VIO_RT_BACKEND_D3D12;
