@@ -2205,6 +2205,15 @@ static void d3d12_begin_frame(void)
     vio_d3d12.current_rt_height = vio_d3d12.height;
     vio_d3d12.current_has_rtv = 1;
 
+    /* Apply a vio_clear() latched before vio_begin() (colour + depth). */
+    if (vio_d3d12.clear_pending) {
+        vio_d3d12.clear_pending = 0;
+        float color[4] = {vio_d3d12.clear_r, vio_d3d12.clear_g, vio_d3d12.clear_b, vio_d3d12.clear_a};
+        ID3D12GraphicsCommandList_ClearRenderTargetView(vio_d3d12.cmd_list, frame->rtv_handle, color, 0, NULL);
+        ID3D12GraphicsCommandList_ClearDepthStencilView(vio_d3d12.cmd_list, dsv_handle,
+            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+    }
+
     /* Grow cbuffer heap if last frame used >75% of its per-frame slice */
     UINT cb_slice = vio_d3d12.cbuffer_heap_capacity / vio_d3d12.frame_count;
     UINT cb_last_used = vio_d3d12.cbuffer_heap_offset - vio_d3d12.cbuffer_frame_base;
@@ -2688,6 +2697,15 @@ unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
 static void d3d12_clear(float r, float g, float b, float a)
 {
     float color[4] = {r, g, b, a};
+
+    if (!vio_d3d12.in_frame) {
+        /* Outside a frame the command list is closed: latch the colour and let
+         * begin_frame clear colour + depth — the portable "clear before begin"
+         * pattern (OpenGL / Metal / D3D11 behave the same way). */
+        vio_d3d12.clear_r = r; vio_d3d12.clear_g = g; vio_d3d12.clear_b = b; vio_d3d12.clear_a = a;
+        vio_d3d12.clear_pending = 1;
+        return;
+    }
 
     /* Clear whichever render target is currently bound (every MRT attachment) */
     if (vio_d3d12.current_has_rtv) {

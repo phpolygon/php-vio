@@ -364,6 +364,7 @@ typedef struct _vio_d3d12_state {
                          * those become no-ops for D3D12 instead of recording
                          * onto a closed command list. */
     float clear_r, clear_g, clear_b, clear_a;
+    int   clear_pending;   /* vio_clear() before vio_begin(): applied (colour + depth) by begin_frame */
     int   width, height;
     int   vsync;
 

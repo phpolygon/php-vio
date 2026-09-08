@@ -1190,6 +1190,17 @@ static void d3d11_begin_frame(void)
     vp.MinDepth = 0.0f;
     vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
+
+    vio_d3d11.in_frame = 1;
+
+    /* Apply a vio_clear() issued before vio_begin() (colour + depth). */
+    if (vio_d3d11.clear_pending) {
+        vio_d3d11.clear_pending = 0;
+        float color[4] = {vio_d3d11.clear_r, vio_d3d11.clear_g, vio_d3d11.clear_b, vio_d3d11.clear_a};
+        if (vio_d3d11.rtv) ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, vio_d3d11.rtv, color);
+        if (vio_d3d11.dsv) ID3D11DeviceContext_ClearDepthStencilView(vio_d3d11.context, vio_d3d11.dsv,
+                                                                       D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    }
 }
 
 /* Mirror the current backbuffer into the GPU-LOCAL readback_mirror texture.
@@ -1287,6 +1298,7 @@ int vio_d3d11_resolve_readback(void)
 
 static void d3d11_end_frame(void)
 {
+    vio_d3d11.in_frame = 0;
     /* Mirror the just-rendered backbuffer — before the caller's Present() /
      * swap rotates FLIP_DISCARD buffers. GPU-local; no CPU transfer. */
     d3d11_mirror_backbuffer();
@@ -1498,6 +1510,12 @@ static void d3d11_present(void)
 static void d3d11_clear(float r, float g, float b, float a)
 {
     float color[4] = {r, g, b, a};
+    if (!vio_d3d11.in_frame) {
+        /* Outside a frame: latch for begin_frame (see clear_pending). */
+        vio_d3d11.clear_r = r; vio_d3d11.clear_g = g; vio_d3d11.clear_b = b; vio_d3d11.clear_a = a;
+        vio_d3d11.clear_pending = 1;
+        return;
+    }
     if (vio_d3d11.current_rtv) {
         ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, vio_d3d11.current_rtv, color);
         /* MRT: attachments 1..n share the clear colour. */

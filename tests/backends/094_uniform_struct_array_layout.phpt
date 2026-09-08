@@ -15,7 +15,14 @@ exact on all of them.
 vio
 --SKIPIF--
 <?php
-require __DIR__ . '/../skipif_gl.inc';
+/* Any headless GPU context will do — the test probes the backends itself. */
+if (!extension_loaded('vio')) die('skip vio not loaded');
+$__ok = false;
+foreach (['auto', 'metal', 'opengl'] as $__b) {
+    $__c = @vio_create($__b, ['width' => 8, 'height' => 8, 'headless' => true]);
+    if ($__c) { vio_destroy($__c); $__ok = true; break; }
+}
+if (!$__ok) die('skip no headless GPU context available');
 /* The Metal path needs the SPIRV-Cross fix from deps-patches/ (upstream PR
  * KhronosGroup/SPIRV-Cross#2678). CI builds against the unpatched Homebrew
  * formula and sets this to skip until the fix ships. */

@@ -8,6 +8,8 @@ $c = @vio_create("auto", ["width" => 8, "height" => 8, "headless" => true, "vsyn
 if (!$c) die("skip no headless GPU context");
 if (!vio_supports_feature($c, VIO_FEATURE_3D_PIPELINE)) die("skip backend lacks 3D pipeline");
 if (!vio_supports_feature($c, VIO_FEATURE_RENDER_TARGET)) die("skip backend lacks render targets");
+$rt = vio_render_target($c, ['width' => 4, 'height' => 4]);
+if (!$rt || @vio_read_render_target($rt) === false) { vio_destroy($c); die("skip backend has no vio_read_render_target (D3D12 follow-up)"); }
 vio_destroy($c);
 ?>
 --FILE--

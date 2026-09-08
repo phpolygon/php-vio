@@ -16,7 +16,14 @@ unrelated pipeline is bound, then switch; (c) the reference order.
 vio
 --SKIPIF--
 <?php
-require __DIR__ . '/../skipif_gl.inc';
+/* Any headless GPU context will do — the test probes the backends itself. */
+if (!extension_loaded('vio')) die('skip vio not loaded');
+$__ok = false;
+foreach (['auto', 'metal', 'opengl'] as $__b) {
+    $__c = @vio_create($__b, ['width' => 8, 'height' => 8, 'headless' => true]);
+    if ($__c) { vio_destroy($__c); $__ok = true; break; }
+}
+if (!$__ok) die('skip no headless GPU context available');
 ?>
 --FILE--
 <?php

@@ -217,6 +217,12 @@ typedef struct _vio_d3d11_state {
     /* State */
     int   initialized;
     float clear_r, clear_g, clear_b, clear_a;
+    /* vio_clear() before vio_begin(): the colour is latched and applied by
+     * begin_frame (colour + depth), the portable "clear before begin" pattern
+     * every backend honours. Before the first frame current_rtv is NULL, so an
+     * immediate ClearRenderTargetView would have been dropped. */
+    int   clear_pending;
+    int   in_frame;   /* 1 between begin_frame and end_frame */
     int   width, height;
     int   vsync;
 

@@ -7,6 +7,8 @@ vio
 $c = @vio_create("auto", ["width" => 8, "height" => 8, "headless" => true, "vsync" => false]);
 if (!$c) die("skip no headless GPU context");
 if (!vio_supports_feature($c, VIO_FEATURE_3D_PIPELINE)) die("skip backend lacks 3D pipeline");
+$t = vio_texture($c, ['data' => "\xFF\xFF\xFF\xFF", 'width' => 1, 'height' => 1]);
+if (!$t || @vio_texture_update($c, $t, "\x00\x00\x00\xFF") === false) { vio_destroy($c); die("skip backend has no vio_texture_update (D3D12 follow-up)"); }
 vio_destroy($c);
 ?>
 --FILE--
