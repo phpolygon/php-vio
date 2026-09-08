@@ -3638,6 +3638,24 @@ static void metal_compute_set_uniforms(void *pipeline_ptr, const void *data, int
     }
 }
 
+/* Command buffer that carries async dispatches not yet known to be complete:
+ * the open frame buffer while recording, the committed one after present. */
+static id<MTLCommandBuffer> metal_async_cb = nil;
+
+static void metal_compute_wait(void)
+{
+    @autoreleasepool {
+        if (!metal_async_cb) return;
+        if (metal_async_cb == vio_mtl.current_cmd_buf) {
+            /* Still recording: commit + wait + reopen (same as mid-frame readback). */
+            metal_flush_for_readback();
+        } else {
+            [metal_async_cb waitUntilCompleted];
+        }
+        metal_async_cb = nil;
+    }
+}
+
 static void metal_dispatch_compute(vio_compute_cmd *cmd)
 {
     if (!cmd) return;
@@ -3654,7 +3672,21 @@ static void metal_dispatch_compute(vio_compute_cmd *cmd)
     @autoreleasepool {
         id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)cp->pso;
 
-        id<MTLCommandBuffer> cbuf = metal_new_command_buffer();
+        /* Async inside a frame: encode on the frame's own command buffer between
+         * the render encoders. Metal orders the encoders and tracks the resource
+         * hazards, so a later draw in this frame sees the kernel's writes without
+         * any CPU sync; completion is observed via compute_wait / read_buffer. */
+        int in_frame_async = cmd->async && vio_mtl.current_cmd_buf != nil;
+        id<MTLCommandBuffer> cbuf;
+        if (in_frame_async) {
+            if (vio_mtl.current_encoder) {
+                [vio_mtl.current_encoder endEncoding];
+                vio_mtl.current_encoder = nil;
+            }
+            cbuf = vio_mtl.current_cmd_buf;
+        } else {
+            cbuf = metal_new_command_buffer();
+        }
         id<MTLComputeCommandEncoder> enc = [cbuf computeCommandEncoder];
         [enc setComputePipelineState:pso];
 
@@ -3695,6 +3727,12 @@ static void metal_dispatch_compute(vio_compute_cmd *cmd)
         [enc dispatchThreadgroups:groups threadsPerThreadgroup:tpt];
 
         [enc endEncoding];
+        if (in_frame_async) {
+            metal_async_cb = cbuf;
+            /* Resume the render pass with Load so earlier draws survive. */
+            metal_open_encoder(/*load_clear=*/0);
+            return;
+        }
         [cbuf commit];
         /* Synchronous, like the other backends: by the time this returns the
          * dispatch is done and the Shared output buffer is coherent for the
@@ -3713,6 +3751,7 @@ static size_t metal_read_buffer(void *backend_buffer, void *out, size_t size)
 {
     vio_metal_compute_buffer *buf = (vio_metal_compute_buffer *)backend_buffer;
     if (!buf || !buf->buffer || !out || size == 0) return 0;
+    metal_compute_wait();   /* async dispatches must have landed before the memcpy */
 
     size_t n = size < buf->size ? size : buf->size;
     @autoreleasepool {
@@ -3888,6 +3927,7 @@ static const vio_backend metal_backend = {
     .compute_bind_buffer      = metal_compute_bind_buffer,
     .compute_set_uniforms     = metal_compute_set_uniforms,
     .compute_bind_image       = metal_compute_bind_image,
+    .compute_wait             = metal_compute_wait,
     .read_buffer              = metal_read_buffer,
 };
 

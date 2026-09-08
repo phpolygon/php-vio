@@ -551,9 +551,20 @@ function vio_compute_bind_image(VioContext $context, VioComputePipeline $pipelin
 function vio_compute_set_uniforms(VioContext $context, VioComputePipeline $pipeline, string $data): void {}
 
 /**
- * Dispatch the compute pipeline (group counts). Blocks until the GPU finishes.
+ * Dispatch the compute pipeline (threadgroup counts; the kernel's local_size is
+ * taken from the shader). Synchronous by default. With ['async' => true] inside
+ * vio_begin/vio_end the dispatch is recorded into the frame's command stream:
+ * later draws of the same frame see its writes, and vio_compute_wait() /
+ * vio_storage_buffer_read() block until it has executed.
+ *
+ * @param array|null $options ['async' => bool]
  */
-function vio_compute_dispatch(VioContext $context, VioComputePipeline $pipeline, int $gx, int $gy, int $gz): void {}
+function vio_compute_dispatch(VioContext $context, VioComputePipeline $pipeline, int $gx, int $gy, int $gz, ?array $options = null): void {}
+
+/**
+ * Block until every async dispatch of this context has executed (no-op otherwise).
+ */
+function vio_compute_wait(VioContext $context): void {}
 
 /**
  * Read back a storage buffer's bytes (GPU -> CPU). Blocks on a fence.

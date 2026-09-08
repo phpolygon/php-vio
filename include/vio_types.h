@@ -366,6 +366,10 @@ typedef struct _vio_compute_cmd {
     int   group_count_x;
     int   group_count_y;
     int   group_count_z;
+    int   async;   /* 1 => record into the open frame's command stream instead of
+                      a fenced standalone submission; completion is observed via
+                      compute_wait / read_buffer. Backends without an in-frame
+                      path (or outside vio_begin/vio_end) run synchronously. */
 } vio_compute_cmd;
 
 #endif /* VIO_TYPES_H */

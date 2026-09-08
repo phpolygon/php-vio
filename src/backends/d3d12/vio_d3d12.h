@@ -263,6 +263,12 @@ typedef struct _vio_d3d12_state {
     ID3D12RootSignature       *compute_root_signature;
     ID3D12DescriptorHeap      *compute_srv_heap;     /* shader-visible, compute-only */
     UINT                       compute_srv_descriptor_size;
+    /* The compute heap is a ring of VIO_D3D12_COMPUTE_HEAP_BLOCKS descriptor
+     * blocks (each MAX SRVs + MAX UAVs); every dispatch takes the next block so
+     * async dispatches recorded into one frame do not overwrite each other's
+     * descriptors before the GPU consumes them. */
+    UINT                       compute_heap_block;   /* next block index */
+    int                        compute_async_pending;/* async dispatches recorded, not yet waited */
 
     /* Currently bound render target (NULL = backbuffer). current_rtv is
      * attachment 0; MRT targets fill current_rtvs[1..count-1] as well so

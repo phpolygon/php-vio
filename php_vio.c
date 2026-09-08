@@ -3683,13 +3683,16 @@ ZEND_FUNCTION(vio_compute_dispatch)
     zval *ctx_zval;
     zval *pipe_zval;
     zend_long gx, gy, gz;
+    HashTable *opts_ht = NULL;
 
-    ZEND_PARSE_PARAMETERS_START(5, 5)
+    ZEND_PARSE_PARAMETERS_START(5, 6)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_compute_pipeline_ce)
         Z_PARAM_LONG(gx)
         Z_PARAM_LONG(gy)
         Z_PARAM_LONG(gz)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT_OR_NULL(opts_ht)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
@@ -3697,6 +3700,16 @@ ZEND_FUNCTION(vio_compute_dispatch)
         php_error_docref(NULL, E_NOTICE, "vio_compute_dispatch: compute not supported");
         return;
     }
+
+    /* ['async' => true]: record into the open frame instead of a fenced
+     * standalone submission. Outside vio_begin/vio_end (or on a backend without
+     * an in-frame path) the dispatch simply runs synchronously. */
+    int async = 0;
+    if (opts_ht) {
+        zval *av = zend_hash_str_find(opts_ht, "async", sizeof("async") - 1);
+        if (av) async = zend_is_true(av) ? 1 : 0;
+    }
+    if (async && !ctx->in_frame) async = 0;
 
     vio_compute_pipeline_object *p = Z_VIO_COMPUTE_PIPELINE_P(pipe_zval);
     if (!p->valid || !p->backend_pipeline) {
@@ -3709,7 +3722,24 @@ ZEND_FUNCTION(vio_compute_dispatch)
     cmd.group_count_x = (int)gx;
     cmd.group_count_y = (int)gy;
     cmd.group_count_z = (int)gz;
+    cmd.async = async;
     ctx->backend->dispatch_compute(&cmd);
+}
+
+ZEND_FUNCTION(vio_compute_wait)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend) return;
+    /* Backends without async dispatch have nothing pending: no-op. */
+    if (ctx->backend->compute_wait) {
+        ctx->backend->compute_wait();
+    }
 }
 
 ZEND_FUNCTION(vio_storage_buffer_read)

@@ -288,6 +288,10 @@ typedef struct _vio_backend {
      * is VIO_COMPUTE_READ or VIO_COMPUTE_WRITE. Optional. */
     void  (*compute_bind_image)(void *pipeline, void *tex_obj, int slot, int access);
 
+    /* Block until every dispatch recorded with cmd->async has executed (no-op
+     * when nothing is pending). read_buffer implies it. Optional. */
+    void  (*compute_wait)(void);
+
     /* GPU -> CPU readback of a storage buffer. Blocks on a fence, then writes up
      * to size bytes into out. Returns the number of bytes written, or 0 on
      * failure / unsupported. */

@@ -2790,12 +2790,14 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
  * dispatch: [0..VIO_D3D12_COMPUTE_MAX_BINDINGS) SRVs, then the same many UAVs.
  * Recreated lazily (small, fixed). Separate from the graphics srv_heap so the
  * complex per-frame partitioning there is untouched. */
+#define VIO_D3D12_COMPUTE_HEAP_BLOCKS 16
+
 static int d3d12_ensure_compute_srv_heap(void)
 {
     if (vio_d3d12.compute_srv_heap) return 0;
     if (d3d12_create_descriptor_heap(&vio_d3d12.compute_srv_heap,
                                      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                                     VIO_D3D12_COMPUTE_MAX_BINDINGS * 2,
+                                     VIO_D3D12_COMPUTE_MAX_BINDINGS * 2 * VIO_D3D12_COMPUTE_HEAP_BLOCKS,
                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
         return -1;
     }
@@ -3038,6 +3040,57 @@ static void d3d12_compute_bind_image(void *pipeline_ptr, void *tex_obj, int slot
     cp->image_count++;
 }
 
+/* Re-arm the graphics state a compute record on the frame list disturbed: the
+ * graphics descriptor heap + root signature, and the PSO/topology of the
+ * pipeline the caller has bound (d3d12_bind_pipeline_state caches it). */
+static void d3d12_restore_graphics_state_after_compute(void)
+{
+    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.srv_heap.heap };
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(vio_d3d12.cmd_list, 1, heaps);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(vio_d3d12.cmd_list, vio_d3d12.root_signature);
+    if (d3d12_current_pipeline && d3d12_current_pipeline->pso) {
+        ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list, d3d12_current_pipeline->pso);
+        ID3D12GraphicsCommandList_IASetPrimitiveTopology(vio_d3d12.cmd_list, d3d12_current_pipeline->topology);
+    }
+    vio_d3d12.srv_table_bound = 0;   /* root SRV table must be re-pointed on the next flush */
+}
+
+/* Wait for async dispatches recorded into the frame list. Mid-frame this
+ * closes + executes + waits on the live list and reopens it (the same pattern
+ * vio_d3d12_capture_frame uses for mid-frame readback); after the frame a plain
+ * GPU wait suffices. */
+static void d3d12_compute_wait(void)
+{
+    if (!vio_d3d12.compute_async_pending) return;
+    vio_d3d12.compute_async_pending = 0;
+    if (!vio_d3d12.in_frame || !vio_d3d12.cmd_list) {
+        vio_d3d12_wait_for_gpu();
+        return;
+    }
+    vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
+    ID3D12GraphicsCommandList_Close(vio_d3d12.cmd_list);
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)vio_d3d12.cmd_list };
+    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    vio_d3d12_wait_for_gpu();
+
+    ID3D12CommandAllocator_Reset(frame->cmd_allocator);
+    ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
+    /* Re-arm the bound target (swapchain or RT), viewport, scissor and the
+     * graphics pipeline state exactly as the frame had them. */
+    if (vio_d3d12.current_has_rtv) {
+        int n = vio_d3d12.current_rtv_count > 0 ? vio_d3d12.current_rtv_count : 1;
+        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, (UINT)n,
+            n > 1 ? vio_d3d12.current_rtvs : &vio_d3d12.current_rtv, FALSE, &vio_d3d12.current_dsv);
+    } else {
+        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 0, NULL, FALSE, &vio_d3d12.current_dsv);
+    }
+    D3D12_VIEWPORT vp = {0, 0, (float)vio_d3d12.current_rt_width, (float)vio_d3d12.current_rt_height, 0.0f, 1.0f};
+    ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, 1, &vp);
+    D3D12_RECT sc = {0, 0, vio_d3d12.current_rt_width, vio_d3d12.current_rt_height};
+    ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &sc);
+    d3d12_restore_graphics_state_after_compute();
+}
+
 static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
 {
     if (!cmd) return;
@@ -3047,6 +3100,11 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
         return;
     }
     if (d3d12_ensure_compute_srv_heap() != 0) return;
+
+    /* Async inside an open frame: record onto the frame's own command list so
+     * the dispatch executes in order with the surrounding draws (a later draw
+     * this frame sees the kernel's writes). Otherwise: transient list + fence. */
+    int in_frame_async = cmd->async && vio_d3d12.in_frame && vio_d3d12.cmd_list != NULL;
 
     /* Build the descriptor table contents in the compute heap. SRVs occupy heap
      * indices [0, MAX); UAVs occupy [MAX, 2*MAX). Within each region a buffer
@@ -3061,6 +3119,11 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &cpu_start);
     ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &gpu_start);
     UINT dsz = vio_d3d12.compute_srv_descriptor_size;
+    /* Ring block for this dispatch's descriptors (see compute_heap_block). */
+    UINT block = vio_d3d12.compute_heap_block;
+    vio_d3d12.compute_heap_block = (block + 1) % VIO_D3D12_COMPUTE_HEAP_BLOCKS;
+    cpu_start.ptr += (SIZE_T)block * (2 * VIO_D3D12_COMPUTE_MAX_BINDINGS) * dsz;
+    gpu_start.ptr += (UINT64)block * (2 * VIO_D3D12_COMPUTE_MAX_BINDINGS) * dsz;
 
     const UINT SRV_BASE = 0;
     const UINT UAV_BASE = VIO_D3D12_COMPUTE_MAX_BINDINGS;
@@ -3157,18 +3220,22 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
      * outside vio_begin/vio_end), so a dedicated allocator/list keeps us fully
      * decoupled from the frame command list and its state. */
     ID3D12CommandAllocator *alloc = NULL;
-    HRESULT hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device,
-        D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc);
-    if (FAILED(hr)) { php_error_docref(NULL, E_WARNING, "D3D12: compute allocator failed"); return; }
-
     ID3D12GraphicsCommandList *list = NULL;
-    hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0,
-        D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, cp->pso,
-        &IID_ID3D12GraphicsCommandList, (void **)&list);
-    if (FAILED(hr)) {
-        ID3D12CommandAllocator_Release(alloc);
-        php_error_docref(NULL, E_WARNING, "D3D12: compute command list failed");
-        return;
+    if (in_frame_async) {
+        list = vio_d3d12.cmd_list;
+    } else {
+        HRESULT hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device,
+            D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc);
+        if (FAILED(hr)) { php_error_docref(NULL, E_WARNING, "D3D12: compute allocator failed"); return; }
+
+        hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, cp->pso,
+            &IID_ID3D12GraphicsCommandList, (void **)&list);
+        if (FAILED(hr)) {
+            ID3D12CommandAllocator_Release(alloc);
+            php_error_docref(NULL, E_WARNING, "D3D12: compute command list failed");
+            return;
+        }
     }
 
     ID3D12GraphicsCommandList_SetComputeRootSignature(list, cp->root_signature);
@@ -3270,6 +3337,14 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
         ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
     }
 
+    if (in_frame_async) {
+        /* Stay on the frame list: put the graphics state back for the draws
+         * that follow and remember that a wait is due before any readback. */
+        d3d12_restore_graphics_state_after_compute();
+        vio_d3d12.compute_async_pending++;
+        return;
+    }
+
     ID3D12GraphicsCommandList_Close(list);
     ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
     ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
@@ -3288,6 +3363,7 @@ static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
 {
     vio_d3d12_buffer *buf = (vio_d3d12_buffer *)backend_buffer;
     if (!buf || !out || size == 0) return 0;
+    d3d12_compute_wait();   /* async dispatches (and their staging copies) must have executed */
     if (!buf->readback_resource) {
         php_error_docref(NULL, E_WARNING,
             "D3D12: read_buffer before any compute dispatch produced a readback");
@@ -3614,6 +3690,7 @@ static const vio_backend d3d12_backend = {
     .destroy_compute_pipeline = d3d12_destroy_compute_pipeline,
     .compute_bind_buffer      = d3d12_compute_bind_buffer,
     .compute_bind_image       = d3d12_compute_bind_image,
+    .compute_wait             = d3d12_compute_wait,
     .compute_set_uniforms     = d3d12_compute_set_uniforms,
     .read_buffer              = d3d12_read_buffer,
     .bind_storage_buffer          = d3d12_bind_storage_buffer,

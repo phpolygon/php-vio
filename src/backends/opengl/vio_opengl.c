@@ -520,6 +520,13 @@ static void opengl_compute_set_uniforms(void *pipeline_ptr, const void *data, in
     glBindBuffer(GL_UNIFORM_BUFFER, 0);
 }
 
+/* GL dispatches are already asynchronous on the in-order GL queue and the
+ * glMemoryBarrier after each dispatch orders them against later draws and
+ * readbacks, so there is nothing to wait for explicitly. */
+static void opengl_compute_wait(void)
+{
+}
+
 static void opengl_dispatch_compute(vio_compute_cmd *cmd)
 {
     if (!cmd || !vio_gl.initialized) return;
@@ -1636,6 +1643,7 @@ static const vio_backend opengl_backend = {
     .destroy_compute_pipeline = opengl_destroy_compute_pipeline,
     .compute_bind_buffer      = opengl_compute_bind_buffer,
     .compute_bind_image       = opengl_compute_bind_image,
+    .compute_wait             = opengl_compute_wait,
     .compute_set_uniforms     = opengl_compute_set_uniforms,
     .read_buffer              = opengl_read_buffer,
     .bind_storage_buffer          = opengl_bind_storage_buffer,

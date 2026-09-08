@@ -429,7 +429,8 @@ jobs:
             tests/render3d/092_render_target_readback.phpt `
             tests/render3d/093_texture_update_and_pipeline_free.phpt `
             tests/render3d/096_storage_image.phpt `
-            tests/render3d/097_mrt.phpt
+            tests/render3d/097_mrt.phpt `
+            tests/render3d/098_async_compute.phpt
 
       - name: Package binary
         shell: pwsh

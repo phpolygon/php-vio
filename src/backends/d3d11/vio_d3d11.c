@@ -1802,6 +1802,12 @@ static void d3d11_compute_bind_image(void *pipeline_ptr, void *tex_obj, int slot
     cp->image_count++;
 }
 
+/* The immediate context is in-order: dispatches run asynchronously on the GPU,
+ * later draws see their writes, and read_buffer's staging Map blocks. No-op. */
+static void d3d11_compute_wait(void)
+{
+}
+
 static void d3d11_dispatch_compute(vio_compute_cmd *cmd)
 {
     if (!cmd) return;
@@ -2132,6 +2138,7 @@ static const vio_backend d3d11_backend = {
     .destroy_compute_pipeline = d3d11_destroy_compute_pipeline,
     .compute_bind_buffer      = d3d11_compute_bind_buffer,
     .compute_bind_image       = d3d11_compute_bind_image,
+    .compute_wait             = d3d11_compute_wait,
     .compute_set_uniforms     = d3d11_compute_set_uniforms,
     .read_buffer              = d3d11_read_buffer,
     .bind_storage_buffer          = d3d11_bind_storage_buffer,

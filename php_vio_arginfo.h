@@ -282,6 +282,11 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_compute_dispatch, 0, 5, IS_V
 	ZEND_ARG_TYPE_INFO(0, gx, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, gy, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, gz, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 1, "null")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_compute_wait, 0, 1, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_storage_buffer_read, 0, 2, MAY_BE_STRING|MAY_BE_FALSE)
@@ -809,6 +814,7 @@ ZEND_FUNCTION(vio_compute_bind_buffer);
 ZEND_FUNCTION(vio_compute_bind_image);
 ZEND_FUNCTION(vio_compute_set_uniforms);
 ZEND_FUNCTION(vio_compute_dispatch);
+ZEND_FUNCTION(vio_compute_wait);
 ZEND_FUNCTION(vio_storage_buffer_read);
 ZEND_FUNCTION(vio_bind_storage_buffer);
 ZEND_FUNCTION(vio_draw_instanced_from_buffer);
@@ -951,6 +957,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_compute_bind_image, arginfo_vio_compute_bind_image)
 	ZEND_FE(vio_compute_set_uniforms, arginfo_vio_compute_set_uniforms)
 	ZEND_FE(vio_compute_dispatch, arginfo_vio_compute_dispatch)
+	ZEND_FE(vio_compute_wait, arginfo_vio_compute_wait)
 	ZEND_FE(vio_storage_buffer_read, arginfo_vio_storage_buffer_read)
 	ZEND_FE(vio_bind_storage_buffer, arginfo_vio_bind_storage_buffer)
 	ZEND_FE(vio_draw_instanced_from_buffer, arginfo_vio_draw_instanced_from_buffer)

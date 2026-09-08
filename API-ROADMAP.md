@@ -1,6 +1,6 @@
 # API-ROADMAP — vio-API über den GL-3.3-Kern hinaus (alle Backends)
 
-Status: 🚧 R1, R2, R7 umgesetzt (2026-09-08, php-vio 2.10-Paket); R3–R9 offen. Ergänzt `METALGPU-REPLACEMENT-PLAN.md`
+Status: 🚧 R1, R2, R7 (inkl. Async) umgesetzt (2026-09-08, php-vio 2.10-Paket); R3–R9 offen. Ergänzt `METALGPU-REPLACEMENT-PLAN.md`
 (dessen Phase 1 zuerst läuft — Cube-RT, `depth_write`, RT-Readback, Headless-Größen,
 Pipeline-Destruktor). Diese Roadmap enthält die Features, die **kein** vio-Backend heute
 exponiert, obwohl Metal, D3D11/12, Vulkan und (meist) OpenGL sie nativ können.
@@ -16,8 +16,8 @@ Grundregeln
   `strcmp(ctx->backend->name, …)`-Vorkommen in `php_vio.c` zählt und einfriert).
 - Reihenfolge nach PHPolygon-Nutzen. Aufwände sind Netto-Implementierung inkl. Tests.
 
-Nächste freie Testnummer: 098 (090–093 Replacement-Plan, 094/095 Metal-Regressionen,
-096 Storage-Images, 097 MRT).
+Nächste freie Testnummer: 099 (090–093 Replacement-Plan, 094/095 Metal-Regressionen,
+096 Storage-Images, 097 MRT, 098 Async-Compute).
 
 ---
 
@@ -110,11 +110,15 @@ vio_draw_indexed_indirect($ctx, $mesh, $args, $offset, $drawCount);
 - Metal `drawIndexedPrimitives:indirectBuffer:` (Multi-Draw per Loop oder ICB), D3D12 `ExecuteIndirect` (Command Signature), D3D11 `DrawIndexedInstancedIndirect` (Loop), GL `glMultiDrawElementsIndirect` (4.3) / `glDrawElementsIndirect` (4.0), Vulkan `vkCmdDrawIndexedIndirect`.
 - `VIO_FEATURE_INDIRECT_DRAW = 29`. Test `099_indirect_draw.phpt` (Compute füllt Args, 4 Quads).
 
-## R7 — Compute-Dispatch-Geometrie + Async   ~½ Tag   ✅ Geometrie umgesetzt, Async offen
+## R7 — Compute-Dispatch-Geometrie + Async   ~½ Tag   ✅ umgesetzt
 
 Stand: Metal liest `local_size` aus der SPIR-V-ExecutionMode (`metal_cs_spirv_to_msl`) und dispatcht
-damit statt (64,1,1); GL/D3D waren bereits implizit korrekt. Der optionale Async-Dispatch im
-Frame-Command-Buffer ist **nicht** umgesetzt (alle Dispatches bleiben synchron).
+damit statt (64,1,1); GL/D3D waren bereits implizit korrekt. `vio_compute_dispatch(…, ['async' => true])`
+zeichnet den Dispatch innerhalb von `vio_begin`/`vio_end` in den Frame-Command-Stream auf (Metal:
+Compute-Encoder zwischen den Render-Encodern desselben Command-Buffers; D3D12: Frame-Command-List mit
+UAV-Barrier, Descriptor-Ring aus 16 Blöcken, Graphics-State wird danach wiederhergestellt; GL/D3D11:
+Queue ist ohnehin in-order). `vio_compute_wait($ctx)` und `vio_storage_buffer_read()` fencen. Außerhalb
+eines Frames läuft `async` synchron. Test `098_async_compute`.
 
 - `local_size` aus der Reflection lesen statt `(64,1,1)` festzuverdrahten (Metal `threadsPerThreadgroup`; GL/D3D implizit). Erlaubt 2D/3D-Kernel (R2 braucht das).
 - Optional `vio_compute_dispatch(…, ['async'=>true])` + `vio_compute_wait($cp)`: Dispatch im Frame-Command-Buffer statt eigenem synchronem Buffer (Metal: gleicher `MTLCommandBuffer`, Compute-Encoder zwischen den Render-Encodern; D3D12: gleiche Command-List + UAV-Barrier).
