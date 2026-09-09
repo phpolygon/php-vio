@@ -69,6 +69,86 @@ probe("null", [
     VIO_FEATURE_NATIVE_2D_BATCH    => 0,
 ]);
 
+/* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
+ * Each block folds its asserts into one "<name>: %s" line so the --EXPECTF--
+ * shape is the same whether the backend is compiled in / can open a device or
+ * not (Linux and macOS CI have no D3D; macOS CI has no Vulkan ICD). */
+function probe_fold(string $backend_name, array $expected): void {
+    $ctx = @vio_create($backend_name, ["width" => 16, "height" => 16, "headless" => true, "vsync" => false]);
+    if (!$ctx) {
+        echo "$backend_name: skip (unavailable)\n";
+        return;
+    }
+    $bad = [];
+    foreach ($expected as $flag => $want) {
+        $got = vio_supports_feature($ctx, $flag);
+        if ((bool)$got !== (bool)$want) $bad[] = "$flag=" . ($got ? 1 : 0) . " (want " . ($want ? 1 : 0) . ")";
+    }
+    vio_destroy($ctx);
+    /* A failure prints a SECOND line so the single "<name>: %s" expectation
+     * cannot swallow it. */
+    echo $bad ? "$backend_name: FAIL\n  " . implode("\n  ", $bad) . "\n" : "$backend_name: OK\n";
+}
+
+/* Shared by both D3D backends: everything a wired 3D backend must have, plus
+ * the honest zeros — no GS/HS/DS stage can be supplied through vio_shader.
+ * Cube targets, mip generation and multisampled targets differ per backend
+ * (see the per-backend entries below). */
+$d3d_common = [
+    VIO_FEATURE_3D_PIPELINE        => 1,
+    VIO_FEATURE_COMPUTE            => 1,
+    VIO_FEATURE_READ_PIXELS        => 1,
+    VIO_FEATURE_INSTANCED_DRAW     => 1,
+    VIO_FEATURE_RENDER_TARGET      => 1,
+    VIO_FEATURE_RENDER_TARGET_HDR  => 1,
+    VIO_FEATURE_RENDER_TARGET_DEPTH=> 1,
+    VIO_FEATURE_CUBEMAP            => 1,
+    VIO_FEATURE_DEPTH_BIAS         => 1,
+    VIO_FEATURE_SCISSOR            => 1,
+    VIO_FEATURE_NATIVE_2D_BATCH    => 1,
+    VIO_FEATURE_TEXTURE_3D         => 1,
+    VIO_FEATURE_VERTEX_STORAGE     => 1,
+    VIO_FEATURE_STORAGE_IMAGE      => 1,
+    VIO_FEATURE_MRT                => 1,
+    VIO_FEATURE_TESSELLATION       => 0,
+    VIO_FEATURE_GEOMETRY           => 0,
+    VIO_FEATURE_RAYTRACING         => 0,
+    VIO_FEATURE_MULTIVIEW          => 0,
+];
+probe_fold("d3d11", $d3d_common + [
+    VIO_FEATURE_TEXTURE_SWIZZLE    => 0,   /* D3D11 SRVs have no component mapping */
+    VIO_FEATURE_RENDER_TARGET_MSAA => 1,   /* multisampled colour + ResolveSubresource (GAP-PLAN 3) */
+    VIO_FEATURE_RENDER_TARGET_CUBE => 1,   /* GAP-PLAN 2.2 */
+    VIO_FEATURE_MIPMAP_GEN         => 1,   /* GenerateMips (GAP-PLAN 2.3) */
+]);
+probe_fold("d3d12", $d3d_common + [
+    VIO_FEATURE_TEXTURE_SWIZZLE    => 1,   /* Shader4ComponentMapping */
+    VIO_FEATURE_RENDER_TARGET_MSAA => 0,   /* PSO SampleDesc variant pending (GAP-PLAN 5) */
+    VIO_FEATURE_RENDER_TARGET_CUBE => 1,   /* GAP-PLAN 2.2 */
+    VIO_FEATURE_MIPMAP_GEN         => 1,   /* CPU box filter + re-upload (GAP-PLAN 2.3) */
+]);
+
+/* Vulkan is a 2D + compute + offscreen-RT backend: vulkan_create_pipeline is
+ * a stub, so every vertex-stage feature is 0 (this is what keeps
+ * vio_create('auto') from picking it over OpenGL on Linux — test 100). */
+probe_fold("vulkan", [
+    VIO_FEATURE_3D_PIPELINE        => 0,
+    VIO_FEATURE_INSTANCED_DRAW     => 0,
+    VIO_FEATURE_DEPTH_BIAS         => 0,
+    VIO_FEATURE_TESSELLATION       => 0,
+    VIO_FEATURE_GEOMETRY           => 0,
+    VIO_FEATURE_VERTEX_STORAGE     => 0,
+    VIO_FEATURE_COMPUTE            => 1,
+    VIO_FEATURE_READ_PIXELS        => 1,
+    VIO_FEATURE_RENDER_TARGET      => 1,
+    VIO_FEATURE_SCISSOR            => 1,
+    VIO_FEATURE_TEXTURE_SWIZZLE    => 1,
+    VIO_FEATURE_NATIVE_2D_BATCH    => 1,
+    VIO_FEATURE_TEXTURE_3D         => 1,
+    VIO_FEATURE_RAYTRACING         => 0,
+    VIO_FEATURE_MULTIVIEW          => 0,
+]);
+
 /* Metal (macOS) — full 3D pipeline + RT + 2D-batch + swizzle */
 $mtl = @vio_create("metal", ["width" => 16, "height" => 16, "headless" => true]);
 if ($mtl) {
@@ -97,5 +177,8 @@ echo "DONE\n";
 --EXPECTF--
 opengl: OK
 null: OK
+d3d11: %s
+d3d12: %s
+vulkan: %s
 metal: %s
 DONE

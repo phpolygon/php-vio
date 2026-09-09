@@ -76,6 +76,23 @@ const vio_backend *vio_get_auto_backend(void)
     const char *priority[] = {"vulkan", "opengl"};
     int priority_count = 2;
 #endif
+    /* First pass: the highest-priority backend that can actually draw 3D.
+     * A registered backend whose supports_feature() reports no
+     * VIO_FEATURE_3D_PIPELINE (today: Vulkan — vulkan_create_pipeline returns
+     * NULL, so vio_pipeline()/vio_draw() would silently render nothing) must not
+     * win "auto" over one that can, or a Linux box with a Vulkan ICD would get a
+     * 2D-only context for a 3D game. supports_feature is a static table on every
+     * backend, so this costs nothing and needs no device. Once a backend gains a
+     * 3D pipeline it automatically becomes eligible again. */
+    for (int p = 0; p < priority_count; p++) {
+        const vio_backend *b = vio_find_backend(priority[p]);
+        if (b && b->supports_feature && b->supports_feature(VIO_FEATURE_3D_PIPELINE)) {
+            return b;
+        }
+    }
+
+    /* Second pass: plain priority order (2D-only deployments, e.g. a build with
+     * only the Vulkan backend). */
     for (int p = 0; p < priority_count; p++) {
         const vio_backend *b = vio_find_backend(priority[p]);
         if (b) {
@@ -83,7 +100,14 @@ const vio_backend *vio_get_auto_backend(void)
         }
     }
 
-    /* Fall back to first registered backend */
+    /* Fall back to the first registered backend that has a 3D pipeline, then
+     * to the first registered backend at all. */
+    for (int i = 0; i < backend_count; i++) {
+        const vio_backend *b = backends[i];
+        if (b->supports_feature && b->supports_feature(VIO_FEATURE_3D_PIPELINE)) {
+            return b;
+        }
+    }
     if (backend_count > 0) {
         return backends[0];
     }
