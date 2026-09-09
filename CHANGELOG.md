@@ -1,3 +1,20 @@
+# [2.10.0](https://github.com/phpolygon/php-vio/compare/v2.9.0...v2.10.0) (2026-09-09)
+
+
+### Bug Fixes
+
+* **2d:** batch owns texture/font refs; mat4 vertex inputs on D3D; root CBV for storage-instanced draws ([fa43716](https://github.com/phpolygon/php-vio/commit/fa437162d3aa2f3aa3d456110330d85c5546487c))
+* **opengl:** per-context generation stamps so stale objects never delete a new context's GL names ([861115d](https://github.com/phpolygon/php-vio/commit/861115d769b7497c9b9f4ecbcaf687cd9717813a))
+* **window:** 1:1 headless surfaces and unscaled headless mouse coordinates ([428fc4d](https://github.com/phpolygon/php-vio/commit/428fc4deaa4e3af024df912423c76a3b97e5ec76))
+
+
+### Features
+
+* **backends:** honest capability flags, 3D-aware auto selection, audit gate 099 ([f490b56](https://github.com/phpolygon/php-vio/commit/f490b5639aabab165c4f35e7e84422d5d61338ee)), closes [#if](https://github.com/phpolygon/php-vio/issues/if)
+* **d3d12:** sampler heap, async upload queue, DEFAULT-heap meshes, mip chains ([f5659a5](https://github.com/phpolygon/php-vio/commit/f5659a5ee9862680456abc1eb83b9f4e5e6d73f3))
+* **rt:** render targets behind the vtable on D3D11/D3D12; MSAA on D3D11 and OpenGL ([948bae1](https://github.com/phpolygon/php-vio/commit/948bae1eba65d46bc77822f8a09db71d0d65363c))
+* **vulkan:** vsync present mode, samplerAnisotropy, persistent transient pool ([ad95271](https://github.com/phpolygon/php-vio/commit/ad9527132e597bc8797cf42ebb8cd4e9fdb0813b))
+
 # [2.9.0](https://github.com/phpolygon/php-vio/compare/v2.8.0...v2.9.0) (2026-09-08)
 
 
