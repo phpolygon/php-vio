@@ -135,6 +135,7 @@ typedef struct _vio_render_target_object {
     void        *d3d12_depth_backend_texture; /* vio_d3d12_texture* */
 
     const struct _vio_backend *backend;  /* Backend that owns the resources above */
+    unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
     zend_object  std;
 } vio_render_target_object;
 

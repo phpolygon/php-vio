@@ -2256,6 +2256,7 @@ ZEND_FUNCTION(vio_shader)
             /* Raw GLSL: compile directly, no SPIR-V round-trip */
             shader->program = vio_opengl_compile_shader_source(
                 Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval));
+            shader->gl_generation = vio_opengl_context_generation();
             if (!shader->program) {
                 php_error_docref(NULL, E_WARNING, "OpenGL shader compilation failed (raw GLSL)");
                 zval_ptr_dtor(&shader_zval);
@@ -2287,6 +2288,7 @@ ZEND_FUNCTION(vio_shader)
             }
 
             shader->program = vio_opengl_compile_shader_source(vert_glsl, frag_glsl);
+            shader->gl_generation = vio_opengl_context_generation();
             free(vert_glsl);
             free(frag_glsl);
 

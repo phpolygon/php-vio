@@ -71,5 +71,8 @@ void vio_opengl_delete_program(unsigned int program);
 /* Returns the GLSL version (e.g. 330) matching the active GL context.
  * Returns 330 if no context is initialized yet — that's the floor we ship. */
 int vio_opengl_get_glsl_version(void);
+/* Generation of the GL context vio_gl currently describes (0 = none yet).
+ * Stamp GL names with it at creation; see gl_owned_by_live_context(). */
+unsigned int vio_opengl_context_generation(void);
 
 #endif /* VIO_OPENGL_H */

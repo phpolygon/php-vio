@@ -61,6 +61,7 @@ typedef struct _vio_shader_object {
     HashTable        *uniform_lookup;
     int               valid;
     const struct _vio_backend *backend;
+    unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
     zend_object       std;
 } vio_shader_object;
 

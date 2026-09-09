@@ -35,6 +35,27 @@
 
 vio_opengl_state vio_gl = {0};
 
+/* Monotonic id of the GL context vio_gl currently describes. Every GL name a
+ * vio object owns is stamped with the generation it was created under and the
+ * destructors compare it: a PHP object can outlive its context (freed during
+ * GC after vio_destroy, or only once a NEW context is current), and a GL
+ * name of a dead context is either invalid or — worse — already handed out
+ * again by the next context, so glDelete* would silently kill a live object
+ * (the second OpenGL context in one process rendered black). Lives outside
+ * vio_gl because opengl_init() memsets that struct per context. */
+static unsigned int gl_context_generation = 0;
+
+unsigned int vio_opengl_context_generation(void)
+{
+    return gl_context_generation;
+}
+
+/* True when the names stamped with `gen` belong to the live context. */
+static int gl_owned_by_live_context(unsigned int gen)
+{
+    return vio_gl.initialized && gen == gl_context_generation;
+}
+
 /* ── Shader compilation helpers ───────────────────────────────────── */
 
 static unsigned int compile_shader_stage(const char *source, GLenum type)
@@ -173,6 +194,7 @@ static void opengl_bind_pipeline(void *pipeline)
  * the mesh/uniform paths and create_buffer returns NULL as before. */
 typedef struct _vio_opengl_compute_buffer {
     GLuint  ssbo;
+    unsigned int gl_generation;
     size_t  size;     /* bytes */
     int     stride;   /* element stride (informational; raw float access in GL) */
 } vio_opengl_compute_buffer;
@@ -187,6 +209,7 @@ typedef struct _vio_opengl_compute_binding {
 
 typedef struct _vio_opengl_compute_pipeline {
     GLuint program;
+    unsigned int gl_generation;
     GLuint ubo;              /* params UBO (lazily (re)created in set_uniforms) */
     GLsizeiptr ubo_capacity; /* current UBO byte capacity */
     int    params_binding;   /* reflected UBO binding point (GLSL binding = 2) */
@@ -220,6 +243,7 @@ static void *opengl_create_buffer(vio_buffer_desc *desc)
     buf->stride = desc->stride;
 
     glGenBuffers(1, &buf->ssbo);
+    buf->gl_generation = gl_context_generation;
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf->ssbo);
     /* Input buffers carry `data` (read-once) -> STATIC_DRAW; output buffers are
      * sized-and-zeroed (NULL data) and read back -> DYNAMIC_DRAW. Either way the
@@ -446,6 +470,7 @@ static void *opengl_create_compute_pipeline(vio_shader_desc *desc)
     vio_opengl_compute_pipeline *cp = calloc(1, sizeof(vio_opengl_compute_pipeline));
     if (!cp) { glDeleteProgram(program); return NULL; }
     cp->program = program;
+    cp->gl_generation = gl_context_generation;
     cp->params_binding = params_binding;
 
     /* Defensive: if the UBO block lost its explicit binding (older spirv-cross),
@@ -462,8 +487,10 @@ static void opengl_destroy_compute_pipeline(void *pipeline_ptr)
 {
     vio_opengl_compute_pipeline *cp = (vio_opengl_compute_pipeline *)pipeline_ptr;
     if (!cp) return;
-    if (cp->ubo) glDeleteBuffers(1, &cp->ubo);
-    if (cp->program) glDeleteProgram(cp->program);
+    if (gl_owned_by_live_context(cp->gl_generation)) {
+        if (cp->ubo) glDeleteBuffers(1, &cp->ubo);
+        if (cp->program) glDeleteProgram(cp->program);
+    }
     free(cp);
 }
 
@@ -623,13 +650,13 @@ static void opengl_destroy_buffer_obj(void *buf_obj)
 {
     vio_buffer_object *buf = (vio_buffer_object *)buf_obj;
     if (buf->buffer_id) {
-        glDeleteBuffers(1, &buf->buffer_id);
+        if (gl_owned_by_live_context(buf->gl_generation)) glDeleteBuffers(1, &buf->buffer_id);
         buf->buffer_id = 0;
     }
     /* STORAGE buffers (compute) live behind backend_buffer as a GL SSBO wrapper. */
     if (buf->backend_buffer) {
         vio_opengl_compute_buffer *cb = (vio_opengl_compute_buffer *)buf->backend_buffer;
-        if (cb->ssbo) glDeleteBuffers(1, &cb->ssbo);
+        if (cb->ssbo && gl_owned_by_live_context(cb->gl_generation)) glDeleteBuffers(1, &cb->ssbo);
         free(cb);
         buf->backend_buffer = NULL;
     }
@@ -641,7 +668,7 @@ static void opengl_destroy_texture_obj(void *tex_obj)
     /* `borrowed` textures (e.g. render-target color/depth alias) are owned
      * by another object and must not be deleted here. */
     if (tex->texture_id && !tex->borrowed) {
-        glDeleteTextures(1, &tex->texture_id);
+        if (gl_owned_by_live_context(tex->gl_generation)) glDeleteTextures(1, &tex->texture_id);
         tex->texture_id = 0;
     }
 }
@@ -650,7 +677,7 @@ static void opengl_destroy_shader_obj(void *shader_obj)
 {
     vio_shader_object *sh = (vio_shader_object *)shader_obj;
     if (sh->program) {
-        glDeleteProgram(sh->program);
+        if (gl_owned_by_live_context(sh->gl_generation)) glDeleteProgram(sh->program);
         sh->program = 0;
     }
 }
@@ -658,9 +685,10 @@ static void opengl_destroy_shader_obj(void *shader_obj)
 static void opengl_destroy_mesh(void *mesh_ptr)
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_ptr;
-    if (mesh->ebo) { glDeleteBuffers(1, &mesh->ebo); mesh->ebo = 0; }
-    if (mesh->vbo) { glDeleteBuffers(1, &mesh->vbo); mesh->vbo = 0; }
-    if (mesh->vao) { glDeleteVertexArrays(1, &mesh->vao); mesh->vao = 0; }
+    int live = gl_owned_by_live_context(mesh->gl_generation);
+    if (mesh->ebo) { if (live) glDeleteBuffers(1, &mesh->ebo); mesh->ebo = 0; }
+    if (mesh->vbo) { if (live) glDeleteBuffers(1, &mesh->vbo); mesh->vbo = 0; }
+    if (mesh->vao) { if (live) glDeleteVertexArrays(1, &mesh->vao); mesh->vao = 0; }
 }
 
 static void opengl_destroy_cubemap(void *cm_ptr)
@@ -672,7 +700,7 @@ static void opengl_destroy_cubemap(void *cm_ptr)
         return;
     }
     if (cm->texture_id) {
-        glDeleteTextures(1, &cm->texture_id);
+        if (gl_owned_by_live_context(cm->gl_generation)) glDeleteTextures(1, &cm->texture_id);
         cm->texture_id = 0;
     }
 }
@@ -687,9 +715,9 @@ static void opengl_destroy_font_atlas(void *font_ptr)
      * calling glDeleteTextures now would either run with no current context
      * (crash) or against a later context whose texture-id space has been reused
      * (silent corruption) — the accumulating fault behind "Premature end of PHP
-     * process" after ~40 render cycles. Only touch the GL object while its
-     * context is live; otherwise just clear the stale id. */
-    if (font->atlas_texture && vio_gl.initialized && glDeleteTextures) {
+     * process" after ~40 render cycles. Only touch the GL object while the
+     * context that created it is live; otherwise just clear the stale id. */
+    if (font->atlas_texture && gl_owned_by_live_context(font->gl_generation) && glDeleteTextures) {
         glDeleteTextures(1, &font->atlas_texture);
     }
     font->atlas_texture = 0;
@@ -719,30 +747,31 @@ static void opengl_destroy_render_target(void *rt_ptr)
      * cross-backend tests. */
     if (rt->backend_type != VIO_RT_BACKEND_OPENGL) return;
     if (vio_gl.current_bound_rt == rt) vio_gl.current_bound_rt = NULL;
+    int live = gl_owned_by_live_context(rt->gl_generation);
     if (rt->gl_msaa_fbo) {
-        glDeleteFramebuffers(1, &rt->gl_msaa_fbo);
+        if (live) glDeleteFramebuffers(1, &rt->gl_msaa_fbo);
         rt->gl_msaa_fbo = 0;
     }
-    if (rt->gl_msaa_color_rb) { glDeleteRenderbuffers(1, &rt->gl_msaa_color_rb); rt->gl_msaa_color_rb = 0; }
-    if (rt->gl_msaa_depth_rb) { glDeleteRenderbuffers(1, &rt->gl_msaa_depth_rb); rt->gl_msaa_depth_rb = 0; }
+    if (rt->gl_msaa_color_rb) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_color_rb); rt->gl_msaa_color_rb = 0; }
+    if (rt->gl_msaa_depth_rb) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_depth_rb); rt->gl_msaa_depth_rb = 0; }
     if (rt->fbo) {
-        glDeleteFramebuffers(1, &rt->fbo);
+        if (live) glDeleteFramebuffers(1, &rt->fbo);
         rt->fbo = 0;
     }
     if (rt->color_texture) {
-        glDeleteTextures(1, &rt->color_texture);
+        if (live) glDeleteTextures(1, &rt->color_texture);
         rt->color_texture = 0;
         rt->color_textures[0] = 0;
     }
     /* MRT attachments 1..n (index 0 is the scalar above). */
     for (int i = 1; i < rt->attachment_count && i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
         if (rt->color_textures[i]) {
-            glDeleteTextures(1, &rt->color_textures[i]);
+            if (live) glDeleteTextures(1, &rt->color_textures[i]);
             rt->color_textures[i] = 0;
         }
     }
     if (rt->depth_texture) {
-        glDeleteTextures(1, &rt->depth_texture);
+        if (live) glDeleteTextures(1, &rt->depth_texture);
         rt->depth_texture = 0;
     }
 }
@@ -753,6 +782,7 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
     if (!vio_gl.initialized) return -1;
 
     glGenFramebuffers(1, &rt->fbo);
+    rt->gl_generation = gl_context_generation;
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
 
     if (rt->is_cube) {
@@ -1173,6 +1203,7 @@ static int opengl_create_uniform_buffer(void *buf_obj, int size, const void *ini
     if (!vio_gl.initialized) return -1;
 
     glGenBuffers(1, &buf->buffer_id);
+    buf->gl_generation = gl_context_generation;
     glBindBuffer(GL_UNIFORM_BUFFER, buf->buffer_id);
     glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)size, initial_data, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_UNIFORM_BUFFER, (GLuint)binding, buf->buffer_id);
@@ -1230,6 +1261,7 @@ static int opengl_upload_cubemap(void *cm_obj, int width, int height, const void
     if (!vio_gl.initialized) return -1;
 
     glGenTextures(1, &cm->texture_id);
+    cm->gl_generation = gl_context_generation;
     glBindTexture(GL_TEXTURE_CUBE_MAP, cm->texture_id);
 
     for (int i = 0; i < 6; i++) {
@@ -1259,6 +1291,7 @@ static int opengl_upload_font_atlas(void *font_obj, int width, int height,
     if (!vio_gl.initialized) return -1;
 
     glGenTextures(1, &font->atlas_texture);
+    font->gl_generation = gl_context_generation;
     glBindTexture(GL_TEXTURE_2D, font->atlas_texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, width, height,
                  0, GL_RED, GL_UNSIGNED_BYTE, r8_data);
@@ -1396,6 +1429,7 @@ static int opengl_upload_texture_2d(void *tex_obj,
     if (!vio_gl.initialized) return -1;
 
     glGenTextures(1, &tex->texture_id);
+    tex->gl_generation = gl_context_generation;
     glBindTexture(GL_TEXTURE_2D, tex->texture_id);
 
     GLint gl_wrap;
@@ -1452,6 +1486,7 @@ static int opengl_upload_texture_3d(void *tex_obj,
     if (!vio_gl.initialized) return -1;
 
     glGenTextures(1, &tex->texture_id);
+    tex->gl_generation = gl_context_generation;
     glBindTexture(GL_TEXTURE_3D, tex->texture_id);
 
     GLint gl_wrap;
@@ -1485,6 +1520,7 @@ static int opengl_create_mesh(void *mesh_obj,
     if (!vio_gl.initialized) return -1;
 
     glGenVertexArrays(1, &mesh->vao);
+    mesh->gl_generation = gl_context_generation;
     glGenBuffers(1, &mesh->vbo);
 
     glBindVertexArray(mesh->vao);
@@ -1881,6 +1917,7 @@ int vio_opengl_setup_context(void)
         return -1;
     }
 
+    gl_context_generation++;
     vio_gl.initialized = 1;
     return 0;
 }

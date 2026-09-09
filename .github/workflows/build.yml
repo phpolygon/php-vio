@@ -447,7 +447,8 @@ jobs:
             tests/render3d/103_midframe_texture_upload_ordering.phpt `
             tests/render3d/104_anisotropy_option.phpt `
             tests/render3d/105_render_target_msaa_resolve.phpt `
-            tests/backends/106_vulkan_present_mode.phpt
+            tests/backends/106_vulkan_present_mode.phpt `
+            tests/backends/107_opengl_context_generation.phpt
 
       - name: Package binary
         shell: pwsh
