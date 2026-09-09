@@ -43,6 +43,8 @@
 #include "vio_render_target.h"   /* vio_render_target_object (bound-RT extent) */
 #endif
 
+static void vio_2d_release_owners(vio_2d_state *state);   /* defined next to vio_2d_begin */
+
 /* ── Orthographic projection matrix ──────────────────────────────── */
 
 static void vio_2d_ortho(float *m, float left, float right, float bottom, float top)
@@ -278,6 +280,7 @@ int vio_2d_init(vio_2d_state *state, int width, int height)
 void vio_2d_shutdown(vio_2d_state *state)
 {
     if (!state->initialized) return;
+    vio_2d_release_owners(state);
 
 #ifdef HAVE_GLFW
     if (state->backend == VIO_2D_BACKEND_OPENGL && state->opengl_state) {
@@ -315,9 +318,22 @@ void vio_2d_shutdown(vio_2d_state *state)
     memset(state, 0, sizeof(vio_2d_state));
 }
 
+/* Drop the references the batch holds on the VioTexture / VioFont objects
+ * behind its textured items (see vio_2d_item.owner). */
+static void vio_2d_release_owners(vio_2d_state *state)
+{
+    for (int i = 0; i < state->item_count; i++) {
+        if (state->items[i].owner) {
+            OBJ_RELEASE((zend_object *)state->items[i].owner);
+            state->items[i].owner = NULL;
+        }
+    }
+}
+
 void vio_2d_begin(vio_2d_state *state)
 {
     if (!state->initialized) return;
+    vio_2d_release_owners(state);
     state->vertex_count     = 0;
     state->item_count       = 0;
     state->transform_depth  = 0;
@@ -350,7 +366,17 @@ void vio_2d_push_item(vio_2d_state *state, vio_2d_item_type type, float z,
                        unsigned int texture_id, void *backend_texture,
                        int vert_start, int vert_count)
 {
-    if (!state->initialized) return;
+    vio_2d_push_item_owned(state, type, z, texture_id, backend_texture, vert_start, vert_count, NULL);
+}
+
+void vio_2d_push_item_owned(vio_2d_state *state, vio_2d_item_type type, float z,
+                             unsigned int texture_id, void *backend_texture,
+                             int vert_start, int vert_count, void *owner)
+{
+    if (!state->initialized) {
+        if (owner) OBJ_RELEASE((zend_object *)owner);   /* caller already ADDREF'd */
+        return;
+    }
     /* Grow buffer if needed */
     if (state->item_count >= state->item_capacity) {
         int new_cap = state->item_capacity * 2;
@@ -366,6 +392,7 @@ void vio_2d_push_item(vio_2d_state *state, vio_2d_item_type type, float z,
     item->vertex_start    = vert_start;
     item->vertex_count    = vert_count;
     item->scissor         = vio_2d_current_scissor(state);
+    item->owner           = owner;
 }
 
 void vio_2d_flush(vio_2d_state *state)
@@ -534,9 +561,8 @@ void vio_2d_flush(vio_2d_state *state)
         ID3D12GraphicsCommandList_SetGraphicsRootSignature(cl, vio_d3d12.root_signature);
         ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(cl, 0, cb_gpu);
 
-        /* Set descriptor heap (required for SRV table) */
-        ID3D12DescriptorHeap *heaps[] = { vio_d3d12.srv_heap.heap };
-        ID3D12GraphicsCommandList_SetDescriptorHeaps(cl, 1, heaps);
+        /* Set descriptor heaps (SRV + sampler tables) */
+        vio_d3d12_bind_graphics_heaps(cl);
 
         /* Bind vertex buffer at the current frame's slice */
         D3D12_VERTEX_BUFFER_VIEW vbv = {0};
@@ -596,8 +622,7 @@ void vio_2d_flush(vio_2d_state *state)
                 if (current_tex) {
                     vio_d3d12_texture *dtex = (vio_d3d12_texture *)current_tex;
                     memset(vio_d3d12.pending_srv_valid, 0, sizeof(vio_d3d12.pending_srv_valid));
-                    vio_d3d12.pending_srvs[0] = dtex->srv_cpu;
-                    vio_d3d12.pending_srv_valid[0] = 1;
+                    vio_d3d12_bind_srv_slot(dtex->srv_cpu, 0, dtex->sampler_index);
                     vio_d3d12_flush_srv_table();
                 }
             }

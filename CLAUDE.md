@@ -91,12 +91,13 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-98 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+109 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
 | `tests/render3d/096–098` | Storage-Images + 2D-Dispatch (API-Roadmap R2/R7), Multiple Render Targets (R1), Async-Compute im Frame (R7) |
+| `tests/core/099–100`, `render3d/101–105`, `backends/106` | GAP-Plan (`D3D-VULKAN-GAP-PLAN.md`): Audit-Gate für Backend-Zweige in `php_vio.c`, Auto-Backend-Wahl, Sampler-Filter/Wrap, Cube-RT/Mipmaps/Readback auf allen Backends, Mid-Frame-Upload-Ordnung, Anisotropie, RT-MSAA-Resolve, Vulkan-Present-Mode. Die `*_all_backends`-Tests iterieren über `opengl/d3d11/d3d12/metal` und drucken pro Backend `OK` oder `skip (…)`. |
 | `tests/core/` | Laden, Konstanten, Null-Backend, Context-Lifecycle, Plugins, Audit-Gate 070, Capability-Matrix 074, Perf/Memory-Gates |
 | `tests/backends/` | Backend-Registrierung + GPU-Kontexte (OpenGL/Vulkan/Metal/D3D11/D3D12), Cross-Backend-Parity 067, Metal-3D 089, Uniform-Layout Struct-Arrays 094, Texture-Bind-Reihenfolge 095, D3D-Spezifika |
 | `tests/render3d/` | Mesh/Shader/Pipeline/Texturen/Buffer/RT/Cubemap/Compute/Vertex-Storage, headless GL |
@@ -723,6 +724,12 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
 - `OPENGL-REFACTOR-PLAN.md` — ✅ implementiert. OpenGL als echtes Backend hinter
   der Vtable; erzwungen durch `tests/core/070_audit_gate_no_gl_outside_backend.phpt`
   (kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`).
+- **`D3D-VULKAN-GAP-PLAN.md` — ✅ Phasen 0–4 umgesetzt (2026-09-09), Phase 5 offen.**
+  Ehrliche Feature-Flags, D3D12-Sampler-Heap, D3D11/D3D12-Render-Targets im Backend
+  (Cube-RT, Mipmaps, Readback, MSAA auf D3D11 + GL), Anisotropie, Vulkan-Present-Mode,
+  D3D12-Upload-Queue; Audit-Gate `099`. Phase 5 listet, was D3D/Vulkan nativ können und
+  noch fehlt (Vulkan-3D-Entscheidung, D3D12-RT-MSAA + Stencil als PSO-State-PR, uint16,
+  Timestamps, Indirect, Pipeline-Cache, DXC/SM6, HDR-Swapchain, VRS/Multiview).
 - `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
 - `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
 - **`METALGPU-REPLACEMENT-PLAN.md` — 🚧 Phasen 1–3 umgesetzt.** php-metal-gpu (`ext-metal`) und
@@ -767,10 +774,76 @@ gegen die Homebrew-Formel mit identischer Modul-API und das `.so` dann in Herd e
 - Config: `~/Library/Application Support/Herd/config/php/{82,84,85}/php.ini` → `extension=vio.so`
 - PHPolygon verlangt `php >= 8.5` → Ziel ist Herd `php85` + Homebrew `php`.
 
+## D3D11 / D3D12 / Vulkan — Stand nach dem GAP-Plan (2026-09-09)
+
+`D3D-VULKAN-GAP-PLAN.md` (Phasen 0–4 umgesetzt, Phase 5 = Folgearbeit). Was sich für
+Aufrufer geändert hat:
+
+- **Feature-Flags sind ehrlich**: Vulkan meldet `3D_PIPELINE/INSTANCED_DRAW/DEPTH_BIAS/
+  TESSELLATION/GEOMETRY = 0`, D3D11/D3D12 melden `TESSELLATION/GEOMETRY = 0` (kein GS/HS/DS
+  über `vio_shader`), D3D12 `RENDER_TARGET_MSAA = 0` (PSO braucht `SampleDesc`, Phase 5),
+  D3D12 `TEXTURE_SWIZZLE = 1`. `074` pinnt jetzt auch d3d11/d3d12/vulkan.
+- **`auto` überspringt Backends ohne 3D-Pipeline**, wenn ein späterer Kandidat eine hat
+  (Linux: OpenGL vor Vulkan, solange Vulkan-3D fehlt). Test `100`.
+- **Audit-Gate `099`** friert `strcmp(ctx->backend->name, …)` (66) und `#if HAVE_D3D11/
+  D3D12/VULKAN` (47) in `php_vio.c` ein — neue Backend-Fähigkeiten gehen über Vtable-Slots.
+  Render-Target-Erstellung/-Bind/-Unbind/-Readback und Cubemap-Upload für D3D11/D3D12
+  liegen jetzt in `src/backends/d3d1x/` (`create_render_target`, `bind_render_target`,
+  `unbind_render_target`, `bind_render_target_face`, `render_target_cubemap`,
+  `generate_mipmaps`, `read_render_target`, `upload_cubemap`, `update_texture`).
+- **D3D12-Sampler**: `filter`/`wrap`/`anisotropy` einer Textur werden honoriert (vorher 8
+  statische LINEAR/WRAP-Sampler). Root-Param [4] ist eine Sampler-Table s0–s7, gefüllt aus
+  einem Kombi-Heap (`vio_d3d12_sampler_combo()`), Shadow-Comparison-Sampler bleiben statisch
+  auf s8–s11. Wer `pending_srvs` schreibt, nimmt `vio_d3d12_bind_srv_slot()`; wer Heaps
+  bindet, nimmt `vio_d3d12_bind_graphics_heaps()`.
+- **`vio_texture(['anisotropy' => 1..16])`** auf D3D11, D3D12, Vulkan (`samplerAnisotropy`
+  wird aktiviert, wenn vorhanden) und OpenGL (`GL_TEXTURE_MAX_ANISOTROPY`); Metal ignoriert
+  es noch. `mipmaps => true` wird auf D3D12 jetzt umgesetzt (CPU-Kette beim Upload).
+- **Cube-Render-Targets + `vio_generate_mipmaps`** auf D3D11 (`GenerateMips`) und D3D12
+  (CPU-Box-Filter + Re-Upload — korrekt, nicht schnell). `vio_read_render_target($rt,
+  $face)` auf D3D11. `vio_texture_update` auf D3D12.
+- **RT-MSAA** (`'samples' => N`) ist auf D3D11 (Resolve beim Unbind/Readback) und OpenGL
+  (Multisample-Renderbuffer + Blit) implementiert; vorher ignorierten beide `samples`
+  bei `RENDER_TARGET_MSAA = 1`. Depth-only-/Cube-/MRT-Targets bleiben single-sample.
+- **Vulkan `vsync: false`** wählt `IMMEDIATE` (Fallback MAILBOX → FIFO); `true` = FIFO.
+- **Headless-Fenster sind undekoriert** und `vio_begin` resized D3D-Swapchains im
+  Headless-Modus nicht mehr auf die Fenstergröße: vorher war ein 32×32-Headless-Backbuffer
+  auf D3D11/D3D12/Vulkan 348 px breit (Windows-Mindestbreite dekorierter Fenster) und
+  `vio_read_pixels` lieferte ab Zeile 1 die falschen Pixel — jeder D3D-Pixeltest mit
+  kleinen Größen prüfte Müll. Jetzt sind alle Backends 1:1 (`strlen(read_pixels) == w*h*4`).
+- **D3D12-Upload-Queue**: Textur-/Cubemap-/Buffer-Uploads und RT-Initial-Clears laufen
+  über einen Allocator-Ring (3) + eine Upload-Command-List mit Fence-Signal statt
+  `wait_for_gpu()` pro Ressource; Staging-Buffer werden in `begin_frame` per Fence
+  freigegeben. Ordnung ist durch die eine DIRECT-Queue garantiert (Test `103`: mid-frame
+  erzeugte/aktualisierte Texturen sind im selben Frame sichtbar). Statische Mesh-VB/IB
+  liegen im DEFAULT-Heap. SRV-Tables starten aus einem vorgebauten Null-Block
+  (1 `CopyDescriptorsSimple` statt 16 `CreateShaderResourceView`).
+- **Vulkan**: persistenter Transient-Pool + Fence für Uploads/Dispatches. **D3D11**:
+  `gpu_flush` yieldet statt zu spinnen. **FXC**: `OPTIMIZATION_LEVEL3` (Release).
+- Debug: `VIO_DUMP_HLSL=1` druckt das transpilierte Grafik-HLSL (wie `VIO_DUMP_CS_HLSL`).
+- **2D-Batch hält Referenzen** auf `VioFont`/`VioTexture` seiner Items (`vio_2d_item.owner`),
+  ein Font darf also nach `vio_text` vor `vio_draw_2d` freigegeben werden (vorher Crash auf D3D).
+- **`in mat4`-Vertex-Attribute** werden aus der Reflection auf 4 Locations expandiert
+  (`vio_vertex_attrib.matrix_columns/matrix_column`); D3D-Input-Layouts nutzen die SPIRV-Cross-
+  Semantik `TEXCOORD{loc}_{col}`. `vio_draw_instanced_from_buffer` bindet Uniforms wie `vio_draw`.
+- **Gallery**: `examples/gallery.php [backend] [outdir] [scene,…]` rendert alle Feature-Pfade
+  headless nach `docs/gallery/*.png` (README-Abschnitt „Gallery"). Auf D3D12 fehlt nur MSAA
+  (dort auf D3D11 gerendert).
+
 ## Bekannte Einschränkungen
 
 - **Vulkan hat keine 3D-Pipeline** (`VIO_FEATURE_3D_PIPELINE == 0`); 2D, Render-Targets,
   Compute und read_pixels funktionieren dort. Vulkan: kein Cubemap, kein HDR/Depth-only/MSAA-RT.
+  `auto` wählt deshalb OpenGL vor Vulkan (siehe GAP-Plan Phase 0.4 / Phase 5).
+- **D3D12 RT-MSAA** fehlt (`RENDER_TARGET_MSAA = 0`): braucht `vio_pipeline(['samples' => N])`,
+  weil die PSO ihr `SampleDesc` kennen muss — zusammen mit Stencil (R3) in einem PSO-State-PR.
+- **Input-Layout auf D3D/Metal** kommt aus der Shader-Reflection (Attribute dicht gepackt in
+  Location-Reihenfolge), nicht aus dem Mesh-Layout: ein Mesh mit Lücken/anderer Reihenfolge
+  (`['location' => 7, …]` zwischen 0 und 1) liest auf D3D falsche Offsets; OpenGL nutzt das
+  Mesh-VAO. Meshes in Location-Reihenfolge ohne Lücken anlegen.
+- `vio_mouse_position`/`vio_mouse_delta` teilen auf Windows durch den GLFW-Content-Scale
+  (physische → logische Cursor-Pixel); im Headless-Modus ist der Scale 1 (injizierte
+  Koordinaten sind logisch) — vorher schlug `026` auf jedem HiDPI-Windows-Host fehl.
 - Metal: max. 8 PSO-Varianten (Zielformat × Mesh-Stride × Samples) pro Pipeline und 8
   2D-Varianten; Texturen sind `MTLStorageModeShared` (Apple Silicon); kein Geometry-/
   Tessellation-Stage (Metal-Limitierung).
@@ -785,7 +858,8 @@ gegen die Homebrew-Formel mit identischer Modul-API und das `.so` dann in Herd e
   PSOs bis zum Fence des aufzeichnenden Frames).
 - Vulkan auf macOS braucht `VK_DRIVER_FILES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json` + `DYLD_LIBRARY_PATH=/usr/local/lib` (SIP blockiert letzteres in Subprozessen). Auto-Auswahl vermeidet Vulkan auf macOS zugunsten von Metal.
 - VideoToolbox-Encoder kann in headless fehlschlagen → Fallback auf libx264
-- `php_vio.c` ist monolithisch (~9000 Zeilen) — alle PHP-Funktionen in einer Datei
+- `php_vio.c` ist monolithisch (~9050 Zeilen) — alle PHP-Funktionen in einer Datei; Audit-Gate
+  `099` hält die Zahl der Backend-Zweige darin auf dem heutigen Stand oder darunter.
 - SPIRV-Cross hat keine Homebrew-Formel; ohne `--with-spirv-cross` kann Metal kein
   GLSL→MSL übersetzen und jeder Shader scheitert (`Makefile.macos` baut es aus `.deps/`).
 - Ungepatchtes SPIRV-Cross (auch Homebrew/CI) hat den Struct-Array-Stride-Bug im

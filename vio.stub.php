@@ -462,7 +462,10 @@ function vio_bind_pipeline(VioContext $context, VioPipeline $pipeline): void {}
 /**
  * Load a texture from file or raw pixel data.
  *
- * @param array $config ['file' => string] or ['data' => string, 'width' => int, 'height' => int], plus optional 'filter', 'wrap', 'mipmaps'
+ * @param array $config ['file' => string] or ['data' => string, 'width' => int, 'height' => int], plus optional
+ *                      'filter' (VIO_FILTER_*), 'wrap' (VIO_WRAP_*), 'mipmaps' (bool),
+ *                      'anisotropy' (1..16, anisotropic filtering with a LINEAR filter; off by default),
+ *                      'storage' (bool, compute image2D target)
  * @return VioTexture|false Texture object or false on failure
  */
 function vio_texture(VioContext $context, array $config): VioTexture|false {}

@@ -16,6 +16,23 @@ A PHP extension that brings GPU rendering, audio, video recording, streaming, an
 - **Plugin System** — Extensible output/input/filter plugins
 - **Cross-Platform** — macOS, Linux, Windows
 
+## Gallery
+
+Every image below is rendered headless by [`examples/gallery.php`](examples/gallery.php)
+(`php -d extension=vio examples/gallery.php [backend]`); the PNGs live in `docs/gallery/`.
+They double as a smoke test of each feature path on a real backend.
+
+| | |
+|---|---|
+| ![2D shapes](docs/gallery/2d_shapes.png) `vio_rect` / `vio_circle` / `vio_line`, z-sorted batch | ![Sprites and text](docs/gallery/2d_sprites_text.png) `vio_sprite` + `vio_text` (HarfBuzz shaping, RTL, Thai, word wrap) |
+| ![3D lit meshes](docs/gallery/3d_lit_meshes.png) `vio_mesh` / `vio_shader` / `vio_pipeline`, GLSL → SPIR-V → HLSL/MSL | ![Instancing](docs/gallery/instancing.png) `vio_draw_instanced`, 400 cubes in one draw |
+| ![Render target post-process](docs/gallery/render_target_postprocess.png) `vio_render_target` → post-process pass | ![Cube environment](docs/gallery/cubemap_environment.png) Cube render target + `vio_generate_mipmaps` → `textureLod` by roughness |
+| ![MRT G-buffer](docs/gallery/mrt_gbuffer.png) Multiple render targets (RGBA8 / RGBA16F / R16F) | ![MSAA](docs/gallery/msaa_render_target.png) `['samples' => 4]` render target, resolved |
+| ![Sampler filter and wrap](docs/gallery/sampler_filter_wrap.png) `filter` × `wrap` sampler grid | ![Anisotropy](docs/gallery/anisotropy.png) `['anisotropy' => 16]` vs. trilinear |
+| ![Compute storage image](docs/gallery/compute_storage_image.png) Compute shader → `image2D` storage texture | ![Compute vertex storage](docs/gallery/compute_vertex_storage.png) Compute writes instance matrices, the vertex stage reads them (no readback) |
+| ![3D texture](docs/gallery/texture_3d_volume.png) `vio_texture_3d` ray-marched via `sampler3D` | ![Shadow map](docs/gallery/shadow_map.png) Depth-only render target → PCF shadows |
+| ![HDR tone mapping](docs/gallery/hdr_tonemap.png) `['hdr' => true]` RGBA16F target + ACES | |
+
 ## Requirements
 
 - PHP >= 8.5

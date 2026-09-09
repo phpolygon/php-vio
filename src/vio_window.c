@@ -143,6 +143,13 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
      * 64×48 used to get 120×48 on a 1.875× display). */
     if (!cfg->headless) {
         glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+    } else {
+        /* Undecorated: a decorated (WS_OVERLAPPEDWINDOW) window has an OS
+         * minimum width, so a hidden 32x32 headless window came back with a
+         * ~350px client area — and backends that render into the swapchain /
+         * surface (D3D11, D3D12, Vulkan) sized it from that. WS_POPUP has no
+         * such minimum, so the surface matches the requested size 1:1. */
+        glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
     }
 
     int is_opengl = (backend_name && strcmp(backend_name, "opengl") == 0);
@@ -204,6 +211,8 @@ GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name)
             glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
             if (!cfg->headless) {
                 glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+            } else {
+                glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
             }
             if (cfg->samples > 0) {
                 glfwWindowHint(GLFW_SAMPLES, cfg->samples);

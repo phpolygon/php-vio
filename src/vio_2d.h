@@ -54,6 +54,12 @@ typedef struct _vio_2d_item {
     int                 vertex_start;
     int                 vertex_count;
     vio_2d_scissor_rect scissor;      /* scissor state at time of push */
+    /* zend_object* that owns backend_texture (VioTexture / VioFont), with one
+     * reference held by the batch (GC_ADDREF at push, released when the items
+     * are cleared). Without it a sprite texture / font freed between vio_sprite
+     * / vio_text and vio_draw_2d left a dangling backend_texture in the batch —
+     * a use-after-free on D3D11 / D3D12 (OpenGL merely samples a deleted name). */
+    void               *owner;
 } vio_2d_item;
 
 /* Backend type for 2D renderer */
@@ -108,6 +114,13 @@ int  vio_2d_push_vertices(vio_2d_state *state, const vio_2d_vertex *verts, int c
 void vio_2d_push_item(vio_2d_state *state, vio_2d_item_type type, float z,
                        unsigned int texture_id, void *backend_texture,
                        int vert_start, int vert_count);
+
+/* Same, for textured items: `owner` is the zend_object of the VioTexture /
+ * VioFont behind backend_texture. The batch takes a reference (GC_ADDREF) and
+ * releases it when the items are cleared (vio_2d_begin / vio_2d_shutdown). */
+void vio_2d_push_item_owned(vio_2d_state *state, vio_2d_item_type type, float z,
+                             unsigned int texture_id, void *backend_texture,
+                             int vert_start, int vert_count, void *owner);
 
 /* Flush all batched items sorted by z-order, then texture */
 void vio_2d_flush(vio_2d_state *state);

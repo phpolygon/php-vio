@@ -24,6 +24,7 @@ typedef struct _vio_texture_object {
     int          channels;
     vio_filter   filter;
     vio_wrap     wrap;
+    int          anisotropy;    /* vio_texture(['anisotropy' => N]), 0/1 = off */
     int          valid;
     int          borrowed;      /* 1 if texture_id is owned by another object (e.g. render target) */
     int          storage;       /* 1 => created with 'storage' => true (compute image2D/3D target) */

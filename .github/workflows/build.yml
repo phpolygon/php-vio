@@ -438,7 +438,16 @@ jobs:
             tests/backends/095_texture_bind_order.phpt `
             tests/render3d/096_storage_image.phpt `
             tests/render3d/097_mrt.phpt `
-            tests/render3d/098_async_compute.phpt
+            tests/render3d/098_async_compute.phpt `
+            tests/core/074_backend_capability_matrix.phpt `
+            tests/core/099_audit_gate_backend_branches.phpt `
+            tests/core/100_auto_backend_prefers_3d.phpt `
+            tests/render3d/101_sampler_filter_wrap.phpt `
+            tests/render3d/102_cube_rt_mipmaps_readback_all_backends.phpt `
+            tests/render3d/103_midframe_texture_upload_ordering.phpt `
+            tests/render3d/104_anisotropy_option.phpt `
+            tests/render3d/105_render_target_msaa_resolve.phpt `
+            tests/backends/106_vulkan_present_mode.phpt
 
       - name: Package binary
         shell: pwsh
