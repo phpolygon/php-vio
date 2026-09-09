@@ -32,7 +32,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
+          # The runner image ships third-party apt sources (Google Chrome,
+          # Microsoft Edge, …) whose mirrors intermittently answer with
+          # "Hash Sum mismatch" and take the whole job down. We only need
+          # Ubuntu's own archive, so drop them and retry once.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/microsoft-edge*.list
+          sudo apt-get update || (sleep 15 && sudo apt-get update)
           sudo apt-get install -y \
             libglfw3-dev \
             glslang-dev \
@@ -113,7 +118,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
+          # The runner image ships third-party apt sources (Google Chrome,
+          # Microsoft Edge, …) whose mirrors intermittently answer with
+          # "Hash Sum mismatch" and take the whole job down. We only need
+          # Ubuntu's own archive, so drop them and retry once.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/microsoft-edge*.list
+          sudo apt-get update || (sleep 15 && sudo apt-get update)
           sudo apt-get install -y \
             libglfw3-dev \
             glslang-dev \
