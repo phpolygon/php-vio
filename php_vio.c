@@ -426,20 +426,9 @@ ZEND_FUNCTION(vio_poll_events)
 #endif
 }
 
-#ifdef HAVE_D3D12
-/* Defined further down (next to vio_bind_render_target); forward-declared here
- * so vio_begin() can flush a render-target bind that was requested before the
- * frame's command list was open. */
-static void d3d12_record_bind_render_target(vio_render_target_object *rt);
-#endif
 
-#ifdef HAVE_D3D11
-/* Defined further down (next to vio_bind_render_target); forward-declared here
- * so vio_begin() can re-apply an offscreen render-target bind that was
- * requested before the frame began (and would otherwise be clobbered by
- * d3d11_begin_frame()'s current_rtv = rtv reset). */
-static void d3d11_apply_render_target_bind(vio_render_target_object *rt);
-#endif
+
+
 
 ZEND_FUNCTION(vio_begin)
 {
@@ -605,15 +594,10 @@ ZEND_FUNCTION(vio_begin)
      * finally be recorded. Without this, a pre-begin vio_bind_render_target on
      * D3D12 is dropped and draws hit the swapchain instead of the offscreen
      * target (the warm-render "bind then begin" order). */
-    if (vio_d3d12.initialized && vio_d3d12.pending_bound_rt
-            && strcmp(ctx->backend->name, "d3d12") == 0) {
-        vio_render_target_object *prt =
-            (vio_render_target_object *)vio_d3d12.pending_bound_rt;
-        vio_d3d12.pending_bound_rt = NULL;
-        if (prt->valid) {
-            d3d12_record_bind_render_target(prt);
-        }
+    if (strcmp(ctx->backend->name, "d3d12") == 0) {
+        vio_d3d12_apply_pending_render_target();
     }
+
 #endif
 
 #ifdef HAVE_D3D11
@@ -632,15 +616,10 @@ ZEND_FUNCTION(vio_begin)
      * and the immediate-context state is identical to pre-fix. The
      * vio_d3d11.initialized + backend-name guard ensures this never touches a
      * non-D3D11 context. */
-    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized
-            && vio_d3d11.pending_bound_rt) {
-        vio_render_target_object *prt =
-            (vio_render_target_object *)vio_d3d11.pending_bound_rt;
-        vio_d3d11.pending_bound_rt = NULL;
-        if (prt->valid) {
-            d3d11_apply_render_target_bind(prt);
-        }
+    if (strcmp(ctx->backend->name, "d3d11") == 0) {
+        vio_d3d11_apply_pending_render_target();
     }
+
 #endif
 
 #ifdef HAVE_VULKAN
@@ -7838,533 +7817,18 @@ ZEND_FUNCTION(vio_render_target)
     rt->attachment_count = attachment_count;
     memcpy(rt->formats, formats, sizeof(formats));
 
-    /* OpenGL + Metal go through the vtable; D3D11/D3D12 still inline below
-     * until their backends implement create_render_target. */
-    if (ctx->backend->create_render_target &&
-        (strcmp(ctx->backend->name, "opengl") == 0 ||
-         strcmp(ctx->backend->name, "metal") == 0)) {
+    /* Every backend builds its resources through the create_render_target slot
+     * and sets rt->backend_type. */
+    if (ctx->backend->create_render_target) {
+
         if (ctx->backend->create_render_target(rt, width, height, hdr, depth_only) != 0) {
             zval_ptr_dtor(&rt_zval);
             RETURN_FALSE;
         }
     }
-
-#ifdef HAVE_D3D11
-    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
-        HRESULT hr;
-
-        /* Depth texture */
-        D3D11_TEXTURE2D_DESC depth_desc = {0};
-        depth_desc.Width = width;
-        depth_desc.Height = height;
-        depth_desc.MipLevels = 1;
-        depth_desc.ArraySize = 1;
-        depth_desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
-        depth_desc.SampleDesc.Count = 1;
-        depth_desc.Usage = D3D11_USAGE_DEFAULT;
-        depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
-
-        ID3D11Texture2D *depth_tex = NULL;
-        hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &depth_desc, NULL, &depth_tex);
-        if (FAILED(hr)) {
-            php_error_docref(NULL, E_WARNING, "D3D11: Failed to create depth texture (0x%08lx)", hr);
-            zval_ptr_dtor(&rt_zval);
-            RETURN_FALSE;
-        }
-
-        /* DSV */
-        D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
-        dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-
-        ID3D11DepthStencilView *dsv = NULL;
-        hr = ID3D11Device_CreateDepthStencilView(vio_d3d11.device, (ID3D11Resource *)depth_tex,
-                                                  &dsv_desc, &dsv);
-        if (FAILED(hr)) {
-            ID3D11Texture2D_Release(depth_tex);
-            php_error_docref(NULL, E_WARNING, "D3D11: Failed to create DSV (0x%08lx)", hr);
-            zval_ptr_dtor(&rt_zval);
-            RETURN_FALSE;
-        }
-
-        /* SRV for depth (for shadow map sampling) */
-        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
-        srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srv_desc.Texture2D.MipLevels = 1;
-
-        ID3D11ShaderResourceView *depth_srv = NULL;
-        ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)depth_tex,
-                                               &srv_desc, &depth_srv);
-
-        rt->d3d11_dsv = dsv;
-        rt->d3d11_depth_tex = depth_tex;
-        rt->d3d11_depth_srv = depth_srv;
-
-        if (!depth_only) {
-            /* One colour texture + RTV + SRV per attachment (MRT). Index 0 also
-             * fills the legacy scalar slots. */
-            for (int ai = 0; ai < attachment_count; ai++) {
-                DXGI_FORMAT dxfmt = vio_pixel_format_to_dxgi(formats[ai]);
-                D3D11_TEXTURE2D_DESC color_desc = {0};
-                color_desc.Width = width;
-                color_desc.Height = height;
-                color_desc.MipLevels = 1;
-                color_desc.ArraySize = 1;
-                color_desc.Format = dxfmt;
-                color_desc.SampleDesc.Count = 1;
-                color_desc.Usage = D3D11_USAGE_DEFAULT;
-                color_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-                ID3D11Texture2D *color_tex = NULL;
-                hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &color_desc, NULL, &color_tex);
-                if (FAILED(hr)) {
-                    php_error_docref(NULL, E_WARNING, "D3D11: Failed to create color texture %d (0x%08lx)", ai, hr);
-                    rt->backend_type = VIO_RT_BACKEND_D3D11;   /* let the free handler release what exists */
-                    zval_ptr_dtor(&rt_zval);
-                    RETURN_FALSE;
-                }
-
-                ID3D11RenderTargetView *rtv = NULL;
-                hr = ID3D11Device_CreateRenderTargetView(vio_d3d11.device, (ID3D11Resource *)color_tex,
-                                                          NULL, &rtv);
-                if (FAILED(hr)) {
-                    ID3D11Texture2D_Release(color_tex);
-                    php_error_docref(NULL, E_WARNING, "D3D11: Failed to create RTV %d (0x%08lx)", ai, hr);
-                    rt->backend_type = VIO_RT_BACKEND_D3D11;
-                    zval_ptr_dtor(&rt_zval);
-                    RETURN_FALSE;
-                }
-
-                /* SRV for sampling the attachment in later passes */
-                ID3D11ShaderResourceView *color_srv = NULL;
-                D3D11_SHADER_RESOURCE_VIEW_DESC color_srv_desc = {0};
-                color_srv_desc.Format = dxfmt;
-                color_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                color_srv_desc.Texture2D.MipLevels = 1;
-                ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)color_tex, &color_srv_desc, &color_srv);
-
-                rt->d3d11_rtvs[ai]       = rtv;
-                rt->d3d11_color_texs[ai] = color_tex;
-                rt->d3d11_color_srvs[ai] = color_srv;
-            }
-            rt->d3d11_rtv       = rt->d3d11_rtvs[0];
-            rt->d3d11_color_tex = rt->d3d11_color_texs[0];
-            rt->d3d11_color_srv = rt->d3d11_color_srvs[0];
-        }
-
-        /* Defined initial contents (colour 0, depth 1.0) like GL / Metal, so a
-         * target that is bound and drawn into without an explicit clear still
-         * depth-tests. */
-        {
-            float zero[4] = {0, 0, 0, 0};
-            for (int ai = 0; ai < attachment_count && !depth_only; ai++) {
-                if (rt->d3d11_rtvs[ai]) ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, (ID3D11RenderTargetView *)rt->d3d11_rtvs[ai], zero);
-            }
-            ID3D11DeviceContext_ClearDepthStencilView(vio_d3d11.context, dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
-        }
-
-        rt->backend_type = VIO_RT_BACKEND_D3D11;
-    }
-#endif
-
-#ifdef HAVE_D3D12
-    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
-        HRESULT hr;
-
-        /* Create dedicated RTV descriptor heap (one descriptor per attachment) */
-        if (!depth_only) {
-            D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {0};
-            rtv_heap_desc.NumDescriptors = (UINT)attachment_count;
-            rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-
-            ID3D12DescriptorHeap *rtv_heap = NULL;
-            hr = ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &rtv_heap_desc,
-                                                    &IID_ID3D12DescriptorHeap, (void **)&rtv_heap);
-            if (FAILED(hr)) {
-                php_error_docref(NULL, E_WARNING, "D3D12: Failed to create RTV heap (0x%08lx)", hr);
-                zval_ptr_dtor(&rt_zval);
-                RETURN_FALSE;
-            }
-            rt->d3d12_rtv_heap = rtv_heap;
-
-            /* Colour resources: one per attachment, RTV i at heap slot i. */
-            D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
-            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtv_heap, &rtv_handle);
-            for (int ai = 0; ai < attachment_count; ai++) {
-                DXGI_FORMAT dxfmt = vio_pixel_format_to_dxgi(formats[ai]);
-                D3D12_HEAP_PROPERTIES heap_props = {0};
-                heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-                D3D12_RESOURCE_DESC res_desc = {0};
-                res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-                res_desc.Width = width;
-                res_desc.Height = height;
-                res_desc.DepthOrArraySize = 1;
-                res_desc.MipLevels = 1;
-                res_desc.Format = dxfmt;
-                res_desc.SampleDesc.Count = 1;
-                res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-
-                D3D12_CLEAR_VALUE clear_val = {0};
-                clear_val.Format = dxfmt;
-
-                ID3D12Resource *color_res = NULL;
-                hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props,
-                    D3D12_HEAP_FLAG_NONE, &res_desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    &clear_val, &IID_ID3D12Resource, (void **)&color_res);
-                if (FAILED(hr)) {
-                    php_error_docref(NULL, E_WARNING, "D3D12: Failed to create color resource %d (0x%08lx)", ai, hr);
-                    rt->backend_type = VIO_RT_BACKEND_D3D12;   /* free handler releases what exists */
-                    zval_ptr_dtor(&rt_zval);
-                    RETURN_FALSE;
-                }
-                rt->d3d12_color_resources[ai] = color_res;
-
-                D3D12_CPU_DESCRIPTOR_HANDLE h = { rtv_handle.ptr + (SIZE_T)ai * vio_d3d12.rtv_descriptor_size };
-                ID3D12Device_CreateRenderTargetView(vio_d3d12.device, color_res, NULL, h);
-            }
-            rt->d3d12_color_resource = rt->d3d12_color_resources[0];
-        }
-
-        /* DSV descriptor heap */
-        D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc = {0};
-        dsv_heap_desc.NumDescriptors = 1;
-        dsv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-
-        ID3D12DescriptorHeap *dsv_heap = NULL;
-        hr = ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &dsv_heap_desc,
-                                                &IID_ID3D12DescriptorHeap, (void **)&dsv_heap);
-        if (FAILED(hr)) {
-            if (rt->d3d12_color_resource) {
-                ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
-                rt->d3d12_color_resource = NULL;
-            }
-            if (rt->d3d12_rtv_heap) {
-                ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap);
-                rt->d3d12_rtv_heap = NULL;
-            }
-            php_error_docref(NULL, E_WARNING, "D3D12: Failed to create DSV heap (0x%08lx)", hr);
-            zval_ptr_dtor(&rt_zval);
-            RETURN_FALSE;
-        }
-        rt->d3d12_dsv_heap = dsv_heap;
-
-        /* Depth resource */
-        D3D12_HEAP_PROPERTIES depth_heap_props = {0};
-        depth_heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-        D3D12_RESOURCE_DESC depth_res_desc = {0};
-        depth_res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        depth_res_desc.Width = width;
-        depth_res_desc.Height = height;
-        depth_res_desc.DepthOrArraySize = 1;
-        depth_res_desc.MipLevels = 1;
-        depth_res_desc.Format = depth_only ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_D24_UNORM_S8_UINT;
-        depth_res_desc.SampleDesc.Count = 1;
-        depth_res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-
-        D3D12_CLEAR_VALUE depth_clear = {0};
-        depth_clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        depth_clear.DepthStencil.Depth = 1.0f;
-
-        ID3D12Resource *depth_res = NULL;
-        hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &depth_heap_props,
-            D3D12_HEAP_FLAG_NONE, &depth_res_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
-            &depth_clear, &IID_ID3D12Resource, (void **)&depth_res);
-        if (FAILED(hr)) {
-            ID3D12DescriptorHeap_Release(dsv_heap);
-            if (rt->d3d12_color_resource) {
-                ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
-                rt->d3d12_color_resource = NULL;
-            }
-            if (rt->d3d12_rtv_heap) {
-                ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap);
-                rt->d3d12_rtv_heap = NULL;
-            }
-            php_error_docref(NULL, E_WARNING, "D3D12: Failed to create depth resource (0x%08lx)", hr);
-            zval_ptr_dtor(&rt_zval);
-            RETURN_FALSE;
-        }
-        rt->d3d12_depth_resource = depth_res;
-
-        /* Create DSV (explicit format for typeless resources) */
-        D3D12_DEPTH_STENCIL_VIEW_DESC dsv_view_desc = {0};
-        dsv_view_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        dsv_view_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsv_heap, &dsv_handle);
-        ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res,
-            depth_only ? &dsv_view_desc : NULL, dsv_handle);
-
-        /* For depth-only targets: pre-create SRV for shadow map sampling.
-         * SRV must live in the staging (non-shader-visible) heap so it can
-         * serve as the source operand of CopyDescriptorsSimple inside
-         * vio_d3d12_flush_srv_table. The GPU handle still indexes into the
-         * matching slot of the shader-visible heap. */
-        if (depth_only && vio_d3d12.srv_heap.count < vio_d3d12.srv_heap.capacity) {
-            UINT srv_idx = vio_d3d12.srv_heap.capacity - 1 - vio_d3d12.srv_heap.count;
-            vio_d3d12.srv_heap.count++;
-            D3D12_CPU_DESCRIPTOR_HANDLE staging_cpu;
-            D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu;
-            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &staging_cpu);
-            ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &srv_gpu);
-            staging_cpu.ptr += srv_idx * vio_d3d12.srv_heap.descriptor_size;
-            srv_gpu.ptr     += srv_idx * vio_d3d12.srv_heap.descriptor_size;
-
-            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
-            srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-            srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srv_desc.Texture2D.MipLevels = 1;
-            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, depth_res, &srv_desc, staging_cpu);
-
-            rt->d3d12_depth_srv_gpu = srv_gpu.ptr;
-            rt->d3d12_depth_srv_cpu = staging_cpu.ptr;
-        }
-
-        /* For color targets: pre-create one SRV per attachment for sampling.
-         * Same staging-heap pattern as the depth-only branch above. */
-        for (int ai = 0; !depth_only && ai < attachment_count; ai++) {
-            if (!rt->d3d12_color_resources[ai] || vio_d3d12.srv_heap.count >= vio_d3d12.srv_heap.capacity) break;
-            UINT color_srv_idx = vio_d3d12.srv_heap.capacity - 1 - vio_d3d12.srv_heap.count;
-            vio_d3d12.srv_heap.count++;
-            D3D12_CPU_DESCRIPTOR_HANDLE color_staging_cpu;
-            D3D12_GPU_DESCRIPTOR_HANDLE color_srv_gpu;
-            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &color_staging_cpu);
-            ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &color_srv_gpu);
-            color_staging_cpu.ptr += color_srv_idx * vio_d3d12.srv_heap.descriptor_size;
-            color_srv_gpu.ptr     += color_srv_idx * vio_d3d12.srv_heap.descriptor_size;
-
-            D3D12_SHADER_RESOURCE_VIEW_DESC color_srv_desc = {0};
-            color_srv_desc.Format = vio_pixel_format_to_dxgi(formats[ai]);
-            color_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            color_srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            color_srv_desc.Texture2D.MipLevels = 1;
-            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, (ID3D12Resource *)rt->d3d12_color_resources[ai], &color_srv_desc, color_staging_cpu);
-
-            rt->d3d12_color_srv_gpus[ai] = color_srv_gpu.ptr;
-            rt->d3d12_color_srv_cpus[ai] = color_staging_cpu.ptr;
-            if (ai == 0) {
-                rt->d3d12_color_srv_gpu = color_srv_gpu.ptr;
-                rt->d3d12_color_srv_cpu = color_staging_cpu.ptr;
-            }
-        }
-
-        /* Defined initial contents (colour 0, depth 1.0) like GL / Metal: the
-         * resources sit in RENDER_TARGET / DEPTH_WRITE right after creation, so
-         * a transient list can clear them without barriers. */
-        {
-            ID3D12CommandAllocator *alloc = NULL;
-            ID3D12GraphicsCommandList *list = NULL;
-            hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                     &IID_ID3D12CommandAllocator, (void **)&alloc);
-            if (SUCCEEDED(hr)) {
-                hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
-                                                    &IID_ID3D12GraphicsCommandList, (void **)&list);
-            }
-            if (SUCCEEDED(hr)) {
-                float zero[4] = {0, 0, 0, 0};
-                if (!depth_only && rt->d3d12_rtv_heap) {
-                    D3D12_CPU_DESCRIPTOR_HANDLE rtv0;
-                    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &rtv0);
-                    for (int ai = 0; ai < attachment_count; ai++) {
-                        D3D12_CPU_DESCRIPTOR_HANDLE h = { rtv0.ptr + (SIZE_T)ai * vio_d3d12.rtv_descriptor_size };
-                        ID3D12GraphicsCommandList_ClearRenderTargetView(list, h, zero, 0, NULL);
-                    }
-                }
-                ID3D12GraphicsCommandList_ClearDepthStencilView(list, dsv_handle,
-                    D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
-                ID3D12GraphicsCommandList_Close(list);
-                ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-                ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
-                vio_d3d12_wait_for_gpu();
-            }
-            if (list)  ID3D12GraphicsCommandList_Release(list);
-            if (alloc) ID3D12CommandAllocator_Release(alloc);
-        }
-
-        rt->backend_type = VIO_RT_BACKEND_D3D12;
-    }
-#endif
-
-#ifdef HAVE_VULKAN
-    if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
-        /* Parallel to the d3d12 inline block: create the per-target Vulkan
-         * resources (color image+view, optional depth, a render-pass-compatible
-         * VkRenderPass, framebuffer, sampler) and tag the backend type. */
-        if (vulkan_create_render_target(rt, width, height, hdr, depth_only) != 0) {
-            zval_ptr_dtor(&rt_zval);
-            RETURN_FALSE;
-        }
-        rt->backend_type = VIO_RT_BACKEND_VULKAN;
-    }
-#endif
-
     rt->valid = 1;
     RETURN_COPY_VALUE(&rt_zval);
 }
-
-#ifdef HAVE_D3D12
-/* Record the D3D12 commands that make `rt` the active render target.
- * Caller MUST ensure the command list is open (vio_d3d12.in_frame == 1) —
- * every call here lands on vio_d3d12.cmd_list, which only accepts commands
- * between d3d12_begin_frame()'s Reset() and d3d12_end_frame()'s Close().
- * Out-of-frame binds are deferred via vio_d3d12.pending_bound_rt and applied
- * from vio_begin(). */
-static void d3d12_record_bind_render_target(vio_render_target_object *rt)
-{
-    /* Barrier: transition the OUTGOING render target's depth back to a samplable
-     * state before we bind the new one. Without this, only the final
-     * vio_unbind_render_target transitions one target (the last-bound) to
-     * PIXEL_SHADER_RESOURCE — so when the engine renders multiple depth-only
-     * targets in sequence (e.g. the CSM cascade loop binds cascade 0, 1, 2 in
-     * turn with a single unbind afterwards), cascades 0 and 1 are left in
-     * DEPTH_WRITE and read back as NULL/garbage when the mesh pass samples them.
-     * Moving the DEPTH_WRITE->PIXEL_SHADER_RESOURCE transition here makes every
-     * previously-bound depth target samplable as soon as a new one is bound,
-     * regardless of how many targets the engine cycles through per unbind. */
-    if (vio_d3d12.current_bound_rt && vio_d3d12.current_bound_rt != rt) {
-        vio_render_target_object *prev = (vio_render_target_object *)vio_d3d12.current_bound_rt;
-        if (prev->d3d12_depth_resource && prev->depth_only && !prev->d3d12_depth_is_srv) {
-            D3D12_RESOURCE_BARRIER barrier = {0};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = (ID3D12Resource *)prev->d3d12_depth_resource;
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
-            prev->d3d12_depth_is_srv = 1;
-        }
-    }
-
-    /* Barrier: if the colour resources were used as SRVs, transition every
-     * attachment back to RENDER_TARGET (one flag covers the whole MRT set). */
-    if (rt->d3d12_color_resource && rt->d3d12_color_is_srv) {
-        int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
-        for (int ai = 0; ai < n && ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
-            ID3D12Resource *res = ai == 0 ? (ID3D12Resource *)rt->d3d12_color_resource
-                                          : (ID3D12Resource *)rt->d3d12_color_resources[ai];
-            if (!res) continue;
-            D3D12_RESOURCE_BARRIER barrier = {0};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = res;
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
-        }
-        rt->d3d12_color_is_srv = 0;
-    }
-
-    /* Barrier: if depth resource was used as SRV, transition back to DEPTH_WRITE */
-    if (rt->d3d12_depth_resource && rt->d3d12_depth_is_srv) {
-        D3D12_RESOURCE_BARRIER barrier = {0};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = (ID3D12Resource *)rt->d3d12_depth_resource;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
-        rt->d3d12_depth_is_srv = 0;
-    }
-
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
-    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
-        (ID3D12DescriptorHeap *)rt->d3d12_dsv_heap, &dsv_handle);
-
-    if (rt->depth_only) {
-        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 0, NULL, FALSE, &dsv_handle);
-        vio_d3d12.current_has_rtv = 0;
-        vio_d3d12.current_rtv_count = 0;
-    } else {
-        /* RTV i lives at heap slot i (see vio_render_target). */
-        int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
-        if (n > VIO_MAX_COLOR_ATTACHMENTS) n = VIO_MAX_COLOR_ATTACHMENTS;
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv_handles[VIO_MAX_COLOR_ATTACHMENTS];
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv_base;
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(
-            (ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &rtv_base);
-        for (int ai = 0; ai < n; ai++) {
-            rtv_handles[ai].ptr = rtv_base.ptr + (SIZE_T)ai * vio_d3d12.rtv_descriptor_size;
-            vio_d3d12.current_rtvs[ai] = rtv_handles[ai];
-        }
-        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, (UINT)n, rtv_handles, FALSE, &dsv_handle);
-        vio_d3d12.current_rtv = rtv_handles[0];
-        vio_d3d12.current_rtv_count = n;
-        vio_d3d12.current_has_rtv = 1;
-    }
-    vio_d3d12.current_dsv = dsv_handle;
-    vio_d3d12.current_rt_width = rt->width;
-    vio_d3d12.current_rt_height = rt->height;
-
-    D3D12_VIEWPORT vp = {0};
-    vp.Width = (float)rt->width;
-    vp.Height = (float)rt->height;
-    vp.MinDepth = 0.0f;
-    vp.MaxDepth = 1.0f;
-    ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, 1, &vp);
-
-    D3D12_RECT scissor = {0, 0, rt->width, rt->height};
-    ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
-
-    vio_d3d12.current_bound_rt = rt;
-}
-#endif
-
-#ifdef HAVE_D3D11
-/* Make `rt` the active D3D11 render target immediately on the (single,
- * immediate) device context: unbind SRVs to clear any read-as-SRV hazard,
- * OMSetRenderTargets to the offscreen RTV/DSV (or DSV-only for depth_only),
- * track current_rtv/current_dsv/current_rt_width/height, and set the viewport
- * to the RT extent. Caller MUST have verified rt->valid and
- * rt->backend_type == VIO_RT_BACKEND_D3D11.
- *
- * Used in two places: (a) the in-frame / render-to-texture path, called
- * directly from vio_bind_render_target while ctx->in_frame; and (b) the
- * out-of-frame warm-render path, deferred via vio_d3d11.pending_bound_rt and
- * re-applied from vio_begin() AFTER begin_frame() (which would otherwise reset
- * current_rtv = rtv and clobber a pre-begin bind). */
-static void d3d11_apply_render_target_bind(vio_render_target_object *rt)
-{
-    ID3D11RenderTargetView *rtv = (ID3D11RenderTargetView *)rt->d3d11_rtv;
-    ID3D11DepthStencilView *dsv = (ID3D11DepthStencilView *)rt->d3d11_dsv;
-
-    /* Unbind all SRVs to avoid D3D11 resource hazard — a resource cannot be
-     * bound as SRV and RTV/DSV simultaneously. This is critical for post-process
-     * passes that read from one render target while writing to another. */
-    {
-        ID3D11ShaderResourceView *null_srvs[8] = {NULL};
-        ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, 0, 8, null_srvs);
-    }
-
-    if (rt->depth_only) {
-        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 0, NULL, dsv);
-        vio_d3d11.current_rtv = NULL;
-        vio_d3d11.current_rtv_count = 0;
-    } else {
-        /* All colour attachments at once (MRT); index 0 == rtv. */
-        int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
-        if (n > VIO_MAX_COLOR_ATTACHMENTS) n = VIO_MAX_COLOR_ATTACHMENTS;
-        ID3D11RenderTargetView *rtvs[VIO_MAX_COLOR_ATTACHMENTS] = { rtv, NULL, NULL, NULL };
-        for (int ai = 1; ai < n; ai++) rtvs[ai] = (ID3D11RenderTargetView *)rt->d3d11_rtvs[ai];
-        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, (UINT)n, rtvs, dsv);
-        vio_d3d11.current_rtv = rtv;
-        for (int ai = 0; ai < n; ai++) vio_d3d11.current_rtvs[ai] = rtvs[ai];
-        vio_d3d11.current_rtv_count = n;
-    }
-    vio_d3d11.current_dsv = dsv;
-    vio_d3d11.current_rt_width = rt->width;
-    vio_d3d11.current_rt_height = rt->height;
-
-    D3D11_VIEWPORT vp = {0};
-    vp.Width = (float)rt->width;
-    vp.Height = (float)rt->height;
-    vp.MinDepth = 0.0f;
-    vp.MaxDepth = 1.0f;
-    ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
-}
-#endif
 
 ZEND_FUNCTION(vio_bind_render_target)
 {
@@ -8415,49 +7879,13 @@ ZEND_FUNCTION(vio_bind_render_target)
         return;
     }
 
-    if (ctx->backend->bind_render_target &&
-        (rt->backend_type == VIO_RT_BACKEND_OPENGL ||
-         rt->backend_type == VIO_RT_BACKEND_METAL)) {
+    /* Backends with a bind slot (OpenGL, Metal, D3D11, D3D12) handle the
+     * in-frame vs. deferred (pre-vio_begin) cases themselves; Vulkan stays
+     * inline below. */
+
+    if (ctx->backend->bind_render_target) {
         ctx->backend->bind_render_target(rt);
     }
-
-#ifdef HAVE_D3D11
-    if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
-        if (ctx->in_frame) {
-            /* In-frame / render-to-texture path: apply the bind on the
-             * immediate context now, exactly as before. The current frame's
-             * draws will land on the offscreen target. */
-            d3d11_apply_render_target_bind(rt);
-        } else {
-            /* Called before vio_begin() (the warm-render "bind then begin"
-             * order): applying now is pointless because d3d11_begin_frame()
-             * unconditionally resets current_rtv = rtv and re-binds the
-             * backbuffer at the start of the frame, clobbering this bind. Defer
-             * it — vio_begin() re-applies the pending bind AFTER begin_frame(),
-             * so the offscreen redirect survives. Storing the rt (not applying)
-             * is the strict no-op the normal path relies on; only a non-NULL
-             * pending_bound_rt makes vio_begin act. */
-            vio_d3d11.pending_bound_rt = rt;
-        }
-    }
-#endif
-
-#ifdef HAVE_D3D12
-    if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized) {
-        if (vio_d3d12.in_frame) {
-            d3d12_record_bind_render_target(rt);
-        } else {
-            /* Called before vio_begin(): the command list is closed, so the
-             * bind cannot be recorded yet (the D3D12 debug layer would report
-             * "This API cannot be called on a closed command list" at the next
-             * begin_frame InfoQueue drain). Defer it — vio_begin() applies the
-             * pending bind once the frame's list is open. This is what makes
-             * the warm-render "bind then begin" order work on D3D12. */
-            vio_d3d12.pending_bound_rt = rt;
-        }
-    }
-#endif
-
 #ifdef HAVE_VULKAN
     if (rt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.initialized) {
         if (vio_vk.in_frame) {
@@ -8511,9 +7939,13 @@ ZEND_FUNCTION(vio_unbind_render_target)
     }
 
     if (ctx->backend->unbind_render_target &&
-        strcmp(ctx->backend->name, "metal") == 0) {
-        /* Metal manages its swapchain via CAMetalLayer internally; the
-         * default_fbo/width/height parameters are ignored on this backend. */
+        (strcmp(ctx->backend->name, "metal") == 0 || strcmp(ctx->backend->name, "d3d11") == 0 ||
+         strcmp(ctx->backend->name, "d3d12") == 0)) {
+        /* Metal manages its swapchain via CAMetalLayer internally and D3D11 /
+         * D3D12 restore their own backbuffer views; the default_fbo/width/
+         * height parameters are ignored on these backends. */
+
+
         int w = ctx->config.width;
         int h = ctx->config.height;
 #ifdef HAVE_GLFW
@@ -8523,126 +7955,6 @@ ZEND_FUNCTION(vio_unbind_render_target)
 #endif
         ctx->backend->unbind_render_target(0, w, h);
     }
-
-#ifdef HAVE_D3D11
-    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
-        /* Drop any deferred (pre-begin) bind. In the warm-render path the caller
-         * does vio_bind_render_target -> vio_begin -> ... -> vio_end ->
-         * vio_unbind_render_target. By the time we get here vio_begin() has
-         * already consumed the pending bind (cleared it to NULL), so this is
-         * normally a no-op. But if unbind is called WITHOUT an intervening
-         * vio_begin (a bind-then-unbind with no frame), clearing it here ensures
-         * a stale pending RT can't leak into a later, unrelated frame. */
-        vio_d3d11.pending_bound_rt = NULL;
-
-        /* Restore main backbuffer RTV + DSV */
-        vio_d3d11.current_rtv = vio_d3d11.rtv;
-        vio_d3d11.current_dsv = vio_d3d11.dsv;
-        vio_d3d11.current_rt_width = vio_d3d11.width;
-        vio_d3d11.current_rt_height = vio_d3d11.height;
-
-        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 1,
-                                               &vio_d3d11.rtv, vio_d3d11.dsv);
-
-        D3D11_VIEWPORT vp = {0};
-        vp.Width = (float)vio_d3d11.width;
-        vp.Height = (float)vio_d3d11.height;
-        vp.MinDepth = 0.0f;
-        vp.MaxDepth = 1.0f;
-        ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
-    }
-#endif
-
-#ifdef HAVE_D3D12
-    if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
-        if (!vio_d3d12.in_frame) {
-            /* Command list is closed (vio_unbind_render_target called after
-             * vio_end — e.g. VioRenderer2D::endFrame / endOffscreenFrame in the
-             * warm-render path). Recording the restore-swapchain barrier +
-             * OMSetRenderTargets here would hit the closed list and surface as
-             * "This API cannot be called on a closed command list" at the next
-             * begin_frame drain. It's also unnecessary: the next
-             * d3d12_begin_frame() unconditionally rebinds the swapchain target.
-             * Just drop tracked + pending binding so stale state can't leak.
-             *
-             * NOTE: this skips the RENDER_TARGET->PIXEL_SHADER_RESOURCE barrier
-             * the in-frame path records, so the offscreen color stays in
-             * RENDER_TARGET state. That's correct for the only out-of-frame
-             * unbind caller (Engine::warmRender, which discards its offscreen
-             * target without ever sampling it). A render-to-texture caller that
-             * wants to SAMPLE the result must unbind while a frame is open so the
-             * SRV transition is recorded. */
-            vio_d3d12.pending_bound_rt = NULL;
-            vio_d3d12.current_bound_rt = NULL;
-            return;
-        }
-
-        /* Barrier: transition the offscreen depth resource to SRV for shadow sampling.
-         * We find the currently bound RT's depth resource from the DSV heap.
-         * Since we track the RT object via current_dsv, and the depth_resource is stored
-         * on the render target object, we use a flag approach:
-         * If the render target was depth-only, its depth resource needs the barrier. */
-        /* Barrier: transition shadow map depth from DEPTH_WRITE → SRV for sampling */
-        if (vio_d3d12.current_bound_rt) {
-            vio_render_target_object *bound_rt = (vio_render_target_object *)vio_d3d12.current_bound_rt;
-            /* Transition depth to SRV if depth-only target (skip if a subsequent
-             * bind already moved it to PIXEL_SHADER_RESOURCE — see the outgoing-RT
-             * transition in d3d12_record_bind_render_target). */
-            if (bound_rt->d3d12_depth_resource && bound_rt->depth_only && !bound_rt->d3d12_depth_is_srv) {
-                D3D12_RESOURCE_BARRIER barrier = {0};
-                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                barrier.Transition.pResource = (ID3D12Resource *)bound_rt->d3d12_depth_resource;
-                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
-                bound_rt->d3d12_depth_is_srv = 1;
-            }
-            /* Transition every colour attachment to SRV if color target */
-            if (bound_rt->d3d12_color_resource && !bound_rt->depth_only) {
-                int n = bound_rt->attachment_count > 0 ? bound_rt->attachment_count : 1;
-                for (int ai = 0; ai < n && ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
-                    ID3D12Resource *res = ai == 0 ? (ID3D12Resource *)bound_rt->d3d12_color_resource
-                                                  : (ID3D12Resource *)bound_rt->d3d12_color_resources[ai];
-                    if (!res) continue;
-                    D3D12_RESOURCE_BARRIER barrier = {0};
-                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                    barrier.Transition.pResource = res;
-                    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                    ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
-                }
-                bound_rt->d3d12_color_is_srv = 1;
-            }
-            vio_d3d12.current_bound_rt = NULL;
-        }
-
-        /* Restore main swapchain render target */
-        vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
-
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.dsv_heap, &dsv_handle);
-        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1,
-                                                      &frame->rtv_handle, FALSE, &dsv_handle);
-
-        vio_d3d12.current_rtv = frame->rtv_handle;
-        vio_d3d12.current_dsv = dsv_handle;
-        vio_d3d12.current_rt_width = vio_d3d12.width;
-        vio_d3d12.current_rt_height = vio_d3d12.height;
-        vio_d3d12.current_has_rtv = 1;
-
-        D3D12_VIEWPORT vp = {0};
-        vp.Width = (float)vio_d3d12.width;
-        vp.Height = (float)vio_d3d12.height;
-        vp.MinDepth = 0.0f;
-        vp.MaxDepth = 1.0f;
-        ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, 1, &vp);
-
-        D3D12_RECT scissor = {0, 0, vio_d3d12.width, vio_d3d12.height};
-        ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
-    }
-#endif
 
 #ifdef HAVE_VULKAN
     if (strcmp(ctx->backend->name, "vulkan") == 0 && vio_vk.initialized) {
@@ -8798,21 +8110,7 @@ ZEND_FUNCTION(vio_texture_update)
 
 /* CPU readback of a render target (colour, or depth as a grey ramp for
  * depth-only targets) — top-down RGBA8, width*height*4 bytes. Works mid-frame.
- * Backends route through the read_render_target slot; D3D11 reads its inline
- * RT resources here. */
-#ifdef HAVE_D3D11
-static float vio_half_to_float(uint16_t h)
-{
-    uint32_t sign = (uint32_t)(h & 0x8000) << 16, exp = (h >> 10) & 0x1F, mant = h & 0x3FF, bits;
-    if (exp == 0) {
-        if (mant == 0) bits = sign;
-        else { exp = 127 - 15 + 1; while (!(mant & 0x400)) { mant <<= 1; exp--; } mant &= 0x3FF; bits = sign | (exp << 23) | (mant << 13); }
-    } else if (exp == 31) bits = sign | 0x7F800000 | (mant << 13);
-    else bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    float f; memcpy(&f, &bits, 4); return f;
-}
-static unsigned char vio_unit_to_byte(float v) { if (v < 0) v = 0; if (v > 1) v = 1; return (unsigned char)(v * 255.0f + 0.5f); }
-#endif
+ * Every backend routes through the read_render_target slot. */
 
 ZEND_FUNCTION(vio_read_render_target)
 {
@@ -8854,47 +8152,6 @@ ZEND_FUNCTION(vio_read_render_target)
         php_error_docref(NULL, E_WARNING, "vio_read_render_target: readback failed");
         RETURN_FALSE;
     }
-
-#ifdef HAVE_D3D11
-    if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
-        ID3D11Texture2D *src = rt->depth_only ? (ID3D11Texture2D *)rt->d3d11_depth_tex
-                             : (attachment == 0 ? (ID3D11Texture2D *)rt->d3d11_color_tex
-                                                : (ID3D11Texture2D *)rt->d3d11_color_texs[attachment]);
-        if (!src) { zend_string_release(buf); RETURN_FALSE; }
-        D3D11_TEXTURE2D_DESC sd;
-        ID3D11Texture2D_GetDesc(src, &sd);
-        sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
-        ID3D11Texture2D *staging = NULL;
-        if (FAILED(ID3D11Device_CreateTexture2D(vio_d3d11.device, &sd, NULL, &staging))) {
-            zend_string_release(buf); RETURN_FALSE;
-        }
-        ID3D11DeviceContext_CopyResource(vio_d3d11.context, (ID3D11Resource *)staging, (ID3D11Resource *)src);
-        D3D11_MAPPED_SUBRESOURCE m = {0};
-        if (FAILED(ID3D11DeviceContext_Map(vio_d3d11.context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m))) {
-            ID3D11Texture2D_Release(staging); zend_string_release(buf); RETURN_FALSE;
-        }
-        unsigned char *out = (unsigned char *)ZSTR_VAL(buf);
-        int w = rt->width, h = rt->height;
-        if (rt->depth_only) {
-            for (int y = 0; y < h; y++) {
-                const unsigned char *row = (const unsigned char *)m.pData + (size_t)y * m.RowPitch;
-                unsigned char *dst = out + (size_t)y * w * 4;
-                /* R24G8_TYPELESS: low 24 bits = depth */
-                for (int x = 0; x < w; x++) {
-                    uint32_t v = *(const uint32_t *)(row + x * 4) & 0x00FFFFFFu;
-                    unsigned char g = (unsigned char)((v * 255ULL) / 0x00FFFFFFu);
-                    dst[x*4+0] = dst[x*4+1] = dst[x*4+2] = g; dst[x*4+3] = 255;
-                }
-            }
-        } else {
-            /* Shared converter: any attachment format -> RGBA8. */
-            vio_rt_convert_to_rgba8(rt->formats[attachment], 0, m.pData, (size_t)m.RowPitch, w, h, out);
-        }
-        ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)staging, 0);
-        ID3D11Texture2D_Release(staging);
-        RETURN_NEW_STR(buf);
-    }
-#endif
 
     zend_string_release(buf);
     php_error_docref(NULL, E_WARNING, "vio_read_render_target: not supported on backend '%s'", rt->backend->name);
@@ -9036,6 +8293,10 @@ ZEND_FUNCTION(vio_render_target_texture)
                 d3d_tex->height = rt->height;
                 d3d_tex->srv_gpu.ptr = rt->d3d12_depth_srv_gpu;
                 d3d_tex->srv_cpu.ptr = rt->d3d12_depth_srv_cpu;
+                /* Manual-compare depth reads sample POINT / CLAMP (D3D11 uses
+                 * POINT / BORDER-white; hardware PCF goes through the static
+                 * comparison samplers s8+ regardless). */
+                d3d_tex->sampler_index = vio_d3d12_sampler_combo(VIO_FILTER_NEAREST, VIO_WRAP_CLAMP, 1);
                 *cache_slot = d3d_tex;
             } else if (!rt->depth_only && color_srv_gpu) {
                 vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
@@ -9044,6 +8305,8 @@ ZEND_FUNCTION(vio_render_target_texture)
                 d3d_tex->height = rt->height;
                 d3d_tex->srv_gpu.ptr = color_srv_gpu;
                 d3d_tex->srv_cpu.ptr = color_srv_cpu;
+                /* Colour attachments sample LINEAR / CLAMP like D3D11 + GL. */
+                d3d_tex->sampler_index = vio_d3d12_sampler_combo(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, 1);
                 *cache_slot = d3d_tex;
             }
         }
@@ -9159,11 +8422,10 @@ ZEND_FUNCTION(vio_cubemap)
         cm->mipmaps = (mm && zend_is_true(mm)) ? 1 : 0;
     }
 
-    /* OpenGL, Metal and D3D12 go through the vtable; D3D11 stays inline below. */
+    /* Every backend with an upload_cubemap slot (OpenGL, Metal, D3D11, D3D12). */
     int cm_is_metal = strcmp(ctx->backend->name, "metal") == 0;
-    if (ctx->backend->upload_cubemap &&
-        (strcmp(ctx->backend->name, "opengl") == 0 || cm_is_metal ||
-         strcmp(ctx->backend->name, "d3d12") == 0)) {
+    if (ctx->backend->upload_cubemap) {
+
         /* Marshal source data: 6 RGBA8 buffers of (face_w, face_h). The
          * vtable assumes uniform face dimensions — file-based loads use
          * the first face's size, pixel-based reads w/h from config. */
@@ -9264,137 +8526,6 @@ ZEND_FUNCTION(vio_cubemap)
         }
     }
 
-#ifdef HAVE_D3D11
-    if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
-        int res_w = 0, res_h = 0;
-        unsigned char *face_data[6] = {NULL};
-        int face_allocated[6] = {0};
-
-        if (faces_zval && Z_TYPE_P(faces_zval) == IS_ARRAY) {
-            HashTable *faces_ht = Z_ARRVAL_P(faces_zval);
-            if (zend_hash_num_elements(faces_ht) != 6) {
-                php_error_docref(NULL, E_WARNING, "cubemap 'faces' must have exactly 6 entries");
-                zval_ptr_dtor(&cm_zval);
-                RETURN_FALSE;
-            }
-            int face_idx = 0;
-            zval *face_path;
-            ZEND_HASH_FOREACH_VAL(faces_ht, face_path) {
-                if (Z_TYPE_P(face_path) != IS_STRING) goto d3d11_cm_fail;
-                int w, h, ch;
-                face_data[face_idx] = stbi_load(Z_STRVAL_P(face_path), &w, &h, &ch, 4);
-                if (!face_data[face_idx]) goto d3d11_cm_fail;
-                face_allocated[face_idx] = 1;
-                if (face_idx == 0) { res_w = w; res_h = h; }
-                face_idx++;
-            } ZEND_HASH_FOREACH_END();
-        } else if (pixels_zval && Z_TYPE_P(pixels_zval) == IS_ARRAY) {
-            HashTable *pixels_ht = Z_ARRVAL_P(pixels_zval);
-            zval *w_zval = zend_hash_str_find(config_ht, "width", sizeof("width") - 1);
-            zval *h_zval = zend_hash_str_find(config_ht, "height", sizeof("height") - 1);
-            if (!w_zval || !h_zval || zend_hash_num_elements(pixels_ht) != 6) goto d3d11_cm_fail;
-            res_w = (int)zval_get_long(w_zval);
-            res_h = (int)zval_get_long(h_zval);
-            size_t face_size = (size_t)res_w * res_h * 4;
-            int face_idx = 0;
-            zval *face_arr;
-            ZEND_HASH_FOREACH_VAL(pixels_ht, face_arr) {
-                if (Z_TYPE_P(face_arr) != IS_ARRAY) goto d3d11_cm_fail;
-                face_data[face_idx] = emalloc(face_size);
-                face_allocated[face_idx] = 2;
-                size_t j = 0;
-                zval *pv;
-                ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(face_arr), pv) {
-                    if (j >= face_size) break;
-                    face_data[face_idx][j++] = (unsigned char)zval_get_long(pv);
-                } ZEND_HASH_FOREACH_END();
-                while (j < face_size) face_data[face_idx][j++] = 0;
-                face_idx++;
-            } ZEND_HASH_FOREACH_END();
-        } else {
-            goto d3d11_cm_fail;
-        }
-
-        cm->resolution = res_w;
-
-        D3D11_TEXTURE2D_DESC tex_desc = {0};
-        tex_desc.Width = res_w;
-        tex_desc.Height = res_h;
-        tex_desc.MipLevels = 1;
-        tex_desc.ArraySize = 6;
-        tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        tex_desc.SampleDesc.Count = 1;
-        tex_desc.Usage = D3D11_USAGE_DEFAULT;
-        tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        tex_desc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
-
-        D3D11_SUBRESOURCE_DATA init_data[6];
-        for (int i = 0; i < 6; i++) {
-            init_data[i].pSysMem = face_data[i];
-            init_data[i].SysMemPitch = res_w * 4;
-            init_data[i].SysMemSlicePitch = 0;
-        }
-
-        ID3D11Texture2D *tex = NULL;
-        HRESULT hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &tex_desc, init_data, &tex);
-
-        for (int i = 0; i < 6; i++) {
-            if (face_allocated[i] == 1 && face_data[i]) stbi_image_free(face_data[i]);
-            else if (face_allocated[i] == 2 && face_data[i]) efree(face_data[i]);
-        }
-
-        if (FAILED(hr)) {
-            php_error_docref(NULL, E_WARNING, "D3D11: Failed to create cubemap texture (0x%08lx)", hr);
-            zval_ptr_dtor(&cm_zval);
-            RETURN_FALSE;
-        }
-
-        cm->d3d11_texture = tex;
-
-        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
-        srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
-        srv_desc.TextureCube.MostDetailedMip = 0;
-        srv_desc.TextureCube.MipLevels = 1;
-
-        ID3D11ShaderResourceView *srv = NULL;
-        hr = ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)tex, &srv_desc, &srv);
-        if (FAILED(hr)) {
-            php_error_docref(NULL, E_WARNING, "D3D11: Failed to create cubemap SRV (0x%08lx)", hr);
-            ID3D11Texture2D_Release(tex);
-            cm->d3d11_texture = NULL;
-            zval_ptr_dtor(&cm_zval);
-            RETURN_FALSE;
-        }
-        cm->d3d11_srv = srv;
-
-        D3D11_SAMPLER_DESC sampler_desc = {0};
-        sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-        sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sampler_desc.MaxAnisotropy = 1;
-        sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
-
-        ID3D11SamplerState *sampler = NULL;
-        ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &sampler);
-        cm->d3d11_sampler = sampler;
-
-        cm->backend_type = 2; /* D3D11 */
-
-        if (0) {
-d3d11_cm_fail:
-            for (int i = 0; i < 6; i++) {
-                if (face_allocated[i] == 1 && face_data[i]) stbi_image_free(face_data[i]);
-                else if (face_allocated[i] == 2 && face_data[i]) efree(face_data[i]);
-            }
-            php_error_docref(NULL, E_WARNING, "D3D11: cubemap creation failed");
-            zval_ptr_dtor(&cm_zval);
-            RETURN_FALSE;
-        }
-    }
-#endif
-
     cm->valid = 1;
     RETURN_COPY_VALUE(&cm_zval);
 }
@@ -9476,8 +8607,10 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
         if (hlsl_slot < 0 || hlsl_slot >= VIO_D3D12_SRV_TABLE_SIZE) return;
         D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
         srv_cpu.ptr = cm->d3d12_srv_cpu;
-        vio_d3d12.pending_srvs[hlsl_slot] = srv_cpu;
-        vio_d3d12.pending_srv_valid[hlsl_slot] = 1;
+        /* Cubemaps sample LINEAR / CLAMP (trilinear when mipmapped) like on
+         * D3D11 / OpenGL. */
+        vio_d3d12_bind_srv_slot(srv_cpu, hlsl_slot,
+                                vio_d3d12_sampler_combo(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, 1));
     }
 #endif
 

@@ -178,6 +178,10 @@ typedef struct _vio_d3d11_state {
      * survives. NULL on a normal frame (strict no-op). Mirrors
      * vio_d3d12.pending_bound_rt. */
     void *pending_bound_rt;
+    /* vio_render_target_object* currently bound via bind_render_target /
+     * bind_render_target_face (NULL = backbuffer). Used for the MSAA resolve on
+     * unbind and the GenerateMips hazard check. */
+    void *current_bound_rt;
 
     /* Identity instance buffer bound to input slot 1 for non-instanced draws.
      * SPIRV-Cross generates HLSL where `layout(location=3..6) vec4` attributes
@@ -244,6 +248,12 @@ void vio_backend_d3d11_register(void);
 
 /* Called after GLFW window creation to set up D3D11 */
 int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg);
+
+/* Re-apply a render-target bind that vio_bind_render_target deferred because
+ * it was called before vio_begin() (d3d11_begin_frame resets the backbuffer
+ * binding, so the offscreen redirect has to be applied AFTER begin_frame).
+ * No-op unless such a bind is pending. Called from vio_begin(). */
+void vio_d3d11_apply_pending_render_target(void);
 
 /* Resolve the GPU-local per-frame mirror (readback_mirror) into the CPU-readable
  * readback_staging texture, creating/resizing staging as needed. Call this

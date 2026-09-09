@@ -51,6 +51,11 @@ typedef struct _vio_opengl_state {
     int          extension_count;
     char       **extensions;
 
+    /* vio_render_target_object* bound via bind_render_target (NULL = default
+     * framebuffer). Needed to resolve a multisampled target on unbind /
+     * rebind (GAP-PLAN Phase 3). */
+    void        *current_bound_rt;
+
     /* Cached driver strings — captured once at setup so vio_gl_info can
      * surface them without re-entering GL from php_vio.c. */
     char        *renderer;

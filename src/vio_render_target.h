@@ -20,6 +20,13 @@ typedef struct _vio_render_target_object {
     unsigned int fbo;
     unsigned int color_texture;
     unsigned int depth_texture;
+    /* MSAA (samples > 1, GAP-PLAN Phase 3): draws go into gl_msaa_fbo
+     * (multisample renderbuffers) and are resolved into fbo / color_texture by
+     * glBlitFramebuffer on unbind / readback. */
+    unsigned int gl_msaa_fbo;
+    unsigned int gl_msaa_color_rb;
+    unsigned int gl_msaa_depth_rb;
+    int          gl_msaa_dirty;
 
     /* D3D11 (opaque pointers — actual types are ID3D11* behind void*) */
     void        *d3d11_rtv;           /* ID3D11RenderTargetView* */
@@ -37,6 +44,14 @@ typedef struct _vio_render_target_object {
      * resources in the free handler. */
     void        *d3d11_color_backend_texture; /* vio_d3d11_texture* */
     void        *d3d11_depth_backend_texture; /* vio_d3d11_texture* */
+    /* Cube targets: one RTV per (face, mip) — ID3D11RenderTargetView*[6 * mip_levels],
+     * index face * mip_levels + level. d3d11_rtv is NULL for cube targets. */
+    void        *d3d11_face_rtvs;
+    /* MSAA (samples > 1): the multisampled colour texture rendered into;
+     * d3d11_color_tex is then the single-sample RESOLVE texture the SRV reads. */
+    void        *d3d11_msaa_color_tex;        /* ID3D11Texture2D* (multisampled) */
+    void        *d3d11_msaa_depth_tex;        /* ID3D11Texture2D* (multisampled) */
+    int          d3d11_msaa_dirty;            /* 1 => resolve needed before sampling / readback */
 
     /* D3D12 (opaque pointers — actual types are ID3D12Resource* etc.) */
     void        *d3d12_color_resource;  /* ID3D12Resource* */

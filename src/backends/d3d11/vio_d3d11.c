@@ -455,6 +455,10 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
         int total_elements = desc->vertex_attrib_count;
         D3D11_INPUT_ELEMENT_DESC *elements = calloc(total_elements,
                                                      sizeof(D3D11_INPUT_ELEMENT_DESC));
+        /* Per-element semantic names for matrix columns: SPIRV-Cross emits
+         * `TEXCOORD{base}_{column}` for `in mat4` inputs, i.e. semantic name
+         * "TEXCOORD3_" with index 0..3, not TEXCOORD3..6. */
+        char (*sem_names)[24] = calloc(total_elements, sizeof(*sem_names));
         UINT vertex_offset = 0;
         UINT instance_offset = 0;
 
@@ -462,6 +466,12 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
             int loc = desc->vertex_layout[i].location;
             elements[i].SemanticName = vio_usage_to_semantic(desc->vertex_layout[i].usage);
             elements[i].SemanticIndex = loc;
+            if (sem_names && desc->vertex_layout[i].matrix_columns > 1) {
+                int base = loc - desc->vertex_layout[i].matrix_column;
+                snprintf(sem_names[i], sizeof(sem_names[i]), "%s%d_", elements[i].SemanticName, base);
+                elements[i].SemanticName = sem_names[i];
+                elements[i].SemanticIndex = (UINT)desc->vertex_layout[i].matrix_column;
+            }
             elements[i].Format = vio_format_to_dxgi(desc->vertex_layout[i].format);
 
             if (loc >= 3 && loc <= 6) {
@@ -487,6 +497,7 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
                                              ID3D10Blob_GetBufferSize(shader->vs_blob),
                                              &pipeline->input_layout);
         free(elements);
+        free(sem_names);
         if (FAILED(hr)) {
             php_error_docref(NULL, E_WARNING, "D3D11: Failed to create input layout (0x%08lx)", hr);
             free(pipeline);
@@ -801,7 +812,13 @@ static void *d3d11_create_texture(vio_texture_desc *desc)
         case VIO_WRAP_CLAMP:  sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; break;
         case VIO_WRAP_MIRROR: sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_MIRROR; break;
     }
+    /* vio_texture(['anisotropy' => N]): D3D11_FILTER_ANISOTROPIC only makes
+     * sense with a LINEAR base filter (point sampling has no anisotropy). */
     sampler_desc.MaxAnisotropy = 1;
+    if (desc->anisotropy > 1 && desc->filter != VIO_FILTER_NEAREST) {
+        sampler_desc.Filter = D3D11_FILTER_ANISOTROPIC;
+        sampler_desc.MaxAnisotropy = desc->anisotropy > 16 ? 16 : (UINT)desc->anisotropy;
+    }
     sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
 
     ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &tex->sampler);
@@ -897,6 +914,10 @@ static void *d3d11_create_texture_3d(vio_texture_desc *desc)
     }
     sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = am;
     sampler_desc.MaxAnisotropy = 1;
+    if (desc->anisotropy > 1 && desc->filter != VIO_FILTER_NEAREST) {
+        sampler_desc.Filter = D3D11_FILTER_ANISOTROPIC;
+        sampler_desc.MaxAnisotropy = desc->anisotropy > 16 ? 16 : (UINT)desc->anisotropy;
+    }
     sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
     ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &tex->sampler);
 
@@ -933,6 +954,12 @@ static void d3d11_destroy_cubemap(void *cm_ptr)
     if (cm->d3d11_sampler) {
         ID3D11SamplerState_Release((ID3D11SamplerState *)cm->d3d11_sampler);
         cm->d3d11_sampler = NULL;
+    }
+    /* vio_render_target_cubemap wrapper: the RT owns texture + SRV. */
+    if (cm->borrowed) {
+        cm->d3d11_srv = NULL;
+        cm->d3d11_texture = NULL;
+        return;
     }
     if (cm->d3d11_srv) {
         ID3D11ShaderResourceView_Release((ID3D11ShaderResourceView *)cm->d3d11_srv);
@@ -1013,6 +1040,567 @@ static void d3d11_destroy_render_target(void *rt_ptr)
         ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_depth_tex);
         rt->d3d11_depth_tex = NULL;
     }
+    /* Cube face RTVs + MSAA textures (GAP-PLAN Phase 2 / 3). */
+    if (rt->d3d11_face_rtvs) {
+        ID3D11RenderTargetView **faces = (ID3D11RenderTargetView **)rt->d3d11_face_rtvs;
+        int n = 6 * (rt->mip_levels > 0 ? rt->mip_levels : 1);
+        for (int i = 0; i < n; i++) if (faces[i]) ID3D11RenderTargetView_Release(faces[i]);
+        free(faces);
+        rt->d3d11_face_rtvs = NULL;
+    }
+    if (rt->d3d11_msaa_color_tex) {
+        ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_color_tex);
+        rt->d3d11_msaa_color_tex = NULL;
+    }
+    if (rt->d3d11_msaa_depth_tex) {
+        ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_depth_tex);
+        rt->d3d11_msaa_depth_tex = NULL;
+    }
+    if (vio_d3d11.current_bound_rt == rt) vio_d3d11.current_bound_rt = NULL;
+    if (vio_d3d11.pending_bound_rt == rt) vio_d3d11.pending_bound_rt = NULL;
+}
+
+/* ── Render targets (GAP-PLAN Phase 2: moved out of php_vio.c) ──────
+ *
+ * D3D11 is immediate-mode: binding a target is OMSetRenderTargets on the one
+ * device context. A bind requested BEFORE vio_begin() is deferred
+ * (pending_bound_rt) because d3d11_begin_frame() re-binds the backbuffer;
+ * vio_begin() re-applies it via vio_d3d11_apply_pending_render_target(). */
+
+static void d3d11_rt_set_viewport(int w, int h)
+{
+    D3D11_VIEWPORT vp = {0};
+    vp.Width = (float)w;
+    vp.Height = (float)h;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
+}
+
+/* Unbind every PS SRV: a resource cannot be bound as SRV and RTV/DSV at the
+ * same time (post-process passes read one target while writing another). */
+static void d3d11_rt_unbind_srvs(void)
+{
+    ID3D11ShaderResourceView *null_srvs[8] = {NULL};
+    ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, 0, 8, null_srvs);
+}
+
+/* Resolve a multisampled target into its single-sample texture so the SRV /
+ * readback sees the final image. No-op for single-sample targets. */
+static void d3d11_rt_resolve_msaa(vio_render_target_object *rt)
+{
+    if (!rt->d3d11_msaa_color_tex || !rt->d3d11_color_tex || !rt->d3d11_msaa_dirty) return;
+    ID3D11DeviceContext_ResolveSubresource(vio_d3d11.context,
+        (ID3D11Resource *)rt->d3d11_color_tex, 0,
+        (ID3D11Resource *)rt->d3d11_msaa_color_tex, 0,
+        vio_pixel_format_to_dxgi(rt->formats[0]));
+    rt->d3d11_msaa_dirty = 0;
+}
+
+/* Make `rt` the active target on the immediate context (in-frame path). Cube
+ * targets bind face 0 / level 0 (vio_bind_render_target without a face). */
+static void d3d11_apply_render_target_bind(vio_render_target_object *rt)
+{
+    ID3D11DepthStencilView *dsv = (ID3D11DepthStencilView *)rt->d3d11_dsv;
+    d3d11_rt_unbind_srvs();
+
+    if (rt->depth_only) {
+        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 0, NULL, dsv);
+        vio_d3d11.current_rtv = NULL;
+        vio_d3d11.current_rtv_count = 0;
+    } else if (rt->is_cube) {
+        ID3D11RenderTargetView **faces = (ID3D11RenderTargetView **)rt->d3d11_face_rtvs;
+        ID3D11RenderTargetView *rtv = faces ? faces[0] : NULL;
+        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, rtv ? 1 : 0, rtv ? &rtv : NULL, dsv);
+        vio_d3d11.current_rtv = rtv;
+        vio_d3d11.current_rtvs[0] = rtv;
+        vio_d3d11.current_rtv_count = 1;
+        rt->bound_face = 0;
+        rt->bound_level = 0;
+    } else {
+        /* All colour attachments at once (MRT); index 0 == d3d11_rtv. */
+        int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+        if (n > VIO_MAX_COLOR_ATTACHMENTS) n = VIO_MAX_COLOR_ATTACHMENTS;
+        ID3D11RenderTargetView *rtvs[VIO_MAX_COLOR_ATTACHMENTS] = { (ID3D11RenderTargetView *)rt->d3d11_rtv, NULL, NULL, NULL };
+        for (int ai = 1; ai < n; ai++) rtvs[ai] = (ID3D11RenderTargetView *)rt->d3d11_rtvs[ai];
+        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, (UINT)n, rtvs, dsv);
+        vio_d3d11.current_rtv = rtvs[0];
+        for (int ai = 0; ai < n; ai++) vio_d3d11.current_rtvs[ai] = rtvs[ai];
+        vio_d3d11.current_rtv_count = n;
+        if (rt->d3d11_msaa_color_tex) rt->d3d11_msaa_dirty = 1;
+    }
+    vio_d3d11.current_dsv = dsv;
+    vio_d3d11.current_rt_width = rt->width;
+    vio_d3d11.current_rt_height = rt->height;
+    vio_d3d11.current_bound_rt = rt;
+    d3d11_rt_set_viewport(rt->width, rt->height);
+}
+
+void vio_d3d11_apply_pending_render_target(void)
+{
+    if (!vio_d3d11.initialized || !vio_d3d11.pending_bound_rt) return;
+    vio_render_target_object *prt = (vio_render_target_object *)vio_d3d11.pending_bound_rt;
+    vio_d3d11.pending_bound_rt = NULL;
+    if (prt->valid && prt->backend_type == VIO_RT_BACKEND_D3D11) {
+        d3d11_apply_render_target_bind(prt);
+    }
+}
+
+static void d3d11_bind_render_target(void *rt_ptr)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!rt || !vio_d3d11.initialized || rt->backend_type != VIO_RT_BACKEND_D3D11) return;
+    if (vio_d3d11.in_frame) {
+        d3d11_apply_render_target_bind(rt);
+    } else {
+        /* Called before vio_begin() (the warm-render "bind then begin" order):
+         * d3d11_begin_frame() would clobber an immediate bind, so defer it —
+         * vio_begin() re-applies it after begin_frame(). Storing (not applying)
+         * keeps the normal path a strict no-op. */
+        vio_d3d11.pending_bound_rt = rt;
+    }
+}
+
+static void d3d11_unbind_render_target(unsigned int default_fbo, int width, int height)
+{
+    (void)default_fbo; (void)width; (void)height;
+    if (!vio_d3d11.initialized || !vio_d3d11.context) return;
+
+    /* Drop any deferred (pre-begin) bind so a stale pending target can't leak
+     * into a later, unrelated frame. */
+    vio_d3d11.pending_bound_rt = NULL;
+
+    /* A multisampled target becomes samplable only after the resolve. */
+    if (vio_d3d11.current_bound_rt) {
+        d3d11_rt_resolve_msaa((vio_render_target_object *)vio_d3d11.current_bound_rt);
+    }
+    vio_d3d11.current_bound_rt = NULL;
+
+    /* Restore main backbuffer RTV + DSV */
+    vio_d3d11.current_rtv = vio_d3d11.rtv;
+    vio_d3d11.current_rtvs[0] = vio_d3d11.rtv;
+    vio_d3d11.current_rtv_count = 1;
+    vio_d3d11.current_dsv = vio_d3d11.dsv;
+    vio_d3d11.current_rt_width = vio_d3d11.width;
+    vio_d3d11.current_rt_height = vio_d3d11.height;
+    ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 1, &vio_d3d11.rtv, vio_d3d11.dsv);
+    d3d11_rt_set_viewport(vio_d3d11.width, vio_d3d11.height);
+}
+
+static int d3d11_bind_render_target_face(void *rt_ptr, int face, int level)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!rt || !vio_d3d11.initialized || rt->backend_type != VIO_RT_BACKEND_D3D11) return -1;
+    if (!rt->is_cube || face < 0 || face > 5 || level < 0 || level >= rt->mip_levels) return -1;
+    ID3D11RenderTargetView **faces = (ID3D11RenderTargetView **)rt->d3d11_face_rtvs;
+    if (!faces) return -1;
+    ID3D11RenderTargetView *rtv = faces[face * rt->mip_levels + level];
+    if (!rtv) return -1;
+
+    d3d11_rt_unbind_srvs();
+    /* The shared depth texture matches level 0 only; smaller levels render
+     * without depth (same contract as OpenGL / Metal). */
+    ID3D11DepthStencilView *dsv = level == 0 ? (ID3D11DepthStencilView *)rt->d3d11_dsv : NULL;
+    ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 1, &rtv, dsv);
+    int dim = rt->width >> level; if (dim < 1) dim = 1;
+    vio_d3d11.current_rtv = rtv;
+    vio_d3d11.current_rtvs[0] = rtv;
+    vio_d3d11.current_rtv_count = 1;
+    vio_d3d11.current_dsv = dsv;
+    vio_d3d11.current_rt_width = dim;
+    vio_d3d11.current_rt_height = dim;
+    vio_d3d11.current_bound_rt = rt;
+    vio_d3d11.pending_bound_rt = NULL;
+    d3d11_rt_set_viewport(dim, dim);
+    rt->bound_face = face;
+    rt->bound_level = level;
+    return 0;
+}
+
+/* Sampler shared by cube targets handed out as VioCubemap and by CPU
+ * cubemaps: linear / clamp, trilinear when the texture has mips. */
+static ID3D11SamplerState *d3d11_create_cube_sampler(void)
+{
+    D3D11_SAMPLER_DESC sd = {0};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxAnisotropy = 1;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    ID3D11SamplerState *s = NULL;
+    ID3D11Device_CreateSamplerState(vio_d3d11.device, &sd, &s);
+    return s;
+}
+
+static int d3d11_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    (void)hdr;   /* rt->formats[0] already encodes it */
+    if (!rt || !vio_d3d11.initialized || width <= 0 || height <= 0) return -1;
+    HRESULT hr;
+    int attachment_count = rt->attachment_count > 0 ? rt->attachment_count : 1;
+    if (attachment_count > VIO_MAX_COLOR_ATTACHMENTS) attachment_count = VIO_MAX_COLOR_ATTACHMENTS;
+    int mips = rt->is_cube && rt->mip_levels > 0 ? rt->mip_levels : 1;
+
+    /* Clamp the requested MSAA count to what the device offers for RGBA8.
+     * Cube / depth-only targets stay single-sample (no resolve path). */
+    UINT samples = 1;
+    if (!rt->is_cube && !depth_only && rt->samples > 1) {
+        UINT want = rt->samples > 8 ? 8 : (UINT)rt->samples;
+        for (UINT s = want; s > 1; s >>= 1) {
+            UINT quality = 0;
+            if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(vio_d3d11.device,
+                    vio_pixel_format_to_dxgi(rt->formats[0]), s, &quality)) && quality > 0) {
+                samples = s;
+                break;
+            }
+        }
+    }
+    rt->samples = (int)samples;
+
+    /* Depth texture (multisampled when the colour is) */
+    D3D11_TEXTURE2D_DESC depth_desc = {0};
+    depth_desc.Width = width;
+    depth_desc.Height = height;
+    depth_desc.MipLevels = 1;
+    depth_desc.ArraySize = 1;
+    depth_desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    depth_desc.SampleDesc.Count = samples;
+    depth_desc.Usage = D3D11_USAGE_DEFAULT;
+    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | (samples == 1 ? D3D11_BIND_SHADER_RESOURCE : 0);
+
+    ID3D11Texture2D *depth_tex = NULL;
+    hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &depth_desc, NULL, &depth_tex);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D11: Failed to create depth texture (0x%08lx)", hr);
+        return -1;
+    }
+
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
+    dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dsv_desc.ViewDimension = samples > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
+    ID3D11DepthStencilView *dsv = NULL;
+    hr = ID3D11Device_CreateDepthStencilView(vio_d3d11.device, (ID3D11Resource *)depth_tex, &dsv_desc, &dsv);
+    if (FAILED(hr)) {
+        ID3D11Texture2D_Release(depth_tex);
+        php_error_docref(NULL, E_WARNING, "D3D11: Failed to create DSV (0x%08lx)", hr);
+        return -1;
+    }
+    rt->d3d11_dsv = dsv;
+    rt->d3d11_depth_tex = depth_tex;
+    rt->backend_type = VIO_RT_BACKEND_D3D11;   /* from here on the destructor releases what exists */
+
+    /* SRV for depth (shadow-map sampling); not available on a multisampled depth. */
+    if (samples == 1) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+        srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = 1;
+        ID3D11ShaderResourceView *depth_srv = NULL;
+        ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)depth_tex, &srv_desc, &depth_srv);
+        rt->d3d11_depth_srv = depth_srv;
+    }
+
+    if (!depth_only && rt->is_cube) {
+        /* Cube: a 6-slice array with the full mip chain, one RTV per (face, mip),
+         * a TEXTURECUBE SRV over all mips (textureLod by roughness). */
+        DXGI_FORMAT dxfmt = vio_pixel_format_to_dxgi(rt->formats[0]);
+        D3D11_TEXTURE2D_DESC cd = {0};
+        cd.Width = width; cd.Height = height;
+        cd.MipLevels = (UINT)mips;
+        cd.ArraySize = 6;
+        cd.Format = dxfmt;
+        cd.SampleDesc.Count = 1;
+        cd.Usage = D3D11_USAGE_DEFAULT;
+        cd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        cd.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE | (mips > 1 ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0);
+        ID3D11Texture2D *cube = NULL;
+        hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &cd, NULL, &cube);
+        if (FAILED(hr)) {
+            php_error_docref(NULL, E_WARNING, "D3D11: Failed to create cube colour texture (0x%08lx)", hr);
+            return -1;
+        }
+        rt->d3d11_color_tex = cube;
+        rt->d3d11_color_texs[0] = cube;
+
+        ID3D11RenderTargetView **faces = calloc((size_t)6 * mips, sizeof(*faces));
+        if (!faces) return -1;
+        rt->d3d11_face_rtvs = faces;
+        for (int f = 0; f < 6; f++) {
+            for (int l = 0; l < mips; l++) {
+                D3D11_RENDER_TARGET_VIEW_DESC rd = {0};
+                rd.Format = dxfmt;
+                rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+                rd.Texture2DArray.MipSlice = (UINT)l;
+                rd.Texture2DArray.FirstArraySlice = (UINT)f;
+                rd.Texture2DArray.ArraySize = 1;
+                hr = ID3D11Device_CreateRenderTargetView(vio_d3d11.device, (ID3D11Resource *)cube, &rd, &faces[f * mips + l]);
+                if (FAILED(hr)) {
+                    php_error_docref(NULL, E_WARNING, "D3D11: Failed to create cube face RTV (0x%08lx)", hr);
+                    return -1;
+                }
+            }
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {0};
+        sd.Format = dxfmt;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+        sd.TextureCube.MostDetailedMip = 0;
+        sd.TextureCube.MipLevels = (UINT)mips;
+        ID3D11ShaderResourceView *srv = NULL;
+        ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)cube, &sd, &srv);
+        rt->d3d11_color_srv = srv;
+        rt->d3d11_color_srvs[0] = srv;
+    } else if (!depth_only) {
+        /* One colour texture + RTV + SRV per attachment (MRT). Index 0 also
+         * fills the legacy scalar slots. With MSAA the RTV targets a
+         * multisampled texture and the SRV reads the single-sample resolve. */
+        for (int ai = 0; ai < attachment_count; ai++) {
+            DXGI_FORMAT dxfmt = vio_pixel_format_to_dxgi(rt->formats[ai]);
+            D3D11_TEXTURE2D_DESC color_desc = {0};
+            color_desc.Width = width;
+            color_desc.Height = height;
+            color_desc.MipLevels = 1;
+            color_desc.ArraySize = 1;
+            color_desc.Format = dxfmt;
+            color_desc.SampleDesc.Count = 1;
+            color_desc.Usage = D3D11_USAGE_DEFAULT;
+            color_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+            ID3D11Texture2D *color_tex = NULL;
+            hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &color_desc, NULL, &color_tex);
+            if (FAILED(hr)) {
+                php_error_docref(NULL, E_WARNING, "D3D11: Failed to create color texture %d (0x%08lx)", ai, hr);
+                return -1;
+            }
+            rt->d3d11_color_texs[ai] = color_tex;
+
+            ID3D11Resource *rtv_res = (ID3D11Resource *)color_tex;
+            if (samples > 1 && ai == 0) {
+                D3D11_TEXTURE2D_DESC ms = color_desc;
+                ms.SampleDesc.Count = samples;
+                ms.BindFlags = D3D11_BIND_RENDER_TARGET;
+                ID3D11Texture2D *ms_tex = NULL;
+                hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &ms, NULL, &ms_tex);
+                if (FAILED(hr)) {
+                    php_error_docref(NULL, E_WARNING, "D3D11: Failed to create MSAA colour texture (0x%08lx)", hr);
+                    return -1;
+                }
+                rt->d3d11_msaa_color_tex = ms_tex;
+                rtv_res = (ID3D11Resource *)ms_tex;
+            }
+
+            ID3D11RenderTargetView *rtv = NULL;
+            hr = ID3D11Device_CreateRenderTargetView(vio_d3d11.device, rtv_res, NULL, &rtv);
+            if (FAILED(hr)) {
+                php_error_docref(NULL, E_WARNING, "D3D11: Failed to create RTV %d (0x%08lx)", ai, hr);
+                return -1;
+            }
+            rt->d3d11_rtvs[ai] = rtv;
+
+            ID3D11ShaderResourceView *color_srv = NULL;
+            D3D11_SHADER_RESOURCE_VIEW_DESC color_srv_desc = {0};
+            color_srv_desc.Format = dxfmt;
+            color_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            color_srv_desc.Texture2D.MipLevels = 1;
+            ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)color_tex, &color_srv_desc, &color_srv);
+            rt->d3d11_color_srvs[ai] = color_srv;
+        }
+        rt->d3d11_rtv       = rt->d3d11_rtvs[0];
+        rt->d3d11_color_tex = rt->d3d11_color_texs[0];
+        rt->d3d11_color_srv = rt->d3d11_color_srvs[0];
+    }
+
+    /* Defined initial contents (colour 0, depth 1.0) like GL / Metal, so a
+     * target that is bound and drawn into without an explicit clear still
+     * depth-tests. */
+    {
+        float zero[4] = {0, 0, 0, 0};
+        if (rt->is_cube) {
+            ID3D11RenderTargetView **faces = (ID3D11RenderTargetView **)rt->d3d11_face_rtvs;
+            for (int i = 0; faces && i < 6 * mips; i++) {
+                if (faces[i]) ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, faces[i], zero);
+            }
+        } else {
+            for (int ai = 0; ai < attachment_count && !depth_only; ai++) {
+                if (rt->d3d11_rtvs[ai]) ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, (ID3D11RenderTargetView *)rt->d3d11_rtvs[ai], zero);
+            }
+        }
+        ID3D11DeviceContext_ClearDepthStencilView(vio_d3d11.context, dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    }
+    return 0;
+}
+
+static int d3d11_render_target_cubemap(void *rt_ptr, void *cm_obj)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
+    if (!rt || !cm || !rt->is_cube || !rt->d3d11_color_tex || !rt->d3d11_color_srv) return -1;
+    /* Borrowed: the RT keeps ownership of texture + SRV; the cubemap owns
+     * only its sampler (d3d11_destroy_cubemap honours cm->borrowed). */
+    cm->d3d11_texture = rt->d3d11_color_tex;
+    cm->d3d11_srv     = rt->d3d11_color_srv;
+    cm->d3d11_sampler = d3d11_create_cube_sampler();
+    cm->mipmaps       = rt->mip_levels > 1;
+    cm->borrowed      = 1;
+    cm->resolution    = rt->width;
+    cm->backend_type  = 2;
+    return 0;
+}
+
+static int d3d11_generate_mipmaps(void *obj, int kind)
+{
+    if (!obj || !vio_d3d11.initialized) return -1;
+    ID3D11ShaderResourceView *srv = NULL;
+    switch (kind) {
+        case 0: {
+            vio_render_target_object *rt = (vio_render_target_object *)obj;
+            if (rt->backend_type != VIO_RT_BACKEND_D3D11) return -1;
+            if (!rt->is_cube || rt->mip_levels <= 1) return 0;   /* nothing to build */
+            srv = (ID3D11ShaderResourceView *)rt->d3d11_color_srv;
+            break;
+        }
+        case 1: {
+            vio_texture_object *t = (vio_texture_object *)obj;
+            vio_d3d11_texture *dt = (vio_d3d11_texture *)t->backend_texture;
+            if (!dt || !dt->srv) return -1;
+            if (!dt->texture) return 0;   /* borrowed RT wrapper / 3D volume: no chain */
+            D3D11_TEXTURE2D_DESC td; ID3D11Texture2D_GetDesc(dt->texture, &td);
+            if (td.MipLevels <= 1 || !(td.MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS)) return 0;
+            srv = dt->srv;
+            break;
+        }
+        case 2: {
+            vio_cubemap_object *cm = (vio_cubemap_object *)obj;
+            if (!cm->d3d11_srv || !cm->mipmaps) return cm->d3d11_srv ? 0 : -1;
+            srv = (ID3D11ShaderResourceView *)cm->d3d11_srv;
+            break;
+        }
+        default: return -1;
+    }
+    /* GenerateMips reads level 0 of a resource that may still be bound as the
+     * render target — unbind SRVs/RTVs first so the runtime does not have to
+     * break the hazard for us. */
+    if (kind == 0 && vio_d3d11.current_bound_rt == obj) {
+        d3d11_unbind_render_target(0, 0, 0);
+    }
+    ID3D11DeviceContext_GenerateMips(vio_d3d11.context, srv);
+    return 0;
+}
+
+static int d3d11_read_render_target(void *rt_ptr, int face, int attachment, void *out_rgba)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    if (!rt || rt->backend_type != VIO_RT_BACKEND_D3D11 || !vio_d3d11.initialized) return -1;
+    int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+    if (attachment < 0 || attachment >= n) return -1;
+
+    if (!rt->depth_only) d3d11_rt_resolve_msaa(rt);
+
+    ID3D11Texture2D *src = rt->depth_only ? (ID3D11Texture2D *)rt->d3d11_depth_tex
+                         : (attachment == 0 ? (ID3D11Texture2D *)rt->d3d11_color_tex
+                                            : (ID3D11Texture2D *)rt->d3d11_color_texs[attachment]);
+    if (!src) return -1;
+    D3D11_TEXTURE2D_DESC sd;
+    ID3D11Texture2D_GetDesc(src, &sd);
+    UINT subresource = 0;
+    if (rt->is_cube) {
+        int f = face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0);
+        subresource = (UINT)f * sd.MipLevels;
+    }
+    sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0; sd.MipLevels = 1; sd.ArraySize = 1; sd.SampleDesc.Count = 1;
+    ID3D11Texture2D *staging = NULL;
+    if (FAILED(ID3D11Device_CreateTexture2D(vio_d3d11.device, &sd, NULL, &staging))) return -1;
+    ID3D11DeviceContext_CopySubresourceRegion(vio_d3d11.context, (ID3D11Resource *)staging, 0, 0, 0, 0,
+                                              (ID3D11Resource *)src, subresource, NULL);
+    D3D11_MAPPED_SUBRESOURCE m = {0};
+    if (FAILED(ID3D11DeviceContext_Map(vio_d3d11.context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m))) {
+        ID3D11Texture2D_Release(staging);
+        return -1;
+    }
+    unsigned char *out = (unsigned char *)out_rgba;
+    int w = rt->width, h = rt->height;
+    if (rt->depth_only) {
+        for (int y = 0; y < h; y++) {
+            const unsigned char *row = (const unsigned char *)m.pData + (size_t)y * m.RowPitch;
+            unsigned char *dst = out + (size_t)y * w * 4;
+            /* R24G8_TYPELESS: low 24 bits = depth */
+            for (int x = 0; x < w; x++) {
+                uint32_t v; memcpy(&v, row + x * 4, 4); v &= 0x00FFFFFFu;
+                unsigned char g = (unsigned char)((v * 255ULL) / 0x00FFFFFFu);
+                dst[x*4+0] = dst[x*4+1] = dst[x*4+2] = g; dst[x*4+3] = 255;
+            }
+        }
+    } else {
+        vio_rt_convert_to_rgba8(rt->formats[attachment], 0, m.pData, (size_t)m.RowPitch, w, h, out);
+    }
+    ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)staging, 0);
+    ID3D11Texture2D_Release(staging);
+    return 0;
+}
+
+/* CPU cubemap upload (six RGBA8 faces): a TEXTURECUBE array, full mip chain
+ * via GenerateMips when cm->mipmaps is set. Face order +X,-X,+Y,-Y,+Z,-Z. */
+static int d3d11_upload_cubemap(void *cm_obj, int width, int height, const void *face_rgba[6])
+{
+    vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
+    if (!cm || !vio_d3d11.initialized || width <= 0 || height <= 0) return -1;
+
+    D3D11_TEXTURE2D_DESC tex_desc = {0};
+    tex_desc.Width = width;
+    tex_desc.Height = height;
+    tex_desc.MipLevels = cm->mipmaps ? 0 : 1;   /* 0 => full chain */
+    tex_desc.ArraySize = 6;
+    tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    tex_desc.SampleDesc.Count = 1;
+    tex_desc.Usage = D3D11_USAGE_DEFAULT;
+    tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | (cm->mipmaps ? D3D11_BIND_RENDER_TARGET : 0);
+    tex_desc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE | (cm->mipmaps ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0);
+
+    /* Initial data can only be supplied for every subresource; with a mip
+     * chain we create empty and UpdateSubresource level 0 of each face. */
+    D3D11_SUBRESOURCE_DATA init_data[6];
+    for (int i = 0; i < 6; i++) {
+        init_data[i].pSysMem = face_rgba[i];
+        init_data[i].SysMemPitch = (UINT)width * 4;
+        init_data[i].SysMemSlicePitch = 0;
+    }
+    ID3D11Texture2D *tex = NULL;
+    HRESULT hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &tex_desc, cm->mipmaps ? NULL : init_data, &tex);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D11: Failed to create cubemap texture (0x%08lx)", hr);
+        return -1;
+    }
+    D3D11_TEXTURE2D_DESC actual; ID3D11Texture2D_GetDesc(tex, &actual);
+    if (cm->mipmaps) {
+        for (int f = 0; f < 6; f++) {
+            if (!face_rgba[f]) continue;
+            ID3D11DeviceContext_UpdateSubresource(vio_d3d11.context, (ID3D11Resource *)tex,
+                (UINT)f * actual.MipLevels, NULL, face_rgba[f], (UINT)width * 4, 0);
+        }
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+    srv_desc.TextureCube.MostDetailedMip = 0;
+    srv_desc.TextureCube.MipLevels = actual.MipLevels;
+    ID3D11ShaderResourceView *srv = NULL;
+    hr = ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)tex, &srv_desc, &srv);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D11: Failed to create cubemap SRV (0x%08lx)", hr);
+        ID3D11Texture2D_Release(tex);
+        return -1;
+    }
+    if (cm->mipmaps) ID3D11DeviceContext_GenerateMips(vio_d3d11.context, srv);
+
+    cm->d3d11_texture = tex;
+    cm->d3d11_srv     = srv;
+    cm->d3d11_sampler = d3d11_create_cube_sampler();
+    cm->resolution    = width;
+    cm->mipmaps       = actual.MipLevels > 1;
+    cm->backend_type  = 2;
+    return 0;
 }
 
 /* ── Shaders ──────────────────────────────────────────────────────── */
@@ -1103,9 +1691,12 @@ static void *d3d11_compile_shader(vio_shader_desc *desc)
     }
 
     /* Compile HLSL -> DXBC */
-    UINT compile_flags = 0;
+    /* FXC defaults to OPTIMIZATION_LEVEL1; LEVEL3 is the release codegen the
+     * driver-side JIT benefits from (GAP-PLAN 2.8). Debug builds keep the
+     * un-optimised, symbol-carrying blob for PIX / RenderDoc. */
+    UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
     if (vio_d3d11.debug_enabled) {
-        compile_flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+        compile_flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
     }
 
     ID3DBlob *error_blob = NULL;
@@ -1636,9 +2227,12 @@ static void *d3d11_create_compute_pipeline(vio_shader_desc *desc)
         fflush(stderr);
     }
 
-    UINT compile_flags = 0;
+    /* FXC defaults to OPTIMIZATION_LEVEL1; LEVEL3 is the release codegen the
+     * driver-side JIT benefits from (GAP-PLAN 2.8). Debug builds keep the
+     * un-optimised, symbol-carrying blob for PIX / RenderDoc. */
+    UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
     if (vio_d3d11.debug_enabled) {
-        compile_flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+        compile_flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
     }
 
     vio_d3d11_compute_pipeline *cp = calloc(1, sizeof(vio_d3d11_compute_pipeline));
@@ -1972,8 +2566,11 @@ static int d3d11_supports_feature(vio_feature feature)
 {
     switch (feature) {
         case VIO_FEATURE_COMPUTE:      return 1; /* compute pipeline + dispatch + readback wired */
-        case VIO_FEATURE_TESSELLATION: return 1;
-        case VIO_FEATURE_GEOMETRY:     return 1;
+        /* The hardware can, but vio_shader_desc only carries a vertex + fragment
+         * stage — there is no way to hand a GS / HS / DS to the backend, so the
+         * flags must not promise it. */
+        case VIO_FEATURE_TESSELLATION: return 0;
+        case VIO_FEATURE_GEOMETRY:     return 0;
         case VIO_FEATURE_RAYTRACING:   return 0; /* No DXR in D3D11 */
         case VIO_FEATURE_MULTIVIEW:    return 0;
         case VIO_FEATURE_3D_PIPELINE:  return 1;
@@ -1982,7 +2579,9 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET:       return 1;
         case VIO_FEATURE_RENDER_TARGET_HDR:   return 1;
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 1;
-        case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1;
+        case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1; /* multisampled colour + ResolveSubresource on unbind (GAP-PLAN Phase 3) */
+        case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice TEXTURECUBE + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
+        case VIO_FEATURE_MIPMAP_GEN:          return 1; /* ID3D11DeviceContext::GenerateMips */
         case VIO_FEATURE_CUBEMAP:      return 1;
         case VIO_FEATURE_DEPTH_BIAS:   return 1; /* rasterizer state */
         case VIO_FEATURE_SCISSOR:      return 1;
@@ -2088,7 +2687,10 @@ static void d3d11_gpu_flush(void)
     BOOL done = FALSE;
     while (ID3D11DeviceContext_GetData(vio_d3d11.context, (ID3D11Asynchronous *)query,
                                        &done, sizeof(done), 0) != S_OK) {
-        /* spin — typical drain is microseconds */
+        /* Typical drain is microseconds, but a long compute dispatch or a
+         * readback can take milliseconds — yield the core instead of spinning
+         * it at 100 % (GAP-PLAN 4.5). */
+        SwitchToThread();
     }
     ID3D11Query_Release(query);
 }
@@ -2166,6 +2768,15 @@ static const vio_backend d3d11_backend = {
     .destroy_font_atlas = d3d11_destroy_font_atlas,
     .destroy_render_target = d3d11_destroy_render_target,
     .update_texture    = d3d11_update_texture,
+    /* Render-target lifecycle (GAP-PLAN Phase 2 — previously inline in php_vio.c). */
+    .create_render_target    = d3d11_create_render_target,
+    .bind_render_target      = d3d11_bind_render_target,
+    .unbind_render_target    = d3d11_unbind_render_target,
+    .bind_render_target_face = d3d11_bind_render_target_face,
+    .render_target_cubemap   = d3d11_render_target_cubemap,
+    .read_render_target      = d3d11_read_render_target,
+    .generate_mipmaps        = d3d11_generate_mipmaps,
+    .upload_cubemap          = d3d11_upload_cubemap,
 };
 
 void vio_backend_d3d11_register(void)

@@ -718,6 +718,13 @@ static void opengl_destroy_render_target(void *rt_ptr)
      * mangling a struct that happens to share the slot with a D3D RT in
      * cross-backend tests. */
     if (rt->backend_type != VIO_RT_BACKEND_OPENGL) return;
+    if (vio_gl.current_bound_rt == rt) vio_gl.current_bound_rt = NULL;
+    if (rt->gl_msaa_fbo) {
+        glDeleteFramebuffers(1, &rt->gl_msaa_fbo);
+        rt->gl_msaa_fbo = 0;
+    }
+    if (rt->gl_msaa_color_rb) { glDeleteRenderbuffers(1, &rt->gl_msaa_color_rb); rt->gl_msaa_color_rb = 0; }
+    if (rt->gl_msaa_depth_rb) { glDeleteRenderbuffers(1, &rt->gl_msaa_depth_rb); rt->gl_msaa_depth_rb = 0; }
     if (rt->fbo) {
         glDeleteFramebuffers(1, &rt->fbo);
         rt->fbo = 0;
@@ -873,14 +880,89 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
         return -1;
     }
 
+    /* MSAA (single colour attachment only): a second FBO with multisample
+     * renderbuffers is what gets drawn into; unbind / readback resolve it into
+     * the texture FBO above with glBlitFramebuffer. Before GAP-PLAN Phase 3
+     * rt->samples was ignored here while VIO_FEATURE_RENDER_TARGET_MSAA
+     * reported 1. */
+    rt->samples = rt->samples > 1 ? rt->samples : 1;
+    if (rt->samples > 1 && !depth_only && (rt->attachment_count <= 1)) {
+        GLint max_samples = 1;
+        glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
+        int samples = rt->samples > 8 ? 8 : rt->samples;
+        if (samples > max_samples) samples = max_samples;
+        while (samples > 1) {
+            GLint internal; GLenum base, type;
+            opengl_color_format(rt->attachment_count > 0 ? rt->formats[0] : (hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8),
+                                &internal, &base, &type);
+            glGenFramebuffers(1, &rt->gl_msaa_fbo);
+            glGenRenderbuffers(1, &rt->gl_msaa_color_rb);
+            glGenRenderbuffers(1, &rt->gl_msaa_depth_rb);
+            glBindRenderbuffer(GL_RENDERBUFFER, rt->gl_msaa_color_rb);
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, internal, width, height);
+            glBindRenderbuffer(GL_RENDERBUFFER, rt->gl_msaa_depth_rb);
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH_COMPONENT24, width, height);
+            glBindRenderbuffer(GL_RENDERBUFFER, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, rt->gl_msaa_fbo);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rt->gl_msaa_color_rb);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rt->gl_msaa_depth_rb);
+            GLenum ms_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            if (ms_status == GL_FRAMEBUFFER_COMPLETE) {
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glDepthMask(GL_TRUE);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                break;
+            }
+            /* This sample count is not renderable here: drop to the next tier. */
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glDeleteFramebuffers(1, &rt->gl_msaa_fbo);
+            glDeleteRenderbuffers(1, &rt->gl_msaa_color_rb);
+            glDeleteRenderbuffers(1, &rt->gl_msaa_depth_rb);
+            rt->gl_msaa_fbo = rt->gl_msaa_color_rb = rt->gl_msaa_depth_rb = 0;
+            samples >>= 1;
+        }
+        rt->samples = rt->gl_msaa_fbo ? samples : 1;
+    } else {
+        rt->samples = 1;
+    }
+
     rt->backend_type = VIO_RT_BACKEND_OPENGL;
     return 0;
+}
+
+/* Resolve a multisampled target into its texture FBO (no-op otherwise). */
+static void opengl_rt_resolve_msaa(vio_render_target_object *rt)
+{
+    if (!rt || !rt->gl_msaa_fbo || !rt->gl_msaa_dirty) return;
+    GLint prev_read = 0, prev_draw = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->gl_msaa_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rt->fbo);
+    glBlitFramebuffer(0, 0, rt->width, rt->height, 0, 0, rt->width, rt->height,
+                      GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw);
+    rt->gl_msaa_dirty = 0;
 }
 
 static void opengl_bind_render_target(void *rt_ptr)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (rt->backend_type != VIO_RT_BACKEND_OPENGL || !vio_gl.initialized) return;
+    /* A previously bound multisampled target is resolved when the binding
+     * moves away from it (bind-to-bind chains never see an unbind). */
+    if (vio_gl.current_bound_rt && vio_gl.current_bound_rt != rt) {
+        opengl_rt_resolve_msaa((vio_render_target_object *)vio_gl.current_bound_rt);
+    }
+    vio_gl.current_bound_rt = rt;
+    if (rt->gl_msaa_fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, rt->gl_msaa_fbo);
+        rt->gl_msaa_dirty = 1;
+        glViewport(0, 0, rt->width, rt->height);
+        return;
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
     if (rt->is_cube) {
         /* Plain bind of a cube RT targets +X at level 0. */
@@ -933,6 +1015,7 @@ static int opengl_read_render_target(void *rt_ptr, int face, int attachment, voi
     int w = rt->width, h = rt->height;
     unsigned char *out = (unsigned char *)out_rgba;
 
+    opengl_rt_resolve_msaa(rt);   /* the texture FBO holds the resolved image */
     GLint prev_fbo = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
@@ -1035,6 +1118,10 @@ static int opengl_generate_mipmaps(void *obj, int kind)
 static void opengl_unbind_render_target(unsigned int default_fbo, int width, int height)
 {
     if (!vio_gl.initialized) return;
+    if (vio_gl.current_bound_rt) {
+        opengl_rt_resolve_msaa((vio_render_target_object *)vio_gl.current_bound_rt);
+        vio_gl.current_bound_rt = NULL;
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, default_fbo);
     if (width > 0 && height > 0) {
         glViewport(0, 0, width, height);
@@ -1298,6 +1385,8 @@ static void opengl_draw_instanced_from_storage(void *mesh_obj, int instance_coun
     glBindVertexArray(0);
 }
 
+static int gl_has_ext(const char *name);   /* defined with the caps setup below */
+
 static int opengl_upload_texture_2d(void *tex_obj,
                                     const void *pixels, int width, int height, int channels,
                                     int filter, int wrap, int mipmaps)
@@ -1321,6 +1410,19 @@ static int opengl_upload_texture_2d(void *tex_obj,
     GLint gl_filter = (filter == VIO_FILTER_NEAREST) ? GL_NEAREST : GL_LINEAR;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter);
+
+    /* vio_texture(['anisotropy' => N]): core in GL 4.6, otherwise the
+     * ubiquitous ARB/EXT extension (same token value). Clamped to the driver
+     * maximum; silently off when neither is exported (tex->anisotropy is read
+     * from the object so the vtable signature stays untouched). */
+    if (tex->anisotropy > 1 && filter != VIO_FILTER_NEAREST &&
+        (gl_ge(4, 6) || gl_has_ext("GL_ARB_texture_filter_anisotropic") ||
+         gl_has_ext("GL_EXT_texture_filter_anisotropic"))) {
+        GLfloat max_aniso = 1.0f;
+        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &max_aniso);
+        GLfloat want = (GLfloat)(tex->anisotropy > 16 ? 16 : tex->anisotropy);
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, want < max_aniso ? want : max_aniso);
+    }
 
     /* Sized internal format: image load/store (storage images) rejects the
      * unsized GL_RGBA; RGBA8 is what every backend stores anyway. */
