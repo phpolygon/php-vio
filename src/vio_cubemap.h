@@ -29,6 +29,7 @@ typedef struct _vio_cubemap_object {
     int          resolution;
     int          valid;
     const struct _vio_backend *backend;  /* Backend that owns texture_id / d3d11_* / d3d12_* */
+    unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
     zend_object  std;
 } vio_cubemap_object;
 

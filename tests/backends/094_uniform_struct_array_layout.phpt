@@ -34,9 +34,17 @@ if (getenv('VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST')) die('skip SPIRV-Cross without th
 // Vulkan without an ICD on Linux CI): probe every candidate quietly and only keep
 // the ones that come up.
 $backends = [];
+$seen = [];
 foreach (['auto', 'metal', 'opengl'] as $candidate) {
     $probe = @vio_create($candidate, ['width' => 4, 'height' => 4, 'headless' => true]);
-    if ($probe) { vio_destroy($probe); $backends[] = $candidate; }
+    if (!$probe) continue;
+    // 'auto' may resolve to a name listed explicitly below ('opengl' on Linux):
+    // run every real backend once.
+    $resolved = vio_backend_name($probe);
+    vio_destroy($probe);
+    if (in_array($resolved, $seen, true)) continue;
+    $seen[] = $resolved;
+    $backends[] = $candidate;
 }
 if (!$backends) { echo "none: skipped\n"; }
 

@@ -25,6 +25,7 @@ typedef struct _vio_mesh_object {
     int          has_colors;      /* 1 if vertex data includes colors */
     int          stride;          /* bytes per vertex */
     const struct _vio_backend *backend;  /* Backend that owns vao/vbo/ebo / backend_vb / backend_ib */
+    unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
     zend_object  std;
 } vio_mesh_object;
 

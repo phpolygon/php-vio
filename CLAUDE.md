@@ -91,12 +91,13 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-109 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+111 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
 | `tests/render3d/096–098` | Storage-Images + 2D-Dispatch (API-Roadmap R2/R7), Multiple Render Targets (R1), Async-Compute im Frame (R7) |
+| `tests/backends/107` | OpenGL-Kontext-Generation: Objekte eines zerstörten Kontexts, die erst freigegeben werden, wenn ein NEUER Kontext current ist, dürfen dessen (wiederverwendete) GL-Namen nicht löschen. |
 | `tests/core/099–100`, `render3d/101–105`, `backends/106` | GAP-Plan (`D3D-VULKAN-GAP-PLAN.md`): Audit-Gate für Backend-Zweige in `php_vio.c`, Auto-Backend-Wahl, Sampler-Filter/Wrap, Cube-RT/Mipmaps/Readback auf allen Backends, Mid-Frame-Upload-Ordnung, Anisotropie, RT-MSAA-Resolve, Vulkan-Present-Mode. Die `*_all_backends`-Tests iterieren über `opengl/d3d11/d3d12/metal` und drucken pro Backend `OK` oder `skip (…)`. |
 | `tests/core/` | Laden, Konstanten, Null-Backend, Context-Lifecycle, Plugins, Audit-Gate 070, Capability-Matrix 074, Perf/Memory-Gates |
 | `tests/backends/` | Backend-Registrierung + GPU-Kontexte (OpenGL/Vulkan/Metal/D3D11/D3D12), Cross-Backend-Parity 067, Metal-3D 089, Uniform-Layout Struct-Arrays 094, Texture-Bind-Reihenfolge 095, D3D-Spezifika |
@@ -710,7 +711,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 099), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 108), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -851,6 +852,12 @@ Aufrufer geändert hat:
   Frame cleart jedes Backend sofort** das gebundene Ziel (Swapchain oder RT) — OpenGL seit
   Phase 1 des Replacement-Plans wie D3D11/D3D12/Metal. Neue RTs starten mit Depth 1.0 /
   Farbe 0 (GL, Metal), damit „bind + draw ohne clear" depth-testet.
+- **GL-Namen sind per Kontext** (`gl_generation` in jedem vio-Objekt, `vio_opengl_context_generation()`):
+  ein VioShader/VioMesh/VioTexture/… aus Kontext 1 wird von PHP oft erst freigegeben, wenn
+  Kontext 2 schon current ist (Neuzuweisung in einer Backend-Schleife, GC nach `vio_destroy`);
+  die GL-Destruktoren löschen nur Namen der lebenden Generation, sonst wird der Kontext-2-
+  Shader mit demselben Namen gekillt (zweiter OpenGL-Kontext rendert schwarz — Test 107).
+  Tests, die über `['auto', …, 'opengl']` iterieren, deduplizieren per `vio_backend_name()`.
 - **Headless-Größen** sind 1:1: `vio_framebuffer_size`/`vio_window_size` = Config-Größe,
   `vio_content_scale`/`vio_pixel_ratio` = 1 — unabhängig vom Retina-Faktor des versteckten
   GLFW-Fensters; Viewport/2D-Projektion in `vio_begin` folgen dem.

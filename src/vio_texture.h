@@ -29,6 +29,7 @@ typedef struct _vio_texture_object {
     int          borrowed;      /* 1 if texture_id is owned by another object (e.g. render target) */
     int          storage;       /* 1 => created with 'storage' => true (compute image2D/3D target) */
     const struct _vio_backend *backend;
+    unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
     zend_object  std;
 } vio_texture_object;
 
