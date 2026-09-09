@@ -54,6 +54,8 @@ typedef struct _vio_pipeline_object {
     int            stencil_pass_op;
     int            stencil_fail_op;
     int            stencil_depth_fail_op;
+    int            patch_vertices;    /* 'patch_vertices': control points per patch
+                                         (VIO_PATCHES / tessellation), 0 => 3 */
     int            valid;
     zend_object    std;
 } vio_pipeline_object;

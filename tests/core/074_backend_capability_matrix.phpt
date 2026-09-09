@@ -100,8 +100,7 @@ function probe_fold(string $backend_name, array $expected): void {
 }
 
 /* Shared by both D3D backends: everything a wired 3D backend must have, plus
- * the honest zeros — no GS/HS/DS stage can be supplied through vio_shader.
- * Cube targets, mip generation and multisampled targets differ per backend
+ * the honest zeros. Cube targets, mip generation and multisampled targets differ per backend
  * (see the per-backend entries below). */
 $d3d_common = [
     VIO_FEATURE_3D_PIPELINE        => 1,
@@ -127,8 +126,10 @@ $d3d_common = [
     VIO_FEATURE_INDIRECT_DRAW      => 1,   /* ExecuteIndirect / Draw*Indirect (GAP-PHASE5 8) */
     VIO_FEATURE_TEXTURE_ARRAY      => 1,   /* Texture2D arrays (GAP-PHASE5 9) */
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1, /* BC1-BC7 (GAP-PHASE5 9) */
-    VIO_FEATURE_TESSELLATION       => 0,
-    VIO_FEATURE_GEOMETRY           => 0,
+    /* TESSELLATION / GEOMETRY are not pinned for D3D: the GPU side always has
+     * the stages, but the flag also requires a SPIRV-Cross that can emit HLSL
+     * for them (vio_hlsl_stage_supported - older Vulkan-SDK builds cannot).
+     * tests/render3d/109 + 110 are the contract: flag = 1 => the stage renders. */
     VIO_FEATURE_RAYTRACING         => 0,
     VIO_FEATURE_MULTIVIEW          => 0,
 ];

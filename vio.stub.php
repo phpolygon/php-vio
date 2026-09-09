@@ -530,16 +530,31 @@ function vio_draw_2d(VioContext $context): void {}
  * Accepts GLSL (compiled to SPIR-V via glslang) or raw SPIR-V binary.
  * Format is auto-detected from SPIR-V magic number if not specified.
  *
- * @param array $config ['vertex' => string, 'fragment' => string, 'format' => int (VIO_SHADER_AUTO|VIO_SHADER_GLSL|VIO_SHADER_SPIRV)]
+ * Optional stages (same encoding as 'vertex' / 'fragment'):
+ *   'geometry'                     — geometry shader; requires VIO_FEATURE_GEOMETRY
+ *   'tess_control' + 'tess_eval'   — tessellation pair (always both); requires VIO_FEATURE_TESSELLATION;
+ *                                    the pipeline then draws VIO_PATCHES ('patch_vertices' control points)
+ * Backends reporting the feature as 0 (Metal, Vulkan, OpenGL < 3.2 / 4.0, D3D with a SPIRV-Cross that
+ * cannot emit the stage - tessellation is not emitted to HLSL at all yet) return false with a warning.
+ * Portable geometry shaders read input positions from a user varying (`layout(location = N) in vec4 vPos[]`
+ * exported by the vertex stage), not from gl_in[].gl_Position, which D3D cannot translate.
+ * Uniforms declared in an extra stage are set with
+ * vio_set_uniform() like any other; on D3D a texture sampled in an extra stage is bound at the register
+ * the fragment-stage sampler map resolves its unit to (declare samplers in the same order per stage).
+ *
+ * @param array $config ['vertex' => string, 'fragment' => string, 'geometry' => ?string,
+ *                      'tess_control' => ?string, 'tess_eval' => ?string,
+ *                      'format' => int (VIO_SHADER_AUTO|VIO_SHADER_GLSL|VIO_SHADER_SPIRV)]
  * @return VioShader|false Shader object or false on failure
  */
 function vio_shader(VioContext $context, array $config): VioShader|false {}
 
 /**
  * Reflect shader resources from SPIR-V binary stored in a VioShader.
- * Returns vertex and fragment stage inputs, UBOs, textures, and uniforms.
+ * Returns vertex and fragment stage inputs, UBOs, textures, and uniforms; the optional
+ * 'geometry' / 'tess_control' / 'tess_eval' keys appear when the shader has that stage.
  *
- * @return array|false Array with 'vertex' and 'fragment' keys, each containing 'inputs', 'ubos', 'textures', 'uniforms'
+ * @return array|false Array with 'vertex' and 'fragment' keys (plus optional stage keys), each containing 'inputs', 'ubos', 'textures', 'uniforms', 'storage_buffers'
  */
 function vio_shader_reflect(VioShader $shader): array|false {}
 
@@ -555,10 +570,12 @@ function vio_shader_reflect(VioShader $shader): array|false {}
  *                                               // MRT: blend mode / VIO_COLOR_* mask PER colour attachment
  *                                               //   (missing entries fall back to 'blend' / 'color_mask')
  *                      'stencil' => ['func' => VIO_CMP_*, 'ref' => int, 'read_mask' => int, 'write_mask' => int,
- *                                     'pass' => VIO_STENCIL_*, 'fail' => VIO_STENCIL_*, 'depth_fail' => VIO_STENCIL_*]]
+ *                                     'pass' => VIO_STENCIL_*, 'fail' => VIO_STENCIL_*, 'depth_fail' => VIO_STENCIL_*],
  *                                               // stencil test (VIO_FEATURE_STENCIL): giving the array enables it;
  *                                               //   defaults ALWAYS / 0 / 0xFF / 0xFF / KEEP. The depth attachment carries
  *                                               //   8 stencil bits, vio_clear resets them to 0. Same ops for front + back.
+ *                      'patch_vertices' => int] // control points per patch for VIO_PATCHES (1..32, default 3);
+ *                                               //   a shader with tessellation stages always draws patches
  * @return VioPipeline|false Pipeline object or false on failure
  */
 function vio_pipeline(VioContext $context, array $config): VioPipeline|false {}

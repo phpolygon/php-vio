@@ -484,7 +484,9 @@ jobs:
             tests/input/131_inject_event_path.phpt `
             tests/input/132_virtual_gamepad.phpt `
             tests/input/133_input_record_replay.phpt `
-            tests/input/134_replay_drops_os_input_win32.phpt
+            tests/input/134_replay_drops_os_input_win32.phpt `
+            tests/render3d/109_geometry_shader_all_backends.phpt `
+            tests/render3d/110_tessellation_all_backends.phpt
 
       - name: Package binary
         shell: pwsh
