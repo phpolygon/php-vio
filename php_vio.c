@@ -553,8 +553,20 @@ ZEND_FUNCTION(vio_begin)
                      || strcmp(ctx->backend->name, "d3d12") == 0)) {
         int fb_w, fb_h;
         float sx = 1.0f, sy = 1.0f;
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        if (ctx->config.headless) {
+            /* Headless: the swapchain IS the offscreen target and must stay at
+             * the requested 1:1 size. The hidden GLFW window can be larger than
+             * asked (Windows enforces a minimum width on decorated windows — a
+             * 32x32 request came back as a 348x32 client area), and resizing
+             * the swapchain to it made vio_read_pixels return a 348-wide image
+             * that callers indexed as 32 wide: every row after the first was
+             * garbage. Same rule the OpenGL / Metal branches above apply. */
+            fb_w = ctx->config.width  > 0 ? ctx->config.width  : 800;
+            fb_h = ctx->config.height > 0 ? ctx->config.height : 600;
+        } else {
+            glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+            glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        }
         if (sx <= 0.0f) sx = 1.0f;
         if (sy <= 0.0f) sy = 1.0f;
         int logical_w = (int)((float)fb_w / sx + 0.5f);
@@ -831,7 +843,10 @@ ZEND_FUNCTION(vio_key_released)
 static double vio_input_logical_scale_x(vio_context_object *ctx)
 {
 #if defined(HAVE_GLFW) && defined(_WIN32)
-    if (ctx && ctx->window) {
+    /* Headless contexts are 1:1 (vio_content_scale == 1) and injected cursor
+     * coordinates are already logical — the monitor DPI of the hidden window
+     * must not scale them (15.5 came back as 5.17 on a 300 % display). */
+    if (ctx && ctx->window && !ctx->config.headless) {
         float sx = 1.0f, sy = 1.0f;
         glfwGetWindowContentScale(ctx->window, &sx, &sy);
         if (sx > 0.0f) return (double)sx;
@@ -844,7 +859,10 @@ static double vio_input_logical_scale_x(vio_context_object *ctx)
 static double vio_input_logical_scale_y(vio_context_object *ctx)
 {
 #if defined(HAVE_GLFW) && defined(_WIN32)
-    if (ctx && ctx->window) {
+    /* Headless contexts are 1:1 (vio_content_scale == 1) and injected cursor
+     * coordinates are already logical — the monitor DPI of the hidden window
+     * must not scale them (15.5 came back as 5.17 on a 300 % display). */
+    if (ctx && ctx->window && !ctx->config.headless) {
         float sx = 1.0f, sy = 1.0f;
         glfwGetWindowContentScale(ctx->window, &sx, &sy);
         if (sy > 0.0f) return (double)sy;
