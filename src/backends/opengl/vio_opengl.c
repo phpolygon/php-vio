@@ -56,6 +56,112 @@ static int gl_owned_by_live_context(unsigned int gen)
     return vio_gl.initialized && gen == gl_context_generation;
 }
 
+/* ── Uniform-name resolution for SPIR-V-path shaders ──────────────────
+ *
+ * vio_spirv_to_glsl() asks SPIRV-Cross to emit uniform buffers as plain
+ * uniforms (GLSL 4.1 on macOS has no usable UBO binding story), and glslang
+ * puts loose `uniform mat4 u_mvp;` declarations of a #version 450 source into
+ * gl_DefaultUniformBlock. Both end up as ONE struct-typed uniform in the
+ * transpiled GLSL — `uniform Matrices _19;` — so the names GL knows are
+ * `_19.uProjection`, while PHP calls vio_set_uniform('uProjection', …).
+ * glGetUniformLocation("uProjection") returned -1 and the value was silently
+ * dropped: every uniform of every non-raw shader was dead on OpenGL.
+ *
+ * Resolve an exact match first, then fall back to the `<struct>.name` (or
+ * `<struct>.name[0]` for arrays, whose location covers the whole array) suffix
+ * among the program's active uniforms. Lookups are cached per (program, name);
+ * entries are dropped when their program is deleted, because GL reuses program
+ * ids. */
+#define GL_ULOC_CACHE_SIZE 1024
+#define GL_ULOC_NAME_MAX   56
+
+typedef struct {
+    GLuint program;   /* 0 = empty slot */
+    GLint  loc;
+    char   name[GL_ULOC_NAME_MAX];
+} gl_uloc_entry;
+
+static gl_uloc_entry gl_uloc_cache[GL_ULOC_CACHE_SIZE];
+
+static unsigned gl_uloc_hash(GLuint program, const char *name)
+{
+    unsigned h = 5381u ^ (program * 2654435761u);
+    for (; *name; name++) h = h * 33u + (unsigned char)*name;
+    return h;
+}
+
+static void gl_uloc_forget_program(GLuint program)
+{
+    if (!program) return;
+    for (int i = 0; i < GL_ULOC_CACHE_SIZE; i++) {
+        if (gl_uloc_cache[i].program == program) gl_uloc_cache[i].program = 0;
+    }
+}
+
+/* Copy `name` into `out`, rewriting every "[<digits>]" to "[0]" — the form in
+ * which glGetActiveUniform() reports array elements. */
+static size_t gl_uloc_normalize(const char *name, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (const char *p = name; *p && o + 4 < cap; p++) {
+        if (*p == '[') {
+            const char *q = p + 1;
+            while (*q >= '0' && *q <= '9') q++;
+            if (*q == ']' && q > p + 1) { out[o++] = '['; out[o++] = '0'; out[o++] = ']'; p = q; continue; }
+        }
+        out[o++] = *p;
+    }
+    out[o] = '\0';
+    return o;
+}
+
+static GLint gl_uloc_suffix_scan(GLuint program, const char *name, size_t len)
+{
+    char norm[256];
+    size_t nlen = gl_uloc_normalize(name, norm, sizeof(norm));
+    GLint count = 0;
+    glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
+    char buf[256], full[512];
+    for (GLint i = 0; i < count; i++) {
+        GLsizei n = 0; GLint size = 0; GLenum type = 0;
+        glGetActiveUniform(program, (GLuint)i, (GLsizei)sizeof(buf), &n, &size, &type, buf);
+        /* active name = "<prefix>.<norm>" ? */
+        if (n <= (GLsizei)nlen + 1 || buf[n - nlen - 1] != '.' || strcmp(buf + n - nlen, norm) != 0) continue;
+        size_t plen = (size_t)n - nlen - 1;
+        if (plen + 1 + len + 1 > sizeof(full)) return -1;
+        memcpy(full, buf, plen);
+        full[plen] = '.';
+        memcpy(full + plen + 1, name, len + 1);
+        return glGetUniformLocation(program, full);   /* exact element (or element 0 for a bare array name) */
+    }
+    return -1;
+}
+static GLint gl_uniform_location(GLuint program, const char *name)
+{
+    size_t len = strlen(name);
+    int cacheable = len < GL_ULOC_NAME_MAX;
+    unsigned idx = gl_uloc_hash(program, name) % GL_ULOC_CACHE_SIZE;
+    gl_uloc_entry *slot = NULL;
+    if (cacheable) {
+        for (int probe = 0; probe < 8; probe++) {
+            gl_uloc_entry *e = &gl_uloc_cache[(idx + probe) % GL_ULOC_CACHE_SIZE];
+            if (e->program == program && strcmp(e->name, name) == 0) return e->loc;
+            if (e->program == 0 && !slot) slot = e;
+        }
+        if (!slot) slot = &gl_uloc_cache[idx];   /* window full: evict */
+    }
+
+    GLint loc = glGetUniformLocation(program, name);
+    if (loc < 0) loc = gl_uloc_suffix_scan(program, name, len);
+
+    if (slot) {
+        slot->program = program;
+        slot->loc = loc;
+        memcpy(slot->name, name, len + 1);
+    }
+    return loc;
+}
+
 /* ── Shader compilation helpers ───────────────────────────────────── */
 
 static unsigned int compile_shader_stage(const char *source, GLenum type)
@@ -110,6 +216,7 @@ unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *
 void vio_opengl_delete_program(unsigned int program)
 {
     if (program) {
+        gl_uloc_forget_program(program);
         glDeleteProgram(program);
     }
 }
@@ -150,6 +257,7 @@ static void opengl_shutdown(void)
     }
     if (vio_gl.renderer) { free(vio_gl.renderer); vio_gl.renderer = NULL; }
     if (vio_gl.vendor)   { free(vio_gl.vendor);   vio_gl.vendor   = NULL; }
+    memset(gl_uloc_cache, 0, sizeof(gl_uloc_cache));   /* program ids die with the context */
     vio_gl.initialized = 0;
 }
 
@@ -303,6 +411,7 @@ static void opengl_destroy_shader(void *shader)
 {
     unsigned int program = (unsigned int)(uintptr_t)shader;
     if (program) {
+        gl_uloc_forget_program(program);
         glDeleteProgram(program);
     }
 }
@@ -677,6 +786,7 @@ static void opengl_destroy_shader_obj(void *shader_obj)
 {
     vio_shader_object *sh = (vio_shader_object *)shader_obj;
     if (sh->program) {
+        gl_uloc_forget_program(sh->program);
         if (gl_owned_by_live_context(sh->gl_generation)) glDeleteProgram(sh->program);
         sh->program = 0;
     }
@@ -1169,7 +1279,7 @@ static void opengl_set_uniform(const char *name, const void *data, int count, in
     glGetIntegerv(GL_CURRENT_PROGRAM, &program);
     if (program <= 0) return;
 
-    GLint loc = glGetUniformLocation((GLuint)program, name);
+    GLint loc = gl_uniform_location((GLuint)program, name);
     if (loc < 0) return;  /* silently drop unknown uniforms — matches old behavior */
 
     switch (type) {
