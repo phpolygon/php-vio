@@ -38,6 +38,15 @@ $vs = "#version 450\n"
     . "layout(location=0) in vec3 aPos;\n"
     . "layout(std430, binding=0) readonly buffer Instances { mat4 models[]; };\n"
     . "void main(){ gl_Position = models[gl_InstanceIndex] * vec4(aPos,1.0); }\n";
+// Same VS with a vertex-stage UBO next to the SSBO: the storage-instanced draw must
+// bind the root CBV like vio_draw does (it used to skip that on D3D12 -> device
+// removed). Used on the D3D / Metal / Vulkan backends; the OpenGL SPIR-V->GLSL path
+// does not route vio_set_uniform into transpiled uniform blocks (tests use GLSL_RAW there).
+$vs_ubo = "#version 450\n"
+    . "layout(location=0) in vec3 aPos;\n"
+    . "layout(std430, binding=0) readonly buffer Instances { mat4 models[]; };\n"
+    . "layout(std140, binding=0) uniform VP { mat4 u_vp; };\n"
+    . "void main(){ gl_Position = u_vp * models[gl_InstanceIndex] * vec4(aPos,1.0); }\n";
 $fs = "#version 450\nlayout(location=0) out vec4 o;\nvoid main(){ o=vec4(1.0); }\n";
 
 /** Render the readback-free scene on one context; return true iff the 4 SSBO-placed quads appear and the SSBO is reflected. */
@@ -62,6 +71,7 @@ function run_backend($ctx, string $cs, string $vs, string $fs, int $VP, int $N):
     vio_viewport($ctx, 0, 0, $VP, $VP);
     vio_clear($ctx, 0, 0, 0, 1);
     vio_bind_pipeline($ctx, $pipe);
+    vio_set_uniform($ctx, 'u_vp', [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
     vio_bind_storage_buffer($ctx, $buf, 0, VIO_COMPUTE_READ);
     vio_draw_instanced_from_buffer($ctx, $mesh, $N);
     $px = vio_read_pixels($ctx);
@@ -93,7 +103,7 @@ foreach (['d3d12', 'd3d11', 'vulkan', 'metal', 'opengl'] as $be) {
     if ($ctx === false) continue;
     if (!vio_supports_feature($ctx, VIO_FEATURE_VERTEX_STORAGE)) { vio_destroy($ctx); continue; }
     $bn = vio_backend_name($ctx);
-    if (!run_backend($ctx, $cs, $vs, $fs, $VP, $N)) {
+    if (!run_backend($ctx, $cs, $bn === 'opengl' ? $vs : $vs_ubo, $fs, $VP, $N)) {
         echo "[FAIL] {$bn}: readback-free instances did not render at their SSBO positions\n";
         $fail = true;
     }

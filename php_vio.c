@@ -1986,6 +1986,83 @@ ZEND_FUNCTION(vio_mesh)
  * Caller guarantees ctx is initialized + in_frame and mesh is non-NULL. */
 static void vio_flush_pending_textures(vio_context_object *ctx);
 
+/* Push pending vio_set_uniform writes into the bound shader's backend
+ * cbuffers and bind them for the next draw. On D3D12 every draw gets its own
+ * 256-byte slice of the per-frame cbuffer heap + root CBV — the SAME code must
+ * run for vio_draw, vio_draw_instanced and vio_draw_instanced_from_buffer;
+ * the latter used to skip the root-CBV bind, so a vertex shader with any
+ * uniform read an unset root descriptor (device removed). */
+static void vio_push_shader_cbuffers(vio_context_object *ctx)
+{
+    /* Flush uniform cbuffers before drawing */
+    if (ctx->bound_shader_object) {
+        vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+
+        /* Upload vertex cbuffer */
+        if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
+            ctx->backend->update_buffer(sh->cbuffer_backend,
+                sh->cbuffer_data, sh->cbuffer_total_size);
+            sh->cbuffer_dirty = 0;
+        }
+        /* Upload fragment cbuffer */
+        if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
+            ctx->backend->update_buffer(sh->frag_cbuffer_backend,
+                sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+            sh->frag_cbuffer_dirty = 0;
+        }
+
+#ifdef HAVE_D3D11
+        if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
+            /* Bind vertex cbuffer to VS slot b0 */
+            if (sh->cbuffer_backend) {
+                vio_d3d11_buffer *cb = (vio_d3d11_buffer *)sh->cbuffer_backend;
+                ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
+                /* Also bind to PS b0 if no separate fragment cbuffer */
+                if (!sh->frag_cbuffer_backend) {
+                    ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
+                }
+            }
+            /* Bind fragment cbuffer to PS slot b0 */
+            if (sh->frag_cbuffer_backend) {
+                vio_d3d11_buffer *fcb = (vio_d3d11_buffer *)sh->frag_cbuffer_backend;
+                ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &fcb->buffer);
+            }
+        }
+#endif
+#ifdef HAVE_D3D12
+        if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
+            /* Allocate per-draw cbuffer slices from the linear allocator.
+             * Each draw gets its own 256-byte-aligned slice so previous
+             * draw data isn't overwritten (D3D12 has no buffer renaming). */
+            if (sh->cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
+                UINT aligned = (sh->cbuffer_total_size + 255) & ~255;
+                UINT offset = vio_d3d12.cbuffer_heap_offset;
+                if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
+                    memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
+                           sh->cbuffer_data, sh->cbuffer_total_size);
+                    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+                        vio_d3d12.cmd_list, 0,
+                        vio_d3d12.cbuffer_heap_gpu + offset);
+                    vio_d3d12.cbuffer_heap_offset = offset + aligned;
+                }
+            }
+            if (sh->frag_cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
+                UINT aligned = (sh->frag_cbuffer_total_size + 255) & ~255;
+                UINT offset = vio_d3d12.cbuffer_heap_offset;
+                if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
+                    memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
+                           sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+                        vio_d3d12.cmd_list, 1,
+                        vio_d3d12.cbuffer_heap_gpu + offset);
+                    vio_d3d12.cbuffer_heap_offset = offset + aligned;
+                }
+            }
+        }
+#endif
+    }
+}
+
 static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
 {
     vio_flush_pending_textures(ctx);
@@ -1995,73 +2072,7 @@ static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
 
     /* Backend draw (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0) {
-        /* Flush uniform cbuffers before drawing */
-        if (ctx->bound_shader_object) {
-            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-
-            /* Upload vertex cbuffer */
-            if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
-                ctx->backend->update_buffer(sh->cbuffer_backend,
-                    sh->cbuffer_data, sh->cbuffer_total_size);
-                sh->cbuffer_dirty = 0;
-            }
-            /* Upload fragment cbuffer */
-            if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
-                ctx->backend->update_buffer(sh->frag_cbuffer_backend,
-                    sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
-                sh->frag_cbuffer_dirty = 0;
-            }
-
-#ifdef HAVE_D3D11
-            if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
-                /* Bind vertex cbuffer to VS slot b0 */
-                if (sh->cbuffer_backend) {
-                    vio_d3d11_buffer *cb = (vio_d3d11_buffer *)sh->cbuffer_backend;
-                    ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
-                    /* Also bind to PS b0 if no separate fragment cbuffer */
-                    if (!sh->frag_cbuffer_backend) {
-                        ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
-                    }
-                }
-                /* Bind fragment cbuffer to PS slot b0 */
-                if (sh->frag_cbuffer_backend) {
-                    vio_d3d11_buffer *fcb = (vio_d3d11_buffer *)sh->frag_cbuffer_backend;
-                    ID3D11DeviceContext_PSSetConstantBuffers(vio_d3d11.context, 0, 1, &fcb->buffer);
-                }
-            }
-#endif
-#ifdef HAVE_D3D12
-            if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
-                /* Allocate per-draw cbuffer slices from the linear allocator.
-                 * Each draw gets its own 256-byte-aligned slice so previous
-                 * draw data isn't overwritten (D3D12 has no buffer renaming). */
-                if (sh->cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
-                    UINT aligned = (sh->cbuffer_total_size + 255) & ~255;
-                    UINT offset = vio_d3d12.cbuffer_heap_offset;
-                    if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
-                        memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
-                               sh->cbuffer_data, sh->cbuffer_total_size);
-                        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
-                            vio_d3d12.cmd_list, 0,
-                            vio_d3d12.cbuffer_heap_gpu + offset);
-                        vio_d3d12.cbuffer_heap_offset = offset + aligned;
-                    }
-                }
-                if (sh->frag_cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
-                    UINT aligned = (sh->frag_cbuffer_total_size + 255) & ~255;
-                    UINT offset = vio_d3d12.cbuffer_heap_offset;
-                    if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
-                        memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
-                               sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
-                        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
-                            vio_d3d12.cmd_list, 1,
-                            vio_d3d12.cbuffer_heap_gpu + offset);
-                        vio_d3d12.cbuffer_heap_offset = offset + aligned;
-                    }
-                }
-            }
-#endif
-        }
+        vio_push_shader_cbuffers(ctx);
         if (mesh->index_count > 0 && mesh->backend_ib && ctx->backend->draw_indexed) {
             vio_draw_indexed_cmd cmd = {0};
             cmd.vertex_buffer = mesh->backend_vb;
@@ -2706,15 +2717,25 @@ ZEND_FUNCTION(vio_pipeline)
             vio_reflect_result reflect = {0};
             char *err = NULL;
             if (vio_spirv_reflect(shader->vert_spirv, shader->vert_spirv_size, &reflect, &err) == 0) {
-                for (int i = 0; i < reflect.input_count && i < 16; i++) {
-                    layout[attrib_count].location = reflect.inputs[i].location;
+                for (int i = 0; i < reflect.input_count && attrib_count < 16; i++) {
                     /* Map SPIRV vecsize to VIO format (enum values match: 1=FLOAT1..4=FLOAT4) */
                     unsigned int vs = reflect.inputs[i].vecsize;
                     if (vs < 1 || vs > 4) vs = 3;
-                    layout[attrib_count].format = (vio_format)vs;
-                    /* SPIRV-Cross maps all GLSL inputs to TEXCOORD{location} in HLSL */
-                    layout[attrib_count].usage = VIO_TEXCOORD;
-                    attrib_count++;
+                    /* A matrix input (`in mat4 aModel`, per-instance transforms)
+                     * occupies one location per column; SPIRV-Cross emits one
+                     * TEXCOORD{location + c} element per column, so the input
+                     * layout must list every column or the PSO fails with
+                     * E_INVALIDARG (D3D) / a missing attribute (Metal). */
+                    unsigned int cols = reflect.inputs[i].columns > 0 ? reflect.inputs[i].columns : 1;
+                    for (unsigned int c = 0; c < cols && attrib_count < 16; c++) {
+                        layout[attrib_count].location = reflect.inputs[i].location + c;
+                        layout[attrib_count].format = (vio_format)vs;
+                        /* SPIRV-Cross maps all GLSL inputs to TEXCOORD{location} in HLSL */
+                        layout[attrib_count].usage = VIO_TEXCOORD;
+                        layout[attrib_count].matrix_columns = cols > 1 ? (int)cols : 0;
+                        layout[attrib_count].matrix_column  = (int)c;
+                        attrib_count++;
+                    }
                 }
                 vio_reflect_free(&reflect);
             }
@@ -3869,19 +3890,8 @@ ZEND_FUNCTION(vio_draw_instanced_from_buffer)
 
     vio_flush_pending_textures(ctx);
 
-    /* Push pending vio_set_uniform writes to the backend cbuffers, the same way
-     * vio_draw / vio_draw_instanced do before recording their draw. */
-    if (ctx->bound_shader_object) {
-        vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-        if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
-            ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size);
-            sh->cbuffer_dirty = 0;
-        }
-        if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
-            ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
-            sh->frag_cbuffer_dirty = 0;
-        }
-    }
+    /* Same cbuffer push + root-CBV bind as vio_draw / vio_draw_instanced. */
+    vio_push_shader_cbuffers(ctx);   /* no-op on OpenGL (no cbuffer_backend) */
 
     ctx->backend->draw_instanced_from_storage(mesh, (int)instance_count);
 }
@@ -4624,7 +4634,10 @@ ZEND_FUNCTION(vio_sprite)
         {p3x, p3y, u0, v1, cr, cg, cb, ca},
     };
     int start = vio_2d_push_vertices(&ctx->state_2d, verts, 6);
-    if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_SPRITE, z, tex->texture_id, tex->backend_texture, start, 6);
+    if (start >= 0) {
+        GC_ADDREF(&tex->std);   /* the batch keeps the texture alive until vio_draw_2d / next frame */
+        vio_2d_push_item_owned(&ctx->state_2d, VIO_2D_SPRITE, z, tex->texture_id, tex->backend_texture, start, 6, &tex->std);
+    }
 }
 
 /* Upload a freshly-packed R8 atlas bitmap into the font's GPU resource.
@@ -4927,7 +4940,10 @@ ZEND_FUNCTION(vio_text)
             {g3x, g3y, u0, v1, cr, cg, cb, ca},
         };
         int start = vio_2d_push_vertices(&ctx->state_2d, verts, 6);
-        if (start >= 0) vio_2d_push_item(&ctx->state_2d, VIO_2D_TEXT, z, font->atlas_texture, font->atlas_backend_texture, start, 6);
+        if (start >= 0) {
+            GC_ADDREF(&font->std);   /* the batch keeps the font (atlas) alive until it is drawn */
+            vio_2d_push_item_owned(&ctx->state_2d, VIO_2D_TEXT, z, font->atlas_texture, font->atlas_backend_texture, start, 6, &font->std);
+        }
 
         fx += b->xadvance * inv_rs;
     }

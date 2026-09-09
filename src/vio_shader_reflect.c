@@ -274,6 +274,13 @@ char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_mod
         return NULL;
     }
 
+    /* Debug aid (like VIO_DUMP_CS_HLSL for compute): print the transpiled
+     * graphics HLSL so register / semantic assignment can be checked. */
+    if (getenv("VIO_DUMP_HLSL")) {
+        fprintf(stderr, "==== HLSL (SM %d) ====\n%s\n==== end ====\n", shader_model, result);
+        fflush(stderr);
+    }
+
     output = strdup(result);
 
     spvc_context_destroy(ctx);
@@ -309,6 +316,8 @@ static void copy_resources(spvc_compiler compiler, spvc_resources resources,
         /* Extract vector size from type (1=float, 2=vec2, 3=vec3, 4=vec4) */
         spvc_type type_handle = spvc_compiler_get_type_handle(compiler, list[i].type_id);
         (*out)[i].vecsize = type_handle ? spvc_type_get_vector_size(type_handle) : 3;
+        (*out)[i].columns = type_handle ? spvc_type_get_columns(type_handle) : 1;
+        if ((*out)[i].columns < 1) (*out)[i].columns = 1;
 
         /* Detect depth image (sampler2DShadow → Depth=1 in SPIR-V) */
         (*out)[i].is_depth = 0;

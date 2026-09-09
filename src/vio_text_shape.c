@@ -482,9 +482,10 @@ static void draw_emit(void *user, unsigned int gid, float pen_x, float y_off)
     };
     int start = vio_2d_push_vertices(&d->ctx->state_2d, verts, 6);
     if (start >= 0) {
-        vio_2d_push_item(&d->ctx->state_2d, VIO_2D_TEXT, d->z,
-                         d->font->atlas_texture, d->font->atlas_backend_texture,
-                         start, 6);
+        GC_ADDREF(&d->font->std);   /* the batch keeps the font (atlas) alive until it is drawn */
+        vio_2d_push_item_owned(&d->ctx->state_2d, VIO_2D_TEXT, d->z,
+                               d->font->atlas_texture, d->font->atlas_backend_texture,
+                               start, 6, &d->font->std);
     }
 }
 

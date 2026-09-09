@@ -38,6 +38,8 @@ typedef struct _vio_reflect_resource {
     unsigned int binding;
     unsigned int location;
     unsigned int vecsize;   /* component count: 1=float, 2=vec2, 3=vec3, 4=vec4/mat4 */
+    unsigned int columns;   /* matrix columns: 1 for scalars/vectors, 4 for mat4 (a
+                               mat4 vertex input occupies 4 consecutive locations) */
     unsigned int is_depth;  /* 1 if sampled image has Depth=1 (sampler2DShadow) */
 } vio_reflect_resource;
 
