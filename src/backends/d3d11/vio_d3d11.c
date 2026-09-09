@@ -30,6 +30,7 @@
 #include "../vio_d3d_common.h"
 #include "../../vio_texture.h"
 #include "../../vio_shader_reflect.h"
+#include "../../vio_shader_compiler.h"  /* vio_compile_glsl_stage_to_spirv — geometry / tessellation stages */
 #include <string.h>
 #include <stdlib.h>
 
@@ -51,7 +52,7 @@ extern uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
 /* ── Helpers ──────────────────────────────────────────────────────── */
 /* vio_format_to_dxgi, vio_format_byte_size, vio_usage_to_semantic from vio_d3d_common.h */
 
-static D3D11_PRIMITIVE_TOPOLOGY vio_topology_to_d3d11(vio_topology t)
+static D3D11_PRIMITIVE_TOPOLOGY vio_topology_to_d3d11(vio_topology t, int patch_vertices)
 {
     switch (t) {
         case VIO_TRIANGLES:      return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -60,6 +61,12 @@ static D3D11_PRIMITIVE_TOPOLOGY vio_topology_to_d3d11(vio_topology t)
         case VIO_LINE_STRIP:     return D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
         case VIO_POINTS:         return D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
         case VIO_TRIANGLE_FAN:   return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; /* no native fan */
+        case VIO_PATCHES: {
+            /* N_CONTROL_POINT_PATCHLIST values are contiguous from 1 (=33). */
+            int n = patch_vertices > 0 ? patch_vertices : 3;
+            if (n > 32) n = 32;
+            return (D3D11_PRIMITIVE_TOPOLOGY)(D3D11_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + (n - 1));
+        }
         default:                 return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     }
 }
@@ -434,10 +441,18 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
 
     pipeline->vs = shader->vs;
     pipeline->ps = shader->ps;
+    pipeline->gs = shader->gs;
+    pipeline->hs = shader->hs;
+    pipeline->ds = shader->ds;
     /* AddRef so pipeline survives shader destruction */
     if (pipeline->vs) ID3D11VertexShader_AddRef(pipeline->vs);
     if (pipeline->ps) ID3D11PixelShader_AddRef(pipeline->ps);
-    pipeline->topology = vio_topology_to_d3d11(desc->topology);
+    if (pipeline->gs) ID3D11GeometryShader_AddRef(pipeline->gs);
+    if (pipeline->hs) ID3D11HullShader_AddRef(pipeline->hs);
+    if (pipeline->ds) ID3D11DomainShader_AddRef(pipeline->ds);
+    /* A hull stage only accepts control-point patch lists. */
+    pipeline->topology = vio_topology_to_d3d11(
+        shader->hs ? VIO_PATCHES : desc->topology, desc->patch_vertices);
 
     /* Input layout from vertex attributes.
      * Separate per-vertex (slot 0, locations 0-2) from per-instance (slot 1, locations 3-6). */
@@ -600,6 +615,9 @@ static void d3d11_destroy_pipeline(void *pipeline_ptr)
     if (d3d11_current_pipeline == p) d3d11_current_pipeline = NULL;
     if (p->vs)                 ID3D11VertexShader_Release(p->vs);
     if (p->ps)                 ID3D11PixelShader_Release(p->ps);
+    if (p->gs)                 ID3D11GeometryShader_Release(p->gs);
+    if (p->hs)                 ID3D11HullShader_Release(p->hs);
+    if (p->ds)                 ID3D11DomainShader_Release(p->ds);
     if (p->input_layout)       ID3D11InputLayout_Release(p->input_layout);
     if (p->rasterizer_state)   ID3D11RasterizerState_Release(p->rasterizer_state);
     if (p->depth_stencil_state) ID3D11DepthStencilState_Release(p->depth_stencil_state);
@@ -617,6 +635,12 @@ static void d3d11_bind_pipeline(void *pipeline_ptr)
     ID3D11DeviceContext_IASetPrimitiveTopology(vio_d3d11.context, p->topology);
     ID3D11DeviceContext_VSSetShader(vio_d3d11.context, p->vs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(vio_d3d11.context, p->ps, NULL, 0);
+    /* Always (re)set the optional stages: a NULL unbinds whatever the previous
+     * pipeline left on the context, otherwise a stale GS / HS / DS would keep
+     * running for every later draw. */
+    ID3D11DeviceContext_GSSetShader(vio_d3d11.context, p->gs, NULL, 0);
+    ID3D11DeviceContext_HSSetShader(vio_d3d11.context, p->hs, NULL, 0);
+    ID3D11DeviceContext_DSSetShader(vio_d3d11.context, p->ds, NULL, 0);
     ID3D11DeviceContext_RSSetState(vio_d3d11.context, p->rasterizer_state);
     ID3D11DeviceContext_OMSetDepthStencilState(vio_d3d11.context, p->depth_stencil_state, 0);
 
@@ -1605,6 +1629,59 @@ static int d3d11_upload_cubemap(void *cm_obj, int width, int height, const void 
 
 /* ── Shaders ──────────────────────────────────────────────────────── */
 
+/* One optional stage (geometry / hull / domain): SPIR-V or GLSL -> HLSL ->
+ * DXBC blob. `format` selects the transpile path exactly like the VS / PS
+ * code below (HLSL source is passed through for VIO_SHADER_HLSL / MSL). */
+static ID3DBlob *d3d11_compile_stage_blob(const void *data, size_t size, int stage, int fixup_depth,
+                                          const char *profile, const char *label,
+                                          UINT compile_flags, vio_shader_format format)
+{
+    const char *hlsl = NULL;
+    char *allocated = NULL;
+    if (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW || format == VIO_SHADER_AUTO) {
+        char *err = NULL;
+        uint32_t *spirv = NULL;
+        size_t spirv_size = 0;
+        int free_spirv = 0;
+        int is_spirv = (size >= 4 && *(const uint32_t *)data == 0x07230203);
+        if (is_spirv) {
+            spirv = (uint32_t *)data;
+            spirv_size = size;
+        } else {
+            spirv = vio_compile_glsl_stage_to_spirv((const char *)data, stage, &spirv_size, &err);
+            if (!spirv) {
+                php_error_docref(NULL, E_WARNING, "D3D11: %s GLSL->SPIR-V failed: %s", label, err ? err : "unknown");
+                if (err) free(err);
+                return NULL;
+            }
+            free_spirv = 1;
+        }
+        allocated = vio_spirv_to_hlsl_ex(spirv, spirv_size, 50, fixup_depth, &err);
+        if (free_spirv) free(spirv);
+        if (!allocated) {
+            php_error_docref(NULL, E_WARNING, "D3D11: %s SPIR-V->HLSL failed: %s", label, err ? err : "unknown");
+            if (err) free(err);
+            return NULL;
+        }
+        hlsl = allocated;
+    } else {
+        hlsl = (const char *)data;
+    }
+
+    ID3DBlob *blob = NULL, *error_blob = NULL;
+    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), label, NULL, NULL, "main", profile,
+                            compile_flags, 0, &blob, &error_blob);
+    if (allocated) free(allocated);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D11: %s compile failed: %s", label,
+                         error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
+        if (error_blob) ID3D10Blob_Release(error_blob);
+        return NULL;
+    }
+    if (error_blob) ID3D10Blob_Release(error_blob);
+    return blob;
+}
+
 static void *d3d11_compile_shader(vio_shader_desc *desc)
 {
     vio_d3d11_shader *shader = calloc(1, sizeof(vio_d3d11_shader));
@@ -1661,8 +1738,10 @@ static void *d3d11_compile_shader(vio_shader_desc *desc)
             free_ps_spirv = 1;
         }
 
-        /* SPIR-V -> HLSL (Shader Model 5.0) */
-        allocated_vs = vio_spirv_to_hlsl(vs_spirv, vs_spirv_size, 50, &err);
+        /* SPIR-V -> HLSL (Shader Model 5.0). The GL->D3D depth fixup goes on the
+         * LAST stage that writes gl_Position (GS, else DS, else VS). */
+        int vs_is_last = !desc->geometry_data && !desc->tess_eval_data;
+        allocated_vs = vio_spirv_to_hlsl_ex(vs_spirv, vs_spirv_size, 50, vs_is_last, &err);
         if (free_vs_spirv) free(vs_spirv);
         if (!allocated_vs) {
             php_error_docref(NULL, E_WARNING, "D3D11: VS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -1732,6 +1811,39 @@ static void *d3d11_compile_shader(vio_shader_desc *desc)
                                          NULL, &shader->ps);
     if (FAILED(hr)) goto fail;
 
+    /* Optional stages: geometry (gs_5_0), hull (hs_5_0), domain (ds_5_0). */
+    {
+        struct { const void *data; size_t size; int stage; const char *profile;
+                 const char *label; int fixup; } extra[3] = {
+            { desc->geometry_data,     desc->geometry_size,     VIO_STAGE_GEOMETRY,     "gs_5_0", "GS", 1 },
+            { desc->tess_control_data, desc->tess_control_size, VIO_STAGE_TESS_CONTROL, "hs_5_0", "HS", 0 },
+            { desc->tess_eval_data,    desc->tess_eval_size,    VIO_STAGE_TESS_EVAL,    "ds_5_0", "DS",
+              desc->geometry_data ? 0 : 1 },
+        };
+        for (int i = 0; i < 3; i++) {
+            if (!extra[i].data) continue;
+            ID3DBlob *blob = d3d11_compile_stage_blob(extra[i].data, extra[i].size, extra[i].stage,
+                                                      extra[i].fixup, extra[i].profile, extra[i].label,
+                                                      compile_flags, desc->format);
+            if (!blob) goto fail;
+            const void *bc = ID3D10Blob_GetBufferPointer(blob);
+            SIZE_T bl = ID3D10Blob_GetBufferSize(blob);
+            switch (extra[i].stage) {
+                case VIO_STAGE_GEOMETRY:
+                    hr = ID3D11Device_CreateGeometryShader(vio_d3d11.device, bc, bl, NULL, &shader->gs); break;
+                case VIO_STAGE_TESS_CONTROL:
+                    hr = ID3D11Device_CreateHullShader(vio_d3d11.device, bc, bl, NULL, &shader->hs); break;
+                default:
+                    hr = ID3D11Device_CreateDomainShader(vio_d3d11.device, bc, bl, NULL, &shader->ds); break;
+            }
+            ID3D10Blob_Release(blob);
+            if (FAILED(hr)) {
+                php_error_docref(NULL, E_WARNING, "D3D11: %s object creation failed (0x%08lx)", extra[i].label, hr);
+                goto fail;
+            }
+        }
+    }
+
     if (allocated_vs) free(allocated_vs);
     if (allocated_ps) free(allocated_ps);
     return shader;
@@ -1743,6 +1855,9 @@ fail:
     if (shader->ps_blob) ID3D10Blob_Release(shader->ps_blob);
     if (shader->vs) ID3D11VertexShader_Release(shader->vs);
     if (shader->ps) ID3D11PixelShader_Release(shader->ps);
+    if (shader->gs) ID3D11GeometryShader_Release(shader->gs);
+    if (shader->hs) ID3D11HullShader_Release(shader->hs);
+    if (shader->ds) ID3D11DomainShader_Release(shader->ds);
     free(shader);
     return NULL;
 }
@@ -1754,9 +1869,32 @@ static void d3d11_destroy_shader(void *shader_ptr)
 
     if (s->vs) ID3D11VertexShader_Release(s->vs);
     if (s->ps) ID3D11PixelShader_Release(s->ps);
+    if (s->gs) ID3D11GeometryShader_Release(s->gs);
+    if (s->hs) ID3D11HullShader_Release(s->hs);
+    if (s->ds) ID3D11DomainShader_Release(s->ds);
     if (s->vs_blob) ID3D10Blob_Release(s->vs_blob);
     if (s->ps_blob) ID3D10Blob_Release(s->ps_blob);
     free(s);
+}
+
+/* Bind the constant block of a geometry / hull / domain stage at that stage's
+ * b0. The generic draw path has already UpdateSubresource'd the data into
+ * backend_buffer (update_buffer) when it was dirty. */
+static void d3d11_bind_stage_constants(int stage, void *backend_buffer,
+                                       const void *data, size_t size)
+{
+    (void)data; (void)size;
+    vio_d3d11_buffer *cb = (vio_d3d11_buffer *)backend_buffer;
+    if (!cb || !cb->buffer || !vio_d3d11.context) return;
+    switch (stage) {
+        case VIO_STAGE_GEOMETRY:
+            ID3D11DeviceContext_GSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer); break;
+        case VIO_STAGE_TESS_CONTROL:
+            ID3D11DeviceContext_HSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer); break;
+        case VIO_STAGE_TESS_EVAL:
+            ID3D11DeviceContext_DSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer); break;
+        default: break;
+    }
 }
 
 /* ── Drawing ──────────────────────────────────────────────────────── */
@@ -2562,15 +2700,51 @@ static size_t d3d11_read_buffer(void *backend_buffer, void *out, size_t size)
 
 /* ── Feature Query ────────────────────────────────────────────────── */
 
+/* Second half of the optional-stage probe: SPIRV-Cross may emit HLSL for a
+ * geometry / hull / domain stage that FXC then rejects (an undeclared `gl_in`
+ * in the GS body was the first case seen), so the flag is only 1 when the
+ * canonical stage also compiles for the profile this backend uses. Cached
+ * per stage for the process. */
+static int d3d11_stage_supported(int stage, const char *profile)
+{
+    static int cache[VIO_STAGE_COUNT] = { -1, -1, -1, -1, -1 };
+    if (stage < 0 || stage >= VIO_STAGE_COUNT) return 0;
+    if (cache[stage] >= 0) return cache[stage];
+    int ok = 0;
+    if (vio_hlsl_stage_supported(stage)) {
+        char *hlsl = vio_hlsl_probe_hlsl(stage, 50);
+        if (hlsl) {
+            ID3DBlob *blob = NULL, *errs = NULL;
+            HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "probe", NULL, NULL, "main", profile,
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &errs);
+            ok = SUCCEEDED(hr) ? 1 : 0;
+            if (!ok && getenv("VIO_DEBUG_STAGE_PROBE")) {
+                fprintf(stderr, "[vio] D3D11 stage probe %d (%s): FXC rejected the SPIRV-Cross HLSL: %s\n",
+                        stage, profile, errs ? (const char *)ID3D10Blob_GetBufferPointer(errs) : "unknown");
+            }
+            if (blob) ID3D10Blob_Release(blob);
+            if (errs) ID3D10Blob_Release(errs);
+            free(hlsl);
+        }
+    }
+    cache[stage] = ok;
+    return ok;
+}
+
 static int d3d11_supports_feature(vio_feature feature)
 {
     switch (feature) {
         case VIO_FEATURE_COMPUTE:      return 1; /* compute pipeline + dispatch + readback wired */
-        /* The hardware can, but vio_shader_desc only carries a vertex + fragment
-         * stage — there is no way to hand a GS / HS / DS to the backend, so the
-         * flags must not promise it. */
-        case VIO_FEATURE_TESSELLATION: return 0;
-        case VIO_FEATURE_GEOMETRY:     return 0;
+        /* vio_shader 'geometry' / 'tess_control' + 'tess_eval': SPIR-V -> HLSL
+         * gs/hs/ds_5_0 via SPIRV-Cross, bound per pipeline. The device is
+         * created at feature level 11_0+, which guarantees both stages on the
+         * GPU side; the flag additionally requires a SPIRV-Cross that can emit
+         * the stage (older Vulkan-SDK builds cannot - vio_hlsl_stage_supported). */
+        case VIO_FEATURE_TESSELLATION:
+            return vio_d3d11.feature_level >= D3D_FEATURE_LEVEL_11_0
+                && d3d11_stage_supported(VIO_STAGE_TESS_CONTROL, "hs_5_0")
+                && d3d11_stage_supported(VIO_STAGE_TESS_EVAL, "ds_5_0");
+        case VIO_FEATURE_GEOMETRY:     return d3d11_stage_supported(VIO_STAGE_GEOMETRY, "gs_5_0");
         case VIO_FEATURE_RAYTRACING:   return 0; /* No DXR in D3D11 */
         case VIO_FEATURE_MULTIVIEW:    return 0;
         case VIO_FEATURE_3D_PIPELINE:  return 1;
@@ -2663,6 +2837,24 @@ static void d3d11_bind_texture(void *texture, int slot)
      * Comparison sampler is bound via d3d11_bind_texture_cmp (for sampler2DShadow). */
     if (tex->sampler) {
         ID3D11DeviceContext_PSSetSamplers(vio_d3d11.context, (UINT)slot, 1, &tex->sampler);
+    }
+    /* Mirror the binding into the optional stages of the bound pipeline so a
+     * domain shader can read a displacement map (same register as the
+     * fragment-stage map resolves the unit to). */
+    vio_d3d11_pipeline *p = d3d11_current_pipeline;
+    if (p && tex->srv) {
+        if (p->gs) {
+            ID3D11DeviceContext_GSSetShaderResources(vio_d3d11.context, (UINT)slot, 1, &tex->srv);
+            if (tex->sampler) ID3D11DeviceContext_GSSetSamplers(vio_d3d11.context, (UINT)slot, 1, &tex->sampler);
+        }
+        if (p->hs) {
+            ID3D11DeviceContext_HSSetShaderResources(vio_d3d11.context, (UINT)slot, 1, &tex->srv);
+            if (tex->sampler) ID3D11DeviceContext_HSSetSamplers(vio_d3d11.context, (UINT)slot, 1, &tex->sampler);
+        }
+        if (p->ds) {
+            ID3D11DeviceContext_DSSetShaderResources(vio_d3d11.context, (UINT)slot, 1, &tex->srv);
+            if (tex->sampler) ID3D11DeviceContext_DSSetSamplers(vio_d3d11.context, (UINT)slot, 1, &tex->sampler);
+        }
     }
 }
 
@@ -2777,6 +2969,7 @@ static const vio_backend d3d11_backend = {
     .read_render_target      = d3d11_read_render_target,
     .generate_mipmaps        = d3d11_generate_mipmaps,
     .upload_cubemap          = d3d11_upload_cubemap,
+    .bind_stage_constants    = d3d11_bind_stage_constants,
 };
 
 void vio_backend_d3d11_register(void)

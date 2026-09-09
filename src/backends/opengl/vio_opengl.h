@@ -60,12 +60,24 @@ typedef struct _vio_opengl_state {
      * surface them without re-entering GL from php_vio.c. */
     char        *renderer;
     char        *vendor;
+
+    /* Topology of the bound pipeline (vio_topology; VIO_TRIANGLES = 0 is the
+     * default even after a memset - GL_POINTS is 0, so the GLenum itself must
+     * not be stored) and, for VIO_PATCHES, the control-point count applied
+     * via glPatchParameteri. */
+    int          draw_topology;
+    int          patch_vertices;
 } vio_opengl_state;
 
 extern vio_opengl_state vio_gl;
 
 /* Shader helpers */
 unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *frag_src);
+/* Link a program from vertex + fragment plus optional geometry / tessellation
+ * control / tessellation evaluation sources (NULL = stage absent). */
+unsigned int vio_opengl_compile_program(const char *vert_src, const char *frag_src,
+                                        const char *geom_src, const char *tesc_src,
+                                        const char *tese_src);
 void vio_opengl_delete_program(unsigned int program);
 
 /* Returns the GLSL version (e.g. 330) matching the active GL context.

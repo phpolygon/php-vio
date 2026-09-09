@@ -9,9 +9,93 @@
 #include "../php_vio.h"
 #include "vio_shader.h"
 #include "vio_shader_reflect.h"
+#include "vio_shader_compiler.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+/* Canonical minimal stages for vio_hlsl_stage_supported(). They use the
+ * builtins every real shader of that stage needs (gl_InvocationID, tess
+ * levels, gl_TessCoord) so an "Unsupported builtin / execution model" from
+ * an older SPIRV-Cross is caught here, not at vio_shader() time.
+ *
+ * The geometry probe deliberately reads its input position from a user
+ * varying, not from gl_in[].gl_Position: SPIRV-Cross's HLSL geometry support
+ * (2025-05) emits `gl_in` unresolved for the builtin block - FXC then fails
+ * with "undeclared identifier 'gl_in'" - while location-qualified inputs are
+ * flattened correctly (its own test shaders use only that form). So the
+ * portable contract for a GS is: the vertex stage exports the position
+ * as `layout(location = N) out vec4`, the GS reads `...In[i]`. */
+static const char *vio_hlsl_probe_source(int stage)
+{
+    switch (stage) {
+        case VIO_STAGE_VERTEX:
+            return "#version 330 core\nlayout(location=0) in vec3 p;\nvoid main(){ gl_Position = vec4(p, 1.0); }\n";
+        case VIO_STAGE_FRAGMENT:
+            return "#version 330 core\nlayout(location=0) out vec4 o;\nvoid main(){ o = vec4(1.0); }\n";
+        case VIO_STAGE_GEOMETRY:
+            /* #version 450: location qualifiers on stage varyings need 410+. */
+            return "#version 450\nlayout(points) in;\nlayout(triangle_strip, max_vertices = 3) out;\n"
+                   "layout(location = 0) in vec4 vPos[];\nuniform float u_half;\n"
+                   "void main(){ for (int i = 0; i < 3; i++) { gl_Position = vPos[0] + vec4(u_half * float(i), 0.0, 0.0, 0.0); EmitVertex(); } EndPrimitive(); }\n";
+        case VIO_STAGE_TESS_CONTROL:
+            return "#version 400 core\nlayout(vertices = 3) out;\n"
+                   "void main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+                   "  if (gl_InvocationID == 0) { gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0; gl_TessLevelOuter[2] = 1.0; gl_TessLevelInner[0] = 1.0; } }\n";
+        case VIO_STAGE_TESS_EVAL:
+            return "#version 400 core\nlayout(triangles, equal_spacing, ccw) in;\n"
+                   "void main(){ gl_Position = gl_in[0].gl_Position * gl_TessCoord.x + gl_in[1].gl_Position * gl_TessCoord.y + gl_in[2].gl_Position * gl_TessCoord.z; }\n";
+        default:
+            return NULL;
+    }
+}
+
+int vio_hlsl_stage_supported(int stage)
+{
+    static int cache[VIO_STAGE_COUNT] = { -1, -1, -1, -1, -1 };
+    if (stage < 0 || stage >= VIO_STAGE_COUNT) return 0;
+    if (cache[stage] >= 0) return cache[stage];
+
+    int ok = 0;
+    const char *src = vio_hlsl_probe_source(stage);
+    if (src) {
+        size_t spirv_size = 0;
+        char *err = NULL;
+        uint32_t *spirv = vio_compile_glsl_stage_to_spirv(src, stage, &spirv_size, &err);
+        if (!spirv && getenv("VIO_DEBUG_STAGE_PROBE")) {
+            fprintf(stderr, "[vio] stage probe %d: GLSL->SPIR-V failed: %s\n", stage, err ? err : "unknown");
+        }
+        if (err) free(err);
+        err = NULL;
+        if (spirv) {
+            char *hlsl = vio_spirv_to_hlsl_ex(spirv, spirv_size, 50, 0, &err);
+            if (hlsl) { ok = 1; free(hlsl); }
+            else if (getenv("VIO_DEBUG_STAGE_PROBE")) {
+                fprintf(stderr, "[vio] stage probe %d: SPIR-V->HLSL failed: %s\n", stage, err ? err : "unknown");
+            }
+            if (err) free(err);
+            free(spirv);
+        }
+    }
+    cache[stage] = ok;
+    return ok;
+}
+
+char *vio_hlsl_probe_hlsl(int stage, int shader_model)
+{
+    const char *src = vio_hlsl_probe_source(stage);
+    if (!src) return NULL;
+    size_t spirv_size = 0;
+    char *err = NULL;
+    uint32_t *spirv = vio_compile_glsl_stage_to_spirv(src, stage, &spirv_size, &err);
+    if (err) free(err);
+    if (!spirv) return NULL;
+    err = NULL;
+    char *hlsl = vio_spirv_to_hlsl_ex(spirv, spirv_size, shader_model, 0, &err);
+    if (err) free(err);
+    free(spirv);
+    return hlsl;
+}
 
 #ifdef HAVE_SPIRV_CROSS
 
@@ -176,6 +260,12 @@ char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_ms
 
 char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_model, char **error_msg)
 {
+    return vio_spirv_to_hlsl_ex(spirv, spirv_size, shader_model, 1, error_msg);
+}
+
+char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_model,
+                           int fixup_depth, char **error_msg)
+{
     spvc_context ctx = NULL;
     spvc_parsed_ir ir = NULL;
     spvc_compiler compiler = NULL;
@@ -207,8 +297,11 @@ char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_mod
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT, SPVC_TRUE);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_COORD_COMPAT, SPVC_TRUE);
     /* Map OpenGL clip space z [-1,1] to D3D11 clip space z [0,1]:
-     * Emits gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5 */
-    spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_FIXUP_DEPTH_CONVENTION, SPVC_TRUE);
+     * Emits gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5.
+     * Only for the LAST vertex-like stage (VS, or the GS / TES behind it) -
+     * SPIRV-Cross would otherwise convert once per stage. */
+    spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_FIXUP_DEPTH_CONVENTION,
+                                   fixup_depth ? SPVC_TRUE : SPVC_FALSE);
     spvc_compiler_install_compiler_options(compiler, options);
 
     /* Remap combined image-samplers to avoid overlapping register semantics.
@@ -552,6 +645,14 @@ char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_ms
 char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_model, char **error_msg)
 {
     (void)spirv; (void)spirv_size; (void)shader_model;
+    if (error_msg) *error_msg = strdup("spirv-cross not available (compile with --with-spirv-cross)");
+    return NULL;
+}
+
+char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_model,
+                           int fixup_depth, char **error_msg)
+{
+    (void)spirv; (void)spirv_size; (void)shader_model; (void)fixup_depth;
     if (error_msg) *error_msg = strdup("spirv-cross not available (compile with --with-spirv-cross)");
     return NULL;
 }

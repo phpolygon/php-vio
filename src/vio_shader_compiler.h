@@ -24,6 +24,11 @@ void vio_shader_compiler_shutdown(void);
 uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
                                      size_t *out_size, char **error_msg);
 
+/* Compile one graphics stage (vio_shader_stage: vertex / fragment / geometry /
+ * tess control / tess eval) to SPIR-V. Same ownership contract as above. */
+uint32_t *vio_compile_glsl_stage_to_spirv(const char *source, int stage,
+                                           size_t *out_size, char **error_msg);
+
 /* Compile a GLSL compute shader to SPIR-V (GLSLANG_STAGE_COMPUTE).
  * Same ownership contract as vio_compile_glsl_to_spirv. */
 uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,

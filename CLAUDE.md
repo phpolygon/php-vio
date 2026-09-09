@@ -91,10 +91,11 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-112 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+114 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/109–110` | Geometry-Stage (`vio_shader(['geometry' => …])`, Punkt → Quad, GS-Uniform, Unbind-Regression) und Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`/`patch_vertices`, Quad-Patch → Disc, Kantenzahl folgt dem TCS-Uniform). Iterieren über `opengl/d3d11/d3d12/metal`; Backend mit Flag 0 → `skip`. |
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
 | `tests/render3d/096–098` | Storage-Images + 2D-Dispatch (API-Roadmap R2/R7), Multiple Render Targets (R1), Async-Compute im Frame (R7) |
 | `tests/backends/108` | OpenGL: `vio_set_uniform()` erreicht UBO-Block-Member, Default-Block-Uniforms und Array-Elemente von SPIR-V-Pfad-Shadern (SPIRV-Cross flacht sie zu `uniform Matrices _19;` ab → GL-Name `_19.uProjection`). |
@@ -161,6 +162,17 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Storage-Images (`'storage' => true` + `vio_compute_bind_image`) | ✅ (wenn Compute) | ✅† | ✅† | ❌ | ✅ |
 | Compute-`local_size` aus Reflection (2D/3D-Dispatch) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Async-Dispatch im Frame (`['async' => true]`, `vio_compute_wait`) | ✅ (Queue in-order) | ✅ (in-order) | ✅† (Frame-List) | sync | ✅ (Frame-Cmd-Buffer) |
+| Geometry-Stage (`vio_shader(['geometry' => …])`) | ✅ (GL ≥ 3.2) | ✅‡ | ✅‡ | ❌ | ❌ (kein GS in Metal) |
+| Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`) | ✅ (GL ≥ 4.0) | ✅‡ | ✅‡ | ❌ | ❌ (Follow-up: compute-basiert) |
+
+‡ D3D: das Flag ist nur 1, wenn das gelinkte SPIRV-Cross HLSL für die Stage emittiert **und FXC
+es annimmt** (`vio_hlsl_stage_supported()` + `d3d1x_stage_supported()`, Probe einmal pro Prozess;
+`VIO_DEBUG_STAGE_PROBE=1` druckt den Grund). Stand SPIRV-Cross `main` 2026-09: **Geometry ja**
+(seit 2025-05), aber nur mit Positionen aus User-Varyings — `gl_in[].gl_Position` wird als
+unaufgelöstes `gl_in` emittiert; **Hull/Domain nein** („Unsupported execution model"), das Flag
+bleibt 0 und `vio_shader` lehnt `tess_control`/`tess_eval` auf D3D ab. Das Vulkan-SDK 1.3.296 der
+Windows-CI kann keins von beiden → 109/110 skippen dort auf D3D. Lokal gegen einen Build aus
+`main` (`C:\php-sdk\spirv-cross-main`) verifiziert: 109 rendert auf D3D11/D3D12 (WARP).
 
 † D3D11/D3D12: implementiert, aber ohne Windows-Build hier nur blind editiert — Windows-CI
 (WARP) ist der Beleg (`tests/render3d/096`, `097`). **Offen auf D3D12/WARP:** eine von der GPU
@@ -169,11 +181,43 @@ folgenden Pass veraltete Daten, hochgeladene Texturen nicht; die MRT-Readbacks s
 korrekt. Die betroffenen Pixel-Checks in 096/097 sind auf D3D12 deaktiviert (FOLLOW-UP).
 
 \* OpenGL/D3D melden `RENDER_TARGET_MSAA = 1`, ignorieren `samples` aber (alle RTs
-single-sampled); D3D meldet auch `TESSELLATION`/`GEOMETRY = 1` ohne Hull/Geometry-Stage.
-Metal ist aktuell das einzige Backend mit echtem MSAA-Resolve.
+single-sampled). Metal ist aktuell das einzige Backend mit echtem MSAA-Resolve.
 
 Vulkan ist in vio 2D-only; 3D lief historisch über die separate php-vulkan-Extension.
-Metal, Geometry-/Tessellation-Shader gibt es in Metal nicht (`VIO_FEATURE_GEOMETRY == 0`).
+Geometry-/Tessellation-Shader gibt es in Metal nicht (`VIO_FEATURE_GEOMETRY == 0`).
+
+#### Geometry- und Tessellation-Stages (`vio_shader` `geometry` / `tess_control` + `tess_eval`)
+
+- **API**: `vio_shader($ctx, ['vertex' => …, 'geometry' => $gs, 'fragment' => …])` bzw.
+  `['tess_control' => $tcs, 'tess_eval' => $tes]` (immer als Paar). Pipeline mit Tessellation
+  zeichnet **immer** `VIO_PATCHES` (`'patch_vertices' => N`, 1..32, Default 3), egal was
+  `topology` sagt. `vio_shader_reflect()` liefert die Stages unter denselben Keys.
+- **Gate**: `vio_shader()` lehnt die Stage vor jedem Backend-Aufruf ab, wenn
+  `VIO_FEATURE_GEOMETRY`/`TESSELLATION` 0 ist (Warning + `false`) — kein Backend-Zweig in
+  `php_vio.c`, Audit-Gate 099 bleibt unverändert.
+- **OpenGL**: alle Stages hängen im selben Programm (`vio_opengl_compile_program`). Draw-Mode
+  kommt seit diesem Feature aus der Pipeline-Topology (`vio_gl.draw_topology`; vorher war
+  jeder Mesh-Draw hart `GL_TRIANGLES` — `VIO_LINES`/`VIO_POINTS` wirken jetzt auch auf GL).
+  Ein Uniform, das mehrere Stages deklarieren, wird von SPIRV-Cross pro Stage als eigenes
+  Struct-Uniform (`_19.u_mvp`, `_27.u_mvp`) emittiert; `opengl_set_uniform` schreibt bis zu
+  drei Treffer (`gl_uniform_location_all`).
+- **D3D11/D3D12**: SPIR-V → HLSL `gs/hs/ds_5_0|5_1`. Der GL→D3D-Depth-Fixup (`z' = (z+w)/2`)
+  wird nur in der **letzten** Position-schreibenden Stage angewandt (`vio_spirv_to_hlsl_ex`),
+  sonst konvertiert SPIRV-Cross pro Stage doppelt. Jede Extra-Stage hat ihren eigenen
+  Constant-Block (`vio_shader_stage_cb`, Vtable-Slot `bind_stage_constants`: D3D11
+  `GS/HS/DSSetConstantBuffers b0`, D3D12 Root-CBV-Slice aus dem Frame-Ring). D3D12-Root-Signature:
+  `[5..7]` CBV, `[8..10]` SRV-Table, `[11..13]` Sampler-Table mit GEOMETRY/HULL/DOMAIN-Visibility
+  (`VIO_D3D12_RP_*`), gespiegelt vom PS-Block beim Flush. `bind_pipeline` setzt fehlende Stages
+  explizit auf NULL (D3D11), sonst liefe ein GS der vorigen Pipeline weiter.
+- **Portabler GS**: Positionen als `layout(location = N) out vec4` aus dem VS exportieren und im
+  GS über `...In[i]`/`vPos[i]` lesen statt `gl_in[i].gl_Position` — auf OpenGL geht beides, auf
+  D3D nur das Varying (SPIRV-Cross-Limitierung, s. ‡ in der Matrix). Test 109 zeigt das Muster.
+- **Texturen in Extra-Stages** (D3D): werden an dasselbe Register gebunden, das die
+  Fragment-Sampler-Map der GL-Unit zuweist; Sampler, die nur eine Extra-Stage deklariert, werden
+  per Replay des Register-Schemas ergänzt. Sampler in allen Stages in derselben Reihenfolge
+  deklarieren.
+- **Vertex-Storage / Instancing** funktionieren mit Extra-Stages unverändert (Cbuffer-Push in
+  allen Draw-Pfaden über `vio_push_extra_stage_constants`).
 
 #### Metal-3D-Pipeline (`src/backends/metal/vio_metal.m`)
 
@@ -438,6 +482,13 @@ vio_draw($ctx, $mesh);
 vio_draw_instanced($ctx, $mesh, $matrices /* array|packed string */, $count);
 vio_submit_batch($ctx, $draws);            // mehrere Draws in einem Call
 vio_draw_3d($ctx);                          // flush_draw_state nach dem 3D-Pass
+
+// Geometry- / Tessellation-Stages (Gate: VIO_FEATURE_GEOMETRY / VIO_FEATURE_TESSELLATION)
+$gsShader = vio_shader($ctx, ["vertex" => $vs, "geometry" => $gs, "fragment" => $fs]);   // z.B. Punkt → Billboard-Quad
+$gsPipe   = vio_pipeline($ctx, ["shader" => $gsShader, "topology" => VIO_POINTS]);
+$tessShader = vio_shader($ctx, ["vertex" => $vs, "tess_control" => $tcs, "tess_eval" => $tes, "fragment" => $fs]);
+$tessPipe   = vio_pipeline($ctx, ["shader" => $tessShader, "patch_vertices" => 4]);        // zeichnet immer VIO_PATCHES
+vio_set_uniform($ctx, "u_level", 16.0);     // Uniforms der Extra-Stages wie gewohnt
 
 // Render Targets (Objekt-API + Stack)
 $rt = vio_render_target($ctx, ["width" => 512, "height" => 512, "hdr" => true, "depth_only" => false, "samples" => 4]);
@@ -712,7 +763,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 109), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 111), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -782,9 +833,10 @@ gegen die Homebrew-Formel mit identischer Modul-API und das `.so` dann in Herd e
 Aufrufer geändert hat:
 
 - **Feature-Flags sind ehrlich**: Vulkan meldet `3D_PIPELINE/INSTANCED_DRAW/DEPTH_BIAS/
-  TESSELLATION/GEOMETRY = 0`, D3D11/D3D12 melden `TESSELLATION/GEOMETRY = 0` (kein GS/HS/DS
-  über `vio_shader`), D3D12 `RENDER_TARGET_MSAA = 0` (PSO braucht `SampleDesc`, Phase 5),
-  D3D12 `TEXTURE_SWIZZLE = 1`. `074` pinnt jetzt auch d3d11/d3d12/vulkan.
+  TESSELLATION/GEOMETRY = 0`, D3D11/D3D12 melden `TESSELLATION/GEOMETRY` nur 1, wenn das
+  gelinkte SPIRV-Cross die Stage nach HLSL bringt (seit dem Stage-Feature, s.o.), D3D12
+  `RENDER_TARGET_MSAA = 0` (PSO braucht `SampleDesc`, Phase 5), D3D12 `TEXTURE_SWIZZLE = 1`.
+  `074` pinnt jetzt auch d3d11/d3d12/vulkan (ohne die zwei probe-abhängigen Flags).
 - **`auto` überspringt Backends ohne 3D-Pipeline**, wenn ein späterer Kandidat eine hat
   (Linux: OpenGL vor Vulkan, solange Vulkan-3D fehlt). Test `100`.
 - **Audit-Gate `099`** friert `strcmp(ctx->backend->name, …)` (66) und `#if HAVE_D3D11/

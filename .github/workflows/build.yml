@@ -461,7 +461,9 @@ jobs:
             tests/render3d/105_render_target_msaa_resolve.phpt `
             tests/backends/106_vulkan_present_mode.phpt `
             tests/backends/107_opengl_context_generation.phpt `
-            tests/backends/108_opengl_spirv_uniform_names.phpt
+            tests/backends/108_opengl_spirv_uniform_names.phpt `
+            tests/render3d/109_geometry_shader_all_backends.phpt `
+            tests/render3d/110_tessellation_all_backends.phpt
 
       - name: Package binary
         shell: pwsh

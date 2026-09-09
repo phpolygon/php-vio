@@ -30,6 +30,7 @@
 #include "vio_d3d12.h"
 #include "../vio_d3d_common.h"
 #include "../../vio_shader_reflect.h"   /* vio_spirv_reflect — data-driven compute register mapping */
+#include "../../vio_shader_compiler.h"  /* vio_compile_glsl_stage_to_spirv — geometry / tessellation stages */
 #include "../../vio_texture.h"          /* vio_texture_object — storage-image binds */
 #include <string.h>
 #include <stdlib.h>
@@ -276,7 +277,7 @@ extern uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
 /* ── Helpers ──────────────────────────────────────────────────────── */
 /* vio_format_to_dxgi, vio_format_byte_size, vio_usage_to_semantic from vio_d3d_common.h */
 
-static D3D12_PRIMITIVE_TOPOLOGY vio_topology_to_d3d12(vio_topology t)
+static D3D12_PRIMITIVE_TOPOLOGY vio_topology_to_d3d12(vio_topology t, int patch_vertices)
 {
     switch (t) {
         case VIO_TRIANGLES:      return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -285,6 +286,12 @@ static D3D12_PRIMITIVE_TOPOLOGY vio_topology_to_d3d12(vio_topology t)
         case VIO_LINE_STRIP:     return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
         case VIO_POINTS:         return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
         case VIO_TRIANGLE_FAN:   return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        case VIO_PATCHES: {
+            /* N_CONTROL_POINT_PATCHLIST values are contiguous from 1 (=33). */
+            int n = patch_vertices > 0 ? patch_vertices : 3;
+            if (n > 32) n = 32;
+            return (D3D12_PRIMITIVE_TOPOLOGY)(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + (n - 1));
+        }
         default:                 return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     }
 }
@@ -298,6 +305,7 @@ static D3D12_PRIMITIVE_TOPOLOGY_TYPE vio_topology_to_d3d12_type(vio_topology t)
         case VIO_LINES:
         case VIO_LINE_STRIP:     return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
         case VIO_POINTS:         return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        case VIO_PATCHES:        return D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
         default:                 return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     }
 }
@@ -406,8 +414,17 @@ static int d3d12_create_root_signature(void)
      *       visibility, which D3D12 permits. A root SRV (raw/structured buffer)
      *       set via SetGraphicsRootShaderResourceView; unused by shaders that
      *       don't declare the SSBO, so normal draws leave it unset.
+     *
+     *   [5..7]   CBV b0 for the GEOMETRY / HULL / DOMAIN stage (vio_shader
+     *            'geometry' / 'tess_control' / 'tess_eval' constant blocks).
+     *   [8..10]  SRV table t0..t15 with GEOMETRY / HULL / DOMAIN visibility -
+     *            the per-draw SRV block bound at [2] is re-pointed here when
+     *            the bound pipeline has the stage (vio_d3d12_flush_srv_table).
+     *   [11..13] Sampler table s0..s7, same replication as the SRV table.
+     *   Indices: VIO_D3D12_RP_* in vio_d3d12.h. Root cost: 5 CBVs (10 DWORDs)
+     *   + 1 root SRV (2) + 8 tables (8) = 20 of 64 DWORDs.
      */
-    D3D12_ROOT_PARAMETER params[5] = {0};
+    D3D12_ROOT_PARAMETER params[VIO_D3D12_RP_COUNT] = {0};
 
     /* [0] CBV b0 — vertex shader only */
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -458,6 +475,34 @@ static int d3d12_create_root_signature(void)
     params[4].DescriptorTable.pDescriptorRanges = &sampler_range;
     params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+    /* [5..13] Optional-stage mirrors: CBV b0, SRV table, sampler table per
+     * GEOMETRY / HULL / DOMAIN visibility. Same register ranges as the PS /
+     * VS ones - D3D12 allows the overlap because the visibilities differ. */
+    {
+        const D3D12_SHADER_VISIBILITY vis[3] = {
+            D3D12_SHADER_VISIBILITY_GEOMETRY, D3D12_SHADER_VISIBILITY_HULL, D3D12_SHADER_VISIBILITY_DOMAIN
+        };
+        for (int s = 0; s < 3; s++) {
+            D3D12_ROOT_PARAMETER *cbv = &params[VIO_D3D12_RP_GS_CBV + s];
+            cbv->ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            cbv->Descriptor.ShaderRegister = 0;
+            cbv->Descriptor.RegisterSpace = 0;
+            cbv->ShaderVisibility = vis[s];
+
+            D3D12_ROOT_PARAMETER *srv = &params[VIO_D3D12_RP_GS_SRV + s];
+            srv->ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            srv->DescriptorTable.NumDescriptorRanges = 1;
+            srv->DescriptorTable.pDescriptorRanges = &srv_range;
+            srv->ShaderVisibility = vis[s];
+
+            D3D12_ROOT_PARAMETER *smp = &params[VIO_D3D12_RP_GS_SAMPLER + s];
+            smp->ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            smp->DescriptorTable.NumDescriptorRanges = 1;
+            smp->DescriptorTable.pDescriptorRanges = &sampler_range;
+            smp->ShaderVisibility = vis[s];
+        }
+    }
+
     /* Static samplers: s8-s11 = comparison (shadow maps with sampler2DShadow).
      * SPIRV-Cross assigns shadow samplers to s8+ and regular to s0+ (see
      * vio_shader_reflect.c — the base is 8 so up to 8 regular samplers fit in
@@ -478,7 +523,7 @@ static int d3d12_create_root_signature(void)
     }
 
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-    rs_desc.NumParameters = 5; /* VS CBV, PS CBV, PS SRV table, VS storage SRV, PS sampler table */
+    rs_desc.NumParameters = VIO_D3D12_RP_COUNT; /* VS CBV, PS CBV, PS SRV table, VS storage SRV, PS sampler table, GS/HS/DS mirrors */
     rs_desc.pParameters = params;
     rs_desc.NumStaticSamplers = 4;
     rs_desc.pStaticSamplers = static_samplers;
@@ -1379,7 +1424,12 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     vio_d3d12_shader *shader = (vio_d3d12_shader *)desc->shader;
     if (!shader) { free(pipeline); return NULL; }
 
-    pipeline->topology = vio_topology_to_d3d12(desc->topology);
+    /* A hull stage only accepts control-point patch lists (PSO type PATCH). */
+    vio_topology topo = shader->hs_blob ? VIO_PATCHES : desc->topology;
+    pipeline->topology = vio_topology_to_d3d12(topo, desc->patch_vertices);
+    pipeline->has_gs = shader->gs_blob != NULL;
+    pipeline->has_hs = shader->hs_blob != NULL;
+    pipeline->has_ds = shader->ds_blob != NULL;
 
     /* Build input layout */
     D3D12_INPUT_ELEMENT_DESC *elements = NULL;
@@ -1431,6 +1481,18 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     pso_desc.VS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->vs_blob);
     pso_desc.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->ps_blob);
     pso_desc.PS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->ps_blob);
+    if (shader->gs_blob) {
+        pso_desc.GS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->gs_blob);
+        pso_desc.GS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->gs_blob);
+    }
+    if (shader->hs_blob) {
+        pso_desc.HS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->hs_blob);
+        pso_desc.HS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->hs_blob);
+    }
+    if (shader->ds_blob) {
+        pso_desc.DS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->ds_blob);
+        pso_desc.DS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->ds_blob);
+    }
 
     /* Input layout */
     pso_desc.InputLayout.pInputElementDescs = elements;
@@ -1510,7 +1572,7 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     }
 
     /* Topology type */
-    pso_desc.PrimitiveTopologyType = vio_topology_to_d3d12_type(desc->topology);
+    pso_desc.PrimitiveTopologyType = vio_topology_to_d3d12_type(topo);
 
     /* Render target format. Must match the format of the render target bound at
      * draw time (D3D12 hard rule), else DrawIndexedInstanced is dropped with
@@ -3110,6 +3172,58 @@ static int d3d12_update_texture(void *tex_obj, const void *pixels, int x, int y,
 
 /* ── Shaders ──────────────────────────────────────────────────────── */
 
+/* One optional stage (geometry / hull / domain): SPIR-V or GLSL -> HLSL ->
+ * DXBC blob, same transpile path selection as the VS / PS code below. */
+static ID3DBlob *d3d12_compile_stage_blob(const void *data, size_t size, int stage, int fixup_depth,
+                                          const char *profile, const char *label,
+                                          UINT compile_flags, vio_shader_format format)
+{
+    const char *hlsl = NULL;
+    char *allocated = NULL;
+    if (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW || format == VIO_SHADER_AUTO) {
+        char *err = NULL;
+        uint32_t *spirv = NULL;
+        size_t spirv_size = 0;
+        int free_spirv = 0;
+        int is_spirv = (size >= 4 && *(const uint32_t *)data == 0x07230203);
+        if (is_spirv) {
+            spirv = (uint32_t *)data;
+            spirv_size = size;
+        } else {
+            spirv = vio_compile_glsl_stage_to_spirv((const char *)data, stage, &spirv_size, &err);
+            if (!spirv) {
+                php_error_docref(NULL, E_WARNING, "D3D12: %s GLSL->SPIR-V failed: %s", label, err ? err : "unknown");
+                if (err) free(err);
+                return NULL;
+            }
+            free_spirv = 1;
+        }
+        allocated = vio_spirv_to_hlsl_ex(spirv, spirv_size, 51, fixup_depth, &err);
+        if (free_spirv) free(spirv);
+        if (!allocated) {
+            php_error_docref(NULL, E_WARNING, "D3D12: %s SPIR-V->HLSL failed: %s", label, err ? err : "unknown");
+            if (err) free(err);
+            return NULL;
+        }
+        hlsl = allocated;
+    } else {
+        hlsl = (const char *)data;
+    }
+
+    ID3DBlob *blob = NULL, *error_blob = NULL;
+    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), label, NULL, NULL, "main", profile,
+                            compile_flags, 0, &blob, &error_blob);
+    if (allocated) free(allocated);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D12: %s compile failed: %s", label,
+                         error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
+        if (error_blob) ID3D10Blob_Release(error_blob);
+        return NULL;
+    }
+    if (error_blob) ID3D10Blob_Release(error_blob);
+    return blob;
+}
+
 static void *d3d12_compile_shader(vio_shader_desc *desc)
 {
     vio_d3d12_shader *shader = calloc(1, sizeof(vio_d3d12_shader));
@@ -3164,8 +3278,10 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
             free_ps_spirv = 1;
         }
 
-        /* SPIR-V -> HLSL SM 5.1 */
-        allocated_vs = vio_spirv_to_hlsl(vs_spirv, vs_spirv_size, 51, &err);
+        /* SPIR-V -> HLSL SM 5.1. The GL->D3D depth fixup goes on the LAST
+         * stage that writes gl_Position (GS, else DS, else VS). */
+        int vs_is_last = !desc->geometry_data && !desc->tess_eval_data;
+        allocated_vs = vio_spirv_to_hlsl_ex(vs_spirv, vs_spirv_size, 51, vs_is_last, &err);
         if (free_vs_spirv) free(vs_spirv);
         if (!allocated_vs) {
             php_error_docref(NULL, E_WARNING, "D3D12: VS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -3221,6 +3337,26 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
         goto fail;
     }
 
+    /* Optional stages: geometry (gs_5_1), hull (hs_5_1), domain (ds_5_1). */
+    if (desc->geometry_data) {
+        shader->gs_blob = d3d12_compile_stage_blob(desc->geometry_data, desc->geometry_size,
+                                                   VIO_STAGE_GEOMETRY, 1, "gs_5_1", "GS",
+                                                   compile_flags, desc->format);
+        if (!shader->gs_blob) goto fail;
+    }
+    if (desc->tess_control_data) {
+        shader->hs_blob = d3d12_compile_stage_blob(desc->tess_control_data, desc->tess_control_size,
+                                                   VIO_STAGE_TESS_CONTROL, 0, "hs_5_1", "HS",
+                                                   compile_flags, desc->format);
+        if (!shader->hs_blob) goto fail;
+    }
+    if (desc->tess_eval_data) {
+        shader->ds_blob = d3d12_compile_stage_blob(desc->tess_eval_data, desc->tess_eval_size,
+                                                   VIO_STAGE_TESS_EVAL, desc->geometry_data ? 0 : 1,
+                                                   "ds_5_1", "DS", compile_flags, desc->format);
+        if (!shader->ds_blob) goto fail;
+    }
+
     if (allocated_vs) free(allocated_vs);
     if (allocated_ps) free(allocated_ps);
     return shader;
@@ -3230,6 +3366,9 @@ fail:
     if (allocated_ps) free(allocated_ps);
     if (shader->vs_blob) ID3D10Blob_Release(shader->vs_blob);
     if (shader->ps_blob) ID3D10Blob_Release(shader->ps_blob);
+    if (shader->gs_blob) ID3D10Blob_Release(shader->gs_blob);
+    if (shader->hs_blob) ID3D10Blob_Release(shader->hs_blob);
+    if (shader->ds_blob) ID3D10Blob_Release(shader->ds_blob);
     free(shader);
     return NULL;
 }
@@ -3240,7 +3379,35 @@ static void d3d12_destroy_shader(void *shader_ptr)
     if (!s) return;
     if (s->vs_blob) ID3D10Blob_Release(s->vs_blob);
     if (s->ps_blob) ID3D10Blob_Release(s->ps_blob);
+    if (s->gs_blob) ID3D10Blob_Release(s->gs_blob);
+    if (s->hs_blob) ID3D10Blob_Release(s->hs_blob);
+    if (s->ds_blob) ID3D10Blob_Release(s->ds_blob);
     free(s);
+}
+
+/* Bind the constant block of a geometry / hull / domain stage: copy `data`
+ * into a fresh 256-byte-aligned slice of this frame's cbuffer ring and point
+ * the stage's root CBV at it (same scheme as the VS / PS slices pushed by
+ * php_vio.c - D3D12 has no buffer renaming, so every draw gets its own). */
+static void d3d12_bind_stage_constants(int stage, void *backend_buffer,
+                                       const void *data, size_t size)
+{
+    (void)backend_buffer;
+    if (!vio_d3d12.cmd_list || !vio_d3d12.cbuffer_heap_mapped || !data || size == 0) return;
+    UINT param;
+    switch (stage) {
+        case VIO_STAGE_GEOMETRY:     param = VIO_D3D12_RP_GS_CBV; break;
+        case VIO_STAGE_TESS_CONTROL: param = VIO_D3D12_RP_HS_CBV; break;
+        case VIO_STAGE_TESS_EVAL:    param = VIO_D3D12_RP_DS_CBV; break;
+        default: return;
+    }
+    UINT aligned = (UINT)((size + 255) & ~(size_t)255);
+    UINT offset = vio_d3d12.cbuffer_heap_offset;
+    if (offset + aligned > vio_d3d12.cbuffer_frame_end) return;   /* slice exhausted; grows next frame */
+    memcpy(vio_d3d12.cbuffer_heap_mapped + offset, data, size);
+    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+        vio_d3d12.cmd_list, param, vio_d3d12.cbuffer_heap_gpu + offset);
+    vio_d3d12.cbuffer_heap_offset = offset + aligned;
 }
 
 /* ── Drawing ──────────────────────────────────────────────────────── */
@@ -4518,15 +4685,48 @@ static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
 
 /* ── Feature Query ────────────────────────────────────────────────── */
 
+/* Second half of the optional-stage probe (see the D3D11 twin): the canonical
+ * stage's SPIRV-Cross HLSL must also pass FXC for the SM 5.1 profile. */
+static int d3d12_stage_supported(int stage, const char *profile)
+{
+    static int cache[VIO_STAGE_COUNT] = { -1, -1, -1, -1, -1 };
+    if (stage < 0 || stage >= VIO_STAGE_COUNT) return 0;
+    if (cache[stage] >= 0) return cache[stage];
+    int ok = 0;
+    if (vio_hlsl_stage_supported(stage)) {
+        char *hlsl = vio_hlsl_probe_hlsl(stage, 51);
+        if (hlsl) {
+            ID3DBlob *blob = NULL, *errs = NULL;
+            HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "probe", NULL, NULL, "main", profile,
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &errs);
+            ok = SUCCEEDED(hr) ? 1 : 0;
+            if (!ok && getenv("VIO_DEBUG_STAGE_PROBE")) {
+                fprintf(stderr, "[vio] D3D12 stage probe %d (%s): FXC rejected the SPIRV-Cross HLSL: %s\n",
+                        stage, profile, errs ? (const char *)ID3D10Blob_GetBufferPointer(errs) : "unknown");
+            }
+            if (blob) ID3D10Blob_Release(blob);
+            if (errs) ID3D10Blob_Release(errs);
+            free(hlsl);
+        }
+    }
+    cache[stage] = ok;
+    return ok;
+}
+
 static int d3d12_supports_feature(vio_feature feature)
 {
     switch (feature) {
         case VIO_FEATURE_COMPUTE:      return 1; /* compute pipeline + dispatch + readback wired */
-        /* The hardware can, but vio_shader_desc only carries a vertex + fragment
-         * stage — there is no way to hand a GS / HS / DS to the backend, so the
-         * flags must not promise it. */
-        case VIO_FEATURE_TESSELLATION: return 0;
-        case VIO_FEATURE_GEOMETRY:     return 0;
+        /* vio_shader 'geometry' / 'tess_control' + 'tess_eval': SPIR-V -> HLSL
+         * gs/hs/ds_5_1 via SPIRV-Cross, baked into the PSO; per-stage root
+         * CBV + SRV / sampler table mirrors (VIO_D3D12_RP_GS_* ..). Every
+         * D3D12 device is feature level 11_0+, so the GPU side always has the
+         * stages; the flag additionally requires a SPIRV-Cross that can emit
+         * them (older Vulkan-SDK builds cannot - vio_hlsl_stage_supported). */
+        case VIO_FEATURE_TESSELLATION:
+            return d3d12_stage_supported(VIO_STAGE_TESS_CONTROL, "hs_5_1")
+                && d3d12_stage_supported(VIO_STAGE_TESS_EVAL, "ds_5_1");
+        case VIO_FEATURE_GEOMETRY:     return d3d12_stage_supported(VIO_STAGE_GEOMETRY, "gs_5_1");
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
         case VIO_FEATURE_MULTIVIEW:    return 0;
         case VIO_FEATURE_3D_PIPELINE:  return 1;
@@ -4666,6 +4866,30 @@ static void d3d12_bind_texture(void *texture, int slot)
 /* Build (or reuse) the 8-sampler block matching pending_samplers[] for the
  * bound SRV slots and point root param 4 at it. Slots without a texture get
  * combo 0 so the block content is fully determined by the bound set. */
+/* Point the PS SRV / sampler table root parameters at `gpu` and mirror the
+ * same block into the GEOMETRY / HULL / DOMAIN table parameters when the
+ * bound pipeline carries those stages (a domain shader sampling a
+ * displacement map sees the texture at the same register as the PS). */
+static void d3d12_set_srv_tables(D3D12_GPU_DESCRIPTOR_HANDLE gpu)
+{
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_PS_SRV, gpu);
+    vio_d3d12_pipeline *p = d3d12_current_pipeline;
+    if (!p) return;
+    if (p->has_gs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_GS_SRV, gpu);
+    if (p->has_hs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_HS_SRV, gpu);
+    if (p->has_ds) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_DS_SRV, gpu);
+}
+
+static void d3d12_set_sampler_tables(D3D12_GPU_DESCRIPTOR_HANDLE gpu)
+{
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_PS_SAMPLER, gpu);
+    vio_d3d12_pipeline *p = d3d12_current_pipeline;
+    if (!p) return;
+    if (p->has_gs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_GS_SAMPLER, gpu);
+    if (p->has_hs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_HS_SAMPLER, gpu);
+    if (p->has_ds) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_DS_SAMPLER, gpu);
+}
+
 static void d3d12_flush_sampler_table(void)
 {
     if (!vio_d3d12.sampler_heap || !vio_d3d12.sampler_combo_heap) return;
@@ -4686,7 +4910,7 @@ static void d3d12_flush_sampler_table(void)
     for (int i = 0; i < vio_d3d12.sampler_set_count; i++) {
         if (memcmp(combos, vio_d3d12.sampler_set_cache[i].combos, sizeof(combos)) == 0) {
             vio_d3d12.sampler_table_gpu = vio_d3d12.sampler_set_cache[i].gpu;
-            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, 4, vio_d3d12.sampler_table_gpu);
+            d3d12_set_sampler_tables(vio_d3d12.sampler_table_gpu);
             vio_d3d12.sampler_table_bound = 1;
             if (i != 0) {
                 /* swap to front */
@@ -4705,7 +4929,7 @@ static void d3d12_flush_sampler_table(void)
         /* Ring exhausted (hundreds of distinct sampler sets in one frame):
          * keep whatever block is bound rather than drop the draw. */
         if (vio_d3d12.sampler_table_bound) {
-            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, 4, vio_d3d12.sampler_table_gpu);
+            d3d12_set_sampler_tables(vio_d3d12.sampler_table_gpu);
         }
         return;
     }
@@ -4727,7 +4951,7 @@ static void d3d12_flush_sampler_table(void)
     ID3D12Device_CopyDescriptors(vio_d3d12.device, 1, &dst_cpu, &dst_size,
                                  VIO_D3D12_SAMPLER_TABLE_SIZE, srcs, NULL,
                                  D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, 4, dst_gpu);
+    d3d12_set_sampler_tables(dst_gpu);
 
     vio_d3d12.sampler_table_gpu = dst_gpu;
     vio_d3d12.sampler_table_bound = 1;
@@ -4779,8 +5003,7 @@ void vio_d3d12_flush_srv_table(void)
             }
         }
         if (same) {
-            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(
-                vio_d3d12.cmd_list, 2, vio_d3d12.srv_table_gpu);
+            d3d12_set_srv_tables(vio_d3d12.srv_table_gpu);
             return;
         }
     }
@@ -4829,7 +5052,7 @@ void vio_d3d12_flush_srv_table(void)
         }
     }
 
-    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, 2, dst_gpu);
+    d3d12_set_srv_tables(dst_gpu);
 
     /* Cache this block + the texture set it was built from for the dedup
      * fast-path above (valid until begin_frame rebases the ring or a pipeline
@@ -4934,6 +5157,7 @@ static const vio_backend d3d12_backend = {
     .render_target_cubemap   = d3d12_render_target_cubemap,
     .generate_mipmaps        = d3d12_generate_mipmaps,
     .update_texture          = d3d12_update_texture,
+    .bind_stage_constants    = d3d12_bind_stage_constants,
 };
 
 void vio_backend_d3d12_register(void)

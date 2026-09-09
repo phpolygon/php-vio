@@ -24,6 +24,24 @@ typedef struct _vio_uniform_entry {
 
 struct _vio_backend;
 
+/* Number of optional stages beyond vertex + fragment: geometry, tessellation
+ * control, tessellation evaluation. Extra-stage arrays are indexed by
+ * VIO_EXTRA_STAGE_INDEX(stage) == stage - VIO_STAGE_GEOMETRY. */
+#define VIO_EXTRA_STAGE_COUNT 3
+#define VIO_EXTRA_STAGE_INDEX(stage) ((stage) - VIO_STAGE_GEOMETRY)
+
+/* Constant block of one extra stage (typed-register backends: D3D11/D3D12).
+ * Same layout/lifecycle as the vertex cbuffer fields below; allocated only
+ * when the stage exists so the common VS+FS shader object stays small. */
+typedef struct _vio_shader_stage_cb {
+    unsigned char     data[VIO_CBUFFER_SIZE];
+    vio_uniform_entry uniforms[VIO_MAX_UNIFORMS];
+    int               uniform_count;
+    int               total_size;
+    void             *backend;   /* backend constant buffer (create_buffer) */
+    int               dirty;
+} vio_shader_stage_cb;
+
 typedef struct _vio_shader_object {
     unsigned int      program;       /* GL program ID (0 if not OpenGL) */
     vio_shader_format format;
@@ -31,6 +49,12 @@ typedef struct _vio_shader_object {
     size_t            vert_spirv_size;
     uint32_t         *frag_spirv;    /* SPIR-V binary for fragment shader */
     size_t            frag_spirv_size;
+    /* Optional geometry / tess-control / tess-eval stages (NULL = absent). */
+    uint32_t         *stage_spirv[VIO_EXTRA_STAGE_COUNT];
+    size_t            stage_spirv_size[VIO_EXTRA_STAGE_COUNT];
+    vio_shader_stage_cb *stage_cb[VIO_EXTRA_STAGE_COUNT];
+    int               has_geometry;  /* 1 => geometry stage present */
+    int               has_tessellation; /* 1 => tess control + eval present */
     void             *backend_shader; /* Backend-specific compiled shader (D3D11/D3D12/Vulkan) */
     /* Uniform buffer for D3D constant buffer mapping — vertex stage */
     unsigned char     cbuffer_data[VIO_CBUFFER_SIZE];

@@ -7,6 +7,7 @@
 #endif
 
 #include "../php_vio.h"
+#include "../include/vio_types.h"   /* vio_shader_stage */
 #include "vio_shader_compiler.h"
 
 #ifdef HAVE_GLSLANG
@@ -142,6 +143,23 @@ uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
         out_size, error_msg);
 }
 
+uint32_t *vio_compile_glsl_stage_to_spirv(const char *source, int stage,
+                                           size_t *out_size, char **error_msg)
+{
+    glslang_stage_t gs;
+    switch (stage) {
+        case VIO_STAGE_VERTEX:       gs = GLSLANG_STAGE_VERTEX; break;
+        case VIO_STAGE_FRAGMENT:     gs = GLSLANG_STAGE_FRAGMENT; break;
+        case VIO_STAGE_GEOMETRY:     gs = GLSLANG_STAGE_GEOMETRY; break;
+        case VIO_STAGE_TESS_CONTROL: gs = GLSLANG_STAGE_TESSCONTROL; break;
+        case VIO_STAGE_TESS_EVAL:    gs = GLSLANG_STAGE_TESSEVALUATION; break;
+        default:
+            if (error_msg) *error_msg = strdup("unknown shader stage");
+            return NULL;
+    }
+    return vio_compile_stage_to_spirv(source, gs, out_size, error_msg);
+}
+
 uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
                                             size_t *out_size, char **error_msg)
 {
@@ -157,6 +175,14 @@ uint32_t *vio_compile_glsl_to_spirv(const char *source, int is_fragment,
                                      size_t *out_size, char **error_msg)
 {
     (void)source; (void)is_fragment; (void)out_size;
+    if (error_msg) *error_msg = strdup("glslang not available (compile with --with-glslang)");
+    return NULL;
+}
+
+uint32_t *vio_compile_glsl_stage_to_spirv(const char *source, int stage,
+                                           size_t *out_size, char **error_msg)
+{
+    (void)source; (void)stage; (void)out_size;
     if (error_msg) *error_msg = strdup("glslang not available (compile with --with-glslang)");
     return NULL;
 }

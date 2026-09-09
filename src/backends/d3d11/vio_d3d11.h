@@ -24,12 +24,16 @@
 #define DXGI_PRESENT_ALLOW_TEARING 0x00000200UL
 #endif
 
-/* Compiled shader pair (vertex + pixel) */
+/* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
+ * stages (NULL when the vio_shader has no such stage). */
 typedef struct _vio_d3d11_shader {
     ID3DBlob *vs_blob;
     ID3DBlob *ps_blob;
     ID3D11VertexShader *vs;
     ID3D11PixelShader  *ps;
+    ID3D11GeometryShader *gs;
+    ID3D11HullShader     *hs;
+    ID3D11DomainShader   *ds;
 } vio_d3d11_shader;
 
 /* Pipeline = input layout + state objects */
@@ -40,6 +44,9 @@ typedef struct _vio_d3d11_pipeline {
     ID3D11BlendState        *blend_state;
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
+    ID3D11GeometryShader    *gs;   /* NULL => stage unbound at bind_pipeline */
+    ID3D11HullShader        *hs;
+    ID3D11DomainShader      *ds;
     D3D11_PRIMITIVE_TOPOLOGY topology;
     UINT                     vertex_stride;
 } vio_d3d11_pipeline;

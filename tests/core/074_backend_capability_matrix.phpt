@@ -110,8 +110,10 @@ $d3d_common = [
     VIO_FEATURE_VERTEX_STORAGE     => 1,
     VIO_FEATURE_STORAGE_IMAGE      => 1,
     VIO_FEATURE_MRT                => 1,
-    VIO_FEATURE_TESSELLATION       => 0,
-    VIO_FEATURE_GEOMETRY           => 0,
+    /* TESSELLATION / GEOMETRY are not pinned for D3D: the GPU side always has
+     * the stages, but the flag also requires a SPIRV-Cross that can emit HLSL
+     * for them (vio_hlsl_stage_supported - older Vulkan-SDK builds cannot).
+     * tests/render3d/109 + 110 are the contract: flag = 1 => the stage renders. */
     VIO_FEATURE_RAYTRACING         => 0,
     VIO_FEATURE_MULTIVIEW          => 0,
 ];
