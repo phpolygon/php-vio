@@ -1,3 +1,10 @@
+## [2.10.1](https://github.com/phpolygon/php-vio/compare/v2.10.0...v2.10.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **opengl:** resolve vio_set_uniform names against SPIRV-Cross's flattened uniform structs ([682a882](https://github.com/phpolygon/php-vio/commit/682a8823b11ae27672f42fcf70b1b779fb204621)), closes [#version](https://github.com/phpolygon/php-vio/issues/version) [#version](https://github.com/phpolygon/php-vio/issues/version)
+
 # [2.10.0](https://github.com/phpolygon/php-vio/compare/v2.9.0...v2.10.0) (2026-09-09)
 
 
