@@ -49,6 +49,18 @@ static void vio_shader_free_object(zend_object *obj)
         free(shader->frag_spirv);
         shader->frag_spirv = NULL;
     }
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        if (shader->stage_spirv[i]) {
+            free(shader->stage_spirv[i]);
+            shader->stage_spirv[i] = NULL;
+        }
+        if (shader->stage_cb[i]) {
+            /* The backend constant buffer follows the vertex/fragment cbuffer
+             * ownership rule (backend-owned, see below). */
+            free(shader->stage_cb[i]);
+            shader->stage_cb[i] = NULL;
+        }
+    }
 
     if (shader->uniform_lookup) {
         zend_hash_destroy(shader->uniform_lookup);

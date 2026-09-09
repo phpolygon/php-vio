@@ -75,9 +75,18 @@ static int gl_owned_by_live_context(unsigned int gen)
 #define GL_ULOC_CACHE_SIZE 1024
 #define GL_ULOC_NAME_MAX   56
 
+/* A name can resolve to more than one location when several stages of the
+ * SPIR-V path declare the same uniform: each stage's flattened block becomes
+ * its own struct-typed uniform (`_19.u_mvp` in the VS, `_27.u_mvp` in the GS),
+ * and GL treats them as independent. vio_set_uniform must then write all of
+ * them, so an entry carries the primary location plus up to
+ * GL_ULOC_ALT_MAX further matches (-1 = none). */
+#define GL_ULOC_ALT_MAX 2
+
 typedef struct {
     GLuint program;   /* 0 = empty slot */
     GLint  loc;
+    GLint  alt[GL_ULOC_ALT_MAX];
     char   name[GL_ULOC_NAME_MAX];
 } gl_uloc_entry;
 
@@ -115,28 +124,35 @@ static size_t gl_uloc_normalize(const char *name, char *out, size_t cap)
     return o;
 }
 
-static GLint gl_uloc_suffix_scan(GLuint program, const char *name, size_t len)
+/* Collect every `<prefix>.<name>` match among the active uniforms into out[]
+ * (at most max entries). Returns the number found. */
+static int gl_uloc_suffix_scan(GLuint program, const char *name, size_t len, GLint *out, int max)
 {
     char norm[256];
     size_t nlen = gl_uloc_normalize(name, norm, sizeof(norm));
     GLint count = 0;
     glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
     char buf[256], full[512];
-    for (GLint i = 0; i < count; i++) {
+    int found = 0;
+    for (GLint i = 0; i < count && found < max; i++) {
         GLsizei n = 0; GLint size = 0; GLenum type = 0;
         glGetActiveUniform(program, (GLuint)i, (GLsizei)sizeof(buf), &n, &size, &type, buf);
         /* active name = "<prefix>.<norm>" ? */
         if (n <= (GLsizei)nlen + 1 || buf[n - nlen - 1] != '.' || strcmp(buf + n - nlen, norm) != 0) continue;
         size_t plen = (size_t)n - nlen - 1;
-        if (plen + 1 + len + 1 > sizeof(full)) return -1;
+        if (plen + 1 + len + 1 > sizeof(full)) continue;
         memcpy(full, buf, plen);
         full[plen] = '.';
         memcpy(full + plen + 1, name, len + 1);
-        return glGetUniformLocation(program, full);   /* exact element (or element 0 for a bare array name) */
+        GLint loc = glGetUniformLocation(program, full);   /* exact element (or element 0 for a bare array name) */
+        if (loc >= 0) out[found++] = loc;
     }
-    return -1;
+    return found;
 }
-static GLint gl_uniform_location(GLuint program, const char *name)
+/* Resolve `name` to its primary location (return value) and, for uniforms
+ * declared in several stages, the further locations in alt[GL_ULOC_ALT_MAX]
+ * (-1 padded). alt may be NULL. */
+static GLint gl_uniform_location_all(GLuint program, const char *name, GLint *alt)
 {
     size_t len = strlen(name);
     int cacheable = len < GL_ULOC_NAME_MAX;
@@ -145,21 +161,36 @@ static GLint gl_uniform_location(GLuint program, const char *name)
     if (cacheable) {
         for (int probe = 0; probe < 8; probe++) {
             gl_uloc_entry *e = &gl_uloc_cache[(idx + probe) % GL_ULOC_CACHE_SIZE];
-            if (e->program == program && strcmp(e->name, name) == 0) return e->loc;
+            if (e->program == program && strcmp(e->name, name) == 0) {
+                if (alt) memcpy(alt, e->alt, sizeof(e->alt));
+                return e->loc;
+            }
             if (e->program == 0 && !slot) slot = e;
         }
         if (!slot) slot = &gl_uloc_cache[idx];   /* window full: evict */
     }
 
+    GLint found[1 + GL_ULOC_ALT_MAX];
+    for (int i = 0; i < 1 + GL_ULOC_ALT_MAX; i++) found[i] = -1;
     GLint loc = glGetUniformLocation(program, name);
-    if (loc < 0) loc = gl_uloc_suffix_scan(program, name, len);
+    if (loc < 0) {
+        int n = gl_uloc_suffix_scan(program, name, len, found, 1 + GL_ULOC_ALT_MAX);
+        if (n > 0) loc = found[0];
+        for (int i = n; i < 1 + GL_ULOC_ALT_MAX; i++) found[i] = -1;
+    }
 
     if (slot) {
         slot->program = program;
         slot->loc = loc;
+        memcpy(slot->alt, found + 1, sizeof(slot->alt));
         memcpy(slot->name, name, len + 1);
     }
+    if (alt) memcpy(alt, found + 1, sizeof(GLint) * GL_ULOC_ALT_MAX);
     return loc;
+}
+static GLint gl_uniform_location(GLuint program, const char *name)
+{
+    return gl_uniform_location_all(program, name, NULL);
 }
 
 /* ── Shader compilation helpers ───────────────────────────────────── */
@@ -184,18 +215,35 @@ static unsigned int compile_shader_stage(const char *source, GLenum type)
 
 unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *frag_src)
 {
-    unsigned int vert = compile_shader_stage(vert_src, GL_VERTEX_SHADER);
-    if (!vert) return 0;
+    return vio_opengl_compile_program(vert_src, frag_src, NULL, NULL, NULL);
+}
 
-    unsigned int frag = compile_shader_stage(frag_src, GL_FRAGMENT_SHADER);
-    if (!frag) {
-        glDeleteShader(vert);
+unsigned int vio_opengl_compile_program(const char *vert_src, const char *frag_src,
+                                        const char *geom_src, const char *tesc_src,
+                                        const char *tese_src)
+{
+    const char *sources[5] = { vert_src, frag_src, geom_src, tesc_src, tese_src };
+    const GLenum types[5]  = { GL_VERTEX_SHADER, GL_FRAGMENT_SHADER, GL_GEOMETRY_SHADER,
+                               GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER };
+    unsigned int stages[5] = { 0, 0, 0, 0, 0 };
+    int n = 0;
+
+    for (int i = 0; i < 5; i++) {
+        if (!sources[i]) continue;
+        stages[i] = compile_shader_stage(sources[i], types[i]);
+        if (!stages[i]) {
+            for (int j = 0; j < i; j++) if (stages[j]) glDeleteShader(stages[j]);
+            return 0;
+        }
+        n++;
+    }
+    if (!stages[0] || !stages[1]) {
+        for (int j = 0; j < 5; j++) if (stages[j]) glDeleteShader(stages[j]);
         return 0;
     }
 
     unsigned int program = glCreateProgram();
-    glAttachShader(program, vert);
-    glAttachShader(program, frag);
+    for (int i = 0; i < 5; i++) if (stages[i]) glAttachShader(program, stages[i]);
     glLinkProgram(program);
 
     int success;
@@ -208,8 +256,8 @@ unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *
         program = 0;
     }
 
-    glDeleteShader(vert);
-    glDeleteShader(frag);
+    for (int i = 0; i < 5; i++) if (stages[i]) glDeleteShader(stages[i]);
+    (void)n;
     return program;
 }
 
@@ -234,7 +282,32 @@ static int opengl_init(vio_config *cfg)
     vio_gl.clear_g = 0.1f;
     vio_gl.clear_b = 0.1f;
     vio_gl.clear_a = 1.0f;
+    vio_gl.draw_topology = VIO_TRIANGLES;
+    vio_gl.patch_vertices = 3;
     return 0;
+}
+
+static GLenum gl_topology_mode(vio_topology t);
+
+/* Primitive mode for the mesh draw calls: the bound pipeline's topology
+ * (GL_TRIANGLES until a pipeline says otherwise). */
+static GLenum gl_draw_mode(void)
+{
+    return gl_topology_mode((vio_topology)vio_gl.draw_topology);
+}
+
+static GLenum gl_topology_mode(vio_topology t)
+{
+    switch (t) {
+        case VIO_TRIANGLE_STRIP: return GL_TRIANGLE_STRIP;
+        case VIO_TRIANGLE_FAN:   return GL_TRIANGLE_FAN;
+        case VIO_LINES:          return GL_LINES;
+        case VIO_LINE_STRIP:     return GL_LINE_STRIP;
+        case VIO_POINTS:         return GL_POINTS;
+        case VIO_PATCHES:        return GL_PATCHES;
+        case VIO_TRIANGLES:
+        default:                 return GL_TRIANGLES;
+    }
 }
 
 static void opengl_shutdown(void)
@@ -1279,31 +1352,38 @@ static void opengl_set_uniform(const char *name, const void *data, int count, in
     glGetIntegerv(GL_CURRENT_PROGRAM, &program);
     if (program <= 0) return;
 
-    GLint loc = gl_uniform_location((GLuint)program, name);
+    GLint alt[GL_ULOC_ALT_MAX];
+    GLint loc = gl_uniform_location_all((GLuint)program, name, alt);
     if (loc < 0) return;  /* silently drop unknown uniforms — matches old behavior */
 
-    switch (type) {
-        case VIO_UNIFORM_INT:
-            glUniform1i(loc, *(const GLint *)data);
-            break;
-        case VIO_UNIFORM_FLOAT:
-            glUniform1f(loc, *(const GLfloat *)data);
-            break;
-        case VIO_UNIFORM_VEC2:
-            glUniform2fv(loc, count, (const GLfloat *)data);
-            break;
-        case VIO_UNIFORM_VEC3:
-            glUniform3fv(loc, count, (const GLfloat *)data);
-            break;
-        case VIO_UNIFORM_VEC4:
-            glUniform4fv(loc, count, (const GLfloat *)data);
-            break;
-        case VIO_UNIFORM_MAT3:
-            glUniformMatrix3fv(loc, count, GL_FALSE, (const GLfloat *)data);
-            break;
-        case VIO_UNIFORM_MAT4:
-            glUniformMatrix4fv(loc, count, GL_FALSE, (const GLfloat *)data);
-            break;
+    /* Write the primary location and every per-stage duplicate (a uniform
+     * declared in both the vertex and a geometry / tessellation stage). */
+    for (int k = -1; k < GL_ULOC_ALT_MAX; k++) {
+        GLint l = (k < 0) ? loc : alt[k];
+        if (l < 0) continue;
+        switch (type) {
+            case VIO_UNIFORM_INT:
+                glUniform1i(l, *(const GLint *)data);
+                break;
+            case VIO_UNIFORM_FLOAT:
+                glUniform1f(l, *(const GLfloat *)data);
+                break;
+            case VIO_UNIFORM_VEC2:
+                glUniform2fv(l, count, (const GLfloat *)data);
+                break;
+            case VIO_UNIFORM_VEC3:
+                glUniform3fv(l, count, (const GLfloat *)data);
+                break;
+            case VIO_UNIFORM_VEC4:
+                glUniform4fv(l, count, (const GLfloat *)data);
+                break;
+            case VIO_UNIFORM_MAT3:
+                glUniformMatrix3fv(l, count, GL_FALSE, (const GLfloat *)data);
+                break;
+            case VIO_UNIFORM_MAT4:
+                glUniformMatrix4fv(l, count, GL_FALSE, (const GLfloat *)data);
+                break;
+        }
     }
 }
 
@@ -1436,9 +1516,9 @@ static void opengl_draw_mesh(void *mesh_obj)
 
     glBindVertexArray(mesh->vao);
     if (mesh->index_count > 0) {
-        glDrawElements(GL_TRIANGLES, mesh->index_count, GL_UNSIGNED_INT, 0);
+        glDrawElements(gl_draw_mode(), mesh->index_count, GL_UNSIGNED_INT, 0);
     } else {
-        glDrawArrays(GL_TRIANGLES, 0, mesh->vertex_count);
+        glDrawArrays(gl_draw_mode(), 0, mesh->vertex_count);
     }
     glBindVertexArray(0);
 
@@ -1474,10 +1554,10 @@ static void opengl_draw_mesh_instanced(void *mesh_obj,
     }
 
     if (mesh->index_count > 0) {
-        glDrawElementsInstanced(GL_TRIANGLES, mesh->index_count,
+        glDrawElementsInstanced(gl_draw_mode(), mesh->index_count,
                                 GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
     } else {
-        glDrawArraysInstanced(GL_TRIANGLES, 0, mesh->vertex_count,
+        glDrawArraysInstanced(gl_draw_mode(), 0, mesh->vertex_count,
                               (GLsizei)instance_count);
     }
 
@@ -1519,10 +1599,10 @@ static void opengl_draw_instanced_from_storage(void *mesh_obj, int instance_coun
 
     glBindVertexArray(mesh->vao);
     if (mesh->index_count > 0) {
-        glDrawElementsInstanced(GL_TRIANGLES, mesh->index_count,
+        glDrawElementsInstanced(gl_draw_mode(), mesh->index_count,
                                 GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
     } else {
-        glDrawArraysInstanced(GL_TRIANGLES, 0, mesh->vertex_count,
+        glDrawArraysInstanced(gl_draw_mode(), 0, mesh->vertex_count,
                               (GLsizei)instance_count);
     }
     glBindVertexArray(0);
@@ -1664,6 +1744,19 @@ static void opengl_bind_pipeline_state(void *pipe_ptr)
     if (!vio_gl.initialized || !pipe) return;
 
     glUseProgram(pipe->shader_program);
+
+    /* Primitive mode for the following draws. A shader with a tessellation
+     * control stage only accepts patches, whatever 'topology' says. */
+    {
+        vio_shader_object *sh = (vio_shader_object *)pipe->shader_ref;
+        vio_topology topo = pipe->topology;
+        if (sh && sh->has_tessellation) topo = VIO_PATCHES;
+        vio_gl.draw_topology = (int)topo;
+        vio_gl.patch_vertices = pipe->patch_vertices > 0 ? pipe->patch_vertices : 3;
+        if (topo == VIO_PATCHES && vio_gl.caps.has_tessellation && glPatchParameteri) {
+            glPatchParameteri(GL_PATCH_VERTICES, vio_gl.patch_vertices);
+        }
+    }
 
     if (pipe->cull_mode == VIO_CULL_NONE) {
         glDisable(GL_CULL_FACE);

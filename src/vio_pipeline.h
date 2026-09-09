@@ -42,6 +42,8 @@ typedef struct _vio_pipeline_object {
                                          hdr_output). Other backends derive them from the
                                          bound render target. */
     int            color_formats[4];  /* vio_pixel_format, VIO_MAX_COLOR_ATTACHMENTS */
+    int            patch_vertices;    /* 'patch_vertices': control points per patch
+                                         (VIO_PATCHES / tessellation), 0 => 3 */
     int            valid;
     zend_object    std;
 } vio_pipeline_object;

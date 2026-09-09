@@ -81,10 +81,34 @@
  * wait for its own previous upload. */
 #define VIO_D3D12_UPLOAD_ALLOCATORS    3
 
-/* Compiled shader pair (vertex + pixel) */
+/* Graphics root-signature parameter indices (d3d12_create_root_signature).
+ * [0..4] is the long-standing layout; [5..13] mirror the per-stage cbuffer,
+ * SRV table and sampler table for the optional geometry / hull / domain
+ * stages (D3D12 needs a separate root parameter per shader visibility). */
+#define VIO_D3D12_RP_VS_CBV       0
+#define VIO_D3D12_RP_PS_CBV       1
+#define VIO_D3D12_RP_PS_SRV       2
+#define VIO_D3D12_RP_VS_SRV       3   /* root SRV t0, vertex storage (Path B) */
+#define VIO_D3D12_RP_PS_SAMPLER   4
+#define VIO_D3D12_RP_GS_CBV       5
+#define VIO_D3D12_RP_HS_CBV       6
+#define VIO_D3D12_RP_DS_CBV       7
+#define VIO_D3D12_RP_GS_SRV       8
+#define VIO_D3D12_RP_HS_SRV       9
+#define VIO_D3D12_RP_DS_SRV       10
+#define VIO_D3D12_RP_GS_SAMPLER   11
+#define VIO_D3D12_RP_HS_SAMPLER   12
+#define VIO_D3D12_RP_DS_SAMPLER   13
+#define VIO_D3D12_RP_COUNT        14
+
+/* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
+ * bytecode (NULL when the vio_shader has no such stage). */
 typedef struct _vio_d3d12_shader {
     ID3DBlob *vs_blob;
     ID3DBlob *ps_blob;
+    ID3DBlob *gs_blob;
+    ID3DBlob *hs_blob;
+    ID3DBlob *ds_blob;
 } vio_d3d12_shader;
 
 /* Pipeline = PSO + root signature reference */
@@ -92,6 +116,7 @@ typedef struct _vio_d3d12_pipeline {
     ID3D12PipelineState    *pso;
     D3D12_PRIMITIVE_TOPOLOGY topology;
     UINT                     vertex_stride;
+    int                      has_gs, has_hs, has_ds;  /* replicate SRV / sampler tables */
 } vio_d3d12_pipeline;
 
 /* Buffer wrapper */

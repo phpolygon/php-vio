@@ -1992,6 +1992,27 @@ static void vio_flush_pending_textures(vio_context_object *ctx);
  * run for vio_draw, vio_draw_instanced and vio_draw_instanced_from_buffer;
  * the latter used to skip the root-CBV bind, so a vertex shader with any
  * uniform read an unset root descriptor (device removed). */
+/* Geometry / tessellation-control / tessellation-evaluation constant blocks:
+ * upload the shadow copy when dirty, then let the backend bind it for the next
+ * draw (bind_stage_constants slot - NULL on OpenGL, whose uniforms are
+ * program-wide, and on backends without those stages). Runs on every draw
+ * path next to the vertex / fragment cbuffer push. */
+static void vio_push_extra_stage_constants(vio_context_object *ctx, vio_shader_object *sh)
+{
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        vio_shader_stage_cb *cb = sh->stage_cb[i];
+        if (!cb || cb->total_size <= 0) continue;
+        if (cb->dirty && cb->backend && ctx->backend->update_buffer) {
+            ctx->backend->update_buffer(cb->backend, cb->data, cb->total_size);
+            cb->dirty = 0;
+        }
+        if (ctx->backend->bind_stage_constants) {
+            ctx->backend->bind_stage_constants(VIO_STAGE_GEOMETRY + i, cb->backend,
+                                               cb->data, (size_t)cb->total_size);
+        }
+    }
+}
+
 static void vio_push_shader_cbuffers(vio_context_object *ctx)
 {
     /* Flush uniform cbuffers before drawing */
@@ -2010,6 +2031,7 @@ static void vio_push_shader_cbuffers(vio_context_object *ctx)
                 sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
             sh->frag_cbuffer_dirty = 0;
         }
+        vio_push_extra_stage_constants(ctx, sh);
 
 #ifdef HAVE_D3D11
         if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
@@ -2126,6 +2148,128 @@ static int vio_is_spirv(const char *data, size_t len)
     return magic == 0x07230203;
 }
 
+/* Optional vio_shader() stages beyond vertex + fragment, indexed by
+ * VIO_EXTRA_STAGE_INDEX(stage): geometry, tessellation control, evaluation. */
+static const char *vio_extra_stage_keys[VIO_EXTRA_STAGE_COUNT] = { "geometry", "tess_control", "tess_eval" };
+static const char *vio_extra_stage_labels[VIO_EXTRA_STAGE_COUNT] = { "Geometry", "Tessellation control", "Tessellation evaluation" };
+
+/* GLSL -> SPIR-V for every optional stage present in extra_zv. Returns 0, or
+ * -1 after emitting the warning (the caller drops the half-built object). */
+static int vio_shader_compile_extra_stages(vio_shader_object *shader, zval **extra_zv)
+{
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        if (!extra_zv[i] || shader->stage_spirv[i]) continue;
+        char *error_msg = NULL;
+        shader->stage_spirv[i] = vio_compile_glsl_stage_to_spirv(
+            Z_STRVAL_P(extra_zv[i]), VIO_STAGE_GEOMETRY + i, &shader->stage_spirv_size[i], &error_msg);
+        if (!shader->stage_spirv[i]) {
+            php_error_docref(NULL, E_WARNING, "%s shader compilation failed: %s",
+                vio_extra_stage_labels[i], error_msg ? error_msg : "unknown error");
+            free(error_msg);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Add the sampled images of one optional stage to the shader's sampler map
+ * (names not yet present only). Registers follow the same per-stage replay
+ * scheme as the fragment stage (vio_spirv_to_hlsl: regular 0.., depth 8..). */
+static void vio_shader_merge_stage_samplers(vio_shader_object *shader, const uint32_t *spirv, size_t size)
+{
+    vio_reflect_result r = {0};
+    char *err = NULL;
+    if (vio_spirv_reflect(spirv, size, &r, &err) != 0) {
+        if (err) free(err);
+        return;
+    }
+    int regular_reg = 0, shadow_reg = 8;
+    for (int t = 0; t < r.texture_count; t++) {
+        int is_depth = r.textures[t].is_depth ? 1 : 0;
+        int reg = is_depth ? shadow_reg++ : regular_reg++;
+        int known = 0;
+        for (int s = 0; s < shader->sampler_count; s++) {
+            if (strcmp(shader->sampler_names[s], r.textures[t].name) == 0) { known = 1; break; }
+        }
+        if (known || shader->sampler_count >= VIO_MAX_SAMPLERS) continue;
+        int s = shader->sampler_count++;
+        strncpy(shader->sampler_names[s], r.textures[t].name, sizeof(shader->sampler_names[s]) - 1);
+        shader->sampler_names[s][sizeof(shader->sampler_names[s]) - 1] = '\0';
+        shader->sampler_is_depth[s] = is_depth;
+        shader->sampler_hlsl_reg[s] = reg;
+    }
+    vio_reflect_free(&r);
+}
+
+/* vio_shader_reflect: one stage's resources as ['inputs','ubos','textures',
+ * 'uniforms','storage_buffers'] under `key` (optional stages; the vertex and
+ * fragment blocks below predate this helper and emit the same shape). */
+static void vio_shader_reflect_stage_add(zval *return_value, const char *key, const char *label,
+                                         const uint32_t *spirv, size_t size)
+{
+    vio_reflect_result result;
+    char *error_msg = NULL;
+    if (vio_spirv_reflect(spirv, size, &result, &error_msg) != 0) {
+        php_error_docref(NULL, E_NOTICE, "%s reflection failed: %s", label,
+            error_msg ? error_msg : "unknown error");
+        free(error_msg);
+        return;
+    }
+    zval stage_arr, inputs_arr, ubos_arr, tex_arr, uni_arr, ssbo_arr;
+    array_init(&stage_arr);
+    array_init(&inputs_arr);
+    for (int i = 0; i < result.input_count; i++) {
+        zval item;
+        array_init(&item);
+        add_assoc_string(&item, "name", (char *)result.inputs[i].name);
+        add_assoc_long(&item, "location", result.inputs[i].location);
+        add_assoc_long(&item, "binding", result.inputs[i].binding);
+        add_next_index_zval(&inputs_arr, &item);
+    }
+    add_assoc_zval(&stage_arr, "inputs", &inputs_arr);
+    array_init(&ubos_arr);
+    for (int i = 0; i < result.ubo_count; i++) {
+        zval item;
+        array_init(&item);
+        add_assoc_string(&item, "name", (char *)result.ubos[i].name);
+        add_assoc_long(&item, "set", result.ubos[i].set);
+        add_assoc_long(&item, "binding", result.ubos[i].binding);
+        add_next_index_zval(&ubos_arr, &item);
+    }
+    add_assoc_zval(&stage_arr, "ubos", &ubos_arr);
+    array_init(&tex_arr);
+    for (int i = 0; i < result.texture_count; i++) {
+        zval item;
+        array_init(&item);
+        add_assoc_string(&item, "name", (char *)result.textures[i].name);
+        add_assoc_long(&item, "set", result.textures[i].set);
+        add_assoc_long(&item, "binding", result.textures[i].binding);
+        add_next_index_zval(&tex_arr, &item);
+    }
+    add_assoc_zval(&stage_arr, "textures", &tex_arr);
+    array_init(&uni_arr);
+    for (int i = 0; i < result.uniform_count; i++) {
+        zval item;
+        array_init(&item);
+        add_assoc_string(&item, "name", (char *)result.uniforms[i].name);
+        add_assoc_long(&item, "binding", result.uniforms[i].binding);
+        add_next_index_zval(&uni_arr, &item);
+    }
+    add_assoc_zval(&stage_arr, "uniforms", &uni_arr);
+    array_init(&ssbo_arr);
+    for (int i = 0; i < result.storage_buffer_count; i++) {
+        zval item;
+        array_init(&item);
+        add_assoc_string(&item, "name", (char *)result.storage_buffers[i].name);
+        add_assoc_long(&item, "set", result.storage_buffers[i].set);
+        add_assoc_long(&item, "binding", result.storage_buffers[i].binding);
+        add_next_index_zval(&ssbo_arr, &item);
+    }
+    add_assoc_zval(&stage_arr, "storage_buffers", &ssbo_arr);
+    add_assoc_zval(return_value, key, &stage_arr);
+    vio_reflect_free(&result);
+}
+
 ZEND_FUNCTION(vio_shader)
 {
     zval *ctx_zval;
@@ -2157,6 +2301,39 @@ ZEND_FUNCTION(vio_shader)
         RETURN_FALSE;
     }
 
+    /* Optional stages: 'geometry', 'tess_control' + 'tess_eval' (always a
+     * pair). Indexed by VIO_EXTRA_STAGE_INDEX(stage). Refused up front on a
+     * backend whose feature flag is 0 (Metal, Vulkan, null, GL < 3.2 / 4.0),
+     * so no backend ever sees a stage it cannot compile. */
+    zval *extra_zv[VIO_EXTRA_STAGE_COUNT] = { NULL, NULL, NULL };
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        zval *z = zend_hash_str_find(config_ht, vio_extra_stage_keys[i], strlen(vio_extra_stage_keys[i]));
+        if (!z) continue;
+        if (Z_TYPE_P(z) != IS_STRING || Z_STRLEN_P(z) == 0) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: '%s' must be a non-empty string", vio_extra_stage_keys[i]);
+            RETURN_FALSE;
+        }
+        extra_zv[i] = z;
+    }
+    int want_geometry = extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)] != NULL;
+    int want_tess     = extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)] != NULL
+                     || extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)] != NULL;
+    if (want_tess && (!extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]
+                   || !extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)])) {
+        php_error_docref(NULL, E_WARNING, "vio_shader: 'tess_control' and 'tess_eval' must be given together");
+        RETURN_FALSE;
+    }
+    if (want_geometry && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_GEOMETRY))) {
+        php_error_docref(NULL, E_WARNING, "vio_shader: backend '%s' has no geometry stage (VIO_FEATURE_GEOMETRY = 0)",
+                         ctx->backend->name);
+        RETURN_FALSE;
+    }
+    if (want_tess && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_TESSELLATION))) {
+        php_error_docref(NULL, E_WARNING, "vio_shader: backend '%s' has no tessellation stages (VIO_FEATURE_TESSELLATION = 0)",
+                         ctx->backend->name);
+        RETURN_FALSE;
+    }
+
     /* Get optional format (auto-detect if VIO_SHADER_AUTO) */
     vio_shader_format format = VIO_SHADER_AUTO;
     zval *fmt_zval = zend_hash_str_find(config_ht, "format", sizeof("format") - 1);
@@ -2181,9 +2358,13 @@ ZEND_FUNCTION(vio_shader)
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized &&
         (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW)) {
         int runtime_glsl = vio_opengl_get_glsl_version();
-        const char *sources[2] = { Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval) };
-        const char *stages[2]  = { "vertex", "fragment" };
-        for (int s = 0; s < 2; s++) {
+        const char *sources[VIO_STAGE_COUNT] = { Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval), NULL, NULL, NULL };
+        const char *stages[VIO_STAGE_COUNT]  = { "vertex", "fragment", "geometry", "tess_control", "tess_eval" };
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            if (extra_zv[i]) sources[VIO_STAGE_GEOMETRY + i] = Z_STRVAL_P(extra_zv[i]);
+        }
+        for (int s = 0; s < VIO_STAGE_COUNT; s++) {
+            if (!sources[s]) continue;
             /* Skip whitespace, look for #version */
             const char *p = sources[s];
             while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
@@ -2213,6 +2394,8 @@ ZEND_FUNCTION(vio_shader)
     vio_shader_object *shader = Z_VIO_SHADER_P(&shader_zval);
     shader->format  = format;
     shader->backend = ctx->backend;
+    shader->has_geometry     = want_geometry;
+    shader->has_tessellation = want_tess;
 
     /* --- SPIR-V input: store directly --- */
     if (format == VIO_SHADER_SPIRV) {
@@ -2223,6 +2406,13 @@ ZEND_FUNCTION(vio_shader)
         shader->frag_spirv_size = Z_STRLEN_P(frag_zval);
         shader->frag_spirv = malloc(shader->frag_spirv_size);
         memcpy(shader->frag_spirv, Z_STRVAL_P(frag_zval), shader->frag_spirv_size);
+
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            if (!extra_zv[i]) continue;
+            shader->stage_spirv_size[i] = Z_STRLEN_P(extra_zv[i]);
+            shader->stage_spirv[i] = malloc(shader->stage_spirv_size[i]);
+            memcpy(shader->stage_spirv[i], Z_STRVAL_P(extra_zv[i]), shader->stage_spirv_size[i]);
+        }
     }
     /* --- GLSL input: compile to SPIR-V via glslang (skip for raw) --- */
     else if (format == VIO_SHADER_GLSL) {
@@ -2247,6 +2437,11 @@ ZEND_FUNCTION(vio_shader)
             zval_ptr_dtor(&shader_zval);
             RETURN_FALSE;
         }
+
+        if (vio_shader_compile_extra_stages(shader, extra_zv) != 0) {
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
     }
 
     /* --- For OpenGL backend --- */
@@ -2254,8 +2449,11 @@ ZEND_FUNCTION(vio_shader)
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
         if (format == VIO_SHADER_GLSL_RAW) {
             /* Raw GLSL: compile directly, no SPIR-V round-trip */
-            shader->program = vio_opengl_compile_shader_source(
-                Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval));
+            shader->program = vio_opengl_compile_program(
+                Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval),
+                extra_zv[0] ? Z_STRVAL_P(extra_zv[0]) : NULL,
+                extra_zv[1] ? Z_STRVAL_P(extra_zv[1]) : NULL,
+                extra_zv[2] ? Z_STRVAL_P(extra_zv[2]) : NULL);
             shader->gl_generation = vio_opengl_context_generation();
             if (!shader->program) {
                 php_error_docref(NULL, E_WARNING, "OpenGL shader compilation failed (raw GLSL)");
@@ -2267,30 +2465,32 @@ ZEND_FUNCTION(vio_shader)
              * (e.g. 330 on HD 3000, 410 on macOS, 460 on modern Linux). */
             int glsl_version = vio_opengl_get_glsl_version();
             char *error_msg = NULL;
+            char *glsl[VIO_STAGE_COUNT] = { NULL, NULL, NULL, NULL, NULL };
+            const uint32_t *spv[VIO_STAGE_COUNT] = {
+                shader->vert_spirv, shader->frag_spirv,
+                shader->stage_spirv[0], shader->stage_spirv[1], shader->stage_spirv[2] };
+            const size_t spv_size[VIO_STAGE_COUNT] = {
+                shader->vert_spirv_size, shader->frag_spirv_size,
+                shader->stage_spirv_size[0], shader->stage_spirv_size[1], shader->stage_spirv_size[2] };
+            static const char *stage_labels[VIO_STAGE_COUNT] = {
+                "Vertex", "Fragment", "Geometry", "Tessellation control", "Tessellation evaluation" };
 
-            char *vert_glsl = vio_spirv_to_glsl(shader->vert_spirv, shader->vert_spirv_size, glsl_version, &error_msg);
-            if (!vert_glsl) {
-                php_error_docref(NULL, E_WARNING, "Vertex SPIR-V to GLSL transpilation failed: %s",
-                    error_msg ? error_msg : "unknown error");
-                free(error_msg);
-                zval_ptr_dtor(&shader_zval);
-                RETURN_FALSE;
+            for (int s = 0; s < VIO_STAGE_COUNT; s++) {
+                if (!spv[s]) continue;
+                glsl[s] = vio_spirv_to_glsl(spv[s], spv_size[s], glsl_version, &error_msg);
+                if (!glsl[s]) {
+                    php_error_docref(NULL, E_WARNING, "%s SPIR-V to GLSL transpilation failed: %s",
+                        stage_labels[s], error_msg ? error_msg : "unknown error");
+                    free(error_msg);
+                    for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);
+                    zval_ptr_dtor(&shader_zval);
+                    RETURN_FALSE;
+                }
             }
 
-            char *frag_glsl = vio_spirv_to_glsl(shader->frag_spirv, shader->frag_spirv_size, glsl_version, &error_msg);
-            if (!frag_glsl) {
-                php_error_docref(NULL, E_WARNING, "Fragment SPIR-V to GLSL transpilation failed: %s",
-                    error_msg ? error_msg : "unknown error");
-                free(error_msg);
-                free(vert_glsl);
-                zval_ptr_dtor(&shader_zval);
-                RETURN_FALSE;
-            }
-
-            shader->program = vio_opengl_compile_shader_source(vert_glsl, frag_glsl);
+            shader->program = vio_opengl_compile_program(glsl[0], glsl[1], glsl[2], glsl[3], glsl[4]);
             shader->gl_generation = vio_opengl_context_generation();
-            free(vert_glsl);
-            free(frag_glsl);
+            for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);
 
             if (!shader->program) {
                 zval_ptr_dtor(&shader_zval);
@@ -2322,6 +2522,11 @@ ZEND_FUNCTION(vio_shader)
                 zval_ptr_dtor(&shader_zval);
                 RETURN_FALSE;
             }
+
+            if (vio_shader_compile_extra_stages(shader, extra_zv) != 0) {
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
         }
 
         /* Pass SPIR-V data to backend (it will transpile to HLSL/MSL as needed) */
@@ -2331,12 +2536,37 @@ ZEND_FUNCTION(vio_shader)
         desc.vertex_size = shader->vert_spirv_size;
         desc.fragment_data = shader->frag_spirv;
         desc.fragment_size = shader->frag_spirv_size;
+        desc.geometry_data     = shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)];
+        desc.geometry_size     = shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)];
+        desc.tess_control_data = shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)];
+        desc.tess_control_size = shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)];
+        desc.tess_eval_data    = shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
+        desc.tess_eval_size    = shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
 
         shader->backend_shader = ctx->backend->compile_shader(&desc);
         if (!shader->backend_shader) {
             php_error_docref(NULL, E_WARNING, "Backend shader compilation failed");
             zval_ptr_dtor(&shader_zval);
             RETURN_FALSE;
+        }
+
+        /* Constant blocks of the optional stages (their own b0 on D3D). */
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            if (!shader->stage_spirv[i]) continue;
+            vio_shader_stage_cb *cb = calloc(1, sizeof(*cb));
+            if (!cb) continue;
+            cb->uniform_count = vio_spirv_get_uniform_offsets(
+                shader->stage_spirv[i], shader->stage_spirv_size[i],
+                cb->uniforms, VIO_MAX_UNIFORMS, &cb->total_size);
+            if (cb->total_size > 0 && ctx->backend->create_buffer) {
+                vio_buffer_desc cb_desc = {0};
+                cb_desc.type = VIO_BUFFER_UNIFORM;
+                cb_desc.data = NULL;
+                cb_desc.size = cb->total_size;
+                cb_desc.binding = 0;
+                cb->backend = ctx->backend->create_buffer(&cb_desc);
+            }
+            shader->stage_cb[i] = cb;
         }
 
         /* Extract uniform offsets from SPIRV for constant buffer mapping */
@@ -2406,6 +2636,18 @@ ZEND_FUNCTION(vio_shader)
                 if (err) free(err);
                 /* Init remap table to identity (no remapping) */
                 for (int s = 0; s < 16; s++) shader->gl_to_hlsl_sampler[s] = -1;
+            }
+        }
+
+        /* Samplers that only a geometry / tessellation stage declares (a
+         * displacement map read in the domain shader) join the map so
+         * vio_set_uniform('u_height', unit) + vio_bind_texture route them.
+         * Registers are replayed per stage; a name already mapped by the
+         * fragment stage keeps that register (the backends mirror the PS
+         * binding into the extra stages at the same register). */
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            if (shader->stage_spirv[i]) {
+                vio_shader_merge_stage_samplers(shader, shader->stage_spirv[i], shader->stage_spirv_size[i]);
             }
         }
     }
@@ -2599,6 +2841,13 @@ ZEND_FUNCTION(vio_shader_reflect)
             free(error_msg);
         }
     }
+
+    /* Optional stages under their vio_shader() config keys. */
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        if (!shader->stage_spirv[i]) continue;
+        vio_shader_reflect_stage_add(return_value, vio_extra_stage_keys[i], vio_extra_stage_labels[i],
+                                     shader->stage_spirv[i], shader->stage_spirv_size[i]);
+    }
 }
 
 ZEND_FUNCTION(vio_pipeline)
@@ -2643,6 +2892,21 @@ ZEND_FUNCTION(vio_pipeline)
     zval *val;
     if ((val = zend_hash_str_find(config_ht, "topology", sizeof("topology") - 1)) != NULL) {
         pipe->topology = (vio_topology)zval_get_long(val);
+    }
+    /* patch_vertices: control points per patch for VIO_PATCHES (1..32, default
+     * 3). A shader with tessellation stages draws patches regardless of
+     * 'topology' - the backends force it. */
+    if ((val = zend_hash_str_find(config_ht, "patch_vertices", sizeof("patch_vertices") - 1)) != NULL) {
+        zend_long pv = zval_get_long(val);
+        if (pv < 1 || pv > 32) {
+            php_error_docref(NULL, E_WARNING, "vio_pipeline: 'patch_vertices' must be 1..32");
+            zval_ptr_dtor(&pipe_zval);
+            RETURN_FALSE;
+        }
+        pipe->patch_vertices = (int)pv;
+    }
+    if (shader->has_tessellation && pipe->topology != VIO_PATCHES) {
+        pipe->topology = VIO_PATCHES;
     }
     if ((val = zend_hash_str_find(config_ht, "cull_mode", sizeof("cull_mode") - 1)) != NULL) {
         pipe->cull_mode = (vio_cull_mode)zval_get_long(val);
@@ -2787,6 +3051,7 @@ ZEND_FUNCTION(vio_pipeline)
         desc.hdr_output = pipe->hdr_output;
         desc.color_count = pipe->color_count;
         memcpy(desc.color_formats, pipe->color_formats, sizeof(desc.color_formats));
+        desc.patch_vertices = pipe->patch_vertices;
 
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
     }
@@ -3911,7 +4176,8 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
         zend_hash_init(sh->uniform_lookup,
                        sh->uniform_count + sh->frag_uniform_count + 1, NULL, NULL, 0);
         /* Vertex first so it wins on a name collision (add-if-absent), matching
-         * the original vertex-before-fragment scan order. */
+         * the original vertex-before-fragment scan order; the optional stages
+         * follow. Bits 40..43 carry the vio_shader_stage. */
         for (int u = 0; u < sh->uniform_count; u++) {
             zend_long enc = (1LL << 48)
                 | ((zend_long)(sh->uniforms[u].offset & 0xFFFF) << 16)
@@ -3920,11 +4186,22 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
                                   strlen(sh->uniforms[u].name), (void *)(intptr_t)enc);
         }
         for (int u = 0; u < sh->frag_uniform_count; u++) {
-            zend_long enc = (1LL << 48) | (1LL << 40)
+            zend_long enc = (1LL << 48) | ((zend_long)VIO_STAGE_FRAGMENT << 40)
                 | ((zend_long)(sh->frag_uniforms[u].offset & 0xFFFF) << 16)
                 | (zend_long)(sh->frag_uniforms[u].size & 0xFFFF);
             zend_hash_str_add_ptr(sh->uniform_lookup, sh->frag_uniforms[u].name,
                                   strlen(sh->frag_uniforms[u].name), (void *)(intptr_t)enc);
+        }
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            vio_shader_stage_cb *cb = sh->stage_cb[i];
+            if (!cb) continue;
+            for (int u = 0; u < cb->uniform_count; u++) {
+                zend_long enc = (1LL << 48) | ((zend_long)(VIO_STAGE_GEOMETRY + i) << 40)
+                    | ((zend_long)(cb->uniforms[u].offset & 0xFFFF) << 16)
+                    | (zend_long)(cb->uniforms[u].size & 0xFFFF);
+                zend_hash_str_add_ptr(sh->uniform_lookup, cb->uniforms[u].name,
+                                      strlen(cb->uniforms[u].name), (void *)(intptr_t)enc);
+            }
         }
     }
     void *p = zend_hash_str_find_ptr(sh->uniform_lookup, name, strlen(name));
@@ -4009,15 +4286,18 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
          * replacing the former linear strcmp scan over both uniform arrays. */
         unsigned char *dst = NULL;
         int max_size = 0;
-        int is_frag = 0;
+        int stage = VIO_STAGE_VERTEX;
 
         zend_long enc = vio_uniform_lookup(sh, name);
         if (enc) {
-            is_frag = (int)((enc >> 40) & 0x1);
+            stage = (int)((enc >> 40) & 0xF);
             int offset = (int)((enc >> 16) & 0xFFFF);
             max_size = (int)(enc & 0xFFFF);
             if (offset >= 0 && offset + max_size <= VIO_CBUFFER_SIZE) {
-                dst = (is_frag ? sh->frag_cbuffer_data : sh->cbuffer_data) + offset;
+                if (stage == VIO_STAGE_VERTEX)        dst = sh->cbuffer_data + offset;
+                else if (stage == VIO_STAGE_FRAGMENT) dst = sh->frag_cbuffer_data + offset;
+                else if (sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)])
+                    dst = sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]->data + offset;
             }
         }
 
@@ -4065,10 +4345,12 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
                 }
             }
 
-            if (is_frag) {
+            if (stage == VIO_STAGE_VERTEX) {
+                sh->cbuffer_dirty = 1;
+            } else if (stage == VIO_STAGE_FRAGMENT) {
                 sh->frag_cbuffer_dirty = 1;
             } else {
-                sh->cbuffer_dirty = 1;
+                sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]->dirty = 1;
             }
         }
     }
@@ -6583,6 +6865,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_LINES", VIO_LINES, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP", VIO_LINE_STRIP, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_POINTS", VIO_POINTS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_PATCHES", VIO_PATCHES, CONST_CS | CONST_PERSISTENT);
 
     /* Cull mode */
     REGISTER_LONG_CONSTANT("VIO_CULL_NONE", VIO_CULL_NONE, CONST_CS | CONST_PERSISTENT);
@@ -7527,6 +7810,7 @@ ZEND_FUNCTION(vio_draw_instanced)
                         ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
                         sh->frag_cbuffer_dirty = 0;
                     }
+                    vio_push_extra_stage_constants(ctx, sh);
                     if (sh->cbuffer_backend) {
                         vio_d3d11_buffer *cb = (vio_d3d11_buffer *)sh->cbuffer_backend;
                         ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
@@ -7600,6 +7884,7 @@ ZEND_FUNCTION(vio_draw_instanced)
                     ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
                     sh->frag_cbuffer_dirty = 0;
                 }
+                vio_push_extra_stage_constants(ctx, sh);
                 /* Allocate per-draw cbuffer slices from linear allocator.
                  * Bound against THIS frame's slice end (cbuffer_frame_end), not
                  * heap capacity — spilling past the slice would clobber the

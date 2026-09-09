@@ -38,6 +38,10 @@ typedef enum _vio_topology {
     VIO_LINES          = 3,
     VIO_LINE_STRIP     = 4,
     VIO_POINTS         = 5,
+    /* Tessellation patches: `patch_vertices` control points per primitive
+     * (vio_pipeline 'patch_vertices', default 3). Implied whenever the
+     * pipeline's shader carries a tessellation-control stage. */
+    VIO_PATCHES        = 6,
 } vio_topology;
 
 /* ── Cull mode ────────────────────────────────────────────────────── */
@@ -297,6 +301,8 @@ typedef struct _vio_pipeline_desc {
                                                 PSO creation; Metal/GL/D3D11 derive them
                                                 from the bound render target. */
     int              color_formats[VIO_MAX_COLOR_ATTACHMENTS]; /* vio_pixel_format */
+    int              patch_vertices;         /* control points per patch for
+                                                VIO_PATCHES (1..32; 0 => 3). */
 } vio_pipeline_desc;
 
 typedef struct _vio_buffer_desc {
@@ -349,7 +355,29 @@ typedef struct _vio_shader_desc {
     const void       *fragment_data;
     size_t            fragment_size;
     vio_shader_format format;
+    /* Optional stages (NULL = absent). Same encoding as vertex/fragment
+     * (SPIR-V when format is GLSL/AUTO on the backend path, else source).
+     * tess_control and tess_eval always come as a pair. Backends that report
+     * VIO_FEATURE_GEOMETRY / VIO_FEATURE_TESSELLATION = 0 never see them:
+     * vio_shader() refuses the stage up front. */
+    const void       *geometry_data;
+    size_t            geometry_size;
+    const void       *tess_control_data;
+    size_t            tess_control_size;
+    const void       *tess_eval_data;
+    size_t            tess_eval_size;
 } vio_shader_desc;
+
+/* Shader stage index shared by vio_shader_object's per-stage constant
+ * buffers, the compiler and the bind_stage_constants vtable slot. */
+typedef enum _vio_shader_stage {
+    VIO_STAGE_VERTEX       = 0,
+    VIO_STAGE_FRAGMENT     = 1,
+    VIO_STAGE_GEOMETRY     = 2,
+    VIO_STAGE_TESS_CONTROL = 3,
+    VIO_STAGE_TESS_EVAL    = 4,
+    VIO_STAGE_COUNT        = 5,
+} vio_shader_stage;
 
 typedef struct _vio_draw_cmd {
     void *pipeline;

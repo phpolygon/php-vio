@@ -30,6 +30,30 @@ char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_ms
  * Returns malloc'd string (caller frees). NULL on failure. */
 char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_model, char **error_msg);
 
+/* Same, with explicit control over the GL -> D3D clip-space depth fixup
+ * (z' = (z + w) / 2 on gl_Position writes). SPIRV-Cross applies it to EVERY
+ * vertex-like stage, so a VS + GS (or VS + TES) pair would convert twice;
+ * callers pass fixup_depth = 1 only for the LAST stage that writes
+ * gl_Position and 0 for the ones before it. */
+char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_model,
+                           int fixup_depth, char **error_msg);
+
+/* Can the linked SPIRV-Cross emit HLSL for this graphics stage
+ * (vio_shader_stage)? Geometry (2025-05) and hull / domain support arrived in
+ * SPIRV-Cross long after vertex / fragment, and the Vulkan-SDK builds the
+ * Windows CI and users link against lag behind - so the D3D backends only
+ * report VIO_FEATURE_GEOMETRY / TESSELLATION when a canonical minimal stage
+ * actually transpiles. Probed once per process (glslang + SPIRV-Cross round
+ * trip of a few lines of GLSL) and cached. Returns 1 / 0. */
+int vio_hlsl_stage_supported(int stage);
+
+/* The transpiled HLSL of the canonical probe stage (malloc'd, caller frees;
+ * NULL when glslang / SPIRV-Cross cannot produce it). The D3D backends feed it
+ * through FXC as the second half of the probe: SPIRV-Cross may emit HLSL that
+ * the compiler then rejects (e.g. an undeclared `gl_in` in a geometry
+ * shader), and only a stage that survives both steps is reported. */
+char *vio_hlsl_probe_hlsl(int stage, int shader_model);
+
 /* Reflection info for a single resource */
 typedef struct _vio_reflect_resource {
     const char *name;

@@ -321,6 +321,16 @@ typedef struct _vio_backend {
 
     /* Query */
     int   (*supports_feature)(vio_feature feature);
+
+    /* Bind the constant block of an EXTRA shader stage (VIO_STAGE_GEOMETRY /
+     * TESS_CONTROL / TESS_EVAL) for the next draw. The generic draw path has
+     * already pushed `data` into `backend_buffer` via update_buffer when the
+     * block was dirty; D3D11 binds that buffer at the stage's b0, D3D12 copies
+     * `data` into a fresh per-frame cbuffer slice and points the stage's root
+     * CBV at it (no buffer renaming). Optional: NULL on backends whose
+     * uniforms are program-wide (OpenGL) or that have no such stages. */
+    void  (*bind_stage_constants)(int stage, void *backend_buffer,
+                                  const void *data, size_t size);
 } vio_backend;
 
 /*
