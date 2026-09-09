@@ -2873,6 +2873,13 @@ ZEND_FUNCTION(vio_texture)
     if ((val = zend_hash_str_find(config_ht, "wrap", sizeof("wrap") - 1)) != NULL) {
         tex->wrap = (vio_wrap)zval_get_long(val);
     }
+    /* 'anisotropy' => 1..16: anisotropic filtering (needs a LINEAR filter to
+     * matter). 0/1/absent = off. Backends clamp to their device limit; Metal
+     * ignores it for now. */
+    if ((val = zend_hash_str_find(config_ht, "anisotropy", sizeof("anisotropy") - 1)) != NULL) {
+        zend_long a = zval_get_long(val);
+        tex->anisotropy = a < 1 ? 1 : (a > 16 ? 16 : (int)a);
+    }
 
     /* Load from file or raw data */
     zval *file_zval = zend_hash_str_find(config_ht, "file", sizeof("file") - 1);
@@ -2970,6 +2977,7 @@ ZEND_FUNCTION(vio_texture)
         desc.height = h;
         desc.filter = tex->filter;
         desc.wrap = tex->wrap;
+        desc.anisotropy = tex->anisotropy;
         desc.mipmaps = mipmaps;
         desc.storage = storage;
         tex->backend_texture = ctx->backend->create_texture(&desc);
@@ -3076,6 +3084,10 @@ ZEND_FUNCTION(vio_texture_3d)
     if ((val = zend_hash_str_find(config_ht, "wrap", sizeof("wrap") - 1)) != NULL) {
         tex->wrap = (vio_wrap)zval_get_long(val);
     }
+    if ((val = zend_hash_str_find(config_ht, "anisotropy", sizeof("anisotropy") - 1)) != NULL) {
+        zend_long a = zval_get_long(val);
+        tex->anisotropy = a < 1 ? 1 : (a > 16 ? 16 : (int)a);
+    }
 
     tex->width    = w;
     tex->height   = h;
@@ -3108,6 +3120,7 @@ ZEND_FUNCTION(vio_texture_3d)
         desc.depth     = d;
         desc.filter    = tex->filter;
         desc.wrap      = tex->wrap;
+        desc.anisotropy = tex->anisotropy;
         desc.storage   = storage;
         tex->backend_texture = ctx->backend->create_texture_3d(&desc);
         if (!tex->backend_texture) {

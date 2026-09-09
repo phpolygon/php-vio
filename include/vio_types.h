@@ -249,6 +249,13 @@ typedef struct _vio_vertex_attrib {
     int        location;
     vio_format format;
     vio_usage  usage;
+    /* Matrix inputs (`layout(location = 3) in mat4 aModel`) are expanded into
+     * one attribute per column at location + column. matrix_columns is the
+     * column count of the source matrix (0 / 1 for plain vectors) and
+     * matrix_column this attribute's column. HLSL from SPIRV-Cross names the
+     * columns TEXCOORD{location}_{column}, so the D3D input layouts need both. */
+    int        matrix_columns;
+    int        matrix_column;
 } vio_vertex_attrib;
 
 /* Mesh-level per-attribute description used by the create_mesh vtable slot.
@@ -331,6 +338,9 @@ typedef struct _vio_texture_desc {
     int         storage;        /* 1 => usable as a compute storage image
                                    (image2D / image3D): Metal ShaderWrite usage,
                                    D3D UAV, GL image unit. Sampling still works. */
+    int         anisotropy;     /* max anisotropic filtering, 0/1 = off (default),
+                                   clamped to 16 and to the device limit. Only
+                                   meaningful with filter = LINEAR. */
 } vio_texture_desc;
 
 typedef struct _vio_shader_desc {
