@@ -142,6 +142,18 @@ typedef struct _vio_vulkan_state {
     /* State */
     int                      initialized;
     int                      swapchain_needs_recreate;
+    /* vio_create(['vsync' => …]) — picks the present mode (GAP-PLAN 2.7):
+     * 0 => IMMEDIATE (uncapped; MAILBOX, then FIFO as fallbacks),
+     * 1 => FIFO (true vsync). */
+    int                      vsync;
+    /* samplerAnisotropy device feature: enabled at device creation when the
+     * physical device offers it; max_anisotropy is the device limit. */
+    int                      anisotropy_supported;
+    float                    max_anisotropy;
+    /* Persistent pool + fence for one-shot uploads / compute dispatches
+     * (GAP-PLAN 4.4); lazily created, destroyed in vulkan_shutdown. */
+    VkCommandPool            transient_pool;
+    VkFence                  transient_fence;
     int                      in_frame;          /* 1 while the command buffer is recording (begin_frame..end_frame) */
     /* Phase 4 — warm-render present-skip. Captured at vulkan_begin_frame: 1 when
      * the frame is OFFSCREEN-ONLY (vio_vk.pending_bound_rt was set BEFORE

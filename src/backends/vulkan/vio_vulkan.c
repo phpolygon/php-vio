@@ -251,7 +251,20 @@ static int create_logical_device(void)
 
     uint32_t device_ext_count = has_portability ? 2 : 1;
 
+    /* Enable only what we use: anisotropic filtering when the device has it
+     * (vio_texture(['anisotropy' => N]) — GAP-PLAN 2.6). */
     VkPhysicalDeviceFeatures features = {0};
+    {
+        VkPhysicalDeviceFeatures avail = {0};
+        VkPhysicalDeviceProperties props = {0};
+        vkGetPhysicalDeviceFeatures(vio_vk.physical_device, &avail);
+        vkGetPhysicalDeviceProperties(vio_vk.physical_device, &props);
+        if (avail.samplerAnisotropy) {
+            features.samplerAnisotropy = VK_TRUE;
+            vio_vk.anisotropy_supported = 1;
+            vio_vk.max_anisotropy = props.limits.maxSamplerAnisotropy;
+        }
+    }
 
     VkDeviceCreateInfo create_info = {0};
     create_info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -372,12 +385,19 @@ static int create_swapchain(void)
     VkPresentModeKHR *modes = malloc(pm_count * sizeof(VkPresentModeKHR));
     vkGetPhysicalDeviceSurfacePresentModesKHR(vio_vk.physical_device, vio_vk.surface, &pm_count, modes);
 
+    /* FIFO is the only mode the spec guarantees and is real vsync. With
+     * vsync off, IMMEDIATE gives the uncapped frame rate D3D/GL deliver
+     * (vio_create(['vsync' => false]) used to leave Vulkan refresh-capped on
+     * MAILBOX); MAILBOX is the fallback when IMMEDIATE is absent (GAP-PLAN 2.7). */
     VkPresentModeKHR chosen_mode = VK_PRESENT_MODE_FIFO_KHR; /* vsync, always available */
-    for (uint32_t i = 0; i < pm_count; i++) {
-        if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
-            chosen_mode = VK_PRESENT_MODE_MAILBOX_KHR;
-            break;
+    if (!vio_vk.vsync) {
+        int has_immediate = 0, has_mailbox = 0;
+        for (uint32_t i = 0; i < pm_count; i++) {
+            if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) has_immediate = 1;
+            if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR)   has_mailbox = 1;
         }
+        if (has_immediate)    chosen_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        else if (has_mailbox) chosen_mode = VK_PRESENT_MODE_MAILBOX_KHR;
     }
     free(modes);
 
@@ -714,6 +734,7 @@ int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
     vio_vk.clear_g = 0.1f;
     vio_vk.clear_b = 0.1f;
     vio_vk.clear_a = 1.0f;
+    vio_vk.vsync   = cfg->vsync;   /* read by create_swapchain (present mode) */
 
     /* 1. Instance */
     if (create_instance(cfg->debug) != 0) return -1;
@@ -880,6 +901,8 @@ static void vulkan_shutdown(void)
         }
     }
     if (vio_vk.vma_allocator) { vio_vma_destroy(vio_vk.vma_allocator); vio_vk.vma_allocator = NULL; }
+    if (vio_vk.device && vio_vk.transient_fence) { vkDestroyFence(vio_vk.device, vio_vk.transient_fence, NULL); vio_vk.transient_fence = VK_NULL_HANDLE; }
+    if (vio_vk.device && vio_vk.transient_pool)  { vkDestroyCommandPool(vio_vk.device, vio_vk.transient_pool, NULL); vio_vk.transient_pool = VK_NULL_HANDLE; }
     if (vio_vk.device) { vkDestroyDevice(vio_vk.device, NULL); vio_vk.device = VK_NULL_HANDLE; }
     if (vio_vk.surface) { vkDestroySurfaceKHR(vio_vk.instance, vio_vk.surface, NULL); vio_vk.surface = VK_NULL_HANDLE; }
 
@@ -1046,30 +1069,54 @@ static void vulkan_destroy_buffer_obj(void *buf_obj)
  * swapchain command buffer is recording), so a full queue stall on the fence is
  * acceptable and keeps lifetimes simple — the upload never touches the per-frame
  * command buffer, so there is no cross-frame hazard. */
+/* Persistent transient pool + fence (GAP-PLAN 4.4): created on first use,
+ * reset per upload / dispatch instead of being created and destroyed every
+ * time. Both live until vulkan_shutdown, which destroys them before the
+ * device. */
+static int vulkan_ensure_transient_pool(void)
+{
+    if (!vio_vk.device) return -1;
+    if (!vio_vk.transient_pool) {
+        VkCommandPoolCreateInfo pool_info = {0};
+        pool_info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pool_info.queueFamilyIndex = vio_vk.graphics_family;
+        if (vkCreateCommandPool(vio_vk.device, &pool_info, NULL, &vio_vk.transient_pool) != VK_SUCCESS) {
+            vio_vk.transient_pool = VK_NULL_HANDLE;
+            php_error_docref(NULL, E_WARNING, "Vulkan: failed to create transient command pool");
+            return -1;
+        }
+    }
+    if (!vio_vk.transient_fence) {
+        VkFenceCreateInfo fci = {0};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(vio_vk.device, &fci, NULL, &vio_vk.transient_fence) != VK_SUCCESS) {
+            vio_vk.transient_fence = VK_NULL_HANDLE;
+            php_error_docref(NULL, E_WARNING, "Vulkan: failed to create transient fence");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int vulkan_begin_transient_commands(VkCommandPool *out_pool, VkCommandBuffer *out_cmd)
 {
     *out_pool = VK_NULL_HANDLE;
     *out_cmd  = VK_NULL_HANDLE;
+    if (vulkan_ensure_transient_pool() != 0) return -1;
 
-    VkCommandPool pool = VK_NULL_HANDLE;
-    VkCommandPoolCreateInfo pool_info = {0};
-    pool_info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    pool_info.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    pool_info.queueFamilyIndex = vio_vk.graphics_family;
-    if (vkCreateCommandPool(vio_vk.device, &pool_info, NULL, &pool) != VK_SUCCESS) {
-        php_error_docref(NULL, E_WARNING, "Vulkan: failed to create transient command pool");
-        return -1;
-    }
+    /* Every previous transient submission was fenced to completion, so the
+     * pool's buffers are free to recycle. */
+    vkResetCommandPool(vio_vk.device, vio_vk.transient_pool, 0);
 
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo cmd_alloc = {0};
     cmd_alloc.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmd_alloc.commandPool        = pool;
+    cmd_alloc.commandPool        = vio_vk.transient_pool;
     cmd_alloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cmd_alloc.commandBufferCount = 1;
     if (vkAllocateCommandBuffers(vio_vk.device, &cmd_alloc, &cmd) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Vulkan: failed to allocate transient command buffer");
-        vkDestroyCommandPool(vio_vk.device, pool, NULL);
         return -1;
     }
 
@@ -1078,11 +1125,11 @@ static int vulkan_begin_transient_commands(VkCommandPool *out_pool, VkCommandBuf
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Vulkan: failed to begin transient command buffer");
-        vkDestroyCommandPool(vio_vk.device, pool, NULL); /* frees cmd */
+        vkFreeCommandBuffers(vio_vk.device, vio_vk.transient_pool, 1, &cmd);
         return -1;
     }
 
-    *out_pool = pool;
+    *out_pool = vio_vk.transient_pool;
     *out_cmd  = cmd;
     return 0;
 }
@@ -1090,38 +1137,29 @@ static int vulkan_begin_transient_commands(VkCommandPool *out_pool, VkCommandBuf
 static int vulkan_submit_transient_commands(VkCommandPool pool, VkCommandBuffer cmd)
 {
     int rc = 0;
+    (void)pool;   /* always the persistent transient pool */
 
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Vulkan: failed to end transient command buffer");
-        vkDestroyCommandPool(vio_vk.device, pool, NULL);
+        vkFreeCommandBuffers(vio_vk.device, vio_vk.transient_pool, 1, &cmd);
         return -1;
     }
 
-    VkFence fence = VK_NULL_HANDLE;
-    VkFenceCreateInfo fci = {0};
-    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    if (vkCreateFence(vio_vk.device, &fci, NULL, &fence) != VK_SUCCESS) {
-        php_error_docref(NULL, E_WARNING, "Vulkan: failed to create transient fence");
-        vkDestroyCommandPool(vio_vk.device, pool, NULL);
-        return -1;
-    }
-
+    vkResetFences(vio_vk.device, 1, &vio_vk.transient_fence);
     VkSubmitInfo submit = {0};
     submit.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers    = &cmd;
-    if (vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, fence) != VK_SUCCESS) {
+    if (vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, vio_vk.transient_fence) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Vulkan: failed to submit transient commands");
         /* The submit did not take; do NOT wait the (never-signalled) fence.
-         * Best-effort drain so the cmd buffer is not in flight, then destroy. */
+         * Best-effort drain so the cmd buffer is not in flight. */
         vkDeviceWaitIdle(vio_vk.device);
         rc = -1;
     } else {
-        vkWaitForFences(vio_vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+        vkWaitForFences(vio_vk.device, 1, &vio_vk.transient_fence, VK_TRUE, UINT64_MAX);
     }
-
-    vkDestroyFence(vio_vk.device, fence, NULL);
-    vkDestroyCommandPool(vio_vk.device, pool, NULL); /* frees cmd */
+    vkFreeCommandBuffers(vio_vk.device, vio_vk.transient_pool, 1, &cmd);
     return rc;
 }
 
@@ -1351,8 +1389,14 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
     sci.addressModeW  = vk_wrap;
     sci.maxLod        = 0.0f;
     sci.borderColor   = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    /* anisotropyEnable left VK_FALSE: the samplerAnisotropy feature is not
-     * enabled on the device, so requesting it would be a validation error. */
+    /* Anisotropy only when the device feature was enabled at creation
+     * (requesting it otherwise is a validation error) and the base filter is
+     * LINEAR; clamped to the device limit. */
+    if (desc->anisotropy > 1 && desc->filter != VIO_FILTER_NEAREST && vio_vk.anisotropy_supported) {
+        float want = (float)(desc->anisotropy > 16 ? 16 : desc->anisotropy);
+        sci.anisotropyEnable = VK_TRUE;
+        sci.maxAnisotropy    = want < vio_vk.max_anisotropy ? want : vio_vk.max_anisotropy;
+    }
     if (vkCreateSampler(vio_vk.device, &sci, NULL, &tex->sampler) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Vulkan: failed to create texture sampler");
         vkDestroyImageView(vio_vk.device, tex->view, NULL);
@@ -1720,6 +1764,7 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
     rt->vulkan_framebuffer = fb;
     rt->vulkan_sampler     = sampler;
     rt->vulkan_color_backend_texture = NULL; /* built lazily by vio_render_target_texture */
+    rt->backend_type = VIO_RT_BACKEND_VULKAN;
 
     /* Track for the shutdown sweep so the RT's GPU objects are freed before
      * vkDestroyDevice even if the PHP object outlives vio_destroy(). */
@@ -3055,19 +3100,27 @@ static int vulkan_supports_feature(vio_feature feature)
 {
     switch (feature) {
         case VIO_FEATURE_COMPUTE:      return 1;
-        case VIO_FEATURE_TESSELLATION: return 1;
-        case VIO_FEATURE_GEOMETRY:     return 1;
-        case VIO_FEATURE_3D_PIPELINE:  return 1;
+        /* The Vulkan backend has NO 3D graphics pipeline: vulkan_create_pipeline
+         * returns NULL and vulkan_draw / vulkan_draw_indexed / vulkan_bind_pipeline
+         * are no-ops (3D went through the standalone php-vulkan extension). It is
+         * a 2D + compute + offscreen-RT backend, so every flag that needs a vertex
+         * stage — 3D pipeline, instancing, depth bias, tessellation, geometry —
+         * reports 0. vio_get_auto_backend() uses VIO_FEATURE_3D_PIPELINE to skip
+         * it in favour of a backend that can draw 3D (see D3D-VULKAN-GAP-PLAN.md,
+         * Phase 0). */
+        case VIO_FEATURE_TESSELLATION: return 0;
+        case VIO_FEATURE_GEOMETRY:     return 0;
+        case VIO_FEATURE_3D_PIPELINE:  return 0;
         case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
         case VIO_FEATURE_MULTIVIEW:    return 0; /* VK_KHR_multiview not wired */
         case VIO_FEATURE_READ_PIXELS:  return 1; /* vkCmdCopyImageToBuffer readback of a RE-ACQUIRED swapchain image (see vulkan_read_pixels); requires the swapchain's TRANSFER_SRC usage added in create_swapchain */
-        case VIO_FEATURE_INSTANCED_DRAW: return 1;
+        case VIO_FEATURE_INSTANCED_DRAW: return 0; /* no 3D draw path */
         case VIO_FEATURE_RENDER_TARGET:       return 1; /* offscreen RT + render-to-texture (Phase 3) */
         case VIO_FEATURE_RENDER_TARGET_HDR:   return 0; /* R16G16B16A16_SFLOAT offscreen not wired (HDR deferred) */
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 0; /* depth-RT sampling descriptor not wired */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 0;
         case VIO_FEATURE_CUBEMAP:      return 0;
-        case VIO_FEATURE_DEPTH_BIAS:   return 1; /* pipeline rasterization state */
+        case VIO_FEATURE_DEPTH_BIAS:   return 0; /* pipeline rasterization state — no 3D pipeline to carry it */
         case VIO_FEATURE_SCISSOR:      return 1;
         case VIO_FEATURE_TEXTURE_SWIZZLE: return 1; /* VkComponentMapping */
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* Vulkan 2D path (shapes/sprites/text) */
