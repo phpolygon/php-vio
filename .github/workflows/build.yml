@@ -35,8 +35,9 @@ jobs:
           # The runner image ships third-party apt sources (Google Chrome,
           # Microsoft Edge, …) whose mirrors intermittently answer with
           # "Hash Sum mismatch" and take the whole job down. We only need
-          # Ubuntu's own archive, so drop them and retry once.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/microsoft-edge*.list
+          # Ubuntu's own archive, so drop them (matched by content — the image
+          # uses deb822 *.sources files, not *.list) and retry once.
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* 2>/dev/null | xargs -r sudo rm -f
           sudo apt-get update || (sleep 15 && sudo apt-get update)
           sudo apt-get install -y \
             libglfw3-dev \
@@ -121,8 +122,9 @@ jobs:
           # The runner image ships third-party apt sources (Google Chrome,
           # Microsoft Edge, …) whose mirrors intermittently answer with
           # "Hash Sum mismatch" and take the whole job down. We only need
-          # Ubuntu's own archive, so drop them and retry once.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/microsoft-edge*.list
+          # Ubuntu's own archive, so drop them (matched by content — the image
+          # uses deb822 *.sources files, not *.list) and retry once.
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* 2>/dev/null | xargs -r sudo rm -f
           sudo apt-get update || (sleep 15 && sudo apt-get update)
           sudo apt-get install -y \
             libglfw3-dev \
