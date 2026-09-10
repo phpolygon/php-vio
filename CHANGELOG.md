@@ -1,3 +1,10 @@
+# [2.18.0](https://github.com/phpolygon/php-vio/compare/v2.17.0...v2.18.0) (2026-09-10)
+
+
+### Features
+
+* **d3d12:** GPU mip generation via compute downsample; Metal honours 'anisotropy' ([e0f8ffb](https://github.com/phpolygon/php-vio/commit/e0f8ffbf081197b3aca46d1b8f752d9dd3905d75))
+
 # [2.17.0](https://github.com/phpolygon/php-vio/compare/v2.16.0...v2.17.0) (2026-09-10)
 
 
