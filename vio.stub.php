@@ -448,8 +448,11 @@ function vio_shader_reflect(VioShader $shader): array|false {}
  * @param array $config ['shader' => VioShader, 'topology' => int, 'cull_mode' => int, 'depth_test' => bool,
  *                      'depth_func' => int, 'depth_write' => bool, 'blend' => int, 'color_mask' => int,
  *                      'depth_bias' => float, 'slope_scaled_depth_bias' => float, 'hdr' => bool,
- *                      'attachments' => int[]]  // MRT output formats (VIO_FORMAT_*) — only D3D12 needs them
+ *                      'attachments' => int[],  // MRT output formats (VIO_FORMAT_*) — only D3D12 needs them
  *                                               //   (PSO RTV formats); must match the bound render target
+ *                      'attachment_blend' => int[], 'attachment_color_mask' => int[]]
+ *                                               // MRT: blend mode / VIO_COLOR_* mask PER colour attachment
+ *                                               //   (missing entries fall back to 'blend' / 'color_mask')
  * @return VioPipeline|false Pipeline object or false on failure
  */
 function vio_pipeline(VioContext $context, array $config): VioPipeline|false {}

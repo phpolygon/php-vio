@@ -2695,6 +2695,33 @@ ZEND_FUNCTION(vio_pipeline)
             pipe->color_formats[pipe->color_count++] = (int)zval_get_long(fz);
         } ZEND_HASH_FOREACH_END();
     }
+    /* Per-attachment blend / write mask (MRT). 'attachment_blend' => [VIO_BLEND_*, ...]
+     * and 'attachment_color_mask' => [VIO_COLOR_*, ...] are indexed by colour attachment;
+     * entries not given fall back to the scalar 'blend' / 'color_mask'. This is what lets
+     * a transparent pass alpha-blend into the colour attachments of a G-buffer target
+     * while leaving (or fully overwriting) the data attachment. */
+    for (int ai = 0; ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
+        pipe->attachment_blend[ai] = (int)pipe->blend;
+        pipe->attachment_mask[ai]  = pipe->color_mask;
+    }
+    if ((val = zend_hash_str_find(config_ht, "attachment_blend", sizeof("attachment_blend") - 1)) != NULL &&
+        Z_TYPE_P(val) == IS_ARRAY) {
+        zval *bz; int ai = 0;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(val), bz) {
+            if (ai >= VIO_MAX_COLOR_ATTACHMENTS) break;
+            pipe->attachment_blend[ai++] = (int)zval_get_long(bz);
+        } ZEND_HASH_FOREACH_END();
+        pipe->per_attachment = 1;
+    }
+    if ((val = zend_hash_str_find(config_ht, "attachment_color_mask", sizeof("attachment_color_mask") - 1)) != NULL &&
+        Z_TYPE_P(val) == IS_ARRAY) {
+        zval *mz; int ai = 0;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(val), mz) {
+            if (ai >= VIO_MAX_COLOR_ATTACHMENTS) break;
+            pipe->attachment_mask[ai++] = (int)(zval_get_long(mz) & VIO_COLOR_RGBA);
+        } ZEND_HASH_FOREACH_END();
+        pipe->per_attachment = 1;
+    }
 
     /* Store backend shader reference for lazy pipeline creation */
     pipe->backend_shader = shader->backend_shader;
@@ -2791,6 +2818,9 @@ ZEND_FUNCTION(vio_pipeline)
         desc.hdr_output = pipe->hdr_output;
         desc.color_count = pipe->color_count;
         memcpy(desc.color_formats, pipe->color_formats, sizeof(desc.color_formats));
+        desc.per_attachment = pipe->per_attachment;
+        memcpy(desc.attachment_blend, pipe->attachment_blend, sizeof(desc.attachment_blend));
+        memcpy(desc.attachment_mask, pipe->attachment_mask, sizeof(desc.attachment_mask));
 
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
     }

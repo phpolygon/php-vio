@@ -297,6 +297,12 @@ typedef struct _vio_pipeline_desc {
                                                 PSO creation; Metal/GL/D3D11 derive them
                                                 from the bound render target. */
     int              color_formats[VIO_MAX_COLOR_ATTACHMENTS]; /* vio_pixel_format */
+    int              per_attachment;         /* 1 => attachment_blend[] / attachment_mask[]
+                                                override blend / color_mask per colour
+                                                attachment (MRT: alpha-blend colour while a
+                                                data attachment stays untouched). */
+    int              attachment_blend[VIO_MAX_COLOR_ATTACHMENTS]; /* vio_blend_mode per attachment */
+    int              attachment_mask[VIO_MAX_COLOR_ATTACHMENTS];  /* VIO_COLOR_* bits per attachment */
 } vio_pipeline_desc;
 
 typedef struct _vio_buffer_desc {

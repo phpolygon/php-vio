@@ -2460,6 +2460,9 @@ typedef struct _vio_metal_pipeline {
     MTLCullMode      cull;
     vio_blend_mode   blend;
     int              color_mask;    /* VIO_COLOR_* bits */
+    int              per_attachment; /* attachment_blend[] / attachment_mask[] override blend / color_mask per attachment */
+    int              attachment_blend[VIO_MAX_COLOR_ATTACHMENTS];
+    int              attachment_mask[VIO_MAX_COLOR_ATTACHMENTS];
     float            depth_bias;
     float            slope_scaled_depth_bias;
     vio_metal_pso_variant variants[VIO_METAL_PSO_VARIANTS];
@@ -2526,6 +2529,11 @@ static void *metal_create_pipeline(vio_pipeline_desc *desc)
         }
         p->blend = desc->blend;
         p->color_mask = desc->color_mask ? desc->color_mask : VIO_COLOR_RGBA;
+        p->per_attachment = desc->per_attachment;
+        for (int ai = 0; ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
+            p->attachment_blend[ai] = desc->attachment_blend[ai];
+            p->attachment_mask[ai]  = desc->attachment_mask[ai]; /* literal: 0 = masked off */
+        }
         p->depth_bias = desc->depth_bias;
         p->slope_scaled_depth_bias = desc->slope_scaled_depth_bias;
 
@@ -2687,21 +2695,24 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
         }
 
         for (int att = 0; att < t->count; att++) {
-            /* Same blend / write-mask state on every attachment (MRT). */
+            /* Blend / write mask per attachment: the pipeline's single state on every
+             * attachment, or - 'attachment_blend' / 'attachment_color_mask' - its own. */
+            int attMask  = p->per_attachment ? p->attachment_mask[att]  : p->color_mask;
+            int attBlend = p->per_attachment ? p->attachment_blend[att] : (int)p->blend;
             MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[att];
             ca.pixelFormat = t->fmts[att];
             MTLColorWriteMask wm = MTLColorWriteMaskNone;
-            if (p->color_mask & VIO_COLOR_R) wm |= MTLColorWriteMaskRed;
-            if (p->color_mask & VIO_COLOR_G) wm |= MTLColorWriteMaskGreen;
-            if (p->color_mask & VIO_COLOR_B) wm |= MTLColorWriteMaskBlue;
-            if (p->color_mask & VIO_COLOR_A) wm |= MTLColorWriteMaskAlpha;
+            if (attMask & VIO_COLOR_R) wm |= MTLColorWriteMaskRed;
+            if (attMask & VIO_COLOR_G) wm |= MTLColorWriteMaskGreen;
+            if (attMask & VIO_COLOR_B) wm |= MTLColorWriteMaskBlue;
+            if (attMask & VIO_COLOR_A) wm |= MTLColorWriteMaskAlpha;
             ca.writeMask = wm;
-            if (p->blend != VIO_BLEND_NONE) {
+            if (attBlend != VIO_BLEND_NONE) {
                 ca.blendingEnabled = YES;
                 ca.rgbBlendOperation = MTLBlendOperationAdd;
                 ca.alphaBlendOperation = MTLBlendOperationAdd;
             }
-            switch (p->blend) {
+            switch (attBlend) {
                 case VIO_BLEND_ALPHA:
                     ca.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
                     ca.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
