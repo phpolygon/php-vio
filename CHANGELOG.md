@@ -1,3 +1,10 @@
+## [2.10.2](https://github.com/phpolygon/php-vio/compare/v2.10.1...v2.10.2) (2026-09-10)
+
+
+### Bug Fixes
+
+* **bind:** the draw-time bind table owns a reference to every pending texture ([63c995f](https://github.com/phpolygon/php-vio/commit/63c995f90e8361322a3af6fcd6824f678081f8cb))
+
 ## [2.10.1](https://github.com/phpolygon/php-vio/compare/v2.10.0...v2.10.1) (2026-09-09)
 
 
