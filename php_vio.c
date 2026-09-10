@@ -3746,6 +3746,9 @@ ZEND_FUNCTION(vio_storage_buffer)
     desc.size = size;
     desc.binding = 0;
     desc.stride = stride;
+    /* 'indirect' => true: usable as vio_draw_indirect() argument buffer. */
+    zval *indirect_zval = zend_hash_str_find(config_ht, "indirect", sizeof("indirect") - 1);
+    desc.indirect = indirect_zval && zend_is_true(indirect_zval) ? 1 : 0;
 
     void *backend_buffer = ctx->backend->create_buffer(&desc);
     if (!backend_buffer) {
@@ -4065,6 +4068,51 @@ ZEND_FUNCTION(vio_draw_instanced_from_buffer)
  *   bit48 present, bit40 is_frag, bits16..31 offset, bits0..15 size. The uniform
  * tables are populated once at shader reflection and never change, so the map is
  * safe to build once and reuse for the shader's lifetime. */
+/* Indirect draw (GAP-PHASE5 Block 8): the draw arguments come from a storage
+ * buffer (typically written by a compute pass), so GPU culling / LOD selection
+ * never round-trips through PHP. Layout per draw: indexed meshes 5 uint32
+ * {indexCount, instanceCount, firstIndex, baseVertex, firstInstance} (stride 20),
+ * unindexed 4 uint32 {vertexCount, instanceCount, firstVertex, firstInstance}
+ * (stride 16). max_draws consecutive records are issued; a record with
+ * instanceCount 0 draws nothing. Works with vio_bind_storage_buffer() for the
+ * per-instance data. */
+ZEND_FUNCTION(vio_draw_indirect)
+{
+    zval *ctx_zval, *mesh_zval, *buf_zval;
+    zend_long max_draws = 1, offset = 0;
+    ZEND_PARSE_PARAMETERS_START(3, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(mesh_zval, vio_mesh_ce)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_buffer_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(max_draws)
+        Z_PARAM_LONG(offset)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_mesh_object *mesh = Z_VIO_MESH_P(mesh_zval);
+    vio_buffer_object *buf = Z_VIO_BUFFER_P(buf_zval);
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_draw_indirect between vio_begin and vio_end");
+        return;
+    }
+    if (!ctx->backend->draw_indirect || !ctx->backend->supports_feature(VIO_FEATURE_INDIRECT_DRAW)) {
+        php_error_docref(NULL, E_NOTICE, "vio_draw_indirect: indirect draws not supported on this backend");
+        return;
+    }
+    if (buf->type != VIO_BUFFER_STORAGE || !buf->backend_buffer || max_draws <= 0 || offset < 0) {
+        return;
+    }
+    size_t stride = mesh->index_count > 0 ? 20 : 16;
+    if ((size_t)offset + (size_t)max_draws * stride > buf->size) {
+        php_error_docref(NULL, E_WARNING, "vio_draw_indirect: %ld draws at offset %ld exceed the argument buffer (%zu bytes)",
+                         (long)max_draws, (long)offset, buf->size);
+        return;
+    }
+    vio_flush_pending_textures(ctx);
+    vio_push_shader_cbuffers(ctx);   /* no-op on OpenGL (no cbuffer_backend) */
+    ctx->backend->draw_indirect(mesh, buf->backend_buffer, (int)max_draws, (size_t)offset);
+}
+
 static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
 {
     if (!sh->uniform_lookup) {
@@ -6934,6 +6982,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_GPU_TIMESTAMP", VIO_FEATURE_GPU_TIMESTAMP, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_FRAME_LATENCY", VIO_FEATURE_FRAME_LATENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_HDR_OUTPUT", VIO_FEATURE_HDR_OUTPUT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_INDIRECT_DRAW", VIO_FEATURE_INDIRECT_DRAW, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_RGB10A2", VIO_FORMAT_RGB10A2, CONST_CS | CONST_PERSISTENT);
 
     /* Actions */

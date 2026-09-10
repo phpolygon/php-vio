@@ -2926,6 +2926,52 @@ static void metal_bind_storage_buffer(void *backend_buffer, int binding, int acc
     metal_pending_storage_binding = binding;
 }
 
+/* Indirect draw (GAP-PHASE5 Block 8): Metal's indirect argument structs share the
+ * 5 / 4 uint32 layout, one draw per record. Per-instance storage binding as in
+ * metal_draw_instanced_from_storage. */
+static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
+    vio_metal_buffer *args = (vio_metal_buffer *)args_buffer;
+    if (!mesh || !args || !args->buffer || max_draws <= 0) return;
+    @autoreleasepool {
+        if (!metal_prepare_draw(mesh->stride)) return;
+        vio_metal_buffer *sb = metal_pending_storage;
+        if (sb && sb->buffer) {
+            vio_metal_stage_res *vs = &metal_current_pipeline->shader->vs;
+            int idx = -1;
+            for (int i = 0; i < vs->buffer_count; i++) {
+                if (vs->buffers[i].kind == 1 && vs->buffers[i].binding == metal_pending_storage_binding) { idx = vs->buffers[i].msl_index; break; }
+            }
+            if (idx < 0) {
+                for (int i = 0; i < vs->buffer_count; i++) { if (vs->buffers[i].kind == 1) { idx = vs->buffers[i].msl_index; break; } }
+            }
+            if (idx >= 0) {
+                [vio_mtl.current_encoder setVertexBuffer:(__bridge id<MTLBuffer>)sb->buffer offset:0 atIndex:(NSUInteger)idx];
+            }
+        }
+        metal_bind_mesh_vb(mesh->backend_vb);
+        vio_metal_buffer *ib = (vio_metal_buffer *)mesh->backend_ib;
+        id<MTLBuffer> argbuf = (__bridge id<MTLBuffer>)args->buffer;
+        if (mesh->index_count > 0 && ib && ib->buffer) {
+            for (int i = 0; i < max_draws; i++) {
+                [vio_mtl.current_encoder drawIndexedPrimitives:metal_current_pipeline->primitive
+                                                     indexType:(mesh->index_bytes == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32)
+                                                   indexBuffer:(__bridge id<MTLBuffer>)ib->buffer
+                                             indexBufferOffset:0
+                                                indirectBuffer:argbuf
+                                          indirectBufferOffset:(NSUInteger)(offset + (size_t)i * 20)];
+            }
+        } else {
+            for (int i = 0; i < max_draws; i++) {
+                [vio_mtl.current_encoder drawPrimitives:metal_current_pipeline->primitive
+                                         indirectBuffer:argbuf
+                                   indirectBufferOffset:(NSUInteger)(offset + (size_t)i * 16)];
+            }
+        }
+    }
+}
+
 static void metal_draw_instanced_from_storage(void *mesh_obj, int instance_count)
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
@@ -3838,6 +3884,8 @@ static int metal_supports_feature(vio_feature f)
         return 1;
     case VIO_FEATURE_GPU_TIMESTAMP: /* MTLCommandBuffer GPUStartTime / GPUEndTime */
         return 1;
+    case VIO_FEATURE_INDIRECT_DRAW: /* drawIndexedPrimitives:indirectBuffer: */
+        return 1;
     case VIO_FEATURE_STENCIL:       /* depth attachments are Depth32Float (no stencil plane) — macOS follow-up */
     case VIO_FEATURE_GEOMETRY:      /* Metal has no geometry stage */
     case VIO_FEATURE_TESSELLATION:  /* not wired (Metal tessellation is compute-driven) */
@@ -3938,6 +3986,7 @@ static const vio_backend metal_backend = {
      * instance_count instances and no per-instance vertex buffer. */
     .bind_storage_buffer         = metal_bind_storage_buffer,
     .draw_instanced_from_storage = metal_draw_instanced_from_storage,
+    .draw_indirect     = metal_draw_indirect,
     .destroy_font_atlas = metal_destroy_font_atlas,
     .upload_font_atlas  = metal_upload_font_atlas,
     .destroy_texture_obj = metal_destroy_texture_obj,

@@ -470,7 +470,8 @@ jobs:
             tests/core/116_shader_cache_all_backends.phpt `
             tests/core/117_frame_latency_all_backends.phpt `
             tests/core/118_hdr_output_d3d.phpt `
-            tests/core/119_shader_model_6_d3d12.phpt
+            tests/core/119_shader_model_6_d3d12.phpt `
+            tests/render3d/120_indirect_draw_all_backends.phpt
 
       - name: Package binary
         shell: pwsh

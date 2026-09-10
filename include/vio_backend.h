@@ -331,6 +331,14 @@ typedef struct _vio_backend {
     /* Fill vio_swapchain_info (buffer count, effective frame latency, HDR
      * output). NULL slot => zeros (GAP-PHASE5 Block 5). */
     void  (*swapchain_info)(vio_swapchain_info *out);
+
+    /* Indirect draw (GAP-PHASE5 Block 8): issue max_draws draws of mesh_obj whose
+     * arguments live in args_buffer_obj (backend storage-buffer handle) starting
+     * at byte offset. Indexed meshes read 5 uint32 per draw {indexCount,
+     * instanceCount, firstIndex, baseVertex, firstInstance} (stride 20), unindexed
+     * 4 uint32 {vertexCount, instanceCount, firstVertex, firstInstance} (16) — the
+     * VkDrawIndexedIndirectCommand / D3D12 / GL / Metal layout. NULL => unsupported. */
+    void  (*draw_indirect)(void *mesh_obj, void *args_buffer, int max_draws, size_t offset);
 } vio_backend;
 
 /*
