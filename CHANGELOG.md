@@ -1,3 +1,11 @@
+# [2.14.0](https://github.com/phpolygon/php-vio/compare/v2.13.0...v2.14.0) (2026-09-10)
+
+
+### Features
+
+* **core:** on-disk shader and pipeline cache (vio_create 'shader_cache') ([95ebaeb](https://github.com/phpolygon/php-vio/commit/95ebaeb7ae32ff26357f0e51dfd8234df5046ff6))
+* **d3d:** waitable swapchain with a frame-latency cap, vio_swapchain_info() ([8612608](https://github.com/phpolygon/php-vio/commit/86126089b6078732af59a97ad0af5d436bfeadb9))
+
 # [2.13.0](https://github.com/phpolygon/php-vio/compare/v2.12.0...v2.13.0) (2026-09-10)
 
 
