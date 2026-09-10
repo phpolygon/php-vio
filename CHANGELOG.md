@@ -1,3 +1,10 @@
+# [2.16.0](https://github.com/phpolygon/php-vio/compare/v2.15.0...v2.16.0) (2026-09-10)
+
+
+### Features
+
+* **d3d12:** Shader Model 6 via DXC (vio_create 'shader_model' => 6) ([487f73e](https://github.com/phpolygon/php-vio/commit/487f73e5367b52813da3a48e146498a0cf3ed0fc))
+
 # [2.15.0](https://github.com/phpolygon/php-vio/compare/v2.14.0...v2.15.0) (2026-09-10)
 
 
