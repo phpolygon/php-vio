@@ -1,3 +1,10 @@
+# [2.24.0](https://github.com/phpolygon/php-vio/compare/v2.23.0...v2.24.0) (2026-09-10)
+
+
+### Features
+
+* **vulkan:** HDR10 swapchain output (GAP-PHASE5 Block 10d) ([0383b2e](https://github.com/phpolygon/php-vio/commit/0383b2e389668e4148e53f58bc110d4b93ff3452))
+
 # [2.23.0](https://github.com/phpolygon/php-vio/compare/v2.22.0...v2.23.0) (2026-09-10)
 
 
