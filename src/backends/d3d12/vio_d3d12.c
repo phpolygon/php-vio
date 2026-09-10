@@ -29,6 +29,7 @@
 
 #include "vio_d3d12.h"
 #include "../vio_d3d_common.h"
+#include "../../vio_texfmt.h"
 #include "../../vio_shader_cache.h"
 #include "../../vio_render_target.h"
 
@@ -2299,8 +2300,146 @@ static int d3d12_format_supports_uav(DXGI_FORMAT fmt)
            (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) ? 1 : 0;
 }
 
+static DXGI_FORMAT d3d12_texfmt(int fmt)
+{
+    switch (fmt) {
+        case VIO_FORMAT_BC1: return DXGI_FORMAT_BC1_UNORM;
+        case VIO_FORMAT_BC3: return DXGI_FORMAT_BC3_UNORM;
+        case VIO_FORMAT_BC4: return DXGI_FORMAT_BC4_UNORM;
+        case VIO_FORMAT_BC5: return DXGI_FORMAT_BC5_UNORM;
+        case VIO_FORMAT_BC7: return DXGI_FORMAT_BC7_UNORM;
+        case VIO_FORMAT_R8:  return DXGI_FORMAT_R8_UNORM;
+        default:             return DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+static int d3d12_generate_mips(ID3D12Resource *res, int slices, int levels, int w, int h, int channels,
+                               D3D12_RESOURCE_STATES state);
+
+/* Texture arrays / block-compressed data / explicit mip chains (GAP-PHASE5
+ * Block 9). Subresource index = layer * mips + mip; the level-major payload is
+ * scattered accordingly and uploaded in chunks of <= 64 subresources (the
+ * resource stays COPY_DEST between chunks, the last one lands in
+ * PIXEL_SHADER_RESOURCE). A single uncompressed level with `mipmaps` gets the
+ * full chain through the compute downsample (CPU fallback inside). */
+static void *d3d12_create_texture_ex(vio_texture_desc *desc)
+{
+    int layers = desc->layers > 1 ? desc->layers : 1;
+    int levels = desc->mip_levels > 1 ? desc->mip_levels : 1;
+    int compressed = vio_texfmt_is_compressed(desc->format);
+    int gen = !compressed && desc->mipmaps && levels == 1;
+    int mips = gen ? vio_texfmt_full_mip_count(desc->width, desc->height) : levels;
+    if (!desc->data) return NULL;
+
+    vio_d3d12_texture *tex = calloc(1, sizeof(vio_d3d12_texture));
+    if (!tex) return NULL;
+    tex->width = desc->width;
+    tex->height = desc->height;
+    tex->channels = vio_texfmt_channels(desc->format);
+    tex->mip_levels = mips;
+    tex->layers = layers;
+    tex->compressed = compressed;
+    tex->sampler_index = vio_d3d12_sampler_combo(desc->filter, desc->wrap, desc->anisotropy);
+
+    D3D12_HEAP_PROPERTIES heap_props = {0};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC res_desc = {0};
+    res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    res_desc.Width = (UINT64)desc->width;
+    res_desc.Height = (UINT)desc->height;
+    res_desc.DepthOrArraySize = (UINT16)layers;
+    res_desc.MipLevels = (UINT16)mips;
+    res_desc.Format = d3d12_texfmt(desc->format);
+    res_desc.SampleDesc.Count = 1;
+    res_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (!compressed && mips > 1 && d3d12_format_supports_uav(res_desc.Format)) res_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props, D3D12_HEAP_FLAG_NONE,
+        &res_desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&tex->resource);
+    if (FAILED(hr)) {
+        free(tex);
+        return NULL;
+    }
+
+    /* Scatter the level-major payload into subresource order. */
+    int count = layers * levels;
+    const void **srcs = calloc((size_t)count, sizeof(*srcs));
+    UINT *pitches = calloc((size_t)count, sizeof(*pitches));
+    UINT *rows = calloc((size_t)count, sizeof(*rows));
+    UINT *slcs = calloc((size_t)count, sizeof(*slcs));
+    if (!srcs || !pitches || !rows || !slcs) {
+        free(srcs); free(pitches); free(rows); free(slcs);
+        ID3D12Resource_Release(tex->resource);
+        free(tex);
+        return NULL;
+    }
+    {
+        const uint8_t *p = (const uint8_t *)desc->data;
+        int lw = desc->width, lh = desc->height;
+        for (int l = 0; l < levels; l++) {
+            UINT pitch = (UINT)vio_texfmt_row_pitch(desc->format, lw);
+            UINT nrows = (UINT)vio_texfmt_rows(desc->format, lh);
+            size_t image = vio_texfmt_image_size(desc->format, lw, lh);
+            for (int a = 0; a < layers; a++) {
+                int i = a * levels + l;
+                srcs[i] = p; pitches[i] = pitch; rows[i] = nrows; slcs[i] = 1;
+                p += image;
+            }
+            lw = lw > 1 ? lw / 2 : 1;
+            lh = lh > 1 ? lh / 2 : 1;
+        }
+    }
+    int rc = 0;
+    if (gen) {
+        /* Only mip 0 of every layer is present: one upload per layer. */
+        for (int a = 0; a < layers && rc == 0; a++) {
+            rc = d3d12_upload_subresources(tex->resource, &res_desc, (UINT)(a * mips), 1, &srcs[a], &pitches[a], &rows[a], &slcs[a],
+                                           D3D12_RESOURCE_STATE_COPY_DEST,
+                                           a == layers - 1 ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_DEST,
+                                           0, 0, 0);
+        }
+    } else {
+        for (int first = 0; first < count && rc == 0; first += 64) {
+            int n = count - first < 64 ? count - first : 64;
+            rc = d3d12_upload_subresources(tex->resource, &res_desc, (UINT)first, (UINT)n, &srcs[first], &pitches[first], &rows[first], &slcs[first],
+                                           D3D12_RESOURCE_STATE_COPY_DEST,
+                                           first + n >= count ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_DEST,
+                                           0, 0, 0);
+        }
+    }
+    free(srcs); free(pitches); free(rows); free(slcs);
+    if (rc != 0) {
+        ID3D12Resource_Release(tex->resource);
+        free(tex);
+        return NULL;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    srv_desc.Format = res_desc.Format;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (layers > 1) {
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srv_desc.Texture2DArray.MipLevels = (UINT)mips;
+        srv_desc.Texture2DArray.ArraySize = (UINT)layers;
+    } else {
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = (UINT)mips;
+    }
+    d3d12_alloc_srv_descriptor(&tex->srv_cpu, &tex->srv_gpu);
+    ID3D12Device_CreateShaderResourceView(vio_d3d12.device, tex->resource, &srv_desc, tex->srv_cpu);
+
+    if (gen && mips > 1) {
+        d3d12_generate_mips(tex->resource, layers, mips, desc->width, desc->height, tex->channels,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    return tex;
+}
+
 static void *d3d12_create_texture(vio_texture_desc *desc)
 {
+    if (desc->layers > 1 || desc->mip_levels > 1 || vio_texfmt_is_compressed(desc->format)) {
+        return d3d12_create_texture_ex(desc);
+    }
     vio_d3d12_texture *tex = calloc(1, sizeof(vio_d3d12_texture));
     if (!tex) return NULL;
 
@@ -3573,8 +3712,8 @@ static int d3d12_generate_mipmaps(void *obj, int kind)
             vio_texture_object *t = (vio_texture_object *)obj;
             vio_d3d12_texture *dt = (vio_d3d12_texture *)t->backend_texture;
             if (!dt || !dt->resource) return -1;
-            if (dt->mip_levels <= 1 || dt->depth > 0) return 0;
-            return d3d12_generate_mips(dt->resource, 1, dt->mip_levels, dt->width, dt->height,
+            if (dt->mip_levels <= 1 || dt->depth > 0 || dt->compressed) return 0;
+            return d3d12_generate_mips(dt->resource, dt->layers > 1 ? dt->layers : 1, dt->mip_levels, dt->width, dt->height,
                                            dt->channels > 0 ? dt->channels : 4, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
         case 2: {
@@ -5156,6 +5295,8 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_FRAME_LATENCY:       return 1; /* FRAME_LATENCY_WAITABLE_OBJECT swapchain */
         case VIO_FEATURE_HDR_OUTPUT:          return 1; /* RGB10A2 + SetColorSpace1(ST 2084), PSO format variants */
         case VIO_FEATURE_INDIRECT_DRAW:       return 1; /* ExecuteIndirect with DrawIndexed / Draw signatures */
+        case VIO_FEATURE_TEXTURE_ARRAY:       return 1; /* DepthOrArraySize > 1 + TEXTURE2DARRAY SRV */
+        case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return 1; /* BC1-BC7 mandatory on every D3D12 device */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* compute downsample (GAP-PHASE5 11), CPU box filter fallback */
         case VIO_FEATURE_CUBEMAP:      return 1;

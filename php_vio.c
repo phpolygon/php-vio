@@ -30,6 +30,8 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_audio.h"
 #include "src/vio_render_target.h"
 #include "src/vio_shader_cache.h"
+#include "src/vio_texfmt.h"
+#include "src/vio_ktx2.h"
 #include "src/vio_cubemap.h"
 #include "src/vio_recorder.h"
 #include "src/vio_stream.h"
@@ -2974,6 +2976,127 @@ ZEND_FUNCTION(vio_bind_pipeline)
 #endif
 }
 
+/* GAP-PHASE5 Block 9: texture arrays, block-compressed data and pre-built mip
+ * chains take the descriptor path on every backend - OpenGL through
+ * upload_texture_ex (writes texture_id), the others through create_texture.
+ * The feature flags gate it honestly. tex is filled on success (returns 0). */
+static int vio_texture_create_extended(vio_context_object *ctx, vio_texture_object *tex, vio_texture_desc *desc)
+{
+    int compressed = vio_texfmt_is_compressed(desc->format);
+    if (desc->layers > 1 && !ctx->backend->supports_feature(VIO_FEATURE_TEXTURE_ARRAY)) {
+        php_error_docref(NULL, E_WARNING, "vio_texture: texture arrays are not supported on backend '%s' (VIO_FEATURE_TEXTURE_ARRAY)", ctx->backend->name);
+        return -1;
+    }
+    if (compressed && !ctx->backend->supports_feature(VIO_FEATURE_TEXTURE_COMPRESSION_BC)) {
+        php_error_docref(NULL, E_WARNING, "vio_texture: block-compressed textures are not supported on backend '%s' (VIO_FEATURE_TEXTURE_COMPRESSION_BC)", ctx->backend->name);
+        return -1;
+    }
+    tex->width      = desc->width;
+    tex->height     = desc->height;
+    tex->layers     = desc->layers > 1 ? desc->layers : 1;
+    tex->is_array   = desc->layers > 1;
+    tex->format     = desc->format;
+    tex->channels   = vio_texfmt_channels(desc->format);
+    tex->mip_levels = desc->mip_levels > 1 ? desc->mip_levels : 1;
+    desc->single_channel = desc->format == VIO_FORMAT_R8;
+    if (ctx->backend->upload_texture_ex) {
+        if (ctx->backend->upload_texture_ex(tex, desc) != 0) {
+            php_error_docref(NULL, E_WARNING, "vio_texture: backend upload failed (format %d, %d layer%s, %d level%s)",
+                             desc->format, tex->layers, tex->layers == 1 ? "" : "s", tex->mip_levels, tex->mip_levels == 1 ? "" : "s");
+            return -1;
+        }
+    } else if (ctx->backend->create_texture) {
+        tex->backend_texture = ctx->backend->create_texture(desc);
+        if (!tex->backend_texture) {
+            php_error_docref(NULL, E_WARNING, "vio_texture: backend texture creation failed (format %d, %d layer%s, %d level%s)",
+                             desc->format, tex->layers, tex->layers == 1 ? "" : "s", tex->mip_levels, tex->mip_levels == 1 ? "" : "s");
+            return -1;
+        }
+    } else {
+        php_error_docref(NULL, E_WARNING, "vio_texture: backend '%s' has no texture path", ctx->backend->name);
+        return -1;
+    }
+    tex->valid = 1;
+    return 0;
+}
+
+/* vio_texture_ktx2(ctx, bytes, options): a KTX2 container (R8 / RGBA8 / BC1 /
+ * BC3 / BC4 / BC5 / BC7, 2D or 2D array, no supercompression) becomes a
+ * texture with its stored mip chain. 'mip_offset' drops the N largest levels
+ * (texture-quality tiers), 'filter' / 'wrap' / 'anisotropy' as vio_texture,
+ * 'mipmaps' => true generates a chain for single-level uncompressed files. */
+ZEND_FUNCTION(vio_texture_ktx2)
+{
+    zval *ctx_zval;
+    zend_string *bytes;
+    HashTable *opts = NULL;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR(bytes)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT_OR_NULL(opts)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        RETURN_FALSE;
+    }
+    vio_ktx2_info info;
+    char err[160];
+    if (vio_ktx2_parse((const uint8_t *)ZSTR_VAL(bytes), ZSTR_LEN(bytes), &info, err, sizeof(err)) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_ktx2: %s", err);
+        RETURN_FALSE;
+    }
+    zend_long mip_offset = 0, filter = VIO_FILTER_LINEAR, wrap = VIO_WRAP_REPEAT, anisotropy = 1;
+    int want_mipmaps = 0;
+    zval *val;
+    if (opts) {
+        if ((val = zend_hash_str_find(opts, "mip_offset", sizeof("mip_offset") - 1)) != NULL) mip_offset = zval_get_long(val);
+        if ((val = zend_hash_str_find(opts, "filter", sizeof("filter") - 1)) != NULL) filter = zval_get_long(val);
+        if ((val = zend_hash_str_find(opts, "wrap", sizeof("wrap") - 1)) != NULL) wrap = zval_get_long(val);
+        if ((val = zend_hash_str_find(opts, "anisotropy", sizeof("anisotropy") - 1)) != NULL) {
+            zend_long a = zval_get_long(val);
+            anisotropy = a < 1 ? 1 : (a > 16 ? 16 : a);
+        }
+        if ((val = zend_hash_str_find(opts, "mipmaps", sizeof("mipmaps") - 1)) != NULL) want_mipmaps = zend_is_true(val);
+    }
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    int w = 0, h = 0, levels = 0;
+    if (vio_ktx2_repack(&info, (const uint8_t *)ZSTR_VAL(bytes), ZSTR_LEN(bytes), (int)mip_offset, &data, &data_len, &w, &h, &levels) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_ktx2: could not unpack the level data");
+        RETURN_FALSE;
+    }
+
+    zval tex_zval;
+    object_init_ex(&tex_zval, vio_texture_ce);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(&tex_zval);
+    tex->backend    = ctx->backend;
+    tex->filter     = (vio_filter)filter;
+    tex->wrap       = (vio_wrap)wrap;
+    tex->anisotropy = (int)anisotropy;
+
+    vio_texture_desc desc = {0};
+    desc.data       = data;
+    desc.data_size  = data_len;
+    desc.width      = w;
+    desc.height     = h;
+    desc.filter     = tex->filter;
+    desc.wrap       = tex->wrap;
+    desc.anisotropy = tex->anisotropy;
+    desc.format     = info.vio_format;
+    desc.layers     = info.layers;
+    desc.mip_levels = levels;
+    desc.mipmaps    = want_mipmaps && levels == 1 && !vio_texfmt_is_compressed(info.vio_format);
+    int rc = vio_texture_create_extended(ctx, tex, &desc);
+    free(data);
+    if (rc != 0) {
+        zval_ptr_dtor(&tex_zval);
+        RETURN_FALSE;
+    }
+    RETURN_COPY_VALUE(&tex_zval);
+}
+
 ZEND_FUNCTION(vio_texture)
 {
     zval *ctx_zval;
@@ -3012,6 +3135,27 @@ ZEND_FUNCTION(vio_texture)
         zend_long a = zval_get_long(val);
         tex->anisotropy = a < 1 ? 1 : (a > 16 ? 16 : (int)a);
     }
+
+    /* GAP-PHASE5 Block 9: 'format' (VIO_FORMAT_BC1/3/4/5/7 block-compressed
+     * data), 'layers' (2D texture array), 'mip_levels' (levels already present
+     * in 'data'). Any of them routes through the descriptor path below. */
+    int tex_format = VIO_FORMAT_RGBA8, layers = 1, mip_levels = 1;
+    if ((val = zend_hash_str_find(config_ht, "format", sizeof("format") - 1)) != NULL) tex_format = (int)zval_get_long(val);
+    if ((val = zend_hash_str_find(config_ht, "layers", sizeof("layers") - 1)) != NULL) layers = (int)zval_get_long(val);
+    if ((val = zend_hash_str_find(config_ht, "mip_levels", sizeof("mip_levels") - 1)) != NULL) mip_levels = (int)zval_get_long(val);
+    if (layers < 1) layers = 1;
+    if (mip_levels < 1) mip_levels = 1;
+    if (tex_format != VIO_FORMAT_RGBA8 && !vio_texfmt_is_compressed(tex_format)) {
+        php_error_docref(NULL, E_WARNING, "vio_texture: 'format' must be VIO_FORMAT_RGBA8 or one of VIO_FORMAT_BC1/BC3/BC4/BC5/BC7");
+        zval_ptr_dtor(&tex_zval);
+        RETURN_FALSE;
+    }
+    if (layers > 2048 || mip_levels > 16) {
+        php_error_docref(NULL, E_WARNING, "vio_texture: 'layers' (<= 2048) or 'mip_levels' (<= 16) out of range");
+        zval_ptr_dtor(&tex_zval);
+        RETURN_FALSE;
+    }
+    int extended = layers > 1 || mip_levels > 1 || vio_texfmt_is_compressed(tex_format);
 
     /* Load from file or raw data */
     zval *file_zval = zend_hash_str_find(config_ht, "file", sizeof("file") - 1);
@@ -3072,11 +3216,16 @@ ZEND_FUNCTION(vio_texture)
          * Without this the backend uploaded uninitialised memory past
          * the end of the PHP string (visible as garbage texture content
          * in production, an out-of-bounds read under valgrind/ASAN). */
-        size_t need = (size_t)w * (size_t)h * 4u;
+        size_t need = vio_texfmt_data_size(tex_format, w, h, layers, mip_levels);
+        if (mip_levels > vio_texfmt_full_mip_count(w, h)) {
+            php_error_docref(NULL, E_WARNING, "vio_texture: %d mip levels exceed the chain of a %dx%d texture", mip_levels, w, h);
+            zval_ptr_dtor(&tex_zval);
+            RETURN_FALSE;
+        }
         if (Z_STRLEN_P(data_zval) < need) {
             php_error_docref(NULL, E_WARNING,
-                "vio_texture: data is %zu bytes but %dx%d RGBA needs %zu",
-                Z_STRLEN_P(data_zval), w, h, need);
+                "vio_texture: data is %zu bytes but %dx%d (format %d, %d layer%s, %d level%s) needs %zu",
+                Z_STRLEN_P(data_zval), w, h, tex_format, layers, layers == 1 ? "" : "s", mip_levels, mip_levels == 1 ? "" : "s", need);
             zval_ptr_dtor(&tex_zval);
             RETURN_FALSE;
         }
@@ -3088,15 +3237,41 @@ ZEND_FUNCTION(vio_texture)
         RETURN_FALSE;
     }
 
+    if (extended && (from_stbi || zero_filled)) {
+        php_error_docref(NULL, E_WARNING, "vio_texture: 'format' / 'layers' / 'mip_levels' need raw 'data' (not 'file' or a zero-filled storage image)");
+        if (from_stbi) stbi_image_free(pixels); else efree(pixels);
+        zval_ptr_dtor(&tex_zval);
+        RETURN_FALSE;
+    }
+
     tex->width    = w;
     tex->height   = h;
     tex->channels = channels;
     tex->storage  = storage;
+    tex->layers   = 1;
+    tex->format   = VIO_FORMAT_RGBA8;
 
     zval *mipmap_zval = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1);
     int mipmaps = (mipmap_zval && zend_is_true(mipmap_zval)) ? 1 : 0;
 
-    if (ctx->backend->upload_texture_2d) {
+    if (extended) {
+        vio_texture_desc desc = {0};
+        desc.data       = pixels;
+        desc.data_size  = vio_texfmt_data_size(tex_format, w, h, layers, mip_levels);
+        desc.width      = w;
+        desc.height     = h;
+        desc.filter     = tex->filter;
+        desc.wrap       = tex->wrap;
+        desc.anisotropy = tex->anisotropy;
+        desc.mipmaps    = mipmaps && mip_levels == 1 && !vio_texfmt_is_compressed(tex_format);
+        desc.format     = tex_format;
+        desc.layers     = layers;
+        desc.mip_levels = mip_levels;
+        if (vio_texture_create_extended(ctx, tex, &desc) != 0) {
+            zval_ptr_dtor(&tex_zval);
+            RETURN_FALSE;
+        }
+    } else if (ctx->backend->upload_texture_2d) {
         /* OpenGL writes texture_id directly into tex_obj */
         ctx->backend->upload_texture_2d(tex, pixels, w, h, channels,
                                         (int)tex->filter, (int)tex->wrap, mipmaps);
@@ -3376,6 +3551,12 @@ static void vio_bind_texture_internal(vio_context_object *ctx, vio_texture_objec
  * that is bound at this moment). */
 static void vio_bind_texture_now(vio_context_object *ctx, vio_texture_object *tex, zend_long slot)
 {
+
+    if (tex->is_array && tex->texture_id && ctx->backend->bind_texture_array_id) {
+        /* OpenGL texture array: GL_TEXTURE_2D_ARRAY target (sampler2DArray). */
+        ctx->backend->bind_texture_array_id(tex->texture_id, (int)slot);
+        return;
+    }
 
     if (tex->is_3d && tex->texture_id && ctx->backend->bind_texture_3d_id) {
         /* OpenGL volume texture (Fieldtracing SDF): bind via the GL_TEXTURE_3D
@@ -6983,7 +7164,14 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_FRAME_LATENCY", VIO_FEATURE_FRAME_LATENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_HDR_OUTPUT", VIO_FEATURE_HDR_OUTPUT, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_INDIRECT_DRAW", VIO_FEATURE_INDIRECT_DRAW, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_ARRAY", VIO_FEATURE_TEXTURE_ARRAY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_COMPRESSION_BC", VIO_FEATURE_TEXTURE_COMPRESSION_BC, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_RGB10A2", VIO_FORMAT_RGB10A2, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_BC1", VIO_FORMAT_BC1, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_BC3", VIO_FORMAT_BC3, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_BC4", VIO_FORMAT_BC4, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_BC5", VIO_FORMAT_BC5, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_BC7", VIO_FORMAT_BC7, CONST_CS | CONST_PERSISTENT);
 
     /* Actions */
     REGISTER_LONG_CONSTANT("VIO_RELEASE", VIO_RELEASE, CONST_CS | CONST_PERSISTENT);
@@ -7616,6 +7804,9 @@ ZEND_FUNCTION(vio_texture_size)
     array_init(return_value);
     add_index_long(return_value, 0, tex->width);
     add_index_long(return_value, 1, tex->height);
+    /* GAP-PHASE5 Block 9: array size and upload format ([2] / [3]). */
+    add_index_long(return_value, 2, tex->layers > 1 ? tex->layers : 1);
+    add_index_long(return_value, 3, tex->format);
 }
 
 /* ── 3D: Render targets, cubemaps, instancing, viewport ──────────── */
@@ -8396,8 +8587,8 @@ ZEND_FUNCTION(vio_texture_update)
         php_error_docref(NULL, E_WARNING, "vio_texture_update: context or texture not valid");
         RETURN_FALSE;
     }
-    if (tex->borrowed || tex->is_3d) {
-        php_error_docref(NULL, E_WARNING, "vio_texture_update: render-target and 3D textures cannot be updated");
+    if (tex->borrowed || tex->is_3d || tex->is_array || vio_texfmt_is_compressed(tex->format)) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_update: render-target, 3D, array and block-compressed textures cannot be updated");
         RETURN_FALSE;
     }
     if (w <= 0) w = tex->width - x;

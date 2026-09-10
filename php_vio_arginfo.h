@@ -240,6 +240,12 @@ ZEND_END_ARG_INFO()
 
 #define arginfo_vio_texture_3d arginfo_vio_texture
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_texture_ktx2, 0, 2, VioTexture, MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, bytes, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 1, "null")
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bind_texture, 0, 2, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
@@ -832,6 +838,7 @@ ZEND_FUNCTION(vio_pipeline);
 ZEND_FUNCTION(vio_bind_pipeline);
 ZEND_FUNCTION(vio_texture);
 ZEND_FUNCTION(vio_texture_3d);
+ZEND_FUNCTION(vio_texture_ktx2);
 ZEND_FUNCTION(vio_bind_texture);
 ZEND_FUNCTION(vio_uniform_buffer);
 ZEND_FUNCTION(vio_update_buffer);
@@ -980,6 +987,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_bind_pipeline, arginfo_vio_bind_pipeline)
 	ZEND_FE(vio_texture, arginfo_vio_texture)
 	ZEND_FE(vio_texture_3d, arginfo_vio_texture_3d)
+	ZEND_FE(vio_texture_ktx2, arginfo_vio_texture_ktx2)
 	ZEND_FE(vio_bind_texture, arginfo_vio_bind_texture)
 	ZEND_FE(vio_uniform_buffer, arginfo_vio_uniform_buffer)
 	ZEND_FE(vio_update_buffer, arginfo_vio_update_buffer)

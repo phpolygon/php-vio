@@ -252,6 +252,12 @@ typedef enum _vio_feature {
      * offsets) read from a storage buffer a compute pass wrote — GPU culling /
      * LOD selection without a CPU round trip. */
     VIO_FEATURE_INDIRECT_DRAW      = 35,
+    /* vio_texture(['layers' => N]): 2D texture arrays (sampler2DArray). */
+    VIO_FEATURE_TEXTURE_ARRAY      = 36,
+    /* vio_texture(['format' => VIO_FORMAT_BC*]) / vio_texture_ktx2(): block-
+     * compressed texture data uploaded as-is (BC1 / BC3 / BC4 / BC5; BC7 on
+     * OpenGL additionally needs BPTC, GL 4.2). */
+    VIO_FEATURE_TEXTURE_COMPRESSION_BC = 37,
 } vio_feature;
 
 /* ── Input actions ────────────────────────────────────────────────── */
@@ -413,6 +419,14 @@ typedef enum {
     VIO_FORMAT_R32F       = 6,
     VIO_FORMAT_R8         = 7,
     VIO_FORMAT_RGB10A2    = 8,   /* HDR10 backbuffer (R10G10B10A2_UNORM); readback expands to RGBA8 */
+    /* Block-compressed texture data (vio_texture(['format' => …]), GAP-PHASE5
+     * Block 9): 4x4 blocks, BC1 / BC4 8 bytes, BC3 / BC5 / BC7 16 bytes. Texture
+     * only - never a render-target format. */
+    VIO_FORMAT_BC1        = 9,   /* RGB(A) 1-bit alpha,   DXT1 */
+    VIO_FORMAT_BC3        = 10,  /* RGBA,                 DXT5 */
+    VIO_FORMAT_BC4        = 11,  /* single channel (R)   */
+    VIO_FORMAT_BC5        = 12,  /* two channels (RG), normal maps */
+    VIO_FORMAT_BC7        = 13,  /* high-quality RGBA    */
 } vio_pixel_format;
 
 typedef struct _vio_texture_desc {
@@ -433,6 +447,14 @@ typedef struct _vio_texture_desc {
     int         anisotropy;     /* max anisotropic filtering, 0/1 = off (default),
                                    clamped to 16 and to the device limit. Only
                                    meaningful with filter = LINEAR. */
+    /* GAP-PHASE5 Block 9. format: VIO_FORMAT_RGBA8 (default; single_channel
+     * selects R8) or a VIO_FORMAT_BC* block format. layers > 1 => 2D texture
+     * array. mip_levels > 1 => `data` already holds that many levels, level-
+     * major with the layers consecutive inside a level, images tightly packed
+     * (rows of 4x4 blocks for BC) - the KTX2 layout; `mipmaps` is then moot. */
+    int         format;
+    int         layers;
+    int         mip_levels;
 } vio_texture_desc;
 
 typedef struct _vio_shader_desc {

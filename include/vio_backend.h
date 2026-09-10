@@ -161,6 +161,8 @@ typedef struct _vio_backend {
     /* OpenGL-side bind of a 3D texture by raw GL handle (GL_TEXTURE_3D target).
      * NULL on backends without a 3D-texture path. */
     void  (*bind_texture_3d_id)(unsigned int texture_id, int slot);
+    /* OpenGL: bind a GL_TEXTURE_2D_ARRAY name (vio_texture(['layers' => N])). */
+    void  (*bind_texture_array_id)(unsigned int texture_id, int slot);
 
     /* Create a 3D / volume texture as an opaque backend handle (D3D11 / D3D12 /
      * Vulkan / Metal). Mirrors create_texture(desc) but builds a 3D resource +
@@ -339,6 +341,11 @@ typedef struct _vio_backend {
      * 4 uint32 {vertexCount, instanceCount, firstVertex, firstInstance} (16) — the
      * VkDrawIndexedIndirectCommand / D3D12 / GL / Metal layout. NULL => unsupported. */
     void  (*draw_indirect)(void *mesh_obj, void *args_buffer, int max_draws, size_t offset);
+
+    /* OpenGL counterpart of create_texture for the descriptor fields upload_texture_2d
+     * cannot carry (GAP-PHASE5 Block 9: format / layers / mip_levels): writes the GL
+     * name into tex_obj->texture_id. Backends with create_texture leave this NULL. */
+    int   (*upload_texture_ex)(void *tex_obj, vio_texture_desc *desc);
 } vio_backend;
 
 /*
