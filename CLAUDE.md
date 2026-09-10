@@ -819,10 +819,13 @@ Aufrufer geändert hat:
   auf s8–s11. Wer `pending_srvs` schreibt, nimmt `vio_d3d12_bind_srv_slot()`; wer Heaps
   bindet, nimmt `vio_d3d12_bind_graphics_heaps()`.
 - **`vio_texture(['anisotropy' => 1..16])`** auf D3D11, D3D12, Vulkan (`samplerAnisotropy`
-  wird aktiviert, wenn vorhanden) und OpenGL (`GL_TEXTURE_MAX_ANISOTROPY`); Metal ignoriert
-  es noch. `mipmaps => true` wird auf D3D12 jetzt umgesetzt (CPU-Kette beim Upload).
+  wird aktiviert, wenn vorhanden), OpenGL (`GL_TEXTURE_MAX_ANISOTROPY`) und Metal
+  (`MTLSamplerDescriptor.maxAnisotropy`, GAP-PHASE5 Block 11). `mipmaps => true` wird auf
+  D3D12 umgesetzt (CPU-Kette beim Upload).
 - **Cube-Render-Targets + `vio_generate_mipmaps`** auf D3D11 (`GenerateMips`) und D3D12
-  (CPU-Box-Filter + Re-Upload — korrekt, nicht schnell). `vio_read_render_target($rt,
+  (Compute-Downsample pro Level – SRV Level n, UAV Level n+1, bilineares `SampleLevel` =
+  2×2-Box; Ressourcen mit Mip-Kette bekommen `ALLOW_UNORDERED_ACCESS`, wenn das Format
+  typed UAV-Stores kann, sonst bleibt der CPU-Box-Filter; GAP-PHASE5 Block 11). `vio_read_render_target($rt,
   $face)` auf D3D11. `vio_texture_update` auf D3D12.
 - **RT-MSAA** (`'samples' => N`) ist auf D3D11 (Resolve beim Unbind/Readback) und OpenGL
   (Multisample-Renderbuffer + Blit) implementiert; vorher ignorierten beide `samples`

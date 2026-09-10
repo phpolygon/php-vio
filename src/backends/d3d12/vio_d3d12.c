@@ -1206,6 +1206,9 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.compute_srv_heap) ID3D12DescriptorHeap_Release(vio_d3d12.compute_srv_heap);
     if (vio_d3d12.cmdsig_indexed) ID3D12CommandSignature_Release(vio_d3d12.cmdsig_indexed);
     if (vio_d3d12.cmdsig_plain)   ID3D12CommandSignature_Release(vio_d3d12.cmdsig_plain);
+    if (vio_d3d12.mipgen_pso)     ID3D12PipelineState_Release(vio_d3d12.mipgen_pso);
+    if (vio_d3d12.mipgen_rs)      ID3D12RootSignature_Release(vio_d3d12.mipgen_rs);
+    if (vio_d3d12.mipgen_heap)    ID3D12DescriptorHeap_Release(vio_d3d12.mipgen_heap);
     if (vio_d3d12.ts_readback)    ID3D12Resource_Release(vio_d3d12.ts_readback);
     if (vio_d3d12.ts_heap)        ID3D12QueryHeap_Release(vio_d3d12.ts_heap);
     if (vio_d3d12.fence)          ID3D12Fence_Release(vio_d3d12.fence);
@@ -2283,6 +2286,19 @@ static int d3d12_upload_mip_chain(ID3D12Resource *res, const D3D12_RESOURCE_DESC
 
 /* ── Resources: Textures ──────────────────────────────────────────── */
 
+/* Typed UAV load-free store support for a format: the precondition for creating
+ * a mipmapped resource with ALLOW_UNORDERED_ACCESS so vio_generate_mipmaps can
+ * downsample it on the GPU (GAP-PHASE5 Block 11). */
+static int d3d12_format_supports_uav(DXGI_FORMAT fmt)
+{
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {0};
+    fs.Format = fmt;
+    if (!vio_d3d12.device) return 0;
+    if (FAILED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)))) return 0;
+    return (fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
+           (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) ? 1 : 0;
+}
+
 static void *d3d12_create_texture(vio_texture_desc *desc)
 {
     vio_d3d12_texture *tex = calloc(1, sizeof(vio_d3d12_texture));
@@ -2307,6 +2323,9 @@ static void *d3d12_create_texture(vio_texture_desc *desc)
     res_desc.SampleDesc.Count = 1;
     res_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     if (desc->storage) res_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    /* Mip chains are regenerated on the GPU (compute downsample) when the
+     * format takes typed UAV stores; otherwise the CPU box filter stays. */
+    if (tex->mip_levels > 1 && d3d12_format_supports_uav(res_desc.Format)) res_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
     /* Textures without initial data (storage images) start directly in the
      * sampling state the rest of the backend assumes; data uploads transition
@@ -2458,6 +2477,7 @@ static int d3d12_upload_cubemap(void *cm_obj, int width, int height, const void 
     res_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     res_desc.SampleDesc.Count = 1;
     res_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (levels > 1 && d3d12_format_supports_uav(res_desc.Format)) res_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;   /* GPU mip generation */
 
     ID3D12Resource *res = NULL;
     HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props, D3D12_HEAP_FLAG_NONE,
@@ -3075,6 +3095,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
             rd.Format = dxfmt;
             rd.SampleDesc.Count = 1;
             rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if (mips > 1 && d3d12_format_supports_uav(dxfmt)) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;   /* GPU mip generation */
             D3D12_CLEAR_VALUE cv = {0};
             cv.Format = dxfmt;
             ID3D12Resource *cube = NULL;
@@ -3311,6 +3332,229 @@ static int d3d12_generate_mips_cpu(ID3D12Resource *res, int slices, int levels, 
     return 0;
 }
 
+/* ── GPU mip generation (GAP-PHASE5 Block 11) ─────────────────────────────
+ * One compute dispatch per level: the destination mip is a typed UAV, the
+ * source mip an SRV sampled bilinearly at the destination texel centre, which
+ * is exactly the 2x2 box filter of the CPU path. Texture2DArray views cover all
+ * slices at once (1 for textures, 6 for cubes). Resources created with the UAV
+ * flag (mipmapped textures / cubemaps / cube RTs whose format takes typed UAV
+ * stores) take this path; everything else keeps the CPU box filter. */
+static const char *d3d12_mipgen_hlsl =
+    "Texture2DArray<float4> src : register(t0);\n"
+    "RWTexture2DArray<float4> dst : register(u0);\n"
+    "SamplerState smp : register(s0);\n"
+    "cbuffer P : register(b0) { uint2 dstSize; uint slices; uint pad; };\n"
+    "[numthreads(8, 8, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID) {\n"
+    "    if (id.x >= dstSize.x || id.y >= dstSize.y || id.z >= slices) return;\n"
+    "    float2 uv = (float2(id.xy) + 0.5) / float2(dstSize);\n"
+    "    dst[id] = src.SampleLevel(smp, float3(uv, (float)id.z), 0.0);\n"
+    "}\n";
+
+static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, const char *profile, UINT flags, ID3DBlob **out);
+
+#define VIO_D3D12_MIPGEN_MAX_LEVELS 16
+
+static int d3d12_ensure_mipgen(void)
+{
+    if (vio_d3d12.mipgen_pso && vio_d3d12.mipgen_heap) return 0;
+    if (vio_d3d12.mipgen_failed || !vio_d3d12.device) return -1;
+    vio_d3d12.mipgen_failed = 1;   /* cleared on success: a failing setup is not retried per call */
+
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {0};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 1;
+    ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 1;
+    ranges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_ROOT_PARAMETER params[2] = {0};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;   /* b0: dstSize, slices */
+    params[0].Constants.Num32BitValues = 4;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;  /* t0 + u0 */
+    params[1].DescriptorTable.NumDescriptorRanges = 2;
+    params[1].DescriptorTable.pDescriptorRanges = ranges;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_STATIC_SAMPLER_DESC smp = {0};
+    smp.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    smp.MaxLOD = D3D12_FLOAT32_MAX;
+    smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rs = {0};
+    rs.NumParameters = 2;
+    rs.pParameters = params;
+    rs.NumStaticSamplers = 1;
+    rs.pStaticSamplers = &smp;
+
+    ID3DBlob *sig = NULL, *err = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) || !sig) {
+        if (err) ID3D10Blob_Release(err);
+        return -1;
+    }
+    HRESULT hr = ID3D12Device_CreateRootSignature(vio_d3d12.device, 0, ID3D10Blob_GetBufferPointer(sig),
+                                                  ID3D10Blob_GetBufferSize(sig), &IID_ID3D12RootSignature,
+                                                  (void **)&vio_d3d12.mipgen_rs);
+    ID3D10Blob_Release(sig);
+    if (FAILED(hr)) return -1;
+
+    ID3DBlob *cs = NULL;
+    if (FAILED(d3d12_compile_cached(d3d12_mipgen_hlsl, "mipgen", "cs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, &cs)) || !cs) return -1;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = vio_d3d12.mipgen_rs;
+    pd.CS.pShaderBytecode = ID3D10Blob_GetBufferPointer(cs);
+    pd.CS.BytecodeLength = ID3D10Blob_GetBufferSize(cs);
+    hr = ID3D12Device_CreateComputePipelineState(vio_d3d12.device, &pd, &IID_ID3D12PipelineState, (void **)&vio_d3d12.mipgen_pso);
+    ID3D10Blob_Release(cs);
+    if (FAILED(hr)) { vio_d3d12.mipgen_pso = NULL; return -1; }
+
+    if (d3d12_create_descriptor_heap(&vio_d3d12.mipgen_heap, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                     2 * VIO_D3D12_MIPGEN_MAX_LEVELS, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+        return -1;
+    }
+    vio_d3d12.mipgen_failed = 0;
+    return 0;
+}
+
+/* 0 = done, 1 = not applicable (caller falls back to the CPU filter), -1 = error.
+ * `state` is the resource's steady state (uniform across subresources, like the
+ * CPU path assumes) and is restored at the end. */
+static int d3d12_generate_mips_gpu(ID3D12Resource *res, int slices, int levels, int w, int h,
+                                   D3D12_RESOURCE_STATES state)
+{
+    D3D12_RESOURCE_DESC rd;
+    ID3D12Resource_GetDesc(res, &rd);
+    if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || levels < 2 ||
+        levels > VIO_D3D12_MIPGEN_MAX_LEVELS || slices < 1) {
+        return 1;
+    }
+    if (d3d12_ensure_mipgen() != 0) return 1;
+
+    /* Mid-frame: draws into the resource recorded so far must land first (the
+     * readback helper's flush-and-reopen pattern). */
+    if (vio_d3d12.in_frame && vio_d3d12.cmd_list) {
+        vio_d3d12.compute_async_pending = 1;
+        d3d12_compute_wait();
+    }
+
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    HRESULT hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                     &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr)) {
+        hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc,
+                                            vio_d3d12.mipgen_pso, &IID_ID3D12GraphicsCommandList, (void **)&list);
+    }
+    if (FAILED(hr)) {
+        if (alloc) ID3D12CommandAllocator_Release(alloc);
+        return -1;
+    }
+    D3D12_RESOURCE_BARRIER *b = calloc((size_t)slices * (size_t)levels, sizeof(*b));
+    if (!b) {
+        ID3D12GraphicsCommandList_Release(list);
+        ID3D12CommandAllocator_Release(alloc);
+        return -1;
+    }
+
+    /* SRV of level l and UAV of level l + 1, all slices, at heap slots 2l / 2l+1. */
+    UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &cpu);
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &gpu);
+    for (int l = 0; l < levels - 1; l++) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+        sd.Format = rd.Format;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2DArray.MostDetailedMip = (UINT)l;
+        sd.Texture2DArray.MipLevels = 1;
+        sd.Texture2DArray.ArraySize = (UINT)slices;
+        D3D12_CPU_DESCRIPTOR_HANDLE hs = { cpu.ptr + (SIZE_T)(2 * l) * inc };
+        ID3D12Device_CreateShaderResourceView(vio_d3d12.device, res, &sd, hs);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
+        ud.Format = rd.Format;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        ud.Texture2DArray.MipSlice = (UINT)(l + 1);
+        ud.Texture2DArray.ArraySize = (UINT)slices;
+        D3D12_CPU_DESCRIPTOR_HANDLE hu = { cpu.ptr + (SIZE_T)(2 * l + 1) * inc };
+        ID3D12Device_CreateUnorderedAccessView(vio_d3d12.device, res, NULL, &ud, hu);
+    }
+
+    /* Level 0 is read, every other level written — per (slice, mip) subresource. */
+    int n = 0;
+    for (int s = 0; s < slices; s++) {
+        for (int m = 0; m < levels; m++) {
+            b[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[n].Transition.pResource = res;
+            b[n].Transition.Subresource = (UINT)(s * levels + m);
+            b[n].Transition.StateBefore = state;
+            b[n].Transition.StateAfter = m == 0 ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                                : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            n++;
+        }
+    }
+    ID3D12GraphicsCommandList_ResourceBarrier(list, (UINT)n, b);
+
+    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.mipgen_heap };
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, vio_d3d12.mipgen_rs);
+    ID3D12GraphicsCommandList_SetPipelineState(list, vio_d3d12.mipgen_pso);
+    int lw = w, lh = h;
+    for (int l = 0; l < levels - 1; l++) {
+        lw = lw > 1 ? lw / 2 : 1;
+        lh = lh > 1 ? lh / 2 : 1;
+        UINT consts[4] = { (UINT)lw, (UINT)lh, (UINT)slices, 0 };
+        ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 4, consts, 0);
+        D3D12_GPU_DESCRIPTOR_HANDLE hg = { gpu.ptr + (UINT64)(2 * l) * inc };
+        ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, hg);
+        ID3D12GraphicsCommandList_Dispatch(list, (UINT)((lw + 7) / 8), (UINT)((lh + 7) / 8), (UINT)slices);
+        /* The level just written is the next level's source. */
+        n = 0;
+        for (int s = 0; s < slices; s++) {
+            b[n].Transition.Subresource = (UINT)(s * levels + l + 1);
+            b[n].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            b[n].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            n++;
+        }
+        ID3D12GraphicsCommandList_ResourceBarrier(list, (UINT)n, b);
+    }
+    /* Everything sits in NON_PIXEL_SHADER_RESOURCE now; back to the steady state. */
+    n = 0;
+    for (int s = 0; s < slices; s++) {
+        for (int m = 0; m < levels; m++) {
+            b[n].Transition.Subresource = (UINT)(s * levels + m);
+            b[n].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            b[n].Transition.StateAfter = state;
+            n++;
+        }
+    }
+    ID3D12GraphicsCommandList_ResourceBarrier(list, (UINT)n, b);
+    free(b);
+
+    ID3D12GraphicsCommandList_Close(list);
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    vio_d3d12_wait_for_gpu();
+    d3d12_drain_info_queue("generate_mipmaps");
+    ID3D12GraphicsCommandList_Release(list);
+    ID3D12CommandAllocator_Release(alloc);
+    return 0;
+}
+
+/* GPU downsample when the resource allows it, otherwise the CPU box filter. */
+static int d3d12_generate_mips(ID3D12Resource *res, int slices, int levels, int w, int h, int channels,
+                               D3D12_RESOURCE_STATES state)
+{
+    int rc = d3d12_generate_mips_gpu(res, slices, levels, w, h, state);
+    if (getenv("VIO_TRACE_MIPGEN")) {
+        fprintf(stderr, "[d3d12] generate_mipmaps: %s (%d slice%s, %d levels, %dx%d)\n",
+                rc == 0 ? "compute" : (rc < 0 ? "compute FAILED" : "CPU box filter"), slices, slices == 1 ? "" : "s", levels, w, h);
+    }
+    if (rc <= 0) return rc;
+    return d3d12_generate_mips_cpu(res, slices, levels, w, h, channels, state);
+}
+
 static int d3d12_generate_mipmaps(void *obj, int kind)
 {
     if (!obj || !vio_d3d12.initialized) return -1;
@@ -3322,7 +3566,7 @@ static int d3d12_generate_mipmaps(void *obj, int kind)
             if (vio_d3d12.current_bound_rt == rt && vio_d3d12.in_frame) d3d12_unbind_render_target(0, 0, 0);
             D3D12_RESOURCE_STATES st = rt->d3d12_color_is_srv ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
                                                               : D3D12_RESOURCE_STATE_RENDER_TARGET;
-            return d3d12_generate_mips_cpu((ID3D12Resource *)rt->d3d12_color_resource, 6, rt->mip_levels,
+            return d3d12_generate_mips((ID3D12Resource *)rt->d3d12_color_resource, 6, rt->mip_levels,
                                            rt->width, rt->height, vio_rt_format_bpp(rt->formats[0]), st);
         }
         case 1: {
@@ -3330,7 +3574,7 @@ static int d3d12_generate_mipmaps(void *obj, int kind)
             vio_d3d12_texture *dt = (vio_d3d12_texture *)t->backend_texture;
             if (!dt || !dt->resource) return -1;
             if (dt->mip_levels <= 1 || dt->depth > 0) return 0;
-            return d3d12_generate_mips_cpu(dt->resource, 1, dt->mip_levels, dt->width, dt->height,
+            return d3d12_generate_mips(dt->resource, 1, dt->mip_levels, dt->width, dt->height,
                                            dt->channels > 0 ? dt->channels : 4, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
         case 2: {
@@ -3339,7 +3583,7 @@ static int d3d12_generate_mipmaps(void *obj, int kind)
             if (!cm->mipmaps) return 0;
             D3D12_RESOURCE_DESC rd; ID3D12Resource_GetDesc((ID3D12Resource *)cm->d3d12_resource, &rd);
             D3D12_RESOURCE_STATES st = cm->borrowed ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            return d3d12_generate_mips_cpu((ID3D12Resource *)cm->d3d12_resource, 6, (int)rd.MipLevels,
+            return d3d12_generate_mips((ID3D12Resource *)cm->d3d12_resource, 6, (int)rd.MipLevels,
                                            (int)rd.Width, (int)rd.Height, 4, st);
         }
         default: return -1;
@@ -4913,7 +5157,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_HDR_OUTPUT:          return 1; /* RGB10A2 + SetColorSpace1(ST 2084), PSO format variants */
         case VIO_FEATURE_INDIRECT_DRAW:       return 1; /* ExecuteIndirect with DrawIndexed / Draw signatures */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
-        case VIO_FEATURE_MIPMAP_GEN:          return 1; /* CPU box filter + re-upload (GAP-PLAN 2.3) */
+        case VIO_FEATURE_MIPMAP_GEN:          return 1; /* compute downsample (GAP-PHASE5 11), CPU box filter fallback */
         case VIO_FEATURE_CUBEMAP:      return 1;
         case VIO_FEATURE_DEPTH_BIAS:   return 1; /* PSO rasterizer state */
         case VIO_FEATURE_SCISSOR:      return 1;

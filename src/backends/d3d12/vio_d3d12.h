@@ -264,6 +264,13 @@ typedef struct _vio_d3d12_state {
     /* Counts begin_frame() calls (never 0 inside a frame): buffers remember the
      * serial of the frame whose list holds them in UNORDERED_ACCESS. */
     UINT64                     frame_serial;
+    /* GPU mip generation (GAP-PHASE5 Block 11): one compute dispatch per level
+     * (bilinear SampleLevel at the destination texel centre == 2x2 box filter),
+     * SRV/UAV pair per level in a small dedicated shader-visible heap. */
+    ID3D12RootSignature       *mipgen_rs;
+    ID3D12PipelineState       *mipgen_pso;
+    ID3D12DescriptorHeap      *mipgen_heap;
+    int                        mipgen_failed;
 
     /* Debug-layer InfoQueue, resolved ONCE at init and owned for the device's
      * lifetime (released in shutdown). NULL whenever the debug layer is inactive,

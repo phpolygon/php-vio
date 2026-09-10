@@ -135,7 +135,7 @@ probe_fold("d3d11", $d3d_common + [
 probe_fold("d3d12", $d3d_common + [
     VIO_FEATURE_TEXTURE_SWIZZLE    => 1,   /* Shader4ComponentMapping */
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,   /* GAP-PLAN 2.2 */
-    VIO_FEATURE_MIPMAP_GEN         => 1,   /* CPU box filter + re-upload (GAP-PLAN 2.3) */
+    VIO_FEATURE_MIPMAP_GEN         => 1,   /* compute downsample, CPU box filter fallback (GAP-PHASE5 11) */
 ]);
 
 /* Vulkan is a 2D + compute + offscreen-RT backend: vulkan_create_pipeline is
