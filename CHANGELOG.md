@@ -1,3 +1,10 @@
+# [2.11.0](https://github.com/phpolygon/php-vio/compare/v2.10.2...v2.11.0) (2026-09-10)
+
+
+### Features
+
+* **pipeline:** blend mode and colour write mask per attachment (MRT) ([3d2910a](https://github.com/phpolygon/php-vio/commit/3d2910af0d11bb3d4c600a7ae3a493aea6f0fc7f))
+
 ## [2.10.2](https://github.com/phpolygon/php-vio/compare/v2.10.1...v2.10.2) (2026-09-10)
 
 
