@@ -2282,13 +2282,19 @@ typedef struct _vio_metal_texture {
     unsigned int registry_id;  /* slot in metal_textures[] so the 2D batch can bind it too; 0 = none */
     int          width, height, depth;
     int          filter, wrap, mipmaps;
+    int          anisotropy;   /* vio_texture(['anisotropy' => N]), 1 = off (GAP-PHASE5 Block 11) */
 } vio_metal_texture;
 
 #define VIO_METAL_WRAP_BORDER_WHITE 100  /* internal: clamp to opaque-white border (shadow maps) */
 
-static id<MTLSamplerState> metal_make_sampler(int filter, int wrap, int mipmaps, int compare)
+static id<MTLSamplerState> metal_make_sampler(int filter, int wrap, int mipmaps, int compare, int anisotropy)
 {
     MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+    /* vio_texture(['anisotropy' => 1..16]): like D3D / GL only with a linear
+     * filter and never on comparison samplers. */
+    if (anisotropy > 1 && filter != VIO_FILTER_NEAREST && !compare) {
+        sd.maxAnisotropy = (NSUInteger)(anisotropy > 16 ? 16 : anisotropy);
+    }
     MTLSamplerMinMagFilter f = (filter == VIO_FILTER_NEAREST) ? MTLSamplerMinMagFilterNearest
                                                               : MTLSamplerMinMagFilterLinear;
     sd.minFilter = f;
@@ -2316,7 +2322,14 @@ static id<MTLSamplerState> metal_make_sampler(int filter, int wrap, int mipmaps,
     return [vio_mtl.device newSamplerStateWithDescriptor:sd];
 }
 
+static vio_metal_texture *metal_wrap_texture_aniso(id<MTLTexture> tex, int filter, int wrap, int mipmaps, int register_2d, int anisotropy);
+
 static vio_metal_texture *metal_wrap_texture(id<MTLTexture> tex, int filter, int wrap, int mipmaps, int register_2d)
+{
+    return metal_wrap_texture_aniso(tex, filter, wrap, mipmaps, register_2d, 1);
+}
+
+static vio_metal_texture *metal_wrap_texture_aniso(id<MTLTexture> tex, int filter, int wrap, int mipmaps, int register_2d, int anisotropy)
 {
     vio_metal_texture *t = calloc(1, sizeof(vio_metal_texture));
     if (!t) return NULL;
@@ -2327,7 +2340,8 @@ static vio_metal_texture *metal_wrap_texture(id<MTLTexture> tex, int filter, int
     t->filter  = filter;
     t->wrap    = wrap;
     t->mipmaps = mipmaps;
-    id<MTLSamplerState> s = metal_make_sampler(filter, wrap, mipmaps, 0);
+    t->anisotropy = anisotropy;
+    id<MTLSamplerState> s = metal_make_sampler(filter, wrap, mipmaps, 0, anisotropy);
     t->sampler = s ? (void *)CFBridgingRetain(s) : NULL;
     if (register_2d) {
         t->registry_id = metal_register_texture(tex);
@@ -2338,7 +2352,7 @@ static vio_metal_texture *metal_wrap_texture(id<MTLTexture> tex, int filter, int
 static id<MTLSamplerState> metal_texture_cmp_sampler(vio_metal_texture *t)
 {
     if (!t->sampler_cmp) {
-        id<MTLSamplerState> s = metal_make_sampler(t->filter, t->wrap, 0, 1);
+        id<MTLSamplerState> s = metal_make_sampler(t->filter, t->wrap, 0, 1, 1);
         t->sampler_cmp = s ? (void *)CFBridgingRetain(s) : NULL;
     }
     return (__bridge id<MTLSamplerState>)t->sampler_cmp;
@@ -2377,7 +2391,7 @@ static void *metal_create_texture(vio_texture_desc *desc)
             [cb waitUntilCompleted];
         }
 
-        return metal_wrap_texture(tex, (int)desc->filter, (int)desc->wrap, desc->mipmaps, 1);
+        return metal_wrap_texture_aniso(tex, (int)desc->filter, (int)desc->wrap, desc->mipmaps, 1, desc->anisotropy);
     }
 }
 
@@ -2405,7 +2419,7 @@ static void *metal_create_texture_3d(vio_texture_desc *desc)
              bytesPerImage:(NSUInteger)desc->width * desc->height * 4];
 
         /* Volumes are never drawn by the 2D batch — skip the registry. */
-        return metal_wrap_texture(tex, (int)desc->filter, (int)desc->wrap, 0, 0);
+        return metal_wrap_texture_aniso(tex, (int)desc->filter, (int)desc->wrap, 0, 0, desc->anisotropy);
     }
 }
 
@@ -3069,7 +3083,7 @@ static int metal_upload_cubemap(void *cm_obj, int width, int height, const void 
             [cb commit];
             [cb waitUntilCompleted];
         }
-        id<MTLSamplerState> s = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, cm->mipmaps ? 1 : 0, 0);
+        id<MTLSamplerState> s = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, cm->mipmaps ? 1 : 0, 0, 1);
         cm->metal_texture = (void *)CFBridgingRetain(tex);
         cm->metal_sampler = s ? (void *)CFBridgingRetain(s) : NULL;
         cm->backend_type  = 4;  /* VIO_CM_BACKEND_METAL — see vio_cubemap.h */
@@ -3085,7 +3099,7 @@ static int metal_render_target_cubemap(void *rt_ptr, void *cm_obj)
     vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
     if (!rt || !cm || !rt->is_cube || !rt->metal_color_texture || !vio_mtl.device) return -1;
     @autoreleasepool {
-        id<MTLSamplerState> s = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, rt->mip_levels > 1 ? 1 : 0, 0);
+        id<MTLSamplerState> s = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, rt->mip_levels > 1 ? 1 : 0, 0, 1);
         cm->metal_texture = (void *)CFRetain((CFTypeRef)rt->metal_color_texture);
         cm->metal_sampler = s ? (void *)CFBridgingRetain(s) : NULL;
         cm->mipmaps       = rt->mip_levels > 1;
