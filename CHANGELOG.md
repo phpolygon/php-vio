@@ -1,3 +1,10 @@
+# [2.22.0](https://github.com/phpolygon/php-vio/compare/v2.21.0...v2.22.0) (2026-09-10)
+
+
+### Features
+
+* **vulkan:** MRT, MSAA and cube render targets, cubemaps, mipmaps (GAP-PHASE5 Block 10b) ([63adeda](https://github.com/phpolygon/php-vio/commit/63adeda76cc79d9672e916cf207bca42add60aae))
+
 # [2.21.0](https://github.com/phpolygon/php-vio/compare/v2.20.0...v2.21.0) (2026-09-10)
 
 
