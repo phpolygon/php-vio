@@ -103,7 +103,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 | `tests/render3d/121` | Texture-Arrays / BC / KTX2: zweischichtiges RGBA8-Array mit expliziter Mip-Kette (`sampler2DArray`, `textureLod`), ein handkodierter BC1-Block, KTX2-Container (BC1 und RGBA8 mit `mip_offset`), defekte Eingabe → `false`. |
 | `tests/render3d/120` | Indirect Draw: zwei Argument-Records (instanceCount 1 / 0) aus einem Storage-Buffer zeichnen genau einen Quad; unindiziertes Mesh mit 4-uint32-Records; ein Compute-Pass, der instanceCount schreibt, steuert den Draw ohne Readback. |
 | `tests/core/119` | `shader_model => 6` auf D3D12 (dxcompiler/dxil aus `dxc_dir`, dem Windows-SDK oder dem Suchpfad): `vio_swapchain_info` meldet 6, Grafik- und Compute-Shader laufen als DXIL; ohne DXC ehrlicher Fallback auf 5. |
-| `tests/core/118` | HDR10-Ausgabe erzwungen (`hdr_output => 2`): D3D11/D3D12 melden Format RGB10A2 + `hdr_output`, ein weisses 2D-Rechteck kommt PQ-kodiert hell zurueck (Readback expandiert 10 Bit), 3D-Draws laufen ueber die PSO-Format-Variante. |
+| `tests/core/118` | HDR10-Ausgabe erzwungen (`hdr_output => 2`): D3D11/D3D12/Vulkan melden Format RGB10A2 + `hdr_output`, ein weisses 2D-Rechteck kommt PQ-kodiert hell zurueck (Readback expandiert 10 Bit), 3D-Draws laufen ueber die PSO-Format-Variante. |
 | `tests/core/117` | `frame_latency => 1`: D3D11/D3D12 melden `waitable` + Latenz 1 in `vio_swapchain_info`, Frames laufen; Backends ohne Feature melden 0 und ignorieren die Option. |
 | `tests/core/116` | Shader-Cache: zweiter Kontext im selben Verzeichnis kompiliert denselben Shader aus dem Cache (`stores` > 0 beim ersten, `hits` > 0 beim zweiten Lauf); Vulkan schreibt seine Pipeline-Cache-Datei beim Destroy. |
 | `tests/core/115` | `vio_gpu_frame_time`: nach drei gerenderten Frames liefert jedes Backend mit dem Feature eine plausible GPU-Zeit (0 ≤ ms < 5000), ohne Feature −1. |
@@ -179,7 +179,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Texture-Arrays + BC + KTX2 (`vio_texture(['layers', 'format' => VIO_FORMAT_BC*, 'mip_levels'])`, `vio_texture_ktx2`, `VIO_FEATURE_TEXTURE_ARRAY` / `_TEXTURE_COMPRESSION_BC`) | ✅ (`GL_TEXTURE_2D_ARRAY`, S3TC/RGTC/BPTC) | ✅ | ✅ | ✅ (2D-Array-Views, `textureCompressionBC`, Block 10c) | ✅ (`MTLTextureType2DArray`, BC-Formate) |
 | Variable Rate Shading (`vio_set_shading_rate`, `VIO_SHADING_RATE_*`, `VIO_FEATURE_SHADING_RATE`) | ❌ | ❌ | ✅ (`RSSetShadingRate`, Tier 1+; 4X4 nur mit Additional Rates) | ✅ (`VK_KHR_fragment_shading_rate`, Pipeline-Rate als Dynamic State, Block 10c) | ❌ |
 | Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Fallback FXC 5.1) | — | — |
-| HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | — (Block 10) | — |
+| HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | ✅ (10-Bit-Surface-Format + `VK_EXT_swapchain_colorspace` HDR10 ST 2084, Block 10d) | — |
 | Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | — (3 Drawables) |
 | GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`) |
 | Stencil (`'stencil' => [...]`, `VIO_FEATURE_STENCIL`) | ✅ (DEPTH24_STENCIL8) | ✅ (D24S8) | ✅ (D24S8, `OMSetStencilRef`) | ✅ (D32S8 / D24S8) | ❌ (Depth32Float ohne Stencil-Plane, macOS-Folgearbeit) |
@@ -215,7 +215,10 @@ Frame parken auch hier bis zum Fence. Texture-Arrays, BC-Daten und gespeicherte 
 `vio_vk_create_texture_ex`, eine Kopie je Level deckt alle Layer ab. Variable Rate Shading nutzt
 `VK_KHR_fragment_shading_rate` als Dynamic State jeder 3D-Pipeline; die Einstiegspunkte kommen per
 `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr`, die Instanz läuft dafür mit API 1.1 (Block 10c).
-Offen: HDR10-Swapchain (`VIO_FEATURE_HDR_OUTPUT`).
+HDR10-Swapchain (Block 10d): `hdr_output => 1` nimmt ein 10-Bit-Surface-Format im Farbraum HDR10 ST 2084,
+`=> 2` erzwingt 10 Bit auch auf SDR-Desktops; Render-Pass und jede Swapchain-Neuanlage nutzen dieselbe
+Formatwahl, der 2D-Batch PQ-kodiert über einen gemeinsamen Push-Constant-Block (mat4 + vec4), und
+`vio_read_pixels` expandiert 10 Bit wie D3D.
 Metal, Geometry-/Tessellation-Shader gibt es in Metal nicht (`VIO_FEATURE_GEOMETRY == 0`).
 
 #### Metal-3D-Pipeline (`src/backends/metal/vio_metal.m`)
@@ -888,7 +891,9 @@ Aufrufer geändert hat:
 - **Vulkan-3D** (GAP-PHASE5 Block 10a–10c) hat den vollständigen Satz: 3D-Pipeline, Instancing,
   Depth-Bias, Stencil, Vertex-Storage, Indirect Draw, HDR-/Depth-only-/MSAA-/Cube-Targets, MRT,
   Cubemaps, Mipmaps, Texture-Arrays/BC/KTX2 und Variable Rate Shading (wenn das Device
-  `VK_KHR_fragment_shading_rate` hat). Es fehlt nur die HDR10-Swapchain (`VIO_FEATURE_HDR_OUTPUT = 0`).
+  `VK_KHR_fragment_shading_rate` hat) und die HDR10-Swapchain (Block 10d). Bekannt: Laufen D3D12-Debug-Layer
+  und Vulkan-Validation mit HDR10-Swapchains nacheinander im selben Prozess (Test 118 im Debug-Harness),
+  stirbt das Zerstören des zweiten Vulkan-HDR-Kontexts; ohne einen der beiden Layer läuft dieselbe Folge.
 - **D3D12 RT-MSAA** (GAP-PHASE5 Block 1): jede `vio_d3d12_pipeline` hält ihre PSO-Beschreibung und
   baut beim Binden lazily die Variante für die Sample-Zahl des gebundenen Targets (2/4/8);
   die RT-Farbe liegt in multisampled Ressourcen, die Resolve-Ziele (SRV/Readback) werden beim

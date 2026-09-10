@@ -111,7 +111,7 @@ static const char *vio_2d_vk_vs =
     "layout(location = 0) in vec2 aPosition;\n"
     "layout(location = 1) in vec2 aTexCoord;\n"
     "layout(location = 2) in vec4 aColor;\n"
-    "layout(push_constant) uniform PushConstants { mat4 uProjection; } pc;\n"
+    "layout(push_constant) uniform PushConstants { mat4 uProjection; vec4 uOutput; } pc;\n"
     "layout(location = 0) out vec2 vTexCoord;\n"
     "layout(location = 1) out vec4 vColor;\n"
     "void main() {\n"
@@ -121,13 +121,25 @@ static const char *vio_2d_vk_vs =
     "    vColor = aColor;\n"
     "}\n";
 
+/* uOutput.x = 1 when the swapchain is HDR10 (PQ-encode, GAP-PHASE5 Block 10d), uOutput.y = paper white in nits. */
+#define VIO_2D_VK_PQ \
+    "layout(push_constant) uniform PushConstants { mat4 uProjection; vec4 uOutput; } pc;\n" \
+    "vec3 vio_pq(vec3 srgb, float nits) {\n" \
+    "    vec3 lin = pow(max(srgb, 0.0), vec3(2.2));\n" \
+    "    vec3 bt2020 = vec3(dot(lin, vec3(0.6274, 0.3293, 0.0433)), dot(lin, vec3(0.0691, 0.9195, 0.0114)), dot(lin, vec3(0.0164, 0.0880, 0.8956)));\n" \
+    "    vec3 y = pow(max(bt2020 * (nits / 10000.0), 0.0), vec3(0.1593017578125));\n" \
+    "    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), vec3(78.84375));\n" \
+    "}\n" \
+    "vec4 vio_out(vec4 c) { if (pc.uOutput.x > 0.5) c.rgb = vio_pq(c.rgb, pc.uOutput.y > 0.0 ? pc.uOutput.y : 200.0); return c; }\n"
+
 static const char *vio_2d_vk_fs_shapes =
     "#version 450\n"
     "layout(location = 0) in vec2 vTexCoord;\n"
     "layout(location = 1) in vec4 vColor;\n"
     "layout(location = 0) out vec4 FragColor;\n"
+    VIO_2D_VK_PQ
     "void main() {\n"
-    "    FragColor = vColor;\n"
+    "    FragColor = vio_out(vColor);\n"
     "}\n";
 
 static const char *vio_2d_vk_fs_sprites =
@@ -136,8 +148,9 @@ static const char *vio_2d_vk_fs_sprites =
     "layout(location = 1) in vec4 vColor;\n"
     "layout(location = 0) out vec4 FragColor;\n"
     "layout(set = 0, binding = 0) uniform sampler2D uTexture;\n"
+    VIO_2D_VK_PQ
     "void main() {\n"
-    "    FragColor = texture(uTexture, vTexCoord) * vColor;\n"
+    "    FragColor = vio_out(texture(uTexture, vTexCoord) * vColor);\n"
     "}\n";
 
 /* ── Metal Shading Language (MSL) equivalents ────────────────────── */

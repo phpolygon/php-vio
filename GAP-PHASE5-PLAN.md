@@ -1,6 +1,10 @@
 # GAP-PHASE5-PLAN — Folgearbeit aus dem D3D-VULKAN-GAP-PLAN, mit Engine-Gegenstücken
 
-Status: in Arbeit (Start 2026-09-10, Ausgangspunkt php-vio v2.11.0, PHPolygon v0.42.0).
+Status: umgesetzt (2026-09-10, Ausgangspunkt php-vio v2.11.0, PHPolygon v0.42.0). Alle zwölf Blöcke
+sind in php-vio gemergt und per semantic-release veröffentlicht; Block 10 kam in vier PRs – 10a
+3D-Pipeline, 10b MRT/MSAA-/Cube-Targets/Cubemaps/Mipmaps, 10c Texture-Arrays/BC/KTX2 + Variable Rate
+Shading + `auto`-Rückfall, 10d HDR10-Swapchain. Die Engine-Gegenstücke liegen im PHPolygon-Branch
+`feat/gap-phase5-engine`.
 Ziel: die in `D3D-VULKAN-GAP-PLAN.md` Phase 5 gelisteten, nativ vorhandenen Fähigkeiten in
 vio verdrahten UND in der Engine (`VioRenderer3D`, `GraphicsSettings`, `EngineConfig`,
 `PerfProfiler`) einen echten Abnehmer geben. Jeder Block ist ein eigener Branch/PR gegen
