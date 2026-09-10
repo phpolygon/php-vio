@@ -1,3 +1,11 @@
+# [2.13.0](https://github.com/phpolygon/php-vio/compare/v2.12.0...v2.13.0) (2026-09-10)
+
+
+### Features
+
+* **core:** GPU frame time via timestamp queries on every backend ([93a8b89](https://github.com/phpolygon/php-vio/commit/93a8b89e09a0d7bad8f22102483ff9f3aa8599e4))
+* **mesh:** 16-bit index buffers when every index fits ([f1201fc](https://github.com/phpolygon/php-vio/commit/f1201fcba4b067ad054f7cabe88dd639ab1270cd))
+
 # [2.12.0](https://github.com/phpolygon/php-vio/compare/v2.11.0...v2.12.0) (2026-09-10)
 
 
