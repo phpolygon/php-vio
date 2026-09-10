@@ -1,3 +1,10 @@
+# [2.15.0](https://github.com/phpolygon/php-vio/compare/v2.14.0...v2.15.0) (2026-09-10)
+
+
+### Features
+
+* **d3d:** HDR10 swapchain output (RGB10A2 + ST 2084) with PQ-encoded 2D batch ([e068605](https://github.com/phpolygon/php-vio/commit/e06860531202b6ee724c8d398ca02447d9d1e9f0))
+
 # [2.14.0](https://github.com/phpolygon/php-vio/compare/v2.13.0...v2.14.0) (2026-09-10)
 
 
