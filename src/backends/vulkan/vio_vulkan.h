@@ -156,6 +156,11 @@ typedef struct _vio_vulkan_state {
     VkFence                  transient_fence;
     /* GPU timestamps (GAP-PHASE5 Block 3): two queries per frame in flight,
      * reset + written in the frame's command buffer, read after its fence. */
+    /* On-disk pipeline cache (GAP-PHASE5 Block 4): loaded at init from the
+     * shader-cache directory, written back at shutdown. VK_NULL_HANDLE when the
+     * cache is disabled (pipelines are then created without a cache). */
+    VkPipelineCache          pipeline_cache;
+    uint64_t                 pipeline_cache_key;
     VkQueryPool              ts_pool;
     float                    ts_period;     /* ns per tick (timestampPeriod) */
     int                      ts_pending[VIO_VK_MAX_FRAMES_IN_FLIGHT];

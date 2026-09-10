@@ -28,6 +28,7 @@
 
 #include "vio_d3d11.h"
 #include "../vio_d3d_common.h"
+#include "../../vio_shader_cache.h"
 #include "../../vio_texture.h"
 #include "../../vio_shader_reflect.h"
 #include <string.h>
@@ -261,6 +262,7 @@ static int d3d11_init(vio_config *cfg)
 
 static void d3d11_shutdown(void)
 {
+    if (vio_d3d11.frame_latency_waitable) { CloseHandle(vio_d3d11.frame_latency_waitable); vio_d3d11.frame_latency_waitable = NULL; }
     for (int i = 0; i < 3; i++) {
         if (vio_d3d11.ts_disjoint[i]) { ID3D11Query_Release(vio_d3d11.ts_disjoint[i]); vio_d3d11.ts_disjoint[i] = NULL; }
         if (vio_d3d11.ts_begin[i])    { ID3D11Query_Release(vio_d3d11.ts_begin[i]);    vio_d3d11.ts_begin[i] = NULL; }
@@ -348,6 +350,9 @@ static void *d3d11_create_surface(vio_config *cfg)
     vio_d3d11.swapchain_flags = vio_d3d11.tearing_supported
         ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
         : 0u;
+    if (cfg->frame_latency > 0) {
+        vio_d3d11.swapchain_flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
     sc_desc.Flags = vio_d3d11.swapchain_flags;
 
     HRESULT hr = IDXGIFactory2_CreateSwapChainForHwnd(
@@ -363,6 +368,17 @@ static void *d3d11_create_surface(vio_config *cfg)
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D11: Failed to create swapchain (0x%08lx)", hr);
         return NULL;
+    }
+    if (cfg->frame_latency > 0) {
+        /* Waitable swapchain (GAP-PHASE5 Block 5): IDXGISwapChain2 for the cap +
+         * waitable object; begin_frame waits on it. */
+        IDXGISwapChain2 *sc2 = NULL;
+        if (SUCCEEDED(IDXGISwapChain1_QueryInterface(vio_d3d11.swapchain, &IID_IDXGISwapChain2, (void **)&sc2)) && sc2) {
+            IDXGISwapChain2_SetMaximumFrameLatency(sc2, (UINT)cfg->frame_latency);
+            vio_d3d11.frame_latency_waitable = IDXGISwapChain2_GetFrameLatencyWaitableObject(sc2);
+            vio_d3d11.frame_latency = vio_d3d11.frame_latency_waitable ? cfg->frame_latency : 0;
+            IDXGISwapChain2_Release(sc2);
+        }
     }
 
     /* Disable ALT+Enter fullscreen toggle. This is also a hard requirement for
@@ -1643,6 +1659,41 @@ static int d3d11_upload_cubemap(void *cm_obj, int width, int height, const void 
 
 /* ── Shaders ──────────────────────────────────────────────────────── */
 
+/* D3DCompile with the on-disk DXBC cache (GAP-PHASE5 Block 4) — D3D12 twin. */
+static HRESULT d3d11_compile_cached(const char *src, const char *entry_tag, const char *profile,
+                                    UINT flags, ID3DBlob **out)
+{
+    uint64_t key = 0;
+    int use_cache = vio_shader_cache_dir() != NULL;
+    if (use_cache) {
+        key = vio_shader_cache_hash(profile, src, strlen(src));
+        key = vio_shader_cache_hash_more(key, &flags, sizeof(flags));
+        size_t len = 0;
+        void *data = vio_shader_cache_load(key, "dxbc", &len);
+        if (data) {
+            if (SUCCEEDED(D3DCreateBlob(len, out)) && *out) {
+                memcpy(ID3D10Blob_GetBufferPointer(*out), data, len);
+                free(data);
+                return S_OK;
+            }
+            free(data);
+        }
+    }
+    ID3DBlob *error_blob = NULL;
+    HRESULT hr = D3DCompile(src, strlen(src), entry_tag, NULL, NULL, "main", profile, flags, 0, out, &error_blob);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D11: %s compile failed: %s", profile,
+                          error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
+        if (error_blob) ID3D10Blob_Release(error_blob);
+        return hr;
+    }
+    if (error_blob) ID3D10Blob_Release(error_blob);
+    if (use_cache && *out) {
+        vio_shader_cache_store(key, "dxbc", ID3D10Blob_GetBufferPointer(*out), ID3D10Blob_GetBufferSize(*out));
+    }
+    return S_OK;
+}
+
 static void *d3d11_compile_shader(vio_shader_desc *desc)
 {
     vio_d3d11_shader *shader = calloc(1, sizeof(vio_d3d11_shader));
@@ -1737,25 +1788,11 @@ static void *d3d11_compile_shader(vio_shader_desc *desc)
         compile_flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
     }
 
-    ID3DBlob *error_blob = NULL;
+    hr = d3d11_compile_cached(hlsl_vs, "vs_main", "vs_5_0", compile_flags, &shader->vs_blob);
+    if (FAILED(hr)) goto fail;
 
-    hr = D3DCompile(hlsl_vs, strlen(hlsl_vs), "vs_main", NULL, NULL,
-                     "main", "vs_5_0", compile_flags, 0, &shader->vs_blob, &error_blob);
-    if (FAILED(hr)) {
-        php_error_docref(NULL, E_WARNING, "D3D11: VS compile failed: %s",
-                          error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
-        if (error_blob) ID3D10Blob_Release(error_blob);
-        goto fail;
-    }
-
-    hr = D3DCompile(hlsl_ps, strlen(hlsl_ps), "ps_main", NULL, NULL,
-                     "main", "ps_5_0", compile_flags, 0, &shader->ps_blob, &error_blob);
-    if (FAILED(hr)) {
-        php_error_docref(NULL, E_WARNING, "D3D11: PS compile failed: %s",
-                          error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
-        if (error_blob) ID3D10Blob_Release(error_blob);
-        goto fail;
-    }
+    hr = d3d11_compile_cached(hlsl_ps, "ps_main", "ps_5_0", compile_flags, &shader->ps_blob);
+    if (FAILED(hr)) goto fail;
 
     /* Create shader objects */
     hr = ID3D11Device_CreateVertexShader(vio_d3d11.device,
@@ -1801,6 +1838,10 @@ static void d3d11_destroy_shader(void *shader_ptr)
 
 static void d3d11_begin_frame(void)
 {
+    /* Waitable swapchain: block until a backbuffer is free (bounded wait). */
+    if (vio_d3d11.frame_latency_waitable) {
+        WaitForSingleObjectEx(vio_d3d11.frame_latency_waitable, 1000, TRUE);
+    }
     /* Reset to backbuffer */
     vio_d3d11.current_rtv = vio_d3d11.rtv;
     vio_d3d11.current_rtvs[0] = vio_d3d11.rtv;
@@ -2304,18 +2345,12 @@ static void *d3d11_create_compute_pipeline(vio_shader_desc *desc)
     if (!cp) { free(hlsl); return NULL; }
     cp->cbv_register = cbv_register;
 
-    ID3DBlob *error_blob = NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "cs_main", NULL, NULL,
-                            "main", "cs_5_0", compile_flags, 0, &cp->cs_blob, &error_blob);
+    HRESULT hr = d3d11_compile_cached(hlsl, "cs_main", "cs_5_0", compile_flags, &cp->cs_blob);
     free(hlsl);
     if (FAILED(hr)) {
-        php_error_docref(NULL, E_WARNING, "D3D11: CS compile failed: %s",
-                         error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
-        if (error_blob) ID3D10Blob_Release(error_blob);
         free(cp);
         return NULL;
     }
-    if (error_blob) ID3D10Blob_Release(error_blob);
 
     hr = ID3D11Device_CreateComputeShader(vio_d3d11.device,
             ID3D10Blob_GetBufferPointer(cp->cs_blob),
@@ -2627,6 +2662,16 @@ static size_t d3d11_read_buffer(void *backend_buffer, void *out, size_t size)
 
 /* ── Feature Query ────────────────────────────────────────────────── */
 
+static void d3d11_swapchain_info(vio_swapchain_info *out)
+{
+    if (!out) return;
+    out->buffer_count  = vio_d3d11.swapchain ? 2 : 0;
+    out->frame_latency = vio_d3d11.frame_latency;
+    out->waitable      = vio_d3d11.frame_latency_waitable != NULL;
+    out->hdr_output    = 0;
+    out->format        = 0;
+}
+
 static double d3d11_gpu_frame_time(void)
 {
     return vio_d3d11.initialized && vio_d3d11.ts_available ? vio_d3d11.last_gpu_ms : -1.0;
@@ -2652,6 +2697,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1; /* multisampled colour + ResolveSubresource on unbind (GAP-PLAN Phase 3) */
         case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + depth-stencil state (GAP-PHASE5 Block 1) */
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d11.ts_available; /* TIMESTAMP + DISJOINT query ring */
+        case VIO_FEATURE_FRAME_LATENCY:       return 1; /* FRAME_LATENCY_WAITABLE_OBJECT swapchain */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice TEXTURECUBE + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* ID3D11DeviceContext::GenerateMips */
         case VIO_FEATURE_CUBEMAP:      return 1;
@@ -2837,6 +2883,7 @@ static const vio_backend d3d11_backend = {
     .draw_instanced_from_storage  = d3d11_draw_instanced_from_storage,
     .supports_feature  = d3d11_supports_feature,
     .gpu_frame_time    = d3d11_gpu_frame_time,
+    .swapchain_info    = d3d11_swapchain_info,
     .destroy_cubemap   = d3d11_destroy_cubemap,
     .destroy_font_atlas = d3d11_destroy_font_atlas,
     .destroy_render_target = d3d11_destroy_render_target,

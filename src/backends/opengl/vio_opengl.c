@@ -16,6 +16,7 @@
 #ifdef HAVE_GLFW
 
 #include <glad/glad.h>
+#include "../../vio_shader_cache.h"
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
@@ -182,8 +183,70 @@ static unsigned int compile_shader_stage(const char *source, GLenum type)
     return shader;
 }
 
+/* Program-binary cache (GAP-PHASE5 Block 4, GL >= 4.1 glGetProgramBinary). The
+ * binary is driver-specific, so the key also hashes GL_VENDOR / GL_RENDERER /
+ * GL_VERSION; a stale or rejected binary just falls through to a normal link.
+ * File layout: 4 bytes binaryFormat + the blob. */
+static uint64_t opengl_program_cache_key(const char *vert_src, const char *frag_src)
+{
+    uint64_t key = vio_shader_cache_hash("gl-program", vert_src, strlen(vert_src));
+    key = vio_shader_cache_hash_more(key, "|", 1);
+    key = vio_shader_cache_hash_more(key, frag_src, strlen(frag_src));
+    const char *vendor = (const char *)glGetString(GL_VENDOR);
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+    const char *version = (const char *)glGetString(GL_VERSION);
+    if (vendor)   key = vio_shader_cache_hash_more(key, vendor, strlen(vendor));
+    if (renderer) key = vio_shader_cache_hash_more(key, renderer, strlen(renderer));
+    if (version)  key = vio_shader_cache_hash_more(key, version, strlen(version));
+    return key;
+}
+
+static unsigned int opengl_program_from_cache(uint64_t key)
+{
+    size_t len = 0;
+    unsigned char *data = vio_shader_cache_load(key, "glpb", &len);
+    if (!data) return 0;
+    unsigned int program = 0;
+    if (len > 4) {
+        GLenum format = 0;
+        memcpy(&format, data, 4);
+        program = glCreateProgram();
+        glProgramBinary(program, format, data + 4, (GLsizei)(len - 4));
+        int ok = 0;
+        glGetProgramiv(program, GL_LINK_STATUS, &ok);
+        if (!ok) { glDeleteProgram(program); program = 0; }
+    }
+    free(data);
+    return program;
+}
+
+static void opengl_program_to_cache(uint64_t key, unsigned int program)
+{
+    int len = 0;
+    glGetProgramiv(program, GL_PROGRAM_BINARY_LENGTH, &len);
+    if (len <= 0) return;
+    unsigned char *buf = malloc((size_t)len + 4);
+    if (!buf) return;
+    GLenum format = 0;
+    GLsizei written = 0;
+    glGetProgramBinary(program, len, &written, &format, buf + 4);
+    if (written > 0) {
+        memcpy(buf, &format, 4);
+        vio_shader_cache_store(key, "glpb", buf, (size_t)written + 4);
+    }
+    free(buf);
+}
+
 unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *frag_src)
 {
+    int use_cache = vio_shader_cache_dir() != NULL && GLAD_GL_VERSION_4_1;
+    uint64_t key = 0;
+    if (use_cache) {
+        key = opengl_program_cache_key(vert_src, frag_src);
+        unsigned int cached = opengl_program_from_cache(key);
+        if (cached) return cached;
+    }
+
     unsigned int vert = compile_shader_stage(vert_src, GL_VERTEX_SHADER);
     if (!vert) return 0;
 
@@ -196,6 +259,7 @@ unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *
     unsigned int program = glCreateProgram();
     glAttachShader(program, vert);
     glAttachShader(program, frag);
+    if (use_cache) glProgramParameteri(program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
     glLinkProgram(program);
 
     int success;
@@ -206,6 +270,8 @@ unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *
         php_error_docref(NULL, E_WARNING, "OpenGL shader link failed: %s", log);
         glDeleteProgram(program);
         program = 0;
+    } else if (use_cache) {
+        opengl_program_to_cache(key, program);
     }
 
     glDeleteShader(vert);

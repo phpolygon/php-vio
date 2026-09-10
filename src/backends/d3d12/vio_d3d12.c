@@ -29,6 +29,7 @@
 
 #include "vio_d3d12.h"
 #include "../vio_d3d_common.h"
+#include "../../vio_shader_cache.h"
 #include "../../vio_shader_reflect.h"   /* vio_spirv_reflect — data-driven compute register mapping */
 #include "../../vio_texture.h"          /* vio_texture_object — storage-image binds */
 #include <string.h>
@@ -1190,6 +1191,7 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.srv_staging_heap) ID3D12DescriptorHeap_Release(vio_d3d12.srv_staging_heap);
     if (vio_d3d12.sampler_combo_heap) ID3D12DescriptorHeap_Release(vio_d3d12.sampler_combo_heap);
     if (vio_d3d12.sampler_heap)   ID3D12DescriptorHeap_Release(vio_d3d12.sampler_heap);
+    if (vio_d3d12.frame_latency_waitable) CloseHandle(vio_d3d12.frame_latency_waitable);
     if (vio_d3d12.swapchain)      IDXGISwapChain3_Release(vio_d3d12.swapchain);
     if (vio_d3d12.cmd_queue)      ID3D12CommandQueue_Release(vio_d3d12.cmd_queue);
     if (vio_d3d12.factory)        IDXGIFactory4_Release(vio_d3d12.factory);
@@ -1233,6 +1235,11 @@ static void *d3d12_create_surface(vio_config *cfg)
     vio_d3d12.swapchain_flags = vio_d3d12.tearing_supported
         ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
         : 0u;
+    /* Waitable swapchain (GAP-PHASE5 Block 5): windowed FLIP swapchains may carry
+     * the frame-latency waitable object; begin_frame waits on it. */
+    if (cfg->frame_latency > 0) {
+        vio_d3d12.swapchain_flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
     sc_desc.Flags = vio_d3d12.swapchain_flags;
 
     IDXGISwapChain1 *swapchain1 = NULL;
@@ -1256,6 +1263,13 @@ static void *d3d12_create_surface(vio_config *cfg)
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12: SwapChain3 not supported (0x%08lx)", hr);
         return NULL;
+    }
+    if (cfg->frame_latency > 0) {
+        /* IDXGISwapChain3 derives from IDXGISwapChain2: set the cap and grab the
+         * waitable object once; ResizeBuffers keeps it valid. */
+        IDXGISwapChain3_SetMaximumFrameLatency(vio_d3d12.swapchain, (UINT)cfg->frame_latency);
+        vio_d3d12.frame_latency_waitable = IDXGISwapChain3_GetFrameLatencyWaitableObject(vio_d3d12.swapchain);
+        vio_d3d12.frame_latency = vio_d3d12.frame_latency_waitable ? cfg->frame_latency : 0;
     }
 
     /* Disable ALT+Enter */
@@ -3295,6 +3309,44 @@ static int d3d12_update_texture(void *tex_obj, const void *pixels, int x, int y,
 
 /* ── Shaders ──────────────────────────────────────────────────────── */
 
+/* D3DCompile with the on-disk DXBC cache (GAP-PHASE5 Block 4): the key hashes
+ * the HLSL, the profile and the compile flags, so a debug build never reuses a
+ * release blob and vice versa. Cached blobs are wrapped in an ID3DBlob so the
+ * PSO / shader-object code stays unchanged. */
+static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, const char *profile,
+                                    UINT flags, ID3DBlob **out)
+{
+    uint64_t key = 0;
+    int use_cache = vio_shader_cache_dir() != NULL;
+    if (use_cache) {
+        key = vio_shader_cache_hash(profile, src, strlen(src));
+        key = vio_shader_cache_hash_more(key, &flags, sizeof(flags));
+        size_t len = 0;
+        void *data = vio_shader_cache_load(key, "dxbc", &len);
+        if (data) {
+            if (SUCCEEDED(D3DCreateBlob(len, out)) && *out) {
+                memcpy(ID3D10Blob_GetBufferPointer(*out), data, len);
+                free(data);
+                return S_OK;
+            }
+            free(data);
+        }
+    }
+    ID3DBlob *error_blob = NULL;
+    HRESULT hr = D3DCompile(src, strlen(src), entry_tag, NULL, NULL, "main", profile, flags, 0, out, &error_blob);
+    if (FAILED(hr)) {
+        php_error_docref(NULL, E_WARNING, "D3D12: %s compile failed: %s", profile,
+                          error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
+        if (error_blob) ID3D10Blob_Release(error_blob);
+        return hr;
+    }
+    if (error_blob) ID3D10Blob_Release(error_blob);
+    if (use_cache && *out) {
+        vio_shader_cache_store(key, "dxbc", ID3D10Blob_GetBufferPointer(*out), ID3D10Blob_GetBufferSize(*out));
+    }
+    return S_OK;
+}
+
 static void *d3d12_compile_shader(vio_shader_desc *desc)
 {
     vio_d3d12_shader *shader = calloc(1, sizeof(vio_d3d12_shader));
@@ -3385,26 +3437,13 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
         compile_flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
     }
 
-    ID3DBlob *error_blob = NULL;
     HRESULT hr;
 
-    hr = D3DCompile(hlsl_vs, strlen(hlsl_vs), "vs_main", NULL, NULL,
-                     "main", "vs_5_1", compile_flags, 0, &shader->vs_blob, &error_blob);
-    if (FAILED(hr)) {
-        php_error_docref(NULL, E_WARNING, "D3D12: VS compile failed: %s",
-                          error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
-        if (error_blob) ID3D10Blob_Release(error_blob);
-        goto fail;
-    }
+    hr = d3d12_compile_cached(hlsl_vs, "vs_main", "vs_5_1", compile_flags, &shader->vs_blob);
+    if (FAILED(hr)) goto fail;
 
-    hr = D3DCompile(hlsl_ps, strlen(hlsl_ps), "ps_main", NULL, NULL,
-                     "main", "ps_5_1", compile_flags, 0, &shader->ps_blob, &error_blob);
-    if (FAILED(hr)) {
-        php_error_docref(NULL, E_WARNING, "D3D12: PS compile failed: %s",
-                          error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
-        if (error_blob) ID3D10Blob_Release(error_blob);
-        goto fail;
-    }
+    hr = d3d12_compile_cached(hlsl_ps, "ps_main", "ps_5_1", compile_flags, &shader->ps_blob);
+    if (FAILED(hr)) goto fail;
 
     if (allocated_vs) free(allocated_vs);
     if (allocated_ps) free(allocated_ps);
@@ -3456,6 +3495,13 @@ static void d3d12_begin_frame(void)
      * event log. Drain on every frame; the InfoQueue normally only fills up
      * on real errors, so the spam stays bounded in practice. */
     d3d12_drain_info_queue("begin_frame");
+
+    /* Waitable swapchain: block until DXGI has a backbuffer for us (caps the
+     * CPU at frame_latency frames ahead — the input-latency control). A bounded
+     * wait so a stalled compositor cannot hang the process. */
+    if (vio_d3d12.frame_latency_waitable) {
+        WaitForSingleObjectEx(vio_d3d12.frame_latency_waitable, 1000, TRUE);
+    }
 
     /* Wait for this frame's previous work to complete */
     d3d12_wait_for_frame(vio_d3d12.frame_index);
@@ -4269,19 +4315,13 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
         return NULL;
     }
 
-    ID3DBlob *error_blob = NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "cs_main", NULL, NULL,
-                            "main", "cs_5_1", compile_flags, 0, &cp->cs_blob, &error_blob);
+    HRESULT hr = d3d12_compile_cached(hlsl, "cs_main", "cs_5_1", compile_flags, &cp->cs_blob);
     free(hlsl);
     if (FAILED(hr)) {
-        php_error_docref(NULL, E_WARNING, "D3D12: CS compile failed: %s",
-                         error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
-        if (error_blob) ID3D10Blob_Release(error_blob);
         if (cp->root_signature) ID3D12RootSignature_Release(cp->root_signature);
         free(cp);
         return NULL;
     }
-    if (error_blob) ID3D10Blob_Release(error_blob);
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {0};
     pso_desc.pRootSignature = cp->root_signature;
@@ -4736,6 +4776,16 @@ static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
 
 /* ── Feature Query ────────────────────────────────────────────────── */
 
+static void d3d12_swapchain_info(vio_swapchain_info *out)
+{
+    if (!out) return;
+    out->buffer_count  = vio_d3d12.swapchain ? (int)vio_d3d12.frame_count : 0;
+    out->frame_latency = vio_d3d12.frame_latency;
+    out->waitable      = vio_d3d12.frame_latency_waitable != NULL;
+    out->hdr_output    = 0;
+    out->format        = 0;
+}
+
 static double d3d12_gpu_frame_time(void)
 {
     return vio_d3d12.initialized && vio_d3d12.ts_heap ? vio_d3d12.last_gpu_ms : -1.0;
@@ -4764,6 +4814,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1;
         case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + PSO depth-stencil state */
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d12.ts_heap != NULL; /* timestamp query heap + readback ring */
+        case VIO_FEATURE_FRAME_LATENCY:       return 1; /* FRAME_LATENCY_WAITABLE_OBJECT swapchain */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* CPU box filter + re-upload (GAP-PLAN 2.3) */
         case VIO_FEATURE_CUBEMAP:      return 1;
@@ -5147,6 +5198,7 @@ static const vio_backend d3d12_backend = {
     .draw_instanced_from_storage  = d3d12_draw_instanced_from_storage,
     .supports_feature  = d3d12_supports_feature,
     .gpu_frame_time    = d3d12_gpu_frame_time,
+    .swapchain_info    = d3d12_swapchain_info,
     .destroy_cubemap   = d3d12_destroy_cubemap,
     .upload_cubemap    = d3d12_upload_cubemap,
     .read_render_target = d3d12_read_render_target,

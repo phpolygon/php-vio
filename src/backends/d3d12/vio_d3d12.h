@@ -240,6 +240,10 @@ typedef struct _vio_d3d12_state {
      * ResizeBuffers MUST be given this same value. */
     int                        tearing_supported;  /* DXGI_FEATURE_PRESENT_ALLOW_TEARING */
     UINT                       swapchain_flags;    /* DXGI_SWAP_CHAIN_FLAG_* used at creation */
+    /* Waitable swapchain (GAP-PHASE5 Block 5): the frame-latency waitable object
+     * begin_frame blocks on, and the latency it was set to (0 = not waitable). */
+    HANDLE                     frame_latency_waitable;
+    int                        frame_latency;
 
     /* Debug-layer InfoQueue, resolved ONCE at init and owned for the device's
      * lifetime (released in shutdown). NULL whenever the debug layer is inactive,
