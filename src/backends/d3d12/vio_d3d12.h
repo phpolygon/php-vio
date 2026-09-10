@@ -193,6 +193,8 @@ typedef struct _vio_d3d12_texture {
     int sampler_index;
     int mip_levels;    /* 1, or the full chain for 'mipmaps' => true */
     int channels;      /* 1 (R8) or 4 (RGBA8) — for update_texture / mip gen */
+    int layers;        /* > 1 for texture arrays (GAP-PHASE5 Block 9) */
+    int compressed;    /* BC format: no update_texture, no mip generation */
 } vio_d3d12_texture;
 
 /* Per-frame resources */

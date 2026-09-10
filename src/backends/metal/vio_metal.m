@@ -23,6 +23,7 @@
 #include "vio_metal.h"
 #include "../../shaders/shaders_2d.h"
 #include "../../vio_render_target.h"
+#include "../../vio_texfmt.h"
 #include "../../vio_buffer.h"   /* vio_buffer_object — compute storage-buffer free path */
 
 /* SPIRV-Cross C API — used by the compute path to transpile the SDF compute
@@ -2358,9 +2359,86 @@ static id<MTLSamplerState> metal_texture_cmp_sampler(vio_metal_texture *t)
     return (__bridge id<MTLSamplerState>)t->sampler_cmp;
 }
 
+static MTLPixelFormat metal_texfmt(int fmt)
+{
+    switch (fmt) {
+        case VIO_FORMAT_BC1: return MTLPixelFormatBC1_RGBA;
+        case VIO_FORMAT_BC3: return MTLPixelFormatBC3_RGBA;
+        case VIO_FORMAT_BC4: return MTLPixelFormatBC4_RUnorm;
+        case VIO_FORMAT_BC5: return MTLPixelFormatBC5_RGUnorm;
+        case VIO_FORMAT_BC7: return MTLPixelFormatBC7_RGBAUnorm;
+        case VIO_FORMAT_R8:  return MTLPixelFormatR8Unorm;
+        default:             return MTLPixelFormatRGBA8Unorm;
+    }
+}
+
+/* BC formats exist on every Mac GPU; the macOS 11 query confirms it where available. */
+static int metal_supports_bc(void)
+{
+    if (!vio_mtl.device) return 0;
+    if ([vio_mtl.device respondsToSelector:@selector(supportsBCTextureCompression)]) {
+        return [vio_mtl.device supportsBCTextureCompression] ? 1 : 0;
+    }
+    return 1;
+}
+
+/* Texture arrays / block-compressed data / explicit mip chains (GAP-PHASE5
+ * Block 9): MTLTextureType2DArray for layers > 1, one replaceRegion per
+ * (level, layer) from the level-major payload; a single uncompressed level with
+ * `mipmaps` is completed by the blit encoder. Arrays stay out of the 2D sprite
+ * registry (the 2D batch samples texture2d only). */
+static void *metal_create_texture_ex(vio_texture_desc *desc)
+{
+    int layers = desc->layers > 1 ? desc->layers : 1;
+    int levels = desc->mip_levels > 1 ? desc->mip_levels : 1;
+    int compressed = vio_texfmt_is_compressed(desc->format);
+    int gen = !compressed && desc->mipmaps && levels == 1;
+    if (compressed && !metal_supports_bc()) return NULL;
+    @autoreleasepool {
+        MTLTextureDescriptor *td = [[MTLTextureDescriptor alloc] init];
+        td.textureType = layers > 1 ? MTLTextureType2DArray : MTLTextureType2D;
+        td.pixelFormat = metal_texfmt(desc->format);
+        td.width = (NSUInteger)desc->width;
+        td.height = (NSUInteger)desc->height;
+        td.arrayLength = (NSUInteger)layers;
+        td.mipmapLevelCount = (NSUInteger)(gen ? vio_texfmt_full_mip_count(desc->width, desc->height) : levels);
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = metal_cpu_texture_storage();
+        id<MTLTexture> tex = [vio_mtl.device newTextureWithDescriptor:td];
+        if (!tex) return NULL;
+
+        const uint8_t *p = (const uint8_t *)desc->data;
+        int lw = desc->width, lh = desc->height;
+        for (int l = 0; l < levels; l++) {
+            NSUInteger pitch = (NSUInteger)vio_texfmt_row_pitch(desc->format, lw);
+            size_t image = vio_texfmt_image_size(desc->format, lw, lh);
+            for (int a = 0; a < layers; a++) {
+                [tex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)lw, (NSUInteger)lh)
+                       mipmapLevel:(NSUInteger)l slice:(NSUInteger)a withBytes:p bytesPerRow:pitch bytesPerImage:0];
+                p += image;
+            }
+            lw = lw > 1 ? lw / 2 : 1;
+            lh = lh > 1 ? lh / 2 : 1;
+        }
+        if (gen && tex.mipmapLevelCount > 1) {
+            id<MTLCommandBuffer> cb = metal_new_command_buffer();
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit generateMipmapsForTexture:tex];
+            [blit endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+        return metal_wrap_texture_aniso(tex, (int)desc->filter, (int)desc->wrap, (levels > 1 || gen) ? 1 : 0,
+                                        layers > 1 ? 0 : 1, desc->anisotropy);
+    }
+}
+
 static void *metal_create_texture(vio_texture_desc *desc)
 {
     if (!desc || !desc->data || !vio_mtl.device || desc->width <= 0 || desc->height <= 0) return NULL;
+    if (desc->layers > 1 || desc->mip_levels > 1 || vio_texfmt_is_compressed(desc->format)) {
+        return metal_create_texture_ex(desc);
+    }
 
     @autoreleasepool {
         MTLPixelFormat fmt = desc->single_channel ? MTLPixelFormatR8Unorm : MTLPixelFormatRGBA8Unorm;
@@ -3900,6 +3978,10 @@ static int metal_supports_feature(vio_feature f)
         return 1;
     case VIO_FEATURE_INDIRECT_DRAW: /* drawIndexedPrimitives:indirectBuffer: */
         return 1;
+    case VIO_FEATURE_TEXTURE_ARRAY: /* MTLTextureType2DArray */
+        return 1;
+    case VIO_FEATURE_TEXTURE_COMPRESSION_BC: /* BC1-BC7 pixel formats (macOS) */
+        return metal_supports_bc();
     case VIO_FEATURE_STENCIL:       /* depth attachments are Depth32Float (no stencil plane) — macOS follow-up */
     case VIO_FEATURE_GEOMETRY:      /* Metal has no geometry stage */
     case VIO_FEATURE_TESSELLATION:  /* not wired (Metal tessellation is compute-driven) */

@@ -30,6 +30,7 @@
 #include "../vio_d3d_common.h"
 #include "../../vio_shader_cache.h"
 #include "../../vio_texture.h"
+#include "../../vio_texfmt.h"
 #include "../../vio_shader_reflect.h"
 #include <string.h>
 #include <stdlib.h>
@@ -807,13 +808,121 @@ static void d3d11_destroy_buffer(void *buffer_ptr)
 
 /* ── Resources: Textures ──────────────────────────────────────────── */
 
+static DXGI_FORMAT d3d11_texfmt(int fmt)
+{
+    switch (fmt) {
+        case VIO_FORMAT_BC1: return DXGI_FORMAT_BC1_UNORM;
+        case VIO_FORMAT_BC3: return DXGI_FORMAT_BC3_UNORM;
+        case VIO_FORMAT_BC4: return DXGI_FORMAT_BC4_UNORM;
+        case VIO_FORMAT_BC5: return DXGI_FORMAT_BC5_UNORM;
+        case VIO_FORMAT_BC7: return DXGI_FORMAT_BC7_UNORM;
+        case VIO_FORMAT_R8:  return DXGI_FORMAT_R8_UNORM;
+        default:             return DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+static void d3d11_texture_sampler(vio_d3d11_texture *tex, const vio_texture_desc *desc);
+
+/* Texture arrays / block-compressed data / explicit mip chains (GAP-PHASE5
+ * Block 9). Data is level-major with the layers consecutive inside a level;
+ * D3D11 wants one D3D11_SUBRESOURCE_DATA per (layer, mip) at index
+ * layer * mips + mip. A single uncompressed level with `mipmaps` is uploaded
+ * per layer and completed with GenerateMips. */
+static void *d3d11_create_texture_ex(vio_texture_desc *desc)
+{
+    int layers = desc->layers > 1 ? desc->layers : 1;
+    int levels = desc->mip_levels > 1 ? desc->mip_levels : 1;
+    int compressed = vio_texfmt_is_compressed(desc->format);
+    int gen = !compressed && desc->mipmaps && levels == 1;
+    vio_d3d11_texture *tex = calloc(1, sizeof(vio_d3d11_texture));
+    if (!tex) return NULL;
+    tex->width = desc->width;
+    tex->height = desc->height;
+    tex->layers = layers;
+
+    D3D11_TEXTURE2D_DESC td = {0};
+    td.Width = (UINT)desc->width;
+    td.Height = (UINT)desc->height;
+    td.MipLevels = gen ? 0 : (UINT)levels;
+    td.ArraySize = (UINT)layers;
+    td.Format = d3d11_texfmt(desc->format);
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (gen) {
+        td.BindFlags |= D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    }
+
+    D3D11_SUBRESOURCE_DATA *init = NULL;
+    if (!gen && desc->data) {
+        init = calloc((size_t)layers * (size_t)levels, sizeof(*init));
+        if (!init) { free(tex); return NULL; }
+        const uint8_t *p = (const uint8_t *)desc->data;
+        int lw = desc->width, lh = desc->height;
+        for (int l = 0; l < levels; l++) {
+            UINT pitch = (UINT)vio_texfmt_row_pitch(desc->format, lw);
+            size_t image = vio_texfmt_image_size(desc->format, lw, lh);
+            for (int a = 0; a < layers; a++) {
+                init[(size_t)a * levels + l].pSysMem = p;
+                init[(size_t)a * levels + l].SysMemPitch = pitch;
+                p += image;
+            }
+            lw = lw > 1 ? lw / 2 : 1;
+            lh = lh > 1 ? lh / 2 : 1;
+        }
+    }
+    HRESULT hr = ID3D11Device_CreateTexture2D(vio_d3d11.device, &td, init, &tex->texture);
+    free(init);
+    if (FAILED(hr)) {
+        free(tex);
+        return NULL;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    srv_desc.Format = td.Format;
+    if (layers > 1) {
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        srv_desc.Texture2DArray.MipLevels = gen ? (UINT)-1 : (UINT)levels;
+        srv_desc.Texture2DArray.ArraySize = (UINT)layers;
+    } else {
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = gen ? (UINT)-1 : (UINT)levels;
+    }
+    hr = ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)tex->texture, &srv_desc, &tex->srv);
+    if (FAILED(hr)) {
+        ID3D11Texture2D_Release(tex->texture);
+        free(tex);
+        return NULL;
+    }
+
+    if (gen && desc->data) {
+        int mips = vio_texfmt_full_mip_count(desc->width, desc->height);
+        const uint8_t *p = (const uint8_t *)desc->data;
+        size_t image = vio_texfmt_image_size(desc->format, desc->width, desc->height);
+        for (int a = 0; a < layers; a++) {
+            ID3D11DeviceContext_UpdateSubresource(vio_d3d11.context, (ID3D11Resource *)tex->texture,
+                                                  (UINT)(a * mips), NULL, p, (UINT)vio_texfmt_row_pitch(desc->format, desc->width), 0);
+            p += image;
+        }
+        ID3D11DeviceContext_GenerateMips(vio_d3d11.context, tex->srv);
+    }
+
+    d3d11_texture_sampler(tex, desc);
+    return tex;
+}
+
 static void *d3d11_create_texture(vio_texture_desc *desc)
 {
+    if (desc->layers > 1 || desc->mip_levels > 1 || vio_texfmt_is_compressed(desc->format)) {
+        return d3d11_create_texture_ex(desc);
+    }
     vio_d3d11_texture *tex = calloc(1, sizeof(vio_d3d11_texture));
     if (!tex) return NULL;
 
     tex->width = desc->width;
     tex->height = desc->height;
+    tex->layers = 1;
 
     D3D11_TEXTURE2D_DESC td = {0};
     td.Width = desc->width;
@@ -879,7 +988,13 @@ static void *d3d11_create_texture(vio_texture_desc *desc)
                                                &uav_desc, &tex->uav);
     }
 
-    /* Sampler */
+    d3d11_texture_sampler(tex, desc);
+    return tex;
+}
+
+/* Sampler state of a vio_texture: filter / wrap / anisotropy from the descriptor. */
+static void d3d11_texture_sampler(vio_d3d11_texture *tex, const vio_texture_desc *desc)
+{
     D3D11_SAMPLER_DESC sampler_desc = {0};
     sampler_desc.Filter = (desc->filter == VIO_FILTER_NEAREST)
         ? D3D11_FILTER_MIN_MAG_MIP_POINT
@@ -900,8 +1015,6 @@ static void *d3d11_create_texture(vio_texture_desc *desc)
     sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
 
     ID3D11Device_CreateSamplerState(vio_d3d11.device, &sampler_desc, &tex->sampler);
-
-    return tex;
 }
 
 /* Create a 3D / volume texture (Fieldtracing SDF). Mirrors d3d11_create_texture
@@ -2750,6 +2863,8 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_FRAME_LATENCY:       return 1; /* FRAME_LATENCY_WAITABLE_OBJECT swapchain */
         case VIO_FEATURE_HDR_OUTPUT:          return 1; /* RGB10A2 + SetColorSpace1(ST 2084) */
         case VIO_FEATURE_INDIRECT_DRAW:       return 1; /* Draw(Indexed)InstancedIndirect, args buffer with DRAWINDIRECT_ARGS */
+        case VIO_FEATURE_TEXTURE_ARRAY:       return 1; /* Texture2D ArraySize > 1 + TEXTURE2DARRAY SRV */
+        case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return 1; /* BC1-BC7 are mandatory from feature level 10 */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice TEXTURECUBE + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* ID3D11DeviceContext::GenerateMips */
         case VIO_FEATURE_CUBEMAP:      return 1;

@@ -109,6 +109,7 @@ typedef struct _vio_d3d11_texture {
     int height;
     int depth;                                /* > 0 for 3D / volume textures */
     int is_depth;                             /* 1 if this is a depth texture */
+    int layers;                               /* > 1 for texture arrays (GAP-PHASE5 Block 9) */
 } vio_d3d11_texture;
 
 /* Cached constant buffer for set_uniform (avoids per-call CreateBuffer) */

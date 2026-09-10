@@ -28,6 +28,10 @@ typedef struct _vio_texture_object {
     int          valid;
     int          borrowed;      /* 1 if texture_id is owned by another object (e.g. render target) */
     int          storage;       /* 1 => created with 'storage' => true (compute image2D/3D target) */
+    int          layers;        /* 1, or the array size for vio_texture(['layers' => N]) */
+    int          is_array;      /* 1 => GL_TEXTURE_2D_ARRAY target (OpenGL bind path) */
+    int          format;        /* VIO_FORMAT_RGBA8 / R8 / BC* the data was uploaded as */
+    int          mip_levels;    /* levels uploaded explicitly (1 = base only / driver-generated) */
     const struct _vio_backend *backend;
     unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
     zend_object  std;

@@ -73,6 +73,8 @@ probe("null", [
     VIO_FEATURE_FRAME_LATENCY      => 0,
     VIO_FEATURE_HDR_OUTPUT         => 0,
     VIO_FEATURE_INDIRECT_DRAW      => 0,
+    VIO_FEATURE_TEXTURE_ARRAY      => 0,
+    VIO_FEATURE_TEXTURE_COMPRESSION_BC => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -122,6 +124,8 @@ $d3d_common = [
     VIO_FEATURE_FRAME_LATENCY      => 1,   /* waitable swapchain (GAP-PHASE5 5) */
     VIO_FEATURE_HDR_OUTPUT         => 1,   /* HDR10 backbuffer (GAP-PHASE5 6) */
     VIO_FEATURE_INDIRECT_DRAW      => 1,   /* ExecuteIndirect / Draw*Indirect (GAP-PHASE5 8) */
+    VIO_FEATURE_TEXTURE_ARRAY      => 1,   /* Texture2D arrays (GAP-PHASE5 9) */
+    VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1, /* BC1-BC7 (GAP-PHASE5 9) */
     VIO_FEATURE_TESSELLATION       => 0,
     VIO_FEATURE_GEOMETRY           => 0,
     VIO_FEATURE_RAYTRACING         => 0,
@@ -146,6 +150,8 @@ probe_fold("vulkan", [
     VIO_FEATURE_STENCIL            => 0,
     VIO_FEATURE_GPU_TIMESTAMP      => 1,   /* vkCmdWriteTimestamp (GAP-PHASE5 3) */
     VIO_FEATURE_INDIRECT_DRAW      => 0,   /* with the 3D pipeline (GAP-PHASE5 10) */
+    VIO_FEATURE_TEXTURE_ARRAY      => 0,   /* with the 3D pipeline (GAP-PHASE5 10) */
+    VIO_FEATURE_TEXTURE_COMPRESSION_BC => 0,
     VIO_FEATURE_INSTANCED_DRAW     => 0,
     VIO_FEATURE_DEPTH_BIAS         => 0,
     VIO_FEATURE_TESSELLATION       => 0,

@@ -1247,6 +1247,8 @@ static int vulkan_submit_transient_commands(VkCommandPool pool, VkCommandBuffer 
  */
 static void *vulkan_create_texture(vio_texture_desc *desc)
 {
+    /* Arrays / block compression / explicit chains arrive with Block 10's 3D pipeline. */
+    if (desc && (desc->layers > 1 || desc->mip_levels > 1 || desc->format != 0)) return NULL;
     if (!vio_vk.initialized || !vio_vk.device || desc->width <= 0 || desc->height <= 0) {
         return NULL;
     }

@@ -525,7 +525,12 @@ function vio_bind_pipeline(VioContext $context, VioPipeline $pipeline): void {}
  * @param array $config ['file' => string] or ['data' => string, 'width' => int, 'height' => int], plus optional
  *                      'filter' (VIO_FILTER_*), 'wrap' (VIO_WRAP_*), 'mipmaps' (bool),
  *                      'anisotropy' (1..16, anisotropic filtering with a LINEAR filter; off by default),
- *                      'storage' (bool, compute image2D target)
+ *                      'storage' (bool, compute image2D target),
+ *                      'format' (VIO_FORMAT_RGBA8 default, or VIO_FORMAT_BC1/BC3/BC4/BC5/BC7 for block-compressed 'data';
+ *                        needs VIO_FEATURE_TEXTURE_COMPRESSION_BC),
+ *                      'layers' (int > 1: 2D texture array for sampler2DArray; needs VIO_FEATURE_TEXTURE_ARRAY),
+ *                      'mip_levels' (int: levels already contained in 'data', level-major with the layers
+ *                        consecutive inside a level, images tightly packed - the KTX2 layout)
  * @return VioTexture|false Texture object or false on failure
  */
 function vio_texture(VioContext $context, array $config): VioTexture|false {}
@@ -543,6 +548,19 @@ function vio_texture(VioContext $context, array $config): VioTexture|false {}
  * @return VioTexture|false Texture object or false on failure / unsupported backend
  */
 function vio_texture_3d(VioContext $context, array $config): VioTexture|false {}
+
+/**
+ * Create a texture from a KTX2 container held in memory (2D or 2D array; R8, RGBA8,
+ * BC1 / BC3 / BC4 / BC5 / BC7; no supercompression - sRGB variants load as UNORM).
+ * The stored mip chain is uploaded as-is.
+ *
+ * @param array|null $options 'mip_offset' (int, drop the N largest levels - texture-quality tiers),
+ *                            'filter' (default VIO_FILTER_LINEAR), 'wrap' (default VIO_WRAP_REPEAT),
+ *                            'anisotropy' (1..16), 'mipmaps' (bool: generate a chain for a
+ *                            single-level uncompressed file)
+ * @return VioTexture|false false (with a warning) for unsupported containers or formats
+ */
+function vio_texture_ktx2(VioContext $context, string $bytes, ?array $options = null): VioTexture|false {}
 
 /**
  * Bind a texture to a texture slot.

@@ -25,6 +25,7 @@
 #include "../../vio_window.h"
 #include "../../vio_mesh.h"
 #include "../../vio_render_target.h"
+#include "../../vio_texfmt.h"
 #include "../../vio_cubemap.h"
 #include "../../vio_font.h"
 #include "../../vio_pipeline.h"
@@ -1344,7 +1345,7 @@ static int opengl_generate_mipmaps(void *obj, int kind)
         case 1: {
             vio_texture_object *t = (vio_texture_object *)obj;
             if (!t->texture_id) return -1;
-            target = t->is_3d ? GL_TEXTURE_3D : GL_TEXTURE_2D;
+            target = t->is_3d ? GL_TEXTURE_3D : (t->is_array ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D);
             id = t->texture_id;
             break;
         }
@@ -1662,6 +1663,104 @@ static void opengl_draw_indirect(void *mesh_obj, void *args_buffer, int max_draw
 }
 
 static int gl_has_ext(const char *name);   /* defined with the caps setup below */
+
+/* ── Texture arrays / block compression / explicit mip chains (GAP-PHASE5 Block 9) ── */
+
+static GLenum opengl_texfmt_internal(int fmt)
+{
+    switch (fmt) {
+        case VIO_FORMAT_BC1: return GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
+        case VIO_FORMAT_BC3: return GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
+        case VIO_FORMAT_BC4: return GL_COMPRESSED_RED_RGTC1;
+        case VIO_FORMAT_BC5: return GL_COMPRESSED_RG_RGTC2;
+        case VIO_FORMAT_BC7: return GL_COMPRESSED_RGBA_BPTC_UNORM;
+        case VIO_FORMAT_R8:  return GL_R8;
+        default:             return GL_RGBA8;
+    }
+}
+
+/* S3TC (BC1/BC3) is an extension every desktop driver ships; RGTC (BC4/BC5) is
+ * core since 3.0; BPTC (BC7) is core since 4.2. */
+static int opengl_has_texfmt(int fmt)
+{
+    switch (fmt) {
+        case VIO_FORMAT_BC1: case VIO_FORMAT_BC3: return gl_has_ext("GL_EXT_texture_compression_s3tc");
+        case VIO_FORMAT_BC7: return gl_ge(4, 2) || gl_has_ext("GL_ARB_texture_compression_bptc");
+        default: return 1;
+    }
+}
+
+/* Level-major data, layers consecutive inside a level (see vio_texture_desc).
+ * GL_TEXTURE_2D_ARRAY for layers > 1, else GL_TEXTURE_2D; glCompressedTexImage
+ * for BC formats. An explicit chain sets MAX_LEVEL; a single uncompressed level
+ * with `mipmaps` is completed with glGenerateMipmap. */
+static int opengl_upload_texture_ex(void *tex_obj, vio_texture_desc *desc)
+{
+    vio_texture_object *tex = (vio_texture_object *)tex_obj;
+    if (!vio_gl.initialized || !desc || !desc->data) return -1;
+    int compressed = vio_texfmt_is_compressed(desc->format);
+    if (!opengl_has_texfmt(desc->format)) return -1;
+    int layers = desc->layers > 1 ? desc->layers : 1;
+    int levels = desc->mip_levels > 1 ? desc->mip_levels : 1;
+    GLenum target = layers > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    GLenum internal = opengl_texfmt_internal(desc->format);
+    GLenum ext_fmt = desc->format == VIO_FORMAT_R8 ? GL_RED : GL_RGBA;
+    int mip = levels > 1 || (desc->mipmaps && !compressed);
+
+    glGenTextures(1, &tex->texture_id);
+    tex->gl_generation = gl_context_generation;
+    glBindTexture(target, tex->texture_id);
+
+    GLint gl_wrap;
+    switch (desc->wrap) {
+        case VIO_WRAP_CLAMP:  gl_wrap = GL_CLAMP_TO_EDGE; break;
+        case VIO_WRAP_MIRROR: gl_wrap = GL_MIRRORED_REPEAT; break;
+        default:              gl_wrap = GL_REPEAT; break;
+    }
+    glTexParameteri(target, GL_TEXTURE_WRAP_S, gl_wrap);
+    glTexParameteri(target, GL_TEXTURE_WRAP_T, gl_wrap);
+    int nearest = desc->filter == VIO_FILTER_NEAREST;
+    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, nearest ? GL_NEAREST : GL_LINEAR);
+    glTexParameteri(target, GL_TEXTURE_MIN_FILTER,
+        nearest ? (mip ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST) : (mip ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR));
+    if (desc->anisotropy > 1 && !nearest &&
+        (gl_ge(4, 6) || gl_has_ext("GL_ARB_texture_filter_anisotropic") || gl_has_ext("GL_EXT_texture_filter_anisotropic"))) {
+        GLfloat max_aniso = 1.0f;
+        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &max_aniso);
+        GLfloat want = (GLfloat)(desc->anisotropy > 16 ? 16 : desc->anisotropy);
+        glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY, want < max_aniso ? want : max_aniso);
+    }
+
+    if (!compressed) glPixelStorei(GL_UNPACK_ALIGNMENT, 1);   /* tightly packed rows (R8, odd widths) */
+    const uint8_t *p = (const uint8_t *)desc->data;
+    int lw = desc->width, lh = desc->height;
+    for (int l = 0; l < levels; l++) {
+        size_t image = vio_texfmt_image_size(desc->format, lw, lh);
+        size_t total = image * (size_t)layers;
+        if (layers > 1) {
+            if (compressed) glCompressedTexImage3D(target, l, internal, lw, lh, layers, 0, (GLsizei)total, p);
+            else            glTexImage3D(target, l, internal, lw, lh, layers, 0, ext_fmt, GL_UNSIGNED_BYTE, p);
+        } else {
+            if (compressed) glCompressedTexImage2D(target, l, internal, lw, lh, 0, (GLsizei)image, p);
+            else            glTexImage2D(target, l, internal, lw, lh, 0, ext_fmt, GL_UNSIGNED_BYTE, p);
+        }
+        p += total;
+        lw = lw > 1 ? lw / 2 : 1;
+        lh = lh > 1 ? lh / 2 : 1;
+    }
+    if (!compressed) glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    if (levels > 1)  glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, levels - 1);
+    else if (mip)    glGenerateMipmap(target);
+    glBindTexture(target, 0);
+    return glGetError() == GL_NO_ERROR ? 0 : -1;
+}
+
+static void opengl_bind_texture_array_id(unsigned int texture_id, int slot)
+{
+    if (!vio_gl.initialized) return;
+    glActiveTexture(GL_TEXTURE0 + (GLenum)slot);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, texture_id);
+}
 
 static int opengl_upload_texture_2d(void *tex_obj,
                                     const void *pixels, int width, int height, int channels,
@@ -2021,6 +2120,9 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_STENCIL:        return 1;             /* DEPTH24_STENCIL8 attachments + glStencil* state */
         case VIO_FEATURE_GPU_TIMESTAMP:  return opengl_has_timer_query(); /* GL_TIMESTAMP queries, core 3.3 */
         case VIO_FEATURE_INDIRECT_DRAW:  return vio_gl.initialized && GLAD_GL_VERSION_4_0; /* glDraw*Indirect */
+        case VIO_FEATURE_TEXTURE_ARRAY:  return vio_gl.initialized;                        /* GL_TEXTURE_2D_ARRAY, core 3.0 */
+        case VIO_FEATURE_TEXTURE_COMPRESSION_BC:                                          /* S3TC ext (BC1/BC3) + core RGTC; BC7 needs BPTC / 4.2 */
+            return vio_gl.initialized && gl_has_ext("GL_EXT_texture_compression_s3tc");
         case VIO_FEATURE_CUBEMAP:        return 1;
         case VIO_FEATURE_DEPTH_BIAS:     return 1;
         case VIO_FEATURE_SCISSOR:        return 1;
@@ -2107,6 +2209,8 @@ static const vio_backend opengl_backend = {
     .upload_texture_2d     = opengl_upload_texture_2d,
     .upload_texture_3d     = opengl_upload_texture_3d,
     .bind_texture_3d_id    = opengl_bind_texture_3d_id,
+    .bind_texture_array_id = opengl_bind_texture_array_id,
+    .upload_texture_ex     = opengl_upload_texture_ex,
     .draw_mesh             = opengl_draw_mesh,
     .draw_mesh_instanced   = opengl_draw_mesh_instanced,
     .create_uniform_buffer = opengl_create_uniform_buffer,

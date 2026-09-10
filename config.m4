@@ -376,6 +376,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_texture.c \
     src/vio_render_target.c \
     src/vio_shader_cache.c \
+    src/vio_ktx2.c \
     src/vio_cubemap.c \
     src/vio_buffer.c \
     src/vio_2d.c \
