@@ -1,6 +1,10 @@
 /*
  * php-vio - Vulkan cubemaps and mip generation (GAP-PHASE5 Block 10b)
  *
+ * Texture arrays, BC data and stored mip chains (Block 10c) take
+ * vio_vk_create_texture_ex: the level-major payload of vio_texture / KTX2 goes
+ * into one staging buffer and one copy per level covers every layer.
+ *
  * vio_cubemap uploads six RGBA8 faces into a cube-compatible image (with a blit
  * mip chain for 'mipmaps' => true); vio_generate_mipmaps blits the chain of a
  * mipmapped texture, a cubemap or a cube render target - inside a frame on the
@@ -21,6 +25,7 @@
 #include "../../vio_texture.h"
 #include "../../vio_cubemap.h"
 #include "../../vio_render_target.h"
+#include "../../vio_texfmt.h"
 #include "../../../include/vio_types.h"
 #include <string.h>
 #include <stdlib.h>
@@ -116,7 +121,8 @@ int vio_vk_generate_mipmaps(void *obj, int kind)
             vio_vulkan_texture *t = (vio_vulkan_texture *)to->backend_texture;
             if (!t) return -1;
             if (t->mip_levels <= 1 || t->depth > 0) return 0;
-            return vkc_run_mips(t->image, t->width, t->height, 1, t->mip_levels);
+            if (vio_texfmt_is_compressed(t->vio_format)) return -1;   /* block data cannot be blitted */
+            return vkc_run_mips(t->image, t->width, t->height, t->layers > 1 ? t->layers : 1, t->mip_levels);
         }
         case 2: {
             vio_cubemap_object *cm = (vio_cubemap_object *)obj;
@@ -254,4 +260,154 @@ void vio_vk_bind_cubemap(void *cm_obj, int slot)
     if (cm && cm->vulkan_texture) vio_vk3d_bind_texture(cm->vulkan_texture, slot);
 }
 
+static VkFormat vkc_tex_format(int f)
+{
+    switch (f) {
+        case VIO_FORMAT_R8:  return VK_FORMAT_R8_UNORM;
+        case VIO_FORMAT_BC1: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case VIO_FORMAT_BC3: return VK_FORMAT_BC3_UNORM_BLOCK;
+        case VIO_FORMAT_BC4: return VK_FORMAT_BC4_UNORM_BLOCK;
+        case VIO_FORMAT_BC5: return VK_FORMAT_BC5_UNORM_BLOCK;
+        case VIO_FORMAT_BC7: return VK_FORMAT_BC7_UNORM_BLOCK;
+        case VIO_FORMAT_RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
+void *vio_vk_create_texture_ex(vio_texture_desc *desc)
+{
+    if (!desc || !vio_vk.device || desc->width <= 0 || desc->height <= 0 || desc->depth > 0) return NULL;
+    int f = desc->format;
+    VkFormat fmt = vkc_tex_format(f);
+    int compressed = vio_texfmt_is_compressed(f);
+    if (fmt == VK_FORMAT_UNDEFINED || (compressed && !vio_vk.bc_supported)) return NULL;
+    int w = desc->width, h = desc->height;
+    int layers = desc->layers > 1 ? desc->layers : 1;
+    int stored = desc->mip_levels > 1 ? desc->mip_levels : 1;
+    int generate = stored == 1 && desc->mipmaps && !compressed;
+    int levels = generate ? vio_texfmt_full_mip_count(w, h) : stored;
+    size_t need = vio_texfmt_data_size(f, w, h, layers, stored);
+    if (desc->data && desc->data_size && desc->data_size < need) return NULL;
+
+    vio_vulkan_texture *tex = (vio_vulkan_texture *)calloc(1, sizeof(vio_vulkan_texture));
+    if (!tex) return NULL;
+    VkImageCreateInfo ci = {0};
+    ci.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ci.imageType     = VK_IMAGE_TYPE_2D;
+    ci.format        = fmt;
+    ci.extent.width  = (uint32_t)w;
+    ci.extent.height = (uint32_t)h;
+    ci.extent.depth  = 1;
+    ci.mipLevels     = (uint32_t)levels;
+    ci.arrayLayers   = (uint32_t)layers;
+    ci.samples       = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (generate ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+    ci.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vio_vma_create_image(vio_vk.vma_allocator, &ci, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &tex->image, &tex->allocation) != 0) {
+        free(tex);
+        return NULL;
+    }
+
+    int ok = 1;
+    VkBuffer staging = VK_NULL_HANDLE;
+    void *staging_alloc = NULL;
+    if (desc->data && need > 0) {
+        ok = vio_vma_create_buffer(vio_vk.vma_allocator, (VkDeviceSize)need, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                   &staging, &staging_alloc) == 0;
+        void *m = ok ? vio_vma_map(vio_vk.vma_allocator, staging_alloc) : NULL;
+        if (m) {
+            memcpy(m, desc->data, need);
+            vio_vma_unmap(vio_vk.vma_allocator, staging_alloc);
+        } else {
+            ok = 0;
+        }
+    }
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (ok) ok = vio_vk_begin_transient(&cmd) == 0;
+    if (ok) {
+        if (staging) {
+            vio_vk_image_barrier_range(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)levels, 0, (uint32_t)layers,
+                                       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkBufferImageCopy copies[16];
+            VkDeviceSize off = 0;
+            int lw = w, lh = h, n = stored > 16 ? 16 : stored;
+            for (int l = 0; l < n; l++) {
+                memset(&copies[l], 0, sizeof(copies[l]));
+                copies[l].bufferOffset = off;
+                copies[l].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                copies[l].imageSubresource.mipLevel   = (uint32_t)l;
+                copies[l].imageSubresource.layerCount = (uint32_t)layers;
+                copies[l].imageExtent.width  = (uint32_t)lw;
+                copies[l].imageExtent.height = (uint32_t)lh;
+                copies[l].imageExtent.depth  = 1;
+                off += (VkDeviceSize)vio_texfmt_image_size(f, lw, lh) * (VkDeviceSize)layers;
+                lw = lw > 1 ? lw / 2 : 1;
+                lh = lh > 1 ? lh / 2 : 1;
+            }
+            vkCmdCopyBufferToImage(cmd, staging, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (uint32_t)n, copies);
+            vio_vk_image_barrier_range(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)levels, 0, (uint32_t)layers,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        } else {
+            vio_vk_image_barrier_range(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)levels, 0, (uint32_t)layers,
+                                       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+        if (generate && levels > 1) vio_vk_record_mips(cmd, tex->image, w, h, layers, levels);
+        ok = vio_vk_submit_transient(cmd) == 0;
+    }
+    if (staging) vio_vma_destroy_buffer(vio_vk.vma_allocator, staging, staging_alloc);
+
+    if (ok) {
+        VkImageViewCreateInfo iv = {0};
+        iv.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        iv.image    = tex->image;
+        iv.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+        iv.format   = fmt;
+        iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        iv.subresourceRange.levelCount = (uint32_t)levels;
+        iv.subresourceRange.layerCount = (uint32_t)layers;
+        ok = vkCreateImageView(vio_vk.device, &iv, NULL, &tex->view) == VK_SUCCESS;
+        tex->view_type = (int)iv.viewType;
+    }
+    if (ok) {
+        VkFilter filt = desc->filter == VIO_FILTER_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+        VkSamplerAddressMode wrap = desc->wrap == VIO_WRAP_CLAMP ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                                  : desc->wrap == VIO_WRAP_MIRROR ? VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT
+                                  : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        VkSamplerCreateInfo sci = {0};
+        sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sci.magFilter    = sci.minFilter = filt;
+        sci.mipmapMode   = (levels > 1 && filt == VK_FILTER_LINEAR) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = wrap;
+        sci.maxLod       = (float)(levels - 1);
+        if (desc->anisotropy > 1 && filt == VK_FILTER_LINEAR && vio_vk.anisotropy_supported) {
+            float want = (float)(desc->anisotropy > 16 ? 16 : desc->anisotropy);
+            sci.anisotropyEnable = VK_TRUE;
+            sci.maxAnisotropy    = want < vio_vk.max_anisotropy ? want : vio_vk.max_anisotropy;
+        }
+        ok = vkCreateSampler(vio_vk.device, &sci, NULL, &tex->sampler) == VK_SUCCESS;
+    }
+    if (!ok) {
+        if (tex->view) vkDestroyImageView(vio_vk.device, tex->view, NULL);
+        vio_vma_destroy_image(vio_vk.vma_allocator, tex->image, tex->allocation);
+        free(tex);
+        return NULL;
+    }
+    tex->width      = w;
+    tex->height     = h;
+    tex->mip_levels = levels;
+    tex->layers     = layers;
+    tex->vio_format = f;
+    tex->filter     = (int)desc->filter;
+    tex->wrap       = (int)desc->wrap;
+    tex->prev = NULL;
+    tex->next = vio_vk.live_textures;
+    if (vio_vk.live_textures) vio_vk.live_textures->prev = tex;
+    vio_vk.live_textures = tex;
+    return tex;
+}
+
 #endif /* HAVE_VULKAN */
+

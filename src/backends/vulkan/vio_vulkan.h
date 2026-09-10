@@ -39,6 +39,8 @@ typedef struct _vio_vulkan_texture {
     int           is_depth;     /* depth-format view (depth render target) */
     int           filter, wrap;
     int           mip_levels;   /* > 1 => mip chain (sampler maxLod follows it) */
+    int           layers;       /* > 1 => 2D array view (Block 10c); 0/1 = single image */
+    int           vio_format;   /* VIO_FORMAT_* of the extended path (BC data cannot be blitted) */
 } vio_vulkan_texture;
 
 /* Per-frame synchronization and command buffer resources.
@@ -247,6 +249,13 @@ typedef struct _vio_vulkan_state {
     int                      depth_has_stencil;    /* depth attachments carry 8 stencil bits */
     int                      multi_draw_indirect;  /* device feature enabled */
     int                      independent_blend;    /* device feature enabled */
+    /* Block 10c: textureCompressionBC, VK_KHR_fragment_shading_rate (pipeline rate). */
+    int                      instance_api_11;      /* instance created with apiVersion 1.1 */
+    int                      bc_supported;
+    int                      vrs_supported;
+    int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
+    int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
+    void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */
     /* Headless frame capture (Block 10): every presented frame is copied into
      * capture_buf in its own command buffer; vio_read_pixels maps it. */
     int                      headless;
@@ -432,6 +441,9 @@ int   vio_vk_generate_mipmaps(void *obj, int kind);
 int   vio_vk_upload_cubemap(void *cm_obj, int width, int height, const void *faces[6]);
 void  vio_vk_destroy_cubemap(void *cm_obj);
 void  vio_vk_bind_cubemap(void *cm_obj, int slot);
+void *vio_vk_create_texture_ex(vio_texture_desc *desc);   /* arrays, BC, stored chains (Block 10c) */
+int   vio_vk_set_shading_rate(int rate);
+void  vio_vk_apply_shading_rate(VkCommandBuffer cmd);     /* after binding a 3D pipeline */
 
 /* ── 3D pipeline (GAP-PHASE5 Block 10, vio_vulkan_3d*.c) ── */
 int   vio_vk3d_available(void);

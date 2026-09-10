@@ -379,6 +379,8 @@ const vio_backend *vio_find_backend(const char *name);
  * Returns NULL if no backends are registered.
  */
 const vio_backend *vio_get_auto_backend(void);
+/* Auto selection that ignores the listed backends (vio_create retries after a failed device open). */
+const vio_backend *vio_get_auto_backend_skip(const vio_backend **skip, int skip_count);
 
 /*
  * Get the number of registered backends.

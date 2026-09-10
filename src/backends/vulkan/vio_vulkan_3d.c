@@ -629,6 +629,7 @@ static int vk3d_prepare(uint32_t stride, VkBuffer inst_buf, VkDeviceSize inst_of
     if (!pl) return -1;
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+    vio_vk_apply_shading_rate(cmd);
     if (sh->binding_count > 0) {
         uint32_t dyn[2];
         uint32_t nd = 0;

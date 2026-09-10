@@ -95,7 +95,12 @@ static int create_instance(int debug)
     app_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
     app_info.pEngineName        = "php-vio";
     app_info.engineVersion      = VK_MAKE_VERSION(0, 1, 0);
-    app_info.apiVersion         = VK_API_VERSION_1_0;
+    /* 1.1 when the loader offers it: VkPhysicalDeviceFeatures2 for
+     * VK_KHR_fragment_shading_rate (Block 10c). Everything else stays 1.0 API. */
+    uint32_t loader_version = VK_API_VERSION_1_0;
+    if (vkEnumerateInstanceVersion(&loader_version) != VK_SUCCESS) loader_version = VK_API_VERSION_1_0;
+    vio_vk.instance_api_11 = loader_version >= VK_API_VERSION_1_1;
+    app_info.apiVersion         = vio_vk.instance_api_11 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
 
     /* Required extensions from GLFW + portability */
     uint32_t glfw_ext_count = 0;
@@ -238,28 +243,77 @@ static int create_logical_device(void)
         queue_infos[i].pQueuePriorities = &queue_priority;
     }
 
-    /* Required device extensions */
-    const char *device_extensions[] = {
-        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-        "VK_KHR_portability_subset", /* MoltenVK */
-    };
+    /* Device extensions: the swapchain, MoltenVK's portability subset, and
+     * VK_KHR_fragment_shading_rate (+ its create_renderpass2 dependency) when the
+     * device offers pipeline shading rates (Block 10c). */
+    const char *device_extensions[4];
+    uint32_t device_ext_count = 0;
+    device_extensions[device_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
 
-    /* Check if portability_subset is available */
     uint32_t ext_count = 0;
     vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &ext_count, NULL);
     VkExtensionProperties *ext_props = malloc(ext_count * sizeof(VkExtensionProperties));
     vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &ext_count, ext_props);
 
-    int has_portability = 0;
+    int has_portability = 0, has_rp2 = 0, has_vrs = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
-        if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) {
-            has_portability = 1;
-            break;
-        }
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_fragment_shading_rate") == 0) has_vrs = 1;
     }
     free(ext_props);
+    if (has_portability) device_extensions[device_ext_count++] = "VK_KHR_portability_subset";
 
-    uint32_t device_ext_count = has_portability ? 2 : 1;
+    vio_vk.vrs_supported = 0;
+    vio_vk.vrs_rates     = 1 << VIO_SHADING_RATE_1X1;
+    vio_vk.shading_rate  = VIO_SHADING_RATE_1X1;
+#ifdef VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME
+    /* Entry points come from the loader at runtime: import libraries / loaders older
+     * than the headers lack the symbols, and the feature then simply stays off. */
+    typedef VkResult (VKAPI_PTR *vio_vk_fsr_rates_fn)(VkPhysicalDevice, uint32_t *, VkPhysicalDeviceFragmentShadingRateKHR *);
+    vio_vk_fsr_rates_fn get_rates = (vio_vk_fsr_rates_fn)vkGetInstanceProcAddr(vio_vk.instance, "vkGetPhysicalDeviceFragmentShadingRatesKHR");
+    vio_vk.vrs_cmd_set = NULL;
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR vrs_enable = {0};
+    vrs_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+    if (has_vrs && has_rp2 && vio_vk.instance_api_11 && get_rates) {
+        VkPhysicalDeviceProperties dprops;
+        vkGetPhysicalDeviceProperties(vio_vk.physical_device, &dprops);
+        if (dprops.apiVersion >= VK_API_VERSION_1_1) {
+            VkPhysicalDeviceFragmentShadingRateFeaturesKHR vrs_avail = {0};
+            vrs_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+            VkPhysicalDeviceFeatures2 f2 = {0};
+            f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            f2.pNext = &vrs_avail;
+            vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+            if (vrs_avail.pipelineFragmentShadingRate) {
+                uint32_t n = 0;
+                get_rates(vio_vk.physical_device, &n, NULL);
+                VkPhysicalDeviceFragmentShadingRateKHR *rates = n ? (VkPhysicalDeviceFragmentShadingRateKHR *)calloc(n, sizeof(*rates)) : NULL;
+                if (rates) {
+                    for (uint32_t i = 0; i < n; i++) rates[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR;
+                    get_rates(vio_vk.physical_device, &n, rates);
+                    for (uint32_t i = 0; i < n; i++) {
+                        if (!(rates[i].sampleCounts & VK_SAMPLE_COUNT_1_BIT)) continue;
+                        uint32_t fw = rates[i].fragmentSize.width, fh = rates[i].fragmentSize.height;
+                        if (fw == 1 && fh == 2) vio_vk.vrs_rates |= 1 << VIO_SHADING_RATE_1X2;
+                        if (fw == 2 && fh == 1) vio_vk.vrs_rates |= 1 << VIO_SHADING_RATE_2X1;
+                        if (fw == 2 && fh == 2) vio_vk.vrs_rates |= 1 << VIO_SHADING_RATE_2X2;
+                        if (fw == 4 && fh == 4) vio_vk.vrs_rates |= 1 << VIO_SHADING_RATE_4X4;
+                    }
+                    free(rates);
+                }
+                if (vio_vk.vrs_rates & (1 << VIO_SHADING_RATE_2X2)) {
+                    vio_vk.vrs_supported = 1;
+                    vrs_enable.pipelineFragmentShadingRate = VK_TRUE;
+                    device_extensions[device_ext_count++] = VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
+                    device_extensions[device_ext_count++] = VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME;
+                }
+            }
+        }
+    }
+#else
+    (void)has_rp2; (void)has_vrs;
+#endif
 
     /* Enable only what we use: anisotropic filtering when the device has it
      * (vio_texture(['anisotropy' => N]) — GAP-PLAN 2.6). */
@@ -278,6 +332,8 @@ static int create_logical_device(void)
          * multi-draw indirect when available (both have fallbacks). */
         if (avail.independentBlend)  { features.independentBlend = VK_TRUE;  vio_vk.independent_blend = 1; }
         if (avail.multiDrawIndirect) { features.multiDrawIndirect = VK_TRUE; vio_vk.multi_draw_indirect = 1; }
+        vio_vk.bc_supported = 0;
+        if (avail.textureCompressionBC) { features.textureCompressionBC = VK_TRUE; vio_vk.bc_supported = 1; }   /* Block 10c */
     }
 
     VkDeviceCreateInfo create_info = {0};
@@ -287,6 +343,9 @@ static int create_logical_device(void)
     create_info.enabledExtensionCount   = device_ext_count;
     create_info.ppEnabledExtensionNames = device_extensions;
     create_info.pEnabledFeatures        = &features;
+#ifdef VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME
+    if (vio_vk.vrs_supported) create_info.pNext = &vrs_enable;
+#endif
 
     VkResult result = vkCreateDevice(vio_vk.physical_device, &create_info, NULL, &vio_vk.device);
     if (result != VK_SUCCESS) {
@@ -295,6 +354,10 @@ static int create_logical_device(void)
     }
 
     vkGetDeviceQueue(vio_vk.device, vio_vk.graphics_family, 0, &vio_vk.graphics_queue);
+    if (vio_vk.vrs_supported) {
+        vio_vk.vrs_cmd_set = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCmdSetFragmentShadingRateKHR");
+        if (!vio_vk.vrs_cmd_set) vio_vk.vrs_supported = 0;   /* pipelines are only built with the dynamic state when this is set */
+    }
     vkGetDeviceQueue(vio_vk.device, vio_vk.present_family, 0, &vio_vk.present_queue);
 
     /* On-disk pipeline cache (GAP-PHASE5 Block 4): keyed by the device so a
@@ -1294,8 +1357,8 @@ int vio_vk_submit_transient(VkCommandBuffer cmd)
  */
 static void *vulkan_create_texture(vio_texture_desc *desc)
 {
-    /* Arrays / block compression / explicit chains arrive with Block 10's 3D pipeline. */
-    if (desc && (desc->layers > 1 || desc->mip_levels > 1 || desc->format != 0)) return NULL;
+    /* Arrays, block compression and stored chains (Block 10c, vio_vulkan_cube.c). */
+    if (desc && (desc->layers > 1 || desc->mip_levels > 1 || desc->format != 0)) return vio_vk_create_texture_ex(desc);
     if (!vio_vk.initialized || !vio_vk.device || desc->width <= 0 || desc->height <= 0) {
         return NULL;
     }
@@ -2010,6 +2073,37 @@ static void vulkan_present(void)
     vio_vk.current_frame = (vio_vk.current_frame + 1) % VIO_VK_MAX_FRAMES_IN_FLIGHT;
 }
 
+
+/* Variable rate shading (GAP-PHASE5 Block 10c): the rate is a dynamic state of
+ * every 3D pipeline, re-applied after each 3D pipeline bind. */
+int vio_vk_set_shading_rate(int rate)
+{
+    if (!vio_vk.vrs_supported || rate < VIO_SHADING_RATE_1X1 || rate > VIO_SHADING_RATE_4X4) return -1;
+    if (!(vio_vk.vrs_rates & (1 << rate))) return -1;
+    vio_vk.shading_rate = rate;
+    return 0;
+}
+
+void vio_vk_apply_shading_rate(VkCommandBuffer cmd)
+{
+#ifdef VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME
+    if (!vio_vk.vrs_supported || !vio_vk.vrs_cmd_set) return;
+    VkExtent2D size = { 1, 1 };
+    switch (vio_vk.shading_rate) {
+        case VIO_SHADING_RATE_1X2: size.width = 1; size.height = 2; break;
+        case VIO_SHADING_RATE_2X1: size.width = 2; size.height = 1; break;
+        case VIO_SHADING_RATE_2X2: size.width = 2; size.height = 2; break;
+        case VIO_SHADING_RATE_4X4: size.width = 4; size.height = 4; break;
+        default: break;
+    }
+    VkFragmentShadingRateCombinerOpKHR ops[2] = { VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+                                                  VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR };
+    typedef void (VKAPI_PTR *vio_vk_fsr_set_fn)(VkCommandBuffer, const VkExtent2D *, const VkFragmentShadingRateCombinerOpKHR[2]);
+    ((vio_vk_fsr_set_fn)vio_vk.vrs_cmd_set)(cmd, &size, ops);
+#else
+    (void)cmd;
+#endif
+}
 
 static void vulkan_clear(float r, float g, float b, float a)
 {
@@ -2857,6 +2951,9 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_CUBE: return vio_vk3d_available(); /* framebuffer per (face, level) (Block 10b) */
         case VIO_FEATURE_MRT:            return vio_vk3d_available(); /* up to 4 colour attachments (Block 10b) */
         case VIO_FEATURE_MIPMAP_GEN:     return vio_vk3d_available(); /* vkCmdBlitImage chain (Block 10b) */
+        case VIO_FEATURE_TEXTURE_ARRAY:  return vio_vk3d_available(); /* 2D array views, stored chains (Block 10c) */
+        case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return vio_vk3d_available() && (!vio_vk.device || vio_vk.bc_supported); /* textureCompressionBC */
+        case VIO_FEATURE_SHADING_RATE:   return vio_vk3d_available() && vio_vk.vrs_supported; /* VK_KHR_fragment_shading_rate, pipeline rate */
         default: return 0;
     }
 }
@@ -2898,6 +2995,7 @@ static const vio_backend vulkan_backend = {
     .upload_cubemap    = vio_vk_upload_cubemap,
     .destroy_cubemap   = vio_vk_destroy_cubemap,
     .bind_cubemap      = vio_vk_bind_cubemap,
+    .set_shading_rate  = vio_vk_set_shading_rate,
     .present           = vulkan_present,
     .clear             = vulkan_clear,
     .gpu_flush         = NULL,
