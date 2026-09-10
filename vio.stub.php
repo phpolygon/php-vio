@@ -450,9 +450,14 @@ function vio_shader_reflect(VioShader $shader): array|false {}
  *                      'depth_bias' => float, 'slope_scaled_depth_bias' => float, 'hdr' => bool,
  *                      'attachments' => int[],  // MRT output formats (VIO_FORMAT_*) — only D3D12 needs them
  *                                               //   (PSO RTV formats); must match the bound render target
- *                      'attachment_blend' => int[], 'attachment_color_mask' => int[]]
+ *                      'attachment_blend' => int[], 'attachment_color_mask' => int[],
  *                                               // MRT: blend mode / VIO_COLOR_* mask PER colour attachment
  *                                               //   (missing entries fall back to 'blend' / 'color_mask')
+ *                      'stencil' => ['func' => VIO_CMP_*, 'ref' => int, 'read_mask' => int, 'write_mask' => int,
+ *                                     'pass' => VIO_STENCIL_*, 'fail' => VIO_STENCIL_*, 'depth_fail' => VIO_STENCIL_*]]
+ *                                               // stencil test (VIO_FEATURE_STENCIL): giving the array enables it;
+ *                                               //   defaults ALWAYS / 0 / 0xFF / 0xFF / KEEP. The depth attachment carries
+ *                                               //   8 stencil bits, vio_clear resets them to 0. Same ops for front + back.
  * @return VioPipeline|false Pipeline object or false on failure
  */
 function vio_pipeline(VioContext $context, array $config): VioPipeline|false {}

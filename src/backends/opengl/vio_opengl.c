@@ -419,7 +419,7 @@ static void opengl_destroy_shader(void *shader)
 static void opengl_begin_frame(void)
 {
     glClearColor(vio_gl.clear_r, vio_gl.clear_g, vio_gl.clear_b, vio_gl.clear_a);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     vio_gl.in_frame = 1;
 }
 
@@ -465,7 +465,7 @@ static void opengl_clear(float r, float g, float b, float a)
     if (vio_gl.initialized && vio_gl.in_frame) {
         glClearColor(r, g, b, a);
         glDepthMask(GL_TRUE);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
 }
 
@@ -926,11 +926,11 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
 
         glGenTextures(1, &rt->depth_texture);
         glBindTexture(GL_TEXTURE_2D, rt->depth_texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, width, width,
-                     0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, width, width,
+                     0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, rt->depth_texture, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, rt->depth_texture, 0);
 
         GLenum cube_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (cube_status == GL_FRAMEBUFFER_COMPLETE) {
@@ -940,7 +940,7 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
             for (int f = 0; f < 6; f++) {
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                        GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, rt->color_texture, 0);
-                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
             }
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                    GL_TEXTURE_CUBE_MAP_POSITIVE_X, rt->color_texture, 0);
@@ -957,18 +957,21 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
         return 0;
     }
 
-    /* Depth texture (always created — shadow-map use-case needs it as SRV) */
+    /* Depth texture (always created — shadow-map use-case needs it as SRV).
+     * DEPTH24_STENCIL8 so the stencil test (VIO_FEATURE_STENCIL) has its 8 bits;
+     * sampling through sampler2DShadow / glReadPixels(GL_DEPTH_COMPONENT) still
+     * reads the depth plane (GL_DEPTH_STENCIL_TEXTURE_MODE defaults to depth). */
     glGenTextures(1, &rt->depth_texture);
     glBindTexture(GL_TEXTURE_2D, rt->depth_texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, width, height,
-        0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, width, height,
+        0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
     float border_color[] = {1.0f, 1.0f, 1.0f, 1.0f};
     glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border_color);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D,
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D,
         rt->depth_texture, 0);
 
     if (depth_only) {
@@ -1009,7 +1012,7 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
          * bound and drawn into without an explicit clear still depth-tests. */
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glDepthMask(GL_TRUE);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -1041,16 +1044,16 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
             glBindRenderbuffer(GL_RENDERBUFFER, rt->gl_msaa_color_rb);
             glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, internal, width, height);
             glBindRenderbuffer(GL_RENDERBUFFER, rt->gl_msaa_depth_rb);
-            glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH_COMPONENT24, width, height);
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, width, height);
             glBindRenderbuffer(GL_RENDERBUFFER, 0);
             glBindFramebuffer(GL_FRAMEBUFFER, rt->gl_msaa_fbo);
             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rt->gl_msaa_color_rb);
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rt->gl_msaa_depth_rb);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rt->gl_msaa_depth_rb);
             GLenum ms_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
             if (ms_status == GL_FRAMEBUFFER_COMPLETE) {
                 glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
                 glDepthMask(GL_TRUE);
-                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 break;
             }
@@ -1687,6 +1690,34 @@ static void opengl_apply_blend(int buf, int blend)
     glBlendFuncSeparatei((GLuint)buf, sRGB, dRGB, sA, dA);
 }
 
+static GLenum opengl_compare_func(int f)
+{
+    switch (f) {
+        case VIO_CMP_NEVER:    return GL_NEVER;
+        case VIO_CMP_LESS:     return GL_LESS;
+        case VIO_CMP_EQUAL:    return GL_EQUAL;
+        case VIO_CMP_LEQUAL:   return GL_LEQUAL;
+        case VIO_CMP_GREATER:  return GL_GREATER;
+        case VIO_CMP_NOTEQUAL: return GL_NOTEQUAL;
+        case VIO_CMP_GEQUAL:   return GL_GEQUAL;
+        default:               return GL_ALWAYS;
+    }
+}
+
+static GLenum opengl_stencil_op(int op)
+{
+    switch (op) {
+        case VIO_STENCIL_ZERO:      return GL_ZERO;
+        case VIO_STENCIL_REPLACE:   return GL_REPLACE;
+        case VIO_STENCIL_INCR:      return GL_INCR;
+        case VIO_STENCIL_DECR:      return GL_DECR;
+        case VIO_STENCIL_INVERT:    return GL_INVERT;
+        case VIO_STENCIL_INCR_WRAP: return GL_INCR_WRAP;
+        case VIO_STENCIL_DECR_WRAP: return GL_DECR_WRAP;
+        default:                    return GL_KEEP;
+    }
+}
+
 static void opengl_bind_pipeline_state(void *pipe_ptr)
 {
     vio_pipeline_object *pipe = (vio_pipeline_object *)pipe_ptr;
@@ -1708,6 +1739,19 @@ static void opengl_bind_pipeline_state(void *pipe_ptr)
         glDisable(GL_DEPTH_TEST);
     }
     glDepthMask(pipe->depth_write ? GL_TRUE : GL_FALSE);
+    /* Stencil (VIO_FEATURE_STENCIL): one function / op set for both faces. A
+     * pipeline without 'stencil' disables the test and restores the full write
+     * mask so vio_clear can reset the plane. */
+    if (pipe->stencil_enable) {
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(opengl_compare_func(pipe->stencil_func), pipe->stencil_ref, (GLuint)pipe->stencil_read_mask);
+        glStencilOp(opengl_stencil_op(pipe->stencil_fail_op), opengl_stencil_op(pipe->stencil_depth_fail_op),
+                    opengl_stencil_op(pipe->stencil_pass_op));
+        glStencilMask((GLuint)pipe->stencil_write_mask);
+    } else {
+        glDisable(GL_STENCIL_TEST);
+        glStencilMask(0xFFu);
+    }
     if (pipe->depth_bias != 0.0f || pipe->slope_scaled_depth_bias != 0.0f) {
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(pipe->slope_scaled_depth_bias, pipe->depth_bias);
@@ -1844,6 +1888,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_HDR:    return 1;       /* RGBA16F since 3.0 */
         case VIO_FEATURE_RENDER_TARGET_DEPTH:  return 1;
         case VIO_FEATURE_RENDER_TARGET_MSAA:   return 1;
+        case VIO_FEATURE_STENCIL:        return 1;             /* DEPTH24_STENCIL8 attachments + glStencil* state */
         case VIO_FEATURE_CUBEMAP:        return 1;
         case VIO_FEATURE_DEPTH_BIAS:     return 1;
         case VIO_FEATURE_SCISSOR:        return 1;

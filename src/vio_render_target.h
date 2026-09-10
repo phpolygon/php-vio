@@ -56,8 +56,14 @@ typedef struct _vio_render_target_object {
     /* D3D12 (opaque pointers — actual types are ID3D12Resource* etc.) */
     void        *d3d12_color_resource;  /* ID3D12Resource* */
     void        *d3d12_depth_resource;  /* ID3D12Resource* */
-    void        *d3d12_rtv_heap;        /* ID3D12DescriptorHeap* (1 RTV) */
+    void        *d3d12_rtv_heap;        /* ID3D12DescriptorHeap* (RTVs: attachments, then the resolve targets when MSAA) */
     void        *d3d12_dsv_heap;        /* ID3D12DescriptorHeap* (1 DSV) */
+    /* MSAA (samples > 1, GAP-PHASE5 Block 1): the multisampled colour resources the
+     * RTVs point at; d3d12_color_resource(s) are then the single-sample RESOLVE
+     * targets the SRVs / readback read. The PSO picks its SampleDesc variant from
+     * the bound target's count (vio_d3d12_pipeline.pso_ms). */
+    void        *d3d12_msaa_color_resources[VIO_MAX_COLOR_ATTACHMENTS]; /* ID3D12Resource* */
+    int          d3d12_msaa_dirty;      /* 1 => drawn into since the last resolve */
 
     /* Metal (opaque pointers — actual types are id<MTLTexture> CFBridgeRetained).
      * Stored as opaque void * so the public header doesn't pull in Metal

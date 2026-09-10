@@ -97,6 +97,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 |---|---|
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
 | `tests/render3d/112` | Blend und Write-Mask je Attachment auf einer MRT-Pipeline: Attachment 0 alpha-blendet, Attachment 1 (Maske 0) bleibt unberührt, Attachment 2 schreibt nur den Rotkanal – der Vertrag für einen Transparent-Pass in ein G-Buffer-Target. |
+| `tests/render3d/113` | Stencil: ein Markierungs-Pass (Farbe maskiert, REPLACE ref 1) auf der linken Hälfte, dann EQUAL-/NOTEQUAL-Passes – links grün, rechts rot, keine Farbe aus dem Markierungs-Pass. |
 | `tests/render3d/111` | Draw-time-Bind-Tabelle haelt Referenzen: eine als Temporary gebundene RT-Textur (`vio_bind_texture(\, vio_render_target_texture(\), 6)`) ueberlebt bis zum Draw, auch wenn danach weitere Texturobjekte entstehen (D3D11/D3D12/Metal; Regression aus 2.9: recycelter Objektspeicher legte die AO-Karte auf das Schatten-Register). |
 | `tests/render3d/096–098` | Storage-Images + 2D-Dispatch (API-Roadmap R2/R7), Multiple Render Targets (R1), Async-Compute im Frame (R7) |
 | `tests/backends/108` | OpenGL: `vio_set_uniform()` erreicht UBO-Block-Member, Default-Block-Uniforms und Array-Elemente von SPIR-V-Pfad-Shadern (SPIRV-Cross flacht sie zu `uniform Matrices _19;` ab → GL-Name `_19.uProjection`). |
@@ -148,7 +149,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | 3D-Pipeline (`vio_mesh`/`vio_shader`/`vio_pipeline`/`vio_draw`) | ✅ | ✅ | ✅ | ❌ stub | ✅ |
 | Native 2D-Batch | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Render Target (Basis) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Render Target HDR / Depth-only / MSAA | ✅/✅/✅* | ✅/✅/✅* | ✅/✅/✅* | ❌/❌/❌ | ✅/✅/✅ |
+| Render Target HDR / Depth-only / MSAA | ✅/✅/✅* | ✅/✅/✅* | ✅/✅/✅ (PSO-Sample-Varianten, GAP-PHASE5 1) | ❌/❌/❌ | ✅/✅/✅ |
 | Cubemap | ✅ | ✅ | ✅† (seit 2.9: Upload war vorher nicht implementiert) | ❌ | ✅ |
 | Compute (`vio_compute_*`) | ✅ (GL ≥ 4.3 → auf macOS nie) | ✅ | ✅ | ✅ | ✅ |
 | Vertex-Storage (`vio_draw_instanced_from_buffer`) | ✅ (wenn Compute) | ✅ | ✅ | ❌ | ✅ |
@@ -161,6 +162,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | `depth_write` / `color_mask` / Blend-Modi | ✅ | ✅ | ✅ | — | ✅ |
 | MRT (`'attachments' => [VIO_FORMAT_*…]`, bis 4) | ✅ | ✅† | ✅† | ❌ | ✅ |
 | Blend/Write-Mask je Attachment (`attachment_blend`, `attachment_color_mask`) | ✅ (GL ≥ 4.0, indexed) | ✅ (IndependentBlend) | ✅ (IndependentBlend) | ❌ | ✅ (per colorAttachment) |
+| Stencil (`'stencil' => [...]`, `VIO_FEATURE_STENCIL`) | ✅ (DEPTH24_STENCIL8) | ✅ (D24S8) | ✅ (D24S8, `OMSetStencilRef`) | ❌ | ❌ (Depth32Float ohne Stencil-Plane, macOS-Folgearbeit) |
 | Storage-Images (`'storage' => true` + `vio_compute_bind_image`) | ✅ (wenn Compute) | ✅† | ✅† | ❌ | ✅ |
 | Compute-`local_size` aus Reflection (2D/3D-Dispatch) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Async-Dispatch im Frame (`['async' => true]`, `vio_compute_wait`) | ✅ (Queue in-order) | ✅ (in-order) | ✅† (Frame-List) | sync | ✅ (Frame-Cmd-Buffer) |
@@ -716,7 +718,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 113 (109/110 gehören dem Branch feat/geometry-tessellation-stages, 111 Bind-Tabelle, 112 Blend je Attachment)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 114 (109/110 gehören dem Branch feat/geometry-tessellation-stages, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -841,8 +843,10 @@ Aufrufer geändert hat:
 - **Vulkan hat keine 3D-Pipeline** (`VIO_FEATURE_3D_PIPELINE == 0`); 2D, Render-Targets,
   Compute und read_pixels funktionieren dort. Vulkan: kein Cubemap, kein HDR/Depth-only/MSAA-RT.
   `auto` wählt deshalb OpenGL vor Vulkan (siehe GAP-Plan Phase 0.4 / Phase 5).
-- **D3D12 RT-MSAA** fehlt (`RENDER_TARGET_MSAA = 0`): braucht `vio_pipeline(['samples' => N])`,
-  weil die PSO ihr `SampleDesc` kennen muss — zusammen mit Stencil (R3) in einem PSO-State-PR.
+- **D3D12 RT-MSAA** (GAP-PHASE5 Block 1): jede `vio_d3d12_pipeline` hält ihre PSO-Beschreibung und
+  baut beim Binden lazily die Variante für die Sample-Zahl des gebundenen Targets (2/4/8);
+  die RT-Farbe liegt in multisampled Ressourcen, die Resolve-Ziele (SRV/Readback) werden beim
+  Unbind per `ResolveSubresource` gefüllt. Kein `'samples'` auf der Pipeline nötig.
 - **Input-Layout auf D3D/Metal** kommt aus der Shader-Reflection (Attribute dicht gepackt in
   Location-Reihenfolge), nicht aus dem Mesh-Layout: ein Mesh mit Lücken/anderer Reihenfolge
   (`['location' => 7, …]` zwischen 0 und 1) liest auf D3D falsche Offsets; OpenGL nutzt das

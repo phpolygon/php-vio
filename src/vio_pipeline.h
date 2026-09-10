@@ -45,6 +45,15 @@ typedef struct _vio_pipeline_object {
     int            per_attachment;    /* 'attachment_blend' / 'attachment_color_mask' given */
     int            attachment_blend[4]; /* vio_blend_mode per colour attachment */
     int            attachment_mask[4];  /* VIO_COLOR_* bits per colour attachment */
+    /* 'stencil' => [...] (see vio_pipeline_desc). */
+    int            stencil_enable;
+    int            stencil_func;
+    int            stencil_ref;
+    int            stencil_read_mask;
+    int            stencil_write_mask;
+    int            stencil_pass_op;
+    int            stencil_fail_op;
+    int            stencil_depth_fail_op;
     int            valid;
     zend_object    std;
 } vio_pipeline_object;

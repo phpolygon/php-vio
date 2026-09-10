@@ -1506,6 +1506,18 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
         ? D3D12_COMPARISON_FUNC_LESS_EQUAL
         : D3D12_COMPARISON_FUNC_LESS;
     pso_desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    /* Stencil (VIO_FEATURE_STENCIL): every depth attachment is D24S8. */
+    if (desc->stencil_enable) {
+        pso_desc.DepthStencilState.StencilEnable = TRUE;
+        pso_desc.DepthStencilState.StencilReadMask = (UINT8)desc->stencil_read_mask;
+        pso_desc.DepthStencilState.StencilWriteMask = (UINT8)desc->stencil_write_mask;
+        pso_desc.DepthStencilState.FrontFace.StencilFunc = vio_d3d_compare_func_12(desc->stencil_func);
+        pso_desc.DepthStencilState.FrontFace.StencilPassOp = vio_d3d_stencil_op_12(desc->stencil_pass_op);
+        pso_desc.DepthStencilState.FrontFace.StencilFailOp = vio_d3d_stencil_op_12(desc->stencil_fail_op);
+        pso_desc.DepthStencilState.FrontFace.StencilDepthFailOp = vio_d3d_stencil_op_12(desc->stencil_depth_fail_op);
+        pso_desc.DepthStencilState.BackFace = pso_desc.DepthStencilState.FrontFace;
+    }
+    pipeline->stencil_ref = (UINT)desc->stencil_ref;
 
     /* Blend: one state for every colour attachment (the D3D default, IndependentBlend
      * off), or - with 'attachment_blend' / 'attachment_color_mask' - one per attachment so
@@ -1548,16 +1560,45 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(vio_d3d12.device, &pso_desc,
                                                            &IID_ID3D12PipelineState,
                                                            (void **)&pipeline->pso);
-    if (elements) free(elements);
-    if (sem_names) free(sem_names);
     if (FAILED(hr)) {
         d3d12_drain_info_queue("create_pso_fail");
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create PSO (0x%08lx)", hr);
+        if (elements) free(elements);
+        if (sem_names) free(sem_names);
         free(pipeline);
         return NULL;
     }
+    /* Keep the description (and the arrays it points into) for the MSAA
+     * variants; the shader blobs stay alive through the VioShader the PHP
+     * pipeline object holds. */
+    pipeline->pso_desc = pso_desc;
+    pipeline->input_elements = elements;
+    pipeline->sem_names = sem_names;
 
     return pipeline;
+}
+
+/* The PSO variant for a render target with `samples` samples (1 = the base
+ * PSO). Variants are created on first use and live as long as the pipeline. */
+static ID3D12PipelineState *d3d12_pipeline_pso_for_samples(vio_d3d12_pipeline *p, int samples)
+{
+    if (!p) return NULL;
+    if (samples <= 1) return p->pso;
+    int idx = samples >= 8 ? 3 : (samples >= 4 ? 2 : 1);
+    if (p->pso_ms[idx]) return p->pso_ms[idx];
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = p->pso_desc;
+    d.SampleDesc.Count = (UINT)(1u << idx);
+    d.SampleDesc.Quality = 0;
+    HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(vio_d3d12.device, &d,
+                                                           &IID_ID3D12PipelineState,
+                                                           (void **)&p->pso_ms[idx]);
+    if (FAILED(hr) || !p->pso_ms[idx]) {
+        d3d12_drain_info_queue("create_pso_msaa_fail");
+        php_error_docref(NULL, E_WARNING, "D3D12: Failed to create %d-sample PSO variant (0x%08lx)", 1 << idx, hr);
+        p->pso_ms[idx] = NULL;
+        return p->pso;
+    }
+    return p->pso_ms[idx];
 }
 
 /* PSOs freed while a frame is recording may still be referenced by that
@@ -1583,15 +1624,29 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
     vio_d3d12_pipeline *p = (vio_d3d12_pipeline *)pipeline_ptr;
     if (!p) return;
     if (d3d12_current_pipeline == p) d3d12_current_pipeline = NULL;
-    if (p->pso) {
+    for (int v = -1; v < 4; v++) {
+        ID3D12PipelineState *pso = v < 0 ? p->pso : p->pso_ms[v];
+        if (!pso) continue;
         UINT slot = vio_d3d12.frame_index < 3 ? vio_d3d12.frame_index : 0;
         if (vio_d3d12.in_frame && d3d12_pending_pso_count[slot] < VIO_D3D12_PENDING_PSO_MAX) {
-            d3d12_pending_pso[slot][d3d12_pending_pso_count[slot]++] = p->pso;
+            d3d12_pending_pso[slot][d3d12_pending_pso_count[slot]++] = pso;
         } else {
-            ID3D12PipelineState_Release(p->pso);
+            ID3D12PipelineState_Release(pso);
         }
     }
+    if (p->input_elements) free(p->input_elements);
+    if (p->sem_names) free(p->sem_names);
     free(p);
+}
+
+/* Re-issue the bound pipeline's PSO for the sample count of the (new) bound
+ * target — called after render-target binds / unbinds so "bind pipeline, then
+ * bind target" orders pick the right variant too. */
+static void d3d12_rearm_pso_for_target(void)
+{
+    if (!d3d12_current_pipeline || !vio_d3d12.cmd_list || !vio_d3d12.in_frame) return;
+    ID3D12PipelineState *pso = d3d12_pipeline_pso_for_samples(d3d12_current_pipeline, vio_d3d12.current_rt_samples);
+    if (pso) ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list, pso);
 }
 
 static void d3d12_bind_pipeline(void *pipeline_ptr)
@@ -1600,10 +1655,12 @@ static void d3d12_bind_pipeline(void *pipeline_ptr)
     if (!p) return;
 
     d3d12_current_pipeline = p;
-    ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list, p->pso);
+    ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list,
+        d3d12_pipeline_pso_for_samples(p, vio_d3d12.current_rt_samples));
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(vio_d3d12.cmd_list,
                                                         vio_d3d12.root_signature);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(vio_d3d12.cmd_list, p->topology);
+    ID3D12GraphicsCommandList_OMSetStencilRef(vio_d3d12.cmd_list, p->stencil_ref);
 
     /* Bind SRV + sampler heaps. Also invalidates the cached root arguments for
      * params 2 / 4 (SetGraphicsRootSignature / SetDescriptorHeaps may reset
@@ -2552,6 +2609,12 @@ static void d3d12_destroy_render_target(void *rt_ptr)
     }
     rt->d3d12_color_backend_textures[0] = NULL;
     rt->d3d12_color_resources[0] = NULL;
+    for (int i = 0; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
+        if (rt->d3d12_msaa_color_resources[i]) {
+            ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_msaa_color_resources[i]);
+            rt->d3d12_msaa_color_resources[i] = NULL;
+        }
+    }
     if (rt->d3d12_color_resource) {
         ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
         rt->d3d12_color_resource = NULL;
@@ -2607,6 +2670,33 @@ static int d3d12_rt_mips(const vio_render_target_object *rt)
     return rt->is_cube && rt->mip_levels > 0 ? rt->mip_levels : 1;
 }
 
+/* Resolve a multisampled target into its single-sample resolve resources so
+ * the SRVs / readback see the final image (D3D11 twin: d3d11_rt_resolve_msaa).
+ * Afterwards the resolve resources sit in PIXEL_SHADER_RESOURCE (color_is_srv)
+ * and the multisampled ones are back in RENDER_TARGET for the next bind. */
+static void d3d12_rt_resolve_msaa(vio_render_target_object *rt)
+{
+    if (!rt || !rt->d3d12_msaa_color_resources[0] || !rt->d3d12_msaa_dirty || !vio_d3d12.cmd_list) return;
+    int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+    if (n > VIO_MAX_COLOR_ATTACHMENTS) n = VIO_MAX_COLOR_ATTACHMENTS;
+    for (int ai = 0; ai < n; ai++) {
+        ID3D12Resource *ms  = (ID3D12Resource *)rt->d3d12_msaa_color_resources[ai];
+        ID3D12Resource *dst = ai == 0 ? (ID3D12Resource *)rt->d3d12_color_resource
+                                      : (ID3D12Resource *)rt->d3d12_color_resources[ai];
+        if (!ms || !dst) continue;
+        DXGI_FORMAT fmt = vio_pixel_format_to_dxgi(rt->formats[ai]);
+        d3d12_rt_barrier(vio_d3d12.cmd_list, ms, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        d3d12_rt_barrier(vio_d3d12.cmd_list, dst,
+                         rt->d3d12_color_is_srv ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET,
+                         D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        ID3D12GraphicsCommandList_ResolveSubresource(vio_d3d12.cmd_list, dst, 0, ms, 0, fmt);
+        d3d12_rt_barrier(vio_d3d12.cmd_list, dst, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        d3d12_rt_barrier(vio_d3d12.cmd_list, ms, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    rt->d3d12_color_is_srv = 1;
+    rt->d3d12_msaa_dirty = 0;
+}
+
 /* Record the commands that make `rt` the active target (colour attachment
  * face/level for cube targets). Caller guarantees vio_d3d12.in_frame. */
 static void d3d12_record_bind_render_target(vio_render_target_object *rt, int face, int level)
@@ -2621,11 +2711,18 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
                              D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             prev->d3d12_depth_is_srv = 1;
         }
+        /* An outgoing multisampled target replaced without an unbind still gets
+         * its resolve, so sampling it later sees what was drawn. */
+        d3d12_rt_resolve_msaa(prev);
     }
 
     /* Colour attachments used as SRVs since the last bind go back to RENDER_TARGET
-     * (one flag covers the whole MRT set / every cube face). */
-    if (rt->d3d12_color_resource && rt->d3d12_color_is_srv) {
+     * (one flag covers the whole MRT set / every cube face). MSAA targets render
+     * into their multisampled resources, which always stay RENDER_TARGET; the
+     * resolve targets keep their SRV state until the next resolve. */
+    if (rt->d3d12_msaa_color_resources[0]) {
+        rt->d3d12_msaa_dirty = 1;
+    } else if (rt->d3d12_color_resource && rt->d3d12_color_is_srv) {
         int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
         for (int ai = 0; ai < n && ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
             ID3D12Resource *res = ai == 0 ? (ID3D12Resource *)rt->d3d12_color_resource
@@ -2686,6 +2783,8 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
     vio_d3d12.current_rt_height = h;
     d3d12_rt_set_viewport_scissor(w, h);
     vio_d3d12.current_bound_rt = rt;
+    vio_d3d12.current_rt_samples = rt->samples > 1 ? rt->samples : 1;
+    d3d12_rearm_pso_for_target();
 }
 
 void vio_d3d12_apply_pending_render_target(void)
@@ -2750,7 +2849,9 @@ static void d3d12_unbind_render_target(unsigned int default_fbo, int width, int 
                              D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             bound_rt->d3d12_depth_is_srv = 1;
         }
-        if (bound_rt->d3d12_color_resource && !bound_rt->depth_only && !bound_rt->d3d12_color_is_srv) {
+        if (bound_rt->d3d12_msaa_color_resources[0]) {
+            d3d12_rt_resolve_msaa(bound_rt);
+        } else if (bound_rt->d3d12_color_resource && !bound_rt->depth_only && !bound_rt->d3d12_color_is_srv) {
             int n = bound_rt->attachment_count > 0 ? bound_rt->attachment_count : 1;
             for (int ai = 0; ai < n && ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
                 ID3D12Resource *res = ai == 0 ? (ID3D12Resource *)bound_rt->d3d12_color_resource
@@ -2774,7 +2875,9 @@ static void d3d12_unbind_render_target(unsigned int default_fbo, int width, int 
     vio_d3d12.current_rt_width = vio_d3d12.width;
     vio_d3d12.current_rt_height = vio_d3d12.height;
     vio_d3d12.current_has_rtv = 1;
+    vio_d3d12.current_rt_samples = 1;
     d3d12_rt_set_viewport_scissor(vio_d3d12.width, vio_d3d12.height);
+    d3d12_rearm_pso_for_target();
 }
 
 /* Initial clear of a freshly created target, recorded on the upload list. */
@@ -2814,12 +2917,33 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     int attachment_count = rt->attachment_count > 0 ? rt->attachment_count : 1;
     if (attachment_count > VIO_MAX_COLOR_ATTACHMENTS) attachment_count = VIO_MAX_COLOR_ATTACHMENTS;
     int mips = d3d12_rt_mips(rt);
-    rt->samples = 1;   /* MSAA needs the PSO SampleDesc variant (GAP-PLAN Phase 5) */
+    /* MSAA (GAP-PHASE5 Block 1): clamp the request to a power of two the device
+     * supports for attachment 0's format. Cube / depth-only targets stay
+     * single-sample (no resolve path), like D3D11. The PSO side is handled by
+     * the per-sample-count variants (d3d12_pipeline_pso_for_samples). */
+    UINT samples = 1;
+    if (!rt->is_cube && !depth_only && rt->samples > 1) {
+        UINT want = rt->samples > 8 ? 8 : (UINT)rt->samples;
+        while (want & (want - 1)) want &= want - 1;   /* round down to a power of two */
+        for (UINT s = want; s > 1; s >>= 1) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS mq = {0};
+            mq.Format = vio_pixel_format_to_dxgi(rt->formats[0]);
+            mq.SampleCount = s;
+            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mq, sizeof(mq)))
+                && mq.NumQualityLevels > 0) {
+                samples = s;
+                break;
+            }
+        }
+    }
+    rt->samples = (int)samples;
     rt->backend_type = VIO_RT_BACKEND_D3D12;   /* the destructor releases whatever exists from here on */
 
     if (!depth_only) {
         D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {0};
-        rtv_heap_desc.NumDescriptors = rt->is_cube ? (UINT)(6 * mips) : (UINT)attachment_count;
+        /* MSAA: attachments' RTVs first, then one RTV per single-sample resolve
+         * target (used only by the initial clear). */
+        rtv_heap_desc.NumDescriptors = rt->is_cube ? (UINT)(6 * mips) : (UINT)(attachment_count * (samples > 1 ? 2 : 1));
         rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         ID3D12DescriptorHeap *rtv_heap = NULL;
         hr = ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &rtv_heap_desc, &IID_ID3D12DescriptorHeap, (void **)&rtv_heap);
@@ -2889,7 +3013,27 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
                 }
                 rt->d3d12_color_resources[ai] = color_res;
                 D3D12_CPU_DESCRIPTOR_HANDLE h = { rtv_base.ptr + (SIZE_T)ai * vio_d3d12.rtv_descriptor_size };
-                ID3D12Device_CreateRenderTargetView(vio_d3d12.device, color_res, NULL, h);
+                if (samples > 1) {
+                    /* The RTV targets the multisampled resource; the single-sample
+                     * resource above becomes the resolve target (SRV / readback) and
+                     * gets its own RTV behind the attachments for the initial clear. */
+                    D3D12_RESOURCE_DESC md = rd;
+                    md.SampleDesc.Count = samples;
+                    md.SampleDesc.Quality = 0;
+                    ID3D12Resource *ms_res = NULL;
+                    hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props, D3D12_HEAP_FLAG_NONE, &md,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, &IID_ID3D12Resource, (void **)&ms_res);
+                    if (FAILED(hr)) {
+                        php_error_docref(NULL, E_WARNING, "D3D12: Failed to create MSAA color resource %d (0x%08lx)", ai, hr);
+                        return -1;
+                    }
+                    rt->d3d12_msaa_color_resources[ai] = ms_res;
+                    ID3D12Device_CreateRenderTargetView(vio_d3d12.device, ms_res, NULL, h);
+                    D3D12_CPU_DESCRIPTOR_HANDLE hr_resolve = { rtv_base.ptr + (SIZE_T)(attachment_count + ai) * vio_d3d12.rtv_descriptor_size };
+                    ID3D12Device_CreateRenderTargetView(vio_d3d12.device, color_res, NULL, hr_resolve);
+                } else {
+                    ID3D12Device_CreateRenderTargetView(vio_d3d12.device, color_res, NULL, h);
+                }
             }
             rt->d3d12_color_resource = rt->d3d12_color_resources[0];
         }
@@ -2916,7 +3060,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     depth_res_desc.DepthOrArraySize = 1;
     depth_res_desc.MipLevels = 1;
     depth_res_desc.Format = depth_only ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_D24_UNORM_S8_UINT;
-    depth_res_desc.SampleDesc.Count = 1;
+    depth_res_desc.SampleDesc.Count = samples;   /* multisampled with the colour (DSV infers 2DMS) */
     depth_res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE depth_clear = {0};
     depth_clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
@@ -2991,7 +3135,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
         job.dsv = dsv_handle;
         if (!depth_only && rt->d3d12_rtv_heap) {
             ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &job.rtv0);
-            job.rtv_count = rt->is_cube ? 6 * mips : attachment_count;
+            job.rtv_count = rt->is_cube ? 6 * mips : attachment_count * (samples > 1 ? 2 : 1);
         }
         d3d12_submit_upload(d3d12_record_rt_clear, &job);
     }
@@ -3312,6 +3456,7 @@ static void d3d12_begin_frame(void)
                                                   &frame->rtv_handle, FALSE, &dsv_handle);
 
     /* Track current render target */
+    vio_d3d12.current_rt_samples = 1;
     vio_d3d12.current_rtv = frame->rtv_handle;
     vio_d3d12.current_rtvs[0] = frame->rtv_handle;
     vio_d3d12.current_rtv_count = 1;
@@ -4192,8 +4337,10 @@ static void d3d12_restore_graphics_state_after_compute(void)
     vio_d3d12_bind_graphics_heaps(vio_d3d12.cmd_list);   /* also drops the cached root tables */
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(vio_d3d12.cmd_list, vio_d3d12.root_signature);
     if (d3d12_current_pipeline && d3d12_current_pipeline->pso) {
-        ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list, d3d12_current_pipeline->pso);
+        ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list,
+            d3d12_pipeline_pso_for_samples(d3d12_current_pipeline, vio_d3d12.current_rt_samples));
         ID3D12GraphicsCommandList_IASetPrimitiveTopology(vio_d3d12.cmd_list, d3d12_current_pipeline->topology);
+        ID3D12GraphicsCommandList_OMSetStencilRef(vio_d3d12.cmd_list, d3d12_current_pipeline->stencil_ref);
     }
 }
 
@@ -4545,10 +4692,11 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET:       return 1;
         case VIO_FEATURE_RENDER_TARGET_HDR:   return 1;
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 1;
-        /* Every resource is SampleDesc.Count = 1 and a PSO's SampleDesc must match
-         * the bound target, so MSAA needs vio_pipeline(['samples' => N]) first
-         * (GAP-PLAN Phase 5). Reporting 1 here made engines skip their fallback. */
-        case VIO_FEATURE_RENDER_TARGET_MSAA:  return 0;
+        /* Multisampled colour + depth resources per target, PSO SampleDesc
+         * variants picked at bind time, ResolveSubresource on unbind (GAP-PHASE5
+         * Block 1). */
+        case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1;
+        case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + PSO depth-stencil state */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* CPU box filter + re-upload (GAP-PLAN 2.3) */
         case VIO_FEATURE_CUBEMAP:      return 1;

@@ -579,6 +579,18 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
     ds_desc.DepthFunc = (desc->depth_func == VIO_DEPTH_LEQUAL)
         ? D3D11_COMPARISON_LESS_EQUAL
         : D3D11_COMPARISON_LESS;
+    /* Stencil (VIO_FEATURE_STENCIL): the swapchain / RT depth is D24S8 already. */
+    if (desc->stencil_enable) {
+        ds_desc.StencilEnable = TRUE;
+        ds_desc.StencilReadMask = (UINT8)desc->stencil_read_mask;
+        ds_desc.StencilWriteMask = (UINT8)desc->stencil_write_mask;
+        ds_desc.FrontFace.StencilFunc = vio_d3d_compare_func(desc->stencil_func);
+        ds_desc.FrontFace.StencilPassOp = vio_d3d_stencil_op(desc->stencil_pass_op);
+        ds_desc.FrontFace.StencilFailOp = vio_d3d_stencil_op(desc->stencil_fail_op);
+        ds_desc.FrontFace.StencilDepthFailOp = vio_d3d_stencil_op(desc->stencil_depth_fail_op);
+        ds_desc.BackFace = ds_desc.FrontFace;
+    }
+    pipeline->stencil_ref = (UINT)desc->stencil_ref;
 
     ID3D11Device_CreateDepthStencilState(vio_d3d11.device, &ds_desc,
                                           &pipeline->depth_stencil_state);
@@ -625,7 +637,7 @@ static void d3d11_bind_pipeline(void *pipeline_ptr)
     ID3D11DeviceContext_VSSetShader(vio_d3d11.context, p->vs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(vio_d3d11.context, p->ps, NULL, 0);
     ID3D11DeviceContext_RSSetState(vio_d3d11.context, p->rasterizer_state);
-    ID3D11DeviceContext_OMSetDepthStencilState(vio_d3d11.context, p->depth_stencil_state, 0);
+    ID3D11DeviceContext_OMSetDepthStencilState(vio_d3d11.context, p->depth_stencil_state, p->stencil_ref);
 
     float blend_factor[4] = {0, 0, 0, 0};
     ID3D11DeviceContext_OMSetBlendState(vio_d3d11.context, p->blend_state, blend_factor, 0xFFFFFFFF);
@@ -2587,6 +2599,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_HDR:   return 1;
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 1;
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1; /* multisampled colour + ResolveSubresource on unbind (GAP-PLAN Phase 3) */
+        case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + depth-stencil state (GAP-PHASE5 Block 1) */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice TEXTURECUBE + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* ID3D11DeviceContext::GenerateMips */
         case VIO_FEATURE_CUBEMAP:      return 1;

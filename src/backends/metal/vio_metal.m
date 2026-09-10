@@ -3823,6 +3823,7 @@ static int metal_supports_feature(vio_feature f)
          * MSAA colour targets render into a 2DMultisample pair and resolve
          * at every pass end (`samples` on vio_render_target). */
         return 1;
+    case VIO_FEATURE_STENCIL:       /* depth attachments are Depth32Float (no stencil plane) — macOS follow-up */
     case VIO_FEATURE_GEOMETRY:      /* Metal has no geometry stage */
     case VIO_FEATURE_TESSELLATION:  /* not wired (Metal tessellation is compute-driven) */
     case VIO_FEATURE_RAYTRACING:

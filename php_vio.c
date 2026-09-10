@@ -2675,6 +2675,28 @@ ZEND_FUNCTION(vio_pipeline)
     if ((val = zend_hash_str_find(config_ht, "slope_scaled_depth_bias", sizeof("slope_scaled_depth_bias") - 1)) != NULL) {
         pipe->slope_scaled_depth_bias = (float)zval_get_double(val);
     }
+    /* Stencil test: 'stencil' => ['func' => VIO_CMP_*, 'ref' => n, 'read_mask' => m,
+     * 'write_mask' => m, 'pass' => VIO_STENCIL_*, 'fail' => VIO_STENCIL_*,
+     * 'depth_fail' => VIO_STENCIL_*]. Giving the array enables the test (unless
+     * 'enabled' => false); missing keys default to ALWAYS / 0 / 0xFF / KEEP, i.e.
+     * a pipeline that writes the reference value everywhere it draws when 'pass'
+     * is REPLACE, and a pure read test when only 'func' + 'ref' are set. */
+    pipe->stencil_func = VIO_CMP_ALWAYS;
+    pipe->stencil_read_mask = 0xFF;
+    pipe->stencil_write_mask = 0xFF;
+    if ((val = zend_hash_str_find(config_ht, "stencil", sizeof("stencil") - 1)) != NULL && Z_TYPE_P(val) == IS_ARRAY) {
+        HashTable *st = Z_ARRVAL_P(val);
+        zval *sv;
+        pipe->stencil_enable = 1;
+        if ((sv = zend_hash_str_find(st, "enabled", sizeof("enabled") - 1)) != NULL) pipe->stencil_enable = zend_is_true(sv) ? 1 : 0;
+        if ((sv = zend_hash_str_find(st, "func", sizeof("func") - 1)) != NULL) pipe->stencil_func = (int)(zval_get_long(sv) & 7);
+        if ((sv = zend_hash_str_find(st, "ref", sizeof("ref") - 1)) != NULL) pipe->stencil_ref = (int)(zval_get_long(sv) & 0xFF);
+        if ((sv = zend_hash_str_find(st, "read_mask", sizeof("read_mask") - 1)) != NULL) pipe->stencil_read_mask = (int)(zval_get_long(sv) & 0xFF);
+        if ((sv = zend_hash_str_find(st, "write_mask", sizeof("write_mask") - 1)) != NULL) pipe->stencil_write_mask = (int)(zval_get_long(sv) & 0xFF);
+        if ((sv = zend_hash_str_find(st, "pass", sizeof("pass") - 1)) != NULL) pipe->stencil_pass_op = (int)(zval_get_long(sv) & 7);
+        if ((sv = zend_hash_str_find(st, "fail", sizeof("fail") - 1)) != NULL) pipe->stencil_fail_op = (int)(zval_get_long(sv) & 7);
+        if ((sv = zend_hash_str_find(st, "depth_fail", sizeof("depth_fail") - 1)) != NULL) pipe->stencil_depth_fail_op = (int)(zval_get_long(sv) & 7);
+    }
     /* Optional 'hdr' flag: when true the PSO's render-target (RTV) format becomes
      * FP16 (R16G16B16A16_FLOAT) instead of the default R8G8B8A8_UNORM. Needed when
      * the pipeline draws into a vio_render_target created with 'hdr' => true, since
@@ -2821,6 +2843,14 @@ ZEND_FUNCTION(vio_pipeline)
         desc.per_attachment = pipe->per_attachment;
         memcpy(desc.attachment_blend, pipe->attachment_blend, sizeof(desc.attachment_blend));
         memcpy(desc.attachment_mask, pipe->attachment_mask, sizeof(desc.attachment_mask));
+        desc.stencil_enable = pipe->stencil_enable;
+        desc.stencil_func = pipe->stencil_func;
+        desc.stencil_ref = pipe->stencil_ref;
+        desc.stencil_read_mask = pipe->stencil_read_mask;
+        desc.stencil_write_mask = pipe->stencil_write_mask;
+        desc.stencil_pass_op = pipe->stencil_pass_op;
+        desc.stencil_fail_op = pipe->stencil_fail_op;
+        desc.stencil_depth_fail_op = pipe->stencil_depth_fail_op;
 
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
     }
@@ -6674,6 +6704,24 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_DEPTH_LESS", VIO_DEPTH_LESS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_DEPTH_LEQUAL", VIO_DEPTH_LEQUAL, CONST_CS | CONST_PERSISTENT);
 
+    /* Stencil: comparison functions + operations (vio_pipeline 'stencil') */
+    REGISTER_LONG_CONSTANT("VIO_CMP_NEVER", VIO_CMP_NEVER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CMP_LESS", VIO_CMP_LESS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CMP_EQUAL", VIO_CMP_EQUAL, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CMP_LEQUAL", VIO_CMP_LEQUAL, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CMP_GREATER", VIO_CMP_GREATER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CMP_NOTEQUAL", VIO_CMP_NOTEQUAL, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CMP_GEQUAL", VIO_CMP_GEQUAL, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CMP_ALWAYS", VIO_CMP_ALWAYS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_STENCIL_KEEP", VIO_STENCIL_KEEP, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_STENCIL_ZERO", VIO_STENCIL_ZERO, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_STENCIL_REPLACE", VIO_STENCIL_REPLACE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_STENCIL_INCR", VIO_STENCIL_INCR, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_STENCIL_DECR", VIO_STENCIL_DECR, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_STENCIL_INVERT", VIO_STENCIL_INVERT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_STENCIL_INCR_WRAP", VIO_STENCIL_INCR_WRAP, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_STENCIL_DECR_WRAP", VIO_STENCIL_DECR_WRAP, CONST_CS | CONST_PERSISTENT);
+
     /* Cursor mode */
     REGISTER_LONG_CONSTANT("VIO_CURSOR_NORMAL", 0, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_CURSOR_DISABLED", 1, CONST_CS | CONST_PERSISTENT);
@@ -6756,6 +6804,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FORMAT_R8", VIO_FORMAT_R8, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STORAGE_IMAGE", VIO_FEATURE_STORAGE_IMAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_STORAGE", VIO_FEATURE_VERTEX_STORAGE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_STENCIL", VIO_FEATURE_STENCIL, CONST_CS | CONST_PERSISTENT);
 
     /* Actions */
     REGISTER_LONG_CONSTANT("VIO_RELEASE", VIO_RELEASE, CONST_CS | CONST_PERSISTENT);
