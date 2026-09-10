@@ -147,4 +147,10 @@ static inline void vio_argb_unpack(uint32_t argb, float *r, float *g, float *b, 
     *b = ((argb      ) & 0xFF) / 255.0f;
 }
 
+
+/* HLSL helper (GAP-PHASE5 Block 6): the 2D pixel shaders share the constant
+ * buffer prelude (projection + output control + PQ encoder); returns a malloc'd
+ * concatenation the caller frees after D3DCompile. */
+char *vio_2d_hlsl_with_cb(const char *ps_body);
+
 #endif /* VIO_2D_H */

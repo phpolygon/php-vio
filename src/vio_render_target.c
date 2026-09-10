@@ -126,6 +126,18 @@ static unsigned char vio_rt_unit_to_byte(float v)
     return (unsigned char)(v * 255.0f + 0.5f);
 }
 
+void vio_rt_rgb10a2_to_rgba8_inplace(unsigned char *buf, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        unsigned char *p = buf + i * 4;
+        uint32_t v; memcpy(&v, p, 4);
+        p[0] = (unsigned char)(((v      ) & 0x3FF) >> 2);
+        p[1] = (unsigned char)(((v >> 10) & 0x3FF) >> 2);
+        p[2] = (unsigned char)(((v >> 20) & 0x3FF) >> 2);
+        p[3] = (unsigned char)(((v >> 30) & 0x3) * 85);
+    }
+}
+
 void vio_rt_convert_to_rgba8(int format, int bgra, const void *src, size_t src_pitch,
                              int w, int h, unsigned char *out)
 {
@@ -144,6 +156,14 @@ void vio_rt_convert_to_rgba8(int format, int bgra, const void *src, size_t src_p
                 case VIO_FORMAT_R8:
                     dst[0] = row[x]; dst[1] = 0; dst[2] = 0; dst[3] = 255;
                     continue;
+                case VIO_FORMAT_RGB10A2: {
+                    uint32_t v; memcpy(&v, row + x * 4, 4);
+                    dst[0] = (unsigned char)(((v      ) & 0x3FF) >> 2);
+                    dst[1] = (unsigned char)(((v >> 10) & 0x3FF) >> 2);
+                    dst[2] = (unsigned char)(((v >> 20) & 0x3FF) >> 2);
+                    dst[3] = (unsigned char)(((v >> 30) & 0x3) * 85);
+                    continue;
+                }
                 case VIO_FORMAT_RGBA16F: {
                     const uint16_t *p = (const uint16_t *)(row + x * 8);
                     r = vio_rt_half_to_float(p[0]); g = vio_rt_half_to_float(p[1]);

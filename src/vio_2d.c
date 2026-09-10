@@ -45,6 +45,19 @@
 
 static void vio_2d_release_owners(vio_2d_state *state);   /* defined next to vio_2d_begin */
 
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
+#include "shaders/shaders_2d.h"
+char *vio_2d_hlsl_with_cb(const char *ps_body)
+{
+    size_t a = strlen(vio_2d_hlsl_cb), b = strlen(ps_body);
+    char *out = malloc(a + b + 1);
+    if (!out) return NULL;
+    memcpy(out, vio_2d_hlsl_cb, a);
+    memcpy(out + a, ps_body, b + 1);
+    return out;
+}
+#endif
+
 /* ── Orthographic projection matrix ──────────────────────────────── */
 
 static void vio_2d_ortho(float *m, float left, float right, float bottom, float top)
@@ -428,11 +441,18 @@ void vio_2d_flush(vio_2d_state *state)
         memcpy(mapped.pData, state->vertices, sizeof(vio_2d_vertex) * state->vertex_count);
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)d3d->vbo, 0);
 
-        /* Upload projection matrix */
+        /* Upload projection matrix + output control (HDR10 PQ flag, paper white) */
         hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)d3d->cb,
                                      0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (FAILED(hr)) return;
-        memcpy(mapped.pData, state->projection, sizeof(float) * 16);
+        {
+            float cb[20];
+            memcpy(cb, state->projection, sizeof(float) * 16);
+            cb[16] = vio_d3d11.hdr_output ? 1.0f : 0.0f;
+            cb[17] = vio_d3d11.hdr_paper_white > 0.0f ? vio_d3d11.hdr_paper_white : 200.0f;
+            cb[18] = 0.0f; cb[19] = 0.0f;
+            memcpy(mapped.pData, cb, sizeof(cb));
+        }
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)d3d->cb, 0);
 
         /* Save current pipeline state for restore */
@@ -461,6 +481,7 @@ void vio_2d_flush(vio_2d_state *state)
         /* Bind vertex shader + constant buffer */
         ID3D11DeviceContext_VSSetShader(ctx, d3d->vs, NULL, 0);
         ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 1, &d3d->cb);
+        ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &d3d->cb);
 
         /* Bind sampler */
         ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &d3d->sampler);
@@ -547,19 +568,27 @@ void vio_2d_flush(vio_2d_state *state)
         UINT vbo_slice_off = vio_d3d12.frame_index * d3d->vbo_slice_size;
         memcpy(d3d->vbo_mapped + vbo_slice_off, state->vertices, sizeof(vio_2d_vertex) * state->vertex_count);
 
-        /* Upload projection matrix via cbuffer heap */
-        UINT cb_aligned = (sizeof(float) * 16 + 255) & ~255;
+        /* Upload projection matrix + output control via cbuffer heap */
+        UINT cb_aligned = (sizeof(float) * 20 + 255) & ~255;
         UINT cb_offset = vio_d3d12.cbuffer_heap_offset;
         if (cb_offset + cb_aligned > vio_d3d12.cbuffer_heap_capacity || !vio_d3d12.cbuffer_heap_mapped) {
             return;
         }
-        memcpy(vio_d3d12.cbuffer_heap_mapped + cb_offset, state->projection, sizeof(float) * 16);
+        {
+            float cb[20];
+            memcpy(cb, state->projection, sizeof(float) * 16);
+            cb[16] = vio_d3d12.hdr_output ? 1.0f : 0.0f;
+            cb[17] = vio_d3d12.hdr_paper_white > 0.0f ? vio_d3d12.hdr_paper_white : 200.0f;
+            cb[18] = 0.0f; cb[19] = 0.0f;
+            memcpy(vio_d3d12.cbuffer_heap_mapped + cb_offset, cb, sizeof(cb));
+        }
         D3D12_GPU_VIRTUAL_ADDRESS cb_gpu = vio_d3d12.cbuffer_heap_gpu + cb_offset;
         vio_d3d12.cbuffer_heap_offset = cb_offset + cb_aligned;
 
         /* Set root signature + cbuffer */
         ID3D12GraphicsCommandList_SetGraphicsRootSignature(cl, vio_d3d12.root_signature);
         ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(cl, 0, cb_gpu);
+        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(cl, 1, cb_gpu);   /* pixel stage reads uOutput */
 
         /* Set descriptor heaps (SRV + sampler tables) */
         vio_d3d12_bind_graphics_heaps(cl);
@@ -608,9 +637,11 @@ void vio_2d_flush(vio_2d_state *state)
                 scissor_custom = 0;
             }
 
-            /* Select PSO */
+            /* Select PSO (format of the bound target: swapchain vs RGBA8 offscreen) */
+            int rgba8_target = d3d->pso_shapes_rgba8 && vio_d3d12.current_rt_format != vio_d3d12.swapchain_format;
             ID3D12PipelineState *wanted_pso = (item->backend_texture)
-                ? d3d->pso_sprites : d3d->pso_shapes;
+                ? (rgba8_target ? d3d->pso_sprites_rgba8 : d3d->pso_sprites)
+                : (rgba8_target ? d3d->pso_shapes_rgba8 : d3d->pso_shapes);
             if (wanted_pso != current_pso) {
                 current_pso = wanted_pso;
                 ID3D12GraphicsCommandList_SetPipelineState(cl, current_pso);

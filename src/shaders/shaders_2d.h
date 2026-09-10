@@ -44,8 +44,21 @@ static const char *vio_2d_fragment_shader_sprites =
 
 /* ── HLSL versions (D3D11 SM 5.0 / D3D12 SM 5.1) ──────────────── */
 
+/* Shared 2D constant buffer: projection + output control. uOutput.x = 1 when the
+ * backbuffer is HDR10 (the pixel shaders PQ-encode their display-referred
+ * colour), uOutput.y = paper-white luminance in nits (GAP-PHASE5 Block 6). */
+static const char *vio_2d_hlsl_cb =
+    "cbuffer CB : register(b0) { float4x4 uProjection; float4 uOutput; };\n"
+    "float3 vio_pq(float3 srgb, float nits) {\n"
+    "    float3 lin = pow(max(srgb, 0.0), 2.2);\n"
+    "    float3 bt2020 = float3(dot(lin, float3(0.6274, 0.3293, 0.0433)), dot(lin, float3(0.0691, 0.9195, 0.0114)), dot(lin, float3(0.0164, 0.0880, 0.8956)));\n"
+    "    float3 y = pow(max(bt2020 * (nits / 10000.0), 0.0), 0.1593017578125);\n"
+    "    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);\n"
+    "}\n"
+    "float4 vio_out(float4 c) { if (uOutput.x > 0.5) c.rgb = vio_pq(c.rgb, uOutput.y > 0.0 ? uOutput.y : 200.0); return c; }\n";
+
 static const char *vio_2d_hlsl_vs =
-    "cbuffer CB : register(b0) { float4x4 uProjection; };\n"
+    "cbuffer CB : register(b0) { float4x4 uProjection; float4 uOutput; };\n"
     "struct VS_IN  { float2 pos : POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };\n"
     "struct VS_OUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };\n"
     "VS_OUT main(VS_IN i) {\n"
@@ -58,14 +71,14 @@ static const char *vio_2d_hlsl_vs =
 
 static const char *vio_2d_hlsl_ps_shapes =
     "struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };\n"
-    "float4 main(PS_IN i) : SV_TARGET { return i.col; }\n";
+    "float4 main(PS_IN i) : SV_TARGET { return vio_out(i.col); }\n";
 
 static const char *vio_2d_hlsl_ps_sprites =
     "Texture2D    uTexture : register(t0);\n"
     "SamplerState uSampler : register(s0);\n"
     "struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };\n"
     "float4 main(PS_IN i) : SV_TARGET {\n"
-    "    return uTexture.Sample(uSampler, i.uv) * i.col;\n"
+    "    return vio_out(uTexture.Sample(uSampler, i.uv) * i.col);\n"
     "}\n";
 
 /* Glyph atlas is an R8 coverage texture (single channel). Sample .r as alpha
@@ -77,7 +90,7 @@ static const char *vio_2d_hlsl_ps_text =
     "struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };\n"
     "float4 main(PS_IN i) : SV_TARGET {\n"
     "    float a = uTexture.Sample(uSampler, i.uv).r;\n"
-    "    return float4(i.col.rgb, i.col.a * a);\n"
+    "    return vio_out(float4(i.col.rgb, i.col.a * a));\n"
     "}\n";
 
 /* ── Vulkan GLSL variants (explicit bindings → SPIR-V) ───────────────

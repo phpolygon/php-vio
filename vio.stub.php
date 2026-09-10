@@ -14,7 +14,10 @@
  *                       pipeline cache: DXBC per HLSL stage on D3D11/D3D12, OpenGL >= 4.1 program
  *                       binaries, the Vulkan pipeline cache — a warm start skips the compiles,
  *                       frame_latency => 1..16: waitable swapchain capping the CPU's run-ahead,
- *                       1 = lowest input latency; D3D11 / D3D12, 0 / absent = driver default)
+ *                       1 = lowest input latency; D3D11 / D3D12, 0 / absent = driver default,
+ *                       hdr_output => true|1|2: HDR10 backbuffer (RGB10A2, ST 2084) on D3D11 / D3D12 when the
+ *                       display is in HDR mode (2 = force); the 2D batch PQ-encodes its output,
+ *                       hdr_paper_white => nits that display white maps to (default 200))
  * @return VioContext|false Context object or false on failure
  */
 function vio_create(string $backend = "auto", array $options = []): VioContext|false {}

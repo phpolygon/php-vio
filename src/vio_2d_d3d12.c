@@ -22,7 +22,7 @@
 #include "shaders/shaders_2d.h"
 
 static ID3D12PipelineState *vio_2d_d3d12_create_pso(
-    ID3DBlob *vs_blob, ID3DBlob *ps_blob, int has_texture)
+    ID3DBlob *vs_blob, ID3DBlob *ps_blob, int has_texture, DXGI_FORMAT rtv_format)
 {
     D3D12_INPUT_ELEMENT_DESC layout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,       0, offsetof(vio_2d_vertex, x), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
@@ -62,7 +62,7 @@ static ID3D12PipelineState *vio_2d_d3d12_create_pso(
     desc.SampleMask = UINT_MAX;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = 1;
-    desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.RTVFormats[0] = rtv_format;   /* swapchain format, or RGBA8 for offscreen targets */
     desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     desc.SampleDesc.Count = 1;
 
@@ -94,7 +94,9 @@ int vio_2d_d3d12_init(vio_2d_d3d12_state *state)
         return -1;
     }
 
-    hr = D3DCompile(vio_2d_hlsl_ps_shapes, strlen(vio_2d_hlsl_ps_shapes), "vio_2d_ps_shapes",
+    char *ps_shapes_src = vio_2d_hlsl_with_cb(vio_2d_hlsl_ps_shapes);
+    char *ps_sprites_src = vio_2d_hlsl_with_cb(vio_2d_hlsl_ps_sprites);
+    hr = D3DCompile(ps_shapes_src, strlen(ps_shapes_src), "vio_2d_ps_shapes",
                      NULL, NULL, "main", "ps_5_1", 0, 0, &ps_shapes_blob, &error_blob);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12 2D PS shapes compile failed: %s",
@@ -104,7 +106,7 @@ int vio_2d_d3d12_init(vio_2d_d3d12_state *state)
         return -1;
     }
 
-    hr = D3DCompile(vio_2d_hlsl_ps_sprites, strlen(vio_2d_hlsl_ps_sprites), "vio_2d_ps_sprites",
+    hr = D3DCompile(ps_sprites_src, strlen(ps_sprites_src), "vio_2d_ps_sprites",
                      NULL, NULL, "main", "ps_5_1", 0, 0, &ps_sprites_blob, &error_blob);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12 2D PS sprites compile failed: %s",
@@ -116,8 +118,16 @@ int vio_2d_d3d12_init(vio_2d_d3d12_state *state)
     }
 
     /* ── Create PSOs ─────────────────────────────────────────────── */
-    state->pso_shapes  = vio_2d_d3d12_create_pso(vs_blob, ps_shapes_blob, 0);
-    state->pso_sprites = vio_2d_d3d12_create_pso(vs_blob, ps_sprites_blob, 1);
+    free(ps_shapes_src); free(ps_sprites_src);
+    /* PSOs for the swapchain format, plus an RGBA8 pair when the swapchain is
+     * HDR10 (RGB10A2) so 2D draws into offscreen RGBA8 targets keep matching. */
+    DXGI_FORMAT sc_fmt = vio_d3d12.swapchain_format ? vio_d3d12.swapchain_format : DXGI_FORMAT_R8G8B8A8_UNORM;
+    state->pso_shapes  = vio_2d_d3d12_create_pso(vs_blob, ps_shapes_blob, 0, sc_fmt);
+    state->pso_sprites = vio_2d_d3d12_create_pso(vs_blob, ps_sprites_blob, 1, sc_fmt);
+    if (sc_fmt != DXGI_FORMAT_R8G8B8A8_UNORM) {
+        state->pso_shapes_rgba8  = vio_2d_d3d12_create_pso(vs_blob, ps_shapes_blob, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+        state->pso_sprites_rgba8 = vio_2d_d3d12_create_pso(vs_blob, ps_sprites_blob, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
 
     ID3D10Blob_Release(vs_blob);
     ID3D10Blob_Release(ps_shapes_blob);
@@ -187,6 +197,8 @@ void vio_2d_d3d12_shutdown(vio_2d_d3d12_state *state)
     }
     if (state->pso_sprites) ID3D12PipelineState_Release(state->pso_sprites);
     if (state->pso_shapes)  ID3D12PipelineState_Release(state->pso_shapes);
+    if (state->pso_sprites_rgba8) ID3D12PipelineState_Release(state->pso_sprites_rgba8);
+    if (state->pso_shapes_rgba8)  ID3D12PipelineState_Release(state->pso_shapes_rgba8);
     memset(state, 0, sizeof(vio_2d_d3d12_state));
 }
 

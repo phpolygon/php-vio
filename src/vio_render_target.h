@@ -160,6 +160,8 @@ int  vio_rt_format_bpp(int format);
 /* Convert w*h pixels of `format` (row pitch src_pitch bytes) into top-down
  * RGBA8. Floats are clamped to [0,1]; missing channels read 0 (G/B) and 1 (A).
  * bgra = 1 for 8-bit sources stored B,G,R,A (Metal's BGRA8Unorm targets). */
+/* Expand packed R10G10B10A2 pixels to RGBA8 in place (count pixels of 4 bytes). */
+void vio_rt_rgb10a2_to_rgba8_inplace(unsigned char *buf, size_t count);
 void vio_rt_convert_to_rgba8(int format, int bgra, const void *src, size_t src_pitch,
                              int w, int h, unsigned char *out);
 
