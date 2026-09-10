@@ -717,9 +717,16 @@ void vio_2d_flush(vio_2d_state *state)
         VkDeviceSize vb_off = slice_off;
         vkCmdBindVertexBuffers(cmd, 0, 1, &vk->vbo, &vb_off);
 
-        /* Projection mat4 via vertex-stage push constant (64 bytes). */
-        vkCmdPushConstants(cmd, vk->pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-                           0, sizeof(float) * 16, state->projection);
+        /* Projection mat4 + output control (HDR10 PQ flag, paper white) via push constant. */
+        {
+            float pcd[20];
+            memcpy(pcd, state->projection, sizeof(float) * 16);
+            pcd[16] = vio_vk.hdr_output ? 1.0f : 0.0f;
+            pcd[17] = vio_vk.hdr_paper_white > 0.0f ? vio_vk.hdr_paper_white : 200.0f;
+            pcd[18] = 0.0f; pcd[19] = 0.0f;
+            vkCmdPushConstants(cmd, vk->pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pcd), pcd);
+        }
 
         /* Default scissor = full render area. */
         VkRect2D full_scissor = {0};

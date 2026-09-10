@@ -256,6 +256,12 @@ typedef struct _vio_vulkan_state {
     int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
     int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
     void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */
+    /* HDR10 output (GAP-PHASE5 Block 10d): vio_create(['hdr_output' => 1|2]). */
+    int                      hdr_request;          /* 0 off, 1 when the surface offers HDR10 ST 2084, 2 forced 10-bit */
+    int                      hdr_output;           /* 1 => 10-bit swapchain, the 2D batch PQ-encodes */
+    int                      hdr10_capable;        /* the surface lists a 10-bit UNORM format */
+    int                      colorspace_ext;       /* VK_EXT_swapchain_colorspace enabled on the instance */
+    float                    hdr_paper_white;      /* nits for PQ encoding (default 200) */
     /* Headless frame capture (Block 10): every presented frame is copied into
      * capture_buf in its own command buffer; vio_read_pixels maps it. */
     int                      headless;

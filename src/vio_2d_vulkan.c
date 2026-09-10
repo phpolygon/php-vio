@@ -218,11 +218,11 @@ int vio_2d_vulkan_init(vio_2d_vulkan_state *state)
         return -1;
     }
 
-    /* 3. Pipeline layout: 1 set + a 64-byte vertex-stage push constant (mat4). */
+    /* 3. Pipeline layout: 1 set + an 80-byte push constant (mat4 projection, vec4 output control). */
     VkPushConstantRange pc = {0};
-    pc.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pc.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;   /* uOutput is read by the fragment stage (Block 10d) */
     pc.offset     = 0;
-    pc.size       = sizeof(float) * 16;
+    pc.size       = sizeof(float) * 20;
 
     VkPipelineLayoutCreateInfo pl_info = {0};
     pl_info.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;

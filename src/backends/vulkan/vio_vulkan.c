@@ -117,6 +117,21 @@ static int create_instance(int debug)
     if (debug) {
         extra_exts[extra_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     }
+    /* HDR10 colour spaces for the swapchain (Block 10d), when the loader has them. */
+    vio_vk.colorspace_ext = 0;
+    {
+        uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
+        VkExtensionProperties *props = n ? (VkExtensionProperties *)malloc(n * sizeof(VkExtensionProperties)) : NULL;
+        if (props) {
+            vkEnumerateInstanceExtensionProperties(NULL, &n, props);
+            for (uint32_t i = 0; i < n; i++) {
+                if (strcmp(props[i].extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0) vio_vk.colorspace_ext = 1;
+            }
+            free(props);
+        }
+        if (vio_vk.colorspace_ext) extra_exts[extra_count++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
+    }
 #ifdef __APPLE__
     /* MoltenVK requires the portability enumeration extension + flag */
     extra_exts[extra_count++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
@@ -485,30 +500,86 @@ static void cleanup_swapchain(void)
     vio_vk.swapchain_image_count = 0;
 }
 
+/* Surface format (Block 10d). SDR: B8G8R8A8_UNORM / sRGB non-linear, so vertex
+ * colours land exactly as on the other backends. hdr_output => 1 takes a 10-bit
+ * format in HDR10 ST 2084 when the surface offers it; => 2 forces a 10-bit
+ * format (ST 2084 preferred, otherwise sRGB-interpreted) so the PQ path runs on
+ * an SDR desktop too. Deterministic, so the render pass created at setup and
+ * every swapchain recreation agree. */
+static int vk_is_10bit(VkFormat f)
+{
+    return f == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+}
+
+static VkSurfaceFormatKHR vk_choose_surface_format(void)
+{
+    uint32_t n = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(vio_vk.physical_device, vio_vk.surface, &n, NULL);
+    VkSurfaceFormatKHR *formats = n ? (VkSurfaceFormatKHR *)malloc(n * sizeof(VkSurfaceFormatKHR)) : NULL;
+    VkSurfaceFormatKHR chosen = { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+    if (!formats) return chosen;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(vio_vk.physical_device, vio_vk.surface, &n, formats);
+    int sdr = -1, hdr10 = -1, forced = -1;
+    for (uint32_t i = 0; i < n; i++) {
+        if (sdr < 0 && formats[i].format == VK_FORMAT_B8G8R8A8_UNORM && formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) sdr = (int)i;
+        if (!vk_is_10bit(formats[i].format)) continue;
+        if (hdr10 < 0 && formats[i].colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) hdr10 = (int)i;
+        if (forced < 0 && formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) forced = (int)i;
+    }
+    vio_vk.hdr10_capable = hdr10 >= 0 || forced >= 0;
+    vio_vk.hdr_output = 0;
+    int pick = sdr >= 0 ? sdr : 0;
+    if (vio_vk.hdr_request >= 1 && hdr10 >= 0) {
+        pick = hdr10;
+        vio_vk.hdr_output = 1;
+    } else if (vio_vk.hdr_request == 2 && forced >= 0) {
+        pick = forced;
+        vio_vk.hdr_output = 1;
+    }
+    chosen = formats[pick];
+    free(formats);
+    return chosen;
+}
+
+/* Swapchain pixel (4 bytes as stored) to RGBA8. */
+static void vk_swapchain_pixel_to_rgba8(const unsigned char *p, unsigned char *d)
+{
+    VkFormat f = vio_vk.swapchain_format;
+    if (vk_is_10bit(f)) {
+        uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        uint32_t lo = v & 0x3FFu, mid = (v >> 10) & 0x3FFu, hi = (v >> 20) & 0x3FFu, a = (v >> 30) & 3u;
+        uint32_t r = f == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? lo : hi;
+        uint32_t b = f == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? hi : lo;
+        d[0] = (unsigned char)(r >> 2);     /* same expansion as vio_rt_rgb10a2_to_rgba8_inplace (D3D) */
+        d[1] = (unsigned char)(mid >> 2);
+        d[2] = (unsigned char)(b >> 2);
+        d[3] = (unsigned char)(a * 85u);
+        return;
+    }
+    int bgra = f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB;
+    d[0] = bgra ? p[2] : p[0];
+    d[1] = p[1];
+    d[2] = bgra ? p[0] : p[2];
+    d[3] = p[3];
+}
+
+static void vulkan_swapchain_info(vio_swapchain_info *out)
+{
+    out->buffer_count  = (int)vio_vk.swapchain_image_count;
+    out->frame_latency = 0;
+    out->waitable      = 0;
+    out->hdr_output    = vio_vk.hdr_output;
+    out->format        = vk_is_10bit(vio_vk.swapchain_format) ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
+    out->shader_model  = 0;
+}
+
 static int create_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vio_vk.physical_device, vio_vk.surface, &caps);
 
-    /* Choose format */
-    uint32_t fmt_count;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(vio_vk.physical_device, vio_vk.surface, &fmt_count, NULL);
-    VkSurfaceFormatKHR *formats = malloc(fmt_count * sizeof(VkSurfaceFormatKHR));
-    vkGetPhysicalDeviceSurfaceFormatsKHR(vio_vk.physical_device, vio_vk.surface, &fmt_count, formats);
-
-    /* Prefer B8G8R8A8_UNORM (linear) so vertex colors land in the swapchain
-     * identically to the other backends (D3D12 uses an UNORM target). An sRGB
-     * swapchain would gamma-encode the same colors and shift them brighter,
-     * making golden-image parity impossible. */
-    VkSurfaceFormatKHR chosen_format = formats[0];
-    for (uint32_t i = 0; i < fmt_count; i++) {
-        if (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM &&
-            formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-            chosen_format = formats[i];
-            break;
-        }
-    }
-    free(formats);
+    /* Choose format (SDR B8G8R8A8, or 10-bit for hdr_output, Block 10d) */
+    VkSurfaceFormatKHR chosen_format = vk_choose_surface_format();
 
     /* Choose present mode */
     uint32_t pm_count;
@@ -873,6 +944,8 @@ int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
     vio_vk.clear_a = 1.0f;
     vio_vk.vsync   = cfg->vsync;   /* read by create_swapchain (present mode) */
     vio_vk.headless = cfg->headless;
+    vio_vk.hdr_request = cfg->hdr_output;
+    vio_vk.hdr_paper_white = cfg->hdr_paper_white > 0.0f ? cfg->hdr_paper_white : 200.0f;
 
     /* 1. Instance */
     if (create_instance(cfg->debug) != 0) return -1;
@@ -902,19 +975,7 @@ int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
     /* 6. Render pass. The color format MUST match the swapchain format chosen
      * in create_swapchain() (B8G8R8A8_UNORM preferred) so the framebuffers and
      * the 2D pipelines are render-pass-compatible. */
-    uint32_t fmt_count = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(vio_vk.physical_device, vio_vk.surface, &fmt_count, NULL);
-    VkSurfaceFormatKHR *formats = malloc(fmt_count * sizeof(VkSurfaceFormatKHR));
-    vkGetPhysicalDeviceSurfaceFormatsKHR(vio_vk.physical_device, vio_vk.surface, &fmt_count, formats);
-    VkFormat color_format = formats[0].format;
-    for (uint32_t i = 0; i < fmt_count; i++) {
-        if (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM &&
-            formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-            color_format = formats[i].format;
-            break;
-        }
-    }
-    free(formats);
+    VkFormat color_format = vk_choose_surface_format().format;
 
     if (create_render_pass(color_format) != 0) return -1;
 
@@ -2629,7 +2690,6 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
         vkDeviceWaitIdle(vio_vk.device);
         unsigned char *src = (unsigned char *)vio_vma_map(vio_vk.vma_allocator, vio_vk.capture_alloc);
         if (!src) return -1;
-        int bgra = vio_vk.swapchain_format == VK_FORMAT_B8G8R8A8_UNORM || vio_vk.swapchain_format == VK_FORMAT_B8G8R8A8_SRGB;
         uint32_t cw = vio_vk.capture_w, ch = vio_vk.capture_h;
         uint32_t rw = (uint32_t)width < cw ? (uint32_t)width : cw;
         uint32_t rh = (uint32_t)height < ch ? (uint32_t)height : ch;
@@ -2638,10 +2698,7 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
             for (uint32_t x = 0; x < rw; x++) {
                 const unsigned char *p = src + ((size_t)y * cw + x) * 4;
                 unsigned char *d = out + ((size_t)y * (uint32_t)width + x) * 4;
-                d[0] = bgra ? p[2] : p[0];
-                d[1] = p[1];
-                d[2] = bgra ? p[0] : p[2];
-                d[3] = p[3];
+                vk_swapchain_pixel_to_rgba8(p, d);
             }
         }
         vio_vma_unmap(vio_vk.vma_allocator, vio_vk.capture_alloc);
@@ -2654,7 +2711,8 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
     if (!(vio_vk.swapchain_format == VK_FORMAT_B8G8R8A8_UNORM ||
           vio_vk.swapchain_format == VK_FORMAT_R8G8B8A8_UNORM ||
           vio_vk.swapchain_format == VK_FORMAT_B8G8R8A8_SRGB ||
-          vio_vk.swapchain_format == VK_FORMAT_R8G8B8A8_SRGB)) {
+          vio_vk.swapchain_format == VK_FORMAT_R8G8B8A8_SRGB ||
+          vk_is_10bit(vio_vk.swapchain_format))) {
         php_error_docref(NULL, E_WARNING,
             "vio_read_pixels: unsupported swapchain format %d for readback",
             (int)vio_vk.swapchain_format);
@@ -2853,8 +2911,6 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
         php_error_docref(NULL, E_WARNING, "vio_read_pixels: failed to map Vulkan readback buffer");
         rc = -1;
     } else {
-        const int swizzle_br = (vio_vk.swapchain_format == VK_FORMAT_B8G8R8A8_UNORM ||
-                                vio_vk.swapchain_format == VK_FORMAT_B8G8R8A8_SRGB);
         const unsigned char *srcp = (const unsigned char *)mapped;
         unsigned char *dst = (unsigned char *)out_rgba;
 
@@ -2868,18 +2924,7 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
         for (uint32_t y = 0; y < copy_h; y++) {
             const unsigned char *srow = srcp + (size_t)y * row_bytes;
             unsigned char       *drow = dst  + (size_t)y * dst_stride;
-            if (swizzle_br) {
-                for (uint32_t x = 0; x < copy_w; x++) {
-                    const unsigned char *sp = srow + (size_t)x * 4;
-                    unsigned char       *dp = drow + (size_t)x * 4;
-                    dp[0] = sp[2]; /* R <- B */
-                    dp[1] = sp[1]; /* G       */
-                    dp[2] = sp[0]; /* B <- R */
-                    dp[3] = sp[3]; /* A       */
-                }
-            } else {
-                memcpy(drow, srow, (size_t)copy_w * 4);
-            }
+            for (uint32_t x = 0; x < copy_w; x++) vk_swapchain_pixel_to_rgba8(srow + (size_t)x * 4, drow + (size_t)x * 4);
         }
         vio_vma_unmap(vio_vk.vma_allocator, rb_alloc);
     }
@@ -2954,6 +2999,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_vk3d_available(); /* 2D array views, stored chains (Block 10c) */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return vio_vk3d_available() && (!vio_vk.device || vio_vk.bc_supported); /* textureCompressionBC */
         case VIO_FEATURE_SHADING_RATE:   return vio_vk3d_available() && vio_vk.vrs_supported; /* VK_KHR_fragment_shading_rate, pipeline rate */
+        case VIO_FEATURE_HDR_OUTPUT:     return vio_vk.device && vio_vk.hdr10_capable; /* 10-bit surface format, ST 2084 via VK_EXT_swapchain_colorspace (Block 10d) */
         default: return 0;
     }
 }
@@ -2996,6 +3042,7 @@ static const vio_backend vulkan_backend = {
     .destroy_cubemap   = vio_vk_destroy_cubemap,
     .bind_cubemap      = vio_vk_bind_cubemap,
     .set_shading_rate  = vio_vk_set_shading_rate,
+    .swapchain_info    = vulkan_swapchain_info,
     .present           = vulkan_present,
     .clear             = vulkan_clear,
     .gpu_flush         = NULL,
