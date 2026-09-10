@@ -1,3 +1,10 @@
+# [2.21.0](https://github.com/phpolygon/php-vio/compare/v2.20.0...v2.21.0) (2026-09-10)
+
+
+### Features
+
+* **vulkan:** 3D pipeline (GAP-PHASE5 Block 10a) ([4a1d705](https://github.com/phpolygon/php-vio/commit/4a1d705a14e390b95137e745a215757c5275df8f))
+
 # [2.20.0](https://github.com/phpolygon/php-vio/compare/v2.19.0...v2.20.0) (2026-09-10)
 
 
