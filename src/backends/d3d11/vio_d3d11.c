@@ -745,6 +745,9 @@ static void *d3d11_create_buffer(vio_buffer_desc *desc)
             } else {
                 /* Raw byte-address view: ByteWidth must be a multiple of 4. */
                 bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+                /* vio_draw_indirect() argument buffer (raw only — D3D11 forbids the
+                 * flag on structured buffers). */
+                if (desc->indirect) bd.MiscFlags |= D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
                 bd.ByteWidth = (bd.ByteWidth + 3u) & ~3u;
                 buf->size = bd.ByteWidth;
             }
@@ -2177,6 +2180,31 @@ static void d3d11_draw_instanced_from_storage(void *mesh_obj, int instance_count
     d3d11_release_vs_storage_srv();
 }
 
+/* Indirect draw (GAP-PHASE5 Block 8): one DrawIndexedInstancedIndirect /
+ * DrawInstancedIndirect per record (D3D11 has no multi-draw). */
+static void d3d11_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
+    vio_d3d11_buffer *args = (vio_d3d11_buffer *)args_buffer;
+    if (!vio_d3d11.initialized || !mesh || !args || !args->buffer || max_draws <= 0) return;
+    vio_d3d11_buffer *vb = (vio_d3d11_buffer *)mesh->backend_vb;
+    if (!vb) return;
+    d3d11_bind_vertex_slots(vb->buffer, (UINT)mesh->stride);
+    if (mesh->index_count > 0 && mesh->backend_ib) {
+        vio_d3d11_buffer *ib = (vio_d3d11_buffer *)mesh->backend_ib;
+        ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
+                                             mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
+        for (int i = 0; i < max_draws; i++) {
+            ID3D11DeviceContext_DrawIndexedInstancedIndirect(vio_d3d11.context, args->buffer, (UINT)(offset + (size_t)i * 20));
+        }
+    } else {
+        for (int i = 0; i < max_draws; i++) {
+            ID3D11DeviceContext_DrawInstancedIndirect(vio_d3d11.context, args->buffer, (UINT)(offset + (size_t)i * 16));
+        }
+    }
+    d3d11_release_vs_storage_srv();
+}
+
 static void d3d11_present(void)
 {
     if (!vio_d3d11.swapchain) return;
@@ -2721,6 +2749,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d11.ts_available; /* TIMESTAMP + DISJOINT query ring */
         case VIO_FEATURE_FRAME_LATENCY:       return 1; /* FRAME_LATENCY_WAITABLE_OBJECT swapchain */
         case VIO_FEATURE_HDR_OUTPUT:          return 1; /* RGB10A2 + SetColorSpace1(ST 2084) */
+        case VIO_FEATURE_INDIRECT_DRAW:       return 1; /* Draw(Indexed)InstancedIndirect, args buffer with DRAWINDIRECT_ARGS */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice TEXTURECUBE + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* ID3D11DeviceContext::GenerateMips */
         case VIO_FEATURE_CUBEMAP:      return 1;
@@ -2907,6 +2936,7 @@ static const vio_backend d3d11_backend = {
     .supports_feature  = d3d11_supports_feature,
     .gpu_frame_time    = d3d11_gpu_frame_time,
     .swapchain_info    = d3d11_swapchain_info,
+    .draw_indirect     = d3d11_draw_indirect,
     .destroy_cubemap   = d3d11_destroy_cubemap,
     .destroy_font_atlas = d3d11_destroy_font_atlas,
     .destroy_render_target = d3d11_destroy_render_target,

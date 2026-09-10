@@ -248,6 +248,10 @@ typedef enum _vio_feature {
      * the 2D batch PQ-encoding its output; vio_swapchain_info()['hdr_output']
      * says whether it is active. */
     VIO_FEATURE_HDR_OUTPUT         = 34,
+    /* vio_draw_indirect(): draw arguments (index/vertex count, instance count,
+     * offsets) read from a storage buffer a compute pass wrote — GPU culling /
+     * LOD selection without a CPU round trip. */
+    VIO_FEATURE_INDIRECT_DRAW      = 35,
 } vio_feature;
 
 /* ── Input actions ────────────────────────────────────────────────── */
@@ -391,6 +395,9 @@ typedef struct _vio_buffer_desc {
     int             stride;   /* element stride in bytes for STORAGE buffers
                                  (StructuredBuffer StructureByteStride). 0 (default)
                                  => treat as raw/4-byte elements. */
+    int             indirect; /* STORAGE buffer that vio_draw_indirect() reads its
+                                 draw arguments from (D3D11 needs the flag at
+                                 creation; raw / stride <= 4 only). */
 } vio_buffer_desc;
 
 /* Colour attachment formats for render targets (vio_render_target

@@ -1637,6 +1637,30 @@ static void opengl_draw_instanced_from_storage(void *mesh_obj, int instance_coun
     glBindVertexArray(0);
 }
 
+/* Indirect draw (GAP-PHASE5 Block 8, GL >= 4.0): the SSBO doubles as the
+ * GL_DRAW_INDIRECT_BUFFER; one glDraw*Indirect per record (multi-draw needs 4.3,
+ * the loop keeps 4.0 contexts covered). */
+static void opengl_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
+    vio_opengl_compute_buffer *args = (vio_opengl_compute_buffer *)args_buffer;
+    if (!vio_gl.initialized || !GLAD_GL_VERSION_4_0 || !mesh || !args || !args->ssbo || max_draws <= 0) return;
+    glBindVertexArray(mesh->vao);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, args->ssbo);
+    if (mesh->index_count > 0) {
+        GLenum type = mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
+        for (int i = 0; i < max_draws; i++) {
+            glDrawElementsIndirect(GL_TRIANGLES, type, (const void *)(uintptr_t)(offset + (size_t)i * 20));
+        }
+    } else {
+        for (int i = 0; i < max_draws; i++) {
+            glDrawArraysIndirect(GL_TRIANGLES, (const void *)(uintptr_t)(offset + (size_t)i * 16));
+        }
+    }
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
 static int gl_has_ext(const char *name);   /* defined with the caps setup below */
 
 static int opengl_upload_texture_2d(void *tex_obj,
@@ -1996,6 +2020,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_MSAA:   return 1;
         case VIO_FEATURE_STENCIL:        return 1;             /* DEPTH24_STENCIL8 attachments + glStencil* state */
         case VIO_FEATURE_GPU_TIMESTAMP:  return opengl_has_timer_query(); /* GL_TIMESTAMP queries, core 3.3 */
+        case VIO_FEATURE_INDIRECT_DRAW:  return vio_gl.initialized && GLAD_GL_VERSION_4_0; /* glDraw*Indirect */
         case VIO_FEATURE_CUBEMAP:        return 1;
         case VIO_FEATURE_DEPTH_BIAS:     return 1;
         case VIO_FEATURE_SCISSOR:        return 1;
@@ -2056,6 +2081,7 @@ static const vio_backend opengl_backend = {
     .draw_instanced_from_storage  = opengl_draw_instanced_from_storage,
     .supports_feature  = opengl_supports_feature,
     .gpu_frame_time    = opengl_gpu_frame_time,
+    .draw_indirect     = opengl_draw_indirect,
     .set_viewport      = opengl_set_viewport,
     .set_uniform       = opengl_set_uniform,
     .destroy_buffer_obj    = opengl_destroy_buffer_obj,

@@ -1204,6 +1204,8 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.root_signature) ID3D12RootSignature_Release(vio_d3d12.root_signature);
     if (vio_d3d12.compute_root_signature) ID3D12RootSignature_Release(vio_d3d12.compute_root_signature);
     if (vio_d3d12.compute_srv_heap) ID3D12DescriptorHeap_Release(vio_d3d12.compute_srv_heap);
+    if (vio_d3d12.cmdsig_indexed) ID3D12CommandSignature_Release(vio_d3d12.cmdsig_indexed);
+    if (vio_d3d12.cmdsig_plain)   ID3D12CommandSignature_Release(vio_d3d12.cmdsig_plain);
     if (vio_d3d12.ts_readback)    ID3D12Resource_Release(vio_d3d12.ts_readback);
     if (vio_d3d12.ts_heap)        ID3D12QueryHeap_Release(vio_d3d12.ts_heap);
     if (vio_d3d12.fence)          ID3D12Fence_Release(vio_d3d12.fence);
@@ -3614,6 +3616,7 @@ static void d3d12_begin_frame(void)
     }
 
     vio_d3d12.in_frame = 1;
+    vio_d3d12.frame_serial++;   /* indirect-draw UAV tracking (Block 8) */
 
     /* Reset command allocator and command list */
     ID3D12CommandAllocator_Reset(frame->cmd_allocator);
@@ -4644,6 +4647,7 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     /* UAVs (same raw-vs-structured logic as SRVs). */
     for (int i = 0; i < cp->uav_count; i++) {
         vio_d3d12_compute_binding *b = &cp->uavs[i];
+        if (in_frame_async && b->buffer) b->buffer->uav_live_serial = vio_d3d12.frame_serial;   /* UAV on this frame's list (Block 8) */
         if (!b->buffer || !b->buffer->resource) continue;
         int rel = b->slot - uav_reg_base;        /* heap-offset within the UAV region */
         if (rel < 0 || rel >= VIO_D3D12_COMPUTE_MAX_BINDINGS) continue;
@@ -4907,6 +4911,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d12.ts_heap != NULL; /* timestamp query heap + readback ring */
         case VIO_FEATURE_FRAME_LATENCY:       return 1; /* FRAME_LATENCY_WAITABLE_OBJECT swapchain */
         case VIO_FEATURE_HDR_OUTPUT:          return 1; /* RGB10A2 + SetColorSpace1(ST 2084), PSO format variants */
+        case VIO_FEATURE_INDIRECT_DRAW:       return 1; /* ExecuteIndirect with DrawIndexed / Draw signatures */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* CPU box filter + re-upload (GAP-PLAN 2.3) */
         case VIO_FEATURE_CUBEMAP:      return 1;
@@ -4976,6 +4981,79 @@ static void d3d12_draw_instanced_from_storage(void *mesh_obj, int instance_count
 }
 
 /* ── State binding ────────────────────────────────────────────────── */
+
+/* Indirect draw (GAP-PHASE5 Block 8): ExecuteIndirect with a DrawIndexed / Draw
+ * command signature over max_draws records of the argument buffer. */
+static ID3D12CommandSignature *d3d12_indirect_signature(int indexed)
+{
+    ID3D12CommandSignature **slot = indexed ? &vio_d3d12.cmdsig_indexed : &vio_d3d12.cmdsig_plain;
+    if (*slot) return *slot;
+    D3D12_INDIRECT_ARGUMENT_DESC arg = {0};
+    arg.Type = indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_COMMAND_SIGNATURE_DESC sd = {0};
+    sd.ByteStride = indexed ? 20 : 16;
+    sd.NumArgumentDescs = 1;
+    sd.pArgumentDescs = &arg;
+    if (FAILED(ID3D12Device_CreateCommandSignature(vio_d3d12.device, &sd, NULL, &IID_ID3D12CommandSignature, (void **)slot))) {
+        *slot = NULL;
+    }
+    return *slot;
+}
+
+static void d3d12_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
+{
+    vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
+    vio_d3d12_buffer *args = (vio_d3d12_buffer *)args_buffer;
+    if (!vio_d3d12.initialized || !vio_d3d12.cmd_list || !mesh || !args || !args->resource || max_draws <= 0) return;
+    vio_d3d12_buffer *vb = (vio_d3d12_buffer *)mesh->backend_vb;
+    if (!vb) return;
+    int indexed = mesh->index_count > 0 && mesh->backend_ib;
+    ID3D12CommandSignature *sig = d3d12_indirect_signature(indexed);
+    if (!sig) return;
+
+    D3D12_VERTEX_BUFFER_VIEW vbvs[2];
+    vbvs[0].BufferLocation = vb->gpu_address;
+    vbvs[0].SizeInBytes = (UINT)vb->size;
+    vbvs[0].StrideInBytes = (UINT)mesh->stride;
+    vbvs[1].BufferLocation = vio_d3d12.identity_instance_gpu;
+    vbvs[1].SizeInBytes = 64;
+    vbvs[1].StrideInBytes = 64;
+    ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 2, vbvs);
+    if (indexed) {
+        vio_d3d12_buffer *ib = (vio_d3d12_buffer *)mesh->backend_ib;
+        D3D12_INDEX_BUFFER_VIEW ibv = {0};
+        ibv.BufferLocation = ib->gpu_address;
+        ibv.SizeInBytes = (UINT)ib->size;
+        ibv.Format = mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+        ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
+    }
+
+    /* A buffer an async dispatch wrote on this frame's list sits in UNORDERED_ACCESS;
+     * ExecuteIndirect needs INDIRECT_ARGUMENT (COMMON / GENERIC_READ promote by
+     * themselves). Flush the UAV writes, transition, draw, transition back. */
+    int live_uav = args->uav_live_serial != 0 && args->uav_live_serial == vio_d3d12.frame_serial;
+    if (live_uav) {
+        D3D12_RESOURCE_BARRIER b[2] = {0};
+        b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b[0].UAV.pResource = args->resource;
+        b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[1].Transition.pResource = args->resource;
+        b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 2, b);
+    }
+    ID3D12GraphicsCommandList_ExecuteIndirect(vio_d3d12.cmd_list, sig, (UINT)max_draws, args->resource, (UINT64)offset, NULL, 0);
+    if (live_uav) {
+        D3D12_RESOURCE_BARRIER b = {0};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = args->resource;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &b);
+    }
+}
 
 static void d3d12_set_uniform(const char *name, const void *data, int count, int type)
 {
@@ -5291,6 +5369,7 @@ static const vio_backend d3d12_backend = {
     .supports_feature  = d3d12_supports_feature,
     .gpu_frame_time    = d3d12_gpu_frame_time,
     .swapchain_info    = d3d12_swapchain_info,
+    .draw_indirect     = d3d12_draw_indirect,
     .destroy_cubemap   = d3d12_destroy_cubemap,
     .upload_cubemap    = d3d12_upload_cubemap,
     .read_render_target = d3d12_read_render_target,

@@ -97,6 +97,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 |---|---|
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
 | `tests/render3d/112` | Blend und Write-Mask je Attachment auf einer MRT-Pipeline: Attachment 0 alpha-blendet, Attachment 1 (Maske 0) bleibt unberührt, Attachment 2 schreibt nur den Rotkanal – der Vertrag für einen Transparent-Pass in ein G-Buffer-Target. |
+| `tests/render3d/120` | Indirect Draw: zwei Argument-Records (instanceCount 1 / 0) aus einem Storage-Buffer zeichnen genau einen Quad; unindiziertes Mesh mit 4-uint32-Records; ein Compute-Pass, der instanceCount schreibt, steuert den Draw ohne Readback. |
 | `tests/core/119` | `shader_model => 6` auf D3D12 (dxcompiler/dxil aus `dxc_dir`, dem Windows-SDK oder dem Suchpfad): `vio_swapchain_info` meldet 6, Grafik- und Compute-Shader laufen als DXIL; ohne DXC ehrlicher Fallback auf 5. |
 | `tests/core/118` | HDR10-Ausgabe erzwungen (`hdr_output => 2`): D3D11/D3D12 melden Format RGB10A2 + `hdr_output`, ein weisses 2D-Rechteck kommt PQ-kodiert hell zurueck (Readback expandiert 10 Bit), 3D-Draws laufen ueber die PSO-Format-Variante. |
 | `tests/core/117` | `frame_latency => 1`: D3D11/D3D12 melden `waitable` + Latenz 1 in `vio_swapchain_info`, Frames laufen; Backends ohne Feature melden 0 und ignorieren die Option. |
@@ -170,6 +171,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Blend/Write-Mask je Attachment (`attachment_blend`, `attachment_color_mask`) | ✅ (GL ≥ 4.0, indexed) | ✅ (IndependentBlend) | ✅ (IndependentBlend) | ❌ | ✅ (per colorAttachment) |
 | uint16-Indices (automatisch, `vio_mesh_index_bytes`) | ✅ | ✅ (R16_UINT) | ✅ (R16_UINT) | — | ✅ (MTLIndexTypeUInt16) |
 | Shader-/Pipeline-Cache auf Platte (`vio_create(['shader_cache' => dir])`, `vio_shader_cache_stats`) | ✅ (GL ≥ 4.1 Program-Binary) | ✅ (DXBC je Stage) | ✅ (DXBC je Stage) | ✅ (`VkPipelineCache`) | — (Metal cacht selbst) |
+| Indirect Draw (`vio_draw_indirect`, `vio_storage_buffer(['indirect' => true])`, `VIO_FEATURE_INDIRECT_DRAW`) | ✅ (GL ≥ 4.0 `glDraw*Indirect`) | ✅ (`Draw*InstancedIndirect`) | ✅ (`ExecuteIndirect`) | ❌ (Block 10) | ✅ (`indirectBuffer:`) |
 | Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Fallback FXC 5.1) | — | — |
 | HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | — (Block 10) | — |
 | Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | — (3 Drawables) |
@@ -730,7 +732,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 120 (109/110 gehören dem Branch feat/geometry-tessellation-stages, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 121 (109/110 gehören dem Branch feat/geometry-tessellation-stages, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.

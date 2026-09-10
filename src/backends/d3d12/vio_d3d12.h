@@ -122,6 +122,11 @@ typedef struct _vio_d3d12_buffer {
      * can Map+memcpy without re-running the GPU. Lazily created on first read. */
     ID3D12Resource  *readback_resource;
     size_t           readback_size;    /* valid bytes currently in readback_resource */
+    /* Frame serial in which an in-frame async dispatch last used this buffer
+     * as a UAV: the resource is then in UNORDERED_ACCESS on the frame list and an
+     * indirect draw must transition it (GAP-PHASE5 Block 8). Otherwise it rests in
+     * COMMON / GENERIC_READ, which promote implicitly. */
+    UINT64           uav_live_serial;
 } vio_d3d12_buffer;
 
 /* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */
@@ -252,6 +257,13 @@ typedef struct _vio_d3d12_state {
     float                      hdr_paper_white;
     /* Shader model in use (GAP-PHASE5 Block 7): 6 => DXC / DXIL, else FXC 5.1. */
     int                        shader_model;
+    /* Indirect draws (GAP-PHASE5 Block 8): command signatures for DrawIndexed
+     * (stride 20) and Draw (stride 16) arguments, created on first use. */
+    ID3D12CommandSignature    *cmdsig_indexed;
+    ID3D12CommandSignature    *cmdsig_plain;
+    /* Counts begin_frame() calls (never 0 inside a frame): buffers remember the
+     * serial of the frame whose list holds them in UNORDERED_ACCESS. */
+    UINT64                     frame_serial;
 
     /* Debug-layer InfoQueue, resolved ONCE at init and owned for the device's
      * lifetime (released in shutdown). NULL whenever the debug layer is inactive,

@@ -353,6 +353,17 @@ function vio_shader_cache_stats(): array {}
 function vio_swapchain_info(VioContext $context): array {}
 
 /**
+ * Draw a mesh with arguments read from a storage buffer (VIO_FEATURE_INDIRECT_DRAW) —
+ * typically written by a compute pass (GPU culling / LOD selection). Per draw record:
+ * indexed meshes 5 uint32 {indexCount, instanceCount, firstIndex, baseVertex, firstInstance}
+ * (stride 20), unindexed 4 uint32 {vertexCount, instanceCount, firstVertex, firstInstance}
+ * (stride 16). $maxDraws consecutive records starting at $offset bytes are issued; a record
+ * with instanceCount 0 draws nothing. Create the buffer with vio_storage_buffer(['indirect'
+ * => true]) (D3D11 needs the flag). Per-instance data comes from vio_bind_storage_buffer().
+ */
+function vio_draw_indirect(VioContext $context, VioMesh $mesh, VioBuffer $args, int $maxDraws = 1, int $offset = 0): void {}
+
+/**
  * Draw a mesh in the current frame.
  */
 function vio_draw(VioContext $context, VioMesh $mesh): void {}
@@ -575,6 +586,7 @@ function vio_compute_pipeline(VioContext $context, array $config): VioComputePip
  * Create a storage (UAV/SRV) buffer for compute.
  *
  * @param array $config ['size' => int]            // zeroed UAV output
+ *                       + 'indirect' => bool      // usable as vio_draw_indirect() argument buffer
  *                       | ['data' => string]       // SRV input (binary)
  *                       , optional ['stride' => int] // element stride (default 4)
  * @return VioBuffer|false
