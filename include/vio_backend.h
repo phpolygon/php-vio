@@ -327,6 +327,10 @@ typedef struct _vio_backend {
      * finished yet. NULL slot => the backend has no GPU timestamps
      * (GAP-PHASE5 Block 3). */
     double (*gpu_frame_time)(void);
+
+    /* Fill vio_swapchain_info (buffer count, effective frame latency, HDR
+     * output). NULL slot => zeros (GAP-PHASE5 Block 5). */
+    void  (*swapchain_info)(vio_swapchain_info *out);
 } vio_backend;
 
 /*

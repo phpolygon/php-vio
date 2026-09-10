@@ -153,6 +153,9 @@ typedef struct _vio_d3d11_state {
      * created with — ResizeBuffers MUST be given this same value. */
     int   tearing_supported;   /* DXGI_FEATURE_PRESENT_ALLOW_TEARING */
     UINT  swapchain_flags;     /* DXGI_SWAP_CHAIN_FLAG_* used at creation */
+    /* Waitable swapchain (GAP-PHASE5 Block 5), see the D3D12 twin. */
+    HANDLE frame_latency_waitable;
+    int    frame_latency;
     int   present_failed_once; /* rate-limits the Present() failure warning */
 
     /* Render targets */

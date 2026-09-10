@@ -241,6 +241,9 @@ typedef enum _vio_feature {
      * (D3D11/D3D12 timestamp queries, GL_TIMESTAMP, vkCmdWriteTimestamp, Metal
      * GPUStart/EndTime) read back one to two frames later. */
     VIO_FEATURE_GPU_TIMESTAMP      = 32,
+    /* vio_create(['frame_latency' => n]): waitable swapchain that caps how many
+     * frames the CPU runs ahead (input latency control). */
+    VIO_FEATURE_FRAME_LATENCY      = 33,
 } vio_feature;
 
 /* ── Input actions ────────────────────────────────────────────────── */
@@ -273,7 +276,21 @@ typedef struct _vio_config {
      * 0 = backend default. Currently only D3D12 honours it (2 or 3); other
      * backends ignore it. See VIO_D3D12_FRAME_COUNT_DEFAULT. */
     int         frame_count;
+    /* Waitable swapchain (GAP-PHASE5 Block 5): maximum frames the CPU may queue
+     * ahead of presentation; vio_begin blocks on the swapchain's waitable object
+     * until a backbuffer is free. 1 = lowest input latency, 0 = driver default
+     * (no waitable object). D3D11 / D3D12 only. */
+    int         frame_latency;
 } vio_config;
+
+/* vio_swapchain_info() — what the presentation path actually runs with. */
+typedef struct _vio_swapchain_info {
+    int buffer_count;    /* backbuffers (0 = unknown / no swapchain) */
+    int frame_latency;   /* effective maximum frame latency (0 = driver default) */
+    int waitable;        /* 1 = frame-latency waitable object in use */
+    int hdr_output;      /* 1 = HDR10 (10-bit, ST 2084) output active (GAP-PHASE5 Block 6) */
+    int format;          /* vio_pixel_format-like code of the backbuffer: 0 RGBA8, 8 RGB10A2 */
+} vio_swapchain_info;
 
 /* ── Descriptor structs ───────────────────────────────────────────── */
 

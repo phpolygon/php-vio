@@ -12,7 +12,9 @@
  * @param array $options Configuration options (width, height, title, vsync, samples, debug,
  *                       headless, frame_count, shader_cache => directory for the on-disk shader /
  *                       pipeline cache: DXBC per HLSL stage on D3D11/D3D12, OpenGL >= 4.1 program
- *                       binaries, the Vulkan pipeline cache — a warm start skips the compiles)
+ *                       binaries, the Vulkan pipeline cache — a warm start skips the compiles,
+ *                       frame_latency => 1..16: waitable swapchain capping the CPU's run-ahead,
+ *                       1 = lowest input latency; D3D11 / D3D12, 0 / absent = driver default)
  * @return VioContext|false Context object or false on failure
  */
 function vio_create(string $backend = "auto", array $options = []): VioContext|false {}
@@ -336,6 +338,13 @@ function vio_gpu_frame_time(VioContext $context): float {}
  * for the process: ['dir' => ?string, 'hits' => int, 'misses' => int, 'stores' => int].
  */
 function vio_shader_cache_stats(): array {}
+
+/**
+ * What the presentation path runs with: ['buffer_count' => int, 'frame_latency' => int
+ * (0 = driver default), 'waitable' => bool (frame-latency waitable object in use),
+ * 'hdr_output' => bool (HDR10 backbuffer), 'format' => int (0 RGBA8, 8 RGB10A2)].
+ */
+function vio_swapchain_info(VioContext $context): array {}
 
 /**
  * Draw a mesh in the current frame.

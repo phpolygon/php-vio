@@ -1191,6 +1191,7 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.srv_staging_heap) ID3D12DescriptorHeap_Release(vio_d3d12.srv_staging_heap);
     if (vio_d3d12.sampler_combo_heap) ID3D12DescriptorHeap_Release(vio_d3d12.sampler_combo_heap);
     if (vio_d3d12.sampler_heap)   ID3D12DescriptorHeap_Release(vio_d3d12.sampler_heap);
+    if (vio_d3d12.frame_latency_waitable) CloseHandle(vio_d3d12.frame_latency_waitable);
     if (vio_d3d12.swapchain)      IDXGISwapChain3_Release(vio_d3d12.swapchain);
     if (vio_d3d12.cmd_queue)      ID3D12CommandQueue_Release(vio_d3d12.cmd_queue);
     if (vio_d3d12.factory)        IDXGIFactory4_Release(vio_d3d12.factory);
@@ -1234,6 +1235,11 @@ static void *d3d12_create_surface(vio_config *cfg)
     vio_d3d12.swapchain_flags = vio_d3d12.tearing_supported
         ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
         : 0u;
+    /* Waitable swapchain (GAP-PHASE5 Block 5): windowed FLIP swapchains may carry
+     * the frame-latency waitable object; begin_frame waits on it. */
+    if (cfg->frame_latency > 0) {
+        vio_d3d12.swapchain_flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
     sc_desc.Flags = vio_d3d12.swapchain_flags;
 
     IDXGISwapChain1 *swapchain1 = NULL;
@@ -1257,6 +1263,13 @@ static void *d3d12_create_surface(vio_config *cfg)
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12: SwapChain3 not supported (0x%08lx)", hr);
         return NULL;
+    }
+    if (cfg->frame_latency > 0) {
+        /* IDXGISwapChain3 derives from IDXGISwapChain2: set the cap and grab the
+         * waitable object once; ResizeBuffers keeps it valid. */
+        IDXGISwapChain3_SetMaximumFrameLatency(vio_d3d12.swapchain, (UINT)cfg->frame_latency);
+        vio_d3d12.frame_latency_waitable = IDXGISwapChain3_GetFrameLatencyWaitableObject(vio_d3d12.swapchain);
+        vio_d3d12.frame_latency = vio_d3d12.frame_latency_waitable ? cfg->frame_latency : 0;
     }
 
     /* Disable ALT+Enter */
@@ -3483,6 +3496,13 @@ static void d3d12_begin_frame(void)
      * on real errors, so the spam stays bounded in practice. */
     d3d12_drain_info_queue("begin_frame");
 
+    /* Waitable swapchain: block until DXGI has a backbuffer for us (caps the
+     * CPU at frame_latency frames ahead — the input-latency control). A bounded
+     * wait so a stalled compositor cannot hang the process. */
+    if (vio_d3d12.frame_latency_waitable) {
+        WaitForSingleObjectEx(vio_d3d12.frame_latency_waitable, 1000, TRUE);
+    }
+
     /* Wait for this frame's previous work to complete */
     d3d12_wait_for_frame(vio_d3d12.frame_index);
     /* This slot's previous command list has retired: PSOs parked while it was
@@ -4756,6 +4776,16 @@ static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
 
 /* ── Feature Query ────────────────────────────────────────────────── */
 
+static void d3d12_swapchain_info(vio_swapchain_info *out)
+{
+    if (!out) return;
+    out->buffer_count  = vio_d3d12.swapchain ? (int)vio_d3d12.frame_count : 0;
+    out->frame_latency = vio_d3d12.frame_latency;
+    out->waitable      = vio_d3d12.frame_latency_waitable != NULL;
+    out->hdr_output    = 0;
+    out->format        = 0;
+}
+
 static double d3d12_gpu_frame_time(void)
 {
     return vio_d3d12.initialized && vio_d3d12.ts_heap ? vio_d3d12.last_gpu_ms : -1.0;
@@ -4784,6 +4814,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1;
         case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + PSO depth-stencil state */
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d12.ts_heap != NULL; /* timestamp query heap + readback ring */
+        case VIO_FEATURE_FRAME_LATENCY:       return 1; /* FRAME_LATENCY_WAITABLE_OBJECT swapchain */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* CPU box filter + re-upload (GAP-PLAN 2.3) */
         case VIO_FEATURE_CUBEMAP:      return 1;
@@ -5167,6 +5198,7 @@ static const vio_backend d3d12_backend = {
     .draw_instanced_from_storage  = d3d12_draw_instanced_from_storage,
     .supports_feature  = d3d12_supports_feature,
     .gpu_frame_time    = d3d12_gpu_frame_time,
+    .swapchain_info    = d3d12_swapchain_info,
     .destroy_cubemap   = d3d12_destroy_cubemap,
     .upload_cubemap    = d3d12_upload_cubemap,
     .read_render_target = d3d12_read_render_target,

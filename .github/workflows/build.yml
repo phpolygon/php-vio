@@ -467,7 +467,8 @@ jobs:
             tests/render3d/113_stencil_test_all_backends.phpt `
             tests/render3d/114_uint16_indices_all_backends.phpt `
             tests/core/115_gpu_frame_time_all_backends.phpt `
-            tests/core/116_shader_cache_all_backends.phpt
+            tests/core/116_shader_cache_all_backends.phpt `
+            tests/core/117_frame_latency_all_backends.phpt
 
       - name: Package binary
         shell: pwsh

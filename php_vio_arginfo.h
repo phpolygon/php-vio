@@ -202,6 +202,10 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_shader_cache_stats, 0, 0, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_swapchain_info, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
 /* ── Shader/Pipeline functions ────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_shader, 0, 2, VioShader, MAY_BE_FALSE)
@@ -799,6 +803,7 @@ ZEND_FUNCTION(vio_draw);
 ZEND_FUNCTION(vio_mesh_index_bytes);
 ZEND_FUNCTION(vio_gpu_frame_time);
 ZEND_FUNCTION(vio_shader_cache_stats);
+ZEND_FUNCTION(vio_swapchain_info);
 ZEND_FUNCTION(vio_rect);
 ZEND_FUNCTION(vio_circle);
 ZEND_FUNCTION(vio_line);
@@ -945,6 +950,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_mesh_index_bytes, arginfo_vio_mesh_index_bytes)
 	ZEND_FE(vio_gpu_frame_time, arginfo_vio_gpu_frame_time)
 	ZEND_FE(vio_shader_cache_stats, arginfo_vio_shader_cache_stats)
+	ZEND_FE(vio_swapchain_info, arginfo_vio_swapchain_info)
 	ZEND_FE(vio_rect, arginfo_vio_rect)
 	ZEND_FE(vio_circle, arginfo_vio_circle)
 	ZEND_FE(vio_line, arginfo_vio_line)
