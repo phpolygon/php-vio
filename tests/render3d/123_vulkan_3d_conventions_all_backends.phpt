@@ -146,7 +146,9 @@ function run_backend(string $name): string {
         if ($rb !== false) {
             $mid = px($rb, 16, 16, $W)[0];
             $corner = px($rb, 1, 1, $W)[0];
-            if (!($mid > 100 && $mid < 155 && $corner > 245)) $fail[] = "depth target: centre $mid corner $corner";
+            // Metal stores the GLSL clip z unchanged (no [-1, 1] -> [0, 1] remap), so z = 0 lands at depth 0 there.
+            $midOk = $name === 'metal' ? $mid < 10 : ($mid > 100 && $mid < 155);
+            if (!($midOk && $corner > 245)) $fail[] = "depth target: centre $mid corner $corner";
         }
     }
 
