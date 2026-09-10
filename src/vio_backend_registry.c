@@ -84,6 +84,19 @@ const vio_backend *vio_get_auto_backend(void)
      * 2D-only context for a 3D game. supports_feature is a static table on every
      * backend, so this costs nothing and needs no device. Once a backend gains a
      * 3D pipeline it automatically becomes eligible again. */
+    /* Pass 0 (GAP-PHASE5 Block 10): prefer a backend with the full 3D feature set an
+     * engine renderer needs (HDR / depth / cube targets, MRT, cubemaps, instancing),
+     * so a backend whose 3D path is still growing (Vulkan while Block 10 lands in
+     * steps) never wins 'auto' over a complete one. */
+    for (int p = 0; p < priority_count; p++) {
+        const vio_backend *b = vio_find_backend(priority[p]);
+        if (b && b->supports_feature && b->supports_feature(VIO_FEATURE_3D_PIPELINE)
+            && b->supports_feature(VIO_FEATURE_INSTANCED_DRAW) && b->supports_feature(VIO_FEATURE_RENDER_TARGET_HDR)
+            && b->supports_feature(VIO_FEATURE_RENDER_TARGET_DEPTH) && b->supports_feature(VIO_FEATURE_RENDER_TARGET_CUBE)
+            && b->supports_feature(VIO_FEATURE_MRT) && b->supports_feature(VIO_FEATURE_CUBEMAP)) {
+            return b;
+        }
+    }
     for (int p = 0; p < priority_count; p++) {
         const vio_backend *b = vio_find_backend(priority[p]);
         if (b && b->supports_feature && b->supports_feature(VIO_FEATURE_3D_PIPELINE)) {

@@ -32,6 +32,12 @@ typedef struct _vio_vulkan_texture {
      * error). vulkan_destroy_texture unlinks itself. */
     struct _vio_vulkan_texture *next;
     struct _vio_vulkan_texture *prev;
+    /* 3D pipeline (GAP-PHASE5 Block 10) */
+    VkSampler     sampler_cmp;  /* comparison sampler (sampler2DShadow), created on first use, owned */
+    int           view_type;    /* VkImageViewType of view; 0 = 2D */
+    int           layout;       /* VkImageLayout for descriptors; 0 = SHADER_READ_ONLY_OPTIMAL */
+    int           is_depth;     /* depth-format view (depth render target) */
+    int           filter, wrap;
 } vio_vulkan_texture;
 
 /* Per-frame synchronization and command buffer resources.
@@ -50,6 +56,18 @@ typedef struct _vio_vk_frame {
     VkSemaphore     image_available;
     VkFence         in_flight;
 } vio_vk_frame;
+
+/* Buffer wrapper for every vio buffer type on this backend: compute / graphics
+ * storage buffers, mesh vertex and index buffers. HOST_VISIBLE | HOST_COHERENT. */
+typedef struct _vio_vulkan_compute_buffer {
+    VkBuffer       buffer;
+    void          *allocation;   /* VmaAllocation (opaque) */
+    VkDeviceSize   size;         /* bytes */
+    int            stride;       /* element stride (informational) */
+    /* Intrusive list (vio_vk.live_compute_buffers) so vulkan_shutdown can sweep
+     * survivors before vkDestroyDevice. */
+    struct _vio_vulkan_compute_buffer *next, *prev;
+} vio_vulkan_compute_buffer;
 
 /* Global Vulkan state */
 typedef struct _vio_vulkan_state {
@@ -189,6 +207,30 @@ typedef struct _vio_vulkan_state {
     int                      frame_presentable;
     float                    clear_r, clear_g, clear_b, clear_a;
 
+    /* 3D pipeline (GAP-PHASE5 Block 10): the render pass open on the frame
+     * command buffer and its attachment signature - pipeline variants are keyed
+     * by it. cur_render_pass is VK_NULL_HANDLE outside a pass. */
+    VkRenderPass             cur_render_pass;
+    int                      cur_color_count;
+    VkFormat                 cur_color_formats[4];
+    int                      cur_samples;
+    int                      cur_has_depth;
+    uint32_t                 cur_width, cur_height;
+    int                      depth_has_stencil;    /* depth attachments carry 8 stencil bits */
+    int                      multi_draw_indirect;  /* device feature enabled */
+    int                      independent_blend;    /* device feature enabled */
+    /* Headless frame capture (Block 10): every presented frame is copied into
+     * capture_buf in its own command buffer; vio_read_pixels maps it. */
+    int                      headless;
+    int                      swapchain_transfer_src;
+    VkBuffer                 capture_buf;
+    void                    *capture_alloc;
+    VkDeviceSize             capture_size;
+    uint32_t                 capture_w, capture_h;
+    int                      capture_valid;
+    int                      acquire_consumed;   /* a mid-frame readback submit already waited image_available */
+    VkFence                  midframe_fence;
+
     /* Offscreen render-target binding (mirrors vio_d3d12). current_bound_rt is
      * the vio_render_target_object* whose render pass is active, or NULL =
      * swapchain. pending_bound_rt holds a target requested before vio_begin;
@@ -321,6 +363,51 @@ void vulkan_record_unbind_render_target(void);
  * overruns). Returns 0 on success, non-zero on failure (out_rgba untouched on
  * failure). Safe to call only when vio_vk.initialized and a frame has rendered. */
 int vulkan_read_pixels(int width, int height, void *out_rgba);
+
+/* ── Shared helpers (vio_vulkan.c) ── */
+VkFormat vio_vk_depth_format(void);
+int      vio_vk_begin_transient(VkCommandBuffer *out_cmd);
+int      vio_vk_submit_transient(VkCommandBuffer cmd);
+/* Sampling wrapper for a render target (colour, or depth for depth_only targets),
+ * cached on the target and owned by it. */
+void    *vulkan_rt_sampling_texture(void *rt);
+
+/* ── Deferred destruction + barriers (vio_vulkan_3d.c) ── */
+#define VIO_VK_GRAVE_IMAGE           1
+#define VIO_VK_GRAVE_VIEW            2
+#define VIO_VK_GRAVE_SAMPLER         3
+#define VIO_VK_GRAVE_BUFFER          4
+#define VIO_VK_GRAVE_PIPELINE        5
+#define VIO_VK_GRAVE_PIPELINE_LAYOUT 6
+#define VIO_VK_GRAVE_SET_LAYOUT      7
+#define VIO_VK_GRAVE_SHADER_MODULE   8
+#define VIO_VK_GRAVE_FRAMEBUFFER     9
+#define VIO_VK_GRAVE_RENDER_PASS     10
+void vio_vk_defer_destroy(int kind, uint64_t handle, void *allocation);
+void vio_vk_image_barrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, uint32_t layers,
+                          VkImageLayout from, VkImageLayout to);
+
+/* ── 3D pipeline (GAP-PHASE5 Block 10, vio_vulkan_3d*.c) ── */
+int   vio_vk3d_available(void);
+void  vio_vk3d_begin_frame(uint32_t frame_slot);
+void  vio_vk3d_shutdown(void);
+void  vio_vk3d_forget_texture(vio_vulkan_texture *tex);
+void  vio_vk3d_forget_buffer(vio_vulkan_compute_buffer *buf);
+void *vio_vk3d_compile_shader(vio_shader_desc *desc);
+void  vio_vk3d_destroy_shader_obj(void *shader_obj);
+void *vio_vk3d_create_pipeline(vio_pipeline_desc *desc);
+void  vio_vk3d_destroy_pipeline(void *pipeline);
+void  vio_vk3d_bind_pipeline(void *pipeline);
+void  vio_vk3d_push_cbuffers(const void *vs_data, int vs_size, const void *fs_data, int fs_size);
+void  vio_vk3d_bind_texture(void *texture, int slot);
+void  vio_vk3d_set_viewport(int x, int y, int width, int height);
+void  vio_vk3d_draw(vio_draw_cmd *cmd);
+void  vio_vk3d_draw_indexed(vio_draw_indexed_cmd *cmd);
+void  vio_vk3d_draw_mesh_instanced(void *mesh_obj, const float *matrices, int count);
+void  vio_vk3d_bind_storage_buffer(void *buf, int binding, int access, int element_count, int stride);
+void  vio_vk3d_draw_instanced_from_storage(void *mesh_obj, int count);
+void  vio_vk3d_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset);
+int   vio_vk3d_read_render_target(void *rt, int face, int attachment, void *out_rgba);
 
 #endif /* HAVE_VULKAN */
 #endif /* VIO_VULKAN_H */

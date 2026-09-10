@@ -6,7 +6,7 @@ vio
 <?php
 $any = false;
 foreach (vio_backends() as $b) {
-    if ($b === 'null' || $b === 'vulkan') continue;
+    if ($b === 'null') continue;
     $c = @vio_create($b, ["width" => 8, "height" => 8, "headless" => true, "vsync" => false]);
     if (!$c) continue;
     if (vio_supports_feature($c, VIO_FEATURE_3D_PIPELINE) && vio_supports_feature($c, VIO_FEATURE_READ_PIXELS)) $any = true;
@@ -90,7 +90,7 @@ function run_backend(string $name): string {
     return $fail ? "FAIL\n  " . implode("\n  ", $fail) : "OK";
 }
 
-foreach (['opengl', 'd3d11', 'd3d12', 'metal'] as $b) {
+foreach (['opengl', 'd3d11', 'd3d12', 'metal', 'vulkan'] as $b) {
     echo "$b: ", run_backend($b), "\n";
 }
 echo "DONE\n";
@@ -100,4 +100,5 @@ opengl: %s
 d3d11: %s
 d3d12: %s
 metal: %s
+vulkan: %s
 DONE

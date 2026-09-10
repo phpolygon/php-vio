@@ -97,6 +97,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 |---|---|
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
 | `tests/render3d/112` | Blend und Write-Mask je Attachment auf einer MRT-Pipeline: Attachment 0 alpha-blendet, Attachment 1 (Maske 0) bleibt unberührt, Attachment 2 schreibt nur den Rotkanal – der Vertrag für einen Transparent-Pass in ein G-Buffer-Target. |
+| `tests/render3d/123` | 3D-Konventionen auf allen Backends (Vulkan wie D3D): Tiefentest, Back-Face-Culling, Uniforms je Stage, Textur-V, Instancing (gepackt), RT-Readback-Zeile 0 und gesampelte Orientierung, Depth-only-Target. |
 | `tests/render3d/122` | Variable Rate Shading (D3D12): mit 2X2 teilen benachbarte Pixel eines Blocks denselben Fragment-Wert, mit 1X1 nicht; ohne VRS-Tier liefert `vio_set_shading_rate` `false`. |
 | `tests/render3d/121` | Texture-Arrays / BC / KTX2: zweischichtiges RGBA8-Array mit expliziter Mip-Kette (`sampler2DArray`, `textureLod`), ein handkodierter BC1-Block, KTX2-Container (BC1 und RGBA8 mit `mip_offset`), defekte Eingabe → `false`. |
 | `tests/render3d/120` | Indirect Draw: zwei Argument-Records (instanceCount 1 / 0) aus einem Storage-Buffer zeichnen genau einen Quad; unindiziertes Mesh mit 4-uint32-Records; ein Compute-Pass, der instanceCount schreibt, steuert den Draw ohne Readback. |
@@ -111,7 +112,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 | `tests/render3d/096–098` | Storage-Images + 2D-Dispatch (API-Roadmap R2/R7), Multiple Render Targets (R1), Async-Compute im Frame (R7) |
 | `tests/backends/108` | OpenGL: `vio_set_uniform()` erreicht UBO-Block-Member, Default-Block-Uniforms und Array-Elemente von SPIR-V-Pfad-Shadern (SPIRV-Cross flacht sie zu `uniform Matrices _19;` ab → GL-Name `_19.uProjection`). |
 | `tests/backends/107` | OpenGL-Kontext-Generation: Objekte eines zerstörten Kontexts, die erst freigegeben werden, wenn ein NEUER Kontext current ist, dürfen dessen (wiederverwendete) GL-Namen nicht löschen. |
-| `tests/core/099–100`, `render3d/101–105`, `backends/106` | GAP-Plan (`D3D-VULKAN-GAP-PLAN.md`): Audit-Gate für Backend-Zweige in `php_vio.c`, Auto-Backend-Wahl, Sampler-Filter/Wrap, Cube-RT/Mipmaps/Readback auf allen Backends, Mid-Frame-Upload-Ordnung, Anisotropie, RT-MSAA-Resolve, Vulkan-Present-Mode. Die `*_all_backends`-Tests iterieren über `opengl/d3d11/d3d12/metal` und drucken pro Backend `OK` oder `skip (…)`. |
+| `tests/core/099–100`, `render3d/101–105`, `backends/106` | GAP-Plan (`D3D-VULKAN-GAP-PLAN.md`): Audit-Gate für Backend-Zweige in `php_vio.c`, Auto-Backend-Wahl, Sampler-Filter/Wrap, Cube-RT/Mipmaps/Readback auf allen Backends, Mid-Frame-Upload-Ordnung, Anisotropie, RT-MSAA-Resolve, Vulkan-Present-Mode. Die `*_all_backends`-Tests iterieren über `opengl/d3d11/d3d12/metal/vulkan` und drucken pro Backend `OK` oder `skip (…)`. |
 | `tests/core/` | Laden, Konstanten, Null-Backend, Context-Lifecycle, Plugins, Audit-Gate 070, Capability-Matrix 074, Perf/Memory-Gates |
 | `tests/backends/` | Backend-Registrierung + GPU-Kontexte (OpenGL/Vulkan/Metal/D3D11/D3D12), Cross-Backend-Parity 067, Metal-3D 089, Uniform-Layout Struct-Arrays 094, Texture-Bind-Reihenfolge 095, D3D-Spezifika |
 | `tests/render3d/` | Mesh/Shader/Pipeline/Texturen/Buffer/RT/Cubemap/Compute/Vertex-Storage, headless GL |
@@ -155,32 +156,32 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 
 | Feature | OpenGL | D3D11 | D3D12 | Vulkan | Metal |
 |---|---|---|---|---|---|
-| 3D-Pipeline (`vio_mesh`/`vio_shader`/`vio_pipeline`/`vio_draw`) | ✅ | ✅ | ✅ | ❌ stub | ✅ |
+| 3D-Pipeline (`vio_mesh`/`vio_shader`/`vio_pipeline`/`vio_draw`) | ✅ | ✅ | ✅ | ✅ (SPIR-V → Vulkan-GLSL → SPIR-V, GAP-PHASE5 Block 10) | ✅ |
 | Native 2D-Batch | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Render Target (Basis) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Render Target HDR / Depth-only / MSAA | ✅/✅/✅* | ✅/✅/✅* | ✅/✅/✅ (PSO-Sample-Varianten, GAP-PHASE5 1) | ❌/❌/❌ | ✅/✅/✅ |
+| Render Target HDR / Depth-only / MSAA | ✅/✅/✅* | ✅/✅/✅* | ✅/✅/✅ (PSO-Sample-Varianten, GAP-PHASE5 1) | ✅/✅/❌ (MSAA: Block 10b) | ✅/✅/✅ |
 | Cubemap | ✅ | ✅ | ✅† (seit 2.9: Upload war vorher nicht implementiert) | ❌ | ✅ |
 | Compute (`vio_compute_*`) | ✅ (GL ≥ 4.3 → auf macOS nie) | ✅ | ✅ | ✅ | ✅ |
-| Vertex-Storage (`vio_draw_instanced_from_buffer`) | ✅ (wenn Compute) | ✅ | ✅ | ❌ | ✅ |
+| Vertex-Storage (`vio_draw_instanced_from_buffer`) | ✅ (wenn Compute) | ✅ | ✅ | ✅ | ✅ |
 | Texture 3D | ✅ | ✅ | ✅ | ✅ | ✅ |
 | read_pixels | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Texture Swizzle | ✅ (3.3+) | ❌ (CPU-Expand) | ❌ (CPU-Expand) | ✅ | ✅ |
 | Cubemap-RT + `vio_generate_mipmaps` | ✅ | ❌ (Follow-up) | ❌ (Follow-up) | ❌ | ✅ |
-| `vio_read_render_target` | ✅ | ✅ | ✅† | ❌ | ✅ |
+| `vio_read_render_target` | ✅ | ✅ | ✅† | ✅ (nach `vio_end`) | ✅ |
 | `vio_texture_update` | ✅ | ✅ | ❌ (Follow-up) | ❌ | ✅ |
-| `depth_write` / `color_mask` / Blend-Modi | ✅ | ✅ | ✅ | — | ✅ |
+| `depth_write` / `color_mask` / Blend-Modi | ✅ | ✅ | ✅ | ✅ | ✅ |
 | MRT (`'attachments' => [VIO_FORMAT_*…]`, bis 4) | ✅ | ✅† | ✅† | ❌ | ✅ |
 | Blend/Write-Mask je Attachment (`attachment_blend`, `attachment_color_mask`) | ✅ (GL ≥ 4.0, indexed) | ✅ (IndependentBlend) | ✅ (IndependentBlend) | ❌ | ✅ (per colorAttachment) |
-| uint16-Indices (automatisch, `vio_mesh_index_bytes`) | ✅ | ✅ (R16_UINT) | ✅ (R16_UINT) | — | ✅ (MTLIndexTypeUInt16) |
+| uint16-Indices (automatisch, `vio_mesh_index_bytes`) | ✅ | ✅ (R16_UINT) | ✅ (R16_UINT) | ✅ (`VK_INDEX_TYPE_UINT16`) | ✅ (MTLIndexTypeUInt16) |
 | Shader-/Pipeline-Cache auf Platte (`vio_create(['shader_cache' => dir])`, `vio_shader_cache_stats`) | ✅ (GL ≥ 4.1 Program-Binary) | ✅ (DXBC je Stage) | ✅ (DXBC je Stage) | ✅ (`VkPipelineCache`) | — (Metal cacht selbst) |
-| Indirect Draw (`vio_draw_indirect`, `vio_storage_buffer(['indirect' => true])`, `VIO_FEATURE_INDIRECT_DRAW`) | ✅ (GL ≥ 4.0 `glDraw*Indirect`) | ✅ (`Draw*InstancedIndirect`) | ✅ (`ExecuteIndirect`) | ❌ (Block 10) | ✅ (`indirectBuffer:`) |
+| Indirect Draw (`vio_draw_indirect`, `vio_storage_buffer(['indirect' => true])`, `VIO_FEATURE_INDIRECT_DRAW`) | ✅ (GL ≥ 4.0 `glDraw*Indirect`) | ✅ (`Draw*InstancedIndirect`) | ✅ (`ExecuteIndirect`) | ✅ (`vkCmdDraw(Indexed)Indirect`, Multi-Draw wenn verfügbar) | ✅ (`indirectBuffer:`) |
 | Texture-Arrays + BC + KTX2 (`vio_texture(['layers', 'format' => VIO_FORMAT_BC*, 'mip_levels'])`, `vio_texture_ktx2`, `VIO_FEATURE_TEXTURE_ARRAY` / `_TEXTURE_COMPRESSION_BC`) | ✅ (`GL_TEXTURE_2D_ARRAY`, S3TC/RGTC/BPTC) | ✅ | ✅ | ❌ (Block 10) | ✅ (`MTLTextureType2DArray`, BC-Formate) |
 | Variable Rate Shading (`vio_set_shading_rate`, `VIO_SHADING_RATE_*`, `VIO_FEATURE_SHADING_RATE`) | ❌ | ❌ | ✅ (`RSSetShadingRate`, Tier 1+; 4X4 nur mit Additional Rates) | ❌ (Block 10) | ❌ |
 | Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Fallback FXC 5.1) | — | — |
 | HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | — (Block 10) | — |
 | Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | — (3 Drawables) |
 | GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`) |
-| Stencil (`'stencil' => [...]`, `VIO_FEATURE_STENCIL`) | ✅ (DEPTH24_STENCIL8) | ✅ (D24S8) | ✅ (D24S8, `OMSetStencilRef`) | ❌ | ❌ (Depth32Float ohne Stencil-Plane, macOS-Folgearbeit) |
+| Stencil (`'stencil' => [...]`, `VIO_FEATURE_STENCIL`) | ✅ (DEPTH24_STENCIL8) | ✅ (D24S8) | ✅ (D24S8, `OMSetStencilRef`) | ✅ (D32S8 / D24S8) | ❌ (Depth32Float ohne Stencil-Plane, macOS-Folgearbeit) |
 | Storage-Images (`'storage' => true` + `vio_compute_bind_image`) | ✅ (wenn Compute) | ✅† | ✅† | ❌ | ✅ |
 | Compute-`local_size` aus Reflection (2D/3D-Dispatch) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Async-Dispatch im Frame (`['async' => true]`, `vio_compute_wait`) | ✅ (Queue in-order) | ✅ (in-order) | ✅† (Frame-List) | sync | ✅ (Frame-Cmd-Buffer) |
@@ -196,7 +197,16 @@ in 096/097 wieder mit.
 single-sampled); D3D meldet auch `TESSELLATION`/`GEOMETRY = 1` ohne Hull/Geometry-Stage.
 Metal ist aktuell das einzige Backend mit echtem MSAA-Resolve.
 
-Vulkan ist in vio 2D-only; 3D lief historisch über die separate php-vulkan-Extension.
+Vulkan-3D (GAP-PHASE5 Block 10, `src/backends/vulkan/vio_vulkan_3d*.c`): Shader gehen GLSL →
+SPIR-V → Vulkan-GLSL (SPIRV-Cross, Bindings umgelegt: Set 0, 0/1 = Default-Uniform-Block VS/FS
+als `UNIFORM_BUFFER_DYNAMIC` im Frame-Upload-Ring, 2–17 = Sampler im D3D12-Register-Schema,
+18–25 = Storage-Buffer) → SPIR-V; der Vertex-Stage wird `y = -y; z = (z + w) / 2` angehängt,
+Varyings bekommen Locations über den Namen. Damit gilt die D3D-Konvention: NDC +Y = RT-Zeile 0,
+Tiefe 0..1, `frontFace` CCW (Test `123`). Pipelines sind Varianten je Render-Pass-Signatur und
+Vertex-Stride; Freigaben mitten im Frame parken bis zum Fence des Slots. Headless-Kontexte
+kopieren jedes präsentierte Bild in einen Host-Buffer (`vio_read_pixels` auch mitten im Frame).
+Offen (Block 10b/10c): MRT, MSAA- und Cube-Targets, Cubemaps, Mipmaps, Texture-Arrays/BC,
+Variable Rate Shading.
 Metal, Geometry-/Tessellation-Shader gibt es in Metal nicht (`VIO_FEATURE_GEOMETRY == 0`).
 
 #### Metal-3D-Pipeline (`src/backends/metal/vio_metal.m`)
@@ -330,7 +340,8 @@ src/
   backends/
     opengl/vio_opengl.c     # OpenGL 3.0–4.6 Core (GLAD), vollständigster Pfad
     opengl/vio_2d_opengl.c  # GL-2D-Batch
-    vulkan/vio_vulkan.c     # Vulkan (VMA, Swapchain, Sync) — 2D + Compute, 3D stub
+    vulkan/vio_vulkan.c     # Vulkan (VMA, Swapchain, Sync, RTs) — 2D + Compute
+    vulkan/vio_vulkan_3d*.c # Vulkan-3D: Shader-Rundreise, Pipeline-Varianten, Frame-Ring, Draws (Block 10)
     vulkan/vio_vma_wrapper.cpp  # VMA C++17 Wrapper
     metal/vio_metal.m       # Metal (ObjC, CAMetalLayer) — 2D + RT + Compute, 3D stub
     metal/vio_metal.c       # C-Shim, #include't vio_metal.m (Autotools kennt kein .m)
@@ -736,7 +747,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 123 (109/110 gehören dem Branch feat/geometry-tessellation-stages, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 124 (109/110 gehören dem Branch feat/geometry-tessellation-stages, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -810,7 +821,8 @@ Aufrufer geändert hat:
   über `vio_shader`), D3D12 `RENDER_TARGET_MSAA = 0` (PSO braucht `SampleDesc`, Phase 5),
   D3D12 `TEXTURE_SWIZZLE = 1`. `074` pinnt jetzt auch d3d11/d3d12/vulkan.
 - **`auto` überspringt Backends ohne 3D-Pipeline**, wenn ein späterer Kandidat eine hat
-  (Linux: OpenGL vor Vulkan, solange Vulkan-3D fehlt). Test `100`.
+  (Linux: OpenGL vor Vulkan, solange Vulkan nicht den vollständigen 3D-Satz meldet – MRT,
+  Cube-Targets, Cubemaps; Registry-Pass 0, GAP-PHASE5 Block 10). Test `100`.
 - **Audit-Gate `099`** friert `strcmp(ctx->backend->name, …)` (66) und `#if HAVE_D3D11/
   D3D12/VULKAN` (47) in `php_vio.c` ein — neue Backend-Fähigkeiten gehen über Vtable-Slots.
   Render-Target-Erstellung/-Bind/-Unbind/-Readback und Cubemap-Upload für D3D11/D3D12
@@ -861,9 +873,10 @@ Aufrufer geändert hat:
 
 ## Bekannte Einschränkungen
 
-- **Vulkan hat keine 3D-Pipeline** (`VIO_FEATURE_3D_PIPELINE == 0`); 2D, Render-Targets,
-  Compute und read_pixels funktionieren dort. Vulkan: kein Cubemap, kein HDR/Depth-only/MSAA-RT.
-  `auto` wählt deshalb OpenGL vor Vulkan (siehe GAP-Plan Phase 0.4 / Phase 5).
+- **Vulkan-3D ist unvollständig** (GAP-PHASE5 Block 10a): 3D-Pipeline, Instancing, Depth-Bias,
+  Stencil, Vertex-Storage, Indirect Draw, HDR- und Depth-only-Targets sind da; MRT, MSAA- und
+  Cube-Targets, Cubemaps, Mipmaps, Texture-Arrays/BC und VRS fehlen noch (Flags 0). `auto` wählt
+  zuerst ein Backend mit dem vollständigen Satz (Registry-Pass 0), unter Linux also OpenGL.
 - **D3D12 RT-MSAA** (GAP-PHASE5 Block 1): jede `vio_d3d12_pipeline` hält ihre PSO-Beschreibung und
   baut beim Binden lazily die Variante für die Sample-Zahl des gebundenen Targets (2/4/8);
   die RT-Farbe liegt in multisampled Ressourcen, die Resolve-Ziele (SRV/Readback) werden beim
