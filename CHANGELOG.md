@@ -1,3 +1,10 @@
+# [2.20.0](https://github.com/phpolygon/php-vio/compare/v2.19.0...v2.20.0) (2026-09-10)
+
+
+### Features
+
+* **d3d12:** variable rate shading (vio_set_shading_rate) ([db48ff0](https://github.com/phpolygon/php-vio/commit/db48ff09dabbe90d72c474b8db5dd4c5b90220e7))
+
 # [2.19.0](https://github.com/phpolygon/php-vio/compare/v2.18.0...v2.19.0) (2026-09-10)
 
 
