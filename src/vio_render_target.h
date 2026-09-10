@@ -81,19 +81,10 @@ typedef struct _vio_render_target_object {
     void        *metal_msaa_color_texture; /* id<MTLTexture> 2DMultisample (CFRetained) */
     void        *metal_msaa_depth_texture; /* id<MTLTexture> 2DMultisample (CFRetained) */
 
-    /* Vulkan (opaque — VkImage/VkImageView/VkRenderPass/VkFramebuffer/VkSampler
-     * handles + VmaAllocation, stored as void* so the public header stays free
-     * of Vulkan headers; 64-bit only). */
-    void        *vulkan_color_image;          /* VkImage */
-    void        *vulkan_color_alloc;          /* VmaAllocation */
-    void        *vulkan_color_view;           /* VkImageView */
-    void        *vulkan_depth_image;          /* VkImage */
-    void        *vulkan_depth_alloc;          /* VmaAllocation */
-    void        *vulkan_depth_view;           /* VkImageView */
-    void        *vulkan_render_pass;          /* VkRenderPass (compatible with the swapchain 2D pipelines) */
-    void        *vulkan_framebuffer;          /* VkFramebuffer */
-    void        *vulkan_sampler;              /* VkSampler for sampling the result */
-    void        *vulkan_color_backend_texture;/* vio_vulkan_texture* cached for vio_render_target_texture() */
+    /* Vulkan: vio_vk_rt* (src/backends/vulkan/vio_vulkan.h) - attachments, MSAA
+     * images, render passes, framebuffers (per cube face / level), sampler and the
+     * cached sampling wrappers. Owned by the target (vio_vulkan_rt.c). */
+    void        *vulkan_rt;
 
     /* Multiple render targets (VIO_FEATURE_MRT). attachment_count is 1 for a
      * classic target; formats[i] is the vio_pixel_format of colour attachment

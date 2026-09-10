@@ -144,8 +144,8 @@ probe_fold("d3d12", $d3d_common + [
 ]);
 
 /* Vulkan: 3D pipeline since GAP-PHASE5 Block 10 (SPIR-V round trip, frame upload
- * ring, HDR / depth targets). MRT / MSAA / cube targets follow, so vio_create('auto')
- * still prefers a backend with the complete set (test 100, registry pass 0). */
+ * ring, HDR / depth targets); MRT, MSAA and cube targets, cubemaps and mip
+ * generation since Block 10b. Texture arrays / BC and shading rate follow (10c). */
 probe_fold("vulkan", [
     VIO_FEATURE_3D_PIPELINE        => 1,   /* GAP-PHASE5 10 */
     VIO_FEATURE_STENCIL            => 1,   /* D32S8 / D24S8 attachments */
@@ -153,6 +153,11 @@ probe_fold("vulkan", [
     VIO_FEATURE_INDIRECT_DRAW      => 1,   /* vkCmdDraw(Indexed)Indirect */
     VIO_FEATURE_RENDER_TARGET_HDR  => 1,
     VIO_FEATURE_RENDER_TARGET_DEPTH=> 1,
+    VIO_FEATURE_MRT                => 1,   /* GAP-PHASE5 10b */
+    VIO_FEATURE_RENDER_TARGET_MSAA => 1,
+    VIO_FEATURE_RENDER_TARGET_CUBE => 1,
+    VIO_FEATURE_CUBEMAP            => 1,
+    VIO_FEATURE_MIPMAP_GEN         => 1,
     VIO_FEATURE_TEXTURE_ARRAY      => 0,   /* with the 3D pipeline (GAP-PHASE5 10) */
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 0,
     VIO_FEATURE_SHADING_RATE       => 0,   /* VK_KHR_fragment_shading_rate with the 3D pipeline */

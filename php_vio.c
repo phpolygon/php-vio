@@ -8902,7 +8902,7 @@ ZEND_FUNCTION(vio_render_target_texture)
      * on the borrowed handles, we leave tex->backend = NULL (the texture free
      * handler short-circuits when backend is NULL) and mark it borrowed. */
     if (rt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.initialized) {
-        void *wrapper = vulkan_rt_sampling_texture(rt);   /* colour, or depth for depth_only targets */
+        void *wrapper = vulkan_rt_sampling_texture(rt, att);   /* colour attachment att, or depth for depth_only targets */
         if (wrapper) {
             tex->backend_texture = wrapper;
             tex->backend         = NULL; /* the RT owns the wrapper and its handles */
@@ -9093,6 +9093,10 @@ ZEND_FUNCTION(vio_bind_cubemap)
 static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm, zend_long slot)
 {
     (void)ctx; (void)cm; (void)slot;
+    if (ctx->backend->bind_cubemap) {   /* Vulkan */
+        ctx->backend->bind_cubemap(cm, (int)slot);
+        return;
+    }
 #ifdef HAVE_D3D11
     if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized &&
         cm->d3d11_srv && cm->d3d11_sampler) {

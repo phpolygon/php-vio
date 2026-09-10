@@ -396,6 +396,8 @@ if test "$PHP_VIO" != "no"; then
     src/backends/vulkan/vio_vulkan.c \
     src/backends/vulkan/vio_vulkan_3d.c \
     src/backends/vulkan/vio_vulkan_3d_shader.c \
+    src/backends/vulkan/vio_vulkan_rt.c \
+    src/backends/vulkan/vio_vulkan_cube.c \
     vendor/glad/src/glad.c \
     vendor/stb/stb_image_impl.c \
     vendor/stb/stb_truetype_impl.c \

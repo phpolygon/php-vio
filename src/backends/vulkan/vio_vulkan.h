@@ -38,6 +38,7 @@ typedef struct _vio_vulkan_texture {
     int           layout;       /* VkImageLayout for descriptors; 0 = SHADER_READ_ONLY_OPTIMAL */
     int           is_depth;     /* depth-format view (depth render target) */
     int           filter, wrap;
+    int           mip_levels;   /* > 1 => mip chain (sampler maxLod follows it) */
 } vio_vulkan_texture;
 
 /* Per-frame synchronization and command buffer resources.
@@ -68,6 +69,33 @@ typedef struct _vio_vulkan_compute_buffer {
      * survivors before vkDestroyDevice. */
     struct _vio_vulkan_compute_buffer *next, *prev;
 } vio_vulkan_compute_buffer;
+
+/* Render target resources (rt->vulkan_rt, vio_vulkan_rt.c, GAP-PHASE5 Block 10b). */
+typedef struct _vio_vk_rt {
+    int            count;          /* colour attachments (0 = depth-only) */
+    int            cube;           /* 6-layer colour image, one framebuffer per (face, level) */
+    int            levels;         /* mip levels of the colour image */
+    int            samples;        /* effective sample count (1 = off) */
+    VkFormat       color_format[4];
+    VkImage        color_image[4]; /* single-sample; the resolve target when MSAA */
+    void          *color_alloc[4];
+    VkImageView    color_view[4];
+    VkImage        msaa_image[4];
+    void          *msaa_alloc[4];
+    VkImageView    msaa_view[4];
+    VkImage        depth_image;
+    void          *depth_alloc;
+    VkImageView    depth_view;
+    VkRenderPass   pass;           /* colour (+ resolve) + depth, CLEAR */
+    VkRenderPass   pass_nodepth;   /* cube levels > 0 */
+    VkFramebuffer  fb;             /* 2D targets */
+    VkFramebuffer *face_fb;        /* cube: [face * levels + level] */
+    VkImageView   *face_view;
+    VkImageView    cube_view;
+    VkSampler      sampler;
+    struct _vio_vulkan_texture *wrap[4];   /* sampling wrappers (vio_render_target_texture) */
+    struct _vio_vulkan_texture *cube_wrap; /* vio_render_target_cubemap */
+} vio_vk_rt;
 
 /* Global Vulkan state */
 typedef struct _vio_vulkan_state {
@@ -286,7 +314,7 @@ void vio_2d_vulkan_reset_frame_descriptors(uint32_t frame_index);
  * These are invoked from php_vio.c (the vio_render_target / vio_bind_render_target
  * / vio_unbind_render_target / vio_render_target dispatchers) and operate on a
  * vio_render_target_object* passed as void* to avoid a header dependency on
- * vio_render_target.h here. The implementations live in vio_vulkan.c. */
+ * vio_render_target.h here. The implementations live in vio_vulkan_rt.c. */
 
 /* Register / unregister an RT in vio_vk.live_render_targets. Registration
  * happens at the end of a successful vulkan_create_render_target; unregistration
@@ -370,7 +398,7 @@ int      vio_vk_begin_transient(VkCommandBuffer *out_cmd);
 int      vio_vk_submit_transient(VkCommandBuffer cmd);
 /* Sampling wrapper for a render target (colour, or depth for depth_only targets),
  * cached on the target and owned by it. */
-void    *vulkan_rt_sampling_texture(void *rt);
+void    *vulkan_rt_sampling_texture(void *rt, int attachment);
 
 /* ── Deferred destruction + barriers (vio_vulkan_3d.c) ── */
 #define VIO_VK_GRAVE_IMAGE           1
@@ -386,6 +414,24 @@ void    *vulkan_rt_sampling_texture(void *rt);
 void vio_vk_defer_destroy(int kind, uint64_t handle, void *allocation);
 void vio_vk_image_barrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, uint32_t layers,
                           VkImageLayout from, VkImageLayout to);
+void vio_vk_image_barrier_range(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
+                                uint32_t base_level, uint32_t levels, uint32_t base_layer, uint32_t layers,
+                                VkImageLayout from, VkImageLayout to);
+void vio_vk_release_texture(vio_vulkan_texture *tex);   /* GPU objects (deferred mid-frame) + the wrapper */
+
+/* ── Render targets, cubemaps, mips (GAP-PHASE5 Block 10b, vio_vulkan_rt.c / vio_vulkan_cube.c) ── */
+VkRenderPass vio_vk_swapchain_resume_pass(void);
+void  vio_vk_resume_swapchain_pass(VkCommandBuffer cmd);
+int   vio_vk_bind_render_target_face(void *rt, int face, int level);
+void  vio_vk_clear_attachments(float r, float g, float b, float a);
+int   vio_vk_render_target_cubemap(void *rt, void *cm_obj);
+int   vio_vk_read_render_target(void *rt, int face, int attachment, void *out_rgba);
+int   vio_vk_record_mips(VkCommandBuffer cmd, VkImage img, int w, int h, int layers, int levels);
+void  vio_vk_texture_finish_mips(vio_vulkan_texture *tex);
+int   vio_vk_generate_mipmaps(void *obj, int kind);
+int   vio_vk_upload_cubemap(void *cm_obj, int width, int height, const void *faces[6]);
+void  vio_vk_destroy_cubemap(void *cm_obj);
+void  vio_vk_bind_cubemap(void *cm_obj, int slot);
 
 /* ── 3D pipeline (GAP-PHASE5 Block 10, vio_vulkan_3d*.c) ── */
 int   vio_vk3d_available(void);
@@ -407,7 +453,6 @@ void  vio_vk3d_draw_mesh_instanced(void *mesh_obj, const float *matrices, int co
 void  vio_vk3d_bind_storage_buffer(void *buf, int binding, int access, int element_count, int stride);
 void  vio_vk3d_draw_instanced_from_storage(void *mesh_obj, int count);
 void  vio_vk3d_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset);
-int   vio_vk3d_read_render_target(void *rt, int face, int attachment, void *out_rgba);
 
 #endif /* HAVE_VULKAN */
 #endif /* VIO_VULKAN_H */
