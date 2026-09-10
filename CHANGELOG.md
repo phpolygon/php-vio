@@ -1,3 +1,10 @@
+# [2.17.0](https://github.com/phpolygon/php-vio/compare/v2.16.0...v2.17.0) (2026-09-10)
+
+
+### Features
+
+* **core:** indirect draws from a storage buffer (vio_draw_indirect) ([f0cfe03](https://github.com/phpolygon/php-vio/commit/f0cfe03eeb9b476030bda9cf380457c0a8c51d86))
+
 # [2.16.0](https://github.com/phpolygon/php-vio/compare/v2.15.0...v2.16.0) (2026-09-10)
 
 
