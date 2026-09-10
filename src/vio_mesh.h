@@ -22,6 +22,7 @@ typedef struct _vio_mesh_object {
     void        *backend_ib;      /* Backend index buffer (D3D11/D3D12/Vulkan) */
     int          vertex_count;
     int          index_count;
+    int          index_bytes;     /* 2 (uint16, every index < 65536) or 4 (uint32); 0 when unindexed */
     int          has_colors;      /* 1 if vertex data includes colors */
     int          stride;          /* bytes per vertex */
     const struct _vio_backend *backend;  /* Backend that owns vao/vbo/ebo / backend_vb / backend_ib */

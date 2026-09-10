@@ -415,6 +415,7 @@ typedef struct _vio_draw_indexed_cmd {
     int   vertex_offset;
     int   instance_count;
     int   vertex_stride;    /* mesh stride in bytes (overrides pipeline stride if > 0) */
+    int   index_bytes;      /* 2 => uint16 indices, 4 (or 0) => uint32 (GAP-PHASE5 Block 2) */
 } vio_draw_indexed_cmd;
 
 typedef struct _vio_compute_cmd {

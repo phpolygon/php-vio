@@ -136,7 +136,7 @@ typedef struct _vio_backend {
                          const void *vertex_data, int vertex_data_size,
                          int stride,
                          const struct _vio_mesh_attrib *layout, int layout_count,
-                         const unsigned int *indices, int index_count);
+                         const void *indices, int index_count, int index_bytes);
 
     /* Upload a 2D RGBA8 texture into the given vio_texture_object. OpenGL
      * writes tex_obj->texture_id; other backends keep using the existing

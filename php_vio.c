@@ -1913,6 +1913,26 @@ ZEND_FUNCTION(vio_mesh)
         } ZEND_HASH_FOREACH_END();
     }
 
+    /* Index width (GAP-PHASE5 Block 2): 16-bit when every index fits, which
+     * halves index bandwidth for the typical mesh; 'index_type' =>
+     * VIO_INDEX_UINT32 forces the wide form (e.g. a mesh that is patched later). */
+    int index_bytes = 0;
+    uint16_t *indices16 = NULL;
+    const void *index_data = indices;
+    if (indices && index_count > 0) {
+        index_bytes = 4;
+        unsigned int max_index = 0;
+        for (int k = 0; k < index_count; k++) if (indices[k] > max_index) max_index = indices[k];
+        zval *it = zend_hash_str_find(config_ht, "index_type", sizeof("index_type") - 1);
+        int forced = it ? (int)zval_get_long(it) : 0;
+        if (forced != 4 && max_index < 65536) {
+            indices16 = emalloc(sizeof(uint16_t) * index_count);
+            for (int k = 0; k < index_count; k++) indices16[k] = (uint16_t)indices[k];
+            index_data = indices16;
+            index_bytes = 2;
+        }
+    }
+
     /* Create VioMesh object */
     zval mesh_zval;
     object_init_ex(&mesh_zval, vio_mesh_ce);
@@ -1920,6 +1940,7 @@ ZEND_FUNCTION(vio_mesh)
 
     mesh->vertex_count = vertex_count;
     mesh->index_count  = index_count;
+    mesh->index_bytes  = index_bytes;
     mesh->has_colors   = has_colors;
     mesh->stride       = floats_per_vertex * sizeof(float);
     mesh->backend      = ctx->backend;
@@ -1951,7 +1972,7 @@ ZEND_FUNCTION(vio_mesh)
         ctx->backend->create_mesh(mesh,
             data, (int)(sizeof(float) * vertex_data_count), mesh->stride,
             normalized_layout, normalized_layout_count,
-            indices, index_count);
+            index_data, index_count, index_bytes);
     }
 
     /* Backend buffer creation (D3D11/D3D12/Vulkan) */
@@ -1967,8 +1988,8 @@ ZEND_FUNCTION(vio_mesh)
         if (indices && index_count > 0) {
             vio_buffer_desc ib_desc = {0};
             ib_desc.type = VIO_BUFFER_INDEX;
-            ib_desc.data = indices;
-            ib_desc.size = sizeof(unsigned int) * index_count;
+            ib_desc.data = index_data;
+            ib_desc.size = (size_t)index_bytes * (size_t)index_count;
             mesh->backend_ib = ctx->backend->create_buffer(&ib_desc);
         }
     }
@@ -1977,8 +1998,23 @@ ZEND_FUNCTION(vio_mesh)
     if (indices) {
         efree(indices);
     }
+    if (indices16) {
+        efree(indices16);
+    }
 
     RETURN_COPY_VALUE(&mesh_zval);
+}
+
+/* Bytes per index of a mesh's index buffer: 2 (uint16), 4 (uint32) or 0 for an
+ * unindexed mesh. Diagnostic for callers / tests; draws pick the format themselves. */
+ZEND_FUNCTION(vio_mesh_index_bytes)
+{
+    zval *mesh_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(mesh_zval, vio_mesh_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_mesh_object *mesh = Z_VIO_MESH_P(mesh_zval);
+    RETURN_LONG(mesh->index_count > 0 ? mesh->index_bytes : 0);
 }
 
 /* Shared draw core: record ONE mesh draw onto the open frame command list.
@@ -2082,6 +2118,7 @@ static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
             cmd.vertex_buffer = mesh->backend_vb;
             cmd.index_buffer = mesh->backend_ib;
             cmd.index_count = mesh->index_count;
+            cmd.index_bytes = mesh->index_bytes;
             cmd.first_index = 0;
             cmd.vertex_offset = 0;
             cmd.instance_count = 1;
@@ -6700,6 +6737,10 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_COLOR_RGB", VIO_COLOR_RGB, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_COLOR_RGBA", VIO_COLOR_RGBA, CONST_CS | CONST_PERSISTENT);
 
+    /* Index width (vio_mesh 'index_type'; default = automatic) */
+    REGISTER_LONG_CONSTANT("VIO_INDEX_UINT16", 2, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_INDEX_UINT32", 4, CONST_CS | CONST_PERSISTENT);
+
     /* Depth function */
     REGISTER_LONG_CONSTANT("VIO_DEPTH_LESS", VIO_DEPTH_LESS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_DEPTH_LEQUAL", VIO_DEPTH_LEQUAL, CONST_CS | CONST_PERSISTENT);
@@ -7800,6 +7841,7 @@ ZEND_FUNCTION(vio_draw_instanced)
                 cmd.vertex_buffer = mesh->backend_vb;
                 cmd.index_buffer = mesh->backend_ib;
                 cmd.index_count = mesh->index_count;
+                cmd.index_bytes = mesh->index_bytes;
                 cmd.instance_count = (int)instance_count;
                 cmd.vertex_stride = mesh->stride;
                 ctx->backend->draw_indexed(&cmd);

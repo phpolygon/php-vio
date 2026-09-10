@@ -1439,7 +1439,7 @@ static void opengl_draw_mesh(void *mesh_obj)
 
     glBindVertexArray(mesh->vao);
     if (mesh->index_count > 0) {
-        glDrawElements(GL_TRIANGLES, mesh->index_count, GL_UNSIGNED_INT, 0);
+        glDrawElements(GL_TRIANGLES, mesh->index_count, mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0);
     } else {
         glDrawArrays(GL_TRIANGLES, 0, mesh->vertex_count);
     }
@@ -1478,7 +1478,7 @@ static void opengl_draw_mesh_instanced(void *mesh_obj,
 
     if (mesh->index_count > 0) {
         glDrawElementsInstanced(GL_TRIANGLES, mesh->index_count,
-                                GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
+                                mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
     } else {
         glDrawArraysInstanced(GL_TRIANGLES, 0, mesh->vertex_count,
                               (GLsizei)instance_count);
@@ -1523,7 +1523,7 @@ static void opengl_draw_instanced_from_storage(void *mesh_obj, int instance_coun
     glBindVertexArray(mesh->vao);
     if (mesh->index_count > 0) {
         glDrawElementsInstanced(GL_TRIANGLES, mesh->index_count,
-                                GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
+                                mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
     } else {
         glDrawArraysInstanced(GL_TRIANGLES, 0, mesh->vertex_count,
                               (GLsizei)instance_count);
@@ -1627,7 +1627,7 @@ static int opengl_create_mesh(void *mesh_obj,
                               const void *vertex_data, int vertex_data_size,
                               int stride,
                               const vio_mesh_attrib *layout, int layout_count,
-                              const unsigned int *indices, int index_count)
+                              const void *indices, int index_count, int index_bytes)
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!vio_gl.initialized) return -1;
@@ -1653,7 +1653,7 @@ static int opengl_create_mesh(void *mesh_obj,
         glGenBuffers(1, &mesh->ebo);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh->ebo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     sizeof(unsigned int) * (size_t)index_count,
+                     (GLsizeiptr)((index_bytes == 2 ? 2 : 4) * (size_t)index_count),
                      indices, GL_STATIC_DRAW);
     }
 

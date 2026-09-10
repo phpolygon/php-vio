@@ -2858,9 +2858,9 @@ static void metal_draw_indexed(vio_draw_indexed_cmd *cmd)
         NSUInteger instances = cmd->instance_count > 0 ? (NSUInteger)cmd->instance_count : 1;
         [vio_mtl.current_encoder drawIndexedPrimitives:metal_current_pipeline->primitive
                                             indexCount:(NSUInteger)cmd->index_count
-                                             indexType:MTLIndexTypeUInt32
+                                             indexType:(cmd->index_bytes == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32)
                                            indexBuffer:(__bridge id<MTLBuffer>)ib->buffer
-                                     indexBufferOffset:(NSUInteger)cmd->first_index * 4
+                                     indexBufferOffset:(NSUInteger)cmd->first_index * (cmd->index_bytes == 2 ? 2 : 4)
                                          instanceCount:instances
                                             baseVertex:(NSInteger)cmd->vertex_offset
                                           baseInstance:0];
@@ -2875,7 +2875,7 @@ static void metal_draw_mesh_instances(vio_mesh_object *mesh, int instance_count)
     if (mesh->index_count > 0 && ib && ib->buffer) {
         [vio_mtl.current_encoder drawIndexedPrimitives:metal_current_pipeline->primitive
                                             indexCount:(NSUInteger)mesh->index_count
-                                             indexType:MTLIndexTypeUInt32
+                                             indexType:(mesh->index_bytes == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32)
                                            indexBuffer:(__bridge id<MTLBuffer>)ib->buffer
                                      indexBufferOffset:0
                                          instanceCount:(NSUInteger)instance_count

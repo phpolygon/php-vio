@@ -3691,7 +3691,7 @@ static void d3d12_draw_indexed(vio_draw_indexed_cmd *cmd)
         D3D12_INDEX_BUFFER_VIEW ibv = {0};
         ibv.BufferLocation = ib->gpu_address;
         ibv.SizeInBytes = (UINT)ib->size;
-        ibv.Format = DXGI_FORMAT_R32_UINT;
+        ibv.Format = cmd->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
         ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
     }
 
@@ -4755,7 +4755,7 @@ static void d3d12_draw_instanced_from_storage(void *mesh_obj, int instance_count
         D3D12_INDEX_BUFFER_VIEW ibv = {0};
         ibv.BufferLocation = ib->gpu_address;
         ibv.SizeInBytes = (UINT)ib->size;
-        ibv.Format = DXGI_FORMAT_R32_UINT;
+        ibv.Format = mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
         ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
         ID3D12GraphicsCommandList_DrawIndexedInstanced(vio_d3d12.cmd_list,
             (UINT)mesh->index_count, (UINT)instance_count, 0, 0, 0);
