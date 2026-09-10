@@ -46,6 +46,7 @@ probe("opengl", [
     VIO_FEATURE_RENDER_TARGET_HDR  => 1,
     VIO_FEATURE_RENDER_TARGET_DEPTH=> 1,
     VIO_FEATURE_RENDER_TARGET_MSAA => 1,
+    VIO_FEATURE_STENCIL            => 1,   /* DEPTH24_STENCIL8 attachments (GAP-PHASE5 1) */
     VIO_FEATURE_CUBEMAP            => 1,
     VIO_FEATURE_DEPTH_BIAS         => 1,
     VIO_FEATURE_SCISSOR            => 1,
@@ -67,6 +68,7 @@ probe("null", [
     VIO_FEATURE_RENDER_TARGET      => 0,
     VIO_FEATURE_READ_PIXELS        => 0,
     VIO_FEATURE_NATIVE_2D_BATCH    => 0,
+    VIO_FEATURE_STENCIL            => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -110,6 +112,8 @@ $d3d_common = [
     VIO_FEATURE_VERTEX_STORAGE     => 1,
     VIO_FEATURE_STORAGE_IMAGE      => 1,
     VIO_FEATURE_MRT                => 1,
+    VIO_FEATURE_STENCIL            => 1,   /* D24S8 + depth-stencil state (GAP-PHASE5 1) */
+    VIO_FEATURE_RENDER_TARGET_MSAA => 1,   /* D3D11: ResolveSubresource (GAP-PLAN 3); D3D12: PSO sample variants (GAP-PHASE5 1) */
     VIO_FEATURE_TESSELLATION       => 0,
     VIO_FEATURE_GEOMETRY           => 0,
     VIO_FEATURE_RAYTRACING         => 0,
@@ -117,13 +121,11 @@ $d3d_common = [
 ];
 probe_fold("d3d11", $d3d_common + [
     VIO_FEATURE_TEXTURE_SWIZZLE    => 0,   /* D3D11 SRVs have no component mapping */
-    VIO_FEATURE_RENDER_TARGET_MSAA => 1,   /* multisampled colour + ResolveSubresource (GAP-PLAN 3) */
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,   /* GAP-PLAN 2.2 */
     VIO_FEATURE_MIPMAP_GEN         => 1,   /* GenerateMips (GAP-PLAN 2.3) */
 ]);
 probe_fold("d3d12", $d3d_common + [
     VIO_FEATURE_TEXTURE_SWIZZLE    => 1,   /* Shader4ComponentMapping */
-    VIO_FEATURE_RENDER_TARGET_MSAA => 0,   /* PSO SampleDesc variant pending (GAP-PLAN 5) */
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,   /* GAP-PLAN 2.2 */
     VIO_FEATURE_MIPMAP_GEN         => 1,   /* CPU box filter + re-upload (GAP-PLAN 2.3) */
 ]);
@@ -133,6 +135,7 @@ probe_fold("d3d12", $d3d_common + [
  * vio_create('auto') from picking it over OpenGL on Linux — test 100). */
 probe_fold("vulkan", [
     VIO_FEATURE_3D_PIPELINE        => 0,
+    VIO_FEATURE_STENCIL            => 0,
     VIO_FEATURE_INSTANCED_DRAW     => 0,
     VIO_FEATURE_DEPTH_BIAS         => 0,
     VIO_FEATURE_TESSELLATION       => 0,

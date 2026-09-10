@@ -55,6 +55,30 @@ typedef enum _vio_depth_func {
     VIO_DEPTH_LEQUAL = 1,
 } vio_depth_func;
 
+/* ── Comparison function (stencil test; GAP-PHASE5 Block 1) ───────── */
+typedef enum _vio_compare_func {
+    VIO_CMP_NEVER    = 0,
+    VIO_CMP_LESS     = 1,
+    VIO_CMP_EQUAL    = 2,
+    VIO_CMP_LEQUAL   = 3,
+    VIO_CMP_GREATER  = 4,
+    VIO_CMP_NOTEQUAL = 5,
+    VIO_CMP_GEQUAL   = 6,
+    VIO_CMP_ALWAYS   = 7,
+} vio_compare_func;
+
+/* ── Stencil operation (what happens to the stencil value) ────────── */
+typedef enum _vio_stencil_op {
+    VIO_STENCIL_KEEP      = 0,
+    VIO_STENCIL_ZERO      = 1,
+    VIO_STENCIL_REPLACE   = 2,   /* write the reference value */
+    VIO_STENCIL_INCR      = 3,   /* increment, clamp at 255 */
+    VIO_STENCIL_DECR      = 4,   /* decrement, clamp at 0 */
+    VIO_STENCIL_INVERT    = 5,
+    VIO_STENCIL_INCR_WRAP = 6,
+    VIO_STENCIL_DECR_WRAP = 7,
+} vio_stencil_op;
+
 /* ── Blend mode ───────────────────────────────────────────────────── */
 
 typedef enum _vio_blend_mode {
@@ -209,6 +233,10 @@ typedef enum _vio_feature {
      * core 4.3), so GL < 4.3 reports 0 and callers stay on the readback path.
      * Value 30 (leaves 23-29 free for unrelated features). */
     VIO_FEATURE_VERTEX_STORAGE     = 30,
+    /* Stencil test / write through vio_pipeline(['stencil' => [...]]) — the
+     * depth attachment carries 8 stencil bits and the pipeline state exposes
+     * compare function, reference, masks and the three operations. */
+    VIO_FEATURE_STENCIL            = 31,
 } vio_feature;
 
 /* ── Input actions ────────────────────────────────────────────────── */
@@ -303,6 +331,18 @@ typedef struct _vio_pipeline_desc {
                                                 data attachment stays untouched). */
     int              attachment_blend[VIO_MAX_COLOR_ATTACHMENTS]; /* vio_blend_mode per attachment */
     int              attachment_mask[VIO_MAX_COLOR_ATTACHMENTS];  /* VIO_COLOR_* bits per attachment */
+    /* Stencil test (vio_pipeline(['stencil' => [...]]), VIO_FEATURE_STENCIL). The
+     * same function / operations apply to front and back faces. The depth
+     * attachments of every backend that reports the feature carry 8 stencil bits
+     * (D24S8 on D3D, DEPTH24_STENCIL8 on GL); vio_clear resets them to 0. */
+    int              stencil_enable;
+    int              stencil_func;           /* vio_compare_func */
+    int              stencil_ref;            /* 0..255 */
+    int              stencil_read_mask;      /* 0..255 */
+    int              stencil_write_mask;     /* 0..255 */
+    int              stencil_pass_op;        /* vio_stencil_op: stencil + depth passed */
+    int              stencil_fail_op;        /* vio_stencil_op: stencil test failed */
+    int              stencil_depth_fail_op;  /* vio_stencil_op: stencil passed, depth failed */
 } vio_pipeline_desc;
 
 typedef struct _vio_buffer_desc {

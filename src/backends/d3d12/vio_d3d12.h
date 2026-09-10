@@ -89,9 +89,18 @@ typedef struct _vio_d3d12_shader {
 
 /* Pipeline = PSO + root signature reference */
 typedef struct _vio_d3d12_pipeline {
-    ID3D12PipelineState    *pso;
+    ID3D12PipelineState    *pso;              /* single-sample variant */
     D3D12_PRIMITIVE_TOPOLOGY topology;
     UINT                     vertex_stride;
+    /* MSAA variants (GAP-PHASE5 Block 1): a PSO bakes its SampleDesc, so drawing
+     * into a target with 2 / 4 / 8 samples needs its own variant. Built lazily
+     * from pso_desc (SampleDesc.Count = 1 template) the first time the pipeline
+     * is bound while such a target is bound; index = log2(samples). */
+    ID3D12PipelineState    *pso_ms[4];
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;
+    D3D12_INPUT_ELEMENT_DESC *input_elements;  /* owned; referenced by pso_desc */
+    char                   (*sem_names)[24];   /* owned; semantic names of matrix columns */
+    UINT                     stencil_ref;      /* OMSetStencilRef */
 } vio_d3d12_pipeline;
 
 /* Buffer wrapper */
@@ -314,6 +323,7 @@ typedef struct _vio_d3d12_state {
     int current_rt_width;
     int current_rt_height;
     int current_has_rtv;  /* 0 = depth-only when offscreen */
+    int current_rt_samples; /* sample count of the bound target (1 = swapchain / single-sample) */
     void *current_bound_rt; /* vio_render_target_object* for barrier tracking */
     void *pending_bound_rt; /* vio_render_target_object* requested via vio_bind_render_target
                              * while the command list was closed (before vio_begin); applied

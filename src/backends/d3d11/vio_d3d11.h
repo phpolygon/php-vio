@@ -42,6 +42,7 @@ typedef struct _vio_d3d11_pipeline {
     ID3D11PixelShader       *ps;
     D3D11_PRIMITIVE_TOPOLOGY topology;
     UINT                     vertex_stride;
+    UINT                     stencil_ref;      /* OMSetDepthStencilState reference */
 } vio_d3d11_pipeline;
 
 /* Buffer wrapper */

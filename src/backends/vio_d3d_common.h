@@ -69,4 +69,39 @@ static inline const char *vio_usage_to_semantic(vio_usage u)
 }
 
 #endif /* HAVE_D3D11 || HAVE_D3D12 */
+
+/* Stencil state mapping shared by D3D11 / D3D12. Only dxgiformat.h is included
+ * here, so the values are the numeric D3D11_/D3D12_COMPARISON_FUNC and
+ * D3D11_/D3D12_STENCIL_OP constants (identical in both APIs; callers cast). */
+static inline int vio_d3d_compare_func_value(int f)
+{
+    switch (f) {
+        case VIO_CMP_NEVER:    return 1;  /* D3D1x_COMPARISON_NEVER */
+        case VIO_CMP_LESS:     return 2;
+        case VIO_CMP_EQUAL:    return 3;
+        case VIO_CMP_LEQUAL:   return 4;
+        case VIO_CMP_GREATER:  return 5;
+        case VIO_CMP_NOTEQUAL: return 6;
+        case VIO_CMP_GEQUAL:   return 7;
+        default:               return 8;  /* ALWAYS */
+    }
+}
+static inline int vio_d3d_stencil_op_value(int op)
+{
+    switch (op) {
+        case VIO_STENCIL_ZERO:      return 2;  /* D3D1x_STENCIL_OP_ZERO */
+        case VIO_STENCIL_REPLACE:   return 3;
+        case VIO_STENCIL_INCR:      return 4;  /* INCR_SAT */
+        case VIO_STENCIL_DECR:      return 5;  /* DECR_SAT */
+        case VIO_STENCIL_INVERT:    return 6;
+        case VIO_STENCIL_INCR_WRAP: return 7;  /* INCR */
+        case VIO_STENCIL_DECR_WRAP: return 8;  /* DECR */
+        default:                    return 1;  /* KEEP */
+    }
+}
+#define vio_d3d_compare_func(f)    ((D3D11_COMPARISON_FUNC)vio_d3d_compare_func_value(f))
+#define vio_d3d_stencil_op(op)     ((D3D11_STENCIL_OP)vio_d3d_stencil_op_value(op))
+#define vio_d3d_compare_func_12(f) ((D3D12_COMPARISON_FUNC)vio_d3d_compare_func_value(f))
+#define vio_d3d_stencil_op_12(op)  ((D3D12_STENCIL_OP)vio_d3d_stencil_op_value(op))
+
 #endif /* VIO_D3D_COMMON_H */

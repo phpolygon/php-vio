@@ -3119,6 +3119,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_HDR:   return 0; /* R16G16B16A16_SFLOAT offscreen not wired (HDR deferred) */
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 0; /* depth-RT sampling descriptor not wired */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 0;
+        case VIO_FEATURE_STENCIL:             return 0; /* with the 3D pipeline (GAP-PHASE5 Block 10) */
         case VIO_FEATURE_CUBEMAP:      return 0;
         case VIO_FEATURE_DEPTH_BIAS:   return 0; /* pipeline rasterization state — no 3D pipeline to carry it */
         case VIO_FEATURE_SCISSOR:      return 1;
