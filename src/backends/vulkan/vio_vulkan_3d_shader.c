@@ -692,10 +692,14 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     cb.attachmentCount = (uint32_t)cc;
     cb.pAttachments    = cc > 0 ? att : NULL;
 
-    VkDynamicState dyn_states[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkDynamicState dyn_states[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_VIEWPORT };
+    uint32_t dyn_count = 2;
+#ifdef VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME
+    if (vio_vk.vrs_supported) dyn_states[dyn_count++] = VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;   /* Block 10c */
+#endif
     VkPipelineDynamicStateCreateInfo dyn = {0};
     dyn.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dyn.dynamicStateCount = 2;
+    dyn.dynamicStateCount = dyn_count;
     dyn.pDynamicStates    = dyn_states;
 
     VkGraphicsPipelineCreateInfo gi = {0};

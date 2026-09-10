@@ -99,7 +99,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 | `tests/render3d/112` | Blend und Write-Mask je Attachment auf einer MRT-Pipeline: Attachment 0 alpha-blendet, Attachment 1 (Maske 0) bleibt unberührt, Attachment 2 schreibt nur den Rotkanal – der Vertrag für einen Transparent-Pass in ein G-Buffer-Target. |
 | `tests/render3d/123` | 3D-Konventionen auf allen Backends (Vulkan wie D3D): Tiefentest, Back-Face-Culling, Uniforms je Stage, Textur-V, Instancing (gepackt), RT-Readback-Zeile 0 und gesampelte Orientierung, Depth-only-Target. |
 | `tests/render3d/124` | MRT mit gemischten Formaten (RGBA16F / R11G11B10F / RGB10A2 / R8): Readback je Attachment und Sampling von Attachment 1; `'mipmaps' => true`-Texturen filtern bei LOD 2 auf den Mittelwert. |
-| `tests/render3d/122` | Variable Rate Shading (D3D12): mit 2X2 teilen benachbarte Pixel eines Blocks denselben Fragment-Wert, mit 1X1 nicht; ohne VRS-Tier liefert `vio_set_shading_rate` `false`. |
+| `tests/render3d/122` | Variable Rate Shading (D3D12, Vulkan): mit 2X2 teilen benachbarte Pixel eines Blocks denselben Fragment-Wert, mit 1X1 nicht; ohne VRS-Tier liefert `vio_set_shading_rate` `false`. |
 | `tests/render3d/121` | Texture-Arrays / BC / KTX2: zweischichtiges RGBA8-Array mit expliziter Mip-Kette (`sampler2DArray`, `textureLod`), ein handkodierter BC1-Block, KTX2-Container (BC1 und RGBA8 mit `mip_offset`), defekte Eingabe → `false`. |
 | `tests/render3d/120` | Indirect Draw: zwei Argument-Records (instanceCount 1 / 0) aus einem Storage-Buffer zeichnen genau einen Quad; unindiziertes Mesh mit 4-uint32-Records; ein Compute-Pass, der instanceCount schreibt, steuert den Draw ohne Readback. |
 | `tests/core/119` | `shader_model => 6` auf D3D12 (dxcompiler/dxil aus `dxc_dir`, dem Windows-SDK oder dem Suchpfad): `vio_swapchain_info` meldet 6, Grafik- und Compute-Shader laufen als DXIL; ohne DXC ehrlicher Fallback auf 5. |
@@ -176,8 +176,8 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | uint16-Indices (automatisch, `vio_mesh_index_bytes`) | ✅ | ✅ (R16_UINT) | ✅ (R16_UINT) | ✅ (`VK_INDEX_TYPE_UINT16`) | ✅ (MTLIndexTypeUInt16) |
 | Shader-/Pipeline-Cache auf Platte (`vio_create(['shader_cache' => dir])`, `vio_shader_cache_stats`) | ✅ (GL ≥ 4.1 Program-Binary) | ✅ (DXBC je Stage) | ✅ (DXBC je Stage) | ✅ (`VkPipelineCache`) | — (Metal cacht selbst) |
 | Indirect Draw (`vio_draw_indirect`, `vio_storage_buffer(['indirect' => true])`, `VIO_FEATURE_INDIRECT_DRAW`) | ✅ (GL ≥ 4.0 `glDraw*Indirect`) | ✅ (`Draw*InstancedIndirect`) | ✅ (`ExecuteIndirect`) | ✅ (`vkCmdDraw(Indexed)Indirect`, Multi-Draw wenn verfügbar) | ✅ (`indirectBuffer:`) |
-| Texture-Arrays + BC + KTX2 (`vio_texture(['layers', 'format' => VIO_FORMAT_BC*, 'mip_levels'])`, `vio_texture_ktx2`, `VIO_FEATURE_TEXTURE_ARRAY` / `_TEXTURE_COMPRESSION_BC`) | ✅ (`GL_TEXTURE_2D_ARRAY`, S3TC/RGTC/BPTC) | ✅ | ✅ | ❌ (Block 10) | ✅ (`MTLTextureType2DArray`, BC-Formate) |
-| Variable Rate Shading (`vio_set_shading_rate`, `VIO_SHADING_RATE_*`, `VIO_FEATURE_SHADING_RATE`) | ❌ | ❌ | ✅ (`RSSetShadingRate`, Tier 1+; 4X4 nur mit Additional Rates) | ❌ (Block 10) | ❌ |
+| Texture-Arrays + BC + KTX2 (`vio_texture(['layers', 'format' => VIO_FORMAT_BC*, 'mip_levels'])`, `vio_texture_ktx2`, `VIO_FEATURE_TEXTURE_ARRAY` / `_TEXTURE_COMPRESSION_BC`) | ✅ (`GL_TEXTURE_2D_ARRAY`, S3TC/RGTC/BPTC) | ✅ | ✅ | ✅ (2D-Array-Views, `textureCompressionBC`, Block 10c) | ✅ (`MTLTextureType2DArray`, BC-Formate) |
+| Variable Rate Shading (`vio_set_shading_rate`, `VIO_SHADING_RATE_*`, `VIO_FEATURE_SHADING_RATE`) | ❌ | ❌ | ✅ (`RSSetShadingRate`, Tier 1+; 4X4 nur mit Additional Rates) | ✅ (`VK_KHR_fragment_shading_rate`, Pipeline-Rate als Dynamic State, Block 10c) | ❌ |
 | Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Fallback FXC 5.1) | — | — |
 | HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | — (Block 10) | — |
 | Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | — (3 Drawables) |
@@ -211,7 +211,11 @@ B8G8R8A8, damit der 2D-Batch passt), MSAA mit Resolve-Attachments im Pass, Cube-
 Framebuffer je (Face, Level), Level > 0 ohne Tiefe. Cubemaps und Mip-Ketten (`'mipmaps' => true`,
 `vio_generate_mipmaps`) laufen über `vkCmdBlitImage` (`vio_vulkan_cube.c`). `vio_clear` im Frame
 löscht die Attachments des offenen Passes (`vkCmdClearAttachments`, wie D3D12). Freigaben mitten im
-Frame parken auch hier bis zum Fence. Offen (Block 10c): Texture-Arrays/BC/KTX2, Variable Rate Shading.
+Frame parken auch hier bis zum Fence. Texture-Arrays, BC-Daten und gespeicherte Mip-Ketten (KTX2) laufen über
+`vio_vk_create_texture_ex`, eine Kopie je Level deckt alle Layer ab. Variable Rate Shading nutzt
+`VK_KHR_fragment_shading_rate` als Dynamic State jeder 3D-Pipeline; die Einstiegspunkte kommen per
+`vkGetInstanceProcAddr`/`vkGetDeviceProcAddr`, die Instanz läuft dafür mit API 1.1 (Block 10c).
+Offen: HDR10-Swapchain (`VIO_FEATURE_HDR_OUTPUT`).
 Metal, Geometry-/Tessellation-Shader gibt es in Metal nicht (`VIO_FEATURE_GEOMETRY == 0`).
 
 #### Metal-3D-Pipeline (`src/backends/metal/vio_metal.m`)
@@ -828,8 +832,9 @@ Aufrufer geändert hat:
   über `vio_shader`), D3D12 `RENDER_TARGET_MSAA = 0` (PSO braucht `SampleDesc`, Phase 5),
   D3D12 `TEXTURE_SWIZZLE = 1`. `074` pinnt jetzt auch d3d11/d3d12/vulkan.
 - **`auto` überspringt Backends ohne 3D-Pipeline**, wenn ein späterer Kandidat eine hat
-  (Linux: OpenGL vor Vulkan, solange Vulkan nicht den vollständigen 3D-Satz meldet – MRT,
-  Cube-Targets, Cubemaps, Texture-Arrays; Registry-Pass 0, GAP-PHASE5 Block 10). Test `100`.
+  (Registry-Pass 0 verlangt den vollständigen 3D-Satz – MRT, Cube-Targets, Cubemaps, Texture-Arrays –,
+  den Vulkan seit GAP-PHASE5 Block 10c meldet; Linux wählt damit wieder Vulkan vor OpenGL. Kann das
+  gewählte Backend kein Device öffnen, versucht `vio_create('auto')` den nächsten Kandidaten). Test `100`.
 - **Audit-Gate `099`** friert `strcmp(ctx->backend->name, …)` (66) und `#if HAVE_D3D11/
   D3D12/VULKAN` (47) in `php_vio.c` ein — neue Backend-Fähigkeiten gehen über Vtable-Slots.
   Render-Target-Erstellung/-Bind/-Unbind/-Readback und Cubemap-Upload für D3D11/D3D12
@@ -880,11 +885,10 @@ Aufrufer geändert hat:
 
 ## Bekannte Einschränkungen
 
-- **Vulkan-3D ist fast vollständig** (GAP-PHASE5 Block 10a/10b): 3D-Pipeline, Instancing, Depth-Bias,
-  Stencil, Vertex-Storage, Indirect Draw, HDR-/Depth-only-/MSAA-/Cube-Targets, MRT, Cubemaps und
-  Mipmaps sind da; Texture-Arrays/BC/KTX2 und VRS fehlen noch (Flags 0, Block 10c). `auto` wählt
-  zuerst ein Backend mit dem vollständigen Satz inklusive Texture-Arrays (Registry-Pass 0), unter
-  Linux also weiter OpenGL.
+- **Vulkan-3D** (GAP-PHASE5 Block 10a–10c) hat den vollständigen Satz: 3D-Pipeline, Instancing,
+  Depth-Bias, Stencil, Vertex-Storage, Indirect Draw, HDR-/Depth-only-/MSAA-/Cube-Targets, MRT,
+  Cubemaps, Mipmaps, Texture-Arrays/BC/KTX2 und Variable Rate Shading (wenn das Device
+  `VK_KHR_fragment_shading_rate` hat). Es fehlt nur die HDR10-Swapchain (`VIO_FEATURE_HDR_OUTPUT = 0`).
 - **D3D12 RT-MSAA** (GAP-PHASE5 Block 1): jede `vio_d3d12_pipeline` hält ihre PSO-Beschreibung und
   baut beim Binden lazily die Variante für die Sample-Zahl des gebundenen Targets (2/4/8);
   die RT-Farbe liegt in multisampled Ressourcen, die Resolve-Ziele (SRV/Readback) werden beim

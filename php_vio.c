@@ -97,6 +97,11 @@ PHP_INI_END()
 
 /* ── PHP function implementations ─────────────────────────────────── */
 
+/* vio_create('auto') (GAP-PHASE5 Block 10c): a registered backend that cannot open a
+ * device on this machine (a Vulkan loader without a driver, ...) hands over to the
+ * next candidate instead of failing the whole call. */
+#define VIO_CREATE_FAIL() do { if (auto_pick && tried_n < 8) { tried[tried_n++] = backend; goto pick_backend; } RETURN_FALSE; } while (0)
+
 ZEND_FUNCTION(vio_create)
 {
     char *backend_name = NULL;
@@ -110,10 +115,15 @@ ZEND_FUNCTION(vio_create)
         Z_PARAM_ARRAY_HT(options_ht)
     ZEND_PARSE_PARAMETERS_END();
 
+    int auto_pick = !backend_name || strcmp(backend_name, "auto") == 0;
+    const vio_backend *tried[8];
+    int tried_n = 0;
+
     /* Find backend */
     const vio_backend *backend;
-    if (!backend_name || strcmp(backend_name, "auto") == 0) {
-        backend = vio_get_auto_backend();
+pick_backend:
+    if (auto_pick) {
+        backend = vio_get_auto_backend_skip(tried, tried_n);
     } else {
         backend = vio_find_backend(backend_name);
     }
@@ -204,7 +214,7 @@ ZEND_FUNCTION(vio_create)
     if (ctx->backend->init && ctx->backend->init(&ctx->config) != 0) {
         php_error_docref(NULL, E_WARNING, "Failed to initialize backend \"%s\"", ctx->backend->name);
         zval_ptr_dtor(&obj);
-        RETURN_FALSE;
+        VIO_CREATE_FAIL();
     }
 
 #ifdef HAVE_GLFW
@@ -216,7 +226,7 @@ ZEND_FUNCTION(vio_create)
                 ctx->backend->shutdown();
             }
             zval_ptr_dtor(&obj);
-            RETURN_FALSE;
+            VIO_CREATE_FAIL();
         }
 
         /* Install input callbacks */
@@ -231,7 +241,7 @@ ZEND_FUNCTION(vio_create)
                     ctx->backend->shutdown();
                 }
                 zval_ptr_dtor(&obj);
-                RETURN_FALSE;
+                VIO_CREATE_FAIL();
             }
 
             /* Headless: ask the backend to set up its offscreen target. For
@@ -246,7 +256,7 @@ ZEND_FUNCTION(vio_create)
                     vio_window_destroy(ctx->window);
                     ctx->window = NULL;
                     zval_ptr_dtor(&obj);
-                    RETURN_FALSE;
+                    VIO_CREATE_FAIL();
                 }
             }
         }
@@ -261,7 +271,7 @@ ZEND_FUNCTION(vio_create)
                     ctx->backend->shutdown();
                 }
                 zval_ptr_dtor(&obj);
-                RETURN_FALSE;
+                VIO_CREATE_FAIL();
             }
         }
 #endif
@@ -276,7 +286,7 @@ ZEND_FUNCTION(vio_create)
                     ctx->backend->shutdown();
                 }
                 zval_ptr_dtor(&obj);
-                RETURN_FALSE;
+                VIO_CREATE_FAIL();
             }
         }
 #endif
@@ -291,7 +301,7 @@ ZEND_FUNCTION(vio_create)
                     ctx->backend->shutdown();
                 }
                 zval_ptr_dtor(&obj);
-                RETURN_FALSE;
+                VIO_CREATE_FAIL();
             }
         }
 #endif
@@ -306,7 +316,7 @@ ZEND_FUNCTION(vio_create)
                     ctx->backend->shutdown();
                 }
                 zval_ptr_dtor(&obj);
-                RETURN_FALSE;
+                VIO_CREATE_FAIL();
             }
         }
 #endif
@@ -327,7 +337,7 @@ ZEND_FUNCTION(vio_create)
                 ctx->backend->shutdown();
             }
             zval_ptr_dtor(&obj);
-            RETURN_FALSE;
+            VIO_CREATE_FAIL();
         }
     }
 #endif

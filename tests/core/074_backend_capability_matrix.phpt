@@ -145,7 +145,8 @@ probe_fold("d3d12", $d3d_common + [
 
 /* Vulkan: 3D pipeline since GAP-PHASE5 Block 10 (SPIR-V round trip, frame upload
  * ring, HDR / depth targets); MRT, MSAA and cube targets, cubemaps and mip
- * generation since Block 10b. Texture arrays / BC and shading rate follow (10c). */
+ * generation since Block 10b; texture arrays / BC since 10c. SHADING_RATE depends on the
+ * device (VK_KHR_fragment_shading_rate) and is exercised by test 122 instead. */
 probe_fold("vulkan", [
     VIO_FEATURE_3D_PIPELINE        => 1,   /* GAP-PHASE5 10 */
     VIO_FEATURE_STENCIL            => 1,   /* D32S8 / D24S8 attachments */
@@ -158,9 +159,8 @@ probe_fold("vulkan", [
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,
     VIO_FEATURE_CUBEMAP            => 1,
     VIO_FEATURE_MIPMAP_GEN         => 1,
-    VIO_FEATURE_TEXTURE_ARRAY      => 0,   /* with the 3D pipeline (GAP-PHASE5 10) */
-    VIO_FEATURE_TEXTURE_COMPRESSION_BC => 0,
-    VIO_FEATURE_SHADING_RATE       => 0,   /* VK_KHR_fragment_shading_rate with the 3D pipeline */
+    VIO_FEATURE_TEXTURE_ARRAY      => 1,   /* GAP-PHASE5 10c */
+    VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1,   /* textureCompressionBC (every desktop GPU) */
     VIO_FEATURE_INSTANCED_DRAW     => 1,
     VIO_FEATURE_DEPTH_BIAS         => 1,
     VIO_FEATURE_TESSELLATION       => 0,

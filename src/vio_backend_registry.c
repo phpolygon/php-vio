@@ -61,6 +61,18 @@ const vio_backend *vio_find_backend(const char *name)
 
 const vio_backend *vio_get_auto_backend(void)
 {
+    return vio_get_auto_backend_skip(NULL, 0);
+}
+
+static int vio_backend_skipped(const vio_backend *b, const vio_backend **skip, int skip_count)
+{
+    for (int i = 0; i < skip_count; i++) if (skip[i] == b) return 1;
+    return 0;
+}
+
+/* 'auto' minus the backends vio_create already failed to open (GAP-PHASE5 Block 10c). */
+const vio_backend *vio_get_auto_backend_skip(const vio_backend **skip, int skip_count)
+{
     /* Platform-specific priority:
      * macOS:   metal > opengl (Vulkan via MoltenVK is opt-in, not auto)
      * Windows: d3d12 > d3d11 > vulkan > opengl
@@ -86,11 +98,11 @@ const vio_backend *vio_get_auto_backend(void)
      * 3D pipeline it automatically becomes eligible again. */
     /* Pass 0 (GAP-PHASE5 Block 10): prefer a backend with the full 3D feature set an
      * engine renderer needs (HDR / depth / cube targets, MRT, cubemaps, instancing,
-     * texture arrays), so a backend whose 3D path is still growing (Vulkan until
-     * Block 10c brings texture arrays / BC) never wins 'auto' over a complete one. */
+     * texture arrays), so a backend whose 3D path is still growing (Vulkan before
+     * Block 10c) never wins 'auto' over a complete one. */
     for (int p = 0; p < priority_count; p++) {
         const vio_backend *b = vio_find_backend(priority[p]);
-        if (b && b->supports_feature && b->supports_feature(VIO_FEATURE_3D_PIPELINE)
+        if (b && !vio_backend_skipped(b, skip, skip_count) && b->supports_feature && b->supports_feature(VIO_FEATURE_3D_PIPELINE)
             && b->supports_feature(VIO_FEATURE_INSTANCED_DRAW) && b->supports_feature(VIO_FEATURE_RENDER_TARGET_HDR)
             && b->supports_feature(VIO_FEATURE_RENDER_TARGET_DEPTH) && b->supports_feature(VIO_FEATURE_RENDER_TARGET_CUBE)
             && b->supports_feature(VIO_FEATURE_MRT) && b->supports_feature(VIO_FEATURE_CUBEMAP)
@@ -100,7 +112,7 @@ const vio_backend *vio_get_auto_backend(void)
     }
     for (int p = 0; p < priority_count; p++) {
         const vio_backend *b = vio_find_backend(priority[p]);
-        if (b && b->supports_feature && b->supports_feature(VIO_FEATURE_3D_PIPELINE)) {
+        if (b && !vio_backend_skipped(b, skip, skip_count) && b->supports_feature && b->supports_feature(VIO_FEATURE_3D_PIPELINE)) {
             return b;
         }
     }
@@ -109,7 +121,7 @@ const vio_backend *vio_get_auto_backend(void)
      * only the Vulkan backend). */
     for (int p = 0; p < priority_count; p++) {
         const vio_backend *b = vio_find_backend(priority[p]);
-        if (b) {
+        if (b && !vio_backend_skipped(b, skip, skip_count)) {
             return b;
         }
     }
@@ -118,12 +130,12 @@ const vio_backend *vio_get_auto_backend(void)
      * to the first registered backend at all. */
     for (int i = 0; i < backend_count; i++) {
         const vio_backend *b = backends[i];
-        if (b->supports_feature && b->supports_feature(VIO_FEATURE_3D_PIPELINE)) {
+        if (!vio_backend_skipped(b, skip, skip_count) && b->supports_feature && b->supports_feature(VIO_FEATURE_3D_PIPELINE)) {
             return b;
         }
     }
-    if (backend_count > 0) {
-        return backends[0];
+    for (int i = 0; i < backend_count; i++) {
+        if (!vio_backend_skipped(backends[i], skip, skip_count)) return backends[i];
     }
 
     return NULL;
