@@ -31,6 +31,12 @@
 #include "../vio_d3d_common.h"
 #include "../../vio_shader_cache.h"
 #include "../../vio_render_target.h"
+
+/* DXC front end (vio_dxc.cpp, GAP-PHASE5 Block 7). */
+int  vio_dxc_available(void);
+void vio_dxc_set_dir(const char *dir);
+int  vio_dxc_compile(const char *hlsl, const char *entry, const char *profile, int debug,
+                     void **out_bytes, size_t *out_len, char **out_error);
 #include "../../vio_shader_reflect.h"   /* vio_spirv_reflect — data-driven compute register mapping */
 #include "../../vio_texture.h"          /* vio_texture_object — storage-image binds */
 #include <string.h>
@@ -860,6 +866,22 @@ static int d3d12_init(vio_config *cfg)
     }
     vio_d3d12.fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     vio_d3d12.fence_value = 0;
+
+    /* Shader model (GAP-PHASE5 Block 7): SM 6 only when asked for, the device
+     * reports it and DXC (+ dxil.dll for signing) can be loaded. */
+    vio_d3d12.shader_model = 5;
+    if (cfg->shader_model >= 6) {
+        if (cfg->dxc_dir[0]) vio_dxc_set_dir(cfg->dxc_dir);
+        D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_0 };
+        int device_ok = SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))
+                        && sm.HighestShaderModel >= D3D_SHADER_MODEL_6_0;
+        if (device_ok && vio_dxc_available()) {
+            vio_d3d12.shader_model = 6;
+        } else {
+            php_error_docref(NULL, E_NOTICE, "D3D12: shader_model 6 requested but %s; using FXC (SM 5.1)",
+                             device_ok ? "dxcompiler.dll / dxil.dll not loadable" : "the device lacks SM 6.0");
+        }
+    }
 
     /* GPU timestamps (GAP-PHASE5 Block 3) — optional; a failure just leaves the
      * feature off. */
@@ -3354,13 +3376,22 @@ static int d3d12_update_texture(void *tex_obj, const void *pixels, int x, int y,
 static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, const char *profile,
                                     UINT flags, ID3DBlob **out)
 {
+    /* Shader Model 6 (GAP-PHASE5 Block 7): the profile string becomes *_6_0 and
+     * DXC produces DXIL; cached under "dxil" so FXC and DXC blobs never mix. */
+    char profile6[16];
+    const char *ext = "dxbc";
+    if (vio_d3d12.shader_model == 6 && strlen(profile) >= 6) {
+        snprintf(profile6, sizeof(profile6), "%.2s_6_0", profile);
+        profile = profile6;
+        ext = "dxil";
+    }
     uint64_t key = 0;
     int use_cache = vio_shader_cache_dir() != NULL;
     if (use_cache) {
         key = vio_shader_cache_hash(profile, src, strlen(src));
         key = vio_shader_cache_hash_more(key, &flags, sizeof(flags));
         size_t len = 0;
-        void *data = vio_shader_cache_load(key, "dxbc", &len);
+        void *data = vio_shader_cache_load(key, ext, &len);
         if (data) {
             if (SUCCEEDED(D3DCreateBlob(len, out)) && *out) {
                 memcpy(ID3D10Blob_GetBufferPointer(*out), data, len);
@@ -3370,17 +3401,34 @@ static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, cons
             free(data);
         }
     }
-    ID3DBlob *error_blob = NULL;
-    HRESULT hr = D3DCompile(src, strlen(src), entry_tag, NULL, NULL, "main", profile, flags, 0, out, &error_blob);
-    if (FAILED(hr)) {
-        php_error_docref(NULL, E_WARNING, "D3D12: %s compile failed: %s", profile,
-                          error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
+    HRESULT hr;
+    if (vio_d3d12.shader_model == 6) {
+        void *bytes = NULL; size_t len = 0; char *err = NULL;
+        int rc = vio_dxc_compile(src, "main", profile, (flags & D3DCOMPILE_DEBUG) ? 1 : 0, &bytes, &len, &err);
+        if (rc != 0 || !bytes) {
+            php_error_docref(NULL, E_WARNING, "D3D12: %s (DXC) compile failed: %s", profile, err ? err : "unknown");
+            if (err) free(err);
+            if (bytes) free(bytes);
+            return E_FAIL;
+        }
+        if (err) free(err);   /* warnings */
+        hr = D3DCreateBlob(len, out);
+        if (FAILED(hr) || !*out) { free(bytes); return FAILED(hr) ? hr : E_FAIL; }
+        memcpy(ID3D10Blob_GetBufferPointer(*out), bytes, len);
+        free(bytes);
+    } else {
+        ID3DBlob *error_blob = NULL;
+        hr = D3DCompile(src, strlen(src), entry_tag, NULL, NULL, "main", profile, flags, 0, out, &error_blob);
+        if (FAILED(hr)) {
+            php_error_docref(NULL, E_WARNING, "D3D12: %s compile failed: %s", profile,
+                              error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
+            if (error_blob) ID3D10Blob_Release(error_blob);
+            return hr;
+        }
         if (error_blob) ID3D10Blob_Release(error_blob);
-        return hr;
     }
-    if (error_blob) ID3D10Blob_Release(error_blob);
     if (use_cache && *out) {
-        vio_shader_cache_store(key, "dxbc", ID3D10Blob_GetBufferPointer(*out), ID3D10Blob_GetBufferSize(*out));
+        vio_shader_cache_store(key, ext, ID3D10Blob_GetBufferPointer(*out), ID3D10Blob_GetBufferSize(*out));
     }
     return S_OK;
 }
@@ -4826,6 +4874,7 @@ static void d3d12_swapchain_info(vio_swapchain_info *out)
     out->waitable      = vio_d3d12.frame_latency_waitable != NULL;
     out->hdr_output    = vio_d3d12.hdr_output;
     out->format        = vio_d3d12.swapchain_format == DXGI_FORMAT_R10G10B10A2_UNORM ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
+    out->shader_model  = vio_d3d12.shader_model == 6 ? 6 : 5;
 }
 
 static double d3d12_gpu_frame_time(void)

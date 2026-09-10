@@ -2691,6 +2691,7 @@ static void d3d11_swapchain_info(vio_swapchain_info *out)
     out->waitable      = vio_d3d11.frame_latency_waitable != NULL;
     out->hdr_output    = vio_d3d11.hdr_output;
     out->format        = vio_d3d11.swapchain_format == DXGI_FORMAT_R10G10B10A2_UNORM ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
+    out->shader_model  = 5;
 }
 
 static double d3d11_gpu_frame_time(void)
