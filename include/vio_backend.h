@@ -204,6 +204,10 @@ typedef struct _vio_backend {
      * D3D / Vulkan / Metal handle cubemap binds via their bind_cubemap
      * slot below. */
     void  (*bind_cubemap_id)(unsigned int texture_id, int slot);
+    /* Bind a vio_cubemap_object at GL texture unit `slot` for backends that keep
+     * cubemaps in their own texture wrapper (Vulkan). Called from the draw-time
+     * pending-texture flush; NULL => the per-backend paths in php_vio.c apply. */
+    void  (*bind_cubemap)(void *cm_obj, int slot);
 
     /* Upload a font atlas (R8 single-channel bitmap) into font_obj. OpenGL
      * uses GL_RED + texture swizzle so the shader can sample .a; Metal calls

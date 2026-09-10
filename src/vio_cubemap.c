@@ -25,6 +25,7 @@ static zend_object *vio_cubemap_create_object(zend_class_entry *ce)
     cm->d3d12_srv_cpu   = 0;
     cm->metal_texture = NULL;
     cm->metal_sampler = NULL;
+    cm->vulkan_texture = NULL;
     cm->backend_type  = 0;
     cm->mipmaps       = 0;
     cm->borrowed      = 0;
