@@ -134,9 +134,9 @@ foreach ($backends as $be) {
             }
         }
     };
-    if ($name !== 'd3d12') {   // FOLLOW-UP: GPU-written textures sample stale on the WARP runner (see 096)
-        $checkPx('blit att1', $screenPx(1, 4), [0, 128, 0]); $checkPx('blit att1 clear', $screenPx(6, 4), [51, 51, 51]);
-    }
+    /* Also on D3D12: the former "stale GPU-written texture" there was the pending-bind
+     * table's raw pointer to a texture temporary (test 111), not a barrier problem. */
+    $checkPx('blit att1', $screenPx(1, 4), [0, 128, 0]); $checkPx('blit att1 clear', $screenPx(6, 4), [51, 51, 51]);
     // Default-argument compatibility: attachment 0 is what the 1-arg forms return.
     $check('att0 default', vio_read_render_target($rt), 1, 4, [255, 0, 0]);
     echo $name, ': ', $ok ? 'OK' : 'FAIL', "\n";
