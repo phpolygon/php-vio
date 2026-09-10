@@ -99,8 +99,9 @@ PHP_INI_END()
 
 /* vio_create('auto') (GAP-PHASE5 Block 10c): a registered backend that cannot open a
  * device on this machine (a Vulkan loader without a driver, ...) hands over to the
- * next candidate instead of failing the whole call. */
-#define VIO_CREATE_FAIL() do { if (auto_pick && tried_n < 8) { tried[tried_n++] = backend; goto pick_backend; } RETURN_FALSE; } while (0)
+ * next candidate instead of failing the whole call. While another candidate remains,
+ * the attempt's warnings are suppressed; the last candidate reports normally. */
+#define VIO_CREATE_FAIL() do { if (vio_quiet) EG(error_reporting) = vio_saved_er; if (auto_pick && tried_n < 8) { tried[tried_n++] = backend; goto pick_backend; } RETURN_FALSE; } while (0)
 
 ZEND_FUNCTION(vio_create)
 {
@@ -135,6 +136,16 @@ pick_backend:
             php_error_docref(NULL, E_WARNING, "No graphics backend available. Load a backend extension (e.g., vio_opengl)");
         }
         RETURN_FALSE;
+    }
+
+    int vio_quiet = 0;
+    int vio_saved_er = (int)EG(error_reporting);
+    if (auto_pick && tried_n < 8) {
+        tried[tried_n] = backend;
+        if (vio_get_auto_backend_skip(tried, tried_n + 1) != NULL) {
+            vio_quiet = 1;
+            EG(error_reporting) &= ~(E_WARNING | E_NOTICE);
+        }
     }
 
     /* Create context object */
@@ -341,6 +352,8 @@ pick_backend:
         }
     }
 #endif
+
+    if (vio_quiet) EG(error_reporting) = vio_saved_er;
 
     /* Initialize 2D rendering system */
     vio_2d_init(&ctx->state_2d, ctx->config.width, ctx->config.height);

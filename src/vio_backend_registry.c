@@ -126,6 +126,10 @@ const vio_backend *vio_get_auto_backend_skip(const vio_backend **skip, int skip_
         }
     }
 
+    /* A retry (skip list) stays inside the platform priority list: never hand a
+     * failed 'auto' over to the null backend. */
+    if (skip_count > 0) return NULL;
+
     /* Fall back to the first registered backend that has a 3D pipeline, then
      * to the first registered backend at all. */
     for (int i = 0; i < backend_count; i++) {
