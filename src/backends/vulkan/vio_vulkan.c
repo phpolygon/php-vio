@@ -283,6 +283,32 @@ static int create_logical_device(void)
     vkGetDeviceQueue(vio_vk.device, vio_vk.graphics_family, 0, &vio_vk.graphics_queue);
     vkGetDeviceQueue(vio_vk.device, vio_vk.present_family, 0, &vio_vk.present_queue);
 
+    /* GPU timestamps (GAP-PHASE5 Block 3): only when the graphics family stamps
+     * with a non-zero valid-bit count. */
+    vio_vk.last_gpu_ms = -1.0;
+    {
+        uint32_t qf_count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(vio_vk.physical_device, &qf_count, NULL);
+        VkQueueFamilyProperties *qf = qf_count ? calloc(qf_count, sizeof(VkQueueFamilyProperties)) : NULL;
+        if (qf) {
+            vkGetPhysicalDeviceQueueFamilyProperties(vio_vk.physical_device, &qf_count, qf);
+            if (vio_vk.graphics_family < qf_count && qf[vio_vk.graphics_family].timestampValidBits > 0) {
+                VkPhysicalDeviceProperties props = {0};
+                vkGetPhysicalDeviceProperties(vio_vk.physical_device, &props);
+                VkQueryPoolCreateInfo qp = {0};
+                qp.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+                qp.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                qp.queryCount = 2 * VIO_VK_MAX_FRAMES_IN_FLIGHT;
+                if (vkCreateQueryPool(vio_vk.device, &qp, NULL, &vio_vk.ts_pool) == VK_SUCCESS) {
+                    vio_vk.ts_period = props.limits.timestampPeriod;
+                } else {
+                    vio_vk.ts_pool = VK_NULL_HANDLE;
+                }
+            }
+            free(qf);
+        }
+    }
+
     return 0;
 }
 
@@ -696,6 +722,10 @@ static int create_frame_resources(void)
 
 static void destroy_frame_resources(void)
 {
+    if (vio_vk.ts_pool) {
+        vkDestroyQueryPool(vio_vk.device, vio_vk.ts_pool, NULL);
+        vio_vk.ts_pool = VK_NULL_HANDLE;
+    }
     for (int i = 0; i < VIO_VK_MAX_FRAMES_IN_FLIGHT; i++) {
         vio_vk_frame *f = &vio_vk.frames[i];
         if (f->in_flight) vkDestroyFence(vio_vk.device, f->in_flight, NULL);
@@ -2086,6 +2116,17 @@ static void vulkan_begin_frame(void)
     /* Wait for this frame's previous work to finish */
     vkWaitForFences(vio_vk.device, 1, &f->in_flight, VK_TRUE, UINT64_MAX);
 
+    /* GPU timestamps: this slot's previous frame has retired — read its pair. */
+    if (vio_vk.ts_pool && vio_vk.ts_pending[vio_vk.current_frame]) {
+        uint64_t ts[2] = {0, 0};
+        if (vkGetQueryPoolResults(vio_vk.device, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * 2, 2,
+                                  sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS
+            && ts[1] > ts[0]) {
+            vio_vk.last_gpu_ms = (double)(ts[1] - ts[0]) * (double)vio_vk.ts_period / 1.0e6;
+        }
+        vio_vk.ts_pending[vio_vk.current_frame] = 0;
+    }
+
     /* Reset this frame's 2D descriptor pool. SAFE only because the fence wait
      * above guarantees the GPU has finished consuming the descriptor sets this
      * pool handed out two frames ago — resetting an in-flight pool would be a
@@ -2105,6 +2146,10 @@ static void vulkan_begin_frame(void)
         VkCommandBufferBeginInfo begin_info = {0};
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(f->cmd_buf, &begin_info);
+        if (vio_vk.ts_pool) {
+            vkCmdResetQueryPool(f->cmd_buf, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * 2, 2);
+            vkCmdWriteTimestamp(f->cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * 2);
+        }
 
         /* No render pass is begun here; vio_begin's deferred-bind block calls
          * vulkan_begin_offscreen_render_pass() to open the offscreen pass (which
@@ -2173,6 +2218,11 @@ static void vulkan_begin_frame(void)
     VkCommandBufferBeginInfo begin_info = {0};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(f->cmd_buf, &begin_info);
+    if (vio_vk.ts_pool) {
+        /* Reset + start stamp outside the render pass (vkCmdResetQueryPool rule). */
+        vkCmdResetQueryPool(f->cmd_buf, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * 2, 2);
+        vkCmdWriteTimestamp(f->cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * 2);
+    }
 
     /* Begin render pass */
     VkClearValue clear_values[2];
@@ -2250,6 +2300,10 @@ static void vulkan_end_frame(void)
         if (vio_vk.current_bound_rt) {
             vkCmdEndRenderPass(f->cmd_buf);
         }
+        if (vio_vk.ts_pool) {
+            vkCmdWriteTimestamp(f->cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * 2 + 1);
+            vio_vk.ts_pending[vio_vk.current_frame] = 1;
+        }
         vkEndCommandBuffer(f->cmd_buf);
 
         VkSubmitInfo submit = {0};
@@ -2273,6 +2327,10 @@ static void vulkan_end_frame(void)
 
     /* End render pass and command buffer */
     vkCmdEndRenderPass(f->cmd_buf);
+    if (vio_vk.ts_pool) {
+        vkCmdWriteTimestamp(f->cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * 2 + 1);
+        vio_vk.ts_pending[vio_vk.current_frame] = 1;
+    }
     vkEndCommandBuffer(f->cmd_buf);
 
     /* Submit */
@@ -3096,6 +3154,11 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
     return rc;
 }
 
+static double vulkan_gpu_frame_time(void)
+{
+    return vio_vk.initialized && vio_vk.ts_pool ? vio_vk.last_gpu_ms : -1.0;
+}
+
 static int vulkan_supports_feature(vio_feature feature)
 {
     switch (feature) {
@@ -3120,6 +3183,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 0; /* depth-RT sampling descriptor not wired */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 0;
         case VIO_FEATURE_STENCIL:             return 0; /* with the 3D pipeline (GAP-PHASE5 Block 10) */
+        case VIO_FEATURE_GPU_TIMESTAMP:       return vio_vk.ts_pool != VK_NULL_HANDLE; /* vkCmdWriteTimestamp per frame */
         case VIO_FEATURE_CUBEMAP:      return 0;
         case VIO_FEATURE_DEPTH_BIAS:   return 0; /* pipeline rasterization state — no 3D pipeline to carry it */
         case VIO_FEATURE_SCISSOR:      return 1;
@@ -3171,6 +3235,7 @@ static const vio_backend vulkan_backend = {
     .compute_set_uniforms     = vulkan_compute_set_uniforms,
     .read_buffer              = vulkan_read_buffer,
     .supports_feature  = vulkan_supports_feature,
+    .gpu_frame_time    = vulkan_gpu_frame_time,
     .destroy_texture_obj = vulkan_destroy_texture_obj,
     .destroy_buffer_obj  = vulkan_destroy_buffer_obj,
     .destroy_font_atlas  = vulkan_destroy_font_atlas,

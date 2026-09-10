@@ -6170,6 +6170,22 @@ ZEND_FUNCTION(vio_gpu_info)
     add_assoc_long(return_value, "ram_bytes", (zend_long)ram_bytes);
 }
 
+/* GPU time of the last completed frame in ms (GAP-PHASE5 Block 3), -1.0 when the
+ * backend has no timestamps or no frame has finished yet. The value trails the
+ * CPU by one to two frames (the ring is read once the frame's fence passed). */
+ZEND_FUNCTION(vio_gpu_frame_time)
+{
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend || !ctx->backend->gpu_frame_time) {
+        RETURN_DOUBLE(-1.0);
+    }
+    RETURN_DOUBLE(ctx->backend->gpu_frame_time());
+}
+
 /* ── Image comparison (VRT) ───────────────────────────────────────── */
 
 ZEND_FUNCTION(vio_compare_images)
@@ -6846,6 +6862,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STORAGE_IMAGE", VIO_FEATURE_STORAGE_IMAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_STORAGE", VIO_FEATURE_VERTEX_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STENCIL", VIO_FEATURE_STENCIL, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_GPU_TIMESTAMP", VIO_FEATURE_GPU_TIMESTAMP, CONST_CS | CONST_PERSISTENT);
 
     /* Actions */
     REGISTER_LONG_CONSTANT("VIO_RELEASE", VIO_RELEASE, CONST_CS | CONST_PERSISTENT);

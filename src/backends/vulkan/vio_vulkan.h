@@ -154,6 +154,12 @@ typedef struct _vio_vulkan_state {
      * (GAP-PLAN 4.4); lazily created, destroyed in vulkan_shutdown. */
     VkCommandPool            transient_pool;
     VkFence                  transient_fence;
+    /* GPU timestamps (GAP-PHASE5 Block 3): two queries per frame in flight,
+     * reset + written in the frame's command buffer, read after its fence. */
+    VkQueryPool              ts_pool;
+    float                    ts_period;     /* ns per tick (timestampPeriod) */
+    int                      ts_pending[VIO_VK_MAX_FRAMES_IN_FLIGHT];
+    double                   last_gpu_ms;
     int                      in_frame;          /* 1 while the command buffer is recording (begin_frame..end_frame) */
     /* Phase 4 — warm-render present-skip. Captured at vulkan_begin_frame: 1 when
      * the frame is OFFSCREEN-ONLY (vio_vk.pending_bound_rt was set BEFORE

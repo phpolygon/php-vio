@@ -460,6 +460,15 @@ typedef struct _vio_d3d12_state {
                            * Present/record so we log the cause ONCE instead of spamming
                            * "Present failed" every frame until the 64KB log fills up */
 
+    /* GPU timestamps (GAP-PHASE5 Block 3): two TIMESTAMP queries per frame slot,
+     * resolved into a READBACK buffer at end_frame and read in begin_frame once
+     * the slot's fence has passed. */
+    ID3D12QueryHeap *ts_heap;
+    ID3D12Resource  *ts_readback;
+    UINT64           ts_frequency;
+    int              ts_pending[VIO_D3D12_MAX_FRAME_COUNT];
+    double           last_gpu_ms;
+
     /* Window reference */
     void *glfw_window;
 } vio_d3d12_state;

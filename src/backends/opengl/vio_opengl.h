@@ -56,6 +56,14 @@ typedef struct _vio_opengl_state {
      * rebind (GAP-PLAN Phase 3). */
     void        *current_bound_rt;
 
+    /* GPU timestamps (GAP-PHASE5 Block 3, GL >= 3.3 GL_TIMESTAMP queries): a
+     * ring of begin/end query pairs, harvested when the slot is reused. */
+    unsigned int ts_query[3][2];
+    int          ts_pending[3];
+    int          ts_slot;
+    unsigned int ts_generation;   /* context generation the query names belong to */
+    double       last_gpu_ms;
+
     /* Cached driver strings — captured once at setup so vio_gl_info can
      * surface them without re-entering GL from php_vio.c. */
     char        *renderer;

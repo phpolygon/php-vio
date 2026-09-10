@@ -859,6 +859,35 @@ static int d3d12_init(vio_config *cfg)
     vio_d3d12.fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     vio_d3d12.fence_value = 0;
 
+    /* GPU timestamps (GAP-PHASE5 Block 3) — optional; a failure just leaves the
+     * feature off. */
+    vio_d3d12.last_gpu_ms = -1.0;
+    {
+        D3D12_QUERY_HEAP_DESC qh = {0};
+        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qh.Count = 2 * VIO_D3D12_MAX_FRAME_COUNT;
+        ID3D12QueryHeap *heap = NULL;
+        if (SUCCEEDED(ID3D12Device_CreateQueryHeap(vio_d3d12.device, &qh, &IID_ID3D12QueryHeap, (void **)&heap)) && heap) {
+            D3D12_HEAP_PROPERTIES hp = {0};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rb = {0};
+            rb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rb.Width = sizeof(UINT64) * 2 * VIO_D3D12_MAX_FRAME_COUNT;
+            rb.Height = 1; rb.DepthOrArraySize = 1; rb.MipLevels = 1;
+            rb.SampleDesc.Count = 1;
+            rb.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource *readback = NULL;
+            if (SUCCEEDED(ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rb,
+                    D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&readback)) && readback) {
+                vio_d3d12.ts_heap = heap;
+                vio_d3d12.ts_readback = readback;
+                ID3D12CommandQueue_GetTimestampFrequency(vio_d3d12.cmd_queue, &vio_d3d12.ts_frequency);
+            } else {
+                ID3D12QueryHeap_Release(heap);
+            }
+        }
+    }
+
     /* Create descriptor heaps */
     if (d3d12_create_descriptor_heap(&vio_d3d12.rtv_heap,
                                       D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -1151,6 +1180,8 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.root_signature) ID3D12RootSignature_Release(vio_d3d12.root_signature);
     if (vio_d3d12.compute_root_signature) ID3D12RootSignature_Release(vio_d3d12.compute_root_signature);
     if (vio_d3d12.compute_srv_heap) ID3D12DescriptorHeap_Release(vio_d3d12.compute_srv_heap);
+    if (vio_d3d12.ts_readback)    ID3D12Resource_Release(vio_d3d12.ts_readback);
+    if (vio_d3d12.ts_heap)        ID3D12QueryHeap_Release(vio_d3d12.ts_heap);
     if (vio_d3d12.fence)          ID3D12Fence_Release(vio_d3d12.fence);
     if (vio_d3d12.fence_event)    CloseHandle(vio_d3d12.fence_event);
     if (vio_d3d12.rtv_heap)       ID3D12DescriptorHeap_Release(vio_d3d12.rtv_heap);
@@ -3434,11 +3465,31 @@ static void d3d12_begin_frame(void)
     /* Staging buffers of uploads whose fence has passed (GAP-PLAN 4.1). */
     d3d12_retire_uploads(0);
 
+    /* This slot's previous frame has retired (wait_for_frame above): read its
+     * GPU timestamps before the slot is reused. */
+    if (vio_d3d12.ts_readback && vio_d3d12.ts_pending[vio_d3d12.frame_index]) {
+        UINT64 *ts = NULL;
+        D3D12_RANGE rr = { (SIZE_T)vio_d3d12.frame_index * 16, (SIZE_T)vio_d3d12.frame_index * 16 + 16 };
+        if (SUCCEEDED(ID3D12Resource_Map(vio_d3d12.ts_readback, 0, &rr, (void **)&ts)) && ts) {
+            UINT64 b = ts[vio_d3d12.frame_index * 2], e = ts[vio_d3d12.frame_index * 2 + 1];
+            if (e > b && vio_d3d12.ts_frequency) {
+                vio_d3d12.last_gpu_ms = (double)(e - b) * 1000.0 / (double)vio_d3d12.ts_frequency;
+            }
+            D3D12_RANGE wr = {0, 0};
+            ID3D12Resource_Unmap(vio_d3d12.ts_readback, 0, &wr);
+        }
+        vio_d3d12.ts_pending[vio_d3d12.frame_index] = 0;
+    }
+
     vio_d3d12.in_frame = 1;
 
     /* Reset command allocator and command list */
     ID3D12CommandAllocator_Reset(frame->cmd_allocator);
     ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
+    if (vio_d3d12.ts_heap) {
+        ID3D12GraphicsCommandList_EndQuery(vio_d3d12.cmd_list, vio_d3d12.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+                                           (UINT)vio_d3d12.frame_index * 2);
+    }
 
     /* Transition render target: PRESENT -> RENDER_TARGET */
     D3D12_RESOURCE_BARRIER barrier = {0};
@@ -3629,6 +3680,16 @@ static void d3d12_end_frame(void)
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+
+    /* GPU timestamp: end of the frame's command stream, resolved into this
+     * slot's readback range; begin_frame reads it once the fence has passed. */
+    if (vio_d3d12.ts_heap && vio_d3d12.ts_readback) {
+        UINT q = (UINT)vio_d3d12.frame_index * 2;
+        ID3D12GraphicsCommandList_EndQuery(vio_d3d12.cmd_list, vio_d3d12.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
+        ID3D12GraphicsCommandList_ResolveQueryData(vio_d3d12.cmd_list, vio_d3d12.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+                                                   q, 2, vio_d3d12.ts_readback, (UINT64)vio_d3d12.frame_index * 16);
+        vio_d3d12.ts_pending[vio_d3d12.frame_index] = 1;
+    }
 
     /* Close and execute command list */
     ID3D12GraphicsCommandList_Close(vio_d3d12.cmd_list);
@@ -4675,6 +4736,11 @@ static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
 
 /* ── Feature Query ────────────────────────────────────────────────── */
 
+static double d3d12_gpu_frame_time(void)
+{
+    return vio_d3d12.initialized && vio_d3d12.ts_heap ? vio_d3d12.last_gpu_ms : -1.0;
+}
+
 static int d3d12_supports_feature(vio_feature feature)
 {
     switch (feature) {
@@ -4697,6 +4763,7 @@ static int d3d12_supports_feature(vio_feature feature)
          * Block 1). */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1;
         case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + PSO depth-stencil state */
+        case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d12.ts_heap != NULL; /* timestamp query heap + readback ring */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* CPU box filter + re-upload (GAP-PLAN 2.3) */
         case VIO_FEATURE_CUBEMAP:      return 1;
@@ -5079,6 +5146,7 @@ static const vio_backend d3d12_backend = {
     .bind_storage_buffer          = d3d12_bind_storage_buffer,
     .draw_instanced_from_storage  = d3d12_draw_instanced_from_storage,
     .supports_feature  = d3d12_supports_feature,
+    .gpu_frame_time    = d3d12_gpu_frame_time,
     .destroy_cubemap   = d3d12_destroy_cubemap,
     .upload_cubemap    = d3d12_upload_cubemap,
     .read_render_target = d3d12_read_render_target,

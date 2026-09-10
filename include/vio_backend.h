@@ -321,6 +321,12 @@ typedef struct _vio_backend {
 
     /* Query */
     int   (*supports_feature)(vio_feature feature);
+
+    /* GPU time of the most recently COMPLETED frame in milliseconds
+     * (begin_frame .. end_frame command stream), negative when nothing has
+     * finished yet. NULL slot => the backend has no GPU timestamps
+     * (GAP-PHASE5 Block 3). */
+    double (*gpu_frame_time)(void);
 } vio_backend;
 
 /*

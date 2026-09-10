@@ -416,18 +416,58 @@ static void opengl_destroy_shader(void *shader)
     }
 }
 
+static int opengl_has_timer_query(void)
+{
+    return vio_gl.initialized && GLAD_GL_VERSION_3_3;
+}
+
 static void opengl_begin_frame(void)
 {
     glClearColor(vio_gl.clear_r, vio_gl.clear_g, vio_gl.clear_b, vio_gl.clear_a);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     vio_gl.in_frame = 1;
+
+    /* GPU timestamps (GAP-PHASE5 Block 3): names belong to the current context
+     * generation; harvest the slot about to be reused, then stamp the start. */
+    if (opengl_has_timer_query()) {
+        if (vio_gl.ts_generation != gl_context_generation || vio_gl.ts_query[0][0] == 0) {
+            glGenQueries(6, &vio_gl.ts_query[0][0]);
+            for (int i = 0; i < 3; i++) vio_gl.ts_pending[i] = 0;
+            vio_gl.last_gpu_ms = -1.0;
+            vio_gl.ts_generation = gl_context_generation;
+        }
+        int slot = vio_gl.ts_slot;
+        if (vio_gl.ts_pending[slot]) {
+            GLint avail = 0;
+            glGetQueryObjectiv(vio_gl.ts_query[slot][1], GL_QUERY_RESULT_AVAILABLE, &avail);
+            if (avail) {
+                GLuint64 b = 0, e = 0;
+                glGetQueryObjectui64v(vio_gl.ts_query[slot][0], GL_QUERY_RESULT, &b);
+                glGetQueryObjectui64v(vio_gl.ts_query[slot][1], GL_QUERY_RESULT, &e);
+                if (e > b) vio_gl.last_gpu_ms = (double)(e - b) / 1.0e6;
+            }
+            vio_gl.ts_pending[slot] = 0;
+        }
+        glQueryCounter(vio_gl.ts_query[slot][0], GL_TIMESTAMP);
+    }
 }
 
 static void opengl_end_frame(void)
 {
+    if (opengl_has_timer_query() && vio_gl.ts_query[0][0] != 0) {
+        int slot = vio_gl.ts_slot;
+        glQueryCounter(vio_gl.ts_query[slot][1], GL_TIMESTAMP);
+        vio_gl.ts_pending[slot] = 1;
+        vio_gl.ts_slot = (slot + 1) % 3;
+    }
     /* Flush any pending GL commands */
     glFlush();
     vio_gl.in_frame = 0;
+}
+
+static double opengl_gpu_frame_time(void)
+{
+    return opengl_has_timer_query() && vio_gl.ts_query[0][0] != 0 ? vio_gl.last_gpu_ms : -1.0;
 }
 
 static void opengl_draw(vio_draw_cmd *cmd)
@@ -1889,6 +1929,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_DEPTH:  return 1;
         case VIO_FEATURE_RENDER_TARGET_MSAA:   return 1;
         case VIO_FEATURE_STENCIL:        return 1;             /* DEPTH24_STENCIL8 attachments + glStencil* state */
+        case VIO_FEATURE_GPU_TIMESTAMP:  return opengl_has_timer_query(); /* GL_TIMESTAMP queries, core 3.3 */
         case VIO_FEATURE_CUBEMAP:        return 1;
         case VIO_FEATURE_DEPTH_BIAS:     return 1;
         case VIO_FEATURE_SCISSOR:        return 1;
@@ -1948,6 +1989,7 @@ static const vio_backend opengl_backend = {
     .bind_storage_buffer          = opengl_bind_storage_buffer,
     .draw_instanced_from_storage  = opengl_draw_instanced_from_storage,
     .supports_feature  = opengl_supports_feature,
+    .gpu_frame_time    = opengl_gpu_frame_time,
     .set_viewport      = opengl_set_viewport,
     .set_uniform       = opengl_set_uniform,
     .destroy_buffer_obj    = opengl_destroy_buffer_obj,

@@ -69,6 +69,7 @@ probe("null", [
     VIO_FEATURE_READ_PIXELS        => 0,
     VIO_FEATURE_NATIVE_2D_BATCH    => 0,
     VIO_FEATURE_STENCIL            => 0,
+    VIO_FEATURE_GPU_TIMESTAMP      => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -114,6 +115,7 @@ $d3d_common = [
     VIO_FEATURE_MRT                => 1,
     VIO_FEATURE_STENCIL            => 1,   /* D24S8 + depth-stencil state (GAP-PHASE5 1) */
     VIO_FEATURE_RENDER_TARGET_MSAA => 1,   /* D3D11: ResolveSubresource (GAP-PLAN 3); D3D12: PSO sample variants (GAP-PHASE5 1) */
+    VIO_FEATURE_GPU_TIMESTAMP      => 1,   /* timestamp query ring (GAP-PHASE5 3) */
     VIO_FEATURE_TESSELLATION       => 0,
     VIO_FEATURE_GEOMETRY           => 0,
     VIO_FEATURE_RAYTRACING         => 0,
@@ -136,6 +138,7 @@ probe_fold("d3d12", $d3d_common + [
 probe_fold("vulkan", [
     VIO_FEATURE_3D_PIPELINE        => 0,
     VIO_FEATURE_STENCIL            => 0,
+    VIO_FEATURE_GPU_TIMESTAMP      => 1,   /* vkCmdWriteTimestamp (GAP-PHASE5 3) */
     VIO_FEATURE_INSTANCED_DRAW     => 0,
     VIO_FEATURE_DEPTH_BIAS         => 0,
     VIO_FEATURE_TESSELLATION       => 0,

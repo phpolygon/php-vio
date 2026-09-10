@@ -238,6 +238,16 @@ typedef struct _vio_d3d11_state {
     ID3D11Debug *debug_interface;
     int          debug_enabled;
 
+    /* GPU timestamps (GAP-PHASE5 Block 3): a ring of disjoint + begin/end
+     * timestamp queries; the slot about to be reused is read (DONOTFLUSH) first. */
+    ID3D11Query *ts_disjoint[3];
+    ID3D11Query *ts_begin[3];
+    ID3D11Query *ts_end[3];
+    int          ts_pending[3];
+    int          ts_slot;
+    int          ts_available;
+    double       last_gpu_ms;
+
     /* Window reference */
     void *glfw_window;
 } vio_d3d11_state;
