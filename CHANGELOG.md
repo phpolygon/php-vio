@@ -1,3 +1,15 @@
+# [2.23.0](https://github.com/phpolygon/php-vio/compare/v2.22.0...v2.23.0) (2026-09-10)
+
+
+### Bug Fixes
+
+* **core:** a failing 'auto' candidate stays quiet while another one remains ([3f87d5e](https://github.com/phpolygon/php-vio/commit/3f87d5e610ae70659c36ac1e6ab2230d8deb65af))
+
+
+### Features
+
+* **vulkan:** texture arrays, BC and KTX2 payloads, variable rate shading (GAP-PHASE5 Block 10c) ([0469c61](https://github.com/phpolygon/php-vio/commit/0469c614e84d19308dbf4f3e7366226517c2a9ad))
+
 # [2.22.0](https://github.com/phpolygon/php-vio/compare/v2.21.0...v2.22.0) (2026-09-10)
 
 
