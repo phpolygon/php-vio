@@ -346,6 +346,11 @@ typedef struct _vio_backend {
      * cannot carry (GAP-PHASE5 Block 9: format / layers / mip_levels): writes the GL
      * name into tex_obj->texture_id. Backends with create_texture leave this NULL. */
     int   (*upload_texture_ex)(void *tex_obj, vio_texture_desc *desc);
+
+    /* Variable rate shading (GAP-PHASE5 Block 12): sticky per-context rate for
+     * every following draw (re-armed after each command-list reset). 0 on
+     * success, -1 when the device lacks the tier / rate. NULL => unsupported. */
+    int   (*set_shading_rate)(int rate);
 } vio_backend;
 
 /*

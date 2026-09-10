@@ -259,6 +259,13 @@ typedef struct _vio_d3d12_state {
     float                      hdr_paper_white;
     /* Shader model in use (GAP-PHASE5 Block 7): 6 => DXC / DXIL, else FXC 5.1. */
     int                        shader_model;
+    /* Variable rate shading (GAP-PHASE5 Block 12): D3D12_VARIABLE_SHADING_RATE_TIER
+     * (0 = none), the additional-rates cap (2x4 / 4x2 / 4x4), the sticky rate
+     * (vio_shading_rate) and the ID3D12GraphicsCommandList5 view of the frame list. */
+    int                        vrs_tier;
+    int                        vrs_additional_rates;
+    int                        shading_rate;
+    ID3D12GraphicsCommandList5 *cmd_list5;
     /* Indirect draws (GAP-PHASE5 Block 8): command signatures for DrawIndexed
      * (stride 20) and Draw (stride 16) arguments, created on first use. */
     ID3D12CommandSignature    *cmdsig_indexed;

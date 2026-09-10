@@ -364,6 +364,16 @@ function vio_swapchain_info(VioContext $context): array {}
 function vio_draw_indirect(VioContext $context, VioMesh $mesh, VioBuffer $args, int $maxDraws = 1, int $offset = 0): void {}
 
 /**
+ * Variable rate shading (VIO_FEATURE_SHADING_RATE, D3D12 VRS Tier 1+): the fragment
+ * shader runs once per 1x2 / 2x1 / 2x2 / 4x4 pixel block for every following draw while
+ * geometry, depth and the resolution stay untouched - the cheapest performance tier.
+ * Sticky until changed (re-armed every frame); set VIO_SHADING_RATE_1X1 before UI and
+ * post-processing. Returns false when the backend has no VRS or the rate is not offered
+ * (VIO_SHADING_RATE_4X4 needs the device's additional-rates capability).
+ */
+function vio_set_shading_rate(VioContext $context, int $rate): bool {}
+
+/**
  * Draw a mesh in the current frame.
  */
 function vio_draw(VioContext $context, VioMesh $mesh): void {}
