@@ -306,10 +306,18 @@ function vio_pixel_ratio(VioContext $context): float {}
  * @param array $config Mesh configuration:
  *   - 'vertices' (float[]) - flat interleaved vertex data (required)
  *   - 'layout' (array) - vertex attribute layout (optional, see above)
- *   - 'indices' (int[]) - index buffer (optional)
+ *   - 'indices' (int[]) - index buffer (optional). Stored as uint16 when every index
+ *     is < 65536 (half the index bandwidth), else uint32.
+ *   - 'index_type' (int, optional) - VIO_INDEX_UINT32 forces 32-bit indices
  * @return VioMesh|false Mesh object or false on failure
  */
 function vio_mesh(VioContext $context, array $config): VioMesh|false {}
+
+/**
+ * Bytes per index of a mesh's index buffer: 2 (uint16), 4 (uint32), 0 when the
+ * mesh is not indexed.
+ */
+function vio_mesh_index_bytes(VioMesh $mesh): int {}
 
 /**
  * Draw a mesh in the current frame.

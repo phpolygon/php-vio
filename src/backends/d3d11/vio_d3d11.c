@@ -1961,7 +1961,7 @@ static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
 
     if (ib) {
         ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
-                                             DXGI_FORMAT_R32_UINT, 0);
+                                             cmd->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
     }
 
     UINT instance_count = cmd->instance_count > 0 ? cmd->instance_count : 1;
@@ -2057,7 +2057,7 @@ static void d3d11_draw_instanced_from_storage(void *mesh_obj, int instance_count
     if (mesh->index_count > 0 && mesh->backend_ib) {
         vio_d3d11_buffer *ib = (vio_d3d11_buffer *)mesh->backend_ib;
         ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
-                                             DXGI_FORMAT_R32_UINT, 0);
+                                             mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
         ID3D11DeviceContext_DrawIndexedInstanced(vio_d3d11.context,
             (UINT)mesh->index_count, (UINT)instance_count, 0, 0, 0);
     } else {

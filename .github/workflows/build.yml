@@ -464,7 +464,8 @@ jobs:
             tests/backends/108_opengl_spirv_uniform_names.phpt `
             tests/render3d/111_pending_texture_lifetime_all_backends.phpt `
             tests/render3d/112_per_attachment_blend_all_backends.phpt `
-            tests/render3d/113_stencil_test_all_backends.phpt
+            tests/render3d/113_stencil_test_all_backends.phpt `
+            tests/render3d/114_uint16_indices_all_backends.phpt
 
       - name: Package binary
         shell: pwsh
