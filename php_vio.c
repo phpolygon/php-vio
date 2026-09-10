@@ -315,6 +315,8 @@ ZEND_FUNCTION(vio_create)
     RETURN_COPY_VALUE(&obj);
 }
 
+static void vio_pending_textures_clear(vio_context_object *ctx);
+
 ZEND_FUNCTION(vio_destroy)
 {
     zval *ctx_zval;
@@ -324,6 +326,9 @@ ZEND_FUNCTION(vio_destroy)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    /* Release the draw-time bind table before the GPU objects behind it go away. */
+    vio_pending_textures_clear(ctx);
 
     if (ctx->initialized && ctx->backend) {
         if (ctx->surface && ctx->backend->destroy_surface) {
@@ -674,8 +679,7 @@ ZEND_FUNCTION(vio_begin)
     }
 #endif
 
-    memset(ctx->pending_tex_kind, 0, sizeof(ctx->pending_tex_kind));
-    memset(ctx->pending_tex_obj, 0, sizeof(ctx->pending_tex_obj));
+    vio_pending_textures_clear(ctx);
     ctx->in_frame = 1;
 }
 
@@ -714,8 +718,7 @@ ZEND_FUNCTION(vio_end)
     }
 #endif
 
-    memset(ctx->pending_tex_kind, 0, sizeof(ctx->pending_tex_kind));
-    memset(ctx->pending_tex_obj, 0, sizeof(ctx->pending_tex_obj));
+    vio_pending_textures_clear(ctx);
     ctx->in_frame = 0;
 }
 
@@ -1985,6 +1988,7 @@ ZEND_FUNCTION(vio_mesh)
  * read from ctx->bound_shader_object, so the caller MUST have bound a pipeline.
  * Caller guarantees ctx is initialized + in_frame and mesh is non-NULL. */
 static void vio_flush_pending_textures(vio_context_object *ctx);
+static void vio_pending_textures_clear(vio_context_object *ctx);
 
 /* Push pending vio_set_uniform writes into the bound shader's backend
  * cbuffers and bind them for the next draw. On D3D12 every draw gets its own
@@ -3180,11 +3184,42 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
  * draw is recorded, not when vio_bind_texture is called. Record per GL unit here
  * (OpenGL binds by unit and needs none of this); vio_flush_pending_textures()
  * resolves the table right before every draw. */
+/* The zend_object behind a pending entry (kind 1 = VioTexture, 2 = VioCubemap). */
+static zend_object *vio_pending_texture_zobj(int kind, void *obj)
+{
+    if (!obj) return NULL;
+    if (kind == 1) return &((vio_texture_object *)obj)->std;
+    if (kind == 2) return &((vio_cubemap_object *)obj)->std;
+    return NULL;
+}
+
+/* Drop every pending entry (frame boundaries, context teardown), releasing the
+ * references the table holds. */
+static void vio_pending_textures_clear(vio_context_object *ctx)
+{
+    for (int slot = 0; slot < 16; slot++) {
+        zend_object *z = vio_pending_texture_zobj(ctx->pending_tex_kind[slot], ctx->pending_tex_obj[slot]);
+        ctx->pending_tex_obj[slot] = NULL;
+        ctx->pending_tex_kind[slot] = 0;
+        if (z) OBJ_RELEASE(z);
+    }
+}
+
 static void vio_pending_texture_set(vio_context_object *ctx, zend_long slot, int kind, void *obj)
 {
     if (slot < 0 || slot >= 16) return;
+    /* The table OWNS a reference to what it points at. Engines bind temporaries
+     * (`vio_bind_texture($ctx, vio_render_target_texture($rt), 6)`): the PHP
+     * object dies as soon as the call returns, and the allocator hands its
+     * memory to the next VioTexture created before the draw — a raw pointer
+     * would then resolve to that unrelated texture at flush time. ADDREF the
+     * new entry BEFORE releasing the old one (same object rebinding). */
+    zend_object *nz = vio_pending_texture_zobj(kind, obj);
+    zend_object *oz = vio_pending_texture_zobj(ctx->pending_tex_kind[slot], ctx->pending_tex_obj[slot]);
+    if (nz) GC_ADDREF(nz);
     ctx->pending_tex_obj[slot] = obj;
     ctx->pending_tex_kind[slot] = kind;
+    if (oz) OBJ_RELEASE(oz);
 }
 
 static void vio_flush_pending_textures(vio_context_object *ctx)
