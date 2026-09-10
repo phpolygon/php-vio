@@ -244,6 +244,10 @@ typedef enum _vio_feature {
     /* vio_create(['frame_latency' => n]): waitable swapchain that caps how many
      * frames the CPU runs ahead (input latency control). */
     VIO_FEATURE_FRAME_LATENCY      = 33,
+    /* vio_create(['hdr_output' => 1]): HDR10 (RGB10A2 + ST 2084) backbuffer with
+     * the 2D batch PQ-encoding its output; vio_swapchain_info()['hdr_output']
+     * says whether it is active. */
+    VIO_FEATURE_HDR_OUTPUT         = 34,
 } vio_feature;
 
 /* ── Input actions ────────────────────────────────────────────────── */
@@ -281,6 +285,12 @@ typedef struct _vio_config {
      * until a backbuffer is free. 1 = lowest input latency, 0 = driver default
      * (no waitable object). D3D11 / D3D12 only. */
     int         frame_latency;
+    /* HDR10 output (GAP-PHASE5 Block 6, D3D11 / D3D12): 1 = 10-bit ST 2084
+     * backbuffer when the window's display is in HDR mode, 2 = force it even on
+     * an SDR display (tests), 0 = 8-bit sRGB. hdr_paper_white is the luminance
+     * (nits) that display-referred white (1.0) maps to; 0 => 200. */
+    int         hdr_output;
+    float       hdr_paper_white;
 } vio_config;
 
 /* vio_swapchain_info() — what the presentation path actually runs with. */
@@ -388,6 +398,7 @@ typedef enum {
     VIO_FORMAT_R16F       = 5,
     VIO_FORMAT_R32F       = 6,
     VIO_FORMAT_R8         = 7,
+    VIO_FORMAT_RGB10A2    = 8,   /* HDR10 backbuffer (R10G10B10A2_UNORM); readback expands to RGBA8 */
 } vio_pixel_format;
 
 typedef struct _vio_texture_desc {

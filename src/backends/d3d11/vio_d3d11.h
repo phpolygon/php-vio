@@ -156,6 +156,10 @@ typedef struct _vio_d3d11_state {
     /* Waitable swapchain (GAP-PHASE5 Block 5), see the D3D12 twin. */
     HANDLE frame_latency_waitable;
     int    frame_latency;
+    /* HDR10 output (GAP-PHASE5 Block 6), see the D3D12 twin. */
+    DXGI_FORMAT swapchain_format;
+    int    hdr_output;
+    float  hdr_paper_white;
     int   present_failed_once; /* rate-limits the Present() failure warning */
 
     /* Render targets */

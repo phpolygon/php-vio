@@ -329,10 +329,18 @@ static void *d3d11_create_surface(vio_config *cfg)
 
     HWND hwnd = glfwGetWin32Window((GLFWwindow *)vio_d3d11.glfw_window);
 
+    /* HDR10 (GAP-PHASE5 Block 6): 10-bit backbuffer when asked for and the
+     * window's display is in HDR mode (or forced). */
+    int want_hdr = cfg->hdr_output == 2
+        || (cfg->hdr_output == 1 && vio_d3d_hwnd_output_is_hdr((IDXGIFactory1 *)vio_d3d11.factory, hwnd));
+    vio_d3d11.swapchain_format = want_hdr ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+    vio_d3d11.hdr_paper_white = cfg->hdr_paper_white > 0.0f ? cfg->hdr_paper_white : 200.0f;
+    vio_d3d11.hdr_output = 0;
+
     DXGI_SWAP_CHAIN_DESC1 sc_desc = {0};
     sc_desc.Width = cfg->width;
     sc_desc.Height = cfg->height;
-    sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sc_desc.Format = vio_d3d11.swapchain_format;
     sc_desc.Stereo = FALSE;
     sc_desc.SampleDesc.Count = 1;
     sc_desc.SampleDesc.Quality = 0;
@@ -368,6 +376,19 @@ static void *d3d11_create_surface(vio_config *cfg)
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D11: Failed to create swapchain (0x%08lx)", hr);
         return NULL;
+    }
+    if (want_hdr) {
+        IDXGISwapChain3 *sc3 = NULL;
+        if (SUCCEEDED(IDXGISwapChain1_QueryInterface(vio_d3d11.swapchain, &IID_IDXGISwapChain3, (void **)&sc3)) && sc3) {
+            UINT support = 0;
+            if (SUCCEEDED(IDXGISwapChain3_CheckColorSpaceSupport(sc3, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &support))
+                && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)
+                && SUCCEEDED(IDXGISwapChain3_SetColorSpace1(sc3, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020))) {
+                vio_d3d11.hdr_output = 1;
+            }
+            IDXGISwapChain3_Release(sc3);
+        }
+        if (!vio_d3d11.hdr_output && cfg->hdr_output == 2) vio_d3d11.hdr_output = 1;
     }
     if (cfg->frame_latency > 0) {
         /* Waitable swapchain (GAP-PHASE5 Block 5): IDXGISwapChain2 for the cap +
@@ -2668,8 +2689,8 @@ static void d3d11_swapchain_info(vio_swapchain_info *out)
     out->buffer_count  = vio_d3d11.swapchain ? 2 : 0;
     out->frame_latency = vio_d3d11.frame_latency;
     out->waitable      = vio_d3d11.frame_latency_waitable != NULL;
-    out->hdr_output    = 0;
-    out->format        = 0;
+    out->hdr_output    = vio_d3d11.hdr_output;
+    out->format        = vio_d3d11.swapchain_format == DXGI_FORMAT_R10G10B10A2_UNORM ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
 }
 
 static double d3d11_gpu_frame_time(void)
@@ -2698,6 +2719,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + depth-stencil state (GAP-PHASE5 Block 1) */
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d11.ts_available; /* TIMESTAMP + DISJOINT query ring */
         case VIO_FEATURE_FRAME_LATENCY:       return 1; /* FRAME_LATENCY_WAITABLE_OBJECT swapchain */
+        case VIO_FEATURE_HDR_OUTPUT:          return 1; /* RGB10A2 + SetColorSpace1(ST 2084) */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice TEXTURECUBE + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* ID3D11DeviceContext::GenerateMips */
         case VIO_FEATURE_CUBEMAP:      return 1;

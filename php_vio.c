@@ -162,6 +162,14 @@ ZEND_FUNCTION(vio_create)
         if ((val = zend_hash_str_find(options_ht, "frame_count", sizeof("frame_count") - 1)) != NULL) {
             ctx->config.frame_count = (int)zval_get_long(val);
         }
+        /* HDR10 output (D3D11 / D3D12): 1 = when the display is in HDR mode, 2 = force. */
+        if ((val = zend_hash_str_find(options_ht, "hdr_output", sizeof("hdr_output") - 1)) != NULL) {
+            zend_long ho = Z_TYPE_P(val) == IS_TRUE ? 1 : (Z_TYPE_P(val) == IS_FALSE ? 0 : zval_get_long(val));
+            ctx->config.hdr_output = ho < 0 ? 0 : (ho > 2 ? 2 : (int)ho);
+        }
+        if ((val = zend_hash_str_find(options_ht, "hdr_paper_white", sizeof("hdr_paper_white") - 1)) != NULL) {
+            ctx->config.hdr_paper_white = (float)zval_get_double(val);
+        }
         /* Waitable swapchain: cap the CPU's run-ahead at n frames (D3D11 / D3D12). */
         if ((val = zend_hash_str_find(options_ht, "frame_latency", sizeof("frame_latency") - 1)) != NULL) {
             zend_long fl = zval_get_long(val);
@@ -5938,6 +5946,9 @@ ZEND_FUNCTION(vio_read_pixels)
 
         for (int y = 0; y < h; y++) {
             memcpy(dst + y * w * 4, src + y * mapped.RowPitch, w * 4);
+            if (vio_d3d11.swapchain_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                vio_rt_rgb10a2_to_rgba8_inplace((unsigned char *)dst + y * w * 4, (size_t)w);
+            }
         }
         ZSTR_VAL(buf)[out_size] = '\0';
 
@@ -6913,6 +6924,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STENCIL", VIO_FEATURE_STENCIL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_GPU_TIMESTAMP", VIO_FEATURE_GPU_TIMESTAMP, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_FRAME_LATENCY", VIO_FEATURE_FRAME_LATENCY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_HDR_OUTPUT", VIO_FEATURE_HDR_OUTPUT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_RGB10A2", VIO_FORMAT_RGB10A2, CONST_CS | CONST_PERSISTENT);
 
     /* Actions */
     REGISTER_LONG_CONSTANT("VIO_RELEASE", VIO_RELEASE, CONST_CS | CONST_PERSISTENT);
@@ -7977,7 +7990,7 @@ ZEND_FUNCTION(vio_render_target)
                 php_error_docref(NULL, E_WARNING, "vio_render_target: at most %d attachments", VIO_MAX_COLOR_ATTACHMENTS);
                 RETURN_FALSE;
             }
-            if (f < VIO_FORMAT_RGBA8 || f > VIO_FORMAT_R8) {
+            if (f < VIO_FORMAT_RGBA8 || f > VIO_FORMAT_RGB10A2) {
                 php_error_docref(NULL, E_WARNING, "vio_render_target: unknown attachment format %ld", (long)f);
                 RETURN_FALSE;
             }

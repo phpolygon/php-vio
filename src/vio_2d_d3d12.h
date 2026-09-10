@@ -11,8 +11,10 @@
 #include <d3dcompiler.h>
 
 typedef struct _vio_2d_d3d12_state {
-    ID3D12PipelineState *pso_shapes;
+    ID3D12PipelineState *pso_shapes;          /* swapchain format */
     ID3D12PipelineState *pso_sprites;
+    ID3D12PipelineState *pso_shapes_rgba8;    /* RGBA8 offscreen targets while the swapchain is HDR10 (else NULL) */
+    ID3D12PipelineState *pso_sprites_rgba8;
     ID3D12Resource      *vbo;
     unsigned char       *vbo_mapped;     /* persistently mapped, sized for FRAME_COUNT slices */
     UINT                 vbo_size;       /* total bytes (slice * vio_d3d12.frame_count) */

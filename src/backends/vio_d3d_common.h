@@ -8,6 +8,8 @@
 #if defined(HAVE_D3D11) || defined(HAVE_D3D12)
 
 #include <dxgiformat.h>
+#include <dxgi1_6.h>
+#include <windows.h>
 #include "../../include/vio_types.h"
 
 /* Colour attachment format (vio_pixel_format) -> DXGI. */
@@ -21,6 +23,7 @@ static inline DXGI_FORMAT vio_pixel_format_to_dxgi(int f)
         case VIO_FORMAT_R16F:       return DXGI_FORMAT_R16_FLOAT;
         case VIO_FORMAT_R32F:       return DXGI_FORMAT_R32_FLOAT;
         case VIO_FORMAT_R8:         return DXGI_FORMAT_R8_UNORM;
+        case VIO_FORMAT_RGB10A2:    return DXGI_FORMAT_R10G10B10A2_UNORM;
         case VIO_FORMAT_RGBA8:
         default:                    return DXGI_FORMAT_R8G8B8A8_UNORM;
     }
@@ -103,5 +106,34 @@ static inline int vio_d3d_stencil_op_value(int op)
 #define vio_d3d_stencil_op(op)     ((D3D11_STENCIL_OP)vio_d3d_stencil_op_value(op))
 #define vio_d3d_compare_func_12(f) ((D3D12_COMPARISON_FUNC)vio_d3d_compare_func_value(f))
 #define vio_d3d_stencil_op_12(op)  ((D3D12_STENCIL_OP)vio_d3d_stencil_op_value(op))
+
+
+/* HDR display detection (GAP-PHASE5 Block 6): is the monitor showing `hwnd` in
+ * HDR mode (its output advertises the ST 2084 / BT.2020 colour space)? Both D3D
+ * backends call this before choosing the swapchain format; DXGI 1.6 only. */
+static inline int vio_d3d_hwnd_output_is_hdr(IDXGIFactory1 *factory, HWND hwnd)
+{
+    if (!factory || !hwnd) return 0;
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    int hdr = 0;
+    IDXGIAdapter1 *adapter = NULL;
+    for (UINT a = 0; !hdr && IDXGIFactory1_EnumAdapters1(factory, a, &adapter) == S_OK; a++) {
+        IDXGIOutput *out = NULL;
+        for (UINT o = 0; !hdr && IDXGIAdapter1_EnumOutputs(adapter, o, &out) == S_OK; o++) {
+            IDXGIOutput6 *out6 = NULL;
+            if (SUCCEEDED(IDXGIOutput_QueryInterface(out, &IID_IDXGIOutput6, (void **)&out6)) && out6) {
+                DXGI_OUTPUT_DESC1 d1;
+                if (SUCCEEDED(IDXGIOutput6_GetDesc1(out6, &d1)) && d1.Monitor == mon
+                    && d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+                    hdr = 1;
+                }
+                IDXGIOutput6_Release(out6);
+            }
+            IDXGIOutput_Release(out);
+        }
+        IDXGIAdapter1_Release(adapter);
+    }
+    return hdr;
+}
 
 #endif /* VIO_D3D_COMMON_H */

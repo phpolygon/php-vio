@@ -43,7 +43,10 @@ int vio_2d_d3d11_init(vio_2d_d3d11_state *state)
         return -1;
     }
 
-    hr = D3DCompile(vio_2d_hlsl_ps_shapes, strlen(vio_2d_hlsl_ps_shapes), "vio_2d_ps_shapes",
+    char *ps_shapes_src = vio_2d_hlsl_with_cb(vio_2d_hlsl_ps_shapes);
+    char *ps_sprites_src = vio_2d_hlsl_with_cb(vio_2d_hlsl_ps_sprites);
+    char *ps_text_src = vio_2d_hlsl_with_cb(vio_2d_hlsl_ps_text);
+    hr = D3DCompile(ps_shapes_src, strlen(ps_shapes_src), "vio_2d_ps_shapes",
                      NULL, NULL, "main", "ps_5_0", flags, 0, &ps_shapes_blob, &error_blob);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "2D PS shapes compile failed: %s",
@@ -53,7 +56,7 @@ int vio_2d_d3d11_init(vio_2d_d3d11_state *state)
         return -1;
     }
 
-    hr = D3DCompile(vio_2d_hlsl_ps_sprites, strlen(vio_2d_hlsl_ps_sprites), "vio_2d_ps_sprites",
+    hr = D3DCompile(ps_sprites_src, strlen(ps_sprites_src), "vio_2d_ps_sprites",
                      NULL, NULL, "main", "ps_5_0", flags, 0, &ps_sprites_blob, &error_blob);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "2D PS sprites compile failed: %s",
@@ -64,7 +67,7 @@ int vio_2d_d3d11_init(vio_2d_d3d11_state *state)
         return -1;
     }
 
-    hr = D3DCompile(vio_2d_hlsl_ps_text, strlen(vio_2d_hlsl_ps_text), "vio_2d_ps_text",
+    hr = D3DCompile(ps_text_src, strlen(ps_text_src), "vio_2d_ps_text",
                      NULL, NULL, "main", "ps_5_0", flags, 0, &ps_text_blob, &error_blob);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "2D PS text compile failed: %s",
@@ -119,9 +122,12 @@ int vio_2d_d3d11_init(vio_2d_d3d11_state *state)
     hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &vb_desc, NULL, &state->vbo);
     if (FAILED(hr)) goto fail;
 
+    free(ps_shapes_src); free(ps_sprites_src); free(ps_text_src);
+    ps_shapes_src = ps_sprites_src = ps_text_src = NULL;
+
     /* ── Constant buffer for projection matrix ───────────────────── */
     D3D11_BUFFER_DESC cb_desc = {0};
-    cb_desc.ByteWidth      = sizeof(float) * 16;  /* 4x4 matrix */
+    cb_desc.ByteWidth      = sizeof(float) * 20;  /* 4x4 matrix + float4 output control */
     cb_desc.Usage          = D3D11_USAGE_DYNAMIC;
     cb_desc.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
     cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;

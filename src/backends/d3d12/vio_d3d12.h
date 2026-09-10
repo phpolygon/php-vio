@@ -96,7 +96,8 @@ typedef struct _vio_d3d12_pipeline {
      * into a target with 2 / 4 / 8 samples needs its own variant. Built lazily
      * from pso_desc (SampleDesc.Count = 1 template) the first time the pipeline
      * is bound while such a target is bound; index = log2(samples). */
-    ID3D12PipelineState    *pso_ms[4];
+    struct { DXGI_FORMAT fmt; UINT samples; ID3D12PipelineState *pso; } pso_variants[8];
+    int                      pso_variant_count;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;
     D3D12_INPUT_ELEMENT_DESC *input_elements;  /* owned; referenced by pso_desc */
     char                   (*sem_names)[24];   /* owned; semantic names of matrix columns */
@@ -244,6 +245,11 @@ typedef struct _vio_d3d12_state {
      * begin_frame blocks on, and the latency it was set to (0 = not waitable). */
     HANDLE                     frame_latency_waitable;
     int                        frame_latency;
+    /* HDR10 output (GAP-PHASE5 Block 6): backbuffer format (RGBA8 or RGB10A2),
+     * whether the ST 2084 colour space is active, paper-white nits. */
+    DXGI_FORMAT                swapchain_format;
+    int                        hdr_output;
+    float                      hdr_paper_white;
 
     /* Debug-layer InfoQueue, resolved ONCE at init and owned for the device's
      * lifetime (released in shutdown). NULL whenever the debug layer is inactive,
@@ -328,6 +334,7 @@ typedef struct _vio_d3d12_state {
     int current_rt_height;
     int current_has_rtv;  /* 0 = depth-only when offscreen */
     int current_rt_samples; /* sample count of the bound target (1 = swapchain / single-sample) */
+    DXGI_FORMAT current_rt_format; /* colour format of the bound target (UNKNOWN = depth-only) */
     void *current_bound_rt; /* vio_render_target_object* for barrier tracking */
     void *pending_bound_rt; /* vio_render_target_object* requested via vio_bind_render_target
                              * while the command list was closed (before vio_begin); applied

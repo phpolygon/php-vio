@@ -30,6 +30,7 @@
 #include "vio_d3d12.h"
 #include "../vio_d3d_common.h"
 #include "../../vio_shader_cache.h"
+#include "../../vio_render_target.h"
 #include "../../vio_shader_reflect.h"   /* vio_spirv_reflect — data-driven compute register mapping */
 #include "../../vio_texture.h"          /* vio_texture_object — storage-image binds */
 #include <string.h>
@@ -1215,10 +1216,18 @@ static void *d3d12_create_surface(vio_config *cfg)
 
     HWND hwnd = glfwGetWin32Window((GLFWwindow *)vio_d3d12.glfw_window);
 
+    /* HDR10 (GAP-PHASE5 Block 6): 10-bit backbuffer when asked for and the
+     * window's display is in HDR mode (or forced); colour space set below. */
+    int want_hdr = cfg->hdr_output == 2
+        || (cfg->hdr_output == 1 && vio_d3d_hwnd_output_is_hdr((IDXGIFactory1 *)vio_d3d12.factory, hwnd));
+    vio_d3d12.swapchain_format = want_hdr ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+    vio_d3d12.hdr_paper_white = cfg->hdr_paper_white > 0.0f ? cfg->hdr_paper_white : 200.0f;
+    vio_d3d12.hdr_output = 0;
+
     DXGI_SWAP_CHAIN_DESC1 sc_desc = {0};
     sc_desc.Width = cfg->width;
     sc_desc.Height = cfg->height;
-    sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sc_desc.Format = vio_d3d12.swapchain_format;
     sc_desc.Stereo = FALSE;
     sc_desc.SampleDesc.Count = 1;
     sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -1263,6 +1272,18 @@ static void *d3d12_create_surface(vio_config *cfg)
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12: SwapChain3 not supported (0x%08lx)", hr);
         return NULL;
+    }
+    if (want_hdr) {
+        /* ST 2084 / BT.2020 when the swapchain can present it; a 10-bit
+         * swapchain on an SDR desktop (forced) stays sRGB-interpreted. */
+        UINT support = 0;
+        if (SUCCEEDED(IDXGISwapChain3_CheckColorSpaceSupport(vio_d3d12.swapchain, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &support))
+            && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)
+            && SUCCEEDED(IDXGISwapChain3_SetColorSpace1(vio_d3d12.swapchain, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020))) {
+            vio_d3d12.hdr_output = 1;
+        } else if (cfg->hdr_output == 2) {
+            vio_d3d12.hdr_output = 1;   /* forced: encode PQ anyway (test path) */
+        }
     }
     if (cfg->frame_latency > 0) {
         /* IDXGISwapChain3 derives from IDXGISwapChain2: set the cap and grab the
@@ -1378,7 +1399,7 @@ static void d3d12_resize(int width, int height)
     HRESULT hr = IDXGISwapChain3_ResizeBuffers(vio_d3d12.swapchain,
                                                 vio_d3d12.frame_count,
                                                 width, height,
-                                                DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                vio_d3d12.swapchain_format,
                                                 vio_d3d12.swapchain_flags);
     if (FAILED(hr)) {
         HRESULT removed = ID3D12Device_GetDeviceRemovedReason(vio_d3d12.device);
@@ -1623,27 +1644,42 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     return pipeline;
 }
 
-/* The PSO variant for a render target with `samples` samples (1 = the base
- * PSO). Variants are created on first use and live as long as the pipeline. */
-static ID3D12PipelineState *d3d12_pipeline_pso_for_samples(vio_d3d12_pipeline *p, int samples)
+/* The PSO variant for the bound target: `samples` (1 = single-sample) and its
+ * colour format (the swapchain may be RGB10A2 while the PSO was declared for
+ * RGBA8, GAP-PHASE5 Block 6). Variants are created on first use and live as
+ * long as the pipeline. Format variants only apply to single-target PSOs whose
+ * declared format is the RGBA8 default (an explicit FP16 / MRT declaration is
+ * kept as is). */
+static ID3D12PipelineState *d3d12_pipeline_pso_for_target(vio_d3d12_pipeline *p, int samples, DXGI_FORMAT fmt)
 {
     if (!p) return NULL;
-    if (samples <= 1) return p->pso;
-    int idx = samples >= 8 ? 3 : (samples >= 4 ? 2 : 1);
-    if (p->pso_ms[idx]) return p->pso_ms[idx];
+    UINT want_samples = samples <= 1 ? 1u : (samples >= 8 ? 8u : (samples >= 4 ? 4u : 2u));
+    DXGI_FORMAT want_fmt = p->pso_desc.RTVFormats[0];
+    if (fmt != DXGI_FORMAT_UNKNOWN && p->pso_desc.NumRenderTargets == 1
+        && p->pso_desc.RTVFormats[0] == DXGI_FORMAT_R8G8B8A8_UNORM && fmt != DXGI_FORMAT_R8G8B8A8_UNORM) {
+        want_fmt = fmt;
+    }
+    if (want_samples == 1 && want_fmt == p->pso_desc.RTVFormats[0]) return p->pso;
+    for (int i = 0; i < p->pso_variant_count; i++) {
+        if (p->pso_variants[i].fmt == want_fmt && p->pso_variants[i].samples == want_samples) return p->pso_variants[i].pso;
+    }
+    if (p->pso_variant_count >= 8) return p->pso;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = p->pso_desc;
-    d.SampleDesc.Count = (UINT)(1u << idx);
+    d.SampleDesc.Count = want_samples;
     d.SampleDesc.Quality = 0;
-    HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(vio_d3d12.device, &d,
-                                                           &IID_ID3D12PipelineState,
-                                                           (void **)&p->pso_ms[idx]);
-    if (FAILED(hr) || !p->pso_ms[idx]) {
-        d3d12_drain_info_queue("create_pso_msaa_fail");
-        php_error_docref(NULL, E_WARNING, "D3D12: Failed to create %d-sample PSO variant (0x%08lx)", 1 << idx, hr);
-        p->pso_ms[idx] = NULL;
+    d.RTVFormats[0] = want_fmt;
+    ID3D12PipelineState *pso = NULL;
+    HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(vio_d3d12.device, &d, &IID_ID3D12PipelineState, (void **)&pso);
+    if (FAILED(hr) || !pso) {
+        d3d12_drain_info_queue("create_pso_variant_fail");
+        php_error_docref(NULL, E_WARNING, "D3D12: Failed to create PSO variant (samples %u, format %d) (0x%08lx)", want_samples, (int)want_fmt, hr);
         return p->pso;
     }
-    return p->pso_ms[idx];
+    p->pso_variants[p->pso_variant_count].fmt = want_fmt;
+    p->pso_variants[p->pso_variant_count].samples = want_samples;
+    p->pso_variants[p->pso_variant_count].pso = pso;
+    p->pso_variant_count++;
+    return pso;
 }
 
 /* PSOs freed while a frame is recording may still be referenced by that
@@ -1669,8 +1705,8 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
     vio_d3d12_pipeline *p = (vio_d3d12_pipeline *)pipeline_ptr;
     if (!p) return;
     if (d3d12_current_pipeline == p) d3d12_current_pipeline = NULL;
-    for (int v = -1; v < 4; v++) {
-        ID3D12PipelineState *pso = v < 0 ? p->pso : p->pso_ms[v];
+    for (int v = -1; v < p->pso_variant_count; v++) {
+        ID3D12PipelineState *pso = v < 0 ? p->pso : p->pso_variants[v].pso;
         if (!pso) continue;
         UINT slot = vio_d3d12.frame_index < 3 ? vio_d3d12.frame_index : 0;
         if (vio_d3d12.in_frame && d3d12_pending_pso_count[slot] < VIO_D3D12_PENDING_PSO_MAX) {
@@ -1690,7 +1726,7 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
 static void d3d12_rearm_pso_for_target(void)
 {
     if (!d3d12_current_pipeline || !vio_d3d12.cmd_list || !vio_d3d12.in_frame) return;
-    ID3D12PipelineState *pso = d3d12_pipeline_pso_for_samples(d3d12_current_pipeline, vio_d3d12.current_rt_samples);
+    ID3D12PipelineState *pso = d3d12_pipeline_pso_for_target(d3d12_current_pipeline, vio_d3d12.current_rt_samples, vio_d3d12.current_rt_format);
     if (pso) ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list, pso);
 }
 
@@ -1701,7 +1737,7 @@ static void d3d12_bind_pipeline(void *pipeline_ptr)
 
     d3d12_current_pipeline = p;
     ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list,
-        d3d12_pipeline_pso_for_samples(p, vio_d3d12.current_rt_samples));
+        d3d12_pipeline_pso_for_target(p, vio_d3d12.current_rt_samples, vio_d3d12.current_rt_format));
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(vio_d3d12.cmd_list,
                                                         vio_d3d12.root_signature);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(vio_d3d12.cmd_list, p->topology);
@@ -2829,6 +2865,7 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
     d3d12_rt_set_viewport_scissor(w, h);
     vio_d3d12.current_bound_rt = rt;
     vio_d3d12.current_rt_samples = rt->samples > 1 ? rt->samples : 1;
+    vio_d3d12.current_rt_format = rt->depth_only ? DXGI_FORMAT_UNKNOWN : vio_pixel_format_to_dxgi(rt->formats[0]);
     d3d12_rearm_pso_for_target();
 }
 
@@ -2921,6 +2958,7 @@ static void d3d12_unbind_render_target(unsigned int default_fbo, int width, int 
     vio_d3d12.current_rt_height = vio_d3d12.height;
     vio_d3d12.current_has_rtv = 1;
     vio_d3d12.current_rt_samples = 1;
+    vio_d3d12.current_rt_format = vio_d3d12.swapchain_format;
     d3d12_rt_set_viewport_scissor(vio_d3d12.width, vio_d3d12.height);
     d3d12_rearm_pso_for_target();
 }
@@ -3554,6 +3592,7 @@ static void d3d12_begin_frame(void)
 
     /* Track current render target */
     vio_d3d12.current_rt_samples = 1;
+    vio_d3d12.current_rt_format = vio_d3d12.swapchain_format;
     vio_d3d12.current_rtv = frame->rtv_handle;
     vio_d3d12.current_rtvs[0] = frame->rtv_handle;
     vio_d3d12.current_rtv_count = 1;
@@ -4061,6 +4100,9 @@ unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
 
     ID3D12Resource_Unmap(readback, 0, NULL);
     ID3D12Resource_Release(readback);
+    if (src_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        vio_rt_rgb10a2_to_rgba8_inplace(out, (size_t)w * (size_t)h);
+    }
 
     if (out_w)    *out_w = w;
     if (out_h)    *out_h = h;
@@ -4439,7 +4481,7 @@ static void d3d12_restore_graphics_state_after_compute(void)
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(vio_d3d12.cmd_list, vio_d3d12.root_signature);
     if (d3d12_current_pipeline && d3d12_current_pipeline->pso) {
         ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list,
-            d3d12_pipeline_pso_for_samples(d3d12_current_pipeline, vio_d3d12.current_rt_samples));
+            d3d12_pipeline_pso_for_target(d3d12_current_pipeline, vio_d3d12.current_rt_samples, vio_d3d12.current_rt_format));
         ID3D12GraphicsCommandList_IASetPrimitiveTopology(vio_d3d12.cmd_list, d3d12_current_pipeline->topology);
         ID3D12GraphicsCommandList_OMSetStencilRef(vio_d3d12.cmd_list, d3d12_current_pipeline->stencil_ref);
     }
@@ -4782,8 +4824,8 @@ static void d3d12_swapchain_info(vio_swapchain_info *out)
     out->buffer_count  = vio_d3d12.swapchain ? (int)vio_d3d12.frame_count : 0;
     out->frame_latency = vio_d3d12.frame_latency;
     out->waitable      = vio_d3d12.frame_latency_waitable != NULL;
-    out->hdr_output    = 0;
-    out->format        = 0;
+    out->hdr_output    = vio_d3d12.hdr_output;
+    out->format        = vio_d3d12.swapchain_format == DXGI_FORMAT_R10G10B10A2_UNORM ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
 }
 
 static double d3d12_gpu_frame_time(void)
@@ -4815,6 +4857,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + PSO depth-stencil state */
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d12.ts_heap != NULL; /* timestamp query heap + readback ring */
         case VIO_FEATURE_FRAME_LATENCY:       return 1; /* FRAME_LATENCY_WAITABLE_OBJECT swapchain */
+        case VIO_FEATURE_HDR_OUTPUT:          return 1; /* RGB10A2 + SetColorSpace1(ST 2084), PSO format variants */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* CPU box filter + re-upload (GAP-PLAN 2.3) */
         case VIO_FEATURE_CUBEMAP:      return 1;
