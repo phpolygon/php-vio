@@ -75,15 +75,9 @@ foreach ($backends as $be) {
     if (!$cp) { echo "$name: compute pipeline failed\n"; vio_destroy($ctx); continue; }
     vio_compute_bind_image($ctx, $cp, $tex, 0, VIO_COMPUTE_WRITE);
     vio_compute_dispatch($ctx, $cp, (int)ceil($W / 8), (int)ceil($W / 8), 1);
-    if ($name === 'd3d12') {
-        // FOLLOW-UP: on the WARP CI runner a texture written by the GPU (UAV /
-        // render target) samples as stale data in the following pass; uploaded
-        // textures are fine. The dispatch itself ran without errors above; the
-        // pixel verification stays disabled on D3D12 until that is understood.
-        echo "$name: skipped\n";
-        vio_destroy($ctx);
-        continue;
-    }
+    /* The D3D12 pixel check used to be disabled here ("GPU-written texture samples
+     * stale"). That was the pending-bind table holding a raw pointer to a texture
+     * temporary (see test 111), not a barrier problem — checked on every backend. */
 
     $fmt = $name === 'opengl' ? VIO_SHADER_GLSL_RAW : VIO_SHADER_GLSL;
     $pipe = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs, 'fragment' => $fs, 'format' => $fmt]),
