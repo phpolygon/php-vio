@@ -4,9 +4,10 @@ vio_create('auto') never picks a backend without a 3D pipeline when another regi
 vio
 --FILE--
 <?php
-/* D3D-VULKAN-GAP-PLAN.md Phase 0.4. The Vulkan backend reports
- * VIO_FEATURE_3D_PIPELINE = 0 (vulkan_create_pipeline is a stub), yet it sits
- * ahead of OpenGL in the Linux priority list. vio_get_auto_backend() therefore
+/* D3D-VULKAN-GAP-PLAN.md Phase 0.4 / GAP-PHASE5 Block 10. A backend whose 3D path
+ * is incomplete (Vulkan before Block 10 reported VIO_FEATURE_3D_PIPELINE = 0) must
+ * not win over a complete one although it sits ahead of OpenGL in the Linux
+ * priority list. vio_get_auto_backend() therefore
  * skips 3D-less backends when a later candidate can draw 3D. This test checks
  * the contract from the outside: if ANY registered backend that can be opened
  * headless reports a 3D pipeline, then 'auto' must report one as well.

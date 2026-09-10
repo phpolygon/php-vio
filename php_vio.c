@@ -2069,6 +2069,10 @@ static void vio_push_shader_cbuffers(vio_context_object *ctx)
     if (ctx->bound_shader_object) {
         vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
 
+        if (ctx->backend->push_cbuffers) {
+            ctx->backend->push_cbuffers(sh->cbuffer_data, sh->cbuffer_total_size,
+                                        sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+        }
         /* Upload vertex cbuffer */
         if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
             ctx->backend->update_buffer(sh->cbuffer_backend,
@@ -7985,6 +7989,7 @@ ZEND_FUNCTION(vio_draw_instanced)
     }
 
     if (ctx->backend->draw_mesh_instanced) {
+        if (ctx->backend->push_cbuffers) vio_push_shader_cbuffers(ctx);   /* Vulkan: per-draw uniform upload */
         ctx->backend->draw_mesh_instanced(mesh, mat_data, (int)instance_count);
     }
 
@@ -8061,7 +8066,7 @@ ZEND_FUNCTION(vio_draw_instanced)
                 if (mesh->index_count > 0 && mesh->backend_ib) {
                     vio_d3d11_buffer *ib = (vio_d3d11_buffer *)mesh->backend_ib;
                     ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
-                                                         DXGI_FORMAT_R32_UINT, 0);
+                                                         mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
                     ID3D11DeviceContext_DrawIndexedInstanced(vio_d3d11.context,
                         mesh->index_count, (UINT)instance_count, 0, 0, 0);
                 } else {
@@ -8167,7 +8172,7 @@ ZEND_FUNCTION(vio_draw_instanced)
                 D3D12_INDEX_BUFFER_VIEW ibv = {0};
                 ibv.BufferLocation = ib->gpu_address;
                 ibv.SizeInBytes = (UINT)ib->size;
-                ibv.Format = DXGI_FORMAT_R32_UINT;
+                ibv.Format = mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
                 ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
                 vio_d3d12_flush_srv_table();
                 ID3D12GraphicsCommandList_DrawIndexedInstanced(vio_d3d12.cmd_list,
@@ -8896,29 +8901,11 @@ ZEND_FUNCTION(vio_render_target_texture)
      * the returned VioTexture's free handler from running vulkan_destroy_texture
      * on the borrowed handles, we leave tex->backend = NULL (the texture free
      * handler short-circuits when backend is NULL) and mark it borrowed. */
-    if (rt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.initialized && !rt->depth_only) {
-        vio_vulkan_texture **cache_slot =
-            (vio_vulkan_texture **)&rt->vulkan_color_backend_texture;
-
-        if (*cache_slot == NULL && rt->vulkan_color_view && rt->vulkan_sampler) {
-            vio_vulkan_texture *w = calloc(1, sizeof(vio_vulkan_texture));
-            if (w) {
-                w->image      = (VkImage)rt->vulkan_color_image; /* borrowed (RT-owned) */
-                w->allocation = NULL;                            /* RT owns the allocation */
-                w->view       = (VkImageView)rt->vulkan_color_view;   /* borrowed */
-                w->sampler    = (VkSampler)rt->vulkan_sampler;        /* borrowed */
-                w->width      = rt->width;
-                w->height     = rt->height;
-                /* NOT linked into vio_vk.live_textures: the shutdown sweep frees
-                 * GPU objects, but these are owned by the RT, not this wrapper. */
-                w->next = w->prev = NULL;
-                *cache_slot = w;
-            }
-        }
-
-        if (*cache_slot != NULL) {
-            tex->backend_texture = *cache_slot;
-            tex->backend         = NULL; /* prevent the tex dtor from freeing borrowed handles */
+    if (rt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.initialized) {
+        void *wrapper = vulkan_rt_sampling_texture(rt);   /* colour, or depth for depth_only targets */
+        if (wrapper) {
+            tex->backend_texture = wrapper;
+            tex->backend         = NULL; /* the RT owns the wrapper and its handles */
             tex->borrowed        = 1;
         }
     }

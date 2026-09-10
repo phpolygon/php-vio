@@ -351,6 +351,12 @@ typedef struct _vio_backend {
      * every following draw (re-armed after each command-list reset). 0 on
      * success, -1 when the device lacks the tier / rate. NULL => unsupported. */
     int   (*set_shading_rate)(int rate);
+
+    /* Per-draw shader constants (GAP-PHASE5 Block 10): the bound shader's vertex and
+     * fragment uniform shadows, called by vio_push_shader_cbuffers() before every
+     * draw on backends that upload them themselves (Vulkan's frame ring). NULL
+     * => the backend uses cbuffer_backend / update_buffer instead. */
+    void  (*push_cbuffers)(const void *vs_data, int vs_size, const void *fs_data, int fs_size);
 } vio_backend;
 
 /*
