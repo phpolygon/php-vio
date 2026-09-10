@@ -1,3 +1,10 @@
+# [2.19.0](https://github.com/phpolygon/php-vio/compare/v2.18.0...v2.19.0) (2026-09-10)
+
+
+### Features
+
+* **core:** texture arrays, BC-compressed textures and a KTX2 loader ([b9b7ca1](https://github.com/phpolygon/php-vio/commit/b9b7ca1ead595ece485a756840bb2e582b7543e4))
+
 # [2.18.0](https://github.com/phpolygon/php-vio/compare/v2.17.0...v2.18.0) (2026-09-10)
 
 
