@@ -75,6 +75,7 @@ probe("null", [
     VIO_FEATURE_INDIRECT_DRAW      => 0,
     VIO_FEATURE_TEXTURE_ARRAY      => 0,
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 0,
+    VIO_FEATURE_SHADING_RATE       => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -152,6 +153,7 @@ probe_fold("vulkan", [
     VIO_FEATURE_INDIRECT_DRAW      => 0,   /* with the 3D pipeline (GAP-PHASE5 10) */
     VIO_FEATURE_TEXTURE_ARRAY      => 0,   /* with the 3D pipeline (GAP-PHASE5 10) */
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 0,
+    VIO_FEATURE_SHADING_RATE       => 0,   /* VK_KHR_fragment_shading_rate with the 3D pipeline */
     VIO_FEATURE_INSTANCED_DRAW     => 0,
     VIO_FEATURE_DEPTH_BIAS         => 0,
     VIO_FEATURE_TESSELLATION       => 0,

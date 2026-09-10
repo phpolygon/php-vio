@@ -340,6 +340,37 @@ static void d3d12_wait_for_frame(UINT frame_idx)
 
 /* ── Descriptor heap helpers ──────────────────────────────────────── */
 
+/* Variable rate shading (GAP-PHASE5 Block 12): RSSetShadingRate is command-list
+ * state, so the sticky rate is re-armed after every Reset of the frame list. */
+static void d3d12_apply_shading_rate(void)
+{
+    if (!vio_d3d12.cmd_list || vio_d3d12.vrs_tier <= 0) return;
+    if (!vio_d3d12.cmd_list5 &&
+        FAILED(ID3D12GraphicsCommandList_QueryInterface(vio_d3d12.cmd_list, &IID_ID3D12GraphicsCommandList5, (void **)&vio_d3d12.cmd_list5))) {
+        vio_d3d12.cmd_list5 = NULL;
+        vio_d3d12.vrs_tier = 0;   /* runtime too old for the interface: report honestly */
+        return;
+    }
+    D3D12_SHADING_RATE r;
+    switch (vio_d3d12.shading_rate) {
+        case VIO_SHADING_RATE_1X2: r = D3D12_SHADING_RATE_1X2; break;
+        case VIO_SHADING_RATE_2X1: r = D3D12_SHADING_RATE_2X1; break;
+        case VIO_SHADING_RATE_2X2: r = D3D12_SHADING_RATE_2X2; break;
+        case VIO_SHADING_RATE_4X4: r = D3D12_SHADING_RATE_4X4; break;
+        default:                   r = D3D12_SHADING_RATE_1X1; break;
+    }
+    ID3D12GraphicsCommandList5_RSSetShadingRate(vio_d3d12.cmd_list5, r, NULL);
+}
+
+static int d3d12_set_shading_rate(int rate)
+{
+    if (vio_d3d12.vrs_tier <= 0) return -1;
+    if (rate == VIO_SHADING_RATE_4X4 && !vio_d3d12.vrs_additional_rates) return -1;
+    vio_d3d12.shading_rate = rate;
+    if (vio_d3d12.in_frame && vio_d3d12.cmd_list) d3d12_apply_shading_rate();
+    return vio_d3d12.vrs_tier > 0 ? 0 : -1;
+}
+
 static int d3d12_create_descriptor_heap(ID3D12DescriptorHeap **out, D3D12_DESCRIPTOR_HEAP_TYPE type,
                                          UINT count, D3D12_DESCRIPTOR_HEAP_FLAGS flags)
 {
@@ -871,6 +902,16 @@ static int d3d12_init(vio_config *cfg)
     /* Shader model (GAP-PHASE5 Block 7): SM 6 only when asked for, the device
      * reports it and DXC (+ dxil.dll for signing) can be loaded. */
     vio_d3d12.shader_model = 5;
+    /* Variable rate shading capability (GAP-PHASE5 Block 12). */
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {0};
+        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6)))) {
+            vio_d3d12.vrs_tier = (int)o6.VariableShadingRateTier;
+            vio_d3d12.vrs_additional_rates = o6.AdditionalShadingRatesSupported ? 1 : 0;
+        }
+        vio_d3d12.shading_rate = VIO_SHADING_RATE_1X1;
+    }
+
     if (cfg->shader_model >= 6) {
         if (cfg->dxc_dir[0]) vio_dxc_set_dir(cfg->dxc_dir);
         D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_0 };
@@ -1210,6 +1251,7 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.mipgen_pso)     ID3D12PipelineState_Release(vio_d3d12.mipgen_pso);
     if (vio_d3d12.mipgen_rs)      ID3D12RootSignature_Release(vio_d3d12.mipgen_rs);
     if (vio_d3d12.mipgen_heap)    ID3D12DescriptorHeap_Release(vio_d3d12.mipgen_heap);
+    if (vio_d3d12.cmd_list5)      ID3D12GraphicsCommandList5_Release(vio_d3d12.cmd_list5);
     if (vio_d3d12.ts_readback)    ID3D12Resource_Release(vio_d3d12.ts_readback);
     if (vio_d3d12.ts_heap)        ID3D12QueryHeap_Release(vio_d3d12.ts_heap);
     if (vio_d3d12.fence)          ID3D12Fence_Release(vio_d3d12.fence);
@@ -4004,6 +4046,7 @@ static void d3d12_begin_frame(void)
     /* Reset command allocator and command list */
     ID3D12CommandAllocator_Reset(frame->cmd_allocator);
     ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
+    if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1) d3d12_apply_shading_rate();   /* VRS is list state */
     if (vio_d3d12.ts_heap) {
         ID3D12GraphicsCommandList_EndQuery(vio_d3d12.cmd_list, vio_d3d12.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP,
                                            (UINT)vio_d3d12.frame_index * 2);
@@ -4465,6 +4508,7 @@ unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
          * transitioned it back above) so no entry barrier is needed here. */
         ID3D12CommandAllocator_Reset(frame->cmd_allocator);
         ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
+        if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1) d3d12_apply_shading_rate();   /* VRS is list state */
         ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1,
             &vio_d3d12.current_rtv, FALSE, &vio_d3d12.current_dsv);
         D3D12_VIEWPORT vp = {0, 0, (float)vio_d3d12.width, (float)vio_d3d12.height, 0.0f, 1.0f};
@@ -4941,6 +4985,7 @@ static void d3d12_compute_wait(void)
 
     ID3D12CommandAllocator_Reset(frame->cmd_allocator);
     ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
+    if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1) d3d12_apply_shading_rate();   /* VRS is list state */
     /* Re-arm the bound target (swapchain or RT), viewport, scissor and the
      * graphics pipeline state exactly as the frame had them. */
     if (vio_d3d12.current_has_rtv) {
@@ -5297,6 +5342,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_INDIRECT_DRAW:       return 1; /* ExecuteIndirect with DrawIndexed / Draw signatures */
         case VIO_FEATURE_TEXTURE_ARRAY:       return 1; /* DepthOrArraySize > 1 + TEXTURE2DARRAY SRV */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return 1; /* BC1-BC7 mandatory on every D3D12 device */
+        case VIO_FEATURE_SHADING_RATE:        return vio_d3d12.vrs_tier > 0; /* RSSetShadingRate, VRS Tier 1+ (GAP-PHASE5 12) */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* compute downsample (GAP-PHASE5 11), CPU box filter fallback */
         case VIO_FEATURE_CUBEMAP:      return 1;
@@ -5755,6 +5801,7 @@ static const vio_backend d3d12_backend = {
     .gpu_frame_time    = d3d12_gpu_frame_time,
     .swapchain_info    = d3d12_swapchain_info,
     .draw_indirect     = d3d12_draw_indirect,
+    .set_shading_rate  = d3d12_set_shading_rate,
     .destroy_cubemap   = d3d12_destroy_cubemap,
     .upload_cubemap    = d3d12_upload_cubemap,
     .read_render_target = d3d12_read_render_target,

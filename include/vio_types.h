@@ -258,7 +258,21 @@ typedef enum _vio_feature {
      * compressed texture data uploaded as-is (BC1 / BC3 / BC4 / BC5; BC7 on
      * OpenGL additionally needs BPTC, GL 4.2). */
     VIO_FEATURE_TEXTURE_COMPRESSION_BC = 37,
+    /* vio_set_shading_rate(): variable rate shading - the fragment shader runs
+     * once per 1x2 / 2x1 / 2x2 / 4x4 pixel block while geometry, depth and the
+     * resolution stay untouched (D3D12 VRS Tier 1+). */
+    VIO_FEATURE_SHADING_RATE       = 38,
 } vio_feature;
+
+/* vio_set_shading_rate() rates (GAP-PHASE5 Block 12). 4X4 needs the device's
+ * additional-rates capability; the call returns false otherwise. */
+typedef enum _vio_shading_rate {
+    VIO_SHADING_RATE_1X1 = 0,   /* full rate (default) */
+    VIO_SHADING_RATE_1X2 = 1,
+    VIO_SHADING_RATE_2X1 = 2,
+    VIO_SHADING_RATE_2X2 = 3,   /* a quarter of the fragment invocations */
+    VIO_SHADING_RATE_4X4 = 4,   /* a sixteenth */
+} vio_shading_rate;
 
 /* ── Input actions ────────────────────────────────────────────────── */
 

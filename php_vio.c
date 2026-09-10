@@ -4294,6 +4294,34 @@ ZEND_FUNCTION(vio_draw_indirect)
     ctx->backend->draw_indirect(mesh, buf->backend_buffer, (int)max_draws, (size_t)offset);
 }
 
+/* Variable rate shading (GAP-PHASE5 Block 12): coarse pixel shading for the
+ * draws that follow - the cheapest performance tier because geometry, depth
+ * and the output resolution stay untouched. Sticky until changed; reset to
+ * VIO_SHADING_RATE_1X1 before UI / post-processing. false when the backend
+ * has no VRS tier or the rate is not offered (4X4 needs additional rates). */
+ZEND_FUNCTION(vio_set_shading_rate)
+{
+    zval *ctx_zval;
+    zend_long rate;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(rate)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        RETURN_FALSE;
+    }
+    if (rate < VIO_SHADING_RATE_1X1 || rate > VIO_SHADING_RATE_4X4) {
+        php_error_docref(NULL, E_WARNING, "vio_set_shading_rate: rate must be one of VIO_SHADING_RATE_1X1 / 1X2 / 2X1 / 2X2 / 4X4");
+        RETURN_FALSE;
+    }
+    if (!ctx->backend->set_shading_rate || !ctx->backend->supports_feature(VIO_FEATURE_SHADING_RATE)) {
+        RETURN_FALSE;
+    }
+    RETURN_BOOL(ctx->backend->set_shading_rate((int)rate) == 0);
+}
+
 static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
 {
     if (!sh->uniform_lookup) {
@@ -7166,6 +7194,12 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_INDIRECT_DRAW", VIO_FEATURE_INDIRECT_DRAW, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_ARRAY", VIO_FEATURE_TEXTURE_ARRAY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_COMPRESSION_BC", VIO_FEATURE_TEXTURE_COMPRESSION_BC, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE", VIO_FEATURE_SHADING_RATE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X1", VIO_SHADING_RATE_1X1, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X2", VIO_SHADING_RATE_1X2, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_2X1", VIO_SHADING_RATE_2X1, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_2X2", VIO_SHADING_RATE_2X2, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_4X4", VIO_SHADING_RATE_4X4, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_RGB10A2", VIO_FORMAT_RGB10A2, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_BC1", VIO_FORMAT_BC1, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_BC3", VIO_FORMAT_BC3, CONST_CS | CONST_PERSISTENT);
