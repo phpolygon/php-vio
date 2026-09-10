@@ -17,7 +17,9 @@
  *                       1 = lowest input latency; D3D11 / D3D12, 0 / absent = driver default,
  *                       hdr_output => true|1|2: HDR10 backbuffer (RGB10A2, ST 2084) on D3D11 / D3D12 when the
  *                       display is in HDR mode (2 = force); the 2D batch PQ-encodes its output,
- *                       hdr_paper_white => nits that display white maps to (default 200))
+ *                       hdr_paper_white => nits that display white maps to (default 200),
+ *                       shader_model => 6: compile D3D12 shaders with DXC to DXIL (needs dxcompiler.dll +
+ *                       dxil.dll, optionally located via dxc_dir => directory; falls back to FXC 5.1))
  * @return VioContext|false Context object or false on failure
  */
 function vio_create(string $backend = "auto", array $options = []): VioContext|false {}
@@ -345,7 +347,8 @@ function vio_shader_cache_stats(): array {}
 /**
  * What the presentation path runs with: ['buffer_count' => int, 'frame_latency' => int
  * (0 = driver default), 'waitable' => bool (frame-latency waitable object in use),
- * 'hdr_output' => bool (HDR10 backbuffer), 'format' => int (0 RGBA8, 8 RGB10A2)].
+ * 'hdr_output' => bool (HDR10 backbuffer), 'format' => int (0 RGBA8, 8 RGB10A2),
+ * 'shader_model' => int (D3D12: 6 with DXC / DXIL, 5 with FXC; D3D11: 5; 0 elsewhere)].
  */
 function vio_swapchain_info(VioContext $context): array {}
 

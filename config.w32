@@ -49,6 +49,7 @@ if (PHP_VIO != "no") {
         "src\\backends\\vulkan\\vio_vulkan.c " +
         "src\\backends\\d3d11\\vio_d3d11.c " +
         "src\\backends\\d3d12\\vio_d3d12.c " +
+        "src\\backends\\d3d12\\vio_dxc.cpp " +
         "vendor\\glad\\src\\glad.c " +
         "vendor\\stb\\stb_image_impl.c " +
         "vendor\\stb\\stb_truetype_impl.c " +

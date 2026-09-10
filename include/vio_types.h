@@ -291,6 +291,12 @@ typedef struct _vio_config {
      * (nits) that display-referred white (1.0) maps to; 0 => 200. */
     int         hdr_output;
     float       hdr_paper_white;
+    /* D3D12 shader model (GAP-PHASE5 Block 7): 6 compiles the SPIRV-Cross HLSL
+     * with DXC to DXIL (dxcompiler.dll + dxil.dll must be loadable, the device
+     * must report SM 6.0); 0 / 5 = FXC 5.1 as before. dxc_dir optionally names
+     * the directory holding the two DLLs. */
+    int         shader_model;
+    char        dxc_dir[512];
 } vio_config;
 
 /* vio_swapchain_info() — what the presentation path actually runs with. */
@@ -300,6 +306,7 @@ typedef struct _vio_swapchain_info {
     int waitable;        /* 1 = frame-latency waitable object in use */
     int hdr_output;      /* 1 = HDR10 (10-bit, ST 2084) output active (GAP-PHASE5 Block 6) */
     int format;          /* vio_pixel_format-like code of the backbuffer: 0 RGBA8, 8 RGB10A2 */
+    int shader_model;    /* D3D: 6 = DXC / DXIL, 5 = FXC; 0 elsewhere (GAP-PHASE5 Block 7) */
 } vio_swapchain_info;
 
 /* ── Descriptor structs ───────────────────────────────────────────── */

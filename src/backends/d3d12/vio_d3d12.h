@@ -250,6 +250,8 @@ typedef struct _vio_d3d12_state {
     DXGI_FORMAT                swapchain_format;
     int                        hdr_output;
     float                      hdr_paper_white;
+    /* Shader model in use (GAP-PHASE5 Block 7): 6 => DXC / DXIL, else FXC 5.1. */
+    int                        shader_model;
 
     /* Debug-layer InfoQueue, resolved ONCE at init and owned for the device's
      * lifetime (released in shutdown). NULL whenever the debug layer is inactive,

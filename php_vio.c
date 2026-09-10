@@ -170,6 +170,14 @@ ZEND_FUNCTION(vio_create)
         if ((val = zend_hash_str_find(options_ht, "hdr_paper_white", sizeof("hdr_paper_white") - 1)) != NULL) {
             ctx->config.hdr_paper_white = (float)zval_get_double(val);
         }
+        /* D3D12 shader model: 6 => DXC / DXIL (opt-in), default FXC 5.1. */
+        if ((val = zend_hash_str_find(options_ht, "shader_model", sizeof("shader_model") - 1)) != NULL) {
+            ctx->config.shader_model = (int)zval_get_long(val);
+        }
+        if ((val = zend_hash_str_find(options_ht, "dxc_dir", sizeof("dxc_dir") - 1)) != NULL && Z_TYPE_P(val) == IS_STRING) {
+            size_t n = Z_STRLEN_P(val);
+            if (n < sizeof(ctx->config.dxc_dir)) memcpy(ctx->config.dxc_dir, Z_STRVAL_P(val), n + 1);
+        }
         /* Waitable swapchain: cap the CPU's run-ahead at n frames (D3D11 / D3D12). */
         if ((val = zend_hash_str_find(options_ht, "frame_latency", sizeof("frame_latency") - 1)) != NULL) {
             zend_long fl = zval_get_long(val);
@@ -6244,6 +6252,7 @@ ZEND_FUNCTION(vio_swapchain_info)
     add_assoc_bool(return_value, "waitable", info.waitable ? 1 : 0);
     add_assoc_bool(return_value, "hdr_output", info.hdr_output ? 1 : 0);
     add_assoc_long(return_value, "format", info.format);
+    add_assoc_long(return_value, "shader_model", info.shader_model);
 }
 
 /* ── Image comparison (VRT) ───────────────────────────────────────── */
