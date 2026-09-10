@@ -29,6 +29,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_shader_reflect.h"
 #include "src/vio_audio.h"
 #include "src/vio_render_target.h"
+#include "src/vio_shader_cache.h"
 #include "src/vio_cubemap.h"
 #include "src/vio_recorder.h"
 #include "src/vio_stream.h"
@@ -166,6 +167,13 @@ ZEND_FUNCTION(vio_create)
         }
         if ((val = zend_hash_str_find(options_ht, "headless", sizeof("headless") - 1)) != NULL) {
             ctx->config.headless = zend_is_true(val);
+        }
+        /* On-disk shader / pipeline cache directory (GAP-PHASE5 Block 4): DXBC per
+         * HLSL stage on D3D11/D3D12, GL program binaries, the Vulkan pipeline
+         * cache. Process-wide; absent or '' keeps everything compiled per run. */
+        if ((val = zend_hash_str_find(options_ht, "shader_cache", sizeof("shader_cache") - 1)) != NULL
+            && Z_TYPE_P(val) == IS_STRING) {
+            vio_shader_cache_set_dir(Z_STRVAL_P(val));
         }
     }
 
@@ -6184,6 +6192,21 @@ ZEND_FUNCTION(vio_gpu_frame_time)
         RETURN_DOUBLE(-1.0);
     }
     RETURN_DOUBLE(ctx->backend->gpu_frame_time());
+}
+
+/* Shader-cache counters (GAP-PHASE5 Block 4): ['dir' => string|null, 'hits' => n,
+ * 'misses' => n, 'stores' => n], cumulative for the process. */
+ZEND_FUNCTION(vio_shader_cache_stats)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    long hits = 0, misses = 0, stores = 0;
+    vio_shader_cache_stats(&hits, &misses, &stores);
+    const char *dir = vio_shader_cache_dir();
+    array_init(return_value);
+    if (dir) add_assoc_string(return_value, "dir", (char *)dir); else add_assoc_null(return_value, "dir");
+    add_assoc_long(return_value, "hits", (zend_long)hits);
+    add_assoc_long(return_value, "misses", (zend_long)misses);
+    add_assoc_long(return_value, "stores", (zend_long)stores);
 }
 
 /* ── Image comparison (VRT) ───────────────────────────────────────── */

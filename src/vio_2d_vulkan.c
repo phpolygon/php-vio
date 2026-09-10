@@ -175,7 +175,7 @@ static VkPipeline vio_2d_vk_make_pipeline(vio_2d_vulkan_state *state, VkShaderMo
     info.basePipelineIndex   = -1;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult r = vkCreateGraphicsPipelines(vio_vk.device, VK_NULL_HANDLE, 1, &info, NULL, &pipeline);
+    VkResult r = vkCreateGraphicsPipelines(vio_vk.device, vio_vk.pipeline_cache, 1, &info, NULL, &pipeline);
     if (r != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Vulkan 2D: vkCreateGraphicsPipelines failed (VkResult %d)", r);
         return VK_NULL_HANDLE;

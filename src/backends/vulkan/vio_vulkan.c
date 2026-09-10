@@ -18,6 +18,7 @@
 #endif
 
 #include "vio_vulkan.h"
+#include "../../vio_shader_cache.h"
 #include "../../vio_texture.h"
 #include "../../vio_font.h"
 #include "../../vio_render_target.h"
@@ -282,6 +283,34 @@ static int create_logical_device(void)
 
     vkGetDeviceQueue(vio_vk.device, vio_vk.graphics_family, 0, &vio_vk.graphics_queue);
     vkGetDeviceQueue(vio_vk.device, vio_vk.present_family, 0, &vio_vk.present_queue);
+
+    /* On-disk pipeline cache (GAP-PHASE5 Block 4): keyed by the device so a
+     * blob from another GPU / driver is never fed back (Vulkan validates the
+     * header too, but a fresh cache is cheaper than a rejected one). */
+    vio_vk.pipeline_cache = VK_NULL_HANDLE;
+    if (vio_shader_cache_dir()) {
+        VkPhysicalDeviceProperties dp = {0};
+        vkGetPhysicalDeviceProperties(vio_vk.physical_device, &dp);
+        uint64_t key = vio_shader_cache_hash("vk-pipeline-cache", dp.deviceName, strlen(dp.deviceName));
+        key = vio_shader_cache_hash_more(key, &dp.driverVersion, sizeof(dp.driverVersion));
+        key = vio_shader_cache_hash_more(key, dp.pipelineCacheUUID, sizeof(dp.pipelineCacheUUID));
+        vio_vk.pipeline_cache_key = key;
+        size_t len = 0;
+        void *data = vio_shader_cache_load(key, "vkpc", &len);
+        VkPipelineCacheCreateInfo pci = {0};
+        pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        pci.initialDataSize = data ? len : 0;
+        pci.pInitialData = data;
+        if (vkCreatePipelineCache(vio_vk.device, &pci, NULL, &vio_vk.pipeline_cache) != VK_SUCCESS) {
+            vio_vk.pipeline_cache = VK_NULL_HANDLE;
+            if (data) {   /* corrupt blob? retry empty */
+                pci.initialDataSize = 0; pci.pInitialData = NULL;
+                if (vkCreatePipelineCache(vio_vk.device, &pci, NULL, &vio_vk.pipeline_cache) != VK_SUCCESS)
+                    vio_vk.pipeline_cache = VK_NULL_HANDLE;
+            }
+        }
+        if (data) free(data);
+    }
 
     /* GPU timestamps (GAP-PHASE5 Block 3): only when the graphics family stamps
      * with a non-zero valid-bit count. */
@@ -933,6 +962,19 @@ static void vulkan_shutdown(void)
     if (vio_vk.vma_allocator) { vio_vma_destroy(vio_vk.vma_allocator); vio_vk.vma_allocator = NULL; }
     if (vio_vk.device && vio_vk.transient_fence) { vkDestroyFence(vio_vk.device, vio_vk.transient_fence, NULL); vio_vk.transient_fence = VK_NULL_HANDLE; }
     if (vio_vk.device && vio_vk.transient_pool)  { vkDestroyCommandPool(vio_vk.device, vio_vk.transient_pool, NULL); vio_vk.transient_pool = VK_NULL_HANDLE; }
+    if (vio_vk.device && vio_vk.pipeline_cache) {
+        /* Persist the pipeline cache for the next run, then drop it. */
+        size_t len = 0;
+        if (vkGetPipelineCacheData(vio_vk.device, vio_vk.pipeline_cache, &len, NULL) == VK_SUCCESS && len > 0) {
+            void *buf = malloc(len);
+            if (buf && vkGetPipelineCacheData(vio_vk.device, vio_vk.pipeline_cache, &len, buf) == VK_SUCCESS) {
+                vio_shader_cache_store(vio_vk.pipeline_cache_key, "vkpc", buf, len);
+            }
+            free(buf);
+        }
+        vkDestroyPipelineCache(vio_vk.device, vio_vk.pipeline_cache, NULL);
+        vio_vk.pipeline_cache = VK_NULL_HANDLE;
+    }
     if (vio_vk.device) { vkDestroyDevice(vio_vk.device, NULL); vio_vk.device = VK_NULL_HANDLE; }
     if (vio_vk.surface) { vkDestroySurfaceKHR(vio_vk.instance, vio_vk.surface, NULL); vio_vk.surface = VK_NULL_HANDLE; }
 
@@ -2596,7 +2638,7 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
     cpi.stage.module        = cp->module;
     cpi.stage.pName         = "main";
     cpi.layout              = cp->pipeline_layout;
-    if (vkCreateComputePipelines(vio_vk.device, VK_NULL_HANDLE, 1, &cpi, NULL, &cp->pipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(vio_vk.device, vio_vk.pipeline_cache, 1, &cpi, NULL, &cp->pipeline) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Vulkan: vkCreateComputePipelines failed");
         vkDestroyPipelineLayout(vio_vk.device, cp->pipeline_layout, NULL);
         vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);

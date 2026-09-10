@@ -9,7 +9,10 @@
  * Create a new VIO rendering context.
  *
  * @param string $backend Backend name ("auto", "opengl", "vulkan", "metal", "null")
- * @param array $options Configuration options (width, height, title, vsync, samples, debug)
+ * @param array $options Configuration options (width, height, title, vsync, samples, debug,
+ *                       headless, frame_count, shader_cache => directory for the on-disk shader /
+ *                       pipeline cache: DXBC per HLSL stage on D3D11/D3D12, OpenGL >= 4.1 program
+ *                       binaries, the Vulkan pipeline cache — a warm start skips the compiles)
  * @return VioContext|false Context object or false on failure
  */
 function vio_create(string $backend = "auto", array $options = []): VioContext|false {}
@@ -327,6 +330,12 @@ function vio_mesh_index_bytes(VioMesh $mesh): int {}
  * timestamps (VIO_FEATURE_GPU_TIMESTAMP) or no frame has finished yet.
  */
 function vio_gpu_frame_time(VioContext $context): float {}
+
+/**
+ * Counters of the on-disk shader cache (vio_create 'shader_cache'), cumulative
+ * for the process: ['dir' => ?string, 'hits' => int, 'misses' => int, 'stores' => int].
+ */
+function vio_shader_cache_stats(): array {}
 
 /**
  * Draw a mesh in the current frame.
