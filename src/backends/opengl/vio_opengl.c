@@ -1658,6 +1658,35 @@ static int opengl_create_mesh(void *mesh_obj,
     return 0;
 }
 
+/* Apply one vio blend mode either globally (buf < 0) or to one draw buffer
+ * (GL 4.0 glBlendFunci family; used by pipelines with per-attachment state). */
+static void opengl_apply_blend(int buf, int blend)
+{
+    GLenum eq = GL_FUNC_ADD, sRGB = GL_ONE, dRGB = GL_ZERO, sA = GL_ONE, dA = GL_ZERO;
+    int enable = 1;
+    switch (blend) {
+        case VIO_BLEND_ALPHA:         sRGB = GL_SRC_ALPHA; dRGB = GL_ONE_MINUS_SRC_ALPHA; sA = GL_ONE; dA = GL_ONE_MINUS_SRC_ALPHA; break;
+        case VIO_BLEND_ADDITIVE:      sRGB = GL_SRC_ALPHA; dRGB = GL_ONE; sA = GL_ONE; dA = GL_ONE; break;
+        case VIO_BLEND_PREMULTIPLIED: sRGB = GL_ONE; dRGB = GL_ONE_MINUS_SRC_ALPHA; sA = GL_ONE; dA = GL_ONE_MINUS_SRC_ALPHA; break;
+        case VIO_BLEND_MULTIPLY:      sRGB = GL_DST_COLOR; dRGB = GL_ZERO; sA = GL_DST_ALPHA; dA = GL_ZERO; break;
+        case VIO_BLEND_SCREEN:        sRGB = GL_ONE; dRGB = GL_ONE_MINUS_SRC_COLOR; sA = GL_ONE; dA = GL_ONE_MINUS_SRC_ALPHA; break;
+        case VIO_BLEND_MIN:           eq = GL_MIN; sRGB = dRGB = sA = dA = GL_ONE; break;
+        case VIO_BLEND_MAX:           eq = GL_MAX; sRGB = dRGB = sA = dA = GL_ONE; break;
+        default:                      enable = 0; break;
+    }
+    if (buf < 0) {
+        glBlendEquation(eq);
+        if (!enable) { glDisable(GL_BLEND); return; }
+        glEnable(GL_BLEND);
+        glBlendFuncSeparate(sRGB, dRGB, sA, dA);
+        return;
+    }
+    glBlendEquationi((GLuint)buf, eq);
+    if (!enable) { glDisablei(GL_BLEND, (GLuint)buf); return; }
+    glEnablei(GL_BLEND, (GLuint)buf);
+    glBlendFuncSeparatei((GLuint)buf, sRGB, dRGB, sA, dA);
+}
+
 static void opengl_bind_pipeline_state(void *pipe_ptr)
 {
     vio_pipeline_object *pipe = (vio_pipeline_object *)pipe_ptr;
@@ -1679,11 +1708,6 @@ static void opengl_bind_pipeline_state(void *pipe_ptr)
         glDisable(GL_DEPTH_TEST);
     }
     glDepthMask(pipe->depth_write ? GL_TRUE : GL_FALSE);
-    glColorMask((pipe->color_mask & VIO_COLOR_R) ? GL_TRUE : GL_FALSE,
-                (pipe->color_mask & VIO_COLOR_G) ? GL_TRUE : GL_FALSE,
-                (pipe->color_mask & VIO_COLOR_B) ? GL_TRUE : GL_FALSE,
-                (pipe->color_mask & VIO_COLOR_A) ? GL_TRUE : GL_FALSE);
-
     if (pipe->depth_bias != 0.0f || pipe->slope_scaled_depth_bias != 0.0f) {
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(pipe->slope_scaled_depth_bias, pipe->depth_bias);
@@ -1691,41 +1715,23 @@ static void opengl_bind_pipeline_state(void *pipe_ptr)
         glDisable(GL_POLYGON_OFFSET_FILL);
     }
 
-    glBlendEquation(GL_FUNC_ADD);
-    switch (pipe->blend) {
-        case VIO_BLEND_NONE:
-            glDisable(GL_BLEND);
-            break;
-        case VIO_BLEND_ALPHA:
-            glEnable(GL_BLEND);
-            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-            break;
-        case VIO_BLEND_ADDITIVE:
-            glEnable(GL_BLEND);
-            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ONE, GL_ONE);
-            break;
-        case VIO_BLEND_PREMULTIPLIED:
-            glEnable(GL_BLEND);
-            glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-            break;
-        case VIO_BLEND_MULTIPLY:
-            glEnable(GL_BLEND);
-            glBlendFuncSeparate(GL_DST_COLOR, GL_ZERO, GL_DST_ALPHA, GL_ZERO);
-            break;
-        case VIO_BLEND_SCREEN:
-            glEnable(GL_BLEND);
-            glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_COLOR, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-            break;
-        case VIO_BLEND_MIN:
-            glEnable(GL_BLEND);
-            glBlendEquation(GL_MIN);
-            glBlendFunc(GL_ONE, GL_ONE);
-            break;
-        case VIO_BLEND_MAX:
-            glEnable(GL_BLEND);
-            glBlendEquation(GL_MAX);
-            glBlendFunc(GL_ONE, GL_ONE);
-            break;
+    /* Blend + colour write mask: one global state, or - 'attachment_blend' /
+     * 'attachment_color_mask' - per draw buffer (GL 4.0 indexed state). A later
+     * pipeline without the per-attachment arrays resets every buffer again through
+     * the non-indexed calls, so no state leaks between pipelines. */
+    if (pipe->per_attachment && GLAD_GL_VERSION_4_0) {
+        for (int ai = 0; ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
+            int cm = pipe->attachment_mask[ai];
+            glColorMaski((GLuint)ai, (cm & VIO_COLOR_R) ? GL_TRUE : GL_FALSE, (cm & VIO_COLOR_G) ? GL_TRUE : GL_FALSE,
+                         (cm & VIO_COLOR_B) ? GL_TRUE : GL_FALSE, (cm & VIO_COLOR_A) ? GL_TRUE : GL_FALSE);
+            opengl_apply_blend(ai, pipe->attachment_blend[ai]);
+        }
+    } else {
+        glColorMask((pipe->color_mask & VIO_COLOR_R) ? GL_TRUE : GL_FALSE,
+                    (pipe->color_mask & VIO_COLOR_G) ? GL_TRUE : GL_FALSE,
+                    (pipe->color_mask & VIO_COLOR_B) ? GL_TRUE : GL_FALSE,
+                    (pipe->color_mask & VIO_COLOR_A) ? GL_TRUE : GL_FALSE);
+        opengl_apply_blend(-1, (int)pipe->blend);
     }
 }
 

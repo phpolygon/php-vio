@@ -96,6 +96,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 | Ordner | Inhalt |
 |---|---|
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
+| `tests/render3d/112` | Blend und Write-Mask je Attachment auf einer MRT-Pipeline: Attachment 0 alpha-blendet, Attachment 1 (Maske 0) bleibt unberührt, Attachment 2 schreibt nur den Rotkanal – der Vertrag für einen Transparent-Pass in ein G-Buffer-Target. |
 | `tests/render3d/111` | Draw-time-Bind-Tabelle haelt Referenzen: eine als Temporary gebundene RT-Textur (`vio_bind_texture(\, vio_render_target_texture(\), 6)`) ueberlebt bis zum Draw, auch wenn danach weitere Texturobjekte entstehen (D3D11/D3D12/Metal; Regression aus 2.9: recycelter Objektspeicher legte die AO-Karte auf das Schatten-Register). |
 | `tests/render3d/096–098` | Storage-Images + 2D-Dispatch (API-Roadmap R2/R7), Multiple Render Targets (R1), Async-Compute im Frame (R7) |
 | `tests/backends/108` | OpenGL: `vio_set_uniform()` erreicht UBO-Block-Member, Default-Block-Uniforms und Array-Elemente von SPIR-V-Pfad-Shadern (SPIRV-Cross flacht sie zu `uniform Matrices _19;` ab → GL-Name `_19.uProjection`). |
@@ -159,6 +160,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | `vio_texture_update` | ✅ | ✅ | ❌ (Follow-up) | ❌ | ✅ |
 | `depth_write` / `color_mask` / Blend-Modi | ✅ | ✅ | ✅ | — | ✅ |
 | MRT (`'attachments' => [VIO_FORMAT_*…]`, bis 4) | ✅ | ✅† | ✅† | ❌ | ✅ |
+| Blend/Write-Mask je Attachment (`attachment_blend`, `attachment_color_mask`) | ✅ (GL ≥ 4.0, indexed) | ✅ (IndependentBlend) | ✅ (IndependentBlend) | ❌ | ✅ (per colorAttachment) |
 | Storage-Images (`'storage' => true` + `vio_compute_bind_image`) | ✅ (wenn Compute) | ✅† | ✅† | ❌ | ✅ |
 | Compute-`local_size` aus Reflection (2D/3D-Dispatch) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Async-Dispatch im Frame (`['async' => true]`, `vio_compute_wait`) | ✅ (Queue in-order) | ✅ (in-order) | ✅† (Frame-List) | sync | ✅ (Frame-Cmd-Buffer) |
@@ -714,7 +716,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 112 (109/110 gehören dem Branch feat/geometry-tessellation-stages, 111 ist die Bind-Tabelle)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 113 (109/110 gehören dem Branch feat/geometry-tessellation-stages, 111 Bind-Tabelle, 112 Blend je Attachment)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.

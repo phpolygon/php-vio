@@ -420,6 +420,55 @@ static void d3d11_resize(int width, int height)
 
 /* ── Pipeline ─────────────────────────────────────────────────────── */
 
+/* Fill one render-target blend description from a vio blend mode + VIO_COLOR_*
+ * write mask. Used for RenderTarget[0] (the classic single state, replicated to
+ * every attachment by the runtime) and, with IndependentBlendEnable, per
+ * attachment when the pipeline carries 'attachment_blend' / 'attachment_color_mask'. */
+static void d3d11_fill_rt_blend(D3D11_RENDER_TARGET_BLEND_DESC *b, int blend, int cm)
+{
+    UINT8 wm = 0; /* cm is taken literally: 0 = write nothing (masked-off attachment) */
+    if (cm & VIO_COLOR_R) wm |= D3D11_COLOR_WRITE_ENABLE_RED;
+    if (cm & VIO_COLOR_G) wm |= D3D11_COLOR_WRITE_ENABLE_GREEN;
+    if (cm & VIO_COLOR_B) wm |= D3D11_COLOR_WRITE_ENABLE_BLUE;
+    if (cm & VIO_COLOR_A) wm |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
+    b->RenderTargetWriteMask = wm;
+    b->BlendEnable = FALSE;
+    b->BlendOp = b->BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    b->SrcBlend = D3D11_BLEND_ONE; b->DestBlend = D3D11_BLEND_ZERO;
+    b->SrcBlendAlpha = D3D11_BLEND_ONE; b->DestBlendAlpha = D3D11_BLEND_ZERO;
+    switch (blend) {
+        case VIO_BLEND_ALPHA:
+            b->BlendEnable = TRUE;
+            b->SrcBlend = D3D11_BLEND_SRC_ALPHA; b->DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+            b->SrcBlendAlpha = D3D11_BLEND_ONE;  b->DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; break;
+        case VIO_BLEND_ADDITIVE:
+            b->BlendEnable = TRUE;
+            b->SrcBlend = D3D11_BLEND_SRC_ALPHA; b->DestBlend = D3D11_BLEND_ONE;
+            b->SrcBlendAlpha = D3D11_BLEND_ONE;  b->DestBlendAlpha = D3D11_BLEND_ONE; break;
+        case VIO_BLEND_PREMULTIPLIED:
+            b->BlendEnable = TRUE;
+            b->SrcBlend = D3D11_BLEND_ONE;       b->DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+            b->SrcBlendAlpha = D3D11_BLEND_ONE;  b->DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; break;
+        case VIO_BLEND_MULTIPLY:
+            b->BlendEnable = TRUE;
+            b->SrcBlend = D3D11_BLEND_DEST_COLOR; b->DestBlend = D3D11_BLEND_ZERO;
+            b->SrcBlendAlpha = D3D11_BLEND_DEST_ALPHA; b->DestBlendAlpha = D3D11_BLEND_ZERO; break;
+        case VIO_BLEND_SCREEN:
+            b->BlendEnable = TRUE;
+            b->SrcBlend = D3D11_BLEND_ONE;       b->DestBlend = D3D11_BLEND_INV_SRC_COLOR;
+            b->SrcBlendAlpha = D3D11_BLEND_ONE;  b->DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; break;
+        case VIO_BLEND_MIN:
+            b->BlendEnable = TRUE;
+            b->BlendOp = b->BlendOpAlpha = D3D11_BLEND_OP_MIN;
+            b->SrcBlend = b->DestBlend = b->SrcBlendAlpha = b->DestBlendAlpha = D3D11_BLEND_ONE; break;
+        case VIO_BLEND_MAX:
+            b->BlendEnable = TRUE;
+            b->BlendOp = b->BlendOpAlpha = D3D11_BLEND_OP_MAX;
+            b->SrcBlend = b->DestBlend = b->SrcBlendAlpha = b->DestBlendAlpha = D3D11_BLEND_ONE; break;
+        default: break;
+    }
+}
+
 static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
 {
     HRESULT hr;
@@ -534,57 +583,15 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
     ID3D11Device_CreateDepthStencilState(vio_d3d11.device, &ds_desc,
                                           &pipeline->depth_stencil_state);
 
-    /* Blend state */
+    /* Blend state (see d3d11_fill_rt_blend; per attachment when the pipeline asks). */
     D3D11_BLEND_DESC blend_desc = {0};
-    {
-        int cm = desc->color_mask ? desc->color_mask : VIO_COLOR_RGBA;
-        UINT8 wm = 0;
-        if (cm & VIO_COLOR_R) wm |= D3D11_COLOR_WRITE_ENABLE_RED;
-        if (cm & VIO_COLOR_G) wm |= D3D11_COLOR_WRITE_ENABLE_GREEN;
-        if (cm & VIO_COLOR_B) wm |= D3D11_COLOR_WRITE_ENABLE_BLUE;
-        if (cm & VIO_COLOR_A) wm |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
-        blend_desc.RenderTarget[0].RenderTargetWriteMask = wm;
-    }
-
-    if (desc->blend == VIO_BLEND_PREMULTIPLIED || desc->blend == VIO_BLEND_MULTIPLY ||
-        desc->blend == VIO_BLEND_SCREEN || desc->blend == VIO_BLEND_MIN || desc->blend == VIO_BLEND_MAX) {
-        D3D11_RENDER_TARGET_BLEND_DESC *b = &blend_desc.RenderTarget[0];
-        b->BlendEnable = TRUE;
-        b->BlendOp = b->BlendOpAlpha = D3D11_BLEND_OP_ADD;
-        switch (desc->blend) {
-            case VIO_BLEND_PREMULTIPLIED:
-                b->SrcBlend = D3D11_BLEND_ONE;       b->DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-                b->SrcBlendAlpha = D3D11_BLEND_ONE;  b->DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; break;
-            case VIO_BLEND_MULTIPLY:
-                b->SrcBlend = D3D11_BLEND_DEST_COLOR; b->DestBlend = D3D11_BLEND_ZERO;
-                b->SrcBlendAlpha = D3D11_BLEND_DEST_ALPHA; b->DestBlendAlpha = D3D11_BLEND_ZERO; break;
-            case VIO_BLEND_SCREEN:
-                b->SrcBlend = D3D11_BLEND_ONE;       b->DestBlend = D3D11_BLEND_INV_SRC_COLOR;
-                b->SrcBlendAlpha = D3D11_BLEND_ONE;  b->DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; break;
-            case VIO_BLEND_MIN:
-                b->BlendOp = b->BlendOpAlpha = D3D11_BLEND_OP_MIN;
-                b->SrcBlend = b->DestBlend = b->SrcBlendAlpha = b->DestBlendAlpha = D3D11_BLEND_ONE; break;
-            case VIO_BLEND_MAX:
-                b->BlendOp = b->BlendOpAlpha = D3D11_BLEND_OP_MAX;
-                b->SrcBlend = b->DestBlend = b->SrcBlendAlpha = b->DestBlendAlpha = D3D11_BLEND_ONE; break;
-            default: break;
+    if (desc->per_attachment) {
+        blend_desc.IndependentBlendEnable = TRUE;
+        for (int ai = 0; ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
+            d3d11_fill_rt_blend(&blend_desc.RenderTarget[ai], desc->attachment_blend[ai], desc->attachment_mask[ai]);
         }
-    } else if (desc->blend == VIO_BLEND_ALPHA) {
-        blend_desc.RenderTarget[0].BlendEnable = TRUE;
-        blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
-        blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-        blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-        blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-        blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-        blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    } else if (desc->blend == VIO_BLEND_ADDITIVE) {
-        blend_desc.RenderTarget[0].BlendEnable = TRUE;
-        blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
-        blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
-        blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-        blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-        blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
-        blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    } else {
+        d3d11_fill_rt_blend(&blend_desc.RenderTarget[0], (int)desc->blend, desc->color_mask ? desc->color_mask : VIO_COLOR_RGBA);
     }
 
     ID3D11Device_CreateBlendState(vio_d3d11.device, &blend_desc, &pipeline->blend_state);
