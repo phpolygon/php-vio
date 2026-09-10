@@ -45,6 +45,7 @@ typedef struct _vio_metal_state {
     id<CAMetalDrawable>        current_drawable;
     id<MTLCommandBuffer>       current_cmd_buf;
     id<MTLRenderCommandEncoder> current_encoder;
+    double                     last_gpu_ms;     /* GPUEndTime - GPUStartTime of the last completed frame */
     MTLRenderPassDescriptor   *render_pass_desc;
     id<MTLTexture>             depth_texture;
     int                        width;
@@ -1191,6 +1192,13 @@ static void metal_present(void)
 {
     @autoreleasepool {
         if (!vio_mtl.current_cmd_buf) return;
+
+        /* GPU timestamps (GAP-PHASE5 Block 3): the command buffer reports its
+         * own GPU span once it completes. */
+        [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            double ms = (done.GPUEndTime - done.GPUStartTime) * 1000.0;
+            if (ms >= 0.0) vio_mtl.last_gpu_ms = ms;
+        }];
 
         if (vio_mtl.current_drawable) {
             /* Vsync path: present drawable to screen */
@@ -3773,6 +3781,11 @@ static size_t metal_read_buffer(void *backend_buffer, void *out, size_t size)
     }
     return n;
 }
+static double metal_gpu_frame_time(void)
+{
+    return vio_mtl.initialized && vio_mtl.last_gpu_ms > 0.0 ? vio_mtl.last_gpu_ms : -1.0;
+}
+
 static int metal_supports_feature(vio_feature f)
 {
     switch (f) {
@@ -3822,6 +3835,8 @@ static int metal_supports_feature(vio_feature f)
         /* MTLTexture-backed offscreen RTs via create/bind/unbind/destroy;
          * MSAA colour targets render into a 2DMultisample pair and resolve
          * at every pass end (`samples` on vio_render_target). */
+        return 1;
+    case VIO_FEATURE_GPU_TIMESTAMP: /* MTLCommandBuffer GPUStartTime / GPUEndTime */
         return 1;
     case VIO_FEATURE_STENCIL:       /* depth attachments are Depth32Float (no stencil plane) — macOS follow-up */
     case VIO_FEATURE_GEOMETRY:      /* Metal has no geometry stage */
@@ -3909,6 +3924,7 @@ static const vio_backend metal_backend = {
     .set_viewport      = metal_set_viewport,
     .dispatch_compute  = metal_dispatch_compute,
     .supports_feature  = metal_supports_feature,
+    .gpu_frame_time    = metal_gpu_frame_time,
     .destroy_mesh      = metal_destroy_mesh,
     .destroy_shader_obj = metal_destroy_shader_obj,
     .upload_cubemap    = metal_upload_cubemap,

@@ -320,6 +320,15 @@ function vio_mesh(VioContext $context, array $config): VioMesh|false {}
 function vio_mesh_index_bytes(VioMesh $mesh): int {}
 
 /**
+ * GPU time of the most recently completed frame in milliseconds — the span
+ * between the frame's first and last GPU command (D3D11/D3D12 timestamp
+ * queries, GL_TIMESTAMP, vkCmdWriteTimestamp, Metal GPUStartTime/GPUEndTime).
+ * Trails the CPU by one to two frames. -1.0 when the backend has no
+ * timestamps (VIO_FEATURE_GPU_TIMESTAMP) or no frame has finished yet.
+ */
+function vio_gpu_frame_time(VioContext $context): float {}
+
+/**
  * Draw a mesh in the current frame.
  */
 function vio_draw(VioContext $context, VioMesh $mesh): void {}

@@ -241,12 +241,31 @@ static int d3d11_init(vio_config *cfg)
     }
 
     vio_d3d11.vsync = cfg->vsync;
+    /* GPU timestamps (GAP-PHASE5 Block 3) — optional. */
+    vio_d3d11.last_gpu_ms = -1.0;
+    vio_d3d11.ts_available = 1;
+    for (int i = 0; i < 3; i++) {
+        D3D11_QUERY_DESC dq = {0}; dq.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        D3D11_QUERY_DESC tq = {0}; tq.Query = D3D11_QUERY_TIMESTAMP;
+        if (FAILED(ID3D11Device_CreateQuery(vio_d3d11.device, &dq, &vio_d3d11.ts_disjoint[i]))
+            || FAILED(ID3D11Device_CreateQuery(vio_d3d11.device, &tq, &vio_d3d11.ts_begin[i]))
+            || FAILED(ID3D11Device_CreateQuery(vio_d3d11.device, &tq, &vio_d3d11.ts_end[i]))) {
+            vio_d3d11.ts_available = 0;
+            break;
+        }
+    }
+
     vio_d3d11.initialized = 1;
     return 0;
 }
 
 static void d3d11_shutdown(void)
 {
+    for (int i = 0; i < 3; i++) {
+        if (vio_d3d11.ts_disjoint[i]) { ID3D11Query_Release(vio_d3d11.ts_disjoint[i]); vio_d3d11.ts_disjoint[i] = NULL; }
+        if (vio_d3d11.ts_begin[i])    { ID3D11Query_Release(vio_d3d11.ts_begin[i]);    vio_d3d11.ts_begin[i] = NULL; }
+        if (vio_d3d11.ts_end[i])      { ID3D11Query_Release(vio_d3d11.ts_end[i]);      vio_d3d11.ts_end[i] = NULL; }
+    }
     if (!vio_d3d11.initialized) return;
 
     /* Ensure GPU is idle before releasing */
@@ -1803,6 +1822,26 @@ static void d3d11_begin_frame(void)
 
     vio_d3d11.in_frame = 1;
 
+    /* GPU timestamps: harvest the slot we are about to reuse (its frame is two
+     * frames old — normally complete; if not, keep the previous value), then
+     * open this frame's disjoint range + begin stamp. */
+    if (vio_d3d11.ts_available) {
+        int slot = vio_d3d11.ts_slot;
+        if (vio_d3d11.ts_pending[slot]) {
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {0};
+            UINT64 b = 0, e = 0;
+            if (ID3D11DeviceContext_GetData(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_disjoint[slot], &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+                && ID3D11DeviceContext_GetData(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_begin[slot], &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+                && ID3D11DeviceContext_GetData(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_end[slot], &e, sizeof(e), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+                && !dj.Disjoint && dj.Frequency && e > b) {
+                vio_d3d11.last_gpu_ms = (double)(e - b) * 1000.0 / (double)dj.Frequency;
+            }
+            vio_d3d11.ts_pending[slot] = 0;
+        }
+        ID3D11DeviceContext_Begin(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_disjoint[slot]);
+        ID3D11DeviceContext_End(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_begin[slot]);
+    }
+
     /* Apply a vio_clear() issued before vio_begin() (colour + depth). */
     if (vio_d3d11.clear_pending) {
         vio_d3d11.clear_pending = 0;
@@ -1908,6 +1947,13 @@ int vio_d3d11_resolve_readback(void)
 
 static void d3d11_end_frame(void)
 {
+    if (vio_d3d11.ts_available && vio_d3d11.in_frame) {
+        int slot = vio_d3d11.ts_slot;
+        ID3D11DeviceContext_End(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_end[slot]);
+        ID3D11DeviceContext_End(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_disjoint[slot]);
+        vio_d3d11.ts_pending[slot] = 1;
+        vio_d3d11.ts_slot = (slot + 1) % 3;
+    }
     vio_d3d11.in_frame = 0;
     /* Mirror the just-rendered backbuffer — before the caller's Present() /
      * swap rotates FLIP_DISCARD buffers. GPU-local; no CPU transfer. */
@@ -2581,6 +2627,11 @@ static size_t d3d11_read_buffer(void *backend_buffer, void *out, size_t size)
 
 /* ── Feature Query ────────────────────────────────────────────────── */
 
+static double d3d11_gpu_frame_time(void)
+{
+    return vio_d3d11.initialized && vio_d3d11.ts_available ? vio_d3d11.last_gpu_ms : -1.0;
+}
+
 static int d3d11_supports_feature(vio_feature feature)
 {
     switch (feature) {
@@ -2600,6 +2651,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 1;
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1; /* multisampled colour + ResolveSubresource on unbind (GAP-PLAN Phase 3) */
         case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + depth-stencil state (GAP-PHASE5 Block 1) */
+        case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d11.ts_available; /* TIMESTAMP + DISJOINT query ring */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice TEXTURECUBE + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* ID3D11DeviceContext::GenerateMips */
         case VIO_FEATURE_CUBEMAP:      return 1;
@@ -2784,6 +2836,7 @@ static const vio_backend d3d11_backend = {
     .bind_storage_buffer          = d3d11_bind_storage_buffer,
     .draw_instanced_from_storage  = d3d11_draw_instanced_from_storage,
     .supports_feature  = d3d11_supports_feature,
+    .gpu_frame_time    = d3d11_gpu_frame_time,
     .destroy_cubemap   = d3d11_destroy_cubemap,
     .destroy_font_atlas = d3d11_destroy_font_atlas,
     .destroy_render_target = d3d11_destroy_render_target,

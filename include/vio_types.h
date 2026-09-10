@@ -237,6 +237,10 @@ typedef enum _vio_feature {
      * depth attachment carries 8 stencil bits and the pipeline state exposes
      * compare function, reference, masks and the three operations. */
     VIO_FEATURE_STENCIL            = 31,
+    /* vio_gpu_frame_time(): GPU timestamps around the frame's command stream
+     * (D3D11/D3D12 timestamp queries, GL_TIMESTAMP, vkCmdWriteTimestamp, Metal
+     * GPUStart/EndTime) read back one to two frames later. */
+    VIO_FEATURE_GPU_TIMESTAMP      = 32,
 } vio_feature;
 
 /* ── Input actions ────────────────────────────────────────────────── */
