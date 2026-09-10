@@ -1,3 +1,10 @@
+# [2.12.0](https://github.com/phpolygon/php-vio/compare/v2.11.0...v2.12.0) (2026-09-10)
+
+
+### Features
+
+* **pipeline:** stencil state on every 3D backend, multisampled render targets on D3D12 ([d8685de](https://github.com/phpolygon/php-vio/commit/d8685deb6498cf6e698132252401098f45a9f45a))
+
 # [2.11.0](https://github.com/phpolygon/php-vio/compare/v2.10.2...v2.11.0) (2026-09-10)
 
 
