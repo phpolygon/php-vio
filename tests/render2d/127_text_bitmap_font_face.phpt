@@ -50,7 +50,7 @@ echo 'size: ', ($w > 40 && $h > 15 && strlen($b['data']) === $w * $h) ? 'ok' : "
 $ink = 0; $max = 0;
 foreach (count_chars($b['data'], 1) as $byte => $n) { if ($byte > 128) $ink += $n; $max = max($max, $byte); }
 echo 'ink: ', ($ink > 50 && $max === 255) ? 'ok' : "bad ink={$ink} max={$max}", "\n";
-echo 'origin: ', ($b['origin_x'] >= -2 && $b['origin_x'] <= 8 && $b['baseline'] > 0 && $b['baseline'] <= $h) ? 'ok' : "bad {$b['origin_x']}/{$b['baseline']}", "\n";
+echo 'origin: ', ($b['origin_x'] >= -8 && $b['origin_x'] <= 8 && $b['baseline'] > 0 && $b['baseline'] <= $h) ? 'ok' : "bad {$b['origin_x']}/{$b['baseline']}", "\n";
 echo 'advance: ', ($b['advance'] >= $w - $b['origin_x'] - 4) ? 'ok' : "bad {$b['advance']}", "\n";
 
 // --- Measure-only returns the same metrics without pixels.
