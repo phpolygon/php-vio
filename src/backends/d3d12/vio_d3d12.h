@@ -176,6 +176,11 @@ typedef struct _vio_d3d12_compute_pipeline {
     ID3D12Resource     *params_buf;
     size_t              params_capacity;  /* allocated bytes (256-aligned) */
     size_t              params_size;      /* bytes actually staged */
+    /* CPU copy of the staged params (params_capacity bytes). An async dispatch
+     * recorded into the frame copies it into the frame's cbuffer slice, because
+     * params_buf is only read when the GPU runs the list - after the CPU may
+     * have staged the values of a later dispatch or of the next frame. */
+    unsigned char      *params_cpu;
 } vio_d3d12_compute_pipeline;
 
 /* Texture wrapper */
