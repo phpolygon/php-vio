@@ -772,12 +772,15 @@ static void *d3d11_create_buffer(vio_buffer_desc *desc)
     return buf;
 }
 
-static void d3d11_update_buffer(void *buffer_ptr, const void *data, size_t size)
+static void d3d11_update_buffer(void *buffer_ptr, const void *data, size_t size, size_t offset)
 {
     vio_d3d11_buffer *buf = (vio_d3d11_buffer *)buffer_ptr;
-    if (!buf || !buf->buffer || !data) return;
+    if (!buf || !buf->buffer || !data || size == 0) return;
 
     if (buf->type == VIO_BUFFER_UNIFORM) {
+        /* A dynamic constant buffer is only ever written whole (WRITE_DISCARD
+         * drops everything outside the written range). */
+        if (offset != 0) return;
         /* Dynamic buffers: Map/Unmap */
         D3D11_MAPPED_SUBRESOURCE mapped = {0};
         HRESULT hr = ID3D11DeviceContext_Map(vio_d3d11.context,
@@ -789,10 +792,15 @@ static void d3d11_update_buffer(void *buffer_ptr, const void *data, size_t size)
                                       (ID3D11Resource *)buf->buffer, 0);
         }
     } else {
-        /* Default buffers: UpdateSubresource */
+        /* Default buffers: UpdateSubresource over the [offset, offset+size) range. */
+        if (buf->size > 0) {
+            if (offset >= buf->size) return;
+            if (size > buf->size - offset) size = buf->size - offset;
+        }
+        D3D11_BOX box = { (UINT)offset, 0, 0, (UINT)(offset + size), 1, 1 };
         ID3D11DeviceContext_UpdateSubresource(vio_d3d11.context,
                                               (ID3D11Resource *)buf->buffer,
-                                              0, NULL, data, 0, 0);
+                                              0, &box, data, 0, 0);
     }
 }
 
@@ -2554,6 +2562,14 @@ static void d3d11_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
     b.access = access;
     b.element_count = element_count;
     b.stride = stride > 0 ? stride : (buf->stride > 0 ? buf->stride : 4);
+
+    /* One buffer per slot: rebinding a slot replaces its binding (see d3d12). */
+    for (int i = 0; i < cp->srv_count; i++) {
+        if (cp->srvs[i].slot == slot) { cp->srvs[i] = cp->srvs[--cp->srv_count]; break; }
+    }
+    for (int i = 0; i < cp->uav_count; i++) {
+        if (cp->uavs[i].slot == slot) { cp->uavs[i] = cp->uavs[--cp->uav_count]; break; }
+    }
 
     if (access == 1 /* VIO_COMPUTE_WRITE */) {
         if (cp->uav_count < VIO_D3D11_COMPUTE_MAX_BINDINGS) cp->uavs[cp->uav_count++] = b;

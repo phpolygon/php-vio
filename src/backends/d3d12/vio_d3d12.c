@@ -638,6 +638,7 @@ static int d3d12_create_depth_buffer(int width, int height)
 static void d3d12_shutdown(void);
 static void d3d12_retire_uploads(int force);   /* upload queue, defined with the texture helpers */
 static int  d3d12_upload_buffer_region(ID3D12Resource *dst, const void *data, size_t size);
+static int  d3d12_upload_buffer_at(ID3D12Resource *dst, UINT64 offset, const void *data, size_t size);
 
 static int d3d12_init(vio_config *cfg)
 {
@@ -1887,25 +1888,17 @@ static void *d3d12_create_buffer(vio_buffer_desc *desc)
         /* CB size must be 256-byte aligned */
         res_desc.Width = (res_desc.Width + 255) & ~255;
     } else if (desc->type == VIO_BUFFER_STORAGE) {
-        if (desc->data) {
-            /* Compute SRV input: UPLOAD heap so the box bytes are CPU-writable
-             * (the data block below maps + memcpys them). Bound as a raw/SRV in
-             * dispatch_compute. UPLOAD buffers sit in GENERIC_READ, which already
-             * permits shader-resource reads, so no transition is needed. */
-            heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
-            initial_state = D3D12_RESOURCE_STATE_GENERIC_READ;
-            /* NO ALLOW_UNORDERED_ACCESS: forbidden on UPLOAD heaps, and the input
-             * is read-only (raw SRV, which doesn't require the UAV flag). */
-        } else {
-            /* Compute UAV output: DEFAULT heap. Buffers have no layout, so the
-             * runtime always creates them in COMMON regardless of the requested
-             * state (it warns if you ask for UNORDERED_ACCESS); a buffer in
-             * COMMON is implicitly promoted to UNORDERED_ACCESS on first UAV
-             * access, so COMMON is the correct, warning-free initial state. */
-            heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-            initial_state = D3D12_RESOURCE_STATE_COMMON;
-            res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        }
+        /* Compute storage: DEFAULT heap with the UAV flag in every case, so one
+         * buffer is a valid kernel input (SRV) AND output (UAV), and CPU writes
+         * (the 'data' seed, vio_update_buffer) go through a staging copy on the
+         * upload queue. A seeded buffer used to live on an UPLOAD heap, which
+         * forbids the UAV flag: binding it for writing removed the device.
+         * Buffers have no layout, so the runtime creates them in COMMON; COMMON
+         * is implicitly promoted to SRV / UAV / COPY_DEST / INDIRECT_ARGUMENT. */
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+        initial_state = D3D12_RESOURCE_STATE_COMMON;
+        res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        buf->default_heap = 1;
     } else if (desc->data) {
         /* Static vertex / index data (vio_mesh): GPU-local DEFAULT heap, filled
          * through a staging copy on the upload queue (GAP-PLAN 4.2). An UPLOAD
@@ -1960,16 +1953,16 @@ static void *d3d12_create_buffer(vio_buffer_desc *desc)
     return buf;
 }
 
-static void d3d12_update_buffer(void *buffer_ptr, const void *data, size_t size)
+static void d3d12_update_buffer(void *buffer_ptr, const void *data, size_t size, size_t offset)
 {
     vio_d3d12_buffer *buf = (vio_d3d12_buffer *)buffer_ptr;
-    if (!buf || !buf->resource || !data) return;
-    if (size > buf->size) size = buf->size;
+    if (!buf || !buf->resource || !data || offset >= buf->size) return;
+    if (size > buf->size - offset) size = buf->size - offset;
 
     if (buf->default_heap) {
         /* GPU-local buffer: staging copy on the upload queue (ordered before
          * the next frame list on the same queue). */
-        d3d12_upload_buffer_region(buf->resource, data, size);
+        d3d12_upload_buffer_at(buf->resource, (UINT64)offset, data, size);
         return;
     }
 
@@ -1977,7 +1970,7 @@ static void d3d12_update_buffer(void *buffer_ptr, const void *data, size_t size)
     D3D12_RANGE read_range = {0, 0};
     HRESULT hr = ID3D12Resource_Map(buf->resource, 0, &read_range, &mapped);
     if (SUCCEEDED(hr)) {
-        memcpy(mapped, data, size);
+        memcpy((char *)mapped + offset, data, size);
         ID3D12Resource_Unmap(buf->resource, 0, NULL);
     }
 }
@@ -2231,15 +2224,22 @@ typedef struct _d3d12_buffer_upload_job {
     ID3D12Resource *dst;
     ID3D12Resource *staging;
     UINT64          size;
+    UINT64          dst_offset;
 } d3d12_buffer_upload_job;
 
 static void d3d12_record_buffer_upload(ID3D12GraphicsCommandList *list, void *user)
 {
     d3d12_buffer_upload_job *job = (d3d12_buffer_upload_job *)user;
-    ID3D12GraphicsCommandList_CopyBufferRegion(list, job->dst, 0, job->staging, 0, job->size);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, job->dst, job->dst_offset, job->staging, 0, job->size);
 }
 
 static int d3d12_upload_buffer_region(ID3D12Resource *dst, const void *data, size_t size)
+{
+    return d3d12_upload_buffer_at(dst, 0, data, size);
+}
+
+/* Staging copy of `data` into `dst` at byte `offset`, on the upload queue. */
+static int d3d12_upload_buffer_at(ID3D12Resource *dst, UINT64 offset, const void *data, size_t size)
 {
     if (!dst || !data || size == 0) return -1;
     D3D12_HEAP_PROPERTIES hp = {0};
@@ -2266,7 +2266,7 @@ static int d3d12_upload_buffer_region(ID3D12Resource *dst, const void *data, siz
     memcpy(mapped, data, size);
     ID3D12Resource_Unmap(staging, 0, NULL);
 
-    d3d12_buffer_upload_job job = { dst, staging, (UINT64)size };
+    d3d12_buffer_upload_job job = { dst, staging, (UINT64)size, offset };
     int rc = d3d12_submit_upload(d3d12_record_buffer_upload, &job);
     if (rc == 0) d3d12_retire_later(staging, vio_d3d12.upload_last_fence);
     else ID3D12Resource_Release(staging);
@@ -4889,6 +4889,17 @@ static void d3d12_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
     b.access = access;
     b.element_count = element_count;
     b.stride = stride > 0 ? stride : (buf->stride > 0 ? buf->stride : 4);
+
+    /* One buffer per slot: rebinding a slot replaces its binding (also when the
+     * access changes). The list used to only grow, so a pipeline reused with
+     * fresh buffers kept feeding the kernel the first ones and dropped every
+     * bind past VIO_D3D12_COMPUTE_MAX_BINDINGS. */
+    for (int i = 0; i < cp->srv_count; i++) {
+        if (cp->srvs[i].slot == slot) { cp->srvs[i] = cp->srvs[--cp->srv_count]; break; }
+    }
+    for (int i = 0; i < cp->uav_count; i++) {
+        if (cp->uavs[i].slot == slot) { cp->uavs[i] = cp->uavs[--cp->uav_count]; break; }
+    }
 
     if (access == 1 /* VIO_COMPUTE_WRITE */) {
         if (cp->uav_count < VIO_D3D12_COMPUTE_MAX_BINDINGS) cp->uavs[cp->uav_count++] = b;

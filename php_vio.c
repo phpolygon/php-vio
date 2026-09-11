@@ -2099,13 +2099,13 @@ static void vio_push_shader_cbuffers(vio_context_object *ctx)
         /* Upload vertex cbuffer */
         if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
             ctx->backend->update_buffer(sh->cbuffer_backend,
-                sh->cbuffer_data, sh->cbuffer_total_size);
+                sh->cbuffer_data, sh->cbuffer_total_size, 0);
             sh->cbuffer_dirty = 0;
         }
         /* Upload fragment cbuffer */
         if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
             ctx->backend->update_buffer(sh->frag_cbuffer_backend,
-                sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                sh->frag_cbuffer_data, sh->frag_cbuffer_total_size, 0);
             sh->frag_cbuffer_dirty = 0;
         }
 
@@ -3759,7 +3759,7 @@ ZEND_FUNCTION(vio_update_buffer)
         return;
     }
 
-    if ((size_t)(offset + data_len) > buf->size) {
+    if (offset < 0 || (size_t)offset + data_len > buf->size) {
         php_error_docref(NULL, E_WARNING, "Data exceeds buffer size");
         return;
     }
@@ -3775,7 +3775,7 @@ ZEND_FUNCTION(vio_update_buffer)
     if (buf->backend_buffer && buf->backend) {
         const vio_backend *be = (const vio_backend *)buf->backend;
         if (be->update_buffer) {
-            be->update_buffer(buf->backend_buffer, data, data_len);
+            be->update_buffer(buf->backend_buffer, data, data_len, (size_t)offset);
         }
     }
 }
@@ -8066,11 +8066,11 @@ ZEND_FUNCTION(vio_draw_instanced)
                 if (ctx->bound_shader_object) {
                     vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
                     if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
-                        ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size);
+                        ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size, 0);
                         sh->cbuffer_dirty = 0;
                     }
                     if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
-                        ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                        ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size, 0);
                         sh->frag_cbuffer_dirty = 0;
                     }
                     if (sh->cbuffer_backend) {
@@ -8139,11 +8139,11 @@ ZEND_FUNCTION(vio_draw_instanced)
             if (ctx->bound_shader_object) {
                 vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
                 if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
-                    ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size);
+                    ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size, 0);
                     sh->cbuffer_dirty = 0;
                 }
                 if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
-                    ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                    ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size, 0);
                     sh->frag_cbuffer_dirty = 0;
                 }
                 /* Allocate per-draw cbuffer slices from linear allocator.
@@ -8213,11 +8213,11 @@ ZEND_FUNCTION(vio_draw_instanced)
             if (ctx->bound_shader_object) {
                 vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
                 if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
-                    ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size);
+                    ctx->backend->update_buffer(sh->cbuffer_backend, sh->cbuffer_data, sh->cbuffer_total_size, 0);
                     sh->cbuffer_dirty = 0;
                 }
                 if (sh->frag_cbuffer_dirty && sh->frag_cbuffer_backend && ctx->backend->update_buffer) {
-                    ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
+                    ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size, 0);
                     sh->frag_cbuffer_dirty = 0;
                 }
             }

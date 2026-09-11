@@ -1219,13 +1219,14 @@ static void *vulkan_create_buffer(vio_buffer_desc *desc)
     return buf;
 }
 
-static void vulkan_update_buffer(void *buf, const void *data, size_t size)
+static void vulkan_update_buffer(void *buf, const void *data, size_t size, size_t offset)
 {
     vio_vulkan_compute_buffer *b = (vio_vulkan_compute_buffer *)buf;
-    if (!b || !b->buffer || !data || !size || !vio_vk.vma_allocator) return;
+    if (!b || !b->buffer || !data || !size || !vio_vk.vma_allocator || offset >= (size_t)b->size) return;
     void *mapped = vio_vma_map(vio_vk.vma_allocator, b->allocation);
     if (!mapped) return;
-    memcpy(mapped, data, (size_t)(size < b->size ? size : b->size));
+    size_t room = (size_t)b->size - offset;
+    memcpy((char *)mapped + offset, data, size < room ? size : room);
     vio_vma_unmap(vio_vk.vma_allocator, b->allocation);
 }
 
@@ -2448,6 +2449,10 @@ static void vulkan_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
     vio_vulkan_compute_pipeline *cp = (vio_vulkan_compute_pipeline *)pipeline_ptr;
     vio_vulkan_compute_buffer  *buf = (vio_vulkan_compute_buffer *)backend_buffer;
     if (!cp || !buf) return;
+    /* One buffer per slot: rebinding a slot replaces its binding. */
+    for (int i = 0; i < cp->binding_count; i++) {
+        if (cp->bindings[i].slot == slot) { cp->bindings[i].buffer = buf; cp->bindings[i].access = access; return; }
+    }
     if (cp->binding_count >= VIO_VK_COMPUTE_MAX_BINDINGS) return;
 
     vio_vk_compute_binding *b = &cp->bindings[cp->binding_count++];

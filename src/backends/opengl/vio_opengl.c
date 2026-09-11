@@ -438,11 +438,17 @@ static void *opengl_create_buffer(vio_buffer_desc *desc)
     return buf;
 }
 
-static void opengl_update_buffer(void *buffer, const void *data, size_t size)
+/* create_buffer only makes storage buffers (SSBOs) on OpenGL, so that is what
+ * this writes. It used to be a stub: vio_update_buffer did nothing on OpenGL. */
+static void opengl_update_buffer(void *buffer, const void *data, size_t size, size_t offset)
 {
-    (void)buffer;
-    (void)data;
-    (void)size;
+    vio_opengl_compute_buffer *buf = (vio_opengl_compute_buffer *)buffer;
+    if (!buf || !data || size == 0 || !buf->ssbo || !vio_gl.initialized) return;
+    if (buf->gl_generation != gl_context_generation || offset >= buf->size) return;
+    if (size > buf->size - offset) size = buf->size - offset;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf->ssbo);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)offset, (GLsizeiptr)size, data);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 }
 
 static void opengl_destroy_buffer(void *buffer)
@@ -717,6 +723,11 @@ static void opengl_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
     vio_opengl_compute_pipeline *cp = (vio_opengl_compute_pipeline *)pipeline_ptr;
     vio_opengl_compute_buffer *buf = (vio_opengl_compute_buffer *)backend_buffer;
     if (!cp || !buf) return;
+    /* One buffer per slot: rebinding a slot replaces its binding (the list used
+     * to only grow and dropped every bind past the table size). */
+    for (int i = 0; i < cp->binding_count; i++) {
+        if (cp->bindings[i].slot == slot) { cp->bindings[i].buffer = buf; cp->bindings[i].access = access; return; }
+    }
     if (cp->binding_count >= VIO_GL_COMPUTE_MAX_BINDINGS) return;
 
     vio_opengl_compute_binding *b = &cp->bindings[cp->binding_count++];
