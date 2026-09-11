@@ -635,4 +635,24 @@ void vio_text_shape_measure(vio_font_object *font,
     if (out_lines) *out_lines = count;
 }
 
+/* ── Bidi runs for external layout ─────────────────────────────────── */
+
+int vio_text_bidi_spans(const char *text, size_t len, vio_text_bidi_span **out)
+{
+    *out = NULL;
+    const SBRun *runs; SBUInteger count;
+    SBLineRef line = bidi_resolve(text, len, &runs, &count);
+    if (!line) return 0;
+    if (count == 0) { SBLineRelease(line); return 0; }
+    vio_text_bidi_span *spans = (vio_text_bidi_span *)emalloc(sizeof(vio_text_bidi_span) * (size_t)count);
+    for (SBUInteger r = 0; r < count; r++) {
+        spans[r].offset = (size_t)runs[r].offset;
+        spans[r].length = (size_t)runs[r].length;
+        spans[r].rtl    = (runs[r].level & 1) != 0;
+    }
+    SBLineRelease(line);
+    *out = spans;
+    return (int)count;
+}
+
 #endif /* HAVE_HARFBUZZ */

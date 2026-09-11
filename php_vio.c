@@ -22,6 +22,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_texture.h"
 #include "src/vio_buffer.h"
 #include "src/vio_compute_pipeline.h"
+#include "src/vio_font_face.h"
 #include "src/vio_2d.h"
 #include "src/vio_font.h"
 #include "src/vio_text_shape.h"
@@ -5687,6 +5688,138 @@ ZEND_FUNCTION(vio_font_has_glyph)
     RETURN_BOOL(zend_hash_index_find(&font->glyph_map, (zend_long)codepoint) != NULL);
 }
 
+/* ── Font faces: shaped text as CPU bitmaps ──────────────────────── */
+
+ZEND_FUNCTION(vio_font_face)
+{
+    char *path;
+    size_t path_len;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(path, path_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_stream *stream = php_stream_open_wrapper(path, "rb", REPORT_ERRORS, NULL);
+    if (!stream) {
+        php_error_docref(NULL, E_WARNING, "Failed to open font file: %s", path);
+        RETURN_FALSE;
+    }
+    zend_string *contents = php_stream_copy_to_mem(stream, PHP_STREAM_COPY_ALL, 0);
+    php_stream_close(stream);
+    if (!contents) {
+        php_error_docref(NULL, E_WARNING, "Failed to read font file: %s", path);
+        RETURN_FALSE;
+    }
+
+    object_init_ex(return_value, vio_font_face_ce);
+    int ok = vio_font_face_load(Z_VIO_FONT_FACE_P(return_value), ZSTR_VAL(contents), ZSTR_LEN(contents));
+    zend_string_release(contents);
+    if (!ok) {
+        zval_ptr_dtor(return_value);
+        php_error_docref(NULL, E_WARNING, "Not a usable TrueType/OpenType font: %s", path);
+        RETURN_FALSE;
+    }
+}
+
+ZEND_FUNCTION(vio_font_face_has_glyph)
+{
+    zval *face_zval;
+    zend_long codepoint;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(face_zval, vio_font_face_ce)
+        Z_PARAM_LONG(codepoint)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (codepoint < 0 || codepoint > 0x10FFFF) {
+        RETURN_FALSE;
+    }
+    RETURN_BOOL(vio_font_face_has_glyph(Z_VIO_FONT_FACE_P(face_zval), (uint32_t)codepoint));
+}
+
+ZEND_FUNCTION(vio_text_bitmap)
+{
+    zval *faces_zval;
+    char *text;
+    size_t text_len;
+    double size;
+    HashTable *opts_ht = NULL;
+
+    ZEND_PARSE_PARAMETERS_START(3, 4)
+        Z_PARAM_ZVAL(faces_zval)
+        Z_PARAM_STRING(text, text_len)
+        Z_PARAM_DOUBLE(size)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT_OR_NULL(opts_ht)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_font_face_object *stack_faces[16];
+    vio_font_face_object **faces = stack_faces;
+    int count = 0;
+
+    if (Z_TYPE_P(faces_zval) == IS_OBJECT && instanceof_function(Z_OBJCE_P(faces_zval), vio_font_face_ce)) {
+        faces[count++] = Z_VIO_FONT_FACE_P(faces_zval);
+    } else if (Z_TYPE_P(faces_zval) == IS_ARRAY) {
+        HashTable *ht = Z_ARRVAL_P(faces_zval);
+        uint32_t n = zend_hash_num_elements(ht);
+        if (n == 0) {
+            zend_argument_value_error(1, "must contain at least one VioFontFace");
+            RETURN_THROWS();
+        }
+        if (n > 16) {
+            faces = (vio_font_face_object **)emalloc(sizeof(vio_font_face_object *) * n);
+        }
+        zval *entry;
+        ZEND_HASH_FOREACH_VAL(ht, entry) {
+            ZVAL_DEREF(entry);
+            if (Z_TYPE_P(entry) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(entry), vio_font_face_ce)) {
+                if (faces != stack_faces) efree(faces);
+                zend_argument_type_error(1, "must contain only VioFontFace objects");
+                RETURN_THROWS();
+            }
+            faces[count++] = Z_VIO_FONT_FACE_P(entry);
+        } ZEND_HASH_FOREACH_END();
+    } else {
+        zend_argument_type_error(1, "must be of type VioFontFace|array, %s given", zend_zval_type_name(faces_zval));
+        RETURN_THROWS();
+    }
+
+    if (!(size > 0.0)) {
+        if (faces != stack_faces) efree(faces);
+        zend_argument_value_error(3, "must be greater than 0");
+        RETURN_THROWS();
+    }
+
+    int want_data = 1;
+    if (opts_ht) {
+        zval *measure = zend_hash_str_find(opts_ht, "measure", sizeof("measure") - 1);
+        if (measure && zend_is_true(measure)) want_data = 0;
+    }
+
+    vio_text_bitmap_result res;
+    int ok = vio_font_face_render_text(faces, count, text, text_len, (float)size, want_data, &res);
+    if (faces != stack_faces) efree(faces);
+    if (!ok) {
+        if (res.data) efree(res.data);
+        RETURN_FALSE;
+    }
+
+    array_init(return_value);
+    add_assoc_long(return_value, "width", (zend_long)res.width);
+    add_assoc_long(return_value, "height", (zend_long)res.height);
+    add_assoc_long(return_value, "origin_x", (zend_long)res.origin_x);
+    add_assoc_long(return_value, "baseline", (zend_long)res.baseline);
+    add_assoc_double(return_value, "advance", (double)res.advance);
+    if (want_data) {
+        if (res.data) {
+            add_assoc_stringl(return_value, "data", (char *)res.data, (size_t)res.width * (size_t)res.height);
+            efree(res.data);
+        } else {
+            add_assoc_stringl(return_value, "data", "", 0);
+        }
+    }
+}
+
 /* ── Transform stack ─────────────────────────────────────────────── */
 
 ZEND_FUNCTION(vio_push_transform)
@@ -9497,6 +9630,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_buffer_register();
     vio_compute_pipeline_register();
     vio_font_register();
+    vio_font_face_register();
     vio_sound_register();
     vio_render_target_register();
     vio_cubemap_register();
