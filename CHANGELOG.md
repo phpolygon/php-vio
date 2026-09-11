@@ -1,3 +1,10 @@
+## [2.24.1](https://github.com/phpolygon/php-vio/compare/v2.24.0...v2.24.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* **compute:** writable seeded storage buffers, slot rebinds, update_buffer offset ([09b0a6a](https://github.com/phpolygon/php-vio/commit/09b0a6a553cee6ffc943a644f7422ebe652ddf48))
+
 # [2.24.0](https://github.com/phpolygon/php-vio/compare/v2.23.0...v2.24.0) (2026-09-10)
 
 
