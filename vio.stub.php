@@ -458,6 +458,41 @@ function vio_text_measure(VioFont $font, string $text, ?array $options = null): 
 function vio_font_has_glyph(VioFont $font, int $codepoint): bool {}
 
 /**
+ * Load a font file as a VioFontFace for vio_text_bitmap().
+ *
+ * Unlike vio_font() it builds no glyph atlas and needs no context, so it is cheap
+ * even for a large CJK face and works without a GPU (build tools, worker threads).
+ * TrueType, OpenType (CFF) and the first face of a collection (.ttc) are read.
+ * Stream wrappers such as phar:// work.
+ */
+function vio_font_face(string $path): VioFontFace|false {}
+
+/**
+ * True if $face carries a real glyph for the Unicode $codepoint.
+ */
+function vio_font_face_has_glyph(VioFontFace $face, int $codepoint): bool {}
+
+/**
+ * Lay out one line of text and rasterize it into an 8-bit coverage bitmap.
+ *
+ * $faces is a face or a fallback chain: the first face that covers a codepoint
+ * claims it, and a segment keeps its face while that face covers the next
+ * codepoint. With HarfBuzz (VIO_HAS_SHAPING) the line is bidi-resolved and
+ * shaped like vio_text() (Arabic joining, ligatures, marks); without it glyphs
+ * are placed left to right with kerning. $size is in pixels per em.
+ *
+ * The bitmap is row-major, top row first, one byte per pixel. Draw it with its
+ * pen origin at column 'origin_x' and its baseline at row 'baseline'. 'advance'
+ * is the pen advance of the whole line. Text without ink (spaces) has width and
+ * height 0. ['measure' => true] returns the metrics without 'data'.
+ *
+ * @param VioFontFace|list<VioFontFace> $faces
+ * @param array{measure?: bool}|null $options
+ * @return array{width: int, height: int, origin_x: int, baseline: int, advance: float, data?: string}|false
+ */
+function vio_text_bitmap(VioFontFace|array $faces, string $text, float $size, ?array $options = null): array|false {}
+
+/**
  * Push a 2D affine transform matrix onto the stack.
  * Matrix layout: | a b e |  (a,b,c,d = 2x2 rotation/scale, e,f = translation)
  *                | c d f |
