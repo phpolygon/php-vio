@@ -4870,6 +4870,7 @@ static void d3d12_destroy_compute_pipeline(void *pipeline_ptr)
      * compute dispatches are fully fenced (wait_for_gpu before returning), so by
      * the time PHP drops the pipeline the GPU is idle — no extra wait needed. */
     if (cp->params_buf) ID3D12Resource_Release(cp->params_buf);
+    free(cp->params_cpu);
     if (cp->pso) ID3D12PipelineState_Release(cp->pso);
     if (cp->root_signature) ID3D12RootSignature_Release(cp->root_signature);
     if (cp->cs_blob) ID3D10Blob_Release(cp->cs_blob);
@@ -4934,6 +4935,10 @@ static void d3d12_compute_set_uniforms(void *pipeline_ptr, const void *data, int
             return;
         }
         cp->params_capacity = aligned;
+        unsigned char *shadow = (unsigned char *)realloc(cp->params_cpu, aligned);
+        if (!shadow) free(cp->params_cpu);
+        else memset(shadow, 0, aligned);
+        cp->params_cpu = shadow;
     }
 
     void *mapped = NULL;
@@ -4943,6 +4948,7 @@ static void d3d12_compute_set_uniforms(void *pipeline_ptr, const void *data, int
         ID3D12Resource_Unmap(cp->params_buf, 0, NULL);
     }
     cp->params_size = (size_t)size;
+    if (cp->params_cpu) memcpy(cp->params_cpu, data, (size_t)size);
 }
 
 static void d3d12_compute_bind_image(void *pipeline_ptr, void *tex_obj, int slot, int access)
@@ -5167,8 +5173,22 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
 
     if (cp->params_buf) {
-        ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(list, 0,
-            ID3D12Resource_GetGPUVirtualAddress(cp->params_buf));
+        D3D12_GPU_VIRTUAL_ADDRESS params_gpu = ID3D12Resource_GetGPUVirtualAddress(cp->params_buf);
+        /* A dispatch on the frame list runs when the frame is submitted. By then
+         * the CPU may have staged other params into params_buf (a second dispatch
+         * of this pipeline, or the next frame while this one is in flight), so it
+         * reads its own copy from this frame's cbuffer slice. A full slice keeps
+         * the shared buffer (the heap grows at the next begin_frame). */
+        if (in_frame_async && cp->params_cpu && vio_d3d12.cbuffer_heap_mapped) {
+            UINT aligned = (UINT)cp->params_capacity;
+            if (vio_d3d12.cbuffer_heap_offset + aligned <= vio_d3d12.cbuffer_frame_end) {
+                UINT offset = vio_d3d12.cbuffer_heap_offset;
+                vio_d3d12.cbuffer_heap_offset += aligned;
+                memcpy(vio_d3d12.cbuffer_heap_mapped + offset, cp->params_cpu, aligned);
+                params_gpu = vio_d3d12.cbuffer_heap_gpu + offset;
+            }
+        }
+        ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(list, 0, params_gpu);
     }
     /* [1] SRV table base, [2] UAV table base */
     D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = { gpu_start.ptr + (UINT64)SRV_BASE * dsz };

@@ -3862,10 +3862,18 @@ static void metal_dispatch_compute(vio_compute_cmd *cmd)
             [enc setBuffer:mb offset:0 atIndex:(NSUInteger)b->slot];
         }
 
-        /* Params UBO at its MSL buffer index (canonical 2). */
+        /* Params UBO at its MSL buffer index (canonical 2). setBytes copies the
+         * staged values into the encoder now. Binding the shared params buffer
+         * let a later compute_set_uniforms (a second dispatch this frame, or the
+         * next frame while this one is in flight) rewrite what an async dispatch
+         * reads. setBytes is capped at 4 KB; larger blocks keep the binding. */
         if (cp->params_buffer && cp->params_size > 0) {
             id<MTLBuffer> pb = (__bridge id<MTLBuffer>)cp->params_buffer;
-            [enc setBuffer:pb offset:0 atIndex:(NSUInteger)cp->params_index];
+            if (cp->params_size <= 4096) {
+                [enc setBytes:[pb contents] length:cp->params_size atIndex:(NSUInteger)cp->params_index];
+            } else {
+                [enc setBuffer:pb offset:0 atIndex:(NSUInteger)cp->params_index];
+            }
         }
 
         /* Storage images at their MSL texture index (== GLSL binding). */
