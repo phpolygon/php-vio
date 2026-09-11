@@ -1,3 +1,10 @@
+## [2.24.2](https://github.com/phpolygon/php-vio/compare/v2.24.1...v2.24.2) (2026-09-11)
+
+
+### Bug Fixes
+
+* **opengl:** declare the S3TC enums the core-profile glad lacks ([b4d40dc](https://github.com/phpolygon/php-vio/commit/b4d40dc4aa1d1d63da51ef44663c0524e19c4706))
+
 ## [2.24.1](https://github.com/phpolygon/php-vio/compare/v2.24.0...v2.24.1) (2026-09-11)
 
 
