@@ -1,3 +1,10 @@
+# [2.25.0](https://github.com/phpolygon/php-vio/compare/v2.24.3...v2.25.0) (2026-09-11)
+
+
+### Features
+
+* **text:** shaped text as CPU bitmaps via VioFontFace and vio_text_bitmap ([f8b2838](https://github.com/phpolygon/php-vio/commit/f8b2838651647b9244bb49ef9efe9901e0c3e9b2))
+
 ## [2.24.3](https://github.com/phpolygon/php-vio/compare/v2.24.2...v2.24.3) (2026-09-11)
 
 
