@@ -59,8 +59,9 @@ static void *null_create_buffer(vio_buffer_desc *desc)
     return NULL;
 }
 
-static void null_update_buffer(void *buffer, const void *data, size_t size)
+static void null_update_buffer(void *buffer, const void *data, size_t size, size_t offset)
 {
+    (void)offset;
     (void)buffer;
     (void)data;
     (void)size;

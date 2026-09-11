@@ -2223,21 +2223,23 @@ static void *metal_create_buffer(vio_buffer_desc *desc)
     return buf;
 }
 
-static void metal_update_buffer(void *buffer_ptr, const void *data, size_t size)
+static void metal_update_buffer(void *buffer_ptr, const void *data, size_t size, size_t offset)
 {
     vio_metal_buffer *buf = (vio_metal_buffer *)buffer_ptr;
     if (!buf || !data || size == 0) return;
 
     if (buf->type == VIO_BUFFER_UNIFORM) {
         if (!buf->shadow) return;
-        memcpy(buf->shadow, data, size < buf->shadow_size ? size : buf->shadow_size);
+        if (offset >= buf->shadow_size) return;
+        memcpy(buf->shadow + offset, data, size < buf->shadow_size - offset ? size : buf->shadow_size - offset);
         return;
     }
     if (!buf->buffer) return;
     @autoreleasepool {
         id<MTLBuffer> mb = (__bridge id<MTLBuffer>)buf->buffer;
-        size_t n = size < buf->size ? size : buf->size;
-        memcpy([mb contents], data, n);
+        if (offset >= buf->size) return;
+        size_t n = size < buf->size - offset ? size : buf->size - offset;
+        memcpy((char *)[mb contents] + offset, data, n);
     }
 }
 
@@ -3743,6 +3745,10 @@ static void metal_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
     vio_metal_compute_pipeline *cp = (vio_metal_compute_pipeline *)pipeline_ptr;
     vio_metal_compute_buffer  *buf = (vio_metal_compute_buffer *)backend_buffer;
     if (!cp || !buf) return;
+    /* One buffer per slot: rebinding a slot replaces its binding. */
+    for (int i = 0; i < cp->binding_count; i++) {
+        if (cp->bindings[i].slot == slot) { cp->bindings[i].buffer = buf; cp->bindings[i].access = access; return; }
+    }
     if (cp->binding_count >= VIO_METAL_COMPUTE_MAX_BINDINGS) return;
 
     vio_metal_compute_binding *b = &cp->bindings[cp->binding_count++];

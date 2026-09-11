@@ -31,7 +31,8 @@ typedef struct _vio_backend {
 
     /* Resources */
     void *(*create_buffer)(vio_buffer_desc *desc);
-    void  (*update_buffer)(void *buffer, const void *data, size_t size);
+    /* Write `size` bytes at byte `offset` (clamped to the buffer). */
+    void  (*update_buffer)(void *buffer, const void *data, size_t size, size_t offset);
     void  (*destroy_buffer)(void *buffer);
 
     void *(*create_texture)(vio_texture_desc *desc);

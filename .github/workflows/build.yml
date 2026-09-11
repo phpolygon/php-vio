@@ -474,8 +474,9 @@ jobs:
             tests/render3d/120_indirect_draw_all_backends.phpt `
             tests/render3d/121_texture_array_bc_ktx2_all_backends.phpt `
             tests/render3d/122_shading_rate_d3d12.phpt `
-            tests/render3d/123_vulkan_3d_conventions_all_backends.phpt
-            tests/render3d/124_mrt_formats_texture_mips_all_backends.phpt
+            tests/render3d/123_vulkan_3d_conventions_all_backends.phpt `
+            tests/render3d/124_mrt_formats_texture_mips_all_backends.phpt `
+            tests/render3d/125_compute_buffer_writable_rebind_update_all_backends.phpt
 
       - name: Package binary
         shell: pwsh
