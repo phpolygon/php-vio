@@ -1,3 +1,10 @@
+## [2.24.3](https://github.com/phpolygon/php-vio/compare/v2.24.2...v2.24.3) (2026-09-11)
+
+
+### Bug Fixes
+
+* **compute:** keep the params of every async dispatch ([1e6fe0f](https://github.com/phpolygon/php-vio/commit/1e6fe0fc77237744a830c48fb21adace7bc4784b))
+
 ## [2.24.2](https://github.com/phpolygon/php-vio/compare/v2.24.1...v2.24.2) (2026-09-11)
 
 
