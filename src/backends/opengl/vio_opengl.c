@@ -1677,6 +1677,16 @@ static int gl_has_ext(const char *name);   /* defined with the caps setup below 
 
 /* ── Texture arrays / block compression / explicit mip chains (GAP-PHASE5 Block 9) ── */
 
+/* S3TC is an extension, not core: the vendored core-profile glad declares no enums
+ * for it, so static Linux / macOS builds failed with "undeclared" (Windows picked
+ * them up from another header). Values from EXT_texture_compression_s3tc. */
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+#define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
+#endif
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
+#endif
+
 static GLenum opengl_texfmt_internal(int fmt)
 {
     switch (fmt) {
