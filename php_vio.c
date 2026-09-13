@@ -490,6 +490,46 @@ ZEND_FUNCTION(vio_poll_events)
 
 
 
+#ifdef HAVE_GLFW
+/* ── Window content scale ──────────────────────────────────────────────
+ *
+ * Every DPI-dependent path here derives from the window's content scale: the
+ * 2D design space, vio_window_size, vio_pixel_ratio, cursor coordinates and
+ * window resizing. That scale comes from the monitor, so a developer or a CI
+ * runner at 100% exercises exactly one value of it — which is how a resize bug
+ * that only appears above 100% reached players in the first place.
+ *
+ * VIO_FORCE_CONTENT_SCALE overrides it so the scaled paths are testable on any
+ * machine. Accepts "1.5" for a uniform scale or "1.5x2" for an asymmetric one.
+ * Read once per process; unset or unparsable means no override. */
+static void vio_window_content_scale(GLFWwindow *window, float *sx, float *sy)
+{
+    static int   checked = 0;
+    static float forced_x = 0.0f, forced_y = 0.0f;
+
+    if (!checked) {
+        checked = 1;
+        const char *env = getenv("VIO_FORCE_CONTENT_SCALE");
+        if (env && *env) {
+            float fx = 0.0f, fy = 0.0f;
+            int n = sscanf(env, "%fx%f", &fx, &fy);
+            if (n >= 1 && fx > 0.0f) {
+                forced_x = fx;
+                forced_y = (n == 2 && fy > 0.0f) ? fy : fx;
+            }
+        }
+    }
+
+    if (forced_x > 0.0f) {
+        *sx = forced_x;
+        *sy = forced_y;
+        return;
+    }
+
+    glfwGetWindowContentScale(window, sx, sy);
+}
+#endif
+
 ZEND_FUNCTION(vio_begin)
 {
     zval *ctx_zval;
@@ -528,7 +568,7 @@ ZEND_FUNCTION(vio_begin)
             fb_h = ctx->config.height;
         } else {
             glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-            glfwGetWindowContentScale(ctx->window, &sx, &sy);
+            vio_window_content_scale(ctx->window, &sx, &sy);
         }
         if (sx <= 0.0f) sx = 1.0f;
         if (sy <= 0.0f) sy = 1.0f;
@@ -564,7 +604,7 @@ ZEND_FUNCTION(vio_begin)
                 sx = sy = 1.0f;
             } else {
                 glfwGetFramebufferSize((GLFWwindow *)ctx->window, &fb_w, &fb_h);
-                glfwGetWindowContentScale((GLFWwindow *)ctx->window, &sx, &sy);
+                vio_window_content_scale((GLFWwindow *)ctx->window, &sx, &sy);
             }
             have_size = 1;
         }
@@ -614,7 +654,7 @@ ZEND_FUNCTION(vio_begin)
             fb_h = ctx->config.height > 0 ? ctx->config.height : 600;
         } else {
             glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-            glfwGetWindowContentScale(ctx->window, &sx, &sy);
+            vio_window_content_scale(ctx->window, &sx, &sy);
         }
         if (sx <= 0.0f) sx = 1.0f;
         if (sy <= 0.0f) sy = 1.0f;
@@ -885,7 +925,7 @@ static double vio_input_logical_scale_x(vio_context_object *ctx)
      * must not scale them (15.5 came back as 5.17 on a 300 % display). */
     if (ctx && ctx->window && !ctx->config.headless) {
         float sx = 1.0f, sy = 1.0f;
-        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        vio_window_content_scale(ctx->window, &sx, &sy);
         if (sx > 0.0f) return (double)sx;
     }
 #endif
@@ -901,7 +941,7 @@ static double vio_input_logical_scale_y(vio_context_object *ctx)
      * must not scale them (15.5 came back as 5.17 on a 300 % display). */
     if (ctx && ctx->window && !ctx->config.headless) {
         float sx = 1.0f, sy = 1.0f;
-        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        vio_window_content_scale(ctx->window, &sx, &sy);
         if (sy > 0.0f) return (double)sy;
     }
 #endif
@@ -1488,7 +1528,7 @@ ZEND_FUNCTION(vio_window_size)
             return;
         }
         glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        vio_window_content_scale(ctx->window, &sx, &sy);
         if (sx <= 0.0f) sx = 1.0f;
         if (sy <= 0.0f) sy = 1.0f;
         int logical_w = (int)((float)fb_w / sx + 0.5f);
@@ -1631,7 +1671,7 @@ ZEND_FUNCTION(vio_content_scale)
      * vio_framebuffer_size), so the effective content scale is 1. */
     if (ctx->window && !ctx->config.headless) {
         float sx = 1.0f, sy = 1.0f;
-        glfwGetWindowContentScale(ctx->window, &sx, &sy);
+        vio_window_content_scale(ctx->window, &sx, &sy);
         add_next_index_double(return_value, (double)sx);
         add_next_index_double(return_value, (double)sy);
         return;
