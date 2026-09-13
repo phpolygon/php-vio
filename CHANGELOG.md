@@ -1,3 +1,10 @@
+## [2.25.2](https://github.com/phpolygon/php-vio/compare/v2.25.1...v2.25.2) (2026-09-13)
+
+
+### Bug Fixes
+
+* **window:** size the window in the space vio_window_size reports ([6b1c3e5](https://github.com/phpolygon/php-vio/commit/6b1c3e54d8c8a8d0a29dbea647f0242b3b8f1af9))
+
 ## [2.25.1](https://github.com/phpolygon/php-vio/compare/v2.25.0...v2.25.1) (2026-09-13)
 
 
