@@ -1,3 +1,10 @@
+## [2.25.1](https://github.com/phpolygon/php-vio/compare/v2.25.0...v2.25.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* **font:** pack the currency symbols and general punctuation block ([31bb47f](https://github.com/phpolygon/php-vio/commit/31bb47f52b817d2b070a52b57f11f8d930d496ab))
+
 # [2.25.0](https://github.com/phpolygon/php-vio/compare/v2.24.3...v2.25.0) (2026-09-11)
 
 
