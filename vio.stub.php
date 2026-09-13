@@ -222,7 +222,11 @@ function vio_set_fullscreen(VioContext $context, int $monitor = -1, int $width =
 function vio_get_auto_iconify(VioContext $context): bool {}
 
 /**
- * Get the window size in screen coordinates.
+ * Get the window size in logical coordinates (framebuffer / content scale).
+ *
+ * DPI-independent, so layout constants keep their meaning on a scaled monitor
+ * while rendering stays at the native physical resolution. Use
+ * vio_framebuffer_size for the pixel dimensions.
  *
  * @return array{0: int, 1: int}
  */
@@ -1123,7 +1127,11 @@ function vio_cubemap(VioContext $context, array $config): VioCubemap|false {}
 function vio_bind_cubemap(VioContext $context, VioCubemap $cubemap, int $slot = 0): void {}
 
 /**
- * Set the window size in screen coordinates.
+ * Set the window size in logical coordinates.
+ *
+ * The same space vio_window_size reports and vio_create takes, so a size set
+ * here reads back unchanged. On a scaled monitor that is not the same as the
+ * platform's screen coordinates; the conversion happens internally.
  */
 function vio_set_window_size(VioContext $context, int $width, int $height): void {}
 

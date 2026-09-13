@@ -9371,11 +9371,46 @@ ZEND_FUNCTION(vio_set_window_size)
     }
 
 #ifdef HAVE_GLFW
-    if (ctx->window) {
+    if (ctx->window && !ctx->config.headless) {
+        /* The size is LOGICAL, matching what vio_window_size reports and what
+         * the create config takes. glfwSetWindowSize speaks screen coordinates,
+         * which stop being the same thing once the monitor scales:
+         *
+         *   logical = framebuffer / contentScale          (vio_window_size)
+         *   screen  = logical * contentScale * (screen / framebuffer)
+         *
+         * The trailing ratio is what keeps this right everywhere rather than
+         * only where it was written. Windows and X11 hand out screen
+         * coordinates in physical pixels, so the ratio is 1 and the factor is
+         * the content scale; macOS hands out points against a 2x framebuffer,
+         * so the ratio is 0.5, the factor cancels to 1, and the request passes
+         * through untouched.
+         *
+         * Without the conversion a request for 1920x1080 on a 1.5x display read
+         * back as 1280x720 - a resolution picker sets a size, sees a smaller
+         * one, and looks to the player like it jumped back an entry. */
+        int fb_w = 0, fb_h = 0, scr_w = 0, scr_h = 0;
+        float sx = 1.0f, sy = 1.0f;
+        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+        glfwGetWindowSize(ctx->window, &scr_w, &scr_h);
+        vio_window_content_scale(ctx->window, &sx, &sy);
+        if (sx <= 0.0f) sx = 1.0f;
+        if (sy <= 0.0f) sy = 1.0f;
+
+        float rx = (fb_w > 0 && scr_w > 0) ? (float)scr_w / (float)fb_w : 1.0f;
+        float ry = (fb_h > 0 && scr_h > 0) ? (float)scr_h / (float)fb_h : 1.0f;
+
+        glfwSetWindowSize(ctx->window,
+                          (int)((float)width  * sx * rx + 0.5f),
+                          (int)((float)height * sy * ry + 0.5f));
+    } else if (ctx->window) {
+        /* Headless targets are 1:1 (see vio_window_size), so no conversion. */
         glfwSetWindowSize(ctx->window, (int)width, (int)height);
     }
 #endif
 
+    /* Store the logical size: vio_window_size falls back to it when there is no
+     * window, so it has to stay in the same space. */
     ctx->config.width  = (int)width;
     ctx->config.height = (int)height;
 }
