@@ -32,7 +32,7 @@ typedef struct
 #define VIO_FONT_ATLAS_SIZE 4096
 
 /* Unicode block ranges packed into the atlas */
-#define VIO_FONT_NUM_RANGES 9
+#define VIO_FONT_NUM_RANGES 10
 
 typedef struct {
     int first_codepoint;
@@ -46,6 +46,18 @@ static const vio_font_range_def vio_font_ranges[VIO_FONT_NUM_RANGES] = {
     { 0x0370,   144 },  /* Greek and Coptic: U+0370..U+03FF */
     { 0x0400,   256 },  /* Cyrillic: U+0400..U+04FF */
     { 0x1E00,   256 },  /* Latin Extended Additional (Vietnamese): U+1E00..U+1EFF */
+    /* General Punctuation + Currency Symbols: U+2000..U+20CF.
+     *
+     * Without this block a font has no euro sign, and neither has any other
+     * currency mark above U+00FF - the rouble, won, hryvnia and dong all sit in
+     * U+20A0..U+20BF. A caller that draws one gets no glyph AND no advance, so
+     * the character vanishes leaving no gap, and text measured through the
+     * fallback planner comes out too narrow to hold it.
+     *
+     * The same gap covers the dash, curly quote, bullet and ellipsis that
+     * typographic UI copy uses. Missing glyphs are skipped when packing, so a
+     * font that has none of these costs nothing. */
+    { 0x2000,   208 },
     { 0x3000,   256 },  /* CJK Symbols + Hiragana + Katakana: U+3000..U+30FF */
     { 0x4E00, 20992 },  /* CJK Unified Ideographs: U+4E00..U+9FFF */
     { 0xAC00, 11172 },  /* Hangul Syllables: U+AC00..U+D7A3 */
