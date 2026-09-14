@@ -1,3 +1,10 @@
+## [2.25.3](https://github.com/phpolygon/php-vio/compare/v2.25.2...v2.25.3) (2026-09-14)
+
+
+### Bug Fixes
+
+* **input:** report the cursor in the space vio_window_size describes ([0178ce7](https://github.com/phpolygon/php-vio/commit/0178ce766c187d20b32ad04ad3077faf7d0d06fa))
+
 ## [2.25.2](https://github.com/phpolygon/php-vio/compare/v2.25.1...v2.25.2) (2026-09-13)
 
 
