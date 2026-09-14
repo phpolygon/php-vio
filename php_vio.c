@@ -909,44 +909,61 @@ ZEND_FUNCTION(vio_key_released)
     RETURN_FALSE;
 }
 
-/* GLFW's cursor-position contract is platform-dependent:
- *   Windows (DPI-aware): glfwGetCursorPos returns physical pixels, so we
- *     divide by content scale to recover logical coords matching the layout.
- *   macOS: glfwGetCursorPos returns points (logical coords) regardless of
- *     Retina scale; dividing again would halve mouse positions on 2x displays.
- *   Linux (X11/Wayland): GLFW reports the same units as the window size, so
- *     no scaling is needed for the logical layout.
- * Only Windows needs the division. */
-static double vio_input_logical_scale_x(vio_context_object *ctx)
+/* Cursor coordinates have to arrive in the space vio_window_size describes,
+ * because a caller lays its UI out against one and hit-tests it with the other.
+ *
+ * GLFW's cursor contract differs per platform: on Windows it reports physical
+ * pixels, on macOS points, on Linux the same units as glfwGetWindowSize. This
+ * used to be handled by dividing by the content scale under _WIN32 only, on the
+ * reasoning that the other two already matched the window. They match
+ * glfwGetWindowSize — but vio_window_size is NOT glfwGetWindowSize: it returns
+ * framebuffer/contentScale. On an X11 desktop at 125 % the window is 1600x900
+ * physical pixels with a content scale of 1.25, so vio_window_size says
+ * 1280x720 while the cursor kept arriving in 1600x900, putting every click 1.25x
+ * too far right and down.
+ *
+ * So derive the factor instead of special-casing the platform: it is whatever
+ * turns a screen coordinate into the logical space, screen/(fb/scale). That
+ * reduces to the content scale on Windows (screen == fb), to 1.0 on macOS
+ * (screen == fb/scale already), and to the content scale on a scaled X11
+ * desktop, which is the case that was broken. */
+static double vio_input_logical_scale(vio_context_object *ctx, int horizontal)
 {
-#if defined(HAVE_GLFW) && defined(_WIN32)
+#if defined(HAVE_GLFW)
     /* Headless contexts are 1:1 (vio_content_scale == 1) and injected cursor
      * coordinates are already logical — the monitor DPI of the hidden window
      * must not scale them (15.5 came back as 5.17 on a 300 % display). */
     if (ctx && ctx->window && !ctx->config.headless) {
+        int scr_w = 0, scr_h = 0, fb_w = 0, fb_h = 0;
         float sx = 1.0f, sy = 1.0f;
+
+        glfwGetWindowSize(ctx->window, &scr_w, &scr_h);
+        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
         vio_window_content_scale(ctx->window, &sx, &sy);
-        if (sx > 0.0f) return (double)sx;
+
+        int scr   = horizontal ? scr_w : scr_h;
+        int fb    = horizontal ? fb_w  : fb_h;
+        float scale = horizontal ? sx : sy;
+
+        if (scr > 0 && fb > 0 && scale > 0.0f) {
+            double logical = (double)fb / (double)scale;
+            if (logical > 0.0) return (double)scr / logical;
+        }
     }
 #endif
     (void)ctx;
+    (void)horizontal;
     return 1.0;
+}
+
+static double vio_input_logical_scale_x(vio_context_object *ctx)
+{
+    return vio_input_logical_scale(ctx, 1);
 }
 
 static double vio_input_logical_scale_y(vio_context_object *ctx)
 {
-#if defined(HAVE_GLFW) && defined(_WIN32)
-    /* Headless contexts are 1:1 (vio_content_scale == 1) and injected cursor
-     * coordinates are already logical — the monitor DPI of the hidden window
-     * must not scale them (15.5 came back as 5.17 on a 300 % display). */
-    if (ctx && ctx->window && !ctx->config.headless) {
-        float sx = 1.0f, sy = 1.0f;
-        vio_window_content_scale(ctx->window, &sx, &sy);
-        if (sy > 0.0f) return (double)sy;
-    }
-#endif
-    (void)ctx;
-    return 1.0;
+    return vio_input_logical_scale(ctx, 0);
 }
 
 ZEND_FUNCTION(vio_mouse_position)
