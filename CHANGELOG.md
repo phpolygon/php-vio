@@ -1,3 +1,10 @@
+## [2.25.4](https://github.com/phpolygon/php-vio/compare/v2.25.3...v2.25.4) (2026-09-15)
+
+
+### Bug Fixes
+
+* **readback:** capture the framebuffer, not the size the window was created with ([394a372](https://github.com/phpolygon/php-vio/commit/394a3724dd368d6aa386c7304fd80b5c673058d8))
+
 ## [2.25.3](https://github.com/phpolygon/php-vio/compare/v2.25.2...v2.25.3) (2026-09-14)
 
 
