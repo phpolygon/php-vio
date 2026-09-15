@@ -1628,6 +1628,45 @@ ZEND_FUNCTION(vio_native_window_handle)
 #endif
 }
 
+/* The size, in pixels, of the surface the context draws into — what
+ * vio_framebuffer_size reports and what a readback reads.
+ *
+ * Not ctx->config.width/height: that is the size the window was created with,
+ * updated only by vio_set_window_size and in LOGICAL units. A maximised,
+ * fullscreen or user-resized window, or any desktop scaled away from 100 %,
+ * leaves it behind the real framebuffer. Readback sized from it returned a
+ * corner of the frame, or — where the pixels came back larger or smaller than
+ * the size handed to the PNG writer — a torn image or a read past the end of
+ * the buffer. */
+static void vio_surface_size(vio_context_object *ctx, int *out_w, int *out_h)
+{
+    int w = ctx->config.width > 0 ? ctx->config.width : 800;
+    int h = ctx->config.height > 0 ? ctx->config.height : 600;
+
+    /* Headless contexts render into a target sized 1:1 with the requested
+     * (logical) size on every backend, whatever the hidden window's Retina
+     * framebuffer says — report THAT size, so callers' viewports and readback
+     * buffers match the pixels they get. */
+    if (!ctx->config.headless) {
+#ifdef HAVE_GLFW
+        if (ctx->window) {
+            /* 0x0 while minimised — reported as such; readback refuses it. */
+            glfwGetFramebufferSize(ctx->window, &w, &h);
+        }
+#endif
+#ifdef HAVE_IOS
+        if (!ctx->window) {
+            int fw = 0, fh = 0;
+            vio_ios_get_framebuffer_size(&fw, &fh);
+            if (fw > 0 && fh > 0) { w = fw; h = fh; }
+        }
+#endif
+    }
+
+    *out_w = w;
+    *out_h = h;
+}
+
 ZEND_FUNCTION(vio_framebuffer_size)
 {
     zval *ctx_zval;
@@ -1638,38 +1677,12 @@ ZEND_FUNCTION(vio_framebuffer_size)
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
+    int w = 0, h = 0;
+    vio_surface_size(ctx, &w, &h);
+
     array_init(return_value);
-    /* Headless contexts render into a target sized 1:1 with the requested
-     * (logical) size on every backend, whatever the hidden window's Retina
-     * framebuffer says — report THAT size, so callers' viewports and readback
-     * buffers match the pixels they get. */
-    if (ctx->config.headless) {
-        add_next_index_long(return_value, ctx->config.width > 0 ? ctx->config.width : 800);
-        add_next_index_long(return_value, ctx->config.height > 0 ? ctx->config.height : 600);
-        return;
-    }
-#ifdef HAVE_GLFW
-    if (ctx->window) {
-        int w = 0, h = 0;
-        glfwGetFramebufferSize(ctx->window, &w, &h);
-        add_next_index_long(return_value, w);
-        add_next_index_long(return_value, h);
-        return;
-    }
-#endif
-#ifdef HAVE_IOS
-    {
-        int w = 0, h = 0;
-        vio_ios_get_framebuffer_size(&w, &h);
-        if (w > 0 && h > 0) {
-            add_next_index_long(return_value, w);
-            add_next_index_long(return_value, h);
-            return;
-        }
-    }
-#endif
-    add_next_index_long(return_value, ctx->config.width > 0 ? ctx->config.width : 800);
-    add_next_index_long(return_value, ctx->config.height > 0 ? ctx->config.height : 600);
+    add_next_index_long(return_value, w);
+    add_next_index_long(return_value, h);
 }
 
 ZEND_FUNCTION(vio_content_scale)
@@ -6334,12 +6347,18 @@ ZEND_FUNCTION(vio_read_pixels)
         RETURN_FALSE;
     }
 
-    int w = ctx->config.width;
-    int h = ctx->config.height;
+    /* The live surface, not the creation size (see vio_surface_size). */
+    int w = 0, h = 0;
+    vio_surface_size(ctx, &w, &h);
+    if (w <= 0 || h <= 0) {
+        php_error_docref(NULL, E_WARNING, "vio_read_pixels: the window has no framebuffer (minimised?)");
+        RETURN_FALSE;
+    }
 
     if (ctx->backend->read_pixels && strcmp(ctx->backend->name, "opengl") == 0) {
         size_t size = (size_t)w * h * 4;
         zend_string *buf = zend_string_alloc(size, 0);
+        memset(ZSTR_VAL(buf), 0, size);
         ctx->backend->read_pixels(ctx->headless_fbo, w, h, ZSTR_VAL(buf));
         ZSTR_VAL(buf)[size] = '\0';
         RETURN_NEW_STR(buf);
@@ -6484,6 +6503,9 @@ ZEND_FUNCTION(vio_read_pixels)
          * Call this after rendering a steady frame, not as a per-frame capture. */
         size_t size = (size_t)w * h * 4;
         zend_string *buf = zend_string_alloc(size, 0);
+        /* Only the overlap with the swapchain image is written; a frame caught
+         * mid-resize must not hand out uninitialised memory for the rest. */
+        memset(ZSTR_VAL(buf), 0, size);
         ZSTR_VAL(buf)[size] = '\0';
 
         if (vulkan_read_pixels(w, h, (unsigned char *)ZSTR_VAL(buf)) == 0) {
@@ -6499,6 +6521,7 @@ ZEND_FUNCTION(vio_read_pixels)
     if (strcmp(ctx->backend->name, "metal") == 0) {
         size_t size = (size_t)w * h * 4;
         zend_string *buf = zend_string_alloc(size, 0);
+        memset(ZSTR_VAL(buf), 0, size);
         ZSTR_VAL(buf)[size] = '\0';
 
         if (vio_metal_read_pixels(w, h, (unsigned char *)ZSTR_VAL(buf)) == 0) {
@@ -6532,12 +6555,17 @@ ZEND_FUNCTION(vio_save_screenshot)
         RETURN_FALSE;
     }
 
-    int w = ctx->config.width;
-    int h = ctx->config.height;
+    /* The live surface, not the creation size (see vio_surface_size). */
+    int w = 0, h = 0;
+    vio_surface_size(ctx, &w, &h);
+    if (w <= 0 || h <= 0) {
+        php_error_docref(NULL, E_WARNING, "vio_save_screenshot: the window has no framebuffer (minimised?)");
+        RETURN_FALSE;
+    }
 
     if (ctx->backend->read_pixels && strcmp(ctx->backend->name, "opengl") == 0) {
         size_t size = (size_t)w * h * 4;
-        unsigned char *pixels = emalloc(size);
+        unsigned char *pixels = ecalloc(size, 1);
         ctx->backend->read_pixels(ctx->headless_fbo, w, h, pixels);
         int ok = stbi_write_png(path, w, h, 4, pixels, w * 4);
         efree(pixels);
@@ -6552,12 +6580,9 @@ ZEND_FUNCTION(vio_save_screenshot)
 
 #ifdef HAVE_D3D12
     if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized) {
-        /* Capture directly so we use the TRUE captured dimensions for the PNG.
-         * The generic delegation path below writes with ctx->config.width/height
-         * (the creation size, e.g. 1280x720) which mismatches the real, possibly
-         * window-resized backbuffer (e.g. 3840x1080) — that wrote a clipped,
-         * row-stride-shifted image. vio_d3d12_capture_frame returns top-down
-         * RGBA8 at the live resolution. */
+        /* Capture directly so the PNG gets the TRUE captured dimensions.
+         * vio_d3d12_capture_frame returns top-down RGBA8 at the live swapchain
+         * resolution, which is right even in the frame a resize happens in. */
         int cap_w = 0, cap_h = 0;
         size_t cap_size = 0;
         unsigned char *pixels = vio_d3d12_capture_frame(&cap_w, &cap_h, &cap_size);
@@ -6595,8 +6620,18 @@ ZEND_FUNCTION(vio_save_screenshot)
             int rc = call_user_function(NULL, NULL, &func_name, &retval, 1, args);
             int ok = 0;
             if (rc == SUCCESS && Z_TYPE(retval) == IS_STRING) {
-                const unsigned char *pixels = (const unsigned char *)Z_STRVAL(retval);
-                ok = stbi_write_png(path, w, h, 4, pixels, w * 4);
+                /* D3D11 reads back at its staging texture's size, which can
+                 * trail the surface for a frame while a resize settles. The
+                 * PNG writer walks w*h*4 bytes, so a buffer of any other length
+                 * is refused rather than read past its end. */
+                if (Z_STRLEN(retval) == (size_t)w * h * 4) {
+                    const unsigned char *pixels = (const unsigned char *)Z_STRVAL(retval);
+                    ok = stbi_write_png(path, w, h, 4, pixels, w * 4);
+                } else {
+                    php_error_docref(NULL, E_WARNING,
+                        "vio_save_screenshot: readback is %zu pixels, the %dx%d surface has %d; try again once the resize settles",
+                        Z_STRLEN(retval) / 4, w, h, w * h);
+                }
             }
 
             zval_ptr_dtor(&func_name);

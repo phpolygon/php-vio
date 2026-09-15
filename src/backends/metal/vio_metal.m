@@ -923,13 +923,19 @@ int vio_metal_read_pixels(int width, int height, unsigned char *out_rgba)
         const unsigned char *bgra = (const unsigned char *)[staging contents];
         if (!bgra) return -1;
 
-        /* Convert BGRA -> RGBA */
-        for (int i = 0; i < use_w * use_h; i++) {
-            int off = i * 4;
-            out_rgba[off + 0] = bgra[off + 2]; /* R */
-            out_rgba[off + 1] = bgra[off + 1]; /* G */
-            out_rgba[off + 2] = bgra[off + 0]; /* B */
-            out_rgba[off + 3] = bgra[off + 3]; /* A */
+        /* Convert BGRA -> RGBA. The caller's buffer is width x height; when the
+         * texture is smaller (a drawable that has not caught up with a resize)
+         * the rows must still land at the caller's stride, or every row after
+         * the first is shifted and the image tears diagonally. */
+        for (int y = 0; y < use_h; y++) {
+            for (int x = 0; x < use_w; x++) {
+                size_t src = ((size_t)y * use_w + x) * 4;
+                size_t dst = ((size_t)y * width + x) * 4;
+                out_rgba[dst + 0] = bgra[src + 2]; /* R */
+                out_rgba[dst + 1] = bgra[src + 1]; /* G */
+                out_rgba[dst + 2] = bgra[src + 0]; /* B */
+                out_rgba[dst + 3] = bgra[src + 3]; /* A */
+            }
         }
 
         return 0;
@@ -956,7 +962,7 @@ static int metal_read_pixels_slot(unsigned int fbo, int width, int height, void 
 
 int vio_metal_save_screenshot(const char *path, int width, int height)
 {
-    unsigned char *rgba = emalloc(width * height * 4);
+    unsigned char *rgba = ecalloc((size_t)width * height * 4, 1);
     if (vio_metal_read_pixels(width, height, rgba) != 0) {
         efree(rgba);
         return -1;
