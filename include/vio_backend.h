@@ -111,8 +111,13 @@ typedef struct _vio_backend {
      * and may leave both slots NULL (caller skips the call). teardown_headless
      * frees the FBO plus its attached renderbuffers — those are looked up
      * via glGetFramebufferAttachmentParameteriv so the backend doesn't have
-     * to track them outside the FBO. Returns 0 from setup on failure. */
-    unsigned int (*setup_headless)(int width, int height);
+     * to track them outside the FBO. Returns 0 from setup on failure.
+     * $samples is the surface's multisample count (config 'samples', as a
+     * window gets it): above 1 the backend draws into a multisampled buffer
+     * and resolves it before a read, so an offscreen frame has the same
+     * smooth edges as the one on screen. Counts the driver will not give are
+     * halved down to 1, which is always a usable surface. */
+    unsigned int (*setup_headless)(int width, int height, int samples);
     void  (*teardown_headless)(unsigned int fbo);
 
     /* Configure draw-pipeline state for the next draw call. Takes the full

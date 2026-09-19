@@ -2029,9 +2029,100 @@ static void opengl_bind_pipeline_state(void *pipe_ptr)
     }
 }
 
-static unsigned int opengl_setup_headless(int width, int height)
+/* The headless surface, when it is multisampled: draws land in gl_headless.fbo
+ * and are resolved into gl_headless.resolve_fbo before anyone reads them. A
+ * window gets its samples from GLFW (GLFW_SAMPLES); without this an offscreen
+ * run drew aliased edges where the same frame on screen was smooth. */
+static struct {
+    GLuint fbo;          /* multisampled draw target, 0 when single-sampled */
+    GLuint resolve_fbo;  /* single-sampled copy the reads come from */
+    GLuint color_rb;
+    GLuint depth_rb;
+    GLuint resolve_rb;
+    int    width;
+    int    height;
+} gl_headless;
+
+/* Samples the driver will actually give us, at most 8 and a power of two. */
+static int opengl_headless_samples(int requested)
+{
+    if (requested < 2) return 1;
+    GLint max_samples = 1;
+    glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
+    int samples = requested > 8 ? 8 : requested;
+    if (samples > (int)max_samples) samples = (int)max_samples;
+    return samples > 1 ? samples : 1;
+}
+
+/* A multisampled headless surface plus the single-sampled buffer its frames
+ * resolve into. Returns the draw FBO, or 0 when the driver will not give us
+ * one at any sample count the caller asked for. */
+static unsigned int opengl_setup_headless_msaa(int width, int height, int samples)
+{
+    while (samples > 1) {
+        GLuint fbo = 0, color_rb = 0, depth_rb = 0;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+
+        glGenRenderbuffers(1, &color_rb);
+        glBindRenderbuffer(GL_RENDERBUFFER, color_rb);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, width, height);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, color_rb);
+
+        glGenRenderbuffers(1, &depth_rb);
+        glBindRenderbuffer(GL_RENDERBUFFER, depth_rb);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, width, height);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depth_rb);
+
+        GLuint resolve_fbo = 0, resolve_rb = 0;
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+            glGenFramebuffers(1, &resolve_fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, resolve_fbo);
+            glGenRenderbuffers(1, &resolve_rb);
+            glBindRenderbuffer(GL_RENDERBUFFER, resolve_rb);
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, resolve_rb);
+
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                gl_headless.fbo = fbo;
+                gl_headless.resolve_fbo = resolve_fbo;
+                gl_headless.color_rb = color_rb;
+                gl_headless.depth_rb = depth_rb;
+                gl_headless.resolve_rb = resolve_rb;
+                gl_headless.width = width;
+                gl_headless.height = height;
+                /* Leave the draw target bound, as the single-sampled path does. */
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                return fbo;
+            }
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (resolve_rb) glDeleteRenderbuffers(1, &resolve_rb);
+        if (resolve_fbo) glDeleteFramebuffers(1, &resolve_fbo);
+        glDeleteRenderbuffers(1, &color_rb);
+        glDeleteRenderbuffers(1, &depth_rb);
+        glDeleteFramebuffers(1, &fbo);
+        /* Some drivers refuse a count they advertise; try the next one down. */
+        samples >>= 1;
+    }
+    return 0;
+}
+
+static unsigned int opengl_setup_headless(int width, int height, int samples)
 {
     if (!vio_gl.initialized) return 0;
+
+    samples = opengl_headless_samples(samples);
+    /* One multisampled headless surface at a time: the resolve pair is kept
+     * here, not on the FBO, and a second context would take the first one's
+     * buffers with it when it goes. A second surface stays single-sampled. */
+    if (samples > 1 && !gl_headless.fbo) {
+        unsigned int msaa = opengl_setup_headless_msaa(width, height, samples);
+        if (msaa) return msaa;
+        /* No multisampled FBO to be had: a single-sampled surface is still a
+         * usable one, so fall through rather than fail the context. */
+    }
 
     GLuint fbo = 0;
     glGenFramebuffers(1, &fbo);
@@ -2065,6 +2156,17 @@ static void opengl_teardown_headless(unsigned int fbo)
 {
     if (!fbo || !vio_gl.initialized) return;
 
+    if (gl_headless.fbo && gl_headless.fbo == (GLuint)fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteRenderbuffers(1, &gl_headless.color_rb);
+        glDeleteRenderbuffers(1, &gl_headless.depth_rb);
+        glDeleteRenderbuffers(1, &gl_headless.resolve_rb);
+        glDeleteFramebuffers(1, &gl_headless.resolve_fbo);
+        glDeleteFramebuffers(1, &gl_headless.fbo);
+        memset(&gl_headless, 0, sizeof(gl_headless));
+        return;
+    }
+
     /* Re-discover the attached renderbuffers via the FBO so we don't have
      * to track them in vio_gl globals (which wouldn't survive a multi-context
      * setup gracefully). */
@@ -2090,6 +2192,18 @@ static void opengl_teardown_headless(unsigned int fbo)
 static int opengl_read_pixels(unsigned int fbo, int width, int height, void *out_rgba)
 {
     if (!vio_gl.initialized || width <= 0 || height <= 0) return -1;
+
+    /* A multisampled headless surface cannot be read directly: resolve it
+     * into its single-sampled twin and read that. */
+    if (fbo && gl_headless.fbo && gl_headless.fbo == (GLuint)fbo) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, gl_headless.fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gl_headless.resolve_fbo);
+        glBlitFramebuffer(0, 0, gl_headless.width, gl_headless.height,
+                          0, 0, gl_headless.width, gl_headless.height,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gl_headless.fbo);
+        fbo = gl_headless.resolve_fbo;
+    }
 
     if (fbo) {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);

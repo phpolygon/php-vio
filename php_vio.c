@@ -262,7 +262,7 @@ pick_backend:
              * offscreen by themselves and leave setup_headless NULL. */
             if (ctx->config.headless && ctx->backend->setup_headless) {
                 ctx->headless_fbo = ctx->backend->setup_headless(
-                    ctx->config.width, ctx->config.height);
+                    ctx->config.width, ctx->config.height, ctx->config.samples);
                 if (!ctx->headless_fbo) {
                     php_error_docref(NULL, E_WARNING, "Headless FBO is not complete");
                     vio_window_destroy(ctx->window);
