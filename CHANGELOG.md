@@ -1,3 +1,10 @@
+# [2.26.0](https://github.com/phpolygon/php-vio/compare/v2.25.4...v2.26.0) (2026-09-19)
+
+
+### Features
+
+* **headless:** multisample the offscreen surface ([db7cf5b](https://github.com/phpolygon/php-vio/commit/db7cf5b1fecd02a0e47c0e2f48a5813ffa9c665d))
+
 ## [2.25.4](https://github.com/phpolygon/php-vio/compare/v2.25.3...v2.25.4) (2026-09-15)
 
 
