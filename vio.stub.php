@@ -726,13 +726,23 @@ function vio_draw_instanced_from_buffer(VioContext $context, VioMesh $mesh, int 
  * Set a uniform value on the currently bound pipeline shader.
  * Supports int, float, vec2/3/4 (flat array), mat3 (9 floats), mat4 (16 floats).
  * Silently ignores uniforms not found in the shader.
+ *
+ * A float-typed value may also be passed as PACKED binary data - a string of
+ * little-endian float32, i.e. pack('g*', ...) - which skips the per-element
+ * conversion an array costs and is the cheaper form on the hot draw path (a
+ * mat4 array is 16 zval reads, the packed form one memcpy). The byte length
+ * selects the type: 4 = float, 8 = vec2, 12 = vec3, 16 = vec4, 36 = mat3,
+ * 64 = mat4; any other length raises E_WARNING. Resulting shader state is
+ * identical to the array form. Pack once and reuse the string - packing it
+ * again every frame costs more than it saves.
  */
-function vio_set_uniform(VioContext $context, string $name, int|float|array $value): void {}
+function vio_set_uniform(VioContext $context, string $name, int|float|array|string $value): void {}
 
 /**
  * Batch form of vio_set_uniform: apply a map of ['u_name' => value, ...] in a
  * single native call. Each value follows the same rules as vio_set_uniform
- * (int, float, or float array for vec/mat). Avoids the per-uniform PHP->C call
+ * (int, float, or a float array / packed float32 string for vec/mat). Avoids
+ * the per-uniform PHP->C call
  * overhead on the hot draw path; the resulting cbuffer state is identical.
  */
 function vio_set_uniforms(VioContext $context, array $uniforms): void {}
@@ -746,6 +756,8 @@ function vio_set_uniforms(VioContext $context, array $uniforms): void {}
  *     'pipeline' => VioPipeline,             // optional; bound only on change
  *     'textures' => [ slot => VioTexture ],  // optional; GL slot => texture
  *     'uniforms' => [ 'u_name' => value ],   // optional; per-draw uniform deltas
+ *                                            //   (any vio_set_uniform value form,
+ *                                            //   packed float32 strings included)
  *   ]
  *
  * Records are applied strictly in array order, so the bound shader's sticky

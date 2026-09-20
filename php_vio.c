@@ -4456,6 +4456,107 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
     return p ? (zend_long)(intptr_t)p : 0;
 }
 
+/* Packed uniform data: a binary string of little-endian float32, as produced by
+ * pack('g*', ...). Accepted for every float-typed uniform so the hot draw path
+ * can skip the per-element zval_get_double() walk an array costs — a mat4 array
+ * is 16 of them, which measured at ~150-250ns per matrix, and an opaque draw
+ * sends two. Same fast path vio_draw_instanced already takes for its instance
+ * matrices (vio_resolve_instance_data). Returns the float count, or 0 when the
+ * byte length is not one of the supported shapes. */
+static int vio_unpack_uniform_floats(zend_string *str, float out[16])
+{
+    size_t len = ZSTR_LEN(str);
+    if (len == 0 || (len & 3) != 0) return 0;
+    size_t n = len >> 2;
+    if (n != 1 && n != 2 && n != 3 && n != 4 && n != 9 && n != 16) return 0;
+    /* memcpy rather than a float* cast: ZSTR_VAL carries no alignment guarantee. */
+    memcpy(out, ZSTR_VAL(str), len);
+    return (int)n;
+}
+
+/* Write `count` floats into a shader cbuffer at dst, applying the mat3 row
+ * padding HLSL/std140 expect (3 floats + 4 bytes of padding per row). Shared by
+ * the array and packed-string paths so both produce identical cbuffer bytes. */
+static void vio_write_uniform_floats(unsigned char *dst, int max_size, const float *vals, int count)
+{
+    if (count == 9 && max_size >= 48) {
+        float padded[12];
+        padded[0]  = vals[0]; padded[1]  = vals[1]; padded[2]  = vals[2]; padded[3]  = 0.0f;
+        padded[4]  = vals[3]; padded[5]  = vals[4]; padded[6]  = vals[5]; padded[7]  = 0.0f;
+        padded[8]  = vals[6]; padded[9]  = vals[7]; padded[10] = vals[8]; padded[11] = 0.0f;
+        memcpy(dst, padded, 48);
+        return;
+    }
+    int copy_size = (int)(count * sizeof(float));
+    if (copy_size > max_size) copy_size = max_size;
+    if (copy_size > 0) memcpy(dst, vals, (size_t)copy_size);
+}
+
+/* Dispatch `count` floats to the OpenGL set_uniform slot as the matching type.
+ * Shared by the array and packed-string paths. */
+static void vio_gl_set_uniform_floats(vio_context_object *ctx, const char *name, const float *vals, int count)
+{
+    switch (count) {
+        case 2:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_VEC2); break;
+        case 3:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_VEC3); break;
+        case 4:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_VEC4); break;
+        case 9:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_MAT3); break;
+        case 16: ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_MAT4); break;
+        default: break;
+    }
+}
+
+/* zval -> float for uniform element data. zval_get_double() inlines only the
+ * IS_DOUBLE case; IS_LONG takes the out-of-line zval_get_double_func(), and a
+ * matrix literal is mostly integers — [1,0,0,0, 0,1,0,0, 0,0,1,0, $x,$y,$z,1]
+ * has 13 IS_LONG elements. Handling both inline here is strictly less work, but
+ * it did NOT measure above this machine's run-to-run noise; do not cite a number
+ * for it. The measured lever is the packed-string path (~15-25% on D3D12/Vulkan). */
+static zend_always_inline float vio_zval_to_float(const zval *z)
+{
+    if (EXPECTED(Z_TYPE_P(z) == IS_DOUBLE)) return (float)Z_DVAL_P(z);
+    if (EXPECTED(Z_TYPE_P(z) == IS_LONG))   return (float)Z_LVAL_P(z);
+    return (float)zval_get_double(z);
+}
+
+/* Collect up to 16 floats from a uniform value array — flat (vec2/3/4, flat
+ * mat3/mat4) or nested rows (mat3/mat4 as arrays of arrays). Shared by the
+ * OpenGL and cbuffer paths so both read the same value the same way. */
+static int vio_collect_uniform_floats(HashTable *ht, float out[16])
+{
+    int i = 0;
+    zval *elem;
+
+    zval *first = zend_hash_index_find(ht, 0);
+    if (first && Z_TYPE_P(first) == IS_ARRAY) {
+        zval *row;
+        ZEND_HASH_FOREACH_VAL(ht, row) {
+            if (Z_TYPE_P(row) == IS_ARRAY) {
+                ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(row), elem) {
+                    if (i < 16) out[i++] = vio_zval_to_float(elem);
+                } ZEND_HASH_FOREACH_END();
+            }
+        } ZEND_HASH_FOREACH_END();
+        return i;
+    }
+
+#if PHP_VERSION_ID >= 80200
+    /* A list literal is a packed array: iterate the zval run directly instead
+     * of walking buckets. */
+    if (HT_IS_PACKED(ht)) {
+        ZEND_HASH_PACKED_FOREACH_VAL(ht, elem) {
+            if (i < 16) out[i++] = vio_zval_to_float(elem);
+        } ZEND_HASH_FOREACH_END();
+        return i;
+    }
+#endif
+
+    ZEND_HASH_FOREACH_VAL(ht, elem) {
+        if (i < 16) out[i++] = vio_zval_to_float(elem);
+    } ZEND_HASH_FOREACH_END();
+    return i;
+}
+
 /* Shared core for vio_set_uniform / vio_set_uniforms: marshal one (name, value)
  * into the OpenGL set_uniform path and/or the bound shader's cbuffer at the
  * reflected offset. Extracted so the single + batch entry points write
@@ -4476,38 +4577,20 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
             float v = (float)Z_DVAL_P(value_zval);
             ctx->backend->set_uniform(name, &v, 1, VIO_UNIFORM_FLOAT);
         } else if (Z_TYPE_P(value_zval) == IS_ARRAY) {
-            HashTable *ht = Z_ARRVAL_P(value_zval);
-            zval *first = zend_hash_index_find(ht, 0);
-            if (first && Z_TYPE_P(first) == IS_ARRAY) {
-                /* Nested array → matrix (3x3 or 4x4) */
-                float mat[16];
-                int i = 0;
-                zval *row;
-                ZEND_HASH_FOREACH_VAL(ht, row) {
-                    if (Z_TYPE_P(row) == IS_ARRAY) {
-                        zval *elem;
-                        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(row), elem) {
-                            if (i < 16) mat[i++] = (float)zval_get_double(elem);
-                        } ZEND_HASH_FOREACH_END();
-                    }
-                } ZEND_HASH_FOREACH_END();
-                if (i == 16) ctx->backend->set_uniform(name, mat, 1, VIO_UNIFORM_MAT4);
-                else if (i == 9) ctx->backend->set_uniform(name, mat, 1, VIO_UNIFORM_MAT3);
+            float vals[16];
+            int i = vio_collect_uniform_floats(Z_ARRVAL_P(value_zval), vals);
+            vio_gl_set_uniform_floats(ctx, name, vals, i);
+        } else if (Z_TYPE_P(value_zval) == IS_STRING) {
+            float vals[16];
+            int n = vio_unpack_uniform_floats(Z_STR_P(value_zval), vals);
+            if (n == 1) {
+                ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_FLOAT);
+            } else if (n > 1) {
+                vio_gl_set_uniform_floats(ctx, name, vals, n);
             } else {
-                /* Flat array: vec2/3/4 or flat mat3/4 */
-                float vals[16];
-                int i = 0;
-                zval *elem;
-                ZEND_HASH_FOREACH_VAL(ht, elem) {
-                    if (i < 16) vals[i++] = (float)zval_get_double(elem);
-                } ZEND_HASH_FOREACH_END();
-                switch (i) {
-                    case 2:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_VEC2); break;
-                    case 3:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_VEC3); break;
-                    case 4:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_VEC4); break;
-                    case 9:  ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_MAT3); break;
-                    case 16: ctx->backend->set_uniform(name, vals, 1, VIO_UNIFORM_MAT4); break;
-                }
+                php_error_docref(NULL, E_WARNING,
+                    "vio_set_uniform: '%s' got %zu bytes of packed data; expected 4, 8, 12, 16, 36 or 64 (pack('g*', ...))",
+                    name, ZSTR_LEN(Z_STR_P(value_zval)));
             }
         }
     }
@@ -4555,38 +4638,17 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
                 if (max_size >= (int)sizeof(float)) memcpy(dst, &v, sizeof(float));
             } else if (Z_TYPE_P(value_zval) == IS_ARRAY) {
                 float vals[16];
-                int i = 0;
-                HashTable *ht = Z_ARRVAL_P(value_zval);
-                zval *first = zend_hash_index_find(ht, 0);
-                if (first && Z_TYPE_P(first) == IS_ARRAY) {
-                    zval *row;
-                    ZEND_HASH_FOREACH_VAL(ht, row) {
-                        if (Z_TYPE_P(row) == IS_ARRAY) {
-                            zval *elem;
-                            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(row), elem) {
-                                if (i < 16) vals[i++] = (float)zval_get_double(elem);
-                            } ZEND_HASH_FOREACH_END();
-                        }
-                    } ZEND_HASH_FOREACH_END();
+                int i = vio_collect_uniform_floats(Z_ARRVAL_P(value_zval), vals);
+                vio_write_uniform_floats(dst, max_size, vals, i);
+            } else if (Z_TYPE_P(value_zval) == IS_STRING) {
+                float vals[16];
+                int n = vio_unpack_uniform_floats(Z_STR_P(value_zval), vals);
+                if (n > 0) {
+                    vio_write_uniform_floats(dst, max_size, vals, n);
                 } else {
-                    zval *elem;
-                    ZEND_HASH_FOREACH_VAL(ht, elem) {
-                        if (i < 16) vals[i++] = (float)zval_get_double(elem);
-                    } ZEND_HASH_FOREACH_END();
-                }
-                /* mat3 special case: HLSL cbuffer pads each row to 16 bytes.
-                 * 9 floats (36 bytes) must become 12 floats (48 bytes) with
-                 * 4-byte padding after every 3 floats. */
-                if (i == 9 && max_size >= 48) {
-                    float padded[12];
-                    padded[0]  = vals[0]; padded[1]  = vals[1]; padded[2]  = vals[2]; padded[3]  = 0.0f;
-                    padded[4]  = vals[3]; padded[5]  = vals[4]; padded[6]  = vals[5]; padded[7]  = 0.0f;
-                    padded[8]  = vals[6]; padded[9]  = vals[7]; padded[10] = vals[8]; padded[11] = 0.0f;
-                    memcpy(dst, padded, 48);
-                } else {
-                    int copy_size = (int)(i * sizeof(float));
-                    if (copy_size > max_size) copy_size = max_size;
-                    memcpy(dst, vals, copy_size);
+                    php_error_docref(NULL, E_WARNING,
+                        "vio_set_uniform: '%s' got %zu bytes of packed data; expected 4, 8, 12, 16, 36 or 64 (pack('g*', ...))",
+                        name, ZSTR_LEN(Z_STR_P(value_zval)));
                 }
             }
 
