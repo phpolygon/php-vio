@@ -3025,29 +3025,12 @@ ZEND_FUNCTION(vio_pipeline)
     RETURN_COPY_VALUE(&pipe_zval);
 }
 
-ZEND_FUNCTION(vio_bind_pipeline)
+/* Shared core: make `pipe` the current pipeline. Extracted from
+ * vio_bind_pipeline so vio_submit_batch's per-record 'pipeline' takes the EXACT
+ * same path — GL state, backend bind AND the Metal cbuffer staging below.
+ * Caller guarantees ctx is initialized + in_frame and pipe is valid. */
+static void vio_bind_pipeline_internal(vio_context_object *ctx, vio_pipeline_object *pipe)
 {
-    zval *ctx_zval;
-    zval *pipe_zval;
-
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
-        Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_pipeline_ce)
-    ZEND_PARSE_PARAMETERS_END();
-
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-
-    if (!ctx->initialized || !ctx->in_frame) {
-        php_error_docref(NULL, E_WARNING, "Must call vio_bind_pipeline between vio_begin and vio_end");
-        return;
-    }
-
-    vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pipe_zval);
-    if (!pipe->valid) {
-        php_error_docref(NULL, E_WARNING, "Pipeline is not valid");
-        return;
-    }
-
     /* Track bound shader in context for vio_draw() and uniform cbuffer */
     ctx->bound_shader_program = pipe->shader_program;
     ctx->bound_shader_object = pipe->shader_ref;
@@ -3072,6 +3055,32 @@ ZEND_FUNCTION(vio_bind_pipeline)
         vio_metal_set_shader_cbuffers(msh->cbuffer_backend, msh->frag_cbuffer_backend);
     }
 #endif
+}
+
+ZEND_FUNCTION(vio_bind_pipeline)
+{
+    zval *ctx_zval;
+    zval *pipe_zval;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_pipeline_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_bind_pipeline between vio_begin and vio_end");
+        return;
+    }
+
+    vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pipe_zval);
+    if (!pipe->valid) {
+        php_error_docref(NULL, E_WARNING, "Pipeline is not valid");
+        return;
+    }
+
+    vio_bind_pipeline_internal(ctx, pipe);
 }
 
 /* GAP-PHASE5 Block 9: texture arrays, block-compressed data and pre-built mip
@@ -4693,11 +4702,17 @@ ZEND_FUNCTION(vio_submit_batch)
         return;
     }
 
-    /* Last backend pipeline bound BY this batch, so a sorted batch re-binds the
-     * PSO only on a real change. NULL = none bound here yet (the caller may have
-     * bound one before the batch — the opaque pass binds once, then its records
-     * omit 'pipeline' entirely). */
-    void *last_pipeline = NULL;
+    /* Last pipeline bound BY this batch, so a sorted batch re-binds the PSO only
+     * on a real change. NULL = none bound here yet (the caller may have bound one
+     * before the batch — the opaque pass binds once, then its records omit
+     * 'pipeline' entirely).
+     *
+     * Tracked by vio_pipeline OBJECT, not by backend_pipeline: OpenGL carries its
+     * state on the vio_pipeline itself and leaves backend_pipeline NULL, so
+     * comparing the backend pointer compared NULL against NULL and skipped the
+     * bind for EVERY GL record — a per-record 'pipeline' was a silent no-op on
+     * OpenGL (tests/render3d/128). */
+    vio_pipeline_object *last_pipeline = NULL;
 
     zval *rec;
     ZEND_HASH_FOREACH_VAL(draws, rec) {
@@ -4708,21 +4723,15 @@ ZEND_FUNCTION(vio_submit_batch)
 
         /* ---- per-record loop body (Lever #2 thread-split point) ------------ */
 
-        /* (1) Pipeline — bind only on change. Mirrors vio_bind_pipeline: update
-         *     the context's bound-shader tracking AND dispatch the backend bind. */
+        /* (1) Pipeline — bind only on change, through the SAME core as
+         *     vio_bind_pipeline (GL state, backend bind, Metal cbuffer staging). */
         zval *pz = zend_hash_str_find(r, "pipeline", sizeof("pipeline") - 1);
         if (pz && Z_TYPE_P(pz) == IS_OBJECT &&
             instanceof_function(Z_OBJCE_P(pz), vio_pipeline_ce)) {
             vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pz);
-            if (pipe->valid && pipe->backend_pipeline != last_pipeline) {
-                ctx->bound_shader_program = pipe->shader_program;
-                ctx->bound_shader_object = pipe->shader_ref;
-                if (ctx->backend->bind_pipeline_state) {
-                    ctx->backend->bind_pipeline_state(pipe);
-                } else if (pipe->backend_pipeline && ctx->backend->bind_pipeline) {
-                    ctx->backend->bind_pipeline(pipe->backend_pipeline);
-                }
-                last_pipeline = pipe->backend_pipeline;
+            if (pipe->valid && pipe != last_pipeline) {
+                vio_bind_pipeline_internal(ctx, pipe);
+                last_pipeline = pipe;
             }
         }
 
