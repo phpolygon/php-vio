@@ -1,3 +1,11 @@
+# [2.27.0](https://github.com/phpolygon/php-vio/compare/v2.26.0...v2.27.0) (2026-09-23)
+
+
+### Features
+
+* **input:** route injected input through the OS event path ([9151812](https://github.com/phpolygon/php-vio/commit/91518121d62e799166f62a4d0ac99b7b8fa76c01))
+* **input:** virtual gamepads and input record/replay ([071985c](https://github.com/phpolygon/php-vio/commit/071985c12055c6ed731694a611fdf3b86a0bb679))
+
 # [2.26.0](https://github.com/phpolygon/php-vio/compare/v2.25.4...v2.26.0) (2026-09-19)
 
 
