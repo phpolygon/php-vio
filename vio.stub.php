@@ -819,19 +819,63 @@ function vio_stream_push(VioStream $stream, VioContext $context): bool {}
 function vio_stream_stop(VioStream $stream): void {}
 
 /**
- * Inject a simulated key event into the context input state.
+ * Inject a simulated key event.
+ *
+ * Takes the same path as a key event from the OS: it updates the key state
+ * (vio_key_pressed / _just_pressed / _released) and fires the vio_on_key
+ * callback with ($key, $action, $mods). Injections apply immediately. For edges
+ * to line up like real input, inject where the loop calls vio_poll_events:
+ * vio_begin() snapshots the previous key state, so a press injected after the
+ * game read its input this frame shows up as a level next frame, never as an edge.
+ *
+ * A key press does not produce text. Typed characters are a separate event,
+ * as on the OS: follow the key with vio_inject_char().
+ *
+ * @param int $action VIO_PRESS, VIO_RELEASE or VIO_REPEAT (anything else throws a ValueError)
+ * @param int $mods   VIO_MOD_* bitmask passed to the vio_on_key callback
  */
-function vio_inject_key(VioContext $context, int $key, int $action): void {}
+function vio_inject_key(VioContext $context, int $key, int $action, int $mods = 0): void {}
 
 /**
- * Inject a simulated mouse move event.
+ * Inject a simulated cursor move.
+ *
+ * Coordinates are raw cursor coordinates, as the OS reports them, and go through
+ * the same conversion as a real pointer. Headless that conversion is 1:1, so
+ * vio_mouse_position() returns exactly what was injected. On a windowed context
+ * on a scaled desktop vio_mouse_position() divides by the scale (see
+ * vio_content_scale()). vio_mouse_delta() is measured against the position at
+ * the last vio_begin().
  */
 function vio_inject_mouse_move(VioContext $context, float $x, float $y): void {}
 
 /**
  * Inject a simulated mouse button event.
+ *
+ * @param int $action VIO_PRESS or VIO_RELEASE (VIO_REPEAT counts as held; anything else throws a ValueError)
  */
 function vio_inject_mouse_button(VioContext $context, int $button, int $action): void {}
+
+/**
+ * Inject a simulated scroll-wheel event.
+ *
+ * Accumulates into vio_mouse_scroll() the way wheel events do; vio_begin()
+ * resets it to zero, so inject before the game reads scroll for the frame.
+ */
+function vio_inject_scroll(VioContext $context, float $dx, float $dy): void {}
+
+/**
+ * Inject typed text.
+ *
+ * Takes one codepoint (int) or a UTF-8 string. Each codepoint goes through the
+ * OS text path: it is appended to vio_chars_typed() and fires the vio_on_char
+ * callback. Control characters (Enter, Tab, Backspace, U+0000-U+001F, U+007F)
+ * are rejected with a ValueError, because the OS delivers them as keys, not
+ * text: use vio_inject_key() for those. Malformed UTF-8 also throws, and nothing
+ * is emitted.
+ *
+ * @return int Number of codepoints emitted
+ */
+function vio_inject_char(VioContext $context, int|string $input): int {}
 
 /**
  * Read the framebuffer as raw RGBA pixel data.

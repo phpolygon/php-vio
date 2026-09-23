@@ -120,6 +120,14 @@ int  vio_input_take_ime_backspaces(vio_input_state *state);
  * Shared by the GLFW char callback and the iOS IME drain. PHP/render thread. */
 void vio_input_emit_char(vio_input_state *state, unsigned int codepoint);
 
+/* Event funnels shared by the GLFW callbacks and vio_inject_*: an injected
+ * event takes the same path as a real one. key_event fires the on_key callback.
+ * Coordinates are in the raw cursor space GLFW reports. PHP/render thread. */
+void vio_input_key_event(vio_input_state *state, int key, int action, int mods);
+void vio_input_cursor_event(vio_input_state *state, double x, double y);
+void vio_input_button_event(vio_input_state *state, int button, int action);
+void vio_input_scroll_event(vio_input_state *state, double dx, double dy);
+
 #ifdef HAVE_GLFW
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>

@@ -529,6 +529,7 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_key, 0, 3, IS_VOID, 0
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, key, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, action, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, mods, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_mouse_move, 0, 3, IS_VOID, 0)
@@ -541,6 +542,17 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_mouse_button, 0, 3, I
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, button, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, action, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_scroll, 0, 3, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, dx, IS_DOUBLE, 0)
+	ZEND_ARG_TYPE_INFO(0, dy, IS_DOUBLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_char, 0, 2, IS_LONG, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_MASK(0, input, MAY_BE_LONG|MAY_BE_STRING, NULL)
 ZEND_END_ARG_INFO()
 
 /* ── Headless / Screenshot functions ─────────────────────────────── */
@@ -900,6 +912,8 @@ ZEND_FUNCTION(vio_stream_stop);
 ZEND_FUNCTION(vio_inject_key);
 ZEND_FUNCTION(vio_inject_mouse_move);
 ZEND_FUNCTION(vio_inject_mouse_button);
+ZEND_FUNCTION(vio_inject_scroll);
+ZEND_FUNCTION(vio_inject_char);
 ZEND_FUNCTION(vio_read_pixels);
 ZEND_FUNCTION(vio_save_screenshot);
 ZEND_FUNCTION(vio_gpu_info);
@@ -1053,6 +1067,8 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_inject_key, arginfo_vio_inject_key)
 	ZEND_FE(vio_inject_mouse_move, arginfo_vio_inject_mouse_move)
 	ZEND_FE(vio_inject_mouse_button, arginfo_vio_inject_mouse_button)
+	ZEND_FE(vio_inject_scroll, arginfo_vio_inject_scroll)
+	ZEND_FE(vio_inject_char, arginfo_vio_inject_char)
 	ZEND_FE(vio_read_pixels, arginfo_vio_read_pixels)
 	ZEND_FE(vio_save_screenshot, arginfo_vio_save_screenshot)
 	ZEND_FE(vio_gpu_info, arginfo_vio_gpu_info)

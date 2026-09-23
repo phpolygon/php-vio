@@ -7,6 +7,7 @@
 #endif
 
 #include "vio_input.h"
+#include "../include/vio_types.h"
 #include <string.h>
 
 void vio_input_init(vio_input_state *state)
@@ -160,20 +161,24 @@ void vio_input_emit_char(vio_input_state *state, unsigned int codepoint)
     }
 }
 
-#ifdef HAVE_GLFW
+/* ── Event funnels ──────────────────────────────────────────────────
+ *
+ * One entry point per event kind, shared by the GLFW callbacks and the
+ * vio_inject_* functions. An injected event reaches the game exactly like one
+ * from the OS: the same state writes and the same PHP callbacks. That matters
+ * for engines that take key edges from vio_on_key rather than from
+ * vio_key_just_pressed - PHPolygon does - since an injection that only wrote
+ * the key array was invisible to them. PHP/render thread only (fires PHP
+ * callbacks). */
 
-static void glfw_key_callback(GLFWwindow *window, int key, int scancode, int action, int mods)
+void vio_input_key_event(vio_input_state *state, int key, int action, int mods)
 {
-    vio_input_state *state = (vio_input_state *)glfwGetWindowUserPointer(window);
     if (!state) return;
 
-    (void)scancode;
-
     if (key >= 0 && key <= VIO_KEY_LAST) {
-        state->keys[key] = (action != GLFW_RELEASE) ? 1 : 0;
+        state->keys[key] = (action != VIO_RELEASE) ? 1 : 0;
     }
 
-    /* Fire PHP callback if registered */
     if (state->has_key_callback) {
         zval retval, args[3];
         ZVAL_LONG(&args[0], key);
@@ -186,6 +191,36 @@ static void glfw_key_callback(GLFWwindow *window, int key, int scancode, int act
     }
 }
 
+void vio_input_cursor_event(vio_input_state *state, double x, double y)
+{
+    if (!state) return;
+    state->mouse_x = x;
+    state->mouse_y = y;
+}
+
+void vio_input_button_event(vio_input_state *state, int button, int action)
+{
+    if (!state) return;
+    if (button >= 0 && button <= VIO_MOUSE_LAST) {
+        state->mouse_buttons[button] = (action != VIO_RELEASE) ? 1 : 0;
+    }
+}
+
+void vio_input_scroll_event(vio_input_state *state, double dx, double dy)
+{
+    if (!state) return;
+    state->scroll_x += dx;
+    state->scroll_y += dy;
+}
+
+#ifdef HAVE_GLFW
+
+static void glfw_key_callback(GLFWwindow *window, int key, int scancode, int action, int mods)
+{
+    (void)scancode;
+    vio_input_key_event((vio_input_state *)glfwGetWindowUserPointer(window), key, action, mods);
+}
+
 static void glfw_char_callback(GLFWwindow *window, unsigned int codepoint)
 {
     vio_input_state *state = (vio_input_state *)glfwGetWindowUserPointer(window);
@@ -195,32 +230,18 @@ static void glfw_char_callback(GLFWwindow *window, unsigned int codepoint)
 
 static void glfw_cursor_pos_callback(GLFWwindow *window, double xpos, double ypos)
 {
-    vio_input_state *state = (vio_input_state *)glfwGetWindowUserPointer(window);
-    if (!state) return;
-
-    state->mouse_x = xpos;
-    state->mouse_y = ypos;
+    vio_input_cursor_event((vio_input_state *)glfwGetWindowUserPointer(window), xpos, ypos);
 }
 
 static void glfw_mouse_button_callback(GLFWwindow *window, int button, int action, int mods)
 {
-    vio_input_state *state = (vio_input_state *)glfwGetWindowUserPointer(window);
-    if (!state) return;
-
     (void)mods;
-
-    if (button >= 0 && button <= VIO_MOUSE_LAST) {
-        state->mouse_buttons[button] = (action != GLFW_RELEASE) ? 1 : 0;
-    }
+    vio_input_button_event((vio_input_state *)glfwGetWindowUserPointer(window), button, action);
 }
 
 static void glfw_scroll_callback(GLFWwindow *window, double xoffset, double yoffset)
 {
-    vio_input_state *state = (vio_input_state *)glfwGetWindowUserPointer(window);
-    if (!state) return;
-
-    state->scroll_x += xoffset;
-    state->scroll_y += yoffset;
+    vio_input_scroll_event((vio_input_state *)glfwGetWindowUserPointer(window), xoffset, yoffset);
 }
 
 static void glfw_framebuffer_size_callback(GLFWwindow *window, int width, int height)

@@ -6210,23 +6210,45 @@ ZEND_FUNCTION(vio_audio_listener)
     ma_engine_listener_set_direction(&vio_audio.engine, 0, (float)fx, (float)fy, (float)fz);
 }
 
-/* ── Input injection functions ────────────────────────────────────── */
+/* ── Input injection functions ────────────────────────────────────────
+ *
+ * Synthetic input for tests, bots and replays. Every injection goes through
+ * the same funnel as the matching GLFW callback (src/vio_input.c), so it
+ * writes the same state and fires the same PHP callbacks as a real event
+ * delivered by vio_poll_events at this point. */
+
+static int vio_inject_check_action(zend_long action, uint32_t arg_num)
+{
+    if (action != VIO_RELEASE && action != VIO_PRESS && action != VIO_REPEAT) {
+        zend_argument_value_error(arg_num, "must be VIO_RELEASE, VIO_PRESS or VIO_REPEAT");
+        return 0;
+    }
+    return 1;
+}
 
 ZEND_FUNCTION(vio_inject_key)
 {
     zval *ctx_zval;
-    zend_long key, action;
+    zend_long key, action, mods = 0;
 
-    ZEND_PARSE_PARAMETERS_START(3, 3)
+    ZEND_PARSE_PARAMETERS_START(3, 4)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_LONG(key)
         Z_PARAM_LONG(action)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(mods)
     ZEND_PARSE_PARAMETERS_END();
+
+    if (!vio_inject_check_action(action, 3)) {
+        RETURN_THROWS();
+    }
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
+    /* Unknown keys are dropped: GLFW reports those as VIO_KEY_UNKNOWN (-1),
+     * which no key array slot holds and no caller can meaningfully inject. */
     if (key >= 0 && key <= VIO_KEY_LAST) {
-        ctx->input.keys[key] = (action != VIO_RELEASE) ? 1 : 0;
+        vio_input_key_event(&ctx->input, (int)key, (int)action, (int)mods);
     }
 }
 
@@ -6242,8 +6264,11 @@ ZEND_FUNCTION(vio_inject_mouse_move)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    ctx->input.mouse_x = x;
-    ctx->input.mouse_y = y;
+
+    /* Raw cursor coordinates, exactly what the GLFW callback stores, so an
+     * injected move goes through the same conversion as a real pointer
+     * (test 078 relies on that). Headless the conversion is 1:1. */
+    vio_input_cursor_event(&ctx->input, x, y);
 }
 
 ZEND_FUNCTION(vio_inject_mouse_button)
@@ -6257,11 +6282,109 @@ ZEND_FUNCTION(vio_inject_mouse_button)
         Z_PARAM_LONG(action)
     ZEND_PARSE_PARAMETERS_END();
 
+    if (!vio_inject_check_action(action, 3)) {
+        RETURN_THROWS();
+    }
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_input_button_event(&ctx->input, (int)button, (int)action);
+}
+
+ZEND_FUNCTION(vio_inject_scroll)
+{
+    zval *ctx_zval;
+    double dx, dy;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_DOUBLE(dx)
+        Z_PARAM_DOUBLE(dy)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_input_scroll_event(&ctx->input, dx, dy);
+}
+
+/* Decode one UTF-8 sequence starting at s[*i] (strict: no overlongs, no
+ * surrogates, max U+10FFFF). Returns the codepoint and advances *i, or
+ * returns -1 on malformed input. */
+static int32_t vio_utf8_next(const unsigned char *s, size_t len, size_t *i)
+{
+    unsigned char c = s[*i];
+    int32_t cp;
+    size_t n;
+
+    if (c < 0x80)      { cp = c;        n = 1; }
+    else if (c < 0xC2) { return -1; }
+    else if (c < 0xE0) { cp = c & 0x1F; n = 2; }
+    else if (c < 0xF0) { cp = c & 0x0F; n = 3; }
+    else if (c < 0xF5) { cp = c & 0x07; n = 4; }
+    else               { return -1; }
+
+    if (*i + n > len) return -1;
+    for (size_t k = 1; k < n; k++) {
+        unsigned char cc = s[*i + k];
+        if ((cc & 0xC0) != 0x80) return -1;
+        cp = (cp << 6) | (cc & 0x3F);
+    }
+    if ((n == 3 && cp < 0x800) || (n == 4 && cp < 0x10000) ||
+        cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        return -1;
+    }
+    *i += n;
+    return cp;
+}
+
+/* A codepoint the OS text path could deliver: GLFW's char callback never
+ * reports C0 controls or DEL (Enter, Backspace, Tab arrive as keys). */
+static int vio_inject_char_ok(int64_t cp)
+{
+    return cp >= 0x20 && cp != 0x7F && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
+}
+
+ZEND_FUNCTION(vio_inject_char)
+{
+    zval *ctx_zval;
+    zend_string *text = NULL;
+    zend_long cp = 0;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR_OR_LONG(text, cp)
+    ZEND_PARSE_PARAMETERS_END();
+
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
-    if (button >= 0 && button <= VIO_MOUSE_LAST) {
-        ctx->input.mouse_buttons[button] = (action != VIO_RELEASE) ? 1 : 0;
+    if (!text) {
+        if (!vio_inject_char_ok(cp)) {
+            zend_argument_value_error(2, "must be a printable Unicode codepoint (control characters are injected as keys)");
+            RETURN_THROWS();
+        }
+        vio_input_emit_char(&ctx->input, (unsigned int)cp);
+        RETURN_LONG(1);
     }
+
+    /* Validate the whole string first, so malformed input emits nothing. */
+    const unsigned char *s = (const unsigned char *)ZSTR_VAL(text);
+    size_t len = ZSTR_LEN(text);
+    for (size_t i = 0; i < len; ) {
+        int32_t c = vio_utf8_next(s, len, &i);
+        if (c < 0) {
+            zend_argument_value_error(2, "must be valid UTF-8");
+            RETURN_THROWS();
+        }
+        if (!vio_inject_char_ok(c)) {
+            zend_argument_value_error(2, "must not contain control characters (inject Enter, Tab, Backspace as keys)");
+            RETURN_THROWS();
+        }
+    }
+
+    zend_long count = 0;
+    for (size_t i = 0; i < len; ) {
+        vio_input_emit_char(&ctx->input, (unsigned int)vio_utf8_next(s, len, &i));
+        count++;
+    }
+    RETURN_LONG(count);
 }
 
 /* ── Headless / Screenshot functions ──────────────────────────────── */
