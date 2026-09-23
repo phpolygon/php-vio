@@ -96,6 +96,8 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 | Ordner | Inhalt |
 |---|---|
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
+| `tests/input/133` | Input-Record/Replay: Tick = `vio_poll_events`-Aufruf seit Start, Tick-0-Events sofort, Replay feuert die Callbacks, Gamepads werden je Poll abgetastet und als virtuelle Pads wiedergegeben, JSON-Round-Trip (Floats werden Ints), unsortierte Skripte (gleicher Tick behält Reihenfolge), `ValueError` mit Entry-Index ohne halbstartetes Replay, `vio_destroy`/Free geben Replay-Pads frei. |
+| `tests/input/132` | Virtuelle Gamepads: Slot 0–15 überlagert den physischen Joystick für alle `vio_gamepad_*`-Leser, Default-Zustand (Trigger −1), Achsen geclamped, Reconnect setzt zurück, Fehler für ungültige Slots/Buttons/Achsen und nicht verbundene Pads. |
 | `tests/input/131` | Input-Injection nimmt den OS-Eventpfad: `vio_inject_key` feuert `vio_on_key` (mit Action + Mods, auch `VIO_REPEAT`), `vio_inject_scroll` akkumuliert bis `vio_begin`, `vio_inject_char` (Codepoint oder UTF-8) füllt `vio_chars_typed` + `vio_on_char`; Steuerzeichen/kaputtes UTF-8 → `ValueError` ohne Teil-Emission; genau eine `just_pressed`-Flanke, wenn zwischen den Frames injiziert. |
 | `tests/render3d/112` | Blend und Write-Mask je Attachment auf einer MRT-Pipeline: Attachment 0 alpha-blendet, Attachment 1 (Maske 0) bleibt unberührt, Attachment 2 schreibt nur den Rotkanal – der Vertrag für einen Transparent-Pass in ein G-Buffer-Target. |
 | `tests/render3d/123` | 3D-Konventionen auf allen Backends (Vulkan wie D3D): Tiefentest, Back-Face-Culling, Uniforms je Stage, Textur-V, Instancing (gepackt), RT-Readback-Zeile 0 und gesampelte Orientierung, Depth-only-Target. |
@@ -461,6 +463,11 @@ vio_keyboard_show($ctx); vio_keyboard_hide($ctx);       // iOS-Softkeyboard, son
 vio_inject_key($ctx, VIO_KEY_W, VIO_PRESS, VIO_MOD_SHIFT);  // Tests/Bots: gleicher Pfad wie GLFW, feuert vio_on_key
 vio_inject_mouse_move($ctx, $x, $y); vio_inject_mouse_button($ctx, VIO_MOUSE_LEFT, VIO_PRESS);  // roher Cursor-Raum (headless 1:1)
 vio_inject_scroll($ctx, 0.0, 1.0); vio_inject_char($ctx, "Hallo");  // Text feuert vio_on_char; Enter/Backspace als Key
+vio_virtual_gamepad_connect(0, "Bot Pad");                   // prozessglobal, überlagert physischen Joystick 0
+vio_inject_gamepad_button(0, VIO_GAMEPAD_A, VIO_PRESS); vio_inject_gamepad_axis(0, VIO_GAMEPAD_AXIS_LEFT_X, 0.7);
+vio_input_record_start($ctx); /* ... spielen ... */ $events = vio_input_record_stop($ctx);  // Array, JSON-fähig
+vio_input_replay($ctx, $events);   // Tick N = N-ter vio_poll_events; OS-Input wird solange ignoriert
+vio_input_replaying($ctx); vio_input_replay_stop($ctx);
 vio_gamepads(); vio_gamepad_buttons($id); vio_gamepad_axes($id); vio_gamepad_triggers($id);
 ```
 
@@ -764,7 +771,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 132 (109/110 gehören dem Branch feat/geometry-tessellation-stages, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 134 (109/110 gehören dem Branch feat/geometry-tessellation-stages, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.

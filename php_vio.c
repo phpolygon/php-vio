@@ -385,6 +385,11 @@ ZEND_FUNCTION(vio_destroy)
     /* Release the draw-time bind table before the GPU objects behind it go away. */
     vio_pending_textures_clear(ctx);
 
+    /* A replay holds process-global virtual gamepads and hides the physical
+     * ones; a destroyed context must give them back even while PHP still holds
+     * the object. */
+    vio_input_replay_stop(&ctx->input);
+
     if (ctx->initialized && ctx->backend) {
         if (ctx->surface && ctx->backend->destroy_surface) {
             ctx->backend->destroy_surface(ctx->surface);
@@ -471,6 +476,11 @@ ZEND_FUNCTION(vio_poll_events)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
     ZEND_PARSE_PARAMETERS_END();
 
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    /* The record/replay clock ticks once per poll; replayed events are
+     * delivered after the OS ones, at the point real ones would arrive. */
+    vio_input_poll_begin(&ctx->input);
 #ifdef HAVE_GLFW
     vio_window_poll_events();
 #endif
@@ -479,11 +489,9 @@ ZEND_FUNCTION(vio_poll_events)
      * codepoints queued by the UIKeyInput view on the main thread, emitting
      * them on this (render) thread through the normal char path - mirrors the
      * GLFW char callback firing during glfwPollEvents. */
-    {
-        vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-        vio_input_drain_ime(&ctx->input);
-    }
+    vio_input_drain_ime(&ctx->input);
 #endif
+    vio_input_poll_end(&ctx->input);
 }
 
 
@@ -6386,6 +6394,385 @@ ZEND_FUNCTION(vio_inject_char)
     }
     RETURN_LONG(count);
 }
+/* ── Virtual gamepads ─────────────────────────────────────────────────
+ *
+ * Process-global like the vio_gamepad_* readers: a virtual pad in slot N
+ * replaces the physical joystick N for every reader until it disconnects. */
+
+static int vio_pad_slot_arg(zend_long id, uint32_t arg_num)
+{
+    if (id < 0 || id >= VIO_GAMEPAD_SLOTS) {
+        zend_argument_value_error(arg_num, "must be between 0 and %d", VIO_GAMEPAD_SLOTS - 1);
+        return 0;
+    }
+    return 1;
+}
+
+ZEND_FUNCTION(vio_virtual_gamepad_connect)
+{
+    zend_long id;
+    zend_string *name = NULL;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_LONG(id)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STR(name)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!vio_pad_slot_arg(id, 1)) {
+        RETURN_THROWS();
+    }
+    vio_virtual_gamepad_connect((int)id, name ? ZSTR_VAL(name) : NULL);
+}
+
+ZEND_FUNCTION(vio_virtual_gamepad_disconnect)
+{
+    zend_long id;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(id)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!vio_pad_slot_arg(id, 1)) {
+        RETURN_THROWS();
+    }
+    vio_virtual_gamepad_disconnect((int)id);
+}
+
+ZEND_FUNCTION(vio_inject_gamepad_button)
+{
+    zend_long id, button, action;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_LONG(id)
+        Z_PARAM_LONG(button)
+        Z_PARAM_LONG(action)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!vio_pad_slot_arg(id, 1)) {
+        RETURN_THROWS();
+    }
+    if (button < 0 || button >= VIO_GAMEPAD_BUTTON_COUNT) {
+        zend_argument_value_error(2, "must be a VIO_GAMEPAD_* button constant");
+        RETURN_THROWS();
+    }
+    if (!vio_inject_check_action(action, 3)) {
+        RETURN_THROWS();
+    }
+    if (!vio_virtual_gamepad_set_button((int)id, (int)button, action != VIO_RELEASE)) {
+        zend_throw_error(NULL, "No virtual gamepad connected in slot " ZEND_LONG_FMT, id);
+        RETURN_THROWS();
+    }
+}
+
+ZEND_FUNCTION(vio_inject_gamepad_axis)
+{
+    zend_long id, axis;
+    double value;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_LONG(id)
+        Z_PARAM_LONG(axis)
+        Z_PARAM_DOUBLE(value)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!vio_pad_slot_arg(id, 1)) {
+        RETURN_THROWS();
+    }
+    if (axis < 0 || axis >= VIO_GAMEPAD_AXIS_COUNT) {
+        zend_argument_value_error(2, "must be a VIO_GAMEPAD_AXIS_* constant");
+        RETURN_THROWS();
+    }
+    if (!vio_virtual_gamepad_set_axis((int)id, (int)axis, value)) {
+        zend_throw_error(NULL, "No virtual gamepad connected in slot " ZEND_LONG_FMT, id);
+        RETURN_THROWS();
+    }
+}
+
+/* ── Input record / replay ────────────────────────────────────────────
+ *
+ * A recording is a plain PHP array of events, one per entry:
+ *   ['tick' => int, 'type' => string, ...fields]
+ * so it can be saved with json_encode/serialize, edited, or written by hand
+ * as a bot script. The tick counts vio_poll_events calls since the start. */
+
+static const struct {
+    int         type;
+    const char *name;
+} vio_input_event_names[] = {
+    { VIO_INPUT_EV_KEY,            "key" },
+    { VIO_INPUT_EV_CHAR,           "char" },
+    { VIO_INPUT_EV_CURSOR,         "cursor" },
+    { VIO_INPUT_EV_BUTTON,         "button" },
+    { VIO_INPUT_EV_SCROLL,         "scroll" },
+    { VIO_INPUT_EV_TOUCH,          "touch" },
+    { VIO_INPUT_EV_PAD_CONNECT,    "gamepad_connect" },
+    { VIO_INPUT_EV_PAD_DISCONNECT, "gamepad_disconnect" },
+    { VIO_INPUT_EV_PAD_BUTTON,     "gamepad_button" },
+    { VIO_INPUT_EV_PAD_AXIS,       "gamepad_axis" },
+    { VIO_INPUT_EV_END,            "end" },
+};
+
+static void vio_input_event_to_array(const vio_input_event *ev, zval *out)
+{
+    array_init(out);
+    add_assoc_long(out, "tick", (zend_long)ev->tick);
+    for (size_t i = 0; i < sizeof(vio_input_event_names) / sizeof(vio_input_event_names[0]); i++) {
+        if (vio_input_event_names[i].type == ev->type) {
+            add_assoc_string(out, "type", (char *)vio_input_event_names[i].name);
+            break;
+        }
+    }
+    switch (ev->type) {
+        case VIO_INPUT_EV_KEY:
+            add_assoc_long(out, "key", ev->a);
+            add_assoc_long(out, "action", ev->b);
+            add_assoc_long(out, "mods", ev->c);
+            break;
+        case VIO_INPUT_EV_CHAR:
+            add_assoc_long(out, "codepoint", ev->a);
+            break;
+        case VIO_INPUT_EV_CURSOR:
+            add_assoc_double(out, "x", ev->x);
+            add_assoc_double(out, "y", ev->y);
+            break;
+        case VIO_INPUT_EV_BUTTON:
+            add_assoc_long(out, "button", ev->a);
+            add_assoc_long(out, "action", ev->b);
+            break;
+        case VIO_INPUT_EV_SCROLL:
+            add_assoc_double(out, "dx", ev->x);
+            add_assoc_double(out, "dy", ev->y);
+            break;
+        case VIO_INPUT_EV_TOUCH:
+            add_assoc_long(out, "id", (zend_long)ev->id);
+            add_assoc_long(out, "phase", ev->b);
+            add_assoc_double(out, "x", ev->x);
+            add_assoc_double(out, "y", ev->y);
+            break;
+        case VIO_INPUT_EV_PAD_CONNECT:
+            add_assoc_long(out, "gamepad", ev->a);
+            if (ev->name) {
+                add_assoc_str(out, "name", zend_string_copy(ev->name));
+            }
+            break;
+        case VIO_INPUT_EV_PAD_DISCONNECT:
+            add_assoc_long(out, "gamepad", ev->a);
+            break;
+        case VIO_INPUT_EV_PAD_BUTTON:
+            add_assoc_long(out, "gamepad", ev->a);
+            add_assoc_long(out, "button", ev->b);
+            add_assoc_bool(out, "pressed", ev->c != 0);
+            break;
+        case VIO_INPUT_EV_PAD_AXIS:
+            add_assoc_long(out, "gamepad", ev->a);
+            add_assoc_long(out, "axis", ev->b);
+            add_assoc_double(out, "value", ev->x);
+            break;
+        default:
+            break;
+    }
+}
+
+/* Field readers for replay entries. Integers must be int; positions accept
+ * int or float, since a JSON round-trip turns 10.0 into 10. */
+static int vio_ev_long(HashTable *ht, const char *key, zend_long *out)
+{
+    zval *z = zend_hash_str_find(ht, key, strlen(key));
+    if (!z || Z_TYPE_P(z) != IS_LONG) return 0;
+    *out = Z_LVAL_P(z);
+    return 1;
+}
+
+static int vio_ev_double(HashTable *ht, const char *key, double *out)
+{
+    zval *z = zend_hash_str_find(ht, key, strlen(key));
+    if (!z) return 0;
+    if (Z_TYPE_P(z) == IS_DOUBLE) { *out = Z_DVAL_P(z); return 1; }
+    if (Z_TYPE_P(z) == IS_LONG)   { *out = (double)Z_LVAL_P(z); return 1; }
+    return 0;
+}
+
+/* Parse one replay entry. On failure returns the reason; the caller turns
+ * it into a ValueError naming the entry. */
+static const char *vio_input_event_from_array(zval *entry, vio_input_event *ev)
+{
+    memset(ev, 0, sizeof(*ev));
+    if (Z_TYPE_P(entry) != IS_ARRAY) return "must be an array";
+    HashTable *ht = Z_ARRVAL_P(entry);
+
+    zend_long tick;
+    if (!vio_ev_long(ht, "tick", &tick) || tick < 0 || tick > (zend_long)UINT32_MAX) {
+        return "needs an int 'tick' >= 0";
+    }
+    ev->tick = (uint32_t)tick;
+
+    zval *type = zend_hash_str_find(ht, "type", sizeof("type") - 1);
+    if (!type || Z_TYPE_P(type) != IS_STRING) return "needs a string 'type'";
+    for (size_t i = 0; i < sizeof(vio_input_event_names) / sizeof(vio_input_event_names[0]); i++) {
+        if (zend_string_equals_cstr(Z_STR_P(type), vio_input_event_names[i].name,
+                                    strlen(vio_input_event_names[i].name))) {
+            ev->type = vio_input_event_names[i].type;
+            break;
+        }
+    }
+
+    zend_long a = 0, b = 0, c = 0;
+    switch (ev->type) {
+        case VIO_INPUT_EV_KEY:
+            if (!vio_ev_long(ht, "key", &a) || a < 0 || a > VIO_KEY_LAST) return "needs a valid int 'key'";
+            if (!vio_ev_long(ht, "action", &b) || b < VIO_RELEASE || b > VIO_REPEAT) return "needs an 'action' of VIO_RELEASE, VIO_PRESS or VIO_REPEAT";
+            vio_ev_long(ht, "mods", &c);
+            break;
+        case VIO_INPUT_EV_CHAR:
+            if (!vio_ev_long(ht, "codepoint", &a) || !vio_inject_char_ok(a)) return "needs a printable 'codepoint'";
+            break;
+        case VIO_INPUT_EV_CURSOR:
+            if (!vio_ev_double(ht, "x", &ev->x) || !vio_ev_double(ht, "y", &ev->y)) return "needs numeric 'x' and 'y'";
+            break;
+        case VIO_INPUT_EV_BUTTON:
+            if (!vio_ev_long(ht, "button", &a) || a < 0 || a > VIO_MOUSE_LAST) return "needs a valid int 'button'";
+            if (!vio_ev_long(ht, "action", &b) || b < VIO_RELEASE || b > VIO_REPEAT) return "needs an 'action' of VIO_RELEASE, VIO_PRESS or VIO_REPEAT";
+            break;
+        case VIO_INPUT_EV_SCROLL:
+            if (!vio_ev_double(ht, "dx", &ev->x) || !vio_ev_double(ht, "dy", &ev->y)) return "needs numeric 'dx' and 'dy'";
+            break;
+        case VIO_INPUT_EV_TOUCH: {
+            zend_long tid;
+            if (!vio_ev_long(ht, "id", &tid)) return "needs an int 'id'";
+            ev->id = (unsigned long long)tid;
+            if (!vio_ev_long(ht, "phase", &b) ||
+                (b != VIO_TOUCH_BEGAN && b != VIO_TOUCH_MOVED && b != VIO_TOUCH_ENDED && b != VIO_TOUCH_CANCELLED)) {
+                return "needs a 'phase' of VIO_TOUCH_BEGAN, _MOVED, _ENDED or _CANCELLED";
+            }
+            if ((b == VIO_TOUCH_BEGAN || b == VIO_TOUCH_MOVED) &&
+                (!vio_ev_double(ht, "x", &ev->x) || !vio_ev_double(ht, "y", &ev->y))) {
+                return "needs numeric 'x' and 'y'";
+            }
+            break;
+        }
+        case VIO_INPUT_EV_PAD_CONNECT: {
+            if (!vio_ev_long(ht, "gamepad", &a) || a < 0 || a >= VIO_GAMEPAD_SLOTS) return "needs a 'gamepad' slot between 0 and 15";
+            zval *name = zend_hash_str_find(ht, "name", sizeof("name") - 1);
+            if (name) {
+                if (Z_TYPE_P(name) != IS_STRING) return "'name' must be a string";
+                ev->name = zend_string_copy(Z_STR_P(name));
+            }
+            break;
+        }
+        case VIO_INPUT_EV_PAD_DISCONNECT:
+            if (!vio_ev_long(ht, "gamepad", &a) || a < 0 || a >= VIO_GAMEPAD_SLOTS) return "needs a 'gamepad' slot between 0 and 15";
+            break;
+        case VIO_INPUT_EV_PAD_BUTTON: {
+            if (!vio_ev_long(ht, "gamepad", &a) || a < 0 || a >= VIO_GAMEPAD_SLOTS) return "needs a 'gamepad' slot between 0 and 15";
+            if (!vio_ev_long(ht, "button", &b) || b < 0 || b >= VIO_GAMEPAD_BUTTON_COUNT) return "needs a VIO_GAMEPAD_* 'button'";
+            zval *pressed = zend_hash_str_find(ht, "pressed", sizeof("pressed") - 1);
+            if (!pressed || (Z_TYPE_P(pressed) != IS_TRUE && Z_TYPE_P(pressed) != IS_FALSE && Z_TYPE_P(pressed) != IS_LONG)) {
+                return "needs a bool 'pressed'";
+            }
+            c = zend_is_true(pressed);
+            break;
+        }
+        case VIO_INPUT_EV_PAD_AXIS:
+            if (!vio_ev_long(ht, "gamepad", &a) || a < 0 || a >= VIO_GAMEPAD_SLOTS) return "needs a 'gamepad' slot between 0 and 15";
+            if (!vio_ev_long(ht, "axis", &b) || b < 0 || b >= VIO_GAMEPAD_AXIS_COUNT) return "needs a VIO_GAMEPAD_AXIS_* 'axis'";
+            if (!vio_ev_double(ht, "value", &ev->x)) return "needs a numeric 'value'";
+            break;
+        case VIO_INPUT_EV_END:
+            break;
+        default:
+            return "has an unknown 'type'";
+    }
+    ev->a = (int)a;
+    ev->b = (int)b;
+    ev->c = (int)c;
+    return NULL;
+}
+
+ZEND_FUNCTION(vio_input_record_start)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_input_record_start(&Z_VIO_CONTEXT_P(ctx_zval)->input);
+}
+
+ZEND_FUNCTION(vio_input_record_stop)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_input_event_list list;
+    vio_input_record_stop(&Z_VIO_CONTEXT_P(ctx_zval)->input, &list);
+
+    array_init_size(return_value, (uint32_t)list.count);
+    for (size_t i = 0; i < list.count; i++) {
+        zval entry;
+        vio_input_event_to_array(&list.items[i], &entry);
+        add_next_index_zval(return_value, &entry);
+    }
+    vio_input_event_list_free(&list);
+}
+
+ZEND_FUNCTION(vio_input_replay)
+{
+    zval *ctx_zval;
+    HashTable *events;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(events)
+    ZEND_PARSE_PARAMETERS_END();
+
+    /* Parse everything before touching the context: a bad entry must not
+     * leave a half-started replay behind. */
+    vio_input_event_list list = {0};
+    uint32_t idx = 0;
+    zval *entry;
+    ZEND_HASH_FOREACH_VAL(events, entry) {
+        vio_input_event ev;
+        const char *err = vio_input_event_from_array(entry, &ev);
+        if (err) {
+            if (ev.name) zend_string_release(ev.name);
+            vio_input_event_list_free(&list);
+            zend_argument_value_error(2, "entry %u %s", idx, err);
+            RETURN_THROWS();
+        }
+        vio_input_event_list_push(&list, &ev);
+        idx++;
+    } ZEND_HASH_FOREACH_END();
+
+    vio_input_replay_start(&Z_VIO_CONTEXT_P(ctx_zval)->input, &list);
+    vio_input_event_list_free(&list);
+}
+
+ZEND_FUNCTION(vio_input_replay_stop)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_input_replay_stop(&Z_VIO_CONTEXT_P(ctx_zval)->input);
+}
+
+ZEND_FUNCTION(vio_input_replaying)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    RETURN_BOOL(Z_VIO_CONTEXT_P(ctx_zval)->input.replaying);
+}
 
 /* ── Headless / Screenshot functions ──────────────────────────────── */
 
@@ -7279,13 +7666,17 @@ ZEND_FUNCTION(vio_gamepads)
 
     array_init(return_value);
 
+    for (int jid = 0; jid < VIO_GAMEPAD_SLOTS; jid++) {
+        if (vio_virtual_gamepad_get(jid)) {
+            add_next_index_long(return_value, jid);
+            continue;
+        }
 #ifdef HAVE_GLFW
-    for (int jid = GLFW_JOYSTICK_1; jid <= GLFW_JOYSTICK_LAST; jid++) {
-        if (glfwJoystickPresent(jid)) {
+        if (!vio_gamepad_physical_hidden() && glfwJoystickPresent(jid)) {
             add_next_index_long(return_value, jid);
         }
-    }
 #endif
+    }
 }
 
 ZEND_FUNCTION(vio_gamepad_connected)
@@ -7296,8 +7687,11 @@ ZEND_FUNCTION(vio_gamepad_connected)
         Z_PARAM_LONG(id)
     ZEND_PARSE_PARAMETERS_END();
 
+    if (id >= 0 && id < VIO_GAMEPAD_SLOTS && vio_virtual_gamepad_get((int)id)) {
+        RETURN_TRUE;
+    }
 #ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST) {
+    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
         RETURN_BOOL(glfwJoystickPresent((int)id));
     }
 #endif
@@ -7312,8 +7706,12 @@ ZEND_FUNCTION(vio_gamepad_name)
         Z_PARAM_LONG(id)
     ZEND_PARSE_PARAMETERS_END();
 
+    const vio_gamepad_snapshot *vpad = (id >= 0 && id < VIO_GAMEPAD_SLOTS) ? vio_virtual_gamepad_get((int)id) : NULL;
+    if (vpad) {
+        RETURN_STRING(vpad->name);
+    }
 #ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && glfwJoystickPresent((int)id)) {
+    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden() && glfwJoystickPresent((int)id)) {
         const char *name = glfwJoystickIsGamepad((int)id)
             ? glfwGetGamepadName((int)id)
             : glfwGetJoystickName((int)id);
@@ -7335,8 +7733,15 @@ ZEND_FUNCTION(vio_gamepad_buttons)
 
     array_init(return_value);
 
+    const vio_gamepad_snapshot *vpad = (id >= 0 && id < VIO_GAMEPAD_SLOTS) ? vio_virtual_gamepad_get((int)id) : NULL;
+    if (vpad) {
+        for (int i = 0; i < VIO_GAMEPAD_BUTTON_COUNT; i++) {
+            add_index_bool(return_value, i, vpad->buttons[i]);
+        }
+        return;
+    }
 #ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST) {
+    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
         GLFWgamepadstate state;
         if (glfwGetGamepadState((int)id, &state)) {
             for (int i = 0; i <= GLFW_GAMEPAD_BUTTON_LAST; i++) {
@@ -7366,8 +7771,15 @@ ZEND_FUNCTION(vio_gamepad_axes)
 
     array_init(return_value);
 
+    const vio_gamepad_snapshot *vpad = (id >= 0 && id < VIO_GAMEPAD_SLOTS) ? vio_virtual_gamepad_get((int)id) : NULL;
+    if (vpad) {
+        for (int i = 0; i < VIO_GAMEPAD_AXIS_COUNT; i++) {
+            add_index_double(return_value, i, (double)vpad->axes[i]);
+        }
+        return;
+    }
 #ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST) {
+    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
         GLFWgamepadstate state;
         if (glfwGetGamepadState((int)id, &state)) {
             for (int i = 0; i <= GLFW_GAMEPAD_AXIS_LAST; i++) {
@@ -7397,8 +7809,14 @@ ZEND_FUNCTION(vio_gamepad_triggers)
 
     array_init(return_value);
 
+    const vio_gamepad_snapshot *vpad = (id >= 0 && id < VIO_GAMEPAD_SLOTS) ? vio_virtual_gamepad_get((int)id) : NULL;
+    if (vpad) {
+        add_assoc_double(return_value, "left", (double)vpad->axes[VIO_GAMEPAD_AXIS_LEFT_TRIGGER]);
+        add_assoc_double(return_value, "right", (double)vpad->axes[VIO_GAMEPAD_AXIS_RIGHT_TRIGGER]);
+        return;
+    }
 #ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST) {
+    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
         GLFWgamepadstate state;
         if (glfwGetGamepadState((int)id, &state)) {
             add_assoc_double(return_value, "left", (double)state.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER]);
@@ -9916,6 +10334,9 @@ PHP_RINIT_FUNCTION(vio)
 
 PHP_RSHUTDOWN_FUNCTION(vio)
 {
+    /* Virtual gamepads are process-global; a request must not leave one
+     * behind for the next (FPM, long-running workers). */
+    vio_virtual_gamepads_reset();
     return SUCCESS;
 }
 

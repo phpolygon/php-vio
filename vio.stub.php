@@ -878,6 +878,103 @@ function vio_inject_scroll(VioContext $context, float $dx, float $dy): void {}
 function vio_inject_char(VioContext $context, int|string $input): int {}
 
 /**
+ * Connect a virtual gamepad in slot $id (0-15), or reset the one already there.
+ *
+ * Gamepads are process-wide, like the vio_gamepad_* readers. While a virtual
+ * pad occupies a slot it replaces the physical joystick with that id for every
+ * reader: vio_gamepads(), _connected(), _name(), _buttons(), _axes() and
+ * _triggers(). It starts with every button released, the sticks centred and the
+ * triggers at -1.0 (released, GLFW convention). Virtual pads end with the request.
+ */
+function vio_virtual_gamepad_connect(int $id, string $name = "Virtual Gamepad"): void {}
+
+/**
+ * Disconnect the virtual gamepad in slot $id; a physical one with that id shows again.
+ */
+function vio_virtual_gamepad_disconnect(int $id): void {}
+
+/**
+ * Press or release a button of a virtual gamepad.
+ *
+ * @param int $button VIO_GAMEPAD_* constant
+ * @param int $action VIO_PRESS or VIO_RELEASE (VIO_REPEAT counts as pressed)
+ * @throws Error when no virtual gamepad is connected in slot $id
+ */
+function vio_inject_gamepad_button(int $id, int $button, int $action): void {}
+
+/**
+ * Set an axis of a virtual gamepad. The value is clamped to [-1.0, 1.0];
+ * triggers use -1.0 for released and 1.0 for fully pressed.
+ *
+ * @param int $axis VIO_GAMEPAD_AXIS_* constant
+ * @throws Error when no virtual gamepad is connected in slot $id
+ */
+function vio_inject_gamepad_axis(int $id, int $axis, float $value): void {}
+
+/**
+ * Start recording the context's input.
+ *
+ * Records keys (with mods), typed text, cursor, mouse buttons, scroll and touch,
+ * whether it came from the OS or vio_inject_*. Also records gamepads, sampled once
+ * per vio_poll_events: connects, disconnects, button and axis changes. Pads
+ * already connected are recorded at tick 0. Time is counted in ticks, one per
+ * vio_poll_events call since the start. A replay is only as deterministic as the
+ * game loop: poll once per frame and advance the simulation with a fixed step.
+ * Restarting discards the events recorded so far.
+ */
+function vio_input_record_start(VioContext $context): void {}
+
+/**
+ * Stop recording and return the events.
+ *
+ * Every entry is an array with 'tick' and 'type' and the fields of its type:
+ *   key                ['key', 'action', 'mods']
+ *   char               ['codepoint']
+ *   cursor             ['x', 'y']          raw cursor coordinates
+ *   button             ['button', 'action']
+ *   scroll             ['dx', 'dy']
+ *   touch              ['id', 'phase', 'x', 'y']
+ *   gamepad_connect    ['gamepad', 'name']
+ *   gamepad_disconnect ['gamepad']
+ *   gamepad_button     ['gamepad', 'button', 'pressed' (bool)]
+ *   gamepad_axis       ['gamepad', 'axis', 'value']
+ *   end                []                  the tick the recording stopped
+ * The array survives json_encode/json_decode and can be written by hand as a
+ * bot script. Returns [] if nothing was recording.
+ *
+ * @return list<array<string, mixed>>
+ */
+function vio_input_record_stop(VioContext $context): array {}
+
+/**
+ * Replay recorded or scripted input.
+ *
+ * Takes the format of vio_input_record_stop(). Entries are sorted by tick; entries
+ * with the same tick keep their order. 'mods' is optional, and so are the
+ * coordinates of an ended or cancelled touch. Tick-0 events are delivered
+ * immediately. Tick N events are delivered in the Nth vio_poll_events call from
+ * here, after the OS events, through the same path as real input (callbacks
+ * fire). The replay owns the input while it runs: OS keyboard/mouse events are
+ * dropped and physical gamepads are hidden. Gamepad events drive virtual pads,
+ * which are disconnected when the replay ends. The replay ends one poll after its
+ * last event, or with vio_input_replay_stop(). Starting a replay stops a running one.
+ *
+ * @param list<array<string, mixed>> $events
+ * @throws ValueError naming the first malformed entry; nothing is replayed then
+ */
+function vio_input_replay(VioContext $context, array $events): void {}
+
+/**
+ * Stop a running replay early and hand input back to the OS.
+ */
+function vio_input_replay_stop(VioContext $context): void {}
+
+/**
+ * Whether a replay is still running.
+ */
+function vio_input_replaying(VioContext $context): bool {}
+
+/**
  * Read the framebuffer as raw RGBA pixel data.
  *
  * @return string|false RGBA pixel data (width * height * 4 bytes) or false on failure
