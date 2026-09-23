@@ -11,6 +11,7 @@
 
 #include "php.h"
 #include "../include/vio_constants.h"
+#include <stdint.h>
 
 /* Max simultaneous touch points. iPad Pro supports 11; we round up nothing
  * because the slot array is fixed-size and small. Touches beyond this count
@@ -36,6 +37,66 @@ typedef struct _vio_touch {
     double             prev_x, prev_y;
     vio_touch_phase    phase;
 } vio_touch;
+
+/* ── Gamepads ───────────────────────────────────────────────────────
+ *
+ * Gamepads are process-global, like GLFW joysticks: the vio_gamepad_* functions
+ * take no context. A virtual gamepad in slot N overrides the physical joystick N
+ * for every reader until it disconnects. */
+#define VIO_GAMEPAD_SLOTS        16  /* GLFW_JOYSTICK_1 .. GLFW_JOYSTICK_LAST */
+#define VIO_GAMEPAD_BUTTON_COUNT 15  /* VIO_GAMEPAD_A .. VIO_GAMEPAD_DPAD_LEFT */
+#define VIO_GAMEPAD_AXIS_COUNT   6   /* VIO_GAMEPAD_AXIS_LEFT_X .. _RIGHT_TRIGGER */
+
+typedef struct _vio_gamepad_snapshot {
+    int           connected;
+    char          name[64];
+    unsigned char buttons[VIO_GAMEPAD_BUTTON_COUNT];
+    float         axes[VIO_GAMEPAD_AXIS_COUNT];
+} vio_gamepad_snapshot;
+
+/* ── Recorded input events ─────────────────────────────────────────
+ *
+ * Field use per type:
+ *   KEY            a = key, b = action, c = mods
+ *   CHAR           a = codepoint
+ *   CURSOR         x, y = raw cursor position
+ *   BUTTON         a = mouse button, b = action
+ *   SCROLL         x, y = offsets
+ *   TOUCH          id, b = phase, x, y
+ *   PAD_CONNECT    a = gamepad, name
+ *   PAD_DISCONNECT a = gamepad
+ *   PAD_BUTTON     a = gamepad, b = button, c = pressed
+ *   PAD_AXIS       a = gamepad, b = axis, x = value
+ *   END            marks the length of a recording
+ * tick counts vio_poll_events calls since the recording started. */
+typedef enum {
+    VIO_INPUT_EV_KEY = 1,
+    VIO_INPUT_EV_CHAR,
+    VIO_INPUT_EV_CURSOR,
+    VIO_INPUT_EV_BUTTON,
+    VIO_INPUT_EV_SCROLL,
+    VIO_INPUT_EV_TOUCH,
+    VIO_INPUT_EV_PAD_CONNECT,
+    VIO_INPUT_EV_PAD_DISCONNECT,
+    VIO_INPUT_EV_PAD_BUTTON,
+    VIO_INPUT_EV_PAD_AXIS,
+    VIO_INPUT_EV_END,
+} vio_input_event_type;
+
+typedef struct _vio_input_event {
+    uint32_t           tick;
+    int                type;
+    int                a, b, c;
+    unsigned long long id;
+    double             x, y;
+    zend_string       *name; /* owned, PAD_CONNECT only */
+} vio_input_event;
+
+typedef struct _vio_input_event_list {
+    vio_input_event *items;
+    size_t           count;
+    size_t           cap;
+} vio_input_event_list;
 
 typedef struct _vio_input_state {
     int    keys[VIO_KEY_LAST + 1];
@@ -66,6 +127,20 @@ typedef struct _vio_input_state {
      * or look up by id. */
     vio_touch touches[VIO_MAX_TOUCHES];
     int       touch_count; /* number of slots currently in use (id != 0) */
+
+    /* Record/replay clock: incremented once per vio_poll_events. */
+    uint32_t poll_tick;
+
+    int                  recording;
+    uint32_t             record_base;
+    vio_input_event_list record;
+    vio_gamepad_snapshot record_pads[VIO_GAMEPAD_SLOTS]; /* last recorded pad state */
+
+    int                  replaying;
+    uint32_t             replay_base;
+    size_t               replay_pos;
+    vio_input_event_list replay;
+    unsigned int         replay_pads; /* bitmask of virtual pads the replay connected */
 } vio_input_state;
 
 /* Swap previous/current state (call at start of each frame) */
@@ -119,6 +194,53 @@ int  vio_input_take_ime_backspaces(vio_input_state *state);
 /* Emit one typed codepoint into the per-frame char buffer + on_char callback.
  * Shared by the GLFW char callback and the iOS IME drain. PHP/render thread. */
 void vio_input_emit_char(vio_input_state *state, unsigned int codepoint);
+
+/* Event funnels shared by the GLFW callbacks and vio_inject_*: an injected
+ * event takes the same path as a real one. key_event fires the on_key callback.
+ * Coordinates are in the raw cursor space GLFW reports. PHP/render thread. */
+void vio_input_key_event(vio_input_state *state, int key, int action, int mods);
+void vio_input_cursor_event(vio_input_state *state, double x, double y);
+void vio_input_button_event(vio_input_state *state, int button, int action);
+void vio_input_scroll_event(vio_input_state *state, double dx, double dy);
+
+/* ── Virtual gamepads (process-global) ─────────────────────────────── */
+
+/* The virtual pad in slot id, or NULL when none is connected there. */
+const vio_gamepad_snapshot *vio_virtual_gamepad_get(int id);
+/* Connect (or reset) a virtual pad: buttons released, sticks centred,
+ * triggers at -1.0 (released, GLFW convention). */
+void vio_virtual_gamepad_connect(int id, const char *name);
+void vio_virtual_gamepad_disconnect(int id);
+/* Return 0 when no virtual pad is connected at id. value is clamped to [-1, 1]. */
+int  vio_virtual_gamepad_set_button(int id, int button, int pressed);
+int  vio_virtual_gamepad_set_axis(int id, int axis, double value);
+/* Disconnect every virtual pad and unhide physical ones (request shutdown). */
+void vio_virtual_gamepads_reset(void);
+/* Non-zero while a replay runs: physical joysticks are hidden so a human's
+ * controller cannot disturb a replayed run. */
+int  vio_gamepad_physical_hidden(void);
+/* Effective gamepad-layout state of slot id (virtual pad, else physical
+ * mapped gamepad). Returns out->connected. */
+int  vio_gamepad_read(int id, vio_gamepad_snapshot *out);
+
+/* ── Record / replay ───────────────────────────────────────────────── */
+
+void vio_input_event_list_free(vio_input_event_list *list);
+/* Copies ev; takes ownership of ev->name. Returns 0 on overflow. */
+int  vio_input_event_list_push(vio_input_event_list *list, const vio_input_event *ev);
+
+/* Brackets vio_poll_events: poll_begin advances the tick, poll_end delivers
+ * due replay events and samples gamepads for a running recording. */
+void vio_input_poll_begin(vio_input_state *state);
+void vio_input_poll_end(vio_input_state *state);
+
+void vio_input_record_start(vio_input_state *state);
+/* Ends the recording, appends an END marker and moves the events into out. */
+void vio_input_record_stop(vio_input_state *state, vio_input_event_list *out);
+/* Takes ownership of events (sorted by tick, stable) and delivers the tick-0
+ * ones immediately. Stops a running replay first. */
+void vio_input_replay_start(vio_input_state *state, vio_input_event_list *events);
+void vio_input_replay_stop(vio_input_state *state);
 
 #ifdef HAVE_GLFW
 #define GLFW_INCLUDE_NONE

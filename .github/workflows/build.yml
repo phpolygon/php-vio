@@ -478,7 +478,11 @@ jobs:
             tests/render3d/124_mrt_formats_texture_mips_all_backends.phpt `
             tests/render3d/125_compute_buffer_writable_rebind_update_all_backends.phpt `
             tests/render3d/126_compute_async_params_snapshot_all_backends.phpt `
-            tests/render2d/127_text_bitmap_font_face.phpt
+            tests/render2d/127_text_bitmap_font_face.phpt `
+            tests/input/131_inject_event_path.phpt `
+            tests/input/132_virtual_gamepad.phpt `
+            tests/input/133_input_record_replay.phpt `
+            tests/input/134_replay_drops_os_input_win32.phpt
 
       - name: Package binary
         shell: pwsh
