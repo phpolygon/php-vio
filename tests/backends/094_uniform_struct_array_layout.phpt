@@ -23,9 +23,10 @@ foreach (['auto', 'metal', 'opengl'] as $__b) {
     if ($__c) { vio_destroy($__c); $__ok = true; break; }
 }
 if (!$__ok) die('skip no headless GPU context available');
-/* The Metal path needs the SPIRV-Cross fix from deps-patches/ (upstream PR
- * KhronosGroup/SPIRV-Cross#2678). CI builds against the unpatched Homebrew
- * formula and sets this to skip until the fix ships. */
+/* The Metal path needs the SPIRV-Cross struct-array stride fix
+ * (KhronosGroup/SPIRV-Cross#2678, merged as 94d59e5). No vulkan-sdk-* tag, and
+ * therefore no Homebrew formula, contains it yet; macOS CI builds against
+ * Homebrew and sets this to skip until one does. */
 if (getenv('VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST')) die('skip SPIRV-Cross without the struct-array stride fix (VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST)');
 ?>
 --FILE--
