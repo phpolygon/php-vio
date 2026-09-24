@@ -14,17 +14,22 @@ für die PHPolygon Game Engine. Aktuell **v2.8.0**, 134 PHP-Funktionen, 13 Zend-
 
 Herd bringt PHP 8.2/8.4/8.5 als Binaries mit, aber **kein `phpize`/`php-config`** —
 der Build braucht die passende Homebrew-Formel (`php` = 8.5, API 20250925 wie Herd
-`php85`; `php@8.4` = API 20240924 wie Herd `php84`). SPIRV-Cross hat **keine
-Homebrew-Formel** und wird aus `.deps/SPIRV-Cross` per cmake nach `/opt/homebrew`
-installiert (Rezept in `Makefile.macos`, untracked).
+`php85`; `php@8.4` = API 20240924 wie Herd `php84`). SPIRV-Cross wird lokal aus
+`.deps/SPIRV-Cross` per cmake nach `/opt/homebrew` installiert (Rezept in
+`Makefile.macos`, untracked) — die Homebrew-Formel `spirv-cross` (nutzt die CI) hat den
+Fix unten noch nicht.
 
-**SPIRV-Cross braucht den Patch `deps-patches/spirv-cross-msl-struct-array-stride.patch`**
-(Basis-Commit in `deps-patches/spirv-cross-base-commit.txt`, upstream `main` Stand
-2026-09-07). Ohne ihn legt der MSL-Backend Struct-Arrays im Default-Uniform-Block
-(`uniform SpotLight u_spot_lights[4]` — std140-Stride 64, gepackte MSL-Größe 52) mit
-falschem Element-Stride oder 48 Byte zu viel Padding an; **alle Uniforms hinter dem
-Array werden auf Metal verschoben gelesen**. Regression: `tests/backends/094`.
-Anwenden: `git -C .deps/SPIRV-Cross apply ../../deps-patches/spirv-cross-msl-struct-array-stride.patch`.
+**SPIRV-Cross braucht den MSL-Struct-Array-Stride-Fix** (KhronosGroup/SPIRV-Cross#2678,
+gemerged 2026-09-16 als `94d59e5`). Ohne ihn legt der MSL-Backend Struct-Arrays im
+Default-Uniform-Block (`uniform SpotLight u_spot_lights[4]` — std140-Stride 64, gepackte
+MSL-Größe 52) mit falschem Element-Stride oder 48 Byte zu viel Padding an; **alle Uniforms
+hinter dem Array werden auf Metal verschoben gelesen**. Regression: `tests/backends/094`.
+Lokal: `.deps/SPIRV-Cross` auf Upstream-`main` ≥ `94d59e5` ziehen
+(`git -C .deps/SPIRV-Cross fetch && git -C .deps/SPIRV-Cross checkout origin/main`) — dann
+entfällt der Patch. Der Patch `deps-patches/spirv-cross-msl-struct-array-stride.patch`
+(Basis-Commit in `deps-patches/spirv-cross-base-commit.txt`) ist code-identisch mit dem
+gemergten Stand und bleibt nur für einen älteren Checkout:
+`git -C .deps/SPIRV-Cross apply ../../deps-patches/spirv-cross-msl-struct-array-stride.patch`.
 
 ```bash
 brew install php glfw glslang ffmpeg harfbuzz vulkan-loader vulkan-headers molten-vk cmake
@@ -952,10 +957,16 @@ Aufrufer geändert hat:
   `099` hält die Zahl der Backend-Zweige darin auf dem heutigen Stand oder darunter.
 - SPIRV-Cross hat keine Homebrew-Formel; ohne `--with-spirv-cross` kann Metal kein
   GLSL→MSL übersetzen und jeder Shader scheitert (`Makefile.macos` baut es aus `.deps/`).
-- Ungepatchtes SPIRV-Cross (auch Homebrew/CI) hat den Struct-Array-Stride-Bug im
-  MSL-Backend (siehe Build → `deps-patches/`); Test 094 schlägt dort fehl. Upstream-PR:
-  KhronosGroup/SPIRV-Cross#2678. Bis zum Merge setzen die macOS-CI-Jobs
-  `VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST=1` (Test 094 skippt) — nach dem Merge Env + SKIPIF entfernen.
+- SPIRV-Cross vor `94d59e5` hat den Struct-Array-Stride-Bug im MSL-Backend (siehe Build);
+  Test 094 schlägt dort fehl. Der Fix (KhronosGroup/SPIRV-Cross#2678) ist seit 2026-09-16
+  in Upstream-`main`, aber noch in **keinem** `vulkan-sdk-*`-Tag (neuester: `1.4.357.0`
+  vom 2026-07-06) und damit nicht in Homebrew `spirv-cross` (1.4.357.0). Bis ein SDK-Tag
+  mit dem Fix erscheint und Homebrew nachzieht, setzen die macOS-CI-Jobs
+  `VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST=1` (Test 094 skippt). Danach Env in `build.yml`, SKIPIF
+  in 094 und `deps-patches/` entfernen. Prüfen:
+  `gh api repos/KhronosGroup/SPIRV-Cross/compare/94d59e5...vulkan-sdk-<neu> --jq .status`
+  muss `ahead` oder `identical` liefern. Windows (Vulkan SDK 1.3.296.0) betrifft das
+  nicht: 094 prüft den Metal-Pfad.
 - Text-Shaping braucht HarfBuzz (`--with-harfbuzz`); ohne es rendern Arabisch/
   Thai/Ligaturen nicht (`VIO_HAS_SHAPING == 0`, Legacy-Codepoint-Pfad). Der
   vcpkg-HarfBuzz (`harfbuzz[core,freetype]`) ist dynamisch — `harfbuzz.dll` +
