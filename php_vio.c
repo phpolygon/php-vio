@@ -3086,6 +3086,13 @@ ZEND_FUNCTION(vio_pipeline)
     if (shader->has_tessellation && pipe->topology != VIO_PATCHES) {
         pipe->topology = VIO_PATCHES;
     }
+    /* Patches without a tessellation stage are invalid on every API (GL
+     * INVALID_OPERATION, Vulkan / D3D12 reject the pipeline); refuse up front. */
+    if (pipe->topology == VIO_PATCHES && !shader->has_tessellation) {
+        php_error_docref(NULL, E_WARNING, "vio_pipeline: VIO_PATCHES needs a shader with 'tess_control' and 'tess_eval' stages");
+        zval_ptr_dtor(&pipe_zval);
+        RETURN_FALSE;
+    }
     if ((val = zend_hash_str_find(config_ht, "cull_mode", sizeof("cull_mode") - 1)) != NULL) {
         pipe->cull_mode = (vio_cull_mode)zval_get_long(val);
     }

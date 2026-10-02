@@ -1748,11 +1748,11 @@ static void opengl_draw_indirect(void *mesh_obj, void *args_buffer, int max_draw
     if (mesh->index_count > 0) {
         GLenum type = mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
         for (int i = 0; i < max_draws; i++) {
-            glDrawElementsIndirect(GL_TRIANGLES, type, (const void *)(uintptr_t)(offset + (size_t)i * 20));
+            glDrawElementsIndirect(gl_draw_mode(), type, (const void *)(uintptr_t)(offset + (size_t)i * 20));
         }
     } else {
         for (int i = 0; i < max_draws; i++) {
-            glDrawArraysIndirect(GL_TRIANGLES, (const void *)(uintptr_t)(offset + (size_t)i * 16));
+            glDrawArraysIndirect(gl_draw_mode(), (const void *)(uintptr_t)(offset + (size_t)i * 16));
         }
     }
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
