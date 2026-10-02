@@ -4983,11 +4983,13 @@ ZEND_FUNCTION(vio_submit_batch)
         return;
     }
 
-    /* Last backend pipeline bound BY this batch, so a sorted batch re-binds the
+    /* Last pipeline object bound BY this batch, so a sorted batch re-binds the
      * PSO only on a real change. NULL = none bound here yet (the caller may have
      * bound one before the batch — the opaque pass binds once, then its records
-     * omit 'pipeline' entirely). */
-    void *last_pipeline = NULL;
+     * omit 'pipeline' entirely). Keyed on the VioPipeline, not on
+     * backend_pipeline: OpenGL has no backend pipeline (NULL), so comparing
+     * that never bound a record's pipeline there. */
+    vio_pipeline_object *last_pipeline = NULL;
 
     zval *rec;
     ZEND_HASH_FOREACH_VAL(draws, rec) {
@@ -5004,7 +5006,7 @@ ZEND_FUNCTION(vio_submit_batch)
         if (pz && Z_TYPE_P(pz) == IS_OBJECT &&
             instanceof_function(Z_OBJCE_P(pz), vio_pipeline_ce)) {
             vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pz);
-            if (pipe->valid && pipe->backend_pipeline != last_pipeline) {
+            if (pipe->valid && pipe != last_pipeline) {
                 ctx->bound_shader_program = pipe->shader_program;
                 ctx->bound_shader_object = pipe->shader_ref;
                 if (ctx->backend->bind_pipeline_state) {
@@ -5012,7 +5014,7 @@ ZEND_FUNCTION(vio_submit_batch)
                 } else if (pipe->backend_pipeline && ctx->backend->bind_pipeline) {
                     ctx->backend->bind_pipeline(pipe->backend_pipeline);
                 }
-                last_pipeline = pipe->backend_pipeline;
+                last_pipeline = pipe;
             }
         }
 
