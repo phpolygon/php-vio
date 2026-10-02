@@ -347,6 +347,12 @@ static int create_logical_device(void)
          * multi-draw indirect when available (both have fallbacks). */
         if (avail.independentBlend)  { features.independentBlend = VK_TRUE;  vio_vk.independent_blend = 1; }
         if (avail.multiDrawIndirect) { features.multiDrawIndirect = VK_TRUE; vio_vk.multi_draw_indirect = 1; }
+        /* Optional shader stages (vio_shader 'geometry' / 'tess_control' +
+         * 'tess_eval'); PointSize in those stages when the device allows it. */
+        vio_vk.geometry_supported = vio_vk.tessellation_supported = 0;
+        if (avail.geometryShader)     { features.geometryShader = VK_TRUE;     vio_vk.geometry_supported = 1; }
+        if (avail.tessellationShader) { features.tessellationShader = VK_TRUE; vio_vk.tessellation_supported = 1; }
+        if (avail.shaderTessellationAndGeometryPointSize) features.shaderTessellationAndGeometryPointSize = VK_TRUE;
         vio_vk.bc_supported = 0;
         if (avail.textureCompressionBC) { features.textureCompressionBC = VK_TRUE; vio_vk.bc_supported = 1; }   /* Block 10c */
     }
@@ -2977,8 +2983,10 @@ static int vulkan_supports_feature(vio_feature feature)
 {
     switch (feature) {
         case VIO_FEATURE_COMPUTE:      return 1;
-        case VIO_FEATURE_TESSELLATION: return 0;
-        case VIO_FEATURE_GEOMETRY:     return 0;
+        /* Native SPIR-V stages: no transpiler limitation as on D3D, only the
+         * device features (every desktop GPU; MoltenVK lacks geometry). */
+        case VIO_FEATURE_TESSELLATION: return vio_vk3d_available() && vio_vk.device && vio_vk.tessellation_supported;
+        case VIO_FEATURE_GEOMETRY:     return vio_vk3d_available() && vio_vk.device && vio_vk.geometry_supported;
         case VIO_FEATURE_3D_PIPELINE:  return vio_vk3d_available(); /* GAP-PHASE5 Block 10 */
         case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
         case VIO_FEATURE_MULTIVIEW:    return 0; /* VK_KHR_multiview not wired */
@@ -3035,6 +3043,7 @@ static const vio_backend vulkan_backend = {
     .set_viewport      = vio_vk3d_set_viewport,
     .bind_texture      = vio_vk3d_bind_texture,
     .push_cbuffers     = vio_vk3d_push_cbuffers,
+    .bind_stage_constants = vio_vk3d_bind_stage_constants,
     .draw_mesh_instanced = vio_vk3d_draw_mesh_instanced,
     .bind_storage_buffer = vio_vk3d_bind_storage_buffer,
     .draw_instanced_from_storage = vio_vk3d_draw_instanced_from_storage,

@@ -249,6 +249,8 @@ typedef struct _vio_vulkan_state {
     int                      depth_has_stencil;    /* depth attachments carry 8 stencil bits */
     int                      multi_draw_indirect;  /* device feature enabled */
     int                      independent_blend;    /* device feature enabled */
+    int                      geometry_supported;   /* geometryShader enabled (vio_shader 'geometry') */
+    int                      tessellation_supported; /* tessellationShader enabled */
     /* Block 10c: textureCompressionBC, VK_KHR_fragment_shading_rate (pipeline rate). */
     int                      instance_api_11;      /* instance created with apiVersion 1.1 */
     int                      bc_supported;
@@ -463,6 +465,7 @@ void *vio_vk3d_create_pipeline(vio_pipeline_desc *desc);
 void  vio_vk3d_destroy_pipeline(void *pipeline);
 void  vio_vk3d_bind_pipeline(void *pipeline);
 void  vio_vk3d_push_cbuffers(const void *vs_data, int vs_size, const void *fs_data, int fs_size);
+void  vio_vk3d_bind_stage_constants(int stage, void *backend_buffer, const void *data, size_t size);
 void  vio_vk3d_bind_texture(void *texture, int slot);
 void  vio_vk3d_set_viewport(int x, int y, int width, int height);
 void  vio_vk3d_draw(vio_draw_cmd *cmd);

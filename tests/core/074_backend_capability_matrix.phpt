@@ -147,7 +147,8 @@ probe_fold("d3d12", $d3d_common + [
 /* Vulkan: 3D pipeline since GAP-PHASE5 Block 10 (SPIR-V round trip, frame upload
  * ring, HDR / depth targets); MRT, MSAA and cube targets, cubemaps and mip
  * generation since Block 10b; texture arrays / BC since 10c. SHADING_RATE depends on the
- * device (VK_KHR_fragment_shading_rate) and is exercised by test 122 instead. */
+ * device (VK_KHR_fragment_shading_rate) and is exercised by test 122 instead; the
+ * geometry / tessellation stages likewise (109, 110, 135). */
 probe_fold("vulkan", [
     VIO_FEATURE_3D_PIPELINE        => 1,   /* GAP-PHASE5 10 */
     VIO_FEATURE_STENCIL            => 1,   /* D32S8 / D24S8 attachments */
@@ -164,8 +165,9 @@ probe_fold("vulkan", [
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1,   /* textureCompressionBC (every desktop GPU) */
     VIO_FEATURE_INSTANCED_DRAW     => 1,
     VIO_FEATURE_DEPTH_BIAS         => 1,
-    VIO_FEATURE_TESSELLATION       => 0,
-    VIO_FEATURE_GEOMETRY           => 0,
+    /* TESSELLATION / GEOMETRY follow the device features geometryShader /
+     * tessellationShader (MoltenVK has no geometry stage) and are therefore not
+     * pinned; tests/render3d/109, 110 and 135 are the contract. */
     VIO_FEATURE_VERTEX_STORAGE     => 1,
     VIO_FEATURE_COMPUTE            => 1,
     VIO_FEATURE_READ_PIXELS        => 1,
