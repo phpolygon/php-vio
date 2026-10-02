@@ -1902,18 +1902,11 @@ static ID3DBlob *d3d11_compile_stage_blob(const void *data, size_t size, int sta
         hlsl = (const char *)data;
     }
 
-    ID3DBlob *blob = NULL, *error_blob = NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), label, NULL, NULL, "main", profile,
-                            compile_flags, 0, &blob, &error_blob);
+    /* Same compile path as VS / PS, including the on-disk DXBC cache. */
+    ID3DBlob *blob = NULL;
+    HRESULT hr = d3d11_compile_cached(hlsl, label, profile, compile_flags, &blob);
     if (allocated) free(allocated);
-    if (FAILED(hr)) {
-        php_error_docref(NULL, E_WARNING, "D3D11: %s compile failed: %s", label,
-                         error_blob ? (char *)ID3D10Blob_GetBufferPointer(error_blob) : "unknown");
-        if (error_blob) ID3D10Blob_Release(error_blob);
-        return NULL;
-    }
-    if (error_blob) ID3D10Blob_Release(error_blob);
-    return blob;
+    return SUCCEEDED(hr) ? blob : NULL;
 }
 
 static void *d3d11_compile_shader(vio_shader_desc *desc)
