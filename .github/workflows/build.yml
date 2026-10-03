@@ -503,7 +503,8 @@ jobs:
             tests/render3d/136_layered_render_targets_all_backends.phpt `
             tests/render3d/137_layered_rendering_all_backends.phpt `
             tests/render3d/138_multi_viewport_all_backends.phpt `
-            tests/render3d/139_gs_instancing_adjacency_all_backends.phpt
+            tests/render3d/139_gs_instancing_adjacency_all_backends.phpt `
+            tests/render3d/140_hlsl_stage_override_all_backends.phpt
 
       - name: Package binary
         shell: pwsh

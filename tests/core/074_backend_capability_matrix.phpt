@@ -81,6 +81,8 @@ probe("null", [
     VIO_FEATURE_LAYERED_RENDER     => 0,   /* device / extension dependent elsewhere: test 137 is the contract */
     VIO_FEATURE_VERTEX_LAYER       => 0,
     VIO_FEATURE_MULTI_VIEWPORT     => 0,
+    VIO_FEATURE_GEOMETRY_INSTANCING => 0,
+    VIO_FEATURE_HLSL_STAGE_OVERRIDE => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -131,6 +133,7 @@ $d3d_common = [
     VIO_FEATURE_INDIRECT_DRAW      => 1,   /* ExecuteIndirect / Draw*Indirect (GAP-PHASE5 8) */
     VIO_FEATURE_TEXTURE_ARRAY      => 1,   /* Texture2D arrays (GAP-PHASE5 9) */
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1, /* BC1-BC7 (GAP-PHASE5 9) */
+    VIO_FEATURE_HLSL_STAGE_OVERRIDE => 1, /* 'hlsl' => [stage => src] (GEOMETRY-STAGES-PLAN 3) */
     VIO_FEATURE_RENDER_TARGET_LAYERED => 1, /* RTV / DSV per array slice (GEOMETRY-STAGES-PLAN 1a) */
     /* TESSELLATION / GEOMETRY are not pinned for D3D: the GPU side always has
      * the stages, but the flag also requires a SPIRV-Cross that can emit HLSL
