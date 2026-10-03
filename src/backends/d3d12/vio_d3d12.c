@@ -41,6 +41,9 @@ int  vio_dxc_compile(const char *hlsl, const char *entry, const char *profile, i
                      void **out_bytes, size_t *out_len, char **out_error);
 #include "../../vio_shader_reflect.h"   /* vio_spirv_reflect — data-driven compute register mapping */
 #include "../../vio_shader_compiler.h"  /* vio_compile_glsl_stage_to_spirv — geometry / tessellation stages */
+#include "../../vio_tess_hlsl.h"
+
+static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, const char *profile, UINT flags, ID3DBlob **out);
 #include "../../vio_texture.h"          /* vio_texture_object — storage-image binds */
 #include <string.h>
 #include <stdlib.h>
@@ -1682,9 +1685,22 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
         pso_desc.GS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->gs_blob);
         pso_desc.GS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->gs_blob);
     }
-    if (shader->hs_blob) {
-        pso_desc.HS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->hs_blob);
-        pso_desc.HS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->hs_blob);
+    /* The hull shader's InputPatch size has to match the draw's patch size;
+     * vio_shader built it for layout(vertices = N), other sizes get a variant. */
+    if (shader->tess_tcs && desc->patch_vertices > 0 && (uint32_t)desc->patch_vertices != shader->hs_input_points) {
+        vio_tess_hlsl_desc td = { shader->tess_tcs, shader->tess_tcs_size, shader->tess_tes, shader->tess_tes_size,
+                                  (uint32_t)desc->patch_vertices, 51, 0 };
+        char *err = NULL;
+        char *hlsl = vio_tess_to_hlsl(VIO_STAGE_TESS_CONTROL, &td, &err);
+        if (!hlsl) php_error_docref(NULL, E_WARNING, "D3D12: hull shader for %d control points: %s", desc->patch_vertices, err ? err : "unknown");
+        else if (FAILED(d3d12_compile_cached(hlsl, "HS", "hs_5_1", shader->compile_flags, &pipeline->hs_variant))) pipeline->hs_variant = NULL;
+        free(hlsl);
+        free(err);
+    }
+    ID3DBlob *hs_blob = pipeline->hs_variant ? pipeline->hs_variant : shader->hs_blob;
+    if (hs_blob) {
+        pso_desc.HS.pShaderBytecode = ID3D10Blob_GetBufferPointer(hs_blob);
+        pso_desc.HS.BytecodeLength = ID3D10Blob_GetBufferSize(hs_blob);
     }
     if (shader->ds_blob) {
         pso_desc.DS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->ds_blob);
@@ -1861,6 +1877,7 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
     }
     if (p->input_elements) free(p->input_elements);
     if (p->sem_names) free(p->sem_names);
+    if (p->hs_variant) ID3D10Blob_Release(p->hs_variant);
     free(p);
 }
 
@@ -4010,6 +4027,25 @@ static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, cons
 
 /* One optional stage (geometry / hull / domain): SPIR-V or GLSL -> HLSL ->
  * DXBC blob, same transpile path selection as the VS / PS code below. */
+/* Hull / domain shader from the GLSL tessellation pair (vio_tess_hlsl.c). */
+static ID3DBlob *d3d12_compile_tess_blob(vio_d3d12_shader *shader, int stage, int fixup_depth,
+                                         const char *profile, const char *label, UINT compile_flags)
+{
+    vio_tess_hlsl_desc td = { shader->tess_tcs, shader->tess_tcs_size, shader->tess_tes, shader->tess_tes_size,
+                              0, 51, fixup_depth };
+    char *err = NULL;
+    char *hlsl = vio_tess_to_hlsl(stage, &td, &err);
+    if (!hlsl) {
+        php_error_docref(NULL, E_WARNING, "D3D12: %s from GLSL: %s", label, err ? err : "unknown");
+        free(err);
+        return NULL;
+    }
+    ID3DBlob *blob = NULL;
+    if (FAILED(d3d12_compile_cached(hlsl, label, profile, compile_flags, &blob))) blob = NULL;
+    free(hlsl);
+    return blob;
+}
+
 static ID3DBlob *d3d12_compile_stage_blob(const void *data, size_t size, int stage, int fixup_depth,
                                           const char *profile, const char *label,
                                           UINT compile_flags, vio_shader_format format,
@@ -4163,6 +4199,28 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
     hr = d3d12_compile_cached(hlsl_ps, "ps_main", "ps_5_1", compile_flags, &shader->ps_blob);
     if (FAILED(hr)) goto fail;
 
+    /* GLSL tessellation without an HLSL override: vio translates both stages
+     * together (vio_tess_hlsl.c) and keeps their SPIR-V for hull shader
+     * variants per patch size (d3d12_create_pipeline). */
+    shader->compile_flags = compile_flags;
+    int tess_generated = desc->tess_control_data && desc->tess_eval_data &&
+        (!desc->tess_control_hlsl || !desc->tess_eval_hlsl) &&
+        (desc->format == VIO_SHADER_GLSL || desc->format == VIO_SHADER_GLSL_RAW || desc->format == VIO_SHADER_AUTO);
+    if (tess_generated) {
+        char *err = NULL;
+        shader->tess_tcs = vio_tess_stage_spirv(desc->tess_control_data, desc->tess_control_size, VIO_STAGE_TESS_CONTROL,
+                                                &shader->tess_tcs_size, &err);
+        if (shader->tess_tcs)
+            shader->tess_tes = vio_tess_stage_spirv(desc->tess_eval_data, desc->tess_eval_size, VIO_STAGE_TESS_EVAL,
+                                                    &shader->tess_tes_size, &err);
+        if (!shader->tess_tes) {
+            php_error_docref(NULL, E_WARNING, "D3D12: tessellation GLSL->SPIR-V failed: %s", err ? err : "unknown");
+            free(err);
+            goto fail;
+        }
+        shader->hs_input_points = vio_tess_output_vertices(shader->tess_tcs, shader->tess_tcs_size);
+    }
+
     /* Optional stages: geometry (gs_5_1), hull (hs_5_1), domain (ds_5_1). */
     if (desc->geometry_data) {
         shader->gs_blob = d3d12_compile_stage_blob(desc->geometry_data, desc->geometry_size,
@@ -4171,15 +4229,22 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
         if (!shader->gs_blob) goto fail;
     }
     if (desc->tess_control_data) {
-        shader->hs_blob = d3d12_compile_stage_blob(desc->tess_control_data, desc->tess_control_size,
-                                                   VIO_STAGE_TESS_CONTROL, 0, "hs_5_1", "HS",
-                                                   compile_flags, desc->format, desc->tess_control_hlsl);
+        if (tess_generated && !desc->tess_control_hlsl)
+            shader->hs_blob = d3d12_compile_tess_blob(shader, VIO_STAGE_TESS_CONTROL, 0, "hs_5_1", "HS", compile_flags);
+        else
+            shader->hs_blob = d3d12_compile_stage_blob(desc->tess_control_data, desc->tess_control_size,
+                                                       VIO_STAGE_TESS_CONTROL, 0, "hs_5_1", "HS",
+                                                       compile_flags, desc->format, desc->tess_control_hlsl);
         if (!shader->hs_blob) goto fail;
     }
     if (desc->tess_eval_data) {
-        shader->ds_blob = d3d12_compile_stage_blob(desc->tess_eval_data, desc->tess_eval_size,
-                                                   VIO_STAGE_TESS_EVAL, desc->geometry_data ? 0 : 1,
-                                                   "ds_5_1", "DS", compile_flags, desc->format, desc->tess_eval_hlsl);
+        if (tess_generated && !desc->tess_eval_hlsl)
+            shader->ds_blob = d3d12_compile_tess_blob(shader, VIO_STAGE_TESS_EVAL, desc->geometry_data ? 0 : 1,
+                                                      "ds_5_1", "DS", compile_flags);
+        else
+            shader->ds_blob = d3d12_compile_stage_blob(desc->tess_eval_data, desc->tess_eval_size,
+                                                       VIO_STAGE_TESS_EVAL, desc->geometry_data ? 0 : 1,
+                                                       "ds_5_1", "DS", compile_flags, desc->format, desc->tess_eval_hlsl);
         if (!shader->ds_blob) goto fail;
     }
 
@@ -4195,6 +4260,8 @@ fail:
     if (shader->gs_blob) ID3D10Blob_Release(shader->gs_blob);
     if (shader->hs_blob) ID3D10Blob_Release(shader->hs_blob);
     if (shader->ds_blob) ID3D10Blob_Release(shader->ds_blob);
+    free(shader->tess_tcs);
+    free(shader->tess_tes);
     free(shader);
     return NULL;
 }
@@ -4208,6 +4275,8 @@ static void d3d12_destroy_shader(void *shader_ptr)
     if (s->gs_blob) ID3D10Blob_Release(s->gs_blob);
     if (s->hs_blob) ID3D10Blob_Release(s->hs_blob);
     if (s->ds_blob) ID3D10Blob_Release(s->ds_blob);
+    free(s->tess_tcs);
+    free(s->tess_tes);
     free(s);
 }
 

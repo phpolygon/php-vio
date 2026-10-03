@@ -10,6 +10,7 @@
 #include "vio_shader.h"
 #include "vio_shader_reflect.h"
 #include "vio_shader_compiler.h"
+#include "vio_tess_hlsl.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -54,6 +55,26 @@ static const char *vio_hlsl_probe_source(int stage)
     }
 }
 
+/* Tessellation stages are probed as a pair: hull and domain shader are
+ * built from both stages (vio_tess_hlsl.c). */
+static char *vio_hlsl_tess_probe(int stage, int shader_model, char **err)
+{
+    size_t tcs_size = 0, tes_size = 0;
+    uint32_t *tcs = vio_compile_glsl_stage_to_spirv(vio_hlsl_probe_source(VIO_STAGE_TESS_CONTROL),
+                                                    VIO_STAGE_TESS_CONTROL, &tcs_size, err);
+    if (!tcs) return NULL;
+    uint32_t *tes = vio_compile_glsl_stage_to_spirv(vio_hlsl_probe_source(VIO_STAGE_TESS_EVAL),
+                                                    VIO_STAGE_TESS_EVAL, &tes_size, err);
+    char *hlsl = NULL;
+    if (tes) {
+        vio_tess_hlsl_desc d = { tcs, tcs_size, tes, tes_size, 0, shader_model, 1 };
+        hlsl = vio_tess_to_hlsl(stage, &d, err);
+        free(tes);
+    }
+    free(tcs);
+    return hlsl;
+}
+
 /* Shader stage a probe compiles as (probe variants map onto a real stage). */
 static int vio_hlsl_probe_stage(int probe)
 {
@@ -68,7 +89,15 @@ int vio_hlsl_stage_supported(int stage)
 
     int ok = 0;
     const char *src = vio_hlsl_probe_source(stage);
-    if (src) {
+    if (stage == VIO_STAGE_TESS_CONTROL || stage == VIO_STAGE_TESS_EVAL) {
+        char *err = NULL;
+        char *hlsl = vio_hlsl_tess_probe(stage, 50, &err);
+        ok = hlsl != NULL;
+        if (!ok && getenv("VIO_DEBUG_STAGE_PROBE"))
+            fprintf(stderr, "[vio] stage probe %d: tessellation HLSL failed: %s\n", stage, err ? err : "unknown");
+        free(hlsl);
+        free(err);
+    } else if (src) {
         size_t spirv_size = 0;
         char *err = NULL;
         uint32_t *spirv = vio_compile_glsl_stage_to_spirv(src, vio_hlsl_probe_stage(stage), &spirv_size, &err);
@@ -93,6 +122,12 @@ int vio_hlsl_stage_supported(int stage)
 
 char *vio_hlsl_probe_hlsl(int stage, int shader_model)
 {
+    if (stage == VIO_STAGE_TESS_CONTROL || stage == VIO_STAGE_TESS_EVAL) {
+        char *err = NULL;
+        char *hlsl = vio_hlsl_tess_probe(stage, shader_model, &err);
+        free(err);
+        return hlsl;
+    }
     const char *src = vio_hlsl_probe_source(stage);
     if (!src) return NULL;
     size_t spirv_size = 0;
@@ -110,6 +145,7 @@ char *vio_hlsl_probe_hlsl(int stage, int shader_model)
 #ifdef HAVE_SPIRV_CROSS
 
 #include <spirv_cross/spirv_cross_c.h>
+#include "vio_hlsl_internal.h"
 
 /* ── Transpilation ───────────────────────────────────────────────── */
 
@@ -593,6 +629,12 @@ char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_mod
 char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_model,
                            int fixup_depth, char **error_msg)
 {
+    return vio_spirv_to_hlsl_hooked(spirv, spirv_size / sizeof(uint32_t), shader_model, fixup_depth, NULL, error_msg);
+}
+
+char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int shader_model,
+                               int fixup_depth, const vio_hlsl_hooks *hooks, char **error_msg)
+{
     spvc_context ctx = NULL;
     spvc_parsed_ir ir = NULL;
     spvc_compiler compiler = NULL;
@@ -604,8 +646,6 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
         if (error_msg) *error_msg = strdup("Failed to create SPIRV-Cross context");
         return NULL;
     }
-
-    size_t word_count = spirv_size / sizeof(uint32_t);
 
     /* Geometry stages: gl_in[].gl_Position / gl_InvocationID (see vio_gs_hlsl_rewrite). */
     uint32_t gs_pos_location = VIO_GS_POS_LOCATION_NONE, gs_invocations = 1;
@@ -644,6 +684,7 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
     int is_geometry = spvc_compiler_get_execution_model(compiler) == SpvExecutionModelGeometry;
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_FIXUP_DEPTH_CONVENTION,
                                    (fixup_depth && !is_geometry) ? SPVC_TRUE : SPVC_FALSE);
+    if (hooks && hooks->configure) hooks->configure(compiler, options, hooks->user);
     spvc_compiler_install_compiler_options(compiler, options);
 
     /* Remap combined image-samplers to avoid overlapping register semantics.
@@ -741,6 +782,7 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
         output = strdup(result);
     }
     if (is_geometry) output = vio_gs_hlsl_patch(output, gs_pos_location, gs_invocation, gs_invocations);
+    if (output && hooks && hooks->finish) output = hooks->finish(compiler, output, error_msg, hooks->user);
 
     spvc_context_destroy(ctx);
     return output;
