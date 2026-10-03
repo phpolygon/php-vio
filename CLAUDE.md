@@ -90,10 +90,12 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-145 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+147 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/139` | GS-Instancing (`layout(invocations = 4)`, Quadranten; Cube in einem Draw mit `invocations = 6` + `gl_Layer`) und Adjacency (`VIO_TRIANGLES_ADJACENCY` über `vio_mesh(['adjacency' => true])` mit pro Dreieck duplizierten Vertices, `VIO_LINES_ADJACENCY`-Reihenfolge, Ablehnung ohne GS). |
+| `tests/render3d/140` | HLSL-Stage-Override: Tessellations-Disc aus 110 mit Hull/Domain-HLSL auf D3D (GLSL auf GL/Vulkan), Instanced-GS per `[instance(4)]`, Warnung bei abweichendem cbuffer-Layout, Argument-Vertrag. |
 | `tests/render3d/109–110` | Geometry-Stage (`vio_shader(['geometry' => …])`, Punkt → Quad, GS-Uniform, Unbind-Regression) und Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`/`patch_vertices`, Quad-Patch → Disc, Kantenzahl folgt dem TCS-Uniform). Iterieren über `opengl/d3d11/d3d12/vulkan/metal`; Backend mit Flag 0 → `skip`. |
 | `tests/render3d/138` | Mehrere Viewports (GEOMETRY-STAGES-PLAN 1d): `vio_viewports()` mit linker/rechter Hälfte, `gl_ViewportIndex` aus dem GS (ein Dreieck je Viewport) und aus dem Vertex-Shader (`gl_InstanceIndex`), ohne Index nur Viewport 0, `vio_viewport` stellt einen Viewport wieder her, Argument-Vertrag. |
 | `tests/render3d/137` | Layered Rendering (GEOMETRY-STAGES-PLAN 1b/1c): `vio_bind_render_target($ctx, $rt, VIO_RT_ALL_LAYERS)`, `vio_clear` löscht alle Layer, ein Draw durch einen GS mit `gl_Layer` füllt jeden Layer bzw. einen Depth-Cube (Punktlicht-Schatten in einem Pass), `gl_Layer = gl_InstanceIndex` im Vertex-Shader (`VIO_FEATURE_VERTEX_LAYER`). |
@@ -178,6 +180,9 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Layered RTs (`'layers' => N`-Arrays, Depth-Cube; `VIO_FEATURE_RENDER_TARGET_LAYERED`) | ✅ (`GL_TEXTURE_2D_ARRAY` / Depth-Cubemap, `glFramebufferTextureLayer`) | ✅ (RTV/DSV je Slice) | ✅ (RTV/DSV je Slice) | ✅ (Framebuffer je Layer, `2D_ARRAY`/`CUBE`-Views) | ❌ (Follow-up, nur CI) |
 | Layered Rendering (`VIO_RT_ALL_LAYERS`, `gl_Layer`; `VIO_FEATURE_LAYERED_RENDER` / `_VERTEX_LAYER`) | ✅ (`glFramebufferTexture`; VS-Layer mit `GL_ARB_shader_viewport_layer_array`) | ✅ (RTV/DSV über alle Slices; GS per Probe, VS-Layer per `D3D11_OPTIONS3`) | ✅ (dto.; VS-Layer immer) | ✅ (Framebuffer `layers = N`; VS-Layer mit `VK_EXT_shader_viewport_index_layer`) | ❌ (Follow-up: `[[render_target_array_index]]` im VS) |
 | Mehrere Viewports (`vio_viewports`, `gl_ViewportIndex`; `VIO_FEATURE_MULTI_VIEWPORT`) | ✅ (GL 4.1 / `ARB_viewport_array`, `glViewportIndexedf`) | ✅ (`RSSetViewports(n)`, 3D ohne Scissor) | ✅ (Viewport + Scissor je Eintrag) | ✅ (`multiViewport`; 3D-Pipelines tragen immer `max_viewports` Viewports, `vk3d_prepare` setzt alle) | ❌ (Follow-up) |
+| GS-Instancing (`layout(invocations = N)`, `VIO_FEATURE_GEOMETRY_INSTANCING`) | ✅ (GL ≥ 4.0 / `ARB_gpu_shader5`) | per HLSL-Override (`[instance(N)]`)‡ | per HLSL-Override‡ | ✅ | ❌ |
+| Adjacency-Topologien (`VIO_*_ADJACENCY`, `vio_mesh(['adjacency' => true])`) | ✅ | ✅ | ✅ | ✅ | ❌ (kein GS) |
+| HLSL-Stage-Override (`'hlsl' => [stage => src]`, `VIO_FEATURE_HLSL_STAGE_OVERRIDE`) | — | ✅ | ✅ (auch DXIL / SM 6) | — | — |
 | Cubemap-RT + `vio_generate_mipmaps` | ✅ | ❌ (Follow-up) | ❌ (Follow-up) | ✅ (Framebuffer je Face/Level, `vkCmdBlitImage`-Kette) | ✅ |
 | `vio_read_render_target` | ✅ | ✅ | ✅† | ✅ (nach `vio_end`, Face und Attachment) | ✅ |
 | `vio_texture_update` | ✅ | ✅ | ❌ (Follow-up) | ❌ | ✅ |
@@ -195,7 +200,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`) |
 | Stencil (`'stencil' => [...]`, `VIO_FEATURE_STENCIL`) | ✅ (DEPTH24_STENCIL8) | ✅ (D24S8) | ✅ (D24S8, `OMSetStencilRef`) | ✅ (D32S8 / D24S8) | ❌ (Depth32Float ohne Stencil-Plane, macOS-Folgearbeit) |
 | Geometry-Stage (`vio_shader(['geometry' => …])`, `VIO_FEATURE_GEOMETRY`) | ✅ (GL ≥ 3.2) | ✅‡ | ✅‡ | ✅ (`geometryShader`) | ❌ (kein GS in Metal) |
-| Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`, `VIO_FEATURE_TESSELLATION`) | ✅ (GL ≥ 4.0) | ❌‡ | ❌‡ | ✅ (`tessellationShader`) | ❌ (Follow-up: compute-basiert) |
+| Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`, `VIO_FEATURE_TESSELLATION`) | ✅ (GL ≥ 4.0) | ✅ nur per HLSL-Override‡ | ✅ nur per HLSL-Override‡ | ✅ (`tessellationShader`) | ❌ (Follow-up: compute-basiert) |
 | Storage-Images (`'storage' => true` + `vio_compute_bind_image`) | ✅ (wenn Compute) | ✅† | ✅† | ❌ | ✅ |
 | Compute-`local_size` aus Reflection (2D/3D-Dispatch) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Async-Dispatch im Frame (`['async' => true]`, `vio_compute_wait`) | ✅ (Queue in-order) | ✅ (in-order) | ✅† (Frame-List) | sync | ✅ (Frame-Cmd-Buffer) |
@@ -204,7 +209,9 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 es annimmt** (`vio_hlsl_stage_supported()` + `d3d1x_stage_supported()`, Probe einmal pro Prozess;
 `VIO_DEBUG_STAGE_PROBE=1` druckt den Grund). Stand SPIRV-Cross 2026-10: **Geometry ja**, aber nur
 mit Positionen aus User-Varyings — `gl_in[].gl_Position` wird als unaufgelöstes `gl_in` emittiert;
-**Hull/Domain nein** („Unsupported execution model"), das Flag bleibt 0 und `vio_shader` lehnt
+**Hull/Domain nein** („Unsupported execution model"), ebenso kein `gl_InvocationID` im GS
+(„Unsupported builtin in HLSL: 8" → `GEOMETRY_INSTANCING` 0). Beides geht auf D3D über den
+HLSL-Stage-Override (`'hlsl' => [...]`, Test 140). Ohne Override bleibt das Flag 0 und `vio_shader` lehnt
 `tess_control`/`tess_eval` auf D3D ab. Die SPIRV-Cross-Libs in `C:\php-sdk\vio-build-deps` (SDK
 1.4.341) können Geometry; das Vulkan SDK 1.3.296 der Windows-CI nicht → 109/135 skippen dort auf D3D.
 
@@ -256,6 +263,12 @@ Metal, Geometry-/Tessellation-Shader gibt es in Metal nicht (`VIO_FEATURE_GEOMET
   zeichnet **immer** `VIO_PATCHES` (`'patch_vertices' => N`, 1..32, Default 3), egal was
   `topology` sagt; `VIO_PATCHES` ohne Tessellation-Stages lehnt `vio_pipeline` ab.
   `vio_shader_reflect()` liefert die Stages unter denselben Keys.
+- **HLSL-Override (D3D)**: `'hlsl' => ['tess_control' => $hs, 'tess_eval' => $ds, 'geometry' => $gs]` —
+  das Backend kompiliert das HLSL statt der übersetzten GLSL-Stage; die GLSL-Stage bleibt Pflicht
+  (GL/Vulkan, Uniform-Layout). Vertrag: Stage-Uniforms in `cbuffer … : register(b0)` mit denselben
+  Namen und Offsets wie in GLSL (sonst Warning aus `vio_d3d_check_override_cbuffer`, per
+  `D3DReflect`; unter SM 6 entfällt die Prüfung), Eingänge mit den SPIRV-Cross-Semantiken der
+  Vorstufe (`SV_Position`, `TEXCOORD<location>`), Ausgabe im D3D-Clipspace (z ∈ [0, w]), kein Fixup.
 - **Gate**: `vio_shader()` lehnt die Stage vor jedem Backend-Aufruf ab, wenn
   `VIO_FEATURE_GEOMETRY`/`TESSELLATION` 0 ist (Warning + `false`) — kein Backend-Zweig in
   `php_vio.c`, Audit-Gate 099 bleibt unverändert.
@@ -849,7 +862,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 139 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 141 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
