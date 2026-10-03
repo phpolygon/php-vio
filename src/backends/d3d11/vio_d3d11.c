@@ -1254,7 +1254,7 @@ static void d3d11_destroy_render_target(void *rt_ptr)
     if (rt->d3d11_face_dsvs) {
         /* Layered targets: d3d11_dsv is entry 0 of this array. */
         ID3D11DepthStencilView **dsvs = (ID3D11DepthStencilView **)rt->d3d11_face_dsvs;
-        int n = vio_rt_layer_count(rt);
+        int n = vio_rt_layer_count(rt) + 1;   /* + the all-layers DSV */
         for (int i = 0; i < n; i++) if (dsvs[i]) ID3D11DepthStencilView_Release(dsvs[i]);
         free(dsvs);
         rt->d3d11_face_dsvs = NULL;
@@ -1275,7 +1275,7 @@ static void d3d11_destroy_render_target(void *rt_ptr)
     /* Cube face RTVs + MSAA textures (GAP-PLAN Phase 2 / 3). */
     if (rt->d3d11_face_rtvs) {
         ID3D11RenderTargetView **faces = (ID3D11RenderTargetView **)rt->d3d11_face_rtvs;
-        int n = vio_rt_layer_count(rt) * (rt->mip_levels > 0 ? rt->mip_levels : 1);
+        int n = vio_rt_layer_count(rt) * (rt->mip_levels > 0 ? rt->mip_levels : 1) + 1;   /* + the all-layers RTV */
         for (int i = 0; i < n; i++) if (faces[i]) ID3D11RenderTargetView_Release(faces[i]);
         free(faces);
         rt->d3d11_face_rtvs = NULL;
@@ -1423,21 +1423,26 @@ static int d3d11_bind_render_target_face(void *rt_ptr, int face, int level)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (!rt || !vio_d3d11.initialized || rt->backend_type != VIO_RT_BACKEND_D3D11) return -1;
-    if ((!rt->is_cube && rt->layers <= 1) || face < 0 || face >= vio_rt_layer_count(rt) ||
-        level < 0 || level >= rt->mip_levels) return -1;
+    int layers = vio_rt_layer_count(rt);
+    int all = face == VIO_RT_ALL_LAYERS;
+    if ((!rt->is_cube && rt->layers <= 1) || level < 0 || level >= rt->mip_levels) return -1;
+    if (all ? level != 0 : (face < 0 || face >= layers)) return -1;
     ID3D11RenderTargetView **faces = (ID3D11RenderTargetView **)rt->d3d11_face_rtvs;
     ID3D11DepthStencilView **dsvs = (ID3D11DepthStencilView **)rt->d3d11_face_dsvs;
+    /* VIO_RT_ALL_LAYERS: the views behind the per-layer ones span every slice;
+     * SV_RenderTargetArrayIndex picks the destination. */
+    int rtv_index = all ? layers * rt->mip_levels : face * rt->mip_levels + level;
     ID3D11RenderTargetView *rtv = NULL;
     if (!rt->depth_only) {
         if (!faces) return -1;
-        rtv = faces[face * rt->mip_levels + level];
+        rtv = faces[rtv_index];
         if (!rtv) return -1;
     }
 
     d3d11_rt_unbind_srvs();
     /* Every layer has its own depth slice, at level 0 only; smaller levels
      * render without depth (same contract as OpenGL / Metal). */
-    ID3D11DepthStencilView *dsv = (level == 0 && dsvs) ? dsvs[face] : NULL;
+    ID3D11DepthStencilView *dsv = (level == 0 && dsvs) ? dsvs[all ? layers : face] : NULL;
     ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, rtv ? 1 : 0, rtv ? &rtv : NULL, dsv);
     int w = rt->width >> level, h = rt->height >> level;
     if (w < 1) w = 1;
@@ -1451,7 +1456,7 @@ static int d3d11_bind_render_target_face(void *rt_ptr, int face, int level)
     vio_d3d11.current_bound_rt = rt;
     vio_d3d11.pending_bound_rt = NULL;
     d3d11_rt_set_viewport(w, h);
-    rt->bound_face = face;
+    rt->bound_face = face;   /* VIO_RT_ALL_LAYERS for a layered bind */
     rt->bound_level = level;
     return 0;
 }
@@ -1520,7 +1525,7 @@ static int d3d11_create_render_target(void *rt_ptr, int width, int height, int h
     ID3D11DepthStencilView *dsv = NULL;
     if (layered) {
         /* One DSV per layer; d3d11_dsv aliases layer 0. */
-        ID3D11DepthStencilView **dsvs = calloc((size_t)layers, sizeof(*dsvs));
+        ID3D11DepthStencilView **dsvs = calloc((size_t)layers + 1, sizeof(*dsvs));
         if (!dsvs) { ID3D11Texture2D_Release(depth_tex); return -1; }
         rt->d3d11_depth_tex = depth_tex;
         rt->d3d11_face_dsvs = dsvs;
@@ -1534,6 +1539,18 @@ static int d3d11_create_render_target(void *rt_ptr, int width, int height, int h
             hr = ID3D11Device_CreateDepthStencilView(vio_d3d11.device, (ID3D11Resource *)depth_tex, &dd, &dsvs[l]);
             if (FAILED(hr)) {
                 php_error_docref(NULL, E_WARNING, "D3D11: Failed to create layer DSV (0x%08lx)", hr);
+                return -1;
+            }
+        }
+        {
+            /* Entry `layers`: every slice at once (VIO_RT_ALL_LAYERS). */
+            D3D11_DEPTH_STENCIL_VIEW_DESC dd = {0};
+            dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+            dd.Texture2DArray.ArraySize = (UINT)layers;
+            hr = ID3D11Device_CreateDepthStencilView(vio_d3d11.device, (ID3D11Resource *)depth_tex, &dd, &dsvs[layers]);
+            if (FAILED(hr)) {
+                php_error_docref(NULL, E_WARNING, "D3D11: Failed to create layered DSV (0x%08lx)", hr);
                 return -1;
             }
         }
@@ -1598,7 +1615,7 @@ static int d3d11_create_render_target(void *rt_ptr, int width, int height, int h
         rt->d3d11_color_tex = cube;
         rt->d3d11_color_texs[0] = cube;
 
-        ID3D11RenderTargetView **faces = calloc((size_t)layers * mips, sizeof(*faces));
+        ID3D11RenderTargetView **faces = calloc((size_t)layers * mips + 1, sizeof(*faces));
         if (!faces) return -1;
         rt->d3d11_face_rtvs = faces;
         for (int f = 0; f < layers; f++) {
@@ -1614,6 +1631,18 @@ static int d3d11_create_render_target(void *rt_ptr, int width, int height, int h
                     php_error_docref(NULL, E_WARNING, "D3D11: Failed to create cube face RTV (0x%08lx)", hr);
                     return -1;
                 }
+            }
+        }
+        {
+            /* Entry layers * mips: every slice of level 0 (VIO_RT_ALL_LAYERS). */
+            D3D11_RENDER_TARGET_VIEW_DESC rd = {0};
+            rd.Format = dxfmt;
+            rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+            rd.Texture2DArray.ArraySize = (UINT)layers;
+            hr = ID3D11Device_CreateRenderTargetView(vio_d3d11.device, (ID3D11Resource *)cube, &rd, &faces[layers * mips]);
+            if (FAILED(hr)) {
+                php_error_docref(NULL, E_WARNING, "D3D11: Failed to create layered RTV (0x%08lx)", hr);
+                return -1;
             }
         }
 
@@ -3121,6 +3150,17 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return 1; /* BC1-BC7 are mandatory from feature level 10 */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice TEXTURECUBE + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_RENDER_TARGET_LAYERED: return 1; /* Texture2D arrays: RTV / DSV per layer, array / cube SRVs */
+        /* An all-slice RTV / DSV is always possible; the flag says a stage can
+         * also pick the slice (SV_RenderTargetArrayIndex from the GS). */
+        case VIO_FEATURE_LAYERED_RENDER: return d3d11_stage_supported(VIO_STAGE_GEOMETRY, "gs_5_0") ||
+                                                d3d11_supports_feature(VIO_FEATURE_VERTEX_LAYER);
+        case VIO_FEATURE_VERTEX_LAYER: {
+            /* SV_RenderTargetArrayIndex from the vertex shader is a D3D11.3 cap. */
+            if (!vio_d3d11.device) return 0;
+            D3D11_FEATURE_DATA_D3D11_OPTIONS3 o3 = {0};
+            return SUCCEEDED(ID3D11Device_CheckFeatureSupport(vio_d3d11.device, D3D11_FEATURE_D3D11_OPTIONS3, &o3, sizeof(o3)))
+                && o3.VPAndRTArrayIndexFromAnyShaderFeedingRasterizer;
+        }
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* ID3D11DeviceContext::GenerateMips */
         case VIO_FEATURE_CUBEMAP:      return 1;
         case VIO_FEATURE_DEPTH_BIAS:   return 1; /* rasterizer state */
