@@ -2872,9 +2872,9 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
         }
         if (sh->tess) {
             /* vert_fn is the TES: it reads the control points from the TCS
-             * output buffers itself, so no vertex descriptor. GL's vertex
-             * order refers to a lower-left domain origin; the TES flips v to
-             * keep gl_TessCoord GL-shaped, which mirrors the winding. */
+             * output buffers itself, so no vertex descriptor. Metal's winding
+             * label matches GL's for tessellated triangles and quads (test 144:
+             * the reversed order culled every GL-ccw patch under CULL_BACK). */
             const vio_metal_tess_info *ti = &sh->tess_info;
             d.tessellationPartitionMode =
                 ti->spacing == VIO_MSL_SPACING_FRACTIONAL_EVEN ? MTLTessellationPartitionModeFractionalEven :
@@ -2883,7 +2883,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
             d.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
             d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
             d.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
-            d.tessellationOutputWindingOrder = ti->ccw ? MTLWindingClockwise : MTLWindingCounterClockwise;
+            d.tessellationOutputWindingOrder = ti->ccw ? MTLWindingCounterClockwise : MTLWindingClockwise;
             d.tessellationFactorScaleEnabled = NO;
             d.maxTessellationFactor = 64;
         } else if (has_mesh_attr || has_inst_attr) {
@@ -4656,6 +4656,7 @@ static const vio_backend metal_backend = {
     .draw_instanced_from_storage = metal_draw_instanced_from_storage,
     .draw_indirect     = metal_draw_indirect,
     .bind_stage_constants = metal_bind_stage_constants,
+    .gpu_info           = vio_metal_gpu_info,
     .destroy_font_atlas = metal_destroy_font_atlas,
     .upload_font_atlas  = metal_upload_font_atlas,
     .destroy_texture_obj = metal_destroy_texture_obj,

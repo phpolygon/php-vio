@@ -90,10 +90,11 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-150 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+151 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/144` | Tessellation hält die OpenGL-Konventionen auf jedem Backend: welche Kante `outer[1]` unterteilt (Quad, Dreieck), Winding unter `VIO_CULL_BACK`, Patch-Varying mit Uniforms in TCS und TES, `vertices = 3` mit 4-Punkt-Patches (`gl_PatchVerticesIn`, HS-Variante), Isolines (auf D3D nur auf Hardware, WARP verliert tessellierte Linien), D3D12 auch mit Shader Model 6. Farben tragen die Domain-Koordinaten, die Prüfung ist unabhängig von der Readback-Orientierung. |
 | `tests/render3d/143` | Geometry-Stage mit `gl_in[0].gl_Position` und `gl_InvocationID` (`layout(invocations = 2)`) aus purem GLSL auf jedem Backend mit GS – auf D3D über den SPIR-V-Umbau vor SPIRV-Cross (`SV_Position`-Eingang, `SV_GSInstanceID` + `[instance(N)]`). |
 | `tests/render3d/142` | Erneutes Binden eines Render-Targets behält Farbe **und Tiefe** (plain, HDR, MSAA, Array-Layer, Cube-Face; im nächsten und im selben Frame) – `vio_clear` ist der einzige Clear. Fehlte auf Vulkan (`loadOp CLEAR`). |
 | `tests/render3d/141` | Vergleichs-Sampling auf jedem Backend: `sampler2DShadow`, `sampler2DArrayShadow`, `samplerCubeShadow` liefern das Vergleichsergebnis (ref ≤ gespeicherte Tiefe), dieselbe Tiefentextur liest per `sampler2D` weiter roh, ein 2D-Sprite auf Unit 0 danach sampelt normal. Schlägt ohne den GL-Vergleichs-Sampler fehl (GL lieferte die rohe Tiefe). |
@@ -203,7 +204,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`) |
 | Stencil (`'stencil' => [...]`, `VIO_FEATURE_STENCIL`) | ✅ (DEPTH24_STENCIL8) | ✅ (D24S8) | ✅ (D24S8, `OMSetStencilRef`) | ✅ (D32S8 / D24S8) | ✅ (`Depth32Float_Stencil8` auf Swapchain und Farb-RTs; depth_only/Cube/Array-Targets ohne Stencil) |
 | Geometry-Stage (`vio_shader(['geometry' => …])`, `VIO_FEATURE_GEOMETRY`) | ✅ (GL ≥ 3.2) | ✅‡ | ✅‡ | ✅ (`geometryShader`) | ❌ (kein GS in Metal) |
-| Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`, `VIO_FEATURE_TESSELLATION`) | ✅ (GL ≥ 4.0) | ✅ nur per HLSL-Override‡ | ✅ nur per HLSL-Override‡ | ✅ (`tessellationShader`) | ✅ (VS/TCS als Compute-Kernel + `drawPatches`; ohne Isolines/point_mode/Indirect) |
+| Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`, `VIO_FEATURE_TESSELLATION`) | ✅ (GL ≥ 4.0) | ✅‡ (GLSL über vios Hull/Domain-Generator `vio_tess_hlsl.c`, oder HLSL-Override) | ✅‡ (dto., auch DXIL / SM 6) | ✅ (`tessellationShader`, Domain-Ursprung unten links) | ✅ (VS/TCS als Compute-Kernel + `drawPatches`; ohne Isolines/point_mode/Indirect) |
 | Storage-Images (`'storage' => true` + `vio_compute_bind_image`) | ✅ (wenn Compute) | ✅† | ✅† | ✅ (`STORAGE_IMAGE` aus der Reflection, Bild in `GENERAL`) | ✅ |
 | Compute-`local_size` aus Reflection (2D/3D-Dispatch) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Async-Dispatch im Frame (`['async' => true]`, `vio_compute_wait`) | ✅ (Queue in-order) | ✅ (in-order) | ✅† (Frame-List) | ✅ (Frame-Command-Buffer, Pass wird geschlossen und mit LOAD fortgesetzt) | ✅ (Frame-Cmd-Buffer) |
@@ -215,10 +216,10 @@ GS-Builtins, die das HLSL-Backend ablehnt („Unsupported builtin in HLSL"), sch
 `vio_gs_hlsl_rewrite()` vorher im SPIR-V um: `gl_in[i].gl_Position` wird ein eigener Eingang mit
 Semantik `SV_Position`, `gl_InvocationID` eine private Variable aus `SV_GSInstanceID` mit
 `[instance(N)]` (Test 143) – damit laufen GLSL-GS mit `gl_in` und GS-Instancing auf D3D ohne Override.
-**Hull/Domain nein** („Unsupported execution model"): SPIRV-Cross hat kein HLSL-Tessellations-Backend,
-ein eigenes wäre ein SPIR-V→HLSL-Übersetzer für zwei Stages. Tessellation geht auf D3D deshalb nur
-über den HLSL-Stage-Override (`'hlsl' => [...]`, Test 140); ohne ihn bleibt das Flag 0 und `vio_shader`
-lehnt `tess_control`/`tess_eval` auf D3D ab. Die SPIRV-Cross-Libs in `C:\php-sdk\vio-build-deps` (SDK
+**Hull/Domain**: SPIRV-Cross hat (noch) kein HLSL-Tessellations-Backend (KhronosGroup/SPIRV-Cross#2693/#2694
+fügen es hinzu). Bis dahin baut vio Hull- und Domain-Shader selbst (`vio_tess_hlsl.c`, siehe
+„Geometry- und Tessellation-Stages"); die Probe übersetzt dafür ein TCS/TES-Paar, das Flag ist damit mit
+jedem SPIRV-Cross 1. Der HLSL-Stage-Override (`'hlsl' => [...]`, Test 140) bleibt und hat Vorrang. Die SPIRV-Cross-Libs in `C:\php-sdk\vio-build-deps` (SDK
 1.4.341) können Geometry; das Vulkan SDK 1.3.296 der Windows-CI nicht → 109/135 skippen dort auf D3D.
 
 † D3D11/D3D12: implementiert, aber ohne Windows-Build hier nur blind editiert — Windows-CI
@@ -298,6 +299,20 @@ compute-basiert (siehe „Metal-3D-Pipeline").
   Frame-Ring). D3D12-Root-Signature: `[5..7]` CBV, `[8..10]` SRV-Table, `[11..13]` Sampler-Table
   mit GEOMETRY/HULL/DOMAIN-Visibility (`VIO_D3D12_RP_*`). Die PSO-Vorlage (`pso_desc`) trägt die
   Stages, MSAA-/Format-Varianten erben sie. `bind_pipeline` setzt fehlende Stages auf NULL (D3D11).
+- **Hull/Domain aus GLSL (D3D, `vio_tess_hlsl.c`)**: `vio_tess_to_hlsl` bekommt **beide** Stages. Die SPIR-V
+  wird zu einer Vertex-Stage umgebaut (Execution-Model, Tessellations-Modes und im TCS Barrieren weg;
+  TCS-Ein-/Ausgänge und TES-Eingänge werden `Private`, die TES-Ausgänge bleiben echte VS-Ausgänge mit
+  Depth-Fixup), SPIRV-Cross übersetzt den Körper (`vert_main`, gleiche Optionen/Register wie VS/PS über
+  `vio_spirv_to_hlsl_hooked`), vio ersetzt `main`: Hull = Patch-Constant-Funktion (alle Ausgangs-
+  Kontrollpunkte laden, Körper je Invocation) + Kontrollpunkt-Funktion; Domain = `[domain]`-Einstieg
+  mit `OutputPatch`, Patch-Struct, `SV_DomainLocation`. Kontrollpunkt- und Patch-Struct (`TEXCOORD<loc>`,
+  `PATCH<loc>`, Faktoren) entstehen aus der TCS und sind in HS und DS identisch. GL-Konvention: D3D hat
+  dieselben Domain-Koordinaten und Faktor-Kanten wie GL, nur die Winding ist umgekehrt → `outputtopology`
+  wird gedreht, `gl_TessCoord` nie gespiegelt (auf WARP gemessen, Test 144). Das Shader-Objekt behält
+  beide SPIR-V-Module: weicht `patch_vertices` von `layout(vertices = N)` ab, baut `vio_pipeline` eine
+  HS-Variante (D3D11 eigenes `ID3D11HullShader`, D3D12 `hs_variant`-Blob der PSO). Grenzen (Warnung,
+  Override als Ausweg): Interface-Blöcke, Matrix-/Struct-Varyings, `gl_ClipDistance`, Lesen fremder
+  Kontrollpunkte in der Kontrollpunkt-Phase. `VIO_DUMP_TESS_SPV=<prefix>` schreibt das umgebaute SPIR-V.
 - **Tiefe im GS (D3D)**: SPIRV-Cross setzt den GL→D3D-Depth-Fixup ans Ende des GS-Einstiegs, hinter
   jedes `Append` — wirkungslos. `vio_spirv_to_hlsl_ex` rechnet deshalb jede ausgegebene Kopie
   (`stage_output.gl_Position`) selbst um (Test 109: Punkt bei z = −0.5).
@@ -320,8 +335,8 @@ compute-basiert (siehe „Metal-3D-Pipeline").
   Puffern). Jeder Draw: beide Kernel in eigenem, sofort committetem Command-Buffer in Ring-Slices,
   dann `drawPatches` auf dem offenen Render-Encoder (Texturen/Viewport bleiben). Indizierte Draws
   werden auf der CPU de-indiziert. Die TCS bekommt die Domain der TES gesetzt (Faktor-Struct), die
-  TES die Kontrollpunktzahl der TCS; `gl_TessCoord` behält den GL-Ursprung unten links (Winding
-  gespiegelt). Nicht unterstützt (Warning): Isolines, `point_mode`, `vio_draw_indirect`,
+  TES die Kontrollpunktzahl der TCS. Metals Tessellator hat GLs Domain-Koordinaten, Faktor-Kanten und
+  Winding-Bezeichnung (Test 144, macOS-CI): keine MSL-Ursprungs-Option, keine Winding-Umkehr. Nicht unterstützt (Warning): Isolines, `point_mode`, `vio_draw_indirect`,
   `vio_draw_instanced_from_buffer` mit Tessellation-Pipeline. Ein async Compute-Dispatch
   desselben Frames läuft **nach** den Tessellation-Kerneln. Varyings zwischen den Stages müssen
   in Location-Reihenfolge übereinstimmen (die Puffer-Structs werden je Stage gebaut). Der
@@ -371,7 +386,8 @@ compute-basiert (siehe „Metal-3D-Pipeline").
   nach stderr loggt (Metal-Thread → kein Zend-Aufruf dort).
 - **Intel-Macs**: CPU-beschriebene Texturen sind `Shared` nur bei `hasUnifiedMemory`,
   sonst `Managed` (`metal_cpu_texture_storage()`); Buffers bleiben überall `Shared`.
-- `vio_gpu_info()` liefert auf Metal `MTLDevice.name` + `recommendedMaxWorkingSetSize`
+- `vio_gpu_info()` fragt den Vtable-Slot `gpu_info` des Backends mit offenem Device (D3D11/D3D12: DXGI-Adapter,
+  headless „Microsoft Basic Render Driver“ = WARP; Vulkan: Physical Device; OpenGL: `GL_RENDERER`) und liefert auf Metal `MTLDevice.name` + `recommendedMaxWorkingSetSize`
   als `vram_bytes` (Unified Memory hat kein dediziertes VRAM).
 - `vio_recorder_capture` / `vio_stream_push` lesen den Frame über den gemeinsamen
   Helper `vio_capture_rgba()` in `php_vio.c` — damit funktioniert Recording/Streaming
@@ -897,7 +913,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 144 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 145 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -976,7 +992,7 @@ Aufrufer geändert hat:
   den Vulkan seit GAP-PHASE5 Block 10c meldet; Linux wählt damit wieder Vulkan vor OpenGL. Kann das
   gewählte Backend kein Device öffnen, versucht `vio_create('auto')` den nächsten Kandidaten). Test `100`.
 - **Audit-Gate `099`** friert `strcmp(ctx->backend->name, …)` (66) und `#if HAVE_D3D11/
-  D3D12/VULKAN` (47) in `php_vio.c` ein — neue Backend-Fähigkeiten gehen über Vtable-Slots.
+  D3D12/VULKAN` (46, seit `vio_gpu_info` über den Slot `gpu_info` läuft) in `php_vio.c` ein — neue Backend-Fähigkeiten gehen über Vtable-Slots.
   Render-Target-Erstellung/-Bind/-Unbind/-Readback und Cubemap-Upload für D3D11/D3D12
   liegen jetzt in `src/backends/d3d1x/` (`create_render_target`, `bind_render_target`,
   `unbind_render_target`, `bind_render_target_face`, `render_target_cubemap`,
@@ -1099,3 +1115,15 @@ Aufrufer geändert hat:
   `harfbuzz[core]:x64-windows-static-md` (ohne FreeType, statisch, /MD) die
   sauberere Deployment-Variante.
 - Shaping: horizontal only. Vertikaler Text (CJK vertical) ist Folgearbeit.
+- **Tessellierte Isolines auf WARP**: Der Software-Rasterizer (vios Headless-D3D11/D3D12-Device und die
+  Windows-CI) verliert die Linien-Primitive tessellierter Isolines – ein eigenständiges D3D11-Programm ohne vio
+  zeichnet dort nichts, in vio kommen je Frame zufällig Linien an. Der Tessellator selbst stimmt (Punkt-Ausgabe
+  liefert exakt Dichte × (Detail + 1) Punkte), gewöhnliche Linien auch. Auf Hardware (RTX 2080) zeichnen
+  generiertes und handgeschriebenes HLSL korrekt und stabil. Test 144 prüft Isolines auf D3D deshalb nur über
+  einen Fenster-Kontext auf D3D11 und D3D12 mit echtem Adapter (`vio_gpu_info()` ≠ „Microsoft Basic Render Driver“).
+- **Tessellations-Domain-Ursprung**: Vulkan setzt `VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT` (vorher oben links →
+  umgekehrte Winding, GL-korrekte Patches verschwanden bei Backface-Culling). Metal nutzte die MSL-Option
+  `tess_domain_origin_lower_left` plus Winding-Umkehr: das legte `outer[1]`/`outer[3]` von Quads auf die
+  Gegenkante und cullte jedes Dreiecks-Patch – Metal braucht keins von beidem (Test 144 auf der macOS-CI).
+- **`gl_PatchVerticesIn` auf OpenGL** mit SPIRV-Cross vor `vulkan-sdk-1.3.275` (Ubuntu 24.04: 1.3.268): das
+  GLSL-Backend schreibt `gl_BuiltIn_14`; `vio_spirv_to_glsl` ersetzt es (`vio_glsl_fix_patch_vertices`).

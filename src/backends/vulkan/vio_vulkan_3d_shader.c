@@ -801,6 +801,14 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     VkPipelineTessellationStateCreateInfo ts = {0};
     ts.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
     ts.patchControlPoints = (uint32_t)(d->patch_vertices > 0 ? d->patch_vertices : 3);
+    /* vio's tessellation stages are GLSL: OpenGL's lower-left domain origin.
+     * Vulkan defaults to upper-left, which reverses the winding of every
+     * generated triangle (the domain coordinates and factor edges are the
+     * same), so back-face culling dropped GL-correct patches. Core in 1.1. */
+    VkPipelineTessellationDomainOriginStateCreateInfo ts_origin = {0};
+    ts_origin.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO;
+    ts_origin.domainOrigin = VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+    ts.pNext = &ts_origin;
 
     VkPipelineViewportStateCreateInfo vp = {0};
     vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;

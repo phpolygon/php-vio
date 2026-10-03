@@ -386,6 +386,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_text_shape.c \
     src/vio_shader_compiler.c \
     src/vio_shader_reflect.c \
+    src/vio_tess_hlsl.c \
     src/vio_audio.c \
     src/vio_recorder.c \
     src/vio_stream.c \

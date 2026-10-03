@@ -390,6 +390,19 @@ static GLenum gl_topology_mode(vio_topology t)
     }
 }
 
+/* vio_gpu_info: GL_RENDERER of the live context; GL has no portable query for
+ * dedicated video memory, so that stays 0. */
+static void opengl_gpu_info(const char **name, uint64_t *vram_bytes)
+{
+    static char gpu_name[256];
+    (void)vram_bytes;
+    if (!vio_gl.initialized) return;
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+    if (!renderer) return;
+    snprintf(gpu_name, sizeof(gpu_name), "%s", renderer);
+    *name = gpu_name;
+}
+
 static void opengl_shutdown(void)
 {
     if (vio_gl.default_shader_program) {
@@ -2634,6 +2647,7 @@ static const vio_backend opengl_backend = {
     .draw_instanced_from_storage  = opengl_draw_instanced_from_storage,
     .supports_feature  = opengl_supports_feature,
     .gpu_frame_time    = opengl_gpu_frame_time,
+    .gpu_info          = opengl_gpu_info,
     .draw_indirect     = opengl_draw_indirect,
     .set_viewport      = opengl_set_viewport,
     .set_viewports     = opengl_set_viewports,

@@ -109,6 +109,13 @@ typedef struct _vio_d3d12_shader {
     ID3DBlob *gs_blob;
     ID3DBlob *hs_blob;
     ID3DBlob *ds_blob;
+    /* GLSL tessellation translated by vio (vio_tess_hlsl.c): both stages'
+     * SPIR-V, kept for hull shader variants per patch size, and the input
+     * patch size hs_blob was built for. NULL / 0 for HLSL overrides. */
+    uint32_t *tess_tcs, *tess_tes;
+    size_t    tess_tcs_size, tess_tes_size;
+    uint32_t  hs_input_points;
+    UINT      compile_flags;
 } vio_d3d12_shader;
 
 /* Pipeline = PSO + root signature reference */
@@ -127,6 +134,7 @@ typedef struct _vio_d3d12_pipeline {
     char                   (*sem_names)[24];   /* owned; semantic names of matrix columns */
     UINT                     stencil_ref;      /* OMSetStencilRef */
     int                      has_gs, has_hs, has_ds;  /* replicate SRV / sampler tables */
+    ID3DBlob                *hs_variant;       /* owned; hull shader for this pipeline's patch size */
 } vio_d3d12_pipeline;
 
 /* Buffer wrapper */

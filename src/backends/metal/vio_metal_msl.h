@@ -312,9 +312,11 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
             spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_MSL_CAPTURE_OUTPUT_TO_BUFFER, SPVC_TRUE);
         } else if (stage == VIO_MSL_TESS_EVAL) {
             /* Control points come from the TCS output buffers, not a stage_in
-             * descriptor; gl_TessCoord keeps the GL origin (lower left). */
+             * descriptor. No TESS_DOMAIN_ORIGIN_LOWER_LEFT: Metal's tessellator
+             * already has GL's domain coordinates, factor edges and winding
+             * (test 144 on the macOS CI); that option flips v for quads, which
+             * put outer[1] / outer[3] on the opposite edges. */
             spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_MSL_RAW_BUFFER_TESE_INPUT, SPVC_TRUE);
-            spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_MSL_TESS_DOMAIN_ORIGIN_LOWER_LEFT, SPVC_TRUE);
         }
         spvc_compiler_install_compiler_options(compiler, opts);
     }

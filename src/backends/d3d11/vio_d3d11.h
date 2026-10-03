@@ -34,6 +34,13 @@ typedef struct _vio_d3d11_shader {
     ID3D11GeometryShader *gs;
     ID3D11HullShader     *hs;
     ID3D11DomainShader   *ds;
+    /* GLSL tessellation translated by vio (vio_tess_hlsl.c): both stages'
+     * SPIR-V, kept for hull shader variants per patch size, and the input
+     * patch size `hs` was built for. NULL / 0 for HLSL overrides. */
+    uint32_t *tess_tcs, *tess_tes;
+    size_t    tess_tcs_size, tess_tes_size;
+    uint32_t  hs_input_points;
+    UINT      compile_flags;
 } vio_d3d11_shader;
 
 /* Pipeline = input layout + state objects */
@@ -265,6 +272,11 @@ typedef struct _vio_d3d11_state {
 
     /* Window reference */
     void *glfw_window;
+
+    /* Adapter of the device, for vio_gpu_info(): UTF-8 description (WARP reports
+     * "Microsoft Basic Render Driver") and DedicatedVideoMemory. */
+    char     gpu_name[256];
+    uint64_t vram_bytes;
 } vio_d3d11_state;
 
 extern vio_d3d11_state vio_d3d11;

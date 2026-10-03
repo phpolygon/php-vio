@@ -1021,9 +1021,11 @@ function vio_save_screenshot(VioContext $context, string $path): bool {}
  *   'vram_bytes' => int    : dedicated video memory in bytes, 0 if unknown.
  *   'ram_bytes'  => int    : total physical system RAM in bytes, 0 if unknown.
  *
- * GPU name/VRAM are only populated on the D3D12 backend after the device has
- * been created (i.e. after a window/renderer exists). On every backend the
- * 'ram_bytes' field is filled, so this call is useful everywhere.
+ * GPU name/VRAM come from the backend whose device is open (backend vtable
+ * slot gpu_info): DXGI adapter on D3D11/D3D12 ("Microsoft Basic Render Driver"
+ * on WARP, which headless D3D contexts use), the physical device on Vulkan,
+ * MTLDevice on Metal, GL_RENDERER on OpenGL (no VRAM figure). Without a context
+ * the name is empty. 'ram_bytes' is filled on every backend.
  *
  * @return array|false false only on hard failure.
  */

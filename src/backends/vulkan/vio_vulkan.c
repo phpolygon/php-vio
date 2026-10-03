@@ -581,6 +581,28 @@ static void vk_swapchain_pixel_to_rgba8(const unsigned char *p, unsigned char *d
     d[3] = p[3];
 }
 
+/* vio_gpu_info: the physical device's name; dedicated memory = the
+ * device-local heaps of a discrete GPU (an integrated GPU's device-local heap
+ * is system memory, reported as 0 like D3D's DedicatedVideoMemory). */
+static void vulkan_gpu_info(const char **name, uint64_t *vram_bytes)
+{
+    static char gpu_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    if (!vio_vk.initialized || !vio_vk.physical_device) return;
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(vio_vk.physical_device, &props);
+    memcpy(gpu_name, props.deviceName, sizeof(gpu_name));
+    gpu_name[sizeof(gpu_name) - 1] = '\0';
+    uint64_t vram = 0;
+    if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+        VkPhysicalDeviceMemoryProperties mem;
+        vkGetPhysicalDeviceMemoryProperties(vio_vk.physical_device, &mem);
+        for (uint32_t i = 0; i < mem.memoryHeapCount; i++)
+            if (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram += mem.memoryHeaps[i].size;
+    }
+    *name = gpu_name;
+    *vram_bytes = vram;
+}
+
 static void vulkan_swapchain_info(vio_swapchain_info *out)
 {
     out->buffer_count  = (int)vio_vk.swapchain_image_count;
@@ -3424,6 +3446,7 @@ static const vio_backend vulkan_backend = {
     .bind_texture      = vio_vk3d_bind_texture,
     .push_cbuffers     = vio_vk3d_push_cbuffers,
     .bind_stage_constants = vio_vk3d_bind_stage_constants,
+    .gpu_info          = vulkan_gpu_info,
     .draw_mesh_instanced = vio_vk3d_draw_mesh_instanced,
     .bind_storage_buffer = vio_vk3d_bind_storage_buffer,
     .draw_instanced_from_storage = vio_vk3d_draw_instanced_from_storage,

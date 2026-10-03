@@ -7636,22 +7636,16 @@ ZEND_FUNCTION(vio_gpu_info)
     const char *gpu_name = "";
     uint64_t    vram_bytes = 0;
 
-#ifdef HAVE_D3D12
-    /* GPU name + dedicated VRAM are only known on D3D12, and only once the
-     * device has been created at init (so the caller must invoke this after the
-     * window/renderer exists). Values were captured from the SELECTED adapter's
-     * DXGI_ADAPTER_DESC1 in d3d12_init. On other backends / before init they
-     * stay at the defaults above. */
-    if (vio_d3d12.initialized) {
-        gpu_name   = vio_d3d12.gpu_name;
-        vram_bytes = vio_d3d12.vram_bytes;
+    /* The adapter of whichever backend has a device open (backends shut down
+     * with their last context, so only live ones answer). */
+    for (int i = 0; i < vio_backend_count(); i++) {
+        const vio_backend *b = vio_find_backend(vio_get_backend_name(i));
+        const char *name = NULL;
+        uint64_t vram = 0;
+        if (!b || !b->gpu_info) continue;
+        b->gpu_info(&name, &vram);
+        if (name && name[0]) { gpu_name = name; vram_bytes = vram; break; }
     }
-#endif
-#ifdef HAVE_METAL
-    /* Metal: MTLDevice.name + recommendedMaxWorkingSetSize (unified memory has
-     * no dedicated VRAM). Set once setup_context has created the device. */
-    vio_metal_gpu_info(&gpu_name, &vram_bytes);
-#endif
 
     uint64_t ram_bytes = vio_query_total_ram_bytes();
 

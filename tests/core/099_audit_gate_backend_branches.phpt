@@ -28,7 +28,8 @@ $ifdef_count  = preg_match_all('/^[ \t]*#[ \t]*(?:ifdef|if)\b[^\n]*HAVE_(?:D3D11
  * 77 -> 66 strcmp branches, 61 -> 47 #if blocks, php_vio.c 9931 -> ~9050
  * lines). Lower them whenever a refactor brings the count down. */
 $STRCMP_CEILING = 66;
-$IFDEF_CEILING  = 47;
+/* 47 -> 46: vio_gpu_info asks the backend vtable (gpu_info slot). */
+$IFDEF_CEILING  = 46;
 
 echo "strcmp(backend->name) branches: ", ($strcmp_count <= $STRCMP_CEILING ? "OK" : "FAIL ($strcmp_count > $STRCMP_CEILING)"), "\n";
 echo "#if HAVE_D3D11/D3D12/VULKAN blocks: ", ($ifdef_count <= $IFDEF_CEILING ? "OK" : "FAIL ($ifdef_count > $IFDEF_CEILING)"), "\n";
