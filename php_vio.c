@@ -10473,6 +10473,15 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
         }
         ID3D11ShaderResourceView *srv = (ID3D11ShaderResourceView *)cm->d3d11_srv;
         ID3D11SamplerState *sampler = (ID3D11SamplerState *)cm->d3d11_sampler;
+        /* samplerCubeShadow on a depth cube: the comparison sampler, chosen
+         * from the shader's sampler type like vio_bind_texture_now does. */
+        if (cm->d3d11_sampler_cmp && ctx->bound_shader_object) {
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            int idx = (slot >= 0 && slot < 16) ? sh->gl_to_hlsl_sampler[slot] : -1;
+            if (idx >= 0 && idx < sh->sampler_count && sh->sampler_is_depth[idx]) {
+                sampler = (ID3D11SamplerState *)cm->d3d11_sampler_cmp;
+            }
+        }
         ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, (UINT)hlsl_slot, 1, &srv);
         ID3D11DeviceContext_PSSetSamplers(vio_d3d11.context, (UINT)hlsl_slot, 1, &sampler);
     }

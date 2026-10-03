@@ -1183,6 +1183,10 @@ static void d3d11_destroy_cubemap(void *cm_ptr)
         ID3D11SamplerState_Release((ID3D11SamplerState *)cm->d3d11_sampler);
         cm->d3d11_sampler = NULL;
     }
+    if (cm->d3d11_sampler_cmp) {
+        ID3D11SamplerState_Release((ID3D11SamplerState *)cm->d3d11_sampler_cmp);
+        cm->d3d11_sampler_cmp = NULL;
+    }
     /* vio_render_target_cubemap wrapper: the RT owns texture + SRV. */
     if (cm->borrowed) {
         cm->d3d11_srv = NULL;
@@ -1768,6 +1772,19 @@ static int d3d11_render_target_cubemap(void *rt_ptr, void *cm_obj)
     cm->d3d11_texture = tex;
     cm->d3d11_srv     = srv;
     cm->d3d11_sampler = d3d11_create_cube_sampler();
+    if (rt->depth_only) {
+        /* samplerCubeShadow: SampleCmp needs a comparison sampler (LESS_EQUAL,
+         * linear PCF); samplerCube .r keeps the plain one. */
+        D3D11_SAMPLER_DESC sd = {0};
+        sd.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+        sd.MaxAnisotropy = 1;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        ID3D11SamplerState *cmp = NULL;
+        ID3D11Device_CreateSamplerState(vio_d3d11.device, &sd, &cmp);
+        cm->d3d11_sampler_cmp = cmp;
+    }
     cm->mipmaps       = rt->mip_levels > 1;
     cm->borrowed      = 1;
     cm->resolution    = rt->width;
