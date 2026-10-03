@@ -202,7 +202,17 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # The runner image ships stale Homebrew metadata and does not auto-update,
+          # so it installed spirv-cross 1.4.357.0 although the formula is on
+          # 1.4.363.0 (the first with the MSL struct-array stride fix test 094 needs).
+          brew update --quiet
           brew install glfw glslang spirv-cross vulkan-loader vulkan-headers ffmpeg harfbuzz pkg-config
+          v=$(brew list --versions spirv-cross | awk '{print $2}')
+          echo "spirv-cross $v"
+          if [ "$(printf '%s\n' 1.4.363.0 "$v" | sort -V | head -n1)" != "1.4.363.0" ]; then
+            echo "::error::spirv-cross $v is older than 1.4.363.0 (MSL struct-array stride fix, test 094)"
+            exit 1
+          fi
 
       - name: Build extension
         run: |
@@ -266,7 +276,17 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # The runner image ships stale Homebrew metadata and does not auto-update,
+          # so it installed spirv-cross 1.4.357.0 although the formula is on
+          # 1.4.363.0 (the first with the MSL struct-array stride fix test 094 needs).
+          brew update --quiet
           brew install glfw glslang spirv-cross vulkan-loader vulkan-headers ffmpeg harfbuzz pkg-config
+          v=$(brew list --versions spirv-cross | awk '{print $2}')
+          echo "spirv-cross $v"
+          if [ "$(printf '%s\n' 1.4.363.0 "$v" | sort -V | head -n1)" != "1.4.363.0" ]; then
+            echo "::error::spirv-cross $v is older than 1.4.363.0 (MSL struct-array stride fix, test 094)"
+            exit 1
+          fi
 
       - name: Build extension
         run: |
