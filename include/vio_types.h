@@ -266,6 +266,11 @@ typedef enum _vio_feature {
      * once per 1x2 / 2x1 / 2x2 / 4x4 pixel block while geometry, depth and the
      * resolution stay untouched (D3D12 VRS Tier 1+). */
     VIO_FEATURE_SHADING_RATE       = 38,
+    /* Layered render targets: vio_render_target(['layers' => N]) 2D arrays
+     * (colour or depth_only, sampled as sampler2DArray) and depth_only cube
+     * targets (sampled through vio_render_target_cubemap). One layer / face is
+     * bound at a time via vio_bind_render_target($ctx, $rt, $layer). */
+    VIO_FEATURE_RENDER_TARGET_LAYERED = 39,
 } vio_feature;
 
 /* vio_set_shading_rate() rates (GAP-PHASE5 Block 12). 4X4 needs the device's

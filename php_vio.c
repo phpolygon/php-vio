@@ -8280,6 +8280,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_ARRAY", VIO_FEATURE_TEXTURE_ARRAY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_COMPRESSION_BC", VIO_FEATURE_TEXTURE_COMPRESSION_BC, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE", VIO_FEATURE_SHADING_RATE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_LAYERED", VIO_FEATURE_RENDER_TARGET_LAYERED, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X1", VIO_SHADING_RATE_1X1, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X2", VIO_SHADING_RATE_1X2, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_2X1", VIO_SHADING_RATE_2X1, CONST_CS | CONST_PERSISTENT);
@@ -9405,15 +9406,17 @@ ZEND_FUNCTION(vio_render_target)
             php_error_docref(NULL, E_WARNING, "vio_render_target: cube 'size' must be >= 1");
             RETURN_FALSE;
         }
-        if (depth_only) {
-            php_error_docref(NULL, E_WARNING, "vio_render_target: cube targets cannot be depth_only");
+        if (depth_only && (!ctx->backend->supports_feature ||
+                           !ctx->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_LAYERED))) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_render_target: depth_only cube targets are not supported on backend '%s'", ctx->backend->name);
             RETURN_FALSE;
         }
         if (attachment_count > 1) {
             php_error_docref(NULL, E_WARNING, "vio_render_target: cube targets support a single attachment");
             RETURN_FALSE;
         }
-        if ((val = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1)) != NULL && zend_is_true(val)) {
+        if (!depth_only && (val = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1)) != NULL && zend_is_true(val)) {
             mip_levels = 1;
             for (int d = width; d > 1; d >>= 1) mip_levels++;
         }
@@ -9427,6 +9430,38 @@ ZEND_FUNCTION(vio_render_target)
         }
     }
 
+    /* Array render target: 'layers' => N (2..64) - colour or depth_only, every
+     * layer with its own depth. One layer is bound at a time
+     * (vio_bind_render_target($ctx, $rt, $layer)); vio_render_target_texture()
+     * hands the whole array out for sampler2DArray sampling. Single attachment,
+     * single-sampled, no mip chain. */
+    int layers = 0;
+    if ((val = zend_hash_str_find(config_ht, "layers", sizeof("layers") - 1)) != NULL) {
+        zend_long n = zval_get_long(val);
+        if (n < 1 || n > 64) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'layers' must be 1..64");
+            RETURN_FALSE;
+        }
+        layers = n > 1 ? (int)n : 0;
+    }
+    if (layers > 1) {
+        if (is_cube) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'layers' cannot be combined with 'cube'");
+            RETURN_FALSE;
+        }
+        if (attachment_count > 1 || samples > 1) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: array targets support a single, single-sampled attachment");
+            RETURN_FALSE;
+        }
+        if (!ctx->backend->supports_feature ||
+            !ctx->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_LAYERED) ||
+            !ctx->backend->bind_render_target_face) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_render_target: array render targets are not supported on backend '%s'", ctx->backend->name);
+            RETURN_FALSE;
+        }
+    }
+
     /* Create VioRenderTarget object */
     zval rt_zval;
     object_init_ex(&rt_zval, vio_render_target_ce);
@@ -9435,8 +9470,9 @@ ZEND_FUNCTION(vio_render_target)
     rt->width      = width;
     rt->height     = height;
     rt->depth_only = depth_only;
-    rt->samples    = samples;
+    rt->samples    = layers > 1 ? 1 : samples;
     rt->is_cube    = is_cube;
+    rt->layers     = layers;
     rt->mip_levels = mip_levels;
     rt->backend    = ctx->backend;
     rt->attachment_count = attachment_count;
@@ -9483,17 +9519,18 @@ ZEND_FUNCTION(vio_bind_render_target)
         return;
     }
 
-    /* Cube RT face bind (vio_render_target(['cube' => true])). face 0..5 =
-     * +X,-X,+Y,-Y,+Z,-Z; level selects the mip level. Same persistent-bind
-     * semantics as a plain bind. */
+    /* Cube RT face bind (vio_render_target(['cube' => true])): face 0..5 =
+     * +X,-X,+Y,-Y,+Z,-Z; level selects the mip level. Array RT ('layers' => N):
+     * the argument is the layer, 0..N-1. Same persistent-bind semantics as a
+     * plain bind. */
     if (face >= 0) {
-        if (!rt->is_cube) {
-            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: 'face' requires a cube render target");
+        if (!rt->is_cube && rt->layers <= 1) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: 'face' requires a cube or array render target");
             return;
         }
-        if (face > 5 || level < 0 || level >= rt->mip_levels) {
-            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: face must be 0..5 and level 0..%d",
-                             rt->mip_levels - 1);
+        if (face >= vio_rt_layer_count(rt) || level < 0 || level >= rt->mip_levels) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: %s must be 0..%d and level 0..%d",
+                             rt->is_cube ? "face" : "layer", vio_rt_layer_count(rt) - 1, rt->mip_levels - 1);
             return;
         }
         if (!ctx->backend->bind_render_target_face ||
@@ -9630,7 +9667,7 @@ ZEND_FUNCTION(vio_generate_mipmaps)
     int kind = -1;
     if (instanceof_function(Z_OBJCE_P(obj_zval), vio_render_target_ce)) {
         vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(obj_zval);
-        if (!rt->valid || rt->depth_only) RETURN_FALSE;
+        if (!rt->valid || rt->depth_only || rt->layers > 1) RETURN_FALSE;   /* array targets have no mip chain */
         obj = rt; kind = 0;
     } else if (instanceof_function(Z_OBJCE_P(obj_zval), vio_texture_ce)) {
         vio_texture_object *t = Z_VIO_TEXTURE_P(obj_zval);
@@ -9755,8 +9792,9 @@ ZEND_FUNCTION(vio_read_render_target)
         php_error_docref(NULL, E_WARNING, "vio_read_render_target: render target is not valid");
         RETURN_FALSE;
     }
-    if (face >= 0 && (!rt->is_cube || face > 5)) {
-        php_error_docref(NULL, E_WARNING, "vio_read_render_target: face must be 0..5 on a cube render target");
+    if (face >= 0 && ((!rt->is_cube && rt->layers <= 1) || face >= vio_rt_layer_count(rt))) {
+        php_error_docref(NULL, E_WARNING, "vio_read_render_target: face / layer must be 0..%d on a cube or array render target",
+                         vio_rt_layer_count(rt) - 1);
         RETURN_FALSE;
     }
     int rt_attachments = rt->attachment_count > 0 ? rt->attachment_count : 1;
@@ -9806,6 +9844,10 @@ ZEND_FUNCTION(vio_render_target_texture)
         RETURN_FALSE;
     }
     int att = (int)attachment;   /* MRT colour attachment index (0 == the legacy scalar fields) */
+    if (rt->is_cube) {
+        php_error_docref(NULL, E_WARNING, "vio_render_target_texture: sample a cube target through vio_render_target_cubemap()");
+        RETURN_FALSE;
+    }
 
     /* Create a VioTexture that references the render target's depth or color texture */
     zval tex_zval;
@@ -9818,6 +9860,8 @@ ZEND_FUNCTION(vio_render_target_texture)
     tex->channels = rt->depth_only ? 1 : 4;
     tex->filter   = VIO_FILTER_NEAREST;
     tex->wrap     = VIO_WRAP_CLAMP;
+    tex->layers   = rt->layers > 1 ? rt->layers : 1;
+    tex->is_array = rt->layers > 1;   /* sampler2DArray; the backend views below are arrays too */
 
     /* Return depth texture for depth-only targets, color texture otherwise */
     tex->texture_id = rt->depth_only ? rt->depth_texture : (att == 0 ? rt->color_texture : rt->color_textures[att]);

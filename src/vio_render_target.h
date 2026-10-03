@@ -47,6 +47,9 @@ typedef struct _vio_render_target_object {
     /* Cube targets: one RTV per (face, mip) — ID3D11RenderTargetView*[6 * mip_levels],
      * index face * mip_levels + level. d3d11_rtv is NULL for cube targets. */
     void        *d3d11_face_rtvs;
+    /* Cube / array targets: one DSV per layer — ID3D11DepthStencilView*[layers];
+     * d3d11_dsv aliases entry 0 (released through this array). */
+    void        *d3d11_face_dsvs;
     /* MSAA (samples > 1): the multisampled colour texture rendered into;
      * d3d11_color_tex is then the single-sample RESOLVE texture the SRV reads. */
     void        *d3d11_msaa_color_tex;        /* ID3D11Texture2D* (multisampled) */
@@ -112,9 +115,12 @@ typedef struct _vio_render_target_object {
     int          width;
     int          height;
     int          depth_only;
-    int          is_cube;             /* 1 => colour attachment is a cubemap (width == height == face size) */
+    int          is_cube;             /* 1 => colour attachment is a cubemap (width == height == face size);
+                                         with depth_only the DEPTH attachment is the cubemap */
+    int          layers;              /* > 1 => 2D array target with this many layers ('layers' => N);
+                                         colour and depth both carry every layer. 0/1 = plain 2D. */
     int          mip_levels;          /* 1, or floor(log2(size)) + 1 when created with 'mipmaps' */
-    int          bound_face;          /* cube: face currently bound as colour attachment (-1 = none) */
+    int          bound_face;          /* cube / array: face or layer currently bound (-1 = none) */
     int          bound_level;         /* cube: mip level currently bound */
     int          samples;             /* requested by vio_render_target(); backends clamp to what
                                          they support and write the effective count back (1 = off) */
@@ -135,6 +141,12 @@ typedef struct _vio_render_target_object {
     unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
     zend_object  std;
 } vio_render_target_object;
+
+/* Number of bindable layers: 6 faces for a cube, N for an array, 1 otherwise. */
+static inline int vio_rt_layer_count(const vio_render_target_object *rt)
+{
+    return rt->is_cube ? 6 : (rt->layers > 1 ? rt->layers : 1);
+}
 
 #define VIO_RT_BACKEND_NONE   0
 #define VIO_RT_BACKEND_OPENGL 1

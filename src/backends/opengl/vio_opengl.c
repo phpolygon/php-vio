@@ -1083,6 +1083,116 @@ static void opengl_destroy_render_target(void *rt_ptr)
     }
 }
 
+/* Attach one layer (cube face or array layer) at `level` of a layered target to
+ * the target's FBO, which must be bound as GL_FRAMEBUFFER. Colour and depth
+ * carry the same layer structure; depth only exists at level 0, so smaller
+ * levels render without depth (the Metal contract). */
+static void opengl_rt_attach_layer(vio_render_target_object *rt, int layer, int level)
+{
+    if (rt->is_cube) {
+        if (!rt->depth_only) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer, rt->color_texture, level);
+        }
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer,
+                               level == 0 ? rt->depth_texture : 0, 0);
+    } else {
+        if (!rt->depth_only) glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rt->color_texture, level, layer);
+        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, level == 0 ? rt->depth_texture : 0, 0, layer);
+    }
+}
+
+/* Cube ('cube' => true) and array ('layers' => N) targets: colour (optional,
+ * cube with a mip chain when requested) and DEPTH24_STENCIL8 depth with the
+ * same layer structure - a depth cube / depth array, so a later layered bind
+ * can attach all layers at once and depth_only targets sample as
+ * samplerCube / sampler2DArray. +X / layer 0 is attached initially. */
+static int opengl_create_layered_render_target(vio_render_target_object *rt, int width, int height, int hdr, int depth_only)
+{
+    GLenum target = rt->is_cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D_ARRAY;
+    int layers = vio_rt_layer_count(rt);
+    if (rt->is_cube) height = width;
+    if (rt->mip_levels < 1) rt->mip_levels = 1;
+
+    if (!depth_only) {
+        /* Mip storage is allocated up front so bind_render_target_face can
+         * target level > 0 before any glGenerateMipmap. */
+        GLint internal; GLenum base, type;
+        opengl_color_format(rt->attachment_count > 0 ? rt->formats[0] : (hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8),
+                            &internal, &base, &type);
+        glGenTextures(1, &rt->color_texture);
+        rt->color_textures[0] = rt->color_texture;
+        glBindTexture(target, rt->color_texture);
+        for (int level = 0; level < rt->mip_levels; level++) {
+            int w = width >> level, h = height >> level;
+            if (w < 1) w = 1;
+            if (h < 1) h = 1;
+            if (rt->is_cube) {
+                for (int f = 0; f < 6; f++) {
+                    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, level, internal, w, w, 0, base, type, NULL);
+                }
+            } else {
+                glTexImage3D(GL_TEXTURE_2D_ARRAY, level, internal, w, h, layers, 0, base, type, NULL);
+            }
+        }
+        glTexParameteri(target, GL_TEXTURE_MIN_FILTER, rt->mip_levels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+        glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+        glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, rt->mip_levels - 1);
+        glBindTexture(target, 0);
+    }
+
+    glGenTextures(1, &rt->depth_texture);
+    glBindTexture(target, rt->depth_texture);
+    if (rt->is_cube) {
+        for (int f = 0; f < 6; f++) {
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, 0, GL_DEPTH24_STENCIL8, width, width, 0,
+                         GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+        }
+    } else {
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH24_STENCIL8, width, height, layers, 0,
+                     GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+    }
+    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, 0);
+    glBindTexture(target, 0);
+
+    if (depth_only) {
+        glDrawBuffer(GL_NONE);
+        glReadBuffer(GL_NONE);
+    }
+    opengl_rt_attach_layer(rt, 0, 0);
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status == GL_FRAMEBUFFER_COMPLETE) {
+        /* Defined initial contents: every layer cleared, depth at 1.0. */
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glDepthMask(GL_TRUE);
+        glClearDepth(1.0);
+        for (int l = 0; l < layers; l++) {
+            opengl_rt_attach_layer(rt, l, 0);
+            glClear((depth_only ? 0 : GL_COLOR_BUFFER_BIT) | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        }
+        opengl_rt_attach_layer(rt, 0, 0);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        php_error_docref(NULL, E_WARNING, "%s render target FBO is not complete (status: 0x%04x)",
+                         rt->is_cube ? "Cube" : "Array", status);
+        return -1;
+    }
+    rt->bound_face = 0;
+    rt->bound_level = 0;
+    rt->samples = 1;
+    rt->backend_type = VIO_RT_BACKEND_OPENGL;
+    return 0;
+}
+
 static int opengl_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
@@ -1092,66 +1202,8 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
     rt->gl_generation = gl_context_generation;
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
 
-    if (rt->is_cube) {
-        /* Cubemap colour attachment (+X face bound initially) with a shared 2D
-         * depth buffer at face size. Mip storage is allocated up front so
-         * bind_render_target_face can target level > 0 before any
-         * glGenerateMipmap. */
-        if (rt->mip_levels < 1) rt->mip_levels = 1;
-        GLint cube_internal; GLenum cube_base, cube_type;
-        opengl_color_format(rt->attachment_count > 0 ? rt->formats[0] : (hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8),
-                            &cube_internal, &cube_base, &cube_type);
-        glGenTextures(1, &rt->color_texture);
-        rt->color_textures[0] = rt->color_texture;
-        glBindTexture(GL_TEXTURE_CUBE_MAP, rt->color_texture);
-        for (int level = 0; level < rt->mip_levels; level++) {
-            int dim = width >> level; if (dim < 1) dim = 1;
-            for (int f = 0; f < 6; f++) {
-                glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, level, cube_internal,
-                             dim, dim, 0, cube_base, cube_type, NULL);
-            }
-        }
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER,
-                        rt->mip_levels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, rt->mip_levels - 1);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_CUBE_MAP_POSITIVE_X, rt->color_texture, 0);
-
-        glGenTextures(1, &rt->depth_texture);
-        glBindTexture(GL_TEXTURE_2D, rt->depth_texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, width, width,
-                     0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, rt->depth_texture, 0);
-
-        GLenum cube_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (cube_status == GL_FRAMEBUFFER_COMPLETE) {
-            /* Defined initial contents: every face cleared, depth at 1.0. */
-            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-            glDepthMask(GL_TRUE);
-            for (int f = 0; f < 6; f++) {
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                       GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, rt->color_texture, 0);
-                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-            }
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                   GL_TEXTURE_CUBE_MAP_POSITIVE_X, rt->color_texture, 0);
-        }
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        if (cube_status != GL_FRAMEBUFFER_COMPLETE) {
-            php_error_docref(NULL, E_WARNING,
-                "Cube render target FBO is not complete (status: 0x%04x)", cube_status);
-            return -1;
-        }
-        rt->backend_type = VIO_RT_BACKEND_OPENGL;
-        return 0;
+    if (rt->is_cube || rt->layers > 1) {
+        return opengl_create_layered_render_target(rt, width, height, hdr, depth_only);
     }
 
     /* Depth texture (always created — shadow-map use-case needs it as SRV).
@@ -1304,11 +1356,9 @@ static void opengl_bind_render_target(void *rt_ptr)
         return;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
-    if (rt->is_cube) {
-        /* Plain bind of a cube RT targets +X at level 0. */
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_CUBE_MAP_POSITIVE_X, rt->color_texture, 0);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, rt->depth_texture, 0);
+    if (rt->is_cube || rt->layers > 1) {
+        /* Plain bind of a cube / array RT targets +X / layer 0 at level 0. */
+        opengl_rt_attach_layer(rt, 0, 0);
         rt->bound_face = 0;
         rt->bound_level = 0;
     }
@@ -1319,16 +1369,18 @@ static int opengl_bind_render_target_face(void *rt_ptr, int face, int level)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (!rt || rt->backend_type != VIO_RT_BACKEND_OPENGL || !vio_gl.initialized) return -1;
-    if (!rt->is_cube || face < 0 || face > 5 || level < 0 || level >= rt->mip_levels) return -1;
+    if ((!rt->is_cube && rt->layers <= 1) || face < 0 || face >= vio_rt_layer_count(rt) ||
+        level < 0 || level >= rt->mip_levels) return -1;
+    if (vio_gl.current_bound_rt && vio_gl.current_bound_rt != rt) {
+        opengl_rt_resolve_msaa((vio_render_target_object *)vio_gl.current_bound_rt);
+    }
+    vio_gl.current_bound_rt = rt;
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, rt->color_texture, level);
-    /* The shared depth buffer matches level 0 only; detach it for smaller levels
-     * (GL 3+ allows the mismatch but we mirror the Metal contract). */
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D,
-                           level == 0 ? rt->depth_texture : 0, 0);
-    int dim = rt->width >> level; if (dim < 1) dim = 1;
-    glViewport(0, 0, dim, dim);
+    opengl_rt_attach_layer(rt, face, level);
+    int w = rt->width >> level, h = rt->height >> level;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    glViewport(0, 0, w, h);
     rt->bound_face = face;
     rt->bound_level = level;
     return 0;
@@ -1338,8 +1390,11 @@ static int opengl_render_target_cubemap(void *rt_ptr, void *cm_obj)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
-    if (!rt || !cm || !rt->is_cube || !rt->color_texture) return -1;
-    cm->texture_id   = rt->color_texture;   /* borrowed — RT owns the GL name */
+    if (!rt || !cm || !rt->is_cube) return -1;
+    /* depth_only cube: the depth cubemap (samplerCube .r / samplerCubeShadow). */
+    unsigned int id = rt->depth_only ? rt->depth_texture : rt->color_texture;
+    if (!id) return -1;
+    cm->texture_id   = id;   /* borrowed — RT owns the GL name */
     cm->mipmaps      = rt->mip_levels > 1;
     cm->borrowed     = 1;
     cm->resolution   = rt->width;
@@ -1360,10 +1415,10 @@ static int opengl_read_render_target(void *rt_ptr, int face, int attachment, voi
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
     if (!rt->depth_only) glReadBuffer(GL_COLOR_ATTACHMENT0 + (GLenum)attachment);
-    if (rt->is_cube) {
+    int layered = rt->is_cube || rt->layers > 1;
+    if (layered) {
         int f = face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, rt->color_texture, 0);
+        opengl_rt_attach_layer(rt, f, 0);
     }
 
     if (rt->depth_only) {
@@ -1392,11 +1447,9 @@ static int opengl_read_render_target(void *rt_ptr, int face, int attachment, voi
         efree(tmp);
     }
 
-    if (rt->is_cube) {
+    if (layered) {
         /* Restore the attachment the RT had bound before the read. */
-        int bf = rt->bound_face >= 0 ? rt->bound_face : 0;
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_CUBE_MAP_POSITIVE_X + bf, rt->color_texture, rt->bound_level);
+        opengl_rt_attach_layer(rt, rt->bound_face >= 0 ? rt->bound_face : 0, rt->bound_level);
     }
     if (!rt->depth_only) glReadBuffer(GL_COLOR_ATTACHMENT0);
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
@@ -2355,6 +2408,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_GPU_TIMESTAMP:  return opengl_has_timer_query(); /* GL_TIMESTAMP queries, core 3.3 */
         case VIO_FEATURE_INDIRECT_DRAW:  return vio_gl.initialized && GLAD_GL_VERSION_4_0; /* glDraw*Indirect */
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_gl.initialized;                        /* GL_TEXTURE_2D_ARRAY, core 3.0 */
+        case VIO_FEATURE_RENDER_TARGET_LAYERED: return vio_gl.initialized;                 /* glFramebufferTextureLayer + depth cubemaps, core 3.0 */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC:                                          /* S3TC ext (BC1/BC3) + core RGTC; BC7 needs BPTC / 4.2 */
             return vio_gl.initialized && gl_has_ext("GL_EXT_texture_compression_s3tc");
         case VIO_FEATURE_CUBEMAP:        return 1;

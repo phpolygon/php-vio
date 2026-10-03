@@ -1224,8 +1224,15 @@ function vio_draw_instanced(VioContext $context, VioMesh $mesh, array|string $ma
  *
  * @param array $config ['width' => int, 'height' => int, 'depth_only' => bool, 'hdr' => bool,
  *                      'samples' => int, 'cube' => bool, 'size' => int, 'mipmaps' => bool,
- *                      'attachments' => int[]]  // MRT: 1..4 VIO_FORMAT_* colour attachments
+ *                      'attachments' => int[],  // MRT: 1..4 VIO_FORMAT_* colour attachments
  *                                               //      (fragment layout(location = i) out); needs VIO_FEATURE_MRT
+ *                      'layers' => int]         // 2..64: 2D array target (colour or depth_only, every layer with its
+ *                                               //   own depth; single attachment, single-sampled, no mips). Bind one
+ *                                               //   layer with vio_bind_render_target($ctx, $rt, $layer), read it with
+ *                                               //   vio_read_render_target($rt, $layer), sample the whole array as
+ *                                               //   sampler2DArray via vio_render_target_texture(). 'cube' + 'depth_only'
+ *                                               //   gives a depth cube (vio_render_target_cubemap). Both need
+ *                                               //   VIO_FEATURE_RENDER_TARGET_LAYERED.
  * @return VioRenderTarget|false Render target or false on failure
  */
 function vio_render_target(VioContext $context, array $config): VioRenderTarget|false {}
