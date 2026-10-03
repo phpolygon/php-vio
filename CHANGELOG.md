@@ -1,3 +1,11 @@
+## [2.29.1](https://github.com/phpolygon/php-vio/compare/v2.29.0...v2.29.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **d3d12:** generate mipmaps inside a frame without draining the GPU ([93043c7](https://github.com/phpolygon/php-vio/commit/93043c70f12db4a609baf969c6821a2f9768769b))
+* vio_set_uniform("name[i]") for arrays of matrices and vectors ([2e9c1cc](https://github.com/phpolygon/php-vio/commit/2e9c1ccb75d66163023ac3e7339f5d6aabc3df21))
+
 # [2.29.0](https://github.com/phpolygon/php-vio/compare/v2.28.0...v2.29.0) (2026-10-03)
 
 
