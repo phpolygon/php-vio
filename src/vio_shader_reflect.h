@@ -16,6 +16,11 @@
  * Returns malloc'd string (caller frees). NULL on failure. */
 char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, char **error_msg);
 
+/* Add #extension GL_ARB_shader_viewport_layer_array to a vertex / TES GLSL
+ * source that uses gl_Layer / gl_ViewportIndex without declaring it. Takes
+ * ownership of the malloc'd source, returns the (possibly new) string. */
+char *vio_glsl_require_viewport_layer_ext(char *glsl);
+
 /* Transpile a COMPUTE SPIR-V module to GLSL (target version >= 430, clamped).
  * Unlike vio_spirv_to_glsl(), keeps UBOs as std140 blocks and SSBOs as std430
  * blocks with their explicit `binding =` qualifiers (required by the OpenGL
