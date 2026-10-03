@@ -29,6 +29,11 @@
 static const char *vio_hlsl_probe_source(int stage)
 {
     switch (stage) {
+        case VIO_PROBE_GS_INSTANCED:
+            /* GS instancing (layout(invocations = N)): [instance(N)] in HLSL. */
+            return "#version 450\nlayout(points, invocations = 4) in;\nlayout(triangle_strip, max_vertices = 3) out;\n"
+                   "layout(location = 0) in vec4 vPos[];\n"
+                   "void main(){ for (int i = 0; i < 3; i++) { gl_Position = vPos[0] + vec4(float(gl_InvocationID), float(i), 0.0, 0.0); EmitVertex(); } EndPrimitive(); }\n";
         case VIO_STAGE_VERTEX:
             return "#version 330 core\nlayout(location=0) in vec3 p;\nvoid main(){ gl_Position = vec4(p, 1.0); }\n";
         case VIO_STAGE_FRAGMENT:
@@ -50,10 +55,16 @@ static const char *vio_hlsl_probe_source(int stage)
     }
 }
 
+/* Shader stage a probe compiles as (probe variants map onto a real stage). */
+static int vio_hlsl_probe_stage(int probe)
+{
+    return probe == VIO_PROBE_GS_INSTANCED ? VIO_STAGE_GEOMETRY : probe;
+}
+
 int vio_hlsl_stage_supported(int stage)
 {
-    static int cache[VIO_STAGE_COUNT] = { -1, -1, -1, -1, -1 };
-    if (stage < 0 || stage >= VIO_STAGE_COUNT) return 0;
+    static int cache[VIO_PROBE_COUNT] = { -1, -1, -1, -1, -1, -1 };
+    if (stage < 0 || stage >= VIO_PROBE_COUNT) return 0;
     if (cache[stage] >= 0) return cache[stage];
 
     int ok = 0;
@@ -61,7 +72,7 @@ int vio_hlsl_stage_supported(int stage)
     if (src) {
         size_t spirv_size = 0;
         char *err = NULL;
-        uint32_t *spirv = vio_compile_glsl_stage_to_spirv(src, stage, &spirv_size, &err);
+        uint32_t *spirv = vio_compile_glsl_stage_to_spirv(src, vio_hlsl_probe_stage(stage), &spirv_size, &err);
         if (!spirv && getenv("VIO_DEBUG_STAGE_PROBE")) {
             fprintf(stderr, "[vio] stage probe %d: GLSL->SPIR-V failed: %s\n", stage, err ? err : "unknown");
         }
@@ -87,7 +98,7 @@ char *vio_hlsl_probe_hlsl(int stage, int shader_model)
     if (!src) return NULL;
     size_t spirv_size = 0;
     char *err = NULL;
-    uint32_t *spirv = vio_compile_glsl_stage_to_spirv(src, stage, &spirv_size, &err);
+    uint32_t *spirv = vio_compile_glsl_stage_to_spirv(src, vio_hlsl_probe_stage(stage), &spirv_size, &err);
     if (err) free(err);
     if (!spirv) return NULL;
     err = NULL;

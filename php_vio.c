@@ -1888,6 +1888,99 @@ ZEND_FUNCTION(vio_pixel_ratio)
     RETURN_DOUBLE(1.0);
 }
 
+/* vio_mesh(['adjacency' => true]): turn a triangle list (indices or implicit
+ * 0..n-1) into a VIO_TRIANGLES_ADJACENCY index list - per triangle
+ * a, n(ab), b, n(bc), c, n(ca), where n(xy) is the vertex of the neighbouring
+ * triangle opposite the shared edge. Edges are matched by vertex POSITION (the
+ * first 3 floats), so meshes that duplicate vertices per face for their
+ * normals / UVs still find their neighbours. An open edge repeats the
+ * triangle's own opposite vertex. Returns an emalloc'd list of 2 * tri_index_count
+ * indices, or NULL. */
+typedef struct { float p[3]; unsigned int idx; } vio_adj_vert;
+typedef struct { uint64_t key; unsigned int tri; unsigned int opp; } vio_adj_edge;
+
+static int vio_adj_vert_cmp(const void *a, const void *b)
+{
+    const vio_adj_vert *x = (const vio_adj_vert *)a, *y = (const vio_adj_vert *)b;
+    int c = memcmp(x->p, y->p, sizeof(x->p));
+    return c ? c : (x->idx < y->idx ? -1 : x->idx > y->idx);
+}
+
+static int vio_adj_edge_cmp(const void *a, const void *b)
+{
+    const vio_adj_edge *x = (const vio_adj_edge *)a, *y = (const vio_adj_edge *)b;
+    if (x->key != y->key) return x->key < y->key ? -1 : 1;
+    return x->tri < y->tri ? -1 : x->tri > y->tri;
+}
+
+static unsigned int *vio_mesh_build_adjacency(const float *data, int floats_per_vertex, int vertex_count,
+                                              const unsigned int *indices, int index_count)
+{
+    int n = indices ? index_count : vertex_count;
+    if (n < 3 || n % 3 != 0 || floats_per_vertex < 3) return NULL;
+    int tris = n / 3;
+    /* Canonical id per vertex: the smallest index with the same position. */
+    vio_adj_vert *verts = emalloc(sizeof(vio_adj_vert) * (size_t)vertex_count);
+    unsigned int *canon = emalloc(sizeof(unsigned int) * (size_t)vertex_count);
+    for (int v = 0; v < vertex_count; v++) {
+        memcpy(verts[v].p, data + (size_t)v * floats_per_vertex, sizeof(verts[v].p));
+        verts[v].idx = (unsigned int)v;
+    }
+    qsort(verts, (size_t)vertex_count, sizeof(vio_adj_vert), vio_adj_vert_cmp);
+    for (int v = 0; v < vertex_count; v++) {
+        int same = v > 0 && memcmp(verts[v].p, verts[v - 1].p, sizeof(verts[v].p)) == 0;
+        canon[verts[v].idx] = same ? canon[verts[v - 1].idx] : verts[v].idx;
+    }
+    efree(verts);
+
+    /* One record per (triangle, edge), keyed by the unordered canonical pair. */
+    vio_adj_edge *edges = emalloc(sizeof(vio_adj_edge) * (size_t)n);
+    for (int t = 0; t < tris; t++) {
+        for (int e = 0; e < 3; e++) {
+            unsigned int i0 = indices ? indices[t * 3 + e] : (unsigned int)(t * 3 + e);
+            unsigned int i1 = indices ? indices[t * 3 + (e + 1) % 3] : (unsigned int)(t * 3 + (e + 1) % 3);
+            unsigned int i2 = indices ? indices[t * 3 + (e + 2) % 3] : (unsigned int)(t * 3 + (e + 2) % 3);
+            if (i0 >= (unsigned int)vertex_count || i1 >= (unsigned int)vertex_count || i2 >= (unsigned int)vertex_count) {
+                efree(edges); efree(canon);
+                return NULL;
+            }
+            uint64_t a = canon[i0], b = canon[i1];
+            edges[t * 3 + e].key = a < b ? (a << 32) | b : (b << 32) | a;
+            edges[t * 3 + e].tri = (unsigned int)t;
+            edges[t * 3 + e].opp = i2;
+        }
+    }
+    unsigned int *out = emalloc(sizeof(unsigned int) * (size_t)n * 2);
+    for (int t = 0; t < tris; t++) {
+        for (int e = 0; e < 3; e++) {
+            unsigned int i0 = indices ? indices[t * 3 + e] : (unsigned int)(t * 3 + e);
+            out[t * 6 + e * 2]     = i0;
+            out[t * 6 + e * 2 + 1] = edges[t * 3 + e].opp;   /* open edge: own opposite vertex */
+        }
+    }
+    /* Pair the records of each shared edge: the neighbour's opposite vertex. */
+    qsort(edges, (size_t)n, sizeof(vio_adj_edge), vio_adj_edge_cmp);
+    for (int i = 0; i + 1 < n; i++) {
+        if (edges[i].key != edges[i + 1].key || edges[i].tri == edges[i + 1].tri) continue;
+        for (int k = 0; k < 2; k++) {
+            const vio_adj_edge *self = &edges[i + k], *other = &edges[i + 1 - k];
+            unsigned int t = self->tri;
+            for (int e = 0; e < 3; e++) {
+                /* The slot whose stored opposite vertex is this record's. */
+                if (out[t * 6 + e * 2 + 1] == self->opp &&
+                    (indices ? indices[t * 3 + (e + 2) % 3] : (unsigned int)(t * 3 + (e + 2) % 3)) == self->opp) {
+                    out[t * 6 + e * 2 + 1] = other->opp;
+                    break;
+                }
+            }
+        }
+        i++;   /* a manifold edge has two records; skip the partner */
+    }
+    efree(edges);
+    efree(canon);
+    return out;
+}
+
 ZEND_FUNCTION(vio_mesh)
 {
     zval *ctx_zval;
@@ -2044,6 +2137,20 @@ ZEND_FUNCTION(vio_mesh)
         ZEND_HASH_FOREACH_VAL(indices_ht, val) {
             indices[j++] = (unsigned int)zval_get_long(val);
         } ZEND_HASH_FOREACH_END();
+    }
+
+    zval *adj_zval = zend_hash_str_find(config_ht, "adjacency", sizeof("adjacency") - 1);
+    if (adj_zval && zend_is_true(adj_zval)) {
+        unsigned int *adj = vio_mesh_build_adjacency(data, floats_per_vertex, vertex_count, indices, index_count);
+        if (!adj) {
+            php_error_docref(NULL, E_WARNING, "vio_mesh: 'adjacency' needs a triangle list (3 indices / vertices per triangle, in range)");
+            efree(data);
+            if (indices) efree(indices);
+            RETURN_FALSE;
+        }
+        index_count = (indices ? index_count : vertex_count) * 2;
+        if (indices) efree(indices);
+        indices = adj;
     }
 
     /* Index width (GAP-PHASE5 Block 2): 16-bit when every index fits, which
@@ -3088,6 +3195,12 @@ ZEND_FUNCTION(vio_pipeline)
     }
     /* Patches without a tessellation stage are invalid on every API (GL
      * INVALID_OPERATION, Vulkan / D3D12 reject the pipeline); refuse up front. */
+    if (pipe->topology >= VIO_LINES_ADJACENCY && pipe->topology <= VIO_TRIANGLE_STRIP_ADJACENCY && !shader->has_geometry) {
+        /* The neighbour vertices only reach a geometry stage. */
+        php_error_docref(NULL, E_WARNING, "vio_pipeline: adjacency topologies need a shader with a 'geometry' stage");
+        zval_ptr_dtor(&pipe_zval);
+        RETURN_FALSE;
+    }
     if (pipe->topology == VIO_PATCHES && !shader->has_tessellation) {
         php_error_docref(NULL, E_WARNING, "vio_pipeline: VIO_PATCHES needs a shader with 'tess_control' and 'tess_eval' stages");
         zval_ptr_dtor(&pipe_zval);
@@ -8286,6 +8399,11 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_RT_ALL_LAYERS", VIO_RT_ALL_LAYERS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_VIEWPORT", VIO_FEATURE_MULTI_VIEWPORT, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_MAX_VIEWPORTS", VIO_MAX_VIEWPORTS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_GEOMETRY_INSTANCING", VIO_FEATURE_GEOMETRY_INSTANCING, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_TRIANGLE_STRIP_ADJACENCY", VIO_TRIANGLE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X1", VIO_SHADING_RATE_1X1, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X2", VIO_SHADING_RATE_1X2, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_2X1", VIO_SHADING_RATE_2X1, CONST_CS | CONST_PERSISTENT);

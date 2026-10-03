@@ -3001,6 +3001,8 @@ static int vulkan_supports_feature(vio_feature feature)
          * device features (every desktop GPU; MoltenVK lacks geometry). */
         case VIO_FEATURE_TESSELLATION: return vio_vk3d_available() && vio_vk.device && vio_vk.tessellation_supported;
         case VIO_FEATURE_GEOMETRY:     return vio_vk3d_available() && vio_vk.device && vio_vk.geometry_supported;
+        /* geometryShader implies maxGeometryShaderInvocations >= 32 (spec minimum). */
+        case VIO_FEATURE_GEOMETRY_INSTANCING: return vio_vk3d_available() && vio_vk.device && vio_vk.geometry_supported;
         case VIO_FEATURE_3D_PIPELINE:  return vio_vk3d_available(); /* GAP-PHASE5 Block 10 */
         case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
         case VIO_FEATURE_MULTIVIEW:    return 0; /* VK_KHR_multiview not wired */

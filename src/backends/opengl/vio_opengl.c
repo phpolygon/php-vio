@@ -377,6 +377,10 @@ static GLenum gl_topology_mode(vio_topology t)
         case VIO_LINES:          return GL_LINES;
         case VIO_LINE_STRIP:     return GL_LINE_STRIP;
         case VIO_POINTS:         return GL_POINTS;
+        case VIO_LINES_ADJACENCY:          return GL_LINES_ADJACENCY;
+        case VIO_LINE_STRIP_ADJACENCY:     return GL_LINE_STRIP_ADJACENCY;
+        case VIO_TRIANGLES_ADJACENCY:      return GL_TRIANGLES_ADJACENCY;
+        case VIO_TRIANGLE_STRIP_ADJACENCY: return GL_TRIANGLE_STRIP_ADJACENCY;
         case VIO_PATCHES:        return GL_PATCHES;
         case VIO_TRIANGLES:
         default:                 return GL_TRIANGLES;
@@ -2418,6 +2422,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_COMPUTE:        return vio_gl.caps.has_compute_shader;
         case VIO_FEATURE_TESSELLATION:   return vio_gl.caps.has_tessellation;
         case VIO_FEATURE_GEOMETRY:       return gl_ge(3, 2);   /* core in 3.3+ */
+        case VIO_FEATURE_GEOMETRY_INSTANCING: return gl_ge(4, 0) || gl_has_ext("GL_ARB_gpu_shader5");
         case VIO_FEATURE_3D_PIPELINE:    return 1;
         case VIO_FEATURE_RAYTRACING:
         case VIO_FEATURE_MULTIVIEW:      return 0;             /* not exposed via core GL */

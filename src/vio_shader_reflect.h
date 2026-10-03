@@ -52,6 +52,12 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
  * trip of a few lines of GLSL) and cached. Returns 1 / 0. */
 int vio_hlsl_stage_supported(int stage);
 
+/* Probe variants beyond the plain stages, accepted by vio_hlsl_stage_supported
+ * / vio_hlsl_probe_hlsl and the D3D backends' stage probes:
+ * VIO_PROBE_GS_INSTANCED = a geometry stage with layout(invocations = N). */
+#define VIO_PROBE_GS_INSTANCED VIO_STAGE_COUNT
+#define VIO_PROBE_COUNT        (VIO_STAGE_COUNT + 1)
+
 /* The transpiled HLSL of the canonical probe stage (malloc'd, caller frees;
  * NULL when glslang / SPIRV-Cross cannot produce it). The D3D backends feed it
  * through FXC as the second half of the probe: SPIRV-Cross may emit HLSL that

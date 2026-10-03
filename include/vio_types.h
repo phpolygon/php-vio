@@ -42,6 +42,13 @@ typedef enum _vio_topology {
      * (vio_pipeline 'patch_vertices', default 3). Implied whenever the
      * pipeline's shader carries a tessellation-control stage. */
     VIO_PATCHES        = 6,
+    /* Primitives with their neighbours (geometry stage only, gl_in has 4 / 6
+     * vertices): silhouettes, outlines, shadow volumes. vio_mesh(['adjacency'
+     * => true]) builds the TRIANGLES_ADJACENCY index buffer from a triangle list. */
+    VIO_LINES_ADJACENCY          = 7,
+    VIO_LINE_STRIP_ADJACENCY     = 8,
+    VIO_TRIANGLES_ADJACENCY      = 9,
+    VIO_TRIANGLE_STRIP_ADJACENCY = 10,
 } vio_topology;
 
 /* ── Cull mode ────────────────────────────────────────────────────── */
@@ -282,6 +289,9 @@ typedef enum _vio_feature {
      * in the geometry stage (or the vertex stage with VIO_FEATURE_VERTEX_LAYER)
      * picks one per primitive - all CSM cascades into one atlas in one pass. */
     VIO_FEATURE_MULTI_VIEWPORT     = 42,
+    /* Geometry-shader instancing: layout(invocations = N) runs the GS N times
+     * per input primitive (gl_InvocationID), e.g. one invocation per cube face. */
+    VIO_FEATURE_GEOMETRY_INSTANCING = 43,
 } vio_feature;
 
 #define VIO_MAX_VIEWPORTS 16

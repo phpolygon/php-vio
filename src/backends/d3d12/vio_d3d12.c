@@ -294,6 +294,10 @@ static D3D12_PRIMITIVE_TOPOLOGY vio_topology_to_d3d12(vio_topology t, int patch_
         case VIO_LINES:          return D3D_PRIMITIVE_TOPOLOGY_LINELIST;
         case VIO_LINE_STRIP:     return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
         case VIO_POINTS:         return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+        case VIO_LINES_ADJACENCY:          return D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
+        case VIO_LINE_STRIP_ADJACENCY:     return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ;
+        case VIO_TRIANGLES_ADJACENCY:      return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ;
+        case VIO_TRIANGLE_STRIP_ADJACENCY: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
         case VIO_TRIANGLE_FAN:   return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         case VIO_PATCHES: {
             /* N_CONTROL_POINT_PATCHLIST values are contiguous from 1 (=33). */
@@ -314,6 +318,10 @@ static D3D12_PRIMITIVE_TOPOLOGY_TYPE vio_topology_to_d3d12_type(vio_topology t)
         case VIO_LINES:
         case VIO_LINE_STRIP:     return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
         case VIO_POINTS:         return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        case VIO_LINES_ADJACENCY:
+        case VIO_LINE_STRIP_ADJACENCY:     return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        case VIO_TRIANGLES_ADJACENCY:
+        case VIO_TRIANGLE_STRIP_ADJACENCY: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         case VIO_PATCHES:        return D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
         default:                 return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     }
@@ -5587,8 +5595,8 @@ static double d3d12_gpu_frame_time(void)
  * stage's SPIRV-Cross HLSL must also pass FXC for the SM 5.1 profile. */
 static int d3d12_stage_supported(int stage, const char *profile)
 {
-    static int cache[VIO_STAGE_COUNT] = { -1, -1, -1, -1, -1 };
-    if (stage < 0 || stage >= VIO_STAGE_COUNT) return 0;
+    static int cache[VIO_PROBE_COUNT] = { -1, -1, -1, -1, -1, -1 };
+    if (stage < 0 || stage >= VIO_PROBE_COUNT) return 0;
     if (cache[stage] >= 0) return cache[stage];
     int ok = 0;
     if (vio_hlsl_stage_supported(stage)) {
@@ -5625,6 +5633,7 @@ static int d3d12_supports_feature(vio_feature feature)
             return d3d12_stage_supported(VIO_STAGE_TESS_CONTROL, "hs_5_1")
                 && d3d12_stage_supported(VIO_STAGE_TESS_EVAL, "ds_5_1");
         case VIO_FEATURE_GEOMETRY:     return d3d12_stage_supported(VIO_STAGE_GEOMETRY, "gs_5_1");
+        case VIO_FEATURE_GEOMETRY_INSTANCING: return d3d12_stage_supported(VIO_PROBE_GS_INSTANCED, "gs_5_1");   /* [instance(N)] */
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
         case VIO_FEATURE_MULTIVIEW:    return 0;
         case VIO_FEATURE_3D_PIPELINE:  return 1;
