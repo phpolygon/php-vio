@@ -3007,6 +3007,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_VERTEX_STORAGE: return vio_vk3d_available(); /* storage bindings 18.. in the vertex stage */
         case VIO_FEATURE_INDIRECT_DRAW:  return vio_vk3d_available(); /* vkCmdDraw(Indexed)Indirect (GAP-PHASE5 Block 8) */
         case VIO_FEATURE_RENDER_TARGET_CUBE: return vio_vk3d_available(); /* framebuffer per (face, level) (Block 10b) */
+        case VIO_FEATURE_RENDER_TARGET_LAYERED: return vio_vk3d_available(); /* array / depth-cube images, framebuffer per layer */
         case VIO_FEATURE_MRT:            return vio_vk3d_available(); /* up to 4 colour attachments (Block 10b) */
         case VIO_FEATURE_MIPMAP_GEN:     return vio_vk3d_available(); /* vkCmdBlitImage chain (Block 10b) */
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_vk3d_available(); /* 2D array views, stored chains (Block 10c) */

@@ -76,6 +76,7 @@ typedef struct _vio_vulkan_compute_buffer {
 typedef struct _vio_vk_rt {
     int            count;          /* colour attachments (0 = depth-only) */
     int            cube;           /* 6-layer colour image, one framebuffer per (face, level) */
+    int            layers;         /* bindable layers: 6 (cube), N (array, 'layers' => N) or 1 */
     int            levels;         /* mip levels of the colour image */
     int            samples;        /* effective sample count (1 = off) */
     VkFormat       color_format[4];
@@ -91,9 +92,10 @@ typedef struct _vio_vk_rt {
     VkRenderPass   pass;           /* colour (+ resolve) + depth, CLEAR */
     VkRenderPass   pass_nodepth;   /* cube levels > 0 */
     VkFramebuffer  fb;             /* 2D targets */
-    VkFramebuffer *face_fb;        /* cube: [face * levels + level] */
-    VkImageView   *face_view;
-    VkImageView    cube_view;
+    VkFramebuffer *face_fb;        /* cube / array: [layer * levels + level] */
+    VkImageView   *face_view;      /* colour view per (layer, level) */
+    VkImageView   *depth_face_view;/* cube / array: depth view per layer (level 0) */
+    VkImageView    cube_view;      /* colour CUBE view, or the colour 2D_ARRAY view of an array */
     VkSampler      sampler;
     struct _vio_vulkan_texture *wrap[4];   /* sampling wrappers (vio_render_target_texture) */
     struct _vio_vulkan_texture *cube_wrap; /* vio_render_target_cubemap */
