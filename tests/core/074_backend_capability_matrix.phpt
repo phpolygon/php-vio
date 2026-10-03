@@ -55,6 +55,7 @@ probe("opengl", [
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,
     VIO_FEATURE_MIPMAP_GEN         => 1,
     VIO_FEATURE_MRT                => 1,
+    VIO_FEATURE_RENDER_TARGET_LAYERED => 1,   /* GL_TEXTURE_2D_ARRAY / depth cubemaps (GEOMETRY-STAGES-PLAN 1a) */
     VIO_FEATURE_RAYTRACING         => 0,
     VIO_FEATURE_MULTIVIEW          => 0,
 ]);
@@ -76,6 +77,7 @@ probe("null", [
     VIO_FEATURE_TEXTURE_ARRAY      => 0,
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 0,
     VIO_FEATURE_SHADING_RATE       => 0,
+    VIO_FEATURE_RENDER_TARGET_LAYERED => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -126,6 +128,7 @@ $d3d_common = [
     VIO_FEATURE_INDIRECT_DRAW      => 1,   /* ExecuteIndirect / Draw*Indirect (GAP-PHASE5 8) */
     VIO_FEATURE_TEXTURE_ARRAY      => 1,   /* Texture2D arrays (GAP-PHASE5 9) */
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1, /* BC1-BC7 (GAP-PHASE5 9) */
+    VIO_FEATURE_RENDER_TARGET_LAYERED => 1, /* RTV / DSV per array slice (GEOMETRY-STAGES-PLAN 1a) */
     /* TESSELLATION / GEOMETRY are not pinned for D3D: the GPU side always has
      * the stages, but the flag also requires a SPIRV-Cross that can emit HLSL
      * for them (vio_hlsl_stage_supported - older Vulkan-SDK builds cannot).
@@ -163,6 +166,7 @@ probe_fold("vulkan", [
     VIO_FEATURE_MIPMAP_GEN         => 1,
     VIO_FEATURE_TEXTURE_ARRAY      => 1,   /* GAP-PHASE5 10c */
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1,   /* textureCompressionBC (every desktop GPU) */
+    VIO_FEATURE_RENDER_TARGET_LAYERED => 1,   /* framebuffer per array layer (GEOMETRY-STAGES-PLAN 1a) */
     VIO_FEATURE_INSTANCED_DRAW     => 1,
     VIO_FEATURE_DEPTH_BIAS         => 1,
     /* TESSELLATION / GEOMETRY follow the device features geometryShader /
