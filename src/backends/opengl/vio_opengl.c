@@ -101,12 +101,15 @@ static unsigned gl_uloc_hash(GLuint program, const char *name)
     return h;
 }
 
+static void gl_shadow_forget_program(GLuint program);
+
 static void gl_uloc_forget_program(GLuint program)
 {
     if (!program) return;
     for (int i = 0; i < GL_ULOC_CACHE_SIZE; i++) {
         if (gl_uloc_cache[i].program == program) gl_uloc_cache[i].program = 0;
     }
+    gl_shadow_forget_program(program);
 }
 
 /* Copy `name` into `out`, rewriting every "[<digits>]" to "[0]" — the form in
@@ -1703,6 +1706,126 @@ static int opengl_upload_font_atlas(void *font_obj, int width, int height,
     return 0;
 }
 
+/* ── Comparison sampling (sampler*Shadow) ────────────────────────────
+ *
+ * A depth texture sampled through sampler2DShadow / sampler2DArrayShadow /
+ * samplerCubeShadow needs GL_TEXTURE_COMPARE_MODE, and without it the result
+ * is undefined. The texture itself must stay without compare mode, because
+ * the same depth target is also read manually (texture(sampler2D, uv).r).
+ * So vio keeps the texture as it is and binds a sampler object with compare
+ * mode to every unit a shadow sampler of the CURRENT program reads, for the
+ * duration of one draw - the D3D model (comparison sampler chosen by the
+ * shader's sampler type): LEQUAL, linear (hardware PCF), clamp to an opaque
+ * white border. The units are released after the draw so the 2D batch and
+ * later draws sample them normally. */
+#define GL_SHADOW_CACHE_SIZE 64
+#define GL_SHADOW_MAX_LOCS   16
+
+typedef struct {
+    GLuint program;                    /* 0 = empty slot */
+    int    count;                      /* shadow sampler locations (array elements expanded) */
+    GLint  locs[GL_SHADOW_MAX_LOCS];
+} gl_shadow_entry;
+
+static gl_shadow_entry gl_shadow_cache[GL_SHADOW_CACHE_SIZE];
+static GLuint   gl_cmp_sampler;
+static unsigned gl_cmp_sampler_gen;
+
+static void gl_shadow_forget_program(GLuint program)
+{
+    for (int i = 0; i < GL_SHADOW_CACHE_SIZE; i++) {
+        if (gl_shadow_cache[i].program == program) gl_shadow_cache[i].program = 0;
+    }
+}
+
+static int gl_is_shadow_sampler_type(GLenum type)
+{
+    switch (type) {
+        case GL_SAMPLER_1D_SHADOW:
+        case GL_SAMPLER_2D_SHADOW:
+        case GL_SAMPLER_1D_ARRAY_SHADOW:
+        case GL_SAMPLER_2D_ARRAY_SHADOW:
+        case GL_SAMPLER_2D_RECT_SHADOW:
+        case GL_SAMPLER_CUBE_SHADOW:
+        case GL_SAMPLER_CUBE_MAP_ARRAY_SHADOW:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* The program's shadow-sampler locations, collected once per program. */
+static const gl_shadow_entry *gl_shadow_entry_for(GLuint program)
+{
+    unsigned slot = (program * 2654435761u) % GL_SHADOW_CACHE_SIZE;
+    gl_shadow_entry *e = &gl_shadow_cache[slot];
+    if (e->program == program) return e;
+    e->program = program;
+    e->count = 0;
+    GLint active = 0;
+    glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &active);
+    for (GLint u = 0; u < active && e->count < GL_SHADOW_MAX_LOCS; u++) {
+        char name[128];
+        GLint size = 0;
+        GLenum type = 0;
+        glGetActiveUniform(program, (GLuint)u, sizeof(name), NULL, &size, &type, name);
+        if (!gl_is_shadow_sampler_type(type)) continue;
+        /* Array elements may not have consecutive locations: query each one. */
+        char *bracket = strchr(name, '[');
+        if (bracket) *bracket = '\0';
+        for (GLint k = 0; k < size && e->count < GL_SHADOW_MAX_LOCS; k++) {
+            char elem[160];
+            if (size > 1) snprintf(elem, sizeof(elem), "%s[%d]", name, (int)k);
+            else snprintf(elem, sizeof(elem), "%s", name);
+            GLint loc = glGetUniformLocation(program, elem);
+            if (loc >= 0) e->locs[e->count++] = loc;
+        }
+    }
+    return e;
+}
+
+/* Bind the comparison sampler to every unit the current program's shadow
+ * samplers read; returns the bound units as a bit mask for gl_shadow_end(). */
+static unsigned gl_shadow_begin(void)
+{
+    if (!glBindSampler || !glGenSamplers) return 0;
+    GLint program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    if (program <= 0) return 0;
+    const gl_shadow_entry *e = gl_shadow_entry_for((GLuint)program);
+    if (e->count == 0) return 0;
+    if (!gl_cmp_sampler || gl_cmp_sampler_gen != gl_context_generation) {
+        /* Sampler objects belong to a context: a new context gets its own. */
+        glGenSamplers(1, &gl_cmp_sampler);
+        gl_cmp_sampler_gen = gl_context_generation;
+        static const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_BORDER);
+        glSamplerParameterfv(gl_cmp_sampler, GL_TEXTURE_BORDER_COLOR, white);
+    }
+    unsigned mask = 0;
+    for (int i = 0; i < e->count; i++) {
+        GLint unit = 0;
+        glGetUniformiv((GLuint)program, e->locs[i], &unit);
+        if (unit < 0 || unit >= 32 || (mask & (1u << unit))) continue;
+        glBindSampler((GLuint)unit, gl_cmp_sampler);
+        mask |= 1u << unit;
+    }
+    return mask;
+}
+
+static void gl_shadow_end(unsigned mask)
+{
+    for (GLuint unit = 0; mask; unit++, mask >>= 1) {
+        if (mask & 1u) glBindSampler(unit, 0);
+    }
+}
+
 static void opengl_draw_mesh(void *mesh_obj)
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
@@ -1721,6 +1844,7 @@ static void opengl_draw_mesh(void *mesh_obj)
         used_default = 1;
     }
 
+    unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
     if (mesh->index_count > 0) {
         glDrawElements(gl_draw_mode(), mesh->index_count, mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0);
@@ -1728,6 +1852,7 @@ static void opengl_draw_mesh(void *mesh_obj)
         glDrawArrays(gl_draw_mode(), 0, mesh->vertex_count);
     }
     glBindVertexArray(0);
+    gl_shadow_end(shadow_units);
 
     if (used_default) {
         glUseProgram(0);
@@ -1760,6 +1885,7 @@ static void opengl_draw_mesh_instanced(void *mesh_obj,
         glVertexAttribDivisor(loc, 1);
     }
 
+    unsigned shadow_units = gl_shadow_begin();
     if (mesh->index_count > 0) {
         glDrawElementsInstanced(gl_draw_mode(), mesh->index_count,
                                 mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
@@ -1767,6 +1893,7 @@ static void opengl_draw_mesh_instanced(void *mesh_obj,
         glDrawArraysInstanced(gl_draw_mode(), 0, mesh->vertex_count,
                               (GLsizei)instance_count);
     }
+    gl_shadow_end(shadow_units);
 
     for (int col = 0; col < 4; col++) {
         glVertexAttribDivisor((GLuint)(3 + col), 0);
@@ -1804,6 +1931,7 @@ static void opengl_draw_instanced_from_storage(void *mesh_obj, int instance_coun
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!vio_gl.initialized || instance_count <= 0) return;
 
+    unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
     if (mesh->index_count > 0) {
         glDrawElementsInstanced(gl_draw_mode(), mesh->index_count,
@@ -1813,6 +1941,7 @@ static void opengl_draw_instanced_from_storage(void *mesh_obj, int instance_coun
                               (GLsizei)instance_count);
     }
     glBindVertexArray(0);
+    gl_shadow_end(shadow_units);
 }
 
 /* Indirect draw (GAP-PHASE5 Block 8, GL >= 4.0): the SSBO doubles as the
@@ -1823,6 +1952,7 @@ static void opengl_draw_indirect(void *mesh_obj, void *args_buffer, int max_draw
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_opengl_compute_buffer *args = (vio_opengl_compute_buffer *)args_buffer;
     if (!vio_gl.initialized || !GLAD_GL_VERSION_4_0 || !mesh || !args || !args->ssbo || max_draws <= 0) return;
+    unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, args->ssbo);
     if (mesh->index_count > 0) {
@@ -1837,6 +1967,7 @@ static void opengl_draw_indirect(void *mesh_obj, void *args_buffer, int max_draw
     }
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
     glBindVertexArray(0);
+    gl_shadow_end(shadow_units);
 }
 
 static int gl_has_ext(const char *name);   /* defined with the caps setup below */
