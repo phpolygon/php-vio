@@ -507,7 +507,8 @@ jobs:
             tests/render3d/140_hlsl_stage_override_all_backends.phpt `
             tests/render3d/141_shadow_comparison_samplers_all_backends.phpt `
             tests/render3d/142_render_target_rebind_keeps_content_all_backends.phpt `
-            tests/render3d/143_gs_gl_in_position_all_backends.phpt
+            tests/render3d/143_gs_gl_in_position_all_backends.phpt `
+            tests/render3d/144_tessellation_gl_conventions_all_backends.phpt
 
       - name: Package binary
         shell: pwsh
