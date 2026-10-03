@@ -3154,6 +3154,7 @@ static int d3d11_supports_feature(vio_feature feature)
          * also pick the slice (SV_RenderTargetArrayIndex from the GS). */
         case VIO_FEATURE_LAYERED_RENDER: return d3d11_stage_supported(VIO_STAGE_GEOMETRY, "gs_5_0") ||
                                                 d3d11_supports_feature(VIO_FEATURE_VERTEX_LAYER);
+        case VIO_FEATURE_MULTI_VIEWPORT: return 1;   /* RSSetViewports(n), every feature level */
         case VIO_FEATURE_VERTEX_LAYER: {
             /* SV_RenderTargetArrayIndex from the vertex shader is a D3D11.3 cap. */
             if (!vio_d3d11.device) return 0;
@@ -3305,6 +3306,24 @@ static void d3d11_set_viewport(int x, int y, int width, int height)
     ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, 1, &vp);
 }
 
+/* RSSetViewports with several entries; SV_ViewportArrayIndex picks one. The
+ * 3D rasterizer state does not scissor (only the 2D batch does). */
+static int d3d11_set_viewports(const int *rects, int count)
+{
+    D3D11_VIEWPORT vps[VIO_MAX_VIEWPORTS];
+    if (!vio_d3d11.context || count < 1 || count > VIO_MAX_VIEWPORTS) return -1;
+    for (int i = 0; i < count; i++) {
+        vps[i].TopLeftX = (float)rects[i * 4];
+        vps[i].TopLeftY = (float)rects[i * 4 + 1];
+        vps[i].Width    = (float)rects[i * 4 + 2];
+        vps[i].Height   = (float)rects[i * 4 + 3];
+        vps[i].MinDepth = 0.0f;
+        vps[i].MaxDepth = 1.0f;
+    }
+    ID3D11DeviceContext_RSSetViewports(vio_d3d11.context, (UINT)count, vps);
+    return 0;
+}
+
 /* ── Setup context (called from vio_create after window creation) ── */
 
 int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg)
@@ -3350,6 +3369,7 @@ static const vio_backend d3d11_backend = {
     .set_uniform       = d3d11_set_uniform,
     .bind_texture      = d3d11_bind_texture,
     .set_viewport      = d3d11_set_viewport,
+    .set_viewports     = d3d11_set_viewports,
     .gpu_flush         = d3d11_gpu_flush,
     .dispatch_compute  = d3d11_dispatch_compute,
     .create_compute_pipeline  = d3d11_create_compute_pipeline,

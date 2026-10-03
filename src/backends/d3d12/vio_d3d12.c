@@ -5653,6 +5653,7 @@ static int d3d12_supports_feature(vio_feature feature)
          * emulate it), so layered binds always have a stage that picks the slice. */
         case VIO_FEATURE_LAYERED_RENDER: return 1;
         case VIO_FEATURE_VERTEX_LAYER:   return 1;
+        case VIO_FEATURE_MULTI_VIEWPORT: return 1;   /* RSSetViewports(n) + scissor per viewport */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* compute downsample (GAP-PHASE5 11), CPU box filter fallback */
         case VIO_FEATURE_CUBEMAP:      return 1;
         case VIO_FEATURE_DEPTH_BIAS:   return 1; /* PSO rasterizer state */
@@ -6073,6 +6074,25 @@ static void d3d12_set_viewport(int x, int y, int width, int height)
     ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
 }
 
+/* Several viewports, each with its own scissor (D3D12 always scissors, and a
+ * viewport without a scissor rect draws nothing). */
+static int d3d12_set_viewports(const int *rects, int count)
+{
+    if (!vio_d3d12.in_frame || !vio_d3d12.cmd_list || count < 1 || count > VIO_MAX_VIEWPORTS) return -1;
+    D3D12_VIEWPORT vps[VIO_MAX_VIEWPORTS];
+    D3D12_RECT scs[VIO_MAX_VIEWPORTS];
+    for (int i = 0; i < count; i++) {
+        int x = rects[i * 4], y = rects[i * 4 + 1], w = rects[i * 4 + 2], h = rects[i * 4 + 3];
+        vps[i].TopLeftX = (float)x; vps[i].TopLeftY = (float)y;
+        vps[i].Width = (float)w;    vps[i].Height = (float)h;
+        vps[i].MinDepth = 0.0f;     vps[i].MaxDepth = 1.0f;
+        scs[i].left = x; scs[i].top = y; scs[i].right = x + w; scs[i].bottom = y + h;
+    }
+    ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, (UINT)count, vps);
+    ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, (UINT)count, scs);
+    return 0;
+}
+
 /* ── Setup context (called from vio_create after window creation) ── */
 
 int vio_d3d12_setup_context(void *glfw_window, vio_config *cfg)
@@ -6118,6 +6138,7 @@ static const vio_backend d3d12_backend = {
     .set_uniform       = d3d12_set_uniform,
     .bind_texture      = d3d12_bind_texture,
     .set_viewport      = d3d12_set_viewport,
+    .set_viewports     = d3d12_set_viewports,
     .gpu_flush         = vio_d3d12_wait_for_gpu,
     .dispatch_compute  = d3d12_dispatch_compute,
     .create_compute_pipeline  = d3d12_create_compute_pipeline,
