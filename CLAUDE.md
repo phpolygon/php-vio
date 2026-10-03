@@ -96,11 +96,12 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-142 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+143 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
 | `tests/render3d/109–110` | Geometry-Stage (`vio_shader(['geometry' => …])`, Punkt → Quad, GS-Uniform, Unbind-Regression) und Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`/`patch_vertices`, Quad-Patch → Disc, Kantenzahl folgt dem TCS-Uniform). Iterieren über `opengl/d3d11/d3d12/vulkan/metal`; Backend mit Flag 0 → `skip`. |
+| `tests/render3d/136` | Layered Render-Targets (GEOMETRY-STAGES-PLAN 1a): `'layers' => N`-Array (Farbe, Clear + Quad je Layer, Readback je Layer, `sampler2DArray`), Depth-Array (`.r` je Layer), Depth-Cube (`vio_render_target_cubemap`, `samplerCube .r` je Face), Options-Vertrag (kein `layers` + `cube`/`samples`, Layer-Bereich, keine Mips). |
 | `tests/render3d/135` | GS-/Tess-Pipelines auf jedem später dazugekommenen Pfad: `vio_submit_batch`, `vio_draw_instanced`, uint16-Indices, `vio_draw_indirect`, `vio_draw_instanced_from_buffer`; in HDR-, MRT-, MSAA- und Stencil-Targets (D3D12-PSO- und Vulkan-Render-Pass-Varianten); Shader-Cache: gleiches VS+FS mit und ohne GS sind verschiedene Programme (kalter und warmer Cache, beide Reihenfolgen). |
 | `tests/render3d/090–093` | Cube-RT/Mipmaps, Pipeline-State, RT-Readback, Texture-Update + Pipeline-Free (Replacement-Plan Phase 1) |
 | `tests/input/134` | Replay besitzt den Input (Win32): echte `WM_KEYDOWN`/`WM_MOUSEMOVE`/`WM_MOUSEWHEEL` per `PostMessageW` (FFI im Kindprozess) an das versteckte GLFW-Fenster kommen live an, werden während eines Replays verworfen (nur das Replay-Event erreicht `vio_on_key`) und nach `vio_input_replay_stop` wieder zugestellt. |
@@ -178,6 +179,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Texture 3D | ✅ | ✅ | ✅ | ✅ | ✅ |
 | read_pixels | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Texture Swizzle | ✅ (3.3+) | ❌ (CPU-Expand) | ❌ (CPU-Expand) | ✅ | ✅ |
+| Layered RTs (`'layers' => N`-Arrays, Depth-Cube; `VIO_FEATURE_RENDER_TARGET_LAYERED`) | ✅ (`GL_TEXTURE_2D_ARRAY` / Depth-Cubemap, `glFramebufferTextureLayer`) | ✅ (RTV/DSV je Slice) | ✅ (RTV/DSV je Slice) | ✅ (Framebuffer je Layer, `2D_ARRAY`/`CUBE`-Views) | ❌ (Follow-up, nur CI) |
 | Cubemap-RT + `vio_generate_mipmaps` | ✅ | ❌ (Follow-up) | ❌ (Follow-up) | ✅ (Framebuffer je Face/Level, `vkCmdBlitImage`-Kette) | ✅ |
 | `vio_read_render_target` | ✅ | ✅ | ✅† | ✅ (nach `vio_end`, Face und Attachment) | ✅ |
 | `vio_texture_update` | ✅ | ✅ | ❌ (Follow-up) | ❌ | ✅ |
@@ -837,7 +839,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 136 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 137 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
