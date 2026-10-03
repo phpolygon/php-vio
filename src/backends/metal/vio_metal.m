@@ -4656,6 +4656,7 @@ static const vio_backend metal_backend = {
     .draw_instanced_from_storage = metal_draw_instanced_from_storage,
     .draw_indirect     = metal_draw_indirect,
     .bind_stage_constants = metal_bind_stage_constants,
+    .gpu_info           = vio_metal_gpu_info,
     .destroy_font_atlas = metal_destroy_font_atlas,
     .upload_font_atlas  = metal_upload_font_atlas,
     .destroy_texture_obj = metal_destroy_texture_obj,

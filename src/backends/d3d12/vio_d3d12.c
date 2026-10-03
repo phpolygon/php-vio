@@ -4266,6 +4266,13 @@ fail:
     return NULL;
 }
 
+static void d3d12_gpu_info(const char **name, uint64_t *vram_bytes)
+{
+    if (!vio_d3d12.initialized) return;
+    *name = vio_d3d12.gpu_name;
+    *vram_bytes = vio_d3d12.vram_bytes;
+}
+
 static void d3d12_destroy_shader(void *shader_ptr)
 {
     vio_d3d12_shader *s = (vio_d3d12_shader *)shader_ptr;
@@ -6258,6 +6265,7 @@ static const vio_backend d3d12_backend = {
     .generate_mipmaps        = d3d12_generate_mipmaps,
     .update_texture          = d3d12_update_texture,
     .bind_stage_constants    = d3d12_bind_stage_constants,
+    .gpu_info                = d3d12_gpu_info,
 };
 
 void vio_backend_d3d12_register(void)

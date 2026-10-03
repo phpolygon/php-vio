@@ -87,10 +87,10 @@ function check_isolines(?string $p, int $w = 64): ?string {
     return $ok ? null : "E: isolines at green " . json_encode($got) . ", want ~" . json_encode($want);
 }
 
-/* E on D3D12 hardware: a windowed context, when it reports a real adapter. */
-function iso_hardware(): string {
+/* E on D3D hardware: a windowed context, when it reports a real adapter. */
+function iso_hardware(string $backend): string {
     global $VS, $FS, $ISO_TCS, $ISO_TES;
-    $ctx = @vio_create('d3d12', ["width" => 256, "height" => 256, "headless" => false, "vsync" => false]);
+    $ctx = @vio_create($backend, ["width" => 256, "height" => 256, "headless" => false, "vsync" => false]);
     if (!$ctx) return "skip (unavailable)";
     $gpu = vio_gpu_info()['name'] ?? '';
     if ($gpu === '' || stripos($gpu, 'Basic Render') !== false) { vio_destroy($ctx); return "skip (WARP)"; }
@@ -178,7 +178,8 @@ $dxc = getenv('VIO_DXC_DIR') ?: '';
 if ($dxc === '') foreach (glob('C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64/dxcompiler.dll') ?: [] as $cand) $dxc = dirname($cand);
 if ($dxc !== '') $sm6['dxc_dir'] = $dxc;
 echo "d3d12 sm6: ", run_backend('d3d12', $sm6), "\n";
-echo "d3d12 hardware isolines: ", iso_hardware(), "\n";
+echo "d3d11 hardware isolines: ", iso_hardware('d3d11'), "\n";
+echo "d3d12 hardware isolines: ", iso_hardware('d3d12'), "\n";
 echo "DONE\n";
 ?>
 --EXPECTF--
@@ -188,5 +189,6 @@ d3d12: %r(OK|skip \(.*\))%r
 vulkan: %r(OK|skip \(.*\))%r
 metal: %r(OK|skip \(.*\))%r
 d3d12 sm6: %r(OK|skip \(.*\))%r
+d3d11 hardware isolines: %r(OK|skip \(.*\))%r
 d3d12 hardware isolines: %r(OK|skip \(.*\))%r
 DONE

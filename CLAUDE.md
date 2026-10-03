@@ -386,7 +386,8 @@ compute-basiert (siehe „Metal-3D-Pipeline").
   nach stderr loggt (Metal-Thread → kein Zend-Aufruf dort).
 - **Intel-Macs**: CPU-beschriebene Texturen sind `Shared` nur bei `hasUnifiedMemory`,
   sonst `Managed` (`metal_cpu_texture_storage()`); Buffers bleiben überall `Shared`.
-- `vio_gpu_info()` liefert auf Metal `MTLDevice.name` + `recommendedMaxWorkingSetSize`
+- `vio_gpu_info()` fragt den Vtable-Slot `gpu_info` des Backends mit offenem Device (D3D11/D3D12: DXGI-Adapter,
+  headless „Microsoft Basic Render Driver“ = WARP; Vulkan: Physical Device; OpenGL: `GL_RENDERER`) und liefert auf Metal `MTLDevice.name` + `recommendedMaxWorkingSetSize`
   als `vram_bytes` (Unified Memory hat kein dediziertes VRAM).
 - `vio_recorder_capture` / `vio_stream_push` lesen den Frame über den gemeinsamen
   Helper `vio_capture_rgba()` in `php_vio.c` — damit funktioniert Recording/Streaming
@@ -991,7 +992,7 @@ Aufrufer geändert hat:
   den Vulkan seit GAP-PHASE5 Block 10c meldet; Linux wählt damit wieder Vulkan vor OpenGL. Kann das
   gewählte Backend kein Device öffnen, versucht `vio_create('auto')` den nächsten Kandidaten). Test `100`.
 - **Audit-Gate `099`** friert `strcmp(ctx->backend->name, …)` (66) und `#if HAVE_D3D11/
-  D3D12/VULKAN` (47) in `php_vio.c` ein — neue Backend-Fähigkeiten gehen über Vtable-Slots.
+  D3D12/VULKAN` (46, seit `vio_gpu_info` über den Slot `gpu_info` läuft) in `php_vio.c` ein — neue Backend-Fähigkeiten gehen über Vtable-Slots.
   Render-Target-Erstellung/-Bind/-Unbind/-Readback und Cubemap-Upload für D3D11/D3D12
   liegen jetzt in `src/backends/d3d1x/` (`create_render_target`, `bind_render_target`,
   `unbind_render_target`, `bind_render_target_face`, `render_target_cubemap`,
@@ -1119,9 +1120,7 @@ Aufrufer geändert hat:
   zeichnet dort nichts, in vio kommen je Frame zufällig Linien an. Der Tessellator selbst stimmt (Punkt-Ausgabe
   liefert exakt Dichte × (Detail + 1) Punkte), gewöhnliche Linien auch. Auf Hardware (RTX 2080) zeichnen
   generiertes und handgeschriebenes HLSL korrekt und stabil. Test 144 prüft Isolines auf D3D deshalb nur über
-  einen Fenster-Kontext auf D3D12 mit echtem Adapter (`vio_gpu_info()` ≠ „Microsoft Basic Render Driver“).
-  D3D11 meldet in `vio_gpu_info()` keinen Adapternamen (Audit-Gate 099 sperrt den nötigen `#ifdef` in
-  `php_vio.c`; ein Vtable-Slot wäre der Weg).
+  einen Fenster-Kontext auf D3D11 und D3D12 mit echtem Adapter (`vio_gpu_info()` ≠ „Microsoft Basic Render Driver“).
 - **Tessellations-Domain-Ursprung**: Vulkan setzt `VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT` (vorher oben links →
   umgekehrte Winding, GL-korrekte Patches verschwanden bei Backface-Culling). Metal nutzt die MSL-Option
   `tess_domain_origin_lower_left` (spiegelt v bei Quads); ob das Quad-Kantenfaktoren vertauscht, zeigt Test 144

@@ -272,6 +272,11 @@ typedef struct _vio_d3d11_state {
 
     /* Window reference */
     void *glfw_window;
+
+    /* Adapter of the device, for vio_gpu_info(): UTF-8 description (WARP reports
+     * "Microsoft Basic Render Driver") and DedicatedVideoMemory. */
+    char     gpu_name[256];
+    uint64_t vram_bytes;
 } vio_d3d11_state;
 
 extern vio_d3d11_state vio_d3d11;

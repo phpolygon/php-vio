@@ -203,6 +203,25 @@ static int d3d11_init(vio_config *cfg)
         return -1;
     }
 
+    /* The adapter the device runs on (vio_gpu_info). */
+    {
+        IDXGIDevice *dxgi_device = NULL;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(vio_d3d11.device, &IID_IDXGIDevice, (void **)&dxgi_device))) {
+            IDXGIAdapter *adapter = NULL;
+            if (SUCCEEDED(IDXGIDevice_GetAdapter(dxgi_device, &adapter))) {
+                DXGI_ADAPTER_DESC ad;
+                if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad))) {
+                    vio_d3d11.vram_bytes = (uint64_t)ad.DedicatedVideoMemory;
+                    if (WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, vio_d3d11.gpu_name,
+                                            (int)sizeof(vio_d3d11.gpu_name), NULL, NULL) <= 0)
+                        vio_d3d11.gpu_name[0] = '\0';
+                }
+                IDXGIAdapter_Release(adapter);
+            }
+            IDXGIDevice_Release(dxgi_device);
+        }
+    }
+
     /* Debug interface */
     if (vio_d3d11.debug_enabled) {
         ID3D11Device_QueryInterface(vio_d3d11.device, &IID_ID3D11Debug,
@@ -3178,6 +3197,13 @@ static void d3d11_swapchain_info(vio_swapchain_info *out)
     out->shader_model  = 5;
 }
 
+static void d3d11_gpu_info(const char **name, uint64_t *vram_bytes)
+{
+    if (!vio_d3d11.initialized) return;
+    *name = vio_d3d11.gpu_name;
+    *vram_bytes = vio_d3d11.vram_bytes;
+}
+
 static double d3d11_gpu_frame_time(void)
 {
     return vio_d3d11.initialized && vio_d3d11.ts_available ? vio_d3d11.last_gpu_ms : -1.0;
@@ -3497,6 +3523,7 @@ static const vio_backend d3d11_backend = {
     .generate_mipmaps        = d3d11_generate_mipmaps,
     .upload_cubemap          = d3d11_upload_cubemap,
     .bind_stage_constants    = d3d11_bind_stage_constants,
+    .gpu_info                = d3d11_gpu_info,
 };
 
 void vio_backend_d3d11_register(void)

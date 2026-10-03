@@ -382,6 +382,12 @@ typedef struct _vio_backend {
      * uniforms are program-wide (OpenGL) or that have no such stages. */
     void  (*bind_stage_constants)(int stage, void *backend_buffer,
                                   const void *data, size_t size);
+
+    /* Adapter of the device this backend has open, for vio_gpu_info(): name
+     * (UTF-8, backend-owned) and dedicated video memory in bytes (0 if unknown,
+     * e.g. WARP or unified memory without a working-set figure). Leaves both
+     * outputs untouched while the backend has no device. NULL => unknown. */
+    void  (*gpu_info)(const char **name, uint64_t *vram_bytes);
 } vio_backend;
 
 /*
