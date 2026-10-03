@@ -1024,6 +1024,7 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
                                      "%s[%u].%s", name, ai, field);
                             entries[count].offset = (int)(base_offset + ai * array_stride + field_offset);
                             entries[count].size = (int)field_size;
+                            entries[count].stride = 0;
                             int end = entries[count].offset + (int)field_size;
                             if (end > *total_size) *total_size = end;
                             count++;
@@ -1031,11 +1032,17 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
                     }
                 }
             } else {
-                /* Simple scalar/vector/matrix member */
+                /* Simple scalar/vector/matrix member, or an array of them */
                 strncpy(entries[count].name, name, sizeof(entries[count].name) - 1);
                 entries[count].name[sizeof(entries[count].name) - 1] = '\0';
                 entries[count].offset = (int)base_offset;
                 entries[count].size = (int)member_size;
+                entries[count].stride = 0;
+                if (num_array_dims > 0) {
+                    unsigned int array_stride = 0;
+                    spvc_compiler_type_struct_member_array_stride(compiler, type, i, &array_stride);
+                    entries[count].stride = (int)array_stride;
+                }
                 int end = (int)(base_offset + member_size);
                 if (end > *total_size) *total_size = end;
                 count++;

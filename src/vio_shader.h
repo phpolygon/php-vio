@@ -20,6 +20,8 @@ typedef struct _vio_uniform_entry {
     char    name[64];
     int     offset;    /* byte offset in cbuffer */
     int     size;      /* size in bytes */
+    int     stride;    /* array of scalars / vectors / matrices: element stride in
+                          bytes, so "name[i]" resolves to one element; 0 otherwise */
 } vio_uniform_entry;
 
 struct _vio_backend;

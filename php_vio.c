@@ -4885,7 +4885,37 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
         }
     }
     void *p = zend_hash_str_find_ptr(sh->uniform_lookup, name, strlen(name));
-    return p ? (zend_long)(intptr_t)p : 0;
+    if (p) return (zend_long)(intptr_t)p;
+
+    /* "name[i]" into an array of scalars / vectors / matrices (`uniform mat4
+     * u_inv[6]`): reflection keeps one entry for the whole array, so resolve the
+     * element from its stride and cache the result under the full name. Arrays
+     * of structs are flattened per element by the reflection already. */
+    size_t len = strlen(name);
+    const char *open = len > 3 && name[len - 1] == ']' ? strrchr(name, '[') : NULL;
+    if (!open || open == name) return 0;
+    char *end = NULL;
+    long index = strtol(open + 1, &end, 10);
+    if (index < 0 || end != name + len - 1) return 0;
+    size_t base_len = (size_t)(open - name);
+    const vio_uniform_entry *e = NULL;
+    int stage = VIO_STAGE_VERTEX;
+    for (int u = 0; u < sh->uniform_count && !e; u++)
+        if (strlen(sh->uniforms[u].name) == base_len && !strncmp(sh->uniforms[u].name, name, base_len)) e = &sh->uniforms[u];
+    for (int u = 0; u < sh->frag_uniform_count && !e; u++)
+        if (strlen(sh->frag_uniforms[u].name) == base_len && !strncmp(sh->frag_uniforms[u].name, name, base_len)) { e = &sh->frag_uniforms[u]; stage = VIO_STAGE_FRAGMENT; }
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT && !e; i++) {
+        vio_shader_stage_cb *cb = sh->stage_cb[i];
+        if (!cb) continue;
+        for (int u = 0; u < cb->uniform_count && !e; u++)
+            if (strlen(cb->uniforms[u].name) == base_len && !strncmp(cb->uniforms[u].name, name, base_len)) { e = &cb->uniforms[u]; stage = VIO_STAGE_GEOMETRY + i; }
+    }
+    if (!e || e->stride <= 0 || (index + 1) * (long)e->stride > e->size) return 0;
+    zend_long enc = (1LL << 48) | ((zend_long)stage << 40)
+        | ((zend_long)((e->offset + index * e->stride) & 0xFFFF) << 16)
+        | (zend_long)(e->stride & 0xFFFF);
+    zend_hash_str_add_ptr(sh->uniform_lookup, name, len, (void *)(intptr_t)enc);
+    return enc;
 }
 
 /* Shared core for vio_set_uniform / vio_set_uniforms: marshal one (name, value)
