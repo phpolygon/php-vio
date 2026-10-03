@@ -90,10 +90,12 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-151 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+153 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/146` | `vio_set_uniform("name[i]", …)` setzt ein Element eines Arrays von Matrizen/Vektoren (`uniform mat4 u_m[3]`, `uniform vec4 u_col[2]`) auf jedem Backend. Vorher fanden D3D11/D3D12/Vulkan/Metal das Element nicht (Befund aus Code Rescue). |
+| `tests/render3d/145` | `vio_generate_mipmaps` im Frame: Cube-RT rendern, Mips bauen und die kleinste Stufe im selben Frame sampeln (zwei Frames mit verschiedenem Inhalt, keine veraltete Stufe); weiche Zeitgrenze, auf D3D12-Hardware ohne GPU-Drain (vorher ~3–10 ms je Aufruf). |
 | `tests/render3d/144` | Tessellation hält die OpenGL-Konventionen auf jedem Backend: welche Kante `outer[1]` unterteilt (Quad, Dreieck), Winding unter `VIO_CULL_BACK`, Patch-Varying mit Uniforms in TCS und TES, `vertices = 3` mit 4-Punkt-Patches (`gl_PatchVerticesIn`, HS-Variante), Isolines (auf D3D nur auf Hardware, WARP verliert tessellierte Linien), D3D12 auch mit Shader Model 6. Farben tragen die Domain-Koordinaten, die Prüfung ist unabhängig von der Readback-Orientierung. |
 | `tests/render3d/143` | Geometry-Stage mit `gl_in[0].gl_Position` und `gl_InvocationID` (`layout(invocations = 2)`) aus purem GLSL auf jedem Backend mit GS – auf D3D über den SPIR-V-Umbau vor SPIRV-Cross (`SV_Position`-Eingang, `SV_GSInstanceID` + `[instance(N)]`). |
 | `tests/render3d/142` | Erneutes Binden eines Render-Targets behält Farbe **und Tiefe** (plain, HDR, MSAA, Array-Layer, Cube-Face; im nächsten und im selben Frame) – `vio_clear` ist der einzige Clear. Fehlte auf Vulkan (`loadOp CLEAR`). |
@@ -220,7 +222,7 @@ Semantik `SV_Position`, `gl_InvocationID` eine private Variable aus `SV_GSInstan
 fügen es hinzu). Bis dahin baut vio Hull- und Domain-Shader selbst (`vio_tess_hlsl.c`, siehe
 „Geometry- und Tessellation-Stages"); die Probe übersetzt dafür ein TCS/TES-Paar, das Flag ist damit mit
 jedem SPIRV-Cross 1. Der HLSL-Stage-Override (`'hlsl' => [...]`, Test 140) bleibt und hat Vorrang. Die SPIRV-Cross-Libs in `C:\php-sdk\vio-build-deps` (SDK
-1.4.341) können Geometry; das Vulkan SDK 1.3.296 der Windows-CI nicht → 109/135 skippen dort auf D3D.
+1.4.341) können Geometry, die Windows-CI nutzt dasselbe SDK (seit v2.30; mit 1.3.296 waren `GEOMETRY` = 0 und GS-Tests auf D3D übersprungen, auch in den Release-DLLs).
 
 † D3D11/D3D12: implementiert, aber ohne Windows-Build hier nur blind editiert — Windows-CI
 (WARP) ist der Beleg (`tests/render3d/096`, `097`). Die frueher dort beobachtete "veraltete
@@ -913,7 +915,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 145 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 147 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -933,6 +935,11 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   D3D12-Upload-Queue; Audit-Gate `099`. Phase 5 listet, was D3D/Vulkan nativ können und
   noch fehlt (Vulkan-3D-Entscheidung, D3D12-RT-MSAA + Stencil als PSO-State-PR, uint16,
   Timestamps, Indirect, Pipeline-Cache, DXC/SM6, HDR-Swapchain, VRS/Multiview).
+- **`D3D12-MIPGEN-STALL-PLAN.md` — ✅ umgesetzt (Befund aus Code Rescue, 2026-10-03).**
+  `vio_generate_mipmaps` im Frame zeichnet auf D3D12 in die offene Frame-Liste auf (Deskriptor-Ring
+  `mipgen_heap`, danach `d3d12_restore_graphics_state_after_compute`), statt zweimal die GPU zu leeren:
+  Repro 10,8 → 0,09 ms. Nebenbefunde: `GEOMETRY` auf D3D = 0 kam vom Vulkan SDK 1.3.296 der Windows-CI
+  (jetzt 1.4.341), `name[i]` für Matrix-/Vektor-Arrays löst die Array-Schrittweite auf (Tests 145, 146).
 - `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
 - `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
 - **`METALGPU-REPLACEMENT-PLAN.md` — 🚧 Phasen 1–3 umgesetzt.** php-metal-gpu (`ext-metal`) und
@@ -1073,7 +1080,9 @@ Aufrufer geändert hat:
   `gl_uniform_location()` auf: exakter Treffer, sonst `<struct>.name`-Suffix-Match über die aktiven
   Uniforms (Array-Indizes werden gegen die `[0]`-Form normalisiert, `u_lights[2].pos` → exaktes
   Element), gecacht pro (Programm, Name), Cache-Einträge sterben mit `glDeleteProgram`. Vorher wurde
-  **jedes** `vio_set_uniform` eines nicht-RAW-Shaders auf GL still verworfen (Test 108). Weiterhin nicht
+  **jedes** `vio_set_uniform` eines nicht-RAW-Shaders auf GL still verworfen (Test 108). Auf den cbuffer-Backends
+  hält die Reflection ein Array von Skalaren/Vektoren/Matrizen als einen Eintrag mit Schrittweite
+  (`vio_uniform_entry.stride`); `vio_uniform_lookup` löst `name[i]` daraus auf (Test 146). Weiterhin nicht
   portabel: `vio_uniform_buffer` + `vio_bind_buffer` für Grafik-Shader (GL: Block ist geflattet, kein
   UBO; D3D12: Root-CBV wird vom Shader-Cbuffer-Push überschrieben) — Aufrufer nehmen `vio_set_uniform`.
   Sampler-Unit ist auf D3D/Metal der Wert aus `vio_set_uniform('u_tex', unit)` (GL-Konvention), nicht
@@ -1105,7 +1114,7 @@ Aufrufer geändert hat:
 - SPIRV-Cross vor `vulkan-sdk-1.4.363.0` hat den Struct-Array-Stride-Bug im MSL-Backend
   (siehe Build); Test 094 schlägt dort auf Metal fehl. Seit Homebrew `spirv-cross` 1.4.363.0
   läuft 094 in der macOS-CI wieder mit (der frühere Skip `VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST`
-  und `deps-patches/` sind entfernt). Windows (Vulkan SDK 1.3.296.0) betrifft das nicht:
+  und `deps-patches/` sind entfernt). Windows (Vulkan SDK 1.4.341.0) betrifft das nicht:
   094 prüft den Metal-Pfad.
 - Text-Shaping braucht HarfBuzz (`--with-harfbuzz`); ohne es rendern Arabisch/
   Thai/Ligaturen nicht (`VIO_HAS_SHAPING == 0`, Legacy-Codepoint-Pfad). Der
