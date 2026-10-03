@@ -292,6 +292,12 @@ typedef enum _vio_feature {
     /* Geometry-shader instancing: layout(invocations = N) runs the GS N times
      * per input primitive (gl_InvocationID), e.g. one invocation per cube face. */
     VIO_FEATURE_GEOMETRY_INSTANCING = 43,
+    /* vio_shader(['hlsl' => ['geometry' | 'tess_control' | 'tess_eval' => src]]):
+     * the backend compiles that HLSL instead of transpiling the GLSL stage -
+     * D3D tessellation (SPIRV-Cross has no hull / domain output) and HLSL-only
+     * features such as [instance(N)]. The GLSL stage stays required: it defines
+     * the uniform layout and serves the other backends. */
+    VIO_FEATURE_HLSL_STAGE_OVERRIDE = 44,
 } vio_feature;
 
 #define VIO_MAX_VIEWPORTS 16
@@ -526,6 +532,12 @@ typedef struct _vio_shader_desc {
     size_t            tess_control_size;
     const void       *tess_eval_data;
     size_t            tess_eval_size;
+    /* HLSL overrides of the optional stages (NULL = transpile the GLSL stage).
+     * Only backends with VIO_FEATURE_HLSL_STAGE_OVERRIDE read them; the source
+     * outputs D3D clip space (z in [0, w]) - no depth fixup is added. */
+    const char       *geometry_hlsl;
+    const char       *tess_control_hlsl;
+    const char       *tess_eval_hlsl;
 } vio_shader_desc;
 
 /* Shader stage index shared by vio_shader_object's per-stage constant

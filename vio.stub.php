@@ -534,8 +534,17 @@ function vio_draw_2d(VioContext $context): void {}
  *   'geometry'                     — geometry shader; requires VIO_FEATURE_GEOMETRY
  *   'tess_control' + 'tess_eval'   — tessellation pair (always both); requires VIO_FEATURE_TESSELLATION;
  *                                    the pipeline then draws VIO_PATCHES ('patch_vertices' control points)
- * Backends reporting the feature as 0 (Metal, Vulkan, OpenGL < 3.2 / 4.0, D3D with a SPIRV-Cross that
- * cannot emit the stage - tessellation is not emitted to HLSL at all yet) return false with a warning.
+ * Backends reporting the feature as 0 (Metal, OpenGL < 3.2 / 4.0, D3D with a SPIRV-Cross that cannot
+ * emit the stage - tessellation is not emitted to HLSL at all) return false with a warning, unless the
+ * backend has VIO_FEATURE_HLSL_STAGE_OVERRIDE (D3D11 / D3D12) and 'hlsl' supplies the stage:
+ *   'hlsl' => ['geometry' | 'tess_control' | 'tess_eval' => HLSL source]
+ *     compiled as-is instead of the transpiled GLSL stage (hs_/ds_/gs_5_x, DXIL under shader model 6).
+ *     The GLSL stage stays required (GL / Vulkan use it, and its uniforms define the layout): declare
+ *     the same uniforms in `cbuffer ... : register(b0)` in the same order - a mismatch warns. Inputs use
+ *     the semantics SPIRV-Cross gives the previous stage's outputs (SV_Position, TEXCOORD<location>);
+ *     the source outputs D3D clip space (z in [0, w]). Also the way to [instance(N)] on D3D.
+ * Geometry stages may use layout(invocations = N) where VIO_FEATURE_GEOMETRY_INSTANCING is 1, and the
+ * VIO_*_ADJACENCY topologies (vio_mesh(['adjacency' => true]) builds the TRIANGLES_ADJACENCY indices).
  * Portable geometry shaders read input positions from a user varying (`layout(location = N) in vec4 vPos[]`
  * exported by the vertex stage), not from gl_in[].gl_Position, which D3D cannot translate.
  * Uniforms declared in an extra stage are set with
@@ -543,7 +552,7 @@ function vio_draw_2d(VioContext $context): void {}
  * the fragment-stage sampler map resolves its unit to (declare samplers in the same order per stage).
  *
  * @param array $config ['vertex' => string, 'fragment' => string, 'geometry' => ?string,
- *                      'tess_control' => ?string, 'tess_eval' => ?string,
+ *                      'tess_control' => ?string, 'tess_eval' => ?string, 'hlsl' => ?array,
  *                      'format' => int (VIO_SHADER_AUTO|VIO_SHADER_GLSL|VIO_SHADER_SPIRV)]
  * @return VioShader|false Shader object or false on failure
  */

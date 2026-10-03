@@ -2608,14 +2608,47 @@ ZEND_FUNCTION(vio_shader)
         php_error_docref(NULL, E_WARNING, "vio_shader: 'tess_control' and 'tess_eval' must be given together");
         RETURN_FALSE;
     }
-    if (want_geometry && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_GEOMETRY))) {
+    /* 'hlsl' => [stage => source]: per-stage HLSL that backends with
+     * VIO_FEATURE_HLSL_STAGE_OVERRIDE compile instead of the transpiled GLSL
+     * (D3D tessellation, [instance(N)]). The GLSL stage stays required. */
+    zval *hlsl_zv[VIO_EXTRA_STAGE_COUNT] = { NULL, NULL, NULL };
+    zval *hlsl_cfg = zend_hash_str_find(config_ht, "hlsl", sizeof("hlsl") - 1);
+    if (hlsl_cfg) {
+        if (Z_TYPE_P(hlsl_cfg) != IS_ARRAY) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: 'hlsl' must be an array of stage => HLSL source");
+            RETURN_FALSE;
+        }
+        zend_string *hk;
+        zval *hv;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(hlsl_cfg), hk, hv) {
+            int idx = -1;
+            for (int i = 0; hk && i < VIO_EXTRA_STAGE_COUNT; i++) {
+                if (strcmp(ZSTR_VAL(hk), vio_extra_stage_keys[i]) == 0) idx = i;
+            }
+            if (idx < 0 || Z_TYPE_P(hv) != IS_STRING || Z_STRLEN_P(hv) == 0) {
+                php_error_docref(NULL, E_WARNING, "vio_shader: 'hlsl' takes 'geometry', 'tess_control' and 'tess_eval' => non-empty HLSL source");
+                RETURN_FALSE;
+            }
+            if (!extra_zv[idx]) {
+                php_error_docref(NULL, E_WARNING, "vio_shader: the HLSL override for '%s' needs the GLSL '%s' stage as well",
+                                 vio_extra_stage_keys[idx], vio_extra_stage_keys[idx]);
+                RETURN_FALSE;
+            }
+            hlsl_zv[idx] = hv;
+        } ZEND_HASH_FOREACH_END();
+    }
+    int hlsl_override = ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_HLSL_STAGE_OVERRIDE);
+    int gs_hlsl   = hlsl_override && hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)];
+    int tess_hlsl = hlsl_override && hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]
+                                  && hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
+    if (want_geometry && !gs_hlsl && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_GEOMETRY))) {
         php_error_docref(NULL, E_WARNING, "vio_shader: backend '%s' has no geometry stage (VIO_FEATURE_GEOMETRY = 0)",
                          ctx->backend->name);
         RETURN_FALSE;
     }
-    if (want_tess && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_TESSELLATION))) {
-        php_error_docref(NULL, E_WARNING, "vio_shader: backend '%s' has no tessellation stages (VIO_FEATURE_TESSELLATION = 0)",
-                         ctx->backend->name);
+    if (want_tess && !tess_hlsl && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_TESSELLATION))) {
+        php_error_docref(NULL, E_WARNING, "vio_shader: backend '%s' has no tessellation stages (VIO_FEATURE_TESSELLATION = 0)%s",
+                         ctx->backend->name, hlsl_override ? "; pass 'hlsl' => ['tess_control' => ..., 'tess_eval' => ...]" : "");
         RETURN_FALSE;
     }
 
@@ -2827,6 +2860,9 @@ ZEND_FUNCTION(vio_shader)
         desc.tess_control_size = shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)];
         desc.tess_eval_data    = shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
         desc.tess_eval_size    = shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
+        desc.geometry_hlsl     = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)]) : NULL;
+        desc.tess_control_hlsl = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]) : NULL;
+        desc.tess_eval_hlsl    = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)]) : NULL;
 
         shader->backend_shader = ctx->backend->compile_shader(&desc);
         if (!shader->backend_shader) {
@@ -8400,6 +8436,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_VIEWPORT", VIO_FEATURE_MULTI_VIEWPORT, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_MAX_VIEWPORTS", VIO_MAX_VIEWPORTS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_GEOMETRY_INSTANCING", VIO_FEATURE_GEOMETRY_INSTANCING, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_HLSL_STAGE_OVERRIDE", VIO_FEATURE_HLSL_STAGE_OVERRIDE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);

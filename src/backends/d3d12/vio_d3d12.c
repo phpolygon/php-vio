@@ -29,6 +29,7 @@
 
 #include "vio_d3d12.h"
 #include "../vio_d3d_common.h"
+#include "../vio_d3d_shader_check.h"
 #include "../../vio_texfmt.h"
 #include "../../vio_shader_cache.h"
 #include "../../vio_render_target.h"
@@ -4011,11 +4012,17 @@ static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, cons
  * DXBC blob, same transpile path selection as the VS / PS code below. */
 static ID3DBlob *d3d12_compile_stage_blob(const void *data, size_t size, int stage, int fixup_depth,
                                           const char *profile, const char *label,
-                                          UINT compile_flags, vio_shader_format format)
+                                          UINT compile_flags, vio_shader_format format,
+                                          const char *hlsl_override)
 {
     const char *hlsl = NULL;
     char *allocated = NULL;
-    if (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW || format == VIO_SHADER_AUTO) {
+    if (hlsl_override) {
+        /* 'hlsl' => [stage => source] (VIO_FEATURE_HLSL_STAGE_OVERRIDE): compiled
+         * as given; `data` is the GLSL stage's SPIR-V, used only to check the
+         * cbuffer layout below. */
+        hlsl = hlsl_override;
+    } else if (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW || format == VIO_SHADER_AUTO) {
         char *err = NULL;
         uint32_t *spirv = NULL;
         size_t spirv_size = 0;
@@ -4050,6 +4057,9 @@ static ID3DBlob *d3d12_compile_stage_blob(const void *data, size_t size, int sta
     ID3DBlob *blob = NULL;
     HRESULT hr = d3d12_compile_cached(hlsl, label, profile, compile_flags, &blob);
     if (allocated) free(allocated);
+    if (SUCCEEDED(hr) && hlsl_override && size >= 4 && *(const uint32_t *)data == 0x07230203) {
+        vio_d3d_check_override_cbuffer(blob, data, size, "D3D12", label);
+    }
     return SUCCEEDED(hr) ? blob : NULL;
 }
 
@@ -4157,19 +4167,19 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
     if (desc->geometry_data) {
         shader->gs_blob = d3d12_compile_stage_blob(desc->geometry_data, desc->geometry_size,
                                                    VIO_STAGE_GEOMETRY, 1, "gs_5_1", "GS",
-                                                   compile_flags, desc->format);
+                                                   compile_flags, desc->format, desc->geometry_hlsl);
         if (!shader->gs_blob) goto fail;
     }
     if (desc->tess_control_data) {
         shader->hs_blob = d3d12_compile_stage_blob(desc->tess_control_data, desc->tess_control_size,
                                                    VIO_STAGE_TESS_CONTROL, 0, "hs_5_1", "HS",
-                                                   compile_flags, desc->format);
+                                                   compile_flags, desc->format, desc->tess_control_hlsl);
         if (!shader->hs_blob) goto fail;
     }
     if (desc->tess_eval_data) {
         shader->ds_blob = d3d12_compile_stage_blob(desc->tess_eval_data, desc->tess_eval_size,
                                                    VIO_STAGE_TESS_EVAL, desc->geometry_data ? 0 : 1,
-                                                   "ds_5_1", "DS", compile_flags, desc->format);
+                                                   "ds_5_1", "DS", compile_flags, desc->format, desc->tess_eval_hlsl);
         if (!shader->ds_blob) goto fail;
     }
 
@@ -5633,6 +5643,7 @@ static int d3d12_supports_feature(vio_feature feature)
             return d3d12_stage_supported(VIO_STAGE_TESS_CONTROL, "hs_5_1")
                 && d3d12_stage_supported(VIO_STAGE_TESS_EVAL, "ds_5_1");
         case VIO_FEATURE_GEOMETRY:     return d3d12_stage_supported(VIO_STAGE_GEOMETRY, "gs_5_1");
+        case VIO_FEATURE_HLSL_STAGE_OVERRIDE: return 1;   /* 'hlsl' => [stage => source] for GS / HS / DS */
         case VIO_FEATURE_GEOMETRY_INSTANCING: return d3d12_stage_supported(VIO_PROBE_GS_INSTANCED, "gs_5_1");   /* [instance(N)] */
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
         case VIO_FEATURE_MULTIVIEW:    return 0;

@@ -28,6 +28,7 @@
 
 #include "vio_d3d11.h"
 #include "../vio_d3d_common.h"
+#include "../vio_d3d_shader_check.h"
 #include "../../vio_shader_cache.h"
 #include "../../vio_texture.h"
 #include "../../vio_texfmt.h"
@@ -1972,11 +1973,17 @@ static HRESULT d3d11_compile_cached(const char *src, const char *entry_tag, cons
  * code below (HLSL source is passed through for VIO_SHADER_HLSL / MSL). */
 static ID3DBlob *d3d11_compile_stage_blob(const void *data, size_t size, int stage, int fixup_depth,
                                           const char *profile, const char *label,
-                                          UINT compile_flags, vio_shader_format format)
+                                          UINT compile_flags, vio_shader_format format,
+                                          const char *hlsl_override)
 {
     const char *hlsl = NULL;
     char *allocated = NULL;
-    if (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW || format == VIO_SHADER_AUTO) {
+    if (hlsl_override) {
+        /* 'hlsl' => [stage => source] (VIO_FEATURE_HLSL_STAGE_OVERRIDE): compiled
+         * as given; `data` is the GLSL stage's SPIR-V, used only to check the
+         * cbuffer layout below. */
+        hlsl = hlsl_override;
+    } else if (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW || format == VIO_SHADER_AUTO) {
         char *err = NULL;
         uint32_t *spirv = NULL;
         size_t spirv_size = 0;
@@ -2010,6 +2017,9 @@ static ID3DBlob *d3d11_compile_stage_blob(const void *data, size_t size, int sta
     ID3DBlob *blob = NULL;
     HRESULT hr = d3d11_compile_cached(hlsl, label, profile, compile_flags, &blob);
     if (allocated) free(allocated);
+    if (SUCCEEDED(hr) && hlsl_override && size >= 4 && *(const uint32_t *)data == 0x07230203) {
+        vio_d3d_check_override_cbuffer(blob, data, size, "D3D11", label);
+    }
     return SUCCEEDED(hr) ? blob : NULL;
 }
 
@@ -2131,17 +2141,17 @@ static void *d3d11_compile_shader(vio_shader_desc *desc)
     /* Optional stages: geometry (gs_5_0), hull (hs_5_0), domain (ds_5_0). */
     {
         struct { const void *data; size_t size; int stage; const char *profile;
-                 const char *label; int fixup; } extra[3] = {
-            { desc->geometry_data,     desc->geometry_size,     VIO_STAGE_GEOMETRY,     "gs_5_0", "GS", 1 },
-            { desc->tess_control_data, desc->tess_control_size, VIO_STAGE_TESS_CONTROL, "hs_5_0", "HS", 0 },
+                 const char *label; int fixup; const char *hlsl; } extra[3] = {
+            { desc->geometry_data,     desc->geometry_size,     VIO_STAGE_GEOMETRY,     "gs_5_0", "GS", 1, desc->geometry_hlsl },
+            { desc->tess_control_data, desc->tess_control_size, VIO_STAGE_TESS_CONTROL, "hs_5_0", "HS", 0, desc->tess_control_hlsl },
             { desc->tess_eval_data,    desc->tess_eval_size,    VIO_STAGE_TESS_EVAL,    "ds_5_0", "DS",
-              desc->geometry_data ? 0 : 1 },
+              desc->geometry_data ? 0 : 1, desc->tess_eval_hlsl },
         };
         for (int i = 0; i < 3; i++) {
             if (!extra[i].data) continue;
             ID3DBlob *blob = d3d11_compile_stage_blob(extra[i].data, extra[i].size, extra[i].stage,
                                                       extra[i].fixup, extra[i].profile, extra[i].label,
-                                                      compile_flags, desc->format);
+                                                      compile_flags, desc->format, extra[i].hlsl);
             if (!blob) goto fail;
             const void *bc = ID3D10Blob_GetBufferPointer(blob);
             SIZE_T bl = ID3D10Blob_GetBufferSize(blob);
@@ -3136,6 +3146,7 @@ static int d3d11_supports_feature(vio_feature feature)
                 && d3d11_stage_supported(VIO_STAGE_TESS_CONTROL, "hs_5_0")
                 && d3d11_stage_supported(VIO_STAGE_TESS_EVAL, "ds_5_0");
         case VIO_FEATURE_GEOMETRY:     return d3d11_stage_supported(VIO_STAGE_GEOMETRY, "gs_5_0");
+        case VIO_FEATURE_HLSL_STAGE_OVERRIDE: return 1;   /* 'hlsl' => [stage => source] for GS / HS / DS */
         case VIO_FEATURE_GEOMETRY_INSTANCING: return d3d11_stage_supported(VIO_PROBE_GS_INSTANCED, "gs_5_0");   /* [instance(N)] */
         case VIO_FEATURE_RAYTRACING:   return 0; /* No DXR in D3D11 */
         case VIO_FEATURE_MULTIVIEW:    return 0;
