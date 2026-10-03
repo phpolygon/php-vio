@@ -96,6 +96,9 @@ typedef struct _vio_vk_rt {
     VkImageView   *face_view;      /* colour view per (layer, level) */
     VkImageView   *depth_face_view;/* cube / array: depth view per layer (level 0) */
     VkImageView    cube_view;      /* colour CUBE view, or the colour 2D_ARRAY view of an array */
+    VkImageView    all_color_view; /* layered bind: colour 2D_ARRAY over every layer, level 0 */
+    VkImageView    all_depth_view; /* layered bind: depth 2D_ARRAY over every layer */
+    VkFramebuffer  all_fb;         /* layered bind: framebuffer with layers = N (VIO_RT_ALL_LAYERS) */
     VkSampler      sampler;
     struct _vio_vulkan_texture *wrap[4];   /* sampling wrappers (vio_render_target_texture) */
     struct _vio_vulkan_texture *cube_wrap; /* vio_render_target_cubemap */
@@ -248,11 +251,13 @@ typedef struct _vio_vulkan_state {
     int                      cur_samples;
     int                      cur_has_depth;
     uint32_t                 cur_width, cur_height;
+    uint32_t                 cur_layers;            /* layers of the open pass's framebuffer (VIO_RT_ALL_LAYERS bind > 1) */
     int                      depth_has_stencil;    /* depth attachments carry 8 stencil bits */
     int                      multi_draw_indirect;  /* device feature enabled */
     int                      independent_blend;    /* device feature enabled */
     int                      geometry_supported;   /* geometryShader enabled (vio_shader 'geometry') */
     int                      tessellation_supported; /* tessellationShader enabled */
+    int                      vertex_layer_supported; /* VK_EXT_shader_viewport_index_layer enabled (gl_Layer in the VS) */
     /* Block 10c: textureCompressionBC, VK_KHR_fragment_shading_rate (pipeline rate). */
     int                      instance_api_11;      /* instance created with apiVersion 1.1 */
     int                      bc_supported;

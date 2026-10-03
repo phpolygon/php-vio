@@ -272,6 +272,7 @@ void vio_vk_resume_swapchain_pass(VkCommandBuffer cmd)
     vio_vk.cur_has_depth        = 1;
     vio_vk.cur_width            = vio_vk.swapchain_extent.width;
     vio_vk.cur_height           = vio_vk.swapchain_extent.height;
+    vio_vk.cur_layers           = 1;
 }
 
 /* ── Live tracking (swept before vkDestroyDevice) ──────────────────── */
@@ -338,6 +339,9 @@ static void vkrt_free(vio_vk_rt *x)
     if (x->face_view) for (int i = 0; i < faces; i++) vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->face_view[i], NULL);
     if (x->depth_face_view) for (int i = 0; i < x->layers; i++) vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->depth_face_view[i], NULL);
     vkrt_kill(VIO_VK_GRAVE_FRAMEBUFFER, (uint64_t)x->fb, NULL);
+    vkrt_kill(VIO_VK_GRAVE_FRAMEBUFFER, (uint64_t)x->all_fb, NULL);
+    vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->all_color_view, NULL);
+    vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->all_depth_view, NULL);
     vkrt_kill(VIO_VK_GRAVE_RENDER_PASS, (uint64_t)x->pass, NULL);
     vkrt_kill(VIO_VK_GRAVE_RENDER_PASS, (uint64_t)x->pass_nodepth, NULL);
     vkrt_kill(VIO_VK_GRAVE_SAMPLER, (uint64_t)x->sampler, NULL);
@@ -367,7 +371,8 @@ static int vkrt_supported_samples(int want)
     return s;
 }
 
-static VkFramebuffer vkrt_framebuffer(VkRenderPass pass, VkImageView *views, uint32_t n, uint32_t w, uint32_t h)
+static VkFramebuffer vkrt_framebuffer_layers(VkRenderPass pass, VkImageView *views, uint32_t n, uint32_t w, uint32_t h,
+                                             uint32_t layers)
 {
     VkFramebufferCreateInfo fi = {0};
     fi.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
@@ -376,10 +381,15 @@ static VkFramebuffer vkrt_framebuffer(VkRenderPass pass, VkImageView *views, uin
     fi.pAttachments    = views;
     fi.width           = w;
     fi.height          = h;
-    fi.layers          = 1;
+    fi.layers          = layers ? layers : 1;
     VkFramebuffer fb = VK_NULL_HANDLE;
     if (vkCreateFramebuffer(vio_vk.device, &fi, NULL, &fb) != VK_SUCCESS) return VK_NULL_HANDLE;
     return fb;
+}
+
+static VkFramebuffer vkrt_framebuffer(VkRenderPass pass, VkImageView *views, uint32_t n, uint32_t w, uint32_t h)
+{
+    return vkrt_framebuffer_layers(pass, views, n, w, h, 1);
 }
 
 int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
@@ -460,6 +470,23 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
         if (x->count) {
             x->cube_view = vkrt_view(x->color_image[0], x->color_format[0], all_view, VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)x->levels, 0, (uint32_t)layers);
             if (!x->cube_view) goto fail;
+        }
+        /* Layered bind (VIO_RT_ALL_LAYERS): 2D_ARRAY attachment views over every
+         * layer at level 0 and a framebuffer with layers = N; gl_Layer picks the
+         * destination. */
+        {
+            VkImageView views[2];
+            uint32_t nv = 0;
+            if (x->count) {
+                x->all_color_view = vkrt_view(x->color_image[0], x->color_format[0], VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, (uint32_t)layers);
+                if (!x->all_color_view) goto fail;
+                views[nv++] = x->all_color_view;
+            }
+            x->all_depth_view = vkrt_view(x->depth_image, df, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, (uint32_t)layers);
+            if (!x->all_depth_view) goto fail;
+            views[nv++] = x->all_depth_view;
+            x->all_fb = vkrt_framebuffer_layers(x->pass, views, nv, (uint32_t)width, (uint32_t)height, (uint32_t)layers);
+            if (!x->all_fb) goto fail;
         }
     } else {
         VkImageView views[9];
@@ -546,8 +573,9 @@ static void vkrt_begin(VkCommandBuffer cmd, vio_render_target_object *rt, int fa
 {
     vio_vk_rt *x = (vio_vk_rt *)rt->vulkan_rt;
     int layered = x->layers > 1;
-    int l = layered ? level : 0;
-    int f = layered ? face : 0;
+    int all = layered && face == VIO_RT_ALL_LAYERS;
+    int l = (layered && !all) ? level : 0;
+    int f = (layered && !all) ? face : 0;
     uint32_t w = (uint32_t)(rt->width >> l) > 0 ? (uint32_t)(rt->width >> l) : 1u;
     uint32_t h = (uint32_t)(rt->height >> l) > 0 ? (uint32_t)(rt->height >> l) : 1u;
     int has_depth = !(layered && l > 0);
@@ -565,7 +593,7 @@ static void vkrt_begin(VkCommandBuffer cmd, vio_render_target_object *rt, int fa
     VkRenderPassBeginInfo rp = {0};
     rp.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rp.renderPass        = has_depth ? x->pass : x->pass_nodepth;
-    rp.framebuffer       = layered ? x->face_fb[f * x->levels + l] : x->fb;
+    rp.framebuffer       = all ? x->all_fb : (layered ? x->face_fb[f * x->levels + l] : x->fb);
     rp.renderArea.extent.width  = w;
     rp.renderArea.extent.height = h;
     rp.clearValueCount   = (uint32_t)x->count + (has_depth ? 1u : 0u);
@@ -584,7 +612,8 @@ static void vkrt_begin(VkCommandBuffer cmd, vio_render_target_object *rt, int fa
     vio_vk.cur_has_depth    = has_depth;
     vio_vk.cur_width        = w;
     vio_vk.cur_height       = h;
-    rt->bound_face  = layered ? f : -1;
+    vio_vk.cur_layers       = all ? (uint32_t)x->layers : 1u;   /* vio_clear covers every bound layer */
+    rt->bound_face  = all ? VIO_RT_ALL_LAYERS : (layered ? f : -1);
     rt->bound_level = l;
 }
 
@@ -609,7 +638,8 @@ int vio_vk_bind_render_target_face(void *rt_ptr, int face, int level)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     vio_vk_rt *x = rt ? (vio_vk_rt *)rt->vulkan_rt : NULL;
-    if (!x || x->layers <= 1 || face < 0 || face >= x->layers || level < 0 || level >= x->levels) return -1;
+    if (!x || x->layers <= 1 || level < 0 || level >= x->levels) return -1;
+    if (face == VIO_RT_ALL_LAYERS ? (level != 0 || !x->all_fb) : (face < 0 || face >= x->layers)) return -1;
     if (!vio_vk.in_frame) {
         php_error_docref(NULL, E_WARNING, "Vulkan: cube face / array layer binds are only valid between vio_begin and vio_end");
         return -1;
@@ -655,7 +685,7 @@ void vio_vk_clear_attachments(float r, float g, float b, float a)
         n++;
     }
     if (!n) return;
-    VkClearRect rect = { { { 0, 0 }, { vio_vk.cur_width, vio_vk.cur_height } }, 0, 1 };
+    VkClearRect rect = { { { 0, 0 }, { vio_vk.cur_width, vio_vk.cur_height } }, 0, vio_vk.cur_layers ? vio_vk.cur_layers : 1 };
     vkCmdClearAttachments(vio_vk.frames[vio_vk.current_frame].cmd_buf, n, att, 1, &rect);
 }
 

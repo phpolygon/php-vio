@@ -261,7 +261,7 @@ static int create_logical_device(void)
     /* Device extensions: the swapchain, MoltenVK's portability subset, and
      * VK_KHR_fragment_shading_rate (+ its create_renderpass2 dependency) when the
      * device offers pipeline shading rates (Block 10c). */
-    const char *device_extensions[4];
+    const char *device_extensions[5];
     uint32_t device_ext_count = 0;
     device_extensions[device_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
 
@@ -270,14 +270,19 @@ static int create_logical_device(void)
     VkExtensionProperties *ext_props = malloc(ext_count * sizeof(VkExtensionProperties));
     vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &ext_count, ext_props);
 
-    int has_portability = 0, has_rp2 = 0, has_vrs = 0;
+    int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_fragment_shading_rate") == 0) has_vrs = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_shader_viewport_index_layer") == 0) has_vpl = 1;
     }
     free(ext_props);
     if (has_portability) device_extensions[device_ext_count++] = "VK_KHR_portability_subset";
+    /* gl_Layer written by the vertex stage (layered rendering without a
+     * geometry stage, GEOMETRY-STAGES-PLAN 1c). */
+    vio_vk.vertex_layer_supported = has_vpl;
+    if (has_vpl) device_extensions[device_ext_count++] = "VK_EXT_shader_viewport_index_layer";
 
     vio_vk.vrs_supported = 0;
     vio_vk.vrs_rates     = 1 << VIO_SHADING_RATE_1X1;
@@ -1923,6 +1928,7 @@ static void vulkan_begin_frame(void)
     vio_vk.cur_has_depth        = 1;
     vio_vk.cur_width            = vio_vk.swapchain_extent.width;
     vio_vk.cur_height           = vio_vk.swapchain_extent.height;
+    vio_vk.cur_layers           = 1;
 
     /* Set dynamic viewport and scissor */
     VkViewport viewport = {0};
@@ -3008,6 +3014,8 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_INDIRECT_DRAW:  return vio_vk3d_available(); /* vkCmdDraw(Indexed)Indirect (GAP-PHASE5 Block 8) */
         case VIO_FEATURE_RENDER_TARGET_CUBE: return vio_vk3d_available(); /* framebuffer per (face, level) (Block 10b) */
         case VIO_FEATURE_RENDER_TARGET_LAYERED: return vio_vk3d_available(); /* array / depth-cube images, framebuffer per layer */
+        case VIO_FEATURE_LAYERED_RENDER: return vio_vk3d_available();        /* framebuffer with layers = N, gl_Layer in the GS */
+        case VIO_FEATURE_VERTEX_LAYER:   return vio_vk3d_available() && vio_vk.device && vio_vk.vertex_layer_supported;
         case VIO_FEATURE_MRT:            return vio_vk3d_available(); /* up to 4 colour attachments (Block 10b) */
         case VIO_FEATURE_MIPMAP_GEN:     return vio_vk3d_available(); /* vkCmdBlitImage chain (Block 10b) */
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_vk3d_available(); /* 2D array views, stored chains (Block 10c) */
