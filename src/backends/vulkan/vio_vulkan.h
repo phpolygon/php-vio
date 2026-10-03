@@ -252,6 +252,12 @@ typedef struct _vio_vulkan_state {
     int                      cur_has_depth;
     uint32_t                 cur_width, cur_height;
     uint32_t                 cur_layers;            /* layers of the open pass's framebuffer (VIO_RT_ALL_LAYERS bind > 1) */
+    /* Viewports of the open pass (vio_viewports). 3D pipelines are built with
+     * max_viewports viewports; vk3d_prepare sets every one before a draw. */
+    uint32_t                 max_viewports;         /* 1, or min(16, maxViewports) with multiViewport */
+    VkViewport               cur_vp[16];
+    VkRect2D                 cur_sc[16];
+    uint32_t                 cur_vp_count;
     int                      depth_has_stencil;    /* depth attachments carry 8 stencil bits */
     int                      multi_draw_indirect;  /* device feature enabled */
     int                      independent_blend;    /* device feature enabled */
@@ -473,6 +479,8 @@ void  vio_vk3d_destroy_pipeline(void *pipeline);
 void  vio_vk3d_bind_pipeline(void *pipeline);
 void  vio_vk3d_push_cbuffers(const void *vs_data, int vs_size, const void *fs_data, int fs_size);
 void  vio_vk3d_bind_stage_constants(int stage, void *backend_buffer, const void *data, size_t size);
+int   vio_vk3d_set_viewports(const int *rects, int count);
+void  vio_vk_note_viewport(const VkViewport *vp, const VkRect2D *sc);
 void  vio_vk3d_bind_texture(void *texture, int slot);
 void  vio_vk3d_set_viewport(int x, int y, int width, int height);
 void  vio_vk3d_draw(vio_draw_cmd *cmd);

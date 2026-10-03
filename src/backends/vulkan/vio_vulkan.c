@@ -358,6 +358,13 @@ static int create_logical_device(void)
         if (avail.geometryShader)     { features.geometryShader = VK_TRUE;     vio_vk.geometry_supported = 1; }
         if (avail.tessellationShader) { features.tessellationShader = VK_TRUE; vio_vk.tessellation_supported = 1; }
         if (avail.shaderTessellationAndGeometryPointSize) features.shaderTessellationAndGeometryPointSize = VK_TRUE;
+        /* vio_viewports: several viewports, gl_ViewportIndex picks one. */
+        vio_vk.max_viewports = 1;
+        if (avail.multiViewport) {
+            features.multiViewport = VK_TRUE;
+            vio_vk.max_viewports = props.limits.maxViewports < 16 ? props.limits.maxViewports : 16;
+            if (vio_vk.max_viewports < 1) vio_vk.max_viewports = 1;
+        }
         vio_vk.bc_supported = 0;
         if (avail.textureCompressionBC) { features.textureCompressionBC = VK_TRUE; vio_vk.bc_supported = 1; }   /* Block 10c */
     }
@@ -1944,6 +1951,7 @@ static void vulkan_begin_frame(void)
     scissor.offset = (VkOffset2D){0, 0};
     scissor.extent = vio_vk.swapchain_extent;
     vkCmdSetScissor(f->cmd_buf, 0, 1, &scissor);
+    vio_vk_note_viewport(&viewport, &scissor);
 
     vio_vk.in_frame = 1;
     /* B1 — a normal swapchain frame is now fully opened (image acquired, command
@@ -3016,6 +3024,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_LAYERED: return vio_vk3d_available(); /* array / depth-cube images, framebuffer per layer */
         case VIO_FEATURE_LAYERED_RENDER: return vio_vk3d_available();        /* framebuffer with layers = N, gl_Layer in the GS */
         case VIO_FEATURE_VERTEX_LAYER:   return vio_vk3d_available() && vio_vk.device && vio_vk.vertex_layer_supported;
+        case VIO_FEATURE_MULTI_VIEWPORT: return vio_vk3d_available() && vio_vk.device && vio_vk.max_viewports > 1;
         case VIO_FEATURE_MRT:            return vio_vk3d_available(); /* up to 4 colour attachments (Block 10b) */
         case VIO_FEATURE_MIPMAP_GEN:     return vio_vk3d_available(); /* vkCmdBlitImage chain (Block 10b) */
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_vk3d_available(); /* 2D array views, stored chains (Block 10c) */
@@ -3050,6 +3059,7 @@ static const vio_backend vulkan_backend = {
     .draw              = vio_vk3d_draw,
     .draw_indexed      = vio_vk3d_draw_indexed,
     .set_viewport      = vio_vk3d_set_viewport,
+    .set_viewports     = vio_vk3d_set_viewports,
     .bind_texture      = vio_vk3d_bind_texture,
     .push_cbuffers     = vio_vk3d_push_cbuffers,
     .bind_stage_constants = vio_vk3d_bind_stage_constants,

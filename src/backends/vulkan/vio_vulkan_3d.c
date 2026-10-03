@@ -520,19 +520,52 @@ void vio_vk3d_bind_stage_constants(int stage, void *backend_buffer, const void *
     }
 }
 
+/* Remember the single viewport / scissor a pass or vio_viewport set: the 3D
+ * pipelines carry max_viewports viewports, and vk3d_prepare sets them all. */
+void vio_vk_note_viewport(const VkViewport *vp, const VkRect2D *sc)
+{
+    if (vp) vio_vk.cur_vp[0] = *vp;
+    if (sc) vio_vk.cur_sc[0] = *sc;
+    vio_vk.cur_vp_count = 1;
+}
+
+/* Viewport rect -> scissor clamped to the open pass (zero extent when outside). */
+static VkRect2D vk3d_clamped_scissor(int x, int y, int w, int h)
+{
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w, y1 = y + h;
+    if (x1 > (int)vio_vk.cur_width)  x1 = (int)vio_vk.cur_width;
+    if (y1 > (int)vio_vk.cur_height) y1 = (int)vio_vk.cur_height;
+    VkRect2D sc = { { x0, y0 }, { 0, 0 } };
+    if (x1 > x0 && y1 > y0) { sc.extent.width = (uint32_t)(x1 - x0); sc.extent.height = (uint32_t)(y1 - y0); }
+    return sc;
+}
+
 void vio_vk3d_set_viewport(int x, int y, int w, int h)
 {
     if (!vio_vk.in_frame || !vio_vk.cur_render_pass || w <= 0 || h <= 0) return;
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
     VkViewport vp = { (float)x, (float)y, (float)w, (float)h, 0.0f, 1.0f };
     vkCmdSetViewport(cmd, 0, 1, &vp);
-    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-    int x1 = x + w, y1 = y + h;
-    if (x1 > (int)vio_vk.cur_width)  x1 = (int)vio_vk.cur_width;
-    if (y1 > (int)vio_vk.cur_height) y1 = (int)vio_vk.cur_height;
-    if (x1 <= x0 || y1 <= y0) return;
-    VkRect2D sc = { { x0, y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } };
+    VkRect2D sc = vk3d_clamped_scissor(x, y, w, h);
+    if (sc.extent.width == 0) { vio_vk_note_viewport(&vp, NULL); return; }
     vkCmdSetScissor(cmd, 0, 1, &sc);
+    vio_vk_note_viewport(&vp, &sc);
+}
+
+/* vio_viewports: recorded at the next draw (vk3d_prepare), where every one of
+ * the pipeline's max_viewports viewports must be set. */
+int vio_vk3d_set_viewports(const int *rects, int count)
+{
+    if (!vio_vk.in_frame || !vio_vk.cur_render_pass || count < 1 || (uint32_t)count > vio_vk.max_viewports) return -1;
+    for (int i = 0; i < count; i++) {
+        int x = rects[i * 4], y = rects[i * 4 + 1], w = rects[i * 4 + 2], h = rects[i * 4 + 3];
+        VkViewport vp = { (float)x, (float)y, (float)w, (float)h, 0.0f, 1.0f };
+        vio_vk.cur_vp[i] = vp;
+        vio_vk.cur_sc[i] = vk3d_clamped_scissor(x, y, w, h);
+    }
+    vio_vk.cur_vp_count = (uint32_t)count;
+    return 0;
 }
 
 static VkSampler vk3d_cmp_sampler(vio_vulkan_texture *t)
@@ -654,6 +687,19 @@ static int vk3d_prepare(uint32_t stride, VkBuffer inst_buf, VkDeviceSize inst_of
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
     vio_vk_apply_shading_rate(cmd);
+    if (vio_vk.max_viewports > 1) {
+        /* The pipeline has max_viewports viewports: set every one (unused ones
+         * repeat viewport 0). */
+        VkViewport vps[16];
+        VkRect2D scs[16];
+        uint32_t n = vio_vk.cur_vp_count ? vio_vk.cur_vp_count : 1;
+        for (uint32_t i = 0; i < vio_vk.max_viewports; i++) {
+            vps[i] = vio_vk.cur_vp[i < n ? i : 0];
+            scs[i] = vio_vk.cur_sc[i < n ? i : 0];
+        }
+        vkCmdSetViewport(cmd, 0, vio_vk.max_viewports, vps);
+        vkCmdSetScissor(cmd, 0, vio_vk.max_viewports, scs);
+    }
     if (sh->binding_count > 0) {
         uint32_t dyn[VK3D_DYN_UBOS];
         uint32_t nd = 0;

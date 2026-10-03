@@ -17,6 +17,7 @@
 #include "../../vio_shader.h"
 #include "../../vio_shader_cache.h"
 #include "../../vio_shader_compiler.h"
+#include "../../vio_shader_reflect.h"
 #include "../../../include/vio_types.h"
 #include <string.h>
 #include <stdlib.h>
@@ -356,6 +357,7 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
               : stage_id == VIO_STAGE_GEOMETRY ? vk3d_gs_fixup(glsl) : vk3d_vs_fixup(glsl);
     spvc_context_destroy(ctx);
     if (!src) return NULL;
+    if (stage_id == VIO_STAGE_VERTEX || stage_id == VIO_STAGE_TESS_EVAL) src = vio_glsl_require_viewport_layer_ext(src);
     if (getenv("VIO_DUMP_VK_GLSL")) {
         fprintf(stderr, "==== Vulkan %s GLSL ====\n%s\n==== end ====\n", stage_name, src);
         fflush(stderr);
@@ -798,8 +800,8 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
 
     VkPipelineViewportStateCreateInfo vp = {0};
     vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1;
-    vp.scissorCount  = 1;
+    vp.viewportCount = vio_vk.max_viewports > 1 ? vio_vk.max_viewports : 1;   /* vio_viewports */
+    vp.scissorCount  = vp.viewportCount;
 
     VkPipelineRasterizationStateCreateInfo rs = {0};
     rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;

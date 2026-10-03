@@ -265,6 +265,7 @@ void vio_vk_resume_swapchain_pass(VkCommandBuffer cmd)
     vkCmdSetViewport(cmd, 0, 1, &vp);
     VkRect2D sc = { { 0, 0 }, vio_vk.swapchain_extent };
     vkCmdSetScissor(cmd, 0, 1, &sc);
+    vio_vk_note_viewport(&vp, &sc);
     vio_vk.cur_render_pass      = resume;
     vio_vk.cur_color_count      = 1;
     vio_vk.cur_color_formats[0] = vio_vk.swapchain_format;
@@ -603,6 +604,7 @@ static void vkrt_begin(VkCommandBuffer cmd, vio_render_target_object *rt, int fa
     vkCmdSetViewport(cmd, 0, 1, &vp);
     VkRect2D sc = { { 0, 0 }, { w, h } };
     vkCmdSetScissor(cmd, 0, 1, &sc);
+    vio_vk_note_viewport(&vp, &sc);
 
     vio_vk.current_bound_rt = rt;
     vio_vk.cur_render_pass  = rp.renderPass;
