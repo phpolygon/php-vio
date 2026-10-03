@@ -57,8 +57,11 @@ function run_backend(string $name): string {
     $pCube  = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs, 'fragment' => $fsCube])] + $base);
     $full  = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0, 1,1,0, -1,1,0], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT3]]);
     $small = vio_mesh($ctx, ['vertices' => [-0.5,-0.5,0, 0.5,-0.5,0, 0.5,0.5,0, -0.5,0.5,0], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT3]]);
-    /* NDC z -> stored depth: GL (z+1)/2, D3D / Vulkan / Metal the same after vio's clip-space fixup. */
-    $grey = fn(float $z): int => (int)round((($z + 1.0) / 2.0) * 255);
+    /* NDC z -> stored depth: (z+1)/2 on GL / D3D / Vulkan (vio's clip-space
+     * fixup), z itself on Metal (NDC z is 0..1 there). The z values below stay
+     * in 0..1 so nothing is clipped on Metal. */
+    $metal = vio_backend_name($ctx) === 'metal';
+    $grey = fn(float $z): int => (int)round(($metal ? $z : ($z + 1.0) / 2.0) * 255);
 
     /* Sample one value into the swapchain and return the centre pixel. */
     $sample = function (callable $bind) use ($ctx, $full, $W): array {
@@ -115,7 +118,7 @@ function run_backend(string $name): string {
     }
 
     /* ---- B: depth array ------------------------------------------------- */
-    $depthZ = [0.0, 0.5];
+    $depthZ = [0.25, 0.5];
     $darr = vio_render_target($ctx, ['width' => $W, 'height' => $W, 'layers' => 2, 'depth_only' => true]);
     if (!($darr instanceof VioRenderTarget)) { $fail[] = "B: depth array target not created"; }
     else {
@@ -164,13 +167,13 @@ function run_backend(string $name): string {
             vio_bind_render_target($ctx, $cube, $f);
             vio_clear($ctx, 0, 0, 0, 1);
             vio_bind_pipeline($ctx, $pDepth);
-            vio_set_uniform($ctx, 'u_z', -0.8 + 0.3 * $f);
+            vio_set_uniform($ctx, 'u_z', 0.05 + 0.15 * $f);
             vio_draw($ctx, $full);
         }
         vio_unbind_render_target($ctx);
         vio_end($ctx);
         for ($f = 0; $f < 6; $f++) {
-            $g = $grey(-0.8 + 0.3 * $f);
+            $g = $grey(0.05 + 0.15 * $f);
             $p = vio_read_render_target($cube, $f);
             if (!$p || strlen($p) !== $W * $W * 4) { $fail[] = "C: face $f readback size"; continue; }
             if (!near(px($p, 8, 8, $W), [$g, $g, $g], 4)) $fail[] = "C: face $f depth " . json_encode(px($p, 8, 8, $W)) . " want $g";
@@ -179,7 +182,7 @@ function run_backend(string $name): string {
         if (!($cm instanceof VioCubemap)) { $fail[] = "C: vio_render_target_cubemap failed"; }
         else {
             for ($f = 0; $f < 6; $f++) {
-                $g = $grey(-0.8 + 0.3 * $f);
+                $g = $grey(0.05 + 0.15 * $f);
                 $got = $sample(function () use ($ctx, $pCube, $cm, $dirs, $f) {
                     vio_bind_pipeline($ctx, $pCube);
                     vio_set_uniform($ctx, 'u_z', 0.0);

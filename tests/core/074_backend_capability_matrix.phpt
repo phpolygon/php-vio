@@ -207,6 +207,12 @@ if ($mtl) {
        /* tessellation = vertex + control kernels (needs SPIRV-Cross like compute); no geometry stage */
        && vio_supports_feature($mtl, VIO_FEATURE_TESSELLATION) === vio_supports_feature($mtl, VIO_FEATURE_COMPUTE)
        && vio_supports_feature($mtl, VIO_FEATURE_GEOMETRY) === false
+       /* Depth32Float_Stencil8 on swapchain / colour targets; 2DArray + depth cubes */
+       && vio_supports_feature($mtl, VIO_FEATURE_STENCIL) === true
+       && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET_LAYERED) === true
+       /* vertex-stage layer / viewport index travel together (Mac2 / Apple5) */
+       && vio_supports_feature($mtl, VIO_FEATURE_LAYERED_RENDER) === vio_supports_feature($mtl, VIO_FEATURE_VERTEX_LAYER)
+       && vio_supports_feature($mtl, VIO_FEATURE_MULTI_VIEWPORT) === vio_supports_feature($mtl, VIO_FEATURE_VERTEX_LAYER)
        && vio_supports_feature($mtl, VIO_FEATURE_NATIVE_2D_BATCH) === true
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET) === true
        && vio_supports_feature($mtl, VIO_FEATURE_TEXTURE_SWIZZLE) === true;
