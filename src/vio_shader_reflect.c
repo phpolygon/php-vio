@@ -300,8 +300,13 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
      * Emits gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5.
      * Only for the LAST vertex-like stage (VS, or the GS / TES behind it) -
      * SPIRV-Cross would otherwise convert once per stage. */
+    /* A geometry shader emits its vertices with Append(); SPIRV-Cross puts the
+     * fixup at the END of the GS entry point, after every Append, where it never
+     * takes effect (z stayed in [-1, 1], so everything with z < 0 was clipped on
+     * D3D). The GS gets a text fixup on each emitted copy below instead. */
+    int is_geometry = spvc_compiler_get_execution_model(compiler) == SpvExecutionModelGeometry;
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_FIXUP_DEPTH_CONVENTION,
-                                   fixup_depth ? SPVC_TRUE : SPVC_FALSE);
+                                   (fixup_depth && !is_geometry) ? SPVC_TRUE : SPVC_FALSE);
     spvc_compiler_install_compiler_options(compiler, options);
 
     /* Remap combined image-samplers to avoid overlapping register semantics.
@@ -374,7 +379,30 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
         fflush(stderr);
     }
 
-    output = strdup(result);
+    if (fixup_depth && is_geometry) {
+        /* Convert the copy that is appended, not the static gl_Position: a GS
+         * may emit the same position twice. */
+        static const char anchor[] = "stage_output.gl_Position = gl_Position;";
+        static const char fixed[] = "stage_output.gl_Position = gl_Position; "
+            "stage_output.gl_Position.z = (stage_output.gl_Position.z + stage_output.gl_Position.w) * 0.5;";
+        size_t count = 0, len = strlen(result);
+        for (const char *p = result; (p = strstr(p, anchor)) != NULL; p += sizeof(anchor) - 1) count++;
+        output = (char *)malloc(len + count * (sizeof(fixed) - sizeof(anchor)) + 1);
+        if (output) {
+            char *w = output;
+            const char *p = result;
+            for (;;) {
+                const char *a = strstr(p, anchor);
+                if (!a) break;
+                memcpy(w, p, (size_t)(a - p)); w += a - p;
+                memcpy(w, fixed, sizeof(fixed) - 1); w += sizeof(fixed) - 1;
+                p = a + sizeof(anchor) - 1;
+            }
+            strcpy(w, p);
+        }
+    } else {
+        output = strdup(result);
+    }
 
     spvc_context_destroy(ctx);
     return output;

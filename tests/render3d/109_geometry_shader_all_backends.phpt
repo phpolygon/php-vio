@@ -93,6 +93,19 @@ function run_backend(string $name): string {
     if (!near(px($p, 32, 32, $W), [0, 255, 0])) $fail[] = "u_half=0.25: centre not green " . json_encode(px($p, 32, 32, $W));
     if (!near(px($p, 20, 20, $W), [0, 0, 0]))   $fail[] = "u_half=0.25: pixel 20,20 not black (GS uniform ignored?) " . json_encode(px($p, 20, 20, $W));
 
+    /* A point at z = -0.5: the GS output still needs the GL -> D3D / Vulkan
+     * depth remap (z' = (z + w) / 2). On D3D SPIRV-Cross used to place it after
+     * every Append, so anything with z < 0 was clipped. */
+    $pointNeg = vio_mesh($ctx, ['vertices' => [0, 0, -0.5], 'layout' => [VIO_FLOAT3]]);
+    vio_clear($ctx, 0, 0, 0, 1);
+    vio_begin($ctx);
+    vio_bind_pipeline($ctx, $p_gs);
+    vio_set_uniform($ctx, 'u_half', 0.5);
+    vio_draw($ctx, $pointNeg);
+    vio_end($ctx);
+    $p = vio_read_pixels($ctx);
+    if (!near(px($p, 32, 32, $W), [0, 255, 0])) $fail[] = "point at z=-0.5: quad clipped " . json_encode(px($p, 32, 32, $W));
+
     /* A plain pipeline bound afterwards must NOT still run the GS. */
     $vs_plain = "#version 450\nlayout(location=0) in vec3 aPos;\nvoid main(){ gl_Position = vec4(aPos, 1.0); }";
     $sh_plain = vio_shader($ctx, ['vertex' => $vs_plain, 'fragment' => $fs_red]);
