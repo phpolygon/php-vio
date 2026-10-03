@@ -1023,6 +1023,10 @@ struct _vio_vulkan_compute_buffer;
 struct _vio_vulkan_compute_pipeline;
 static void vulkan_release_compute_buffer_gpu(struct _vio_vulkan_compute_buffer *cb);
 static void vulkan_release_compute_pipeline_gpu(struct _vio_vulkan_compute_pipeline *cp);
+/* Compute descriptor pools and async bookkeeping (defined with the compute primitive). */
+static void vkc_pools_reset(int slot);
+static void vkc_pools_destroy(void);
+static void vkc_frame_submitted(void);
 
 static int vulkan_init(vio_config *cfg)
 {
@@ -1109,6 +1113,7 @@ static void vulkan_shutdown(void)
         vulkan_release_compute_buffer_gpu(
             (struct _vio_vulkan_compute_buffer *)vio_vk.live_compute_buffers);
     }
+    vkc_pools_destroy();
 
     /* Frame resources, swapchain, render passes all require the device. On a
      * partial unwind where device creation failed, these were never created
@@ -1454,8 +1459,11 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
     const int is3d   = desc->depth > 0;
     tex->depth = is3d ? vdepth : 0;
     /* 'mipmaps' => true: full chain, blitted from level 0 after the upload (Block 10b). */
+    /* 'storage' => true: a compute storage image as well (vio_compute_bind_image).
+     * It lives in GENERAL, which sampling and imageStore both accept. */
+    const int storage = desc->storage && !desc->single_channel;
     int levels = 1;
-    if (!is3d && desc->mipmaps) { for (int m = desc->width > desc->height ? desc->width : desc->height; m > 1; m >>= 1) levels++; }
+    if (!is3d && desc->mipmaps && !storage) { for (int m = desc->width > desc->height ? desc->width : desc->height; m > 1; m >>= 1) levels++; }
     tex->mip_levels = levels;
     tex->view_type = is3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
     tex->filter = (int)desc->filter;
@@ -1478,7 +1486,8 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
     img_info.samples       = VK_SAMPLE_COUNT_1_BIT;
     img_info.tiling        = VK_IMAGE_TILING_OPTIMAL;
     img_info.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                             (levels > 1 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+                             (levels > 1 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0) |
+                             (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
     img_info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -1559,7 +1568,7 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
         VkImageMemoryBarrier to_read = {0};
         to_read.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         to_read.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        to_read.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_read.newLayout           = storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         to_read.image               = tex->image;
@@ -1567,10 +1576,10 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
         to_read.subresourceRange.levelCount = 1;
         to_read.subresourceRange.layerCount = 1;
         to_read.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
-        to_read.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+        to_read.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT | (storage ? VK_ACCESS_SHADER_WRITE_BIT : 0);
         vkCmdPipelineBarrier(up_cmd,
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             storage ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, NULL, 0, NULL, 1, &to_read);
 
         if (vulkan_submit_transient_commands(up_pool, up_cmd) != 0) {
@@ -1592,6 +1601,30 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
             return NULL;
         }
 
+        if (storage) {
+            /* Storage images start zeroed (like D3D / Metal). */
+            VkImageMemoryBarrier to_gen = {0};
+            to_gen.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_gen.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+            to_gen.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
+            to_gen.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_gen.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_gen.image               = tex->image;
+            to_gen.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            to_gen.subresourceRange.levelCount = 1;
+            to_gen.subresourceRange.layerCount = 1;
+            to_gen.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(up_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, NULL, 0, NULL, 1, &to_gen);
+            VkClearColorValue zero = {{0.0f, 0.0f, 0.0f, 0.0f}};
+            VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCmdClearColorImage(up_cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            to_gen.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
+            to_gen.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_gen.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(up_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 0, 0, NULL, 0, NULL, 1, &to_gen);
+        } else {
         VkImageMemoryBarrier to_read = {0};
         to_read.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         to_read.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1608,6 +1641,7 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, NULL, 0, NULL, 1, &to_read);
+        }
 
         if (vulkan_submit_transient_commands(up_pool, up_cmd) != 0) {
             vio_vma_destroy_image(vio_vk.vma_allocator, tex->image, tex->allocation);
@@ -1617,6 +1651,7 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
     }
 
     if (levels > 1) vio_vk_texture_finish_mips(tex);
+    if (storage) tex->layout = (int)VK_IMAGE_LAYOUT_GENERAL;
 
     /* 3. Image view. */
     VkImageViewCreateInfo iv = {0};
@@ -1727,6 +1762,81 @@ static void vulkan_release_texture_gpu(vio_vulkan_texture *tex, int wait)
     tex->allocation = NULL;
 }
 
+/* vio_texture_update: copy a region into mip level 0 of a 2D texture through a
+ * staging buffer on the transient command buffer. Queue order puts the copy
+ * after every earlier submission and before the open frame, so the barrier
+ * (shader reads -> transfer write -> shader reads) covers in-flight frames that
+ * still sample the old contents, and every draw of the current frame sees the
+ * new texels. Compressed and array textures are refused, like on D3D. */
+static int vulkan_update_texture(void *tex_obj, const void *pixels, int x, int y, int w, int h)
+{
+    vio_texture_object *t = (vio_texture_object *)tex_obj;
+    vio_vulkan_texture *tex = t ? (vio_vulkan_texture *)t->backend_texture : NULL;
+    if (!tex || !tex->image || !pixels || w <= 0 || h <= 0 || !vio_vk.device) return -1;
+    if (tex->depth > 0 || tex->layers > 1 || tex->is_depth ||
+        (tex->vio_format != 0 && tex->vio_format != VIO_FORMAT_RGBA8)) return -1;
+    if (x < 0 || y < 0 || x + w > tex->width || y + h > tex->height) return -1;
+
+    VkDeviceSize bpp = (t->channels == 1) ? 1 : 4;
+    VkDeviceSize bytes = (VkDeviceSize)w * (VkDeviceSize)h * bpp;
+    VkBuffer staging = VK_NULL_HANDLE;
+    void *staging_alloc = NULL;
+    if (vio_vma_create_buffer(vio_vk.vma_allocator, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              &staging, &staging_alloc) != 0) {
+        return -1;
+    }
+    void *mapped = vio_vma_map(vio_vk.vma_allocator, staging_alloc);
+    if (!mapped) {
+        vio_vma_destroy_buffer(vio_vk.vma_allocator, staging, staging_alloc);
+        return -1;
+    }
+    memcpy(mapped, pixels, (size_t)bytes);
+    vio_vma_unmap(vio_vk.vma_allocator, staging_alloc);
+
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vulkan_begin_transient_commands(&pool, &cmd) != 0) {
+        vio_vma_destroy_buffer(vio_vk.vma_allocator, staging, staging_alloc);
+        return -1;
+    }
+    VkImageLayout steady = tex->layout ? (VkImageLayout)tex->layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkImageMemoryBarrier b = {0};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = tex->image;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = 1;
+    b.oldLayout = steady;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+
+    VkBufferImageCopy copy = {0};
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageOffset.x = x;
+    copy.imageOffset.y = y;
+    copy.imageExtent.width = (uint32_t)w;
+    copy.imageExtent.height = (uint32_t)h;
+    copy.imageExtent.depth = 1;
+    vkCmdCopyBufferToImage(cmd, staging, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = steady;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+    int rc = vulkan_submit_transient_commands(pool, cmd);
+    vio_vma_destroy_buffer(vio_vk.vma_allocator, staging, staging_alloc);
+    return rc;
+}
+
 static void vulkan_destroy_texture(void *texture_ptr)
 {
     vio_vulkan_texture *tex = (vio_vulkan_texture *)texture_ptr;
@@ -1816,6 +1926,7 @@ static void vulkan_begin_frame(void)
      * state is initialised. */
     vio_2d_vulkan_reset_frame_descriptors(vio_vk.current_frame);
     vio_vk3d_begin_frame(vio_vk.current_frame);   /* 3D ring / pools / deferred destroys (Block 10) */
+    vkc_pools_reset((int)vio_vk.current_frame);     /* compute descriptor sets of this slot */
     vio_vk.cur_render_pass = VK_NULL_HANDLE;
     vio_vk.acquire_consumed = 0;
 
@@ -2052,6 +2163,7 @@ static void vulkan_end_frame(void)
          * this frame's command buffer / descriptor pool / VBO slice, and
          * vulkan_destroy_render_target's vkDeviceWaitIdle (4c) also gates on it. */
         vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, f->in_flight);
+        vkc_frame_submitted();
 
         vio_vk.in_frame = 0;
         return;
@@ -2084,6 +2196,7 @@ static void vulkan_end_frame(void)
     submit.pSignalSemaphores    = &vio_vk.render_finished_per_image[vio_vk.current_image_index];
 
     vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, f->in_flight);
+    vkc_frame_submitted();
     vio_vk.acquire_consumed = 0;
 
     vio_vk.in_frame = 0;
@@ -2215,6 +2328,8 @@ static void vulkan_clear(float r, float g, float b, float a)
  * time read_buffer or destroy runs, the GPU is idle and nothing is in flight. */
 
 #define VIO_VK_COMPUTE_MAX_BINDINGS 8
+#define VIO_VK_COMPUTE_MAX_IMAGES   8
+#define VIO_VK_COMPUTE_MAX_LAYOUT   24
 
 typedef struct _vio_vk_compute_binding {
     vio_vulkan_compute_buffer *buffer;
@@ -2222,15 +2337,29 @@ typedef struct _vio_vk_compute_binding {
     int access;    /* VIO_COMPUTE_READ (0) / VIO_COMPUTE_WRITE (1) */
 } vio_vk_compute_binding;
 
+typedef struct _vio_vk_compute_image {
+    vio_vulkan_texture *tex;
+    int slot;
+    int access;
+} vio_vk_compute_image;
+
 typedef struct _vio_vulkan_compute_pipeline {
     VkShaderModule        module;
     VkDescriptorSetLayout set_layout;
     VkPipelineLayout      pipeline_layout;
     VkPipeline            pipeline;
-    VkDescriptorPool      desc_pool;
-    VkDescriptorSet       desc_set;
 
-    /* Params UBO (host-visible), lazily (re)created in set_uniforms. */
+    /* The set layout as reflected from the kernel: binding number and type of
+     * every storage buffer, storage image and the params UBO. Descriptor writes
+     * are filtered against it. */
+    uint32_t              layout_binding[VIO_VK_COMPUTE_MAX_LAYOUT];
+    VkDescriptorType      layout_type[VIO_VK_COMPUTE_MAX_LAYOUT];
+    int                   layout_count;
+
+    /* Params UBO: a CPU copy (each dispatch snapshots it - async ones into the
+     * frame upload ring) plus a host-visible buffer for synchronous dispatches. */
+    unsigned char        *params_data;
+    int                   params_size;
     VkBuffer              params_buf;
     void                 *params_alloc;
     VkDeviceSize          params_capacity;
@@ -2239,10 +2368,112 @@ typedef struct _vio_vulkan_compute_pipeline {
 
     vio_vk_compute_binding bindings[VIO_VK_COMPUTE_MAX_BINDINGS];
     int                    binding_count;
+    vio_vk_compute_image   images[VIO_VK_COMPUTE_MAX_IMAGES];
+    int                    image_count;
 
     /* Intrusive list (vio_vk.live_compute_pipelines) for the shutdown sweep. */
     struct _vio_vulkan_compute_pipeline *next, *prev;
 } vio_vulkan_compute_pipeline;
+
+/* ── Compute descriptor sets ──────────────────────────────────────────
+ * Every dispatch writes a fresh set: an async dispatch is recorded into the
+ * frame command buffer, and rewriting a set that a recorded (not yet executed)
+ * command uses is invalid. Slots 0..MAX_FRAMES-1 belong to the frames in
+ * flight and are reset when the frame's fence has passed; the last slot serves
+ * synchronous dispatches, which wait for their own fence. */
+#define VKC_POOL_SLOTS     (VIO_VK_MAX_FRAMES_IN_FLIGHT + 1)
+#define VKC_SYNC_SLOT      VIO_VK_MAX_FRAMES_IN_FLIGHT
+#define VKC_MAX_POOLS      16
+#define VKC_SETS_PER_POOL  64
+
+static struct {
+    VkDescriptorPool pools[VKC_POOL_SLOTS][VKC_MAX_POOLS];
+    int              count[VKC_POOL_SLOTS];
+    int              cur[VKC_POOL_SLOTS];
+} vkc;
+
+static void vkc_pools_reset(int slot)
+{
+    if (slot < 0 || slot >= VKC_POOL_SLOTS || !vio_vk.device) return;
+    for (int i = 0; i < vkc.count[slot]; i++) vkResetDescriptorPool(vio_vk.device, vkc.pools[slot][i], 0);
+    vkc.cur[slot] = 0;
+}
+
+static void vkc_pools_destroy(void)
+{
+    for (int s = 0; s < VKC_POOL_SLOTS; s++) {
+        for (int i = 0; i < vkc.count[s]; i++) {
+            if (vio_vk.device && vkc.pools[s][i]) vkDestroyDescriptorPool(vio_vk.device, vkc.pools[s][i], NULL);
+            vkc.pools[s][i] = VK_NULL_HANDLE;
+        }
+        vkc.count[s] = vkc.cur[s] = 0;
+    }
+}
+
+static VkDescriptorSet vkc_alloc_set(int slot, VkDescriptorSetLayout layout)
+{
+    for (;;) {
+        if (vkc.cur[slot] < vkc.count[slot]) {
+            VkDescriptorSetAllocateInfo ai = {0};
+            ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            ai.descriptorPool     = vkc.pools[slot][vkc.cur[slot]];
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts        = &layout;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            VkResult r = vkAllocateDescriptorSets(vio_vk.device, &ai, &set);
+            if (r == VK_SUCCESS) return set;
+            if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) return VK_NULL_HANDLE;
+            vkc.cur[slot]++;
+            continue;
+        }
+        if (vkc.count[slot] >= VKC_MAX_POOLS) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: compute descriptor pools exhausted for this frame");
+            return VK_NULL_HANDLE;
+        }
+        VkDescriptorPoolSize sizes[3] = {
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VKC_SETS_PER_POOL * VIO_VK_COMPUTE_MAX_BINDINGS },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  VKC_SETS_PER_POOL * VIO_VK_COMPUTE_MAX_IMAGES },
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VKC_SETS_PER_POOL * 2 },
+        };
+        VkDescriptorPoolCreateInfo pi = {0};
+        pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pi.maxSets       = VKC_SETS_PER_POOL;
+        pi.poolSizeCount = 3;
+        pi.pPoolSizes    = sizes;
+        if (vkCreateDescriptorPool(vio_vk.device, &pi, NULL, &vkc.pools[slot][vkc.count[slot]]) != VK_SUCCESS) {
+            return VK_NULL_HANDLE;
+        }
+        vkc.count[slot]++;
+    }
+}
+
+/* Async dispatches recorded into the open frame / submitted with a frame but
+ * not yet waited for (vulkan_compute_wait, vulkan_read_buffer). */
+static int vkc_async_open = 0;
+static int vkc_async_submitted = 0;
+
+/* end_frame: async dispatches of the frame are now on the queue. */
+static void vkc_frame_submitted(void)
+{
+    if (vkc_async_open) { vkc_async_open = 0; vkc_async_submitted = 1; }
+}
+
+static void vkc_layout_add(vio_vulkan_compute_pipeline *cp, uint32_t binding, VkDescriptorType type)
+{
+    for (int i = 0; i < cp->layout_count; i++) if (cp->layout_binding[i] == binding) return;
+    if (cp->layout_count >= VIO_VK_COMPUTE_MAX_LAYOUT) return;
+    cp->layout_binding[cp->layout_count] = binding;
+    cp->layout_type[cp->layout_count] = type;
+    cp->layout_count++;
+}
+
+static int vkc_layout_has(const vio_vulkan_compute_pipeline *cp, uint32_t binding, VkDescriptorType type)
+{
+    for (int i = 0; i < cp->layout_count; i++) {
+        if (cp->layout_binding[i] == binding && cp->layout_type[i] == type) return 1;
+    }
+    return 0;
+}
 
 static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
 {
@@ -2280,29 +2511,39 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
         free_spirv = 1;
     }
 
-    /* Reflect the params UBO binding (canonical = 2). Defaults to 2 if reflection
-     * is unavailable, matching the frozen contract's layout. */
-    int params_binding = 2;
+    vio_vulkan_compute_pipeline *cp = calloc(1, sizeof(vio_vulkan_compute_pipeline));
+    if (!cp) { if (free_spirv) free(spirv); return NULL; }
+    cp->params_binding = 2;
+
+    /* The descriptor-set layout follows the kernel: every storage buffer,
+     * storage image (image2D / image3D) and the params UBO (the lowest UBO
+     * binding, canonical 2) at its own binding. Without reflection the frozen
+     * contract stays: SSBOs 0 and 1, UBO 2. */
     {
         vio_reflect_result refl;
         char *rerr = NULL;
         if (vio_spirv_reflect(spirv, spirv_size, &refl, &rerr) == 0) {
             if (refl.ubo_count > 0) {
-                params_binding = (int)refl.ubos[0].binding;
+                cp->params_binding = (int)refl.ubos[0].binding;
                 for (int i = 1; i < refl.ubo_count; i++) {
-                    if ((int)refl.ubos[i].binding < params_binding)
-                        params_binding = (int)refl.ubos[i].binding;
+                    if ((int)refl.ubos[i].binding < cp->params_binding) cp->params_binding = (int)refl.ubos[i].binding;
                 }
+                vkc_layout_add(cp, (uint32_t)cp->params_binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+            }
+            for (int i = 0; i < refl.storage_buffer_count; i++) {
+                vkc_layout_add(cp, refl.storage_buffers[i].binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            }
+            for (int i = 0; i < refl.storage_image_count; i++) {
+                vkc_layout_add(cp, refl.storage_images[i].binding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
             }
             vio_reflect_free(&refl);
         } else {
             if (rerr) free(rerr);
+            vkc_layout_add(cp, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            vkc_layout_add(cp, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            vkc_layout_add(cp, 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         }
     }
-
-    vio_vulkan_compute_pipeline *cp = calloc(1, sizeof(vio_vulkan_compute_pipeline));
-    if (!cp) { if (free_spirv) free(spirv); return NULL; }
-    cp->params_binding = params_binding;
 
     /* Shader module straight from SPIR-V. */
     VkShaderModuleCreateInfo smi = {0};
@@ -2317,26 +2558,17 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
         return NULL;
     }
 
-    /* Fixed 3-binding descriptor-set layout (the frozen contract). Binding the
-     * params UBO at its reflected binding keeps the layout matching the SPIR-V
-     * even if a future shader moves it. */
-    VkDescriptorSetLayoutBinding lb[3] = {0};
-    lb[0].binding         = 0;
-    lb[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    lb[0].descriptorCount = 1;
-    lb[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-    lb[1].binding         = 1;
-    lb[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    lb[1].descriptorCount = 1;
-    lb[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-    lb[2].binding         = (uint32_t)params_binding;
-    lb[2].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    lb[2].descriptorCount = 1;
-    lb[2].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-
+    VkDescriptorSetLayoutBinding lb[VIO_VK_COMPUTE_MAX_LAYOUT];
+    memset(lb, 0, sizeof(lb));
+    for (int i = 0; i < cp->layout_count; i++) {
+        lb[i].binding         = cp->layout_binding[i];
+        lb[i].descriptorType  = cp->layout_type[i];
+        lb[i].descriptorCount = 1;
+        lb[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo dsli = {0};
     dsli.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dsli.bindingCount = 3;
+    dsli.bindingCount = (uint32_t)cp->layout_count;
     dsli.pBindings    = lb;
     if (vkCreateDescriptorSetLayout(vio_vk.device, &dsli, NULL, &cp->set_layout) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Vulkan: vkCreateDescriptorSetLayout failed");
@@ -2373,43 +2605,6 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
         return NULL;
     }
 
-    /* Descriptor pool sized for one set (2 storage + 1 uniform). */
-    VkDescriptorPoolSize ps[2] = {0};
-    ps[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    ps[0].descriptorCount = 2;
-    ps[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    ps[1].descriptorCount = 1;
-    VkDescriptorPoolCreateInfo dpi = {0};
-    dpi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpi.maxSets       = 1;
-    dpi.poolSizeCount = 2;
-    dpi.pPoolSizes    = ps;
-    if (vkCreateDescriptorPool(vio_vk.device, &dpi, NULL, &cp->desc_pool) != VK_SUCCESS) {
-        php_error_docref(NULL, E_WARNING, "Vulkan: vkCreateDescriptorPool failed");
-        vkDestroyPipeline(vio_vk.device, cp->pipeline, NULL);
-        vkDestroyPipelineLayout(vio_vk.device, cp->pipeline_layout, NULL);
-        vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);
-        vkDestroyShaderModule(vio_vk.device, cp->module, NULL);
-        free(cp);
-        return NULL;
-    }
-
-    VkDescriptorSetAllocateInfo dsai = {0};
-    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsai.descriptorPool     = cp->desc_pool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts        = &cp->set_layout;
-    if (vkAllocateDescriptorSets(vio_vk.device, &dsai, &cp->desc_set) != VK_SUCCESS) {
-        php_error_docref(NULL, E_WARNING, "Vulkan: vkAllocateDescriptorSets failed");
-        vkDestroyDescriptorPool(vio_vk.device, cp->desc_pool, NULL);
-        vkDestroyPipeline(vio_vk.device, cp->pipeline, NULL);
-        vkDestroyPipelineLayout(vio_vk.device, cp->pipeline_layout, NULL);
-        vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);
-        vkDestroyShaderModule(vio_vk.device, cp->module, NULL);
-        free(cp);
-        return NULL;
-    }
-
     /* Link into the live-compute-pipelines list for the shutdown sweep. */
     cp->prev = NULL;
     cp->next = (vio_vulkan_compute_pipeline *)vio_vk.live_compute_pipelines;
@@ -2422,9 +2617,9 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
 /* Release a compute pipeline's GPU objects + unlink from the live list, zeroing
  * handles so this is idempotent. Does NOT free the struct (mirrors
  * vulkan_release_texture_gpu) — only the PHP VioComputePipeline free handler frees
- * it, so the shutdown sweep and PHP GC (either order) never double-free. The
- * VkDescriptorSet is freed implicitly with its pool (the pool lacks
- * FREE_DESCRIPTOR_SET_BIT), so destroying desc_pool releases desc_set too. */
+ * it, so the shutdown sweep and PHP GC (either order) never double-free. An
+ * async dispatch may still be recorded in the open frame / in flight, so the
+ * objects go through the frame graveyard. */
 static void vulkan_release_compute_pipeline_gpu(vio_vulkan_compute_pipeline *cp)
 {
     if (!cp) return;
@@ -2433,21 +2628,28 @@ static void vulkan_release_compute_pipeline_gpu(vio_vulkan_compute_pipeline *cp)
     if (cp->next) cp->next->prev = cp->prev;
     cp->prev = cp->next = NULL;
 
-    /* All dispatches are fully fenced (transient cmd buf + fence wait), so the GPU
-     * is idle w.r.t. this pipeline. Destroy in reverse-dependency order. */
     if (vio_vk.device) {
-        if (cp->params_buf && vio_vk.vma_allocator)
-            vio_vma_destroy_buffer(vio_vk.vma_allocator, cp->params_buf, cp->params_alloc);
-        if (cp->desc_pool)       vkDestroyDescriptorPool(vio_vk.device, cp->desc_pool, NULL);
-        if (cp->pipeline)        vkDestroyPipeline(vio_vk.device, cp->pipeline, NULL);
-        if (cp->pipeline_layout) vkDestroyPipelineLayout(vio_vk.device, cp->pipeline_layout, NULL);
-        if (cp->set_layout)      vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);
-        if (cp->module)          vkDestroyShaderModule(vio_vk.device, cp->module, NULL);
+        if (vio_vk.in_frame || vkc_async_submitted) {
+            /* An async dispatch of this pipeline may sit in the open frame or a
+             * frame in flight. */
+            if (cp->params_buf) vio_vk_defer_destroy(VIO_VK_GRAVE_BUFFER, (uint64_t)cp->params_buf, cp->params_alloc);
+            vio_vk_defer_destroy(VIO_VK_GRAVE_PIPELINE, (uint64_t)cp->pipeline, NULL);
+            vio_vk_defer_destroy(VIO_VK_GRAVE_PIPELINE_LAYOUT, (uint64_t)cp->pipeline_layout, NULL);
+            vio_vk_defer_destroy(VIO_VK_GRAVE_SET_LAYOUT, (uint64_t)cp->set_layout, NULL);
+            vio_vk_defer_destroy(VIO_VK_GRAVE_SHADER_MODULE, (uint64_t)cp->module, NULL);
+        } else {
+            if (cp->params_buf && vio_vk.vma_allocator)
+                vio_vma_destroy_buffer(vio_vk.vma_allocator, cp->params_buf, cp->params_alloc);
+            if (cp->pipeline)        vkDestroyPipeline(vio_vk.device, cp->pipeline, NULL);
+            if (cp->pipeline_layout) vkDestroyPipelineLayout(vio_vk.device, cp->pipeline_layout, NULL);
+            if (cp->set_layout)      vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);
+            if (cp->module)          vkDestroyShaderModule(vio_vk.device, cp->module, NULL);
+        }
     }
+    free(cp->params_data);
+    cp->params_data     = NULL;
     cp->params_buf      = VK_NULL_HANDLE;
     cp->params_alloc    = NULL;
-    cp->desc_pool       = VK_NULL_HANDLE;
-    cp->desc_set        = VK_NULL_HANDLE;
     cp->pipeline        = VK_NULL_HANDLE;
     cp->pipeline_layout = VK_NULL_HANDLE;
     cp->set_layout      = VK_NULL_HANDLE;
@@ -2481,36 +2683,54 @@ static void vulkan_compute_bind_buffer(void *pipeline_ptr, void *backend_buffer,
     b->access = access;
 }
 
+/* vio_compute_bind_image: a texture created with 'storage' => true (usage
+ * STORAGE, kept in GENERAL so it can be sampled and written without layout
+ * transitions) at the kernel's image2D / image3D binding. */
+static void vulkan_compute_bind_image(void *pipeline_ptr, void *tex_obj, int slot, int access)
+{
+    vio_vulkan_compute_pipeline *cp = (vio_vulkan_compute_pipeline *)pipeline_ptr;
+    vio_texture_object *t = (vio_texture_object *)tex_obj;
+    vio_vulkan_texture *vt = t ? (vio_vulkan_texture *)t->backend_texture : NULL;
+    if (!cp || !vt || !vt->view || vt->layout != VK_IMAGE_LAYOUT_GENERAL) return;
+    for (int i = 0; i < cp->image_count; i++) {
+        if (cp->images[i].slot == slot) { cp->images[i].tex = vt; cp->images[i].access = access; return; }
+    }
+    if (cp->image_count >= VIO_VK_COMPUTE_MAX_IMAGES) return;
+    cp->images[cp->image_count].tex = vt;
+    cp->images[cp->image_count].slot = slot;
+    cp->images[cp->image_count].access = access;
+    cp->image_count++;
+}
+
 static void vulkan_compute_set_uniforms(void *pipeline_ptr, const void *data, int size)
 {
     vio_vulkan_compute_pipeline *cp = (vio_vulkan_compute_pipeline *)pipeline_ptr;
     if (!cp || !data || size <= 0 || !vio_vk.initialized || !vio_vk.vma_allocator) return;
 
-    if (!cp->params_buf || cp->params_capacity < (VkDeviceSize)size) {
-        if (cp->params_buf) {
-            vio_vma_destroy_buffer(vio_vk.vma_allocator, cp->params_buf, cp->params_alloc);
-            cp->params_buf = VK_NULL_HANDLE;
-            cp->params_alloc = NULL;
-        }
-        if (vio_vma_create_buffer(vio_vk.vma_allocator, (VkDeviceSize)size,
-                                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                  &cp->params_buf, &cp->params_alloc) != 0 || !cp->params_buf) {
-            php_error_docref(NULL, E_WARNING, "Vulkan: compute params UBO create failed");
-            cp->params_buf = VK_NULL_HANDLE;
-            return;
-        }
-        cp->params_capacity = (VkDeviceSize)size;
+    if (!cp->params_data || cp->params_size < size) {
+        unsigned char *grown = (unsigned char *)realloc(cp->params_data, (size_t)size);
+        if (!grown) return;
+        cp->params_data = grown;
     }
+    memcpy(cp->params_data, data, (size_t)size);
+    cp->params_size = size;
+    cp->params_set = 1;
+}
 
-    void *mapped = vio_vma_map(vio_vk.vma_allocator, cp->params_alloc);
-    if (mapped) {
-        memcpy(mapped, data, (size_t)size);
-        vio_vma_unmap(vio_vk.vma_allocator, cp->params_alloc);
-        cp->params_set = 1;
-    } else {
-        php_error_docref(NULL, E_WARNING, "Vulkan: compute params UBO map failed");
+/* Wait for every async dispatch: one still recorded in the open frame needs the
+ * frame flushed (submitted and resumed), submitted ones a queue drain. */
+static void vulkan_compute_wait(void)
+{
+    if (vkc_async_open && vio_vk.in_frame) {
+        vio_vk_flush_frame();
+        vkc_async_open = 0;
+        vkc_async_submitted = 0;
+        return;
+    }
+    if (vkc_async_open || vkc_async_submitted) {
+        vkQueueWaitIdle(vio_vk.graphics_queue);
+        vkc_async_open = 0;
+        vkc_async_submitted = 0;
     }
 }
 
@@ -2523,110 +2743,188 @@ static void vulkan_dispatch_compute(vio_compute_cmd *cmd)
         return;
     }
 
-    /* Commit the descriptor set: each bound storage buffer at its slot, plus the
-     * params UBO at its reflected binding. Build the writes for whatever is
-     * actually bound (every binding in the layout that has a resource). */
-    VkDescriptorBufferInfo binfos[VIO_VK_COMPUTE_MAX_BINDINGS];
-    VkWriteDescriptorSet   writes[VIO_VK_COMPUTE_MAX_BINDINGS + 1];
-    uint32_t write_count = 0;
+    /* Async inside a frame: record into the frame command buffer between the
+     * render passes, like D3D12's frame list and Metal's frame command buffer.
+     * Everything else runs on the transient command buffer and blocks. */
+    int in_frame = cmd->async && vio_vk.in_frame;
+    int slot = in_frame ? (int)vio_vk.current_frame : VKC_SYNC_SLOT;
+
+    /* Params: snapshot this dispatch's values (later set_uniforms calls must not
+     * reach an already recorded dispatch). */
+    VkBuffer params_buf = VK_NULL_HANDLE;
+    VkDeviceSize params_off = 0;
+    if (cp->params_set && cp->params_data && vkc_layout_has(cp, (uint32_t)cp->params_binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)) {
+        if (in_frame) {
+            if (vio_vk3d_upload_bytes(cp->params_data, (VkDeviceSize)cp->params_size, &params_buf, &params_off) != 0) {
+                params_buf = VK_NULL_HANDLE;
+            }
+        } else {
+            if (!cp->params_buf || cp->params_capacity < (VkDeviceSize)cp->params_size) {
+                if (cp->params_buf) vio_vma_destroy_buffer(vio_vk.vma_allocator, cp->params_buf, cp->params_alloc);
+                cp->params_buf = VK_NULL_HANDLE;
+                cp->params_alloc = NULL;
+                if (vio_vma_create_buffer(vio_vk.vma_allocator, (VkDeviceSize)cp->params_size,
+                                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                          &cp->params_buf, &cp->params_alloc) != 0) {
+                    php_error_docref(NULL, E_WARNING, "Vulkan: compute params UBO create failed");
+                    cp->params_buf = VK_NULL_HANDLE;
+                }
+                cp->params_capacity = cp->params_buf ? (VkDeviceSize)cp->params_size : 0;
+            }
+            if (cp->params_buf) {
+                void *mapped = vio_vma_map(vio_vk.vma_allocator, cp->params_alloc);
+                if (mapped) {
+                    memcpy(mapped, cp->params_data, (size_t)cp->params_size);
+                    vio_vma_unmap(vio_vk.vma_allocator, cp->params_alloc);
+                    params_buf = cp->params_buf;
+                }
+            }
+        }
+    }
+
+    VkDescriptorSet set = vkc_alloc_set(slot, cp->set_layout);
+    if (!set) return;
+
+    VkDescriptorBufferInfo binfos[VIO_VK_COMPUTE_MAX_BINDINGS + 1];
+    VkDescriptorImageInfo  iinfos[VIO_VK_COMPUTE_MAX_IMAGES];
+    VkWriteDescriptorSet   writes[VIO_VK_COMPUTE_MAX_BINDINGS + VIO_VK_COMPUTE_MAX_IMAGES + 1];
+    uint32_t write_count = 0, nb = 0, ni = 0;
 
     for (int i = 0; i < cp->binding_count; i++) {
         vio_vk_compute_binding *b = &cp->bindings[i];
         if (!b->buffer || !b->buffer->buffer) continue;
-        binfos[write_count].buffer = b->buffer->buffer;
-        binfos[write_count].offset = 0;
-        binfos[write_count].range  = VK_WHOLE_SIZE;
-
-        VkWriteDescriptorSet *w = &writes[write_count];
+        if (!vkc_layout_has(cp, (uint32_t)b->slot, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)) continue;
+        binfos[nb].buffer = b->buffer->buffer;
+        binfos[nb].offset = 0;
+        binfos[nb].range  = VK_WHOLE_SIZE;
+        VkWriteDescriptorSet *w = &writes[write_count++];
         memset(w, 0, sizeof(*w));
         w->sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w->dstSet          = cp->desc_set;
+        w->dstSet          = set;
         w->dstBinding      = (uint32_t)b->slot;
-        w->dstArrayElement = 0;
         w->descriptorCount = 1;
         w->descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        w->pBufferInfo     = &binfos[write_count];
-        write_count++;
+        w->pBufferInfo     = &binfos[nb++];
     }
-
-    VkDescriptorBufferInfo pinfo = {0};
-    if (cp->params_set && cp->params_buf) {
-        pinfo.buffer = cp->params_buf;
-        pinfo.offset = 0;
-        pinfo.range  = VK_WHOLE_SIZE;
-        VkWriteDescriptorSet *w = &writes[write_count];
+    for (int i = 0; i < cp->image_count; i++) {
+        vio_vk_compute_image *im = &cp->images[i];
+        if (!im->tex || !im->tex->view) continue;
+        if (!vkc_layout_has(cp, (uint32_t)im->slot, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)) continue;
+        iinfos[ni].sampler     = VK_NULL_HANDLE;
+        iinfos[ni].imageView   = im->tex->view;
+        iinfos[ni].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet *w = &writes[write_count++];
         memset(w, 0, sizeof(*w));
         w->sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w->dstSet          = cp->desc_set;
+        w->dstSet          = set;
+        w->dstBinding      = (uint32_t)im->slot;
+        w->descriptorCount = 1;
+        w->descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w->pImageInfo      = &iinfos[ni++];
+    }
+    if (params_buf) {
+        binfos[nb].buffer = params_buf;
+        binfos[nb].offset = params_off;
+        binfos[nb].range  = (VkDeviceSize)cp->params_size;
+        VkWriteDescriptorSet *w = &writes[write_count++];
+        memset(w, 0, sizeof(*w));
+        w->sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w->dstSet          = set;
         w->dstBinding      = (uint32_t)cp->params_binding;
-        w->dstArrayElement = 0;
         w->descriptorCount = 1;
         w->descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        w->pBufferInfo     = &pinfo;
-        write_count++;
+        w->pBufferInfo     = &binfos[nb++];
     }
-
-    if (write_count > 0) {
-        vkUpdateDescriptorSets(vio_vk.device, write_count, writes, 0, NULL);
-    }
-
-    /* Transient one-time-submit command buffer (does not touch the frame cmd
-     * buffer; compute runs outside any swapchain frame, like texture uploads). */
-    VkCommandPool pool = VK_NULL_HANDLE;
-    VkCommandBuffer cbuf = VK_NULL_HANDLE;
-    if (vulkan_begin_transient_commands(&pool, &cbuf) != 0) return;
-
-    vkCmdBindPipeline(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline);
-    vkCmdBindDescriptorSets(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout,
-                            0, 1, &cp->desc_set, 0, NULL);
+    if (write_count > 0) vkUpdateDescriptorSets(vio_vk.device, write_count, writes, 0, NULL);
 
     uint32_t gx = cmd->group_count_x > 0 ? (uint32_t)cmd->group_count_x : 1;
     uint32_t gy = cmd->group_count_y > 0 ? (uint32_t)cmd->group_count_y : 1;
     uint32_t gz = cmd->group_count_z > 0 ? (uint32_t)cmd->group_count_z : 1;
+
+    /* Earlier work that reads or writes the same resources (draws sampling the
+     * image, an earlier dispatch) before the kernel; the kernel's writes before
+     * whatever comes later - draws, indirect arguments, vertex fetch, copies and
+     * the host map in read_buffer. Storage images stay in GENERAL. */
+    VkMemoryBarrier pre = {0};
+    pre.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    pre.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
+    pre.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    VkMemoryBarrier post = {0};
+    post.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    post.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    post.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
+                         VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT |
+                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    VkPipelineStageFlags graphics_and_compute = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                                                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    if (vio_vk.tessellation_supported) {
+        graphics_and_compute |= VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+                                VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
+    }
+    if (vio_vk.geometry_supported) graphics_and_compute |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+
+    if (in_frame) {
+        VkCommandBuffer fcmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+        /* A dispatch cannot run inside a render pass: close it, dispatch, then
+         * resume the same target with LOAD (viewports restored). */
+        int had_pass = vio_vk.cur_render_pass != VK_NULL_HANDLE;
+        VkViewport vp[16];
+        VkRect2D sc[16];
+        uint32_t vp_count = vio_vk.cur_vp_count ? vio_vk.cur_vp_count : 1;
+        if (vp_count > 16) vp_count = 16;
+        memcpy(vp, vio_vk.cur_vp, sizeof(VkViewport) * vp_count);
+        memcpy(sc, vio_vk.cur_sc, sizeof(VkRect2D) * vp_count);
+        if (had_pass) {
+            vkCmdEndRenderPass(fcmd);
+            vio_vk.cur_render_pass = VK_NULL_HANDLE;
+        }
+        vkCmdPipelineBarrier(fcmd, graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &pre, 0, NULL, 0, NULL);
+        vkCmdBindPipeline(fcmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline);
+        vkCmdBindDescriptorSets(fcmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout, 0, 1, &set, 0, NULL);
+        vkCmdDispatch(fcmd, gx, gy, gz);
+        vkCmdPipelineBarrier(fcmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &post, 0, NULL, 0, NULL);
+        if (had_pass) {
+            vio_vk_resume_pass(fcmd);
+            memcpy(vio_vk.cur_vp, vp, sizeof(VkViewport) * vp_count);
+            memcpy(vio_vk.cur_sc, sc, sizeof(VkRect2D) * vp_count);
+            vio_vk.cur_vp_count = vp_count;
+            vkCmdSetViewport(fcmd, 0, 1, &vp[0]);
+            vkCmdSetScissor(fcmd, 0, 1, &sc[0]);
+        }
+        vkc_async_open = 1;
+        return;
+    }
+
+    /* Synchronous: transient one-time-submit command buffer, fenced. */
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cbuf = VK_NULL_HANDLE;
+    if (vulkan_begin_transient_commands(&pool, &cbuf) != 0) { vkc_pools_reset(VKC_SYNC_SLOT); return; }
+    vkCmdPipelineBarrier(cbuf, graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &pre, 0, NULL, 0, NULL);
+    vkCmdBindPipeline(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline);
+    vkCmdBindDescriptorSets(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout, 0, 1, &set, 0, NULL);
     vkCmdDispatch(cbuf, gx, gy, gz);
-
-    /* Make every WRITE storage buffer's shader writes visible to the host map in
-     * read_buffer. One barrier per writeonly buffer: SHADER_WRITE@COMPUTE ->
-     * HOST_READ@HOST. Read-only inputs need no post-dispatch barrier. */
-    VkBufferMemoryBarrier barriers[VIO_VK_COMPUTE_MAX_BINDINGS];
-    uint32_t bar_count = 0;
-    for (int i = 0; i < cp->binding_count; i++) {
-        vio_vk_compute_binding *b = &cp->bindings[i];
-        if (b->access != 1 /* VIO_COMPUTE_WRITE */) continue;
-        if (!b->buffer || !b->buffer->buffer) continue;
-        VkBufferMemoryBarrier *bm = &barriers[bar_count++];
-        memset(bm, 0, sizeof(*bm));
-        bm->sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        bm->srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
-        bm->dstAccessMask       = VK_ACCESS_HOST_READ_BIT;
-        bm->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bm->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bm->buffer              = b->buffer->buffer;
-        bm->offset              = 0;
-        bm->size                = VK_WHOLE_SIZE;
-    }
-    if (bar_count > 0) {
-        vkCmdPipelineBarrier(cbuf,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_HOST_BIT,
-                             0, 0, NULL, bar_count, barriers, 0, NULL);
-    }
-
-    /* End + submit on a fence + BLOCK until complete (fully synchronous). After
-     * this returns the dispatch is done and the host-coherent output memory holds
-     * the results, ready for read_buffer to map. */
+    vkCmdPipelineBarrier(cbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &post, 0, NULL, 0, NULL);
+    /* End + submit on a fence + BLOCK until complete. The set's pool is free
+     * again afterwards. */
     vulkan_submit_transient_commands(pool, cbuf);
+    vkc_pools_reset(VKC_SYNC_SLOT);
 }
 
-/* GPU->CPU readback of a storage buffer. The dispatch already fenced + ran the
- * COMPUTE->HOST barrier, so the (HOST_VISIBLE|HOST_COHERENT) memory is current:
- * map, memcpy, unmap. Host-coherent => no manual vkInvalidateMappedMemoryRanges
- * is required (VMA picked coherent memory for our HOST_COHERENT request). */
+/* GPU->CPU readback of a storage buffer. Async dispatches are waited for first;
+ * the dispatch barriers make the writes visible to the host, and the buffer is
+ * HOST_COHERENT, so map + memcpy is enough. */
 static size_t vulkan_read_buffer(void *backend_buffer, void *out, size_t size)
 {
     vio_vulkan_compute_buffer *buf = (vio_vulkan_compute_buffer *)backend_buffer;
     if (!buf || !buf->buffer || !out || size == 0 || !vio_vk.initialized || !vio_vk.vma_allocator)
         return 0;
+    vulkan_compute_wait();
 
     size_t n = size < (size_t)buf->size ? size : (size_t)buf->size;
     void *mapped = vio_vma_map(vio_vk.vma_allocator, buf->allocation);
@@ -2639,6 +2937,65 @@ static size_t vulkan_read_buffer(void *backend_buffer, void *out, size_t size)
     return n;
 }
 
+/* Submit what the open frame recorded so far, wait for it and reopen the frame
+ * command buffer with the same pass (LOAD). Used by vio_compute_wait inside a
+ * frame. The acquire semaphore is waited by the first submit only. */
+void vio_vk_flush_frame(void)
+{
+    if (!vio_vk.in_frame) return;
+    vio_vk_frame *f = &vio_vk.frames[vio_vk.current_frame];
+    VkCommandBuffer cmd = f->cmd_buf;
+    int had_pass = vio_vk.cur_render_pass != VK_NULL_HANDLE;
+    VkViewport vp[16];
+    VkRect2D sc[16];
+    uint32_t vp_count = vio_vk.cur_vp_count ? vio_vk.cur_vp_count : 1;
+    if (vp_count > 16) vp_count = 16;
+    memcpy(vp, vio_vk.cur_vp, sizeof(VkViewport) * vp_count);
+    memcpy(sc, vio_vk.cur_sc, sizeof(VkRect2D) * vp_count);
+    if (had_pass) vkCmdEndRenderPass(cmd);
+    vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vkEndCommandBuffer(cmd);
+
+    if (!vio_vk.midframe_fence) {
+        VkFenceCreateInfo fci = {0};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(vio_vk.device, &fci, NULL, &vio_vk.midframe_fence) != VK_SUCCESS) vio_vk.midframe_fence = VK_NULL_HANDLE;
+    }
+    int ok = 0;
+    if (vio_vk.midframe_fence) {
+        vkResetFences(vio_vk.device, 1, &vio_vk.midframe_fence);
+        VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo si = {0};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        int wait_acquire = !vio_vk.frame_is_offscreen && vio_vk.frame_presentable && !vio_vk.acquire_consumed;
+        if (wait_acquire) {
+            si.waitSemaphoreCount = 1;
+            si.pWaitSemaphores    = &f->image_available;
+            si.pWaitDstStageMask  = &ws;
+        }
+        si.commandBufferCount = 1;
+        si.pCommandBuffers    = &cmd;
+        if (vkQueueSubmit(vio_vk.graphics_queue, 1, &si, vio_vk.midframe_fence) == VK_SUCCESS) {
+            vkWaitForFences(vio_vk.device, 1, &vio_vk.midframe_fence, VK_TRUE, UINT64_MAX);
+            if (wait_acquire) vio_vk.acquire_consumed = 1;
+            ok = 1;
+        }
+    }
+    if (!ok) vkDeviceWaitIdle(vio_vk.device);
+
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi = {0};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd, &bi);
+    if (had_pass) {
+        vio_vk_resume_pass(cmd);
+        memcpy(vio_vk.cur_vp, vp, sizeof(VkViewport) * vp_count);
+        memcpy(vio_vk.cur_sc, sc, sizeof(VkRect2D) * vp_count);
+        vio_vk.cur_vp_count = vp_count;
+        vkCmdSetViewport(cmd, 0, 1, &vp[0]);
+        vkCmdSetScissor(cmd, 0, 1, &sc[0]);
+    }
+}
 /* Phase 5 — CPU readback of swapchain content. See the header comment for the
  * full contract. NOTE: unlike D3D12 (which reads its last_presented buffer
  * directly), this RE-ACQUIRES a swapchain image via vkAcquireNextImageKHR and
@@ -2997,6 +3354,7 @@ static int vulkan_supports_feature(vio_feature feature)
 {
     switch (feature) {
         case VIO_FEATURE_COMPUTE:      return 1;
+        case VIO_FEATURE_STORAGE_IMAGE: return 1; /* STORAGE_IMAGE descriptors from the kernel's reflection, images kept in GENERAL */
         /* Native SPIR-V stages: no transpiler limitation as on D3D, only the
          * device features (every desktop GPU; MoltenVK lacks geometry). */
         case VIO_FEATURE_TESSELLATION: return vio_vk3d_available() && vio_vk.device && vio_vk.tessellation_supported;
@@ -3052,6 +3410,7 @@ static const vio_backend vulkan_backend = {
     .update_buffer     = vulkan_update_buffer,
     .destroy_buffer    = vulkan_destroy_buffer,
     .create_texture    = vulkan_create_texture,
+    .update_texture    = vulkan_update_texture,
     .create_texture_3d = vulkan_create_texture,  /* depth-aware: desc->depth > 0 => 3D */
     .destroy_texture   = vulkan_destroy_texture,
     .compile_shader    = vio_vk3d_compile_shader,
@@ -3088,6 +3447,8 @@ static const vio_backend vulkan_backend = {
     .create_compute_pipeline  = vulkan_create_compute_pipeline,
     .destroy_compute_pipeline = vulkan_destroy_compute_pipeline,
     .compute_bind_buffer      = vulkan_compute_bind_buffer,
+    .compute_bind_image       = vulkan_compute_bind_image,
+    .compute_wait             = vulkan_compute_wait,
     .compute_set_uniforms     = vulkan_compute_set_uniforms,
     .read_buffer              = vulkan_read_buffer,
     .supports_feature  = vulkan_supports_feature,

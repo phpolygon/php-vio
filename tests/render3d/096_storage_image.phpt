@@ -8,7 +8,7 @@ backend must dispatch with the kernel's reflected local_size instead of the lega
 (64,1,1) contract. The result is then sampled by a normal fragment shader onto the
 16x16 swapchain and read back — exercising the storage -> sampled hand-off.
 
-Skips where compute / storage images are unavailable (macOS OpenGL 4.1, Vulkan).
+Skips where compute / storage images are unavailable (macOS OpenGL 4.1).
 --EXTENSIONS--
 vio
 --SKIPIF--
@@ -29,7 +29,7 @@ if (!$__ok) die('skip no headless GPU context available');
 // the ones that come up.
 $backends = [];
 $seen = [];
-foreach (['auto', 'metal', 'opengl'] as $candidate) {
+foreach (['auto', 'metal', 'opengl', 'd3d11', 'd3d12', 'vulkan'] as $candidate) {
     $probe = @vio_create($candidate, ['width' => 4, 'height' => 4, 'headless' => true]);
     if (!$probe) continue;
     // 'auto' may resolve to a name listed explicitly below ('opengl' on Linux):

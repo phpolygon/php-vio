@@ -452,6 +452,11 @@ void vio_vk_release_texture(vio_vulkan_texture *tex);   /* GPU objects (deferred
 /* ── Render targets, cubemaps, mips (GAP-PHASE5 Block 10b, vio_vulkan_rt.c / vio_vulkan_cube.c) ── */
 VkRenderPass vio_vk_swapchain_resume_pass(void);
 void  vio_vk_resume_swapchain_pass(VkCommandBuffer cmd);
+/* Reopen the pass that was open before (bound render target layer / level, or the
+ * swapchain) with LOAD, after vkCmdEndRenderPass for a compute dispatch or a flush. */
+void  vio_vk_resume_pass(VkCommandBuffer cmd);
+/* Submit the open frame's commands so far, wait, and reopen it (vio_compute_wait). */
+void  vio_vk_flush_frame(void);
 int   vio_vk_bind_render_target_face(void *rt, int face, int level);
 void  vio_vk_clear_attachments(float r, float g, float b, float a);
 int   vio_vk_render_target_cubemap(void *rt, void *cm_obj);
@@ -469,6 +474,8 @@ void  vio_vk_apply_shading_rate(VkCommandBuffer cmd);     /* after binding a 3D 
 /* ── 3D pipeline (GAP-PHASE5 Block 10, vio_vulkan_3d*.c) ── */
 int   vio_vk3d_available(void);
 void  vio_vk3d_begin_frame(uint32_t frame_slot);
+/* Copy bytes into the current frame's upload ring (uniform-buffer aligned). */
+int   vio_vk3d_upload_bytes(const void *data, VkDeviceSize size, VkBuffer *out_buf, VkDeviceSize *out_off);
 void  vio_vk3d_shutdown(void);
 void  vio_vk3d_forget_texture(vio_vulkan_texture *tex);
 void  vio_vk3d_forget_buffer(vio_vulkan_compute_buffer *buf);

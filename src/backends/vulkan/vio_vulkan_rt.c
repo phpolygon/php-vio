@@ -674,6 +674,17 @@ int vio_vk_bind_render_target_face(void *rt_ptr, int face, int level)
     return 0;
 }
 
+void vio_vk_resume_pass(VkCommandBuffer cmd)
+{
+    vio_render_target_object *rt = (vio_render_target_object *)vio_vk.current_bound_rt;
+    if (rt && rt->vulkan_rt) {
+        int face = rt->bound_face == VIO_RT_ALL_LAYERS ? VIO_RT_ALL_LAYERS : (rt->bound_face < 0 ? 0 : rt->bound_face);
+        vkrt_begin(cmd, rt, face, rt->bound_level < 0 ? 0 : rt->bound_level);
+        return;
+    }
+    if (!vio_vk.frame_is_offscreen) vio_vk_resume_swapchain_pass(cmd);
+}
+
 void vulkan_record_unbind_render_target(void)
 {
     if (!vio_vk.in_frame) return;

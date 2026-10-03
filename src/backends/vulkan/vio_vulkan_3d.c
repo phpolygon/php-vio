@@ -245,6 +245,12 @@ static int vk3d_upload(const void *data, VkDeviceSize data_size, VkDeviceSize to
     }
 }
 
+int vio_vk3d_upload_bytes(const void *data, VkDeviceSize size, VkBuffer *out_buf, VkDeviceSize *out_off)
+{
+    if (!vio_vk.in_frame || size == 0) return -1;
+    return vk3d_upload(data, size, size, vk3d_ubo_align(), out_buf, out_off);
+}
+
 static VkDescriptorSet vk3d_alloc_set(VkDescriptorSetLayout layout)
 {
     vk3d_frame *f = &vk3d.frames[vio_vk.current_frame % VIO_VK_MAX_FRAMES_IN_FLIGHT];
