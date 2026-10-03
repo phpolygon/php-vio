@@ -318,6 +318,7 @@ typedef struct _vio_d3d12_state {
     ID3D12PipelineState       *mipgen_pso;
     ID3D12DescriptorHeap      *mipgen_heap;
     int                        mipgen_failed;
+    UINT                       mipgen_block;   /* next descriptor block of the mipgen_heap ring */
 
     /* Debug-layer InfoQueue, resolved ONCE at init and owned for the device's
      * lifetime (released in shutdown). NULL whenever the debug layer is inactive,

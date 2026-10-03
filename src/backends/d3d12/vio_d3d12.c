@@ -3700,6 +3700,13 @@ static const char *d3d12_mipgen_hlsl =
 static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, const char *profile, UINT flags, ID3DBlob **out);
 
 #define VIO_D3D12_MIPGEN_MAX_LEVELS 16
+/* mipgen_heap is a ring of blocks (one per vio_generate_mipmaps call, each
+ * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS descriptors): a call recorded on the frame
+ * list must not overwrite descriptors of a frame still in flight. 64 blocks
+ * cover 21 calls per frame at three frames in flight. */
+#define VIO_D3D12_MIPGEN_BLOCKS 64
+
+static void d3d12_restore_graphics_state_after_compute(void);
 
 static int d3d12_ensure_mipgen(void)
 {
@@ -3755,7 +3762,8 @@ static int d3d12_ensure_mipgen(void)
     if (FAILED(hr)) { vio_d3d12.mipgen_pso = NULL; return -1; }
 
     if (d3d12_create_descriptor_heap(&vio_d3d12.mipgen_heap, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                                     2 * VIO_D3D12_MIPGEN_MAX_LEVELS, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+                                     2 * VIO_D3D12_MIPGEN_MAX_LEVELS * VIO_D3D12_MIPGEN_BLOCKS,
+                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
         return -1;
     }
     vio_d3d12.mipgen_failed = 0;
@@ -3776,29 +3784,35 @@ static int d3d12_generate_mips_gpu(ID3D12Resource *res, int slices, int levels, 
     }
     if (d3d12_ensure_mipgen() != 0) return 1;
 
-    /* Mid-frame: draws into the resource recorded so far must land first (the
-     * readback helper's flush-and-reopen pattern). */
-    if (vio_d3d12.in_frame && vio_d3d12.cmd_list) {
-        vio_d3d12.compute_async_pending = 1;
-        d3d12_compute_wait();
-    }
-
+    /* Mid-frame the dispatches go onto the frame's own command list, after the
+     * draws into the resource recorded so far: the queue keeps the order, so
+     * neither a flush nor a CPU wait is needed (before 2.30 this drained the GPU
+     * twice and cost ~10 ms CPU per call - every environment-cube update
+     * stuttered, D3D12-MIPGEN-STALL-PLAN). Outside a frame (loading, tests) a
+     * transient list executes and waits as before. */
+    int in_frame = vio_d3d12.in_frame && vio_d3d12.cmd_list;
     ID3D12CommandAllocator *alloc = NULL;
     ID3D12GraphicsCommandList *list = NULL;
-    HRESULT hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                     &IID_ID3D12CommandAllocator, (void **)&alloc);
-    if (SUCCEEDED(hr)) {
-        hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc,
-                                            vio_d3d12.mipgen_pso, &IID_ID3D12GraphicsCommandList, (void **)&list);
-    }
-    if (FAILED(hr)) {
-        if (alloc) ID3D12CommandAllocator_Release(alloc);
-        return -1;
+    if (in_frame) {
+        list = vio_d3d12.cmd_list;
+    } else {
+        HRESULT hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                         &IID_ID3D12CommandAllocator, (void **)&alloc);
+        if (SUCCEEDED(hr)) {
+            hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc,
+                                                vio_d3d12.mipgen_pso, &IID_ID3D12GraphicsCommandList, (void **)&list);
+        }
+        if (FAILED(hr)) {
+            if (alloc) ID3D12CommandAllocator_Release(alloc);
+            return -1;
+        }
     }
     D3D12_RESOURCE_BARRIER *b = calloc((size_t)slices * (size_t)levels, sizeof(*b));
     if (!b) {
-        ID3D12GraphicsCommandList_Release(list);
-        ID3D12CommandAllocator_Release(alloc);
+        if (!in_frame) {
+            ID3D12GraphicsCommandList_Release(list);
+            ID3D12CommandAllocator_Release(alloc);
+        }
         return -1;
     }
 
@@ -3808,6 +3822,10 @@ static int d3d12_generate_mips_gpu(ID3D12Resource *res, int slices, int levels, 
     D3D12_GPU_DESCRIPTOR_HANDLE gpu;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &cpu);
     ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &gpu);
+    UINT block = vio_d3d12.mipgen_block;
+    vio_d3d12.mipgen_block = (block + 1) % VIO_D3D12_MIPGEN_BLOCKS;
+    cpu.ptr += (SIZE_T)block * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS * inc;
+    gpu.ptr += (UINT64)block * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS * inc;
     for (int l = 0; l < levels - 1; l++) {
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
         sd.Format = rd.Format;
@@ -3877,6 +3895,12 @@ static int d3d12_generate_mips_gpu(ID3D12Resource *res, int slices, int levels, 
     }
     ID3D12GraphicsCommandList_ResourceBarrier(list, (UINT)n, b);
     free(b);
+
+    if (in_frame) {
+        /* Back to the frame's graphics heaps, root signature and pipeline. */
+        d3d12_restore_graphics_state_after_compute();
+        return 0;
+    }
 
     ID3D12GraphicsCommandList_Close(list);
     ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
