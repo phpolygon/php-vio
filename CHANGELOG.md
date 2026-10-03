@@ -1,3 +1,17 @@
+# [2.29.0](https://github.com/phpolygon/php-vio/compare/v2.28.0...v2.29.0) (2026-10-03)
+
+
+### Bug Fixes
+
+* **metal,opengl:** tessellation conventions found by test 144 in CI ([9c4e0e4](https://github.com/phpolygon/php-vio/commit/9c4e0e49450b8b0beed2ec57e0c87fdca1e6c01c))
+* **vulkan:** lower-left tessellation domain origin ([1faf636](https://github.com/phpolygon/php-vio/commit/1faf636c22c7847a16d2e64050da58822113c8d2))
+
+
+### Features
+
+* **d3d:** hull and domain shaders from GLSL tessellation stages ([19ae153](https://github.com/phpolygon/php-vio/commit/19ae153aa0f4d4ddcc935ee9b2a72ebbf2398c67)), closes [KhronosGroup/SPIRV-Cross#2693](https://github.com/KhronosGroup/SPIRV-Cross/issues/2693) [#2694](https://github.com/phpolygon/php-vio/issues/2694)
+* vio_gpu_info through a backend vtable slot ([a1910ce](https://github.com/phpolygon/php-vio/commit/a1910cebee2ea466aa47d7777041ddeabedb7ac3)), closes [#ifdefs](https://github.com/phpolygon/php-vio/issues/ifdefs) [#if](https://github.com/phpolygon/php-vio/issues/if)
+
 # [2.28.0](https://github.com/phpolygon/php-vio/compare/v2.27.0...v2.28.0) (2026-10-03)
 
 
