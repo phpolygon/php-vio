@@ -488,7 +488,8 @@ jobs:
             tests/input/133_input_record_replay.phpt `
             tests/input/134_replay_drops_os_input_win32.phpt `
             tests/render3d/135_geometry_tessellation_draw_paths_all_backends.phpt `
-            tests/render3d/136_layered_render_targets_all_backends.phpt
+            tests/render3d/136_layered_render_targets_all_backends.phpt `
+            tests/render3d/137_layered_rendering_all_backends.phpt
 
       - name: Package binary
         shell: pwsh

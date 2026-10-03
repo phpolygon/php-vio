@@ -78,6 +78,8 @@ probe("null", [
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 0,
     VIO_FEATURE_SHADING_RATE       => 0,
     VIO_FEATURE_RENDER_TARGET_LAYERED => 0,
+    VIO_FEATURE_LAYERED_RENDER     => 0,   /* device / extension dependent elsewhere: test 137 is the contract */
+    VIO_FEATURE_VERTEX_LAYER       => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
