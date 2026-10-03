@@ -204,6 +204,9 @@ if ($mtl) {
        && vio_supports_feature($mtl, VIO_FEATURE_MIPMAP_GEN) === true
        && vio_supports_feature($mtl, VIO_FEATURE_MRT) === true
        && vio_supports_feature($mtl, VIO_FEATURE_STORAGE_IMAGE) === vio_supports_feature($mtl, VIO_FEATURE_COMPUTE)
+       /* tessellation = vertex + control kernels (needs SPIRV-Cross like compute); no geometry stage */
+       && vio_supports_feature($mtl, VIO_FEATURE_TESSELLATION) === vio_supports_feature($mtl, VIO_FEATURE_COMPUTE)
+       && vio_supports_feature($mtl, VIO_FEATURE_GEOMETRY) === false
        && vio_supports_feature($mtl, VIO_FEATURE_NATIVE_2D_BATCH) === true
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET) === true
        && vio_supports_feature($mtl, VIO_FEATURE_TEXTURE_SWIZZLE) === true;
