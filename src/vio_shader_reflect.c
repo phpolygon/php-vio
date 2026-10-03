@@ -19,13 +19,12 @@
  * levels, gl_TessCoord) so an "Unsupported builtin / execution model" from
  * an older SPIRV-Cross is caught here, not at vio_shader() time.
  *
- * The geometry probe deliberately reads its input position from a user
- * varying, not from gl_in[].gl_Position: SPIRV-Cross's HLSL geometry support
- * (2025-05) emits `gl_in` unresolved for the builtin block - FXC then fails
- * with "undeclared identifier 'gl_in'" - while location-qualified inputs are
- * flattened correctly (its own test shaders use only that form). So the
- * portable contract for a GS is: the vertex stage exports the position
- * as `layout(location = N) out vec4`, the GS reads `...In[i]`. */
+ * The geometry probes read their input position from a user varying: the
+ * probe asks whether SPIRV-Cross emits HLSL geometry stages at all.
+ * gl_in[].gl_Position and gl_InvocationID, which its HLSL backend rejects as
+ * "Unsupported builtin", are rewritten before transpiling
+ * (vio_gs_hlsl_rewrite), so the GS-instancing probe passes through that path
+ * too. */
 static const char *vio_hlsl_probe_source(int stage)
 {
     switch (stage) {
@@ -303,6 +302,289 @@ char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_ms
     return output;
 }
 
+/* ── Geometry stages for HLSL ─────────────────────────────────────────
+ *
+ * SPIRV-Cross's HLSL backend rejects two geometry-shader builtins with
+ * "Unsupported builtin in HLSL": the input position gl_in[i].gl_Position and
+ * gl_InvocationID. Both have plain HLSL counterparts (an SV_Position input
+ * element, SV_GSInstanceID with [instance(N)]), so the module is rewritten
+ * before transpiling and the HLSL is patched after:
+ *   - gl_in[i].gl_Position: every access chain gl_in[i].member0 is pointed at a
+ *     new input array `vio_gl_in_Position` at a free location; SPIRV-Cross
+ *     emits it as TEXCOORD<loc>, which becomes SV_Position. The vertex stage
+ *     outputs gl_Position as SV_Position, so the signatures link.
+ *   - gl_InvocationID: the builtin input becomes a Private variable
+ *     `vio_gs_invocation`; main() takes SV_GSInstanceID and assigns it.
+ * Modules without these builtins pass through unchanged. */
+
+typedef struct { uint32_t *w; size_t n, cap; int oom; } vio_spv_words;
+
+static void spv_push(vio_spv_words *v, uint32_t x)
+{
+    if (v->oom) return;
+    if (v->n == v->cap) {
+        size_t cap = v->cap ? v->cap * 2 : 1024;
+        uint32_t *g = (uint32_t *)realloc(v->w, cap * sizeof(uint32_t));
+        if (!g) { v->oom = 1; return; }
+        v->w = g;
+        v->cap = cap;
+    }
+    v->w[v->n++] = x;
+}
+
+static void spv_inst(vio_spv_words *v, uint32_t op, const uint32_t *ops, uint32_t count)
+{
+    spv_push(v, ((count + 1) << 16) | op);
+    for (uint32_t i = 0; i < count; i++) spv_push(v, ops[i]);
+}
+
+static void spv_name(vio_spv_words *v, uint32_t id, const char *name)
+{
+    uint32_t len = (uint32_t)strlen(name);
+    uint32_t words = len / 4 + 1;
+    spv_push(v, ((words + 2) << 16) | 5 /* OpName */);
+    spv_push(v, id);
+    for (uint32_t i = 0; i < words; i++) {
+        uint32_t w = 0;
+        for (uint32_t b = 0; b < 4; b++) {
+            uint32_t k = i * 4 + b;
+            if (k < len) w |= (uint32_t)(unsigned char)name[k] << (8 * b);
+        }
+        spv_push(v, w);
+    }
+}
+
+#define VIO_GS_POS_LOCATION_NONE 0xFFFFFFFFu
+
+/* Returns a rewritten module (malloc'd, *out_words set) or NULL when nothing
+ * had to change. *pos_location receives the location of the position input
+ * (VIO_GS_POS_LOCATION_NONE if none), *invocation 1 when gl_InvocationID was
+ * replaced, *invocations the layout(invocations = N) count. */
+static uint32_t *vio_gs_hlsl_rewrite(const uint32_t *spv, size_t words, size_t *out_words,
+                                     uint32_t *pos_location, int *invocation, uint32_t *invocations)
+{
+    *pos_location = VIO_GS_POS_LOCATION_NONE;
+    *invocation = 0;
+    *invocations = 1;
+    if (words < 5 || spv[0] != 0x07230203) return NULL;
+
+    uint32_t bound = spv[3];
+    /* id -> instruction offset, for types / constants / variables. */
+    size_t *def = (size_t *)calloc(bound, sizeof(size_t));
+    unsigned char *pervertex = (unsigned char *)calloc(bound, 1);
+    if (!def || !pervertex) { free(def); free(pervertex); return NULL; }
+
+    uint32_t inv_var = 0, max_location = 0, glin_var = 0;
+    int has_location = 0, is_geometry = 0;
+    for (size_t i = 5; i < words; ) {
+        uint32_t op = spv[i] & 0xFFFF, wc = spv[i] >> 16;
+        if (wc == 0 || i + wc > words) { free(def); free(pervertex); return NULL; }
+        switch (op) {
+            case 16: /* OpExecutionMode ep Invocations N */
+                if (wc >= 4 && spv[i + 2] == 0) *invocations = spv[i + 3];
+                break;
+            case 71: /* OpDecorate id dec ... */
+                if (wc >= 4 && spv[i + 2] == 11 && spv[i + 3] == 8) inv_var = spv[i + 1];
+                if (wc >= 4 && spv[i + 2] == 30) { has_location = 1; if (spv[i + 3] > max_location) max_location = spv[i + 3]; }
+                break;
+            case 72: /* OpMemberDecorate struct member BuiltIn Position */
+                if (wc >= 5 && spv[i + 2] == 0 && spv[i + 3] == 11 && spv[i + 4] == 0 && spv[i + 1] < bound) pervertex[spv[i + 1]] = 1;
+                break;
+            case 15: /* OpEntryPoint model ... */
+                if (wc >= 2 && spv[i + 1] == 3 /* Geometry */) is_geometry = 1;
+                break;
+            case 21: case 23: case 28: case 30: case 32:
+                if (spv[i + 1] < bound) def[spv[i + 1]] = i;   /* types: result id is operand 1 */
+                break;
+            case 43: /* OpConstant type result value */
+                if (wc >= 4 && spv[i + 2] < bound) def[spv[i + 2]] = i;
+                break;
+            case 59: /* OpVariable type id storage */
+                if (wc >= 4 && spv[i + 2] < bound) def[spv[i + 2]] = i;
+                if (wc >= 4 && spv[i + 3] == 1 /* Input */) {
+                    size_t pt = spv[i + 1] < bound ? def[spv[i + 1]] : 0;   /* OpTypePointer Input T */
+                    if (pt && (spv[pt] & 0xFFFF) == 32) {
+                        size_t at = spv[pt + 3] < bound ? def[spv[pt + 3]] : 0;
+                        if (at && (spv[at] & 0xFFFF) == 28 && spv[at + 2] < bound && pervertex[spv[at + 2]]) glin_var = spv[i + 2];
+                    }
+                }
+                break;
+            default: break;
+        }
+        i += wc;
+    }
+
+    if (!is_geometry) { free(def); free(pervertex); return NULL; }
+
+    /* gl_in[i].gl_Position: access chains with member index constant 0. */
+    uint32_t vec4_type = 0, len_id = 0;
+    int glin_rewrites = 0, glin_other_uses = 0;
+    if (glin_var) {
+        size_t pt = def[spv[def[glin_var] + 1]];
+        size_t at = def[spv[pt + 3]];
+        len_id = spv[at + 3];
+        size_t st = def[spv[at + 2]];
+        if (st && (spv[st] & 0xFFFF) == 30 && (spv[st] >> 16) >= 3) vec4_type = spv[st + 2];
+        for (size_t i = 5; i < words; i += spv[i] >> 16) {
+            uint32_t op = spv[i] & 0xFFFF, wc = spv[i] >> 16;
+            if (op == 15 /* OpEntryPoint */ || op == 59 || op == 5 || op == 6 || op == 71 || op == 72) continue;
+            int uses = 0;
+            for (uint32_t k = 1; k < wc; k++) if (spv[i + k] == glin_var) uses = 1;
+            if (!uses) continue;
+            if ((op == 65 || op == 66) && wc >= 6 && spv[i + 3] == glin_var) {
+                size_t c = spv[i + 5] < bound ? def[spv[i + 5]] : 0;
+                if (c && (spv[c] & 0xFFFF) == 43 && spv[c + 3] == 0) { glin_rewrites++; continue; }
+            }
+            glin_other_uses++;
+        }
+        if (!vec4_type || !glin_rewrites) glin_var = 0;
+    }
+    if (!glin_var && !inv_var) { free(def); free(pervertex); return NULL; }
+
+    uint32_t inv_int_type = 0;
+    if (inv_var) {
+        size_t pt = def[spv[def[inv_var] + 1]];
+        inv_int_type = spv[pt + 3];
+    }
+
+    uint32_t new_bound = bound;
+    uint32_t arr_id = 0, arr_ptr_id = 0, pos_var = 0, priv_ptr_id = 0;
+    if (glin_var) { arr_id = new_bound++; arr_ptr_id = new_bound++; pos_var = new_bound++; }
+    if (inv_var) priv_ptr_id = new_bound++;
+    uint32_t loc = has_location ? max_location + 1 : 0;
+
+    vio_spv_words out = { NULL, 0, 0, 0 };
+    for (int h = 0; h < 5; h++) spv_push(&out, spv[h]);
+    out.w[3] = new_bound;
+
+    int annotations_done = 0, globals_done = 0;
+    for (size_t i = 5; i < words; ) {
+        uint32_t op = spv[i] & 0xFFFF, wc = spv[i] >> 16;
+        if (!annotations_done && (op == 71 || op == 72)) {
+            if (pos_var) {
+                spv_name(&out, pos_var, "vio_gl_in_Position");
+                uint32_t d[3] = { pos_var, 30, loc };
+                spv_inst(&out, 71, d, 3);
+            }
+            if (inv_var) spv_name(&out, inv_var, "vio_gs_invocation");
+            annotations_done = 1;
+        }
+        if (!globals_done && op == 54 /* OpFunction */) {
+            if (pos_var) {
+                uint32_t a[3] = { arr_id, vec4_type, len_id };
+                spv_inst(&out, 28, a, 3);
+                uint32_t p[3] = { arr_ptr_id, 1, arr_id };
+                spv_inst(&out, 32, p, 3);
+                uint32_t v[3] = { arr_ptr_id, pos_var, 1 };
+                spv_inst(&out, 59, v, 3);
+            }
+            if (inv_var) {
+                uint32_t p[3] = { priv_ptr_id, 6 /* Private */, inv_int_type };
+                spv_inst(&out, 32, p, 3);
+                uint32_t v[3] = { priv_ptr_id, inv_var, 6 };
+                spv_inst(&out, 59, v, 3);
+            }
+            globals_done = 1;
+        }
+        if (op == 15) {
+            /* OpEntryPoint model id "name" interface... */
+            uint32_t k = 3;
+            while (k < wc) { uint32_t w = spv[i + k++]; if ((w >> 24) == 0 || ((w >> 16) & 0xFF) == 0 || ((w >> 8) & 0xFF) == 0 || (w & 0xFF) == 0) break; }
+            vio_spv_words ep = { NULL, 0, 0, 0 };
+            for (uint32_t j = 1; j < k; j++) spv_push(&ep, spv[i + j]);
+            for (uint32_t j = k; j < wc; j++) {
+                uint32_t id = spv[i + j];
+                if (inv_var && id == inv_var) continue;
+                if (glin_var && id == glin_var && !glin_other_uses) continue;
+                spv_push(&ep, id);
+            }
+            if (pos_var) spv_push(&ep, pos_var);
+            spv_inst(&out, 15, ep.w, (uint32_t)ep.n);
+            free(ep.w);
+        } else if (op == 5 && inv_var && wc >= 2 && spv[i + 1] == inv_var) {
+            /* drop: renamed above */
+        } else if (op == 71 && inv_var && wc >= 3 && spv[i + 1] == inv_var) {
+            /* drop the BuiltIn InvocationId decoration */
+        } else if (op == 59 && inv_var && wc >= 3 && spv[i + 2] == inv_var) {
+            /* re-declared as Private before the first function */
+        } else if (glin_var && (op == 65 || op == 66) && wc >= 6 && spv[i + 3] == glin_var &&
+                   spv[i + 5] < bound && def[spv[i + 5]] && (spv[def[spv[i + 5]]] & 0xFFFF) == 43 &&
+                   spv[def[spv[i + 5]] + 3] == 0) {
+            /* type result base idx0 0 rest... -> type result pos_var idx0 rest... */
+            vio_spv_words ac = { NULL, 0, 0, 0 };
+            spv_push(&ac, spv[i + 1]);
+            spv_push(&ac, spv[i + 2]);
+            spv_push(&ac, pos_var);
+            spv_push(&ac, spv[i + 4]);
+            for (uint32_t j = 6; j < wc; j++) spv_push(&ac, spv[i + j]);
+            spv_inst(&out, op, ac.w, (uint32_t)ac.n);
+            free(ac.w);
+        } else {
+            for (uint32_t j = 0; j < wc; j++) spv_push(&out, spv[i + j]);
+        }
+        i += wc;
+    }
+    free(def);
+    free(pervertex);
+    if (out.oom || !annotations_done || !globals_done) { free(out.w); return NULL; }
+    *out_words = out.n;
+    if (pos_var) *pos_location = loc;
+    if (inv_var) *invocation = 1;
+    return out.w;
+}
+
+/* Insert `ins` at `at` into the malloc'd string s (takes ownership). */
+static char *vio_str_insert(char *s, size_t at, const char *ins)
+{
+    size_t len = strlen(s), il = strlen(ins);
+    char *r = (char *)malloc(len + il + 1);
+    if (!r) return s;
+    memcpy(r, s, at);
+    memcpy(r + at, ins, il);
+    memcpy(r + at + il, s + at, len - at + 1);
+    free(s);
+    return r;
+}
+
+/* Patch the transpiled GS for the rewrites of vio_gs_hlsl_rewrite. */
+static char *vio_gs_hlsl_patch(char *hlsl, uint32_t pos_location, int invocation, uint32_t invocations)
+{
+    if (!hlsl) return NULL;
+    if (pos_location != VIO_GS_POS_LOCATION_NONE) {
+        char sem[32];
+        snprintf(sem, sizeof(sem), ": TEXCOORD%u;", pos_location);
+        char *st = strstr(hlsl, "struct SPIRV_Cross_Input");
+        char *p = st ? strstr(st, sem) : NULL;
+        char *end = st ? strstr(st, "};") : NULL;
+        if (p && (!end || p < end)) {
+            size_t at = (size_t)(p - hlsl);
+            size_t sl = strlen(sem);
+            memmove(hlsl + at, hlsl + at + sl, strlen(hlsl + at + sl) + 1);
+            hlsl = vio_str_insert(hlsl, at, ": SV_Position;");
+        }
+    }
+    if (invocation) {
+        char *m = strstr(hlsl, "void main(");
+        char *close = m ? strchr(m, ')') : NULL;
+        if (close) {
+            size_t at = (size_t)(close - hlsl);
+            hlsl = vio_str_insert(hlsl, at, ", uint vio_gs_instance : SV_GSInstanceID");
+            m = strstr(hlsl, "void main(");
+            char *brace = m ? strchr(m, '{') : NULL;
+            if (brace) hlsl = vio_str_insert(hlsl, (size_t)(brace - hlsl) + 1, "\n    vio_gs_invocation = int(vio_gs_instance);");
+        }
+        if (!strstr(hlsl, "[instance(")) {
+            char *mv = strstr(hlsl, "[maxvertexcount(");
+            if (mv) {
+                char attr[32];
+                snprintf(attr, sizeof(attr), "[instance(%u)]\n", invocations ? invocations : 1);
+                hlsl = vio_str_insert(hlsl, (size_t)(mv - hlsl), attr);
+            }
+        }
+    }
+    return hlsl;
+}
+
 char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_model, char **error_msg)
 {
     return vio_spirv_to_hlsl_ex(spirv, spirv_size, shader_model, 1, error_msg);
@@ -325,7 +607,17 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
 
     size_t word_count = spirv_size / sizeof(uint32_t);
 
-    if (spvc_context_parse_spirv(ctx, spirv, word_count, &ir) != SPVC_SUCCESS) {
+    /* Geometry stages: gl_in[].gl_Position / gl_InvocationID (see vio_gs_hlsl_rewrite). */
+    uint32_t gs_pos_location = VIO_GS_POS_LOCATION_NONE, gs_invocations = 1;
+    int gs_invocation = 0;
+    size_t rewritten_words = 0;
+    uint32_t *rewritten = vio_gs_hlsl_rewrite(spirv, word_count, &rewritten_words,
+                                              &gs_pos_location, &gs_invocation, &gs_invocations);
+
+    spvc_result parsed = spvc_context_parse_spirv(ctx, rewritten ? rewritten : spirv,
+                                                  rewritten ? rewritten_words : word_count, &ir);
+    free(rewritten);   /* the parsed IR holds its own copy */
+    if (parsed != SPVC_SUCCESS) {
         if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
         spvc_context_destroy(ctx);
         return NULL;
@@ -448,6 +740,7 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
     } else {
         output = strdup(result);
     }
+    if (is_geometry) output = vio_gs_hlsl_patch(output, gs_pos_location, gs_invocation, gs_invocations);
 
     spvc_context_destroy(ctx);
     return output;
