@@ -9,8 +9,12 @@
  *   - cube targets: one 6-layer image with a mip chain, a framebuffer per
  *     (face, level) - level 0 with the depth attachment, the others without,
  *   - depth-only targets store and sample their depth (DEPTH_STENCIL_READ_ONLY).
- * Every pass clears on bind; colour ends SHADER_READ_ONLY, so an unbind needs no
- * barrier before sampling.
+ * Binding a target keeps its contents (loadOp LOAD for colour and depth, like
+ * OpenGL / D3D); vio_clear is the only clear (vkCmdClearAttachments). Every
+ * image is initialised at creation and stays in a steady layout between
+ * passes: colour SHADER_READ_ONLY (an unbind needs no barrier before
+ * sampling), multisampled colour COLOR_ATTACHMENT, depth DEPTH_STENCIL_ATTACHMENT
+ * (depth_only targets: DEPTH_STENCIL_READ_ONLY, they are sampled).
  */
 
 #ifdef HAVE_CONFIG_H
@@ -38,6 +42,9 @@ static VkAccessFlags vkrt_access(VkImageLayout l)
         case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:            return VK_ACCESS_TRANSFER_READ_BIT;
         case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
         case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: return VK_ACCESS_SHADER_READ_BIT;
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:        return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+            return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         default:                                              return 0;
     }
 }
@@ -146,11 +153,11 @@ static VkRenderPass vkrt_pass(const vio_vk_rt *x, int with_depth)
     for (int i = 0; i < x->count; i++) {
         a[n].format         = x->color_format[i];
         a[n].samples        = (VkSampleCountFlagBits)x->samples;
-        a[n].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        a[n].storeOp        = ms ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+        a[n].loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;    /* a bind keeps what was drawn */
+        a[n].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;  /* MSAA too: the next bind loads it */
         a[n].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         a[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        a[n].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+        a[n].initialLayout  = ms ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         a[n].finalLayout    = ms ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         cref[i].attachment  = n;
         cref[i].layout      = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -160,11 +167,11 @@ static VkRenderPass vkrt_pass(const vio_vk_rt *x, int with_depth)
         int depth_only = x->count == 0;
         a[n].format         = vio_vk_depth_format();
         a[n].samples        = (VkSampleCountFlagBits)x->samples;
-        a[n].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        a[n].storeOp        = depth_only ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        a[n].stencilLoadOp  = vio_vk.depth_has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        a[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        a[n].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+        a[n].loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
+        a[n].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;  /* depth survives an unbind / rebind */
+        a[n].stencilLoadOp  = vio_vk.depth_has_stencil ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        a[n].stencilStoreOp = vio_vk.depth_has_stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        a[n].initialLayout  = depth_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         a[n].finalLayout    = depth_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         dref.attachment     = n;
         dref.layout         = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -420,7 +427,8 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
         x->color_view[i] = vkrt_view(x->color_image[i], x->color_format[i], VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
         if (!x->color_view[i]) goto fail;
         if (x->samples > 1) {
-            if (vkrt_image(x->color_format[i], width, height, 1, 1, x->samples, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            if (vkrt_image(x->color_format[i], width, height, 1, 1, x->samples,
+                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                            0, &x->msaa_image[i], &x->msaa_alloc[i]) != 0) goto fail;
             x->msaa_view[i] = vkrt_view(x->msaa_image[i], x->color_format[i], VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
             if (!x->msaa_view[i]) goto fail;
@@ -430,8 +438,8 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
      * so every layer has its own depth and depth_only targets sample as
      * samplerCube / sampler2DArray. */
     if (vkrt_image(df, width, height, 1, layers, x->samples,
-                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                   (depth_only ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT) : 0),
+                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                   (depth_only ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) : 0),
                    x->cube, &x->depth_image, &x->depth_alloc) != 0) goto fail;
     /* depth_view: the 2D attachment / sampling view, or for a layered
      * depth_only target the whole-image CUBE / 2D_ARRAY sampling view. */
@@ -528,13 +536,26 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
                 vio_vk_image_barrier_range(cmd, x->color_image[i], VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)x->levels, 0, (uint32_t)layers,
                                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             }
-            if (depth_only) {
+            for (int i = 0; i < x->count && x->samples > 1; i++) {
+                VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                VkClearColorValue cv = {{ 0.0f, 0.0f, 0.0f, 0.0f }};
+                vio_vk_image_barrier_range(cmd, x->msaa_image[i], VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1,
+                                           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                vkCmdClearColorImage(cmd, x->msaa_image[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &r);
+                vio_vk_image_barrier_range(cmd, x->msaa_image[i], VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1,
+                                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            }
+            {
+                /* Depth 1.0 / stencil 0, so "bind + draw without clear" depth-tests
+                 * (the GL / Metal / D3D initial contents). */
                 VkImageAspectFlags da = vkrt_depth_aspect();
                 VkImageSubresourceRange r = { da, 0, 1, 0, (uint32_t)layers };
                 VkClearDepthStencilValue dv = { 1.0f, 0 };
+                VkImageLayout steady = depth_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                  : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
                 vio_vk_image_barrier_range(cmd, x->depth_image, da, 0, 1, 0, (uint32_t)layers, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 vkCmdClearDepthStencilImage(cmd, x->depth_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1, &r);
-                vio_vk_image_barrier_range(cmd, x->depth_image, da, 0, 1, 0, (uint32_t)layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+                vio_vk_image_barrier_range(cmd, x->depth_image, da, 0, 1, 0, (uint32_t)layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, steady);
             }
             vio_vk_submit_transient(cmd);
         }

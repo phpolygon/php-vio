@@ -72,8 +72,8 @@ function run_backend(string $name): string {
     $arr = vio_render_target($ctx, ['width' => $W, 'height' => $W, 'layers' => 3]);
     if (!($arr instanceof VioRenderTarget)) { $fail[] = "A: array target not created"; }
     else {
-        /* The quad goes into layer 1 while it is bound: re-binding a target
-         * clears it on Vulkan (loadOp CLEAR) but not on GL / D3D. */
+        /* The quad goes into layer 1 while it is bound (re-binding keeps the
+         * contents on every backend; test 142). */
         vio_begin($ctx);
         foreach ($colors as $l => $c) {
             vio_bind_render_target($ctx, $arr, $l);
