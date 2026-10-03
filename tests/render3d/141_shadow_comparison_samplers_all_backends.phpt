@@ -42,7 +42,7 @@ function run_backend(string $name): string {
     }
     $fail = [];
     $layered = vio_supports_feature($ctx, VIO_FEATURE_RENDER_TARGET_LAYERED);
-    $depthOf = fn(float $z): float => vio_backend_name($ctx) === 'metal' ? max(0.0, min(1.0, $z)) : ($z + 1.0) / 2.0;
+    $depthOf = fn(float $z): float => vio_backend_name($ctx) === 'metal' ? $z : ($z + 1.0) / 2.0;   /* z stays in 0..1 throughout */
     $vs = "#version 450\nlayout(location=0) in vec3 aPos;\nuniform float u_z;\nvoid main(){ gl_Position = vec4(aPos.xy, u_z, 1.0); }";
     $fsDepth = "#version 450\nvoid main(){ }";
     $full = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0, 1,1,0, -1,1,0], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT3]]);
@@ -139,7 +139,7 @@ function run_backend(string $name): string {
              . "void main(){ float s = texture(u_sh, vec4(u_dir, u_ref)); o = vec4(s, s, s, 1.0); }";
         $pC = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs, 'fragment' => $fsC])] + $base);
         $cube = vio_render_target($ctx, ['cube' => true, 'size' => $W, 'depth_only' => true]);
-        $zs = []; for ($f = 0; $f < 6; $f++) $zs[$f] = -0.8 + 0.3 * $f;   /* depths 0.1 .. 0.85 */
+        $zs = []; for ($f = 0; $f < 6; $f++) $zs[$f] = 0.1 + 0.15 * $f;   /* z 0.1 .. 0.85: inside 0..1, so Metal (which clips z < 0) keeps every face */
         $fill($cube, $zs);
         $cm = vio_render_target_cubemap($cube);
         $dirs = [[1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]];

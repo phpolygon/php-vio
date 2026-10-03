@@ -3924,6 +3924,12 @@ static void metal_set_viewport(int x, int y, int width, int height)
     @autoreleasepool {
         MTLViewport vp = {(double)x, (double)y, (double)width, (double)height, 0.0, 1.0};
         [vio_mtl.current_encoder setViewport:vp];
+        if (metal_vp_has_scissor) {
+            /* vio_viewports clipped viewport 0 to its own rect: a single
+             * viewport draws without a scissor again (full target). */
+            MTLScissorRect full = {0, 0, (NSUInteger)metal_target_w, (NSUInteger)metal_target_h};
+            [vio_mtl.current_encoder setScissorRect:full];
+        }
         metal_vp[0] = vp;
         metal_sc[0] = metal_clamped_scissor(x, y, width, height);
         metal_vp_count = 1;
