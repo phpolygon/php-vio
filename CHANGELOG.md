@@ -1,3 +1,41 @@
+# [2.28.0](https://github.com/phpolygon/php-vio/compare/v2.27.0...v2.28.0) (2026-10-03)
+
+
+### Bug Fixes
+
+* **batch:** bind record pipelines on OpenGL in vio_submit_batch ([92b9fa6](https://github.com/phpolygon/php-vio/commit/92b9fa65c5a0fedc431bdd2b12c265d4ee2fc37a))
+* **d3d11:** comparison sampler for depth cubes ([a25fe00](https://github.com/phpolygon/php-vio/commit/a25fe001d0fb32c08cbeb9a4075a2860002cb4db))
+* **d3d:** compile geometry / hull / domain stages through the cached path ([e7b2e5c](https://github.com/phpolygon/php-vio/commit/e7b2e5c76e7ae56f94db6f439d95005d3f338efd))
+* **d3d:** remap depth on every geometry-shader vertex ([02cb0d0](https://github.com/phpolygon/php-vio/commit/02cb0d05adfef25b311be0564473c9063a35ce5d))
+* **metal:** vio_viewport drops the vio_viewports scissors; 141 cube depths inside 0..1 ([3625b3b](https://github.com/phpolygon/php-vio/commit/3625b3bcf2d5b6d53ad7271d667743e6a3249f88))
+* **opengl:** comparison sampling for sampler*Shadow ([58fc126](https://github.com/phpolygon/php-vio/commit/58fc1261735819cafbaff40156fb6e234566617c))
+* **shader:** declare the viewport/layer extension SPIRV-Cross omits ([2f0cc2e](https://github.com/phpolygon/php-vio/commit/2f0cc2e1de0b2dc2664e9cc72596021d1c12a06c)), closes [#extension](https://github.com/phpolygon/php-vio/issues/extension) [#version](https://github.com/phpolygon/php-vio/issues/version)
+* **shader:** patch topology on indirect draws, refuse patches without tessellation ([6b13e9a](https://github.com/phpolygon/php-vio/commit/6b13e9a685fb73100a51dba979d1bc6af2780908))
+* **vulkan:** re-binding a render target keeps colour and depth ([29c5940](https://github.com/phpolygon/php-vio/commit/29c5940c0a7e31c4d8e97ada131b3c5f2a73c340))
+
+
+### Features
+
+* **d3d11:** array and depth-cube render targets ([a497b9c](https://github.com/phpolygon/php-vio/commit/a497b9c0d590294395e7aabbf016fb3ab5253cfa))
+* **d3d11:** layered rendering ([a9fee65](https://github.com/phpolygon/php-vio/commit/a9fee6529fcf5fa41bebbe4c382562c0116f4adf))
+* **d3d12:** array and depth-cube render targets ([df0c9b7](https://github.com/phpolygon/php-vio/commit/df0c9b75dae186af1577489e9d67c42eca8b4d47))
+* **d3d12:** layered rendering ([896371a](https://github.com/phpolygon/php-vio/commit/896371a7538c705a350c22a2c73168d96cdb6515))
+* **d3d:** gl_in[].gl_Position and gl_InvocationID in GLSL geometry stages ([659716b](https://github.com/phpolygon/php-vio/commit/659716b00ea69856422d8a48b10f6a1f12d3f62b))
+* **d3d:** HLSL overrides for the geometry and tessellation stages ([e51ddaf](https://github.com/phpolygon/php-vio/commit/e51ddafc5d149305771e89ea7bb343d0a3a9aa15))
+* **d3d:** multiple viewports ([fb432d9](https://github.com/phpolygon/php-vio/commit/fb432d9c92ad3546877c0c53cd4f6270a26eae4c))
+* **metal:** stencil, layered render targets, gl_Layer, multiple viewports ([dd57ce5](https://github.com/phpolygon/php-vio/commit/dd57ce523d7f659cffa189038f6fc53ec13bf283))
+* **metal:** tessellation stages via compute kernels and drawPatches ([33002eb](https://github.com/phpolygon/php-vio/commit/33002eb5237ffe4bc6a31d14d034126be686b511))
+* **render-target:** array and depth-cube render targets ([df29559](https://github.com/phpolygon/php-vio/commit/df29559d9e4d9ac28932de4b3a5fcd267b374f2f))
+* **render-target:** layered rendering with VIO_RT_ALL_LAYERS ([274353e](https://github.com/phpolygon/php-vio/commit/274353e3138b3a6ad7297bcaa5688c6f1b194ad5))
+* **shader:** geometry and tessellation stages for vio_shader ([c01044c](https://github.com/phpolygon/php-vio/commit/c01044c70e9927e1bdeb61558f024c1df9469345))
+* **shader:** GS instancing flag and adjacency topologies ([b2c573b](https://github.com/phpolygon/php-vio/commit/b2c573b8a54dae6ca237dd8756b2c2fae624cfad))
+* **viewport:** vio_viewports for several viewports at once ([db14754](https://github.com/phpolygon/php-vio/commit/db14754514f9f68e585ca56bebad55e755bc0a17))
+* **vulkan:** array and depth-cube render targets ([6561510](https://github.com/phpolygon/php-vio/commit/6561510ff709d2d60fc4b4f0ecec1ec48b3a3ea6))
+* **vulkan:** geometry and tessellation stages ([1362f9c](https://github.com/phpolygon/php-vio/commit/1362f9ca0001faa37ab80180e5b1f08c68de90ec))
+* **vulkan:** layered rendering ([b3df4f1](https://github.com/phpolygon/php-vio/commit/b3df4f19ee0754906b32b62c62ad91fb555d643b))
+* **vulkan:** multiple viewports ([d4bba15](https://github.com/phpolygon/php-vio/commit/d4bba1504e06940fc478ae313bc03235aa79458b))
+* **vulkan:** texture updates, storage images and async compute in the frame ([39652e8](https://github.com/phpolygon/php-vio/commit/39652e8365848eeea103b69ea6f15ef883c7f56d))
+
 # [2.27.0](https://github.com/phpolygon/php-vio/compare/v2.26.0...v2.27.0) (2026-09-23)
 
 
