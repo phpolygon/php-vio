@@ -271,7 +271,18 @@ typedef enum _vio_feature {
      * targets (sampled through vio_render_target_cubemap). One layer / face is
      * bound at a time via vio_bind_render_target($ctx, $rt, $layer). */
     VIO_FEATURE_RENDER_TARGET_LAYERED = 39,
+    /* Layered rendering: vio_bind_render_target($ctx, $rt, VIO_RT_ALL_LAYERS)
+     * binds every layer / face of a layered target at once; a geometry stage
+     * picks the layer per primitive with gl_Layer (single-pass cube / CSM). */
+    VIO_FEATURE_LAYERED_RENDER     = 40,
+    /* gl_Layer written by the VERTEX stage (no geometry stage needed:
+     * gl_Layer = gl_InstanceIndex with one instance per layer). */
+    VIO_FEATURE_VERTEX_LAYER       = 41,
 } vio_feature;
+
+/* vio_bind_render_target() face / layer argument that binds every layer of a
+ * cube or array target at once (VIO_FEATURE_LAYERED_RENDER). */
+#define VIO_RT_ALL_LAYERS (-2)
 
 /* vio_set_shading_rate() rates (GAP-PHASE5 Block 12). 4X4 needs the device's
  * additional-rates capability; the call returns false otherwise. */

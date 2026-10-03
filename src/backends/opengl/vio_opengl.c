@@ -1089,6 +1089,13 @@ static void opengl_destroy_render_target(void *rt_ptr)
  * levels render without depth (the Metal contract). */
 static void opengl_rt_attach_layer(vio_render_target_object *rt, int layer, int level)
 {
+    if (layer < 0) {
+        /* VIO_RT_ALL_LAYERS: layered attachments (every face / layer); gl_Layer
+         * in the geometry or vertex stage selects the destination. */
+        if (!rt->depth_only) glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rt->color_texture, level);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, level == 0 ? rt->depth_texture : 0, 0);
+        return;
+    }
     if (rt->is_cube) {
         if (!rt->depth_only) {
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -1369,8 +1376,12 @@ static int opengl_bind_render_target_face(void *rt_ptr, int face, int level)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (!rt || rt->backend_type != VIO_RT_BACKEND_OPENGL || !vio_gl.initialized) return -1;
-    if ((!rt->is_cube && rt->layers <= 1) || face < 0 || face >= vio_rt_layer_count(rt) ||
-        level < 0 || level >= rt->mip_levels) return -1;
+    if ((!rt->is_cube && rt->layers <= 1) || level < 0 || level >= rt->mip_levels) return -1;
+    if (face == VIO_RT_ALL_LAYERS) {
+        if (level != 0 || !GLAD_GL_VERSION_3_2) return -1;
+    } else if (face < 0 || face >= vio_rt_layer_count(rt)) {
+        return -1;
+    }
     if (vio_gl.current_bound_rt && vio_gl.current_bound_rt != rt) {
         opengl_rt_resolve_msaa((vio_render_target_object *)vio_gl.current_bound_rt);
     }
@@ -2409,6 +2420,8 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_INDIRECT_DRAW:  return vio_gl.initialized && GLAD_GL_VERSION_4_0; /* glDraw*Indirect */
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_gl.initialized;                        /* GL_TEXTURE_2D_ARRAY, core 3.0 */
         case VIO_FEATURE_RENDER_TARGET_LAYERED: return vio_gl.initialized;                 /* glFramebufferTextureLayer + depth cubemaps, core 3.0 */
+        case VIO_FEATURE_LAYERED_RENDER: return vio_gl.initialized && GLAD_GL_VERSION_3_2;  /* glFramebufferTexture (layered attachment) */
+        case VIO_FEATURE_VERTEX_LAYER:   return vio_gl.initialized && gl_has_ext("GL_ARB_shader_viewport_layer_array");
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC:                                          /* S3TC ext (BC1/BC3) + core RGTC; BC7 needs BPTC / 4.2 */
             return vio_gl.initialized && gl_has_ext("GL_EXT_texture_compression_s3tc");
         case VIO_FEATURE_CUBEMAP:        return 1;

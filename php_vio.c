@@ -8281,6 +8281,9 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_COMPRESSION_BC", VIO_FEATURE_TEXTURE_COMPRESSION_BC, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE", VIO_FEATURE_SHADING_RATE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_LAYERED", VIO_FEATURE_RENDER_TARGET_LAYERED, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_LAYERED_RENDER", VIO_FEATURE_LAYERED_RENDER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_LAYER", VIO_FEATURE_VERTEX_LAYER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_RT_ALL_LAYERS", VIO_RT_ALL_LAYERS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X1", VIO_SHADING_RATE_1X1, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X2", VIO_SHADING_RATE_1X2, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_2X1", VIO_SHADING_RATE_2X1, CONST_CS | CONST_PERSISTENT);
@@ -9522,7 +9525,25 @@ ZEND_FUNCTION(vio_bind_render_target)
     /* Cube RT face bind (vio_render_target(['cube' => true])): face 0..5 =
      * +X,-X,+Y,-Y,+Z,-Z; level selects the mip level. Array RT ('layers' => N):
      * the argument is the layer, 0..N-1. Same persistent-bind semantics as a
-     * plain bind. */
+     * plain bind. VIO_RT_ALL_LAYERS binds every layer at level 0; a geometry
+     * (or, with VIO_FEATURE_VERTEX_LAYER, vertex) stage picks the layer with
+     * gl_Layer, and vio_clear clears all of them. */
+    if (face == VIO_RT_ALL_LAYERS) {
+        if (!rt->is_cube && rt->layers <= 1) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: VIO_RT_ALL_LAYERS requires a cube or array render target");
+            return;
+        }
+        if (level != 0 || !ctx->backend->supports_feature ||
+            !ctx->backend->supports_feature(VIO_FEATURE_LAYERED_RENDER) || !ctx->backend->bind_render_target_face) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: layered binds (level 0) are not supported on backend '%s'",
+                             ctx->backend->name);
+            return;
+        }
+        if (ctx->backend->bind_render_target_face(rt, VIO_RT_ALL_LAYERS, 0) != 0) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: layered bind failed on backend '%s'", ctx->backend->name);
+        }
+        return;
+    }
     if (face >= 0) {
         if (!rt->is_cube && rt->layers <= 1) {
             php_error_docref(NULL, E_WARNING, "vio_bind_render_target: 'face' requires a cube or array render target");

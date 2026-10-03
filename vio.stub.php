@@ -1239,6 +1239,13 @@ function vio_render_target(VioContext $context, array $config): VioRenderTarget|
 
 /**
  * Bind a render target for subsequent draw calls (redirects rendering to FBO).
+ *
+ * @param int $face  -1: the whole target (cube / array: face / layer 0). 0..5: one cube face,
+ *                   0..N-1: one array layer, at mip $level. VIO_RT_ALL_LAYERS: every face /
+ *                   layer at once (level 0, VIO_FEATURE_LAYERED_RENDER) - gl_Layer in the
+ *                   geometry stage, or in the vertex stage with VIO_FEATURE_VERTEX_LAYER
+ *                   (#extension GL_ARB_shader_viewport_layer_array), picks the destination per
+ *                   primitive; vio_clear clears every layer. Single-pass cube / cascaded shadows.
  */
 function vio_bind_render_target(VioContext $context, VioRenderTarget $target, int $face = -1, int $level = 0): void {}
 
