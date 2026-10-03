@@ -337,6 +337,7 @@ typedef struct _vio_d3d12_state {
     /* Descriptor heaps */
     ID3D12DescriptorHeap      *rtv_heap;
     UINT                       rtv_descriptor_size;
+    UINT                       dsv_descriptor_size;   /* layered render targets: one DSV per layer */
     ID3D12DescriptorHeap      *dsv_heap;
     vio_d3d12_descriptor_heap  srv_heap;          /* GPU-visible CBV/SRV/UAV */
     ID3D12DescriptorHeap      *srv_staging_heap;  /* CPU-only staging mirror for srv_heap. D3D12

@@ -1009,6 +1009,8 @@ static int d3d12_init(vio_config *cfg)
     }
     vio_d3d12.rtv_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    vio_d3d12.dsv_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(
+        vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
     if (d3d12_create_descriptor_heap(&vio_d3d12.dsv_heap,
                                       D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1,
@@ -2867,6 +2869,8 @@ static unsigned char *d3d12_readback_subresource(ID3D12Resource *src, UINT subre
     return out;
 }
 
+static int d3d12_rt_mips(const vio_render_target_object *rt);
+
 /* vio_read_render_target on D3D12: colour attachment (any vio_pixel_format,
  * converted to RGBA8 by the shared converter) or the depth buffer
  * (R24G8_TYPELESS -> grey ramp). Cube targets are not available on D3D12. */
@@ -2876,11 +2880,12 @@ static int d3d12_read_render_target(void *rt_ptr, int face, int attachment, void
     if (!rt || rt->backend_type != VIO_RT_BACKEND_D3D12 || !vio_d3d12.device) return -1;
     int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
     if (attachment < 0 || attachment >= n) return -1;
-    /* Cube targets: subresource = face * mip_levels (mip 0 of that slice). */
+    /* Cube / array targets: subresource = layer * mip_levels (mip 0 of that
+     * slice); the depth resource has a single level. */
     UINT subresource = 0;
-    if (rt->is_cube) {
+    if (rt->is_cube || rt->layers > 1) {
         int f = face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0);
-        subresource = (UINT)(f * (rt->mip_levels > 0 ? rt->mip_levels : 1));
+        subresource = (UINT)(f * (rt->depth_only ? 1 : d3d12_rt_mips(rt)));
     }
 
     ID3D12Resource *src;
@@ -3108,27 +3113,34 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_dsv_heap, &dsv_handle);
     int w = rt->width, h = rt->height;
+    int layers = vio_rt_layer_count(rt);
+    if (layers > 1) {
+        /* Cube / array: one DSV per layer (heap entry = layer). */
+        if (face < 0 || face >= layers) face = 0;
+        dsv_handle.ptr += (SIZE_T)face * vio_d3d12.dsv_descriptor_size;
+    }
 
     if (rt->depth_only) {
         ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 0, NULL, FALSE, &dsv_handle);
         vio_d3d12.current_has_rtv = 0;
         vio_d3d12.current_rtv_count = 0;
         vio_d3d12.current_dsv = dsv_handle;
-    } else if (rt->is_cube) {
+        if (layers > 1) { rt->bound_face = face; rt->bound_level = 0; }
+    } else if (layers > 1) {
         int mips = d3d12_rt_mips(rt);
-        if (face < 0 || face > 5) face = 0;
         if (level < 0 || level >= mips) level = 0;
         D3D12_CPU_DESCRIPTOR_HANDLE rtv_base;
         ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &rtv_base);
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = { rtv_base.ptr + (SIZE_T)(face * mips + level) * vio_d3d12.rtv_descriptor_size };
-        /* The shared depth texture matches level 0 only (GL / Metal contract). */
+        /* The layer's depth slice matches level 0 only (GL / Metal contract). */
         ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1, &rtv, FALSE, level == 0 ? &dsv_handle : NULL);
         vio_d3d12.current_rtv = rtv;
         vio_d3d12.current_rtvs[0] = rtv;
         vio_d3d12.current_rtv_count = 1;
         vio_d3d12.current_has_rtv = 1;
         vio_d3d12.current_dsv = dsv_handle;
-        w = h = (rt->width >> level) > 0 ? (rt->width >> level) : 1;
+        w = (rt->width >> level) > 0 ? (rt->width >> level) : 1;
+        h = (rt->height >> level) > 0 ? (rt->height >> level) : 1;
         rt->bound_face = face;
         rt->bound_level = level;
     } else {
@@ -3184,9 +3196,10 @@ static int d3d12_bind_render_target_face(void *rt_ptr, int face, int level)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (!rt || !vio_d3d12.initialized || rt->backend_type != VIO_RT_BACKEND_D3D12) return -1;
-    if (!rt->is_cube || face < 0 || face > 5 || level < 0 || level >= d3d12_rt_mips(rt)) return -1;
+    if ((!rt->is_cube && rt->layers <= 1) || face < 0 || face >= vio_rt_layer_count(rt) ||
+        level < 0 || level >= d3d12_rt_mips(rt)) return -1;
     if (!vio_d3d12.in_frame) {
-        php_error_docref(NULL, E_WARNING, "D3D12: cube face binds are only valid between vio_begin and vio_end");
+        php_error_docref(NULL, E_WARNING, "D3D12: cube face / array layer binds are only valid between vio_begin and vio_end");
         return -1;
     }
     d3d12_record_bind_render_target(rt, face, level);
@@ -3254,7 +3267,8 @@ static void d3d12_unbind_render_target(unsigned int default_fbo, int width, int 
 typedef struct _d3d12_rt_clear_job {
     D3D12_CPU_DESCRIPTOR_HANDLE rtv0;
     int                         rtv_count;
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv;          /* first DSV; layered targets have dsv_count */
+    int                         dsv_count;
 } d3d12_rt_clear_job;
 
 static void d3d12_record_rt_clear(ID3D12GraphicsCommandList *list, void *user)
@@ -3265,8 +3279,12 @@ static void d3d12_record_rt_clear(ID3D12GraphicsCommandList *list, void *user)
         D3D12_CPU_DESCRIPTOR_HANDLE h = { job->rtv0.ptr + (SIZE_T)i * vio_d3d12.rtv_descriptor_size };
         ID3D12GraphicsCommandList_ClearRenderTargetView(list, h, zero, 0, NULL);
     }
-    ID3D12GraphicsCommandList_ClearDepthStencilView(list, job->dsv,
-        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+    int n = job->dsv_count > 0 ? job->dsv_count : 1;
+    for (int i = 0; i < n; i++) {
+        D3D12_CPU_DESCRIPTOR_HANDLE d = { job->dsv.ptr + (SIZE_T)i * vio_d3d12.dsv_descriptor_size };
+        ID3D12GraphicsCommandList_ClearDepthStencilView(list, d,
+            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+    }
 }
 
 /* Allocate a static SRV (staging heap) for a render-target view. */
@@ -3287,12 +3305,14 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     int attachment_count = rt->attachment_count > 0 ? rt->attachment_count : 1;
     if (attachment_count > VIO_MAX_COLOR_ATTACHMENTS) attachment_count = VIO_MAX_COLOR_ATTACHMENTS;
     int mips = d3d12_rt_mips(rt);
+    int layers = vio_rt_layer_count(rt);
+    int layered = layers > 1;
     /* MSAA (GAP-PHASE5 Block 1): clamp the request to a power of two the device
      * supports for attachment 0's format. Cube / depth-only targets stay
      * single-sample (no resolve path), like D3D11. The PSO side is handled by
      * the per-sample-count variants (d3d12_pipeline_pso_for_samples). */
     UINT samples = 1;
-    if (!rt->is_cube && !depth_only && rt->samples > 1) {
+    if (!layered && !depth_only && rt->samples > 1) {
         UINT want = rt->samples > 8 ? 8 : (UINT)rt->samples;
         while (want & (want - 1)) want &= want - 1;   /* round down to a power of two */
         for (UINT s = want; s > 1; s >>= 1) {
@@ -3313,7 +3333,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
         D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {0};
         /* MSAA: attachments' RTVs first, then one RTV per single-sample resolve
          * target (used only by the initial clear). */
-        rtv_heap_desc.NumDescriptors = rt->is_cube ? (UINT)(6 * mips) : (UINT)(attachment_count * (samples > 1 ? 2 : 1));
+        rtv_heap_desc.NumDescriptors = layered ? (UINT)(layers * mips) : (UINT)(attachment_count * (samples > 1 ? 2 : 1));
         rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         ID3D12DescriptorHeap *rtv_heap = NULL;
         hr = ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &rtv_heap_desc, &IID_ID3D12DescriptorHeap, (void **)&rtv_heap);
@@ -3328,12 +3348,14 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
         D3D12_HEAP_PROPERTIES heap_props = {0};
         heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-        if (rt->is_cube) {
+        if (layered) {
+            /* Cube (6 slices, mip chain) or array ('layers' => N): one RTV per
+             * (layer, level). */
             DXGI_FORMAT dxfmt = vio_pixel_format_to_dxgi(rt->formats[0]);
             D3D12_RESOURCE_DESC rd = {0};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             rd.Width = width; rd.Height = height;
-            rd.DepthOrArraySize = 6;
+            rd.DepthOrArraySize = (UINT16)layers;
             rd.MipLevels = (UINT16)mips;
             rd.Format = dxfmt;
             rd.SampleDesc.Count = 1;
@@ -3345,12 +3367,12 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
             hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props, D3D12_HEAP_FLAG_NONE, &rd,
                 D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, &IID_ID3D12Resource, (void **)&cube);
             if (FAILED(hr)) {
-                php_error_docref(NULL, E_WARNING, "D3D12: Failed to create cube colour resource (0x%08lx)", hr);
+                php_error_docref(NULL, E_WARNING, "D3D12: Failed to create %s colour resource (0x%08lx)", rt->is_cube ? "cube" : "array", hr);
                 return -1;
             }
             rt->d3d12_color_resource = cube;
             rt->d3d12_color_resources[0] = cube;
-            for (int f = 0; f < 6; f++) {
+            for (int f = 0; f < layers; f++) {
                 for (int l = 0; l < mips; l++) {
                     D3D12_RENDER_TARGET_VIEW_DESC vd = {0};
                     vd.Format = dxfmt;
@@ -3410,9 +3432,10 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
         }
     }
 
-    /* DSV heap + depth resource (shared, level-0 sized) */
+    /* DSV heap + depth resource (level-0 sized; cube / array targets carry a
+     * depth slice and a DSV per layer) */
     D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc = {0};
-    dsv_heap_desc.NumDescriptors = 1;
+    dsv_heap_desc.NumDescriptors = (UINT)layers;
     dsv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     ID3D12DescriptorHeap *dsv_heap = NULL;
     hr = ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &dsv_heap_desc, &IID_ID3D12DescriptorHeap, (void **)&dsv_heap);
@@ -3428,7 +3451,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     depth_res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     depth_res_desc.Width = width;
     depth_res_desc.Height = height;
-    depth_res_desc.DepthOrArraySize = 1;
+    depth_res_desc.DepthOrArraySize = (UINT16)layers;
     depth_res_desc.MipLevels = 1;
     depth_res_desc.Format = depth_only ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_D24_UNORM_S8_UINT;
     depth_res_desc.SampleDesc.Count = samples;   /* multisampled with the colour (DSV infers 2DMS) */
@@ -3450,7 +3473,19 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     dsv_view_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsv_heap, &dsv_handle);
-    ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, depth_only ? &dsv_view_desc : NULL, dsv_handle);
+    if (layered) {
+        for (int l = 0; l < layers; l++) {
+            D3D12_DEPTH_STENCIL_VIEW_DESC dd = {0};
+            dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+            dd.Texture2DArray.FirstArraySlice = (UINT)l;
+            dd.Texture2DArray.ArraySize = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = { dsv_handle.ptr + (SIZE_T)l * vio_d3d12.dsv_descriptor_size };
+            ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, &dd, h);
+        }
+    } else {
+        ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, depth_only ? &dsv_view_desc : NULL, dsv_handle);
+    }
 
     /* Static SRVs (staging heap) for sampling the target later. */
     if (depth_only) {
@@ -3458,22 +3493,37 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
         if (d3d12_rt_alloc_srv(&cpu, &gpu) == 0) {
             D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
             sd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            sd.Texture2D.MipLevels = 1;
+            if (rt->is_cube) {
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+                sd.TextureCube.MipLevels = 1;
+            } else if (layered) {
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                sd.Texture2DArray.MipLevels = 1;
+                sd.Texture2DArray.ArraySize = (UINT)layers;
+            } else {
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                sd.Texture2D.MipLevels = 1;
+            }
             D3D12_CPU_DESCRIPTOR_HANDLE h = { (SIZE_T)cpu };
             ID3D12Device_CreateShaderResourceView(vio_d3d12.device, depth_res, &sd, h);
             rt->d3d12_depth_srv_gpu = gpu;
             rt->d3d12_depth_srv_cpu = cpu;
         }
-    } else if (rt->is_cube) {
+    } else if (layered) {
         uint64_t cpu, gpu;
         if (d3d12_rt_alloc_srv(&cpu, &gpu) == 0) {
             D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
             sd.Format = vio_pixel_format_to_dxgi(rt->formats[0]);
-            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
             sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            sd.TextureCube.MipLevels = (UINT)mips;
+            if (rt->is_cube) {
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+                sd.TextureCube.MipLevels = (UINT)mips;
+            } else {
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                sd.Texture2DArray.MipLevels = (UINT)mips;
+                sd.Texture2DArray.ArraySize = (UINT)layers;
+            }
             D3D12_CPU_DESCRIPTOR_HANDLE h = { (SIZE_T)cpu };
             ID3D12Device_CreateShaderResourceView(vio_d3d12.device, (ID3D12Resource *)rt->d3d12_color_resource, &sd, h);
             rt->d3d12_color_srv_gpus[0] = rt->d3d12_color_srv_gpu = gpu;
@@ -3504,9 +3554,10 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     {
         d3d12_rt_clear_job job = {0};
         job.dsv = dsv_handle;
+        job.dsv_count = layers;
         if (!depth_only && rt->d3d12_rtv_heap) {
             ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &job.rtv0);
-            job.rtv_count = rt->is_cube ? 6 * mips : attachment_count * (samples > 1 ? 2 : 1);
+            job.rtv_count = layered ? layers * mips : attachment_count * (samples > 1 ? 2 : 1);
         }
         d3d12_submit_upload(d3d12_record_rt_clear, &job);
     }
@@ -3517,13 +3568,18 @@ static int d3d12_render_target_cubemap(void *rt_ptr, void *cm_obj)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
-    if (!rt || !cm || !rt->is_cube || !rt->d3d12_color_resource || !rt->d3d12_color_srv_cpu) return -1;
+    if (!rt || !cm || !rt->is_cube) return -1;
+    /* depth_only: the depth cube (TEXTURECUBE SRV over the R24 plane). */
+    void *res = rt->depth_only ? rt->d3d12_depth_resource : rt->d3d12_color_resource;
+    uint64_t srv_cpu = rt->depth_only ? rt->d3d12_depth_srv_cpu : rt->d3d12_color_srv_cpu;
+    uint64_t srv_gpu = rt->depth_only ? rt->d3d12_depth_srv_gpu : rt->d3d12_color_srv_gpu;
+    if (!res || !srv_cpu) return -1;
     /* Borrowed: the RT owns the resource + descriptor (d3d12_destroy_cubemap
      * honours cm->borrowed). Binding reads d3d12_srv_cpu, which stays valid for
      * the RT's life. */
-    cm->d3d12_resource = rt->d3d12_color_resource;
-    cm->d3d12_srv_cpu  = rt->d3d12_color_srv_cpu;
-    cm->d3d12_srv_gpu  = rt->d3d12_color_srv_gpu;
+    cm->d3d12_resource = res;
+    cm->d3d12_srv_cpu  = srv_cpu;
+    cm->d3d12_srv_gpu  = srv_gpu;
     cm->mipmaps        = rt->mip_levels > 1;
     cm->borrowed       = 1;
     cm->resolution     = rt->width;
@@ -5569,6 +5625,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return 1; /* BC1-BC7 mandatory on every D3D12 device */
         case VIO_FEATURE_SHADING_RATE:        return vio_d3d12.vrs_tier > 0; /* RSSetShadingRate, VRS Tier 1+ (GAP-PHASE5 12) */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
+        case VIO_FEATURE_RENDER_TARGET_LAYERED: return 1; /* array resources: RTV / DSV per layer, array / cube SRVs */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* compute downsample (GAP-PHASE5 11), CPU box filter fallback */
         case VIO_FEATURE_CUBEMAP:      return 1;
         case VIO_FEATURE_DEPTH_BIAS:   return 1; /* PSO rasterizer state */
