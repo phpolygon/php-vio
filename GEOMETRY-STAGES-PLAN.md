@@ -1,7 +1,8 @@
 # GEOMETRY-STAGES-PLAN — was nach den Geometry-/Tessellation-Stages fehlt
 
 Stand 2026-10-03, nach PR #23 (Geometry + Tessellation für `vio_shader`, Vulkan nativ,
-Test 109/110/135). Phasen 1–3 sind umgesetzt (Tabelle am Ende), offen ist Phase 4 und Metal für Phase 1. Dieser Plan sammelt die Funktionen, die der PR bewusst ausgelassen hat, und
+Test 109/110/135). Alle Phasen sind umgesetzt (Tabelle am Ende); offen bleiben nur Hull/Domain aus GLSL auf D3D
+(SPIRV-Cross hat kein HLSL-Tessellations-Backend, der HLSL-Override deckt es ab). Dieser Plan sammelt die Funktionen, die der PR bewusst ausgelassen hat, und
 ordnet sie nach Nutzen für PHPolygon und nach Testbarkeit auf dem Windows-Entwicklungsrechner
 (RTX 2080, Vulkan 1.4, D3D11/D3D12, OpenGL 4.6; Metal nur über die macOS-CI).
 
@@ -177,17 +178,17 @@ D3D12 auf der RTX 2080 und auf WARP.
 
 ## Reihenfolge und Testbarkeit
 
-| Phase | Inhalt | Aufwand | Lokal testbar |
-|---|---|---|---|
 | Phase | Inhalt | Aufwand | Lokal testbar | Stand |
 |---|---|---|---|---|
 | 1a–1b | Array-/Depth-Cube-Targets, alle Layer binden | M | GL, D3D11, D3D12, Vulkan | ✅ Test 136/137 |
-| 1c | `gl_Layer` aus GS und VS | S–M | GL, D3D11, D3D12, Vulkan (Metal: CI) | ✅ Test 137 (Metal offen) |
+| 1c | `gl_Layer` aus GS und VS | S–M | GL, D3D11, D3D12, Vulkan (Metal: CI) | ✅ Test 137 (Metal: nur Vertex-Stage, `[[render_target_array_index]]`) |
 | 1d | Mehrere Viewports | S | GL, D3D11, D3D12, Vulkan | ✅ Test 138 |
-| 2 | GS-Instancing, Adjacency + Mesh-Helfer | S | GL, D3D11, D3D12, Vulkan | ✅ Test 139 (D3D-Instancing nur per Override) |
+| 2 | GS-Instancing, Adjacency + Mesh-Helfer | S | GL, D3D11, D3D12, Vulkan | ✅ Test 139, 143 (D3D: `gl_InvocationID`/`gl_in` über den SPIR-V-Umbau vor SPIRV-Cross) |
 | 3 | D3D-Tessellation über HLSL-Override | M | D3D11, D3D12 | ✅ Test 140, als allgemeiner Override für GS/HS/DS (`VIO_FEATURE_HLSL_STAGE_OVERRIDE`) |
-| 4 | Metal-Tessellation | L | nur CI | offen |
+| 4 | Metal-Tessellation | L | nur CI | ✅ Test 110/140 auf macOS (VS/TCS als Compute-Kernel, TES nach `drawPatches`) |
+| 1 (Metal) | Layered Targets, VS-Layer, mehrere Viewports | M | nur CI | ✅ Test 136–138, 142 auf macOS |
 
 Abweichungen vom Plan: Phase 3 ist kein Tessellation-Sonderfall (`VIO_FEATURE_TESSELLATION_HLSL`),
 sondern ein Override für alle drei Extra-Stages - damit bekommt D3D auch GS-Instancing
-(`[instance(N)]`), das SPIRV-Cross nicht übersetzen kann. Metal meldet die Flags aus Phase 1 noch 0.
+(`[instance(N)]`). Seit dem SPIR-V-Umbau (`vio_gs_hlsl_rewrite`) braucht GS-Instancing auf D3D den
+Override nicht mehr; für Hull/Domain bleibt er der einzige Weg.
