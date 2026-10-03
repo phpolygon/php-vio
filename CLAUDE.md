@@ -94,7 +94,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 
 | Ordner | Inhalt |
 |---|---|
-| `tests/render3d/144` | Tessellation hält die OpenGL-Konventionen auf jedem Backend: welche Kante `outer[1]` unterteilt (Quad, Dreieck), Winding unter `VIO_CULL_BACK`, Patch-Varying mit Uniforms in TCS und TES, `vertices = 3` mit 4-Punkt-Patches (`gl_PatchVerticesIn`, HS-Variante), Isolines (nicht auf D3D), D3D12 auch mit Shader Model 6. Farben tragen die Domain-Koordinaten, die Prüfung ist unabhängig von der Readback-Orientierung. |
+| `tests/render3d/144` | Tessellation hält die OpenGL-Konventionen auf jedem Backend: welche Kante `outer[1]` unterteilt (Quad, Dreieck), Winding unter `VIO_CULL_BACK`, Patch-Varying mit Uniforms in TCS und TES, `vertices = 3` mit 4-Punkt-Patches (`gl_PatchVerticesIn`, HS-Variante), Isolines (auf D3D nur auf Hardware, WARP verliert tessellierte Linien), D3D12 auch mit Shader Model 6. Farben tragen die Domain-Koordinaten, die Prüfung ist unabhängig von der Readback-Orientierung. |
 | `tests/render3d/143` | Geometry-Stage mit `gl_in[0].gl_Position` und `gl_InvocationID` (`layout(invocations = 2)`) aus purem GLSL auf jedem Backend mit GS – auf D3D über den SPIR-V-Umbau vor SPIRV-Cross (`SV_Position`-Eingang, `SV_GSInstanceID` + `[instance(N)]`). |
 | `tests/render3d/142` | Erneutes Binden eines Render-Targets behält Farbe **und Tiefe** (plain, HDR, MSAA, Array-Layer, Cube-Face; im nächsten und im selben Frame) – `vio_clear` ist der einzige Clear. Fehlte auf Vulkan (`loadOp CLEAR`). |
 | `tests/render3d/141` | Vergleichs-Sampling auf jedem Backend: `sampler2DShadow`, `sampler2DArrayShadow`, `samplerCubeShadow` liefern das Vergleichsergebnis (ref ≤ gespeicherte Tiefe), dieselbe Tiefentextur liest per `sampler2D` weiter roh, ein 2D-Sprite auf Unit 0 danach sampelt normal. Schlägt ohne den GL-Vergleichs-Sampler fehl (GL lieferte die rohe Tiefe). |
@@ -1114,9 +1114,14 @@ Aufrufer geändert hat:
   `harfbuzz[core]:x64-windows-static-md` (ohne FreeType, statisch, /MD) die
   sauberere Deployment-Variante.
 - Shaping: horizontal only. Vertikaler Text (CJK vertical) ist Folgearbeit.
-- **Isolines auf D3D11/D3D12** zeichnen in vio unzuverlässig (gleicher Lauf mal vier Linien als Bänder über
-  die volle Breite, mal keine) – auf WARP und Hardware, mit generiertem wie handgeschriebenem HLSL; gewöhnliche
-  Linien sind korrekt. Offen; Test 144 prüft Isolines auf D3D nicht.
+- **Tessellierte Isolines auf WARP**: Der Software-Rasterizer (vios Headless-D3D11/D3D12-Device und die
+  Windows-CI) verliert die Linien-Primitive tessellierter Isolines – ein eigenständiges D3D11-Programm ohne vio
+  zeichnet dort nichts, in vio kommen je Frame zufällig Linien an. Der Tessellator selbst stimmt (Punkt-Ausgabe
+  liefert exakt Dichte × (Detail + 1) Punkte), gewöhnliche Linien auch. Auf Hardware (RTX 2080) zeichnen
+  generiertes und handgeschriebenes HLSL korrekt und stabil. Test 144 prüft Isolines auf D3D deshalb nur über
+  einen Fenster-Kontext auf D3D12 mit echtem Adapter (`vio_gpu_info()` ≠ „Microsoft Basic Render Driver“).
+  D3D11 meldet in `vio_gpu_info()` keinen Adapternamen (Audit-Gate 099 sperrt den nötigen `#ifdef` in
+  `php_vio.c`; ein Vtable-Slot wäre der Weg).
 - **Tessellations-Domain-Ursprung**: Vulkan setzt `VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT` (vorher oben links →
   umgekehrte Winding, GL-korrekte Patches verschwanden bei Backface-Culling). Metal nutzt die MSL-Option
   `tess_domain_origin_lower_left` (spiegelt v bei Quads); ob das Quad-Kantenfaktoren vertauscht, zeigt Test 144

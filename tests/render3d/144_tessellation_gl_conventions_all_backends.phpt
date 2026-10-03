@@ -26,7 +26,9 @@ if (!$any) die("skip no backend with tessellation");
  *      a uniform of the evaluation stage
  *   D. layout(vertices = 3) fed with 4-point patches: the control stage reads
  *      the 4th input point and gl_PatchVerticesIn == 4
- *   E. isolines: lines at v = 0, 1/4, 1/2, 3/4 (not on D3D, see below)
+ *   E. isolines: lines at v = 0, 1/4, 1/2, 3/4 - on D3D only on hardware: WARP
+ *      (vio's headless D3D device, the Windows CI) loses the line primitives of
+ *      tessellated isolines (point output is fine), with any HLSL
  *   F. A once more on D3D12 with shader_model 6 (DXC), when available
  * Every check is orientation independent: colours carry the domain
  * coordinates (R = marker, G = v), so the readback's row order does not
@@ -64,9 +66,9 @@ $ISO_TES = "#version 450\nlayout(isolines, equal_spacing) in;\nlayout(location=0
          . "void main(){ vec2 uv = gl_TessCoord.xy; c = vec3(1.0, uv.y, 0.0); gl_Position = vec4(uv.x * 1.8 - 0.9, uv.y * 1.8 - 0.9, 0.0, 1.0); }";
 
 /* lit pixels, and the green value of the reddest pixel */
-function scan(string $p): array {
+function scan(string $p, int $w = 64): array {
     $lit = 0; $best = -1; $g = -1; $greens = [];
-    for ($i = 0; $i < 64 * 64; $i++) {
+    for ($i = 0; $i < $w * $w; $i++) {
         $r = ord($p[$i * 4]); $gg = ord($p[$i * 4 + 1]); $b = ord($p[$i * 4 + 2]);
         if ($r || $gg || $b) $lit++;
         if ($r > $best) { $best = $r; $g = $gg; }
@@ -74,6 +76,37 @@ function scan(string $p): array {
     }
     ksort($greens);
     return [$lit, $best, $g, array_keys($greens)];
+}
+
+function check_isolines(?string $p, int $w = 64): ?string {
+    if ($p === null) return "E: shader not created";
+    $want = [0, 64, 128, 191];
+    $got = scan($p, $w)[3];
+    $ok = count($got) === 4;
+    foreach ($want as $i => $v) if (!$ok || abs($got[$i] - $v) > 1) $ok = false;
+    return $ok ? null : "E: isolines at green " . json_encode($got) . ", want ~" . json_encode($want);
+}
+
+/* E on D3D12 hardware: a windowed context, when it reports a real adapter. */
+function iso_hardware(): string {
+    global $VS, $FS, $ISO_TCS, $ISO_TES;
+    $ctx = @vio_create('d3d12', ["width" => 256, "height" => 256, "headless" => false, "vsync" => false]);
+    if (!$ctx) return "skip (unavailable)";
+    $gpu = vio_gpu_info()['name'] ?? '';
+    if ($gpu === '' || stripos($gpu, 'Basic Render') !== false) { vio_destroy($ctx); return "skip (WARP)"; }
+    if (vio_framebuffer_size($ctx) !== [256, 256]) { vio_destroy($ctx); return "skip (window is not 256x256)"; }
+    $sh = vio_shader($ctx, ['vertex' => $VS, 'tess_control' => $ISO_TCS, 'tess_eval' => $ISO_TES, 'fragment' => $FS]);
+    $pipe = $sh ? vio_pipeline($ctx, ['shader' => $sh, 'patch_vertices' => 2, 'depth_test' => false, 'cull_mode' => VIO_CULL_BACK]) : null;
+    $line = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0], 'layout' => [VIO_FLOAT3]]);
+    $p = null;
+    if ($pipe) for ($f = 0; $f < 2; $f++) {   /* the first frame of a fresh window may be empty */
+        vio_clear($ctx, 0, 0, 0, 1);
+        vio_begin($ctx); vio_bind_pipeline($ctx, $pipe); vio_draw($ctx, $line); vio_end($ctx);
+        $p = vio_read_pixels($ctx);
+    }
+    $e = check_isolines($p, 256);
+    vio_destroy($ctx);
+    return $e ? "FAIL\n  $e" : "OK";
 }
 
 function run_backend(string $name, array $opts = []): string {
@@ -128,20 +161,9 @@ function run_backend(string $name, array $opts = []): string {
         if (abs($red - 128) > 2) $fail[] = "D: gl_PatchVerticesIn / 8 = " . round($red / 255, 3) . ", want 0.5";
     }
 
-    /* Isolines on D3D11 / D3D12 draw unreliably in vio (with generated and
-     * hand-written HLSL alike, on WARP and hardware) - known issue, not
-     * checked there. */
-    if (!$d3d) {
-        $p = $draw($ISO_TCS, $ISO_TES, 2, $line);
-        if ($p === null) $fail[] = "E: shader not created";
-        else {
-            $want = [0, 64, 128, 191];
-            $got = scan($p)[3];
-            $ok = count($got) === 4;
-            foreach ($want as $i => $v) if (!$ok || abs($got[$i] - $v) > 1) $ok = false;
-            if (!$ok) $fail[] = "E: isolines at green " . json_encode($got) . ", want ~" . json_encode($want);
-        }
-    }
+    /* Headless D3D is WARP, which cannot draw tessellated isolines; see
+     * iso_hardware() below for D3D. */
+    if (!$d3d && ($e = check_isolines($draw($ISO_TCS, $ISO_TES, 2, $line)))) $fail[] = $e;
 
     vio_destroy($ctx);
     return $fail ? "FAIL\n  " . implode("\n  ", $fail) : "OK";
@@ -156,6 +178,7 @@ $dxc = getenv('VIO_DXC_DIR') ?: '';
 if ($dxc === '') foreach (glob('C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64/dxcompiler.dll') ?: [] as $cand) $dxc = dirname($cand);
 if ($dxc !== '') $sm6['dxc_dir'] = $dxc;
 echo "d3d12 sm6: ", run_backend('d3d12', $sm6), "\n";
+echo "d3d12 hardware isolines: ", iso_hardware(), "\n";
 echo "DONE\n";
 ?>
 --EXPECTF--
@@ -165,4 +188,5 @@ d3d12: %r(OK|skip \(.*\))%r
 vulkan: %r(OK|skip \(.*\))%r
 metal: %r(OK|skip \(.*\))%r
 d3d12 sm6: %r(OK|skip \(.*\))%r
+d3d12 hardware isolines: %r(OK|skip \(.*\))%r
 DONE
