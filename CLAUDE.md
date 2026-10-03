@@ -90,10 +90,11 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-147 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+148 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/141` | Vergleichs-Sampling auf jedem Backend: `sampler2DShadow`, `sampler2DArrayShadow`, `samplerCubeShadow` liefern das Vergleichsergebnis (ref ≤ gespeicherte Tiefe), dieselbe Tiefentextur liest per `sampler2D` weiter roh, ein 2D-Sprite auf Unit 0 danach sampelt normal. Schlägt ohne den GL-Vergleichs-Sampler fehl (GL lieferte die rohe Tiefe). |
 | `tests/render3d/139` | GS-Instancing (`layout(invocations = 4)`, Quadranten; Cube in einem Draw mit `invocations = 6` + `gl_Layer`) und Adjacency (`VIO_TRIANGLES_ADJACENCY` über `vio_mesh(['adjacency' => true])` mit pro Dreieck duplizierten Vertices, `VIO_LINES_ADJACENCY`-Reihenfolge, Ablehnung ohne GS). |
 | `tests/render3d/140` | HLSL-Stage-Override: Tessellations-Disc aus 110 mit Hull/Domain-HLSL auf D3D (GLSL auf GL/Vulkan), Instanced-GS per `[instance(4)]`, Warnung bei abweichendem cbuffer-Layout, Argument-Vertrag. |
 | `tests/render3d/109–110` | Geometry-Stage (`vio_shader(['geometry' => …])`, Punkt → Quad, GS-Uniform, Unbind-Regression) und Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`/`patch_vertices`, Quad-Patch → Disc, Kantenzahl folgt dem TCS-Uniform). Iterieren über `opengl/d3d11/d3d12/vulkan/metal`; Backend mit Flag 0 → `skip`. |
@@ -862,7 +863,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 141 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 142 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -1026,6 +1027,13 @@ Aufrufer geändert hat:
   UBO; D3D12: Root-CBV wird vom Shader-Cbuffer-Push überschrieben) — Aufrufer nehmen `vio_set_uniform`.
   Sampler-Unit ist auf D3D/Metal der Wert aus `vio_set_uniform('u_tex', unit)` (GL-Konvention), nicht
   das `layout(binding)`; ohne Set gilt Unit 0.
+- **Vergleichs-Sampling auf OpenGL**: Tiefentexturen tragen kein `GL_TEXTURE_COMPARE_MODE` (sie werden
+  auch roh per `sampler2D` gelesen). Vor jedem 3D-Draw bindet das Backend stattdessen an jede Unit, die
+  ein `sampler*Shadow` des aktuellen Programms liest, ein Sampler-Objekt mit `GL_COMPARE_REF_TO_TEXTURE`
+  (LEQUAL, linear, Rand weiß) und löst es nach dem Draw wieder (`gl_shadow_begin/end`; Locations je
+  Programm gecacht). Vorher war `sampler2DShadow` auf GL undefiniert und lieferte die rohe Tiefe.
+  D3D11-Tiefen-Cubes (`vio_render_target_cubemap`) haben dafür einen eigenen Vergleichs-Sampler
+  (`d3d11_sampler_cmp`). Test 141.
 - **GL-Namen sind per Kontext** (`gl_generation` in jedem vio-Objekt, `vio_opengl_context_generation()`):
   ein VioShader/VioMesh/VioTexture/… aus Kontext 1 wird von PHP oft erst freigegeben, wenn
   Kontext 2 schon current ist (Neuzuweisung in einer Backend-Schleife, GC nach `vio_destroy`);
