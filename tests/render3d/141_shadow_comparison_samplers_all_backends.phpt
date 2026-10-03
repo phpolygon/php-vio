@@ -21,7 +21,8 @@ if (!$any) die("skip no backend with depth targets");
  * the units a shadow sampler of the current program reads, for that draw only.
  * The other backends already pick a comparison sampler from the shader's
  * sampler type. Every depth here is uniform over the target, so the checks do
- * not depend on the row order.
+ * not depend on the row order. Stored depth = (z + 1) / 2 on GL / D3D / Vulkan
+ * (vio's clip-space fixup), z itself on Metal (NDC z is 0..1 there).
  *   A. sampler2DShadow: depth 0.5, ref 0.4 -> 1, ref 0.6 -> 0
  *   B. sampler2DArrayShadow: layer depths 0.5 / 0.75, refs around each
  *   C. samplerCubeShadow (VIO_FEATURE_RENDER_TARGET_LAYERED): a depth per face
@@ -41,6 +42,7 @@ function run_backend(string $name): string {
     }
     $fail = [];
     $layered = vio_supports_feature($ctx, VIO_FEATURE_RENDER_TARGET_LAYERED);
+    $depthOf = fn(float $z): float => vio_backend_name($ctx) === 'metal' ? max(0.0, min(1.0, $z)) : ($z + 1.0) / 2.0;
     $vs = "#version 450\nlayout(location=0) in vec3 aPos;\nuniform float u_z;\nvoid main(){ gl_Position = vec4(aPos.xy, u_z, 1.0); }";
     $fsDepth = "#version 450\nvoid main(){ }";
     $full = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0, 1,1,0, -1,1,0], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT3]]);
@@ -78,9 +80,10 @@ function run_backend(string $name): string {
          . "void main(){ float s = texture(u_sh, vec3(0.5, 0.5, u_ref)); o = vec4(s, s, s, 1.0); }";
     $p2 = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs, 'fragment' => $fs2])] + $base);
     $rt = vio_render_target($ctx, ['width' => $W, 'height' => $W, 'depth_only' => true]);
-    $fill($rt, [-1 => 0.0]);   /* depth 0.5 */
+    $fill($rt, [-1 => 0.5]);
+    $dA = $depthOf(0.5);   /* 0.75, Metal 0.5 */
     $tex = vio_render_target_texture($rt);
-    foreach ([[0.4, 255], [0.6, 0]] as [$ref, $want]) {
+    foreach ([[$dA - 0.1, 255], [$dA + 0.1, 0]] as [$ref, $want]) {
         $got = $sample($p2, function () use ($ctx, $tex) { vio_set_uniform($ctx, 'u_sh', 0); vio_bind_texture($ctx, $tex, 0); }, ['u_ref' => (float)$ref]);
         if (!near($got, [$want, $want, $want])) $fail[] = "A: sampler2DShadow ref $ref " . json_encode($got) . " want $want";
     }
@@ -94,7 +97,7 @@ function run_backend(string $name): string {
     vio_bind_pipeline($ctx, $p2);
     vio_set_uniform($ctx, 'u_sh', 0);
     vio_bind_texture($ctx, $tex, 0);
-    vio_set_uniform($ctx, 'u_ref', 0.4);
+    vio_set_uniform($ctx, 'u_ref', $dA - 0.1);
     vio_set_uniform($ctx, 'u_z', 0.0);
     vio_draw($ctx, $full);
     vio_viewport($ctx, 0, 0, $W >> 1, $W);   /* raw read: left half */
@@ -109,8 +112,9 @@ function run_backend(string $name): string {
     vio_end($ctx);
     $img = vio_read_pixels($ctx);
     $raw = null;
-    foreach ([[3, 3], [3, 12]] as [$x, $y]) { $c = px($img, $x, $y, $W); if (near($c, [128, 128, 128])) $raw = $c; }
-    if ($raw === null) $fail[] = "D: raw sampler2D read of the depth texture " . json_encode([px($img, 3, 3, $W), px($img, 3, 12, $W)]) . " want 128";
+    $g = (int)round($dA * 255);
+    foreach ([[3, 3], [3, 12]] as [$x, $y]) { $c = px($img, $x, $y, $W); if (near($c, [$g, $g, $g])) $raw = $c; }
+    if ($raw === null) $fail[] = "D: raw sampler2D read of the depth texture " . json_encode([px($img, 3, 3, $W), px($img, 3, 12, $W)]) . " want $g";
     $sprite = false;
     foreach ([[13, 13], [13, 2]] as [$x, $y]) if (near(px($img, $x, $y, $W), [255, 0, 0])) $sprite = true;
     if (!$sprite) $fail[] = "D: 2D sprite after the shadow draw is not red " . json_encode([px($img, 13, 13, $W), px($img, 13, 2, $W)]);
@@ -121,9 +125,10 @@ function run_backend(string $name): string {
              . "void main(){ float s = texture(u_sh, vec4(0.5, 0.5, u_layer, u_ref)); o = vec4(s, s, s, 1.0); }";
         $pA = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs, 'fragment' => $fsA])] + $base);
         $arr = vio_render_target($ctx, ['width' => $W, 'height' => $W, 'layers' => 2, 'depth_only' => true]);
-        $fill($arr, [0 => 0.0, 1 => 0.5]);   /* depths 0.5, 0.75 */
+        $fill($arr, [0 => 0.0, 1 => 0.5]);
+        $d0 = $depthOf(0.0); $d1 = $depthOf(0.5);
         $atex = vio_render_target_texture($arr);
-        foreach ([[0, 0.45, 255], [0, 0.55, 0], [1, 0.7, 255], [1, 0.8, 0]] as [$layer, $ref, $want]) {
+        foreach ([[0, $d0 - 0.05, 255], [0, $d0 + 0.05, 0], [1, $d1 - 0.05, 255], [1, $d1 + 0.05, 0]] as [$layer, $ref, $want]) {
             $got = $sample($pA, function () use ($ctx, $atex) { vio_set_uniform($ctx, 'u_sh', 0); vio_bind_texture($ctx, $atex, 0); },
                            ['u_ref' => $ref, 'u_layer' => (float)$layer]);
             if (!near($got, [$want, $want, $want])) $fail[] = "B: layer $layer ref $ref " . json_encode($got) . " want $want";
@@ -139,7 +144,7 @@ function run_backend(string $name): string {
         $cm = vio_render_target_cubemap($cube);
         $dirs = [[1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]];
         for ($f = 0; $f < 6; $f++) {
-            $d = ($zs[$f] + 1.0) / 2.0;
+            $d = $depthOf($zs[$f]);
             foreach ([[$d - 0.05, 255], [$d + 0.05, 0]] as [$ref, $want]) {
                 $got = $sample($pC, function () use ($ctx, $cm) { vio_set_uniform($ctx, 'u_sh', 0); vio_bind_cubemap($ctx, $cm, 0); },
                                ['u_ref' => $ref, 'u_dir' => $dirs[$f]]);
