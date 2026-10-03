@@ -8284,6 +8284,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_LAYERED_RENDER", VIO_FEATURE_LAYERED_RENDER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_LAYER", VIO_FEATURE_VERTEX_LAYER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_RT_ALL_LAYERS", VIO_RT_ALL_LAYERS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_VIEWPORT", VIO_FEATURE_MULTI_VIEWPORT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_MAX_VIEWPORTS", VIO_MAX_VIEWPORTS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X1", VIO_SHADING_RATE_1X1, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X2", VIO_SHADING_RATE_1X2, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_2X1", VIO_SHADING_RATE_2X1, CONST_CS | CONST_PERSISTENT);
@@ -8957,6 +8959,65 @@ ZEND_FUNCTION(vio_viewport)
     if (ctx->backend->set_viewport) {
         ctx->backend->set_viewport((int)x, (int)y, (int)w, (int)h);
     }
+}
+
+/* Several viewports at once: [[x, y, w, h], ...] (1..VIO_MAX_VIEWPORTS), same
+ * coordinate convention as vio_viewport. gl_ViewportIndex picks one per
+ * primitive; primitives that do not write it use viewport 0. vio_viewport()
+ * returns to a single viewport. */
+ZEND_FUNCTION(vio_viewports)
+{
+    zval *ctx_zval;
+    HashTable *list;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(list)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        RETURN_FALSE;
+    }
+    int rects[VIO_MAX_VIEWPORTS * 4];
+    int count = 0;
+    zval *entry;
+    ZEND_HASH_FOREACH_VAL(list, entry) {
+        if (count >= VIO_MAX_VIEWPORTS) {
+            php_error_docref(NULL, E_WARNING, "vio_viewports: at most %d viewports", VIO_MAX_VIEWPORTS);
+            RETURN_FALSE;
+        }
+        if (Z_TYPE_P(entry) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(entry)) != 4) {
+            php_error_docref(NULL, E_WARNING, "vio_viewports: viewport %d must be [x, y, width, height]", count);
+            RETURN_FALSE;
+        }
+        int k = 0;
+        zval *v;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(entry), v) {
+            rects[count * 4 + k++] = (int)zval_get_long(v);
+        } ZEND_HASH_FOREACH_END();
+        if (rects[count * 4 + 2] <= 0 || rects[count * 4 + 3] <= 0) {
+            php_error_docref(NULL, E_WARNING, "vio_viewports: viewport %d has no area", count);
+            RETURN_FALSE;
+        }
+        count++;
+    } ZEND_HASH_FOREACH_END();
+    if (count == 0) {
+        php_error_docref(NULL, E_WARNING, "vio_viewports: at least one viewport is required");
+        RETURN_FALSE;
+    }
+    if (count == 1) {
+        if (ctx->backend->set_viewport) ctx->backend->set_viewport(rects[0], rects[1], rects[2], rects[3]);
+        RETURN_TRUE;
+    }
+    if (!ctx->backend->set_viewports || !ctx->backend->supports_feature ||
+        !ctx->backend->supports_feature(VIO_FEATURE_MULTI_VIEWPORT)) {
+        php_error_docref(NULL, E_WARNING, "vio_viewports: multiple viewports are not supported on backend '%s'",
+                         ctx->backend->name);
+        RETURN_FALSE;
+    }
+    RETURN_BOOL(ctx->backend->set_viewports(rects, count) == 0);
 }
 
 ZEND_FUNCTION(vio_draw_3d)

@@ -260,6 +260,12 @@ typedef struct _vio_backend {
     void  (*set_uniform)(const char *name, const void *data, int count, int type);
     void  (*bind_texture)(void *texture, int slot);
     void  (*set_viewport)(int x, int y, int width, int height);
+    /* Several viewports at once (vio_viewports, VIO_FEATURE_MULTI_VIEWPORT):
+     * rects = count * {x, y, w, h} in the set_viewport convention of the
+     * backend, each with a matching scissor rect where the backend scissors.
+     * A later set_viewport goes back to one viewport. 0 on success.
+     * NULL => single viewport only. */
+    int   (*set_viewports)(const int *rects, int count);
 
     /* Compute (optional) */
     void  (*dispatch_compute)(vio_compute_cmd *cmd);

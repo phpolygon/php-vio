@@ -937,7 +937,19 @@ static size_t opengl_read_buffer(void *backend_buffer, void *out, size_t size)
 static void opengl_set_viewport(int x, int y, int width, int height)
 {
     if (!vio_gl.initialized) return;
-    glViewport((GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height);
+    glViewport((GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height);   /* sets every indexed viewport */
+}
+
+/* GL 4.1 / ARB_viewport_array: indexed viewports; the 3D path does not
+ * scissor, so no scissor array is needed. */
+static int opengl_set_viewports(const int *rects, int count)
+{
+    if (!vio_gl.initialized || !glViewportIndexedf) return -1;
+    for (int i = 0; i < count; i++) {
+        glViewportIndexedf((GLuint)i, (GLfloat)rects[i * 4], (GLfloat)rects[i * 4 + 1],
+                           (GLfloat)rects[i * 4 + 2], (GLfloat)rects[i * 4 + 3]);
+    }
+    return 0;
 }
 
 /* True when the active context is at least the given GL version. The window
@@ -2422,6 +2434,8 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_LAYERED: return vio_gl.initialized;                 /* glFramebufferTextureLayer + depth cubemaps, core 3.0 */
         case VIO_FEATURE_LAYERED_RENDER: return vio_gl.initialized && GLAD_GL_VERSION_3_2;  /* glFramebufferTexture (layered attachment) */
         case VIO_FEATURE_VERTEX_LAYER:   return vio_gl.initialized && gl_has_ext("GL_ARB_shader_viewport_layer_array");
+        case VIO_FEATURE_MULTI_VIEWPORT: return vio_gl.initialized && glViewportIndexedf != NULL &&
+                                                (gl_ge(4, 1) || gl_has_ext("GL_ARB_viewport_array"));
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC:                                          /* S3TC ext (BC1/BC3) + core RGTC; BC7 needs BPTC / 4.2 */
             return vio_gl.initialized && gl_has_ext("GL_EXT_texture_compression_s3tc");
         case VIO_FEATURE_CUBEMAP:        return 1;
@@ -2486,6 +2500,7 @@ static const vio_backend opengl_backend = {
     .gpu_frame_time    = opengl_gpu_frame_time,
     .draw_indirect     = opengl_draw_indirect,
     .set_viewport      = opengl_set_viewport,
+    .set_viewports     = opengl_set_viewports,
     .set_uniform       = opengl_set_uniform,
     .destroy_buffer_obj    = opengl_destroy_buffer_obj,
     .destroy_texture_obj   = opengl_destroy_texture_obj,

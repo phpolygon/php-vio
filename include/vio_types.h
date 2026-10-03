@@ -278,7 +278,13 @@ typedef enum _vio_feature {
     /* gl_Layer written by the VERTEX stage (no geometry stage needed:
      * gl_Layer = gl_InstanceIndex with one instance per layer). */
     VIO_FEATURE_VERTEX_LAYER       = 41,
+    /* vio_viewports(): up to VIO_MAX_VIEWPORTS viewports at once; gl_ViewportIndex
+     * in the geometry stage (or the vertex stage with VIO_FEATURE_VERTEX_LAYER)
+     * picks one per primitive - all CSM cascades into one atlas in one pass. */
+    VIO_FEATURE_MULTI_VIEWPORT     = 42,
 } vio_feature;
+
+#define VIO_MAX_VIEWPORTS 16
 
 /* vio_bind_render_target() face / layer argument that binds every layer of a
  * cube or array target at once (VIO_FEATURE_LAYERED_RENDER). */

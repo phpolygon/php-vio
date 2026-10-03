@@ -1206,6 +1206,17 @@ function vio_texture_update(VioContext $context, VioTexture $texture, string $da
 function vio_viewport(VioContext $context, int $x, int $y, int $width, int $height): void {}
 
 /**
+ * Set several viewports at once (VIO_FEATURE_MULTI_VIEWPORT, up to VIO_MAX_VIEWPORTS).
+ * Same coordinate convention as vio_viewport(). gl_ViewportIndex in the geometry stage,
+ * or in the vertex stage with VIO_FEATURE_VERTEX_LAYER, picks the viewport per primitive;
+ * primitives that do not write it use viewport 0. vio_viewport() returns to one viewport.
+ * Typical use: every CSM cascade into one shadow atlas in a single pass.
+ *
+ * @param array $viewports [[x, y, width, height], ...]
+ */
+function vio_viewports(VioContext $context, array $viewports): bool {}
+
+/**
  * Flush/finalize 3D draw calls (parallel to vio_draw_2d for 2D).
  */
 function vio_draw_3d(VioContext $context): void {}
