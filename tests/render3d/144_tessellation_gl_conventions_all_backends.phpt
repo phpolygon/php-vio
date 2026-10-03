@@ -116,6 +116,7 @@ function run_backend(string $name, array $opts = []): string {
     if (!vio_supports_feature($ctx, VIO_FEATURE_TESSELLATION)) { vio_destroy($ctx); return "skip (no tessellation)"; }
     if (isset($opts['shader_model']) && (vio_swapchain_info($ctx)['shader_model'] ?? 5) < 6) { vio_destroy($ctx); return "skip (no DXC)"; }
     $d3d = in_array(vio_backend_name($ctx), ['d3d11', 'd3d12'], true);
+    $metal = vio_backend_name($ctx) === 'metal';   /* no isolines in Metal's tessellator */
     $fail = [];
     $quad = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0, 1,1,0, -1,1,0], 'layout' => [VIO_FLOAT3]]);
     $tri  = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0, 0,1,0], 'layout' => [VIO_FLOAT3]]);
@@ -163,7 +164,7 @@ function run_backend(string $name, array $opts = []): string {
 
     /* Headless D3D is WARP, which cannot draw tessellated isolines; see
      * iso_hardware() below for D3D. */
-    if (!$d3d && ($e = check_isolines($draw($ISO_TCS, $ISO_TES, 2, $line)))) $fail[] = $e;
+    if (!$d3d && !$metal && ($e = check_isolines($draw($ISO_TCS, $ISO_TES, 2, $line)))) $fail[] = $e;
 
     vio_destroy($ctx);
     return $fail ? "FAIL\n  " . implode("\n  ", $fail) : "OK";

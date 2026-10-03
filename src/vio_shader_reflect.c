@@ -179,6 +179,29 @@ char *vio_glsl_require_viewport_layer_ext(char *glsl)
     return out;
 }
 
+/* SPIRV-Cross before vulkan-sdk-1.3.275 (Ubuntu 24.04 ships 1.3.268) has no
+ * GLSL name for BuiltIn PatchVertices and emits `gl_BuiltIn_14`, which the GL
+ * compiler rejects. Takes ownership of `glsl` (malloc'd). */
+static char *vio_glsl_fix_patch_vertices(char *glsl)
+{
+    static const char bad[] = "gl_BuiltIn_14";
+    static const char good[] = "gl_PatchVerticesIn";
+    if (!glsl || !strstr(glsl, bad)) return glsl;
+    size_t count = 0, len = strlen(glsl);
+    for (const char *p = glsl; (p = strstr(p, bad)) != NULL; p += sizeof(bad) - 1) count++;
+    char *out = (char *)malloc(len + count * (sizeof(good) - sizeof(bad)) + 1);
+    if (!out) return glsl;
+    char *w = out;
+    const char *p = glsl;
+    for (const char *a; (a = strstr(p, bad)) != NULL; p = a + sizeof(bad) - 1) {
+        memcpy(w, p, (size_t)(a - p)); w += a - p;
+        memcpy(w, good, sizeof(good) - 1); w += sizeof(good) - 1;
+    }
+    strcpy(w, p);
+    free(glsl);
+    return out;
+}
+
 char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, char **error_msg)
 {
     spvc_context ctx = NULL;
@@ -226,7 +249,7 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
     if (getenv("VIO_DEBUG_SPIRV")) {
         fprintf(stderr, "[vio] SPIRV-Cross output (first 500 chars):\n%.500s\n---\n", result);
     }
-    output = strdup(result);
+    output = vio_glsl_fix_patch_vertices(strdup(result));
     SpvExecutionModel model = spvc_compiler_get_execution_model(compiler);
     if (model == SpvExecutionModelVertex || model == SpvExecutionModelTessellationEvaluation) {
         output = vio_glsl_require_viewport_layer_ext(output);

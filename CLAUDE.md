@@ -335,8 +335,8 @@ compute-basiert (siehe „Metal-3D-Pipeline").
   Puffern). Jeder Draw: beide Kernel in eigenem, sofort committetem Command-Buffer in Ring-Slices,
   dann `drawPatches` auf dem offenen Render-Encoder (Texturen/Viewport bleiben). Indizierte Draws
   werden auf der CPU de-indiziert. Die TCS bekommt die Domain der TES gesetzt (Faktor-Struct), die
-  TES die Kontrollpunktzahl der TCS; `gl_TessCoord` behält den GL-Ursprung unten links (Winding
-  gespiegelt). Nicht unterstützt (Warning): Isolines, `point_mode`, `vio_draw_indirect`,
+  TES die Kontrollpunktzahl der TCS. Metals Tessellator hat GLs Domain-Koordinaten, Faktor-Kanten und
+  Winding-Bezeichnung (Test 144, macOS-CI): keine MSL-Ursprungs-Option, keine Winding-Umkehr. Nicht unterstützt (Warning): Isolines, `point_mode`, `vio_draw_indirect`,
   `vio_draw_instanced_from_buffer` mit Tessellation-Pipeline. Ein async Compute-Dispatch
   desselben Frames läuft **nach** den Tessellation-Kerneln. Varyings zwischen den Stages müssen
   in Location-Reihenfolge übereinstimmen (die Puffer-Structs werden je Stage gebaut). Der
@@ -1122,6 +1122,8 @@ Aufrufer geändert hat:
   generiertes und handgeschriebenes HLSL korrekt und stabil. Test 144 prüft Isolines auf D3D deshalb nur über
   einen Fenster-Kontext auf D3D11 und D3D12 mit echtem Adapter (`vio_gpu_info()` ≠ „Microsoft Basic Render Driver“).
 - **Tessellations-Domain-Ursprung**: Vulkan setzt `VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT` (vorher oben links →
-  umgekehrte Winding, GL-korrekte Patches verschwanden bei Backface-Culling). Metal nutzt die MSL-Option
-  `tess_domain_origin_lower_left` (spiegelt v bei Quads); ob das Quad-Kantenfaktoren vertauscht, zeigt Test 144
-  auf der macOS-CI.
+  umgekehrte Winding, GL-korrekte Patches verschwanden bei Backface-Culling). Metal nutzte die MSL-Option
+  `tess_domain_origin_lower_left` plus Winding-Umkehr: das legte `outer[1]`/`outer[3]` von Quads auf die
+  Gegenkante und cullte jedes Dreiecks-Patch – Metal braucht keins von beidem (Test 144 auf der macOS-CI).
+- **`gl_PatchVerticesIn` auf OpenGL** mit SPIRV-Cross vor `vulkan-sdk-1.3.275` (Ubuntu 24.04: 1.3.268): das
+  GLSL-Backend schreibt `gl_BuiltIn_14`; `vio_spirv_to_glsl` ersetzt es (`vio_glsl_fix_patch_vertices`).
