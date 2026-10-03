@@ -151,7 +151,7 @@ mit Test 144 auf der macOS-CI gemessen.
 | 2 | Hull-Shader: Statics + einmaliger Körper, CP-Funktion, Patch-Constant-Funktion mit Invocation-Schleife, Attribute, `tess_input_control_points`, `barrier()` | Fork `hlsl-tessellation-hull` | L | ✅ H1–H7: 8 asm-Tests `shaders-hlsl/asm/tesc/` (normal + opt), FXC `hs_5_0/5_1` + DXC `hs_6_0`, HS+DS-Signaturen verglichen; Winding-Umkehr bei Lower-Left für Dreiecke und Quads |
 | 3 | C-API: Option `SPVC_COMPILER_OPTION_HLSL_TESS_INPUT_CONTROL_POINTS`, `..._TESS_DOMAIN_ORIGIN_LOWER_LEFT` | Fork | S | ✅ 95 (Origin), 96 (Eingangs-Kontrollpunkte); API-Version bumpt upstream der Maintainer |
 | 4 | Upstream-PRs mit Bezug auf #905 | KhronosGroup | – | ✅ eingereicht 2026-10-03: #2692 GS `gl_in`, #2693 Domain-Shader, #2694 Hull-Shader; CI grün (alle 13 Testvarianten, mit den CI-Werkzeugständen aus `checkout_glslang_spirv_tools.sh`); Review offen |
-| 5 | vio-Integration, siehe unten (5a–5f) | php-vio | L | 110/135/144 auf D3D11/D3D12 ohne Override; 140 bleibt (Override vorrangig) |
+| 5 | vio-Integration, siehe unten (5a–5f) | php-vio | L | ✅ 5a/5c/5d/5f, 5e Vulkan: 110/135/144 auf D3D11/D3D12 (auch SM 6) ohne Override, 140 unverändert, volle Suite grün. Offen: 5b nativer Pfad, Metal-Messung (macOS-CI), D3D-Isolines |
 | 6 | Fork-Stand in `C:\php-sdk\vio-build-deps` bauen, um den nativen Pfad (5b) lokal zu prüfen; die Windows-CI bleibt beim SDK-SPIRV-Cross und nutzt den Generator (5c) | php-vio | S | lokaler Lauf mit nativem Pfad |
 
 ## vio-Integration (Phase 5)
