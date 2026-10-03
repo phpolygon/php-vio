@@ -371,7 +371,7 @@ jobs:
       - name: Setup Vulkan SDK (vulkan + glslang + SPIRV-Cross + SPIRV-Tools)
         uses: humbletim/setup-vulkan-sdk@v1.2.1  # v1.2.0 bundles actions/cache@v2 (deprecated)
         with:
-          vulkan-query-version: 1.3.296.0
+          vulkan-query-version: 1.4.341.0
           vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, SPIRV-Cross, SPIRV-Tools, SPIRV-Reflect
           vulkan-use-cache: true
 
@@ -508,7 +508,9 @@ jobs:
             tests/render3d/141_shadow_comparison_samplers_all_backends.phpt `
             tests/render3d/142_render_target_rebind_keeps_content_all_backends.phpt `
             tests/render3d/143_gs_gl_in_position_all_backends.phpt `
-            tests/render3d/144_tessellation_gl_conventions_all_backends.phpt
+            tests/render3d/144_tessellation_gl_conventions_all_backends.phpt `
+            tests/render3d/145_cube_mipmaps_in_frame_all_backends.phpt `
+            tests/render3d/146_uniform_array_elements_all_backends.phpt
 
       - name: Package binary
         shell: pwsh
