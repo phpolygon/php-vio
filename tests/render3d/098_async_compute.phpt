@@ -28,7 +28,7 @@ if (!$__ok) die('skip no headless GPU context available');
 // the ones that come up.
 $backends = [];
 $seen = [];
-foreach (['auto', 'metal', 'opengl'] as $candidate) {
+foreach (['auto', 'metal', 'opengl', 'd3d11', 'd3d12', 'vulkan'] as $candidate) {
     $probe = @vio_create($candidate, ['width' => 4, 'height' => 4, 'headless' => true]);
     if (!$probe) continue;
     // 'auto' may resolve to a name listed explicitly below ('opengl' on Linux):

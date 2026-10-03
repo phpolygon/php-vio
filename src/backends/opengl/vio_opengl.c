@@ -77,9 +77,18 @@ static int gl_owned_by_live_context(unsigned int gen)
 #define GL_ULOC_CACHE_SIZE 1024
 #define GL_ULOC_NAME_MAX   56
 
+/* A name can resolve to more than one location when several stages of the
+ * SPIR-V path declare the same uniform: each stage's flattened block becomes
+ * its own struct-typed uniform (`_19.u_mvp` in the VS, `_27.u_mvp` in the GS),
+ * and GL treats them as independent. vio_set_uniform must then write all of
+ * them, so an entry carries the primary location plus up to
+ * GL_ULOC_ALT_MAX further matches (-1 = none). */
+#define GL_ULOC_ALT_MAX 2
+
 typedef struct {
     GLuint program;   /* 0 = empty slot */
     GLint  loc;
+    GLint  alt[GL_ULOC_ALT_MAX];
     char   name[GL_ULOC_NAME_MAX];
 } gl_uloc_entry;
 
@@ -92,12 +101,15 @@ static unsigned gl_uloc_hash(GLuint program, const char *name)
     return h;
 }
 
+static void gl_shadow_forget_program(GLuint program);
+
 static void gl_uloc_forget_program(GLuint program)
 {
     if (!program) return;
     for (int i = 0; i < GL_ULOC_CACHE_SIZE; i++) {
         if (gl_uloc_cache[i].program == program) gl_uloc_cache[i].program = 0;
     }
+    gl_shadow_forget_program(program);
 }
 
 /* Copy `name` into `out`, rewriting every "[<digits>]" to "[0]" — the form in
@@ -117,28 +129,35 @@ static size_t gl_uloc_normalize(const char *name, char *out, size_t cap)
     return o;
 }
 
-static GLint gl_uloc_suffix_scan(GLuint program, const char *name, size_t len)
+/* Collect every `<prefix>.<name>` match among the active uniforms into out[]
+ * (at most max entries). Returns the number found. */
+static int gl_uloc_suffix_scan(GLuint program, const char *name, size_t len, GLint *out, int max)
 {
     char norm[256];
     size_t nlen = gl_uloc_normalize(name, norm, sizeof(norm));
     GLint count = 0;
     glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
     char buf[256], full[512];
-    for (GLint i = 0; i < count; i++) {
+    int found = 0;
+    for (GLint i = 0; i < count && found < max; i++) {
         GLsizei n = 0; GLint size = 0; GLenum type = 0;
         glGetActiveUniform(program, (GLuint)i, (GLsizei)sizeof(buf), &n, &size, &type, buf);
         /* active name = "<prefix>.<norm>" ? */
         if (n <= (GLsizei)nlen + 1 || buf[n - nlen - 1] != '.' || strcmp(buf + n - nlen, norm) != 0) continue;
         size_t plen = (size_t)n - nlen - 1;
-        if (plen + 1 + len + 1 > sizeof(full)) return -1;
+        if (plen + 1 + len + 1 > sizeof(full)) continue;
         memcpy(full, buf, plen);
         full[plen] = '.';
         memcpy(full + plen + 1, name, len + 1);
-        return glGetUniformLocation(program, full);   /* exact element (or element 0 for a bare array name) */
+        GLint loc = glGetUniformLocation(program, full);   /* exact element (or element 0 for a bare array name) */
+        if (loc >= 0) out[found++] = loc;
     }
-    return -1;
+    return found;
 }
-static GLint gl_uniform_location(GLuint program, const char *name)
+/* Resolve `name` to its primary location (return value) and, for uniforms
+ * declared in several stages, the further locations in alt[GL_ULOC_ALT_MAX]
+ * (-1 padded). alt may be NULL. */
+static GLint gl_uniform_location_all(GLuint program, const char *name, GLint *alt)
 {
     size_t len = strlen(name);
     int cacheable = len < GL_ULOC_NAME_MAX;
@@ -147,21 +166,36 @@ static GLint gl_uniform_location(GLuint program, const char *name)
     if (cacheable) {
         for (int probe = 0; probe < 8; probe++) {
             gl_uloc_entry *e = &gl_uloc_cache[(idx + probe) % GL_ULOC_CACHE_SIZE];
-            if (e->program == program && strcmp(e->name, name) == 0) return e->loc;
+            if (e->program == program && strcmp(e->name, name) == 0) {
+                if (alt) memcpy(alt, e->alt, sizeof(e->alt));
+                return e->loc;
+            }
             if (e->program == 0 && !slot) slot = e;
         }
         if (!slot) slot = &gl_uloc_cache[idx];   /* window full: evict */
     }
 
+    GLint found[1 + GL_ULOC_ALT_MAX];
+    for (int i = 0; i < 1 + GL_ULOC_ALT_MAX; i++) found[i] = -1;
     GLint loc = glGetUniformLocation(program, name);
-    if (loc < 0) loc = gl_uloc_suffix_scan(program, name, len);
+    if (loc < 0) {
+        int n = gl_uloc_suffix_scan(program, name, len, found, 1 + GL_ULOC_ALT_MAX);
+        if (n > 0) loc = found[0];
+        for (int i = n; i < 1 + GL_ULOC_ALT_MAX; i++) found[i] = -1;
+    }
 
     if (slot) {
         slot->program = program;
         slot->loc = loc;
+        memcpy(slot->alt, found + 1, sizeof(slot->alt));
         memcpy(slot->name, name, len + 1);
     }
+    if (alt) memcpy(alt, found + 1, sizeof(GLint) * GL_ULOC_ALT_MAX);
     return loc;
+}
+static GLint gl_uniform_location(GLuint program, const char *name)
+{
+    return gl_uniform_location_all(program, name, NULL);
 }
 
 /* ── Shader compilation helpers ───────────────────────────────────── */
@@ -188,11 +222,16 @@ static unsigned int compile_shader_stage(const char *source, GLenum type)
  * binary is driver-specific, so the key also hashes GL_VENDOR / GL_RENDERER /
  * GL_VERSION; a stale or rejected binary just falls through to a normal link.
  * File layout: 4 bytes binaryFormat + the blob. */
-static uint64_t opengl_program_cache_key(const char *vert_src, const char *frag_src)
+static uint64_t opengl_program_cache_key(const char *const sources[5])
 {
-    uint64_t key = vio_shader_cache_hash("gl-program", vert_src, strlen(vert_src));
-    key = vio_shader_cache_hash_more(key, "|", 1);
-    key = vio_shader_cache_hash_more(key, frag_src, strlen(frag_src));
+    /* Every stage is part of the key, and an absent stage hashes differently
+     * from an empty one: the same VS + FS with and without a geometry stage
+     * are distinct programs. */
+    uint64_t key = vio_shader_cache_hash("gl-program", sources[0], strlen(sources[0]));
+    for (int i = 1; i < 5; i++) {
+        key = vio_shader_cache_hash_more(key, sources[i] ? "|" : "#", 1);
+        if (sources[i]) key = vio_shader_cache_hash_more(key, sources[i], strlen(sources[i]));
+    }
     const char *vendor = (const char *)glGetString(GL_VENDOR);
     const char *renderer = (const char *)glGetString(GL_RENDERER);
     const char *version = (const char *)glGetString(GL_VERSION);
@@ -240,26 +279,44 @@ static void opengl_program_to_cache(uint64_t key, unsigned int program)
 
 unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *frag_src)
 {
+    return vio_opengl_compile_program(vert_src, frag_src, NULL, NULL, NULL);
+}
+
+unsigned int vio_opengl_compile_program(const char *vert_src, const char *frag_src,
+                                        const char *geom_src, const char *tesc_src,
+                                        const char *tese_src)
+{
+    const char *sources[5] = { vert_src, frag_src, geom_src, tesc_src, tese_src };
+    const GLenum types[5]  = { GL_VERTEX_SHADER, GL_FRAGMENT_SHADER, GL_GEOMETRY_SHADER,
+                               GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER };
+    unsigned int stages[5] = { 0, 0, 0, 0, 0 };
+    int n = 0;
+
+    if (!vert_src || !frag_src) return 0;
     int use_cache = vio_shader_cache_dir() != NULL && GLAD_GL_VERSION_4_1;
     uint64_t key = 0;
     if (use_cache) {
-        key = opengl_program_cache_key(vert_src, frag_src);
+        key = opengl_program_cache_key(sources);
         unsigned int cached = opengl_program_from_cache(key);
         if (cached) return cached;
     }
 
-    unsigned int vert = compile_shader_stage(vert_src, GL_VERTEX_SHADER);
-    if (!vert) return 0;
-
-    unsigned int frag = compile_shader_stage(frag_src, GL_FRAGMENT_SHADER);
-    if (!frag) {
-        glDeleteShader(vert);
+    for (int i = 0; i < 5; i++) {
+        if (!sources[i]) continue;
+        stages[i] = compile_shader_stage(sources[i], types[i]);
+        if (!stages[i]) {
+            for (int j = 0; j < i; j++) if (stages[j]) glDeleteShader(stages[j]);
+            return 0;
+        }
+        n++;
+    }
+    if (!stages[0] || !stages[1]) {
+        for (int j = 0; j < 5; j++) if (stages[j]) glDeleteShader(stages[j]);
         return 0;
     }
 
     unsigned int program = glCreateProgram();
-    glAttachShader(program, vert);
-    glAttachShader(program, frag);
+    for (int i = 0; i < 5; i++) if (stages[i]) glAttachShader(program, stages[i]);
     if (use_cache) glProgramParameteri(program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
     glLinkProgram(program);
 
@@ -275,8 +332,8 @@ unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *
         opengl_program_to_cache(key, program);
     }
 
-    glDeleteShader(vert);
-    glDeleteShader(frag);
+    for (int i = 0; i < 5; i++) if (stages[i]) glDeleteShader(stages[i]);
+    (void)n;
     return program;
 }
 
@@ -301,7 +358,36 @@ static int opengl_init(vio_config *cfg)
     vio_gl.clear_g = 0.1f;
     vio_gl.clear_b = 0.1f;
     vio_gl.clear_a = 1.0f;
+    vio_gl.draw_topology = VIO_TRIANGLES;
+    vio_gl.patch_vertices = 3;
     return 0;
+}
+
+static GLenum gl_topology_mode(vio_topology t);
+
+/* Primitive mode for the mesh draw calls: the bound pipeline's topology
+ * (GL_TRIANGLES until a pipeline says otherwise). */
+static GLenum gl_draw_mode(void)
+{
+    return gl_topology_mode((vio_topology)vio_gl.draw_topology);
+}
+
+static GLenum gl_topology_mode(vio_topology t)
+{
+    switch (t) {
+        case VIO_TRIANGLE_STRIP: return GL_TRIANGLE_STRIP;
+        case VIO_TRIANGLE_FAN:   return GL_TRIANGLE_FAN;
+        case VIO_LINES:          return GL_LINES;
+        case VIO_LINE_STRIP:     return GL_LINE_STRIP;
+        case VIO_POINTS:         return GL_POINTS;
+        case VIO_LINES_ADJACENCY:          return GL_LINES_ADJACENCY;
+        case VIO_LINE_STRIP_ADJACENCY:     return GL_LINE_STRIP_ADJACENCY;
+        case VIO_TRIANGLES_ADJACENCY:      return GL_TRIANGLES_ADJACENCY;
+        case VIO_TRIANGLE_STRIP_ADJACENCY: return GL_TRIANGLE_STRIP_ADJACENCY;
+        case VIO_PATCHES:        return GL_PATCHES;
+        case VIO_TRIANGLES:
+        default:                 return GL_TRIANGLES;
+    }
 }
 
 static void opengl_shutdown(void)
@@ -858,7 +944,19 @@ static size_t opengl_read_buffer(void *backend_buffer, void *out, size_t size)
 static void opengl_set_viewport(int x, int y, int width, int height)
 {
     if (!vio_gl.initialized) return;
-    glViewport((GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height);
+    glViewport((GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height);   /* sets every indexed viewport */
+}
+
+/* GL 4.1 / ARB_viewport_array: indexed viewports; the 3D path does not
+ * scissor, so no scissor array is needed. */
+static int opengl_set_viewports(const int *rects, int count)
+{
+    if (!vio_gl.initialized || !glViewportIndexedf) return -1;
+    for (int i = 0; i < count; i++) {
+        glViewportIndexedf((GLuint)i, (GLfloat)rects[i * 4], (GLfloat)rects[i * 4 + 1],
+                           (GLfloat)rects[i * 4 + 2], (GLfloat)rects[i * 4 + 3]);
+    }
+    return 0;
 }
 
 /* True when the active context is at least the given GL version. The window
@@ -1004,6 +1102,123 @@ static void opengl_destroy_render_target(void *rt_ptr)
     }
 }
 
+/* Attach one layer (cube face or array layer) at `level` of a layered target to
+ * the target's FBO, which must be bound as GL_FRAMEBUFFER. Colour and depth
+ * carry the same layer structure; depth only exists at level 0, so smaller
+ * levels render without depth (the Metal contract). */
+static void opengl_rt_attach_layer(vio_render_target_object *rt, int layer, int level)
+{
+    if (layer < 0) {
+        /* VIO_RT_ALL_LAYERS: layered attachments (every face / layer); gl_Layer
+         * in the geometry or vertex stage selects the destination. */
+        if (!rt->depth_only) glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rt->color_texture, level);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, level == 0 ? rt->depth_texture : 0, 0);
+        return;
+    }
+    if (rt->is_cube) {
+        if (!rt->depth_only) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer, rt->color_texture, level);
+        }
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer,
+                               level == 0 ? rt->depth_texture : 0, 0);
+    } else {
+        if (!rt->depth_only) glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rt->color_texture, level, layer);
+        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, level == 0 ? rt->depth_texture : 0, 0, layer);
+    }
+}
+
+/* Cube ('cube' => true) and array ('layers' => N) targets: colour (optional,
+ * cube with a mip chain when requested) and DEPTH24_STENCIL8 depth with the
+ * same layer structure - a depth cube / depth array, so a later layered bind
+ * can attach all layers at once and depth_only targets sample as
+ * samplerCube / sampler2DArray. +X / layer 0 is attached initially. */
+static int opengl_create_layered_render_target(vio_render_target_object *rt, int width, int height, int hdr, int depth_only)
+{
+    GLenum target = rt->is_cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D_ARRAY;
+    int layers = vio_rt_layer_count(rt);
+    if (rt->is_cube) height = width;
+    if (rt->mip_levels < 1) rt->mip_levels = 1;
+
+    if (!depth_only) {
+        /* Mip storage is allocated up front so bind_render_target_face can
+         * target level > 0 before any glGenerateMipmap. */
+        GLint internal; GLenum base, type;
+        opengl_color_format(rt->attachment_count > 0 ? rt->formats[0] : (hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8),
+                            &internal, &base, &type);
+        glGenTextures(1, &rt->color_texture);
+        rt->color_textures[0] = rt->color_texture;
+        glBindTexture(target, rt->color_texture);
+        for (int level = 0; level < rt->mip_levels; level++) {
+            int w = width >> level, h = height >> level;
+            if (w < 1) w = 1;
+            if (h < 1) h = 1;
+            if (rt->is_cube) {
+                for (int f = 0; f < 6; f++) {
+                    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, level, internal, w, w, 0, base, type, NULL);
+                }
+            } else {
+                glTexImage3D(GL_TEXTURE_2D_ARRAY, level, internal, w, h, layers, 0, base, type, NULL);
+            }
+        }
+        glTexParameteri(target, GL_TEXTURE_MIN_FILTER, rt->mip_levels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+        glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+        glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, rt->mip_levels - 1);
+        glBindTexture(target, 0);
+    }
+
+    glGenTextures(1, &rt->depth_texture);
+    glBindTexture(target, rt->depth_texture);
+    if (rt->is_cube) {
+        for (int f = 0; f < 6; f++) {
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, 0, GL_DEPTH24_STENCIL8, width, width, 0,
+                         GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+        }
+    } else {
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH24_STENCIL8, width, height, layers, 0,
+                     GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+    }
+    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, 0);
+    glBindTexture(target, 0);
+
+    if (depth_only) {
+        glDrawBuffer(GL_NONE);
+        glReadBuffer(GL_NONE);
+    }
+    opengl_rt_attach_layer(rt, 0, 0);
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status == GL_FRAMEBUFFER_COMPLETE) {
+        /* Defined initial contents: every layer cleared, depth at 1.0. */
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glDepthMask(GL_TRUE);
+        glClearDepth(1.0);
+        for (int l = 0; l < layers; l++) {
+            opengl_rt_attach_layer(rt, l, 0);
+            glClear((depth_only ? 0 : GL_COLOR_BUFFER_BIT) | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        }
+        opengl_rt_attach_layer(rt, 0, 0);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        php_error_docref(NULL, E_WARNING, "%s render target FBO is not complete (status: 0x%04x)",
+                         rt->is_cube ? "Cube" : "Array", status);
+        return -1;
+    }
+    rt->bound_face = 0;
+    rt->bound_level = 0;
+    rt->samples = 1;
+    rt->backend_type = VIO_RT_BACKEND_OPENGL;
+    return 0;
+}
+
 static int opengl_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
@@ -1013,66 +1228,8 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
     rt->gl_generation = gl_context_generation;
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
 
-    if (rt->is_cube) {
-        /* Cubemap colour attachment (+X face bound initially) with a shared 2D
-         * depth buffer at face size. Mip storage is allocated up front so
-         * bind_render_target_face can target level > 0 before any
-         * glGenerateMipmap. */
-        if (rt->mip_levels < 1) rt->mip_levels = 1;
-        GLint cube_internal; GLenum cube_base, cube_type;
-        opengl_color_format(rt->attachment_count > 0 ? rt->formats[0] : (hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8),
-                            &cube_internal, &cube_base, &cube_type);
-        glGenTextures(1, &rt->color_texture);
-        rt->color_textures[0] = rt->color_texture;
-        glBindTexture(GL_TEXTURE_CUBE_MAP, rt->color_texture);
-        for (int level = 0; level < rt->mip_levels; level++) {
-            int dim = width >> level; if (dim < 1) dim = 1;
-            for (int f = 0; f < 6; f++) {
-                glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, level, cube_internal,
-                             dim, dim, 0, cube_base, cube_type, NULL);
-            }
-        }
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER,
-                        rt->mip_levels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, rt->mip_levels - 1);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_CUBE_MAP_POSITIVE_X, rt->color_texture, 0);
-
-        glGenTextures(1, &rt->depth_texture);
-        glBindTexture(GL_TEXTURE_2D, rt->depth_texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, width, width,
-                     0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, rt->depth_texture, 0);
-
-        GLenum cube_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (cube_status == GL_FRAMEBUFFER_COMPLETE) {
-            /* Defined initial contents: every face cleared, depth at 1.0. */
-            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-            glDepthMask(GL_TRUE);
-            for (int f = 0; f < 6; f++) {
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                       GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, rt->color_texture, 0);
-                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-            }
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                   GL_TEXTURE_CUBE_MAP_POSITIVE_X, rt->color_texture, 0);
-        }
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        if (cube_status != GL_FRAMEBUFFER_COMPLETE) {
-            php_error_docref(NULL, E_WARNING,
-                "Cube render target FBO is not complete (status: 0x%04x)", cube_status);
-            return -1;
-        }
-        rt->backend_type = VIO_RT_BACKEND_OPENGL;
-        return 0;
+    if (rt->is_cube || rt->layers > 1) {
+        return opengl_create_layered_render_target(rt, width, height, hdr, depth_only);
     }
 
     /* Depth texture (always created — shadow-map use-case needs it as SRV).
@@ -1225,11 +1382,9 @@ static void opengl_bind_render_target(void *rt_ptr)
         return;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
-    if (rt->is_cube) {
-        /* Plain bind of a cube RT targets +X at level 0. */
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_CUBE_MAP_POSITIVE_X, rt->color_texture, 0);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, rt->depth_texture, 0);
+    if (rt->is_cube || rt->layers > 1) {
+        /* Plain bind of a cube / array RT targets +X / layer 0 at level 0. */
+        opengl_rt_attach_layer(rt, 0, 0);
         rt->bound_face = 0;
         rt->bound_level = 0;
     }
@@ -1240,16 +1395,22 @@ static int opengl_bind_render_target_face(void *rt_ptr, int face, int level)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (!rt || rt->backend_type != VIO_RT_BACKEND_OPENGL || !vio_gl.initialized) return -1;
-    if (!rt->is_cube || face < 0 || face > 5 || level < 0 || level >= rt->mip_levels) return -1;
+    if ((!rt->is_cube && rt->layers <= 1) || level < 0 || level >= rt->mip_levels) return -1;
+    if (face == VIO_RT_ALL_LAYERS) {
+        if (level != 0 || !GLAD_GL_VERSION_3_2) return -1;
+    } else if (face < 0 || face >= vio_rt_layer_count(rt)) {
+        return -1;
+    }
+    if (vio_gl.current_bound_rt && vio_gl.current_bound_rt != rt) {
+        opengl_rt_resolve_msaa((vio_render_target_object *)vio_gl.current_bound_rt);
+    }
+    vio_gl.current_bound_rt = rt;
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, rt->color_texture, level);
-    /* The shared depth buffer matches level 0 only; detach it for smaller levels
-     * (GL 3+ allows the mismatch but we mirror the Metal contract). */
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D,
-                           level == 0 ? rt->depth_texture : 0, 0);
-    int dim = rt->width >> level; if (dim < 1) dim = 1;
-    glViewport(0, 0, dim, dim);
+    opengl_rt_attach_layer(rt, face, level);
+    int w = rt->width >> level, h = rt->height >> level;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    glViewport(0, 0, w, h);
     rt->bound_face = face;
     rt->bound_level = level;
     return 0;
@@ -1259,8 +1420,11 @@ static int opengl_render_target_cubemap(void *rt_ptr, void *cm_obj)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
-    if (!rt || !cm || !rt->is_cube || !rt->color_texture) return -1;
-    cm->texture_id   = rt->color_texture;   /* borrowed — RT owns the GL name */
+    if (!rt || !cm || !rt->is_cube) return -1;
+    /* depth_only cube: the depth cubemap (samplerCube .r / samplerCubeShadow). */
+    unsigned int id = rt->depth_only ? rt->depth_texture : rt->color_texture;
+    if (!id) return -1;
+    cm->texture_id   = id;   /* borrowed — RT owns the GL name */
     cm->mipmaps      = rt->mip_levels > 1;
     cm->borrowed     = 1;
     cm->resolution   = rt->width;
@@ -1281,10 +1445,10 @@ static int opengl_read_render_target(void *rt_ptr, int face, int attachment, voi
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
     if (!rt->depth_only) glReadBuffer(GL_COLOR_ATTACHMENT0 + (GLenum)attachment);
-    if (rt->is_cube) {
+    int layered = rt->is_cube || rt->layers > 1;
+    if (layered) {
         int f = face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, rt->color_texture, 0);
+        opengl_rt_attach_layer(rt, f, 0);
     }
 
     if (rt->depth_only) {
@@ -1313,11 +1477,9 @@ static int opengl_read_render_target(void *rt_ptr, int face, int attachment, voi
         efree(tmp);
     }
 
-    if (rt->is_cube) {
+    if (layered) {
         /* Restore the attachment the RT had bound before the read. */
-        int bf = rt->bound_face >= 0 ? rt->bound_face : 0;
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_CUBE_MAP_POSITIVE_X + bf, rt->color_texture, rt->bound_level);
+        opengl_rt_attach_layer(rt, rt->bound_face >= 0 ? rt->bound_face : 0, rt->bound_level);
     }
     if (!rt->depth_only) glReadBuffer(GL_COLOR_ATTACHMENT0);
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
@@ -1400,31 +1562,38 @@ static void opengl_set_uniform(const char *name, const void *data, int count, in
     glGetIntegerv(GL_CURRENT_PROGRAM, &program);
     if (program <= 0) return;
 
-    GLint loc = gl_uniform_location((GLuint)program, name);
+    GLint alt[GL_ULOC_ALT_MAX];
+    GLint loc = gl_uniform_location_all((GLuint)program, name, alt);
     if (loc < 0) return;  /* silently drop unknown uniforms — matches old behavior */
 
-    switch (type) {
-        case VIO_UNIFORM_INT:
-            glUniform1i(loc, *(const GLint *)data);
-            break;
-        case VIO_UNIFORM_FLOAT:
-            glUniform1f(loc, *(const GLfloat *)data);
-            break;
-        case VIO_UNIFORM_VEC2:
-            glUniform2fv(loc, count, (const GLfloat *)data);
-            break;
-        case VIO_UNIFORM_VEC3:
-            glUniform3fv(loc, count, (const GLfloat *)data);
-            break;
-        case VIO_UNIFORM_VEC4:
-            glUniform4fv(loc, count, (const GLfloat *)data);
-            break;
-        case VIO_UNIFORM_MAT3:
-            glUniformMatrix3fv(loc, count, GL_FALSE, (const GLfloat *)data);
-            break;
-        case VIO_UNIFORM_MAT4:
-            glUniformMatrix4fv(loc, count, GL_FALSE, (const GLfloat *)data);
-            break;
+    /* Write the primary location and every per-stage duplicate (a uniform
+     * declared in both the vertex and a geometry / tessellation stage). */
+    for (int k = -1; k < GL_ULOC_ALT_MAX; k++) {
+        GLint l = (k < 0) ? loc : alt[k];
+        if (l < 0) continue;
+        switch (type) {
+            case VIO_UNIFORM_INT:
+                glUniform1i(l, *(const GLint *)data);
+                break;
+            case VIO_UNIFORM_FLOAT:
+                glUniform1f(l, *(const GLfloat *)data);
+                break;
+            case VIO_UNIFORM_VEC2:
+                glUniform2fv(l, count, (const GLfloat *)data);
+                break;
+            case VIO_UNIFORM_VEC3:
+                glUniform3fv(l, count, (const GLfloat *)data);
+                break;
+            case VIO_UNIFORM_VEC4:
+                glUniform4fv(l, count, (const GLfloat *)data);
+                break;
+            case VIO_UNIFORM_MAT3:
+                glUniformMatrix3fv(l, count, GL_FALSE, (const GLfloat *)data);
+                break;
+            case VIO_UNIFORM_MAT4:
+                glUniformMatrix4fv(l, count, GL_FALSE, (const GLfloat *)data);
+                break;
+        }
     }
 }
 
@@ -1537,6 +1706,126 @@ static int opengl_upload_font_atlas(void *font_obj, int width, int height,
     return 0;
 }
 
+/* ── Comparison sampling (sampler*Shadow) ────────────────────────────
+ *
+ * A depth texture sampled through sampler2DShadow / sampler2DArrayShadow /
+ * samplerCubeShadow needs GL_TEXTURE_COMPARE_MODE, and without it the result
+ * is undefined. The texture itself must stay without compare mode, because
+ * the same depth target is also read manually (texture(sampler2D, uv).r).
+ * So vio keeps the texture as it is and binds a sampler object with compare
+ * mode to every unit a shadow sampler of the CURRENT program reads, for the
+ * duration of one draw - the D3D model (comparison sampler chosen by the
+ * shader's sampler type): LEQUAL, linear (hardware PCF), clamp to an opaque
+ * white border. The units are released after the draw so the 2D batch and
+ * later draws sample them normally. */
+#define GL_SHADOW_CACHE_SIZE 64
+#define GL_SHADOW_MAX_LOCS   16
+
+typedef struct {
+    GLuint program;                    /* 0 = empty slot */
+    int    count;                      /* shadow sampler locations (array elements expanded) */
+    GLint  locs[GL_SHADOW_MAX_LOCS];
+} gl_shadow_entry;
+
+static gl_shadow_entry gl_shadow_cache[GL_SHADOW_CACHE_SIZE];
+static GLuint   gl_cmp_sampler;
+static unsigned gl_cmp_sampler_gen;
+
+static void gl_shadow_forget_program(GLuint program)
+{
+    for (int i = 0; i < GL_SHADOW_CACHE_SIZE; i++) {
+        if (gl_shadow_cache[i].program == program) gl_shadow_cache[i].program = 0;
+    }
+}
+
+static int gl_is_shadow_sampler_type(GLenum type)
+{
+    switch (type) {
+        case GL_SAMPLER_1D_SHADOW:
+        case GL_SAMPLER_2D_SHADOW:
+        case GL_SAMPLER_1D_ARRAY_SHADOW:
+        case GL_SAMPLER_2D_ARRAY_SHADOW:
+        case GL_SAMPLER_2D_RECT_SHADOW:
+        case GL_SAMPLER_CUBE_SHADOW:
+        case GL_SAMPLER_CUBE_MAP_ARRAY_SHADOW:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* The program's shadow-sampler locations, collected once per program. */
+static const gl_shadow_entry *gl_shadow_entry_for(GLuint program)
+{
+    unsigned slot = (program * 2654435761u) % GL_SHADOW_CACHE_SIZE;
+    gl_shadow_entry *e = &gl_shadow_cache[slot];
+    if (e->program == program) return e;
+    e->program = program;
+    e->count = 0;
+    GLint active = 0;
+    glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &active);
+    for (GLint u = 0; u < active && e->count < GL_SHADOW_MAX_LOCS; u++) {
+        char name[128];
+        GLint size = 0;
+        GLenum type = 0;
+        glGetActiveUniform(program, (GLuint)u, sizeof(name), NULL, &size, &type, name);
+        if (!gl_is_shadow_sampler_type(type)) continue;
+        /* Array elements may not have consecutive locations: query each one. */
+        char *bracket = strchr(name, '[');
+        if (bracket) *bracket = '\0';
+        for (GLint k = 0; k < size && e->count < GL_SHADOW_MAX_LOCS; k++) {
+            char elem[160];
+            if (size > 1) snprintf(elem, sizeof(elem), "%s[%d]", name, (int)k);
+            else snprintf(elem, sizeof(elem), "%s", name);
+            GLint loc = glGetUniformLocation(program, elem);
+            if (loc >= 0) e->locs[e->count++] = loc;
+        }
+    }
+    return e;
+}
+
+/* Bind the comparison sampler to every unit the current program's shadow
+ * samplers read; returns the bound units as a bit mask for gl_shadow_end(). */
+static unsigned gl_shadow_begin(void)
+{
+    if (!glBindSampler || !glGenSamplers) return 0;
+    GLint program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    if (program <= 0) return 0;
+    const gl_shadow_entry *e = gl_shadow_entry_for((GLuint)program);
+    if (e->count == 0) return 0;
+    if (!gl_cmp_sampler || gl_cmp_sampler_gen != gl_context_generation) {
+        /* Sampler objects belong to a context: a new context gets its own. */
+        glGenSamplers(1, &gl_cmp_sampler);
+        gl_cmp_sampler_gen = gl_context_generation;
+        static const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+        glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_BORDER);
+        glSamplerParameterfv(gl_cmp_sampler, GL_TEXTURE_BORDER_COLOR, white);
+    }
+    unsigned mask = 0;
+    for (int i = 0; i < e->count; i++) {
+        GLint unit = 0;
+        glGetUniformiv((GLuint)program, e->locs[i], &unit);
+        if (unit < 0 || unit >= 32 || (mask & (1u << unit))) continue;
+        glBindSampler((GLuint)unit, gl_cmp_sampler);
+        mask |= 1u << unit;
+    }
+    return mask;
+}
+
+static void gl_shadow_end(unsigned mask)
+{
+    for (GLuint unit = 0; mask; unit++, mask >>= 1) {
+        if (mask & 1u) glBindSampler(unit, 0);
+    }
+}
+
 static void opengl_draw_mesh(void *mesh_obj)
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
@@ -1555,13 +1844,15 @@ static void opengl_draw_mesh(void *mesh_obj)
         used_default = 1;
     }
 
+    unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
     if (mesh->index_count > 0) {
-        glDrawElements(GL_TRIANGLES, mesh->index_count, mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0);
+        glDrawElements(gl_draw_mode(), mesh->index_count, mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0);
     } else {
-        glDrawArrays(GL_TRIANGLES, 0, mesh->vertex_count);
+        glDrawArrays(gl_draw_mode(), 0, mesh->vertex_count);
     }
     glBindVertexArray(0);
+    gl_shadow_end(shadow_units);
 
     if (used_default) {
         glUseProgram(0);
@@ -1594,13 +1885,15 @@ static void opengl_draw_mesh_instanced(void *mesh_obj,
         glVertexAttribDivisor(loc, 1);
     }
 
+    unsigned shadow_units = gl_shadow_begin();
     if (mesh->index_count > 0) {
-        glDrawElementsInstanced(GL_TRIANGLES, mesh->index_count,
+        glDrawElementsInstanced(gl_draw_mode(), mesh->index_count,
                                 mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
     } else {
-        glDrawArraysInstanced(GL_TRIANGLES, 0, mesh->vertex_count,
+        glDrawArraysInstanced(gl_draw_mode(), 0, mesh->vertex_count,
                               (GLsizei)instance_count);
     }
+    gl_shadow_end(shadow_units);
 
     for (int col = 0; col < 4; col++) {
         glVertexAttribDivisor((GLuint)(3 + col), 0);
@@ -1638,15 +1931,17 @@ static void opengl_draw_instanced_from_storage(void *mesh_obj, int instance_coun
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!vio_gl.initialized || instance_count <= 0) return;
 
+    unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
     if (mesh->index_count > 0) {
-        glDrawElementsInstanced(GL_TRIANGLES, mesh->index_count,
+        glDrawElementsInstanced(gl_draw_mode(), mesh->index_count,
                                 mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
     } else {
-        glDrawArraysInstanced(GL_TRIANGLES, 0, mesh->vertex_count,
+        glDrawArraysInstanced(gl_draw_mode(), 0, mesh->vertex_count,
                               (GLsizei)instance_count);
     }
     glBindVertexArray(0);
+    gl_shadow_end(shadow_units);
 }
 
 /* Indirect draw (GAP-PHASE5 Block 8, GL >= 4.0): the SSBO doubles as the
@@ -1657,20 +1952,22 @@ static void opengl_draw_indirect(void *mesh_obj, void *args_buffer, int max_draw
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_opengl_compute_buffer *args = (vio_opengl_compute_buffer *)args_buffer;
     if (!vio_gl.initialized || !GLAD_GL_VERSION_4_0 || !mesh || !args || !args->ssbo || max_draws <= 0) return;
+    unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, args->ssbo);
     if (mesh->index_count > 0) {
         GLenum type = mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
         for (int i = 0; i < max_draws; i++) {
-            glDrawElementsIndirect(GL_TRIANGLES, type, (const void *)(uintptr_t)(offset + (size_t)i * 20));
+            glDrawElementsIndirect(gl_draw_mode(), type, (const void *)(uintptr_t)(offset + (size_t)i * 20));
         }
     } else {
         for (int i = 0; i < max_draws; i++) {
-            glDrawArraysIndirect(GL_TRIANGLES, (const void *)(uintptr_t)(offset + (size_t)i * 16));
+            glDrawArraysIndirect(gl_draw_mode(), (const void *)(uintptr_t)(offset + (size_t)i * 16));
         }
     }
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
     glBindVertexArray(0);
+    gl_shadow_end(shadow_units);
 }
 
 static int gl_has_ext(const char *name);   /* defined with the caps setup below */
@@ -1975,6 +2272,19 @@ static void opengl_bind_pipeline_state(void *pipe_ptr)
 
     glUseProgram(pipe->shader_program);
 
+    /* Primitive mode for the following draws. A shader with a tessellation
+     * control stage only accepts patches, whatever 'topology' says. */
+    {
+        vio_shader_object *sh = (vio_shader_object *)pipe->shader_ref;
+        vio_topology topo = pipe->topology;
+        if (sh && sh->has_tessellation) topo = VIO_PATCHES;
+        vio_gl.draw_topology = (int)topo;
+        vio_gl.patch_vertices = pipe->patch_vertices > 0 ? pipe->patch_vertices : 3;
+        if (topo == VIO_PATCHES && vio_gl.caps.has_tessellation && glPatchParameteri) {
+            glPatchParameteri(GL_PATCH_VERTICES, vio_gl.patch_vertices);
+        }
+    }
+
     if (pipe->cull_mode == VIO_CULL_NONE) {
         glDisable(GL_CULL_FACE);
     } else {
@@ -2243,6 +2553,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_COMPUTE:        return vio_gl.caps.has_compute_shader;
         case VIO_FEATURE_TESSELLATION:   return vio_gl.caps.has_tessellation;
         case VIO_FEATURE_GEOMETRY:       return gl_ge(3, 2);   /* core in 3.3+ */
+        case VIO_FEATURE_GEOMETRY_INSTANCING: return gl_ge(4, 0) || gl_has_ext("GL_ARB_gpu_shader5");
         case VIO_FEATURE_3D_PIPELINE:    return 1;
         case VIO_FEATURE_RAYTRACING:
         case VIO_FEATURE_MULTIVIEW:      return 0;             /* not exposed via core GL */
@@ -2256,6 +2567,11 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_GPU_TIMESTAMP:  return opengl_has_timer_query(); /* GL_TIMESTAMP queries, core 3.3 */
         case VIO_FEATURE_INDIRECT_DRAW:  return vio_gl.initialized && GLAD_GL_VERSION_4_0; /* glDraw*Indirect */
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_gl.initialized;                        /* GL_TEXTURE_2D_ARRAY, core 3.0 */
+        case VIO_FEATURE_RENDER_TARGET_LAYERED: return vio_gl.initialized;                 /* glFramebufferTextureLayer + depth cubemaps, core 3.0 */
+        case VIO_FEATURE_LAYERED_RENDER: return vio_gl.initialized && GLAD_GL_VERSION_3_2;  /* glFramebufferTexture (layered attachment) */
+        case VIO_FEATURE_VERTEX_LAYER:   return vio_gl.initialized && gl_has_ext("GL_ARB_shader_viewport_layer_array");
+        case VIO_FEATURE_MULTI_VIEWPORT: return vio_gl.initialized && glViewportIndexedf != NULL &&
+                                                (gl_ge(4, 1) || gl_has_ext("GL_ARB_viewport_array"));
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC:                                          /* S3TC ext (BC1/BC3) + core RGTC; BC7 needs BPTC / 4.2 */
             return vio_gl.initialized && gl_has_ext("GL_EXT_texture_compression_s3tc");
         case VIO_FEATURE_CUBEMAP:        return 1;
@@ -2320,6 +2636,7 @@ static const vio_backend opengl_backend = {
     .gpu_frame_time    = opengl_gpu_frame_time,
     .draw_indirect     = opengl_draw_indirect,
     .set_viewport      = opengl_set_viewport,
+    .set_viewports     = opengl_set_viewports,
     .set_uniform       = opengl_set_uniform,
     .destroy_buffer_obj    = opengl_destroy_buffer_obj,
     .destroy_texture_obj   = opengl_destroy_texture_obj,

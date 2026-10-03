@@ -101,6 +101,7 @@ typedef struct _vio_metal_2d_variant {
     int                        color_count;
     int                        samples;
     int                        has_depth;     /* 0 on cube-RT mip levels > 0 (no depth attachment) */
+    int                        has_stencil;
     id<MTLRenderPipelineState> shapes;
     id<MTLRenderPipelineState> sprites;
 } vio_metal_2d_variant;
@@ -162,11 +163,79 @@ typedef struct _vio_metal_target_desc {
     int            count;      /* colour attachments; 0 => depth-only */
     int            samples;
     int            has_depth;
+    int            has_stencil; /* depth attachment is VIO_METAL_DEPTH_STENCIL */
 } vio_metal_target_desc;
+
+/* Depth format of the swapchain and of colour render targets: 8 stencil bits
+ * for vio_pipeline(['stencil' => ...]). depth_only, cube and array targets keep
+ * Depth32Float - they are sampled and read back as depth. */
+#define VIO_METAL_DEPTH_STENCIL MTLPixelFormatDepth32Float_Stencil8
 static void metal_current_target(vio_metal_target_desc *t);
 static MTLPixelFormat metal_pixel_format(int vio_fmt);
 static int metal_rt_attachment_count(const vio_render_target_object *rt);
 static void metal_destroy_texture(void *texture);
+
+/* ── Pass state that outlives a reopened encoder ──────────────────────
+ * metal_open_encoder starts every pass with the full-target viewport; a
+ * tessellation draw that has to reopen the pass mid-draw restores the
+ * viewports and the fragment textures bound for that draw from here. */
+#define VIO_METAL_MAX_VIEWPORTS 16
+static int            metal_target_w = 0, metal_target_h = 0;
+static MTLViewport    metal_vp[VIO_METAL_MAX_VIEWPORTS];
+static MTLScissorRect metal_sc[VIO_METAL_MAX_VIEWPORTS];
+static int            metal_vp_count = 0;        /* 0 = full-target default */
+static int            metal_vp_has_scissor = 0;  /* vio_viewports sets a scissor per viewport */
+#define VIO_METAL_FS_SLOTS 31
+static id<MTLTexture>      metal_fs_tex[VIO_METAL_FS_SLOTS];
+static id<MTLSamplerState> metal_fs_smp[VIO_METAL_FS_SLOTS];
+
+static void metal_fs_shadow_reset(void)
+{
+    for (int i = 0; i < VIO_METAL_FS_SLOTS; i++) { metal_fs_tex[i] = nil; metal_fs_smp[i] = nil; }
+}
+
+static void metal_fs_shadow_set(int idx, id<MTLTexture> tex, id<MTLSamplerState> smp)
+{
+    if (idx < 0 || idx >= VIO_METAL_FS_SLOTS) return;
+    metal_fs_tex[idx] = tex;
+    metal_fs_smp[idx] = smp;
+}
+
+/* Viewport rect -> scissor clamped to the open pass (empty when outside). */
+static MTLScissorRect metal_clamped_scissor(int x, int y, int w, int h)
+{
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w, y1 = y + h;
+    if (x1 > metal_target_w) x1 = metal_target_w;
+    if (y1 > metal_target_h) y1 = metal_target_h;
+    MTLScissorRect r = { (NSUInteger)(x0 < metal_target_w ? x0 : 0), (NSUInteger)(y0 < metal_target_h ? y0 : 0), 0, 0 };
+    if (x1 > x0 && y1 > y0) { r.width = (NSUInteger)(x1 - x0); r.height = (NSUInteger)(y1 - y0); }
+    return r;
+}
+
+static void metal_apply_viewports(void)
+{
+    if (!vio_mtl.current_encoder || metal_vp_count < 1) return;
+    if (metal_vp_count == 1) {
+        [vio_mtl.current_encoder setViewport:metal_vp[0]];
+        if (metal_vp_has_scissor) [vio_mtl.current_encoder setScissorRect:metal_sc[0]];
+        return;
+    }
+    [vio_mtl.current_encoder setViewports:metal_vp count:(NSUInteger)metal_vp_count];
+    [vio_mtl.current_encoder setScissorRects:metal_sc count:(NSUInteger)metal_vp_count];
+}
+
+/* Vertex-stage [[render_target_array_index]] / [[viewport_array_index]] and
+ * setViewports:count: (layered rendering, multiple viewports). */
+static int metal_supports_layered_vertex(void)
+{
+    if (!vio_mtl.device) return 0;
+    if (@available(macOS 10.15, iOS 13.0, *)) {
+        return [vio_mtl.device supportsFamily:MTLGPUFamilyMac2] ||
+               [vio_mtl.device supportsFamily:MTLGPUFamilyApple5];
+    }
+    return 0;
+}
 static void metal_ring_begin_frame(void);
 static void metal_ring_end_frame(id<MTLCommandBuffer> cb);
 static void metal_3d_shutdown(void);
@@ -223,7 +292,7 @@ static void metal_create_swapchain_msaa(int w, int h)
     vio_mtl.msaa_color = [vio_mtl.device newTextureWithDescriptor:cd];
 
     MTLTextureDescriptor *dd = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:w height:h mipmapped:NO];
+        texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL width:w height:h mipmapped:NO];
     dd.textureType = MTLTextureType2DMultisample;
     dd.sampleCount = (NSUInteger)vio_mtl.samples;
     dd.usage = MTLTextureUsageRenderTarget;
@@ -247,7 +316,7 @@ static void create_depth_texture(int w, int h)
     }
 
     MTLTextureDescriptor *desc = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+        texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL
         width:w height:h mipmapped:NO];
     desc.usage = MTLTextureUsageRenderTarget;
     desc.storageMode = MTLStorageModePrivate;
@@ -475,11 +544,12 @@ static vio_metal_2d_variant *metal_2d_variant(const vio_metal_target_desc *t)
     MTLPixelFormat fmt = t->fmts[0];
     int samples = t->samples < 1 ? 1 : t->samples;
     int has_depth = t->has_depth;
+    int has_stencil = t->has_stencil;
     int count = t->count < 1 ? 1 : t->count;
     for (int i = 0; i < mtl_2d.variant_count; i++) {
         vio_metal_2d_variant *v = &mtl_2d.variants[i];
         if (v->pixel_format != (int)fmt || v->samples != samples || v->has_depth != has_depth ||
-            v->color_count != count) continue;
+            v->has_stencil != has_stencil || v->color_count != count) continue;
         int same = 1;
         for (int k = 1; k < count; k++) if (v->extra_fmts[k - 1] != (int)t->fmts[k]) { same = 0; break; }
         if (same) return v;
@@ -510,7 +580,9 @@ static vio_metal_2d_variant *metal_2d_variant(const vio_metal_target_desc *t)
             pipeDesc.colorAttachments[k].pixelFormat = t->fmts[k];
             pipeDesc.colorAttachments[k].writeMask = MTLColorWriteMaskNone;
         }
-        pipeDesc.depthAttachmentPixelFormat = has_depth ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
+        pipeDesc.depthAttachmentPixelFormat = has_depth ? (has_stencil ? VIO_METAL_DEPTH_STENCIL : MTLPixelFormatDepth32Float)
+                                                        : MTLPixelFormatInvalid;
+        pipeDesc.stencilAttachmentPixelFormat = (has_depth && has_stencil) ? VIO_METAL_DEPTH_STENCIL : MTLPixelFormatInvalid;
 
         id<MTLRenderPipelineState> shapes =
             [vio_mtl.device newRenderPipelineStateWithDescriptor:pipeDesc error:&error];
@@ -534,6 +606,7 @@ static vio_metal_2d_variant *metal_2d_variant(const vio_metal_target_desc *t)
         for (int k = 1; k < count; k++) v->extra_fmts[k - 1] = (int)t->fmts[k];
         v->samples      = samples;
         v->has_depth    = has_depth;
+        v->has_stencil  = has_stencil;
         v->shapes       = shapes;
         v->sprites      = sprites;
         return v;
@@ -593,7 +666,7 @@ int vio_metal_2d_init(int width, int height)
 
         /* Swapchain variant (BGRA8, single sample) is built eagerly so a
          * failure surfaces at init, not at the first flush. */
-        vio_metal_target_desc swap = { { MTLPixelFormatBGRA8Unorm, 0, 0, 0 }, 1, 1, 1 };
+        vio_metal_target_desc swap = { { MTLPixelFormatBGRA8Unorm, 0, 0, 0 }, 1, 1, 1, 1 };
         vio_metal_2d_variant *v0 = metal_2d_variant(&swap);
         if (!v0) {
             return -1;
@@ -1053,7 +1126,7 @@ static void metal_open_encoder(int load_clear)
         id<MTLTexture> color_targets[VIO_MAX_COLOR_ATTACHMENTS]  = {nil, nil, nil, nil};
         id<MTLTexture> resolve_targets[VIO_MAX_COLOR_ATTACHMENTS] = {nil, nil, nil, nil};
         int n_color = 0;
-        NSUInteger cube_slice = 0, cube_level = 0;
+        NSUInteger cube_slice = 0, cube_level = 0, all_layers = 0;
         if (current_bound_rt) {
             depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_depth_texture;
             target_w = current_bound_rt->width;
@@ -1073,7 +1146,10 @@ static void metal_open_encoder(int load_clear)
                     }
                 }
             }
-            if (current_bound_rt->is_cube) {
+            if (current_bound_rt->is_cube || current_bound_rt->layers > 1) {
+                /* Cube face / array layer, or every layer (VIO_RT_ALL_LAYERS: the
+                 * vertex stage picks it with [[render_target_array_index]]). */
+                if (current_bound_face == VIO_RT_ALL_LAYERS) all_layers = (NSUInteger)vio_rt_layer_count(current_bound_rt);
                 cube_slice = (NSUInteger)(current_bound_face >= 0 ? current_bound_face : 0);
                 cube_level = (NSUInteger)current_bound_level;
                 target_w >>= cube_level; if (target_w < 1) target_w = 1;
@@ -1120,8 +1196,19 @@ static void metal_open_encoder(int load_clear)
             ca.clearColor = MTLClearColorMake(vio_mtl.clear_r, vio_mtl.clear_g, vio_mtl.clear_b, vio_mtl.clear_a);
         }
 
+        if (all_layers > 1) desc.renderTargetArrayLength = all_layers;
         if (depth_target) {
+            int depth_layered = depth_target.textureType == MTLTextureTypeCube ||
+                                depth_target.textureType == MTLTextureType2DArray;
             desc.depthAttachment.texture = depth_target;
+            if (depth_layered) desc.depthAttachment.slice = cube_slice;
+            if (depth_target.pixelFormat == VIO_METAL_DEPTH_STENCIL) {
+                desc.stencilAttachment.texture = depth_target;
+                if (depth_layered) desc.stencilAttachment.slice = cube_slice;
+                desc.stencilAttachment.loadAction = load_clear ? MTLLoadActionClear : MTLLoadActionLoad;
+                desc.stencilAttachment.storeAction = MTLStoreActionStore;
+                desc.stencilAttachment.clearStencil = 0;
+            }
             desc.depthAttachment.loadAction = load_clear ? MTLLoadActionClear : MTLLoadActionLoad;
             /* Always Store: a mid-frame RT bind/unbind closes this encoder and
              * reopens one with Load — DontCare would hand that Load undefined
@@ -1135,6 +1222,10 @@ static void metal_open_encoder(int load_clear)
 
         MTLViewport viewport = {0, 0, (double)target_w, (double)target_h, 0.0, 1.0};
         [vio_mtl.current_encoder setViewport:viewport];
+        metal_target_w = target_w;
+        metal_target_h = target_h;
+        metal_vp_count = 0;   /* a new pass starts with the full-target viewport */
+        metal_fs_shadow_reset();
 
         MTLScissorRect scissor = {0, 0, (NSUInteger)target_w, (NSUInteger)target_h};
         [vio_mtl.current_encoder setScissorRect:scissor];
@@ -1279,43 +1370,13 @@ extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
 #define VIO_METAL_VB_MESH      30
 #define VIO_METAL_VB_INSTANCE  29
 
-#define VIO_METAL_MAX_RES 16
+/* Resource tables, stage-input layout and the SPIR-V -> MSL transpiler
+ * (metal_gfx_spirv_to_msl, vio_metal_tess_reflect) live in plain C. */
+#include "vio_metal_msl.h"
 
-/* One buffer-like resource of a shader stage after the MSL renumbering. */
-typedef struct _vio_metal_res_buffer {
-    int kind;       /* 0 = UBO, 1 = SSBO, 2 = push-constant block */
-    int set;        /* original GLSL descriptor set */
-    int binding;    /* original GLSL binding (what vio_bind_buffer / vio_bind_storage_buffer pass) */
-    int msl_index;  /* [[buffer(N)]] the resource was pinned to */
-} vio_metal_res_buffer;
-
-/* One combined image-sampler of a shader stage. Listed in SPIRV-Cross's
- * sampled_images order — the SAME order vio_spirv_reflect() reports and the PHP
- * layer's gl_to_hlsl_sampler remap indexes (see vio_bind_texture_internal). */
-typedef struct _vio_metal_res_texture {
-    int binding;    /* original GLSL binding */
-    int msl_index;  /* [[texture(N)]] == [[sampler(N)]] */
-    int is_depth;   /* sampler2DShadow -> needs a compare sampler */
-    int is_cube;    /* samplerCube */
-} vio_metal_res_texture;
-
-typedef struct _vio_metal_vs_input {
-    int location;
-    int components; /* 1..4 */
-    int columns;    /* 1 for vectors, 4 for a mat4 (occupies location..location+3) */
-} vio_metal_vs_input;
-
-typedef struct _vio_metal_stage_res {
-    vio_metal_res_buffer  buffers[VIO_METAL_MAX_RES];
-    int                   buffer_count;
-    vio_metal_res_texture textures[VIO_METAL_MAX_RES];
-    int                   texture_count;
-    /* MSL buffer index of the stage's default uniform block — ubos[0], else the
-     * push-constant block; -1 when the stage has neither. This is the block
-     * vio_spirv_get_uniform_offsets() reflects into sh->cbuffer_data, so the
-     * per-draw cbuffer slice is bound here. */
-    int                   cbuffer_index;
-} vio_metal_stage_res;
+/* Compute pipelines of a tessellation shader's vertex kernel, one per mesh
+ * stride (the stage-input descriptor bakes the stride in). */
+#define VIO_METAL_TESS_VS_VARIANTS 4
 
 /* ARC does not track strong references stored in C structs, so we keep
  * Metal objects as opaque `void *` and bridge across this boundary
@@ -1331,10 +1392,21 @@ typedef struct _vio_metal_shader {
     void *frag_fn_noout;  /* id<MTLFunction>, +1 retained */
     vio_metal_stage_res vs;
     vio_metal_stage_res fs;
-    vio_metal_vs_input  inputs[VIO_METAL_MAX_RES];
-    int                 input_count;
-    int                 vertex_stride;          /* bytes of per-vertex attributes (locations outside 3..6) */
-    int                 uses_instance_attribs;  /* any input at location 3..6 (per-instance mat4 columns) */
+    vio_metal_vs_layout vl;
+    /* Tessellation (tess control + eval present). vert_fn is then the TES as a
+     * post-tessellation vertex function; the vertex and control stages run as
+     * compute kernels before every draw (metal_draw_tess). */
+    int                 tess;
+    vio_metal_tess_info tess_info;
+    vio_metal_stage_res tcs;
+    vio_metal_stage_res tes;
+    void               *vs_kernel_fn;  /* id<MTLFunction> kernel, +1 retained */
+    void               *tcs_pso;       /* id<MTLComputePipelineState>, +1 retained */
+    struct {
+        int   stride;
+        void *pso;                     /* id<MTLComputePipelineState>, +1 retained */
+    } vs_kernel_variants[VIO_METAL_TESS_VS_VARIANTS];
+    int                 vs_kernel_variant_count;
 } vio_metal_shader;
 
 static id<MTLFunction> metal_build_function(const char *msl, char **error_out)
@@ -1343,7 +1415,7 @@ static id<MTLFunction> metal_build_function(const char *msl, char **error_out)
         NSString *src = [NSString stringWithUTF8String:msl];
         NSError *err = nil;
         MTLCompileOptions *opts = [MTLCompileOptions new];
-        opts.languageVersion = MTLLanguageVersion2_0;
+        opts.languageVersion = MTLLanguageVersion2_1;  /* 2.1: [[patch]] / tessellation kernels */
         id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:src options:opts error:&err];
         if (!lib) {
             if (error_out) {
@@ -1367,180 +1439,6 @@ static id<MTLFunction> metal_build_function(const char *msl, char **error_out)
     }
 }
 
-#ifdef HAVE_SPIRV_CROSS
-static void metal_gfx_add_binding(spvc_compiler compiler, SpvExecutionModel stage,
-                                  unsigned desc_set, unsigned binding, unsigned msl_index)
-{
-    spvc_msl_resource_binding_2 rb;
-    spvc_msl_resource_binding_init_2(&rb);
-    rb.stage       = stage;
-    rb.desc_set    = desc_set;
-    rb.binding     = binding;
-    rb.count       = 1;
-    /* One entry serves whichever resource kind lives at this (set, binding):
-     * a buffer reads msl_buffer, a texture reads msl_texture + msl_sampler. */
-    rb.msl_buffer  = msl_index;
-    rb.msl_texture = msl_index;
-    rb.msl_sampler = msl_index;
-    spvc_compiler_msl_add_resource_binding_2(compiler, &rb);
-}
-
-/* Transpile one GRAPHICS stage to MSL with deterministic resource indices.
- *
- * glslang's AUTO_MAP_BINDINGS leaves every resource of an OpenGL-style shader
- * at (set 0, binding 0) — three sampler2Ds all report binding 0 — so the GLSL
- * bindings cannot be used as MSL indices directly (SPIRV-Cross keys explicit
- * bindings by (set, binding) and would collapse them). Instead every UBO, SSBO,
- * push-constant block and sampled image is renumbered to a unique binding k in
- * list order and pinned to [[buffer(k)]] / [[texture(k)]] / [[sampler(k)]]. The
- * resulting tables (vio_metal_stage_res) are what draw / bind_texture /
- * bind_storage_buffer consult at runtime. Mirrors what vio_spirv_to_hlsl does
- * with SpvDecorationBinding for the D3D register spaces.
- *
- * Returns a malloc'd MSL string (caller frees) or NULL. */
-static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, int is_vertex,
-                                    vio_metal_shader *sh, unsigned frag_output_mask,
-                                    char **error_msg)
-{
-    spvc_context   ctx = NULL;
-    spvc_parsed_ir ir = NULL;
-    spvc_compiler  compiler = NULL;
-    spvc_compiler_options opts = NULL;
-    spvc_resources resources = NULL;
-    const char    *result = NULL;
-
-    vio_metal_stage_res *res = is_vertex ? &sh->vs : &sh->fs;
-    memset(res, 0, sizeof(*res));
-    res->cbuffer_index = -1;
-
-    if (spvc_context_create(&ctx) != SPVC_SUCCESS) {
-        if (error_msg) *error_msg = strdup("Failed to create SPIRV-Cross context");
-        return NULL;
-    }
-    if (spvc_context_parse_spirv(ctx, spirv, spirv_size / sizeof(uint32_t), &ir) != SPVC_SUCCESS ||
-        spvc_context_create_compiler(ctx, SPVC_BACKEND_MSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP,
-                                     &compiler) != SPVC_SUCCESS) {
-        if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
-        spvc_context_destroy(ctx);
-        return NULL;
-    }
-
-    if (spvc_compiler_create_compiler_options(compiler, &opts) == SPVC_SUCCESS) {
-        spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_VERSION, SPVC_MAKE_MSL_VERSION(2, 0, 0));
-        spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_PLATFORM, SPVC_MSL_PLATFORM_MACOS);
-        if (!is_vertex) {
-            spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_ENABLE_FRAG_OUTPUT_MASK, frag_output_mask);
-        }
-        spvc_compiler_install_compiler_options(compiler, opts);
-    }
-
-    if (spvc_compiler_create_shader_resources(compiler, &resources) != SPVC_SUCCESS) {
-        if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
-        spvc_context_destroy(ctx);
-        return NULL;
-    }
-
-    SpvExecutionModel em = is_vertex ? SpvExecutionModelVertex : SpvExecutionModelFragment;
-    unsigned next = 0;
-
-    /* Buffers: UBOs first so ubos[0] becomes the default cbuffer (the block
-     * vio_spirv_get_uniform_offsets picks), then SSBOs, then push constants. */
-    static const struct { spvc_resource_type type; int kind; } buffer_kinds[] = {
-        { SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, 0 },
-        { SPVC_RESOURCE_TYPE_STORAGE_BUFFER, 1 },
-        { SPVC_RESOURCE_TYPE_PUSH_CONSTANT,  2 },
-    };
-    for (size_t k = 0; k < sizeof(buffer_kinds) / sizeof(buffer_kinds[0]); k++) {
-        const spvc_reflected_resource *list = NULL;
-        size_t count = 0;
-        spvc_resources_get_resource_list_for_type(resources, buffer_kinds[k].type, &list, &count);
-        for (size_t i = 0; i < count && res->buffer_count < VIO_METAL_MAX_RES; i++) {
-            vio_metal_res_buffer *b = &res->buffers[res->buffer_count++];
-            b->kind      = buffer_kinds[k].kind;
-            b->set       = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet);
-            b->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
-            b->msl_index = (int)next;
-            if (b->kind == 2) {
-                metal_gfx_add_binding(compiler, em, SPVC_MSL_PUSH_CONSTANT_DESC_SET,
-                                      SPVC_MSL_PUSH_CONSTANT_BINDING, next);
-            } else {
-                spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
-                spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
-                metal_gfx_add_binding(compiler, em, 0, next, next);
-            }
-            if (res->cbuffer_index < 0 && b->kind != 1) {
-                res->cbuffer_index = (int)next;
-            }
-            next++;
-        }
-    }
-
-    /* Combined image-samplers, in sampled_images order. */
-    {
-        const spvc_reflected_resource *list = NULL;
-        size_t count = 0;
-        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, &list, &count);
-        for (size_t i = 0; i < count && res->texture_count < VIO_METAL_MAX_RES; i++) {
-            vio_metal_res_texture *t = &res->textures[res->texture_count++];
-            t->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
-            t->msl_index = (int)next;
-            spvc_type type = spvc_compiler_get_type_handle(compiler, list[i].type_id);
-            spvc_type image = type ? spvc_compiler_get_type_handle(compiler, spvc_type_get_base_type_id(type)) : NULL;
-            if (image) {
-                t->is_depth = spvc_type_get_image_is_depth(image) ? 1 : 0;
-                t->is_cube  = (spvc_type_get_image_dimension(image) == SpvDimCube) ? 1 : 0;
-            }
-            spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
-            spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
-            metal_gfx_add_binding(compiler, em, 0, next, next);
-            next++;
-        }
-    }
-
-    /* Vertex inputs: what the [[stage_in]] struct expects, so the pipeline can
-     * build a matching MTLVertexDescriptor without trusting the caller's layout
-     * (a mat4 instance attribute reflects as ONE input with 4 columns). */
-    if (is_vertex) {
-        const spvc_reflected_resource *list = NULL;
-        size_t count = 0;
-        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STAGE_INPUT, &list, &count);
-        sh->input_count = 0;
-        sh->vertex_stride = 0;
-        sh->uses_instance_attribs = 0;
-        for (size_t i = 0; i < count && sh->input_count < VIO_METAL_MAX_RES; i++) {
-            vio_metal_vs_input *in = &sh->inputs[sh->input_count++];
-            in->location = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationLocation);
-            spvc_type type = spvc_compiler_get_type_handle(compiler, list[i].type_id);
-            in->components = type ? (int)spvc_type_get_vector_size(type) : 3;
-            in->columns    = type ? (int)spvc_type_get_columns(type) : 1;
-            if (in->components < 1 || in->components > 4) in->components = 3;
-            if (in->columns < 1) in->columns = 1;
-            if (in->location >= 3 && in->location <= 6) {
-                sh->uses_instance_attribs = 1;
-            } else {
-                sh->vertex_stride += in->components * in->columns * (int)sizeof(float);
-            }
-        }
-    }
-
-    if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS) {
-        if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
-        spvc_context_destroy(ctx);
-        return NULL;
-    }
-
-    if (getenv("VIO_DUMP_MSL")) {
-        fprintf(stderr, "==== Metal %s MSL ====\n%s\n==== end ====\n",
-                is_vertex ? "vertex" : "fragment", result);
-        fflush(stderr);
-    }
-
-    char *output = strdup(result);
-    spvc_context_destroy(ctx);
-    return output;
-}
-#endif /* HAVE_SPIRV_CROSS */
-
 static void metal_destroy_shader(void *s)
 {
     if (!s) return;
@@ -1548,8 +1446,30 @@ static void metal_destroy_shader(void *s)
     if (sh->vert_fn) { CFRelease((CFTypeRef)sh->vert_fn); sh->vert_fn = NULL; }
     if (sh->frag_fn) { CFRelease((CFTypeRef)sh->frag_fn); sh->frag_fn = NULL; }
     if (sh->frag_fn_noout) { CFRelease((CFTypeRef)sh->frag_fn_noout); sh->frag_fn_noout = NULL; }
+    if (sh->vs_kernel_fn) { CFRelease((CFTypeRef)sh->vs_kernel_fn); sh->vs_kernel_fn = NULL; }
+    if (sh->tcs_pso) { CFRelease((CFTypeRef)sh->tcs_pso); sh->tcs_pso = NULL; }
+    for (int i = 0; i < sh->vs_kernel_variant_count; i++) {
+        if (sh->vs_kernel_variants[i].pso) CFRelease((CFTypeRef)sh->vs_kernel_variants[i].pso);
+    }
     free(sh);
 }
+
+#ifdef HAVE_SPIRV_CROSS
+/* SPIR-V of the vertex / fragment stage: php_vio.c hands over SPIR-V, older
+ * callers raw GLSL. Sets *owned when the result must be freed. */
+static uint32_t *metal_stage_spirv(const void *data, size_t size, int is_fragment,
+                                   size_t *out_size, int *owned, char **err)
+{
+    *owned = 0;
+    if (size >= 4 && *(const uint32_t *)data == 0x07230203) {
+        *out_size = size;
+        return (uint32_t *)data;
+    }
+    uint32_t *spv = vio_compile_glsl_to_spirv((const char *)data, is_fragment, out_size, err);
+    if (spv) *owned = 1;
+    return spv;
+}
+#endif
 
 static void *metal_compile_shader(vio_shader_desc *desc)
 {
@@ -1565,123 +1485,119 @@ static void *metal_compile_shader(vio_shader_desc *desc)
     php_error_docref(NULL, E_WARNING, "Metal: shaders require SPIRV-Cross (build with --with-spirv-cross)");
     return NULL;
 #else
+    if (desc->geometry_data) {
+        php_error_docref(NULL, E_WARNING, "Metal: there is no geometry stage on Metal");
+        return NULL;
+    }
+    int tess = desc->tess_control_data && desc->tess_eval_data;
+    if (tess && !(desc->tess_control_size >= 4 && *(const uint32_t *)desc->tess_control_data == 0x07230203 &&
+                  desc->tess_eval_size >= 4 && *(const uint32_t *)desc->tess_eval_data == 0x07230203)) {
+        php_error_docref(NULL, E_WARNING, "Metal: tessellation stages must arrive as SPIR-V");
+        return NULL;
+    }
+
     char *err = NULL;
-    uint32_t *vs_spirv = NULL;
-    uint32_t *fs_spirv = NULL;
+    const char *what = NULL;
     size_t vs_size = 0, fs_size = 0;
     int vs_owned = 0, fs_owned = 0;
-
-    /* Detect SPIR-V magic 0x07230203 vs raw GLSL source */
-    int vs_is_spirv = (desc->vertex_size >= 4 &&
-        *(const uint32_t *)desc->vertex_data == 0x07230203);
-    int fs_is_spirv = (desc->fragment_size >= 4 &&
-        *(const uint32_t *)desc->fragment_data == 0x07230203);
-
-    if (vs_is_spirv) {
-        vs_spirv = (uint32_t *)desc->vertex_data;
-        vs_size  = desc->vertex_size;
-    } else {
-        vs_spirv = vio_compile_glsl_to_spirv(
-            (const char *)desc->vertex_data, 0, &vs_size, &err);
-        if (!vs_spirv) {
-            php_error_docref(NULL, E_WARNING, "Metal: VS GLSL→SPIR-V failed: %s",
-                err ? err : "unknown");
-            free(err);
-            return NULL;
-        }
-        vs_owned = 1;
-    }
-
-    if (fs_is_spirv) {
-        fs_spirv = (uint32_t *)desc->fragment_data;
-        fs_size  = desc->fragment_size;
-    } else {
-        fs_spirv = vio_compile_glsl_to_spirv(
-            (const char *)desc->fragment_data, 1, &fs_size, &err);
-        if (!fs_spirv) {
-            php_error_docref(NULL, E_WARNING, "Metal: FS GLSL→SPIR-V failed: %s",
-                err ? err : "unknown");
-            free(err);
-            if (vs_owned) free(vs_spirv);
-            return NULL;
-        }
-        fs_owned = 1;
-    }
+    uint32_t *vs_spirv = NULL, *fs_spirv = NULL;
+    char *vs_msl = NULL, *fs_msl = NULL, *fs_msl_noout = NULL, *tcs_msl = NULL, *tes_msl = NULL;
+    id<MTLFunction> vfn = nil, ffn = nil, ffn_noout = nil, kfn = nil, tcsfn = nil;
+    id<MTLComputePipelineState> tcs_pso = nil;
 
     vio_metal_shader *sh = calloc(1, sizeof(vio_metal_shader));
-    if (!sh) {
-        if (vs_owned) free(vs_spirv);
-        if (fs_owned) free(fs_spirv);
-        return NULL;
+    if (!sh) return NULL;
+
+    vs_spirv = metal_stage_spirv(desc->vertex_data, desc->vertex_size, 0, &vs_size, &vs_owned, &err);
+    if (!vs_spirv) { what = "VS GLSL→SPIR-V"; goto fail; }
+    fs_spirv = metal_stage_spirv(desc->fragment_data, desc->fragment_size, 1, &fs_size, &fs_owned, &err);
+    if (!fs_spirv) { what = "FS GLSL→SPIR-V"; goto fail; }
+
+    if (tess) {
+        /* Metal has no hull / domain stages: the vertex and control stages
+         * become compute kernels, the evaluation stage the post-tessellation
+         * vertex function (see metal_draw_tess). */
+        sh->tess = 1;
+        if (vio_metal_tess_reflect((const uint32_t *)desc->tess_control_data, desc->tess_control_size,
+                                   (const uint32_t *)desc->tess_eval_data, desc->tess_eval_size,
+                                   &sh->tess_info, &err) != 0) { what = "tessellation reflection"; goto fail; }
+        if (sh->tess_info.domain == VIO_MSL_DOMAIN_ISOLINES || sh->tess_info.point_mode) {
+            err = strdup("Metal tessellates triangle and quad domains only (no isolines, no point_mode)");
+            what = "tessellation";
+            goto fail;
+        }
+        vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_VERTEX_TESS, &sh->vs, &sh->vl,
+                                        0xFFFFFFFFu, &sh->tess_info, &err);
+        if (!vs_msl) { what = "VS SPIR-V→MSL kernel"; goto fail; }
+        tcs_msl = metal_gfx_spirv_to_msl((const uint32_t *)desc->tess_control_data, desc->tess_control_size,
+                                         VIO_MSL_TESS_CONTROL, &sh->tcs, NULL, 0xFFFFFFFFu, &sh->tess_info, &err);
+        if (!tcs_msl) { what = "TCS SPIR-V→MSL"; goto fail; }
+        tes_msl = metal_gfx_spirv_to_msl((const uint32_t *)desc->tess_eval_data, desc->tess_eval_size,
+                                         VIO_MSL_TESS_EVAL, &sh->tes, NULL, 0xFFFFFFFFu, &sh->tess_info, &err);
+        if (!tes_msl) { what = "TES SPIR-V→MSL"; goto fail; }
+    } else {
+        vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_VERTEX, &sh->vs, &sh->vl,
+                                        0xFFFFFFFFu, NULL, &err);
+        if (!vs_msl) { what = "VS SPIR-V→MSL"; goto fail; }
     }
 
-    char *vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, 1, sh, 0xFFFFFFFFu, &err);
-    if (vs_owned) free(vs_spirv);
-    if (!vs_msl) {
-        php_error_docref(NULL, E_WARNING, "Metal: VS SPIR-V→MSL failed: %s",
-            err ? err : "unknown");
-        free(err);
-        if (fs_owned) free(fs_spirv);
-        free(sh);
-        return NULL;
-    }
-
-    char *fs_msl = metal_gfx_spirv_to_msl(fs_spirv, fs_size, 0, sh, 0xFFFFFFFFu, &err);
-
+    fs_msl = metal_gfx_spirv_to_msl(fs_spirv, fs_size, VIO_MSL_FRAGMENT, &sh->fs, NULL, 0xFFFFFFFFu, NULL, &err);
+    if (!fs_msl) { what = "FS SPIR-V→MSL"; goto fail; }
     /* Depth-only variant: same resource renumbering (identical inputs, identical
      * algorithm => identical tables), colour outputs masked. Best effort. */
-    char *fs_msl_noout = NULL;
-    if (fs_msl) {
-        vio_metal_shader scratch;
-        memset(&scratch, 0, sizeof(scratch));
+    {
+        vio_metal_stage_res scratch;
         char *err2 = NULL;
-        fs_msl_noout = metal_gfx_spirv_to_msl(fs_spirv, fs_size, 0, &scratch, 0u, &err2);
+        fs_msl_noout = metal_gfx_spirv_to_msl(fs_spirv, fs_size, VIO_MSL_FRAGMENT, &scratch, NULL, 0u, NULL, &err2);
         free(err2);
     }
-    if (fs_owned) free(fs_spirv);
-    if (!fs_msl) {
-        php_error_docref(NULL, E_WARNING, "Metal: FS SPIR-V→MSL failed: %s",
-            err ? err : "unknown");
-        free(err);
-        free(vs_msl);
-        free(sh);
-        return NULL;
-    }
 
-    id<MTLFunction> vfn = metal_build_function(vs_msl, &err);
-    free(vs_msl);
-    if (!vfn) {
-        php_error_docref(NULL, E_WARNING, "Metal: VS MSL→MTLFunction failed: %s",
-            err ? err : "unknown");
-        free(err);
-        free(fs_msl);
-        free(sh);
-        return NULL;
+    if (tess) {
+        kfn = metal_build_function(vs_msl, &err);
+        if (!kfn) { what = "VS kernel MSL→MTLFunction"; goto fail; }
+        tcsfn = metal_build_function(tcs_msl, &err);
+        if (!tcsfn) { what = "TCS MSL→MTLFunction"; goto fail; }
+        NSError *nserr = nil;
+        tcs_pso = [vio_mtl.device newComputePipelineStateWithFunction:tcsfn error:&nserr];
+        if (!tcs_pso) {
+            err = strdup(nserr ? [[nserr localizedDescription] UTF8String] : "unknown");
+            what = "TCS compute pipeline";
+            goto fail;
+        }
+        vfn = metal_build_function(tes_msl, &err);
+        if (!vfn) { what = "TES MSL→MTLFunction"; goto fail; }
+    } else {
+        vfn = metal_build_function(vs_msl, &err);
+        if (!vfn) { what = "VS MSL→MTLFunction"; goto fail; }
     }
-
-    id<MTLFunction> ffn = metal_build_function(fs_msl, &err);
-    free(fs_msl);
-    if (!ffn) {
-        php_error_docref(NULL, E_WARNING, "Metal: FS MSL→MTLFunction failed: %s",
-            err ? err : "unknown");
-        free(err);
-        free(fs_msl_noout);
-        free(sh);
-        return NULL;
-    }
-
-    id<MTLFunction> ffn_noout = nil;
+    ffn = metal_build_function(fs_msl, &err);
+    if (!ffn) { what = "FS MSL→MTLFunction"; goto fail; }
     if (fs_msl_noout) {
         char *err2 = NULL;
         ffn_noout = metal_build_function(fs_msl_noout, &err2);
         free(err2);
-        free(fs_msl_noout);
     }
 
     sh->vert_fn = (void *)CFBridgingRetain(vfn);
     sh->frag_fn = (void *)CFBridgingRetain(ffn);
     sh->frag_fn_noout = ffn_noout ? (void *)CFBridgingRetain(ffn_noout) : NULL;
+    if (tess) {
+        sh->vs_kernel_fn = (void *)CFBridgingRetain(kfn);
+        sh->tcs_pso = (void *)CFBridgingRetain(tcs_pso);
+    }
+    if (vs_owned) free(vs_spirv);
+    if (fs_owned) free(fs_spirv);
+    free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl);
     return sh;
+
+fail:
+    php_error_docref(NULL, E_WARNING, "Metal: %s failed: %s", what ? what : "shader compile", err ? err : "unknown");
+    free(err);
+    if (vs_owned) free(vs_spirv);
+    if (fs_owned) free(fs_spirv);
+    free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl);
+    free(sh);
+    return NULL;
 #endif /* HAVE_SPIRV_CROSS */
 }
 
@@ -1750,7 +1666,8 @@ static void metal_rt_initial_clear(vio_render_target_object *rt)
                          : (rt->metal_msaa_depth_texture ? (__bridge id<MTLTexture>)rt->metal_msaa_depth_texture : nil);
     if (!rt->metal_color_texture && !depth) return;
     id<MTLCommandBuffer> cb = metal_new_command_buffer();
-    int slices = rt->is_cube ? 6 : 1;
+    int slices = vio_rt_layer_count(rt);
+    int depth_layered = depth && (depth.textureType == MTLTextureTypeCube || depth.textureType == MTLTextureType2DArray);
     for (int s = 0; s < slices; s++) {
         MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
         for (int i = 0; i < n_color; i++) {
@@ -1768,11 +1685,18 @@ static void metal_rt_initial_clear(vio_render_target_object *rt)
                 d.colorAttachments[i].storeAction = MTLStoreActionStore;
             }
         }
-        if (depth) {
+        if (depth && (depth_layered || s == 0)) {
             d.depthAttachment.texture = depth;
+            if (depth_layered) d.depthAttachment.slice = (NSUInteger)s;
             d.depthAttachment.loadAction = MTLLoadActionClear;
             d.depthAttachment.storeAction = MTLStoreActionStore;
             d.depthAttachment.clearDepth = 1.0;
+            if (depth.pixelFormat == VIO_METAL_DEPTH_STENCIL) {
+                d.stencilAttachment.texture = depth;
+                d.stencilAttachment.loadAction = MTLLoadActionClear;
+                d.stencilAttachment.storeAction = MTLStoreActionStore;
+                d.stencilAttachment.clearStencil = 0;
+            }
         }
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:d];
         [enc endEncoding];
@@ -1819,6 +1743,59 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
         }
         MTLPixelFormat color_fmt = metal_pixel_format(rt->formats[0]);
 
+        if (rt->is_cube && depth_only) {
+            /* Depth-only cube (point-light shadows): one Depth32Float cube, a
+             * face per bind or every face with VIO_RT_ALL_LAYERS. */
+            MTLTextureDescriptor *dd = [MTLTextureDescriptor
+                textureCubeDescriptorWithPixelFormat:MTLPixelFormatDepth32Float size:(NSUInteger)width mipmapped:NO];
+            dd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            dd.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> dcube = [vio_mtl.device newTextureWithDescriptor:dd];
+            if (!dcube) {
+                php_error_docref(NULL, E_WARNING, "Metal: failed to create depth cube render target (%d)", width);
+                return -1;
+            }
+            rt->mip_levels = 1;
+            rt->metal_depth_texture = (void *)CFBridgingRetain(dcube);
+            rt->backend_type = VIO_RT_BACKEND_METAL;
+            metal_rt_initial_clear(rt);
+            return 0;
+        }
+        if (rt->layers > 1) {
+            /* Array target ('layers' => N): colour and depth both 2DArray, a
+             * layer per bind or all of them with VIO_RT_ALL_LAYERS. */
+            MTLTextureDescriptor *dd = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:(NSUInteger)width height:(NSUInteger)height mipmapped:NO];
+            dd.textureType = MTLTextureType2DArray;
+            dd.arrayLength = (NSUInteger)rt->layers;
+            dd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            dd.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> darr = [vio_mtl.device newTextureWithDescriptor:dd];
+            id<MTLTexture> carr = nil;
+            if (!depth_only) {
+                MTLTextureDescriptor *cd = [MTLTextureDescriptor
+                    texture2DDescriptorWithPixelFormat:color_fmt width:(NSUInteger)width height:(NSUInteger)height mipmapped:NO];
+                cd.textureType = MTLTextureType2DArray;
+                cd.arrayLength = (NSUInteger)rt->layers;
+                cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                cd.storageMode = MTLStorageModePrivate;
+                carr = [vio_mtl.device newTextureWithDescriptor:cd];
+            }
+            if (!darr || (!depth_only && !carr)) {
+                php_error_docref(NULL, E_WARNING, "Metal: failed to create array render target (%dx%d, %d layers)",
+                                 width, height, rt->layers);
+                return -1;
+            }
+            rt->mip_levels = 1;
+            if (carr) {
+                rt->metal_color_textures[0] = (void *)CFBridgingRetain(carr);
+                rt->metal_color_texture = rt->metal_color_textures[0];
+            }
+            rt->metal_depth_texture = (void *)CFBridgingRetain(darr);
+            rt->backend_type = VIO_RT_BACKEND_METAL;
+            metal_rt_initial_clear(rt);
+            return 0;
+        }
         if (rt->is_cube) {
             /* Cubemap colour attachment: one MTLTextureTypeCube with the full
              * mip chain when requested (generate_mipmaps fills it), plus ONE
@@ -1831,9 +1808,10 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             cd.storageMode = MTLStorageModePrivate;
             id<MTLTexture> cube = [vio_mtl.device newTextureWithDescriptor:cd];
+            /* Depth is a cube too, so VIO_RT_ALL_LAYERS can depth-test every
+             * face in one pass; a face bind selects its slice. */
             MTLTextureDescriptor *dd = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                width:width height:width mipmapped:NO];
+                textureCubeDescriptorWithPixelFormat:MTLPixelFormatDepth32Float size:(NSUInteger)width mipmapped:NO];
             dd.usage = MTLTextureUsageRenderTarget;
             dd.storageMode = MTLStorageModePrivate;
             id<MTLTexture> cube_depth = [vio_mtl.device newTextureWithDescriptor:dd];
@@ -1854,7 +1832,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
         /* Depth texture — always created (parallel to OpenGL's "always create
          * depth attachment" pattern so shadow-map RTs work uniformly). */
         MTLTextureDescriptor *depth_desc = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+            texture2DDescriptorWithPixelFormat:(depth_only ? MTLPixelFormatDepth32Float : VIO_METAL_DEPTH_STENCIL)
             width:width height:height mipmapped:NO];
         depth_desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         depth_desc.storageMode = MTLStorageModePrivate;
@@ -1956,14 +1934,20 @@ static void metal_bind_render_target_at(vio_render_target_object *rt, int face, 
 static void metal_bind_render_target(void *rt_ptr)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
-    /* A cube RT bound without an explicit face renders into +X, level 0. */
-    metal_bind_render_target_at(rt, rt->is_cube ? 0 : -1, 0);
+    /* A cube / array RT bound without an explicit face renders into +X /
+     * layer 0, level 0. */
+    metal_bind_render_target_at(rt, (rt->is_cube || rt->layers > 1) ? 0 : -1, 0);
 }
 
 static int metal_bind_render_target_face(void *rt_ptr, int face, int level)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
-    if (!rt || !rt->is_cube || face < 0 || face > 5 || level < 0 || level >= rt->mip_levels) return -1;
+    if (!rt || (!rt->is_cube && rt->layers <= 1)) return -1;
+    if (face == VIO_RT_ALL_LAYERS) {
+        if (level != 0) return -1;
+    } else if (face < 0 || face >= vio_rt_layer_count(rt) || level < 0 || level >= rt->mip_levels) {
+        return -1;
+    }
     metal_bind_render_target_at(rt, face, level);
     return 0;
 }
@@ -2555,6 +2539,7 @@ typedef struct _vio_metal_pso_variant {
     int   stride;      /* mesh vertex stride baked into the vertex descriptor */
     int   samples;     /* raster sample count of the target (1 or the RT's MSAA count) */
     int   has_depth;   /* 0 when the target has no depth attachment (cube-RT mip > 0) */
+    int   has_stencil; /* depth attachment carries stencil */
     void *pso;         /* id<MTLRenderPipelineState>, +1 retained */
 } vio_metal_pso_variant;
 
@@ -2563,7 +2548,9 @@ typedef struct _vio_metal_pipeline {
     void            *vert_fn;       /* +1 retained copies so a PSO can be built after the shader is gone */
     void            *frag_fn;
     void            *frag_fn_noout; /* depth-only variant, may be NULL */
-    void            *depth_state;   /* id<MTLDepthStencilState>, +1 retained */
+    void            *depth_state;   /* id<MTLDepthStencilState>, +1 retained (with the stencil test) */
+    void            *depth_state_nostencil; /* same depth test, stencil off: targets without a stencil plane */
+    uint32_t         stencil_ref;
     MTLPrimitiveType primitive;
     MTLCullMode      cull;
     vio_blend_mode   blend;
@@ -2573,6 +2560,7 @@ typedef struct _vio_metal_pipeline {
     int              attachment_mask[VIO_MAX_COLOR_ATTACHMENTS];
     float            depth_bias;
     float            slope_scaled_depth_bias;
+    int              patch_vertices; /* input control points per patch (tessellation shaders) */
     vio_metal_pso_variant variants[VIO_METAL_PSO_VARIANTS];
     int                   variant_count;
 } vio_metal_pipeline;
@@ -2592,6 +2580,62 @@ static int               metal_pending_storage_binding = -1;
  * shaders that declare location 3..6 — otherwise the vertex fetch reads an
  * unbound slot (D3D11 has the same identity_instance_buf). */
 static id<MTLBuffer> metal_identity_instance = nil;
+
+/* Constant blocks of the tessellation stages for the next draw, copied by
+ * bind_stage_constants (vio_push_extra_stage_constants runs right before every
+ * draw). The TCS kernel takes them via setBytes, the TES as a ring slice. */
+static unsigned char metal_stage_const[VIO_EXTRA_STAGE_COUNT][VIO_CBUFFER_SIZE];
+static size_t        metal_stage_const_size[VIO_EXTRA_STAGE_COUNT];
+
+static void metal_bind_stage_constants(int stage, void *backend_buffer, const void *data, size_t size)
+{
+    (void)backend_buffer;
+    int i = VIO_EXTRA_STAGE_INDEX(stage);
+    if (i < 0 || i >= VIO_EXTRA_STAGE_COUNT || !data) return;
+    if (size > VIO_CBUFFER_SIZE) size = VIO_CBUFFER_SIZE;
+    memcpy(metal_stage_const[i], data, size);
+    /* MSL structs round up to 16 bytes; the tail stays zero. */
+    if (size < VIO_CBUFFER_SIZE) memset(metal_stage_const[i] + size, 0, ((size + 15) & ~(size_t)15) - size);
+    metal_stage_const_size[i] = (size + 15) & ~(size_t)15;
+}
+
+static MTLPrimitiveTopologyClass metal_topology_class(MTLPrimitiveType t)
+{
+    switch (t) {
+        case MTLPrimitiveTypePoint:     return MTLPrimitiveTopologyClassPoint;
+        case MTLPrimitiveTypeLine:
+        case MTLPrimitiveTypeLineStrip: return MTLPrimitiveTopologyClassLine;
+        default:                        return MTLPrimitiveTopologyClassTriangle;
+    }
+}
+
+static MTLCompareFunction metal_compare(int f)
+{
+    switch (f) {
+        case VIO_CMP_NEVER:    return MTLCompareFunctionNever;
+        case VIO_CMP_LESS:     return MTLCompareFunctionLess;
+        case VIO_CMP_EQUAL:    return MTLCompareFunctionEqual;
+        case VIO_CMP_LEQUAL:   return MTLCompareFunctionLessEqual;
+        case VIO_CMP_GREATER:  return MTLCompareFunctionGreater;
+        case VIO_CMP_NOTEQUAL: return MTLCompareFunctionNotEqual;
+        case VIO_CMP_GEQUAL:   return MTLCompareFunctionGreaterEqual;
+        default:               return MTLCompareFunctionAlways;
+    }
+}
+
+static MTLStencilOperation metal_stencil_op(int op)
+{
+    switch (op) {
+        case VIO_STENCIL_ZERO:      return MTLStencilOperationZero;
+        case VIO_STENCIL_REPLACE:   return MTLStencilOperationReplace;
+        case VIO_STENCIL_INCR:      return MTLStencilOperationIncrementClamp;
+        case VIO_STENCIL_DECR:      return MTLStencilOperationDecrementClamp;
+        case VIO_STENCIL_INVERT:    return MTLStencilOperationInvert;
+        case VIO_STENCIL_INCR_WRAP: return MTLStencilOperationIncrementWrap;
+        case VIO_STENCIL_DECR_WRAP: return MTLStencilOperationDecrementWrap;
+        default:                    return MTLStencilOperationKeep;
+    }
+}
 
 static MTLPrimitiveType metal_topology(vio_topology t)
 {
@@ -2644,6 +2688,8 @@ static void *metal_create_pipeline(vio_pipeline_desc *desc)
         }
         p->depth_bias = desc->depth_bias;
         p->slope_scaled_depth_bias = desc->slope_scaled_depth_bias;
+        p->patch_vertices = desc->patch_vertices > 0 ? desc->patch_vertices : 3;
+        if (p->patch_vertices > 32) p->patch_vertices = 32;
 
         MTLDepthStencilDescriptor *ds = [[MTLDepthStencilDescriptor alloc] init];
         if (desc->depth_test) {
@@ -2653,8 +2699,25 @@ static void *metal_create_pipeline(vio_pipeline_desc *desc)
             ds.depthCompareFunction = MTLCompareFunctionAlways;
         }
         ds.depthWriteEnabled = (desc->depth_test && desc->depth_write) ? YES : NO;
-        id<MTLDepthStencilState> dss = [vio_mtl.device newDepthStencilStateWithDescriptor:ds];
-        p->depth_state = dss ? (void *)CFBridgingRetain(dss) : NULL;
+        id<MTLDepthStencilState> plain = [vio_mtl.device newDepthStencilStateWithDescriptor:ds];
+        p->depth_state_nostencil = plain ? (void *)CFBridgingRetain(plain) : NULL;
+        if (desc->stencil_enable) {
+            /* Same test on both faces, like D3D's FrontFace / BackFace pair. */
+            MTLStencilDescriptor *sd = [[MTLStencilDescriptor alloc] init];
+            sd.stencilCompareFunction    = metal_compare(desc->stencil_func);
+            sd.stencilFailureOperation   = metal_stencil_op(desc->stencil_fail_op);
+            sd.depthFailureOperation     = metal_stencil_op(desc->stencil_depth_fail_op);
+            sd.depthStencilPassOperation = metal_stencil_op(desc->stencil_pass_op);
+            sd.readMask  = (uint32_t)desc->stencil_read_mask & 0xFF;
+            sd.writeMask = (uint32_t)desc->stencil_write_mask & 0xFF;
+            ds.frontFaceStencil = sd;
+            ds.backFaceStencil  = sd;
+            p->stencil_ref = (uint32_t)desc->stencil_ref & 0xFF;
+            id<MTLDepthStencilState> dss = [vio_mtl.device newDepthStencilStateWithDescriptor:ds];
+            p->depth_state = dss ? (void *)CFBridgingRetain(dss) : NULL;
+        } else if (p->depth_state_nostencil) {
+            p->depth_state = (void *)CFRetain((CFTypeRef)p->depth_state_nostencil);
+        }
 
         if (!metal_identity_instance) {
             static const float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -2674,6 +2737,7 @@ static void metal_destroy_pipeline(void *pipeline_ptr)
         if (p->variants[i].pso) CFRelease((CFTypeRef)p->variants[i].pso);
     }
     if (p->depth_state) CFRelease((CFTypeRef)p->depth_state);
+    if (p->depth_state_nostencil) CFRelease((CFTypeRef)p->depth_state_nostencil);
     if (p->vert_fn)     CFRelease((CFTypeRef)p->vert_fn);
     if (p->frag_fn)     CFRelease((CFTypeRef)p->frag_fn);
     if (p->frag_fn_noout) CFRelease((CFTypeRef)p->frag_fn_noout);
@@ -2684,7 +2748,9 @@ static void metal_bind_pipeline(void *pipeline_ptr)
 {
     metal_current_pipeline = (vio_metal_pipeline *)pipeline_ptr;
     /* Fixed-function + PSO are (re)applied per draw by metal_prepare_draw —
-     * the target format may change between bind and draw (RT bind). */
+     * the target format may change between bind and draw (RT bind). Stage
+     * constants of the previous shader must not leak into this one. */
+    memset(metal_stage_const_size, 0, sizeof(metal_stage_const_size));
 }
 
 void vio_metal_set_shader_cbuffers(void *vs_cbuffer, void *fs_cbuffer)
@@ -2701,7 +2767,9 @@ static void metal_current_target(vio_metal_target_desc *t)
     t->samples = 1;
     t->has_depth = 1;
     if (current_bound_rt) {
-        if (current_bound_rt->is_cube && current_bound_level > 0) t->has_depth = 0;
+        if ((current_bound_rt->is_cube || current_bound_rt->layers > 1) && current_bound_level > 0) t->has_depth = 0;
+        void *dt = current_bound_rt->samples > 1 ? current_bound_rt->metal_msaa_depth_texture : current_bound_rt->metal_depth_texture;
+        t->has_stencil = t->has_depth && dt && ((__bridge id<MTLTexture>)dt).pixelFormat == VIO_METAL_DEPTH_STENCIL;
         if (current_bound_rt->samples > 1) t->samples = current_bound_rt->samples;
         if (current_bound_rt->depth_only || !current_bound_rt->metal_color_texture) {
             t->count = 0;
@@ -2717,20 +2785,24 @@ static void metal_current_target(vio_metal_target_desc *t)
     t->fmts[0] = MTLPixelFormatBGRA8Unorm;
     t->count = 1;
     if (vio_mtl.samples > 1 && vio_mtl.msaa_color) t->samples = vio_mtl.samples;
+    id<MTLTexture> sdt = (vio_mtl.samples > 1 && vio_mtl.msaa_color) ? vio_mtl.msaa_depth : vio_mtl.depth_texture;
+    t->has_stencil = sdt && sdt.pixelFormat == VIO_METAL_DEPTH_STENCIL;
 }
 
 /* Find or build the PSO variant for (target colour formats, mesh stride, samples, depth). */
 static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, const vio_metal_target_desc *t, int stride)
 {
     vio_metal_shader *sh = p->shader;
-    if (stride <= 0 || stride < sh->vertex_stride) stride = sh->vertex_stride;
+    if (stride <= 0 || stride < sh->vl.vertex_stride) stride = sh->vl.vertex_stride;
     int samples = t->samples < 1 ? 1 : t->samples;
     int has_depth = t->has_depth;
+    int has_stencil = t->has_stencil;
     int has_color = t->count > 0;
 
     for (int i = 0; i < p->variant_count; i++) {
         vio_metal_pso_variant *v = &p->variants[i];
-        if (v->color_count != t->count || v->stride != stride || v->samples != samples || v->has_depth != has_depth) continue;
+        if (v->color_count != t->count || v->stride != stride || v->samples != samples || v->has_depth != has_depth ||
+            v->has_stencil != has_stencil) continue;
         int same = 1;
         for (int k = 0; k < t->count; k++) if (v->color_fmts[k] != (int)t->fmts[k]) { same = 0; break; }
         if (same) return (__bridge id<MTLRenderPipelineState>)v->pso;
@@ -2758,8 +2830,8 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
          * the per-instance mat4 columns in the instance buffer. */
         MTLVertexDescriptor *vd = [[MTLVertexDescriptor alloc] init];
         vio_metal_vs_input sorted[VIO_METAL_MAX_RES];
-        int n = sh->input_count;
-        memcpy(sorted, sh->inputs, sizeof(vio_metal_vs_input) * (size_t)n);
+        int n = sh->vl.input_count;
+        memcpy(sorted, sh->vl.inputs, sizeof(vio_metal_vs_input) * (size_t)n);
         for (int a = 0; a < n - 1; a++) {
             for (int b = 0; b < n - 1 - a; b++) {
                 if (sorted[b].location > sorted[b + 1].location) {
@@ -2798,7 +2870,23 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
             vd.layouts[VIO_METAL_VB_INSTANCE].stepFunction = MTLVertexStepFunctionPerInstance;
             vd.layouts[VIO_METAL_VB_INSTANCE].stepRate = 1;
         }
-        if (has_mesh_attr || has_inst_attr) {
+        if (sh->tess) {
+            /* vert_fn is the TES: it reads the control points from the TCS
+             * output buffers itself, so no vertex descriptor. GL's vertex
+             * order refers to a lower-left domain origin; the TES flips v to
+             * keep gl_TessCoord GL-shaped, which mirrors the winding. */
+            const vio_metal_tess_info *ti = &sh->tess_info;
+            d.tessellationPartitionMode =
+                ti->spacing == VIO_MSL_SPACING_FRACTIONAL_EVEN ? MTLTessellationPartitionModeFractionalEven :
+                ti->spacing == VIO_MSL_SPACING_FRACTIONAL_ODD  ? MTLTessellationPartitionModeFractionalOdd :
+                                                                 MTLTessellationPartitionModeInteger;
+            d.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+            d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+            d.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+            d.tessellationOutputWindingOrder = ti->ccw ? MTLWindingClockwise : MTLWindingCounterClockwise;
+            d.tessellationFactorScaleEnabled = NO;
+            d.maxTessellationFactor = 64;
+        } else if (has_mesh_attr || has_inst_attr) {
             d.vertexDescriptor = vd;
         }
 
@@ -2867,7 +2955,15 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
                     break;
             }
         }
-        d.depthAttachmentPixelFormat = has_depth ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
+        d.depthAttachmentPixelFormat = has_depth ? (has_stencil ? VIO_METAL_DEPTH_STENCIL : MTLPixelFormatDepth32Float)
+                                                 : MTLPixelFormatInvalid;
+        d.stencilAttachmentPixelFormat = (has_depth && has_stencil) ? VIO_METAL_DEPTH_STENCIL : MTLPixelFormatInvalid;
+        if (!sh->tess) {
+            /* Required on macOS when the vertex stage writes gl_Layer /
+             * gl_ViewportIndex ([[render_target_array_index]] /
+             * [[viewport_array_index]]); harmless otherwise. */
+            d.inputPrimitiveTopology = metal_topology_class(p->primitive);
+        }
 
         NSError *err = nil;
         id<MTLRenderPipelineState> pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:d error:&err];
@@ -2882,6 +2978,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
         v->stride    = stride;
         v->samples   = samples;
         v->has_depth = has_depth;
+        v->has_stencil = has_stencil;
         v->pso       = (void *)CFBridgingRetain(pso);
         return pso;
     }
@@ -2907,8 +3004,11 @@ static int metal_prepare_draw(int stride)
     if (!has_depth) {
         /* No depth attachment on this target: a depth-writing state is invalid. */
         [enc setDepthStencilState:mtl_2d.depth_disabled];
-    } else if (p->depth_state) {
+    } else if (target.has_stencil && p->depth_state) {
         [enc setDepthStencilState:(__bridge id<MTLDepthStencilState>)p->depth_state];
+        [enc setStencilReferenceValue:p->stencil_ref];
+    } else if (p->depth_state_nostencil) {
+        [enc setDepthStencilState:(__bridge id<MTLDepthStencilState>)p->depth_state_nostencil];
     }
     [enc setCullMode:p->cull];
     [enc setFrontFacingWinding:MTLWindingCounterClockwise];  /* match GL / D3D FrontCounterClockwise */
@@ -2918,6 +3018,22 @@ static int metal_prepare_draw(int stride)
      * but got no separate cbuffer object shares the vertex data (D3D11 binds
      * the VS cbuffer to PS b0 in that case). */
     vio_metal_shader *sh = p->shader;
+    if (sh->tess) {
+        /* The vertex function is the TES (its own block); the vertex stage's
+         * block goes to the vertex kernel in metal_draw_tess. */
+        int ti = VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL);
+        if (sh->tes.cbuffer_index >= 0 && metal_stage_const_size[ti] > 0) {
+            NSUInteger off = 0;
+            id<MTLBuffer> rb = metal_ring_alloc(metal_stage_const_size[ti], &off);
+            if (rb) {
+                memcpy((char *)[rb contents] + off, metal_stage_const[ti], metal_stage_const_size[ti]);
+                [enc setVertexBuffer:rb offset:off atIndex:(NSUInteger)sh->tes.cbuffer_index];
+            }
+        }
+        vio_metal_buffer *fcb = metal_current_fs_cb ? metal_current_fs_cb : metal_current_vs_cb;
+        if (fcb) metal_bind_uniform_slice(fcb, -1, sh->fs.cbuffer_index);
+        return 1;
+    }
     if (metal_current_vs_cb) {
         metal_bind_uniform_slice(metal_current_vs_cb, sh->vs.cbuffer_index,
                                  metal_current_fs_cb ? -1 : sh->fs.cbuffer_index);
@@ -2926,7 +3042,7 @@ static int metal_prepare_draw(int stride)
         metal_bind_uniform_slice(metal_current_fs_cb, -1, sh->fs.cbuffer_index);
     }
 
-    if (sh->uses_instance_attribs && metal_identity_instance) {
+    if (sh->vl.uses_instance_attribs && metal_identity_instance) {
         [enc setVertexBuffer:metal_identity_instance offset:0 atIndex:VIO_METAL_VB_INSTANCE];
     }
     return 1;
@@ -2941,9 +3057,328 @@ static void metal_bind_mesh_vb(void *vertex_buffer)
     }
 }
 
+/* ── Tessellation draws ───────────────────────────────────────────
+ *
+ * Metal has no hull / domain stages. Every draw of a tessellation shader runs
+ *   1. the vertex kernel: one thread per (vertex, instance), outputs into a
+ *      ring slice;
+ *   2. the control kernel: one thread per output control point (a threadgroup
+ *      per patch), writing control points, patch constants and the
+ *      tessellation factors into ring slices;
+ *   3. drawPatches on the frame's render encoder: the fixed-function
+ *      tessellator reads the factors, the TES (vertex function) the control
+ *      points and patch constants.
+ * The kernels go into their own command buffer, committed at once: it is
+ * enqueued before the frame's command buffer (committed in vio_end), and
+ * Metal's hazard tracking orders the ring writes before the draw reads them.
+ * The render encoder stays open, so the textures, viewport and scissor of the
+ * draw survive. Consequence: an async compute dispatch recorded earlier in the
+ * same frame runs after these kernels. */
+
+static MTLAttributeFormat metal_attribute_format(int components)
+{
+    switch (components) {
+        case 1:  return MTLAttributeFormatFloat;
+        case 2:  return MTLAttributeFormatFloat2;
+        case 4:  return MTLAttributeFormatFloat4;
+        default: return MTLAttributeFormatFloat3;
+    }
+}
+
+/* Compute pipeline of the vertex kernel for one mesh stride: the stage-input
+ * descriptor mirrors the render path's vertex descriptor, stepping per vertex
+ * along grid X and per instance along grid Y. */
+static id<MTLComputePipelineState> metal_tess_vs_pso(vio_metal_shader *sh, int stride)
+{
+    for (int i = 0; i < sh->vs_kernel_variant_count; i++) {
+        if (sh->vs_kernel_variants[i].stride == stride) {
+            return (__bridge id<MTLComputePipelineState>)sh->vs_kernel_variants[i].pso;
+        }
+    }
+    if (sh->vs_kernel_variant_count >= VIO_METAL_TESS_VS_VARIANTS) {
+        php_error_docref(NULL, E_WARNING,
+            "Metal: tessellation shader drawn with more than %d mesh strides", VIO_METAL_TESS_VS_VARIANTS);
+        return nil;
+    }
+    @autoreleasepool {
+        MTLStageInputOutputDescriptor *sd = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+        vio_metal_vs_input sorted[VIO_METAL_MAX_RES];
+        int n = sh->vl.input_count;
+        memcpy(sorted, sh->vl.inputs, sizeof(vio_metal_vs_input) * (size_t)n);
+        for (int a = 0; a < n - 1; a++) {
+            for (int b = 0; b < n - 1 - a; b++) {
+                if (sorted[b].location > sorted[b + 1].location) {
+                    vio_metal_vs_input tmp = sorted[b]; sorted[b] = sorted[b + 1]; sorted[b + 1] = tmp;
+                }
+            }
+        }
+        NSUInteger mesh_offset = 0;
+        int has_mesh_attr = 0, has_inst_attr = 0;
+        for (int i = 0; i < n; i++) {
+            vio_metal_vs_input *in = &sorted[i];
+            for (int c = 0; c < in->columns; c++) {
+                int loc = in->location + c;
+                if (loc < 0 || loc > 30) continue;
+                sd.attributes[loc].format = metal_attribute_format(in->components);
+                if (in->location >= 3 && in->location <= 6) {
+                    sd.attributes[loc].offset = (NSUInteger)(loc - 3) * 16;
+                    sd.attributes[loc].bufferIndex = VIO_METAL_VB_INSTANCE;
+                    has_inst_attr = 1;
+                } else {
+                    sd.attributes[loc].offset = mesh_offset;
+                    sd.attributes[loc].bufferIndex = VIO_METAL_VB_MESH;
+                    mesh_offset += (NSUInteger)in->components * sizeof(float);
+                    has_mesh_attr = 1;
+                }
+            }
+        }
+        if (has_mesh_attr) {
+            sd.layouts[VIO_METAL_VB_MESH].stride = (NSUInteger)stride;
+            sd.layouts[VIO_METAL_VB_MESH].stepFunction = MTLStepFunctionThreadPositionInGridX;
+            sd.layouts[VIO_METAL_VB_MESH].stepRate = 1;
+        }
+        if (has_inst_attr) {
+            sd.layouts[VIO_METAL_VB_INSTANCE].stride = 64;
+            sd.layouts[VIO_METAL_VB_INSTANCE].stepFunction = MTLStepFunctionThreadPositionInGridY;
+            sd.layouts[VIO_METAL_VB_INSTANCE].stepRate = 1;
+        }
+
+        MTLComputePipelineDescriptor *cd = [[MTLComputePipelineDescriptor alloc] init];
+        cd.computeFunction = (__bridge id<MTLFunction>)sh->vs_kernel_fn;
+        cd.stageInputDescriptor = sd;
+        NSError *err = nil;
+        id<MTLComputePipelineState> pso = [vio_mtl.device newComputePipelineStateWithDescriptor:cd
+                                                                                        options:MTLPipelineOptionNone
+                                                                                     reflection:nil
+                                                                                          error:&err];
+        if (!pso) {
+            php_error_docref(NULL, E_WARNING, "Metal: tessellation vertex kernel pipeline failed: %s",
+                err ? [[err localizedDescription] UTF8String] : "unknown");
+            return nil;
+        }
+        sh->vs_kernel_variants[sh->vs_kernel_variant_count].stride = stride;
+        sh->vs_kernel_variants[sh->vs_kernel_variant_count].pso = (void *)CFBridgingRetain(pso);
+        sh->vs_kernel_variant_count++;
+        return pso;
+    }
+}
+
+/* Command buffer that carries async dispatches not yet known to be complete:
+ * the open frame buffer while recording, the committed one after present. */
+static id<MTLCommandBuffer> metal_async_cb = nil;
+static void metal_compute_wait(void);
+
+static void metal_fs_shadow_copy(id<MTLTexture> __strong *tex, id<MTLSamplerState> __strong *smp)
+{
+    for (int i = 0; i < VIO_METAL_FS_SLOTS; i++) { tex[i] = metal_fs_tex[i]; smp[i] = metal_fs_smp[i]; }
+}
+
+/* Re-bind the fragment textures of the draw on a reopened encoder. */
+static void metal_fs_shadow_restore(id<MTLTexture> __strong *tex, id<MTLSamplerState> __strong *smp)
+{
+    if (!vio_mtl.current_encoder) return;
+    for (int i = 0; i < VIO_METAL_FS_SLOTS; i++) {
+        if (!tex[i]) continue;
+        [vio_mtl.current_encoder setFragmentTexture:tex[i] atIndex:(NSUInteger)i];
+        if (smp[i]) [vio_mtl.current_encoder setFragmentSamplerState:smp[i] atIndex:(NSUInteger)i];
+        metal_fs_shadow_set(i, tex[i], smp[i]);
+    }
+}
+
+/* Draw the current tessellation pipeline. An indexed draw is de-indexed into a
+ * ring slice first (the kernel's stage-input fetch reads vertices in grid
+ * order; mesh buffers are Shared, so the CPU can gather them). Every
+ * patch_vertices input vertices form one patch; a remainder is dropped like on
+ * the other backends. instance_mats: per-instance mat4s (locations 3..6) or
+ * NULL for identity. */
+static void metal_draw_tess(vio_metal_buffer *vb, int stride, int first_vertex, int vertex_count,
+                            vio_metal_buffer *ib, int index_bytes, int first_index, int index_count,
+                            int base_vertex, const float *instance_mats, int instances, int with_storage)
+{
+    vio_metal_pipeline *p = metal_current_pipeline;
+    vio_metal_shader *sh = p ? p->shader : NULL;
+    if (!sh || !sh->tess || !vb || !vb->buffer || !sh->tcs_pso || !vio_mtl.current_encoder) return;
+    if (stride <= 0) stride = sh->vl.vertex_stride;
+    if (stride <= 0 || stride % 4 != 0) return;
+    if (instances < 1) instances = 1;
+
+    @autoreleasepool {
+        const vio_metal_tess_info *ti = &sh->tess_info;
+        int pv = p->patch_vertices;
+        id<MTLBuffer> in_buf = (__bridge id<MTLBuffer>)vb->buffer;
+        NSUInteger in_off = 0;
+        size_t vb_count = vb->size / (size_t)stride;
+        int n;
+
+        if (ib && ib->buffer && index_count > 0) {
+            n = index_count;
+            NSUInteger off = 0;
+            id<MTLBuffer> rb = metal_ring_alloc((NSUInteger)n * (NSUInteger)stride, &off);
+            if (!rb) return;
+            const unsigned char *src = (const unsigned char *)[in_buf contents];
+            const void *idx = [(__bridge id<MTLBuffer>)ib->buffer contents];
+            unsigned char *dst = (unsigned char *)[rb contents] + off;
+            size_t ib_count = ib->size / (index_bytes == 2 ? 2 : 4);
+            for (int i = 0; i < n; i++) {
+                size_t k = (size_t)first_index + (size_t)i;
+                long long v = 0;
+                if (k < ib_count) v = index_bytes == 2 ? ((const uint16_t *)idx)[k] : ((const uint32_t *)idx)[k];
+                v += base_vertex;
+                if (v < 0 || (size_t)v >= vb_count) v = 0;
+                memcpy(dst + (size_t)i * (size_t)stride, src + (size_t)v * (size_t)stride, (size_t)stride);
+            }
+            in_buf = rb;
+            in_off = off;
+        } else {
+            if (first_vertex < 0 || (size_t)first_vertex >= vb_count) return;
+            n = vertex_count;
+            if ((size_t)first_vertex + (size_t)n > vb_count) n = (int)(vb_count - (size_t)first_vertex);
+            in_off = (NSUInteger)first_vertex * (NSUInteger)stride;
+        }
+
+        int per_instance = n / pv;
+        if (per_instance <= 0) return;
+        NSUInteger used = (NSUInteger)per_instance * (NSUInteger)pv;
+        NSUInteger patches = (NSUInteger)per_instance * (NSUInteger)instances;
+        NSUInteger out_cp = (NSUInteger)ti->output_vertices;
+        /* MTLQuadTessellationFactorsHalf / MTLTriangleTessellationFactorsHalf */
+        NSUInteger factor_bytes = ti->domain == VIO_MSL_DOMAIN_QUADS ? 12 : 8;
+
+        NSUInteger vs_off = 0, cp_off = 0, patch_off = 0, fac_off = 0, inst_off = 0;
+        id<MTLBuffer> vs_out    = metal_ring_alloc(used * (NSUInteger)instances * ti->vs_out_stride, &vs_off);
+        id<MTLBuffer> cp_out    = metal_ring_alloc(patches * out_cp * ti->cp_stride, &cp_off);
+        id<MTLBuffer> patch_out = metal_ring_alloc(patches * ti->patch_stride, &patch_off);
+        id<MTLBuffer> factors   = metal_ring_alloc(patches * factor_bytes, &fac_off);
+        id<MTLBuffer> inst      = nil;
+        if (sh->vl.uses_instance_attribs) {
+            inst = metal_ring_alloc((NSUInteger)instances * 64, &inst_off);
+            if (inst) {
+                float *m = (float *)((char *)[inst contents] + inst_off);
+                for (int i = 0; i < instances; i++) {
+                    if (instance_mats) {
+                        memcpy(m + i * 16, instance_mats + i * 16, 64);
+                    } else {
+                        static const float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                        memcpy(m + i * 16, identity, 64);
+                    }
+                }
+            }
+        }
+        if (!vs_out || !cp_out || !patch_out || !factors || (sh->vl.uses_instance_attribs && !inst)) return;
+
+        id<MTLComputePipelineState> vs_pso = metal_tess_vs_pso(sh, stride);
+        id<MTLComputePipelineState> tcs_pso = (__bridge id<MTLComputePipelineState>)sh->tcs_pso;
+        if (!vs_pso) return;
+
+        /* An async dispatch recorded earlier in this frame may write what the
+         * kernels read: then they go into the frame command buffer behind it
+         * (the pass is closed and reopened, the draw's textures and viewports
+         * restored). Otherwise they run in their own command buffer, committed
+         * ahead of the frame's, and the open pass is left alone. */
+        int in_frame = metal_async_cb != nil && metal_async_cb == vio_mtl.current_cmd_buf;
+        id<MTLTexture> saved_tex[VIO_METAL_FS_SLOTS];
+        id<MTLSamplerState> saved_smp[VIO_METAL_FS_SLOTS];
+        MTLViewport saved_vp[VIO_METAL_MAX_VIEWPORTS];
+        MTLScissorRect saved_sc[VIO_METAL_MAX_VIEWPORTS];
+        int saved_vp_count = metal_vp_count, saved_has_sc = metal_vp_has_scissor;
+        id<MTLCommandBuffer> cb = nil;
+        if (in_frame) {
+            metal_fs_shadow_copy(saved_tex, saved_smp);
+            memcpy(saved_vp, metal_vp, sizeof(saved_vp));
+            memcpy(saved_sc, metal_sc, sizeof(saved_sc));
+            [vio_mtl.current_encoder endEncoding];
+            vio_mtl.current_encoder = nil;
+            cb = vio_mtl.current_cmd_buf;
+        } else {
+            cb = metal_new_command_buffer();
+        }
+        if (!cb) return;
+
+        /* 1. vertex kernel */
+        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        [ce setComputePipelineState:vs_pso];
+        [ce setBuffer:in_buf offset:in_off atIndex:VIO_METAL_VB_MESH];
+        if (inst) [ce setBuffer:inst offset:inst_off atIndex:VIO_METAL_VB_INSTANCE];
+        if (with_storage && metal_pending_storage && metal_pending_storage->buffer) {
+            /* vio_draw_instanced_from_buffer: the vertex stage's SSBO. */
+            int sidx = -1;
+            for (int i = 0; i < sh->vs.buffer_count; i++) {
+                if (sh->vs.buffers[i].kind == 1 && sh->vs.buffers[i].binding == metal_pending_storage_binding) { sidx = sh->vs.buffers[i].msl_index; break; }
+            }
+            for (int i = 0; sidx < 0 && i < sh->vs.buffer_count; i++) {
+                if (sh->vs.buffers[i].kind == 1) sidx = sh->vs.buffers[i].msl_index;
+            }
+            if (sidx >= 0) [ce setBuffer:(__bridge id<MTLBuffer>)metal_pending_storage->buffer offset:0 atIndex:(NSUInteger)sidx];
+        }
+        if (metal_current_vs_cb && metal_current_vs_cb->shadow && sh->vs.cbuffer_index >= 0) {
+            [ce setBytes:metal_current_vs_cb->shadow length:metal_current_vs_cb->shadow_size
+                 atIndex:(NSUInteger)sh->vs.cbuffer_index];
+        }
+        [ce setBuffer:vs_out offset:vs_off atIndex:VIO_METAL_TESS_OUT_INDEX];
+        [ce setStageInRegion:MTLRegionMake2D(0, 0, used, (NSUInteger)instances)];
+        NSUInteger w = vs_pso.maxTotalThreadsPerThreadgroup < 64 ? vs_pso.maxTotalThreadsPerThreadgroup : 64;
+        [ce dispatchThreads:MTLSizeMake(used, (NSUInteger)instances, 1)
+            threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+        [ce endEncoding];
+
+        /* 2. control kernel: a threadgroup per patch, so barrier() in the TCS
+         * only spans the patch's own control points. */
+        ce = [cb computeCommandEncoder];
+        [ce setComputePipelineState:tcs_pso];
+        [ce setBuffer:vs_out offset:vs_off atIndex:VIO_METAL_TESS_IN_INDEX];
+        [ce setBuffer:cp_out offset:cp_off atIndex:VIO_METAL_TESS_OUT_INDEX];
+        [ce setBuffer:patch_out offset:patch_off atIndex:VIO_METAL_TESS_PATCH_OUT_INDEX];
+        [ce setBuffer:factors offset:fac_off atIndex:VIO_METAL_TESS_FACTOR_INDEX];
+        uint32_t params[2] = { (uint32_t)pv, (uint32_t)patches };
+        [ce setBytes:params length:sizeof(params) atIndex:VIO_METAL_TESS_PARAMS_INDEX];
+        int tc = VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL);
+        if (sh->tcs.cbuffer_index >= 0 && metal_stage_const_size[tc] > 0) {
+            [ce setBytes:metal_stage_const[tc] length:metal_stage_const_size[tc]
+                 atIndex:(NSUInteger)sh->tcs.cbuffer_index];
+        }
+        [ce dispatchThreadgroups:MTLSizeMake(patches, 1, 1) threadsPerThreadgroup:MTLSizeMake(out_cp, 1, 1)];
+        [ce endEncoding];
+        if (in_frame) {
+            metal_open_encoder(/*load_clear=*/0);
+            metal_fs_shadow_restore(saved_tex, saved_smp);
+            memcpy(metal_vp, saved_vp, sizeof(saved_vp));
+            memcpy(metal_sc, saved_sc, sizeof(saved_sc));
+            metal_vp_count = saved_vp_count;
+            metal_vp_has_scissor = saved_has_sc;
+            metal_apply_viewports();
+        } else {
+            [cb commit];
+        }
+
+        /* 3. tessellate + rasterize in the frame's render pass */
+        if (!metal_prepare_draw(stride)) return;
+        id<MTLRenderCommandEncoder> enc = vio_mtl.current_encoder;
+        [enc setVertexBuffer:cp_out offset:cp_off atIndex:VIO_METAL_TESS_IN_INDEX];
+        [enc setVertexBuffer:patch_out offset:patch_off atIndex:VIO_METAL_TESS_PATCH_IN_INDEX];
+        [enc setTessellationFactorBuffer:factors offset:fac_off instanceStride:0];
+        [enc drawPatches:out_cp
+              patchStart:0
+              patchCount:patches
+        patchIndexBuffer:nil
+  patchIndexBufferOffset:0
+           instanceCount:1
+            baseInstance:0];
+    }
+}
+
+static int metal_tess_bound(void)
+{
+    return metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->tess;
+}
+
 static void metal_draw(vio_draw_cmd *cmd)
 {
     if (!cmd || cmd->vertex_count <= 0) return;
+    if (metal_tess_bound()) {
+        metal_draw_tess((vio_metal_buffer *)cmd->vertex_buffer, cmd->vertex_stride, cmd->first_vertex,
+                        cmd->vertex_count, NULL, 0, 0, 0, 0, NULL, cmd->instance_count, 0);
+        return;
+    }
     @autoreleasepool {
         if (!metal_prepare_draw(cmd->vertex_stride)) return;
         metal_bind_mesh_vb(cmd->vertex_buffer);
@@ -2960,6 +3395,12 @@ static void metal_draw_indexed(vio_draw_indexed_cmd *cmd)
     if (!cmd || cmd->index_count <= 0) return;
     vio_metal_buffer *ib = (vio_metal_buffer *)cmd->index_buffer;
     if (!ib || !ib->buffer) return;
+    if (metal_tess_bound()) {
+        metal_draw_tess((vio_metal_buffer *)cmd->vertex_buffer, cmd->vertex_stride, 0, 0,
+                        ib, cmd->index_bytes, cmd->first_index, cmd->index_count, cmd->vertex_offset,
+                        NULL, cmd->instance_count, 0);
+        return;
+    }
     @autoreleasepool {
         if (!metal_prepare_draw(cmd->vertex_stride)) return;
         metal_bind_mesh_vb(cmd->vertex_buffer);
@@ -3001,6 +3442,12 @@ void vio_metal_draw_instanced(void *mesh_obj, const float *matrices_4x4, int ins
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!mesh || !matrices_4x4 || instance_count <= 0) return;
+    if (metal_tess_bound()) {
+        metal_draw_tess((vio_metal_buffer *)mesh->backend_vb, mesh->stride, 0, mesh->vertex_count,
+                        mesh->index_count > 0 ? (vio_metal_buffer *)mesh->backend_ib : NULL,
+                        mesh->index_bytes, 0, mesh->index_count, 0, matrices_4x4, instance_count, 0);
+        return;
+    }
     @autoreleasepool {
         if (!metal_prepare_draw(mesh->stride)) return;
 
@@ -3034,6 +3481,53 @@ static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_metal_buffer *args = (vio_metal_buffer *)args_buffer;
     if (!mesh || !args || !args->buffer || max_draws <= 0) return;
+    if (metal_tess_bound()) {
+        /* The tessellation kernels need the vertex and instance counts when they
+         * are encoded, so the argument records are read on the CPU (the buffer
+         * is Shared). A dispatch of this frame that writes them runs first; the
+         * draw's textures and viewports survive that flush. */
+        @autoreleasepool {
+            id<MTLTexture> saved_tex[VIO_METAL_FS_SLOTS];
+            id<MTLSamplerState> saved_smp[VIO_METAL_FS_SLOTS];
+            MTLViewport saved_vp[VIO_METAL_MAX_VIEWPORTS];
+            MTLScissorRect saved_sc[VIO_METAL_MAX_VIEWPORTS];
+            int saved_vp_count = metal_vp_count, saved_has_sc = metal_vp_has_scissor;
+            int flush = metal_async_cb != nil && metal_async_cb == vio_mtl.current_cmd_buf;
+            if (flush) {
+                metal_fs_shadow_copy(saved_tex, saved_smp);
+                memcpy(saved_vp, metal_vp, sizeof(saved_vp));
+                memcpy(saved_sc, metal_sc, sizeof(saved_sc));
+            }
+            metal_compute_wait();
+            if (flush) {
+                metal_fs_shadow_restore(saved_tex, saved_smp);
+                memcpy(metal_vp, saved_vp, sizeof(saved_vp));
+                memcpy(metal_sc, saved_sc, sizeof(saved_sc));
+                metal_vp_count = saved_vp_count;
+                metal_vp_has_scissor = saved_has_sc;
+                metal_apply_viewports();
+            }
+            vio_metal_buffer *tib = mesh->index_count > 0 ? (vio_metal_buffer *)mesh->backend_ib : NULL;
+            int indexed = tib && tib->buffer;
+            size_t rec = indexed ? 20 : 16;
+            const unsigned char *a = (const unsigned char *)[(__bridge id<MTLBuffer>)args->buffer contents];
+            for (int i = 0; a && i < max_draws; i++) {
+                size_t o = offset + (size_t)i * rec;
+                if (o + rec > args->size) break;
+                uint32_t r[5];
+                memcpy(r, a + o, rec);
+                if (r[0] == 0 || r[1] == 0) continue;
+                if (indexed) {
+                    metal_draw_tess((vio_metal_buffer *)mesh->backend_vb, mesh->stride, 0, 0, tib, mesh->index_bytes,
+                                    (int)r[2], (int)r[0], (int)(int32_t)r[3], NULL, (int)r[1], 0);
+                } else {
+                    metal_draw_tess((vio_metal_buffer *)mesh->backend_vb, mesh->stride, (int)r[2], (int)r[0],
+                                    NULL, 0, 0, 0, 0, NULL, (int)r[1], 0);
+                }
+            }
+        }
+        return;
+    }
     @autoreleasepool {
         if (!metal_prepare_draw(mesh->stride)) return;
         vio_metal_buffer *sb = metal_pending_storage;
@@ -3076,6 +3570,13 @@ static void metal_draw_instanced_from_storage(void *mesh_obj, int instance_count
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!mesh || instance_count <= 0) return;
+    if (metal_tess_bound()) {
+        /* The vertex kernel reads the SSBO (gl_InstanceIndex = grid row). */
+        metal_draw_tess((vio_metal_buffer *)mesh->backend_vb, mesh->stride, 0, mesh->vertex_count,
+                        mesh->index_count > 0 ? (vio_metal_buffer *)mesh->backend_ib : NULL,
+                        mesh->index_bytes, 0, mesh->index_count, 0, NULL, instance_count, 1);
+        return;
+    }
     @autoreleasepool {
         if (!metal_prepare_draw(mesh->stride)) return;
 
@@ -3134,6 +3635,7 @@ static void metal_bind_texture(void *texture, int slot)
                                          : (__bridge id<MTLSamplerState>)t->sampler;
         [vio_mtl.current_encoder setFragmentTexture:(__bridge id<MTLTexture>)t->tex atIndex:(NSUInteger)idx];
         if (s) [vio_mtl.current_encoder setFragmentSamplerState:s atIndex:(NSUInteger)idx];
+        metal_fs_shadow_set(idx, (__bridge id<MTLTexture>)t->tex, s);
     }
 }
 
@@ -3183,10 +3685,13 @@ static int metal_render_target_cubemap(void *rt_ptr, void *cm_obj)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
-    if (!rt || !cm || !rt->is_cube || !rt->metal_color_texture || !vio_mtl.device) return -1;
+    /* A depth_only cube hands out its depth cube (samplerCube .r, or
+     * samplerCubeShadow through the compare sampler in vio_metal_bind_cubemap). */
+    void *src = rt && rt->depth_only ? rt->metal_depth_texture : (rt ? rt->metal_color_texture : NULL);
+    if (!rt || !cm || !rt->is_cube || !src || !vio_mtl.device) return -1;
     @autoreleasepool {
         id<MTLSamplerState> s = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, rt->mip_levels > 1 ? 1 : 0, 0, 1);
-        cm->metal_texture = (void *)CFRetain((CFTypeRef)rt->metal_color_texture);
+        cm->metal_texture = (void *)CFRetain((CFTypeRef)src);
         cm->metal_sampler = s ? (void *)CFBridgingRetain(s) : NULL;
         cm->mipmaps       = rt->mip_levels > 1;
         cm->borrowed      = 1;
@@ -3253,7 +3758,8 @@ static int metal_read_render_target(void *rt_ptr, int face, int attachment, void
             : (__bridge id<MTLTexture>)rt->metal_color_textures[attachment];   /* resolve texture when MSAA */
         if (!src) return -1;
         NSUInteger slice = 0;
-        if (rt->is_cube) slice = (NSUInteger)(face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0));
+        if (rt->is_cube || rt->layers > 1) slice = (NSUInteger)(face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0));
+        if ((int)slice >= vio_rt_layer_count(rt)) return -1;
 
         metal_flush_for_readback();
 
@@ -3321,7 +3827,7 @@ static int metal_generate_mipmaps(void *obj, int kind)
         switch (kind) {
             case 0: {
                 vio_render_target_object *rt = (vio_render_target_object *)obj;
-                if (rt->backend_type != VIO_RT_BACKEND_METAL || !rt->metal_color_texture) return -1;
+                if (rt->backend_type != VIO_RT_BACKEND_METAL || !rt->metal_color_texture || rt->layers > 1) return -1;
                 tex = (__bridge id<MTLTexture>)rt->metal_color_texture;
                 break;
             }
@@ -3379,12 +3885,16 @@ void vio_metal_bind_cubemap(void *cubemap_obj, int slot)
         int is_depth = 0;
         int idx = metal_resolve_fs_texture(slot, &is_depth);
         if (idx < 0 || idx > 30) return;
-        [vio_mtl.current_encoder setFragmentTexture:(__bridge id<MTLTexture>)cm->metal_texture
-                                            atIndex:(NSUInteger)idx];
-        if (cm->metal_sampler) {
-            [vio_mtl.current_encoder setFragmentSamplerState:(__bridge id<MTLSamplerState>)cm->metal_sampler
-                                                     atIndex:(NSUInteger)idx];
+        id<MTLTexture> ctex = (__bridge id<MTLTexture>)cm->metal_texture;
+        id<MTLSamplerState> csmp = cm->metal_sampler ? (__bridge id<MTLSamplerState>)cm->metal_sampler : nil;
+        if (is_depth) {
+            static id<MTLSamplerState> cube_cmp = nil;
+            if (!cube_cmp) cube_cmp = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, 0, 1, 1);
+            csmp = cube_cmp;
         }
+        [vio_mtl.current_encoder setFragmentTexture:ctex atIndex:(NSUInteger)idx];
+        if (csmp) [vio_mtl.current_encoder setFragmentSamplerState:csmp atIndex:(NSUInteger)idx];
+        metal_fs_shadow_set(idx, ctex, csmp);
     }
 }
 
@@ -3414,7 +3924,36 @@ static void metal_set_viewport(int x, int y, int width, int height)
     @autoreleasepool {
         MTLViewport vp = {(double)x, (double)y, (double)width, (double)height, 0.0, 1.0};
         [vio_mtl.current_encoder setViewport:vp];
+        if (metal_vp_has_scissor) {
+            /* vio_viewports clipped viewport 0 to its own rect: a single
+             * viewport draws without a scissor again (full target). */
+            MTLScissorRect full = {0, 0, (NSUInteger)metal_target_w, (NSUInteger)metal_target_h};
+            [vio_mtl.current_encoder setScissorRect:full];
+        }
+        metal_vp[0] = vp;
+        metal_sc[0] = metal_clamped_scissor(x, y, width, height);
+        metal_vp_count = 1;
+        metal_vp_has_scissor = 0;
     }
+}
+
+/* vio_viewports: viewport i (and its scissor, clamped to the target) for
+ * gl_ViewportIndex = i ([[viewport_array_index]] in the vertex stage). */
+static int metal_set_viewports(const int *rects, int count)
+{
+    if (!vio_mtl.current_encoder || count < 1 || count > VIO_METAL_MAX_VIEWPORTS) return -1;
+    @autoreleasepool {
+        for (int i = 0; i < count; i++) {
+            int x = rects[i * 4], y = rects[i * 4 + 1], w = rects[i * 4 + 2], h = rects[i * 4 + 3];
+            MTLViewport vp = {(double)x, (double)y, (double)w, (double)h, 0.0, 1.0};
+            metal_vp[i] = vp;
+            metal_sc[i] = metal_clamped_scissor(x, y, w, h);
+        }
+        metal_vp_count = count;
+        metal_vp_has_scissor = 1;
+        metal_apply_viewports();
+    }
+    return 0;
 }
 
 static void metal_destroy_mesh(void *mesh_ptr)
@@ -3807,9 +4346,8 @@ static void metal_compute_set_uniforms(void *pipeline_ptr, const void *data, int
     }
 }
 
-/* Command buffer that carries async dispatches not yet known to be complete:
- * the open frame buffer while recording, the committed one after present. */
-static id<MTLCommandBuffer> metal_async_cb = nil;
+/* metal_async_cb (async dispatches not yet known to be complete) is declared
+ * with the tessellation draws, which have to order themselves after it. */
 
 static void metal_compute_wait(void)
 {
@@ -3951,6 +4489,7 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_3D_PIPELINE:
     case VIO_FEATURE_VERTEX_STORAGE:
     case VIO_FEATURE_STORAGE_IMAGE:
+    case VIO_FEATURE_TESSELLATION:  /* vertex + control kernels, then drawPatches (metal_draw_tess) */
 #ifdef HAVE_SPIRV_CROSS
         /* Every shader stage reaches the GPU through GLSL -> SPIR-V -> MSL, so
          * compute, the 3D draw pipeline and the vertex-stage SSBO path (Path B)
@@ -4002,9 +4541,21 @@ static int metal_supports_feature(vio_feature f)
         return 1;
     case VIO_FEATURE_TEXTURE_COMPRESSION_BC: /* BC1-BC7 pixel formats (macOS) */
         return metal_supports_bc();
-    case VIO_FEATURE_STENCIL:       /* depth attachments are Depth32Float (no stencil plane) — macOS follow-up */
+    case VIO_FEATURE_STENCIL:
+        /* Swapchain and colour targets use Depth32Float_Stencil8. */
+        return 1;
+    case VIO_FEATURE_RENDER_TARGET_LAYERED:
+        /* 2DArray colour + depth, Depth32Float cubes (depth_only). */
+        return 1;
+    case VIO_FEATURE_LAYERED_RENDER:
+    case VIO_FEATURE_VERTEX_LAYER:
+    case VIO_FEATURE_MULTI_VIEWPORT:
+        /* renderTargetArrayLength + [[render_target_array_index]] /
+         * [[viewport_array_index]] from the vertex function and
+         * setViewports:count: - Mac2 / Apple5 GPU families. No geometry stage,
+         * so gl_Layer / gl_ViewportIndex come from the vertex stage only. */
+        return metal_supports_layered_vertex();
     case VIO_FEATURE_GEOMETRY:      /* Metal has no geometry stage */
-    case VIO_FEATURE_TESSELLATION:  /* not wired (Metal tessellation is compute-driven) */
     case VIO_FEATURE_RAYTRACING:
     case VIO_FEATURE_MULTIVIEW:
     default:
@@ -4086,6 +4637,7 @@ static const vio_backend metal_backend = {
     .read_pixels       = metal_read_pixels_slot,
     .bind_texture      = metal_bind_texture,
     .set_viewport      = metal_set_viewport,
+    .set_viewports     = metal_set_viewports,
     .dispatch_compute  = metal_dispatch_compute,
     .supports_feature  = metal_supports_feature,
     .gpu_frame_time    = metal_gpu_frame_time,
@@ -4103,6 +4655,7 @@ static const vio_backend metal_backend = {
     .bind_storage_buffer         = metal_bind_storage_buffer,
     .draw_instanced_from_storage = metal_draw_instanced_from_storage,
     .draw_indirect     = metal_draw_indirect,
+    .bind_stage_constants = metal_bind_stage_constants,
     .destroy_font_atlas = metal_destroy_font_atlas,
     .upload_font_atlas  = metal_upload_font_atlas,
     .destroy_texture_obj = metal_destroy_texture_obj,

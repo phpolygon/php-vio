@@ -38,6 +38,17 @@ typedef enum _vio_topology {
     VIO_LINES          = 3,
     VIO_LINE_STRIP     = 4,
     VIO_POINTS         = 5,
+    /* Tessellation patches: `patch_vertices` control points per primitive
+     * (vio_pipeline 'patch_vertices', default 3). Implied whenever the
+     * pipeline's shader carries a tessellation-control stage. */
+    VIO_PATCHES        = 6,
+    /* Primitives with their neighbours (geometry stage only, gl_in has 4 / 6
+     * vertices): silhouettes, outlines, shadow volumes. vio_mesh(['adjacency'
+     * => true]) builds the TRIANGLES_ADJACENCY index buffer from a triangle list. */
+    VIO_LINES_ADJACENCY          = 7,
+    VIO_LINE_STRIP_ADJACENCY     = 8,
+    VIO_TRIANGLES_ADJACENCY      = 9,
+    VIO_TRIANGLE_STRIP_ADJACENCY = 10,
 } vio_topology;
 
 /* ── Cull mode ────────────────────────────────────────────────────── */
@@ -262,7 +273,38 @@ typedef enum _vio_feature {
      * once per 1x2 / 2x1 / 2x2 / 4x4 pixel block while geometry, depth and the
      * resolution stay untouched (D3D12 VRS Tier 1+). */
     VIO_FEATURE_SHADING_RATE       = 38,
+    /* Layered render targets: vio_render_target(['layers' => N]) 2D arrays
+     * (colour or depth_only, sampled as sampler2DArray) and depth_only cube
+     * targets (sampled through vio_render_target_cubemap). One layer / face is
+     * bound at a time via vio_bind_render_target($ctx, $rt, $layer). */
+    VIO_FEATURE_RENDER_TARGET_LAYERED = 39,
+    /* Layered rendering: vio_bind_render_target($ctx, $rt, VIO_RT_ALL_LAYERS)
+     * binds every layer / face of a layered target at once; a geometry stage
+     * picks the layer per primitive with gl_Layer (single-pass cube / CSM). */
+    VIO_FEATURE_LAYERED_RENDER     = 40,
+    /* gl_Layer written by the VERTEX stage (no geometry stage needed:
+     * gl_Layer = gl_InstanceIndex with one instance per layer). */
+    VIO_FEATURE_VERTEX_LAYER       = 41,
+    /* vio_viewports(): up to VIO_MAX_VIEWPORTS viewports at once; gl_ViewportIndex
+     * in the geometry stage (or the vertex stage with VIO_FEATURE_VERTEX_LAYER)
+     * picks one per primitive - all CSM cascades into one atlas in one pass. */
+    VIO_FEATURE_MULTI_VIEWPORT     = 42,
+    /* Geometry-shader instancing: layout(invocations = N) runs the GS N times
+     * per input primitive (gl_InvocationID), e.g. one invocation per cube face. */
+    VIO_FEATURE_GEOMETRY_INSTANCING = 43,
+    /* vio_shader(['hlsl' => ['geometry' | 'tess_control' | 'tess_eval' => src]]):
+     * the backend compiles that HLSL instead of transpiling the GLSL stage -
+     * D3D tessellation (SPIRV-Cross has no hull / domain output) and HLSL-only
+     * features such as [instance(N)]. The GLSL stage stays required: it defines
+     * the uniform layout and serves the other backends. */
+    VIO_FEATURE_HLSL_STAGE_OVERRIDE = 44,
 } vio_feature;
+
+#define VIO_MAX_VIEWPORTS 16
+
+/* vio_bind_render_target() face / layer argument that binds every layer of a
+ * cube or array target at once (VIO_FEATURE_LAYERED_RENDER). */
+#define VIO_RT_ALL_LAYERS (-2)
 
 /* vio_set_shading_rate() rates (GAP-PHASE5 Block 12). 4X4 needs the device's
  * additional-rates capability; the call returns false otherwise. */
@@ -405,6 +447,8 @@ typedef struct _vio_pipeline_desc {
     int              stencil_pass_op;        /* vio_stencil_op: stencil + depth passed */
     int              stencil_fail_op;        /* vio_stencil_op: stencil test failed */
     int              stencil_depth_fail_op;  /* vio_stencil_op: stencil passed, depth failed */
+    int              patch_vertices;         /* control points per patch for
+                                                VIO_PATCHES (1..32; 0 => 3). */
 } vio_pipeline_desc;
 
 typedef struct _vio_buffer_desc {
@@ -477,7 +521,35 @@ typedef struct _vio_shader_desc {
     const void       *fragment_data;
     size_t            fragment_size;
     vio_shader_format format;
+    /* Optional stages (NULL = absent). Same encoding as vertex/fragment
+     * (SPIR-V when format is GLSL/AUTO on the backend path, else source).
+     * tess_control and tess_eval always come as a pair. Backends that report
+     * VIO_FEATURE_GEOMETRY / VIO_FEATURE_TESSELLATION = 0 never see them:
+     * vio_shader() refuses the stage up front. */
+    const void       *geometry_data;
+    size_t            geometry_size;
+    const void       *tess_control_data;
+    size_t            tess_control_size;
+    const void       *tess_eval_data;
+    size_t            tess_eval_size;
+    /* HLSL overrides of the optional stages (NULL = transpile the GLSL stage).
+     * Only backends with VIO_FEATURE_HLSL_STAGE_OVERRIDE read them; the source
+     * outputs D3D clip space (z in [0, w]) - no depth fixup is added. */
+    const char       *geometry_hlsl;
+    const char       *tess_control_hlsl;
+    const char       *tess_eval_hlsl;
 } vio_shader_desc;
+
+/* Shader stage index shared by vio_shader_object's per-stage constant
+ * buffers, the compiler and the bind_stage_constants vtable slot. */
+typedef enum _vio_shader_stage {
+    VIO_STAGE_VERTEX       = 0,
+    VIO_STAGE_FRAGMENT     = 1,
+    VIO_STAGE_GEOMETRY     = 2,
+    VIO_STAGE_TESS_CONTROL = 3,
+    VIO_STAGE_TESS_EVAL    = 4,
+    VIO_STAGE_COUNT        = 5,
+} vio_shader_stage;
 
 typedef struct _vio_draw_cmd {
     void *pipeline;

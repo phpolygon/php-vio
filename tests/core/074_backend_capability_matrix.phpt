@@ -55,6 +55,7 @@ probe("opengl", [
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,
     VIO_FEATURE_MIPMAP_GEN         => 1,
     VIO_FEATURE_MRT                => 1,
+    VIO_FEATURE_RENDER_TARGET_LAYERED => 1,   /* GL_TEXTURE_2D_ARRAY / depth cubemaps (GEOMETRY-STAGES-PLAN 1a) */
     VIO_FEATURE_RAYTRACING         => 0,
     VIO_FEATURE_MULTIVIEW          => 0,
 ]);
@@ -76,6 +77,12 @@ probe("null", [
     VIO_FEATURE_TEXTURE_ARRAY      => 0,
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 0,
     VIO_FEATURE_SHADING_RATE       => 0,
+    VIO_FEATURE_RENDER_TARGET_LAYERED => 0,
+    VIO_FEATURE_LAYERED_RENDER     => 0,   /* device / extension dependent elsewhere: test 137 is the contract */
+    VIO_FEATURE_VERTEX_LAYER       => 0,
+    VIO_FEATURE_MULTI_VIEWPORT     => 0,
+    VIO_FEATURE_GEOMETRY_INSTANCING => 0,
+    VIO_FEATURE_HLSL_STAGE_OVERRIDE => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -100,8 +107,7 @@ function probe_fold(string $backend_name, array $expected): void {
 }
 
 /* Shared by both D3D backends: everything a wired 3D backend must have, plus
- * the honest zeros — no GS/HS/DS stage can be supplied through vio_shader.
- * Cube targets, mip generation and multisampled targets differ per backend
+ * the honest zeros. Cube targets, mip generation and multisampled targets differ per backend
  * (see the per-backend entries below). */
 $d3d_common = [
     VIO_FEATURE_3D_PIPELINE        => 1,
@@ -127,8 +133,12 @@ $d3d_common = [
     VIO_FEATURE_INDIRECT_DRAW      => 1,   /* ExecuteIndirect / Draw*Indirect (GAP-PHASE5 8) */
     VIO_FEATURE_TEXTURE_ARRAY      => 1,   /* Texture2D arrays (GAP-PHASE5 9) */
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1, /* BC1-BC7 (GAP-PHASE5 9) */
-    VIO_FEATURE_TESSELLATION       => 0,
-    VIO_FEATURE_GEOMETRY           => 0,
+    VIO_FEATURE_HLSL_STAGE_OVERRIDE => 1, /* 'hlsl' => [stage => src] (GEOMETRY-STAGES-PLAN 3) */
+    VIO_FEATURE_RENDER_TARGET_LAYERED => 1, /* RTV / DSV per array slice (GEOMETRY-STAGES-PLAN 1a) */
+    /* TESSELLATION / GEOMETRY are not pinned for D3D: the GPU side always has
+     * the stages, but the flag also requires a SPIRV-Cross that can emit HLSL
+     * for them (vio_hlsl_stage_supported - older Vulkan-SDK builds cannot).
+     * tests/render3d/109 + 110 are the contract: flag = 1 => the stage renders. */
     VIO_FEATURE_RAYTRACING         => 0,
     VIO_FEATURE_MULTIVIEW          => 0,
 ];
@@ -146,7 +156,8 @@ probe_fold("d3d12", $d3d_common + [
 /* Vulkan: 3D pipeline since GAP-PHASE5 Block 10 (SPIR-V round trip, frame upload
  * ring, HDR / depth targets); MRT, MSAA and cube targets, cubemaps and mip
  * generation since Block 10b; texture arrays / BC since 10c. SHADING_RATE depends on the
- * device (VK_KHR_fragment_shading_rate) and is exercised by test 122 instead. */
+ * device (VK_KHR_fragment_shading_rate) and is exercised by test 122 instead; the
+ * geometry / tessellation stages likewise (109, 110, 135). */
 probe_fold("vulkan", [
     VIO_FEATURE_3D_PIPELINE        => 1,   /* GAP-PHASE5 10 */
     VIO_FEATURE_STENCIL            => 1,   /* D32S8 / D24S8 attachments */
@@ -161,10 +172,12 @@ probe_fold("vulkan", [
     VIO_FEATURE_MIPMAP_GEN         => 1,
     VIO_FEATURE_TEXTURE_ARRAY      => 1,   /* GAP-PHASE5 10c */
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1,   /* textureCompressionBC (every desktop GPU) */
+    VIO_FEATURE_RENDER_TARGET_LAYERED => 1,   /* framebuffer per array layer (GEOMETRY-STAGES-PLAN 1a) */
     VIO_FEATURE_INSTANCED_DRAW     => 1,
     VIO_FEATURE_DEPTH_BIAS         => 1,
-    VIO_FEATURE_TESSELLATION       => 0,
-    VIO_FEATURE_GEOMETRY           => 0,
+    /* TESSELLATION / GEOMETRY follow the device features geometryShader /
+     * tessellationShader (MoltenVK has no geometry stage) and are therefore not
+     * pinned; tests/render3d/109, 110 and 135 are the contract. */
     VIO_FEATURE_VERTEX_STORAGE     => 1,
     VIO_FEATURE_COMPUTE            => 1,
     VIO_FEATURE_READ_PIXELS        => 1,
@@ -191,6 +204,15 @@ if ($mtl) {
        && vio_supports_feature($mtl, VIO_FEATURE_MIPMAP_GEN) === true
        && vio_supports_feature($mtl, VIO_FEATURE_MRT) === true
        && vio_supports_feature($mtl, VIO_FEATURE_STORAGE_IMAGE) === vio_supports_feature($mtl, VIO_FEATURE_COMPUTE)
+       /* tessellation = vertex + control kernels (needs SPIRV-Cross like compute); no geometry stage */
+       && vio_supports_feature($mtl, VIO_FEATURE_TESSELLATION) === vio_supports_feature($mtl, VIO_FEATURE_COMPUTE)
+       && vio_supports_feature($mtl, VIO_FEATURE_GEOMETRY) === false
+       /* Depth32Float_Stencil8 on swapchain / colour targets; 2DArray + depth cubes */
+       && vio_supports_feature($mtl, VIO_FEATURE_STENCIL) === true
+       && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET_LAYERED) === true
+       /* vertex-stage layer / viewport index travel together (Mac2 / Apple5) */
+       && vio_supports_feature($mtl, VIO_FEATURE_LAYERED_RENDER) === vio_supports_feature($mtl, VIO_FEATURE_VERTEX_LAYER)
+       && vio_supports_feature($mtl, VIO_FEATURE_MULTI_VIEWPORT) === vio_supports_feature($mtl, VIO_FEATURE_VERTEX_LAYER)
        && vio_supports_feature($mtl, VIO_FEATURE_NATIVE_2D_BATCH) === true
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET) === true
        && vio_supports_feature($mtl, VIO_FEATURE_TEXTURE_SWIZZLE) === true;

@@ -18,6 +18,7 @@ typedef struct _vio_cubemap_object {
     void        *d3d11_texture; /* ID3D11Texture2D* (ArraySize=6) */
     void        *d3d11_srv;     /* ID3D11ShaderResourceView* (TEXTURECUBE) */
     void        *d3d11_sampler; /* ID3D11SamplerState* */
+    void        *d3d11_sampler_cmp; /* ID3D11SamplerState* comparison sampler (depth cubes, samplerCubeShadow) */
     void        *d3d12_resource;  /* ID3D12Resource* (DepthOrArraySize=6) */
     uint64_t     d3d12_srv_gpu;   /* D3D12_GPU_DESCRIPTOR_HANDLE.ptr */
     uint64_t     d3d12_srv_cpu;   /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */

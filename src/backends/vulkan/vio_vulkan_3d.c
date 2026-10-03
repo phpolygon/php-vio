@@ -61,8 +61,8 @@ static struct {
     vio_vk3d_pipeline          *pipeline;
     vio_vulkan_texture         *tex[VK3D_MAX_SAMPLERS];
     vio_vulkan_compute_buffer  *storage[VK3D_MAX_STORAGE];
-    VkBuffer                    ubo_buf[2];
-    uint32_t                    ubo_off[2];
+    VkBuffer                    ubo_buf[VK3D_DYN_UBOS];   /* vk3d_dyn_index order: VS, FS, GS, TCS, TES */
+    uint32_t                    ubo_off[VK3D_DYN_UBOS];
     /* descriptor set reuse for consecutive identical draws */
     VkDescriptorSet             last_set;
     vio_vk3d_shader            *last_shader;
@@ -245,6 +245,12 @@ static int vk3d_upload(const void *data, VkDeviceSize data_size, VkDeviceSize to
     }
 }
 
+int vio_vk3d_upload_bytes(const void *data, VkDeviceSize size, VkBuffer *out_buf, VkDeviceSize *out_off)
+{
+    if (!vio_vk.in_frame || size == 0) return -1;
+    return vk3d_upload(data, size, size, vk3d_ubo_align(), out_buf, out_off);
+}
+
 static VkDescriptorSet vk3d_alloc_set(VkDescriptorSetLayout layout)
 {
     vk3d_frame *f = &vk3d.frames[vio_vk.current_frame % VIO_VK_MAX_FRAMES_IN_FLIGHT];
@@ -267,7 +273,7 @@ static VkDescriptorSet vk3d_alloc_set(VkDescriptorSetLayout layout)
             return VK_NULL_HANDLE;
         }
         VkDescriptorPoolSize sizes[4] = {
-            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK3D_SETS_PER_POOL * 2 },
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK3D_SETS_PER_POOL * VK3D_DYN_UBOS },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         VK3D_SETS_PER_POOL * VK3D_MAX_EXTRA_UBO },
             { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK3D_SETS_PER_POOL * VK3D_MAX_SAMPLERS },
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         VK3D_SETS_PER_POOL * VK3D_MAX_STORAGE },
@@ -295,7 +301,7 @@ void vio_vk3d_begin_frame(uint32_t slot)
     f->cur_pool = 0;
     vk3d.last_set = VK_NULL_HANDLE;
     vk3d.last_shader = NULL;
-    vk3d.ubo_buf[0] = vk3d.ubo_buf[1] = VK_NULL_HANDLE;
+    memset(vk3d.ubo_buf, 0, sizeof(vk3d.ubo_buf));
 }
 
 /* ── Dummy resources (unbound samplers / blocks / storage) ─────────── */
@@ -496,19 +502,76 @@ void vio_vk3d_push_cbuffers(const void *vs, int vs_size, const void *fs, int fs_
     }
 }
 
+/* Default uniform block of a geometry / tessellation stage (bind_stage_constants
+ * slot): the shadow copy goes into the frame ring like the VS / FS blocks in
+ * vio_vk3d_push_cbuffers; backend_buffer is not used on this backend. */
+void vio_vk3d_bind_stage_constants(int stage, void *backend_buffer, const void *data, size_t size)
+{
+    (void)backend_buffer;
+    vio_vk3d_pipeline *p = vk3d.pipeline;
+    if (!p || !p->shader || p->shader->dead || !vio_vk.in_frame) return;
+    if (stage < VIO_STAGE_GEOMETRY || stage > VIO_STAGE_TESS_EVAL) return;
+    uint32_t binding = (uint32_t)(VK3D_B_STAGE_UBO0 + (stage - VIO_STAGE_GEOMETRY));
+    for (int i = 0; i < p->shader->binding_count; i++) {
+        const vk3d_binding *b = &p->shader->bindings[i];
+        if (b->binding != binding || b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) continue;
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceSize off = 0;
+        if (vk3d_upload(data, (VkDeviceSize)size, b->size ? b->size : 4, vk3d_ubo_align(), &buf, &off) == 0) {
+            int idx = vk3d_dyn_index(binding);
+            vk3d.ubo_buf[idx] = buf;
+            vk3d.ubo_off[idx] = (uint32_t)off;
+        }
+        return;
+    }
+}
+
+/* Remember the single viewport / scissor a pass or vio_viewport set: the 3D
+ * pipelines carry max_viewports viewports, and vk3d_prepare sets them all. */
+void vio_vk_note_viewport(const VkViewport *vp, const VkRect2D *sc)
+{
+    if (vp) vio_vk.cur_vp[0] = *vp;
+    if (sc) vio_vk.cur_sc[0] = *sc;
+    vio_vk.cur_vp_count = 1;
+}
+
+/* Viewport rect -> scissor clamped to the open pass (zero extent when outside). */
+static VkRect2D vk3d_clamped_scissor(int x, int y, int w, int h)
+{
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w, y1 = y + h;
+    if (x1 > (int)vio_vk.cur_width)  x1 = (int)vio_vk.cur_width;
+    if (y1 > (int)vio_vk.cur_height) y1 = (int)vio_vk.cur_height;
+    VkRect2D sc = { { x0, y0 }, { 0, 0 } };
+    if (x1 > x0 && y1 > y0) { sc.extent.width = (uint32_t)(x1 - x0); sc.extent.height = (uint32_t)(y1 - y0); }
+    return sc;
+}
+
 void vio_vk3d_set_viewport(int x, int y, int w, int h)
 {
     if (!vio_vk.in_frame || !vio_vk.cur_render_pass || w <= 0 || h <= 0) return;
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
     VkViewport vp = { (float)x, (float)y, (float)w, (float)h, 0.0f, 1.0f };
     vkCmdSetViewport(cmd, 0, 1, &vp);
-    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-    int x1 = x + w, y1 = y + h;
-    if (x1 > (int)vio_vk.cur_width)  x1 = (int)vio_vk.cur_width;
-    if (y1 > (int)vio_vk.cur_height) y1 = (int)vio_vk.cur_height;
-    if (x1 <= x0 || y1 <= y0) return;
-    VkRect2D sc = { { x0, y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } };
+    VkRect2D sc = vk3d_clamped_scissor(x, y, w, h);
+    if (sc.extent.width == 0) { vio_vk_note_viewport(&vp, NULL); return; }
     vkCmdSetScissor(cmd, 0, 1, &sc);
+    vio_vk_note_viewport(&vp, &sc);
+}
+
+/* vio_viewports: recorded at the next draw (vk3d_prepare), where every one of
+ * the pipeline's max_viewports viewports must be set. */
+int vio_vk3d_set_viewports(const int *rects, int count)
+{
+    if (!vio_vk.in_frame || !vio_vk.cur_render_pass || count < 1 || (uint32_t)count > vio_vk.max_viewports) return -1;
+    for (int i = 0; i < count; i++) {
+        int x = rects[i * 4], y = rects[i * 4 + 1], w = rects[i * 4 + 2], h = rects[i * 4 + 3];
+        VkViewport vp = { (float)x, (float)y, (float)w, (float)h, 0.0f, 1.0f };
+        vio_vk.cur_vp[i] = vp;
+        vio_vk.cur_sc[i] = vk3d_clamped_scissor(x, y, w, h);
+    }
+    vio_vk.cur_vp_count = (uint32_t)count;
+    return 0;
 }
 
 static VkSampler vk3d_cmp_sampler(vio_vulkan_texture *t)
@@ -535,7 +598,7 @@ static void vk3d_resolve(vio_vk3d_shader *sh, vk3d_res *out)
         vk3d_res *r = &out[i];
         switch (b->type) {
             case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
-                r->buf = vk3d.ubo_buf[b->binding & 1];
+                r->buf = vk3d.ubo_buf[vk3d_dyn_index(b->binding)];
                 r->range = b->size ? b->size : 4;
                 break;
             case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
@@ -630,19 +693,32 @@ static int vk3d_prepare(uint32_t stride, VkBuffer inst_buf, VkDeviceSize inst_of
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
     vio_vk_apply_shading_rate(cmd);
+    if (vio_vk.max_viewports > 1) {
+        /* The pipeline has max_viewports viewports: set every one (unused ones
+         * repeat viewport 0). */
+        VkViewport vps[16];
+        VkRect2D scs[16];
+        uint32_t n = vio_vk.cur_vp_count ? vio_vk.cur_vp_count : 1;
+        for (uint32_t i = 0; i < vio_vk.max_viewports; i++) {
+            vps[i] = vio_vk.cur_vp[i < n ? i : 0];
+            scs[i] = vio_vk.cur_sc[i < n ? i : 0];
+        }
+        vkCmdSetViewport(cmd, 0, vio_vk.max_viewports, vps);
+        vkCmdSetScissor(cmd, 0, vio_vk.max_viewports, scs);
+    }
     if (sh->binding_count > 0) {
-        uint32_t dyn[2];
+        uint32_t dyn[VK3D_DYN_UBOS];
         uint32_t nd = 0;
         for (int i = 0; i < sh->binding_count; i++) {
             const vk3d_binding *b = &sh->bindings[i];
             if (b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) continue;
-            int idx = (int)(b->binding & 1);
+            int idx = vk3d_dyn_index(b->binding);
             if (!vk3d.ubo_buf[idx]) {   /* no vio_set_uniform push for this draw: zeros */
                 VkDeviceSize off = 0;
                 if (vk3d_upload(NULL, 0, b->size ? b->size : 4, vk3d_ubo_align(), &vk3d.ubo_buf[idx], &off) != 0) return -1;
                 vk3d.ubo_off[idx] = (uint32_t)off;
             }
-            if (nd < 2) dyn[nd++] = vk3d.ubo_off[idx];
+            if (nd < VK3D_DYN_UBOS) dyn[nd++] = vk3d.ubo_off[idx];
         }
         VkDescriptorSet set = vk3d_descriptor_set(sh);
         if (!set) return -1;
@@ -659,7 +735,7 @@ static int vk3d_prepare(uint32_t stride, VkBuffer inst_buf, VkDeviceSize inst_of
 
 static void vk3d_after_draw(void)
 {
-    vk3d.ubo_buf[0] = vk3d.ubo_buf[1] = VK_NULL_HANDLE;
+    memset(vk3d.ubo_buf, 0, sizeof(vk3d.ubo_buf));
 }
 
 static int vk3d_bind_mesh(VkCommandBuffer cmd, void *vb_ptr, void *ib_ptr, int index_bytes)

@@ -99,8 +99,10 @@ vio_draw($ctx, $quad);
 vio_end($ctx);
 echo "level-1 face: ", near(px(vio_read_pixels($ctx), 16, 16, $W), [255,255,255]) ? "OK" : "FAIL", "\n";
 
-// Bad arguments are rejected without touching the GPU.
-var_dump(@vio_render_target($ctx, ['cube' => true, 'size' => 8, 'depth_only' => true]) === false);
+// Bad arguments are rejected without touching the GPU. A depth_only cube is
+// valid exactly when the backend has layered targets (test 136 covers it).
+var_dump((@vio_render_target($ctx, ['cube' => true, 'size' => 8, 'depth_only' => true]) === false)
+         === !vio_supports_feature($ctx, VIO_FEATURE_RENDER_TARGET_LAYERED));
 vio_begin($ctx);
 @vio_bind_render_target($ctx, $rt, 6);   // face out of range -> warning, no bind
 vio_end($ctx);

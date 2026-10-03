@@ -16,7 +16,12 @@
  *     upload ring), 2..17 = combined image samplers (regular samplers 0..7,
  *     shadow samplers 8..15 - the D3D12 register scheme), 18..25 = storage
  *     buffers (18 + GLSL binding), 26..29 = further uniform blocks (bound to a
- *     zero buffer; vio has no user UBO binding on this backend).
+ *     zero buffer; vio has no user UBO binding on this backend), 30..32 =
+ *     default uniform blocks of the geometry / tessellation-control /
+ *     tessellation-evaluation stages (dynamic, like 0 and 1).
+ *   - Optional stages: varyings are matched by name along VS -> TCS -> TES ->
+ *     GS -> FS, and the clip-space fixup above moves to the LAST stage that
+ *     writes gl_Position (GS: before every EmitVertex, TES: end of main).
  *   - Vertex input: locations 3..6 are per-instance (binding 1, 64-byte mat4
  *     columns), everything else per-vertex (binding 0) - the D3D input layout.
  */
@@ -37,8 +42,16 @@
 #define VK3D_MAX_STORAGE    8
 #define VK3D_B_EXTRA_UBO0   26
 #define VK3D_MAX_EXTRA_UBO  4
-#define VK3D_MAX_BINDINGS   30
+#define VK3D_B_STAGE_UBO0   30   /* + VIO_EXTRA_STAGE_INDEX(stage): GS 30, TCS 31, TES 32 */
+#define VK3D_MAX_BINDINGS   33
+#define VK3D_DYN_UBOS       5    /* dynamic default blocks: VS, FS, GS, TCS, TES */
 #define VK3D_MAX_VARIANTS   12
+
+/* Slot of a dynamic default-uniform-block binding in the bound-state arrays. */
+static inline int vk3d_dyn_index(uint32_t binding)
+{
+    return binding >= VK3D_B_STAGE_UBO0 ? (int)(binding - VK3D_B_STAGE_UBO0) + 2 : (int)(binding & 1);
+}
 
 typedef struct _vk3d_binding {
     uint32_t           binding;
@@ -51,6 +64,7 @@ typedef struct _vk3d_binding {
 
 typedef struct _vio_vk3d_shader {
     VkShaderModule        vs, fs;
+    VkShaderModule        gs, tcs, tes;   /* optional stages, VK_NULL_HANDLE when absent */
     VkDescriptorSetLayout set_layout;
     VkPipelineLayout      layout;
     vk3d_binding          bindings[VK3D_MAX_BINDINGS];

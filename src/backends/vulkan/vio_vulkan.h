@@ -76,6 +76,7 @@ typedef struct _vio_vulkan_compute_buffer {
 typedef struct _vio_vk_rt {
     int            count;          /* colour attachments (0 = depth-only) */
     int            cube;           /* 6-layer colour image, one framebuffer per (face, level) */
+    int            layers;         /* bindable layers: 6 (cube), N (array, 'layers' => N) or 1 */
     int            levels;         /* mip levels of the colour image */
     int            samples;        /* effective sample count (1 = off) */
     VkFormat       color_format[4];
@@ -91,9 +92,13 @@ typedef struct _vio_vk_rt {
     VkRenderPass   pass;           /* colour (+ resolve) + depth, CLEAR */
     VkRenderPass   pass_nodepth;   /* cube levels > 0 */
     VkFramebuffer  fb;             /* 2D targets */
-    VkFramebuffer *face_fb;        /* cube: [face * levels + level] */
-    VkImageView   *face_view;
-    VkImageView    cube_view;
+    VkFramebuffer *face_fb;        /* cube / array: [layer * levels + level] */
+    VkImageView   *face_view;      /* colour view per (layer, level) */
+    VkImageView   *depth_face_view;/* cube / array: depth view per layer (level 0) */
+    VkImageView    cube_view;      /* colour CUBE view, or the colour 2D_ARRAY view of an array */
+    VkImageView    all_color_view; /* layered bind: colour 2D_ARRAY over every layer, level 0 */
+    VkImageView    all_depth_view; /* layered bind: depth 2D_ARRAY over every layer */
+    VkFramebuffer  all_fb;         /* layered bind: framebuffer with layers = N (VIO_RT_ALL_LAYERS) */
     VkSampler      sampler;
     struct _vio_vulkan_texture *wrap[4];   /* sampling wrappers (vio_render_target_texture) */
     struct _vio_vulkan_texture *cube_wrap; /* vio_render_target_cubemap */
@@ -246,9 +251,19 @@ typedef struct _vio_vulkan_state {
     int                      cur_samples;
     int                      cur_has_depth;
     uint32_t                 cur_width, cur_height;
+    uint32_t                 cur_layers;            /* layers of the open pass's framebuffer (VIO_RT_ALL_LAYERS bind > 1) */
+    /* Viewports of the open pass (vio_viewports). 3D pipelines are built with
+     * max_viewports viewports; vk3d_prepare sets every one before a draw. */
+    uint32_t                 max_viewports;         /* 1, or min(16, maxViewports) with multiViewport */
+    VkViewport               cur_vp[16];
+    VkRect2D                 cur_sc[16];
+    uint32_t                 cur_vp_count;
     int                      depth_has_stencil;    /* depth attachments carry 8 stencil bits */
     int                      multi_draw_indirect;  /* device feature enabled */
     int                      independent_blend;    /* device feature enabled */
+    int                      geometry_supported;   /* geometryShader enabled (vio_shader 'geometry') */
+    int                      tessellation_supported; /* tessellationShader enabled */
+    int                      vertex_layer_supported; /* VK_EXT_shader_viewport_index_layer enabled (gl_Layer in the VS) */
     /* Block 10c: textureCompressionBC, VK_KHR_fragment_shading_rate (pipeline rate). */
     int                      instance_api_11;      /* instance created with apiVersion 1.1 */
     int                      bc_supported;
@@ -437,6 +452,11 @@ void vio_vk_release_texture(vio_vulkan_texture *tex);   /* GPU objects (deferred
 /* ── Render targets, cubemaps, mips (GAP-PHASE5 Block 10b, vio_vulkan_rt.c / vio_vulkan_cube.c) ── */
 VkRenderPass vio_vk_swapchain_resume_pass(void);
 void  vio_vk_resume_swapchain_pass(VkCommandBuffer cmd);
+/* Reopen the pass that was open before (bound render target layer / level, or the
+ * swapchain) with LOAD, after vkCmdEndRenderPass for a compute dispatch or a flush. */
+void  vio_vk_resume_pass(VkCommandBuffer cmd);
+/* Submit the open frame's commands so far, wait, and reopen it (vio_compute_wait). */
+void  vio_vk_flush_frame(void);
 int   vio_vk_bind_render_target_face(void *rt, int face, int level);
 void  vio_vk_clear_attachments(float r, float g, float b, float a);
 int   vio_vk_render_target_cubemap(void *rt, void *cm_obj);
@@ -454,6 +474,8 @@ void  vio_vk_apply_shading_rate(VkCommandBuffer cmd);     /* after binding a 3D 
 /* ── 3D pipeline (GAP-PHASE5 Block 10, vio_vulkan_3d*.c) ── */
 int   vio_vk3d_available(void);
 void  vio_vk3d_begin_frame(uint32_t frame_slot);
+/* Copy bytes into the current frame's upload ring (uniform-buffer aligned). */
+int   vio_vk3d_upload_bytes(const void *data, VkDeviceSize size, VkBuffer *out_buf, VkDeviceSize *out_off);
 void  vio_vk3d_shutdown(void);
 void  vio_vk3d_forget_texture(vio_vulkan_texture *tex);
 void  vio_vk3d_forget_buffer(vio_vulkan_compute_buffer *buf);
@@ -463,6 +485,9 @@ void *vio_vk3d_create_pipeline(vio_pipeline_desc *desc);
 void  vio_vk3d_destroy_pipeline(void *pipeline);
 void  vio_vk3d_bind_pipeline(void *pipeline);
 void  vio_vk3d_push_cbuffers(const void *vs_data, int vs_size, const void *fs_data, int fs_size);
+void  vio_vk3d_bind_stage_constants(int stage, void *backend_buffer, const void *data, size_t size);
+int   vio_vk3d_set_viewports(const int *rects, int count);
+void  vio_vk_note_viewport(const VkViewport *vp, const VkRect2D *sc);
 void  vio_vk3d_bind_texture(void *texture, int slot);
 void  vio_vk3d_set_viewport(int x, int y, int width, int height);
 void  vio_vk3d_draw(vio_draw_cmd *cmd);

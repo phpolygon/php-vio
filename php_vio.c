@@ -1888,6 +1888,99 @@ ZEND_FUNCTION(vio_pixel_ratio)
     RETURN_DOUBLE(1.0);
 }
 
+/* vio_mesh(['adjacency' => true]): turn a triangle list (indices or implicit
+ * 0..n-1) into a VIO_TRIANGLES_ADJACENCY index list - per triangle
+ * a, n(ab), b, n(bc), c, n(ca), where n(xy) is the vertex of the neighbouring
+ * triangle opposite the shared edge. Edges are matched by vertex POSITION (the
+ * first 3 floats), so meshes that duplicate vertices per face for their
+ * normals / UVs still find their neighbours. An open edge repeats the
+ * triangle's own opposite vertex. Returns an emalloc'd list of 2 * tri_index_count
+ * indices, or NULL. */
+typedef struct { float p[3]; unsigned int idx; } vio_adj_vert;
+typedef struct { uint64_t key; unsigned int tri; unsigned int opp; } vio_adj_edge;
+
+static int vio_adj_vert_cmp(const void *a, const void *b)
+{
+    const vio_adj_vert *x = (const vio_adj_vert *)a, *y = (const vio_adj_vert *)b;
+    int c = memcmp(x->p, y->p, sizeof(x->p));
+    return c ? c : (x->idx < y->idx ? -1 : x->idx > y->idx);
+}
+
+static int vio_adj_edge_cmp(const void *a, const void *b)
+{
+    const vio_adj_edge *x = (const vio_adj_edge *)a, *y = (const vio_adj_edge *)b;
+    if (x->key != y->key) return x->key < y->key ? -1 : 1;
+    return x->tri < y->tri ? -1 : x->tri > y->tri;
+}
+
+static unsigned int *vio_mesh_build_adjacency(const float *data, int floats_per_vertex, int vertex_count,
+                                              const unsigned int *indices, int index_count)
+{
+    int n = indices ? index_count : vertex_count;
+    if (n < 3 || n % 3 != 0 || floats_per_vertex < 3) return NULL;
+    int tris = n / 3;
+    /* Canonical id per vertex: the smallest index with the same position. */
+    vio_adj_vert *verts = emalloc(sizeof(vio_adj_vert) * (size_t)vertex_count);
+    unsigned int *canon = emalloc(sizeof(unsigned int) * (size_t)vertex_count);
+    for (int v = 0; v < vertex_count; v++) {
+        memcpy(verts[v].p, data + (size_t)v * floats_per_vertex, sizeof(verts[v].p));
+        verts[v].idx = (unsigned int)v;
+    }
+    qsort(verts, (size_t)vertex_count, sizeof(vio_adj_vert), vio_adj_vert_cmp);
+    for (int v = 0; v < vertex_count; v++) {
+        int same = v > 0 && memcmp(verts[v].p, verts[v - 1].p, sizeof(verts[v].p)) == 0;
+        canon[verts[v].idx] = same ? canon[verts[v - 1].idx] : verts[v].idx;
+    }
+    efree(verts);
+
+    /* One record per (triangle, edge), keyed by the unordered canonical pair. */
+    vio_adj_edge *edges = emalloc(sizeof(vio_adj_edge) * (size_t)n);
+    for (int t = 0; t < tris; t++) {
+        for (int e = 0; e < 3; e++) {
+            unsigned int i0 = indices ? indices[t * 3 + e] : (unsigned int)(t * 3 + e);
+            unsigned int i1 = indices ? indices[t * 3 + (e + 1) % 3] : (unsigned int)(t * 3 + (e + 1) % 3);
+            unsigned int i2 = indices ? indices[t * 3 + (e + 2) % 3] : (unsigned int)(t * 3 + (e + 2) % 3);
+            if (i0 >= (unsigned int)vertex_count || i1 >= (unsigned int)vertex_count || i2 >= (unsigned int)vertex_count) {
+                efree(edges); efree(canon);
+                return NULL;
+            }
+            uint64_t a = canon[i0], b = canon[i1];
+            edges[t * 3 + e].key = a < b ? (a << 32) | b : (b << 32) | a;
+            edges[t * 3 + e].tri = (unsigned int)t;
+            edges[t * 3 + e].opp = i2;
+        }
+    }
+    unsigned int *out = emalloc(sizeof(unsigned int) * (size_t)n * 2);
+    for (int t = 0; t < tris; t++) {
+        for (int e = 0; e < 3; e++) {
+            unsigned int i0 = indices ? indices[t * 3 + e] : (unsigned int)(t * 3 + e);
+            out[t * 6 + e * 2]     = i0;
+            out[t * 6 + e * 2 + 1] = edges[t * 3 + e].opp;   /* open edge: own opposite vertex */
+        }
+    }
+    /* Pair the records of each shared edge: the neighbour's opposite vertex. */
+    qsort(edges, (size_t)n, sizeof(vio_adj_edge), vio_adj_edge_cmp);
+    for (int i = 0; i + 1 < n; i++) {
+        if (edges[i].key != edges[i + 1].key || edges[i].tri == edges[i + 1].tri) continue;
+        for (int k = 0; k < 2; k++) {
+            const vio_adj_edge *self = &edges[i + k], *other = &edges[i + 1 - k];
+            unsigned int t = self->tri;
+            for (int e = 0; e < 3; e++) {
+                /* The slot whose stored opposite vertex is this record's. */
+                if (out[t * 6 + e * 2 + 1] == self->opp &&
+                    (indices ? indices[t * 3 + (e + 2) % 3] : (unsigned int)(t * 3 + (e + 2) % 3)) == self->opp) {
+                    out[t * 6 + e * 2 + 1] = other->opp;
+                    break;
+                }
+            }
+        }
+        i++;   /* a manifold edge has two records; skip the partner */
+    }
+    efree(edges);
+    efree(canon);
+    return out;
+}
+
 ZEND_FUNCTION(vio_mesh)
 {
     zval *ctx_zval;
@@ -2046,6 +2139,20 @@ ZEND_FUNCTION(vio_mesh)
         } ZEND_HASH_FOREACH_END();
     }
 
+    zval *adj_zval = zend_hash_str_find(config_ht, "adjacency", sizeof("adjacency") - 1);
+    if (adj_zval && zend_is_true(adj_zval)) {
+        unsigned int *adj = vio_mesh_build_adjacency(data, floats_per_vertex, vertex_count, indices, index_count);
+        if (!adj) {
+            php_error_docref(NULL, E_WARNING, "vio_mesh: 'adjacency' needs a triangle list (3 indices / vertices per triangle, in range)");
+            efree(data);
+            if (indices) efree(indices);
+            RETURN_FALSE;
+        }
+        index_count = (indices ? index_count : vertex_count) * 2;
+        if (indices) efree(indices);
+        indices = adj;
+    }
+
     /* Index width (GAP-PHASE5 Block 2): 16-bit when every index fits, which
      * halves index bandwidth for the typical mesh; 'index_type' =>
      * VIO_INDEX_UINT32 forces the wide form (e.g. a mesh that is patched later). */
@@ -2165,6 +2272,27 @@ static void vio_pending_textures_clear(vio_context_object *ctx);
  * run for vio_draw, vio_draw_instanced and vio_draw_instanced_from_buffer;
  * the latter used to skip the root-CBV bind, so a vertex shader with any
  * uniform read an unset root descriptor (device removed). */
+/* Geometry / tessellation-control / tessellation-evaluation constant blocks:
+ * upload the shadow copy when dirty, then let the backend bind it for the next
+ * draw (bind_stage_constants slot - NULL on OpenGL, whose uniforms are
+ * program-wide, and on backends without those stages). Runs on every draw
+ * path next to the vertex / fragment cbuffer push. */
+static void vio_push_extra_stage_constants(vio_context_object *ctx, vio_shader_object *sh)
+{
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        vio_shader_stage_cb *cb = sh->stage_cb[i];
+        if (!cb || cb->total_size <= 0) continue;
+        if (cb->dirty && cb->backend && ctx->backend->update_buffer) {
+            ctx->backend->update_buffer(cb->backend, cb->data, cb->total_size, 0);
+            cb->dirty = 0;
+        }
+        if (ctx->backend->bind_stage_constants) {
+            ctx->backend->bind_stage_constants(VIO_STAGE_GEOMETRY + i, cb->backend,
+                                               cb->data, (size_t)cb->total_size);
+        }
+    }
+}
+
 static void vio_push_shader_cbuffers(vio_context_object *ctx)
 {
     /* Flush uniform cbuffers before drawing */
@@ -2187,6 +2315,7 @@ static void vio_push_shader_cbuffers(vio_context_object *ctx)
                 sh->frag_cbuffer_data, sh->frag_cbuffer_total_size, 0);
             sh->frag_cbuffer_dirty = 0;
         }
+        vio_push_extra_stage_constants(ctx, sh);
 
 #ifdef HAVE_D3D11
         if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
@@ -2304,6 +2433,128 @@ static int vio_is_spirv(const char *data, size_t len)
     return magic == 0x07230203;
 }
 
+/* Optional vio_shader() stages beyond vertex + fragment, indexed by
+ * VIO_EXTRA_STAGE_INDEX(stage): geometry, tessellation control, evaluation. */
+static const char *vio_extra_stage_keys[VIO_EXTRA_STAGE_COUNT] = { "geometry", "tess_control", "tess_eval" };
+static const char *vio_extra_stage_labels[VIO_EXTRA_STAGE_COUNT] = { "Geometry", "Tessellation control", "Tessellation evaluation" };
+
+/* GLSL -> SPIR-V for every optional stage present in extra_zv. Returns 0, or
+ * -1 after emitting the warning (the caller drops the half-built object). */
+static int vio_shader_compile_extra_stages(vio_shader_object *shader, zval **extra_zv)
+{
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        if (!extra_zv[i] || shader->stage_spirv[i]) continue;
+        char *error_msg = NULL;
+        shader->stage_spirv[i] = vio_compile_glsl_stage_to_spirv(
+            Z_STRVAL_P(extra_zv[i]), VIO_STAGE_GEOMETRY + i, &shader->stage_spirv_size[i], &error_msg);
+        if (!shader->stage_spirv[i]) {
+            php_error_docref(NULL, E_WARNING, "%s shader compilation failed: %s",
+                vio_extra_stage_labels[i], error_msg ? error_msg : "unknown error");
+            free(error_msg);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Add the sampled images of one optional stage to the shader's sampler map
+ * (names not yet present only). Registers follow the same per-stage replay
+ * scheme as the fragment stage (vio_spirv_to_hlsl: regular 0.., depth 8..). */
+static void vio_shader_merge_stage_samplers(vio_shader_object *shader, const uint32_t *spirv, size_t size)
+{
+    vio_reflect_result r = {0};
+    char *err = NULL;
+    if (vio_spirv_reflect(spirv, size, &r, &err) != 0) {
+        if (err) free(err);
+        return;
+    }
+    int regular_reg = 0, shadow_reg = 8;
+    for (int t = 0; t < r.texture_count; t++) {
+        int is_depth = r.textures[t].is_depth ? 1 : 0;
+        int reg = is_depth ? shadow_reg++ : regular_reg++;
+        int known = 0;
+        for (int s = 0; s < shader->sampler_count; s++) {
+            if (strcmp(shader->sampler_names[s], r.textures[t].name) == 0) { known = 1; break; }
+        }
+        if (known || shader->sampler_count >= VIO_MAX_SAMPLERS) continue;
+        int s = shader->sampler_count++;
+        strncpy(shader->sampler_names[s], r.textures[t].name, sizeof(shader->sampler_names[s]) - 1);
+        shader->sampler_names[s][sizeof(shader->sampler_names[s]) - 1] = '\0';
+        shader->sampler_is_depth[s] = is_depth;
+        shader->sampler_hlsl_reg[s] = reg;
+    }
+    vio_reflect_free(&r);
+}
+
+/* vio_shader_reflect: one stage's resources as ['inputs','ubos','textures',
+ * 'uniforms','storage_buffers'] under `key` (optional stages; the vertex and
+ * fragment blocks below predate this helper and emit the same shape). */
+static void vio_shader_reflect_stage_add(zval *return_value, const char *key, const char *label,
+                                         const uint32_t *spirv, size_t size)
+{
+    vio_reflect_result result;
+    char *error_msg = NULL;
+    if (vio_spirv_reflect(spirv, size, &result, &error_msg) != 0) {
+        php_error_docref(NULL, E_NOTICE, "%s reflection failed: %s", label,
+            error_msg ? error_msg : "unknown error");
+        free(error_msg);
+        return;
+    }
+    zval stage_arr, inputs_arr, ubos_arr, tex_arr, uni_arr, ssbo_arr;
+    array_init(&stage_arr);
+    array_init(&inputs_arr);
+    for (int i = 0; i < result.input_count; i++) {
+        zval item;
+        array_init(&item);
+        add_assoc_string(&item, "name", (char *)result.inputs[i].name);
+        add_assoc_long(&item, "location", result.inputs[i].location);
+        add_assoc_long(&item, "binding", result.inputs[i].binding);
+        add_next_index_zval(&inputs_arr, &item);
+    }
+    add_assoc_zval(&stage_arr, "inputs", &inputs_arr);
+    array_init(&ubos_arr);
+    for (int i = 0; i < result.ubo_count; i++) {
+        zval item;
+        array_init(&item);
+        add_assoc_string(&item, "name", (char *)result.ubos[i].name);
+        add_assoc_long(&item, "set", result.ubos[i].set);
+        add_assoc_long(&item, "binding", result.ubos[i].binding);
+        add_next_index_zval(&ubos_arr, &item);
+    }
+    add_assoc_zval(&stage_arr, "ubos", &ubos_arr);
+    array_init(&tex_arr);
+    for (int i = 0; i < result.texture_count; i++) {
+        zval item;
+        array_init(&item);
+        add_assoc_string(&item, "name", (char *)result.textures[i].name);
+        add_assoc_long(&item, "set", result.textures[i].set);
+        add_assoc_long(&item, "binding", result.textures[i].binding);
+        add_next_index_zval(&tex_arr, &item);
+    }
+    add_assoc_zval(&stage_arr, "textures", &tex_arr);
+    array_init(&uni_arr);
+    for (int i = 0; i < result.uniform_count; i++) {
+        zval item;
+        array_init(&item);
+        add_assoc_string(&item, "name", (char *)result.uniforms[i].name);
+        add_assoc_long(&item, "binding", result.uniforms[i].binding);
+        add_next_index_zval(&uni_arr, &item);
+    }
+    add_assoc_zval(&stage_arr, "uniforms", &uni_arr);
+    array_init(&ssbo_arr);
+    for (int i = 0; i < result.storage_buffer_count; i++) {
+        zval item;
+        array_init(&item);
+        add_assoc_string(&item, "name", (char *)result.storage_buffers[i].name);
+        add_assoc_long(&item, "set", result.storage_buffers[i].set);
+        add_assoc_long(&item, "binding", result.storage_buffers[i].binding);
+        add_next_index_zval(&ssbo_arr, &item);
+    }
+    add_assoc_zval(&stage_arr, "storage_buffers", &ssbo_arr);
+    add_assoc_zval(return_value, key, &stage_arr);
+    vio_reflect_free(&result);
+}
+
 ZEND_FUNCTION(vio_shader)
 {
     zval *ctx_zval;
@@ -2335,6 +2586,72 @@ ZEND_FUNCTION(vio_shader)
         RETURN_FALSE;
     }
 
+    /* Optional stages: 'geometry', 'tess_control' + 'tess_eval' (always a
+     * pair). Indexed by VIO_EXTRA_STAGE_INDEX(stage). Refused up front on a
+     * backend whose feature flag is 0 (Metal, Vulkan, null, GL < 3.2 / 4.0),
+     * so no backend ever sees a stage it cannot compile. */
+    zval *extra_zv[VIO_EXTRA_STAGE_COUNT] = { NULL, NULL, NULL };
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        zval *z = zend_hash_str_find(config_ht, vio_extra_stage_keys[i], strlen(vio_extra_stage_keys[i]));
+        if (!z) continue;
+        if (Z_TYPE_P(z) != IS_STRING || Z_STRLEN_P(z) == 0) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: '%s' must be a non-empty string", vio_extra_stage_keys[i]);
+            RETURN_FALSE;
+        }
+        extra_zv[i] = z;
+    }
+    int want_geometry = extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)] != NULL;
+    int want_tess     = extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)] != NULL
+                     || extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)] != NULL;
+    if (want_tess && (!extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]
+                   || !extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)])) {
+        php_error_docref(NULL, E_WARNING, "vio_shader: 'tess_control' and 'tess_eval' must be given together");
+        RETURN_FALSE;
+    }
+    /* 'hlsl' => [stage => source]: per-stage HLSL that backends with
+     * VIO_FEATURE_HLSL_STAGE_OVERRIDE compile instead of the transpiled GLSL
+     * (D3D tessellation, [instance(N)]). The GLSL stage stays required. */
+    zval *hlsl_zv[VIO_EXTRA_STAGE_COUNT] = { NULL, NULL, NULL };
+    zval *hlsl_cfg = zend_hash_str_find(config_ht, "hlsl", sizeof("hlsl") - 1);
+    if (hlsl_cfg) {
+        if (Z_TYPE_P(hlsl_cfg) != IS_ARRAY) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: 'hlsl' must be an array of stage => HLSL source");
+            RETURN_FALSE;
+        }
+        zend_string *hk;
+        zval *hv;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(hlsl_cfg), hk, hv) {
+            int idx = -1;
+            for (int i = 0; hk && i < VIO_EXTRA_STAGE_COUNT; i++) {
+                if (strcmp(ZSTR_VAL(hk), vio_extra_stage_keys[i]) == 0) idx = i;
+            }
+            if (idx < 0 || Z_TYPE_P(hv) != IS_STRING || Z_STRLEN_P(hv) == 0) {
+                php_error_docref(NULL, E_WARNING, "vio_shader: 'hlsl' takes 'geometry', 'tess_control' and 'tess_eval' => non-empty HLSL source");
+                RETURN_FALSE;
+            }
+            if (!extra_zv[idx]) {
+                php_error_docref(NULL, E_WARNING, "vio_shader: the HLSL override for '%s' needs the GLSL '%s' stage as well",
+                                 vio_extra_stage_keys[idx], vio_extra_stage_keys[idx]);
+                RETURN_FALSE;
+            }
+            hlsl_zv[idx] = hv;
+        } ZEND_HASH_FOREACH_END();
+    }
+    int hlsl_override = ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_HLSL_STAGE_OVERRIDE);
+    int gs_hlsl   = hlsl_override && hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)];
+    int tess_hlsl = hlsl_override && hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]
+                                  && hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
+    if (want_geometry && !gs_hlsl && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_GEOMETRY))) {
+        php_error_docref(NULL, E_WARNING, "vio_shader: backend '%s' has no geometry stage (VIO_FEATURE_GEOMETRY = 0)",
+                         ctx->backend->name);
+        RETURN_FALSE;
+    }
+    if (want_tess && !tess_hlsl && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_TESSELLATION))) {
+        php_error_docref(NULL, E_WARNING, "vio_shader: backend '%s' has no tessellation stages (VIO_FEATURE_TESSELLATION = 0)%s",
+                         ctx->backend->name, hlsl_override ? "; pass 'hlsl' => ['tess_control' => ..., 'tess_eval' => ...]" : "");
+        RETURN_FALSE;
+    }
+
     /* Get optional format (auto-detect if VIO_SHADER_AUTO) */
     vio_shader_format format = VIO_SHADER_AUTO;
     zval *fmt_zval = zend_hash_str_find(config_ht, "format", sizeof("format") - 1);
@@ -2359,9 +2676,13 @@ ZEND_FUNCTION(vio_shader)
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized &&
         (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW)) {
         int runtime_glsl = vio_opengl_get_glsl_version();
-        const char *sources[2] = { Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval) };
-        const char *stages[2]  = { "vertex", "fragment" };
-        for (int s = 0; s < 2; s++) {
+        const char *sources[VIO_STAGE_COUNT] = { Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval), NULL, NULL, NULL };
+        const char *stages[VIO_STAGE_COUNT]  = { "vertex", "fragment", "geometry", "tess_control", "tess_eval" };
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            if (extra_zv[i]) sources[VIO_STAGE_GEOMETRY + i] = Z_STRVAL_P(extra_zv[i]);
+        }
+        for (int s = 0; s < VIO_STAGE_COUNT; s++) {
+            if (!sources[s]) continue;
             /* Skip whitespace, look for #version */
             const char *p = sources[s];
             while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
@@ -2391,6 +2712,8 @@ ZEND_FUNCTION(vio_shader)
     vio_shader_object *shader = Z_VIO_SHADER_P(&shader_zval);
     shader->format  = format;
     shader->backend = ctx->backend;
+    shader->has_geometry     = want_geometry;
+    shader->has_tessellation = want_tess;
 
     /* --- SPIR-V input: store directly --- */
     if (format == VIO_SHADER_SPIRV) {
@@ -2401,6 +2724,13 @@ ZEND_FUNCTION(vio_shader)
         shader->frag_spirv_size = Z_STRLEN_P(frag_zval);
         shader->frag_spirv = malloc(shader->frag_spirv_size);
         memcpy(shader->frag_spirv, Z_STRVAL_P(frag_zval), shader->frag_spirv_size);
+
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            if (!extra_zv[i]) continue;
+            shader->stage_spirv_size[i] = Z_STRLEN_P(extra_zv[i]);
+            shader->stage_spirv[i] = malloc(shader->stage_spirv_size[i]);
+            memcpy(shader->stage_spirv[i], Z_STRVAL_P(extra_zv[i]), shader->stage_spirv_size[i]);
+        }
     }
     /* --- GLSL input: compile to SPIR-V via glslang (skip for raw) --- */
     else if (format == VIO_SHADER_GLSL) {
@@ -2425,6 +2755,11 @@ ZEND_FUNCTION(vio_shader)
             zval_ptr_dtor(&shader_zval);
             RETURN_FALSE;
         }
+
+        if (vio_shader_compile_extra_stages(shader, extra_zv) != 0) {
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
     }
 
     /* --- For OpenGL backend --- */
@@ -2432,8 +2767,11 @@ ZEND_FUNCTION(vio_shader)
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
         if (format == VIO_SHADER_GLSL_RAW) {
             /* Raw GLSL: compile directly, no SPIR-V round-trip */
-            shader->program = vio_opengl_compile_shader_source(
-                Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval));
+            shader->program = vio_opengl_compile_program(
+                Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval),
+                extra_zv[0] ? Z_STRVAL_P(extra_zv[0]) : NULL,
+                extra_zv[1] ? Z_STRVAL_P(extra_zv[1]) : NULL,
+                extra_zv[2] ? Z_STRVAL_P(extra_zv[2]) : NULL);
             shader->gl_generation = vio_opengl_context_generation();
             if (!shader->program) {
                 php_error_docref(NULL, E_WARNING, "OpenGL shader compilation failed (raw GLSL)");
@@ -2445,30 +2783,32 @@ ZEND_FUNCTION(vio_shader)
              * (e.g. 330 on HD 3000, 410 on macOS, 460 on modern Linux). */
             int glsl_version = vio_opengl_get_glsl_version();
             char *error_msg = NULL;
+            char *glsl[VIO_STAGE_COUNT] = { NULL, NULL, NULL, NULL, NULL };
+            const uint32_t *spv[VIO_STAGE_COUNT] = {
+                shader->vert_spirv, shader->frag_spirv,
+                shader->stage_spirv[0], shader->stage_spirv[1], shader->stage_spirv[2] };
+            const size_t spv_size[VIO_STAGE_COUNT] = {
+                shader->vert_spirv_size, shader->frag_spirv_size,
+                shader->stage_spirv_size[0], shader->stage_spirv_size[1], shader->stage_spirv_size[2] };
+            static const char *stage_labels[VIO_STAGE_COUNT] = {
+                "Vertex", "Fragment", "Geometry", "Tessellation control", "Tessellation evaluation" };
 
-            char *vert_glsl = vio_spirv_to_glsl(shader->vert_spirv, shader->vert_spirv_size, glsl_version, &error_msg);
-            if (!vert_glsl) {
-                php_error_docref(NULL, E_WARNING, "Vertex SPIR-V to GLSL transpilation failed: %s",
-                    error_msg ? error_msg : "unknown error");
-                free(error_msg);
-                zval_ptr_dtor(&shader_zval);
-                RETURN_FALSE;
+            for (int s = 0; s < VIO_STAGE_COUNT; s++) {
+                if (!spv[s]) continue;
+                glsl[s] = vio_spirv_to_glsl(spv[s], spv_size[s], glsl_version, &error_msg);
+                if (!glsl[s]) {
+                    php_error_docref(NULL, E_WARNING, "%s SPIR-V to GLSL transpilation failed: %s",
+                        stage_labels[s], error_msg ? error_msg : "unknown error");
+                    free(error_msg);
+                    for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);
+                    zval_ptr_dtor(&shader_zval);
+                    RETURN_FALSE;
+                }
             }
 
-            char *frag_glsl = vio_spirv_to_glsl(shader->frag_spirv, shader->frag_spirv_size, glsl_version, &error_msg);
-            if (!frag_glsl) {
-                php_error_docref(NULL, E_WARNING, "Fragment SPIR-V to GLSL transpilation failed: %s",
-                    error_msg ? error_msg : "unknown error");
-                free(error_msg);
-                free(vert_glsl);
-                zval_ptr_dtor(&shader_zval);
-                RETURN_FALSE;
-            }
-
-            shader->program = vio_opengl_compile_shader_source(vert_glsl, frag_glsl);
+            shader->program = vio_opengl_compile_program(glsl[0], glsl[1], glsl[2], glsl[3], glsl[4]);
             shader->gl_generation = vio_opengl_context_generation();
-            free(vert_glsl);
-            free(frag_glsl);
+            for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);
 
             if (!shader->program) {
                 zval_ptr_dtor(&shader_zval);
@@ -2500,6 +2840,11 @@ ZEND_FUNCTION(vio_shader)
                 zval_ptr_dtor(&shader_zval);
                 RETURN_FALSE;
             }
+
+            if (vio_shader_compile_extra_stages(shader, extra_zv) != 0) {
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
         }
 
         /* Pass SPIR-V data to backend (it will transpile to HLSL/MSL as needed) */
@@ -2509,12 +2854,40 @@ ZEND_FUNCTION(vio_shader)
         desc.vertex_size = shader->vert_spirv_size;
         desc.fragment_data = shader->frag_spirv;
         desc.fragment_size = shader->frag_spirv_size;
+        desc.geometry_data     = shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)];
+        desc.geometry_size     = shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)];
+        desc.tess_control_data = shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)];
+        desc.tess_control_size = shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)];
+        desc.tess_eval_data    = shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
+        desc.tess_eval_size    = shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
+        desc.geometry_hlsl     = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)]) : NULL;
+        desc.tess_control_hlsl = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]) : NULL;
+        desc.tess_eval_hlsl    = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)]) : NULL;
 
         shader->backend_shader = ctx->backend->compile_shader(&desc);
         if (!shader->backend_shader) {
             php_error_docref(NULL, E_WARNING, "Backend shader compilation failed");
             zval_ptr_dtor(&shader_zval);
             RETURN_FALSE;
+        }
+
+        /* Constant blocks of the optional stages (their own b0 on D3D). */
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            if (!shader->stage_spirv[i]) continue;
+            vio_shader_stage_cb *cb = calloc(1, sizeof(*cb));
+            if (!cb) continue;
+            cb->uniform_count = vio_spirv_get_uniform_offsets(
+                shader->stage_spirv[i], shader->stage_spirv_size[i],
+                cb->uniforms, VIO_MAX_UNIFORMS, &cb->total_size);
+            if (cb->total_size > 0 && ctx->backend->create_buffer) {
+                vio_buffer_desc cb_desc = {0};
+                cb_desc.type = VIO_BUFFER_UNIFORM;
+                cb_desc.data = NULL;
+                cb_desc.size = cb->total_size;
+                cb_desc.binding = 0;
+                cb->backend = ctx->backend->create_buffer(&cb_desc);
+            }
+            shader->stage_cb[i] = cb;
         }
 
         /* Extract uniform offsets from SPIRV for constant buffer mapping */
@@ -2584,6 +2957,18 @@ ZEND_FUNCTION(vio_shader)
                 if (err) free(err);
                 /* Init remap table to identity (no remapping) */
                 for (int s = 0; s < 16; s++) shader->gl_to_hlsl_sampler[s] = -1;
+            }
+        }
+
+        /* Samplers that only a geometry / tessellation stage declares (a
+         * displacement map read in the domain shader) join the map so
+         * vio_set_uniform('u_height', unit) + vio_bind_texture route them.
+         * Registers are replayed per stage; a name already mapped by the
+         * fragment stage keeps that register (the backends mirror the PS
+         * binding into the extra stages at the same register). */
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            if (shader->stage_spirv[i]) {
+                vio_shader_merge_stage_samplers(shader, shader->stage_spirv[i], shader->stage_spirv_size[i]);
             }
         }
     }
@@ -2777,6 +3162,13 @@ ZEND_FUNCTION(vio_shader_reflect)
             free(error_msg);
         }
     }
+
+    /* Optional stages under their vio_shader() config keys. */
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        if (!shader->stage_spirv[i]) continue;
+        vio_shader_reflect_stage_add(return_value, vio_extra_stage_keys[i], vio_extra_stage_labels[i],
+                                     shader->stage_spirv[i], shader->stage_spirv_size[i]);
+    }
 }
 
 ZEND_FUNCTION(vio_pipeline)
@@ -2821,6 +3213,34 @@ ZEND_FUNCTION(vio_pipeline)
     zval *val;
     if ((val = zend_hash_str_find(config_ht, "topology", sizeof("topology") - 1)) != NULL) {
         pipe->topology = (vio_topology)zval_get_long(val);
+    }
+    /* patch_vertices: control points per patch for VIO_PATCHES (1..32, default
+     * 3). A shader with tessellation stages draws patches regardless of
+     * 'topology' - the backends force it. */
+    if ((val = zend_hash_str_find(config_ht, "patch_vertices", sizeof("patch_vertices") - 1)) != NULL) {
+        zend_long pv = zval_get_long(val);
+        if (pv < 1 || pv > 32) {
+            php_error_docref(NULL, E_WARNING, "vio_pipeline: 'patch_vertices' must be 1..32");
+            zval_ptr_dtor(&pipe_zval);
+            RETURN_FALSE;
+        }
+        pipe->patch_vertices = (int)pv;
+    }
+    if (shader->has_tessellation && pipe->topology != VIO_PATCHES) {
+        pipe->topology = VIO_PATCHES;
+    }
+    /* Patches without a tessellation stage are invalid on every API (GL
+     * INVALID_OPERATION, Vulkan / D3D12 reject the pipeline); refuse up front. */
+    if (pipe->topology >= VIO_LINES_ADJACENCY && pipe->topology <= VIO_TRIANGLE_STRIP_ADJACENCY && !shader->has_geometry) {
+        /* The neighbour vertices only reach a geometry stage. */
+        php_error_docref(NULL, E_WARNING, "vio_pipeline: adjacency topologies need a shader with a 'geometry' stage");
+        zval_ptr_dtor(&pipe_zval);
+        RETURN_FALSE;
+    }
+    if (pipe->topology == VIO_PATCHES && !shader->has_tessellation) {
+        php_error_docref(NULL, E_WARNING, "vio_pipeline: VIO_PATCHES needs a shader with 'tess_control' and 'tess_eval' stages");
+        zval_ptr_dtor(&pipe_zval);
+        RETURN_FALSE;
     }
     if ((val = zend_hash_str_find(config_ht, "cull_mode", sizeof("cull_mode") - 1)) != NULL) {
         pipe->cull_mode = (vio_cull_mode)zval_get_long(val);
@@ -3025,6 +3445,7 @@ ZEND_FUNCTION(vio_pipeline)
         desc.stencil_pass_op = pipe->stencil_pass_op;
         desc.stencil_fail_op = pipe->stencil_fail_op;
         desc.stencil_depth_fail_op = pipe->stencil_depth_fail_op;
+        desc.patch_vertices = pipe->patch_vertices;
 
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
     }
@@ -4435,7 +4856,8 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
         zend_hash_init(sh->uniform_lookup,
                        sh->uniform_count + sh->frag_uniform_count + 1, NULL, NULL, 0);
         /* Vertex first so it wins on a name collision (add-if-absent), matching
-         * the original vertex-before-fragment scan order. */
+         * the original vertex-before-fragment scan order; the optional stages
+         * follow. Bits 40..43 carry the vio_shader_stage. */
         for (int u = 0; u < sh->uniform_count; u++) {
             zend_long enc = (1LL << 48)
                 | ((zend_long)(sh->uniforms[u].offset & 0xFFFF) << 16)
@@ -4444,11 +4866,22 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
                                   strlen(sh->uniforms[u].name), (void *)(intptr_t)enc);
         }
         for (int u = 0; u < sh->frag_uniform_count; u++) {
-            zend_long enc = (1LL << 48) | (1LL << 40)
+            zend_long enc = (1LL << 48) | ((zend_long)VIO_STAGE_FRAGMENT << 40)
                 | ((zend_long)(sh->frag_uniforms[u].offset & 0xFFFF) << 16)
                 | (zend_long)(sh->frag_uniforms[u].size & 0xFFFF);
             zend_hash_str_add_ptr(sh->uniform_lookup, sh->frag_uniforms[u].name,
                                   strlen(sh->frag_uniforms[u].name), (void *)(intptr_t)enc);
+        }
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            vio_shader_stage_cb *cb = sh->stage_cb[i];
+            if (!cb) continue;
+            for (int u = 0; u < cb->uniform_count; u++) {
+                zend_long enc = (1LL << 48) | ((zend_long)(VIO_STAGE_GEOMETRY + i) << 40)
+                    | ((zend_long)(cb->uniforms[u].offset & 0xFFFF) << 16)
+                    | (zend_long)(cb->uniforms[u].size & 0xFFFF);
+                zend_hash_str_add_ptr(sh->uniform_lookup, cb->uniforms[u].name,
+                                      strlen(cb->uniforms[u].name), (void *)(intptr_t)enc);
+            }
         }
     }
     void *p = zend_hash_str_find_ptr(sh->uniform_lookup, name, strlen(name));
@@ -4533,15 +4966,18 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
          * replacing the former linear strcmp scan over both uniform arrays. */
         unsigned char *dst = NULL;
         int max_size = 0;
-        int is_frag = 0;
+        int stage = VIO_STAGE_VERTEX;
 
         zend_long enc = vio_uniform_lookup(sh, name);
         if (enc) {
-            is_frag = (int)((enc >> 40) & 0x1);
+            stage = (int)((enc >> 40) & 0xF);
             int offset = (int)((enc >> 16) & 0xFFFF);
             max_size = (int)(enc & 0xFFFF);
             if (offset >= 0 && offset + max_size <= VIO_CBUFFER_SIZE) {
-                dst = (is_frag ? sh->frag_cbuffer_data : sh->cbuffer_data) + offset;
+                if (stage == VIO_STAGE_VERTEX)        dst = sh->cbuffer_data + offset;
+                else if (stage == VIO_STAGE_FRAGMENT) dst = sh->frag_cbuffer_data + offset;
+                else if (sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)])
+                    dst = sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]->data + offset;
             }
         }
 
@@ -4589,10 +5025,12 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
                 }
             }
 
-            if (is_frag) {
+            if (stage == VIO_STAGE_VERTEX) {
+                sh->cbuffer_dirty = 1;
+            } else if (stage == VIO_STAGE_FRAGMENT) {
                 sh->frag_cbuffer_dirty = 1;
             } else {
-                sh->cbuffer_dirty = 1;
+                sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]->dirty = 1;
             }
         }
     }
@@ -4701,11 +5139,13 @@ ZEND_FUNCTION(vio_submit_batch)
         return;
     }
 
-    /* Last backend pipeline bound BY this batch, so a sorted batch re-binds the
+    /* Last pipeline object bound BY this batch, so a sorted batch re-binds the
      * PSO only on a real change. NULL = none bound here yet (the caller may have
      * bound one before the batch — the opaque pass binds once, then its records
-     * omit 'pipeline' entirely). */
-    void *last_pipeline = NULL;
+     * omit 'pipeline' entirely). Keyed on the VioPipeline, not on
+     * backend_pipeline: OpenGL has no backend pipeline (NULL), so comparing
+     * that never bound a record's pipeline there. */
+    vio_pipeline_object *last_pipeline = NULL;
 
     zval *rec;
     ZEND_HASH_FOREACH_VAL(draws, rec) {
@@ -4722,7 +5162,7 @@ ZEND_FUNCTION(vio_submit_batch)
         if (pz && Z_TYPE_P(pz) == IS_OBJECT &&
             instanceof_function(Z_OBJCE_P(pz), vio_pipeline_ce)) {
             vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pz);
-            if (pipe->valid && pipe->backend_pipeline != last_pipeline) {
+            if (pipe->valid && pipe != last_pipeline) {
                 ctx->bound_shader_program = pipe->shader_program;
                 ctx->bound_shader_object = pipe->shader_ref;
                 if (ctx->backend->bind_pipeline_state) {
@@ -4730,7 +5170,7 @@ ZEND_FUNCTION(vio_submit_batch)
                 } else if (pipe->backend_pipeline && ctx->backend->bind_pipeline) {
                     ctx->backend->bind_pipeline(pipe->backend_pipeline);
                 }
-                last_pipeline = pipe->backend_pipeline;
+                last_pipeline = pipe;
             }
         }
 
@@ -7850,6 +8290,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_LINES", VIO_LINES, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP", VIO_LINE_STRIP, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_POINTS", VIO_POINTS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_PATCHES", VIO_PATCHES, CONST_CS | CONST_PERSISTENT);
 
     /* Cull mode */
     REGISTER_LONG_CONSTANT("VIO_CULL_NONE", VIO_CULL_NONE, CONST_CS | CONST_PERSISTENT);
@@ -7988,6 +8429,18 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_ARRAY", VIO_FEATURE_TEXTURE_ARRAY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_COMPRESSION_BC", VIO_FEATURE_TEXTURE_COMPRESSION_BC, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE", VIO_FEATURE_SHADING_RATE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_LAYERED", VIO_FEATURE_RENDER_TARGET_LAYERED, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_LAYERED_RENDER", VIO_FEATURE_LAYERED_RENDER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_LAYER", VIO_FEATURE_VERTEX_LAYER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_RT_ALL_LAYERS", VIO_RT_ALL_LAYERS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_VIEWPORT", VIO_FEATURE_MULTI_VIEWPORT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_MAX_VIEWPORTS", VIO_MAX_VIEWPORTS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_GEOMETRY_INSTANCING", VIO_FEATURE_GEOMETRY_INSTANCING, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_HLSL_STAGE_OVERRIDE", VIO_FEATURE_HLSL_STAGE_OVERRIDE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_TRIANGLE_STRIP_ADJACENCY", VIO_TRIANGLE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X1", VIO_SHADING_RATE_1X1, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_1X2", VIO_SHADING_RATE_1X2, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_SHADING_RATE_2X1", VIO_SHADING_RATE_2X1, CONST_CS | CONST_PERSISTENT);
@@ -8663,6 +9116,65 @@ ZEND_FUNCTION(vio_viewport)
     }
 }
 
+/* Several viewports at once: [[x, y, w, h], ...] (1..VIO_MAX_VIEWPORTS), same
+ * coordinate convention as vio_viewport. gl_ViewportIndex picks one per
+ * primitive; primitives that do not write it use viewport 0. vio_viewport()
+ * returns to a single viewport. */
+ZEND_FUNCTION(vio_viewports)
+{
+    zval *ctx_zval;
+    HashTable *list;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(list)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        RETURN_FALSE;
+    }
+    int rects[VIO_MAX_VIEWPORTS * 4];
+    int count = 0;
+    zval *entry;
+    ZEND_HASH_FOREACH_VAL(list, entry) {
+        if (count >= VIO_MAX_VIEWPORTS) {
+            php_error_docref(NULL, E_WARNING, "vio_viewports: at most %d viewports", VIO_MAX_VIEWPORTS);
+            RETURN_FALSE;
+        }
+        if (Z_TYPE_P(entry) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(entry)) != 4) {
+            php_error_docref(NULL, E_WARNING, "vio_viewports: viewport %d must be [x, y, width, height]", count);
+            RETURN_FALSE;
+        }
+        int k = 0;
+        zval *v;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(entry), v) {
+            rects[count * 4 + k++] = (int)zval_get_long(v);
+        } ZEND_HASH_FOREACH_END();
+        if (rects[count * 4 + 2] <= 0 || rects[count * 4 + 3] <= 0) {
+            php_error_docref(NULL, E_WARNING, "vio_viewports: viewport %d has no area", count);
+            RETURN_FALSE;
+        }
+        count++;
+    } ZEND_HASH_FOREACH_END();
+    if (count == 0) {
+        php_error_docref(NULL, E_WARNING, "vio_viewports: at least one viewport is required");
+        RETURN_FALSE;
+    }
+    if (count == 1) {
+        if (ctx->backend->set_viewport) ctx->backend->set_viewport(rects[0], rects[1], rects[2], rects[3]);
+        RETURN_TRUE;
+    }
+    if (!ctx->backend->set_viewports || !ctx->backend->supports_feature ||
+        !ctx->backend->supports_feature(VIO_FEATURE_MULTI_VIEWPORT)) {
+        php_error_docref(NULL, E_WARNING, "vio_viewports: multiple viewports are not supported on backend '%s'",
+                         ctx->backend->name);
+        RETURN_FALSE;
+    }
+    RETURN_BOOL(ctx->backend->set_viewports(rects, count) == 0);
+}
+
 ZEND_FUNCTION(vio_draw_3d)
 {
     zval *ctx_zval;
@@ -8839,6 +9351,7 @@ ZEND_FUNCTION(vio_draw_instanced)
                         ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size, 0);
                         sh->frag_cbuffer_dirty = 0;
                     }
+                    vio_push_extra_stage_constants(ctx, sh);
                     if (sh->cbuffer_backend) {
                         vio_d3d11_buffer *cb = (vio_d3d11_buffer *)sh->cbuffer_backend;
                         ID3D11DeviceContext_VSSetConstantBuffers(vio_d3d11.context, 0, 1, &cb->buffer);
@@ -8912,6 +9425,7 @@ ZEND_FUNCTION(vio_draw_instanced)
                     ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size, 0);
                     sh->frag_cbuffer_dirty = 0;
                 }
+                vio_push_extra_stage_constants(ctx, sh);
                 /* Allocate per-draw cbuffer slices from linear allocator.
                  * Bound against THIS frame's slice end (cbuffer_frame_end), not
                  * heap capacity — spilling past the slice would clobber the
@@ -9111,15 +9625,17 @@ ZEND_FUNCTION(vio_render_target)
             php_error_docref(NULL, E_WARNING, "vio_render_target: cube 'size' must be >= 1");
             RETURN_FALSE;
         }
-        if (depth_only) {
-            php_error_docref(NULL, E_WARNING, "vio_render_target: cube targets cannot be depth_only");
+        if (depth_only && (!ctx->backend->supports_feature ||
+                           !ctx->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_LAYERED))) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_render_target: depth_only cube targets are not supported on backend '%s'", ctx->backend->name);
             RETURN_FALSE;
         }
         if (attachment_count > 1) {
             php_error_docref(NULL, E_WARNING, "vio_render_target: cube targets support a single attachment");
             RETURN_FALSE;
         }
-        if ((val = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1)) != NULL && zend_is_true(val)) {
+        if (!depth_only && (val = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1)) != NULL && zend_is_true(val)) {
             mip_levels = 1;
             for (int d = width; d > 1; d >>= 1) mip_levels++;
         }
@@ -9133,6 +9649,38 @@ ZEND_FUNCTION(vio_render_target)
         }
     }
 
+    /* Array render target: 'layers' => N (2..64) - colour or depth_only, every
+     * layer with its own depth. One layer is bound at a time
+     * (vio_bind_render_target($ctx, $rt, $layer)); vio_render_target_texture()
+     * hands the whole array out for sampler2DArray sampling. Single attachment,
+     * single-sampled, no mip chain. */
+    int layers = 0;
+    if ((val = zend_hash_str_find(config_ht, "layers", sizeof("layers") - 1)) != NULL) {
+        zend_long n = zval_get_long(val);
+        if (n < 1 || n > 64) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'layers' must be 1..64");
+            RETURN_FALSE;
+        }
+        layers = n > 1 ? (int)n : 0;
+    }
+    if (layers > 1) {
+        if (is_cube) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'layers' cannot be combined with 'cube'");
+            RETURN_FALSE;
+        }
+        if (attachment_count > 1 || samples > 1) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: array targets support a single, single-sampled attachment");
+            RETURN_FALSE;
+        }
+        if (!ctx->backend->supports_feature ||
+            !ctx->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_LAYERED) ||
+            !ctx->backend->bind_render_target_face) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_render_target: array render targets are not supported on backend '%s'", ctx->backend->name);
+            RETURN_FALSE;
+        }
+    }
+
     /* Create VioRenderTarget object */
     zval rt_zval;
     object_init_ex(&rt_zval, vio_render_target_ce);
@@ -9141,8 +9689,9 @@ ZEND_FUNCTION(vio_render_target)
     rt->width      = width;
     rt->height     = height;
     rt->depth_only = depth_only;
-    rt->samples    = samples;
+    rt->samples    = layers > 1 ? 1 : samples;
     rt->is_cube    = is_cube;
+    rt->layers     = layers;
     rt->mip_levels = mip_levels;
     rt->backend    = ctx->backend;
     rt->attachment_count = attachment_count;
@@ -9189,17 +9738,36 @@ ZEND_FUNCTION(vio_bind_render_target)
         return;
     }
 
-    /* Cube RT face bind (vio_render_target(['cube' => true])). face 0..5 =
-     * +X,-X,+Y,-Y,+Z,-Z; level selects the mip level. Same persistent-bind
-     * semantics as a plain bind. */
-    if (face >= 0) {
-        if (!rt->is_cube) {
-            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: 'face' requires a cube render target");
+    /* Cube RT face bind (vio_render_target(['cube' => true])): face 0..5 =
+     * +X,-X,+Y,-Y,+Z,-Z; level selects the mip level. Array RT ('layers' => N):
+     * the argument is the layer, 0..N-1. Same persistent-bind semantics as a
+     * plain bind. VIO_RT_ALL_LAYERS binds every layer at level 0; a geometry
+     * (or, with VIO_FEATURE_VERTEX_LAYER, vertex) stage picks the layer with
+     * gl_Layer, and vio_clear clears all of them. */
+    if (face == VIO_RT_ALL_LAYERS) {
+        if (!rt->is_cube && rt->layers <= 1) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: VIO_RT_ALL_LAYERS requires a cube or array render target");
             return;
         }
-        if (face > 5 || level < 0 || level >= rt->mip_levels) {
-            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: face must be 0..5 and level 0..%d",
-                             rt->mip_levels - 1);
+        if (level != 0 || !ctx->backend->supports_feature ||
+            !ctx->backend->supports_feature(VIO_FEATURE_LAYERED_RENDER) || !ctx->backend->bind_render_target_face) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: layered binds (level 0) are not supported on backend '%s'",
+                             ctx->backend->name);
+            return;
+        }
+        if (ctx->backend->bind_render_target_face(rt, VIO_RT_ALL_LAYERS, 0) != 0) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: layered bind failed on backend '%s'", ctx->backend->name);
+        }
+        return;
+    }
+    if (face >= 0) {
+        if (!rt->is_cube && rt->layers <= 1) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: 'face' requires a cube or array render target");
+            return;
+        }
+        if (face >= vio_rt_layer_count(rt) || level < 0 || level >= rt->mip_levels) {
+            php_error_docref(NULL, E_WARNING, "vio_bind_render_target: %s must be 0..%d and level 0..%d",
+                             rt->is_cube ? "face" : "layer", vio_rt_layer_count(rt) - 1, rt->mip_levels - 1);
             return;
         }
         if (!ctx->backend->bind_render_target_face ||
@@ -9336,7 +9904,7 @@ ZEND_FUNCTION(vio_generate_mipmaps)
     int kind = -1;
     if (instanceof_function(Z_OBJCE_P(obj_zval), vio_render_target_ce)) {
         vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(obj_zval);
-        if (!rt->valid || rt->depth_only) RETURN_FALSE;
+        if (!rt->valid || rt->depth_only || rt->layers > 1) RETURN_FALSE;   /* array targets have no mip chain */
         obj = rt; kind = 0;
     } else if (instanceof_function(Z_OBJCE_P(obj_zval), vio_texture_ce)) {
         vio_texture_object *t = Z_VIO_TEXTURE_P(obj_zval);
@@ -9461,8 +10029,9 @@ ZEND_FUNCTION(vio_read_render_target)
         php_error_docref(NULL, E_WARNING, "vio_read_render_target: render target is not valid");
         RETURN_FALSE;
     }
-    if (face >= 0 && (!rt->is_cube || face > 5)) {
-        php_error_docref(NULL, E_WARNING, "vio_read_render_target: face must be 0..5 on a cube render target");
+    if (face >= 0 && ((!rt->is_cube && rt->layers <= 1) || face >= vio_rt_layer_count(rt))) {
+        php_error_docref(NULL, E_WARNING, "vio_read_render_target: face / layer must be 0..%d on a cube or array render target",
+                         vio_rt_layer_count(rt) - 1);
         RETURN_FALSE;
     }
     int rt_attachments = rt->attachment_count > 0 ? rt->attachment_count : 1;
@@ -9512,6 +10081,10 @@ ZEND_FUNCTION(vio_render_target_texture)
         RETURN_FALSE;
     }
     int att = (int)attachment;   /* MRT colour attachment index (0 == the legacy scalar fields) */
+    if (rt->is_cube) {
+        php_error_docref(NULL, E_WARNING, "vio_render_target_texture: sample a cube target through vio_render_target_cubemap()");
+        RETURN_FALSE;
+    }
 
     /* Create a VioTexture that references the render target's depth or color texture */
     zval tex_zval;
@@ -9524,6 +10097,8 @@ ZEND_FUNCTION(vio_render_target_texture)
     tex->channels = rt->depth_only ? 1 : 4;
     tex->filter   = VIO_FILTER_NEAREST;
     tex->wrap     = VIO_WRAP_CLAMP;
+    tex->layers   = rt->layers > 1 ? rt->layers : 1;
+    tex->is_array = rt->layers > 1;   /* sampler2DArray; the backend views below are arrays too */
 
     /* Return depth texture for depth-only targets, color texture otherwise */
     tex->texture_id = rt->depth_only ? rt->depth_texture : (att == 0 ? rt->color_texture : rt->color_textures[att]);
@@ -9898,6 +10473,15 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
         }
         ID3D11ShaderResourceView *srv = (ID3D11ShaderResourceView *)cm->d3d11_srv;
         ID3D11SamplerState *sampler = (ID3D11SamplerState *)cm->d3d11_sampler;
+        /* samplerCubeShadow on a depth cube: the comparison sampler, chosen
+         * from the shader's sampler type like vio_bind_texture_now does. */
+        if (cm->d3d11_sampler_cmp && ctx->bound_shader_object) {
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            int idx = (slot >= 0 && slot < 16) ? sh->gl_to_hlsl_sampler[slot] : -1;
+            if (idx >= 0 && idx < sh->sampler_count && sh->sampler_is_depth[idx]) {
+                sampler = (ID3D11SamplerState *)cm->d3d11_sampler_cmp;
+            }
+        }
         ID3D11DeviceContext_PSSetShaderResources(vio_d3d11.context, (UINT)hlsl_slot, 1, &srv);
         ID3D11DeviceContext_PSSetSamplers(vio_d3d11.context, (UINT)hlsl_slot, 1, &sampler);
     }

@@ -530,16 +530,40 @@ function vio_draw_2d(VioContext $context): void {}
  * Accepts GLSL (compiled to SPIR-V via glslang) or raw SPIR-V binary.
  * Format is auto-detected from SPIR-V magic number if not specified.
  *
- * @param array $config ['vertex' => string, 'fragment' => string, 'format' => int (VIO_SHADER_AUTO|VIO_SHADER_GLSL|VIO_SHADER_SPIRV)]
+ * Optional stages (same encoding as 'vertex' / 'fragment'):
+ *   'geometry'                     — geometry shader; requires VIO_FEATURE_GEOMETRY
+ *   'tess_control' + 'tess_eval'   — tessellation pair (always both); requires VIO_FEATURE_TESSELLATION;
+ *                                    the pipeline then draws VIO_PATCHES ('patch_vertices' control points)
+ * Backends reporting the feature as 0 (Metal, OpenGL < 3.2 / 4.0, D3D with a SPIRV-Cross that cannot
+ * emit the stage - tessellation is not emitted to HLSL at all) return false with a warning, unless the
+ * backend has VIO_FEATURE_HLSL_STAGE_OVERRIDE (D3D11 / D3D12) and 'hlsl' supplies the stage:
+ *   'hlsl' => ['geometry' | 'tess_control' | 'tess_eval' => HLSL source]
+ *     compiled as-is instead of the transpiled GLSL stage (hs_/ds_/gs_5_x, DXIL under shader model 6).
+ *     The GLSL stage stays required (GL / Vulkan use it, and its uniforms define the layout): declare
+ *     the same uniforms in `cbuffer ... : register(b0)` in the same order - a mismatch warns. Inputs use
+ *     the semantics SPIRV-Cross gives the previous stage's outputs (SV_Position, TEXCOORD<location>);
+ *     the source outputs D3D clip space (z in [0, w]). Also the way to [instance(N)] on D3D.
+ * Geometry stages may use layout(invocations = N) where VIO_FEATURE_GEOMETRY_INSTANCING is 1, and the
+ * VIO_*_ADJACENCY topologies (vio_mesh(['adjacency' => true]) builds the TRIANGLES_ADJACENCY indices).
+ * Portable geometry shaders read input positions from a user varying (`layout(location = N) in vec4 vPos[]`
+ * exported by the vertex stage), not from gl_in[].gl_Position, which D3D cannot translate.
+ * Uniforms declared in an extra stage are set with
+ * vio_set_uniform() like any other; on D3D a texture sampled in an extra stage is bound at the register
+ * the fragment-stage sampler map resolves its unit to (declare samplers in the same order per stage).
+ *
+ * @param array $config ['vertex' => string, 'fragment' => string, 'geometry' => ?string,
+ *                      'tess_control' => ?string, 'tess_eval' => ?string, 'hlsl' => ?array,
+ *                      'format' => int (VIO_SHADER_AUTO|VIO_SHADER_GLSL|VIO_SHADER_SPIRV)]
  * @return VioShader|false Shader object or false on failure
  */
 function vio_shader(VioContext $context, array $config): VioShader|false {}
 
 /**
  * Reflect shader resources from SPIR-V binary stored in a VioShader.
- * Returns vertex and fragment stage inputs, UBOs, textures, and uniforms.
+ * Returns vertex and fragment stage inputs, UBOs, textures, and uniforms; the optional
+ * 'geometry' / 'tess_control' / 'tess_eval' keys appear when the shader has that stage.
  *
- * @return array|false Array with 'vertex' and 'fragment' keys, each containing 'inputs', 'ubos', 'textures', 'uniforms'
+ * @return array|false Array with 'vertex' and 'fragment' keys (plus optional stage keys), each containing 'inputs', 'ubos', 'textures', 'uniforms', 'storage_buffers'
  */
 function vio_shader_reflect(VioShader $shader): array|false {}
 
@@ -555,10 +579,12 @@ function vio_shader_reflect(VioShader $shader): array|false {}
  *                                               // MRT: blend mode / VIO_COLOR_* mask PER colour attachment
  *                                               //   (missing entries fall back to 'blend' / 'color_mask')
  *                      'stencil' => ['func' => VIO_CMP_*, 'ref' => int, 'read_mask' => int, 'write_mask' => int,
- *                                     'pass' => VIO_STENCIL_*, 'fail' => VIO_STENCIL_*, 'depth_fail' => VIO_STENCIL_*]]
+ *                                     'pass' => VIO_STENCIL_*, 'fail' => VIO_STENCIL_*, 'depth_fail' => VIO_STENCIL_*],
  *                                               // stencil test (VIO_FEATURE_STENCIL): giving the array enables it;
  *                                               //   defaults ALWAYS / 0 / 0xFF / 0xFF / KEEP. The depth attachment carries
  *                                               //   8 stencil bits, vio_clear resets them to 0. Same ops for front + back.
+ *                      'patch_vertices' => int] // control points per patch for VIO_PATCHES (1..32, default 3);
+ *                                               //   a shader with tessellation stages always draws patches
  * @return VioPipeline|false Pipeline object or false on failure
  */
 function vio_pipeline(VioContext $context, array $config): VioPipeline|false {}
@@ -1189,6 +1215,17 @@ function vio_texture_update(VioContext $context, VioTexture $texture, string $da
 function vio_viewport(VioContext $context, int $x, int $y, int $width, int $height): void {}
 
 /**
+ * Set several viewports at once (VIO_FEATURE_MULTI_VIEWPORT, up to VIO_MAX_VIEWPORTS).
+ * Same coordinate convention as vio_viewport(). gl_ViewportIndex in the geometry stage,
+ * or in the vertex stage with VIO_FEATURE_VERTEX_LAYER, picks the viewport per primitive;
+ * primitives that do not write it use viewport 0. vio_viewport() returns to one viewport.
+ * Typical use: every CSM cascade into one shadow atlas in a single pass.
+ *
+ * @param array $viewports [[x, y, width, height], ...]
+ */
+function vio_viewports(VioContext $context, array $viewports): bool {}
+
+/**
  * Flush/finalize 3D draw calls (parallel to vio_draw_2d for 2D).
  */
 function vio_draw_3d(VioContext $context): void {}
@@ -1207,14 +1244,28 @@ function vio_draw_instanced(VioContext $context, VioMesh $mesh, array|string $ma
  *
  * @param array $config ['width' => int, 'height' => int, 'depth_only' => bool, 'hdr' => bool,
  *                      'samples' => int, 'cube' => bool, 'size' => int, 'mipmaps' => bool,
- *                      'attachments' => int[]]  // MRT: 1..4 VIO_FORMAT_* colour attachments
+ *                      'attachments' => int[],  // MRT: 1..4 VIO_FORMAT_* colour attachments
  *                                               //      (fragment layout(location = i) out); needs VIO_FEATURE_MRT
+ *                      'layers' => int]         // 2..64: 2D array target (colour or depth_only, every layer with its
+ *                                               //   own depth; single attachment, single-sampled, no mips). Bind one
+ *                                               //   layer with vio_bind_render_target($ctx, $rt, $layer), read it with
+ *                                               //   vio_read_render_target($rt, $layer), sample the whole array as
+ *                                               //   sampler2DArray via vio_render_target_texture(). 'cube' + 'depth_only'
+ *                                               //   gives a depth cube (vio_render_target_cubemap). Both need
+ *                                               //   VIO_FEATURE_RENDER_TARGET_LAYERED.
  * @return VioRenderTarget|false Render target or false on failure
  */
 function vio_render_target(VioContext $context, array $config): VioRenderTarget|false {}
 
 /**
  * Bind a render target for subsequent draw calls (redirects rendering to FBO).
+ *
+ * @param int $face  -1: the whole target (cube / array: face / layer 0). 0..5: one cube face,
+ *                   0..N-1: one array layer, at mip $level. VIO_RT_ALL_LAYERS: every face /
+ *                   layer at once (level 0, VIO_FEATURE_LAYERED_RENDER) - gl_Layer in the
+ *                   geometry stage, or in the vertex stage with VIO_FEATURE_VERTEX_LAYER
+ *                   (#extension GL_ARB_shader_viewport_layer_array), picks the destination per
+ *                   primitive; vio_clear clears every layer. Single-pass cube / cascaded shadows.
  */
 function vio_bind_render_target(VioContext $context, VioRenderTarget $target, int $face = -1, int $level = 0): void {}
 

@@ -29,6 +29,7 @@
 
 #include "vio_d3d12.h"
 #include "../vio_d3d_common.h"
+#include "../vio_d3d_shader_check.h"
 #include "../../vio_texfmt.h"
 #include "../../vio_shader_cache.h"
 #include "../../vio_render_target.h"
@@ -39,6 +40,7 @@ void vio_dxc_set_dir(const char *dir);
 int  vio_dxc_compile(const char *hlsl, const char *entry, const char *profile, int debug,
                      void **out_bytes, size_t *out_len, char **out_error);
 #include "../../vio_shader_reflect.h"   /* vio_spirv_reflect — data-driven compute register mapping */
+#include "../../vio_shader_compiler.h"  /* vio_compile_glsl_stage_to_spirv — geometry / tessellation stages */
 #include "../../vio_texture.h"          /* vio_texture_object — storage-image binds */
 #include <string.h>
 #include <stdlib.h>
@@ -285,7 +287,7 @@ extern uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
 /* ── Helpers ──────────────────────────────────────────────────────── */
 /* vio_format_to_dxgi, vio_format_byte_size, vio_usage_to_semantic from vio_d3d_common.h */
 
-static D3D12_PRIMITIVE_TOPOLOGY vio_topology_to_d3d12(vio_topology t)
+static D3D12_PRIMITIVE_TOPOLOGY vio_topology_to_d3d12(vio_topology t, int patch_vertices)
 {
     switch (t) {
         case VIO_TRIANGLES:      return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -293,7 +295,17 @@ static D3D12_PRIMITIVE_TOPOLOGY vio_topology_to_d3d12(vio_topology t)
         case VIO_LINES:          return D3D_PRIMITIVE_TOPOLOGY_LINELIST;
         case VIO_LINE_STRIP:     return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
         case VIO_POINTS:         return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+        case VIO_LINES_ADJACENCY:          return D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
+        case VIO_LINE_STRIP_ADJACENCY:     return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ;
+        case VIO_TRIANGLES_ADJACENCY:      return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ;
+        case VIO_TRIANGLE_STRIP_ADJACENCY: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
         case VIO_TRIANGLE_FAN:   return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        case VIO_PATCHES: {
+            /* N_CONTROL_POINT_PATCHLIST values are contiguous from 1 (=33). */
+            int n = patch_vertices > 0 ? patch_vertices : 3;
+            if (n > 32) n = 32;
+            return (D3D12_PRIMITIVE_TOPOLOGY)(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + (n - 1));
+        }
         default:                 return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     }
 }
@@ -307,6 +319,11 @@ static D3D12_PRIMITIVE_TOPOLOGY_TYPE vio_topology_to_d3d12_type(vio_topology t)
         case VIO_LINES:
         case VIO_LINE_STRIP:     return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
         case VIO_POINTS:         return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        case VIO_LINES_ADJACENCY:
+        case VIO_LINE_STRIP_ADJACENCY:     return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        case VIO_TRIANGLES_ADJACENCY:
+        case VIO_TRIANGLE_STRIP_ADJACENCY: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        case VIO_PATCHES:        return D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
         default:                 return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     }
 }
@@ -446,8 +463,17 @@ static int d3d12_create_root_signature(void)
      *       visibility, which D3D12 permits. A root SRV (raw/structured buffer)
      *       set via SetGraphicsRootShaderResourceView; unused by shaders that
      *       don't declare the SSBO, so normal draws leave it unset.
+     *
+     *   [5..7]   CBV b0 for the GEOMETRY / HULL / DOMAIN stage (vio_shader
+     *            'geometry' / 'tess_control' / 'tess_eval' constant blocks).
+     *   [8..10]  SRV table t0..t15 with GEOMETRY / HULL / DOMAIN visibility -
+     *            the per-draw SRV block bound at [2] is re-pointed here when
+     *            the bound pipeline has the stage (vio_d3d12_flush_srv_table).
+     *   [11..13] Sampler table s0..s7, same replication as the SRV table.
+     *   Indices: VIO_D3D12_RP_* in vio_d3d12.h. Root cost: 5 CBVs (10 DWORDs)
+     *   + 1 root SRV (2) + 8 tables (8) = 20 of 64 DWORDs.
      */
-    D3D12_ROOT_PARAMETER params[5] = {0};
+    D3D12_ROOT_PARAMETER params[VIO_D3D12_RP_COUNT] = {0};
 
     /* [0] CBV b0 — vertex shader only */
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -498,6 +524,34 @@ static int d3d12_create_root_signature(void)
     params[4].DescriptorTable.pDescriptorRanges = &sampler_range;
     params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+    /* [5..13] Optional-stage mirrors: CBV b0, SRV table, sampler table per
+     * GEOMETRY / HULL / DOMAIN visibility. Same register ranges as the PS /
+     * VS ones - D3D12 allows the overlap because the visibilities differ. */
+    {
+        const D3D12_SHADER_VISIBILITY vis[3] = {
+            D3D12_SHADER_VISIBILITY_GEOMETRY, D3D12_SHADER_VISIBILITY_HULL, D3D12_SHADER_VISIBILITY_DOMAIN
+        };
+        for (int s = 0; s < 3; s++) {
+            D3D12_ROOT_PARAMETER *cbv = &params[VIO_D3D12_RP_GS_CBV + s];
+            cbv->ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            cbv->Descriptor.ShaderRegister = 0;
+            cbv->Descriptor.RegisterSpace = 0;
+            cbv->ShaderVisibility = vis[s];
+
+            D3D12_ROOT_PARAMETER *srv = &params[VIO_D3D12_RP_GS_SRV + s];
+            srv->ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            srv->DescriptorTable.NumDescriptorRanges = 1;
+            srv->DescriptorTable.pDescriptorRanges = &srv_range;
+            srv->ShaderVisibility = vis[s];
+
+            D3D12_ROOT_PARAMETER *smp = &params[VIO_D3D12_RP_GS_SAMPLER + s];
+            smp->ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            smp->DescriptorTable.NumDescriptorRanges = 1;
+            smp->DescriptorTable.pDescriptorRanges = &sampler_range;
+            smp->ShaderVisibility = vis[s];
+        }
+    }
+
     /* Static samplers: s8-s11 = comparison (shadow maps with sampler2DShadow).
      * SPIRV-Cross assigns shadow samplers to s8+ and regular to s0+ (see
      * vio_shader_reflect.c — the base is 8 so up to 8 regular samplers fit in
@@ -518,7 +572,7 @@ static int d3d12_create_root_signature(void)
     }
 
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-    rs_desc.NumParameters = 5; /* VS CBV, PS CBV, PS SRV table, VS storage SRV, PS sampler table */
+    rs_desc.NumParameters = VIO_D3D12_RP_COUNT; /* VS CBV, PS CBV, PS SRV table, VS storage SRV, PS sampler table, GS/HS/DS mirrors */
     rs_desc.pParameters = params;
     rs_desc.NumStaticSamplers = 4;
     rs_desc.pStaticSamplers = static_samplers;
@@ -964,6 +1018,8 @@ static int d3d12_init(vio_config *cfg)
     }
     vio_d3d12.rtv_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    vio_d3d12.dsv_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(
+        vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
     if (d3d12_create_descriptor_heap(&vio_d3d12.dsv_heap,
                                       D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1,
@@ -1565,7 +1621,12 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     vio_d3d12_shader *shader = (vio_d3d12_shader *)desc->shader;
     if (!shader) { free(pipeline); return NULL; }
 
-    pipeline->topology = vio_topology_to_d3d12(desc->topology);
+    /* A hull stage only accepts control-point patch lists (PSO type PATCH). */
+    vio_topology topo = shader->hs_blob ? VIO_PATCHES : desc->topology;
+    pipeline->topology = vio_topology_to_d3d12(topo, desc->patch_vertices);
+    pipeline->has_gs = shader->gs_blob != NULL;
+    pipeline->has_hs = shader->hs_blob != NULL;
+    pipeline->has_ds = shader->ds_blob != NULL;
 
     /* Build input layout */
     D3D12_INPUT_ELEMENT_DESC *elements = NULL;
@@ -1617,6 +1678,18 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     pso_desc.VS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->vs_blob);
     pso_desc.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->ps_blob);
     pso_desc.PS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->ps_blob);
+    if (shader->gs_blob) {
+        pso_desc.GS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->gs_blob);
+        pso_desc.GS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->gs_blob);
+    }
+    if (shader->hs_blob) {
+        pso_desc.HS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->hs_blob);
+        pso_desc.HS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->hs_blob);
+    }
+    if (shader->ds_blob) {
+        pso_desc.DS.pShaderBytecode = ID3D10Blob_GetBufferPointer(shader->ds_blob);
+        pso_desc.DS.BytecodeLength = ID3D10Blob_GetBufferSize(shader->ds_blob);
+    }
 
     /* Input layout */
     pso_desc.InputLayout.pInputElementDescs = elements;
@@ -1669,7 +1742,7 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     }
 
     /* Topology type */
-    pso_desc.PrimitiveTopologyType = vio_topology_to_d3d12_type(desc->topology);
+    pso_desc.PrimitiveTopologyType = vio_topology_to_d3d12_type(topo);
 
     /* Render target format. Must match the format of the render target bound at
      * draw time (D3D12 hard rule), else DrawIndexedInstanced is dropped with
@@ -2805,6 +2878,8 @@ static unsigned char *d3d12_readback_subresource(ID3D12Resource *src, UINT subre
     return out;
 }
 
+static int d3d12_rt_mips(const vio_render_target_object *rt);
+
 /* vio_read_render_target on D3D12: colour attachment (any vio_pixel_format,
  * converted to RGBA8 by the shared converter) or the depth buffer
  * (R24G8_TYPELESS -> grey ramp). Cube targets are not available on D3D12. */
@@ -2814,11 +2889,12 @@ static int d3d12_read_render_target(void *rt_ptr, int face, int attachment, void
     if (!rt || rt->backend_type != VIO_RT_BACKEND_D3D12 || !vio_d3d12.device) return -1;
     int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
     if (attachment < 0 || attachment >= n) return -1;
-    /* Cube targets: subresource = face * mip_levels (mip 0 of that slice). */
+    /* Cube / array targets: subresource = layer * mip_levels (mip 0 of that
+     * slice); the depth resource has a single level. */
     UINT subresource = 0;
-    if (rt->is_cube) {
+    if (rt->is_cube || rt->layers > 1) {
         int f = face >= 0 ? face : (rt->bound_face >= 0 ? rt->bound_face : 0);
-        subresource = (UINT)(f * (rt->mip_levels > 0 ? rt->mip_levels : 1));
+        subresource = (UINT)(f * (rt->depth_only ? 1 : d3d12_rt_mips(rt)));
     }
 
     ID3D12Resource *src;
@@ -3046,28 +3122,39 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_dsv_heap, &dsv_handle);
     int w = rt->width, h = rt->height;
+    int layers = vio_rt_layer_count(rt);
+    int all = layers > 1 && face == VIO_RT_ALL_LAYERS;
+    if (layers > 1) {
+        /* Cube / array: one DSV per layer (heap entry = layer); entry `layers`
+         * spans every slice (VIO_RT_ALL_LAYERS, SV_RenderTargetArrayIndex picks). */
+        if (!all && (face < 0 || face >= layers)) face = 0;
+        dsv_handle.ptr += (SIZE_T)(all ? layers : face) * vio_d3d12.dsv_descriptor_size;
+    }
 
     if (rt->depth_only) {
         ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 0, NULL, FALSE, &dsv_handle);
         vio_d3d12.current_has_rtv = 0;
         vio_d3d12.current_rtv_count = 0;
         vio_d3d12.current_dsv = dsv_handle;
-    } else if (rt->is_cube) {
+        if (layers > 1) { rt->bound_face = all ? VIO_RT_ALL_LAYERS : face; rt->bound_level = 0; }
+    } else if (layers > 1) {
         int mips = d3d12_rt_mips(rt);
-        if (face < 0 || face > 5) face = 0;
         if (level < 0 || level >= mips) level = 0;
         D3D12_CPU_DESCRIPTOR_HANDLE rtv_base;
         ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &rtv_base);
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = { rtv_base.ptr + (SIZE_T)(face * mips + level) * vio_d3d12.rtv_descriptor_size };
-        /* The shared depth texture matches level 0 only (GL / Metal contract). */
+        if (all) level = 0;
+        int rtv_index = all ? layers * mips : face * mips + level;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = { rtv_base.ptr + (SIZE_T)rtv_index * vio_d3d12.rtv_descriptor_size };
+        /* The layer's depth slice matches level 0 only (GL / Metal contract). */
         ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1, &rtv, FALSE, level == 0 ? &dsv_handle : NULL);
         vio_d3d12.current_rtv = rtv;
         vio_d3d12.current_rtvs[0] = rtv;
         vio_d3d12.current_rtv_count = 1;
         vio_d3d12.current_has_rtv = 1;
         vio_d3d12.current_dsv = dsv_handle;
-        w = h = (rt->width >> level) > 0 ? (rt->width >> level) : 1;
-        rt->bound_face = face;
+        w = (rt->width >> level) > 0 ? (rt->width >> level) : 1;
+        h = (rt->height >> level) > 0 ? (rt->height >> level) : 1;
+        rt->bound_face = all ? VIO_RT_ALL_LAYERS : face;
         rt->bound_level = level;
     } else {
         int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
@@ -3122,9 +3209,10 @@ static int d3d12_bind_render_target_face(void *rt_ptr, int face, int level)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (!rt || !vio_d3d12.initialized || rt->backend_type != VIO_RT_BACKEND_D3D12) return -1;
-    if (!rt->is_cube || face < 0 || face > 5 || level < 0 || level >= d3d12_rt_mips(rt)) return -1;
+    if ((!rt->is_cube && rt->layers <= 1) || level < 0 || level >= d3d12_rt_mips(rt)) return -1;
+    if (face == VIO_RT_ALL_LAYERS ? level != 0 : (face < 0 || face >= vio_rt_layer_count(rt))) return -1;
     if (!vio_d3d12.in_frame) {
-        php_error_docref(NULL, E_WARNING, "D3D12: cube face binds are only valid between vio_begin and vio_end");
+        php_error_docref(NULL, E_WARNING, "D3D12: cube face / array layer binds are only valid between vio_begin and vio_end");
         return -1;
     }
     d3d12_record_bind_render_target(rt, face, level);
@@ -3192,7 +3280,8 @@ static void d3d12_unbind_render_target(unsigned int default_fbo, int width, int 
 typedef struct _d3d12_rt_clear_job {
     D3D12_CPU_DESCRIPTOR_HANDLE rtv0;
     int                         rtv_count;
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv;          /* first DSV; layered targets have dsv_count */
+    int                         dsv_count;
 } d3d12_rt_clear_job;
 
 static void d3d12_record_rt_clear(ID3D12GraphicsCommandList *list, void *user)
@@ -3203,8 +3292,12 @@ static void d3d12_record_rt_clear(ID3D12GraphicsCommandList *list, void *user)
         D3D12_CPU_DESCRIPTOR_HANDLE h = { job->rtv0.ptr + (SIZE_T)i * vio_d3d12.rtv_descriptor_size };
         ID3D12GraphicsCommandList_ClearRenderTargetView(list, h, zero, 0, NULL);
     }
-    ID3D12GraphicsCommandList_ClearDepthStencilView(list, job->dsv,
-        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+    int n = job->dsv_count > 0 ? job->dsv_count : 1;
+    for (int i = 0; i < n; i++) {
+        D3D12_CPU_DESCRIPTOR_HANDLE d = { job->dsv.ptr + (SIZE_T)i * vio_d3d12.dsv_descriptor_size };
+        ID3D12GraphicsCommandList_ClearDepthStencilView(list, d,
+            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+    }
 }
 
 /* Allocate a static SRV (staging heap) for a render-target view. */
@@ -3225,12 +3318,14 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     int attachment_count = rt->attachment_count > 0 ? rt->attachment_count : 1;
     if (attachment_count > VIO_MAX_COLOR_ATTACHMENTS) attachment_count = VIO_MAX_COLOR_ATTACHMENTS;
     int mips = d3d12_rt_mips(rt);
+    int layers = vio_rt_layer_count(rt);
+    int layered = layers > 1;
     /* MSAA (GAP-PHASE5 Block 1): clamp the request to a power of two the device
      * supports for attachment 0's format. Cube / depth-only targets stay
      * single-sample (no resolve path), like D3D11. The PSO side is handled by
      * the per-sample-count variants (d3d12_pipeline_pso_for_samples). */
     UINT samples = 1;
-    if (!rt->is_cube && !depth_only && rt->samples > 1) {
+    if (!layered && !depth_only && rt->samples > 1) {
         UINT want = rt->samples > 8 ? 8 : (UINT)rt->samples;
         while (want & (want - 1)) want &= want - 1;   /* round down to a power of two */
         for (UINT s = want; s > 1; s >>= 1) {
@@ -3251,7 +3346,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
         D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {0};
         /* MSAA: attachments' RTVs first, then one RTV per single-sample resolve
          * target (used only by the initial clear). */
-        rtv_heap_desc.NumDescriptors = rt->is_cube ? (UINT)(6 * mips) : (UINT)(attachment_count * (samples > 1 ? 2 : 1));
+        rtv_heap_desc.NumDescriptors = layered ? (UINT)(layers * mips + 1) : (UINT)(attachment_count * (samples > 1 ? 2 : 1));
         rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         ID3D12DescriptorHeap *rtv_heap = NULL;
         hr = ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &rtv_heap_desc, &IID_ID3D12DescriptorHeap, (void **)&rtv_heap);
@@ -3266,12 +3361,14 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
         D3D12_HEAP_PROPERTIES heap_props = {0};
         heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-        if (rt->is_cube) {
+        if (layered) {
+            /* Cube (6 slices, mip chain) or array ('layers' => N): one RTV per
+             * (layer, level). */
             DXGI_FORMAT dxfmt = vio_pixel_format_to_dxgi(rt->formats[0]);
             D3D12_RESOURCE_DESC rd = {0};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             rd.Width = width; rd.Height = height;
-            rd.DepthOrArraySize = 6;
+            rd.DepthOrArraySize = (UINT16)layers;
             rd.MipLevels = (UINT16)mips;
             rd.Format = dxfmt;
             rd.SampleDesc.Count = 1;
@@ -3283,12 +3380,12 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
             hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &heap_props, D3D12_HEAP_FLAG_NONE, &rd,
                 D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, &IID_ID3D12Resource, (void **)&cube);
             if (FAILED(hr)) {
-                php_error_docref(NULL, E_WARNING, "D3D12: Failed to create cube colour resource (0x%08lx)", hr);
+                php_error_docref(NULL, E_WARNING, "D3D12: Failed to create %s colour resource (0x%08lx)", rt->is_cube ? "cube" : "array", hr);
                 return -1;
             }
             rt->d3d12_color_resource = cube;
             rt->d3d12_color_resources[0] = cube;
-            for (int f = 0; f < 6; f++) {
+            for (int f = 0; f < layers; f++) {
                 for (int l = 0; l < mips; l++) {
                     D3D12_RENDER_TARGET_VIEW_DESC vd = {0};
                     vd.Format = dxfmt;
@@ -3299,6 +3396,15 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
                     D3D12_CPU_DESCRIPTOR_HANDLE h = { rtv_base.ptr + (SIZE_T)(f * mips + l) * vio_d3d12.rtv_descriptor_size };
                     ID3D12Device_CreateRenderTargetView(vio_d3d12.device, cube, &vd, h);
                 }
+            }
+            {
+                /* Entry layers * mips: every slice of level 0 (VIO_RT_ALL_LAYERS). */
+                D3D12_RENDER_TARGET_VIEW_DESC vd = {0};
+                vd.Format = dxfmt;
+                vd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                vd.Texture2DArray.ArraySize = (UINT)layers;
+                D3D12_CPU_DESCRIPTOR_HANDLE h = { rtv_base.ptr + (SIZE_T)(layers * mips) * vio_d3d12.rtv_descriptor_size };
+                ID3D12Device_CreateRenderTargetView(vio_d3d12.device, cube, &vd, h);
             }
         } else {
             for (int ai = 0; ai < attachment_count; ai++) {
@@ -3348,9 +3454,10 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
         }
     }
 
-    /* DSV heap + depth resource (shared, level-0 sized) */
+    /* DSV heap + depth resource (level-0 sized; cube / array targets carry a
+     * depth slice and a DSV per layer) */
     D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc = {0};
-    dsv_heap_desc.NumDescriptors = 1;
+    dsv_heap_desc.NumDescriptors = layered ? (UINT)layers + 1 : 1u;   /* + the all-slice DSV */
     dsv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     ID3D12DescriptorHeap *dsv_heap = NULL;
     hr = ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &dsv_heap_desc, &IID_ID3D12DescriptorHeap, (void **)&dsv_heap);
@@ -3366,7 +3473,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     depth_res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     depth_res_desc.Width = width;
     depth_res_desc.Height = height;
-    depth_res_desc.DepthOrArraySize = 1;
+    depth_res_desc.DepthOrArraySize = (UINT16)layers;
     depth_res_desc.MipLevels = 1;
     depth_res_desc.Format = depth_only ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_D24_UNORM_S8_UINT;
     depth_res_desc.SampleDesc.Count = samples;   /* multisampled with the colour (DSV infers 2DMS) */
@@ -3388,7 +3495,27 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     dsv_view_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsv_heap, &dsv_handle);
-    ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, depth_only ? &dsv_view_desc : NULL, dsv_handle);
+    if (layered) {
+        for (int l = 0; l < layers; l++) {
+            D3D12_DEPTH_STENCIL_VIEW_DESC dd = {0};
+            dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+            dd.Texture2DArray.FirstArraySlice = (UINT)l;
+            dd.Texture2DArray.ArraySize = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = { dsv_handle.ptr + (SIZE_T)l * vio_d3d12.dsv_descriptor_size };
+            ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, &dd, h);
+        }
+        {
+            D3D12_DEPTH_STENCIL_VIEW_DESC dd = {0};
+            dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+            dd.Texture2DArray.ArraySize = (UINT)layers;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = { dsv_handle.ptr + (SIZE_T)layers * vio_d3d12.dsv_descriptor_size };
+            ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, &dd, h);
+        }
+    } else {
+        ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, depth_only ? &dsv_view_desc : NULL, dsv_handle);
+    }
 
     /* Static SRVs (staging heap) for sampling the target later. */
     if (depth_only) {
@@ -3396,22 +3523,37 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
         if (d3d12_rt_alloc_srv(&cpu, &gpu) == 0) {
             D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
             sd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            sd.Texture2D.MipLevels = 1;
+            if (rt->is_cube) {
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+                sd.TextureCube.MipLevels = 1;
+            } else if (layered) {
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                sd.Texture2DArray.MipLevels = 1;
+                sd.Texture2DArray.ArraySize = (UINT)layers;
+            } else {
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                sd.Texture2D.MipLevels = 1;
+            }
             D3D12_CPU_DESCRIPTOR_HANDLE h = { (SIZE_T)cpu };
             ID3D12Device_CreateShaderResourceView(vio_d3d12.device, depth_res, &sd, h);
             rt->d3d12_depth_srv_gpu = gpu;
             rt->d3d12_depth_srv_cpu = cpu;
         }
-    } else if (rt->is_cube) {
+    } else if (layered) {
         uint64_t cpu, gpu;
         if (d3d12_rt_alloc_srv(&cpu, &gpu) == 0) {
             D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
             sd.Format = vio_pixel_format_to_dxgi(rt->formats[0]);
-            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
             sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            sd.TextureCube.MipLevels = (UINT)mips;
+            if (rt->is_cube) {
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+                sd.TextureCube.MipLevels = (UINT)mips;
+            } else {
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                sd.Texture2DArray.MipLevels = (UINT)mips;
+                sd.Texture2DArray.ArraySize = (UINT)layers;
+            }
             D3D12_CPU_DESCRIPTOR_HANDLE h = { (SIZE_T)cpu };
             ID3D12Device_CreateShaderResourceView(vio_d3d12.device, (ID3D12Resource *)rt->d3d12_color_resource, &sd, h);
             rt->d3d12_color_srv_gpus[0] = rt->d3d12_color_srv_gpu = gpu;
@@ -3442,9 +3584,10 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     {
         d3d12_rt_clear_job job = {0};
         job.dsv = dsv_handle;
+        job.dsv_count = layers;
         if (!depth_only && rt->d3d12_rtv_heap) {
             ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap, &job.rtv0);
-            job.rtv_count = rt->is_cube ? 6 * mips : attachment_count * (samples > 1 ? 2 : 1);
+            job.rtv_count = layered ? layers * mips : attachment_count * (samples > 1 ? 2 : 1);
         }
         d3d12_submit_upload(d3d12_record_rt_clear, &job);
     }
@@ -3455,13 +3598,18 @@ static int d3d12_render_target_cubemap(void *rt_ptr, void *cm_obj)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     vio_cubemap_object *cm = (vio_cubemap_object *)cm_obj;
-    if (!rt || !cm || !rt->is_cube || !rt->d3d12_color_resource || !rt->d3d12_color_srv_cpu) return -1;
+    if (!rt || !cm || !rt->is_cube) return -1;
+    /* depth_only: the depth cube (TEXTURECUBE SRV over the R24 plane). */
+    void *res = rt->depth_only ? rt->d3d12_depth_resource : rt->d3d12_color_resource;
+    uint64_t srv_cpu = rt->depth_only ? rt->d3d12_depth_srv_cpu : rt->d3d12_color_srv_cpu;
+    uint64_t srv_gpu = rt->depth_only ? rt->d3d12_depth_srv_gpu : rt->d3d12_color_srv_gpu;
+    if (!res || !srv_cpu) return -1;
     /* Borrowed: the RT owns the resource + descriptor (d3d12_destroy_cubemap
      * honours cm->borrowed). Binding reads d3d12_srv_cpu, which stays valid for
      * the RT's life. */
-    cm->d3d12_resource = rt->d3d12_color_resource;
-    cm->d3d12_srv_cpu  = rt->d3d12_color_srv_cpu;
-    cm->d3d12_srv_gpu  = rt->d3d12_color_srv_gpu;
+    cm->d3d12_resource = res;
+    cm->d3d12_srv_cpu  = srv_cpu;
+    cm->d3d12_srv_gpu  = srv_gpu;
     cm->mipmaps        = rt->mip_levels > 1;
     cm->borrowed       = 1;
     cm->resolution     = rt->width;
@@ -3860,6 +4008,61 @@ static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, cons
     return S_OK;
 }
 
+/* One optional stage (geometry / hull / domain): SPIR-V or GLSL -> HLSL ->
+ * DXBC blob, same transpile path selection as the VS / PS code below. */
+static ID3DBlob *d3d12_compile_stage_blob(const void *data, size_t size, int stage, int fixup_depth,
+                                          const char *profile, const char *label,
+                                          UINT compile_flags, vio_shader_format format,
+                                          const char *hlsl_override)
+{
+    const char *hlsl = NULL;
+    char *allocated = NULL;
+    if (hlsl_override) {
+        /* 'hlsl' => [stage => source] (VIO_FEATURE_HLSL_STAGE_OVERRIDE): compiled
+         * as given; `data` is the GLSL stage's SPIR-V, used only to check the
+         * cbuffer layout below. */
+        hlsl = hlsl_override;
+    } else if (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW || format == VIO_SHADER_AUTO) {
+        char *err = NULL;
+        uint32_t *spirv = NULL;
+        size_t spirv_size = 0;
+        int free_spirv = 0;
+        int is_spirv = (size >= 4 && *(const uint32_t *)data == 0x07230203);
+        if (is_spirv) {
+            spirv = (uint32_t *)data;
+            spirv_size = size;
+        } else {
+            spirv = vio_compile_glsl_stage_to_spirv((const char *)data, stage, &spirv_size, &err);
+            if (!spirv) {
+                php_error_docref(NULL, E_WARNING, "D3D12: %s GLSL->SPIR-V failed: %s", label, err ? err : "unknown");
+                if (err) free(err);
+                return NULL;
+            }
+            free_spirv = 1;
+        }
+        allocated = vio_spirv_to_hlsl_ex(spirv, spirv_size, 51, fixup_depth, &err);
+        if (free_spirv) free(spirv);
+        if (!allocated) {
+            php_error_docref(NULL, E_WARNING, "D3D12: %s SPIR-V->HLSL failed: %s", label, err ? err : "unknown");
+            if (err) free(err);
+            return NULL;
+        }
+        hlsl = allocated;
+    } else {
+        hlsl = (const char *)data;
+    }
+
+    /* Same compile path as VS / PS: the on-disk cache, and DXIL under Shader
+     * Model 6 - a PSO cannot mix a DXBC geometry stage with DXIL VS / PS. */
+    ID3DBlob *blob = NULL;
+    HRESULT hr = d3d12_compile_cached(hlsl, label, profile, compile_flags, &blob);
+    if (allocated) free(allocated);
+    if (SUCCEEDED(hr) && hlsl_override && size >= 4 && *(const uint32_t *)data == 0x07230203) {
+        vio_d3d_check_override_cbuffer(blob, data, size, "D3D12", label);
+    }
+    return SUCCEEDED(hr) ? blob : NULL;
+}
+
 static void *d3d12_compile_shader(vio_shader_desc *desc)
 {
     vio_d3d12_shader *shader = calloc(1, sizeof(vio_d3d12_shader));
@@ -3914,8 +4117,10 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
             free_ps_spirv = 1;
         }
 
-        /* SPIR-V -> HLSL SM 5.1 */
-        allocated_vs = vio_spirv_to_hlsl(vs_spirv, vs_spirv_size, 51, &err);
+        /* SPIR-V -> HLSL SM 5.1. The GL->D3D depth fixup goes on the LAST
+         * stage that writes gl_Position (GS, else DS, else VS). */
+        int vs_is_last = !desc->geometry_data && !desc->tess_eval_data;
+        allocated_vs = vio_spirv_to_hlsl_ex(vs_spirv, vs_spirv_size, 51, vs_is_last, &err);
         if (free_vs_spirv) free(vs_spirv);
         if (!allocated_vs) {
             php_error_docref(NULL, E_WARNING, "D3D12: VS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -3958,6 +4163,26 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
     hr = d3d12_compile_cached(hlsl_ps, "ps_main", "ps_5_1", compile_flags, &shader->ps_blob);
     if (FAILED(hr)) goto fail;
 
+    /* Optional stages: geometry (gs_5_1), hull (hs_5_1), domain (ds_5_1). */
+    if (desc->geometry_data) {
+        shader->gs_blob = d3d12_compile_stage_blob(desc->geometry_data, desc->geometry_size,
+                                                   VIO_STAGE_GEOMETRY, 1, "gs_5_1", "GS",
+                                                   compile_flags, desc->format, desc->geometry_hlsl);
+        if (!shader->gs_blob) goto fail;
+    }
+    if (desc->tess_control_data) {
+        shader->hs_blob = d3d12_compile_stage_blob(desc->tess_control_data, desc->tess_control_size,
+                                                   VIO_STAGE_TESS_CONTROL, 0, "hs_5_1", "HS",
+                                                   compile_flags, desc->format, desc->tess_control_hlsl);
+        if (!shader->hs_blob) goto fail;
+    }
+    if (desc->tess_eval_data) {
+        shader->ds_blob = d3d12_compile_stage_blob(desc->tess_eval_data, desc->tess_eval_size,
+                                                   VIO_STAGE_TESS_EVAL, desc->geometry_data ? 0 : 1,
+                                                   "ds_5_1", "DS", compile_flags, desc->format, desc->tess_eval_hlsl);
+        if (!shader->ds_blob) goto fail;
+    }
+
     if (allocated_vs) free(allocated_vs);
     if (allocated_ps) free(allocated_ps);
     return shader;
@@ -3967,6 +4192,9 @@ fail:
     if (allocated_ps) free(allocated_ps);
     if (shader->vs_blob) ID3D10Blob_Release(shader->vs_blob);
     if (shader->ps_blob) ID3D10Blob_Release(shader->ps_blob);
+    if (shader->gs_blob) ID3D10Blob_Release(shader->gs_blob);
+    if (shader->hs_blob) ID3D10Blob_Release(shader->hs_blob);
+    if (shader->ds_blob) ID3D10Blob_Release(shader->ds_blob);
     free(shader);
     return NULL;
 }
@@ -3977,7 +4205,35 @@ static void d3d12_destroy_shader(void *shader_ptr)
     if (!s) return;
     if (s->vs_blob) ID3D10Blob_Release(s->vs_blob);
     if (s->ps_blob) ID3D10Blob_Release(s->ps_blob);
+    if (s->gs_blob) ID3D10Blob_Release(s->gs_blob);
+    if (s->hs_blob) ID3D10Blob_Release(s->hs_blob);
+    if (s->ds_blob) ID3D10Blob_Release(s->ds_blob);
     free(s);
+}
+
+/* Bind the constant block of a geometry / hull / domain stage: copy `data`
+ * into a fresh 256-byte-aligned slice of this frame's cbuffer ring and point
+ * the stage's root CBV at it (same scheme as the VS / PS slices pushed by
+ * php_vio.c - D3D12 has no buffer renaming, so every draw gets its own). */
+static void d3d12_bind_stage_constants(int stage, void *backend_buffer,
+                                       const void *data, size_t size)
+{
+    (void)backend_buffer;
+    if (!vio_d3d12.cmd_list || !vio_d3d12.cbuffer_heap_mapped || !data || size == 0) return;
+    UINT param;
+    switch (stage) {
+        case VIO_STAGE_GEOMETRY:     param = VIO_D3D12_RP_GS_CBV; break;
+        case VIO_STAGE_TESS_CONTROL: param = VIO_D3D12_RP_HS_CBV; break;
+        case VIO_STAGE_TESS_EVAL:    param = VIO_D3D12_RP_DS_CBV; break;
+        default: return;
+    }
+    UINT aligned = (UINT)((size + 255) & ~(size_t)255);
+    UINT offset = vio_d3d12.cbuffer_heap_offset;
+    if (offset + aligned > vio_d3d12.cbuffer_frame_end) return;   /* slice exhausted; grows next frame */
+    memcpy(vio_d3d12.cbuffer_heap_mapped + offset, data, size);
+    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+        vio_d3d12.cmd_list, param, vio_d3d12.cbuffer_heap_gpu + offset);
+    vio_d3d12.cbuffer_heap_offset = offset + aligned;
 }
 
 /* ── Drawing ──────────────────────────────────────────────────────── */
@@ -5345,15 +5601,50 @@ static double d3d12_gpu_frame_time(void)
     return vio_d3d12.initialized && vio_d3d12.ts_heap ? vio_d3d12.last_gpu_ms : -1.0;
 }
 
+/* Second half of the optional-stage probe (see the D3D11 twin): the canonical
+ * stage's SPIRV-Cross HLSL must also pass FXC for the SM 5.1 profile. */
+static int d3d12_stage_supported(int stage, const char *profile)
+{
+    static int cache[VIO_PROBE_COUNT] = { -1, -1, -1, -1, -1, -1 };
+    if (stage < 0 || stage >= VIO_PROBE_COUNT) return 0;
+    if (cache[stage] >= 0) return cache[stage];
+    int ok = 0;
+    if (vio_hlsl_stage_supported(stage)) {
+        char *hlsl = vio_hlsl_probe_hlsl(stage, 51);
+        if (hlsl) {
+            ID3DBlob *blob = NULL, *errs = NULL;
+            HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "probe", NULL, NULL, "main", profile,
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &errs);
+            ok = SUCCEEDED(hr) ? 1 : 0;
+            if (!ok && getenv("VIO_DEBUG_STAGE_PROBE")) {
+                fprintf(stderr, "[vio] D3D12 stage probe %d (%s): FXC rejected the SPIRV-Cross HLSL: %s\n",
+                        stage, profile, errs ? (const char *)ID3D10Blob_GetBufferPointer(errs) : "unknown");
+            }
+            if (blob) ID3D10Blob_Release(blob);
+            if (errs) ID3D10Blob_Release(errs);
+            free(hlsl);
+        }
+    }
+    cache[stage] = ok;
+    return ok;
+}
+
 static int d3d12_supports_feature(vio_feature feature)
 {
     switch (feature) {
         case VIO_FEATURE_COMPUTE:      return 1; /* compute pipeline + dispatch + readback wired */
-        /* The hardware can, but vio_shader_desc only carries a vertex + fragment
-         * stage — there is no way to hand a GS / HS / DS to the backend, so the
-         * flags must not promise it. */
-        case VIO_FEATURE_TESSELLATION: return 0;
-        case VIO_FEATURE_GEOMETRY:     return 0;
+        /* vio_shader 'geometry' / 'tess_control' + 'tess_eval': SPIR-V -> HLSL
+         * gs/hs/ds_5_1 via SPIRV-Cross, baked into the PSO; per-stage root
+         * CBV + SRV / sampler table mirrors (VIO_D3D12_RP_GS_* ..). Every
+         * D3D12 device is feature level 11_0+, so the GPU side always has the
+         * stages; the flag additionally requires a SPIRV-Cross that can emit
+         * them (older Vulkan-SDK builds cannot - vio_hlsl_stage_supported). */
+        case VIO_FEATURE_TESSELLATION:
+            return d3d12_stage_supported(VIO_STAGE_TESS_CONTROL, "hs_5_1")
+                && d3d12_stage_supported(VIO_STAGE_TESS_EVAL, "ds_5_1");
+        case VIO_FEATURE_GEOMETRY:     return d3d12_stage_supported(VIO_STAGE_GEOMETRY, "gs_5_1");
+        case VIO_FEATURE_HLSL_STAGE_OVERRIDE: return 1;   /* 'hlsl' => [stage => source] for GS / HS / DS */
+        case VIO_FEATURE_GEOMETRY_INSTANCING: return d3d12_stage_supported(VIO_PROBE_GS_INSTANCED, "gs_5_1");   /* [instance(N)] */
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
         case VIO_FEATURE_MULTIVIEW:    return 0;
         case VIO_FEATURE_3D_PIPELINE:  return 1;
@@ -5375,6 +5666,14 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return 1; /* BC1-BC7 mandatory on every D3D12 device */
         case VIO_FEATURE_SHADING_RATE:        return vio_d3d12.vrs_tier > 0; /* RSSetShadingRate, VRS Tier 1+ (GAP-PHASE5 12) */
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
+        case VIO_FEATURE_RENDER_TARGET_LAYERED: return 1; /* array resources: RTV / DSV per layer, array / cube SRVs */
+        /* All-slice RTV / DSV + SV_RenderTargetArrayIndex from the GS. */
+        /* SV_RenderTargetArrayIndex from the VS is core D3D12 (drivers without
+         * VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation
+         * emulate it), so layered binds always have a stage that picks the slice. */
+        case VIO_FEATURE_LAYERED_RENDER: return 1;
+        case VIO_FEATURE_VERTEX_LAYER:   return 1;
+        case VIO_FEATURE_MULTI_VIEWPORT: return 1;   /* RSSetViewports(n) + scissor per viewport */
         case VIO_FEATURE_MIPMAP_GEN:          return 1; /* compute downsample (GAP-PHASE5 11), CPU box filter fallback */
         case VIO_FEATURE_CUBEMAP:      return 1;
         case VIO_FEATURE_DEPTH_BIAS:   return 1; /* PSO rasterizer state */
@@ -5574,6 +5873,30 @@ static void d3d12_bind_texture(void *texture, int slot)
 /* Build (or reuse) the 8-sampler block matching pending_samplers[] for the
  * bound SRV slots and point root param 4 at it. Slots without a texture get
  * combo 0 so the block content is fully determined by the bound set. */
+/* Point the PS SRV / sampler table root parameters at `gpu` and mirror the
+ * same block into the GEOMETRY / HULL / DOMAIN table parameters when the
+ * bound pipeline carries those stages (a domain shader sampling a
+ * displacement map sees the texture at the same register as the PS). */
+static void d3d12_set_srv_tables(D3D12_GPU_DESCRIPTOR_HANDLE gpu)
+{
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_PS_SRV, gpu);
+    vio_d3d12_pipeline *p = d3d12_current_pipeline;
+    if (!p) return;
+    if (p->has_gs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_GS_SRV, gpu);
+    if (p->has_hs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_HS_SRV, gpu);
+    if (p->has_ds) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_DS_SRV, gpu);
+}
+
+static void d3d12_set_sampler_tables(D3D12_GPU_DESCRIPTOR_HANDLE gpu)
+{
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_PS_SAMPLER, gpu);
+    vio_d3d12_pipeline *p = d3d12_current_pipeline;
+    if (!p) return;
+    if (p->has_gs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_GS_SAMPLER, gpu);
+    if (p->has_hs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_HS_SAMPLER, gpu);
+    if (p->has_ds) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_DS_SAMPLER, gpu);
+}
+
 static void d3d12_flush_sampler_table(void)
 {
     if (!vio_d3d12.sampler_heap || !vio_d3d12.sampler_combo_heap) return;
@@ -5594,7 +5917,7 @@ static void d3d12_flush_sampler_table(void)
     for (int i = 0; i < vio_d3d12.sampler_set_count; i++) {
         if (memcmp(combos, vio_d3d12.sampler_set_cache[i].combos, sizeof(combos)) == 0) {
             vio_d3d12.sampler_table_gpu = vio_d3d12.sampler_set_cache[i].gpu;
-            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, 4, vio_d3d12.sampler_table_gpu);
+            d3d12_set_sampler_tables(vio_d3d12.sampler_table_gpu);
             vio_d3d12.sampler_table_bound = 1;
             if (i != 0) {
                 /* swap to front */
@@ -5613,7 +5936,7 @@ static void d3d12_flush_sampler_table(void)
         /* Ring exhausted (hundreds of distinct sampler sets in one frame):
          * keep whatever block is bound rather than drop the draw. */
         if (vio_d3d12.sampler_table_bound) {
-            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, 4, vio_d3d12.sampler_table_gpu);
+            d3d12_set_sampler_tables(vio_d3d12.sampler_table_gpu);
         }
         return;
     }
@@ -5635,7 +5958,7 @@ static void d3d12_flush_sampler_table(void)
     ID3D12Device_CopyDescriptors(vio_d3d12.device, 1, &dst_cpu, &dst_size,
                                  VIO_D3D12_SAMPLER_TABLE_SIZE, srcs, NULL,
                                  D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, 4, dst_gpu);
+    d3d12_set_sampler_tables(dst_gpu);
 
     vio_d3d12.sampler_table_gpu = dst_gpu;
     vio_d3d12.sampler_table_bound = 1;
@@ -5687,8 +6010,7 @@ void vio_d3d12_flush_srv_table(void)
             }
         }
         if (same) {
-            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(
-                vio_d3d12.cmd_list, 2, vio_d3d12.srv_table_gpu);
+            d3d12_set_srv_tables(vio_d3d12.srv_table_gpu);
             return;
         }
     }
@@ -5737,7 +6059,7 @@ void vio_d3d12_flush_srv_table(void)
         }
     }
 
-    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, 2, dst_gpu);
+    d3d12_set_srv_tables(dst_gpu);
 
     /* Cache this block + the texture set it was built from for the dedup
      * fast-path above (valid until begin_frame rebases the ring or a pipeline
@@ -5770,6 +6092,25 @@ static void d3d12_set_viewport(int x, int y, int width, int height)
 
     D3D12_RECT scissor = {x, y, x + width, y + height};
     ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
+}
+
+/* Several viewports, each with its own scissor (D3D12 always scissors, and a
+ * viewport without a scissor rect draws nothing). */
+static int d3d12_set_viewports(const int *rects, int count)
+{
+    if (!vio_d3d12.in_frame || !vio_d3d12.cmd_list || count < 1 || count > VIO_MAX_VIEWPORTS) return -1;
+    D3D12_VIEWPORT vps[VIO_MAX_VIEWPORTS];
+    D3D12_RECT scs[VIO_MAX_VIEWPORTS];
+    for (int i = 0; i < count; i++) {
+        int x = rects[i * 4], y = rects[i * 4 + 1], w = rects[i * 4 + 2], h = rects[i * 4 + 3];
+        vps[i].TopLeftX = (float)x; vps[i].TopLeftY = (float)y;
+        vps[i].Width = (float)w;    vps[i].Height = (float)h;
+        vps[i].MinDepth = 0.0f;     vps[i].MaxDepth = 1.0f;
+        scs[i].left = x; scs[i].top = y; scs[i].right = x + w; scs[i].bottom = y + h;
+    }
+    ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, (UINT)count, vps);
+    ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, (UINT)count, scs);
+    return 0;
 }
 
 /* ── Setup context (called from vio_create after window creation) ── */
@@ -5817,6 +6158,7 @@ static const vio_backend d3d12_backend = {
     .set_uniform       = d3d12_set_uniform,
     .bind_texture      = d3d12_bind_texture,
     .set_viewport      = d3d12_set_viewport,
+    .set_viewports     = d3d12_set_viewports,
     .gpu_flush         = vio_d3d12_wait_for_gpu,
     .dispatch_compute  = d3d12_dispatch_compute,
     .create_compute_pipeline  = d3d12_create_compute_pipeline,
@@ -5846,6 +6188,7 @@ static const vio_backend d3d12_backend = {
     .render_target_cubemap   = d3d12_render_target_cubemap,
     .generate_mipmaps        = d3d12_generate_mipmaps,
     .update_texture          = d3d12_update_texture,
+    .bind_stage_constants    = d3d12_bind_stage_constants,
 };
 
 void vio_backend_d3d12_register(void)

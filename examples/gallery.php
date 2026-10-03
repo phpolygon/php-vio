@@ -904,6 +904,179 @@ GLSL;
     if (!vio_save_screenshot($ctx, $out)) throw new RuntimeException('screenshot');
 });
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * 16. Geometry shader — point sprites: one vertex in, a screen-aligned quad out
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('geometry_shader', [VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_GEOMETRY], function (VioContext $ctx, string $out) {
+    /* #version 450: location qualifiers on the varyings the GS reads. The
+     * geometry stage takes its input position from vData[0] (a user varying),
+     * not gl_in[0].gl_Position - the portable form for the D3D backends. */
+    $vs = <<<'GLSL'
+#version 450
+layout(location=0) in vec4 aPosSize;   // xyz = position, w = sprite size
+layout(location=1) in vec3 aColor;
+layout(location=0) out vec4 vData;
+layout(location=1) out vec3 vColor;
+void main() { vData = aPosSize; vColor = aColor; gl_Position = vec4(aPosSize.xyz, 1.0); }
+GLSL;
+    $gs = <<<'GLSL'
+#version 450
+layout(points) in;
+layout(triangle_strip, max_vertices = 4) out;
+layout(location=0) in vec4 vData[];
+layout(location=1) in vec3 vColor[];
+layout(location=0) out vec2 gUv;
+layout(location=1) out vec3 gColor;
+uniform float u_scale;
+uniform float u_aspect;
+void main() {
+    vec4 c = vec4(vData[0].xyz, 1.0);
+    float s = vData[0].w * u_scale;
+    vec2 h = vec2(s / u_aspect, s);
+    gColor = vColor[0];
+    gUv = vec2(0.0, 0.0); gl_Position = c + vec4(-h.x, -h.y, 0.0, 0.0); EmitVertex();
+    gUv = vec2(1.0, 0.0); gl_Position = c + vec4( h.x, -h.y, 0.0, 0.0); EmitVertex();
+    gUv = vec2(0.0, 1.0); gl_Position = c + vec4(-h.x,  h.y, 0.0, 0.0); EmitVertex();
+    gUv = vec2(1.0, 1.0); gl_Position = c + vec4( h.x,  h.y, 0.0, 0.0); EmitVertex();
+    EndPrimitive();
+}
+GLSL;
+    $fs = <<<'GLSL'
+#version 450
+layout(location=0) in vec2 gUv;
+layout(location=1) in vec3 gColor;
+layout(location=0) out vec4 o;
+void main() {
+    float d = length(gUv - vec2(0.5)) * 2.0;
+    float core = 1.0 - smoothstep(0.55, 0.75, d);
+    float glow = exp(-d * d * 3.0) * 0.5;
+    o = vec4(gColor * (core + glow) * 0.55, 1.0);
+}
+GLSL;
+    $sh = vio_shader($ctx, ['vertex' => $vs, 'geometry' => $gs, 'fragment' => $fs, 'format' => shader_fmt($ctx)]);
+    if (!$sh) throw new RuntimeException('geometry shader failed');
+    $p = vio_pipeline($ctx, ['shader' => $sh, 'topology' => VIO_POINTS, 'blend' => VIO_BLEND_ADDITIVE,
+                             'depth_test' => false, 'cull_mode' => VIO_CULL_NONE]);
+    if (!$p) throw new RuntimeException('pipeline failed');
+    /* A galaxy spiral of points: position + size + colour per vertex, ONE
+     * vertex each - the GS turns every one into a sprite quad. */
+    $v = []; $n = 700;
+    mt_srand(7);
+    for ($i = 0; $i < $n; $i++) {
+        $t = $i / $n;
+        $arm = $i % 3;
+        $a = $t * 9.0 + $arm * (2 * M_PI / 3) + (mt_rand() / mt_getrandmax() - 0.5) * 0.6;
+        $r = 0.08 + $t * 0.82 + (mt_rand() / mt_getrandmax() - 0.5) * 0.12;
+        $x = cos($a) * $r; $y = sin($a) * $r * 0.62;
+        $size = 0.012 + (1.0 - $t) * 0.05 + (mt_rand() / mt_getrandmax()) * 0.02;
+        $col = [0.35 + 0.65 * $t, 0.45 + 0.35 * (1 - $t) * 0.8, 1.0 - 0.55 * $t];
+        if ($arm === 1) $col = [$col[2], $col[0], $col[1]];
+        array_push($v, $x, $y, 0.0, $size, $col[0], $col[1], $col[2]);
+    }
+    $points = vio_mesh($ctx, ['vertices' => $v, 'layout' => [VIO_FLOAT4, VIO_FLOAT3]]);
+    vio_begin($ctx);
+    vio_clear($ctx, 0.02, 0.02, 0.05, 1.0);
+    vio_bind_pipeline($ctx, $p);
+    vio_set_uniform($ctx, 'u_scale', 1.0);
+    vio_set_uniform($ctx, 'u_aspect', W / H);
+    vio_draw($ctx, $points);
+    label($ctx, "Geometry stage: $n vertices (VIO_POINTS) → one sprite quad per point, emitted by the GS", 12, 28, 0xFFFFFFFF, 14);
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    if (!vio_save_screenshot($ctx, $out)) throw new RuntimeException('screenshot');
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * 17. Tessellation — quad patches displaced in the evaluation stage
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('tessellation', [VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_TESSELLATION], function (VioContext $ctx, string $out) {
+    $vs = <<<'GLSL'
+#version 450
+layout(location=0) in vec3 aPos;
+void main() { gl_Position = vec4(aPos, 1.0); }
+GLSL;
+    /* Control shader: passes the 4 control points through and sets every
+     * tessellation level from u_level (its own constant block on D3D). */
+    $tcs = <<<'GLSL'
+#version 450
+layout(vertices = 4) out;
+uniform float u_level;
+void main() {
+    gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
+    if (gl_InvocationID == 0) {
+        gl_TessLevelOuter[0] = u_level; gl_TessLevelOuter[1] = u_level;
+        gl_TessLevelOuter[2] = u_level; gl_TessLevelOuter[3] = u_level;
+        gl_TessLevelInner[0] = u_level; gl_TessLevelInner[1] = u_level;
+    }
+}
+GLSL;
+    /* Evaluation shader: bilinear patch position, procedural height, MVP. */
+    $tes = <<<'GLSL'
+#version 450
+layout(quads, equal_spacing, ccw) in;
+uniform mat4 u_mvp;
+layout(location=0) out vec3 vW;
+float height(vec2 p) { return 0.28 * sin(p.x * 2.6) * cos(p.y * 2.2) + 0.12 * sin(p.x * 6.0 + p.y * 4.0); }
+void main() {
+    vec2 uv = gl_TessCoord.xy;
+    vec4 a = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, uv.x);
+    vec4 b = mix(gl_in[3].gl_Position, gl_in[2].gl_Position, uv.x);
+    vec4 p = mix(a, b, uv.y);
+    p.y = height(p.xz);
+    vW = p.xyz;
+    gl_Position = u_mvp * vec4(p.xyz, 1.0);
+}
+GLSL;
+    /* Faceted lighting from screen-space derivatives makes the generated
+     * triangles visible: the density is the tessellation level. */
+    $fs = <<<'GLSL'
+#version 450
+layout(location=0) in vec3 vW;
+uniform vec3 u_light;
+layout(location=0) out vec4 o;
+void main() {
+    vec3 n = normalize(cross(dFdx(vW), dFdy(vW)));
+    if (n.y < 0.0) n = -n;
+    float d = max(dot(n, normalize(u_light - vW)), 0.0);
+    float h = clamp(vW.y * 1.6 + 0.5, 0.0, 1.0);
+    vec3 base = mix(vec3(0.12, 0.35, 0.55), vec3(0.95, 0.75, 0.35), h);
+    o = vec4(base * (0.25 + 0.75 * d), 1.0);
+}
+GLSL;
+    $sh = vio_shader($ctx, ['vertex' => $vs, 'tess_control' => $tcs, 'tess_eval' => $tes, 'fragment' => $fs, 'format' => shader_fmt($ctx)]);
+    if (!$sh) throw new RuntimeException('tessellation shader failed');
+    $p = vio_pipeline($ctx, ['shader' => $sh, 'patch_vertices' => 4, 'depth_test' => true, 'cull_mode' => VIO_CULL_NONE]);
+    if (!$p) throw new RuntimeException('pipeline failed');
+    /* Two 3x3 grids of quad patches (4 control points each, no indices) on
+     * the xz plane: left half drawn at level 2, right half at level 18. */
+    $grid = function (float $x0, float $x1, float $z0, float $z1, int $n) {
+        $v = [];
+        for ($i = 0; $i < $n; $i++) for ($j = 0; $j < $n; $j++) {
+            $ax = $x0 + ($x1 - $x0) * $i / $n; $bx = $x0 + ($x1 - $x0) * ($i + 1) / $n;
+            $az = $z0 + ($z1 - $z0) * $j / $n; $bz = $z0 + ($z1 - $z0) * ($j + 1) / $n;
+            array_push($v, $ax, 0, $az, $bx, 0, $az, $bx, 0, $bz, $ax, 0, $bz);
+        }
+        return $v;
+    };
+    $left  = vio_mesh($ctx, ['vertices' => $grid(-2.05, -0.05, -1.5, 1.5, 3), 'layout' => [VIO_FLOAT3]]);
+    $right = vio_mesh($ctx, ['vertices' => $grid(0.05, 2.05, -1.5, 1.5, 3), 'layout' => [VIO_FLOAT3]]);
+    $proj = m_perspective(deg2rad(40), W / H, 0.1, 30);
+    $mvp = m_mul($proj, m_lookat([0.0, 2.6, 4.2], [0, -0.1, 0], [0, 1, 0]));
+    vio_begin($ctx);
+    vio_clear($ctx, 0.05, 0.06, 0.09, 1.0);
+    vio_bind_pipeline($ctx, $p);
+    vio_set_uniform($ctx, 'u_mvp', $mvp);
+    vio_set_uniform($ctx, 'u_light', [3.0, 5.0, 3.0]);
+    vio_set_uniform($ctx, 'u_level', 2.0);
+    vio_draw($ctx, $left);
+    vio_set_uniform($ctx, 'u_level', 18.0);
+    vio_draw($ctx, $right);
+    label($ctx, 'Tessellation: 3x3 quad patches, height in the evaluation stage — u_level 2 (left) vs 18 (right)', 12, 28, 0xFFFFFFFF, 14);
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    if (!vio_save_screenshot($ctx, $out)) throw new RuntimeException('screenshot');
+});
+
 /* ── Report ─────────────────────────────────────────────────────────── */
 $probe = vio_create($backend, ['width' => 8, 'height' => 8, 'headless' => true, 'vsync' => false]);
 echo "backend: ", $probe ? vio_backend_name($probe) : 'n/a', "\n";

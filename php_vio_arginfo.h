@@ -726,6 +726,11 @@ ZEND_END_ARG_INFO()
 
 /* ── 3D: Render targets, cubemaps, instancing, viewport ──────────── */
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_viewports, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, viewports, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_viewport, 0, 5, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, x, IS_LONG, 0)
@@ -986,6 +991,7 @@ ZEND_FUNCTION(vio_font_load_async);
 ZEND_FUNCTION(vio_font_load_poll);
 ZEND_FUNCTION(vio_texture_size);
 ZEND_FUNCTION(vio_viewport);
+ZEND_FUNCTION(vio_viewports);
 ZEND_FUNCTION(vio_draw_3d);
 ZEND_FUNCTION(vio_draw_instanced);
 ZEND_FUNCTION(vio_render_target);
@@ -1150,6 +1156,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_font_load_poll, arginfo_vio_font_load_poll)
 	ZEND_FE(vio_texture_size, arginfo_vio_texture_size)
 	ZEND_FE(vio_viewport, arginfo_vio_viewport)
+	ZEND_FE(vio_viewports, arginfo_vio_viewports)
 	ZEND_FE(vio_draw_3d, arginfo_vio_draw_3d)
 	ZEND_FE(vio_draw_instanced, arginfo_vio_draw_instanced)
 	ZEND_FE(vio_render_target, arginfo_vio_render_target)
