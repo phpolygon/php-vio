@@ -179,9 +179,10 @@ typedef struct _vio_metal_target_desc {
     int            has_stencil; /* depth attachment is VIO_METAL_DEPTH_STENCIL */
 } vio_metal_target_desc;
 
-/* Depth format of the swapchain and of colour render targets: 8 stencil bits
- * for vio_pipeline(['stencil' => ...]). depth_only, cube and array targets keep
- * Depth32Float - they are sampled and read back as depth. */
+/* Depth format of the swapchain and of every render target (colour, depth_only,
+ * cube, array): 8 stencil bits for vio_pipeline(['stencil' => ...]), like D3D's
+ * D24S8 everywhere. Sampling reads the depth plane; the depth readback blits it
+ * with MTLBlitOptionDepthFromDepthStencil. */
 #define VIO_METAL_DEPTH_STENCIL MTLPixelFormatDepth32Float_Stencil8
 static void metal_current_target(vio_metal_target_desc *t);
 static MTLPixelFormat metal_pixel_format(int vio_fmt);
@@ -1859,10 +1860,10 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
         MTLPixelFormat color_fmt = metal_pixel_format(rt->formats[0]);
 
         if (rt->is_cube && depth_only) {
-            /* Depth-only cube (point-light shadows): one Depth32Float cube, a
+            /* Depth-only cube (point-light shadows): one depth-stencil cube, a
              * face per bind or every face with VIO_RT_ALL_LAYERS. */
             MTLTextureDescriptor *dd = [MTLTextureDescriptor
-                textureCubeDescriptorWithPixelFormat:MTLPixelFormatDepth32Float size:(NSUInteger)width mipmapped:NO];
+                textureCubeDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL size:(NSUInteger)width mipmapped:NO];
             dd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             dd.storageMode = MTLStorageModePrivate;
             id<MTLTexture> dcube = [vio_mtl.device newTextureWithDescriptor:dd];
@@ -1880,7 +1881,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             /* Array target ('layers' => N): colour and depth both 2DArray, a
              * layer per bind or all of them with VIO_RT_ALL_LAYERS. */
             MTLTextureDescriptor *dd = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:(NSUInteger)width height:(NSUInteger)height mipmapped:NO];
+                texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL width:(NSUInteger)width height:(NSUInteger)height mipmapped:NO];
             dd.textureType = MTLTextureType2DArray;
             dd.arrayLength = (NSUInteger)rt->layers;
             dd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
@@ -1926,7 +1927,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             /* Depth is a cube too, so VIO_RT_ALL_LAYERS can depth-test every
              * face in one pass; a face bind selects its slice. */
             MTLTextureDescriptor *dd = [MTLTextureDescriptor
-                textureCubeDescriptorWithPixelFormat:MTLPixelFormatDepth32Float size:(NSUInteger)width mipmapped:NO];
+                textureCubeDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL size:(NSUInteger)width mipmapped:NO];
             dd.usage = MTLTextureUsageRenderTarget;
             dd.storageMode = MTLStorageModePrivate;
             id<MTLTexture> cube_depth = [vio_mtl.device newTextureWithDescriptor:dd];
@@ -1947,7 +1948,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
         /* Depth texture — always created (parallel to OpenGL's "always create
          * depth attachment" pattern so shadow-map RTs work uniformly). */
         MTLTextureDescriptor *depth_desc = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:(depth_only ? MTLPixelFormatDepth32Float : VIO_METAL_DEPTH_STENCIL)
+            texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL
             width:width height:height mipmapped:NO];
         depth_desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         depth_desc.storageMode = MTLStorageModePrivate;
@@ -3880,10 +3881,11 @@ static int metal_read_render_target(void *rt_ptr, int face, int attachment, void
 
         int w = rt->width, h = rt->height;
         MTLPixelFormat fmt = src.pixelFormat;
+        int is_depth = fmt == MTLPixelFormatDepth32Float || fmt == VIO_METAL_DEPTH_STENCIL;
         int bgra = 0;
-        int vfmt = (fmt == MTLPixelFormatDepth32Float) ? -1 : metal_vio_format(fmt, &bgra);
+        int vfmt = is_depth ? -1 : metal_vio_format(fmt, &bgra);
         if (vfmt < -1) return -1;
-        NSUInteger bpp = (fmt == MTLPixelFormatDepth32Float) ? 4 : (NSUInteger)vio_rt_format_bpp(vfmt);
+        NSUInteger bpp = is_depth ? 4 : (NSUInteger)vio_rt_format_bpp(vfmt);
         NSUInteger bpr = (NSUInteger)w * bpp;
         id<MTLBuffer> staging = [vio_mtl.device newBufferWithLength:bpr * h options:MTLResourceStorageModeShared];
         if (!staging) return -1;
@@ -3893,7 +3895,8 @@ static int metal_read_render_target(void *rt_ptr, int face, int attachment, void
         [blit copyFromTexture:src sourceSlice:slice sourceLevel:0
                  sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
                      toBuffer:staging destinationOffset:0
-       destinationBytesPerRow:bpr destinationBytesPerImage:bpr * h];
+       destinationBytesPerRow:bpr destinationBytesPerImage:bpr * h
+                      options:(fmt == VIO_METAL_DEPTH_STENCIL ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone)];
         [blit endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -3901,7 +3904,7 @@ static int metal_read_render_target(void *rt_ptr, int face, int attachment, void
         const unsigned char *s = (const unsigned char *)[staging contents];
         unsigned char *out = (unsigned char *)out_rgba;
         size_t n = (size_t)w * h;
-        if (fmt == MTLPixelFormatDepth32Float) {
+        if (is_depth) {
             const float *d = (const float *)s;
             for (size_t i = 0; i < n; i++) {
                 unsigned char g = metal_unit_to_byte(d[i]);
@@ -4682,7 +4685,7 @@ static int metal_supports_feature(vio_feature f)
         /* Swapchain and colour targets use Depth32Float_Stencil8. */
         return 1;
     case VIO_FEATURE_RENDER_TARGET_LAYERED:
-        /* 2DArray colour + depth, Depth32Float cubes (depth_only). */
+        /* 2DArray colour + depth, depth-stencil cubes (depth_only). */
         return 1;
     case VIO_FEATURE_LAYERED_RENDER:
     case VIO_FEATURE_VERTEX_LAYER:
