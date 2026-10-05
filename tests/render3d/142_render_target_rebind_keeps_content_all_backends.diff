@@ -1,0 +1,18 @@
+001- opengl: %s
+002- d3d11: %s
+003- d3d12: %s
+004- vulkan: %s
+005- metal: %s
+006- DONE
+001+ opengl: 
+002+ Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/142_render_target_rebind_keeps_content_all_backends.php on line 29
+003+ 
+004+ Warning: vio_pipeline(): vio_pipeline requires 'shader' (VioShader object) in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/142_render_target_rebind_keeps_content_all_backends.php on line 29
+005+ 
+006+ Fatal error: Uncaught TypeError: vio_bind_pipeline(): Argument #2 ($pipeline) must be of type VioPipeline, false given in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/142_render_target_rebind_keeps_content_all_backends.php:33
+007+ Stack trace:
+008+ #0 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/142_render_target_rebind_keeps_content_all_backends.php(33): vio_bind_pipeline(Object(VioContext), false)
+009+ #1 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/142_render_target_rebind_keeps_content_all_backends.php(52): {closure:run_backend():32}(0.4, 1.0, Array)
+010+ #2 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/142_render_target_rebind_keeps_content_all_backends.php(71): run_backend('opengl')
+011+ #3 {main}
+012+   thrown in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/142_render_target_rebind_keeps_content_all_backends.php on line 33

@@ -1,0 +1,18 @@
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/backends/108_opengl_spirv_uniform_names.php on line 37
+ubo block: shader FAIL
+
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/backends/108_opengl_spirv_uniform_names.php on line 37
+default block: shader FAIL
+
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/backends/108_opengl_spirv_uniform_names.php on line 37
+array member: shader FAIL
+
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/backends/108_opengl_spirv_uniform_names.php on line 67
+
+Warning: vio_pipeline(): vio_pipeline requires 'shader' (VioShader object) in /Users/hmennen/PhpstormProjects/php-vio/tests/backends/108_opengl_spirv_uniform_names.php on line 68
+
+Fatal error: Uncaught TypeError: vio_bind_pipeline(): Argument #2 ($pipeline) must be of type VioPipeline, false given in /Users/hmennen/PhpstormProjects/php-vio/tests/backends/108_opengl_spirv_uniform_names.php:72
+Stack trace:
+#0 /Users/hmennen/PhpstormProjects/php-vio/tests/backends/108_opengl_spirv_uniform_names.php(72): vio_bind_pipeline(Object(VioContext), false)
+#1 {main}
+  thrown in /Users/hmennen/PhpstormProjects/php-vio/tests/backends/108_opengl_spirv_uniform_names.php on line 72

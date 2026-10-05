@@ -1,0 +1,7 @@
+opengl: FAIL
+  no GPU time after 7 frames (-1)
+d3d11: skip (unavailable)
+d3d12: skip (unavailable)
+vulkan: skip (unavailable)
+metal: OK
+DONE

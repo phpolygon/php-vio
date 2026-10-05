@@ -1,0 +1,12 @@
+001- opengl: %s
+001+ opengl: 
+002+ Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/143_gs_gl_in_position_all_backends.php on line 51
+003+ 
+004+ Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/143_gs_gl_in_position_all_backends.php on line 61
+005+ FAIL
+006+   A: gl_in shader not created
+007+   B: instanced shader not created
+     d3d11: %s
+     d3d12: %s
+     vulkan: %s
+--

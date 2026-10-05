@@ -1,0 +1,23 @@
+001- opengl: %r(OK|skip \(.*\))%r
+002- d3d11: %r(OK|skip \(.*\))%r
+003- d3d12: %r(OK|skip \(.*\))%r
+004- vulkan: %r(OK|skip \(.*\))%r
+005- metal: %r(OK|skip \(.*\))%r
+006- d3d12 hardware: %r(OK|skip \(.*\))%r
+007- DONE
+001+ opengl: 
+002+ Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/145_cube_mipmaps_in_frame_all_backends.php on line 29
+003+ 
+004+ Warning: vio_pipeline(): vio_pipeline requires 'shader' (VioShader object) in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/145_cube_mipmaps_in_frame_all_backends.php on line 29
+005+ 
+006+ Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/145_cube_mipmaps_in_frame_all_backends.php on line 30
+007+ 
+008+ Warning: vio_pipeline(): vio_pipeline requires 'shader' (VioShader object) in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/145_cube_mipmaps_in_frame_all_backends.php on line 30
+009+ 
+010+ Fatal error: Uncaught TypeError: vio_bind_pipeline(): Argument #2 ($pipeline) must be of type VioPipeline, false given in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/145_cube_mipmaps_in_frame_all_backends.php:42
+011+ Stack trace:
+012+ #0 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/145_cube_mipmaps_in_frame_all_backends.php(42): vio_bind_pipeline(Object(VioContext), false)
+013+ #1 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/145_cube_mipmaps_in_frame_all_backends.php(61): {closure:run_backend():34}(0, true)
+014+ #2 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/145_cube_mipmaps_in_frame_all_backends.php(88): run_backend('opengl')
+015+ #3 {main}
+016+   thrown in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/145_cube_mipmaps_in_frame_all_backends.php on line 42

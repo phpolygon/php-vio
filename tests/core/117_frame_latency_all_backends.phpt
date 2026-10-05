@@ -1,5 +1,5 @@
 --TEST--
-Waitable swapchain: vio_create(['frame_latency' => 1]) caps the CPU run-ahead on D3D11 / D3D12 (VIO_FEATURE_FRAME_LATENCY)
+Waitable swapchain: vio_create(['frame_latency' => 1]) caps the CPU run-ahead on D3D11 / D3D12 / Metal (VIO_FEATURE_FRAME_LATENCY)
 --EXTENSIONS--
 vio
 --SKIPIF--

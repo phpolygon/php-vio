@@ -1,0 +1,20 @@
+opengl: 
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/139_gs_instancing_adjacency_all_backends.php on line 47
+
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/139_gs_instancing_adjacency_all_backends.php on line 65
+
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/139_gs_instancing_adjacency_all_backends.php on line 93
+
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/139_gs_instancing_adjacency_all_backends.php on line 122
+
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/139_gs_instancing_adjacency_all_backends.php on line 132
+FAIL
+  A: instanced geometry shader not created
+  B: cube shader / target not created
+  C: adjacency geometry shader not created
+  D: line-adjacency geometry shader not created
+d3d11: skip (unavailable)
+d3d12: skip (unavailable)
+vulkan: skip (unavailable)
+metal: skip (no geometry stage)
+DONE

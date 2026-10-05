@@ -1,0 +1,9 @@
+001- opengl: %s
+001+ opengl: 
+002+ Notice: vio_storage_buffer(): vio_storage_buffer: compute not supported on this backend in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/120_indirect_draw_all_backends.php on line 39
+003+ FAIL
+004+   indirect argument buffer not created
+     d3d11: %s
+     d3d12: %s
+     metal: %s
+--
