@@ -1,0 +1,11 @@
+     set_title OK
+     cursor_mode OK
+003- fullscreen 2× OK
+004- borderless 2× OK
+005- windowed 2× OK
+006- transitions OK
+007- bool(true)
+008- bool(true)
+009- bool(true)
+010- bool(true)
+011- OK
