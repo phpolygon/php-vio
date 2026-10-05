@@ -9524,6 +9524,8 @@ ZEND_FUNCTION(vio_draw_instanced)
                     ctx->backend->update_buffer(sh->frag_cbuffer_backend, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size, 0);
                     sh->frag_cbuffer_dirty = 0;
                 }
+                /* Geometry / tessellation stage uniforms (test 135). */
+                vio_push_extra_stage_constants(ctx, sh);
             }
             /* Matrices go into this draw's own per-frame ring slice. */
             vio_metal_draw_instanced(mesh, mat_data, (int)instance_count);

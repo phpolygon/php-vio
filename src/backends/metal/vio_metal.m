@@ -1490,6 +1490,12 @@ extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
  * (metal_gfx_spirv_to_msl, vio_metal_tess_reflect) live in plain C. */
 #include "vio_metal_msl.h"
 
+/* Vertex + geometry stage as compute kernels and the pass-through vertex
+ * function (METAL-GEOMETRY-PLAN.md). */
+extern uint32_t *vio_compile_glsl_compute_to_spirv(const char *source, size_t *out_size, char **error_msg);
+extern uint32_t *vio_compile_glsl_stage_to_spirv(const char *source, int stage, size_t *out_size, char **error_msg);
+#include "vio_metal_kernel.h"
+
 /* Compute pipelines of a tessellation shader's vertex kernel, one per mesh
  * stride (the stage-input descriptor bakes the stride in). */
 #define VIO_METAL_TESS_VS_VARIANTS 4
@@ -1523,6 +1529,21 @@ typedef struct _vio_metal_shader {
         void *pso;                     /* id<MTLComputePipelineState>, +1 retained */
     } vs_kernel_variants[VIO_METAL_TESS_VS_VARIANTS];
     int                 vs_kernel_variant_count;
+    /* Geometry stage, emulated: vert_fn is the pass-through vertex function
+     * (vs / vl its tables), the vertex and geometry stages run as kernels
+     * before every draw (metal_draw_gs). */
+    int                 gs;
+    int                 gs_in_vertices;  /* 1 / 2 / 3 / 4 / 6 per input primitive */
+    int                 gs_out_prim;     /* MK_PRIM_* */
+    int                 gs_max_vertices, gs_invocations, gs_idx_per;
+    int                 gs_vs_slots, gs_slots;  /* vec4 slots per vertex / geometry record */
+    int                 gs_vs_inst;      /* the vertex stage reads locations 3..6 */
+    int                 gs_mesh_stride;  /* default mesh stride of the vertex stage */
+    void               *gs_vs_pso;       /* id<MTLComputePipelineState>, +1 retained */
+    void               *gs_pso;          /* id<MTLComputePipelineState>, +1 retained */
+    vio_metal_stage_res gs_vsk, gs_gsk;  /* resource tables of the two kernels */
+    int                 gs_vs_cb, gs_gs_cb;   /* MSL index of each stage's own uniform block, -1 */
+    int                 gs_rec_index;    /* pass-through: MSL index of the record buffer */
 } vio_metal_shader;
 
 static id<MTLFunction> metal_build_function(const char *msl, char **error_out)
@@ -1564,6 +1585,8 @@ static void metal_destroy_shader(void *s)
     if (sh->frag_fn_noout) { CFRelease((CFTypeRef)sh->frag_fn_noout); sh->frag_fn_noout = NULL; }
     if (sh->vs_kernel_fn) { CFRelease((CFTypeRef)sh->vs_kernel_fn); sh->vs_kernel_fn = NULL; }
     if (sh->tcs_pso) { CFRelease((CFTypeRef)sh->tcs_pso); sh->tcs_pso = NULL; }
+    if (sh->gs_vs_pso) { CFRelease((CFTypeRef)sh->gs_vs_pso); sh->gs_vs_pso = NULL; }
+    if (sh->gs_pso) { CFRelease((CFTypeRef)sh->gs_pso); sh->gs_pso = NULL; }
     for (int i = 0; i < sh->vs_kernel_variant_count; i++) {
         if (sh->vs_kernel_variants[i].pso) CFRelease((CFTypeRef)sh->vs_kernel_variants[i].pso);
     }
@@ -1587,6 +1610,95 @@ static uint32_t *metal_stage_spirv(const void *data, size_t size, int is_fragmen
 }
 #endif
 
+#ifdef HAVE_SPIRV_CROSS
+/* GLSL compute kernel -> SPIR-V -> MSL (renumbered like every stage) -> PSO. */
+static id<MTLComputePipelineState> metal_kernel_pso(const char *glsl, vio_metal_stage_res *res, char **err)
+{
+    size_t size = 0;
+    char *warn = NULL;
+    uint32_t *spv = vio_compile_glsl_compute_to_spirv(glsl, &size, &warn);
+    if (!spv) { *err = warn; return nil; }
+    free(warn);
+    char *msl = metal_gfx_spirv_to_msl(spv, size, VIO_MSL_KERNEL, res, NULL, 0xFFFFFFFFu, NULL, err);
+    free(spv);
+    if (!msl) return nil;
+    id<MTLFunction> fn = metal_build_function(msl, err);
+    free(msl);
+    if (!fn) return nil;
+    NSError *nserr = nil;
+    id<MTLComputePipelineState> pso = [vio_mtl.device newComputePipelineStateWithFunction:fn error:&nserr];
+    if (!pso) *err = strdup(nserr ? [[nserr localizedDescription] UTF8String] : "compute pipeline failed");
+    return pso;
+}
+
+/* Geometry stage (METAL-GEOMETRY-PLAN.md): vertex and geometry kernels, and
+ * the pass-through vertex stage as the shader's MSL vertex source (returned,
+ * malloc'd; sh->vs / sh->vl describe it). */
+static char *metal_gs_prepare(vio_metal_shader *sh, const uint32_t *vs_spirv, size_t vs_size,
+                              const void *gs_data, size_t gs_size, char **err)
+{
+    mk_module mv, mg;
+    char *vk = NULL, *gk = NULL, *pt = NULL, *msl = NULL;
+    uint32_t *pt_spv = NULL;
+    size_t pt_size = 0;
+    char *warn = NULL;
+    id<MTLComputePipelineState> vs_pso = nil, gs_pso = nil;
+    if (mk_parse(&mv, vs_spirv, vs_size, err) != 0) return NULL;
+    if (mk_parse(&mg, (const uint32_t *)gs_data, gs_size, err) != 0) { mk_free(&mv); return NULL; }
+    if (mv.model != MK_MODEL_VERTEX || mg.model != MK_MODEL_GEOMETRY) {
+        *err = strdup("expected a vertex and a geometry stage");
+        goto done;
+    }
+    if (mv.has_samplers || mg.has_samplers) {
+        *err = strdup("textures in the vertex / geometry stage of a geometry pipeline are not supported on Metal");
+        goto done;
+    }
+    vk = mk_vs_kernel_glsl(&mv, err);
+    if (!vk) goto done;
+    gk = mk_gs_kernel_glsl(&mg, &mv, err);
+    if (!gk) goto done;
+    pt = mk_passthrough_vs_glsl(&mg);
+    if (!pt) { *err = strdup("out of memory"); goto done; }
+    if (getenv("VIO_DUMP_GS_GLSL")) {
+        fprintf(stderr, "==== Metal vertex kernel GLSL ====\n%s\n==== Metal geometry kernel GLSL ====\n%s\n"
+                        "==== Metal pass-through vertex GLSL ====\n%s\n==== end ====\n", vk, gk, pt);
+        fflush(stderr);
+    }
+
+    vs_pso = metal_kernel_pso(vk, &sh->gs_vsk, err);
+    if (!vs_pso) goto done;
+    gs_pso = metal_kernel_pso(gk, &sh->gs_gsk, err);
+    if (!gs_pso) goto done;
+    pt_spv = vio_compile_glsl_stage_to_spirv(pt, VIO_STAGE_VERTEX, &pt_size, &warn);
+    if (!pt_spv) { *err = warn; goto done; }
+    free(warn);
+    msl = metal_gfx_spirv_to_msl(pt_spv, pt_size, VIO_MSL_VERTEX, &sh->vs, &sh->vl, 0xFFFFFFFFu, NULL, err);
+    if (!msl) goto done;
+
+    sh->gs = 1;
+    sh->gs_in_vertices  = mg.in_vertices;
+    sh->gs_out_prim     = mg.out_prim;
+    sh->gs_max_vertices = mg.max_vertices;
+    sh->gs_invocations  = mg.invocations;
+    sh->gs_idx_per      = mk_gs_index_count(&mg);
+    sh->gs_vs_slots     = mv.out_slots;
+    sh->gs_slots        = mg.out_slots;
+    sh->gs_vs_inst      = mk_vs_uses_instance(&mv);
+    sh->gs_mesh_stride  = mk_vs_mesh_stride(&mv);
+    sh->gs_vs_cb        = mk_user_cbuffer(&sh->gs_vsk);
+    sh->gs_gs_cb        = mk_user_cbuffer(&sh->gs_gsk);
+    sh->gs_rec_index    = mk_res_index(&sh->vs, VIO_MK_BIND_IN);
+    sh->gs_vs_pso = (void *)CFBridgingRetain(vs_pso);
+    sh->gs_pso    = (void *)CFBridgingRetain(gs_pso);
+done:
+    mk_free(&mv);
+    mk_free(&mg);
+    free(vk); free(gk); free(pt); free(pt_spv);
+    if (!sh->gs) { free(msl); return NULL; }
+    return msl;
+}
+#endif
+
 static void *metal_compile_shader(vio_shader_desc *desc)
 {
     if (!desc || !desc->vertex_data || !desc->fragment_data) {
@@ -1601,11 +1713,18 @@ static void *metal_compile_shader(vio_shader_desc *desc)
     php_error_docref(NULL, E_WARNING, "Metal: shaders require SPIRV-Cross (build with --with-spirv-cross)");
     return NULL;
 #else
-    if (desc->geometry_data) {
-        php_error_docref(NULL, E_WARNING, "Metal: there is no geometry stage on Metal");
-        return NULL;
-    }
     int tess = desc->tess_control_data && desc->tess_eval_data;
+    if (desc->geometry_data) {
+        /* Emulated with compute kernels (metal_draw_gs). */
+        if (tess) {
+            php_error_docref(NULL, E_WARNING, "Metal: a geometry stage behind tessellation is not supported");
+            return NULL;
+        }
+        if (desc->geometry_size < 20 || *(const uint32_t *)desc->geometry_data != 0x07230203) {
+            php_error_docref(NULL, E_WARNING, "Metal: the geometry stage must arrive as SPIR-V");
+            return NULL;
+        }
+    }
     if (tess && !(desc->tess_control_size >= 4 && *(const uint32_t *)desc->tess_control_data == 0x07230203 &&
                   desc->tess_eval_size >= 4 && *(const uint32_t *)desc->tess_eval_data == 0x07230203)) {
         php_error_docref(NULL, E_WARNING, "Metal: tessellation stages must arrive as SPIR-V");
@@ -1651,6 +1770,9 @@ static void *metal_compile_shader(vio_shader_desc *desc)
         tes_msl = metal_gfx_spirv_to_msl((const uint32_t *)desc->tess_eval_data, desc->tess_eval_size,
                                          VIO_MSL_TESS_EVAL, &sh->tes, NULL, 0xFFFFFFFFu, &sh->tess_info, &err);
         if (!tes_msl) { what = "TES SPIR-V→MSL"; goto fail; }
+    } else if (desc->geometry_data) {
+        vs_msl = metal_gs_prepare(sh, vs_spirv, vs_size, desc->geometry_data, desc->geometry_size, &err);
+        if (!vs_msl) { what = "geometry stage"; goto fail; }
     } else {
         vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_VERTEX, &sh->vs, &sh->vl,
                                         0xFFFFFFFFu, NULL, &err);
@@ -1712,7 +1834,7 @@ fail:
     if (vs_owned) free(vs_spirv);
     if (fs_owned) free(fs_spirv);
     free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl);
-    free(sh);
+    metal_destroy_shader(sh);   /* kernel PSOs of a geometry stage */
     return NULL;
 #endif /* HAVE_SPIRV_CROSS */
 }
@@ -2677,6 +2799,7 @@ typedef struct _vio_metal_pipeline {
     float            depth_bias;
     float            slope_scaled_depth_bias;
     int              patch_vertices; /* input control points per patch (tessellation shaders) */
+    vio_topology     topology;       /* primitive assembly of an emulated geometry stage */
     vio_metal_pso_variant variants[VIO_METAL_PSO_VARIANTS];
     int                   variant_count;
 } vio_metal_pipeline;
@@ -2790,6 +2913,12 @@ static void *metal_create_pipeline(vio_pipeline_desc *desc)
         if (sh->frag_fn) p->frag_fn = (void *)CFRetain((CFTypeRef)sh->frag_fn);
         if (sh->frag_fn_noout) p->frag_fn_noout = (void *)CFRetain((CFTypeRef)sh->frag_fn_noout);
         p->primitive = metal_topology(desc->topology);
+        p->topology = desc->topology;
+        if (sh->gs) {
+            /* The draw rasterizes what the geometry kernel emitted. */
+            p->primitive = sh->gs_out_prim == MK_PRIM_POINTS ? MTLPrimitiveTypePoint
+                         : sh->gs_out_prim == MK_PRIM_LINES  ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle;
+        }
         switch (desc->cull_mode) {
             case VIO_CULL_BACK:  p->cull = MTLCullModeBack;  break;
             case VIO_CULL_FRONT: p->cull = MTLCullModeFront; break;
@@ -3482,6 +3611,233 @@ static void metal_draw_tess(vio_metal_buffer *vb, int stride, int first_vertex, 
     }
 }
 
+/* ── Geometry-stage draws (METAL-GEOMETRY-PLAN.md) ─────────────────
+ *
+ * 1. CPU: primitive assembly into a stream of mesh vertex indices, gs_in_vertices
+ *    per primitive (lists as they are, strips / fans expanded in GL order);
+ * 2. vertex kernel: one thread per (stream vertex, instance) -> vertex records;
+ * 3. geometry kernel: one thread per (primitive x invocation, instance) ->
+ *    geometry records + an index list (unused entries point at record 0, a
+ *    vertex outside the clip volume);
+ * 4. indexed draw of that list through the pass-through vertex function.
+ * Kernels are encoded like the tessellation kernels: own command buffer ahead
+ * of the frame, or inside the frame behind an async dispatch. */
+
+/* Source position of vertex k of primitive `prim` for the pipeline topology,
+ * -1 when the topology cannot feed this input primitive. */
+static long metal_gs_assemble(vio_topology topo, int n_in, long prim, int k)
+{
+    switch (topo) {
+        case VIO_LINE_STRIP:
+            if (n_in == 2) return prim + k;
+            break;
+        case VIO_TRIANGLE_STRIP:
+            if (n_in == 3) {
+                /* odd triangles swap their first two vertices (GL 10.1.4) */
+                if ((prim & 1) && k < 2) return prim + (1 - k);
+                return prim + k;
+            }
+            break;
+        case VIO_TRIANGLE_FAN:
+            if (n_in == 3) return k == 0 ? prim + 1 : (k == 1 ? prim + 2 : 0);
+            break;
+        case VIO_LINE_STRIP_ADJACENCY:
+            if (n_in == 4) return prim + k;
+            break;
+        case VIO_TRIANGLE_STRIP_ADJACENCY:
+            return -1;
+        default:
+            break;
+    }
+    return prim * n_in + k;
+}
+
+static long metal_gs_prim_count(vio_topology topo, int n_in, long n_src)
+{
+    switch (topo) {
+        case VIO_LINE_STRIP:            if (n_in == 2) return n_src - 1; break;
+        case VIO_TRIANGLE_STRIP:
+        case VIO_TRIANGLE_FAN:          if (n_in == 3) return n_src - 2; break;
+        case VIO_LINE_STRIP_ADJACENCY:  if (n_in == 4) return n_src - 3; break;
+        case VIO_TRIANGLE_STRIP_ADJACENCY: return -1;
+        default: break;
+    }
+    return n_src / n_in;
+}
+
+static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, int vertex_count,
+                          vio_metal_buffer *ib, int index_bytes, int first_index, int index_count,
+                          int base_vertex, const float *instance_mats, int instances, int with_storage)
+{
+    vio_metal_pipeline *p = metal_current_pipeline;
+    vio_metal_shader *sh = p ? p->shader : NULL;
+    if (!sh || !sh->gs || !vb || !vb->buffer || !sh->gs_vs_pso || !sh->gs_pso || !vio_mtl.current_encoder) return;
+    if (stride <= 0) stride = sh->gs_mesh_stride;
+    if (stride < 0 || stride % 4 != 0) return;
+    if (instances < 1) instances = 1;
+
+    @autoreleasepool {
+        int indexed = ib && ib->buffer && index_count > 0;
+        long n_src = indexed ? index_count : vertex_count;
+        size_t vb_count = stride > 0 ? vb->size / (size_t)stride : 1;
+        long prims = metal_gs_prim_count(p->topology, sh->gs_in_vertices, n_src);
+        if (prims < 0) {
+            php_error_docref(NULL, E_WARNING, "Metal: triangle strips with adjacency are not supported by the geometry emulation");
+            return;
+        }
+        if (prims == 0 || sh->gs_idx_per == 0) return;
+        NSUInteger stream = (NSUInteger)prims * (NSUInteger)sh->gs_in_vertices;
+        NSUInteger total_inv = (NSUInteger)prims * (NSUInteger)sh->gs_invocations * (NSUInteger)instances;
+
+        NSUInteger vid_off = 0, vrec_off = 0, grec_off = 0, idx_off = 0, inst_off = 0;
+        id<MTLBuffer> vid  = metal_ring_alloc(stream * 4, &vid_off);
+        id<MTLBuffer> vrec = metal_ring_alloc(stream * (NSUInteger)instances * (NSUInteger)sh->gs_vs_slots * 16, &vrec_off);
+        id<MTLBuffer> grec = metal_ring_alloc((1 + total_inv * (NSUInteger)sh->gs_max_vertices) * (NSUInteger)sh->gs_slots * 16, &grec_off);
+        id<MTLBuffer> idx  = metal_ring_alloc(total_inv * (NSUInteger)sh->gs_idx_per * 4, &idx_off);
+        id<MTLBuffer> inst = nil;
+        if (sh->gs_vs_inst) {
+            inst = metal_ring_alloc((NSUInteger)instances * 64, &inst_off);
+            if (inst) {
+                float *m = (float *)((char *)[inst contents] + inst_off);
+                static const float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                for (int i = 0; i < instances; i++) memcpy(m + i * 16, instance_mats ? instance_mats + i * 16 : identity, 64);
+            }
+        }
+        if (!vid || !vrec || !grec || !idx || (sh->gs_vs_inst && !inst)) return;
+
+        /* 1. assembly: mesh vertex of every stream position */
+        {
+            uint32_t *dst = (uint32_t *)((char *)[vid contents] + vid_off);
+            const void *ix = indexed ? [(__bridge id<MTLBuffer>)ib->buffer contents] : NULL;
+            size_t ib_count = indexed ? ib->size / (index_bytes == 2 ? 2 : 4) : 0;
+            for (long pr = 0; pr < prims; pr++) {
+                for (int k = 0; k < sh->gs_in_vertices; k++) {
+                    long s = metal_gs_assemble(p->topology, sh->gs_in_vertices, pr, k);
+                    long long v;
+                    if (indexed) {
+                        size_t at = (size_t)first_index + (size_t)s;
+                        v = at < ib_count ? (index_bytes == 2 ? ((const uint16_t *)ix)[at] : ((const uint32_t *)ix)[at]) : 0;
+                        v += base_vertex;
+                    } else {
+                        v = (long long)first_vertex + s;
+                    }
+                    if (v < 0 || (size_t)v >= vb_count) v = 0;
+                    dst[pr * sh->gs_in_vertices + k] = (uint32_t)v;
+                }
+            }
+        }
+        /* record 0: the culled vertex unused indices point at */
+        {
+            float *r0 = (float *)((char *)[grec contents] + grec_off);
+            memset(r0, 0, (size_t)sh->gs_slots * 16);
+            r0[0] = 4.0f; r0[1] = 4.0f; r0[2] = 4.0f; r0[3] = 1.0f;
+            r0[6] = 1.0f;   /* point size */
+        }
+
+        int in_frame = metal_async_cb != nil && metal_async_cb == vio_mtl.current_cmd_buf;
+        id<MTLTexture> saved_tex[VIO_METAL_FS_SLOTS];
+        id<MTLSamplerState> saved_smp[VIO_METAL_FS_SLOTS];
+        MTLViewport saved_vp[VIO_METAL_MAX_VIEWPORTS];
+        MTLScissorRect saved_sc[VIO_METAL_MAX_VIEWPORTS];
+        int saved_vp_count = metal_vp_count, saved_has_sc = metal_vp_has_scissor;
+        id<MTLCommandBuffer> cb = nil;
+        if (in_frame) {
+            metal_fs_shadow_copy(saved_tex, saved_smp);
+            memcpy(saved_vp, metal_vp, sizeof(saved_vp));
+            memcpy(saved_sc, metal_sc, sizeof(saved_sc));
+            [vio_mtl.current_encoder endEncoding];
+            vio_mtl.current_encoder = nil;
+            cb = vio_mtl.current_cmd_buf;
+        } else {
+            cb = metal_new_command_buffer();
+        }
+        if (!cb) return;
+        static const unsigned char zero_block[256] = {0};
+
+        /* 2. vertex kernel */
+        id<MTLComputePipelineState> vs_pso = (__bridge id<MTLComputePipelineState>)sh->gs_vs_pso;
+        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        [ce setComputePipelineState:vs_pso];
+        int ix;
+        if ((ix = mk_res_index(&sh->gs_vsk, VIO_MK_BIND_IN)) >= 0)  [ce setBuffer:(__bridge id<MTLBuffer>)vb->buffer offset:0 atIndex:(NSUInteger)ix];
+        if ((ix = mk_res_index(&sh->gs_vsk, VIO_MK_BIND_OUT)) >= 0) [ce setBuffer:vrec offset:vrec_off atIndex:(NSUInteger)ix];
+        if ((ix = mk_res_index(&sh->gs_vsk, VIO_MK_BIND_VID)) >= 0) [ce setBuffer:vid offset:vid_off atIndex:(NSUInteger)ix];
+        if ((ix = mk_res_index(&sh->gs_vsk, VIO_MK_BIND_INST)) >= 0) {
+            if (inst) [ce setBuffer:inst offset:inst_off atIndex:(NSUInteger)ix];
+            else if (metal_identity_instance) [ce setBuffer:metal_identity_instance offset:0 atIndex:(NSUInteger)ix];
+        }
+        if ((ix = mk_res_index(&sh->gs_vsk, VIO_MK_BIND_PARAMS)) >= 0) {
+            uint32_t params[4] = { (uint32_t)stream, (uint32_t)instances, (uint32_t)(stride / 4), 0 };
+            [ce setBytes:params length:sizeof(params) atIndex:(NSUInteger)ix];
+        }
+        if (sh->gs_vs_cb >= 0) {
+            if (metal_current_vs_cb && metal_current_vs_cb->shadow) {
+                [ce setBytes:metal_current_vs_cb->shadow length:metal_current_vs_cb->shadow_size atIndex:(NSUInteger)sh->gs_vs_cb];
+            } else {
+                [ce setBytes:zero_block length:sizeof(zero_block) atIndex:(NSUInteger)sh->gs_vs_cb];
+            }
+        }
+        if (with_storage && metal_pending_storage && metal_pending_storage->buffer &&
+            (ix = mk_user_storage(&sh->gs_vsk, metal_pending_storage_binding)) >= 0) {
+            [ce setBuffer:(__bridge id<MTLBuffer>)metal_pending_storage->buffer offset:0 atIndex:(NSUInteger)ix];
+        }
+        NSUInteger tw = vs_pso.maxTotalThreadsPerThreadgroup < VIO_MK_LOCAL_SIZE ? vs_pso.maxTotalThreadsPerThreadgroup : VIO_MK_LOCAL_SIZE;
+        [ce dispatchThreads:MTLSizeMake(stream, (NSUInteger)instances, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [ce endEncoding];
+
+        /* 3. geometry kernel */
+        id<MTLComputePipelineState> gs_pso = (__bridge id<MTLComputePipelineState>)sh->gs_pso;
+        ce = [cb computeCommandEncoder];
+        [ce setComputePipelineState:gs_pso];
+        if ((ix = mk_res_index(&sh->gs_gsk, VIO_MK_BIND_IN)) >= 0)  [ce setBuffer:vrec offset:vrec_off atIndex:(NSUInteger)ix];
+        if ((ix = mk_res_index(&sh->gs_gsk, VIO_MK_BIND_OUT)) >= 0) [ce setBuffer:grec offset:grec_off atIndex:(NSUInteger)ix];
+        if ((ix = mk_res_index(&sh->gs_gsk, VIO_MK_BIND_IDX)) >= 0) [ce setBuffer:idx offset:idx_off atIndex:(NSUInteger)ix];
+        if ((ix = mk_res_index(&sh->gs_gsk, VIO_MK_BIND_PARAMS)) >= 0) {
+            uint32_t params[4] = { (uint32_t)prims, (uint32_t)stream, (uint32_t)instances, 0 };
+            [ce setBytes:params length:sizeof(params) atIndex:(NSUInteger)ix];
+        }
+        if (sh->gs_gs_cb >= 0) {
+            int gi = VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY);
+            if (metal_stage_const_size[gi] > 0) {
+                [ce setBytes:metal_stage_const[gi] length:metal_stage_const_size[gi] atIndex:(NSUInteger)sh->gs_gs_cb];
+            } else {
+                [ce setBytes:zero_block length:sizeof(zero_block) atIndex:(NSUInteger)sh->gs_gs_cb];
+            }
+        }
+        NSUInteger gx = (NSUInteger)prims * (NSUInteger)sh->gs_invocations;
+        tw = gs_pso.maxTotalThreadsPerThreadgroup < VIO_MK_LOCAL_SIZE ? gs_pso.maxTotalThreadsPerThreadgroup : VIO_MK_LOCAL_SIZE;
+        [ce dispatchThreads:MTLSizeMake(gx, (NSUInteger)instances, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [ce endEncoding];
+
+        if (in_frame) {
+            metal_open_encoder(/*load_clear=*/0);
+            metal_fs_shadow_restore(saved_tex, saved_smp);
+            memcpy(metal_vp, saved_vp, sizeof(saved_vp));
+            memcpy(metal_sc, saved_sc, sizeof(saved_sc));
+            metal_vp_count = saved_vp_count;
+            metal_vp_has_scissor = saved_has_sc;
+            metal_apply_viewports();
+        } else {
+            [cb commit];
+        }
+
+        /* 4. rasterize the emitted primitives */
+        if (!metal_prepare_draw(0)) return;
+        id<MTLRenderCommandEncoder> enc = vio_mtl.current_encoder;
+        if (sh->gs_rec_index >= 0) [enc setVertexBuffer:grec offset:grec_off atIndex:(NSUInteger)sh->gs_rec_index];
+        [enc drawIndexedPrimitives:p->primitive
+                        indexCount:total_inv * (NSUInteger)sh->gs_idx_per
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:idx
+                 indexBufferOffset:idx_off];
+    }
+}
+
+static int metal_gs_bound(void)
+{
+    return metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->gs;
+}
+
 static int metal_tess_bound(void)
 {
     return metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->tess;
@@ -3490,6 +3846,11 @@ static int metal_tess_bound(void)
 static void metal_draw(vio_draw_cmd *cmd)
 {
     if (!cmd || cmd->vertex_count <= 0) return;
+    if (metal_gs_bound()) {
+        metal_draw_gs((vio_metal_buffer *)cmd->vertex_buffer, cmd->vertex_stride, cmd->first_vertex,
+                      cmd->vertex_count, NULL, 0, 0, 0, 0, NULL, cmd->instance_count, 0);
+        return;
+    }
     if (metal_tess_bound()) {
         metal_draw_tess((vio_metal_buffer *)cmd->vertex_buffer, cmd->vertex_stride, cmd->first_vertex,
                         cmd->vertex_count, NULL, 0, 0, 0, 0, NULL, cmd->instance_count, 0);
@@ -3511,6 +3872,12 @@ static void metal_draw_indexed(vio_draw_indexed_cmd *cmd)
     if (!cmd || cmd->index_count <= 0) return;
     vio_metal_buffer *ib = (vio_metal_buffer *)cmd->index_buffer;
     if (!ib || !ib->buffer) return;
+    if (metal_gs_bound()) {
+        metal_draw_gs((vio_metal_buffer *)cmd->vertex_buffer, cmd->vertex_stride, 0, 0,
+                      ib, cmd->index_bytes, cmd->first_index, cmd->index_count, cmd->vertex_offset,
+                      NULL, cmd->instance_count, 0);
+        return;
+    }
     if (metal_tess_bound()) {
         metal_draw_tess((vio_metal_buffer *)cmd->vertex_buffer, cmd->vertex_stride, 0, 0,
                         ib, cmd->index_bytes, cmd->first_index, cmd->index_count, cmd->vertex_offset,
@@ -3558,6 +3925,12 @@ void vio_metal_draw_instanced(void *mesh_obj, const float *matrices_4x4, int ins
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!mesh || !matrices_4x4 || instance_count <= 0) return;
+    if (metal_gs_bound()) {
+        metal_draw_gs((vio_metal_buffer *)mesh->backend_vb, mesh->stride, 0, mesh->vertex_count,
+                      mesh->index_count > 0 ? (vio_metal_buffer *)mesh->backend_ib : NULL,
+                      mesh->index_bytes, 0, mesh->index_count, 0, matrices_4x4, instance_count, 0);
+        return;
+    }
     if (metal_tess_bound()) {
         metal_draw_tess((vio_metal_buffer *)mesh->backend_vb, mesh->stride, 0, mesh->vertex_count,
                         mesh->index_count > 0 ? (vio_metal_buffer *)mesh->backend_ib : NULL,
@@ -3597,8 +3970,9 @@ static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_metal_buffer *args = (vio_metal_buffer *)args_buffer;
     if (!mesh || !args || !args->buffer || max_draws <= 0) return;
-    if (metal_tess_bound()) {
-        /* The tessellation kernels need the vertex and instance counts when they
+    if (metal_tess_bound() || metal_gs_bound()) {
+        int gs = metal_gs_bound();
+        /* The tessellation / geometry kernels need the vertex and instance counts when they
          * are encoded, so the argument records are read on the CPU (the buffer
          * is Shared). A dispatch of this frame that writes them runs first; the
          * draw's textures and viewports survive that flush. */
@@ -3633,12 +4007,14 @@ static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
                 uint32_t r[5];
                 memcpy(r, a + o, rec);
                 if (r[0] == 0 || r[1] == 0) continue;
+                void (*draw)(vio_metal_buffer *, int, int, int, vio_metal_buffer *, int, int, int, int,
+                             const float *, int, int) = gs ? metal_draw_gs : metal_draw_tess;
                 if (indexed) {
-                    metal_draw_tess((vio_metal_buffer *)mesh->backend_vb, mesh->stride, 0, 0, tib, mesh->index_bytes,
-                                    (int)r[2], (int)r[0], (int)(int32_t)r[3], NULL, (int)r[1], 0);
+                    draw((vio_metal_buffer *)mesh->backend_vb, mesh->stride, 0, 0, tib, mesh->index_bytes,
+                         (int)r[2], (int)r[0], (int)(int32_t)r[3], NULL, (int)r[1], 0);
                 } else {
-                    metal_draw_tess((vio_metal_buffer *)mesh->backend_vb, mesh->stride, (int)r[2], (int)r[0],
-                                    NULL, 0, 0, 0, 0, NULL, (int)r[1], 0);
+                    draw((vio_metal_buffer *)mesh->backend_vb, mesh->stride, (int)r[2], (int)r[0],
+                         NULL, 0, 0, 0, 0, NULL, (int)r[1], 0);
                 }
             }
         }
@@ -3686,6 +4062,13 @@ static void metal_draw_instanced_from_storage(void *mesh_obj, int instance_count
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!mesh || instance_count <= 0) return;
+    if (metal_gs_bound()) {
+        /* The vertex kernel reads the SSBO (gl_InstanceIndex = grid row). */
+        metal_draw_gs((vio_metal_buffer *)mesh->backend_vb, mesh->stride, 0, mesh->vertex_count,
+                      mesh->index_count > 0 ? (vio_metal_buffer *)mesh->backend_ib : NULL,
+                      mesh->index_bytes, 0, mesh->index_count, 0, NULL, instance_count, 1);
+        return;
+    }
     if (metal_tess_bound()) {
         /* The vertex kernel reads the SSBO (gl_InstanceIndex = grid row). */
         metal_draw_tess((vio_metal_buffer *)mesh->backend_vb, mesh->stride, 0, mesh->vertex_count,
@@ -4695,7 +5078,15 @@ static int metal_supports_feature(vio_feature f)
          * setViewports:count: - Mac2 / Apple5 GPU families. No geometry stage,
          * so gl_Layer / gl_ViewportIndex come from the vertex stage only. */
         return metal_supports_layered_vertex();
-    case VIO_FEATURE_GEOMETRY:      /* Metal has no geometry stage */
+    case VIO_FEATURE_GEOMETRY:
+    case VIO_FEATURE_GEOMETRY_INSTANCING:
+        /* No geometry stage in Metal: vertex + geometry kernels and a
+         * pass-through vertex function (metal_draw_gs). */
+#ifdef HAVE_SPIRV_CROSS
+        return 1;
+#else
+        return 0;
+#endif
     case VIO_FEATURE_RAYTRACING:
     case VIO_FEATURE_MULTIVIEW:
     default:

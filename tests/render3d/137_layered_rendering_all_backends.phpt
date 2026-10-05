@@ -104,12 +104,16 @@ function run_backend(string $name): string {
             vio_bind_render_target($ctx, $cube, VIO_RT_ALL_LAYERS);
             vio_clear($ctx, 0, 0, 0, 1);
             vio_bind_pipeline($ctx, $pd);
-            vio_set_uniforms($ctx, ['u_layers' => 6.0, 'u_z0' => -0.8, 'u_dz' => 0.3]);
+            /* Metal keeps clip z in 0..1 (no GL remap): positive depths there. */
+            $mtl = vio_backend_name($ctx) === 'metal';
+            [$z0, $dz] = $mtl ? [0.1, 0.15] : [-0.8, 0.3];
+            vio_set_uniforms($ctx, ['u_layers' => 6.0, 'u_z0' => $z0, 'u_dz' => $dz]);
             vio_draw($ctx, $tri);
             vio_unbind_render_target($ctx);
             vio_end($ctx);
             for ($f = 0; $f < 6; $f++) {
-                $g = (int)round(((-0.8 + 0.3 * $f + 1.0) / 2.0) * 255);
+                $z = $z0 + $dz * $f;
+                $g = (int)round(($mtl ? $z : ($z + 1.0) / 2.0) * 255);
                 $got = px(vio_read_render_target($cube, $f), 8, 8, $W);
                 if (!near($got, [$g, $g, $g], 4)) $fail[] = "C: face $f depth " . json_encode($got) . " want $g";
             }

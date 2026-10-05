@@ -95,8 +95,10 @@ function run_backend(string $name): string {
 
     /* A point at z = -0.5: the GS output still needs the GL -> D3D / Vulkan
      * depth remap (z' = (z + w) / 2). On D3D SPIRV-Cross used to place it after
-     * every Append, so anything with z < 0 was clipped. */
-    $pointNeg = vio_mesh($ctx, ['vertices' => [0, 0, -0.5], 'layout' => [VIO_FLOAT3]]);
+     * every Append, so anything with z < 0 was clipped. Metal has no remap on
+     * any stage (clip z is 0..1, BackendConventions::depthZeroToOne), so the
+     * same point sits at z = +0.5 there. */
+    $pointNeg = vio_mesh($ctx, ['vertices' => [0, 0, vio_backend_name($ctx) === 'metal' ? 0.5 : -0.5], 'layout' => [VIO_FLOAT3]]);
     vio_clear($ctx, 0, 0, 0, 1);
     vio_begin($ctx);
     vio_bind_pipeline($ctx, $p_gs);

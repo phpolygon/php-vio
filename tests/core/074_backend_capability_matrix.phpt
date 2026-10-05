@@ -204,9 +204,11 @@ if ($mtl) {
        && vio_supports_feature($mtl, VIO_FEATURE_MIPMAP_GEN) === true
        && vio_supports_feature($mtl, VIO_FEATURE_MRT) === true
        && vio_supports_feature($mtl, VIO_FEATURE_STORAGE_IMAGE) === vio_supports_feature($mtl, VIO_FEATURE_COMPUTE)
-       /* tessellation = vertex + control kernels (needs SPIRV-Cross like compute); no geometry stage */
+       /* tessellation = vertex + control kernels, geometry = vertex + geometry kernels
+        * (both need SPIRV-Cross like compute) */
        && vio_supports_feature($mtl, VIO_FEATURE_TESSELLATION) === vio_supports_feature($mtl, VIO_FEATURE_COMPUTE)
-       && vio_supports_feature($mtl, VIO_FEATURE_GEOMETRY) === false
+       && vio_supports_feature($mtl, VIO_FEATURE_GEOMETRY) === vio_supports_feature($mtl, VIO_FEATURE_COMPUTE)
+       && vio_supports_feature($mtl, VIO_FEATURE_GEOMETRY_INSTANCING) === vio_supports_feature($mtl, VIO_FEATURE_GEOMETRY)
        /* Depth32Float_Stencil8 on swapchain / colour targets; 2DArray + depth cubes */
        && vio_supports_feature($mtl, VIO_FEATURE_STENCIL) === true
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET_LAYERED) === true

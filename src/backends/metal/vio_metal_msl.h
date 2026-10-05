@@ -72,7 +72,8 @@ typedef enum {
     VIO_MSL_FRAGMENT,
     VIO_MSL_VERTEX_TESS,   /* vertex stage as a kernel, one thread per (vertex, instance) */
     VIO_MSL_TESS_CONTROL,  /* tess control as a kernel, one thread per output control point */
-    VIO_MSL_TESS_EVAL      /* tess evaluation as a [[patch]] vertex function */
+    VIO_MSL_TESS_EVAL,     /* tess evaluation as a [[patch]] vertex function */
+    VIO_MSL_KERNEL         /* vertex / geometry stage rebuilt as a GLSL compute kernel (vio_metal_kernel.h) */
 } vio_msl_stage;
 
 /* Buffer indices of the tessellation plumbing. Resources of every stage are
@@ -435,7 +436,8 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
 
     if (getenv("VIO_DUMP_MSL")) {
         static const char *labels[] = { "vertex", "fragment", "vertex (tessellation kernel)",
-                                        "tessellation control", "tessellation evaluation" };
+                                        "tessellation control", "tessellation evaluation",
+                                        "stage kernel" };
         fprintf(stderr, "==== Metal %s MSL ====\n%s\n==== end ====\n", labels[stage], result);
         fflush(stderr);
     }
