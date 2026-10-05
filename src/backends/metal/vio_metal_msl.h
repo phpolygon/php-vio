@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #define VIO_METAL_MAX_RES 16
 
@@ -104,6 +105,7 @@ typedef struct _vio_metal_tess_info {
     size_t vs_out_stride;    /* one VS kernel output vertex */
     size_t cp_stride;        /* one TCS output control point */
     size_t patch_stride;     /* one TCS patch record */
+    size_t tes_out_stride;   /* one TES output vertex (isolines / point_mode capture) */
 } vio_metal_tess_info;
 
 #ifdef HAVE_SPIRV_CROSS
@@ -426,6 +428,8 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
         metal_output_strides(compiler, resources, 0, &tess->vs_out_stride, NULL);
     } else if (stage == VIO_MSL_TESS_CONTROL) {
         metal_output_strides(compiler, resources, 1, &tess->cp_stride, &tess->patch_stride);
+    } else if (stage == VIO_MSL_TESS_EVAL) {
+        metal_output_strides(compiler, resources, 0, &tess->tes_out_stride, NULL);
     }
 
     if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS) {
@@ -445,6 +449,236 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
     char *output = strdup(result);
     spvc_context_destroy(ctx);
     return output;
+}
+
+/* ── Isolines and point_mode ─────────────────────────────────────
+ *
+ * Metal's tessellator has neither. vio drives it with integer factors it
+ * computed itself (quad domain for isolines) and runs the evaluation stage as
+ * a capture function with rasterization off: every domain point vio needs is
+ * written to its own slot of a capture buffer, gl_TessCoord remapped to GL's
+ * spacing rule; points the integer tessellation adds beyond that set are
+ * dropped. The draw then reads the slots through vio_pass (same library, same
+ * output struct) as lines or points. Per-patch parameters (uint4 x 4 at
+ * VIO_METAL_TESS_EMUL_INFO_INDEX):
+ *   isolines   [0] = (slot base, lines, segments, segment level bits)
+ *   quads      [0] = (base, m0, m1, m2) [1] = (m3, n0, n1, -) [2] = levels m0..m3 [3] = (inner0, inner1)
+ *   triangles  [0] = (base, m0, m1, m2) [1] = (n, -, -, -)    [2] = levels m0..m2 [3] = (inner)
+ * m = outer subdivisions, n = inner; 0 lines / m0 = 0 marks a culled patch. */
+
+#define VIO_METAL_TESS_EMUL_INFO_INDEX 24
+#define VIO_METAL_TESS_EMUL_CAP_INDEX  25
+
+static const char *metal_tess_emul_helpers =
+    "static inline float vio_sub(uint k, uint n, float f)\n"
+    "{\n"
+    "    if (VIO_SPACING == 0 || n <= 1u || abs(f - float(n)) < 1e-4) return float(k) / float(n);\n"
+    "    if (k == 0u) return 0.0;\n"
+    "    if (k >= n) return 1.0;\n"
+    "    float L = 1.0 / f, sh = (1.0 - float(n - 2u) * L) * 0.5;   /* two short segments at the ends */\n"
+    "    return sh + float(k - 1u) * L;\n"
+    "}\n"
+    "static inline bool vio_idx(float x, uint n, thread uint &k)\n"
+    "{\n"
+    "    float t = x * float(n), r = rint(t);\n"
+    "    if (abs(t - r) > 0.01) return false;\n"
+    "    k = uint(r);\n"
+    "    return true;\n"
+    "}\n";
+
+static const char *metal_tess_emul_iso =
+    "static inline bool vio_tess_point(float2 pic, const device uint4 *tp, uint pid, thread uint &slot, thread float2 &tc)\n"
+    "{\n"
+    "    uint4 a = tp[pid * 4u];\n"
+    "    uint i, j;\n"
+    "    if (a.y == 0u || !vio_idx(pic.y, a.y, i) || !vio_idx(pic.x, a.z, j) || i >= a.y || j > a.z) return false;\n"
+    "    slot = a.x + i * (a.z + 1u) + j;\n"
+    "    tc = float2(vio_sub(j, a.z, as_type<float>(a.w)), float(i) / float(a.y));\n"
+    "    return true;\n"
+    "}\n";
+
+static const char *metal_tess_emul_quad =
+    "static inline bool vio_tess_point(float2 pic, const device uint4 *tp, uint pid, thread uint &slot, thread float2 &tc)\n"
+    "{\n"
+    "    uint4 a = tp[pid * 4u], b = tp[pid * 4u + 1u];\n"
+    "    float4 f = as_type<float4>(tp[pid * 4u + 2u]);\n"
+    "    float2 fi = as_type<float2>(tp[pid * 4u + 3u].xy);\n"
+    "    if (a.y == 0u) return false;\n"
+    "    float u = pic.x, v = pic.y;\n"
+    "    const float e = 1e-5;\n"
+    "    bool u0 = u < e, u1 = u > 1.0 - e, v0 = v < e, v1 = v > 1.0 - e;\n"
+    "    if ((u0 || u1) && (v0 || v1)) { slot = a.x + (u0 ? (v0 ? 0u : 3u) : (v0 ? 1u : 2u)); tc = float2(u1 ? 1.0 : 0.0, v1 ? 1.0 : 0.0); return true; }\n"
+    "    uint k, off = a.x + 4u;\n"
+    "    if (u0) { if (!vio_idx(v, a.y, k) || k == 0u || k >= a.y) return false; slot = off + k - 1u; tc = float2(0.0, vio_sub(k, a.y, f.x)); return true; }\n"
+    "    off += a.y - 1u;\n"
+    "    if (v0) { if (!vio_idx(u, a.z, k) || k == 0u || k >= a.z) return false; slot = off + k - 1u; tc = float2(vio_sub(k, a.z, f.y), 0.0); return true; }\n"
+    "    off += a.z - 1u;\n"
+    "    if (u1) { if (!vio_idx(v, a.w, k) || k == 0u || k >= a.w) return false; slot = off + k - 1u; tc = float2(1.0, vio_sub(k, a.w, f.z)); return true; }\n"
+    "    off += a.w - 1u;\n"
+    "    if (v1) { if (!vio_idx(u, b.x, k) || k == 0u || k >= b.x) return false; slot = off + k - 1u; tc = float2(vio_sub(k, b.x, f.w), 1.0); return true; }\n"
+    "    off += b.x - 1u;\n"
+    "    uint i, j;\n"
+    "    if (!vio_idx(u, b.y, i) || !vio_idx(v, b.z, j) || i == 0u || i >= b.y || j == 0u || j >= b.z) return false;\n"
+    "    slot = off + (j - 1u) * (b.y - 1u) + (i - 1u);\n"
+    "    tc = float2(vio_sub(i, b.y, fi.x), vio_sub(j, b.z, fi.y));\n"
+    "    return true;\n"
+    "}\n";
+
+/* Inner rings of a triangle with n inner subdivisions (equal spacing): ring k
+ * has its corners at barycentric (1 - 4k/3n, 2k/3n, 2k/3n) and permutations,
+ * n - 2k segments per side, a single centre point when n = 2k. */
+static const char *metal_tess_emul_tri =
+    "static inline bool vio_tess_point(float3 pic, const device uint4 *tp, uint pid, thread uint &slot, thread float3 &tc)\n"
+    "{\n"
+    "    uint4 a = tp[pid * 4u], b = tp[pid * 4u + 1u];\n"
+    "    float4 f = as_type<float4>(tp[pid * 4u + 2u]);\n"
+    "    if (a.y == 0u) return false;\n"
+    "    float x = pic.x, y = pic.y, z = pic.z;\n"
+    "    const float e = 1e-5;\n"
+    "    tc = pic;\n"
+    "    if (x > 1.0 - e) { slot = a.x; tc = float3(1.0, 0.0, 0.0); return true; }\n"
+    "    if (y > 1.0 - e) { slot = a.x + 1u; tc = float3(0.0, 1.0, 0.0); return true; }\n"
+    "    if (z > 1.0 - e) { slot = a.x + 2u; tc = float3(0.0, 0.0, 1.0); return true; }\n"
+    "    uint k, off = a.x + 3u;\n"
+    "    if (x < e) { if (!vio_idx(y, a.y, k) || k == 0u || k >= a.y) return false; slot = off + k - 1u; float s = vio_sub(k, a.y, f.x); tc = float3(0.0, s, 1.0 - s); return true; }\n"
+    "    off += a.y - 1u;\n"
+    "    if (y < e) { if (!vio_idx(z, a.z, k) || k == 0u || k >= a.z) return false; slot = off + k - 1u; float s = vio_sub(k, a.z, f.y); tc = float3(1.0 - s, 0.0, s); return true; }\n"
+    "    off += a.z - 1u;\n"
+    "    if (z < e) { if (!vio_idx(x, a.w, k) || k == 0u || k >= a.w) return false; slot = off + k - 1u; float s = vio_sub(k, a.w, f.z); tc = float3(s, 1.0 - s, 0.0); return true; }\n"
+    "    off += a.w - 1u;\n"
+    "    uint n = b.x;\n"
+    "    float mn = min(x, min(y, z)), rk = mn * 3.0 * float(n) * 0.5;\n"
+    "    uint r = uint(rint(rk));\n"
+    "    if (abs(rk - float(r)) > 0.02 || r == 0u || 2u * r > n) return false;\n"
+    "    for (uint q = 1u; q < r; q++) off += (n == 2u * q) ? 1u : 3u * (n - 2u * q);\n"
+    "    uint len = n - 2u * r;\n"
+    "    if (len == 0u) { slot = off; return true; }\n"
+    "    uint ord; float t;\n"
+    "    if (x <= y && x <= z) { ord = 0u; t = y; } else if (z <= y) { ord = 1u; t = x; } else { ord = 2u; t = z; }\n"
+    "    float it = (t - 2.0 * float(r) / (3.0 * float(n))) * float(n);\n"
+    "    uint ix = uint(rint(it));\n"
+    "    if (abs(it - float(ix)) > 0.02 || ix > len) return false;\n"
+    "    slot = off + (ord * len + ix) % (3u * len);\n"
+    "    return true;\n"
+    "}\n";
+
+static char *metal_str_replace_all(const char *src, const char *from, const char *to)
+{
+    size_t fl = strlen(from), tl = strlen(to), n = 0;
+    for (const char *p = strstr(src, from); p; p = strstr(p + fl, from)) n++;
+    size_t len = strlen(src) + n * (tl > fl ? tl - fl : 0) + 1;
+    char *out = (char *)malloc(len), *o = out;
+    if (!out) return NULL;
+    const char *p = src;
+    for (const char *q = strstr(p, from); q; q = strstr(p, from)) {
+        memcpy(o, p, (size_t)(q - p)); o += q - p;
+        memcpy(o, to, tl); o += tl;
+        p = q + fl;
+    }
+    strcpy(o, p);
+    return out;
+}
+
+/* Rewrite the TES MSL (main0, a [[patch]] vertex function returning
+ * main0_out) into the capture function and append vio_pass. `domain` is the
+ * GLSL domain (VIO_MSL_DOMAIN_*, isolines already compiled as quads), spacing
+ * VIO_MSL_SPACING_*. Returns malloc'd MSL or NULL. */
+static char *metal_tess_emul_msl(const char *tes, int domain, int spacing, char **error_msg)
+{
+    const char *sig = strstr(tes, "vertex main0_out main0(");
+    const char *pip = strstr(tes, "[[position_in_patch]]");
+    const char *sb  = strstr(tes, "struct main0_out\n{");
+    if (!sig || !pip || !sb || pip < sig) {
+        if (error_msg) *error_msg = strdup("unexpected tessellation evaluation MSL");
+        return NULL;
+    }
+    /* name and type of the position_in_patch parameter */
+    const char *ne = pip;
+    while (ne > sig && ne[-1] == ' ') ne--;
+    const char *nb = ne;
+    while (nb > sig && (isalnum((unsigned char)nb[-1]) || nb[-1] == '_')) nb--;
+    char pname[64];
+    size_t pl = (size_t)(ne - nb);
+    if (pl == 0 || pl >= sizeof(pname)) { if (error_msg) *error_msg = strdup("position_in_patch parameter"); return NULL; }
+    memcpy(pname, nb, pl);
+    pname[pl] = '\0';
+    const char *ptype = domain == VIO_MSL_DOMAIN_TRIANGLES ? "float3" : "float2";
+    /* patch id parameter, added when the shader does not read gl_PrimitiveID */
+    char pid[64] = "vio_pid";
+    const char *pidp = strstr(sig, "[[patch_id]]");
+    int add_pid = 1;
+    if (pidp) {
+        const char *e2 = pidp;
+        while (e2 > sig && e2[-1] == ' ') e2--;
+        const char *b2 = e2;
+        while (b2 > sig && (isalnum((unsigned char)b2[-1]) || b2[-1] == '_')) b2--;
+        if (e2 > b2 && (size_t)(e2 - b2) < sizeof(pid)) { memcpy(pid, b2, (size_t)(e2 - b2)); pid[e2 - b2] = '\0'; add_pid = 0; }
+    }
+    const char *body = strchr(pip, '{');
+    if (!body) { if (error_msg) *error_msg = strdup("tessellation evaluation body"); return NULL; }
+    const char *se = strstr(sb, "};");
+    if (!se) { if (error_msg) *error_msg = strdup("main0_out struct"); return NULL; }
+    int has_psize = strstr(sb, "[[point_size]]") && strstr(sb, "[[point_size]]") < se;
+
+    size_t cap = strlen(tes) + 16384;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    size_t o = 0;
+#define EMIT(...) do { int w_ = snprintf(out + o, cap - o, __VA_ARGS__); if (w_ < 0 || (size_t)w_ >= cap - o) { free(out); return NULL; } o += (size_t)w_; } while (0)
+    /* everything up to the signature's line, the helpers, the [[patch]] attribute */
+    const char *line = sig;
+    while (line > tes && line[-1] != '\n') line--;
+    EMIT("%.*s", (int)(line - tes), tes);
+    EMIT("#define VIO_SPACING %d\n%s%s", spacing, metal_tess_emul_helpers,
+         domain == VIO_MSL_DOMAIN_ISOLINES ? metal_tess_emul_iso :
+         domain == VIO_MSL_DOMAIN_QUADS ? metal_tess_emul_quad : metal_tess_emul_tri);
+    EMIT("%.*s", (int)(sig - line), line);
+    EMIT("vertex void main0(device main0_out* vio_cap [[buffer(%d)]], const device uint4* vio_tp [[buffer(%d)]], ",
+         VIO_METAL_TESS_EMUL_CAP_INDEX, VIO_METAL_TESS_EMUL_INFO_INDEX);
+    if (add_pid) EMIT("uint vio_pid [[patch_id]], ");
+    /* the original parameters with position_in_patch renamed */
+    const char *params = sig + strlen("vertex main0_out main0(");
+    EMIT("%.*svio_pic %.*s", (int)(nb - params), params, (int)(body - pip), pip);
+    EMIT("{\n    uint vio_slot;\n    %s %s;\n    if (!vio_tess_point(vio_pic, vio_tp, %s, vio_slot, %s)) return;\n",
+         ptype, pname, pid, pname);
+    /* body: every `return out;` stores the record */
+    size_t blen = strlen(body + 1);
+    char *rest = (char *)malloc(blen + 1);
+    if (!rest) { free(out); return NULL; }
+    memcpy(rest, body + 1, blen + 1);
+    char *patched = metal_str_replace_all(rest, "return out;", "{ vio_cap[vio_slot] = out; return; }");
+    free(rest);
+    if (!patched) { free(out); return NULL; }
+    if (o + strlen(patched) + 4096 > cap) {
+        cap = o + strlen(patched) + 4096;
+        char *g = (char *)realloc(out, cap);
+        if (!g) { free(out); free(patched); return NULL; }
+        out = g;
+    }
+    EMIT("%s", patched);
+    free(patched);
+    /* vio_pass: the captured record as the draw's vertex output. Lines must
+     * not carry [[point_size]], points always do. */
+    int points = domain != VIO_MSL_DOMAIN_ISOLINES;
+    {
+        const char *bs = sb + strlen("struct main0_out\n");
+        size_t bl = (size_t)(se - bs);
+        char *sbody = (char *)malloc(bl + 1);
+        if (!sbody) { free(out); return NULL; }
+        memcpy(sbody, bs, bl);
+        sbody[bl] = '\0';
+        char *clean = points ? strdup(sbody) : metal_str_replace_all(sbody, "[[point_size]]", "");
+        free(sbody);
+        if (!clean) { free(out); return NULL; }
+        EMIT("\nstruct vio_pass_out\n%s", clean);
+        free(clean);
+    }
+    if (points && !has_psize) EMIT("    float vio_psize [[point_size]];\n");
+    EMIT("};\n\nvertex vio_pass_out vio_pass(const device main0_out* vio_cap [[buffer(%d)]], uint vio_vid [[vertex_id]])\n{\n"
+         "    vio_pass_out o;\n    reinterpret_cast<thread main0_out&>(o) = vio_cap[vio_vid];\n%s    return o;\n}\n",
+         VIO_METAL_TESS_EMUL_CAP_INDEX, (points && !has_psize) ? "    o.vio_psize = 1.0;\n" : "");
+#undef EMIT
+    return out;
 }
 
 #endif /* HAVE_SPIRV_CROSS */

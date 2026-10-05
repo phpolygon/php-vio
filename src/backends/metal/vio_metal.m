@@ -1529,6 +1529,12 @@ typedef struct _vio_metal_shader {
         void *pso;                     /* id<MTLComputePipelineState>, +1 retained */
     } vs_kernel_variants[VIO_METAL_TESS_VS_VARIANTS];
     int                 vs_kernel_variant_count;
+    /* Isolines / point_mode (metal_tess_emul_msl): vert_fn is vio_pass, the
+     * TES runs as the capture function of an extra pass without rasterization. */
+    int                 tess_emul;
+    int                 tess_emul_domain;  /* VIO_MSL_DOMAIN_* of the GLSL (isolines compiled as quads) */
+    void               *tess_cap_fn;       /* id<MTLFunction>, +1 retained */
+    void               *tess_cap_pso;      /* id<MTLRenderPipelineState>, +1 retained, built lazily */
     /* Geometry stage, emulated: vert_fn is the pass-through vertex function
      * (vs / vl its tables), the vertex and geometry stages run as kernels
      * before every draw (metal_draw_gs). */
@@ -1545,6 +1551,16 @@ typedef struct _vio_metal_shader {
     int                 gs_vs_cb, gs_gs_cb;   /* MSL index of each stage's own uniform block, -1 */
     int                 gs_rec_index;    /* pass-through: MSL index of the record buffer */
 } vio_metal_shader;
+
+static id<MTLLibrary> metal_build_library(const char *msl, char **error_out)
+{
+    NSError *err = nil;
+    MTLCompileOptions *opts = [MTLCompileOptions new];
+    opts.languageVersion = MTLLanguageVersion2_1;
+    id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:[NSString stringWithUTF8String:msl] options:opts error:&err];
+    if (!lib && error_out) *error_out = strdup(err ? [[err localizedDescription] UTF8String] : "unknown MSL compile error");
+    return lib;
+}
 
 static id<MTLFunction> metal_build_function(const char *msl, char **error_out)
 {
@@ -1586,6 +1602,8 @@ static void metal_destroy_shader(void *s)
     if (sh->vs_kernel_fn) { CFRelease((CFTypeRef)sh->vs_kernel_fn); sh->vs_kernel_fn = NULL; }
     if (sh->tcs_pso) { CFRelease((CFTypeRef)sh->tcs_pso); sh->tcs_pso = NULL; }
     if (sh->gs_vs_pso) { CFRelease((CFTypeRef)sh->gs_vs_pso); sh->gs_vs_pso = NULL; }
+    if (sh->tess_cap_fn) { CFRelease((CFTypeRef)sh->tess_cap_fn); sh->tess_cap_fn = NULL; }
+    if (sh->tess_cap_pso) { CFRelease((CFTypeRef)sh->tess_cap_pso); sh->tess_cap_pso = NULL; }
     if (sh->gs_pso) { CFRelease((CFTypeRef)sh->gs_pso); sh->gs_pso = NULL; }
     for (int i = 0; i < sh->vs_kernel_variant_count; i++) {
         if (sh->vs_kernel_variants[i].pso) CFRelease((CFTypeRef)sh->vs_kernel_variants[i].pso);
@@ -1737,7 +1755,7 @@ static void *metal_compile_shader(vio_shader_desc *desc)
     int vs_owned = 0, fs_owned = 0;
     uint32_t *vs_spirv = NULL, *fs_spirv = NULL;
     char *vs_msl = NULL, *fs_msl = NULL, *fs_msl_noout = NULL, *tcs_msl = NULL, *tes_msl = NULL;
-    id<MTLFunction> vfn = nil, ffn = nil, ffn_noout = nil, kfn = nil, tcsfn = nil;
+    id<MTLFunction> vfn = nil, ffn = nil, ffn_noout = nil, kfn = nil, tcsfn = nil, cap_fn = nil;
     id<MTLComputePipelineState> tcs_pso = nil;
 
     vio_metal_shader *sh = calloc(1, sizeof(vio_metal_shader));
@@ -1756,10 +1774,26 @@ static void *metal_compile_shader(vio_shader_desc *desc)
         if (vio_metal_tess_reflect((const uint32_t *)desc->tess_control_data, desc->tess_control_size,
                                    (const uint32_t *)desc->tess_eval_data, desc->tess_eval_size,
                                    &sh->tess_info, &err) != 0) { what = "tessellation reflection"; goto fail; }
+        /* Isolines and point_mode: Metal's tessellator has neither (see
+         * metal_tess_emul_msl). The control stage writes quad factors for
+         * isolines, the evaluation stage is compiled as a quad domain. */
+        uint32_t *tes_words = (uint32_t *)desc->tess_eval_data;
+        size_t tes_bytes = desc->tess_eval_size;
+        uint32_t *tes_copy = NULL;
         if (sh->tess_info.domain == VIO_MSL_DOMAIN_ISOLINES || sh->tess_info.point_mode) {
-            err = strdup("Metal tessellates triangle and quad domains only (no isolines, no point_mode)");
-            what = "tessellation";
-            goto fail;
+            sh->tess_emul = 1;
+            sh->tess_emul_domain = sh->tess_info.domain;
+            if (sh->tess_info.domain == VIO_MSL_DOMAIN_ISOLINES) {
+                sh->tess_info.domain = VIO_MSL_DOMAIN_QUADS;
+                tes_copy = (uint32_t *)malloc(tes_bytes);
+                if (!tes_copy) { what = "tessellation"; goto fail; }
+                memcpy(tes_copy, tes_words, tes_bytes);
+                for (size_t i = 5; i < tes_bytes / 4 && (tes_copy[i] >> 16); i += tes_copy[i] >> 16) {
+                    /* OpExecutionMode Isolines -> Quads */
+                    if ((tes_copy[i] & 0xFFFF) == 16 && (tes_copy[i] >> 16) >= 3 && tes_copy[i + 2] == 25) tes_copy[i + 2] = 24;
+                }
+                tes_words = tes_copy;
+            }
         }
         vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_VERTEX_TESS, &sh->vs, &sh->vl,
                                         0xFFFFFFFFu, &sh->tess_info, &err);
@@ -1767,9 +1801,16 @@ static void *metal_compile_shader(vio_shader_desc *desc)
         tcs_msl = metal_gfx_spirv_to_msl((const uint32_t *)desc->tess_control_data, desc->tess_control_size,
                                          VIO_MSL_TESS_CONTROL, &sh->tcs, NULL, 0xFFFFFFFFu, &sh->tess_info, &err);
         if (!tcs_msl) { what = "TCS SPIR-V→MSL"; goto fail; }
-        tes_msl = metal_gfx_spirv_to_msl((const uint32_t *)desc->tess_eval_data, desc->tess_eval_size,
+        tes_msl = metal_gfx_spirv_to_msl(tes_words, tes_bytes,
                                          VIO_MSL_TESS_EVAL, &sh->tes, NULL, 0xFFFFFFFFu, &sh->tess_info, &err);
+        free(tes_copy);
         if (!tes_msl) { what = "TES SPIR-V→MSL"; goto fail; }
+        if (sh->tess_emul) {
+            char *emul = metal_tess_emul_msl(tes_msl, sh->tess_emul_domain, sh->tess_info.spacing, &err);
+            free(tes_msl);
+            tes_msl = emul;
+            if (!tes_msl) { what = "TES capture MSL"; goto fail; }
+        }
     } else if (desc->geometry_data) {
         vs_msl = metal_gs_prepare(sh, vs_spirv, vs_size, desc->geometry_data, desc->geometry_size, &err);
         if (!vs_msl) { what = "geometry stage"; goto fail; }
@@ -1802,8 +1843,17 @@ static void *metal_compile_shader(vio_shader_desc *desc)
             what = "TCS compute pipeline";
             goto fail;
         }
-        vfn = metal_build_function(tes_msl, &err);
-        if (!vfn) { what = "TES MSL→MTLFunction"; goto fail; }
+        if (sh->tess_emul) {
+            /* main0 is the capture function; the draw's vertex function is vio_pass. */
+            id<MTLLibrary> lib = metal_build_library(tes_msl, &err);
+            if (!lib) { what = "TES capture MSL→MTLLibrary"; goto fail; }
+            cap_fn = [lib newFunctionWithName:@"main0"];
+            vfn = [lib newFunctionWithName:@"vio_pass"];
+            if (!cap_fn || !vfn) { err = strdup("capture / pass functions missing"); what = "TES capture"; goto fail; }
+        } else {
+            vfn = metal_build_function(tes_msl, &err);
+            if (!vfn) { what = "TES MSL→MTLFunction"; goto fail; }
+        }
     } else {
         vfn = metal_build_function(vs_msl, &err);
         if (!vfn) { what = "VS MSL→MTLFunction"; goto fail; }
@@ -1822,6 +1872,7 @@ static void *metal_compile_shader(vio_shader_desc *desc)
     if (tess) {
         sh->vs_kernel_fn = (void *)CFBridgingRetain(kfn);
         sh->tcs_pso = (void *)CFBridgingRetain(tcs_pso);
+        if (cap_fn) sh->tess_cap_fn = (void *)CFBridgingRetain(cap_fn);
     }
     if (vs_owned) free(vs_spirv);
     if (fs_owned) free(fs_spirv);
@@ -2914,6 +2965,9 @@ static void *metal_create_pipeline(vio_pipeline_desc *desc)
         if (sh->frag_fn_noout) p->frag_fn_noout = (void *)CFRetain((CFTypeRef)sh->frag_fn_noout);
         p->primitive = metal_topology(desc->topology);
         p->topology = desc->topology;
+        if (sh->tess_emul) {
+            p->primitive = sh->tess_emul_domain == VIO_MSL_DOMAIN_ISOLINES ? MTLPrimitiveTypeLine : MTLPrimitiveTypePoint;
+        }
         if (sh->gs) {
             /* The draw rasterizes what the geometry kernel emitted. */
             p->primitive = sh->gs_out_prim == MK_PRIM_POINTS ? MTLPrimitiveTypePoint
@@ -3115,7 +3169,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
             vd.layouts[VIO_METAL_VB_INSTANCE].stepFunction = MTLVertexStepFunctionPerInstance;
             vd.layouts[VIO_METAL_VB_INSTANCE].stepRate = 1;
         }
-        if (sh->tess) {
+        if (sh->tess && !sh->tess_emul) {
             /* vert_fn is the TES: it reads the control points from the TCS
              * output buffers itself, so no vertex descriptor. Metal's winding
              * label matches GL's for tessellated triangles and quads (test 144:
@@ -3131,7 +3185,8 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
             d.tessellationOutputWindingOrder = ti->ccw ? MTLWindingCounterClockwise : MTLWindingClockwise;
             d.tessellationFactorScaleEnabled = NO;
             d.maxTessellationFactor = 64;
-        } else if (has_mesh_attr || has_inst_attr) {
+        } else if (!sh->tess && (has_mesh_attr || has_inst_attr)) {
+            /* (an emulated isoline / point_mode draw reads the capture buffer) */
             d.vertexDescriptor = vd;
         }
 
@@ -3203,7 +3258,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
         d.depthAttachmentPixelFormat = has_depth ? (has_stencil ? VIO_METAL_DEPTH_STENCIL : MTLPixelFormatDepth32Float)
                                                  : MTLPixelFormatInvalid;
         d.stencilAttachmentPixelFormat = (has_depth && has_stencil) ? VIO_METAL_DEPTH_STENCIL : MTLPixelFormatInvalid;
-        if (!sh->tess) {
+        if (!sh->tess || sh->tess_emul) {
             /* Required on macOS when the vertex stage writes gl_Layer /
              * gl_ViewportIndex ([[render_target_array_index]] /
              * [[viewport_array_index]]); harmless otherwise. */
@@ -3430,6 +3485,217 @@ static void metal_fs_shadow_restore(id<MTLTexture> __strong *tex, id<MTLSamplerS
     }
 }
 
+/* Async dispatches of this frame finish before what follows, the open pass
+ * keeps its textures and viewports (indirect / emulated tessellation draws). */
+static void metal_flush_async_keep_pass(void)
+{
+    if (!(metal_async_cb != nil && metal_async_cb == vio_mtl.current_cmd_buf)) return;
+    id<MTLTexture> saved_tex[VIO_METAL_FS_SLOTS];
+    id<MTLSamplerState> saved_smp[VIO_METAL_FS_SLOTS];
+    MTLViewport saved_vp[VIO_METAL_MAX_VIEWPORTS];
+    MTLScissorRect saved_sc[VIO_METAL_MAX_VIEWPORTS];
+    int saved_vp_count = metal_vp_count, saved_has_sc = metal_vp_has_scissor;
+    metal_fs_shadow_copy(saved_tex, saved_smp);
+    memcpy(saved_vp, metal_vp, sizeof(saved_vp));
+    memcpy(saved_sc, metal_sc, sizeof(saved_sc));
+    metal_compute_wait();
+    metal_fs_shadow_restore(saved_tex, saved_smp);
+    memcpy(metal_vp, saved_vp, sizeof(saved_vp));
+    memcpy(metal_sc, saved_sc, sizeof(saved_sc));
+    metal_vp_count = saved_vp_count;
+    metal_vp_has_scissor = saved_has_sc;
+    metal_apply_viewports();
+}
+
+/* GL rounding of a tessellation level (11.2.2): 0 when the level culls. */
+static int metal_tess_round(float f, int spacing, float *clamped)
+{
+    if (!(f > 0.0f)) return 0;
+    int n;
+    if (spacing == VIO_MSL_SPACING_FRACTIONAL_ODD) {
+        f = f < 1.0f ? 1.0f : (f > 63.0f ? 63.0f : f);
+        n = 2 * (int)ceilf((f - 1.0f) * 0.5f) + 1;
+    } else if (spacing == VIO_MSL_SPACING_FRACTIONAL_EVEN) {
+        f = f < 2.0f ? 2.0f : (f > 64.0f ? 64.0f : f);
+        n = 2 * (int)ceilf(f * 0.5f);
+    } else {
+        f = f < 1.0f ? 1.0f : (f > 64.0f ? 64.0f : f);
+        n = (int)ceilf(f);
+    }
+    if (clamped) *clamped = f;
+    return n;
+}
+
+/* Inner level: never culls (clamped to 1), and 1 counts as 1 + epsilon unless
+ * every level of the patch is 1. */
+static int metal_tess_inner(float f, int spacing, int all_one, float *clamped)
+{
+    int n = metal_tess_round(f > 0.0f ? f : 1.0f, spacing, clamped);
+    if (n <= 1 && !all_one) {
+        n = spacing == VIO_MSL_SPACING_FRACTIONAL_ODD ? 3 : 2;
+        *clamped = (float)n;
+    }
+    return n;
+}
+
+static uint32_t metal_f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static void metal_put_half(uint16_t *dst, float f) { __fp16 h = (__fp16)f; memcpy(dst, &h, 2); }
+
+/* Isolines / point_mode (metal_tess_emul_msl): the kernels have run in `kcb`;
+ * read the levels back, tessellate with exact integer factors in a pass
+ * without rasterization that captures every domain point, then draw the
+ * captured points as lines / points in the frame's pass. Synchronous - these
+ * draws wait for their kernels. */
+static void metal_tess_emul_draw(vio_metal_shader *sh, id<MTLCommandBuffer> kcb, NSUInteger out_cp,
+                                 id<MTLBuffer> cp_out, NSUInteger cp_off, id<MTLBuffer> patch_out, NSUInteger patch_off,
+                                 id<MTLBuffer> factors, NSUInteger fac_off, NSUInteger patches)
+{
+    [kcb commit];
+    [kcb waitUntilCompleted];
+    const int dom = sh->tess_emul_domain, sp = sh->tess_info.spacing;
+    const int quadlike = dom != VIO_MSL_DOMAIN_TRIANGLES;
+    const size_t fstride = quadlike ? 6 : 4;   /* halfs per MTL{Quad,Triangle}TessellationFactorsHalf */
+    NSUInteger hw_off = 0, info_off = 0;
+    id<MTLBuffer> hw = metal_ring_alloc(patches * fstride * 2, &hw_off);
+    id<MTLBuffer> info = metal_ring_alloc(patches * 64, &info_off);
+    if (!hw || !info) return;
+    const __fp16 *fh = (const __fp16 *)((const char *)[factors contents] + fac_off);
+    uint16_t *hwp = (uint16_t *)((char *)[hw contents] + hw_off);
+    uint32_t *ip = (uint32_t *)((char *)[info contents] + info_off);
+    uint32_t total = 0;
+    uint32_t *lines = NULL;
+    size_t line_count = 0, line_cap = 0;
+
+    for (NSUInteger pi = 0; pi < patches; pi++) {
+        const __fp16 *f = fh + pi * fstride;
+        uint16_t *h = hwp + pi * fstride;
+        uint32_t *t = ip + pi * 16;
+        memset(t, 0, 64);
+        memset(h, 0, fstride * 2);
+        t[0] = total;
+        if (dom == VIO_MSL_DOMAIN_ISOLINES) {
+            float fl;
+            int lines_n = metal_tess_round((float)f[0], VIO_MSL_SPACING_EQUAL, NULL);
+            int seg = metal_tess_round((float)f[1], sp, &fl);
+            if (!lines_n || !seg) continue;
+            t[1] = (uint32_t)lines_n; t[2] = (uint32_t)seg; t[3] = metal_f2u(fl);
+            metal_put_half(h + 0, (float)lines_n); metal_put_half(h + 1, (float)seg);
+            metal_put_half(h + 2, (float)lines_n); metal_put_half(h + 3, (float)seg);
+            metal_put_half(h + 4, (float)seg);     metal_put_half(h + 5, (float)lines_n);
+            for (int i = 0; i < lines_n; i++) {
+                for (int j = 0; j < seg; j++) {
+                    if (line_count + 2 > line_cap) {
+                        line_cap = line_cap ? line_cap * 2 : 1024;
+                        uint32_t *g = (uint32_t *)realloc(lines, line_cap * 4);
+                        if (!g) { free(lines); return; }
+                        lines = g;
+                    }
+                    uint32_t v = total + (uint32_t)(i * (seg + 1) + j);
+                    lines[line_count++] = v;
+                    lines[line_count++] = v + 1;
+                }
+            }
+            total += (uint32_t)(lines_n * (seg + 1));
+        } else if (dom == VIO_MSL_DOMAIN_QUADS) {
+            float lv[4], li[2];
+            int m[4], ok = 1, ones = 1;
+            for (int e = 0; e < 4; e++) { m[e] = metal_tess_round((float)f[e], sp, &lv[e]); ok = ok && m[e]; ones = ones && m[e] == 1; }
+            if (!ok) continue;
+            int in0r = metal_tess_round((float)f[4] > 0 ? (float)f[4] : 1.0f, sp, NULL);
+            int in1r = metal_tess_round((float)f[5] > 0 ? (float)f[5] : 1.0f, sp, NULL);
+            ones = ones && in0r == 1 && in1r == 1;
+            int n0 = metal_tess_inner((float)f[4], sp, ones, &li[0]);
+            int n1 = metal_tess_inner((float)f[5], sp, ones, &li[1]);
+            t[1] = (uint32_t)m[0]; t[2] = (uint32_t)m[1]; t[3] = (uint32_t)m[2];
+            t[4] = (uint32_t)m[3]; t[5] = (uint32_t)n0; t[6] = (uint32_t)n1;
+            for (int e = 0; e < 4; e++) { t[8 + e] = metal_f2u(lv[e]); metal_put_half(h + e, (float)m[e]); }
+            t[12] = metal_f2u(li[0]); t[13] = metal_f2u(li[1]);
+            metal_put_half(h + 4, (float)n0); metal_put_half(h + 5, (float)n1);
+            total += 4 + (uint32_t)(m[0] - 1 + m[1] - 1 + m[2] - 1 + m[3] - 1) + (uint32_t)((n0 - 1) * (n1 - 1));
+        } else {
+            float lv[3], li;
+            int m[3], ok = 1, ones = 1;
+            for (int e = 0; e < 3; e++) { m[e] = metal_tess_round((float)f[e], sp, &lv[e]); ok = ok && m[e]; ones = ones && m[e] == 1; }
+            if (!ok) continue;
+            ones = ones && metal_tess_round((float)f[3] > 0 ? (float)f[3] : 1.0f, sp, NULL) == 1;
+            int n = metal_tess_inner((float)f[3], sp, ones, &li);
+            t[1] = (uint32_t)m[0]; t[2] = (uint32_t)m[1]; t[3] = (uint32_t)m[2]; t[4] = (uint32_t)n;
+            for (int e = 0; e < 3; e++) { t[8 + e] = metal_f2u(lv[e]); metal_put_half(h + e, (float)m[e]); }
+            t[12] = metal_f2u(li);
+            metal_put_half(h + 3, (float)n);
+            uint32_t pts = 3 + (uint32_t)(m[0] - 1 + m[1] - 1 + m[2] - 1);
+            if (!ones) for (int k = 1; 2 * k <= n; k++) pts += (n == 2 * k) ? 1 : 3 * (uint32_t)(n - 2 * k);
+            total += pts;
+        }
+    }
+    if (total == 0) { free(lines); return; }
+
+    NSUInteger cap_off = 0, idx_off = 0;
+    id<MTLBuffer> cap = metal_ring_alloc((NSUInteger)total * sh->tess_info.tes_out_stride, &cap_off);
+    id<MTLBuffer> idx = nil;
+    if (line_count) {
+        idx = metal_ring_alloc(line_count * 4, &idx_off);
+        if (idx) memcpy((char *)[idx contents] + idx_off, lines, line_count * 4);
+    }
+    free(lines);
+    if (!cap || (dom == VIO_MSL_DOMAIN_ISOLINES && !idx)) return;
+
+    if (!sh->tess_cap_pso) {
+        MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+        d.vertexFunction = (__bridge id<MTLFunction>)sh->tess_cap_fn;
+        d.rasterizationEnabled = NO;
+        d.tessellationPartitionMode = MTLTessellationPartitionModeInteger;
+        d.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+        d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+        d.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+        d.tessellationOutputWindingOrder = MTLWindingCounterClockwise;
+        d.tessellationFactorScaleEnabled = NO;
+        d.maxTessellationFactor = 64;
+        NSError *err = nil;
+        id<MTLRenderPipelineState> pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:d error:&err];
+        if (!pso) {
+            php_error_docref(NULL, E_WARNING, "Metal: tessellation capture pipeline failed: %s",
+                             err ? [[err localizedDescription] UTF8String] : "unknown");
+            return;
+        }
+        sh->tess_cap_pso = (void *)CFBridgingRetain(pso);
+    }
+
+    /* capture pass: no attachments, no rasterization */
+    id<MTLCommandBuffer> cb = metal_new_command_buffer();
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.renderTargetWidth = 1;
+    rp.renderTargetHeight = 1;
+    rp.defaultRasterSampleCount = 1;
+    id<MTLRenderCommandEncoder> ce = [cb renderCommandEncoderWithDescriptor:rp];
+    [ce setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)sh->tess_cap_pso];
+    [ce setVertexBuffer:cp_out offset:cp_off atIndex:VIO_METAL_TESS_IN_INDEX];
+    [ce setVertexBuffer:patch_out offset:patch_off atIndex:VIO_METAL_TESS_PATCH_IN_INDEX];
+    [ce setVertexBuffer:factors offset:fac_off atIndex:VIO_METAL_TESS_FACTOR_INDEX];   /* gl_TessLevel* as written */
+    [ce setVertexBuffer:info offset:info_off atIndex:VIO_METAL_TESS_EMUL_INFO_INDEX];
+    [ce setVertexBuffer:cap offset:cap_off atIndex:VIO_METAL_TESS_EMUL_CAP_INDEX];
+    int ti = VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL);
+    if (sh->tes.cbuffer_index >= 0 && metal_stage_const_size[ti] > 0) {
+        [ce setVertexBytes:metal_stage_const[ti] length:metal_stage_const_size[ti] atIndex:(NSUInteger)sh->tes.cbuffer_index];
+    }
+    [ce setTessellationFactorBuffer:hw offset:hw_off instanceStride:0];
+    [ce drawPatches:out_cp patchStart:0 patchCount:patches patchIndexBuffer:nil patchIndexBufferOffset:0
+      instanceCount:1 baseInstance:0];
+    [ce endEncoding];
+    [cb commit];
+
+    /* the draw: captured points through vio_pass */
+    if (!metal_prepare_draw(0)) return;
+    id<MTLRenderCommandEncoder> enc = vio_mtl.current_encoder;
+    [enc setVertexBuffer:cap offset:cap_off atIndex:VIO_METAL_TESS_EMUL_CAP_INDEX];
+    if (dom == VIO_MSL_DOMAIN_ISOLINES) {
+        [enc drawIndexedPrimitives:MTLPrimitiveTypeLine indexCount:line_count indexType:MTLIndexTypeUInt32
+                       indexBuffer:idx indexBufferOffset:idx_off];
+    } else {
+        [enc drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:total];
+    }
+}
+
 /* Draw the current tessellation pipeline. An indexed draw is de-indexed into a
  * ring slice first (the kernel's stage-input fetch reads vertices in grid
  * order; mesh buffers are Shared, so the CPU can gather them). Every
@@ -3520,6 +3786,9 @@ static void metal_draw_tess(vio_metal_buffer *vb, int stride, int first_vertex, 
          * (the pass is closed and reopened, the draw's textures and viewports
          * restored). Otherwise they run in their own command buffer, committed
          * ahead of the frame's, and the open pass is left alone. */
+        /* Emulated isolines / point_mode wait for their kernels: async work
+         * of the frame is flushed first so they can run in their own buffer. */
+        if (sh->tess_emul) metal_flush_async_keep_pass();
         int in_frame = metal_async_cb != nil && metal_async_cb == vio_mtl.current_cmd_buf;
         id<MTLTexture> saved_tex[VIO_METAL_FS_SLOTS];
         id<MTLSamplerState> saved_smp[VIO_METAL_FS_SLOTS];
@@ -3583,6 +3852,10 @@ static void metal_draw_tess(vio_metal_buffer *vb, int stride, int first_vertex, 
         }
         [ce dispatchThreadgroups:MTLSizeMake(patches, 1, 1) threadsPerThreadgroup:MTLSizeMake(out_cp, 1, 1)];
         [ce endEncoding];
+        if (sh->tess_emul && !in_frame) {
+            metal_tess_emul_draw(sh, cb, out_cp, cp_out, cp_off, patch_out, patch_off, factors, fac_off, patches);
+            return;
+        }
         if (in_frame) {
             metal_open_encoder(/*load_clear=*/0);
             metal_fs_shadow_restore(saved_tex, saved_smp);
@@ -3600,6 +3873,7 @@ static void metal_draw_tess(vio_metal_buffer *vb, int stride, int first_vertex, 
         id<MTLRenderCommandEncoder> enc = vio_mtl.current_encoder;
         [enc setVertexBuffer:cp_out offset:cp_off atIndex:VIO_METAL_TESS_IN_INDEX];
         [enc setVertexBuffer:patch_out offset:patch_off atIndex:VIO_METAL_TESS_PATCH_IN_INDEX];
+        [enc setVertexBuffer:factors offset:fac_off atIndex:VIO_METAL_TESS_FACTOR_INDEX];   /* gl_TessLevel* in the TES */
         [enc setTessellationFactorBuffer:factors offset:fac_off instanceStride:0];
         [enc drawPatches:out_cp
               patchStart:0
