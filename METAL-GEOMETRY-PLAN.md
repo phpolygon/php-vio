@@ -1,6 +1,6 @@
 # Metal: Geometry-Stage per Compute-Emulation
 
-Status: 🚧 in Arbeit (2026-10-05). Ziel: `VIO_FEATURE_GEOMETRY` (+ `GEOMETRY_INSTANCING`, Adjacency,
+Status: ✅ umgesetzt (2026-10-05, `src/backends/metal/vio_metal_kernel.h`, `metal_draw_gs`). Ziel: `VIO_FEATURE_GEOMETRY` (+ `GEOMETRY_INSTANCING`, Adjacency,
 `gl_Layer`/`gl_ViewportIndex` aus dem GS) auf Metal, damit die Tests 109, 135, 137, 138, 139 und 143
 auch dort laufen statt zu skippen. Metal hat keine Geometry-Stage; MoltenVK emuliert sie ebenfalls
 nicht. vio emuliert sie wie die Tessellation: Stages als Compute-Kernel, Ergebnis in Ring-Puffer,
@@ -47,6 +47,11 @@ Keine handgeschriebenen SPIR-V-Loads/Stores; die Umbauten sind strukturell, den 
 Record-Format (vec4-Slots): Slot 0 `gl_Position`, Slot 1 `(layer, viewport, point_size, -)` als Bits,
 danach je User-Output in Location-Reihenfolge `ceil(Komponenten/4) × Spalten × Arraylänge` Slots.
 VS- und GS-Records nutzen dasselbe Schema (VS-Records werden vom GS über die Location gefunden).
+
+Upstream: SPIRV-Cross #2654 („Complete MSL lowering for geometry shaders“, Draft, Konflikte, an
+MoltenVK#2786 gekoppelt; der Maintainer lehnte die Vorgänger-Iteration ab) und #2200 (GS über Metal-
+3-Object/Mesh-Stages, CHANGES_REQUESTED, seit 2025 inaktiv) sind die einzigen Ansätze – keiner ist
+absehbar mergebar, beide bräuchten Mesh-Shader (macOS 13+). vio emuliert deshalb selbst.
 
 ## Grenzen (Warning bei `vio_shader`)
 

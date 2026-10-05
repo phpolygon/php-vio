@@ -94,6 +94,8 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/148` | Tessellation `point_mode` (Dreieck/Quad) erzeugt jeden Domain-Punkt genau einmal (Punktzahl nach GL-Regel, additives Blending deckt Duplikate auf), Isolines mit `fractional_odd_spacing`; auf Metal emuliert (siehe „Metal-3D-Pipeline"). |
+| `tests/render3d/147` | Stencil in Array-Layer, Cube-Face und depth_only-Target (Schema von 113); vorher hatte Metal dort keine Stencil-Plane. |
 | `tests/render3d/146` | `vio_set_uniform("name[i]", …)` setzt ein Element eines Arrays von Matrizen/Vektoren (`uniform mat4 u_m[3]`, `uniform vec4 u_col[2]`) auf jedem Backend. Vorher fanden D3D11/D3D12/Vulkan/Metal das Element nicht (Befund aus Code Rescue). |
 | `tests/render3d/145` | `vio_generate_mipmaps` im Frame: Cube-RT rendern, Mips bauen und die kleinste Stufe im selben Frame sampeln (zwei Frames mit verschiedenem Inhalt, keine veraltete Stufe); weiche Zeitgrenze, auf D3D12-Hardware ohne GPU-Drain (vorher ~3–10 ms je Aufruf). |
 | `tests/render3d/144` | Tessellation hält die OpenGL-Konventionen auf jedem Backend: welche Kante `outer[1]` unterteilt (Quad, Dreieck), Winding unter `VIO_CULL_BACK`, Patch-Varying mit Uniforms in TCS und TES, `vertices = 3` mit 4-Punkt-Patches (`gl_PatchVerticesIn`, HS-Variante), Isolines (auf D3D nur auf Hardware, WARP verliert tessellierte Linien), D3D12 auch mit Shader Model 6. Farben tragen die Domain-Koordinaten, die Prüfung ist unabhängig von der Readback-Orientierung. |
@@ -119,8 +121,8 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 | `tests/render3d/121` | Texture-Arrays / BC / KTX2: zweischichtiges RGBA8-Array mit expliziter Mip-Kette (`sampler2DArray`, `textureLod`), ein handkodierter BC1-Block, KTX2-Container (BC1 und RGBA8 mit `mip_offset`), defekte Eingabe → `false`. |
 | `tests/render3d/120` | Indirect Draw: zwei Argument-Records (instanceCount 1 / 0) aus einem Storage-Buffer zeichnen genau einen Quad; unindiziertes Mesh mit 4-uint32-Records; ein Compute-Pass, der instanceCount schreibt, steuert den Draw ohne Readback. |
 | `tests/core/119` | `shader_model => 6` auf D3D12 (dxcompiler/dxil aus `dxc_dir`, dem Windows-SDK oder dem Suchpfad): `vio_swapchain_info` meldet 6, Grafik- und Compute-Shader laufen als DXIL; ohne DXC ehrlicher Fallback auf 5. |
-| `tests/core/118` | HDR10-Ausgabe erzwungen (`hdr_output => 2`): D3D11/D3D12/Vulkan melden Format RGB10A2 + `hdr_output`, ein weisses 2D-Rechteck kommt PQ-kodiert hell zurueck (Readback expandiert 10 Bit), 3D-Draws laufen ueber die PSO-Format-Variante. |
-| `tests/core/117` | `frame_latency => 1`: D3D11/D3D12 melden `waitable` + Latenz 1 in `vio_swapchain_info`, Frames laufen; Backends ohne Feature melden 0 und ignorieren die Option. |
+| `tests/core/118` | HDR10-Ausgabe erzwungen (`hdr_output => 2`): D3D11/D3D12/Vulkan/Metal melden Format RGB10A2 + `hdr_output`, ein weisses 2D-Rechteck kommt PQ-kodiert hell zurueck (Readback expandiert 10 Bit), 3D-Draws laufen ueber die PSO-Format-Variante. |
+| `tests/core/117` | `frame_latency => 1`: D3D11/D3D12/Metal melden `waitable` + Latenz 1 in `vio_swapchain_info`, Frames laufen; Backends ohne Feature melden 0 und ignorieren die Option. |
 | `tests/core/116` | Shader-Cache: zweiter Kontext im selben Verzeichnis kompiliert denselben Shader aus dem Cache (`stores` > 0 beim ersten, `hits` > 0 beim zweiten Lauf); Vulkan schreibt seine Pipeline-Cache-Datei beim Destroy. |
 | `tests/core/115` | `vio_gpu_frame_time`: nach drei gerenderten Frames liefert jedes Backend mit dem Feature eine plausible GPU-Zeit (0 ≤ ms < 5000), ohne Feature −1. |
 | `tests/render3d/114` | 16-Bit-Indices: kleines Mesh bekommt 2 Bytes je Index und zeichnet auf jedem Backend korrekt; ein Index ≥ 65536 oder `index_type => VIO_INDEX_UINT32` erzwingt 4 Bytes. |
@@ -184,10 +186,10 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | read_pixels | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Texture Swizzle | ✅ (3.3+) | ❌ (CPU-Expand) | ❌ (CPU-Expand) | ✅ | ✅ |
 | Layered RTs (`'layers' => N`-Arrays, Depth-Cube; `VIO_FEATURE_RENDER_TARGET_LAYERED`) | ✅ (`GL_TEXTURE_2D_ARRAY` / Depth-Cubemap, `glFramebufferTextureLayer`) | ✅ (RTV/DSV je Slice) | ✅ (RTV/DSV je Slice) | ✅ (Framebuffer je Layer, `2D_ARRAY`/`CUBE`-Views) | ✅ (`MTLTextureType2DArray` Farbe + Tiefe, Depth32Float-Cube; Slice je Bind) |
-| Layered Rendering (`VIO_RT_ALL_LAYERS`, `gl_Layer`; `VIO_FEATURE_LAYERED_RENDER` / `_VERTEX_LAYER`) | ✅ (`glFramebufferTexture`; VS-Layer mit `GL_ARB_shader_viewport_layer_array`) | ✅ (RTV/DSV über alle Slices; GS per Probe, VS-Layer per `D3D11_OPTIONS3`) | ✅ (dto.; VS-Layer immer) | ✅ (Framebuffer `layers = N`; VS-Layer mit `VK_EXT_shader_viewport_index_layer`) | ✅ nur VS-Layer (`renderTargetArrayLength`, `[[render_target_array_index]]`; Mac2/Apple5, kein GS) |
+| Layered Rendering (`VIO_RT_ALL_LAYERS`, `gl_Layer`; `VIO_FEATURE_LAYERED_RENDER` / `_VERTEX_LAYER`) | ✅ (`glFramebufferTexture`; VS-Layer mit `GL_ARB_shader_viewport_layer_array`) | ✅ (RTV/DSV über alle Slices; GS per Probe, VS-Layer per `D3D11_OPTIONS3`) | ✅ (dto.; VS-Layer immer) | ✅ (Framebuffer `layers = N`; VS-Layer mit `VK_EXT_shader_viewport_index_layer`) | ✅ (`renderTargetArrayLength`, `[[render_target_array_index]]` aus VS oder emuliertem GS; Mac2/Apple5) |
 | Mehrere Viewports (`vio_viewports`, `gl_ViewportIndex`; `VIO_FEATURE_MULTI_VIEWPORT`) | ✅ (GL 4.1 / `ARB_viewport_array`, `glViewportIndexedf`) | ✅ (`RSSetViewports(n)`, 3D ohne Scissor) | ✅ (Viewport + Scissor je Eintrag) | ✅ (`multiViewport`; 3D-Pipelines tragen immer `max_viewports` Viewports, `vk3d_prepare` setzt alle) | ✅ (`setViewports:count:` + Scissor je Eintrag, `[[viewport_array_index]]` im VS; Mac2/Apple5) |
-| GS-Instancing (`layout(invocations = N)`, `VIO_FEATURE_GEOMETRY_INSTANCING`) | ✅ (GL ≥ 4.0 / `ARB_gpu_shader5`) | ✅‡ (GLSL über SPIR-V-Umbau: `SV_GSInstanceID` + `[instance(N)]`) | ✅‡ | ✅ | ❌ (kein GS) |
-| Adjacency-Topologien (`VIO_*_ADJACENCY`, `vio_mesh(['adjacency' => true])`) | ✅ | ✅ | ✅ | ✅ | ❌ (kein GS) |
+| GS-Instancing (`layout(invocations = N)`, `VIO_FEATURE_GEOMETRY_INSTANCING`) | ✅ (GL ≥ 4.0 / `ARB_gpu_shader5`) | ✅‡ (GLSL über SPIR-V-Umbau: `SV_GSInstanceID` + `[instance(N)]`) | ✅‡ | ✅ | ✅ (emuliert: Thread je Primitiv × Invocation) |
+| Adjacency-Topologien (`VIO_*_ADJACENCY`, `vio_mesh(['adjacency' => true])`) | ✅ | ✅ | ✅ | ✅ | ✅ (emuliert; ohne `TRIANGLE_STRIP_ADJACENCY`) |
 | HLSL-Stage-Override (`'hlsl' => [stage => src]`, `VIO_FEATURE_HLSL_STAGE_OVERRIDE`) | — | ✅ | ✅ (auch DXIL / SM 6) | — | — |
 | Cubemap-RT + `vio_generate_mipmaps` | ✅ | ✅ (`GenerateMips`) | ✅ (Compute-Downsample, CPU-Fallback) | ✅ (Framebuffer je Face/Level, `vkCmdBlitImage`-Kette) | ✅ |
 | `vio_read_render_target` | ✅ | ✅ | ✅† | ✅ (nach `vio_end`, Face und Attachment) | ✅ |
@@ -201,12 +203,12 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Texture-Arrays + BC + KTX2 (`vio_texture(['layers', 'format' => VIO_FORMAT_BC*, 'mip_levels'])`, `vio_texture_ktx2`, `VIO_FEATURE_TEXTURE_ARRAY` / `_TEXTURE_COMPRESSION_BC`) | ✅ (`GL_TEXTURE_2D_ARRAY`, S3TC/RGTC/BPTC) | ✅ | ✅ | ✅ (2D-Array-Views, `textureCompressionBC`, Block 10c) | ✅ (`MTLTextureType2DArray`, BC-Formate) |
 | Variable Rate Shading (`vio_set_shading_rate`, `VIO_SHADING_RATE_*`, `VIO_FEATURE_SHADING_RATE`) | ❌ | ❌ | ✅ (`RSSetShadingRate`, Tier 1+; 4X4 nur mit Additional Rates) | ✅ (`VK_KHR_fragment_shading_rate`, Pipeline-Rate als Dynamic State, Block 10c) | ❌ |
 | Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Fallback FXC 5.1) | — | — |
-| HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | ✅ (10-Bit-Surface-Format + `VK_EXT_swapchain_colorspace` HDR10 ST 2084, Block 10d) | — |
-| Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | — (3 Drawables) |
+| HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | ✅ (10-Bit-Surface-Format + `VK_EXT_swapchain_colorspace` HDR10 ST 2084, Block 10d) | ✅ (`CAMetalLayer` RGB10A2 im BT.2100-PQ-Farbraum, `hdr_output => 1` nur auf EDR-Displays) |
+| Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | ✅ (Dispatch-Semaphore über die Frames in Flight, 1..3) |
 | GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`) |
-| Stencil (`'stencil' => [...]`, `VIO_FEATURE_STENCIL`) | ✅ (DEPTH24_STENCIL8) | ✅ (D24S8) | ✅ (D24S8, `OMSetStencilRef`) | ✅ (D32S8 / D24S8) | ✅ (`Depth32Float_Stencil8` auf Swapchain und Farb-RTs; depth_only/Cube/Array-Targets ohne Stencil) |
-| Geometry-Stage (`vio_shader(['geometry' => …])`, `VIO_FEATURE_GEOMETRY`) | ✅ (GL ≥ 3.2) | ✅‡ | ✅‡ | ✅ (`geometryShader`) | ❌ (kein GS in Metal) |
-| Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`, `VIO_FEATURE_TESSELLATION`) | ✅ (GL ≥ 4.0) | ✅‡ (GLSL über vios Hull/Domain-Generator `vio_tess_hlsl.c`, oder HLSL-Override) | ✅‡ (dto., auch DXIL / SM 6) | ✅ (`tessellationShader`, Domain-Ursprung unten links) | ✅ (VS/TCS als Compute-Kernel + `drawPatches`; ohne Isolines/point_mode/Indirect) |
+| Stencil (`'stencil' => [...]`, `VIO_FEATURE_STENCIL`) | ✅ (DEPTH24_STENCIL8) | ✅ (D24S8) | ✅ (D24S8, `OMSetStencilRef`) | ✅ (D32S8 / D24S8) | ✅ (`Depth32Float_Stencil8` auf Swapchain und allen RTs, auch depth_only/Cube/Array; Test 147) |
+| Geometry-Stage (`vio_shader(['geometry' => …])`, `VIO_FEATURE_GEOMETRY`) | ✅ (GL ≥ 3.2) | ✅‡ | ✅‡ | ✅ (`geometryShader`) | ✅ (Compute-Emulation, `METAL-GEOMETRY-PLAN.md`) |
+| Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`, `VIO_FEATURE_TESSELLATION`) | ✅ (GL ≥ 4.0) | ✅‡ (GLSL über vios Hull/Domain-Generator `vio_tess_hlsl.c`, oder HLSL-Override) | ✅‡ (dto., auch DXIL / SM 6) | ✅ (`tessellationShader`, Domain-Ursprung unten links) | ✅ (VS/TCS als Compute-Kernel + `drawPatches`; Isolines/`point_mode` emuliert, Test 148) |
 | Storage-Images (`'storage' => true` + `vio_compute_bind_image`) | ✅ (wenn Compute) | ✅† | ✅† | ✅ (`STORAGE_IMAGE` aus der Reflection, Bild in `GENERAL`) | ✅ |
 | Compute-`local_size` aus Reflection (2D/3D-Dispatch) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Async-Dispatch im Frame (`['async' => true]`, `vio_compute_wait`) | ✅ (Queue in-order) | ✅ (in-order) | ✅† (Frame-List) | ✅ (Frame-Command-Buffer, Pass wird geschlossen und mit LOAD fortgesetzt) | ✅ (Frame-Cmd-Buffer) |
@@ -269,8 +271,8 @@ verbunden, der Clip-Space-Fixup wandert in die **letzte** Position schreibende S
 30–32 (dynamisch, Frame-Ring wie 0/1), `VIO_PATCHES` + `VkPipelineTessellationStateCreateInfo`.
 Der Shader-Cache-Schlüssel jeder Stage enthält die SPIR-V aller vorigen Stages und das
 „letzte Stage"-Flag (gleiches VS mit und ohne GS kompiliert verschieden, Test 135).
-Metal: Geometry-Shader gibt es in Metal nicht (`VIO_FEATURE_GEOMETRY == 0`); Tessellation läuft
-compute-basiert (siehe „Metal-3D-Pipeline").
+Metal: Geometry-Shader gibt es in Metal nicht; vio emuliert sie über Compute-Kernel, die Tessellation
+läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
 
 #### Geometry- und Tessellation-Stages (`vio_shader` `geometry` / `tess_control` + `tess_eval`)
 
@@ -338,8 +340,18 @@ compute-basiert (siehe „Metal-3D-Pipeline").
   dann `drawPatches` auf dem offenen Render-Encoder (Texturen/Viewport bleiben). Indizierte Draws
   werden auf der CPU de-indiziert. Die TCS bekommt die Domain der TES gesetzt (Faktor-Struct), die
   TES die Kontrollpunktzahl der TCS. Metals Tessellator hat GLs Domain-Koordinaten, Faktor-Kanten und
-  Winding-Bezeichnung (Test 144, macOS-CI): keine MSL-Ursprungs-Option, keine Winding-Umkehr. Nicht unterstützt (Warning): Isolines, `point_mode`, `vio_draw_indirect`,
-  `vio_draw_instanced_from_buffer` mit Tessellation-Pipeline. Ein async Compute-Dispatch
+  Winding-Bezeichnung (Test 144, macOS-CI): keine MSL-Ursprungs-Option, keine Winding-Umkehr.
+  `vio_draw_indirect` liest die Argument-Records auf der CPU (Shared-Buffer, async Dispatches des
+  Frames laufen vorher), `vio_draw_instanced_from_buffer` bindet die SSBO an den Vertex-Kernel.
+  **Isolines und `point_mode`** (Metals Tessellator hat beides nicht): nach dem Control-Kernel
+  liest vio die Level zurück (diese Draws warten auf ihre Kernel), rundet sie nach GL-Spacing und
+  treibt den Tessellator mit exakten Integer-Faktoren (Isolines als Quad-Domain, SPIR-V-
+  Execution-Mode `Isolines` → `Quads`). Die TES läuft als Capture-Funktion in einem Pass ohne
+  Rasterisierung (`metal_tess_emul_msl`): jeder benötigte Domain-Punkt landet in einem festen Slot,
+  `gl_TessCoord` wird auf die Fractional-Regel umgerechnet (die zwei kurzen Segmente liegen an den
+  Enden), zusätzliche Punkte der Integer-Tessellation verfallen. Der Draw liest die Slots über
+  `vio_pass` (dieselbe Library, dasselbe Output-Struct) als Linien bzw. Punkte. Grenze: innere Ringe
+  eines `point_mode`-Dreiecks folgen bei Fractional-Spacing der Integer-Lage. Ein async Compute-Dispatch
   desselben Frames läuft **nach** den Tessellation-Kerneln. Varyings zwischen den Stages müssen
   in Location-Reihenfolge übereinstimmen (die Puffer-Structs werden je Stage gebaut). Der
   Transpiler liegt als reines C in `src/backends/metal/vio_metal_msl.h` und lässt sich ohne Mac
@@ -407,14 +419,37 @@ compute-basiert (siehe „Metal-3D-Pipeline").
   `MTLSamplerState` mit `compareFunction = LessEqual`.
 - Winding CCW = Front (wie GL/D3D-`FrontCounterClockwise`), NDC-Z 0..1 (PHPolygon:
   `BackendConventions::depthZeroToOne()`), Render-Target-Origin oben links.
-- **Stencil**: Swapchain- und Farb-RT-Tiefe sind `Depth32Float_Stencil8` (Stencil-Plane im Pass, Clear auf 0),
-  depth_only-/Cube-/Array-Targets bleiben `Depth32Float`. Jede Pipeline hat einen Depth-State mit und einen ohne
+- **Stencil**: Swapchain- und jede RT-Tiefe (auch depth_only/Cube/Array, wie D3Ds D24S8) sind
+  `Depth32Float_Stencil8` (Stencil-Plane im Pass, Clear auf 0); Sampling liest die Depth-Plane, der
+  Depth-Readback blittet mit `MTLBlitOptionDepthFromDepthStencil`. Jede Pipeline hat einen Depth-State mit und einen ohne
   Stencil (für Ziele ohne Plane); PSO- und 2D-Varianten tragen das Stencil-Format.
 - **Layered Targets**: `'layers' => N` = 2DArray für Farbe und Tiefe, depth_only-Cube = Depth32Float-Cube,
   Farb-Cubes haben eine Cube-Tiefe. `VIO_RT_ALL_LAYERS` setzt `renderTargetArrayLength`; `gl_Layer` /
   `gl_ViewportIndex` kommen aus der Vertex-Stage (`[[render_target_array_index]]` / `[[viewport_array_index]]`,
   PSOs setzen dafür `inputPrimitiveTopology`), `vio_viewports` → `setViewports:count:` + Scissor je Eintrag.
   Flags `LAYERED_RENDER`/`VERTEX_LAYER`/`MULTI_VIEWPORT` nur auf Mac2/Apple5.
+- **Geometry-Stage (emuliert, `METAL-GEOMETRY-PLAN.md`)**: `vio_shader(['geometry' => …])` baut aus VS
+  und GS je einen Compute-Kernel (`vio_metal_kernel.h`, reines C): SPIR-V-Umbau (GLCompute, Interface-
+  Variablen `Private`, `EmitVertex`/`EndPrimitive` → Aufrufe von `vio_emit`/`vio_end_primitive`),
+  SPIRV-Cross → GLSL mit von vio vergebenen Namen (`vio_i<loc>`, `vio_o<loc>`, `vio_gl_in`, …), die
+  Puffer-Logik als GLSL-Text drumherum, glslang → MSL über die normale Umnummerierung. Je Draw:
+  CPU-Primitiv-Assembly (Strips/Fans in GL-Reihenfolge, Adjacency-Listen), VS-Kernel (Thread je
+  Stream-Vertex × Instanz, Attribute aus dem Mesh-Puffer wie der Vertex-Deskriptor, 3–6 aus dem
+  Instanz-Puffer) → Records aus vec4-Slots (0 `gl_Position`, 1 Layer/Viewport/PointSize, dann die
+  Outputs nach Location), GS-Kernel (Thread je Primitiv × Invocation × Instanz, fester Bereich von
+  `max_vertices` Records, Strips als Indexliste, unbenutzte Indizes zeigen auf den geclippten Record 0
+  – die Primitiv-Reihenfolge bleibt wie in GL), dann `drawIndexedPrimitives` über eine generierte
+  Durchreich-Vertex-Funktion (liest den Record per `gl_VertexIndex`, schreibt `gl_Layer` /
+  `gl_ViewportIndex` / `gl_PointSize`). Uniforms: VS-Default-Block an den VS-Kernel, GS-Block aus
+  `bind_stage_constants`; die Plumbing-Bindings 20–25 findet der Draw über die Ressourcen-Tabelle
+  (`mk_res_index`, `mk_user_cbuffer`). `VIO_DUMP_GS_GLSL=1` druckt die drei generierten GLSL-Quellen.
+- **HDR10 / Frame-Latenz**: `hdr_output => 2` (bzw. `1` auf einem EDR-Display, `NSScreen.
+  maximumPotentialExtendedDynamicRangeColorComponentValue > 1`) schaltet den `CAMetalLayer` auf
+  `RGB10A2Unorm` im Farbraum `kCGColorSpaceITUR_2100_PQ`; das Swapchain-Format (`vio_mtl.swap_format`)
+  bestimmt Offscreen-/MSAA-Texturen, 2D- und PSO-Varianten. Der 2D-Batch PQ-kodiert nur, was auf der
+  Swapchain landet (RTs bleiben display-referred), der Readback expandiert 10 Bit wie D3D/Vulkan.
+  `frame_latency => n` (1..3) begrenzt die Frames in Flight mit einer Dispatch-Semaphore, die der
+  Command-Buffer jedes Frames beim Abschluss signalisiert; `vio_swapchain_info()` meldet beides.
 - Tests: `tests/backends/089_metal_3d_pipeline.phpt` (Pixel-Kontrakt), `088` läuft jetzt auch auf Metal.
 
 ### Zend-Objekte (13 Klassen)
@@ -490,7 +525,9 @@ src/
     vulkan/vio_vulkan_rt.c  # Vulkan-Render-Targets: MRT, MSAA-Resolve, Cube-Faces, Readback, Mid-Frame-Clear (Block 10b)
     vulkan/vio_vulkan_cube.c # Vulkan-Cubemaps und Mip-Ketten per Blit (Block 10b)
     vulkan/vio_vma_wrapper.cpp  # VMA C++17 Wrapper
-    metal/vio_metal.m       # Metal (ObjC, CAMetalLayer) — 2D + RT + Compute, 3D stub
+    metal/vio_metal.m       # Metal (ObjC, CAMetalLayer) — 2D, 3D, RT, Compute, Tessellation, emulierte GS
+    metal/vio_metal_msl.h   # SPIR-V → MSL (Umnummerierung, Tess-Stages, Isolines/point_mode-Capture), reines C
+    metal/vio_metal_kernel.h  # VS/GS als Compute-Kernel (SPIR-V-Umbau → GLSL), reines C
     metal/vio_metal.c       # C-Shim, #include't vio_metal.m (Autotools kennt kein .m)
     d3d11/vio_d3d11.c       # Direct3D 11 (Windows), vollständig
     d3d12/vio_d3d12.c       # Direct3D 12 (Windows), vollständig, frame_count konfigurierbar
@@ -915,7 +952,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 147 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 149 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -942,6 +979,10 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   (jetzt 1.4.341), `name[i]` für Matrix-/Vektor-Arrays löst die Array-Schrittweite auf (Tests 145, 146).
 - `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
 - `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
+- **`METAL-GEOMETRY-PLAN.md` — ✅ umgesetzt (2026-10-05).** Geometry-Stage auf Metal per Compute-
+  Emulation (VS- und GS-Kernel aus SPIR-V-Umbau → SPIRV-Cross-GLSL → glslang, `vio_metal_kernel.h`,
+  Durchreich-Vertex-Funktion); Tests 109/135/137–139/143 laufen auf Metal. Upstream-Alternativen
+  (SPIRV-Cross #2654 / #2200, Mesh-Stage-basiert, Drafts mit Konflikten) sind nicht absehbar mergebar.
 - **`METALGPU-REPLACEMENT-PLAN.md` — 🚧 Phasen 1–3 umgesetzt.** php-metal-gpu (`ext-metal`) und
   PHPolygons Standalone-`MetalRenderer3D` durch vio-Metal ersetzen. Phase 1 erweitert die
   vio-API auf allen Backends (Cubemap-Render-Target + `vio_generate_mipmaps`, `depth_write`/
@@ -1066,9 +1107,12 @@ Aufrufer geändert hat:
   (physische → logische Cursor-Pixel); im Headless-Modus ist der Scale 1 (injizierte
   Koordinaten sind logisch) — vorher schlug `026` auf jedem HiDPI-Windows-Host fehl.
 - Metal: max. 8 PSO-Varianten (Zielformat × Mesh-Stride × Samples) pro Pipeline und 8
-  2D-Varianten; Texturen sind `MTLStorageModeShared` (Apple Silicon); keine Geometry-Stage
-  (Metal-Limitierung) – Layer und Viewport wählt nur die Vertex-Stage, Tessellation läuft über
-  Compute-Kernel (siehe „Geometry- und Tessellation-Stages").
+  2D-Varianten; Texturen sind `MTLStorageModeShared` (Apple Silicon); Geometry- und Tessellation-
+  Stages laufen über Compute-Kernel (siehe „Metal-3D-Pipeline"). Grenzen der GS-Emulation (Warning
+  bei `vio_shader`): Sampler in VS/GS einer GS-Pipeline, Interface-Blöcke/Struct-Varyings, GS hinter
+  Tessellation, `TRIANGLE_STRIP_ADJACENCY`; ein vom GS geschriebenes `gl_PrimitiveID` erreicht den
+  Fragment-Shader nicht. Variable Rate Shading gibt es nicht: Metals Rasterization-Rate-Maps
+  verkleinern das physische Target und lassen sich nicht transparent auf `vio_set_shading_rate` abbilden.
 - `vio_clear`: vor `vio_begin` wird die Farbe gelatcht und beim Frame-Start angewendet; **im
   Frame cleart jedes Backend sofort** das gebundene Ziel (Swapchain oder RT) — OpenGL seit
   Phase 1 des Replacement-Plans wie D3D11/D3D12/Metal. Neue RTs starten mit Depth 1.0 /

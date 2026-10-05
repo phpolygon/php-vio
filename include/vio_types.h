@@ -349,9 +349,10 @@ typedef struct _vio_config {
     /* Waitable swapchain (GAP-PHASE5 Block 5): maximum frames the CPU may queue
      * ahead of presentation; vio_begin blocks on the swapchain's waitable object
      * until a backbuffer is free. 1 = lowest input latency, 0 = driver default
-     * (no waitable object). D3D11 / D3D12 only. */
+     * (no waitable object). D3D11 / D3D12 (waitable object) and Metal (frames
+     * in flight, 1..3). */
     int         frame_latency;
-    /* HDR10 output (GAP-PHASE5 Block 6, D3D11 / D3D12): 1 = 10-bit ST 2084
+    /* HDR10 output (GAP-PHASE5 Block 6, D3D11 / D3D12 / Vulkan / Metal): 1 = 10-bit ST 2084
      * backbuffer when the window's display is in HDR mode, 2 = force it even on
      * an SDR display (tests), 0 = 8-bit sRGB. hdr_paper_white is the luminance
      * (nits) that display-referred white (1.0) maps to; 0 => 200. */
