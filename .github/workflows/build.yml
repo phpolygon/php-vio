@@ -510,7 +510,9 @@ jobs:
             tests/render3d/143_gs_gl_in_position_all_backends.phpt `
             tests/render3d/144_tessellation_gl_conventions_all_backends.phpt `
             tests/render3d/145_cube_mipmaps_in_frame_all_backends.phpt `
-            tests/render3d/146_uniform_array_elements_all_backends.phpt
+            tests/render3d/146_uniform_array_elements_all_backends.phpt `
+            tests/render3d/147_stencil_layered_depth_only_all_backends.phpt `
+            tests/render3d/148_tessellation_point_mode_isolines_all_backends.phpt
 
       - name: Package binary
         shell: pwsh
