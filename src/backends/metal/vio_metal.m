@@ -64,6 +64,19 @@ typedef struct _vio_metal_state {
     int                        debug;            /* vio_create 'debug': per-command-buffer error reporting */
     int                        unified_memory;   /* Apple silicon: Shared textures OK; Intel: Managed */
     char                       gpu_name[256];
+    /* Swapchain colour format: BGRA8Unorm, or RGB10A2Unorm with the layer in
+     * the ITU-R 2100 PQ colour space for vio_create(['hdr_output' => ...]). The
+     * offscreen / MSAA swapchain textures, the 2D swapchain variant and the PSO
+     * target description all follow it. */
+    MTLPixelFormat             swap_format;
+    int                        hdr_output;       /* 1 = HDR10 (RGB10A2 + ST 2084) active */
+    float                      hdr_paper_white;  /* nits that 2D white (1.0) maps to */
+    /* vio_create(['frame_latency' => n]): at most n frames in flight. begin_frame
+     * waits on the semaphore, the frame's command buffer signals it on
+     * completion - the Metal counterpart of the DXGI waitable object. */
+    dispatch_semaphore_t       frame_semaphore;
+    int                        frame_latency;
+    int                        frame_semaphore_held; /* begin_frame took a slot present has not handed on yet */
 #ifdef HAVE_GLFW
     /* When the backend was bootstrapped via vio_metal_setup_context() the
      * GLFW window is polled each frame to discover resizes. Pure-native
@@ -284,7 +297,7 @@ static void metal_create_swapchain_msaa(int w, int h)
     if (vio_mtl.samples <= 1) return;
 
     MTLTextureDescriptor *cd = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
+        texture2DDescriptorWithPixelFormat:vio_mtl.swap_format width:w height:h mipmapped:NO];
     cd.textureType = MTLTextureType2DMultisample;
     cd.sampleCount = (NSUInteger)vio_mtl.samples;
     cd.usage = MTLTextureUsageRenderTarget;
@@ -325,6 +338,39 @@ static void create_depth_texture(int w, int h)
 }
 
 /* ── Setup / Teardown ────────────────────────────────────────────── */
+
+/* Set by the platform wrapper before setup_context_native: 1 when the window's
+ * display can show extended dynamic range (an HDR / XDR screen), which is what
+ * hdr_output => 1 asks for. hdr_output => 2 ignores it. */
+static int metal_display_edr = 0;
+
+/* HDR10 swapchain: 10-bit RGB10A2 in the ITU-R BT.2100 PQ colour space. The
+ * layer then expects ST 2084-encoded values - the 2D batch PQ-encodes its
+ * display-referred colours (paper white), 3D shaders write what they write,
+ * exactly as on the D3D / Vulkan HDR10 swapchains. */
+static void metal_configure_layer_format(vio_config *cfg)
+{
+    vio_mtl.swap_format = MTLPixelFormatBGRA8Unorm;
+    vio_mtl.hdr_output = 0;
+    vio_mtl.hdr_paper_white = cfg->hdr_paper_white > 0.0f ? cfg->hdr_paper_white : 200.0f;
+#if TARGET_OS_OSX
+    if (cfg->hdr_output >= 2 || (cfg->hdr_output == 1 && metal_display_edr)) {
+        if (@available(macOS 10.15, *)) {
+            CGColorSpaceRef pq = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
+            if (pq) {
+                vio_mtl.metal_layer.pixelFormat = MTLPixelFormatRGB10A2Unorm;
+                vio_mtl.metal_layer.colorspace = pq;
+                vio_mtl.metal_layer.wantsExtendedDynamicRangeContent = YES;
+                CGColorSpaceRelease(pq);
+                vio_mtl.swap_format = MTLPixelFormatRGB10A2Unorm;
+                vio_mtl.hdr_output = 1;
+                return;
+            }
+        }
+    }
+#endif
+    vio_mtl.metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+}
 
 int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
                                    vio_config *cfg)
@@ -368,7 +414,7 @@ int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
          * and keep an ARC-strong reference for the context lifetime. */
         vio_mtl.metal_layer = (__bridge CAMetalLayer *)cf_metal_layer;
         vio_mtl.metal_layer.device = vio_mtl.device;
-        vio_mtl.metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        metal_configure_layer_format(cfg);
         vio_mtl.metal_layer.framebufferOnly = NO; /* Need readable for screenshots */
         vio_mtl.metal_layer.opaque = YES;
         vio_mtl.vsync = cfg->vsync;
@@ -380,6 +426,12 @@ int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
         /* Use 3 drawables to avoid nextDrawable returning nil when PHP's GC
            causes occasional frame time spikes. Default of 2 is too tight. */
         vio_mtl.metal_layer.maximumDrawableCount = 3;
+
+        /* frame_latency => n: cap the frames in flight (CPU run-ahead). The
+         * per-frame ring has 3 slots, so 3 is also the natural maximum. */
+        vio_mtl.frame_latency = cfg->frame_latency > 0 ? (cfg->frame_latency > 3 ? 3 : cfg->frame_latency) : 0;
+        vio_mtl.frame_semaphore = vio_mtl.frame_latency > 0 ? dispatch_semaphore_create(vio_mtl.frame_latency) : nil;
+        vio_mtl.frame_semaphore_held = 0;
         vio_mtl.metal_layer.drawableSize = CGSizeMake(width, height);
 
         vio_mtl.width  = width;
@@ -392,7 +444,7 @@ int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
         /* Create offscreen render target for vsync-off mode */
         if (!cfg->vsync) {
             MTLTextureDescriptor *offDesc = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                texture2DDescriptorWithPixelFormat:vio_mtl.swap_format
                 width:width height:height mipmapped:NO];
             offDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             offDesc.storageMode = MTLStorageModePrivate;
@@ -448,6 +500,15 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
         [content_view setWantsLayer:YES];
         [content_view setLayer:layer];
         [content_view setLayerContentsRedrawPolicy:NSViewLayerContentsRedrawNever];
+
+#if TARGET_OS_OSX
+        /* hdr_output => 1 only switches to HDR10 on a display that can show it. */
+        metal_display_edr = 0;
+        if (@available(macOS 10.15, *)) {
+            NSScreen *screen = ns_window.screen ? ns_window.screen : [NSScreen mainScreen];
+            metal_display_edr = screen && screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0;
+        }
+#endif
 
         int fb_w, fb_h;
         if (cfg->headless) {
@@ -521,6 +582,19 @@ void vio_metal_shutdown_context(void)
             [cmd commit];
             [cmd waitUntilCompleted];
         }
+
+        /* libdispatch aborts when a semaphore is released below its initial
+         * value: hand back a slot taken by an unpresented frame, then wait out
+         * every in-flight frame's completion handler before dropping it. */
+        if (vio_mtl.frame_semaphore) {
+            if (vio_mtl.frame_semaphore_held) dispatch_semaphore_signal(vio_mtl.frame_semaphore);
+            for (int i = 0; i < vio_mtl.frame_latency; i++) dispatch_semaphore_wait(vio_mtl.frame_semaphore, DISPATCH_TIME_FOREVER);
+            for (int i = 0; i < vio_mtl.frame_latency; i++) dispatch_semaphore_signal(vio_mtl.frame_semaphore);
+            vio_mtl.frame_semaphore = nil;
+            vio_mtl.frame_semaphore_held = 0;
+            vio_mtl.frame_latency = 0;
+        }
+        vio_mtl.offscreen_texture = nil;
 
         vio_mtl.depth_texture    = nil;
         vio_mtl.msaa_color       = nil;
@@ -666,7 +740,7 @@ int vio_metal_2d_init(int width, int height)
 
         /* Swapchain variant (BGRA8, single sample) is built eagerly so a
          * failure surfaces at init, not at the first flush. */
-        vio_metal_target_desc swap = { { MTLPixelFormatBGRA8Unorm, 0, 0, 0 }, 1, 1, 1, 1 };
+        vio_metal_target_desc swap = { { vio_mtl.swap_format, 0, 0, 0 }, 1, 1, 1, 1 };
         vio_metal_2d_variant *v0 = metal_2d_variant(&swap);
         if (!v0) {
             return -1;
@@ -728,11 +802,14 @@ void vio_metal_2d_flush(vio_2d_state *state)
         memcpy([mtl_2d.vertex_buffer contents], state->vertices,
                sizeof(vio_2d_vertex) * state->vertex_count);
 
-        /* Upload projection matrix as a small buffer */
-        id<MTLBuffer> projBuf = [vio_mtl.device
-            newBufferWithBytes:state->projection
-            length:sizeof(float) * 16
-            options:MTLResourceStorageModeShared];
+        /* Projection + output control: PQ-encode only what lands on an HDR10
+         * swapchain - a render target keeps display-referred values, so 2D drawn
+         * into it and composited onto the swapchain later is encoded once. */
+        float ub[20];
+        memcpy(ub, state->projection, sizeof(float) * 16);
+        ub[16] = (vio_mtl.hdr_output && !current_bound_rt) ? 1.0f : 0.0f;
+        ub[17] = vio_mtl.hdr_paper_white > 0.0f ? vio_mtl.hdr_paper_white : 200.0f;
+        ub[18] = 0.0f; ub[19] = 0.0f;
 
         /* Disable depth for 2D, and undo any 3D encoder state (a preceding
          * vio_draw may have left back-face culling / depth bias set — the 2D
@@ -743,7 +820,8 @@ void vio_metal_2d_flush(vio_2d_state *state)
 
         /* Bind vertex buffer and projection */
         [vio_mtl.current_encoder setVertexBuffer:mtl_2d.vertex_buffer offset:0 atIndex:0];
-        [vio_mtl.current_encoder setVertexBuffer:projBuf offset:0 atIndex:1];
+        [vio_mtl.current_encoder setVertexBytes:ub length:sizeof(ub) atIndex:1];
+        [vio_mtl.current_encoder setFragmentBytes:ub length:sizeof(ub) atIndex:1];
 
         /* PSO pair matching the bound target (swapchain / HDR RT / MSAA RT). */
         vio_metal_target_desc target;
@@ -1000,6 +1078,22 @@ int vio_metal_read_pixels(int width, int height, unsigned char *out_rgba)
          * texture is smaller (a drawable that has not caught up with a resize)
          * the rows must still land at the caller's stride, or every row after
          * the first is shifted and the image tears diagonally. */
+        if (srcTexture.pixelFormat == MTLPixelFormatRGB10A2Unorm) {
+            /* HDR10 swapchain: R bits 0-9, G 10-19, B 20-29, A 30-31; the top 8
+             * bits of each channel, as the D3D / Vulkan 10-bit readbacks do. */
+            for (int y = 0; y < use_h; y++) {
+                const uint32_t *row = (const uint32_t *)(bgra + (size_t)y * bytesPerRow);
+                for (int x = 0; x < use_w; x++) {
+                    uint32_t v = row[x];
+                    size_t dst = ((size_t)y * width + x) * 4;
+                    out_rgba[dst + 0] = (unsigned char)((v >> 2) & 0xFF);
+                    out_rgba[dst + 1] = (unsigned char)((v >> 12) & 0xFF);
+                    out_rgba[dst + 2] = (unsigned char)((v >> 22) & 0xFF);
+                    out_rgba[dst + 3] = (unsigned char)(((v >> 30) & 0x3) * 85);
+                }
+            }
+            return 0;
+        }
         for (int y = 0; y < use_h; y++) {
             for (int x = 0; x < use_w; x++) {
                 size_t src = ((size_t)y * use_w + x) * 4;
@@ -1085,7 +1179,7 @@ static void metal_resize(int width, int height)
         /* Recreate offscreen texture for vsync-off mode */
         if (!vio_mtl.vsync) {
             MTLTextureDescriptor *offDesc = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                texture2DDescriptorWithPixelFormat:vio_mtl.swap_format
                 width:width height:height mipmapped:NO];
             offDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             offDesc.storageMode = MTLStorageModePrivate;
@@ -1261,13 +1355,25 @@ static void metal_begin_frame(void)
            throttling from nextDrawable. This gives accurate GPU-only frame timing
            for benchmarks. In vsync mode, render directly to the drawable.
            Only fetch a drawable when no explicit RT is bound. */
+        /* frame_latency: block until one of the n in-flight frames retired. */
+        if (vio_mtl.frame_semaphore && !vio_mtl.frame_semaphore_held) {
+            dispatch_semaphore_wait(vio_mtl.frame_semaphore, DISPATCH_TIME_FOREVER);
+            vio_mtl.frame_semaphore_held = 1;
+        }
+
         if (current_bound_rt) {
             vio_mtl.current_drawable = nil;
         } else if (!vio_mtl.vsync && vio_mtl.offscreen_texture) {
             vio_mtl.current_drawable = nil;
         } else {
             vio_mtl.current_drawable = [vio_mtl.metal_layer nextDrawable];
-            if (!vio_mtl.current_drawable) return;
+            if (!vio_mtl.current_drawable) {
+                if (vio_mtl.frame_semaphore_held) {
+                    dispatch_semaphore_signal(vio_mtl.frame_semaphore);
+                    vio_mtl.frame_semaphore_held = 0;
+                }
+                return;
+            }
         }
 
         vio_mtl.current_cmd_buf = metal_new_command_buffer();
@@ -1297,6 +1403,15 @@ static void metal_present(void)
             double ms = (done.GPUEndTime - done.GPUStartTime) * 1000.0;
             if (ms >= 0.0) vio_mtl.last_gpu_ms = ms;
         }];
+        if (vio_mtl.frame_semaphore_held) {
+            /* The frame's slot frees up when its command buffer retires. */
+            dispatch_semaphore_t sem = vio_mtl.frame_semaphore;
+            [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                (void)done;
+                dispatch_semaphore_signal(sem);
+            }];
+            vio_mtl.frame_semaphore_held = 0;
+        }
 
         if (vio_mtl.current_drawable) {
             /* Vsync path: present drawable to screen */
@@ -2782,7 +2897,7 @@ static void metal_current_target(vio_metal_target_desc *t)
         }
         return;
     }
-    t->fmts[0] = MTLPixelFormatBGRA8Unorm;
+    t->fmts[0] = vio_mtl.swap_format;
     t->count = 1;
     if (vio_mtl.samples > 1 && vio_mtl.msaa_color) t->samples = vio_mtl.samples;
     id<MTLTexture> sdt = (vio_mtl.samples > 1 && vio_mtl.msaa_color) ? vio_mtl.msaa_depth : vio_mtl.depth_texture;
@@ -4482,6 +4597,18 @@ static double metal_gpu_frame_time(void)
     return vio_mtl.initialized && vio_mtl.last_gpu_ms > 0.0 ? vio_mtl.last_gpu_ms : -1.0;
 }
 
+/* vio_swapchain_info(): drawables, frames in flight (frame_latency semaphore),
+ * HDR10 layer. */
+static void metal_swapchain_info(vio_swapchain_info *out)
+{
+    if (!vio_mtl.initialized) return;
+    out->buffer_count  = vio_mtl.metal_layer ? (int)vio_mtl.metal_layer.maximumDrawableCount : 0;
+    out->frame_latency = vio_mtl.frame_semaphore ? vio_mtl.frame_latency : 0;
+    out->waitable      = vio_mtl.frame_semaphore ? 1 : 0;
+    out->hdr_output    = vio_mtl.hdr_output;
+    out->format        = vio_mtl.swap_format == MTLPixelFormatRGB10A2Unorm ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
+}
+
 static int metal_supports_feature(vio_feature f)
 {
     switch (f) {
@@ -4535,6 +4662,16 @@ static int metal_supports_feature(vio_feature f)
         return 1;
     case VIO_FEATURE_GPU_TIMESTAMP: /* MTLCommandBuffer GPUStartTime / GPUEndTime */
         return 1;
+    case VIO_FEATURE_FRAME_LATENCY:
+        /* frame_latency => n: dispatch semaphore over the frames in flight,
+         * signalled by each frame's command buffer on completion. */
+        return 1;
+    case VIO_FEATURE_HDR_OUTPUT:
+#if TARGET_OS_OSX
+        /* RGB10A2 CAMetalLayer in the BT.2100 PQ colour space (macOS 10.15+). */
+        if (@available(macOS 10.15, *)) return 1;
+#endif
+        return 0;
     case VIO_FEATURE_INDIRECT_DRAW: /* drawIndexedPrimitives:indirectBuffer: */
         return 1;
     case VIO_FEATURE_TEXTURE_ARRAY: /* MTLTextureType2DArray */
@@ -4641,6 +4778,7 @@ static const vio_backend metal_backend = {
     .dispatch_compute  = metal_dispatch_compute,
     .supports_feature  = metal_supports_feature,
     .gpu_frame_time    = metal_gpu_frame_time,
+    .swapchain_info    = metal_swapchain_info,
     .destroy_mesh      = metal_destroy_mesh,
     .destroy_shader_obj = metal_destroy_shader_obj,
     .upload_cubemap    = metal_upload_cubemap,

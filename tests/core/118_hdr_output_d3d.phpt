@@ -1,11 +1,11 @@
 --TEST--
-HDR10 swapchain output on D3D11 / D3D12 / Vulkan: forced RGB10A2 backbuffer, PQ-encoded 2D batch, 3D PSO format variants (VIO_FEATURE_HDR_OUTPUT)
+HDR10 swapchain output on D3D11 / D3D12 / Vulkan / Metal: forced RGB10A2 backbuffer, PQ-encoded 2D batch, 3D PSO format variants (VIO_FEATURE_HDR_OUTPUT)
 --EXTENSIONS--
 vio
 --SKIPIF--
 <?php
 $any = false;
-foreach (['d3d11', 'd3d12', 'vulkan'] as $b) {
+foreach (['d3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
     $c = @vio_create($b, ["width" => 8, "height" => 8, "headless" => true, "vsync" => false]);
     if ($c) { if (vio_supports_feature($c, VIO_FEATURE_HDR_OUTPUT)) $any = true; vio_destroy($c); }
 }
@@ -70,7 +70,7 @@ function run_backend(string $name): string {
     return $fail ? "FAIL\n  " . implode("\n  ", $fail) : "OK";
 }
 
-foreach (['d3d11', 'd3d12', 'vulkan'] as $b) {
+foreach (['d3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
     echo "$b: ", run_backend($b), "\n";
 }
 echo "DONE\n";
@@ -79,4 +79,5 @@ echo "DONE\n";
 d3d11: %s
 d3d12: %s
 vulkan: %s
+metal: %s
 DONE

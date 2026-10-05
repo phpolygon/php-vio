@@ -1,0 +1,18 @@
+opengl: 
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php on line 98
+
+Warning: vio_pipeline(): vio_pipeline requires 'shader' (VioShader object) in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php on line 99
+
+Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php on line 106
+
+Warning: vio_pipeline(): vio_pipeline requires 'shader' (VioShader object) in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php on line 107
+
+Fatal error: Uncaught TypeError: vio_bind_pipeline(): Argument #2 ($pipeline) must be of type VioPipeline, false given in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php:103
+Stack trace:
+#0 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php(103): vio_bind_pipeline(Object(VioContext), false)
+#1 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php(127): {closure:run_backend():103}()
+#2 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php(51): {closure:run_backend():126}()
+#3 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php(126): frame(Object(VioContext), NULL, 0, Object(Closure))
+#4 /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php(233): run_backend('opengl')
+#5 {main}
+  thrown in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/135_geometry_tessellation_draw_paths_all_backends.php on line 103

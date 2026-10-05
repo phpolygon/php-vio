@@ -1,0 +1,21 @@
+001- opengl: %r(OK|skip \(.*\))%r
+001+ opengl: 
+002+ Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/144_tessellation_gl_conventions_all_backends.php on line 108
+003+ 
+004+ Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/144_tessellation_gl_conventions_all_backends.php on line 108
+005+ 
+006+ Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/144_tessellation_gl_conventions_all_backends.php on line 108
+007+ 
+008+ Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/144_tessellation_gl_conventions_all_backends.php on line 108
+009+ 
+010+ Warning: vio_shader(): vio_shader: vertex shader requires GLSL >= 450, but runtime context provides 410. Lower the #version directive or run on a newer GPU. in /Users/hmennen/PhpstormProjects/php-vio/tests/render3d/144_tessellation_gl_conventions_all_backends.php on line 108
+011+ FAIL
+012+   A: shader not created
+013+   B: shader not created
+014+   C: shader not created
+015+   D: shader not created
+016+   E: shader not created
+     d3d11: %r(OK|skip \(.*\))%r
+     d3d12: %r(OK|skip \(.*\))%r
+     vulkan: %r(OK|skip \(.*\))%r
+--

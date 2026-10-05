@@ -214,6 +214,9 @@ if ($mtl) {
        && vio_supports_feature($mtl, VIO_FEATURE_LAYERED_RENDER) === vio_supports_feature($mtl, VIO_FEATURE_VERTEX_LAYER)
        && vio_supports_feature($mtl, VIO_FEATURE_MULTI_VIEWPORT) === vio_supports_feature($mtl, VIO_FEATURE_VERTEX_LAYER)
        && vio_supports_feature($mtl, VIO_FEATURE_NATIVE_2D_BATCH) === true
+       /* frame-latency semaphore; RGB10A2 layer in the BT.2100 PQ colour space */
+       && vio_supports_feature($mtl, VIO_FEATURE_FRAME_LATENCY) === true
+       && vio_supports_feature($mtl, VIO_FEATURE_HDR_OUTPUT) === true
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET) === true
        && vio_supports_feature($mtl, VIO_FEATURE_TEXTURE_SWIZZLE) === true;
     vio_destroy($mtl);
