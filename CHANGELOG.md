@@ -1,3 +1,13 @@
+# [2.30.0](https://github.com/phpolygon/php-vio/compare/v2.29.1...v2.30.0) (2026-10-05)
+
+
+### Features
+
+* **metal:** geometry stage through compute kernels ([a1c7a85](https://github.com/phpolygon/php-vio/commit/a1c7a8580f84908002b361b83b0ecda38e284c7a))
+* **metal:** HDR10 output and frame latency ([289d348](https://github.com/phpolygon/php-vio/commit/289d348a0e5c553c1251fc09b2220dd7f1c1f425))
+* **metal:** stencil plane on depth_only, cube and array render targets ([0c71fd5](https://github.com/phpolygon/php-vio/commit/0c71fd5669e8bd5e376ab3b30801df44df50699b))
+* **metal:** tessellation isolines and point_mode ([a7764d1](https://github.com/phpolygon/php-vio/commit/a7764d144a23bf8dd6c50145f7370f5e4b517c36))
+
 ## [2.29.1](https://github.com/phpolygon/php-vio/compare/v2.29.0...v2.29.1) (2026-10-03)
 
 
