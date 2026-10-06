@@ -198,6 +198,11 @@ pick_backend:
         if ((val = zend_hash_str_find(options_ht, "shader_model", sizeof("shader_model") - 1)) != NULL) {
             ctx->config.shader_model = (int)zval_get_long(val);
         }
+        /* Metal: pin the language ladder (major * 10 + minor, e.g. 21 = MSL 2.1). */
+        if ((val = zend_hash_str_find(options_ht, "msl_version", sizeof("msl_version") - 1)) != NULL) {
+            zend_long mv = zval_get_long(val);
+            ctx->config.msl_version = mv < 0 ? 0 : (mv > 99 ? 99 : (int)mv);
+        }
         if ((val = zend_hash_str_find(options_ht, "dxc_dir", sizeof("dxc_dir") - 1)) != NULL && Z_TYPE_P(val) == IS_STRING) {
             size_t n = Z_STRLEN_P(val);
             if (n < sizeof(ctx->config.dxc_dir)) memcpy(ctx->config.dxc_dir, Z_STRVAL_P(val), n + 1);
@@ -7736,6 +7741,39 @@ ZEND_FUNCTION(vio_swapchain_info)
     add_assoc_bool(return_value, "hdr_output", info.hdr_output ? 1 : 0);
     add_assoc_long(return_value, "format", info.format);
     add_assoc_long(return_value, "shader_model", info.shader_model);
+}
+
+ZEND_FUNCTION(vio_backend_info)
+{
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_backend_description d;
+    memset(&d, 0, sizeof(d));
+    if (!ctx->initialized || !ctx->backend || !ctx->backend->describe || ctx->backend->describe(&d) != 0) {
+        RETURN_FALSE;
+    }
+    array_init(return_value);
+    add_assoc_string(return_value, "backend", (char *)ctx->backend->name);
+    add_assoc_string(return_value, "api", (char *)(d.api ? d.api : ""));
+    add_assoc_string(return_value, "device", (char *)(d.device ? d.device : ""));
+    add_assoc_string(return_value, "shading_language", (char *)(d.shading_language ? d.shading_language : ""));
+    add_assoc_long(return_value, "shading_language_version", d.shading_language_version);
+    add_assoc_long(return_value, "shading_language_max", d.shading_language_max);
+    zval families;
+    array_init(&families);
+    for (int i = 0; i < d.family_count && i < VIO_BACKEND_INFO_MAX_FAMILIES; i++) {
+        if (d.families[i]) add_next_index_string(&families, (char *)d.families[i]);
+    }
+    add_assoc_zval(return_value, "families", &families);
+    zval caps;
+    array_init(&caps);
+    for (int i = 0; i < d.cap_count && i < VIO_BACKEND_INFO_MAX_CAPS; i++) {
+        if (d.cap_names[i]) add_assoc_bool(&caps, (char *)d.cap_names[i], d.cap_values[i] ? 1 : 0);
+    }
+    add_assoc_zval(return_value, "caps", &caps);
 }
 
 /* ── Image comparison (VRT) ───────────────────────────────────────── */

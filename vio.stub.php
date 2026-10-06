@@ -19,7 +19,9 @@
  *                       display is in HDR mode (2 = force); the 2D batch PQ-encodes its output,
  *                       hdr_paper_white => nits that display white maps to (default 200),
  *                       shader_model => 6: compile D3D12 shaders with DXC to DXIL (needs dxcompiler.dll +
- *                       dxil.dll, optionally located via dxc_dir => directory; falls back to FXC 5.1))
+ *                       dxil.dll, optionally located via dxc_dir => directory; falls back to FXC 5.1),
+ *                       msl_version => 21: pin the Metal Shading Language version (major * 10 + minor,
+ *                       2.0 .. the OS maximum; default the maximum, or VIO_METAL_MSL_VERSION))
  * @return VioContext|false Context object or false on failure
  */
 function vio_create(string $backend = "auto", array $options = []): VioContext|false {}
@@ -355,6 +357,18 @@ function vio_shader_cache_stats(): array {}
  * 'shader_model' => int (D3D12: 6 with DXC / DXIL, 5 with FXC; D3D11: 5; 0 elsewhere)].
  */
 function vio_swapchain_info(VioContext $context): array {}
+
+/**
+ * API level the backend negotiated and what it can do there - the Metal
+ * language ladder (MSL 4.x -> 2.0, pinned with vio_create(['msl_version' => 21])
+ * or VIO_METAL_MSL_VERSION): ['backend' => string, 'api' => string ('Metal 4'),
+ * 'device' => string, 'shading_language' => string ('MSL'),
+ * 'shading_language_version' => int (in use, major * 10 + minor),
+ * 'shading_language_max' => int (highest the OS accepts), 'families' => string[]
+ * ('apple7', 'mac2', 'metal3', ...), 'caps' => array<string, bool> (device support
+ * AND minimum language version)]. False for backends without the report.
+ */
+function vio_backend_info(VioContext $context): array|false {}
 
 /**
  * Draw a mesh with arguments read from a storage buffer (VIO_FEATURE_INDIRECT_DRAW) —

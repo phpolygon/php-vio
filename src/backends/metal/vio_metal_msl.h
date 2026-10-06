@@ -18,6 +18,28 @@
 
 #define VIO_METAL_MAX_RES 16
 
+/* MSL target of every transpile (graphics stages, kernels, compute): the rung
+ * of the version ladder the device context picked (major * 10 + minor, see
+ * metal_select_msl_version in vio_metal.m), and the platform. Set once per
+ * context before any shader is built. */
+static int metal_msl_target_version = 21;
+static int metal_msl_target_ios = 0;
+
+static void metal_msl_set_target(int version, int ios)
+{
+    metal_msl_target_version = version;
+    metal_msl_target_ios = ios;
+}
+
+/* SPIRV-Cross encoding (major * 10000 + minor * 100) of the target, never
+ * below `floor` (major * 10 + minor) - the tessellation stages need 2.1. */
+static unsigned metal_msl_spvc_version(int floor)
+{
+    int v = metal_msl_target_version < floor ? floor : metal_msl_target_version;
+    return (unsigned)((v / 10) * 10000 + (v % 10) * 100);
+}
+
+
 /* One buffer-like resource of a shader stage after the MSL renumbering. */
 typedef struct _vio_metal_res_buffer {
     int kind;       /* 0 = UBO, 1 = SSBO, 2 = push-constant block */
@@ -109,6 +131,13 @@ typedef struct _vio_metal_tess_info {
 } vio_metal_tess_info;
 
 #ifdef HAVE_SPIRV_CROSS
+static void metal_msl_apply_target(spvc_compiler_options opts, int floor)
+{
+    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_VERSION, metal_msl_spvc_version(floor));
+    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_PLATFORM,
+                                   metal_msl_target_ios ? SPVC_MSL_PLATFORM_IOS : SPVC_MSL_PLATFORM_MACOS);
+}
+
 
 static void metal_gfx_add_binding(spvc_compiler compiler, SpvExecutionModel stage,
                                   unsigned desc_set, unsigned binding, unsigned msl_index)
@@ -289,9 +318,7 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
     }
 
     if (spvc_compiler_create_compiler_options(compiler, &opts) == SPVC_SUCCESS) {
-        spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_VERSION,
-                                       is_tess ? SPVC_MAKE_MSL_VERSION(2, 1, 0) : SPVC_MAKE_MSL_VERSION(2, 0, 0));
-        spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_PLATFORM, SPVC_MSL_PLATFORM_MACOS);
+        metal_msl_apply_target(opts, is_tess ? 21 : 20);
         if (stage == VIO_MSL_FRAGMENT) {
             spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_ENABLE_FRAG_OUTPUT_MASK, frag_output_mask);
         }

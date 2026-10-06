@@ -12,6 +12,7 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <objc/message.h>
 
 #ifdef HAVE_GLFW
 #define GLFW_INCLUDE_NONE
@@ -36,6 +37,35 @@
 
 /* stb_image_write for screenshot PNG export (implementation in stb_image_write_impl.c) */
 #include "../../../vendor/stb/stb_image_write.h"
+
+/* ── Version ladder / capabilities ───────────────────────────────── */
+
+/* What the device can do at the Metal Shading Language version the context
+ * runs at - the Metal counterpart of vio_gl.caps. Filled once per context in
+ * metal_detect_caps(); every version-gated flag is (device support AND
+ * msl_version >= its minimum), so pinning a lower rung switches it off. */
+typedef struct _vio_metal_caps {
+    int msl_version;            /* rung in use, major * 10 + minor (20 .. 41) */
+    int msl_max;                /* highest rung the OS compiles */
+    int apple_family;           /* highest MTLGPUFamilyAppleN, 0 = none */
+    int mac2, metal3, metal4;   /* MTLGPUFamilyMac2 / Metal3 / Metal4 */
+    int tessellation;           /* MSL 2.1: [[patch]] + tessellation kernels */
+    int layered_vertex;         /* [[render_target_array_index]] from the VS: Mac2 / Apple5 */
+    int quad_group;             /* quad_* permutes, MSL 2.1 (SPIRV-Cross on macOS): Mac2 / Apple4 */
+    int simd_group;             /* simd_* reductions / ballot, MSL 2.1: Mac2 / Apple7 */
+    int barycentrics;           /* [[barycentric_coord]], MSL 2.2 */
+    int vertex_amplification;   /* [[amplification_id]], MSL 2.2 */
+    int argument_buffers_tier2; /* bindless-style argument buffers */
+    int raytracing;             /* intersection queries, MSL 2.3 */
+    int function_pointers;      /* visible / intersection function tables, MSL 2.3 */
+    int raytracing_from_render; /* ray queries in render pipelines, MSL 2.4 */
+    int mesh_shaders;           /* object / mesh stages, MSL 3.0: Metal3 + (Apple7 / Mac2) */
+    int atomic64;               /* 64-bit atomic min / max, MSL 3.1: Apple9 */
+    int tensors;                /* MTLTensor + Metal Performance Primitives, MSL 4.0: Metal4 */
+    int rasterization_rate_map;
+    int bc_texture_compression;
+    int unified_memory;
+} vio_metal_caps;
 
 /* ── Metal state ─────────────────────────────────────────────────── */
 
@@ -64,6 +94,8 @@ typedef struct _vio_metal_state {
     int                        debug;            /* vio_create 'debug': per-command-buffer error reporting */
     int                        unified_memory;   /* Apple silicon: Shared textures OK; Intel: Managed */
     char                       gpu_name[256];
+    vio_metal_caps             caps;             /* version ladder + device capabilities */
+    char                       api_name[16];     /* "Metal 4" (vio_backend_info) */
     /* Swapchain colour format: BGRA8Unorm, or RGB10A2Unorm with the layer in
      * the ITU-R 2100 PQ colour space for vio_create(['hdr_output' => ...]). The
      * offscreen / MSAA swapchain textures, the 2D swapchain variant and the PSO
@@ -243,12 +275,7 @@ static void metal_apply_viewports(void)
  * setViewports:count: (layered rendering, multiple viewports). */
 static int metal_supports_layered_vertex(void)
 {
-    if (!vio_mtl.device) return 0;
-    if (@available(macOS 10.15, iOS 13.0, *)) {
-        return [vio_mtl.device supportsFamily:MTLGPUFamilyMac2] ||
-               [vio_mtl.device supportsFamily:MTLGPUFamilyApple5];
-    }
-    return 0;
+    return vio_mtl.device ? vio_mtl.caps.layered_vertex : 0;
 }
 static void metal_ring_begin_frame(void);
 static void metal_ring_end_frame(id<MTLCommandBuffer> cb);
@@ -373,6 +400,146 @@ static void metal_configure_layer_format(vio_config *cfg)
     vio_mtl.metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 }
 
+/* ── Version ladder ──────────────────────────────────────────────── */
+
+static int  metal_supports_bc(void);
+static void metal_msl_set_target(int version, int ios);   /* vio_metal_msl.h */
+
+/* Metal Shading Language rungs, newest first - the counterpart of the OpenGL
+ * context ladder (vio_window.c). The values are major * 10 + minor; the
+ * MTLLanguageVersion is built numerically ((major << 16) | minor) so an older
+ * SDK still compiles and the OS decides at runtime what it accepts. */
+static const int metal_msl_ladder[] = { 41, 40, 32, 31, 30, 24, 23, 22, 21, 20 };
+#define METAL_MSL_LADDER_N ((int)(sizeof(metal_msl_ladder) / sizeof(metal_msl_ladder[0])))
+#define METAL_MSL_FLOOR 20
+
+static MTLLanguageVersion metal_language_version(int v)
+{
+    return (MTLLanguageVersion)(((NSUInteger)(v / 10) << 16) | (NSUInteger)(v % 10));
+}
+
+/* MTLCompileOptions for every library of the context: the ladder rung. */
+static MTLCompileOptions *metal_compile_options(void)
+{
+    MTLCompileOptions *opts = [MTLCompileOptions new];
+    opts.languageVersion = metal_language_version(vio_mtl.caps.msl_version > 0 ? vio_mtl.caps.msl_version : 21);
+    return opts;
+}
+
+/* 1 when the OS compiles a trivial kernel at MSL `v`. An unknown language
+ * version fails the compile (older OS) or raises (older framework). */
+static int metal_probe_msl(id<MTLDevice> device, int v)
+{
+    @autoreleasepool {
+        MTLCompileOptions *opts = [MTLCompileOptions new];
+        id<MTLLibrary> lib = nil;
+        @try {
+            opts.languageVersion = metal_language_version(v);
+            NSError *err = nil;
+            lib = [device newLibraryWithSource:@"kernel void vio_probe(device uint *b [[buffer(0)]]) { b[0] = 1u; }\n"
+                                       options:opts error:&err];
+        } @catch (NSException *e) {
+            lib = nil;
+        }
+        return lib != nil;
+    }
+}
+
+/* Highest rung the OS accepts (cached: it depends on the OS, not the context). */
+static int metal_msl_max(id<MTLDevice> device)
+{
+    static int cached = 0;
+    if (cached) return cached;
+    cached = METAL_MSL_FLOOR;
+    for (int i = 0; i < METAL_MSL_LADDER_N; i++) {
+        if (metal_probe_msl(device, metal_msl_ladder[i])) { cached = metal_msl_ladder[i]; break; }
+    }
+    return cached;
+}
+
+/* Rung for a request (major * 10 + minor; 0 = the maximum): the highest rung
+ * <= the request, clamped to [floor, max]. */
+static int metal_select_msl_version(int requested, int max)
+{
+    if (requested <= 0 || requested >= max) return max;
+    for (int i = 0; i < METAL_MSL_LADDER_N; i++) {
+        if (metal_msl_ladder[i] <= requested && metal_msl_ladder[i] <= max) return metal_msl_ladder[i];
+    }
+    return METAL_MSL_FLOOR;
+}
+
+static int metal_has_family(long family)
+{
+    if (@available(macOS 10.15, iOS 13.0, *)) {
+        @try {
+            return [vio_mtl.device supportsFamily:(MTLGPUFamily)family] ? 1 : 0;
+        } @catch (NSException *e) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+#define METAL_DEVICE_BOOL(sel) \
+    ([vio_mtl.device respondsToSelector:@selector(sel)] && ((BOOL (*)(id, SEL))objc_msgSend)(vio_mtl.device, @selector(sel)))
+
+/* Fill vio_mtl.caps for the rung `msl` (the device is open). */
+static void metal_detect_caps(int msl, int max)
+{
+    vio_metal_caps *c = &vio_mtl.caps;
+    memset(c, 0, sizeof(*c));
+    c->msl_version = msl;
+    c->msl_max = max;
+    for (int a = 11; a >= 1; a--) {
+        if (metal_has_family(1000 + a)) { c->apple_family = a; break; }
+    }
+    c->mac2   = metal_has_family(2002);
+    c->metal3 = metal_has_family(5001);
+    c->metal4 = metal_has_family(5002);
+    snprintf(vio_mtl.api_name, sizeof(vio_mtl.api_name), "Metal %d", c->metal4 ? 4 : (c->metal3 ? 3 : 2));
+
+    int spirv_cross = 0;
+#ifdef HAVE_SPIRV_CROSS
+    spirv_cross = 1;
+#endif
+    c->tessellation   = spirv_cross && msl >= 21;
+    c->layered_vertex = c->mac2 || c->apple_family >= 5;
+    c->quad_group     = msl >= 21 && (c->mac2 || c->apple_family >= 4);
+    c->simd_group     = msl >= 21 && (c->mac2 || c->apple_family >= 7);
+    c->barycentrics   = msl >= 22 && METAL_DEVICE_BOOL(supportsShaderBarycentricCoordinates);
+    if (msl >= 22 && [vio_mtl.device respondsToSelector:@selector(supportsVertexAmplificationCount:)]) {
+        if (@available(macOS 10.15.4, iOS 13.0, *)) c->vertex_amplification = [vio_mtl.device supportsVertexAmplificationCount:2] ? 1 : 0;
+    }
+    if ([vio_mtl.device respondsToSelector:@selector(argumentBuffersSupport)]) {
+        c->argument_buffers_tier2 = vio_mtl.device.argumentBuffersSupport == MTLArgumentBuffersTier2;
+    }
+    c->raytracing             = msl >= 23 && METAL_DEVICE_BOOL(supportsRaytracing);
+    c->function_pointers      = msl >= 23 && METAL_DEVICE_BOOL(supportsFunctionPointers);
+    c->raytracing_from_render = msl >= 24 && METAL_DEVICE_BOOL(supportsRaytracingFromRender);
+    c->mesh_shaders           = msl >= 30 && c->metal3 && (c->apple_family >= 7 || c->mac2);
+    c->atomic64               = msl >= 31 && c->apple_family >= 9;
+    c->tensors                = msl >= 40 && c->metal4;
+    if ([vio_mtl.device respondsToSelector:@selector(supportsRasterizationRateMapWithLayerCount:)]) {
+        if (@available(macOS 10.15.4, iOS 13.0, *)) c->rasterization_rate_map = [vio_mtl.device supportsRasterizationRateMapWithLayerCount:1] ? 1 : 0;
+    }
+    c->bc_texture_compression = metal_supports_bc();
+    c->unified_memory         = vio_mtl.unified_memory;
+
+#if TARGET_OS_IPHONE
+    metal_msl_set_target(msl, 1);
+#else
+    metal_msl_set_target(msl, 0);
+#endif
+}
+
+/* Requested rung: vio_create(['msl_version' => n]), else VIO_METAL_MSL_VERSION. */
+static int metal_requested_msl(const vio_config *cfg)
+{
+    if (cfg && cfg->msl_version > 0) return cfg->msl_version;
+    const char *env = getenv("VIO_METAL_MSL_VERSION");
+    return env && *env ? atoi(env) : 0;
+}
+
 int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
                                    vio_config *cfg)
 {
@@ -402,6 +569,13 @@ int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
         vio_mtl.unified_memory = vio_mtl.device.hasUnifiedMemory ? 1 : 0;
         snprintf(vio_mtl.gpu_name, sizeof(vio_mtl.gpu_name), "%s", [vio_mtl.device.name UTF8String]);
         vio_mtl.samples = metal_clamp_sample_count(cfg->samples);
+
+        /* Version ladder: the highest MSL the OS compiles, or the pinned rung;
+         * every shader of the context is built for it. */
+        {
+            int max = metal_msl_max(vio_mtl.device);
+            metal_detect_caps(metal_select_msl_version(metal_requested_msl(cfg), max), max);
+        }
 
         /* Create command queue */
         vio_mtl.command_queue = [vio_mtl.device newCommandQueue];
@@ -697,7 +871,7 @@ int vio_metal_2d_init(int width, int height)
         NSError *error = nil;
         NSString *source = [NSString stringWithUTF8String:vio_2d_metal_shader_source];
         id<MTLLibrary> library = [vio_mtl.device newLibraryWithSource:source
-                                                              options:nil
+                                                              options:metal_compile_options()
                                                                 error:&error];
         if (!library) {
             php_error_docref(NULL, E_WARNING, "Metal 2D: shader compilation failed: %s",
@@ -1555,8 +1729,7 @@ typedef struct _vio_metal_shader {
 static id<MTLLibrary> metal_build_library(const char *msl, char **error_out)
 {
     NSError *err = nil;
-    MTLCompileOptions *opts = [MTLCompileOptions new];
-    opts.languageVersion = MTLLanguageVersion2_1;
+    MTLCompileOptions *opts = metal_compile_options();
     id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:[NSString stringWithUTF8String:msl] options:opts error:&err];
     if (!lib && error_out) *error_out = strdup(err ? [[err localizedDescription] UTF8String] : "unknown MSL compile error");
     return lib;
@@ -1567,8 +1740,7 @@ static id<MTLFunction> metal_build_function(const char *msl, char **error_out)
     @autoreleasepool {
         NSString *src = [NSString stringWithUTF8String:msl];
         NSError *err = nil;
-        MTLCompileOptions *opts = [MTLCompileOptions new];
-        opts.languageVersion = MTLLanguageVersion2_1;  /* 2.1: [[patch]] / tessellation kernels */
+        MTLCompileOptions *opts = metal_compile_options();   /* the ladder rung (tessellation needs 2.1) */
         id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:src options:opts error:&err];
         if (!lib) {
             if (error_out) {
@@ -4884,6 +5056,14 @@ static char *metal_cs_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
         }
     }
 
+    {
+        spvc_compiler_options cs_opts = NULL;
+        if (spvc_compiler_create_compiler_options(compiler, &cs_opts) == SPVC_SUCCESS) {
+            metal_msl_apply_target(cs_opts, METAL_MSL_FLOOR);   /* the ladder rung (was SPIRV-Cross's default 1.2) */
+            spvc_compiler_install_compiler_options(compiler, cs_opts);
+        }
+    }
+
     /* Install explicit MSL resource bindings for (set 0, binding N) ->
      * msl_buffer N / msl_texture N. This removes the dependency on SPIRV-Cross's
      * automatic index assignment entirely: whatever the shader declares at GLSL
@@ -5007,8 +5187,7 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
         msl = NULL;
 
         NSError *nerr = nil;
-        MTLCompileOptions *opts = [MTLCompileOptions new];
-        opts.languageVersion = MTLLanguageVersion2_0;
+        MTLCompileOptions *opts = metal_compile_options();
         id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:msl_src options:opts error:&nerr];
         if (!lib) {
             php_error_docref(NULL, E_WARNING, "Metal: CS MSL compile failed: %s",
@@ -5269,6 +5448,40 @@ static void metal_swapchain_info(vio_swapchain_info *out)
     out->format        = vio_mtl.swap_format == MTLPixelFormatRGB10A2Unorm ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
 }
 
+/* vio_backend_info(): the version ladder rung and the capability set. */
+static int metal_describe(vio_backend_description *out)
+{
+    if (!vio_mtl.initialized || !vio_mtl.device || !out) return -1;
+    static const char *apple_names[] = { "apple1", "apple2", "apple3", "apple4", "apple5", "apple6",
+                                         "apple7", "apple8", "apple9", "apple10", "apple11" };
+    const vio_metal_caps *c = &vio_mtl.caps;
+    out->api = vio_mtl.api_name;
+    out->device = vio_mtl.gpu_name;
+    out->shading_language = "MSL";
+    out->shading_language_version = c->msl_version;
+    out->shading_language_max = c->msl_max;
+    out->family_count = 0;
+    for (int a = 1; a <= 11; a++) {
+        if (metal_has_family(1000 + a)) out->families[out->family_count++] = apple_names[a - 1];
+    }
+    if (metal_has_family(2001)) out->families[out->family_count++] = "mac1";
+    if (c->mac2)                out->families[out->family_count++] = "mac2";
+    if (metal_has_family(3001)) out->families[out->family_count++] = "common1";
+    if (metal_has_family(3002)) out->families[out->family_count++] = "common2";
+    if (metal_has_family(3003)) out->families[out->family_count++] = "common3";
+    if (c->metal3)              out->families[out->family_count++] = "metal3";
+    if (c->metal4)              out->families[out->family_count++] = "metal4";
+#define CAP(n) do { out->cap_names[out->cap_count] = #n; out->cap_values[out->cap_count++] = c->n; } while (0)
+    out->cap_count = 0;
+    CAP(tessellation); CAP(layered_vertex); CAP(quad_group); CAP(simd_group);
+    CAP(barycentrics); CAP(vertex_amplification); CAP(argument_buffers_tier2);
+    CAP(raytracing); CAP(function_pointers); CAP(raytracing_from_render);
+    CAP(mesh_shaders); CAP(atomic64); CAP(tensors);
+    CAP(rasterization_rate_map); CAP(bc_texture_compression); CAP(unified_memory);
+#undef CAP
+    return 0;
+}
+
 static int metal_supports_feature(vio_feature f)
 {
     switch (f) {
@@ -5276,7 +5489,6 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_3D_PIPELINE:
     case VIO_FEATURE_VERTEX_STORAGE:
     case VIO_FEATURE_STORAGE_IMAGE:
-    case VIO_FEATURE_TESSELLATION:  /* vertex + control kernels, then drawPatches (metal_draw_tess) */
 #ifdef HAVE_SPIRV_CROSS
         /* Every shader stage reaches the GPU through GLSL -> SPIR-V -> MSL, so
          * compute, the 3D draw pipeline and the vertex-stage SSBO path (Path B)
@@ -5286,6 +5498,10 @@ static int metal_supports_feature(vio_feature f)
 #else
         return 0;
 #endif
+    case VIO_FEATURE_TESSELLATION:
+        /* vertex + control kernels, then drawPatches (metal_draw_tess); the
+         * [[patch]] functions need MSL 2.1 (version ladder). */
+        return vio_mtl.caps.tessellation;
     case VIO_FEATURE_INSTANCED_DRAW:
         /* vio_draw_instanced -> per-draw ring slice bound as the per-instance
          * mat4 buffer (locations 3..6). */
@@ -5447,6 +5663,7 @@ static const vio_backend metal_backend = {
     .supports_feature  = metal_supports_feature,
     .gpu_frame_time    = metal_gpu_frame_time,
     .swapchain_info    = metal_swapchain_info,
+    .describe          = metal_describe,
     .destroy_mesh      = metal_destroy_mesh,
     .destroy_shader_obj = metal_destroy_shader_obj,
     .upload_cubemap    = metal_upload_cubemap,

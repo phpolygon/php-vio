@@ -364,6 +364,10 @@ typedef struct _vio_config {
      * the directory holding the two DLLs. */
     int         shader_model;
     char        dxc_dir[512];
+    /* Metal: pin the version ladder to this Metal Shading Language version
+     * (major * 10 + minor, e.g. 21 = MSL 2.1); 0 = the highest the OS accepts
+     * (or VIO_METAL_MSL_VERSION from the environment). */
+    int         msl_version;
 } vio_config;
 
 /* vio_swapchain_info() — what the presentation path actually runs with. */
@@ -375,6 +379,24 @@ typedef struct _vio_swapchain_info {
     int format;          /* vio_pixel_format-like code of the backbuffer: 0 RGBA8, 8 RGB10A2 */
     int shader_model;    /* D3D: 6 = DXC / DXIL, 5 = FXC; 0 elsewhere (GAP-PHASE5 Block 7) */
 } vio_swapchain_info;
+
+/* vio_backend_info() — the API level a backend negotiated and what it can do
+ * there (the OpenGL context ladder / Metal language ladder). Strings are
+ * backend-owned and stay valid while the backend has its device. */
+#define VIO_BACKEND_INFO_MAX_FAMILIES 32
+#define VIO_BACKEND_INFO_MAX_CAPS     48
+typedef struct _vio_backend_description {
+    const char *api;                      /* e.g. "Metal 4" */
+    const char *device;                   /* GPU / adapter name */
+    const char *shading_language;         /* e.g. "MSL" */
+    int         shading_language_version; /* in use, major * 10 + minor */
+    int         shading_language_max;     /* highest the platform accepts */
+    int         family_count;
+    const char *families[VIO_BACKEND_INFO_MAX_FAMILIES];
+    int         cap_count;
+    const char *cap_names[VIO_BACKEND_INFO_MAX_CAPS];
+    int         cap_values[VIO_BACKEND_INFO_MAX_CAPS];
+} vio_backend_description;
 
 /* ── Descriptor structs ───────────────────────────────────────────── */
 

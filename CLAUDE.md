@@ -4,7 +4,7 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.8.0**, 134 PHP-Funktionen, 13 Zend-Klassen,
+für die PHPolygon Game Engine. Aktuell **v2.8.0**, 135 PHP-Funktionen, 13 Zend-Klassen,
 6 Backends, 98 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
@@ -94,6 +94,8 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/backends/150` | Metal-Versionsleiter: `vio_backend_info()` (MSL-Version in Benutzung und Maximum, GPU-Familien, Caps), jede Stufe bis zum OS-Maximum per `msl_version` erzwingbar, versionsgebundene Caps folgen der Stufe, Clamping (unter 2.0 → 2.0, über Maximum → Maximum, zwischen Stufen → darunter), `VIO_METAL_MSL_VERSION` greift ohne Option, Option gewinnt; `null` liefert `false`. |
+| `tests/render3d/151` | Dieselbe Szene auf jeder MSL-Stufe 2.0 … OS-Maximum: 3D-Draw mit Uniform + Textur in ein RT (Readback), Compute, emulierter GS, Tessellation (ab 2.1, darunter abgelehnt), 2D-Batch. |
 | `tests/render3d/148` | Tessellation `point_mode` (Dreieck/Quad) erzeugt jeden Domain-Punkt genau einmal (Punktzahl nach GL-Regel, additives Blending deckt Duplikate auf), Isolines mit `fractional_odd_spacing`; auf Metal emuliert (siehe „Metal-3D-Pipeline"). |
 | `tests/render3d/147` | Stencil in Array-Layer, Cube-Face und depth_only-Target (Schema von 113); vorher hatte Metal dort keine Stencil-Plane. |
 | `tests/render3d/146` | `vio_set_uniform("name[i]", …)` setzt ein Element eines Arrays von Matrizen/Vektoren (`uniform mat4 u_m[3]`, `uniform vec4 u_col[2]`) auf jedem Backend. Vorher fanden D3D11/D3D12/Vulkan/Metal das Element nicht (Befund aus Code Rescue). |
@@ -478,7 +480,7 @@ Alle folgen dem gleichen Muster: `zend_object std` als letztes Feld, `Z_VIO_*_P(
 php_vio.c                   # Alle PHP-Funktionen (~9000 Zeilen, monolithisch)
 php_vio.h                   # Module-Globals (default_backend, debug, vsync)
 php_vio_arginfo.h           # Arginfo + Funktionstabelle (generiert aus vio.stub.php)
-vio.stub.php                # PHP-Stubs für IDE-Support (134 Funktionen)
+vio.stub.php                # PHP-Stubs für IDE-Support (135 Funktionen)
 config.m4 / config.w32      # Autotools- bzw. Windows-Build-Konfiguration
 configure.ac                # PHP-freier Autotools-Einstieg (CI-Permutationen)
 CMakeLists.txt              # IDE-Support (CLion/PhpStorm), kein Release-Build
@@ -560,7 +562,7 @@ Vendored (kein Homebrew): GLAD, stb_image/truetype/write/rect_pack, VMA,
 miniaudio, **SheenBidi** (BiDi, Apache-2.0, `vendor/sheenbidi/`, UNITY-Build via
 `-DSB_CONFIG_UNITY`).
 
-## PHP API (134 Funktionen)
+## PHP API (135 Funktionen)
 
 Vollständige Signaturen in `vio.stub.php`. Die Beispiele hier zeigen die Gruppen.
 
@@ -583,6 +585,7 @@ vio_close($ctx); vio_destroy($ctx);
 | `debug` | 0 | Validation Layers / Debug Output (D3D Debug Layer, Vulkan Validation, Metal API-Validation + Command-Buffer-Fault-Log) |
 | `headless` | 0 | Offscreen, kein sichtbares Fenster |
 | `frame_count` | 2 (**nur D3D12**) | In-Flight-Frames, siehe unten |
+| `msl_version` | 0 = Maximum (bzw. `VIO_METAL_MSL_VERSION`) | **nur Metal**: MSL-Stufe festnageln (`21` = MSL 2.1), siehe „Metal-Feature-Ladder" |
 
 ##### `frame_count` — Pipeline-Tiefe (D3D12)
 
@@ -945,6 +948,42 @@ Tessellation / DSA / Buffer-Storage / Texture-Storage > 4.2 sind dort
 nie verfügbar; `gl_has_ext()` greift, falls Apple jemals den ARB-Pfad
 nachgeliefert hat (aktuell nicht).
 
+## Metal-Feature-Ladder
+
+Gegenstück zur OpenGL-Leiter: `vio_metal_setup_context_native` probiert die Metal-Shading-Language-
+Stufen **4.1 → 4.0 → 3.2 → 3.1 → 3.0 → 2.4 → 2.3 → 2.2 → 2.1 → 2.0** (ein Probe-Kernel je Stufe,
+`MTLLanguageVersion` numerisch `(major << 16) | minor`, damit ältere SDKs bauen; das Maximum wird je
+Prozess gecacht) und nimmt die erste, die das OS kompiliert. `vio_create(['msl_version' => 21])` bzw.
+`VIO_METAL_MSL_VERSION=21` nageln eine niedrigere Stufe fest (nächste Stufe darunter, Boden 2.0) —
+so läuft die ganze Suite auf einem neuen Mac auch gegen alte Stufen. **Alle** Shader des Kontexts
+nutzen die Stufe: SPIRV-Cross-MSL der Grafik-Stages, Kernel der GS-Emulation, Tessellation (mindestens
+2.1), Compute (vorher SPIRV-Cross-Default 1.2) und die handgeschriebenen 2D-Shader
+(`metal_compile_options()`, `metal_msl_apply_target()`); auf iOS mit `SPVC_MSL_PLATFORM_IOS`.
+
+`vio_mtl.caps` (`metal_detect_caps`) = Device-Unterstützung **und** Mindest-MSL. `vio_backend_info($ctx)`
+(Vtable-Slot `describe`) legt Stufe, Maximum, Familien (`apple1`…`apple11`, `mac1/2`, `common1–3`,
+`metal3/4`) und Caps offen:
+
+| Cap | Mindest-MSL | Hardware / Abfrage | Nutzt heute |
+|---|---|---|---|
+| `tessellation` | 2.1 | jede (Kernel + `drawPatches`) | `VIO_FEATURE_TESSELLATION` |
+| `layered_vertex` | — | Mac2 / Apple5 | `LAYERED_RENDER`, `VERTEX_LAYER`, `MULTI_VIEWPORT` |
+| `quad_group` | 2.1 | Mac2 / Apple4 | — (Plan) |
+| `simd_group` | 2.1 | Mac2 / Apple7 | — (Plan: Subgroups) |
+| `barycentrics` | 2.2 | `supportsShaderBarycentricCoordinates` | — |
+| `vertex_amplification` | 2.2 | `supportsVertexAmplificationCount:2` | — |
+| `argument_buffers_tier2` | — | `argumentBuffersSupport` | — |
+| `raytracing` / `function_pointers` | 2.3 | `supportsRaytracing` / `supportsFunctionPointers` | — |
+| `raytracing_from_render` | 2.4 | `supportsRaytracingFromRender` | — |
+| `mesh_shaders` | 3.0 | Metal3 + (Apple7 / Mac2) | — |
+| `atomic64` | 3.1 | Apple9 | — |
+| `tensors` | 4.0 | Metal4 | — |
+| `rasterization_rate_map`, `bc_texture_compression`, `unified_memory` | — | Device-Abfragen | BC: `TEXTURE_COMPRESSION_BC` |
+
+Auf dem M5 (macOS 27, Metal 4) ist das Maximum 4.1, alle Caps 1. Die lokale Suite ist auf 4.1, 3.0, 2.1
+und 2.0 für Metal grün (Tests 150/151 fahren jede Stufe). Neue Metal-Features hängen ihr Flag an eine Cap,
+nicht an `@available` im Feature-Code.
+
 ## Konventionen
 
 - **Sprache**: Code und Kommentare auf Englisch. Kommunikation auf Deutsch.
@@ -952,7 +991,7 @@ nachgeliefert hat (aktuell nicht).
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 149 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 152, 149 ist für den SM6-Branch reserviert (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.

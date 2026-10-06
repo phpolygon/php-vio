@@ -388,6 +388,11 @@ typedef struct _vio_backend {
      * e.g. WARP or unified memory without a working-set figure). Leaves both
      * outputs untouched while the backend has no device. NULL => unknown. */
     void  (*gpu_info)(const char **name, uint64_t *vram_bytes);
+
+    /* vio_backend_info(): negotiated API / shading-language level, device
+     * families and capabilities. Returns 0 when filled, -1 without a device.
+     * NULL => the function reports false. */
+    int   (*describe)(vio_backend_description *out);
 } vio_backend;
 
 /*
