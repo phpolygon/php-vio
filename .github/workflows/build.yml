@@ -109,9 +109,11 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE=1 VIO_REQUIRE_SUBGROUP=vulkan \
             xvfb-run -a php -n run-tests.php -q --show-diff $TESTS
           # Pass 2: OpenGL on zink; print what the driver reports first.
-          export MESA_LOADER_DRIVER_OVERRIDE=zink
+          # Xvfb has no DRI3; LIBGL_KOPPER_DRI2 lets zink present without it.
+          export MESA_LOADER_DRIVER_OVERRIDE=zink LIBGL_KOPPER_DRI2=1
           xvfb-run -a php -n -d extension_dir=$PWD/modules -d extension=vio.so -r '
             $c = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);
+            if (!$c) { echo "zink: no OpenGL context\n"; exit(1); }
             $i = vio_gl_info($c);
             printf("GL %s (%s) compute=%d KHR_shader_subgroup=%d stages=0x%x features=0x%x size=%d\n",
               $i["version"], $i["renderer"], $i["features"]["compute_shader"],
@@ -224,9 +226,11 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE=1 VIO_REQUIRE_SUBGROUP=vulkan \
             xvfb-run -a php -n run-tests.php -q --show-diff $TESTS
           # Pass 2: OpenGL on zink; print what the driver reports first.
-          export MESA_LOADER_DRIVER_OVERRIDE=zink
+          # Xvfb has no DRI3; LIBGL_KOPPER_DRI2 lets zink present without it.
+          export MESA_LOADER_DRIVER_OVERRIDE=zink LIBGL_KOPPER_DRI2=1
           xvfb-run -a php -n -d extension_dir=$PWD/modules -d extension=vio.so -r '
             $c = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);
+            if (!$c) { echo "zink: no OpenGL context\n"; exit(1); }
             $i = vio_gl_info($c);
             printf("GL %s (%s) compute=%d KHR_shader_subgroup=%d stages=0x%x features=0x%x size=%d\n",
               $i["version"], $i["renderer"], $i["features"]["compute_shader"],
