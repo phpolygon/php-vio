@@ -20,7 +20,7 @@ vio_destroy($c);
 const LADDER = [20, 21, 22, 23, 24, 30, 31, 32, 40, 41];
 /* Minimum MSL version of each version-gated capability (0 = API / device only). */
 const CAP_MIN = [
-    'tessellation' => 21, 'layered_vertex' => 0, 'quad_group' => 21, 'simd_group' => 21,
+    'tessellation' => 21, 'layered_vertex' => 0, 'quad_group' => 21, 'simd_group' => 22,
     'barycentrics' => 22, 'vertex_amplification' => 22, 'argument_buffers_tier2' => 0,
     'raytracing' => 23, 'function_pointers' => 23, 'raytracing_from_render' => 24,
     'mesh_shaders' => 30, 'atomic64' => 31, 'tensors' => 40,
