@@ -50,13 +50,18 @@ static uint32_t *vio_compile_stage_to_spirv(const char *source, glslang_stage_t 
         return NULL;
     }
 
+    /* GL_KHR_shader_subgroup_* needs a Vulkan 1.1 / SPIR-V 1.3 target. Only
+     * shaders that use it get the newer target, so every other module stays
+     * SPIR-V 1.0 for the SPIR-V rewriters (GS / tessellation / Metal kernels). */
+    int subgroup = source && strstr(source, "GL_KHR_shader_subgroup") != NULL;
+
     glslang_input_t input = {0};
     input.language                          = GLSLANG_SOURCE_GLSL;
     input.stage                             = stage;
     input.client                            = GLSLANG_CLIENT_VULKAN;
-    input.client_version                    = GLSLANG_TARGET_VULKAN_1_0;
+    input.client_version                    = subgroup ? GLSLANG_TARGET_VULKAN_1_1 : GLSLANG_TARGET_VULKAN_1_0;
     input.target_language                   = GLSLANG_TARGET_SPV;
-    input.target_language_version           = GLSLANG_TARGET_SPV_1_0;
+    input.target_language_version           = subgroup ? GLSLANG_TARGET_SPV_1_3 : GLSLANG_TARGET_SPV_1_0;
     input.code                              = source;
     input.default_version                   = 330;
     input.default_profile                   = GLSLANG_CORE_PROFILE;

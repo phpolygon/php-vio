@@ -14,6 +14,7 @@
 #include <dxcapi.h>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,7 @@ int  vio_dxc_available(void);
 void vio_dxc_set_dir(const char *dir);
 int  vio_dxc_compile(const char *hlsl, const char *entry, const char *profile, int debug,
                      void **out_bytes, size_t *out_len, char **out_error);
+int  vio_dxc_highest_minor(int max_minor);
 }
 
 namespace {
@@ -35,6 +37,8 @@ std::string g_dir;
 HMODULE load_from(const std::string &dir, const char *name)
 {
     if (dir.empty()) return LoadLibraryA(name);
+    /* A module of the same base name that is already loaded wins over the
+     * path; this only matters if dxc_dir changes within the process. */
     std::string path = dir;
     if (path.back() != '\\' && path.back() != '/') path += '\\';
     path += name;
@@ -72,8 +76,14 @@ std::wstring widen(const char *s)
 
 extern "C" void vio_dxc_set_dir(const char *dir)
 {
-    g_dir = dir ? dir : "";
-    g_state = 0;   /* re-probe with the new directory */
+    std::string next = dir ? dir : "";
+    if (next == g_dir) return;
+    g_dir = next;
+    /* Re-probe with the new directory; drop what the old one loaded. */
+    if (g_dxcompiler) { FreeLibrary(g_dxcompiler); g_dxcompiler = nullptr; }
+    if (g_dxil) { FreeLibrary(g_dxil); g_dxil = nullptr; }
+    g_create = nullptr;
+    g_state = 0;
 }
 
 extern "C" int vio_dxc_available(void)
@@ -153,4 +163,23 @@ extern "C" int vio_dxc_compile(const char *hlsl, const char *entry, const char *
     compiler->Release();
     utils->Release();
     return rc;
+}
+
+/* Highest Shader Model 6 minor version (0..max_minor) this DXC + dxil.dll pair
+ * compiles and validates: a newer profile than the validator knows fails to
+ * sign, so the trivial compute shader goes through the full compile. -1 when
+ * not even cs_6_0 works. */
+extern "C" int vio_dxc_highest_minor(int max_minor)
+{
+    static const char *probe = "[numthreads(1, 1, 1)] void main() {}\n";
+    for (int minor = max_minor; minor >= 0; minor--) {
+        char profile[16];
+        std::snprintf(profile, sizeof(profile), "cs_6_%d", minor);
+        void *bytes = nullptr; size_t len = 0; char *err = nullptr;
+        int rc = vio_dxc_compile(probe, "main", profile, 0, &bytes, &len, &err);
+        std::free(bytes);
+        std::free(err);
+        if (rc == 0) return minor;
+    }
+    return -1;
 }

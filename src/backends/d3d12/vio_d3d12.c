@@ -37,6 +37,7 @@
 /* DXC front end (vio_dxc.cpp, GAP-PHASE5 Block 7). */
 int  vio_dxc_available(void);
 void vio_dxc_set_dir(const char *dir);
+int  vio_dxc_highest_minor(int max_minor);
 int  vio_dxc_compile(const char *hlsl, const char *entry, const char *profile, int debug,
                      void **out_bytes, size_t *out_len, char **out_error);
 #include "../../vio_shader_reflect.h"   /* vio_spirv_reflect — data-driven compute register mapping */
@@ -44,6 +45,8 @@ int  vio_dxc_compile(const char *hlsl, const char *entry, const char *profile, i
 #include "../../vio_tess_hlsl.h"
 
 static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, const char *profile, UINT flags, ID3DBlob **out);
+static int d3d12_hlsl_target(void);
+static const char *d3d12_profile(const char *profile, char *buf, size_t n);
 #include "../../vio_texture.h"          /* vio_texture_object — storage-image binds */
 #include <string.h>
 #include <stdlib.h>
@@ -960,6 +963,8 @@ static int d3d12_init(vio_config *cfg)
     /* Shader model (GAP-PHASE5 Block 7): SM 6 only when asked for, the device
      * reports it and DXC (+ dxil.dll for signing) can be loaded. */
     vio_d3d12.shader_model = 5;
+    vio_d3d12.shader_model_version = 51;
+    vio_d3d12.wave_ops = 0;
     /* Variable rate shading capability (GAP-PHASE5 Block 12). */
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {0};
@@ -972,14 +977,30 @@ static int d3d12_init(vio_config *cfg)
 
     if (cfg->shader_model >= 6) {
         if (cfg->dxc_dir[0]) vio_dxc_set_dir(cfg->dxc_dir);
-        D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_0 };
-        int device_ok = SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))
-                        && sm.HighestShaderModel >= D3D_SHADER_MODEL_6_0;
-        if (device_ok && vio_dxc_available()) {
+        /* The runtime rejects HighestShaderModel values it does not know
+         * (E_INVALIDARG), so walk down from 6.9 until it answers; it then
+         * lowers the value to what the device supports. D3D_SHADER_MODEL
+         * values are 0xMm, written as numbers so older SDK headers work. */
+        int device_minor = -1;
+        for (int v = 0x69; v >= 0x60 && device_minor < 0; v--) {
+            D3D12_FEATURE_DATA_SHADER_MODEL sm = { (D3D_SHADER_MODEL)v };
+            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
+                if ((int)sm.HighestShaderModel >= 0x60) device_minor = (int)sm.HighestShaderModel & 0xF;
+                break;
+            }
+        }
+        int dxc_minor = (device_minor >= 0 && vio_dxc_available()) ? vio_dxc_highest_minor(device_minor) : -1;
+        if (dxc_minor >= 0) {
             vio_d3d12.shader_model = 6;
+            vio_d3d12.shader_model_version = 60 + dxc_minor;
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {0};
+            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))))
+                vio_d3d12.wave_ops = o1.WaveOps ? 1 : 0;
         } else {
             php_error_docref(NULL, E_NOTICE, "D3D12: shader_model 6 requested but %s; using FXC (SM 5.1)",
-                             device_ok ? "dxcompiler.dll / dxil.dll not loadable" : "the device lacks SM 6.0");
+                             device_minor < 0 ? "the device lacks SM 6.0"
+                             : vio_dxc_available() ? "DXC / dxil.dll cannot compile cs_6_0"
+                             : "dxcompiler.dll / dxil.dll not loadable");
         }
     }
 
@@ -1689,7 +1710,7 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
      * vio_shader built it for layout(vertices = N), other sizes get a variant. */
     if (shader->tess_tcs && desc->patch_vertices > 0 && (uint32_t)desc->patch_vertices != shader->hs_input_points) {
         vio_tess_hlsl_desc td = { shader->tess_tcs, shader->tess_tcs_size, shader->tess_tes, shader->tess_tes_size,
-                                  (uint32_t)desc->patch_vertices, 51, 0 };
+                                  (uint32_t)desc->patch_vertices, d3d12_hlsl_target(), 0 };
         char *err = NULL;
         char *hlsl = vio_tess_to_hlsl(VIO_STAGE_TESS_CONTROL, &td, &err);
         if (!hlsl) php_error_docref(NULL, E_WARNING, "D3D12: hull shader for %d control points: %s", desc->patch_vertices, err ? err : "unknown");
@@ -3985,6 +4006,21 @@ static int d3d12_update_texture(void *tex_obj, const void *pixels, int x, int y,
 
 /* ── Shaders ──────────────────────────────────────────────────────── */
 
+/* HLSL target of the SPIRV-Cross transpile: the compile profile, so wave
+ * intrinsics (subgroups, SM 6.0+) are emitted when DXC is in use. */
+static int d3d12_hlsl_target(void)
+{
+    return vio_d3d12.shader_model == 6 ? vio_d3d12.shader_model_version : 51;
+}
+
+/* "vs_5_1" -> "vs_6_<minor>" under Shader Model 6, unchanged otherwise. */
+static const char *d3d12_profile(const char *profile, char *buf, size_t n)
+{
+    if (vio_d3d12.shader_model != 6 || strlen(profile) < 6) return profile;
+    snprintf(buf, n, "%.2s_%d_%d", profile, vio_d3d12.shader_model_version / 10, vio_d3d12.shader_model_version % 10);
+    return buf;
+}
+
 /* D3DCompile with the on-disk DXBC cache (GAP-PHASE5 Block 4): the key hashes
  * the HLSL, the profile and the compile flags, so a debug build never reuses a
  * release blob and vice versa. Cached blobs are wrapped in an ID3DBlob so the
@@ -3992,13 +4028,13 @@ static int d3d12_update_texture(void *tex_obj, const void *pixels, int x, int y,
 static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, const char *profile,
                                     UINT flags, ID3DBlob **out)
 {
-    /* Shader Model 6 (GAP-PHASE5 Block 7): the profile string becomes *_6_0 and
-     * DXC produces DXIL; cached under "dxil" so FXC and DXC blobs never mix. */
+    /* Shader Model 6 (GAP-PHASE5 Block 7): the profile string becomes *_6_<minor>
+     * and DXC produces DXIL; cached under "dxil" so FXC and DXC blobs never mix
+     * (the profile, part of the key, keeps different minors apart). */
     char profile6[16];
     const char *ext = "dxbc";
-    if (vio_d3d12.shader_model == 6 && strlen(profile) >= 6) {
-        snprintf(profile6, sizeof(profile6), "%.2s_6_0", profile);
-        profile = profile6;
+    if (vio_d3d12.shader_model == 6) {
+        profile = d3d12_profile(profile, profile6, sizeof(profile6));
         ext = "dxil";
     }
     uint64_t key = 0;
@@ -4056,7 +4092,7 @@ static ID3DBlob *d3d12_compile_tess_blob(vio_d3d12_shader *shader, int stage, in
                                          const char *profile, const char *label, UINT compile_flags)
 {
     vio_tess_hlsl_desc td = { shader->tess_tcs, shader->tess_tcs_size, shader->tess_tes, shader->tess_tes_size,
-                              0, 51, fixup_depth };
+                              0, d3d12_hlsl_target(), fixup_depth };
     char *err = NULL;
     char *hlsl = vio_tess_to_hlsl(stage, &td, &err);
     if (!hlsl) {
@@ -4100,7 +4136,7 @@ static ID3DBlob *d3d12_compile_stage_blob(const void *data, size_t size, int sta
             }
             free_spirv = 1;
         }
-        allocated = vio_spirv_to_hlsl_ex(spirv, spirv_size, 51, fixup_depth, &err);
+        allocated = vio_spirv_to_hlsl_ex(spirv, spirv_size, d3d12_hlsl_target(), fixup_depth, &err);
         if (free_spirv) free(spirv);
         if (!allocated) {
             php_error_docref(NULL, E_WARNING, "D3D12: %s SPIR-V->HLSL failed: %s", label, err ? err : "unknown");
@@ -4180,7 +4216,7 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
         /* SPIR-V -> HLSL SM 5.1. The GL->D3D depth fixup goes on the LAST
          * stage that writes gl_Position (GS, else DS, else VS). */
         int vs_is_last = !desc->geometry_data && !desc->tess_eval_data;
-        allocated_vs = vio_spirv_to_hlsl_ex(vs_spirv, vs_spirv_size, 51, vs_is_last, &err);
+        allocated_vs = vio_spirv_to_hlsl_ex(vs_spirv, vs_spirv_size, d3d12_hlsl_target(), vs_is_last, &err);
         if (free_vs_spirv) free(vs_spirv);
         if (!allocated_vs) {
             php_error_docref(NULL, E_WARNING, "D3D12: VS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -4190,7 +4226,7 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
             return NULL;
         }
 
-        allocated_ps = vio_spirv_to_hlsl(ps_spirv, ps_spirv_size, 51, &err);
+        allocated_ps = vio_spirv_to_hlsl(ps_spirv, ps_spirv_size, d3d12_hlsl_target(), &err);
         if (free_ps_spirv) free(ps_spirv);
         if (!allocated_ps) {
             php_error_docref(NULL, E_WARNING, "D3D12: PS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -5156,7 +5192,7 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
     int srv_base_reg = storage_min_binding >= 0 ? storage_min_binding : 0;
     int uav_base_reg = storage_min_binding >= 0 ? storage_min_binding : 0;
 
-    char *hlsl = vio_spirv_to_hlsl(spirv, spirv_size, 51, &err);
+    char *hlsl = vio_spirv_to_hlsl(spirv, spirv_size, d3d12_hlsl_target(), &err);
     if (free_spirv) free(spirv);
     if (!hlsl) {
         php_error_docref(NULL, E_WARNING, "D3D12: CS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -5694,6 +5730,7 @@ static void d3d12_swapchain_info(vio_swapchain_info *out)
     out->hdr_output    = vio_d3d12.hdr_output;
     out->format        = vio_d3d12.swapchain_format == DXGI_FORMAT_R10G10B10A2_UNORM ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
     out->shader_model  = vio_d3d12.shader_model == 6 ? 6 : 5;
+    out->shader_model_version = vio_d3d12.shader_model_version;
 }
 
 static double d3d12_gpu_frame_time(void)
@@ -5702,30 +5739,49 @@ static double d3d12_gpu_frame_time(void)
 }
 
 /* Second half of the optional-stage probe (see the D3D11 twin): the canonical
- * stage's SPIRV-Cross HLSL must also pass FXC for the SM 5.1 profile. */
+ * stage's SPIRV-Cross HLSL must also pass the compiler the shaders will use -
+ * FXC for SM 5.1, DXC for the Shader Model 6 profile. The result is cached
+ * per compile target (51, 60..69). */
 static int d3d12_stage_supported(int stage, const char *profile)
 {
-    static int cache[VIO_PROBE_COUNT] = { -1, -1, -1, -1, -1, -1 };
+    static int cache[20][VIO_PROBE_COUNT];
+    static int cache_init = 0;
+    if (!cache_init) { memset(cache, 0xFF, sizeof(cache)); cache_init = 1; }   /* -1 = untried */
     if (stage < 0 || stage >= VIO_PROBE_COUNT) return 0;
-    if (cache[stage] >= 0) return cache[stage];
+    int target = d3d12_hlsl_target();
+    int row = target >= 60 && target <= 69 ? target - 50 : 0;   /* 0 = FXC 5.1, 10..19 = SM 6.0..6.9 */
+    if (cache[row][stage] >= 0) return cache[row][stage];
     int ok = 0;
     if (vio_hlsl_stage_supported(stage)) {
-        char *hlsl = vio_hlsl_probe_hlsl(stage, 51);
+        char *hlsl = vio_hlsl_probe_hlsl(stage, target);
         if (hlsl) {
-            ID3DBlob *blob = NULL, *errs = NULL;
-            HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "probe", NULL, NULL, "main", profile,
-                                    D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &errs);
-            ok = SUCCEEDED(hr) ? 1 : 0;
-            if (!ok && getenv("VIO_DEBUG_STAGE_PROBE")) {
-                fprintf(stderr, "[vio] D3D12 stage probe %d (%s): FXC rejected the SPIRV-Cross HLSL: %s\n",
-                        stage, profile, errs ? (const char *)ID3D10Blob_GetBufferPointer(errs) : "unknown");
+            if (vio_d3d12.shader_model == 6) {
+                char profile6[16];
+                const char *p6 = d3d12_profile(profile, profile6, sizeof(profile6));
+                void *bytes = NULL; size_t len = 0; char *err = NULL;
+                ok = vio_dxc_compile(hlsl, "main", p6, 0, &bytes, &len, &err) == 0 && bytes ? 1 : 0;
+                if (!ok && getenv("VIO_DEBUG_STAGE_PROBE")) {
+                    fprintf(stderr, "[vio] D3D12 stage probe %d (%s): DXC rejected the SPIRV-Cross HLSL: %s\n",
+                            stage, p6, err ? err : "unknown");
+                }
+                free(bytes);
+                free(err);
+            } else {
+                ID3DBlob *blob = NULL, *errs = NULL;
+                HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "probe", NULL, NULL, "main", profile,
+                                        D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &errs);
+                ok = SUCCEEDED(hr) ? 1 : 0;
+                if (!ok && getenv("VIO_DEBUG_STAGE_PROBE")) {
+                    fprintf(stderr, "[vio] D3D12 stage probe %d (%s): FXC rejected the SPIRV-Cross HLSL: %s\n",
+                            stage, profile, errs ? (const char *)ID3D10Blob_GetBufferPointer(errs) : "unknown");
+                }
+                if (blob) ID3D10Blob_Release(blob);
+                if (errs) ID3D10Blob_Release(errs);
             }
-            if (blob) ID3D10Blob_Release(blob);
-            if (errs) ID3D10Blob_Release(errs);
             free(hlsl);
         }
     }
-    cache[stage] = ok;
+    cache[row][stage] = ok;
     return ok;
 }
 
@@ -5745,6 +5801,9 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_GEOMETRY:     return d3d12_stage_supported(VIO_STAGE_GEOMETRY, "gs_5_1");
         case VIO_FEATURE_HLSL_STAGE_OVERRIDE: return 1;   /* 'hlsl' => [stage => source] for GS / HS / DS */
         case VIO_FEATURE_GEOMETRY_INSTANCING: return d3d12_stage_supported(VIO_PROBE_GS_INSTANCED, "gs_5_1");   /* [instance(N)] */
+        /* GL_KHR_shader_subgroup_* -> SPIRV-Cross wave intrinsics: needs the
+         * DXC path (SM 6.0+) and a device with WaveOps. */
+        case VIO_FEATURE_SUBGROUP:     return vio_d3d12.shader_model == 6 && vio_d3d12.wave_ops;
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
         case VIO_FEATURE_MULTIVIEW:    return 0;
         case VIO_FEATURE_3D_PIPELINE:  return 1;

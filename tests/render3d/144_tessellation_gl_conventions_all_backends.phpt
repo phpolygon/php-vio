@@ -114,7 +114,11 @@ function run_backend(string $name, array $opts = []): string {
     $ctx = @vio_create($name, ["width" => $W, "height" => $W, "headless" => true, "vsync" => false] + $opts);
     if (!$ctx) return "skip (unavailable)";
     if (!vio_supports_feature($ctx, VIO_FEATURE_TESSELLATION)) { vio_destroy($ctx); return "skip (no tessellation)"; }
-    if (isset($opts['shader_model']) && (vio_swapchain_info($ctx)['shader_model'] ?? 5) < 6) { vio_destroy($ctx); return "skip (no DXC)"; }
+    if (isset($opts['shader_model']) && (vio_swapchain_info($ctx)['shader_model'] ?? 5) < 6) {
+        vio_destroy($ctx);
+        /* VIO_REQUIRE_SM6=1 (Windows CI): the DXC run must happen, not skip. */
+        return getenv('VIO_REQUIRE_SM6') ? "FAIL\n  VIO_REQUIRE_SM6 set but DXC unavailable" : "skip (no DXC)";
+    }
     $d3d = in_array(vio_backend_name($ctx), ['d3d11', 'd3d12'], true);
     $fail = [];
     $quad = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0, 1,1,0, -1,1,0], 'layout' => [VIO_FLOAT3]]);

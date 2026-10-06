@@ -295,8 +295,13 @@ typedef struct _vio_d3d12_state {
     DXGI_FORMAT                swapchain_format;
     int                        hdr_output;
     float                      hdr_paper_white;
-    /* Shader model in use (GAP-PHASE5 Block 7): 6 => DXC / DXIL, else FXC 5.1. */
+    /* Shader model in use (GAP-PHASE5 Block 7): 6 => DXC / DXIL, else FXC 5.1.
+     * shader_model_version is the profile as major * 10 + minor (60..69 with
+     * DXC: the highest the device and DXC / dxil.dll accept; 51 with FXC) and
+     * the SPIRV-Cross HLSL target. wave_ops: OPTIONS1.WaveOps (subgroups). */
     int                        shader_model;
+    int                        shader_model_version;
+    int                        wave_ops;
     /* Variable rate shading (GAP-PHASE5 Block 12): D3D12_VARIABLE_SHADING_RATE_TIER
      * (0 = none), the additional-rates cap (2x4 / 4x2 / 4x4), the sticky rate
      * (vio_shading_rate) and the ID3D12GraphicsCommandList5 view of the frame list. */

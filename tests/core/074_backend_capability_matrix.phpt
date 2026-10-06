@@ -83,6 +83,7 @@ probe("null", [
     VIO_FEATURE_MULTI_VIEWPORT     => 0,
     VIO_FEATURE_GEOMETRY_INSTANCING => 0,
     VIO_FEATURE_HLSL_STAGE_OVERRIDE => 0,
+    VIO_FEATURE_SUBGROUP           => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -144,6 +145,7 @@ $d3d_common = [
 ];
 probe_fold("d3d11", $d3d_common + [
     VIO_FEATURE_TEXTURE_SWIZZLE    => 0,   /* D3D11 SRVs have no component mapping */
+    VIO_FEATURE_SUBGROUP           => 0,   /* wave intrinsics need SM 6 (D3D12 only); D3D11 is FXC 5.0 */
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,   /* GAP-PLAN 2.2 */
     VIO_FEATURE_MIPMAP_GEN         => 1,   /* GenerateMips (GAP-PLAN 2.3) */
 ]);
@@ -151,6 +153,7 @@ probe_fold("d3d12", $d3d_common + [
     VIO_FEATURE_TEXTURE_SWIZZLE    => 1,   /* Shader4ComponentMapping */
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,   /* GAP-PLAN 2.2 */
     VIO_FEATURE_MIPMAP_GEN         => 1,   /* compute downsample, CPU box filter fallback (GAP-PHASE5 11) */
+    VIO_FEATURE_SUBGROUP           => 0,   /* default context is FXC 5.1; SM 6 + WaveOps: test 149 */
 ]);
 
 /* Vulkan: 3D pipeline since GAP-PHASE5 Block 10 (SPIR-V round trip, frame upload
