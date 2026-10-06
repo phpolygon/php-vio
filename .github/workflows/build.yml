@@ -91,19 +91,25 @@ jobs:
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
-      - name: Run required-feature tests (lavapipe Vulkan + llvmpipe GL)
+      - name: Run required-feature tests (lavapipe Vulkan, zink GL)
         run: |
           # Feature tests skip where a flag is 0, so a green suite cannot tell a
-          # real run from a skip. Here the backends are mandatory: subgroups
-          # must run on Vulkan (lavapipe) and OpenGL (llvmpipe).
-          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          # real run from a skip. Here the backends are mandatory. llvmpipe has
+          # no GL_KHR_shader_subgroup (measured: Mesa / LLVM 20), so OpenGL runs
+          # on zink (GL over lavapipe) in a second pass.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
           VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)
           if [ -z "$VK_DRIVER_FILES" ]; then echo "lavapipe ICD not found"; exit 1; fi
           export VK_DRIVER_FILES
           echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
-          # What llvmpipe reports, so a missing GL flag can be told apart (no
-          # extension vs. missing stage / operation bits).
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          TESTS="tests/render3d/149_subgroup_ops_all_backends.phpt"
+          # Pass 1: Vulkan on lavapipe (GL stays llvmpipe, not required).
+          LIBGL_ALWAYS_SOFTWARE=1 VIO_REQUIRE_SUBGROUP=vulkan \
+            xvfb-run -a php -n run-tests.php -q --show-diff $TESTS
+          # Pass 2: OpenGL on zink; print what the driver reports first.
+          export MESA_LOADER_DRIVER_OVERRIDE=zink
           xvfb-run -a php -n -d extension_dir=$PWD/modules -d extension=vio.so -r '
             $c = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);
             $i = vio_gl_info($c);
@@ -111,10 +117,7 @@ jobs:
               $i["version"], $i["renderer"], $i["features"]["compute_shader"],
               in_array("GL_KHR_shader_subgroup", $i["extensions"], true),
               $i["subgroup_stages"], $i["subgroup_features"], $i["subgroup_size"]);'
-          export VIO_REQUIRE_SUBGROUP=vulkan,opengl
-          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
-          xvfb-run -a php -n run-tests.php -q --show-diff \
-            tests/render3d/149_subgroup_ops_all_backends.phpt
+          VIO_REQUIRE_SUBGROUP=opengl xvfb-run -a php -n run-tests.php -q --show-diff $TESTS
 
       - name: Package binary
         run: |
@@ -203,19 +206,25 @@ jobs:
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
-      - name: Run required-feature tests (lavapipe Vulkan + llvmpipe GL)
+      - name: Run required-feature tests (lavapipe Vulkan, zink GL)
         run: |
           # Feature tests skip where a flag is 0, so a green suite cannot tell a
-          # real run from a skip. Here the backends are mandatory: subgroups
-          # must run on Vulkan (lavapipe) and OpenGL (llvmpipe).
-          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          # real run from a skip. Here the backends are mandatory. llvmpipe has
+          # no GL_KHR_shader_subgroup (measured: Mesa / LLVM 20), so OpenGL runs
+          # on zink (GL over lavapipe) in a second pass.
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
           VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)
           if [ -z "$VK_DRIVER_FILES" ]; then echo "lavapipe ICD not found"; exit 1; fi
           export VK_DRIVER_FILES
           echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
-          # What llvmpipe reports, so a missing GL flag can be told apart (no
-          # extension vs. missing stage / operation bits).
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          TESTS="tests/render3d/149_subgroup_ops_all_backends.phpt"
+          # Pass 1: Vulkan on lavapipe (GL stays llvmpipe, not required).
+          LIBGL_ALWAYS_SOFTWARE=1 VIO_REQUIRE_SUBGROUP=vulkan \
+            xvfb-run -a php -n run-tests.php -q --show-diff $TESTS
+          # Pass 2: OpenGL on zink; print what the driver reports first.
+          export MESA_LOADER_DRIVER_OVERRIDE=zink
           xvfb-run -a php -n -d extension_dir=$PWD/modules -d extension=vio.so -r '
             $c = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);
             $i = vio_gl_info($c);
@@ -223,10 +232,7 @@ jobs:
               $i["version"], $i["renderer"], $i["features"]["compute_shader"],
               in_array("GL_KHR_shader_subgroup", $i["extensions"], true),
               $i["subgroup_stages"], $i["subgroup_features"], $i["subgroup_size"]);'
-          export VIO_REQUIRE_SUBGROUP=vulkan,opengl
-          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
-          xvfb-run -a php -n run-tests.php -q --show-diff \
-            tests/render3d/149_subgroup_ops_all_backends.phpt
+          VIO_REQUIRE_SUBGROUP=opengl xvfb-run -a php -n run-tests.php -q --show-diff $TESTS
 
       - name: Package binary
         run: |
