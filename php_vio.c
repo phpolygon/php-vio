@@ -10729,6 +10729,10 @@ ZEND_FUNCTION(vio_gl_info)
     add_assoc_bool(&features, "texture_swizzle",         vio_gl.caps.has_texture_swizzle);
     add_assoc_bool(&features, "subgroup",                vio_gl.caps.has_subgroup);
     add_assoc_zval(return_value, "features", &features);
+    /* Raw GL_KHR_shader_subgroup limits (0 without the extension or compute). */
+    add_assoc_long(return_value, "subgroup_stages",   vio_gl.caps.subgroup_stages);
+    add_assoc_long(return_value, "subgroup_features", vio_gl.caps.subgroup_features);
+    add_assoc_long(return_value, "subgroup_size",     vio_gl.caps.subgroup_size);
     return;
 #else
     RETURN_FALSE;

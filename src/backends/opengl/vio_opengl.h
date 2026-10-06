@@ -47,6 +47,9 @@ typedef struct _vio_opengl_state {
         int has_texture_swizzle;         /* core 3.3 / GL_ARB_texture_swizzle */
         int has_subgroup;                /* GL_KHR_shader_subgroup: basic / vote / ballot / arithmetic /
                                           * shuffle in compute + fragment (needs compute) */
+        int subgroup_stages;             /* raw GL_SUBGROUP_SUPPORTED_STAGES_KHR (vio_gl_info) */
+        int subgroup_features;           /* raw GL_SUBGROUP_SUPPORTED_FEATURES_KHR */
+        int subgroup_size;               /* raw GL_SUBGROUP_SIZE_KHR */
     } caps;
 
     /* Cached extension list. NULL until setup; freed in shutdown. */

@@ -2779,6 +2779,9 @@ int vio_opengl_setup_context(void)
             | GL_SUBGROUP_FEATURE_ARITHMETIC_BIT_KHR | GL_SUBGROUP_FEATURE_BALLOT_BIT_KHR
             | GL_SUBGROUP_FEATURE_SHUFFLE_BIT_KHR;
         vio_gl.caps.has_subgroup = (stages & need_stages) == need_stages && (features & need_ops) == need_ops && size > 1;
+        vio_gl.caps.subgroup_stages = stages;
+        vio_gl.caps.subgroup_features = features;
+        vio_gl.caps.subgroup_size = size;
     }
 
     glEnable(GL_DEPTH_TEST);

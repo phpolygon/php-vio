@@ -102,6 +102,15 @@ jobs:
           if [ -z "$VK_DRIVER_FILES" ]; then echo "lavapipe ICD not found"; exit 1; fi
           export VK_DRIVER_FILES
           echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
+          # What llvmpipe reports, so a missing GL flag can be told apart (no
+          # extension vs. missing stage / operation bits).
+          xvfb-run -a php -n -d extension_dir=$PWD/modules -d extension=vio.so -r '
+            $c = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);
+            $i = vio_gl_info($c);
+            printf("GL %s (%s) compute=%d KHR_shader_subgroup=%d stages=0x%x features=0x%x size=%d\n",
+              $i["version"], $i["renderer"], $i["features"]["compute_shader"],
+              in_array("GL_KHR_shader_subgroup", $i["extensions"], true),
+              $i["subgroup_stages"], $i["subgroup_features"], $i["subgroup_size"]);'
           export VIO_REQUIRE_SUBGROUP=vulkan,opengl
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff \
@@ -205,6 +214,15 @@ jobs:
           if [ -z "$VK_DRIVER_FILES" ]; then echo "lavapipe ICD not found"; exit 1; fi
           export VK_DRIVER_FILES
           echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
+          # What llvmpipe reports, so a missing GL flag can be told apart (no
+          # extension vs. missing stage / operation bits).
+          xvfb-run -a php -n -d extension_dir=$PWD/modules -d extension=vio.so -r '
+            $c = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);
+            $i = vio_gl_info($c);
+            printf("GL %s (%s) compute=%d KHR_shader_subgroup=%d stages=0x%x features=0x%x size=%d\n",
+              $i["version"], $i["renderer"], $i["features"]["compute_shader"],
+              in_array("GL_KHR_shader_subgroup", $i["extensions"], true),
+              $i["subgroup_stages"], $i["subgroup_features"], $i["subgroup_size"]);'
           export VIO_REQUIRE_SUBGROUP=vulkan,opengl
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff \
