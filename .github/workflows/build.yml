@@ -47,6 +47,7 @@ jobs:
             spirv-cross libspirv-cross-c-shared-dev \
             libharfbuzz-dev \
             xvfb libgl1-mesa-dri libglx-mesa0 \
+            mesa-vulkan-drivers \
             pkg-config
 
       - name: Build extension
@@ -81,11 +82,30 @@ jobs:
           # load" warnings and break the --EXPECT-- match.
           export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          # mesa-vulkan-drivers (lavapipe) is installed for the step below; hide
+          # it here so the suite keeps running on OpenGL (auto would pick Vulkan).
+          export VK_DRIVER_FILES=/nonexistent/vio-no-vulkan.json
           # No sound card on CI runners -> ALSA spews "cannot find card" errors
           # that pollute audio-test output. Route the default device to null so
           # miniaudio opens it silently.
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
+
+      - name: Run required-feature tests (lavapipe Vulkan + llvmpipe GL)
+        run: |
+          # Feature tests skip where a flag is 0, so a green suite cannot tell a
+          # real run from a skip. Here the backends are mandatory: subgroups
+          # must run on Vulkan (lavapipe) and OpenGL (llvmpipe).
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)
+          if [ -z "$VK_DRIVER_FILES" ]; then echo "lavapipe ICD not found"; exit 1; fi
+          export VK_DRIVER_FILES
+          echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
+          export VIO_REQUIRE_SUBGROUP=vulkan,opengl
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          xvfb-run -a php -n run-tests.php -q --show-diff \
+            tests/render3d/149_subgroup_ops_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -134,6 +154,7 @@ jobs:
             spirv-cross libspirv-cross-c-shared-dev \
             libharfbuzz-dev \
             xvfb libgl1-mesa-dri libglx-mesa0 \
+            mesa-vulkan-drivers \
             pkg-config
 
       - name: Build extension
@@ -164,11 +185,30 @@ jobs:
           # load" warnings and break the --EXPECT-- match.
           export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          # mesa-vulkan-drivers (lavapipe) is installed for the step below; hide
+          # it here so the suite keeps running on OpenGL (auto would pick Vulkan).
+          export VK_DRIVER_FILES=/nonexistent/vio-no-vulkan.json
           # No sound card on CI runners -> ALSA spews "cannot find card" errors
           # that pollute audio-test output. Route the default device to null so
           # miniaudio opens it silently.
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
+
+      - name: Run required-feature tests (lavapipe Vulkan + llvmpipe GL)
+        run: |
+          # Feature tests skip where a flag is 0, so a green suite cannot tell a
+          # real run from a skip. Here the backends are mandatory: subgroups
+          # must run on Vulkan (lavapipe) and OpenGL (llvmpipe).
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)
+          if [ -z "$VK_DRIVER_FILES" ]; then echo "lavapipe ICD not found"; exit 1; fi
+          export VK_DRIVER_FILES
+          echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
+          export VIO_REQUIRE_SUBGROUP=vulkan,opengl
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          xvfb-run -a php -n run-tests.php -q --show-diff \
+            tests/render3d/149_subgroup_ops_all_backends.phpt
 
       - name: Package binary
         run: |
