@@ -1016,6 +1016,11 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   `mipgen_heap`, danach `d3d12_restore_graphics_state_after_compute`), statt zweimal die GPU zu leeren:
   Repro 10,8 → 0,09 ms. Nebenbefunde: `GEOMETRY` auf D3D = 0 kam vom Vulkan SDK 1.3.296 der Windows-CI
   (jetzt 1.4.341), `name[i]` für Matrix-/Vektor-Arrays löst die Array-Schrittweite auf (Tests 145, 146).
+- **`SHADER-FEATURES-PLAN.md` — 📋 geplant (2026-10-06).** Shader-Model-6.0–6.9-Features und ihre
+  Metal-/Vulkan-/GL-Gegenstücke als portable `VIO_FEATURE_*`: Phase 0 Infrastruktur (Metal-Leiter ✅,
+  SM6-Branch, `describe` überall, SM-Pinning, Agility SDK), 1 Intrinsics (Subgroups, Quad, Barycentrics,
+  Float16, Base Vertex, Atomic64, Compute-Derivate), 2 Multiview, 3 VRS Tier 2, 4 Bindless, 5 Mesh-Shader,
+  6 Raytracing (Ray Query → Pipeline → SER/OMM), 7 Sampler Feedback, 8 Neural Shading, 9 Work Graphs.
 - `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
 - `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
 - **`METAL-GEOMETRY-PLAN.md` — ✅ umgesetzt (2026-10-05).** Geometry-Stage auf Metal per Compute-
