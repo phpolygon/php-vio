@@ -91,21 +91,30 @@ jobs:
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
-      - name: Run required-feature tests (lavapipe Vulkan + llvmpipe GL)
+      - name: Run required-feature tests (lavapipe Vulkan)
         run: |
           # Feature tests skip where a flag is 0, so a green suite cannot tell a
-          # real run from a skip. Here the backends are mandatory: subgroups
-          # must run on Vulkan (lavapipe) and OpenGL (llvmpipe).
+          # real run from a skip. Here Vulkan (lavapipe) is mandatory. OpenGL is
+          # not: llvmpipe has no GL_KHR_shader_subgroup (Mesa / LLVM 20 on
+          # ubuntu-24.04) and zink gets no context under Xvfb (no DRI3, also
+          # with LIBGL_KOPPER_DRI2) - measured on this runner. The GL line below
+          # records what llvmpipe reports.
           export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
           VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)
           if [ -z "$VK_DRIVER_FILES" ]; then echo "lavapipe ICD not found"; exit 1; fi
           export VK_DRIVER_FILES
           echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
-          export VIO_REQUIRE_SUBGROUP=vulkan,opengl
-          export VIO_REQUIRE_SUBGROUP_QUAD=vulkan,opengl
-          export VIO_REQUIRE_BARYCENTRICS=vulkan
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          xvfb-run -a php -n -d extension_dir=$PWD/modules -d extension=vio.so -r '
+            $c = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);
+            if (!$c) { echo "GL: no context\n"; exit(0); }
+            $i = vio_gl_info($c);
+            printf("GL %s (%s) compute=%d KHR_shader_subgroup=%d stages=0x%x features=0x%x size=%d\n",
+              $i["version"], $i["renderer"], $i["features"]["compute_shader"],
+              in_array("GL_KHR_shader_subgroup", $i["extensions"], true),
+              $i["subgroup_stages"], $i["subgroup_features"], $i["subgroup_size"]);'
+          export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_BARYCENTRICS=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \
@@ -198,21 +207,30 @@ jobs:
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
-      - name: Run required-feature tests (lavapipe Vulkan + llvmpipe GL)
+      - name: Run required-feature tests (lavapipe Vulkan)
         run: |
           # Feature tests skip where a flag is 0, so a green suite cannot tell a
-          # real run from a skip. Here the backends are mandatory: subgroups
-          # must run on Vulkan (lavapipe) and OpenGL (llvmpipe).
+          # real run from a skip. Here Vulkan (lavapipe) is mandatory. OpenGL is
+          # not: llvmpipe has no GL_KHR_shader_subgroup (Mesa / LLVM 20 on
+          # ubuntu-24.04) and zink gets no context under Xvfb (no DRI3, also
+          # with LIBGL_KOPPER_DRI2) - measured on this runner. The GL line below
+          # records what llvmpipe reports.
           export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
           VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)
           if [ -z "$VK_DRIVER_FILES" ]; then echo "lavapipe ICD not found"; exit 1; fi
           export VK_DRIVER_FILES
           echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
-          export VIO_REQUIRE_SUBGROUP=vulkan,opengl
-          export VIO_REQUIRE_SUBGROUP_QUAD=vulkan,opengl
-          export VIO_REQUIRE_BARYCENTRICS=vulkan
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          xvfb-run -a php -n -d extension_dir=$PWD/modules -d extension=vio.so -r '
+            $c = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);
+            if (!$c) { echo "GL: no context\n"; exit(0); }
+            $i = vio_gl_info($c);
+            printf("GL %s (%s) compute=%d KHR_shader_subgroup=%d stages=0x%x features=0x%x size=%d\n",
+              $i["version"], $i["renderer"], $i["features"]["compute_shader"],
+              in_array("GL_KHR_shader_subgroup", $i["extensions"], true),
+              $i["subgroup_stages"], $i["subgroup_features"], $i["subgroup_size"]);'
+          export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_BARYCENTRICS=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \
@@ -507,6 +525,8 @@ jobs:
           $env:VIO_DXC_DIR = $dxc.DirectoryName
           $env:VIO_REQUIRE_SM6 = "1"
           Write-Host "VIO_DXC_DIR=$env:VIO_DXC_DIR"
+          # Which shader-model features WARP offers (tests skip what it lacks).
+          php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r '$c = vio_create("d3d12", ["width" => 8, "height" => 8, "headless" => true, "shader_model" => 6, "dxc_dir" => getenv("VIO_DXC_DIR")]); $i = vio_swapchain_info($c); printf("D3D12 SM %d (%d) subgroup=%d quad=%d barycentrics=%d\n", $i["shader_model"], $i["shader_model_version"], vio_supports_feature($c, VIO_FEATURE_SUBGROUP), vio_supports_feature($c, VIO_FEATURE_SUBGROUP_QUAD), vio_supports_feature($c, VIO_FEATURE_BARYCENTRICS));'
           $env:NO_INTERACTION = "1"
           $env:REPORT_EXIT_STATUS = "1"
           $env:TEST_PHP_ARGS = "-n -d extension_dir=$dllDir -d extension=php_vio.dll"
