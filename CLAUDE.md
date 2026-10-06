@@ -96,7 +96,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 |---|---|
 | `tests/backends/150` | Metal-Versionsleiter: `vio_backend_info()` (MSL-Version in Benutzung und Maximum, GPU-Familien, Caps), jede Stufe bis zum OS-Maximum per `msl_version` erzwingbar, versionsgebundene Caps folgen der Stufe, Clamping (unter 2.0 → 2.0, über Maximum → Maximum, zwischen Stufen → darunter), `VIO_METAL_MSL_VERSION` greift ohne Option, Option gewinnt; `null` liefert `false`. |
 | `tests/render3d/151` | Dieselbe Szene auf jeder MSL-Stufe 2.0 … OS-Maximum: 3D-Draw mit Uniform + Textur in ein RT (Readback), Compute, emulierter GS, Tessellation (ab 2.1, darunter abgelehnt), 2D-Batch. |
-| `tests/render3d/149` | Subgroup-Operationen (`VIO_FEATURE_SUBGROUP`): Compute-Shader mit `subgroupAdd`/`subgroupBroadcastFirst`/`gl_SubgroupSize`, Ergebnisse unabhängig von der Wave-Größe konsistent; auf D3D12 über SM 6 (DXC) als Wave-Intrinsics, sonst `skip`. |
+| `tests/render3d/149` | Subgroup-Operationen (`VIO_FEATURE_SUBGROUP`): Compute-Shader mit `subgroupAdd`/`subgroupBroadcastFirst`/`gl_SubgroupSize` (Ergebnisse unabhängig von der Wave-Größe konsistent) und Fragment-Shader mit `subgroupAllEqual`/`subgroupAdd`; D3D12 über SM 6 (DXC), Metal muss das Flag melden, wenn `vio_backend_info()` `simd_group` meldet (ab MSL 2.2), Vulkan/GL nach Device-Eigenschaften. |
 | `tests/render3d/148` | Tessellation `point_mode` (Dreieck/Quad) erzeugt jeden Domain-Punkt genau einmal (Punktzahl nach GL-Regel, additives Blending deckt Duplikate auf), Isolines mit `fractional_odd_spacing`; auf Metal emuliert (siehe „Metal-3D-Pipeline"). |
 | `tests/render3d/147` | Stencil in Array-Layer, Cube-Face und depth_only-Target (Schema von 113); vorher hatte Metal dort keine Stencil-Plane. |
 | `tests/render3d/146` | `vio_set_uniform("name[i]", …)` setzt ein Element eines Arrays von Matrizen/Vektoren (`uniform mat4 u_m[3]`, `uniform vec4 u_col[2]`) auf jedem Backend. Vorher fanden D3D11/D3D12/Vulkan/Metal das Element nicht (Befund aus Code Rescue). |
@@ -206,7 +206,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Texture-Arrays + BC + KTX2 (`vio_texture(['layers', 'format' => VIO_FORMAT_BC*, 'mip_levels'])`, `vio_texture_ktx2`, `VIO_FEATURE_TEXTURE_ARRAY` / `_TEXTURE_COMPRESSION_BC`) | ✅ (`GL_TEXTURE_2D_ARRAY`, S3TC/RGTC/BPTC) | ✅ | ✅ | ✅ (2D-Array-Views, `textureCompressionBC`, Block 10c) | ✅ (`MTLTextureType2DArray`, BC-Formate) |
 | Variable Rate Shading (`vio_set_shading_rate`, `VIO_SHADING_RATE_*`, `VIO_FEATURE_SHADING_RATE`) | ❌ | ❌ | ✅ (`RSSetShadingRate`, Tier 1+; 4X4 nur mit Additional Rates) | ✅ (`VK_KHR_fragment_shading_rate`, Pipeline-Rate als Dynamic State, Block 10c) | ❌ |
 | Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model' / 'shader_model_version']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Profil = höchstes 6.x, das Device **und** DXC/dxil.dll können; SPIRV-Cross übersetzt auf dasselbe Profil; Fallback FXC 5.1) | — | — |
-| Subgroups (`GL_KHR_shader_subgroup_*`, `VIO_FEATURE_SUBGROUP`) | ❌ | ❌ | ✅ (nur mit SM 6 + `OPTIONS1.WaveOps`: Wave-Intrinsics) | ❌ (noch nicht gewired) | ❌ (noch nicht gewired) |
+| Subgroups (`GL_KHR_shader_subgroup_*` in Compute + Fragment, `VIO_FEATURE_SUBGROUP`) | ✅ (`GL_KHR_shader_subgroup`, Stages/Features per `glGetIntegerv`; braucht Compute) | ❌ | ✅ (nur mit SM 6 + `OPTIONS1.WaveOps`: Wave-Intrinsics) | ✅ (`VkPhysicalDeviceSubgroupProperties`: Compute + Fragment, basic/vote/ballot/arithmetic/shuffle) | ✅ (`simd_group`: MSL 2.2, Mac2/Apple7) |
 | HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | ✅ (10-Bit-Surface-Format + `VK_EXT_swapchain_colorspace` HDR10 ST 2084, Block 10d) | ✅ (`CAMetalLayer` RGB10A2 im BT.2100-PQ-Farbraum, `hdr_output => 1` nur auf EDR-Displays) |
 | Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | ✅ (Dispatch-Semaphore über die Frames in Flight, 1..3) |
 | GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`) |
@@ -971,7 +971,7 @@ nutzen die Stufe: SPIRV-Cross-MSL der Grafik-Stages, Kernel der GS-Emulation, Te
 | `tessellation` | 2.1 | jede (Kernel + `drawPatches`) | `VIO_FEATURE_TESSELLATION` |
 | `layered_vertex` | — | Mac2 / Apple5 | `LAYERED_RENDER`, `VERTEX_LAYER`, `MULTI_VIEWPORT` |
 | `quad_group` | 2.1 | Mac2 / Apple4 | — (Plan) |
-| `simd_group` | 2.1 | Mac2 / Apple7 | — (Plan: Subgroups) |
+| `simd_group` | 2.2 (`threads_per_simdgroup` im Fragment-Shader) | Mac2 / Apple7 | `VIO_FEATURE_SUBGROUP` |
 | `barycentrics` | 2.2 | `supportsShaderBarycentricCoordinates` | — |
 | `vertex_amplification` | 2.2 | `supportsVertexAmplificationCount:2` | — |
 | `argument_buffers_tier2` | — | `argumentBuffersSupport` | — |

@@ -10727,6 +10727,7 @@ ZEND_FUNCTION(vio_gl_info)
     add_assoc_bool(&features, "buffer_storage",          vio_gl.caps.has_buffer_storage);
     add_assoc_bool(&features, "texture_storage",         vio_gl.caps.has_texture_storage);
     add_assoc_bool(&features, "texture_swizzle",         vio_gl.caps.has_texture_swizzle);
+    add_assoc_bool(&features, "subgroup",                vio_gl.caps.has_subgroup);
     add_assoc_zval(return_value, "features", &features);
     return;
 #else

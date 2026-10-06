@@ -45,6 +45,8 @@ typedef struct _vio_opengl_state {
         int has_buffer_storage;          /* core 4.4 / GL_ARB_buffer_storage */
         int has_texture_storage;         /* core 4.2 / GL_ARB_texture_storage */
         int has_texture_swizzle;         /* core 3.3 / GL_ARB_texture_swizzle */
+        int has_subgroup;                /* GL_KHR_shader_subgroup: basic / vote / ballot / arithmetic /
+                                          * shuffle in compute + fragment (needs compute) */
     } caps;
 
     /* Cached extension list. NULL until setup; freed in shutdown. */

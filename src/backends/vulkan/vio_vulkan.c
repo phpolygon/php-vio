@@ -335,6 +335,27 @@ static int create_logical_device(void)
     (void)has_rp2; (void)has_vrs;
 #endif
 
+    /* Subgroup operations (GL_KHR_shader_subgroup_*): core 1.1 properties. Shaders
+     * that use them are compiled for SPIR-V 1.3, which a 1.1 device accepts. */
+    vio_vk.subgroup_supported = 0;
+    if (vio_vk.instance_api_11) {
+        VkPhysicalDeviceProperties dprops;
+        vkGetPhysicalDeviceProperties(vio_vk.physical_device, &dprops);
+        if (dprops.apiVersion >= VK_API_VERSION_1_1) {
+            VkPhysicalDeviceSubgroupProperties sg = {0};
+            sg.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+            VkPhysicalDeviceProperties2 p2 = {0};
+            p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            p2.pNext = &sg;
+            vkGetPhysicalDeviceProperties2(vio_vk.physical_device, &p2);
+            const VkShaderStageFlags stages = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+            const VkSubgroupFeatureFlags ops = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT
+                | VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+            vio_vk.subgroup_supported = (sg.supportedStages & stages) == stages
+                                     && (sg.supportedOperations & ops) == ops && sg.subgroupSize > 1;
+        }
+    }
+
     /* Enable only what we use: anisotropic filtering when the device has it
      * (vio_texture(['anisotropy' => N]) — GAP-PLAN 2.6). */
     VkPhysicalDeviceFeatures features = {0};
@@ -3412,6 +3433,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_vk3d_available(); /* 2D array views, stored chains (Block 10c) */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return vio_vk3d_available() && (!vio_vk.device || vio_vk.bc_supported); /* textureCompressionBC */
         case VIO_FEATURE_SHADING_RATE:   return vio_vk3d_available() && vio_vk.vrs_supported; /* VK_KHR_fragment_shading_rate, pipeline rate */
+        case VIO_FEATURE_SUBGROUP:       return vio_vk.device && vio_vk.subgroup_supported; /* core 1.1 subgroup properties, compute + fragment */
         case VIO_FEATURE_HDR_OUTPUT:     return vio_vk.device && vio_vk.hdr10_capable; /* 10-bit surface format, ST 2084 via VK_EXT_swapchain_colorspace (Block 10d) */
         default: return 0;
     }

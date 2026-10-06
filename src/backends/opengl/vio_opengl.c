@@ -2591,6 +2591,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_DEPTH_BIAS:     return 1;
         case VIO_FEATURE_SCISSOR:        return 1;
         case VIO_FEATURE_TEXTURE_SWIZZLE: return vio_gl.caps.has_texture_swizzle;
+        case VIO_FEATURE_SUBGROUP:       return vio_gl.caps.has_subgroup;   /* GL_KHR_shader_subgroup */
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1;
         case VIO_FEATURE_DEBUG_OUTPUT:   return vio_gl.caps.has_debug_output;
         case VIO_FEATURE_DSA:            return vio_gl.caps.has_dsa;
@@ -2766,6 +2767,19 @@ int vio_opengl_setup_context(void)
     vio_gl.caps.has_buffer_storage   = gl_ge(4, 4) || gl_has_ext("GL_ARB_buffer_storage");
     vio_gl.caps.has_texture_storage  = gl_ge(4, 2) || gl_has_ext("GL_ARB_texture_storage");
     vio_gl.caps.has_texture_swizzle  = gl_ge(3, 3) || gl_has_ext("GL_ARB_texture_swizzle");
+    vio_gl.caps.has_subgroup = 0;
+    if (vio_gl.caps.has_compute_shader && gl_has_ext("GL_KHR_shader_subgroup")) {
+        /* The extension reports which stages and operation groups it covers. */
+        GLint stages = 0, features = 0, size = 0;
+        glGetIntegerv(GL_SUBGROUP_SUPPORTED_STAGES_KHR, &stages);
+        glGetIntegerv(GL_SUBGROUP_SUPPORTED_FEATURES_KHR, &features);
+        glGetIntegerv(GL_SUBGROUP_SIZE_KHR, &size);
+        const GLint need_stages = GL_COMPUTE_SHADER_BIT | GL_FRAGMENT_SHADER_BIT;
+        const GLint need_ops = GL_SUBGROUP_FEATURE_BASIC_BIT_KHR | GL_SUBGROUP_FEATURE_VOTE_BIT_KHR
+            | GL_SUBGROUP_FEATURE_ARITHMETIC_BIT_KHR | GL_SUBGROUP_FEATURE_BALLOT_BIT_KHR
+            | GL_SUBGROUP_FEATURE_SHUFFLE_BIT_KHR;
+        vio_gl.caps.has_subgroup = (stages & need_stages) == need_stages && (features & need_ops) == need_ops && size > 1;
+    }
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);

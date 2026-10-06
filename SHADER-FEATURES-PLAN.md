@@ -56,7 +56,7 @@ Reiner Übersetzungs-/Gate-Kram, keine neue Ressourcen-API. Reihenfolge = Nutzen
 
 | # | Feature (`VIO_FEATURE_*`) | D3D12 | Vulkan | Metal | OpenGL | Nutzen / Hardware |
 |---|---|---|---|---|---|---|
-| 1a | Subgroups `SUBGROUP` (basic/vote/ballot/arithmetic/shuffle) | ✅ Branch (SM 6.0 + `WaveOps`) | `VkPhysicalDeviceSubgroupProperties` (Stages + Operations) | `simd_group` (MSL 2.1, Mac2/Apple7) | `GL_KHR_shader_subgroup` (Mesa, NV) | Reduktionen/Culling ohne Shared Memory; jede DX12-Klasse-GPU |
+| 1a ✅ | Subgroups `SUBGROUP` (basic/vote/ballot/arithmetic/shuffle, Compute + Fragment) | ✅ SM 6.0 + `WaveOps` | ✅ `VkPhysicalDeviceSubgroupProperties` (Stages + Operations) | ✅ `simd_group` (MSL **2.2** — `threads_per_simdgroup` im Fragment-Shader, per Leiter gefunden; Mac2/Apple7) | ✅ `GL_KHR_shader_subgroup` (Mesa, NV) | Reduktionen/Culling ohne Shared Memory; jede DX12-Klasse-GPU |
 | 1b | Quad-Ops `SUBGROUP_QUAD` | SM 6.0 | `subgroupQuadOperationsInAllStages` / Quad-Bit | `quad_group` (Mac2/Apple4) | KHR-Ext | Nachbarpixel ohne Derivate (Filter, Post-FX) |
 | 1c | Barycentrics `BARYCENTRICS` | SM 6.1 + `OPTIONS3.BarycentricsSupported` | `VK_KHR_fragment_shader_barycentric` | `barycentrics` (MSL 2.2) | `GL_NV_fragment_shader_barycentric` / AMD | Visibility Buffer, Wireframe ohne GS; Turing+/RDNA2+/Arc/Apple |
 | 1d | 16-Bit-Typen `SHADER_FLOAT16` | SM 6.2 + `OPTIONS4.Native16BitShaderOpsSupported`, DXC `-enable-16bit-types`, SPIRV-Cross-HLSL-Option | `shaderFloat16` + `storageBuffer16BitAccess` | `half` (immer) | `GL_AMD_gpu_shader_half_float` / NV | halber Registerdruck, 2× FP16 auf Turing+/Vega+/Intel; auf Apple mehr Occupancy |

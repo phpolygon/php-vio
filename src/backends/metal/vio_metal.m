@@ -52,7 +52,7 @@ typedef struct _vio_metal_caps {
     int tessellation;           /* MSL 2.1: [[patch]] + tessellation kernels */
     int layered_vertex;         /* [[render_target_array_index]] from the VS: Mac2 / Apple5 */
     int quad_group;             /* quad_* permutes, MSL 2.1 (SPIRV-Cross on macOS): Mac2 / Apple4 */
-    int simd_group;             /* simd_* reductions / ballot, MSL 2.1: Mac2 / Apple7 */
+    int simd_group;             /* simd_* reductions / ballot, MSL 2.2 (threads_per_simdgroup in fragment functions): Mac2 / Apple7 */
     int barycentrics;           /* [[barycentric_coord]], MSL 2.2 */
     int vertex_amplification;   /* [[amplification_id]], MSL 2.2 */
     int argument_buffers_tier2; /* bindless-style argument buffers */
@@ -505,7 +505,7 @@ static void metal_detect_caps(int msl, int max)
     c->tessellation   = spirv_cross && msl >= 21;
     c->layered_vertex = c->mac2 || c->apple_family >= 5;
     c->quad_group     = msl >= 21 && (c->mac2 || c->apple_family >= 4);
-    c->simd_group     = msl >= 21 && (c->mac2 || c->apple_family >= 7);
+    c->simd_group     = msl >= 22 && (c->mac2 || c->apple_family >= 7);   /* gl_SubgroupSize in a fragment shader needs 2.2 */
     c->barycentrics   = msl >= 22 && METAL_DEVICE_BOOL(supportsShaderBarycentricCoordinates);
     if (msl >= 22 && [vio_mtl.device respondsToSelector:@selector(supportsVertexAmplificationCount:)]) {
         if (@available(macOS 10.15.4, iOS 13.0, *)) c->vertex_amplification = [vio_mtl.device supportsVertexAmplificationCount:2] ? 1 : 0;
@@ -5498,6 +5498,11 @@ static int metal_supports_feature(vio_feature f)
 #else
         return 0;
 #endif
+    case VIO_FEATURE_SUBGROUP:
+        /* GL_KHR_shader_subgroup_* -> SPIRV-Cross simd_* / quad_* functions
+         * in compute and fragment stages (MSL 2.2+, SIMD-group reductions on
+         * Mac2 / Apple7). */
+        return vio_mtl.caps.simd_group;
     case VIO_FEATURE_TESSELLATION:
         /* vertex + control kernels, then drawPatches (metal_draw_tess); the
          * [[patch]] functions need MSL 2.1 (version ladder). */
