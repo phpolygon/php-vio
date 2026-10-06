@@ -19,7 +19,9 @@
  *                       display is in HDR mode (2 = force); the 2D batch PQ-encodes its output,
  *                       hdr_paper_white => nits that display white maps to (default 200),
  *                       shader_model => 6: compile D3D12 shaders with DXC to DXIL (needs dxcompiler.dll +
- *                       dxil.dll, optionally located via dxc_dir => directory; falls back to FXC 5.1),
+ *                       dxil.dll, optionally located via dxc_dir => directory; falls back to FXC 5.1). The
+ *                       profile is the highest 6.x the device and DXC accept; it enables subgroup
+ *                       operations (VIO_FEATURE_SUBGROUP) on devices with wave ops),
  *                       msl_version => 21: pin the Metal Shading Language version (major * 10 + minor,
  *                       2.0 .. the OS maximum; default the maximum, or VIO_METAL_MSL_VERSION))
  * @return VioContext|false Context object or false on failure
@@ -354,7 +356,9 @@ function vio_shader_cache_stats(): array {}
  * What the presentation path runs with: ['buffer_count' => int, 'frame_latency' => int
  * (0 = driver default), 'waitable' => bool (frame-latency waitable object in use),
  * 'hdr_output' => bool (HDR10 backbuffer), 'format' => int (0 RGBA8, 8 RGB10A2),
- * 'shader_model' => int (D3D12: 6 with DXC / DXIL, 5 with FXC; D3D11: 5; 0 elsewhere)].
+ * 'shader_model' => int (D3D12: 6 with DXC / DXIL, 5 with FXC; D3D11: 5; 0 elsewhere),
+ * 'shader_model_version' => int (compile profile as major * 10 + minor: D3D12 60..69 with DXC,
+ * 51 with FXC; D3D11 50; 0 elsewhere)].
  */
 function vio_swapchain_info(VioContext $context): array {}
 

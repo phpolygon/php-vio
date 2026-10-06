@@ -298,6 +298,11 @@ typedef enum _vio_feature {
      * features such as [instance(N)]. The GLSL stage stays required: it defines
      * the uniform layout and serves the other backends. */
     VIO_FEATURE_HLSL_STAGE_OVERRIDE = 44,
+    /* Subgroup operations (GL_KHR_shader_subgroup_basic / _vote / _ballot /
+     * _arithmetic): gl_SubgroupSize, subgroupAdd, subgroupBroadcastFirst, ...
+     * D3D12 maps them onto wave intrinsics, which need Shader Model 6
+     * (vio_create(['shader_model' => 6]) with DXC) and a device with WaveOps. */
+    VIO_FEATURE_SUBGROUP           = 45,
 } vio_feature;
 
 #define VIO_MAX_VIEWPORTS 16
@@ -360,8 +365,9 @@ typedef struct _vio_config {
     float       hdr_paper_white;
     /* D3D12 shader model (GAP-PHASE5 Block 7): 6 compiles the SPIRV-Cross HLSL
      * with DXC to DXIL (dxcompiler.dll + dxil.dll must be loadable, the device
-     * must report SM 6.0); 0 / 5 = FXC 5.1 as before. dxc_dir optionally names
-     * the directory holding the two DLLs. */
+     * must report SM 6.0); 0 / 5 = FXC 5.1 as before. The profile is the highest
+     * 6.x both the device and the loaded DXC / dxil.dll accept. dxc_dir
+     * optionally names the directory holding the two DLLs. */
     int         shader_model;
     char        dxc_dir[512];
     /* Metal: pin the version ladder to this Metal Shading Language version
@@ -378,6 +384,8 @@ typedef struct _vio_swapchain_info {
     int hdr_output;      /* 1 = HDR10 (10-bit, ST 2084) output active (GAP-PHASE5 Block 6) */
     int format;          /* vio_pixel_format-like code of the backbuffer: 0 RGBA8, 8 RGB10A2 */
     int shader_model;    /* D3D: 6 = DXC / DXIL, 5 = FXC; 0 elsewhere (GAP-PHASE5 Block 7) */
+    int shader_model_version; /* compile profile as major * 10 + minor: D3D12 60..69 (DXC) or 51,
+                               * D3D11 50; 0 elsewhere */
 } vio_swapchain_info;
 
 /* vio_backend_info() — the API level a backend negotiated and what it can do

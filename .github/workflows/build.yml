@@ -449,6 +449,16 @@ jobs:
           # Smoke: the extension loads with the full runtime DLL chain present.
           php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r 'exit((int)!extension_loaded("vio"));'
           if ($LASTEXITCODE -ne 0) { throw "vio failed to load (runtime DLL chain incomplete)" }
+          # Shader Model 6: DXC (dxcompiler.dll + dxil.dll) from the newest Windows
+          # SDK. VIO_REQUIRE_SM6 makes 119 / 144 / 149 fail instead of silently
+          # falling back to FXC, so a green run proves the DXIL path ran.
+          $dxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\dxcompiler.dll" -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path (Join-Path $_.DirectoryName 'dxil.dll') } |
+            Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
+          if (-not $dxc) { throw "Windows SDK DXC (dxcompiler.dll + dxil.dll) not found" }
+          $env:VIO_DXC_DIR = $dxc.DirectoryName
+          $env:VIO_REQUIRE_SM6 = "1"
+          Write-Host "VIO_DXC_DIR=$env:VIO_DXC_DIR"
           $env:NO_INTERACTION = "1"
           $env:REPORT_EXIT_STATUS = "1"
           $env:TEST_PHP_ARGS = "-n -d extension_dir=$dllDir -d extension=php_vio.dll"
@@ -512,7 +522,8 @@ jobs:
             tests/render3d/145_cube_mipmaps_in_frame_all_backends.phpt `
             tests/render3d/146_uniform_array_elements_all_backends.phpt `
             tests/render3d/147_stencil_layered_depth_only_all_backends.phpt `
-            tests/render3d/148_tessellation_point_mode_isolines_all_backends.phpt
+            tests/render3d/148_tessellation_point_mode_isolines_all_backends.phpt `
+            tests/render3d/149_subgroup_ops_all_backends.phpt
 
       - name: Package binary
         shell: pwsh
