@@ -2594,6 +2594,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_SUBGROUP:       return vio_gl.caps.has_subgroup;   /* GL_KHR_shader_subgroup */
         case VIO_FEATURE_SUBGROUP_QUAD:  return vio_gl.caps.has_subgroup_quad;
         case VIO_FEATURE_BARYCENTRICS:   return vio_gl.caps.has_barycentrics;
+        case VIO_FEATURE_ATOMIC64:       return vio_gl.caps.has_atomic64;
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1;
         case VIO_FEATURE_DEBUG_OUTPUT:   return vio_gl.caps.has_debug_output;
         case VIO_FEATURE_DSA:            return vio_gl.caps.has_dsa;
@@ -2772,6 +2773,8 @@ int vio_opengl_setup_context(void)
     vio_gl.caps.has_subgroup = 0;
     vio_gl.caps.has_subgroup_quad = 0;
     vio_gl.caps.has_barycentrics = gl_has_ext("GL_EXT_fragment_shader_barycentric");
+    vio_gl.caps.has_atomic64 = vio_gl.caps.has_compute_shader && gl_has_ext("GL_ARB_gpu_shader_int64")
+                            && gl_has_ext("GL_NV_shader_atomic_int64");
     if (gl_has_ext("GL_KHR_shader_subgroup")) {
         GLint stages = 0, features = 0;
         glGetIntegerv(GL_SUBGROUP_SUPPORTED_STAGES_KHR, &stages);

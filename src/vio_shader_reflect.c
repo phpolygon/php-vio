@@ -12,6 +12,7 @@
 #include "vio_shader_compiler.h"
 #include "vio_tess_hlsl.h"
 #include <string.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -655,6 +656,73 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
     return vio_spirv_to_hlsl_hooked(spirv, spirv_size / sizeof(uint32_t), shader_model, fixup_depth, NULL, error_msg);
 }
 
+/* 64-bit atomics on a RWByteAddressBuffer (GL_EXT_shader_atomic_int64 on an
+ * SSBO, VIO_FEATURE_ATOMIC64). SPIRV-Cross emits `buf.InterlockedMax(off, v, r)`
+ * for them, but the 64-bit raw-buffer methods of Shader Model 6.6 are the *64
+ * ones; with a uint64_t value the 32-bit overload still compiles and silently
+ * truncates (checked with DXC 1.9). SPIRV-Cross always passes the original
+ * value as a temporary it declared as `uint64_t _N;` / `int64_t _N;`, so a call
+ * whose last argument is such a temporary is renamed to its *64 method. Below
+ * Shader Model 6.6 DXC then rejects the shader instead of computing garbage.
+ * Free InterlockedX(dest, ...) calls (groupshared, typed) are overloaded on the
+ * operand type and left alone. Takes ownership of `hlsl`. */
+static int hlsl_is_int64_temp(const char *hlsl, const char *id, size_t id_len)
+{
+    static const char *types[] = { "uint64_t ", "int64_t " };
+    for (int t = 0; t < 2; t++) {
+        size_t tl = strlen(types[t]);
+        for (const char *p = hlsl; (p = strstr(p, types[t])) != NULL; p += tl) {
+            if (p > hlsl && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) continue;
+            const char *q = p + tl;
+            if (strncmp(q, id, id_len) == 0 && (q[id_len] == ';' || q[id_len] == ' ' || q[id_len] == '=')) return 1;
+        }
+    }
+    return 0;
+}
+
+static char *vio_hlsl_fix_int64_buffer_atomics(char *hlsl)
+{
+    if (!hlsl || !strstr(hlsl, "int64_t") || !strstr(hlsl, ".Interlocked")) return hlsl;
+    size_t len = strlen(hlsl), cap = len + 64, n = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) return hlsl;
+    const char *p = hlsl;
+    for (;;) {
+        const char *m = strstr(p, ".Interlocked");
+        if (!m) break;
+        const char *name = m + 1, *paren = name;
+        while (isalnum((unsigned char)*paren) || *paren == '_') paren++;
+        size_t name_len = (size_t)(paren - name);
+        int is64 = 0;
+        if (*paren == '(' && !(name_len > 2 && name[name_len - 2] == '6' && name[name_len - 1] == '4')) {
+            /* Last top-level argument of the call. */
+            int depth = 0;
+            const char *last = paren + 1, *q = paren + 1;
+            for (; *q; q++) {
+                if (*q == '(') depth++;
+                else if (*q == ')') { if (depth == 0) break; depth--; }
+                else if (*q == ',' && depth == 0) last = q + 1;
+            }
+            while (last < q && isspace((unsigned char)*last)) last++;
+            const char *end = q;
+            while (end > last && isspace((unsigned char)end[-1])) end--;
+            int ident = end > last;
+            for (const char *c = last; c < end; c++) if (!(isalnum((unsigned char)*c) || *c == '_')) ident = 0;
+            if (ident && *q == ')') is64 = hlsl_is_int64_temp(hlsl, last, (size_t)(end - last));
+        }
+        size_t chunk = (size_t)(paren - p);
+        if (n + chunk + 3 >= cap) { cap = (n + chunk + 3) * 2; char *g = (char *)realloc(out, cap); if (!g) { free(out); return hlsl; } out = g; }
+        memcpy(out + n, p, chunk); n += chunk;
+        if (is64) { out[n++] = '6'; out[n++] = '4'; }
+        p = paren;
+    }
+    size_t rest = strlen(p);
+    if (n + rest + 1 > cap) { char *g = (char *)realloc(out, n + rest + 1); if (!g) { free(out); return hlsl; } out = g; }
+    memcpy(out + n, p, rest + 1);
+    free(hlsl);
+    return out;
+}
+
 char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int shader_model,
                                int fixup_depth, const vio_hlsl_hooks *hooks, char **error_msg)
 {
@@ -805,6 +873,7 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
         output = strdup(result);
     }
     if (is_geometry) output = vio_gs_hlsl_patch(output, gs_pos_location, gs_invocation, gs_invocations);
+    output = vio_hlsl_fix_int64_buffer_atomics(output);
     if (output && hooks && hooks->finish) output = hooks->finish(compiler, output, error_msg, hooks->user);
 
     spvc_context_destroy(ctx);

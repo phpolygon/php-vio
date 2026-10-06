@@ -5498,6 +5498,10 @@ static int metal_supports_feature(vio_feature f)
 #else
         return 0;
 #endif
+    case VIO_FEATURE_ATOMIC64:
+        /* Metal has 64-bit atomic min / max only (atomic64 cap, MSL 3.1) and
+         * SPIRV-Cross refuses 64-bit atomics for MSL: not offered. */
+        return 0;
     case VIO_FEATURE_SUBGROUP_QUAD:
         /* quad_shuffle / quad_broadcast in fragment functions (Mac2 / Apple4, MSL 2.1). */
         return vio_mtl.caps.quad_group;

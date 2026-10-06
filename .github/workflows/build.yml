@@ -115,14 +115,15 @@ jobs:
               in_array("GL_KHR_shader_subgroup", $i["extensions"], true),
               $i["subgroup_stages"], $i["subgroup_features"], $i["subgroup_size"]);'
           # What lavapipe offers for the feature tests below.
-          vulkaninfo 2>/dev/null | grep -E "deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric" | sort -u || true
+          vulkaninfo 2>/dev/null | grep -E "deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics" | sort -u || true
           # Barycentrics stay optional here: lavapipe (Mesa, Vulkan 1.4.318) has no
           # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
-          export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan
+          export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_ATOMIC64=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \
-            tests/render3d/153_barycentrics_all_backends.phpt
+            tests/render3d/153_barycentrics_all_backends.phpt \
+            tests/render3d/154_atomic64_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -235,14 +236,15 @@ jobs:
               in_array("GL_KHR_shader_subgroup", $i["extensions"], true),
               $i["subgroup_stages"], $i["subgroup_features"], $i["subgroup_size"]);'
           # What lavapipe offers for the feature tests below.
-          vulkaninfo 2>/dev/null | grep -E "deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric" | sort -u || true
+          vulkaninfo 2>/dev/null | grep -E "deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics" | sort -u || true
           # Barycentrics stay optional here: lavapipe (Mesa, Vulkan 1.4.318) has no
           # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
-          export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan
+          export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_ATOMIC64=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \
-            tests/render3d/153_barycentrics_all_backends.phpt
+            tests/render3d/153_barycentrics_all_backends.phpt \
+            tests/render3d/154_atomic64_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -603,7 +605,8 @@ jobs:
             tests/render3d/148_tessellation_point_mode_isolines_all_backends.phpt `
             tests/render3d/149_subgroup_ops_all_backends.phpt `
             tests/render3d/152_subgroup_quad_all_backends.phpt `
-            tests/render3d/153_barycentrics_all_backends.phpt
+            tests/render3d/153_barycentrics_all_backends.phpt `
+            tests/render3d/154_atomic64_all_backends.phpt
 
       - name: Package binary
         shell: pwsh

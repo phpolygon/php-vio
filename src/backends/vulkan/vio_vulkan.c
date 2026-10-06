@@ -270,13 +270,14 @@ static int create_logical_device(void)
     VkExtensionProperties *ext_props = malloc(ext_count * sizeof(VkExtensionProperties));
     vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &ext_count, ext_props);
 
-    int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0, has_bary = 0;
+    int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0, has_bary = 0, has_a64 = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_fragment_shading_rate") == 0) has_vrs = 1;
         if (strcmp(ext_props[i].extensionName, "VK_EXT_shader_viewport_index_layer") == 0) has_vpl = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_fragment_shader_barycentric") == 0) has_bary = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_atomic_int64") == 0) has_a64 = 1;
     }
     free(ext_props);
     if (has_portability) device_extensions[device_ext_count++] = "VK_KHR_portability_subset";
@@ -419,6 +420,29 @@ static int create_logical_device(void)
         if (avail.textureCompressionBC) { features.textureCompressionBC = VK_TRUE; vio_vk.bc_supported = 1; }   /* Block 10c */
     }
 
+    /* 64-bit buffer atomics (GL_EXT_shader_atomic_int64): shaderInt64 plus
+     * VK_KHR_shader_atomic_int64's shaderBufferInt64Atomics (core in 1.2; vio
+     * runs a 1.1 instance, so through the extension). */
+    vio_vk.atomic64_supported = 0;
+    VkPhysicalDeviceShaderAtomicInt64FeaturesKHR a64_enable = {0};
+    a64_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES_KHR;
+    if (has_a64 && vio_vk.instance_api_11) {
+        VkPhysicalDeviceFeatures base = {0};
+        vkGetPhysicalDeviceFeatures(vio_vk.physical_device, &base);
+        VkPhysicalDeviceShaderAtomicInt64FeaturesKHR a64_avail = {0};
+        a64_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES_KHR;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &a64_avail;
+        vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+        if (base.shaderInt64 && a64_avail.shaderBufferInt64Atomics) {
+            features.shaderInt64 = VK_TRUE;
+            a64_enable.shaderBufferInt64Atomics = VK_TRUE;
+            device_extensions[device_ext_count++] = "VK_KHR_shader_atomic_int64";
+            vio_vk.atomic64_supported = 1;
+        }
+    }
+
     VkDeviceCreateInfo create_info = {0};
     create_info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     create_info.queueCreateInfoCount    = unique_count;
@@ -434,6 +458,7 @@ static int create_logical_device(void)
 #ifdef VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME
     if (vio_vk.barycentrics_supported) { bary_enable.pNext = feature_chain; feature_chain = &bary_enable; }
 #endif
+    if (vio_vk.atomic64_supported) { a64_enable.pNext = feature_chain; feature_chain = &a64_enable; }
     create_info.pNext = feature_chain;
 
     VkResult result = vkCreateDevice(vio_vk.physical_device, &create_info, NULL, &vio_vk.device);
@@ -3471,6 +3496,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_SUBGROUP:       return vio_vk.device && vio_vk.subgroup_supported; /* core 1.1 subgroup properties, compute + fragment */
         case VIO_FEATURE_SUBGROUP_QUAD:  return vio_vk.device && vio_vk.subgroup_quad_supported;
         case VIO_FEATURE_BARYCENTRICS:   return vio_vk.device && vio_vk.barycentrics_supported; /* VK_KHR_fragment_shader_barycentric */
+        case VIO_FEATURE_ATOMIC64:       return vio_vk.device && vio_vk.atomic64_supported; /* VK_KHR_shader_atomic_int64 */
         case VIO_FEATURE_HDR_OUTPUT:     return vio_vk.device && vio_vk.hdr10_capable; /* 10-bit surface format, ST 2084 via VK_EXT_swapchain_colorspace (Block 10d) */
         default: return 0;
     }

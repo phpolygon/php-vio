@@ -311,6 +311,12 @@ typedef enum _vio_feature {
      * (GL_EXT_fragment_shader_barycentric): the interpolation weights of the
      * triangle's vertices, in vertex order. D3D12: SM 6.1 + BarycentricsSupported. */
     VIO_FEATURE_BARYCENTRICS       = 47,
+    /* 64-bit integer atomics on storage-buffer elements in compute shaders
+     * (GL_EXT_shader_atomic_int64: atomicAdd / Min / Max / And / Or / Xor /
+     * Exchange / CompSwap on uint64_t / int64_t) - e.g. a visibility buffer that
+     * packs depth and ID into one atomicMax. D3D12: SM 6.6 + Int64ShaderOps.
+     * Metal: 0 (only min / max exist, and SPIRV-Cross refuses 64-bit atomics). */
+    VIO_FEATURE_ATOMIC64           = 48,
 } vio_feature;
 
 #define VIO_MAX_VIEWPORTS 16

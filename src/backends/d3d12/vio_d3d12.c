@@ -966,6 +966,7 @@ static int d3d12_init(vio_config *cfg)
     vio_d3d12.shader_model_version = 51;
     vio_d3d12.wave_ops = 0;
     vio_d3d12.barycentrics = 0;
+    vio_d3d12.int64_ops = 0;
     /* Variable rate shading capability (GAP-PHASE5 Block 12). */
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {0};
@@ -997,6 +998,7 @@ static int d3d12_init(vio_config *cfg)
             D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {0};
             if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))))
                 vio_d3d12.wave_ops = o1.WaveOps ? 1 : 0;
+            vio_d3d12.int64_ops = o1.Int64ShaderOps ? 1 : 0;
             D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {0};
             if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
                 vio_d3d12.barycentrics = o3.BarycentricsSupported ? 1 : 0;
@@ -5810,6 +5812,9 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_SUBGROUP:     return vio_d3d12.shader_model == 6 && vio_d3d12.wave_ops;
         case VIO_FEATURE_SUBGROUP_QUAD: return vio_d3d12.shader_model == 6 && vio_d3d12.wave_ops;   /* QuadReadAcross* (SM 6.0) */
         /* SV_Barycentrics: SPIRV-Cross needs an HLSL target of 6.1. */
+        /* InterlockedX64 on raw buffers (SM 6.6, mandatory there); vio_shader_reflect.c
+         * renames SPIRV-Cross's 32-bit method names for 64-bit operands. */
+        case VIO_FEATURE_ATOMIC64:     return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 66 && vio_d3d12.int64_ops;
         case VIO_FEATURE_BARYCENTRICS: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 61 && vio_d3d12.barycentrics;
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
         case VIO_FEATURE_MULTIVIEW:    return 0;

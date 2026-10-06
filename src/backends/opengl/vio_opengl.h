@@ -52,6 +52,7 @@ typedef struct _vio_opengl_state {
         int subgroup_size;               /* raw GL_SUBGROUP_SIZE_KHR */
         int has_subgroup_quad;           /* GL_KHR_shader_subgroup quad operations in the fragment stage */
         int has_barycentrics;            /* GL_EXT_fragment_shader_barycentric */
+        int has_atomic64;                /* compute + GL_ARB_gpu_shader_int64 + GL_NV_shader_atomic_int64 */
     } caps;
 
     /* Cached extension list. NULL until setup; freed in shutdown. */

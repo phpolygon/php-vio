@@ -273,6 +273,7 @@ typedef struct _vio_vulkan_state {
     int                      subgroup_supported;
     int                      subgroup_quad_supported;   /* QUAD operations in the fragment stage */
     int                      barycentrics_supported;    /* VK_KHR_fragment_shader_barycentric enabled */
+    int                      atomic64_supported;        /* shaderInt64 + shaderBufferInt64Atomics enabled */
     int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
     int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
     void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */
