@@ -116,7 +116,9 @@ jobs:
               $i["subgroup_stages"], $i["subgroup_features"], $i["subgroup_size"]);'
           # What lavapipe offers for the feature tests below.
           vulkaninfo 2>/dev/null | grep -E "deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric" | sort -u || true
-          export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_BARYCENTRICS=vulkan
+          # Barycentrics stay optional here: lavapipe (Mesa, Vulkan 1.4.318) has no
+          # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
+          export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \
@@ -234,7 +236,9 @@ jobs:
               $i["subgroup_stages"], $i["subgroup_features"], $i["subgroup_size"]);'
           # What lavapipe offers for the feature tests below.
           vulkaninfo 2>/dev/null | grep -E "deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric" | sort -u || true
-          export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_BARYCENTRICS=vulkan
+          # Barycentrics stay optional here: lavapipe (Mesa, Vulkan 1.4.318) has no
+          # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
+          export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \
