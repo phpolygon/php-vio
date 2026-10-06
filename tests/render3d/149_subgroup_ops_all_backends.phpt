@@ -15,6 +15,9 @@ vio
  * uniform, subgroupAdd within gl_SubgroupSize) and writes green where they hold.
  * Metal reports the flag wherever vio_backend_info() lists the simd_group
  * capability (Mac2 / Apple7 at MSL 2.2+); a mismatch fails.
+ * VIO_REQUIRE_SUBGROUP=vulkan,opengl (Linux CI with lavapipe + llvmpipe) turns
+ * an unavailable backend or a missing flag on the listed backends into a
+ * failure, so a green run proves those paths executed.
  * D3D12 needs Shader Model 6 (DXC) for wave intrinsics, so the context asks for
  * it (other backends ignore the option). VIO_REQUIRE_SM6=1 (Windows CI) turns
  * a missing D3D12 flag into a failure. */
@@ -49,9 +52,13 @@ $FS = "#version 450\n"
 
 function run_backend(string $name, array $opts, string $cs, int $n): string {
     global $VS, $FS;
+    $required = in_array($name, array_map('trim', explode(',', getenv('VIO_REQUIRE_SUBGROUP') ?: '')), true);
     $ctx = @vio_create($name, $opts);
-    if (!$ctx) return "skip (unavailable)";
-    if (vio_backend_name($ctx) !== $name) { vio_destroy($ctx); return "skip (unavailable)"; }
+    if (!$ctx) return $required ? "FAIL\n  VIO_REQUIRE_SUBGROUP lists $name but it is unavailable" : "skip (unavailable)";
+    if (vio_backend_name($ctx) !== $name) {
+        vio_destroy($ctx);
+        return $required ? "FAIL\n  VIO_REQUIRE_SUBGROUP lists $name but it is unavailable" : "skip (unavailable)";
+    }
     $info = vio_backend_info($ctx);
     $flag = vio_supports_feature($ctx, VIO_FEATURE_SUBGROUP);
     if ($name === 'metal' && is_array($info) && $flag !== $info['caps']['simd_group']) {
@@ -62,6 +69,7 @@ function run_backend(string $name, array $opts, string $cs, int $n): string {
         $sm = vio_swapchain_info($ctx)['shader_model'] ?? 0;
         vio_destroy($ctx);
         if ($name === 'd3d12' && getenv('VIO_REQUIRE_SM6')) return "FAIL\n  VIO_REQUIRE_SM6 set but no subgroups (shader_model $sm)";
+        if ($required) return "FAIL\n  VIO_REQUIRE_SUBGROUP lists $name but VIO_FEATURE_SUBGROUP is 0";
         return "skip (no subgroups)";
     }
     $cp = vio_compute_pipeline($ctx, ['source' => $cs]);
