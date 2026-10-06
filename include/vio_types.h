@@ -303,6 +303,14 @@ typedef enum _vio_feature {
      * D3D12 maps them onto wave intrinsics, which need Shader Model 6
      * (vio_create(['shader_model' => 6]) with DXC) and a device with WaveOps. */
     VIO_FEATURE_SUBGROUP           = 45,
+    /* Quad operations in the fragment stage (GL_KHR_shader_subgroup_quad):
+     * subgroupQuadSwapHorizontal / Vertical / Diagonal, subgroupQuadBroadcast
+     * across the 2x2 pixel quad. D3D12: SM 6 + WaveOps; Metal: quad_group. */
+    VIO_FEATURE_SUBGROUP_QUAD      = 46,
+    /* gl_BaryCoordEXT / gl_BaryCoordNoPerspEXT in the fragment stage
+     * (GL_EXT_fragment_shader_barycentric): the interpolation weights of the
+     * triangle's vertices, in vertex order. D3D12: SM 6.1 + BarycentricsSupported. */
+    VIO_FEATURE_BARYCENTRICS       = 47,
 } vio_feature;
 
 #define VIO_MAX_VIEWPORTS 16

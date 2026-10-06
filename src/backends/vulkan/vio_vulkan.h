@@ -271,6 +271,8 @@ typedef struct _vio_vulkan_state {
     /* VkPhysicalDeviceSubgroupProperties: basic / vote / ballot / arithmetic /
      * shuffle in the compute and fragment stages (VIO_FEATURE_SUBGROUP). */
     int                      subgroup_supported;
+    int                      subgroup_quad_supported;   /* QUAD operations in the fragment stage */
+    int                      barycentrics_supported;    /* VK_KHR_fragment_shader_barycentric enabled */
     int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
     int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
     void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */

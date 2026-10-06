@@ -8501,6 +8501,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_GEOMETRY_INSTANCING", VIO_FEATURE_GEOMETRY_INSTANCING, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_HLSL_STAGE_OVERRIDE", VIO_FEATURE_HLSL_STAGE_OVERRIDE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SUBGROUP", VIO_FEATURE_SUBGROUP, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SUBGROUP_QUAD", VIO_FEATURE_SUBGROUP_QUAD, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_BARYCENTRICS", VIO_FEATURE_BARYCENTRICS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
@@ -10728,6 +10730,8 @@ ZEND_FUNCTION(vio_gl_info)
     add_assoc_bool(&features, "texture_storage",         vio_gl.caps.has_texture_storage);
     add_assoc_bool(&features, "texture_swizzle",         vio_gl.caps.has_texture_swizzle);
     add_assoc_bool(&features, "subgroup",                vio_gl.caps.has_subgroup);
+    add_assoc_bool(&features, "subgroup_quad",           vio_gl.caps.has_subgroup_quad);
+    add_assoc_bool(&features, "barycentrics",            vio_gl.caps.has_barycentrics);
     add_assoc_zval(return_value, "features", &features);
     return;
 #else

@@ -261,7 +261,7 @@ static int create_logical_device(void)
     /* Device extensions: the swapchain, MoltenVK's portability subset, and
      * VK_KHR_fragment_shading_rate (+ its create_renderpass2 dependency) when the
      * device offers pipeline shading rates (Block 10c). */
-    const char *device_extensions[5];
+    const char *device_extensions[8];
     uint32_t device_ext_count = 0;
     device_extensions[device_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
 
@@ -270,12 +270,13 @@ static int create_logical_device(void)
     VkExtensionProperties *ext_props = malloc(ext_count * sizeof(VkExtensionProperties));
     vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &ext_count, ext_props);
 
-    int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0;
+    int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0, has_bary = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_fragment_shading_rate") == 0) has_vrs = 1;
         if (strcmp(ext_props[i].extensionName, "VK_EXT_shader_viewport_index_layer") == 0) has_vpl = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_fragment_shader_barycentric") == 0) has_bary = 1;
     }
     free(ext_props);
     if (has_portability) device_extensions[device_ext_count++] = "VK_KHR_portability_subset";
@@ -353,8 +354,36 @@ static int create_logical_device(void)
                 | VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
             vio_vk.subgroup_supported = (sg.supportedStages & stages) == stages
                                      && (sg.supportedOperations & ops) == ops && sg.subgroupSize > 1;
+            vio_vk.subgroup_quad_supported = (sg.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT)
+                                          && (sg.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT);
         }
     }
+
+    /* gl_BaryCoordEXT (VK_KHR_fragment_shader_barycentric). */
+    vio_vk.barycentrics_supported = 0;
+#ifdef VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME
+    VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary_enable = {0};
+    bary_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR;
+    if (has_bary && vio_vk.instance_api_11) {
+        VkPhysicalDeviceProperties dprops;
+        vkGetPhysicalDeviceProperties(vio_vk.physical_device, &dprops);
+        if (dprops.apiVersion >= VK_API_VERSION_1_1) {
+            VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary_avail = {0};
+            bary_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR;
+            VkPhysicalDeviceFeatures2 f2 = {0};
+            f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            f2.pNext = &bary_avail;
+            vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+            if (bary_avail.fragmentShaderBarycentric) {
+                bary_enable.fragmentShaderBarycentric = VK_TRUE;
+                device_extensions[device_ext_count++] = VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME;
+                vio_vk.barycentrics_supported = 1;
+            }
+        }
+    }
+#else
+    (void)has_bary;
+#endif
 
     /* Enable only what we use: anisotropic filtering when the device has it
      * (vio_texture(['anisotropy' => N]) — GAP-PLAN 2.6). */
@@ -397,9 +426,15 @@ static int create_logical_device(void)
     create_info.enabledExtensionCount   = device_ext_count;
     create_info.ppEnabledExtensionNames = device_extensions;
     create_info.pEnabledFeatures        = &features;
+    /* Feature structs of the enabled extensions, chained through pNext. */
+    void *feature_chain = NULL;
 #ifdef VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME
-    if (vio_vk.vrs_supported) create_info.pNext = &vrs_enable;
+    if (vio_vk.vrs_supported) { vrs_enable.pNext = feature_chain; feature_chain = &vrs_enable; }
 #endif
+#ifdef VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME
+    if (vio_vk.barycentrics_supported) { bary_enable.pNext = feature_chain; feature_chain = &bary_enable; }
+#endif
+    create_info.pNext = feature_chain;
 
     VkResult result = vkCreateDevice(vio_vk.physical_device, &create_info, NULL, &vio_vk.device);
     if (result != VK_SUCCESS) {
@@ -3434,6 +3469,8 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return vio_vk3d_available() && (!vio_vk.device || vio_vk.bc_supported); /* textureCompressionBC */
         case VIO_FEATURE_SHADING_RATE:   return vio_vk3d_available() && vio_vk.vrs_supported; /* VK_KHR_fragment_shading_rate, pipeline rate */
         case VIO_FEATURE_SUBGROUP:       return vio_vk.device && vio_vk.subgroup_supported; /* core 1.1 subgroup properties, compute + fragment */
+        case VIO_FEATURE_SUBGROUP_QUAD:  return vio_vk.device && vio_vk.subgroup_quad_supported;
+        case VIO_FEATURE_BARYCENTRICS:   return vio_vk.device && vio_vk.barycentrics_supported; /* VK_KHR_fragment_shader_barycentric */
         case VIO_FEATURE_HDR_OUTPUT:     return vio_vk.device && vio_vk.hdr10_capable; /* 10-bit surface format, ST 2084 via VK_EXT_swapchain_colorspace (Block 10d) */
         default: return 0;
     }

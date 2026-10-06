@@ -84,6 +84,8 @@ probe("null", [
     VIO_FEATURE_GEOMETRY_INSTANCING => 0,
     VIO_FEATURE_HLSL_STAGE_OVERRIDE => 0,
     VIO_FEATURE_SUBGROUP           => 0,
+    VIO_FEATURE_SUBGROUP_QUAD      => 0,
+    VIO_FEATURE_BARYCENTRICS       => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.

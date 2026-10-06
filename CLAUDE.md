@@ -94,6 +94,8 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/152` | Quad-Operationen im Fragment-Shader (`VIO_FEATURE_SUBGROUP_QUAD`): `subgroupQuadSwapHorizontal/Vertical/Diagonal` und `subgroupQuadBroadcast` liefern für jedes Pixel die 2×2-Nachbarn (gerade ausgerichtete Quads, unabhängig von der Zeilenrichtung); Metal folgt `quad_group` (MSL 2.1). |
+| `tests/render3d/153` | Baryzentrische Koordinaten (`VIO_FEATURE_BARYCENTRICS`): `gl_BaryCoordEXT` gleich der interpolierten Einheitsvektoren der Vertices (Vertex-Reihenfolge, zwei Dreiecke ohne geteilte Vertices); Metal folgt `barycentrics` (MSL 2.2), D3D12 braucht SM 6.1 + `BarycentricsSupported`. |
 | `tests/backends/150` | Metal-Versionsleiter: `vio_backend_info()` (MSL-Version in Benutzung und Maximum, GPU-Familien, Caps), jede Stufe bis zum OS-Maximum per `msl_version` erzwingbar, versionsgebundene Caps folgen der Stufe, Clamping (unter 2.0 → 2.0, über Maximum → Maximum, zwischen Stufen → darunter), `VIO_METAL_MSL_VERSION` greift ohne Option, Option gewinnt; `null` liefert `false`. |
 | `tests/render3d/151` | Dieselbe Szene auf jeder MSL-Stufe 2.0 … OS-Maximum: 3D-Draw mit Uniform + Textur in ein RT (Readback), Compute, emulierter GS, Tessellation (ab 2.1, darunter abgelehnt), 2D-Batch. |
 | `tests/render3d/149` | Subgroup-Operationen (`VIO_FEATURE_SUBGROUP`): Compute-Shader mit `subgroupAdd`/`subgroupBroadcastFirst`/`gl_SubgroupSize` (Ergebnisse unabhängig von der Wave-Größe konsistent) und Fragment-Shader mit `subgroupAllEqual`/`subgroupAdd`; D3D12 über SM 6 (DXC), Metal muss das Flag melden, wenn `vio_backend_info()` `simd_group` meldet (ab MSL 2.2), Vulkan/GL nach Device-Eigenschaften. |
@@ -207,6 +209,8 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Variable Rate Shading (`vio_set_shading_rate`, `VIO_SHADING_RATE_*`, `VIO_FEATURE_SHADING_RATE`) | ❌ | ❌ | ✅ (`RSSetShadingRate`, Tier 1+; 4X4 nur mit Additional Rates) | ✅ (`VK_KHR_fragment_shading_rate`, Pipeline-Rate als Dynamic State, Block 10c) | ❌ |
 | Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model' / 'shader_model_version']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Profil = höchstes 6.x, das Device **und** DXC/dxil.dll können; SPIRV-Cross übersetzt auf dasselbe Profil; Fallback FXC 5.1) | — | — |
 | Subgroups (`GL_KHR_shader_subgroup_*` in Compute + Fragment, `VIO_FEATURE_SUBGROUP`) | ✅ (`GL_KHR_shader_subgroup`, Stages/Features per `glGetIntegerv`; braucht Compute) | ❌ | ✅ (nur mit SM 6 + `OPTIONS1.WaveOps`: Wave-Intrinsics) | ✅ (`VkPhysicalDeviceSubgroupProperties`: Compute + Fragment, basic/vote/ballot/arithmetic/shuffle) | ✅ (`simd_group`: MSL 2.2, Mac2/Apple7) |
+| Quad-Ops im Fragment-Shader (`GL_KHR_shader_subgroup_quad`, `VIO_FEATURE_SUBGROUP_QUAD`) | ✅ (`GL_SUBGROUP_FEATURE_QUAD_BIT_KHR` + Fragment-Stage) | ❌ | ✅ (SM 6 + `WaveOps`, `QuadReadAcross*`) | ✅ (`VK_SUBGROUP_FEATURE_QUAD_BIT`) | ✅ (`quad_group`: MSL 2.1, Mac2/Apple4) |
+| Barycentrics (`gl_BaryCoordEXT`, `VIO_FEATURE_BARYCENTRICS`) | ✅ (`GL_EXT_fragment_shader_barycentric`) | ❌ | ✅ (SM 6.1 + `OPTIONS3.BarycentricsSupported`, `SV_Barycentrics`) | ✅ (`VK_KHR_fragment_shader_barycentric`, Feature im pNext-Chain) | ✅ (`barycentrics`: MSL 2.2) |
 | HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | ✅ (10-Bit-Surface-Format + `VK_EXT_swapchain_colorspace` HDR10 ST 2084, Block 10d) | ✅ (`CAMetalLayer` RGB10A2 im BT.2100-PQ-Farbraum, `hdr_output => 1` nur auf EDR-Displays) |
 | Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | ✅ (Dispatch-Semaphore über die Frames in Flight, 1..3) |
 | GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`) |
@@ -970,9 +974,9 @@ nutzen die Stufe: SPIRV-Cross-MSL der Grafik-Stages, Kernel der GS-Emulation, Te
 |---|---|---|---|
 | `tessellation` | 2.1 | jede (Kernel + `drawPatches`) | `VIO_FEATURE_TESSELLATION` |
 | `layered_vertex` | — | Mac2 / Apple5 | `LAYERED_RENDER`, `VERTEX_LAYER`, `MULTI_VIEWPORT` |
-| `quad_group` | 2.1 | Mac2 / Apple4 | — (Plan) |
+| `quad_group` | 2.1 | Mac2 / Apple4 | `VIO_FEATURE_SUBGROUP_QUAD` |
 | `simd_group` | 2.2 (`threads_per_simdgroup` im Fragment-Shader) | Mac2 / Apple7 | `VIO_FEATURE_SUBGROUP` |
-| `barycentrics` | 2.2 | `supportsShaderBarycentricCoordinates` | — |
+| `barycentrics` | 2.2 | `supportsShaderBarycentricCoordinates` | `VIO_FEATURE_BARYCENTRICS` |
 | `vertex_amplification` | 2.2 | `supportsVertexAmplificationCount:2` | — |
 | `argument_buffers_tier2` | — | `argumentBuffersSupport` | — |
 | `raytracing` / `function_pointers` | 2.3 | `supportsRaytracing` / `supportsFunctionPointers` | — |
@@ -993,7 +997,7 @@ nicht an `@available` im Feature-Code.
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 152 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 154 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -1201,6 +1205,9 @@ Aufrufer geändert hat:
   GLFW-Fensters; Viewport/2D-Projektion in `vio_begin` folgen dem.
 - Pipelines geben ihre Backend-Objekte im Free-Handler frei (`destroy_pipeline`; D3D12 parkt
   PSOs bis zum Fence des aufzeichnenden Frames).
+- **Vulkan headless auf macOS (MoltenVK, Retina)** rendert in doppelter Größe; `vio_read_pixels` liefert nur
+  das obere linke Viertel (bei Test 153 entdeckt; die CI fährt Vulkan nicht auf macOS). Pixel-Tests mit
+  Vulkan lokal auf dem Mac deshalb nur mit symmetrischen/positionsunabhängigen Prüfungen bewerten.
 - Vulkan auf macOS braucht `VK_DRIVER_FILES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json` + `DYLD_LIBRARY_PATH=/usr/local/lib` (SIP blockiert letzteres in Subprozessen). Auto-Auswahl vermeidet Vulkan auf macOS zugunsten von Metal.
 - VideoToolbox-Encoder kann in headless fehlschlagen → Fallback auf libx264
 - `php_vio.c` ist monolithisch (~9050 Zeilen) — alle PHP-Funktionen in einer Datei; Audit-Gate

@@ -103,9 +103,13 @@ jobs:
           export VK_DRIVER_FILES
           echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
           export VIO_REQUIRE_SUBGROUP=vulkan,opengl
+          export VIO_REQUIRE_SUBGROUP_QUAD=vulkan,opengl
+          export VIO_REQUIRE_BARYCENTRICS=vulkan
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff \
-            tests/render3d/149_subgroup_ops_all_backends.phpt
+            tests/render3d/149_subgroup_ops_all_backends.phpt \
+            tests/render3d/152_subgroup_quad_all_backends.phpt \
+            tests/render3d/153_barycentrics_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -206,9 +210,13 @@ jobs:
           export VK_DRIVER_FILES
           echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
           export VIO_REQUIRE_SUBGROUP=vulkan,opengl
+          export VIO_REQUIRE_SUBGROUP_QUAD=vulkan,opengl
+          export VIO_REQUIRE_BARYCENTRICS=vulkan
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff \
-            tests/render3d/149_subgroup_ops_all_backends.phpt
+            tests/render3d/149_subgroup_ops_all_backends.phpt \
+            tests/render3d/152_subgroup_quad_all_backends.phpt \
+            tests/render3d/153_barycentrics_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -563,7 +571,9 @@ jobs:
             tests/render3d/146_uniform_array_elements_all_backends.phpt `
             tests/render3d/147_stencil_layered_depth_only_all_backends.phpt `
             tests/render3d/148_tessellation_point_mode_isolines_all_backends.phpt `
-            tests/render3d/149_subgroup_ops_all_backends.phpt
+            tests/render3d/149_subgroup_ops_all_backends.phpt `
+            tests/render3d/152_subgroup_quad_all_backends.phpt `
+            tests/render3d/153_barycentrics_all_backends.phpt
 
       - name: Package binary
         shell: pwsh

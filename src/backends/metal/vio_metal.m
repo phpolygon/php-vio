@@ -5498,6 +5498,12 @@ static int metal_supports_feature(vio_feature f)
 #else
         return 0;
 #endif
+    case VIO_FEATURE_SUBGROUP_QUAD:
+        /* quad_shuffle / quad_broadcast in fragment functions (Mac2 / Apple4, MSL 2.1). */
+        return vio_mtl.caps.quad_group;
+    case VIO_FEATURE_BARYCENTRICS:
+        /* [[barycentric_coord]] (MSL 2.2, supportsShaderBarycentricCoordinates). */
+        return vio_mtl.caps.barycentrics;
     case VIO_FEATURE_SUBGROUP:
         /* GL_KHR_shader_subgroup_* -> SPIRV-Cross simd_* / quad_* functions
          * in compute and fragment stages (MSL 2.2+, SIMD-group reductions on
