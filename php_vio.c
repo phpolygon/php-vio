@@ -4446,7 +4446,8 @@ static int vio_texture_create_extended(vio_context_object *ctx, vio_texture_obje
 
 /* vio_texture_ktx2(ctx, bytes, options): a KTX2 container (R8 / RGBA8 / BC1 /
  * BC3 / BC4 / BC5 / BC7, 2D or 2D array, no supercompression) becomes a
- * texture with its stored mip chain. 'mip_offset' drops the N largest levels
+ * texture with its stored mip chain; six faces a VioCubemap, a depth a 3D
+ * texture (uncompressed). 'mip_offset' drops the N largest levels
  * (texture-quality tiers), 'filter' / 'wrap' / 'anisotropy' as vio_texture,
  * 'mipmaps' => true generates a chain for single-level uncompressed files. */
 ZEND_FUNCTION(vio_texture_ktx2)
@@ -4483,6 +4484,61 @@ ZEND_FUNCTION(vio_texture_ktx2)
             anisotropy = a < 1 ? 1 : (a > 16 ? 16 : a);
         }
         if ((val = zend_hash_str_find(opts, "mipmaps", sizeof("mipmaps") - 1)) != NULL) want_mipmaps = zend_is_true(val);
+    }
+    /* Six faces -> VioCubemap, a depth -> 3D VioTexture (OPEN-ITEMS-PLAN A35), both
+     * through the public constructors so every backend path stays the same.
+     * Uncompressed only (RGBA8; R8 expands to grey); the base is level
+     * 'mip_offset', further cube levels are rebuilt by 'mipmaps'. */
+    if (info.faces == 6 || info.depth > 1) {
+        int cube = info.faces == 6;
+        if (info.vio_format != VIO_FORMAT_RGBA8 && info.vio_format != VIO_FORMAT_R8) {
+            php_error_docref(NULL, E_WARNING, "vio_texture_ktx2: %s KTX2 files must be RGBA8 or R8 (block-compressed %s are not supported)",
+                             cube ? "cubemap" : "3D", cube ? "cubemaps" : "volumes");
+            RETURN_FALSE;
+        }
+        int lvl = (int)(mip_offset < 0 ? 0 : (mip_offset > info.levels - 1 ? info.levels - 1 : mip_offset));
+        int lw = info.width, lh = info.height, ld = info.depth;
+        for (int l = 0; l < lvl; l++) { lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1; ld = ld > 1 ? ld / 2 : 1; }
+        size_t texels = (size_t)lw * (size_t)lh * (size_t)(cube ? 6 : ld);
+        const uint8_t *src = (const uint8_t *)ZSTR_VAL(bytes) + info.level_offset[lvl];
+        zend_string *rgba = zend_string_alloc(texels * 4, 0);
+        uint8_t *dst = (uint8_t *)ZSTR_VAL(rgba);
+        if (info.vio_format == VIO_FORMAT_R8) {
+            for (size_t i = 0; i < texels; i++) { dst[i * 4] = dst[i * 4 + 1] = dst[i * 4 + 2] = src[i]; dst[i * 4 + 3] = 255; }
+        } else {
+            memcpy(dst, src, texels * 4);
+        }
+        ZSTR_VAL(rgba)[texels * 4] = '\0';
+        zval cfg, fn, args[2];
+        array_init(&cfg);
+        if (cube) {
+            zval faces;
+            size_t face_bytes = (size_t)lw * (size_t)lh * 4;
+            array_init(&faces);
+            for (int f = 0; f < 6; f++) add_next_index_stringl(&faces, ZSTR_VAL(rgba) + (size_t)f * face_bytes, face_bytes);
+            add_assoc_zval(&cfg, "faces", &faces);
+            add_assoc_long(&cfg, "width", lw);
+            add_assoc_long(&cfg, "height", lh);
+            add_assoc_bool(&cfg, "mipmaps", want_mipmaps || info.levels - lvl > 1);
+            ZVAL_STRING(&fn, "vio_cubemap");
+        } else {
+            add_assoc_str(&cfg, "data", zend_string_copy(rgba));
+            add_assoc_long(&cfg, "width", lw);
+            add_assoc_long(&cfg, "height", lh);
+            add_assoc_long(&cfg, "depth", ld);
+            add_assoc_long(&cfg, "filter", filter);
+            add_assoc_long(&cfg, "wrap", wrap);
+            add_assoc_long(&cfg, "anisotropy", anisotropy);
+            ZVAL_STRING(&fn, "vio_texture_3d");
+        }
+        zend_string_release(rgba);
+        ZVAL_COPY(&args[0], ctx_zval);
+        ZVAL_COPY_VALUE(&args[1], &cfg);
+        if (call_user_function(NULL, NULL, &fn, return_value, 2, args) != SUCCESS) RETVAL_FALSE;
+        zval_ptr_dtor(&fn);
+        zval_ptr_dtor(&args[0]);
+        zval_ptr_dtor(&cfg);
+        return;
     }
     uint8_t *data = NULL;
     size_t data_len = 0;
@@ -12184,6 +12240,11 @@ ZEND_FUNCTION(vio_cubemap)
     /* Every backend with an upload_cubemap slot (OpenGL, Metal, D3D11, D3D12). */
     int cm_is_metal = strcmp(ctx->backend->name, "metal") == 0;
     if (ctx->backend->upload_cubemap) {
+        /* 'faces' entries are file paths, or raw RGBA8 strings of
+         * 'width' x 'height' x 4 bytes when both keys are given. */
+        zval *raw_w_zv = zend_hash_str_find(config_ht, "width", sizeof("width") - 1);
+        zval *raw_h_zv = zend_hash_str_find(config_ht, "height", sizeof("height") - 1);
+        zend_long raw_w = raw_w_zv ? zval_get_long(raw_w_zv) : 0, raw_h = raw_h_zv ? zval_get_long(raw_h_zv) : 0;
 
         /* Marshal source data: 6 RGBA8 buffers of (face_w, face_h). The
          * vtable assumes uniform face dimensions — file-based loads use
@@ -12207,6 +12268,12 @@ ZEND_FUNCTION(vio_cubemap)
                     php_error_docref(NULL, E_WARNING, "cubemap face %d must be a string path", face_idx);
                     ok = 0;
                     break;
+                }
+                if (raw_w > 0 && raw_h > 0 && Z_STRLEN_P(face_path) == (size_t)raw_w * (size_t)raw_h * 4) {
+                    if (face_idx == 0) { face_w = (int)raw_w; face_h = (int)raw_h; cm->resolution = (int)raw_w; }
+                    faces[face_idx] = Z_STRVAL_P(face_path);
+                    face_idx++;
+                    continue;
                 }
                 int w, h, ch;
                 unsigned char *data = stbi_load(Z_STRVAL_P(face_path), &w, &h, &ch, 4);

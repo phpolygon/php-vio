@@ -930,9 +930,12 @@ function vio_texture_3d(VioContext $context, array $config): VioTexture|false {}
  *                            'filter' (default VIO_FILTER_LINEAR), 'wrap' (default VIO_WRAP_REPEAT),
  *                            'anisotropy' (1..16), 'mipmaps' (bool: generate a chain for a
  *                            single-level uncompressed file)
- * @return VioTexture|false false (with a warning) for unsupported containers or formats
+ * A cubemap file (faceCount 6) returns a VioCubemap, a 3D file (pixelDepth > 1) a 3D
+ * VioTexture - both uncompressed (RGBA8, R8 expands to grey), base = level 'mip_offset';
+ * a cube with more levels gets its chain rebuilt.
+ * @return VioTexture|VioCubemap|false false (with a warning) for unsupported containers or formats
  */
-function vio_texture_ktx2(VioContext $context, string $bytes, ?array $options = null): VioTexture|false {}
+function vio_texture_ktx2(VioContext $context, string $bytes, ?array $options = null): VioTexture|VioCubemap|false {}
 
 /**
  * Bind a texture to a texture slot.

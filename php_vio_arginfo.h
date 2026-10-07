@@ -376,7 +376,7 @@ ZEND_END_ARG_INFO()
 
 #define arginfo_vio_texture_3d arginfo_vio_texture
 
-ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_texture_ktx2, 0, 2, VioTexture, MAY_BE_FALSE)
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_texture_ktx2, 0, 2, VioTexture|VioCubemap, MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, bytes, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 1, "null")

@@ -56,8 +56,11 @@ int vio_ktx2_parse(const uint8_t *b, size_t len, vio_ktx2_info *out, char *err, 
     uint32_t supercomp    = rd32(b + 44);
 
     if (supercomp != 0) return fail(err, err_len, "supercompressed KTX2 (Basis / zstd) is not supported - decode offline");
-    if (face_count != 1) return fail(err, err_len, "cubemap KTX2 files are not supported here (use vio_cubemap)");
-    if (depth > 1) return fail(err, err_len, "3D KTX2 textures are not supported here (use vio_texture_3d)");
+    if (face_count != 1 && face_count != 6) return fail(err, err_len, "faceCount must be 1 or 6");
+    if (face_count == 6 && (width != height || layer_count > 1 || depth > 1))
+        return fail(err, err_len, "a KTX2 cubemap must be square, without array layers or depth");
+    if (depth > 1 && layer_count > 1) return fail(err, err_len, "3D KTX2 texture arrays are not supported");
+    if (depth > 2048) return fail(err, err_len, "invalid KTX2 depth");
     if (width == 0 || height == 0 || width > 16384 || height > 16384) return fail(err, err_len, "invalid KTX2 dimensions");
     int fmt = vio_ktx2_format(vk_format);
     if (fmt < 0) {
@@ -73,19 +76,23 @@ int vio_ktx2_parse(const uint8_t *b, size_t len, vio_ktx2_info *out, char *err, 
     /* Level index follows the 80-byte header + index section. */
     size_t need_index = 80 + (size_t)levels * 24;
     if (len < need_index) return fail(err, err_len, "truncated KTX2 level index");
-    int lw = (int)width, lh = (int)height;
+    int lw = (int)width, lh = (int)height, ld = depth > 1 ? (int)depth : 1;
     for (int l = 0; l < levels; l++) {
         const uint8_t *e = b + 80 + (size_t)l * 24;
         uint64_t off = rd64(e), length = rd64(e + 8);
-        uint64_t want = (uint64_t)vio_texfmt_image_size(fmt, lw, lh) * (uint64_t)layers;
+        /* A level holds layers x faces x depth slices of the image. */
+        uint64_t want = (uint64_t)vio_texfmt_image_size(fmt, lw, lh) * (uint64_t)layers * (uint64_t)face_count * (uint64_t)ld;
         if (off > len || length > len - off) return fail(err, err_len, "KTX2 level data outside the file");
         if (length < want) return fail(err, err_len, "KTX2 level shorter than its image size");
         out->level_offset[l] = off;
         out->level_length[l] = want;   /* what we copy; trailing padding is ignored */
         lw = lw > 1 ? lw / 2 : 1;
         lh = lh > 1 ? lh / 2 : 1;
+        ld = ld > 1 ? ld / 2 : 1;
     }
 
+    out->faces  = (int)face_count;
+    out->depth  = depth > 1 ? (int)depth : 1;
     out->vk_format  = vk_format;
     out->vio_format = fmt;
     out->width  = (int)width;
