@@ -320,6 +320,20 @@ static char *vk3d_gs_fixup(const char *glsl)
  * stage (input locations follow their outputs' names); `is_last` marks the
  * stage that carries the clip-space fixup. Both are part of the cache key: the
  * same vertex SPIR-V compiles differently with and without a geometry stage. */
+/* SPIRV-Cross emits ray queries only for GLSL 460. */
+static int vk3d_uses_ray_query(const uint32_t *spirv, size_t spirv_bytes)
+{
+    size_t n = spirv_bytes / 4;
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = spirv[i] >> 16, op = spirv[i] & 0xFFFF;
+        if (wc == 0) break;
+        if (op == 17 /* OpCapability */ && i + 1 < n && spirv[i + 1] == 4472 /* RayQueryKHR */) return 1;
+        if (op != 17 && op != 11 && op != 14 && op != 15 && op != 16 && op != 10) break;
+        i += wc;
+    }
+    return 0;
+}
+
 static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage_id, int is_last,
                             vio_vk3d_shader *sh, vk3d_varyings *vt_in, vk3d_varyings *vt_out,
                             vk3d_stage_samplers *smp, uint64_t upstream, size_t *out_bytes)
@@ -357,7 +371,8 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
 
     spvc_compiler_options opts = NULL;
     spvc_compiler_create_compiler_options(c, &opts);
-    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_GLSL_VERSION, 450);
+    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_GLSL_VERSION,
+                                   vk3d_uses_ray_query(spirv, spirv_bytes) ? 460 : 450);
     spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_GLSL_ES, SPVC_FALSE);
     spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_GLSL_VULKAN_SEMANTICS, SPVC_TRUE);
     spvc_compiler_install_compiler_options(c, opts);
