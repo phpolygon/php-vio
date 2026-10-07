@@ -4,6 +4,7 @@
 
 #include "vio_backend_registry.h"
 #include <string.h>
+#include <stdio.h>
 
 static const vio_backend *backends[VIO_MAX_BACKENDS];
 static int backend_count = 0;
@@ -143,6 +144,131 @@ const vio_backend *vio_get_auto_backend_skip(const vio_backend **skip, int skip_
     }
 
     return NULL;
+}
+
+/* ── Scoring for 'auto' with prefer / require (OPEN-ITEMS-PLAN A7) ──────
+ *
+ * score = vendor profile (200 per rank step) + device type (discrete +60,
+ * integrated +30, software -1000: WARP / llvmpipe / lavapipe only as the last
+ * resort) + feature points weighted by `prefer` (compat: none). The profile
+ * follows the vendor of the best hardware adapter on the machine. */
+static const char *const vio_prof_nvidia[]       = { "d3d12", "vulkan", "d3d11", "opengl", NULL };
+static const char *const vio_prof_amd[]          = { "vulkan", "d3d12", "d3d11", "opengl", NULL };
+static const char *const vio_prof_intel_old[]    = { "d3d11", "d3d12", "vulkan", "opengl", NULL };
+static const char *const vio_prof_windows[]      = { "d3d12", "d3d11", "vulkan", "opengl", NULL };
+static const char *const vio_prof_win_compat[]   = { "d3d11", "opengl", "d3d12", "vulkan", NULL };
+static const char *const vio_prof_macos[]        = { "metal", "opengl", "vulkan", NULL };
+static const char *const vio_prof_linux[]        = { "vulkan", "opengl", NULL };
+static const char *const vio_prof_linux_compat[] = { "opengl", "vulkan", NULL };
+
+int vio_select_host_platform(void)
+{
+#ifdef __APPLE__
+    return VIO_PLATFORM_MACOS;
+#elif defined(_WIN32)
+    return VIO_PLATFORM_WINDOWS;
+#else
+    return VIO_PLATFORM_LINUX;
+#endif
+}
+
+static const char *const *vio_select_profile(int platform, int prefer, const vio_adapter_info *sys)
+{
+    if (platform == VIO_PLATFORM_MACOS) return vio_prof_macos;
+    if (platform == VIO_PLATFORM_LINUX) return prefer == VIO_PREFER_COMPAT ? vio_prof_linux_compat : vio_prof_linux;
+    if (prefer == VIO_PREFER_COMPAT) return vio_prof_win_compat;
+    if (sys) {
+        switch (sys->vendor_id) {
+        case 0x10DE: return vio_prof_nvidia;
+        case 0x1002: case 0x1022: return vio_prof_amd;
+        /* Intel: Arc / Xe (mesh shaders) like NVIDIA, older iGPUs run D3D11 best. */
+        case 0x8086: return (sys->features & VIO_FEATURE_BIT(VIO_FEATURE_MESH_SHADER)) ? vio_prof_nvidia : vio_prof_intel_old;
+        default: break;
+        }
+    }
+    return vio_prof_windows;
+}
+
+static int vio_select_weight(int prefer, int f)
+{
+    if (prefer == VIO_PREFER_COMPAT) return 0;
+    if (prefer == VIO_PREFER_QUALITY) {
+        switch (f) {
+        case VIO_FEATURE_RAY_QUERY:          return 15;
+        case VIO_FEATURE_MESH_SHADER:        return 15;
+        case VIO_FEATURE_RAYTRACING:         return 10;
+        case VIO_FEATURE_SHADING_RATE:       return 10;
+        case VIO_FEATURE_BINDLESS:           return 10;
+        case VIO_FEATURE_SHADING_RATE_IMAGE: return 5;
+        default:                             return 1;
+        }
+    }
+    switch (f) {
+    case VIO_FEATURE_SUBGROUP:      return 15;
+    case VIO_FEATURE_BINDLESS:      return 15;
+    case VIO_FEATURE_INDIRECT_DRAW: return 10;
+    case VIO_FEATURE_MULTIVIEW:     return 5;
+    default:                        return 1;
+    }
+}
+
+static int vio_select_type_rank(const char *t)
+{
+    if (!t) return 2;
+    if (strcmp(t, "discrete") == 0) return 0;
+    if (strcmp(t, "integrated") == 0) return 1;
+    if (strcmp(t, "software") == 0) return 3;
+    return 2;
+}
+
+void vio_select_rank(vio_select_candidate *c, int n, int platform, int prefer, uint64_t require)
+{
+    const vio_adapter_info *sys = NULL;
+    int sys_rank = 3;
+    for (int i = 0; i < n; i++) {
+        if (!c[i].has_adapter) continue;
+        int r = vio_select_type_rank(c[i].adapter.device_type);
+        if (r < sys_rank) { sys_rank = r; sys = &c[i].adapter; }
+    }
+    const char *const *prof = vio_select_profile(platform, prefer, sys);
+    int plen = 0;
+    while (prof[plen]) plen++;
+    for (int i = 0; i < n; i++) {
+        vio_select_candidate *k = &c[i];
+        int s = 0;
+        for (int p = 0; p < plen; p++) {
+            if (strcmp(prof[p], k->backend) == 0) { s += (plen - p) * 200; break; }
+        }
+        if (k->has_adapter) {
+            int r = vio_select_type_rank(k->adapter.device_type);
+            s += r == 0 ? 60 : r == 1 ? 30 : r == 3 ? -1000 : 0;
+            if (!(k->adapter.features & VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE))) s -= 500;
+            for (int f = 0; f < 64; f++)
+                if (k->adapter.features & VIO_FEATURE_BIT(f)) s += vio_select_weight(prefer, f);
+        }
+        k->score = s;
+        k->eligible = 1;
+        k->reason[0] = '\0';
+        /* Unknown before a context (no adapter info): vio_create checks the
+         * flags once the device is open. */
+        for (int f = 0; f < 64 && k->has_adapter; f++) {
+            if (!(require & VIO_FEATURE_BIT(f)) || (k->adapter.features & VIO_FEATURE_BIT(f))) continue;
+            if (k->be && k->be->supports_feature && k->be->supports_feature((vio_feature)f)) continue;
+            k->eligible = 0;
+            snprintf(k->reason, sizeof(k->reason), "feature %d not supported", f);
+            break;
+        }
+    }
+    /* Stable insertion sort: eligible first, then the higher score. */
+    for (int i = 1; i < n; i++) {
+        vio_select_candidate tmp = c[i];
+        int j = i - 1;
+        while (j >= 0 && (c[j].eligible < tmp.eligible || (c[j].eligible == tmp.eligible && c[j].score < tmp.score))) {
+            c[j + 1] = c[j];
+            j--;
+        }
+        c[j + 1] = tmp;
+    }
 }
 
 int vio_backend_count(void)

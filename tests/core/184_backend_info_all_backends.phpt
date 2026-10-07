@@ -9,7 +9,7 @@ vio
 $vendors = [0x10DE => 'NVIDIA', 0x1002 => 'AMD', 0x8086 => 'Intel', 0x106B => 'Apple', 0x1414 => 'Microsoft',
             0x13B5 => 'ARM', 0x5143 => 'Qualcomm', 0x10005 => 'Mesa', 0 => 'unknown'];
 $keys = ['backend', 'api', 'device', 'shading_language', 'shading_language_version', 'shading_language_max',
-         'families', 'caps', 'vendor_id', 'vendor', 'driver', 'device_type', 'vram_bytes'];
+         'families', 'caps', 'vendor_id', 'vendor', 'driver', 'device_type', 'vram_bytes', 'selected_by', 'candidates'];
 
 foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
     $ctx = @vio_create($b, ['width' => 16, 'height' => 16, 'headless' => true, 'vsync' => false]);

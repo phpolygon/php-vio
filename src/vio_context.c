@@ -27,6 +27,8 @@ static zend_object *vio_context_create_object(zend_class_entry *ce)
     ctx->saved_win_x = ctx->saved_win_y = 0;
     ctx->saved_win_w = ctx->saved_win_h = 0;
     ctx->has_saved_win_geometry = 0;
+    ctx->selected_by = NULL;
+    ctx->candidates = NULL;
 
     zend_object_std_init(&ctx->std, ce);
     object_properties_init(&ctx->std, ce);
@@ -56,6 +58,10 @@ static void vio_context_free_object(zend_object *obj)
 
     /* The table's textures free their GPU objects through the backend: before it shuts down. */
     vio_context_bindless_clear(ctx);
+    if (ctx->candidates) {
+        if (GC_DELREF(ctx->candidates) == 0) zend_array_destroy(ctx->candidates);
+        ctx->candidates = NULL;
+    }
     for (int i = 0; i < VIO_MAX_UBO_BINDINGS; i++) {
         if (ctx->bound_ubo[i]) { OBJ_RELEASE(ctx->bound_ubo[i]); ctx->bound_ubo[i] = NULL; }
     }

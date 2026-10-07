@@ -60,6 +60,10 @@ ZEND_TSRMLS_CACHE_DEFINE()
 
 #include <string.h>
 #include <stdlib.h>
+#include "ext/json/php_json.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #ifdef HAVE_GLFW
 #include <glad/glad.h>
@@ -101,6 +105,188 @@ PHP_INI_END()
 
 /* ── PHP function implementations ─────────────────────────────────── */
 
+/* ── Backend scoring for 'auto' (OPEN-ITEMS-PLAN A7) ────────────────── */
+
+/* 1 = 'prefer' / 'require' given (scored 'auto'), 0 = plain 'auto', -1 = bad option (warned). */
+static int vio_select_options(HashTable *opts, int *prefer, uint64_t *require)
+{
+    zval *v;
+    int scored = 0;
+    *prefer = VIO_PREFER_PERFORMANCE;
+    *require = 0;
+    if (!opts) return 0;
+    if ((v = zend_hash_str_find(opts, "prefer", sizeof("prefer") - 1)) != NULL) {
+        scored = 1;
+        if (Z_TYPE_P(v) == IS_STRING && strcmp(Z_STRVAL_P(v), "performance") == 0) *prefer = VIO_PREFER_PERFORMANCE;
+        else if (Z_TYPE_P(v) == IS_STRING && strcmp(Z_STRVAL_P(v), "quality") == 0) *prefer = VIO_PREFER_QUALITY;
+        else if (Z_TYPE_P(v) == IS_STRING && strcmp(Z_STRVAL_P(v), "compat") == 0) *prefer = VIO_PREFER_COMPAT;
+        else {
+            php_error_docref(NULL, E_WARNING, "'prefer' must be one of performance, quality, compat");
+            return -1;
+        }
+    }
+    if ((v = zend_hash_str_find(opts, "require", sizeof("require") - 1)) != NULL) {
+        zval *f;
+        scored = 1;
+        if (Z_TYPE_P(v) != IS_ARRAY) {
+            php_error_docref(NULL, E_WARNING, "'require' must be an array of VIO_FEATURE_* constants");
+            return -1;
+        }
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(v), f) {
+            zend_long x = zval_get_long(f);
+            if (x < 0 || x > 63) {
+                php_error_docref(NULL, E_WARNING, "'require' must be an array of VIO_FEATURE_* constants");
+                return -1;
+            }
+            *require |= VIO_FEATURE_BIT(x);
+        } ZEND_HASH_FOREACH_END();
+    }
+    return scored;
+}
+
+/* Test hook: the variable is read at call time (putenv in the same process works). */
+static int vio_select_env(const char *name, char *buf, size_t size)
+{
+#ifdef _WIN32
+    DWORD n = GetEnvironmentVariableA(name, buf, (DWORD)size);
+    return n > 0 && n < size;
+#else
+    const char *v = getenv(name);
+    if (!v || !*v || strlen(v) >= size) return 0;
+    memcpy(buf, v, strlen(v) + 1);
+    return 1;
+#endif
+}
+
+static void vio_select_adapter_from_zval(vio_adapter_info *a, zval *z)
+{
+    zval *v;
+    memset(a, 0, sizeof(*a));
+    if (Z_TYPE_P(z) != IS_ARRAY) return;
+    if ((v = zend_hash_str_find(Z_ARRVAL_P(z), "name", 4)) && Z_TYPE_P(v) == IS_STRING)
+        snprintf(a->name, sizeof(a->name), "%s", Z_STRVAL_P(v));
+    if ((v = zend_hash_str_find(Z_ARRVAL_P(z), "vendor_id", 9))) a->vendor_id = (uint32_t)zval_get_long(v);
+    if ((v = zend_hash_str_find(Z_ARRVAL_P(z), "vram_bytes", 10))) a->vram_bytes = (uint64_t)zval_get_long(v);
+    if ((v = zend_hash_str_find(Z_ARRVAL_P(z), "device_type", 11)) && Z_TYPE_P(v) == IS_STRING) {
+        if (strcmp(Z_STRVAL_P(v), "discrete") == 0) a->device_type = "discrete";
+        else if (strcmp(Z_STRVAL_P(v), "integrated") == 0) a->device_type = "integrated";
+        else if (strcmp(Z_STRVAL_P(v), "software") == 0) a->device_type = "software";
+    }
+    if ((v = zend_hash_str_find(Z_ARRVAL_P(z), "features", 8)) && Z_TYPE_P(v) == IS_ARRAY) {
+        zval *f;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(v), f) {
+            zend_long x = zval_get_long(f);
+            if (x >= 0 && x < 64) a->features |= VIO_FEATURE_BIT(x);
+        } ZEND_HASH_FOREACH_END();
+    }
+}
+
+/* One candidate per backend with its preferred adapter: from the backends, or
+ * simulated from VIO_TEST_ADAPTERS = {"platform": "windows"|"macos"|"linux",
+ * "adapters": {"<backend>": [{name, vendor_id, device_type, vram_bytes,
+ * features}], ...}} so the ranking is testable without the GPUs. */
+static int vio_select_collect(vio_select_candidate *c, int max, int *platform)
+{
+    char *env = (char *)emalloc(65536);
+    int n = 0;
+    *platform = vio_select_host_platform();
+    if (vio_select_env("VIO_TEST_ADAPTERS", env, 65536)) {
+        zval root;
+        if (php_json_decode_ex(&root, env, strlen(env), PHP_JSON_OBJECT_AS_ARRAY, 16) == SUCCESS) {
+            if (Z_TYPE(root) == IS_ARRAY) {
+                zval *pv = zend_hash_str_find(Z_ARRVAL(root), "platform", 8), *ad, *list;
+                zend_string *key;
+                if (pv && Z_TYPE_P(pv) == IS_STRING) {
+                    if (strcmp(Z_STRVAL_P(pv), "windows") == 0) *platform = VIO_PLATFORM_WINDOWS;
+                    else if (strcmp(Z_STRVAL_P(pv), "macos") == 0) *platform = VIO_PLATFORM_MACOS;
+                    else if (strcmp(Z_STRVAL_P(pv), "linux") == 0) *platform = VIO_PLATFORM_LINUX;
+                }
+                ad = zend_hash_str_find(Z_ARRVAL(root), "adapters", 8);
+                if (ad && Z_TYPE_P(ad) == IS_ARRAY) {
+                    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(ad), key, list) {
+                        if (!key || n >= max) continue;
+                        vio_select_candidate *k = &c[n++];
+                        memset(k, 0, sizeof(*k));
+                        snprintf(k->backend, sizeof(k->backend), "%s", ZSTR_VAL(key));
+                        k->be = vio_find_backend(k->backend);
+                        zval *first = Z_TYPE_P(list) == IS_ARRAY ? zend_hash_index_find(Z_ARRVAL_P(list), 0) : NULL;
+                        if (first) {
+                            vio_select_adapter_from_zval(&k->adapter, first);
+                            k->has_adapter = 1;
+                        }
+                    } ZEND_HASH_FOREACH_END();
+                }
+            }
+            zval_ptr_dtor(&root);
+        }
+    } else {
+        vio_adapter_info *list = (vio_adapter_info *)ecalloc(VIO_MAX_ADAPTERS, sizeof(vio_adapter_info));
+        for (int b = 0; b < vio_backend_count() && n < max; b++) {
+            const char *name = vio_get_backend_name(b);
+            const vio_backend *be = name ? vio_find_backend(name) : NULL;
+            if (!be || strcmp(name, "null") == 0) continue;
+            vio_select_candidate *k = &c[n++];
+            memset(k, 0, sizeof(*k));
+            snprintf(k->backend, sizeof(k->backend), "%s", name);
+            k->be = be;
+            if (be->enumerate_adapters && be->enumerate_adapters(list, VIO_MAX_ADAPTERS) > 0) {
+                k->adapter = list[0];
+                k->has_adapter = 1;
+            }
+        }
+        efree(list);
+    }
+    efree(env);
+    return n;
+}
+
+static const vio_backend *vio_select_next(const vio_select_candidate *c, int n, const vio_backend **tried, int tried_n)
+{
+    for (int i = 0; i < n; i++) {
+        int seen = 0;
+        if (!c[i].eligible || !c[i].be) continue;
+        for (int t = 0; t < tried_n; t++) if (tried[t] == c[i].be) seen = 1;
+        if (!seen) return c[i].be;
+    }
+    return NULL;
+}
+
+static void vio_select_to_zval(zval *out, const vio_select_candidate *c, int n)
+{
+    array_init(out);
+    for (int i = 0; i < n; i++) {
+        zval e;
+        array_init(&e);
+        add_assoc_string(&e, "backend", (char *)c[i].backend);
+        if (c[i].has_adapter) add_assoc_string(&e, "adapter", (char *)c[i].adapter.name);
+        else add_assoc_null(&e, "adapter");
+        add_assoc_string(&e, "vendor", (char *)vio_vendor_name(c[i].has_adapter ? c[i].adapter.vendor_id : 0));
+        add_assoc_string(&e, "device_type", (char *)(c[i].has_adapter && c[i].adapter.device_type ? c[i].adapter.device_type : "unknown"));
+        add_assoc_long(&e, "score", c[i].score);
+        add_assoc_bool(&e, "eligible", c[i].eligible);
+        if (c[i].reason[0]) add_assoc_string(&e, "reason", (char *)c[i].reason);
+        else add_assoc_null(&e, "reason");
+        add_next_index_zval(out, &e);
+    }
+}
+
+/* vio_rank_backends(array $options = []): the ranking a scored 'auto' would use. */
+ZEND_FUNCTION(vio_rank_backends)
+{
+    HashTable *opts = NULL;
+    int prefer, platform;
+    uint64_t require;
+    vio_select_candidate rank[VIO_MAX_BACKENDS];
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+    if (vio_select_options(opts, &prefer, &require) < 0) RETURN_FALSE;
+    int n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
+    vio_select_rank(rank, n, platform, prefer, require);
+    vio_select_to_zval(return_value, rank, n);
+}
+
 /* vio_create('auto') (GAP-PHASE5 Block 10c): a registered backend that cannot open a
  * device on this machine (a Vulkan loader without a driver, ...) hands over to the
  * next candidate instead of failing the whole call. While another candidate remains,
@@ -124,16 +310,33 @@ ZEND_FUNCTION(vio_create)
     const vio_backend *tried[8];
     int tried_n = 0;
 
+    /* 'prefer' / 'require' turn 'auto' into a ranking (A7); plain 'auto' keeps
+     * the platform priority list. */
+    int select_prefer = VIO_PREFER_PERFORMANCE, rank_n = 0;
+    uint64_t select_require = 0;
+    vio_select_candidate rank[VIO_MAX_BACKENDS];
+    int scored = auto_pick ? vio_select_options(options_ht, &select_prefer, &select_require) : 0;
+    if (scored < 0) RETURN_FALSE;
+    if (scored) {
+        int platform;
+        rank_n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
+        vio_select_rank(rank, rank_n, platform, select_prefer, select_require);
+    }
+
     /* Find backend */
     const vio_backend *backend;
 pick_backend:
     if (auto_pick) {
-        backend = vio_get_auto_backend_skip(tried, tried_n);
+        backend = scored ? vio_select_next(rank, rank_n, tried, tried_n) : vio_get_auto_backend_skip(tried, tried_n);
     } else {
         backend = vio_find_backend(backend_name);
     }
 
     if (!backend) {
+        if (scored) {
+            php_error_docref(NULL, E_WARNING, "'auto': no backend provides the required features or opens a device");
+            RETURN_FALSE;
+        }
         if (backend_name && strcmp(backend_name, "auto") != 0) {
             php_error_docref(NULL, E_WARNING, "Backend \"%s\" is not available", backend_name);
         } else {
@@ -146,7 +349,7 @@ pick_backend:
     int vio_saved_er = (int)EG(error_reporting);
     if (auto_pick && tried_n < 8) {
         tried[tried_n] = backend;
-        if (vio_get_auto_backend_skip(tried, tried_n + 1) != NULL) {
+        if ((scored ? vio_select_next(rank, rank_n, tried, tried_n + 1) : vio_get_auto_backend_skip(tried, tried_n + 1)) != NULL) {
             vio_quiet = 1;
             EG(error_reporting) &= ~(E_WARNING | E_NOTICE);
         }
@@ -384,6 +587,21 @@ pick_backend:
 #endif
 
     ctx->initialized = 1;
+    /* A required feature the ranking could not see before the device opened
+     * (OpenGL, shader-toolchain flags): next candidate. */
+    for (int f = 0; scored && f < 64; f++) {
+        if ((select_require & VIO_FEATURE_BIT(f))
+            && !(ctx->backend->supports_feature && ctx->backend->supports_feature((vio_feature)f))) {
+            zval_ptr_dtor(&obj);
+            VIO_CREATE_FAIL();
+        }
+    }
+    ctx->selected_by = !auto_pick ? "explicit" : (scored ? "score" : "priority");
+    if (scored) {
+        zval cand;
+        vio_select_to_zval(&cand, rank, rank_n);
+        ctx->candidates = Z_ARR(cand);
+    }
     RETURN_COPY_VALUE(&obj);
 }
 
@@ -8537,6 +8755,11 @@ ZEND_FUNCTION(vio_backend_info)
     add_assoc_string(return_value, "driver", (char *)(d.driver ? d.driver : ""));
     add_assoc_string(return_value, "device_type", (char *)(d.device_type ? d.device_type : "unknown"));
     add_assoc_long(return_value, "vram_bytes", (zend_long)d.vram_bytes);
+    add_assoc_string(return_value, "selected_by", (char *)(ctx->selected_by ? ctx->selected_by : "explicit"));
+    zval cand;
+    if (ctx->candidates) ZVAL_ARR(&cand, zend_array_dup(ctx->candidates));
+    else array_init(&cand);
+    add_assoc_zval(return_value, "candidates", &cand);
 }
 
 /* vio_adapters(?string $backend = null): ['<backend>' => [adapter, ...], ...]

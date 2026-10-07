@@ -244,6 +244,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_backend_info, 0, 1, MAY_BE_A
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_rank_backends, 0, 0, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_adapters, 0, 0, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, backend, IS_STRING, 1, "null")
 ZEND_END_ARG_INFO()
@@ -1026,6 +1030,7 @@ ZEND_FUNCTION(vio_shader_cache_stats);
 ZEND_FUNCTION(vio_swapchain_info);
 ZEND_FUNCTION(vio_backend_info);
 ZEND_FUNCTION(vio_adapters);
+ZEND_FUNCTION(vio_rank_backends);
 ZEND_FUNCTION(vio_texture_index);
 ZEND_FUNCTION(vio_texture_release_index);
 ZEND_FUNCTION(vio_sampler_feedback_bind);
@@ -1214,6 +1219,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_swapchain_info, arginfo_vio_swapchain_info)
 	ZEND_FE(vio_backend_info, arginfo_vio_backend_info)
 	ZEND_FE(vio_adapters, arginfo_vio_adapters)
+	ZEND_FE(vio_rank_backends, arginfo_vio_rank_backends)
 	ZEND_FE(vio_texture_index, arginfo_vio_texture_index)
 	ZEND_FE(vio_texture_release_index, arginfo_vio_texture_release_index)
 	ZEND_FE(vio_sampler_feedback_bind, arginfo_vio_sampler_feedback_bind)

@@ -69,6 +69,10 @@ typedef struct _vio_context_object {
     int               *bindless_free;
     int                bindless_free_count;
     unsigned int       frame_no;   /* vio_begin calls on this context */
+    /* vio_backend_info: how vio_create chose the backend ("explicit", "priority",
+     * "score") and the ranked candidates of a scored 'auto' (NULL otherwise). */
+    const char        *selected_by;
+    zend_array        *candidates;
     zend_object        std;
 } vio_context_object;
 

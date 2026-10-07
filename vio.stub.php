@@ -410,7 +410,9 @@ function vio_swapchain_info(VioContext $context): array {}
  * ('discrete' | 'integrated' | 'software' | 'unknown'), 'vram_bytes' => int].
  * D3D11 / D3D12 report the feature level and HLSL shader model, Vulkan the SPIR-V
  * version of the instance / device API, OpenGL the GLSL version. False without a
- * device.
+ * device. 'selected_by' => 'explicit' | 'priority' (plain 'auto') | 'score'
+ * ('auto' with prefer / require), 'candidates' => the vio_rank_backends()
+ * ranking of a scored 'auto' ([] otherwise).
  */
 function vio_backend_info(VioContext $context): array|false {}
 
@@ -424,6 +426,20 @@ function vio_backend_info(VioContext $context): array|false {}
  * live context. A backend name limits the scan; an unknown one is a ValueError.
  */
 function vio_adapters(?string $backend = null): array {}
+
+/**
+ * The ranking vio_create('auto', ['prefer' => ..., 'require' => [...]]) uses:
+ * one candidate per backend with its preferred adapter, eligible ones first,
+ * then by score - vendor profile (NVIDIA d3d12 > vulkan > d3d11, AMD vulkan >
+ * d3d12, older Intel iGPUs d3d11, Apple metal, Linux vulkan > opengl), discrete
+ * before integrated, software rasterizers last, feature points by 'prefer'
+ * ('performance' default, 'quality', 'compat' = d3d11 / opengl first, no
+ * feature points). 'require' (VIO_FEATURE_* list) filters; a feature the
+ * backend cannot tell before a context is checked when vio_create opens it.
+ * Entries: ['backend', 'adapter' => ?string, 'vendor', 'device_type', 'score',
+ * 'eligible' => bool, 'reason' => ?string]. False on a bad option (warning).
+ */
+function vio_rank_backends(array $options = []): array|false {}
 
 /**
  * Inline ray tracing (VIO_FEATURE_RAY_QUERY): build a bottom-level acceleration
