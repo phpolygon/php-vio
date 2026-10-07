@@ -41,6 +41,9 @@ void vio_hlsl_set_16bit_types(int enable);
 /* 1 when the SPIR-V module decorates a variable with BuiltIn `builtin`
  * (e.g. 4432 PrimitiveShadingRateKHR). Plain word scan, no SPIRV-Cross. */
 int vio_spirv_has_builtin(const void *spirv, size_t bytes, uint32_t builtin);
+/* Binding of the module's first acceleration-structure variable (GL_EXT_ray_query),
+ * -1 when it has none. Plain word scan. */
+int vio_spirv_accel_binding(const void *spirv, size_t bytes);
 /* GL_OVR_multiview2: views of the next vio_spirv_to_glsl calls (0 = off). */
 void vio_glsl_set_ovr_view_count(int views);
 

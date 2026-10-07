@@ -46,6 +46,7 @@ typedef struct {
     VkImageView   view;
     VkSampler     sampler;
     VkImageLayout layout;
+    VkAccelerationStructureKHR accel;   /* ray query: the bound top-level structure */
 } vk3d_res;
 
 enum { VK3D_DUMMY_2D, VK3D_DUMMY_3D, VK3D_DUMMY_CUBE, VK3D_DUMMY_2D_ARRAY, VK3D_DUMMY_DEPTH, VK3D_DUMMY_COUNT };
@@ -272,16 +273,17 @@ static VkDescriptorSet vk3d_alloc_set(VkDescriptorSetLayout layout)
             php_error_docref(NULL, E_WARNING, "Vulkan: descriptor pools exhausted for this frame");
             return VK_NULL_HANDLE;
         }
-        VkDescriptorPoolSize sizes[4] = {
+        VkDescriptorPoolSize sizes[5] = {
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK3D_SETS_PER_POOL * VK3D_DYN_UBOS },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         VK3D_SETS_PER_POOL * VK3D_MAX_EXTRA_UBO },
             { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK3D_SETS_PER_POOL * VK3D_MAX_SAMPLERS },
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         VK3D_SETS_PER_POOL * VK3D_MAX_STORAGE },
+            { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK3D_SETS_PER_POOL },
         };
         VkDescriptorPoolCreateInfo pi = {0};
         pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pi.maxSets       = VK3D_SETS_PER_POOL;
-        pi.poolSizeCount = 4;
+        pi.poolSizeCount = vio_vk.ray_query_supported ? 5 : 4;   /* the type is only valid with the extension */
         pi.pPoolSizes    = sizes;
         if (vkCreateDescriptorPool(vio_vk.device, &pi, NULL, &f->pools[f->pool_count]) != VK_SUCCESS) {
             return VK_NULL_HANDLE;
@@ -605,6 +607,9 @@ static void vk3d_resolve(vio_vk3d_shader *sh, vk3d_res *out)
                 r->buf = vk3d_zero_buffer();
                 r->range = b->size && b->size < VK3D_ZERO_BUF_SIZE ? b->size : VK3D_ZERO_BUF_SIZE;
                 break;
+            case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+                r->accel = (VkAccelerationStructureKHR)vio_vk.bound_accel;
+                break;
             case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
                 vio_vulkan_compute_buffer *sb = vk3d.storage[(b->binding - VK3D_B_STORAGE0) % VK3D_MAX_STORAGE];
                 r->buf = (sb && sb->buffer) ? sb->buffer : vk3d_zero_buffer();
@@ -650,6 +655,7 @@ static VkDescriptorSet vk3d_descriptor_set(vio_vk3d_shader *sh)
     VkWriteDescriptorSet w[VK3D_MAX_BINDINGS];
     VkDescriptorBufferInfo bi[VK3D_MAX_BINDINGS];
     VkDescriptorImageInfo ii[VK3D_MAX_BINDINGS];
+    VkWriteDescriptorSetAccelerationStructureKHR ai[VK3D_MAX_BINDINGS];
     uint32_t n = 0;
     for (int i = 0; i < sh->binding_count; i++) {
         const vk3d_binding *b = &sh->bindings[i];
@@ -659,7 +665,14 @@ static VkDescriptorSet vk3d_descriptor_set(vio_vk3d_shader *sh)
         w[n].dstBinding      = b->binding;
         w[n].descriptorCount = 1;
         w[n].descriptorType  = b->type;
-        if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+        if (b->type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+            if (!res[i].accel) continue;
+            memset(&ai[n], 0, sizeof(ai[n]));
+            ai[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+            ai[n].accelerationStructureCount = 1;
+            ai[n].pAccelerationStructures = &res[i].accel;
+            w[n].pNext = &ai[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
             if (!res[i].view || !res[i].sampler) continue;
             ii[n].imageView   = res[i].view;
             ii[n].sampler     = res[i].sampler;

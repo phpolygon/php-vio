@@ -375,6 +375,23 @@ function vio_swapchain_info(VioContext $context): array {}
 function vio_backend_info(VioContext $context): array|false {}
 
 /**
+ * Inline ray tracing (VIO_FEATURE_RAY_QUERY): build a bottom-level acceleration
+ * structure per distinct mesh (its location-0 positions and indices) and a
+ * top-level structure over the instances. Each instance is
+ * ['mesh' => VioMesh, 'transform' => float[16]] (column-major 4x4, optional,
+ * identity). Shaders query it with GL_EXT_ray_query (rayQueryEXT) in the
+ * fragment and compute stages. False + warning where the feature is 0.
+ */
+function vio_acceleration_structure(VioContext $context, array $instances): VioAccelerationStructure|false {}
+
+/**
+ * Bind an acceleration structure for the following draws and compute
+ * dispatches at the GLSL binding of the shader's accelerationStructureEXT.
+ */
+function vio_bind_acceleration_structure(VioContext $context, VioAccelerationStructure $accelerationStructure, int $binding): void {}
+
+
+/**
  * Draw a mesh with arguments read from a storage buffer (VIO_FEATURE_INDIRECT_DRAW) —
  * typically written by a compute pass (GPU culling / LOD selection). Per draw record:
  * indexed meshes 5 uint32 {indexCount, instanceCount, firstIndex, baseVertex, firstInstance}

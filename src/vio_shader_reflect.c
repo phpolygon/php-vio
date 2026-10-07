@@ -143,6 +143,30 @@ char *vio_hlsl_probe_hlsl(int stage, int shader_model)
     return hlsl;
 }
 
+int vio_spirv_accel_binding(const void *spirv, size_t bytes)
+{
+    const uint32_t *w = (const uint32_t *)spirv;
+    size_t n = bytes / 4;
+    if (!w || n < 5 || w[0] != 0x07230203u) return -1;
+    uint32_t as_type = 0, as_ptr = 0, as_var = 0;
+    for (size_t i = 5; i < n; ) {
+        uint32_t count = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (count == 0) break;
+        if (op == 5341 && count >= 2) as_type = w[i + 1];                                     /* OpTypeAccelerationStructureKHR */
+        else if (op == 32 && count >= 4 && as_type && w[i + 3] == as_type) as_ptr = w[i + 1];  /* OpTypePointer */
+        else if (op == 59 && count >= 4 && as_ptr && w[i + 1] == as_ptr && !as_var) as_var = w[i + 2]; /* OpVariable */
+        i += count;
+    }
+    if (!as_var) return -1;
+    for (size_t i = 5; i < n; ) {
+        uint32_t count = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (count == 0) break;
+        if (op == 71 && count >= 4 && w[i + 1] == as_var && w[i + 2] == 33) return (int)w[i + 3];  /* Binding */
+        i += count;
+    }
+    return 0;
+}
+
 int vio_spirv_has_builtin(const void *spirv, size_t bytes, uint32_t builtin)
 {
     const uint32_t *w = (const uint32_t *)spirv;
@@ -905,6 +929,18 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
         for (size_t i = 0; i < sep_image_count; i++) {
             spvc_compiler_set_decoration(compiler, sep_images[i].id,
                                           SpvDecorationBinding, (unsigned int)(sampled_count + i));
+        }
+
+        /* Ray query (GL_EXT_ray_query): the acceleration structure moves to its
+         * own register space so the D3D12 root SRV (t0, space9) never overlaps the
+         * SRV tables of space 0. One structure per shader stage. */
+        const spvc_reflected_resource *accels;
+        size_t accel_count;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_ACCELERATION_STRUCTURE,
+                                                   &accels, &accel_count);
+        for (size_t i = 0; i < accel_count; i++) {
+            spvc_compiler_set_decoration(compiler, accels[i].id, SpvDecorationDescriptorSet, 9);
+            spvc_compiler_set_decoration(compiler, accels[i].id, SpvDecorationBinding, (unsigned int)i);
         }
 
         const spvc_reflected_resource *sep_samplers;

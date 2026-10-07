@@ -139,7 +139,11 @@ Größter Architekturhebel: ersetzt Pending-Bind-Tabelle und GL-Unit-Mapping fü
 
 `VIO_FEATURE_RAYTRACING` aufteilen in `RAY_QUERY` (6a) und `RAYTRACING_PIPELINE` (6b).
 
-**6a Inline-Raytracing / Ray Query (zuerst)** — RT-Schatten/-AO ohne eigene Pipeline.
+**6a Inline-Raytracing / Ray Query ✅ (2026-10-07, `VIO_FEATURE_RAY_QUERY`, Test 163)** — umgesetzt als
+`vio_acceleration_structure($ctx, [['mesh' => …, 'transform' => float[16]], …])` (Klasse `VioAccelerationStructure`,
+BLAS je Mesh aus der CPU-Kopie, die `VioMesh` auf Ray-Query-Backends behält) + `vio_bind_acceleration_structure`.
+Metal auf dem M5 ausgeführt (ab MSL 2.4); D3D12 per mingw + DXC geprüft, Vulkan nur gegen die Header kompiliert
+(MoltenVK ohne Ray Query). Ursprüngliche Planung: — RT-Schatten/-AO ohne eigene Pipeline.
 - Neue API: `vio_acceleration_structure($ctx, ['meshes' => [...]])` (BLAS), `vio_tlas($ctx, $instances)`,
   Rebuild/Refit, Bind als Ressource; GLSL `GL_EXT_ray_query`.
 - D3D12: DXR 1.1 (SM 6.5, `OPTIONS5.RaytracingTier >= 1_1`), `RayQuery<>`; SPIRV-Cross-HLSL-Unterstützung

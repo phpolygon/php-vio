@@ -49,7 +49,7 @@ static unsigned metal_msl_spvc_version(int floor)
 
 /* One buffer-like resource of a shader stage after the MSL renumbering. */
 typedef struct _vio_metal_res_buffer {
-    int kind;       /* 0 = UBO, 1 = SSBO, 2 = push-constant block */
+    int kind;       /* 0 = UBO, 1 = SSBO, 2 = push-constant block, 3 = acceleration structure (ray query) */
     int set;        /* original GLSL descriptor set */
     int binding;    /* original GLSL binding (what vio_bind_buffer / vio_bind_storage_buffer pass) */
     int msl_index;  /* [[buffer(N)]] the resource was pinned to */
@@ -430,6 +430,25 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
                 t->is_depth = spvc_type_get_image_is_depth(image) ? 1 : 0;
                 t->is_cube  = (spvc_type_get_image_dimension(image) == SpvDimCube) ? 1 : 0;
             }
+            spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
+            spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
+            metal_gfx_add_binding(compiler, em, 0, next, next);
+            next++;
+        }
+    }
+
+    /* Acceleration structures (GL_EXT_ray_query): renumbered into the buffer
+     * table like a UBO, bound with set*AccelerationStructure at draw time. */
+    {
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_ACCELERATION_STRUCTURE, &list, &count);
+        for (size_t i = 0; i < count && res->buffer_count < VIO_METAL_MAX_RES; i++) {
+            vio_metal_res_buffer *b = &res->buffers[res->buffer_count++];
+            b->kind      = 3;
+            b->set       = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet);
+            b->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            b->msl_index = (int)next;
             spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
             spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
             metal_gfx_add_binding(compiler, em, 0, next, next);

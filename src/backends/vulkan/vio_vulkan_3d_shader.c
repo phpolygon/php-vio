@@ -236,6 +236,15 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
         vk3d_add_binding(sh, binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, VK_IMAGE_VIEW_TYPE_2D, 0, 0);
     }
 
+    /* Ray query (GL_EXT_ray_query): the acceleration structure of any stage
+     * sits at one fixed binding; vio_bind_acceleration_structure fills it. */
+    spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_ACCELERATION_STRUCTURE, &list, &n);
+    for (size_t i = 0; i < n && i < 1; i++) {
+        spvc_compiler_set_decoration(c, list[i].id, SpvDecorationDescriptorSet, 0);
+        spvc_compiler_set_decoration(c, list[i].id, SpvDecorationBinding, VK3D_B_ACCEL);
+        vk3d_add_binding(sh, VK3D_B_ACCEL, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, stage, VK_IMAGE_VIEW_TYPE_2D, 0, 0);
+    }
+
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &n);
     if (n > 0) {
         php_error_docref(NULL, E_NOTICE, "Vulkan: separate texture/sampler objects are not supported by the 3D pipeline; use combined samplers");

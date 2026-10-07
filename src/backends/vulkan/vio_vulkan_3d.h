@@ -43,7 +43,8 @@
 #define VK3D_B_EXTRA_UBO0   26
 #define VK3D_MAX_EXTRA_UBO  4
 #define VK3D_B_STAGE_UBO0   30   /* + VIO_EXTRA_STAGE_INDEX(stage): GS 30, TCS 31, TES 32 */
-#define VK3D_MAX_BINDINGS   33
+#define VK3D_B_ACCEL        33   /* ray query: the acceleration structure (vio_bind_acceleration_structure) */
+#define VK3D_MAX_BINDINGS   34
 #define VK3D_DYN_UBOS       5    /* dynamic default blocks: VS, FS, GS, TCS, TES */
 #define VK3D_MAX_VARIANTS   12
 

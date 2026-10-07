@@ -393,6 +393,15 @@ typedef struct _vio_backend {
      * families and capabilities. Returns 0 when filled, -1 without a device.
      * NULL => the function reports false. */
     int   (*describe)(vio_backend_description *out);
+
+    /* Inline ray tracing (VIO_FEATURE_RAY_QUERY): build the bottom- and
+     * top-level structures of `desc` (returns the backend handle or NULL),
+     * free them (deferred while a frame may still use them), and bind one for
+     * the following draws and dispatches at the GLSL binding of the shader's
+     * accelerationStructureEXT (NULL unbinds). */
+    void *(*create_acceleration_structure)(const vio_as_desc *desc);
+    void  (*destroy_acceleration_structure)(void *as);
+    void  (*bind_acceleration_structure)(void *as, int binding);
 } vio_backend;
 
 /*

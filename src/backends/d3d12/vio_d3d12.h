@@ -99,7 +99,8 @@
 #define VIO_D3D12_RP_GS_SAMPLER   11
 #define VIO_D3D12_RP_HS_SAMPLER   12
 #define VIO_D3D12_RP_DS_SAMPLER   13
-#define VIO_D3D12_RP_COUNT        14
+#define VIO_D3D12_RP_ACCEL        14  /* root SRV t0, space9: ray-query acceleration structure (all stages) */
+#define VIO_D3D12_RP_COUNT        15
 
 /* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
  * bytecode (NULL when the vio_shader has no such stage). */
@@ -206,6 +207,7 @@ typedef struct _vio_d3d12_compute_pipeline {
     int                 cbv_register;
     int                 srv_base_reg;
     int                 uav_base_reg;
+    int                 uses_accel;   /* the kernel queries an acceleration structure: root SRV [3] t0, space9 */
     /* Params constant block. An UPLOAD-heap buffer, persistently re-mapped by
      * compute_set_uniforms (256-byte aligned per the CB requirement). Bound to
      * the reflected cbv_register. */
@@ -309,6 +311,7 @@ typedef struct _vio_d3d12_state {
     int                        int64_ops;      /* OPTIONS1.Int64ShaderOps (64-bit integers in shaders) */
     int                        native16;       /* OPTIONS4.Native16BitShaderOpsSupported under SM 6.2+ */
     int                        view_instancing; /* OPTIONS3.ViewInstancingTier (multiview, SV_ViewID needs SM 6.1) */
+    int                        raytracing_tier; /* OPTIONS5.RaytracingTier (ray query needs 1.1 + SM 6.5) */
     /* Variable rate shading (GAP-PHASE5 Block 12): D3D12_VARIABLE_SHADING_RATE_TIER
      * (0 = none), the additional-rates cap (2x4 / 4x2 / 4x4), the sticky rate
      * (vio_shading_rate) and the ID3D12GraphicsCommandList5 view of the frame list. */

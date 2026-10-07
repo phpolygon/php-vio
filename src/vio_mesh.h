@@ -27,6 +27,12 @@ typedef struct _vio_mesh_object {
     int          stride;          /* bytes per vertex */
     const struct _vio_backend *backend;  /* Backend that owns vao/vbo/ebo / backend_vb / backend_ib */
     unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
+    /* Ray tracing (VIO_FEATURE_RAY_QUERY): CPU copies of the positions
+     * (location 0, xyz) and indices that vio_acceleration_structure() builds
+     * bottom-level structures from. NULL on backends without ray queries. */
+    float       *rt_positions;
+    uint32_t    *rt_indices;
+    int          rt_index_count;
     zend_object  std;
 } vio_mesh_object;
 

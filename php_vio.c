@@ -22,6 +22,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_texture.h"
 #include "src/vio_buffer.h"
 #include "src/vio_compute_pipeline.h"
+#include "src/vio_acceleration_structure.h"
 #include "src/vio_font_face.h"
 #include "src/vio_2d.h"
 #include "src/vio_font.h"
@@ -2189,6 +2190,19 @@ ZEND_FUNCTION(vio_mesh)
     mesh->has_colors   = has_colors;
     mesh->stride       = floats_per_vertex * sizeof(float);
     mesh->backend      = ctx->backend;
+
+    /* Ray tracing: keep the positions (the first three floats of a vertex,
+     * location 0) and the indices for vio_acceleration_structure(). */
+    if (floats_per_vertex >= 3 && vertex_count > 0 && ctx->backend->supports_feature
+        && ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY)) {
+        mesh->rt_positions = emalloc(sizeof(float) * 3 * (size_t)vertex_count);
+        for (int v = 0; v < vertex_count; v++) memcpy(&mesh->rt_positions[v * 3], &data[v * floats_per_vertex], sizeof(float) * 3);
+        if (indices && index_count > 0) {
+            mesh->rt_indices = emalloc(sizeof(uint32_t) * (size_t)index_count);
+            for (int k = 0; k < index_count; k++) mesh->rt_indices[k] = (uint32_t)indices[k];
+            mesh->rt_index_count = index_count;
+        }
+    }
 
     /* Normalize the layout into a backend-agnostic array so create_mesh can
      * do one straight glVertexAttribPointer-loop without re-deriving the
@@ -7809,6 +7823,129 @@ ZEND_FUNCTION(vio_backend_info)
     add_assoc_zval(return_value, "caps", &caps);
 }
 
+/* ── Inline ray tracing (VIO_FEATURE_RAY_QUERY) ──────────────────── */
+
+/* vio_acceleration_structure($ctx, [['mesh' => VioMesh, 'transform' => float[16]], ...]):
+ * one bottom-level structure per distinct mesh (its CPU positions / indices),
+ * one top-level structure over the instances; transform is column-major 4x4
+ * (the last row is ignored), identity when absent. */
+ZEND_FUNCTION(vio_acceleration_structure)
+{
+    zval *ctx_zval;
+    HashTable *list;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(list)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: context not initialized");
+        RETURN_FALSE;
+    }
+    if (!(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY))
+        || !ctx->backend->create_acceleration_structure) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: backend '%s' has no ray queries (VIO_FEATURE_RAY_QUERY = 0)",
+                         ctx->backend->name);
+        RETURN_FALSE;
+    }
+    int n = (int)zend_hash_num_elements(list);
+    if (n < 1) {
+        zend_argument_value_error(2, "must contain at least one instance");
+        RETURN_THROWS();
+    }
+    vio_as_instance *inst = ecalloc((size_t)n, sizeof(vio_as_instance));
+    vio_as_geometry *geo = ecalloc((size_t)n, sizeof(vio_as_geometry));
+    vio_mesh_object **geo_mesh = ecalloc((size_t)n, sizeof(vio_mesh_object *));
+    int geo_count = 0, idx = 0;
+    zval *entry;
+    ZEND_HASH_FOREACH_VAL(list, entry) {
+        zval *mz = Z_TYPE_P(entry) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(entry), "mesh", sizeof("mesh") - 1) : NULL;
+        if (!mz || Z_TYPE_P(mz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(mz), vio_mesh_ce)) {
+            efree(inst); efree(geo); efree(geo_mesh);
+            zend_argument_value_error(2, "instance %d needs 'mesh' => VioMesh", idx);
+            RETURN_THROWS();
+        }
+        vio_mesh_object *mesh = Z_VIO_MESH_P(mz);
+        if (!mesh->rt_positions || mesh->vertex_count < 3) {
+            efree(inst); efree(geo); efree(geo_mesh);
+            php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: instance %d: the mesh has no triangle positions "
+                             "(create it on this context, location 0 at least float3)", idx);
+            RETURN_FALSE;
+        }
+        int g = -1;
+        for (int k = 0; k < geo_count; k++) if (geo_mesh[k] == mesh) { g = k; break; }
+        if (g < 0) {
+            g = geo_count++;
+            geo_mesh[g] = mesh;
+            geo[g].positions = mesh->rt_positions;
+            geo[g].vertex_count = mesh->vertex_count;
+            geo[g].indices = mesh->rt_indices;
+            geo[g].index_count = mesh->rt_indices ? mesh->rt_index_count : 0;
+        }
+        inst[idx].geometry = g;
+        float m[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        zval *tz = zend_hash_str_find(Z_ARRVAL_P(entry), "transform", sizeof("transform") - 1);
+        if (tz) {
+            if (Z_TYPE_P(tz) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(tz)) != 16) {
+                efree(inst); efree(geo); efree(geo_mesh);
+                zend_argument_value_error(2, "instance %d: 'transform' must be 16 floats (column-major 4x4)", idx);
+                RETURN_THROWS();
+            }
+            int c = 0;
+            zval *f;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(tz), f) { m[c++] = (float)zval_get_double(f); } ZEND_HASH_FOREACH_END();
+        }
+        /* column-major 4x4 -> row-major 3x4 */
+        for (int r = 0; r < 3; r++)
+            for (int col = 0; col < 4; col++) inst[idx].transform[r * 4 + col] = m[col * 4 + r];
+        idx++;
+    } ZEND_HASH_FOREACH_END();
+
+    vio_as_desc desc;
+    desc.geometries = geo;
+    desc.geometry_count = geo_count;
+    desc.instances = inst;
+    desc.instance_count = n;
+    void *handle = ctx->backend->create_acceleration_structure(&desc);
+    efree(inst); efree(geo); efree(geo_mesh);
+    if (!handle) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: the backend could not build it");
+        RETURN_FALSE;
+    }
+    object_init_ex(return_value, vio_acceleration_structure_ce);
+    vio_acceleration_structure_object *as = Z_VIO_ACCELERATION_STRUCTURE_P(return_value);
+    as->backend_as = handle;
+    as->backend = ctx->backend;
+    as->instance_count = n;
+    as->valid = 1;
+}
+
+/* vio_bind_acceleration_structure($ctx, $as, $binding): the following draws and
+ * dispatches see $as at the GLSL binding of their accelerationStructureEXT. */
+ZEND_FUNCTION(vio_bind_acceleration_structure)
+{
+    zval *ctx_zval, *as_zval;
+    zend_long binding;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(as_zval, vio_acceleration_structure_ce)
+        Z_PARAM_LONG(binding)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_acceleration_structure_object *as = Z_VIO_ACCELERATION_STRUCTURE_P(as_zval);
+    if (binding < 0 || binding > 31) {
+        zend_argument_value_error(3, "must be 0..31");
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !ctx->backend || !as->valid || as->backend != ctx->backend
+        || !ctx->backend->bind_acceleration_structure) {
+        php_error_docref(NULL, E_WARNING, "vio_bind_acceleration_structure: not built on this context's backend");
+        return;
+    }
+    ctx->backend->bind_acceleration_structure(as->backend_as, (int)binding);
+}
+
 /* ── Image comparison (VRT) ───────────────────────────────────────── */
 
 ZEND_FUNCTION(vio_compare_images)
@@ -8540,6 +8677,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BASE_VERTEX", VIO_FEATURE_BASE_VERTEX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_COMPUTE_DERIVATIVES", VIO_FEATURE_COMPUTE_DERIVATIVES, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE_PRIMITIVE", VIO_FEATURE_SHADING_RATE_PRIMITIVE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_RAY_QUERY", VIO_FEATURE_RAY_QUERY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
@@ -10998,6 +11136,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_texture_register();
     vio_buffer_register();
     vio_compute_pipeline_register();
+    vio_acceleration_structure_register();
     vio_font_register();
     vio_font_face_register();
     vio_sound_register();

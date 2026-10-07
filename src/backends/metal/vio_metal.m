@@ -3465,6 +3465,172 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
 /* Apply everything a draw needs on the open encoder: PSO variant for the
  * current target, depth/cull/bias state, this draw's cbuffer slices and the
  * identity instance buffer. Returns 0 when there is nothing to draw into. */
+/* ── Inline ray tracing (VIO_FEATURE_RAY_QUERY) ─────────────────────
+ * One primitive acceleration structure per geometry, one instance structure
+ * over the instances, built synchronously on their own command buffer. The
+ * structure bound with vio_bind_acceleration_structure reaches the shader at
+ * the [[buffer(n)]] index its acceleration_structure parameter was renumbered
+ * to (vertex / fragment), or at the GLSL binding (compute); the instance
+ * structure only references the primitive ones, so every draw / dispatch that
+ * binds it declares them with useResource. */
+typedef struct _vio_metal_as {
+    void  *tlas;          /* id<MTLAccelerationStructure>, +1 */
+    void **blas;          /* id<MTLAccelerationStructure>[blas_count], +1 each */
+    int    blas_count;
+    void  *instances;     /* id<MTLBuffer> of instance descriptors, +1 */
+} vio_metal_as;
+
+static vio_metal_as *metal_bound_as = NULL;
+static int           metal_bound_as_binding = 0;
+
+static void metal_use_as(id<MTLRenderCommandEncoder> renc, id<MTLComputeCommandEncoder> cenc, vio_metal_as *as)
+{
+    if (!as) return;
+    for (int i = 0; i < as->blas_count; i++) {
+        id<MTLResource> r = (__bridge id<MTLResource>)as->blas[i];
+        if (renc) {
+            if (@available(macOS 13.0, iOS 16.0, *)) [renc useResource:r usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+            else [renc useResource:r usage:MTLResourceUsageRead];
+        }
+        if (cenc) [cenc useResource:r usage:MTLResourceUsageRead];
+    }
+}
+
+static void *metal_create_acceleration_structure(const vio_as_desc *desc)
+{
+    if (!desc || desc->geometry_count < 1 || desc->instance_count < 1 || !vio_mtl.device) return NULL;
+    if (!vio_mtl.caps.raytracing) return NULL;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        vio_metal_as *as = calloc(1, sizeof(vio_metal_as));
+        if (!as) return NULL;
+        as->blas = calloc((size_t)desc->geometry_count, sizeof(void *));
+        if (!as->blas) { free(as); return NULL; }
+        @autoreleasepool {
+            id<MTLDevice> dev = vio_mtl.device;
+            id<MTLCommandBuffer> cb = [vio_mtl.command_queue commandBuffer];
+            id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
+            NSMutableArray *keep = [NSMutableArray array];   /* geometry + scratch buffers live until the wait */
+            NSMutableArray *blases = [NSMutableArray array];
+            for (int g = 0; g < desc->geometry_count; g++) {
+                const vio_as_geometry *geo = &desc->geometries[g];
+                id<MTLBuffer> vb = [dev newBufferWithBytes:geo->positions length:(NSUInteger)geo->vertex_count * 12
+                                                   options:MTLResourceStorageModeShared];
+                MTLAccelerationStructureTriangleGeometryDescriptor *tri = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+                tri.vertexBuffer = vb;
+                tri.vertexStride = 12;
+                tri.opaque = YES;
+                if (geo->indices && geo->index_count >= 3) {
+                    id<MTLBuffer> ib = [dev newBufferWithBytes:geo->indices length:(NSUInteger)geo->index_count * 4
+                                                       options:MTLResourceStorageModeShared];
+                    tri.indexBuffer = ib;
+                    tri.indexType = MTLIndexTypeUInt32;
+                    tri.triangleCount = (NSUInteger)geo->index_count / 3;
+                    [keep addObject:ib];
+                } else {
+                    tri.triangleCount = (NSUInteger)geo->vertex_count / 3;
+                }
+                [keep addObject:vb];
+                MTLPrimitiveAccelerationStructureDescriptor *pd = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+                pd.geometryDescriptors = @[ tri ];
+                MTLAccelerationStructureSizes sz = [dev accelerationStructureSizesWithDescriptor:pd];
+                id<MTLAccelerationStructure> blas = [dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
+                id<MTLBuffer> scratch = [dev newBufferWithLength:sz.buildScratchBufferSize > 0 ? sz.buildScratchBufferSize : 16
+                                                         options:MTLResourceStorageModePrivate];
+                if (!blas || !scratch) { [enc endEncoding]; goto fail; }
+                [enc buildAccelerationStructure:blas descriptor:pd scratchBuffer:scratch scratchBufferOffset:0];
+                [keep addObject:scratch];
+                [blases addObject:blas];
+                as->blas[as->blas_count++] = (void *)CFBridgingRetain(blas);
+            }
+            [enc endEncoding];
+
+            /* Instance descriptors: the row-major 3x4 transform as four packed columns. */
+            id<MTLBuffer> ibuf = [dev newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor) * (NSUInteger)desc->instance_count
+                                                  options:MTLResourceStorageModeShared];
+            MTLAccelerationStructureInstanceDescriptor *ids = (MTLAccelerationStructureInstanceDescriptor *)[ibuf contents];
+            for (int i = 0; i < desc->instance_count; i++) {
+                const vio_as_instance *in = &desc->instances[i];
+                memset(&ids[i], 0, sizeof(ids[i]));
+                for (int c = 0; c < 4; c++) {
+                    ids[i].transformationMatrix.columns[c].x = in->transform[0 * 4 + c];
+                    ids[i].transformationMatrix.columns[c].y = in->transform[1 * 4 + c];
+                    ids[i].transformationMatrix.columns[c].z = in->transform[2 * 4 + c];
+                }
+                ids[i].options = MTLAccelerationStructureInstanceOptionOpaque;
+                ids[i].mask = 0xFF;
+                ids[i].intersectionFunctionTableOffset = 0;
+                ids[i].accelerationStructureIndex = (uint32_t)in->geometry;
+            }
+            MTLInstanceAccelerationStructureDescriptor *idesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
+            idesc.instancedAccelerationStructures = blases;
+            idesc.instanceCount = (NSUInteger)desc->instance_count;
+            idesc.instanceDescriptorBuffer = ibuf;
+            MTLAccelerationStructureSizes isz = [dev accelerationStructureSizesWithDescriptor:idesc];
+            id<MTLAccelerationStructure> tlas = [dev newAccelerationStructureWithSize:isz.accelerationStructureSize];
+            id<MTLBuffer> iscratch = [dev newBufferWithLength:isz.buildScratchBufferSize > 0 ? isz.buildScratchBufferSize : 16
+                                                      options:MTLResourceStorageModePrivate];
+            if (!tlas || !iscratch) goto fail;
+            /* A second encoder: the instance build reads the finished primitive structures. */
+            id<MTLAccelerationStructureCommandEncoder> ienc = [cb accelerationStructureCommandEncoder];
+            [ienc buildAccelerationStructure:tlas descriptor:idesc scratchBuffer:iscratch scratchBufferOffset:0];
+            [ienc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) goto fail;
+            as->tlas = (void *)CFBridgingRetain(tlas);
+            as->instances = (void *)CFBridgingRetain(ibuf);
+            (void)keep;
+            return as;
+        }
+fail:
+        for (int i = 0; i < as->blas_count; i++) CFRelease(as->blas[i]);
+        free(as->blas);
+        free(as);
+        return NULL;
+    }
+    return NULL;
+}
+
+static void metal_destroy_acceleration_structure(void *ptr)
+{
+    vio_metal_as *as = (vio_metal_as *)ptr;
+    if (!as) return;
+    if (metal_bound_as == as) metal_bound_as = NULL;
+    /* Command buffers retain what they reference: releasing now is safe. */
+    if (as->tlas) CFRelease(as->tlas);
+    if (as->instances) CFRelease(as->instances);
+    for (int i = 0; i < as->blas_count; i++) if (as->blas[i]) CFRelease(as->blas[i]);
+    free(as->blas);
+    free(as);
+}
+
+static void metal_bind_acceleration_structure(void *ptr, int binding)
+{
+    metal_bound_as = (vio_metal_as *)ptr;
+    metal_bound_as_binding = binding;
+}
+
+/* Bind the bound acceleration structure to the stages of the current draw. */
+static void metal_bind_as_for_draw(id<MTLRenderCommandEncoder> enc, vio_metal_shader *sh)
+{
+    if (!metal_bound_as || !metal_bound_as->tlas || !sh) return;
+    int used = 0;
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        id<MTLAccelerationStructure> tlas = (__bridge id<MTLAccelerationStructure>)metal_bound_as->tlas;
+        for (int i = 0; i < sh->vs.buffer_count; i++) {
+            if (sh->vs.buffers[i].kind != 3) continue;
+            [enc setVertexAccelerationStructure:tlas atBufferIndex:(NSUInteger)sh->vs.buffers[i].msl_index];
+            used = 1;
+        }
+        for (int i = 0; i < sh->fs.buffer_count; i++) {
+            if (sh->fs.buffers[i].kind != 3) continue;
+            [enc setFragmentAccelerationStructure:tlas atBufferIndex:(NSUInteger)sh->fs.buffers[i].msl_index];
+            used = 1;
+        }
+    }
+    if (used) metal_use_as(enc, nil, metal_bound_as);
+}
+
 static int metal_prepare_draw(int stride)
 {
     vio_metal_pipeline *p = metal_current_pipeline;
@@ -3523,6 +3689,7 @@ static int metal_prepare_draw(int stride)
     if (sh->vl.uses_instance_attribs && metal_identity_instance) {
         [enc setVertexBuffer:metal_identity_instance offset:0 atIndex:VIO_METAL_VB_INSTANCE];
     }
+    metal_bind_as_for_draw(enc, sh);
     if (sh->view_count > 1) {
         /* SPIRV-Cross's multiview view mask: {base view, view count}. */
         uint32_t mask[2] = { 0u, (uint32_t)sh->view_count };
@@ -5060,6 +5227,7 @@ typedef struct _vio_metal_compute_pipeline {
     /* local_size_{x,y,z} reflected from the SPIR-V ExecutionMode so 2D/3D
      * kernels dispatch with the right threadsPerThreadgroup (0 => 64,1,1). */
     unsigned                  local_size[3];
+    int                       uses_as;   /* the kernel declares an acceleration structure (ray query) */
 } vio_metal_compute_pipeline;
 
 #ifdef HAVE_SPIRV_CROSS
@@ -5232,6 +5400,7 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
 
     vio_metal_compute_pipeline *cp = NULL;
 
+    int uses_as = msl && strstr(msl, "acceleration_structure") != NULL;
     @autoreleasepool {
         NSString *msl_src = [NSString stringWithUTF8String:msl];
         free(msl);
@@ -5268,6 +5437,7 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
         }
         cp->pso          = (void *)CFBridgingRetain(pso);
         cp->params_index = params_index;
+        cp->uses_as      = uses_as;
         memcpy(cp->local_size, local_size, sizeof(local_size));
     }
 
@@ -5401,6 +5571,16 @@ static void metal_dispatch_compute(vio_compute_cmd *cmd)
         }
         id<MTLComputeCommandEncoder> enc = [cbuf computeCommandEncoder];
         [enc setComputePipelineState:pso];
+
+        /* Ray query: the bound acceleration structure at its GLSL binding (the
+         * compute remap pins binding n to [[buffer(n)]]). */
+        if (cp->uses_as && metal_bound_as && metal_bound_as->tlas) {
+            if (@available(macOS 11.0, iOS 14.0, *)) {
+                [enc setAccelerationStructure:(__bridge id<MTLAccelerationStructure>)metal_bound_as->tlas
+                                atBufferIndex:(NSUInteger)metal_bound_as_binding];
+                metal_use_as(nil, enc, metal_bound_as);
+            }
+        }
 
         /* Bind each storage buffer at its MSL buffer index (== GLSL binding,
          * guaranteed by the explicit resource-binding remap at compile time). */
@@ -5564,6 +5744,14 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_COMPUTE_DERIVATIVES:
         /* Kernel functions have no dfdx / dfdy (the driver rejects them). */
         return 0;
+    case VIO_FEATURE_RAY_QUERY:
+        /* Ray queries in compute (MSL 2.3) and fragment functions (2.4, ray
+         * tracing from render pipelines); hardware RT on Apple9+, else emulated. */
+#ifdef HAVE_SPIRV_CROSS
+        return vio_mtl.caps.raytracing && vio_mtl.caps.raytracing_from_render;
+#else
+        return 0;
+#endif
     case VIO_FEATURE_ATOMIC64:
         /* Metal has 64-bit atomic min / max only (atomic64 cap, MSL 3.1) and
          * SPIRV-Cross refuses 64-bit atomics for MSL: not offered. */
@@ -5752,6 +5940,9 @@ static const vio_backend metal_backend = {
     .gpu_frame_time    = metal_gpu_frame_time,
     .swapchain_info    = metal_swapchain_info,
     .describe          = metal_describe,
+    .create_acceleration_structure  = metal_create_acceleration_structure,
+    .destroy_acceleration_structure = metal_destroy_acceleration_structure,
+    .bind_acceleration_structure    = metal_bind_acceleration_structure,
     .destroy_mesh      = metal_destroy_mesh,
     .destroy_shader_obj = metal_destroy_shader_obj,
     .upload_cubemap    = metal_upload_cubemap,

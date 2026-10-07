@@ -587,8 +587,15 @@ static int d3d12_create_root_signature(void)
         static_samplers[s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
 
+    /* [14] root SRV t0, space9: the ray-query acceleration structure (vio_shader_reflect.c
+     * moves every RaytracingAccelerationStructure there), visible to every stage. */
+    params[VIO_D3D12_RP_ACCEL].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[VIO_D3D12_RP_ACCEL].Descriptor.ShaderRegister = 0;
+    params[VIO_D3D12_RP_ACCEL].Descriptor.RegisterSpace = 9;
+    params[VIO_D3D12_RP_ACCEL].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-    rs_desc.NumParameters = VIO_D3D12_RP_COUNT; /* VS CBV, PS CBV, PS SRV table, VS storage SRV, PS sampler table, GS/HS/DS mirrors */
+    rs_desc.NumParameters = VIO_D3D12_RP_COUNT; /* VS CBV, PS CBV, PS SRV table, VS storage SRV, PS sampler table, GS/HS/DS mirrors, accel */
     rs_desc.pParameters = params;
     rs_desc.NumStaticSamplers = 4;
     rs_desc.pStaticSamplers = static_samplers;
@@ -979,6 +986,7 @@ static int d3d12_init(vio_config *cfg)
     vio_d3d12.int64_ops = 0;
     vio_d3d12.native16 = 0;
     vio_d3d12.view_instancing = 0;
+    vio_d3d12.raytracing_tier = 0;
     /* Variable rate shading capability (GAP-PHASE5 Block 12). */
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {0};
@@ -1024,6 +1032,10 @@ static int d3d12_init(vio_config *cfg)
                 vio_d3d12.barycentrics = o3.BarycentricsSupported ? 1 : 0;
             if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
                 vio_d3d12.view_instancing = (int)o3.ViewInstancingTier;
+            D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5;
+            memset(&o5, 0, sizeof(o5));
+            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))))
+                vio_d3d12.raytracing_tier = (int)o5.RaytracingTier;
             vio_hlsl_set_16bit_types(vio_d3d12.native16);
         } else {
             php_error_docref(NULL, E_NOTICE, "D3D12: shader_model 6 requested but %s; using FXC (SM 5.1)",
@@ -1668,6 +1680,229 @@ static void d3d12_fill_rt_blend(D3D12_RENDER_TARGET_BLEND_DESC *b, int blend, in
     }
 }
 
+/* ── Inline ray tracing (VIO_FEATURE_RAY_QUERY) ─────────────────────
+ * DXR 1.1 acceleration structures, built synchronously on a dedicated command
+ * list: one bottom-level structure per geometry (positions R32G32B32_FLOAT,
+ * uint32 indices, opaque), one top-level structure over the instances. The
+ * shaders read the bound top level through root SRV t0, space9
+ * (VIO_D3D12_RP_ACCEL / compute root parameter 3). */
+typedef struct _vio_d3d12_as {
+    ID3D12Resource  *tlas;
+    ID3D12Resource **blas;
+    int              blas_count;
+} vio_d3d12_as;
+
+static vio_d3d12_as *d3d12_bound_as = NULL;
+
+static ID3D12Resource *d3d12_as_buffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags,
+                                       D3D12_RESOURCE_STATES state)
+{
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = heap;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = size > 0 ? size : 256;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.Flags = flags;
+    ID3D12Resource *r = NULL;
+    if (FAILED(ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, state, NULL,
+                                                    &IID_ID3D12Resource, (void **)&r))) return NULL;
+    return r;
+}
+
+static ID3D12Resource *d3d12_as_upload(const void *data, size_t size)
+{
+    ID3D12Resource *r = d3d12_as_buffer((UINT64)size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                                        D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!r) return NULL;
+    void *p = NULL;
+    D3D12_RANGE none = { 0, 0 };
+    if (FAILED(ID3D12Resource_Map(r, 0, &none, &p)) || !p) { ID3D12Resource_Release(r); return NULL; }
+    memcpy(p, data, size);
+    ID3D12Resource_Unmap(r, 0, NULL);
+    return r;
+}
+
+static void d3d12_as_free(vio_d3d12_as *as)
+{
+    if (!as) return;
+    if (as->tlas) ID3D12Resource_Release(as->tlas);
+    for (int i = 0; i < as->blas_count; i++) if (as->blas[i]) ID3D12Resource_Release(as->blas[i]);
+    free(as->blas);
+    free(as);
+}
+
+static void *d3d12_create_acceleration_structure(const vio_as_desc *desc)
+{
+    if (!desc || desc->geometry_count < 1 || desc->instance_count < 1 || !vio_d3d12.device) return NULL;
+    ID3D12Device5 *dev5 = NULL;
+    if (FAILED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device5, (void **)&dev5)) || !dev5) return NULL;
+    vio_d3d12_as *as = calloc(1, sizeof(vio_d3d12_as));
+    ID3D12Resource **tmp = calloc((size_t)desc->geometry_count * 3 + 4, sizeof(ID3D12Resource *));
+    int tmp_count = 0;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    ID3D12GraphicsCommandList4 *list4 = NULL;
+    if (!as || !tmp) goto fail;
+    as->blas = calloc((size_t)desc->geometry_count, sizeof(ID3D12Resource *));
+    if (!as->blas) goto fail;
+    if (FAILED(ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   &IID_ID3D12CommandAllocator, (void **)&alloc))) goto fail;
+    if (FAILED(ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                              &IID_ID3D12GraphicsCommandList, (void **)&list))) goto fail;
+    if (FAILED(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList4, (void **)&list4))) goto fail;
+
+    for (int g = 0; g < desc->geometry_count; g++) {
+        const vio_as_geometry *geo = &desc->geometries[g];
+        ID3D12Resource *vb = d3d12_as_upload(geo->positions, (size_t)geo->vertex_count * 12);
+        if (!vb) goto fail;
+        tmp[tmp_count++] = vb;
+        D3D12_RAYTRACING_GEOMETRY_DESC gd;
+        memset(&gd, 0, sizeof(gd));
+        gd.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        gd.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+        gd.Triangles.VertexBuffer.StartAddress = ID3D12Resource_GetGPUVirtualAddress(vb);
+        gd.Triangles.VertexBuffer.StrideInBytes = 12;
+        gd.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        gd.Triangles.VertexCount = (UINT)geo->vertex_count;
+        if (geo->indices && geo->index_count >= 3) {
+            ID3D12Resource *ib = d3d12_as_upload(geo->indices, (size_t)geo->index_count * 4);
+            if (!ib) goto fail;
+            tmp[tmp_count++] = ib;
+            gd.Triangles.IndexBuffer = ID3D12Resource_GetGPUVirtualAddress(ib);
+            gd.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+            gd.Triangles.IndexCount = (UINT)geo->index_count;
+        }
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in;
+        memset(&in, 0, sizeof(in));
+        in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+        in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+        in.NumDescs = 1;
+        in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        in.pGeometryDescs = &gd;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pre;
+        memset(&pre, 0, sizeof(pre));
+        ID3D12Device5_GetRaytracingAccelerationStructurePrebuildInfo(dev5, &in, &pre);
+        ID3D12Resource *blas = d3d12_as_buffer(pre.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                               D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+        ID3D12Resource *scratch = d3d12_as_buffer(pre.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (!blas || !scratch) { if (blas) ID3D12Resource_Release(blas); if (scratch) ID3D12Resource_Release(scratch); goto fail; }
+        as->blas[as->blas_count++] = blas;
+        tmp[tmp_count++] = scratch;
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd;
+        memset(&bd, 0, sizeof(bd));
+        bd.Inputs = in;
+        bd.DestAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(blas);
+        bd.ScratchAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(scratch);
+        ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(list4, &bd, 0, NULL);
+    }
+    /* The top level reads the finished bottom levels. */
+    {
+        D3D12_RESOURCE_BARRIER uav;
+        memset(&uav, 0, sizeof(uav));
+        uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav.UAV.pResource = NULL;   /* all UAV accesses */
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &uav);
+    }
+    {
+        D3D12_RAYTRACING_INSTANCE_DESC *ids = calloc((size_t)desc->instance_count, sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+        if (!ids) goto fail;
+        for (int i = 0; i < desc->instance_count; i++) {
+            const vio_as_instance *src = &desc->instances[i];
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 4; c++) ids[i].Transform[r][c] = src->transform[r * 4 + c];
+            ids[i].InstanceID = (UINT)i;
+            ids[i].InstanceMask = 0xFF;
+            ids[i].InstanceContributionToHitGroupIndex = 0;
+            ids[i].Flags = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+            ids[i].AccelerationStructure = ID3D12Resource_GetGPUVirtualAddress(as->blas[src->geometry]);
+        }
+        ID3D12Resource *ibuf = d3d12_as_upload(ids, sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * (size_t)desc->instance_count);
+        free(ids);
+        if (!ibuf) goto fail;
+        tmp[tmp_count++] = ibuf;
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in;
+        memset(&in, 0, sizeof(in));
+        in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+        in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+        in.NumDescs = (UINT)desc->instance_count;
+        in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        in.InstanceDescs = ID3D12Resource_GetGPUVirtualAddress(ibuf);
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pre;
+        memset(&pre, 0, sizeof(pre));
+        ID3D12Device5_GetRaytracingAccelerationStructurePrebuildInfo(dev5, &in, &pre);
+        as->tlas = d3d12_as_buffer(pre.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+        ID3D12Resource *scratch = d3d12_as_buffer(pre.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (!as->tlas || !scratch) { if (scratch) ID3D12Resource_Release(scratch); goto fail; }
+        tmp[tmp_count++] = scratch;
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd;
+        memset(&bd, 0, sizeof(bd));
+        bd.Inputs = in;
+        bd.DestAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(as->tlas);
+        bd.ScratchAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(scratch);
+        ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(list4, &bd, 0, NULL);
+    }
+    if (FAILED(ID3D12GraphicsCommandList_Close(list))) goto fail;
+    {
+        ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        vio_d3d12_wait_for_gpu();   /* the temporaries below are freed right after */
+    }
+    for (int i = 0; i < tmp_count; i++) ID3D12Resource_Release(tmp[i]);
+    free(tmp);
+    ID3D12GraphicsCommandList4_Release(list4);
+    ID3D12GraphicsCommandList_Release(list);
+    ID3D12CommandAllocator_Release(alloc);
+    ID3D12Device5_Release(dev5);
+    return as;
+
+fail:
+    php_error_docref(NULL, E_WARNING, "D3D12: acceleration structure build failed");
+    if (tmp) { for (int i = 0; i < tmp_count; i++) ID3D12Resource_Release(tmp[i]); free(tmp); }
+    if (list4) ID3D12GraphicsCommandList4_Release(list4);
+    if (list) ID3D12GraphicsCommandList_Release(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    d3d12_as_free(as);
+    ID3D12Device5_Release(dev5);
+    return NULL;
+}
+
+static void d3d12_destroy_acceleration_structure(void *ptr)
+{
+    vio_d3d12_as *as = (vio_d3d12_as *)ptr;
+    if (!as) return;
+    if (d3d12_bound_as == as) d3d12_bound_as = NULL;
+    /* A frame in flight may still read it: drain before releasing (rare). */
+    vio_d3d12_wait_for_gpu();
+    d3d12_as_free(as);
+}
+
+static void d3d12_bind_acceleration_structure(void *ptr, int binding)
+{
+    (void)binding;   /* the shader's structure always sits at t0, space9 */
+    d3d12_bound_as = (vio_d3d12_as *)ptr;
+}
+
+/* Graphics draws: the bound top level at root SRV [14] (root arguments reset
+ * with every SetGraphicsRootSignature, so every draw re-arms it). */
+static void d3d12_apply_accel(void)
+{
+    if (!d3d12_bound_as || !d3d12_bound_as->tlas || !vio_d3d12.cmd_list) return;
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(vio_d3d12.cmd_list, VIO_D3D12_RP_ACCEL,
+        ID3D12Resource_GetGPUVirtualAddress(d3d12_bound_as->tlas));
+}
+
 /* Multiview (VIO_FEATURE_MULTIVIEW): view instancing exists only in the
  * pipeline-state-stream API (ID3D12Device2::CreatePipelineState). The stream is
  * the graphics description subobject by subobject plus VIEW_INSTANCING; every
@@ -2009,6 +2244,7 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
  * re-arms it. */
 static void d3d12_apply_view_mask(void)
 {
+    d3d12_apply_accel();   /* every draw site calls this helper first */
     vio_d3d12_pipeline *p = d3d12_current_pipeline;
     if (!p || p->view_count <= 1 || !vio_d3d12.cmd_list) return;
     if (!vio_d3d12.cmd_list1 &&
@@ -5162,7 +5398,13 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
     uav_range.RegisterSpace = 0;
     uav_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER params[3] = {0};
+    D3D12_ROOT_PARAMETER params[4] = {0};
+
+    /* [3] root SRV t0, space9 — the ray-query acceleration structure, when used. */
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[3].Descriptor.ShaderRegister = 0;
+    params[3].Descriptor.RegisterSpace = 9;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     /* [0] root CBV — the Params block, at its reflected register b{cbv_register}.
      * With no UBO, park it at b0/space1 (never referenced -> no bind error). */
@@ -5184,7 +5426,7 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-    rs_desc.NumParameters = 3;
+    rs_desc.NumParameters = cp->uses_accel ? 4 : 3;
     rs_desc.pParameters = params;
     rs_desc.NumStaticSamplers = 0;
     rs_desc.pStaticSamplers = NULL;
@@ -5339,6 +5581,7 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
     cp->cbv_register = cbv_register;
     cp->srv_base_reg = srv_base_reg;
     cp->uav_base_reg = uav_base_reg;
+    cp->uses_accel   = strstr(hlsl, "RaytracingAccelerationStructure") != NULL;
 
     /* Build the per-pipeline root signature from the reflected registers. */
     if (d3d12_build_compute_root_signature(cp) != 0) {
@@ -5681,6 +5924,8 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
 
     ID3D12GraphicsCommandList_SetComputeRootSignature(list, cp->root_signature);
     ID3D12GraphicsCommandList_SetPipelineState(list, cp->pso);
+    if (cp->uses_accel && d3d12_bound_as && d3d12_bound_as->tlas)
+        ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(list, 3, ID3D12Resource_GetGPUVirtualAddress(d3d12_bound_as->tlas));
     ID3D12DescriptorHeap *heaps[] = { vio_d3d12.compute_srv_heap };
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
 
@@ -5928,6 +6173,9 @@ static int d3d12_supports_feature(vio_feature feature)
         /* SV_Barycentrics: SPIRV-Cross needs an HLSL target of 6.1. */
         /* InterlockedX64 on raw buffers (SM 6.6, mandatory there); vio_shader_reflect.c
          * renames SPIRV-Cross's 32-bit method names for 64-bit operands. */
+        /* Inline ray tracing: RayQuery (SM 6.5) needs DXR Tier 1.1. */
+        case VIO_FEATURE_RAY_QUERY:    return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 65
+                                              && vio_d3d12.raytracing_tier >= D3D12_RAYTRACING_TIER_1_1;
         /* View instancing (SV_ViewID, SM 6.1) through a pipeline-state stream. */
         case VIO_FEATURE_MULTIVIEW:    return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 61 && vio_d3d12.view_instancing > 0;
         case VIO_FEATURE_SHADER_FLOAT16: return vio_d3d12.shader_model == 6 && vio_d3d12.native16;   /* SM 6.2 half */
@@ -6484,6 +6732,9 @@ static const vio_backend d3d12_backend = {
     .update_texture          = d3d12_update_texture,
     .bind_stage_constants    = d3d12_bind_stage_constants,
     .gpu_info                = d3d12_gpu_info,
+    .create_acceleration_structure  = d3d12_create_acceleration_structure,
+    .destroy_acceleration_structure = d3d12_destroy_acceleration_structure,
+    .bind_acceleration_structure    = d3d12_bind_acceleration_structure,
 };
 
 void vio_backend_d3d12_register(void)
