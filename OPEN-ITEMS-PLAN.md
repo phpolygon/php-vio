@@ -64,4 +64,4 @@ und Feature-Matrix im selben Batch nachziehen.
 - [x] Batch 1 (Branch `feat/open-items-batch1`): A40 Test 169, A5 Test 170, A9 Test 171, A19 Test 172, E/F;
   Nebenbefund beim Schreiben von 172: D3D12 verlor die gebundene Pipeline über die Frame-Grenze und entfernte
   beim nächsten Draw das Device (Fix + Test 173).
-- [ ] Batch 2 · [ ] Batch 3 · [ ] Batch 4 · [ ] Batch 5 · [ ] Batch 6 · [ ] Batch 7
+- [x] Batch 2 (Branch `feat/open-items-batch2`): A31, A32, A12, A23, B4/B5, A11, A10, A27 — Tests 174–183. · [ ] Batch 3 · [ ] Batch 4 · [ ] Batch 5 · [ ] Batch 6 · [ ] Batch 7
