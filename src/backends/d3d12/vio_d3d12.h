@@ -522,7 +522,9 @@ typedef struct _vio_d3d12_state {
     int                        upload_alloc_idx;
     ID3D12GraphicsCommandList *upload_list;
     UINT64                     upload_last_fence;
-    struct { ID3D12Resource *res; UINT64 fence; } *upload_retire;
+    /* Any COM object (staging buffers, PSOs freed after vio_end) released once
+     * the fence passes. */
+    struct { IUnknown *res; UINT64 fence; } *upload_retire;
     int                        upload_retire_count;
     int                        upload_retire_cap;
 
