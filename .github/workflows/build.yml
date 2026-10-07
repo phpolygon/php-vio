@@ -138,6 +138,7 @@ jobs:
             tests/render3d/157_compute_derivatives_all_backends.phpt \
             tests/render3d/158_multiview_all_backends.phpt \
             tests/render3d/159_primitive_shading_rate_all_backends.phpt \
+            tests/render3d/160_shading_rate_image_all_backends.phpt \
             tests/render3d/161_bindless_all_backends.phpt
 
       - name: Package binary
@@ -274,6 +275,7 @@ jobs:
             tests/render3d/157_compute_derivatives_all_backends.phpt \
             tests/render3d/158_multiview_all_backends.phpt \
             tests/render3d/159_primitive_shading_rate_all_backends.phpt \
+            tests/render3d/160_shading_rate_image_all_backends.phpt \
             tests/render3d/161_bindless_all_backends.phpt
 
       - name: Package binary
@@ -574,7 +576,7 @@ jobs:
           $env:VIO_REQUIRE_BINDLESS = "d3d12"
           Write-Host "VIO_DXC_DIR=$env:VIO_DXC_DIR"
           # Which shader-model features WARP offers (tests skip what it lacks).
-          php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r '$c = vio_create("d3d12", ["width" => 8, "height" => 8, "headless" => true, "shader_model" => 6, "dxc_dir" => getenv("VIO_DXC_DIR")]); $i = vio_swapchain_info($c); printf("D3D12 SM %d (%d) subgroup=%d quad=%d barycentrics=%d atomic64=%d float16=%d base_vertex=%d compute_derivatives=%d multiview=%d bindless=%d\n", $i["shader_model"], $i["shader_model_version"], vio_supports_feature($c, VIO_FEATURE_SUBGROUP), vio_supports_feature($c, VIO_FEATURE_SUBGROUP_QUAD), vio_supports_feature($c, VIO_FEATURE_BARYCENTRICS), vio_supports_feature($c, VIO_FEATURE_ATOMIC64), vio_supports_feature($c, VIO_FEATURE_SHADER_FLOAT16), vio_supports_feature($c, VIO_FEATURE_BASE_VERTEX), vio_supports_feature($c, VIO_FEATURE_COMPUTE_DERIVATIVES), vio_supports_feature($c, VIO_FEATURE_MULTIVIEW), vio_supports_feature($c, VIO_FEATURE_BINDLESS));'
+          php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r '$c = vio_create("d3d12", ["width" => 8, "height" => 8, "headless" => true, "shader_model" => 6, "dxc_dir" => getenv("VIO_DXC_DIR")]); $i = vio_swapchain_info($c); printf("D3D12 SM %d (%d) subgroup=%d quad=%d barycentrics=%d atomic64=%d float16=%d base_vertex=%d compute_derivatives=%d multiview=%d shading_rate_image=%d bindless=%d\n", $i["shader_model"], $i["shader_model_version"], vio_supports_feature($c, VIO_FEATURE_SUBGROUP), vio_supports_feature($c, VIO_FEATURE_SUBGROUP_QUAD), vio_supports_feature($c, VIO_FEATURE_BARYCENTRICS), vio_supports_feature($c, VIO_FEATURE_ATOMIC64), vio_supports_feature($c, VIO_FEATURE_SHADER_FLOAT16), vio_supports_feature($c, VIO_FEATURE_BASE_VERTEX), vio_supports_feature($c, VIO_FEATURE_COMPUTE_DERIVATIVES), vio_supports_feature($c, VIO_FEATURE_MULTIVIEW), vio_supports_feature($c, VIO_FEATURE_SHADING_RATE_IMAGE), vio_supports_feature($c, VIO_FEATURE_BINDLESS));'
           $env:NO_INTERACTION = "1"
           $env:REPORT_EXIT_STATUS = "1"
           $env:TEST_PHP_ARGS = "-n -d extension_dir=$dllDir -d extension=php_vio.dll"
@@ -648,6 +650,7 @@ jobs:
             tests/render3d/157_compute_derivatives_all_backends.phpt `
             tests/render3d/158_multiview_all_backends.phpt `
             tests/render3d/159_primitive_shading_rate_all_backends.phpt `
+            tests/render3d/160_shading_rate_image_all_backends.phpt `
             tests/render3d/161_bindless_all_backends.phpt
 
       - name: Package binary

@@ -215,6 +215,17 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_backend_info, 0, 1, MAY_BE_A
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_shading_rate_image, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, rates, IS_STRING, 1)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, tilesX, IS_LONG, 0, "0")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, tilesY, IS_LONG, 0, "0")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_shading_rate_tile_size, 0, 1, IS_LONG, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_shading_rate, 0, 2, _IS_BOOL, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, rate, IS_LONG, 0)
@@ -909,6 +920,8 @@ ZEND_FUNCTION(vio_backend_info);
 ZEND_FUNCTION(vio_texture_index);
 ZEND_FUNCTION(vio_draw_indirect);
 ZEND_FUNCTION(vio_set_shading_rate);
+ZEND_FUNCTION(vio_set_shading_rate_image);
+ZEND_FUNCTION(vio_shading_rate_tile_size);
 ZEND_FUNCTION(vio_rect);
 ZEND_FUNCTION(vio_circle);
 ZEND_FUNCTION(vio_line);
@@ -1076,6 +1089,8 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_texture_index, arginfo_vio_texture_index)
 	ZEND_FE(vio_draw_indirect, arginfo_vio_draw_indirect)
 	ZEND_FE(vio_set_shading_rate, arginfo_vio_set_shading_rate)
+	ZEND_FE(vio_set_shading_rate_image, arginfo_vio_set_shading_rate_image)
+	ZEND_FE(vio_shading_rate_tile_size, arginfo_vio_shading_rate_tile_size)
 	ZEND_FE(vio_rect, arginfo_vio_rect)
 	ZEND_FE(vio_circle, arginfo_vio_circle)
 	ZEND_FE(vio_line, arginfo_vio_line)
