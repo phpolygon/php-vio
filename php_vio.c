@@ -11530,6 +11530,30 @@ ZEND_FUNCTION(vio_supports_feature)
     RETURN_BOOL(ctx->backend->supports_feature((vio_feature)feature) != 0);
 }
 
+/* supported / emulated / method of one VIO_FEATURE_* (OPEN-ITEMS-PLAN A9). */
+ZEND_FUNCTION(vio_feature_info)
+{
+    zval *ctx_zval;
+    zend_long feature;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(feature)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    int supported = ctx->backend && ctx->backend->supports_feature
+        && ctx->backend->supports_feature((vio_feature)feature) != 0;
+    const char *method = supported && ctx->backend->feature_emulation
+        ? ctx->backend->feature_emulation((vio_feature)feature) : NULL;
+
+    array_init(return_value);
+    add_assoc_bool(return_value, "supported", supported);
+    add_assoc_bool(return_value, "emulated", method != NULL);
+    if (method) add_assoc_string(return_value, "method", method);
+    else add_assoc_null(return_value, "method");
+}
+
 /* ── OpenGL diagnostics (Issue #3 part 3) ─────────────────────────── */
 
 ZEND_FUNCTION(vio_gl_info)

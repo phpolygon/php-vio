@@ -5906,6 +5906,25 @@ static int metal_describe(vio_backend_description *out)
     return 0;
 }
 
+/* vio_feature_info: features metal_supports_feature reports that Metal has no
+ * stage or call for. */
+static const char *metal_feature_emulation(vio_feature f)
+{
+    switch (f) {
+    case VIO_FEATURE_GEOMETRY:
+    case VIO_FEATURE_GEOMETRY_INSTANCING:
+        return "compute kernels (vertex + geometry) and a pass-through vertex function";
+    case VIO_FEATURE_MULTIVIEW:
+        return "instancing, one instance per view ([[render_target_array_index]])";
+    case VIO_FEATURE_RAY_QUERY:
+        /* Hardware ray tracing from Apple9 on; older GPUs run Metal's own
+         * software intersector behind the same API. */
+        return vio_mtl.caps.apple_family >= 9 ? NULL : "Metal software intersector (no ray tracing hardware)";
+    default:
+        return NULL;
+    }
+}
+
 static int metal_supports_feature(vio_feature f)
 {
     switch (f) {
@@ -6155,6 +6174,7 @@ static const vio_backend metal_backend = {
     .set_viewports     = metal_set_viewports,
     .dispatch_compute  = metal_dispatch_compute,
     .supports_feature  = metal_supports_feature,
+    .feature_emulation = metal_feature_emulation,
     .gpu_frame_time    = metal_gpu_frame_time,
     .swapchain_info    = metal_swapchain_info,
     .describe          = metal_describe,

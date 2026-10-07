@@ -1556,6 +1556,18 @@ function vio_gl_info(VioContext $context): array|false {}
 function vio_supports_feature(VioContext $context, int $feature): bool {}
 
 /**
+ * How the context's backend provides a VIO_FEATURE_* capability.
+ * 'supported' equals vio_supports_feature(); 'emulated' is true when the feature
+ * is reached by other means than the API's own stage or call (e.g. Metal runs a
+ * GLSL geometry shader as compute kernels, Metal multiview draws instances), and
+ * 'method' then names how. Emulated paths work, but usually cost more than on a
+ * backend that has the feature natively.
+ *
+ * @return array{supported: bool, emulated: bool, method: ?string}
+ */
+function vio_feature_info(VioContext $context, int $feature): array {}
+
+/**
  * Convenience alias for vio_render_target() with explicit option keys
  * (issue #4). Returns an object interchangeable with the existing API.
  */

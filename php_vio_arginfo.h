@@ -925,6 +925,11 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_supports_feature, 0, 2, _IS_
 	ZEND_ARG_TYPE_INFO(0, feature, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_feature_info, 0, 2, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, feature, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_create_render_target, 0, 3, VioRenderTarget, MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, width, IS_LONG, 0)
@@ -1128,6 +1133,7 @@ ZEND_FUNCTION(vio_bind_cubemap);
 ZEND_FUNCTION(vio_set_window_size);
 ZEND_FUNCTION(vio_gl_info);
 ZEND_FUNCTION(vio_supports_feature);
+ZEND_FUNCTION(vio_feature_info);
 ZEND_FUNCTION(vio_create_render_target);
 ZEND_FUNCTION(vio_set_render_target);
 ZEND_FUNCTION(vio_destroy_render_target);
@@ -1311,6 +1317,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_set_window_size, arginfo_vio_set_window_size)
 	ZEND_FE(vio_gl_info, arginfo_vio_gl_info)
 	ZEND_FE(vio_supports_feature, arginfo_vio_supports_feature)
+	ZEND_FE(vio_feature_info, arginfo_vio_feature_info)
 	ZEND_FE(vio_create_render_target, arginfo_vio_create_render_target)
 	ZEND_FE(vio_set_render_target, arginfo_vio_set_render_target)
 	ZEND_FE(vio_destroy_render_target, arginfo_vio_destroy_render_target)

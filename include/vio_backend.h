@@ -449,6 +449,12 @@ typedef struct _vio_backend {
     void  (*destroy_work_graph)(void *graph);
     void  (*work_graph_bind_buffer)(void *graph, void *buffer, int slot);
     void  (*dispatch_graph)(void *graph, const void *records, int count);
+
+    /* How a supported feature is reached when it is not the API's own stage or
+     * call (vio_feature_info): a short static description such as "compute
+     * kernels", or NULL when the feature is native or unsupported. NULL slot =>
+     * everything the backend reports is native. */
+    const char *(*feature_emulation)(vio_feature feature);
 } vio_backend;
 
 /*
