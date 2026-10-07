@@ -382,6 +382,8 @@ static void d3d12_apply_shading_rate(void)
     ID3D12GraphicsCommandList5_RSSetShadingRate(vio_d3d12.cmd_list5, r, NULL);
 }
 
+static void d3d12_retire_object_later(IUnknown *obj, UINT64 fence);
+
 static int d3d12_set_shading_rate(int rate)
 {
     if (vio_d3d12.vrs_tier <= 0) return -1;
@@ -1872,7 +1874,12 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
         if (vio_d3d12.in_frame && d3d12_pending_pso_count[slot] < VIO_D3D12_PENDING_PSO_MAX) {
             d3d12_pending_pso[slot][d3d12_pending_pso_count[slot]++] = pso;
         } else {
-            ID3D12PipelineState_Release(pso);
+            /* Between frames the last submitted frame may still run on the GPU
+             * (a pipeline freed right after vio_end): release once everything
+             * signalled so far has completed. The debug layer ends the process
+             * on a PSO deleted while still in use. */
+            if (vio_d3d12.device && vio_d3d12.fence) d3d12_retire_object_later((IUnknown *)pso, vio_d3d12.fence_value);
+            else ID3D12PipelineState_Release(pso);   /* context gone: nothing in flight */
         }
     }
     if (p->input_elements) free(p->input_elements);
@@ -2106,7 +2113,7 @@ static void d3d12_retire_uploads(int force)
     int kept = 0;
     for (int i = 0; i < vio_d3d12.upload_retire_count; i++) {
         if (force || vio_d3d12.upload_retire[i].fence <= done) {
-            ID3D12Resource_Release(vio_d3d12.upload_retire[i].res);
+            IUnknown_Release(vio_d3d12.upload_retire[i].res);
         } else {
             vio_d3d12.upload_retire[kept++] = vio_d3d12.upload_retire[i];
         }
@@ -2114,24 +2121,29 @@ static void d3d12_retire_uploads(int force)
     vio_d3d12.upload_retire_count = kept;
 }
 
-static void d3d12_retire_later(ID3D12Resource *res, UINT64 fence)
+static void d3d12_retire_object_later(IUnknown *obj, UINT64 fence)
 {
-    if (!res) return;
+    if (!obj) return;
     if (vio_d3d12.upload_retire_count >= vio_d3d12.upload_retire_cap) {
         int cap = vio_d3d12.upload_retire_cap ? vio_d3d12.upload_retire_cap * 2 : 32;
         void *grown = realloc(vio_d3d12.upload_retire, (size_t)cap * sizeof(*vio_d3d12.upload_retire));
         if (!grown) {
             /* Out of memory for bookkeeping: fall back to the old stall. */
             vio_d3d12_wait_for_gpu();
-            ID3D12Resource_Release(res);
+            IUnknown_Release(obj);
             return;
         }
         vio_d3d12.upload_retire = grown;
         vio_d3d12.upload_retire_cap = cap;
     }
-    vio_d3d12.upload_retire[vio_d3d12.upload_retire_count].res = res;
+    vio_d3d12.upload_retire[vio_d3d12.upload_retire_count].res = obj;
     vio_d3d12.upload_retire[vio_d3d12.upload_retire_count].fence = fence;
     vio_d3d12.upload_retire_count++;
+}
+
+static void d3d12_retire_later(ID3D12Resource *res, UINT64 fence)
+{
+    d3d12_retire_object_later((IUnknown *)res, fence);
 }
 
 /* Record + submit an upload list. Returns 0 on success; the submission's
