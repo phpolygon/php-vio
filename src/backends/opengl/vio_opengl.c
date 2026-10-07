@@ -1119,8 +1119,14 @@ static void opengl_destroy_render_target(void *rt_ptr)
  * the target's FBO, which must be bound as GL_FRAMEBUFFER. Colour and depth
  * carry the same layer structure; depth only exists at level 0, so smaller
  * levels render without depth (the Metal contract). */
+/* Multiview (see gl_mv_prepare): the target whose attachments are multiview
+ * attachments right now. Any re-attach below replaces them, so it resets this. */
+static void *gl_mv_rt = NULL;
+static int   gl_mv_views = 0;
+
 static void opengl_rt_attach_layer(vio_render_target_object *rt, int layer, int level)
 {
+    if (gl_mv_rt == rt) { gl_mv_rt = NULL; gl_mv_views = 0; }
     if (layer < 0) {
         /* VIO_RT_ALL_LAYERS: layered attachments (every face / layer); gl_Layer
          * in the geometry or vertex stage selects the destination. */
@@ -1806,8 +1812,6 @@ static const gl_shadow_entry *gl_shadow_entry_for(GLuint program)
  * attachments back. */
 #define GL_MV_MAX_PROGRAMS 64
 static struct { GLuint program; int views; unsigned int gen; } gl_mv_programs[GL_MV_MAX_PROGRAMS];
-static void *gl_mv_rt = NULL;     /* target whose attachments are multiview now */
-static int   gl_mv_views = 0;
 
 void vio_opengl_set_program_views(unsigned int program, int views)
 {
