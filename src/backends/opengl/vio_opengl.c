@@ -2651,8 +2651,14 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_DEPTH_BIAS:     return 1;
         case VIO_FEATURE_SCISSOR:        return 1;
         case VIO_FEATURE_TEXTURE_SWIZZLE: return vio_gl.caps.has_texture_swizzle;
-        case VIO_FEATURE_SUBGROUP:       return vio_gl.caps.has_subgroup;   /* GL_KHR_shader_subgroup */
-        case VIO_FEATURE_SUBGROUP_QUAD:  return vio_gl.caps.has_subgroup_quad;
+        /* The driver may have GL_KHR_shader_subgroup (has_subgroup / _quad, see
+         * vio_gl_info), but shaders reach GL through SPIRV-Cross, whose GLSL
+         * backend rejects shuffle, min/max/and/or/xor and every quad operation
+         * outside Vulkan semantics ("only supported in Vulkan semantics"). Only
+         * basic / vote / ballot / add / mul transpile, which is less than the
+         * flags promise, so both stay 0 on GL. */
+        case VIO_FEATURE_SUBGROUP:       return 0;
+        case VIO_FEATURE_SUBGROUP_QUAD:  return 0;
         case VIO_FEATURE_BARYCENTRICS:   return vio_gl.caps.has_barycentrics;
         case VIO_FEATURE_ATOMIC64:       return vio_gl.caps.has_atomic64;
         case VIO_FEATURE_SHADER_FLOAT16: return vio_gl.caps.has_float16;
@@ -2837,8 +2843,12 @@ int vio_opengl_setup_context(void)
     vio_gl.caps.has_subgroup = 0;
     vio_gl.caps.has_subgroup_quad = 0;
     vio_gl.caps.has_barycentrics = gl_has_ext("GL_EXT_fragment_shader_barycentric");
-    vio_gl.caps.has_atomic64 = vio_gl.caps.has_compute_shader && gl_has_ext("GL_ARB_gpu_shader_int64")
-                            && gl_has_ext("GL_NV_shader_atomic_int64");
+    /* 0 on GL: SPIRV-Cross declares 64-bit atomics as GL_EXT_shader_atomic_int64,
+     * which no GL driver exposes, and the one GL extension that has them
+     * (GL_NV_shader_atomic_int64, NVIDIA only) lacks the uint64_t overloads of
+     * atomicAdd / atomicExchange / atomicCompSwap (driver 2026-10, RTX 2080:
+     * only the int64_t ones compile). */
+    vio_gl.caps.has_atomic64 = 0;
     vio_gl.caps.has_float16 = gl_has_ext("GL_AMD_gpu_shader_half_float") || gl_has_ext("GL_NV_gpu_shader5");
     vio_gl.caps.has_draw_parameters = (gl_ge(4, 6) || gl_has_ext("GL_ARB_shader_draw_parameters"))
                                    && (gl_ge(4, 2) || gl_has_ext("GL_ARB_base_instance"));
