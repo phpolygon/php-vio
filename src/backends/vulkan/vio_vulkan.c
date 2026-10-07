@@ -286,7 +286,7 @@ static int create_logical_device(void)
     int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0, has_di = 0, has_m3 = 0;
     int has_as = 0, has_rq = 0, has_dho = 0, has_bda = 0, has_spv14 = 0, has_sfc = 0;
     int has_rtp = 0;
-    int has_mesh = 0, has_fc = 0, has_cm = 0, has_vmm = 0;
+    int has_mesh = 0, has_fc = 0, has_cm = 0, has_vmm = 0, has_ssc = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
@@ -310,6 +310,7 @@ static int create_logical_device(void)
         if (strcmp(ext_props[i].extensionName, "VK_EXT_mesh_shader") == 0) has_mesh = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_cooperative_matrix") == 0) has_cm = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_vulkan_memory_model") == 0) has_vmm = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_subgroup_size_control") == 0) has_ssc = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_fc = 1;
     }
     free(ext_props);
@@ -365,6 +366,16 @@ static int create_logical_device(void)
                     if (vrs_avail.primitiveFragmentShadingRate) {
                         vrs_enable.primitiveFragmentShadingRate = VK_TRUE;
                         vio_vk.vrs_primitive = 1;
+                        /* Without this limit a pipeline whose vertex stage writes the
+                         * rate may only have one viewport (vk3d pipelines carry
+                         * max_viewports otherwise). */
+                        VkPhysicalDeviceFragmentShadingRatePropertiesKHR vrs_props = {0};
+                        vrs_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR;
+                        VkPhysicalDeviceProperties2 p2 = {0};
+                        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                        p2.pNext = &vrs_props;
+                        vkGetPhysicalDeviceProperties2(vio_vk.physical_device, &p2);
+                        vio_vk.vrs_primitive_multi_viewport = vrs_props.primitiveFragmentShadingRateWithMultipleViewports ? 1 : 0;
                     }
                     VIO_VK_ADD_DEVICE_EXT(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
                     VIO_VK_ADD_DEVICE_EXT(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
@@ -447,7 +458,11 @@ static int create_logical_device(void)
         vio_vk.geometry_supported = vio_vk.tessellation_supported = 0;
         if (avail.geometryShader)     { features.geometryShader = VK_TRUE;     vio_vk.geometry_supported = 1; }
         if (avail.tessellationShader) { features.tessellationShader = VK_TRUE; vio_vk.tessellation_supported = 1; }
-        if (avail.shaderTessellationAndGeometryPointSize) features.shaderTessellationAndGeometryPointSize = VK_TRUE;
+        vio_vk.tess_geometry_point_size = 0;
+        if (avail.shaderTessellationAndGeometryPointSize) {
+            features.shaderTessellationAndGeometryPointSize = VK_TRUE;
+            vio_vk.tess_geometry_point_size = 1;
+        }
         /* vio_viewports: several viewports, gl_ViewportIndex picks one. */
         vio_vk.max_viewports = 1;
         if (avail.multiViewport) {
@@ -665,8 +680,12 @@ static int create_logical_device(void)
     vmm_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR;
     VkPhysicalDevice16BitStorageFeatures s16_enable = {0};
     s16_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT ssc_enable = {0};
+    ssc_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
+    vio_vk.full_subgroups = 0;
+    vio_vk.max_subgroup_size = 0;
     if (has_cm && has_vmm && vio_vk.instance_api_11
-        && device_ext_count + 2 <= (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
+        && device_ext_count + 3 <= (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
         VkPhysicalDeviceProperties dprops;
         vkGetPhysicalDeviceProperties(vio_vk.physical_device, &dprops);
         PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_props = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
@@ -677,13 +696,26 @@ static int create_logical_device(void)
         vmm_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR;
         VkPhysicalDevice16BitStorageFeatures s16_avail = {0};
         s16_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        VkPhysicalDeviceSubgroupSizeControlFeaturesEXT ssc_avail = {0};
+        ssc_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
         cm_avail.pNext = &vmm_avail;
         vmm_avail.pNext = &s16_avail;
+        if (has_ssc) s16_avail.pNext = &ssc_avail;
         VkPhysicalDeviceFeatures2 f2 = {0};
         f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         f2.pNext = &cm_avail;
         if (dprops.apiVersion >= VK_API_VERSION_1_1 && get_props) {
             vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+        }
+        /* Cooperative-matrix kernels need REQUIRE_FULL_SUBGROUPS (SPIR-V < 1.6). */
+        if (ssc_avail.computeFullSubgroups) {
+            VkPhysicalDeviceSubgroupSizeControlPropertiesEXT ssc_props = {0};
+            ssc_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT;
+            VkPhysicalDeviceProperties2 p2 = {0};
+            p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            p2.pNext = &ssc_props;
+            vkGetPhysicalDeviceProperties2(vio_vk.physical_device, &p2);
+            vio_vk.max_subgroup_size = ssc_props.maxSubgroupSize;
         }
         if (cm_avail.cooperativeMatrix && vmm_avail.vulkanMemoryModel) {
             coopmat_f16 = vio_vk.float16_supported && s16_avail.storageBuffer16BitAccess;
@@ -713,9 +745,17 @@ static int create_logical_device(void)
             if (vio_vk.coopmat_shape_count > 0) {
                 cm_enable.cooperativeMatrix = VK_TRUE;
                 vmm_enable.vulkanMemoryModel = VK_TRUE;
+                /* With the memory model on, every Device-scope atomic or barrier
+                 * (the default scope of GLSL atomics, test 154) needs this too. */
+                vmm_enable.vulkanMemoryModelDeviceScope = vmm_avail.vulkanMemoryModelDeviceScope;
                 if (coopmat_f16) s16_enable.storageBuffer16BitAccess = VK_TRUE;
                 VIO_VK_ADD_DEVICE_EXT("VK_KHR_cooperative_matrix");
                 VIO_VK_ADD_DEVICE_EXT("VK_KHR_vulkan_memory_model");
+                if (vio_vk.max_subgroup_size) {
+                    ssc_enable.computeFullSubgroups = VK_TRUE;
+                    vio_vk.full_subgroups = 1;
+                    VIO_VK_ADD_DEVICE_EXT("VK_EXT_subgroup_size_control");
+                }
             }
         }
     }
@@ -760,6 +800,7 @@ static int create_logical_device(void)
         vmm_enable.pNext = &cm_enable;
         feature_chain = &vmm_enable;
         if (coopmat_f16) { s16_enable.pNext = feature_chain; feature_chain = &s16_enable; }
+        if (vio_vk.full_subgroups) { ssc_enable.pNext = feature_chain; feature_chain = &ssc_enable; }
     }
 #endif
     (void)coopmat_f16;
@@ -2565,8 +2606,9 @@ static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, in
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                         0, 1, &mb, 0, NULL, 0, NULL);
+    /* HOST_WRITE belongs to the host stage, which ALL_COMMANDS does not cover. */
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0, 1, &mb, 0, NULL, 0, NULL);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt->pipeline);
     if (rt->binding_count > 0)
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt->layout, 0, 1, &rt->set, 0, NULL);
@@ -3728,6 +3770,15 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
         }
     }
 
+    /* Cooperative-matrix kernels must run on full subgroups (or be SPIR-V 1.6,
+     * which a Vulkan 1.1 instance cannot take); the flag also needs the
+     * workgroup width to be a multiple of the largest subgroup size. */
+    uint32_t full_subgroups = 0;
+    if (vio_vk.full_subgroups && vio_spirv_has_capability(spirv, spirv_size, 6022 /* CooperativeMatrixKHR */)) {
+        uint32_t lx = vio_spirv_local_size_x(spirv, spirv_size);
+        if (lx && vio_vk.max_subgroup_size && lx % vio_vk.max_subgroup_size == 0) full_subgroups = 1;
+    }
+
     /* Shader module straight from SPIR-V. */
     VkShaderModuleCreateInfo smi = {0};
     smi.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -3778,6 +3829,11 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
     cpi.stage.stage         = VK_SHADER_STAGE_COMPUTE_BIT;
     cpi.stage.module        = cp->module;
     cpi.stage.pName         = "main";
+#ifdef VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME
+    if (full_subgroups) cpi.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+#else
+    (void)full_subgroups;
+#endif
     cpi.layout              = cp->pipeline_layout;
     if (vkCreateComputePipelines(vio_vk.device, vio_vk.pipeline_cache, 1, &cpi, NULL, &cp->pipeline) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Vulkan: vkCreateComputePipelines failed");

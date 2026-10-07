@@ -42,6 +42,8 @@ void vio_hlsl_set_16bit_types(int enable);
 /* 1 when the SPIR-V module decorates a variable with BuiltIn `builtin`
  * (e.g. 4432 PrimitiveShadingRateKHR). Plain word scan, no SPIRV-Cross. */
 int vio_spirv_has_builtin(const void *spirv, size_t bytes, uint32_t builtin);
+int vio_spirv_has_capability(const void *spirv, size_t bytes, uint32_t capability);
+uint32_t vio_spirv_local_size_x(const void *spirv, size_t bytes);   /* 0 when not a literal LocalSize */
 /* Execution model of the module's first OpEntryPoint (0 = Vertex, 4 = Fragment,
  * 5364 = TaskEXT, 5365 = MeshEXT, ...), -1 when the words are no SPIR-V. */
 int vio_spirv_execution_model(const void *spirv, size_t bytes);

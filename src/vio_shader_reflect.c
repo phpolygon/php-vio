@@ -240,6 +240,35 @@ int vio_spirv_has_builtin(const void *spirv, size_t bytes, uint32_t builtin)
     return 0;
 }
 
+int vio_spirv_has_capability(const void *spirv, size_t bytes, uint32_t capability)
+{
+    const uint32_t *w = (const uint32_t *)spirv;
+    size_t n = bytes / 4;
+    if (!w || n < 5 || w[0] != 0x07230203u) return 0;
+    for (size_t i = 5; i < n; ) {
+        uint32_t count = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (count == 0) break;
+        if (op == 17 && count >= 2 && w[i + 1] == capability) return 1;   /* OpCapability */
+        i += count;
+    }
+    return 0;
+}
+
+uint32_t vio_spirv_local_size_x(const void *spirv, size_t bytes)
+{
+    const uint32_t *w = (const uint32_t *)spirv;
+    size_t n = bytes / 4;
+    if (!w || n < 5 || w[0] != 0x07230203u) return 0;
+    for (size_t i = 5; i < n; ) {
+        uint32_t count = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (count == 0) break;
+        /* OpExecutionMode %entry LocalSize x y z (LocalSizeId: spec constants, unknown here) */
+        if (op == 16 && count >= 6 && w[i + 2] == 17) return w[i + 3];
+        i += count;
+    }
+    return 0;
+}
+
 #ifdef HAVE_SPIRV_CROSS
 
 #include <spirv_cross/spirv_cross_c.h>

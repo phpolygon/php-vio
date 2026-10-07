@@ -325,6 +325,27 @@ static char *vk3d_gs_fixup(const char *glsl)
     return out;
 }
 
+/* With shaderTessellationAndGeometryPointSize enabled, a point_mode evaluation
+ * stage feeding the rasterizer must write PointSize (VUID-07723, before
+ * maintenance5). GLSL TES rarely do, so the stage gets gl_PointSize = 1.0 at
+ * the top of main - GL's default size. Takes ownership of `glsl`. */
+static char *vk3d_tes_point_size(char *glsl)
+{
+    if (!glsl || !strstr(glsl, "point_mode") || strstr(glsl, "gl_PointSize")) return glsl;
+    const char *m = strstr(glsl, "void main()");
+    const char *brace = m ? strchr(m, '{') : NULL;
+    if (!brace) return glsl;
+    static const char ins[] = "\n    gl_PointSize = 1.0;";
+    size_t head = (size_t)(brace + 1 - glsl), len = strlen(glsl);
+    char *out = (char *)malloc(len + sizeof(ins));
+    if (!out) return glsl;
+    memcpy(out, glsl, head);
+    memcpy(out + head, ins, sizeof(ins) - 1);
+    memcpy(out + head + sizeof(ins) - 1, glsl + head, len - head + 1);
+    free(glsl);
+    return out;
+}
+
 /* OpCapability RayQueryKHR (4472) in the module. */
 static int vk3d_uses_ray_query(const uint32_t *code, size_t bytes)
 {
@@ -363,7 +384,7 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     }
 
     char tag[24];
-    snprintf(tag, sizeof(tag), "vk3d-%s-3", stage_name);
+    snprintf(tag, sizeof(tag), "vk3d-%s-4", stage_name);   /* -4: point_mode TES write gl_PointSize */
     uint64_t key = vio_shader_cache_hash(tag, spirv, spirv_bytes);
     key = vio_shader_cache_hash_more(key, &upstream, sizeof(upstream));
     key = vio_shader_cache_hash_more(key, &is_last, sizeof(is_last));
@@ -398,6 +419,7 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
               : stage_id == VIO_STAGE_GEOMETRY ? vk3d_gs_fixup(glsl) : vk3d_vs_fixup(glsl);
     spvc_context_destroy(ctx);
     if (!src) return NULL;
+    if (stage_id == VIO_STAGE_TESS_EVAL && is_last && vio_vk.tess_geometry_point_size) src = vk3d_tes_point_size(src);
     if (stage_id == VIO_STAGE_VERTEX || stage_id == VIO_STAGE_TESS_EVAL) src = vio_glsl_require_viewport_layer_ext(src);
     if (stage_id == VIO_STAGE_FRAGMENT) src = vio_glsl_require_mesh_shader_ext(src);
     if (getenv("VIO_DUMP_VK_GLSL")) {
@@ -882,6 +904,9 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     VkPipelineViewportStateCreateInfo vp = {0};
     vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     vp.viewportCount = vio_vk.max_viewports > 1 ? vio_vk.max_viewports : 1;   /* vio_viewports */
+    /* A per-primitive shading rate needs a single viewport unless the device has
+     * primitiveFragmentShadingRateWithMultipleViewports (VUID-04503). */
+    if (sh->writes_shading_rate && !vio_vk.vrs_primitive_multi_viewport) vp.viewportCount = 1;
     vp.scissorCount  = vp.viewportCount;
 
     VkPipelineRasterizationStateCreateInfo rs = {0};

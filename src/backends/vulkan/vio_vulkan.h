@@ -271,6 +271,8 @@ typedef struct _vio_vulkan_state {
     int                      bc_supported;
     int                      vrs_supported;
     int                      vrs_primitive;        /* primitiveFragmentShadingRate enabled */
+    int                      vrs_primitive_multi_viewport;   /* primitiveFragmentShadingRateWithMultipleViewports */
+    int                      tess_geometry_point_size;       /* shaderTessellationAndGeometryPointSize enabled */
     /* VkPhysicalDeviceSubgroupProperties: basic / vote / ballot / arithmetic /
      * shuffle in the compute and fragment stages (VIO_FEATURE_SUBGROUP). */
     int                      subgroup_supported;
@@ -315,6 +317,10 @@ typedef struct _vio_vulkan_state {
      * subgroup-scope shapes whose component types the device can run (float16
      * needs shaderFloat16 + 16-bit storage buffers), read once at device creation. */
     int                      coopmat_shape_count;
+    /* VK_EXT_subgroup_size_control computeFullSubgroups (enabled with cooperative
+     * matrices, whose kernels must run on full subgroups) and maxSubgroupSize. */
+    int                      full_subgroups;
+    uint32_t                 max_subgroup_size;
     vio_coopmat_shape        coopmat_shapes[VIO_COOPMAT_MAX_SHAPES];
     /* HDR10 output (GAP-PHASE5 Block 10d): vio_create(['hdr_output' => 1|2]). */
     int                      hdr_request;          /* 0 off, 1 when the surface offers HDR10 ST 2084, 2 forced 10-bit */
