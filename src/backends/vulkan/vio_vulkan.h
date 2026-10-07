@@ -99,6 +99,8 @@ typedef struct _vio_vk_rt {
     VkImageView    all_color_view; /* layered bind: colour 2D_ARRAY over every layer, level 0 */
     VkImageView    all_depth_view; /* layered bind: depth 2D_ARRAY over every layer */
     VkFramebuffer  all_fb;         /* layered bind: framebuffer with layers = N (VIO_RT_ALL_LAYERS) */
+    VkRenderPass   mv_pass[3];     /* multiview passes for 2 / 3 / 4 views (viewMask), lazily */
+    VkFramebuffer  mv_fb[3];       /* their framebuffers: the 2D_ARRAY views, layers = 1 */
     VkSampler      sampler;
     struct _vio_vulkan_texture *wrap[4];   /* sampling wrappers (vio_render_target_texture) */
     struct _vio_vulkan_texture *cube_wrap; /* vio_render_target_cubemap */
@@ -277,6 +279,7 @@ typedef struct _vio_vulkan_state {
     int                      float16_supported;         /* VK_KHR_shader_float16_int8 shaderFloat16 enabled */
     int                      draw_parameters_supported; /* shaderDrawParameters + drawIndirectFirstInstance enabled */
     int                      compute_derivatives_supported; /* VK_NV / KHR_compute_shader_derivatives (quads) enabled */
+    int                      multiview_supported;       /* VkPhysicalDeviceMultiviewFeatures.multiview enabled (core 1.1) */
     int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
     int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
     void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */
@@ -464,6 +467,11 @@ void  vio_vk_resume_swapchain_pass(VkCommandBuffer cmd);
 /* Reopen the pass that was open before (bound render target layer / level, or the
  * swapchain) with LOAD, after vkCmdEndRenderPass for a compute dispatch or a flush. */
 void  vio_vk_resume_pass(VkCommandBuffer cmd);
+/* Multiview (VIO_FEATURE_MULTIVIEW): make the open render pass of the layered
+ * target bound with VIO_RT_ALL_LAYERS a multiview pass for `views` views (2..4),
+ * or switch it back to the plain layered pass for `views` = 0. Returns -1 when
+ * a multiview draw has no fitting target. */
+int   vio_vk_rt_ensure_views(int views);
 /* Submit the open frame's commands so far, wait, and reopen it (vio_compute_wait). */
 void  vio_vk_flush_frame(void);
 int   vio_vk_bind_render_target_face(void *rt, int face, int level);

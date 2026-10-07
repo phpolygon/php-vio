@@ -1706,6 +1706,7 @@ typedef struct _vio_metal_shader {
     /* Isolines / point_mode (metal_tess_emul_msl): vert_fn is vio_pass, the
      * TES runs as the capture function of an extra pass without rasterization. */
     int                 tess_emul;
+    int                 view_count;      /* multiview views (instancing emulation), 0 = off */
     int                 tess_emul_domain;  /* VIO_MSL_DOMAIN_* of the GLSL (isolines compiled as quads) */
     void               *tess_cap_fn;       /* id<MTLFunction>, +1 retained */
     void               *tess_cap_pso;      /* id<MTLRenderPipelineState>, +1 retained, built lazily */
@@ -1923,6 +1924,7 @@ static void *metal_compile_shader(vio_shader_desc *desc)
 
     char *err = NULL;
     const char *what = NULL;
+    metal_msl_multiview = desc->view_count > 1;   /* reset at the end and on failure */
     size_t vs_size = 0, fs_size = 0;
     int vs_owned = 0, fs_owned = 0;
     uint32_t *vs_spirv = NULL, *fs_spirv = NULL;
@@ -2002,6 +2004,8 @@ static void *metal_compile_shader(vio_shader_desc *desc)
         fs_msl_noout = metal_gfx_spirv_to_msl(fs_spirv, fs_size, VIO_MSL_FRAGMENT, &scratch, NULL, 0u, NULL, &err2);
         free(err2);
     }
+    metal_msl_multiview = 0;
+    sh->view_count = desc->view_count > 1 ? desc->view_count : 0;
 
     if (tess) {
         kfn = metal_build_function(vs_msl, &err);
@@ -2052,6 +2056,7 @@ static void *metal_compile_shader(vio_shader_desc *desc)
     return sh;
 
 fail:
+    metal_msl_multiview = 0;
     php_error_docref(NULL, E_WARNING, "Metal: %s failed: %s", what ? what : "shader compile", err ? err : "unknown");
     free(err);
     if (vs_owned) free(vs_spirv);
@@ -3339,7 +3344,8 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
         if (has_inst_attr) {
             vd.layouts[VIO_METAL_VB_INSTANCE].stride = 64;
             vd.layouts[VIO_METAL_VB_INSTANCE].stepFunction = MTLVertexStepFunctionPerInstance;
-            vd.layouts[VIO_METAL_VB_INSTANCE].stepRate = 1;
+            /* Multiview draws N emulated instances per real one. */
+            vd.layouts[VIO_METAL_VB_INSTANCE].stepRate = sh->view_count > 1 ? (NSUInteger)sh->view_count : 1;
         }
         if (sh->tess && !sh->tess_emul) {
             /* vert_fn is the TES: it reads the control points from the TCS
@@ -3517,7 +3523,21 @@ static int metal_prepare_draw(int stride)
     if (sh->vl.uses_instance_attribs && metal_identity_instance) {
         [enc setVertexBuffer:metal_identity_instance offset:0 atIndex:VIO_METAL_VB_INSTANCE];
     }
+    if (sh->view_count > 1) {
+        /* SPIRV-Cross's multiview view mask: {base view, view count}. */
+        uint32_t mask[2] = { 0u, (uint32_t)sh->view_count };
+        [enc setVertexBytes:mask length:sizeof(mask) atIndex:VIO_METAL_VIEW_MASK_INDEX];
+        [enc setFragmentBytes:mask length:sizeof(mask) atIndex:VIO_METAL_VIEW_MASK_INDEX];
+    }
     return 1;
+}
+
+/* Instances to issue for `n` user instances: x views under multiview. */
+static NSUInteger metal_mv_instances(NSUInteger n)
+{
+    vio_metal_pipeline *p = metal_current_pipeline;
+    int v = (p && p->shader) ? p->shader->view_count : 0;
+    return v > 1 ? n * (NSUInteger)v : n;
 }
 
 static void metal_bind_mesh_vb(void *vertex_buffer)
@@ -4305,7 +4325,7 @@ static void metal_draw(vio_draw_cmd *cmd)
     @autoreleasepool {
         if (!metal_prepare_draw(cmd->vertex_stride)) return;
         metal_bind_mesh_vb(cmd->vertex_buffer);
-        NSUInteger instances = cmd->instance_count > 0 ? (NSUInteger)cmd->instance_count : 1;
+        NSUInteger instances = metal_mv_instances(cmd->instance_count > 0 ? (NSUInteger)cmd->instance_count : 1);
         [vio_mtl.current_encoder drawPrimitives:metal_current_pipeline->primitive
                                     vertexStart:(NSUInteger)cmd->first_vertex
                                     vertexCount:(NSUInteger)cmd->vertex_count
@@ -4333,7 +4353,7 @@ static void metal_draw_indexed(vio_draw_indexed_cmd *cmd)
     @autoreleasepool {
         if (!metal_prepare_draw(cmd->vertex_stride)) return;
         metal_bind_mesh_vb(cmd->vertex_buffer);
-        NSUInteger instances = cmd->instance_count > 0 ? (NSUInteger)cmd->instance_count : 1;
+        NSUInteger instances = metal_mv_instances(cmd->instance_count > 0 ? (NSUInteger)cmd->instance_count : 1);
         [vio_mtl.current_encoder drawIndexedPrimitives:metal_current_pipeline->primitive
                                             indexCount:(NSUInteger)cmd->index_count
                                              indexType:(cmd->index_bytes == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32)
@@ -4356,14 +4376,14 @@ static void metal_draw_mesh_instances(vio_mesh_object *mesh, int instance_count)
                                              indexType:(mesh->index_bytes == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32)
                                            indexBuffer:(__bridge id<MTLBuffer>)ib->buffer
                                      indexBufferOffset:0
-                                         instanceCount:(NSUInteger)instance_count
+                                         instanceCount:metal_mv_instances((NSUInteger)instance_count)
                                             baseVertex:0
                                           baseInstance:0];
     } else if (mesh->vertex_count > 0) {
         [vio_mtl.current_encoder drawPrimitives:metal_current_pipeline->primitive
                                     vertexStart:0
                                     vertexCount:(NSUInteger)mesh->vertex_count
-                                  instanceCount:(NSUInteger)instance_count];
+                                  instanceCount:metal_mv_instances((NSUInteger)instance_count)];
     }
 }
 
@@ -4411,12 +4431,32 @@ static void metal_bind_storage_buffer(void *backend_buffer, int binding, int acc
 /* Indirect draw (GAP-PHASE5 Block 8): Metal's indirect argument structs share the
  * 5 / 4 uint32 layout, one draw per record. Per-instance storage binding as in
  * metal_draw_instanced_from_storage. */
+/* vio_bind_storage_buffer's buffer at the vertex stage's SSBO slot (its GLSL
+ * binding, else the first SSBO) - the indirect draws read per-instance data there. */
+static void metal_bind_pending_storage_vs(void)
+{
+    vio_metal_buffer *sb = metal_pending_storage;
+    if (!sb || !sb->buffer || !metal_current_pipeline || !metal_current_pipeline->shader) return;
+    vio_metal_stage_res *vs = &metal_current_pipeline->shader->vs;
+    int idx = -1;
+    for (int i = 0; i < vs->buffer_count; i++) {
+        if (vs->buffers[i].kind == 1 && vs->buffers[i].binding == metal_pending_storage_binding) { idx = vs->buffers[i].msl_index; break; }
+    }
+    if (idx < 0) {
+        for (int i = 0; i < vs->buffer_count; i++) { if (vs->buffers[i].kind == 1) { idx = vs->buffers[i].msl_index; break; } }
+    }
+    if (idx >= 0) {
+        [vio_mtl.current_encoder setVertexBuffer:(__bridge id<MTLBuffer>)sb->buffer offset:0 atIndex:(NSUInteger)idx];
+    }
+}
+
 static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_metal_buffer *args = (vio_metal_buffer *)args_buffer;
     if (!mesh || !args || !args->buffer || max_draws <= 0) return;
-    if (metal_tess_bound() || metal_gs_bound()) {
+    int mv = metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->view_count > 1;
+    if (metal_tess_bound() || metal_gs_bound() || mv) {
         int gs = metal_gs_bound();
         /* The tessellation / geometry kernels need the vertex and instance counts when they
          * are encoded, so the argument records are read on the CPU (the buffer
@@ -4453,6 +4493,30 @@ static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
                 uint32_t r[5];
                 memcpy(r, a + o, rec);
                 if (r[0] == 0 || r[1] == 0) continue;
+                if (mv) {
+                    /* Multiview: the GPU records hold the user's instance count;
+                     * issue the draw with it multiplied by the views. */
+                    if (!metal_prepare_draw(mesh->stride)) break;
+                    metal_bind_pending_storage_vs();
+                    metal_bind_mesh_vb(mesh->backend_vb);
+                    if (indexed) {
+                        [vio_mtl.current_encoder drawIndexedPrimitives:metal_current_pipeline->primitive
+                                                            indexCount:r[0]
+                                                             indexType:(mesh->index_bytes == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32)
+                                                           indexBuffer:(__bridge id<MTLBuffer>)tib->buffer
+                                                     indexBufferOffset:(NSUInteger)r[2] * (mesh->index_bytes == 2 ? 2 : 4)
+                                                         instanceCount:metal_mv_instances(r[1])
+                                                            baseVertex:(NSInteger)(int32_t)r[3]
+                                                          baseInstance:r[4]];
+                    } else {
+                        [vio_mtl.current_encoder drawPrimitives:metal_current_pipeline->primitive
+                                                    vertexStart:r[2]
+                                                    vertexCount:r[0]
+                                                  instanceCount:metal_mv_instances(r[1])
+                                                   baseInstance:r[3]];
+                    }
+                    continue;
+                }
                 void (*draw)(vio_metal_buffer *, int, int, int, vio_metal_buffer *, int, int, int, int,
                              const float *, int, int) = gs ? metal_draw_gs : metal_draw_tess;
                 if (indexed) {
@@ -4468,20 +4532,7 @@ static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
     }
     @autoreleasepool {
         if (!metal_prepare_draw(mesh->stride)) return;
-        vio_metal_buffer *sb = metal_pending_storage;
-        if (sb && sb->buffer) {
-            vio_metal_stage_res *vs = &metal_current_pipeline->shader->vs;
-            int idx = -1;
-            for (int i = 0; i < vs->buffer_count; i++) {
-                if (vs->buffers[i].kind == 1 && vs->buffers[i].binding == metal_pending_storage_binding) { idx = vs->buffers[i].msl_index; break; }
-            }
-            if (idx < 0) {
-                for (int i = 0; i < vs->buffer_count; i++) { if (vs->buffers[i].kind == 1) { idx = vs->buffers[i].msl_index; break; } }
-            }
-            if (idx >= 0) {
-                [vio_mtl.current_encoder setVertexBuffer:(__bridge id<MTLBuffer>)sb->buffer offset:0 atIndex:(NSUInteger)idx];
-            }
-        }
+        metal_bind_pending_storage_vs();
         metal_bind_mesh_vb(mesh->backend_vb);
         vio_metal_buffer *ib = (vio_metal_buffer *)mesh->backend_ib;
         id<MTLBuffer> argbuf = (__bridge id<MTLBuffer>)args->buffer;
@@ -5607,8 +5658,15 @@ static int metal_supports_feature(vio_feature f)
 #else
         return 0;
 #endif
-    case VIO_FEATURE_RAYTRACING:
     case VIO_FEATURE_MULTIVIEW:
+        /* SPIRV-Cross's instancing emulation writes [[render_target_array_index]]
+         * from the vertex stage (Mac2 / Apple5). */
+#ifdef HAVE_SPIRV_CROSS
+        return vio_mtl.caps.layered_vertex;
+#else
+        return 0;
+#endif
+    case VIO_FEATURE_RAYTRACING:
     default:
         return 0;
     }

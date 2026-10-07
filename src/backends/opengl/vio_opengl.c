@@ -1799,6 +1799,59 @@ static const gl_shadow_entry *gl_shadow_entry_for(GLuint program)
 
 /* Bind the comparison sampler to every unit the current program's shadow
  * samplers read; returns the bound units as a bit mask for gl_shadow_end(). */
+/* ── Multiview (GL_OVR_multiview2) ────────────────────────────────────
+ * A program compiled with 'view_count' draws every view into one layer of the
+ * target bound with VIO_RT_ALL_LAYERS: its attachments become multiview
+ * attachments (views 0..N-1) for the draw, and a plain program gets the layered
+ * attachments back. */
+#define GL_MV_MAX_PROGRAMS 64
+static struct { GLuint program; int views; unsigned int gen; } gl_mv_programs[GL_MV_MAX_PROGRAMS];
+static void *gl_mv_rt = NULL;     /* target whose attachments are multiview now */
+static int   gl_mv_views = 0;
+
+void vio_opengl_set_program_views(unsigned int program, int views)
+{
+    if (!program) return;
+    int slot = -1;
+    for (int i = 0; i < GL_MV_MAX_PROGRAMS; i++) {
+        if (gl_mv_programs[i].program == program && gl_mv_programs[i].gen == gl_context_generation) { slot = i; break; }
+        if (slot < 0 && (gl_mv_programs[i].program == 0 || gl_mv_programs[i].gen != gl_context_generation)) slot = i;
+    }
+    if (slot < 0) slot = (int)(program % GL_MV_MAX_PROGRAMS);
+    gl_mv_programs[slot].program = views > 1 ? program : 0;
+    gl_mv_programs[slot].views = views;
+    gl_mv_programs[slot].gen = gl_context_generation;
+}
+
+static void gl_mv_prepare(void)
+{
+    if (!vio_gl.caps.has_multiview) return;
+    GLint program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    int views = 0;
+    for (int i = 0; i < GL_MV_MAX_PROGRAMS && program > 0; i++) {
+        if (gl_mv_programs[i].program == (GLuint)program && gl_mv_programs[i].gen == gl_context_generation) { views = gl_mv_programs[i].views; break; }
+    }
+    vio_render_target_object *rt = (vio_render_target_object *)vio_gl.current_bound_rt;
+    if (gl_mv_rt && (gl_mv_rt != rt || views != gl_mv_views)) {
+        /* Back to the layered attachments of the previous multiview target. */
+        vio_render_target_object *old = (vio_render_target_object *)gl_mv_rt;
+        if (old == rt && rt->bound_face == VIO_RT_ALL_LAYERS) {
+            glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+            opengl_rt_attach_layer(rt, -1, 0);
+        }
+        gl_mv_rt = NULL;
+        gl_mv_views = 0;
+    }
+    if (views > 1 && rt && rt->bound_face == VIO_RT_ALL_LAYERS && rt->layers >= views && !gl_mv_rt) {
+        glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+        if (!rt->depth_only) glFramebufferTextureMultiviewOVR(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rt->color_texture, 0, 0, views);
+        glFramebufferTextureMultiviewOVR(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, rt->depth_texture, 0, 0, views);
+        gl_mv_rt = rt;
+        gl_mv_views = views;
+    }
+}
+
 static unsigned gl_shadow_begin(void)
 {
     if (!glBindSampler || !glGenSamplers) return 0;
@@ -1857,6 +1910,7 @@ static void opengl_draw_mesh(void *mesh_obj)
         used_default = 1;
     }
 
+    gl_mv_prepare();
     unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
     if (mesh->index_count > 0) {
@@ -1898,6 +1952,7 @@ static void opengl_draw_mesh_instanced(void *mesh_obj,
         glVertexAttribDivisor(loc, 1);
     }
 
+    gl_mv_prepare();
     unsigned shadow_units = gl_shadow_begin();
     if (mesh->index_count > 0) {
         glDrawElementsInstanced(gl_draw_mode(), mesh->index_count,
@@ -1944,6 +1999,7 @@ static void opengl_draw_instanced_from_storage(void *mesh_obj, int instance_coun
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!vio_gl.initialized || instance_count <= 0) return;
 
+    gl_mv_prepare();
     unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
     if (mesh->index_count > 0) {
@@ -1965,6 +2021,7 @@ static void opengl_draw_indirect(void *mesh_obj, void *args_buffer, int max_draw
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_opengl_compute_buffer *args = (vio_opengl_compute_buffer *)args_buffer;
     if (!vio_gl.initialized || !GLAD_GL_VERSION_4_0 || !mesh || !args || !args->ssbo || max_draws <= 0) return;
+    gl_mv_prepare();
     unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, args->ssbo);
@@ -2568,8 +2625,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_GEOMETRY:       return gl_ge(3, 2);   /* core in 3.3+ */
         case VIO_FEATURE_GEOMETRY_INSTANCING: return gl_ge(4, 0) || gl_has_ext("GL_ARB_gpu_shader5");
         case VIO_FEATURE_3D_PIPELINE:    return 1;
-        case VIO_FEATURE_RAYTRACING:
-        case VIO_FEATURE_MULTIVIEW:      return 0;             /* not exposed via core GL */
+        case VIO_FEATURE_RAYTRACING:     return 0;             /* not exposed via core GL */
         case VIO_FEATURE_READ_PIXELS:    return 1;
         case VIO_FEATURE_INSTANCED_DRAW: return 1;             /* core since 3.1 */
         case VIO_FEATURE_RENDER_TARGET:        return 1;
@@ -2598,6 +2654,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_SHADER_FLOAT16: return vio_gl.caps.has_float16;
         case VIO_FEATURE_BASE_VERTEX:    return vio_gl.caps.has_draw_parameters;
         case VIO_FEATURE_COMPUTE_DERIVATIVES: return vio_gl.caps.has_compute_derivatives;
+        case VIO_FEATURE_MULTIVIEW:      return vio_gl.caps.has_multiview;   /* GL_OVR_multiview2 */
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1;
         case VIO_FEATURE_DEBUG_OUTPUT:   return vio_gl.caps.has_debug_output;
         case VIO_FEATURE_DSA:            return vio_gl.caps.has_dsa;
@@ -2782,6 +2839,7 @@ int vio_opengl_setup_context(void)
     vio_gl.caps.has_draw_parameters = (gl_ge(4, 6) || gl_has_ext("GL_ARB_shader_draw_parameters"))
                                    && (gl_ge(4, 2) || gl_has_ext("GL_ARB_base_instance"));
     vio_gl.caps.has_compute_derivatives = vio_gl.caps.has_compute_shader && gl_has_ext("GL_NV_compute_shader_derivatives");
+    vio_gl.caps.has_multiview = gl_ge(3, 2) && gl_has_ext("GL_OVR_multiview2") && glFramebufferTextureMultiviewOVR != NULL;
     if (gl_has_ext("GL_KHR_shader_subgroup")) {
         GLint stages = 0, features = 0;
         glGetIntegerv(GL_SUBGROUP_SUPPORTED_STAGES_KHR, &stages);

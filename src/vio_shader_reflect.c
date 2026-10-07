@@ -203,6 +203,9 @@ static char *vio_glsl_fix_patch_vertices(char *glsl)
     return out;
 }
 
+static int vio_glsl_ovr_views = 0;
+void vio_glsl_set_ovr_view_count(int views) { vio_glsl_ovr_views = views > 0 ? views : 0; }
+
 char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, char **error_msg)
 {
     spvc_context ctx = NULL;
@@ -236,6 +239,9 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_GLSL_ES, SPVC_FALSE);
     /* Flatten UBOs to plain uniforms for GLSL <=420 (macOS only supports 410) */
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_GLSL_EMIT_UNIFORM_BUFFER_AS_PLAIN_UNIFORMS, SPVC_TRUE);
+    /* gl_ViewIndex -> gl_ViewID_OVR + layout(num_views = N) (vio_shader 'view_count'). */
+    if (vio_glsl_ovr_views > 0)
+        spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_GLSL_OVR_MULTIVIEW_VIEW_COUNT, (unsigned)vio_glsl_ovr_views);
     spvc_compiler_install_compiler_options(compiler, options);
 
     if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS) {
@@ -1165,6 +1171,7 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
 #else /* !HAVE_SPIRV_CROSS */
 
 void vio_hlsl_set_16bit_types(int enable) { (void)enable; }
+void vio_glsl_set_ovr_view_count(int views) { (void)views; }
 
 char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, char **error_msg)
 {

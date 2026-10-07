@@ -2657,6 +2657,30 @@ ZEND_FUNCTION(vio_shader)
         RETURN_FALSE;
     }
 
+    /* Multiview (VIO_FEATURE_MULTIVIEW): views per draw, 2..4 (the D3D12 view
+     * instancing limit). Refused, not ignored, without the feature. */
+    int view_count = 0;
+    {
+        zval *vc = zend_hash_str_find(config_ht, "view_count", sizeof("view_count") - 1);
+        if (vc) {
+            zend_long n = zval_get_long(vc);
+            if (n < 2 || n > 4) {
+                php_error_docref(NULL, E_WARNING, "vio_shader: 'view_count' must be 2..4, got " ZEND_LONG_FMT, n);
+                RETURN_FALSE;
+            }
+            if (!(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_MULTIVIEW))) {
+                php_error_docref(NULL, E_WARNING, "vio_shader: backend '%s' has no multiview (VIO_FEATURE_MULTIVIEW = 0)",
+                                 ctx->backend->name);
+                RETURN_FALSE;
+            }
+            if (want_geometry || want_tess) {
+                php_error_docref(NULL, E_WARNING, "vio_shader: 'view_count' with geometry / tessellation stages is not supported");
+                RETURN_FALSE;
+            }
+            view_count = (int)n;
+        }
+    }
+
     /* Get optional format (auto-detect if VIO_SHADER_AUTO) */
     vio_shader_format format = VIO_SHADER_AUTO;
     zval *fmt_zval = zend_hash_str_find(config_ht, "format", sizeof("format") - 1);
@@ -2719,6 +2743,7 @@ ZEND_FUNCTION(vio_shader)
     shader->backend = ctx->backend;
     shader->has_geometry     = want_geometry;
     shader->has_tessellation = want_tess;
+    shader->view_count = view_count;
 
     /* --- SPIR-V input: store directly --- */
     if (format == VIO_SHADER_SPIRV) {
@@ -2800,7 +2825,10 @@ ZEND_FUNCTION(vio_shader)
 
             for (int s = 0; s < VIO_STAGE_COUNT; s++) {
                 if (!spv[s]) continue;
+                /* GL_OVR_multiview2 needs the view count in the GLSL (num_views). */
+                vio_glsl_set_ovr_view_count(view_count);
                 glsl[s] = vio_spirv_to_glsl(spv[s], spv_size[s], glsl_version, &error_msg);
+                vio_glsl_set_ovr_view_count(0);
                 if (!glsl[s]) {
                     php_error_docref(NULL, E_WARNING, "%s SPIR-V to GLSL transpilation failed: %s",
                         stage_labels[s], error_msg ? error_msg : "unknown error");
@@ -2812,6 +2840,7 @@ ZEND_FUNCTION(vio_shader)
             }
 
             shader->program = vio_opengl_compile_program(glsl[0], glsl[1], glsl[2], glsl[3], glsl[4]);
+            if (view_count > 1) vio_opengl_set_program_views(shader->program, view_count);
             shader->gl_generation = vio_opengl_context_generation();
             for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);
 
@@ -2868,6 +2897,7 @@ ZEND_FUNCTION(vio_shader)
         desc.geometry_hlsl     = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)]) : NULL;
         desc.tess_control_hlsl = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]) : NULL;
         desc.tess_eval_hlsl    = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)]) : NULL;
+        desc.view_count        = view_count;
 
         shader->backend_shader = ctx->backend->compile_shader(&desc);
         if (!shader->backend_shader) {
@@ -3451,6 +3481,7 @@ ZEND_FUNCTION(vio_pipeline)
         desc.stencil_fail_op = pipe->stencil_fail_op;
         desc.stencil_depth_fail_op = pipe->stencil_depth_fail_op;
         desc.patch_vertices = pipe->patch_vertices;
+        desc.view_count = shader->view_count;
 
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
     }
@@ -10740,6 +10771,7 @@ ZEND_FUNCTION(vio_gl_info)
     add_assoc_bool(&features, "float16",                 vio_gl.caps.has_float16);
     add_assoc_bool(&features, "draw_parameters",         vio_gl.caps.has_draw_parameters);
     add_assoc_bool(&features, "compute_derivatives",     vio_gl.caps.has_compute_derivatives);
+    add_assoc_bool(&features, "multiview",               vio_gl.caps.has_multiview);
     add_assoc_zval(return_value, "features", &features);
     /* Raw GL_KHR_shader_subgroup limits (0 without the extension or compute). */
     add_assoc_long(return_value, "subgroup_stages",   vio_gl.caps.subgroup_stages);

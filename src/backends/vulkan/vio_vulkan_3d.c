@@ -688,6 +688,13 @@ static int vk3d_prepare(uint32_t stride, VkBuffer inst_buf, VkDeviceSize inst_of
     vio_vk3d_pipeline *p = vk3d.pipeline;
     if (!vio_vk.in_frame || !vio_vk.cur_render_pass || !p || p->dead || !p->shader || p->shader->dead) return -1;
     vio_vk3d_shader *sh = p->shader;
+    /* Multiview pipelines draw into a multiview pass over the layered target;
+     * plain pipelines need the plain pass back. */
+    if (vio_vk_rt_ensure_views(p->desc.view_count > 1 ? p->desc.view_count : 0) != 0) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: a multiview pipeline (view_count %d) needs a layered render target "
+                         "with at least that many layers bound with VIO_RT_ALL_LAYERS", p->desc.view_count);
+        return -1;
+    }
     VkPipeline pl = vk3d_pipeline_variant(p, stride);
     if (!pl) return -1;
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;

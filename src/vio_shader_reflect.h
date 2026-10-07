@@ -38,6 +38,8 @@ char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_mod
  * set by D3D12 under SM 6.2+ with Native16BitShaderOpsSupported, cleared by
  * every other D3D context. Process-wide, like the D3D backends themselves. */
 void vio_hlsl_set_16bit_types(int enable);
+/* GL_OVR_multiview2: views of the next vio_spirv_to_glsl calls (0 = off). */
+void vio_glsl_set_ovr_view_count(int views);
 
 /* Same, with explicit control over the GL -> D3D clip-space depth fixup
  * (z' = (z + w) / 2 on gl_Position writes). SPIRV-Cross applies it to EVERY

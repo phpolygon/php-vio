@@ -57,7 +57,7 @@ probe("opengl", [
     VIO_FEATURE_MRT                => 1,
     VIO_FEATURE_RENDER_TARGET_LAYERED => 1,   /* GL_TEXTURE_2D_ARRAY / depth cubemaps (GEOMETRY-STAGES-PLAN 1a) */
     VIO_FEATURE_RAYTRACING         => 0,
-    VIO_FEATURE_MULTIVIEW          => 0,
+    /* MULTIVIEW is device dependent here (GL_OVR_multiview2 / VkPhysicalDeviceMultiviewFeatures): test 158. */
 ]);
 
 /* Null: always 0 — it's the no-op test backend */
@@ -196,7 +196,7 @@ probe_fold("vulkan", [
     VIO_FEATURE_NATIVE_2D_BATCH    => 1,
     VIO_FEATURE_TEXTURE_3D         => 1,
     VIO_FEATURE_RAYTRACING         => 0,
-    VIO_FEATURE_MULTIVIEW          => 0,
+    /* MULTIVIEW is device dependent here (GL_OVR_multiview2 / VkPhysicalDeviceMultiviewFeatures): test 158. */
 ]);
 
 /* Metal (macOS) — full 3D pipeline + RT + 2D-batch + swizzle */

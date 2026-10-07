@@ -24,6 +24,13 @@
  * context before any shader is built. */
 static int metal_msl_target_version = 21;
 static int metal_msl_target_ios = 0;
+/* Multiview (vio_shader 'view_count'): set around the transpile of a multiview
+ * shader's vertex / fragment stage. SPIRV-Cross emulates the views with
+ * instancing - instance count x views, gl_ViewIndex from the instance, written
+ * to [[render_target_array_index]] - and reads {base view, view count} from
+ * [[buffer(VIO_METAL_VIEW_MASK_INDEX)]] (its default 24 is a tessellation slot). */
+static int metal_msl_multiview = 0;
+#define VIO_METAL_VIEW_MASK_INDEX 23
 
 static void metal_msl_set_target(int version, int ios)
 {
@@ -319,6 +326,11 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
 
     if (spvc_compiler_create_compiler_options(compiler, &opts) == SPVC_SUCCESS) {
         metal_msl_apply_target(opts, is_tess ? 21 : 20);
+        if (metal_msl_multiview && (stage == VIO_MSL_VERTEX || stage == VIO_MSL_FRAGMENT)) {
+            spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_MSL_MULTIVIEW, SPVC_TRUE);
+            spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_MSL_MULTIVIEW_LAYERED_RENDERING, SPVC_TRUE);
+            spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_VIEW_MASK_BUFFER_INDEX, VIO_METAL_VIEW_MASK_INDEX);
+        }
         if (stage == VIO_MSL_FRAGMENT) {
             spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_ENABLE_FRAG_OUTPUT_MASK, frag_output_mask);
         }

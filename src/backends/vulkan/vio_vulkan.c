@@ -452,6 +452,9 @@ static int create_logical_device(void)
     vio_vk.float16_supported = vio_vk.draw_parameters_supported = vio_vk.compute_derivatives_supported = 0;
     VkPhysicalDeviceShaderFloat16Int8FeaturesKHR f16_enable = {0};
     f16_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;
+    VkPhysicalDeviceMultiviewFeatures mv_enable = {0};
+    mv_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES;
+    vio_vk.multiview_supported = 0;
     VkPhysicalDeviceShaderDrawParametersFeatures dp_enable = {0};
     dp_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
     VkPhysicalDeviceComputeShaderDerivativesFeaturesNV cd_enable = {0};
@@ -462,6 +465,8 @@ static int create_logical_device(void)
         if (dprops.apiVersion >= VK_API_VERSION_1_1) {
             VkPhysicalDeviceShaderFloat16Int8FeaturesKHR f16_avail = {0};
             f16_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;
+            VkPhysicalDeviceMultiviewFeatures mv_avail = {0};
+            mv_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES;
             VkPhysicalDeviceShaderDrawParametersFeatures dp_avail = {0};
             dp_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
             VkPhysicalDeviceComputeShaderDerivativesFeaturesNV cd_avail = {0};
@@ -471,8 +476,13 @@ static int create_logical_device(void)
             if (!has_f16) dp_avail.pNext = (has_cd_nv || has_cd_khr) ? (void *)&cd_avail : NULL;
             VkPhysicalDeviceFeatures2 f2 = {0};
             f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            f2.pNext = &dp_avail;
+            mv_avail.pNext = &dp_avail;
+            f2.pNext = &mv_avail;
             vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+            if (mv_avail.multiview) {
+                mv_enable.multiview = VK_TRUE;
+                vio_vk.multiview_supported = 1;
+            }
             if (has_f16 && f16_avail.shaderFloat16) {
                 f16_enable.shaderFloat16 = VK_TRUE;
                 device_extensions[device_ext_count++] = "VK_KHR_shader_float16_int8";
@@ -513,6 +523,7 @@ static int create_logical_device(void)
     if (vio_vk.float16_supported) { f16_enable.pNext = feature_chain; feature_chain = &f16_enable; }
     if (vio_vk.draw_parameters_supported) { dp_enable.pNext = feature_chain; feature_chain = &dp_enable; }
     if (vio_vk.compute_derivatives_supported) { cd_enable.pNext = feature_chain; feature_chain = &cd_enable; }
+    if (vio_vk.multiview_supported) { mv_enable.pNext = feature_chain; feature_chain = &mv_enable; }
     create_info.pNext = feature_chain;
 
     VkResult result = vkCreateDevice(vio_vk.physical_device, &create_info, NULL, &vio_vk.device);
@@ -3520,7 +3531,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_GEOMETRY_INSTANCING: return vio_vk3d_available() && vio_vk.device && vio_vk.geometry_supported;
         case VIO_FEATURE_3D_PIPELINE:  return vio_vk3d_available(); /* GAP-PHASE5 Block 10 */
         case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
-        case VIO_FEATURE_MULTIVIEW:    return 0; /* VK_KHR_multiview not wired */
+        case VIO_FEATURE_MULTIVIEW:    return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_supported; /* VkRenderPassMultiviewCreateInfo */
         case VIO_FEATURE_READ_PIXELS:  return 1; /* vkCmdCopyImageToBuffer readback of a RE-ACQUIRED swapchain image (see vulkan_read_pixels); requires the swapchain's TRANSFER_SRC usage added in create_swapchain */
         case VIO_FEATURE_INSTANCED_DRAW: return vio_vk3d_available(); /* per-instance binding 1 from the frame ring */
         case VIO_FEATURE_RENDER_TARGET:       return 1; /* offscreen RT + render-to-texture (Phase 3) */

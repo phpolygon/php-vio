@@ -174,6 +174,9 @@ typedef enum _vio_feature {
     VIO_FEATURE_RAYTRACING   = 1,
     VIO_FEATURE_TESSELLATION = 2,
     VIO_FEATURE_GEOMETRY     = 3,
+    /* vio_shader(['view_count' => 2..4]) + a layered target bound with
+     * VIO_RT_ALL_LAYERS: one draw renders every view, view v (gl_ViewIndex,
+     * GL_EXT_multiview) into layer v. Stereo / several shadow cascades per draw. */
     VIO_FEATURE_MULTIVIEW    = 4,
     /* Backend has a wired 3D draw pipeline (create_pipeline / create_buffer /
      * create_texture / draw / draw_indexed all functional). Returns 0 when
@@ -507,6 +510,8 @@ typedef struct _vio_pipeline_desc {
     int              stencil_depth_fail_op;  /* vio_stencil_op: stencil passed, depth failed */
     int              patch_vertices;         /* control points per patch for
                                                 VIO_PATCHES (1..32; 0 => 3). */
+    int              view_count;             /* multiview: views per draw (the
+                                                shader's 'view_count', 2..4); 0 = off */
 } vio_pipeline_desc;
 
 typedef struct _vio_buffer_desc {
@@ -596,6 +601,10 @@ typedef struct _vio_shader_desc {
     const char       *geometry_hlsl;
     const char       *tess_control_hlsl;
     const char       *tess_eval_hlsl;
+    /* vio_shader(['view_count' => N]) (VIO_FEATURE_MULTIVIEW): the stages use
+     * gl_ViewIndex and every draw runs N times, view v into layer v of a target
+     * bound with VIO_RT_ALL_LAYERS. 0 = not a multiview shader. */
+    int               view_count;
 } vio_shader_desc;
 
 /* Shader stage index shared by vio_shader_object's per-stage constant

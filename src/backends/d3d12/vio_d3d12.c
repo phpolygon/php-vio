@@ -968,6 +968,7 @@ static int d3d12_init(vio_config *cfg)
     vio_d3d12.barycentrics = 0;
     vio_d3d12.int64_ops = 0;
     vio_d3d12.native16 = 0;
+    vio_d3d12.view_instancing = 0;
     /* Variable rate shading capability (GAP-PHASE5 Block 12). */
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {0};
@@ -1011,6 +1012,8 @@ static int d3d12_init(vio_config *cfg)
             D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {0};
             if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
                 vio_d3d12.barycentrics = o3.BarycentricsSupported ? 1 : 0;
+            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
+                vio_d3d12.view_instancing = (int)o3.ViewInstancingTier;
             vio_hlsl_set_16bit_types(vio_d3d12.native16);
         } else {
             php_error_docref(NULL, E_NOTICE, "D3D12: shader_model 6 requested but %s; using FXC (SM 5.1)",
@@ -1349,6 +1352,8 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.mipgen_rs)      ID3D12RootSignature_Release(vio_d3d12.mipgen_rs);
     if (vio_d3d12.mipgen_heap)    ID3D12DescriptorHeap_Release(vio_d3d12.mipgen_heap);
     if (vio_d3d12.cmd_list5)      ID3D12GraphicsCommandList5_Release(vio_d3d12.cmd_list5);
+    if (vio_d3d12.cmd_list1)      ID3D12GraphicsCommandList1_Release(vio_d3d12.cmd_list1);
+    vio_d3d12.cmd_list1 = NULL;
     if (vio_d3d12.ts_readback)    ID3D12Resource_Release(vio_d3d12.ts_readback);
     if (vio_d3d12.ts_heap)        ID3D12QueryHeap_Release(vio_d3d12.ts_heap);
     if (vio_d3d12.fence)          ID3D12Fence_Release(vio_d3d12.fence);
@@ -1653,6 +1658,74 @@ static void d3d12_fill_rt_blend(D3D12_RENDER_TARGET_BLEND_DESC *b, int blend, in
     }
 }
 
+/* Multiview (VIO_FEATURE_MULTIVIEW): view instancing exists only in the
+ * pipeline-state-stream API (ID3D12Device2::CreatePipelineState). The stream is
+ * the graphics description subobject by subobject plus VIEW_INSTANCING; every
+ * subobject starts pointer-aligned with its value after the 4-byte type at the
+ * value's own alignment (the CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT layout). */
+static void d3d12_pss_add(unsigned char *buf, size_t *off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type,
+                          const void *value, size_t size, size_t align)
+{
+    size_t o = (*off + 7) & ~(size_t)7;
+    memcpy(buf + o, &type, sizeof(type));
+    size_t vo = (o + sizeof(type) + align - 1) & ~(align - 1);
+    memcpy(buf + vo, value, size);
+    *off = (vo + size + 7) & ~(size_t)7;
+}
+
+static HRESULT d3d12_create_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d, int view_count, ID3D12PipelineState **out)
+{
+    if (view_count <= 1)
+        return ID3D12Device_CreateGraphicsPipelineState(vio_d3d12.device, d, &IID_ID3D12PipelineState, (void **)out);
+    ID3D12Device2 *dev2 = NULL;
+    if (FAILED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device2, (void **)&dev2)) || !dev2)
+        return E_NOINTERFACE;
+    /* View v renders into slice v of the all-slices RTV / DSV (VIO_RT_ALL_LAYERS). */
+    D3D12_VIEW_INSTANCE_LOCATION loc[4];
+    for (int v = 0; v < 4; v++) { loc[v].ViewportArrayIndex = 0; loc[v].RenderTargetArrayIndex = (UINT)v; }
+    D3D12_VIEW_INSTANCING_DESC vi;
+    vi.ViewInstanceCount      = (UINT)view_count;
+    vi.pViewInstanceLocations = loc;
+    vi.Flags                  = D3D12_VIEW_INSTANCING_FLAG_NONE;
+    struct D3D12_RT_FORMAT_ARRAY rtf;   /* d3d12.h declares it without a typedef */
+    memset(&rtf, 0, sizeof(rtf));
+    rtf.NumRenderTargets = d->NumRenderTargets;
+    memcpy(rtf.RTFormats, d->RTVFormats, sizeof(rtf.RTFormats));
+    ID3D12RootSignature *rs = d->pRootSignature;
+    UINT sample_mask = d->SampleMask, node_mask = d->NodeMask;
+    UINT64 storage[160];
+    unsigned char *buf = (unsigned char *)storage;
+    memset(storage, 0, sizeof(storage));
+    size_t off = 0;
+#define VIO_PSS(T, V, A) d3d12_pss_add(buf, &off, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_##T, &(V), sizeof(V), (A))
+    VIO_PSS(ROOT_SIGNATURE, rs, sizeof(void *));
+    if (d->VS.pShaderBytecode) VIO_PSS(VS, d->VS, sizeof(void *));
+    if (d->PS.pShaderBytecode) VIO_PSS(PS, d->PS, sizeof(void *));
+    if (d->DS.pShaderBytecode) VIO_PSS(DS, d->DS, sizeof(void *));
+    if (d->HS.pShaderBytecode) VIO_PSS(HS, d->HS, sizeof(void *));
+    if (d->GS.pShaderBytecode) VIO_PSS(GS, d->GS, sizeof(void *));
+    VIO_PSS(BLEND, d->BlendState, 4);
+    VIO_PSS(SAMPLE_MASK, sample_mask, 4);
+    VIO_PSS(RASTERIZER, d->RasterizerState, 4);
+    VIO_PSS(DEPTH_STENCIL, d->DepthStencilState, 4);
+    VIO_PSS(INPUT_LAYOUT, d->InputLayout, sizeof(void *));
+    VIO_PSS(IB_STRIP_CUT_VALUE, d->IBStripCutValue, 4);
+    VIO_PSS(PRIMITIVE_TOPOLOGY, d->PrimitiveTopologyType, 4);
+    VIO_PSS(RENDER_TARGET_FORMATS, rtf, 4);
+    VIO_PSS(DEPTH_STENCIL_FORMAT, d->DSVFormat, 4);
+    VIO_PSS(SAMPLE_DESC, d->SampleDesc, 4);
+    VIO_PSS(NODE_MASK, node_mask, 4);
+    VIO_PSS(FLAGS, d->Flags, 4);
+    VIO_PSS(VIEW_INSTANCING, vi, sizeof(void *));
+#undef VIO_PSS
+    D3D12_PIPELINE_STATE_STREAM_DESC sd;
+    sd.SizeInBytes                   = off;
+    sd.pPipelineStateSubobjectStream = buf;
+    HRESULT hr = ID3D12Device2_CreatePipelineState(dev2, &sd, &IID_ID3D12PipelineState, (void **)out);
+    ID3D12Device2_Release(dev2);
+    return hr;
+}
+
 static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
 {
     vio_d3d12_pipeline *pipeline = calloc(1, sizeof(vio_d3d12_pipeline));
@@ -1820,9 +1893,8 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     pso_desc.SampleDesc.Count = 1;
     pso_desc.SampleMask = UINT_MAX;
 
-    HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(vio_d3d12.device, &pso_desc,
-                                                           &IID_ID3D12PipelineState,
-                                                           (void **)&pipeline->pso);
+    pipeline->view_count = desc->view_count > 1 ? desc->view_count : 0;
+    HRESULT hr = d3d12_create_pso(&pso_desc, pipeline->view_count, &pipeline->pso);
     if (FAILED(hr)) {
         d3d12_drain_info_queue("create_pso_fail");
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create PSO (0x%08lx)", hr);
@@ -1866,7 +1938,7 @@ static ID3D12PipelineState *d3d12_pipeline_pso_for_target(vio_d3d12_pipeline *p,
     d.SampleDesc.Quality = 0;
     d.RTVFormats[0] = want_fmt;
     ID3D12PipelineState *pso = NULL;
-    HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(vio_d3d12.device, &d, &IID_ID3D12PipelineState, (void **)&pso);
+    HRESULT hr = d3d12_create_pso(&d, p->view_count, &pso);
     if (FAILED(hr) || !pso) {
         d3d12_drain_info_queue("create_pso_variant_fail");
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create PSO variant (samples %u, format %d) (0x%08lx)", want_samples, (int)want_fmt, hr);
@@ -1921,11 +1993,25 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
 /* Re-issue the bound pipeline's PSO for the sample count of the (new) bound
  * target — called after render-target binds / unbinds so "bind pipeline, then
  * bind target" orders pick the right variant too. */
+/* Multiview: enable every view of the bound PSO (views 0..N-1 -> slices
+ * 0..N-1). The mask is command-list state that a Reset clears, so every draw
+ * re-arms it. */
+static void d3d12_apply_view_mask(void)
+{
+    vio_d3d12_pipeline *p = d3d12_current_pipeline;
+    if (!p || p->view_count <= 1 || !vio_d3d12.cmd_list) return;
+    if (!vio_d3d12.cmd_list1 &&
+        FAILED(ID3D12GraphicsCommandList_QueryInterface(vio_d3d12.cmd_list, &IID_ID3D12GraphicsCommandList1, (void **)&vio_d3d12.cmd_list1)))
+        vio_d3d12.cmd_list1 = NULL;
+    if (vio_d3d12.cmd_list1) ID3D12GraphicsCommandList1_SetViewInstanceMask(vio_d3d12.cmd_list1, (1u << p->view_count) - 1u);
+}
+
 static void d3d12_rearm_pso_for_target(void)
 {
     if (!d3d12_current_pipeline || !vio_d3d12.cmd_list || !vio_d3d12.in_frame) return;
     ID3D12PipelineState *pso = d3d12_pipeline_pso_for_target(d3d12_current_pipeline, vio_d3d12.current_rt_samples, vio_d3d12.current_rt_format);
     if (pso) ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list, pso);
+    d3d12_apply_view_mask();
 }
 
 static void d3d12_bind_pipeline(void *pipeline_ptr)
@@ -1940,6 +2026,7 @@ static void d3d12_bind_pipeline(void *pipeline_ptr)
                                                         vio_d3d12.root_signature);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(vio_d3d12.cmd_list, p->topology);
     ID3D12GraphicsCommandList_OMSetStencilRef(vio_d3d12.cmd_list, p->stencil_ref);
+    d3d12_apply_view_mask();   /* also covers vio_draw_instanced's draw in php_vio.c */
 
     /* Bind SRV + sampler heaps. Also invalidates the cached root arguments for
      * params 2 / 4 (SetGraphicsRootSignature / SetDescriptorHeaps may reset
@@ -4693,6 +4780,7 @@ static void d3d12_draw(vio_draw_cmd *cmd)
     vio_d3d12_flush_srv_table();
 
     UINT instance_count = cmd->instance_count > 0 ? cmd->instance_count : 1;
+    d3d12_apply_view_mask();
     ID3D12GraphicsCommandList_DrawInstanced(vio_d3d12.cmd_list,
                                              cmd->vertex_count,
                                              instance_count,
@@ -4730,6 +4818,7 @@ static void d3d12_draw_indexed(vio_draw_indexed_cmd *cmd)
     vio_d3d12_flush_srv_table();
 
     UINT instance_count = cmd->instance_count > 0 ? cmd->instance_count : 1;
+    d3d12_apply_view_mask();
     ID3D12GraphicsCommandList_DrawIndexedInstanced(vio_d3d12.cmd_list,
                                                     cmd->index_count,
                                                     instance_count,
@@ -5825,13 +5914,14 @@ static int d3d12_supports_feature(vio_feature feature)
         /* SV_Barycentrics: SPIRV-Cross needs an HLSL target of 6.1. */
         /* InterlockedX64 on raw buffers (SM 6.6, mandatory there); vio_shader_reflect.c
          * renames SPIRV-Cross's 32-bit method names for 64-bit operands. */
+        /* View instancing (SV_ViewID, SM 6.1) through a pipeline-state stream. */
+        case VIO_FEATURE_MULTIVIEW:    return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 61 && vio_d3d12.view_instancing > 0;
         case VIO_FEATURE_SHADER_FLOAT16: return vio_d3d12.shader_model == 6 && vio_d3d12.native16;   /* SM 6.2 half */
         case VIO_FEATURE_BASE_VERTEX:  return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 68; /* SV_Start*Location */
         case VIO_FEATURE_COMPUTE_DERIVATIVES: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 66;
         case VIO_FEATURE_ATOMIC64:     return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 66 && vio_d3d12.int64_ops;
         case VIO_FEATURE_BARYCENTRICS: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 61 && vio_d3d12.barycentrics;
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
-        case VIO_FEATURE_MULTIVIEW:    return 0;
         case VIO_FEATURE_3D_PIPELINE:  return 1;
         case VIO_FEATURE_READ_PIXELS:  return 1;
         case VIO_FEATURE_INSTANCED_DRAW: return 1;
@@ -5918,9 +6008,11 @@ static void d3d12_draw_instanced_from_storage(void *mesh_obj, int instance_count
         ibv.SizeInBytes = (UINT)ib->size;
         ibv.Format = mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
         ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
+        d3d12_apply_view_mask();
         ID3D12GraphicsCommandList_DrawIndexedInstanced(vio_d3d12.cmd_list,
             (UINT)mesh->index_count, (UINT)instance_count, 0, 0, 0);
     } else {
+        d3d12_apply_view_mask();
         ID3D12GraphicsCommandList_DrawInstanced(vio_d3d12.cmd_list,
             (UINT)mesh->vertex_count, (UINT)instance_count, 0, 0);
     }
@@ -5989,6 +6081,7 @@ static void d3d12_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
         b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
         ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 2, b);
     }
+    d3d12_apply_view_mask();
     ID3D12GraphicsCommandList_ExecuteIndirect(vio_d3d12.cmd_list, sig, (UINT)max_draws, args->resource, (UINT64)offset, NULL, 0);
     if (live_uav) {
         D3D12_RESOURCE_BARRIER b = {0};

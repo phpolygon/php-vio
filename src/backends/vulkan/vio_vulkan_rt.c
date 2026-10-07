@@ -142,8 +142,9 @@ static void vkrt_dependency(VkSubpassDependency *dep)
     dep->dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 }
 
-/* Attachments: colour 0..count-1, depth, then (MSAA) the resolve targets. */
-static VkRenderPass vkrt_pass(const vio_vk_rt *x, int with_depth)
+/* Attachments: colour 0..count-1, depth, then (MSAA) the resolve targets.
+ * views > 1: a multiview pass rendering views 0..views-1 (VK_KHR_multiview, core 1.1). */
+static VkRenderPass vkrt_pass_views(const vio_vk_rt *x, int with_depth, int views)
 {
     VkAttachmentDescription a[9];
     VkAttachmentReference cref[4], rref[4], dref;
@@ -208,9 +209,24 @@ static VkRenderPass vkrt_pass(const vio_vk_rt *x, int with_depth)
     ri.pSubpasses      = &sp;
     ri.dependencyCount = 1;
     ri.pDependencies   = &dep;
+    uint32_t view_mask = views > 1 ? (1u << views) - 1u : 0u;
+    VkRenderPassMultiviewCreateInfo mv = {0};
+    if (views > 1) {
+        mv.sType                = VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO;
+        mv.subpassCount         = 1;
+        mv.pViewMasks           = &view_mask;
+        mv.correlationMaskCount = 1;
+        mv.pCorrelationMasks    = &view_mask;
+        ri.pNext                = &mv;
+    }
     VkRenderPass rp = VK_NULL_HANDLE;
     if (vkCreateRenderPass(vio_vk.device, &ri, NULL, &rp) != VK_SUCCESS) return VK_NULL_HANDLE;
     return rp;
+}
+
+static VkRenderPass vkrt_pass(const vio_vk_rt *x, int with_depth)
+{
+    return vkrt_pass_views(x, with_depth, 0);
 }
 
 VkRenderPass vio_vk_swapchain_resume_pass(void)
@@ -348,6 +364,10 @@ static void vkrt_free(vio_vk_rt *x)
     if (x->depth_face_view) for (int i = 0; i < x->layers; i++) vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->depth_face_view[i], NULL);
     vkrt_kill(VIO_VK_GRAVE_FRAMEBUFFER, (uint64_t)x->fb, NULL);
     vkrt_kill(VIO_VK_GRAVE_FRAMEBUFFER, (uint64_t)x->all_fb, NULL);
+    for (int v = 0; v < 3; v++) {
+        vkrt_kill(VIO_VK_GRAVE_FRAMEBUFFER, (uint64_t)x->mv_fb[v], NULL);
+        vkrt_kill(VIO_VK_GRAVE_RENDER_PASS, (uint64_t)x->mv_pass[v], NULL);
+    }
     vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->all_color_view, NULL);
     vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->all_depth_view, NULL);
     vkrt_kill(VIO_VK_GRAVE_RENDER_PASS, (uint64_t)x->pass, NULL);
@@ -671,6 +691,53 @@ int vio_vk_bind_render_target_face(void *rt_ptr, int face, int level)
     if (vio_vk.cur_render_pass) vkCmdEndRenderPass(cmd);
     vio_vk.cur_render_pass = VK_NULL_HANDLE;
     vkrt_begin(cmd, rt, face, level);
+    return 0;
+}
+
+int vio_vk_rt_ensure_views(int views)
+{
+    vio_render_target_object *rt = vio_vk.current_bound_rt;
+    vio_vk_rt *x = rt ? (vio_vk_rt *)rt->vulkan_rt : NULL;
+    int in_mv = 0;
+    if (x) for (int v = 0; v < 3; v++) if (x->mv_pass[v] && vio_vk.cur_render_pass == x->mv_pass[v]) in_mv = v + 2;
+    if (views == in_mv) return 0;
+    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    if (views <= 1) {
+        /* Back to the plain layered pass (LOAD keeps what the views drew). */
+        if (!in_mv) return 0;
+        vkCmdEndRenderPass(cmd);
+        vkrt_begin(cmd, rt, VIO_RT_ALL_LAYERS, 0);
+        return 0;
+    }
+    if (!x || rt->bound_face != VIO_RT_ALL_LAYERS || x->layers < views || x->cube || !x->all_depth_view) return -1;
+    int vi = views - 2;
+    if (!x->mv_pass[vi]) {
+        x->mv_pass[vi] = vkrt_pass_views(x, 1, views);
+        if (!x->mv_pass[vi]) return -1;
+        VkImageView att[2];
+        uint32_t n = 0;
+        if (x->count) att[n++] = x->all_color_view;
+        att[n++] = x->all_depth_view;
+        /* Multiview framebuffers have one layer; the view mask picks the slices. */
+        x->mv_fb[vi] = vkrt_framebuffer_layers(x->mv_pass[vi], att, n, (uint32_t)rt->width, (uint32_t)rt->height, 1);
+        if (!x->mv_fb[vi]) return -1;
+    }
+    vkCmdEndRenderPass(cmd);
+    uint32_t w = (uint32_t)rt->width, h = (uint32_t)rt->height;
+    VkRenderPassBeginInfo rp = {0};
+    rp.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp.renderPass        = x->mv_pass[vi];
+    rp.framebuffer       = x->mv_fb[vi];
+    rp.renderArea.extent.width  = w;
+    rp.renderArea.extent.height = h;
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D sc = { { 0, 0 }, { w, h } };
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+    vio_vk_note_viewport(&vp, &sc);
+    vio_vk.cur_render_pass = x->mv_pass[vi];
+    vio_vk.cur_layers      = 1u;   /* a clear in a multiview pass covers every view with layerCount 1 */
     return 0;
 }
 

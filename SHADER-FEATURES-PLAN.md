@@ -76,7 +76,11 @@ Barycentrics über Farbinterpolation an Dreiecksecken, Float16 über Ergebnis- u
 Base Vertex über zwei indirekte Draws mit `baseVertex`/`baseInstance`, Atomic64 über `atomicMax` eines
 (Tiefe, ID)-Paars.
 
-## Phase 2 — View Instancing / Multiview (M)
+## Phase 2 — View Instancing / Multiview (M) ✅ (2026-10-07)
+
+Umgesetzt mit `vio_shader(['view_count' => N])` statt einer Pipeline-Option: GL braucht die View-Zahl schon
+in der GLSL (`num_views`), alle anderen Backends übernehmen sie aus dem Shader. Metal nutzt SPIRV-Cross'
+Instancing-Emulation statt Vertex Amplification (SPIRV-Cross erzeugt kein `[[amplification_id]]`). Test 158.
 
 `VIO_FEATURE_MULTIVIEW` (heute überall 0). API: `vio_pipeline(['view_count' => N])`, Ziel = Layered-RT
 (`'layers' => N`), GLSL `GL_EXT_multiview` + `gl_ViewIndex`.

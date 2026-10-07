@@ -135,6 +135,7 @@ typedef struct _vio_d3d12_pipeline {
     UINT                     stencil_ref;      /* OMSetStencilRef */
     int                      has_gs, has_hs, has_ds;  /* replicate SRV / sampler tables */
     ID3DBlob                *hs_variant;       /* owned; hull shader for this pipeline's patch size */
+    int                      view_count;       /* multiview: view instancing views (2..4), 0 = off */
 } vio_d3d12_pipeline;
 
 /* Buffer wrapper */
@@ -305,6 +306,7 @@ typedef struct _vio_d3d12_state {
     int                        barycentrics;   /* OPTIONS3.BarycentricsSupported (SM 6.1) */
     int                        int64_ops;      /* OPTIONS1.Int64ShaderOps (64-bit integers in shaders) */
     int                        native16;       /* OPTIONS4.Native16BitShaderOpsSupported under SM 6.2+ */
+    int                        view_instancing; /* OPTIONS3.ViewInstancingTier (multiview, SV_ViewID needs SM 6.1) */
     /* Variable rate shading (GAP-PHASE5 Block 12): D3D12_VARIABLE_SHADING_RATE_TIER
      * (0 = none), the additional-rates cap (2x4 / 4x2 / 4x4), the sticky rate
      * (vio_shading_rate) and the ID3D12GraphicsCommandList5 view of the frame list. */
@@ -312,6 +314,7 @@ typedef struct _vio_d3d12_state {
     int                        vrs_additional_rates;
     int                        shading_rate;
     ID3D12GraphicsCommandList5 *cmd_list5;
+    ID3D12GraphicsCommandList1 *cmd_list1;   /* SetViewInstanceMask (multiview) */
     /* Indirect draws (GAP-PHASE5 Block 8): command signatures for DrawIndexed
      * (stride 20) and Draw (stride 16) arguments, created on first use. */
     ID3D12CommandSignature    *cmdsig_indexed;

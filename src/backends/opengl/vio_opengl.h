@@ -56,6 +56,7 @@ typedef struct _vio_opengl_state {
         int has_float16;                 /* GL_AMD_gpu_shader_half_float / GL_NV_gpu_shader5 (SPIRV-Cross's choices) */
         int has_draw_parameters;         /* GL 4.6 / GL_ARB_shader_draw_parameters + base instance (4.2) */
         int has_compute_derivatives;     /* compute + GL_NV_compute_shader_derivatives */
+        int has_multiview;               /* GL_OVR_multiview2 + layered attachments (3.2) */
     } caps;
 
     /* Cached extension list. NULL until setup; freed in shutdown. */
@@ -94,6 +95,10 @@ extern vio_opengl_state vio_gl;
 unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *frag_src);
 /* Link a program from vertex + fragment plus optional geometry / tessellation
  * control / tessellation evaluation sources (NULL = stage absent). */
+/* Multiview (vio_shader 'view_count'): remember a program's view count so the
+ * draws attach the layered target with glFramebufferTextureMultiviewOVR. */
+void vio_opengl_set_program_views(unsigned int program, int views);
+
 unsigned int vio_opengl_compile_program(const char *vert_src, const char *frag_src,
                                         const char *geom_src, const char *tesc_src,
                                         const char *tese_src);

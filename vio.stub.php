@@ -548,6 +548,11 @@ function vio_draw_2d(VioContext $context): void {}
  * Accepts GLSL (compiled to SPIR-V via glslang) or raw SPIR-V binary.
  * Format is auto-detected from SPIR-V magic number if not specified.
  *
+ * 'view_count' => 2..4 (VIO_FEATURE_MULTIVIEW): a multiview shader (GLSL GL_EXT_multiview,
+ *   gl_ViewIndex). Every draw with it runs once per view, view v into layer v of a layered
+ *   target ('layers' >= view_count) bound with VIO_RT_ALL_LAYERS. Not with geometry /
+ *   tessellation stages; refused (warning + false) where the feature is 0.
+ *
  * Optional stages (same encoding as 'vertex' / 'fragment'):
  *   'geometry'                     — geometry shader; requires VIO_FEATURE_GEOMETRY
  *   'tess_control' + 'tess_eval'   — tessellation pair (always both); requires VIO_FEATURE_TESSELLATION;

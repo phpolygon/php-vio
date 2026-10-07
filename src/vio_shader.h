@@ -57,6 +57,7 @@ typedef struct _vio_shader_object {
     vio_shader_stage_cb *stage_cb[VIO_EXTRA_STAGE_COUNT];
     int               has_geometry;  /* 1 => geometry stage present */
     int               has_tessellation; /* 1 => tess control + eval present */
+    int               view_count;    /* multiview views (2..4), 0 = off */
     void             *backend_shader; /* Backend-specific compiled shader (D3D11/D3D12/Vulkan) */
     /* Uniform buffer for D3D constant buffer mapping — vertex stage */
     unsigned char     cbuffer_data[VIO_CBUFFER_SIZE];

@@ -738,6 +738,7 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     key = vk3d_mix(key, (uint64_t)vio_vk.cur_samples);
     key = vk3d_mix(key, (uint64_t)vio_vk.cur_has_depth);
     key = vk3d_mix(key, (uint64_t)stride);
+    key = vk3d_mix(key, (uint64_t)p->desc.view_count);   /* multiview pass (viewMask) */
     for (int i = 0; i < p->variant_count; i++) {
         if (p->variants[i].key == key) return p->variants[i].pipeline;
     }
