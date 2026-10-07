@@ -19,11 +19,13 @@ $VS = "#version 450\nlayout(location=0) in vec3 aPos;\nlayout(location=0) out ve
     . "void main(){ uv = aPos.xy * 0.5 + 0.5; gl_Position = vec4(aPos, 1.0); }";
 $FS = "#version 450\nlayout(location=0) in vec2 uv;\nlayout(location=0) out vec4 o;\nuniform sampler2D u_tex;\n"
     . "void main(){ o = texture(u_tex, uv); }";
-/* Same interface as the GLSL stage: t0 / s0 (vio's register scheme), TEXCOORD0. */
+/* Same interface as the GLSL stage: t0 / s0 (vio's register scheme), and the
+ * input struct in the order of the transpiled vertex output (TEXCOORD0, then
+ * SV_Position) - D3D12 links the signatures by register, not by name. */
 $PS_HLSL = "Texture2D<float4> u_tex : register(t0);\n"
     . "SamplerState _u_tex_sampler : register(s0);\n"
     . "FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> vio_feedback : register(u0, space2);\n"
-    . "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    . "struct PSIn { float2 uv : TEXCOORD0; float4 pos : SV_Position; };\n"
     . "float4 main(PSIn i) : SV_Target0 {\n"
     . "  vio_feedback.WriteSamplerFeedback(u_tex, _u_tex_sampler, i.uv);\n"
     . "  return u_tex.Sample(_u_tex_sampler, i.uv);\n"

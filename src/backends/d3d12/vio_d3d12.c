@@ -1760,6 +1760,8 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.sampler_combo_heap) ID3D12DescriptorHeap_Release(vio_d3d12.sampler_combo_heap);
     if (vio_d3d12.sampler_heap)   ID3D12DescriptorHeap_Release(vio_d3d12.sampler_heap);
     if (vio_d3d12.frame_latency_waitable) CloseHandle(vio_d3d12.frame_latency_waitable);
+    if (vio_d3d12.fb_null_map)    ID3D12Resource_Release(vio_d3d12.fb_null_map);
+    if (vio_d3d12.fb_null_tex)    ID3D12Resource_Release(vio_d3d12.fb_null_tex);
     if (vio_d3d12.swapchain)      IDXGISwapChain3_Release(vio_d3d12.swapchain);
     if (vio_d3d12.cmd_queue)      ID3D12CommandQueue_Release(vio_d3d12.cmd_queue);
     if (vio_d3d12.factory)        IDXGIFactory4_Release(vio_d3d12.factory);
@@ -3737,13 +3739,53 @@ static int d3d12_feedback_ensure(vio_d3d12_texture *t)
 static int d3d12_feedback_null(D3D12_GPU_DESCRIPTOR_HANDLE *out)
 {
     if (!vio_d3d12.fb_null_gpu.ptr) {
+        /* D3D12 has no null feedback UAV: CreateSamplerFeedbackUnorderedAccessView
+         * with NULL resources and a null UAV in the opaque feedback format are
+         * both invalid calls that remove the device at the next submit. The
+         * writes go to a private 8x8 texture / map pair instead. */
         ID3D12Device8 *dev8 = NULL;
         if (FAILED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device8, (void **)&dev8)) || !dev8) return -1;
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td = {0};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = 8;
+        td.Height = 8;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        ID3D12Resource *tex = NULL, *map = NULL;
+        HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+            D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&tex);
+        if (SUCCEEDED(hr) && tex) {
+            D3D12_RESOURCE_DESC1 md = {0};
+            md.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            md.Width = 8;
+            md.Height = 8;
+            md.DepthOrArraySize = 1;
+            md.MipLevels = 1;
+            md.Format = DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE;
+            md.SampleDesc.Count = 1;
+            md.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            md.SamplerFeedbackMipRegion.Width = 4;
+            md.SamplerFeedbackMipRegion.Height = 4;
+            md.SamplerFeedbackMipRegion.Depth = 1;
+            hr = ID3D12Device8_CreateCommittedResource2(dev8, &hp, D3D12_HEAP_FLAG_NONE, &md,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, NULL, &IID_ID3D12Resource, (void **)&map);
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
-        if (d3d12_alloc_srv_descriptor(&cpu, &gpu) == UINT_MAX) { ID3D12Device8_Release(dev8); return -1; }
-        ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(dev8, NULL, NULL, d3d12_visible_cpu_of(cpu));
+        if (FAILED(hr) || !tex || !map || d3d12_alloc_srv_descriptor(&cpu, &gpu) == UINT_MAX) {
+            if (map) ID3D12Resource_Release(map);
+            if (tex) ID3D12Resource_Release(tex);
+            ID3D12Device8_Release(dev8);
+            return -1;
+        }
+        ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(dev8, tex, map, d3d12_visible_cpu_of(cpu));
         ID3D12Device8_Release(dev8);
+        vio_d3d12.fb_null_tex = tex;
+        vio_d3d12.fb_null_map = map;
         vio_d3d12.fb_null_gpu = gpu;
     }
     *out = vio_d3d12.fb_null_gpu;

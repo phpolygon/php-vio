@@ -344,11 +344,15 @@ typedef struct _vio_d3d12_state {
     int                        raytracing_tier; /* OPTIONS5.RaytracingTier (ray query needs 1.1 + SM 6.5) */
     /* Sampler feedback: OPTIONS7.SamplerFeedbackTier >= 0.9, SM 6.5, ID3D12Device8 and
      * the bindless root layout (root parameter [16] follows [15]). fb_bound is the
-     * texture whose map vio_sampler_feedback_bind() selected; fb_null_gpu a null
-     * feedback UAV for feedback shaders drawn without one (created on demand). */
+     * texture whose map vio_sampler_feedback_bind() selected; fb_null_gpu the
+     * feedback UAV of a private 8x8 texture / map pair (fb_null_tex / fb_null_map)
+     * for feedback shaders drawn without one - D3D12 has no null feedback UAV
+     * (created on demand). */
     int                        sampler_feedback;
     struct _vio_d3d12_texture *fb_bound;
     D3D12_GPU_DESCRIPTOR_HANDLE fb_null_gpu;
+    ID3D12Resource            *fb_null_tex;
+    ID3D12Resource            *fb_null_map;
     /* Variable rate shading (GAP-PHASE5 Block 12): D3D12_VARIABLE_SHADING_RATE_TIER
      * (0 = none), the additional-rates cap (2x4 / 4x2 / 4x4), the sticky rate
      * (vio_shading_rate) and the ID3D12GraphicsCommandList5 view of the frame list. */
