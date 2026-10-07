@@ -27,6 +27,10 @@ static int vio_ktx2_format(uint32_t vk)
         case 139:                     return VIO_FORMAT_BC4;     /* BC4_UNORM */
         case 141:                     return VIO_FORMAT_BC5;     /* BC5_UNORM */
         case 145: case 146:           return VIO_FORMAT_BC7;
+        case 157: case 158:           return VIO_FORMAT_ASTC_4x4; /* ASTC_4x4_UNORM / _SRGB_BLOCK */
+        case 161: case 162:           return VIO_FORMAT_ASTC_5x5;
+        case 165: case 166:           return VIO_FORMAT_ASTC_6x6;
+        case 171: case 172:           return VIO_FORMAT_ASTC_8x8;
         default:                      return -1;
     }
 }
@@ -64,7 +68,7 @@ int vio_ktx2_parse(const uint8_t *b, size_t len, vio_ktx2_info *out, char *err, 
     if (width == 0 || height == 0 || width > 16384 || height > 16384) return fail(err, err_len, "invalid KTX2 dimensions");
     int fmt = vio_ktx2_format(vk_format);
     if (fmt < 0) {
-        if (err && err_len) snprintf(err, err_len, "unsupported vkFormat %u (supported: R8, RGBA8, BC1/BC3/BC4/BC5/BC7)", vk_format);
+        if (err && err_len) snprintf(err, err_len, "unsupported vkFormat %u (supported: R8, RGBA8, BC1/BC3/BC4/BC5/BC7, ASTC 4x4/5x5/6x6/8x8)", vk_format);
         return -1;
     }
     if (layer_count > 2048) return fail(err, err_len, "too many array layers");

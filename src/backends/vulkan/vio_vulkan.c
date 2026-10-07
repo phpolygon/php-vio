@@ -473,6 +473,8 @@ static int create_logical_device(void)
         }
         vio_vk.bc_supported = 0;
         if (avail.textureCompressionBC) { features.textureCompressionBC = VK_TRUE; vio_vk.bc_supported = 1; }   /* Block 10c */
+        vio_vk.astc_supported = 0;
+        if (avail.textureCompressionASTC_LDR) { features.textureCompressionASTC_LDR = VK_TRUE; vio_vk.astc_supported = 1; }   /* A20 */
     }
 
     /* 64-bit buffer atomics (GL_EXT_shader_atomic_int64): shaderInt64 plus
@@ -1193,6 +1195,7 @@ static int vulkan_enumerate_adapters(vio_adapter_info *out, int max)
             if (f.tessellationShader)   a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION);
             if (f.multiViewport)        a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MULTI_VIEWPORT);
             if (f.textureCompressionBC) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_BC);
+            if (f.textureCompressionASTC_LDR) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
             if (p.apiVersion >= VK_API_VERSION_1_1) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MULTIVIEW);
             uint32_t ne = 0;
             vkEnumerateDeviceExtensionProperties(pds[i], NULL, &ne, NULL);
@@ -4906,6 +4909,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_MIPMAP_GEN:     return vio_vk3d_available(); /* vkCmdBlitImage chain (Block 10b) */
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_vk3d_available(); /* 2D array views, stored chains (Block 10c) */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return vio_vk3d_available() && (!vio_vk.device || vio_vk.bc_supported); /* textureCompressionBC */
+        case VIO_FEATURE_TEXTURE_COMPRESSION_ASTC: return vio_vk3d_available() && vio_vk.device && vio_vk.astc_supported; /* textureCompressionASTC_LDR */
         case VIO_FEATURE_SHADING_RATE:   return vio_vk3d_available() && vio_vk.vrs_supported; /* VK_KHR_fragment_shading_rate, pipeline rate */
         case VIO_FEATURE_SHADING_RATE_PRIMITIVE: return vio_vk3d_available() && vio_vk.vrs_supported && vio_vk.vrs_primitive;
         case VIO_FEATURE_SUBGROUP:       return vio_vk.device && vio_vk.subgroup_supported; /* core 1.1 subgroup properties, compute + fragment */

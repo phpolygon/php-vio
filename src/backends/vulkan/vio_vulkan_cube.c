@@ -269,6 +269,10 @@ static VkFormat vkc_tex_format(int f)
         case VIO_FORMAT_BC4: return VK_FORMAT_BC4_UNORM_BLOCK;
         case VIO_FORMAT_BC5: return VK_FORMAT_BC5_UNORM_BLOCK;
         case VIO_FORMAT_BC7: return VK_FORMAT_BC7_UNORM_BLOCK;
+        case VIO_FORMAT_ASTC_4x4: return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+        case VIO_FORMAT_ASTC_5x5: return VK_FORMAT_ASTC_5x5_UNORM_BLOCK;
+        case VIO_FORMAT_ASTC_6x6: return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+        case VIO_FORMAT_ASTC_8x8: return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
         case VIO_FORMAT_RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
         default: return VK_FORMAT_UNDEFINED;
     }
@@ -280,7 +284,8 @@ void *vio_vk_create_texture_ex(vio_texture_desc *desc)
     int f = desc->format;
     VkFormat fmt = vkc_tex_format(f);
     int compressed = vio_texfmt_is_compressed(f);
-    if (fmt == VK_FORMAT_UNDEFINED || (compressed && !vio_vk.bc_supported)) return NULL;
+    if (fmt == VK_FORMAT_UNDEFINED) return NULL;
+    if (vio_texfmt_is_astc(f) ? !vio_vk.astc_supported : (compressed && !vio_vk.bc_supported)) return NULL;
     int w = desc->width, h = desc->height;
     int layers = desc->layers > 1 ? desc->layers : 1;
     int stored = desc->mip_levels > 1 ? desc->mip_levels : 1;

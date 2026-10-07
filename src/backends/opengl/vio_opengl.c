@@ -2243,6 +2243,10 @@ static GLenum opengl_texfmt_internal(int fmt)
         case VIO_FORMAT_BC4: return GL_COMPRESSED_RED_RGTC1;
         case VIO_FORMAT_BC5: return GL_COMPRESSED_RG_RGTC2;
         case VIO_FORMAT_BC7: return GL_COMPRESSED_RGBA_BPTC_UNORM;
+        case VIO_FORMAT_ASTC_4x4: return 0x93B0;   /* GL_COMPRESSED_RGBA_ASTC_4x4_KHR */
+        case VIO_FORMAT_ASTC_5x5: return 0x93B2;
+        case VIO_FORMAT_ASTC_6x6: return 0x93B4;
+        case VIO_FORMAT_ASTC_8x8: return 0x93B7;
         case VIO_FORMAT_R8:  return GL_R8;
         default:             return GL_RGBA8;
     }
@@ -2255,6 +2259,8 @@ static int opengl_has_texfmt(int fmt)
     switch (fmt) {
         case VIO_FORMAT_BC1: case VIO_FORMAT_BC3: return gl_has_ext("GL_EXT_texture_compression_s3tc");
         case VIO_FORMAT_BC7: return gl_ge(4, 2) || gl_has_ext("GL_ARB_texture_compression_bptc");
+        case VIO_FORMAT_ASTC_4x4: case VIO_FORMAT_ASTC_5x5: case VIO_FORMAT_ASTC_6x6: case VIO_FORMAT_ASTC_8x8:
+            return gl_has_ext("GL_KHR_texture_compression_astc_ldr");
         default: return 1;
     }
 }
@@ -2835,6 +2841,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_VERTEX_LAYER:   return vio_gl.initialized && gl_has_ext("GL_ARB_shader_viewport_layer_array");
         case VIO_FEATURE_MULTI_VIEWPORT: return vio_gl.initialized && glViewportIndexedf != NULL &&
                                                 (gl_ge(4, 1) || gl_has_ext("GL_ARB_viewport_array"));
+        case VIO_FEATURE_TEXTURE_COMPRESSION_ASTC: return vio_gl.initialized && opengl_has_texfmt(VIO_FORMAT_ASTC_4x4);
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC:                                          /* S3TC ext (BC1/BC3) + core RGTC; BC7 needs BPTC / 4.2 */
             return vio_gl.initialized && gl_has_ext("GL_EXT_texture_compression_s3tc");
         case VIO_FEATURE_CUBEMAP:        return 1;

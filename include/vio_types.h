@@ -388,6 +388,9 @@ typedef enum _vio_feature {
      * stages out), D3D11 and Metal (their multiview is instancing in the vertex stage). */
     VIO_FEATURE_MULTIVIEW_GEOMETRY     = 60,
     VIO_FEATURE_MULTIVIEW_TESSELLATION = 61,
+    /* VIO_FORMAT_ASTC_* textures (A20): Metal on Apple GPUs, Vulkan with
+     * textureCompressionASTC_LDR, GL with the KHR extension; D3D has no ASTC. */
+    VIO_FEATURE_TEXTURE_COMPRESSION_ASTC = 62,
 } vio_feature;
 
 /* Component types of a cooperative-matrix shape. */
@@ -797,6 +800,12 @@ typedef enum {
     VIO_FORMAT_BC4        = 11,  /* single channel (R)   */
     VIO_FORMAT_BC5        = 12,  /* two channels (RG), normal maps */
     VIO_FORMAT_BC7        = 13,  /* high-quality RGBA    */
+    /* ASTC LDR, 16-byte blocks of N x N texels (OPEN-ITEMS-PLAN A20); Apple GPUs,
+     * Vulkan textureCompressionASTC_LDR, GL_KHR_texture_compression_astc_ldr. */
+    VIO_FORMAT_ASTC_4x4   = 14,
+    VIO_FORMAT_ASTC_5x5   = 15,
+    VIO_FORMAT_ASTC_6x6   = 16,
+    VIO_FORMAT_ASTC_8x8   = 17,
 } vio_pixel_format;
 
 typedef struct _vio_texture_desc {

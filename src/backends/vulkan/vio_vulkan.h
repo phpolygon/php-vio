@@ -276,6 +276,7 @@ typedef struct _vio_vulkan_state {
     /* Block 10c: textureCompressionBC, VK_KHR_fragment_shading_rate (pipeline rate). */
     int                      instance_api_11;      /* instance created with apiVersion 1.1 */
     int                      bc_supported;
+    int                      astc_supported;   /* textureCompressionASTC_LDR enabled (A20) */
     int                      vrs_supported;
     int                      vrs_primitive;        /* primitiveFragmentShadingRate enabled */
     int                      vrs_primitive_multi_viewport;   /* primitiveFragmentShadingRateWithMultipleViewports */

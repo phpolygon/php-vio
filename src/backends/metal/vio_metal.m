@@ -2930,6 +2930,10 @@ static MTLPixelFormat metal_texfmt(int fmt)
         case VIO_FORMAT_BC4: return MTLPixelFormatBC4_RUnorm;
         case VIO_FORMAT_BC5: return MTLPixelFormatBC5_RGUnorm;
         case VIO_FORMAT_BC7: return MTLPixelFormatBC7_RGBAUnorm;
+        case VIO_FORMAT_ASTC_4x4: return MTLPixelFormatASTC_4x4_LDR;
+        case VIO_FORMAT_ASTC_5x5: return MTLPixelFormatASTC_5x5_LDR;
+        case VIO_FORMAT_ASTC_6x6: return MTLPixelFormatASTC_6x6_LDR;
+        case VIO_FORMAT_ASTC_8x8: return MTLPixelFormatASTC_8x8_LDR;
         case VIO_FORMAT_R8:  return MTLPixelFormatR8Unorm;
         default:             return MTLPixelFormatRGBA8Unorm;
     }
@@ -2956,7 +2960,7 @@ static void *metal_create_texture_ex(vio_texture_desc *desc)
     int levels = desc->mip_levels > 1 ? desc->mip_levels : 1;
     int compressed = vio_texfmt_is_compressed(desc->format);
     int gen = !compressed && desc->mipmaps && levels == 1;
-    if (compressed && !metal_supports_bc()) return NULL;
+    if (vio_texfmt_is_astc(desc->format) ? vio_mtl.caps.apple_family < 2 : (compressed && !metal_supports_bc())) return NULL;
     @autoreleasepool {
         MTLTextureDescriptor *td = [[MTLTextureDescriptor alloc] init];
         td.textureType = layers > 1 ? MTLTextureType2DArray : MTLTextureType2D;
@@ -6084,6 +6088,8 @@ static int metal_enumerate_adapters(vio_adapter_info *out, int max)
                         | VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION) | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW);
             if ([dev respondsToSelector:@selector(supportsRaytracing)] && dev.supportsRaytracing)
                 a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAY_QUERY);
+            if ([dev supportsFamily:MTLGPUFamilyApple2])
+                a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
             if ([dev supportsFamily:MTLGPUFamilyApple7] || [dev supportsFamily:MTLGPUFamilyMac2])
                 a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MESH_SHADER) | VIO_FEATURE_BIT(VIO_FEATURE_SUBGROUP);
         }
@@ -6271,6 +6277,8 @@ static int metal_supports_feature(vio_feature f)
         return 1;
     case VIO_FEATURE_TEXTURE_ARRAY: /* MTLTextureType2DArray */
         return 1;
+    case VIO_FEATURE_TEXTURE_COMPRESSION_ASTC: /* ASTC LDR on Apple GPUs (Apple2+), not on Intel / AMD Macs */
+        return vio_mtl.caps.apple_family >= 2;
     case VIO_FEATURE_TEXTURE_COMPRESSION_BC: /* BC1-BC7 pixel formats (macOS) */
         return metal_supports_bc();
     case VIO_FEATURE_STENCIL:
