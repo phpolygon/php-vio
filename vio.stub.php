@@ -467,12 +467,15 @@ function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width
  *   layout(set = 1, binding = 2) uniform sampler vio_sampler_nearest;         // optional
  *   layout(set = 1, binding = 3) uniform sampler vio_sampler_clamp;           // optional
  *   layout(set = 1, binding = 4) uniform sampler vio_sampler_nearest_clamp;   // optional
+ *   layout(set = 1, binding = 5) uniform textureCube vio_cubes[];             // VioCubemap slots
+ *   layout(set = 1, binding = 6) uniform texture2DArray vio_texture_arrays[]; // layered VioTexture slots
  * and index it with nonuniformEXT (GL_EXT_nonuniform_qualifier). The first call adds
  * the texture and keeps it alive until vio_texture_release_index or vio_destroy; later
- * calls return the same slot. Plain 2D textures only, up to 1024. False (with a
- * warning) without the feature.
+ * calls return the same slot. 2D textures, texture arrays and cubemaps share the
+ * 1024 slots; a slot is read through the array of its kind. 3D textures and
+ * render-target wrappers stay out. False (with a warning) without the feature.
  */
-function vio_texture_index(VioContext $context, VioTexture $texture): int|false {}
+function vio_texture_index(VioContext $context, VioTexture|VioCubemap $texture): int|false {}
 
 /**
  * Free the bindless slot of $texture. Frames already recorded may still read it, so
@@ -480,7 +483,7 @@ function vio_texture_index(VioContext $context, VioTexture $texture): int|false 
  * the slot is cleared and vio_texture_index hands it out again. The texture can
  * re-enter the table at once (under a new slot). False when it is not in the table.
  */
-function vio_texture_release_index(VioContext $context, VioTexture $texture): bool {}
+function vio_texture_release_index(VioContext $context, VioTexture|VioCubemap $texture): bool {}
 
 /**
  * Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK; D3D12 with SM 6.5 + SamplerFeedbackTier 0.9):

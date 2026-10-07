@@ -45,6 +45,7 @@ void vio_context_bindless_clear(vio_context_object *ctx)
     ctx->bindless = NULL;
     ctx->bindless_count = 0;
     if (ctx->bindless_retire) { efree(ctx->bindless_retire); ctx->bindless_retire = NULL; }
+    if (ctx->bindless_kind) { efree(ctx->bindless_kind); ctx->bindless_kind = NULL; }
     if (ctx->bindless_free) { efree(ctx->bindless_free); ctx->bindless_free = NULL; }
     ctx->bindless_free_count = 0;
 }

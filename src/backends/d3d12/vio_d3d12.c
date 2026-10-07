@@ -34,6 +34,7 @@
 #endif
 
 #include "vio_d3d12.h"
+#include "../../vio_cubemap.h"   /* bindless cube slots */
 #include "../vio_d3d_common.h"
 #include "../vio_d3d_shader_check.h"
 #include "../../vio_texfmt.h"
@@ -699,15 +700,21 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
      * SRV range t0.. in register space 1 for every stage, and its sampler as a
      * static s1 / space1 (linear, repeat) - the GLSL contract's Set 1 binding 0
      * / 1. Only with Resource Binding Tier 2+ (unbounded ranges). */
-    D3D12_DESCRIPTOR_RANGE bindless_range = {0};
-    bindless_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    bindless_range.NumDescriptors = UINT_MAX;   /* unbounded */
-    bindless_range.BaseShaderRegister = 0;
-    bindless_range.RegisterSpace = 1;
-    bindless_range.OffsetInDescriptorsFromTableStart = 0;
+    /* The same descriptors, also as TextureCube[] (space 3, vio_cubes) and
+     * Texture2DArray[] (space 4, vio_texture_arrays): each slot is read through
+     * the array of its kind (BINDLESS-PLAN 4b). */
+    D3D12_DESCRIPTOR_RANGE bindless_ranges[3];
+    memset(bindless_ranges, 0, sizeof(bindless_ranges));
+    for (int r = 0; r < 3; r++) {
+        bindless_ranges[r].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        bindless_ranges[r].NumDescriptors = UINT_MAX;   /* unbounded */
+        bindless_ranges[r].BaseShaderRegister = 0;
+        bindless_ranges[r].RegisterSpace = r == 0 ? 1 : 2 + (UINT)r;
+        bindless_ranges[r].OffsetInDescriptorsFromTableStart = 0;
+    }
     params[VIO_D3D12_RP_BINDLESS].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[VIO_D3D12_RP_BINDLESS].DescriptorTable.NumDescriptorRanges = 1;
-    params[VIO_D3D12_RP_BINDLESS].DescriptorTable.pDescriptorRanges = &bindless_range;
+    params[VIO_D3D12_RP_BINDLESS].DescriptorTable.NumDescriptorRanges = 3;
+    params[VIO_D3D12_RP_BINDLESS].DescriptorTable.pDescriptorRanges = bindless_ranges;
     params[VIO_D3D12_RP_BINDLESS].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     /* The bindless table's samplers, s1..s4 in space 1 (BINDLESS-PLAN): vio_sampler
      * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp. */
@@ -2720,10 +2727,19 @@ static void d3d12_apply_bindless(void)
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_BINDLESS, g);
 }
 
-static int d3d12_bindless_set(int slot, void *backend_texture)
+static int d3d12_bindless_set(int slot, void *backend_texture, int kind)
 {
-    vio_d3d12_texture *t = (vio_d3d12_texture *)backend_texture;
-    if (!t && vio_d3d12.bindless && slot >= 0 && slot < VIO_BINDLESS_MAX) {
+    vio_d3d12_texture *t = kind == VIO_BINDLESS_KIND_CUBE ? NULL : (vio_d3d12_texture *)backend_texture;
+    if (backend_texture && kind == VIO_BINDLESS_KIND_CUBE) {
+        vio_cubemap_object *cm = (vio_cubemap_object *)backend_texture;
+        if (!vio_d3d12.bindless || !cm->d3d12_srv_cpu || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
+        D3D12_CPU_DESCRIPTOR_HANDLE d, s = { (SIZE_T)cm->d3d12_srv_cpu };
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &d);
+        d.ptr += (SIZE_T)(vio_d3d12.bindless_base + (UINT)slot) * vio_d3d12.srv_heap.descriptor_size;
+        ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, d, s, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        return 0;
+    }
+    if (!backend_texture && vio_d3d12.bindless && slot >= 0 && slot < VIO_BINDLESS_MAX) {
         /* Released: back to the null SRV the table starts with. */
         D3D12_SHADER_RESOURCE_VIEW_DESC nd = {0};
         nd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2736,8 +2752,8 @@ static int d3d12_bindless_set(int slot, void *backend_texture)
         ID3D12Device_CreateShaderResourceView(vio_d3d12.device, NULL, &nd, d);
         return 0;
     }
-    if (!vio_d3d12.bindless || !t || !t->resource || !t->srv_cpu.ptr || t->depth > 0 || t->layers > 1
-        || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
+    if (!vio_d3d12.bindless || !t || !t->resource || !t->srv_cpu.ptr || t->depth > 0
+        || (t->layers > 1) != (kind == VIO_BINDLESS_KIND_ARRAY) || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
     D3D12_CPU_DESCRIPTOR_HANDLE d;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &d);
     d.ptr += (SIZE_T)(vio_d3d12.bindless_base + (UINT)slot) * vio_d3d12.srv_heap.descriptor_size;
@@ -5462,7 +5478,8 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
     if (desc->fragment_hlsl) hlsl_ps = desc->fragment_hlsl;
 
     /* Bindless table: SPIRV-Cross keeps Set 1 in register space 1. */
-    shader->uses_bindless = (hlsl_vs && strstr(hlsl_vs, "space1)")) || (hlsl_ps && strstr(hlsl_ps, "space1)"));
+    shader->uses_bindless = (hlsl_vs && (strstr(hlsl_vs, "space1)") || strstr(hlsl_vs, "space3)") || strstr(hlsl_vs, "space4)")))
+                         || (hlsl_ps && (strstr(hlsl_ps, "space1)") || strstr(hlsl_ps, "space3)") || strstr(hlsl_ps, "space4)")));
     shader->uses_feedback = hlsl_ps && strstr(hlsl_ps, "FeedbackTexture2D") != NULL;
     if (shader->uses_feedback && !vio_d3d12.sampler_feedback) {
         php_error_docref(NULL, E_WARNING, "D3D12: the pixel shader writes sampler feedback but the device has none "

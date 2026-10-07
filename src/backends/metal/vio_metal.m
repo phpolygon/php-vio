@@ -3870,10 +3870,14 @@ static int metal_prepare_draw(int stride)
 }
 
 /* ── Bindless table (vio_texture_index, BINDLESS-PLAN.md) ──────────────
- * A Shared buffer of MTLResourceIDs (one texture2d handle per slot) that the
- * Set 1 argument buffer of a shader reads, plus the textures themselves so
- * every draw can make them resident (useResources). */
-static id<MTLBuffer>   metal_bindless_buf = nil;
+ * One Shared buffer of MTLResourceIDs per kind - vio_textures (2D), vio_texture_arrays
+ * and vio_cubes - that the shader's Set 1 / 2 / 3 argument buffers read (the MSL
+ * translation moves vio_cubes / vio_texture_arrays to sets 2 / 3, each an unsized
+ * array at offset 0), plus the textures themselves so every draw can make them
+ * resident (useResources). The slot space is shared: a slot has one kind. */
+static id<MTLBuffer>   metal_bindless_bufs[3] = { nil, nil, nil };   /* per VIO_BINDLESS_KIND_* */
+static const NSUInteger metal_bindless_index[3] = {
+    VIO_METAL_BINDLESS_INDEX, VIO_METAL_BINDLESS_ARRAY_INDEX, VIO_METAL_BINDLESS_CUBE_INDEX };
 static id<MTLResource> metal_bindless_res[VIO_BINDLESS_MAX];
 static int             metal_bindless_count = 0;
 /* The live entries, packed for useResources (released slots are nil). */
@@ -3888,27 +3892,35 @@ static void metal_bindless_pack(void)
     for (int i = metal_bindless_live_count; i < VIO_BINDLESS_MAX && metal_bindless_live[i]; i++) metal_bindless_live[i] = nil;
 }
 
-static int metal_bindless_set(int slot, void *backend_texture)
+static int metal_bindless_set(int slot, void *backend_texture, int kind)
 {
-    vio_metal_texture *mt = (vio_metal_texture *)backend_texture;
-    if (!mt && slot >= 0 && slot < VIO_BINDLESS_MAX) {
+    if (slot < 0 || slot >= VIO_BINDLESS_MAX || kind < VIO_BINDLESS_KIND_2D || kind > VIO_BINDLESS_KIND_CUBE) return -1;
+    if (!backend_texture) {
         /* Released: a zero resource ID, and no longer resident. */
-        if (metal_bindless_buf) memset((char *)[metal_bindless_buf contents] + (size_t)slot * 8, 0, 8);
+        if (metal_bindless_bufs[kind]) memset((char *)[metal_bindless_bufs[kind] contents] + (size_t)slot * 8, 0, 8);
         metal_bindless_res[slot] = nil;
         metal_bindless_pack();
         return 0;
     }
-    if (!vio_mtl.device || !mt || !mt->tex || slot < 0 || slot >= VIO_BINDLESS_MAX || !vio_mtl.caps.bindless) return -1;
+    if (!vio_mtl.device || !vio_mtl.caps.bindless) return -1;
+    id<MTLTexture> tex = nil;
+    if (kind == VIO_BINDLESS_KIND_CUBE) {
+        vio_cubemap_object *cm = (vio_cubemap_object *)backend_texture;
+        if (cm->metal_texture) tex = (__bridge id<MTLTexture>)cm->metal_texture;
+    } else {
+        vio_metal_texture *mt = (vio_metal_texture *)backend_texture;
+        if (mt->tex) tex = (__bridge id<MTLTexture>)mt->tex;
+    }
+    if (!tex) return -1;
     if (@available(macOS 13.0, iOS 16.0, *)) {
-        if (!metal_bindless_buf) {
-            metal_bindless_buf = [vio_mtl.device newBufferWithLength:VIO_BINDLESS_MAX * sizeof(MTLResourceID)
-                                                             options:MTLResourceStorageModeShared];
-            if (!metal_bindless_buf) return -1;
-            memset([metal_bindless_buf contents], 0, VIO_BINDLESS_MAX * sizeof(MTLResourceID));
+        if (!metal_bindless_bufs[kind]) {
+            metal_bindless_bufs[kind] = [vio_mtl.device newBufferWithLength:VIO_BINDLESS_MAX * sizeof(MTLResourceID)
+                                                                    options:MTLResourceStorageModeShared];
+            if (!metal_bindless_bufs[kind]) return -1;
+            memset([metal_bindless_bufs[kind] contents], 0, VIO_BINDLESS_MAX * sizeof(MTLResourceID));
         }
-        id<MTLTexture> tex = (__bridge id<MTLTexture>)mt->tex;
         MTLResourceID rid = tex.gpuResourceID;
-        memcpy((char *)[metal_bindless_buf contents] + (size_t)slot * sizeof(MTLResourceID), &rid, sizeof(rid));
+        memcpy((char *)[metal_bindless_bufs[kind] contents] + (size_t)slot * sizeof(MTLResourceID), &rid, sizeof(rid));
         metal_bindless_res[slot] = tex;
         if (slot + 1 > metal_bindless_count) metal_bindless_count = slot + 1;
         metal_bindless_pack();
@@ -3922,16 +3934,19 @@ static void metal_bindless_release(void)
     for (int i = 0; i < metal_bindless_count; i++) metal_bindless_res[i] = nil;
     metal_bindless_count = 0;
     metal_bindless_pack();
-    metal_bindless_buf = nil;
+    for (int k = 0; k < 3; k++) metal_bindless_bufs[k] = nil;
 }
 
-/* Bind the table's argument buffer to the stages that read it and make its
- * textures resident for this draw. */
+/* Bind the tables' argument buffers to the stages that read them and make
+ * their textures resident for this draw. */
 static void metal_bindless_bind(id<MTLRenderCommandEncoder> enc, int vertex, int fragment)
 {
-    if (!metal_bindless_buf || (!vertex && !fragment)) return;
-    if (vertex)   [enc setVertexBuffer:metal_bindless_buf offset:0 atIndex:VIO_METAL_BINDLESS_INDEX];
-    if (fragment) [enc setFragmentBuffer:metal_bindless_buf offset:0 atIndex:VIO_METAL_BINDLESS_INDEX];
+    if (!vertex && !fragment) return;
+    for (int k = 0; k < 3; k++) {
+        if (!metal_bindless_bufs[k]) continue;
+        if (vertex)   [enc setVertexBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+        if (fragment) [enc setFragmentBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+    }
     if (metal_bindless_live_count > 0) {
         MTLRenderStages stages = (vertex ? MTLRenderStageVertex : 0) | (fragment ? MTLRenderStageFragment : 0);
         [enc useResources:metal_bindless_live count:(NSUInteger)metal_bindless_live_count usage:MTLResourceUsageRead stages:stages];

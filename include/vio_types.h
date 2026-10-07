@@ -414,6 +414,11 @@ typedef struct _vio_coopmat_shape {
  * vio_begin calls: more than any backend keeps frames in flight (D3D12 <= 3,
  * Vulkan 2, Metal 3), so no recorded frame can still read the old entry. */
 #define VIO_BINDLESS_RETIRE_FRAMES 4
+/* Kind of a bindless slot: which Set 1 array the shader reads it through
+ * (vio_textures[] binding 0, vio_texture_arrays[] binding 6, vio_cubes[] binding 5). */
+#define VIO_BINDLESS_KIND_2D    0
+#define VIO_BINDLESS_KIND_ARRAY 1
+#define VIO_BINDLESS_KIND_CUBE  2
 
 #define VIO_MAX_VIEWPORTS 16
 

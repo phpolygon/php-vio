@@ -542,7 +542,7 @@ void  vio_vk_apply_shading_rate(VkCommandBuffer cmd, int primitive);   /* after 
 /* ── 3D pipeline (GAP-PHASE5 Block 10, vio_vulkan_3d*.c) ── */
 int   vio_vk3d_available(void);
 void  vio_vk3d_begin_frame(uint32_t frame_slot);
-VkImageView vio_vk3d_dummy_2d_view(void);   /* 1x1 sampled 2D image (cleared bindless slots) */
+VkImageView vio_vk3d_dummy_view(int bindless_kind);   /* 1x1 2D / 2D array / cube view (cleared bindless slots) */
 /* Copy bytes into the current frame's upload ring (uniform-buffer aligned). */
 int   vio_vk3d_upload_bytes(const void *data, VkDeviceSize size, VkBuffer *out_buf, VkDeviceSize *out_off);
 void  vio_vk3d_shutdown(void);

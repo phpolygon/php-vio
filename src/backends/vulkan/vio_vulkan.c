@@ -18,6 +18,7 @@
 #endif
 
 #include "vio_vulkan.h"
+#include "../../vio_cubemap.h"   /* bindless cube slots */
 #include "../../vio_shader_cache.h"
 #include "../../vio_texture.h"
 #include "../../vio_font.h"
@@ -1543,7 +1544,7 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void)
         vi.addressModeU = vi.addressModeV = vi.addressModeW = clamp ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
         if (vkCreateSampler(vio_vk.device, &vi, NULL, &vio_vk.bindless_sampler_variants[v]) != VK_SUCCESS) return VK_NULL_HANDLE;
     }
-    VkDescriptorSetLayoutBinding b[5];
+    VkDescriptorSetLayoutBinding b[7];
     memset(b, 0, sizeof(b));
     b[0].binding            = 0;
     b[0].descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -1559,23 +1560,30 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void)
         b[2 + v].binding = 2 + (uint32_t)v;
         b[2 + v].pImmutableSamplers = &vio_vk.bindless_sampler_variants[v];
     }
-    VkDescriptorBindingFlagsEXT flags[5] = {
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT, 0, 0, 0, 0 };
+    /* Bindings 5 / 6: vio_cubes[], vio_texture_arrays[] (BINDLESS-PLAN 4b). */
+    b[5] = b[0];
+    b[5].binding = 5;
+    b[6] = b[0];
+    b[6].binding = 6;
+    VkDescriptorBindingFlagsEXT flags[7] = {
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT, 0, 0, 0, 0,
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT,
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT };
     VkDescriptorSetLayoutBindingFlagsCreateInfoEXT bf = {0};
     bf.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT;
-    bf.bindingCount  = 5;
+    bf.bindingCount  = 7;
     bf.pBindingFlags = flags;
     VkDescriptorSetLayoutCreateInfo li = {0};
     li.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     li.pNext        = &bf;
     li.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT_EXT;
-    li.bindingCount = 5;
+    li.bindingCount = 7;
     li.pBindings    = b;
     if (vkCreateDescriptorSetLayout(vio_vk.device, &li, NULL, &vio_vk.bindless_layout) != VK_SUCCESS) {
         vio_vk.bindless_layout = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VIO_BINDLESS_MAX }, { VK_DESCRIPTOR_TYPE_SAMPLER, 4 } };
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * VIO_BINDLESS_MAX }, { VK_DESCRIPTOR_TYPE_SAMPLER, 4 } };
     VkDescriptorPoolCreateInfo pi = {0};
     pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pi.flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT_EXT;
@@ -1595,11 +1603,14 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void)
     return vio_vk.bindless_layout;
 }
 
-static int vulkan_bindless_set(int slot, void *backend_texture)
+static int vulkan_bindless_set(int slot, void *backend_texture, int kind)
 {
     vio_vulkan_texture *t = (vio_vulkan_texture *)backend_texture;
-    /* Released: point the slot at the 1x1 dummy, so it never names a destroyed view. */
-    VkImageView view = t ? t->view : vio_vk3d_dummy_2d_view();
+    if (t && kind == VIO_BINDLESS_KIND_CUBE) t = (vio_vulkan_texture *)((vio_cubemap_object *)backend_texture)->vulkan_texture;
+    else if (!t && backend_texture) return -1;
+    if (backend_texture && !t) return -1;
+    /* Released: point the slot at the 1x1 dummy of its kind, so it never names a destroyed view. */
+    VkImageView view = t ? t->view : vio_vk3d_dummy_view(kind);
     if (!view || (t && t->depth > 0) || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
     if (!vio_vk_bindless_layout() || !vio_vk.bindless_set) return -1;
     VkDescriptorImageInfo ii = {0};
@@ -1608,7 +1619,7 @@ static int vulkan_bindless_set(int slot, void *backend_texture)
     VkWriteDescriptorSet w = {0};
     w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w.dstSet          = vio_vk.bindless_set;
-    w.dstBinding      = 0;
+    w.dstBinding      = kind == VIO_BINDLESS_KIND_CUBE ? 5u : kind == VIO_BINDLESS_KIND_ARRAY ? 6u : 0u;
     w.dstArrayElement = (uint32_t)slot;
     w.descriptorCount = 1;
     w.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;

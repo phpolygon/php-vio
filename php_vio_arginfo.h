@@ -217,12 +217,12 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_texture_release_index, 0, 2, _IS_BOOL, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
-	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, texture, VioTexture|VioCubemap, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_texture_index, 0, 2, MAY_BE_LONG|MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
-	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, texture, VioTexture|VioCubemap, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_sampler_feedback_bind, 0, 2, _IS_BOOL, 0)

@@ -97,6 +97,10 @@ typedef struct _vio_metal_stage_res {
 } vio_metal_stage_res;
 
 #define VIO_METAL_BINDLESS_INDEX 21
+/* vio_cubes / vio_texture_arrays (Set 1 bindings 5 / 6): their own argument
+ * buffers, the MSL translation moves them to sets 2 / 3 (BINDLESS-PLAN 4b). */
+#define VIO_METAL_BINDLESS_CUBE_INDEX  17
+#define VIO_METAL_BINDLESS_ARRAY_INDEX 18
 
 /* What one SPIR-V module is transpiled into. Metal has no hull / domain
  * stages: tessellation runs the vertex and control stages as compute kernels
@@ -420,7 +424,15 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
         size_t count = 0;
         spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &count);
         for (size_t i = 0; i < count; i++) {
-            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) == 1) res->uses_bindless = 1;
+            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 1) continue;
+            res->uses_bindless = 1;
+            /* Unsized arrays share one argument buffer badly (each member is one
+             * element long), so vio_cubes / vio_texture_arrays get sets 2 / 3. */
+            unsigned b = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            if (b == 5 || b == 6) {
+                spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, b == 5 ? 2 : 3);
+                spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, 0);
+            }
         }
     }
     if (res->uses_bindless) {
@@ -430,9 +442,18 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
             spvc_compiler_options_set_uint(bopts, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER, 1);   /* tier 2 */
             spvc_compiler_install_compiler_options(compiler, bopts);
         }
-        for (unsigned s = 0; s < 8; s++) if (s != 1) spvc_compiler_msl_add_discrete_descriptor_set(compiler, s);
+        for (unsigned s = 0; s < 8; s++) if (s < 1 || s > 3) spvc_compiler_msl_add_discrete_descriptor_set(compiler, s);
         spvc_compiler_msl_add_discrete_descriptor_set(compiler, SPVC_MSL_PUSH_CONSTANT_DESC_SET);
-        spvc_compiler_msl_set_argument_buffer_device_address_space(compiler, 1, SPVC_TRUE);
+        for (unsigned s = 1; s <= 3; s++) spvc_compiler_msl_set_argument_buffer_device_address_space(compiler, s, SPVC_TRUE);
+        for (unsigned s = 2; s <= 3; s++) {
+            spvc_msl_resource_binding_2 sb;
+            spvc_msl_resource_binding_init_2(&sb);
+            sb.stage      = em;
+            sb.desc_set   = s;
+            sb.binding    = SPVC_MSL_ARGUMENT_BUFFER_BINDING;
+            sb.msl_buffer = s == 2 ? VIO_METAL_BINDLESS_CUBE_INDEX : VIO_METAL_BINDLESS_ARRAY_INDEX;
+            spvc_compiler_msl_add_resource_binding_2(compiler, &sb);
+        }
         spvc_msl_resource_binding_2 ab;
         spvc_msl_resource_binding_init_2(&ab);
         ab.stage      = em;

@@ -310,9 +310,10 @@ void vio_vk3d_begin_frame(uint32_t slot)
 
 static vio_vulkan_texture *vk3d_dummy(int which);
 
-VkImageView vio_vk3d_dummy_2d_view(void)
+VkImageView vio_vk3d_dummy_view(int bindless_kind)
 {
-    vio_vulkan_texture *t = vk3d_dummy(VK3D_DUMMY_2D);
+    vio_vulkan_texture *t = vk3d_dummy(bindless_kind == VIO_BINDLESS_KIND_CUBE ? VK3D_DUMMY_CUBE
+                                       : bindless_kind == VIO_BINDLESS_KIND_ARRAY ? VK3D_DUMMY_2D_ARRAY : VK3D_DUMMY_2D);
     return t ? t->view : VK_NULL_HANDLE;
 }
 

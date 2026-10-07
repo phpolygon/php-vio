@@ -563,7 +563,7 @@ static void vio_bindless_retire(vio_context_object *ctx)
     if (!ctx->bindless) return;
     for (int i = 0; i < ctx->bindless_count; i++) {
         if (!ctx->bindless_retire[i] || ctx->bindless_retire[i] > ctx->frame_no) continue;
-        if (ctx->backend && ctx->backend->bindless_set) ctx->backend->bindless_set(i, NULL);
+        if (ctx->backend && ctx->backend->bindless_set) ctx->backend->bindless_set(i, NULL, ctx->bindless_kind[i]);
         if (ctx->bindless[i]) { OBJ_RELEASE(ctx->bindless[i]); ctx->bindless[i] = NULL; }
         ctx->bindless_retire[i] = 0;
         ctx->bindless_free[ctx->bindless_free_count++] = i;
@@ -8235,26 +8235,53 @@ ZEND_FUNCTION(vio_swapchain_info)
 /* vio_texture_index(): the texture's slot in the context's bindless table
  * (BINDLESS-PLAN.md). The first call takes a slot and a reference; later calls
  * return the same slot. */
+/* What a VioTexture / VioCubemap enters the bindless table as: its kind and the
+ * handle bindless_set takes. 0 when it cannot enter. */
+static int vio_bindless_entry(zend_object *obj, int *kind, void **handle)
+{
+    if (obj->ce == vio_texture_ce) {
+        vio_texture_object *t = vio_texture_from_obj(obj);
+        if (!t->valid || !t->backend_texture || t->is_3d || t->borrowed) return 0;
+        *kind = t->layers > 1 ? VIO_BINDLESS_KIND_ARRAY : VIO_BINDLESS_KIND_2D;
+        *handle = t->backend_texture;
+        return 1;
+    }
+    if (obj->ce == vio_cubemap_ce) {
+        vio_cubemap_object *cm = vio_cubemap_from_obj(obj);
+        if (!cm->valid || cm->borrowed) return 0;
+        *kind = VIO_BINDLESS_KIND_CUBE;
+        *handle = cm;
+        return 1;
+    }
+    return 0;
+}
+
 ZEND_FUNCTION(vio_texture_index)
 {
-    zval *ctx_zval, *tex_zval;
+    zval *ctx_zval;
+    zend_object *tex_obj;
     ZEND_PARSE_PARAMETERS_START(2, 2)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
-        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+        Z_PARAM_OBJ(tex_obj)
     ZEND_PARSE_PARAMETERS_END();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (tex_obj->ce != vio_texture_ce && tex_obj->ce != vio_cubemap_ce) {
+        zend_argument_type_error(2, "must be of type VioTexture|VioCubemap, %s given", ZSTR_VAL(tex_obj->ce->name));
+        RETURN_THROWS();
+    }
     if (!ctx->initialized || !ctx->backend || !ctx->backend->bindless_set
         || !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_BINDLESS))) {
         php_error_docref(NULL, E_WARNING, "vio_texture_index: backend has no bindless textures (VIO_FEATURE_BINDLESS = 0)");
         RETURN_FALSE;
     }
-    if (!tex->valid || !tex->backend_texture || tex->is_3d || tex->layers > 1 || tex->borrowed) {
-        php_error_docref(NULL, E_WARNING, "vio_texture_index: only plain 2D textures can enter the table");
+    int kind = 0;
+    void *handle = NULL;
+    if (!vio_bindless_entry(tex_obj, &kind, &handle)) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_index: only 2D textures, texture arrays and cubemaps of their own can enter the table");
         RETURN_FALSE;
     }
     for (int i = 0; i < ctx->bindless_count; i++) {
-        if (ctx->bindless[i] == &tex->std && !ctx->bindless_retire[i]) RETURN_LONG(i);
+        if (ctx->bindless[i] == tex_obj && !ctx->bindless_retire[i]) RETURN_LONG(i);
     }
     if (!ctx->bindless_free_count && ctx->bindless_count >= VIO_BINDLESS_MAX) {
         php_error_docref(NULL, E_WARNING, "vio_texture_index: the table is full (%d textures)", VIO_BINDLESS_MAX);
@@ -8264,16 +8291,18 @@ ZEND_FUNCTION(vio_texture_index)
         ctx->bindless = ecalloc(VIO_BINDLESS_MAX, sizeof(zend_object *));
         ctx->bindless_retire = ecalloc(VIO_BINDLESS_MAX, sizeof(unsigned int));
         ctx->bindless_free = ecalloc(VIO_BINDLESS_MAX, sizeof(int));
+        ctx->bindless_kind = ecalloc(VIO_BINDLESS_MAX, 1);
     }
     /* Retired slots first (vio_bindless_retire); they hold a null entry. */
     int reuse = ctx->bindless_free_count > 0;
     int slot = reuse ? ctx->bindless_free[ctx->bindless_free_count - 1] : ctx->bindless_count;
-    if (ctx->backend->bindless_set(slot, tex->backend_texture) != 0) {
+    if (ctx->backend->bindless_set(slot, handle, kind) != 0) {
         php_error_docref(NULL, E_WARNING, "vio_texture_index: the backend could not add the texture");
         RETURN_FALSE;
     }
-    GC_ADDREF(&tex->std);
-    ctx->bindless[slot] = &tex->std;
+    GC_ADDREF(tex_obj);
+    ctx->bindless[slot] = tex_obj;
+    ctx->bindless_kind[slot] = (unsigned char)kind;
     if (reuse) ctx->bindless_free_count--;
     else ctx->bindless_count++;
     RETURN_LONG(slot);
@@ -8284,16 +8313,20 @@ ZEND_FUNCTION(vio_texture_index)
  * more vio_begin calls (vio_bindless_retire); then the slot is cleared and reused. */
 ZEND_FUNCTION(vio_texture_release_index)
 {
-    zval *ctx_zval, *tex_zval;
+    zval *ctx_zval;
+    zend_object *tex_obj;
     ZEND_PARSE_PARAMETERS_START(2, 2)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
-        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+        Z_PARAM_OBJ(tex_obj)
     ZEND_PARSE_PARAMETERS_END();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (tex_obj->ce != vio_texture_ce && tex_obj->ce != vio_cubemap_ce) {
+        zend_argument_type_error(2, "must be of type VioTexture|VioCubemap, %s given", ZSTR_VAL(tex_obj->ce->name));
+        RETURN_THROWS();
+    }
     if (!ctx->initialized || !ctx->bindless) RETURN_FALSE;
     for (int i = 0; i < ctx->bindless_count; i++) {
-        if (ctx->bindless[i] == &tex->std && !ctx->bindless_retire[i]) {
+        if (ctx->bindless[i] == tex_obj && !ctx->bindless_retire[i]) {
             ctx->bindless_retire[i] = ctx->frame_no + VIO_BINDLESS_RETIRE_FRAMES;
             RETURN_TRUE;
         }
