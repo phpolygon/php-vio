@@ -304,6 +304,7 @@ typedef struct _vio_d3d12_state {
     int                        wave_ops;
     int                        barycentrics;   /* OPTIONS3.BarycentricsSupported (SM 6.1) */
     int                        int64_ops;      /* OPTIONS1.Int64ShaderOps (64-bit integers in shaders) */
+    int                        native16;       /* OPTIONS4.Native16BitShaderOpsSupported under SM 6.2+ */
     /* Variable rate shading (GAP-PHASE5 Block 12): D3D12_VARIABLE_SHADING_RATE_TIER
      * (0 = none), the additional-rates cap (2x4 / 4x2 / 4x4), the sticky rate
      * (vio_shading_rate) and the ID3D12GraphicsCommandList5 view of the frame list. */

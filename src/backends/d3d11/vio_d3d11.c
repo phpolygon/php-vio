@@ -168,6 +168,7 @@ static void d3d11_release_views(void)
 
 static int d3d11_init(vio_config *cfg)
 {
+    vio_hlsl_set_16bit_types(0);   /* FXC 5.0 has no native 16-bit types; undo a D3D12 SM 6.2 context */
     HRESULT hr;
     UINT create_flags = 0;
 

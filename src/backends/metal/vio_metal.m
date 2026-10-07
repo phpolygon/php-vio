@@ -5498,6 +5498,21 @@ static int metal_supports_feature(vio_feature f)
 #else
         return 0;
 #endif
+    case VIO_FEATURE_SHADER_FLOAT16:
+        /* float16_t -> MSL half, native on every Metal GPU. */
+#ifdef HAVE_SPIRV_CROSS
+        return 1;
+#else
+        return 0;
+#endif
+    case VIO_FEATURE_BASE_VERTEX:
+        /* [[base_vertex]] / [[base_instance]] (Mac2 / Apple3); the indirect
+         * argument records carry both. Not in the emulated GS / tessellation
+         * pipelines (their vertex stage runs as a kernel). */
+        return vio_mtl.caps.mac2 || vio_mtl.caps.apple_family >= 3;
+    case VIO_FEATURE_COMPUTE_DERIVATIVES:
+        /* Kernel functions have no dfdx / dfdy (the driver rejects them). */
+        return 0;
     case VIO_FEATURE_ATOMIC64:
         /* Metal has 64-bit atomic min / max only (atomic64 cap, MSL 3.1) and
          * SPIRV-Cross refuses 64-bit atomics for MSL: not offered. */

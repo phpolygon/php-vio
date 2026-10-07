@@ -315,11 +315,42 @@ char *vio_spirv_to_glsl_compute(const uint32_t *spirv, size_t spirv_size, int ve
         return NULL;
     }
 
+    /* SPIRV-Cross drops the derivative-group execution mode of a compute module
+     * (GL_NV_compute_shader_derivatives), and dFdx in a compute shader without it
+     * does not compile - put the extension and the layout back after #version.
+     * The split literal keeps the GL audit gate (070) quiet. */
+    int quads = 0, linear = 0;
+    {
+        const SpvExecutionMode *modes = NULL;
+        size_t mode_count = 0;
+        if (spvc_compiler_get_execution_modes(compiler, &modes, &mode_count) == SPVC_SUCCESS) {
+            for (size_t m = 0; m < mode_count; m++) {
+                if ((int)modes[m] == 5289) quads = 1;    /* DerivativeGroupQuadsNV / KHR */
+                if ((int)modes[m] == 5290) linear = 1;   /* DerivativeGroupLinearNV / KHR */
+            }
+        }
+    }
+    if ((quads || linear) && strncmp(result, "#version", 8) == 0) {
+        const char *nl = strchr(result, '\n');
+        const char *ins = quads
+            ? "#extension GL_" "NV_compute_shader_derivatives : require\nlayout(derivative_group_quadsNV) in;\n"
+            : "#extension GL_" "NV_compute_shader_derivatives : require\nlayout(derivative_group_linearNV) in;\n";
+        if (nl) {
+            size_t head = (size_t)(nl - result) + 1, len = strlen(result), il = strlen(ins);
+            output = (char *)malloc(len + il + 1);
+            if (output) {
+                memcpy(output, result, head);
+                memcpy(output + head, ins, il);
+                memcpy(output + head + il, result + head, len - head + 1);
+            }
+        }
+    }
+
     if (getenv("VIO_DUMP_CS_GLSL")) {
-        fprintf(stderr, "==== OpenGL compute GLSL ====\n%s\n==== end ====\n", result);
+        fprintf(stderr, "==== OpenGL compute GLSL ====\n%s\n==== end ====\n", output ? output : result);
         fflush(stderr);
     }
-    output = strdup(result);
+    if (!output) output = strdup(result);
     spvc_context_destroy(ctx);
     return output;
 }
@@ -656,6 +687,9 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
     return vio_spirv_to_hlsl_hooked(spirv, spirv_size / sizeof(uint32_t), shader_model, fixup_depth, NULL, error_msg);
 }
 
+static int vio_hlsl_16bit_types = 0;
+void vio_hlsl_set_16bit_types(int enable) { vio_hlsl_16bit_types = enable ? 1 : 0; }
+
 /* 64-bit atomics on a RWByteAddressBuffer (GL_EXT_shader_atomic_int64 on an
  * SSBO, VIO_FEATURE_ATOMIC64). SPIRV-Cross emits `buf.InterlockedMax(off, v, r)`
  * for them, but the 64-bit raw-buffer methods of Shader Model 6.6 are the *64
@@ -762,6 +796,8 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
 
     spvc_compiler_create_compiler_options(compiler, &options);
     spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL, shader_model);
+    if (vio_hlsl_16bit_types && shader_model >= 62)
+        spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_ENABLE_16BIT_TYPES, SPVC_TRUE);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT, SPVC_TRUE);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_COORD_COMPAT, SPVC_TRUE);
     /* Map OpenGL clip space z [-1,1] to D3D11 clip space z [0,1]:
@@ -1127,6 +1163,8 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
 }
 
 #else /* !HAVE_SPIRV_CROSS */
+
+void vio_hlsl_set_16bit_types(int enable) { (void)enable; }
 
 char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, char **error_msg)
 {

@@ -317,6 +317,19 @@ typedef enum _vio_feature {
      * packs depth and ID into one atomicMax. D3D12: SM 6.6 + Int64ShaderOps.
      * Metal: 0 (only min / max exist, and SPIRV-Cross refuses 64-bit atomics). */
     VIO_FEATURE_ATOMIC64           = 48,
+    /* float16_t / f16vecN arithmetic in shaders (GL_EXT_shader_explicit_arithmetic_types_float16,
+     * no 16-bit storage) that really runs at half precision. D3D12: SM 6.2 +
+     * Native16BitShaderOpsSupported (`half`, DXC -enable-16bit-types) - without it
+     * SPIRV-Cross emits min16float, a precision hint only. */
+    VIO_FEATURE_SHADER_FLOAT16     = 49,
+    /* gl_BaseVertex / gl_BaseInstance (GLSL 460 / GL_ARB_shader_draw_parameters):
+     * an indirect draw's baseVertex / firstInstance, 0 for vio_draw. D3D12: SM 6.8
+     * (SV_StartVertexLocation / SV_StartInstanceLocation). */
+    VIO_FEATURE_BASE_VERTEX        = 50,
+    /* dFdx / dFdy / fwidth in compute shaders with layout(derivative_group_quadsNV)
+     * (GL_NV_compute_shader_derivatives): 2x2 quads of local x / y. D3D12: SM 6.6;
+     * Metal: 0 (kernel functions have no derivatives). */
+    VIO_FEATURE_COMPUTE_DERIVATIVES = 51,
 } vio_feature;
 
 #define VIO_MAX_VIEWPORTS 16

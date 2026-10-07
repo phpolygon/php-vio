@@ -34,6 +34,10 @@ char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_ms
 /* Transpile SPIR-V to HLSL (target shader_model e.g. 50=SM5.0, 51=SM5.1).
  * Returns malloc'd string (caller frees). NULL on failure. */
 char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_model, char **error_msg);
+/* Native 16-bit types in the HLSL (`half` / int16_t instead of min16float):
+ * set by D3D12 under SM 6.2+ with Native16BitShaderOpsSupported, cleared by
+ * every other D3D context. Process-wide, like the D3D backends themselves. */
+void vio_hlsl_set_16bit_types(int enable);
 
 /* Same, with explicit control over the GL -> D3D clip-space depth fixup
  * (z' = (z + w) / 2 on gl_Position writes). SPIRV-Cross applies it to EVERY

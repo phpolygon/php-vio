@@ -39,7 +39,7 @@ int  vio_dxc_available(void);
 void vio_dxc_set_dir(const char *dir);
 int  vio_dxc_highest_minor(int max_minor);
 int  vio_dxc_compile(const char *hlsl, const char *entry, const char *profile, int debug,
-                     void **out_bytes, size_t *out_len, char **out_error);
+                     int enable_16bit, void **out_bytes, size_t *out_len, char **out_error);
 #include "../../vio_shader_reflect.h"   /* vio_spirv_reflect — data-driven compute register mapping */
 #include "../../vio_shader_compiler.h"  /* vio_compile_glsl_stage_to_spirv — geometry / tessellation stages */
 #include "../../vio_tess_hlsl.h"
@@ -967,6 +967,7 @@ static int d3d12_init(vio_config *cfg)
     vio_d3d12.wave_ops = 0;
     vio_d3d12.barycentrics = 0;
     vio_d3d12.int64_ops = 0;
+    vio_d3d12.native16 = 0;
     /* Variable rate shading capability (GAP-PHASE5 Block 12). */
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {0};
@@ -977,6 +978,7 @@ static int d3d12_init(vio_config *cfg)
         vio_d3d12.shading_rate = VIO_SHADING_RATE_1X1;
     }
 
+    vio_hlsl_set_16bit_types(0);   /* FXC / SM < 6.2: min16float as before */
     if (cfg->shader_model >= 6) {
         if (cfg->dxc_dir[0]) vio_dxc_set_dir(cfg->dxc_dir);
         /* The runtime rejects HighestShaderModel values it does not know
@@ -999,9 +1001,17 @@ static int d3d12_init(vio_config *cfg)
             if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))))
                 vio_d3d12.wave_ops = o1.WaveOps ? 1 : 0;
             vio_d3d12.int64_ops = o1.Int64ShaderOps ? 1 : 0;
+            /* Native 16-bit shader ops (SM 6.2): SPIRV-Cross emits `half`, DXC gets
+             * -enable-16bit-types; the cache key includes the HLSL, so blobs of the
+             * two modes never mix. */
+            D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4 = {0};
+            if (vio_d3d12.shader_model_version >= 62
+                && SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof(o4))))
+                vio_d3d12.native16 = o4.Native16BitShaderOpsSupported ? 1 : 0;
             D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {0};
             if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
                 vio_d3d12.barycentrics = o3.BarycentricsSupported ? 1 : 0;
+            vio_hlsl_set_16bit_types(vio_d3d12.native16);
         } else {
             php_error_docref(NULL, E_NOTICE, "D3D12: shader_model 6 requested but %s; using FXC (SM 5.1)",
                              device_minor < 0 ? "the device lacks SM 6.0"
@@ -4062,7 +4072,8 @@ static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, cons
     HRESULT hr;
     if (vio_d3d12.shader_model == 6) {
         void *bytes = NULL; size_t len = 0; char *err = NULL;
-        int rc = vio_dxc_compile(src, "main", profile, (flags & D3DCOMPILE_DEBUG) ? 1 : 0, &bytes, &len, &err);
+        int rc = vio_dxc_compile(src, "main", profile, (flags & D3DCOMPILE_DEBUG) ? 1 : 0, vio_d3d12.native16,
+                                 &bytes, &len, &err);
         if (rc != 0 || !bytes) {
             php_error_docref(NULL, E_WARNING, "D3D12: %s (DXC) compile failed: %s", profile, err ? err : "unknown");
             if (err) free(err);
@@ -5765,7 +5776,7 @@ static int d3d12_stage_supported(int stage, const char *profile)
                 char profile6[16];
                 const char *p6 = d3d12_profile(profile, profile6, sizeof(profile6));
                 void *bytes = NULL; size_t len = 0; char *err = NULL;
-                ok = vio_dxc_compile(hlsl, "main", p6, 0, &bytes, &len, &err) == 0 && bytes ? 1 : 0;
+                ok = vio_dxc_compile(hlsl, "main", p6, 0, vio_d3d12.native16, &bytes, &len, &err) == 0 && bytes ? 1 : 0;
                 if (!ok && getenv("VIO_DEBUG_STAGE_PROBE")) {
                     fprintf(stderr, "[vio] D3D12 stage probe %d (%s): DXC rejected the SPIRV-Cross HLSL: %s\n",
                             stage, p6, err ? err : "unknown");
@@ -5814,6 +5825,9 @@ static int d3d12_supports_feature(vio_feature feature)
         /* SV_Barycentrics: SPIRV-Cross needs an HLSL target of 6.1. */
         /* InterlockedX64 on raw buffers (SM 6.6, mandatory there); vio_shader_reflect.c
          * renames SPIRV-Cross's 32-bit method names for 64-bit operands. */
+        case VIO_FEATURE_SHADER_FLOAT16: return vio_d3d12.shader_model == 6 && vio_d3d12.native16;   /* SM 6.2 half */
+        case VIO_FEATURE_BASE_VERTEX:  return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 68; /* SV_Start*Location */
+        case VIO_FEATURE_COMPUTE_DERIVATIVES: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 66;
         case VIO_FEATURE_ATOMIC64:     return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 66 && vio_d3d12.int64_ops;
         case VIO_FEATURE_BARYCENTRICS: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 61 && vio_d3d12.barycentrics;
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */

@@ -261,7 +261,7 @@ static int create_logical_device(void)
     /* Device extensions: the swapchain, MoltenVK's portability subset, and
      * VK_KHR_fragment_shading_rate (+ its create_renderpass2 dependency) when the
      * device offers pipeline shading rates (Block 10c). */
-    const char *device_extensions[8];
+    const char *device_extensions[12];
     uint32_t device_ext_count = 0;
     device_extensions[device_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
 
@@ -271,6 +271,7 @@ static int create_logical_device(void)
     vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &ext_count, ext_props);
 
     int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0, has_bary = 0, has_a64 = 0;
+    int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
@@ -278,6 +279,9 @@ static int create_logical_device(void)
         if (strcmp(ext_props[i].extensionName, "VK_EXT_shader_viewport_index_layer") == 0) has_vpl = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_fragment_shader_barycentric") == 0) has_bary = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_atomic_int64") == 0) has_a64 = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float16_int8") == 0) has_f16 = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_NV_compute_shader_derivatives") == 0) has_cd_nv = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_compute_shader_derivatives") == 0) has_cd_khr = 1;
     }
     free(ext_props);
     if (has_portability) device_extensions[device_ext_count++] = "VK_KHR_portability_subset";
@@ -443,6 +447,53 @@ static int create_logical_device(void)
         }
     }
 
+    /* VIO_FEATURE_SHADER_FLOAT16 / BASE_VERTEX / COMPUTE_DERIVATIVES: feature
+     * structs of 1.1 core and of extensions, queried in one Features2 call. */
+    vio_vk.float16_supported = vio_vk.draw_parameters_supported = vio_vk.compute_derivatives_supported = 0;
+    VkPhysicalDeviceShaderFloat16Int8FeaturesKHR f16_enable = {0};
+    f16_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;
+    VkPhysicalDeviceShaderDrawParametersFeatures dp_enable = {0};
+    dp_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesNV cd_enable = {0};
+    cd_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV;
+    if (vio_vk.instance_api_11) {
+        VkPhysicalDeviceProperties dprops;
+        vkGetPhysicalDeviceProperties(vio_vk.physical_device, &dprops);
+        if (dprops.apiVersion >= VK_API_VERSION_1_1) {
+            VkPhysicalDeviceShaderFloat16Int8FeaturesKHR f16_avail = {0};
+            f16_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;
+            VkPhysicalDeviceShaderDrawParametersFeatures dp_avail = {0};
+            dp_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
+            VkPhysicalDeviceComputeShaderDerivativesFeaturesNV cd_avail = {0};
+            cd_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV;
+            dp_avail.pNext = has_f16 ? (void *)&f16_avail : NULL;
+            f16_avail.pNext = (has_cd_nv || has_cd_khr) ? (void *)&cd_avail : NULL;
+            if (!has_f16) dp_avail.pNext = (has_cd_nv || has_cd_khr) ? (void *)&cd_avail : NULL;
+            VkPhysicalDeviceFeatures2 f2 = {0};
+            f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            f2.pNext = &dp_avail;
+            vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+            if (has_f16 && f16_avail.shaderFloat16) {
+                f16_enable.shaderFloat16 = VK_TRUE;
+                device_extensions[device_ext_count++] = "VK_KHR_shader_float16_int8";
+                vio_vk.float16_supported = 1;
+            }
+            /* gl_BaseInstance only means something for indirect draws when
+             * firstInstance may be non-zero there. */
+            if (dp_avail.shaderDrawParameters && f2.features.drawIndirectFirstInstance) {
+                dp_enable.shaderDrawParameters = VK_TRUE;
+                features.drawIndirectFirstInstance = VK_TRUE;
+                vio_vk.draw_parameters_supported = 1;
+            }
+            if ((has_cd_nv || has_cd_khr) && cd_avail.computeDerivativeGroupQuads) {
+                cd_enable.computeDerivativeGroupQuads = VK_TRUE;
+                cd_enable.computeDerivativeGroupLinear = cd_avail.computeDerivativeGroupLinear;
+                device_extensions[device_ext_count++] = has_cd_nv ? "VK_NV_compute_shader_derivatives" : "VK_KHR_compute_shader_derivatives";
+                vio_vk.compute_derivatives_supported = 1;
+            }
+        }
+    }
+
     VkDeviceCreateInfo create_info = {0};
     create_info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     create_info.queueCreateInfoCount    = unique_count;
@@ -459,6 +510,9 @@ static int create_logical_device(void)
     if (vio_vk.barycentrics_supported) { bary_enable.pNext = feature_chain; feature_chain = &bary_enable; }
 #endif
     if (vio_vk.atomic64_supported) { a64_enable.pNext = feature_chain; feature_chain = &a64_enable; }
+    if (vio_vk.float16_supported) { f16_enable.pNext = feature_chain; feature_chain = &f16_enable; }
+    if (vio_vk.draw_parameters_supported) { dp_enable.pNext = feature_chain; feature_chain = &dp_enable; }
+    if (vio_vk.compute_derivatives_supported) { cd_enable.pNext = feature_chain; feature_chain = &cd_enable; }
     create_info.pNext = feature_chain;
 
     VkResult result = vkCreateDevice(vio_vk.physical_device, &create_info, NULL, &vio_vk.device);
@@ -3497,6 +3551,9 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_SUBGROUP_QUAD:  return vio_vk.device && vio_vk.subgroup_quad_supported;
         case VIO_FEATURE_BARYCENTRICS:   return vio_vk.device && vio_vk.barycentrics_supported; /* VK_KHR_fragment_shader_barycentric */
         case VIO_FEATURE_ATOMIC64:       return vio_vk.device && vio_vk.atomic64_supported; /* VK_KHR_shader_atomic_int64 */
+        case VIO_FEATURE_SHADER_FLOAT16: return vio_vk.device && vio_vk.float16_supported;   /* shaderFloat16 */
+        case VIO_FEATURE_BASE_VERTEX:    return vio_vk3d_available() && vio_vk.device && vio_vk.draw_parameters_supported;
+        case VIO_FEATURE_COMPUTE_DERIVATIVES: return vio_vk.device && vio_vk.compute_derivatives_supported;
         case VIO_FEATURE_HDR_OUTPUT:     return vio_vk.device && vio_vk.hdr10_capable; /* 10-bit surface format, ST 2084 via VK_EXT_swapchain_colorspace (Block 10d) */
         default: return 0;
     }

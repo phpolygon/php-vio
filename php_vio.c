@@ -8504,6 +8504,9 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SUBGROUP_QUAD", VIO_FEATURE_SUBGROUP_QUAD, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BARYCENTRICS", VIO_FEATURE_BARYCENTRICS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_ATOMIC64", VIO_FEATURE_ATOMIC64, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADER_FLOAT16", VIO_FEATURE_SHADER_FLOAT16, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_BASE_VERTEX", VIO_FEATURE_BASE_VERTEX, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_COMPUTE_DERIVATIVES", VIO_FEATURE_COMPUTE_DERIVATIVES, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
@@ -10734,6 +10737,9 @@ ZEND_FUNCTION(vio_gl_info)
     add_assoc_bool(&features, "subgroup_quad",           vio_gl.caps.has_subgroup_quad);
     add_assoc_bool(&features, "barycentrics",            vio_gl.caps.has_barycentrics);
     add_assoc_bool(&features, "atomic64",                vio_gl.caps.has_atomic64);
+    add_assoc_bool(&features, "float16",                 vio_gl.caps.has_float16);
+    add_assoc_bool(&features, "draw_parameters",         vio_gl.caps.has_draw_parameters);
+    add_assoc_bool(&features, "compute_derivatives",     vio_gl.caps.has_compute_derivatives);
     add_assoc_zval(return_value, "features", &features);
     /* Raw GL_KHR_shader_subgroup limits (0 without the extension or compute). */
     add_assoc_long(return_value, "subgroup_stages",   vio_gl.caps.subgroup_stages);

@@ -53,6 +53,9 @@ typedef struct _vio_opengl_state {
         int has_subgroup_quad;           /* GL_KHR_shader_subgroup quad operations in the fragment stage */
         int has_barycentrics;            /* GL_EXT_fragment_shader_barycentric */
         int has_atomic64;                /* compute + GL_ARB_gpu_shader_int64 + GL_NV_shader_atomic_int64 */
+        int has_float16;                 /* GL_AMD_gpu_shader_half_float / GL_NV_gpu_shader5 (SPIRV-Cross's choices) */
+        int has_draw_parameters;         /* GL 4.6 / GL_ARB_shader_draw_parameters + base instance (4.2) */
+        int has_compute_derivatives;     /* compute + GL_NV_compute_shader_derivatives */
     } caps;
 
     /* Cached extension list. NULL until setup; freed in shutdown. */

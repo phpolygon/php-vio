@@ -22,7 +22,7 @@ extern "C" {
 int  vio_dxc_available(void);
 void vio_dxc_set_dir(const char *dir);
 int  vio_dxc_compile(const char *hlsl, const char *entry, const char *profile, int debug,
-                     void **out_bytes, size_t *out_len, char **out_error);
+                     int enable_16bit, void **out_bytes, size_t *out_len, char **out_error);
 int  vio_dxc_highest_minor(int max_minor);
 }
 
@@ -92,7 +92,7 @@ extern "C" int vio_dxc_available(void)
 }
 
 extern "C" int vio_dxc_compile(const char *hlsl, const char *entry, const char *profile, int debug,
-                               void **out_bytes, size_t *out_len, char **out_error)
+                               int enable_16bit, void **out_bytes, size_t *out_len, char **out_error)
 {
     if (out_bytes) *out_bytes = nullptr;
     if (out_len) *out_len = 0;
@@ -122,6 +122,8 @@ extern "C" int vio_dxc_compile(const char *hlsl, const char *entry, const char *
     /* SPIRV-Cross emits SM 5.1 style HLSL; keep DXC's stricter defaults but
      * allow the legacy resource binding shape it produces. */
     args.push_back(L"-HV"); args.push_back(L"2018");
+    /* `half` / int16_t are real 16-bit types (SM 6.2+, VIO_FEATURE_SHADER_FLOAT16). */
+    if (enable_16bit) args.push_back(L"-enable-16bit-types");
 
     DxcBuffer src = {};
     src.Ptr = hlsl;
@@ -176,7 +178,7 @@ extern "C" int vio_dxc_highest_minor(int max_minor)
         char profile[16];
         std::snprintf(profile, sizeof(profile), "cs_6_%d", minor);
         void *bytes = nullptr; size_t len = 0; char *err = nullptr;
-        int rc = vio_dxc_compile(probe, "main", profile, 0, &bytes, &len, &err);
+        int rc = vio_dxc_compile(probe, "main", profile, 0, 0, &bytes, &len, &err);
         std::free(bytes);
         std::free(err);
         if (rc == 0) return minor;

@@ -59,11 +59,17 @@ Reiner Übersetzungs-/Gate-Kram, keine neue Ressourcen-API. Reihenfolge = Nutzen
 | 1a ✅ | Subgroups `SUBGROUP` (basic/vote/ballot/arithmetic/shuffle, Compute + Fragment) | ✅ SM 6.0 + `WaveOps` | ✅ `VkPhysicalDeviceSubgroupProperties` (Stages + Operations) | ✅ `simd_group` (MSL **2.2** — `threads_per_simdgroup` im Fragment-Shader, per Leiter gefunden; Mac2/Apple7) | ✅ `GL_KHR_shader_subgroup` (Mesa, NV) | Reduktionen/Culling ohne Shared Memory; jede DX12-Klasse-GPU |
 | 1b ✅ | Quad-Ops `SUBGROUP_QUAD` (Fragment-Stage) | SM 6.0 | `subgroupQuadOperationsInAllStages` / Quad-Bit | `quad_group` (Mac2/Apple4) | KHR-Ext | Nachbarpixel ohne Derivate (Filter, Post-FX) |
 | 1c ✅ | Barycentrics `BARYCENTRICS` | SM 6.1 + `OPTIONS3.BarycentricsSupported` | `VK_KHR_fragment_shader_barycentric` | `barycentrics` (MSL 2.2) | `GL_NV_fragment_shader_barycentric` / AMD | Visibility Buffer, Wireframe ohne GS; Turing+/RDNA2+/Arc/Apple |
-| 1d | 16-Bit-Typen `SHADER_FLOAT16` | SM 6.2 + `OPTIONS4.Native16BitShaderOpsSupported`, DXC `-enable-16bit-types`, SPIRV-Cross-HLSL-Option | `shaderFloat16` + `storageBuffer16BitAccess` | `half` (immer) | `GL_AMD_gpu_shader_half_float` / NV | halber Registerdruck, 2× FP16 auf Turing+/Vega+/Intel; auf Apple mehr Occupancy |
-| 1e | Base Vertex/Instance `BASE_VERTEX` | SM 6.8 `SV_StartVertexLocation`, darunter Root-Konstante je Draw | `shaderDrawParameters` (1.1) | `[[base_vertex]]`/`[[base_instance]]` (Mac2/Apple3) | GL 4.6 / `ARB_shader_draw_parameters` | `gl_BaseVertex` für `vio_draw_indirect` mit Offsets; alle |
+| 1d ✅ | 16-Bit-Typen `SHADER_FLOAT16` | SM 6.2 + `OPTIONS4.Native16BitShaderOpsSupported`, DXC `-enable-16bit-types`, SPIRV-Cross-HLSL-Option | `shaderFloat16` + `storageBuffer16BitAccess` | `half` (immer) | `GL_AMD_gpu_shader_half_float` / NV | halber Registerdruck, 2× FP16 auf Turing+/Vega+/Intel; auf Apple mehr Occupancy |
+| 1e ✅ | Base Vertex/Instance `BASE_VERTEX` | SM 6.8 `SV_StartVertexLocation`, darunter Root-Konstante je Draw | `shaderDrawParameters` (1.1) | `[[base_vertex]]`/`[[base_instance]]` (Mac2/Apple3) | GL 4.6 / `ARB_shader_draw_parameters` | `gl_BaseVertex` für `vio_draw_indirect` mit Offsets; alle |
 | 1f ✅ (ohne Metal) | 64-Bit-Atomics `ATOMIC64` | SM 6.6 + `OPTIONS9`/`OPTIONS11` Int64-Atomics | `shaderBufferInt64Atomics`, `VK_EXT_shader_image_atomic_int64` | `atomic64` (MSL 3.1, Apple9) — **Blocker**: SPIRV-Cross-MSL; Upstream-Patch oder MSL-Textumbau | `GL_NV_shader_atomic_int64` | Software-Rasterisierung (Nanite-Art), Visibility Buffer; Turing+/RDNA2+/M3+ |
-| 1g | Compute-Derivate `COMPUTE_DERIVATIVES` | SM 6.6 | `VK_KHR_compute_shader_derivatives` | ❌ (Treiber lehnt ab) → 0 | `GL_NV_compute_shader_derivatives` | Mip-Auswahl in Compute (Deferred Texturing) |
-| 1h | 6.7-Texturops: `SampleCmpLevel`, Raw Gather, Integer-Sampling | SM 6.7 + `OPTIONS14` | core / `shaderImageGatherExtended` | MSL `sample_compare(level)` | GL 4.x | Shadow-Sampling in allen Stages |
+| 1g ✅ | Compute-Derivate `COMPUTE_DERIVATIVES` | SM 6.6 | `VK_KHR_compute_shader_derivatives` | ❌ (Treiber lehnt ab) → 0 | `GL_NV_compute_shader_derivatives` | Mip-Auswahl in Compute (Deferred Texturing) |
+| 1h ⏸ | 6.7-Texturops: `SampleCmpLevel`, Raw Gather, Integer-Sampling | SM 6.7 + `OPTIONS14` | core / `shaderImageGatherExtended` | MSL `sample_compare(level)` | GL 4.x | Shadow-Sampling in allen Stages |
+
+**1h zurückgestellt (2026-10-07):** vio hat keine Tiefentexturen mit Mip-Kette (depth_only-Targets nie
+`mipmaps`, `php_vio.c` 9707/9976), ein explizites LOD/Gradient am Shadow-Sampler wäre ohne sichtbare Wirkung.
+Außerdem verwirft SPIRV-Cross das LOD bei Shadow-Samplern für HLSL auf jeder SM-Stufe (`SampleCmpLevelZero`,
+mit SPIRV-Cross-CLI geprüft). Voraussetzung wäre zuerst ein Feature „Tiefentexturen mit Mips“ plus ein
+SPIRV-Cross-Patch (`SampleCmpLevel` ab SM 6.7, `SampleCmpGrad` ab 6.8).
 
 Tests (ab 152): je Feature ein `_all_backends`-Test mit wave-größen-unabhängiger Prüfung (Muster 149),
 Barycentrics über Farbinterpolation an Dreiecksecken, Float16 über Ergebnis- und Präzisionsgrenzen,
