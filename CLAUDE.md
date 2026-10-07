@@ -94,7 +94,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 
 | Ordner | Inhalt |
 |---|---|
-| `tests/render3d/158` | Multiview (`VIO_FEATURE_MULTIVIEW`, `vio_shader(['view_count' => N])`): ein Draw rendert jede View in Layer `gl_ViewIndex` eines mit `VIO_RT_ALL_LAYERS` gebundenen Layered-RTs — Fragment- und Vertex-Arbeit je View, Instancing (Instanz-Attribute stepen je Instanz, nicht je (Instanz, View)), 4 Views, indirekter Draw, Optionsvertrag (2..4, ohne Flag abgelehnt). |
+| `tests/render3d/158` | Multiview (`VIO_FEATURE_MULTIVIEW`, `vio_shader(['view_count' => N])`): ein Draw rendert jede View in Layer `gl_ViewIndex` eines mit `VIO_RT_ALL_LAYERS` gebundenen Layered-RTs — Fragment- und Vertex-Arbeit je View, Instancing (Instanz-Attribute stepen je Instanz, nicht je (Instanz, View)), 4 Views, indirekter Draw, Optionsvertrag (2..4, ohne Flag abgelehnt). CI-Pflicht auf allen vier Backends: OpenGL (llvmpipe, `GL_OVR_multiview2`), Vulkan (lavapipe), D3D12 (WARP, SM 6.2), Metal (macOS-Runner). |
 | `tests/render3d/155` | 16-Bit-Floats (`VIO_FEATURE_SHADER_FLOAT16`): `float16_t` zur Laufzeit gerundet (2049 → 2048, 0.1 → 0.0999755859375) — beweist echte halbe Genauigkeit (HLSL `min16float` wäre nur ein Hinweis). |
 | `tests/render3d/156` | Draw-Parameter (`VIO_FEATURE_BASE_VERTEX`): indirekter Draw mit baseVertex 4 / firstInstance 3 liefert `gl_BaseVertex`/`gl_BaseInstance` = (4, 3), `vio_draw` (0, 0); Vertices 0..3 sind degeneriert, ein ignorierter Base Vertex zeichnet nichts. |
 | `tests/render3d/157` | Compute-Derivate (`VIO_FEATURE_COMPUTE_DERIVATIVES`): `derivative_group_quadsNV`, `dFdx`/`dFdy` von 3x + 5y ergeben überall (3, 5); Metal muss 0 melden. |
