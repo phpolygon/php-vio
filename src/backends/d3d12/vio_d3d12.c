@@ -7228,8 +7228,16 @@ static void *d3d12_create_work_graph(const char *hlsl, const char *entry, int re
     if (ok) {
         wchar_t wentry[256];
         int n = MultiByteToWideChar(CP_UTF8, 0, entry, -1, wentry, 256);
-        D3D12_NODE_ID id = { wentry, 0 };
-        g->entry_index = n > 0 ? ID3D12WorkGraphProperties_GetEntrypointIndex(wgp, wg_index, id) : 0xFFFFFFFFu;
+        /* Look the name up among the entry points instead of asking
+         * GetEntrypointIndex: an unknown name is a caller error vio reports
+         * itself, and the query logs a debug-layer error for it. */
+        g->entry_index = 0xFFFFFFFFu;
+        UINT entries = n > 0 ? ID3D12WorkGraphProperties_GetNumEntrypoints(wgp, wg_index) : 0;
+        for (UINT e = 0; e < entries; e++) {
+            D3D12_NODE_ID id;
+            ID3D12WorkGraphProperties_GetEntrypointID(wgp, &id, wg_index, e);   /* C ABI: struct return as out parameter */
+            if (id.ArrayIndex == 0 && id.Name && wcscmp(id.Name, wentry) == 0) { g->entry_index = e; break; }
+        }
         if (g->entry_index == 0xFFFFFFFFu) {
             if (error) *error = d3d12_wg_error("'%s' is not an entry node of the graph (a node no other node targets)", entry);
             ok = 0;
