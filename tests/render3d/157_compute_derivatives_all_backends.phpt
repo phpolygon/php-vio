@@ -12,8 +12,8 @@ vio
  * backends mandatory. */
 $CS = "#version 450\n"
     . "#extension GL_NV_compute_shader_derivatives : require\n"
-    . "layout(derivative_group_quadsNV) in;\n"
     . "layout(local_size_x = 8, local_size_y = 8) in;\n"
+    . "layout(derivative_group_quadsNV) in;\n"
     . "layout(std430, binding = 0) buffer B { vec2 v[]; } b;\n"
     . "void main(){ float f = float(gl_LocalInvocationID.x * 3u + gl_LocalInvocationID.y * 5u);\n"
     . "  b.v[gl_LocalInvocationIndex] = vec2(dFdx(f), dFdy(f)); }\n";

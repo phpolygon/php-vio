@@ -123,6 +123,8 @@ jobs:
           # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
           export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_ATOMIC64=vulkan
           export VIO_REQUIRE_SHADER_FLOAT16=vulkan VIO_REQUIRE_BASE_VERTEX=vulkan,opengl
+          # lavapipe has VK_KHR_compute_shader_derivatives (measured).
+          export VIO_REQUIRE_COMPUTE_DERIVATIVES=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \
@@ -251,6 +253,8 @@ jobs:
           # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
           export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_ATOMIC64=vulkan
           export VIO_REQUIRE_SHADER_FLOAT16=vulkan VIO_REQUIRE_BASE_VERTEX=vulkan,opengl
+          # lavapipe has VK_KHR_compute_shader_derivatives (measured).
+          export VIO_REQUIRE_COMPUTE_DERIVATIVES=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \
