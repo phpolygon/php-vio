@@ -444,10 +444,12 @@ static void opengl_resize(int width, int height)
     glViewport(0, 0, width, height);
 }
 
+/* GL keeps pipeline state in the VioPipeline object and applies it when the
+ * pipeline is bound (php_vio.c), so there is no backend handle. */
 static void *opengl_create_pipeline(vio_pipeline_desc *desc)
 {
     (void)desc;
-    return NULL; /* TODO: Phase 4 */
+    return NULL;
 }
 
 static void opengl_destroy_pipeline(void *pipeline)
@@ -555,10 +557,12 @@ static void opengl_destroy_buffer(void *buffer)
     (void)buffer;
 }
 
+/* GL textures are created by the VioTexture paths that own the GL name; the
+ * generic slot is not used on this backend. */
 static void *opengl_create_texture(vio_texture_desc *desc)
 {
     (void)desc;
-    return NULL; /* TODO: Phase 4 */
+    return NULL;
 }
 
 static void opengl_destroy_texture(void *texture)

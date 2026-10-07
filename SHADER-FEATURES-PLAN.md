@@ -5,13 +5,13 @@ Metal, Vulkan und OpenGL als portable vio-Features — GLSL bleibt die Quelle, j
 `VIO_FEATURE_*`-Flag, einen `_all_backends`-Test und läuft auf jedem Backend, das es kann. Arbeitsweise
 **TDD**: Test zuerst (rot), dann Implementierung, dann Flag in `074` pinnen.
 
-## Ausgangslage
+## Ausgangslage (2026-10-06, vor diesem Plan)
 
 | Baustein | Stand |
 |---|---|
 | OpenGL-Kontext-Leiter 4.6 → 3.0, `vio_gl.caps` | ✅ (`vio_window.c`, `vio_opengl.c`) |
 | **Metal-Versionsleiter** MSL 4.1 → 2.0, `vio_mtl.caps`, `vio_backend_info()` | ✅ `a17e588` (Tests 150, 151) |
-| **D3D12 Shader Model 6** (höchstes 6.x aus Device ∩ DXC, SPIRV-Cross auf dasselbe Profil, DXC-Stage-Probe, `VIO_FEATURE_SUBGROUP`) | 🚧 Branch `feat/d3d12-shader-model-6` (`b0fcfc1`, Test 149, CI erzwingt DXC) |
+| **D3D12 Shader Model 6** (höchstes 6.x aus Device ∩ DXC, SPIRV-Cross auf dasselbe Profil, DXC-Stage-Probe, `VIO_FEATURE_SUBGROUP`) | ✅ (Test 149, CI erzwingt DXC; Profil festlegbar per `shader_model => 6x`, Test 170) |
 | Vulkan: Instanz API 1.1, Device-Features einzeln abgefragt | ✅, aber keine Leiter-/Caps-Auskunft |
 
 Geprüft auf Apple M5 / macOS 27 (Metal 4, Apple10): GLSL → glslang → SPIRV-Cross → MSL → Treiber

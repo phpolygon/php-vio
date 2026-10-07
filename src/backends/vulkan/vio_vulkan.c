@@ -1758,9 +1758,9 @@ static void vulkan_resize(int width, int height)
  * means no manual flush/invalidate is needed: the GPU sees the seeded input and
  * the host sees the dispatch's writes once the dispatch fence is signalled.
  *
- * Graphics buffers (vertex/index/uniform) are NOT handled here — they return
- * NULL exactly as before (those paths are still stubbed in this backend), so
- * this addition is compute-only and cannot perturb any existing behaviour. */
+ * vulkan_create_buffer below also creates vertex and index buffers for the 3D
+ * pipeline; uniform buffers stay NULL (shader cbuffers go through the frame
+ * ring per draw). */
 /* vio_vulkan_compute_buffer: see vio_vulkan.h */
 
 static void *vulkan_create_buffer(vio_buffer_desc *desc)

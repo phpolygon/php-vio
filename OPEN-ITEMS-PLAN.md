@@ -17,7 +17,7 @@ Größe: S ≤ ½ Tag, M ≈ 1–2 Tage, L = mehrere Tage. Nummern A1–A41 stam
 | A5 | D3D12-Shader-Model festlegen: `shader_model => 62`… bzw. `VIO_D3D12_SHADER_MODEL` | D3D12 | S |
 | A9 | Caps unterscheiden „nativ“ und „emuliert“ (`vio_feature_info()` o. ä.) | alle | S |
 | A19 | Benannte GPU-Zeitmarken je Pass (`vio_gpu_timestamp`, `vio_gpu_timings`) | alle | S–M |
-| A25 | Vulkan-Cube-RT: Tiefe auch für Level > 0 | Vulkan | S |
+| ~~A25~~ | ~~Vulkan-Cube-RT: Tiefe auch für Level > 0~~ — **gestrichen**: keine Vulkan-Lücke, sondern der gemeinsame Vertrag aller fünf Backends (Mip-Level > 0 eines Cube-RTs rendern ohne Tiefe, siehe `d3d11_bind_render_target_face`). Ändern hieße alle Backends umbauen, ohne Bedarf: Mip-Ketten füllt man mit tiefenlosen Vollbild-Passes. | — | — |
 
 ## Batch 2 — Korrektheit und Portabilität im Alltag
 | # | Punkt | Backend | Größe |
@@ -61,4 +61,7 @@ Test zuerst (rot auf dem Ausgangsstand), dann Code, dann volle Suite auf WARP **
 und Feature-Matrix im selben Batch nachziehen.
 
 ## Stand
-- [ ] Batch 1 · [ ] Batch 2 · [ ] Batch 3 · [ ] Batch 4 · [ ] Batch 5 · [ ] Batch 6 · [ ] Batch 7
+- [x] Batch 1 (Branch `feat/open-items-batch1`): A40 Test 169, A5 Test 170, A9 Test 171, A19 Test 172, E/F;
+  Nebenbefund beim Schreiben von 172: D3D12 verlor die gebundene Pipeline über die Frame-Grenze und entfernte
+  beim nächsten Draw das Device (Fix + Test 173).
+- [ ] Batch 2 · [ ] Batch 3 · [ ] Batch 4 · [ ] Batch 5 · [ ] Batch 6 · [ ] Batch 7

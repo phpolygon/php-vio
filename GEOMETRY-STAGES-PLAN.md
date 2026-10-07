@@ -1,12 +1,12 @@
 # GEOMETRY-STAGES-PLAN — was nach den Geometry-/Tessellation-Stages fehlt
 
 Stand 2026-10-03, nach PR #23 (Geometry + Tessellation für `vio_shader`, Vulkan nativ,
-Test 109/110/135). Alle Phasen sind umgesetzt (Tabelle am Ende); offen bleiben nur Hull/Domain aus GLSL auf D3D
-(SPIRV-Cross hat kein HLSL-Tessellations-Backend, der HLSL-Override deckt es ab). Dieser Plan sammelt die Funktionen, die der PR bewusst ausgelassen hat, und
+Test 109/110/135). Alle Phasen sind umgesetzt (Tabelle am Ende), auch Hull/Domain aus GLSL auf D3D: SPIRV-Cross
+hat (noch) kein HLSL-Tessellations-Backend, vio baut die Stages selbst (`vio_tess_hlsl.c`, Test 144); der HLSL-Override bleibt. Dieser Plan sammelt die Funktionen, die der PR bewusst ausgelassen hat, und
 ordnet sie nach Nutzen für PHPolygon und nach Testbarkeit auf dem Windows-Entwicklungsrechner
 (RTX 2080, Vulkan 1.4, D3D11/D3D12, OpenGL 4.6; Metal nur über die macOS-CI).
 
-## Ausgangslage
+## Ausgangslage (2026-10-03, vor diesem Plan)
 
 | | OpenGL | D3D11 | D3D12 | Vulkan | Metal |
 |---|---|---|---|---|---|
