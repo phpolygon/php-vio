@@ -10256,7 +10256,9 @@ ZEND_FUNCTION(vio_draw_instanced)
     }
 
     /* Backend instanced draw (D3D11/D3D12/Vulkan) */
-    if (strcmp(ctx->backend->name, "opengl") != 0 && mesh->backend_vb) {
+    /* Without a bound pipeline the typed backends have no shaders on the
+     * context; GL alone falls back to its built-in shader (test 173). */
+    if (strcmp(ctx->backend->name, "opengl") != 0 && mesh->backend_vb && ctx->bound_shader_object) {
 
 #ifdef HAVE_D3D11
         if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {

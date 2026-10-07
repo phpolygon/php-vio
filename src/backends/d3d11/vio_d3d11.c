@@ -2535,6 +2535,9 @@ static void d3d11_bind_vertex_slots(ID3D11Buffer *mesh_vb, UINT mesh_stride)
 static void d3d11_draw(vio_draw_cmd *cmd)
 {
     if (!cmd) return;
+    /* Nothing bound yet: no vertex shader on the context. WARP draws nothing,
+     * hardware drivers remove the device (test 173). */
+    if (!d3d11_current_pipeline) return;
 
     vio_d3d11_buffer *vb = (vio_d3d11_buffer *)cmd->vertex_buffer;
     if (vb) {
@@ -2553,6 +2556,7 @@ static void d3d11_draw(vio_draw_cmd *cmd)
 static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
 {
     if (!cmd) return;
+    if (!d3d11_current_pipeline) return;   /* see d3d11_draw */
 
     vio_d3d11_buffer *vb = (vio_d3d11_buffer *)cmd->vertex_buffer;
     vio_d3d11_buffer *ib = (vio_d3d11_buffer *)cmd->index_buffer;
@@ -2653,6 +2657,7 @@ static void d3d11_draw_instanced_from_storage(void *mesh_obj, int instance_count
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!vio_d3d11.initialized || !mesh || instance_count <= 0) return;
+    if (!d3d11_current_pipeline) return;   /* see d3d11_draw */
 
     vio_d3d11_buffer *vb = (vio_d3d11_buffer *)mesh->backend_vb;
     if (!vb) return;
@@ -2677,6 +2682,7 @@ static void d3d11_draw_instanced_from_storage(void *mesh_obj, int instance_count
  * DrawInstancedIndirect per record (D3D11 has no multi-draw). */
 static void d3d11_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
 {
+    if (!d3d11_current_pipeline) return;   /* see d3d11_draw */
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_d3d11_buffer *args = (vio_d3d11_buffer *)args_buffer;
     if (!vio_d3d11.initialized || !mesh || !args || !args->buffer || max_draws <= 0) return;
