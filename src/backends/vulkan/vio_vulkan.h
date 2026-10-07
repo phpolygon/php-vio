@@ -349,6 +349,10 @@ typedef struct _vio_vulkan_state {
     int                      capture_valid;
     int                      acquire_consumed;   /* a mid-frame readback submit already waited image_available */
     VkFence                  midframe_fence;
+    /* The in_flight fence of the submit that carries the newest capture copy
+     * (A36): vio_read_pixels waits it instead of vkDeviceWaitIdle. Cleared once
+     * begin_frame has waited that fence (the copy is done). */
+    VkFence                  capture_fence;
 
     /* Offscreen render-target binding (mirrors vio_d3d12). current_bound_rt is
      * the vio_render_target_object* whose render pass is active, or NULL =

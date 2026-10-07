@@ -1563,6 +1563,7 @@ static void destroy_frame_resources(void)
         if (f->image_available) vkDestroySemaphore(vio_vk.device, f->image_available, NULL);
         if (f->cmd_pool) vkDestroyCommandPool(vio_vk.device, f->cmd_pool, NULL);
     }
+    vio_vk.capture_fence = VK_NULL_HANDLE;
 }
 
 /* ── Swapchain recreation ────────────────────────────────────────── */
@@ -3302,6 +3303,7 @@ static void vulkan_begin_frame(void)
 
     /* Wait for this frame's previous work to finish */
     vkWaitForFences(vio_vk.device, 1, &f->in_flight, VK_TRUE, UINT64_MAX);
+    if (vio_vk.capture_fence == f->in_flight) vio_vk.capture_fence = VK_NULL_HANDLE;   /* copy retired; the fence is reset below */
 
     /* GPU timestamps: this slot's previous frame has retired — read its pair. */
     if (vio_vk.ts_pool && vio_vk.ts_pending[vio_vk.current_frame]) {
@@ -3598,6 +3600,7 @@ static void vulkan_end_frame(void)
     vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, f->in_flight);
     vkc_frame_submitted();
     vio_vk.acquire_consumed = 0;
+    if (vio_vk.capture_valid) vio_vk.capture_fence = f->in_flight;
 
     vio_vk.in_frame = 0;
 }
@@ -4500,6 +4503,7 @@ static int vulkan_capture_midframe(void)
         }
     }
     if (!ok) vkDeviceWaitIdle(vio_vk.device);
+    vio_vk.capture_fence = VK_NULL_HANDLE;   /* the copy above is complete */
 
     /* Reopen the frame command buffer and resume the swapchain pass (LOAD). */
     vkResetCommandBuffer(cmd, 0);
@@ -4521,7 +4525,9 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
 
     /* Headless: the frame copied at end_frame (exactly the last presented image). */
     if (vio_vk.headless && vio_vk.capture_valid && vio_vk.capture_buf) {
-        vkDeviceWaitIdle(vio_vk.device);
+        /* Only the submit that copied the newest frame (A36); earlier copies into
+         * the same buffer retire before it on the one graphics queue. */
+        if (vio_vk.capture_fence) vkWaitForFences(vio_vk.device, 1, &vio_vk.capture_fence, VK_TRUE, UINT64_MAX);
         unsigned char *src = (unsigned char *)vio_vma_map(vio_vk.vma_allocator, vio_vk.capture_alloc);
         if (!src) return -1;
         uint32_t cw = vio_vk.capture_w, ch = vio_vk.capture_h;
@@ -4553,9 +4559,18 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
         return -1;
     }
 
-    /* Ensure all rendering (the just-submitted frame) has completed on the GPU
-     * queue so the source image holds the final, fully-rendered pixels. */
-    vkDeviceWaitIdle(vio_vk.device);
+    /* Ensure all rendering (the just-submitted frames) has completed so the
+     * source image holds the final pixels: the frames' fences, not the whole
+     * device (A36). Outside a frame every in_flight fence is signalled or
+     * belongs to a submitted batch (begin_frame resets it only on a path that
+     * reaches end_frame). */
+    {
+        VkFence fences[VIO_VK_MAX_FRAMES_IN_FLIGHT];
+        uint32_t nf = 0;
+        for (int i = 0; i < VIO_VK_MAX_FRAMES_IN_FLIGHT; i++)
+            if (vio_vk.frames[i].in_flight) fences[nf++] = vio_vk.frames[i].in_flight;
+        if (nf) vkWaitForFences(vio_vk.device, nf, fences, VK_TRUE, UINT64_MAX);
+    }
 
     /* Re-acquire a swapchain image to read from. This is REQUIRED for sync
      * correctness, not just convenience: after vio_end the just-rendered image
