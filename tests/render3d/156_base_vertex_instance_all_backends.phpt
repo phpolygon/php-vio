@@ -12,9 +12,12 @@ vio
  * D3D12 needs SM 6.8 (SV_StartVertexLocation / SV_StartInstanceLocation);
  * below that SPIRV-Cross would need a cbuffer vio cannot fill for indirect draws.
  * VIO_REQUIRE_BASE_VERTEX=vulkan makes the listed backends mandatory. */
-$VS = "#version 460\nlayout(location=0) in vec3 aPos;\nlayout(location=0) flat out ivec2 bp;\n"
-     . "void main(){ bp = ivec2(gl_BaseVertex, gl_BaseInstance); gl_Position = vec4(aPos, 1.0); }";
-$FS = "#version 460\nlayout(location=0) flat in ivec2 bp;\nlayout(location=0) out vec4 o;\nuniform vec2 u_want;\n"
+/* #version 450 + GL_ARB_shader_draw_parameters (gl_BaseVertexARB) runs on
+ * GL 4.5 contexts with the extension too - #version 460 would need GL 4.6. */
+$VS = "#version 450\n#extension GL_ARB_shader_draw_parameters : require\n"
+     . "layout(location=0) in vec3 aPos;\nlayout(location=0) flat out ivec2 bp;\n"
+     . "void main(){ bp = ivec2(gl_BaseVertexARB, gl_BaseInstanceARB); gl_Position = vec4(aPos, 1.0); }";
+$FS = "#version 450\nlayout(location=0) flat in ivec2 bp;\nlayout(location=0) out vec4 o;\nuniform vec2 u_want;\n"
      . "void main(){ o = bp == ivec2(u_want) ? vec4(0.0, 1.0, 0.0, 1.0) : vec4(1.0, 0.0, 0.0, 1.0); }";
 $opts = ["width" => 16, "height" => 16, "headless" => true, "vsync" => false, "shader_model" => 6];
 $dxc = getenv('VIO_DXC_DIR') ?: '';
