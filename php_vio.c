@@ -3448,6 +3448,15 @@ ZEND_FUNCTION(vio_pipeline)
         desc.patch_vertices = pipe->patch_vertices;
 
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
+        /* The backend has warned (e.g. a PSO the driver rejects). Returning the
+         * object anyway let callers draw with no pipeline state bound, which
+         * crashed D3D12 at the end of the frame. Backends without a 3D
+         * pipeline (null) return NULL by design and keep the old behaviour. */
+        if (!pipe->backend_pipeline && ctx->backend->supports_feature
+            && ctx->backend->supports_feature(VIO_FEATURE_3D_PIPELINE)) {
+            zval_ptr_dtor(&pipe_zval);
+            RETURN_FALSE;
+        }
     }
 
     pipe->valid = 1;
