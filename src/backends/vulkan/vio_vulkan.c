@@ -4606,6 +4606,12 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
     return rc;
 }
 
+static void vulkan_apply_mesh_layout(const vio_mesh_layout *ml)
+{
+    if (ml) vio_vk.mesh_layout = *ml;
+    else vio_vk.mesh_layout.key = 0;
+}
+
 static double vulkan_gpu_frame_time(void)
 {
     return vio_vk.initialized && vio_vk.ts_pool ? vio_vk.last_gpu_ms : -1.0;
@@ -4754,6 +4760,7 @@ static const vio_backend vulkan_backend = {
     .compute_set_uniforms     = vulkan_compute_set_uniforms,
     .read_buffer              = vulkan_read_buffer,
     .supports_feature  = vulkan_supports_feature,
+    .apply_mesh_layout = vulkan_apply_mesh_layout,
     .gpu_frame_time    = vulkan_gpu_frame_time,
     .gpu_mark          = vulkan_gpu_mark,
     .gpu_marks         = vulkan_gpu_marks,

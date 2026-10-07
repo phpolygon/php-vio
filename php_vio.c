@@ -2221,6 +2221,8 @@ ZEND_FUNCTION(vio_mesh)
      * legacy "pos-only" / "pos+color" shapes inside the backend. */
     vio_mesh_attrib normalized_layout[VIO_MAX_VERTEX_ATTRIBS];
     int normalized_layout_count = 0;
+    for (int l = 0; l < VIO_MESH_MAX_LOCATIONS; l++) mesh->layout.offset[l] = -1;
+    mesh->layout.key = 0;
     if (has_explicit_layout && parsed_layout_count > 0) {
         int offset = 0;
         for (int a = 0; a < parsed_layout_count; a++) {
@@ -2230,6 +2232,17 @@ ZEND_FUNCTION(vio_mesh)
             offset += parsed_layout[a].components;
         }
         normalized_layout_count = parsed_layout_count;
+        /* FNV-1a over (location, offset); never 0, which means "no layout". */
+        uint32_t h = 2166136261u;
+        for (int a = 0; a < parsed_layout_count; a++) {
+            int loc = normalized_layout[a].location;
+            if (loc < 0 || loc >= VIO_MESH_MAX_LOCATIONS) continue;
+            mesh->layout.offset[loc] = (int16_t)normalized_layout[a].offset;
+            h = (h ^ (uint32_t)loc) * 16777619u;
+            h = (h ^ (uint32_t)normalized_layout[a].offset) * 16777619u;
+        }
+        h = (h ^ (uint32_t)mesh->stride) * 16777619u;
+        mesh->layout.key = h ? h : 1u;
     } else if (has_colors && floats_per_vertex >= 7) {
         normalized_layout[0] = (vio_mesh_attrib){0, 3, 0};
         normalized_layout[1] = (vio_mesh_attrib){1, 4, 3 * (int)sizeof(float)};
@@ -2409,10 +2422,17 @@ static int vio_bound_shader_is_mesh(vio_context_object *ctx, const char *fn)
     return 1;
 }
 
+/* Hand the mesh's vertex layout to the backend before a draw (OPEN-ITEMS-PLAN A31). */
+static void vio_apply_mesh_layout(vio_context_object *ctx, vio_mesh_object *mesh)
+{
+    if (ctx->backend->apply_mesh_layout) ctx->backend->apply_mesh_layout(mesh ? &mesh->layout : NULL);
+}
+
 static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
 {
     if (vio_bound_shader_is_mesh(ctx, "vio_draw")) return;
     vio_flush_pending_textures(ctx);
+    vio_apply_mesh_layout(ctx, mesh);
     if (ctx->backend->draw_mesh) {
         ctx->backend->draw_mesh(mesh);
     }
@@ -4911,6 +4931,7 @@ ZEND_FUNCTION(vio_draw_instanced_from_buffer)
     }
 
     vio_flush_pending_textures(ctx);
+    vio_apply_mesh_layout(ctx, mesh);
 
     /* Same cbuffer push + root-CBV bind as vio_draw / vio_draw_instanced. */
     vio_push_shader_cbuffers(ctx);   /* no-op on OpenGL (no cbuffer_backend) */
@@ -4966,6 +4987,7 @@ ZEND_FUNCTION(vio_draw_indirect)
         return;
     }
     vio_flush_pending_textures(ctx);
+    vio_apply_mesh_layout(ctx, mesh);
     vio_push_shader_cbuffers(ctx);   /* no-op on OpenGL (no cbuffer_backend) */
     ctx->backend->draw_indirect(mesh, buf->backend_buffer, (int)max_draws, (size_t)offset);
 }
@@ -10240,6 +10262,7 @@ ZEND_FUNCTION(vio_draw_instanced)
         return;
     }
     vio_flush_pending_textures(ctx);
+    vio_apply_mesh_layout(ctx, mesh);
 
     /* Resolve matrix data (fast binary or slow array path) */
     const float *mat_data = NULL;

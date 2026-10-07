@@ -463,6 +463,13 @@ typedef struct _vio_backend {
      * NULL slots => no named timestamps. */
     int (*gpu_mark)(const char *name);
     const vio_gpu_mark_result *(*gpu_marks)(void);
+
+    /* Called before every mesh draw (vio_draw, vio_draw_instanced,
+     * vio_submit_batch, vio_draw_indirect, vio_draw_instanced_from_buffer)
+     * with the mesh's layout: the backend reads each vertex input at the mesh's
+     * offset (input layout / PSO variant). NULL slot => the backend uses the
+     * mesh's own vertex description already (OpenGL VAOs). */
+    void (*apply_mesh_layout)(const vio_mesh_layout *layout);
 } vio_backend;
 
 /*

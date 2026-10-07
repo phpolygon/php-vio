@@ -57,6 +57,16 @@ typedef struct _vio_d3d11_pipeline {
     D3D11_PRIMITIVE_TOPOLOGY topology;
     UINT                     vertex_stride;
     UINT                     stencil_ref;      /* OMSetDepthStencilState reference */
+    /* Input layouts per mesh layout (vio_mesh_layout.key, OPEN-ITEMS-PLAN A31):
+     * the element template with each element's location, the VS bytecode to
+     * validate against, and the variants built so far. */
+    D3D11_INPUT_ELEMENT_DESC *elements;
+    int                      *element_loc;
+    char                    (*sem_names)[24];
+    int                       element_count;
+    ID3DBlob                 *vs_blob;
+    struct { uint32_t key; ID3D11InputLayout *il; } il_variants[8];
+    int                       il_variant_count;
 } vio_d3d11_pipeline;
 
 /* Buffer wrapper */

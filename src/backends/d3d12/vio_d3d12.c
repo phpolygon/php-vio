@@ -2429,9 +2429,12 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
         /* Matrix columns: SPIRV-Cross names them TEXCOORD{base}_{column}
          * (semantic "TEXCOORD3_" index 0..3), see the D3D11 twin. */
         sem_names = calloc(desc->vertex_attrib_count, sizeof(*sem_names));
+        pipeline->input_locations = calloc(desc->vertex_attrib_count, sizeof(int));
+        pipeline->input_count = desc->vertex_attrib_count;
         UINT vertex_offset = 0;
         for (int i = 0; i < desc->vertex_attrib_count; i++) {
             int loc = desc->vertex_layout[i].location;
+            if (pipeline->input_locations) pipeline->input_locations[i] = loc;
             elements[i].SemanticName = vio_usage_to_semantic(desc->vertex_layout[i].usage);
             elements[i].SemanticIndex = loc;
             if (sem_names && desc->vertex_layout[i].matrix_columns > 1) {
@@ -2607,17 +2610,32 @@ static ID3D12PipelineState *d3d12_pipeline_pso_for_target(vio_d3d12_pipeline *p,
         && p->pso_desc.RTVFormats[0] == DXGI_FORMAT_R8G8B8A8_UNORM && fmt != DXGI_FORMAT_R8G8B8A8_UNORM) {
         want_fmt = fmt;
     }
-    if (want_samples == 1 && want_fmt == p->pso_desc.RTVFormats[0]) return p->pso;
+    /* The mesh's own attribute offsets (OPEN-ITEMS-PLAN A31). */
+    const vio_mesh_layout *ml = &vio_d3d12.mesh_layout;
+    uint32_t want_layout = (p->input_elements && p->input_locations && !p->is_mesh) ? ml->key : 0;
+    if (want_samples == 1 && want_fmt == p->pso_desc.RTVFormats[0] && want_layout == 0) return p->pso;
     for (int i = 0; i < p->pso_variant_count; i++) {
-        if (p->pso_variants[i].fmt == want_fmt && p->pso_variants[i].samples == want_samples) return p->pso_variants[i].pso;
+        if (p->pso_variants[i].fmt == want_fmt && p->pso_variants[i].samples == want_samples
+            && p->pso_variants[i].layout == want_layout) return p->pso_variants[i].pso;
     }
-    if (p->pso_variant_count >= 8) return p->pso;
+    if (p->pso_variant_count >= 16) return p->pso;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = p->pso_desc;
     d.SampleDesc.Count = want_samples;
     d.SampleDesc.Quality = 0;
     d.RTVFormats[0] = want_fmt;
+    D3D12_INPUT_ELEMENT_DESC *moved = NULL;
+    if (want_layout) {
+        moved = malloc(sizeof(*moved) * (size_t)p->input_count);
+        if (!moved) return p->pso;
+        memcpy(moved, p->input_elements, sizeof(*moved) * (size_t)p->input_count);
+        for (int i = 0; i < p->input_count; i++)
+            if (moved[i].InputSlot == 0)
+                moved[i].AlignedByteOffset = (UINT)vio_mesh_layout_offset(ml, p->input_locations[i], (int)moved[i].AlignedByteOffset);
+        d.InputLayout.pInputElementDescs = moved;
+    }
     ID3D12PipelineState *pso = NULL;
     HRESULT hr = d3d12_create_pso(&d, p->view_count, p->is_mesh ? p : NULL, &pso);
+    free(moved);   /* the PSO keeps its own copy */
     if (FAILED(hr) || !pso) {
         d3d12_drain_info_queue("create_pso_variant_fail");
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create PSO variant (samples %u, format %d) (0x%08lx)", want_samples, (int)want_fmt, hr);
@@ -2625,6 +2643,7 @@ static ID3D12PipelineState *d3d12_pipeline_pso_for_target(vio_d3d12_pipeline *p,
     }
     p->pso_variants[p->pso_variant_count].fmt = want_fmt;
     p->pso_variants[p->pso_variant_count].samples = want_samples;
+    p->pso_variants[p->pso_variant_count].layout = want_layout;
     p->pso_variants[p->pso_variant_count].pso = pso;
     p->pso_variant_count++;
     return pso;
@@ -2669,6 +2688,7 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
         }
     }
     if (p->input_elements) free(p->input_elements);
+    free(p->input_locations);
     if (p->sem_names) free(p->sem_names);
     if (p->hs_variant) ID3D10Blob_Release(p->hs_variant);
     free(p);
@@ -2734,6 +2754,21 @@ static void d3d12_rearm_pso_for_target(void)
     if (pso) ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list, pso);
     d3d12_apply_view_mask();
     d3d12_apply_bindless();
+}
+
+/* The mesh about to be drawn: select the PSO variant with its attribute
+ * offsets. Meshes without a declared layout keep the PSO untouched. */
+static void d3d12_apply_mesh_layout(const vio_mesh_layout *ml)
+{
+    uint32_t key = ml ? ml->key : 0;
+    uint32_t prev = vio_d3d12.applied_layout_key;
+    if (ml) vio_d3d12.mesh_layout = *ml;
+    else vio_d3d12.mesh_layout.key = 0;
+    vio_d3d12.applied_layout_key = key;
+    if (key == 0 && prev == 0) return;
+    if (!d3d12_current_pipeline || !vio_d3d12.cmd_list || !vio_d3d12.in_frame) return;
+    ID3D12PipelineState *pso = d3d12_pipeline_pso_for_target(d3d12_current_pipeline, vio_d3d12.current_rt_samples, vio_d3d12.current_rt_format);
+    if (pso) ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list, pso);
 }
 
 static void d3d12_bind_pipeline(void *pipeline_ptr)
@@ -8191,6 +8226,7 @@ static const vio_backend d3d12_backend = {
     .bind_storage_buffer          = d3d12_bind_storage_buffer,
     .draw_instanced_from_storage  = d3d12_draw_instanced_from_storage,
     .supports_feature  = d3d12_supports_feature,
+    .apply_mesh_layout = d3d12_apply_mesh_layout,
     .gpu_frame_time    = d3d12_gpu_frame_time,
     .gpu_mark          = d3d12_gpu_mark,
     .gpu_marks         = d3d12_gpu_marks,

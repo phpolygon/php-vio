@@ -591,6 +591,26 @@ typedef struct _vio_vertex_attrib {
 /* Mesh-level per-attribute description used by the create_mesh vtable slot.
  * Simpler than vio_vertex_attrib (no semantic usage), since mesh upload only
  * needs to know where each float-N attribute sits in the vertex layout. */
+/* Where each vertex location sits in a mesh's vertices (OPEN-ITEMS-PLAN A31).
+ * The typed-layout backends (D3D11, D3D12, Vulkan, Metal) build their input
+ * layout from the shader's inputs; with this map they read each input at the
+ * mesh's own offset instead of packing the inputs densely in location order.
+ * key 0 = the mesh declared no layout (dense packing as before); otherwise a
+ * hash of the offsets, so pipeline variants can be cached per layout. */
+#define VIO_MESH_MAX_LOCATIONS 16
+typedef struct _vio_mesh_layout {
+    uint32_t key;
+    int16_t  offset[VIO_MESH_MAX_LOCATIONS];   /* bytes into the vertex, -1 = not in the mesh */
+} vio_mesh_layout;
+
+/* Byte offset of a shader input at `location`: the mesh's when it has one,
+ * else `dense` (the backend's packed offset). */
+static inline int vio_mesh_layout_offset(const vio_mesh_layout *l, int location, int dense)
+{
+    if (!l || !l->key || location < 0 || location >= VIO_MESH_MAX_LOCATIONS || l->offset[location] < 0) return dense;
+    return l->offset[location];
+}
+
 typedef struct _vio_mesh_attrib {
     int location;     /* glsl `layout(location = N)` */
     int components;   /* 1..4 floats */

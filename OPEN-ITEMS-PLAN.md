@@ -22,7 +22,7 @@ Größe: S ≤ ½ Tag, M ≈ 1–2 Tage, L = mehrere Tage. Nummern A1–A41 stam
 ## Batch 2 — Korrektheit und Portabilität im Alltag
 | # | Punkt | Backend | Größe |
 |---|---|---|---|
-| A31 | Input-Layout auf D3D/Metal aus dem Mesh-Layout statt aus der Reflection (Lücken, Reihenfolge) | D3D11, D3D12, Metal (CI) | M |
+| A31 ✅ | Input-Layout aus dem Mesh-Layout statt aus der Reflection (Lücken, Reihenfolge) — betraf auch Vulkan (Test 174) | D3D11, D3D12, Vulkan, Metal (CI) | M |
 | A32 | `vio_uniform_buffer` + `vio_bind_buffer` für Grafik-Shader portabel | GL, D3D12 | M |
 | A12 | Bindless 4b: Slot-Freigabe am Fence, Sampler je Eintrag, Arrays/Cubes, Compute | D3D12, Vulkan, Metal (CI) | M–L |
 | A23 | Vulkan-3D: getrennte `texture`/`sampler`-Objekte | Vulkan | M |

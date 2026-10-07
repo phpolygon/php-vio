@@ -1777,8 +1777,9 @@ typedef struct _vio_metal_shader {
     void               *vs_kernel_fn;  /* id<MTLFunction> kernel, +1 retained */
     void               *tcs_pso;       /* id<MTLComputePipelineState>, +1 retained */
     struct {
-        int   stride;
-        void *pso;                     /* id<MTLComputePipelineState>, +1 retained */
+        int      stride;
+        uint32_t layout;               /* vio_mesh_layout.key of the mesh */
+        void    *pso;                  /* id<MTLComputePipelineState>, +1 retained */
     } vs_kernel_variants[VIO_METAL_TESS_VS_VARIANTS];
     int                 vs_kernel_variant_count;
     /* Isolines / point_mode (metal_tess_emul_msl): vert_fn is vio_pass, the
@@ -3107,11 +3108,23 @@ typedef struct _vio_metal_pso_variant {
     int   color_fmts[VIO_MAX_COLOR_ATTACHMENTS]; /* MTLPixelFormat per attachment */
     int   color_count; /* 0 for depth-only targets */
     int   stride;      /* mesh vertex stride baked into the vertex descriptor */
+    uint32_t layout;   /* vio_mesh_layout.key whose offsets the descriptor uses (0 = dense) */
     int   samples;     /* raster sample count of the target (1 or the RT's MSAA count) */
     int   has_depth;   /* 0 when the target has no depth attachment (cube-RT mip > 0) */
     int   has_stencil; /* depth attachment carries stencil */
     void *pso;         /* id<MTLRenderPipelineState>, +1 retained */
 } vio_metal_pso_variant;
+
+/* Layout of the mesh being drawn (apply_mesh_layout, OPEN-ITEMS-PLAN A31): the
+ * vertex descriptors read each input at the mesh's offset. The emulated
+ * geometry stage bakes dense offsets into its vertex kernel and keeps them. */
+static vio_mesh_layout metal_mesh_layout;
+
+static void metal_apply_mesh_layout(const vio_mesh_layout *ml)
+{
+    if (ml) metal_mesh_layout = *ml;
+    else metal_mesh_layout.key = 0;
+}
 
 typedef struct _vio_metal_pipeline {
     vio_metal_shader *shader;       /* borrowed — the VioPipeline holds a strong ref to its VioShader */
@@ -3378,11 +3391,13 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
     int has_depth = t->has_depth;
     int has_stencil = t->has_stencil;
     int has_color = t->count > 0;
+    const vio_mesh_layout *ml = &metal_mesh_layout;
+    uint32_t want_layout = ml->key;
 
     for (int i = 0; i < p->variant_count; i++) {
         vio_metal_pso_variant *v = &p->variants[i];
         if (v->color_count != t->count || v->stride != stride || v->samples != samples || v->has_depth != has_depth ||
-            v->has_stencil != has_stencil) continue;
+            v->has_stencil != has_stencil || v->layout != want_layout) continue;
         int same = 1;
         for (int k = 0; k < t->count; k++) if (v->color_fmts[k] != (int)t->fmts[k]) { same = 0; break; }
         if (same) return (__bridge id<MTLRenderPipelineState>)v->pso;
@@ -3433,7 +3448,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
                     has_inst_attr = 1;
                 } else {
                     vd.attributes[loc].format = metal_vertex_format(in->components);
-                    vd.attributes[loc].offset = mesh_offset;
+                    vd.attributes[loc].offset = (NSUInteger)vio_mesh_layout_offset(ml, loc, (int)mesh_offset);
                     vd.attributes[loc].bufferIndex = VIO_METAL_VB_MESH;
                     mesh_offset += (NSUInteger)in->components * sizeof(float);
                     has_mesh_attr = 1;
@@ -3589,6 +3604,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
         v->color_count = t->count;
         for (int k = 0; k < t->count; k++) v->color_fmts[k] = (int)t->fmts[k];
         v->stride    = stride;
+        v->layout    = want_layout;
         v->samples   = samples;
         v->has_depth = has_depth;
         v->has_stencil = has_stencil;
@@ -3952,8 +3968,9 @@ static MTLAttributeFormat metal_attribute_format(int components)
  * along grid X and per instance along grid Y. */
 static id<MTLComputePipelineState> metal_tess_vs_pso(vio_metal_shader *sh, int stride)
 {
+    const vio_mesh_layout *ml = &metal_mesh_layout;
     for (int i = 0; i < sh->vs_kernel_variant_count; i++) {
-        if (sh->vs_kernel_variants[i].stride == stride) {
+        if (sh->vs_kernel_variants[i].stride == stride && sh->vs_kernel_variants[i].layout == ml->key) {
             return (__bridge id<MTLComputePipelineState>)sh->vs_kernel_variants[i].pso;
         }
     }
@@ -3987,7 +4004,7 @@ static id<MTLComputePipelineState> metal_tess_vs_pso(vio_metal_shader *sh, int s
                     sd.attributes[loc].bufferIndex = VIO_METAL_VB_INSTANCE;
                     has_inst_attr = 1;
                 } else {
-                    sd.attributes[loc].offset = mesh_offset;
+                    sd.attributes[loc].offset = (NSUInteger)vio_mesh_layout_offset(ml, loc, (int)mesh_offset);
                     sd.attributes[loc].bufferIndex = VIO_METAL_VB_MESH;
                     mesh_offset += (NSUInteger)in->components * sizeof(float);
                     has_mesh_attr = 1;
@@ -4019,6 +4036,7 @@ static id<MTLComputePipelineState> metal_tess_vs_pso(vio_metal_shader *sh, int s
             return nil;
         }
         sh->vs_kernel_variants[sh->vs_kernel_variant_count].stride = stride;
+        sh->vs_kernel_variants[sh->vs_kernel_variant_count].layout = ml->key;
         sh->vs_kernel_variants[sh->vs_kernel_variant_count].pso = (void *)CFBridgingRetain(pso);
         sh->vs_kernel_variant_count++;
         return pso;
@@ -6284,6 +6302,7 @@ static const vio_backend metal_backend = {
     .set_viewports     = metal_set_viewports,
     .dispatch_compute  = metal_dispatch_compute,
     .supports_feature  = metal_supports_feature,
+    .apply_mesh_layout = metal_apply_mesh_layout,
     .feature_emulation = metal_feature_emulation,
     .gpu_frame_time    = metal_gpu_frame_time,
     .gpu_mark          = metal_gpu_mark,

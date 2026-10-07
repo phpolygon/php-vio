@@ -45,6 +45,9 @@ vio_d3d11_state vio_d3d11 = {0};
 
 /* Currently bound pipeline (for vertex stride in draw calls) */
 static vio_d3d11_pipeline *d3d11_current_pipeline = NULL;
+/* Input layout last set on the context and the pipeline it came from. */
+static ID3D11InputLayout  *d3d11_current_il = NULL;
+static vio_d3d11_pipeline *d3d11_current_il_owner = NULL;
 
 /* Forward declarations for SPIRV-Cross HLSL transpilation (in vio_shader_reflect.c) */
 extern char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size,
@@ -636,11 +639,13 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
          * `TEXCOORD{base}_{column}` for `in mat4` inputs, i.e. semantic name
          * "TEXCOORD3_" with index 0..3, not TEXCOORD3..6. */
         char (*sem_names)[24] = calloc(total_elements, sizeof(*sem_names));
+        int *element_loc = calloc(total_elements, sizeof(int));
         UINT vertex_offset = 0;
         UINT instance_offset = 0;
 
         for (int i = 0; i < desc->vertex_attrib_count; i++) {
             int loc = desc->vertex_layout[i].location;
+            if (element_loc) element_loc[i] = loc;
             elements[i].SemanticName = vio_usage_to_semantic(desc->vertex_layout[i].usage);
             elements[i].SemanticIndex = loc;
             if (sem_names && desc->vertex_layout[i].matrix_columns > 1) {
@@ -673,13 +678,21 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
                                              ID3D10Blob_GetBufferPointer(shader->vs_blob),
                                              ID3D10Blob_GetBufferSize(shader->vs_blob),
                                              &pipeline->input_layout);
-        free(elements);
-        free(sem_names);
         if (FAILED(hr)) {
+            free(elements);
+            free(sem_names);
+            free(element_loc);
             php_error_docref(NULL, E_WARNING, "D3D11: Failed to create input layout (0x%08lx)", hr);
             free(pipeline);
             return NULL;
         }
+        /* Kept for the input layouts of other mesh layouts (d3d11_apply_mesh_layout). */
+        pipeline->elements = elements;
+        pipeline->element_loc = element_loc;
+        pipeline->sem_names = sem_names;
+        pipeline->element_count = total_elements;
+        pipeline->vs_blob = shader->vs_blob;
+        ID3D10Blob_AddRef(pipeline->vs_blob);
     }
 
     /* Rasterizer state */
@@ -751,10 +764,58 @@ static void d3d11_destroy_pipeline(void *pipeline_ptr)
     if (p->hs)                 ID3D11HullShader_Release(p->hs);
     if (p->ds)                 ID3D11DomainShader_Release(p->ds);
     if (p->input_layout)       ID3D11InputLayout_Release(p->input_layout);
+    for (int i = 0; i < p->il_variant_count; i++)
+        if (p->il_variants[i].il) ID3D11InputLayout_Release(p->il_variants[i].il);
+    if (d3d11_current_il_owner == p) d3d11_current_il_owner = NULL;
+    if (p->vs_blob) ID3D10Blob_Release(p->vs_blob);
+    free(p->elements);
+    free(p->element_loc);
+    free(p->sem_names);
     if (p->rasterizer_state)   ID3D11RasterizerState_Release(p->rasterizer_state);
     if (p->depth_stencil_state) ID3D11DepthStencilState_Release(p->depth_stencil_state);
     if (p->blend_state)        ID3D11BlendState_Release(p->blend_state);
     free(p);
+}
+
+/* The input layout for the mesh about to be drawn: the pipeline's own for a
+ * mesh without a declared layout, otherwise a variant whose per-vertex
+ * elements sit at the mesh's offsets (OPEN-ITEMS-PLAN A31). */
+static ID3D11InputLayout *d3d11_input_layout_for(vio_d3d11_pipeline *p, const vio_mesh_layout *ml)
+{
+    if (!ml || !ml->key || !p->elements || !p->vs_blob) return p->input_layout;
+    for (int i = 0; i < p->il_variant_count; i++)
+        if (p->il_variants[i].key == ml->key) return p->il_variants[i].il;
+    if (p->il_variant_count >= 8) return p->input_layout;
+    D3D11_INPUT_ELEMENT_DESC *e = malloc(sizeof(*e) * (size_t)p->element_count);
+    if (!e) return p->input_layout;
+    memcpy(e, p->elements, sizeof(*e) * (size_t)p->element_count);
+    for (int i = 0; i < p->element_count; i++)
+        if (e[i].InputSlot == 0)
+            e[i].AlignedByteOffset = (UINT)vio_mesh_layout_offset(ml, p->element_loc[i], (int)e[i].AlignedByteOffset);
+    ID3D11InputLayout *il = NULL;
+    HRESULT hr = ID3D11Device_CreateInputLayout(vio_d3d11.device, e, (UINT)p->element_count,
+                                                ID3D10Blob_GetBufferPointer(p->vs_blob), ID3D10Blob_GetBufferSize(p->vs_blob), &il);
+    free(e);
+    if (FAILED(hr) || !il) {
+        php_error_docref(NULL, E_WARNING, "D3D11: input layout for the mesh layout failed (0x%08lx)", hr);
+        return p->input_layout;
+    }
+    p->il_variants[p->il_variant_count].key = ml->key;
+    p->il_variants[p->il_variant_count].il = il;
+    p->il_variant_count++;
+    return il;
+}
+
+static void d3d11_apply_mesh_layout(const vio_mesh_layout *ml)
+{
+    vio_d3d11_pipeline *p = d3d11_current_pipeline;
+    if (!p || !vio_d3d11.context) return;
+    ID3D11InputLayout *il = d3d11_input_layout_for(p, ml);
+    if (il != d3d11_current_il || d3d11_current_il_owner != p) {
+        ID3D11DeviceContext_IASetInputLayout(vio_d3d11.context, il);
+        d3d11_current_il = il;
+        d3d11_current_il_owner = p;
+    }
 }
 
 static void d3d11_bind_pipeline(void *pipeline_ptr)
@@ -764,6 +825,8 @@ static void d3d11_bind_pipeline(void *pipeline_ptr)
 
     d3d11_current_pipeline = p;
     ID3D11DeviceContext_IASetInputLayout(vio_d3d11.context, p->input_layout);
+    d3d11_current_il = p->input_layout;
+    d3d11_current_il_owner = p;
     ID3D11DeviceContext_IASetPrimitiveTopology(vio_d3d11.context, p->topology);
     ID3D11DeviceContext_VSSetShader(vio_d3d11.context, p->vs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(vio_d3d11.context, p->ps, NULL, 0);
@@ -3560,6 +3623,7 @@ static const vio_backend d3d11_backend = {
     .bind_storage_buffer          = d3d11_bind_storage_buffer,
     .draw_instanced_from_storage  = d3d11_draw_instanced_from_storage,
     .supports_feature  = d3d11_supports_feature,
+    .apply_mesh_layout = d3d11_apply_mesh_layout,
     .gpu_frame_time    = d3d11_gpu_frame_time,
     .gpu_mark          = d3d11_gpu_mark,
     .gpu_marks         = d3d11_gpu_marks,

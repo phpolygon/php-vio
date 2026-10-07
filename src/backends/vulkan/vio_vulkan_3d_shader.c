@@ -820,6 +820,8 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     key = vk3d_mix(key, (uint64_t)vio_vk.cur_samples);
     key = vk3d_mix(key, (uint64_t)vio_vk.cur_has_depth);
     key = vk3d_mix(key, (uint64_t)stride);
+    const vio_mesh_layout *ml = p->shader->is_mesh ? NULL : &vio_vk.mesh_layout;
+    key = vk3d_mix(key, (uint64_t)(ml ? ml->key : 0));   /* the mesh's attribute offsets */
     key = vk3d_mix(key, (uint64_t)p->desc.view_count);   /* multiview pass (viewMask) */
     for (int i = 0; i < p->variant_count; i++) {
         if (p->variants[i].key == key) return p->variants[i].pipeline;
@@ -871,7 +873,7 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
             va[i].offset  = (uint32_t)(loc - 3) * 16u;
         } else {
             va[i].binding = 0;
-            va[i].offset  = off;
+            va[i].offset  = (uint32_t)vio_mesh_layout_offset(ml, loc, (int)off);
             off += vk3d_format_size(p->attribs[i].format);
         }
     }

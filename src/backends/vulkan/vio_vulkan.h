@@ -223,6 +223,9 @@ typedef struct _vio_vulkan_state {
     /* Named marks (vio_gpu_timestamp): VIO_GPU_TS_PER_FRAME queries per slot. */
     vio_gpu_mark_names       ts_marks[VIO_VK_MAX_FRAMES_IN_FLIGHT];
     vio_gpu_mark_result      ts_result;
+    /* Layout of the mesh being drawn (apply_mesh_layout): pipeline variants
+     * read each vertex input at the mesh's offset (OPEN-ITEMS-PLAN A31). */
+    vio_mesh_layout          mesh_layout;
     int                      ts_result_valid;
     int                      in_frame;          /* 1 while the command buffer is recording (begin_frame..end_frame) */
     /* Phase 4 — warm-render present-skip. Captured at vulkan_begin_frame: 1 when

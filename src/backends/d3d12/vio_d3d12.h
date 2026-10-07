@@ -137,10 +137,13 @@ typedef struct _vio_d3d12_pipeline {
      * into a target with 2 / 4 / 8 samples needs its own variant. Built lazily
      * from pso_desc (SampleDesc.Count = 1 template) the first time the pipeline
      * is bound while such a target is bound; index = log2(samples). */
-    struct { DXGI_FORMAT fmt; UINT samples; ID3D12PipelineState *pso; } pso_variants[8];
+    /* ... and per mesh layout (vio_mesh_layout.key, 0 = dense; OPEN-ITEMS-PLAN A31). */
+    struct { DXGI_FORMAT fmt; UINT samples; uint32_t layout; ID3D12PipelineState *pso; } pso_variants[16];
     int                      pso_variant_count;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;
     D3D12_INPUT_ELEMENT_DESC *input_elements;  /* owned; referenced by pso_desc */
+    int                     *input_locations;  /* owned; vertex location of each element */
+    int                      input_count;
     char                   (*sem_names)[24];   /* owned; semantic names of matrix columns */
     UINT                     stencil_ref;      /* OMSetStencilRef */
     int                      has_gs, has_hs, has_ds;  /* replicate SRV / sampler tables */
@@ -632,6 +635,10 @@ typedef struct _vio_d3d12_state {
     UINT64           ts_frequency;
     int              ts_pending[VIO_D3D12_MAX_FRAME_COUNT];
     double           last_gpu_ms;
+    /* Layout of the mesh being drawn (apply_mesh_layout); PSOs pick their
+     * input-layout variant from it. */
+    vio_mesh_layout  mesh_layout;
+    uint32_t         applied_layout_key;
     /* Named marks (vio_gpu_timestamp) after the pair: VIO_GPU_TS_PER_FRAME
      * queries per slot. */
     vio_gpu_mark_names  ts_marks[VIO_D3D12_MAX_FRAME_COUNT];
