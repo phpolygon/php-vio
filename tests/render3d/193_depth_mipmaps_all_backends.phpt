@@ -79,9 +79,9 @@ foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
 echo "DONE\n";
 ?>
 --EXPECTF--
-opengl: %r(OK|skip \(.*\))%r
-d3d11: %r(OK|skip \(.*\))%r
-d3d12: %r(OK|skip \(.*\))%r
-vulkan: %r(OK|skip \(.*\))%r
-metal: %r(OK|skip \(.*\))%r
+opengl: %r(OK|skip \(unavailable\))%r
+d3d11: %r(OK|skip \(unavailable\))%r
+d3d12: %r(OK|skip \(unavailable\))%r
+vulkan: %r(OK|skip \(unavailable\))%r
+metal: %r(OK|skip \(unavailable\))%r
 DONE
