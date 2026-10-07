@@ -1432,6 +1432,16 @@ static void d3d11_destroy_render_target(void *rt_ptr)
     for (int i = 1; i < 4; i++) {
         if (rt->d3d11_msaa_color_texs[i]) { ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_color_texs[i]); rt->d3d11_msaa_color_texs[i] = NULL; }
     }
+    if (rt->d3d11_msaa_face_rtvs || rt->d3d11_msaa_face_dsvs) {
+        ID3D11RenderTargetView **r = (ID3D11RenderTargetView **)rt->d3d11_msaa_face_rtvs;
+        ID3D11DepthStencilView **d = (ID3D11DepthStencilView **)rt->d3d11_msaa_face_dsvs;
+        for (int l = 0; l <= vio_rt_layer_count(rt); l++) {
+            if (r && r[l]) ID3D11RenderTargetView_Release(r[l]);
+            if (d && d[l]) ID3D11DepthStencilView_Release(d[l]);
+        }
+        free(r); free(d);
+        rt->d3d11_msaa_face_rtvs = rt->d3d11_msaa_face_dsvs = NULL;
+    }
     if (rt->d3d11_msaa_depth_tex) {
         ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_depth_tex);
         rt->d3d11_msaa_depth_tex = NULL;
@@ -1469,6 +1479,19 @@ static void d3d11_rt_unbind_srvs(void)
  * readback sees the final image. No-op for single-sample targets. */
 static void d3d11_rt_resolve_msaa(vio_render_target_object *rt)
 {
+    if (rt->d3d11_msaa_face_rtvs) {
+        /* Cube / array: the layer(s) the MS views rendered into, into mip 0 of the face. */
+        if (!rt->d3d11_msaa_dirty || !rt->d3d11_color_tex || !rt->d3d11_msaa_color_tex) return;
+        int layers = vio_rt_layer_count(rt), mips = rt->mip_levels > 0 ? rt->mip_levels : 1;
+        int first = rt->d3d11_msaa_layer < 0 ? 0 : rt->d3d11_msaa_layer;
+        int last = rt->d3d11_msaa_layer < 0 ? layers - 1 : rt->d3d11_msaa_layer;
+        for (int l = first; l <= last; l++) {
+            ID3D11DeviceContext_ResolveSubresource(vio_d3d11.context, (ID3D11Resource *)rt->d3d11_color_tex, (UINT)(l * mips),
+                (ID3D11Resource *)rt->d3d11_msaa_color_tex, (UINT)l, vio_pixel_format_to_dxgi(rt->formats[0]));
+        }
+        rt->d3d11_msaa_dirty = 0;
+        return;
+    }
     if (!rt->d3d11_msaa_color_tex || !rt->d3d11_color_tex || !rt->d3d11_msaa_dirty) return;
     /* Every attachment (A24: MRT targets are multisampled per attachment). */
     int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
@@ -1496,6 +1519,18 @@ static void d3d11_apply_render_target_bind(vio_render_target_object *rt)
         ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 0, NULL, dsv);
         vio_d3d11.current_rtv = NULL;
         vio_d3d11.current_rtv_count = 0;
+    } else if ((rt->is_cube || rt->layers > 1) && rt->d3d11_msaa_face_rtvs) {
+        if (rt->d3d11_msaa_dirty && rt->d3d11_msaa_layer != 0) d3d11_rt_resolve_msaa(rt);
+        ID3D11RenderTargetView *rtv = ((ID3D11RenderTargetView **)rt->d3d11_msaa_face_rtvs)[0];
+        dsv = ((ID3D11DepthStencilView **)rt->d3d11_msaa_face_dsvs)[0];
+        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 1, &rtv, dsv);
+        vio_d3d11.current_rtv = rtv;
+        vio_d3d11.current_rtvs[0] = rtv;
+        vio_d3d11.current_rtv_count = 1;
+        rt->d3d11_msaa_layer = 0;
+        rt->d3d11_msaa_dirty = 1;
+        rt->bound_face = 0;
+        rt->bound_level = 0;
     } else if (rt->is_cube || rt->layers > 1) {
         ID3D11RenderTargetView **faces = (ID3D11RenderTargetView **)rt->d3d11_face_rtvs;
         ID3D11RenderTargetView *rtv = faces ? faces[0] : NULL;
@@ -1595,7 +1630,19 @@ static int d3d11_bind_render_target_face(void *rt_ptr, int face, int level)
         if (!rtv) return -1;
     }
 
+    if (vio_d3d11.current_bound_rt && vio_d3d11.current_bound_rt != rt)
+        d3d11_rt_resolve_msaa((vio_render_target_object *)vio_d3d11.current_bound_rt);
     d3d11_rt_unbind_srvs();
+    /* MSAA (A24): level 0 renders into the layer of the MS array; leaving a
+     * layer (or going to a smaller level) resolves it first. */
+    int ms_layer = all ? -1 : face;
+    if (rt->d3d11_msaa_face_rtvs && rt->d3d11_msaa_dirty && (level != 0 || rt->d3d11_msaa_layer != ms_layer)) d3d11_rt_resolve_msaa(rt);
+    if (rt->d3d11_msaa_face_rtvs && level == 0) {
+        rtv = ((ID3D11RenderTargetView **)rt->d3d11_msaa_face_rtvs)[all ? layers : face];
+        dsvs = (ID3D11DepthStencilView **)rt->d3d11_msaa_face_dsvs;
+        rt->d3d11_msaa_layer = ms_layer;
+        rt->d3d11_msaa_dirty = 1;
+    }
     /* Every layer has its own depth slice, at level 0 only; smaller levels
      * render without depth (same contract as OpenGL / Metal). */
     ID3D11DepthStencilView *dsv = (level == 0 && dsvs) ? dsvs[all ? layers : face] : NULL;
@@ -1640,6 +1687,7 @@ static int d3d11_create_render_target(void *rt_ptr, int width, int height, int h
     int attachment_count = rt->attachment_count > 0 ? rt->attachment_count : 1;
     if (attachment_count > VIO_MAX_COLOR_ATTACHMENTS) attachment_count = VIO_MAX_COLOR_ATTACHMENTS;
     int mips = rt->is_cube && rt->mip_levels > 0 ? rt->mip_levels : 1;
+    int want_samples = rt->samples;   /* cube / array MSAA below (A24) */
     int layers = vio_rt_layer_count(rt);
     int layered = layers > 1;
 
@@ -1903,6 +1951,64 @@ static int d3d11_create_render_target(void *rt_ptr, int width, int height, int h
             }
         } else {
             ID3D11DeviceContext_ClearDepthStencilView(vio_d3d11.context, dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+        }
+    }
+    /* Cube / array MSAA (A24): a multisampled colour + depth array beside the
+     * single-sample cube / array; level-0 binds render into its layer, leaving
+     * the layer resolves it into the face. */
+    if (layered && !depth_only && want_samples > 1) {
+        DXGI_FORMAT dxfmt = vio_pixel_format_to_dxgi(rt->formats[0]);
+        UINT ms = 1;
+        for (UINT s = want_samples > 8 ? 8 : (UINT)want_samples; s > 1; s >>= 1) {
+            UINT q = 0;
+            if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(vio_d3d11.device, dxfmt, s, &q)) && q > 0) { ms = s; break; }
+        }
+        if (ms > 1) {
+            D3D11_TEXTURE2D_DESC cd = {0};
+            cd.Width = width; cd.Height = height; cd.MipLevels = 1; cd.ArraySize = (UINT)layers;
+            cd.Format = dxfmt; cd.SampleDesc.Count = ms; cd.Usage = D3D11_USAGE_DEFAULT; cd.BindFlags = D3D11_BIND_RENDER_TARGET;
+            D3D11_TEXTURE2D_DESC dd = cd;
+            dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+            ID3D11Texture2D *ctex = NULL, *dtex = NULL;
+            ID3D11RenderTargetView **rtvs = calloc((size_t)layers + 1, sizeof(*rtvs));
+            ID3D11DepthStencilView **dsvs = calloc((size_t)layers + 1, sizeof(*dsvs));
+            int ok = rtvs && dsvs
+                && SUCCEEDED(ID3D11Device_CreateTexture2D(vio_d3d11.device, &cd, NULL, &ctex))
+                && SUCCEEDED(ID3D11Device_CreateTexture2D(vio_d3d11.device, &dd, NULL, &dtex));
+            for (int l = 0; ok && l <= layers; l++) {
+                D3D11_RENDER_TARGET_VIEW_DESC rd = {0};
+                rd.Format = dxfmt;
+                rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
+                rd.Texture2DMSArray.FirstArraySlice = l < layers ? (UINT)l : 0;
+                rd.Texture2DMSArray.ArraySize = l < layers ? 1 : (UINT)layers;
+                D3D11_DEPTH_STENCIL_VIEW_DESC sd = {0};
+                sd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+                sd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY;
+                sd.Texture2DMSArray.FirstArraySlice = rd.Texture2DMSArray.FirstArraySlice;
+                sd.Texture2DMSArray.ArraySize = rd.Texture2DMSArray.ArraySize;
+                ok = SUCCEEDED(ID3D11Device_CreateRenderTargetView(vio_d3d11.device, (ID3D11Resource *)ctex, &rd, &rtvs[l]))
+                  && SUCCEEDED(ID3D11Device_CreateDepthStencilView(vio_d3d11.device, (ID3D11Resource *)dtex, &sd, &dsvs[l]));
+            }
+            if (ok) {
+                float zero[4] = {0, 0, 0, 0};
+                ID3D11DeviceContext_ClearRenderTargetView(vio_d3d11.context, rtvs[layers], zero);
+                ID3D11DeviceContext_ClearDepthStencilView(vio_d3d11.context, dsvs[layers], D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+                rt->d3d11_msaa_color_tex = ctex;
+                rt->d3d11_msaa_depth_tex = dtex;
+                rt->d3d11_msaa_face_rtvs = rtvs;
+                rt->d3d11_msaa_face_dsvs = dsvs;
+                rt->d3d11_msaa_layer = 0;
+                rt->samples = (int)ms;
+            } else {
+                for (int l = 0; l <= layers; l++) {
+                    if (rtvs && rtvs[l]) ID3D11RenderTargetView_Release(rtvs[l]);
+                    if (dsvs && dsvs[l]) ID3D11DepthStencilView_Release(dsvs[l]);
+                }
+                free(rtvs); free(dsvs);
+                if (ctex) ID3D11Texture2D_Release(ctex);
+                if (dtex) ID3D11Texture2D_Release(dtex);
+            }
         }
     }
     rt->bound_face = layered ? 0 : -1;

@@ -58,6 +58,9 @@ typedef struct _vio_render_target_object {
      * d3d11_color_tex is then the single-sample RESOLVE texture the SRV reads. */
     void        *d3d11_msaa_color_tex;        /* ID3D11Texture2D* (multisampled) */
     void        *d3d11_msaa_color_texs[4];    /* MRT: attachments 1..3 ([0] = d3d11_msaa_color_tex) */
+    void        *d3d11_msaa_face_rtvs;        /* cube / array MSAA (A24): RTV per layer of the MS array, + all layers */
+    void        *d3d11_msaa_face_dsvs;        /* ... and the DSVs of the MS depth array */
+    int          d3d11_msaa_layer;            /* layer the MS views render into (-1 = all) */
     void        *d3d11_msaa_depth_tex;        /* ID3D11Texture2D* (multisampled) */
     int          d3d11_msaa_dirty;            /* 1 => resolve needed before sampling / readback */
 
