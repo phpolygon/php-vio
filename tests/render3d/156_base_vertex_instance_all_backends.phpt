@@ -14,8 +14,8 @@ vio
  * VIO_REQUIRE_BASE_VERTEX=vulkan makes the listed backends mandatory. */
 $VS = "#version 460\nlayout(location=0) in vec3 aPos;\nlayout(location=0) flat out ivec2 bp;\n"
      . "void main(){ bp = ivec2(gl_BaseVertex, gl_BaseInstance); gl_Position = vec4(aPos, 1.0); }";
-$FS = "#version 460\nlayout(location=0) flat in ivec2 bp;\nlayout(location=0) out vec4 o;\nuniform ivec2 u_want;\n"
-     . "void main(){ o = bp == u_want ? vec4(0.0, 1.0, 0.0, 1.0) : vec4(1.0, 0.0, 0.0, 1.0); }";
+$FS = "#version 460\nlayout(location=0) flat in ivec2 bp;\nlayout(location=0) out vec4 o;\nuniform vec2 u_want;\n"
+     . "void main(){ o = bp == ivec2(u_want) ? vec4(0.0, 1.0, 0.0, 1.0) : vec4(1.0, 0.0, 0.0, 1.0); }";
 $opts = ["width" => 16, "height" => 16, "headless" => true, "vsync" => false, "shader_model" => 6];
 $dxc = getenv('VIO_DXC_DIR') ?: '';
 if ($dxc === '') foreach (glob('C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64/dxcompiler.dll') ?: [] as $cand) $dxc = dirname($cand);
@@ -55,14 +55,14 @@ function run_backend(string $name): string {
     vio_clear($ctx, 0, 0, 0, 1);
     vio_begin($ctx);
     vio_bind_pipeline($ctx, $pipe);
-    vio_set_uniform($ctx, 'u_want', [4, 3]);
+    vio_set_uniform($ctx, 'u_want', [4.0, 3.0]);   /* vec2: array uniforms are floats */
     vio_draw_indirect($ctx, $mesh8, $args, 1, 0);
     vio_end($ctx);
     if (!green(vio_read_pixels($ctx), 16)) $fail[] = "indirect draw: gl_BaseVertex / gl_BaseInstance are not (4, 3) (or the base vertex was ignored)";
     vio_clear($ctx, 0, 0, 0, 1);
     vio_begin($ctx);
     vio_bind_pipeline($ctx, $pipe);
-    vio_set_uniform($ctx, 'u_want', [0, 0]);
+    vio_set_uniform($ctx, 'u_want', [0.0, 0.0]);
     vio_draw($ctx, $mesh4);
     vio_end($ctx);
     if (!green(vio_read_pixels($ctx), 16)) $fail[] = "vio_draw: gl_BaseVertex / gl_BaseInstance are not (0, 0)";
