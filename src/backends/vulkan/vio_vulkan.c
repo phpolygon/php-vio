@@ -1549,11 +1549,11 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void)
     b[0].binding            = 0;
     b[0].descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     b[0].descriptorCount    = VIO_BINDLESS_MAX;
-    b[0].stageFlags         = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[0].stageFlags         = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     b[1].binding            = 1;
     b[1].descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLER;
     b[1].descriptorCount    = 1;
-    b[1].stageFlags         = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[1].stageFlags         = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     b[1].pImmutableSamplers = &vio_vk.bindless_sampler;
     for (int v = 0; v < 3; v++) {
         b[2 + v] = b[1];
@@ -3619,6 +3619,7 @@ typedef struct _vio_vulkan_compute_pipeline {
     int                   params_set;     /* 1 once uniforms have been staged */
     int                   params_binding; /* reflected UBO binding (canonical = 2) */
     int                   accel_binding;  /* ray query: the acceleration structure binding, -1 = none */
+    int                   uses_bindless;  /* reads the bindless table: set 1 = vio_vk.bindless_set */
 
     vio_vk_compute_binding bindings[VIO_VK_COMPUTE_MAX_BINDINGS];
     int                    binding_count;
@@ -3816,6 +3817,10 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
         if (lx && vio_vk.max_subgroup_size && lx % vio_vk.max_subgroup_size == 0) full_subgroups = 1;
     }
 
+    /* The bindless table (Set 1, BINDLESS-PLAN 4b) joins the pipeline layout. */
+    cp->uses_bindless = vio_vk.bindless_supported && vio_spirv_uses_descriptor_set(spirv, spirv_size, 1)
+                     && vio_vk_bindless_layout() && vio_vk.bindless_set;
+
     /* Shader module straight from SPIR-V. */
     VkShaderModuleCreateInfo smi = {0};
     smi.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -3848,10 +3853,11 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
         return NULL;
     }
 
+    VkDescriptorSetLayout set_layouts[2] = { cp->set_layout, cp->uses_bindless ? vio_vk.bindless_layout : VK_NULL_HANDLE };
     VkPipelineLayoutCreateInfo pli = {0};
     pli.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pli.setLayoutCount = 1;
-    pli.pSetLayouts    = &cp->set_layout;
+    pli.setLayoutCount = cp->uses_bindless ? 2 : 1;
+    pli.pSetLayouts    = set_layouts;
     if (vkCreatePipelineLayout(vio_vk.device, &pli, NULL, &cp->pipeline_layout) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Vulkan: vkCreatePipelineLayout failed");
         vkDestroyDescriptorSetLayout(vio_vk.device, cp->set_layout, NULL);
@@ -4175,6 +4181,8 @@ static void vulkan_dispatch_compute(vio_compute_cmd *cmd)
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &pre, 0, NULL, 0, NULL);
         vkCmdBindPipeline(fcmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline);
         vkCmdBindDescriptorSets(fcmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout, 0, 1, &set, 0, NULL);
+        if (cp->uses_bindless)
+            vkCmdBindDescriptorSets(fcmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout, 1, 1, &vio_vk.bindless_set, 0, NULL);
         vkCmdDispatch(fcmd, gx, gy, gz);
         vkCmdPipelineBarrier(fcmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &post, 0, NULL, 0, NULL);
@@ -4198,6 +4206,8 @@ static void vulkan_dispatch_compute(vio_compute_cmd *cmd)
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &pre, 0, NULL, 0, NULL);
     vkCmdBindPipeline(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline);
     vkCmdBindDescriptorSets(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout, 0, 1, &set, 0, NULL);
+    if (cp->uses_bindless)
+        vkCmdBindDescriptorSets(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout, 1, 1, &vio_vk.bindless_set, 0, NULL);
     vkCmdDispatch(cbuf, gx, gy, gz);
     vkCmdPipelineBarrier(cbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &post, 0, NULL, 0, NULL);

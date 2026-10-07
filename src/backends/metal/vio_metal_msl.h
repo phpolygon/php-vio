@@ -304,6 +304,79 @@ static int vio_metal_tess_reflect(const uint32_t *tcs, size_t tcs_size,
     return 0;
 }
 
+/* Bindless table (Set 1, BINDLESS-PLAN): Set 1 becomes a device-address argument
+ * buffer of texture handles at [[buffer(VIO_METAL_BINDLESS_INDEX)]] (vio_cubes /
+ * vio_texture_arrays move to sets 2 / 3 with their own buffers), every other set
+ * stays discrete, and the table's samplers are constexpr samplers - so nothing
+ * but the buffers has to be bound. Graphics stages and compute kernels share it.
+ * Returns 1 when the module reads the table. */
+static int metal_msl_bindless(spvc_compiler compiler, spvc_resources resources, SpvExecutionModel em)
+{
+    int uses = 0;
+    {
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &count);
+        for (size_t i = 0; i < count; i++) {
+            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 1) continue;
+            uses = 1;
+            /* Unsized arrays share one argument buffer badly (each member is one
+             * element long), so vio_cubes / vio_texture_arrays get sets 2 / 3. */
+            unsigned b = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            if (b == 5 || b == 6) {
+                spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, b == 5 ? 2 : 3);
+                spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, 0);
+            }
+        }
+    }
+    if (uses) {
+        spvc_compiler_options bopts = NULL;
+        if (spvc_compiler_create_compiler_options(compiler, &bopts) == SPVC_SUCCESS) {
+            spvc_compiler_options_set_bool(bopts, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_TRUE);
+            spvc_compiler_options_set_uint(bopts, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER, 1);   /* tier 2 */
+            spvc_compiler_install_compiler_options(compiler, bopts);
+        }
+        for (unsigned s = 0; s < 8; s++) if (s < 1 || s > 3) spvc_compiler_msl_add_discrete_descriptor_set(compiler, s);
+        spvc_compiler_msl_add_discrete_descriptor_set(compiler, SPVC_MSL_PUSH_CONSTANT_DESC_SET);
+        for (unsigned s = 1; s <= 3; s++) spvc_compiler_msl_set_argument_buffer_device_address_space(compiler, s, SPVC_TRUE);
+        for (unsigned s = 2; s <= 3; s++) {
+            spvc_msl_resource_binding_2 sb;
+            spvc_msl_resource_binding_init_2(&sb);
+            sb.stage      = em;
+            sb.desc_set   = s;
+            sb.binding    = SPVC_MSL_ARGUMENT_BUFFER_BINDING;
+            sb.msl_buffer = s == 2 ? VIO_METAL_BINDLESS_CUBE_INDEX : VIO_METAL_BINDLESS_ARRAY_INDEX;
+            spvc_compiler_msl_add_resource_binding_2(compiler, &sb);
+        }
+        spvc_msl_resource_binding_2 ab;
+        spvc_msl_resource_binding_init_2(&ab);
+        ab.stage      = em;
+        ab.desc_set   = 1;
+        ab.binding    = SPVC_MSL_ARGUMENT_BUFFER_BINDING;
+        ab.msl_buffer = VIO_METAL_BINDLESS_INDEX;
+        spvc_compiler_msl_add_resource_binding_2(compiler, &ab);
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS, &list, &count);
+        for (size_t i = 0; i < count; i++) {
+            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 1) continue;
+            /* Bindings 1..4: vio_sampler (linear, repeat), vio_sampler_nearest,
+             * vio_sampler_clamp, vio_sampler_nearest_clamp (BINDLESS-PLAN). */
+            unsigned v = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            v = (v >= 1 && v <= 4) ? v - 1 : 0;
+            spvc_msl_constexpr_sampler cs;
+            spvc_msl_constexpr_sampler_init(&cs);
+            cs.min_filter = (v & 1) ? SPVC_MSL_SAMPLER_FILTER_NEAREST : SPVC_MSL_SAMPLER_FILTER_LINEAR;
+            cs.mag_filter = cs.min_filter;
+            cs.s_address  = (v & 2) ? SPVC_MSL_SAMPLER_ADDRESS_CLAMP_TO_EDGE : SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
+            cs.t_address  = cs.s_address;
+            spvc_compiler_msl_remap_constexpr_sampler(compiler, list[i].id, &cs);
+        }
+    }
+
+    return uses;
+}
+
 /* Transpile one GRAPHICS stage to MSL with deterministic resource indices.
  *
  * glslang's AUTO_MAP_BINDINGS leaves every resource of an OpenGL-style shader
@@ -415,70 +488,7 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
     SpvExecutionModel em = spvc_compiler_get_execution_model(compiler);
     unsigned next = 0;
 
-    /* Bindless table (Set 1): Set 1 becomes a device-address argument buffer of
-     * texture handles at [[buffer(VIO_METAL_BINDLESS_INDEX)]], every other set
-     * stays discrete as before, and the table's sampler is a constexpr sampler
-     * (linear, repeat) - so nothing but the buffer has to be bound. */
-    {
-        const spvc_reflected_resource *list = NULL;
-        size_t count = 0;
-        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &count);
-        for (size_t i = 0; i < count; i++) {
-            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 1) continue;
-            res->uses_bindless = 1;
-            /* Unsized arrays share one argument buffer badly (each member is one
-             * element long), so vio_cubes / vio_texture_arrays get sets 2 / 3. */
-            unsigned b = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
-            if (b == 5 || b == 6) {
-                spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, b == 5 ? 2 : 3);
-                spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, 0);
-            }
-        }
-    }
-    if (res->uses_bindless) {
-        spvc_compiler_options bopts = NULL;
-        if (spvc_compiler_create_compiler_options(compiler, &bopts) == SPVC_SUCCESS) {
-            spvc_compiler_options_set_bool(bopts, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_TRUE);
-            spvc_compiler_options_set_uint(bopts, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER, 1);   /* tier 2 */
-            spvc_compiler_install_compiler_options(compiler, bopts);
-        }
-        for (unsigned s = 0; s < 8; s++) if (s < 1 || s > 3) spvc_compiler_msl_add_discrete_descriptor_set(compiler, s);
-        spvc_compiler_msl_add_discrete_descriptor_set(compiler, SPVC_MSL_PUSH_CONSTANT_DESC_SET);
-        for (unsigned s = 1; s <= 3; s++) spvc_compiler_msl_set_argument_buffer_device_address_space(compiler, s, SPVC_TRUE);
-        for (unsigned s = 2; s <= 3; s++) {
-            spvc_msl_resource_binding_2 sb;
-            spvc_msl_resource_binding_init_2(&sb);
-            sb.stage      = em;
-            sb.desc_set   = s;
-            sb.binding    = SPVC_MSL_ARGUMENT_BUFFER_BINDING;
-            sb.msl_buffer = s == 2 ? VIO_METAL_BINDLESS_CUBE_INDEX : VIO_METAL_BINDLESS_ARRAY_INDEX;
-            spvc_compiler_msl_add_resource_binding_2(compiler, &sb);
-        }
-        spvc_msl_resource_binding_2 ab;
-        spvc_msl_resource_binding_init_2(&ab);
-        ab.stage      = em;
-        ab.desc_set   = 1;
-        ab.binding    = SPVC_MSL_ARGUMENT_BUFFER_BINDING;
-        ab.msl_buffer = VIO_METAL_BINDLESS_INDEX;
-        spvc_compiler_msl_add_resource_binding_2(compiler, &ab);
-        const spvc_reflected_resource *list = NULL;
-        size_t count = 0;
-        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS, &list, &count);
-        for (size_t i = 0; i < count; i++) {
-            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 1) continue;
-            /* Bindings 1..4: vio_sampler (linear, repeat), vio_sampler_nearest,
-             * vio_sampler_clamp, vio_sampler_nearest_clamp (BINDLESS-PLAN). */
-            unsigned v = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
-            v = (v >= 1 && v <= 4) ? v - 1 : 0;
-            spvc_msl_constexpr_sampler cs;
-            spvc_msl_constexpr_sampler_init(&cs);
-            cs.min_filter = (v & 1) ? SPVC_MSL_SAMPLER_FILTER_NEAREST : SPVC_MSL_SAMPLER_FILTER_LINEAR;
-            cs.mag_filter = cs.min_filter;
-            cs.s_address  = (v & 2) ? SPVC_MSL_SAMPLER_ADDRESS_CLAMP_TO_EDGE : SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
-            cs.t_address  = cs.s_address;
-            spvc_compiler_msl_remap_constexpr_sampler(compiler, list[i].id, &cs);
-        }
-    }
+    res->uses_bindless = metal_msl_bindless(compiler, resources, em);
 
     /* Buffers: UBOs first so ubos[0] becomes the default cbuffer (the block
      * vio_spirv_get_uniform_offsets picks), then SSBOs, then push constants. */

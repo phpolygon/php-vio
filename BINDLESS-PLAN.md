@@ -58,6 +58,11 @@ Fragment-Shader; dazu der Vertrag (Slot stabil, Referenz hält die Textur, ohne 
   `TextureCube[]` (`t0, space3`) und `Texture2DArray[]` (`t0, space4`) — drei unbegrenzte Bereiche mit Offset 0;
   Vulkan: Bindings 5/6 im Set-1-Layout; Metal: die MSL-Übersetzung legt sie in Set 2/3, je ein Argument-Buffer
   (`[[buffer(17)]]` / `[[buffer(18)]]`), weil unbegrenzte Arrays sich keinen Argument-Buffer teilen können.
+- ✅ Compute-Stages (Test 179, synchron und async im Frame): D3D12 spiegelt die Tabelle über eine CPU-Kopie
+  (`bindless_cpu_heap`) in einen Block hinter den Dispatch-Blöcken des Compute-Heaps, Kernels mit Set 1 bekommen
+  Root-Tabelle [4] und die vier statischen Sampler; Vulkan hängt das Set-1-Layout an das Compute-Pipeline-Layout
+  (Stage-Flags jetzt mit COMPUTE); Metal teilt den Bindless-Teil der MSL-Übersetzung (`metal_msl_bindless`) mit
+  den Grafik-Stages und bindet die Puffer am Compute-Encoder.
 
-Offen: Samplerwahl je Eintrag, Arrays/Cubes, Compute-Stages,
+Offen (Metal 4, nicht ohne neuere macOS-Runner prüfbar): Samplerwahl je Eintrag, Arrays/Cubes, Compute-Stages,
 Vertex-Stage-Zugriff auf Metal ohne `useResources`-Kosten (Residency Sets, Metal 4).

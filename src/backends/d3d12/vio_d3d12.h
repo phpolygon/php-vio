@@ -186,6 +186,8 @@ typedef struct _vio_d3d12_buffer {
 
 /* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */
 #define VIO_D3D12_COMPUTE_MAX_BINDINGS 8
+/* Dispatch descriptor blocks in the compute heap (a ring, one block per dispatch). */
+#define VIO_D3D12_COMPUTE_HEAP_BLOCKS 16
 
 /* One recorded storage-buffer binding on a compute pipeline. */
 typedef struct _vio_d3d12_compute_binding {
@@ -226,6 +228,7 @@ typedef struct _vio_d3d12_compute_pipeline {
     int                 srv_base_reg;
     int                 uav_base_reg;
     int                 uses_accel;   /* the kernel queries an acceleration structure: root SRV [3] t0, space9 */
+    int                 uses_bindless; /* reads the bindless table (spaces 1 / 3 / 4): root table [4] */
     /* Params constant block. An UPLOAD-heap buffer, persistently re-mapped by
      * compute_set_uniforms (256-byte aligned per the CB requirement). Bound to
      * the reflected cbv_register. */
@@ -343,6 +346,9 @@ typedef struct _vio_d3d12_state {
      * SRV heap are reserved for it (root parameter [14]). */
     int                        bindless;
     UINT                       bindless_base;
+    /* CPU-only mirror of the bindless table: the source every copy into a
+     * shader-visible heap reads (graphics block and the compute heap's block). */
+    ID3D12DescriptorHeap      *bindless_cpu_heap;
     int                        view_instancing; /* OPTIONS3.ViewInstancingTier (multiview, SV_ViewID needs SM 6.1) */
     int                        raytracing_tier; /* OPTIONS5.RaytracingTier (ray query needs 1.1 + SM 6.5) */
     /* Sampler feedback: OPTIONS7.SamplerFeedbackTier >= 0.9, SM 6.5, ID3D12Device8 and

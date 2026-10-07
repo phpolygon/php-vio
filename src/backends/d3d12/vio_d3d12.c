@@ -560,6 +560,39 @@ static UINT d3d12_alloc_srv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE *out_cpu,
 
 /* ── Root Signature ───────────────────────────────────────────────── */
 
+/* The bindless table's samplers, s1..s4 in space 1 (BINDLESS-PLAN): vio_sampler
+ * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp.
+ * Graphics and compute root signatures carry the same four. */
+static void d3d12_bindless_static_samplers(D3D12_STATIC_SAMPLER_DESC out[4])
+{
+    for (int v = 0; v < 4; v++) {
+        D3D12_STATIC_SAMPLER_DESC *s = &out[v];
+        D3D12_TEXTURE_ADDRESS_MODE am = (v & 2) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        memset(s, 0, sizeof(*s));
+        s->Filter = (v & 1) ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        s->AddressU = s->AddressV = s->AddressW = am;
+        s->ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        s->MaxLOD = D3D12_FLOAT32_MAX;
+        s->ShaderRegister = 1 + (UINT)v;
+        s->RegisterSpace = 1;
+        s->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+}
+
+/* The bindless table's SRV ranges: Texture2D[] (space 1), TextureCube[] (space 3)
+ * and Texture2DArray[] (space 4), all unbounded over the same descriptors. */
+static void d3d12_bindless_ranges(D3D12_DESCRIPTOR_RANGE out[3])
+{
+    memset(out, 0, sizeof(D3D12_DESCRIPTOR_RANGE) * 3);
+    for (int r = 0; r < 3; r++) {
+        out[r].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        out[r].NumDescriptors = UINT_MAX;   /* unbounded */
+        out[r].BaseShaderRegister = 0;
+        out[r].RegisterSpace = r == 0 ? 1 : 2 + (UINT)r;
+        out[r].OffsetInDescriptorsFromTableStart = 0;
+    }
+}
+
 static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
 {
     /*
@@ -704,14 +737,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
      * Texture2DArray[] (space 4, vio_texture_arrays): each slot is read through
      * the array of its kind (BINDLESS-PLAN 4b). */
     D3D12_DESCRIPTOR_RANGE bindless_ranges[3];
-    memset(bindless_ranges, 0, sizeof(bindless_ranges));
-    for (int r = 0; r < 3; r++) {
-        bindless_ranges[r].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        bindless_ranges[r].NumDescriptors = UINT_MAX;   /* unbounded */
-        bindless_ranges[r].BaseShaderRegister = 0;
-        bindless_ranges[r].RegisterSpace = r == 0 ? 1 : 2 + (UINT)r;
-        bindless_ranges[r].OffsetInDescriptorsFromTableStart = 0;
-    }
+    d3d12_bindless_ranges(bindless_ranges);
     params[VIO_D3D12_RP_BINDLESS].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[VIO_D3D12_RP_BINDLESS].DescriptorTable.NumDescriptorRanges = 3;
     params[VIO_D3D12_RP_BINDLESS].DescriptorTable.pDescriptorRanges = bindless_ranges;
@@ -720,18 +746,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
      * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp. */
     D3D12_STATIC_SAMPLER_DESC all_samplers[8];
     memcpy(all_samplers, static_samplers, sizeof(static_samplers));
-    for (int v = 0; v < 4; v++) {
-        D3D12_STATIC_SAMPLER_DESC *s = &all_samplers[4 + v];
-        D3D12_TEXTURE_ADDRESS_MODE am = (v & 2) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        memset(s, 0, sizeof(*s));
-        s->Filter = (v & 1) ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        s->AddressU = s->AddressV = s->AddressW = am;
-        s->ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-        s->MaxLOD = D3D12_FLOAT32_MAX;
-        s->ShaderRegister = 1 + (UINT)v;
-        s->RegisterSpace = 1;
-        s->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    }
+    d3d12_bindless_static_samplers(&all_samplers[4]);
 
     /* [16] Sampler feedback map (VIO_FEATURE_SAMPLER_FEEDBACK): one UAV u0 in
      * register space 2 for the pixel stage - the FeedbackTexture2D of an
@@ -1497,6 +1512,17 @@ static int d3d12_init(vio_config *cfg)
             D3D12_CPU_DESCRIPTOR_HANDLE d = { h.ptr + (SIZE_T)(vio_d3d12.bindless_base + i) * vio_d3d12.srv_heap.descriptor_size };
             ID3D12Device_CreateShaderResourceView(vio_d3d12.device, NULL, &nd, d);
         }
+        /* The CPU-only mirror starts with the same null SRVs. */
+        vio_d3d12.bindless_cpu_heap = NULL;
+        if (d3d12_create_descriptor_heap(&vio_d3d12.bindless_cpu_heap, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                         VIO_BINDLESS_MAX, D3D12_DESCRIPTOR_HEAP_FLAG_NONE) == 0) {
+            D3D12_CPU_DESCRIPTOR_HANDLE m;
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.bindless_cpu_heap, &m);
+            for (UINT i = 0; i < VIO_BINDLESS_MAX; i++) {
+                D3D12_CPU_DESCRIPTOR_HANDLE d = { m.ptr + (SIZE_T)i * vio_d3d12.srv_heap.descriptor_size };
+                ID3D12Device_CreateShaderResourceView(vio_d3d12.device, NULL, &nd, d);
+            }
+        }
     }
 
     /* CPU-only staging mirror — texture SRVs live here so they can serve as
@@ -1765,6 +1791,7 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.cmd_list)       ID3D12GraphicsCommandList_Release(vio_d3d12.cmd_list);
     if (vio_d3d12.root_signature) ID3D12RootSignature_Release(vio_d3d12.root_signature);
     if (vio_d3d12.compute_root_signature) ID3D12RootSignature_Release(vio_d3d12.compute_root_signature);
+    if (vio_d3d12.bindless_cpu_heap) { ID3D12DescriptorHeap_Release(vio_d3d12.bindless_cpu_heap); vio_d3d12.bindless_cpu_heap = NULL; }
     if (vio_d3d12.compute_srv_heap) ID3D12DescriptorHeap_Release(vio_d3d12.compute_srv_heap);
     if (vio_d3d12.cmdsig_indexed) ID3D12CommandSignature_Release(vio_d3d12.cmdsig_indexed);
     if (vio_d3d12.cmdsig_plain)   ID3D12CommandSignature_Release(vio_d3d12.cmdsig_plain);
@@ -2727,38 +2754,54 @@ static void d3d12_apply_bindless(void)
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_BINDLESS, g);
 }
 
+/* Index of the bindless block in the compute heap: behind the dispatch blocks. */
+#define VIO_D3D12_COMPUTE_BINDLESS_BASE (VIO_D3D12_COMPUTE_MAX_BINDINGS * 2 * VIO_D3D12_COMPUTE_HEAP_BLOCKS)
+
+/* Copy slot `slot` of the CPU mirror into the shader-visible blocks: the
+ * graphics heap's and, once it exists, the compute heap's. */
+static void d3d12_bindless_publish(int slot)
+{
+    UINT inc = vio_d3d12.srv_heap.descriptor_size;
+    D3D12_CPU_DESCRIPTOR_HANDLE m, g;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.bindless_cpu_heap, &m);
+    m.ptr += (SIZE_T)slot * inc;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &g);
+    g.ptr += (SIZE_T)(vio_d3d12.bindless_base + (UINT)slot) * inc;
+    ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, g, m, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (vio_d3d12.compute_srv_heap) {
+        D3D12_CPU_DESCRIPTOR_HANDLE c;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &c);
+        c.ptr += (SIZE_T)(VIO_D3D12_COMPUTE_BINDLESS_BASE + (UINT)slot) * vio_d3d12.compute_srv_descriptor_size;
+        ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, c, m, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+}
+
 static int d3d12_bindless_set(int slot, void *backend_texture, int kind)
 {
-    vio_d3d12_texture *t = kind == VIO_BINDLESS_KIND_CUBE ? NULL : (vio_d3d12_texture *)backend_texture;
-    if (backend_texture && kind == VIO_BINDLESS_KIND_CUBE) {
-        vio_cubemap_object *cm = (vio_cubemap_object *)backend_texture;
-        if (!vio_d3d12.bindless || !cm->d3d12_srv_cpu || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
-        D3D12_CPU_DESCRIPTOR_HANDLE d, s = { (SIZE_T)cm->d3d12_srv_cpu };
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &d);
-        d.ptr += (SIZE_T)(vio_d3d12.bindless_base + (UINT)slot) * vio_d3d12.srv_heap.descriptor_size;
-        ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, d, s, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        return 0;
-    }
-    if (!backend_texture && vio_d3d12.bindless && slot >= 0 && slot < VIO_BINDLESS_MAX) {
+    if (!vio_d3d12.bindless || !vio_d3d12.bindless_cpu_heap || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
+    D3D12_CPU_DESCRIPTOR_HANDLE m;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.bindless_cpu_heap, &m);
+    m.ptr += (SIZE_T)slot * vio_d3d12.srv_heap.descriptor_size;
+    if (!backend_texture) {
         /* Released: back to the null SRV the table starts with. */
         D3D12_SHADER_RESOURCE_VIEW_DESC nd = {0};
         nd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         nd.Texture2D.MipLevels = 1;
-        D3D12_CPU_DESCRIPTOR_HANDLE d;
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &d);
-        d.ptr += (SIZE_T)(vio_d3d12.bindless_base + (UINT)slot) * vio_d3d12.srv_heap.descriptor_size;
-        ID3D12Device_CreateShaderResourceView(vio_d3d12.device, NULL, &nd, d);
-        return 0;
+        ID3D12Device_CreateShaderResourceView(vio_d3d12.device, NULL, &nd, m);
+    } else if (kind == VIO_BINDLESS_KIND_CUBE) {
+        vio_cubemap_object *cm = (vio_cubemap_object *)backend_texture;
+        if (!cm->d3d12_srv_cpu) return -1;
+        D3D12_CPU_DESCRIPTOR_HANDLE s = { (SIZE_T)cm->d3d12_srv_cpu };
+        ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, m, s, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    } else {
+        vio_d3d12_texture *t = (vio_d3d12_texture *)backend_texture;
+        if (!t->resource || !t->srv_cpu.ptr || t->depth > 0 || (t->layers > 1) != (kind == VIO_BINDLESS_KIND_ARRAY)) return -1;
+        /* From the texture's staging (CPU-only) SRV. */
+        ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, m, t->srv_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
-    if (!vio_d3d12.bindless || !t || !t->resource || !t->srv_cpu.ptr || t->depth > 0
-        || (t->layers > 1) != (kind == VIO_BINDLESS_KIND_ARRAY) || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
-    D3D12_CPU_DESCRIPTOR_HANDLE d;
-    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &d);
-    d.ptr += (SIZE_T)(vio_d3d12.bindless_base + (UINT)slot) * vio_d3d12.srv_heap.descriptor_size;
-    /* From the texture's staging (CPU-only) SRV into the shader-visible block. */
-    ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, d, t->srv_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    d3d12_bindless_publish(slot);
     return 0;
 }
 
@@ -6298,7 +6341,17 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
     uav_range.RegisterSpace = 0;
     uav_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER params[4] = {0};
+    D3D12_ROOT_PARAMETER params[5] = {0};
+
+    /* [4] the bindless table (BINDLESS-PLAN 4b): the compute heap's bindless block. */
+    D3D12_DESCRIPTOR_RANGE bindless_ranges[3];
+    d3d12_bindless_ranges(bindless_ranges);
+    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[4].DescriptorTable.NumDescriptorRanges = 3;
+    params[4].DescriptorTable.pDescriptorRanges = bindless_ranges;
+    params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_STATIC_SAMPLER_DESC bindless_samplers[4];
+    d3d12_bindless_static_samplers(bindless_samplers);
 
     /* [3] root SRV t0, space9 — the ray-query acceleration structure, when used. */
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -6326,10 +6379,10 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-    rs_desc.NumParameters = cp->uses_accel ? 4 : 3;
+    rs_desc.NumParameters = cp->uses_bindless ? 5 : cp->uses_accel ? 4 : 3;
     rs_desc.pParameters = params;
-    rs_desc.NumStaticSamplers = 0;
-    rs_desc.pStaticSamplers = NULL;
+    rs_desc.NumStaticSamplers = cp->uses_bindless ? 4 : 0;
+    rs_desc.pStaticSamplers = cp->uses_bindless ? bindless_samplers : NULL;
     rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE; /* NO input-assembler flag */
 
     ID3DBlob *sig = NULL, *err = NULL;
@@ -6357,19 +6410,28 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
  * dispatch: [0..VIO_D3D12_COMPUTE_MAX_BINDINGS) SRVs, then the same many UAVs.
  * Recreated lazily (small, fixed). Separate from the graphics srv_heap so the
  * complex per-frame partitioning there is untouched. */
-#define VIO_D3D12_COMPUTE_HEAP_BLOCKS 16
 
 static int d3d12_ensure_compute_srv_heap(void)
 {
     if (vio_d3d12.compute_srv_heap) return 0;
+    /* Behind the dispatch blocks: the bindless table, copied from its CPU mirror
+     * (d3d12_bindless_publish keeps it current). */
+    UINT extra = (vio_d3d12.bindless && vio_d3d12.bindless_cpu_heap) ? VIO_BINDLESS_MAX : 0;
     if (d3d12_create_descriptor_heap(&vio_d3d12.compute_srv_heap,
                                      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                                     VIO_D3D12_COMPUTE_MAX_BINDINGS * 2 * VIO_D3D12_COMPUTE_HEAP_BLOCKS,
+                                     VIO_D3D12_COMPUTE_MAX_BINDINGS * 2 * VIO_D3D12_COMPUTE_HEAP_BLOCKS + extra,
                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
         return -1;
     }
     vio_d3d12.compute_srv_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (extra) {
+        D3D12_CPU_DESCRIPTOR_HANDLE c, m;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &c);
+        c.ptr += (SIZE_T)VIO_D3D12_COMPUTE_BINDLESS_BASE * vio_d3d12.compute_srv_descriptor_size;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.bindless_cpu_heap, &m);
+        ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, VIO_BINDLESS_MAX, c, m, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
     return 0;
 }
 
@@ -6482,6 +6544,8 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
     cp->srv_base_reg = srv_base_reg;
     cp->uav_base_reg = uav_base_reg;
     cp->uses_accel   = strstr(hlsl, "RaytracingAccelerationStructure") != NULL;
+    cp->uses_bindless = vio_d3d12.bindless && vio_d3d12.bindless_cpu_heap
+                     && (strstr(hlsl, "space1)") || strstr(hlsl, "space3)") || strstr(hlsl, "space4)"));
 
     /* Build the per-pipeline root signature from the reflected registers. */
     if (d3d12_build_compute_root_signature(cp) != 0) {
@@ -6881,6 +6945,12 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
         ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(list, 3, ID3D12Resource_GetGPUVirtualAddress(d3d12_bound_as->tlas));
     ID3D12DescriptorHeap *heaps[] = { vio_d3d12.compute_srv_heap };
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
+    if (cp->uses_bindless) {
+        D3D12_GPU_DESCRIPTOR_HANDLE bt;
+        ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &bt);
+        bt.ptr += (UINT64)VIO_D3D12_COMPUTE_BINDLESS_BASE * vio_d3d12.compute_srv_descriptor_size;
+        ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 4, bt);
+    }
 
     if (cp->params_buf) {
         D3D12_GPU_VIRTUAL_ADDRESS params_gpu = ID3D12Resource_GetGPUVirtualAddress(cp->params_buf);

@@ -3953,6 +3953,16 @@ static void metal_bindless_bind(id<MTLRenderCommandEncoder> enc, int vertex, int
     }
 }
 
+/* The same for a compute kernel. */
+static void metal_bindless_bind_compute(id<MTLComputeCommandEncoder> enc)
+{
+    for (int k = 0; k < 3; k++) {
+        if (metal_bindless_bufs[k]) [enc setBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+    }
+    if (metal_bindless_live_count > 0)
+        [enc useResources:metal_bindless_live count:(NSUInteger)metal_bindless_live_count usage:MTLResourceUsageRead];
+}
+
 /* Instances to issue for `n` user instances: x views under multiview. */
 static NSUInteger metal_mv_instances(NSUInteger n)
 {
@@ -5524,6 +5534,7 @@ typedef struct _vio_metal_compute_pipeline {
      * kernels dispatch with the right threadsPerThreadgroup (0 => 64,1,1). */
     unsigned                  local_size[3];
     int                       uses_as;   /* the kernel declares an acceleration structure (ray query) */
+    int                       uses_bindless;   /* reads the bindless table (metal_bindless_bind_compute) */
 } vio_metal_compute_pipeline;
 
 #ifdef HAVE_SPIRV_CROSS
@@ -5534,7 +5545,7 @@ typedef struct _vio_metal_compute_pipeline {
  * (the explicit binding we installed for it, canonical 2). */
 static char *metal_cs_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
                                    int *params_index_out, unsigned local_size_out[3],
-                                   char **error_msg)
+                                   int *uses_bindless_out, char **error_msg)
 {
     spvc_context  ctx = NULL;
     spvc_parsed_ir ir = NULL;
@@ -5543,6 +5554,7 @@ static char *metal_cs_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
     char         *output = NULL;
 
     if (params_index_out) *params_index_out = 2; /* canonical default */
+    if (uses_bindless_out) *uses_bindless_out = 0;
 
     if (spvc_context_create(&ctx) != SPVC_SUCCESS) {
         if (error_msg) *error_msg = strdup("Failed to create SPIRV-Cross context");
@@ -5596,6 +5608,15 @@ static char *metal_cs_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
         rb.msl_texture = b;   /* unused for buffers; set for completeness */
         rb.msl_sampler = b;
         spvc_compiler_msl_add_resource_binding(compiler, &rb);
+    }
+
+    /* The bindless table (Set 1..3 argument buffers), as in the graphics stages. */
+    {
+        spvc_resources resources = NULL;
+        if (spvc_compiler_create_shader_resources(compiler, &resources) == SPVC_SUCCESS) {
+            int uses = metal_msl_bindless(compiler, resources, SpvExecutionModelGLCompute);
+            if (uses_bindless_out) *uses_bindless_out = uses;
+        }
     }
 
     if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS) {
@@ -5685,7 +5706,8 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
 
     int params_index = 2;
     unsigned local_size[3] = {0, 0, 0};
-    char *msl = metal_cs_spirv_to_msl(spirv, spirv_size, &params_index, local_size, &err);
+    int uses_bindless = 0;
+    char *msl = metal_cs_spirv_to_msl(spirv, spirv_size, &params_index, local_size, &uses_bindless, &err);
     if (free_spirv) free(spirv);
     if (!msl) {
         php_error_docref(NULL, E_WARNING, "Metal: CS SPIR-V->MSL failed: %s",
@@ -5734,6 +5756,7 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
         cp->pso          = (void *)CFBridgingRetain(pso);
         cp->params_index = params_index;
         cp->uses_as      = uses_as;
+        cp->uses_bindless = uses_bindless;
         memcpy(cp->local_size, local_size, sizeof(local_size));
     }
 
@@ -5877,6 +5900,8 @@ static void metal_dispatch_compute(vio_compute_cmd *cmd)
                 metal_use_as(nil, enc, metal_bound_as);
             }
         }
+
+        if (cp->uses_bindless) metal_bindless_bind_compute(enc);
 
         /* Bind each storage buffer at its MSL buffer index (== GLSL binding,
          * guaranteed by the explicit resource-binding remap at compile time). */
