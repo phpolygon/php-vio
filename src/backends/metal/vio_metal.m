@@ -6060,6 +6060,37 @@ static int metal_cooperative_matrix_shapes(vio_coopmat_shape *out, int max)
     return n;
 }
 
+/* vio_adapters (A6): every Metal device (MTLCopyAllDevices on macOS). */
+static int metal_enumerate_adapters(vio_adapter_info *out, int max)
+{
+    int n = 0;
+    @autoreleasepool {
+#if TARGET_OS_OSX
+        NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+#else
+        id<MTLDevice> one = MTLCreateSystemDefaultDevice();
+        NSArray<id<MTLDevice>> *devices = one ? @[ one ] : @[];
+#endif
+        for (id<MTLDevice> dev in devices) {
+            if (n >= max) break;
+            vio_adapter_info *a = &out[n++];
+            memset(a, 0, sizeof(*a));
+            snprintf(a->name, sizeof(a->name), "%s", dev.name.UTF8String ? dev.name.UTF8String : "Metal");
+            a->vendor_id = strstr(a->name, "AMD") ? 0x1002 : strstr(a->name, "Intel") ? 0x8086
+                         : strstr(a->name, "NVIDIA") ? 0x10DE : 0x106B;
+            a->device_type = dev.hasUnifiedMemory ? "integrated" : "discrete";
+            a->vram_bytes = (uint64_t)dev.recommendedMaxWorkingSetSize;
+            a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
+                        | VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION) | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW);
+            if ([dev respondsToSelector:@selector(supportsRaytracing)] && dev.supportsRaytracing)
+                a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAY_QUERY);
+            if ([dev supportsFamily:MTLGPUFamilyApple7] || [dev supportsFamily:MTLGPUFamilyMac2])
+                a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MESH_SHADER) | VIO_FEATURE_BIT(VIO_FEATURE_SUBGROUP);
+        }
+    }
+    return n;
+}
+
 /* vio_backend_info(): the version ladder rung and the capability set. */
 static int metal_describe(vio_backend_description *out)
 {
@@ -6377,6 +6408,7 @@ static const vio_backend metal_backend = {
     .gpu_marks         = metal_gpu_marks,
     .swapchain_info    = metal_swapchain_info,
     .describe          = metal_describe,
+    .enumerate_adapters = metal_enumerate_adapters,
     .create_acceleration_structure  = metal_create_acceleration_structure,
     .destroy_acceleration_structure = metal_destroy_acceleration_structure,
     .bind_acceleration_structure    = metal_bind_acceleration_structure,

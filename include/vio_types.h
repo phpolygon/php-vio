@@ -545,6 +545,22 @@ typedef struct _vio_backend_description {
     uint64_t    vram_bytes;
 } vio_backend_description;
 
+/* vio_adapters() (OPEN-ITEMS-PLAN A6): one adapter as the backend sees it
+ * without a context. features: bit VIO_FEATURE_* for each device capability
+ * the backend can tell without opening its own device (hardware support; the
+ * flag of a context may still depend on the shader toolchain). */
+#define VIO_MAX_ADAPTERS 16
+#define VIO_FEATURE_BIT(f) (1ull << (unsigned)(f))
+typedef struct _vio_adapter_info {
+    char        name[256];
+    uint32_t    vendor_id;
+    uint32_t    device_id;
+    char        driver[64];
+    const char *device_type;   /* "discrete" / "integrated" / "software", NULL = unknown */
+    uint64_t    vram_bytes;
+    uint64_t    features;
+} vio_adapter_info;
+
 /* Vendor name for a PCI vendor id (vio_backend_info / vio_adapters). */
 static inline const char *vio_vendor_name(uint32_t id)
 {

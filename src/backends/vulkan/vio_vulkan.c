@@ -1128,6 +1128,94 @@ static int vulkan_describe(vio_backend_description *out)
     return 0;
 }
 
+static int vulkan_has_device_ext(VkExtensionProperties *ext, uint32_t n, const char *name)
+{
+    for (uint32_t i = 0; i < n; i++) if (strcmp(ext[i].extensionName, name) == 0) return 1;
+    return 0;
+}
+
+static int vulkan_device_type_rank(VkPhysicalDeviceType t)
+{
+    return t == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 0 : t == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1
+         : t == VK_PHYSICAL_DEVICE_TYPE_CPU ? 3 : 2;
+}
+
+/* vio_adapters (A6): a throwaway instance lists the physical devices with
+ * their core features and extensions; discrete devices first. */
+static int vulkan_enumerate_adapters(vio_adapter_info *out, int max)
+{
+    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    VkInstanceCreateInfo ci = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    VkInstance inst = VK_NULL_HANDLE;
+    uint32_t loader = VK_API_VERSION_1_0;
+    if (vkEnumerateInstanceVersion(&loader) != VK_SUCCESS) loader = VK_API_VERSION_1_0;
+    app.pApplicationName = "vio_adapters";
+    app.apiVersion = loader >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
+    ci.pApplicationInfo = &app;
+    if (vkCreateInstance(&ci, NULL, &inst) != VK_SUCCESS) return 0;
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(inst, &count, NULL);
+    VkPhysicalDevice *pds = count ? (VkPhysicalDevice *)calloc(count, sizeof(*pds)) : NULL;
+    if (pds) vkEnumeratePhysicalDevices(inst, &count, pds);
+    else count = 0;
+    int n = 0;
+    for (int rank = 0; rank < 4; rank++) {
+        for (uint32_t i = 0; i < count && n < max; i++) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(pds[i], &p);
+            if (vulkan_device_type_rank(p.deviceType) != rank) continue;
+            vio_adapter_info *a = &out[n++];
+            memset(a, 0, sizeof(*a));
+            snprintf(a->name, sizeof(a->name), "%s", p.deviceName);
+            a->vendor_id = p.vendorID;
+            a->device_id = p.deviceID;
+            uint32_t v = p.driverVersion;
+            if (p.vendorID == 0x10DE)
+                snprintf(a->driver, sizeof(a->driver), "%u.%u", (v >> 22) & 0x3FF, (v >> 14) & 0xFF);
+#ifdef _WIN32
+            else if (p.vendorID == 0x8086)
+                snprintf(a->driver, sizeof(a->driver), "%u.%u", v >> 14, v & 0x3FFF);
+#endif
+            else
+                snprintf(a->driver, sizeof(a->driver), "%u.%u.%u", VK_VERSION_MAJOR(v), VK_VERSION_MINOR(v), VK_VERSION_PATCH(v));
+            a->device_type = rank == 0 ? "discrete" : rank == 1 ? "integrated" : rank == 3 ? "software" : NULL;
+            if (rank == 0) {
+                VkPhysicalDeviceMemoryProperties mem;
+                vkGetPhysicalDeviceMemoryProperties(pds[i], &mem);
+                for (uint32_t h = 0; h < mem.memoryHeapCount; h++)
+                    if (mem.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) a->vram_bytes += mem.memoryHeaps[h].size;
+            }
+            VkPhysicalDeviceFeatures f;
+            vkGetPhysicalDeviceFeatures(pds[i], &f);
+            a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
+                        | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW);
+            if (f.geometryShader)       a->features |= VIO_FEATURE_BIT(VIO_FEATURE_GEOMETRY);
+            if (f.tessellationShader)   a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION);
+            if (f.multiViewport)        a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MULTI_VIEWPORT);
+            if (f.textureCompressionBC) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_BC);
+            if (p.apiVersion >= VK_API_VERSION_1_1) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MULTIVIEW);
+            uint32_t ne = 0;
+            vkEnumerateDeviceExtensionProperties(pds[i], NULL, &ne, NULL);
+            VkExtensionProperties *ext = ne ? (VkExtensionProperties *)calloc(ne, sizeof(*ext)) : NULL;
+            if (ext && vkEnumerateDeviceExtensionProperties(pds[i], NULL, &ne, ext) == VK_SUCCESS) {
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_ray_query")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAY_QUERY);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_ray_tracing_pipeline")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAYTRACING);
+                if (vulkan_has_device_ext(ext, ne, "VK_EXT_mesh_shader")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MESH_SHADER);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_fragment_shading_rate")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_SHADING_RATE);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_fragment_shader_barycentric")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_BARYCENTRICS);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_cooperative_matrix")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_COOPERATIVE_MATRIX);
+                if (p.apiVersion >= VK_API_VERSION_1_2 || vulkan_has_device_ext(ext, ne, "VK_EXT_descriptor_indexing"))
+                    a->features |= VIO_FEATURE_BIT(VIO_FEATURE_BINDLESS);
+            }
+            free(ext);
+            if (p.apiVersion >= VK_API_VERSION_1_1) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_SUBGROUP);
+        }
+    }
+    free(pds);
+    vkDestroyInstance(inst, NULL);
+    return n;
+}
+
 static void vulkan_swapchain_info(vio_swapchain_info *out)
 {
     out->buffer_count  = (int)vio_vk.swapchain_image_count;
@@ -4834,6 +4922,7 @@ static const vio_backend vulkan_backend = {
     .bind_stage_constants = vio_vk3d_bind_stage_constants,
     .gpu_info          = vulkan_gpu_info,
     .describe          = vulkan_describe,
+    .enumerate_adapters = vulkan_enumerate_adapters,
     .draw_mesh_instanced = vio_vk3d_draw_mesh_instanced,
     .bind_storage_buffer = vio_vk3d_bind_storage_buffer,
     .draw_instanced_from_storage = vio_vk3d_draw_instanced_from_storage,

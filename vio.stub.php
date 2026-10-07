@@ -415,6 +415,17 @@ function vio_swapchain_info(VioContext $context): array {}
 function vio_backend_info(VioContext $context): array|false {}
 
 /**
+ * Adapters each registered backend can open, without a context:
+ * ['<backend>' => [['index' => int, 'name' => string, 'vendor_id' => int,
+ * 'vendor' => string, 'device_id' => int, 'driver' => string, 'device_type' =>
+ * 'discrete' | 'integrated' | 'software' | 'unknown', 'vram_bytes' => int,
+ * 'features' => int[] (VIO_FEATURE_* the hardware supports)], ...], ...].
+ * Preferred (discrete) adapters first. OpenGL lists only the adapter of its
+ * live context. A backend name limits the scan; an unknown one is a ValueError.
+ */
+function vio_adapters(?string $backend = null): array {}
+
+/**
  * Inline ray tracing (VIO_FEATURE_RAY_QUERY): build a bottom-level acceleration
  * structure per distinct mesh (its location-0 positions and indices) and a
  * top-level structure over the instances. Each instance is

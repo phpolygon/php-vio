@@ -5649,6 +5649,59 @@ static void d3d12_gpu_info(const char **name, uint64_t *vram_bytes)
 
 static int d3d12_supports_feature(vio_feature feature);
 
+/* vio_adapters (A6): a throwaway device on the adapter answers the hardware
+ * tiers (OS runtime; the Agility SDK may report more on the context). */
+static int d3d12_probe_adapter(IDXGIAdapter1 *adapter, vio_adapter_info *a)
+{
+    ID3D12Device *dev = NULL;
+    if (FAILED(D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&dev)) || !dev)
+        return -1;
+    a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
+                | VIO_FEATURE_BIT(VIO_FEATURE_GEOMETRY) | VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION)
+                | VIO_FEATURE_BIT(VIO_FEATURE_MULTI_VIEWPORT) | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW)
+                | VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_BC);
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o = {0};
+    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o)))
+        && o.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3)
+        a->features |= VIO_FEATURE_BIT(VIO_FEATURE_BINDLESS);
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {0};
+    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))) && o1.WaveOps)
+        a->features |= VIO_FEATURE_BIT(VIO_FEATURE_SUBGROUP);
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {0};
+    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3)))) {
+        if (o3.ViewInstancingTier > D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MULTIVIEW);
+        if (o3.BarycentricsSupported) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_BARYCENTRICS);
+    }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {0};
+    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5)))) {
+        if (o5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAYTRACING);
+        if (o5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAY_QUERY);
+    }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {0};
+    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6)))) {
+        if (o6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_1) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_SHADING_RATE);
+        if (o6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2)
+            a->features |= VIO_FEATURE_BIT(VIO_FEATURE_SHADING_RATE_IMAGE) | VIO_FEATURE_BIT(VIO_FEATURE_SHADING_RATE_PRIMITIVE);
+    }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {0};
+    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7)))) {
+        if (o7.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MESH_SHADER);
+        if (o7.SamplerFeedbackTier >= D3D12_SAMPLER_FEEDBACK_TIER_0_9) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_SAMPLER_FEEDBACK);
+    }
+    if (!a->device_type) {
+        D3D12_FEATURE_DATA_ARCHITECTURE1 arch = {0};
+        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch))))
+            a->device_type = arch.UMA ? "integrated" : "discrete";
+    }
+    ID3D12Device_Release(dev);
+    return 0;
+}
+
+static int d3d12_enumerate_adapters(vio_adapter_info *out, int max)
+{
+    return vio_dxgi_enumerate_adapters(out, max, d3d12_probe_adapter);
+}
+
 /* vio_backend_info (A4): feature level, shader model in use / of the device,
  * adapter identity and the optional features. */
 static int d3d12_describe(vio_backend_description *out)
@@ -8604,6 +8657,7 @@ static const vio_backend d3d12_backend = {
     .bind_stage_constants    = d3d12_bind_stage_constants,
     .gpu_info                = d3d12_gpu_info,
     .describe                = d3d12_describe,
+    .enumerate_adapters      = d3d12_enumerate_adapters,
     .create_acceleration_structure  = d3d12_create_acceleration_structure,
     .destroy_acceleration_structure = d3d12_destroy_acceleration_structure,
     .bind_acceleration_structure    = d3d12_bind_acceleration_structure,

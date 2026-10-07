@@ -8539,6 +8539,52 @@ ZEND_FUNCTION(vio_backend_info)
     add_assoc_long(return_value, "vram_bytes", (zend_long)d.vram_bytes);
 }
 
+/* vio_adapters(?string $backend = null): ['<backend>' => [adapter, ...], ...]
+ * for every registered backend that can list its adapters (OPEN-ITEMS-PLAN A6). */
+ZEND_FUNCTION(vio_adapters)
+{
+    zend_string *only = NULL;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STR_OR_NULL(only)
+    ZEND_PARSE_PARAMETERS_END();
+    if (only && !vio_find_backend(ZSTR_VAL(only))) {
+        zend_argument_value_error(1, "must be a registered backend name");
+        RETURN_THROWS();
+    }
+    vio_adapter_info *list = (vio_adapter_info *)ecalloc(VIO_MAX_ADAPTERS, sizeof(vio_adapter_info));
+    array_init(return_value);
+    for (int b = 0; b < vio_backend_count(); b++) {
+        const char *name = vio_get_backend_name(b);
+        const vio_backend *be = name ? vio_find_backend(name) : NULL;
+        if (!be || !be->enumerate_adapters) continue;
+        if (only && strcmp(ZSTR_VAL(only), name) != 0) continue;
+        int n = be->enumerate_adapters(list, VIO_MAX_ADAPTERS);
+        zval adapters;
+        array_init(&adapters);
+        for (int i = 0; i < n && i < VIO_MAX_ADAPTERS; i++) {
+            const vio_adapter_info *a = &list[i];
+            zval entry, features;
+            array_init(&entry);
+            add_assoc_long(&entry, "index", i);
+            add_assoc_string(&entry, "name", (char *)a->name);
+            add_assoc_long(&entry, "vendor_id", (zend_long)a->vendor_id);
+            add_assoc_string(&entry, "vendor", (char *)vio_vendor_name(a->vendor_id));
+            add_assoc_long(&entry, "device_id", (zend_long)a->device_id);
+            add_assoc_string(&entry, "driver", (char *)a->driver);
+            add_assoc_string(&entry, "device_type", (char *)(a->device_type ? a->device_type : "unknown"));
+            add_assoc_long(&entry, "vram_bytes", (zend_long)a->vram_bytes);
+            array_init(&features);
+            for (int f = 0; f < 64; f++)
+                if (a->features & VIO_FEATURE_BIT(f)) add_next_index_long(&features, f);
+            add_assoc_zval(&entry, "features", &features);
+            add_next_index_zval(&adapters, &entry);
+        }
+        add_assoc_zval(return_value, name, &adapters);
+    }
+    efree(list);
+}
+
 /* ── Inline ray tracing (VIO_FEATURE_RAY_QUERY) ──────────────────── */
 
 /* vio_acceleration_structure($ctx, [['mesh' => VioMesh, 'transform' => float[16]], ...]):

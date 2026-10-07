@@ -448,6 +448,24 @@ static int opengl_describe(vio_backend_description *out)
     return 0;
 }
 
+/* vio_adapters (A6): GL cannot list adapters, it only knows the one its live
+ * context runs on. */
+static int opengl_enumerate_adapters(vio_adapter_info *out, int max)
+{
+    vio_backend_description d;
+    if (max < 1 || !vio_gl.initialized) return 0;
+    memset(&d, 0, sizeof(d));
+    if (opengl_describe(&d) != 0) return 0;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->name, sizeof(out->name), "%s", d.device);
+    snprintf(out->driver, sizeof(out->driver), "%s", d.driver ? d.driver : "");
+    out->vendor_id = d.vendor_id;
+    out->device_type = d.device_type;
+    for (int f = 0; f < 64; f++)
+        if (opengl_supports_feature((vio_feature)f)) out->features |= VIO_FEATURE_BIT(f);
+    return 1;
+}
+
 static void opengl_shutdown(void)
 {
     if (vio_gl.default_shader_program) {
@@ -2886,6 +2904,7 @@ static const vio_backend opengl_backend = {
     .gpu_marks         = opengl_gpu_marks,
     .gpu_info          = opengl_gpu_info,
     .describe          = opengl_describe,
+    .enumerate_adapters = opengl_enumerate_adapters,
     .draw_indirect     = opengl_draw_indirect,
     .set_viewport      = opengl_set_viewport,
     .set_viewports     = opengl_set_viewports,

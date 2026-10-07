@@ -484,6 +484,11 @@ typedef struct _vio_backend {
      * (SPIRV-Cross' HLSL backend takes SV_ViewID in VS and PS only): vio_shader
      * then forwards it from the vertex stage (vio_glsl_multiview_forward). */
     int (*multiview_view_from_vertex)(void);
+
+    /* vio_adapters() (A6): the adapters this backend can open, without a context
+     * (OpenGL: the live context's only). Fills up to `max` entries, preferred
+     * (discrete) first, and returns the count. */
+    int (*enumerate_adapters)(vio_adapter_info *out, int max);
 } vio_backend;
 
 /*

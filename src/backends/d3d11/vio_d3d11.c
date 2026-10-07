@@ -3331,6 +3331,36 @@ static void d3d11_swapchain_info(vio_swapchain_info *out)
 
 static int d3d11_supports_feature(vio_feature feature);
 
+/* vio_adapters (A6): feature level 11_0 on the adapter carries vio's D3D11
+ * feature set; a throwaway device answers it and the memory architecture. */
+static int d3d11_probe_adapter(IDXGIAdapter1 *adapter, vio_adapter_info *a)
+{
+    static const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    ID3D11Device *dev = NULL;
+    HRESULT hr = D3D11CreateDevice((IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, levels, 2,
+                                   D3D11_SDK_VERSION, &dev, NULL, NULL);
+    if (hr == E_INVALIDARG)   /* runtimes without 11_1 */
+        hr = D3D11CreateDevice((IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, levels + 1, 1,
+                               D3D11_SDK_VERSION, &dev, NULL, NULL);
+    if (FAILED(hr) || !dev) return -1;
+    a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
+                | VIO_FEATURE_BIT(VIO_FEATURE_GEOMETRY) | VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION)
+                | VIO_FEATURE_BIT(VIO_FEATURE_MULTI_VIEWPORT) | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW)
+                | VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_BC);
+    if (!a->device_type) {
+        D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2 = {0};
+        if (SUCCEEDED(ID3D11Device_CheckFeatureSupport(dev, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof(o2))))
+            a->device_type = o2.UnifiedMemoryArchitecture ? "integrated" : "discrete";
+    }
+    ID3D11Device_Release(dev);
+    return 0;
+}
+
+static int d3d11_enumerate_adapters(vio_adapter_info *out, int max)
+{
+    return vio_dxgi_enumerate_adapters(out, max, d3d11_probe_adapter);
+}
+
 /* vio_backend_info (A4): feature level, adapter identity, optional features.
  * FXC compiles Shader Model 5.0 on every feature level vio creates (11_0+). */
 static int d3d11_describe(vio_backend_description *out)
@@ -3735,6 +3765,7 @@ static const vio_backend d3d11_backend = {
     .bind_stage_constants    = d3d11_bind_stage_constants,
     .gpu_info                = d3d11_gpu_info,
     .describe                = d3d11_describe,
+    .enumerate_adapters      = d3d11_enumerate_adapters,
 };
 
 void vio_backend_d3d11_register(void)

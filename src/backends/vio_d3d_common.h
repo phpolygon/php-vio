@@ -31,6 +31,43 @@ static inline void vio_dxgi_adapter_identity(IDXGIAdapter *adapter, uint32_t *ve
                  (unsigned)HIWORD(umd.HighPart), (unsigned)LOWORD(umd.HighPart),
                  (unsigned)HIWORD(umd.LowPart), (unsigned)LOWORD(umd.LowPart));
 }
+
+/* vio_adapters (A6): DXGI adapters in high-performance order (the software
+ * adapter last). `probe` adds the API's features and device type and returns
+ * 0 when the API can open the adapter. */
+typedef int (*vio_dxgi_probe_fn)(IDXGIAdapter1 *adapter, vio_adapter_info *a);
+static inline int vio_dxgi_enumerate_adapters(vio_adapter_info *out, int max, vio_dxgi_probe_fn probe)
+{
+    IDXGIFactory1 *f1 = NULL;
+    IDXGIFactory6 *f6 = NULL;
+    int n = 0;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) return 0;
+    if (FAILED(IDXGIFactory1_QueryInterface(f1, &IID_IDXGIFactory6, (void **)&f6))) f6 = NULL;
+    for (UINT i = 0; n < max; i++) {
+        IDXGIAdapter1 *ad = NULL;
+        HRESULT hr = f6 ? IDXGIFactory6_EnumAdapterByGpuPreference(f6, i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                                  &IID_IDXGIAdapter1, (void **)&ad)
+                        : IDXGIFactory1_EnumAdapters1(f1, i, &ad);
+        if (FAILED(hr) || !ad) break;
+        vio_adapter_info *a = &out[n];
+        DXGI_ADAPTER_DESC1 d;
+        int sw = 0;
+        memset(a, 0, sizeof(*a));
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(ad, &d))) {
+            if (WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, a->name, (int)sizeof(a->name), NULL, NULL) <= 0)
+                a->name[0] = '\0';
+            a->device_id = d.DeviceId;
+            a->vram_bytes = (uint64_t)d.DedicatedVideoMemory;
+        }
+        vio_dxgi_adapter_identity((IDXGIAdapter *)ad, &a->vendor_id, a->driver, sizeof(a->driver), &sw);
+        a->device_type = sw ? "software" : NULL;
+        if (probe(ad, a) == 0) n++;
+        IDXGIAdapter1_Release(ad);
+    }
+    if (f6) IDXGIFactory6_Release(f6);
+    IDXGIFactory1_Release(f1);
+    return n;
+}
 #include <windows.h>
 #include "../../include/vio_types.h"
 
