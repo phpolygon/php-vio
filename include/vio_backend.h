@@ -413,6 +413,14 @@ typedef struct _vio_backend {
     void *(*create_acceleration_structure)(const vio_as_desc *desc);
     void  (*destroy_acceleration_structure)(void *as);
     void  (*bind_acceleration_structure)(void *as, int binding);
+    /* Ray tracing pipeline (VIO_FEATURE_RAYTRACING): build the pipeline and
+     * its shader binding table (NULL on failure, the backend warns), free it,
+     * and launch w * h * d raygen invocations synchronously against the bound
+     * acceleration structure with `count` storage buffers. The buffers are
+     * readable through read_buffer afterwards. 0 on success, -1 otherwise. */
+    void *(*create_rt_pipeline)(const vio_rt_pipeline_desc *desc);
+    void  (*destroy_rt_pipeline)(void *pipeline);
+    int   (*trace_rays)(void *pipeline, const vio_rt_buffer_binding *buffers, int count, int w, int h, int d);
 } vio_backend;
 
 /*

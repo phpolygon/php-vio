@@ -237,6 +237,26 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bind_acceleration_structure,
 	ZEND_ARG_TYPE_INFO(0, binding, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_rt_pipeline, 0, 2, VioRtPipeline, MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, desc, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_rt_bind_buffer, 0, 4, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, pipeline, VioRtPipeline, 0)
+	ZEND_ARG_OBJ_INFO(0, buffer, VioBuffer, 0)
+	ZEND_ARG_TYPE_INFO(0, binding, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_trace_rays, 0, 4, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, pipeline, VioRtPipeline, 0)
+	ZEND_ARG_TYPE_INFO(0, width, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, height, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, depth, IS_LONG, 0, "1")
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_shading_rate, 0, 2, _IS_BOOL, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, rate, IS_LONG, 0)
@@ -931,6 +951,9 @@ ZEND_FUNCTION(vio_backend_info);
 ZEND_FUNCTION(vio_texture_index);
 ZEND_FUNCTION(vio_acceleration_structure);
 ZEND_FUNCTION(vio_bind_acceleration_structure);
+ZEND_FUNCTION(vio_rt_pipeline);
+ZEND_FUNCTION(vio_rt_bind_buffer);
+ZEND_FUNCTION(vio_trace_rays);
 ZEND_FUNCTION(vio_draw_indirect);
 ZEND_FUNCTION(vio_set_shading_rate);
 ZEND_FUNCTION(vio_set_shading_rate_image);
@@ -1102,6 +1125,9 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_texture_index, arginfo_vio_texture_index)
 	ZEND_FE(vio_acceleration_structure, arginfo_vio_acceleration_structure)
 	ZEND_FE(vio_bind_acceleration_structure, arginfo_vio_bind_acceleration_structure)
+	ZEND_FE(vio_rt_pipeline, arginfo_vio_rt_pipeline)
+	ZEND_FE(vio_rt_bind_buffer, arginfo_vio_rt_bind_buffer)
+	ZEND_FE(vio_trace_rays, arginfo_vio_trace_rays)
 	ZEND_FE(vio_draw_indirect, arginfo_vio_draw_indirect)
 	ZEND_FE(vio_set_shading_rate, arginfo_vio_set_shading_rate)
 	ZEND_FE(vio_set_shading_rate_image, arginfo_vio_set_shading_rate_image)

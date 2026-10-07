@@ -5918,6 +5918,12 @@ static int metal_supports_feature(vio_feature f)
         return 0;
 #endif
     case VIO_FEATURE_RAYTRACING:
+        /* No ray tracing pipeline: Metal has no raygen / miss / hit stages
+         * (an intersector in a compute kernel plus intersection function
+         * tables), and SPIRV-Cross cannot translate traceRayEXT or the
+         * payload / hit attribute storage classes to MSL. Ray queries
+         * (VIO_FEATURE_RAY_QUERY) cover inline tracing. */
+        return 0;
     default:
         return 0;
     }

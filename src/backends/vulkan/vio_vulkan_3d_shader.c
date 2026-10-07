@@ -316,6 +316,20 @@ static char *vk3d_gs_fixup(const char *glsl)
     return out;
 }
 
+/* OpCapability RayQueryKHR (4472) in the module. */
+static int vk3d_uses_ray_query(const uint32_t *code, size_t bytes)
+{
+    size_t words = bytes / 4, i = 5;
+    while (i < words) {
+        uint32_t op = code[i] & 0xFFFF, count = code[i] >> 16;
+        if (count == 0) break;
+        if (op == 17 && count >= 2 && code[i + 1] == 4472) return 1;
+        if (op != 17 && op != 11 && op != 14 && op != 10) break;   /* capabilities come first */
+        i += count;
+    }
+    return 0;
+}
+
 /* One stage of the round trip. `upstream` hashes the SPIR-V of every earlier
  * stage (input locations follow their outputs' names); `is_last` marks the
  * stage that carries the clip-space fixup. Both are part of the cache key: the
@@ -357,7 +371,8 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
 
     spvc_compiler_options opts = NULL;
     spvc_compiler_create_compiler_options(c, &opts);
-    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_GLSL_VERSION, 450);
+    /* rayQueryEXT needs GLSL 460 (SPIRV-Cross refuses it below). */
+    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_GLSL_VERSION, vk3d_uses_ray_query(spirv, spirv_bytes) ? 460 : 450);
     spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_GLSL_ES, SPVC_FALSE);
     spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_GLSL_VULKAN_SEMANTICS, SPVC_TRUE);
     spvc_compiler_install_compiler_options(c, opts);

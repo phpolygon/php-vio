@@ -5961,6 +5961,59 @@ static void d3d12_compute_wait(void)
     d3d12_restore_graphics_state_after_compute();
 }
 
+/* After a kernel / ray tracing launch on `list`: UAV barrier on a STORAGE
+ * buffer (UNORDERED_ACCESS by promotion), then copy it into its lazily created
+ * READBACK staging buffer, so a later vio_storage_buffer_read just maps it. */
+static void d3d12_buffer_to_readback(ID3D12GraphicsCommandList *list, vio_d3d12_buffer *buf)
+{
+    if (!buf || !buf->resource) return;
+
+    D3D12_RESOURCE_BARRIER uavb = {0};
+    uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavb.UAV.pResource = buf->resource;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &uavb);
+
+    /* Lazily (re)create a READBACK staging buffer sized to the output. */
+    if (!buf->readback_resource || buf->readback_size < buf->size) {
+        if (buf->readback_resource) { ID3D12Resource_Release(buf->readback_resource); buf->readback_resource = NULL; }
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = buf->size;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT rhr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp,
+            D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void **)&buf->readback_resource);
+        if (FAILED(rhr)) {
+            php_error_docref(NULL, E_WARNING, "D3D12: compute readback buffer create failed (0x%08lx)", rhr);
+            buf->readback_resource = NULL;
+            return;
+        }
+    }
+    buf->readback_size = buf->size;
+
+    /* STORAGE buffers live in UNORDERED_ACCESS; transition -> COPY_SOURCE,
+     * copy the whole buffer, then transition back so a subsequent dispatch
+     * (or another read) finds it in its declared UAV state again. */
+    D3D12_RESOURCE_BARRIER tb = {0};
+    tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    tb.Transition.pResource = buf->resource;
+    tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    tb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
+
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, buf->readback_resource, 0,
+                                               buf->resource, 0, buf->size);
+
+    tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
+}
+
 static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
 {
     if (!cmd) return;
@@ -6174,55 +6227,7 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     /* UAV barrier (ensure all writes complete) + transition each UAV output to
      * COPY_SOURCE and copy into its READBACK staging buffer, so a later
      * vio_storage_buffer_read just Maps the staging without re-running the GPU. */
-    for (int i = 0; i < cp->uav_count; i++) {
-        vio_d3d12_buffer *buf = cp->uavs[i].buffer;
-        if (!buf || !buf->resource) continue;
-
-        D3D12_RESOURCE_BARRIER uavb = {0};
-        uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        uavb.UAV.pResource = buf->resource;
-        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &uavb);
-
-        /* Lazily (re)create a READBACK staging buffer sized to the output. */
-        if (!buf->readback_resource || buf->readback_size < buf->size) {
-            if (buf->readback_resource) { ID3D12Resource_Release(buf->readback_resource); buf->readback_resource = NULL; }
-            D3D12_HEAP_PROPERTIES hp = {0};
-            hp.Type = D3D12_HEAP_TYPE_READBACK;
-            D3D12_RESOURCE_DESC rd = {0};
-            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            rd.Width = buf->size;
-            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-            rd.SampleDesc.Count = 1;
-            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            HRESULT rhr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp,
-                D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                &IID_ID3D12Resource, (void **)&buf->readback_resource);
-            if (FAILED(rhr)) {
-                php_error_docref(NULL, E_WARNING, "D3D12: compute readback buffer create failed (0x%08lx)", rhr);
-                buf->readback_resource = NULL;
-                continue;
-            }
-        }
-        buf->readback_size = buf->size;
-
-        /* STORAGE buffers live in UNORDERED_ACCESS; transition -> COPY_SOURCE,
-         * copy the whole buffer, then transition back so a subsequent dispatch
-         * (or another read) finds it in its declared UAV state again. */
-        D3D12_RESOURCE_BARRIER tb = {0};
-        tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        tb.Transition.pResource = buf->resource;
-        tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
-
-        ID3D12GraphicsCommandList_CopyBufferRegion(list, buf->readback_resource, 0,
-                                                   buf->resource, 0, buf->size);
-
-        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
-    }
+    for (int i = 0; i < cp->uav_count; i++) d3d12_buffer_to_readback(list, cp->uavs[i].buffer);
 
     if (in_frame_async) {
         /* Stay on the frame list: put the graphics state back for the draws
@@ -6269,6 +6274,218 @@ static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
     D3D12_RANGE no_write = {0, 0};
     ID3D12Resource_Unmap(buf->readback_resource, 0, &no_write);
     return n;
+}
+
+/* ── Ray tracing pipeline (VIO_FEATURE_RAYTRACING) ──────────────────
+ * DXR 1.0 state object from one DXC library (lib_6_x) with the exports
+ * vio_raygen, vio_miss, vio_closest_hit and optional vio_any_hit (one triangle
+ * hit group "vio_hit_group"). Global root signature: [0] root SRV t0 (the bound
+ * top level), [1 + n] root UAV u<n> for n = 0..VIO_D3D12_RT_UAVS-1 (the buffers of
+ * vio_rt_bind_buffer). The shader table holds one record per group in an
+ * upload buffer, each table 64-byte aligned. vio_trace_rays records into its
+ * own list and waits, like the acceleration structure build. */
+#define VIO_D3D12_RT_UAVS 16
+
+typedef struct _vio_d3d12_rtp {
+    ID3D12StateObject   *state;
+    ID3D12RootSignature *root_sig;
+    ID3D12Resource      *table;     /* raygen | miss | hit group, 64 bytes apart */
+} vio_d3d12_rtp;
+
+static void d3d12_rtp_free(vio_d3d12_rtp *p)
+{
+    if (!p) return;
+    if (p->table) ID3D12Resource_Release(p->table);
+    if (p->state) ID3D12StateObject_Release(p->state);
+    if (p->root_sig) ID3D12RootSignature_Release(p->root_sig);
+    free(p);
+}
+
+static void *d3d12_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
+{
+    if (!desc || !vio_d3d12.device) return NULL;
+    if (!desc->hlsl || !desc->hlsl[0]) {
+        php_error_docref(NULL, E_WARNING, "D3D12: vio_rt_pipeline needs 'hlsl' (a DXR library with vio_raygen, vio_miss, "
+                         "vio_closest_hit%s)", desc->spirv[VIO_RT_STAGE_ANY_HIT] ? ", vio_any_hit" : "");
+        return NULL;
+    }
+    ID3D12Device5 *dev5 = NULL;
+    if (FAILED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device5, (void **)&dev5)) || !dev5) return NULL;
+    vio_d3d12_rtp *p = calloc(1, sizeof(vio_d3d12_rtp));
+    void *dxil = NULL;
+    size_t dxil_len = 0;
+    char *err = NULL;
+    ID3DBlob *sig = NULL, *sig_err = NULL;
+    ID3D12StateObjectProperties *props = NULL;
+    if (!p) goto fail;
+
+    char profile[16];
+    int minor = vio_d3d12.shader_model_version % 10;
+    snprintf(profile, sizeof(profile), "lib_6_%d", minor < 3 ? 3 : minor);
+    if (vio_dxc_compile(desc->hlsl, NULL, profile, 0, vio_d3d12.native16, &dxil, &dxil_len, &err) != 0 || !dxil) {
+        php_error_docref(NULL, E_WARNING, "D3D12: ray tracing library (%s): %s", profile, err ? err : "compile failed");
+        goto fail;
+    }
+
+    D3D12_ROOT_PARAMETER rp[1 + VIO_D3D12_RT_UAVS];
+    memset(rp, 0, sizeof(rp));
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rp[0].Descriptor.ShaderRegister = 0;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    for (int i = 0; i < VIO_D3D12_RT_UAVS; i++) {
+        rp[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        rp[1 + i].Descriptor.ShaderRegister = (UINT)i;
+        rp[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rs = {0};
+    rs.NumParameters = 1 + VIO_D3D12_RT_UAVS;
+    rs.pParameters = rp;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &sig_err)) || !sig) goto fail;
+    if (FAILED(ID3D12Device_CreateRootSignature(vio_d3d12.device, 0, ID3D10Blob_GetBufferPointer(sig),
+                                                ID3D10Blob_GetBufferSize(sig), &IID_ID3D12RootSignature,
+                                                (void **)&p->root_sig))) goto fail;
+
+    D3D12_DXIL_LIBRARY_DESC lib = {0};
+    lib.DXILLibrary.pShaderBytecode = dxil;
+    lib.DXILLibrary.BytecodeLength = dxil_len;   /* no export list: every export */
+    D3D12_HIT_GROUP_DESC hg = {0};
+    hg.HitGroupExport = L"vio_hit_group";
+    hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+    hg.ClosestHitShaderImport = L"vio_closest_hit";
+    hg.AnyHitShaderImport = desc->spirv[VIO_RT_STAGE_ANY_HIT] ? L"vio_any_hit" : NULL;
+    D3D12_RAYTRACING_SHADER_CONFIG sc = {0};
+    sc.MaxPayloadSizeInBytes = (UINT)desc->payload_size;
+    sc.MaxAttributeSizeInBytes = D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES;
+    D3D12_GLOBAL_ROOT_SIGNATURE grs = {0};
+    grs.pGlobalRootSignature = p->root_sig;
+    D3D12_RAYTRACING_PIPELINE_CONFIG pc = {0};
+    pc.MaxTraceRecursionDepth = (UINT)desc->max_recursion;
+    D3D12_STATE_SUBOBJECT sub[5];
+    sub[0].Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;           sub[0].pDesc = &lib;
+    sub[1].Type = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;              sub[1].pDesc = &hg;
+    sub[2].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG; sub[2].pDesc = &sc;
+    sub[3].Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;  sub[3].pDesc = &grs;
+    sub[4].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG; sub[4].pDesc = &pc;
+    D3D12_STATE_OBJECT_DESC so = {0};
+    so.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+    so.NumSubobjects = 5;
+    so.pSubobjects = sub;
+    HRESULT hr = ID3D12Device5_CreateStateObject(dev5, &so, &IID_ID3D12StateObject, (void **)&p->state);
+    if (FAILED(hr) || !p->state) {
+        php_error_docref(NULL, E_WARNING, "D3D12: CreateStateObject failed (0x%08lx): the library needs the exports "
+                         "vio_raygen, vio_miss, vio_closest_hit%s and resources only at t0 / u0..u%d",
+                         hr, desc->spirv[VIO_RT_STAGE_ANY_HIT] ? ", vio_any_hit" : "", VIO_D3D12_RT_UAVS - 1);
+        d3d12_drain_info_queue("create_rt_pipeline");
+        goto fail;
+    }
+    if (FAILED(ID3D12StateObject_QueryInterface(p->state, &IID_ID3D12StateObjectProperties, (void **)&props))) goto fail;
+
+    static const WCHAR *exports[3] = { L"vio_raygen", L"vio_miss", L"vio_hit_group" };
+    p->table = d3d12_as_buffer(3 * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, D3D12_HEAP_TYPE_UPLOAD,
+                               D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    unsigned char *map = NULL;
+    D3D12_RANGE none = { 0, 0 };
+    if (!p->table || FAILED(ID3D12Resource_Map(p->table, 0, &none, (void **)&map)) || !map) goto fail;
+    for (int g = 0; g < 3; g++) {
+        void *id = ID3D12StateObjectProperties_GetShaderIdentifier(props, exports[g]);
+        if (!id) {
+            ID3D12Resource_Unmap(p->table, 0, NULL);
+            goto fail;
+        }
+        memcpy(map + (size_t)g * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+    }
+    ID3D12Resource_Unmap(p->table, 0, NULL);
+
+    ID3D12StateObjectProperties_Release(props);
+    ID3D10Blob_Release(sig);
+    free(dxil);
+    free(err);
+    ID3D12Device5_Release(dev5);
+    return p;
+
+fail:
+    if (sig_err) {
+        php_error_docref(NULL, E_WARNING, "D3D12: ray tracing root signature: %s", (const char *)ID3D10Blob_GetBufferPointer(sig_err));
+        ID3D10Blob_Release(sig_err);
+    }
+    if (props) ID3D12StateObjectProperties_Release(props);
+    if (sig) ID3D10Blob_Release(sig);
+    free(dxil);
+    free(err);
+    d3d12_rtp_free(p);
+    ID3D12Device5_Release(dev5);
+    return NULL;
+}
+
+static void d3d12_destroy_rt_pipeline(void *ptr)
+{
+    d3d12_rtp_free((vio_d3d12_rtp *)ptr);   /* traces wait for the GPU: nothing in flight */
+}
+
+static int d3d12_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int count, int w, int h, int d)
+{
+    vio_d3d12_rtp *p = (vio_d3d12_rtp *)ptr;
+    if (!p || !p->state || !vio_d3d12.device || vio_d3d12.in_frame) return -1;
+    if (!d3d12_bound_as || !d3d12_bound_as->tlas) {
+        php_error_docref(NULL, E_WARNING, "vio_trace_rays: no acceleration structure bound (vio_bind_acceleration_structure)");
+        return -1;
+    }
+    for (int i = 0; i < count; i++) {
+        if (buffers[i].binding >= VIO_D3D12_RT_UAVS) {
+            php_error_docref(NULL, E_WARNING, "vio_trace_rays: D3D12 takes buffers at u0..u%d (binding %d)",
+                             VIO_D3D12_RT_UAVS - 1, buffers[i].binding);
+            return -1;
+        }
+    }
+    d3d12_compute_wait();
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    ID3D12GraphicsCommandList4 *list4 = NULL;
+    int rc = -1;
+    if (FAILED(ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   &IID_ID3D12CommandAllocator, (void **)&alloc))) goto done;
+    if (FAILED(ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                              &IID_ID3D12GraphicsCommandList, (void **)&list))) goto done;
+    if (FAILED(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList4, (void **)&list4))) goto done;
+
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, p->root_sig);
+    ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(list, 0, ID3D12Resource_GetGPUVirtualAddress(d3d12_bound_as->tlas));
+    for (int i = 0; i < count; i++) {
+        vio_d3d12_buffer *buf = (vio_d3d12_buffer *)buffers[i].backend_buffer;
+        if (!buf || !buf->resource) continue;
+        ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, (UINT)(1 + buffers[i].binding),
+                                                                   ID3D12Resource_GetGPUVirtualAddress(buf->resource));
+    }
+    ID3D12GraphicsCommandList4_SetPipelineState1(list4, p->state);
+    D3D12_GPU_VIRTUAL_ADDRESS t = ID3D12Resource_GetGPUVirtualAddress(p->table);
+    D3D12_DISPATCH_RAYS_DESC dr;
+    memset(&dr, 0, sizeof(dr));
+    dr.RayGenerationShaderRecord.StartAddress = t;
+    dr.RayGenerationShaderRecord.SizeInBytes = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+    dr.MissShaderTable.StartAddress = t + D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT;
+    dr.MissShaderTable.SizeInBytes = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+    dr.MissShaderTable.StrideInBytes = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+    dr.HitGroupTable.StartAddress = t + 2 * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT;
+    dr.HitGroupTable.SizeInBytes = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+    dr.HitGroupTable.StrideInBytes = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+    dr.Width = (UINT)w;
+    dr.Height = (UINT)h;
+    dr.Depth = (UINT)d;
+    ID3D12GraphicsCommandList4_DispatchRays(list4, &dr);
+    for (int i = 0; i < count; i++) d3d12_buffer_to_readback(list, (vio_d3d12_buffer *)buffers[i].backend_buffer);
+    if (FAILED(ID3D12GraphicsCommandList_Close(list))) goto done;
+    {
+        ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        vio_d3d12_wait_for_gpu();
+    }
+    d3d12_drain_info_queue("trace_rays");
+    rc = 0;
+done:
+    if (list4) ID3D12GraphicsCommandList4_Release(list4);
+    if (list) ID3D12GraphicsCommandList_Release(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    return rc;
 }
 
 /* ── Feature Query ────────────────────────────────────────────────── */
@@ -6373,7 +6590,8 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_BINDLESS:     return vio_d3d12.bindless;
         case VIO_FEATURE_ATOMIC64:     return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 66 && vio_d3d12.int64_ops;
         case VIO_FEATURE_BARYCENTRICS: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 61 && vio_d3d12.barycentrics;
-        case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
+        case VIO_FEATURE_RAYTRACING:   return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 63
+                                              && vio_d3d12.raytracing_tier >= D3D12_RAYTRACING_TIER_1_0; /* DXR 1.0 state objects, lib_6_3 */
         case VIO_FEATURE_3D_PIPELINE:  return 1;
         case VIO_FEATURE_READ_PIXELS:  return 1;
         case VIO_FEATURE_INSTANCED_DRAW: return 1;
@@ -6933,6 +7151,9 @@ static const vio_backend d3d12_backend = {
     .create_acceleration_structure  = d3d12_create_acceleration_structure,
     .destroy_acceleration_structure = d3d12_destroy_acceleration_structure,
     .bind_acceleration_structure    = d3d12_bind_acceleration_structure,
+    .create_rt_pipeline             = d3d12_create_rt_pipeline,
+    .destroy_rt_pipeline            = d3d12_destroy_rt_pipeline,
+    .trace_rays                     = d3d12_trace_rays,
 };
 
 void vio_backend_d3d12_register(void)

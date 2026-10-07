@@ -163,10 +163,24 @@ Metal auf dem M5 ausgeführt (ab MSL 2.4); D3D12 per mingw + DXC geprüft, Vulka
 - OpenGL: 0.
 - Hardware: RTX 20+, RX 6000+, Arc, Apple M3+ (Apple ab M1 per Compute langsamer).
 
-**6b Raytracing-Pipeline (Raygen/Hit/Miss)** — SPIRV-Cross übersetzt `traceRayEXT` nicht (geprüft, MSL),
-HLSL-seitig ebenso nicht verlässlich ⇒ HLSL-/MSL-Quellen je Backend (wie der Stage-Override), D3D12
-State Objects + Shader Tables, Vulkan RT-Pipeline aus GLSL, Metal Intersection Functions + Visible
-Function Tables. Erst nach 6a und nur mit konkretem Bedarf (Path Tracing).
+**6b Raytracing-Pipeline (Raygen/Hit/Miss) ✅ (2026-10-07, `VIO_FEATURE_RAYTRACING`, Test 164)** — umgesetzt als
+`vio_rt_pipeline($ctx, ['raygen', 'miss', 'closest_hit', 'any_hit'?, 'max_recursion' = 1, 'payload_size' = 32, 'hlsl'?])`
+(Klasse `VioRtPipeline`), `vio_rt_bind_buffer($ctx, $p, $storageBuffer, $binding)` und
+`vio_trace_rays($ctx, $p, $w, $h, $d = 1)` (synchron, außerhalb eines Frames) gegen die per
+`vio_bind_acceleration_structure` gebundene Struktur. Eine Raygen-, eine Miss- und eine Dreiecks-Hit-Gruppe.
+`VIO_FEATURE_RAYTRACING` bleibt der Name (kein neues `RAYTRACING_PIPELINE`, 074 pinnt die 0 auf null).
+- Vulkan: `VK_KHR_ray_tracing_pipeline` auf dem Ray-Query-Satz, die GLSL-Stages gehen nativ als SPIR-V 1.4
+  (glslang Vulkan 1.2) in die Pipeline, Set 0 aus den Bindings der Stages (`vk_rt_scan`: Acceleration
+  Structures + Storage-Buffer), SBT in einem host-sichtbaren Buffer. **Auf lavapipe ausgeführt** (Mesa 25.0,
+  Debian trixie, Docker) — dort lief auch 163 auf Vulkan erstmals, nach zwei Korrekturen am 6a-Pfad
+  (GLSL 460 für die Vulkan-Rundreise von `rayQueryEXT`, SPIR-V 1.4 für `GL_EXT_ray_query`-Quellen).
+- D3D12: DXR 1.0 State Object (SM ≥ 6.3, Tier ≥ 1.0) aus der `'hlsl'`-Bibliothek (DXC `lib_6_x`, ohne `-E`),
+  Exports `vio_raygen`, `vio_miss`, `vio_closest_hit`, `vio_any_hit`; globale Root-Signatur TLAS `t0` +
+  Root-UAVs `u0..u15`; nur per mingw + DXC geprüft.
+- Metal: 0 — keine Raygen-/Hit-Stages, SPIRV-Cross übersetzt `traceRayEXT` nicht nach MSL; eine
+  Abbildung auf Intersection Functions + Visible Function Tables bräuchte eigene MSL-Quellen je Stage.
+- Offen: mehrere Miss-/Hit-Gruppen, Callable-Shader, Shader-Record-Daten, Texturen/UBOs in RT-Stages,
+  Trace im Frame.
 
 **6c SM 6.9 Shader Execution Reordering + Opacity Micromaps** — nur D3D12 (Agility SDK + DXC ≥ 1.9,
 Phase 0d) und Vulkan (`VK_EXT_ray_tracing_invocation_reorder`, `VK_EXT_opacity_micromap`); Metal hat

@@ -391,6 +391,40 @@ function vio_acceleration_structure(VioContext $context, array $instances): VioA
 function vio_bind_acceleration_structure(VioContext $context, VioAccelerationStructure $accelerationStructure, int $binding): void {}
 
 /**
+ * Ray tracing pipeline (VIO_FEATURE_RAYTRACING): one raygen shader, one miss
+ * shader and one triangle hit group (closest hit + optional any hit).
+ * $desc keys: 'raygen', 'miss', 'closest_hit' (GLSL, GL_EXT_ray_tracing,
+ * required), 'any_hit' (GLSL, optional), 'max_recursion' (int, default 1),
+ * 'payload_size' (bytes, default 32, D3D12 only), 'hlsl' (string, D3D12).
+ * Vulkan (VK_KHR_ray_tracing_pipeline) compiles the GLSL stages. D3D12 (DXR 1.0,
+ * needs vio_create(['shader_model' => 6])) compiles 'hlsl' as one DXC library
+ * (lib_6_3) with the exports vio_raygen, vio_miss, vio_closest_hit and, when
+ * 'any_hit' is given, vio_any_hit; the payload struct is the library's own,
+ * at most 'payload_size' bytes. HLSL contract: the bound acceleration
+ * structure is RaytracingAccelerationStructure at t0, a buffer bound with
+ * vio_rt_bind_buffer(..., $binding) is RWStructuredBuffer / RWByteAddressBuffer
+ * at u<$binding>; no other resources. GLSL: the accelerationStructureEXT and
+ * the std430 buffers at their bindings (set 0). False + warning where the
+ * feature is 0 or a stage does not compile.
+ */
+function vio_rt_pipeline(VioContext $context, array $desc): VioRtPipeline|false {}
+
+/**
+ * Bind a storage buffer (vio_storage_buffer) at $binding (0..15, up to 8 per
+ * pipeline) for the following vio_trace_rays of $pipeline. Read the result
+ * with vio_storage_buffer_read().
+ */
+function vio_rt_bind_buffer(VioContext $context, VioRtPipeline $pipeline, VioBuffer $buffer, int $binding): void {}
+
+/**
+ * Launch $width * $height * $depth raygen invocations (gl_LaunchIDEXT /
+ * DispatchRaysIndex) against the acceleration structure bound with
+ * vio_bind_acceleration_structure(). Synchronous: the buffers are complete on
+ * return. Outside vio_begin / vio_end.
+ */
+function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width, int $height, int $depth = 1): void {}
+
+/**
  * Slot of $texture in the context's bindless texture table (VIO_FEATURE_BINDLESS,
  * BINDLESS-PLAN.md). Shaders read the table as
  *   layout(set = 1, binding = 0) uniform texture2D vio_textures[];

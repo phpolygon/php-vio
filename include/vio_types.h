@@ -171,7 +171,7 @@ typedef enum _vio_uniform_type {
 
 typedef enum _vio_feature {
     VIO_FEATURE_COMPUTE      = 0,
-    VIO_FEATURE_RAYTRACING   = 1,
+    VIO_FEATURE_RAYTRACING   = 1,   /* vio_rt_pipeline / vio_trace_rays (D3D12 DXR 1.0, Vulkan VK_KHR_ray_tracing_pipeline) */
     VIO_FEATURE_TESSELLATION = 2,
     VIO_FEATURE_GEOMETRY     = 3,
     /* vio_shader(['view_count' => 2..4]) + a layered target bound with
@@ -353,7 +353,7 @@ typedef enum _vio_feature {
      * (rayQueryEXT) in the fragment and compute stages. D3D12: DXR Tier 1.1 +
      * SM 6.5 (RayQuery); Vulkan: VK_KHR_acceleration_structure + VK_KHR_ray_query;
      * Metal: ray queries from render pipelines (MSL 2.4). The ray-tracing
-     * PIPELINE (raygen / hit shaders) is VIO_FEATURE_RAYTRACING, still 0. */
+     * PIPELINE (raygen / hit shaders) is VIO_FEATURE_RAYTRACING. */
     VIO_FEATURE_RAY_QUERY          = 56,
 } vio_feature;
 
@@ -483,6 +483,34 @@ typedef struct _vio_as_desc {
     const vio_as_instance *instances;
     int                    instance_count;
 } vio_as_desc;
+
+/* vio_rt_pipeline() (VIO_FEATURE_RAYTRACING): the ray tracing stages as
+ * SPIR-V (GL_EXT_ray_tracing, Vulkan) and/or an HLSL library (D3D12, DXR 1.0:
+ * exports vio_raygen / vio_miss / vio_closest_hit / vio_any_hit). One raygen,
+ * one miss shader, one triangle hit group (closest hit + optional any hit). */
+typedef enum {
+    VIO_RT_STAGE_RAYGEN      = 0,
+    VIO_RT_STAGE_MISS        = 1,
+    VIO_RT_STAGE_CLOSEST_HIT = 2,
+    VIO_RT_STAGE_ANY_HIT     = 3,
+    VIO_RT_STAGE_COUNT       = 4
+} vio_rt_stage;
+
+typedef struct _vio_rt_pipeline_desc {
+    const uint32_t *spirv[VIO_RT_STAGE_COUNT];      /* NULL: stage absent (any hit) */
+    size_t          spirv_size[VIO_RT_STAGE_COUNT]; /* bytes */
+    const char     *hlsl;                           /* D3D12 library source, NULL when not given */
+    int             max_recursion;                  /* >= 1 */
+    int             payload_size;                   /* bytes, D3D12 shader config */
+} vio_rt_pipeline_desc;
+
+/* A storage buffer bound for vio_trace_rays (vio_rt_bind_buffer). */
+typedef struct _vio_rt_buffer_binding {
+    void *backend_buffer;          /* create_storage_buffer handle */
+    int   binding;                 /* GLSL binding / HLSL u register */
+} vio_rt_buffer_binding;
+
+#define VIO_RT_MAX_BUFFERS 8
 
 /* ── Descriptor structs ───────────────────────────────────────────── */
 

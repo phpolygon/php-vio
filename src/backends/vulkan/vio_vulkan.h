@@ -289,6 +289,12 @@ typedef struct _vio_vulkan_state {
                             *fn_get_as_address, *fn_get_buffer_address;
     uint64_t                 bound_accel;
     int                      bound_accel_binding;
+    /* Ray tracing pipeline (VIO_FEATURE_RAYTRACING): VK_KHR_ray_tracing_pipeline
+     * enabled on top of the ray query set, its entry points and the shader
+     * group handle layout of the device. */
+    int                      rt_pipeline_supported;
+    void                    *fn_create_rt_pipelines, *fn_get_rt_group_handles, *fn_cmd_trace_rays;
+    uint32_t                 rt_handle_size, rt_handle_alignment, rt_base_alignment, rt_max_recursion;
     /* Bindless table (vio_texture_index, BINDLESS-PLAN.md): descriptor indexing
      * enabled; one global Set 1 (1024 sampled images, partially bound, update
      * after bind, + an immutable linear / repeat sampler), created lazily. */

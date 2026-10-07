@@ -4,7 +4,7 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.8.0**, 140 PHP-Funktionen, 14 Zend-Klassen,
+für die PHPolygon Game Engine. Aktuell **v2.8.0**, 143 PHP-Funktionen, 15 Zend-Klassen,
 6 Backends, 98 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
@@ -96,7 +96,8 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 |---|---|
 | `tests/render3d/160` | Shading-Rate-Bild (`VIO_FEATURE_SHADING_RATE_IMAGE`, `vio_set_shading_rate_image`, `vio_shading_rate_tile_size`): 2X2-Kacheln links, 1X1 rechts → links grob, rechts fein; Bild klebt über Frames, `null` löscht; falsche Byte-Zahl / Rate 99 → `false`; ohne Feature Kachelgröße 0 und `false`. Nur D3D12 (Tier 2) — in der CI nicht ausführbar (WARP-Tier unbekannt, Diagnose druckt `shading_rate_image`). |
 | `tests/render3d/161` | Bindless-Texturtabelle (`VIO_FEATURE_BINDLESS`, `vio_texture_index()`, BINDLESS-PLAN.md): 64 einfarbige Texturen, ein Draw mit 64 Quads, Slot als Vertex-Attribut → nicht-uniformer Index in `vio_textures[]` (Set 1) im Fragment-Shader; Slot stabil und eindeutig, die Tabelle hält die Texturen am Leben (PHP-Variablen vor dem Draw verworfen); ohne Flag `false`. Liest ein Render-Target (MoltenVK-Swapchain-Readback auf Retina ist nicht exakt). |
-| `tests/render3d/163` | Inline-Raytracing (`VIO_FEATURE_RAY_QUERY`): `vio_acceleration_structure` (BLAS je Mesh, TLAS über Instanzen mit Transform) + `vio_bind_acceleration_structure`; `rayQueryEXT` im Fragment-Shader (Verdecker links / per Transform rechts / beide) und im Compute-Shader (4 Strahlen → 1 1 0 0); ohne Flag liefert `vio_acceleration_structure` `false`. Metal ab MSL 2.4 (M5: ausgeführt), D3D12 DXR 1.1 + SM 6.5, Vulkan `VK_KHR_ray_query`. |
+| `tests/render3d/163` | Inline-Raytracing (`VIO_FEATURE_RAY_QUERY`): `vio_acceleration_structure` (BLAS je Mesh, TLAS über Instanzen mit Transform) + `vio_bind_acceleration_structure`; `rayQueryEXT` im Fragment-Shader (Verdecker links / per Transform rechts / beide) und im Compute-Shader (4 Strahlen → 1 1 0 0); ohne Flag liefert `vio_acceleration_structure` `false`. Metal ab MSL 2.4 (M5: ausgeführt), D3D12 DXR 1.1 + SM 6.5, Vulkan `VK_KHR_ray_query` (lavapipe: ausgeführt; die Vulkan-Rundreise übersetzt `rayQueryEXT` mit GLSL 460). |
+| `tests/render3d/164` | Raytracing-Pipeline (`VIO_FEATURE_RAYTRACING`): `vio_rt_pipeline` (Raygen / Miss / Closest-Hit, optional Any-Hit) gegen `vio_acceleration_structure`; `vio_trace_rays` (16×4, auch Tiefe 2) schreibt je Strahl den Payload über `vio_rt_bind_buffer` in einen Storage-Buffer: Treffer 100 + 10·`gl_HitTEXT` = 105 links, Miss 0 rechts, per Transform gespiegelt, Any-Hit mit `ignoreIntersectionEXT` + erzwungen nicht-opak → alles 0; ohne Flag `false`. Vulkan (GLSL `GL_EXT_ray_tracing`) auf lavapipe (Mesa 25.0, Debian trixie) ausgeführt, D3D12 (DXR 1.0, HLSL-Bibliothek `lib_6_3`) nur per DXC + mingw geprüft, Metal 0. `VIO_REQUIRE_RAYTRACING`. |
 | `tests/render3d/159` | Shading-Rate pro Primitiv (`VIO_FEATURE_SHADING_RATE_PRIMITIVE`): Vertex-Stage schreibt `gl_PrimitiveShadingRateEXT` (2×2 = 5, auf Vulkan und D3D12 gleich kodiert) und überschreibt `vio_set_shading_rate`; Pipelines ohne den Write behalten die gesetzte Rate. **Nirgends ausführbar** (lavapipe ohne VRS, WARP nur SM 6.2, MoltenVK/Metal ohne VRS) — D3D12-HLSL nur per DXC geprüft. |
 | `tests/render3d/158` | Multiview (`VIO_FEATURE_MULTIVIEW`, `vio_shader(['view_count' => N])`): ein Draw rendert jede View in Layer `gl_ViewIndex` eines mit `VIO_RT_ALL_LAYERS` gebundenen Layered-RTs — Fragment- und Vertex-Arbeit je View, Instancing (Instanz-Attribute stepen je Instanz, nicht je (Instanz, View)), 4 Views, indirekter Draw, Optionsvertrag (2..4, ohne Flag abgelehnt). CI-Pflicht auf allen vier Backends: OpenGL (llvmpipe, `GL_OVR_multiview2`), Vulkan (lavapipe), D3D12 (WARP, SM 6.2), Metal (macOS-Runner). |
 | `tests/render3d/155` | 16-Bit-Floats (`VIO_FEATURE_SHADER_FLOAT16`): `float16_t` zur Laufzeit gerundet (2049 → 2048, 0.1 → 0.0999755859375) — beweist echte halbe Genauigkeit (HLSL `min16float` wäre nur ein Hinweis). |
@@ -220,6 +221,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | VRS-Bild (`vio_set_shading_rate_image`, `VIO_FEATURE_SHADING_RATE_IMAGE`) | ❌ | ❌ | ✅ (Tier 2: R8_UINT-Textur in `SHADING_RATE_SOURCE`, `RSSetShadingRateImage`, Combiner MAX; nach jedem Listen-Reset neu gesetzt) | ❌ (bräuchte `vkCreateRenderPass2` + Fragment-Shading-Rate-Attachment in jedem Pass; kein Treiber in CI/lokal) | ❌ (Rasterization Rate Maps sind ein anderes Modell) |
 | Bindless-Texturtabelle (`vio_texture_index`, `texture2D vio_textures[]` + `sampler vio_sampler` in Set 1, `VIO_FEATURE_BINDLESS`) | ❌ (GL-GLSL hat keine getrennten Texturen; `ARB_bindless_texture` nicht gewired) | ❌ | ✅ (Resource Binding Tier 2+: Root-Parameter [15] unbegrenzter SRV-Bereich `t0, space1`, statischer Sampler `s1, space1`, 1024 reservierte Deskriptoren oben im shader-sichtbaren SRV-Heap; FXC 5.1 und DXC) | ✅ (`VK_EXT_descriptor_indexing`: globales Set 1, 1024 Sampled Images `PARTIALLY_BOUND` + `UPDATE_AFTER_BIND`, unveränderlicher Sampler) | ✅ (SPIRV-Cross-Argument-Buffer nur für Set 1, `device`-Adressraum, `gpuResourceID`s auf `[[buffer(21)]]`, `useResources` je Draw, `constexpr`-Sampler; Cap `bindless`: Metal3 + Tier 2 + MSL 3.0) |
 | Ray Query (`vio_acceleration_structure`, `rayQueryEXT`, `VIO_FEATURE_RAY_QUERY`) | ❌ | ❌ | ✅ (DXR Tier 1.1 + SM 6.5 `RayQuery<>`; TLAS als Root-SRV `t0, space9` — Grafik-Root-Parameter [14], Compute-Parameter [3]; Bau synchron über `ID3D12GraphicsCommandList4`) | ✅ (`VK_KHR_acceleration_structure` + `VK_KHR_ray_query` + Abhängigkeiten als Extensions auf der 1.1-Instanz; Binding 33 im 3D-Set, Compute an der GLSL-Binding; Bau im Transient-Command-Buffer) | ✅ (`MTLPrimitive`/`MTLInstanceAccelerationStructureDescriptor`, `set*AccelerationStructure` + `useResource` der BLAS; MSL 2.4) |
+| Raytracing-Pipeline (`vio_rt_pipeline`, `vio_rt_bind_buffer`, `vio_trace_rays`, `VIO_FEATURE_RAYTRACING`) | ❌ | ❌ | ✅ (DXR 1.0 State Object, SM ≥ 6.3 + Tier 1.0; `'hlsl'`-Bibliothek per DXC `lib_6_x` mit den Exports `vio_raygen`, `vio_miss`, `vio_closest_hit`, `vio_any_hit`; globale Root-Signatur: TLAS Root-SRV `t0`, Buffer Root-UAV `u0..u15`; Shader-Tabelle im Upload-Heap, `DispatchRays` auf eigener Liste + Readback-Kopie) | ✅ (`VK_KHR_ray_tracing_pipeline` auf dem Ray-Query-Satz; GLSL-Stages nativ als SPIR-V 1.4, Set 0 aus den Bindings der Stages (Acceleration Structures + Storage-Buffer), SBT in einem host-sichtbaren Buffer, `vkCmdTraceRaysKHR` im Transient-Command-Buffer) | ❌ (keine Raygen-/Hit-Stages; SPIRV-Cross übersetzt `traceRayEXT` nicht nach MSL) |
 | Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model' / 'shader_model_version']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Profil = höchstes 6.x, das Device **und** DXC/dxil.dll können; SPIRV-Cross übersetzt auf dasselbe Profil; Fallback FXC 5.1) | — | — |
 | Subgroups (`GL_KHR_shader_subgroup_*` in Compute + Fragment, `VIO_FEATURE_SUBGROUP`) | ✅ (`GL_KHR_shader_subgroup`, Stages/Features per `glGetIntegerv`; braucht Compute) | ❌ | ✅ (nur mit SM 6 + `OPTIONS1.WaveOps`: Wave-Intrinsics) | ✅ (`VkPhysicalDeviceSubgroupProperties`: Compute + Fragment, basic/vote/ballot/arithmetic/shuffle) | ✅ (`simd_group`: MSL 2.2, Mac2/Apple7) |
 | Quad-Ops im Fragment-Shader (`GL_KHR_shader_subgroup_quad`, `VIO_FEATURE_SUBGROUP_QUAD`) | ✅ (`GL_SUBGROUP_FEATURE_QUAD_BIT_KHR` + Fragment-Stage) | ❌ | ✅ (SM 6 + `WaveOps`, `QuadReadAcross*`) | ✅ (`VK_SUBGROUP_FEATURE_QUAD_BIT`) | ✅ (`quad_group`: MSL 2.1, Mac2/Apple4) |
@@ -478,7 +480,7 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   Command-Buffer jedes Frames beim Abschluss signalisiert; `vio_swapchain_info()` meldet beides.
 - Tests: `tests/backends/089_metal_3d_pipeline.phpt` (Pixel-Kontrakt), `088` läuft jetzt auch auf Metal.
 
-### Zend-Objekte (14 Klassen)
+### Zend-Objekte (15 Klassen)
 
 | Klasse | Header | Zweck |
 |--------|--------|-------|
@@ -492,6 +494,7 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
 | VioCubemap | src/vio_cubemap.h | 6-Face-Cubemap |
 | VioComputePipeline | src/vio_compute_pipeline.h | Compute-Shader + gebundene Storage-Buffer/Params |
 | VioAccelerationStructure | src/vio_acceleration_structure.h | Ray Query: BLAS je Mesh + TLAS über die Instanzen (`vio_acceleration_structure`) |
+| VioRtPipeline | src/vio_rt_pipeline.h | Raytracing-Pipeline: Raygen/Miss/Hit-Gruppe + Shader-Tabelle, gebundene Storage-Buffer (`vio_rt_pipeline`) |
 | VioFont | src/vio_font.h | TTF-Font (stb_truetype Atlas, glyph-index-keyed mit HarfBuzz) |
 | VioSound | src/vio_audio.h | Audio-Quelle (miniaudio) |
 | VioRecorder | src/vio_recorder.h | Video-Encoder (FFmpeg) |
@@ -505,7 +508,7 @@ Alle folgen dem gleichen Muster: `zend_object std` als letztes Feld, `Z_VIO_*_P(
 php_vio.c                   # Alle PHP-Funktionen (~9000 Zeilen, monolithisch)
 php_vio.h                   # Module-Globals (default_backend, debug, vsync)
 php_vio_arginfo.h           # Arginfo + Funktionstabelle (generiert aus vio.stub.php)
-vio.stub.php                # PHP-Stubs für IDE-Support (140 Funktionen)
+vio.stub.php                # PHP-Stubs für IDE-Support (143 Funktionen)
 config.m4 / config.w32      # Autotools- bzw. Windows-Build-Konfiguration
 configure.ac                # PHP-freier Autotools-Einstieg (CI-Permutationen)
 CMakeLists.txt              # IDE-Support (CLion/PhpStorm), kein Release-Build
@@ -587,7 +590,7 @@ Vendored (kein Homebrew): GLAD, stb_image/truetype/write/rect_pack, VMA,
 miniaudio, **SheenBidi** (BiDi, Apache-2.0, `vendor/sheenbidi/`, UNITY-Build via
 `-DSB_CONFIG_UNITY`).
 
-## PHP API (140 Funktionen)
+## PHP API (143 Funktionen)
 
 Vollständige Signaturen in `vio.stub.php`. Die Beispiele hier zeigen die Gruppen.
 
@@ -1052,7 +1055,8 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   signieren (`vio_dxc_highest_minor`, Probe-Compute-Shader). `d3d12_hlsl_target()` gibt SPIRV-Cross
   dasselbe Ziel (ab 60 Wave-Intrinsics, ab 62 templated `Load/Store<T>`), `d3d12_stage_supported`
   probt GS/HS/DS mit dem Compiler, der später kompiliert (DXC unter SM 6), Cache je Ziel. GLSL mit
-  `GL_KHR_shader_subgroup` kompiliert glslang gegen Vulkan 1.1 / SPIR-V 1.3, alles andere bleibt 1.0.
+  `GL_KHR_shader_subgroup` kompiliert glslang gegen Vulkan 1.1 / SPIR-V 1.3, `GL_EXT_ray_query` und die
+  Raytracing-Stages gegen Vulkan 1.2 / SPIR-V 1.4, alles andere bleibt 1.0.
 - `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
 - `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
 - **`METAL-GEOMETRY-PLAN.md` — ✅ umgesetzt (2026-10-05).** Geometry-Stage auf Metal per Compute-
