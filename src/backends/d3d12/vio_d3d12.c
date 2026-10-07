@@ -4326,6 +4326,10 @@ static const char *d3d12_profile(const char *profile, char *buf, size_t n)
 static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, const char *profile,
                                     UINT flags, ID3DBlob **out)
 {
+    /* The bindless table (root parameter VIO_D3D12_RP_BINDLESS) is an unbounded
+     * SRV range; FXC refuses those without this flag (X3596). DXC accepts them
+     * as is and ignores the D3DCOMPILE flags. Part of the cache key. */
+    flags |= D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
     /* Shader Model 6 (GAP-PHASE5 Block 7): the profile string becomes *_6_<minor>
      * and DXC produces DXIL; cached under "dxil" so FXC and DXC blobs never mix
      * (the profile, part of the key, keeps different minors apart). */
