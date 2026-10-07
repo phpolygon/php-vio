@@ -394,6 +394,25 @@ typedef struct _vio_backend {
      * NULL => the function reports false. */
     int   (*describe)(vio_backend_description *out);
 
+    /* Shading-rate image (VIO_FEATURE_SHADING_RATE_IMAGE): tiles_x * tiles_y
+     * VIO_SHADING_RATE_* bytes, row by row; rates == NULL clears the image.
+     * Sticky across frames like set_shading_rate. 0 on success, -1 otherwise. */
+    int   (*set_shading_rate_image)(const unsigned char *rates, int tiles_x, int tiles_y);
+    /* Edge of one image tile in pixels; 0 without the feature. */
+    int   (*shading_rate_tile_size)(void);
+    /* vio_texture_index() (VIO_FEATURE_BINDLESS): write `backend_texture`
+     * (create_texture's handle, 2D) into slot 0..VIO_BINDLESS_MAX-1 of the
+     * context's texture table that shaders read as Set 1 binding 0. The
+     * frontend owns slot allocation and keeps the texture alive. 0 = ok. */
+    int   (*bindless_set)(int slot, void *backend_texture);
+    /* Inline ray tracing (VIO_FEATURE_RAY_QUERY): build the bottom- and
+     * top-level structures of `desc` (returns the backend handle or NULL),
+     * free them (deferred while a frame may still use them), and bind one for
+     * the following draws and dispatches at the GLSL binding of the shader's
+     * accelerationStructureEXT (NULL unbinds). */
+    void *(*create_acceleration_structure)(const vio_as_desc *desc);
+    void  (*destroy_acceleration_structure)(void *as);
+    void  (*bind_acceleration_structure)(void *as, int binding);
     /* Mesh pipelines (VIO_FEATURE_MESH_SHADER): launch x * y * z task groups
      * (mesh groups without a task stage) with the bound mesh pipeline, or read
      * {x, y, z} uint32 records from a storage buffer. NULL => no mesh stages. */

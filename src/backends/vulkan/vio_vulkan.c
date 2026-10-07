@@ -49,6 +49,8 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug_callback(
 
 /* ── Helper: find memory type ────────────────────────────────────── */
 
+static void vulkan_release_acceleration_structures(void);   /* ray query, defined with the transient helpers */
+
 static uint32_t find_memory_type(uint32_t filter, VkMemoryPropertyFlags props)
 {
     VkPhysicalDeviceMemoryProperties mem_props;
@@ -261,9 +263,18 @@ static int create_logical_device(void)
     /* Device extensions: the swapchain, MoltenVK's portability subset, and
      * VK_KHR_fragment_shading_rate (+ its create_renderpass2 dependency) when the
      * device offers pipeline shading rates (Block 10c). */
-    const char *device_extensions[20];
+    const char *device_extensions[24];
     uint32_t device_ext_count = 0;
     device_extensions[device_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    /* Several features need the same extension (descriptor indexing: bindless
+     * and ray query); a name must appear once in the list. */
+#define VIO_VK_ADD_DEVICE_EXT(name) do { \
+        const char *vio_ext_ = (name); int vio_dup_ = 0; \
+        for (uint32_t vio_e_ = 0; vio_e_ < device_ext_count; vio_e_++) \
+            if (strcmp(device_extensions[vio_e_], vio_ext_) == 0) vio_dup_ = 1; \
+        if (!vio_dup_ && device_ext_count < (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) \
+            device_extensions[device_ext_count++] = vio_ext_; \
+    } while (0)
 
     uint32_t ext_count = 0;
     vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &ext_count, NULL);
@@ -271,7 +282,9 @@ static int create_logical_device(void)
     vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &ext_count, ext_props);
 
     int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0, has_bary = 0, has_a64 = 0;
-    int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0, has_mesh = 0, has_spv14 = 0, has_fc = 0;
+    int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0, has_di = 0, has_m3 = 0;
+    int has_as = 0, has_rq = 0, has_dho = 0, has_bda = 0, has_spv14 = 0, has_sfc = 0;
+    int has_mesh = 0, has_fc = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
@@ -280,18 +293,26 @@ static int create_logical_device(void)
         if (strcmp(ext_props[i].extensionName, "VK_KHR_fragment_shader_barycentric") == 0) has_bary = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_atomic_int64") == 0) has_a64 = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float16_int8") == 0) has_f16 = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_descriptor_indexing") == 0) has_di = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_maintenance3") == 0) has_m3 = 1;
         if (strcmp(ext_props[i].extensionName, "VK_NV_compute_shader_derivatives") == 0) has_cd_nv = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_compute_shader_derivatives") == 0) has_cd_khr = 1;
-        if (strcmp(ext_props[i].extensionName, "VK_EXT_mesh_shader") == 0) has_mesh = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_acceleration_structure") == 0) has_as = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_ray_query") == 0) has_rq = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_deferred_host_operations") == 0) has_dho = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_buffer_device_address") == 0) has_bda = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_descriptor_indexing") == 0) has_di = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_spirv_1_4") == 0) has_spv14 = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_sfc = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_mesh_shader") == 0) has_mesh = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_fc = 1;
     }
     free(ext_props);
-    if (has_portability) device_extensions[device_ext_count++] = "VK_KHR_portability_subset";
+    if (has_portability) VIO_VK_ADD_DEVICE_EXT("VK_KHR_portability_subset");
     /* gl_Layer written by the vertex stage (layered rendering without a
      * geometry stage, GEOMETRY-STAGES-PLAN 1c). */
     vio_vk.vertex_layer_supported = has_vpl;
-    if (has_vpl) device_extensions[device_ext_count++] = "VK_EXT_shader_viewport_index_layer";
+    if (has_vpl) VIO_VK_ADD_DEVICE_EXT("VK_EXT_shader_viewport_index_layer");
 
     vio_vk.vrs_supported = 0;
     vio_vk.vrs_primitive = 0;
@@ -340,8 +361,8 @@ static int create_logical_device(void)
                         vrs_enable.primitiveFragmentShadingRate = VK_TRUE;
                         vio_vk.vrs_primitive = 1;
                     }
-                    device_extensions[device_ext_count++] = VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
-                    device_extensions[device_ext_count++] = VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME;
+                    VIO_VK_ADD_DEVICE_EXT(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
+                    VIO_VK_ADD_DEVICE_EXT(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
                 }
             }
         }
@@ -390,7 +411,7 @@ static int create_logical_device(void)
             vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
             if (bary_avail.fragmentShaderBarycentric) {
                 bary_enable.fragmentShaderBarycentric = VK_TRUE;
-                device_extensions[device_ext_count++] = VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME;
+                VIO_VK_ADD_DEVICE_EXT(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
                 vio_vk.barycentrics_supported = 1;
             }
         }
@@ -451,7 +472,7 @@ static int create_logical_device(void)
         if (base.shaderInt64 && a64_avail.shaderBufferInt64Atomics) {
             features.shaderInt64 = VK_TRUE;
             a64_enable.shaderBufferInt64Atomics = VK_TRUE;
-            device_extensions[device_ext_count++] = "VK_KHR_shader_atomic_int64";
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_shader_atomic_int64");
             vio_vk.atomic64_supported = 1;
         }
     }
@@ -468,6 +489,9 @@ static int create_logical_device(void)
     dp_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
     VkPhysicalDeviceComputeShaderDerivativesFeaturesNV cd_enable = {0};
     cd_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV;
+    VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_enable = {0};
+    di_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
+    vio_vk.bindless_supported = 0;
     if (vio_vk.instance_api_11) {
         VkPhysicalDeviceProperties dprops;
         vkGetPhysicalDeviceProperties(vio_vk.physical_device, &dprops);
@@ -483,18 +507,33 @@ static int create_logical_device(void)
             dp_avail.pNext = has_f16 ? (void *)&f16_avail : NULL;
             f16_avail.pNext = (has_cd_nv || has_cd_khr) ? (void *)&cd_avail : NULL;
             if (!has_f16) dp_avail.pNext = (has_cd_nv || has_cd_khr) ? (void *)&cd_avail : NULL;
+            VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_avail = {0};
+            di_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
             VkPhysicalDeviceFeatures2 f2 = {0};
             f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
             mv_avail.pNext = &dp_avail;
-            f2.pNext = &mv_avail;
+            di_avail.pNext = &mv_avail;
+            f2.pNext = (has_di && has_m3) ? (void *)&di_avail : (void *)&mv_avail;
             vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+            /* Bindless table (BINDLESS-PLAN.md): a runtime-sized, non-uniformly
+             * indexed, partially bound sampled-image array updated after bind. */
+            if (has_di && has_m3 && di_avail.runtimeDescriptorArray && di_avail.shaderSampledImageArrayNonUniformIndexing
+                && di_avail.descriptorBindingPartiallyBound && di_avail.descriptorBindingSampledImageUpdateAfterBind) {
+                di_enable.runtimeDescriptorArray                       = VK_TRUE;
+                di_enable.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;
+                di_enable.descriptorBindingPartiallyBound              = VK_TRUE;
+                di_enable.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+                VIO_VK_ADD_DEVICE_EXT("VK_KHR_maintenance3");
+                VIO_VK_ADD_DEVICE_EXT("VK_EXT_descriptor_indexing");
+                vio_vk.bindless_supported = 1;
+            }
             if (mv_avail.multiview) {
                 mv_enable.multiview = VK_TRUE;
                 vio_vk.multiview_supported = 1;
             }
             if (has_f16 && f16_avail.shaderFloat16) {
                 f16_enable.shaderFloat16 = VK_TRUE;
-                device_extensions[device_ext_count++] = "VK_KHR_shader_float16_int8";
+                VIO_VK_ADD_DEVICE_EXT("VK_KHR_shader_float16_int8");
                 vio_vk.float16_supported = 1;
             }
             /* gl_BaseInstance only means something for indirect draws when
@@ -507,7 +546,7 @@ static int create_logical_device(void)
             if ((has_cd_nv || has_cd_khr) && cd_avail.computeDerivativeGroupQuads) {
                 cd_enable.computeDerivativeGroupQuads = VK_TRUE;
                 cd_enable.computeDerivativeGroupLinear = cd_avail.computeDerivativeGroupLinear;
-                device_extensions[device_ext_count++] = has_cd_nv ? "VK_NV_compute_shader_derivatives" : "VK_KHR_compute_shader_derivatives";
+                VIO_VK_ADD_DEVICE_EXT(has_cd_nv ? "VK_NV_compute_shader_derivatives" : "VK_KHR_compute_shader_derivatives");
                 vio_vk.compute_derivatives_supported = 1;
             }
         }
@@ -521,7 +560,7 @@ static int create_logical_device(void)
 #ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_enable = {0};
     mesh_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
-    if (has_mesh && has_spv14 && has_fc && vio_vk.instance_api_11 && device_ext_count + 3 <= 20) {
+    if (has_mesh && has_spv14 && has_fc && vio_vk.instance_api_11 && device_ext_count + 3 <= (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
         VkPhysicalDeviceMeshShaderFeaturesEXT mesh_avail = {0};
         mesh_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
         VkPhysicalDeviceFeatures2 f2 = {0};
@@ -531,15 +570,55 @@ static int create_logical_device(void)
         if (mesh_avail.meshShader && mesh_avail.taskShader) {
             mesh_enable.meshShader = VK_TRUE;
             mesh_enable.taskShader = VK_TRUE;
-            device_extensions[device_ext_count++] = "VK_EXT_mesh_shader";
-            device_extensions[device_ext_count++] = "VK_KHR_spirv_1_4";
-            device_extensions[device_ext_count++] = "VK_KHR_shader_float_controls";
+            VIO_VK_ADD_DEVICE_EXT("VK_EXT_mesh_shader");
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_spirv_1_4");
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_shader_float_controls");
             vio_vk.mesh_supported = 1;
         }
     }
 #else
     (void)has_mesh; (void)has_spv14; (void)has_fc;
 #endif
+    /* Inline ray tracing (GL_EXT_ray_query): VK_KHR_acceleration_structure needs
+     * deferred host operations, buffer device addresses and descriptor indexing;
+     * VK_KHR_ray_query needs SPIR-V 1.4 (+ float controls). The instance runs 1.1,
+     * so all of them are enabled as extensions even where a 1.2 device has them
+     * in core. */
+    vio_vk.ray_query_supported = 0;
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR as_enable = {0};
+    as_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    VkPhysicalDeviceRayQueryFeaturesKHR rq_enable = {0};
+    rq_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    VkPhysicalDeviceBufferDeviceAddressFeaturesKHR bda_enable = {0};
+    bda_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
+    if (has_as && has_rq && has_dho && has_bda && has_di && has_spv14 && has_sfc && vio_vk.instance_api_11) {
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR as_avail = {0};
+        as_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+        VkPhysicalDeviceRayQueryFeaturesKHR rq_avail = {0};
+        rq_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+        VkPhysicalDeviceBufferDeviceAddressFeaturesKHR bda_avail = {0};
+        bda_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
+        as_avail.pNext = &rq_avail;
+        rq_avail.pNext = &bda_avail;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &as_avail;
+        vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+        if (as_avail.accelerationStructure && rq_avail.rayQuery && bda_avail.bufferDeviceAddress
+            && device_ext_count + 7 <= (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
+            as_enable.accelerationStructure = VK_TRUE;
+            rq_enable.rayQuery = VK_TRUE;
+            bda_enable.bufferDeviceAddress = VK_TRUE;
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_acceleration_structure");
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_ray_query");
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_deferred_host_operations");
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_buffer_device_address");
+            VIO_VK_ADD_DEVICE_EXT("VK_EXT_descriptor_indexing");
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_spirv_1_4");
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_shader_float_controls");
+            vio_vk.ray_query_supported = 1;
+        }
+    }
 
     VkDeviceCreateInfo create_info = {0};
     create_info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -564,6 +643,13 @@ static int create_logical_device(void)
 #ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
     if (vio_vk.mesh_supported) { mesh_enable.pNext = feature_chain; feature_chain = &mesh_enable; }
 #endif
+    if (vio_vk.ray_query_supported) {
+        bda_enable.pNext = feature_chain;
+        rq_enable.pNext = &bda_enable;
+        as_enable.pNext = &rq_enable;
+        feature_chain = &as_enable;
+    }
+    if (vio_vk.bindless_supported) { di_enable.pNext = feature_chain; feature_chain = &di_enable; }
     create_info.pNext = feature_chain;
 
     VkResult result = vkCreateDevice(vio_vk.physical_device, &create_info, NULL, &vio_vk.device);
@@ -583,6 +669,16 @@ static int create_logical_device(void)
         if (!vio_vk.mesh_cmd_draw || !vio_vk.mesh_cmd_draw_indirect) vio_vk.mesh_supported = 0;
     }
     vkGetDeviceQueue(vio_vk.device, vio_vk.present_family, 0, &vio_vk.present_queue);
+    if (vio_vk.ray_query_supported) {
+        vio_vk.fn_get_as_build_sizes = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkGetAccelerationStructureBuildSizesKHR");
+        vio_vk.fn_create_as          = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCreateAccelerationStructureKHR");
+        vio_vk.fn_destroy_as         = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkDestroyAccelerationStructureKHR");
+        vio_vk.fn_cmd_build_as       = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCmdBuildAccelerationStructuresKHR");
+        vio_vk.fn_get_as_address     = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkGetAccelerationStructureDeviceAddressKHR");
+        vio_vk.fn_get_buffer_address = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkGetBufferDeviceAddressKHR");
+        if (!vio_vk.fn_get_as_build_sizes || !vio_vk.fn_create_as || !vio_vk.fn_destroy_as || !vio_vk.fn_cmd_build_as
+            || !vio_vk.fn_get_as_address || !vio_vk.fn_get_buffer_address) vio_vk.ray_query_supported = 0;
+    }
 
     /* On-disk pipeline cache (GAP-PHASE5 Block 4): keyed by the device so a
      * blob from another GPU / driver is never fed back (Vulkan validates the
@@ -1248,6 +1344,90 @@ static int vulkan_init(vio_config *cfg)
     return 0;
 }
 
+/* ── Bindless table (vio_texture_index, BINDLESS-PLAN.md) ─────────────── */
+
+VkDescriptorSetLayout vio_vk_bindless_layout(void)
+{
+    if (!vio_vk.device || !vio_vk.bindless_supported) return VK_NULL_HANDLE;
+    if (vio_vk.bindless_layout) return vio_vk.bindless_layout;
+    VkSamplerCreateInfo sci = {0};
+    sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sci.magFilter    = VK_FILTER_LINEAR;
+    sci.minFilter    = VK_FILTER_LINEAR;
+    sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.maxLod       = VK_LOD_CLAMP_NONE;
+    if (vkCreateSampler(vio_vk.device, &sci, NULL, &vio_vk.bindless_sampler) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkDescriptorSetLayoutBinding b[2];
+    memset(b, 0, sizeof(b));
+    b[0].binding            = 0;
+    b[0].descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    b[0].descriptorCount    = VIO_BINDLESS_MAX;
+    b[0].stageFlags         = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[1].binding            = 1;
+    b[1].descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLER;
+    b[1].descriptorCount    = 1;
+    b[1].stageFlags         = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[1].pImmutableSamplers = &vio_vk.bindless_sampler;
+    VkDescriptorBindingFlagsEXT flags[2] = {
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT, 0 };
+    VkDescriptorSetLayoutBindingFlagsCreateInfoEXT bf = {0};
+    bf.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT;
+    bf.bindingCount  = 2;
+    bf.pBindingFlags = flags;
+    VkDescriptorSetLayoutCreateInfo li = {0};
+    li.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    li.pNext        = &bf;
+    li.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT_EXT;
+    li.bindingCount = 2;
+    li.pBindings    = b;
+    if (vkCreateDescriptorSetLayout(vio_vk.device, &li, NULL, &vio_vk.bindless_layout) != VK_SUCCESS) {
+        vio_vk.bindless_layout = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VIO_BINDLESS_MAX }, { VK_DESCRIPTOR_TYPE_SAMPLER, 1 } };
+    VkDescriptorPoolCreateInfo pi = {0};
+    pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pi.flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT_EXT;
+    pi.maxSets       = 1;
+    pi.poolSizeCount = 2;
+    pi.pPoolSizes    = ps;
+    if (vkCreateDescriptorPool(vio_vk.device, &pi, NULL, &vio_vk.bindless_pool) != VK_SUCCESS) {
+        vio_vk.bindless_pool = VK_NULL_HANDLE;
+        return vio_vk.bindless_layout;
+    }
+    VkDescriptorSetAllocateInfo ai = {0};
+    ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool     = vio_vk.bindless_pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts        = &vio_vk.bindless_layout;
+    if (vkAllocateDescriptorSets(vio_vk.device, &ai, &vio_vk.bindless_set) != VK_SUCCESS) vio_vk.bindless_set = VK_NULL_HANDLE;
+    return vio_vk.bindless_layout;
+}
+
+static int vulkan_bindless_set(int slot, void *backend_texture)
+{
+    vio_vulkan_texture *t = (vio_vulkan_texture *)backend_texture;
+    if (!t || !t->view || t->depth > 0 || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
+    if (!vio_vk_bindless_layout() || !vio_vk.bindless_set) return -1;
+    VkDescriptorImageInfo ii = {0};
+    ii.imageView   = t->view;
+    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet w = {0};
+    w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet          = vio_vk.bindless_set;
+    w.dstBinding      = 0;
+    w.dstArrayElement = (uint32_t)slot;
+    w.descriptorCount = 1;
+    w.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w.pImageInfo      = &ii;
+    /* UPDATE_AFTER_BIND: legal while earlier frames that bound the set still run. */
+    vkUpdateDescriptorSets(vio_vk.device, 1, &w, 0, NULL);
+    return 0;
+}
+
 static void vulkan_shutdown(void)
 {
     /* M1 — handle-based teardown, NOT gated on vio_vk.initialized.
@@ -1344,8 +1524,16 @@ static void vulkan_shutdown(void)
             vio_vk.render_pass = VK_NULL_HANDLE;
         }
     }
+    if (vio_vk.device) {
+        /* Bindless table (the pool frees its set). */
+        if (vio_vk.bindless_pool)    { vkDestroyDescriptorPool(vio_vk.device, vio_vk.bindless_pool, NULL); vio_vk.bindless_pool = VK_NULL_HANDLE; }
+        if (vio_vk.bindless_layout)  { vkDestroyDescriptorSetLayout(vio_vk.device, vio_vk.bindless_layout, NULL); vio_vk.bindless_layout = VK_NULL_HANDLE; }
+        if (vio_vk.bindless_sampler) { vkDestroySampler(vio_vk.device, vio_vk.bindless_sampler, NULL); vio_vk.bindless_sampler = VK_NULL_HANDLE; }
+        vio_vk.bindless_set = VK_NULL_HANDLE;
+    }
     if (vio_vk.vma_allocator) { vio_vma_destroy(vio_vk.vma_allocator); vio_vk.vma_allocator = NULL; }
     if (vio_vk.device && vio_vk.transient_fence) { vkDestroyFence(vio_vk.device, vio_vk.transient_fence, NULL); vio_vk.transient_fence = VK_NULL_HANDLE; }
+    vulkan_release_acceleration_structures();
     if (vio_vk.device && vio_vk.transient_pool)  { vkDestroyCommandPool(vio_vk.device, vio_vk.transient_pool, NULL); vio_vk.transient_pool = VK_NULL_HANDLE; }
     if (vio_vk.device && vio_vk.pipeline_cache) {
         /* Persist the pipeline cache for the next run, then drop it. */
@@ -1630,6 +1818,308 @@ static int vulkan_submit_transient_commands(VkCommandPool pool, VkCommandBuffer 
     }
     vkFreeCommandBuffers(vio_vk.device, vio_vk.transient_pool, 1, &cmd);
     return rc;
+}
+
+/* ── Inline ray tracing (VIO_FEATURE_RAY_QUERY) ─────────────────────
+ * VK_KHR_acceleration_structure, built synchronously in a transient command
+ * buffer: one bottom-level structure per geometry, one top-level structure.
+ * Buffers that need device addresses are allocated directly (the VMA allocator
+ * is created without the device-address flag). Live structures are listed so
+ * vulkan_shutdown can free their GPU objects before the device; a structure
+ * PHP frees afterwards only releases its memory. */
+typedef struct _vio_vk_as_buf {
+    VkBuffer       buf;
+    VkDeviceMemory mem;
+} vio_vk_as_buf;
+
+typedef struct _vio_vk_as {
+    VkAccelerationStructureKHR  tlas;
+    vio_vk_as_buf               tlas_buf;
+    VkAccelerationStructureKHR *blas;
+    vio_vk_as_buf              *blas_buf;
+    int                         blas_count;
+    int                         dead;
+    struct _vio_vk_as          *next, *prev;
+} vio_vk_as;
+
+static vio_vk_as *vk_live_as = NULL;
+
+static int vk_as_buffer(VkDeviceSize size, VkBufferUsageFlags usage, int host_visible, vio_vk_as_buf *out)
+{
+    memset(out, 0, sizeof(*out));
+    VkBufferCreateInfo bi = {0};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bi.size = size > 0 ? size : 256;
+    bi.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(vio_vk.device, &bi, NULL, &out->buf) != VK_SUCCESS) return -1;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(vio_vk.device, out->buf, &req);
+    VkMemoryAllocateFlagsInfo flags = {0};
+    flags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai = {0};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.pNext = &flags;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, host_visible
+        ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vio_vk.device, &ai, NULL, &out->mem) != VK_SUCCESS) {
+        vkDestroyBuffer(vio_vk.device, out->buf, NULL);
+        out->buf = VK_NULL_HANDLE;
+        return -1;
+    }
+    vkBindBufferMemory(vio_vk.device, out->buf, out->mem, 0);
+    return 0;
+}
+
+static void vk_as_buffer_free(vio_vk_as_buf *b)
+{
+    if (b->buf) vkDestroyBuffer(vio_vk.device, b->buf, NULL);
+    if (b->mem) vkFreeMemory(vio_vk.device, b->mem, NULL);
+    b->buf = VK_NULL_HANDLE;
+    b->mem = VK_NULL_HANDLE;
+}
+
+static int vk_as_upload(const void *data, size_t size, VkBufferUsageFlags usage, vio_vk_as_buf *out)
+{
+    if (vk_as_buffer((VkDeviceSize)size, usage, 1, out) != 0) return -1;
+    void *p = NULL;
+    if (vkMapMemory(vio_vk.device, out->mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) { vk_as_buffer_free(out); return -1; }
+    memcpy(p, data, size);
+    vkUnmapMemory(vio_vk.device, out->mem);
+    return 0;
+}
+
+static VkDeviceAddress vk_buffer_address(VkBuffer buf)
+{
+    VkBufferDeviceAddressInfo info = {0};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    info.buffer = buf;
+    return ((PFN_vkGetBufferDeviceAddressKHR)vio_vk.fn_get_buffer_address)(vio_vk.device, &info);
+}
+
+/* Create the structure object over a fresh buffer of the build's size. */
+static int vk_as_create(VkAccelerationStructureTypeKHR type, VkDeviceSize size, VkAccelerationStructureKHR *as, vio_vk_as_buf *buf)
+{
+    if (vk_as_buffer(size, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, 0, buf) != 0) return -1;
+    VkAccelerationStructureCreateInfoKHR ci = {0};
+    ci.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+    ci.buffer = buf->buf;
+    ci.size = size;
+    ci.type = type;
+    if (((PFN_vkCreateAccelerationStructureKHR)vio_vk.fn_create_as)(vio_vk.device, &ci, NULL, as) != VK_SUCCESS) {
+        vk_as_buffer_free(buf);
+        return -1;
+    }
+    return 0;
+}
+
+static void vk_as_release_gpu(vio_vk_as *as)
+{
+    if (!as || as->dead || !vio_vk.device) return;
+    PFN_vkDestroyAccelerationStructureKHR destroy = (PFN_vkDestroyAccelerationStructureKHR)vio_vk.fn_destroy_as;
+    if (as->tlas && destroy) destroy(vio_vk.device, as->tlas, NULL);
+    vk_as_buffer_free(&as->tlas_buf);
+    for (int i = 0; i < as->blas_count; i++) {
+        if (as->blas[i] && destroy) destroy(vio_vk.device, as->blas[i], NULL);
+        vk_as_buffer_free(&as->blas_buf[i]);
+    }
+    as->dead = 1;
+}
+
+static void vk_as_unlink(vio_vk_as *as)
+{
+    if (as->prev) as->prev->next = as->next; else if (vk_live_as == as) vk_live_as = as->next;
+    if (as->next) as->next->prev = as->prev;
+    as->next = as->prev = NULL;
+}
+
+static void *vulkan_create_acceleration_structure(const vio_as_desc *desc)
+{
+    if (!desc || desc->geometry_count < 1 || desc->instance_count < 1 || !vio_vk.ray_query_supported) return NULL;
+    PFN_vkGetAccelerationStructureBuildSizesKHR sizes_fn = (PFN_vkGetAccelerationStructureBuildSizesKHR)vio_vk.fn_get_as_build_sizes;
+    PFN_vkCmdBuildAccelerationStructuresKHR build_fn = (PFN_vkCmdBuildAccelerationStructuresKHR)vio_vk.fn_cmd_build_as;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR addr_fn = (PFN_vkGetAccelerationStructureDeviceAddressKHR)vio_vk.fn_get_as_address;
+    vio_vk_as *as = calloc(1, sizeof(vio_vk_as));
+    int temps_cap = desc->geometry_count * 3 + 4, temps_n = 0;
+    vio_vk_as_buf *temps = calloc((size_t)temps_cap, sizeof(vio_vk_as_buf));
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (!as || !temps) goto fail;
+    as->blas = calloc((size_t)desc->geometry_count, sizeof(VkAccelerationStructureKHR));
+    as->blas_buf = calloc((size_t)desc->geometry_count, sizeof(vio_vk_as_buf));
+    if (!as->blas || !as->blas_buf) goto fail;
+    if (vulkan_begin_transient_commands(&pool, &cmd) != 0) goto fail;
+
+    const VkBufferUsageFlags input = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    for (int g = 0; g < desc->geometry_count; g++) {
+        const vio_as_geometry *geo = &desc->geometries[g];
+        vio_vk_as_buf *vb = &temps[temps_n++];
+        if (vk_as_upload(geo->positions, (size_t)geo->vertex_count * 12, input, vb) != 0) goto fail_cmd;
+        VkAccelerationStructureGeometryKHR gm = {0};
+        gm.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        gm.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        gm.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        gm.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        gm.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        gm.geometry.triangles.vertexData.deviceAddress = vk_buffer_address(vb->buf);
+        gm.geometry.triangles.vertexStride = 12;
+        gm.geometry.triangles.maxVertex = (uint32_t)(geo->vertex_count - 1);
+        uint32_t prims;
+        if (geo->indices && geo->index_count >= 3) {
+            vio_vk_as_buf *ib = &temps[temps_n++];
+            if (vk_as_upload(geo->indices, (size_t)geo->index_count * 4, input, ib) != 0) goto fail_cmd;
+            gm.geometry.triangles.indexType = VK_INDEX_TYPE_UINT32;
+            gm.geometry.triangles.indexData.deviceAddress = vk_buffer_address(ib->buf);
+            prims = (uint32_t)geo->index_count / 3;
+        } else {
+            gm.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+            prims = (uint32_t)geo->vertex_count / 3;
+        }
+        VkAccelerationStructureBuildGeometryInfoKHR bg = {0};
+        bg.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+        bg.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        bg.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        bg.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        bg.geometryCount = 1;
+        bg.pGeometries = &gm;
+        VkAccelerationStructureBuildSizesInfoKHR sz = {0};
+        sz.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+        sizes_fn(vio_vk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bg, &prims, &sz);
+        if (vk_as_create(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, sz.accelerationStructureSize,
+                         &as->blas[g], &as->blas_buf[g]) != 0) goto fail_cmd;
+        as->blas_count = g + 1;
+        vio_vk_as_buf *scratch = &temps[temps_n++];
+        if (vk_as_buffer(sz.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 0, scratch) != 0) goto fail_cmd;
+        bg.dstAccelerationStructure = as->blas[g];
+        bg.scratchData.deviceAddress = vk_buffer_address(scratch->buf);
+        VkAccelerationStructureBuildRangeInfoKHR range = { prims, 0, 0, 0 };
+        const VkAccelerationStructureBuildRangeInfoKHR *ranges[1] = { &range };
+        build_fn(cmd, 1, &bg, ranges);
+    }
+    /* The top level reads the finished bottom levels. */
+    {
+        VkMemoryBarrier mb = {0};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                             VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    {
+        VkAccelerationStructureInstanceKHR *ins = calloc((size_t)desc->instance_count, sizeof(VkAccelerationStructureInstanceKHR));
+        if (!ins) goto fail_cmd;
+        for (int i = 0; i < desc->instance_count; i++) {
+            const vio_as_instance *src = &desc->instances[i];
+            memcpy(ins[i].transform.matrix, src->transform, sizeof(float) * 12);   /* row-major 3x4 */
+            ins[i].instanceCustomIndex = (uint32_t)i;
+            ins[i].mask = 0xFF;
+            ins[i].instanceShaderBindingTableRecordOffset = 0;
+            ins[i].flags = VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+            VkAccelerationStructureDeviceAddressInfoKHR ai = {0};
+            ai.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+            ai.accelerationStructure = as->blas[src->geometry];
+            ins[i].accelerationStructureReference = addr_fn(vio_vk.device, &ai);
+        }
+        vio_vk_as_buf *ibuf = &temps[temps_n++];
+        int ok = vk_as_upload(ins, sizeof(VkAccelerationStructureInstanceKHR) * (size_t)desc->instance_count, input, ibuf) == 0;
+        free(ins);
+        if (!ok) goto fail_cmd;
+        VkAccelerationStructureGeometryKHR gm = {0};
+        gm.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        gm.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+        gm.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+        gm.geometry.instances.arrayOfPointers = VK_FALSE;
+        gm.geometry.instances.data.deviceAddress = vk_buffer_address(ibuf->buf);
+        VkAccelerationStructureBuildGeometryInfoKHR bg = {0};
+        bg.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+        bg.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+        bg.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        bg.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        bg.geometryCount = 1;
+        bg.pGeometries = &gm;
+        uint32_t count = (uint32_t)desc->instance_count;
+        VkAccelerationStructureBuildSizesInfoKHR sz = {0};
+        sz.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+        sizes_fn(vio_vk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bg, &count, &sz);
+        if (vk_as_create(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sz.accelerationStructureSize,
+                         &as->tlas, &as->tlas_buf) != 0) goto fail_cmd;
+        vio_vk_as_buf *scratch = &temps[temps_n++];
+        if (vk_as_buffer(sz.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 0, scratch) != 0) goto fail_cmd;
+        bg.dstAccelerationStructure = as->tlas;
+        bg.scratchData.deviceAddress = vk_buffer_address(scratch->buf);
+        VkAccelerationStructureBuildRangeInfoKHR range = { count, 0, 0, 0 };
+        const VkAccelerationStructureBuildRangeInfoKHR *ranges[1] = { &range };
+        build_fn(cmd, 1, &bg, ranges);
+    }
+    /* Shaders of later submissions read the structure. */
+    {
+        VkMemoryBarrier mb = {0};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    if (vulkan_submit_transient_commands(pool, cmd) != 0) { cmd = VK_NULL_HANDLE; goto fail; }
+    for (int i = 0; i < temps_n; i++) vk_as_buffer_free(&temps[i]);
+    free(temps);
+    as->next = vk_live_as;
+    if (vk_live_as) vk_live_as->prev = as;
+    vk_live_as = as;
+    return as;
+
+fail_cmd:
+    if (cmd) {
+        vkEndCommandBuffer(cmd);
+        vkFreeCommandBuffers(vio_vk.device, vio_vk.transient_pool, 1, &cmd);
+    }
+fail:
+    php_error_docref(NULL, E_WARNING, "Vulkan: acceleration structure build failed");
+    if (temps) { for (int i = 0; i < temps_n; i++) vk_as_buffer_free(&temps[i]); free(temps); }
+    if (as) {
+        vk_as_release_gpu(as);
+        free(as->blas);
+        free(as->blas_buf);
+        free(as);
+    }
+    return NULL;
+}
+
+static void vulkan_destroy_acceleration_structure(void *ptr)
+{
+    vio_vk_as *as = (vio_vk_as *)ptr;
+    if (!as) return;
+    if (!as->dead) {
+        if (vio_vk.bound_accel == (uint64_t)as->tlas) vio_vk.bound_accel = 0;
+        /* A frame in flight may still read it: drain first (rare). */
+        if (vio_vk.device) vkDeviceWaitIdle(vio_vk.device);
+        vk_as_release_gpu(as);
+        vk_as_unlink(as);
+    }
+    free(as->blas);
+    free(as->blas_buf);
+    free(as);
+}
+
+static void vulkan_bind_acceleration_structure(void *ptr, int binding)
+{
+    vio_vk_as *as = (vio_vk_as *)ptr;
+    vio_vk.bound_accel = (as && !as->dead) ? (uint64_t)as->tlas : 0;
+    vio_vk.bound_accel_binding = binding;
+}
+
+/* vulkan_shutdown: GPU objects of every live structure go before the device. */
+static void vulkan_release_acceleration_structures(void)
+{
+    while (vk_live_as) {
+        vio_vk_as *as = vk_live_as;
+        vk_as_release_gpu(as);
+        vk_as_unlink(as);
+    }
+    vio_vk.bound_accel = 0;
 }
 
 int vio_vk_begin_transient(VkCommandBuffer *out_cmd)
@@ -2582,6 +3072,7 @@ typedef struct _vio_vulkan_compute_pipeline {
     VkDeviceSize          params_capacity;
     int                   params_set;     /* 1 once uniforms have been staged */
     int                   params_binding; /* reflected UBO binding (canonical = 2) */
+    int                   accel_binding;  /* ray query: the acceleration structure binding, -1 = none */
 
     vio_vk_compute_binding bindings[VIO_VK_COMPUTE_MAX_BINDINGS];
     int                    binding_count;
@@ -2647,15 +3138,16 @@ static VkDescriptorSet vkc_alloc_set(int slot, VkDescriptorSetLayout layout)
             php_error_docref(NULL, E_WARNING, "Vulkan: compute descriptor pools exhausted for this frame");
             return VK_NULL_HANDLE;
         }
-        VkDescriptorPoolSize sizes[3] = {
+        VkDescriptorPoolSize sizes[4] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VKC_SETS_PER_POOL * VIO_VK_COMPUTE_MAX_BINDINGS },
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  VKC_SETS_PER_POOL * VIO_VK_COMPUTE_MAX_IMAGES },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VKC_SETS_PER_POOL * 2 },
+            { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VKC_SETS_PER_POOL },
         };
         VkDescriptorPoolCreateInfo pi = {0};
         pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pi.maxSets       = VKC_SETS_PER_POOL;
-        pi.poolSizeCount = 3;
+        pi.poolSizeCount = vio_vk.ray_query_supported ? 4 : 3;   /* the type is only valid with the extension */
         pi.pPoolSizes    = sizes;
         if (vkCreateDescriptorPool(vio_vk.device, &pi, NULL, &vkc.pools[slot][vkc.count[slot]]) != VK_SUCCESS) {
             return VK_NULL_HANDLE;
@@ -2731,6 +3223,7 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
     vio_vulkan_compute_pipeline *cp = calloc(1, sizeof(vio_vulkan_compute_pipeline));
     if (!cp) { if (free_spirv) free(spirv); return NULL; }
     cp->params_binding = 2;
+    cp->accel_binding = -1;
 
     /* The descriptor-set layout follows the kernel: every storage buffer,
      * storage image (image2D / image3D) and the params UBO (the lowest UBO
@@ -2752,6 +3245,12 @@ static void *vulkan_create_compute_pipeline(vio_shader_desc *desc)
             }
             for (int i = 0; i < refl.storage_image_count; i++) {
                 vkc_layout_add(cp, refl.storage_images[i].binding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+            }
+            /* Ray query: the kernel's acceleration structure at its own binding. */
+            int accel = vio_vk.ray_query_supported ? vio_spirv_accel_binding(spirv, spirv_size) : -1;
+            if (accel >= 0) {
+                vkc_layout_add(cp, (uint32_t)accel, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+                cp->accel_binding = accel;
             }
             vio_reflect_free(&refl);
         } else {
@@ -3005,7 +3504,7 @@ static void vulkan_dispatch_compute(vio_compute_cmd *cmd)
 
     VkDescriptorBufferInfo binfos[VIO_VK_COMPUTE_MAX_BINDINGS + 1];
     VkDescriptorImageInfo  iinfos[VIO_VK_COMPUTE_MAX_IMAGES];
-    VkWriteDescriptorSet   writes[VIO_VK_COMPUTE_MAX_BINDINGS + VIO_VK_COMPUTE_MAX_IMAGES + 1];
+    VkWriteDescriptorSet   writes[VIO_VK_COMPUTE_MAX_BINDINGS + VIO_VK_COMPUTE_MAX_IMAGES + 2];
     uint32_t write_count = 0, nb = 0, ni = 0;
 
     for (int i = 0; i < cp->binding_count; i++) {
@@ -3052,6 +3551,21 @@ static void vulkan_dispatch_compute(vio_compute_cmd *cmd)
         w->descriptorCount = 1;
         w->descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         w->pBufferInfo     = &binfos[nb++];
+    }
+    VkWriteDescriptorSetAccelerationStructureKHR accel_write = {0};
+    VkAccelerationStructureKHR accel_handle = (VkAccelerationStructureKHR)vio_vk.bound_accel;
+    if (cp->accel_binding >= 0 && accel_handle) {
+        accel_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+        accel_write.accelerationStructureCount = 1;
+        accel_write.pAccelerationStructures = &accel_handle;
+        VkWriteDescriptorSet *w = &writes[write_count++];
+        memset(w, 0, sizeof(*w));
+        w->sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w->pNext           = &accel_write;
+        w->dstSet          = set;
+        w->dstBinding      = (uint32_t)cp->accel_binding;
+        w->descriptorCount = 1;
+        w->descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     }
     if (write_count > 0) vkUpdateDescriptorSets(vio_vk.device, write_count, writes, 0, NULL);
 
@@ -3582,6 +4096,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_MESH_SHADER:  return vio_vk3d_available() && vio_vk.device && vio_vk.mesh_supported; /* VK_EXT_mesh_shader */
         case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
         case VIO_FEATURE_MULTIVIEW:    return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_supported; /* VkRenderPassMultiviewCreateInfo */
+        case VIO_FEATURE_RAY_QUERY:    return vio_vk3d_available() && vio_vk.device && vio_vk.ray_query_supported; /* VK_KHR_ray_query */
         case VIO_FEATURE_READ_PIXELS:  return 1; /* vkCmdCopyImageToBuffer readback of a RE-ACQUIRED swapchain image (see vulkan_read_pixels); requires the swapchain's TRANSFER_SRC usage added in create_swapchain */
         case VIO_FEATURE_INSTANCED_DRAW: return vio_vk3d_available(); /* per-instance binding 1 from the frame ring */
         case VIO_FEATURE_RENDER_TARGET:       return 1; /* offscreen RT + render-to-texture (Phase 3) */
@@ -3613,6 +4128,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_SUBGROUP_QUAD:  return vio_vk.device && vio_vk.subgroup_quad_supported;
         case VIO_FEATURE_BARYCENTRICS:   return vio_vk.device && vio_vk.barycentrics_supported; /* VK_KHR_fragment_shader_barycentric */
         case VIO_FEATURE_ATOMIC64:       return vio_vk.device && vio_vk.atomic64_supported; /* VK_KHR_shader_atomic_int64 */
+        case VIO_FEATURE_BINDLESS:       return vio_vk3d_available() && vio_vk.device && vio_vk.bindless_supported; /* descriptor indexing, Set 1 */
         case VIO_FEATURE_SHADER_FLOAT16: return vio_vk.device && vio_vk.float16_supported;   /* shaderFloat16 */
         case VIO_FEATURE_BASE_VERTEX:    return vio_vk3d_available() && vio_vk.device && vio_vk.draw_parameters_supported;
         case VIO_FEATURE_COMPUTE_DERIVATIVES: return vio_vk.device && vio_vk.compute_derivatives_supported;
@@ -3666,6 +4182,7 @@ static const vio_backend vulkan_backend = {
     .bind_cubemap      = vio_vk_bind_cubemap,
     .set_shading_rate  = vio_vk_set_shading_rate,
     .swapchain_info    = vulkan_swapchain_info,
+    .bindless_set      = vulkan_bindless_set,
     .present           = vulkan_present,
     .clear             = vulkan_clear,
     .gpu_flush         = NULL,
@@ -3695,6 +4212,9 @@ static const vio_backend vulkan_backend = {
      * are intentionally left NULL — same as d3d11/d3d12. */
     .create_render_target  = vulkan_create_render_target,
     .destroy_render_target = vulkan_destroy_render_target,
+    .create_acceleration_structure  = vulkan_create_acceleration_structure,
+    .destroy_acceleration_structure = vulkan_destroy_acceleration_structure,
+    .bind_acceleration_structure    = vulkan_bind_acceleration_structure,
 };
 
 void vio_backend_vulkan_register(void)

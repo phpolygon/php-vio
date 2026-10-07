@@ -860,7 +860,7 @@ static int mk_user_cbuffer(const vio_metal_stage_res *res)
 {
     for (int i = 0; i < res->buffer_count; i++) {
         const vio_metal_res_buffer *b = &res->buffers[i];
-        if (b->kind == 1) continue;
+        if (b->kind == 1 || b->kind == 3) continue;
         if (b->kind == 0 && b->binding >= VIO_MK_BIND_IN && b->binding <= VIO_MK_BIND_IDX) continue;
         return b->msl_index;
     }

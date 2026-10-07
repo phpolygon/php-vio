@@ -52,6 +52,9 @@ int vio_spirv_execution_model(const void *spirv, size_t bytes);
  * flip_y negates y (Vulkan), fix_z maps z from [-w, w] to [0, w] (D3D, Vulkan).
  * `vec4` names the target language's vector type. Takes ownership of `src`. */
 char *vio_mesh_fix_positions(char *src, int flip_y, int fix_z, const char *vec4);
+/* Binding of the module's first acceleration-structure variable (GL_EXT_ray_query),
+ * -1 when it has none. Plain word scan. */
+int vio_spirv_accel_binding(const void *spirv, size_t bytes);
 /* GL_OVR_multiview2: views of the next vio_spirv_to_glsl calls (0 = off). */
 void vio_glsl_set_ovr_view_count(int views);
 

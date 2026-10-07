@@ -53,8 +53,16 @@ typedef struct _vio_context_object {
      * glfwRestoreWindow() does for a maximized window, so we track it here. */
     int                saved_win_x, saved_win_y, saved_win_w, saved_win_h;
     int                has_saved_win_geometry;
+    /* vio_texture_index() table (VIO_FEATURE_BINDLESS): slot -> VioTexture,
+     * each holding a reference until vio_destroy / free so a slot never points
+     * at a freed texture. emalloc'd lazily (VIO_BINDLESS_MAX entries). */
+    zend_object      **bindless;
+    int                bindless_count;
     zend_object        std;
 } vio_context_object;
+
+/* Drop the vio_texture_index() references (before the backend shuts down). */
+void vio_context_bindless_clear(vio_context_object *ctx);
 
 extern zend_class_entry *vio_context_ce;
 

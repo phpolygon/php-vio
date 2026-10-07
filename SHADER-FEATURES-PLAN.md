@@ -92,7 +92,7 @@ Instancing-Emulation statt Vertex Amplification (SPIRV-Cross erzeugt kein `[[amp
 - Nutzen: Stereo/VR, mehrere Shadow-Kaskaden pro Draw. Pascal+ in Hardware, sonst emuliert.
 - Test: 2 Views in 2 Layer, `gl_ViewIndex` färbt, Readback je Layer.
 
-## Phase 3 — Variable Rate Shading Tier 2 (M) — 3a ✅, 3b ⏸ (2026-10-07)
+## Phase 3 — Variable Rate Shading Tier 2 (M) — 3a ✅, 3b ✅ D3D12 (2026-10-07)
 
 **3a pro Primitiv umgesetzt** (`VIO_FEATURE_SHADING_RATE_PRIMITIVE`, Test 159): D3D12 Tier 2 + SM 6.4, Vulkan
 `primitiveFragmentShadingRate`; der Combiner folgt der Pipeline (Vertex-Stage schreibt die Rate → OVERRIDE /
@@ -100,9 +100,13 @@ REPLACE, sonst die gesetzte Rate). **Kein ausführender Treiber verfügbar:** la
 `VK_KHR_fragment_shading_rate` (CI-`vulkaninfo`), WARP endet bei SM 6.2, MoltenVK und Metal haben kein VRS.
 D3D12-HLSL per DXC geprüft (`vs_6_4` ok, `vs_6_3` abgelehnt).
 
-**3b Rate-Bild zurückgestellt:** braucht auf Vulkan `vkCreateRenderPass2` für jeden Render-Pass (Fragment-
-Shading-Rate-Attachment) und wäre ebenso nirgends ausführbar. Wieder aufnehmen, sobald ein CI-Treiber VRS
-Tier 2 / `attachmentFragmentShadingRate` anbietet.
+**3b Rate-Bild (D3D12) umgesetzt** (`VIO_FEATURE_SHADING_RATE_IMAGE`, `vio_set_shading_rate_image($ctx, ?string
+$rates, $tilesX, $tilesY)`, `vio_shading_rate_tile_size($ctx)`, Test 160): ein `VIO_SHADING_RATE_*`-Byte je Kachel,
+R8_UINT-Textur in `SHADING_RATE_SOURCE`, `RSSetShadingRateImage` + Combiner MAX (die gröbere Rate gewinnt),
+nach jedem Listen-Reset neu gesetzt. Ein neues Kachelraster legt die Textur neu an (außerhalb eines Frames nach
+GPU-Drain, im Frame bleibt die alte bis zum Kontextende). Nur per mingw-w64 + DirectX-Headers kompiliert.
+**Vulkan bleibt 0:** bräuchte `vkCreateRenderPass2` mit Fragment-Shading-Rate-Attachment in jedem Render-Pass;
+kein Treiber (lavapipe/MoltenVK) bietet `attachmentFragmentShadingRate`.
 
 Heute: Tier 1 (`vio_set_shading_rate`, D3D12/Vulkan). Neu: Rate je Primitiv (`gl_PrimitiveShadingRateEXT`
 ↔ `SV_ShadingRate`, SM 6.4) und Rate-Bild (`vio_set_shading_rate_image($ctx, $tex)`).
@@ -111,7 +115,12 @@ Heute: Tier 1 (`vio_set_shading_rate`, D3D12/Vulkan). Neu: Rate je Primitiv (`gl
   bewusst getrenntes Feature `VIO_FEATURE_RASTER_RATE_MAP` evaluieren, nicht in VRS pressen.
 - GL: `GL_NV_shading_rate_image` → sonst 0.
 
-## Phase 4 — Bindless / dynamische Ressourcen (L, eigener Sub-Plan `BINDLESS-PLAN.md`)
+## Phase 4 — Bindless / dynamische Ressourcen (L, eigener Sub-Plan `BINDLESS-PLAN.md`) — 4a ✅ (2026-10-07)
+
+**4a umgesetzt** (`vio_texture_index`, `VIO_FEATURE_BINDLESS`, Test 161): Metal (Argument Buffer Set 1), Vulkan
+(Descriptor Indexing), D3D12 (unbegrenzter SRV-Bereich in `space1`, Tier 2+); OpenGL/D3D11 0. Ausgeführt auf
+dem M5 (Metal ab MSL 3.0, Vulkan über MoltenVK); D3D12 per mingw + DXC geprüft, läuft auf WARP (Tier 3) in
+der CI. Offen (4b): Slot-Freigabe, Sampler je Eintrag, Arrays/Cubes, Compute.
 
 Größter Architekturhebel: ersetzt Pending-Bind-Tabelle und GL-Unit-Mapping für Materialsysteme.
 - API-Skizze: `vio_texture_index($tex): int` (stabiler Heap-Index), GLSL `layout(set=1) uniform texture2D
@@ -147,7 +156,11 @@ SPIRV-Cross setzt keinen Clip-Fixup in Mesh-Ausgaben; `vio_mesh_fix_positions` s
 
 `VIO_FEATURE_RAYTRACING` aufteilen in `RAY_QUERY` (6a) und `RAYTRACING_PIPELINE` (6b).
 
-**6a Inline-Raytracing / Ray Query (zuerst)** — RT-Schatten/-AO ohne eigene Pipeline.
+**6a Inline-Raytracing / Ray Query ✅ (2026-10-07, `VIO_FEATURE_RAY_QUERY`, Test 163)** — umgesetzt als
+`vio_acceleration_structure($ctx, [['mesh' => …, 'transform' => float[16]], …])` (Klasse `VioAccelerationStructure`,
+BLAS je Mesh aus der CPU-Kopie, die `VioMesh` auf Ray-Query-Backends behält) + `vio_bind_acceleration_structure`.
+Metal auf dem M5 ausgeführt (ab MSL 2.4); D3D12 per mingw + DXC geprüft, Vulkan nur gegen die Header kompiliert
+(MoltenVK ohne Ray Query). Ursprüngliche Planung: — RT-Schatten/-AO ohne eigene Pipeline.
 - Neue API: `vio_acceleration_structure($ctx, ['meshes' => [...]])` (BLAS), `vio_tlas($ctx, $instances)`,
   Rebuild/Refit, Bind als Ressource; GLSL `GL_EXT_ray_query`.
 - D3D12: DXR 1.1 (SM 6.5, `OPTIONS5.RaytracingTier >= 1_1`), `RayQuery<>`; SPIRV-Cross-HLSL-Unterstützung

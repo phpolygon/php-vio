@@ -99,7 +99,9 @@
 #define VIO_D3D12_RP_GS_SAMPLER   11
 #define VIO_D3D12_RP_HS_SAMPLER   12
 #define VIO_D3D12_RP_DS_SAMPLER   13
-#define VIO_D3D12_RP_COUNT        14
+#define VIO_D3D12_RP_ACCEL        14  /* root SRV t0, space9: ray-query acceleration structure (all stages) */
+#define VIO_D3D12_RP_BINDLESS     15  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
+#define VIO_D3D12_RP_COUNT        16
 
 /* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
  * bytecode (NULL when the vio_shader has no such stage). */
@@ -121,6 +123,7 @@ typedef struct _vio_d3d12_shader {
      * (ms_6_x), as_blob the optional amplification (task) shader. */
     int       is_mesh;
     ID3DBlob *as_blob;
+    int       uses_bindless;         /* reads the bindless table (register space 1, BINDLESS-PLAN.md) */
 } vio_d3d12_shader;
 
 /* Pipeline = PSO + root signature reference */
@@ -147,6 +150,7 @@ typedef struct _vio_d3d12_pipeline {
      * stream with vio_d3d12.mesh_root_signature. */
     int                      is_mesh;
     ID3DBlob                *as_blob;
+    int                      uses_bindless;    /* the shader reads the bindless table */
 } vio_d3d12_pipeline;
 
 /* Buffer wrapper */
@@ -215,6 +219,7 @@ typedef struct _vio_d3d12_compute_pipeline {
     int                 cbv_register;
     int                 srv_base_reg;
     int                 uav_base_reg;
+    int                 uses_accel;   /* the kernel queries an acceleration structure: root SRV [3] t0, space9 */
     /* Params constant block. An UPLOAD-heap buffer, persistently re-mapped by
      * compute_set_uniforms (256-byte aligned per the CB requirement). Bound to
      * the reflected cbv_register. */
@@ -317,13 +322,26 @@ typedef struct _vio_d3d12_state {
     int                        barycentrics;   /* OPTIONS3.BarycentricsSupported (SM 6.1) */
     int                        int64_ops;      /* OPTIONS1.Int64ShaderOps (64-bit integers in shaders) */
     int                        native16;       /* OPTIONS4.Native16BitShaderOpsSupported under SM 6.2+ */
+    /* Bindless table (vio_texture_index): ResourceBindingTier >= 2; the
+     * VIO_BINDLESS_MAX descriptors from bindless_base up in the shader-visible
+     * SRV heap are reserved for it (root parameter [14]). */
+    int                        bindless;
+    UINT                       bindless_base;
     int                        view_instancing; /* OPTIONS3.ViewInstancingTier (multiview, SV_ViewID needs SM 6.1) */
+    int                        raytracing_tier; /* OPTIONS5.RaytracingTier (ray query needs 1.1 + SM 6.5) */
     /* Variable rate shading (GAP-PHASE5 Block 12): D3D12_VARIABLE_SHADING_RATE_TIER
      * (0 = none), the additional-rates cap (2x4 / 4x2 / 4x4), the sticky rate
      * (vio_shading_rate) and the ID3D12GraphicsCommandList5 view of the frame list. */
     int                        vrs_tier;
     int                        vrs_additional_rates;
     int                        shading_rate;
+    /* Shading-rate image (VIO_FEATURE_SHADING_RATE_IMAGE, Tier 2): an R8_UINT
+     * texture of D3D12_SHADING_RATE values, one texel per tile. */
+    int                        vrs_tile_size;      /* OPTIONS6.ShadingRateImageTileSize */
+    ID3D12Resource            *vrs_image;
+    int                        vrs_image_w, vrs_image_h;
+    int                        vrs_image_active;
+    int                        vrs_image_in_source; /* resource is in SHADING_RATE_SOURCE (after the first upload) */
     ID3D12GraphicsCommandList5 *cmd_list5;
     ID3D12GraphicsCommandList1 *cmd_list1;   /* SetViewInstanceMask (multiview) */
     /* Mesh shaders (VIO_FEATURE_MESH_SHADER): OPTIONS7.MeshShaderTier, the

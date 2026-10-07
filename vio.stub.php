@@ -375,6 +375,33 @@ function vio_swapchain_info(VioContext $context): array {}
 function vio_backend_info(VioContext $context): array|false {}
 
 /**
+ * Inline ray tracing (VIO_FEATURE_RAY_QUERY): build a bottom-level acceleration
+ * structure per distinct mesh (its location-0 positions and indices) and a
+ * top-level structure over the instances. Each instance is
+ * ['mesh' => VioMesh, 'transform' => float[16]] (column-major 4x4, optional,
+ * identity). Shaders query it with GL_EXT_ray_query (rayQueryEXT) in the
+ * fragment and compute stages. False + warning where the feature is 0.
+ */
+function vio_acceleration_structure(VioContext $context, array $instances): VioAccelerationStructure|false {}
+
+/**
+ * Bind an acceleration structure for the following draws and compute
+ * dispatches at the GLSL binding of the shader's accelerationStructureEXT.
+ */
+function vio_bind_acceleration_structure(VioContext $context, VioAccelerationStructure $accelerationStructure, int $binding): void {}
+
+/**
+ * Slot of $texture in the context's bindless texture table (VIO_FEATURE_BINDLESS,
+ * BINDLESS-PLAN.md). Shaders read the table as
+ *   layout(set = 1, binding = 0) uniform texture2D vio_textures[];
+ *   layout(set = 1, binding = 1) uniform sampler vio_sampler;   // linear, repeat
+ * and index it with nonuniformEXT (GL_EXT_nonuniform_qualifier). The first call adds
+ * the texture and keeps it alive until vio_destroy; later calls return the same slot.
+ * Plain 2D textures only, up to 1024. False (with a warning) without the feature.
+ */
+function vio_texture_index(VioContext $context, VioTexture $texture): int|false {}
+
+/**
  * Draw a mesh with arguments read from a storage buffer (VIO_FEATURE_INDIRECT_DRAW) —
  * typically written by a compute pass (GPU culling / LOD selection). Per draw record:
  * indexed meshes 5 uint32 {indexCount, instanceCount, firstIndex, baseVertex, firstInstance}
@@ -409,6 +436,22 @@ function vio_draw_mesh_tasks_indirect(VioContext $context, VioBuffer $args, int 
  * (VIO_SHADING_RATE_4X4 needs the device's additional-rates capability).
  */
 function vio_set_shading_rate(VioContext $context, int $rate): bool {}
+
+/**
+ * Shading-rate image (VIO_FEATURE_SHADING_RATE_IMAGE, D3D12 VRS Tier 2): one
+ * VIO_SHADING_RATE_* byte per screen tile, row by row ($tilesX * $tilesY bytes, the
+ * tile edge is vio_shading_rate_tile_size()). Each tile shades at the coarser of its
+ * own rate and the set / per-primitive rate (combiner MAX). Sticky across frames like
+ * vio_set_shading_rate; null clears it. False where the feature is 0 or the bytes do
+ * not match the tile count.
+ */
+function vio_set_shading_rate_image(VioContext $context, ?string $rates, int $tilesX = 0, int $tilesY = 0): bool {}
+
+/**
+ * Edge of one shading-rate image tile in pixels (D3D12 ShadingRateImageTileSize:
+ * 8, 16 or 32); 0 without VIO_FEATURE_SHADING_RATE_IMAGE.
+ */
+function vio_shading_rate_tile_size(VioContext $context): int {}
 
 /**
  * Draw a mesh in the current frame.

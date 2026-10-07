@@ -338,6 +338,23 @@ typedef enum _vio_feature {
      * vio_set_shading_rate set, for pipelines whose vertex stage writes it.
      * D3D12: VRS Tier 2 + SM 6.4 (SV_ShadingRate); Vulkan primitiveFragmentShadingRate. */
     VIO_FEATURE_SHADING_RATE_PRIMITIVE = 52,
+    /* vio_set_shading_rate_image(): one VIO_SHADING_RATE_* byte per screen tile
+     * (vio_shading_rate_tile_size() pixels); the final rate is the coarser of the
+     * set / primitive rate and the tile's rate. D3D12: VRS Tier 2. */
+    VIO_FEATURE_SHADING_RATE_IMAGE = 53,
+    /* vio_texture_index(): a per-context texture table the shaders index
+     * non-uniformly - `layout(set = 1, binding = 0) uniform texture2D
+     * vio_textures[]` + `layout(set = 1, binding = 1) uniform sampler vio_sampler`
+     * (BINDLESS-PLAN.md). D3D12 ResourceBindingTier 2, Vulkan descriptor
+     * indexing, Metal3 argument buffers tier 2; OpenGL / D3D11 0. */
+    VIO_FEATURE_BINDLESS           = 54,
+    /* Inline ray tracing: vio_acceleration_structure() (a BLAS per mesh + a TLAS
+     * over the instances), vio_bind_acceleration_structure(), GL_EXT_ray_query
+     * (rayQueryEXT) in the fragment and compute stages. D3D12: DXR Tier 1.1 +
+     * SM 6.5 (RayQuery); Vulkan: VK_KHR_acceleration_structure + VK_KHR_ray_query;
+     * Metal: ray queries from render pipelines (MSL 2.4). The ray-tracing
+     * PIPELINE (raygen / hit shaders) is VIO_FEATURE_RAYTRACING, still 0. */
+    VIO_FEATURE_RAY_QUERY          = 56,
     /* Mesh and task (amplification / object) stages: vio_shader(['task' => ?,
      * 'mesh' => ..., 'fragment' => ...]) (GL_EXT_mesh_shader) drawn with
      * vio_draw_mesh_tasks / vio_draw_mesh_tasks_indirect - geometry generated on
@@ -345,6 +362,9 @@ typedef enum _vio_feature {
      * Vulkan: VK_EXT_mesh_shader; Metal: mesh pipelines (Metal 3, Apple7 / Mac2). */
     VIO_FEATURE_MESH_SHADER        = 55,
 } vio_feature;
+
+/* Slots of the vio_texture_index() table (Set 1 of the bindless contract). */
+#define VIO_BINDLESS_MAX 1024
 
 #define VIO_MAX_VIEWPORTS 16
 
@@ -446,6 +466,29 @@ typedef struct _vio_backend_description {
     const char *cap_names[VIO_BACKEND_INFO_MAX_CAPS];
     int         cap_values[VIO_BACKEND_INFO_MAX_CAPS];
 } vio_backend_description;
+
+/* vio_acceleration_structure(): triangle geometry (positions xyz, uint32
+ * indices; CPU copies the mesh keeps) and the instances placing it. The
+ * backend builds one bottom-level structure per geometry and one top-level
+ * structure over the instances, synchronously. */
+typedef struct _vio_as_geometry {
+    const float    *positions;     /* vertex_count * 3 floats */
+    int             vertex_count;
+    const uint32_t *indices;       /* index_count uint32 (NULL: non-indexed triangle list) */
+    int             index_count;
+} vio_as_geometry;
+
+typedef struct _vio_as_instance {
+    int   geometry;                /* index into geometries */
+    float transform[12];           /* row-major 3x4 object -> world */
+} vio_as_instance;
+
+typedef struct _vio_as_desc {
+    const vio_as_geometry *geometries;
+    int                    geometry_count;
+    const vio_as_instance *instances;
+    int                    instance_count;
+} vio_as_desc;
 
 /* ── Descriptor structs ───────────────────────────────────────────── */
 
