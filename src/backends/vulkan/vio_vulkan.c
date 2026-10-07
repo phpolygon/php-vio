@@ -596,11 +596,25 @@ static int create_logical_device(void)
     rq_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
     VkPhysicalDeviceBufferDeviceAddressFeaturesKHR bda_enable = {0};
     bda_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
+    /* lavapipe on aarch64 (Mesa 25.2) crashes in its JIT-compiled BVH build
+     * (a store through an out-of-range address on the first
+     * vkCmdBuildAccelerationStructuresKHR); the same build runs on x86_64.
+     * Report no ray query there instead of taking the process down;
+     * VIO_VK_FORCE_RAY_QUERY=1 re-enables it to check a newer Mesa. */
+    int rq_driver_ok = 1;
+#if defined(__aarch64__)
+    {
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(vio_vk.physical_device, &pp);
+        const char *force = getenv("VIO_VK_FORCE_RAY_QUERY");
+        if (strncmp(pp.deviceName, "llvmpipe", 8) == 0 && !(force && force[0] == '1')) rq_driver_ok = 0;
+    }
+#endif
     /* The ray tracing pipeline (VIO_FEATURE_RAYTRACING) builds on the same set. */
     vio_vk.rt_pipeline_supported = 0;
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtp_enable = {0};
     rtp_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
-    if (has_as && has_rq && has_dho && has_bda && has_di && has_spv14 && has_sfc && vio_vk.instance_api_11) {
+    if (rq_driver_ok && has_as && has_rq && has_dho && has_bda && has_di && has_spv14 && has_sfc && vio_vk.instance_api_11) {
         VkPhysicalDeviceAccelerationStructureFeaturesKHR as_avail = {0};
         as_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
         VkPhysicalDeviceRayQueryFeaturesKHR rq_avail = {0};
