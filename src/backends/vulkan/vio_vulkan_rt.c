@@ -392,6 +392,10 @@ static void vkrt_free(vio_vk_rt *x)
     vkrt_kill(VIO_VK_GRAVE_DESCRIPTOR_POOL, (uint64_t)x->dmip_pool, NULL);
     free(x->dmip_fb); free(x->dmip_att); free(x->dmip_src); free(x->dmip_set);
     vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->depth_sample_view, NULL);
+    vkrt_kill(VIO_VK_GRAVE_FRAMEBUFFER, (uint64_t)x->dres_fb, NULL);
+    vkrt_kill(VIO_VK_GRAVE_DESCRIPTOR_POOL, (uint64_t)x->dres_pool, NULL);
+    vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->msaa_depth_view, NULL);
+    vkrt_kill(VIO_VK_GRAVE_IMAGE, (uint64_t)x->msaa_depth_image, x->msaa_depth_alloc);
     vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->depth_view, NULL);
     vkrt_kill(VIO_VK_GRAVE_IMAGE, (uint64_t)x->depth_image, x->depth_alloc);
     free(x->face_fb);
@@ -461,6 +465,17 @@ static const char *vk_dmip_fs =
     "    gl_FragDepth = d;\n"
     "}\n";
 
+static const char *vk_dmip_resolve_fs =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2DMS u_src;\n"
+    "layout(push_constant) uniform P { ivec4 sizes; ivec4 mode; } pc;\n"
+    "void main() {\n"
+    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "    float d = pc.mode.x == 0 ? 0.0 : 1.0;\n"
+    "    for (int s = 0; s < pc.mode.y; s++) { float v = texelFetch(u_src, p, s).r; d = pc.mode.x == 0 ? max(d, v) : min(d, v); }\n"
+    "    gl_FragDepth = d;\n"
+    "}\n";
+
 extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage, size_t *out_size, char **error_msg);
 
 static struct {
@@ -469,12 +484,14 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout      layout;
     VkPipeline            pipeline;
+    VkPipeline            resolve_pipeline;   /* depth_only MSAA (A24) */
 } vk_dmip;
 
 void vio_vk_depth_mip_shutdown(void)
 {
     if (!vk_dmip.device) return;
     if (vk_dmip.pipeline) vkDestroyPipeline(vk_dmip.device, vk_dmip.pipeline, NULL);
+    if (vk_dmip.resolve_pipeline) vkDestroyPipeline(vk_dmip.device, vk_dmip.resolve_pipeline, NULL);
     if (vk_dmip.layout)   vkDestroyPipelineLayout(vk_dmip.device, vk_dmip.layout, NULL);
     if (vk_dmip.dsl)      vkDestroyDescriptorSetLayout(vk_dmip.device, vk_dmip.dsl, NULL);
     if (vk_dmip.pass)     vkDestroyRenderPass(vk_dmip.device, vk_dmip.pass, NULL);
@@ -498,35 +515,10 @@ static VkShaderModule vk_dmip_module(const char *src, int fragment)
     return m;
 }
 
-static int vk_dmip_ensure(void)
+/* A full-screen depth-writing pipeline on the depth-only pass and layout. */
+static int vk_dmip_pipeline(const char *fs_src, VkPipeline *out)
 {
-    if (vk_dmip.device == vio_vk.device && vk_dmip.pipeline) return 0;
-    vio_vk_depth_mip_shutdown();
-    vk_dmip.device = vio_vk.device;
-    vio_vk_rt shape;
-    memset(&shape, 0, sizeof(shape));
-    shape.samples = 1;   /* depth-only, single-sample: compatible with every depth_only target pass */
-    vk_dmip.pass = vkrt_pass_views(&shape, 1, 0);
-    VkDescriptorSetLayoutBinding b = {0};
-    b.binding = 0;
-    b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b.descriptorCount = 1;
-    b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo dci = {0};
-    dci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dci.bindingCount = 1;
-    dci.pBindings = &b;
-    VkPushConstantRange pr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32 };
-    if (!vk_dmip.pass || vkCreateDescriptorSetLayout(vio_vk.device, &dci, NULL, &vk_dmip.dsl) != VK_SUCCESS) return -1;
-    VkPipelineLayoutCreateInfo lci = {0};
-    lci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    lci.setLayoutCount = 1;
-    lci.pSetLayouts = &vk_dmip.dsl;
-    lci.pushConstantRangeCount = 1;
-    lci.pPushConstantRanges = &pr;
-    if (vkCreatePipelineLayout(vio_vk.device, &lci, NULL, &vk_dmip.layout) != VK_SUCCESS) return -1;
-
-    VkShaderModule vs = vk_dmip_module(vk_dmip_vs, 0), fs = vk_dmip_module(vk_dmip_fs, 1);
+    VkShaderModule vs = vk_dmip_module(vk_dmip_vs, 0), fs = vk_dmip_module(fs_src, 1);
     int ok = vs && fs;
     if (ok) {
         VkPipelineShaderStageCreateInfo st[2] = {0};
@@ -567,11 +559,43 @@ static int vk_dmip_ensure(void)
         pci.pDynamicState = &dy;
         pci.layout = vk_dmip.layout;
         pci.renderPass = vk_dmip.pass;
-        ok = vkCreateGraphicsPipelines(vio_vk.device, VK_NULL_HANDLE, 1, &pci, NULL, &vk_dmip.pipeline) == VK_SUCCESS;
+        ok = vkCreateGraphicsPipelines(vio_vk.device, VK_NULL_HANDLE, 1, &pci, NULL, out) == VK_SUCCESS;
     }
     if (vs) vkDestroyShaderModule(vio_vk.device, vs, NULL);
     if (fs) vkDestroyShaderModule(vio_vk.device, fs, NULL);
     return ok ? 0 : -1;
+}
+
+static int vk_dmip_ensure(void)
+{
+    if (vk_dmip.device == vio_vk.device && vk_dmip.pipeline) return 0;
+    vio_vk_depth_mip_shutdown();
+    vk_dmip.device = vio_vk.device;
+    vio_vk_rt shape;
+    memset(&shape, 0, sizeof(shape));
+    shape.samples = 1;   /* depth-only, single-sample: compatible with every depth_only target pass */
+    vk_dmip.pass = vkrt_pass_views(&shape, 1, 0);
+    VkDescriptorSetLayoutBinding b = {0};
+    b.binding = 0;
+    b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b.descriptorCount = 1;
+    b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo dci = {0};
+    dci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dci.bindingCount = 1;
+    dci.pBindings = &b;
+    VkPushConstantRange pr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32 };
+    if (!vk_dmip.pass || vkCreateDescriptorSetLayout(vio_vk.device, &dci, NULL, &vk_dmip.dsl) != VK_SUCCESS) return -1;
+    VkPipelineLayoutCreateInfo lci = {0};
+    lci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    lci.setLayoutCount = 1;
+    lci.pSetLayouts = &vk_dmip.dsl;
+    lci.pushConstantRangeCount = 1;
+    lci.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(vio_vk.device, &lci, NULL, &vk_dmip.layout) != VK_SUCCESS) return -1;
+
+    if (vk_dmip_pipeline(vk_dmip_fs, &vk_dmip.pipeline) != 0) return -1;
+    return vk_dmip_pipeline(vk_dmip_resolve_fs, &vk_dmip.resolve_pipeline);
 }
 
 /* Per-target views, framebuffers and descriptor sets, built once. */
@@ -710,6 +734,7 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
     x->levels  = (x->cube && rt->mip_levels > 1 && !depth_only) ? rt->mip_levels : 1;
     /* Cube / array targets multisample too (A24): an MS colour array, the depth
      * array multisampled, resolve attachments into level 0 of each face. */
+    int want_ms = rt->samples;   /* depth_only MSAA below (A24) */
     x->samples = depth_only ? 1 : vkrt_supported_samples(rt->samples);
     rt->samples = x->samples;
     VkFormat df = vio_vk_depth_format();
@@ -736,6 +761,8 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
      * so every layer has its own depth and depth_only targets sample as
      * samplerCube / sampler2DArray. */
     x->depth_levels = (depth_only && !layered && rt->mip_levels > 1) ? rt->mip_levels : 1;
+    /* depth_only MSAA (A24): the sampled depth stays single-sample. */
+    int depth_ms = (depth_only && !layered && x->depth_levels == 1 && want_ms > 1) ? vkrt_supported_samples(want_ms) : 1;
     if (vkrt_image(df, width, height, x->depth_levels, layers, x->samples,
                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                    (depth_only ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) : 0),
@@ -746,6 +773,15 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
         ? vkrt_view(x->depth_image, df, all_view, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, (uint32_t)layers)
         : vkrt_view(x->depth_image, df, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1);
     if (!x->depth_view) goto fail;
+    if (depth_ms > 1) {
+        if (vkrt_image(df, width, height, 1, 1, depth_ms,
+                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       0, &x->msaa_depth_image, &x->msaa_depth_alloc) != 0) goto fail;
+        x->msaa_depth_view = vkrt_view(x->msaa_depth_image, df, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1);
+        if (!x->msaa_depth_view) goto fail;
+        x->samples = depth_ms;   /* the pass and the pipelines render multisampled */
+        rt->samples = depth_ms;
+    }
     if (x->depth_levels > 1) {
         x->depth_sample_view = vkrt_view(x->depth_image, df, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 0, (uint32_t)x->depth_levels, 0, 1);
         if (!x->depth_sample_view) goto fail;
@@ -822,7 +858,7 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
         VkImageView views[9];
         uint32_t n = 0;
         for (int i = 0; i < x->count; i++) views[n++] = x->samples > 1 ? x->msaa_view[i] : x->color_view[i];
-        views[n++] = x->depth_view;
+        views[n++] = x->msaa_depth_view ? x->msaa_depth_view : x->depth_view;
         if (x->samples > 1) for (int i = 0; i < x->count; i++) views[n++] = x->color_view[i];
         x->fb = vkrt_framebuffer(x->pass, views, n, (uint32_t)width, (uint32_t)height);
         if (!x->fb) goto fail;
@@ -879,6 +915,12 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
                 vio_vk_image_barrier_range(cmd, x->depth_image, da, 0, (uint32_t)x->depth_levels, 0, (uint32_t)layers, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 vkCmdClearDepthStencilImage(cmd, x->depth_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1, &r);
                 vio_vk_image_barrier_range(cmd, x->depth_image, da, 0, (uint32_t)x->depth_levels, 0, (uint32_t)layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, steady);
+                if (x->msaa_depth_image) {
+                    VkImageSubresourceRange mr = { da, 0, 1, 0, 1 };
+                    vio_vk_image_barrier_range(cmd, x->msaa_depth_image, da, 0, 1, 0, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    vkCmdClearDepthStencilImage(cmd, x->msaa_depth_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1, &mr);
+                    vio_vk_image_barrier_range(cmd, x->msaa_depth_image, da, 0, 1, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, steady);
+                }
             }
             vio_vk_submit_transient(cmd);
         }
@@ -963,13 +1005,82 @@ static void vkrt_begin(VkCommandBuffer cmd, vio_render_target_object *rt, int fa
     rt->bound_level = l;
 }
 
+/* depth_only MSAA (A24): reduce each texel's samples (max / min, the target's
+ * depth_reduction) into the single-sample depth with a full-screen pass. */
+static void vk_dres_record(VkCommandBuffer cmd, vio_render_target_object *rt, vio_vk_rt *x)
+{
+    if (vk_dmip_ensure() != 0) return;
+    if (!x->dres_fb) {
+        VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
+        VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        pci.maxSets = 1;
+        pci.poolSizeCount = 1;
+        pci.pPoolSizes = &ps;
+        if (vkCreateDescriptorPool(vio_vk.device, &pci, NULL, &x->dres_pool) != VK_SUCCESS) return;
+        VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        ai.descriptorPool = x->dres_pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &vk_dmip.dsl;
+        if (vkAllocateDescriptorSets(vio_vk.device, &ai, &x->dres_set) != VK_SUCCESS) return;
+        VkDescriptorImageInfo ii = { x->sampler, x->msaa_depth_view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL };
+        VkWriteDescriptorSet wd = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        wd.dstSet = x->dres_set;
+        wd.descriptorCount = 1;
+        wd.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wd.pImageInfo = &ii;
+        vkUpdateDescriptorSets(vio_vk.device, 1, &wd, 0, NULL);
+        x->dres_fb = vkrt_framebuffer(vk_dmip.pass, &x->depth_view, 1, (uint32_t)rt->width, (uint32_t)rt->height);
+        if (!x->dres_fb) return;
+    }
+    VkImageAspectFlags da = vkrt_depth_aspect();
+    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    b.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = x->msaa_depth_image;
+    b.subresourceRange.aspectMask = da;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    VkRenderPassBeginInfo rb = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rb.renderPass = vk_dmip.pass;
+    rb.framebuffer = x->dres_fb;
+    rb.renderArea.extent.width = (uint32_t)rt->width;
+    rb.renderArea.extent.height = (uint32_t)rt->height;
+    vkCmdBeginRenderPass(cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport vp = { 0.0f, 0.0f, (float)rt->width, (float)rt->height, 0.0f, 1.0f };
+    VkRect2D sc = { { 0, 0 }, { (uint32_t)rt->width, (uint32_t)rt->height } };
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_dmip.resolve_pipeline);
+    int32_t pc[8] = { rt->width, rt->height, rt->width, rt->height, rt->depth_reduction == VIO_DEPTH_REDUCE_MIN ? 1 : 0, x->samples, 0, 0 };
+    vkCmdPushConstants(cmd, vk_dmip.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_dmip.layout, 0, 1, &x->dres_set, 0, NULL);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cmd);
+    b.image = x->depth_image;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                         VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
+/* End the open pass; a multisampled depth_only target being left resolves. */
+static void vkrt_leave(VkCommandBuffer cmd)
+{
+    if (vio_vk.cur_render_pass) vkCmdEndRenderPass(cmd);
+    vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vio_render_target_object *prev = (vio_render_target_object *)vio_vk.current_bound_rt;
+    vio_vk_rt *px = prev ? (vio_vk_rt *)prev->vulkan_rt : NULL;
+    if (px && px->msaa_depth_image) vk_dres_record(cmd, prev, px);
+}
+
 void vulkan_record_bind_render_target(void *rt_ptr)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (!rt || rt->backend_type != VIO_RT_BACKEND_VULKAN || !rt->vulkan_rt || !vio_vk.in_frame) return;
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
-    if (vio_vk.cur_render_pass) vkCmdEndRenderPass(cmd);
-    vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vkrt_leave(cmd);
     vkrt_begin(cmd, rt, 0, 0);
 }
 
@@ -991,8 +1102,7 @@ int vio_vk_bind_render_target_face(void *rt_ptr, int face, int level)
         return -1;
     }
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
-    if (vio_vk.cur_render_pass) vkCmdEndRenderPass(cmd);
-    vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vkrt_leave(cmd);
     vkrt_begin(cmd, rt, face, level);
     return 0;
 }
@@ -1059,8 +1169,7 @@ void vulkan_record_unbind_render_target(void)
 {
     if (!vio_vk.in_frame) return;
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
-    if (vio_vk.cur_render_pass) vkCmdEndRenderPass(cmd);   /* MSAA resolves here */
-    vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vkrt_leave(cmd);   /* colour MSAA resolves in the pass, depth_only MSAA here */
     vio_vk.current_bound_rt = NULL;
     if (vio_vk.frame_is_offscreen) return;   /* no swapchain image in an offscreen-only frame */
     vio_vk_resume_swapchain_pass(cmd);

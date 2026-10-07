@@ -88,6 +88,14 @@ typedef struct _vio_vk_rt {
     VkImageView    msaa_view[4];
     VkImageView   *msaa_face_view; /* cube / array MSAA (A24): MS colour view per layer */
     VkImageView    msaa_all_view;  /* ... and over every layer (VIO_RT_ALL_LAYERS) */
+    /* depth_only MSAA (A24): the multisampled depth drawn into, resolved into
+     * depth_image (max / min of the samples) when the binding leaves it. */
+    VkImage        msaa_depth_image;
+    void          *msaa_depth_alloc;
+    VkImageView    msaa_depth_view;
+    VkFramebuffer  dres_fb;
+    VkDescriptorPool dres_pool;
+    VkDescriptorSet  dres_set;
     VkImage        depth_image;
     void          *depth_alloc;
     VkImageView    depth_view;
