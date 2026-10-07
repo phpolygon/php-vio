@@ -1306,7 +1306,20 @@ static int d3d12_init(vio_config *cfg)
     }
 
     vio_hlsl_set_16bit_types(0);   /* FXC / SM < 6.2: min16float as before */
-    if (cfg->shader_model >= 6) {
+    /* 6 = highest 6.x; 60..69 (major * 10 + minor) pins the profile, values above
+     * the device / DXC maximum clamp to it. Without the option,
+     * VIO_D3D12_SHADER_MODEL (same encoding) applies. */
+    int sm_req = cfg->shader_model;
+    if (sm_req == 0) {
+        /* Win32 block, not the CRT copy: PHP's putenv() updates the former. */
+        char env[16];
+        DWORD n = GetEnvironmentVariableA("VIO_D3D12_SHADER_MODEL", env, sizeof(env));
+        if (n > 0 && n < sizeof(env)) sm_req = atoi(env);
+    }
+    /* 50..59 = FXC 5.1 explicitly; other values >= 6 (pre-pinning callers passed
+     * 6) take DXC, capped at the pinned minor. */
+    int sm_cap_minor = (sm_req >= 60 && sm_req <= 69) ? sm_req - 60 : 9;
+    if (sm_req >= 6 && !(sm_req >= 50 && sm_req <= 59)) {
         if (cfg->dxc_dir[0]) vio_dxc_set_dir(cfg->dxc_dir);
         /* The runtime rejects HighestShaderModel values it does not know
          * (E_INVALIDARG), so walk down from 6.9 until it answers; it then
@@ -1320,6 +1333,7 @@ static int d3d12_init(vio_config *cfg)
                 break;
             }
         }
+        if (device_minor > sm_cap_minor) device_minor = sm_cap_minor;
         int dxc_minor = (device_minor >= 0 && vio_dxc_available()) ? vio_dxc_highest_minor(device_minor) : -1;
         if (dxc_minor >= 0) {
             vio_d3d12.shader_model = 6;

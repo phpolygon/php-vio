@@ -471,8 +471,10 @@ typedef struct _vio_config {
     float       hdr_paper_white;
     /* D3D12 shader model (GAP-PHASE5 Block 7): 6 compiles the SPIRV-Cross HLSL
      * with DXC to DXIL (dxcompiler.dll + dxil.dll must be loadable, the device
-     * must report SM 6.0); 0 / 5 = FXC 5.1 as before. The profile is the highest
-     * 6.x both the device and the loaded DXC / dxil.dll accept. dxc_dir
+     * must report SM 6.0); 0 / 5 / 50..59 = FXC 5.1 as before. The profile is the
+     * highest 6.x both the device and the loaded DXC / dxil.dll accept; 60..69
+     * (major * 10 + minor) pins a lower one. 0 falls back to the environment
+     * variable VIO_D3D12_SHADER_MODEL (same encoding). dxc_dir
      * optionally names the directory holding the two DLLs. */
     int         shader_model;
     char        dxc_dir[512];

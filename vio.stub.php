@@ -20,7 +20,9 @@
  *                       hdr_paper_white => nits that display white maps to (default 200),
  *                       shader_model => 6: compile D3D12 shaders with DXC to DXIL (needs dxcompiler.dll +
  *                       dxil.dll, optionally located via dxc_dir => directory; falls back to FXC 5.1). The
- *                       profile is the highest 6.x the device and DXC accept; it enables subgroup
+ *                       profile is the highest 6.x the device and DXC accept; 60..69 pins it
+ *                       (62 = SM 6.2, clamped to that maximum; 50..59 = FXC 5.1; without the option the
+ *                       environment variable VIO_D3D12_SHADER_MODEL applies). SM 6 enables subgroup
  *                       operations (VIO_FEATURE_SUBGROUP) on devices with wave ops),
  *                       msl_version => 21: pin the Metal Shading Language version (major * 10 + minor,
  *                       2.0 .. the OS maximum; default the maximum, or VIO_METAL_MSL_VERSION),

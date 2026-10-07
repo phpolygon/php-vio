@@ -197,7 +197,7 @@ pick_backend:
         if ((val = zend_hash_str_find(options_ht, "hdr_paper_white", sizeof("hdr_paper_white") - 1)) != NULL) {
             ctx->config.hdr_paper_white = (float)zval_get_double(val);
         }
-        /* D3D12 shader model: 6 => DXC / DXIL (opt-in), default FXC 5.1. */
+        /* D3D12 shader model: 6 => DXC / DXIL (opt-in), 60..69 pins the profile, default FXC 5.1. */
         if ((val = zend_hash_str_find(options_ht, "shader_model", sizeof("shader_model") - 1)) != NULL) {
             ctx->config.shader_model = (int)zval_get_long(val);
         }
