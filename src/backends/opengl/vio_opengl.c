@@ -403,6 +403,51 @@ static void opengl_gpu_info(const char **name, uint64_t *vram_bytes)
     *name = gpu_name;
 }
 
+static int opengl_supports_feature(vio_feature feature);
+
+/* vio_backend_info (A4): GL has no PCI vendor id and no device type query, so
+ * both come from GL_VENDOR / GL_RENDERER; software rasterizers (llvmpipe,
+ * softpipe, Microsoft's GDI renderer) report their vendor as Mesa / Microsoft. */
+static int opengl_describe(vio_backend_description *out)
+{
+    static char api[32], device[256], driver[256], core[24];
+    if (!vio_gl.initialized || !out) return -1;
+    const char *vendor = (const char *)glGetString(GL_VENDOR);
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+    const char *version = (const char *)glGetString(GL_VERSION);
+    if (!vendor) vendor = "";
+    if (!renderer) renderer = "";
+    snprintf(api, sizeof(api), "OpenGL %d.%d", vio_gl.gl_major, vio_gl.gl_minor);
+    snprintf(core, sizeof(core), "core_%d_%d", vio_gl.gl_major, vio_gl.gl_minor);
+    snprintf(device, sizeof(device), "%s", renderer[0] ? renderer : "OpenGL");
+    snprintf(driver, sizeof(driver), "%s", version ? version : "");
+    int software = strstr(renderer, "llvmpipe") || strstr(renderer, "softpipe")
+                || strstr(renderer, "GDI Generic") || strstr(renderer, "SwiftShader");
+    uint32_t id = 0;
+    if (strstr(renderer, "GDI Generic") || strstr(vendor, "Microsoft")) id = 0x1414;
+    else if (software || strstr(vendor, "Mesa") || strstr(vendor, "VMware")) id = 0x10005;
+    else if (strstr(vendor, "NVIDIA")) id = 0x10DE;
+    else if (strstr(vendor, "ATI") || strstr(vendor, "AMD")) id = 0x1002;
+    else if (strstr(vendor, "Intel")) id = 0x8086;
+    else if (strstr(vendor, "Apple")) id = 0x106B;
+    else if (strstr(vendor, "ARM")) id = 0x13B5;
+    else if (strstr(vendor, "Qualcomm")) id = 0x5143;
+    out->api = api;
+    out->device = device;
+    out->shading_language = "GLSL";
+    out->shading_language_version = vio_gl.glsl_version / 10;
+    out->shading_language_max = vio_gl.glsl_version / 10;
+    out->family_count = 0;
+    out->families[out->family_count++] = core;
+    out->cap_count = 0;
+    vio_describe_feature_caps(out, opengl_supports_feature);
+    out->vendor_id = id;
+    out->driver = driver;
+    out->device_type = software ? "software" : NULL;
+    out->vram_bytes = 0;
+    return 0;
+}
+
 static void opengl_shutdown(void)
 {
     if (vio_gl.default_shader_program) {
@@ -2840,6 +2885,7 @@ static const vio_backend opengl_backend = {
     .gpu_mark          = opengl_gpu_mark,
     .gpu_marks         = opengl_gpu_marks,
     .gpu_info          = opengl_gpu_info,
+    .describe          = opengl_describe,
     .draw_indirect     = opengl_draw_indirect,
     .set_viewport      = opengl_set_viewport,
     .set_viewports     = opengl_set_viewports,

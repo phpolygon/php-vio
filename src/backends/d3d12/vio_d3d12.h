@@ -436,6 +436,9 @@ typedef struct _vio_d3d12_state {
      * vram_bytes = DedicatedVideoMemory; 0 if unknown (e.g. WARP/headless). */
     char                       gpu_name[256];
     uint64_t                   vram_bytes;
+    uint32_t                   vendor_id;        /* vio_backend_info (A4) */
+    char                       driver[32];
+    int                        software_adapter; /* WARP */
 
     /* Index of the most recently presented backbuffer. frame_index is
      * updated to the NEXT buffer right after Present(), so code paths

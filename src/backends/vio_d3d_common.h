@@ -9,6 +9,28 @@
 
 #include <dxgiformat.h>
 #include <dxgi1_6.h>
+#include <stdio.h>
+
+/* vio_backend_info (A4): PCI vendor, user-mode driver version and whether the
+ * adapter is the software rasterizer (WARP / Microsoft Basic Render Driver). */
+static inline void vio_dxgi_adapter_identity(IDXGIAdapter *adapter, uint32_t *vendor_id,
+                                             char *driver, size_t driver_size, int *software)
+{
+    DXGI_ADAPTER_DESC d;
+    LARGE_INTEGER umd;
+    *vendor_id = 0;
+    *software = 0;
+    if (driver_size) driver[0] = '\0';
+    if (!adapter) return;
+    if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &d))) {
+        *vendor_id = d.VendorId;
+        *software = d.VendorId == 0x1414 && d.DeviceId == 0x8C;
+    }
+    if (driver_size && SUCCEEDED(IDXGIAdapter_CheckInterfaceSupport(adapter, &IID_IDXGIDevice, &umd)))
+        snprintf(driver, driver_size, "%u.%u.%u.%u",
+                 (unsigned)HIWORD(umd.HighPart), (unsigned)LOWORD(umd.HighPart),
+                 (unsigned)HIWORD(umd.LowPart), (unsigned)LOWORD(umd.LowPart));
+}
 #include <windows.h>
 #include "../../include/vio_types.h"
 

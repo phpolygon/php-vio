@@ -1195,6 +1195,8 @@ static int d3d12_init(vio_config *cfg)
         DXGI_ADAPTER_DESC1 sel_desc;
         if (SUCCEEDED(IDXGIAdapter1_GetDesc1(adapter, &sel_desc))) {
             vio_d3d12.vram_bytes = (uint64_t)sel_desc.DedicatedVideoMemory;
+            vio_dxgi_adapter_identity((IDXGIAdapter *)adapter, &vio_d3d12.vendor_id, vio_d3d12.driver,
+                                      sizeof(vio_d3d12.driver), &vio_d3d12.software_adapter);
             int n = WideCharToMultiByte(CP_UTF8, 0, sel_desc.Description, -1,
                                         vio_d3d12.gpu_name, (int)sizeof(vio_d3d12.gpu_name),
                                         NULL, NULL);
@@ -5645,6 +5647,58 @@ static void d3d12_gpu_info(const char **name, uint64_t *vram_bytes)
     *vram_bytes = vio_d3d12.vram_bytes;
 }
 
+static int d3d12_supports_feature(vio_feature feature);
+
+/* vio_backend_info (A4): feature level, shader model in use / of the device,
+ * adapter identity and the optional features. */
+static int d3d12_describe(vio_backend_description *out)
+{
+    static char fl_name[16];
+    if (!vio_d3d12.initialized || !vio_d3d12.device || !out) return -1;
+    /* 12_2 (0xc200) first; runtimes that do not know it reject the query. */
+    static const D3D_FEATURE_LEVEL levels[] = { (D3D_FEATURE_LEVEL)0xc200, D3D_FEATURE_LEVEL_12_1,
+        D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    int flv = D3D_FEATURE_LEVEL_11_0;
+    for (int first = 0; first < 2; first++) {
+        D3D12_FEATURE_DATA_FEATURE_LEVELS fl = { (UINT)(5 - first), levels + first, D3D_FEATURE_LEVEL_11_0 };
+        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl)))) {
+            flv = (int)fl.MaxSupportedFeatureLevel;
+            break;
+        }
+    }
+    snprintf(fl_name, sizeof(fl_name), "fl_%d_%d", (flv >> 12) & 0xF, (flv >> 8) & 0xF);
+    int sm_max = 51;
+    for (int v = 0x69; v >= 0x60; v--) {
+        D3D12_FEATURE_DATA_SHADER_MODEL sm = { (D3D_SHADER_MODEL)v };
+        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
+            if ((int)sm.HighestShaderModel >= 0x60)
+                sm_max = ((int)sm.HighestShaderModel >> 4) * 10 + ((int)sm.HighestShaderModel & 0xF);
+            break;
+        }
+    }
+    out->api = "Direct3D 12";
+    out->device = vio_d3d12.gpu_name;
+    out->shading_language = "HLSL";
+    out->shading_language_version = vio_d3d12.shader_model == 6 ? vio_d3d12.shader_model_version : 51;
+    out->shading_language_max = sm_max > out->shading_language_version ? sm_max : out->shading_language_version;
+    out->family_count = 0;
+    out->families[out->family_count++] = fl_name;
+    out->families[out->family_count++] = vio_d3d12.shader_model == 6 ? "dxil" : "dxbc";
+    if (vio_d3d12.agility_sdk) out->families[out->family_count++] = "agility_sdk";
+    out->cap_count = 0;
+    vio_describe_feature_caps(out, d3d12_supports_feature);
+    out->vendor_id = vio_d3d12.vendor_id;
+    out->driver = vio_d3d12.driver;
+    out->vram_bytes = vio_d3d12.vram_bytes;
+    if (vio_d3d12.software_adapter) out->device_type = "software";
+    else {
+        D3D12_FEATURE_DATA_ARCHITECTURE1 arch = {0};
+        out->device_type = SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch)))
+            ? (arch.UMA ? "integrated" : "discrete") : NULL;
+    }
+    return 0;
+}
+
 static void d3d12_destroy_shader(void *shader_ptr)
 {
     vio_d3d12_shader *s = (vio_d3d12_shader *)shader_ptr;
@@ -8549,6 +8603,7 @@ static const vio_backend d3d12_backend = {
     .update_texture          = d3d12_update_texture,
     .bind_stage_constants    = d3d12_bind_stage_constants,
     .gpu_info                = d3d12_gpu_info,
+    .describe                = d3d12_describe,
     .create_acceleration_structure  = d3d12_create_acceleration_structure,
     .destroy_acceleration_structure = d3d12_destroy_acceleration_structure,
     .bind_acceleration_structure    = d3d12_bind_acceleration_structure,

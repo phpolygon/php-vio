@@ -8532,6 +8532,11 @@ ZEND_FUNCTION(vio_backend_info)
         if (d.cap_names[i]) add_assoc_bool(&caps, (char *)d.cap_names[i], d.cap_values[i] ? 1 : 0);
     }
     add_assoc_zval(return_value, "caps", &caps);
+    add_assoc_long(return_value, "vendor_id", (zend_long)d.vendor_id);
+    add_assoc_string(return_value, "vendor", (char *)vio_vendor_name(d.vendor_id));
+    add_assoc_string(return_value, "driver", (char *)(d.driver ? d.driver : ""));
+    add_assoc_string(return_value, "device_type", (char *)(d.device_type ? d.device_type : "unknown"));
+    add_assoc_long(return_value, "vram_bytes", (zend_long)d.vram_bytes);
 }
 
 /* ── Inline ray tracing (VIO_FEATURE_RAY_QUERY) ──────────────────── */

@@ -6091,6 +6091,14 @@ static int metal_describe(vio_backend_description *out)
     CAP(mesh_shaders); CAP(atomic64); CAP(tensors); CAP(bindless);
     CAP(rasterization_rate_map); CAP(bc_texture_compression); CAP(unified_memory);
 #undef CAP
+    /* Metal has no PCI vendor id: Intel Macs carry AMD / Intel GPUs. */
+    const char *nm = vio_mtl.gpu_name;
+    out->vendor_id = strstr(nm, "AMD") ? 0x1002 : strstr(nm, "Intel") ? 0x8086
+                   : strstr(nm, "NVIDIA") ? 0x10DE : 0x106B;
+    out->driver = "";
+    out->device_type = c->unified_memory ? "integrated" : "discrete";
+    const char *unused = NULL;
+    vio_metal_gpu_info(&unused, &out->vram_bytes);
     return 0;
 }
 

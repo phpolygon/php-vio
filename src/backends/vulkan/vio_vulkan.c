@@ -1074,6 +1074,60 @@ static void vulkan_gpu_info(const char **name, uint64_t *vram_bytes)
     *vram_bytes = vram;
 }
 
+static int vulkan_supports_feature(vio_feature feature);
+
+/* SPIR-V version a Vulkan API version consumes, as major * 10 + minor. */
+static int vulkan_spirv_for_api(uint32_t api)
+{
+    uint32_t mn = VK_VERSION_MINOR(api);
+    return mn >= 3 ? 16 : mn == 2 ? 15 : mn == 1 ? 13 : 10;
+}
+
+/* vio_backend_info (A4): API versions, SPIR-V in use / accepted, adapter
+ * identity and the optional features. driverVersion is vendor-encoded. */
+static int vulkan_describe(vio_backend_description *out)
+{
+    static char api[32], driver[32], device[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE], core[16];
+    if (!vio_vk.initialized || !vio_vk.physical_device || !out) return -1;
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(vio_vk.physical_device, &props);
+    uint32_t inst = vio_vk.instance_api_11 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
+    uint32_t used = props.apiVersion < inst ? props.apiVersion : inst;
+    snprintf(api, sizeof(api), "Vulkan %u.%u", VK_VERSION_MAJOR(used), VK_VERSION_MINOR(used));
+    snprintf(core, sizeof(core), "core_%u_%u", VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion));
+    memcpy(device, props.deviceName, sizeof(device));
+    device[sizeof(device) - 1] = '\0';
+    uint32_t v = props.driverVersion;
+    if (props.vendorID == 0x10DE)
+        snprintf(driver, sizeof(driver), "%u.%u", (v >> 22) & 0x3FF, (v >> 14) & 0xFF);
+#ifdef _WIN32
+    else if (props.vendorID == 0x8086)
+        snprintf(driver, sizeof(driver), "%u.%u", v >> 14, v & 0x3FFF);
+#endif
+    else
+        snprintf(driver, sizeof(driver), "%u.%u.%u", VK_VERSION_MAJOR(v), VK_VERSION_MINOR(v), VK_VERSION_PATCH(v));
+    out->api = api;
+    out->device = device;
+    out->shading_language = "SPIR-V";
+    out->shading_language_version = vulkan_spirv_for_api(used);
+    out->shading_language_max = vulkan_spirv_for_api(props.apiVersion);
+    out->family_count = 0;
+    out->families[out->family_count++] = core;
+    out->cap_count = 0;
+    vio_describe_feature_caps(out, vulkan_supports_feature);
+    out->vendor_id = props.vendorID;
+    out->driver = driver;
+    switch (props.deviceType) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   out->device_type = "discrete"; break;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: out->device_type = "integrated"; break;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:            out->device_type = "software"; break;
+    default:                                     out->device_type = NULL; break;
+    }
+    const char *name = NULL;
+    vulkan_gpu_info(&name, &out->vram_bytes);
+    return 0;
+}
+
 static void vulkan_swapchain_info(vio_swapchain_info *out)
 {
     out->buffer_count  = (int)vio_vk.swapchain_image_count;
@@ -4779,6 +4833,7 @@ static const vio_backend vulkan_backend = {
     .push_cbuffers     = vio_vk3d_push_cbuffers,
     .bind_stage_constants = vio_vk3d_bind_stage_constants,
     .gpu_info          = vulkan_gpu_info,
+    .describe          = vulkan_describe,
     .draw_mesh_instanced = vio_vk3d_draw_mesh_instanced,
     .bind_storage_buffer = vio_vk3d_bind_storage_buffer,
     .draw_instanced_from_storage = vio_vk3d_draw_instanced_from_storage,

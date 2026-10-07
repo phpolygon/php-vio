@@ -536,7 +536,66 @@ typedef struct _vio_backend_description {
     int         cap_count;
     const char *cap_names[VIO_BACKEND_INFO_MAX_CAPS];
     int         cap_values[VIO_BACKEND_INFO_MAX_CAPS];
+    /* Adapter identity (OPEN-ITEMS-PLAN A4): PCI vendor id (0x10005 = Mesa's
+     * software vendor, 0 = unknown), driver version, device type ("discrete",
+     * "integrated", "software"; NULL = unknown) and dedicated video memory. */
+    uint32_t    vendor_id;
+    const char *driver;
+    const char *device_type;
+    uint64_t    vram_bytes;
 } vio_backend_description;
+
+/* Vendor name for a PCI vendor id (vio_backend_info / vio_adapters). */
+static inline const char *vio_vendor_name(uint32_t id)
+{
+    switch (id) {
+    case 0x10DE:  return "NVIDIA";
+    case 0x1002:  return "AMD";
+    case 0x1022:  return "AMD";
+    case 0x8086:  return "Intel";
+    case 0x106B:  return "Apple";
+    case 0x1414:  return "Microsoft";
+    case 0x13B5:  return "ARM";
+    case 0x5143:  return "Qualcomm";
+    case 0x10005: return "Mesa";
+    default:      return "unknown";
+    }
+}
+
+/* The capability set of backends without their own (D3D, Vulkan, GL): the
+ * optional VIO_FEATURE_* flags the backend reports. */
+static inline void vio_describe_feature_caps(vio_backend_description *out, int (*supports)(vio_feature))
+{
+#define VIO_DCAP(n, f) do { if (out->cap_count < VIO_BACKEND_INFO_MAX_CAPS) { \
+        out->cap_names[out->cap_count] = n; out->cap_values[out->cap_count++] = supports(f) ? 1 : 0; } } while (0)
+    VIO_DCAP("compute", VIO_FEATURE_COMPUTE);
+    VIO_DCAP("geometry", VIO_FEATURE_GEOMETRY);
+    VIO_DCAP("tessellation", VIO_FEATURE_TESSELLATION);
+    VIO_DCAP("multiview", VIO_FEATURE_MULTIVIEW);
+    VIO_DCAP("multi_viewport", VIO_FEATURE_MULTI_VIEWPORT);
+    VIO_DCAP("layered_vertex", VIO_FEATURE_VERTEX_LAYER);
+    VIO_DCAP("indirect_draw", VIO_FEATURE_INDIRECT_DRAW);
+    VIO_DCAP("bc_texture_compression", VIO_FEATURE_TEXTURE_COMPRESSION_BC);
+    VIO_DCAP("shading_rate", VIO_FEATURE_SHADING_RATE);
+    VIO_DCAP("shading_rate_image", VIO_FEATURE_SHADING_RATE_IMAGE);
+    VIO_DCAP("hdr_output", VIO_FEATURE_HDR_OUTPUT);
+    VIO_DCAP("subgroup", VIO_FEATURE_SUBGROUP);
+    VIO_DCAP("quad_group", VIO_FEATURE_SUBGROUP_QUAD);
+    VIO_DCAP("barycentrics", VIO_FEATURE_BARYCENTRICS);
+    VIO_DCAP("atomic64", VIO_FEATURE_ATOMIC64);
+    VIO_DCAP("float16", VIO_FEATURE_SHADER_FLOAT16);
+    VIO_DCAP("draw_parameters", VIO_FEATURE_BASE_VERTEX);
+    VIO_DCAP("compute_derivatives", VIO_FEATURE_COMPUTE_DERIVATIVES);
+    VIO_DCAP("bindless", VIO_FEATURE_BINDLESS);
+    VIO_DCAP("mesh_shaders", VIO_FEATURE_MESH_SHADER);
+    VIO_DCAP("raytracing", VIO_FEATURE_RAYTRACING);
+    VIO_DCAP("ray_query", VIO_FEATURE_RAY_QUERY);
+    VIO_DCAP("sampler_feedback", VIO_FEATURE_SAMPLER_FEEDBACK);
+    VIO_DCAP("cooperative_matrix", VIO_FEATURE_COOPERATIVE_MATRIX);
+    VIO_DCAP("work_graphs", VIO_FEATURE_WORK_GRAPHS);
+    VIO_DCAP("gpu_timestamp", VIO_FEATURE_GPU_TIMESTAMP);
+#undef VIO_DCAP
+}
 
 /* vio_acceleration_structure(): triangle geometry (positions xyz, uint32
  * indices; CPU copies the mesh keeps) and the instances placing it. The

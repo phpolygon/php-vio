@@ -295,6 +295,9 @@ typedef struct _vio_d3d11_state {
      * "Microsoft Basic Render Driver") and DedicatedVideoMemory. */
     char     gpu_name[256];
     uint64_t vram_bytes;
+    uint32_t vendor_id;        /* vio_backend_info (A4) */
+    char     driver[32];
+    int      software_adapter; /* WARP */
 } vio_d3d11_state;
 
 extern vio_d3d11_state vio_d3d11;

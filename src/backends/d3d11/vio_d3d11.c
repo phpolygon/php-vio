@@ -219,6 +219,8 @@ static int d3d11_init(vio_config *cfg)
                 DXGI_ADAPTER_DESC ad;
                 if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad))) {
                     vio_d3d11.vram_bytes = (uint64_t)ad.DedicatedVideoMemory;
+                    vio_dxgi_adapter_identity(adapter, &vio_d3d11.vendor_id, vio_d3d11.driver,
+                                              sizeof(vio_d3d11.driver), &vio_d3d11.software_adapter);
                     if (WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, vio_d3d11.gpu_name,
                                             (int)sizeof(vio_d3d11.gpu_name), NULL, NULL) <= 0)
                         vio_d3d11.gpu_name[0] = '\0';
@@ -3327,6 +3329,38 @@ static void d3d11_swapchain_info(vio_swapchain_info *out)
     out->shader_model_version = 50;
 }
 
+static int d3d11_supports_feature(vio_feature feature);
+
+/* vio_backend_info (A4): feature level, adapter identity, optional features.
+ * FXC compiles Shader Model 5.0 on every feature level vio creates (11_0+). */
+static int d3d11_describe(vio_backend_description *out)
+{
+    static char fl_name[16];
+    if (!vio_d3d11.initialized || !vio_d3d11.device || !out) return -1;
+    int flv = (int)vio_d3d11.feature_level;
+    snprintf(fl_name, sizeof(fl_name), "fl_%d_%d", (flv >> 12) & 0xF, (flv >> 8) & 0xF);
+    out->api = "Direct3D 11";
+    out->device = vio_d3d11.gpu_name;
+    out->shading_language = "HLSL";
+    out->shading_language_version = 50;
+    out->shading_language_max = 50;
+    out->family_count = 0;
+    out->families[out->family_count++] = fl_name;
+    out->families[out->family_count++] = "dxbc";
+    out->cap_count = 0;
+    vio_describe_feature_caps(out, d3d11_supports_feature);
+    out->vendor_id = vio_d3d11.vendor_id;
+    out->driver = vio_d3d11.driver;
+    out->vram_bytes = vio_d3d11.vram_bytes;
+    if (vio_d3d11.software_adapter) out->device_type = "software";
+    else {
+        D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2 = {0};
+        out->device_type = SUCCEEDED(ID3D11Device_CheckFeatureSupport(vio_d3d11.device, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof(o2)))
+            ? (o2.UnifiedMemoryArchitecture ? "integrated" : "discrete") : NULL;
+    }
+    return 0;
+}
+
 static void d3d11_gpu_info(const char **name, uint64_t *vram_bytes)
 {
     if (!vio_d3d11.initialized) return;
@@ -3700,6 +3734,7 @@ static const vio_backend d3d11_backend = {
     .upload_cubemap          = d3d11_upload_cubemap,
     .bind_stage_constants    = d3d11_bind_stage_constants,
     .gpu_info                = d3d11_gpu_info,
+    .describe                = d3d11_describe,
 };
 
 void vio_backend_d3d11_register(void)

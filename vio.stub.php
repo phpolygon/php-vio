@@ -405,7 +405,12 @@ function vio_swapchain_info(VioContext $context): array {}
  * 'shading_language_version' => int (in use, major * 10 + minor),
  * 'shading_language_max' => int (highest the OS accepts), 'families' => string[]
  * ('apple7', 'mac2', 'metal3', ...), 'caps' => array<string, bool> (device support
- * AND minimum language version)]. False for backends without the report.
+ * AND minimum language version), 'vendor_id' => int (PCI vendor, 0x10005 = Mesa,
+ * 0 = unknown), 'vendor' => string, 'driver' => string, 'device_type' => string
+ * ('discrete' | 'integrated' | 'software' | 'unknown'), 'vram_bytes' => int].
+ * D3D11 / D3D12 report the feature level and HLSL shader model, Vulkan the SPIR-V
+ * version of the instance / device API, OpenGL the GLSL version. False without a
+ * device.
  */
 function vio_backend_info(VioContext $context): array|false {}
 
