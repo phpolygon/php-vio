@@ -182,8 +182,11 @@ static int d3d11_init(vio_config *cfg)
         D3D_FEATURE_LEVEL_11_0,
     };
 
-    /* Use WARP if headless (software renderer, no GPU needed) */
-    D3D_DRIVER_TYPE driver_type = cfg->headless
+    /* Use WARP if headless (software renderer, no GPU needed).
+     * VIO_D3D_HEADLESS_HARDWARE=1 keeps the GPU for headless contexts, so the
+     * headless test suite can cover hardware-only paths. */
+    const char *hw_env = getenv("VIO_D3D_HEADLESS_HARDWARE");
+    D3D_DRIVER_TYPE driver_type = cfg->headless && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)
         ? D3D_DRIVER_TYPE_WARP
         : D3D_DRIVER_TYPE_HARDWARE;
 

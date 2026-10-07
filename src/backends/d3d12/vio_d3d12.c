@@ -1108,9 +1108,13 @@ static int d3d12_init(vio_config *cfg)
         }
     }
 
-    /* Select adapter (WARP for headless, hardware otherwise) */
+    /* Select adapter (WARP for headless, hardware otherwise).
+     * VIO_D3D_HEADLESS_HARDWARE=1 keeps the GPU for headless contexts, so the
+     * headless test suite can cover hardware-only paths (mesh shaders, DXR,
+     * sampler feedback, VRS tier 2). */
     IDXGIAdapter1 *adapter = NULL;
-    if (cfg->headless) {
+    const char *hw_env = getenv("VIO_D3D_HEADLESS_HARDWARE");
+    if (cfg->headless && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)) {
         hr = IDXGIFactory4_EnumWarpAdapter(vio_d3d12.factory, &IID_IDXGIAdapter1, (void **)&adapter);
         if (FAILED(hr)) {
             php_error_docref(NULL, E_WARNING, "D3D12: WARP adapter not available (0x%08lx)", hr);
