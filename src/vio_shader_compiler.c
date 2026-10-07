@@ -57,15 +57,20 @@ static uint32_t *vio_compile_stage_to_spirv_ex(const char *source, glslang_stage
     int subgroup = source && strstr(source, "GL_" "KHR_shader_subgroup") != NULL;
     /* GL_EXT_ray_query needs SPIR-V 1.4 (Vulkan 1.2 rules). */
     if (source && strstr(source, "GL_" "EXT_ray_query") != NULL) vulkan_1_2 = 1;
+    /* GL_KHR_cooperative_matrix: subgroup-scope operations, same target. */
+    if (source && strstr(source, "GL_" "KHR_cooperative_matrix") != NULL) subgroup = 1;
+    /* GL_EXT_mesh_shader (mesh / task stages and per-primitive fragment inputs)
+     * needs SPIR-V 1.4. */
+    int mesh = source && strstr(source, "GL_" "EXT_mesh_shader") != NULL;
 
     glslang_input_t input = {0};
     input.language                          = GLSLANG_SOURCE_GLSL;
     input.stage                             = stage;
     input.client                            = GLSLANG_CLIENT_VULKAN;
     input.client_version                    = vulkan_1_2 ? GLSLANG_TARGET_VULKAN_1_2
-                                            : subgroup ? GLSLANG_TARGET_VULKAN_1_1 : GLSLANG_TARGET_VULKAN_1_0;
+                                            : (subgroup || mesh) ? GLSLANG_TARGET_VULKAN_1_1 : GLSLANG_TARGET_VULKAN_1_0;
     input.target_language                   = GLSLANG_TARGET_SPV;
-    input.target_language_version           = vulkan_1_2 ? GLSLANG_TARGET_SPV_1_4
+    input.target_language_version           = (vulkan_1_2 || mesh) ? GLSLANG_TARGET_SPV_1_4
                                             : subgroup ? GLSLANG_TARGET_SPV_1_3 : GLSLANG_TARGET_SPV_1_0;
     input.code                              = source;
     input.default_version                   = 330;
@@ -169,6 +174,8 @@ uint32_t *vio_compile_glsl_stage_to_spirv(const char *source, int stage,
         case VIO_STAGE_GEOMETRY:     gs = GLSLANG_STAGE_GEOMETRY; break;
         case VIO_STAGE_TESS_CONTROL: gs = GLSLANG_STAGE_TESSCONTROL; break;
         case VIO_STAGE_TESS_EVAL:    gs = GLSLANG_STAGE_TESSEVALUATION; break;
+        case VIO_STAGE_MESH:         gs = GLSLANG_STAGE_MESH_NV; break;   /* = GLSLANG_STAGE_MESH (EXT) */
+        case VIO_STAGE_TASK:         gs = GLSLANG_STAGE_TASK_NV; break;
         default:
             if (error_msg) *error_msg = strdup("unknown shader stage");
             return NULL;

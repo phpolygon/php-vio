@@ -306,6 +306,16 @@ typedef struct _vio_vulkan_state {
     int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
     int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
     void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */
+    /* VK_EXT_mesh_shader (VIO_FEATURE_MESH_SHADER): meshShader + taskShader
+     * enabled, draw entry points via vkGetDeviceProcAddr. */
+    int                      mesh_supported;
+    void                    *mesh_cmd_draw;          /* vkCmdDrawMeshTasksEXT */
+    void                    *mesh_cmd_draw_indirect; /* vkCmdDrawMeshTasksIndirectEXT */
+    /* VK_KHR_cooperative_matrix (VIO_FEATURE_COOPERATIVE_MATRIX): the
+     * subgroup-scope shapes whose component types the device can run (float16
+     * needs shaderFloat16 + 16-bit storage buffers), read once at device creation. */
+    int                      coopmat_shape_count;
+    vio_coopmat_shape        coopmat_shapes[VIO_COOPMAT_MAX_SHAPES];
     /* HDR10 output (GAP-PHASE5 Block 10d): vio_create(['hdr_output' => 1|2]). */
     int                      hdr_request;          /* 0 off, 1 when the surface offers HDR10 ST 2084, 2 forced 10-bit */
     int                      hdr_output;           /* 1 => 10-bit swapchain, the 2D batch PQ-encodes */
@@ -540,6 +550,8 @@ void  vio_vk3d_draw_mesh_instanced(void *mesh_obj, const float *matrices, int co
 void  vio_vk3d_bind_storage_buffer(void *buf, int binding, int access, int element_count, int stride);
 void  vio_vk3d_draw_instanced_from_storage(void *mesh_obj, int count);
 void  vio_vk3d_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset);
+void  vio_vk3d_draw_mesh_tasks(uint32_t x, uint32_t y, uint32_t z);
+void  vio_vk3d_draw_mesh_tasks_indirect(void *args_buffer, int max_draws, size_t offset);
 
 #endif /* HAVE_VULKAN */
 #endif /* VIO_VULKAN_H */

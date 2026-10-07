@@ -436,6 +436,34 @@ function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width
 function vio_texture_index(VioContext $context, VioTexture $texture): int|false {}
 
 /**
+ * Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK; D3D12 with SM 6.5 + SamplerFeedbackTier 0.9):
+ * bind the MinMip feedback map paired with $texture (created on first use) for the
+ * following draws; null unbinds. GLSL has no sampler feedback, so the fragment stage is an
+ * HLSL override, vio_shader(['vertex' => …, 'fragment' => $glsl, 'hlsl' => ['fragment' => $ps]]),
+ * whose `main` declares
+ *   FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> vio_feedback : register(u0, space2);
+ * and calls vio_feedback.WriteSamplerFeedback($tex, $sampler, $uv) next to its sample.
+ * Texture / sampler registers follow vio's scheme (t0 / s0 for unit 0, cbuffer b0 with the
+ * layout of the GLSL fragment uniforms), inputs use the SPIRV-Cross semantics
+ * (TEXCOORD<location>), entry point `main`. One map entry covers a region of mip 0: the
+ * largest power of two <= half the shorter side, between 4 and 128 texels (128 x 128 =
+ * one 64 KB tile of a 32-bit texture). False + warning without the feature or for
+ * 3D / array / borrowed textures and textures smaller than 8 x 8.
+ */
+function vio_sampler_feedback_bind(VioContext $context, ?VioTexture $texture): bool {}
+
+/**
+ * Decode the feedback map of $texture: ['regions_x' => int, 'regions_y' => int,
+ * 'region' => int (mip-0 texels per region edge), 'min_mip' => list<int|null>] row by row,
+ * the lowest mip sampled in each region since the last clear, null = never sampled.
+ * Waits for the GPU (also mid-frame, like vio_read_render_target).
+ */
+function vio_sampler_feedback_read(VioContext $context, VioTexture $texture): array|false {}
+
+/** Reset the feedback map of $texture to "never sampled" (creates it if needed). */
+function vio_sampler_feedback_clear(VioContext $context, VioTexture $texture): bool {}
+
+/**
  * Draw a mesh with arguments read from a storage buffer (VIO_FEATURE_INDIRECT_DRAW) —
  * typically written by a compute pass (GPU culling / LOD selection). Per draw record:
  * indexed meshes 5 uint32 {indexCount, instanceCount, firstIndex, baseVertex, firstInstance}
@@ -445,6 +473,21 @@ function vio_texture_index(VioContext $context, VioTexture $texture): int|false 
  * => true]) (D3D11 needs the flag). Per-instance data comes from vio_bind_storage_buffer().
  */
 function vio_draw_indirect(VioContext $context, VioMesh $mesh, VioBuffer $args, int $maxDraws = 1, int $offset = 0): void {}
+
+/**
+ * Launch $x * $y * $z task workgroups of the bound mesh pipeline (VIO_FEATURE_MESH_SHADER) -
+ * mesh workgroups directly when the shader has no 'task' stage. Each count 0..65535 (0 draws
+ * nothing). D3D12: DispatchMesh (SM 6.5 + MeshShaderTier), Vulkan: vkCmdDrawMeshTasksEXT,
+ * Metal: drawMeshThreadgroups (Metal 3, Apple7 / Mac2).
+ */
+function vio_draw_mesh_tasks(VioContext $context, int $x, int $y = 1, int $z = 1): void {}
+
+/**
+ * vio_draw_mesh_tasks with the group counts read from a storage buffer: $maxDraws records of
+ * 3 uint32 {x, y, z} (stride 12) starting at $offset bytes (multiple of 4) - typically written
+ * by a compute pass. Create the buffer with vio_storage_buffer(['indirect' => true]).
+ */
+function vio_draw_mesh_tasks_indirect(VioContext $context, VioBuffer $args, int $maxDraws = 1, int $offset = 0): void {}
 
 /**
  * Variable rate shading (VIO_FEATURE_SHADING_RATE, D3D12 VRS Tier 1+): the fragment
@@ -471,6 +514,17 @@ function vio_set_shading_rate_image(VioContext $context, ?string $rates, int $ti
  * 8, 16 or 32); 0 without VIO_FEATURE_SHADING_RATE_IMAGE.
  */
 function vio_shading_rate_tile_size(VioContext $context): int {}
+
+/**
+ * Cooperative-matrix shapes (VIO_FEATURE_COOPERATIVE_MATRIX, GL_KHR_cooperative_matrix):
+ * the subgroup-scope tiles compute kernels can multiply with coopMatMulAdd, as
+ * ['m' => int, 'n' => int, 'k' => int, 'a' => string, 'b' => string, 'c' => string,
+ * 'result' => string] (A is M x K, B is K x N, C / result M x N; types 'float16',
+ * 'float32', 'sint8', 'uint8', 'sint32', 'bfloat16', ...). Vulkan lists the device's
+ * VK_KHR_cooperative_matrix properties, Metal 8 x 8 x 8 simdgroup_matrix shapes;
+ * [] without the feature.
+ */
+function vio_cooperative_matrix_shapes(VioContext $context): array {}
 
 /**
  * Draw a mesh in the current frame.
@@ -645,6 +699,11 @@ function vio_draw_2d(VioContext $context): void {}
  *     the source outputs D3D clip space (z in [0, w]). Also the way to [instance(N)] on D3D.
  * Geometry stages may use layout(invocations = N) where VIO_FEATURE_GEOMETRY_INSTANCING is 1, and the
  * VIO_*_ADJACENCY topologies (vio_mesh(['adjacency' => true]) builds the TRIANGLES_ADJACENCY indices).
+ * Mesh pipelines (VIO_FEATURE_MESH_SHADER, GL_EXT_mesh_shader): 'mesh' => GLSL mesh stage replaces
+ * 'vertex' (giving both is refused), 'task' => optional task (amplification / object) stage; draw them
+ * with vio_draw_mesh_tasks() / vio_draw_mesh_tasks_indirect(), not vio_draw(). The mesh stage's
+ * uniforms are set with vio_set_uniform() like vertex uniforms (a task stage shares that block).
+ * Without the feature 'mesh' returns false with a warning.
  * Portable geometry shaders read input positions from a user varying (`layout(location = N) in vec4 vPos[]`
  * exported by the vertex stage), not from gl_in[].gl_Position, which D3D cannot translate.
  * Uniforms declared in an extra stage are set with
@@ -653,6 +712,7 @@ function vio_draw_2d(VioContext $context): void {}
  *
  * @param array $config ['vertex' => string, 'fragment' => string, 'geometry' => ?string,
  *                      'tess_control' => ?string, 'tess_eval' => ?string, 'hlsl' => ?array,
+ *                      'mesh' => ?string, 'task' => ?string,
  *                      'format' => int (VIO_SHADER_AUTO|VIO_SHADER_GLSL|VIO_SHADER_SPIRV)]
  * @return VioShader|false Shader object or false on failure
  */

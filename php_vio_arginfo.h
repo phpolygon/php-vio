@@ -211,6 +211,21 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_texture_index, 0, 2, MAY_BE_
 	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_sampler_feedback_bind, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_sampler_feedback_read, 0, 2, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_sampler_feedback_clear, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_backend_info, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
@@ -226,6 +241,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_shading_rate_tile_size, 0, 1
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_cooperative_matrix_shapes, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_acceleration_structure, 0, 2, VioAccelerationStructure, MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, instances, IS_ARRAY, 0)
@@ -235,6 +254,20 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bind_acceleration_structure,
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_OBJ_INFO(0, accelerationStructure, VioAccelerationStructure, 0)
 	ZEND_ARG_TYPE_INFO(0, binding, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_draw_mesh_tasks, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, x, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, y, IS_LONG, 0, "1")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, z, IS_LONG, 0, "1")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_draw_mesh_tasks_indirect, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, args, VioBuffer, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, maxDraws, IS_LONG, 0, "1")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, offset, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_rt_pipeline, 0, 2, VioRtPipeline, MAY_BE_FALSE)
@@ -949,8 +982,13 @@ ZEND_FUNCTION(vio_shader_cache_stats);
 ZEND_FUNCTION(vio_swapchain_info);
 ZEND_FUNCTION(vio_backend_info);
 ZEND_FUNCTION(vio_texture_index);
+ZEND_FUNCTION(vio_sampler_feedback_bind);
+ZEND_FUNCTION(vio_sampler_feedback_read);
+ZEND_FUNCTION(vio_sampler_feedback_clear);
 ZEND_FUNCTION(vio_acceleration_structure);
 ZEND_FUNCTION(vio_bind_acceleration_structure);
+ZEND_FUNCTION(vio_draw_mesh_tasks);
+ZEND_FUNCTION(vio_draw_mesh_tasks_indirect);
 ZEND_FUNCTION(vio_rt_pipeline);
 ZEND_FUNCTION(vio_rt_bind_buffer);
 ZEND_FUNCTION(vio_trace_rays);
@@ -958,6 +996,7 @@ ZEND_FUNCTION(vio_draw_indirect);
 ZEND_FUNCTION(vio_set_shading_rate);
 ZEND_FUNCTION(vio_set_shading_rate_image);
 ZEND_FUNCTION(vio_shading_rate_tile_size);
+ZEND_FUNCTION(vio_cooperative_matrix_shapes);
 ZEND_FUNCTION(vio_rect);
 ZEND_FUNCTION(vio_circle);
 ZEND_FUNCTION(vio_line);
@@ -1123,8 +1162,13 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_swapchain_info, arginfo_vio_swapchain_info)
 	ZEND_FE(vio_backend_info, arginfo_vio_backend_info)
 	ZEND_FE(vio_texture_index, arginfo_vio_texture_index)
+	ZEND_FE(vio_sampler_feedback_bind, arginfo_vio_sampler_feedback_bind)
+	ZEND_FE(vio_sampler_feedback_read, arginfo_vio_sampler_feedback_read)
+	ZEND_FE(vio_sampler_feedback_clear, arginfo_vio_sampler_feedback_clear)
 	ZEND_FE(vio_acceleration_structure, arginfo_vio_acceleration_structure)
 	ZEND_FE(vio_bind_acceleration_structure, arginfo_vio_bind_acceleration_structure)
+	ZEND_FE(vio_draw_mesh_tasks, arginfo_vio_draw_mesh_tasks)
+	ZEND_FE(vio_draw_mesh_tasks_indirect, arginfo_vio_draw_mesh_tasks_indirect)
 	ZEND_FE(vio_rt_pipeline, arginfo_vio_rt_pipeline)
 	ZEND_FE(vio_rt_bind_buffer, arginfo_vio_rt_bind_buffer)
 	ZEND_FE(vio_trace_rays, arginfo_vio_trace_rays)
@@ -1132,6 +1176,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_set_shading_rate, arginfo_vio_set_shading_rate)
 	ZEND_FE(vio_set_shading_rate_image, arginfo_vio_set_shading_rate_image)
 	ZEND_FE(vio_shading_rate_tile_size, arginfo_vio_shading_rate_tile_size)
+	ZEND_FE(vio_cooperative_matrix_shapes, arginfo_vio_cooperative_matrix_shapes)
 	ZEND_FE(vio_rect, arginfo_vio_rect)
 	ZEND_FE(vio_circle, arginfo_vio_circle)
 	ZEND_FE(vio_line, arginfo_vio_line)

@@ -134,6 +134,14 @@ Größter Architekturhebel: ersetzt Pending-Bind-Tabelle und GL-Unit-Mapping fü
 
 ## Phase 5 — Mesh- und Task-/Amplification-Shader (L)
 
+**✅ umgesetzt (Test 162).** Metal läuft auf dem M5 (MSL-Sprosse ≥ 3.0; Sprosse 2.1 meldet 0 und skippt).
+D3D12 (SM 6.5 + `MeshShaderTier`, AS/MS über den Pipeline-State-Stream, Root-Signatur-Variante mit
+MESH-/AMPLIFICATION-Sichtbarkeit, `DispatchMesh`, `ExecuteIndirect` mit `DISPATCH_MESH`) und Vulkan
+(`VK_EXT_mesh_shader` + `VK_KHR_spirv_1_4`, `vkCmdDrawMeshTasks(Indirect)EXT`) sind nur Compile-/Text-geprüft:
+mingw + DirectX-Headers, das erzeugte HLSL mit DXC (`as/ms/ps_6_5`, `_6_6`), das Vulkan-GLSL mit
+glslang + `spirv-val` (vulkan1.1spv1.4). WARP endet bei SM 6.2, MoltenVK hat kein `VK_EXT_mesh_shader`.
+SPIRV-Cross setzt keinen Clip-Fixup in Mesh-Ausgaben; `vio_mesh_fix_positions` schreibt die Zuweisungen um.
+
 `VIO_FEATURE_MESH_SHADER`. API: `vio_shader(['task' => …, 'mesh' => …, 'fragment' => …])`,
 `vio_draw_mesh_tasks($ctx, $x, $y, $z)` + indirekte Variante über `vio_storage_buffer(['indirect'])`.
 - D3D12: SM 6.5, `OPTIONS7.MeshShaderTier`, `D3D12_PIPELINE_STATE_STREAM` (Mesh-PSO), `DispatchMesh`.
@@ -194,6 +202,22 @@ kein Gegenstück ⇒ Flags dort 0. Nutzen auf RTX 40/50 (Hardware-Reorder, OMM-T
 - Metal: Sparse Textures (`sparseTileSizeInBytes`) + Zugriffszähler.
 - Gemeinsame API erst nach einem Prototyp festlegen (Streaming-Manager in PHPolygon ist der Abnehmer).
 
+**Stand (2026-10-07): D3D12 umgesetzt, Test 165.** Flag 57, nur D3D12 (SM 6.5 über `shader_model => 6`,
+`OPTIONS7.SamplerFeedbackTier ≥ 0.9`, `ID3D12Device8`, Bindless-Root-Layout). API:
+- `vio_sampler_feedback_bind($ctx, ?VioTexture)` – legt beim ersten Aufruf die MinMip-Feedback-Map
+  der Textur an (`CreateCommittedResource2`, Region = größte Zweierpotenz ≤ halbe kürzere Seite,
+  4..128 Texel) und bindet sie für die folgenden Draws; `null` löst.
+- `vio_sampler_feedback_read($ctx, $tex)` – `ResolveSubresourceRegion(DECODE_SAMPLER_FEEDBACK)` nach
+  R8_UINT + Readback → `['regions_x', 'regions_y', 'region', 'min_mip' => list<int|null>]`.
+- `vio_sampler_feedback_clear($ctx, $tex)` – `ClearUnorderedAccessViewUint`.
+- Shader: GLSL kennt kein Sampler-Feedback ⇒ Fragment-Stage als HLSL-Override
+  `'hlsl' => ['fragment' => $ps]` mit `FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> vio_feedback :
+  register(u0, space2)` und `WriteSamplerFeedback`. Root-Parameter [16] (UAV-Table, PIXEL) hängt nur mit
+  dem Feature hinter [15] Bindless; ein Feedback-Shader ohne gebundene Map schreibt in eine Null-UAV.
+- Vulkan/Metal/GL: Flag 0 – Sparse-Residency (`sparseResidency*` + `OpImageSparse*`) bzw. Metal Sparse
+  Textures liefern Residenz, kein Zugriffs-Feedback je Region; ein eigener Pfad (Atomic-Min in ein
+  Storage-Image) wäre Emulation und bleibt offen, bis PHPolygons Streaming-Manager ihn braucht.
+
 ## Phase 8 — Neural Shading: Long Vectors / Cooperative Vectors / Tensoren (L, evaluieren)
 
 - D3D12: SM 6.9 Long Vectors; Cooperative Vectors (teils Preview) — RTX 40/50 Tensor-Kerne.
@@ -202,6 +226,22 @@ kein Gegenstück ⇒ Flags dort 0. Nutzen auf RTX 40/50 (Hardware-Reorder, OMM-T
   Accelerators je GPU-Kern; geprüft: Pipeline baut.
 - Keine GLSL-Quelle ⇒ backend-native Quellen (`'msl' => …`, `'hlsl' => …`) über einen erweiterten
   Stage-Override; Feature-Flag nur, wo eine portable Form existiert (`GL_KHR_cooperative_matrix`).
+
+**Stand 2026-10-07 — 8a kooperative Matrizen ✅** (`VIO_FEATURE_COOPERATIVE_MATRIX = 59`,
+`vio_cooperative_matrix_shapes($ctx)`, Test 167): GLSL `GL_KHR_cooperative_matrix` (`coopmat`,
+`coopMatLoad`/`coopMatMulAdd`/`coopMatStore`, Subgroup-Scope) in `vio_compute_pipeline`, keine neue
+Dispatch-API.
+- Vulkan: `VK_KHR_cooperative_matrix` + `VK_KHR_vulkan_memory_model` (glslang erzeugt
+  `OpMemoryModel Vulkan`), float16 mit `shaderFloat16` + `storageBuffer16BitAccess`; die Formen kommen aus
+  `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` (nur Subgroup-Scope, nur float16/float32 — Int8/
+  BFloat16 bräuchten weitere Features). Nur kompiliert: MoltenVK hat die Extension nicht.
+- Metal: SPIRV-Cross bildet `coopmat` auf `simdgroup_matrix` ab, **nur 8×8** und erst ab **MSL 3.1**
+  (Cap `cooperative_matrix`, Apple7+); Formen 8×8×8 half/half, half/float, float/float — auf dem M5
+  ausgeführt (MSL 3.1 und 4.1), MSL 3.0 meldet nichts.
+- D3D12: 0. SPIRV-Cross übersetzt `coopmat` nicht nach HLSL („Access chains have no default expression
+  representation"); SM 6.9 Wave-Matrix / Cooperative Vectors bleiben an Agility SDK + DXC-Quellen gebunden.
+- Offen: 8b Cooperative Vectors (`VK_NV_cooperative_vector`, D3D12 Preview), 8c Metal-Tensoren
+  (`MTLTensor` + MPP `matmul2d`, MSL 4.0) über einen `'msl'`-Override — beides ohne portable GLSL-Form.
 
 ## Phase 9 — Work Graphs (nur D3D12, zurückgestellt)
 

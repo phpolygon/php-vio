@@ -94,6 +94,9 @@ probe("null", [
     VIO_FEATURE_SHADING_RATE_IMAGE => 0,
     VIO_FEATURE_BINDLESS           => 0,
     VIO_FEATURE_RAY_QUERY          => 0,
+    VIO_FEATURE_MESH_SHADER        => 0,
+    VIO_FEATURE_SAMPLER_FEEDBACK   => 0,
+    VIO_FEATURE_COOPERATIVE_MATRIX => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.

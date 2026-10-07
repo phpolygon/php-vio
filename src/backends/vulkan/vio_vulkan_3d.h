@@ -66,6 +66,10 @@ typedef struct _vk3d_binding {
 typedef struct _vio_vk3d_shader {
     VkShaderModule        vs, fs;
     VkShaderModule        gs, tcs, tes;   /* optional stages, VK_NULL_HANDLE when absent */
+    /* Mesh pipeline (VIO_FEATURE_MESH_SHADER): vs holds the MESH stage, ts the
+     * optional task stage; no vertex input / input assembly. */
+    int                   is_mesh;
+    VkShaderModule        ts;
     VkDescriptorSetLayout set_layout;
     VkPipelineLayout      layout;
     vk3d_binding          bindings[VK3D_MAX_BINDINGS];

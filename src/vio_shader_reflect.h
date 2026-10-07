@@ -41,6 +41,17 @@ void vio_hlsl_set_16bit_types(int enable);
 /* 1 when the SPIR-V module decorates a variable with BuiltIn `builtin`
  * (e.g. 4432 PrimitiveShadingRateKHR). Plain word scan, no SPIRV-Cross. */
 int vio_spirv_has_builtin(const void *spirv, size_t bytes, uint32_t builtin);
+/* Execution model of the module's first OpEntryPoint (0 = Vertex, 4 = Fragment,
+ * 5364 = TaskEXT, 5365 = MeshEXT, ...), -1 when the words are no SPIR-V. */
+int vio_spirv_execution_model(const void *spirv, size_t bytes);
+#define VIO_SPIRV_MODEL_TASK_EXT 5364
+#define VIO_SPIRV_MODEL_MESH_EXT 5365
+/* Mesh stages: SPIRV-Cross applies no clip-space fixup to gl_MeshVerticesEXT
+ * positions. Rewrites every `gl_MeshVerticesEXT[i].gl_Position = e;` of the
+ * transpiled source to store the GL position converted for the backend:
+ * flip_y negates y (Vulkan), fix_z maps z from [-w, w] to [0, w] (D3D, Vulkan).
+ * `vec4` names the target language's vector type. Takes ownership of `src`. */
+char *vio_mesh_fix_positions(char *src, int flip_y, int fix_z, const char *vec4);
 /* Binding of the module's first acceleration-structure variable (GL_EXT_ray_query),
  * -1 when it has none. Plain word scan. */
 int vio_spirv_accel_binding(const void *spirv, size_t bytes);

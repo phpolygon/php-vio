@@ -109,8 +109,28 @@ typedef enum {
     VIO_MSL_VERTEX_TESS,   /* vertex stage as a kernel, one thread per (vertex, instance) */
     VIO_MSL_TESS_CONTROL,  /* tess control as a kernel, one thread per output control point */
     VIO_MSL_TESS_EVAL,     /* tess evaluation as a [[patch]] vertex function */
-    VIO_MSL_KERNEL         /* vertex / geometry stage rebuilt as a GLSL compute kernel (vio_metal_kernel.h) */
+    VIO_MSL_KERNEL,        /* vertex / geometry stage rebuilt as a GLSL compute kernel (vio_metal_kernel.h) */
+    VIO_MSL_MESH,          /* mesh stage ([[mesh]], MSL 3.0) */
+    VIO_MSL_TASK           /* task stage ([[object]], MSL 3.0) */
 } vio_msl_stage;
+
+/* LocalSize execution mode of a compute-like module (mesh / task stages):
+ * the threads per threadgroup drawMeshThreadgroups needs. 1x1x1 when absent. */
+static void metal_spirv_local_size(const uint32_t *w, size_t bytes, unsigned out[3])
+{
+    out[0] = out[1] = out[2] = 1;
+    size_t n = bytes / 4;
+    if (!w || n < 5 || w[0] != 0x07230203u) return;
+    for (size_t i = 5; i < n; ) {
+        uint32_t count = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (count == 0) break;
+        if (op == 16 && count >= 6 && w[i + 2] == 17) {   /* OpExecutionMode %entry LocalSize x y z */
+            out[0] = w[i + 3]; out[1] = w[i + 4]; out[2] = w[i + 5];
+            return;
+        }
+        i += count;
+    }
+}
 
 /* Buffer indices of the tessellation plumbing. Resources of every stage are
  * renumbered to 0..N-1 (N <= 2 * VIO_METAL_MAX_RES), so they stay below 19. */
@@ -331,7 +351,9 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
     }
 
     if (spvc_compiler_create_compiler_options(compiler, &opts) == SPVC_SUCCESS) {
-        metal_msl_apply_target(opts, is_tess ? 21 : 20);
+        /* Mesh / task stages need MSL 3.0 (the ladder only reports the
+         * capability from that rung). */
+        metal_msl_apply_target(opts, (stage == VIO_MSL_MESH || stage == VIO_MSL_TASK) ? 30 : (is_tess ? 21 : 20));
         if (metal_msl_multiview && (stage == VIO_MSL_VERTEX || stage == VIO_MSL_FRAGMENT)) {
             spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_MSL_MULTIVIEW, SPVC_TRUE);
             spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_MSL_MULTIVIEW_LAYERED_RENDERING, SPVC_TRUE);
@@ -549,7 +571,7 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
     if (getenv("VIO_DUMP_MSL")) {
         static const char *labels[] = { "vertex", "fragment", "vertex (tessellation kernel)",
                                         "tessellation control", "tessellation evaluation",
-                                        "stage kernel" };
+                                        "stage kernel", "mesh", "task" };
         fprintf(stderr, "==== Metal %s MSL ====\n%s\n==== end ====\n", labels[stage], result);
         fflush(stderr);
     }
