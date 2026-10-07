@@ -402,6 +402,34 @@ function vio_bind_acceleration_structure(VioContext $context, VioAccelerationStr
 function vio_texture_index(VioContext $context, VioTexture $texture): int|false {}
 
 /**
+ * Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK; D3D12 with SM 6.5 + SamplerFeedbackTier 0.9):
+ * bind the MinMip feedback map paired with $texture (created on first use) for the
+ * following draws; null unbinds. GLSL has no sampler feedback, so the fragment stage is an
+ * HLSL override, vio_shader(['vertex' => …, 'fragment' => $glsl, 'hlsl' => ['fragment' => $ps]]),
+ * whose `main` declares
+ *   FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> vio_feedback : register(u0, space2);
+ * and calls vio_feedback.WriteSamplerFeedback($tex, $sampler, $uv) next to its sample.
+ * Texture / sampler registers follow vio's scheme (t0 / s0 for unit 0, cbuffer b0 with the
+ * layout of the GLSL fragment uniforms), inputs use the SPIRV-Cross semantics
+ * (TEXCOORD<location>), entry point `main`. One map entry covers a region of mip 0: the
+ * largest power of two <= half the shorter side, between 4 and 128 texels (128 x 128 =
+ * one 64 KB tile of a 32-bit texture). False + warning without the feature or for
+ * 3D / array / borrowed textures and textures smaller than 8 x 8.
+ */
+function vio_sampler_feedback_bind(VioContext $context, ?VioTexture $texture): bool {}
+
+/**
+ * Decode the feedback map of $texture: ['regions_x' => int, 'regions_y' => int,
+ * 'region' => int (mip-0 texels per region edge), 'min_mip' => list<int|null>] row by row,
+ * the lowest mip sampled in each region since the last clear, null = never sampled.
+ * Waits for the GPU (also mid-frame, like vio_read_render_target).
+ */
+function vio_sampler_feedback_read(VioContext $context, VioTexture $texture): array|false {}
+
+/** Reset the feedback map of $texture to "never sampled" (creates it if needed). */
+function vio_sampler_feedback_clear(VioContext $context, VioTexture $texture): bool {}
+
+/**
  * Draw a mesh with arguments read from a storage buffer (VIO_FEATURE_INDIRECT_DRAW) —
  * typically written by a compute pass (GPU culling / LOD selection). Per draw record:
  * indexed meshes 5 uint32 {indexCount, instanceCount, firstIndex, baseVertex, firstInstance}

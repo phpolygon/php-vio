@@ -95,6 +95,7 @@ probe("null", [
     VIO_FEATURE_BINDLESS           => 0,
     VIO_FEATURE_RAY_QUERY          => 0,
     VIO_FEATURE_MESH_SHADER        => 0,
+    VIO_FEATURE_SAMPLER_FEEDBACK   => 0,
     VIO_FEATURE_COOPERATIVE_MATRIX => 0,
 ]);
 

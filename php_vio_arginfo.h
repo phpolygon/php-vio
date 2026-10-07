@@ -211,6 +211,21 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_texture_index, 0, 2, MAY_BE_
 	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_sampler_feedback_bind, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_sampler_feedback_read, 0, 2, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_sampler_feedback_clear, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_backend_info, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
@@ -947,6 +962,9 @@ ZEND_FUNCTION(vio_shader_cache_stats);
 ZEND_FUNCTION(vio_swapchain_info);
 ZEND_FUNCTION(vio_backend_info);
 ZEND_FUNCTION(vio_texture_index);
+ZEND_FUNCTION(vio_sampler_feedback_bind);
+ZEND_FUNCTION(vio_sampler_feedback_read);
+ZEND_FUNCTION(vio_sampler_feedback_clear);
 ZEND_FUNCTION(vio_acceleration_structure);
 ZEND_FUNCTION(vio_bind_acceleration_structure);
 ZEND_FUNCTION(vio_draw_mesh_tasks);
@@ -1121,6 +1139,9 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_swapchain_info, arginfo_vio_swapchain_info)
 	ZEND_FE(vio_backend_info, arginfo_vio_backend_info)
 	ZEND_FE(vio_texture_index, arginfo_vio_texture_index)
+	ZEND_FE(vio_sampler_feedback_bind, arginfo_vio_sampler_feedback_bind)
+	ZEND_FE(vio_sampler_feedback_read, arginfo_vio_sampler_feedback_read)
+	ZEND_FE(vio_sampler_feedback_clear, arginfo_vio_sampler_feedback_clear)
 	ZEND_FE(vio_acceleration_structure, arginfo_vio_acceleration_structure)
 	ZEND_FE(vio_bind_acceleration_structure, arginfo_vio_bind_acceleration_structure)
 	ZEND_FE(vio_draw_mesh_tasks, arginfo_vio_draw_mesh_tasks)

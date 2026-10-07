@@ -714,9 +714,26 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     all_samplers[4].RegisterSpace = 1;
     all_samplers[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+    /* [16] Sampler feedback map (VIO_FEATURE_SAMPLER_FEEDBACK): one UAV u0 in
+     * register space 2 for the pixel stage - the FeedbackTexture2D of an
+     * 'hlsl' => ['fragment' => ...] override. Only when the feature is on, which
+     * implies the bindless table, so the optional parameters stay trailing. */
+    D3D12_DESCRIPTOR_RANGE feedback_range = {0};
+    feedback_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    feedback_range.NumDescriptors = 1;
+    feedback_range.BaseShaderRegister = 0;
+    feedback_range.RegisterSpace = 2;
+    feedback_range.OffsetInDescriptorsFromTableStart = 0;
+    params[VIO_D3D12_RP_FEEDBACK].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[VIO_D3D12_RP_FEEDBACK].DescriptorTable.NumDescriptorRanges = 1;
+    params[VIO_D3D12_RP_FEEDBACK].DescriptorTable.pDescriptorRanges = &feedback_range;
+    params[VIO_D3D12_RP_FEEDBACK].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-    /* VS CBV, PS CBV, PS SRV table, VS storage SRV, PS sampler table, GS/HS/DS mirrors, accel (+ bindless table) */
-    rs_desc.NumParameters = vio_d3d12.bindless ? VIO_D3D12_RP_COUNT : VIO_D3D12_RP_BINDLESS;
+    /* VS CBV, PS CBV, PS SRV table, VS storage SRV, PS sampler table, GS/HS/DS mirrors, accel
+     * (+ bindless table (+ feedback table)) */
+    rs_desc.NumParameters = vio_d3d12.sampler_feedback ? VIO_D3D12_RP_COUNT
+                          : vio_d3d12.bindless ? VIO_D3D12_RP_FEEDBACK : VIO_D3D12_RP_BINDLESS;
     rs_desc.pParameters = params;
     rs_desc.NumStaticSamplers = vio_d3d12.bindless ? 5 : 4;
     rs_desc.pStaticSamplers = all_samplers;
@@ -1244,6 +1261,24 @@ static int d3d12_init(vio_config *cfg)
             vio_d3d12.bindless = o0.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2;
     }
 
+    /* Sampler feedback: WriteSamplerFeedback is SM 6.5 (DXC), the feedback map
+     * needs ID3D12Device8::CreateCommittedResource2 and Tier 0.9; root
+     * parameter [16] sits behind the bindless table. */
+    vio_d3d12.sampler_feedback = 0;
+    vio_d3d12.fb_bound = NULL;
+    vio_d3d12.fb_null_gpu.ptr = 0;
+    if (vio_d3d12.bindless && vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 65) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7;
+        memset(&o7, 0, sizeof(o7));
+        ID3D12Device8 *dev8 = NULL;
+        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7)))
+            && o7.SamplerFeedbackTier >= D3D12_SAMPLER_FEEDBACK_TIER_0_9
+            && SUCCEEDED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device8, (void **)&dev8)) && dev8) {
+            vio_d3d12.sampler_feedback = 1;
+        }
+        if (dev8) ID3D12Device8_Release(dev8);
+    }
+
     /* GPU-visible SRV/CBV/UAV heap */
     if (d3d12_create_descriptor_heap(&vio_d3d12.srv_heap.heap,
                                       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -1574,6 +1609,8 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.device)         ID3D12Device_Release(vio_d3d12.device);
 
     d3d12_current_pipeline = NULL;
+    vio_d3d12.fb_bound = NULL;
+    vio_d3d12.fb_null_gpu.ptr = 0;
     memset(&vio_d3d12, 0, sizeof(vio_d3d12));
 }
 
@@ -2188,6 +2225,7 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     pipeline->has_gs = shader->gs_blob != NULL;
     pipeline->writes_shading_rate = shader->writes_shading_rate;
     pipeline->uses_bindless = shader->uses_bindless;
+    pipeline->uses_feedback = shader->uses_feedback;
     pipeline->has_hs = shader->hs_blob != NULL;
     pipeline->has_ds = shader->ds_blob != NULL;
     pipeline->is_mesh = shader->is_mesh;
@@ -2457,8 +2495,11 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
 /* Bindless table (vio_texture_index): root table [14] at the reserved block
  * for pipelines whose shader reads it. Root arguments do not survive
  * SetGraphicsRootSignature, so every draw re-points it (cheap). */
+static void d3d12_apply_feedback(void);
+
 static void d3d12_apply_bindless(void)
 {
+    d3d12_apply_feedback();   /* same call sites: root tables reset with the signature */
     vio_d3d12_pipeline *p = d3d12_current_pipeline;
     if (!p || !p->uses_bindless || !vio_d3d12.bindless || !vio_d3d12.cmd_list) return;
     D3D12_GPU_DESCRIPTOR_HANDLE g;
@@ -3330,6 +3371,9 @@ static void d3d12_destroy_texture(void *texture_ptr)
 {
     vio_d3d12_texture *tex = (vio_d3d12_texture *)texture_ptr;
     if (!tex) return;
+    if (vio_d3d12.fb_bound == tex) vio_d3d12.fb_bound = NULL;
+    if (tex->fb_map) ID3D12Resource_Release(tex->fb_map);
+    if (tex->fb_decoded) ID3D12Resource_Release(tex->fb_decoded);
     if (tex->upload_resource) ID3D12Resource_Release(tex->upload_resource);
     if (tex->resource) ID3D12Resource_Release(tex->resource);
     /* Note: descriptor in SRV heap is leaked (linear allocator doesn't support free).
@@ -3417,6 +3461,218 @@ static int d3d12_upload_cubemap(void *cm_obj, int width, int height, const void 
     cm->resolution     = width;
     cm->mipmaps        = levels > 1;
     cm->backend_type   = 3;
+    return 0;
+}
+
+/* ── Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK) ─────────────────── */
+
+/* The CPU handle in the shader-visible heap at the index of a staging handle
+ * from d3d12_alloc_srv_descriptor (both heaps use the same indices). */
+static D3D12_CPU_DESCRIPTOR_HANDLE d3d12_visible_cpu_of(D3D12_CPU_DESCRIPTOR_HANDLE staging)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE s0, v0;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &s0);
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &v0);
+    v0.ptr += staging.ptr - s0.ptr;
+    return v0;
+}
+
+/* Create the texture's MinMip feedback map on first use. One region per
+ * standard 64 KB tile of a 32-bit texture (128 x 128 texels), smaller for
+ * small textures: the largest power of two <= half the shorter side, >= 4. */
+static int d3d12_feedback_ensure(vio_d3d12_texture *t)
+{
+    if (t->fb_map) return 0;
+    if (!vio_d3d12.sampler_feedback || !t->resource || t->depth > 0 || t->layers > 1 || t->width < 8 || t->height < 8)
+        return -1;
+    ID3D12Device8 *dev8 = NULL;
+    if (FAILED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device8, (void **)&dev8)) || !dev8) return -1;
+
+    int shorter = t->width < t->height ? t->width : t->height;
+    int region = 4;
+    while (region < 128 && region * 2 <= shorter / 2) region *= 2;
+    int rx = (t->width + region - 1) / region, ry = (t->height + region - 1) / region;
+
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC1 d = {0};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = (UINT64)t->width;
+    d.Height = (UINT)t->height;
+    d.DepthOrArraySize = 1;
+    d.MipLevels = (UINT16)(t->mip_levels > 0 ? t->mip_levels : 1);   /* must match the paired texture */
+    d.Format = DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE;
+    d.SampleDesc.Count = 1;
+    d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    d.SamplerFeedbackMipRegion.Width = (UINT)region;
+    d.SamplerFeedbackMipRegion.Height = (UINT)region;
+    d.SamplerFeedbackMipRegion.Depth = 1;
+    ID3D12Resource *map = NULL;
+    HRESULT hr = ID3D12Device8_CreateCommittedResource2(dev8, &hp, D3D12_HEAP_FLAG_NONE, &d,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, NULL, &IID_ID3D12Resource, (void **)&map);
+    if (FAILED(hr) || !map) {
+        php_error_docref(NULL, E_WARNING, "D3D12: sampler feedback map creation failed (0x%08lx)", hr);
+        ID3D12Device8_Release(dev8);
+        return -1;
+    }
+
+    /* Decode target: one R8_UINT texel per region (the lowest mip, 0xFF = none). */
+    D3D12_RESOURCE_DESC dd = {0};
+    dd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    dd.Width = (UINT64)rx;
+    dd.Height = (UINT)ry;
+    dd.DepthOrArraySize = 1;
+    dd.MipLevels = 1;
+    dd.Format = DXGI_FORMAT_R8_UINT;
+    dd.SampleDesc.Count = 1;
+    dd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    ID3D12Resource *decoded = NULL;
+    hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &dd,
+        D3D12_RESOURCE_STATE_RESOLVE_DEST, NULL, &IID_ID3D12Resource, (void **)&decoded);
+    if (FAILED(hr) || !decoded) {
+        php_error_docref(NULL, E_WARNING, "D3D12: sampler feedback decode target creation failed (0x%08lx)", hr);
+        ID3D12Resource_Release(map);
+        ID3D12Device8_Release(dev8);
+        return -1;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    if (d3d12_alloc_srv_descriptor(&cpu, &gpu) == UINT_MAX) {
+        ID3D12Resource_Release(decoded);
+        ID3D12Resource_Release(map);
+        ID3D12Device8_Release(dev8);
+        return -1;
+    }
+    /* The staging copy is the CPU handle of ClearUnorderedAccessViewUint, the
+     * shader-visible one is what root parameter [16] points at. */
+    ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(dev8, t->resource, map, cpu);
+    ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(dev8, t->resource, map, d3d12_visible_cpu_of(cpu));
+    ID3D12Device8_Release(dev8);
+
+    t->fb_map = map;
+    t->fb_decoded = decoded;
+    t->fb_uav_cpu = cpu;
+    t->fb_uav_gpu = gpu;
+    t->fb_region = region;
+    t->fb_rx = rx;
+    t->fb_ry = ry;
+    return 0;
+}
+
+/* Null feedback UAV for a feedback shader drawn without a bound map: its
+ * writes are dropped instead of hitting an unset root table. */
+static int d3d12_feedback_null(D3D12_GPU_DESCRIPTOR_HANDLE *out)
+{
+    if (!vio_d3d12.fb_null_gpu.ptr) {
+        ID3D12Device8 *dev8 = NULL;
+        if (FAILED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device8, (void **)&dev8)) || !dev8) return -1;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+        if (d3d12_alloc_srv_descriptor(&cpu, &gpu) == UINT_MAX) { ID3D12Device8_Release(dev8); return -1; }
+        ID3D12Device8_CreateSamplerFeedbackUnorderedAccessView(dev8, NULL, NULL, d3d12_visible_cpu_of(cpu));
+        ID3D12Device8_Release(dev8);
+        vio_d3d12.fb_null_gpu = gpu;
+    }
+    *out = vio_d3d12.fb_null_gpu;
+    return 0;
+}
+
+/* Root parameter [16] for pipelines whose pixel stage writes feedback; runs
+ * with d3d12_apply_bindless at every draw site and pipeline bind. */
+static void d3d12_apply_feedback(void)
+{
+    vio_d3d12_pipeline *p = d3d12_current_pipeline;
+    if (!p || !p->uses_feedback || !vio_d3d12.sampler_feedback || !vio_d3d12.cmd_list || !vio_d3d12.in_frame) return;
+    D3D12_GPU_DESCRIPTOR_HANDLE g;
+    if (vio_d3d12.fb_bound && vio_d3d12.fb_bound->fb_map) g = vio_d3d12.fb_bound->fb_uav_gpu;
+    else if (d3d12_feedback_null(&g) != 0) return;
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_FEEDBACK, g);
+}
+
+static int d3d12_sampler_feedback_bind(void *backend_texture)
+{
+    vio_d3d12_texture *t = (vio_d3d12_texture *)backend_texture;
+    if (!vio_d3d12.sampler_feedback) return -1;
+    if (t && d3d12_feedback_ensure(t) != 0) return -1;
+    vio_d3d12.fb_bound = t;
+    d3d12_apply_feedback();
+    return 0;
+}
+
+static void d3d12_record_feedback_clear(ID3D12GraphicsCommandList *list, void *user)
+{
+    vio_d3d12_texture *t = (vio_d3d12_texture *)user;
+    /* The GPU handle must lie in the heap bound on the list. */
+    vio_d3d12_bind_graphics_heaps(list);
+    static const UINT zero[4] = {0, 0, 0, 0};   /* opaque format: any value clears to "not sampled" */
+    ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, t->fb_uav_gpu, t->fb_uav_cpu, t->fb_map, zero, 0, NULL);
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    b.UAV.pResource = t->fb_map;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+}
+
+static int d3d12_sampler_feedback_clear(void *backend_texture)
+{
+    vio_d3d12_texture *t = (vio_d3d12_texture *)backend_texture;
+    if (!t || d3d12_feedback_ensure(t) != 0) return -1;
+    if (vio_d3d12.in_frame && vio_d3d12.cmd_list) {
+        d3d12_record_feedback_clear(vio_d3d12.cmd_list, t);
+        d3d12_apply_bindless();   /* the heap rebind dropped the root tables */
+        return 0;
+    }
+    return d3d12_submit_upload(d3d12_record_feedback_clear, t);
+}
+
+/* MinMip map -> R8_UINT decode target (ResolveSubresourceRegion with
+ * DECODE_SAMPLER_FEEDBACK; all mips of the map are subresource UINT_MAX). */
+static void d3d12_record_feedback_resolve(ID3D12GraphicsCommandList *list, void *user)
+{
+    vio_d3d12_texture *t = (vio_d3d12_texture *)user;
+    ID3D12GraphicsCommandList1 *list1 = NULL;
+    if (FAILED(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList1, (void **)&list1)) || !list1)
+        return;
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = t->fb_map;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+    ID3D12GraphicsCommandList1_ResolveSubresourceRegion(list1, t->fb_decoded, 0, 0, 0, t->fb_map, UINT_MAX, NULL,
+                                                        DXGI_FORMAT_R8_UINT, D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+    ID3D12GraphicsCommandList1_Release(list1);
+}
+
+static unsigned char *d3d12_readback_subresource(ID3D12Resource *src, UINT subresource,
+                                                 D3D12_RESOURCE_STATES state, UINT *out_pitch);
+
+static int d3d12_sampler_feedback_read(void *backend_texture, unsigned char **out,
+                                       int *regions_x, int *regions_y, int *region_px)
+{
+    vio_d3d12_texture *t = (vio_d3d12_texture *)backend_texture;
+    *out = NULL;
+    if (!t || !t->fb_map) return -1;
+    if (vio_d3d12.in_frame && vio_d3d12.cmd_list) d3d12_record_feedback_resolve(vio_d3d12.cmd_list, t);
+    else if (d3d12_submit_upload(d3d12_record_feedback_resolve, t) != 0) return -1;
+    /* Same queue: the copy below runs after the resolve (mid-frame on the
+     * frame list, which the helper executes and reopens). */
+    UINT pitch = 0;
+    unsigned char *raw = d3d12_readback_subresource(t->fb_decoded, 0, D3D12_RESOURCE_STATE_RESOLVE_DEST, &pitch);
+    if (!raw) return -1;
+    unsigned char *mips = (unsigned char *)malloc((size_t)t->fb_rx * t->fb_ry);
+    if (!mips) { free(raw); return -1; }
+    for (int y = 0; y < t->fb_ry; y++) memcpy(mips + (size_t)y * t->fb_rx, raw + (size_t)y * pitch, (size_t)t->fb_rx);
+    free(raw);
+    *out = mips;
+    *regions_x = t->fb_rx;
+    *regions_y = t->fb_ry;
+    *region_px = t->fb_region;
     return 0;
 }
 
@@ -4915,13 +5171,26 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
 
     HRESULT hr;
 
+    /* 'hlsl' => ['fragment' => src]: the pixel shader as given (sampler
+     * feedback has no GLSL form); the GLSL fragment stage only defines the
+     * cbuffer layout, checked below like the other overrides. */
+    if (desc->fragment_hlsl) hlsl_ps = desc->fragment_hlsl;
+
     /* Bindless table: SPIRV-Cross keeps Set 1 in register space 1. */
     shader->uses_bindless = (hlsl_vs && strstr(hlsl_vs, "space1)")) || (hlsl_ps && strstr(hlsl_ps, "space1)"));
+    shader->uses_feedback = hlsl_ps && strstr(hlsl_ps, "FeedbackTexture2D") != NULL;
+    if (shader->uses_feedback && !vio_d3d12.sampler_feedback) {
+        php_error_docref(NULL, E_WARNING, "D3D12: the pixel shader writes sampler feedback but the device has none "
+                         "(VIO_FEATURE_SAMPLER_FEEDBACK = 0: needs SM 6.5 via shader_model 6, SamplerFeedbackTier 0.9)");
+        goto fail;
+    }
     hr = d3d12_compile_cached(hlsl_vs, "vs_main", "vs_5_1", compile_flags, &shader->vs_blob);
     if (FAILED(hr)) goto fail;
 
     hr = d3d12_compile_cached(hlsl_ps, "ps_main", "ps_5_1", compile_flags, &shader->ps_blob);
     if (FAILED(hr)) goto fail;
+    if (desc->fragment_hlsl && desc->fragment_size >= 4 && *(const uint32_t *)desc->fragment_data == 0x07230203)
+        vio_d3d_check_override_cbuffer(shader->ps_blob, desc->fragment_data, desc->fragment_size, "D3D12", "PS");
 
     /* GLSL tessellation without an HLSL override: vio translates both stages
      * together (vio_tess_hlsl.c) and keeps their SPIR-V for hull shader
@@ -6497,6 +6766,8 @@ static int d3d12_supports_feature(vio_feature feature)
         /* Unbounded SRV table in register space 1 (Resource Binding Tier 2+);
          * works with FXC 5.1 and DXC. */
         case VIO_FEATURE_BINDLESS:     return vio_d3d12.bindless;
+        /* MinMip feedback maps (SM 6.5 WriteSamplerFeedback, Tier 0.9). */
+        case VIO_FEATURE_SAMPLER_FEEDBACK: return vio_d3d12.sampler_feedback;
         case VIO_FEATURE_ATOMIC64:     return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 66 && vio_d3d12.int64_ops;
         case VIO_FEATURE_BARYCENTRICS: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 61 && vio_d3d12.barycentrics;
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
@@ -7160,6 +7431,9 @@ static const vio_backend d3d12_backend = {
     .create_acceleration_structure  = d3d12_create_acceleration_structure,
     .destroy_acceleration_structure = d3d12_destroy_acceleration_structure,
     .bind_acceleration_structure    = d3d12_bind_acceleration_structure,
+    .sampler_feedback_bind          = d3d12_sampler_feedback_bind,
+    .sampler_feedback_read          = d3d12_sampler_feedback_read,
+    .sampler_feedback_clear         = d3d12_sampler_feedback_clear,
 };
 
 void vio_backend_d3d12_register(void)

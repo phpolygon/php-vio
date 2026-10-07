@@ -4,7 +4,7 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.8.0**, 143 PHP-Funktionen, 14 Zend-Klassen,
+für die PHPolygon Game Engine. Aktuell **v2.8.0**, 146 PHP-Funktionen, 14 Zend-Klassen,
 6 Backends, 98 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
@@ -94,6 +94,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/165` | Sampler Feedback (`VIO_FEATURE_SAMPLER_FEEDBACK`, nur D3D12, SM 6.5 + Tier 0.9): Fragment-Stage als HLSL-Override (`'hlsl' => ['fragment' => …]`) mit `FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> vio_feedback : register(u0, space2)` + `WriteSamplerFeedback`; eine 256²-Textur mit Mip-Kette auf ein 32²-Ziel gezeichnet meldet in jeder Region Mip ≈ 3, nach `vio_sampler_feedback_clear` keine; ohne Flag liefern bind/read/clear `false`. `VIO_REQUIRE_SAMPLER_FEEDBACK=d3d12` macht das Backend Pflicht. |
 | `tests/render3d/160` | Shading-Rate-Bild (`VIO_FEATURE_SHADING_RATE_IMAGE`, `vio_set_shading_rate_image`, `vio_shading_rate_tile_size`): 2X2-Kacheln links, 1X1 rechts → links grob, rechts fein; Bild klebt über Frames, `null` löscht; falsche Byte-Zahl / Rate 99 → `false`; ohne Feature Kachelgröße 0 und `false`. Nur D3D12 (Tier 2) — in der CI nicht ausführbar (WARP-Tier unbekannt, Diagnose druckt `shading_rate_image`). |
 | `tests/render3d/161` | Bindless-Texturtabelle (`VIO_FEATURE_BINDLESS`, `vio_texture_index()`, BINDLESS-PLAN.md): 64 einfarbige Texturen, ein Draw mit 64 Quads, Slot als Vertex-Attribut → nicht-uniformer Index in `vio_textures[]` (Set 1) im Fragment-Shader; Slot stabil und eindeutig, die Tabelle hält die Texturen am Leben (PHP-Variablen vor dem Draw verworfen); ohne Flag `false`. Liest ein Render-Target (MoltenVK-Swapchain-Readback auf Retina ist nicht exakt). |
 | `tests/render3d/163` | Inline-Raytracing (`VIO_FEATURE_RAY_QUERY`): `vio_acceleration_structure` (BLAS je Mesh, TLAS über Instanzen mit Transform) + `vio_bind_acceleration_structure`; `rayQueryEXT` im Fragment-Shader (Verdecker links / per Transform rechts / beide) und im Compute-Shader (4 Strahlen → 1 1 0 0); ohne Flag liefert `vio_acceleration_structure` `false`. Metal ab MSL 2.4 (M5: ausgeführt), D3D12 DXR 1.1 + SM 6.5, Vulkan `VK_KHR_ray_query`. |
@@ -221,6 +222,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | VRS pro Primitiv (`gl_PrimitiveShadingRateEXT`, `VIO_FEATURE_SHADING_RATE_PRIMITIVE`) | ❌ (SPIRV-Cross: nur Vulkan-GLSL) | ❌ | ✅ (Tier 2 + SM 6.4 `SV_ShadingRate`, Combiner OVERRIDE für Pipelines, deren VS die Rate schreibt) | ✅ (`primitiveFragmentShadingRate`, Combiner REPLACE je Pipeline) | ❌ |
 | VRS-Bild (`vio_set_shading_rate_image`, `VIO_FEATURE_SHADING_RATE_IMAGE`) | ❌ | ❌ | ✅ (Tier 2: R8_UINT-Textur in `SHADING_RATE_SOURCE`, `RSSetShadingRateImage`, Combiner MAX; nach jedem Listen-Reset neu gesetzt) | ❌ (bräuchte `vkCreateRenderPass2` + Fragment-Shading-Rate-Attachment in jedem Pass; kein Treiber in CI/lokal) | ❌ (Rasterization Rate Maps sind ein anderes Modell) |
 | Bindless-Texturtabelle (`vio_texture_index`, `texture2D vio_textures[]` + `sampler vio_sampler` in Set 1, `VIO_FEATURE_BINDLESS`) | ❌ (GL-GLSL hat keine getrennten Texturen; `ARB_bindless_texture` nicht gewired) | ❌ | ✅ (Resource Binding Tier 2+: Root-Parameter [15] unbegrenzter SRV-Bereich `t0, space1`, statischer Sampler `s1, space1`, 1024 reservierte Deskriptoren oben im shader-sichtbaren SRV-Heap; FXC 5.1 und DXC) | ✅ (`VK_EXT_descriptor_indexing`: globales Set 1, 1024 Sampled Images `PARTIALLY_BOUND` + `UPDATE_AFTER_BIND`, unveränderlicher Sampler) | ✅ (SPIRV-Cross-Argument-Buffer nur für Set 1, `device`-Adressraum, `gpuResourceID`s auf `[[buffer(21)]]`, `useResources` je Draw, `constexpr`-Sampler; Cap `bindless`: Metal3 + Tier 2 + MSL 3.0) |
+| Sampler Feedback (`vio_sampler_feedback_bind/read/clear`, HLSL-Fragment-Override, `VIO_FEATURE_SAMPLER_FEEDBACK`) | ❌ | ❌ | ✅ (SM 6.5 + `OPTIONS7.SamplerFeedbackTier ≥ 0.9` + `ID3D12Device8` + Bindless-Layout: MinMip-Map je Textur über `CreateCommittedResource2`, UAV-Table `u0, space2` als Root-Parameter [16] (PIXEL), Decode per `ResolveSubresourceRegion(DECODE_SAMPLER_FEEDBACK)` nach R8_UINT) | ❌ (Sparse Residency liefert Residenz, kein Zugriffs-Feedback) | ❌ (Sparse Textures: dto.) |
 | Ray Query (`vio_acceleration_structure`, `rayQueryEXT`, `VIO_FEATURE_RAY_QUERY`) | ❌ | ❌ | ✅ (DXR Tier 1.1 + SM 6.5 `RayQuery<>`; TLAS als Root-SRV `t0, space9` — Grafik-Root-Parameter [14], Compute-Parameter [3]; Bau synchron über `ID3D12GraphicsCommandList4`) | ✅ (`VK_KHR_acceleration_structure` + `VK_KHR_ray_query` + Abhängigkeiten als Extensions auf der 1.1-Instanz; Binding 33 im 3D-Set, Compute an der GLSL-Binding; Bau im Transient-Command-Buffer) | ✅ (`MTLPrimitive`/`MTLInstanceAccelerationStructureDescriptor`, `set*AccelerationStructure` + `useResource` der BLAS; MSL 2.4) |
 | Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model' / 'shader_model_version']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Profil = höchstes 6.x, das Device **und** DXC/dxil.dll können; SPIRV-Cross übersetzt auf dasselbe Profil; Fallback FXC 5.1) | — | — |
 | Subgroups (`GL_KHR_shader_subgroup_*` in Compute + Fragment, `VIO_FEATURE_SUBGROUP`) | ✅ (`GL_KHR_shader_subgroup`, Stages/Features per `glGetIntegerv`; braucht Compute) | ❌ | ✅ (nur mit SM 6 + `OPTIONS1.WaveOps`: Wave-Intrinsics) | ✅ (`VkPhysicalDeviceSubgroupProperties`: Compute + Fragment, basic/vote/ballot/arithmetic/shuffle) | ✅ (`simd_group`: MSL 2.2, Mac2/Apple7) |
@@ -509,7 +511,7 @@ Alle folgen dem gleichen Muster: `zend_object std` als letztes Feld, `Z_VIO_*_P(
 php_vio.c                   # Alle PHP-Funktionen (~9000 Zeilen, monolithisch)
 php_vio.h                   # Module-Globals (default_backend, debug, vsync)
 php_vio_arginfo.h           # Arginfo + Funktionstabelle (generiert aus vio.stub.php)
-vio.stub.php                # PHP-Stubs für IDE-Support (143 Funktionen)
+vio.stub.php                # PHP-Stubs für IDE-Support (146 Funktionen)
 config.m4 / config.w32      # Autotools- bzw. Windows-Build-Konfiguration
 configure.ac                # PHP-freier Autotools-Einstieg (CI-Permutationen)
 CMakeLists.txt              # IDE-Support (CLion/PhpStorm), kein Release-Build
@@ -591,7 +593,7 @@ Vendored (kein Homebrew): GLAD, stb_image/truetype/write/rect_pack, VMA,
 miniaudio, **SheenBidi** (BiDi, Apache-2.0, `vendor/sheenbidi/`, UNITY-Build via
 `-DSB_CONFIG_UNITY`).
 
-## PHP API (143 Funktionen)
+## PHP API (146 Funktionen)
 
 Vollständige Signaturen in `vio.stub.php`. Die Beispiele hier zeigen die Gruppen.
 

@@ -361,6 +361,13 @@ typedef enum _vio_feature {
      * the GPU per workgroup (meshlet culling, LOD). D3D12: SM 6.5 + MeshShaderTier;
      * Vulkan: VK_EXT_mesh_shader; Metal: mesh pipelines (Metal 3, Apple7 / Mac2). */
     VIO_FEATURE_MESH_SHADER        = 55,
+    /* Sampler feedback (texture streaming): vio_sampler_feedback_bind() pairs a
+     * MinMip feedback map with a texture, a fragment stage writes it with
+     * WriteSamplerFeedback (HLSL override, register u0 space2), and
+     * vio_sampler_feedback_read() decodes the lowest mip sampled per region.
+     * D3D12 only: SM 6.5 + SamplerFeedbackTier 0.9 (and the bindless root
+     * layout); Vulkan / Metal / OpenGL have no equivalent. */
+    VIO_FEATURE_SAMPLER_FEEDBACK   = 57,
     /* Cooperative matrices (GL_KHR_cooperative_matrix): coopMatLoad /
      * coopMatMulAdd / coopMatStore on subgroup-scope tiles in compute kernels,
      * run on the hardware matrix units. vio_cooperative_matrix_shapes() lists
@@ -687,6 +694,10 @@ typedef struct _vio_shader_desc {
     const char       *geometry_hlsl;
     const char       *tess_control_hlsl;
     const char       *tess_eval_hlsl;
+    /* 'hlsl' => ['fragment' => src]: replaces the transpiled pixel shader (D3D12;
+     * sampler feedback has no GLSL form). The GLSL fragment stage stays required
+     * and defines the cbuffer layout. */
+    const char       *fragment_hlsl;
     /* vio_shader(['view_count' => N]) (VIO_FEATURE_MULTIVIEW): the stages use
      * gl_ViewIndex and every draw runs N times, view v into layer v of a target
      * bound with VIO_RT_ALL_LAYERS. 0 = not a multiview shader. */
