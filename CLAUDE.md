@@ -4,7 +4,7 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.8.0**, 143 PHP-Funktionen, 14 Zend-Klassen,
+für die PHPolygon Game Engine. Aktuell **v2.8.0**, 145 PHP-Funktionen, 14 Zend-Klassen,
 6 Backends, 98 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
@@ -98,6 +98,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 | `tests/render3d/160` | Shading-Rate-Bild (`VIO_FEATURE_SHADING_RATE_IMAGE`, `vio_set_shading_rate_image`, `vio_shading_rate_tile_size`): 2X2-Kacheln links, 1X1 rechts → links grob, rechts fein; Bild klebt über Frames, `null` löscht; falsche Byte-Zahl / Rate 99 → `false`; ohne Feature Kachelgröße 0 und `false`. Nur D3D12 (Tier 2) — in der CI nicht ausführbar (WARP-Tier unbekannt, Diagnose druckt `shading_rate_image`). |
 | `tests/render3d/161` | Bindless-Texturtabelle (`VIO_FEATURE_BINDLESS`, `vio_texture_index()`, BINDLESS-PLAN.md): 64 einfarbige Texturen, ein Draw mit 64 Quads, Slot als Vertex-Attribut → nicht-uniformer Index in `vio_textures[]` (Set 1) im Fragment-Shader; Slot stabil und eindeutig, die Tabelle hält die Texturen am Leben (PHP-Variablen vor dem Draw verworfen); ohne Flag `false`. Liest ein Render-Target (MoltenVK-Swapchain-Readback auf Retina ist nicht exakt). |
 | `tests/render3d/163` | Inline-Raytracing (`VIO_FEATURE_RAY_QUERY`): `vio_acceleration_structure` (BLAS je Mesh, TLAS über Instanzen mit Transform) + `vio_bind_acceleration_structure`; `rayQueryEXT` im Fragment-Shader (Verdecker links / per Transform rechts / beide) und im Compute-Shader (4 Strahlen → 1 1 0 0); ohne Flag liefert `vio_acceleration_structure` `false`. Metal ab MSL 2.4 (M5: ausgeführt), D3D12 DXR 1.1 + SM 6.5, Vulkan `VK_KHR_ray_query`. |
+| `tests/render3d/162` | Mesh- und Task-Shader (`VIO_FEATURE_MESH_SHADER`, `vio_shader(['task' => …, 'mesh' => …, 'fragment' => …])`, `vio_draw_mesh_tasks`/`_indirect`): Task-Stage startet Mesh-Gruppen nur für gerade Gruppen-IDs (Payload), Mesh-Stage emittiert je Gruppe ein Quad mit Per-Primitiv-Farbe × Mesh-Uniform; nur Mesh; indirekt (3 × uint32); Orientierung gleich einer Vertex-Pipeline; Vertrag (`vertex` + `mesh`, `task` ohne `mesh`, ohne Flag abgelehnt). Ausgeführt auf Metal (M-Serie, MSL ≥ 3.0); D3D12 (SM 6.5 + `MeshShaderTier`, nicht auf WARP) und Vulkan (`VK_EXT_mesh_shader`, nicht MoltenVK) nur Text-/Compile-geprüft. `VIO_REQUIRE_MESH_SHADER`. |
 | `tests/render3d/159` | Shading-Rate pro Primitiv (`VIO_FEATURE_SHADING_RATE_PRIMITIVE`): Vertex-Stage schreibt `gl_PrimitiveShadingRateEXT` (2×2 = 5, auf Vulkan und D3D12 gleich kodiert) und überschreibt `vio_set_shading_rate`; Pipelines ohne den Write behalten die gesetzte Rate. **Nirgends ausführbar** (lavapipe ohne VRS, WARP nur SM 6.2, MoltenVK/Metal ohne VRS) — D3D12-HLSL nur per DXC geprüft. |
 | `tests/render3d/158` | Multiview (`VIO_FEATURE_MULTIVIEW`, `vio_shader(['view_count' => N])`): ein Draw rendert jede View in Layer `gl_ViewIndex` eines mit `VIO_RT_ALL_LAYERS` gebundenen Layered-RTs — Fragment- und Vertex-Arbeit je View, Instancing (Instanz-Attribute stepen je Instanz, nicht je (Instanz, View)), 4 Views, indirekter Draw, Optionsvertrag (2..4, ohne Flag abgelehnt). CI-Pflicht auf allen vier Backends: OpenGL (llvmpipe, `GL_OVR_multiview2`), Vulkan (lavapipe), D3D12 (WARP, SM 6.2), Metal (macOS-Runner). |
 | `tests/render3d/155` | 16-Bit-Floats (`VIO_FEATURE_SHADER_FLOAT16`): `float16_t` zur Laufzeit gerundet (2049 → 2048, 0.1 → 0.0999755859375) — beweist echte halbe Genauigkeit (HLSL `min16float` wäre nur ein Hinweis). |
@@ -231,6 +232,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Draw-Parameter (`gl_BaseVertex`/`gl_BaseInstance`, `VIO_FEATURE_BASE_VERTEX`) | ✅ (4.6 / `ARB_shader_draw_parameters` + Base Instance 4.2) | ❌ | ✅ (SM 6.8 `SV_StartVertexLocation`/`SV_StartInstanceLocation`; darunter bräuchte SPIRV-Cross einen cbuffer, den indirekte Draws nicht füllen können) | ✅ (`shaderDrawParameters` + `drawIndirectFirstInstance`, letzteres war vorher nie aktiviert) | ✅ (`[[base_vertex]]`/`[[base_instance]]`, Mac2/Apple3; nicht in emulierten GS/Tess-Pipelines) |
 | Compute-Derivate (`derivative_group_quadsNV`, `VIO_FEATURE_COMPUTE_DERIVATIVES`) | ✅ (`GL_NV_compute_shader_derivatives`; SPIRV-Cross verliert den Ausführungsmodus, `vio_spirv_to_glsl_compute` setzt Extension + Layout wieder ein) | ❌ | ✅ (SM 6.6) | ✅ (`VK_NV`/`VK_KHR_compute_shader_derivatives`) | ❌ (Kernel ohne Derivate) |
 | Multiview (`vio_shader(['view_count' => 2..4])`, `gl_ViewIndex`, `VIO_FEATURE_MULTIVIEW`) | ✅ (`GL_OVR_multiview2`: SPIRV-Cross `num_views`, Attachments je Draw per `glFramebufferTextureMultiviewOVR`, View-Zahl je Programm) | ❌ | ✅ (SM 6.1 + `ViewInstancingTier`: PSO über Pipeline-State-Stream mit `VIEW_INSTANCING`, `SetViewInstanceMask` vor jedem Draw) | ✅ (Render-Pass mit `viewMask` je RT lazily, `vk3d_prepare` schaltet zwischen Multiview- und Layered-Pass um) | ✅ (SPIRV-Cross-Instancing-Emulation: Instanzen × N, Instanz-Attribute `stepRate` N, `spvViewMask` auf Buffer 23, indirekte Draws über die CPU; Mac2/Apple5) |
+| Mesh-/Task-Shader (`vio_shader(['mesh', 'task'])`, `vio_draw_mesh_tasks(_indirect)`, `VIO_FEATURE_MESH_SHADER`) | ❌ (`GL_NV_mesh_shader` nicht über SPIRV-Cross) | ❌ | ✅ (SM 6.5 + `OPTIONS7.MeshShaderTier`: AS/MS-PSO über den Pipeline-State-Stream, Root-Signatur-Variante mit MESH-/AMPLIFICATION-Sichtbarkeit, `DispatchMesh`, `ExecuteIndirect` `DISPATCH_MESH`) | ✅ (`VK_EXT_mesh_shader` + `VK_KHR_spirv_1_4`, Pipeline ohne Vertex-Input, `vkCmdDrawMeshTasks(Indirect)EXT`) | ✅ (`MTLMeshRenderPipelineDescriptor`, `drawMeshThreadgroups`; Metal 3 + Apple7/Mac2, MSL ≥ 3.0) |
 | HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | ✅ (10-Bit-Surface-Format + `VK_EXT_swapchain_colorspace` HDR10 ST 2084, Block 10d) | ✅ (`CAMetalLayer` RGB10A2 im BT.2100-PQ-Farbraum, `hdr_output => 1` nur auf EDR-Displays) |
 | Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | ✅ (Dispatch-Semaphore über die Frames in Flight, 1..3) |
 | GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`) |
@@ -507,7 +509,7 @@ Alle folgen dem gleichen Muster: `zend_object std` als letztes Feld, `Z_VIO_*_P(
 php_vio.c                   # Alle PHP-Funktionen (~9000 Zeilen, monolithisch)
 php_vio.h                   # Module-Globals (default_backend, debug, vsync)
 php_vio_arginfo.h           # Arginfo + Funktionstabelle (generiert aus vio.stub.php)
-vio.stub.php                # PHP-Stubs für IDE-Support (143 Funktionen)
+vio.stub.php                # PHP-Stubs für IDE-Support (145 Funktionen)
 config.m4 / config.w32      # Autotools- bzw. Windows-Build-Konfiguration
 configure.ac                # PHP-freier Autotools-Einstieg (CI-Permutationen)
 CMakeLists.txt              # IDE-Support (CLion/PhpStorm), kein Release-Build
@@ -589,7 +591,7 @@ Vendored (kein Homebrew): GLAD, stb_image/truetype/write/rect_pack, VMA,
 miniaudio, **SheenBidi** (BiDi, Apache-2.0, `vendor/sheenbidi/`, UNITY-Build via
 `-DSB_CONFIG_UNITY`).
 
-## PHP API (143 Funktionen)
+## PHP API (145 Funktionen)
 
 Vollständige Signaturen in `vio.stub.php`. Die Beispiele hier zeigen die Gruppen.
 
@@ -1259,5 +1261,10 @@ Aufrufer geändert hat:
   umgekehrte Winding, GL-korrekte Patches verschwanden bei Backface-Culling). Metal nutzte die MSL-Option
   `tess_domain_origin_lower_left` plus Winding-Umkehr: das legte `outer[1]`/`outer[3]` von Quads auf die
   Gegenkante und cullte jedes Dreiecks-Patch – Metal braucht keins von beidem (Test 144 auf der macOS-CI).
+- **Mesh-Shader**: Die Mesh-Stage belegt den Vertex-Slot des Shader-Objekts (Uniforms/Reflection wie ein
+  Vertex-Shader; eine Task-Stage liest denselben Block: D3D12 über den GS-CBV-Slot der Mesh-Root-Signatur,
+  Metal `setObjectBuffer`). SPIRV-Cross wendet auf `gl_MeshVerticesEXT[i].gl_Position` keinen Clip-Fixup an;
+  `vio_mesh_fix_positions` schreibt jede Zuweisung um (Vulkan y-Flip + z, D3D12 nur z). Texturen nur im
+  Fragment-Shader. MSL reserviert `quad` (u. a.) – eine GLSL-Funktion dieses Namens bricht den Metal-Compile.
 - **`gl_PatchVerticesIn` auf OpenGL** mit SPIRV-Cross vor `vulkan-sdk-1.3.275` (Ubuntu 24.04: 1.3.268): das
   GLSL-Backend schreibt `gl_BuiltIn_14`; `vio_spirv_to_glsl` ersetzt es (`vio_glsl_fix_patch_vertices`).

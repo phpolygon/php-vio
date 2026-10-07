@@ -153,6 +153,10 @@ static VkShaderStageFlags vk3d_stage_bit(int stage)
         case VIO_STAGE_GEOMETRY:     return VK_SHADER_STAGE_GEOMETRY_BIT;
         case VIO_STAGE_TESS_CONTROL: return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
         case VIO_STAGE_TESS_EVAL:    return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+#ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
+        case VIO_STAGE_MESH:         return VK_SHADER_STAGE_MESH_BIT_EXT;
+        case VIO_STAGE_TASK:         return VK_SHADER_STAGE_TASK_BIT_EXT;
+#endif
         default:                     return VK_SHADER_STAGE_VERTEX_BIT;
     }
 }
@@ -164,6 +168,8 @@ static const char *vk3d_stage_name(int stage)
         case VIO_STAGE_GEOMETRY:     return "geometry";
         case VIO_STAGE_TESS_CONTROL: return "tess_control";
         case VIO_STAGE_TESS_EVAL:    return "tess_eval";
+        case VIO_STAGE_MESH:         return "mesh";
+        case VIO_STAGE_TASK:         return "task";
         default:                     return "vertex";
     }
 }
@@ -183,8 +189,11 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
     if (is_fragment) vk3d_assign_locations(c, res, SPVC_RESOURCE_TYPE_STAGE_OUTPUT, NULL, 0, 0);
     else             vk3d_assign_locations(c, res, SPVC_RESOURCE_TYPE_STAGE_OUTPUT, vt_out, 1, 0);
     VkShaderStageFlags stage = vk3d_stage_bit(stage_id);
+    /* Mesh / task stages share the vertex stage's block: the mesh stage takes
+     * the vertex slot of the shader object (uniform reflection, cbuffer). */
     uint32_t default_block = stage_id == VIO_STAGE_FRAGMENT ? VK3D_B_FS_UBO
-                           : stage_id == VIO_STAGE_VERTEX   ? VK3D_B_VS_UBO
+                           : (stage_id == VIO_STAGE_VERTEX || stage_id == VIO_STAGE_MESH ||
+                              stage_id == VIO_STAGE_TASK) ? VK3D_B_VS_UBO
                            : (uint32_t)(VK3D_B_STAGE_UBO0 + (stage_id - VIO_STAGE_GEOMETRY));
     const spvc_reflected_resource *list;
     size_t n;
@@ -320,6 +329,20 @@ static char *vk3d_gs_fixup(const char *glsl)
  * stage (input locations follow their outputs' names); `is_last` marks the
  * stage that carries the clip-space fixup. Both are part of the cache key: the
  * same vertex SPIR-V compiles differently with and without a geometry stage. */
+/* SPIRV-Cross emits ray queries only for GLSL 460. */
+static int vk3d_uses_ray_query(const uint32_t *spirv, size_t spirv_bytes)
+{
+    size_t n = spirv_bytes / 4;
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = spirv[i] >> 16, op = spirv[i] & 0xFFFF;
+        if (wc == 0) break;
+        if (op == 17 /* OpCapability */ && i + 1 < n && spirv[i + 1] == 4472 /* RayQueryKHR */) return 1;
+        if (op != 17 && op != 11 && op != 14 && op != 15 && op != 16 && op != 10) break;
+        i += wc;
+    }
+    return 0;
+}
+
 static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage_id, int is_last,
                             vio_vk3d_shader *sh, vk3d_varyings *vt_in, vk3d_varyings *vt_out,
                             vk3d_stage_samplers *smp, uint64_t upstream, size_t *out_bytes)
@@ -357,7 +380,8 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
 
     spvc_compiler_options opts = NULL;
     spvc_compiler_create_compiler_options(c, &opts);
-    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_GLSL_VERSION, 450);
+    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_GLSL_VERSION,
+                                   vk3d_uses_ray_query(spirv, spirv_bytes) ? 460 : 450);
     spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_GLSL_ES, SPVC_FALSE);
     spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_GLSL_VULKAN_SEMANTICS, SPVC_TRUE);
     spvc_compiler_install_compiler_options(c, opts);
@@ -370,6 +394,7 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
         return NULL;
     }
     char *src = !is_last ? strdup(glsl)
+              : stage_id == VIO_STAGE_MESH ? vio_mesh_fix_positions(strdup(glsl), 1, 1, "vec4")
               : stage_id == VIO_STAGE_GEOMETRY ? vk3d_gs_fixup(glsl) : vk3d_vs_fixup(glsl);
     spvc_context_destroy(ctx);
     if (!src) return NULL;
@@ -443,11 +468,12 @@ void vk3d_shader_release_gpu(vio_vk3d_shader *sh)
         if (sh->gs)         vio_vk_defer_destroy(VIO_VK_GRAVE_SHADER_MODULE, (uint64_t)sh->gs, NULL);
         if (sh->tcs)        vio_vk_defer_destroy(VIO_VK_GRAVE_SHADER_MODULE, (uint64_t)sh->tcs, NULL);
         if (sh->tes)        vio_vk_defer_destroy(VIO_VK_GRAVE_SHADER_MODULE, (uint64_t)sh->tes, NULL);
+        if (sh->ts)         vio_vk_defer_destroy(VIO_VK_GRAVE_SHADER_MODULE, (uint64_t)sh->ts, NULL);
     }
     sh->layout = VK_NULL_HANDLE;
     sh->set_layout = VK_NULL_HANDLE;
     sh->vs = sh->fs = VK_NULL_HANDLE;
-    sh->gs = sh->tcs = sh->tes = VK_NULL_HANDLE;
+    sh->gs = sh->tcs = sh->tes = sh->ts = VK_NULL_HANDLE;
     sh->dead = 1;
 }
 
@@ -465,14 +491,21 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
     }
     /* Pipeline order VS -> TCS -> TES -> GS -> FS; tess control + eval come as
      * a pair (vio_shader guarantees it). */
-    struct { int id; const void *data; size_t size; VkShaderModule *module; } st[5] = {
-        { VIO_STAGE_VERTEX,       desc->vertex_data,       desc->vertex_size,       NULL },
+    /* Mesh pipelines: task -> mesh (in the vertex slot) -> fragment. */
+    int is_mesh = vio_spirv_execution_model(desc->vertex_data, desc->vertex_size) == VIO_SPIRV_MODEL_MESH_EXT;
+    if (desc->task_data && (!is_mesh || desc->task_size < 20 || *(const uint32_t *)desc->task_data != 0x07230203)) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: a task stage needs a mesh stage, both as SPIR-V");
+        return NULL;
+    }
+    struct { int id; const void *data; size_t size; VkShaderModule *module; } st[6] = {
+        { VIO_STAGE_TASK,         desc->task_data,         desc->task_size,         NULL },
+        { is_mesh ? VIO_STAGE_MESH : VIO_STAGE_VERTEX, desc->vertex_data, desc->vertex_size, NULL },
         { VIO_STAGE_TESS_CONTROL, desc->tess_control_data, desc->tess_control_size, NULL },
         { VIO_STAGE_TESS_EVAL,    desc->tess_eval_data,    desc->tess_eval_size,    NULL },
         { VIO_STAGE_GEOMETRY,     desc->geometry_data,     desc->geometry_size,     NULL },
         { VIO_STAGE_FRAGMENT,     desc->fragment_data,     desc->fragment_size,     NULL },
     };
-    for (int i = 1; i < 4; i++) {
+    for (int i = 2; i < 5; i++) {
         if (st[i].data && (st[i].size < 20 || *(const uint32_t *)st[i].data != 0x07230203)) {
             php_error_docref(NULL, E_WARNING, "Vulkan: %s stage must reach the backend as SPIR-V", vk3d_stage_name(st[i].id));
             return NULL;
@@ -485,19 +518,21 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
     vio_vk3d_shader *sh = (vio_vk3d_shader *)calloc(1, sizeof(vio_vk3d_shader));
     if (sh) sh->writes_shading_rate = vio_spirv_has_builtin(desc->vertex_data, desc->vertex_size, 4432);   /* PrimitiveShadingRateKHR */
     if (!sh) return NULL;
-    st[0].module = &sh->vs; st[1].module = &sh->tcs; st[2].module = &sh->tes;
-    st[3].module = &sh->gs; st[4].module = &sh->fs;
+    sh->is_mesh = is_mesh;
+    st[0].module = &sh->ts; st[1].module = &sh->vs; st[2].module = &sh->tcs; st[3].module = &sh->tes;
+    st[4].module = &sh->gs; st[5].module = &sh->fs;
 
     /* The last stage before the rasterizer owns the clip-space fixup. */
-    int last_geo = desc->geometry_data ? VIO_STAGE_GEOMETRY
+    int last_geo = is_mesh ? VIO_STAGE_MESH
+                 : desc->geometry_data ? VIO_STAGE_GEOMETRY
                  : desc->tess_eval_data ? VIO_STAGE_TESS_EVAL : VIO_STAGE_VERTEX;
     vk3d_varyings vt[2];
     memset(vt, 0, sizeof(vt));
-    vk3d_stage_samplers smp[5];
+    vk3d_stage_samplers smp[6];
     memset(smp, 0, sizeof(smp));
     uint64_t upstream = 0;
     int cur = 0, ok = 1;
-    for (int i = 0; i < 5 && ok; i++) {
+    for (int i = 0; i < 6 && ok; i++) {
         if (!st[i].data) continue;
         vk3d_varyings *in = &vt[cur], *out = &vt[cur ^ 1];
         memset(out, 0, sizeof(*out));
@@ -521,12 +556,12 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
      * fragment ones, in php_vio.c's merge order (geometry, tess control, tess
      * eval), so vio_set_uniform('u_height', unit) + vio_bind_texture reach them. */
     {
-        static const int merge_order[3] = { 3, 1, 2 };
+        static const int merge_order[3] = { 4, 2, 3 };
         for (int k = 0; k < 3; k++) {
             const vk3d_stage_samplers *s = &smp[merge_order[k]];
             for (int j = 0; j < s->count && sh->fs_sampler_count < VK3D_MAX_SAMPLERS; j++) {
                 int known = 0;
-                for (int f = 0; f < smp[4].count && !known; f++) known = strcmp(smp[4].names[f], s->names[j]) == 0;
+                for (int f = 0; f < smp[5].count && !known; f++) known = strcmp(smp[5].names[f], s->names[j]) == 0;
                 for (int q = 0; q < k && !known; q++) {
                     const vk3d_stage_samplers *e = &smp[merge_order[q]];
                     for (int f = 0; f < e->count && !known; f++) known = strcmp(e->names[f], s->names[j]) == 0;
@@ -771,17 +806,25 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     const vio_vk3d_shader *sh = p->shader;
     /* Depth-only passes skip a fragment stage that could only write colour. */
     int with_fs = !(cc == 0 && !sh->fs_needed_without_color);
-    const struct { VkShaderStageFlagBits bit; VkShaderModule m; } order[5] = {
-        { VK_SHADER_STAGE_VERTEX_BIT,                  sh->vs  },
+#ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
+    const VkShaderStageFlagBits first_bit = sh->is_mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT;
+    const VkShaderStageFlagBits task_bit = VK_SHADER_STAGE_TASK_BIT_EXT;
+#else
+    const VkShaderStageFlagBits first_bit = VK_SHADER_STAGE_VERTEX_BIT;
+    const VkShaderStageFlagBits task_bit = VK_SHADER_STAGE_VERTEX_BIT;
+#endif
+    const struct { VkShaderStageFlagBits bit; VkShaderModule m; } order[6] = {
+        { task_bit,                                    sh->ts  },
+        { first_bit,                                   sh->vs  },
         { VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,    sh->tcs },
         { VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, sh->tes },
         { VK_SHADER_STAGE_GEOMETRY_BIT,                sh->gs  },
         { VK_SHADER_STAGE_FRAGMENT_BIT,                with_fs ? sh->fs : VK_NULL_HANDLE },
     };
-    VkPipelineShaderStageCreateInfo stages[5];
+    VkPipelineShaderStageCreateInfo stages[6];
     memset(stages, 0, sizeof(stages));
     uint32_t stage_count = 0;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         if (!order[i].m) continue;
         stages[stage_count].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[stage_count].stage  = order[i].bit;
@@ -899,8 +942,8 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     gi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     gi.stageCount          = stage_count;
     gi.pStages             = stages;
-    gi.pVertexInputState   = &vi;
-    gi.pInputAssemblyState = &ia;
+    gi.pVertexInputState   = sh->is_mesh ? NULL : &vi;   /* mesh pipelines have no vertex input */
+    gi.pInputAssemblyState = sh->is_mesh ? NULL : &ia;
     gi.pTessellationState  = tess ? &ts : NULL;
     gi.pViewportState      = &vp;
     gi.pRasterizationState = &rs;

@@ -284,6 +284,7 @@ static int create_logical_device(void)
     int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0, has_bary = 0, has_a64 = 0;
     int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0, has_di = 0, has_m3 = 0;
     int has_as = 0, has_rq = 0, has_dho = 0, has_bda = 0, has_spv14 = 0, has_sfc = 0;
+    int has_mesh = 0, has_fc = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
@@ -303,6 +304,8 @@ static int create_logical_device(void)
         if (strcmp(ext_props[i].extensionName, "VK_EXT_descriptor_indexing") == 0) has_di = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_spirv_1_4") == 0) has_spv14 = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_sfc = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_mesh_shader") == 0) has_mesh = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_fc = 1;
     }
     free(ext_props);
     if (has_portability) VIO_VK_ADD_DEVICE_EXT("VK_KHR_portability_subset");
@@ -549,6 +552,33 @@ static int create_logical_device(void)
         }
     }
 
+    /* VIO_FEATURE_MESH_SHADER: VK_EXT_mesh_shader with mesh AND task stages.
+     * GL_EXT_mesh_shader compiles to SPIR-V 1.4, which a 1.1 instance only
+     * accepts through VK_KHR_spirv_1_4 (+ its dependency float_controls). */
+    vio_vk.mesh_supported = 0;
+    vio_vk.mesh_cmd_draw = vio_vk.mesh_cmd_draw_indirect = NULL;
+#ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
+    VkPhysicalDeviceMeshShaderFeaturesEXT mesh_enable = {0};
+    mesh_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+    if (has_mesh && has_spv14 && has_fc && vio_vk.instance_api_11 && device_ext_count + 3 <= (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
+        VkPhysicalDeviceMeshShaderFeaturesEXT mesh_avail = {0};
+        mesh_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &mesh_avail;
+        vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+        if (mesh_avail.meshShader && mesh_avail.taskShader) {
+            mesh_enable.meshShader = VK_TRUE;
+            mesh_enable.taskShader = VK_TRUE;
+            VIO_VK_ADD_DEVICE_EXT("VK_EXT_mesh_shader");
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_spirv_1_4");
+            VIO_VK_ADD_DEVICE_EXT("VK_KHR_shader_float_controls");
+            vio_vk.mesh_supported = 1;
+        }
+    }
+#else
+    (void)has_mesh; (void)has_spv14; (void)has_fc;
+#endif
     /* Inline ray tracing (GL_EXT_ray_query): VK_KHR_acceleration_structure needs
      * deferred host operations, buffer device addresses and descriptor indexing;
      * VK_KHR_ray_query needs SPIR-V 1.4 (+ float controls). The instance runs 1.1,
@@ -610,6 +640,9 @@ static int create_logical_device(void)
     if (vio_vk.draw_parameters_supported) { dp_enable.pNext = feature_chain; feature_chain = &dp_enable; }
     if (vio_vk.compute_derivatives_supported) { cd_enable.pNext = feature_chain; feature_chain = &cd_enable; }
     if (vio_vk.multiview_supported) { mv_enable.pNext = feature_chain; feature_chain = &mv_enable; }
+#ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
+    if (vio_vk.mesh_supported) { mesh_enable.pNext = feature_chain; feature_chain = &mesh_enable; }
+#endif
     if (vio_vk.ray_query_supported) {
         bda_enable.pNext = feature_chain;
         rq_enable.pNext = &bda_enable;
@@ -629,6 +662,11 @@ static int create_logical_device(void)
     if (vio_vk.vrs_supported) {
         vio_vk.vrs_cmd_set = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCmdSetFragmentShadingRateKHR");
         if (!vio_vk.vrs_cmd_set) vio_vk.vrs_supported = 0;   /* pipelines are only built with the dynamic state when this is set */
+    }
+    if (vio_vk.mesh_supported) {
+        vio_vk.mesh_cmd_draw = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCmdDrawMeshTasksEXT");
+        vio_vk.mesh_cmd_draw_indirect = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCmdDrawMeshTasksIndirectEXT");
+        if (!vio_vk.mesh_cmd_draw || !vio_vk.mesh_cmd_draw_indirect) vio_vk.mesh_supported = 0;
     }
     vkGetDeviceQueue(vio_vk.device, vio_vk.present_family, 0, &vio_vk.present_queue);
     if (vio_vk.ray_query_supported) {
@@ -4055,6 +4093,7 @@ static int vulkan_supports_feature(vio_feature feature)
         /* geometryShader implies maxGeometryShaderInvocations >= 32 (spec minimum). */
         case VIO_FEATURE_GEOMETRY_INSTANCING: return vio_vk3d_available() && vio_vk.device && vio_vk.geometry_supported;
         case VIO_FEATURE_3D_PIPELINE:  return vio_vk3d_available(); /* GAP-PHASE5 Block 10 */
+        case VIO_FEATURE_MESH_SHADER:  return vio_vk3d_available() && vio_vk.device && vio_vk.mesh_supported; /* VK_EXT_mesh_shader */
         case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
         case VIO_FEATURE_MULTIVIEW:    return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_supported; /* VkRenderPassMultiviewCreateInfo */
         case VIO_FEATURE_RAY_QUERY:    return vio_vk3d_available() && vio_vk.device && vio_vk.ray_query_supported; /* VK_KHR_ray_query */
@@ -4131,6 +4170,8 @@ static const vio_backend vulkan_backend = {
     .draw_mesh_instanced = vio_vk3d_draw_mesh_instanced,
     .bind_storage_buffer = vio_vk3d_bind_storage_buffer,
     .draw_instanced_from_storage = vio_vk3d_draw_instanced_from_storage,
+    .draw_mesh_tasks          = vio_vk3d_draw_mesh_tasks,
+    .draw_mesh_tasks_indirect = vio_vk3d_draw_mesh_tasks_indirect,
     .draw_indirect     = vio_vk3d_draw_indirect,
     .read_render_target = vio_vk_read_render_target,
     .bind_render_target_face = vio_vk_bind_render_target_face,

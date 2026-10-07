@@ -441,6 +441,21 @@ function vio_sampler_feedback_clear(VioContext $context, VioTexture $texture): b
 function vio_draw_indirect(VioContext $context, VioMesh $mesh, VioBuffer $args, int $maxDraws = 1, int $offset = 0): void {}
 
 /**
+ * Launch $x * $y * $z task workgroups of the bound mesh pipeline (VIO_FEATURE_MESH_SHADER) -
+ * mesh workgroups directly when the shader has no 'task' stage. Each count 0..65535 (0 draws
+ * nothing). D3D12: DispatchMesh (SM 6.5 + MeshShaderTier), Vulkan: vkCmdDrawMeshTasksEXT,
+ * Metal: drawMeshThreadgroups (Metal 3, Apple7 / Mac2).
+ */
+function vio_draw_mesh_tasks(VioContext $context, int $x, int $y = 1, int $z = 1): void {}
+
+/**
+ * vio_draw_mesh_tasks with the group counts read from a storage buffer: $maxDraws records of
+ * 3 uint32 {x, y, z} (stride 12) starting at $offset bytes (multiple of 4) - typically written
+ * by a compute pass. Create the buffer with vio_storage_buffer(['indirect' => true]).
+ */
+function vio_draw_mesh_tasks_indirect(VioContext $context, VioBuffer $args, int $maxDraws = 1, int $offset = 0): void {}
+
+/**
  * Variable rate shading (VIO_FEATURE_SHADING_RATE, D3D12 VRS Tier 1+): the fragment
  * shader runs once per 1x2 / 2x1 / 2x2 / 4x4 pixel block for every following draw while
  * geometry, depth and the resolution stay untouched - the cheapest performance tier.
@@ -639,6 +654,11 @@ function vio_draw_2d(VioContext $context): void {}
  *     the source outputs D3D clip space (z in [0, w]). Also the way to [instance(N)] on D3D.
  * Geometry stages may use layout(invocations = N) where VIO_FEATURE_GEOMETRY_INSTANCING is 1, and the
  * VIO_*_ADJACENCY topologies (vio_mesh(['adjacency' => true]) builds the TRIANGLES_ADJACENCY indices).
+ * Mesh pipelines (VIO_FEATURE_MESH_SHADER, GL_EXT_mesh_shader): 'mesh' => GLSL mesh stage replaces
+ * 'vertex' (giving both is refused), 'task' => optional task (amplification / object) stage; draw them
+ * with vio_draw_mesh_tasks() / vio_draw_mesh_tasks_indirect(), not vio_draw(). The mesh stage's
+ * uniforms are set with vio_set_uniform() like vertex uniforms (a task stage shares that block).
+ * Without the feature 'mesh' returns false with a warning.
  * Portable geometry shaders read input positions from a user varying (`layout(location = N) in vec4 vPos[]`
  * exported by the vertex stage), not from gl_in[].gl_Position, which D3D cannot translate.
  * Uniforms declared in an extra stage are set with
@@ -647,6 +667,7 @@ function vio_draw_2d(VioContext $context): void {}
  *
  * @param array $config ['vertex' => string, 'fragment' => string, 'geometry' => ?string,
  *                      'tess_control' => ?string, 'tess_eval' => ?string, 'hlsl' => ?array,
+ *                      'mesh' => ?string, 'task' => ?string,
  *                      'format' => int (VIO_SHADER_AUTO|VIO_SHADER_GLSL|VIO_SHADER_SPIRV)]
  * @return VioShader|false Shader object or false on failure
  */

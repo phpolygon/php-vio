@@ -58,6 +58,12 @@ typedef struct _vio_shader_object {
     int               has_geometry;  /* 1 => geometry stage present */
     int               has_tessellation; /* 1 => tess control + eval present */
     int               view_count;    /* multiview views (2..4), 0 = off */
+    /* Mesh pipeline (VIO_FEATURE_MESH_SHADER): vert_spirv holds the MESH stage
+     * (it takes the vertex stage's role for uniforms / reflection), task_spirv
+     * the optional task stage. */
+    int               is_mesh;
+    uint32_t         *task_spirv;
+    size_t            task_spirv_size;
     void             *backend_shader; /* Backend-specific compiled shader (D3D11/D3D12/Vulkan) */
     /* Uniform buffer for D3D constant buffer mapping — vertex stage */
     unsigned char     cbuffer_data[VIO_CBUFFER_SIZE];

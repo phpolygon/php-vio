@@ -118,7 +118,7 @@ jobs:
               $i["features"]["float16"], $i["features"]["draw_parameters"], $i["features"]["compute_derivatives"],
               $i["features"]["atomic64"], $i["features"]["barycentrics"], $i["features"]["multiview"]);'
           # What lavapipe offers for the feature tests below.
-          vulkaninfo 2>/dev/null | grep -E "rayQuery|accelerationStructure\b|VK_KHR_ray_query|VK_KHR_acceleration_structure|runtimeDescriptorArray|shaderSampledImageArrayNonUniformIndexing|descriptorBindingPartiallyBound|descriptorBindingSampledImageUpdateAfterBind|VK_EXT_descriptor_indexing|FragmentShadingRate|fragment_shading_rate|NonTrivialCombinerOps|multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads" | sort -u || true
+          vulkaninfo 2>/dev/null | grep -E "VK_EXT_mesh_shader|meshShader|taskShader|rayQuery|accelerationStructure\b|VK_KHR_ray_query|VK_KHR_acceleration_structure|runtimeDescriptorArray|shaderSampledImageArrayNonUniformIndexing|descriptorBindingPartiallyBound|descriptorBindingSampledImageUpdateAfterBind|VK_EXT_descriptor_indexing|FragmentShadingRate|fragment_shading_rate|NonTrivialCombinerOps|multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads" | sort -u || true
           # Barycentrics stay optional here: lavapipe (Mesa, Vulkan 1.4.318) has no
           # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
           export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_ATOMIC64=vulkan
@@ -128,6 +128,8 @@ jobs:
           export VIO_REQUIRE_MULTIVIEW=vulkan,opengl
           # Bindless table (descriptor indexing, lavapipe).
           export VIO_REQUIRE_BINDLESS=vulkan
+          # lavapipe reports rayQuery = true (BLAS/TLAS built on the CPU).
+          export VIO_REQUIRE_RAY_QUERY=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \
@@ -141,6 +143,7 @@ jobs:
             tests/render3d/160_shading_rate_image_all_backends.phpt \
             tests/render3d/161_bindless_all_backends.phpt \
             tests/render3d/163_ray_query_all_backends.phpt \
+            tests/render3d/162_mesh_shaders_all_backends.phpt \
             tests/render3d/165_sampler_feedback_d3d12.phpt
 
       - name: Package binary
@@ -257,7 +260,7 @@ jobs:
               $i["features"]["float16"], $i["features"]["draw_parameters"], $i["features"]["compute_derivatives"],
               $i["features"]["atomic64"], $i["features"]["barycentrics"], $i["features"]["multiview"]);'
           # What lavapipe offers for the feature tests below.
-          vulkaninfo 2>/dev/null | grep -E "rayQuery|accelerationStructure\b|VK_KHR_ray_query|VK_KHR_acceleration_structure|runtimeDescriptorArray|shaderSampledImageArrayNonUniformIndexing|descriptorBindingPartiallyBound|descriptorBindingSampledImageUpdateAfterBind|VK_EXT_descriptor_indexing|FragmentShadingRate|fragment_shading_rate|NonTrivialCombinerOps|multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads" | sort -u || true
+          vulkaninfo 2>/dev/null | grep -E "VK_EXT_mesh_shader|meshShader|taskShader|rayQuery|accelerationStructure\b|VK_KHR_ray_query|VK_KHR_acceleration_structure|runtimeDescriptorArray|shaderSampledImageArrayNonUniformIndexing|descriptorBindingPartiallyBound|descriptorBindingSampledImageUpdateAfterBind|VK_EXT_descriptor_indexing|FragmentShadingRate|fragment_shading_rate|NonTrivialCombinerOps|multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads" | sort -u || true
           # Barycentrics stay optional here: lavapipe (Mesa, Vulkan 1.4.318) has no
           # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
           export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_ATOMIC64=vulkan
@@ -267,6 +270,8 @@ jobs:
           export VIO_REQUIRE_MULTIVIEW=vulkan,opengl
           # Bindless table (descriptor indexing, lavapipe).
           export VIO_REQUIRE_BINDLESS=vulkan
+          # lavapipe reports rayQuery = true (BLAS/TLAS built on the CPU).
+          export VIO_REQUIRE_RAY_QUERY=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \
@@ -280,6 +285,7 @@ jobs:
             tests/render3d/160_shading_rate_image_all_backends.phpt \
             tests/render3d/161_bindless_all_backends.phpt \
             tests/render3d/163_ray_query_all_backends.phpt \
+            tests/render3d/162_mesh_shaders_all_backends.phpt \
             tests/render3d/165_sampler_feedback_d3d12.phpt
 
       - name: Package binary
@@ -580,7 +586,7 @@ jobs:
           $env:VIO_REQUIRE_BINDLESS = "d3d12"
           Write-Host "VIO_DXC_DIR=$env:VIO_DXC_DIR"
           # Which shader-model features WARP offers (tests skip what it lacks).
-          php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r '$c = vio_create("d3d12", ["width" => 8, "height" => 8, "headless" => true, "shader_model" => 6, "dxc_dir" => getenv("VIO_DXC_DIR")]); $i = vio_swapchain_info($c); printf("D3D12 SM %d (%d) subgroup=%d quad=%d barycentrics=%d atomic64=%d float16=%d base_vertex=%d compute_derivatives=%d multiview=%d shading_rate_image=%d bindless=%d ray_query=%d sampler_feedback=%d\n", $i["shader_model"], $i["shader_model_version"], vio_supports_feature($c, VIO_FEATURE_SUBGROUP), vio_supports_feature($c, VIO_FEATURE_SUBGROUP_QUAD), vio_supports_feature($c, VIO_FEATURE_BARYCENTRICS), vio_supports_feature($c, VIO_FEATURE_ATOMIC64), vio_supports_feature($c, VIO_FEATURE_SHADER_FLOAT16), vio_supports_feature($c, VIO_FEATURE_BASE_VERTEX), vio_supports_feature($c, VIO_FEATURE_COMPUTE_DERIVATIVES), vio_supports_feature($c, VIO_FEATURE_MULTIVIEW), vio_supports_feature($c, VIO_FEATURE_SHADING_RATE_IMAGE), vio_supports_feature($c, VIO_FEATURE_BINDLESS), vio_supports_feature($c, VIO_FEATURE_RAY_QUERY), vio_supports_feature($c, VIO_FEATURE_SAMPLER_FEEDBACK));'
+          php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r '$c = vio_create("d3d12", ["width" => 8, "height" => 8, "headless" => true, "shader_model" => 6, "dxc_dir" => getenv("VIO_DXC_DIR")]); $i = vio_swapchain_info($c); printf("D3D12 SM %d (%d) subgroup=%d quad=%d barycentrics=%d atomic64=%d float16=%d base_vertex=%d compute_derivatives=%d multiview=%d shading_rate_image=%d bindless=%d ray_query=%d mesh_shader=%d sampler_feedback=%d\n", $i["shader_model"], $i["shader_model_version"], vio_supports_feature($c, VIO_FEATURE_SUBGROUP), vio_supports_feature($c, VIO_FEATURE_SUBGROUP_QUAD), vio_supports_feature($c, VIO_FEATURE_BARYCENTRICS), vio_supports_feature($c, VIO_FEATURE_ATOMIC64), vio_supports_feature($c, VIO_FEATURE_SHADER_FLOAT16), vio_supports_feature($c, VIO_FEATURE_BASE_VERTEX), vio_supports_feature($c, VIO_FEATURE_COMPUTE_DERIVATIVES), vio_supports_feature($c, VIO_FEATURE_MULTIVIEW), vio_supports_feature($c, VIO_FEATURE_SHADING_RATE_IMAGE), vio_supports_feature($c, VIO_FEATURE_BINDLESS), vio_supports_feature($c, VIO_FEATURE_RAY_QUERY), vio_supports_feature($c, VIO_FEATURE_MESH_SHADER), vio_supports_feature($c, VIO_FEATURE_SAMPLER_FEEDBACK));'
           $env:NO_INTERACTION = "1"
           $env:REPORT_EXIT_STATUS = "1"
           $env:TEST_PHP_ARGS = "-n -d extension_dir=$dllDir -d extension=php_vio.dll"
@@ -657,6 +663,7 @@ jobs:
             tests/render3d/160_shading_rate_image_all_backends.phpt `
             tests/render3d/161_bindless_all_backends.phpt `
             tests/render3d/163_ray_query_all_backends.phpt `
+            tests/render3d/162_mesh_shaders_all_backends.phpt `
             tests/render3d/165_sampler_feedback_d3d12.phpt
 
       - name: Package binary

@@ -355,6 +355,12 @@ typedef enum _vio_feature {
      * Metal: ray queries from render pipelines (MSL 2.4). The ray-tracing
      * PIPELINE (raygen / hit shaders) is VIO_FEATURE_RAYTRACING, still 0. */
     VIO_FEATURE_RAY_QUERY          = 56,
+    /* Mesh and task (amplification / object) stages: vio_shader(['task' => ?,
+     * 'mesh' => ..., 'fragment' => ...]) (GL_EXT_mesh_shader) drawn with
+     * vio_draw_mesh_tasks / vio_draw_mesh_tasks_indirect - geometry generated on
+     * the GPU per workgroup (meshlet culling, LOD). D3D12: SM 6.5 + MeshShaderTier;
+     * Vulkan: VK_EXT_mesh_shader; Metal: mesh pipelines (Metal 3, Apple7 / Mac2). */
+    VIO_FEATURE_MESH_SHADER        = 55,
     /* Sampler feedback (texture streaming): vio_sampler_feedback_bind() pairs a
      * MinMip feedback map with a texture, a fragment stage writes it with
      * WriteSamplerFeedback (HLSL override, register u0 space2), and
@@ -664,6 +670,11 @@ typedef struct _vio_shader_desc {
      * gl_ViewIndex and every draw runs N times, view v into layer v of a target
      * bound with VIO_RT_ALL_LAYERS. 0 = not a multiview shader. */
     int               view_count;
+    /* Mesh pipelines (VIO_FEATURE_MESH_SHADER): vertex_data then holds the MESH
+     * stage's SPIR-V (execution model MeshEXT, see vio_spirv_execution_model) and
+     * task_data the optional task stage. */
+    const void       *task_data;
+    size_t            task_size;
 } vio_shader_desc;
 
 /* Shader stage index shared by vio_shader_object's per-stage constant
@@ -676,6 +687,12 @@ typedef enum _vio_shader_stage {
     VIO_STAGE_TESS_EVAL    = 4,
     VIO_STAGE_COUNT        = 5,
 } vio_shader_stage;
+
+/* Mesh-pipeline stages for vio_compile_glsl_stage_to_spirv (outside the
+ * per-stage arrays VIO_STAGE_COUNT sizes: a mesh shader takes the vertex slot
+ * of vio_shader_object, the task shader its own field). */
+#define VIO_STAGE_MESH 16
+#define VIO_STAGE_TASK 17
 
 typedef struct _vio_draw_cmd {
     void *pipeline;

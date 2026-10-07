@@ -252,6 +252,20 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bind_acceleration_structure,
 	ZEND_ARG_TYPE_INFO(0, binding, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_draw_mesh_tasks, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, x, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, y, IS_LONG, 0, "1")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, z, IS_LONG, 0, "1")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_draw_mesh_tasks_indirect, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, args, VioBuffer, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, maxDraws, IS_LONG, 0, "1")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, offset, IS_LONG, 0, "0")
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_shading_rate, 0, 2, _IS_BOOL, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, rate, IS_LONG, 0)
@@ -949,6 +963,8 @@ ZEND_FUNCTION(vio_sampler_feedback_read);
 ZEND_FUNCTION(vio_sampler_feedback_clear);
 ZEND_FUNCTION(vio_acceleration_structure);
 ZEND_FUNCTION(vio_bind_acceleration_structure);
+ZEND_FUNCTION(vio_draw_mesh_tasks);
+ZEND_FUNCTION(vio_draw_mesh_tasks_indirect);
 ZEND_FUNCTION(vio_draw_indirect);
 ZEND_FUNCTION(vio_set_shading_rate);
 ZEND_FUNCTION(vio_set_shading_rate_image);
@@ -1123,6 +1139,8 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_sampler_feedback_clear, arginfo_vio_sampler_feedback_clear)
 	ZEND_FE(vio_acceleration_structure, arginfo_vio_acceleration_structure)
 	ZEND_FE(vio_bind_acceleration_structure, arginfo_vio_bind_acceleration_structure)
+	ZEND_FE(vio_draw_mesh_tasks, arginfo_vio_draw_mesh_tasks)
+	ZEND_FE(vio_draw_mesh_tasks_indirect, arginfo_vio_draw_mesh_tasks_indirect)
 	ZEND_FE(vio_draw_indirect, arginfo_vio_draw_indirect)
 	ZEND_FE(vio_set_shading_rate, arginfo_vio_set_shading_rate)
 	ZEND_FE(vio_set_shading_rate_image, arginfo_vio_set_shading_rate_image)

@@ -413,6 +413,11 @@ typedef struct _vio_backend {
     void *(*create_acceleration_structure)(const vio_as_desc *desc);
     void  (*destroy_acceleration_structure)(void *as);
     void  (*bind_acceleration_structure)(void *as, int binding);
+    /* Mesh pipelines (VIO_FEATURE_MESH_SHADER): launch x * y * z task groups
+     * (mesh groups without a task stage) with the bound mesh pipeline, or read
+     * {x, y, z} uint32 records from a storage buffer. NULL => no mesh stages. */
+    void  (*draw_mesh_tasks)(uint32_t x, uint32_t y, uint32_t z);
+    void  (*draw_mesh_tasks_indirect)(void *args_buffer, int max_draws, size_t offset);
     /* Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK) on a create_texture
      * handle: bind its MinMip feedback map (created on first use) for the
      * following draws - NULL unbinds -; decode it into one byte per region

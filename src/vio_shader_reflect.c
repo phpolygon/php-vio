@@ -143,6 +143,63 @@ char *vio_hlsl_probe_hlsl(int stage, int shader_model)
     return hlsl;
 }
 
+int vio_spirv_execution_model(const void *spirv, size_t bytes)
+{
+    const uint32_t *w = (const uint32_t *)spirv;
+    size_t n = bytes / 4;
+    if (!w || n < 5 || w[0] != 0x07230203u) return -1;
+    for (size_t i = 5; i < n; ) {
+        uint32_t count = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (count == 0) break;
+        if (op == 15 && count >= 3) return (int)w[i + 1];   /* OpEntryPoint <model> <id> <name> */
+        i += count;
+    }
+    return -1;
+}
+
+char *vio_mesh_fix_positions(char *src, int flip_y, int fix_z, const char *vec4)
+{
+    static const char head[] = "gl_MeshVerticesEXT[";
+    static const char tail[] = "].gl_Position = ";
+    if (!src || (!flip_y && !fix_z) || !strstr(src, head)) return src;
+    size_t len = strlen(src), cap = len * 2 + 256, n = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) return src;
+    const char *p = src;
+    for (;;) {
+        const char *m = strstr(p, head);
+        if (!m) break;
+        /* index expression up to the matching ']' */
+        const char *q = m + sizeof(head) - 1;
+        int depth = 0;
+        while (*q && !(*q == ']' && depth == 0)) { if (*q == '[') depth++; else if (*q == ']') depth--; q++; }
+        const char *semi = (*q && strncmp(q, tail, sizeof(tail) - 1) == 0) ? strchr(q + sizeof(tail) - 1, ';') : NULL;
+        if (!semi) {
+            size_t chunk = (size_t)(m + sizeof(head) - 1 - p);
+            if (n + chunk + 1 >= cap) { cap = (n + chunk + 1) * 2; char *g = (char *)realloc(out, cap); if (!g) { free(out); return src; } out = g; }
+            memcpy(out + n, p, chunk); n += chunk;
+            p = m + sizeof(head) - 1;
+            continue;
+        }
+        const char *idx = m + sizeof(head) - 1;
+        size_t idx_len = (size_t)(q - idx);
+        const char *expr = q + sizeof(tail) - 1;
+        size_t expr_len = (size_t)(semi - expr);
+        size_t need = (size_t)(m - p) + idx_len * 2 + expr_len + 256;
+        if (n + need >= cap) { cap = (n + need) * 2; char *g = (char *)realloc(out, cap); if (!g) { free(out); return src; } out = g; }
+        memcpy(out + n, p, (size_t)(m - p)); n += (size_t)(m - p);
+        n += (size_t)sprintf(out + n, "{ %s _vio_mp = %.*s; gl_MeshVerticesEXT[%.*s].gl_Position = %s(_vio_mp.x, %s_vio_mp.y, %s, _vio_mp.w); }",
+                             vec4, (int)expr_len, expr, (int)idx_len, idx, vec4, flip_y ? "-" : "",
+                             fix_z ? "(_vio_mp.z + _vio_mp.w) * 0.5" : "_vio_mp.z");
+        p = semi + 1;
+    }
+    size_t rest = strlen(p);
+    if (n + rest + 1 > cap) { char *g = (char *)realloc(out, n + rest + 1); if (!g) { free(out); return src; } out = g; }
+    memcpy(out + n, p, rest + 1);
+    free(src);
+    return out;
+}
+
 int vio_spirv_accel_binding(const void *spirv, size_t bytes)
 {
     const uint32_t *w = (const uint32_t *)spirv;

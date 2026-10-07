@@ -49,6 +49,10 @@ static void vio_shader_free_object(zend_object *obj)
         free(shader->frag_spirv);
         shader->frag_spirv = NULL;
     }
+    if (shader->task_spirv) {
+        free(shader->task_spirv);
+        shader->task_spirv = NULL;
+    }
     for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
         if (shader->stage_spirv[i]) {
             free(shader->stage_spirv[i]);
