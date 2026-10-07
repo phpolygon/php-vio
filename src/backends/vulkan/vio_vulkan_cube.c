@@ -113,6 +113,7 @@ int vio_vk_generate_mipmaps(void *obj, int kind)
             vio_render_target_object *rt = (vio_render_target_object *)obj;
             vio_vk_rt *x = (vio_vk_rt *)rt->vulkan_rt;
             if (!x) return -1;
+            if (rt->depth_only) return vio_vk_generate_depth_mips(rt);
             if (!x->cube || x->levels <= 1) return 0;
             return vkc_run_mips(x->color_image[0], rt->width, rt->height, 6, x->levels);
         }

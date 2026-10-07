@@ -154,6 +154,7 @@ static void vk3d_destroy_now(int kind, uint64_t h, void *alloc)
         case VIO_VK_GRAVE_SHADER_MODULE:   vkDestroyShaderModule(d, (VkShaderModule)h, NULL); break;
         case VIO_VK_GRAVE_FRAMEBUFFER:     vkDestroyFramebuffer(d, (VkFramebuffer)h, NULL); break;
         case VIO_VK_GRAVE_RENDER_PASS:     vkDestroyRenderPass(d, (VkRenderPass)h, NULL); break;
+        case VIO_VK_GRAVE_DESCRIPTOR_POOL: vkDestroyDescriptorPool(d, (VkDescriptorPool)h, NULL); break;
         default: break;
     }
 }

@@ -102,6 +102,16 @@ typedef struct _vio_vk_rt {
     VkRenderPass   mv_pass[3];     /* multiview passes for 2 / 3 / 4 views (viewMask), lazily */
     VkFramebuffer  mv_fb[3];       /* their framebuffers: the 2D_ARRAY views, layers = 1 */
     VkSampler      sampler;
+    /* depth_only + 'mipmaps' (A26): the depth chain, a sampling view over every
+     * level and, built on the first vio_generate_mipmaps, per level the
+     * attachment view, the source view, a framebuffer and a descriptor set. */
+    int            depth_levels;
+    VkImageView    depth_sample_view;
+    VkImageView   *dmip_att;
+    VkImageView   *dmip_src;
+    VkFramebuffer *dmip_fb;
+    VkDescriptorPool dmip_pool;
+    VkDescriptorSet *dmip_set;
     struct _vio_vulkan_texture *wrap[4];   /* sampling wrappers (vio_render_target_texture) */
     struct _vio_vulkan_texture *cube_wrap; /* vio_render_target_cubemap */
 } vio_vk_rt;
@@ -507,6 +517,7 @@ void    *vulkan_rt_sampling_texture(void *rt, int attachment);
 #define VIO_VK_GRAVE_SHADER_MODULE   8
 #define VIO_VK_GRAVE_FRAMEBUFFER     9
 #define VIO_VK_GRAVE_RENDER_PASS     10
+#define VIO_VK_GRAVE_DESCRIPTOR_POOL 11
 void vio_vk_defer_destroy(int kind, uint64_t handle, void *allocation);
 void vio_vk_image_barrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, uint32_t layers,
                           VkImageLayout from, VkImageLayout to);
@@ -538,6 +549,8 @@ int   vio_vk_read_render_target(void *rt, int face, int attachment, void *out_rg
 int   vio_vk_record_mips(VkCommandBuffer cmd, VkImage img, int w, int h, int layers, int levels);
 void  vio_vk_texture_finish_mips(vio_vulkan_texture *tex);
 int   vio_vk_generate_mipmaps(void *obj, int kind);
+int   vio_vk_generate_depth_mips(void *rt_obj);   /* depth_only + 'mipmaps' (A26) */
+void  vio_vk_depth_mip_shutdown(void);
 int   vio_vk_upload_cubemap(void *cm_obj, int width, int height, const void *faces[6]);
 void  vio_vk_destroy_cubemap(void *cm_obj);
 void  vio_vk_bind_cubemap(void *cm_obj, int slot);

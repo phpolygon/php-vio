@@ -1822,6 +1822,7 @@ static void vulkan_shutdown(void)
         vkDeviceWaitIdle(vio_vk.device);
     }
     vio_vk3d_shutdown();
+    vio_vk_depth_mip_shutdown();
     if (vio_vk.capture_buf && vio_vk.vma_allocator) {
         vio_vma_destroy_buffer(vio_vk.vma_allocator, vio_vk.capture_buf, vio_vk.capture_alloc);
         vio_vk.capture_buf = VK_NULL_HANDLE;
@@ -4910,6 +4911,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_vk3d_available(); /* 2D array views, stored chains (Block 10c) */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return vio_vk3d_available() && (!vio_vk.device || vio_vk.bc_supported); /* textureCompressionBC */
         case VIO_FEATURE_TEXTURE_COMPRESSION_ASTC: return vio_vk3d_available() && vio_vk.device && vio_vk.astc_supported; /* textureCompressionASTC_LDR */
+        case VIO_FEATURE_DEPTH_MIPMAPS: return vio_vk3d_available() && vio_vk.device != VK_NULL_HANDLE;   /* vio_vk_generate_depth_mips (A26) */
         case VIO_FEATURE_SHADING_RATE:   return vio_vk3d_available() && vio_vk.vrs_supported; /* VK_KHR_fragment_shading_rate, pipeline rate */
         case VIO_FEATURE_SHADING_RATE_PRIMITIVE: return vio_vk3d_available() && vio_vk.vrs_supported && vio_vk.vrs_primitive;
         case VIO_FEATURE_SUBGROUP:       return vio_vk.device && vio_vk.subgroup_supported; /* core 1.1 subgroup properties, compute + fragment */
