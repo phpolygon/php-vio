@@ -632,6 +632,11 @@ typedef struct _vio_d3d12_state {
     UINT64           ts_frequency;
     int              ts_pending[VIO_D3D12_MAX_FRAME_COUNT];
     double           last_gpu_ms;
+    /* Named marks (vio_gpu_timestamp) after the pair: VIO_GPU_TS_PER_FRAME
+     * queries per slot. */
+    vio_gpu_mark_names  ts_marks[VIO_D3D12_MAX_FRAME_COUNT];
+    vio_gpu_mark_result ts_result;
+    int                 ts_result_valid;
 
     /* Window reference */
     void *glfw_window;

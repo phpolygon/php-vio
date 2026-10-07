@@ -1384,17 +1384,19 @@ static int d3d12_init(vio_config *cfg)
     /* GPU timestamps (GAP-PHASE5 Block 3) — optional; a failure just leaves the
      * feature off. */
     vio_d3d12.last_gpu_ms = -1.0;
+    memset(vio_d3d12.ts_marks, 0, sizeof(vio_d3d12.ts_marks));
+    vio_d3d12.ts_result_valid = 0;
     {
         D3D12_QUERY_HEAP_DESC qh = {0};
         qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qh.Count = 2 * VIO_D3D12_MAX_FRAME_COUNT;
+        qh.Count = VIO_GPU_TS_PER_FRAME * VIO_D3D12_MAX_FRAME_COUNT;
         ID3D12QueryHeap *heap = NULL;
         if (SUCCEEDED(ID3D12Device_CreateQueryHeap(vio_d3d12.device, &qh, &IID_ID3D12QueryHeap, (void **)&heap)) && heap) {
             D3D12_HEAP_PROPERTIES hp = {0};
             hp.Type = D3D12_HEAP_TYPE_READBACK;
             D3D12_RESOURCE_DESC rb = {0};
             rb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            rb.Width = sizeof(UINT64) * 2 * VIO_D3D12_MAX_FRAME_COUNT;
+            rb.Width = sizeof(UINT64) * VIO_GPU_TS_PER_FRAME * VIO_D3D12_MAX_FRAME_COUNT;
             rb.Height = 1; rb.DepthOrArraySize = 1; rb.MipLevels = 1;
             rb.SampleDesc.Count = 1;
             rb.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -5585,11 +5587,16 @@ static void d3d12_begin_frame(void)
      * GPU timestamps before the slot is reused. */
     if (vio_d3d12.ts_readback && vio_d3d12.ts_pending[vio_d3d12.frame_index]) {
         UINT64 *ts = NULL;
-        D3D12_RANGE rr = { (SIZE_T)vio_d3d12.frame_index * 16, (SIZE_T)vio_d3d12.frame_index * 16 + 16 };
+        const vio_gpu_mark_names *marks = &vio_d3d12.ts_marks[vio_d3d12.frame_index];
+        SIZE_T base = (SIZE_T)vio_d3d12.frame_index * VIO_GPU_TS_PER_FRAME;
+        D3D12_RANGE rr = { base * 8, (base + 2 + (SIZE_T)marks->count) * 8 };
         if (SUCCEEDED(ID3D12Resource_Map(vio_d3d12.ts_readback, 0, &rr, (void **)&ts)) && ts) {
-            UINT64 b = ts[vio_d3d12.frame_index * 2], e = ts[vio_d3d12.frame_index * 2 + 1];
+            UINT64 b = ts[base], e = ts[base + 1];
             if (e > b && vio_d3d12.ts_frequency) {
                 vio_d3d12.last_gpu_ms = (double)(e - b) * 1000.0 / (double)vio_d3d12.ts_frequency;
+                vio_gpu_mark_resolve(&vio_d3d12.ts_result, marks, (const uint64_t *)&ts[base],
+                                     1000.0 / (double)vio_d3d12.ts_frequency);
+                vio_d3d12.ts_result_valid = 1;
             }
             D3D12_RANGE wr = {0, 0};
             ID3D12Resource_Unmap(vio_d3d12.ts_readback, 0, &wr);
@@ -5604,9 +5611,10 @@ static void d3d12_begin_frame(void)
     ID3D12CommandAllocator_Reset(frame->cmd_allocator);
     ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
     if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1 || vio_d3d12.vrs_image_active) d3d12_apply_shading_rate();   /* VRS is list state */
+    vio_d3d12.ts_marks[vio_d3d12.frame_index].count = 0;
     if (vio_d3d12.ts_heap) {
         ID3D12GraphicsCommandList_EndQuery(vio_d3d12.cmd_list, vio_d3d12.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP,
-                                           (UINT)vio_d3d12.frame_index * 2);
+                                           (UINT)vio_d3d12.frame_index * VIO_GPU_TS_PER_FRAME);
     }
 
     /* Transition render target: PRESENT -> RENDER_TARGET */
@@ -5803,10 +5811,11 @@ static void d3d12_end_frame(void)
     /* GPU timestamp: end of the frame's command stream, resolved into this
      * slot's readback range; begin_frame reads it once the fence has passed. */
     if (vio_d3d12.ts_heap && vio_d3d12.ts_readback) {
-        UINT q = (UINT)vio_d3d12.frame_index * 2;
+        UINT q = (UINT)vio_d3d12.frame_index * VIO_GPU_TS_PER_FRAME;
         ID3D12GraphicsCommandList_EndQuery(vio_d3d12.cmd_list, vio_d3d12.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
         ID3D12GraphicsCommandList_ResolveQueryData(vio_d3d12.cmd_list, vio_d3d12.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP,
-                                                   q, 2, vio_d3d12.ts_readback, (UINT64)vio_d3d12.frame_index * 16);
+                                                   q, 2 + (UINT)vio_d3d12.ts_marks[vio_d3d12.frame_index].count,
+                                                   vio_d3d12.ts_readback, (UINT64)q * 8);
         vio_d3d12.ts_pending[vio_d3d12.frame_index] = 1;
     }
 
@@ -7434,6 +7443,21 @@ static double d3d12_gpu_frame_time(void)
     return vio_d3d12.initialized && vio_d3d12.ts_heap ? vio_d3d12.last_gpu_ms : -1.0;
 }
 
+static int d3d12_gpu_mark(const char *name)
+{
+    if (!vio_d3d12.initialized || !vio_d3d12.ts_heap || !vio_d3d12.in_frame) return 0;
+    int i = vio_gpu_mark_push(&vio_d3d12.ts_marks[vio_d3d12.frame_index], name);
+    if (i < 0) return 0;
+    ID3D12GraphicsCommandList_EndQuery(vio_d3d12.cmd_list, vio_d3d12.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+                                       (UINT)(vio_d3d12.frame_index * VIO_GPU_TS_PER_FRAME + 2 + i));
+    return 1;
+}
+
+static const vio_gpu_mark_result *d3d12_gpu_marks(void)
+{
+    return vio_d3d12.initialized && vio_d3d12.ts_heap && vio_d3d12.ts_result_valid ? &vio_d3d12.ts_result : NULL;
+}
+
 /* Second half of the optional-stage probe (see the D3D11 twin): the canonical
  * stage's SPIRV-Cross HLSL must also pass the compiler the shaders will use -
  * FXC for SM 5.1, DXC for the Shader Model 6 profile. The result is cached
@@ -8157,6 +8181,8 @@ static const vio_backend d3d12_backend = {
     .draw_instanced_from_storage  = d3d12_draw_instanced_from_storage,
     .supports_feature  = d3d12_supports_feature,
     .gpu_frame_time    = d3d12_gpu_frame_time,
+    .gpu_mark          = d3d12_gpu_mark,
+    .gpu_marks         = d3d12_gpu_marks,
     .swapchain_info    = d3d12_swapchain_info,
     .bindless_set      = d3d12_bindless_set,
     .draw_indirect     = d3d12_draw_indirect,

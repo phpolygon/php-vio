@@ -603,23 +603,34 @@ static void opengl_begin_frame(void)
      * generation; harvest the slot about to be reused, then stamp the start. */
     if (opengl_has_timer_query()) {
         if (vio_gl.ts_generation != gl_context_generation || vio_gl.ts_query[0][0] == 0) {
-            glGenQueries(6, &vio_gl.ts_query[0][0]);
-            for (int i = 0; i < 3; i++) vio_gl.ts_pending[i] = 0;
+            glGenQueries(3 * VIO_GPU_TS_PER_FRAME, &vio_gl.ts_query[0][0]);
+            for (int i = 0; i < 3; i++) { vio_gl.ts_pending[i] = 0; vio_gl.ts_marks[i].count = 0; }
             vio_gl.last_gpu_ms = -1.0;
+            vio_gl.ts_result_valid = 0;
             vio_gl.ts_generation = gl_context_generation;
         }
         int slot = vio_gl.ts_slot;
         if (vio_gl.ts_pending[slot]) {
-            GLint avail = 0;
-            glGetQueryObjectiv(vio_gl.ts_query[slot][1], GL_QUERY_RESULT_AVAILABLE, &avail);
-            if (avail) {
-                GLuint64 b = 0, e = 0;
-                glGetQueryObjectui64v(vio_gl.ts_query[slot][0], GL_QUERY_RESULT, &b);
-                glGetQueryObjectui64v(vio_gl.ts_query[slot][1], GL_QUERY_RESULT, &e);
-                if (e > b) vio_gl.last_gpu_ms = (double)(e - b) / 1.0e6;
+            /* GL_QUERY_RESULT waits for the three-frame-old slot (like the D3D12 /
+             * Vulkan fence wait); skipping unfinished frames left the values
+             * stale whenever nothing throttles the CPU (headless, vsync off). */
+            {
+                uint64_t ticks[VIO_GPU_TS_PER_FRAME];
+                int n = 2 + vio_gl.ts_marks[slot].count;
+                for (int i = 0; i < n; i++) {
+                    GLuint64 v = 0;
+                    glGetQueryObjectui64v(vio_gl.ts_query[slot][i], GL_QUERY_RESULT, &v);
+                    ticks[i] = (uint64_t)v;
+                }
+                if (ticks[1] > ticks[0]) {
+                    vio_gl.last_gpu_ms = (double)(ticks[1] - ticks[0]) / 1.0e6;
+                    vio_gpu_mark_resolve(&vio_gl.ts_result, &vio_gl.ts_marks[slot], ticks, 1.0e-6);
+                    vio_gl.ts_result_valid = 1;
+                }
             }
             vio_gl.ts_pending[slot] = 0;
         }
+        vio_gl.ts_marks[slot].count = 0;
         glQueryCounter(vio_gl.ts_query[slot][0], GL_TIMESTAMP);
     }
 }
@@ -640,6 +651,22 @@ static void opengl_end_frame(void)
 static double opengl_gpu_frame_time(void)
 {
     return opengl_has_timer_query() && vio_gl.ts_query[0][0] != 0 ? vio_gl.last_gpu_ms : -1.0;
+}
+
+static int opengl_gpu_mark(const char *name)
+{
+    if (!vio_gl.in_frame || !opengl_has_timer_query() || vio_gl.ts_query[0][0] == 0
+        || vio_gl.ts_generation != gl_context_generation) return 0;
+    int slot = vio_gl.ts_slot;
+    int i = vio_gpu_mark_push(&vio_gl.ts_marks[slot], name);
+    if (i < 0) return 0;
+    glQueryCounter(vio_gl.ts_query[slot][2 + i], GL_TIMESTAMP);
+    return 1;
+}
+
+static const vio_gpu_mark_result *opengl_gpu_marks(void)
+{
+    return opengl_has_timer_query() && vio_gl.ts_result_valid ? &vio_gl.ts_result : NULL;
 }
 
 static void opengl_draw(vio_draw_cmd *cmd)
@@ -2721,6 +2748,8 @@ static const vio_backend opengl_backend = {
     .draw_instanced_from_storage  = opengl_draw_instanced_from_storage,
     .supports_feature  = opengl_supports_feature,
     .gpu_frame_time    = opengl_gpu_frame_time,
+    .gpu_mark          = opengl_gpu_mark,
+    .gpu_marks         = opengl_gpu_marks,
     .gpu_info          = opengl_gpu_info,
     .draw_indirect     = opengl_draw_indirect,
     .set_viewport      = opengl_set_viewport,

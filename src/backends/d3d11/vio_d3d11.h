@@ -265,6 +265,11 @@ typedef struct _vio_d3d11_state {
     ID3D11Query *ts_disjoint[3];
     ID3D11Query *ts_begin[3];
     ID3D11Query *ts_end[3];
+    /* Named marks (vio_gpu_timestamp), created on first use. */
+    ID3D11Query        *ts_mark[3][VIO_GPU_MARKS_MAX];
+    vio_gpu_mark_names  ts_marks[3];
+    vio_gpu_mark_result ts_result;
+    int                 ts_result_valid;
     int          ts_pending[3];
     int          ts_slot;
     int          ts_available;

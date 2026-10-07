@@ -8011,6 +8011,50 @@ ZEND_FUNCTION(vio_gpu_frame_time)
     RETURN_DOUBLE(ctx->backend->gpu_frame_time());
 }
 
+/* Named GPU timestamps (OPEN-ITEMS-PLAN A19): a mark closes the section that
+ * began at the previous mark (or at the frame start). */
+static int vio_has_gpu_marks(vio_context_object *ctx)
+{
+    return ctx->initialized && ctx->backend && ctx->backend->gpu_mark && ctx->backend->gpu_marks
+        && ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_GPU_TIMESTAMP);
+}
+
+ZEND_FUNCTION(vio_gpu_timestamp)
+{
+    zval *ctx_zval;
+    zend_string *name;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR(name)
+    ZEND_PARSE_PARAMETERS_END();
+    if (ZSTR_LEN(name) == 0 || ZSTR_LEN(name) >= VIO_GPU_MARK_NAME_MAX || memchr(ZSTR_VAL(name), 0, ZSTR_LEN(name))) {
+        zend_argument_value_error(2, "must be 1 to %d bytes without NUL", VIO_GPU_MARK_NAME_MAX - 1);
+        RETURN_THROWS();
+    }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_has_gpu_marks(ctx)) RETURN_FALSE;
+    RETURN_BOOL(ctx->backend->gpu_mark(ZSTR_VAL(name)) != 0);
+}
+
+ZEND_FUNCTION(vio_gpu_timings)
+{
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_has_gpu_marks(ctx)) RETURN_FALSE;
+    array_init(return_value);
+    const vio_gpu_mark_result *r = ctx->backend->gpu_marks();
+    if (!r) return;
+    for (int i = 0; i < r->count && i < VIO_GPU_MARKS_MAX; i++) {
+        /* A name used twice in a frame adds up. */
+        zval *prev = zend_hash_str_find(Z_ARRVAL_P(return_value), r->name[i], strlen(r->name[i]));
+        if (prev) ZVAL_DOUBLE(prev, Z_DVAL_P(prev) + r->ms[i]);
+        else add_assoc_double(return_value, r->name[i], r->ms[i]);
+    }
+}
+
 /* Shader-cache counters (GAP-PHASE5 Block 4): ['dir' => string|null, 'hits' => n,
  * 'misses' => n, 'stores' => n], cumulative for the process. */
 ZEND_FUNCTION(vio_shader_cache_stats)

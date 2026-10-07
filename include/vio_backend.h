@@ -7,6 +7,7 @@
 #define VIO_BACKEND_H
 
 #include "vio_types.h"
+#include "vio_gpu_marks.h"
 
 #define VIO_BACKEND_API_VERSION 1
 #define VIO_MAX_BACKENDS 8
@@ -455,6 +456,13 @@ typedef struct _vio_backend {
      * kernels", or NULL when the feature is native or unsupported. NULL slot =>
      * everything the backend reports is native. */
     const char *(*feature_emulation)(vio_feature feature);
+
+    /* Named GPU timestamp in the open frame (vio_gpu_timestamp): 1 = recorded,
+     * 0 = no frame open, no timestamps or VIO_GPU_MARKS_MAX reached. gpu_marks
+     * returns the marks of the most recently completed frame (NULL = none yet).
+     * NULL slots => no named timestamps. */
+    int (*gpu_mark)(const char *name);
+    const vio_gpu_mark_result *(*gpu_marks)(void);
 } vio_backend;
 
 /*

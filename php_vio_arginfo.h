@@ -199,6 +199,15 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_gpu_frame_time, 0, 1, IS_DOU
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_gpu_timestamp, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_gpu_timings, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_shader_cache_stats, 0, 0, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
@@ -1002,6 +1011,8 @@ ZEND_FUNCTION(vio_mesh);
 ZEND_FUNCTION(vio_draw);
 ZEND_FUNCTION(vio_mesh_index_bytes);
 ZEND_FUNCTION(vio_gpu_frame_time);
+ZEND_FUNCTION(vio_gpu_timestamp);
+ZEND_FUNCTION(vio_gpu_timings);
 ZEND_FUNCTION(vio_shader_cache_stats);
 ZEND_FUNCTION(vio_swapchain_info);
 ZEND_FUNCTION(vio_backend_info);
@@ -1186,6 +1197,8 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_draw, arginfo_vio_draw)
 	ZEND_FE(vio_mesh_index_bytes, arginfo_vio_mesh_index_bytes)
 	ZEND_FE(vio_gpu_frame_time, arginfo_vio_gpu_frame_time)
+	ZEND_FE(vio_gpu_timestamp, arginfo_vio_gpu_timestamp)
+	ZEND_FE(vio_gpu_timings, arginfo_vio_gpu_timings)
 	ZEND_FE(vio_shader_cache_stats, arginfo_vio_shader_cache_stats)
 	ZEND_FE(vio_swapchain_info, arginfo_vio_swapchain_info)
 	ZEND_FE(vio_backend_info, arginfo_vio_backend_info)

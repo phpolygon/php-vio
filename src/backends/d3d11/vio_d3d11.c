@@ -285,6 +285,8 @@ static int d3d11_init(vio_config *cfg)
     /* GPU timestamps (GAP-PHASE5 Block 3) — optional. */
     vio_d3d11.last_gpu_ms = -1.0;
     vio_d3d11.ts_available = 1;
+    vio_d3d11.ts_result_valid = 0;
+    memset(vio_d3d11.ts_marks, 0, sizeof(vio_d3d11.ts_marks));
     for (int i = 0; i < 3; i++) {
         D3D11_QUERY_DESC dq = {0}; dq.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
         D3D11_QUERY_DESC tq = {0}; tq.Query = D3D11_QUERY_TIMESTAMP;
@@ -307,6 +309,8 @@ static void d3d11_shutdown(void)
         if (vio_d3d11.ts_disjoint[i]) { ID3D11Query_Release(vio_d3d11.ts_disjoint[i]); vio_d3d11.ts_disjoint[i] = NULL; }
         if (vio_d3d11.ts_begin[i])    { ID3D11Query_Release(vio_d3d11.ts_begin[i]);    vio_d3d11.ts_begin[i] = NULL; }
         if (vio_d3d11.ts_end[i])      { ID3D11Query_Release(vio_d3d11.ts_end[i]);      vio_d3d11.ts_end[i] = NULL; }
+        for (int m = 0; m < VIO_GPU_MARKS_MAX; m++)
+            if (vio_d3d11.ts_mark[i][m]) { ID3D11Query_Release(vio_d3d11.ts_mark[i][m]); vio_d3d11.ts_mark[i][m] = NULL; }
     }
     if (!vio_d3d11.initialized) return;
 
@@ -2358,22 +2362,40 @@ static void d3d11_begin_frame(void)
 
     vio_d3d11.in_frame = 1;
 
-    /* GPU timestamps: harvest the slot we are about to reuse (its frame is two
-     * frames old — normally complete; if not, keep the previous value), then
-     * open this frame's disjoint range + begin stamp. */
+    /* GPU timestamps: harvest the slot we are about to reuse, then open this
+     * frame's disjoint range + begin stamp. The slot's frame is three frames
+     * old; wait for it like D3D12 / Vulkan wait on the slot's fence, since
+     * without present throttling (headless) a heavy frame is often not done
+     * yet and dropping it left vio_gpu_frame_time / vio_gpu_timings stale. */
     if (vio_d3d11.ts_available) {
         int slot = vio_d3d11.ts_slot;
         if (vio_d3d11.ts_pending[slot]) {
             D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {0};
             UINT64 b = 0, e = 0;
+            while (ID3D11DeviceContext_GetData(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_disjoint[slot], &dj, sizeof(dj), 0) == S_FALSE)
+                SwitchToThread();
             if (ID3D11DeviceContext_GetData(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_disjoint[slot], &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
                 && ID3D11DeviceContext_GetData(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_begin[slot], &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
                 && ID3D11DeviceContext_GetData(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_end[slot], &e, sizeof(e), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
                 && !dj.Disjoint && dj.Frequency && e > b) {
                 vio_d3d11.last_gpu_ms = (double)(e - b) * 1000.0 / (double)dj.Frequency;
+                uint64_t ticks[VIO_GPU_TS_PER_FRAME];
+                int ok = 1;
+                ticks[0] = b; ticks[1] = e;
+                for (int m = 0; m < vio_d3d11.ts_marks[slot].count && ok; m++) {
+                    UINT64 t = 0;
+                    ok = ID3D11DeviceContext_GetData(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_mark[slot][m],
+                                                     &t, sizeof(t), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+                    ticks[2 + m] = t;
+                }
+                if (ok) {
+                    vio_gpu_mark_resolve(&vio_d3d11.ts_result, &vio_d3d11.ts_marks[slot], ticks, 1000.0 / (double)dj.Frequency);
+                    vio_d3d11.ts_result_valid = 1;
+                }
             }
             vio_d3d11.ts_pending[slot] = 0;
         }
+        vio_d3d11.ts_marks[slot].count = 0;
         ID3D11DeviceContext_Begin(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_disjoint[slot]);
         ID3D11DeviceContext_End(vio_d3d11.context, (ID3D11Asynchronous *)vio_d3d11.ts_begin[slot]);
     }
@@ -3214,6 +3236,27 @@ static double d3d11_gpu_frame_time(void)
     return vio_d3d11.initialized && vio_d3d11.ts_available ? vio_d3d11.last_gpu_ms : -1.0;
 }
 
+static int d3d11_gpu_mark(const char *name)
+{
+    if (!vio_d3d11.initialized || !vio_d3d11.ts_available || !vio_d3d11.in_frame) return 0;
+    int slot = vio_d3d11.ts_slot;
+    vio_gpu_mark_names *n = &vio_d3d11.ts_marks[slot];
+    if (n->count >= VIO_GPU_MARKS_MAX) return 0;
+    ID3D11Query **q = &vio_d3d11.ts_mark[slot][n->count];
+    if (!*q) {
+        D3D11_QUERY_DESC tq = {0}; tq.Query = D3D11_QUERY_TIMESTAMP;
+        if (FAILED(ID3D11Device_CreateQuery(vio_d3d11.device, &tq, q))) { *q = NULL; return 0; }
+    }
+    vio_gpu_mark_push(n, name);
+    ID3D11DeviceContext_End(vio_d3d11.context, (ID3D11Asynchronous *)*q);
+    return 1;
+}
+
+static const vio_gpu_mark_result *d3d11_gpu_marks(void)
+{
+    return vio_d3d11.initialized && vio_d3d11.ts_available && vio_d3d11.ts_result_valid ? &vio_d3d11.ts_result : NULL;
+}
+
 /* Second half of the optional-stage probe: SPIRV-Cross may emit HLSL for a
  * geometry / hull / domain stage that FXC then rejects (an undeclared `gl_in`
  * in the GS body was the first case seen), so the flag is only 1 when the
@@ -3512,6 +3555,8 @@ static const vio_backend d3d11_backend = {
     .draw_instanced_from_storage  = d3d11_draw_instanced_from_storage,
     .supports_feature  = d3d11_supports_feature,
     .gpu_frame_time    = d3d11_gpu_frame_time,
+    .gpu_mark          = d3d11_gpu_mark,
+    .gpu_marks         = d3d11_gpu_marks,
     .swapchain_info    = d3d11_swapchain_info,
     .draw_indirect     = d3d11_draw_indirect,
     .destroy_cubemap   = d3d11_destroy_cubemap,

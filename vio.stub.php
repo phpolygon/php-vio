@@ -355,6 +355,32 @@ function vio_mesh_index_bytes(VioMesh $mesh): int {}
 function vio_gpu_frame_time(VioContext $context): float {}
 
 /**
+ * Named GPU timestamp inside the open frame. It closes a section that began at
+ * the previous vio_gpu_timestamp of the frame (or at vio_begin):
+ *
+ *   vio_begin($ctx);
+ *   ... shadow passes ...   vio_gpu_timestamp($ctx, 'shadows');
+ *   ... main pass ...       vio_gpu_timestamp($ctx, 'main');
+ *   vio_end($ctx);
+ *
+ * Up to 32 marks per frame. Returns false outside a frame, past the limit, or
+ * when the backend has no GPU timestamps (VIO_FEATURE_GPU_TIMESTAMP). Names are
+ * 1 to 47 bytes (ValueError otherwise).
+ */
+function vio_gpu_timestamp(VioContext $context, string $name): bool {}
+
+/**
+ * GPU milliseconds of each named section of the most recently completed frame,
+ * in mark order: ['shadows' => 1.8, 'main' => 4.2]. A name used twice in one
+ * frame adds up. Like vio_gpu_frame_time() it trails the CPU by one to two
+ * frames; [] until such a frame has completed, false when the backend has no
+ * GPU timestamps.
+ *
+ * @return array<string, float>|false
+ */
+function vio_gpu_timings(VioContext $context): array|false {}
+
+/**
  * Counters of the on-disk shader cache (vio_create 'shader_cache'), cumulative
  * for the process: ['dir' => ?string, 'hits' => int, 'misses' => int, 'stores' => int].
  */

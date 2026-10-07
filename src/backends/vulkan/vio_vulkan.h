@@ -220,6 +220,10 @@ typedef struct _vio_vulkan_state {
     float                    ts_period;     /* ns per tick (timestampPeriod) */
     int                      ts_pending[VIO_VK_MAX_FRAMES_IN_FLIGHT];
     double                   last_gpu_ms;
+    /* Named marks (vio_gpu_timestamp): VIO_GPU_TS_PER_FRAME queries per slot. */
+    vio_gpu_mark_names       ts_marks[VIO_VK_MAX_FRAMES_IN_FLIGHT];
+    vio_gpu_mark_result      ts_result;
+    int                      ts_result_valid;
     int                      in_frame;          /* 1 while the command buffer is recording (begin_frame..end_frame) */
     /* Phase 4 — warm-render present-skip. Captured at vulkan_begin_frame: 1 when
      * the frame is OFFSCREEN-ONLY (vio_vk.pending_bound_rt was set BEFORE

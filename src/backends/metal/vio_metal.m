@@ -13,6 +13,8 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <objc/message.h>
+#include <os/lock.h>
+#include <stdatomic.h>
 
 #ifdef HAVE_GLFW
 #define GLFW_INCLUDE_NONE
@@ -22,6 +24,8 @@
 #endif
 
 #include "vio_metal.h"
+
+static void metal_marks_reset(void);
 #include "../../shaders/shaders_2d.h"
 #include "../../vio_render_target.h"
 #include "../../vio_texfmt.h"
@@ -79,6 +83,7 @@ typedef struct _vio_metal_state {
     id<MTLCommandBuffer>       current_cmd_buf;
     id<MTLRenderCommandEncoder> current_encoder;
     double                     last_gpu_ms;     /* GPUEndTime - GPUStartTime of the last completed frame */
+    void                      *cur_marks;       /* metal_mark_frame of the open frame (vio_gpu_timestamp), NULL = no mark yet */
     MTLRenderPassDescriptor   *render_pass_desc;
     id<MTLTexture>             depth_texture;
     int                        width;
@@ -644,6 +649,7 @@ int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
         vio_mtl.clear_b = 0.1f;
         vio_mtl.clear_a = 1.0f;
 
+        metal_marks_reset();   /* a new context starts without named GPU sections */
         vio_mtl.initialized = 1;
     }
 
@@ -1574,6 +1580,61 @@ static void metal_end_frame(void)
     }
 }
 
+/* ── Named GPU timestamps (vio_gpu_timestamp, OPEN-ITEMS-PLAN A19) ──────
+ * Metal has no timestamp at an arbitrary point of a command buffer, so a mark
+ * ends a section: the frame's command buffer so far is committed (no CPU
+ * wait) and the frame continues on a new one, reopened with Load like the
+ * mid-frame readback. A section lasts from the previous section's GPUEndTime
+ * (the first one from its buffer's GPUStartTime) to its buffer's GPUEndTime.
+ * The completion handlers run on Metal threads; whichever finishes last
+ * publishes the frame. The upload ring fences on the frame's last buffer
+ * (metal_ring_end_frame), so splitting the frame keeps its memory alive. */
+typedef struct {
+    vio_gpu_mark_names names;
+    double             start;
+    double             end[VIO_GPU_MARKS_MAX];
+    atomic_int         remaining;   /* section buffers + the frame's last buffer */
+} metal_mark_frame;
+
+static os_unfair_lock      metal_marks_lock = OS_UNFAIR_LOCK_INIT;
+static vio_gpu_mark_result metal_marks_result;
+static vio_gpu_mark_result metal_marks_snapshot;
+static int                 metal_marks_valid;
+
+static void metal_marks_publish(const metal_mark_frame *mf)
+{
+    vio_gpu_mark_result r;
+    r.count = mf ? mf->names.count : 0;
+    double prev = mf ? mf->start : 0.0;
+    for (int i = 0; i < r.count; i++) {
+        memcpy(r.name[i], mf->names.name[i], VIO_GPU_MARK_NAME_MAX);
+        double t = mf->end[i];
+        r.ms[i] = t > prev ? (t - prev) * 1000.0 : 0.0;
+        if (t > prev) prev = t;
+    }
+    os_unfair_lock_lock(&metal_marks_lock);
+    metal_marks_result = r;
+    metal_marks_valid = 1;
+    os_unfair_lock_unlock(&metal_marks_lock);
+}
+
+static void metal_marks_reset(void)
+{
+    os_unfair_lock_lock(&metal_marks_lock);
+    metal_marks_valid = 0;
+    os_unfair_lock_unlock(&metal_marks_lock);
+    vio_mtl.cur_marks = NULL;   /* an unfinished frame's set is owned by its handlers */
+}
+
+/* The section buffer or the frame's last buffer completed. */
+static void metal_marks_done(metal_mark_frame *mf)
+{
+    if (atomic_fetch_sub(&mf->remaining, 1) == 1) {
+        metal_marks_publish(mf);
+        free(mf);
+    }
+}
+
 static void metal_present(void)
 {
     @autoreleasepool {
@@ -1584,6 +1645,15 @@ static void metal_present(void)
         [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
             double ms = (done.GPUEndTime - done.GPUStartTime) * 1000.0;
             if (ms >= 0.0) vio_mtl.last_gpu_ms = ms;
+        }];
+        /* Named sections: the frame completes with its last buffer (a frame
+         * without marks publishes an empty set). */
+        metal_mark_frame *mf = (metal_mark_frame *)vio_mtl.cur_marks;
+        vio_mtl.cur_marks = NULL;
+        [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)done;
+            if (mf) metal_marks_done(mf);
+            else metal_marks_publish(NULL);
         }];
         if (vio_mtl.frame_semaphore_held) {
             /* The frame's slot frees up when its command buffer retires. */
@@ -5840,6 +5910,46 @@ static double metal_gpu_frame_time(void)
     return vio_mtl.initialized && vio_mtl.last_gpu_ms > 0.0 ? vio_mtl.last_gpu_ms : -1.0;
 }
 
+static int metal_gpu_mark(const char *name)
+{
+    if (!vio_mtl.initialized || !vio_mtl.current_cmd_buf) return 0;
+    @autoreleasepool {
+        metal_mark_frame *mf = (metal_mark_frame *)vio_mtl.cur_marks;
+        if (!mf) {
+            mf = calloc(1, sizeof(*mf));
+            if (!mf) return 0;
+            atomic_init(&mf->remaining, 1);   /* the frame's last buffer (metal_present) */
+            vio_mtl.cur_marks = mf;
+        }
+        int i = vio_gpu_mark_push(&mf->names, name);
+        if (i < 0) return 0;
+        if (vio_mtl.current_encoder) {
+            [vio_mtl.current_encoder endEncoding];
+            vio_mtl.current_encoder = nil;
+        }
+        atomic_fetch_add(&mf->remaining, 1);
+        [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if (i == 0) mf->start = done.GPUStartTime;
+            mf->end[i] = done.GPUEndTime;
+            metal_marks_done(mf);
+        }];
+        [vio_mtl.current_cmd_buf commit];
+        vio_mtl.current_cmd_buf = metal_new_command_buffer();
+        metal_open_encoder(/*load_clear=*/0);
+    }
+    return 1;
+}
+
+static const vio_gpu_mark_result *metal_gpu_marks(void)
+{
+    int valid;
+    os_unfair_lock_lock(&metal_marks_lock);
+    valid = metal_marks_valid;
+    if (valid) metal_marks_snapshot = metal_marks_result;
+    os_unfair_lock_unlock(&metal_marks_lock);
+    return vio_mtl.initialized && valid ? &metal_marks_snapshot : NULL;
+}
+
 /* vio_swapchain_info(): drawables, frames in flight (frame_latency semaphore),
  * HDR10 layer. */
 static void metal_swapchain_info(vio_swapchain_info *out)
@@ -6176,6 +6286,8 @@ static const vio_backend metal_backend = {
     .supports_feature  = metal_supports_feature,
     .feature_emulation = metal_feature_emulation,
     .gpu_frame_time    = metal_gpu_frame_time,
+    .gpu_mark          = metal_gpu_mark,
+    .gpu_marks         = metal_gpu_marks,
     .swapchain_info    = metal_swapchain_info,
     .describe          = metal_describe,
     .create_acceleration_structure  = metal_create_acceleration_structure,

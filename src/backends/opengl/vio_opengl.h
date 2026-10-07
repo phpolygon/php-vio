@@ -70,7 +70,10 @@ typedef struct _vio_opengl_state {
 
     /* GPU timestamps (GAP-PHASE5 Block 3, GL >= 3.3 GL_TIMESTAMP queries): a
      * ring of begin/end query pairs, harvested when the slot is reused. */
-    unsigned int ts_query[3][2];
+    unsigned int ts_query[3][VIO_GPU_TS_PER_FRAME];   /* begin, end, named marks */
+    vio_gpu_mark_names  ts_marks[3];
+    vio_gpu_mark_result ts_result;
+    int                 ts_result_valid;
     int          ts_pending[3];
     int          ts_slot;
     unsigned int ts_generation;   /* context generation the query names belong to */
