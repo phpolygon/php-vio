@@ -159,7 +159,8 @@ jobs:
             tests/render3d/176_bindless_release_all_backends.phpt \
             tests/render3d/177_bindless_samplers_all_backends.phpt \
             tests/render3d/178_bindless_cubes_arrays_all_backends.phpt \
-            tests/render3d/179_bindless_compute_all_backends.phpt
+            tests/render3d/179_bindless_compute_all_backends.phpt \
+            tests/render3d/180_separate_texture_sampler_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -316,7 +317,8 @@ jobs:
             tests/render3d/176_bindless_release_all_backends.phpt \
             tests/render3d/177_bindless_samplers_all_backends.phpt \
             tests/render3d/178_bindless_cubes_arrays_all_backends.phpt \
-            tests/render3d/179_bindless_compute_all_backends.phpt
+            tests/render3d/179_bindless_compute_all_backends.phpt \
+            tests/render3d/180_separate_texture_sampler_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -717,6 +719,7 @@ jobs:
             tests/render3d/177_bindless_samplers_all_backends.phpt `
             tests/render3d/178_bindless_cubes_arrays_all_backends.phpt `
             tests/render3d/179_bindless_compute_all_backends.phpt `
+            tests/render3d/180_separate_texture_sampler_all_backends.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt
 
       - name: Package binary

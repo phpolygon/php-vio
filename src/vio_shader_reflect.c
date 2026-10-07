@@ -427,6 +427,8 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
     if (vio_glsl_ovr_views > 0)
         spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_GLSL_OVR_MULTIVIEW_VIEW_COUNT, (unsigned)vio_glsl_ovr_views);
     spvc_compiler_install_compiler_options(compiler, options);
+    /* GLSL for OpenGL has no separate textures / samplers. */
+    vio_spvc_combine_separate(compiler);
 
     if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS) {
         if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
@@ -1264,6 +1266,52 @@ static void vio_entry_set_type(spvc_compiler compiler, spvc_type_id type_id, vio
     e->columns = (short)spvc_type_get_columns(t);
 }
 
+int vio_spvc_combine_separate(void *compiler_handle)
+{
+    spvc_compiler c = (spvc_compiler)compiler_handle;
+    spvc_resources res = NULL;
+    if (!c || spvc_compiler_create_shader_resources(c, &res) != SPVC_SUCCESS || !res) return 0;
+    const spvc_reflected_resource *list = NULL;
+    size_t n = 0;
+    spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &n);
+    if (n == 0) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (spvc_compiler_get_decoration(c, list[i].id, SpvDecorationDescriptorSet) == 1) return 0;
+    if (spvc_compiler_build_combined_image_samplers(c) != SPVC_SUCCESS) return 0;
+    const spvc_combined_image_sampler *cis = NULL;
+    size_t cn = 0;
+    spvc_compiler_get_combined_image_samplers(c, &cis, &cn);
+    for (size_t i = 0; i < cn; i++) {
+        const char *name = spvc_compiler_get_name(c, cis[i].image_id);
+        if (name && name[0]) spvc_compiler_set_name(c, cis[i].combined_id, name);
+    }
+    return (int)cn;
+}
+
+int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*names)[64], int max)
+{
+    spvc_context ctx = NULL;
+    spvc_parsed_ir ir = NULL;
+    spvc_compiler compiler = NULL;
+    spvc_resources resources = NULL;
+    int n = 0;
+    if (!spirv || spvc_context_create(&ctx) != SPVC_SUCCESS) return 0;
+    if (spvc_context_parse_spirv(ctx, spirv, spirv_size / sizeof(uint32_t), &ir) == SPVC_SUCCESS
+        && spvc_context_create_compiler(ctx, SPVC_BACKEND_NONE, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &compiler) == SPVC_SUCCESS
+        && spvc_compiler_create_shader_resources(compiler, &resources) == SPVC_SUCCESS) {
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &count);
+        for (size_t i = 0; i < count && n < max; i++) {
+            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) == 1) continue;
+            snprintf(names[n], 64, "%s", list[i].name ? list[i].name : "");
+            n++;
+        }
+    }
+    spvc_context_destroy(ctx);
+    return n;
+}
+
 int vio_spirv_uniform_block_binding(const uint32_t *spirv, size_t spirv_size)
 {
     spvc_context ctx = NULL;
@@ -1497,6 +1545,18 @@ int vio_spirv_uniform_block_binding(const uint32_t *spirv, size_t spirv_size)
 {
     (void)spirv; (void)spirv_size;
     return -1;
+}
+
+int vio_spvc_combine_separate(void *compiler)
+{
+    (void)compiler;
+    return 0;
+}
+
+int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*names)[64], int max)
+{
+    (void)spirv; (void)spirv_size; (void)names; (void)max;
+    return 0;
 }
 
 #endif /* HAVE_SPIRV_CROSS */

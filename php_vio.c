@@ -3195,6 +3195,17 @@ ZEND_FUNCTION(vio_shader)
                         shader->sampler_is_depth[s] = is_depth;
                         shader->sampler_hlsl_reg[s] = is_depth ? shadow_reg++ : regular_reg++;
                     }
+                    /* Separate textures (texture(sampler2D(u_tex, u_smp), uv), OPEN-ITEMS-PLAN
+                     * A23) follow, in reflection order: HLSL gives them t{sampled count + j},
+                     * Vulkan and Metal put them at the same list positions. */
+                    char sep[VIO_MAX_SAMPLERS][64];
+                    int nsep = vio_spirv_separate_images(shader->frag_spirv, shader->frag_spirv_size, sep, VIO_MAX_SAMPLERS);
+                    for (int j = 0; j < nsep && shader->sampler_count < VIO_MAX_SAMPLERS; j++) {
+                        int s = shader->sampler_count++;
+                        snprintf(shader->sampler_names[s], sizeof(shader->sampler_names[s]), "%s", sep[j]);
+                        shader->sampler_is_depth[s] = 0;
+                        shader->sampler_hlsl_reg[s] = frag_reflect.texture_count + j;
+                    }
                     vio_reflect_free(&frag_reflect);
                 }
                 if (err) free(err);

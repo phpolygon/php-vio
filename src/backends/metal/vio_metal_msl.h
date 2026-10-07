@@ -544,6 +544,41 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
         }
     }
 
+    /* Separate textures in set 0 (texture(sampler2D(u_tex, u_smp), uv), OPEN-ITEMS-PLAN
+     * A23): texture slots after the combined samplers, in reflection order, so a
+     * GL unit reaches them like a sampler2D. MSL keeps the pair separate, so their
+     * samplers become constexpr samplers (linear, repeat) instead of the texture's
+     * own sampler state (OpenGL / Vulkan / D3D combine them). */
+    {
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &count);
+        for (size_t i = 0; i < count && res->texture_count < VIO_METAL_MAX_RES; i++) {
+            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 0) continue;
+            vio_metal_res_texture *t = &res->textures[res->texture_count++];
+            t->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            t->msl_index = (int)next;
+            spvc_type image = spvc_compiler_get_type_handle(compiler, list[i].type_id);
+            if (image) {
+                t->is_depth = spvc_type_get_image_is_depth(image) ? 1 : 0;
+                t->is_cube  = (spvc_type_get_image_dimension(image) == SpvDimCube) ? 1 : 0;
+            }
+            spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
+            spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
+            metal_gfx_add_binding(compiler, em, 0, next, next);
+            next++;
+        }
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS, &list, &count);
+        for (size_t i = 0; i < count; i++) {
+            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 0) continue;
+            spvc_msl_constexpr_sampler cs;
+            spvc_msl_constexpr_sampler_init(&cs);
+            cs.min_filter = cs.mag_filter = SPVC_MSL_SAMPLER_FILTER_LINEAR;
+            cs.s_address = cs.t_address = SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
+            spvc_compiler_msl_remap_constexpr_sampler(compiler, list[i].id, &cs);
+        }
+    }
+
     /* Acceleration structures (GL_EXT_ray_query): renumbered into the buffer
      * table like a UBO, bound with set*AccelerationStructure at draw time. */
     {

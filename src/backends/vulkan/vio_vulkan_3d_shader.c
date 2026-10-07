@@ -210,10 +210,41 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
                          stage, VK_IMAGE_VIEW_TYPE_2D, 0, (uint32_t)size);
     }
 
+    /* Separate textures combined by vio_spvc_combine_separate take the list positions
+     * php_vio.c gives them: behind the shader's own combined samplers, in the order
+     * of the original separate images (OPEN-ITEMS-PLAN A23). */
+    const spvc_combined_image_sampler *cis = NULL;
+    size_t cis_n = 0;
+    spvc_compiler_get_combined_image_samplers(c, &cis, &cis_n);
+    const spvc_reflected_resource *sep_list = NULL;
+    size_t sep_n = 0;
+    spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &sep_list, &sep_n);
     /* Samplers: regular 0.., shadow 8.. (the D3D12 register replay in php_vio.c). */
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, &list, &n);
     int regular = 0, shadow = 8;
+    size_t own = 0;   /* combined samplers the shader declared itself */
     for (size_t i = 0; i < n; i++) {
+        int combined = 0;
+        for (size_t k = 0; k < cis_n; k++) if (cis[k].combined_id == list[i].id) combined = 1;
+        if (!combined) own++;
+    }
+    size_t own_seen = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t fi = own_seen;   /* position in php_vio.c's sampler list */
+        int from_separate = 0;
+        for (size_t k = 0; k < cis_n; k++) {
+            if (cis[k].combined_id != list[i].id) continue;
+            from_separate = 1;
+            size_t j = 0, at = (size_t)-1;
+            for (size_t q = 0; q < sep_n; q++) {
+                if (spvc_compiler_get_decoration(c, sep_list[q].id, SpvDecorationDescriptorSet) == 1) continue;
+                if (sep_list[q].id == cis[k].image_id) { at = j; break; }
+                j++;
+            }
+            fi = at == (size_t)-1 ? (size_t)VK3D_MAX_SAMPLERS : own + at;
+            break;
+        }
+        if (!from_separate) own_seen++;
         int is_depth = 0;
         VkImageViewType dim = vk3d_sampler_dim(c, list[i].type_id, &is_depth);
         int reg = is_depth ? shadow++ : regular++;
@@ -222,10 +253,10 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
         spvc_compiler_set_decoration(c, list[i].id, SpvDecorationDescriptorSet, 0);
         spvc_compiler_set_decoration(c, list[i].id, SpvDecorationBinding, binding);
         vk3d_add_binding(sh, binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, dim, is_depth, 0);
-        if (is_fragment && i < VK3D_MAX_SAMPLERS) {
-            sh->fs_sampler_binding[i] = (int)binding;
-            sh->fs_sampler_depth[i] = is_depth;
-            if ((int)i + 1 > sh->fs_sampler_count) sh->fs_sampler_count = (int)i + 1;
+        if (is_fragment && fi < VK3D_MAX_SAMPLERS) {
+            sh->fs_sampler_binding[fi] = (int)binding;
+            sh->fs_sampler_depth[fi] = is_depth;
+            if ((int)fi + 1 > sh->fs_sampler_count) sh->fs_sampler_count = (int)fi + 1;
         }
         if (smp && smp->count < VK3D_MAX_SAMPLERS) {
             snprintf(smp->names[smp->count], sizeof(smp->names[0]), "%s", list[i].name ? list[i].name : "");
@@ -255,15 +286,16 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
     }
 
     /* Set 1 is the bindless table (vio_texture_index): it keeps its set and
-     * bindings; any other separate texture / sampler is unsupported. */
+     * bindings. Other separate textures / samplers were combined before
+     * (vio_spvc_combine_separate) - except next to the bindless table. */
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &n);
     int other = 0;
     for (size_t i = 0; i < n; i++) {
         if (spvc_compiler_get_decoration(c, list[i].id, SpvDecorationDescriptorSet) == 1) sh->uses_bindless = 1;
         else other = 1;
     }
-    if (other) {
-        php_error_docref(NULL, E_NOTICE, "Vulkan: separate texture/sampler objects are not supported by the 3D pipeline; use combined samplers");
+    if (other && sh->uses_bindless) {
+        php_error_docref(NULL, E_NOTICE, "Vulkan: separate texture/sampler objects next to the bindless table are not supported; use combined samplers there");
     }
     return 0;
 }
@@ -376,6 +408,7 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     if (spvc_context_create(&ctx) != SPVC_SUCCESS) return NULL;
     if (spvc_context_parse_spirv(ctx, spirv, spirv_bytes / sizeof(uint32_t), &ir) != SPVC_SUCCESS ||
         spvc_context_create_compiler(ctx, SPVC_BACKEND_GLSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &c) != SPVC_SUCCESS ||
+        (vio_spvc_combine_separate(c), 0) ||   /* separate texture + sampler -> combined (OPEN-ITEMS-PLAN A23) */
         vk3d_remap_stage(c, stage_id, sh, vt_in, vt_out, smp) != 0) {
         php_error_docref(NULL, E_WARNING, "Vulkan: %s SPIR-V reflection failed: %s", stage_name,
                          spvc_context_get_last_error_string(ctx));

@@ -146,4 +146,17 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
  * uniform block), push constants or no block. */
 int vio_spirv_uniform_block_binding(const uint32_t *spirv, size_t spirv_size);
 
+/* GLSL targets that need combined samplers (OpenGL, the Vulkan round trip):
+ * turn separate textures + samplers (texture(sampler2D(u_tex, u_smp), uv)) into
+ * one combined sampler per pair, named after the texture so
+ * vio_set_uniform('u_tex', unit) and vio_bind_texture reach it. The bindless
+ * table (set 1) stays separate: then nothing is combined. `compiler` is an
+ * spvc_compiler before compile; returns the number of combined samplers. */
+int vio_spvc_combine_separate(void *compiler);
+
+/* Names of the separate textures in set 0, in reflection order (the order the
+ * HLSL translation gives them t-registers after the combined samplers).
+ * Returns the count (<= max). */
+int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*names)[64], int max);
+
 #endif /* VIO_SHADER_REFLECT_H */
