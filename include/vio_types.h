@@ -355,6 +355,13 @@ typedef enum _vio_feature {
      * Metal: ray queries from render pipelines (MSL 2.4). The ray-tracing
      * PIPELINE (raygen / hit shaders) is VIO_FEATURE_RAYTRACING, still 0. */
     VIO_FEATURE_RAY_QUERY          = 56,
+    /* Sampler feedback (texture streaming): vio_sampler_feedback_bind() pairs a
+     * MinMip feedback map with a texture, a fragment stage writes it with
+     * WriteSamplerFeedback (HLSL override, register u0 space2), and
+     * vio_sampler_feedback_read() decodes the lowest mip sampled per region.
+     * D3D12 only: SM 6.5 + SamplerFeedbackTier 0.9 (and the bindless root
+     * layout); Vulkan / Metal / OpenGL have no equivalent. */
+    VIO_FEATURE_SAMPLER_FEEDBACK   = 57,
 } vio_feature;
 
 /* Slots of the vio_texture_index() table (Set 1 of the bindless contract). */
@@ -649,6 +656,10 @@ typedef struct _vio_shader_desc {
     const char       *geometry_hlsl;
     const char       *tess_control_hlsl;
     const char       *tess_eval_hlsl;
+    /* 'hlsl' => ['fragment' => src]: replaces the transpiled pixel shader (D3D12;
+     * sampler feedback has no GLSL form). The GLSL fragment stage stays required
+     * and defines the cbuffer layout. */
+    const char       *fragment_hlsl;
     /* vio_shader(['view_count' => N]) (VIO_FEATURE_MULTIVIEW): the stages use
      * gl_ViewIndex and every draw runs N times, view v into layer v of a target
      * bound with VIO_RT_ALL_LAYERS. 0 = not a multiview shader. */

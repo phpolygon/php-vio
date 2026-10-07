@@ -413,6 +413,14 @@ typedef struct _vio_backend {
     void *(*create_acceleration_structure)(const vio_as_desc *desc);
     void  (*destroy_acceleration_structure)(void *as);
     void  (*bind_acceleration_structure)(void *as, int binding);
+    /* Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK) on a create_texture
+     * handle: bind its MinMip feedback map (created on first use) for the
+     * following draws - NULL unbinds -; decode it into one byte per region
+     * (*out malloc'd, 0xFF = never sampled); clear it. 0 on success. */
+    int   (*sampler_feedback_bind)(void *backend_texture);
+    int   (*sampler_feedback_read)(void *backend_texture, unsigned char **out,
+                                   int *regions_x, int *regions_y, int *region_px);
+    int   (*sampler_feedback_clear)(void *backend_texture);
 } vio_backend;
 
 /*

@@ -2632,6 +2632,7 @@ ZEND_FUNCTION(vio_shader)
      * VIO_FEATURE_HLSL_STAGE_OVERRIDE compile instead of the transpiled GLSL
      * (D3D tessellation, [instance(N)]). The GLSL stage stays required. */
     zval *hlsl_zv[VIO_EXTRA_STAGE_COUNT] = { NULL, NULL, NULL };
+    zval *hlsl_fragment_zv = NULL;   /* 'fragment' => src (D3D12; e.g. WriteSamplerFeedback) */
     zval *hlsl_cfg = zend_hash_str_find(config_ht, "hlsl", sizeof("hlsl") - 1);
     if (hlsl_cfg) {
         if (Z_TYPE_P(hlsl_cfg) != IS_ARRAY) {
@@ -2645,8 +2646,12 @@ ZEND_FUNCTION(vio_shader)
             for (int i = 0; hk && i < VIO_EXTRA_STAGE_COUNT; i++) {
                 if (strcmp(ZSTR_VAL(hk), vio_extra_stage_keys[i]) == 0) idx = i;
             }
+            if (hk && strcmp(ZSTR_VAL(hk), "fragment") == 0 && Z_TYPE_P(hv) == IS_STRING && Z_STRLEN_P(hv) > 0) {
+                hlsl_fragment_zv = hv;
+                continue;
+            }
             if (idx < 0 || Z_TYPE_P(hv) != IS_STRING || Z_STRLEN_P(hv) == 0) {
-                php_error_docref(NULL, E_WARNING, "vio_shader: 'hlsl' takes 'geometry', 'tess_control' and 'tess_eval' => non-empty HLSL source");
+                php_error_docref(NULL, E_WARNING, "vio_shader: 'hlsl' takes 'geometry', 'tess_control', 'tess_eval' and 'fragment' => non-empty HLSL source");
                 RETURN_FALSE;
             }
             if (!extra_zv[idx]) {
@@ -2913,6 +2918,7 @@ ZEND_FUNCTION(vio_shader)
         desc.geometry_hlsl     = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)]) : NULL;
         desc.tess_control_hlsl = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]) : NULL;
         desc.tess_eval_hlsl    = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)]) : NULL;
+        desc.fragment_hlsl     = hlsl_fragment_zv ? Z_STRVAL_P(hlsl_fragment_zv) : NULL;
         desc.view_count        = view_count;
 
         shader->backend_shader = ctx->backend->compile_shader(&desc);
@@ -7883,6 +7889,96 @@ ZEND_FUNCTION(vio_texture_index)
     RETURN_LONG(slot);
 }
 
+/* ── Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK) ───────────────────── */
+
+static int vio_sampler_feedback_ready(vio_context_object *ctx, const char *fn, int has_slot)
+{
+    if (!ctx->initialized || !ctx->backend || !has_slot
+        || !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_SAMPLER_FEEDBACK))) {
+        php_error_docref(NULL, E_WARNING, "%s: backend has no sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK = 0)", fn);
+        return 0;
+    }
+    return 1;
+}
+
+static int vio_sampler_feedback_texture_ok(vio_texture_object *tex, const char *fn)
+{
+    if (!tex->valid || !tex->backend_texture || tex->is_3d || tex->layers > 1 || tex->borrowed) {
+        php_error_docref(NULL, E_WARNING, "%s: sampler feedback needs a plain 2D texture", fn);
+        return 0;
+    }
+    return 1;
+}
+
+/* Bind the texture's MinMip feedback map (u0, space2) for the following draws;
+ * null unbinds. The map is created on the first bind. */
+ZEND_FUNCTION(vio_sampler_feedback_bind)
+{
+    zval *ctx_zval, *tex_zval = NULL;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS_OR_NULL(tex_zval, vio_texture_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_bind", ctx->backend && ctx->backend->sampler_feedback_bind)) RETURN_FALSE;
+    void *bt = NULL;
+    if (tex_zval) {
+        vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+        if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_bind")) RETURN_FALSE;
+        bt = tex->backend_texture;
+    }
+    RETURN_BOOL(ctx->backend->sampler_feedback_bind(bt) == 0);
+}
+
+/* Decode the feedback map: ['regions_x', 'regions_y', 'region' (mip-0 texels per
+ * region edge), 'min_mip' => list<int|null> row by row, null = never sampled]. */
+ZEND_FUNCTION(vio_sampler_feedback_read)
+{
+    zval *ctx_zval, *tex_zval;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_read", ctx->backend && ctx->backend->sampler_feedback_read)) RETURN_FALSE;
+    if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_read")) RETURN_FALSE;
+    unsigned char *mips = NULL;
+    int rx = 0, ry = 0, region = 0;
+    if (ctx->backend->sampler_feedback_read(tex->backend_texture, &mips, &rx, &ry, &region) != 0 || !mips) {
+        php_error_docref(NULL, E_WARNING, "vio_sampler_feedback_read: the texture has no feedback map (bind or clear it first)");
+        free(mips);
+        RETURN_FALSE;
+    }
+    array_init(return_value);
+    add_assoc_long(return_value, "regions_x", rx);
+    add_assoc_long(return_value, "regions_y", ry);
+    add_assoc_long(return_value, "region", region);
+    zval list;
+    array_init_size(&list, (uint32_t)(rx * ry));
+    for (int i = 0; i < rx * ry; i++) {
+        if (mips[i] == 0xFF) add_next_index_null(&list);
+        else add_next_index_long(&list, mips[i]);
+    }
+    add_assoc_zval(return_value, "min_mip", &list);
+    free(mips);
+}
+
+/* Reset the texture's feedback map to "never sampled" (creates it if needed). */
+ZEND_FUNCTION(vio_sampler_feedback_clear)
+{
+    zval *ctx_zval, *tex_zval;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_clear", ctx->backend && ctx->backend->sampler_feedback_clear)) RETURN_FALSE;
+    if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_clear")) RETURN_FALSE;
+    RETURN_BOOL(ctx->backend->sampler_feedback_clear(tex->backend_texture) == 0);
+}
+
 ZEND_FUNCTION(vio_backend_info)
 {
     zval *ctx_zval;
@@ -8773,6 +8869,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE_IMAGE", VIO_FEATURE_SHADING_RATE_IMAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BINDLESS", VIO_FEATURE_BINDLESS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RAY_QUERY", VIO_FEATURE_RAY_QUERY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SAMPLER_FEEDBACK", VIO_FEATURE_SAMPLER_FEEDBACK, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);

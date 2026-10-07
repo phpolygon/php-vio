@@ -180,6 +180,22 @@ kein Gegenstück ⇒ Flags dort 0. Nutzen auf RTX 40/50 (Hardware-Reorder, OMM-T
 - Metal: Sparse Textures (`sparseTileSizeInBytes`) + Zugriffszähler.
 - Gemeinsame API erst nach einem Prototyp festlegen (Streaming-Manager in PHPolygon ist der Abnehmer).
 
+**Stand (2026-10-07): D3D12 umgesetzt, Test 165.** Flag 57, nur D3D12 (SM 6.5 über `shader_model => 6`,
+`OPTIONS7.SamplerFeedbackTier ≥ 0.9`, `ID3D12Device8`, Bindless-Root-Layout). API:
+- `vio_sampler_feedback_bind($ctx, ?VioTexture)` – legt beim ersten Aufruf die MinMip-Feedback-Map
+  der Textur an (`CreateCommittedResource2`, Region = größte Zweierpotenz ≤ halbe kürzere Seite,
+  4..128 Texel) und bindet sie für die folgenden Draws; `null` löst.
+- `vio_sampler_feedback_read($ctx, $tex)` – `ResolveSubresourceRegion(DECODE_SAMPLER_FEEDBACK)` nach
+  R8_UINT + Readback → `['regions_x', 'regions_y', 'region', 'min_mip' => list<int|null>]`.
+- `vio_sampler_feedback_clear($ctx, $tex)` – `ClearUnorderedAccessViewUint`.
+- Shader: GLSL kennt kein Sampler-Feedback ⇒ Fragment-Stage als HLSL-Override
+  `'hlsl' => ['fragment' => $ps]` mit `FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> vio_feedback :
+  register(u0, space2)` und `WriteSamplerFeedback`. Root-Parameter [16] (UAV-Table, PIXEL) hängt nur mit
+  dem Feature hinter [15] Bindless; ein Feedback-Shader ohne gebundene Map schreibt in eine Null-UAV.
+- Vulkan/Metal/GL: Flag 0 – Sparse-Residency (`sparseResidency*` + `OpImageSparse*`) bzw. Metal Sparse
+  Textures liefern Residenz, kein Zugriffs-Feedback je Region; ein eigener Pfad (Atomic-Min in ein
+  Storage-Image) wäre Emulation und bleibt offen, bis PHPolygons Streaming-Manager ihn braucht.
+
 ## Phase 8 — Neural Shading: Long Vectors / Cooperative Vectors / Tensoren (L, evaluieren)
 
 - D3D12: SM 6.9 Long Vectors; Cooperative Vectors (teils Preview) — RTX 40/50 Tensor-Kerne.
