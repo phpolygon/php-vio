@@ -1819,6 +1819,7 @@ static void d3d12_shutdown(void)
     }
     d3d12_release_parked_all();
     if (vio_d3d12.dmip_pso)       { ID3D12PipelineState_Release(vio_d3d12.dmip_pso); vio_d3d12.dmip_pso = NULL; }
+    if (vio_d3d12.dmip_resolve_pso) { ID3D12PipelineState_Release(vio_d3d12.dmip_resolve_pso); vio_d3d12.dmip_resolve_pso = NULL; }
     if (vio_d3d12.dmip_rs)        { ID3D12RootSignature_Release(vio_d3d12.dmip_rs); vio_d3d12.dmip_rs = NULL; }
     if (vio_d3d12.mipgen_pso)     ID3D12PipelineState_Release(vio_d3d12.mipgen_pso);
     if (vio_d3d12.mipgen_rs)      ID3D12RootSignature_Release(vio_d3d12.mipgen_rs);
@@ -4275,6 +4276,7 @@ static void d3d12_destroy_render_target(void *rt_ptr)
     if (rt->d3d12_msaa_rtv_heap) { ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_msaa_rtv_heap); rt->d3d12_msaa_rtv_heap = NULL; }
     if (rt->d3d12_msaa_dsv_heap) { ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_msaa_dsv_heap); rt->d3d12_msaa_dsv_heap = NULL; }
     rt->d3d12_msaa_layered = 0;
+    rt->d3d12_msaa_depth_only = 0;
     if (rt->d3d12_color_resource) {
         ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
         rt->d3d12_color_resource = NULL;
@@ -4334,8 +4336,17 @@ static int d3d12_rt_mips(const vio_render_target_object *rt)
  * the SRVs / readback see the final image (D3D11 twin: d3d11_rt_resolve_msaa).
  * Afterwards the resolve resources sit in PIXEL_SHADER_RESOURCE (color_is_srv)
  * and the multisampled ones are back in RENDER_TARGET for the next bind. */
+static int d3d12_resolve_depth_msaa(vio_render_target_object *rt);
+
 static void d3d12_rt_resolve_msaa(vio_render_target_object *rt)
 {
+    if (rt && rt->d3d12_msaa_depth_only) {   /* depth_only MSAA (A24) */
+        if (rt->d3d12_msaa_dirty && vio_d3d12.cmd_list) {
+            d3d12_resolve_depth_msaa(rt);
+            rt->d3d12_msaa_dirty = 0;
+        }
+        return;
+    }
     if (rt && rt->d3d12_msaa_layered && vio_d3d12.cmd_list) {
         /* Cube / array (A24): the drawn layer(s) into mip 0 of the face; the whole
          * single-sample resource ends readable (one state flag covers it). */
@@ -4437,6 +4448,10 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
     }
 
     if (rt->depth_only) {
+        if (rt->d3d12_msaa_depth_only) {
+            ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_msaa_dsv_heap, &dsv_handle);
+            rt->d3d12_msaa_dirty = 1;
+        }
         ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 0, NULL, FALSE, &dsv_handle);
         vio_d3d12.current_has_rtv = 0;
         vio_d3d12.current_rtv_count = 0;
@@ -4570,7 +4585,7 @@ static void d3d12_unbind_render_target(unsigned int default_fbo, int width, int 
                              D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             bound_rt->d3d12_depth_is_srv = 1;
         }
-        if (bound_rt->d3d12_msaa_color_resources[0]) {
+        if (bound_rt->d3d12_msaa_color_resources[0] || bound_rt->d3d12_msaa_depth_only) {
             d3d12_rt_resolve_msaa(bound_rt);
         } else if (bound_rt->d3d12_color_resource && !bound_rt->depth_only && !bound_rt->d3d12_color_is_srv) {
             int n = bound_rt->attachment_count > 0 ? bound_rt->attachment_count : 1;
@@ -4929,6 +4944,60 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     /* Cube / array MSAA (A24): a multisampled colour + depth array beside the
      * single-sample cube / array; level-0 binds render into its layer, leaving
      * the layer resolves it into mip 0 of the face. */
+    if (depth_only && !layered && rt->mip_levels <= 1 && want_samples > 1) {
+        /* depth_only MSAA (A24): a multisampled R24G8 depth with its own DSV; the
+         * resolve pass reduces its samples into the plain (sampled) depth. */
+        UINT ms = 1;
+        for (UINT s = want_samples > 8 ? 8 : (UINT)want_samples; s > 1; s >>= 1) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS mq = {0};
+            mq.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            mq.SampleCount = s;
+            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mq, sizeof(mq)))
+                && mq.NumQualityLevels > 0) { ms = s; break; }
+        }
+        if (ms > 1) {
+            D3D12_HEAP_PROPERTIES hp = {0};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = {0};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = (UINT64)width;
+            rd.Height = (UINT)height;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_R24G8_TYPELESS;
+            rd.SampleDesc.Count = ms;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            D3D12_CLEAR_VALUE dc = {0};
+            dc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            dc.DepthStencil.Depth = 1.0f;
+            ID3D12Resource *mres = NULL;
+            ID3D12DescriptorHeap *mh = NULL;
+            D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+            hd.NumDescriptors = 1;
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+            if (SUCCEEDED(ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE, &dc, &IID_ID3D12Resource, (void **)&mres)) &&
+                SUCCEEDED(ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &hd, &IID_ID3D12DescriptorHeap, (void **)&mh))) {
+                D3D12_DEPTH_STENCIL_VIEW_DESC dv = {0};
+                dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+                dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
+                D3D12_CPU_DESCRIPTOR_HANDLE h;
+                ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(mh, &h);
+                ID3D12Device_CreateDepthStencilView(vio_d3d12.device, mres, &dv, h);
+                rt->d3d12_msaa_depth_resource = mres;
+                rt->d3d12_msaa_dsv_heap = mh;
+                rt->d3d12_msaa_depth_only = 1;
+                rt->samples = (int)ms;
+                d3d12_rt_clear_job mjob = {0};
+                mjob.dsv = h;
+                mjob.dsv_count = 1;
+                d3d12_submit_upload(d3d12_record_rt_clear, &mjob);
+            } else {
+                if (mres) ID3D12Resource_Release(mres);
+                if (mh) ID3D12DescriptorHeap_Release(mh);
+            }
+        }
+    }
     if (layered && !depth_only && want_samples > 1) {
         DXGI_FORMAT cf = vio_pixel_format_to_dxgi(rt->formats[0]);
         UINT ms = 1;
@@ -5428,6 +5497,92 @@ static void d3d12_dmip_barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *
         b[p].Transition.StateAfter = to;
     }
     ID3D12GraphicsCommandList_ResourceBarrier(list, 2, b);
+}
+
+/* depth_only MSAA (A24): each texel's samples reduced (max / min, the target's
+ * depth_reduction) into the single-sample depth. The pass leaves both depth
+ * resources in the states it found them in (one flag tracks the plain one). */
+static const char *d3d12_dmip_resolve_src =
+    "Texture2DMS<float> src : register(t0);\n"
+    "cbuffer P : register(b0) { int4 sizes; int4 mode; };\n"
+    "float main(float4 pos : SV_Position) : SV_Depth {\n"
+    "    int2 p = int2(pos.xy);\n"
+    "    float d = mode.x == 0 ? 0.0 : 1.0;\n"
+    "    for (int s = 0; s < mode.y; s++) { float v = src.Load(p, s); d = mode.x == 0 ? max(d, v) : min(d, v); }\n"
+    "    return d;\n"
+    "}\n";
+
+static int d3d12_resolve_depth_msaa(vio_render_target_object *rt)
+{
+    ID3D12GraphicsCommandList *list = vio_d3d12.cmd_list;
+    ID3D12Resource *ms = (ID3D12Resource *)rt->d3d12_msaa_depth_resource;
+    ID3D12Resource *dst = (ID3D12Resource *)rt->d3d12_depth_resource;
+    if (!list || !ms || !dst || d3d12_ensure_depth_mip() != 0) return -1;
+    if (!vio_d3d12.dmip_resolve_pso) {
+        ID3DBlob *ps = NULL;
+        if (FAILED(d3d12_compile_cached(d3d12_dmip_resolve_src, "vio_depth_resolve_ps", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, &ps)) || !ps) return -1;
+        ID3DBlob *vs = NULL;
+        if (FAILED(d3d12_compile_cached(d3d12_dmip_vs_src, "vio_depth_mip_vs", "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, &vs)) || !vs) { ID3D10Blob_Release(ps); return -1; }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+        pd.pRootSignature = vio_d3d12.dmip_rs;
+        pd.VS.pShaderBytecode = ID3D10Blob_GetBufferPointer(vs);
+        pd.VS.BytecodeLength = ID3D10Blob_GetBufferSize(vs);
+        pd.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(ps);
+        pd.PS.BytecodeLength = ID3D10Blob_GetBufferSize(ps);
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = 0xFFFFFFFFu;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.DepthStencilState.DepthEnable = TRUE;
+        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        pd.SampleDesc.Count = 1;
+        HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(vio_d3d12.device, &pd, &IID_ID3D12PipelineState, (void **)&vio_d3d12.dmip_resolve_pso);
+        ID3D10Blob_Release(vs);
+        ID3D10Blob_Release(ps);
+        if (FAILED(hr)) { vio_d3d12.dmip_resolve_pso = NULL; return -1; }
+    }
+    UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu, dsv;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &cpu);
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &gpu);
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_dsv_heap, &dsv);
+    UINT block = vio_d3d12.mipgen_block;
+    vio_d3d12.mipgen_block = (block + 1) % VIO_D3D12_MIPGEN_BLOCKS;
+    cpu.ptr += (SIZE_T)block * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS * inc;
+    gpu.ptr += (UINT64)block * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS * inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+    sd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    ID3D12Device_CreateShaderResourceView(vio_d3d12.device, ms, &sd, cpu);
+
+    int dst_srv = rt->d3d12_depth_is_srv;
+    d3d12_rt_barrier(list, ms, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (dst_srv) d3d12_rt_barrier(list, dst, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.mipgen_heap };
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, vio_d3d12.dmip_rs);
+    ID3D12GraphicsCommandList_SetPipelineState(list, vio_d3d12.dmip_resolve_pso);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_OMSetRenderTargets(list, 0, NULL, FALSE, &dsv);
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)rt->width, (float)rt->height, 0.0f, 1.0f };
+    D3D12_RECT sc = { 0, 0, rt->width, rt->height };
+    ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+    ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+    UINT consts[8] = { (UINT)rt->width, (UINT)rt->height, (UINT)rt->width, (UINT)rt->height,
+                       rt->depth_reduction == VIO_DEPTH_REDUCE_MIN ? 1u : 0u, (UINT)rt->samples, 0, 0 };
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 8, consts, 0);
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, gpu);
+    ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+    if (dst_srv) d3d12_rt_barrier(list, dst, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    d3d12_rt_barrier(list, ms, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    d3d12_restore_graphics_state_after_compute();
+    return 0;
 }
 
 static int d3d12_generate_depth_mips(vio_render_target_object *rt)

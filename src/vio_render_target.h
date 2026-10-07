@@ -85,6 +85,7 @@ typedef struct _vio_render_target_object {
     void        *d3d12_msaa_depth_resource;
     void        *d3d12_msaa_rtv_heap;
     void        *d3d12_msaa_dsv_heap;
+    int          d3d12_msaa_depth_only;  /* depth_only MSAA (A24): d3d12_msaa_depth_resource + its DSV heap */
 
     /* Metal (opaque pointers — actual types are id<MTLTexture> CFBridgeRetained).
      * Stored as opaque void * so the public header doesn't pull in Metal
