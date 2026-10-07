@@ -21,6 +21,9 @@ GLSL-Vertrag (fest, alle Backends):
 #extension GL_EXT_nonuniform_qualifier : require
 layout(set = 1, binding = 0) uniform texture2D vio_textures[];
 layout(set = 1, binding = 1) uniform sampler   vio_sampler;     // linear, repeat
+layout(set = 1, binding = 2) uniform sampler   vio_sampler_nearest;         // 4b: nearest, repeat
+layout(set = 1, binding = 3) uniform sampler   vio_sampler_clamp;           // 4b: linear, clamp
+layout(set = 1, binding = 4) uniform sampler   vio_sampler_nearest_clamp;   // 4b: nearest, clamp
 ... texture(sampler2D(vio_textures[nonuniformEXT(i)], vio_sampler), uv)
 ```
 
@@ -45,6 +48,9 @@ Fragment-Shader; dazu der Vertrag (Slot stabil, Referenz hält die Textur, ohne 
 - ✅ Freigabe von Slots (`vio_texture_release_index`, Test 176): der Slot bleibt `VIO_BINDLESS_RETIRE_FRAMES` (4)
   `vio_begin` lang reserviert, dann schreibt das Backend einen leeren Eintrag (D3D12 Null-SRV, Vulkan 1×1-Dummy,
   Metal Null-Resource-ID) und der Slot wird neu vergeben.
+- ✅ Samplerwahl (Test 177): Set 1 Binding 2–4 sind feste Varianten (nearest / clamp / nearest + clamp); der
+  Shader wählt je Zugriff. D3D12 statische Sampler `s1`–`s4, space1`, Vulkan unveränderliche Sampler im Set-1-
+  Layout, Metal `constexpr`-Sampler je Binding.
 
 Offen: Samplerwahl je Eintrag, Arrays/Cubes, Compute-Stages,
 Vertex-Stage-Zugriff auf Metal ohne `useResources`-Kosten (Residency Sets, Metal 4).

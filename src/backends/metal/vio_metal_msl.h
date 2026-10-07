@@ -445,12 +445,16 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
         spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS, &list, &count);
         for (size_t i = 0; i < count; i++) {
             if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 1) continue;
+            /* Bindings 1..4: vio_sampler (linear, repeat), vio_sampler_nearest,
+             * vio_sampler_clamp, vio_sampler_nearest_clamp (BINDLESS-PLAN). */
+            unsigned v = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            v = (v >= 1 && v <= 4) ? v - 1 : 0;
             spvc_msl_constexpr_sampler cs;
             spvc_msl_constexpr_sampler_init(&cs);
-            cs.min_filter = SPVC_MSL_SAMPLER_FILTER_LINEAR;
-            cs.mag_filter = SPVC_MSL_SAMPLER_FILTER_LINEAR;
-            cs.s_address  = SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
-            cs.t_address  = SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
+            cs.min_filter = (v & 1) ? SPVC_MSL_SAMPLER_FILTER_NEAREST : SPVC_MSL_SAMPLER_FILTER_LINEAR;
+            cs.mag_filter = cs.min_filter;
+            cs.s_address  = (v & 2) ? SPVC_MSL_SAMPLER_ADDRESS_CLAMP_TO_EDGE : SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
+            cs.t_address  = cs.s_address;
             spvc_compiler_msl_remap_constexpr_sampler(compiler, list[i].id, &cs);
         }
     }

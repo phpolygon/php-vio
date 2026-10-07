@@ -709,18 +709,22 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     params[VIO_D3D12_RP_BINDLESS].DescriptorTable.NumDescriptorRanges = 1;
     params[VIO_D3D12_RP_BINDLESS].DescriptorTable.pDescriptorRanges = &bindless_range;
     params[VIO_D3D12_RP_BINDLESS].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_STATIC_SAMPLER_DESC all_samplers[5];
+    /* The bindless table's samplers, s1..s4 in space 1 (BINDLESS-PLAN): vio_sampler
+     * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp. */
+    D3D12_STATIC_SAMPLER_DESC all_samplers[8];
     memcpy(all_samplers, static_samplers, sizeof(static_samplers));
-    memset(&all_samplers[4], 0, sizeof(all_samplers[4]));
-    all_samplers[4].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    all_samplers[4].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    all_samplers[4].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    all_samplers[4].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    all_samplers[4].ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-    all_samplers[4].MaxLOD = D3D12_FLOAT32_MAX;
-    all_samplers[4].ShaderRegister = 1;
-    all_samplers[4].RegisterSpace = 1;
-    all_samplers[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    for (int v = 0; v < 4; v++) {
+        D3D12_STATIC_SAMPLER_DESC *s = &all_samplers[4 + v];
+        D3D12_TEXTURE_ADDRESS_MODE am = (v & 2) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        memset(s, 0, sizeof(*s));
+        s->Filter = (v & 1) ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        s->AddressU = s->AddressV = s->AddressW = am;
+        s->ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        s->MaxLOD = D3D12_FLOAT32_MAX;
+        s->ShaderRegister = 1 + (UINT)v;
+        s->RegisterSpace = 1;
+        s->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
 
     /* [16] Sampler feedback map (VIO_FEATURE_SAMPLER_FEEDBACK): one UAV u0 in
      * register space 2 for the pixel stage - the FeedbackTexture2D of an
@@ -743,7 +747,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     rs_desc.NumParameters = vio_d3d12.sampler_feedback ? VIO_D3D12_RP_COUNT
                           : vio_d3d12.bindless ? VIO_D3D12_RP_FEEDBACK : VIO_D3D12_RP_BINDLESS;
     rs_desc.pParameters = params;
-    rs_desc.NumStaticSamplers = vio_d3d12.bindless ? 5 : 4;
+    rs_desc.NumStaticSamplers = vio_d3d12.bindless ? 8 : 4;
     rs_desc.pStaticSamplers = all_samplers;
     rs_desc.Flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 

@@ -312,6 +312,7 @@ typedef struct _vio_vulkan_state {
     VkDescriptorPool         bindless_pool;
     VkDescriptorSet          bindless_set;
     VkSampler                bindless_sampler;
+    VkSampler                bindless_sampler_variants[3];   /* nearest, clamp, nearest + clamp (bindings 2..4) */
     int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
     int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
     void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */

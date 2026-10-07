@@ -156,7 +156,8 @@ jobs:
             tests/render3d/173_pipeline_survives_frame_all_backends.phpt \
             tests/render3d/174_mesh_layout_input_layout_all_backends.phpt \
             tests/render3d/175_uniform_buffer_graphics_all_backends.phpt \
-            tests/render3d/176_bindless_release_all_backends.phpt
+            tests/render3d/176_bindless_release_all_backends.phpt \
+            tests/render3d/177_bindless_samplers_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -310,7 +311,8 @@ jobs:
             tests/render3d/173_pipeline_survives_frame_all_backends.phpt \
             tests/render3d/174_mesh_layout_input_layout_all_backends.phpt \
             tests/render3d/175_uniform_buffer_graphics_all_backends.phpt \
-            tests/render3d/176_bindless_release_all_backends.phpt
+            tests/render3d/176_bindless_release_all_backends.phpt \
+            tests/render3d/177_bindless_samplers_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -708,6 +710,7 @@ jobs:
             tests/render3d/174_mesh_layout_input_layout_all_backends.phpt `
             tests/render3d/175_uniform_buffer_graphics_all_backends.phpt `
             tests/render3d/176_bindless_release_all_backends.phpt `
+            tests/render3d/177_bindless_samplers_all_backends.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt
 
       - name: Package binary

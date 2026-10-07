@@ -464,6 +464,9 @@ function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width
  * BINDLESS-PLAN.md). Shaders read the table as
  *   layout(set = 1, binding = 0) uniform texture2D vio_textures[];
  *   layout(set = 1, binding = 1) uniform sampler vio_sampler;   // linear, repeat
+ *   layout(set = 1, binding = 2) uniform sampler vio_sampler_nearest;         // optional
+ *   layout(set = 1, binding = 3) uniform sampler vio_sampler_clamp;           // optional
+ *   layout(set = 1, binding = 4) uniform sampler vio_sampler_nearest_clamp;   // optional
  * and index it with nonuniformEXT (GL_EXT_nonuniform_qualifier). The first call adds
  * the texture and keeps it alive until vio_texture_release_index or vio_destroy; later
  * calls return the same slot. Plain 2D textures only, up to 1024. False (with a
