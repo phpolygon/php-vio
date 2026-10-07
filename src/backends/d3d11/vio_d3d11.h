@@ -67,6 +67,9 @@ typedef struct _vio_d3d11_pipeline {
     ID3DBlob                 *vs_blob;
     struct { uint32_t key; ID3D11InputLayout *il; } il_variants[8];
     int                       il_variant_count;
+    /* Multiview by instancing (OPEN-ITEMS-PLAN A10): instances per user instance
+     * (the views), 1 without multiview; per-instance data steps every `views`. */
+    UINT                      views;
 } vio_d3d11_pipeline;
 
 /* Buffer wrapper */
@@ -307,6 +310,9 @@ int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg);
  * binding, so the offscreen redirect has to be applied AFTER begin_frame).
  * No-op unless such a bind is pending. Called from vio_begin(). */
 void vio_d3d11_apply_pending_render_target(void);
+/* Instances per user instance of the bound pipeline (views under multiview by
+ * instancing, else 1): vio_draw_instanced's inline D3D11 path multiplies by it. */
+UINT vio_d3d11_multiview_instances(void);
 
 /* Resolve the GPU-local per-frame mirror (readback_mirror) into the CPU-readable
  * readback_staging texture, creating/resizing staging as needed. Call this

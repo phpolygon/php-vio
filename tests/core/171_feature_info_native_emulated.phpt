@@ -12,7 +12,7 @@ echo count($features) > 40 ? "constants OK\n" : "FAIL only " . count($features) 
 
 /* Features whose support is native wherever this backend reports it. */
 $native = [
-    'opengl' => ['VIO_FEATURE_GEOMETRY', 'VIO_FEATURE_TESSELLATION', 'VIO_FEATURE_MULTIVIEW'],
+    'opengl' => ['VIO_FEATURE_GEOMETRY', 'VIO_FEATURE_TESSELLATION'],   /* multiview: OVR or instancing */
     'd3d11'  => ['VIO_FEATURE_GEOMETRY', 'VIO_FEATURE_TESSELLATION'],
     'd3d12'  => ['VIO_FEATURE_GEOMETRY', 'VIO_FEATURE_TESSELLATION', 'VIO_FEATURE_MULTIVIEW', 'VIO_FEATURE_RAY_QUERY'],
     'vulkan' => ['VIO_FEATURE_GEOMETRY', 'VIO_FEATURE_TESSELLATION', 'VIO_FEATURE_MULTIVIEW', 'VIO_FEATURE_RAY_QUERY'],
@@ -22,6 +22,7 @@ $native = [
 /* Features that are emulated wherever this backend reports them. */
 $emulated = [
     'metal' => ['VIO_FEATURE_GEOMETRY', 'VIO_FEATURE_GEOMETRY_INSTANCING', 'VIO_FEATURE_MULTIVIEW'],
+    'd3d11' => ['VIO_FEATURE_MULTIVIEW'],   /* by instancing (OPEN-ITEMS-PLAN A10) */
 ];
 
 foreach (['null', 'opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {

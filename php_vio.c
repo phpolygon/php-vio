@@ -2924,6 +2924,25 @@ ZEND_FUNCTION(vio_shader)
     shader->view_count = view_count;
     shader->is_mesh = want_mesh;
 
+    /* Multiview by instancing (OPEN-ITEMS-PLAN A10): the backend has no views of
+     * its own, so the GLSL itself splits gl_InstanceIndex into view and instance. */
+    if (view_count > 1 && ctx->backend->multiview_via_instancing && ctx->backend->multiview_via_instancing()) {
+        if (format != VIO_SHADER_GLSL) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: 'view_count' on backend '%s' needs GLSL source (multiview by instancing)", ctx->backend->name);
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
+        shader->mv_src[0] = vio_glsl_multiview_instancing(Z_STRVAL_P(vert_zval), 0, view_count);
+        shader->mv_src[1] = vio_glsl_multiview_instancing(Z_STRVAL_P(frag_zval), 1, view_count);
+        if (!shader->mv_src[0] || !shader->mv_src[1]) {
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
+        shader->view_emulated = 1;
+    }
+    const char *vert_src = shader->mv_src[0] ? shader->mv_src[0] : Z_STRVAL_P(vert_zval);
+    const char *frag_src = shader->mv_src[1] ? shader->mv_src[1] : Z_STRVAL_P(frag_zval);
+
     /* --- SPIR-V input: store directly --- */
     if (format == VIO_SHADER_SPIRV) {
         shader->vert_spirv_size = Z_STRLEN_P(vert_zval);
@@ -2952,7 +2971,7 @@ ZEND_FUNCTION(vio_shader)
 
         shader->vert_spirv = want_mesh
             ? vio_compile_glsl_stage_to_spirv(Z_STRVAL_P(vert_zval), VIO_STAGE_MESH, &shader->vert_spirv_size, &error_msg)
-            : vio_compile_glsl_to_spirv(Z_STRVAL_P(vert_zval), 0, &shader->vert_spirv_size, &error_msg);
+            : vio_compile_glsl_to_spirv(vert_src, 0, &shader->vert_spirv_size, &error_msg);
         if (!shader->vert_spirv) {
             php_error_docref(NULL, E_WARNING, "%s shader compilation failed: %s", want_mesh ? "Mesh" : "Vertex",
                 error_msg ? error_msg : "unknown error");
@@ -2972,7 +2991,7 @@ ZEND_FUNCTION(vio_shader)
         }
 
         shader->frag_spirv = vio_compile_glsl_to_spirv(
-            Z_STRVAL_P(frag_zval), 1, &shader->frag_spirv_size, &error_msg);
+            frag_src, 1, &shader->frag_spirv_size, &error_msg);
         if (!shader->frag_spirv) {
             php_error_docref(NULL, E_WARNING, "Fragment shader compilation failed: %s",
                 error_msg ? error_msg : "unknown error");
@@ -3022,7 +3041,7 @@ ZEND_FUNCTION(vio_shader)
                 if (!spv[s]) continue;
                 /* GL_OVR_multiview2 needs the view count in the GLSL (num_views);
                  * SPIRV-Cross takes it for the vertex stage only. */
-                vio_glsl_set_ovr_view_count(s == VIO_STAGE_VERTEX ? view_count : 0);
+                vio_glsl_set_ovr_view_count(s == VIO_STAGE_VERTEX && !shader->view_emulated ? view_count : 0);
                 glsl[s] = vio_spirv_to_glsl(spv[s], spv_size[s], glsl_version, &error_msg);
                 vio_glsl_set_ovr_view_count(0);
                 if (!glsl[s]) break;
@@ -3077,7 +3096,7 @@ ZEND_FUNCTION(vio_shader)
             char *error_msg = NULL;
             shader->vert_spirv = want_mesh
                 ? vio_compile_glsl_stage_to_spirv(Z_STRVAL_P(vert_zval), VIO_STAGE_MESH, &shader->vert_spirv_size, &error_msg)
-                : vio_compile_glsl_to_spirv(Z_STRVAL_P(vert_zval), 0, &shader->vert_spirv_size, &error_msg);
+                : vio_compile_glsl_to_spirv(vert_src, 0, &shader->vert_spirv_size, &error_msg);
             if (shader->vert_spirv && task_zval && !shader->task_spirv) {
                 shader->task_spirv = vio_compile_glsl_stage_to_spirv(Z_STRVAL_P(task_zval), VIO_STAGE_TASK,
                                                                      &shader->task_spirv_size, &error_msg);
@@ -3094,7 +3113,7 @@ ZEND_FUNCTION(vio_shader)
             }
 
             shader->frag_spirv = vio_compile_glsl_to_spirv(
-                Z_STRVAL_P(frag_zval), 1, &shader->frag_spirv_size, &error_msg);
+                frag_src, 1, &shader->frag_spirv_size, &error_msg);
             if (!shader->frag_spirv) {
                 php_error_docref(NULL, E_WARNING, "FS GLSL->SPIR-V failed: %s", error_msg ? error_msg : "unknown");
                 free(error_msg);
@@ -10567,10 +10586,10 @@ ZEND_FUNCTION(vio_draw_instanced)
                     ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
                                                          mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
                     ID3D11DeviceContext_DrawIndexedInstanced(vio_d3d11.context,
-                        mesh->index_count, (UINT)instance_count, 0, 0, 0);
+                        mesh->index_count, (UINT)instance_count * vio_d3d11_multiview_instances(), 0, 0, 0);
                 } else {
                     ID3D11DeviceContext_DrawInstanced(vio_d3d11.context,
-                        mesh->vertex_count, (UINT)instance_count, 0, 0);
+                        mesh->vertex_count, (UINT)instance_count * vio_d3d11_multiview_instances(), 0, 0);
                 }
             }
         } else

@@ -65,6 +65,10 @@ typedef struct _vio_shader_object {
     int               has_geometry;  /* 1 => geometry stage present */
     int               has_tessellation; /* 1 => tess control + eval present */
     int               view_count;    /* multiview views (2..4), 0 = off */
+    /* Multiview by instancing (OPEN-ITEMS-PLAN A10, backends without views of
+     * their own): the rewritten vertex / fragment GLSL that was compiled. */
+    int               view_emulated;
+    char             *mv_src[2];
     /* Mesh pipeline (VIO_FEATURE_MESH_SHADER): vert_spirv holds the MESH stage
      * (it takes the vertex stage's role for uniforms / reflection), task_spirv
      * the optional task stage. */
@@ -113,6 +117,12 @@ typedef struct _vio_shader_object {
 extern zend_class_entry *vio_shader_ce;
 
 void vio_shader_register(void);
+
+/* GLSL for multiview by instancing: the vertex stage runs views x instances,
+ * takes gl_ViewIndex = gl_InstanceIndex % views and gl_InstanceIndex / views,
+ * writes gl_Layer and hands the view to the fragment stage at location 31.
+ * malloc'd, NULL on failure. */
+char *vio_glsl_multiview_instancing(const char *src, int fragment, int views);
 
 static inline vio_shader_object *vio_shader_from_obj(zend_object *obj) {
     return (vio_shader_object *)((char *)obj - XtOffsetOf(vio_shader_object, std));

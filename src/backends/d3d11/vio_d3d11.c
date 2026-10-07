@@ -583,6 +583,7 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
         free(pipeline);
         return NULL;
     }
+    pipeline->views = desc->view_count > 1 ? (UINT)desc->view_count : 1;
 
     pipeline->vs = shader->vs;
     pipeline->ps = shader->ps;
@@ -661,7 +662,7 @@ static void *d3d11_create_pipeline(vio_pipeline_desc *desc)
                 elements[i].InputSlot = 1;
                 elements[i].AlignedByteOffset = (loc - 3) * 16;  /* 4 floats per column */
                 elements[i].InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
-                elements[i].InstanceDataStepRate = 1;
+                elements[i].InstanceDataStepRate = pipeline->views;   /* one step per user instance */
             } else {
                 /* Per-vertex attribute — InputSlot 0 */
                 elements[i].InputSlot = 0;
@@ -2609,7 +2610,7 @@ static void d3d11_draw(vio_draw_cmd *cmd)
         d3d11_bind_vertex_slots(vb->buffer, stride);
     }
 
-    UINT instance_count = cmd->instance_count > 0 ? cmd->instance_count : 1;
+    UINT instance_count = (cmd->instance_count > 0 ? cmd->instance_count : 1) * d3d11_current_pipeline->views;
     ID3D11DeviceContext_DrawInstanced(vio_d3d11.context,
                                       cmd->vertex_count,
                                       instance_count,
@@ -2635,7 +2636,7 @@ static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
                                              cmd->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
     }
 
-    UINT instance_count = cmd->instance_count > 0 ? cmd->instance_count : 1;
+    UINT instance_count = (cmd->instance_count > 0 ? cmd->instance_count : 1) * d3d11_current_pipeline->views;
     ID3D11DeviceContext_DrawIndexedInstanced(vio_d3d11.context,
                                              cmd->index_count,
                                              instance_count,
@@ -2731,10 +2732,10 @@ static void d3d11_draw_instanced_from_storage(void *mesh_obj, int instance_count
         ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
                                              mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
         ID3D11DeviceContext_DrawIndexedInstanced(vio_d3d11.context,
-            (UINT)mesh->index_count, (UINT)instance_count, 0, 0, 0);
+            (UINT)mesh->index_count, (UINT)instance_count * d3d11_current_pipeline->views, 0, 0, 0);
     } else {
         ID3D11DeviceContext_DrawInstanced(vio_d3d11.context,
-            (UINT)mesh->vertex_count, (UINT)instance_count, 0, 0);
+            (UINT)mesh->vertex_count, (UINT)instance_count * d3d11_current_pipeline->views, 0, 0);
     }
 
     /* Release the SRV now that the draw is recorded (immediate context). */
@@ -2752,6 +2753,39 @@ static void d3d11_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
     vio_d3d11_buffer *vb = (vio_d3d11_buffer *)mesh->backend_vb;
     if (!vb) return;
     d3d11_bind_vertex_slots(vb->buffer, (UINT)mesh->stride);
+    UINT mv = d3d11_current_pipeline->views;
+    if (mv > 1) {
+        /* Multiview by instancing: every record's instances x views. The records
+         * are read back - a stall, but only on this emulated path. */
+        int indexed = mesh->index_count > 0 && mesh->backend_ib;
+        UINT stride = indexed ? 20 : 16;
+        D3D11_BUFFER_DESC sd = {0};
+        sd.ByteWidth = stride * (UINT)max_draws;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Buffer *staging = NULL;
+        if (FAILED(ID3D11Device_CreateBuffer(vio_d3d11.device, &sd, NULL, &staging)) || !staging) return;
+        D3D11_BOX box = { (UINT)offset, 0, 0, (UINT)offset + sd.ByteWidth, 1, 1 };
+        ID3D11DeviceContext_CopySubresourceRegion(vio_d3d11.context, (ID3D11Resource *)staging, 0, 0, 0, 0,
+                                                  (ID3D11Resource *)args->buffer, 0, &box);
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(vio_d3d11.context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m))) {
+            const UINT *rec = (const UINT *)m.pData;
+            if (indexed) {
+                vio_d3d11_buffer *ib = (vio_d3d11_buffer *)mesh->backend_ib;
+                ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
+                                                     mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
+            }
+            for (int i = 0; i < max_draws; i++, rec += stride / 4) {
+                if (indexed) ID3D11DeviceContext_DrawIndexedInstanced(vio_d3d11.context, rec[0], rec[1] * mv, rec[2], (INT)rec[3], rec[4] * mv);
+                else         ID3D11DeviceContext_DrawInstanced(vio_d3d11.context, rec[0], rec[1] * mv, rec[2], rec[3] * mv);
+            }
+            ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)staging, 0);
+        }
+        ID3D11Buffer_Release(staging);
+        d3d11_release_vs_storage_srv();
+        return;
+    }
     if (mesh->index_count > 0 && mesh->backend_ib) {
         vio_d3d11_buffer *ib = (vio_d3d11_buffer *)mesh->backend_ib;
         ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
@@ -3300,6 +3334,25 @@ static void d3d11_gpu_info(const char **name, uint64_t *vram_bytes)
     *vram_bytes = vio_d3d11.vram_bytes;
 }
 
+UINT vio_d3d11_multiview_instances(void)
+{
+    return d3d11_current_pipeline ? d3d11_current_pipeline->views : 1;
+}
+
+static int d3d11_multiview_via_instancing(void)
+{
+    return 1;   /* D3D11 has no view instancing */
+}
+
+static int d3d11_supports_feature(vio_feature feature);
+
+static const char *d3d11_feature_emulation(vio_feature f)
+{
+    if (f == VIO_FEATURE_MULTIVIEW && d3d11_supports_feature(VIO_FEATURE_MULTIVIEW))
+        return "instancing, one instance per view, SV_RenderTargetArrayIndex from the vertex stage";
+    return NULL;
+}
+
 static double d3d11_gpu_frame_time(void)
 {
     return vio_d3d11.initialized && vio_d3d11.ts_available ? vio_d3d11.last_gpu_ms : -1.0;
@@ -3374,7 +3427,8 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_HLSL_STAGE_OVERRIDE: return 1;   /* 'hlsl' => [stage => source] for GS / HS / DS */
         case VIO_FEATURE_GEOMETRY_INSTANCING: return d3d11_stage_supported(VIO_PROBE_GS_INSTANCED, "gs_5_0");   /* [instance(N)] */
         case VIO_FEATURE_RAYTRACING:   return 0; /* No DXR in D3D11 */
-        case VIO_FEATURE_MULTIVIEW:    return 0;
+        /* Views by instancing, the layer from the vertex stage (OPEN-ITEMS-PLAN A10). */
+        case VIO_FEATURE_MULTIVIEW:    return d3d11_supports_feature(VIO_FEATURE_VERTEX_LAYER);
         case VIO_FEATURE_3D_PIPELINE:  return 1;
         case VIO_FEATURE_READ_PIXELS:  return 1;
         case VIO_FEATURE_INSTANCED_DRAW: return 1;
@@ -3623,6 +3677,8 @@ static const vio_backend d3d11_backend = {
     .bind_storage_buffer          = d3d11_bind_storage_buffer,
     .draw_instanced_from_storage  = d3d11_draw_instanced_from_storage,
     .supports_feature  = d3d11_supports_feature,
+    .feature_emulation = d3d11_feature_emulation,
+    .multiview_via_instancing = d3d11_multiview_via_instancing,
     .apply_mesh_layout = d3d11_apply_mesh_layout,
     .gpu_frame_time    = d3d11_gpu_frame_time,
     .gpu_mark          = d3d11_gpu_mark,

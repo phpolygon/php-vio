@@ -1865,9 +1865,33 @@ void vio_opengl_set_program_views(unsigned int program, int views)
     gl_mv_programs[slot].gen = gl_context_generation;
 }
 
+/* Views come from GL_OVR_multiview2 unless forced to instancing. */
+static int gl_mv_native(void)
+{
+    return vio_gl.caps.has_multiview && !vio_gl.caps.multiview_emulate;
+}
+
+static int gl_mv_program_views(void)
+{
+    GLint program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    for (int i = 0; i < GL_MV_MAX_PROGRAMS && program > 0; i++) {
+        if (gl_mv_programs[i].program == (GLuint)program && gl_mv_programs[i].gen == gl_context_generation) return gl_mv_programs[i].views;
+    }
+    return 0;
+}
+
+/* Multiview by instancing (A10): instances per user instance of this draw. */
+static int gl_mv_instances(void)
+{
+    if (gl_mv_native()) return 1;
+    int v = gl_mv_program_views();
+    return v > 1 ? v : 1;
+}
+
 static void gl_mv_prepare(void)
 {
-    if (!vio_gl.caps.has_multiview) return;
+    if (!gl_mv_native()) return;
     GLint program = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &program);
     int views = 0;
@@ -1955,7 +1979,13 @@ static void opengl_draw_mesh(void *mesh_obj)
     gl_mv_prepare();
     unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
-    if (mesh->index_count > 0) {
+    int mv = gl_mv_instances();
+    if (mv > 1) {
+        if (mesh->index_count > 0)
+            glDrawElementsInstanced(gl_draw_mode(), mesh->index_count, mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0, mv);
+        else
+            glDrawArraysInstanced(gl_draw_mode(), 0, mesh->vertex_count, mv);
+    } else if (mesh->index_count > 0) {
         glDrawElements(gl_draw_mode(), mesh->index_count, mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0);
     } else {
         glDrawArrays(gl_draw_mode(), 0, mesh->vertex_count);
@@ -1983,7 +2013,9 @@ static void opengl_draw_mesh_instanced(void *mesh_obj,
                  matrices, GL_STREAM_DRAW);
 
     /* Bind mesh VAO and wire the per-instance matrix attributes at locations
-     * 3..6 (one vec4 per column). Divisor=1 advances them per instance. */
+     * 3..6 (one vec4 per column). Divisor=1 advances them per instance; with
+     * multiview by instancing every `mv` instances (one per view). */
+    int mv = gl_mv_instances();
     glBindVertexArray(mesh->vao);
     for (int col = 0; col < 4; col++) {
         GLuint loc = (GLuint)(3 + col);
@@ -1991,17 +2023,17 @@ static void opengl_draw_mesh_instanced(void *mesh_obj,
         glVertexAttribPointer(loc, 4, GL_FLOAT, GL_FALSE,
                               sizeof(float) * 16,
                               (void *)(uintptr_t)(sizeof(float) * 4 * col));
-        glVertexAttribDivisor(loc, 1);
+        glVertexAttribDivisor(loc, (GLuint)mv);
     }
 
     gl_mv_prepare();
     unsigned shadow_units = gl_shadow_begin();
     if (mesh->index_count > 0) {
         glDrawElementsInstanced(gl_draw_mode(), mesh->index_count,
-                                mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
+                                mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0, (GLsizei)instance_count * mv);
     } else {
         glDrawArraysInstanced(gl_draw_mode(), 0, mesh->vertex_count,
-                              (GLsizei)instance_count);
+                              (GLsizei)instance_count * mv);
     }
     gl_shadow_end(shadow_units);
 
@@ -2044,12 +2076,13 @@ static void opengl_draw_instanced_from_storage(void *mesh_obj, int instance_coun
     gl_mv_prepare();
     unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
+    int mv = gl_mv_instances();
     if (mesh->index_count > 0) {
         glDrawElementsInstanced(gl_draw_mode(), mesh->index_count,
-                                mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0, (GLsizei)instance_count);
+                                mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, 0, (GLsizei)instance_count * mv);
     } else {
         glDrawArraysInstanced(gl_draw_mode(), 0, mesh->vertex_count,
-                              (GLsizei)instance_count);
+                              (GLsizei)instance_count * mv);
     }
     glBindVertexArray(0);
     gl_shadow_end(shadow_units);
@@ -2066,6 +2099,36 @@ static void opengl_draw_indirect(void *mesh_obj, void *args_buffer, int max_draw
     gl_mv_prepare();
     unsigned shadow_units = gl_shadow_begin();
     glBindVertexArray(mesh->vao);
+    int mv = gl_mv_instances();
+    if (mv > 1) {
+        /* Multiview by instancing: every record's instances x views, its first
+         * instance scaled alike (gl_InstanceIndex / views). The records are read
+         * back - a stall, but only on this emulated path. */
+        size_t stride = mesh->index_count > 0 ? 20 : 16;
+        GLuint rec[5];
+        glBindBuffer(GL_COPY_READ_BUFFER, args->ssbo);
+        for (int i = 0; i < max_draws; i++) {
+            memset(rec, 0, sizeof(rec));
+            glGetBufferSubData(GL_COPY_READ_BUFFER, (GLintptr)(offset + (size_t)i * stride), (GLsizeiptr)stride, rec);
+            if (mesh->index_count > 0) {
+                GLenum type = mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
+                const void *first = (const void *)(uintptr_t)((size_t)rec[2] * (size_t)mesh->index_bytes);
+                if (GLAD_GL_VERSION_4_2)
+                    glDrawElementsInstancedBaseVertexBaseInstance(gl_draw_mode(), (GLsizei)rec[0], type, first,
+                        (GLsizei)(rec[1] * (GLuint)mv), (GLint)rec[3], rec[4] * (GLuint)mv);
+                else
+                    glDrawElementsInstancedBaseVertex(gl_draw_mode(), (GLsizei)rec[0], type, first, (GLsizei)(rec[1] * (GLuint)mv), (GLint)rec[3]);
+            } else if (GLAD_GL_VERSION_4_2) {
+                glDrawArraysInstancedBaseInstance(gl_draw_mode(), (GLint)rec[2], (GLsizei)rec[0], (GLsizei)(rec[1] * (GLuint)mv), rec[3] * (GLuint)mv);
+            } else {
+                glDrawArraysInstanced(gl_draw_mode(), (GLint)rec[2], (GLsizei)rec[0], (GLsizei)(rec[1] * (GLuint)mv));
+            }
+        }
+        glBindBuffer(GL_COPY_READ_BUFFER, 0);
+        glBindVertexArray(0);
+        gl_shadow_end(shadow_units);
+        return;
+    }
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, args->ssbo);
     if (mesh->index_count > 0) {
         GLenum type = mesh->index_bytes == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
@@ -2649,6 +2712,19 @@ static int opengl_read_pixels(unsigned int fbo, int width, int height, void *out
 
 /* Linear scan over the cached extension list. List is small (typically 200-400
  * entries) and queried a handful of times at context setup; not worth a hash. */
+/* vio_feature_info / vio_shader: multiview by instancing without OVR_multiview2. */
+static int opengl_multiview_via_instancing(void)
+{
+    return vio_gl.initialized && !gl_mv_native();
+}
+
+static const char *opengl_feature_emulation(vio_feature f)
+{
+    if (f == VIO_FEATURE_MULTIVIEW && opengl_multiview_via_instancing())
+        return "instancing, one instance per view, gl_Layer from the vertex stage";
+    return NULL;
+}
+
 static int gl_has_ext(const char *name)
 {
     for (int i = 0; i < vio_gl.extension_count; i++) {
@@ -2700,7 +2776,9 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_SHADER_FLOAT16: return vio_gl.caps.has_float16;
         case VIO_FEATURE_BASE_VERTEX:    return vio_gl.caps.has_draw_parameters;
         case VIO_FEATURE_COMPUTE_DERIVATIVES: return vio_gl.caps.has_compute_derivatives;
-        case VIO_FEATURE_MULTIVIEW:      return vio_gl.caps.has_multiview;   /* GL_OVR_multiview2 */
+        /* GL_OVR_multiview2, or views by instancing with gl_Layer from the vertex
+         * stage (OPEN-ITEMS-PLAN A10). */
+        case VIO_FEATURE_MULTIVIEW:      return vio_gl.caps.has_multiview || vio_gl.caps.has_vertex_layer;
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1;
         case VIO_FEATURE_DEBUG_OUTPUT:   return vio_gl.caps.has_debug_output;
         case VIO_FEATURE_DSA:            return vio_gl.caps.has_dsa;
@@ -2756,6 +2834,8 @@ static const vio_backend opengl_backend = {
     .bind_storage_buffer          = opengl_bind_storage_buffer,
     .draw_instanced_from_storage  = opengl_draw_instanced_from_storage,
     .supports_feature  = opengl_supports_feature,
+    .feature_emulation = opengl_feature_emulation,
+    .multiview_via_instancing = opengl_multiview_via_instancing,
     .gpu_frame_time    = opengl_gpu_frame_time,
     .gpu_mark          = opengl_gpu_mark,
     .gpu_marks         = opengl_gpu_marks,
@@ -2892,6 +2972,18 @@ int vio_opengl_setup_context(void)
                                    && (gl_ge(4, 2) || gl_has_ext("GL_ARB_base_instance"));
     vio_gl.caps.has_compute_derivatives = vio_gl.caps.has_compute_shader && gl_has_ext("GL_NV_compute_shader_derivatives");
     vio_gl.caps.has_multiview = gl_ge(3, 2) && gl_has_ext("GL_OVR_multiview2") && glFramebufferTextureMultiviewOVR != NULL;
+    vio_gl.caps.has_vertex_layer = gl_ge(3, 2) && gl_has_ext("GL_ARB_shader_viewport_layer_array");
+    {
+        /* Test knob: run multiview by instancing on a driver with OVR_multiview2. */
+#ifdef _WIN32
+        char ev[8];
+        DWORD n = GetEnvironmentVariableA("VIO_GL_EMULATE_MULTIVIEW", ev, sizeof(ev));
+        vio_gl.caps.multiview_emulate = n > 0 && n < sizeof(ev) && ev[0] == '1';
+#else
+        const char *ev = getenv("VIO_GL_EMULATE_MULTIVIEW");
+        vio_gl.caps.multiview_emulate = ev && ev[0] == '1';
+#endif
+    }
     if (gl_has_ext("GL_KHR_shader_subgroup")) {
         GLint stages = 0, features = 0;
         glGetIntegerv(GL_SUBGROUP_SUPPORTED_STAGES_KHR, &stages);

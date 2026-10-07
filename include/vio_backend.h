@@ -472,6 +472,13 @@ typedef struct _vio_backend {
      * offset (input layout / PSO variant). NULL slot => the backend uses the
      * mesh's own vertex description already (OpenGL VAOs). */
     void (*apply_mesh_layout)(const vio_mesh_layout *layout);
+
+    /* 1 when VIO_FEATURE_MULTIVIEW is reached by instancing that vio_shader
+     * sets up in the GLSL (vio_glsl_multiview_instancing): views x instances
+     * per draw, per-instance data stepping every `views` instances, the view's
+     * layer from the vertex stage. NULL / 0 => native views (or SPIRV-Cross's
+     * own emulation on Metal). */
+    int (*multiview_via_instancing)(void);
 } vio_backend;
 
 /*

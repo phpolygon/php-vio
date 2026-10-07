@@ -30,6 +30,65 @@ static zend_object *vio_shader_create_object(zend_class_entry *ce)
     return &shader->std;
 }
 
+/* Where declarations may start: after the #version / #extension lines that lead
+ * the source (blank and comment-only lines in between are skipped). */
+static size_t vio_glsl_header_end(const char *src)
+{
+    size_t end = 0;
+    const char *p = src;
+    while (*p) {
+        const char *line = p;
+        const char *nl = strchr(p, '\n');
+        const char *next = nl ? nl + 1 : p + strlen(p);
+        while (*line == ' ' || *line == '\t' || *line == '\r') line++;
+        if (strncmp(line, "#version", 8) == 0 || strncmp(line, "#extension", 10) == 0) {
+            end = (size_t)(next - src);
+        } else if (*line != '\n' && *line != '\0' && strncmp(line, "//", 2) != 0) {
+            break;
+        }
+        p = next;
+    }
+    return end;
+}
+
+char *vio_glsl_multiview_instancing(const char *src, int fragment, int views)
+{
+    char head[512], tail[512];
+    if (!src || views < 2) return NULL;
+    if (fragment) {
+        snprintf(head, sizeof(head),
+            "layout(location = 31) flat in int vio_mv_view_in;\n"
+            "#define gl_ViewIndex vio_mv_view_in\n");
+        tail[0] = '\0';
+    } else {
+        snprintf(head, sizeof(head),
+            "#extension GL" "_ARB_shader_viewport_layer_array : require\n"   /* split: audit gate 070 */
+            "layout(location = 31) flat out int vio_mv_view_out;\n"
+            "int vio_mv_view;\nint vio_mv_instance;\n"
+            "#define gl_ViewIndex vio_mv_view\n"
+            "#define gl_InstanceIndex vio_mv_instance\n"
+            "#define main vio_mv_user_main\n");
+        snprintf(tail, sizeof(tail),
+            "\n#undef main\n#undef gl_InstanceIndex\n#undef gl_ViewIndex\n"
+            "void main() {\n"
+            "    vio_mv_view = gl_InstanceIndex %% %d;\n"
+            "    vio_mv_instance = gl_InstanceIndex / %d;\n"
+            "    vio_mv_view_out = vio_mv_view;\n"
+            "    gl_Layer = vio_mv_view;\n"
+            "    vio_mv_user_main();\n"
+            "}\n", views, views);
+    }
+    size_t at = vio_glsl_header_end(src), len = strlen(src);
+    size_t hl = strlen(head), tl = strlen(tail);
+    char *out = (char *)malloc(len + hl + tl + 2);
+    if (!out) return NULL;
+    memcpy(out, src, at);
+    memcpy(out + at, head, hl);
+    memcpy(out + at + hl, src + at, len - at);
+    memcpy(out + len + hl, tail, tl + 1);
+    return out;
+}
+
 static void vio_shader_free_object(zend_object *obj)
 {
     vio_shader_object *shader = vio_shader_from_obj(obj);
@@ -40,6 +99,10 @@ static void vio_shader_free_object(zend_object *obj)
             be->destroy_shader_obj(shader);
         }
     }
+
+    free(shader->mv_src[0]);
+    free(shader->mv_src[1]);
+    shader->mv_src[0] = shader->mv_src[1] = NULL;
 
     if (shader->vert_spirv) {
         free(shader->vert_spirv);
