@@ -370,6 +370,9 @@ static void vkrt_free(vio_vk_rt *x)
         vkrt_kill(VIO_VK_GRAVE_RENDER_PASS, (uint64_t)x->mv_pass[v], NULL);
     }
     vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->all_color_view, NULL);
+    if (x->msaa_face_view) for (int i = 0; i < x->layers; i++) vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->msaa_face_view[i], NULL);
+    free(x->msaa_face_view);
+    vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->msaa_all_view, NULL);
     vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->all_depth_view, NULL);
     vkrt_kill(VIO_VK_GRAVE_RENDER_PASS, (uint64_t)x->pass, NULL);
     vkrt_kill(VIO_VK_GRAVE_RENDER_PASS, (uint64_t)x->pass_nodepth, NULL);
@@ -705,7 +708,9 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
     x->layers  = vio_rt_layer_count(rt);
     int layered = x->layers > 1;
     x->levels  = (x->cube && rt->mip_levels > 1 && !depth_only) ? rt->mip_levels : 1;
-    x->samples = (layered || depth_only) ? 1 : vkrt_supported_samples(rt->samples);
+    /* Cube / array targets multisample too (A24): an MS colour array, the depth
+     * array multisampled, resolve attachments into level 0 of each face. */
+    x->samples = depth_only ? 1 : vkrt_supported_samples(rt->samples);
     rt->samples = x->samples;
     VkFormat df = vio_vk_depth_format();
     int layers = x->layers;
@@ -720,7 +725,7 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
         x->color_view[i] = vkrt_view(x->color_image[i], x->color_format[i], VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
         if (!x->color_view[i]) goto fail;
         if (x->samples > 1) {
-            if (vkrt_image(x->color_format[i], width, height, 1, 1, x->samples,
+            if (vkrt_image(x->color_format[i], width, height, 1, layered ? layers : 1, x->samples,
                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                            0, &x->msaa_image[i], &x->msaa_alloc[i]) != 0) goto fail;
             x->msaa_view[i] = vkrt_view(x->msaa_image[i], x->color_format[i], VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
@@ -734,7 +739,7 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
     if (vkrt_image(df, width, height, x->depth_levels, layers, x->samples,
                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                    (depth_only ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) : 0),
-                   x->cube, &x->depth_image, &x->depth_alloc) != 0) goto fail;
+                   x->cube && x->samples == 1, &x->depth_image, &x->depth_alloc) != 0) goto fail;   /* MS images cannot be cube-compatible */
     /* depth_view: the 2D attachment / sampling view, or for a layered
      * depth_only target the whole-image CUBE / 2D_ARRAY sampling view. */
     x->depth_view = (layered && depth_only)
@@ -749,7 +754,22 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
     x->pass = vkrt_pass(x, 1);
     if (!x->pass) goto fail;
     if (layered) {
-        x->pass_nodepth = vkrt_pass(x, 0);
+        /* Levels > 0 render single-sampled (the MS array has level 0 only). */
+        if (x->samples > 1) {
+            vio_vk_rt one = *x;
+            one.samples = 1;
+            x->pass_nodepth = vkrt_pass(&one, 0);
+            x->msaa_face_view = (VkImageView *)calloc((size_t)layers, sizeof(VkImageView));
+            if (!x->msaa_face_view) goto fail;
+            for (int f = 0; f < layers; f++) {
+                x->msaa_face_view[f] = vkrt_view(x->msaa_image[0], x->color_format[0], VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, (uint32_t)f, 1);
+                if (!x->msaa_face_view[f]) goto fail;
+            }
+            x->msaa_all_view = vkrt_view(x->msaa_image[0], x->color_format[0], VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, (uint32_t)layers);
+            if (!x->msaa_all_view) goto fail;
+        } else {
+            x->pass_nodepth = vkrt_pass(x, 0);
+        }
         int n = layers * x->levels;
         x->face_fb = (VkFramebuffer *)calloc((size_t)n, sizeof(VkFramebuffer));
         x->face_view = (VkImageView *)calloc((size_t)n, sizeof(VkImageView));
@@ -762,14 +782,16 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
                 int idx = f * x->levels + l;
                 uint32_t lw = (uint32_t)(width >> l) > 0 ? (uint32_t)(width >> l) : 1u;
                 uint32_t lh = (uint32_t)(height >> l) > 0 ? (uint32_t)(height >> l) : 1u;
-                VkImageView views[2];
+                VkImageView views[3];
                 uint32_t nv = 0;
                 if (x->count) {
                     x->face_view[idx] = vkrt_view(x->color_image[0], x->color_format[0], VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)l, 1, (uint32_t)f, 1);
                     if (!x->face_view[idx]) goto fail;
-                    views[nv++] = x->face_view[idx];
+                    /* MSAA level 0: MS layer, depth layer, then the face as resolve target. */
+                    views[nv++] = (x->samples > 1 && l == 0) ? x->msaa_face_view[f] : x->face_view[idx];
                 }
                 if (l == 0) views[nv++] = x->depth_face_view[f];
+                if (x->samples > 1 && l == 0 && x->count) views[nv++] = x->face_view[idx];
                 x->face_fb[idx] = vkrt_framebuffer(l == 0 ? x->pass : x->pass_nodepth, views, nv, lw, lh);
                 if (!x->face_fb[idx]) goto fail;
             }
@@ -782,16 +804,17 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
          * layer at level 0 and a framebuffer with layers = N; gl_Layer picks the
          * destination. */
         {
-            VkImageView views[2];
+            VkImageView views[3];
             uint32_t nv = 0;
             if (x->count) {
                 x->all_color_view = vkrt_view(x->color_image[0], x->color_format[0], VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, (uint32_t)layers);
                 if (!x->all_color_view) goto fail;
-                views[nv++] = x->all_color_view;
+                views[nv++] = x->samples > 1 ? x->msaa_all_view : x->all_color_view;
             }
             x->all_depth_view = vkrt_view(x->depth_image, df, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, (uint32_t)layers);
             if (!x->all_depth_view) goto fail;
             views[nv++] = x->all_depth_view;
+            if (x->samples > 1 && x->count) views[nv++] = x->all_color_view;
             x->all_fb = vkrt_framebuffer_layers(x->pass, views, nv, (uint32_t)width, (uint32_t)height, (uint32_t)layers);
             if (!x->all_fb) goto fail;
         }
@@ -836,12 +859,13 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
                                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             }
             for (int i = 0; i < x->count && x->samples > 1; i++) {
-                VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                uint32_t ml = layered ? (uint32_t)layers : 1u;
+                VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, ml };
                 VkClearColorValue cv = {{ 0.0f, 0.0f, 0.0f, 0.0f }};
-                vio_vk_image_barrier_range(cmd, x->msaa_image[i], VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1,
+                vio_vk_image_barrier_range(cmd, x->msaa_image[i], VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, ml,
                                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 vkCmdClearColorImage(cmd, x->msaa_image[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &r);
-                vio_vk_image_barrier_range(cmd, x->msaa_image[i], VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1,
+                vio_vk_image_barrier_range(cmd, x->msaa_image[i], VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, ml,
                                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             }
             {
@@ -930,7 +954,7 @@ static void vkrt_begin(VkCommandBuffer cmd, vio_render_target_object *rt, int fa
     vio_vk.cur_render_pass  = rp.renderPass;
     vio_vk.cur_color_count  = x->count;
     for (int i = 0; i < x->count && i < 4; i++) vio_vk.cur_color_formats[i] = x->color_format[i];
-    vio_vk.cur_samples      = x->samples;
+    vio_vk.cur_samples      = has_depth ? x->samples : 1;   /* layered levels > 0 are single-sampled */
     vio_vk.cur_has_depth    = has_depth;
     vio_vk.cur_width        = w;
     vio_vk.cur_height       = h;

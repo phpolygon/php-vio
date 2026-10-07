@@ -86,6 +86,8 @@ typedef struct _vio_vk_rt {
     VkImage        msaa_image[4];
     void          *msaa_alloc[4];
     VkImageView    msaa_view[4];
+    VkImageView   *msaa_face_view; /* cube / array MSAA (A24): MS colour view per layer */
+    VkImageView    msaa_all_view;  /* ... and over every layer (VIO_RT_ALL_LAYERS) */
     VkImage        depth_image;
     void          *depth_alloc;
     VkImageView    depth_view;
