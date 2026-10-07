@@ -2825,8 +2825,9 @@ ZEND_FUNCTION(vio_shader)
 
             for (int s = 0; s < VIO_STAGE_COUNT; s++) {
                 if (!spv[s]) continue;
-                /* GL_OVR_multiview2 needs the view count in the GLSL (num_views). */
-                vio_glsl_set_ovr_view_count(view_count);
+                /* GL_OVR_multiview2 needs the view count in the GLSL (num_views);
+                 * SPIRV-Cross takes it for the vertex stage only. */
+                vio_glsl_set_ovr_view_count(s == VIO_STAGE_VERTEX ? view_count : 0);
                 glsl[s] = vio_spirv_to_glsl(spv[s], spv_size[s], glsl_version, &error_msg);
                 vio_glsl_set_ovr_view_count(0);
                 if (!glsl[s]) {
