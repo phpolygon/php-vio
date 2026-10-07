@@ -882,6 +882,12 @@ function vio_update_buffer(VioBuffer $buffer, string $data, int $offset = 0): vo
 
 /**
  * Bind a buffer to a binding point.
+ *
+ * A uniform buffer feeds the named uniform block declared at that binding
+ * (`layout(std140, binding = N) uniform Block { ... }`) in every stage of the
+ * bound graphics shader, on every backend; each draw reads the contents as of
+ * that draw, so vio_update_buffer between two draws gives them different
+ * values. Bindings 0..15; the binding defaults to the buffer's 'binding'.
  */
 function vio_bind_buffer(VioContext $context, VioBuffer $buffer, int $binding = -1): void {}
 

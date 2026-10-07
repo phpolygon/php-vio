@@ -1041,6 +1041,18 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
                                           SpvDecorationBinding, (unsigned int)(sampled_count + i));
         }
 
+        /* The first uniform block holds the stage constants (vio_spirv_get_uniform_offsets),
+         * which the D3D backends bind at b0 per stage: keep it there whatever its GLSL
+         * binding, so `layout(binding = 1) uniform Material` works (OPEN-ITEMS-PLAN A32).
+         * Graphics stages only (vertex .. fragment): compute keeps its Params block
+         * where the compute root signature expects it. */
+        if ((int)spvc_compiler_get_execution_model(compiler) <= (int)SpvExecutionModelFragment) {
+            const spvc_reflected_resource *ubos;
+            size_t ubo_count;
+            spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, &ubos, &ubo_count);
+            if (ubo_count > 0) spvc_compiler_set_decoration(compiler, ubos[0].id, SpvDecorationBinding, 0);
+        }
+
         /* Ray query (GL_EXT_ray_query): the acceleration structure moves to its
          * own register space so the D3D12 root SRV (t0, space9) never overlaps the
          * SRV tables of space 0. One structure per shader stage. */
@@ -1216,6 +1228,44 @@ void vio_reflect_free(vio_reflect_result *result)
     memset(result, 0, sizeof(vio_reflect_result));
 }
 
+/* Component type of a uniform member for vio_uniform_entry. */
+static void vio_entry_set_type(spvc_compiler compiler, spvc_type_id type_id, vio_uniform_entry *e)
+{
+    spvc_type t = spvc_compiler_get_type_handle(compiler, type_id);
+    e->base_type = 0; e->vecsize = 0; e->columns = 0;
+    if (!t) return;
+    spvc_basetype bt = spvc_type_get_basetype(t);
+    if (bt == SPVC_BASETYPE_FP32) e->base_type = 1;
+    else if (bt == SPVC_BASETYPE_INT32 || bt == SPVC_BASETYPE_UINT32 || bt == SPVC_BASETYPE_BOOLEAN) e->base_type = 2;
+    e->vecsize = (short)spvc_type_get_vector_size(t);
+    e->columns = (short)spvc_type_get_columns(t);
+}
+
+int vio_spirv_uniform_block_binding(const uint32_t *spirv, size_t spirv_size)
+{
+    spvc_context ctx = NULL;
+    spvc_parsed_ir ir = NULL;
+    spvc_compiler compiler = NULL;
+    spvc_resources resources = NULL;
+    int binding = -1;
+    if (!spirv || spvc_context_create(&ctx) != SPVC_SUCCESS) return -1;
+    if (spvc_context_parse_spirv(ctx, spirv, spirv_size / sizeof(uint32_t), &ir) == SPVC_SUCCESS
+        && spvc_context_create_compiler(ctx, SPVC_BACKEND_NONE, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &compiler) == SPVC_SUCCESS
+        && spvc_compiler_create_shader_resources(compiler, &resources) == SPVC_SUCCESS) {
+        const spvc_reflected_resource *ubos = NULL;
+        size_t ubo_count = 0;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, &ubos, &ubo_count);
+        if (ubo_count > 0) {
+            const char *block = spvc_compiler_get_name(compiler, ubos[0].base_type_id);
+            int loose = (block && strcmp(block, "gl_DefaultUniformBlock") == 0)
+                     || (ubos[0].name && strcmp(ubos[0].name, "gl_DefaultUniformBlock") == 0);
+            if (!loose) binding = (int)spvc_compiler_get_decoration(compiler, ubos[0].id, SpvDecorationBinding);
+        }
+    }
+    spvc_context_destroy(ctx);
+    return binding;
+}
+
 int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
                                    vio_uniform_entry *entries, int max_entries,
                                    int *total_size)
@@ -1323,6 +1373,7 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
                             entries[count].offset = (int)(base_offset + ai * array_stride + field_offset);
                             entries[count].size = (int)field_size;
                             entries[count].stride = 0;
+                            vio_entry_set_type(compiler, spvc_type_get_member_type(elem_type, si), &entries[count]);
                             int end = entries[count].offset + (int)field_size;
                             if (end > *total_size) *total_size = end;
                             count++;
@@ -1336,6 +1387,7 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
                 entries[count].offset = (int)base_offset;
                 entries[count].size = (int)member_size;
                 entries[count].stride = 0;
+                vio_entry_set_type(compiler, member_type_id, &entries[count]);
                 if (num_array_dims > 0) {
                     unsigned int array_stride = 0;
                     spvc_compiler_type_struct_member_array_stride(compiler, type, i, &array_stride);
@@ -1416,6 +1468,12 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
     (void)spirv; (void)spirv_size; (void)entries; (void)max_entries;
     if (total_size) *total_size = 0;
     return 0;
+}
+
+int vio_spirv_uniform_block_binding(const uint32_t *spirv, size_t spirv_size)
+{
+    (void)spirv; (void)spirv_size;
+    return -1;
 }
 
 #endif /* HAVE_SPIRV_CROSS */

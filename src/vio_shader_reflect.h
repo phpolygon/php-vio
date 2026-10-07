@@ -138,4 +138,9 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
                                    vio_uniform_entry *entries, int max_entries,
                                    int *total_size);
 
+/* Binding of the uniform block vio_spirv_get_uniform_offsets reads (the first
+ * one) when it is a named block; -1 for loose uniforms (glslang's default
+ * uniform block), push constants or no block. */
+int vio_spirv_uniform_block_binding(const uint32_t *spirv, size_t spirv_size);
+
 #endif /* VIO_SHADER_REFLECT_H */

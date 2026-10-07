@@ -2422,10 +2422,79 @@ static int vio_bound_shader_is_mesh(vio_context_object *ctx, const char *fn)
     return 1;
 }
 
-/* Hand the mesh's vertex layout to the backend before a draw (OPEN-ITEMS-PLAN A31). */
+/* OpenGL: set the members of a uniform block from the buffer bytes one by one
+ * (the SPIR-V path flattens blocks into plain uniforms). std140 arrays and
+ * mat3 columns are padded to 16 bytes; glUniform* wants them tight. */
+static void vio_gl_block_from_bytes(vio_context_object *ctx, const vio_uniform_entry *ents, int n,
+                                    const unsigned char *src, size_t len)
+{
+    float f[64];
+    for (int k = 0; k < n; k++) {
+        const vio_uniform_entry *e = &ents[k];
+        if (e->offset < 0 || (size_t)(e->offset + e->size) > len || e->size <= 0) continue;
+        int elems = e->stride > 0 ? e->size / e->stride : 1;
+        int step = e->stride > 0 ? e->stride : e->size;
+        const unsigned char *p = src + e->offset;
+        int vec = e->vecsize, cols = e->columns > 0 ? e->columns : 1;
+        int per = vec * cols, type;
+        if (e->base_type == 1 && cols == 1 && vec >= 1 && vec <= 4)
+            type = vec == 1 ? VIO_UNIFORM_FLOAT : vec == 2 ? VIO_UNIFORM_VEC2 : vec == 3 ? VIO_UNIFORM_VEC3 : VIO_UNIFORM_VEC4;
+        else if (e->base_type == 1 && cols == 4 && vec == 4) type = VIO_UNIFORM_MAT4;
+        else if (e->base_type == 1 && cols == 3 && vec == 3) type = VIO_UNIFORM_MAT3;
+        else if (e->base_type == 2 && cols == 1 && vec == 1) type = VIO_UNIFORM_INT;
+        else continue;   /* ivecN / other matrices: not reachable through set_uniform */
+        if (elems * per > 64) elems = 64 / per;
+        for (int a = 0; a < elems; a++)
+            for (int c = 0; c < cols; c++)
+                memcpy(&f[a * per + c * vec], p + (size_t)a * step + (size_t)c * 16, sizeof(float) * (size_t)vec);
+        ctx->backend->set_uniform(e->name, f, elems, type);
+    }
+}
+
+/* One stage: the block at `binding` reads the buffer bound there. */
+static void vio_apply_ubo_stage(vio_context_object *ctx, int binding, const vio_uniform_entry *ents, int n,
+                                unsigned char *cb, int cb_size, int *dirty)
+{
+    if (binding < 0 || binding >= VIO_MAX_UBO_BINDINGS || !ctx->bound_ubo[binding]) return;
+    vio_buffer_object *buf = vio_buffer_from_obj(ctx->bound_ubo[binding]);
+    if (!buf->shadow) return;
+    if (cb) {
+        size_t len = buf->size < (size_t)cb_size ? buf->size : (size_t)cb_size;
+        if (len > VIO_CBUFFER_SIZE) len = VIO_CBUFFER_SIZE;
+        if (len && memcmp(cb, buf->shadow, len) != 0) { memcpy(cb, buf->shadow, len); *dirty = 1; }
+    } else if (ctx->backend->set_uniform) {
+        vio_gl_block_from_bytes(ctx, ents, n, buf->shadow, buf->size);
+    }
+}
+
+/* vio_bind_buffer for graphics shaders (OPEN-ITEMS-PLAN A32): every named uniform
+ * block of the bound shader takes the contents of the uniform buffer bound at its
+ * binding, as of this draw. On the cbuffer backends the block is the stage's
+ * constant buffer; OpenGL sets its members. Runs before the cbuffer push. */
+static void vio_apply_bound_ubos(vio_context_object *ctx)
+{
+    vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+    if (!sh) return;
+    int gl = sh->backend_shader == NULL;
+    vio_apply_ubo_stage(ctx, sh->block_binding, sh->uniforms, sh->uniform_count,
+                        gl ? NULL : sh->cbuffer_data, sh->cbuffer_total_size, &sh->cbuffer_dirty);
+    if (!(gl && sh->frag_block_binding == sh->block_binding))   /* GL: one program, same names */
+        vio_apply_ubo_stage(ctx, sh->frag_block_binding, sh->frag_uniforms, sh->frag_uniform_count,
+                            gl ? NULL : sh->frag_cbuffer_data, sh->frag_cbuffer_total_size, &sh->frag_cbuffer_dirty);
+    if (!gl) {
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            vio_shader_stage_cb *cb = sh->stage_cb[i];
+            if (cb) vio_apply_ubo_stage(ctx, cb->block_binding, cb->uniforms, cb->uniform_count, cb->data, cb->total_size, &cb->dirty);
+        }
+    }
+}
+
+/* Before every mesh draw: the mesh's vertex layout (A31) and the bound uniform
+ * buffers (A32). */
 static void vio_apply_mesh_layout(vio_context_object *ctx, vio_mesh_object *mesh)
 {
     if (ctx->backend->apply_mesh_layout) ctx->backend->apply_mesh_layout(mesh ? &mesh->layout : NULL);
+    vio_apply_bound_ubos(ctx);
 }
 
 static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
@@ -3128,6 +3197,23 @@ ZEND_FUNCTION(vio_shader)
                 vio_shader_merge_stage_samplers(shader, shader->stage_spirv[i], shader->stage_spirv_size[i]);
             }
         }
+    }
+
+    /* Named uniform blocks per stage, fed by vio_bind_buffer (OPEN-ITEMS-PLAN A32).
+     * OpenGL sets their members one by one, so it needs the member table too. */
+    shader->block_binding = shader->vert_spirv ? vio_spirv_uniform_block_binding(shader->vert_spirv, shader->vert_spirv_size) : -1;
+    shader->frag_block_binding = shader->frag_spirv ? vio_spirv_uniform_block_binding(shader->frag_spirv, shader->frag_spirv_size) : -1;
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        if (shader->stage_cb[i] && shader->stage_spirv[i])
+            shader->stage_cb[i]->block_binding = vio_spirv_uniform_block_binding(shader->stage_spirv[i], shader->stage_spirv_size[i]);
+    }
+    if (!shader->backend_shader) {
+        if (shader->vert_spirv && shader->block_binding >= 0)
+            shader->uniform_count = vio_spirv_get_uniform_offsets(shader->vert_spirv, shader->vert_spirv_size,
+                shader->uniforms, VIO_MAX_UNIFORMS, &shader->cbuffer_total_size);
+        if (shader->frag_spirv && shader->frag_block_binding >= 0)
+            shader->frag_uniform_count = vio_spirv_get_uniform_offsets(shader->frag_spirv, shader->frag_spirv_size,
+                shader->frag_uniforms, VIO_MAX_UNIFORMS, &shader->frag_cbuffer_total_size);
     }
 
     shader->valid = 1;
@@ -4382,12 +4468,14 @@ ZEND_FUNCTION(vio_uniform_buffer)
     buf->type    = VIO_BUFFER_UNIFORM;
     buf->size    = size;
     buf->binding = binding;
+    buf->shadow  = size > 0 ? ecalloc(1, size) : NULL;
 
     /* Get optional initial data */
     zval *data_zval = zend_hash_str_find(config_ht, "data", sizeof("data") - 1);
     const void *init_data = NULL;
     if (data_zval && Z_TYPE_P(data_zval) == IS_STRING) {
         init_data = Z_STRVAL_P(data_zval);
+        if (buf->shadow) memcpy(buf->shadow, init_data, Z_STRLEN_P(data_zval) < size ? Z_STRLEN_P(data_zval) : size);
     }
 
     buf->backend = ctx->backend;
@@ -4430,6 +4518,8 @@ ZEND_FUNCTION(vio_update_buffer)
         php_error_docref(NULL, E_WARNING, "Data exceeds buffer size");
         return;
     }
+
+    if (buf->shadow) memcpy(buf->shadow + offset, data, data_len);
 
     /* OpenGL stores its handle in buf->buffer_id and goes through
      * update_uniform_buffer; D3D / Vulkan use the backend handle path. */
@@ -4474,6 +4564,15 @@ ZEND_FUNCTION(vio_bind_buffer)
     }
 
     int bind_point = (binding >= 0) ? (int)binding : buf->binding;
+
+    /* Graphics shaders read the buffer at draw time (vio_apply_bound_ubos). */
+    if (buf->type == VIO_BUFFER_UNIFORM && bind_point >= 0 && bind_point < VIO_MAX_UBO_BINDINGS) {
+        if (ctx->bound_ubo[bind_point] != &buf->std) {
+            GC_ADDREF(&buf->std);
+            if (ctx->bound_ubo[bind_point]) OBJ_RELEASE(ctx->bound_ubo[bind_point]);
+            ctx->bound_ubo[bind_point] = &buf->std;
+        }
+    }
 
     if (ctx->backend->bind_uniform_buffer && buf->buffer_id) {
         ctx->backend->bind_uniform_buffer(buf, bind_point);

@@ -52,6 +52,9 @@ static void vio_context_free_object(zend_object *obj)
 
     /* The table's textures free their GPU objects through the backend: before it shuts down. */
     vio_context_bindless_clear(ctx);
+    for (int i = 0; i < VIO_MAX_UBO_BINDINGS; i++) {
+        if (ctx->bound_ubo[i]) { OBJ_RELEASE(ctx->bound_ubo[i]); ctx->bound_ubo[i] = NULL; }
+    }
 
     /* Backend / surface / window cleanup runs only when the ctx is still
      * initialised — vio_destroy may have already run these, in which case

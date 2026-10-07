@@ -31,6 +31,10 @@ typedef struct _vio_context_object {
     /* Currently bound pipeline shader (0 = use default) */
     unsigned int       bound_shader_program;
     void              *bound_shader_object;  /* vio_shader_object* for uniform cbuffer */
+    /* vio_bind_buffer: uniform buffer per binding point (referenced), read by
+     * the bound shader's uniform blocks at each draw. */
+#define VIO_MAX_UBO_BINDINGS 16
+    zend_object       *bound_ubo[VIO_MAX_UBO_BINDINGS];
     /* Metal: last object bound per GL texture unit. Resolved against the
      * shader bound AT DRAW TIME (vio_flush_pending_textures), so vio_bind_texture
      * may precede vio_set_uniform('u_sampler', unit) and pipeline switches, the

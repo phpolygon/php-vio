@@ -1623,10 +1623,10 @@ static void opengl_set_uniform(const char *name, const void *data, int count, in
         if (l < 0) continue;
         switch (type) {
             case VIO_UNIFORM_INT:
-                glUniform1i(l, *(const GLint *)data);
+                glUniform1iv(l, count > 0 ? count : 1, (const GLint *)data);
                 break;
             case VIO_UNIFORM_FLOAT:
-                glUniform1f(l, *(const GLfloat *)data);
+                glUniform1fv(l, count > 0 ? count : 1, (const GLfloat *)data);
                 break;
             case VIO_UNIFORM_VEC2:
                 glUniform2fv(l, count, (const GLfloat *)data);

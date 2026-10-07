@@ -22,6 +22,12 @@ typedef struct _vio_uniform_entry {
     int     size;      /* size in bytes */
     int     stride;    /* array of scalars / vectors / matrices: element stride in
                           bytes, so "name[i]" resolves to one element; 0 otherwise */
+    /* Component type for vio_bind_buffer on OpenGL, which sets block members
+     * one by one: base_type 1 = float, 2 = int / uint / bool, 0 = other;
+     * vecsize x columns as in GLSL (mat4 = 4 x 4). */
+    short   base_type;
+    short   vecsize;
+    short   columns;
 } vio_uniform_entry;
 
 struct _vio_backend;
@@ -42,6 +48,7 @@ typedef struct _vio_shader_stage_cb {
     int               total_size;
     void             *backend;   /* backend constant buffer (create_buffer) */
     int               dirty;
+    int               block_binding;   /* binding of its named uniform block, -1 = none */
 } vio_shader_stage_cb;
 
 typedef struct _vio_shader_object {
@@ -79,6 +86,11 @@ typedef struct _vio_shader_object {
     int               frag_cbuffer_total_size;
     void             *frag_cbuffer_backend;
     int               frag_cbuffer_dirty;
+    /* Binding of the named uniform block behind each stage's constants, -1
+     * when the stage only has loose uniforms: vio_bind_buffer feeds a block
+     * from the buffer bound at that binding (OPEN-ITEMS-PLAN A32). */
+    int               block_binding;
+    int               frag_block_binding;
     /* Sampler binding map: sampler_names[i] -> hlsl register i */
     char              sampler_names[VIO_MAX_SAMPLERS][64];
     int               sampler_is_depth[VIO_MAX_SAMPLERS]; /* 1 if sampler2DShadow */
