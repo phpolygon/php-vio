@@ -1409,6 +1409,9 @@ static void metal_open_encoder(int load_clear)
         id<MTLTexture> resolve_targets[VIO_MAX_COLOR_ATTACHMENTS] = {nil, nil, nil, nil};
         int n_color = 0;
         NSUInteger cube_slice = 0, cube_level = 0, all_layers = 0;
+        /* A layered target multisamples at level 0 only (A24). */
+        int rt_ms = current_bound_rt && current_bound_rt->samples > 1 &&
+                    !((current_bound_rt->is_cube || current_bound_rt->layers > 1) && current_bound_level > 0);
         if (current_bound_rt) {
             depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_depth_texture;
             target_w = current_bound_rt->width;
@@ -1418,7 +1421,7 @@ static void metal_open_encoder(int load_clear)
                 for (int i = 0; i < n_color; i++) {
                     id<MTLTexture> c = i == 0 ? metal_current_color_texture()
                                               : (__bridge id<MTLTexture>)current_bound_rt->metal_color_textures[i];
-                    if (current_bound_rt->samples > 1) {
+                    if (rt_ms) {
                         /* MSAA: render into the multisample pair, resolve into the
                          * single-sample colour texture at every pass end. */
                         resolve_targets[i] = c;
@@ -1439,7 +1442,7 @@ static void metal_open_encoder(int load_clear)
                 /* The shared depth texture only matches level 0. */
                 if (cube_level > 0) depth_target = nil;
             }
-            if (current_bound_rt->samples > 1) {
+            if (rt_ms) {
                 depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_msaa_depth_texture;
             }
         } else {
@@ -1469,6 +1472,8 @@ static void metal_open_encoder(int load_clear)
             ca.loadAction = load_clear ? MTLLoadActionClear : MTLLoadActionLoad;
             if (resolve_targets[i]) {
                 ca.resolveTexture = resolve_targets[i];
+                ca.resolveSlice = cube_slice;
+                ca.resolveLevel = cube_level;
                 /* Keep the MSAA contents too, so a reopened pass (RT bind /
                  * unbind / eager clear / mid-frame readback) can Load them. */
                 ca.storeAction = MTLStoreActionStoreAndMultisampleResolve;
@@ -1481,7 +1486,8 @@ static void metal_open_encoder(int load_clear)
         if (all_layers > 1) desc.renderTargetArrayLength = all_layers;
         if (depth_target) {
             int depth_layered = depth_target.textureType == MTLTextureTypeCube ||
-                                depth_target.textureType == MTLTextureType2DArray;
+                                depth_target.textureType == MTLTextureType2DArray ||
+                                depth_target.textureType == MTLTextureType2DMultisampleArray;
             desc.depthAttachment.texture = depth_target;
             if (depth_layered) desc.depthAttachment.slice = cube_slice;
             if (depth_target.pixelFormat == VIO_METAL_DEPTH_STENCIL) {
@@ -2233,12 +2239,13 @@ static int metal_vio_format(MTLPixelFormat f, int *bgra)
 static void metal_rt_initial_clear(vio_render_target_object *rt)
 {
     int n_color = rt->depth_only ? 0 : metal_rt_attachment_count(rt);
-    id<MTLTexture> depth = rt->metal_depth_texture ? (__bridge id<MTLTexture>)rt->metal_depth_texture
-                         : (rt->metal_msaa_depth_texture ? (__bridge id<MTLTexture>)rt->metal_msaa_depth_texture : nil);
+    id<MTLTexture> depth = rt->metal_msaa_depth_texture ? (__bridge id<MTLTexture>)rt->metal_msaa_depth_texture
+                         : (rt->metal_depth_texture ? (__bridge id<MTLTexture>)rt->metal_depth_texture : nil);
     if (!rt->metal_color_texture && !depth) return;
     id<MTLCommandBuffer> cb = metal_new_command_buffer();
     int slices = vio_rt_layer_count(rt);
-    int depth_layered = depth && (depth.textureType == MTLTextureTypeCube || depth.textureType == MTLTextureType2DArray);
+    int depth_layered = depth && (depth.textureType == MTLTextureTypeCube || depth.textureType == MTLTextureType2DArray ||
+                                  depth.textureType == MTLTextureType2DMultisampleArray);
     for (int s = 0; s < slices; s++) {
         MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
         for (int i = 0; i < n_color; i++) {
@@ -2251,6 +2258,7 @@ static void metal_rt_initial_clear(vio_render_target_object *rt)
             d.colorAttachments[i].clearColor = MTLClearColorMake(0, 0, 0, 0);
             if (msaa) {
                 d.colorAttachments[i].resolveTexture = color;
+                d.colorAttachments[i].resolveSlice = (NSUInteger)s;
                 d.colorAttachments[i].storeAction = MTLStoreActionStoreAndMultisampleResolve;
             } else {
                 d.colorAttachments[i].storeAction = MTLStoreActionStore;
@@ -2291,6 +2299,36 @@ static int metal_clamp_sample_count(int requested)
     return 1;
 }
 
+/* Cube / array MSAA (A24, blind - macOS CI): a 2DMultisampleArray colour + depth
+ * pair; level-0 passes render into the face's slice and resolve into the same
+ * slice of the cube / array (StoreAndMultisampleResolve), levels > 0 render
+ * single-sampled into the face. */
+static void metal_rt_layered_msaa(vio_render_target_object *rt, MTLPixelFormat fmt, int w, int h)
+{
+    int layers = vio_rt_layer_count(rt);
+    if (rt->samples <= 1) return;
+    MTLTextureDescriptor *cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                    width:(NSUInteger)w height:(NSUInteger)h mipmapped:NO];
+    cd.textureType = MTLTextureType2DMultisampleArray;
+    cd.sampleCount = (NSUInteger)rt->samples;
+    cd.arrayLength = (NSUInteger)layers;
+    cd.usage = MTLTextureUsageRenderTarget;
+    cd.storageMode = MTLStorageModePrivate;
+    MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL
+                                    width:(NSUInteger)w height:(NSUInteger)h mipmapped:NO];
+    dd.textureType = MTLTextureType2DMultisampleArray;
+    dd.sampleCount = (NSUInteger)rt->samples;
+    dd.arrayLength = (NSUInteger)layers;
+    dd.usage = MTLTextureUsageRenderTarget;
+    dd.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> c = [vio_mtl.device newTextureWithDescriptor:cd];
+    id<MTLTexture> d = [vio_mtl.device newTextureWithDescriptor:dd];
+    if (!c || !d) { rt->samples = 1; return; }
+    rt->metal_msaa_color_texture = (void *)CFBridgingRetain(c);
+    rt->metal_msaa_color_textures[0] = rt->metal_msaa_color_texture;
+    rt->metal_msaa_depth_texture = (void *)CFBridgingRetain(d);
+}
+
 static int metal_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
 {
     @autoreleasepool {
@@ -2304,7 +2342,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
          * pair and resolve into the plain textures every pass end
          * (StoreAndMultisampleResolve), so metal_color_texture stays the one
          * thing wrappers / the 2D registry / readback see. */
-        int samples = (depth_only || rt->is_cube) ? 1 : metal_clamp_sample_count(rt->samples);
+        int samples = depth_only ? 1 : metal_clamp_sample_count(rt->samples);
         rt->samples = samples;
 
         int n_color = metal_rt_attachment_count(rt);
@@ -2361,6 +2399,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             if (carr) {
                 rt->metal_color_textures[0] = (void *)CFBridgingRetain(carr);
                 rt->metal_color_texture = rt->metal_color_textures[0];
+                metal_rt_layered_msaa(rt, color_fmt, width, height);
             }
             rt->metal_depth_texture = (void *)CFBridgingRetain(darr);
             rt->backend_type = VIO_RT_BACKEND_METAL;
@@ -2395,6 +2434,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             rt->metal_color_texture = (void *)CFBridgingRetain(cube);
             rt->metal_color_textures[0] = rt->metal_color_texture;
             rt->metal_depth_texture = (void *)CFBridgingRetain(cube_depth);
+            metal_rt_layered_msaa(rt, color_fmt, width, width);
             rt->backend_type = VIO_RT_BACKEND_METAL;
             metal_rt_initial_clear(rt);
             return 0;
@@ -3367,9 +3407,11 @@ static void metal_current_target(vio_metal_target_desc *t)
     t->has_depth = 1;
     if (current_bound_rt) {
         if ((current_bound_rt->is_cube || current_bound_rt->layers > 1) && current_bound_level > 0) t->has_depth = 0;
-        void *dt = current_bound_rt->samples > 1 ? current_bound_rt->metal_msaa_depth_texture : current_bound_rt->metal_depth_texture;
+        int rt_ms = current_bound_rt->samples > 1 && t->has_depth;   /* layered levels > 0: single-sample (A24) */
+        if (current_bound_rt->samples > 1 && !(current_bound_rt->is_cube || current_bound_rt->layers > 1)) rt_ms = 1;
+        void *dt = rt_ms ? current_bound_rt->metal_msaa_depth_texture : current_bound_rt->metal_depth_texture;
         t->has_stencil = t->has_depth && dt && ((__bridge id<MTLTexture>)dt).pixelFormat == VIO_METAL_DEPTH_STENCIL;
-        if (current_bound_rt->samples > 1) t->samples = current_bound_rt->samples;
+        if (rt_ms) t->samples = current_bound_rt->samples;
         if (current_bound_rt->depth_only || !current_bound_rt->metal_color_texture) {
             t->count = 0;
             return;
