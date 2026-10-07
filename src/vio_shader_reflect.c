@@ -203,6 +203,29 @@ static char *vio_glsl_fix_patch_vertices(char *glsl)
     return out;
 }
 
+/* GL_OVR_multiview2: SPIRV-Cross maps gl_ViewIndex to gl_ViewID_OVR but keeps
+ * treating it as the int of GL_EXT_multiview - it casts to uint where it needs
+ * one and assigns it to ints as is, which GL rejects (gl_ViewID_OVR is a uint).
+ * Every use becomes int(gl_ViewID_OVR). Takes ownership of `glsl`. */
+static char *vio_glsl_fix_ovr_view_id(char *glsl)
+{
+    static const char id[] = "gl_ViewID_OVR";
+    if (!glsl || !strstr(glsl, id)) return glsl;
+    size_t count = 0, len = strlen(glsl);
+    for (const char *p = glsl; (p = strstr(p, id)) != NULL; p += sizeof(id) - 1) count++;
+    char *out = (char *)malloc(len + count * 5 + 1);   /* "int(" + ")" per use */
+    if (!out) return glsl;
+    char *w = out;
+    const char *p = glsl;
+    for (const char *m; (m = strstr(p, id)) != NULL; p = m + sizeof(id) - 1) {
+        memcpy(w, p, (size_t)(m - p)); w += m - p;
+        memcpy(w, "int(" "gl_ViewID_OVR)", 18); w += 18;
+    }
+    strcpy(w, p);
+    free(glsl);
+    return out;
+}
+
 static int vio_glsl_ovr_views = 0;
 void vio_glsl_set_ovr_view_count(int views) { vio_glsl_ovr_views = views > 0 ? views : 0; }
 
@@ -257,6 +280,7 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
         fprintf(stderr, "[vio] SPIRV-Cross output (first 500 chars):\n%.500s\n---\n", result);
     }
     output = vio_glsl_fix_patch_vertices(strdup(result));
+    output = vio_glsl_fix_ovr_view_id(output);
     SpvExecutionModel model = spvc_compiler_get_execution_model(compiler);
     if (model == SpvExecutionModelVertex || model == SpvExecutionModelTessellationEvaluation) {
         output = vio_glsl_require_viewport_layer_ext(output);
