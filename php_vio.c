@@ -7000,6 +7000,7 @@ ZEND_FUNCTION(vio_text)
     float cr = 1.0f, cg = 1.0f, cb = 1.0f, ca = 1.0f;
     float z = 0.0f;
     float max_width = 0.0f, line_height = 0.0f;
+    int vertical = 0;
 
     if (opts_ht) {
         zval *val;
@@ -7017,16 +7018,25 @@ ZEND_FUNCTION(vio_text)
         if ((val = zend_hash_str_find(opts_ht, "line_height", sizeof("line_height") - 1)) != NULL) {
             line_height = (float)zval_get_double(val);
         }
+        /* Top-to-bottom columns (A34): (x, y) = top-right corner, '\n' starts
+         * the next column to the left, line_height = column pitch. */
+        if ((val = zend_hash_str_find(opts_ht, "vertical", sizeof("vertical") - 1)) != NULL) {
+            vertical = zend_is_true(val);
+        }
     }
 
 #ifdef HAVE_HARFBUZZ
     if (vio_text_shape_available(font)) {
         vio_text_shape_draw(ctx, font, text, text_len,
                             (float)x, (float)y, z, cr, cg, cb, ca,
-                            max_width, line_height);
+                            max_width, line_height, vertical);
         return;
     }
 #endif
+    if (vertical) {
+        php_error_docref(NULL, E_WARNING, "vio_text: 'vertical' needs text shaping (HarfBuzz, VIO_HAS_SHAPING)");
+        return;
+    }
 
     float fx = (float)x, fy = (float)y;
     float inv_w = 1.0f / (float)font->atlas_w;
@@ -7288,6 +7298,7 @@ ZEND_FUNCTION(vio_text_measure)
     }
 
     float max_width = 0.0f, line_height = 0.0f;
+    int vertical = 0;
     if (opts_ht) {
         zval *val;
         if ((val = zend_hash_str_find(opts_ht, "max_width", sizeof("max_width") - 1)) != NULL) {
@@ -7296,6 +7307,9 @@ ZEND_FUNCTION(vio_text_measure)
         if ((val = zend_hash_str_find(opts_ht, "line_height", sizeof("line_height") - 1)) != NULL) {
             line_height = (float)zval_get_double(val);
         }
+        if ((val = zend_hash_str_find(opts_ht, "vertical", sizeof("vertical") - 1)) != NULL) {
+            vertical = zend_is_true(val);
+        }
     }
 
 #ifdef HAVE_HARFBUZZ
@@ -7303,7 +7317,7 @@ ZEND_FUNCTION(vio_text_measure)
         float w = 0.0f, h = 0.0f;
         int lines = 0;
         vio_text_shape_measure(font, text, text_len, max_width, line_height,
-                               &w, &h, &lines);
+                               &w, &h, &lines, vertical);
         array_init(return_value);
         add_assoc_double(return_value, "width", (double)w);
         add_assoc_double(return_value, "height", (double)h);

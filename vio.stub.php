@@ -706,7 +706,10 @@ function vio_font(VioContext $context, string $path, float $size = 24.0, float $
  * With HarfBuzz shaping enabled (VIO_HAS_SHAPING === 1), '\n' always starts a
  * new line and 'max_width' turns on word wrapping.
  *
- * @param array|null $options ['color' => int, 'z' => float, 'max_width' => float, 'line_height' => float]
+ * @param array|null $options ['color' => int, 'z' => float, 'max_width' => float, 'line_height' => float,
+ *                            'vertical' => bool (HarfBuzz: top-to-bottom columns, upright glyphs with
+ *                            vertical forms; (x, y) = top-right corner, '\n' starts the next column to
+ *                            the left, line_height = column pitch, max_width is ignored)]
  */
 function vio_text(VioContext $context, VioFont $font, string $text, float $x, float $y, ?array $options = null): void {}
 
@@ -723,7 +726,8 @@ function vio_rounded_rect(VioContext $context, float $x, float $y, float $width,
  * Pass the same wrapping options as vio_text() ('max_width', 'line_height') to
  * measure wrapped/multi-line text. 'lines' is only meaningful with shaping.
  *
- * @param array|null $options ['max_width' => float, 'line_height' => float]
+ * @param array|null $options ['max_width' => float, 'line_height' => float, 'vertical' => bool
+ *                            (width = columns x line height, height = longest column, lines = columns)]
  * @return array{width: float, height: float, lines: int}|false
  */
 function vio_text_measure(VioFont $font, string $text, ?array $options = null): array|false {}

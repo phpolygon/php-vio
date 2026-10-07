@@ -508,16 +508,16 @@ typedef struct {
     float cr, cg, cb, ca;
 } vio_draw_ctx;
 
-static void draw_emit(void *user, unsigned int gid, float pen_x, float y_off)
+/* One glyph whose horizontal origin (pen on the baseline) lies at the logical
+ * point (ox, oy). */
+static void draw_glyph_at(vio_draw_ctx *d, unsigned int gid, float ox, float oy)
 {
-    vio_draw_ctx *d = (vio_draw_ctx *)user;
     const vio_glyph_slot *s = shape_slot_raster(d->atlas, gid, d->atlas->shadow);
     if (!s || s->state != VIO_GLYPH_READY || s->w == 0 || s->h == 0) return; /* blank / dropped */
 
-    /* Baseline convention matches the legacy path: y is the baseline, glyph
-     * top = baseline + bearing_y. HarfBuzz y_offset is y-up, so it subtracts. */
-    float px = d->pen_x + (pen_x + s->bearing_x) * d->inv_rs;
-    float py = d->baseline_y + (s->bearing_y - y_off) * d->inv_rs;
+    /* Glyph top = baseline + bearing_y (y-down), as on the legacy path. */
+    float px = ox + s->bearing_x * d->inv_rs;
+    float py = oy + s->bearing_y * d->inv_rs;
     float pw = s->w * d->inv_rs;
     float ph = s->h * d->inv_rs;
 
@@ -550,6 +550,72 @@ static void draw_emit(void *user, unsigned int gid, float pen_x, float y_off)
                                d->font->atlas_texture, d->font->atlas_backend_texture,
                                start, 6, &d->font->std);
     }
+}
+
+static void draw_emit(void *user, unsigned int gid, float pen_x, float y_off)
+{
+    vio_draw_ctx *d = (vio_draw_ctx *)user;
+    /* HarfBuzz y_offset is y-up, so it subtracts from the y-down baseline. */
+    draw_glyph_at(d, gid, d->pen_x + pen_x * d->inv_rs, d->baseline_y - y_off * d->inv_rs);
+}
+
+/* ── Vertical text (A34) ─────────────────────────────────────────────
+ *
+ * One column, top to bottom: HarfBuzz shapes it with HB_DIRECTION_TTB (vertical
+ * alternates via 'vert'/'vrt2', vertical advances from vmtx or synthesized),
+ * glyphs stay upright. HarfBuzz already folds each glyph's vertical origin into
+ * x_offset / y_offset, so they place the horizontal origin the atlas metrics
+ * use. With d == NULL it only measures. Returns the
+ * column length in physical px. */
+static float shape_column(vio_draw_ctx *d, hb_font_t *hbf, const char *text, size_t n,
+                          float center_x, float top_y, float *max_x_extent)
+{
+    if (n == 0) return 0.0f;
+    hb_buffer_t *buf = hb_buffer_create();
+    hb_buffer_add_utf8(buf, text, (int)n, 0, (int)n);
+    hb_buffer_guess_segment_properties(buf);
+    hb_buffer_set_direction(buf, HB_DIRECTION_TTB);
+    hb_shape(hbf, buf, NULL, 0);
+    unsigned int count = 0;
+    hb_glyph_info_t     *info = hb_buffer_get_glyph_infos(buf, &count);
+    hb_glyph_position_t *pos  = hb_buffer_get_glyph_positions(buf, &count);
+    float pen = 0.0f;   /* y-up, runs negative */
+    for (unsigned int i = 0; i < count; i++) {
+        float hx = pos[i].x_offset / 64.0f;
+        float hy = pen + pos[i].y_offset / 64.0f;
+        if (max_x_extent && -hx > *max_x_extent) *max_x_extent = -hx;
+        if (d) draw_glyph_at(d, info[i].codepoint, center_x + hx * d->inv_rs, top_y - hy * d->inv_rs);
+        pen += pos[i].y_advance / 64.0f;
+    }
+    hb_buffer_destroy(buf);
+    return -pen;
+}
+
+/* Columns split at '\n'; calls cb(user, text, n, index) per column. */
+static int vertical_columns(const char *text, size_t len, void (*cb)(void *, const char *, size_t, int), void *user)
+{
+    int index = 0;
+    size_t start = 0;
+    for (size_t i = 0; i <= len; i++) {
+        if (i == len || text[i] == '\n') {
+            size_t n = i - start;
+            if (n && text[start + n - 1] == '\r') n--;
+            cb(user, text + start, n, index++);
+            start = i + 1;
+        }
+    }
+    return index;
+}
+
+typedef struct { vio_draw_ctx *d; hb_font_t *hbf; float right, top, step, longest; } vio_column_ctx;
+
+static void column_cb(void *user, const char *text, size_t n, int index)
+{
+    vio_column_ctx *c = (vio_column_ctx *)user;
+    /* Columns run right to left; (right, top) is the block's top-right corner. */
+    float center = c->right - c->step * ((float)index + 0.5f);
+    float len = shape_column(c->d, c->hbf, text, n, center, c->top, NULL);
+    if (len > c->longest) c->longest = len;
 }
 
 /* Shape one already-broken line (sub-buffer [text, text+n)) and emit its glyphs
@@ -597,7 +663,7 @@ void vio_text_shape_draw(vio_context_object *ctx, vio_font_object *font,
                          const char *text, size_t len,
                          float x, float y, float z,
                          float cr, float cg, float cb, float ca,
-                         float max_width, float line_height)
+                         float max_width, float line_height, int vertical)
 {
     vio_shape_atlas *a = (vio_shape_atlas *)font->shape_atlas;
     if (!a || len == 0) return;
@@ -615,6 +681,13 @@ void vio_text_shape_draw(vio_context_object *ctx, vio_font_object *font,
     float max_w_phys = (max_width > 0.0f) ? max_width * rs : 0.0f;
     float step = (line_height > 0.0f) ? line_height : (a->line_height * d.inv_rs);
 
+    if (vertical) {
+        vio_column_ctx vc;
+        vc.d = &d; vc.hbf = hbf; vc.right = x; vc.top = y; vc.step = step; vc.longest = 0.0f;
+        vertical_columns(text, len, column_cb, &vc);
+        shape_atlas_flush(font, a);
+        return;
+    }
     vio_draw_lines_ctx c;
     c.d = &d; c.hbf = hbf; c.x = x; c.y0 = y; c.step = step;
     break_lines(hbf, text, len, max_w_phys, draw_line_cb, &c);
@@ -669,7 +742,7 @@ static void measure_line_cb(void *user, const char *text, size_t off, size_t n, 
 void vio_text_shape_measure(vio_font_object *font,
                             const char *text, size_t len,
                             float max_width, float line_height,
-                            float *out_width, float *out_height, int *out_lines)
+                            float *out_width, float *out_height, int *out_lines, int vertical)
 {
     *out_width = 0.0f; *out_height = 0.0f;
     if (out_lines) *out_lines = 0;
@@ -681,6 +754,17 @@ void vio_text_shape_measure(vio_font_object *font,
     float inv_rs = 1.0f / rs;
     float max_w_phys = (max_width > 0.0f) ? max_width * rs : 0.0f;
 
+    if (vertical) {
+        /* Columns of `step` width; height = the longest column. */
+        float vstep = (line_height > 0.0f) ? line_height : (a->line_height * inv_rs);
+        vio_column_ctx vc;
+        vc.d = NULL; vc.hbf = hbf; vc.right = 0.0f; vc.top = 0.0f; vc.step = vstep; vc.longest = 0.0f;
+        int cols = vertical_columns(text, len, column_cb, &vc);
+        *out_width = (float)cols * vstep;
+        *out_height = vc.longest * inv_rs;
+        if (out_lines) *out_lines = cols;
+        return;
+    }
     vio_measure_lines_ctx c;
     c.atlas = a; c.hbf = hbf; c.text = text; c.len = len; c.inv_rs = inv_rs;
     c.max_line_w = 0.0f; c.min_y = 0.0f; c.max_y = 0.0f;
