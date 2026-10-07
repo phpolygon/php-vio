@@ -1193,6 +1193,8 @@ static void opengl_destroy_render_target(void *rt_ptr)
         rt->gl_msaa_fbo = 0;
     }
     if (rt->gl_msaa_color_rb) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_color_rb); rt->gl_msaa_color_rb = 0; }
+    for (int i = 1; i < 4; i++)
+        if (rt->gl_msaa_color_rbs[i]) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_color_rbs[i]); rt->gl_msaa_color_rbs[i] = 0; }
     if (rt->gl_msaa_depth_rb) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_depth_rb); rt->gl_msaa_depth_rb = 0; }
     if (rt->fbo) {
         if (live) glDeleteFramebuffers(1, &rt->fbo);
@@ -1423,13 +1425,14 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
         return -1;
     }
 
-    /* MSAA (single colour attachment only): a second FBO with multisample
+    /* MSAA (every colour attachment, A24): a second FBO with multisample
      * renderbuffers is what gets drawn into; unbind / readback resolve it into
      * the texture FBO above with glBlitFramebuffer. Before GAP-PLAN Phase 3
      * rt->samples was ignored here while VIO_FEATURE_RENDER_TARGET_MSAA
      * reported 1. */
     rt->samples = rt->samples > 1 ? rt->samples : 1;
-    if (rt->samples > 1 && !depth_only && (rt->attachment_count <= 1)) {
+    if (rt->samples > 1 && !depth_only) {
+        int n_att = rt->attachment_count > 0 ? rt->attachment_count : 1;
         GLint max_samples = 1;
         glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
         int samples = rt->samples > 8 ? 8 : rt->samples;
@@ -1440,6 +1443,7 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
                                 &internal, &base, &type);
             glGenFramebuffers(1, &rt->gl_msaa_fbo);
             glGenRenderbuffers(1, &rt->gl_msaa_color_rb);
+            for (int i = 1; i < n_att; i++) glGenRenderbuffers(1, &rt->gl_msaa_color_rbs[i]);
             glGenRenderbuffers(1, &rt->gl_msaa_depth_rb);
             glBindRenderbuffer(GL_RENDERBUFFER, rt->gl_msaa_color_rb);
             glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, internal, width, height);
@@ -1448,6 +1452,17 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
             glBindRenderbuffer(GL_RENDERBUFFER, 0);
             glBindFramebuffer(GL_FRAMEBUFFER, rt->gl_msaa_fbo);
             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rt->gl_msaa_color_rb);
+            GLenum ms_bufs[VIO_MAX_COLOR_ATTACHMENTS] = { GL_COLOR_ATTACHMENT0 };
+            for (int i = 1; i < n_att; i++) {
+                GLint ai; GLenum ab, at;
+                opengl_color_format(rt->formats[i], &ai, &ab, &at);
+                glBindRenderbuffer(GL_RENDERBUFFER, rt->gl_msaa_color_rbs[i]);
+                glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, ai, width, height);
+                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + (GLenum)i, GL_RENDERBUFFER, rt->gl_msaa_color_rbs[i]);
+                ms_bufs[i] = GL_COLOR_ATTACHMENT0 + (GLenum)i;
+            }
+            glBindRenderbuffer(GL_RENDERBUFFER, 0);
+            glDrawBuffers(n_att, ms_bufs);
             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rt->gl_msaa_depth_rb);
             GLenum ms_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
             if (ms_status == GL_FRAMEBUFFER_COMPLETE) {
@@ -1462,6 +1477,7 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
             glDeleteFramebuffers(1, &rt->gl_msaa_fbo);
             glDeleteRenderbuffers(1, &rt->gl_msaa_color_rb);
             glDeleteRenderbuffers(1, &rt->gl_msaa_depth_rb);
+            for (int i = 1; i < n_att; i++) { glDeleteRenderbuffers(1, &rt->gl_msaa_color_rbs[i]); rt->gl_msaa_color_rbs[i] = 0; }
             rt->gl_msaa_fbo = rt->gl_msaa_color_rb = rt->gl_msaa_depth_rb = 0;
             samples >>= 1;
         }
@@ -1483,8 +1499,19 @@ static void opengl_rt_resolve_msaa(vio_render_target_object *rt)
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->gl_msaa_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rt->fbo);
-    glBlitFramebuffer(0, 0, rt->width, rt->height, 0, 0, rt->width, rt->height,
-                      GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    /* One blit per attachment (read / draw buffer i), depth with the first. */
+    int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+    GLenum all[VIO_MAX_COLOR_ATTACHMENTS];
+    for (int i = 0; i < n; i++) {
+        GLenum buf = GL_COLOR_ATTACHMENT0 + (GLenum)i;
+        all[i] = buf;
+        glReadBuffer(buf);
+        glDrawBuffers(1, &buf);
+        glBlitFramebuffer(0, 0, rt->width, rt->height, 0, 0, rt->width, rt->height,
+                          GL_COLOR_BUFFER_BIT | (i == 0 ? GL_DEPTH_BUFFER_BIT : 0), GL_NEAREST);
+    }
+    glDrawBuffers(n, all);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw);
     rt->gl_msaa_dirty = 0;

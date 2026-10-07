@@ -1429,6 +1429,9 @@ static void d3d11_destroy_render_target(void *rt_ptr)
         ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_color_tex);
         rt->d3d11_msaa_color_tex = NULL;
     }
+    for (int i = 1; i < 4; i++) {
+        if (rt->d3d11_msaa_color_texs[i]) { ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_color_texs[i]); rt->d3d11_msaa_color_texs[i] = NULL; }
+    }
     if (rt->d3d11_msaa_depth_tex) {
         ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_depth_tex);
         rt->d3d11_msaa_depth_tex = NULL;
@@ -1467,10 +1470,15 @@ static void d3d11_rt_unbind_srvs(void)
 static void d3d11_rt_resolve_msaa(vio_render_target_object *rt)
 {
     if (!rt->d3d11_msaa_color_tex || !rt->d3d11_color_tex || !rt->d3d11_msaa_dirty) return;
-    ID3D11DeviceContext_ResolveSubresource(vio_d3d11.context,
-        (ID3D11Resource *)rt->d3d11_color_tex, 0,
-        (ID3D11Resource *)rt->d3d11_msaa_color_tex, 0,
-        vio_pixel_format_to_dxgi(rt->formats[0]));
+    /* Every attachment (A24: MRT targets are multisampled per attachment). */
+    int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+    for (int i = 0; i < n && i < 4; i++) {
+        void *ms = i == 0 ? rt->d3d11_msaa_color_tex : rt->d3d11_msaa_color_texs[i];
+        if (!ms || !rt->d3d11_color_texs[i]) continue;
+        ID3D11DeviceContext_ResolveSubresource(vio_d3d11.context,
+            (ID3D11Resource *)rt->d3d11_color_texs[i], 0, (ID3D11Resource *)ms, 0,
+            vio_pixel_format_to_dxgi(rt->formats[i]));
+    }
     rt->d3d11_msaa_dirty = 0;
 }
 
@@ -1478,6 +1486,9 @@ static void d3d11_rt_resolve_msaa(vio_render_target_object *rt)
  * targets bind face 0 / level 0 (vio_bind_render_target without a face). */
 static void d3d11_apply_render_target_bind(vio_render_target_object *rt)
 {
+    /* Bind-to-bind chains never see an unbind: resolve the target being left. */
+    if (vio_d3d11.current_bound_rt && vio_d3d11.current_bound_rt != rt)
+        d3d11_rt_resolve_msaa((vio_render_target_object *)vio_d3d11.current_bound_rt);
     ID3D11DepthStencilView *dsv = (ID3D11DepthStencilView *)rt->d3d11_dsv;
     d3d11_rt_unbind_srvs();
 
@@ -1832,7 +1843,9 @@ static int d3d11_create_render_target(void *rt_ptr, int width, int height, int h
             rt->d3d11_color_texs[ai] = color_tex;
 
             ID3D11Resource *rtv_res = (ID3D11Resource *)color_tex;
-            if (samples > 1 && ai == 0) {
+            /* Every attachment multisampled with the depth (A24; before, only
+             * attachment 0 was, and the mismatched MRT bind drew nothing). */
+            if (samples > 1) {
                 D3D11_TEXTURE2D_DESC ms = color_desc;
                 ms.SampleDesc.Count = samples;
                 ms.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -1842,7 +1855,8 @@ static int d3d11_create_render_target(void *rt_ptr, int width, int height, int h
                     php_error_docref(NULL, E_WARNING, "D3D11: Failed to create MSAA colour texture (0x%08lx)", hr);
                     return -1;
                 }
-                rt->d3d11_msaa_color_tex = ms_tex;
+                if (ai == 0) rt->d3d11_msaa_color_tex = ms_tex;
+                else rt->d3d11_msaa_color_texs[ai] = ms_tex;
                 rtv_res = (ID3D11Resource *)ms_tex;
             }
 
