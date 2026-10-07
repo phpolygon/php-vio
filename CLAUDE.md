@@ -94,6 +94,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/backends/168` | D3D12 mit `vio.debug=1`: eine direkt nach `vio_end` freigegebene Pipeline wird erst nach dem Fence ihres Frames freigegeben; vorher beendete der Debug-Layer den Prozess (PSO gelöscht, während die GPU ihn noch nutzt). Ohne installierten Debug-Layer läuft der Test einfach mit. (149–167 sind vom Feature-Stack #50–#65 belegt.) |
 | `tests/render3d/148` | Tessellation `point_mode` (Dreieck/Quad) erzeugt jeden Domain-Punkt genau einmal (Punktzahl nach GL-Regel, additives Blending deckt Duplikate auf), Isolines mit `fractional_odd_spacing`; auf Metal emuliert (siehe „Metal-3D-Pipeline"). |
 | `tests/render3d/147` | Stencil in Array-Layer, Cube-Face und depth_only-Target (Schema von 113); vorher hatte Metal dort keine Stencil-Plane. |
 | `tests/render3d/146` | `vio_set_uniform("name[i]", …)` setzt ein Element eines Arrays von Matrizen/Vektoren (`uniform mat4 u_m[3]`, `uniform vec4 u_col[2]`) auf jedem Backend. Vorher fanden D3D11/D3D12/Vulkan/Metal das Element nicht (Befund aus Code Rescue). |
