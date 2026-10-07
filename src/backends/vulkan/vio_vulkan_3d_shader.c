@@ -399,6 +399,7 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     spvc_context_destroy(ctx);
     if (!src) return NULL;
     if (stage_id == VIO_STAGE_VERTEX || stage_id == VIO_STAGE_TESS_EVAL) src = vio_glsl_require_viewport_layer_ext(src);
+    if (stage_id == VIO_STAGE_FRAGMENT) src = vio_glsl_require_mesh_shader_ext(src);
     if (getenv("VIO_DUMP_VK_GLSL")) {
         fprintf(stderr, "==== Vulkan %s GLSL ====\n%s\n==== end ====\n", stage_name, src);
         fflush(stderr);

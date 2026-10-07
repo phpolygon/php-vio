@@ -1288,6 +1288,10 @@ Aufrufer geändert hat:
   liefert exakt Dichte × (Detail + 1) Punkte), gewöhnliche Linien auch. Auf Hardware (RTX 2080) zeichnen
   generiertes und handgeschriebenes HLSL korrekt und stabil. Test 144 prüft Isolines auf D3D deshalb nur über
   einen Fenster-Kontext auf D3D11 und D3D12 mit echtem Adapter (`vio_gpu_info()` ≠ „Microsoft Basic Render Driver“).
+- **Ray Query auf lavapipe/aarch64**: Mesa 25.2 (Ubuntu 24.04, CI-Runner `ubuntu-24.04-arm`) stürzt im JIT-kompilierten
+  BVH-Bau ab (Store über eine Adresse außerhalb des Puffers beim ersten `vkCmdBuildAccelerationStructuresKHR`); derselbe
+  Code läuft auf x86_64 mit derselben Mesa-Version. vio meldet dort `VIO_FEATURE_RAY_QUERY = 0`
+  (`VIO_VK_FORCE_RAY_QUERY=1` schaltet es zum Prüfen neuerer Mesa-Stände wieder ein); die Linux-CI verlangt Ray Query nur auf x86_64.
 - **Tessellations-Domain-Ursprung**: Vulkan setzt `VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT` (vorher oben links →
   umgekehrte Winding, GL-korrekte Patches verschwanden bei Backface-Culling). Metal nutzte die MSL-Option
   `tess_domain_origin_lower_left` plus Winding-Umkehr: das legte `outer[1]`/`outer[3]` von Quads auf die
