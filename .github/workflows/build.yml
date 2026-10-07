@@ -118,7 +118,7 @@ jobs:
               $i["features"]["float16"], $i["features"]["draw_parameters"], $i["features"]["compute_derivatives"],
               $i["features"]["atomic64"], $i["features"]["barycentrics"], $i["features"]["multiview"]);'
           # What lavapipe offers for the feature tests below.
-          vulkaninfo 2>/dev/null | grep -E "multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads" | sort -u || true
+          vulkaninfo 2>/dev/null | grep -E "FragmentShadingRate|fragment_shading_rate|NonTrivialCombinerOps|multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads" | sort -u || true
           # Barycentrics stay optional here: lavapipe (Mesa, Vulkan 1.4.318) has no
           # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
           export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_ATOMIC64=vulkan
@@ -250,7 +250,7 @@ jobs:
               $i["features"]["float16"], $i["features"]["draw_parameters"], $i["features"]["compute_derivatives"],
               $i["features"]["atomic64"], $i["features"]["barycentrics"], $i["features"]["multiview"]);'
           # What lavapipe offers for the feature tests below.
-          vulkaninfo 2>/dev/null | grep -E "multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads" | sort -u || true
+          vulkaninfo 2>/dev/null | grep -E "FragmentShadingRate|fragment_shading_rate|NonTrivialCombinerOps|multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads" | sort -u || true
           # Barycentrics stay optional here: lavapipe (Mesa, Vulkan 1.4.318) has no
           # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
           export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_ATOMIC64=vulkan
