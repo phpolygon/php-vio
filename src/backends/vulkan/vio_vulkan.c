@@ -1216,6 +1216,21 @@ static int vulkan_enumerate_adapters(vio_adapter_info *out, int max)
     return n;
 }
 
+/* Glyph atlas filled on demand (A33): the atlas is an R8 texture from
+ * create_texture (single_channel); the sub-region upload is update_texture's. */
+static int vulkan_update_font_atlas(void *font_obj, const unsigned char *r8, int x, int y, int w, int h)
+{
+    vio_font_object *font = (vio_font_object *)font_obj;
+    vio_texture_object shim;
+    if (!font || !font->atlas_backend_texture || !r8) return -1;
+    memset(&shim, 0, sizeof(shim));
+    shim.backend_texture = font->atlas_backend_texture;
+    shim.channels = 1;
+    shim.width = font->atlas_w;
+    shim.height = font->atlas_h;
+    return vulkan_update_texture(&shim, r8, x, y, w, h);
+}
+
 static void vulkan_swapchain_info(vio_swapchain_info *out)
 {
     out->buffer_count  = (int)vio_vk.swapchain_image_count;
@@ -4977,6 +4992,7 @@ static const vio_backend vulkan_backend = {
     .destroy_texture_obj = vulkan_destroy_texture_obj,
     .destroy_buffer_obj  = vulkan_destroy_buffer_obj,
     .destroy_font_atlas  = vulkan_destroy_font_atlas,
+    .update_font_atlas   = vulkan_update_font_atlas,
     /* Offscreen render targets (Phase 3). create_render_target is invoked
      * directly from the HAVE_VULKAN branch of ZEND_FUNCTION(vio_render_target)
      * (the create dispatch gates the vtable call by backend name, like d3d12);

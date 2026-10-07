@@ -31,6 +31,7 @@
 #include "../vio_d3d_shader_check.h"
 #include "../../vio_shader_cache.h"
 #include "../../vio_texture.h"
+#include "../../vio_font.h"
 #include "../../vio_texfmt.h"
 #include "../../vio_shader_reflect.h"
 #include "../../vio_shader_compiler.h"  /* vio_compile_glsl_stage_to_spirv — geometry / tessellation stages */
@@ -1185,6 +1186,21 @@ static int d3d11_update_texture(void *tex_obj, const void *pixels, int x, int y,
     ID3D11DeviceContext_UpdateSubresource(vio_d3d11.context, (ID3D11Resource *)dt->texture, 0, &box,
                                           pixels, (UINT)w * bpp, 0);
     return 0;
+}
+
+/* Glyph atlas filled on demand (A33): the atlas is an R8 texture from
+ * create_texture (single_channel); the sub-region upload is update_texture's. */
+static int d3d11_update_font_atlas(void *font_obj, const unsigned char *r8, int x, int y, int w, int h)
+{
+    vio_font_object *font = (vio_font_object *)font_obj;
+    vio_texture_object shim;
+    if (!font || !font->atlas_backend_texture || !r8) return -1;
+    memset(&shim, 0, sizeof(shim));
+    shim.backend_texture = font->atlas_backend_texture;
+    shim.channels = 1;
+    shim.width = font->atlas_w;
+    shim.height = font->atlas_h;
+    return d3d11_update_texture(&shim, r8, x, y, w, h);
 }
 
 static void *d3d11_create_texture_3d(vio_texture_desc *desc)
@@ -3754,6 +3770,7 @@ static const vio_backend d3d11_backend = {
     .draw_indirect     = d3d11_draw_indirect,
     .destroy_cubemap   = d3d11_destroy_cubemap,
     .destroy_font_atlas = d3d11_destroy_font_atlas,
+    .update_font_atlas  = d3d11_update_font_atlas,
     .destroy_render_target = d3d11_destroy_render_target,
     .update_texture    = d3d11_update_texture,
     /* Render-target lifecycle (GAP-PLAN Phase 2 — previously inline in php_vio.c). */

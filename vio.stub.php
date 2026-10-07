@@ -739,6 +739,15 @@ function vio_text_measure(VioFont $font, string $text, ?array $options = null): 
 function vio_font_has_glyph(VioFont $font, int $codepoint): bool {}
 
 /**
+ * Glyph atlas of a font: ['glyphs' => int (glyphs in the face; legacy path: packed
+ * codepoints), 'rasterized' => int (glyphs in the atlas so far), 'atlas_size' =>
+ * int (side in px), 'lazy' => bool]. With HarfBuzz the atlas fills on demand on
+ * every backend: vio_text rasterizes new glyphs and uploads only the rectangle
+ * they dirtied; vio_text_measure rasterizes nothing. False for an invalid font.
+ */
+function vio_font_info(VioFont $font): array|false {}
+
+/**
  * Load a font file as a VioFontFace for vio_text_bitmap().
  *
  * Unlike vio_font() it builds no glyph atlas and needs no context, so it is cheap

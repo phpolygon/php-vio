@@ -7285,6 +7285,26 @@ ZEND_FUNCTION(vio_text_measure)
  * Reliable coverage detection for fallback-chain routing: unlike advance width
  * (a font's .notdef box can measure non-zero), this reports actual glyph
  * presence, so callers never let a primary font claim an uncovered codepoint. */
+/* vio_font_info(VioFont): ['glyphs', 'rasterized', 'atlas_size', 'lazy'] (A33). */
+ZEND_FUNCTION(vio_font_info)
+{
+    zval *font_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(font_zval, vio_font_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_font_object *font = Z_VIO_FONT_P(font_zval);
+    if (!font->valid) RETURN_FALSE;
+    int glyphs = (int)zend_hash_num_elements(&font->glyph_map), rasterized = glyphs, side = font->atlas_w, lazy = 0;
+#ifdef HAVE_HARFBUZZ
+    if (vio_text_shape_available(font)) vio_text_shape_stats(font, &glyphs, &rasterized, &side, &lazy);
+#endif
+    array_init(return_value);
+    add_assoc_long(return_value, "glyphs", glyphs);
+    add_assoc_long(return_value, "rasterized", rasterized);
+    add_assoc_long(return_value, "atlas_size", side);
+    add_assoc_bool(return_value, "lazy", lazy);
+}
+
 ZEND_FUNCTION(vio_font_has_glyph)
 {
     zval *font_zval;

@@ -87,6 +87,10 @@ void vio_text_shape_measure(vio_font_object *font,
  * emalloc'd array in *out the caller efree()s; 0 when resolution fails. */
 int  vio_text_bidi_spans(const char *text, size_t len, vio_text_bidi_span **out);
 
+/* vio_font_info: glyph count, glyphs in the atlas so far, atlas side, and
+ * whether the atlas fills on demand (A33). */
+void vio_text_shape_stats(const vio_font_object *font, int *glyphs, int *rasterized, int *side, int *lazy);
+
 #endif /* HAVE_HARFBUZZ */
 
 #endif /* VIO_TEXT_SHAPE_H */

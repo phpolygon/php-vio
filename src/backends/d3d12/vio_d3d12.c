@@ -55,6 +55,7 @@ static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, cons
 static int d3d12_hlsl_target(void);
 static const char *d3d12_profile(const char *profile, char *buf, size_t n);
 #include "../../vio_texture.h"          /* vio_texture_object — storage-image binds */
+#include "../../vio_font.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -5237,6 +5238,21 @@ static int d3d12_update_texture(void *tex_obj, const void *pixels, int x, int y,
                                      (UINT)x, (UINT)y, 0);
 }
 
+/* Glyph atlas filled on demand (A33): the atlas is an R8 texture from
+ * create_texture (single_channel); the sub-region upload is update_texture's. */
+static int d3d12_update_font_atlas(void *font_obj, const unsigned char *r8, int x, int y, int w, int h)
+{
+    vio_font_object *font = (vio_font_object *)font_obj;
+    vio_texture_object shim;
+    if (!font || !font->atlas_backend_texture || !r8) return -1;
+    memset(&shim, 0, sizeof(shim));
+    shim.backend_texture = font->atlas_backend_texture;
+    shim.channels = 1;
+    shim.width = font->atlas_w;
+    shim.height = font->atlas_h;
+    return d3d12_update_texture(&shim, r8, x, y, w, h);
+}
+
 /* ── Shaders ──────────────────────────────────────────────────────── */
 
 /* HLSL target of the SPIRV-Cross transpile: the compile profile, so wave
@@ -8645,6 +8661,7 @@ static const vio_backend d3d12_backend = {
     .upload_cubemap    = d3d12_upload_cubemap,
     .read_render_target = d3d12_read_render_target,
     .destroy_font_atlas = d3d12_destroy_font_atlas,
+    .update_font_atlas  = d3d12_update_font_atlas,
     .destroy_render_target = d3d12_destroy_render_target,
     /* Render-target lifecycle (GAP-PLAN Phase 2 — previously inline in php_vio.c). */
     .create_render_target    = d3d12_create_render_target,

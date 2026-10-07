@@ -1826,6 +1826,19 @@ static int opengl_upload_font_atlas(void *font_obj, int width, int height,
     return 0;
 }
 
+/* Glyph atlas filled on demand (A33): the atlas is GL_RED, row 0 at GL row 0. */
+static int opengl_update_font_atlas(void *font_obj, const unsigned char *r8, int x, int y, int w, int h)
+{
+    vio_font_object *font = (vio_font_object *)font_obj;
+    if (!vio_gl.initialized || !font || !font->atlas_texture || !r8) return -1;
+    glBindTexture(GL_TEXTURE_2D, font->atlas_texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RED, GL_UNSIGNED_BYTE, r8);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return 0;
+}
+
 /* ── Comparison sampling (sampler*Shadow) ────────────────────────────
  *
  * A depth texture sampled through sampler2DShadow / sampler2DArrayShadow /
@@ -2942,6 +2955,7 @@ static const vio_backend opengl_backend = {
     .bind_texture_id       = opengl_bind_texture_id,
     .bind_cubemap_id       = opengl_bind_cubemap_id,
     .upload_font_atlas     = opengl_upload_font_atlas,
+    .update_font_atlas     = opengl_update_font_atlas,
     .flush_draw_state      = opengl_flush_draw_state,
     .upload_cubemap        = opengl_upload_cubemap,
 };

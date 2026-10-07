@@ -244,6 +244,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_backend_info, 0, 1, MAY_BE_A
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_font_info, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, font, VioFont, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_rank_backends, 0, 0, MAY_BE_ARRAY|MAY_BE_FALSE)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
 ZEND_END_ARG_INFO()
@@ -1064,6 +1068,7 @@ ZEND_FUNCTION(vio_draw_2d);
 ZEND_FUNCTION(vio_rounded_rect);
 ZEND_FUNCTION(vio_text_measure);
 ZEND_FUNCTION(vio_font_has_glyph);
+ZEND_FUNCTION(vio_font_info);
 ZEND_FUNCTION(vio_font_face);
 ZEND_FUNCTION(vio_font_face_has_glyph);
 ZEND_FUNCTION(vio_text_bitmap);
@@ -1254,6 +1259,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_rounded_rect, arginfo_vio_rounded_rect)
 	ZEND_FE(vio_text_measure, arginfo_vio_text_measure)
 	ZEND_FE(vio_font_has_glyph, arginfo_vio_font_has_glyph)
+	ZEND_FE(vio_font_info, arginfo_vio_font_info)
 	ZEND_FE(vio_font_face, arginfo_vio_font_face)
 	ZEND_FE(vio_font_face_has_glyph, arginfo_vio_font_face_has_glyph)
 	ZEND_FE(vio_text_bitmap, arginfo_vio_text_bitmap)

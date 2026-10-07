@@ -489,6 +489,11 @@ typedef struct _vio_backend {
      * (OpenGL: the live context's only). Fills up to `max` entries, preferred
      * (discrete) first, and returns the count. */
     int (*enumerate_adapters)(vio_adapter_info *out, int max);
+
+    /* Glyph atlas filled on demand (A33): upload an R8 sub-rectangle (w*h bytes,
+     * tightly packed, top-down) into font_obj's atlas at (x, y). NULL => the
+     * shaping path rasterizes every glyph up front, as before. */
+    int (*update_font_atlas)(void *font_obj, const unsigned char *r8, int x, int y, int w, int h);
 } vio_backend;
 
 /*

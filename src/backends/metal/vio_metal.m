@@ -6367,6 +6367,19 @@ static int metal_upload_font_atlas(void *font_obj, int width, int height,
     return font->atlas_texture ? 0 : -1;
 }
 
+/* Glyph atlas filled on demand (A33): replaceRegion on the R8 atlas texture. */
+static int metal_update_font_atlas(void *font_obj, const unsigned char *r8, int x, int y, int w, int h)
+{
+    vio_font_object *font = (vio_font_object *)font_obj;
+    if (!font || !r8 || font->atlas_texture == 0 || font->atlas_texture >= VIO_METAL_MAX_TEXTURES) return -1;
+    @autoreleasepool {
+        id<MTLTexture> tex = metal_textures[font->atlas_texture];
+        if (!tex) return -1;
+        [tex replaceRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0 withBytes:r8 bytesPerRow:w];
+    }
+    return 0;
+}
+
 /* ── Backend registration ────────────────────────────────────────── */
 
 static const vio_backend metal_backend = {
@@ -6434,6 +6447,7 @@ static const vio_backend metal_backend = {
     .gpu_info           = vio_metal_gpu_info,
     .destroy_font_atlas = metal_destroy_font_atlas,
     .upload_font_atlas  = metal_upload_font_atlas,
+    .update_font_atlas  = metal_update_font_atlas,
     .destroy_texture_obj = metal_destroy_texture_obj,
     .destroy_buffer_obj  = metal_destroy_buffer_obj,
     .create_render_target  = metal_create_render_target,
