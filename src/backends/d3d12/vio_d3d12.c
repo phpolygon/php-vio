@@ -5787,6 +5787,11 @@ static void d3d12_begin_frame(void)
 
     D3D12_RECT scissor = {0, 0, vio_d3d12.width, vio_d3d12.height};
     ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &scissor);
+
+    /* The list was reset: re-arm the pipeline bound in an earlier frame, which
+     * GL, D3D11 and Vulkan keep across vio_end / vio_begin as well. A draw
+     * without it ran with no PSO / root signature and removed the device. */
+    if (d3d12_current_pipeline) d3d12_bind_pipeline(d3d12_current_pipeline);
 }
 
 static void d3d12_end_frame(void)
@@ -5830,6 +5835,9 @@ static void d3d12_end_frame(void)
 static void d3d12_draw(vio_draw_cmd *cmd)
 {
     if (!cmd) return;
+    /* Nothing bound yet: no PSO / root signature on the list, and a draw there
+     * removes the device. GL, D3D11 and Vulkan draw nothing as well. */
+    if (!d3d12_current_pipeline) return;
 
     vio_d3d12_buffer *vb = (vio_d3d12_buffer *)cmd->vertex_buffer;
     if (vb) {
@@ -5861,6 +5869,7 @@ static void d3d12_draw(vio_draw_cmd *cmd)
 static void d3d12_draw_indexed(vio_draw_indexed_cmd *cmd)
 {
     if (!cmd) return;
+    if (!d3d12_current_pipeline) return;   /* see d3d12_draw */
 
     vio_d3d12_buffer *vb = (vio_d3d12_buffer *)cmd->vertex_buffer;
     vio_d3d12_buffer *ib = (vio_d3d12_buffer *)cmd->index_buffer;
@@ -7619,6 +7628,7 @@ static void d3d12_draw_instanced_from_storage(void *mesh_obj, int instance_count
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!vio_d3d12.initialized || !vio_d3d12.cmd_list || !mesh || instance_count <= 0) return;
+    if (!d3d12_current_pipeline) return;   /* see d3d12_draw */
 
     vio_d3d12_buffer *vb = (vio_d3d12_buffer *)mesh->backend_vb;
     if (!vb) return;
@@ -7673,6 +7683,7 @@ static ID3D12CommandSignature *d3d12_indirect_signature(int indexed)
 
 static void d3d12_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
 {
+    if (!d3d12_current_pipeline) return;   /* see d3d12_draw */
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_d3d12_buffer *args = (vio_d3d12_buffer *)args_buffer;
     if (!vio_d3d12.initialized || !vio_d3d12.cmd_list || !mesh || !args || !args->resource || max_draws <= 0) return;

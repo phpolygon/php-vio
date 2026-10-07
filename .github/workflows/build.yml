@@ -152,7 +152,8 @@ jobs:
             tests/render3d/166_work_graphs_d3d12.phpt \
             tests/render3d/169_submit_batch_parity_all_backends.phpt \
             tests/core/171_feature_info_native_emulated.phpt \
-            tests/core/172_gpu_named_timestamps_all_backends.phpt
+            tests/core/172_gpu_named_timestamps_all_backends.phpt \
+            tests/render3d/173_pipeline_survives_frame_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -302,7 +303,8 @@ jobs:
             tests/render3d/166_work_graphs_d3d12.phpt \
             tests/render3d/169_submit_batch_parity_all_backends.phpt \
             tests/core/171_feature_info_native_emulated.phpt \
-            tests/core/172_gpu_named_timestamps_all_backends.phpt
+            tests/core/172_gpu_named_timestamps_all_backends.phpt \
+            tests/render3d/173_pipeline_survives_frame_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -696,6 +698,7 @@ jobs:
             tests/render3d/169_submit_batch_parity_all_backends.phpt `
             tests/core/171_feature_info_native_emulated.phpt `
             tests/core/172_gpu_named_timestamps_all_backends.phpt `
+            tests/render3d/173_pipeline_survives_frame_all_backends.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt
 
       - name: Package binary
