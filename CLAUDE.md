@@ -4,7 +4,7 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.8.0**, 152 PHP-Funktionen, 16 Zend-Klassen,
+für die PHPolygon Game Engine. Aktuell **v2.8.0**, 188 PHP-Funktionen, 16 Zend-Klassen,
 6 Backends, 98 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
@@ -102,6 +102,10 @@ mit `-d vio.debug=1` (D3D12-Debug-Layer, Vulkan-Validation): mehrere Befunde zei
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/core/187` | Kalibrierlauf (`vio_benchmark_backends`, `vio_create('auto', ['benchmark' => true])`): dieselbe Szene (64 Draws in ein RT, Post-Pass, async Compute; headless auf der GPU) auf den drei besten Kandidaten, Ergebnis nach ms sortiert, Cache `vio-benchmark.json` je (Backend, Adapter, Treiber, vio-Version) – ein Treffer überspringt den Lauf; ein im Cache schnellster Kandidat gewinnt `auto` (`selected_by` = `benchmark`, `benchmark_ms` je Kandidat). |
+| `tests/core/186` | Scoring für `auto` (`prefer`, `require`, `vio_rank_backends`): Herstellerprofil (NVIDIA d3d12 > vulkan > d3d11, AMD vulkan > d3d12, ältere Intel-iGPUs d3d11, Apple metal, Linux vulkan > opengl, `compat` d3d11/opengl vorn), Software-Rasterizer zuletzt, `require` filtert; simuliert über `VIO_TEST_ADAPTERS` (JSON mit Plattform), unerfüllbares `require` → `false` mit Warnung; `vio_backend_info` meldet `selected_by` und die Kandidaten. |
+| `tests/core/185` | `vio_adapters()` ohne Kontext: je Backend die Adapter (Name, PCI-Vendor/-Device, Treiber, Gerätetyp, VRAM, Hardware-Features als `VIO_FEATURE_*`), diskrete zuerst, WARP/Software zuletzt; der Adapter eines geöffneten Kontexts ist dabei; GL kennt nur den Adapter des lebenden Kontexts; unbekanntes Backend → `ValueError`. |
+| `tests/core/184` | `vio_backend_info` auf jedem Backend (vorher nur Metal): API, Gerät, Shading-Sprache mit Stufe in Benutzung und Maximum (HLSL-Shader-Model, SPIR-V der Instanz/des Device, GLSL), Familien, Caps, PCI-Vendor + Name, Treiber, Gerätetyp, VRAM. |
 | `tests/render3d/183` | Multiview mit Geometry- und Tessellations-Stages (`VIO_FEATURE_MULTIVIEW_GEOMETRY` / `_TESSELLATION`): `gl_ViewIndex` im GS bzw. in der TES färbt je View, jede View landet in ihrem Layer; ohne Flag lehnt `vio_shader` die Kombination ab. Vulkan nativ (`multiviewGeometryShader`/`multiviewTessellationShader`), D3D12 reicht die View vom Vertex-Shader durch (SPIRV-Cross nimmt `SV_ViewID` nur in VS/PS). |
 | `tests/render3d/182` | Multiview per Instancing auf D3D11 und auf GL ohne `GL_OVR_multiview2` (`VIO_GL_EMULATE_MULTIVIEW=1` erzwingt es): Views × Instanzen je Draw, `gl_ViewIndex` in beiden Stages, Instanzdaten je Nutzer-Instanz, indirekte Datensätze, `vio_feature_info` meldet die Emulation, SPIR-V-Eingabe wird abgelehnt. |
 | `tests/render3d/181` | Draw-Parameter auf D3D12 unter SM 6.8: `gl_BaseVertex`/`gl_BaseInstance` über die `b13`-Root-Konstanten – je Datensatz eines indirekten Multi-Draws (4/3 und 8/5), 0 bei `vio_draw` – unter FXC 5.1, festgelegtem SM 6.0/6.5 und SM 6.8; Vulkan und GL als Referenz. |
@@ -202,6 +206,16 @@ Alle GPU-Operationen gehen durch `vio_backend` Vtable in `include/vio_backend.h`
 - macOS: Metal > OpenGL
 - Windows: D3D12 > D3D11 > Vulkan > OpenGL
 - Linux: Vulkan > OpenGL
+
+Mit `vio_create('auto', ['prefer' => 'performance' | 'quality' | 'compat', 'require' => [VIO_FEATURE_*…]])`
+rankt `auto` stattdessen je Backend den bevorzugten Adapter (`vio_rank_backends`, `src/vio_backend_registry.c`):
+Herstellerprofil des besten Hardware-Adapters (NVIDIA d3d12 > vulkan > d3d11, AMD vulkan > d3d12, Intel ohne
+Mesh-Shader d3d11 zuerst, Apple metal, Linux vulkan > opengl), diskret vor integriert, WARP/llvmpipe/lavapipe nur
+als letzter Ausweg, Feature-Punkte nach `prefer`; `require` filtert über die Adapter-Features (`vio_adapters`,
+Vtable-Slot `enumerate_adapters`) und nach dem Öffnen noch einmal über die echten Flags. `'benchmark' => true`
+misst die drei besten Kandidaten mit einer Kalibrierszene (Cache `vio-benchmark.json` je Adapter + Treiber,
+`vio_benchmark_backends`). `vio_backend_info()['selected_by']` = `explicit` / `priority` / `score` / `benchmark`.
+`VIO_TEST_ADAPTERS` (JSON) simuliert die Adapter für Tests.
 
 `null` wird nie auto-gewählt. iOS (`--with-ios`) ist kein GPU-Backend, sondern
 ersetzt die GLFW-Fenster/Input-Hälfte (`src/backends/ios/`) und rendert über Metal.
@@ -646,6 +660,9 @@ vio_close($ctx); vio_destroy($ctx);
 | `debug` | 0 | Validation Layers / Debug Output (D3D Debug Layer, Vulkan Validation, Metal API-Validation + Command-Buffer-Fault-Log) |
 | `headless` | 0 | Offscreen, kein sichtbares Fenster |
 | `frame_count` | 2 (**nur D3D12**) | In-Flight-Frames, siehe unten |
+| `headless_hardware` | false (**D3D11/D3D12**) | Headless-Kontext auf der GPU statt WARP (wie `VIO_D3D_HEADLESS_HARDWARE=1`, je Kontext) |
+| `prefer` / `require` | — (**nur `auto`**) | Backend-Ranking statt fester Prioritätsliste, siehe „Backend-Dispatch“ |
+| `benchmark` / `benchmark_cache` / `benchmark_frames` | false / Shader-Cache-Verzeichnis / 120 (**nur `auto`**) | Kalibrierlauf unter den drei besten Kandidaten, Ergebnis gecacht |
 | `agility_sdk` / `agility_sdk_version` | — (**nur D3D12**) | Agility SDK statt System-Runtime, siehe unten |
 | `msl_version` | 0 = Maximum (bzw. `VIO_METAL_MSL_VERSION`) | **nur Metal**: MSL-Stufe festnageln (`21` = MSL 2.1), siehe „Metal-Feature-Ladder" |
 
@@ -729,6 +746,9 @@ vio_get_auto_iconify($ctx);             // seit v2.7.4 false: Fullscreen minimie
 vio_monitors($ctx); vio_monitor_info($ctx); vio_video_modes($ctx, $monitor = -1);
 vio_native_window_handle($ctx);         // NSWindow*/HWND als int — für Standalone-Renderer (php-metal-gpu)
 vio_backend_name($ctx); vio_backends(); vio_backend_count();
+vio_backend_info($ctx);                 // API, Gerät, Shading-Sprache + Stufen, Familien, Caps, Vendor, Treiber, Gerätetyp, VRAM, selected_by
+vio_adapters();                         // ['d3d12' => [['name', 'vendor_id', 'driver', 'device_type', 'features', …]], …] ohne Kontext
+vio_rank_backends(['prefer' => 'quality']); vio_benchmark_backends(['frames' => 120]);  // Ranking / Kalibrierlauf für `auto`
 vio_gpu_info(); vio_gl_info($ctx); vio_thermal_state(); vio_supports_feature($ctx, VIO_FEATURE_COMPUTE);
 vio_feature_info($ctx, VIO_FEATURE_GEOMETRY);  // ['supported' => true, 'emulated' => true, 'method' => 'compute kernels …'] auf Metal
 ```
@@ -1071,7 +1091,7 @@ nicht an `@available` im Feature-Code.
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 184 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 188 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess, 184 `vio_backend_info` auf allen Backends, 185 `vio_adapters`, 186 Scoring für `auto`, 187 Kalibrierlauf)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.

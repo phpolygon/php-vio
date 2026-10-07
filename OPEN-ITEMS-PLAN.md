@@ -31,8 +31,10 @@ Größe: S ≤ ½ Tag, M ≈ 1–2 Tage, L = mehrere Tage. Nummern A1–A41 stam
 | A10 ✅ | Multiview-Emulation per Instancing (Tests 158 / 182) | D3D11, GL ohne OVR | M |
 | A27 ✅ | `view_count` zusammen mit GS-/Tess-Stages: Vulkan nativ, D3D12 über eine aus dem VS durchgereichte View; GL (OVR schließt die Stages aus), D3D11 und Metal (View per Instancing im VS) melden 0 (Test 183) | Vulkan, D3D12 | M |
 
-## Batch 3 — Backend-Auswahl (BACKEND-SELECTION-PLAN)
-A4 `describe` für D3D12/Vulkan/GL · A6 `vio_adapters()` · A7 Scoring für `auto` · A8 Kalibrierlauf mit Cache.
+## Batch 3 — Backend-Auswahl (BACKEND-SELECTION-PLAN) ✅
+A4 `describe` für D3D12/D3D11/Vulkan/GL (Test 184) ✅ · A6 `vio_adapters()` (Test 185) ✅ · A7 Scoring für `auto`
+(`prefer`/`require`, `vio_rank_backends`, `VIO_TEST_ADAPTERS`; Test 186) ✅ · A8 Kalibrierlauf mit Cache (`benchmark`,
+`vio_benchmark_backends`, `headless_hardware`; Test 187) ✅.
 
 ## Batch 4 — Render-Features
 A24 MSAA für Depth-only/Cube/Array/MRT · A26 Tiefentexturen mit Mip-Kette · A35 KTX2-Cubemaps und -3D
@@ -64,4 +66,4 @@ und Feature-Matrix im selben Batch nachziehen.
 - [x] Batch 1 (Branch `feat/open-items-batch1`): A40 Test 169, A5 Test 170, A9 Test 171, A19 Test 172, E/F;
   Nebenbefund beim Schreiben von 172: D3D12 verlor die gebundene Pipeline über die Frame-Grenze und entfernte
   beim nächsten Draw das Device (Fix + Test 173).
-- [x] Batch 2 (Branch `feat/open-items-batch2`): A31, A32, A12, A23, B4/B5, A11, A10, A27 — Tests 174–183. · [ ] Batch 3 · [ ] Batch 4 · [ ] Batch 5 · [ ] Batch 6 · [ ] Batch 7
+- [x] Batch 2 (Branch `feat/open-items-batch2`): A31, A32, A12, A23, B4/B5, A11, A10, A27 — Tests 174–183. · [x] Batch 3 (Branch `feat/open-items-batch3`): A4, A6, A7, A8 — Tests 184–187. · [ ] Batch 4 · [ ] Batch 5 · [ ] Batch 6 · [ ] Batch 7
