@@ -203,7 +203,7 @@ probe_fold("vulkan", [
     VIO_FEATURE_TEXTURE_SWIZZLE    => 1,
     VIO_FEATURE_NATIVE_2D_BATCH    => 1,
     VIO_FEATURE_TEXTURE_3D         => 1,
-    VIO_FEATURE_RAYTRACING         => 0,
+    /* RAYTRACING follows VK_KHR_ray_tracing_pipeline (1 on RTX, 0 on lavapipe): test 164. */
     /* MULTIVIEW is device dependent here (GL_OVR_multiview2 / VkPhysicalDeviceMultiviewFeatures): test 158. */
 ]);
 
