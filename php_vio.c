@@ -3025,17 +3025,39 @@ ZEND_FUNCTION(vio_shader)
                 vio_glsl_set_ovr_view_count(s == VIO_STAGE_VERTEX ? view_count : 0);
                 glsl[s] = vio_spirv_to_glsl(spv[s], spv_size[s], glsl_version, &error_msg);
                 vio_glsl_set_ovr_view_count(0);
-                if (!glsl[s]) {
-                    php_error_docref(NULL, E_WARNING, "%s SPIR-V to GLSL transpilation failed: %s",
-                        stage_labels[s], error_msg ? error_msg : "unknown error");
-                    free(error_msg);
-                    for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);
-                    zval_ptr_dtor(&shader_zval);
-                    RETURN_FALSE;
-                }
+                if (!glsl[s]) break;
             }
 
-            shader->program = vio_opengl_compile_program(glsl[0], glsl[1], glsl[2], glsl[3], glsl[4]);
+            int failed = -1;
+            for (int s = 0; s < VIO_STAGE_COUNT; s++) if (spv[s] && !glsl[s]) { failed = s; break; }
+            if (failed >= 0 && format == VIO_SHADER_GLSL && view_count <= 1) {
+                /* SPIRV-Cross refuses some GLSL outside Vulkan semantics (subgroup
+                 * shuffle, min / max, quad operations). The caller's own GLSL can
+                 * still suit the driver (GL_KHR_shader_subgroup): compile the text
+                 * as it is (OPEN-ITEMS-PLAN B4/B5). Uniforms keep their names. */
+                for (int k = 0; k < VIO_STAGE_COUNT; k++) { free(glsl[k]); glsl[k] = NULL; }
+                shader->program = vio_opengl_compile_program(
+                    Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval),
+                    extra_zv[0] ? Z_STRVAL_P(extra_zv[0]) : NULL,
+                    extra_zv[1] ? Z_STRVAL_P(extra_zv[1]) : NULL,
+                    extra_zv[2] ? Z_STRVAL_P(extra_zv[2]) : NULL);
+                if (shader->program) {
+                    shader->gl_generation = vio_opengl_context_generation();
+                    free(error_msg);
+                    error_msg = NULL;
+                    failed = -1;
+                }
+            }
+            if (failed >= 0) {
+                php_error_docref(NULL, E_WARNING, "%s SPIR-V to GLSL transpilation failed: %s",
+                    stage_labels[failed], error_msg ? error_msg : "unknown error");
+                free(error_msg);
+                for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
+
+            if (!shader->program) shader->program = vio_opengl_compile_program(glsl[0], glsl[1], glsl[2], glsl[3], glsl[4]);
             if (view_count > 1) vio_opengl_set_program_views(shader->program, view_count);
             shader->gl_generation = vio_opengl_context_generation();
             for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);

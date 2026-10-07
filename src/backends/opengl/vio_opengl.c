@@ -781,6 +781,13 @@ static void *opengl_create_compute_pipeline(vio_shader_desc *desc)
     int glsl_version = vio_gl.glsl_version >= 430 ? vio_gl.glsl_version : 430;
     char *glsl = vio_spirv_to_glsl_compute(spirv, spirv_size, glsl_version, &err);
     if (free_spirv) free(spirv);
+    if (!glsl && !is_spirv && vio_gl.caps.has_subgroup) {
+        /* SPIRV-Cross refuses subgroup operations outside Vulkan semantics (shuffle,
+         * min / max, quad); a driver with GL_KHR_shader_subgroup takes the caller's
+         * GLSL as it is. */
+        glsl = strdup(src);
+        if (err) { free(err); err = NULL; }
+    }
     if (!glsl) {
         php_error_docref(NULL, E_WARNING, "OpenGL: CS SPIR-V->GLSL failed: %s", err ? err : "unknown");
         if (err) free(err);
@@ -2682,14 +2689,12 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_DEPTH_BIAS:     return 1;
         case VIO_FEATURE_SCISSOR:        return 1;
         case VIO_FEATURE_TEXTURE_SWIZZLE: return vio_gl.caps.has_texture_swizzle;
-        /* The driver may have GL_KHR_shader_subgroup (has_subgroup / _quad, see
-         * vio_gl_info), but shaders reach GL through SPIRV-Cross, whose GLSL
-         * backend rejects shuffle, min/max/and/or/xor and every quad operation
-         * outside Vulkan semantics ("only supported in Vulkan semantics"). Only
-         * basic / vote / ballot / add / mul transpile, which is less than the
-         * flags promise, so both stay 0 on GL. */
-        case VIO_FEATURE_SUBGROUP:       return 0;
-        case VIO_FEATURE_SUBGROUP_QUAD:  return 0;
+        /* GL_KHR_shader_subgroup as the driver reports it. SPIRV-Cross' GLSL
+         * backend rejects shuffle, min/max/and/or/xor and quad operations outside
+         * Vulkan semantics; such shaders reach the driver as the caller's GLSL
+         * text instead (vio_shader / compute fallback, OPEN-ITEMS-PLAN B4/B5). */
+        case VIO_FEATURE_SUBGROUP:       return vio_gl.caps.has_subgroup;
+        case VIO_FEATURE_SUBGROUP_QUAD:  return vio_gl.caps.has_subgroup_quad;
         case VIO_FEATURE_BARYCENTRICS:   return vio_gl.caps.has_barycentrics;
         case VIO_FEATURE_ATOMIC64:       return vio_gl.caps.has_atomic64;
         case VIO_FEATURE_SHADER_FLOAT16: return vio_gl.caps.has_float16;

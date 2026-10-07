@@ -26,7 +26,7 @@ Größe: S ≤ ½ Tag, M ≈ 1–2 Tage, L = mehrere Tage. Nummern A1–A41 stam
 | A32 ✅ | `vio_uniform_buffer` + `vio_bind_buffer` für Grafik-Shader portabel — betraf alle Backends (Test 175) | alle | M |
 | A12 ✅ | Bindless 4b: Slot-Freigabe, Sampler-Varianten, Arrays/Cubes, Compute (Tests 176–179); Metal-4-Residency-Sets bleiben offen | D3D12, Vulkan, Metal (CI) | M–L |
 | A23 ✅ | Getrennte `texture`/`sampler`-Objekte — Vulkan und GL, Metal (CI) (Test 180) | Vulkan, GL, Metal | M |
-| B4/B5* | GL: Rohquelltext-Fallback, wenn SPIRV-Cross Subgroup-/Quad-Ops ablehnt (reine php-vio-Arbeit) | GL | M |
+| B4/B5* ✅ | GL: Rohquelltext-Fallback, wenn SPIRV-Cross Subgroup-/Quad-Ops ablehnt; `SUBGROUP`/`SUBGROUP_QUAD` folgen dem Treiber (Tests 149/152 laufen auf GL) | GL | M |
 | A11 | D3D12 Draw-Parameter unter SM 6.8 per Root-Konstante | D3D12 | S–M |
 | A10 | Multiview-Emulation per Instancing | D3D11, GL ohne OVR | M |
 | A27 | `view_count` zusammen mit GS-/Tess-Stages | alle | M |
