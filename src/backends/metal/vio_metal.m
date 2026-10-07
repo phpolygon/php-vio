@@ -1650,6 +1650,7 @@ extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
 
 #include "../../vio_mesh.h"
 #include "../../vio_shader.h"
+#include "../../vio_shader_reflect.h"   /* vio_spirv_execution_model */
 #include "../../vio_cubemap.h"
 #include "../../vio_texture.h"
 
@@ -1707,6 +1708,13 @@ typedef struct _vio_metal_shader {
      * TES runs as the capture function of an extra pass without rasterization. */
     int                 tess_emul;
     int                 view_count;      /* multiview views (instancing emulation), 0 = off */
+    /* Mesh pipeline (VIO_FEATURE_MESH_SHADER): vert_fn is the [[mesh]] function
+     * (the mesh stage takes the vertex slot), object_fn the optional [[object]]
+     * function; threads per threadgroup from each stage's LocalSize. */
+    int                 mesh;
+    void               *object_fn;       /* id<MTLFunction>, +1 retained, NULL without a task stage */
+    unsigned            mesh_tpg[3], object_tpg[3];
+    vio_metal_stage_res obj;             /* task stage resources (its uniform block shares the mesh stage's) */
     int                 tess_emul_domain;  /* VIO_MSL_DOMAIN_* of the GLSL (isolines compiled as quads) */
     void               *tess_cap_fn;       /* id<MTLFunction>, +1 retained */
     void               *tess_cap_pso;      /* id<MTLRenderPipelineState>, +1 retained, built lazily */
@@ -1770,6 +1778,7 @@ static void metal_destroy_shader(void *s)
     if (!s) return;
     vio_metal_shader *sh = (vio_metal_shader *)s;
     if (sh->vert_fn) { CFRelease((CFTypeRef)sh->vert_fn); sh->vert_fn = NULL; }
+    if (sh->object_fn) { CFRelease((CFTypeRef)sh->object_fn); sh->object_fn = NULL; }
     if (sh->frag_fn) { CFRelease((CFTypeRef)sh->frag_fn); sh->frag_fn = NULL; }
     if (sh->frag_fn_noout) { CFRelease((CFTypeRef)sh->frag_fn_noout); sh->frag_fn_noout = NULL; }
     if (sh->vs_kernel_fn) { CFRelease((CFTypeRef)sh->vs_kernel_fn); sh->vs_kernel_fn = NULL; }
@@ -1928,7 +1937,7 @@ static void *metal_compile_shader(vio_shader_desc *desc)
     size_t vs_size = 0, fs_size = 0;
     int vs_owned = 0, fs_owned = 0;
     uint32_t *vs_spirv = NULL, *fs_spirv = NULL;
-    char *vs_msl = NULL, *fs_msl = NULL, *fs_msl_noout = NULL, *tcs_msl = NULL, *tes_msl = NULL;
+    char *vs_msl = NULL, *fs_msl = NULL, *fs_msl_noout = NULL, *tcs_msl = NULL, *tes_msl = NULL, *task_msl = NULL;
     id<MTLFunction> vfn = nil, ffn = nil, ffn_noout = nil, kfn = nil, tcsfn = nil, cap_fn = nil;
     id<MTLComputePipelineState> tcs_pso = nil;
 
@@ -1985,6 +1994,19 @@ static void *metal_compile_shader(vio_shader_desc *desc)
             tes_msl = emul;
             if (!tes_msl) { what = "TES capture MSL"; goto fail; }
         }
+    } else if (vio_spirv_execution_model(vs_spirv, vs_size) == VIO_SPIRV_MODEL_MESH_EXT) {
+        /* Mesh pipeline: the mesh stage arrives in the vertex slot. */
+        sh->mesh = 1;
+        metal_spirv_local_size(vs_spirv, vs_size, sh->mesh_tpg);
+        vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_MESH, &sh->vs, NULL, 0xFFFFFFFFu, NULL, &err);
+        if (!vs_msl) { what = "mesh SPIR-V→MSL"; goto fail; }
+        if (desc->task_data) {
+            if (desc->task_size < 20 || *(const uint32_t *)desc->task_data != 0x07230203) { err = strdup("not SPIR-V"); what = "task stage"; goto fail; }
+            metal_spirv_local_size((const uint32_t *)desc->task_data, desc->task_size, sh->object_tpg);
+            task_msl = metal_gfx_spirv_to_msl((const uint32_t *)desc->task_data, desc->task_size, VIO_MSL_TASK,
+                                              &sh->obj, NULL, 0xFFFFFFFFu, NULL, &err);
+            if (!task_msl) { what = "task SPIR-V→MSL"; goto fail; }
+        }
     } else if (desc->geometry_data) {
         vs_msl = metal_gs_prepare(sh, vs_spirv, vs_size, desc->geometry_data, desc->geometry_size, &err);
         if (!vs_msl) { what = "geometry stage"; goto fail; }
@@ -2032,7 +2054,12 @@ static void *metal_compile_shader(vio_shader_desc *desc)
         }
     } else {
         vfn = metal_build_function(vs_msl, &err);
-        if (!vfn) { what = "VS MSL→MTLFunction"; goto fail; }
+        if (!vfn) { what = sh->mesh ? "mesh MSL→MTLFunction" : "VS MSL→MTLFunction"; goto fail; }
+        if (task_msl) {
+            id<MTLFunction> ofn = metal_build_function(task_msl, &err);
+            if (!ofn) { what = "task MSL→MTLFunction"; goto fail; }
+            sh->object_fn = (void *)CFBridgingRetain(ofn);
+        }
     }
     ffn = metal_build_function(fs_msl, &err);
     if (!ffn) { what = "FS MSL→MTLFunction"; goto fail; }
@@ -2052,7 +2079,7 @@ static void *metal_compile_shader(vio_shader_desc *desc)
     }
     if (vs_owned) free(vs_spirv);
     if (fs_owned) free(fs_spirv);
-    free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl);
+    free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl); free(task_msl);
     return sh;
 
 fail:
@@ -2061,7 +2088,7 @@ fail:
     free(err);
     if (vs_owned) free(vs_spirv);
     if (fs_owned) free(fs_spirv);
-    free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl);
+    free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl); free(task_msl);
     metal_destroy_shader(sh);   /* kernel PSOs of a geometry stage */
     return NULL;
 #endif /* HAVE_SPIRV_CROSS */
@@ -3444,7 +3471,38 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
         }
 
         NSError *err = nil;
-        id<MTLRenderPipelineState> pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:d error:&err];
+        id<MTLRenderPipelineState> pso = nil;
+        if (sh->mesh) {
+            /* Mesh pipeline: same attachments / blend state, object + mesh
+             * functions instead of the vertex stage. */
+            MTLMeshRenderPipelineDescriptor *md = [[MTLMeshRenderPipelineDescriptor alloc] init];
+            md.objectFunction = sh->object_fn ? (__bridge id<MTLFunction>)sh->object_fn : nil;
+            md.meshFunction = (__bridge id<MTLFunction>)p->vert_fn;
+            md.fragmentFunction = d.fragmentFunction;
+            md.rasterSampleCount = d.rasterSampleCount;
+            md.rasterizationEnabled = YES;
+            if (sh->object_fn) md.payloadMemoryLength = 16384;
+            for (int k = 0; k < 8; k++) {
+                MTLRenderPipelineColorAttachmentDescriptor *src = d.colorAttachments[k];
+                if (src.pixelFormat == MTLPixelFormatInvalid) continue;
+                MTLRenderPipelineColorAttachmentDescriptor *dst = md.colorAttachments[k];
+                dst.pixelFormat = src.pixelFormat;
+                dst.writeMask = src.writeMask;
+                dst.blendingEnabled = src.blendingEnabled;
+                dst.rgbBlendOperation = src.rgbBlendOperation;
+                dst.alphaBlendOperation = src.alphaBlendOperation;
+                dst.sourceRGBBlendFactor = src.sourceRGBBlendFactor;
+                dst.destinationRGBBlendFactor = src.destinationRGBBlendFactor;
+                dst.sourceAlphaBlendFactor = src.sourceAlphaBlendFactor;
+                dst.destinationAlphaBlendFactor = src.destinationAlphaBlendFactor;
+            }
+            md.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat;
+            md.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+            pso = [vio_mtl.device newRenderPipelineStateWithMeshDescriptor:md options:MTLPipelineOptionNone
+                                                                reflection:nil error:&err];
+        } else {
+            pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:d error:&err];
+        }
         if (!pso) {
             php_error_docref(NULL, E_WARNING, "Metal: render pipeline creation failed: %s",
                 err ? [[err localizedDescription] UTF8String] : "unknown");
@@ -3496,6 +3554,24 @@ static int metal_prepare_draw(int stride)
      * but got no separate cbuffer object shares the vertex data (D3D11 binds
      * the VS cbuffer to PS b0 in that case). */
     vio_metal_shader *sh = p->shader;
+    if (sh->mesh) {
+        /* The mesh stage owns the "vertex" uniform block; a task stage that
+         * declares the same block reads the same slice. */
+        vio_metal_buffer *mcb = metal_current_vs_cb;
+        if (mcb && mcb->shadow && mcb->shadow_size > 0) {
+            NSUInteger off = 0;
+            id<MTLBuffer> rb = metal_ring_alloc(mcb->shadow_size, &off);
+            if (rb) {
+                memcpy((char *)[rb contents] + off, mcb->shadow, mcb->shadow_size);
+                if (sh->vs.cbuffer_index >= 0) [enc setMeshBuffer:rb offset:off atIndex:(NSUInteger)sh->vs.cbuffer_index];
+                if (sh->object_fn && sh->obj.cbuffer_index >= 0) [enc setObjectBuffer:rb offset:off atIndex:(NSUInteger)sh->obj.cbuffer_index];
+            }
+        }
+        vio_metal_buffer *fcb = metal_current_fs_cb ? metal_current_fs_cb : NULL;
+        if (fcb) metal_bind_uniform_slice(fcb, -1, sh->fs.cbuffer_index);
+        else if (mcb && sh->fs.cbuffer_index >= 0) metal_bind_uniform_slice(mcb, -1, sh->fs.cbuffer_index);
+        return 1;
+    }
     if (sh->tess) {
         /* The vertex function is the TES (its own block); the vertex stage's
          * block goes to the vertex kernel in metal_draw_tess. */
@@ -4555,6 +4631,46 @@ static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
     }
 }
 
+/* Mesh pipelines: x * y * z object (task) threadgroups, or mesh threadgroups
+ * when the pipeline has no task stage. */
+static int metal_mesh_bound(void)
+{
+    return metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->mesh;
+}
+
+static void metal_draw_mesh_tasks(uint32_t x, uint32_t y, uint32_t z)
+{
+    if (!metal_mesh_bound() || !x || !y || !z) return;
+    @autoreleasepool {
+        if (!metal_prepare_draw(0)) return;
+        vio_metal_shader *sh = metal_current_pipeline->shader;
+        const unsigned *ot = sh->object_tpg, *mt = sh->mesh_tpg;
+        [vio_mtl.current_encoder drawMeshThreadgroups:MTLSizeMake(x, y, z)
+                          threadsPerObjectThreadgroup:MTLSizeMake(ot[0], ot[1], ot[2])
+                            threadsPerMeshThreadgroup:MTLSizeMake(mt[0], mt[1], mt[2])];
+    }
+}
+
+static void metal_draw_mesh_tasks_indirect(void *args_buffer, int max_draws, size_t offset)
+{
+    vio_metal_buffer *args = (vio_metal_buffer *)args_buffer;
+    if (!metal_mesh_bound() || !args || !args->buffer || max_draws <= 0) return;
+    @autoreleasepool {
+        if (!metal_prepare_draw(0)) return;
+        vio_metal_shader *sh = metal_current_pipeline->shader;
+        const unsigned *ot = sh->object_tpg, *mt = sh->mesh_tpg;
+        id<MTLBuffer> argbuf = (__bridge id<MTLBuffer>)args->buffer;
+        for (int i = 0; i < max_draws; i++) {
+            size_t o = offset + (size_t)i * 12;   /* MTLDispatchThreadgroupsIndirectArguments */
+            if (o + 12 > args->size) break;
+            [vio_mtl.current_encoder drawMeshThreadgroupsWithIndirectBuffer:argbuf
+                                                       indirectBufferOffset:(NSUInteger)o
+                                                threadsPerObjectThreadgroup:MTLSizeMake(ot[0], ot[1], ot[2])
+                                                  threadsPerMeshThreadgroup:MTLSizeMake(mt[0], mt[1], mt[2])];
+        }
+    }
+}
+
 static void metal_draw_instanced_from_storage(void *mesh_obj, int instance_count)
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
@@ -5583,6 +5699,14 @@ static int metal_supports_feature(vio_feature f)
         /* vertex + control kernels, then drawPatches (metal_draw_tess); the
          * [[patch]] functions need MSL 2.1 (version ladder). */
         return vio_mtl.caps.tessellation;
+    case VIO_FEATURE_MESH_SHADER:
+        /* MTLMeshRenderPipelineDescriptor + drawMeshThreadgroups: Metal 3 on
+         * Apple7 / Mac2, MSL 3.0 rung. */
+#ifdef HAVE_SPIRV_CROSS
+        return vio_mtl.caps.mesh_shaders;
+#else
+        return 0;
+#endif
     case VIO_FEATURE_INSTANCED_DRAW:
         /* vio_draw_instanced -> per-draw ring slice bound as the per-instance
          * mat4 buffer (locations 3..6). */
@@ -5766,6 +5890,8 @@ static const vio_backend metal_backend = {
     .bind_storage_buffer         = metal_bind_storage_buffer,
     .draw_instanced_from_storage = metal_draw_instanced_from_storage,
     .draw_indirect     = metal_draw_indirect,
+    .draw_mesh_tasks          = metal_draw_mesh_tasks,
+    .draw_mesh_tasks_indirect = metal_draw_mesh_tasks_indirect,
     .bind_stage_constants = metal_bind_stage_constants,
     .gpu_info           = vio_metal_gpu_info,
     .destroy_font_atlas = metal_destroy_font_atlas,

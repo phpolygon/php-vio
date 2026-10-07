@@ -393,6 +393,12 @@ typedef struct _vio_backend {
      * families and capabilities. Returns 0 when filled, -1 without a device.
      * NULL => the function reports false. */
     int   (*describe)(vio_backend_description *out);
+
+    /* Mesh pipelines (VIO_FEATURE_MESH_SHADER): launch x * y * z task groups
+     * (mesh groups without a task stage) with the bound mesh pipeline, or read
+     * {x, y, z} uint32 records from a storage buffer. NULL => no mesh stages. */
+    void  (*draw_mesh_tasks)(uint32_t x, uint32_t y, uint32_t z);
+    void  (*draw_mesh_tasks_indirect)(void *args_buffer, int max_draws, size_t offset);
 } vio_backend;
 
 /*

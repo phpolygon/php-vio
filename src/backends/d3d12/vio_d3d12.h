@@ -117,6 +117,10 @@ typedef struct _vio_d3d12_shader {
     uint32_t  hs_input_points;
     UINT      compile_flags;
     int       writes_shading_rate;   /* the vertex stage writes SV_ShadingRate (gl_PrimitiveShadingRateEXT) */
+    /* Mesh pipeline (VIO_FEATURE_MESH_SHADER): vs_blob holds the MESH shader
+     * (ms_6_x), as_blob the optional amplification (task) shader. */
+    int       is_mesh;
+    ID3DBlob *as_blob;
 } vio_d3d12_shader;
 
 /* Pipeline = PSO + root signature reference */
@@ -138,6 +142,11 @@ typedef struct _vio_d3d12_pipeline {
     ID3DBlob                *hs_variant;       /* owned; hull shader for this pipeline's patch size */
     int                      view_count;       /* multiview: view instancing views (2..4), 0 = off */
     int                      writes_shading_rate; /* the shader's vertex stage writes SV_ShadingRate */
+    /* Mesh pipeline: pso_desc.VS carries the mesh shader, as_blob (borrowed from
+     * the shader) the amplification stage; built through the pipeline-state
+     * stream with vio_d3d12.mesh_root_signature. */
+    int                      is_mesh;
+    ID3DBlob                *as_blob;
 } vio_d3d12_pipeline;
 
 /* Buffer wrapper */
@@ -317,6 +326,14 @@ typedef struct _vio_d3d12_state {
     int                        shading_rate;
     ID3D12GraphicsCommandList5 *cmd_list5;
     ID3D12GraphicsCommandList1 *cmd_list1;   /* SetViewInstanceMask (multiview) */
+    /* Mesh shaders (VIO_FEATURE_MESH_SHADER): OPTIONS7.MeshShaderTier, the
+     * root signature variant whose VS parameters are MESH-visible (+ the task
+     * stage's CBV), DispatchMesh's command list interface and the
+     * DISPATCH_MESH command signature (all created on first use). */
+    int                        mesh_tier;
+    ID3D12RootSignature       *mesh_root_signature;
+    ID3D12GraphicsCommandList6 *cmd_list6;
+    ID3D12CommandSignature    *cmdsig_mesh;
     /* Indirect draws (GAP-PHASE5 Block 8): command signatures for DrawIndexed
      * (stride 20) and Draw (stride 16) arguments, created on first use. */
     ID3D12CommandSignature    *cmdsig_indexed;

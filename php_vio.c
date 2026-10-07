@@ -2374,8 +2374,18 @@ static void vio_push_shader_cbuffers(vio_context_object *ctx)
     }
 }
 
+/* A mesh pipeline has no vertex stage: its draws are vio_draw_mesh_tasks. */
+static int vio_bound_shader_is_mesh(vio_context_object *ctx, const char *fn)
+{
+    vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+    if (!sh || !sh->is_mesh) return 0;
+    php_error_docref(NULL, E_WARNING, "%s: the bound pipeline is a mesh pipeline - draw it with vio_draw_mesh_tasks", fn);
+    return 1;
+}
+
 static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
 {
+    if (vio_bound_shader_is_mesh(ctx, "vio_draw")) return;
     vio_flush_pending_textures(ctx);
     if (ctx->backend->draw_mesh) {
         ctx->backend->draw_mesh(mesh);
@@ -2577,8 +2587,35 @@ ZEND_FUNCTION(vio_shader)
         RETURN_FALSE;
     }
 
-    /* Get vertex shader source */
-    zval *vert_zval = zend_hash_str_find(config_ht, "vertex", sizeof("vertex") - 1);
+    /* Mesh pipelines (VIO_FEATURE_MESH_SHADER): 'mesh' (+ optional 'task')
+     * replaces 'vertex'. The mesh stage takes the vertex slot of the object, so
+     * its default uniform block is the "vertex" cbuffer of vio_set_uniform. */
+    zval *mesh_zval = zend_hash_str_find(config_ht, "mesh", sizeof("mesh") - 1);
+    zval *task_zval = zend_hash_str_find(config_ht, "task", sizeof("task") - 1);
+    int want_mesh = mesh_zval != NULL;
+    if (task_zval && !want_mesh) {
+        php_error_docref(NULL, E_WARNING, "vio_shader: 'task' needs a 'mesh' stage");
+        RETURN_FALSE;
+    }
+    if (want_mesh) {
+        if (Z_TYPE_P(mesh_zval) != IS_STRING || Z_STRLEN_P(mesh_zval) == 0 ||
+            (task_zval && (Z_TYPE_P(task_zval) != IS_STRING || Z_STRLEN_P(task_zval) == 0))) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: 'mesh' and 'task' must be non-empty strings");
+            RETURN_FALSE;
+        }
+        if (zend_hash_str_find(config_ht, "vertex", sizeof("vertex") - 1)) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: 'mesh' replaces 'vertex' - give one of them");
+            RETURN_FALSE;
+        }
+        if (!(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_MESH_SHADER))) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: backend '%s' has no mesh stages (VIO_FEATURE_MESH_SHADER = 0)",
+                             ctx->backend->name);
+            RETURN_FALSE;
+        }
+    }
+
+    /* Get vertex shader source (the mesh stage for mesh pipelines) */
+    zval *vert_zval = want_mesh ? mesh_zval : zend_hash_str_find(config_ht, "vertex", sizeof("vertex") - 1);
     if (!vert_zval || Z_TYPE_P(vert_zval) != IS_STRING) {
         php_error_docref(NULL, E_WARNING, "vio_shader requires 'vertex' string");
         RETURN_FALSE;
@@ -2611,6 +2648,10 @@ ZEND_FUNCTION(vio_shader)
     if (want_tess && (!extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]
                    || !extra_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)])) {
         php_error_docref(NULL, E_WARNING, "vio_shader: 'tess_control' and 'tess_eval' must be given together");
+        RETURN_FALSE;
+    }
+    if (want_mesh && (want_geometry || want_tess || zend_hash_str_find(config_ht, "view_count", sizeof("view_count") - 1))) {
+        php_error_docref(NULL, E_WARNING, "vio_shader: 'mesh' does not combine with geometry / tessellation stages or 'view_count'");
         RETURN_FALSE;
     }
     /* 'hlsl' => [stage => source]: per-stage HLSL that backends with
@@ -2744,6 +2785,7 @@ ZEND_FUNCTION(vio_shader)
     shader->has_geometry     = want_geometry;
     shader->has_tessellation = want_tess;
     shader->view_count = view_count;
+    shader->is_mesh = want_mesh;
 
     /* --- SPIR-V input: store directly --- */
     if (format == VIO_SHADER_SPIRV) {
@@ -2761,19 +2803,35 @@ ZEND_FUNCTION(vio_shader)
             shader->stage_spirv[i] = malloc(shader->stage_spirv_size[i]);
             memcpy(shader->stage_spirv[i], Z_STRVAL_P(extra_zv[i]), shader->stage_spirv_size[i]);
         }
+        if (task_zval) {
+            shader->task_spirv_size = Z_STRLEN_P(task_zval);
+            shader->task_spirv = malloc(shader->task_spirv_size);
+            memcpy(shader->task_spirv, Z_STRVAL_P(task_zval), shader->task_spirv_size);
+        }
     }
     /* --- GLSL input: compile to SPIR-V via glslang (skip for raw) --- */
     else if (format == VIO_SHADER_GLSL) {
         char *error_msg = NULL;
 
-        shader->vert_spirv = vio_compile_glsl_to_spirv(
-            Z_STRVAL_P(vert_zval), 0, &shader->vert_spirv_size, &error_msg);
+        shader->vert_spirv = want_mesh
+            ? vio_compile_glsl_stage_to_spirv(Z_STRVAL_P(vert_zval), VIO_STAGE_MESH, &shader->vert_spirv_size, &error_msg)
+            : vio_compile_glsl_to_spirv(Z_STRVAL_P(vert_zval), 0, &shader->vert_spirv_size, &error_msg);
         if (!shader->vert_spirv) {
-            php_error_docref(NULL, E_WARNING, "Vertex shader compilation failed: %s",
+            php_error_docref(NULL, E_WARNING, "%s shader compilation failed: %s", want_mesh ? "Mesh" : "Vertex",
                 error_msg ? error_msg : "unknown error");
             free(error_msg);
             zval_ptr_dtor(&shader_zval);
             RETURN_FALSE;
+        }
+        if (task_zval) {
+            shader->task_spirv = vio_compile_glsl_stage_to_spirv(Z_STRVAL_P(task_zval), VIO_STAGE_TASK,
+                                                                 &shader->task_spirv_size, &error_msg);
+            if (!shader->task_spirv) {
+                php_error_docref(NULL, E_WARNING, "Task shader compilation failed: %s", error_msg ? error_msg : "unknown error");
+                free(error_msg);
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
         }
 
         shader->frag_spirv = vio_compile_glsl_to_spirv(
@@ -2858,8 +2916,17 @@ ZEND_FUNCTION(vio_shader)
         /* Ensure SPIR-V is available (compile from GLSL if needed) */
         if (!shader->vert_spirv && (format == VIO_SHADER_GLSL_RAW || format == VIO_SHADER_GLSL)) {
             char *error_msg = NULL;
-            shader->vert_spirv = vio_compile_glsl_to_spirv(
-                Z_STRVAL_P(vert_zval), 0, &shader->vert_spirv_size, &error_msg);
+            shader->vert_spirv = want_mesh
+                ? vio_compile_glsl_stage_to_spirv(Z_STRVAL_P(vert_zval), VIO_STAGE_MESH, &shader->vert_spirv_size, &error_msg)
+                : vio_compile_glsl_to_spirv(Z_STRVAL_P(vert_zval), 0, &shader->vert_spirv_size, &error_msg);
+            if (shader->vert_spirv && task_zval && !shader->task_spirv) {
+                shader->task_spirv = vio_compile_glsl_stage_to_spirv(Z_STRVAL_P(task_zval), VIO_STAGE_TASK,
+                                                                     &shader->task_spirv_size, &error_msg);
+                if (!shader->task_spirv) {
+                    free(shader->vert_spirv);
+                    shader->vert_spirv = NULL;
+                }
+            }
             if (!shader->vert_spirv) {
                 php_error_docref(NULL, E_WARNING, "VS GLSL->SPIR-V failed: %s", error_msg ? error_msg : "unknown");
                 free(error_msg);
@@ -2899,6 +2966,8 @@ ZEND_FUNCTION(vio_shader)
         desc.tess_control_hlsl = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]) : NULL;
         desc.tess_eval_hlsl    = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)]) : NULL;
         desc.view_count        = view_count;
+        desc.task_data         = shader->task_spirv;
+        desc.task_size         = shader->task_spirv_size;
 
         shader->backend_shader = ctx->backend->compile_shader(&desc);
         if (!shader->backend_shader) {
@@ -4791,6 +4860,7 @@ ZEND_FUNCTION(vio_draw_instanced_from_buffer)
         php_error_docref(NULL, E_WARNING, "Must call vio_draw_instanced_from_buffer between vio_begin and vio_end");
         return;
     }
+    if (vio_bound_shader_is_mesh(ctx, "vio_draw_instanced_from_buffer")) return;
     if (instance_count <= 0) {
         return;
     }
@@ -4847,6 +4917,7 @@ ZEND_FUNCTION(vio_draw_indirect)
     if (buf->type != VIO_BUFFER_STORAGE || !buf->backend_buffer || max_draws <= 0 || offset < 0) {
         return;
     }
+    if (vio_bound_shader_is_mesh(ctx, "vio_draw_indirect")) return;
     size_t stride = mesh->index_count > 0 ? 20 : 16;
     if ((size_t)offset + (size_t)max_draws * stride > buf->size) {
         php_error_docref(NULL, E_WARNING, "vio_draw_indirect: %ld draws at offset %ld exceed the argument buffer (%zu bytes)",
@@ -4856,6 +4927,79 @@ ZEND_FUNCTION(vio_draw_indirect)
     vio_flush_pending_textures(ctx);
     vio_push_shader_cbuffers(ctx);   /* no-op on OpenGL (no cbuffer_backend) */
     ctx->backend->draw_indirect(mesh, buf->backend_buffer, (int)max_draws, (size_t)offset);
+}
+
+/* Mesh pipelines (VIO_FEATURE_MESH_SHADER): x * y * z task groups (mesh groups
+ * without a task stage) with the bound mesh pipeline. */
+static int vio_mesh_draw_ready(vio_context_object *ctx, const char *fn)
+{
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call %s between vio_begin and vio_end", fn);
+        return 0;
+    }
+    if (!ctx->backend->draw_mesh_tasks || !ctx->backend->supports_feature
+        || !ctx->backend->supports_feature(VIO_FEATURE_MESH_SHADER)) {
+        php_error_docref(NULL, E_WARNING, "%s: backend '%s' has no mesh stages (VIO_FEATURE_MESH_SHADER = 0)", fn, ctx->backend->name);
+        return 0;
+    }
+    vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+    if (!sh || !sh->is_mesh) {
+        php_error_docref(NULL, E_WARNING, "%s: bind a pipeline whose shader has a 'mesh' stage first", fn);
+        return 0;
+    }
+    return 1;
+}
+
+ZEND_FUNCTION(vio_draw_mesh_tasks)
+{
+    zval *ctx_zval;
+    zend_long x, y = 1, z = 1;
+    ZEND_PARSE_PARAMETERS_START(2, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(x)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(y)
+        Z_PARAM_LONG(z)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (x < 0 || y < 0 || z < 0 || x > 0xFFFF || y > 0xFFFF || z > 0xFFFF) {
+        zend_argument_value_error(2, "group counts must be 0..65535");
+        RETURN_THROWS();
+    }
+    if (!vio_mesh_draw_ready(ctx, "vio_draw_mesh_tasks")) return;
+    if (x == 0 || y == 0 || z == 0) return;
+    vio_flush_pending_textures(ctx);
+    vio_push_shader_cbuffers(ctx);
+    ctx->backend->draw_mesh_tasks((uint32_t)x, (uint32_t)y, (uint32_t)z);
+}
+
+ZEND_FUNCTION(vio_draw_mesh_tasks_indirect)
+{
+    zval *ctx_zval, *buf_zval;
+    zend_long max_draws = 1, offset = 0;
+    ZEND_PARSE_PARAMETERS_START(2, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_buffer_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(max_draws)
+        Z_PARAM_LONG(offset)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_buffer_object *buf = Z_VIO_BUFFER_P(buf_zval);
+    if (!vio_mesh_draw_ready(ctx, "vio_draw_mesh_tasks_indirect")) return;
+    if (!ctx->backend->draw_mesh_tasks_indirect) {
+        php_error_docref(NULL, E_WARNING, "vio_draw_mesh_tasks_indirect: not supported on backend '%s'", ctx->backend->name);
+        return;
+    }
+    if (buf->type != VIO_BUFFER_STORAGE || !buf->backend_buffer || max_draws <= 0 || offset < 0 || (offset & 3)) return;
+    if ((size_t)offset + (size_t)max_draws * 12 > buf->size) {
+        php_error_docref(NULL, E_WARNING, "vio_draw_mesh_tasks_indirect: %ld records at offset %ld exceed the argument buffer (%zu bytes)",
+                         (long)max_draws, (long)offset, buf->size);
+        return;
+    }
+    vio_flush_pending_textures(ctx);
+    vio_push_shader_cbuffers(ctx);
+    ctx->backend->draw_mesh_tasks_indirect(buf->backend_buffer, (int)max_draws, (size_t)offset);
 }
 
 /* Variable rate shading (GAP-PHASE5 Block 12): coarse pixel shading for the
@@ -8540,6 +8684,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BASE_VERTEX", VIO_FEATURE_BASE_VERTEX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_COMPUTE_DERIVATIVES", VIO_FEATURE_COMPUTE_DERIVATIVES, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE_PRIMITIVE", VIO_FEATURE_SHADING_RATE_PRIMITIVE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_MESH_SHADER", VIO_FEATURE_MESH_SHADER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
@@ -9377,6 +9522,7 @@ ZEND_FUNCTION(vio_draw_instanced)
         php_error_docref(NULL, E_WARNING, "Must call vio_draw_instanced between vio_begin and vio_end");
         return;
     }
+    if (vio_bound_shader_is_mesh(ctx, "vio_draw_instanced")) return;
 
     if (instance_count <= 0) {
         return;

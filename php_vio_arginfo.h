@@ -210,6 +210,20 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_backend_info, 0, 1, MAY_BE_A
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_draw_mesh_tasks, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, x, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, y, IS_LONG, 0, "1")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, z, IS_LONG, 0, "1")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_draw_mesh_tasks_indirect, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, args, VioBuffer, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, maxDraws, IS_LONG, 0, "1")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, offset, IS_LONG, 0, "0")
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_shading_rate, 0, 2, _IS_BOOL, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, rate, IS_LONG, 0)
@@ -901,6 +915,8 @@ ZEND_FUNCTION(vio_gpu_frame_time);
 ZEND_FUNCTION(vio_shader_cache_stats);
 ZEND_FUNCTION(vio_swapchain_info);
 ZEND_FUNCTION(vio_backend_info);
+ZEND_FUNCTION(vio_draw_mesh_tasks);
+ZEND_FUNCTION(vio_draw_mesh_tasks_indirect);
 ZEND_FUNCTION(vio_draw_indirect);
 ZEND_FUNCTION(vio_set_shading_rate);
 ZEND_FUNCTION(vio_rect);
@@ -1067,6 +1083,8 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_shader_cache_stats, arginfo_vio_shader_cache_stats)
 	ZEND_FE(vio_swapchain_info, arginfo_vio_swapchain_info)
 	ZEND_FE(vio_backend_info, arginfo_vio_backend_info)
+	ZEND_FE(vio_draw_mesh_tasks, arginfo_vio_draw_mesh_tasks)
+	ZEND_FE(vio_draw_mesh_tasks_indirect, arginfo_vio_draw_mesh_tasks_indirect)
 	ZEND_FE(vio_draw_indirect, arginfo_vio_draw_indirect)
 	ZEND_FE(vio_set_shading_rate, arginfo_vio_set_shading_rate)
 	ZEND_FE(vio_rect, arginfo_vio_rect)

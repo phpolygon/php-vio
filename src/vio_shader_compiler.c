@@ -55,14 +55,18 @@ static uint32_t *vio_compile_stage_to_spirv(const char *source, glslang_stage_t 
      * SPIR-V 1.0 for the SPIR-V rewriters (GS / tessellation / Metal kernels). */
     /* Split literal: the audit gate (070) flags GL_ tokens outside the GL backend. */
     int subgroup = source && strstr(source, "GL_" "KHR_shader_subgroup") != NULL;
+    /* GL_EXT_mesh_shader (mesh / task stages and per-primitive fragment inputs)
+     * needs SPIR-V 1.4. */
+    int mesh = source && strstr(source, "GL_" "EXT_mesh_shader") != NULL;
 
     glslang_input_t input = {0};
     input.language                          = GLSLANG_SOURCE_GLSL;
     input.stage                             = stage;
     input.client                            = GLSLANG_CLIENT_VULKAN;
-    input.client_version                    = subgroup ? GLSLANG_TARGET_VULKAN_1_1 : GLSLANG_TARGET_VULKAN_1_0;
+    input.client_version                    = (subgroup || mesh) ? GLSLANG_TARGET_VULKAN_1_1 : GLSLANG_TARGET_VULKAN_1_0;
     input.target_language                   = GLSLANG_TARGET_SPV;
-    input.target_language_version           = subgroup ? GLSLANG_TARGET_SPV_1_3 : GLSLANG_TARGET_SPV_1_0;
+    input.target_language_version           = mesh ? GLSLANG_TARGET_SPV_1_4
+                                            : subgroup ? GLSLANG_TARGET_SPV_1_3 : GLSLANG_TARGET_SPV_1_0;
     input.code                              = source;
     input.default_version                   = 330;
     input.default_profile                   = GLSLANG_CORE_PROFILE;
@@ -159,6 +163,8 @@ uint32_t *vio_compile_glsl_stage_to_spirv(const char *source, int stage,
         case VIO_STAGE_GEOMETRY:     gs = GLSLANG_STAGE_GEOMETRY; break;
         case VIO_STAGE_TESS_CONTROL: gs = GLSLANG_STAGE_TESSCONTROL; break;
         case VIO_STAGE_TESS_EVAL:    gs = GLSLANG_STAGE_TESSEVALUATION; break;
+        case VIO_STAGE_MESH:         gs = GLSLANG_STAGE_MESH_NV; break;   /* = GLSLANG_STAGE_MESH (EXT) */
+        case VIO_STAGE_TASK:         gs = GLSLANG_STAGE_TASK_NV; break;
         default:
             if (error_msg) *error_msg = strdup("unknown shader stage");
             return NULL;

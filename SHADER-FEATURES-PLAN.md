@@ -125,6 +125,14 @@ Größter Architekturhebel: ersetzt Pending-Bind-Tabelle und GL-Unit-Mapping fü
 
 ## Phase 5 — Mesh- und Task-/Amplification-Shader (L)
 
+**✅ umgesetzt (Test 162).** Metal läuft auf dem M5 (MSL-Sprosse ≥ 3.0; Sprosse 2.1 meldet 0 und skippt).
+D3D12 (SM 6.5 + `MeshShaderTier`, AS/MS über den Pipeline-State-Stream, Root-Signatur-Variante mit
+MESH-/AMPLIFICATION-Sichtbarkeit, `DispatchMesh`, `ExecuteIndirect` mit `DISPATCH_MESH`) und Vulkan
+(`VK_EXT_mesh_shader` + `VK_KHR_spirv_1_4`, `vkCmdDrawMeshTasks(Indirect)EXT`) sind nur Compile-/Text-geprüft:
+mingw + DirectX-Headers, das erzeugte HLSL mit DXC (`as/ms/ps_6_5`, `_6_6`), das Vulkan-GLSL mit
+glslang + `spirv-val` (vulkan1.1spv1.4). WARP endet bei SM 6.2, MoltenVK hat kein `VK_EXT_mesh_shader`.
+SPIRV-Cross setzt keinen Clip-Fixup in Mesh-Ausgaben; `vio_mesh_fix_positions` schreibt die Zuweisungen um.
+
 `VIO_FEATURE_MESH_SHADER`. API: `vio_shader(['task' => …, 'mesh' => …, 'fragment' => …])`,
 `vio_draw_mesh_tasks($ctx, $x, $y, $z)` + indirekte Variante über `vio_storage_buffer(['indirect'])`.
 - D3D12: SM 6.5, `OPTIONS7.MeshShaderTier`, `D3D12_PIPELINE_STATE_STREAM` (Mesh-PSO), `DispatchMesh`.

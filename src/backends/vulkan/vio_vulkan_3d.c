@@ -835,4 +835,40 @@ void vio_vk3d_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, si
     vk3d_after_draw();
 }
 
+/* Mesh pipelines (VIO_FEATURE_MESH_SHADER): no vertex buffers, the task /
+ * mesh stages generate the geometry. */
+static int vk3d_mesh_bound(void)
+{
+    return vk3d.pipeline && vk3d.pipeline->shader && vk3d.pipeline->shader->is_mesh && vio_vk.mesh_supported;
+}
+
+void vio_vk3d_draw_mesh_tasks(uint32_t x, uint32_t y, uint32_t z)
+{
+    if (!vk3d_mesh_bound() || !x || !y || !z) return;
+    if (vk3d_prepare(0, VK_NULL_HANDLE, 0) != 0) { vk3d_after_draw(); return; }
+#ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
+    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    ((PFN_vkCmdDrawMeshTasksEXT)vio_vk.mesh_cmd_draw)(cmd, x, y, z);
+#endif
+    vk3d_after_draw();
+}
+
+void vio_vk3d_draw_mesh_tasks_indirect(void *args_buffer, int max_draws, size_t offset)
+{
+    vio_vulkan_compute_buffer *args = (vio_vulkan_compute_buffer *)args_buffer;
+    if (!vk3d_mesh_bound() || !args || !args->buffer || max_draws <= 0) return;
+    if (vk3d_prepare(0, VK_NULL_HANDLE, 0) != 0) { vk3d_after_draw(); return; }
+#ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
+    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    PFN_vkCmdDrawMeshTasksIndirectEXT fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vio_vk.mesh_cmd_draw_indirect;
+    const uint32_t stride = 12u;   /* VkDrawMeshTasksIndirectCommandEXT */
+    if (vio_vk.multi_draw_indirect) {
+        fn(cmd, args->buffer, (VkDeviceSize)offset, (uint32_t)max_draws, stride);
+    } else {
+        for (int i = 0; i < max_draws; i++) fn(cmd, args->buffer, (VkDeviceSize)offset + (VkDeviceSize)i * stride, 1, stride);
+    }
+#endif
+    vk3d_after_draw();
+}
+
 #endif /* HAVE_VULKAN */
