@@ -11622,8 +11622,8 @@ ZEND_FUNCTION(vio_render_target)
             php_error_docref(NULL, E_WARNING, "vio_render_target: 'layers' cannot be combined with 'cube'");
             RETURN_FALSE;
         }
-        if (attachment_count > 1 || samples > 1) {
-            php_error_docref(NULL, E_WARNING, "vio_render_target: array targets support a single, single-sampled attachment");
+        if (attachment_count > 1) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: array targets support a single attachment");
             RETURN_FALSE;
         }
         if (!ctx->backend->supports_feature ||
@@ -11667,7 +11667,7 @@ ZEND_FUNCTION(vio_render_target)
     rt->width      = width;
     rt->height     = height;
     rt->depth_only = depth_only;
-    rt->samples    = layers > 1 ? 1 : samples;
+    rt->samples    = samples;   /* backends clamp (and write back) what they can do */
     rt->is_cube    = is_cube;
     rt->layers     = layers;
     rt->mip_levels = mip_levels;

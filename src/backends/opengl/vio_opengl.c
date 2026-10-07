@@ -1196,6 +1196,8 @@ static void opengl_destroy_render_target(void *rt_ptr)
     for (int i = 1; i < 4; i++)
         if (rt->gl_msaa_color_rbs[i]) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_color_rbs[i]); rt->gl_msaa_color_rbs[i] = 0; }
     if (rt->gl_msaa_depth_rb) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_depth_rb); rt->gl_msaa_depth_rb = 0; }
+    if (rt->gl_msaa_color_arr) { if (live) glDeleteTextures(1, &rt->gl_msaa_color_arr); rt->gl_msaa_color_arr = 0; }
+    if (rt->gl_msaa_depth_arr) { if (live) glDeleteTextures(1, &rt->gl_msaa_depth_arr); rt->gl_msaa_depth_arr = 0; }
     if (rt->fbo) {
         if (live) glDeleteFramebuffers(1, &rt->fbo);
         rt->fbo = 0;
@@ -1248,6 +1250,68 @@ static void opengl_rt_attach_layer(vio_render_target_object *rt, int layer, int 
         if (!rt->depth_only) glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rt->color_texture, level, layer);
         glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, level == 0 ? rt->depth_texture : 0, 0, layer);
     }
+}
+
+/* Cube / array MSAA (A24): the MSAA FBO renders into one layer of a multisample
+ * array (or every layer for VIO_RT_ALL_LAYERS); each face keeps its own samples,
+ * so re-binding a face keeps its colour and depth. */
+static void gl_msaa_attach_layer(GLenum target, vio_render_target_object *rt, int layer)
+{
+    if (layer < 0) {
+        glFramebufferTexture(target, GL_COLOR_ATTACHMENT0, rt->gl_msaa_color_arr, 0);
+        glFramebufferTexture(target, GL_DEPTH_STENCIL_ATTACHMENT, rt->gl_msaa_depth_arr, 0);
+    } else {
+        glFramebufferTextureLayer(target, GL_COLOR_ATTACHMENT0, rt->gl_msaa_color_arr, 0, layer);
+        glFramebufferTextureLayer(target, GL_DEPTH_STENCIL_ATTACHMENT, rt->gl_msaa_depth_arr, 0, layer);
+    }
+}
+
+static void gl_create_layered_msaa(vio_render_target_object *rt, int width, int height, int hdr)
+{
+    int layers = vio_rt_layer_count(rt);
+    GLint max_samples = 1, max_color = 1, max_depth = 1;
+    if (rt->samples <= 1 || !GLAD_GL_VERSION_3_2) { rt->samples = 1; return; }
+    glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
+    glGetIntegerv(GL_MAX_COLOR_TEXTURE_SAMPLES, &max_color);
+    glGetIntegerv(GL_MAX_DEPTH_TEXTURE_SAMPLES, &max_depth);
+    int samples = rt->samples > 8 ? 8 : rt->samples;
+    if (samples > max_samples) samples = max_samples;
+    if (samples > max_color) samples = max_color;
+    if (samples > max_depth) samples = max_depth;
+    GLint internal; GLenum base, type;
+    opengl_color_format(rt->attachment_count > 0 ? rt->formats[0] : (hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8), &internal, &base, &type);
+    while (samples > 1) {
+        glGenTextures(1, &rt->gl_msaa_color_arr);
+        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, rt->gl_msaa_color_arr);
+        glTexImage3DMultisample(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, samples, internal, width, height, layers, GL_TRUE);
+        glGenTextures(1, &rt->gl_msaa_depth_arr);
+        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, rt->gl_msaa_depth_arr);
+        glTexImage3DMultisample(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, samples, GL_DEPTH24_STENCIL8, width, height, layers, GL_TRUE);
+        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, 0);
+        glGenFramebuffers(1, &rt->gl_msaa_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, rt->gl_msaa_fbo);
+        gl_msaa_attach_layer(GL_FRAMEBUFFER, rt, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glDepthMask(GL_TRUE);
+            glClearDepth(1.0);
+            for (int l = 0; l < layers; l++) {
+                gl_msaa_attach_layer(GL_FRAMEBUFFER, rt, l);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+            }
+            gl_msaa_attach_layer(GL_FRAMEBUFFER, rt, 0);
+            rt->gl_msaa_layer = 0;
+            break;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1, &rt->gl_msaa_fbo);
+        glDeleteTextures(1, &rt->gl_msaa_color_arr);
+        glDeleteTextures(1, &rt->gl_msaa_depth_arr);
+        rt->gl_msaa_fbo = rt->gl_msaa_color_arr = rt->gl_msaa_depth_arr = 0;
+        samples >>= 1;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+    rt->samples = rt->gl_msaa_fbo ? samples : 1;
 }
 
 /* Cube ('cube' => true) and array ('layers' => N) targets: colour (optional,
@@ -1336,7 +1400,9 @@ static int opengl_create_layered_render_target(vio_render_target_object *rt, int
     }
     rt->bound_face = 0;
     rt->bound_level = 0;
-    rt->samples = 1;
+    if (!depth_only) gl_create_layered_msaa(rt, width, height, hdr);
+    else rt->samples = 1;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     rt->backend_type = VIO_RT_BACKEND_OPENGL;
     return 0;
 }
@@ -1497,6 +1563,26 @@ static void opengl_rt_resolve_msaa(vio_render_target_object *rt)
     GLint prev_read = 0, prev_draw = 0;
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+    if (rt->gl_msaa_color_arr) {
+        /* Cube / array: the layer(s) the MSAA FBO rendered into, face by face. */
+        int layers = vio_rt_layer_count(rt);
+        int first = rt->gl_msaa_layer < 0 ? 0 : rt->gl_msaa_layer;
+        int last = rt->gl_msaa_layer < 0 ? layers - 1 : rt->gl_msaa_layer;
+        for (int l = first; l <= last; l++) {
+            glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+            opengl_rt_attach_layer(rt, l, 0);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->gl_msaa_fbo);
+            gl_msaa_attach_layer(GL_READ_FRAMEBUFFER, rt, l);
+            glBlitFramebuffer(0, 0, rt->width, rt->height, 0, 0, rt->width, rt->height,
+                              GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, rt->gl_msaa_fbo);
+        gl_msaa_attach_layer(GL_FRAMEBUFFER, rt, rt->gl_msaa_layer);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw);
+        rt->gl_msaa_dirty = 0;
+        return;
+    }
     glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->gl_msaa_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rt->fbo);
     /* One blit per attachment (read / draw buffer i), depth with the first. */
@@ -1528,7 +1614,14 @@ static void opengl_bind_render_target(void *rt_ptr)
     }
     vio_gl.current_bound_rt = rt;
     if (rt->gl_msaa_fbo) {
+        if (rt->gl_msaa_color_arr && rt->gl_msaa_layer != 0) opengl_rt_resolve_msaa(rt);
         glBindFramebuffer(GL_FRAMEBUFFER, rt->gl_msaa_fbo);
+        if (rt->gl_msaa_color_arr) {
+            gl_msaa_attach_layer(GL_FRAMEBUFFER, rt, 0);
+            rt->gl_msaa_layer = 0;
+            rt->bound_face = 0;
+            rt->bound_level = 0;
+        }
         rt->gl_msaa_dirty = 1;
         glViewport(0, 0, rt->width, rt->height);
         return;
@@ -1557,6 +1650,19 @@ static int opengl_bind_render_target_face(void *rt_ptr, int face, int level)
         opengl_rt_resolve_msaa((vio_render_target_object *)vio_gl.current_bound_rt);
     }
     vio_gl.current_bound_rt = rt;
+    /* Leaving one face of a multisampled cube / array resolves it. */
+    int ms_face = face == VIO_RT_ALL_LAYERS ? -1 : face;
+    if (rt->gl_msaa_color_arr && rt->gl_msaa_dirty && (level != 0 || rt->gl_msaa_layer != ms_face)) opengl_rt_resolve_msaa(rt);
+    if (rt->gl_msaa_color_arr && level == 0) {
+        glBindFramebuffer(GL_FRAMEBUFFER, rt->gl_msaa_fbo);
+        gl_msaa_attach_layer(GL_FRAMEBUFFER, rt, ms_face);
+        rt->gl_msaa_layer = ms_face;
+        rt->gl_msaa_dirty = 1;
+        glViewport(0, 0, rt->width, rt->height);
+        rt->bound_face = face;
+        rt->bound_level = 0;
+        return 0;
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
     opengl_rt_attach_layer(rt, face, level);
     int w = rt->width >> level, h = rt->height >> level;

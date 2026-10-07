@@ -26,6 +26,9 @@ typedef struct _vio_render_target_object {
     unsigned int gl_msaa_fbo;
     unsigned int gl_msaa_color_rb;
     unsigned int gl_msaa_color_rbs[4];   /* MRT: attachments 1..3 ([0] unused, see gl_msaa_color_rb) */
+    unsigned int gl_msaa_color_arr;      /* cube / array MSAA (A24): GL_TEXTURE_2D_MULTISAMPLE_ARRAY, a layer per face */
+    unsigned int gl_msaa_depth_arr;
+    int          gl_msaa_layer;          /* layer the MSAA FBO renders into (-1 = all) */
     unsigned int gl_msaa_depth_rb;
     int          gl_msaa_dirty;
 
