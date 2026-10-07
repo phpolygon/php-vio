@@ -75,6 +75,13 @@ typedef struct _vio_render_target_object {
      * the bound target's count (vio_d3d12_pipeline.pso_ms). */
     void        *d3d12_msaa_color_resources[VIO_MAX_COLOR_ATTACHMENTS]; /* ID3D12Resource* */
     int          d3d12_msaa_dirty;      /* 1 => drawn into since the last resolve */
+    /* Cube / array MSAA (A24): d3d12_msaa_color_resources[0] is a multisampled
+     * array with a depth array beside it, RTVs / DSVs per layer + all layers. */
+    int          d3d12_msaa_layered;
+    int          d3d12_msaa_layer;      /* layer drawn into (-1 = all) */
+    void        *d3d12_msaa_depth_resource;
+    void        *d3d12_msaa_rtv_heap;
+    void        *d3d12_msaa_dsv_heap;
 
     /* Metal (opaque pointers — actual types are id<MTLTexture> CFBridgeRetained).
      * Stored as opaque void * so the public header doesn't pull in Metal

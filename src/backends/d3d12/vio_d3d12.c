@@ -4271,6 +4271,10 @@ static void d3d12_destroy_render_target(void *rt_ptr)
             rt->d3d12_msaa_color_resources[i] = NULL;
         }
     }
+    if (rt->d3d12_msaa_depth_resource) { ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_msaa_depth_resource); rt->d3d12_msaa_depth_resource = NULL; }
+    if (rt->d3d12_msaa_rtv_heap) { ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_msaa_rtv_heap); rt->d3d12_msaa_rtv_heap = NULL; }
+    if (rt->d3d12_msaa_dsv_heap) { ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_msaa_dsv_heap); rt->d3d12_msaa_dsv_heap = NULL; }
+    rt->d3d12_msaa_layered = 0;
     if (rt->d3d12_color_resource) {
         ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
         rt->d3d12_color_resource = NULL;
@@ -4332,6 +4336,31 @@ static int d3d12_rt_mips(const vio_render_target_object *rt)
  * and the multisampled ones are back in RENDER_TARGET for the next bind. */
 static void d3d12_rt_resolve_msaa(vio_render_target_object *rt)
 {
+    if (rt && rt->d3d12_msaa_layered && vio_d3d12.cmd_list) {
+        /* Cube / array (A24): the drawn layer(s) into mip 0 of the face; the whole
+         * single-sample resource ends readable (one state flag covers it). */
+        ID3D12Resource *dst = (ID3D12Resource *)rt->d3d12_color_resource;
+        ID3D12Resource *ms = (ID3D12Resource *)rt->d3d12_msaa_color_resources[0];
+        if (!dst || !ms) return;
+        D3D12_RESOURCE_STATES cur = rt->d3d12_color_is_srv ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (rt->d3d12_msaa_dirty) {
+            int layers = vio_rt_layer_count(rt), mips = d3d12_rt_mips(rt);
+            int first = rt->d3d12_msaa_layer < 0 ? 0 : rt->d3d12_msaa_layer;
+            int last = rt->d3d12_msaa_layer < 0 ? layers - 1 : rt->d3d12_msaa_layer;
+            d3d12_rt_barrier(vio_d3d12.cmd_list, ms, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            d3d12_rt_barrier(vio_d3d12.cmd_list, dst, cur, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+            for (int l = first; l <= last; l++)
+                ID3D12GraphicsCommandList_ResolveSubresource(vio_d3d12.cmd_list, dst, (UINT)(l * mips), ms, (UINT)l,
+                                                             vio_pixel_format_to_dxgi(rt->formats[0]));
+            d3d12_rt_barrier(vio_d3d12.cmd_list, ms, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            d3d12_rt_barrier(vio_d3d12.cmd_list, dst, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            rt->d3d12_msaa_dirty = 0;
+        } else if (!rt->d3d12_color_is_srv) {
+            d3d12_rt_barrier(vio_d3d12.cmd_list, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        rt->d3d12_color_is_srv = 1;
+        return;
+    }
     if (!rt || !rt->d3d12_msaa_color_resources[0] || !rt->d3d12_msaa_dirty || !vio_d3d12.cmd_list) return;
     int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
     if (n > VIO_MAX_COLOR_ATTACHMENTS) n = VIO_MAX_COLOR_ATTACHMENTS;
@@ -4376,7 +4405,9 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
      * (one flag covers the whole MRT set / every cube face). MSAA targets render
      * into their multisampled resources, which always stay RENDER_TARGET; the
      * resolve targets keep their SRV state until the next resolve. */
-    if (rt->d3d12_msaa_color_resources[0]) {
+    if (rt->d3d12_msaa_layered) {
+        /* handled per face below */
+    } else if (rt->d3d12_msaa_color_resources[0]) {
         rt->d3d12_msaa_dirty = 1;
     } else if (rt->d3d12_color_resource && rt->d3d12_color_is_srv) {
         int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
@@ -4419,6 +4450,26 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
         if (all) level = 0;
         int rtv_index = all ? layers * mips : face * mips + level;
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = { rtv_base.ptr + (SIZE_T)rtv_index * vio_d3d12.rtv_descriptor_size };
+        if (rt->d3d12_msaa_layered) {
+            /* MSAA (A24): level 0 renders into the layer of the MS array; leaving a
+             * layer or going to a smaller level resolves first, smaller levels render
+             * single-sampled into the face itself. */
+            int ms_layer = all ? -1 : face;
+            if (rt->d3d12_msaa_dirty && (level != 0 || rt->d3d12_msaa_layer != ms_layer)) d3d12_rt_resolve_msaa(rt);
+            if (level == 0) {
+                D3D12_CPU_DESCRIPTOR_HANDLE r0, d0;
+                ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_msaa_rtv_heap, &r0);
+                ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_msaa_dsv_heap, &d0);
+                rtv.ptr = r0.ptr + (SIZE_T)(all ? layers : face) * vio_d3d12.rtv_descriptor_size;
+                dsv_handle.ptr = d0.ptr + (SIZE_T)(all ? layers : face) * vio_d3d12.dsv_descriptor_size;
+                rt->d3d12_msaa_layer = ms_layer;
+                rt->d3d12_msaa_dirty = 1;
+            } else if (rt->d3d12_color_is_srv) {
+                d3d12_rt_barrier(vio_d3d12.cmd_list, (ID3D12Resource *)rt->d3d12_color_resource,
+                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                rt->d3d12_color_is_srv = 0;
+            }
+        }
         /* The layer's depth slice matches level 0 only (GL / Metal contract). */
         ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1, &rtv, FALSE, level == 0 ? &dsv_handle : NULL);
         vio_d3d12.current_rtv = rtv;
@@ -4450,7 +4501,8 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
     vio_d3d12.current_rt_height = h;
     d3d12_rt_set_viewport_scissor(w, h);
     vio_d3d12.current_bound_rt = rt;
-    vio_d3d12.current_rt_samples = rt->samples > 1 ? rt->samples : 1;
+    /* A layered MSAA target renders single-sampled at levels > 0. */
+    vio_d3d12.current_rt_samples = (rt->samples > 1 && !(rt->d3d12_msaa_layered && rt->bound_level > 0)) ? rt->samples : 1;
     vio_d3d12.current_rt_format = rt->depth_only ? DXGI_FORMAT_UNKNOWN : vio_pixel_format_to_dxgi(rt->formats[0]);
     d3d12_rearm_pso_for_target();
 }
@@ -4594,6 +4646,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     int mips = d3d12_rt_mips(rt);
     int layers = vio_rt_layer_count(rt);
     int layered = layers > 1;
+    int want_samples = rt->samples;   /* cube / array MSAA at the end (A24) */
     /* MSAA (GAP-PHASE5 Block 1): clamp the request to a power of two the device
      * supports for attachment 0's format. Cube / depth-only targets stay
      * single-sample (no resolve path), like D3D11. The PSO side is handled by
@@ -4872,6 +4925,92 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
             job.rtv_count = layered ? layers * mips : attachment_count * (samples > 1 ? 2 : 1);
         }
         d3d12_submit_upload(d3d12_record_rt_clear, &job);
+    }
+    /* Cube / array MSAA (A24): a multisampled colour + depth array beside the
+     * single-sample cube / array; level-0 binds render into its layer, leaving
+     * the layer resolves it into mip 0 of the face. */
+    if (layered && !depth_only && want_samples > 1) {
+        DXGI_FORMAT cf = vio_pixel_format_to_dxgi(rt->formats[0]);
+        UINT ms = 1;
+        for (UINT s = want_samples > 8 ? 8 : (UINT)want_samples; s > 1; s >>= 1) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS mq = {0};
+            mq.Format = cf;
+            mq.SampleCount = s;
+            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mq, sizeof(mq)))
+                && mq.NumQualityLevels > 0) { ms = s; break; }
+        }
+        if (ms > 1) {
+            D3D12_HEAP_PROPERTIES hp = {0};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = {0};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = (UINT64)width;
+            rd.Height = (UINT)height;
+            rd.DepthOrArraySize = (UINT16)layers;
+            rd.MipLevels = 1;
+            rd.Format = cf;
+            rd.SampleDesc.Count = ms;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            D3D12_CLEAR_VALUE cc = {0};
+            cc.Format = cf;
+            D3D12_RESOURCE_DESC dd = rd;
+            dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            D3D12_CLEAR_VALUE dc = {0};
+            dc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            dc.DepthStencil.Depth = 1.0f;
+            ID3D12Resource *cres = NULL, *dres = NULL;
+            ID3D12DescriptorHeap *rh = NULL, *dh = NULL;
+            D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+            hd.NumDescriptors = (UINT)layers + 1;
+            int ok = SUCCEEDED(ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                         D3D12_RESOURCE_STATE_RENDER_TARGET, &cc, &IID_ID3D12Resource, (void **)&cres))
+                  && SUCCEEDED(ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &dd,
+                         D3D12_RESOURCE_STATE_DEPTH_WRITE, &dc, &IID_ID3D12Resource, (void **)&dres));
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+            if (ok) ok = SUCCEEDED(ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &hd, &IID_ID3D12DescriptorHeap, (void **)&rh));
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+            if (ok) ok = SUCCEEDED(ID3D12Device_CreateDescriptorHeap(vio_d3d12.device, &hd, &IID_ID3D12DescriptorHeap, (void **)&dh));
+            if (ok) {
+                D3D12_CPU_DESCRIPTOR_HANDLE r0, d0;
+                ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rh, &r0);
+                ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dh, &d0);
+                for (int l = 0; l <= layers; l++) {
+                    D3D12_RENDER_TARGET_VIEW_DESC rv = {0};
+                    rv.Format = cf;
+                    rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+                    rv.Texture2DMSArray.FirstArraySlice = l < layers ? (UINT)l : 0;
+                    rv.Texture2DMSArray.ArraySize = l < layers ? 1 : (UINT)layers;
+                    D3D12_DEPTH_STENCIL_VIEW_DESC dv = {0};
+                    dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+                    dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+                    dv.Texture2DMSArray.FirstArraySlice = rv.Texture2DMSArray.FirstArraySlice;
+                    dv.Texture2DMSArray.ArraySize = rv.Texture2DMSArray.ArraySize;
+                    D3D12_CPU_DESCRIPTOR_HANDLE rhh = { r0.ptr + (SIZE_T)l * vio_d3d12.rtv_descriptor_size };
+                    D3D12_CPU_DESCRIPTOR_HANDLE dhh = { d0.ptr + (SIZE_T)l * vio_d3d12.dsv_descriptor_size };
+                    ID3D12Device_CreateRenderTargetView(vio_d3d12.device, cres, &rv, rhh);
+                    ID3D12Device_CreateDepthStencilView(vio_d3d12.device, dres, &dv, dhh);
+                }
+                rt->d3d12_msaa_color_resources[0] = cres;
+                rt->d3d12_msaa_depth_resource = dres;
+                rt->d3d12_msaa_rtv_heap = rh;
+                rt->d3d12_msaa_dsv_heap = dh;
+                rt->d3d12_msaa_layered = 1;
+                rt->d3d12_msaa_layer = 0;
+                rt->samples = (int)ms;
+                d3d12_rt_clear_job mjob = {0};
+                mjob.rtv0 = r0;
+                mjob.rtv_count = layers;
+                mjob.dsv = d0;
+                mjob.dsv_count = layers;
+                d3d12_submit_upload(d3d12_record_rt_clear, &mjob);
+            } else {
+                if (cres) ID3D12Resource_Release(cres);
+                if (dres) ID3D12Resource_Release(dres);
+                if (rh) ID3D12DescriptorHeap_Release(rh);
+                if (dh) ID3D12DescriptorHeap_Release(dh);
+            }
+        }
     }
     return 0;
 }
