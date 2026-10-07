@@ -11639,20 +11639,21 @@ ZEND_FUNCTION(vio_render_target)
      * depth_only target; vio_generate_mipmaps reduces each level from the one
      * below ('depth_reduction' => VIO_DEPTH_REDUCE_MAX (default) / _MIN). */
     int depth_reduction = VIO_DEPTH_REDUCE_MAX;
+    /* Also the resolve of a multisampled depth_only target (A24). */
+    if (depth_only && (val = zend_hash_str_find(config_ht, "depth_reduction", sizeof("depth_reduction") - 1)) != NULL) {
+        zend_long r = zval_get_long(val);
+        if (r != VIO_DEPTH_REDUCE_MAX && r != VIO_DEPTH_REDUCE_MIN) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'depth_reduction' must be VIO_DEPTH_REDUCE_MAX or VIO_DEPTH_REDUCE_MIN");
+            RETURN_FALSE;
+        }
+        depth_reduction = (int)r;
+    }
     if (depth_only && !is_cube && layers <= 1 &&
         (val = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1)) != NULL && zend_is_true(val)) {
         if (!ctx->backend->supports_feature || !ctx->backend->supports_feature(VIO_FEATURE_DEPTH_MIPMAPS)) {
             php_error_docref(NULL, E_WARNING,
                 "vio_render_target: depth targets with mipmaps are not supported on backend '%s' (VIO_FEATURE_DEPTH_MIPMAPS)", ctx->backend->name);
             RETURN_FALSE;
-        }
-        if ((val = zend_hash_str_find(config_ht, "depth_reduction", sizeof("depth_reduction") - 1)) != NULL) {
-            zend_long r = zval_get_long(val);
-            if (r != VIO_DEPTH_REDUCE_MAX && r != VIO_DEPTH_REDUCE_MIN) {
-                php_error_docref(NULL, E_WARNING, "vio_render_target: 'depth_reduction' must be VIO_DEPTH_REDUCE_MAX or VIO_DEPTH_REDUCE_MIN");
-                RETURN_FALSE;
-            }
-            depth_reduction = (int)r;
         }
         mip_levels = 1;
         for (int d = width > height ? width : height; d > 1; d >>= 1) mip_levels++;

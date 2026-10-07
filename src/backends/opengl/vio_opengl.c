@@ -1197,6 +1197,7 @@ static void opengl_destroy_render_target(void *rt_ptr)
         if (rt->gl_msaa_color_rbs[i]) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_color_rbs[i]); rt->gl_msaa_color_rbs[i] = 0; }
     if (rt->gl_msaa_depth_rb) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_depth_rb); rt->gl_msaa_depth_rb = 0; }
     if (rt->gl_msaa_color_arr) { if (live) glDeleteTextures(1, &rt->gl_msaa_color_arr); rt->gl_msaa_color_arr = 0; }
+    if (rt->gl_msaa_depth_tex) { if (live) glDeleteTextures(1, &rt->gl_msaa_depth_tex); rt->gl_msaa_depth_tex = 0; }
     if (rt->gl_msaa_depth_arr) { if (live) glDeleteTextures(1, &rt->gl_msaa_depth_arr); rt->gl_msaa_depth_arr = 0; }
     if (rt->fbo) {
         if (live) glDeleteFramebuffers(1, &rt->fbo);
@@ -1548,6 +1549,37 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
             samples >>= 1;
         }
         rt->samples = rt->gl_msaa_fbo ? samples : 1;
+    } else if (rt->samples > 1 && depth_only && rt->mip_levels <= 1 && GLAD_GL_VERSION_3_2) {
+        /* depth_only MSAA (A24): a multisample depth texture drawn into, resolved
+         * into depth_texture by a shader (max / min of the samples). */
+        GLint max_depth = 1;
+        glGetIntegerv(GL_MAX_DEPTH_TEXTURE_SAMPLES, &max_depth);
+        int samples = rt->samples > 8 ? 8 : rt->samples;
+        if (samples > max_depth) samples = max_depth;
+        while (samples > 1) {
+            glGenTextures(1, &rt->gl_msaa_depth_tex);
+            glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, rt->gl_msaa_depth_tex);
+            glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, samples, GL_DEPTH24_STENCIL8, width, height, GL_TRUE);
+            glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, 0);
+            glGenFramebuffers(1, &rt->gl_msaa_fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, rt->gl_msaa_fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D_MULTISAMPLE, rt->gl_msaa_depth_tex, 0);
+            glDrawBuffer(GL_NONE);
+            glReadBuffer(GL_NONE);
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                glDepthMask(GL_TRUE);
+                glClearDepth(1.0);
+                glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                break;
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glDeleteFramebuffers(1, &rt->gl_msaa_fbo);
+            glDeleteTextures(1, &rt->gl_msaa_depth_tex);
+            rt->gl_msaa_fbo = rt->gl_msaa_depth_tex = 0;
+            samples >>= 1;
+        }
+        rt->samples = rt->gl_msaa_fbo ? samples : 1;
     } else {
         rt->samples = 1;
     }
@@ -1556,10 +1588,17 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
     return 0;
 }
 
+static int gl_resolve_depth_msaa(vio_render_target_object *rt);
+
 /* Resolve a multisampled target into its texture FBO (no-op otherwise). */
 static void opengl_rt_resolve_msaa(vio_render_target_object *rt)
 {
     if (!rt || !rt->gl_msaa_fbo || !rt->gl_msaa_dirty) return;
+    if (rt->gl_msaa_depth_tex) {   /* depth_only MSAA (A24) */
+        gl_resolve_depth_msaa(rt);
+        rt->gl_msaa_dirty = 0;
+        return;
+    }
     GLint prev_read = 0, prev_draw = 0;
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
@@ -1862,6 +1901,78 @@ static int gl_generate_depth_mips(vio_render_target_object *rt)
     return ok ? 0 : -1;
 }
 
+/* depth_only MSAA (A24): the samples of each texel reduced (max / min, the
+ * target's depth_reduction) into the single-sample depth texture by a
+ * full-screen triangle writing gl_FragDepth. */
+static const char *gl_depth_resolve_fs =
+    "#version 330 core\n"
+    "uniform sampler2DMS u_src; uniform int u_mode; uniform int u_samples;\n"
+    "void main() {\n"
+    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "    float d = u_mode == 0 ? 0.0 : 1.0;\n"
+    "    for (int s = 0; s < u_samples; s++) { float v = texelFetch(u_src, p, s).r; d = u_mode == 0 ? max(d, v) : min(d, v); }\n"
+    "    gl_FragDepth = d;\n"
+    "}\n";
+static GLuint gl_depth_resolve_prog = 0;
+static unsigned int gl_depth_resolve_gen = 0;
+
+static int gl_resolve_depth_msaa(vio_render_target_object *rt)
+{
+    if (!rt->gl_msaa_depth_tex || !rt->depth_texture) return -1;
+    if (!gl_depth_reduce_vao || gl_depth_reduce_gen != gl_context_generation) {
+        glGenVertexArrays(1, &gl_depth_reduce_vao);
+        gl_depth_reduce_prog = 0;
+        gl_depth_reduce_gen = gl_context_generation;
+    }
+    if (!gl_depth_resolve_prog || gl_depth_resolve_gen != gl_context_generation) {
+        gl_depth_resolve_prog = vio_opengl_compile_shader_source(gl_depth_reduce_vs, gl_depth_resolve_fs);
+        gl_depth_resolve_gen = gl_context_generation;
+        if (!gl_depth_resolve_prog) return -1;
+    }
+    GLint prev_fbo = 0, prev_prog = 0, prev_vao = 0, prev_active = 0, prev_tex = 0, prev_func = GL_LESS, vp[4];
+    GLboolean prev_mask = GL_TRUE;
+    GLboolean prev_test = glIsEnabled(GL_DEPTH_TEST), prev_scissor = glIsEnabled(GL_SCISSOR_TEST), prev_cull = glIsEnabled(GL_CULL_FACE);
+    GLboolean prev_stencil = glIsEnabled(GL_STENCIL_TEST);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev_vao);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+    glGetIntegerv(GL_VIEWPORT, vp);
+    glGetIntegerv(GL_DEPTH_FUNC, &prev_func);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &prev_mask);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D_MULTISAMPLE, &prev_tex);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+    glUseProgram(gl_depth_resolve_prog);
+    glBindVertexArray(gl_depth_reduce_vao);
+    glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, rt->gl_msaa_depth_tex);
+    glUniform1i(glGetUniformLocation(gl_depth_resolve_prog, "u_src"), 0);
+    glUniform1i(glGetUniformLocation(gl_depth_resolve_prog, "u_mode"), rt->depth_reduction == VIO_DEPTH_REDUCE_MIN ? 1 : 0);
+    glUniform1i(glGetUniformLocation(gl_depth_resolve_prog, "u_samples"), rt->samples);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_ALWAYS);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_STENCIL_TEST);
+    glViewport(0, 0, rt->width, rt->height);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, (GLuint)prev_tex);
+    glActiveTexture((GLenum)prev_active);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+    glUseProgram((GLuint)prev_prog);
+    glBindVertexArray((GLuint)prev_vao);
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+    glDepthFunc((GLenum)prev_func);
+    glDepthMask(prev_mask);
+    if (!prev_test) glDisable(GL_DEPTH_TEST);
+    if (prev_scissor) glEnable(GL_SCISSOR_TEST);
+    if (prev_cull) glEnable(GL_CULL_FACE);
+    if (prev_stencil) glEnable(GL_STENCIL_TEST);
+    return 0;
+}
 static int opengl_generate_mipmaps(void *obj, int kind)
 {
     if (!obj || !vio_gl.initialized) return -1;
