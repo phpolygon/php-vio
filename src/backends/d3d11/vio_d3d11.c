@@ -2542,6 +2542,9 @@ static void d3d11_mirror_backbuffer(void)
 
 int vio_d3d11_resolve_readback(void)
 {
+    /* Mid-frame (the D3D / Metal / GL contract): the frame so far, not the
+     * mirror end_frame left from the previous frame. */
+    if (vio_d3d11.context && vio_d3d11.in_frame && !vio_d3d11.current_bound_rt) d3d11_mirror_backbuffer();
     if (!vio_d3d11.context || !vio_d3d11.readback_mirror) return 0;
 
     D3D11_TEXTURE2D_DESC md;
