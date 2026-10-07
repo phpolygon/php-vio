@@ -4,7 +4,7 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.8.0**, 188 PHP-Funktionen, 16 Zend-Klassen,
+für die PHPolygon Game Engine. Aktuell **v2.8.0**, 189 PHP-Funktionen, 16 Zend-Klassen,
 6 Backends, 98 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
@@ -102,6 +102,12 @@ mit `-d vio.debug=1` (D3D12-Debug-Layer, Vulkan-Validation): mehrere Befunde zei
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/193` | Tiefen-Targets mit Mip-Kette (`'depth_only' => true, 'mipmaps' => true`, `'depth_reduction' => VIO_DEPTH_REDUCE_MAX`/`_MIN`, `VIO_FEATURE_DEPTH_MIPMAPS`): `vio_generate_mipmaps` baut jede Stufe als Max/Min der 2×2-Texel darunter (Hi-Z); Stufe 1 und 4 per `texelFetch` gegen die eigenen Level-0-Werte, eine Kette im Frame, eine danach; Targets ohne Kette lehnen ab. |
+| `tests/render2d/192` | Vertikaltext (`'vertical' => true`, HarfBuzz TTB): Spalten von oben nach unten ab (x = rechter Rand, y = oben), `'\n'` beginnt die nächste Spalte links, vertikale Formen der Interpunktion; `vio_text_measure` tauscht die Achsen (Breite = Spalten × Zeilenhöhe). Braucht einen CJK-Systemfont. |
+| `tests/render3d/191` | ASTC (`VIO_FORMAT_ASTC_4x4/5x5/6x6/8x8`, `VIO_FEATURE_TEXTURE_COMPRESSION_ASTC`): ein handkodierter Void-Extent-Block dekodiert in jeder Blockgröße und aus KTX2, wo das Flag gesetzt ist (Apple-GPUs, Vulkan/GL mit ASTC-LDR); sonst lehnt `vio_texture` mit Warnung ab. |
+| `tests/render3d/190` | KTX2 mit sechs Faces → `VioCubemap`, mit Tiefe → 3D-`VioTexture` (RGBA8 / R8, `mip_offset`), BC-Cubes werden abgelehnt; `vio_cubemap(['faces' => [RGBA-Strings], 'width', 'height'])`. |
+| `tests/render2d/189` | Glyph-Atlas füllt sich bei Bedarf: `vio_font` rasterisiert nichts, `vio_text` nur die neuen Glyphen (Teilrechteck-Upload über `update_font_atlas`), `vio_text_measure` gar nichts (`vio_font_info`); über mehrere Frames angekommener Text gleicht pixelgenau einem frischen Font. |
+| `tests/render3d/188` | `vio_read_pixels` liefert auf jedem Backend den neuesten Frame: nach jedem Frame, nach mehreren ungelesenen Frames in flight, nach einem Offscreen-Frame und mitten im Frame (D3D11 lieferte dort den vorigen Frame). Vulkan wartet nur noch auf den Fence des kopierenden Frames statt `vkDeviceWaitIdle`. |
 | `tests/core/187` | Kalibrierlauf (`vio_benchmark_backends`, `vio_create('auto', ['benchmark' => true])`): dieselbe Szene (64 Draws in ein RT, Post-Pass, async Compute; headless auf der GPU) auf den drei besten Kandidaten, Ergebnis nach ms sortiert, Cache `vio-benchmark.json` je (Backend, Adapter, Treiber, vio-Version) – ein Treffer überspringt den Lauf; ein im Cache schnellster Kandidat gewinnt `auto` (`selected_by` = `benchmark`, `benchmark_ms` je Kandidat). |
 | `tests/core/186` | Scoring für `auto` (`prefer`, `require`, `vio_rank_backends`): Herstellerprofil (NVIDIA d3d12 > vulkan > d3d11, AMD vulkan > d3d12, ältere Intel-iGPUs d3d11, Apple metal, Linux vulkan > opengl, `compat` d3d11/opengl vorn), Software-Rasterizer zuletzt, `require` filtert; simuliert über `VIO_TEST_ADAPTERS` (JSON mit Plattform), unerfüllbares `require` → `false` mit Warnung; `vio_backend_info` meldet `selected_by` und die Kandidaten. |
 | `tests/core/185` | `vio_adapters()` ohne Kontext: je Backend die Adapter (Name, PCI-Vendor/-Device, Treiber, Gerätetyp, VRAM, Hardware-Features als `VIO_FEATURE_*`), diskrete zuerst, WARP/Software zuletzt; der Adapter eines geöffneten Kontexts ist dabei; GL kennt nur den Adapter des lebenden Kontexts; unbekanntes Backend → `ValueError`. |
@@ -249,6 +255,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Adjacency-Topologien (`VIO_*_ADJACENCY`, `vio_mesh(['adjacency' => true])`) | ✅ | ✅ | ✅ | ✅ | ✅ (emuliert; ohne `TRIANGLE_STRIP_ADJACENCY`) |
 | HLSL-Stage-Override (`'hlsl' => [stage => src]`, `VIO_FEATURE_HLSL_STAGE_OVERRIDE`) | — | ✅ | ✅ (auch DXIL / SM 6) | — | — |
 | Cubemap-RT + `vio_generate_mipmaps` | ✅ | ✅ (`GenerateMips`) | ✅ (Compute-Downsample, CPU-Fallback) | ✅ (Framebuffer je Face/Level, `vkCmdBlitImage`-Kette) | ✅ |
+| Tiefen-Mips / Hi-Z (`'depth_only' => true, 'mipmaps' => true`, `'depth_reduction'`, `VIO_FEATURE_DEPTH_MIPMAPS`) | ✅ (Vollbild-Dreieck schreibt `gl_FragDepth`, Basis-Level auf die Quelle gepinnt) | ✅ (DSV je Stufe + Ein-Mip-SRV, Zustand wird wiederhergestellt) | ✅ (Grafik-PSO, beide Ebenen je Stufe `PIXEL_SHADER_RESOURCE`/`DEPTH_WRITE`, im Frame auf der Frame-Liste) | ✅ (Depth-only-Pass je Stufe, Ressourcen je Target gecacht) | ✅ (`Depth32Float`-Kette, Pass je Stufe, `[[depth(any)]]`) |
 | `vio_read_render_target` | ✅ | ✅ | ✅† | ✅ (nach `vio_end`, Face und Attachment) | ✅ |
 | `vio_texture_update` | ✅ | ✅ | ✅ | ✅ (Staging-Buffer + Transient-Command-Buffer, Level 0) | ✅ |
 | `depth_write` / `color_mask` / Blend-Modi | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -258,6 +265,8 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Shader-/Pipeline-Cache auf Platte (`vio_create(['shader_cache' => dir])`, `vio_shader_cache_stats`) | ✅ (GL ≥ 4.1 Program-Binary) | ✅ (DXBC je Stage) | ✅ (DXBC je Stage) | ✅ (`VkPipelineCache`) | — (Metal cacht selbst) |
 | Indirect Draw (`vio_draw_indirect`, `vio_storage_buffer(['indirect' => true])`, `VIO_FEATURE_INDIRECT_DRAW`) | ✅ (GL ≥ 4.0 `glDraw*Indirect`) | ✅ (`Draw*InstancedIndirect`) | ✅ (`ExecuteIndirect`) | ✅ (`vkCmdDraw(Indexed)Indirect`, Multi-Draw wenn verfügbar) | ✅ (`indirectBuffer:`) |
 | Texture-Arrays + BC + KTX2 (`vio_texture(['layers', 'format' => VIO_FORMAT_BC*, 'mip_levels'])`, `vio_texture_ktx2`, `VIO_FEATURE_TEXTURE_ARRAY` / `_TEXTURE_COMPRESSION_BC`) | ✅ (`GL_TEXTURE_2D_ARRAY`, S3TC/RGTC/BPTC) | ✅ | ✅ | ✅ (2D-Array-Views, `textureCompressionBC`, Block 10c) | ✅ (`MTLTextureType2DArray`, BC-Formate) |
+| KTX2-Cubemaps / -3D (`vio_texture_ktx2` → `VioCubemap` bzw. 3D-`VioTexture`, unkomprimiert) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| ASTC (`VIO_FORMAT_ASTC_4x4/5x5/6x6/8x8`, `VIO_FEATURE_TEXTURE_COMPRESSION_ASTC`) | ✅ mit `GL_KHR_texture_compression_astc_ldr` | ❌ | ❌ | ✅ mit `textureCompressionASTC_LDR` | ✅ (Apple2+, nicht auf Intel-/AMD-Macs) |
 | Variable Rate Shading (`vio_set_shading_rate`, `VIO_SHADING_RATE_*`, `VIO_FEATURE_SHADING_RATE`) | ❌ | ❌ | ✅ (`RSSetShadingRate`, Tier 1+; 4X4 nur mit Additional Rates) | ✅ (`VK_KHR_fragment_shading_rate`, Pipeline-Rate als Dynamic State, Block 10c) | ❌ |
 | VRS pro Primitiv (`gl_PrimitiveShadingRateEXT`, `VIO_FEATURE_SHADING_RATE_PRIMITIVE`) | ❌ (SPIRV-Cross: nur Vulkan-GLSL) | ❌ | ✅ (Tier 2 + SM 6.4 `SV_ShadingRate`, Combiner OVERRIDE für Pipelines, deren VS die Rate schreibt) | ✅ (`primitiveFragmentShadingRate`, Combiner REPLACE je Pipeline) | ❌ |
 | VRS-Bild (`vio_set_shading_rate_image`, `VIO_FEATURE_SHADING_RATE_IMAGE`) | ❌ | ❌ | ✅ (Tier 2: R8_UINT-Textur in `SHADING_RATE_SOURCE`, `RSSetShadingRateImage`, Combiner MAX; nach jedem Listen-Reset neu gesetzt) | ❌ (bräuchte `vkCreateRenderPass2` + Fragment-Shading-Rate-Attachment in jedem Pass; kein Treiber in CI/lokal) | ❌ (Rasterization Rate Maps sind ein anderes Modell) |
@@ -974,11 +983,13 @@ through a full shaping pipeline instead of the legacy codepoint-per-glyph path �
 this is what makes Arabic (RTL + joining), Thai (clustering), and ligatures
 render correctly. Implementation: `src/vio_text_shape.c`.
 
-- **Atlas**: switches from codepoint-keyed to **glyph-index-keyed**. Every glyph
-  the font has (0..numGlyphs) is packed once at `vio_font()` creation via
-  `stb_rect_pack` + `stbtt_MakeGlyphBitmap`, then uploaded once — so the GPU
-  atlas handle is **stable for the font's life** (no runtime re-upload, no
-  destroy race on deferred backends). Glyph-index keying is required because
+- **Atlas**: switches from codepoint-keyed to **glyph-index-keyed**. The atlas
+  texture is created once at `vio_font()` (its GPU handle is **stable for the
+  font's life**) and **fills on demand** (OPEN-ITEMS-PLAN A33): `vio_text`
+  rasterizes a glyph the first time it draws it into a CPU copy of the atlas and
+  uploads the rectangle its new glyphs dirtied through the vtable slot
+  `update_font_atlas`; `vio_text_measure` rasterizes nothing; `vio_font_info()`
+  reports glyphs / rasterized / atlas size. Glyph-index keying is required because
   HarfBuzz emits glyphs (ligatures, positional forms) that no codepoint reaches.
 - **Pipeline** per string: SheenBidi resolves BiDi levels and returns runs in
   *visual* order (`SBLine`) → each run is shaped by HarfBuzz with the
@@ -998,7 +1009,10 @@ render correctly. Implementation: `src/vio_text_shape.c`.
   leading-vowel starts a cluster; combining vowels/tones stay attached). Thai is
   dictionary-free, so it breaks at clusters, not true word boundaries; a segment
   wider than `max_width` still overflows (no mid-cluster/mid-word split).
-  Vertical text is out of scope.
+  **Vertical text** (`'vertical' => true` on `vio_text` / `vio_text_measure`,
+  A34): each column is shaped top to bottom (HB_DIRECTION_TTB, vertical forms),
+  glyphs upright, (x, y) = top-right corner, `'\n'` starts the next column to the
+  left; soft wrapping stays horizontal only.
 
 ## PIE Installation
 
@@ -1091,7 +1105,7 @@ nicht an `@available` im Feature-Code.
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 188 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess, 184 `vio_backend_info` auf allen Backends, 185 `vio_adapters`, 186 Scoring für `auto`, 187 Kalibrierlauf)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 194 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess, 184 `vio_backend_info` auf allen Backends, 185 `vio_adapters`, 186 Scoring für `auto`, 187 Kalibrierlauf, 188 Readback des neuesten Frames, 189 Glyph-Atlas bei Bedarf, 190 KTX2-Cubemaps/-3D, 191 ASTC, 192 Vertikaltext, 193 Tiefen-Mips)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -1336,7 +1350,7 @@ Aufrufer geändert hat:
   Laufzeit neben `php.exe` liegen. Für ein self-contained `vio.dll` wäre
   `harfbuzz[core]:x64-windows-static-md` (ohne FreeType, statisch, /MD) die
   sauberere Deployment-Variante.
-- Shaping: horizontal only. Vertikaler Text (CJK vertical) ist Folgearbeit.
+- Shaping: Vertikaltext (`'vertical' => true`) ohne weichen Umbruch und ohne seitlich gedrehte Latein-Läufe (alles aufrecht).
 - **Tessellierte Isolines auf WARP**: Der Software-Rasterizer (vios Headless-D3D11/D3D12-Device und die
   Windows-CI) verliert die Linien-Primitive tessellierter Isolines – ein eigenständiges D3D11-Programm ohne vio
   zeichnet dort nichts, in vio kommen je Frame zufällig Linien an. Der Tessellator selbst stimmt (Punkt-Ausgabe

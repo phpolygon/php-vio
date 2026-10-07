@@ -167,7 +167,13 @@ jobs:
             tests/core/184_backend_info_all_backends.phpt \
             tests/core/185_adapters.phpt \
             tests/core/186_backend_scoring.phpt \
-            tests/core/187_backend_benchmark.phpt
+            tests/core/187_backend_benchmark.phpt \
+            tests/render3d/188_readback_latest_frame_all_backends.phpt \
+            tests/render2d/189_glyph_atlas_lazy_all_backends.phpt \
+            tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt \
+            tests/render3d/191_astc_textures_all_backends.phpt \
+            tests/render2d/192_vertical_text.phpt \
+            tests/render3d/193_depth_mipmaps_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -332,7 +338,13 @@ jobs:
             tests/core/184_backend_info_all_backends.phpt \
             tests/core/185_adapters.phpt \
             tests/core/186_backend_scoring.phpt \
-            tests/core/187_backend_benchmark.phpt
+            tests/core/187_backend_benchmark.phpt \
+            tests/render3d/188_readback_latest_frame_all_backends.phpt \
+            tests/render2d/189_glyph_atlas_lazy_all_backends.phpt \
+            tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt \
+            tests/render3d/191_astc_textures_all_backends.phpt \
+            tests/render2d/192_vertical_text.phpt \
+            tests/render3d/193_depth_mipmaps_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -741,6 +753,12 @@ jobs:
             tests/core/185_adapters.phpt `
             tests/core/186_backend_scoring.phpt `
             tests/core/187_backend_benchmark.phpt `
+            tests/render3d/188_readback_latest_frame_all_backends.phpt `
+            tests/render2d/189_glyph_atlas_lazy_all_backends.phpt `
+            tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt `
+            tests/render3d/191_astc_textures_all_backends.phpt `
+            tests/render2d/192_vertical_text.phpt `
+            tests/render3d/193_depth_mipmaps_all_backends.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt
 
       - name: Package binary

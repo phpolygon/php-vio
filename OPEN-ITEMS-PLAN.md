@@ -37,9 +37,10 @@ A4 `describe` für D3D12/D3D11/Vulkan/GL (Test 184) ✅ · A6 `vio_adapters()` (
 `vio_benchmark_backends`, `headless_hardware`; Test 187) ✅.
 
 ## Batch 4 — Render-Features
-A24 MSAA für Depth-only/Cube/Array/MRT · A26 Tiefentexturen mit Mip-Kette · A35 KTX2-Cubemaps und -3D
-(Supercompression braucht zstd/Basis → **nicht** in diesem Plan) · A20 ASTC · A33 Sub-Image-Uploads für den Glyph-Atlas ·
-A34 Vertikaltext · A36 Vulkan `read_pixels` ohne `vkDeviceWaitIdle`.
+A24 MSAA für Depth-only/Cube/Array/MRT · A26 Tiefentexturen mit Mip-Kette ✅ (Test 193) · A35 KTX2-Cubemaps und -3D ✅ (Test 190)
+(Supercompression braucht zstd/Basis → **nicht** in diesem Plan) · A20 ASTC ✅ (Test 191; Dekodierung belegt nur die macOS-CI) ·
+A33 Sub-Image-Uploads für den Glyph-Atlas ✅ (Test 189) · A34 Vertikaltext ✅ (Test 192) · A36 Vulkan `read_pixels` ohne
+`vkDeviceWaitIdle` ✅ (Test 188; Nebenbefund: D3D11 las mitten im Frame den vorigen Frame).
 
 ## Batch 5 — Lücken der Shader-Stages
 A29 Hull/Domain-Generator (Interface-Blöcke, Struct-/Matrix-Varyings, `gl_ClipDistance`, fremde Kontrollpunkte) ·
