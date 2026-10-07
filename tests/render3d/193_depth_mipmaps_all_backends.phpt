@@ -52,8 +52,12 @@ foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
         vio_bind_pipeline($ctx, $pDepth);
         foreach ([$qa, $qb, $qs] as $q) vio_draw($ctx, $q);
         vio_unbind_render_target($ctx);
+        // 'min' builds the chain inside the frame (recorded on the frame's command stream), 'max' after it.
+        $inFrame = $mode === VIO_DEPTH_REDUCE_MIN;
+        $gen = $inFrame ? vio_generate_mipmaps($ctx, $rt) : null;
         vio_end($ctx);
-        if (!vio_generate_mipmaps($ctx, $rt)) { $fail[] = "$name: generate_mipmaps false"; continue; }
+        if (!$inFrame) $gen = vio_generate_mipmaps($ctx, $rt);
+        if (!$gen) { $fail[] = "$name: generate_mipmaps false"; continue; }
         $l0 = $read($rt, 0);
         [$dl, $ds, $dr] = [$l0[0], $l0[2], $l0[8]];
         if (!($dl < $ds && $ds < $dr)) { $fail[] = "$name level 0 " . json_encode($l0); continue; }
