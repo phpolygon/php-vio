@@ -2402,9 +2402,11 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
 
         /* Depth texture — always created (parallel to OpenGL's "always create
          * depth attachment" pattern so shadow-map RTs work uniformly). */
+        /* depth_only + 'mipmaps' (A26): a Depth32Float chain (no stencil plane). */
+        int depth_mips = depth_only && rt->mip_levels > 1 && samples <= 1;
         MTLTextureDescriptor *depth_desc = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL
-            width:width height:height mipmapped:NO];
+            texture2DDescriptorWithPixelFormat:(depth_mips ? MTLPixelFormatDepth32Float : VIO_METAL_DEPTH_STENCIL)
+            width:width height:height mipmapped:(depth_mips ? YES : NO)];
         depth_desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         depth_desc.storageMode = MTLStorageModePrivate;
         if (samples > 1) {
@@ -5294,6 +5296,122 @@ static int metal_update_texture(void *tex_obj, const void *pixels, int x, int y,
 /* Build the mip chain of an RT colour texture / texture / cubemap. Inside a
  * frame the open pass is closed first so the blit is ordered after the draws
  * that produced level 0, then reopened with Load. */
+/* Depth mip chain (A26, blind - the macOS CI is the check): each level is the
+ * max / min of the 2x2 texels below (odd sizes fold the extra column / row
+ * into the last texel), written as [[depth(any)]] by a full-screen triangle in
+ * one render pass per level; the source is a single-level view of the level
+ * below. Mipmapped depth targets are Depth32Float (no stencil plane). */
+static const char *metal_dmip_msl =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VOut { float4 pos [[position]]; };\n"
+    "struct P { int4 sizes; int4 mode; };\n"
+    "struct FOut { float depth [[depth(any)]]; };\n"
+    "vertex VOut vio_dmip_vs(uint vid [[vertex_id]]) {\n"
+    "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+    "    VOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;\n"
+    "}\n"
+    "fragment FOut vio_dmip_fs(VOut in [[stage_in]], depth2d<float> src [[texture(0)]], constant P& p [[buffer(0)]]) {\n"
+    "    int2 o = int2(in.pos.xy);\n"
+    "    int2 n = int2((o.x == p.sizes.z - 1 && (p.sizes.x & 1) == 1 && p.sizes.x > 1) ? 3 : 2,\n"
+    "                  (o.y == p.sizes.w - 1 && (p.sizes.y & 1) == 1 && p.sizes.y > 1) ? 3 : 2);\n"
+    "    float d = p.mode.x == 0 ? 0.0 : 1.0;\n"
+    "    for (int y = 0; y < 3; y++) for (int x = 0; x < 3; x++) {\n"
+    "        if (x >= n.x || y >= n.y) continue;\n"
+    "        int2 c = min(o * 2 + int2(x, y), p.sizes.xy - 1);\n"
+    "        float s = src.read(uint2(c), 0);\n"
+    "        d = p.mode.x == 0 ? max(d, s) : min(d, s);\n"
+    "    }\n"
+    "    FOut r; r.depth = d; return r;\n"
+    "}\n";
+
+static id<MTLRenderPipelineState> metal_dmip_pso = nil;
+static id<MTLDepthStencilState>   metal_dmip_dss = nil;
+static id<MTLDevice>              metal_dmip_device = nil;
+
+static int metal_generate_depth_mips(vio_render_target_object *rt)
+{
+    if (!rt->metal_depth_texture || rt->mip_levels < 2) return -1;
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)rt->metal_depth_texture;
+    if (tex.mipmapLevelCount < 2) return -1;
+    if (metal_dmip_device != vio_mtl.device || !metal_dmip_pso) {
+        metal_dmip_pso = nil;
+        metal_dmip_dss = nil;
+        metal_dmip_device = vio_mtl.device;
+        char *err = NULL;
+        id<MTLLibrary> lib = metal_build_library(metal_dmip_msl, &err);
+        if (!lib) {
+            php_error_docref(NULL, E_WARNING, "Metal: depth mip shader: %s", err ? err : "compile failed");
+            free(err);
+            return -1;
+        }
+        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = [lib newFunctionWithName:@"vio_dmip_vs"];
+        pd.fragmentFunction = [lib newFunctionWithName:@"vio_dmip_fs"];
+        pd.depthAttachmentPixelFormat = tex.pixelFormat;
+        if (tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) pd.stencilAttachmentPixelFormat = tex.pixelFormat;
+        NSError *e = nil;
+        metal_dmip_pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:pd error:&e];
+        MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = YES;
+        metal_dmip_dss = [vio_mtl.device newDepthStencilStateWithDescriptor:dd];
+        if (!metal_dmip_pso || !metal_dmip_dss) {
+            php_error_docref(NULL, E_WARNING, "Metal: depth mip pipeline: %s", e ? e.localizedDescription.UTF8String : "failed");
+            metal_dmip_pso = nil;
+            return -1;
+        }
+    }
+    int in_frame = vio_mtl.current_cmd_buf != nil;
+    id<MTLCommandBuffer> cb = in_frame ? vio_mtl.current_cmd_buf : metal_new_command_buffer();
+    if (in_frame && vio_mtl.current_encoder) {
+        [vio_mtl.current_encoder endEncoding];
+        vio_mtl.current_encoder = nil;
+    }
+    for (int l = 1; l < rt->mip_levels; l++) {
+        int sw = rt->width >> (l - 1), sh = rt->height >> (l - 1), dw = rt->width >> l, dh = rt->height >> l;
+        if (sw < 1) sw = 1;
+        if (sh < 1) sh = 1;
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        id<MTLTexture> src = [tex newTextureViewWithPixelFormat:tex.pixelFormat textureType:MTLTextureType2D
+                                                         levels:NSMakeRange((NSUInteger)(l - 1), 1) slices:NSMakeRange(0, 1)];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.depthAttachment.texture = tex;
+        rp.depthAttachment.level = (NSUInteger)l;
+        rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        if (tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+            rp.stencilAttachment.texture = tex;
+            rp.stencilAttachment.level = (NSUInteger)l;
+            rp.stencilAttachment.loadAction = MTLLoadActionDontCare;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        if (!src || !enc) {
+            if (enc) [enc endEncoding];
+            break;
+        }
+        MTLViewport vp = { 0.0, 0.0, (double)dw, (double)dh, 0.0, 1.0 };
+        [enc setViewport:vp];
+        [enc setRenderPipelineState:metal_dmip_pso];
+        [enc setDepthStencilState:metal_dmip_dss];
+        [enc setCullMode:MTLCullModeNone];
+        int32_t pc[8] = { sw, sh, dw, dh, rt->depth_reduction == VIO_DEPTH_REDUCE_MIN ? 1 : 0, 0, 0, 0 };
+        [enc setFragmentBytes:pc length:sizeof(pc) atIndex:0];
+        [enc setFragmentTexture:src atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+    }
+    if (in_frame) {
+        metal_open_encoder(/*load_clear=*/0);
+    } else {
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    return 0;
+}
+
 static int metal_generate_mipmaps(void *obj, int kind)
 {
     if (!obj || !vio_mtl.device) return -1;
@@ -5302,6 +5420,7 @@ static int metal_generate_mipmaps(void *obj, int kind)
         switch (kind) {
             case 0: {
                 vio_render_target_object *rt = (vio_render_target_object *)obj;
+                if (rt->backend_type == VIO_RT_BACKEND_METAL && rt->depth_only) return metal_generate_depth_mips(rt);
                 if (rt->backend_type != VIO_RT_BACKEND_METAL || !rt->metal_color_texture || rt->layers > 1) return -1;
                 tex = (__bridge id<MTLTexture>)rt->metal_color_texture;
                 break;
@@ -6276,6 +6395,8 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_INDIRECT_DRAW: /* drawIndexedPrimitives:indirectBuffer: */
         return 1;
     case VIO_FEATURE_TEXTURE_ARRAY: /* MTLTextureType2DArray */
+        return 1;
+    case VIO_FEATURE_DEPTH_MIPMAPS: /* metal_generate_depth_mips (A26) */
         return 1;
     case VIO_FEATURE_TEXTURE_COMPRESSION_ASTC: /* ASTC LDR on Apple GPUs (Apple2+), not on Intel / AMD Macs */
         return vio_mtl.caps.apple_family >= 2;
