@@ -393,6 +393,13 @@ typedef struct _vio_backend {
      * families and capabilities. Returns 0 when filled, -1 without a device.
      * NULL => the function reports false. */
     int   (*describe)(vio_backend_description *out);
+
+    /* Shading-rate image (VIO_FEATURE_SHADING_RATE_IMAGE): tiles_x * tiles_y
+     * VIO_SHADING_RATE_* bytes, row by row; rates == NULL clears the image.
+     * Sticky across frames like set_shading_rate. 0 on success, -1 otherwise. */
+    int   (*set_shading_rate_image)(const unsigned char *rates, int tiles_x, int tiles_y);
+    /* Edge of one image tile in pixels; 0 without the feature. */
+    int   (*shading_rate_tile_size)(void);
 } vio_backend;
 
 /*

@@ -315,6 +315,13 @@ typedef struct _vio_d3d12_state {
     int                        vrs_tier;
     int                        vrs_additional_rates;
     int                        shading_rate;
+    /* Shading-rate image (VIO_FEATURE_SHADING_RATE_IMAGE, Tier 2): an R8_UINT
+     * texture of D3D12_SHADING_RATE values, one texel per tile. */
+    int                        vrs_tile_size;      /* OPTIONS6.ShadingRateImageTileSize */
+    ID3D12Resource            *vrs_image;
+    int                        vrs_image_w, vrs_image_h;
+    int                        vrs_image_active;
+    int                        vrs_image_in_source; /* resource is in SHADING_RATE_SOURCE (after the first upload) */
     ID3D12GraphicsCommandList5 *cmd_list5;
     ID3D12GraphicsCommandList1 *cmd_list1;   /* SetViewInstanceMask (multiview) */
     /* Indirect draws (GAP-PHASE5 Block 8): command signatures for DrawIndexed

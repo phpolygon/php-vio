@@ -338,6 +338,10 @@ typedef enum _vio_feature {
      * vio_set_shading_rate set, for pipelines whose vertex stage writes it.
      * D3D12: VRS Tier 2 + SM 6.4 (SV_ShadingRate); Vulkan primitiveFragmentShadingRate. */
     VIO_FEATURE_SHADING_RATE_PRIMITIVE = 52,
+    /* vio_set_shading_rate_image(): one VIO_SHADING_RATE_* byte per screen tile
+     * (vio_shading_rate_tile_size() pixels); the final rate is the coarser of the
+     * set / primitive rate and the tile's rate. D3D12: VRS Tier 2. */
+    VIO_FEATURE_SHADING_RATE_IMAGE = 53,
 } vio_feature;
 
 #define VIO_MAX_VIEWPORTS 16

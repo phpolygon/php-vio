@@ -363,6 +363,18 @@ static void d3d12_wait_for_frame(UINT frame_idx)
 
 /* ── Descriptor heap helpers ──────────────────────────────────────── */
 
+/* VIO_SHADING_RATE_* -> D3D12_SHADING_RATE (log2 width << 2 | log2 height). */
+static D3D12_SHADING_RATE d3d12_shading_rate_value(int rate)
+{
+    switch (rate) {
+        case VIO_SHADING_RATE_1X2: return D3D12_SHADING_RATE_1X2;
+        case VIO_SHADING_RATE_2X1: return D3D12_SHADING_RATE_2X1;
+        case VIO_SHADING_RATE_2X2: return D3D12_SHADING_RATE_2X2;
+        case VIO_SHADING_RATE_4X4: return D3D12_SHADING_RATE_4X4;
+        default:                   return D3D12_SHADING_RATE_1X1;
+    }
+}
+
 /* Variable rate shading (GAP-PHASE5 Block 12): RSSetShadingRate is command-list
  * state, so the sticky rate is re-armed after every Reset of the frame list. */
 static void d3d12_apply_shading_rate(void)
@@ -374,25 +386,103 @@ static void d3d12_apply_shading_rate(void)
         vio_d3d12.vrs_tier = 0;   /* runtime too old for the interface: report honestly */
         return;
     }
-    D3D12_SHADING_RATE r;
-    switch (vio_d3d12.shading_rate) {
-        case VIO_SHADING_RATE_1X2: r = D3D12_SHADING_RATE_1X2; break;
-        case VIO_SHADING_RATE_2X1: r = D3D12_SHADING_RATE_2X1; break;
-        case VIO_SHADING_RATE_2X2: r = D3D12_SHADING_RATE_2X2; break;
-        case VIO_SHADING_RATE_4X4: r = D3D12_SHADING_RATE_4X4; break;
-        default:                   r = D3D12_SHADING_RATE_1X1; break;
-    }
+    D3D12_SHADING_RATE r = d3d12_shading_rate_value(vio_d3d12.shading_rate);
     /* Tier 2: a pipeline whose vertex stage writes SV_ShadingRate overrides the
-     * set rate with the per-primitive one; every other pipeline keeps it. */
+     * set rate with the per-primitive one; every other pipeline keeps it. The
+     * shading-rate image then combines by MAX (the coarser rate wins). */
     if (vio_d3d12.vrs_tier >= 2) {
+        int image = vio_d3d12.vrs_image_active && vio_d3d12.vrs_image;
         D3D12_SHADING_RATE_COMBINER comb[2] = {
             (d3d12_current_pipeline && d3d12_current_pipeline->writes_shading_rate)
                 ? D3D12_SHADING_RATE_COMBINER_OVERRIDE : D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
-            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH };
+            image ? D3D12_SHADING_RATE_COMBINER_MAX : D3D12_SHADING_RATE_COMBINER_PASSTHROUGH };
         ID3D12GraphicsCommandList5_RSSetShadingRate(vio_d3d12.cmd_list5, r, comb);
+        ID3D12GraphicsCommandList5_RSSetShadingRateImage(vio_d3d12.cmd_list5, image ? vio_d3d12.vrs_image : NULL);
         return;
     }
     ID3D12GraphicsCommandList5_RSSetShadingRate(vio_d3d12.cmd_list5, r, NULL);
+}
+
+static int d3d12_upload_subresources(ID3D12Resource *dst, const D3D12_RESOURCE_DESC *rd,
+                                     UINT first_sub, UINT num_sub,
+                                     const void *const *src, const UINT *src_row_pitch,
+                                     const UINT *src_rows, const UINT *src_slices,
+                                     D3D12_RESOURCE_STATES state_before,
+                                     D3D12_RESOURCE_STATES state_after,
+                                     UINT dst_x, UINT dst_y, UINT dst_z);
+static void d3d12_retire_later(ID3D12Resource *res, UINT64 fence);
+
+/* Shading-rate image (VIO_FEATURE_SHADING_RATE_IMAGE, Tier 2): an R8_UINT
+ * texture with one D3D12_SHADING_RATE per tile. A new tile count recreates it -
+ * outside a frame after a GPU drain, inside one the old texture stays alive to
+ * the end of the context (the recorded list may still reference it); the same
+ * tile count only re-uploads, ordered by the single DIRECT queue. */
+static int d3d12_set_shading_rate_image(const unsigned char *rates, int tiles_x, int tiles_y)
+{
+    if (vio_d3d12.vrs_tier < 2 || vio_d3d12.vrs_tile_size <= 0) return -1;
+    if (!rates) {
+        vio_d3d12.vrs_image_active = 0;
+        if (vio_d3d12.in_frame && vio_d3d12.cmd_list) d3d12_apply_shading_rate();
+        return 0;
+    }
+    if (tiles_x <= 0 || tiles_y <= 0) return -1;
+    size_t n = (size_t)tiles_x * (size_t)tiles_y;
+    unsigned char *texels = (unsigned char *)malloc(n);
+    if (!texels) return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (rates[i] == VIO_SHADING_RATE_4X4 && !vio_d3d12.vrs_additional_rates) { free(texels); return -1; }
+        texels[i] = (unsigned char)d3d12_shading_rate_value(rates[i]);
+    }
+    if (vio_d3d12.vrs_image && (vio_d3d12.vrs_image_w != tiles_x || vio_d3d12.vrs_image_h != tiles_y)) {
+        if (vio_d3d12.in_frame) {
+            d3d12_retire_later(vio_d3d12.vrs_image, UINT64_MAX);   /* released at shutdown */
+        } else {
+            vio_d3d12_wait_for_gpu();
+            ID3D12Resource_Release(vio_d3d12.vrs_image);
+        }
+        vio_d3d12.vrs_image = NULL;
+    }
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = (UINT64)tiles_x;
+    rd.Height = (UINT)tiles_y;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8_UINT;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    if (!vio_d3d12.vrs_image) {
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                       D3D12_RESOURCE_STATE_COMMON, NULL,
+                                                       &IID_ID3D12Resource, (void **)&vio_d3d12.vrs_image))) {
+            vio_d3d12.vrs_image = NULL;
+            free(texels);
+            return -1;
+        }
+        vio_d3d12.vrs_image_w = tiles_x;
+        vio_d3d12.vrs_image_h = tiles_y;
+        vio_d3d12.vrs_image_in_source = 0;
+    }
+    const void *src = texels;
+    UINT pitch = (UINT)tiles_x, rows = (UINT)tiles_y, slices = 1;
+    int rc = d3d12_upload_subresources(vio_d3d12.vrs_image, &rd, 0, 1, &src, &pitch, &rows, &slices,
+                                       vio_d3d12.vrs_image_in_source ? D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE
+                                                                     : D3D12_RESOURCE_STATE_COMMON,
+                                       D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE, 0, 0, 0);
+    free(texels);
+    if (rc != 0) return -1;
+    vio_d3d12.vrs_image_in_source = 1;
+    vio_d3d12.vrs_image_active = 1;
+    if (vio_d3d12.in_frame && vio_d3d12.cmd_list) d3d12_apply_shading_rate();
+    return 0;
+}
+
+static int d3d12_shading_rate_tile_size(void)
+{
+    return vio_d3d12.vrs_tier >= 2 ? vio_d3d12.vrs_tile_size : 0;
 }
 
 static int d3d12_set_shading_rate(int rate)
@@ -985,8 +1075,13 @@ static int d3d12_init(vio_config *cfg)
         if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6)))) {
             vio_d3d12.vrs_tier = (int)o6.VariableShadingRateTier;
             vio_d3d12.vrs_additional_rates = o6.AdditionalShadingRatesSupported ? 1 : 0;
+            vio_d3d12.vrs_tile_size = (int)o6.ShadingRateImageTileSize;
         }
         vio_d3d12.shading_rate = VIO_SHADING_RATE_1X1;
+        vio_d3d12.vrs_image = NULL;
+        vio_d3d12.vrs_image_w = vio_d3d12.vrs_image_h = 0;
+        vio_d3d12.vrs_image_active = 0;
+        vio_d3d12.vrs_image_in_source = 0;
     }
 
     vio_hlsl_set_16bit_types(0);   /* FXC / SM < 6.2: min16float as before */
@@ -1310,6 +1405,9 @@ static void d3d12_shutdown(void)
 
     /* Wait for GPU to finish all work */
     vio_d3d12_wait_for_gpu();
+
+    if (vio_d3d12.vrs_image) { ID3D12Resource_Release(vio_d3d12.vrs_image); vio_d3d12.vrs_image = NULL; }
+    vio_d3d12.vrs_image_active = 0;
 
     /* Upload queue: every submission is complete now, release all staging. */
     d3d12_retire_uploads(1);
@@ -4556,7 +4654,7 @@ static void d3d12_begin_frame(void)
     /* Reset command allocator and command list */
     ID3D12CommandAllocator_Reset(frame->cmd_allocator);
     ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
-    if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1) d3d12_apply_shading_rate();   /* VRS is list state */
+    if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1 || vio_d3d12.vrs_image_active) d3d12_apply_shading_rate();   /* VRS is list state */
     if (vio_d3d12.ts_heap) {
         ID3D12GraphicsCommandList_EndQuery(vio_d3d12.cmd_list, vio_d3d12.ts_heap, D3D12_QUERY_TYPE_TIMESTAMP,
                                            (UINT)vio_d3d12.frame_index * 2);
@@ -5020,7 +5118,7 @@ unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
          * transitioned it back above) so no entry barrier is needed here. */
         ID3D12CommandAllocator_Reset(frame->cmd_allocator);
         ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
-        if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1) d3d12_apply_shading_rate();   /* VRS is list state */
+        if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1 || vio_d3d12.vrs_image_active) d3d12_apply_shading_rate();   /* VRS is list state */
         ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1,
             &vio_d3d12.current_rtv, FALSE, &vio_d3d12.current_dsv);
         D3D12_VIEWPORT vp = {0, 0, (float)vio_d3d12.width, (float)vio_d3d12.height, 0.0f, 1.0f};
@@ -5514,7 +5612,7 @@ static void d3d12_compute_wait(void)
 
     ID3D12CommandAllocator_Reset(frame->cmd_allocator);
     ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
-    if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1) d3d12_apply_shading_rate();   /* VRS is list state */
+    if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1 || vio_d3d12.vrs_image_active) d3d12_apply_shading_rate();   /* VRS is list state */
     /* Re-arm the bound target (swapchain or RT), viewport, scissor and the
      * graphics pipeline state exactly as the frame had them. */
     if (vio_d3d12.current_has_rtv) {
@@ -5955,6 +6053,8 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return 1; /* BC1-BC7 mandatory on every D3D12 device */
         case VIO_FEATURE_SHADING_RATE:        return vio_d3d12.vrs_tier > 0; /* RSSetShadingRate, VRS Tier 1+ (GAP-PHASE5 12) */
         /* SV_ShadingRate (SM 6.4) + the OVERRIDE combiner (Tier 2). */
+        /* RSSetShadingRateImage + the MAX combiner (Tier 2). */
+        case VIO_FEATURE_SHADING_RATE_IMAGE:  return vio_d3d12.vrs_tier >= 2 && vio_d3d12.vrs_tile_size > 0;
         case VIO_FEATURE_SHADING_RATE_PRIMITIVE: return vio_d3d12.vrs_tier >= 2 && vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 64;
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_RENDER_TARGET_LAYERED: return 1; /* array resources: RTV / DSV per layer, array / cube SRVs */
@@ -6469,6 +6569,8 @@ static const vio_backend d3d12_backend = {
     .swapchain_info    = d3d12_swapchain_info,
     .draw_indirect     = d3d12_draw_indirect,
     .set_shading_rate  = d3d12_set_shading_rate,
+    .set_shading_rate_image = d3d12_set_shading_rate_image,
+    .shading_rate_tile_size = d3d12_shading_rate_tile_size,
     .destroy_cubemap   = d3d12_destroy_cubemap,
     .upload_cubemap    = d3d12_upload_cubemap,
     .read_render_target = d3d12_read_render_target,

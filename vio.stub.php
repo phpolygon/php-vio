@@ -396,6 +396,22 @@ function vio_draw_indirect(VioContext $context, VioMesh $mesh, VioBuffer $args, 
 function vio_set_shading_rate(VioContext $context, int $rate): bool {}
 
 /**
+ * Shading-rate image (VIO_FEATURE_SHADING_RATE_IMAGE, D3D12 VRS Tier 2): one
+ * VIO_SHADING_RATE_* byte per screen tile, row by row ($tilesX * $tilesY bytes, the
+ * tile edge is vio_shading_rate_tile_size()). Each tile shades at the coarser of its
+ * own rate and the set / per-primitive rate (combiner MAX). Sticky across frames like
+ * vio_set_shading_rate; null clears it. False where the feature is 0 or the bytes do
+ * not match the tile count.
+ */
+function vio_set_shading_rate_image(VioContext $context, ?string $rates, int $tilesX = 0, int $tilesY = 0): bool {}
+
+/**
+ * Edge of one shading-rate image tile in pixels (D3D12 ShadingRateImageTileSize:
+ * 8, 16 or 32); 0 without VIO_FEATURE_SHADING_RATE_IMAGE.
+ */
+function vio_shading_rate_tile_size(VioContext $context): int {}
+
+/**
  * Draw a mesh in the current frame.
  */
 function vio_draw(VioContext $context, VioMesh $mesh): void {}

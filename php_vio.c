@@ -4863,6 +4863,58 @@ ZEND_FUNCTION(vio_draw_indirect)
  * and the output resolution stay untouched. Sticky until changed; reset to
  * VIO_SHADING_RATE_1X1 before UI / post-processing. false when the backend
  * has no VRS tier or the rate is not offered (4X4 needs additional rates). */
+ZEND_FUNCTION(vio_set_shading_rate_image)
+{
+    zval *ctx_zval;
+    zend_string *rates = NULL;
+    zend_long tiles_x = 0, tiles_y = 0;
+    ZEND_PARSE_PARAMETERS_START(2, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR_OR_NULL(rates)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(tiles_x)
+        Z_PARAM_LONG(tiles_y)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        RETURN_FALSE;
+    }
+    if (!ctx->backend->set_shading_rate_image || !ctx->backend->supports_feature
+        || !ctx->backend->supports_feature(VIO_FEATURE_SHADING_RATE_IMAGE)) {
+        RETURN_FALSE;
+    }
+    if (!rates) RETURN_BOOL(ctx->backend->set_shading_rate_image(NULL, 0, 0) == 0);
+    if (tiles_x <= 0 || tiles_y <= 0 || tiles_x > 4096 || tiles_y > 4096
+        || (zend_long)ZSTR_LEN(rates) != tiles_x * tiles_y) {
+        php_error_docref(NULL, E_WARNING, "vio_set_shading_rate_image: expected tilesX * tilesY (%d x %d) rate bytes, got %zu",
+                         (int)tiles_x, (int)tiles_y, ZSTR_LEN(rates));
+        RETURN_FALSE;
+    }
+    const unsigned char *r = (const unsigned char *)ZSTR_VAL(rates);
+    for (size_t i = 0; i < ZSTR_LEN(rates); i++) {
+        if (r[i] > VIO_SHADING_RATE_4X4) {
+            php_error_docref(NULL, E_WARNING, "vio_set_shading_rate_image: byte %zu is %u, not a VIO_SHADING_RATE_* value", i, r[i]);
+            RETURN_FALSE;
+        }
+    }
+    RETURN_BOOL(ctx->backend->set_shading_rate_image(r, (int)tiles_x, (int)tiles_y) == 0);
+}
+
+ZEND_FUNCTION(vio_shading_rate_tile_size)
+{
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend->shading_rate_tile_size || !ctx->backend->supports_feature
+        || !ctx->backend->supports_feature(VIO_FEATURE_SHADING_RATE_IMAGE)) {
+        RETURN_LONG(0);
+    }
+    RETURN_LONG(ctx->backend->shading_rate_tile_size());
+}
+
 ZEND_FUNCTION(vio_set_shading_rate)
 {
     zval *ctx_zval;
@@ -8540,6 +8592,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BASE_VERTEX", VIO_FEATURE_BASE_VERTEX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_COMPUTE_DERIVATIVES", VIO_FEATURE_COMPUTE_DERIVATIVES, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE_PRIMITIVE", VIO_FEATURE_SHADING_RATE_PRIMITIVE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE_IMAGE", VIO_FEATURE_SHADING_RATE_IMAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
