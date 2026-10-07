@@ -197,6 +197,22 @@ kein Gegenstück ⇒ Flags dort 0. Nutzen auf RTX 40/50 (Hardware-Reorder, OMM-T
 - Keine GLSL-Quelle ⇒ backend-native Quellen (`'msl' => …`, `'hlsl' => …`) über einen erweiterten
   Stage-Override; Feature-Flag nur, wo eine portable Form existiert (`GL_KHR_cooperative_matrix`).
 
+**Stand 2026-10-07 — 8a kooperative Matrizen ✅** (`VIO_FEATURE_COOPERATIVE_MATRIX = 59`,
+`vio_cooperative_matrix_shapes($ctx)`, Test 167): GLSL `GL_KHR_cooperative_matrix` (`coopmat`,
+`coopMatLoad`/`coopMatMulAdd`/`coopMatStore`, Subgroup-Scope) in `vio_compute_pipeline`, keine neue
+Dispatch-API.
+- Vulkan: `VK_KHR_cooperative_matrix` + `VK_KHR_vulkan_memory_model` (glslang erzeugt
+  `OpMemoryModel Vulkan`), float16 mit `shaderFloat16` + `storageBuffer16BitAccess`; die Formen kommen aus
+  `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` (nur Subgroup-Scope, nur float16/float32 — Int8/
+  BFloat16 bräuchten weitere Features). Nur kompiliert: MoltenVK hat die Extension nicht.
+- Metal: SPIRV-Cross bildet `coopmat` auf `simdgroup_matrix` ab, **nur 8×8** und erst ab **MSL 3.1**
+  (Cap `cooperative_matrix`, Apple7+); Formen 8×8×8 half/half, half/float, float/float — auf dem M5
+  ausgeführt (MSL 3.1 und 4.1), MSL 3.0 meldet nichts.
+- D3D12: 0. SPIRV-Cross übersetzt `coopmat` nicht nach HLSL („Access chains have no default expression
+  representation"); SM 6.9 Wave-Matrix / Cooperative Vectors bleiben an Agility SDK + DXC-Quellen gebunden.
+- Offen: 8b Cooperative Vectors (`VK_NV_cooperative_vector`, D3D12 Preview), 8c Metal-Tensoren
+  (`MTLTensor` + MPP `matmul2d`, MSL 4.0) über einen `'msl'`-Override — beides ohne portable GLSL-Form.
+
 ## Phase 9 — Work Graphs (nur D3D12, zurückgestellt)
 
 SM 6.8, RDNA3/Ada. Kein Metal-/GL-Gegenstück, Vulkan nur `VK_AMDX_shader_enqueue`. Alternativen für

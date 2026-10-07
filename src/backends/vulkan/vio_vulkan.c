@@ -263,7 +263,7 @@ static int create_logical_device(void)
     /* Device extensions: the swapchain, MoltenVK's portability subset, and
      * VK_KHR_fragment_shading_rate (+ its create_renderpass2 dependency) when the
      * device offers pipeline shading rates (Block 10c). */
-    const char *device_extensions[24];
+    const char *device_extensions[32];
     uint32_t device_ext_count = 0;
     device_extensions[device_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     /* Several features need the same extension (descriptor indexing: bindless
@@ -284,7 +284,7 @@ static int create_logical_device(void)
     int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0, has_bary = 0, has_a64 = 0;
     int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0, has_di = 0, has_m3 = 0;
     int has_as = 0, has_rq = 0, has_dho = 0, has_bda = 0, has_spv14 = 0, has_sfc = 0;
-    int has_mesh = 0, has_fc = 0;
+    int has_mesh = 0, has_fc = 0, has_cm = 0, has_vmm = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
@@ -305,6 +305,8 @@ static int create_logical_device(void)
         if (strcmp(ext_props[i].extensionName, "VK_KHR_spirv_1_4") == 0) has_spv14 = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_sfc = 1;
         if (strcmp(ext_props[i].extensionName, "VK_EXT_mesh_shader") == 0) has_mesh = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_cooperative_matrix") == 0) has_cm = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_vulkan_memory_model") == 0) has_vmm = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_fc = 1;
     }
     free(ext_props);
@@ -620,6 +622,78 @@ static int create_logical_device(void)
         }
     }
 
+    /* VIO_FEATURE_COOPERATIVE_MATRIX: VK_KHR_cooperative_matrix. GL_KHR_cooperative_matrix
+     * kernels run on the Vulkan memory model (GL_KHR_memory_scope_semantics), and
+     * float16 tiles load from 16-bit storage buffers. Only subgroup-scope shapes
+     * of float16 / float32 components are offered - the integer and bfloat16
+     * shapes would need 8-bit storage / int8 / bfloat16 features as well. */
+    vio_vk.coopmat_shape_count = 0;
+    int coopmat_f16 = 0;
+#ifdef VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm_enable = {0};
+    cm_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    VkPhysicalDeviceVulkanMemoryModelFeaturesKHR vmm_enable = {0};
+    vmm_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR;
+    VkPhysicalDevice16BitStorageFeatures s16_enable = {0};
+    s16_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    if (has_cm && has_vmm && vio_vk.instance_api_11
+        && device_ext_count + 2 <= (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
+        VkPhysicalDeviceProperties dprops;
+        vkGetPhysicalDeviceProperties(vio_vk.physical_device, &dprops);
+        PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_props = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+            vkGetInstanceProcAddr(vio_vk.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm_avail = {0};
+        cm_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+        VkPhysicalDeviceVulkanMemoryModelFeaturesKHR vmm_avail = {0};
+        vmm_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR;
+        VkPhysicalDevice16BitStorageFeatures s16_avail = {0};
+        s16_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        cm_avail.pNext = &vmm_avail;
+        vmm_avail.pNext = &s16_avail;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &cm_avail;
+        if (dprops.apiVersion >= VK_API_VERSION_1_1 && get_props) {
+            vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+        }
+        if (cm_avail.cooperativeMatrix && vmm_avail.vulkanMemoryModel) {
+            coopmat_f16 = vio_vk.float16_supported && s16_avail.storageBuffer16BitAccess;
+            uint32_t count = 0;
+            get_props(vio_vk.physical_device, &count, NULL);
+            VkCooperativeMatrixPropertiesKHR *props = count ? calloc(count, sizeof(*props)) : NULL;
+            if (props) {
+                for (uint32_t i = 0; i < count; i++) props[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                get_props(vio_vk.physical_device, &count, props);
+                for (uint32_t i = 0; i < count && vio_vk.coopmat_shape_count < VIO_COOPMAT_MAX_SHAPES; i++) {
+                    const VkCooperativeMatrixPropertiesKHR *p = &props[i];
+                    VkComponentTypeKHR t[4] = { p->AType, p->BType, p->CType, p->ResultType };
+                    int ok = p->scope == VK_SCOPE_SUBGROUP_KHR;
+                    for (int j = 0; j < 4 && ok; j++) {
+                        ok = t[j] == VK_COMPONENT_TYPE_FLOAT32_KHR || (t[j] == VK_COMPONENT_TYPE_FLOAT16_KHR && coopmat_f16);
+                    }
+                    if (!ok) continue;
+                    vio_coopmat_shape *s = &vio_vk.coopmat_shapes[vio_vk.coopmat_shape_count++];
+                    s->m = (int)p->MSize; s->n = (int)p->NSize; s->k = (int)p->KSize;
+                    s->a = t[0] == VK_COMPONENT_TYPE_FLOAT16_KHR ? VIO_COOPMAT_FLOAT16 : VIO_COOPMAT_FLOAT32;
+                    s->b = t[1] == VK_COMPONENT_TYPE_FLOAT16_KHR ? VIO_COOPMAT_FLOAT16 : VIO_COOPMAT_FLOAT32;
+                    s->c = t[2] == VK_COMPONENT_TYPE_FLOAT16_KHR ? VIO_COOPMAT_FLOAT16 : VIO_COOPMAT_FLOAT32;
+                    s->result = t[3] == VK_COMPONENT_TYPE_FLOAT16_KHR ? VIO_COOPMAT_FLOAT16 : VIO_COOPMAT_FLOAT32;
+                }
+                free(props);
+            }
+            if (vio_vk.coopmat_shape_count > 0) {
+                cm_enable.cooperativeMatrix = VK_TRUE;
+                vmm_enable.vulkanMemoryModel = VK_TRUE;
+                if (coopmat_f16) s16_enable.storageBuffer16BitAccess = VK_TRUE;
+                VIO_VK_ADD_DEVICE_EXT("VK_KHR_cooperative_matrix");
+                VIO_VK_ADD_DEVICE_EXT("VK_KHR_vulkan_memory_model");
+            }
+        }
+    }
+#else
+    (void)has_cm; (void)has_vmm;
+#endif
+
     VkDeviceCreateInfo create_info = {0};
     create_info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     create_info.queueCreateInfoCount    = unique_count;
@@ -650,6 +724,15 @@ static int create_logical_device(void)
         feature_chain = &as_enable;
     }
     if (vio_vk.bindless_supported) { di_enable.pNext = feature_chain; feature_chain = &di_enable; }
+#ifdef VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME
+    if (vio_vk.coopmat_shape_count > 0) {
+        cm_enable.pNext = feature_chain;
+        vmm_enable.pNext = &cm_enable;
+        feature_chain = &vmm_enable;
+        if (coopmat_f16) { s16_enable.pNext = feature_chain; feature_chain = &s16_enable; }
+    }
+#endif
+    (void)coopmat_f16;
     create_info.pNext = feature_chain;
 
     VkResult result = vkCreateDevice(vio_vk.physical_device, &create_info, NULL, &vio_vk.device);
@@ -4081,6 +4164,15 @@ static double vulkan_gpu_frame_time(void)
     return vio_vk.initialized && vio_vk.ts_pool ? vio_vk.last_gpu_ms : -1.0;
 }
 
+/* VIO_FEATURE_COOPERATIVE_MATRIX: the shapes read at device creation. */
+static int vulkan_cooperative_matrix_shapes(vio_coopmat_shape *out, int max)
+{
+    if (!vio_vk.device || !out) return 0;
+    int n = vio_vk.coopmat_shape_count < max ? vio_vk.coopmat_shape_count : max;
+    memcpy(out, vio_vk.coopmat_shapes, (size_t)n * sizeof(*out));
+    return n;
+}
+
 static int vulkan_supports_feature(vio_feature feature)
 {
     switch (feature) {
@@ -4094,6 +4186,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_GEOMETRY_INSTANCING: return vio_vk3d_available() && vio_vk.device && vio_vk.geometry_supported;
         case VIO_FEATURE_3D_PIPELINE:  return vio_vk3d_available(); /* GAP-PHASE5 Block 10 */
         case VIO_FEATURE_MESH_SHADER:  return vio_vk3d_available() && vio_vk.device && vio_vk.mesh_supported; /* VK_EXT_mesh_shader */
+        case VIO_FEATURE_COOPERATIVE_MATRIX: return vio_vk.device && vio_vk.coopmat_shape_count > 0; /* VK_KHR_cooperative_matrix */
         case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
         case VIO_FEATURE_MULTIVIEW:    return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_supported; /* VkRenderPassMultiviewCreateInfo */
         case VIO_FEATURE_RAY_QUERY:    return vio_vk3d_available() && vio_vk.device && vio_vk.ray_query_supported; /* VK_KHR_ray_query */
@@ -4172,6 +4265,7 @@ static const vio_backend vulkan_backend = {
     .draw_instanced_from_storage = vio_vk3d_draw_instanced_from_storage,
     .draw_mesh_tasks          = vio_vk3d_draw_mesh_tasks,
     .draw_mesh_tasks_indirect = vio_vk3d_draw_mesh_tasks_indirect,
+    .cooperative_matrix_shapes = vulkan_cooperative_matrix_shapes,
     .draw_indirect     = vio_vk3d_draw_indirect,
     .read_render_target = vio_vk_read_render_target,
     .bind_render_target_face = vio_vk_bind_render_target_face,

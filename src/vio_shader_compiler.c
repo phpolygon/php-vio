@@ -55,6 +55,8 @@ static uint32_t *vio_compile_stage_to_spirv(const char *source, glslang_stage_t 
      * SPIR-V 1.0 for the SPIR-V rewriters (GS / tessellation / Metal kernels). */
     /* Split literal: the audit gate (070) flags GL_ tokens outside the GL backend. */
     int subgroup = source && strstr(source, "GL_" "KHR_shader_subgroup") != NULL;
+    /* GL_KHR_cooperative_matrix: subgroup-scope operations, same target. */
+    if (source && strstr(source, "GL_" "KHR_cooperative_matrix") != NULL) subgroup = 1;
     /* GL_EXT_mesh_shader (mesh / task stages and per-primitive fragment inputs)
      * needs SPIR-V 1.4. */
     int mesh = source && strstr(source, "GL_" "EXT_mesh_shader") != NULL;

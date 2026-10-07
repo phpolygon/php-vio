@@ -361,7 +361,39 @@ typedef enum _vio_feature {
      * the GPU per workgroup (meshlet culling, LOD). D3D12: SM 6.5 + MeshShaderTier;
      * Vulkan: VK_EXT_mesh_shader; Metal: mesh pipelines (Metal 3, Apple7 / Mac2). */
     VIO_FEATURE_MESH_SHADER        = 55,
+    /* Cooperative matrices (GL_KHR_cooperative_matrix): coopMatLoad /
+     * coopMatMulAdd / coopMatStore on subgroup-scope tiles in compute kernels,
+     * run on the hardware matrix units. vio_cooperative_matrix_shapes() lists
+     * the M x N x K shapes and component types. Vulkan: VK_KHR_cooperative_matrix;
+     * Metal: simdgroup_matrix (8x8 only, MSL 2.3, Apple7+); D3D12: 0 (SPIRV-Cross
+     * has no HLSL mapping, SM 6.9 wave matrices are out of reach). */
+    VIO_FEATURE_COOPERATIVE_MATRIX = 59,
 } vio_feature;
+
+/* Component types of a cooperative-matrix shape. */
+typedef enum _vio_coopmat_type {
+    VIO_COOPMAT_FLOAT16 = 0,
+    VIO_COOPMAT_FLOAT32,
+    VIO_COOPMAT_FLOAT64,
+    VIO_COOPMAT_SINT8,
+    VIO_COOPMAT_SINT16,
+    VIO_COOPMAT_SINT32,
+    VIO_COOPMAT_SINT64,
+    VIO_COOPMAT_UINT8,
+    VIO_COOPMAT_UINT16,
+    VIO_COOPMAT_UINT32,
+    VIO_COOPMAT_UINT64,
+    VIO_COOPMAT_BFLOAT16,
+} vio_coopmat_type;
+
+/* One shape vio_cooperative_matrix_shapes() reports: A is M x K, B is K x N,
+ * C and the result are M x N. */
+typedef struct _vio_coopmat_shape {
+    int m, n, k;
+    vio_coopmat_type a, b, c, result;
+} vio_coopmat_shape;
+
+#define VIO_COOPMAT_MAX_SHAPES 32
 
 /* Slots of the vio_texture_index() table (Set 1 of the bindless contract). */
 #define VIO_BINDLESS_MAX 1024

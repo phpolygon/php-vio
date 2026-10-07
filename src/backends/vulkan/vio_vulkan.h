@@ -305,6 +305,11 @@ typedef struct _vio_vulkan_state {
     int                      mesh_supported;
     void                    *mesh_cmd_draw;          /* vkCmdDrawMeshTasksEXT */
     void                    *mesh_cmd_draw_indirect; /* vkCmdDrawMeshTasksIndirectEXT */
+    /* VK_KHR_cooperative_matrix (VIO_FEATURE_COOPERATIVE_MATRIX): the
+     * subgroup-scope shapes whose component types the device can run (float16
+     * needs shaderFloat16 + 16-bit storage buffers), read once at device creation. */
+    int                      coopmat_shape_count;
+    vio_coopmat_shape        coopmat_shapes[VIO_COOPMAT_MAX_SHAPES];
     /* HDR10 output (GAP-PHASE5 Block 10d): vio_create(['hdr_output' => 1|2]). */
     int                      hdr_request;          /* 0 off, 1 when the surface offers HDR10 ST 2084, 2 forced 10-bit */
     int                      hdr_output;           /* 1 => 10-bit swapchain, the 2D batch PQ-encodes */

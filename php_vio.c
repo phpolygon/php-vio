@@ -5074,6 +5074,42 @@ ZEND_FUNCTION(vio_shading_rate_tile_size)
     RETURN_LONG(ctx->backend->shading_rate_tile_size());
 }
 
+/* VIO_FEATURE_COOPERATIVE_MATRIX: the subgroup-scope coopmat shapes the device
+ * multiplies, [['m', 'n', 'k', 'a', 'b', 'c', 'result'], ...] with component
+ * types as strings ('float16', 'float32', 'sint8', ...). [] without the feature. */
+ZEND_FUNCTION(vio_cooperative_matrix_shapes)
+{
+    static const char *const type_names[] = {
+        "float16", "float32", "float64", "sint8", "sint16", "sint32", "sint64",
+        "uint8", "uint16", "uint32", "uint64", "bfloat16",
+    };
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    array_init(return_value);
+    if (!ctx->initialized || !ctx->backend->cooperative_matrix_shapes || !ctx->backend->supports_feature
+        || !ctx->backend->supports_feature(VIO_FEATURE_COOPERATIVE_MATRIX)) {
+        return;
+    }
+    vio_coopmat_shape shapes[VIO_COOPMAT_MAX_SHAPES];
+    int n = ctx->backend->cooperative_matrix_shapes(shapes, VIO_COOPMAT_MAX_SHAPES);
+    for (int i = 0; i < n; i++) {
+        const vio_coopmat_type t[4] = { shapes[i].a, shapes[i].b, shapes[i].c, shapes[i].result };
+        const char *keys[4] = { "a", "b", "c", "result" };
+        zval s;
+        array_init(&s);
+        add_assoc_long(&s, "m", shapes[i].m);
+        add_assoc_long(&s, "n", shapes[i].n);
+        add_assoc_long(&s, "k", shapes[i].k);
+        for (int j = 0; j < 4; j++) {
+            add_assoc_string(&s, keys[j], (unsigned)t[j] < sizeof(type_names) / sizeof(type_names[0]) ? type_names[t[j]] : "unknown");
+        }
+        add_next_index_zval(return_value, &s);
+    }
+}
+
 ZEND_FUNCTION(vio_set_shading_rate)
 {
     zval *ctx_zval;
@@ -8918,6 +8954,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BINDLESS", VIO_FEATURE_BINDLESS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RAY_QUERY", VIO_FEATURE_RAY_QUERY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MESH_SHADER", VIO_FEATURE_MESH_SHADER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_COOPERATIVE_MATRIX", VIO_FEATURE_COOPERATIVE_MATRIX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);

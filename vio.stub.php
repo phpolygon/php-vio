@@ -454,6 +454,17 @@ function vio_set_shading_rate_image(VioContext $context, ?string $rates, int $ti
 function vio_shading_rate_tile_size(VioContext $context): int {}
 
 /**
+ * Cooperative-matrix shapes (VIO_FEATURE_COOPERATIVE_MATRIX, GL_KHR_cooperative_matrix):
+ * the subgroup-scope tiles compute kernels can multiply with coopMatMulAdd, as
+ * ['m' => int, 'n' => int, 'k' => int, 'a' => string, 'b' => string, 'c' => string,
+ * 'result' => string] (A is M x K, B is K x N, C / result M x N; types 'float16',
+ * 'float32', 'sint8', 'uint8', 'sint32', 'bfloat16', ...). Vulkan lists the device's
+ * VK_KHR_cooperative_matrix properties, Metal 8 x 8 x 8 simdgroup_matrix shapes;
+ * [] without the feature.
+ */
+function vio_cooperative_matrix_shapes(VioContext $context): array {}
+
+/**
  * Draw a mesh in the current frame.
  */
 function vio_draw(VioContext $context, VioMesh $mesh): void {}

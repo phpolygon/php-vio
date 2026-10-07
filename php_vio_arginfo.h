@@ -226,6 +226,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_shading_rate_tile_size, 0, 1
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_cooperative_matrix_shapes, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_acceleration_structure, 0, 2, VioAccelerationStructure, MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, instances, IS_ARRAY, 0)
@@ -951,6 +955,7 @@ ZEND_FUNCTION(vio_draw_indirect);
 ZEND_FUNCTION(vio_set_shading_rate);
 ZEND_FUNCTION(vio_set_shading_rate_image);
 ZEND_FUNCTION(vio_shading_rate_tile_size);
+ZEND_FUNCTION(vio_cooperative_matrix_shapes);
 ZEND_FUNCTION(vio_rect);
 ZEND_FUNCTION(vio_circle);
 ZEND_FUNCTION(vio_line);
@@ -1124,6 +1129,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_set_shading_rate, arginfo_vio_set_shading_rate)
 	ZEND_FE(vio_set_shading_rate_image, arginfo_vio_set_shading_rate_image)
 	ZEND_FE(vio_shading_rate_tile_size, arginfo_vio_shading_rate_tile_size)
+	ZEND_FE(vio_cooperative_matrix_shapes, arginfo_vio_cooperative_matrix_shapes)
 	ZEND_FE(vio_rect, arginfo_vio_rect)
 	ZEND_FE(vio_circle, arginfo_vio_circle)
 	ZEND_FE(vio_line, arginfo_vio_line)

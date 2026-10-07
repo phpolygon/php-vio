@@ -418,6 +418,11 @@ typedef struct _vio_backend {
      * {x, y, z} uint32 records from a storage buffer. NULL => no mesh stages. */
     void  (*draw_mesh_tasks)(uint32_t x, uint32_t y, uint32_t z);
     void  (*draw_mesh_tasks_indirect)(void *args_buffer, int max_draws, size_t offset);
+    /* Cooperative matrices (VIO_FEATURE_COOPERATIVE_MATRIX): the subgroup-scope
+     * shapes the device multiplies (GL_KHR_cooperative_matrix coopmat<T,
+     * gl_ScopeSubgroup, ...>), up to `max` into `out`. Returns the count, 0
+     * without the feature. NULL => none. */
+    int   (*cooperative_matrix_shapes)(vio_coopmat_shape *out, int max);
 } vio_backend;
 
 /*
