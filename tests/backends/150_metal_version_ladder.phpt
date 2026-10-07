@@ -23,7 +23,7 @@ const CAP_MIN = [
     'tessellation' => 21, 'layered_vertex' => 0, 'quad_group' => 21, 'simd_group' => 22,
     'barycentrics' => 22, 'vertex_amplification' => 22, 'argument_buffers_tier2' => 0,
     'raytracing' => 23, 'function_pointers' => 23, 'raytracing_from_render' => 24,
-    'mesh_shaders' => 30, 'atomic64' => 31, 'tensors' => 40,
+    'mesh_shaders' => 30, 'atomic64' => 31, 'tensors' => 40, 'bindless' => 30,
     'rasterization_rate_map' => 0, 'bc_texture_compression' => 0, 'unified_memory' => 0,
 ];
 $fail = [];

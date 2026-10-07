@@ -289,6 +289,14 @@ typedef struct _vio_vulkan_state {
                             *fn_get_as_address, *fn_get_buffer_address;
     uint64_t                 bound_accel;
     int                      bound_accel_binding;
+    /* Bindless table (vio_texture_index, BINDLESS-PLAN.md): descriptor indexing
+     * enabled; one global Set 1 (1024 sampled images, partially bound, update
+     * after bind, + an immutable linear / repeat sampler), created lazily. */
+    int                      bindless_supported;
+    VkDescriptorSetLayout    bindless_layout;
+    VkDescriptorPool         bindless_pool;
+    VkDescriptorSet          bindless_set;
+    VkSampler                bindless_sampler;
     int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
     int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
     void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */
@@ -476,6 +484,9 @@ void  vio_vk_resume_swapchain_pass(VkCommandBuffer cmd);
 /* Reopen the pass that was open before (bound render target layer / level, or the
  * swapchain) with LOAD, after vkCmdEndRenderPass for a compute dispatch or a flush. */
 void  vio_vk_resume_pass(VkCommandBuffer cmd);
+/* The bindless Set 1 layout (created with its pool / set on first use);
+ * VK_NULL_HANDLE without descriptor indexing. */
+VkDescriptorSetLayout vio_vk_bindless_layout(void);
 /* Multiview (VIO_FEATURE_MULTIVIEW): make the open render pass of the layered
  * target bound with VIO_RT_ALL_LAYERS a multiview pass for `views` views (2..4),
  * or switch it back to the plain layered pass for `views` = 0. Returns -1 when

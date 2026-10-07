@@ -926,7 +926,10 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
         size_t sep_image_count;
         spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
                                                    &sep_images, &sep_image_count);
+        /* Set 1 is the bindless table (vio_texture_index): it keeps its
+         * bindings, t0 / s1 in register space 1 (the D3D12 root table). */
         for (size_t i = 0; i < sep_image_count; i++) {
+            if (spvc_compiler_get_decoration(compiler, sep_images[i].id, SpvDecorationDescriptorSet) == 1) continue;
             spvc_compiler_set_decoration(compiler, sep_images[i].id,
                                           SpvDecorationBinding, (unsigned int)(sampled_count + i));
         }
@@ -948,6 +951,7 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
         spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
                                                    &sep_samplers, &sep_sampler_count);
         for (size_t i = 0; i < sep_sampler_count; i++) {
+            if (spvc_compiler_get_decoration(compiler, sep_samplers[i].id, SpvDecorationDescriptorSet) == 1) continue;
             spvc_compiler_set_decoration(compiler, sep_samplers[i].id,
                                           SpvDecorationBinding, (unsigned int)(sampled_count + sep_image_count + i));
         }

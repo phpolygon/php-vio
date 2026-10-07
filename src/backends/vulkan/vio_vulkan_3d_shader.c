@@ -245,8 +245,15 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
         vk3d_add_binding(sh, VK3D_B_ACCEL, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, stage, VK_IMAGE_VIEW_TYPE_2D, 0, 0);
     }
 
+    /* Set 1 is the bindless table (vio_texture_index): it keeps its set and
+     * bindings; any other separate texture / sampler is unsupported. */
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &n);
-    if (n > 0) {
+    int other = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (spvc_compiler_get_decoration(c, list[i].id, SpvDecorationDescriptorSet) == 1) sh->uses_bindless = 1;
+        else other = 1;
+    }
+    if (other) {
         php_error_docref(NULL, E_NOTICE, "Vulkan: separate texture/sampler objects are not supported by the 3D pipeline; use combined samplers");
     }
     return 0;
@@ -556,9 +563,16 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
          vkCreateDescriptorSetLayout(vio_vk.device, &dsl, NULL, &sh->set_layout) == VK_SUCCESS;
     if (ok) {
         VkPipelineLayoutCreateInfo pl = {0};
+        VkDescriptorSetLayout sets[2] = { sh->set_layout, VK_NULL_HANDLE };
         pl.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pl.setLayoutCount = 1;
-        pl.pSetLayouts    = &sh->set_layout;
+        pl.pSetLayouts    = sets;
+        if (sh->uses_bindless) {
+            /* Set 1: the context's bindless table (vio_texture_index). */
+            sets[1] = vio_vk_bindless_layout();
+            if (sets[1]) pl.setLayoutCount = 2;
+            else php_error_docref(NULL, E_WARNING, "Vulkan: the shader reads vio_textures[] but the device has no descriptor indexing");
+        }
         ok = vkCreatePipelineLayout(vio_vk.device, &pl, NULL, &sh->layout) == VK_SUCCESS;
     }
     if (!ok) {

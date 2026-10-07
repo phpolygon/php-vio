@@ -744,6 +744,9 @@ static int vk3d_prepare(uint32_t stride, VkBuffer inst_buf, VkDeviceSize inst_of
         if (!set) return -1;
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sh->layout, 0, 1, &set, nd, dyn);
     }
+    if (sh->uses_bindless && vio_vk.bindless_set) {
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sh->layout, 1, 1, &vio_vk.bindless_set, 0, NULL);
+    }
     if (p->has_instance_attrs) {
         VkBuffer b = inst_buf ? inst_buf : vk3d_identity_buffer();
         VkDeviceSize o = inst_buf ? inst_off : 0;

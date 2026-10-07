@@ -390,6 +390,7 @@ ZEND_FUNCTION(vio_destroy)
 
     /* Release the draw-time bind table before the GPU objects behind it go away. */
     vio_pending_textures_clear(ctx);
+    vio_context_bindless_clear(ctx);
 
     /* A replay holds process-global virtual gamepads and hides the physical
      * ones; a destroyed context must give them back even while PHP still holds
@@ -4877,6 +4878,58 @@ ZEND_FUNCTION(vio_draw_indirect)
  * and the output resolution stay untouched. Sticky until changed; reset to
  * VIO_SHADING_RATE_1X1 before UI / post-processing. false when the backend
  * has no VRS tier or the rate is not offered (4X4 needs additional rates). */
+ZEND_FUNCTION(vio_set_shading_rate_image)
+{
+    zval *ctx_zval;
+    zend_string *rates = NULL;
+    zend_long tiles_x = 0, tiles_y = 0;
+    ZEND_PARSE_PARAMETERS_START(2, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR_OR_NULL(rates)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(tiles_x)
+        Z_PARAM_LONG(tiles_y)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        RETURN_FALSE;
+    }
+    if (!ctx->backend->set_shading_rate_image || !ctx->backend->supports_feature
+        || !ctx->backend->supports_feature(VIO_FEATURE_SHADING_RATE_IMAGE)) {
+        RETURN_FALSE;
+    }
+    if (!rates) RETURN_BOOL(ctx->backend->set_shading_rate_image(NULL, 0, 0) == 0);
+    if (tiles_x <= 0 || tiles_y <= 0 || tiles_x > 4096 || tiles_y > 4096
+        || (zend_long)ZSTR_LEN(rates) != tiles_x * tiles_y) {
+        php_error_docref(NULL, E_WARNING, "vio_set_shading_rate_image: expected tilesX * tilesY (%d x %d) rate bytes, got %zu",
+                         (int)tiles_x, (int)tiles_y, ZSTR_LEN(rates));
+        RETURN_FALSE;
+    }
+    const unsigned char *r = (const unsigned char *)ZSTR_VAL(rates);
+    for (size_t i = 0; i < ZSTR_LEN(rates); i++) {
+        if (r[i] > VIO_SHADING_RATE_4X4) {
+            php_error_docref(NULL, E_WARNING, "vio_set_shading_rate_image: byte %zu is %u, not a VIO_SHADING_RATE_* value", i, r[i]);
+            RETURN_FALSE;
+        }
+    }
+    RETURN_BOOL(ctx->backend->set_shading_rate_image(r, (int)tiles_x, (int)tiles_y) == 0);
+}
+
+ZEND_FUNCTION(vio_shading_rate_tile_size)
+{
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend->shading_rate_tile_size || !ctx->backend->supports_feature
+        || !ctx->backend->supports_feature(VIO_FEATURE_SHADING_RATE_IMAGE)) {
+        RETURN_LONG(0);
+    }
+    RETURN_LONG(ctx->backend->shading_rate_tile_size());
+}
+
 ZEND_FUNCTION(vio_set_shading_rate)
 {
     zval *ctx_zval;
@@ -7790,6 +7843,46 @@ ZEND_FUNCTION(vio_swapchain_info)
     add_assoc_long(return_value, "shader_model_version", info.shader_model_version);
 }
 
+/* vio_texture_index(): the texture's slot in the context's bindless table
+ * (BINDLESS-PLAN.md). The first call takes a slot and a reference; later calls
+ * return the same slot. */
+ZEND_FUNCTION(vio_texture_index)
+{
+    zval *ctx_zval, *tex_zval;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (!ctx->initialized || !ctx->backend || !ctx->backend->bindless_set
+        || !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_BINDLESS))) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_index: backend has no bindless textures (VIO_FEATURE_BINDLESS = 0)");
+        RETURN_FALSE;
+    }
+    if (!tex->valid || !tex->backend_texture || tex->is_3d || tex->layers > 1 || tex->borrowed) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_index: only plain 2D textures can enter the table");
+        RETURN_FALSE;
+    }
+    for (int i = 0; i < ctx->bindless_count; i++) {
+        if (ctx->bindless[i] == &tex->std) RETURN_LONG(i);
+    }
+    if (ctx->bindless_count >= VIO_BINDLESS_MAX) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_index: the table is full (%d textures)", VIO_BINDLESS_MAX);
+        RETURN_FALSE;
+    }
+    if (!ctx->bindless) ctx->bindless = ecalloc(VIO_BINDLESS_MAX, sizeof(zend_object *));
+    int slot = ctx->bindless_count;
+    if (ctx->backend->bindless_set(slot, tex->backend_texture) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_index: the backend could not add the texture");
+        RETURN_FALSE;
+    }
+    GC_ADDREF(&tex->std);
+    ctx->bindless[slot] = &tex->std;
+    ctx->bindless_count++;
+    RETURN_LONG(slot);
+}
+
 ZEND_FUNCTION(vio_backend_info)
 {
     zval *ctx_zval;
@@ -8677,6 +8770,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BASE_VERTEX", VIO_FEATURE_BASE_VERTEX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_COMPUTE_DERIVATIVES", VIO_FEATURE_COMPUTE_DERIVATIVES, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE_PRIMITIVE", VIO_FEATURE_SHADING_RATE_PRIMITIVE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE_IMAGE", VIO_FEATURE_SHADING_RATE_IMAGE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_BINDLESS", VIO_FEATURE_BINDLESS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RAY_QUERY", VIO_FEATURE_RAY_QUERY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);

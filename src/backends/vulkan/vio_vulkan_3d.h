@@ -76,6 +76,7 @@ typedef struct _vio_vk3d_shader {
     int                   fs_sampler_depth[VK3D_MAX_SAMPLERS];
     int                   fs_sampler_count;
     int                   fs_needed_without_color; /* fragment stage discards or writes depth */
+    int                   uses_bindless;           /* reads the bindless table (Set 1, BINDLESS-PLAN.md) */
     int                   writes_shading_rate;     /* the vertex stage writes gl_PrimitiveShadingRateEXT */
     int                   dead;       /* GPU objects released (context torn down) */
     struct _vio_vk3d_shader *next, *prev;

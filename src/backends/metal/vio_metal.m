@@ -62,6 +62,7 @@ typedef struct _vio_metal_caps {
     int mesh_shaders;           /* object / mesh stages, MSL 3.0: Metal3 + (Apple7 / Mac2) */
     int atomic64;               /* 64-bit atomic min / max, MSL 3.1: Apple9 */
     int tensors;                /* MTLTensor + Metal Performance Primitives, MSL 4.0: Metal4 */
+    int bindless;               /* texture-handle argument buffers (gpuResourceID), MSL 3.0: Metal3 + tier 2 */
     int rasterization_rate_map;
     int bc_texture_compression;
     int unified_memory;
@@ -119,6 +120,8 @@ typedef struct _vio_metal_state {
 } vio_metal_state;
 
 static vio_metal_state vio_mtl = {0};
+static void metal_bindless_release(void);
+static void metal_bindless_bind(id<MTLRenderCommandEncoder> enc, int vertex, int fragment);
 
 /* Keep reference to last presented frame for read_pixels/screenshot */
 static id<MTLTexture>       last_presented_texture = nil;
@@ -519,6 +522,7 @@ static void metal_detect_caps(int msl, int max)
     c->mesh_shaders           = msl >= 30 && c->metal3 && (c->apple_family >= 7 || c->mac2);
     c->atomic64               = msl >= 31 && c->apple_family >= 9;
     c->tensors                = msl >= 40 && c->metal4;
+    c->bindless               = msl >= 30 && c->metal3 && c->argument_buffers_tier2;
     if ([vio_mtl.device respondsToSelector:@selector(supportsRasterizationRateMapWithLayerCount:)]) {
         if (@available(macOS 10.15.4, iOS 13.0, *)) c->rasterization_rate_map = [vio_mtl.device supportsRasterizationRateMapWithLayerCount:1] ? 1 : 0;
     }
@@ -723,6 +727,7 @@ void vio_metal_shutdown_context(void)
 {
     @autoreleasepool {
         if (!vio_mtl.initialized) return;
+        metal_bindless_release();
 
         /* Shutdown 2D pipeline */
         if (mtl_2d.initialized) {
@@ -3690,6 +3695,7 @@ static int metal_prepare_draw(int stride)
         [enc setVertexBuffer:metal_identity_instance offset:0 atIndex:VIO_METAL_VB_INSTANCE];
     }
     metal_bind_as_for_draw(enc, sh);
+    metal_bindless_bind(enc, sh->vs.uses_bindless, sh->fs.uses_bindless);
     if (sh->view_count > 1) {
         /* SPIRV-Cross's multiview view mask: {base view, view count}. */
         uint32_t mask[2] = { 0u, (uint32_t)sh->view_count };
@@ -3697,6 +3703,55 @@ static int metal_prepare_draw(int stride)
         [enc setFragmentBytes:mask length:sizeof(mask) atIndex:VIO_METAL_VIEW_MASK_INDEX];
     }
     return 1;
+}
+
+/* ── Bindless table (vio_texture_index, BINDLESS-PLAN.md) ──────────────
+ * A Shared buffer of MTLResourceIDs (one texture2d handle per slot) that the
+ * Set 1 argument buffer of a shader reads, plus the textures themselves so
+ * every draw can make them resident (useResources). */
+static id<MTLBuffer>   metal_bindless_buf = nil;
+static id<MTLResource> metal_bindless_res[VIO_BINDLESS_MAX];
+static int             metal_bindless_count = 0;
+
+static int metal_bindless_set(int slot, void *backend_texture)
+{
+    vio_metal_texture *mt = (vio_metal_texture *)backend_texture;
+    if (!vio_mtl.device || !mt || !mt->tex || slot < 0 || slot >= VIO_BINDLESS_MAX || !vio_mtl.caps.bindless) return -1;
+    if (@available(macOS 13.0, iOS 16.0, *)) {
+        if (!metal_bindless_buf) {
+            metal_bindless_buf = [vio_mtl.device newBufferWithLength:VIO_BINDLESS_MAX * sizeof(MTLResourceID)
+                                                             options:MTLResourceStorageModeShared];
+            if (!metal_bindless_buf) return -1;
+            memset([metal_bindless_buf contents], 0, VIO_BINDLESS_MAX * sizeof(MTLResourceID));
+        }
+        id<MTLTexture> tex = (__bridge id<MTLTexture>)mt->tex;
+        MTLResourceID rid = tex.gpuResourceID;
+        memcpy((char *)[metal_bindless_buf contents] + (size_t)slot * sizeof(MTLResourceID), &rid, sizeof(rid));
+        metal_bindless_res[slot] = tex;
+        if (slot + 1 > metal_bindless_count) metal_bindless_count = slot + 1;
+        return 0;
+    }
+    return -1;
+}
+
+static void metal_bindless_release(void)
+{
+    for (int i = 0; i < metal_bindless_count; i++) metal_bindless_res[i] = nil;
+    metal_bindless_count = 0;
+    metal_bindless_buf = nil;
+}
+
+/* Bind the table's argument buffer to the stages that read it and make its
+ * textures resident for this draw. */
+static void metal_bindless_bind(id<MTLRenderCommandEncoder> enc, int vertex, int fragment)
+{
+    if (!metal_bindless_buf || (!vertex && !fragment)) return;
+    if (vertex)   [enc setVertexBuffer:metal_bindless_buf offset:0 atIndex:VIO_METAL_BINDLESS_INDEX];
+    if (fragment) [enc setFragmentBuffer:metal_bindless_buf offset:0 atIndex:VIO_METAL_BINDLESS_INDEX];
+    if (metal_bindless_count > 0) {
+        MTLRenderStages stages = (vertex ? MTLRenderStageVertex : 0) | (fragment ? MTLRenderStageFragment : 0);
+        [enc useResources:metal_bindless_res count:(NSUInteger)metal_bindless_count usage:MTLResourceUsageRead stages:stages];
+    }
 }
 
 /* Instances to issue for `n` user instances: x views under multiview. */
@@ -5707,7 +5762,7 @@ static int metal_describe(vio_backend_description *out)
     CAP(tessellation); CAP(layered_vertex); CAP(quad_group); CAP(simd_group);
     CAP(barycentrics); CAP(vertex_amplification); CAP(argument_buffers_tier2);
     CAP(raytracing); CAP(function_pointers); CAP(raytracing_from_render);
-    CAP(mesh_shaders); CAP(atomic64); CAP(tensors);
+    CAP(mesh_shaders); CAP(atomic64); CAP(tensors); CAP(bindless);
     CAP(rasterization_rate_map); CAP(bc_texture_compression); CAP(unified_memory);
 #undef CAP
     return 0;
@@ -5846,6 +5901,14 @@ static int metal_supports_feature(vio_feature f)
 #else
         return 0;
 #endif
+    case VIO_FEATURE_BINDLESS:
+        /* Texture handles (gpuResourceID) in a Set 1 argument buffer: Metal3 +
+         * argument buffers tier 2, MSL 3.0 (caps.bindless). */
+#ifdef HAVE_SPIRV_CROSS
+        return vio_mtl.caps.bindless;
+#else
+        return 0;
+#endif
     case VIO_FEATURE_MULTIVIEW:
         /* SPIRV-Cross's instancing emulation writes [[render_target_array_index]]
          * from the vertex stage (Mac2 / Apple5). */
@@ -5943,6 +6006,7 @@ static const vio_backend metal_backend = {
     .create_acceleration_structure  = metal_create_acceleration_structure,
     .destroy_acceleration_structure = metal_destroy_acceleration_structure,
     .bind_acceleration_structure    = metal_bind_acceleration_structure,
+    .bindless_set      = metal_bindless_set,
     .destroy_mesh      = metal_destroy_mesh,
     .destroy_shader_obj = metal_destroy_shader_obj,
     .upload_cubemap    = metal_upload_cubemap,
