@@ -73,12 +73,17 @@ function run_backend(string $name): string {
     /* The table keeps the textures alive. */
     $tex = null; $tex0 = null; gc_collect_cycles();
 
-    vio_clear($ctx, 0, 0, 0, 1);
+    /* Into a render target: its readback is exact on every backend (the
+     * headless swapchain of MoltenVK on Retina is not, see CLAUDE.md). */
+    $rt = vio_render_target($ctx, ['width' => $W, 'height' => $W]);
     vio_begin($ctx);
+    vio_bind_render_target($ctx, $rt);
+    vio_clear($ctx, 0, 0, 0, 1);
     vio_bind_pipeline($ctx, $pipe);
     vio_draw($ctx, $mesh);
+    vio_unbind_render_target($ctx);
     vio_end($ctx);
-    $p = vio_read_pixels($ctx);
+    $p = vio_read_render_target($rt);
     $cell = intdiv($W, $N);
     $hits = [0, 0]; $first = [null, null];
     foreach ([0, 1] as $flip) {
