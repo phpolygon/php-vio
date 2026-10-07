@@ -20,6 +20,12 @@
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 
+/* Work graphs need the Windows 11 24H2 SDK (10.0.26100) headers. */
+#if defined(__ID3D12WorkGraphProperties_INTERFACE_DEFINED__) && defined(__ID3D12GraphicsCommandList10_INTERFACE_DEFINED__) \
+    && defined(__ID3D12StateObjectProperties1_INTERFACE_DEFINED__)
+#define VIO_D3D12_HAS_WORK_GRAPHS 1
+#endif
+
 #ifdef HAVE_GLFW
 #define GLFW_INCLUDE_NONE
 #define GLFW_EXPOSE_NATIVE_WIN32
@@ -50,6 +56,7 @@ static const char *d3d12_profile(const char *profile, char *buf, size_t n);
 #include "../../vio_texture.h"          /* vio_texture_object — storage-image binds */
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 vio_d3d12_state vio_d3d12 = {0};
 
@@ -848,6 +855,137 @@ static void d3d12_retire_uploads(int force);   /* upload queue, defined with the
 static int  d3d12_upload_buffer_region(ID3D12Resource *dst, const void *data, size_t size);
 static int  d3d12_upload_buffer_at(ID3D12Resource *dst, UINT64 offset, const void *data, size_t size);
 
+/* ── Agility SDK (vio_create(['agility_sdk' => dir])) ─────────────── */
+
+/* An application opts into the Agility SDK by exporting D3D12SDKVersion /
+ * D3D12SDKPath from its .exe - a PHP extension cannot. Instead the device comes
+ * from an independent device factory of the SDK's D3D12Core.dll:
+ * D3D12GetInterface(CLSID_D3D12SDKConfiguration) ->
+ * ID3D12SDKConfiguration1::CreateDeviceFactory(version, path) ->
+ * ID3D12DeviceFactory::CreateDevice. Needs a d3d12.dll that knows
+ * ID3D12SDKConfiguration1 (Windows 10 with the 2023 updates / Windows 11). */
+#if defined(__ID3D12SDKConfiguration1_INTERFACE_DEFINED__) && defined(__ID3D12DeviceFactory_INTERFACE_DEFINED__)
+#define VIO_D3D12_HAS_AGILITY 1
+
+/* `dir` as the runtime wants it: UTF-8, backslashes, a trailing backslash; a
+ * relative directory stays relative (the runtime resolves it against the
+ * executable's directory), an absolute one inside the executable's directory
+ * is made relative too. */
+static void d3d12_agility_path(const char *dir, char *out, size_t n)
+{
+    char tmp[512];
+    size_t len = strlen(dir);
+    if (len >= sizeof(tmp) - 2) len = sizeof(tmp) - 2;
+    for (size_t i = 0; i < len; i++) tmp[i] = dir[i] == '/' ? '\\' : dir[i];
+    if (len == 0 || tmp[len - 1] != '\\') tmp[len++] = '\\';
+    tmp[len] = '\0';
+
+    char exe[MAX_PATH];
+    DWORD el = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
+    if (el > 0 && el < sizeof(exe)) {
+        char *slash = strrchr(exe, '\\');
+        if (slash) {
+            slash[1] = '\0';
+            size_t pl = strlen(exe);
+            if (_strnicmp(tmp, exe, pl) == 0) {
+                snprintf(out, n, ".\\%s", tmp + pl);
+                return;
+            }
+        }
+    }
+    snprintf(out, n, "%s", tmp);
+}
+
+/* D3D12SDKVersion as D3D12Core.dll in `dir` exports it; 0 when unreadable. */
+static UINT d3d12_agility_dll_version(const char *dir)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s%sD3D12Core.dll", dir,
+             (dir[0] && dir[strlen(dir) - 1] != '\\' && dir[strlen(dir) - 1] != '/') ? "\\" : "");
+    for (char *c = path; *c; c++) if (*c == '/') *c = '\\';
+    if (path[0] == '.' || !(path[1] == ':' || (path[0] == '\\' && path[1] == '\\'))) {
+        /* relative: against the executable's directory, like the runtime */
+        char exe[MAX_PATH];
+        DWORD el = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
+        char *slash = (el > 0 && el < sizeof(exe)) ? strrchr(exe, '\\') : NULL;
+        if (slash) {
+            char abs[MAX_PATH + 600];
+            slash[1] = '\0';
+            snprintf(abs, sizeof(abs), "%s%s", exe, path);
+            snprintf(path, sizeof(path), "%s", abs);
+        }
+    }
+    HMODULE core = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!core) return 0;
+    UINT version = 0;
+    const UINT *exported = (const UINT *)(void *)GetProcAddress(core, "D3D12SDKVersion");
+    if (exported) version = *exported;
+    FreeLibrary(core);
+    return version;
+}
+
+typedef HRESULT (WINAPI *vio_pfn_d3d12_get_interface)(REFCLSID, REFIID, void **);
+
+/* Device on `adapter` from the Agility runtime in cfg->agility_sdk; S_OK and
+ * vio_d3d12.device set, or a failure the caller answers with the OS runtime. */
+static HRESULT d3d12_agility_create_device(vio_config *cfg, IDXGIAdapter1 *adapter)
+{
+    HMODULE d3d12 = GetModuleHandleA("d3d12.dll");
+    vio_pfn_d3d12_get_interface get_interface = d3d12
+        ? (vio_pfn_d3d12_get_interface)(void *)GetProcAddress(d3d12, "D3D12GetInterface") : NULL;
+    if (!get_interface) {
+        php_error_docref(NULL, E_WARNING, "D3D12: agility_sdk: this d3d12.dll has no D3D12GetInterface; using the OS runtime");
+        return E_NOINTERFACE;
+    }
+    UINT version = cfg->agility_sdk_version > 0 ? (UINT)cfg->agility_sdk_version : d3d12_agility_dll_version(cfg->agility_sdk);
+    if (version == 0) {
+        php_error_docref(NULL, E_WARNING, "D3D12: agility_sdk: no D3D12Core.dll with D3D12SDKVersion in '%s' "
+                         "(pass agility_sdk_version); using the OS runtime", cfg->agility_sdk);
+        return E_INVALIDARG;
+    }
+    char path[600];
+    d3d12_agility_path(cfg->agility_sdk, path, sizeof(path));
+
+    ID3D12SDKConfiguration1 *config = NULL;
+    HRESULT hr = get_interface(&CLSID_D3D12SDKConfiguration, &IID_ID3D12SDKConfiguration1, (void **)&config);
+    if (FAILED(hr) || !config) {
+        php_error_docref(NULL, E_WARNING, "D3D12: agility_sdk: ID3D12SDKConfiguration1 unavailable (0x%08lx, OS too old); "
+                         "using the OS runtime", hr);
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+    }
+    ID3D12DeviceFactory *factory = NULL;
+    hr = ID3D12SDKConfiguration1_CreateDeviceFactory(config, version, path, &IID_ID3D12DeviceFactory, (void **)&factory);
+    if (FAILED(hr) || !factory) {
+        php_error_docref(NULL, E_WARNING, "D3D12: agility_sdk: CreateDeviceFactory(%u, '%s') failed (0x%08lx); "
+                         "using the OS runtime", version, path, hr);
+        ID3D12SDKConfiguration1_Release(config);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    /* The debug layer of THIS runtime (D3D12GetDebugInterface reached the OS one). */
+    if (cfg->debug) {
+        ID3D12Debug *dbg = NULL;
+        if (SUCCEEDED(ID3D12DeviceFactory_GetConfigurationInterface(factory, &CLSID_D3D12Debug, &IID_ID3D12Debug, (void **)&dbg)) && dbg) {
+            ID3D12Debug_EnableDebugLayer(dbg);
+            ID3D12Debug_Release(dbg);
+        }
+    }
+    hr = ID3D12DeviceFactory_CreateDevice(factory, (IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0,
+                                          &IID_ID3D12Device, (void **)&vio_d3d12.device);
+    if (FAILED(hr) || !vio_d3d12.device) {
+        php_error_docref(NULL, E_WARNING, "D3D12: agility_sdk: CreateDevice on the SDK %u runtime failed (0x%08lx); "
+                         "using the OS runtime", version, hr);
+        vio_d3d12.device = NULL;
+        ID3D12DeviceFactory_Release(factory);
+        ID3D12SDKConfiguration1_Release(config);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    vio_d3d12.agility_sdk = (int)version;
+    vio_d3d12.agility_config = (IUnknown *)config;
+    vio_d3d12.agility_factory = (IUnknown *)factory;
+    return S_OK;
+}
+#endif
+
 static int d3d12_init(vio_config *cfg)
 {
     HRESULT hr;
@@ -1008,9 +1146,19 @@ static int d3d12_init(vio_config *cfg)
         }
     }
 
-    /* Create device */
-    hr = D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0,
-                            &IID_ID3D12Device, (void **)&vio_d3d12.device);
+    /* Create device: from the Agility SDK runtime when asked for (falls back to
+     * the OS runtime with a warning), else from the OS runtime. */
+    vio_d3d12.agility_sdk = 0;
+    hr = E_FAIL;
+#ifdef VIO_D3D12_HAS_AGILITY
+    if (cfg->agility_sdk[0]) hr = d3d12_agility_create_device(cfg, adapter);
+#else
+    if (cfg->agility_sdk[0])
+        php_error_docref(NULL, E_WARNING, "D3D12: agility_sdk: built against a Windows SDK without ID3D12SDKConfiguration1; using the OS runtime");
+#endif
+    if (FAILED(hr))
+        hr = D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0,
+                               &IID_ID3D12Device, (void **)&vio_d3d12.device);
     IDXGIAdapter1_Release(adapter);
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D12: Failed to create device (0x%08lx)", hr);
@@ -1119,6 +1267,7 @@ static int d3d12_init(vio_config *cfg)
     vio_d3d12.view_instancing = 0;
     vio_d3d12.mesh_tier = 0;
     vio_d3d12.raytracing_tier = 0;
+    vio_d3d12.work_graphs_tier = 0;
     /* Variable rate shading capability (GAP-PHASE5 Block 12). */
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {0};
@@ -1174,6 +1323,15 @@ static int d3d12_init(vio_config *cfg)
             if (vio_d3d12.shader_model_version >= 65
                 && SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7))))
                 vio_d3d12.mesh_tier = (int)o7.MeshShaderTier;
+#ifdef VIO_D3D12_HAS_WORK_GRAPHS
+            /* Work graphs (SM 6.8 node shaders); the OS runtime usually needs the
+             * Agility SDK (agility_sdk) to report a tier. */
+            D3D12_FEATURE_DATA_D3D12_OPTIONS21 o21;
+            memset(&o21, 0, sizeof(o21));
+            if (vio_d3d12.shader_model_version >= 68
+                && SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS21, &o21, sizeof(o21))))
+                vio_d3d12.work_graphs_tier = (int)o21.WorkGraphsTier;
+#endif
             D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5;
             memset(&o5, 0, sizeof(o5));
             if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))))
@@ -1572,6 +1730,8 @@ static void d3d12_shutdown(void)
     /* Cached debug-layer InfoQueue — must go before the device it was QI'd from. */
     if (vio_d3d12.info_queue)     ID3D12InfoQueue_Release(vio_d3d12.info_queue);
     if (vio_d3d12.device)         ID3D12Device_Release(vio_d3d12.device);
+    if (vio_d3d12.agility_factory) IUnknown_Release(vio_d3d12.agility_factory);
+    if (vio_d3d12.agility_config)  IUnknown_Release(vio_d3d12.agility_config);
 
     d3d12_current_pipeline = NULL;
     memset(&vio_d3d12, 0, sizeof(vio_d3d12));
@@ -6087,6 +6247,58 @@ static void d3d12_compute_wait(void)
     d3d12_restore_graphics_state_after_compute();
 }
 
+/* After a pass that wrote `buf` as a UAV: UAV barrier, copy the whole buffer
+ * into its READBACK staging buffer (created / grown lazily) and leave it in
+ * UNORDERED_ACCESS again, so a later vio_storage_buffer_read just Maps the
+ * staging without re-running the GPU (compute dispatches, work graphs). */
+static void d3d12_stage_uav_readback(ID3D12GraphicsCommandList *list, vio_d3d12_buffer *buf)
+{
+    D3D12_RESOURCE_BARRIER uavb = {0};
+    uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavb.UAV.pResource = buf->resource;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &uavb);
+
+    /* Lazily (re)create a READBACK staging buffer sized to the output. */
+    if (!buf->readback_resource || buf->readback_size < buf->size) {
+        if (buf->readback_resource) { ID3D12Resource_Release(buf->readback_resource); buf->readback_resource = NULL; }
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = buf->size;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT rhr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp,
+            D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void **)&buf->readback_resource);
+        if (FAILED(rhr)) {
+            php_error_docref(NULL, E_WARNING, "D3D12: compute readback buffer create failed (0x%08lx)", rhr);
+            buf->readback_resource = NULL;
+            return;
+        }
+    }
+    buf->readback_size = buf->size;
+
+    /* STORAGE buffers live in UNORDERED_ACCESS; transition -> COPY_SOURCE,
+     * copy the whole buffer, then transition back so a subsequent dispatch
+     * (or another read) finds it in its declared UAV state again. */
+    D3D12_RESOURCE_BARRIER tb = {0};
+    tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    tb.Transition.pResource = buf->resource;
+    tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    tb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
+
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, buf->readback_resource, 0,
+                                               buf->resource, 0, buf->size);
+
+    tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
+}
+
 static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
 {
     if (!cmd) return;
@@ -6303,51 +6515,7 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     for (int i = 0; i < cp->uav_count; i++) {
         vio_d3d12_buffer *buf = cp->uavs[i].buffer;
         if (!buf || !buf->resource) continue;
-
-        D3D12_RESOURCE_BARRIER uavb = {0};
-        uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        uavb.UAV.pResource = buf->resource;
-        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &uavb);
-
-        /* Lazily (re)create a READBACK staging buffer sized to the output. */
-        if (!buf->readback_resource || buf->readback_size < buf->size) {
-            if (buf->readback_resource) { ID3D12Resource_Release(buf->readback_resource); buf->readback_resource = NULL; }
-            D3D12_HEAP_PROPERTIES hp = {0};
-            hp.Type = D3D12_HEAP_TYPE_READBACK;
-            D3D12_RESOURCE_DESC rd = {0};
-            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            rd.Width = buf->size;
-            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-            rd.SampleDesc.Count = 1;
-            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            HRESULT rhr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp,
-                D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                &IID_ID3D12Resource, (void **)&buf->readback_resource);
-            if (FAILED(rhr)) {
-                php_error_docref(NULL, E_WARNING, "D3D12: compute readback buffer create failed (0x%08lx)", rhr);
-                buf->readback_resource = NULL;
-                continue;
-            }
-        }
-        buf->readback_size = buf->size;
-
-        /* STORAGE buffers live in UNORDERED_ACCESS; transition -> COPY_SOURCE,
-         * copy the whole buffer, then transition back so a subsequent dispatch
-         * (or another read) finds it in its declared UAV state again. */
-        D3D12_RESOURCE_BARRIER tb = {0};
-        tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        tb.Transition.pResource = buf->resource;
-        tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
-
-        ID3D12GraphicsCommandList_CopyBufferRegion(list, buf->readback_resource, 0,
-                                                   buf->resource, 0, buf->size);
-
-        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
+        d3d12_stage_uav_readback(list, buf);
     }
 
     if (in_frame_async) {
@@ -6397,6 +6565,298 @@ static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
     return n;
 }
 
+/* ── Work graphs (VIO_FEATURE_WORK_GRAPHS) ────────────────────────── */
+
+#ifdef VIO_D3D12_HAS_WORK_GRAPHS
+
+#define VIO_D3D12_WG_BUFFERS 8          /* root UAVs u0..u7, space 0 */
+#define VIO_D3D12_WG_MAX_BACKING (64ull << 20)
+
+typedef struct _vio_d3d12_work_graph {
+    ID3D12StateObject       *state_object;
+    ID3D12RootSignature     *root_signature;   /* global: 8 root UAVs */
+    ID3D12Resource          *backing;          /* GetWorkGraphMemoryRequirements */
+    UINT64                   backing_size;
+    D3D12_PROGRAM_IDENTIFIER program;
+    UINT                     entry_index;
+    int                      record_size;
+    int                      initialized;      /* backing memory initialized by a SetProgram */
+    UINT64                   used_serial;      /* frame_serial of the last in-frame dispatch */
+    vio_d3d12_buffer        *buffers[VIO_D3D12_WG_BUFFERS];
+} vio_d3d12_work_graph;
+
+static void d3d12_work_graph_free(vio_d3d12_work_graph *g)
+{
+    if (!g) return;
+    if (g->backing)        ID3D12Resource_Release(g->backing);
+    if (g->state_object)   ID3D12StateObject_Release(g->state_object);
+    if (g->root_signature) ID3D12RootSignature_Release(g->root_signature);
+    free(g);
+}
+
+static char *d3d12_wg_error(const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    return estrdup(buf);
+}
+
+/* One graph over every node of the lib_6_8 library (INCLUDE_ALL_AVAILABLE_NODES),
+ * a global root signature of eight root UAVs (u0..u7) and backing memory of
+ * the size the runtime asks for. */
+static void *d3d12_create_work_graph(const char *hlsl, const char *entry, int record_size, char **error)
+{
+    if (error) *error = NULL;
+    void *dxil = NULL;
+    size_t dxil_len = 0;
+    char *dxc_err = NULL;
+    if (vio_dxc_compile(hlsl, "", "lib_6_8", vio_d3d12.debug_enabled, vio_d3d12.native16, &dxil, &dxil_len, &dxc_err) != 0 || !dxil) {
+        if (error) *error = d3d12_wg_error("lib_6_8 compile failed: %s", dxc_err ? dxc_err : "DXC unavailable");
+        free(dxc_err);
+        return NULL;
+    }
+    free(dxc_err);
+
+    vio_d3d12_work_graph *g = (vio_d3d12_work_graph *)calloc(1, sizeof(*g));
+    if (!g) { free(dxil); return NULL; }
+    g->record_size = record_size;
+
+    /* Global root signature: root UAV descriptors u0..u7 (raw / structured). */
+    D3D12_ROOT_PARAMETER params[VIO_D3D12_WG_BUFFERS];
+    memset(params, 0, sizeof(params));
+    for (int i = 0; i < VIO_D3D12_WG_BUFFERS; i++) {
+        params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[i].Descriptor.ShaderRegister = (UINT)i;
+        params[i].Descriptor.RegisterSpace = 0;
+        params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rs = {0};
+    rs.NumParameters = VIO_D3D12_WG_BUFFERS;
+    rs.pParameters = params;
+    ID3DBlob *sig = NULL, *sig_err = NULL;
+    HRESULT hr = D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &sig_err);
+    if (SUCCEEDED(hr) && sig)
+        hr = ID3D12Device_CreateRootSignature(vio_d3d12.device, 0, ID3D10Blob_GetBufferPointer(sig),
+                                              ID3D10Blob_GetBufferSize(sig), &IID_ID3D12RootSignature,
+                                              (void **)&g->root_signature);
+    if (sig) ID3D10Blob_Release(sig);
+    if (sig_err) ID3D10Blob_Release(sig_err);
+    if (FAILED(hr) || !g->root_signature) {
+        if (error) *error = d3d12_wg_error("root signature failed (0x%08lx)", (unsigned long)hr);
+        free(dxil); d3d12_work_graph_free(g);
+        return NULL;
+    }
+
+    /* State object: DXIL library (all exports) + global root signature + work graph. */
+    D3D12_DXIL_LIBRARY_DESC lib = {0};
+    lib.DXILLibrary.pShaderBytecode = dxil;
+    lib.DXILLibrary.BytecodeLength = dxil_len;
+    D3D12_GLOBAL_ROOT_SIGNATURE grs = { g->root_signature };
+    D3D12_WORK_GRAPH_DESC wg;
+    memset(&wg, 0, sizeof(wg));
+    wg.ProgramName = L"vio_work_graph";
+    wg.Flags = D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES;
+    D3D12_STATE_SUBOBJECT subs[3];
+    subs[0].Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;     subs[0].pDesc = &lib;
+    subs[1].Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE; subs[1].pDesc = &grs;
+    subs[2].Type = D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH;       subs[2].pDesc = &wg;
+    D3D12_STATE_OBJECT_DESC so = {0};
+    so.Type = D3D12_STATE_OBJECT_TYPE_EXECUTABLE;
+    so.NumSubobjects = 3;
+    so.pSubobjects = subs;
+
+    ID3D12Device5 *dev5 = NULL;
+    hr = ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device5, (void **)&dev5);
+    if (SUCCEEDED(hr) && dev5) {
+        hr = ID3D12Device5_CreateStateObject(dev5, &so, &IID_ID3D12StateObject, (void **)&g->state_object);
+        ID3D12Device5_Release(dev5);
+    }
+    free(dxil);
+    if (FAILED(hr) || !g->state_object) {
+        d3d12_drain_info_queue("create_work_graph");
+        if (error) *error = d3d12_wg_error("CreateStateObject failed (0x%08lx) - check the node attributes and that "
+                                           "every NodeOutput has a node", (unsigned long)hr);
+        d3d12_work_graph_free(g);
+        return NULL;
+    }
+
+    ID3D12StateObjectProperties1 *props = NULL;
+    ID3D12WorkGraphProperties *wgp = NULL;
+    ID3D12StateObject_QueryInterface(g->state_object, &IID_ID3D12StateObjectProperties1, (void **)&props);
+    ID3D12StateObject_QueryInterface(g->state_object, &IID_ID3D12WorkGraphProperties, (void **)&wgp);
+    int ok = props && wgp;
+    UINT wg_index = 0;
+    if (ok) {
+        ID3D12StateObjectProperties1_GetProgramIdentifier(props, &g->program, L"vio_work_graph");
+        wg_index = ID3D12WorkGraphProperties_GetWorkGraphIndex(wgp, L"vio_work_graph");
+        ok = wg_index != 0xFFFFFFFFu;
+    }
+    if (ok) {
+        wchar_t wentry[256];
+        int n = MultiByteToWideChar(CP_UTF8, 0, entry, -1, wentry, 256);
+        D3D12_NODE_ID id = { wentry, 0 };
+        g->entry_index = n > 0 ? ID3D12WorkGraphProperties_GetEntrypointIndex(wgp, wg_index, id) : 0xFFFFFFFFu;
+        if (g->entry_index == 0xFFFFFFFFu) {
+            if (error) *error = d3d12_wg_error("'%s' is not an entry node of the graph (a node no other node targets)", entry);
+            ok = 0;
+        } else {
+            UINT rs_bytes = ID3D12WorkGraphProperties_GetEntrypointRecordSizeInBytes(wgp, wg_index, g->entry_index);
+            if ((int)rs_bytes != record_size) {
+                if (error) *error = d3d12_wg_error("entry node '%s' takes %u-byte records, record_size is %d",
+                                                   entry, rs_bytes, record_size);
+                ok = 0;
+            }
+        }
+    } else if (error && !*error) {
+        *error = d3d12_wg_error("the state object has no work graph properties");
+    }
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS req;
+    memset(&req, 0, sizeof(req));
+    if (ok) ID3D12WorkGraphProperties_GetWorkGraphMemoryRequirements(wgp, wg_index, &req);
+    if (props) ID3D12StateObjectProperties1_Release(props);
+    if (wgp) ID3D12WorkGraphProperties_Release(wgp);
+    if (!ok) { d3d12_work_graph_free(g); return NULL; }
+
+    /* Backing memory: the maximum the runtime may use (faster), capped at
+     * 64 MB but never below the minimum, in whole granules. */
+    UINT64 size = req.MaxSizeInBytes;
+    if (size > VIO_D3D12_WG_MAX_BACKING) size = VIO_D3D12_WG_MAX_BACKING;
+    if (size < req.MinSizeInBytes) size = req.MinSizeInBytes;
+    if (req.SizeGranularityInBytes > 1)
+        size = (size + req.SizeGranularityInBytes - 1) / req.SizeGranularityInBytes * req.SizeGranularityInBytes;
+    if (size > 0) {
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = size;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                  D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource,
+                                                  (void **)&g->backing);
+        if (FAILED(hr) || !g->backing) {
+            if (error) *error = d3d12_wg_error("backing memory allocation failed (0x%08lx)", (unsigned long)hr);
+            d3d12_work_graph_free(g);
+            return NULL;
+        }
+        g->backing_size = size;
+    }
+    return g;
+}
+
+static void d3d12_destroy_work_graph(void *ptr)
+{
+    vio_d3d12_work_graph *g = (vio_d3d12_work_graph *)ptr;
+    if (!g) return;
+    /* Recorded into the open frame: submit the frame so far, then drain. */
+    if (vio_d3d12.in_frame && g->used_serial == vio_d3d12.frame_serial) vio_d3d12.compute_async_pending++;
+    d3d12_compute_wait();
+    vio_d3d12_wait_for_gpu();
+    d3d12_work_graph_free(g);
+}
+
+static void d3d12_work_graph_bind_buffer(void *ptr, void *buffer, int slot)
+{
+    vio_d3d12_work_graph *g = (vio_d3d12_work_graph *)ptr;
+    if (!g || slot < 0 || slot >= VIO_D3D12_WG_BUFFERS) return;
+    g->buffers[slot] = (vio_d3d12_buffer *)buffer;
+}
+
+static void d3d12_dispatch_graph(void *ptr, const void *records, int count)
+{
+    vio_d3d12_work_graph *g = (vio_d3d12_work_graph *)ptr;
+    if (!g || !g->state_object || !records || count < 1) return;
+
+    int in_frame = vio_d3d12.in_frame && vio_d3d12.cmd_list != NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    if (in_frame) {
+        list = vio_d3d12.cmd_list;
+    } else {
+        HRESULT hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                         &IID_ID3D12CommandAllocator, (void **)&alloc);
+        if (SUCCEEDED(hr))
+            hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                                &IID_ID3D12GraphicsCommandList, (void **)&list);
+        if (FAILED(hr) || !list) {
+            if (alloc) ID3D12CommandAllocator_Release(alloc);
+            php_error_docref(NULL, E_WARNING, "D3D12: dispatch_graph command list failed (0x%08lx)", hr);
+            return;
+        }
+    }
+    ID3D12GraphicsCommandList10 *list10 = NULL;
+    if (FAILED(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList10, (void **)&list10)) || !list10) {
+        php_error_docref(NULL, E_WARNING, "D3D12: dispatch_graph needs ID3D12GraphicsCommandList10");
+        if (!in_frame) {
+            ID3D12GraphicsCommandList_Close(list);
+            ID3D12GraphicsCommandList_Release(list);
+            ID3D12CommandAllocator_Release(alloc);
+        }
+        return;
+    }
+
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, g->root_signature);
+    for (int i = 0; i < VIO_D3D12_WG_BUFFERS; i++) {
+        vio_d3d12_buffer *b = g->buffers[i];
+        ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, (UINT)i,
+            b && b->resource ? ID3D12Resource_GetGPUVirtualAddress(b->resource) : 0);
+        if (in_frame && b) b->uav_live_serial = vio_d3d12.frame_serial;   /* UAV on this frame's list (Block 8) */
+    }
+    /* Earlier writes (a dispatch, a previous graph on the same backing memory) first. */
+    D3D12_RESOURCE_BARRIER all_uav = {0};
+    all_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    all_uav.UAV.pResource = NULL;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &all_uav);
+
+    D3D12_SET_PROGRAM_DESC sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
+    sp.WorkGraph.ProgramIdentifier = g->program;
+    sp.WorkGraph.Flags = g->initialized ? D3D12_SET_WORK_GRAPH_FLAG_NONE : D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE;
+    if (g->backing) {
+        sp.WorkGraph.BackingMemory.StartAddress = ID3D12Resource_GetGPUVirtualAddress(g->backing);
+        sp.WorkGraph.BackingMemory.SizeInBytes = g->backing_size;
+    }
+    ID3D12GraphicsCommandList10_SetProgram(list10, &sp);
+    g->initialized = 1;
+
+    /* The records are copied into the command list at record time. */
+    D3D12_DISPATCH_GRAPH_DESC dg;
+    memset(&dg, 0, sizeof(dg));
+    dg.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
+    dg.NodeCPUInput.EntrypointIndex = g->entry_index;
+    dg.NodeCPUInput.NumRecords = (UINT)count;
+    dg.NodeCPUInput.pRecords = records;
+    dg.NodeCPUInput.RecordStrideInBytes = (UINT64)g->record_size;
+    ID3D12GraphicsCommandList10_DispatchGraph(list10, &dg);
+    ID3D12GraphicsCommandList10_Release(list10);
+
+    for (int i = 0; i < VIO_D3D12_WG_BUFFERS; i++)
+        if (g->buffers[i] && g->buffers[i]->resource) d3d12_stage_uav_readback(list, g->buffers[i]);
+
+    if (in_frame) {
+        g->used_serial = vio_d3d12.frame_serial;
+        d3d12_restore_graphics_state_after_compute();
+        vio_d3d12.compute_async_pending++;   /* read_buffer waits for the frame */
+        return;
+    }
+    ID3D12GraphicsCommandList_Close(list);
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    vio_d3d12_wait_for_gpu();
+    d3d12_drain_info_queue("dispatch_graph");
+    ID3D12GraphicsCommandList_Release(list);
+    ID3D12CommandAllocator_Release(alloc);
+}
+
+#endif /* VIO_D3D12_HAS_WORK_GRAPHS */
+
 /* ── Feature Query ────────────────────────────────────────────────── */
 
 static void d3d12_swapchain_info(vio_swapchain_info *out)
@@ -6409,6 +6869,7 @@ static void d3d12_swapchain_info(vio_swapchain_info *out)
     out->format        = vio_d3d12.swapchain_format == DXGI_FORMAT_R10G10B10A2_UNORM ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
     out->shader_model  = vio_d3d12.shader_model == 6 ? 6 : 5;
     out->shader_model_version = vio_d3d12.shader_model_version;
+    out->agility_sdk   = vio_d3d12.agility_sdk;
 }
 
 static double d3d12_gpu_frame_time(void)
@@ -6520,6 +6981,9 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_SHADING_RATE:        return vio_d3d12.vrs_tier > 0; /* RSSetShadingRate, VRS Tier 1+ (GAP-PHASE5 12) */
         /* SV_ShadingRate (SM 6.4) + the OVERRIDE combiner (Tier 2). */
         case VIO_FEATURE_MESH_SHADER:  return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 65 && vio_d3d12.mesh_tier > 0;
+#ifdef VIO_D3D12_HAS_WORK_GRAPHS
+        case VIO_FEATURE_WORK_GRAPHS:  return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 68 && vio_d3d12.work_graphs_tier >= 10;
+#endif
         /* RSSetShadingRateImage + the MAX combiner (Tier 2). */
         case VIO_FEATURE_SHADING_RATE_IMAGE:  return vio_d3d12.vrs_tier >= 2 && vio_d3d12.vrs_tile_size > 0;
         case VIO_FEATURE_SHADING_RATE_PRIMITIVE: return vio_d3d12.vrs_tier >= 2 && vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 64;
@@ -7139,6 +7603,12 @@ static const vio_backend d3d12_backend = {
     .push_cbuffers     = d3d12_push_cbuffers,
     .draw_mesh_tasks          = d3d12_draw_mesh_tasks,
     .draw_mesh_tasks_indirect = d3d12_draw_mesh_tasks_indirect,
+#ifdef VIO_D3D12_HAS_WORK_GRAPHS
+    .create_work_graph        = d3d12_create_work_graph,
+    .destroy_work_graph       = d3d12_destroy_work_graph,
+    .work_graph_bind_buffer   = d3d12_work_graph_bind_buffer,
+    .dispatch_graph           = d3d12_dispatch_graph,
+#endif
     .set_shading_rate  = d3d12_set_shading_rate,
     .set_shading_rate_image = d3d12_set_shading_rate_image,
     .shading_rate_tile_size = d3d12_shading_rate_tile_size,

@@ -352,6 +352,15 @@ typedef struct _vio_d3d12_state {
     ID3D12RootSignature       *mesh_root_signature;
     ID3D12GraphicsCommandList6 *cmd_list6;
     ID3D12CommandSignature    *cmdsig_mesh;
+    /* Work graphs (VIO_FEATURE_WORK_GRAPHS): OPTIONS21.WorkGraphsTier under
+     * SM 6.8+ (10 = D3D12_WORK_GRAPHS_TIER_1_0). */
+    int                        work_graphs_tier;
+    /* Agility SDK (vio_create(['agility_sdk' => dir])): the SDK version the
+     * device runs on (0 = OS runtime) and the ID3D12SDKConfiguration1 /
+     * ID3D12DeviceFactory that made it (released after the device). */
+    int                        agility_sdk;
+    IUnknown                  *agility_config;
+    IUnknown                  *agility_factory;
     /* Indirect draws (GAP-PHASE5 Block 8): command signatures for DrawIndexed
      * (stride 20) and Draw (stride 16) arguments, created on first use. */
     ID3D12CommandSignature    *cmdsig_indexed;

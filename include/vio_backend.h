@@ -418,6 +418,16 @@ typedef struct _vio_backend {
      * {x, y, z} uint32 records from a storage buffer. NULL => no mesh stages. */
     void  (*draw_mesh_tasks)(uint32_t x, uint32_t y, uint32_t z);
     void  (*draw_mesh_tasks_indirect)(void *args_buffer, int max_draws, size_t offset);
+    /* Work graphs (VIO_FEATURE_WORK_GRAPHS): build an executable graph from an
+     * HLSL lib_6_8 source whose CPU-fed entry node is `entry` and takes records
+     * of record_size bytes (NULL + *error on failure, error is emalloc'd);
+     * bind a storage buffer at u<slot> (0..7, space 0, raw or structured);
+     * dispatch count records (synchronous outside a frame, recorded into the
+     * frame inside one; bound buffers are readable with read_buffer after). */
+    void *(*create_work_graph)(const char *hlsl, const char *entry, int record_size, char **error);
+    void  (*destroy_work_graph)(void *graph);
+    void  (*work_graph_bind_buffer)(void *graph, void *buffer, int slot);
+    void  (*dispatch_graph)(void *graph, const void *records, int count);
 } vio_backend;
 
 /*

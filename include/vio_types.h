@@ -361,6 +361,12 @@ typedef enum _vio_feature {
      * the GPU per workgroup (meshlet culling, LOD). D3D12: SM 6.5 + MeshShaderTier;
      * Vulkan: VK_EXT_mesh_shader; Metal: mesh pipelines (Metal 3, Apple7 / Mac2). */
     VIO_FEATURE_MESH_SHADER        = 55,
+    /* Work graphs (SM 6.8 node shaders): vio_work_graph() builds an HLSL lib_6_8
+     * graph, vio_dispatch_graph() feeds CPU records to its entry node and the
+     * graph schedules its own follow-up work on the GPU. HLSL only (GLSL has no
+     * node shaders). D3D12: OPTIONS21.WorkGraphsTier >= 1_0 + SM 6.8 (usually
+     * through the Agility SDK, vio_create(['agility_sdk' => dir])); 0 elsewhere. */
+    VIO_FEATURE_WORK_GRAPHS        = 58,
 } vio_feature;
 
 /* Slots of the vio_texture_index() table (Set 1 of the bindless contract). */
@@ -435,6 +441,13 @@ typedef struct _vio_config {
      * (major * 10 + minor, e.g. 21 = MSL 2.1); 0 = the highest the OS accepts
      * (or VIO_METAL_MSL_VERSION from the environment). */
     int         msl_version;
+    /* D3D12 Agility SDK: directory holding D3D12Core.dll (absolute, or relative
+     * to the php executable's directory); the device then comes from
+     * ID3D12SDKConfiguration1::CreateDeviceFactory instead of the OS runtime.
+     * agility_sdk_version is the SDK version D3D12Core.dll exports
+     * (D3D12SDKVersion); 0 = read it from the DLL. Empty = OS runtime. */
+    char        agility_sdk[512];
+    int         agility_sdk_version;
 } vio_config;
 
 /* vio_swapchain_info() — what the presentation path actually runs with. */
@@ -447,6 +460,7 @@ typedef struct _vio_swapchain_info {
     int shader_model;    /* D3D: 6 = DXC / DXIL, 5 = FXC; 0 elsewhere (GAP-PHASE5 Block 7) */
     int shader_model_version; /* compile profile as major * 10 + minor: D3D12 60..69 (DXC) or 51,
                                * D3D11 50; 0 elsewhere */
+    int agility_sdk;     /* D3D12: the Agility SDK version the device runs on, 0 = OS runtime */
 } vio_swapchain_info;
 
 /* vio_backend_info() — the API level a backend negotiated and what it can do

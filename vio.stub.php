@@ -23,7 +23,13 @@
  *                       profile is the highest 6.x the device and DXC accept; it enables subgroup
  *                       operations (VIO_FEATURE_SUBGROUP) on devices with wave ops),
  *                       msl_version => 21: pin the Metal Shading Language version (major * 10 + minor,
- *                       2.0 .. the OS maximum; default the maximum, or VIO_METAL_MSL_VERSION))
+ *                       2.0 .. the OS maximum; default the maximum, or VIO_METAL_MSL_VERSION),
+ *                       agility_sdk => directory holding the D3D12 Agility SDK's D3D12Core.dll
+ *                       (absolute, or relative to php.exe's directory): the D3D12 device comes from
+ *                       that runtime (ID3D12SDKConfiguration1::CreateDeviceFactory) instead of the OS
+ *                       one - needed for work graphs / SM 6.8+ on most Windows builds;
+ *                       agility_sdk_version => the SDK version D3D12Core.dll exports (default: read
+ *                       from the DLL). Falls back to the OS runtime with a warning.)
  * @return VioContext|false Context object or false on failure
  */
 function vio_create(string $backend = "auto", array $options = []): VioContext|false {}
@@ -358,7 +364,8 @@ function vio_shader_cache_stats(): array {}
  * 'hdr_output' => bool (HDR10 backbuffer), 'format' => int (0 RGBA8, 8 RGB10A2),
  * 'shader_model' => int (D3D12: 6 with DXC / DXIL, 5 with FXC; D3D11: 5; 0 elsewhere),
  * 'shader_model_version' => int (compile profile as major * 10 + minor: D3D12 60..69 with DXC,
- * 51 with FXC; D3D11 50; 0 elsewhere)].
+ * 51 with FXC; D3D11 50; 0 elsewhere), 'agility_sdk' => int (D3D12: the Agility SDK version
+ * the device runs on, 0 = OS runtime; 0 elsewhere)].
  */
 function vio_swapchain_info(VioContext $context): array {}
 
@@ -426,6 +433,36 @@ function vio_draw_mesh_tasks(VioContext $context, int $x, int $y = 1, int $z = 1
  * by a compute pass. Create the buffer with vio_storage_buffer(['indirect' => true]).
  */
 function vio_draw_mesh_tasks_indirect(VioContext $context, VioBuffer $args, int $maxDraws = 1, int $offset = 0): void {}
+
+/**
+ * Work graph (VIO_FEATURE_WORK_GRAPHS, Shader Model 6.8 node shaders; D3D12 only, false +
+ * warning elsewhere). $desc = ['hlsl' => string, 'entry' => string, 'record_size' => int].
+ * HLSL only - GLSL has no node shaders. Contract:
+ *   - 'hlsl' is a library compiled as lib_6_8 with DXC (shader_model => 6 and dxcompiler.dll);
+ *     every [Shader("node")] function in it becomes a node of one graph.
+ *   - 'entry' names the node vio_dispatch_graph() feeds; its input record (the
+ *     DispatchNodeInputRecord / ThreadNodeInputRecord / GroupNodeInputRecords struct) is
+ *     'record_size' bytes (1..32768) and laid out as the packed records passed in.
+ *   - Resources: storage buffers bound with vio_work_graph_bind_buffer() at
+ *     RWByteAddressBuffer / RWStructuredBuffer<T> : register(u0..u7) in space 0. No textures,
+ *     samplers or constant buffers; pass parameters in the records.
+ */
+function vio_work_graph(VioContext $context, array $desc): VioWorkGraph|false {}
+
+/**
+ * Bind a storage buffer (vio_storage_buffer) to register(u$slot) (0..7) of every node of
+ * $graph; the graph keeps a reference. After a dispatch the buffer is readable with
+ * vio_storage_buffer_read().
+ */
+function vio_work_graph_bind_buffer(VioContext $context, VioWorkGraph $graph, VioBuffer $buffer, int $slot): void {}
+
+/**
+ * Launch $graph with $count records for its entry node ($records holds $count *
+ * record_size bytes, D3D12_DISPATCH_MODE_NODE_CPU_INPUT). Outside vio_begin/vio_end the
+ * call waits for the graph to finish; inside a frame it runs in order with the frame's
+ * draws and dispatches.
+ */
+function vio_dispatch_graph(VioContext $context, VioWorkGraph $graph, string $records, int $count): void {}
 
 /**
  * Variable rate shading (VIO_FEATURE_SHADING_RATE, D3D12 VRS Tier 1+): the fragment

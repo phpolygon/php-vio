@@ -45,9 +45,13 @@ Aufwand: **S** ≤ 1 Tag, **M** einige Tage, **L** eigener Sub-Plan.
   Extensions, Subgroup-Properties) und **OpenGL** (Version, GLSL, Caps — `vio_gl_info` bleibt).
 - **0c** D3D12-Leiter festnageln wie Metal: `vio_create(['shader_model' => 62])` / `VIO_D3D12_SHADER_MODEL`
   pinnt das Profil (6.0 … Maximum), damit Feature-Gates je Profil testbar sind.
-- **0d** **Agility SDK** (D3D12, optional): `D3D12SDKVersion`/`D3D12SDKPath`-Exporte über eine
-  Lader-DLL neben `php.exe`; Voraussetzung für SM 6.9 auf Windows-Builds ohne neueste Runtime.
-  Ohne Agility bleibt das Maximum, was die System-Runtime meldet.
+- **0d** **Agility SDK** (D3D12, optional) — **✅ umgesetzt (2026-10-07, Test 166).** Exporte aus einer
+  PHP-Extension gehen nicht; stattdessen `vio_create('d3d12', ['agility_sdk' => dir])` →
+  `ID3D12SDKConfiguration1::CreateDeviceFactory(version, dir)` → `ID3D12DeviceFactory::CreateDevice`
+  (Version aus `agility_sdk_version` oder dem Export von `D3D12Core.dll`), gemeldet als
+  `vio_swapchain_info()['agility_sdk']`. Ohne Option unverändert; jeder Fehlschlag fällt mit Warnung auf
+  die System-Runtime zurück. Die SM-Probe startet weiter bei 6.9 (Maximum des SDK). Nur Compile-geprüft
+  (mingw + DirectX-Headers); ausführbar erst auf Windows mit dem NuGet-Paket.
 - Tests: 150-Muster für D3D12/Vulkan/GL (`vio_backend_info` je Backend), Profil-Pinning wie 151.
 
 ## Phase 1 — Shader-Intrinsics über GLSL-Extensions (S je Feature)
@@ -197,11 +201,18 @@ kein Gegenstück ⇒ Flags dort 0. Nutzen auf RTX 40/50 (Hardware-Reorder, OMM-T
 - Keine GLSL-Quelle ⇒ backend-native Quellen (`'msl' => …`, `'hlsl' => …`) über einen erweiterten
   Stage-Override; Feature-Flag nur, wo eine portable Form existiert (`GL_KHR_cooperative_matrix`).
 
-## Phase 9 — Work Graphs (nur D3D12, zurückgestellt)
+## Phase 9 — Work Graphs (nur D3D12) — ✅ umgesetzt (2026-10-07, Test 166)
 
-SM 6.8, RDNA3/Ada. Kein Metal-/GL-Gegenstück, Vulkan nur `VK_AMDX_shader_enqueue`. Alternativen für
-GPU-getriebene Arbeit: Indirect Draw (✅), Metal Indirect Command Buffers, Vulkan Device-Generated
-Commands. Erst bei konkretem Bedarf.
+SM 6.8, RDNA3/Ada. Kein Metal-/GL-Gegenstück, Vulkan nur `VK_AMDX_shader_enqueue` (nicht angebunden).
+`VIO_FEATURE_WORK_GRAPHS = 58` (SM ≥ 6.8 + `OPTIONS21.WorkGraphsTier` ≥ 1.0), Klasse `VioWorkGraph`:
+`vio_work_graph($ctx, ['hlsl' => lib_6_8, 'entry' => Knoten, 'record_size' => n])` baut ein
+`EXECUTABLE`-State-Object (DXIL-Library, globale Root-Signatur mit 8 Root-UAVs `u0..u7`, `WORK_GRAPH` mit
+`INCLUDE_ALL_AVAILABLE_NODES`), prüft Einstieg und Record-Größe gegen `ID3D12WorkGraphProperties` und legt
+das Backing Memory an (Maximum, gedeckelt auf 64 MB); `vio_work_graph_bind_buffer` bindet Storage-Buffer,
+`vio_dispatch_graph` = `SetProgram` (erster Lauf `INITIALIZE`) + `DispatchGraph` mit CPU-Records auf
+`ID3D12GraphicsCommandList10` — außerhalb eines Frames synchron, im Frame auf der Frame-Liste. Danach sind
+die Buffer per `vio_storage_buffer_read` lesbar. Nur HLSL (GLSL hat keine Node-Shader). Nur Compile-/
+DXC-geprüft; Ausführung braucht Windows mit RDNA3/Ada+ und meist das Agility SDK (0d).
 
 ## Nicht übernommen
 

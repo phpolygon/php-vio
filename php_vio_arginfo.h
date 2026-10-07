@@ -251,6 +251,25 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_draw_mesh_tasks_indirect, 0,
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, offset, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_work_graph, 0, 2, VioWorkGraph, MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, desc, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_work_graph_bind_buffer, 0, 4, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, graph, VioWorkGraph, 0)
+	ZEND_ARG_OBJ_INFO(0, buffer, VioBuffer, 0)
+	ZEND_ARG_TYPE_INFO(0, slot, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_dispatch_graph, 0, 4, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, graph, VioWorkGraph, 0)
+	ZEND_ARG_TYPE_INFO(0, records, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, count, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_shading_rate, 0, 2, _IS_BOOL, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, rate, IS_LONG, 0)
@@ -947,6 +966,9 @@ ZEND_FUNCTION(vio_acceleration_structure);
 ZEND_FUNCTION(vio_bind_acceleration_structure);
 ZEND_FUNCTION(vio_draw_mesh_tasks);
 ZEND_FUNCTION(vio_draw_mesh_tasks_indirect);
+ZEND_FUNCTION(vio_work_graph);
+ZEND_FUNCTION(vio_work_graph_bind_buffer);
+ZEND_FUNCTION(vio_dispatch_graph);
 ZEND_FUNCTION(vio_draw_indirect);
 ZEND_FUNCTION(vio_set_shading_rate);
 ZEND_FUNCTION(vio_set_shading_rate_image);
@@ -1120,6 +1142,9 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_bind_acceleration_structure, arginfo_vio_bind_acceleration_structure)
 	ZEND_FE(vio_draw_mesh_tasks, arginfo_vio_draw_mesh_tasks)
 	ZEND_FE(vio_draw_mesh_tasks_indirect, arginfo_vio_draw_mesh_tasks_indirect)
+	ZEND_FE(vio_work_graph, arginfo_vio_work_graph)
+	ZEND_FE(vio_work_graph_bind_buffer, arginfo_vio_work_graph_bind_buffer)
+	ZEND_FE(vio_dispatch_graph, arginfo_vio_dispatch_graph)
 	ZEND_FE(vio_draw_indirect, arginfo_vio_draw_indirect)
 	ZEND_FE(vio_set_shading_rate, arginfo_vio_set_shading_rate)
 	ZEND_FE(vio_set_shading_rate_image, arginfo_vio_set_shading_rate_image)

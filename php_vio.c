@@ -23,6 +23,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_buffer.h"
 #include "src/vio_compute_pipeline.h"
 #include "src/vio_acceleration_structure.h"
+#include "src/vio_work_graph.h"
 #include "src/vio_font_face.h"
 #include "src/vio_2d.h"
 #include "src/vio_font.h"
@@ -207,6 +208,15 @@ pick_backend:
         if ((val = zend_hash_str_find(options_ht, "dxc_dir", sizeof("dxc_dir") - 1)) != NULL && Z_TYPE_P(val) == IS_STRING) {
             size_t n = Z_STRLEN_P(val);
             if (n < sizeof(ctx->config.dxc_dir)) memcpy(ctx->config.dxc_dir, Z_STRVAL_P(val), n + 1);
+        }
+        /* D3D12 Agility SDK: directory with D3D12Core.dll (+ optional version). */
+        if ((val = zend_hash_str_find(options_ht, "agility_sdk", sizeof("agility_sdk") - 1)) != NULL && Z_TYPE_P(val) == IS_STRING) {
+            size_t n = Z_STRLEN_P(val);
+            if (n < sizeof(ctx->config.agility_sdk)) memcpy(ctx->config.agility_sdk, Z_STRVAL_P(val), n + 1);
+        }
+        if ((val = zend_hash_str_find(options_ht, "agility_sdk_version", sizeof("agility_sdk_version") - 1)) != NULL) {
+            zend_long av = zval_get_long(val);
+            ctx->config.agility_sdk_version = av < 0 ? 0 : (int)av;
         }
         /* Waitable swapchain: cap the CPU's run-ahead at n frames (D3D11 / D3D12). */
         if ((val = zend_hash_str_find(options_ht, "frame_latency", sizeof("frame_latency") - 1)) != NULL) {
@@ -7985,6 +7995,7 @@ ZEND_FUNCTION(vio_swapchain_info)
     add_assoc_long(return_value, "format", info.format);
     add_assoc_long(return_value, "shader_model", info.shader_model);
     add_assoc_long(return_value, "shader_model_version", info.shader_model_version);
+    add_assoc_long(return_value, "agility_sdk", info.agility_sdk);
 }
 
 /* vio_texture_index(): the texture's slot in the context's bindless table
@@ -8181,6 +8192,124 @@ ZEND_FUNCTION(vio_bind_acceleration_structure)
         return;
     }
     ctx->backend->bind_acceleration_structure(as->backend_as, (int)binding);
+}
+
+/* ── Work graphs (VIO_FEATURE_WORK_GRAPHS) ──────────────────────────── */
+
+/* vio_work_graph($ctx, ['hlsl' => lib_6_8 source, 'entry' => node name,
+ * 'record_size' => bytes]): an executable graph over every node of the
+ * library; `entry` is the node vio_dispatch_graph() feeds with CPU records. */
+ZEND_FUNCTION(vio_work_graph)
+{
+    zval *ctx_zval;
+    HashTable *desc;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(desc)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend) {
+        php_error_docref(NULL, E_WARNING, "vio_work_graph: context not initialized");
+        RETURN_FALSE;
+    }
+    if (!(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_WORK_GRAPHS))
+        || !ctx->backend->create_work_graph) {
+        php_error_docref(NULL, E_WARNING, "vio_work_graph: backend '%s' has no work graphs (VIO_FEATURE_WORK_GRAPHS = 0)",
+                         ctx->backend->name);
+        RETURN_FALSE;
+    }
+    zval *hz = zend_hash_str_find(desc, "hlsl", sizeof("hlsl") - 1);
+    if (!hz || Z_TYPE_P(hz) != IS_STRING || Z_STRLEN_P(hz) == 0) {
+        zend_argument_value_error(2, "needs 'hlsl' => lib_6_8 source");
+        RETURN_THROWS();
+    }
+    zval *ez = zend_hash_str_find(desc, "entry", sizeof("entry") - 1);
+    if (!ez || Z_TYPE_P(ez) != IS_STRING || Z_STRLEN_P(ez) == 0 || Z_STRLEN_P(ez) > 255) {
+        zend_argument_value_error(2, "needs 'entry' => the name of the node that takes CPU records");
+        RETURN_THROWS();
+    }
+    zval *rz = zend_hash_str_find(desc, "record_size", sizeof("record_size") - 1);
+    zend_long record_size = rz ? zval_get_long(rz) : 0;
+    if (record_size < 1 || record_size > 32768) {
+        zend_argument_value_error(2, "'record_size' must be 1..32768 bytes");
+        RETURN_THROWS();
+    }
+    char *error = NULL;
+    void *graph = ctx->backend->create_work_graph(Z_STRVAL_P(hz), Z_STRVAL_P(ez), (int)record_size, &error);
+    if (!graph) {
+        php_error_docref(NULL, E_WARNING, "vio_work_graph: %s", error ? error : "the backend could not build it");
+        if (error) efree(error);
+        RETURN_FALSE;
+    }
+    object_init_ex(return_value, vio_work_graph_ce);
+    vio_work_graph_object *g = Z_VIO_WORK_GRAPH_P(return_value);
+    g->backend_graph = graph;
+    g->backend = ctx->backend;
+    g->record_size = (int)record_size;
+    g->valid = 1;
+}
+
+/* vio_work_graph_bind_buffer($ctx, $graph, $buffer, $slot): the graph's nodes
+ * see $buffer as RW(ByteAddress|Structured)Buffer at register(u<slot>). */
+ZEND_FUNCTION(vio_work_graph_bind_buffer)
+{
+    zval *ctx_zval, *g_zval, *buf_zval;
+    zend_long slot;
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(g_zval, vio_work_graph_ce)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_buffer_ce)
+        Z_PARAM_LONG(slot)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_work_graph_object *g = Z_VIO_WORK_GRAPH_P(g_zval);
+    vio_buffer_object *buf = Z_VIO_BUFFER_P(buf_zval);
+    if (slot < 0 || slot >= VIO_WORK_GRAPH_MAX_BUFFERS) {
+        zend_argument_value_error(4, "must be 0..%d", VIO_WORK_GRAPH_MAX_BUFFERS - 1);
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !ctx->backend || !g->valid || g->backend != ctx->backend
+        || !ctx->backend->work_graph_bind_buffer || !buf->valid || !buf->backend_buffer) {
+        php_error_docref(NULL, E_WARNING, "vio_work_graph_bind_buffer: graph or buffer not from this context's backend");
+        return;
+    }
+    /* The graph keeps the buffer alive while it is bound. */
+    if (g->buffers[slot]) OBJ_RELEASE(g->buffers[slot]);
+    g->buffers[slot] = Z_OBJ_P(buf_zval);
+    GC_ADDREF(g->buffers[slot]);
+    ctx->backend->work_graph_bind_buffer(g->backend_graph, buf->backend_buffer, (int)slot);
+}
+
+/* vio_dispatch_graph($ctx, $graph, $records, $count): $count records of the
+ * graph's record_size bytes each go to the entry node. Outside a frame the
+ * call waits for the graph; inside one it runs in order with the frame. */
+ZEND_FUNCTION(vio_dispatch_graph)
+{
+    zval *ctx_zval, *g_zval;
+    zend_string *records;
+    zend_long count;
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(g_zval, vio_work_graph_ce)
+        Z_PARAM_STR(records)
+        Z_PARAM_LONG(count)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_work_graph_object *g = Z_VIO_WORK_GRAPH_P(g_zval);
+    if (count < 1 || count > 0xFFFFFF) {
+        zend_argument_value_error(4, "must be 1..16777215");
+        RETURN_THROWS();
+    }
+    if (!g->valid || ZSTR_LEN(records) < (size_t)count * (size_t)g->record_size) {
+        zend_argument_value_error(3, "must hold %d records of %d bytes", (int)count, g->record_size);
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !ctx->backend || g->backend != ctx->backend || !ctx->backend->dispatch_graph) {
+        php_error_docref(NULL, E_WARNING, "vio_dispatch_graph: graph not built on this context's backend");
+        return;
+    }
+    ctx->backend->dispatch_graph(g->backend_graph, ZSTR_VAL(records), (int)count);
 }
 
 /* ── Image comparison (VRT) ───────────────────────────────────────── */
@@ -8918,6 +9047,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BINDLESS", VIO_FEATURE_BINDLESS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RAY_QUERY", VIO_FEATURE_RAY_QUERY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MESH_SHADER", VIO_FEATURE_MESH_SHADER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_WORK_GRAPHS", VIO_FEATURE_WORK_GRAPHS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
@@ -11378,6 +11508,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_buffer_register();
     vio_compute_pipeline_register();
     vio_acceleration_structure_register();
+    vio_work_graph_register();
     vio_font_register();
     vio_font_face_register();
     vio_sound_register();
