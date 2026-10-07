@@ -100,9 +100,10 @@
 #define VIO_D3D12_RP_HS_SAMPLER   12
 #define VIO_D3D12_RP_DS_SAMPLER   13
 #define VIO_D3D12_RP_ACCEL        14  /* root SRV t0, space9: ray-query acceleration structure (all stages) */
-#define VIO_D3D12_RP_BINDLESS     15  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
-#define VIO_D3D12_RP_FEEDBACK     16  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
-#define VIO_D3D12_RP_COUNT        17
+#define VIO_D3D12_RP_DRAW_PARAMS  15  /* 2 root constants b13 (VERTEX): gl_BaseVertex / gl_BaseInstance below SM 6.8 */
+#define VIO_D3D12_RP_BINDLESS     16  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
+#define VIO_D3D12_RP_FEEDBACK     17  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
+#define VIO_D3D12_RP_COUNT        18
 
 /* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
  * bytecode (NULL when the vio_shader has no such stage). */
@@ -125,6 +126,7 @@ typedef struct _vio_d3d12_shader {
     int       is_mesh;
     ID3DBlob *as_blob;
     int       uses_bindless;         /* reads the bindless table (register space 1, BINDLESS-PLAN.md) */
+    int       uses_draw_params;      /* reads gl_BaseVertex / gl_BaseInstance from the b13 root constants */
     int       uses_feedback;         /* the pixel stage writes a FeedbackTexture2D (u0, space2) */
 } vio_d3d12_shader;
 
@@ -156,6 +158,7 @@ typedef struct _vio_d3d12_pipeline {
     int                      is_mesh;
     ID3DBlob                *as_blob;
     int                      uses_bindless;    /* the shader reads the bindless table */
+    int                      uses_draw_params; /* the vertex stage reads the draw-parameter root constants */
     int                      uses_feedback;    /* the pixel stage writes sampler feedback */
 } vio_d3d12_pipeline;
 
@@ -398,6 +401,13 @@ typedef struct _vio_d3d12_state {
      * (stride 20) and Draw (stride 16) arguments, created on first use. */
     ID3D12CommandSignature    *cmdsig_indexed;
     ID3D12CommandSignature    *cmdsig_plain;
+    /* ... and with the draw-parameter root constants in front (strides 28 / 24),
+     * over records copied into a per-frame ring (OPEN-ITEMS-PLAN A11). */
+    ID3D12CommandSignature    *cmdsig_indexed_dp;
+    ID3D12CommandSignature    *cmdsig_plain_dp;
+    ID3D12Resource            *dp_buf[VIO_D3D12_MAX_FRAME_COUNT];
+    UINT64                     dp_cap[VIO_D3D12_MAX_FRAME_COUNT];
+    UINT64                     dp_used[VIO_D3D12_MAX_FRAME_COUNT];
     /* Counts begin_frame() calls (never 0 inside a frame): buffers remember the
      * serial of the frame whose list holds them in UNORDERED_ACCESS. */
     UINT64                     frame_serial;

@@ -420,6 +420,8 @@ static int d3d12_upload_subresources(ID3D12Resource *dst, const D3D12_RESOURCE_D
                                      UINT dst_x, UINT dst_y, UINT dst_z);
 static void d3d12_retire_later(ID3D12Resource *res, UINT64 fence);
 static void d3d12_retire_object_later(IUnknown *obj, UINT64 fence);
+static void d3d12_release_parked(UINT slot);
+static void d3d12_release_parked_all(void);
 
 /* Shading-rate image (VIO_FEATURE_SHADING_RATE_IMAGE, Tier 2): an R8_UINT
  * texture with one D3D12_SHADING_RATE per tile. A new tile count recreates it -
@@ -748,7 +750,16 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     memcpy(all_samplers, static_samplers, sizeof(static_samplers));
     d3d12_bindless_static_samplers(&all_samplers[4]);
 
-    /* [16] Sampler feedback map (VIO_FEATURE_SAMPLER_FEEDBACK): one UAV u0 in
+    /* [15] Draw parameters (OPEN-ITEMS-PLAN A11): gl_BaseVertex / gl_BaseInstance as
+     * two root constants at b13 for vertex stages below SM 6.8, set per draw
+     * (0 for direct draws, from the copied records for indirect ones). */
+    params[VIO_D3D12_RP_DRAW_PARAMS].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[VIO_D3D12_RP_DRAW_PARAMS].Constants.ShaderRegister = 13;
+    params[VIO_D3D12_RP_DRAW_PARAMS].Constants.RegisterSpace = 0;
+    params[VIO_D3D12_RP_DRAW_PARAMS].Constants.Num32BitValues = 2;
+    params[VIO_D3D12_RP_DRAW_PARAMS].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+    /* [17] Sampler feedback map (VIO_FEATURE_SAMPLER_FEEDBACK): one UAV u0 in
      * register space 2 for the pixel stage - the FeedbackTexture2D of an
      * 'hlsl' => ['fragment' => ...] override. Only when the feature is on, which
      * implies the bindless table, so the optional parameters stay trailing. */
@@ -1795,6 +1806,15 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.compute_srv_heap) ID3D12DescriptorHeap_Release(vio_d3d12.compute_srv_heap);
     if (vio_d3d12.cmdsig_indexed) ID3D12CommandSignature_Release(vio_d3d12.cmdsig_indexed);
     if (vio_d3d12.cmdsig_plain)   ID3D12CommandSignature_Release(vio_d3d12.cmdsig_plain);
+    if (vio_d3d12.cmdsig_indexed_dp) ID3D12CommandSignature_Release(vio_d3d12.cmdsig_indexed_dp);
+    if (vio_d3d12.cmdsig_plain_dp)   ID3D12CommandSignature_Release(vio_d3d12.cmdsig_plain_dp);
+    vio_d3d12.cmdsig_indexed_dp = vio_d3d12.cmdsig_plain_dp = NULL;
+    for (int i = 0; i < VIO_D3D12_MAX_FRAME_COUNT; i++) {
+        if (vio_d3d12.dp_buf[i]) ID3D12Resource_Release(vio_d3d12.dp_buf[i]);
+        vio_d3d12.dp_buf[i] = NULL;
+        vio_d3d12.dp_cap[i] = vio_d3d12.dp_used[i] = 0;
+    }
+    d3d12_release_parked_all();
     if (vio_d3d12.mipgen_pso)     ID3D12PipelineState_Release(vio_d3d12.mipgen_pso);
     if (vio_d3d12.mipgen_rs)      ID3D12RootSignature_Release(vio_d3d12.mipgen_rs);
     if (vio_d3d12.mipgen_heap)    ID3D12DescriptorHeap_Release(vio_d3d12.mipgen_heap);
@@ -2446,6 +2466,7 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     pipeline->has_gs = shader->gs_blob != NULL;
     pipeline->writes_shading_rate = shader->writes_shading_rate;
     pipeline->uses_bindless = shader->uses_bindless;
+    pipeline->uses_draw_params = shader->uses_draw_params;
     pipeline->uses_feedback = shader->uses_feedback;
     pipeline->has_hs = shader->hs_blob != NULL;
     pipeline->has_ds = shader->ds_blob != NULL;
@@ -2805,9 +2826,21 @@ static int d3d12_bindless_set(int slot, void *backend_texture, int kind)
     return 0;
 }
 
+/* Direct draws: gl_BaseVertex / gl_BaseInstance are 0 (vio_draw has no base
+ * vertex or first instance). Root arguments are lost with every root-signature
+ * change and after ExecuteIndirect, so every draw site sets them. */
+static void d3d12_apply_draw_params_zero(void)
+{
+    vio_d3d12_pipeline *p = d3d12_current_pipeline;
+    if (!p || !p->uses_draw_params || p->is_mesh || !vio_d3d12.cmd_list) return;
+    static const UINT zero[2] = { 0, 0 };
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(vio_d3d12.cmd_list, VIO_D3D12_RP_DRAW_PARAMS, 2, zero, 0);
+}
+
 static void d3d12_apply_view_mask(void)
 {
     d3d12_apply_accel();   /* every draw site calls this helper first */
+    d3d12_apply_draw_params_zero();
     vio_d3d12_pipeline *p = d3d12_current_pipeline;
     if (!p || p->view_count <= 1 || !vio_d3d12.cmd_list) return;
     if (!vio_d3d12.cmd_list1 &&
@@ -5521,6 +5554,7 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
     if (desc->fragment_hlsl) hlsl_ps = desc->fragment_hlsl;
 
     /* Bindless table: SPIRV-Cross keeps Set 1 in register space 1. */
+    shader->uses_draw_params = hlsl_vs && strstr(hlsl_vs, "SPIRV_Cross_VertexInfo") != NULL;
     shader->uses_bindless = (hlsl_vs && (strstr(hlsl_vs, "space1)") || strstr(hlsl_vs, "space3)") || strstr(hlsl_vs, "space4)")))
                          || (hlsl_ps && (strstr(hlsl_ps, "space1)") || strstr(hlsl_ps, "space3)") || strstr(hlsl_ps, "space4)")));
     shader->uses_feedback = hlsl_ps && strstr(hlsl_ps, "FeedbackTexture2D") != NULL;
@@ -5692,6 +5726,8 @@ static void d3d12_begin_frame(void)
     /* This slot's previous command list has retired: PSOs parked while it was
      * recording can go now (see d3d12_destroy_pipeline). */
     d3d12_release_pending_psos(vio_d3d12.frame_index);
+    d3d12_release_parked(vio_d3d12.frame_index);
+    vio_d3d12.dp_used[vio_d3d12.frame_index] = 0;
     /* Staging buffers of uploads whose fence has passed (GAP-PLAN 4.1). */
     d3d12_retire_uploads(0);
 
@@ -7682,7 +7718,8 @@ static int d3d12_supports_feature(vio_feature feature)
         /* View instancing (SV_ViewID, SM 6.1) through a pipeline-state stream. */
         case VIO_FEATURE_MULTIVIEW:    return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 61 && vio_d3d12.view_instancing > 0;
         case VIO_FEATURE_SHADER_FLOAT16: return vio_d3d12.shader_model == 6 && vio_d3d12.native16;   /* SM 6.2 half */
-        case VIO_FEATURE_BASE_VERTEX:  return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 68; /* SV_Start*Location */
+        /* SV_Start*Location from SM 6.8, below that the b13 root constants (A11). */
+        case VIO_FEATURE_BASE_VERTEX:  return 1;
         case VIO_FEATURE_COMPUTE_DERIVATIVES: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 66;
         /* Unbounded SRV table in register space 1 (Resource Binding Tier 2+);
          * works with FXC 5.1 and DXC. */
@@ -7820,6 +7857,142 @@ static ID3D12CommandSignature *d3d12_indirect_signature(int indexed)
     return *slot;
 }
 
+/* Objects replaced mid-frame (a grown draw-parameter ring): released once this
+ * frame slot's fence has passed (begin_frame), like the parked PSOs. An upload
+ * signal in between would come too early for the frame list. */
+#define VIO_D3D12_PARKED_MAX 16
+static IUnknown *d3d12_parked[VIO_D3D12_MAX_FRAME_COUNT][VIO_D3D12_PARKED_MAX];
+static int       d3d12_parked_count[VIO_D3D12_MAX_FRAME_COUNT];
+
+static void d3d12_release_parked(UINT slot)
+{
+    if (slot >= VIO_D3D12_MAX_FRAME_COUNT) return;
+    for (int i = 0; i < d3d12_parked_count[slot]; i++) {
+        if (d3d12_parked[slot][i]) IUnknown_Release(d3d12_parked[slot][i]);
+        d3d12_parked[slot][i] = NULL;
+    }
+    d3d12_parked_count[slot] = 0;
+}
+
+static void d3d12_release_parked_all(void)
+{
+    for (UINT s = 0; s < VIO_D3D12_MAX_FRAME_COUNT; s++) d3d12_release_parked(s);
+}
+
+static void d3d12_park_object(IUnknown *obj)
+{
+    UINT slot = vio_d3d12.frame_index < VIO_D3D12_MAX_FRAME_COUNT ? vio_d3d12.frame_index : 0;
+    if (d3d12_parked_count[slot] < VIO_D3D12_PARKED_MAX) {
+        d3d12_parked[slot][d3d12_parked_count[slot]++] = obj;
+    } else {
+        vio_d3d12_wait_for_gpu();   /* bookkeeping full: drain instead */
+        IUnknown_Release(obj);
+    }
+}
+
+/* Draw parameters below SM 6.8 (OPEN-ITEMS-PLAN A11): command signatures that set
+ * the b13 root constants before each Draw(Indexed). */
+static ID3D12CommandSignature *d3d12_indirect_signature_dp(int indexed)
+{
+    ID3D12CommandSignature **slot = indexed ? &vio_d3d12.cmdsig_indexed_dp : &vio_d3d12.cmdsig_plain_dp;
+    if (*slot) return *slot;
+    D3D12_INDIRECT_ARGUMENT_DESC arg[2];
+    memset(arg, 0, sizeof(arg));
+    arg[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    arg[0].Constant.RootParameterIndex = VIO_D3D12_RP_DRAW_PARAMS;
+    arg[0].Constant.DestOffsetIn32BitValues = 0;
+    arg[0].Constant.Num32BitValuesToSet = 2;
+    arg[1].Type = indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_COMMAND_SIGNATURE_DESC sd = {0};
+    sd.ByteStride = indexed ? 28 : 24;
+    sd.NumArgumentDescs = 2;
+    sd.pArgumentDescs = arg;
+    if (FAILED(ID3D12Device_CreateCommandSignature(vio_d3d12.device, &sd, vio_d3d12.root_signature,
+                                                   &IID_ID3D12CommandSignature, (void **)slot))) {
+        *slot = NULL;
+    }
+    return *slot;
+}
+
+/* Room for `bytes` in this frame's draw-parameter ring: the buffer and the offset.
+ * A ring too small for the frame is replaced (the old one parked until the
+ * frame's fence); begin_frame rewinds it. */
+static ID3D12Resource *d3d12_dp_alloc(UINT64 bytes, UINT64 *offset)
+{
+    UINT slot = vio_d3d12.frame_index;
+    if (!vio_d3d12.dp_buf[slot] || vio_d3d12.dp_used[slot] + bytes > vio_d3d12.dp_cap[slot]) {
+        UINT64 cap = vio_d3d12.dp_cap[slot] ? vio_d3d12.dp_cap[slot] * 2 : 64 * 1024;
+        while (cap < vio_d3d12.dp_used[slot] + bytes) cap *= 2;
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = cap;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource *buf = NULL;
+        if (FAILED(ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&buf)) || !buf) return NULL;
+        if (vio_d3d12.dp_buf[slot]) d3d12_park_object((IUnknown *)vio_d3d12.dp_buf[slot]);
+        vio_d3d12.dp_buf[slot] = buf;
+        vio_d3d12.dp_cap[slot] = cap;
+        vio_d3d12.dp_used[slot] = 0;
+    }
+    *offset = vio_d3d12.dp_used[slot];
+    vio_d3d12.dp_used[slot] += (bytes + 255) & ~(UINT64)255;
+    return vio_d3d12.dp_buf[slot];
+}
+
+static void d3d12_buffer_barrier(ID3D12Resource *r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = before;
+    b.Transition.StateAfter = after;
+    ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &b);
+}
+
+/* vio records (indexed: indexCount, instanceCount, firstIndex, baseVertex,
+ * firstInstance; plain: vertexCount, instanceCount, firstVertex, firstInstance)
+ * become D3D12 records with gl_BaseVertex / gl_BaseInstance in front: two
+ * CopyBufferRegion per record - the pair (baseVertex / firstVertex and
+ * firstInstance sit next to each other), then the arguments. GPU-written
+ * arguments stay GPU-side. Returns 0 when the draw was issued. */
+static int d3d12_draw_indirect_dp(vio_d3d12_buffer *args, int indexed, int max_draws, size_t offset, int live_uav)
+{
+    ID3D12CommandSignature *sig = d3d12_indirect_signature_dp(indexed);
+    if (!sig) return -1;
+    UINT src_stride = indexed ? 20 : 16, dst_stride = src_stride + 8;
+    UINT64 base = 0;
+    ID3D12Resource *dp = d3d12_dp_alloc((UINT64)max_draws * dst_stride, &base);
+    if (!dp) return -1;
+    if (live_uav) {
+        D3D12_RESOURCE_BARRIER u = {0};
+        u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        u.UAV.pResource = args->resource;
+        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &u);
+        d3d12_buffer_barrier(args->resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+    d3d12_buffer_barrier(dp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    UINT pair = indexed ? 12 : 8;   /* byte offset of baseVertex / firstVertex */
+    for (int i = 0; i < max_draws; i++) {
+        UINT64 s = (UINT64)offset + (UINT64)i * src_stride, d = base + (UINT64)i * dst_stride;
+        ID3D12GraphicsCommandList_CopyBufferRegion(vio_d3d12.cmd_list, dp, d, args->resource, s + pair, 8);
+        ID3D12GraphicsCommandList_CopyBufferRegion(vio_d3d12.cmd_list, dp, d + 8, args->resource, s, src_stride);
+    }
+    d3d12_buffer_barrier(dp, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    if (live_uav) d3d12_buffer_barrier(args->resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    d3d12_apply_view_mask();
+    d3d12_apply_bindless();
+    ID3D12GraphicsCommandList_ExecuteIndirect(vio_d3d12.cmd_list, sig, (UINT)max_draws, dp, base, NULL, 0);
+    d3d12_buffer_barrier(dp, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+    d3d12_apply_draw_params_zero();   /* the signature left the constants undefined */
+    return 0;
+}
+
 static void d3d12_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
 {
     if (!d3d12_current_pipeline) return;   /* see d3d12_draw */
@@ -7853,6 +8026,7 @@ static void d3d12_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
      * ExecuteIndirect needs INDIRECT_ARGUMENT (COMMON / GENERIC_READ promote by
      * themselves). Flush the UAV writes, transition, draw, transition back. */
     int live_uav = args->uav_live_serial != 0 && args->uav_live_serial == vio_d3d12.frame_serial;
+    if (d3d12_current_pipeline->uses_draw_params && d3d12_draw_indirect_dp(args, indexed, max_draws, offset, live_uav) == 0) return;
     if (live_uav) {
         D3D12_RESOURCE_BARRIER b[2] = {0};
         b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;

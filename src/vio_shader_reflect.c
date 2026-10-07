@@ -883,6 +883,27 @@ char *vio_spirv_to_hlsl_ex(const uint32_t *spirv, size_t spirv_size, int shader_
 static int vio_hlsl_16bit_types = 0;
 void vio_hlsl_set_16bit_types(int enable) { vio_hlsl_16bit_types = enable ? 1 : 0; }
 
+/* SPIRV-Cross declares the draw-parameter cbuffer without a register, so the
+ * compiler would pick the lowest free one. Pin it to b13, where D3D12's root
+ * signature keeps the draw-parameter root constants (D3D11 leaves b13 unbound:
+ * the values read 0, like vio_draw's). */
+static char *vio_hlsl_pin_vertex_info(char *hlsl)
+{
+    static const char decl[] = "cbuffer SPIRV_Cross_VertexInfo";
+    static const char reg[] = " : register(b13)";
+    if (!hlsl) return hlsl;
+    char *at = strstr(hlsl, decl);
+    if (!at) return hlsl;
+    size_t len = strlen(hlsl), head = (size_t)(at - hlsl) + sizeof(decl) - 1;
+    char *out = (char *)malloc(len + sizeof(reg));
+    if (!out) return hlsl;
+    memcpy(out, hlsl, head);
+    memcpy(out + head, reg, sizeof(reg) - 1);
+    strcpy(out + head + sizeof(reg) - 1, hlsl + head);
+    free(hlsl);
+    return out;
+}
+
 /* 64-bit atomics on a RWByteAddressBuffer (GL_EXT_shader_atomic_int64 on an
  * SSBO, VIO_FEATURE_ATOMIC64). SPIRV-Cross emits `buf.InterlockedMax(off, v, r)`
  * for them, but the 64-bit raw-buffer methods of Shader Model 6.6 are the *64
@@ -989,6 +1010,12 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
 
     spvc_compiler_create_compiler_options(compiler, &options);
     spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL, shader_model);
+    /* gl_BaseVertex / gl_BaseInstance below SM 6.8 (no SV_Start*Location):
+     * SPIRV-Cross reads them from cbuffer SPIRV_Cross_VertexInfo, which
+     * vio_hlsl_pin_vertex_info puts at b13 - D3D12's draw-parameter root
+     * constants (OPEN-ITEMS-PLAN A11). */
+    if (shader_model < 68)
+        spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_SUPPORT_NONZERO_BASE_VERTEX_BASE_INSTANCE, SPVC_TRUE);
     if (vio_hlsl_16bit_types && shader_model >= 62)
         spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_ENABLE_16BIT_TYPES, SPVC_TRUE);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT, SPVC_TRUE);
@@ -1140,6 +1167,7 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
     }
     if (is_geometry) output = vio_gs_hlsl_patch(output, gs_pos_location, gs_invocation, gs_invocations);
     output = vio_hlsl_fix_int64_buffer_atomics(output);
+    output = vio_hlsl_pin_vertex_info(output);
     if (output && hooks && hooks->finish) output = hooks->finish(compiler, output, error_msg, hooks->user);
 
     spvc_context_destroy(ctx);
