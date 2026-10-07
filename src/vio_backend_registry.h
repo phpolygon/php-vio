@@ -23,6 +23,10 @@ typedef struct _vio_select_candidate {
     int                score;
     int                eligible;
     char               reason[48];  /* why not eligible */
+    /* Calibration run (A8): 0 not run, 1 measured, 2 from the cache, -1 failed. */
+    int                bench_state;
+    double             bench_ms;     /* wall time per frame */
+    double             bench_gpu_ms; /* median vio_gpu_frame_time, -1 unknown */
 } vio_select_candidate;
 
 int vio_select_host_platform(void);

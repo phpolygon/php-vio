@@ -410,7 +410,7 @@ function vio_swapchain_info(VioContext $context): array {}
  * ('discrete' | 'integrated' | 'software' | 'unknown'), 'vram_bytes' => int].
  * D3D11 / D3D12 report the feature level and HLSL shader model, Vulkan the SPIR-V
  * version of the instance / device API, OpenGL the GLSL version. False without a
- * device. 'selected_by' => 'explicit' | 'priority' (plain 'auto') | 'score'
+ * device. 'selected_by' => 'explicit' | 'priority' (plain 'auto') | 'score' | 'benchmark'
  * ('auto' with prefer / require), 'candidates' => the vio_rank_backends()
  * ranking of a scored 'auto' ([] otherwise).
  */
@@ -437,9 +437,25 @@ function vio_adapters(?string $backend = null): array {}
  * feature points). 'require' (VIO_FEATURE_* list) filters; a feature the
  * backend cannot tell before a context is checked when vio_create opens it.
  * Entries: ['backend', 'adapter' => ?string, 'vendor', 'device_type', 'score',
- * 'eligible' => bool, 'reason' => ?string]. False on a bad option (warning).
+ * 'eligible' => bool, 'reason' => ?string, 'benchmark_ms' => ?float]. False on
+ * a bad option (warning).
  */
 function vio_rank_backends(array $options = []): array|false {}
+
+/**
+ * Calibration run without a selection (settings menus, tools): the same scene
+ * (64 draws into a render target, a post pass, async compute; headless on the
+ * GPU, 256 x 256) on the top 'max' (default 3) candidates of the ranking
+ * ('prefer' / 'require' as for vio_rank_backends). 'frames' (default 120) per
+ * candidate; 'cache' => dir (default: the shader cache directory) keeps the
+ * result per (backend, adapter, driver, vio version) in vio-benchmark.json and
+ * a hit skips the run. Entries ['backend', 'adapter' => ?string, 'driver',
+ * 'ms' (wall time per frame, -1 = failed), 'gpu_ms' (median GPU time, -1
+ * unknown), 'cached' => bool], fastest first, failed runs last.
+ * vio_create('auto', ['benchmark' => true, 'benchmark_cache' => dir,
+ * 'benchmark_frames' => n]) picks the fastest (selected_by 'benchmark').
+ */
+function vio_benchmark_backends(array $options = []): array|false {}
 
 /**
  * Inline ray tracing (VIO_FEATURE_RAY_QUERY): build a bottom-level acceleration

@@ -469,6 +469,7 @@ typedef struct _vio_config {
     int         samples;    /* MSAA, 0 = off */
     int         debug;      /* Validation Layers / Debug Output */
     int         headless;   /* Offscreen rendering, no visible window */
+    int         headless_hardware; /* D3D11 / D3D12: headless on the GPU instead of WARP */
     /* Backbuffers == how many frames the CPU may run ahead of the GPU.
      * 0 = backend default. Currently only D3D12 honours it (2 or 3); other
      * backends ignore it. See VIO_D3D12_FRAME_COUNT_DEFAULT. */

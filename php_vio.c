@@ -61,6 +61,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include <string.h>
 #include <stdlib.h>
 #include "ext/json/php_json.h"
+#include "zend_smart_str.h"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -107,14 +108,20 @@ PHP_INI_END()
 
 /* ── Backend scoring for 'auto' (OPEN-ITEMS-PLAN A7) ────────────────── */
 
-/* 1 = 'prefer' / 'require' given (scored 'auto'), 0 = plain 'auto', -1 = bad option (warned). */
-static int vio_select_options(HashTable *opts, int *prefer, uint64_t *require)
+/* 1 = 'prefer' / 'require' / 'benchmark' given (scored 'auto'), 0 = plain 'auto', -1 = bad option (warned). */
+static int vio_select_options(HashTable *opts, int *prefer, uint64_t *require, int *benchmark)
 {
     zval *v;
     int scored = 0;
     *prefer = VIO_PREFER_PERFORMANCE;
     *require = 0;
+    *benchmark = 0;
     if (!opts) return 0;
+    /* A8: calibration run among the top candidates (implies the ranking). */
+    if ((v = zend_hash_str_find(opts, "benchmark", sizeof("benchmark") - 1)) != NULL && zend_is_true(v)) {
+        *benchmark = 1;
+        scored = 1;
+    }
     if ((v = zend_hash_str_find(opts, "prefer", sizeof("prefer") - 1)) != NULL) {
         scored = 1;
         if (Z_TYPE_P(v) == IS_STRING && strcmp(Z_STRVAL_P(v), "performance") == 0) *prefer = VIO_PREFER_PERFORMANCE;
@@ -266,6 +273,8 @@ static void vio_select_to_zval(zval *out, const vio_select_candidate *c, int n)
         add_assoc_bool(&e, "eligible", c[i].eligible);
         if (c[i].reason[0]) add_assoc_string(&e, "reason", (char *)c[i].reason);
         else add_assoc_null(&e, "reason");
+        if (c[i].bench_state > 0) add_assoc_double(&e, "benchmark_ms", c[i].bench_ms);
+        else add_assoc_null(&e, "benchmark_ms");
         add_next_index_zval(out, &e);
     }
 }
@@ -274,17 +283,328 @@ static void vio_select_to_zval(zval *out, const vio_select_candidate *c, int n)
 ZEND_FUNCTION(vio_rank_backends)
 {
     HashTable *opts = NULL;
-    int prefer, platform;
+    int prefer, platform, bench;
     uint64_t require;
     vio_select_candidate rank[VIO_MAX_BACKENDS];
     ZEND_PARSE_PARAMETERS_START(0, 1)
         Z_PARAM_OPTIONAL
         Z_PARAM_ARRAY_HT(opts)
     ZEND_PARSE_PARAMETERS_END();
-    if (vio_select_options(opts, &prefer, &require) < 0) RETURN_FALSE;
+    if (vio_select_options(opts, &prefer, &require, &bench) < 0) RETURN_FALSE;
     int n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
     vio_select_rank(rank, n, platform, prefer, require);
     vio_select_to_zval(return_value, rank, n);
+}
+
+/* ── Calibration run (OPEN-ITEMS-PLAN A8) ────────────────────────────────
+ *
+ * The same scene on every candidate, through the public API only: 64 draws of a
+ * 2k-triangle grid with per-draw uniforms into a render target, a 25-tap
+ * post pass to the backbuffer and an async compute dispatch (when the backend
+ * has compute). Headless on the GPU (headless_hardware), 256 x 256. */
+static const char vio_bench_scene_src[] =
+    "function (string $backend, int $frames): array|false {\n"
+    "    $size = 256;\n"
+    "    $ctx = @vio_create($backend, ['width' => $size, 'height' => $size, 'headless' => true,\n"
+    "                                  'headless_hardware' => true, 'vsync' => false]);\n"
+    "    if (!$ctx) return false;\n"
+    "    if (vio_backend_name($ctx) !== $backend || !vio_supports_feature($ctx, VIO_FEATURE_3D_PIPELINE)) {\n"
+    "        vio_destroy($ctx);\n"
+    "        return false;\n"
+    "    }\n"
+    "    $scene = vio_shader($ctx, ['vertex' => '#version 330 core\n"
+    "layout(location = 0) in vec3 aPos;\n"
+    "uniform vec4 u_xform;\n"
+    "out vec2 v_p;\n"
+    "void main() { v_p = aPos.xy; gl_Position = vec4(aPos.xy * u_xform.z + u_xform.xy, aPos.z, 1.0); }',\n"
+    "        'fragment' => '#version 330 core\n"
+    "in vec2 v_p;\n"
+    "uniform vec4 u_color;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "void main() { float s = 0.0; for (int k = 0; k < 16; k++) s += sin(v_p.x * float(k) + v_p.y); o = u_color * (0.5 + 0.03 * s); }']);\n"
+    "    $post = vio_shader($ctx, ['vertex' => '#version 330 core\n"
+    "layout(location = 0) in vec3 aPos;\n"
+    "out vec2 v_uv;\n"
+    "void main() { v_uv = aPos.xy * 0.5 + 0.5; gl_Position = vec4(aPos, 1.0); }',\n"
+    "        'fragment' => '#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "uniform sampler2D u_tex;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "void main() { vec4 c = vec4(0.0); for (int y = -2; y <= 2; y++) for (int x = -2; x <= 2; x++) c += texture(u_tex, v_uv + vec2(x, y) / 256.0); o = c / 25.0; }']);\n"
+    "    if (!$scene || !$post) { vio_destroy($ctx); return false; }\n"
+    "    $pScene = vio_pipeline($ctx, ['shader' => $scene, 'depth_test' => true]);\n"
+    "    $pPost = vio_pipeline($ctx, ['shader' => $post, 'depth_test' => false]);\n"
+    "    $v = [];\n"
+    "    $idx = [];\n"
+    "    $n = 32;\n"
+    "    for ($y = 0; $y <= $n; $y++) for ($x = 0; $x <= $n; $x++) { $v[] = $x / $n * 2 - 1; $v[] = $y / $n * 2 - 1; $v[] = 0.5; }\n"
+    "    for ($y = 0; $y < $n; $y++) for ($x = 0; $x < $n; $x++) {\n"
+    "        $a = $y * ($n + 1) + $x;\n"
+    "        array_push($idx, $a, $a + 1, $a + $n + 2, $a, $a + $n + 2, $a + $n + 1);\n"
+    "    }\n"
+    "    $grid = vio_mesh($ctx, ['vertices' => $v, 'indices' => $idx, 'layout' => [VIO_FLOAT3]]);\n"
+    "    $full = vio_mesh($ctx, ['vertices' => [-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0], 'indices' => [0, 1, 2, 0, 2, 3], 'layout' => [VIO_FLOAT3]]);\n"
+    "    $rt = vio_render_target($ctx, ['width' => $size, 'height' => $size]);\n"
+    "    $cp = null;\n"
+    "    if (vio_supports_feature($ctx, VIO_FEATURE_COMPUTE)) {\n"
+    "        $cp = @vio_compute_pipeline($ctx, ['source' => '#version 450\n"
+    "layout(local_size_x = 64) in;\n"
+    "layout(std430, binding = 0) buffer Data { float v[]; };\n"
+    "void main() { uint i = gl_GlobalInvocationID.x; float x = v[i]; for (int k = 0; k < 32; k++) x = sin(x) * 0.999 + 0.5; v[i] = x; }']);\n"
+    "        $buf = $cp ? @vio_storage_buffer($ctx, ['size' => 65536 * 4]) : null;\n"
+    "        if ($buf) vio_compute_bind_buffer($ctx, $cp, $buf, 0, VIO_COMPUTE_WRITE);\n"
+    "        else $cp = null;\n"
+    "    }\n"
+    "    if (!$pScene || !$pPost || !$grid || !$full || !$rt) { vio_destroy($ctx); return false; }\n"
+    "    $frame = function () use ($ctx, $pScene, $pPost, $grid, $full, $rt, $cp) {\n"
+    "        vio_begin($ctx);\n"
+    "        if ($cp) vio_compute_dispatch($ctx, $cp, 1024, 1, 1, ['async' => true]);\n"
+    "        vio_bind_render_target($ctx, $rt);\n"
+    "        vio_clear($ctx, 0.1, 0.1, 0.1, 1.0);\n"
+    "        vio_bind_pipeline($ctx, $pScene);\n"
+    "        for ($i = 0; $i < 64; $i++) {\n"
+    "            vio_set_uniform($ctx, 'u_xform', [($i % 8) / 4.0 - 0.875, intdiv($i, 8) / 4.0 - 0.875, 0.12, 0.0]);\n"
+    "            vio_set_uniform($ctx, 'u_color', [($i % 3) / 2.0, ($i % 5) / 4.0, ($i % 7) / 6.0, 1.0]);\n"
+    "            vio_draw($ctx, $grid);\n"
+    "        }\n"
+    "        vio_unbind_render_target($ctx);\n"
+    "        vio_bind_pipeline($ctx, $pPost);\n"
+    "        vio_set_uniform($ctx, 'u_tex', 0);\n"
+    "        vio_bind_texture($ctx, vio_render_target_texture($rt), 0);\n"
+    "        vio_draw($ctx, $full);\n"
+    "        vio_end($ctx);\n"
+    "    };\n"
+    "    for ($i = 0; $i < 3; $i++) $frame();\n"
+    "    vio_read_pixels($ctx);\n"
+    "    $gpu = [];\n"
+    "    $t = hrtime(true);\n"
+    "    for ($i = 0; $i < $frames; $i++) {\n"
+    "        $frame();\n"
+    "        $g = vio_gpu_frame_time($ctx);\n"
+    "        if ($g >= 0) $gpu[] = $g;\n"
+    "    }\n"
+    "    vio_read_pixels($ctx);\n"
+    "    $ms = (hrtime(true) - $t) / 1e6 / max(1, $frames);\n"
+    "    vio_destroy($ctx);\n"
+    "    sort($gpu);\n"
+    "    return ['ms' => $ms, 'gpu_ms' => $gpu ? (float)$gpu[intdiv(count($gpu), 2)] : -1.0];\n"
+    "}\n";
+
+static int vio_bench_run(const char *backend, int frames, double *ms, double *gpu_ms)
+{
+    zval fn, ret, args[2];
+    int ok = 0;
+    int saved_er = (int)EG(error_reporting);
+    if (zend_eval_stringl(vio_bench_scene_src, sizeof(vio_bench_scene_src) - 1, &fn, "vio calibration scene") != SUCCESS)
+        return 0;
+    ZVAL_STRING(&args[0], backend);
+    ZVAL_LONG(&args[1], frames);
+    EG(error_reporting) &= ~(E_WARNING | E_NOTICE);
+    if (call_user_function(NULL, NULL, &fn, &ret, 2, args) == SUCCESS) {
+        if (!EG(exception) && Z_TYPE(ret) == IS_ARRAY) {
+            zval *m = zend_hash_str_find(Z_ARRVAL(ret), "ms", 2);
+            zval *g = zend_hash_str_find(Z_ARRVAL(ret), "gpu_ms", 6);
+            if (m) {
+                *ms = zval_get_double(m);
+                *gpu_ms = g ? zval_get_double(g) : -1.0;
+                ok = *ms > 0;
+            }
+        }
+        zval_ptr_dtor(&ret);
+    }
+    /* A candidate that throws simply did not run the scene. */
+    if (EG(exception)) zend_clear_exception();
+    EG(error_reporting) = saved_er;
+    zval_ptr_dtor(&args[0]);
+    zval_ptr_dtor(&fn);
+    return ok;
+}
+
+/* Cache key: a driver update or a new vio version measures again. */
+static void vio_bench_key(char *out, size_t size, const vio_select_candidate *c)
+{
+    snprintf(out, size, "%s|%s|%s|%s", c->backend, c->has_adapter ? c->adapter.name : "",
+             c->has_adapter ? c->adapter.driver : "", PHP_VIO_VERSION);
+}
+
+static void vio_bench_path(char *out, size_t size, const char *dir)
+{
+    size_t n = strlen(dir);
+    int sep = n && (dir[n - 1] == '/' || dir[n - 1] == '\\');
+    snprintf(out, size, "%s%svio-benchmark.json", dir, sep ? "" : "/");
+}
+
+/* {"version": 1, "entries": {key: {"ms", "gpu_ms"}}}; UNDEF when absent / unreadable. */
+static void vio_bench_load(zval *root, const char *dir)
+{
+    char path[1100];
+    ZVAL_UNDEF(root);
+    vio_bench_path(path, sizeof(path), dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len > 0 && len < (16 << 20)) {
+        char *buf = (char *)emalloc((size_t)len + 1);
+        size_t got = fread(buf, 1, (size_t)len, f);
+        buf[got] = '\0';
+        if (php_json_decode_ex(root, buf, got, PHP_JSON_OBJECT_AS_ARRAY, 8) != SUCCESS || Z_TYPE_P(root) != IS_ARRAY) {
+            zval_ptr_dtor(root);
+            ZVAL_UNDEF(root);
+        }
+        efree(buf);
+    }
+    fclose(f);
+}
+
+static void vio_bench_save(zval *entries, const char *dir)
+{
+    char path[1100];
+    smart_str out = {0};
+    zval root, ver;
+    array_init(&root);
+    ZVAL_LONG(&ver, 1);
+    add_assoc_zval(&root, "version", &ver);
+    Z_TRY_ADDREF_P(entries);
+    add_assoc_zval(&root, "entries", entries);
+    if (php_json_encode(&out, &root, PHP_JSON_PRETTY_PRINT | PHP_JSON_UNESCAPED_SLASHES) == SUCCESS && out.s) {
+        vio_bench_path(path, sizeof(path), dir);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(ZSTR_VAL(out.s), 1, ZSTR_LEN(out.s), f);
+            fclose(f);
+        }
+    }
+    smart_str_free(&out);
+    zval_ptr_dtor(&root);
+}
+
+/* Measure (or read from the cache) the first `max` eligible registered
+ * candidates of the ranking. */
+static void vio_bench_candidates(vio_select_candidate *c, int n, int max, int frames, const char *dir)
+{
+    zval root, entries;
+    int dirty = 0, done = 0;
+    char key[600];
+    array_init(&entries);
+    if (dir && *dir) {
+        vio_bench_load(&root, dir);
+        if (Z_TYPE(root) == IS_ARRAY) {
+            zval *e = zend_hash_str_find(Z_ARRVAL(root), "entries", 7);
+            zval *v = zend_hash_str_find(Z_ARRVAL(root), "version", 7);
+            if (e && Z_TYPE_P(e) == IS_ARRAY && v && zval_get_long(v) == 1) {
+                zval_ptr_dtor(&entries);
+                ZVAL_ARR(&entries, zend_array_dup(Z_ARRVAL_P(e)));
+            }
+            zval_ptr_dtor(&root);
+        }
+    }
+    for (int i = 0; i < n && done < max; i++) {
+        vio_select_candidate *k = &c[i];
+        double ms = 0, gpu = -1;
+        if (!k->eligible || !k->be) continue;
+        done++;
+        vio_bench_key(key, sizeof(key), k);
+        zval *hit = zend_hash_str_find(Z_ARRVAL(entries), key, strlen(key));
+        zval *hm = hit && Z_TYPE_P(hit) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(hit), "ms", 2) : NULL;
+        if (hm && zval_get_double(hm) > 0) {
+            zval *hg = zend_hash_str_find(Z_ARRVAL_P(hit), "gpu_ms", 6);
+            k->bench_state = 2;
+            k->bench_ms = zval_get_double(hm);
+            k->bench_gpu_ms = hg ? zval_get_double(hg) : -1.0;
+            continue;
+        }
+        if (vio_bench_run(k->backend, frames, &ms, &gpu)) {
+            zval e;
+            k->bench_state = 1;
+            k->bench_ms = ms;
+            k->bench_gpu_ms = gpu;
+            array_init(&e);
+            add_assoc_double(&e, "ms", ms);
+            add_assoc_double(&e, "gpu_ms", gpu);
+            zend_hash_str_update(Z_ARRVAL(entries), key, strlen(key), &e);
+            dirty = 1;
+        } else {
+            k->bench_state = -1;
+            k->bench_ms = -1.0;
+            k->bench_gpu_ms = -1.0;
+        }
+    }
+    if (dirty && dir && *dir) vio_bench_save(&entries, dir);
+    zval_ptr_dtor(&entries);
+}
+
+/* Measured candidates first, fastest first; the rest keep the ranking. */
+static void vio_bench_reorder(vio_select_candidate *c, int n)
+{
+    for (int i = 1; i < n; i++) {
+        vio_select_candidate tmp = c[i];
+        int j = i - 1;
+        int tm = tmp.bench_state > 0;
+        while (j >= 0) {
+            int cm = c[j].bench_state > 0;
+            if (!(tm && (!cm || c[j].bench_ms > tmp.bench_ms))) break;
+            c[j + 1] = c[j];
+            j--;
+        }
+        c[j + 1] = tmp;
+    }
+}
+
+static const char *vio_bench_dir(HashTable *opts, const char *key)
+{
+    zval *v = opts ? zend_hash_str_find(opts, key, strlen(key)) : NULL;
+    if (v && Z_TYPE_P(v) == IS_STRING && Z_STRLEN_P(v)) return Z_STRVAL_P(v);
+    v = opts ? zend_hash_str_find(opts, "shader_cache", sizeof("shader_cache") - 1) : NULL;
+    if (v && Z_TYPE_P(v) == IS_STRING && Z_STRLEN_P(v)) return Z_STRVAL_P(v);
+    return vio_shader_cache_dir();
+}
+
+static int vio_bench_frames(HashTable *opts, const char *key)
+{
+    zval *v = opts ? zend_hash_str_find(opts, key, strlen(key)) : NULL;
+    zend_long f = v ? zval_get_long(v) : 120;
+    return f < 1 ? 1 : (f > 2000 ? 2000 : (int)f);
+}
+
+/* vio_benchmark_backends(array $options = []): the calibration table, no selection. */
+ZEND_FUNCTION(vio_benchmark_backends)
+{
+    HashTable *opts = NULL;
+    int prefer, platform, bench;
+    uint64_t require;
+    vio_select_candidate rank[VIO_MAX_BACKENDS];
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+    if (vio_select_options(opts, &prefer, &require, &bench) < 0) RETURN_FALSE;
+    zval *mv = opts ? zend_hash_str_find(opts, "max", 3) : NULL;
+    zend_long max = mv ? zval_get_long(mv) : 3;
+    if (max < 1) max = 1;
+    if (max > VIO_MAX_BACKENDS) max = VIO_MAX_BACKENDS;
+    int n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
+    vio_select_rank(rank, n, platform, prefer, require);
+    vio_bench_candidates(rank, n, (int)max, vio_bench_frames(opts, "frames"), vio_bench_dir(opts, "cache"));
+    vio_bench_reorder(rank, n);
+    array_init(return_value);
+    /* Measured first (fastest first), failed runs last. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < n; i++) {
+            zval e;
+            if (rank[i].bench_state == 0 || (pass == 0) != (rank[i].bench_state > 0)) continue;
+            array_init(&e);
+            add_assoc_string(&e, "backend", rank[i].backend);
+            if (rank[i].has_adapter) add_assoc_string(&e, "adapter", rank[i].adapter.name);
+            else add_assoc_null(&e, "adapter");
+            add_assoc_string(&e, "driver", rank[i].has_adapter ? rank[i].adapter.driver : "");
+            add_assoc_double(&e, "ms", rank[i].bench_ms);
+            add_assoc_double(&e, "gpu_ms", rank[i].bench_gpu_ms);
+            add_assoc_bool(&e, "cached", rank[i].bench_state == 2);
+            add_next_index_zval(return_value, &e);
+        }
+    }
 }
 
 /* vio_create('auto') (GAP-PHASE5 Block 10c): a registered backend that cannot open a
@@ -312,15 +632,22 @@ ZEND_FUNCTION(vio_create)
 
     /* 'prefer' / 'require' turn 'auto' into a ranking (A7); plain 'auto' keeps
      * the platform priority list. */
-    int select_prefer = VIO_PREFER_PERFORMANCE, rank_n = 0;
+    int select_prefer = VIO_PREFER_PERFORMANCE, rank_n = 0, benchmark = 0;
     uint64_t select_require = 0;
     vio_select_candidate rank[VIO_MAX_BACKENDS];
-    int scored = auto_pick ? vio_select_options(options_ht, &select_prefer, &select_require) : 0;
+    int scored = auto_pick ? vio_select_options(options_ht, &select_prefer, &select_require, &benchmark) : 0;
     if (scored < 0) RETURN_FALSE;
     if (scored) {
         int platform;
         rank_n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
         vio_select_rank(rank, rank_n, platform, select_prefer, select_require);
+        /* A8: the calibration run decides among the top three; cached per adapter + driver. */
+        if (benchmark) {
+            vio_bench_candidates(rank, rank_n, 3, vio_bench_frames(options_ht, "benchmark_frames"),
+                                 vio_bench_dir(options_ht, "benchmark_cache"));
+            vio_bench_reorder(rank, rank_n);
+            benchmark = rank_n > 0 && rank[0].bench_state > 0;
+        }
     }
 
     /* Find backend */
@@ -432,6 +759,11 @@ pick_backend:
         }
         if ((val = zend_hash_str_find(options_ht, "headless", sizeof("headless") - 1)) != NULL) {
             ctx->config.headless = zend_is_true(val);
+        }
+        /* D3D11 / D3D12 run headless contexts on WARP; this keeps the GPU
+         * (like VIO_D3D_HEADLESS_HARDWARE=1, per context). */
+        if ((val = zend_hash_str_find(options_ht, "headless_hardware", sizeof("headless_hardware") - 1)) != NULL) {
+            ctx->config.headless_hardware = zend_is_true(val);
         }
         /* On-disk shader / pipeline cache directory (GAP-PHASE5 Block 4): DXBC per
          * HLSL stage on D3D11/D3D12, GL program binaries, the Vulkan pipeline
@@ -596,7 +928,7 @@ pick_backend:
             VIO_CREATE_FAIL();
         }
     }
-    ctx->selected_by = !auto_pick ? "explicit" : (scored ? "score" : "priority");
+    ctx->selected_by = !auto_pick ? "explicit" : (benchmark && backend == rank[0].be ? "benchmark" : (scored ? "score" : "priority"));
     if (scored) {
         zval cand;
         vio_select_to_zval(&cand, rank, rank_n);

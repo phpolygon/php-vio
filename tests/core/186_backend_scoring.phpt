@@ -72,7 +72,7 @@ require rq:  vulkan > d3d12 (x) > d3d11 (x)
 warp last:   vulkan > d3d12 > d3d11
 lavapipe:    opengl > vulkan
 apple:       metal > opengl
-keys:        backend,adapter,vendor,device_type,score,eligible,reason
+keys:        backend,adapter,vendor,device_type,score,eligible,reason,benchmark_ms
 bool(false)
 %Sno backend provides the required features%S
 score: score listed
