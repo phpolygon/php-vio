@@ -2719,6 +2719,19 @@ static void d3d12_apply_bindless(void)
 static int d3d12_bindless_set(int slot, void *backend_texture)
 {
     vio_d3d12_texture *t = (vio_d3d12_texture *)backend_texture;
+    if (!t && vio_d3d12.bindless && slot >= 0 && slot < VIO_BINDLESS_MAX) {
+        /* Released: back to the null SRV the table starts with. */
+        D3D12_SHADER_RESOURCE_VIEW_DESC nd = {0};
+        nd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nd.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE d;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &d);
+        d.ptr += (SIZE_T)(vio_d3d12.bindless_base + (UINT)slot) * vio_d3d12.srv_heap.descriptor_size;
+        ID3D12Device_CreateShaderResourceView(vio_d3d12.device, NULL, &nd, d);
+        return 0;
+    }
     if (!vio_d3d12.bindless || !t || !t->resource || !t->srv_cpu.ptr || t->depth > 0 || t->layers > 1
         || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
     D3D12_CPU_DESCRIPTOR_HANDLE d;

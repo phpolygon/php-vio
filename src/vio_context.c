@@ -44,6 +44,9 @@ void vio_context_bindless_clear(vio_context_object *ctx)
     efree(ctx->bindless);
     ctx->bindless = NULL;
     ctx->bindless_count = 0;
+    if (ctx->bindless_retire) { efree(ctx->bindless_retire); ctx->bindless_retire = NULL; }
+    if (ctx->bindless_free) { efree(ctx->bindless_free); ctx->bindless_free = NULL; }
+    ctx->bindless_free_count = 0;
 }
 
 static void vio_context_free_object(zend_object *obj)

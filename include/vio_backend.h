@@ -405,7 +405,7 @@ typedef struct _vio_backend {
      * (create_texture's handle, 2D) into slot 0..VIO_BINDLESS_MAX-1 of the
      * context's texture table that shaders read as Set 1 binding 0. The
      * frontend owns slot allocation and keeps the texture alive. 0 = ok. */
-    int   (*bindless_set)(int slot, void *backend_texture);
+    int   (*bindless_set)(int slot, void *backend_texture);   /* NULL texture: clear the slot (released, retired) */
     /* Inline ray tracing (VIO_FEATURE_RAY_QUERY): build the bottom- and
      * top-level structures of `desc` (returns the backend handle or NULL),
      * free them (deferred while a frame may still use them), and bind one for

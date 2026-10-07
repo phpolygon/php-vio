@@ -62,6 +62,12 @@ typedef struct _vio_context_object {
      * at a freed texture. emalloc'd lazily (VIO_BINDLESS_MAX entries). */
     zend_object      **bindless;
     int                bindless_count;
+    /* vio_texture_release_index: per slot the vio_begin count from which the
+     * slot may be handed out again (0 = live or empty), and the free slots. */
+    unsigned int      *bindless_retire;
+    int               *bindless_free;
+    int                bindless_free_count;
+    unsigned int       frame_no;   /* vio_begin calls on this context */
     zend_object        std;
 } vio_context_object;
 

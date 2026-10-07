@@ -556,6 +556,20 @@ static void vio_window_content_scale(GLFWwindow *window, float *sx, float *sy)
 }
 #endif
 
+/* Released bindless slots whose frames have finished: clear the entry, drop the
+ * table's reference, and hand the slot out again. Between frames. */
+static void vio_bindless_retire(vio_context_object *ctx)
+{
+    if (!ctx->bindless) return;
+    for (int i = 0; i < ctx->bindless_count; i++) {
+        if (!ctx->bindless_retire[i] || ctx->bindless_retire[i] > ctx->frame_no) continue;
+        if (ctx->backend && ctx->backend->bindless_set) ctx->backend->bindless_set(i, NULL);
+        if (ctx->bindless[i]) { OBJ_RELEASE(ctx->bindless[i]); ctx->bindless[i] = NULL; }
+        ctx->bindless_retire[i] = 0;
+        ctx->bindless_free[ctx->bindless_free_count++] = i;
+    }
+}
+
 ZEND_FUNCTION(vio_begin)
 {
     zval *ctx_zval;
@@ -575,6 +589,9 @@ ZEND_FUNCTION(vio_begin)
         php_error_docref(NULL, E_WARNING, "Already in a frame (vio_begin called twice without vio_end)");
         return;
     }
+
+    ctx->frame_no++;
+    vio_bindless_retire(ctx);
 
     vio_input_update(&ctx->input);
 
@@ -8237,22 +8254,51 @@ ZEND_FUNCTION(vio_texture_index)
         RETURN_FALSE;
     }
     for (int i = 0; i < ctx->bindless_count; i++) {
-        if (ctx->bindless[i] == &tex->std) RETURN_LONG(i);
+        if (ctx->bindless[i] == &tex->std && !ctx->bindless_retire[i]) RETURN_LONG(i);
     }
-    if (ctx->bindless_count >= VIO_BINDLESS_MAX) {
+    if (!ctx->bindless_free_count && ctx->bindless_count >= VIO_BINDLESS_MAX) {
         php_error_docref(NULL, E_WARNING, "vio_texture_index: the table is full (%d textures)", VIO_BINDLESS_MAX);
         RETURN_FALSE;
     }
-    if (!ctx->bindless) ctx->bindless = ecalloc(VIO_BINDLESS_MAX, sizeof(zend_object *));
-    int slot = ctx->bindless_count;
+    if (!ctx->bindless) {
+        ctx->bindless = ecalloc(VIO_BINDLESS_MAX, sizeof(zend_object *));
+        ctx->bindless_retire = ecalloc(VIO_BINDLESS_MAX, sizeof(unsigned int));
+        ctx->bindless_free = ecalloc(VIO_BINDLESS_MAX, sizeof(int));
+    }
+    /* Retired slots first (vio_bindless_retire); they hold a null entry. */
+    int reuse = ctx->bindless_free_count > 0;
+    int slot = reuse ? ctx->bindless_free[ctx->bindless_free_count - 1] : ctx->bindless_count;
     if (ctx->backend->bindless_set(slot, tex->backend_texture) != 0) {
         php_error_docref(NULL, E_WARNING, "vio_texture_index: the backend could not add the texture");
         RETURN_FALSE;
     }
     GC_ADDREF(&tex->std);
     ctx->bindless[slot] = &tex->std;
-    ctx->bindless_count++;
+    if (reuse) ctx->bindless_free_count--;
+    else ctx->bindless_count++;
     RETURN_LONG(slot);
+}
+
+/* Free the slot of a texture (BINDLESS-PLAN 4b). Frames already recorded may still
+ * read it, so the entry and the texture stay until VIO_BINDLESS_RETIRE_FRAMES
+ * more vio_begin calls (vio_bindless_retire); then the slot is cleared and reused. */
+ZEND_FUNCTION(vio_texture_release_index)
+{
+    zval *ctx_zval, *tex_zval;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (!ctx->initialized || !ctx->bindless) RETURN_FALSE;
+    for (int i = 0; i < ctx->bindless_count; i++) {
+        if (ctx->bindless[i] == &tex->std && !ctx->bindless_retire[i]) {
+            ctx->bindless_retire[i] = ctx->frame_no + VIO_BINDLESS_RETIRE_FRAMES;
+            RETURN_TRUE;
+        }
+    }
+    RETURN_FALSE;
 }
 
 /* ── Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK) ───────────────────── */

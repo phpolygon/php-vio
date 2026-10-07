@@ -410,6 +410,10 @@ typedef struct _vio_coopmat_shape {
 
 /* Slots of the vio_texture_index() table (Set 1 of the bindless contract). */
 #define VIO_BINDLESS_MAX 1024
+/* A released bindless slot (vio_texture_release_index) is reused after this many
+ * vio_begin calls: more than any backend keeps frames in flight (D3D12 <= 3,
+ * Vulkan 2, Metal 3), so no recorded frame can still read the old entry. */
+#define VIO_BINDLESS_RETIRE_FRAMES 4
 
 #define VIO_MAX_VIEWPORTS 16
 

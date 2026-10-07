@@ -40,7 +40,11 @@ Texturen + Sampler, weil SPIRV-Cross-MSL kombinierte `sampler2D[]` mit Laufzeitg
 Test 161: 64 einfarbige Texturen, ein Quad je Textur, Index pro Instanz → nicht-uniformer Index im
 Fragment-Shader; dazu der Vertrag (Slot stabil, Referenz hält die Textur, ohne Flag abgelehnt).
 
-## Phase 4b (offen)
+## Phase 4b
 
-Freigabe von Slots (`vio_texture_release_index`), Samplerwahl je Eintrag, Arrays/Cubes, Compute-Stages,
+- ✅ Freigabe von Slots (`vio_texture_release_index`, Test 176): der Slot bleibt `VIO_BINDLESS_RETIRE_FRAMES` (4)
+  `vio_begin` lang reserviert, dann schreibt das Backend einen leeren Eintrag (D3D12 Null-SRV, Vulkan 1×1-Dummy,
+  Metal Null-Resource-ID) und der Slot wird neu vergeben.
+
+Offen: Samplerwahl je Eintrag, Arrays/Cubes, Compute-Stages,
 Vertex-Stage-Zugriff auf Metal ohne `useResources`-Kosten (Residency Sets, Metal 4).

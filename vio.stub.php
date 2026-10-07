@@ -465,10 +465,19 @@ function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width
  *   layout(set = 1, binding = 0) uniform texture2D vio_textures[];
  *   layout(set = 1, binding = 1) uniform sampler vio_sampler;   // linear, repeat
  * and index it with nonuniformEXT (GL_EXT_nonuniform_qualifier). The first call adds
- * the texture and keeps it alive until vio_destroy; later calls return the same slot.
- * Plain 2D textures only, up to 1024. False (with a warning) without the feature.
+ * the texture and keeps it alive until vio_texture_release_index or vio_destroy; later
+ * calls return the same slot. Plain 2D textures only, up to 1024. False (with a
+ * warning) without the feature.
  */
 function vio_texture_index(VioContext $context, VioTexture $texture): int|false {}
+
+/**
+ * Free the bindless slot of $texture. Frames already recorded may still read it, so
+ * the table keeps the entry and the texture for 4 more vio_begin calls; after that
+ * the slot is cleared and vio_texture_index hands it out again. The texture can
+ * re-enter the table at once (under a new slot). False when it is not in the table.
+ */
+function vio_texture_release_index(VioContext $context, VioTexture $texture): bool {}
 
 /**
  * Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK; D3D12 with SM 6.5 + SamplerFeedbackTier 0.9):

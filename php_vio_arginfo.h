@@ -215,6 +215,11 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_swapchain_info, 0, 1, IS_ARR
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_texture_release_index, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_texture_index, 0, 2, MAY_BE_LONG|MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
@@ -1017,6 +1022,7 @@ ZEND_FUNCTION(vio_shader_cache_stats);
 ZEND_FUNCTION(vio_swapchain_info);
 ZEND_FUNCTION(vio_backend_info);
 ZEND_FUNCTION(vio_texture_index);
+ZEND_FUNCTION(vio_texture_release_index);
 ZEND_FUNCTION(vio_sampler_feedback_bind);
 ZEND_FUNCTION(vio_sampler_feedback_read);
 ZEND_FUNCTION(vio_sampler_feedback_clear);
@@ -1203,6 +1209,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_swapchain_info, arginfo_vio_swapchain_info)
 	ZEND_FE(vio_backend_info, arginfo_vio_backend_info)
 	ZEND_FE(vio_texture_index, arginfo_vio_texture_index)
+	ZEND_FE(vio_texture_release_index, arginfo_vio_texture_release_index)
 	ZEND_FE(vio_sampler_feedback_bind, arginfo_vio_sampler_feedback_bind)
 	ZEND_FE(vio_sampler_feedback_read, arginfo_vio_sampler_feedback_read)
 	ZEND_FE(vio_sampler_feedback_clear, arginfo_vio_sampler_feedback_clear)

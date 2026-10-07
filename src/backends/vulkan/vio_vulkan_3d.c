@@ -308,6 +308,14 @@ void vio_vk3d_begin_frame(uint32_t slot)
 
 /* ── Dummy resources (unbound samplers / blocks / storage) ─────────── */
 
+static vio_vulkan_texture *vk3d_dummy(int which);
+
+VkImageView vio_vk3d_dummy_2d_view(void)
+{
+    vio_vulkan_texture *t = vk3d_dummy(VK3D_DUMMY_2D);
+    return t ? t->view : VK_NULL_HANDLE;
+}
+
 static vio_vulkan_texture *vk3d_dummy(int which)
 {
     if (vk3d.dummy[which]) return vk3d.dummy[which];

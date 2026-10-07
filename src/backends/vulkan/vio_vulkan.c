@@ -1584,10 +1584,12 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void)
 static int vulkan_bindless_set(int slot, void *backend_texture)
 {
     vio_vulkan_texture *t = (vio_vulkan_texture *)backend_texture;
-    if (!t || !t->view || t->depth > 0 || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
+    /* Released: point the slot at the 1x1 dummy, so it never names a destroyed view. */
+    VkImageView view = t ? t->view : vio_vk3d_dummy_2d_view();
+    if (!view || (t && t->depth > 0) || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
     if (!vio_vk_bindless_layout() || !vio_vk.bindless_set) return -1;
     VkDescriptorImageInfo ii = {0};
-    ii.imageView   = t->view;
+    ii.imageView   = view;
     ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkWriteDescriptorSet w = {0};
     w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
