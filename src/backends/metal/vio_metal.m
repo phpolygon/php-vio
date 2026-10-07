@@ -59,6 +59,7 @@ typedef struct _vio_metal_caps {
     int raytracing;             /* intersection queries, MSL 2.3 */
     int function_pointers;      /* visible / intersection function tables, MSL 2.3 */
     int raytracing_from_render; /* ray queries in render pipelines, MSL 2.4 */
+    int cooperative_matrix;     /* GL_KHR_cooperative_matrix -> simdgroup_matrix 8x8; SPIRV-Cross needs MSL 3.1: Apple7+ */
     int mesh_shaders;           /* object / mesh stages, MSL 3.0: Metal3 + (Apple7 / Mac2) */
     int atomic64;               /* 64-bit atomic min / max, MSL 3.1: Apple9 */
     int tensors;                /* MTLTensor + Metal Performance Primitives, MSL 4.0: Metal4 */
@@ -519,6 +520,7 @@ static void metal_detect_caps(int msl, int max)
     c->raytracing             = msl >= 23 && METAL_DEVICE_BOOL(supportsRaytracing);
     c->function_pointers      = msl >= 23 && METAL_DEVICE_BOOL(supportsFunctionPointers);
     c->raytracing_from_render = msl >= 24 && METAL_DEVICE_BOOL(supportsRaytracingFromRender);
+    c->cooperative_matrix     = spirv_cross && msl >= 31 && c->apple_family >= 7;
     c->mesh_shaders           = msl >= 30 && c->metal3 && (c->apple_family >= 7 || c->mac2);
     c->atomic64               = msl >= 31 && c->apple_family >= 9;
     c->tensors                = msl >= 40 && c->metal4;
@@ -5850,6 +5852,26 @@ static void metal_swapchain_info(vio_swapchain_info *out)
     out->format        = vio_mtl.swap_format == MTLPixelFormatRGB10A2Unorm ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
 }
 
+/* VIO_FEATURE_COOPERATIVE_MATRIX: simdgroup_matrix comes in 8x8 half and
+ * float; simdgroup_multiply_accumulate also takes half A / B with a float
+ * accumulator. */
+static int metal_cooperative_matrix_shapes(vio_coopmat_shape *out, int max)
+{
+    static const vio_coopmat_type types[][2] = {
+        { VIO_COOPMAT_FLOAT16, VIO_COOPMAT_FLOAT16 },
+        { VIO_COOPMAT_FLOAT16, VIO_COOPMAT_FLOAT32 },
+        { VIO_COOPMAT_FLOAT32, VIO_COOPMAT_FLOAT32 },
+    };
+    if (!vio_mtl.caps.cooperative_matrix || !out) return 0;
+    int n = 0;
+    for (int i = 0; i < 3 && n < max; i++, n++) {
+        out[n].m = out[n].n = out[n].k = 8;
+        out[n].a = out[n].b = types[i][0];
+        out[n].c = out[n].result = types[i][1];
+    }
+    return n;
+}
+
 /* vio_backend_info(): the version ladder rung and the capability set. */
 static int metal_describe(vio_backend_description *out)
 {
@@ -5877,7 +5899,7 @@ static int metal_describe(vio_backend_description *out)
     out->cap_count = 0;
     CAP(tessellation); CAP(layered_vertex); CAP(quad_group); CAP(simd_group);
     CAP(barycentrics); CAP(vertex_amplification); CAP(argument_buffers_tier2);
-    CAP(raytracing); CAP(function_pointers); CAP(raytracing_from_render);
+    CAP(raytracing); CAP(function_pointers); CAP(raytracing_from_render); CAP(cooperative_matrix);
     CAP(mesh_shaders); CAP(atomic64); CAP(tensors); CAP(bindless);
     CAP(rasterization_rate_map); CAP(bc_texture_compression); CAP(unified_memory);
 #undef CAP
@@ -5942,6 +5964,9 @@ static int metal_supports_feature(vio_feature f)
         /* vertex + control kernels, then drawPatches (metal_draw_tess); the
          * [[patch]] functions need MSL 2.1 (version ladder). */
         return vio_mtl.caps.tessellation;
+    case VIO_FEATURE_COOPERATIVE_MATRIX:
+        /* coopmat -> simdgroup_matrix (SPIRV-Cross, 8x8 only, MSL 3.1, Apple7+). */
+        return vio_mtl.caps.cooperative_matrix;
     case VIO_FEATURE_MESH_SHADER:
         /* MTLMeshRenderPipelineDescriptor + drawMeshThreadgroups: Metal 3 on
          * Apple7 / Mac2, MSL 3.0 rung. */
@@ -6042,6 +6067,12 @@ static int metal_supports_feature(vio_feature f)
         return 0;
 #endif
     case VIO_FEATURE_RAYTRACING:
+        /* No ray tracing pipeline: Metal has no raygen / miss / hit stages
+         * (an intersector in a compute kernel plus intersection function
+         * tables), and SPIRV-Cross cannot translate traceRayEXT or the
+         * payload / hit attribute storage classes to MSL. Ray queries
+         * (VIO_FEATURE_RAY_QUERY) cover inline tracing. */
+        return 0;
     default:
         return 0;
     }
@@ -6147,6 +6178,7 @@ static const vio_backend metal_backend = {
     .draw_indirect     = metal_draw_indirect,
     .draw_mesh_tasks          = metal_draw_mesh_tasks,
     .draw_mesh_tasks_indirect = metal_draw_mesh_tasks_indirect,
+    .cooperative_matrix_shapes = metal_cooperative_matrix_shapes,
     .bind_stage_constants = metal_bind_stage_constants,
     .gpu_info           = vio_metal_gpu_info,
     .destroy_font_atlas = metal_destroy_font_atlas,

@@ -171,7 +171,7 @@ typedef enum _vio_uniform_type {
 
 typedef enum _vio_feature {
     VIO_FEATURE_COMPUTE      = 0,
-    VIO_FEATURE_RAYTRACING   = 1,
+    VIO_FEATURE_RAYTRACING   = 1,   /* vio_rt_pipeline / vio_trace_rays (D3D12 DXR 1.0, Vulkan VK_KHR_ray_tracing_pipeline) */
     VIO_FEATURE_TESSELLATION = 2,
     VIO_FEATURE_GEOMETRY     = 3,
     /* vio_shader(['view_count' => 2..4]) + a layered target bound with
@@ -353,7 +353,7 @@ typedef enum _vio_feature {
      * (rayQueryEXT) in the fragment and compute stages. D3D12: DXR Tier 1.1 +
      * SM 6.5 (RayQuery); Vulkan: VK_KHR_acceleration_structure + VK_KHR_ray_query;
      * Metal: ray queries from render pipelines (MSL 2.4). The ray-tracing
-     * PIPELINE (raygen / hit shaders) is VIO_FEATURE_RAYTRACING, still 0. */
+     * PIPELINE (raygen / hit shaders) is VIO_FEATURE_RAYTRACING. */
     VIO_FEATURE_RAY_QUERY          = 56,
     /* Mesh and task (amplification / object) stages: vio_shader(['task' => ?,
      * 'mesh' => ..., 'fragment' => ...]) (GL_EXT_mesh_shader) drawn with
@@ -361,6 +361,20 @@ typedef enum _vio_feature {
      * the GPU per workgroup (meshlet culling, LOD). D3D12: SM 6.5 + MeshShaderTier;
      * Vulkan: VK_EXT_mesh_shader; Metal: mesh pipelines (Metal 3, Apple7 / Mac2). */
     VIO_FEATURE_MESH_SHADER        = 55,
+    /* Sampler feedback (texture streaming): vio_sampler_feedback_bind() pairs a
+     * MinMip feedback map with a texture, a fragment stage writes it with
+     * WriteSamplerFeedback (HLSL override, register u0 space2), and
+     * vio_sampler_feedback_read() decodes the lowest mip sampled per region.
+     * D3D12 only: SM 6.5 + SamplerFeedbackTier 0.9 (and the bindless root
+     * layout); Vulkan / Metal / OpenGL have no equivalent. */
+    VIO_FEATURE_SAMPLER_FEEDBACK   = 57,
+    /* Cooperative matrices (GL_KHR_cooperative_matrix): coopMatLoad /
+     * coopMatMulAdd / coopMatStore on subgroup-scope tiles in compute kernels,
+     * run on the hardware matrix units. vio_cooperative_matrix_shapes() lists
+     * the M x N x K shapes and component types. Vulkan: VK_KHR_cooperative_matrix;
+     * Metal: simdgroup_matrix (8x8 only, MSL 2.3, Apple7+); D3D12: 0 (SPIRV-Cross
+     * has no HLSL mapping, SM 6.9 wave matrices are out of reach). */
+    VIO_FEATURE_COOPERATIVE_MATRIX = 59,
     /* Work graphs (SM 6.8 node shaders): vio_work_graph() builds an HLSL lib_6_8
      * graph, vio_dispatch_graph() feeds CPU records to its entry node and the
      * graph schedules its own follow-up work on the GPU. HLSL only (GLSL has no
@@ -368,6 +382,31 @@ typedef enum _vio_feature {
      * through the Agility SDK, vio_create(['agility_sdk' => dir])); 0 elsewhere. */
     VIO_FEATURE_WORK_GRAPHS        = 58,
 } vio_feature;
+
+/* Component types of a cooperative-matrix shape. */
+typedef enum _vio_coopmat_type {
+    VIO_COOPMAT_FLOAT16 = 0,
+    VIO_COOPMAT_FLOAT32,
+    VIO_COOPMAT_FLOAT64,
+    VIO_COOPMAT_SINT8,
+    VIO_COOPMAT_SINT16,
+    VIO_COOPMAT_SINT32,
+    VIO_COOPMAT_SINT64,
+    VIO_COOPMAT_UINT8,
+    VIO_COOPMAT_UINT16,
+    VIO_COOPMAT_UINT32,
+    VIO_COOPMAT_UINT64,
+    VIO_COOPMAT_BFLOAT16,
+} vio_coopmat_type;
+
+/* One shape vio_cooperative_matrix_shapes() reports: A is M x K, B is K x N,
+ * C and the result are M x N. */
+typedef struct _vio_coopmat_shape {
+    int m, n, k;
+    vio_coopmat_type a, b, c, result;
+} vio_coopmat_shape;
+
+#define VIO_COOPMAT_MAX_SHAPES 32
 
 /* Slots of the vio_texture_index() table (Set 1 of the bindless contract). */
 #define VIO_BINDLESS_MAX 1024
@@ -503,6 +542,34 @@ typedef struct _vio_as_desc {
     const vio_as_instance *instances;
     int                    instance_count;
 } vio_as_desc;
+
+/* vio_rt_pipeline() (VIO_FEATURE_RAYTRACING): the ray tracing stages as
+ * SPIR-V (GL_EXT_ray_tracing, Vulkan) and/or an HLSL library (D3D12, DXR 1.0:
+ * exports vio_raygen / vio_miss / vio_closest_hit / vio_any_hit). One raygen,
+ * one miss shader, one triangle hit group (closest hit + optional any hit). */
+typedef enum {
+    VIO_RT_STAGE_RAYGEN      = 0,
+    VIO_RT_STAGE_MISS        = 1,
+    VIO_RT_STAGE_CLOSEST_HIT = 2,
+    VIO_RT_STAGE_ANY_HIT     = 3,
+    VIO_RT_STAGE_COUNT       = 4
+} vio_rt_stage;
+
+typedef struct _vio_rt_pipeline_desc {
+    const uint32_t *spirv[VIO_RT_STAGE_COUNT];      /* NULL: stage absent (any hit) */
+    size_t          spirv_size[VIO_RT_STAGE_COUNT]; /* bytes */
+    const char     *hlsl;                           /* D3D12 library source, NULL when not given */
+    int             max_recursion;                  /* >= 1 */
+    int             payload_size;                   /* bytes, D3D12 shader config */
+} vio_rt_pipeline_desc;
+
+/* A storage buffer bound for vio_trace_rays (vio_rt_bind_buffer). */
+typedef struct _vio_rt_buffer_binding {
+    void *backend_buffer;          /* create_storage_buffer handle */
+    int   binding;                 /* GLSL binding / HLSL u register */
+} vio_rt_buffer_binding;
+
+#define VIO_RT_MAX_BUFFERS 8
 
 /* ── Descriptor structs ───────────────────────────────────────────── */
 
@@ -669,6 +736,10 @@ typedef struct _vio_shader_desc {
     const char       *geometry_hlsl;
     const char       *tess_control_hlsl;
     const char       *tess_eval_hlsl;
+    /* 'hlsl' => ['fragment' => src]: replaces the transpiled pixel shader (D3D12;
+     * sampler feedback has no GLSL form). The GLSL fragment stage stays required
+     * and defines the cbuffer layout. */
+    const char       *fragment_hlsl;
     /* vio_shader(['view_count' => N]) (VIO_FEATURE_MULTIVIEW): the stages use
      * gl_ViewIndex and every draw runs N times, view v into layer v of a target
      * bound with VIO_RT_ALL_LAYERS. 0 = not a multiview shader. */

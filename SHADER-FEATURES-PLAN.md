@@ -175,10 +175,24 @@ Metal auf dem M5 ausgeführt (ab MSL 2.4); D3D12 per mingw + DXC geprüft, Vulka
 - OpenGL: 0.
 - Hardware: RTX 20+, RX 6000+, Arc, Apple M3+ (Apple ab M1 per Compute langsamer).
 
-**6b Raytracing-Pipeline (Raygen/Hit/Miss)** — SPIRV-Cross übersetzt `traceRayEXT` nicht (geprüft, MSL),
-HLSL-seitig ebenso nicht verlässlich ⇒ HLSL-/MSL-Quellen je Backend (wie der Stage-Override), D3D12
-State Objects + Shader Tables, Vulkan RT-Pipeline aus GLSL, Metal Intersection Functions + Visible
-Function Tables. Erst nach 6a und nur mit konkretem Bedarf (Path Tracing).
+**6b Raytracing-Pipeline (Raygen/Hit/Miss) ✅ (2026-10-07, `VIO_FEATURE_RAYTRACING`, Test 164)** — umgesetzt als
+`vio_rt_pipeline($ctx, ['raygen', 'miss', 'closest_hit', 'any_hit'?, 'max_recursion' = 1, 'payload_size' = 32, 'hlsl'?])`
+(Klasse `VioRtPipeline`), `vio_rt_bind_buffer($ctx, $p, $storageBuffer, $binding)` und
+`vio_trace_rays($ctx, $p, $w, $h, $d = 1)` (synchron, außerhalb eines Frames) gegen die per
+`vio_bind_acceleration_structure` gebundene Struktur. Eine Raygen-, eine Miss- und eine Dreiecks-Hit-Gruppe.
+`VIO_FEATURE_RAYTRACING` bleibt der Name (kein neues `RAYTRACING_PIPELINE`, 074 pinnt die 0 auf null).
+- Vulkan: `VK_KHR_ray_tracing_pipeline` auf dem Ray-Query-Satz, die GLSL-Stages gehen nativ als SPIR-V 1.4
+  (glslang Vulkan 1.2) in die Pipeline, Set 0 aus den Bindings der Stages (`vk_rt_scan`: Acceleration
+  Structures + Storage-Buffer), SBT in einem host-sichtbaren Buffer. **Auf lavapipe ausgeführt** (Mesa 25.0,
+  Debian trixie, Docker) — dort lief auch 163 auf Vulkan erstmals, nach zwei Korrekturen am 6a-Pfad
+  (GLSL 460 für die Vulkan-Rundreise von `rayQueryEXT`, SPIR-V 1.4 für `GL_EXT_ray_query`-Quellen).
+- D3D12: DXR 1.0 State Object (SM ≥ 6.3, Tier ≥ 1.0) aus der `'hlsl'`-Bibliothek (DXC `lib_6_x`, ohne `-E`),
+  Exports `vio_raygen`, `vio_miss`, `vio_closest_hit`, `vio_any_hit`; globale Root-Signatur TLAS `t0` +
+  Root-UAVs `u0..u15`; nur per mingw + DXC geprüft.
+- Metal: 0 — keine Raygen-/Hit-Stages, SPIRV-Cross übersetzt `traceRayEXT` nicht nach MSL; eine
+  Abbildung auf Intersection Functions + Visible Function Tables bräuchte eigene MSL-Quellen je Stage.
+- Offen: mehrere Miss-/Hit-Gruppen, Callable-Shader, Shader-Record-Daten, Texturen/UBOs in RT-Stages,
+  Trace im Frame.
 
 **6c SM 6.9 Shader Execution Reordering + Opacity Micromaps** — nur D3D12 (Agility SDK + DXC ≥ 1.9,
 Phase 0d) und Vulkan (`VK_EXT_ray_tracing_invocation_reorder`, `VK_EXT_opacity_micromap`); Metal hat
@@ -192,6 +206,22 @@ kein Gegenstück ⇒ Flags dort 0. Nutzen auf RTX 40/50 (Hardware-Reorder, OMM-T
 - Metal: Sparse Textures (`sparseTileSizeInBytes`) + Zugriffszähler.
 - Gemeinsame API erst nach einem Prototyp festlegen (Streaming-Manager in PHPolygon ist der Abnehmer).
 
+**Stand (2026-10-07): D3D12 umgesetzt, Test 165.** Flag 57, nur D3D12 (SM 6.5 über `shader_model => 6`,
+`OPTIONS7.SamplerFeedbackTier ≥ 0.9`, `ID3D12Device8`, Bindless-Root-Layout). API:
+- `vio_sampler_feedback_bind($ctx, ?VioTexture)` – legt beim ersten Aufruf die MinMip-Feedback-Map
+  der Textur an (`CreateCommittedResource2`, Region = größte Zweierpotenz ≤ halbe kürzere Seite,
+  4..128 Texel) und bindet sie für die folgenden Draws; `null` löst.
+- `vio_sampler_feedback_read($ctx, $tex)` – `ResolveSubresourceRegion(DECODE_SAMPLER_FEEDBACK)` nach
+  R8_UINT + Readback → `['regions_x', 'regions_y', 'region', 'min_mip' => list<int|null>]`.
+- `vio_sampler_feedback_clear($ctx, $tex)` – `ClearUnorderedAccessViewUint`.
+- Shader: GLSL kennt kein Sampler-Feedback ⇒ Fragment-Stage als HLSL-Override
+  `'hlsl' => ['fragment' => $ps]` mit `FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> vio_feedback :
+  register(u0, space2)` und `WriteSamplerFeedback`. Root-Parameter [16] (UAV-Table, PIXEL) hängt nur mit
+  dem Feature hinter [15] Bindless; ein Feedback-Shader ohne gebundene Map schreibt in eine Null-UAV.
+- Vulkan/Metal/GL: Flag 0 – Sparse-Residency (`sparseResidency*` + `OpImageSparse*`) bzw. Metal Sparse
+  Textures liefern Residenz, kein Zugriffs-Feedback je Region; ein eigener Pfad (Atomic-Min in ein
+  Storage-Image) wäre Emulation und bleibt offen, bis PHPolygons Streaming-Manager ihn braucht.
+
 ## Phase 8 — Neural Shading: Long Vectors / Cooperative Vectors / Tensoren (L, evaluieren)
 
 - D3D12: SM 6.9 Long Vectors; Cooperative Vectors (teils Preview) — RTX 40/50 Tensor-Kerne.
@@ -200,6 +230,22 @@ kein Gegenstück ⇒ Flags dort 0. Nutzen auf RTX 40/50 (Hardware-Reorder, OMM-T
   Accelerators je GPU-Kern; geprüft: Pipeline baut.
 - Keine GLSL-Quelle ⇒ backend-native Quellen (`'msl' => …`, `'hlsl' => …`) über einen erweiterten
   Stage-Override; Feature-Flag nur, wo eine portable Form existiert (`GL_KHR_cooperative_matrix`).
+
+**Stand 2026-10-07 — 8a kooperative Matrizen ✅** (`VIO_FEATURE_COOPERATIVE_MATRIX = 59`,
+`vio_cooperative_matrix_shapes($ctx)`, Test 167): GLSL `GL_KHR_cooperative_matrix` (`coopmat`,
+`coopMatLoad`/`coopMatMulAdd`/`coopMatStore`, Subgroup-Scope) in `vio_compute_pipeline`, keine neue
+Dispatch-API.
+- Vulkan: `VK_KHR_cooperative_matrix` + `VK_KHR_vulkan_memory_model` (glslang erzeugt
+  `OpMemoryModel Vulkan`), float16 mit `shaderFloat16` + `storageBuffer16BitAccess`; die Formen kommen aus
+  `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` (nur Subgroup-Scope, nur float16/float32 — Int8/
+  BFloat16 bräuchten weitere Features). Nur kompiliert: MoltenVK hat die Extension nicht.
+- Metal: SPIRV-Cross bildet `coopmat` auf `simdgroup_matrix` ab, **nur 8×8** und erst ab **MSL 3.1**
+  (Cap `cooperative_matrix`, Apple7+); Formen 8×8×8 half/half, half/float, float/float — auf dem M5
+  ausgeführt (MSL 3.1 und 4.1), MSL 3.0 meldet nichts.
+- D3D12: 0. SPIRV-Cross übersetzt `coopmat` nicht nach HLSL („Access chains have no default expression
+  representation"); SM 6.9 Wave-Matrix / Cooperative Vectors bleiben an Agility SDK + DXC-Quellen gebunden.
+- Offen: 8b Cooperative Vectors (`VK_NV_cooperative_vector`, D3D12 Preview), 8c Metal-Tensoren
+  (`MTLTensor` + MPP `matmul2d`, MSL 4.0) über einen `'msl'`-Override — beides ohne portable GLSL-Form.
 
 ## Phase 9 — Work Graphs (nur D3D12) — ✅ umgesetzt (2026-10-07, Test 166)
 

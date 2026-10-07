@@ -50,6 +50,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug_callback(
 /* ── Helper: find memory type ────────────────────────────────────── */
 
 static void vulkan_release_acceleration_structures(void);   /* ray query, defined with the transient helpers */
+static void vulkan_release_rt_pipelines(void);              /* ray tracing pipeline, defined after it */
 
 static uint32_t find_memory_type(uint32_t filter, VkMemoryPropertyFlags props)
 {
@@ -263,7 +264,7 @@ static int create_logical_device(void)
     /* Device extensions: the swapchain, MoltenVK's portability subset, and
      * VK_KHR_fragment_shading_rate (+ its create_renderpass2 dependency) when the
      * device offers pipeline shading rates (Block 10c). */
-    const char *device_extensions[24];
+    const char *device_extensions[32];
     uint32_t device_ext_count = 0;
     device_extensions[device_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     /* Several features need the same extension (descriptor indexing: bindless
@@ -284,7 +285,8 @@ static int create_logical_device(void)
     int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0, has_bary = 0, has_a64 = 0;
     int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0, has_di = 0, has_m3 = 0;
     int has_as = 0, has_rq = 0, has_dho = 0, has_bda = 0, has_spv14 = 0, has_sfc = 0;
-    int has_mesh = 0, has_fc = 0;
+    int has_rtp = 0;
+    int has_mesh = 0, has_fc = 0, has_cm = 0, has_vmm = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
@@ -299,12 +301,15 @@ static int create_logical_device(void)
         if (strcmp(ext_props[i].extensionName, "VK_KHR_compute_shader_derivatives") == 0) has_cd_khr = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_acceleration_structure") == 0) has_as = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_ray_query") == 0) has_rq = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_ray_tracing_pipeline") == 0) has_rtp = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_deferred_host_operations") == 0) has_dho = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_buffer_device_address") == 0) has_bda = 1;
         if (strcmp(ext_props[i].extensionName, "VK_EXT_descriptor_indexing") == 0) has_di = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_spirv_1_4") == 0) has_spv14 = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_sfc = 1;
         if (strcmp(ext_props[i].extensionName, "VK_EXT_mesh_shader") == 0) has_mesh = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_cooperative_matrix") == 0) has_cm = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_vulkan_memory_model") == 0) has_vmm = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_fc = 1;
     }
     free(ext_props);
@@ -591,6 +596,10 @@ static int create_logical_device(void)
     rq_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
     VkPhysicalDeviceBufferDeviceAddressFeaturesKHR bda_enable = {0};
     bda_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
+    /* The ray tracing pipeline (VIO_FEATURE_RAYTRACING) builds on the same set. */
+    vio_vk.rt_pipeline_supported = 0;
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtp_enable = {0};
+    rtp_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
     if (has_as && has_rq && has_dho && has_bda && has_di && has_spv14 && has_sfc && vio_vk.instance_api_11) {
         VkPhysicalDeviceAccelerationStructureFeaturesKHR as_avail = {0};
         as_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
@@ -598,14 +607,17 @@ static int create_logical_device(void)
         rq_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
         VkPhysicalDeviceBufferDeviceAddressFeaturesKHR bda_avail = {0};
         bda_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
+        VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtp_avail = {0};
+        rtp_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
         as_avail.pNext = &rq_avail;
         rq_avail.pNext = &bda_avail;
+        if (has_rtp) bda_avail.pNext = &rtp_avail;
         VkPhysicalDeviceFeatures2 f2 = {0};
         f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         f2.pNext = &as_avail;
         vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
         if (as_avail.accelerationStructure && rq_avail.rayQuery && bda_avail.bufferDeviceAddress
-            && device_ext_count + 7 <= (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
+            && device_ext_count + 8 <= (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
             as_enable.accelerationStructure = VK_TRUE;
             rq_enable.rayQuery = VK_TRUE;
             bda_enable.bufferDeviceAddress = VK_TRUE;
@@ -617,8 +629,85 @@ static int create_logical_device(void)
             VIO_VK_ADD_DEVICE_EXT("VK_KHR_spirv_1_4");
             VIO_VK_ADD_DEVICE_EXT("VK_KHR_shader_float_controls");
             vio_vk.ray_query_supported = 1;
+            if (has_rtp && rtp_avail.rayTracingPipeline) {
+                rtp_enable.rayTracingPipeline = VK_TRUE;
+                VIO_VK_ADD_DEVICE_EXT("VK_KHR_ray_tracing_pipeline");
+                vio_vk.rt_pipeline_supported = 1;
+            }
         }
     }
+
+    /* VIO_FEATURE_COOPERATIVE_MATRIX: VK_KHR_cooperative_matrix. GL_KHR_cooperative_matrix
+     * kernels run on the Vulkan memory model (GL_KHR_memory_scope_semantics), and
+     * float16 tiles load from 16-bit storage buffers. Only subgroup-scope shapes
+     * of float16 / float32 components are offered - the integer and bfloat16
+     * shapes would need 8-bit storage / int8 / bfloat16 features as well. */
+    vio_vk.coopmat_shape_count = 0;
+    int coopmat_f16 = 0;
+#ifdef VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm_enable = {0};
+    cm_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    VkPhysicalDeviceVulkanMemoryModelFeaturesKHR vmm_enable = {0};
+    vmm_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR;
+    VkPhysicalDevice16BitStorageFeatures s16_enable = {0};
+    s16_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    if (has_cm && has_vmm && vio_vk.instance_api_11
+        && device_ext_count + 2 <= (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
+        VkPhysicalDeviceProperties dprops;
+        vkGetPhysicalDeviceProperties(vio_vk.physical_device, &dprops);
+        PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_props = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+            vkGetInstanceProcAddr(vio_vk.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm_avail = {0};
+        cm_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+        VkPhysicalDeviceVulkanMemoryModelFeaturesKHR vmm_avail = {0};
+        vmm_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR;
+        VkPhysicalDevice16BitStorageFeatures s16_avail = {0};
+        s16_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        cm_avail.pNext = &vmm_avail;
+        vmm_avail.pNext = &s16_avail;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &cm_avail;
+        if (dprops.apiVersion >= VK_API_VERSION_1_1 && get_props) {
+            vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+        }
+        if (cm_avail.cooperativeMatrix && vmm_avail.vulkanMemoryModel) {
+            coopmat_f16 = vio_vk.float16_supported && s16_avail.storageBuffer16BitAccess;
+            uint32_t count = 0;
+            get_props(vio_vk.physical_device, &count, NULL);
+            VkCooperativeMatrixPropertiesKHR *props = count ? calloc(count, sizeof(*props)) : NULL;
+            if (props) {
+                for (uint32_t i = 0; i < count; i++) props[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                get_props(vio_vk.physical_device, &count, props);
+                for (uint32_t i = 0; i < count && vio_vk.coopmat_shape_count < VIO_COOPMAT_MAX_SHAPES; i++) {
+                    const VkCooperativeMatrixPropertiesKHR *p = &props[i];
+                    VkComponentTypeKHR t[4] = { p->AType, p->BType, p->CType, p->ResultType };
+                    int ok = p->scope == VK_SCOPE_SUBGROUP_KHR;
+                    for (int j = 0; j < 4 && ok; j++) {
+                        ok = t[j] == VK_COMPONENT_TYPE_FLOAT32_KHR || (t[j] == VK_COMPONENT_TYPE_FLOAT16_KHR && coopmat_f16);
+                    }
+                    if (!ok) continue;
+                    vio_coopmat_shape *s = &vio_vk.coopmat_shapes[vio_vk.coopmat_shape_count++];
+                    s->m = (int)p->MSize; s->n = (int)p->NSize; s->k = (int)p->KSize;
+                    s->a = t[0] == VK_COMPONENT_TYPE_FLOAT16_KHR ? VIO_COOPMAT_FLOAT16 : VIO_COOPMAT_FLOAT32;
+                    s->b = t[1] == VK_COMPONENT_TYPE_FLOAT16_KHR ? VIO_COOPMAT_FLOAT16 : VIO_COOPMAT_FLOAT32;
+                    s->c = t[2] == VK_COMPONENT_TYPE_FLOAT16_KHR ? VIO_COOPMAT_FLOAT16 : VIO_COOPMAT_FLOAT32;
+                    s->result = t[3] == VK_COMPONENT_TYPE_FLOAT16_KHR ? VIO_COOPMAT_FLOAT16 : VIO_COOPMAT_FLOAT32;
+                }
+                free(props);
+            }
+            if (vio_vk.coopmat_shape_count > 0) {
+                cm_enable.cooperativeMatrix = VK_TRUE;
+                vmm_enable.vulkanMemoryModel = VK_TRUE;
+                if (coopmat_f16) s16_enable.storageBuffer16BitAccess = VK_TRUE;
+                VIO_VK_ADD_DEVICE_EXT("VK_KHR_cooperative_matrix");
+                VIO_VK_ADD_DEVICE_EXT("VK_KHR_vulkan_memory_model");
+            }
+        }
+    }
+#else
+    (void)has_cm; (void)has_vmm;
+#endif
 
     VkDeviceCreateInfo create_info = {0};
     create_info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -645,11 +734,21 @@ static int create_logical_device(void)
 #endif
     if (vio_vk.ray_query_supported) {
         bda_enable.pNext = feature_chain;
+        if (vio_vk.rt_pipeline_supported) { rtp_enable.pNext = feature_chain; bda_enable.pNext = &rtp_enable; }
         rq_enable.pNext = &bda_enable;
         as_enable.pNext = &rq_enable;
         feature_chain = &as_enable;
     }
     if (vio_vk.bindless_supported) { di_enable.pNext = feature_chain; feature_chain = &di_enable; }
+#ifdef VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME
+    if (vio_vk.coopmat_shape_count > 0) {
+        cm_enable.pNext = feature_chain;
+        vmm_enable.pNext = &cm_enable;
+        feature_chain = &vmm_enable;
+        if (coopmat_f16) { s16_enable.pNext = feature_chain; feature_chain = &s16_enable; }
+    }
+#endif
+    (void)coopmat_f16;
     create_info.pNext = feature_chain;
 
     VkResult result = vkCreateDevice(vio_vk.physical_device, &create_info, NULL, &vio_vk.device);
@@ -678,6 +777,24 @@ static int create_logical_device(void)
         vio_vk.fn_get_buffer_address = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkGetBufferDeviceAddressKHR");
         if (!vio_vk.fn_get_as_build_sizes || !vio_vk.fn_create_as || !vio_vk.fn_destroy_as || !vio_vk.fn_cmd_build_as
             || !vio_vk.fn_get_as_address || !vio_vk.fn_get_buffer_address) vio_vk.ray_query_supported = 0;
+    }
+    if (!vio_vk.ray_query_supported) vio_vk.rt_pipeline_supported = 0;
+    if (vio_vk.rt_pipeline_supported) {
+        vio_vk.fn_create_rt_pipelines  = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCreateRayTracingPipelinesKHR");
+        vio_vk.fn_get_rt_group_handles = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkGetRayTracingShaderGroupHandlesKHR");
+        vio_vk.fn_cmd_trace_rays       = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCmdTraceRaysKHR");
+        VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtp_props = {0};
+        rtp_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+        VkPhysicalDeviceProperties2 p2 = {0};
+        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        p2.pNext = &rtp_props;
+        vkGetPhysicalDeviceProperties2(vio_vk.physical_device, &p2);
+        vio_vk.rt_handle_size      = rtp_props.shaderGroupHandleSize;
+        vio_vk.rt_handle_alignment = rtp_props.shaderGroupHandleAlignment ? rtp_props.shaderGroupHandleAlignment : 1;
+        vio_vk.rt_base_alignment   = rtp_props.shaderGroupBaseAlignment ? rtp_props.shaderGroupBaseAlignment : 64;
+        vio_vk.rt_max_recursion    = rtp_props.maxRayRecursionDepth;
+        if (!vio_vk.fn_create_rt_pipelines || !vio_vk.fn_get_rt_group_handles || !vio_vk.fn_cmd_trace_rays
+            || vio_vk.rt_handle_size == 0 || vio_vk.rt_max_recursion == 0) vio_vk.rt_pipeline_supported = 0;
     }
 
     /* On-disk pipeline cache (GAP-PHASE5 Block 4): keyed by the device so a
@@ -1533,6 +1650,7 @@ static void vulkan_shutdown(void)
     }
     if (vio_vk.vma_allocator) { vio_vma_destroy(vio_vk.vma_allocator); vio_vk.vma_allocator = NULL; }
     if (vio_vk.device && vio_vk.transient_fence) { vkDestroyFence(vio_vk.device, vio_vk.transient_fence, NULL); vio_vk.transient_fence = VK_NULL_HANDLE; }
+    vulkan_release_rt_pipelines();
     vulkan_release_acceleration_structures();
     if (vio_vk.device && vio_vk.transient_pool)  { vkDestroyCommandPool(vio_vk.device, vio_vk.transient_pool, NULL); vio_vk.transient_pool = VK_NULL_HANDLE; }
     if (vio_vk.device && vio_vk.pipeline_cache) {
@@ -2120,6 +2238,341 @@ static void vulkan_release_acceleration_structures(void)
         vk_as_unlink(as);
     }
     vio_vk.bound_accel = 0;
+}
+
+/* ── Ray tracing pipeline (VIO_FEATURE_RAYTRACING) ──────────────────
+ * VK_KHR_ray_tracing_pipeline: groups 0 raygen, 1 miss, 2 triangle hit group
+ * (closest hit + optional any hit). The descriptor set 0 layout comes from
+ * the stages' own bindings (acceleration structures and storage buffers, see
+ * vk_rt_scan); one set per pipeline, rewritten by every (synchronous) trace.
+ * The shader binding table is one host-visible buffer, each region aligned to
+ * shaderGroupBaseAlignment. */
+#define VK_RT_MAX_BINDINGS 16
+
+typedef struct _vio_vk_rtp {
+    VkPipeline            pipeline;
+    VkPipelineLayout      layout;
+    VkDescriptorSetLayout set_layout;
+    VkDescriptorPool      pool;
+    VkDescriptorSet       set;
+    vio_vk_as_buf         sbt;
+    VkStridedDeviceAddressRegionKHR rgen, miss, hit, call;
+    VkDescriptorSetLayoutBinding bindings[VK_RT_MAX_BINDINGS];
+    int                   binding_count;
+    int                   dead;
+    struct _vio_vk_rtp    *next, *prev;
+} vio_vk_rtp;
+
+static vio_vk_rtp *vk_live_rtp = NULL;
+
+/* The set-0 resources one stage declares: OpVariable in StorageBuffer (12)
+ * -> storage buffer, in UniformConstant (0) pointing at an
+ * OpTypeAccelerationStructureKHR -> acceleration structure. Anything else
+ * with a binding is outside the contract (-1). */
+static int vk_rt_scan(const uint32_t *spv, size_t bytes, VkShaderStageFlags stage, vio_vk_rtp *rt)
+{
+    size_t words = bytes / 4;
+    if (words < 5 || spv[0] != 0x07230203u) return -1;
+    uint32_t bound = spv[3];
+    if (bound == 0 || bound > (1u << 22)) return -1;
+    int32_t *binding = malloc(sizeof(int32_t) * bound);
+    int32_t *set = malloc(sizeof(int32_t) * bound);
+    uint32_t *ptr_type = calloc(bound, sizeof(uint32_t));
+    unsigned char *is_as = calloc(bound, 1);
+    if (!binding || !set || !ptr_type || !is_as) {
+        free(binding); free(set); free(ptr_type); free(is_as);
+        return -1;
+    }
+    for (uint32_t i = 0; i < bound; i++) { binding[i] = -1; set[i] = 0; }
+    /* Pass 1: decorations and types. */
+    for (size_t i = 5; i < words;) {
+        uint32_t op = spv[i] & 0xFFFF, n = spv[i] >> 16;
+        if (n == 0 || i + n > words) break;
+        if (op == 71 && n >= 4 && spv[i + 1] < bound) {                 /* OpDecorate */
+            if (spv[i + 2] == 33) binding[spv[i + 1]] = (int32_t)spv[i + 3];
+            if (spv[i + 2] == 34) set[spv[i + 1]] = (int32_t)spv[i + 3];
+        } else if (op == 32 && n >= 4 && spv[i + 1] < bound) {          /* OpTypePointer */
+            ptr_type[spv[i + 1]] = spv[i + 3];
+        } else if (op == 5341 && n >= 2 && spv[i + 1] < bound) {        /* OpTypeAccelerationStructureKHR */
+            is_as[spv[i + 1]] = 1;
+        }
+        i += n;
+    }
+    int rc = 0;
+    /* Pass 2: variables. */
+    for (size_t i = 5; i < words; i += (spv[i] >> 16)) {
+        uint32_t op = spv[i] & 0xFFFF, n = spv[i] >> 16;
+        if (n == 0 || i + n > words) break;
+        if (op != 59 || n < 4 || spv[i + 1] >= bound || spv[i + 2] >= bound) continue;   /* OpVariable */
+        uint32_t id = spv[i + 2], cls = spv[i + 3];
+        if (binding[id] < 0) continue;
+        VkDescriptorType type;
+        uint32_t pointee = ptr_type[spv[i + 1]];
+        if (cls == 12) type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        else if (cls == 0 && pointee < bound && is_as[pointee]) type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        else { rc = -1; continue; }
+        if (set[id] != 0) { rc = -1; continue; }
+        int k;
+        for (k = 0; k < rt->binding_count; k++) if (rt->bindings[k].binding == (uint32_t)binding[id]) break;
+        if (k == rt->binding_count) {
+            if (k >= VK_RT_MAX_BINDINGS) { rc = -1; continue; }
+            memset(&rt->bindings[k], 0, sizeof(rt->bindings[k]));
+            rt->bindings[k].binding = (uint32_t)binding[id];
+            rt->bindings[k].descriptorType = type;
+            rt->bindings[k].descriptorCount = 1;
+            rt->binding_count++;
+        } else if (rt->bindings[k].descriptorType != type) {
+            rc = -1;
+        }
+        rt->bindings[k].stageFlags |= stage;
+    }
+    free(binding); free(set); free(ptr_type); free(is_as);
+    return rc;
+}
+
+static void vk_rt_release_gpu(vio_vk_rtp *rt)
+{
+    if (!rt || rt->dead || !vio_vk.device) return;
+    if (rt->pipeline) vkDestroyPipeline(vio_vk.device, rt->pipeline, NULL);
+    if (rt->layout) vkDestroyPipelineLayout(vio_vk.device, rt->layout, NULL);
+    if (rt->pool) vkDestroyDescriptorPool(vio_vk.device, rt->pool, NULL);
+    if (rt->set_layout) vkDestroyDescriptorSetLayout(vio_vk.device, rt->set_layout, NULL);
+    vk_as_buffer_free(&rt->sbt);
+    rt->dead = 1;
+}
+
+static void vk_rt_unlink(vio_vk_rtp *rt)
+{
+    if (rt->prev) rt->prev->next = rt->next; else if (vk_live_rtp == rt) vk_live_rtp = rt->next;
+    if (rt->next) rt->next->prev = rt->prev;
+    rt->next = rt->prev = NULL;
+}
+
+static VkDeviceSize vk_align_up(VkDeviceSize v, VkDeviceSize a) { return (v + a - 1) / a * a; }
+
+static void *vulkan_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
+{
+    if (!desc || !vio_vk.device || !vio_vk.rt_pipeline_supported) return NULL;
+    static const VkShaderStageFlagBits stages[VIO_RT_STAGE_COUNT] = {
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR, VK_SHADER_STAGE_MISS_BIT_KHR,
+        VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, VK_SHADER_STAGE_ANY_HIT_BIT_KHR };
+    static const char *names[VIO_RT_STAGE_COUNT] = { "raygen", "miss", "closest_hit", "any_hit" };
+    vio_vk_rtp *rt = calloc(1, sizeof(vio_vk_rtp));
+    if (!rt) return NULL;
+    VkShaderModule mods[VIO_RT_STAGE_COUNT] = { VK_NULL_HANDLE };
+    VkPipelineShaderStageCreateInfo si[VIO_RT_STAGE_COUNT];
+    uint32_t stage_index[VIO_RT_STAGE_COUNT];
+    uint32_t stage_count = 0;
+    for (int st = 0; st < VIO_RT_STAGE_COUNT; st++) {
+        stage_index[st] = VK_SHADER_UNUSED_KHR;
+        if (!desc->spirv[st]) {
+            if (st == VIO_RT_STAGE_ANY_HIT) continue;
+            goto fail;
+        }
+        if (vk_rt_scan(desc->spirv[st], desc->spirv_size[st], stages[st], rt) != 0) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: ray tracing %s stage: only acceleration structures and storage buffers "
+                             "in set 0 are supported (at most %d bindings)", names[st], VK_RT_MAX_BINDINGS);
+            goto fail;
+        }
+        VkShaderModuleCreateInfo mi = {0};
+        mi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        mi.codeSize = desc->spirv_size[st];
+        mi.pCode = desc->spirv[st];
+        if (vkCreateShaderModule(vio_vk.device, &mi, NULL, &mods[st]) != VK_SUCCESS) goto fail;
+        memset(&si[stage_count], 0, sizeof(si[0]));
+        si[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        si[stage_count].stage = stages[st];
+        si[stage_count].module = mods[st];
+        si[stage_count].pName = "main";
+        stage_index[st] = stage_count++;
+    }
+
+    VkDescriptorSetLayoutCreateInfo dl = {0};
+    dl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dl.bindingCount = (uint32_t)rt->binding_count;
+    dl.pBindings = rt->bindings;
+    if (vkCreateDescriptorSetLayout(vio_vk.device, &dl, NULL, &rt->set_layout) != VK_SUCCESS) goto fail;
+    VkPipelineLayoutCreateInfo pl = {0};
+    pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &rt->set_layout;
+    if (vkCreatePipelineLayout(vio_vk.device, &pl, NULL, &rt->layout) != VK_SUCCESS) goto fail;
+    if (rt->binding_count > 0) {
+        VkDescriptorPoolSize ps[2];
+        uint32_t psn = 0, n_sb = 0, n_as = 0;
+        for (int k = 0; k < rt->binding_count; k++) {
+            if (rt->bindings[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) n_sb++; else n_as++;
+        }
+        if (n_sb) { ps[psn].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; ps[psn].descriptorCount = n_sb; psn++; }
+        if (n_as) { ps[psn].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; ps[psn].descriptorCount = n_as; psn++; }
+        VkDescriptorPoolCreateInfo pi = {0};
+        pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pi.maxSets = 1;
+        pi.poolSizeCount = psn;
+        pi.pPoolSizes = ps;
+        if (vkCreateDescriptorPool(vio_vk.device, &pi, NULL, &rt->pool) != VK_SUCCESS) goto fail;
+        VkDescriptorSetAllocateInfo ai = {0};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = rt->pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &rt->set_layout;
+        if (vkAllocateDescriptorSets(vio_vk.device, &ai, &rt->set) != VK_SUCCESS) goto fail;
+    }
+
+    VkRayTracingShaderGroupCreateInfoKHR groups[3];
+    memset(groups, 0, sizeof(groups));
+    for (int g = 0; g < 3; g++) {
+        groups[g].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        groups[g].generalShader = VK_SHADER_UNUSED_KHR;
+        groups[g].closestHitShader = VK_SHADER_UNUSED_KHR;
+        groups[g].anyHitShader = VK_SHADER_UNUSED_KHR;
+        groups[g].intersectionShader = VK_SHADER_UNUSED_KHR;
+    }
+    groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[0].generalShader = stage_index[VIO_RT_STAGE_RAYGEN];
+    groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[1].generalShader = stage_index[VIO_RT_STAGE_MISS];
+    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[2].closestHitShader = stage_index[VIO_RT_STAGE_CLOSEST_HIT];
+    groups[2].anyHitShader = stage_index[VIO_RT_STAGE_ANY_HIT];
+
+    VkRayTracingPipelineCreateInfoKHR ci = {0};
+    ci.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
+    ci.stageCount = stage_count;
+    ci.pStages = si;
+    ci.groupCount = 3;
+    ci.pGroups = groups;
+    ci.maxPipelineRayRecursionDepth = (uint32_t)desc->max_recursion < vio_vk.rt_max_recursion
+                                    ? (uint32_t)desc->max_recursion : vio_vk.rt_max_recursion;
+    ci.layout = rt->layout;
+    VkResult vr = ((PFN_vkCreateRayTracingPipelinesKHR)vio_vk.fn_create_rt_pipelines)(
+        vio_vk.device, VK_NULL_HANDLE, vio_vk.pipeline_cache, 1, &ci, NULL, &rt->pipeline);
+    if (vr != VK_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: vkCreateRayTracingPipelinesKHR failed (VkResult %d)", vr);
+        rt->pipeline = VK_NULL_HANDLE;
+        goto fail;
+    }
+
+    /* Shader binding table: raygen | miss | hit, one record each. */
+    uint32_t hs = vio_vk.rt_handle_size;
+    VkDeviceSize stride = vk_align_up(hs, vio_vk.rt_handle_alignment);
+    VkDeviceSize region = vk_align_up(stride, vio_vk.rt_base_alignment);
+    unsigned char handles[3 * 64];
+    if (hs > 64 || ((PFN_vkGetRayTracingShaderGroupHandlesKHR)vio_vk.fn_get_rt_group_handles)(
+            vio_vk.device, rt->pipeline, 0, 3, (size_t)3 * hs, handles) != VK_SUCCESS) goto fail;
+    if (vk_as_buffer(3 * region + vio_vk.rt_base_alignment, VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR, 1, &rt->sbt) != 0) goto fail;
+    VkDeviceAddress base = vk_buffer_address(rt->sbt.buf);
+    VkDeviceAddress aligned = (VkDeviceAddress)vk_align_up(base, vio_vk.rt_base_alignment);
+    unsigned char *map = NULL;
+    if (vkMapMemory(vio_vk.device, rt->sbt.mem, 0, VK_WHOLE_SIZE, 0, (void **)&map) != VK_SUCCESS || !map) goto fail;
+    for (int g = 0; g < 3; g++) memcpy(map + (aligned - base) + (VkDeviceSize)g * region, handles + (size_t)g * hs, hs);
+    vkUnmapMemory(vio_vk.device, rt->sbt.mem);
+    rt->rgen.deviceAddress = aligned;
+    rt->rgen.stride = region;          /* raygen: size == stride */
+    rt->rgen.size = region;
+    rt->miss.deviceAddress = aligned + region;
+    rt->miss.stride = stride;
+    rt->miss.size = region;
+    rt->hit.deviceAddress = aligned + 2 * region;
+    rt->hit.stride = stride;
+    rt->hit.size = region;
+
+    for (int st = 0; st < VIO_RT_STAGE_COUNT; st++) if (mods[st]) vkDestroyShaderModule(vio_vk.device, mods[st], NULL);
+    rt->next = vk_live_rtp;
+    if (vk_live_rtp) vk_live_rtp->prev = rt;
+    vk_live_rtp = rt;
+    return rt;
+
+fail:
+    for (int st = 0; st < VIO_RT_STAGE_COUNT; st++) if (mods[st]) vkDestroyShaderModule(vio_vk.device, mods[st], NULL);
+    vk_rt_release_gpu(rt);
+    free(rt);
+    return NULL;
+}
+
+static void vulkan_destroy_rt_pipeline(void *ptr)
+{
+    vio_vk_rtp *rt = (vio_vk_rtp *)ptr;
+    if (!rt) return;
+    if (!rt->dead) {
+        vk_rt_release_gpu(rt);   /* traces are synchronous: nothing in flight */
+        vk_rt_unlink(rt);
+    }
+    free(rt);
+}
+
+static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int count, int w, int h, int d)
+{
+    vio_vk_rtp *rt = (vio_vk_rtp *)ptr;
+    if (!rt || rt->dead || !vio_vk.device || vio_vk.in_frame) return -1;
+    VkWriteDescriptorSet wr[VK_RT_MAX_BINDINGS];
+    VkDescriptorBufferInfo bi[VK_RT_MAX_BINDINGS];
+    VkWriteDescriptorSetAccelerationStructureKHR ai[VK_RT_MAX_BINDINGS];
+    VkAccelerationStructureKHR tlas = (VkAccelerationStructureKHR)(uintptr_t)vio_vk.bound_accel;
+    memset(wr, 0, sizeof(wr));
+    for (int k = 0; k < rt->binding_count; k++) {
+        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[k].dstSet = rt->set;
+        wr[k].dstBinding = rt->bindings[k].binding;
+        wr[k].descriptorCount = 1;
+        wr[k].descriptorType = rt->bindings[k].descriptorType;
+        if (rt->bindings[k].descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+            if (!tlas) {
+                php_error_docref(NULL, E_WARNING, "vio_trace_rays: no acceleration structure bound (vio_bind_acceleration_structure)");
+                return -1;
+            }
+            memset(&ai[k], 0, sizeof(ai[k]));
+            ai[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+            ai[k].accelerationStructureCount = 1;
+            ai[k].pAccelerationStructures = &tlas;
+            wr[k].pNext = &ai[k];
+        } else {
+            vio_vulkan_compute_buffer *buf = NULL;
+            for (int i = 0; i < count; i++)
+                if ((uint32_t)buffers[i].binding == rt->bindings[k].binding) buf = (vio_vulkan_compute_buffer *)buffers[i].backend_buffer;
+            if (!buf || !buf->buffer) {
+                php_error_docref(NULL, E_WARNING, "vio_trace_rays: no buffer bound at binding %u (vio_rt_bind_buffer)",
+                                 rt->bindings[k].binding);
+                return -1;
+            }
+            bi[k].buffer = buf->buffer;
+            bi[k].offset = 0;
+            bi[k].range = VK_WHOLE_SIZE;
+            wr[k].pBufferInfo = &bi[k];
+        }
+    }
+    if (rt->binding_count > 0) vkUpdateDescriptorSets(vio_vk.device, (uint32_t)rt->binding_count, wr, 0, NULL);
+
+    VkCommandPool pool;
+    VkCommandBuffer cmd;
+    if (vulkan_begin_transient_commands(&pool, &cmd) != 0) return -1;
+    /* Earlier compute / host writes to the buffers and the structure build come first. */
+    VkMemoryBarrier mb = {0};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt->pipeline);
+    if (rt->binding_count > 0)
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt->layout, 0, 1, &rt->set, 0, NULL);
+    ((PFN_vkCmdTraceRaysKHR)vio_vk.fn_cmd_trace_rays)(cmd, &rt->rgen, &rt->miss, &rt->hit, &rt->call,
+                                                       (uint32_t)w, (uint32_t)h, (uint32_t)d);
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    return vulkan_submit_transient_commands(pool, cmd);
+}
+
+/* vulkan_shutdown: GPU objects of every live pipeline go before the device. */
+static void vulkan_release_rt_pipelines(void)
+{
+    while (vk_live_rtp) {
+        vio_vk_rtp *rt = vk_live_rtp;
+        vk_rt_release_gpu(rt);
+        vk_rt_unlink(rt);
+    }
 }
 
 int vio_vk_begin_transient(VkCommandBuffer *out_cmd)
@@ -4081,6 +4534,15 @@ static double vulkan_gpu_frame_time(void)
     return vio_vk.initialized && vio_vk.ts_pool ? vio_vk.last_gpu_ms : -1.0;
 }
 
+/* VIO_FEATURE_COOPERATIVE_MATRIX: the shapes read at device creation. */
+static int vulkan_cooperative_matrix_shapes(vio_coopmat_shape *out, int max)
+{
+    if (!vio_vk.device || !out) return 0;
+    int n = vio_vk.coopmat_shape_count < max ? vio_vk.coopmat_shape_count : max;
+    memcpy(out, vio_vk.coopmat_shapes, (size_t)n * sizeof(*out));
+    return n;
+}
+
 static int vulkan_supports_feature(vio_feature feature)
 {
     switch (feature) {
@@ -4094,7 +4556,8 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_GEOMETRY_INSTANCING: return vio_vk3d_available() && vio_vk.device && vio_vk.geometry_supported;
         case VIO_FEATURE_3D_PIPELINE:  return vio_vk3d_available(); /* GAP-PHASE5 Block 10 */
         case VIO_FEATURE_MESH_SHADER:  return vio_vk3d_available() && vio_vk.device && vio_vk.mesh_supported; /* VK_EXT_mesh_shader */
-        case VIO_FEATURE_RAYTRACING:   return 0; /* VK_KHR_ray_tracing not wired */
+        case VIO_FEATURE_COOPERATIVE_MATRIX: return vio_vk.device && vio_vk.coopmat_shape_count > 0; /* VK_KHR_cooperative_matrix */
+        case VIO_FEATURE_RAYTRACING:   return vio_vk3d_available() && vio_vk.device && vio_vk.rt_pipeline_supported; /* VK_KHR_ray_tracing_pipeline */
         case VIO_FEATURE_MULTIVIEW:    return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_supported; /* VkRenderPassMultiviewCreateInfo */
         case VIO_FEATURE_RAY_QUERY:    return vio_vk3d_available() && vio_vk.device && vio_vk.ray_query_supported; /* VK_KHR_ray_query */
         case VIO_FEATURE_READ_PIXELS:  return 1; /* vkCmdCopyImageToBuffer readback of a RE-ACQUIRED swapchain image (see vulkan_read_pixels); requires the swapchain's TRANSFER_SRC usage added in create_swapchain */
@@ -4172,6 +4635,7 @@ static const vio_backend vulkan_backend = {
     .draw_instanced_from_storage = vio_vk3d_draw_instanced_from_storage,
     .draw_mesh_tasks          = vio_vk3d_draw_mesh_tasks,
     .draw_mesh_tasks_indirect = vio_vk3d_draw_mesh_tasks_indirect,
+    .cooperative_matrix_shapes = vulkan_cooperative_matrix_shapes,
     .draw_indirect     = vio_vk3d_draw_indirect,
     .read_render_target = vio_vk_read_render_target,
     .bind_render_target_face = vio_vk_bind_render_target_face,
@@ -4215,6 +4679,9 @@ static const vio_backend vulkan_backend = {
     .create_acceleration_structure  = vulkan_create_acceleration_structure,
     .destroy_acceleration_structure = vulkan_destroy_acceleration_structure,
     .bind_acceleration_structure    = vulkan_bind_acceleration_structure,
+    .create_rt_pipeline             = vulkan_create_rt_pipeline,
+    .destroy_rt_pipeline            = vulkan_destroy_rt_pipeline,
+    .trace_rays                     = vulkan_trace_rays,
 };
 
 void vio_backend_vulkan_register(void)

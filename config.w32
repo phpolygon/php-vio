@@ -32,6 +32,7 @@ if (PHP_VIO != "no") {
         "src\\vio_buffer.c " +
         "src\\vio_compute_pipeline.c " +
         "src\\vio_acceleration_structure.c " +
+        "src\\vio_rt_pipeline.c " +
         "src\\vio_work_graph.c " +
         "src\\vio_2d.c " +
         "src\\vio_2d_d3d11.c " +

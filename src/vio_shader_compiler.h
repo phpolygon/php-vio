@@ -34,4 +34,9 @@ uint32_t *vio_compile_glsl_stage_to_spirv(const char *source, int stage,
 uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
                                             size_t *out_size, char **error_msg);
 
+/* Compile one ray tracing stage (VIO_RT_STAGE_*, GL_EXT_ray_tracing) to
+ * SPIR-V 1.4 (Vulkan 1.2 rules). Same ownership contract as above. */
+uint32_t *vio_compile_glsl_rt_stage_to_spirv(const char *source, int rt_stage,
+                                             size_t *out_size, char **error_msg);
+
 #endif /* VIO_SHADER_COMPILER_H */

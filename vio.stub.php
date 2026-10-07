@@ -398,6 +398,40 @@ function vio_acceleration_structure(VioContext $context, array $instances): VioA
 function vio_bind_acceleration_structure(VioContext $context, VioAccelerationStructure $accelerationStructure, int $binding): void {}
 
 /**
+ * Ray tracing pipeline (VIO_FEATURE_RAYTRACING): one raygen shader, one miss
+ * shader and one triangle hit group (closest hit + optional any hit).
+ * $desc keys: 'raygen', 'miss', 'closest_hit' (GLSL, GL_EXT_ray_tracing,
+ * required), 'any_hit' (GLSL, optional), 'max_recursion' (int, default 1),
+ * 'payload_size' (bytes, default 32, D3D12 only), 'hlsl' (string, D3D12).
+ * Vulkan (VK_KHR_ray_tracing_pipeline) compiles the GLSL stages. D3D12 (DXR 1.0,
+ * needs vio_create(['shader_model' => 6])) compiles 'hlsl' as one DXC library
+ * (lib_6_3) with the exports vio_raygen, vio_miss, vio_closest_hit and, when
+ * 'any_hit' is given, vio_any_hit; the payload struct is the library's own,
+ * at most 'payload_size' bytes. HLSL contract: the bound acceleration
+ * structure is RaytracingAccelerationStructure at t0, a buffer bound with
+ * vio_rt_bind_buffer(..., $binding) is RWStructuredBuffer / RWByteAddressBuffer
+ * at u<$binding>; no other resources. GLSL: the accelerationStructureEXT and
+ * the std430 buffers at their bindings (set 0). False + warning where the
+ * feature is 0 or a stage does not compile.
+ */
+function vio_rt_pipeline(VioContext $context, array $desc): VioRtPipeline|false {}
+
+/**
+ * Bind a storage buffer (vio_storage_buffer) at $binding (0..15, up to 8 per
+ * pipeline) for the following vio_trace_rays of $pipeline. Read the result
+ * with vio_storage_buffer_read().
+ */
+function vio_rt_bind_buffer(VioContext $context, VioRtPipeline $pipeline, VioBuffer $buffer, int $binding): void {}
+
+/**
+ * Launch $width * $height * $depth raygen invocations (gl_LaunchIDEXT /
+ * DispatchRaysIndex) against the acceleration structure bound with
+ * vio_bind_acceleration_structure(). Synchronous: the buffers are complete on
+ * return. Outside vio_begin / vio_end.
+ */
+function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width, int $height, int $depth = 1): void {}
+
+/**
  * Slot of $texture in the context's bindless texture table (VIO_FEATURE_BINDLESS,
  * BINDLESS-PLAN.md). Shaders read the table as
  *   layout(set = 1, binding = 0) uniform texture2D vio_textures[];
@@ -407,6 +441,34 @@ function vio_bind_acceleration_structure(VioContext $context, VioAccelerationStr
  * Plain 2D textures only, up to 1024. False (with a warning) without the feature.
  */
 function vio_texture_index(VioContext $context, VioTexture $texture): int|false {}
+
+/**
+ * Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK; D3D12 with SM 6.5 + SamplerFeedbackTier 0.9):
+ * bind the MinMip feedback map paired with $texture (created on first use) for the
+ * following draws; null unbinds. GLSL has no sampler feedback, so the fragment stage is an
+ * HLSL override, vio_shader(['vertex' => …, 'fragment' => $glsl, 'hlsl' => ['fragment' => $ps]]),
+ * whose `main` declares
+ *   FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> vio_feedback : register(u0, space2);
+ * and calls vio_feedback.WriteSamplerFeedback($tex, $sampler, $uv) next to its sample.
+ * Texture / sampler registers follow vio's scheme (t0 / s0 for unit 0, cbuffer b0 with the
+ * layout of the GLSL fragment uniforms), inputs use the SPIRV-Cross semantics
+ * (TEXCOORD<location>), entry point `main`. One map entry covers a region of mip 0: the
+ * largest power of two <= half the shorter side, between 4 and 128 texels (128 x 128 =
+ * one 64 KB tile of a 32-bit texture). False + warning without the feature or for
+ * 3D / array / borrowed textures and textures smaller than 8 x 8.
+ */
+function vio_sampler_feedback_bind(VioContext $context, ?VioTexture $texture): bool {}
+
+/**
+ * Decode the feedback map of $texture: ['regions_x' => int, 'regions_y' => int,
+ * 'region' => int (mip-0 texels per region edge), 'min_mip' => list<int|null>] row by row,
+ * the lowest mip sampled in each region since the last clear, null = never sampled.
+ * Waits for the GPU (also mid-frame, like vio_read_render_target).
+ */
+function vio_sampler_feedback_read(VioContext $context, VioTexture $texture): array|false {}
+
+/** Reset the feedback map of $texture to "never sampled" (creates it if needed). */
+function vio_sampler_feedback_clear(VioContext $context, VioTexture $texture): bool {}
 
 /**
  * Draw a mesh with arguments read from a storage buffer (VIO_FEATURE_INDIRECT_DRAW) —
@@ -489,6 +551,17 @@ function vio_set_shading_rate_image(VioContext $context, ?string $rates, int $ti
  * 8, 16 or 32); 0 without VIO_FEATURE_SHADING_RATE_IMAGE.
  */
 function vio_shading_rate_tile_size(VioContext $context): int {}
+
+/**
+ * Cooperative-matrix shapes (VIO_FEATURE_COOPERATIVE_MATRIX, GL_KHR_cooperative_matrix):
+ * the subgroup-scope tiles compute kernels can multiply with coopMatMulAdd, as
+ * ['m' => int, 'n' => int, 'k' => int, 'a' => string, 'b' => string, 'c' => string,
+ * 'result' => string] (A is M x K, B is K x N, C / result M x N; types 'float16',
+ * 'float32', 'sint8', 'uint8', 'sint32', 'bfloat16', ...). Vulkan lists the device's
+ * VK_KHR_cooperative_matrix properties, Metal 8 x 8 x 8 simdgroup_matrix shapes;
+ * [] without the feature.
+ */
+function vio_cooperative_matrix_shapes(VioContext $context): array {}
 
 /**
  * Draw a mesh in the current frame.

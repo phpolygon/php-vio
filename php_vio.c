@@ -23,6 +23,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_buffer.h"
 #include "src/vio_compute_pipeline.h"
 #include "src/vio_acceleration_structure.h"
+#include "src/vio_rt_pipeline.h"
 #include "src/vio_work_graph.h"
 #include "src/vio_font_face.h"
 #include "src/vio_2d.h"
@@ -2683,6 +2684,7 @@ ZEND_FUNCTION(vio_shader)
      * VIO_FEATURE_HLSL_STAGE_OVERRIDE compile instead of the transpiled GLSL
      * (D3D tessellation, [instance(N)]). The GLSL stage stays required. */
     zval *hlsl_zv[VIO_EXTRA_STAGE_COUNT] = { NULL, NULL, NULL };
+    zval *hlsl_fragment_zv = NULL;   /* 'fragment' => src (D3D12; e.g. WriteSamplerFeedback) */
     zval *hlsl_cfg = zend_hash_str_find(config_ht, "hlsl", sizeof("hlsl") - 1);
     if (hlsl_cfg) {
         if (Z_TYPE_P(hlsl_cfg) != IS_ARRAY) {
@@ -2696,8 +2698,12 @@ ZEND_FUNCTION(vio_shader)
             for (int i = 0; hk && i < VIO_EXTRA_STAGE_COUNT; i++) {
                 if (strcmp(ZSTR_VAL(hk), vio_extra_stage_keys[i]) == 0) idx = i;
             }
+            if (hk && strcmp(ZSTR_VAL(hk), "fragment") == 0 && Z_TYPE_P(hv) == IS_STRING && Z_STRLEN_P(hv) > 0) {
+                hlsl_fragment_zv = hv;
+                continue;
+            }
             if (idx < 0 || Z_TYPE_P(hv) != IS_STRING || Z_STRLEN_P(hv) == 0) {
-                php_error_docref(NULL, E_WARNING, "vio_shader: 'hlsl' takes 'geometry', 'tess_control' and 'tess_eval' => non-empty HLSL source");
+                php_error_docref(NULL, E_WARNING, "vio_shader: 'hlsl' takes 'geometry', 'tess_control', 'tess_eval' and 'fragment' => non-empty HLSL source");
                 RETURN_FALSE;
             }
             if (!extra_zv[idx]) {
@@ -2990,6 +2996,7 @@ ZEND_FUNCTION(vio_shader)
         desc.geometry_hlsl     = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)]) : NULL;
         desc.tess_control_hlsl = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)]) : NULL;
         desc.tess_eval_hlsl    = hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)] ? Z_STRVAL_P(hlsl_zv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)]) : NULL;
+        desc.fragment_hlsl     = hlsl_fragment_zv ? Z_STRVAL_P(hlsl_fragment_zv) : NULL;
         desc.view_count        = view_count;
         desc.task_data         = shader->task_spirv;
         desc.task_size         = shader->task_spirv_size;
@@ -5082,6 +5089,42 @@ ZEND_FUNCTION(vio_shading_rate_tile_size)
         RETURN_LONG(0);
     }
     RETURN_LONG(ctx->backend->shading_rate_tile_size());
+}
+
+/* VIO_FEATURE_COOPERATIVE_MATRIX: the subgroup-scope coopmat shapes the device
+ * multiplies, [['m', 'n', 'k', 'a', 'b', 'c', 'result'], ...] with component
+ * types as strings ('float16', 'float32', 'sint8', ...). [] without the feature. */
+ZEND_FUNCTION(vio_cooperative_matrix_shapes)
+{
+    static const char *const type_names[] = {
+        "float16", "float32", "float64", "sint8", "sint16", "sint32", "sint64",
+        "uint8", "uint16", "uint32", "uint64", "bfloat16",
+    };
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    array_init(return_value);
+    if (!ctx->initialized || !ctx->backend->cooperative_matrix_shapes || !ctx->backend->supports_feature
+        || !ctx->backend->supports_feature(VIO_FEATURE_COOPERATIVE_MATRIX)) {
+        return;
+    }
+    vio_coopmat_shape shapes[VIO_COOPMAT_MAX_SHAPES];
+    int n = ctx->backend->cooperative_matrix_shapes(shapes, VIO_COOPMAT_MAX_SHAPES);
+    for (int i = 0; i < n; i++) {
+        const vio_coopmat_type t[4] = { shapes[i].a, shapes[i].b, shapes[i].c, shapes[i].result };
+        const char *keys[4] = { "a", "b", "c", "result" };
+        zval s;
+        array_init(&s);
+        add_assoc_long(&s, "m", shapes[i].m);
+        add_assoc_long(&s, "n", shapes[i].n);
+        add_assoc_long(&s, "k", shapes[i].k);
+        for (int j = 0; j < 4; j++) {
+            add_assoc_string(&s, keys[j], (unsigned)t[j] < sizeof(type_names) / sizeof(type_names[0]) ? type_names[t[j]] : "unknown");
+        }
+        add_next_index_zval(return_value, &s);
+    }
 }
 
 ZEND_FUNCTION(vio_set_shading_rate)
@@ -8038,6 +8081,96 @@ ZEND_FUNCTION(vio_texture_index)
     RETURN_LONG(slot);
 }
 
+/* ── Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK) ───────────────────── */
+
+static int vio_sampler_feedback_ready(vio_context_object *ctx, const char *fn, int has_slot)
+{
+    if (!ctx->initialized || !ctx->backend || !has_slot
+        || !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_SAMPLER_FEEDBACK))) {
+        php_error_docref(NULL, E_WARNING, "%s: backend has no sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK = 0)", fn);
+        return 0;
+    }
+    return 1;
+}
+
+static int vio_sampler_feedback_texture_ok(vio_texture_object *tex, const char *fn)
+{
+    if (!tex->valid || !tex->backend_texture || tex->is_3d || tex->layers > 1 || tex->borrowed) {
+        php_error_docref(NULL, E_WARNING, "%s: sampler feedback needs a plain 2D texture", fn);
+        return 0;
+    }
+    return 1;
+}
+
+/* Bind the texture's MinMip feedback map (u0, space2) for the following draws;
+ * null unbinds. The map is created on the first bind. */
+ZEND_FUNCTION(vio_sampler_feedback_bind)
+{
+    zval *ctx_zval, *tex_zval = NULL;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS_OR_NULL(tex_zval, vio_texture_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_bind", ctx->backend && ctx->backend->sampler_feedback_bind)) RETURN_FALSE;
+    void *bt = NULL;
+    if (tex_zval) {
+        vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+        if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_bind")) RETURN_FALSE;
+        bt = tex->backend_texture;
+    }
+    RETURN_BOOL(ctx->backend->sampler_feedback_bind(bt) == 0);
+}
+
+/* Decode the feedback map: ['regions_x', 'regions_y', 'region' (mip-0 texels per
+ * region edge), 'min_mip' => list<int|null> row by row, null = never sampled]. */
+ZEND_FUNCTION(vio_sampler_feedback_read)
+{
+    zval *ctx_zval, *tex_zval;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_read", ctx->backend && ctx->backend->sampler_feedback_read)) RETURN_FALSE;
+    if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_read")) RETURN_FALSE;
+    unsigned char *mips = NULL;
+    int rx = 0, ry = 0, region = 0;
+    if (ctx->backend->sampler_feedback_read(tex->backend_texture, &mips, &rx, &ry, &region) != 0 || !mips) {
+        php_error_docref(NULL, E_WARNING, "vio_sampler_feedback_read: the texture has no feedback map (bind or clear it first)");
+        free(mips);
+        RETURN_FALSE;
+    }
+    array_init(return_value);
+    add_assoc_long(return_value, "regions_x", rx);
+    add_assoc_long(return_value, "regions_y", ry);
+    add_assoc_long(return_value, "region", region);
+    zval list;
+    array_init_size(&list, (uint32_t)(rx * ry));
+    for (int i = 0; i < rx * ry; i++) {
+        if (mips[i] == 0xFF) add_next_index_null(&list);
+        else add_next_index_long(&list, mips[i]);
+    }
+    add_assoc_zval(return_value, "min_mip", &list);
+    free(mips);
+}
+
+/* Reset the texture's feedback map to "never sampled" (creates it if needed). */
+ZEND_FUNCTION(vio_sampler_feedback_clear)
+{
+    zval *ctx_zval, *tex_zval;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_clear", ctx->backend && ctx->backend->sampler_feedback_clear)) RETURN_FALSE;
+    if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_clear")) RETURN_FALSE;
+    RETURN_BOOL(ctx->backend->sampler_feedback_clear(tex->backend_texture) == 0);
+}
+
 ZEND_FUNCTION(vio_backend_info)
 {
     zval *ctx_zval;
@@ -8091,9 +8224,11 @@ ZEND_FUNCTION(vio_acceleration_structure)
         php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: context not initialized");
         RETURN_FALSE;
     }
-    if (!(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY))
+    /* Ray queries and the ray tracing pipeline both trace against it. */
+    if (!(ctx->backend->supports_feature && (ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY)
+                                             || ctx->backend->supports_feature(VIO_FEATURE_RAYTRACING)))
         || !ctx->backend->create_acceleration_structure) {
-        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: backend '%s' has no ray queries (VIO_FEATURE_RAY_QUERY = 0)",
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: backend '%s' has no ray tracing (VIO_FEATURE_RAY_QUERY = VIO_FEATURE_RAYTRACING = 0)",
                          ctx->backend->name);
         RETURN_FALSE;
     }
@@ -8192,6 +8327,165 @@ ZEND_FUNCTION(vio_bind_acceleration_structure)
         return;
     }
     ctx->backend->bind_acceleration_structure(as->backend_as, (int)binding);
+}
+
+/* vio_rt_pipeline($ctx, ['raygen' => glsl, 'miss' => glsl, 'closest_hit' => glsl,
+ * 'any_hit' => glsl?, 'max_recursion' => 1, 'payload_size' => 32, 'hlsl' => lib?]):
+ * the GLSL stages go to SPIR-V here (they are the portable contract); the
+ * backend takes the SPIR-V (Vulkan) or the HLSL library (D3D12). */
+ZEND_FUNCTION(vio_rt_pipeline)
+{
+    zval *ctx_zval;
+    HashTable *desc_ht;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(desc_ht)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: context not initialized");
+        RETURN_FALSE;
+    }
+    if (!(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_RAYTRACING))
+        || !ctx->backend->create_rt_pipeline || !ctx->backend->trace_rays) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: backend '%s' has no ray tracing pipeline (VIO_FEATURE_RAYTRACING = 0)",
+                         ctx->backend->name);
+        RETURN_FALSE;
+    }
+    static const char *keys[VIO_RT_STAGE_COUNT] = { "raygen", "miss", "closest_hit", "any_hit" };
+    vio_rt_pipeline_desc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.max_recursion = 1;
+    desc.payload_size = 32;
+    for (int st = 0; st < VIO_RT_STAGE_COUNT; st++) {
+        zval *z = zend_hash_str_find(desc_ht, keys[st], strlen(keys[st]));
+        if (!z) {
+            if (st == VIO_RT_STAGE_ANY_HIT) continue;
+            for (int k = 0; k < st; k++) free((void *)desc.spirv[k]);
+            zend_argument_value_error(2, "needs '%s' (GLSL source)", keys[st]);
+            RETURN_THROWS();
+        }
+        if (Z_TYPE_P(z) != IS_STRING) {
+            for (int k = 0; k < st; k++) free((void *)desc.spirv[k]);
+            zend_argument_value_error(2, "'%s' must be a GLSL source string", keys[st]);
+            RETURN_THROWS();
+        }
+        char *err = NULL;
+        size_t size = 0;
+        uint32_t *spv = vio_compile_glsl_rt_stage_to_spirv(Z_STRVAL_P(z), st, &size, &err);
+        if (!spv) {
+            php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: %s: %s", keys[st], err ? err : "compile failed");
+            free(err);
+            for (int k = 0; k < st; k++) free((void *)desc.spirv[k]);
+            RETURN_FALSE;
+        }
+        free(err);
+        desc.spirv[st] = spv;
+        desc.spirv_size[st] = size;
+    }
+    zval *z;
+    if ((z = zend_hash_str_find(desc_ht, "max_recursion", sizeof("max_recursion") - 1))) desc.max_recursion = (int)zval_get_long(z);
+    if ((z = zend_hash_str_find(desc_ht, "payload_size", sizeof("payload_size") - 1))) desc.payload_size = (int)zval_get_long(z);
+    if ((z = zend_hash_str_find(desc_ht, "hlsl", sizeof("hlsl") - 1)) && Z_TYPE_P(z) == IS_STRING) desc.hlsl = Z_STRVAL_P(z);
+    if (desc.max_recursion < 1 || desc.max_recursion > 31 || desc.payload_size < 4 || desc.payload_size > 4096) {
+        for (int k = 0; k < VIO_RT_STAGE_COUNT; k++) free((void *)desc.spirv[k]);
+        zend_argument_value_error(2, "'max_recursion' must be 1..31 and 'payload_size' 4..4096");
+        RETURN_THROWS();
+    }
+    void *handle = ctx->backend->create_rt_pipeline(&desc);
+    for (int k = 0; k < VIO_RT_STAGE_COUNT; k++) free((void *)desc.spirv[k]);
+    if (!handle) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: the backend could not build the pipeline");
+        RETURN_FALSE;
+    }
+    object_init_ex(return_value, vio_rt_pipeline_ce);
+    vio_rt_pipeline_object *p = Z_VIO_RT_PIPELINE_P(return_value);
+    p->backend_pipeline = handle;
+    p->backend = ctx->backend;
+    p->valid = 1;
+}
+
+/* vio_rt_bind_buffer($ctx, $pipeline, $storage_buffer, $binding): one buffer
+ * per binding, replaced on rebind; the pipeline keeps a reference. */
+ZEND_FUNCTION(vio_rt_bind_buffer)
+{
+    zval *ctx_zval, *p_zval, *buf_zval;
+    zend_long binding;
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(p_zval, vio_rt_pipeline_ce)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_buffer_ce)
+        Z_PARAM_LONG(binding)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_rt_pipeline_object *p = Z_VIO_RT_PIPELINE_P(p_zval);
+    vio_buffer_object *buf = Z_VIO_BUFFER_P(buf_zval);
+    if (binding < 0 || binding > 15) {
+        zend_argument_value_error(4, "must be 0..15");
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !p->valid || p->backend != ctx->backend) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_bind_buffer: the pipeline was not built on this context's backend");
+        return;
+    }
+    if (!buf->valid || !buf->backend_buffer || buf->type != VIO_BUFFER_STORAGE) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_bind_buffer: needs a storage buffer (vio_storage_buffer)");
+        return;
+    }
+    int slot = -1;
+    for (int i = 0; i < p->buffer_count; i++) if (p->bindings[i] == (int)binding) { slot = i; break; }
+    if (slot < 0) {
+        if (p->buffer_count >= VIO_RT_MAX_BUFFERS) {
+            php_error_docref(NULL, E_WARNING, "vio_rt_bind_buffer: at most %d buffers per pipeline", VIO_RT_MAX_BUFFERS);
+            return;
+        }
+        slot = p->buffer_count++;
+    } else {
+        OBJ_RELEASE(p->buffers[slot]);
+    }
+    GC_ADDREF(Z_OBJ_P(buf_zval));
+    p->buffers[slot] = Z_OBJ_P(buf_zval);
+    p->bindings[slot] = (int)binding;
+}
+
+/* vio_trace_rays($ctx, $pipeline, $w, $h, $d = 1): synchronous launch against
+ * the bound acceleration structure. */
+ZEND_FUNCTION(vio_trace_rays)
+{
+    zval *ctx_zval, *p_zval;
+    zend_long w, h, d = 1;
+    ZEND_PARSE_PARAMETERS_START(4, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(p_zval, vio_rt_pipeline_ce)
+        Z_PARAM_LONG(w)
+        Z_PARAM_LONG(h)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(d)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_rt_pipeline_object *p = Z_VIO_RT_PIPELINE_P(p_zval);
+    if (w < 1 || h < 1 || d < 1 || w > 65536 || h > 65536 || d > 65536 || w * h * d > (zend_long)1 << 30) {
+        zend_argument_value_error(3, "width, height and depth must be >= 1 (at most 2^30 rays)");
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !p->valid || p->backend != ctx->backend || !ctx->backend->trace_rays) {
+        php_error_docref(NULL, E_WARNING, "vio_trace_rays: the pipeline was not built on this context's backend");
+        return;
+    }
+    if (ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "vio_trace_rays: call it outside vio_begin / vio_end");
+        return;
+    }
+    vio_rt_buffer_binding b[VIO_RT_MAX_BUFFERS];
+    for (int i = 0; i < p->buffer_count; i++) {
+        vio_buffer_object *buf = vio_buffer_from_obj(p->buffers[i]);
+        b[i].backend_buffer = buf->backend_buffer;
+        b[i].binding = p->bindings[i];
+    }
+    if (ctx->backend->trace_rays(p->backend_pipeline, b, p->buffer_count, (int)w, (int)h, (int)d) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_trace_rays: the backend could not trace");
+    }
 }
 
 /* ── Work graphs (VIO_FEATURE_WORK_GRAPHS) ──────────────────────────── */
@@ -9047,6 +9341,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BINDLESS", VIO_FEATURE_BINDLESS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RAY_QUERY", VIO_FEATURE_RAY_QUERY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MESH_SHADER", VIO_FEATURE_MESH_SHADER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SAMPLER_FEEDBACK", VIO_FEATURE_SAMPLER_FEEDBACK, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_COOPERATIVE_MATRIX", VIO_FEATURE_COOPERATIVE_MATRIX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_WORK_GRAPHS", VIO_FEATURE_WORK_GRAPHS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
@@ -11508,6 +11804,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_buffer_register();
     vio_compute_pipeline_register();
     vio_acceleration_structure_register();
+    vio_rt_pipeline_register();
     vio_work_graph_register();
     vio_font_register();
     vio_font_face_register();

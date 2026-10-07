@@ -418,6 +418,27 @@ typedef struct _vio_backend {
      * {x, y, z} uint32 records from a storage buffer. NULL => no mesh stages. */
     void  (*draw_mesh_tasks)(uint32_t x, uint32_t y, uint32_t z);
     void  (*draw_mesh_tasks_indirect)(void *args_buffer, int max_draws, size_t offset);
+    /* Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK) on a create_texture
+     * handle: bind its MinMip feedback map (created on first use) for the
+     * following draws - NULL unbinds -; decode it into one byte per region
+     * (*out malloc'd, 0xFF = never sampled); clear it. 0 on success. */
+    int   (*sampler_feedback_bind)(void *backend_texture);
+    int   (*sampler_feedback_read)(void *backend_texture, unsigned char **out,
+                                   int *regions_x, int *regions_y, int *region_px);
+    int   (*sampler_feedback_clear)(void *backend_texture);
+    /* Cooperative matrices (VIO_FEATURE_COOPERATIVE_MATRIX): the subgroup-scope
+     * shapes the device multiplies (GL_KHR_cooperative_matrix coopmat<T,
+     * gl_ScopeSubgroup, ...>), up to `max` into `out`. Returns the count, 0
+     * without the feature. NULL => none. */
+    int   (*cooperative_matrix_shapes)(vio_coopmat_shape *out, int max);
+    /* Ray tracing pipeline (VIO_FEATURE_RAYTRACING): build the pipeline and
+     * its shader binding table (NULL on failure, the backend warns), free it,
+     * and launch w * h * d raygen invocations synchronously against the bound
+     * acceleration structure with `count` storage buffers. The buffers are
+     * readable through read_buffer afterwards. 0 on success, -1 otherwise. */
+    void *(*create_rt_pipeline)(const vio_rt_pipeline_desc *desc);
+    void  (*destroy_rt_pipeline)(void *pipeline);
+    int   (*trace_rays)(void *pipeline, const vio_rt_buffer_binding *buffers, int count, int w, int h, int d);
     /* Work graphs (VIO_FEATURE_WORK_GRAPHS): build an executable graph from an
      * HLSL lib_6_8 source whose CPU-fed entry node is `entry` and takes records
      * of record_size bytes (NULL + *error on failure, error is emalloc'd);
