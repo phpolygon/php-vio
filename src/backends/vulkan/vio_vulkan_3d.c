@@ -699,7 +699,7 @@ static int vk3d_prepare(uint32_t stride, VkBuffer inst_buf, VkDeviceSize inst_of
     if (!pl) return -1;
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
-    vio_vk_apply_shading_rate(cmd);
+    vio_vk_apply_shading_rate(cmd, sh->writes_shading_rate);
     if (vio_vk.max_viewports > 1) {
         /* The pipeline has max_viewports viewports: set every one (unused ones
          * repeat viewport 0). */

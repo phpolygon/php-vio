@@ -467,6 +467,7 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
         return NULL;
     }
     vio_vk3d_shader *sh = (vio_vk3d_shader *)calloc(1, sizeof(vio_vk3d_shader));
+    if (sh) sh->writes_shading_rate = vio_spirv_has_builtin(desc->vertex_data, desc->vertex_size, 4432);   /* PrimitiveShadingRateKHR */
     if (!sh) return NULL;
     st[0].module = &sh->vs; st[1].module = &sh->tcs; st[2].module = &sh->tes;
     st[3].module = &sh->gs; st[4].module = &sh->fs;

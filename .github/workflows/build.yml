@@ -134,7 +134,8 @@ jobs:
             tests/render3d/155_shader_float16_all_backends.phpt \
             tests/render3d/156_base_vertex_instance_all_backends.phpt \
             tests/render3d/157_compute_derivatives_all_backends.phpt \
-            tests/render3d/158_multiview_all_backends.phpt
+            tests/render3d/158_multiview_all_backends.phpt \
+            tests/render3d/159_primitive_shading_rate_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -266,7 +267,8 @@ jobs:
             tests/render3d/155_shader_float16_all_backends.phpt \
             tests/render3d/156_base_vertex_instance_all_backends.phpt \
             tests/render3d/157_compute_derivatives_all_backends.phpt \
-            tests/render3d/158_multiview_all_backends.phpt
+            tests/render3d/158_multiview_all_backends.phpt \
+            tests/render3d/159_primitive_shading_rate_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -636,7 +638,8 @@ jobs:
             tests/render3d/155_shader_float16_all_backends.phpt `
             tests/render3d/156_base_vertex_instance_all_backends.phpt `
             tests/render3d/157_compute_derivatives_all_backends.phpt `
-            tests/render3d/158_multiview_all_backends.phpt
+            tests/render3d/158_multiview_all_backends.phpt `
+            tests/render3d/159_primitive_shading_rate_all_backends.phpt
 
       - name: Package binary
         shell: pwsh

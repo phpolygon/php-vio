@@ -270,6 +270,7 @@ typedef struct _vio_vulkan_state {
     int                      instance_api_11;      /* instance created with apiVersion 1.1 */
     int                      bc_supported;
     int                      vrs_supported;
+    int                      vrs_primitive;        /* primitiveFragmentShadingRate enabled */
     /* VkPhysicalDeviceSubgroupProperties: basic / vote / ballot / arithmetic /
      * shuffle in the compute and fragment stages (VIO_FEATURE_SUBGROUP). */
     int                      subgroup_supported;
@@ -486,7 +487,8 @@ void  vio_vk_destroy_cubemap(void *cm_obj);
 void  vio_vk_bind_cubemap(void *cm_obj, int slot);
 void *vio_vk_create_texture_ex(vio_texture_desc *desc);   /* arrays, BC, stored chains (Block 10c) */
 int   vio_vk_set_shading_rate(int rate);
-void  vio_vk_apply_shading_rate(VkCommandBuffer cmd);     /* after binding a 3D pipeline */
+void  vio_vk_apply_shading_rate(VkCommandBuffer cmd, int primitive);   /* after binding a 3D pipeline;
+                                                                        primitive: its VS writes the rate */
 
 /* ── 3D pipeline (GAP-PHASE5 Block 10, vio_vulkan_3d*.c) ── */
 int   vio_vk3d_available(void);

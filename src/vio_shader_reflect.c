@@ -143,6 +143,22 @@ char *vio_hlsl_probe_hlsl(int stage, int shader_model)
     return hlsl;
 }
 
+int vio_spirv_has_builtin(const void *spirv, size_t bytes, uint32_t builtin)
+{
+    const uint32_t *w = (const uint32_t *)spirv;
+    size_t n = bytes / 4;
+    if (!w || n < 5 || w[0] != 0x07230203u) return 0;
+    for (size_t i = 5; i < n; ) {
+        uint32_t count = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (count == 0) break;
+        /* OpDecorate %target BuiltIn <builtin> / OpMemberDecorate %type <m> BuiltIn <builtin> */
+        if (op == 71 && count >= 4 && w[i + 2] == 11 && w[i + 3] == builtin) return 1;
+        if (op == 72 && count >= 5 && w[i + 3] == 11 && w[i + 4] == builtin) return 1;
+        i += count;
+    }
+    return 0;
+}
+
 #ifdef HAVE_SPIRV_CROSS
 
 #include <spirv_cross/spirv_cross_c.h>

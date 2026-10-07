@@ -291,6 +291,7 @@ static int create_logical_device(void)
     if (has_vpl) device_extensions[device_ext_count++] = "VK_EXT_shader_viewport_index_layer";
 
     vio_vk.vrs_supported = 0;
+    vio_vk.vrs_primitive = 0;
     vio_vk.vrs_rates     = 1 << VIO_SHADING_RATE_1X1;
     vio_vk.shading_rate  = VIO_SHADING_RATE_1X1;
 #ifdef VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME
@@ -331,6 +332,11 @@ static int create_logical_device(void)
                 if (vio_vk.vrs_rates & (1 << VIO_SHADING_RATE_2X2)) {
                     vio_vk.vrs_supported = 1;
                     vrs_enable.pipelineFragmentShadingRate = VK_TRUE;
+                    /* gl_PrimitiveShadingRateEXT from the vertex stage (VIO_FEATURE_SHADING_RATE_PRIMITIVE). */
+                    if (vrs_avail.primitiveFragmentShadingRate) {
+                        vrs_enable.primitiveFragmentShadingRate = VK_TRUE;
+                        vio_vk.vrs_primitive = 1;
+                    }
                     device_extensions[device_ext_count++] = VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
                     device_extensions[device_ext_count++] = VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME;
                 }
@@ -2447,7 +2453,7 @@ int vio_vk_set_shading_rate(int rate)
     return 0;
 }
 
-void vio_vk_apply_shading_rate(VkCommandBuffer cmd)
+void vio_vk_apply_shading_rate(VkCommandBuffer cmd, int primitive)
 {
 #ifdef VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME
     if (!vio_vk.vrs_supported || !vio_vk.vrs_cmd_set) return;
@@ -2459,12 +2465,16 @@ void vio_vk_apply_shading_rate(VkCommandBuffer cmd)
         case VIO_SHADING_RATE_4X4: size.width = 4; size.height = 4; break;
         default: break;
     }
-    VkFragmentShadingRateCombinerOpKHR ops[2] = { VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
-                                                  VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR };
+    /* A vertex stage that writes gl_PrimitiveShadingRateEXT replaces the set
+     * (pipeline) rate; REPLACE is a trivial combiner op, always available. */
+    VkFragmentShadingRateCombinerOpKHR ops[2] = {
+        (primitive && vio_vk.vrs_primitive) ? VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR
+                                            : VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+        VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR };
     typedef void (VKAPI_PTR *vio_vk_fsr_set_fn)(VkCommandBuffer, const VkExtent2D *, const VkFragmentShadingRateCombinerOpKHR[2]);
     ((vio_vk_fsr_set_fn)vio_vk.vrs_cmd_set)(cmd, &size, ops);
 #else
-    (void)cmd;
+    (void)cmd; (void)primitive;
 #endif
 }
 
@@ -3558,6 +3568,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_vk3d_available(); /* 2D array views, stored chains (Block 10c) */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return vio_vk3d_available() && (!vio_vk.device || vio_vk.bc_supported); /* textureCompressionBC */
         case VIO_FEATURE_SHADING_RATE:   return vio_vk3d_available() && vio_vk.vrs_supported; /* VK_KHR_fragment_shading_rate, pipeline rate */
+        case VIO_FEATURE_SHADING_RATE_PRIMITIVE: return vio_vk3d_available() && vio_vk.vrs_supported && vio_vk.vrs_primitive;
         case VIO_FEATURE_SUBGROUP:       return vio_vk.device && vio_vk.subgroup_supported; /* core 1.1 subgroup properties, compute + fragment */
         case VIO_FEATURE_SUBGROUP_QUAD:  return vio_vk.device && vio_vk.subgroup_quad_supported;
         case VIO_FEATURE_BARYCENTRICS:   return vio_vk.device && vio_vk.barycentrics_supported; /* VK_KHR_fragment_shader_barycentric */

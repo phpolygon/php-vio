@@ -382,6 +382,16 @@ static void d3d12_apply_shading_rate(void)
         case VIO_SHADING_RATE_4X4: r = D3D12_SHADING_RATE_4X4; break;
         default:                   r = D3D12_SHADING_RATE_1X1; break;
     }
+    /* Tier 2: a pipeline whose vertex stage writes SV_ShadingRate overrides the
+     * set rate with the per-primitive one; every other pipeline keeps it. */
+    if (vio_d3d12.vrs_tier >= 2) {
+        D3D12_SHADING_RATE_COMBINER comb[2] = {
+            (d3d12_current_pipeline && d3d12_current_pipeline->writes_shading_rate)
+                ? D3D12_SHADING_RATE_COMBINER_OVERRIDE : D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH };
+        ID3D12GraphicsCommandList5_RSSetShadingRate(vio_d3d12.cmd_list5, r, comb);
+        return;
+    }
     ID3D12GraphicsCommandList5_RSSetShadingRate(vio_d3d12.cmd_list5, r, NULL);
 }
 
@@ -1738,6 +1748,7 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     vio_topology topo = shader->hs_blob ? VIO_PATCHES : desc->topology;
     pipeline->topology = vio_topology_to_d3d12(topo, desc->patch_vertices);
     pipeline->has_gs = shader->gs_blob != NULL;
+    pipeline->writes_shading_rate = shader->writes_shading_rate;
     pipeline->has_hs = shader->hs_blob != NULL;
     pipeline->has_ds = shader->ds_blob != NULL;
 
@@ -2027,6 +2038,7 @@ static void d3d12_bind_pipeline(void *pipeline_ptr)
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(vio_d3d12.cmd_list, p->topology);
     ID3D12GraphicsCommandList_OMSetStencilRef(vio_d3d12.cmd_list, p->stencil_ref);
     d3d12_apply_view_mask();   /* also covers vio_draw_instanced's draw in php_vio.c */
+    if (vio_d3d12.vrs_tier >= 2) d3d12_apply_shading_rate();   /* the combiner follows the pipeline */
 
     /* Bind SRV + sampler heaps. Also invalidates the cached root arguments for
      * params 2 / 4 (SetGraphicsRootSignature / SetDescriptorHeaps may reset
@@ -4267,6 +4279,8 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
 {
     vio_d3d12_shader *shader = calloc(1, sizeof(vio_d3d12_shader));
     if (!shader) return NULL;
+    /* gl_PrimitiveShadingRateEXT (BuiltIn PrimitiveShadingRateKHR = 4432). */
+    shader->writes_shading_rate = desc->vertex_data && vio_spirv_has_builtin(desc->vertex_data, desc->vertex_size, 4432);
 
     const char *hlsl_vs = NULL;
     const char *hlsl_ps = NULL;
@@ -5940,6 +5954,8 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_ARRAY:       return 1; /* DepthOrArraySize > 1 + TEXTURE2DARRAY SRV */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return 1; /* BC1-BC7 mandatory on every D3D12 device */
         case VIO_FEATURE_SHADING_RATE:        return vio_d3d12.vrs_tier > 0; /* RSSetShadingRate, VRS Tier 1+ (GAP-PHASE5 12) */
+        /* SV_ShadingRate (SM 6.4) + the OVERRIDE combiner (Tier 2). */
+        case VIO_FEATURE_SHADING_RATE_PRIMITIVE: return vio_d3d12.vrs_tier >= 2 && vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 64;
         case VIO_FEATURE_RENDER_TARGET_CUBE:  return 1; /* 6-slice array + per-(face,mip) RTVs (GAP-PLAN Phase 2) */
         case VIO_FEATURE_RENDER_TARGET_LAYERED: return 1; /* array resources: RTV / DSV per layer, array / cube SRVs */
         /* All-slice RTV / DSV + SV_RenderTargetArrayIndex from the GS. */

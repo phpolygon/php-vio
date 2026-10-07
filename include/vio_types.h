@@ -333,6 +333,11 @@ typedef enum _vio_feature {
      * (GL_NV_compute_shader_derivatives): 2x2 quads of local x / y. D3D12: SM 6.6;
      * Metal: 0 (kernel functions have no derivatives). */
     VIO_FEATURE_COMPUTE_DERIVATIVES = 51,
+    /* gl_PrimitiveShadingRateEXT written by the vertex stage
+     * (GL_EXT_fragment_shading_rate): the primitive's rate replaces the one
+     * vio_set_shading_rate set, for pipelines whose vertex stage writes it.
+     * D3D12: VRS Tier 2 + SM 6.4 (SV_ShadingRate); Vulkan primitiveFragmentShadingRate. */
+    VIO_FEATURE_SHADING_RATE_PRIMITIVE = 52,
 } vio_feature;
 
 #define VIO_MAX_VIEWPORTS 16

@@ -116,6 +116,7 @@ typedef struct _vio_d3d12_shader {
     size_t    tess_tcs_size, tess_tes_size;
     uint32_t  hs_input_points;
     UINT      compile_flags;
+    int       writes_shading_rate;   /* the vertex stage writes SV_ShadingRate (gl_PrimitiveShadingRateEXT) */
 } vio_d3d12_shader;
 
 /* Pipeline = PSO + root signature reference */
@@ -136,6 +137,7 @@ typedef struct _vio_d3d12_pipeline {
     int                      has_gs, has_hs, has_ds;  /* replicate SRV / sampler tables */
     ID3DBlob                *hs_variant;       /* owned; hull shader for this pipeline's patch size */
     int                      view_count;       /* multiview: view instancing views (2..4), 0 = off */
+    int                      writes_shading_rate; /* the shader's vertex stage writes SV_ShadingRate */
 } vio_d3d12_pipeline;
 
 /* Buffer wrapper */

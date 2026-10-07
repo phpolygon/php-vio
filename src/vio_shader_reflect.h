@@ -38,6 +38,9 @@ char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_mod
  * set by D3D12 under SM 6.2+ with Native16BitShaderOpsSupported, cleared by
  * every other D3D context. Process-wide, like the D3D backends themselves. */
 void vio_hlsl_set_16bit_types(int enable);
+/* 1 when the SPIR-V module decorates a variable with BuiltIn `builtin`
+ * (e.g. 4432 PrimitiveShadingRateKHR). Plain word scan, no SPIRV-Cross. */
+int vio_spirv_has_builtin(const void *spirv, size_t bytes, uint32_t builtin);
 /* GL_OVR_multiview2: views of the next vio_spirv_to_glsl calls (0 = off). */
 void vio_glsl_set_ovr_view_count(int views);
 
