@@ -128,6 +128,8 @@ jobs:
           export VIO_REQUIRE_MULTIVIEW=vulkan,opengl
           # Bindless table (descriptor indexing, lavapipe).
           export VIO_REQUIRE_BINDLESS=vulkan
+          # Mesh and task shaders (VK_EXT_mesh_shader, lavapipe).
+          export VIO_REQUIRE_MESH_SHADER=vulkan
           # lavapipe reports rayQuery = true (BLAS/TLAS built on the CPU).
           export VIO_REQUIRE_RAY_QUERY=vulkan
           xvfb-run -a php -n run-tests.php -q --show-diff \
@@ -271,8 +273,10 @@ jobs:
           export VIO_REQUIRE_MULTIVIEW=vulkan,opengl
           # Bindless table (descriptor indexing, lavapipe).
           export VIO_REQUIRE_BINDLESS=vulkan
-          # lavapipe reports rayQuery = true (BLAS/TLAS built on the CPU).
-          export VIO_REQUIRE_RAY_QUERY=vulkan
+          # Mesh and task shaders (VK_EXT_mesh_shader, lavapipe).
+          export VIO_REQUIRE_MESH_SHADER=vulkan
+          # Ray query is not required here: lavapipe on aarch64 crashes in its BVH
+          # build, so vio reports VIO_FEATURE_RAY_QUERY = 0 on it (x86_64 runs 163).
           xvfb-run -a php -n run-tests.php -q --show-diff \
             tests/render3d/149_subgroup_ops_all_backends.phpt \
             tests/render3d/152_subgroup_quad_all_backends.phpt \

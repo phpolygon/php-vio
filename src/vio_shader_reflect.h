@@ -20,6 +20,7 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
  * source that uses gl_Layer / gl_ViewportIndex without declaring it. Takes
  * ownership of the malloc'd source, returns the (possibly new) string. */
 char *vio_glsl_require_viewport_layer_ext(char *glsl);
+char *vio_glsl_require_mesh_shader_ext(char *glsl);
 
 /* Transpile a COMPUTE SPIR-V module to GLSL (target version >= 430, clamped).
  * Unlike vio_spirv_to_glsl(), keeps UBOs as std140 blocks and SSBOs as std430
