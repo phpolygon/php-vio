@@ -120,6 +120,7 @@ typedef struct _vio_render_target_object {
     int          layers;              /* > 1 => 2D array target with this many layers ('layers' => N);
                                          colour and depth both carry every layer. 0/1 = plain 2D. */
     int          mip_levels;          /* 1, or floor(log2(size)) + 1 when created with 'mipmaps' */
+    int          depth_reduction;     /* depth_only + mipmaps: VIO_DEPTH_REDUCE_MAX (0) / _MIN (1) */
     int          bound_face;          /* cube / array: face or layer currently bound (-1 = none) */
     int          bound_level;         /* cube: mip level currently bound */
     int          samples;             /* requested by vio_render_target(); backends clamp to what

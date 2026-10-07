@@ -10378,6 +10378,9 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTIVIEW_GEOMETRY", VIO_FEATURE_MULTIVIEW_GEOMETRY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTIVIEW_TESSELLATION", VIO_FEATURE_MULTIVIEW_TESSELLATION, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_COMPRESSION_ASTC", VIO_FEATURE_TEXTURE_COMPRESSION_ASTC, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_DEPTH_MIPMAPS", VIO_FEATURE_DEPTH_MIPMAPS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_DEPTH_REDUCE_MAX", VIO_DEPTH_REDUCE_MAX, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_DEPTH_REDUCE_MIN", VIO_DEPTH_REDUCE_MIN, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
@@ -11632,6 +11635,30 @@ ZEND_FUNCTION(vio_render_target)
         }
     }
 
+    /* Depth target with a mip chain (A26): 'mipmaps' => true on a plain 2D
+     * depth_only target; vio_generate_mipmaps reduces each level from the one
+     * below ('depth_reduction' => VIO_DEPTH_REDUCE_MAX (default) / _MIN). */
+    int depth_reduction = VIO_DEPTH_REDUCE_MAX;
+    if (depth_only && !is_cube && layers <= 1 &&
+        (val = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1)) != NULL && zend_is_true(val)) {
+        if (!ctx->backend->supports_feature || !ctx->backend->supports_feature(VIO_FEATURE_DEPTH_MIPMAPS)) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_render_target: depth targets with mipmaps are not supported on backend '%s' (VIO_FEATURE_DEPTH_MIPMAPS)", ctx->backend->name);
+            RETURN_FALSE;
+        }
+        if ((val = zend_hash_str_find(config_ht, "depth_reduction", sizeof("depth_reduction") - 1)) != NULL) {
+            zend_long r = zval_get_long(val);
+            if (r != VIO_DEPTH_REDUCE_MAX && r != VIO_DEPTH_REDUCE_MIN) {
+                php_error_docref(NULL, E_WARNING, "vio_render_target: 'depth_reduction' must be VIO_DEPTH_REDUCE_MAX or VIO_DEPTH_REDUCE_MIN");
+                RETURN_FALSE;
+            }
+            depth_reduction = (int)r;
+        }
+        mip_levels = 1;
+        for (int d = width > height ? width : height; d > 1; d >>= 1) mip_levels++;
+        samples = 1;
+    }
+
     /* Create VioRenderTarget object */
     zval rt_zval;
     object_init_ex(&rt_zval, vio_render_target_ce);
@@ -11644,6 +11671,7 @@ ZEND_FUNCTION(vio_render_target)
     rt->is_cube    = is_cube;
     rt->layers     = layers;
     rt->mip_levels = mip_levels;
+    rt->depth_reduction = depth_reduction;
     rt->backend    = ctx->backend;
     rt->attachment_count = attachment_count;
     memcpy(rt->formats, formats, sizeof(formats));
@@ -11855,7 +11883,8 @@ ZEND_FUNCTION(vio_generate_mipmaps)
     int kind = -1;
     if (instanceof_function(Z_OBJCE_P(obj_zval), vio_render_target_ce)) {
         vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(obj_zval);
-        if (!rt->valid || rt->depth_only || rt->layers > 1) RETURN_FALSE;   /* array targets have no mip chain */
+        /* Array targets have no mip chain; a depth target only with 'mipmaps' (A26). */
+        if (!rt->valid || rt->layers > 1 || (rt->depth_only && (rt->mip_levels < 2 || rt->is_cube))) RETURN_FALSE;
         obj = rt; kind = 0;
     } else if (instanceof_function(Z_OBJCE_P(obj_zval), vio_texture_ce)) {
         vio_texture_object *t = Z_VIO_TEXTURE_P(obj_zval);

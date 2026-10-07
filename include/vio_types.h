@@ -391,6 +391,9 @@ typedef enum _vio_feature {
     /* VIO_FORMAT_ASTC_* textures (A20): Metal on Apple GPUs, Vulkan with
      * textureCompressionASTC_LDR, GL with the KHR extension; D3D has no ASTC. */
     VIO_FEATURE_TEXTURE_COMPRESSION_ASTC = 62,
+    /* depth_only render targets with a mip chain built by vio_generate_mipmaps as
+     * a max / min reduction of the 2x2 texels below (Hi-Z, OPEN-ITEMS-PLAN A26). */
+    VIO_FEATURE_DEPTH_MIPMAPS = 63,
 } vio_feature;
 
 /* Component types of a cooperative-matrix shape. */
@@ -564,6 +567,10 @@ typedef struct _vio_adapter_info {
     uint64_t    vram_bytes;
     uint64_t    features;
 } vio_adapter_info;
+
+/* Depth mip reduction (A26). */
+#define VIO_DEPTH_REDUCE_MAX 0
+#define VIO_DEPTH_REDUCE_MIN 1
 
 /* Vendor name for a PCI vendor id (vio_backend_info / vio_adapters). */
 static inline const char *vio_vendor_name(uint32_t id)

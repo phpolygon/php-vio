@@ -1358,8 +1358,13 @@ static int opengl_create_render_target(void *rt_ptr, int width, int height, int 
      * reads the depth plane (GL_DEPTH_STENCIL_TEXTURE_MODE defaults to depth). */
     glGenTextures(1, &rt->depth_texture);
     glBindTexture(GL_TEXTURE_2D, rt->depth_texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, width, height,
-        0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+    /* depth_only + 'mipmaps' (A26): every level, levels > 0 filled by vio_generate_mipmaps. */
+    for (int l = 0; l < (depth_only && rt->mip_levels > 1 ? rt->mip_levels : 1); l++) {
+        int lw = width >> l, lh = height >> l;
+        glTexImage2D(GL_TEXTURE_2D, l, GL_DEPTH24_STENCIL8, lw > 0 ? lw : 1, lh > 0 ? lh : 1,
+            0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, depth_only && rt->mip_levels > 1 ? rt->mip_levels - 1 : 0);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
@@ -1622,6 +1627,108 @@ static int opengl_update_texture(void *tex_obj, const void *pixels, int x, int y
     return 0;
 }
 
+/* Depth mip chain (A26): each level is the max / min of the 2x2 texels below,
+ * written as gl_FragDepth by a full-screen triangle; the depth texture's base
+ * level is pinned to the source level so sampling never sees the target. Odd
+ * sizes fold the extra column / row into the last texel. */
+static const char *gl_depth_reduce_vs =
+    "#version 330 core\n"
+    "void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+static const char *gl_depth_reduce_fs =
+    "#version 330 core\n"
+    "uniform sampler2D u_src; uniform int u_mode; uniform ivec2 u_src_size; uniform ivec2 u_dst_size;\n"
+    "void main() {\n"
+    "    ivec2 o = ivec2(gl_FragCoord.xy);\n"
+    "    ivec2 n = ivec2((o.x == u_dst_size.x - 1 && (u_src_size.x & 1) == 1 && u_src_size.x > 1) ? 3 : 2,\n"
+    "                    (o.y == u_dst_size.y - 1 && (u_src_size.y & 1) == 1 && u_src_size.y > 1) ? 3 : 2);\n"
+    "    float d = u_mode == 0 ? 0.0 : 1.0;\n"
+    "    for (int y = 0; y < 3; y++) for (int x = 0; x < 3; x++) {\n"
+    "        if (x >= n.x || y >= n.y) continue;\n"
+    "        float s = texelFetch(u_src, min(o * 2 + ivec2(x, y), u_src_size - 1), 0).r;\n"
+    "        d = u_mode == 0 ? max(d, s) : min(d, s);\n"
+    "    }\n"
+    "    gl_FragDepth = d;\n"
+    "}\n";
+static GLuint gl_depth_reduce_prog = 0, gl_depth_reduce_vao = 0;
+static unsigned int gl_depth_reduce_gen = 0;
+
+static int gl_generate_depth_mips(vio_render_target_object *rt)
+{
+    if (!rt->depth_texture || rt->mip_levels < 2) return -1;
+    if (!gl_depth_reduce_prog || gl_depth_reduce_gen != gl_context_generation) {
+        gl_depth_reduce_prog = vio_opengl_compile_shader_source(gl_depth_reduce_vs, gl_depth_reduce_fs);
+        glGenVertexArrays(1, &gl_depth_reduce_vao);
+        gl_depth_reduce_gen = gl_context_generation;
+        if (!gl_depth_reduce_prog) return -1;
+    }
+    GLint prev_fbo = 0, prev_prog = 0, prev_vao = 0, prev_active = 0, prev_tex = 0, prev_func = GL_LESS, vp[4];
+    GLboolean prev_mask = GL_TRUE;
+    GLboolean prev_test = glIsEnabled(GL_DEPTH_TEST), prev_scissor = glIsEnabled(GL_SCISSOR_TEST), prev_cull = glIsEnabled(GL_CULL_FACE);
+    GLboolean prev_stencil = glIsEnabled(GL_STENCIL_TEST);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev_vao);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+    glGetIntegerv(GL_VIEWPORT, vp);
+    glGetIntegerv(GL_DEPTH_FUNC, &prev_func);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &prev_mask);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+    glUseProgram(gl_depth_reduce_prog);
+    glBindVertexArray(gl_depth_reduce_vao);
+    glBindTexture(GL_TEXTURE_2D, rt->depth_texture);
+    glUniform1i(glGetUniformLocation(gl_depth_reduce_prog, "u_src"), 0);
+    glUniform1i(glGetUniformLocation(gl_depth_reduce_prog, "u_mode"), rt->depth_reduction == VIO_DEPTH_REDUCE_MIN ? 1 : 0);
+    GLint loc_src = glGetUniformLocation(gl_depth_reduce_prog, "u_src_size");
+    GLint loc_dst = glGetUniformLocation(gl_depth_reduce_prog, "u_dst_size");
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_ALWAYS);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_STENCIL_TEST);
+    int ok = 1;
+    for (int l = 1; l < rt->mip_levels && ok; l++) {
+        int sw = rt->width >> (l - 1), sh = rt->height >> (l - 1);
+        int dw = rt->width >> l, dh = rt->height >> l;
+        if (sw < 1) sw = 1;
+        if (sh < 1) sh = 1;
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, l - 1);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, l - 1);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, rt->depth_texture, l);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { ok = 0; break; }
+        glViewport(0, 0, dw, dh);
+        glUniform2i(loc_src, sw, sh);
+        glUniform2i(loc_dst, dw, dh);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, rt->mip_levels - 1);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+    glDeleteFramebuffers(1, &fbo);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    glActiveTexture((GLenum)prev_active);
+    glUseProgram((GLuint)prev_prog);
+    glBindVertexArray((GLuint)prev_vao);
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+    glDepthFunc((GLenum)prev_func);
+    glDepthMask(prev_mask);
+    if (!prev_test) glDisable(GL_DEPTH_TEST);
+    if (prev_scissor) glEnable(GL_SCISSOR_TEST);
+    if (prev_cull) glEnable(GL_CULL_FACE);
+    if (prev_stencil) glEnable(GL_STENCIL_TEST);
+    return ok ? 0 : -1;
+}
+
 static int opengl_generate_mipmaps(void *obj, int kind)
 {
     if (!obj || !vio_gl.initialized) return -1;
@@ -1630,6 +1737,7 @@ static int opengl_generate_mipmaps(void *obj, int kind)
     switch (kind) {
         case 0: {
             vio_render_target_object *rt = (vio_render_target_object *)obj;
+            if (rt->backend_type == VIO_RT_BACKEND_OPENGL && rt->depth_only) return gl_generate_depth_mips(rt);
             if (rt->backend_type != VIO_RT_BACKEND_OPENGL || !rt->color_texture) return -1;
             target = rt->is_cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
             id = rt->color_texture;
@@ -2842,6 +2950,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_MULTI_VIEWPORT: return vio_gl.initialized && glViewportIndexedf != NULL &&
                                                 (gl_ge(4, 1) || gl_has_ext("GL_ARB_viewport_array"));
         case VIO_FEATURE_TEXTURE_COMPRESSION_ASTC: return vio_gl.initialized && opengl_has_texfmt(VIO_FORMAT_ASTC_4x4);
+        case VIO_FEATURE_DEPTH_MIPMAPS: return vio_gl.initialized;   /* gl_generate_depth_mips (A26) */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC:                                          /* S3TC ext (BC1/BC3) + core RGTC; BC7 needs BPTC / 4.2 */
             return vio_gl.initialized && gl_has_ext("GL_EXT_texture_compression_s3tc");
         case VIO_FEATURE_CUBEMAP:        return 1;
