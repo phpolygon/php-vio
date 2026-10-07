@@ -290,6 +290,8 @@ typedef struct _vio_vulkan_state {
     int                      draw_parameters_supported; /* shaderDrawParameters + drawIndirectFirstInstance enabled */
     int                      compute_derivatives_supported; /* VK_NV / KHR_compute_shader_derivatives (quads) enabled */
     int                      multiview_supported;       /* VkPhysicalDeviceMultiviewFeatures.multiview enabled (core 1.1) */
+    int                      multiview_geometry;        /* ... multiviewGeometryShader (with geometryShader) */
+    int                      multiview_tessellation;    /* ... multiviewTessellationShader (with tessellationShader) */
     /* Inline ray tracing (VIO_FEATURE_RAY_QUERY): accelerationStructure + rayQuery +
      * bufferDeviceAddress enabled, the KHR entry points, and the structure bound
      * with vio_bind_acceleration_structure (a VkAccelerationStructureKHR handle). */

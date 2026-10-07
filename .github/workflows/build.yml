@@ -162,7 +162,8 @@ jobs:
             tests/render3d/179_bindless_compute_all_backends.phpt \
             tests/render3d/180_separate_texture_sampler_all_backends.phpt \
             tests/render3d/181_base_vertex_below_sm68.phpt \
-            tests/render3d/182_multiview_instancing_emulation.phpt
+            tests/render3d/182_multiview_instancing_emulation.phpt \
+            tests/render3d/183_multiview_geometry_tessellation.phpt
 
       - name: Package binary
         run: |
@@ -322,7 +323,8 @@ jobs:
             tests/render3d/179_bindless_compute_all_backends.phpt \
             tests/render3d/180_separate_texture_sampler_all_backends.phpt \
             tests/render3d/181_base_vertex_below_sm68.phpt \
-            tests/render3d/182_multiview_instancing_emulation.phpt
+            tests/render3d/182_multiview_instancing_emulation.phpt \
+            tests/render3d/183_multiview_geometry_tessellation.phpt
 
       - name: Package binary
         run: |
@@ -726,6 +728,7 @@ jobs:
             tests/render3d/180_separate_texture_sampler_all_backends.phpt `
             tests/render3d/181_base_vertex_below_sm68.phpt `
             tests/render3d/182_multiview_instancing_emulation.phpt `
+            tests/render3d/183_multiview_geometry_tessellation.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt
 
       - name: Package binary

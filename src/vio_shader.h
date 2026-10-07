@@ -69,6 +69,10 @@ typedef struct _vio_shader_object {
      * their own): the rewritten vertex / fragment GLSL that was compiled. */
     int               view_emulated;
     char             *mv_src[2];
+    /* View forwarded from the vertex stage (backends whose geometry /
+     * tessellation stages cannot read the view, A27): rewritten GLSL of the
+     * geometry, tess-control and tess-eval stages. */
+    char             *mv_stage_src[VIO_EXTRA_STAGE_COUNT];
     /* Mesh pipeline (VIO_FEATURE_MESH_SHADER): vert_spirv holds the MESH stage
      * (it takes the vertex stage's role for uniforms / reflection), task_spirv
      * the optional task stage. */
@@ -123,6 +127,12 @@ void vio_shader_register(void);
  * writes gl_Layer and hands the view to the fragment stage at location 31.
  * malloc'd, NULL on failure. */
 char *vio_glsl_multiview_instancing(const char *src, int fragment, int views);
+
+/* GLSL that hands gl_ViewIndex from the vertex stage to geometry / tessellation
+ * stages through an int varying at location 30 (stage: VIO_STAGE_*). The vertex
+ * stage writes it, tess-control forwards it per control point, geometry and
+ * tess-eval read it in place of gl_ViewIndex. malloc'd, NULL on failure. */
+char *vio_glsl_multiview_forward(const char *src, int stage);
 
 static inline vio_shader_object *vio_shader_from_obj(zend_object *obj) {
     return (vio_shader_object *)((char *)obj - XtOffsetOf(vio_shader_object, std));

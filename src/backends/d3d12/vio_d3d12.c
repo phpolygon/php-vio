@@ -7717,6 +7717,9 @@ static int d3d12_supports_feature(vio_feature feature)
                                               && vio_d3d12.raytracing_tier >= D3D12_RAYTRACING_TIER_1_1;
         /* View instancing (SV_ViewID, SM 6.1) through a pipeline-state stream. */
         case VIO_FEATURE_MULTIVIEW:    return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 61 && vio_d3d12.view_instancing > 0;
+        /* SV_ViewID is valid in every stage of a view-instanced PSO (A27). */
+        case VIO_FEATURE_MULTIVIEW_GEOMETRY:     return d3d12_supports_feature(VIO_FEATURE_MULTIVIEW) && d3d12_supports_feature(VIO_FEATURE_GEOMETRY);
+        case VIO_FEATURE_MULTIVIEW_TESSELLATION: return d3d12_supports_feature(VIO_FEATURE_MULTIVIEW) && d3d12_supports_feature(VIO_FEATURE_TESSELLATION);
         case VIO_FEATURE_SHADER_FLOAT16: return vio_d3d12.shader_model == 6 && vio_d3d12.native16;   /* SM 6.2 half */
         /* SV_Start*Location from SM 6.8, below that the b13 root constants (A11). */
         case VIO_FEATURE_BASE_VERTEX:  return 1;
@@ -7841,6 +7844,13 @@ static void d3d12_draw_instanced_from_storage(void *mesh_obj, int instance_count
 
 /* Indirect draw (GAP-PHASE5 Block 8): ExecuteIndirect with a DrawIndexed / Draw
  * command signature over max_draws records of the argument buffer. */
+/* SPIRV-Cross' HLSL backend reads SV_ViewID in VS and PS only: vio_shader hands the
+ * view to geometry / tessellation stages from the vertex stage (A27). */
+static int d3d12_multiview_view_from_vertex(void)
+{
+    return 1;
+}
+
 static ID3D12CommandSignature *d3d12_indirect_signature(int indexed)
 {
     ID3D12CommandSignature **slot = indexed ? &vio_d3d12.cmdsig_indexed : &vio_d3d12.cmdsig_plain;
@@ -8504,6 +8514,7 @@ static const vio_backend d3d12_backend = {
     .bind_storage_buffer          = d3d12_bind_storage_buffer,
     .draw_instanced_from_storage  = d3d12_draw_instanced_from_storage,
     .supports_feature  = d3d12_supports_feature,
+    .multiview_view_from_vertex = d3d12_multiview_view_from_vertex,
     .apply_mesh_layout = d3d12_apply_mesh_layout,
     .gpu_frame_time    = d3d12_gpu_frame_time,
     .gpu_mark          = d3d12_gpu_mark,

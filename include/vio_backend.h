@@ -479,6 +479,11 @@ typedef struct _vio_backend {
      * layer from the vertex stage. NULL / 0 => native views (or SPIRV-Cross's
      * own emulation on Metal). */
     int (*multiview_via_instancing)(void);
+
+    /* 1 when geometry / tessellation stages cannot read the view themselves
+     * (SPIRV-Cross' HLSL backend takes SV_ViewID in VS and PS only): vio_shader
+     * then forwards it from the vertex stage (vio_glsl_multiview_forward). */
+    int (*multiview_view_from_vertex)(void);
 } vio_backend;
 
 /*

@@ -381,6 +381,13 @@ typedef enum _vio_feature {
      * node shaders). D3D12: OPTIONS21.WorkGraphsTier >= 1_0 + SM 6.8 (usually
      * through the Agility SDK, vio_create(['agility_sdk' => dir])); 0 elsewhere. */
     VIO_FEATURE_WORK_GRAPHS        = 58,
+    /* vio_shader 'view_count' together with a geometry stage / a tessellation pair
+     * (gl_ViewIndex in those stages, OPEN-ITEMS-PLAN A27). Vulkan:
+     * multiviewGeometryShader / multiviewTessellationShader; D3D12: view
+     * instancing (SV_ViewID in every stage). 0 on GL (GL_OVR_multiview rules the
+     * stages out), D3D11 and Metal (their multiview is instancing in the vertex stage). */
+    VIO_FEATURE_MULTIVIEW_GEOMETRY     = 60,
+    VIO_FEATURE_MULTIVIEW_TESSELLATION = 61,
 } vio_feature;
 
 /* Component types of a cooperative-matrix shape. */

@@ -551,6 +551,15 @@ static int create_logical_device(void)
             if (mv_avail.multiview) {
                 mv_enable.multiview = VK_TRUE;
                 vio_vk.multiview_supported = 1;
+                /* gl_ViewIndex in geometry / tessellation stages (OPEN-ITEMS-PLAN A27). */
+                if (mv_avail.multiviewGeometryShader && vio_vk.geometry_supported) {
+                    mv_enable.multiviewGeometryShader = VK_TRUE;
+                    vio_vk.multiview_geometry = 1;
+                }
+                if (mv_avail.multiviewTessellationShader && vio_vk.tessellation_supported) {
+                    mv_enable.multiviewTessellationShader = VK_TRUE;
+                    vio_vk.multiview_tessellation = 1;
+                }
             }
             if (has_f16 && f16_avail.shaderFloat16) {
                 f16_enable.shaderFloat16 = VK_TRUE;
@@ -4697,6 +4706,8 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_COOPERATIVE_MATRIX: return vio_vk.device && vio_vk.coopmat_shape_count > 0; /* VK_KHR_cooperative_matrix */
         case VIO_FEATURE_RAYTRACING:   return vio_vk3d_available() && vio_vk.device && vio_vk.rt_pipeline_supported; /* VK_KHR_ray_tracing_pipeline */
         case VIO_FEATURE_MULTIVIEW:    return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_supported; /* VkRenderPassMultiviewCreateInfo */
+        case VIO_FEATURE_MULTIVIEW_GEOMETRY:     return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_geometry;
+        case VIO_FEATURE_MULTIVIEW_TESSELLATION: return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_tessellation;
         case VIO_FEATURE_RAY_QUERY:    return vio_vk3d_available() && vio_vk.device && vio_vk.ray_query_supported; /* VK_KHR_ray_query */
         case VIO_FEATURE_READ_PIXELS:  return 1; /* vkCmdCopyImageToBuffer readback of a RE-ACQUIRED swapchain image (see vulkan_read_pixels); requires the swapchain's TRANSFER_SRC usage added in create_swapchain */
         case VIO_FEATURE_INSTANCED_DRAW: return vio_vk3d_available(); /* per-instance binding 1 from the frame ring */

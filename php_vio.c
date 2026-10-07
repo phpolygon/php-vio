@@ -2593,7 +2593,8 @@ static int vio_shader_compile_extra_stages(vio_shader_object *shader, zval **ext
         if (!extra_zv[i] || shader->stage_spirv[i]) continue;
         char *error_msg = NULL;
         shader->stage_spirv[i] = vio_compile_glsl_stage_to_spirv(
-            Z_STRVAL_P(extra_zv[i]), VIO_STAGE_GEOMETRY + i, &shader->stage_spirv_size[i], &error_msg);
+            shader->mv_stage_src[i] ? shader->mv_stage_src[i] : Z_STRVAL_P(extra_zv[i]),
+            VIO_STAGE_GEOMETRY + i, &shader->stage_spirv_size[i], &error_msg);
         if (!shader->stage_spirv[i]) {
             php_error_docref(NULL, E_WARNING, "%s shader compilation failed: %s",
                 vio_extra_stage_labels[i], error_msg ? error_msg : "unknown error");
@@ -2851,8 +2852,10 @@ ZEND_FUNCTION(vio_shader)
                                  ctx->backend->name);
                 RETURN_FALSE;
             }
-            if (want_geometry || want_tess) {
-                php_error_docref(NULL, E_WARNING, "vio_shader: 'view_count' with geometry / tessellation stages is not supported");
+            if ((want_geometry && !ctx->backend->supports_feature(VIO_FEATURE_MULTIVIEW_GEOMETRY))
+                || (want_tess && !ctx->backend->supports_feature(VIO_FEATURE_MULTIVIEW_TESSELLATION))) {
+                php_error_docref(NULL, E_WARNING, "vio_shader: 'view_count' with %s stages needs VIO_FEATURE_MULTIVIEW_%s on backend '%s'",
+                                 want_geometry ? "geometry" : "tessellation", want_geometry ? "GEOMETRY" : "TESSELLATION", ctx->backend->name);
                 RETURN_FALSE;
             }
             view_count = (int)n;
@@ -2939,6 +2942,28 @@ ZEND_FUNCTION(vio_shader)
             RETURN_FALSE;
         }
         shader->view_emulated = 1;
+    }
+    /* gl_ViewIndex in geometry / tessellation stages that the backend can only give
+     * the vertex stage (A27): the vertex stage forwards it. */
+    if (view_count > 1 && (want_geometry || want_tess) && !shader->view_emulated
+        && ctx->backend->multiview_view_from_vertex && ctx->backend->multiview_view_from_vertex()) {
+        if (format != VIO_SHADER_GLSL) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: 'view_count' with geometry / tessellation stages on backend '%s' needs GLSL source", ctx->backend->name);
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
+        shader->mv_src[0] = vio_glsl_multiview_forward(Z_STRVAL_P(vert_zval), VIO_STAGE_VERTEX);
+        int ok = shader->mv_src[0] != NULL;
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT && ok; i++) {
+            if (!extra_zv[i]) continue;
+            shader->mv_stage_src[i] = vio_glsl_multiview_forward(Z_STRVAL_P(extra_zv[i]), VIO_STAGE_GEOMETRY + i);
+            ok = shader->mv_stage_src[i] != NULL;
+        }
+        if (!ok) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: could not forward gl_ViewIndex to the geometry / tessellation stages");
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
     }
     const char *vert_src = shader->mv_src[0] ? shader->mv_src[0] : Z_STRVAL_P(vert_zval);
     const char *frag_src = shader->mv_src[1] ? shader->mv_src[1] : Z_STRVAL_P(frag_zval);
@@ -9649,6 +9674,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SAMPLER_FEEDBACK", VIO_FEATURE_SAMPLER_FEEDBACK, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_COOPERATIVE_MATRIX", VIO_FEATURE_COOPERATIVE_MATRIX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_WORK_GRAPHS", VIO_FEATURE_WORK_GRAPHS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTIVIEW_GEOMETRY", VIO_FEATURE_MULTIVIEW_GEOMETRY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTIVIEW_TESSELLATION", VIO_FEATURE_MULTIVIEW_TESSELLATION, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);

@@ -89,6 +89,49 @@ char *vio_glsl_multiview_instancing(const char *src, int fragment, int views)
     return out;
 }
 
+/* Insert `stmt` right after the opening brace of main(). */
+static char *vio_glsl_main_prologue(const char *src, size_t head_at, const char *head, const char *stmt)
+{
+    const char *m = strstr(src, "void main");
+    const char *brace = m ? strchr(m, '{') : NULL;
+    size_t len = strlen(src), hl = strlen(head), sl = stmt ? strlen(stmt) : 0;
+    if (stmt && !brace) return NULL;
+    size_t b = brace ? (size_t)(brace - src) + 1 : len;
+    if (b < head_at) return NULL;
+    char *out = (char *)malloc(len + hl + sl + 1);
+    if (!out) return NULL;
+    char *w = out;
+    memcpy(w, src, head_at); w += head_at;
+    memcpy(w, head, hl); w += hl;
+    memcpy(w, src + head_at, b - head_at); w += b - head_at;
+    if (sl) { memcpy(w, stmt, sl); w += sl; }
+    memcpy(w, src + b, len - b + 1);
+    return out;
+}
+
+char *vio_glsl_multiview_forward(const char *src, int stage)
+{
+    if (!src) return NULL;
+    size_t at = vio_glsl_header_end(src);
+    switch (stage) {
+        case VIO_STAGE_VERTEX:
+            return vio_glsl_main_prologue(src, at,
+                "#extension GL" "_EXT_multiview : enable\nlayout(location = 30) out int vio_mv_fwd;\n",   /* split: audit gate 070 */
+                " vio_mv_fwd = int(gl_ViewIndex); ");
+        case VIO_STAGE_TESS_CONTROL:
+            return vio_glsl_main_prologue(src, at,
+                "layout(location = 30) in int vio_mv_fwd[];\nlayout(location = 30) out int vio_mv_fwd_out[];\n"
+                "#define gl_ViewIndex vio_mv_fwd[gl_InvocationID]\n",
+                " vio_mv_fwd_out[gl_InvocationID] = vio_mv_fwd[gl_InvocationID]; ");
+        case VIO_STAGE_TESS_EVAL:
+        case VIO_STAGE_GEOMETRY:
+            return vio_glsl_main_prologue(src, at,
+                "layout(location = 30) in int vio_mv_fwd[];\n#define gl_ViewIndex vio_mv_fwd[0]\n", NULL);
+        default:
+            return NULL;
+    }
+}
+
 static void vio_shader_free_object(zend_object *obj)
 {
     vio_shader_object *shader = vio_shader_from_obj(obj);
@@ -103,6 +146,7 @@ static void vio_shader_free_object(zend_object *obj)
     free(shader->mv_src[0]);
     free(shader->mv_src[1]);
     shader->mv_src[0] = shader->mv_src[1] = NULL;
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) { free(shader->mv_stage_src[i]); shader->mv_stage_src[i] = NULL; }
 
     if (shader->vert_spirv) {
         free(shader->vert_spirv);

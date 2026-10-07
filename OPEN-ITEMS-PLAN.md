@@ -29,7 +29,7 @@ Größe: S ≤ ½ Tag, M ≈ 1–2 Tage, L = mehrere Tage. Nummern A1–A41 stam
 | B4/B5* ✅ | GL: Rohquelltext-Fallback, wenn SPIRV-Cross Subgroup-/Quad-Ops ablehnt; `SUBGROUP`/`SUBGROUP_QUAD` folgen dem Treiber (Tests 149/152 laufen auf GL) | GL | M |
 | A11 ✅ | D3D12 Draw-Parameter unter SM 6.8 per Root-Konstante, auch FXC und indirekte Multi-Draws (Test 181) | D3D12 | S–M |
 | A10 ✅ | Multiview-Emulation per Instancing (Tests 158 / 182) | D3D11, GL ohne OVR | M |
-| A27 | `view_count` zusammen mit GS-/Tess-Stages | alle | M |
+| A27 ✅ | `view_count` zusammen mit GS-/Tess-Stages: Vulkan nativ, D3D12 über eine aus dem VS durchgereichte View; GL (OVR schließt die Stages aus), D3D11 und Metal (View per Instancing im VS) melden 0 (Test 183) | Vulkan, D3D12 | M |
 
 ## Batch 3 — Backend-Auswahl (BACKEND-SELECTION-PLAN)
 A4 `describe` für D3D12/Vulkan/GL · A6 `vio_adapters()` · A7 Scoring für `auto` · A8 Kalibrierlauf mit Cache.
