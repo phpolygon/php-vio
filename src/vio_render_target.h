@@ -62,6 +62,8 @@ typedef struct _vio_render_target_object {
     void        *d3d11_msaa_face_rtvs;        /* cube / array MSAA (A24): RTV per layer of the MS array, + all layers */
     void        *d3d11_msaa_face_dsvs;        /* ... and the DSVs of the MS depth array */
     int          d3d11_msaa_layer;            /* layer the MS views render into (-1 = all) */
+    void        *d3d11_msaa_dsv;              /* depth_only MSAA (A24): DSV / SRV of the MS depth (d3d11_msaa_depth_tex) */
+    void        *d3d11_msaa_depth_srv;
     void        *d3d11_msaa_depth_tex;        /* ID3D11Texture2D* (multisampled) */
     int          d3d11_msaa_dirty;            /* 1 => resolve needed before sampling / readback */
 
