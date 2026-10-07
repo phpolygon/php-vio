@@ -277,6 +277,27 @@ char *vio_glsl_require_viewport_layer_ext(char *glsl)
     return out;
 }
 
+/* SPIRV-Cross before vulkan-sdk-1.3.275 (Ubuntu 24.04) writes `perprimitiveEXT`
+ * fragment inputs without enabling GL_EXT_mesh_shader, which glslang then
+ * rejects. Takes ownership of `glsl` (malloc'd). */
+char *vio_glsl_require_mesh_shader_ext(char *glsl)
+{
+    static const char name[] = "GL_" "EXT_mesh_shader";
+    if (!glsl || !strstr(glsl, "perprimitiveEXT") || strstr(glsl, name)) return glsl;
+    const char *nl = strstr(glsl, "#version");
+    nl = nl ? strchr(nl, '\n') : NULL;
+    if (!nl) return glsl;
+    static const char ext[] = "#extension GL_" "EXT_mesh_shader : require\n";
+    size_t head = (size_t)(nl + 1 - glsl), len = strlen(glsl);
+    char *out = (char *)malloc(len + sizeof(ext));
+    if (!out) return glsl;
+    memcpy(out, glsl, head);
+    memcpy(out + head, ext, sizeof(ext) - 1);
+    memcpy(out + head + sizeof(ext) - 1, glsl + head, len - head + 1);
+    free(glsl);
+    return out;
+}
+
 /* SPIRV-Cross before vulkan-sdk-1.3.275 (Ubuntu 24.04 ships 1.3.268) has no
  * GLSL name for BuiltIn PatchVertices and emits `gl_BuiltIn_14`, which the GL
  * compiler rejects. Takes ownership of `glsl` (malloc'd). */
