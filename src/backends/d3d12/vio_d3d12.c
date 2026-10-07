@@ -587,11 +587,39 @@ static int d3d12_create_root_signature(void)
         static_samplers[s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
 
+    /* [14] Bindless table (vio_texture_index, BINDLESS-PLAN.md): an unbounded
+     * SRV range t0.. in register space 1 for every stage, and its sampler as a
+     * static s1 / space1 (linear, repeat) - the GLSL contract's Set 1 binding 0
+     * / 1. Only with Resource Binding Tier 2+ (unbounded ranges). */
+    D3D12_DESCRIPTOR_RANGE bindless_range = {0};
+    bindless_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    bindless_range.NumDescriptors = UINT_MAX;   /* unbounded */
+    bindless_range.BaseShaderRegister = 0;
+    bindless_range.RegisterSpace = 1;
+    bindless_range.OffsetInDescriptorsFromTableStart = 0;
+    params[VIO_D3D12_RP_BINDLESS].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[VIO_D3D12_RP_BINDLESS].DescriptorTable.NumDescriptorRanges = 1;
+    params[VIO_D3D12_RP_BINDLESS].DescriptorTable.pDescriptorRanges = &bindless_range;
+    params[VIO_D3D12_RP_BINDLESS].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_STATIC_SAMPLER_DESC all_samplers[5];
+    memcpy(all_samplers, static_samplers, sizeof(static_samplers));
+    memset(&all_samplers[4], 0, sizeof(all_samplers[4]));
+    all_samplers[4].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    all_samplers[4].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    all_samplers[4].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    all_samplers[4].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    all_samplers[4].ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    all_samplers[4].MaxLOD = D3D12_FLOAT32_MAX;
+    all_samplers[4].ShaderRegister = 1;
+    all_samplers[4].RegisterSpace = 1;
+    all_samplers[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-    rs_desc.NumParameters = VIO_D3D12_RP_COUNT; /* VS CBV, PS CBV, PS SRV table, VS storage SRV, PS sampler table, GS/HS/DS mirrors */
+    /* VS CBV, PS CBV, PS SRV table, VS storage SRV, PS sampler table, GS/HS/DS mirrors (+ bindless table) */
+    rs_desc.NumParameters = vio_d3d12.bindless ? VIO_D3D12_RP_COUNT : VIO_D3D12_RP_BINDLESS;
     rs_desc.pParameters = params;
-    rs_desc.NumStaticSamplers = 4;
-    rs_desc.pStaticSamplers = static_samplers;
+    rs_desc.NumStaticSamplers = vio_d3d12.bindless ? 5 : 4;
+    rs_desc.pStaticSamplers = all_samplers;
     rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     ID3DBlob *signature_blob = NULL;
@@ -1080,6 +1108,16 @@ static int d3d12_init(vio_config *cfg)
         goto init_fail;
     }
 
+    /* Bindless texture table (vio_texture_index) needs unbounded descriptor
+     * tables: Resource Binding Tier 2 (the root signature below adds the table
+     * only then). */
+    vio_d3d12.bindless = 0;
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS o0 = {0};
+        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS, &o0, sizeof(o0))))
+            vio_d3d12.bindless = o0.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2;
+    }
+
     /* GPU-visible SRV/CBV/UAV heap */
     if (d3d12_create_descriptor_heap(&vio_d3d12.srv_heap.heap,
                                       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -1091,6 +1129,24 @@ static int d3d12_init(vio_config *cfg)
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     vio_d3d12.srv_heap.capacity = VIO_D3D12_MAX_SRV_DESCRIPTORS;
     vio_d3d12.srv_heap.count = 0;
+    if (vio_d3d12.bindless) {
+        /* The top VIO_BINDLESS_MAX descriptors are the bindless table: static
+         * SRVs grow down below them, the per-frame region stays under those.
+         * Null Texture2D SRVs until vio_texture_index fills a slot. */
+        vio_d3d12.bindless_base = VIO_D3D12_MAX_SRV_DESCRIPTORS - VIO_BINDLESS_MAX;
+        vio_d3d12.srv_heap.count = VIO_BINDLESS_MAX;
+        D3D12_SHADER_RESOURCE_VIEW_DESC nd = {0};
+        nd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nd.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE h;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &h);
+        for (UINT i = 0; i < VIO_BINDLESS_MAX; i++) {
+            D3D12_CPU_DESCRIPTOR_HANDLE d = { h.ptr + (SIZE_T)(vio_d3d12.bindless_base + i) * vio_d3d12.srv_heap.descriptor_size };
+            ID3D12Device_CreateShaderResourceView(vio_d3d12.device, NULL, &nd, d);
+        }
+    }
 
     /* CPU-only staging mirror — texture SRVs live here so they can serve as
      * the source of CopyDescriptorsSimple into the per-frame shader-visible
@@ -1749,6 +1805,7 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     pipeline->topology = vio_topology_to_d3d12(topo, desc->patch_vertices);
     pipeline->has_gs = shader->gs_blob != NULL;
     pipeline->writes_shading_rate = shader->writes_shading_rate;
+    pipeline->uses_bindless = shader->uses_bindless;
     pipeline->has_hs = shader->hs_blob != NULL;
     pipeline->has_ds = shader->ds_blob != NULL;
 
@@ -2007,6 +2064,32 @@ static void d3d12_destroy_pipeline(void *pipeline_ptr)
 /* Multiview: enable every view of the bound PSO (views 0..N-1 -> slices
  * 0..N-1). The mask is command-list state that a Reset clears, so every draw
  * re-arms it. */
+/* Bindless table (vio_texture_index): root table [14] at the reserved block
+ * for pipelines whose shader reads it. Root arguments do not survive
+ * SetGraphicsRootSignature, so every draw re-points it (cheap). */
+static void d3d12_apply_bindless(void)
+{
+    vio_d3d12_pipeline *p = d3d12_current_pipeline;
+    if (!p || !p->uses_bindless || !vio_d3d12.bindless || !vio_d3d12.cmd_list) return;
+    D3D12_GPU_DESCRIPTOR_HANDLE g;
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &g);
+    g.ptr += (UINT64)vio_d3d12.bindless_base * vio_d3d12.srv_heap.descriptor_size;
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_BINDLESS, g);
+}
+
+static int d3d12_bindless_set(int slot, void *backend_texture)
+{
+    vio_d3d12_texture *t = (vio_d3d12_texture *)backend_texture;
+    if (!vio_d3d12.bindless || !t || !t->resource || !t->srv_cpu.ptr || t->depth > 0 || t->layers > 1
+        || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
+    D3D12_CPU_DESCRIPTOR_HANDLE d;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &d);
+    d.ptr += (SIZE_T)(vio_d3d12.bindless_base + (UINT)slot) * vio_d3d12.srv_heap.descriptor_size;
+    /* From the texture's staging (CPU-only) SRV into the shader-visible block. */
+    ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, d, t->srv_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return 0;
+}
+
 static void d3d12_apply_view_mask(void)
 {
     vio_d3d12_pipeline *p = d3d12_current_pipeline;
@@ -2023,6 +2106,7 @@ static void d3d12_rearm_pso_for_target(void)
     ID3D12PipelineState *pso = d3d12_pipeline_pso_for_target(d3d12_current_pipeline, vio_d3d12.current_rt_samples, vio_d3d12.current_rt_format);
     if (pso) ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list, pso);
     d3d12_apply_view_mask();
+    d3d12_apply_bindless();
 }
 
 static void d3d12_bind_pipeline(void *pipeline_ptr)
@@ -2044,6 +2128,7 @@ static void d3d12_bind_pipeline(void *pipeline_ptr)
      * params 2 / 4 (SetGraphicsRootSignature / SetDescriptorHeaps may reset
      * them), so the next flush rebuilds + re-points rather than reusing. */
     vio_d3d12_bind_graphics_heaps(vio_d3d12.cmd_list);
+    d3d12_apply_bindless();   /* after the heaps: a table must point into the bound heap */
 }
 
 /* ── Sampler combos + graphics heap binding (GAP-PLAN Phase 1) ─────── */
@@ -4371,6 +4456,8 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
 
     HRESULT hr;
 
+    /* Bindless table: SPIRV-Cross keeps Set 1 in register space 1. */
+    shader->uses_bindless = (hlsl_vs && strstr(hlsl_vs, "space1)")) || (hlsl_ps && strstr(hlsl_ps, "space1)"));
     hr = d3d12_compile_cached(hlsl_vs, "vs_main", "vs_5_1", compile_flags, &shader->vs_blob);
     if (FAILED(hr)) goto fail;
 
@@ -4795,6 +4882,7 @@ static void d3d12_draw(vio_draw_cmd *cmd)
 
     UINT instance_count = cmd->instance_count > 0 ? cmd->instance_count : 1;
     d3d12_apply_view_mask();
+    d3d12_apply_bindless();
     ID3D12GraphicsCommandList_DrawInstanced(vio_d3d12.cmd_list,
                                              cmd->vertex_count,
                                              instance_count,
@@ -4833,6 +4921,7 @@ static void d3d12_draw_indexed(vio_draw_indexed_cmd *cmd)
 
     UINT instance_count = cmd->instance_count > 0 ? cmd->instance_count : 1;
     d3d12_apply_view_mask();
+    d3d12_apply_bindless();
     ID3D12GraphicsCommandList_DrawIndexedInstanced(vio_d3d12.cmd_list,
                                                     cmd->index_count,
                                                     instance_count,
@@ -5933,6 +6022,9 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_SHADER_FLOAT16: return vio_d3d12.shader_model == 6 && vio_d3d12.native16;   /* SM 6.2 half */
         case VIO_FEATURE_BASE_VERTEX:  return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 68; /* SV_Start*Location */
         case VIO_FEATURE_COMPUTE_DERIVATIVES: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 66;
+        /* Unbounded SRV table in register space 1 (Resource Binding Tier 2+);
+         * works with FXC 5.1 and DXC. */
+        case VIO_FEATURE_BINDLESS:     return vio_d3d12.bindless;
         case VIO_FEATURE_ATOMIC64:     return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 66 && vio_d3d12.int64_ops;
         case VIO_FEATURE_BARYCENTRICS: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 61 && vio_d3d12.barycentrics;
         case VIO_FEATURE_RAYTRACING:   return 0; /* DXR possible but not implemented */
@@ -6025,10 +6117,12 @@ static void d3d12_draw_instanced_from_storage(void *mesh_obj, int instance_count
         ibv.Format = mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
         ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
         d3d12_apply_view_mask();
+        d3d12_apply_bindless();
         ID3D12GraphicsCommandList_DrawIndexedInstanced(vio_d3d12.cmd_list,
             (UINT)mesh->index_count, (UINT)instance_count, 0, 0, 0);
     } else {
         d3d12_apply_view_mask();
+        d3d12_apply_bindless();
         ID3D12GraphicsCommandList_DrawInstanced(vio_d3d12.cmd_list,
             (UINT)mesh->vertex_count, (UINT)instance_count, 0, 0);
     }
@@ -6098,6 +6192,7 @@ static void d3d12_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
         ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 2, b);
     }
     d3d12_apply_view_mask();
+    d3d12_apply_bindless();
     ID3D12GraphicsCommandList_ExecuteIndirect(vio_d3d12.cmd_list, sig, (UINT)max_draws, args->resource, (UINT64)offset, NULL, 0);
     if (live_uav) {
         D3D12_RESOURCE_BARRIER b = {0};
@@ -6467,6 +6562,7 @@ static const vio_backend d3d12_backend = {
     .supports_feature  = d3d12_supports_feature,
     .gpu_frame_time    = d3d12_gpu_frame_time,
     .swapchain_info    = d3d12_swapchain_info,
+    .bindless_set      = d3d12_bindless_set,
     .draw_indirect     = d3d12_draw_indirect,
     .set_shading_rate  = d3d12_set_shading_rate,
     .destroy_cubemap   = d3d12_destroy_cubemap,

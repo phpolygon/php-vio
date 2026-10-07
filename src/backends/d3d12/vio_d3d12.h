@@ -99,7 +99,8 @@
 #define VIO_D3D12_RP_GS_SAMPLER   11
 #define VIO_D3D12_RP_HS_SAMPLER   12
 #define VIO_D3D12_RP_DS_SAMPLER   13
-#define VIO_D3D12_RP_COUNT        14
+#define VIO_D3D12_RP_BINDLESS     14  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
+#define VIO_D3D12_RP_COUNT        15
 
 /* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
  * bytecode (NULL when the vio_shader has no such stage). */
@@ -117,6 +118,7 @@ typedef struct _vio_d3d12_shader {
     uint32_t  hs_input_points;
     UINT      compile_flags;
     int       writes_shading_rate;   /* the vertex stage writes SV_ShadingRate (gl_PrimitiveShadingRateEXT) */
+    int       uses_bindless;         /* reads the bindless table (register space 1, BINDLESS-PLAN.md) */
 } vio_d3d12_shader;
 
 /* Pipeline = PSO + root signature reference */
@@ -138,6 +140,7 @@ typedef struct _vio_d3d12_pipeline {
     ID3DBlob                *hs_variant;       /* owned; hull shader for this pipeline's patch size */
     int                      view_count;       /* multiview: view instancing views (2..4), 0 = off */
     int                      writes_shading_rate; /* the shader's vertex stage writes SV_ShadingRate */
+    int                      uses_bindless;    /* the shader reads the bindless table */
 } vio_d3d12_pipeline;
 
 /* Buffer wrapper */
@@ -308,6 +311,11 @@ typedef struct _vio_d3d12_state {
     int                        barycentrics;   /* OPTIONS3.BarycentricsSupported (SM 6.1) */
     int                        int64_ops;      /* OPTIONS1.Int64ShaderOps (64-bit integers in shaders) */
     int                        native16;       /* OPTIONS4.Native16BitShaderOpsSupported under SM 6.2+ */
+    /* Bindless table (vio_texture_index): ResourceBindingTier >= 2; the
+     * VIO_BINDLESS_MAX descriptors from bindless_base up in the shader-visible
+     * SRV heap are reserved for it (root parameter [14]). */
+    int                        bindless;
+    UINT                       bindless_base;
     int                        view_instancing; /* OPTIONS3.ViewInstancingTier (multiview, SV_ViewID needs SM 6.1) */
     /* Variable rate shading (GAP-PHASE5 Block 12): D3D12_VARIABLE_SHADING_RATE_TIER
      * (0 = none), the additional-rates cap (2x4 / 4x2 / 4x4), the sticky rate

@@ -389,6 +389,7 @@ ZEND_FUNCTION(vio_destroy)
 
     /* Release the draw-time bind table before the GPU objects behind it go away. */
     vio_pending_textures_clear(ctx);
+    vio_context_bindless_clear(ctx);
 
     /* A replay holds process-global virtual gamepads and hides the physical
      * ones; a destroyed context must give them back even while PHP still holds
@@ -7776,6 +7777,46 @@ ZEND_FUNCTION(vio_swapchain_info)
     add_assoc_long(return_value, "shader_model_version", info.shader_model_version);
 }
 
+/* vio_texture_index(): the texture's slot in the context's bindless table
+ * (BINDLESS-PLAN.md). The first call takes a slot and a reference; later calls
+ * return the same slot. */
+ZEND_FUNCTION(vio_texture_index)
+{
+    zval *ctx_zval, *tex_zval;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (!ctx->initialized || !ctx->backend || !ctx->backend->bindless_set
+        || !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_BINDLESS))) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_index: backend has no bindless textures (VIO_FEATURE_BINDLESS = 0)");
+        RETURN_FALSE;
+    }
+    if (!tex->valid || !tex->backend_texture || tex->is_3d || tex->layers > 1 || tex->borrowed) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_index: only plain 2D textures can enter the table");
+        RETURN_FALSE;
+    }
+    for (int i = 0; i < ctx->bindless_count; i++) {
+        if (ctx->bindless[i] == &tex->std) RETURN_LONG(i);
+    }
+    if (ctx->bindless_count >= VIO_BINDLESS_MAX) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_index: the table is full (%d textures)", VIO_BINDLESS_MAX);
+        RETURN_FALSE;
+    }
+    if (!ctx->bindless) ctx->bindless = ecalloc(VIO_BINDLESS_MAX, sizeof(zend_object *));
+    int slot = ctx->bindless_count;
+    if (ctx->backend->bindless_set(slot, tex->backend_texture) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_index: the backend could not add the texture");
+        RETURN_FALSE;
+    }
+    GC_ADDREF(&tex->std);
+    ctx->bindless[slot] = &tex->std;
+    ctx->bindless_count++;
+    RETURN_LONG(slot);
+}
+
 ZEND_FUNCTION(vio_backend_info)
 {
     zval *ctx_zval;
@@ -8540,6 +8581,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_BASE_VERTEX", VIO_FEATURE_BASE_VERTEX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_COMPUTE_DERIVATIVES", VIO_FEATURE_COMPUTE_DERIVATIVES, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADING_RATE_PRIMITIVE", VIO_FEATURE_SHADING_RATE_PRIMITIVE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_BINDLESS", VIO_FEATURE_BINDLESS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);

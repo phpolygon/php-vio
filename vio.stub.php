@@ -375,6 +375,17 @@ function vio_swapchain_info(VioContext $context): array {}
 function vio_backend_info(VioContext $context): array|false {}
 
 /**
+ * Slot of $texture in the context's bindless texture table (VIO_FEATURE_BINDLESS,
+ * BINDLESS-PLAN.md). Shaders read the table as
+ *   layout(set = 1, binding = 0) uniform texture2D vio_textures[];
+ *   layout(set = 1, binding = 1) uniform sampler vio_sampler;   // linear, repeat
+ * and index it with nonuniformEXT (GL_EXT_nonuniform_qualifier). The first call adds
+ * the texture and keeps it alive until vio_destroy; later calls return the same slot.
+ * Plain 2D textures only, up to 1024. False (with a warning) without the feature.
+ */
+function vio_texture_index(VioContext $context, VioTexture $texture): int|false {}
+
+/**
  * Draw a mesh with arguments read from a storage buffer (VIO_FEATURE_INDIRECT_DRAW) —
  * typically written by a compute pass (GPU culling / LOD selection). Per draw record:
  * indexed meshes 5 uint32 {indexCount, instanceCount, firstIndex, baseVertex, firstInstance}

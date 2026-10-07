@@ -271,7 +271,7 @@ static int create_logical_device(void)
     vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &ext_count, ext_props);
 
     int has_portability = 0, has_rp2 = 0, has_vrs = 0, has_vpl = 0, has_bary = 0, has_a64 = 0;
-    int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0;
+    int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0, has_di = 0, has_m3 = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
@@ -280,6 +280,8 @@ static int create_logical_device(void)
         if (strcmp(ext_props[i].extensionName, "VK_KHR_fragment_shader_barycentric") == 0) has_bary = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_atomic_int64") == 0) has_a64 = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float16_int8") == 0) has_f16 = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_descriptor_indexing") == 0) has_di = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_KHR_maintenance3") == 0) has_m3 = 1;
         if (strcmp(ext_props[i].extensionName, "VK_NV_compute_shader_derivatives") == 0) has_cd_nv = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_compute_shader_derivatives") == 0) has_cd_khr = 1;
     }
@@ -465,6 +467,9 @@ static int create_logical_device(void)
     dp_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
     VkPhysicalDeviceComputeShaderDerivativesFeaturesNV cd_enable = {0};
     cd_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV;
+    VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_enable = {0};
+    di_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
+    vio_vk.bindless_supported = 0;
     if (vio_vk.instance_api_11) {
         VkPhysicalDeviceProperties dprops;
         vkGetPhysicalDeviceProperties(vio_vk.physical_device, &dprops);
@@ -480,11 +485,26 @@ static int create_logical_device(void)
             dp_avail.pNext = has_f16 ? (void *)&f16_avail : NULL;
             f16_avail.pNext = (has_cd_nv || has_cd_khr) ? (void *)&cd_avail : NULL;
             if (!has_f16) dp_avail.pNext = (has_cd_nv || has_cd_khr) ? (void *)&cd_avail : NULL;
+            VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_avail = {0};
+            di_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
             VkPhysicalDeviceFeatures2 f2 = {0};
             f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
             mv_avail.pNext = &dp_avail;
-            f2.pNext = &mv_avail;
+            di_avail.pNext = &mv_avail;
+            f2.pNext = (has_di && has_m3) ? (void *)&di_avail : (void *)&mv_avail;
             vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+            /* Bindless table (BINDLESS-PLAN.md): a runtime-sized, non-uniformly
+             * indexed, partially bound sampled-image array updated after bind. */
+            if (has_di && has_m3 && di_avail.runtimeDescriptorArray && di_avail.shaderSampledImageArrayNonUniformIndexing
+                && di_avail.descriptorBindingPartiallyBound && di_avail.descriptorBindingSampledImageUpdateAfterBind) {
+                di_enable.runtimeDescriptorArray                       = VK_TRUE;
+                di_enable.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;
+                di_enable.descriptorBindingPartiallyBound              = VK_TRUE;
+                di_enable.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+                device_extensions[device_ext_count++] = "VK_KHR_maintenance3";
+                device_extensions[device_ext_count++] = "VK_EXT_descriptor_indexing";
+                vio_vk.bindless_supported = 1;
+            }
             if (mv_avail.multiview) {
                 mv_enable.multiview = VK_TRUE;
                 vio_vk.multiview_supported = 1;
@@ -530,6 +550,7 @@ static int create_logical_device(void)
     if (vio_vk.draw_parameters_supported) { dp_enable.pNext = feature_chain; feature_chain = &dp_enable; }
     if (vio_vk.compute_derivatives_supported) { cd_enable.pNext = feature_chain; feature_chain = &cd_enable; }
     if (vio_vk.multiview_supported) { mv_enable.pNext = feature_chain; feature_chain = &mv_enable; }
+    if (vio_vk.bindless_supported) { di_enable.pNext = feature_chain; feature_chain = &di_enable; }
     create_info.pNext = feature_chain;
 
     VkResult result = vkCreateDevice(vio_vk.physical_device, &create_info, NULL, &vio_vk.device);
@@ -1209,6 +1230,90 @@ static int vulkan_init(vio_config *cfg)
     return 0;
 }
 
+/* ── Bindless table (vio_texture_index, BINDLESS-PLAN.md) ─────────────── */
+
+VkDescriptorSetLayout vio_vk_bindless_layout(void)
+{
+    if (!vio_vk.device || !vio_vk.bindless_supported) return VK_NULL_HANDLE;
+    if (vio_vk.bindless_layout) return vio_vk.bindless_layout;
+    VkSamplerCreateInfo sci = {0};
+    sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sci.magFilter    = VK_FILTER_LINEAR;
+    sci.minFilter    = VK_FILTER_LINEAR;
+    sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.maxLod       = VK_LOD_CLAMP_NONE;
+    if (vkCreateSampler(vio_vk.device, &sci, NULL, &vio_vk.bindless_sampler) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkDescriptorSetLayoutBinding b[2];
+    memset(b, 0, sizeof(b));
+    b[0].binding            = 0;
+    b[0].descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    b[0].descriptorCount    = VIO_BINDLESS_MAX;
+    b[0].stageFlags         = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[1].binding            = 1;
+    b[1].descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLER;
+    b[1].descriptorCount    = 1;
+    b[1].stageFlags         = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[1].pImmutableSamplers = &vio_vk.bindless_sampler;
+    VkDescriptorBindingFlagsEXT flags[2] = {
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT, 0 };
+    VkDescriptorSetLayoutBindingFlagsCreateInfoEXT bf = {0};
+    bf.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT;
+    bf.bindingCount  = 2;
+    bf.pBindingFlags = flags;
+    VkDescriptorSetLayoutCreateInfo li = {0};
+    li.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    li.pNext        = &bf;
+    li.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT_EXT;
+    li.bindingCount = 2;
+    li.pBindings    = b;
+    if (vkCreateDescriptorSetLayout(vio_vk.device, &li, NULL, &vio_vk.bindless_layout) != VK_SUCCESS) {
+        vio_vk.bindless_layout = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VIO_BINDLESS_MAX }, { VK_DESCRIPTOR_TYPE_SAMPLER, 1 } };
+    VkDescriptorPoolCreateInfo pi = {0};
+    pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pi.flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT_EXT;
+    pi.maxSets       = 1;
+    pi.poolSizeCount = 2;
+    pi.pPoolSizes    = ps;
+    if (vkCreateDescriptorPool(vio_vk.device, &pi, NULL, &vio_vk.bindless_pool) != VK_SUCCESS) {
+        vio_vk.bindless_pool = VK_NULL_HANDLE;
+        return vio_vk.bindless_layout;
+    }
+    VkDescriptorSetAllocateInfo ai = {0};
+    ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool     = vio_vk.bindless_pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts        = &vio_vk.bindless_layout;
+    if (vkAllocateDescriptorSets(vio_vk.device, &ai, &vio_vk.bindless_set) != VK_SUCCESS) vio_vk.bindless_set = VK_NULL_HANDLE;
+    return vio_vk.bindless_layout;
+}
+
+static int vulkan_bindless_set(int slot, void *backend_texture)
+{
+    vio_vulkan_texture *t = (vio_vulkan_texture *)backend_texture;
+    if (!t || !t->view || t->depth > 0 || slot < 0 || slot >= VIO_BINDLESS_MAX) return -1;
+    if (!vio_vk_bindless_layout() || !vio_vk.bindless_set) return -1;
+    VkDescriptorImageInfo ii = {0};
+    ii.imageView   = t->view;
+    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet w = {0};
+    w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet          = vio_vk.bindless_set;
+    w.dstBinding      = 0;
+    w.dstArrayElement = (uint32_t)slot;
+    w.descriptorCount = 1;
+    w.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w.pImageInfo      = &ii;
+    /* UPDATE_AFTER_BIND: legal while earlier frames that bound the set still run. */
+    vkUpdateDescriptorSets(vio_vk.device, 1, &w, 0, NULL);
+    return 0;
+}
+
 static void vulkan_shutdown(void)
 {
     /* M1 — handle-based teardown, NOT gated on vio_vk.initialized.
@@ -1304,6 +1409,13 @@ static void vulkan_shutdown(void)
             vkDestroyRenderPass(vio_vk.device, vio_vk.render_pass, NULL);
             vio_vk.render_pass = VK_NULL_HANDLE;
         }
+    }
+    if (vio_vk.device) {
+        /* Bindless table (the pool frees its set). */
+        if (vio_vk.bindless_pool)    { vkDestroyDescriptorPool(vio_vk.device, vio_vk.bindless_pool, NULL); vio_vk.bindless_pool = VK_NULL_HANDLE; }
+        if (vio_vk.bindless_layout)  { vkDestroyDescriptorSetLayout(vio_vk.device, vio_vk.bindless_layout, NULL); vio_vk.bindless_layout = VK_NULL_HANDLE; }
+        if (vio_vk.bindless_sampler) { vkDestroySampler(vio_vk.device, vio_vk.bindless_sampler, NULL); vio_vk.bindless_sampler = VK_NULL_HANDLE; }
+        vio_vk.bindless_set = VK_NULL_HANDLE;
     }
     if (vio_vk.vma_allocator) { vio_vma_destroy(vio_vk.vma_allocator); vio_vk.vma_allocator = NULL; }
     if (vio_vk.device && vio_vk.transient_fence) { vkDestroyFence(vio_vk.device, vio_vk.transient_fence, NULL); vio_vk.transient_fence = VK_NULL_HANDLE; }
@@ -3573,6 +3685,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_SUBGROUP_QUAD:  return vio_vk.device && vio_vk.subgroup_quad_supported;
         case VIO_FEATURE_BARYCENTRICS:   return vio_vk.device && vio_vk.barycentrics_supported; /* VK_KHR_fragment_shader_barycentric */
         case VIO_FEATURE_ATOMIC64:       return vio_vk.device && vio_vk.atomic64_supported; /* VK_KHR_shader_atomic_int64 */
+        case VIO_FEATURE_BINDLESS:       return vio_vk3d_available() && vio_vk.device && vio_vk.bindless_supported; /* descriptor indexing, Set 1 */
         case VIO_FEATURE_SHADER_FLOAT16: return vio_vk.device && vio_vk.float16_supported;   /* shaderFloat16 */
         case VIO_FEATURE_BASE_VERTEX:    return vio_vk3d_available() && vio_vk.device && vio_vk.draw_parameters_supported;
         case VIO_FEATURE_COMPUTE_DERIVATIVES: return vio_vk.device && vio_vk.compute_derivatives_supported;
@@ -3624,6 +3737,7 @@ static const vio_backend vulkan_backend = {
     .bind_cubemap      = vio_vk_bind_cubemap,
     .set_shading_rate  = vio_vk_set_shading_rate,
     .swapchain_info    = vulkan_swapchain_info,
+    .bindless_set      = vulkan_bindless_set,
     .present           = vulkan_present,
     .clear             = vulkan_clear,
     .gpu_flush         = NULL,

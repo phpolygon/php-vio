@@ -393,6 +393,12 @@ typedef struct _vio_backend {
      * families and capabilities. Returns 0 when filled, -1 without a device.
      * NULL => the function reports false. */
     int   (*describe)(vio_backend_description *out);
+
+    /* vio_texture_index() (VIO_FEATURE_BINDLESS): write `backend_texture`
+     * (create_texture's handle, 2D) into slot 0..VIO_BINDLESS_MAX-1 of the
+     * context's texture table that shaders read as Set 1 binding 0. The
+     * frontend owns slot allocation and keeps the texture alive. 0 = ok. */
+    int   (*bindless_set)(int slot, void *backend_texture);
 } vio_backend;
 
 /*

@@ -111,7 +111,12 @@ Heute: Tier 1 (`vio_set_shading_rate`, D3D12/Vulkan). Neu: Rate je Primitiv (`gl
   bewusst getrenntes Feature `VIO_FEATURE_RASTER_RATE_MAP` evaluieren, nicht in VRS pressen.
 - GL: `GL_NV_shading_rate_image` → sonst 0.
 
-## Phase 4 — Bindless / dynamische Ressourcen (L, eigener Sub-Plan `BINDLESS-PLAN.md`)
+## Phase 4 — Bindless / dynamische Ressourcen (L, eigener Sub-Plan `BINDLESS-PLAN.md`) — 4a ✅ (2026-10-07)
+
+**4a umgesetzt** (`vio_texture_index`, `VIO_FEATURE_BINDLESS`, Test 161): Metal (Argument Buffer Set 1), Vulkan
+(Descriptor Indexing), D3D12 (unbegrenzter SRV-Bereich in `space1`, Tier 2+); OpenGL/D3D11 0. Ausgeführt auf
+dem M5 (Metal ab MSL 3.0, Vulkan über MoltenVK); D3D12 per mingw + DXC geprüft, läuft auf WARP (Tier 3) in
+der CI. Offen (4b): Slot-Freigabe, Sampler je Eintrag, Arrays/Cubes, Compute.
 
 Größter Architekturhebel: ersetzt Pending-Bind-Tabelle und GL-Unit-Mapping für Materialsysteme.
 - API-Skizze: `vio_texture_index($tex): int` (stabiler Heap-Index), GLSL `layout(set=1) uniform texture2D
