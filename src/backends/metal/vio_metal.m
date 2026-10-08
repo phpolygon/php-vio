@@ -1640,18 +1640,18 @@ static void metal_present(void)
     @autoreleasepool {
         if (!vio_mtl.current_cmd_buf) return;
 
-        /* GPU timestamps (GAP-PHASE5 Block 3): the command buffer reports its
-         * own GPU span once it completes. */
-        [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            double ms = (done.GPUEndTime - done.GPUStartTime) * 1000.0;
-            if (ms >= 0.0) vio_mtl.last_gpu_ms = ms;
-        }];
-        /* Named sections: the frame completes with its last buffer (a frame
-         * without marks publishes an empty set). */
+        /* GPU timestamps (GAP-PHASE5 Block 3) and named sections: the frame
+         * completes with its last buffer. vio_gpu_timestamp splits the frame
+         * into several buffers (the queue runs them in order), so the frame
+         * spans from the first section's start to this buffer's end - before,
+         * only the last buffer counted and the sections outgrew the frame (test
+         * 172 on the CI). A frame without marks publishes an empty set. */
         metal_mark_frame *mf = (metal_mark_frame *)vio_mtl.cur_marks;
         vio_mtl.cur_marks = NULL;
         [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            (void)done;
+            double start = (mf && mf->start > 0.0) ? mf->start : done.GPUStartTime;
+            double ms = (done.GPUEndTime - start) * 1000.0;
+            if (ms >= 0.0) vio_mtl.last_gpu_ms = ms;
             if (mf) metal_marks_done(mf);
             else metal_marks_publish(NULL);
         }];
