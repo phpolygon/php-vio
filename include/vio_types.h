@@ -638,6 +638,8 @@ typedef struct _vio_as_geometry {
 typedef struct _vio_as_instance {
     int   geometry;                /* index into geometries */
     float transform[12];           /* row-major 3x4 object -> world */
+    int   hit_group;               /* hit group of the RT pipeline (A13; SBT offset / contribution) */
+    int   mask;                    /* instance mask, 0..255 (rays skip it when mask & cull mask == 0) */
 } vio_as_instance;
 
 typedef struct _vio_as_desc {
@@ -659,12 +661,37 @@ typedef enum {
     VIO_RT_STAGE_COUNT       = 4
 } vio_rt_stage;
 
+#define VIO_RT_STAGE_CALLABLE 4     /* not in spirv[]: vio_rt_pipeline_desc.callable */
+#define VIO_RT_MAX_GROUPS     8     /* miss shaders, hit groups, callables (each) */
+#define VIO_RT_MAX_RECORD     256   /* bytes of shader record data per group */
+
+/* One shader group (A13): a general group (raygen / miss / callable) has its
+ * shader in spirv[0]; a triangle hit group the closest hit in spirv[0] and the
+ * optional any hit in spirv[1]. record = the group's shader record data. */
+typedef struct _vio_rt_group_src {
+    const uint32_t *spirv[2];
+    size_t          spirv_size[2];
+    unsigned char   record[VIO_RT_MAX_RECORD];
+} vio_rt_group_src;
+
 typedef struct _vio_rt_pipeline_desc {
-    const uint32_t *spirv[VIO_RT_STAGE_COUNT];      /* NULL: stage absent (any hit) */
+    const uint32_t *spirv[VIO_RT_STAGE_COUNT];      /* raygen / miss 0 / hit group 0 (legacy view) */
     size_t          spirv_size[VIO_RT_STAGE_COUNT]; /* bytes */
     const char     *hlsl;                           /* D3D12 library source, NULL when not given */
     int             max_recursion;                  /* >= 1 */
     int             payload_size;                   /* bytes, D3D12 shader config */
+    /* Every group (A13): traceRayEXT's missIndex picks a miss shader, the
+     * instance's hit_group (+ sbtRecordOffset) a hit group, executeCallableEXT's
+     * index a callable. record_size bytes of record data follow each handle
+     * (GLSL shaderRecordEXT buffer; D3D12 root constants at b0, space1). */
+    vio_rt_group_src raygen;
+    vio_rt_group_src miss[VIO_RT_MAX_GROUPS];
+    int              miss_count;
+    vio_rt_group_src hit[VIO_RT_MAX_GROUPS];
+    int              hit_count;
+    vio_rt_group_src callable[VIO_RT_MAX_GROUPS];
+    int              callable_count;
+    int              record_size;                   /* multiple of 4, 0 = no records */
 } vio_rt_pipeline_desc;
 
 /* A storage buffer bound for vio_trace_rays (vio_rt_bind_buffer). */

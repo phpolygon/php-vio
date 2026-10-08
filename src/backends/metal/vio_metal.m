@@ -3736,7 +3736,7 @@ static id<MTLBuffer> metal_as_instance_buffer(id<MTLDevice> dev, const vio_as_in
             ids[i].transformationMatrix.columns[c].z = in->transform[2 * 4 + c];
         }
         ids[i].options = MTLAccelerationStructureInstanceOptionOpaque;
-        ids[i].mask = 0xFF;
+        ids[i].mask = (uint32_t)(in->mask & 0xFF);
         ids[i].intersectionFunctionTableOffset = 0;
         ids[i].accelerationStructureIndex = (uint32_t)in->geometry;
     }

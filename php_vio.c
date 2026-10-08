@@ -9381,6 +9381,19 @@ static int vio_as_parse(const char *fn, HashTable *list, vio_as_instance **inst_
             geo[g].index_count = mesh->rt_indices ? mesh->rt_index_count : 0;
         }
         inst[idx].geometry = g;
+        inst[idx].mask = 0xFF;
+        {
+            zval *hz = zend_hash_str_find(Z_ARRVAL_P(entry), "hit_group", sizeof("hit_group") - 1);
+            zval *kz = zend_hash_str_find(Z_ARRVAL_P(entry), "mask", sizeof("mask") - 1);
+            zend_long hg = hz ? zval_get_long(hz) : 0, mk = kz ? zval_get_long(kz) : 0xFF;
+            if (hg < 0 || hg >= VIO_RT_MAX_GROUPS || mk < 0 || mk > 255) {
+                efree(inst); efree(geo); efree(geo_mesh);
+                zend_argument_value_error(strlen(fn) > 26 ? 3 : 2, "instance %d: 'hit_group' must be 0..%d and 'mask' 0..255", idx, VIO_RT_MAX_GROUPS - 1);
+                return 0;
+            }
+            inst[idx].hit_group = (int)hg;
+            inst[idx].mask = (int)mk;
+        }
         float m[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         zval *tz = zend_hash_str_find(Z_ARRVAL_P(entry), "transform", sizeof("transform") - 1);
         if (tz) {
@@ -9527,6 +9540,181 @@ ZEND_FUNCTION(vio_bind_acceleration_structure)
     ctx->backend->bind_acceleration_structure(as->backend_as, (int)binding);
 }
 
+/* ── vio_rt_pipeline groups (OPEN-ITEMS-PLAN A13) ── */
+
+static void vio_rt_free_groups(vio_rt_pipeline_desc *d)
+{
+    vio_rt_group_src *all[1 + 3 * VIO_RT_MAX_GROUPS];
+    int n = 0;
+    all[n++] = &d->raygen;
+    for (int i = 0; i < d->miss_count; i++) all[n++] = &d->miss[i];
+    for (int i = 0; i < d->hit_count; i++) all[n++] = &d->hit[i];
+    for (int i = 0; i < d->callable_count; i++) all[n++] = &d->callable[i];
+    for (int i = 0; i < n; i++) for (int k = 0; k < 2; k++) { free((void *)all[i]->spirv[k]); all[i]->spirv[k] = NULL; }
+}
+
+/* Compile one GLSL stage into g->spirv[slot]. 0 ok, 1 thrown, -1 warned. */
+static int vio_rt_compile_into(zval *z, int stage, const char *label, vio_rt_group_src *g, int slot)
+{
+    if (!z || Z_TYPE_P(z) != IS_STRING) {
+        zend_argument_value_error(2, "%s must be a GLSL source string", label);
+        return 1;
+    }
+    char *err = NULL;
+    size_t size = 0;
+    uint32_t *spv = vio_compile_glsl_rt_stage_to_spirv(Z_STRVAL_P(z), stage, &size, &err);
+    if (!spv) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: %s: %s", label, err ? err : "compile failed");
+        free(err);
+        return -1;
+    }
+    free(err);
+    g->spirv[slot] = spv;
+    g->spirv_size[slot] = size;
+    return 0;
+}
+
+/* A list (or, where `single` allows, one string) of 1..VIO_RT_MAX_GROUPS entries. */
+static int vio_rt_list(zval *z, const char *key, int min, HashTable **out, int *count)
+{
+    *out = NULL;
+    *count = 0;
+    if (!z) return 0;
+    if (Z_TYPE_P(z) != IS_ARRAY) return 0;
+    int n = (int)zend_hash_num_elements(Z_ARRVAL_P(z));
+    if (n < min || n > VIO_RT_MAX_GROUPS) {
+        zend_argument_value_error(2, "'%s' must hold %d..%d entries", key, min, VIO_RT_MAX_GROUPS);
+        return 1;
+    }
+    *out = Z_ARRVAL_P(z);
+    *count = n;
+    return 0;
+}
+
+/* Shader records: ['raygen' => bytes, 'miss' => [bytes], 'hit_groups' => [bytes], 'callables' => [bytes]]. */
+static int vio_rt_records(HashTable *desc_ht, vio_rt_pipeline_desc *d)
+{
+    zval *rz = zend_hash_str_find(desc_ht, "records", sizeof("records") - 1);
+    if (!rz) return 0;
+    if (Z_TYPE_P(rz) != IS_ARRAY) { zend_argument_value_error(2, "'records' must be an array"); return 1; }
+    static const char *keys[4] = { "raygen", "miss", "hit_groups", "callables" };
+    vio_rt_group_src *base[4] = { &d->raygen, d->miss, d->hit, d->callable };
+    int counts[4] = { 1, d->miss_count, d->hit_count, d->callable_count };
+    int max = 0;
+    for (int k = 0; k < 4; k++) {
+        zval *z = zend_hash_str_find(Z_ARRVAL_P(rz), keys[k], strlen(keys[k]));
+        if (!z) continue;
+        zval single, *e;
+        HashTable *list;
+        if (k == 0) {
+            array_init(&single);
+            Z_TRY_ADDREF_P(z);
+            add_next_index_zval(&single, z);
+            list = Z_ARRVAL(single);
+        } else if (Z_TYPE_P(z) == IS_ARRAY) {
+            list = Z_ARRVAL_P(z);
+        } else {
+            zend_argument_value_error(2, "'records' => '%s' must be a list of byte strings", keys[k]);
+            return 1;
+        }
+        int i = 0, bad = 0;
+        ZEND_HASH_FOREACH_VAL(list, e) {
+            if (i >= counts[k] || Z_TYPE_P(e) != IS_STRING || Z_STRLEN_P(e) > VIO_RT_MAX_RECORD) { bad = 1; break; }
+            memcpy(base[k][i].record, Z_STRVAL_P(e), Z_STRLEN_P(e));
+            if ((int)Z_STRLEN_P(e) > max) max = (int)Z_STRLEN_P(e);
+            i++;
+        } ZEND_HASH_FOREACH_END();
+        if (k == 0) zval_ptr_dtor(&single);
+        if (bad) {
+            zend_argument_value_error(2, "'records' => '%s': one string of at most %d bytes per group", keys[k], VIO_RT_MAX_RECORD);
+            return 1;
+        }
+    }
+    d->record_size = (max + 3) & ~3;
+    return 0;
+}
+
+/* raygen; miss (string or list); hit groups ('hit_groups' => [['closest_hit', 'any_hit'?]]
+ * or the legacy 'closest_hit' / 'any_hit'); callables; records.
+ * 0 ok, 1 thrown, -1 warned (stages compiled so far stay in d for vio_rt_free_groups). */
+static int vio_rt_parse_groups(HashTable *desc_ht, vio_rt_pipeline_desc *d)
+{
+    int rc;
+    zval *z = zend_hash_str_find(desc_ht, "raygen", sizeof("raygen") - 1);
+    if (!z) { zend_argument_value_error(2, "needs 'raygen' (GLSL source)"); return 1; }
+    if ((rc = vio_rt_compile_into(z, VIO_RT_STAGE_RAYGEN, "raygen", &d->raygen, 0)) != 0) return rc;
+
+    z = zend_hash_str_find(desc_ht, "miss", sizeof("miss") - 1);
+    if (!z) { zend_argument_value_error(2, "needs 'miss' (GLSL source or a list of them)"); return 1; }
+    if (Z_TYPE_P(z) == IS_STRING) {
+        if ((rc = vio_rt_compile_into(z, VIO_RT_STAGE_MISS, "miss", &d->miss[0], 0)) != 0) return rc;
+        d->miss_count = 1;
+    } else {
+        HashTable *list;
+        int n;
+        if ((rc = vio_rt_list(z, "miss", 1, &list, &n)) != 0) return rc;
+        if (!list) { zend_argument_value_error(2, "'miss' must be a GLSL source or a list of them"); return 1; }
+        zval *e;
+        ZEND_HASH_FOREACH_VAL(list, e) {
+            char label[32];
+            snprintf(label, sizeof(label), "miss %d", d->miss_count);
+            if ((rc = vio_rt_compile_into(e, VIO_RT_STAGE_MISS, label, &d->miss[d->miss_count], 0)) != 0) return rc;
+            d->miss_count++;
+        } ZEND_HASH_FOREACH_END();
+    }
+
+    z = zend_hash_str_find(desc_ht, "hit_groups", sizeof("hit_groups") - 1);
+    if (z) {
+        HashTable *list;
+        int n;
+        if ((rc = vio_rt_list(z, "hit_groups", 1, &list, &n)) != 0) return rc;
+        if (!list) { zend_argument_value_error(2, "'hit_groups' must be a list of ['closest_hit' => glsl, 'any_hit' => glsl?]"); return 1; }
+        zval *e;
+        ZEND_HASH_FOREACH_VAL(list, e) {
+            char label[40];
+            vio_rt_group_src *g = &d->hit[d->hit_count];
+            if (Z_TYPE_P(e) != IS_ARRAY) { zend_argument_value_error(2, "hit group %d must be an array", d->hit_count); return 1; }
+            snprintf(label, sizeof(label), "hit group %d closest_hit", d->hit_count);
+            if ((rc = vio_rt_compile_into(zend_hash_str_find(Z_ARRVAL_P(e), "closest_hit", sizeof("closest_hit") - 1),
+                                          VIO_RT_STAGE_CLOSEST_HIT, label, g, 0)) != 0) return rc;
+            d->hit_count++;
+            zval *ah = zend_hash_str_find(Z_ARRVAL_P(e), "any_hit", sizeof("any_hit") - 1);
+            snprintf(label, sizeof(label), "hit group %d any_hit", d->hit_count - 1);
+            if (ah && (rc = vio_rt_compile_into(ah, VIO_RT_STAGE_ANY_HIT, label, g, 1)) != 0) return rc;
+        } ZEND_HASH_FOREACH_END();
+    } else {
+        z = zend_hash_str_find(desc_ht, "closest_hit", sizeof("closest_hit") - 1);
+        if (!z) { zend_argument_value_error(2, "needs 'closest_hit' (GLSL source) or 'hit_groups'"); return 1; }
+        if ((rc = vio_rt_compile_into(z, VIO_RT_STAGE_CLOSEST_HIT, "closest_hit", &d->hit[0], 0)) != 0) return rc;
+        d->hit_count = 1;
+        zval *ah = zend_hash_str_find(desc_ht, "any_hit", sizeof("any_hit") - 1);
+        if (ah && (rc = vio_rt_compile_into(ah, VIO_RT_STAGE_ANY_HIT, "any_hit", &d->hit[0], 1)) != 0) return rc;
+    }
+
+    z = zend_hash_str_find(desc_ht, "callables", sizeof("callables") - 1);
+    if (z) {
+        HashTable *list;
+        int n;
+        if ((rc = vio_rt_list(z, "callables", 0, &list, &n)) != 0) return rc;
+        if (!list) { zend_argument_value_error(2, "'callables' must be a list of GLSL sources"); return 1; }
+        zval *e;
+        ZEND_HASH_FOREACH_VAL(list, e) {
+            char label[32];
+            snprintf(label, sizeof(label), "callable %d", d->callable_count);
+            if ((rc = vio_rt_compile_into(e, VIO_RT_STAGE_CALLABLE, label, &d->callable[d->callable_count], 0)) != 0) return rc;
+            d->callable_count++;
+        } ZEND_HASH_FOREACH_END();
+    }
+    if ((rc = vio_rt_records(desc_ht, d)) != 0) return rc;
+
+    /* The legacy single-group view. */
+    d->spirv[VIO_RT_STAGE_RAYGEN] = d->raygen.spirv[0];       d->spirv_size[VIO_RT_STAGE_RAYGEN] = d->raygen.spirv_size[0];
+    d->spirv[VIO_RT_STAGE_MISS] = d->miss[0].spirv[0];        d->spirv_size[VIO_RT_STAGE_MISS] = d->miss[0].spirv_size[0];
+    d->spirv[VIO_RT_STAGE_CLOSEST_HIT] = d->hit[0].spirv[0];  d->spirv_size[VIO_RT_STAGE_CLOSEST_HIT] = d->hit[0].spirv_size[0];
+    d->spirv[VIO_RT_STAGE_ANY_HIT] = d->hit[0].spirv[1];      d->spirv_size[VIO_RT_STAGE_ANY_HIT] = d->hit[0].spirv_size[1];
+    return 0;
+}
+
 /* vio_rt_pipeline($ctx, ['raygen' => glsl, 'miss' => glsl, 'closest_hit' => glsl,
  * 'any_hit' => glsl?, 'max_recursion' => 1, 'payload_size' => 32, 'hlsl' => lib?]):
  * the GLSL stages go to SPIR-V here (they are the portable contract); the
@@ -9551,48 +9739,25 @@ ZEND_FUNCTION(vio_rt_pipeline)
                          ctx->backend->name);
         RETURN_FALSE;
     }
-    static const char *keys[VIO_RT_STAGE_COUNT] = { "raygen", "miss", "closest_hit", "any_hit" };
-    vio_rt_pipeline_desc desc;
-    memset(&desc, 0, sizeof(desc));
-    desc.max_recursion = 1;
-    desc.payload_size = 32;
-    for (int st = 0; st < VIO_RT_STAGE_COUNT; st++) {
-        zval *z = zend_hash_str_find(desc_ht, keys[st], strlen(keys[st]));
-        if (!z) {
-            if (st == VIO_RT_STAGE_ANY_HIT) continue;
-            for (int k = 0; k < st; k++) free((void *)desc.spirv[k]);
-            zend_argument_value_error(2, "needs '%s' (GLSL source)", keys[st]);
-            RETURN_THROWS();
+    vio_rt_pipeline_desc *desc = ecalloc(1, sizeof(vio_rt_pipeline_desc));
+    desc->max_recursion = 1;
+    desc->payload_size = 32;
+    int rc = vio_rt_parse_groups(desc_ht, desc);
+    if (rc == 0) {
+        zval *z;
+        if ((z = zend_hash_str_find(desc_ht, "max_recursion", sizeof("max_recursion") - 1))) desc->max_recursion = (int)zval_get_long(z);
+        if ((z = zend_hash_str_find(desc_ht, "payload_size", sizeof("payload_size") - 1))) desc->payload_size = (int)zval_get_long(z);
+        if ((z = zend_hash_str_find(desc_ht, "hlsl", sizeof("hlsl") - 1)) && Z_TYPE_P(z) == IS_STRING) desc->hlsl = Z_STRVAL_P(z);
+        if (desc->max_recursion < 1 || desc->max_recursion > 31 || desc->payload_size < 4 || desc->payload_size > 4096) {
+            zend_argument_value_error(2, "'max_recursion' must be 1..31 and 'payload_size' 4..4096");
+            rc = 1;
         }
-        if (Z_TYPE_P(z) != IS_STRING) {
-            for (int k = 0; k < st; k++) free((void *)desc.spirv[k]);
-            zend_argument_value_error(2, "'%s' must be a GLSL source string", keys[st]);
-            RETURN_THROWS();
-        }
-        char *err = NULL;
-        size_t size = 0;
-        uint32_t *spv = vio_compile_glsl_rt_stage_to_spirv(Z_STRVAL_P(z), st, &size, &err);
-        if (!spv) {
-            php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: %s: %s", keys[st], err ? err : "compile failed");
-            free(err);
-            for (int k = 0; k < st; k++) free((void *)desc.spirv[k]);
-            RETURN_FALSE;
-        }
-        free(err);
-        desc.spirv[st] = spv;
-        desc.spirv_size[st] = size;
     }
-    zval *z;
-    if ((z = zend_hash_str_find(desc_ht, "max_recursion", sizeof("max_recursion") - 1))) desc.max_recursion = (int)zval_get_long(z);
-    if ((z = zend_hash_str_find(desc_ht, "payload_size", sizeof("payload_size") - 1))) desc.payload_size = (int)zval_get_long(z);
-    if ((z = zend_hash_str_find(desc_ht, "hlsl", sizeof("hlsl") - 1)) && Z_TYPE_P(z) == IS_STRING) desc.hlsl = Z_STRVAL_P(z);
-    if (desc.max_recursion < 1 || desc.max_recursion > 31 || desc.payload_size < 4 || desc.payload_size > 4096) {
-        for (int k = 0; k < VIO_RT_STAGE_COUNT; k++) free((void *)desc.spirv[k]);
-        zend_argument_value_error(2, "'max_recursion' must be 1..31 and 'payload_size' 4..4096");
-        RETURN_THROWS();
-    }
-    void *handle = ctx->backend->create_rt_pipeline(&desc);
-    for (int k = 0; k < VIO_RT_STAGE_COUNT; k++) free((void *)desc.spirv[k]);
+    void *handle = rc == 0 ? ctx->backend->create_rt_pipeline(desc) : NULL;
+    vio_rt_free_groups(desc);
+    efree(desc);
+    if (rc == 1) RETURN_THROWS();
+    if (rc < 0) RETURN_FALSE;
     if (!handle) {
         php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: the backend could not build the pipeline");
         RETURN_FALSE;

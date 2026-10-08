@@ -2242,8 +2242,8 @@ static int d3d12_as_record_tlas(ID3D12Device5 *dev5, ID3D12GraphicsCommandList4 
         for (int r = 0; r < 3; r++)
             for (int c = 0; c < 4; c++) ids[i].Transform[r][c] = src->transform[r * 4 + c];
         ids[i].InstanceID = (UINT)i;
-        ids[i].InstanceMask = 0xFF;
-        ids[i].InstanceContributionToHitGroupIndex = 0;
+        ids[i].InstanceMask = (UINT)(src->mask & 0xFF);
+        ids[i].InstanceContributionToHitGroupIndex = (UINT)src->hit_group;
         ids[i].Flags = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
         ids[i].AccelerationStructure = ID3D12Resource_GetGPUVirtualAddress(as->blas[src->geometry]);
     }
@@ -7821,7 +7821,11 @@ static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
 typedef struct _vio_d3d12_rtp {
     ID3D12StateObject   *state;
     ID3D12RootSignature *root_sig;
-    ID3D12Resource      *table;     /* raygen | miss | hit group, 64 bytes apart */
+    ID3D12RootSignature *local_sig;     /* shader records (A13): root constants b0, space1; NULL without */
+    ID3D12Resource      *table;         /* raygen | miss | hit groups | callables, each table 64-byte aligned */
+    UINT64               stride;        /* one record: identifier + record data, 32-byte aligned */
+    UINT64               off_miss, off_hit, off_call;
+    int                  miss_count, hit_count, callable_count;
 } vio_d3d12_rtp;
 
 static void d3d12_rtp_free(vio_d3d12_rtp *p)
@@ -7830,15 +7834,45 @@ static void d3d12_rtp_free(vio_d3d12_rtp *p)
     if (p->table) ID3D12Resource_Release(p->table);
     if (p->state) ID3D12StateObject_Release(p->state);
     if (p->root_sig) ID3D12RootSignature_Release(p->root_sig);
+    if (p->local_sig) ID3D12RootSignature_Release(p->local_sig);
     free(p);
 }
+
+/* Export names of the library: base, base<k> for k > 0 (vio_callable<k> always numbered). */
+static void d3d12_rt_name(WCHAR *out, size_t cap, const char *base, int k, int always)
+{
+    char tmp[48];
+    if (k == 0 && !always) snprintf(tmp, sizeof(tmp), "%s", base);
+    else snprintf(tmp, sizeof(tmp), "%s%d", base, k);
+    size_t i = 0;
+    for (; tmp[i] && i + 1 < cap; i++) out[i] = (WCHAR)tmp[i];
+    out[i] = 0;
+}
+
+static ID3D12RootSignature *d3d12_rt_root_sig(const D3D12_ROOT_SIGNATURE_DESC *rs, const char *what)
+{
+    ID3DBlob *sig = NULL, *err = NULL;
+    ID3D12RootSignature *out = NULL;
+    if (FAILED(D3D12SerializeRootSignature(rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) || !sig) {
+        php_error_docref(NULL, E_WARNING, "D3D12: ray tracing %s root signature: %s", what,
+                         err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "serialize failed");
+    } else if (FAILED(ID3D12Device_CreateRootSignature(vio_d3d12.device, 0, ID3D10Blob_GetBufferPointer(sig),
+                                                       ID3D10Blob_GetBufferSize(sig), &IID_ID3D12RootSignature, (void **)&out))) {
+        out = NULL;
+    }
+    if (sig) ID3D10Blob_Release(sig);
+    if (err) ID3D10Blob_Release(err);
+    return out;
+}
+
+static UINT64 d3d12_align(UINT64 v, UINT64 a) { return (v + a - 1) / a * a; }
 
 static void *d3d12_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
 {
     if (!desc || !vio_d3d12.device) return NULL;
     if (!desc->hlsl || !desc->hlsl[0]) {
         php_error_docref(NULL, E_WARNING, "D3D12: vio_rt_pipeline needs 'hlsl' (a DXR library with vio_raygen, vio_miss, "
-                         "vio_closest_hit%s)", desc->spirv[VIO_RT_STAGE_ANY_HIT] ? ", vio_any_hit" : "");
+                         "vio_closest_hit%s)", desc->hit[0].spirv[1] ? ", vio_any_hit" : "");
         return NULL;
     }
     ID3D12Device5 *dev5 = NULL;
@@ -7847,9 +7881,11 @@ static void *d3d12_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
     void *dxil = NULL;
     size_t dxil_len = 0;
     char *err = NULL;
-    ID3DBlob *sig = NULL, *sig_err = NULL;
     ID3D12StateObjectProperties *props = NULL;
     if (!p) goto fail;
+    p->miss_count = desc->miss_count;
+    p->hit_count = desc->hit_count;
+    p->callable_count = desc->callable_count;
 
     char profile[16];
     int minor = vio_d3d12.shader_model_version % 10;
@@ -7859,89 +7895,148 @@ static void *d3d12_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
         goto fail;
     }
 
-    D3D12_ROOT_PARAMETER rp[1 + VIO_D3D12_RT_UAVS];
-    memset(rp, 0, sizeof(rp));
-    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    rp[0].Descriptor.ShaderRegister = 0;
-    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    for (int i = 0; i < VIO_D3D12_RT_UAVS; i++) {
-        rp[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        rp[1 + i].Descriptor.ShaderRegister = (UINT)i;
-        rp[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    {
+        D3D12_ROOT_PARAMETER rp[1 + VIO_D3D12_RT_UAVS];
+        memset(rp, 0, sizeof(rp));
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rp[0].Descriptor.ShaderRegister = 0;
+        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        for (int i = 0; i < VIO_D3D12_RT_UAVS; i++) {
+            rp[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rp[1 + i].Descriptor.ShaderRegister = (UINT)i;
+            rp[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        D3D12_ROOT_SIGNATURE_DESC rs = {0};
+        rs.NumParameters = 1 + VIO_D3D12_RT_UAVS;
+        rs.pParameters = rp;
+        if (!(p->root_sig = d3d12_rt_root_sig(&rs, "global"))) goto fail;
     }
-    D3D12_ROOT_SIGNATURE_DESC rs = {0};
-    rs.NumParameters = 1 + VIO_D3D12_RT_UAVS;
-    rs.pParameters = rp;
-    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &sig_err)) || !sig) goto fail;
-    if (FAILED(ID3D12Device_CreateRootSignature(vio_d3d12.device, 0, ID3D10Blob_GetBufferPointer(sig),
-                                                ID3D10Blob_GetBufferSize(sig), &IID_ID3D12RootSignature,
-                                                (void **)&p->root_sig))) goto fail;
+    if (desc->record_size > 0) {
+        /* Shader records: the bytes behind each identifier, as root constants. */
+        D3D12_ROOT_PARAMETER lp;
+        memset(&lp, 0, sizeof(lp));
+        lp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        lp.Constants.ShaderRegister = 0;
+        lp.Constants.RegisterSpace = 1;
+        lp.Constants.Num32BitValues = (UINT)(desc->record_size / 4);
+        lp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rs = {0};
+        rs.NumParameters = 1;
+        rs.pParameters = &lp;
+        rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE;
+        if (!(p->local_sig = d3d12_rt_root_sig(&rs, "local (shader record)"))) goto fail;
+    }
+
+    /* Export names. */
+    WCHAR n_raygen[32], n_miss[VIO_RT_MAX_GROUPS][32], n_chit[VIO_RT_MAX_GROUPS][32], n_ahit[VIO_RT_MAX_GROUPS][32];
+    WCHAR n_group[VIO_RT_MAX_GROUPS][32], n_call[VIO_RT_MAX_GROUPS][32];
+    d3d12_rt_name(n_raygen, 32, "vio_raygen", 0, 0);
+    for (int k = 0; k < desc->miss_count; k++) d3d12_rt_name(n_miss[k], 32, "vio_miss", k, 0);
+    for (int k = 0; k < desc->hit_count; k++) {
+        d3d12_rt_name(n_chit[k], 32, "vio_closest_hit", k, 0);
+        d3d12_rt_name(n_ahit[k], 32, "vio_any_hit", k, 0);
+        d3d12_rt_name(n_group[k], 32, "vio_hit_group", k, 0);
+    }
+    for (int k = 0; k < desc->callable_count; k++) d3d12_rt_name(n_call[k], 32, "vio_callable", k, 1);
 
     D3D12_DXIL_LIBRARY_DESC lib = {0};
     lib.DXILLibrary.pShaderBytecode = dxil;
     lib.DXILLibrary.BytecodeLength = dxil_len;   /* no export list: every export */
-    D3D12_HIT_GROUP_DESC hg = {0};
-    hg.HitGroupExport = L"vio_hit_group";
-    hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
-    hg.ClosestHitShaderImport = L"vio_closest_hit";
-    hg.AnyHitShaderImport = desc->spirv[VIO_RT_STAGE_ANY_HIT] ? L"vio_any_hit" : NULL;
+    D3D12_HIT_GROUP_DESC hg[VIO_RT_MAX_GROUPS];
+    memset(hg, 0, sizeof(hg));
     D3D12_RAYTRACING_SHADER_CONFIG sc = {0};
     sc.MaxPayloadSizeInBytes = (UINT)desc->payload_size;
     sc.MaxAttributeSizeInBytes = D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES;
     D3D12_GLOBAL_ROOT_SIGNATURE grs = {0};
     grs.pGlobalRootSignature = p->root_sig;
+    D3D12_LOCAL_ROOT_SIGNATURE lrs = {0};
+    lrs.pLocalRootSignature = p->local_sig;
     D3D12_RAYTRACING_PIPELINE_CONFIG pc = {0};
     pc.MaxTraceRecursionDepth = (UINT)desc->max_recursion;
-    D3D12_STATE_SUBOBJECT sub[5];
-    sub[0].Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;           sub[0].pDesc = &lib;
-    sub[1].Type = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;              sub[1].pDesc = &hg;
-    sub[2].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG; sub[2].pDesc = &sc;
-    sub[3].Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;  sub[3].pDesc = &grs;
-    sub[4].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG; sub[4].pDesc = &pc;
+    LPCWSTR assoc_exports[1 + 3 * VIO_RT_MAX_GROUPS];
+    UINT assoc_n = 0;
+    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION assoc = {0};
+    D3D12_STATE_SUBOBJECT sub[8 + VIO_RT_MAX_GROUPS];
+    UINT ns = 0;
+    sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY; sub[ns].pDesc = &lib; ns++;
+    for (int k = 0; k < desc->hit_count; k++) {
+        hg[k].HitGroupExport = n_group[k];
+        hg[k].Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+        hg[k].ClosestHitShaderImport = n_chit[k];
+        hg[k].AnyHitShaderImport = desc->hit[k].spirv[1] ? n_ahit[k] : NULL;
+        sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP; sub[ns].pDesc = &hg[k]; ns++;
+    }
+    sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG; sub[ns].pDesc = &sc; ns++;
+    sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;  sub[ns].pDesc = &grs; ns++;
+    sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG; sub[ns].pDesc = &pc; ns++;
+    if (p->local_sig) {
+        UINT li = ns;
+        sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE; sub[ns].pDesc = &lrs; ns++;
+        assoc_exports[assoc_n++] = n_raygen;
+        for (int k = 0; k < desc->miss_count; k++) assoc_exports[assoc_n++] = n_miss[k];
+        for (int k = 0; k < desc->hit_count; k++) assoc_exports[assoc_n++] = n_group[k];
+        for (int k = 0; k < desc->callable_count; k++) assoc_exports[assoc_n++] = n_call[k];
+        assoc.pSubobjectToAssociate = &sub[li];
+        assoc.NumExports = assoc_n;
+        assoc.pExports = assoc_exports;
+        sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION; sub[ns].pDesc = &assoc; ns++;
+    }
     D3D12_STATE_OBJECT_DESC so = {0};
     so.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
-    so.NumSubobjects = 5;
+    so.NumSubobjects = ns;
     so.pSubobjects = sub;
     HRESULT hr = ID3D12Device5_CreateStateObject(dev5, &so, &IID_ID3D12StateObject, (void **)&p->state);
     if (FAILED(hr) || !p->state) {
         php_error_docref(NULL, E_WARNING, "D3D12: CreateStateObject failed (0x%08lx): the library needs the exports "
-                         "vio_raygen, vio_miss, vio_closest_hit%s and resources only at t0 / u0..u%d",
-                         hr, desc->spirv[VIO_RT_STAGE_ANY_HIT] ? ", vio_any_hit" : "", VIO_D3D12_RT_UAVS - 1);
+                         "vio_raygen, vio_miss[<k>] (%d), vio_closest_hit[<k>] / vio_any_hit[<k>] (%d hit groups), "
+                         "vio_callable<k> (%d); resources only at t0 / u0..u%d%s",
+                         hr, desc->miss_count, desc->hit_count, desc->callable_count, VIO_D3D12_RT_UAVS - 1,
+                         p->local_sig ? ", records at b0, space1" : "");
         d3d12_drain_info_queue("create_rt_pipeline");
         goto fail;
     }
     if (FAILED(ID3D12StateObject_QueryInterface(p->state, &IID_ID3D12StateObjectProperties, (void **)&props))) goto fail;
 
-    static const WCHAR *exports[3] = { L"vio_raygen", L"vio_miss", L"vio_hit_group" };
-    p->table = d3d12_as_buffer(3 * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, D3D12_HEAP_TYPE_UPLOAD,
-                               D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    /* Shader table: raygen | miss | hit groups | callables, each table 64-byte aligned. */
+    p->stride = d3d12_align(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES + (UINT64)desc->record_size, D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT);
+    const UINT64 ta = D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT;
+    p->off_miss = d3d12_align(p->stride, ta);
+    p->off_hit = p->off_miss + d3d12_align(p->stride * (UINT64)desc->miss_count, ta);
+    p->off_call = p->off_hit + d3d12_align(p->stride * (UINT64)desc->hit_count, ta);
+    UINT64 total = p->off_call + d3d12_align(p->stride * (UINT64)(desc->callable_count > 0 ? desc->callable_count : 1), ta);
+    p->table = d3d12_as_buffer(total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     unsigned char *map = NULL;
     D3D12_RANGE none = { 0, 0 };
     if (!p->table || FAILED(ID3D12Resource_Map(p->table, 0, &none, (void **)&map)) || !map) goto fail;
-    for (int g = 0; g < 3; g++) {
-        void *id = ID3D12StateObjectProperties_GetShaderIdentifier(props, exports[g]);
-        if (!id) {
-            ID3D12Resource_Unmap(p->table, 0, NULL);
-            goto fail;
+    memset(map, 0, (size_t)total);
+    {
+        struct { const WCHAR *name; const vio_rt_group_src *src; UINT64 at; } recs[1 + 3 * VIO_RT_MAX_GROUPS];
+        int nr = 0;
+        recs[nr].name = n_raygen; recs[nr].src = &desc->raygen; recs[nr].at = 0; nr++;
+        for (int k = 0; k < desc->miss_count; k++) { recs[nr].name = n_miss[k]; recs[nr].src = &desc->miss[k]; recs[nr].at = p->off_miss + (UINT64)k * p->stride; nr++; }
+        for (int k = 0; k < desc->hit_count; k++) { recs[nr].name = n_group[k]; recs[nr].src = &desc->hit[k]; recs[nr].at = p->off_hit + (UINT64)k * p->stride; nr++; }
+        for (int k = 0; k < desc->callable_count; k++) { recs[nr].name = n_call[k]; recs[nr].src = &desc->callable[k]; recs[nr].at = p->off_call + (UINT64)k * p->stride; nr++; }
+        for (int r = 0; r < nr; r++) {
+            void *id = ID3D12StateObjectProperties_GetShaderIdentifier(props, recs[r].name);
+            if (!id) {
+                ID3D12Resource_Unmap(p->table, 0, NULL);
+                php_error_docref(NULL, E_WARNING, "D3D12: the ray tracing library has no export for group %d", r);
+                goto fail;
+            }
+            memcpy(map + recs[r].at, id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+            if (desc->record_size > 0) memcpy(map + recs[r].at + D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, recs[r].src->record, (size_t)desc->record_size);
         }
-        memcpy(map + (size_t)g * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, id, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
     }
     ID3D12Resource_Unmap(p->table, 0, NULL);
 
     ID3D12StateObjectProperties_Release(props);
-    ID3D10Blob_Release(sig);
     free(dxil);
     free(err);
     ID3D12Device5_Release(dev5);
     return p;
 
 fail:
-    if (sig_err) {
-        php_error_docref(NULL, E_WARNING, "D3D12: ray tracing root signature: %s", (const char *)ID3D10Blob_GetBufferPointer(sig_err));
-        ID3D10Blob_Release(sig_err);
-    }
     if (props) ID3D12StateObjectProperties_Release(props);
-    if (sig) ID3D10Blob_Release(sig);
     free(dxil);
     free(err);
     d3d12_rtp_free(p);
@@ -7993,13 +8088,18 @@ static int d3d12_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int
     D3D12_DISPATCH_RAYS_DESC dr;
     memset(&dr, 0, sizeof(dr));
     dr.RayGenerationShaderRecord.StartAddress = t;
-    dr.RayGenerationShaderRecord.SizeInBytes = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
-    dr.MissShaderTable.StartAddress = t + D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT;
-    dr.MissShaderTable.SizeInBytes = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
-    dr.MissShaderTable.StrideInBytes = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
-    dr.HitGroupTable.StartAddress = t + 2 * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT;
-    dr.HitGroupTable.SizeInBytes = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
-    dr.HitGroupTable.StrideInBytes = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+    dr.RayGenerationShaderRecord.SizeInBytes = p->stride;
+    dr.MissShaderTable.StartAddress = t + p->off_miss;
+    dr.MissShaderTable.SizeInBytes = p->stride * (UINT64)p->miss_count;
+    dr.MissShaderTable.StrideInBytes = p->stride;
+    dr.HitGroupTable.StartAddress = t + p->off_hit;
+    dr.HitGroupTable.SizeInBytes = p->stride * (UINT64)p->hit_count;
+    dr.HitGroupTable.StrideInBytes = p->stride;
+    if (p->callable_count > 0) {
+        dr.CallableShaderTable.StartAddress = t + p->off_call;
+        dr.CallableShaderTable.SizeInBytes = p->stride * (UINT64)p->callable_count;
+        dr.CallableShaderTable.StrideInBytes = p->stride;
+    }
     dr.Width = (UINT)w;
     dr.Height = (UINT)h;
     dr.Depth = (UINT)d;

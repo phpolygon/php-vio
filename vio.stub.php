@@ -462,7 +462,9 @@ function vio_benchmark_backends(array $options = []): array|false {}
  * structure per distinct mesh (its location-0 positions and indices) and a
  * top-level structure over the instances. Each instance is
  * ['mesh' => VioMesh, 'transform' => float[16]] (column-major 4x4, optional,
- * identity). Shaders query it with GL_EXT_ray_query (rayQueryEXT) in the
+ * identity), optional 'hit_group' (0..7, the RT pipeline hit group) and 'mask'
+ * (0..255, default 0xFF: rays skip it when mask & cull mask is 0). Shaders query
+ * it with GL_EXT_ray_query (rayQueryEXT) in the
  * fragment and compute stages. False + warning where the feature is 0.
  */
 function vio_acceleration_structure(VioContext $context, array $instances): VioAccelerationStructure|false {}
@@ -486,8 +488,18 @@ function vio_acceleration_structure_update(VioContext $context, VioAccelerationS
 function vio_bind_acceleration_structure(VioContext $context, VioAccelerationStructure $accelerationStructure, int $binding): void {}
 
 /**
- * Ray tracing pipeline (VIO_FEATURE_RAYTRACING): one raygen shader, one miss
- * shader and one triangle hit group (closest hit + optional any hit).
+ * Ray tracing pipeline (VIO_FEATURE_RAYTRACING): one raygen shader, one or more
+ * miss shaders, triangle hit groups and callables (OPEN-ITEMS-PLAN A13).
+ * 'miss' => glsl | list<glsl> (traceRayEXT's missIndex picks one), 'hit_groups' =>
+ * list<['closest_hit' => glsl, 'any_hit' => glsl?]> (or the single-group keys
+ * 'closest_hit' / 'any_hit'; an instance's 'hit_group' plus sbtRecordOffset picks
+ * one), 'callables' => list<glsl> (executeCallableEXT(index)), 'records' =>
+ * ['raygen' => bytes, 'miss' => list<bytes>, 'hit_groups' => list<bytes>,
+ * 'callables' => list<bytes>] - each group's shader record, up to 256 bytes, read
+ * as layout(shaderRecordEXT) buffer (D3D12: root constants of a local root
+ * signature, ConstantBuffer<T> : register(b0, space1)). At most 8 of each kind.
+ * D3D12 exports: vio_raygen, vio_miss / vio_miss<k>, vio_closest_hit /
+ * vio_closest_hit<k> (+ vio_any_hit / vio_any_hit<k>), vio_callable<k>.
  * $desc keys: 'raygen', 'miss', 'closest_hit' (GLSL, GL_EXT_ray_tracing,
  * required), 'any_hit' (GLSL, optional), 'max_recursion' (int, default 1),
  * 'payload_size' (bytes, default 32, D3D12 only), 'hlsl' (string, D3D12).

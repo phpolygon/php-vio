@@ -2347,8 +2347,8 @@ static int vk_as_record_tlas(VkCommandBuffer cmd, vio_vk_as *as, const vio_as_in
         memset(&ins[i], 0, sizeof(ins[i]));
         memcpy(ins[i].transform.matrix, src->transform, sizeof(float) * 12);   /* row-major 3x4 */
         ins[i].instanceCustomIndex = (uint32_t)i;
-        ins[i].mask = 0xFF;
-        ins[i].instanceShaderBindingTableRecordOffset = 0;
+        ins[i].mask = (uint32_t)(src->mask & 0xFF);
+        ins[i].instanceShaderBindingTableRecordOffset = (uint32_t)src->hit_group;
         ins[i].flags = VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
         VkAccelerationStructureDeviceAddressInfoKHR ai = {0};
         ai.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
@@ -2681,41 +2681,89 @@ static void vk_rt_unlink(vio_vk_rtp *rt)
 
 static VkDeviceSize vk_align_up(VkDeviceSize v, VkDeviceSize a) { return (v + a - 1) / a * a; }
 
+/* One stage of the pipeline: scan its bindings, make the module. Its index in si[], or -1. */
+static int vk_rt_add_stage(vio_vk_rtp *rt, const uint32_t *spv, size_t size, VkShaderStageFlagBits stage, const char *label,
+                           VkShaderModule *mods, VkPipelineShaderStageCreateInfo *si, uint32_t *count)
+{
+    if (vk_rt_scan(spv, size, stage, rt) != 0) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: ray tracing %s stage: only acceleration structures and storage buffers "
+                         "in set 0 are supported (at most %d bindings)", label, VK_RT_MAX_BINDINGS);
+        return -1;
+    }
+    VkShaderModuleCreateInfo mi = {0};
+    mi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    mi.codeSize = size;
+    mi.pCode = spv;
+    if (vkCreateShaderModule(vio_vk.device, &mi, NULL, &mods[*count]) != VK_SUCCESS) return -1;
+    memset(&si[*count], 0, sizeof(si[0]));
+    si[*count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    si[*count].stage = stage;
+    si[*count].module = mods[*count];
+    si[*count].pName = "main";
+    return (int)(*count)++;
+}
+
 static void *vulkan_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
 {
     if (!desc || !vio_vk.device || !vio_vk.rt_pipeline_supported) return NULL;
-    static const VkShaderStageFlagBits stages[VIO_RT_STAGE_COUNT] = {
-        VK_SHADER_STAGE_RAYGEN_BIT_KHR, VK_SHADER_STAGE_MISS_BIT_KHR,
-        VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, VK_SHADER_STAGE_ANY_HIT_BIT_KHR };
-    static const char *names[VIO_RT_STAGE_COUNT] = { "raygen", "miss", "closest_hit", "any_hit" };
+    if (desc->miss_count < 1 || desc->hit_count < 1) return NULL;
     vio_vk_rtp *rt = calloc(1, sizeof(vio_vk_rtp));
     if (!rt) return NULL;
-    VkShaderModule mods[VIO_RT_STAGE_COUNT] = { VK_NULL_HANDLE };
-    VkPipelineShaderStageCreateInfo si[VIO_RT_STAGE_COUNT];
-    uint32_t stage_index[VIO_RT_STAGE_COUNT];
-    uint32_t stage_count = 0;
-    for (int st = 0; st < VIO_RT_STAGE_COUNT; st++) {
-        stage_index[st] = VK_SHADER_UNUSED_KHR;
-        if (!desc->spirv[st]) {
-            if (st == VIO_RT_STAGE_ANY_HIT) continue;
-            goto fail;
+    enum { MAX_STAGES = 1 + 4 * VIO_RT_MAX_GROUPS, MAX_GROUPS = 1 + 3 * VIO_RT_MAX_GROUPS };
+    VkShaderModule mods[MAX_STAGES];
+    VkPipelineShaderStageCreateInfo si[MAX_STAGES];
+    VkRayTracingShaderGroupCreateInfoKHR groups[MAX_GROUPS];
+    const vio_rt_group_src *group_src[MAX_GROUPS];
+    unsigned char *handles = NULL;
+    uint32_t stage_count = 0, group_count = 0;
+    memset(mods, 0, sizeof(mods));
+    memset(groups, 0, sizeof(groups));
+    for (int g = 0; g < MAX_GROUPS; g++) {
+        groups[g].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        groups[g].generalShader = VK_SHADER_UNUSED_KHR;
+        groups[g].closestHitShader = VK_SHADER_UNUSED_KHR;
+        groups[g].anyHitShader = VK_SHADER_UNUSED_KHR;
+        groups[g].intersectionShader = VK_SHADER_UNUSED_KHR;
+    }
+    /* Groups in table order: raygen, miss shaders, hit groups, callables. */
+    {
+        int s = vk_rt_add_stage(rt, desc->raygen.spirv[0], desc->raygen.spirv_size[0], VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+                                "raygen", mods, si, &stage_count);
+        if (s < 0) goto fail;
+        groups[group_count].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+        groups[group_count].generalShader = (uint32_t)s;
+        group_src[group_count++] = &desc->raygen;
+    }
+    for (int k = 0; k < desc->miss_count; k++) {
+        int s = vk_rt_add_stage(rt, desc->miss[k].spirv[0], desc->miss[k].spirv_size[0], VK_SHADER_STAGE_MISS_BIT_KHR,
+                                "miss", mods, si, &stage_count);
+        if (s < 0) goto fail;
+        groups[group_count].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+        groups[group_count].generalShader = (uint32_t)s;
+        group_src[group_count++] = &desc->miss[k];
+    }
+    for (int k = 0; k < desc->hit_count; k++) {
+        int c = vk_rt_add_stage(rt, desc->hit[k].spirv[0], desc->hit[k].spirv_size[0], VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
+                                "closest hit", mods, si, &stage_count);
+        if (c < 0) goto fail;
+        int a = -2;
+        if (desc->hit[k].spirv[1]) {
+            a = vk_rt_add_stage(rt, desc->hit[k].spirv[1], desc->hit[k].spirv_size[1], VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
+                                "any hit", mods, si, &stage_count);
+            if (a < 0) goto fail;
         }
-        if (vk_rt_scan(desc->spirv[st], desc->spirv_size[st], stages[st], rt) != 0) {
-            php_error_docref(NULL, E_WARNING, "Vulkan: ray tracing %s stage: only acceleration structures and storage buffers "
-                             "in set 0 are supported (at most %d bindings)", names[st], VK_RT_MAX_BINDINGS);
-            goto fail;
-        }
-        VkShaderModuleCreateInfo mi = {0};
-        mi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        mi.codeSize = desc->spirv_size[st];
-        mi.pCode = desc->spirv[st];
-        if (vkCreateShaderModule(vio_vk.device, &mi, NULL, &mods[st]) != VK_SUCCESS) goto fail;
-        memset(&si[stage_count], 0, sizeof(si[0]));
-        si[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        si[stage_count].stage = stages[st];
-        si[stage_count].module = mods[st];
-        si[stage_count].pName = "main";
-        stage_index[st] = stage_count++;
+        groups[group_count].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+        groups[group_count].closestHitShader = (uint32_t)c;
+        groups[group_count].anyHitShader = a >= 0 ? (uint32_t)a : VK_SHADER_UNUSED_KHR;
+        group_src[group_count++] = &desc->hit[k];
+    }
+    for (int k = 0; k < desc->callable_count; k++) {
+        int s = vk_rt_add_stage(rt, desc->callable[k].spirv[0], desc->callable[k].spirv_size[0], VK_SHADER_STAGE_CALLABLE_BIT_KHR,
+                                "callable", mods, si, &stage_count);
+        if (s < 0) goto fail;
+        groups[group_count].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+        groups[group_count].generalShader = (uint32_t)s;
+        group_src[group_count++] = &desc->callable[k];
     }
 
     VkDescriptorSetLayoutCreateInfo dl = {0};
@@ -2750,28 +2798,11 @@ static void *vulkan_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
         if (vkAllocateDescriptorSets(vio_vk.device, &ai, &rt->set) != VK_SUCCESS) goto fail;
     }
 
-    VkRayTracingShaderGroupCreateInfoKHR groups[3];
-    memset(groups, 0, sizeof(groups));
-    for (int g = 0; g < 3; g++) {
-        groups[g].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-        groups[g].generalShader = VK_SHADER_UNUSED_KHR;
-        groups[g].closestHitShader = VK_SHADER_UNUSED_KHR;
-        groups[g].anyHitShader = VK_SHADER_UNUSED_KHR;
-        groups[g].intersectionShader = VK_SHADER_UNUSED_KHR;
-    }
-    groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[0].generalShader = stage_index[VIO_RT_STAGE_RAYGEN];
-    groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[1].generalShader = stage_index[VIO_RT_STAGE_MISS];
-    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
-    groups[2].closestHitShader = stage_index[VIO_RT_STAGE_CLOSEST_HIT];
-    groups[2].anyHitShader = stage_index[VIO_RT_STAGE_ANY_HIT];
-
     VkRayTracingPipelineCreateInfoKHR ci = {0};
     ci.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
     ci.stageCount = stage_count;
     ci.pStages = si;
-    ci.groupCount = 3;
+    ci.groupCount = group_count;
     ci.pGroups = groups;
     ci.maxPipelineRayRecursionDepth = (uint32_t)desc->max_recursion < vio_vk.rt_max_recursion
                                     ? (uint32_t)desc->max_recursion : vio_vk.rt_max_recursion;
@@ -2784,38 +2815,62 @@ static void *vulkan_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
         goto fail;
     }
 
-    /* Shader binding table: raygen | miss | hit, one record each. */
+    /* Shader binding table: raygen | miss | hit | callable regions, each aligned to
+     * shaderGroupBaseAlignment; a record is the handle plus the group's shader
+     * record data (shaderRecordEXT, A13), padded to shaderGroupHandleAlignment. */
     uint32_t hs = vio_vk.rt_handle_size;
-    VkDeviceSize stride = vk_align_up(hs, vio_vk.rt_handle_alignment);
-    VkDeviceSize region = vk_align_up(stride, vio_vk.rt_base_alignment);
-    unsigned char handles[3 * 64];
-    if (hs > 64 || ((PFN_vkGetRayTracingShaderGroupHandlesKHR)vio_vk.fn_get_rt_group_handles)(
-            vio_vk.device, rt->pipeline, 0, 3, (size_t)3 * hs, handles) != VK_SUCCESS) goto fail;
-    if (vk_as_buffer(3 * region + vio_vk.rt_base_alignment, VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR, 1, &rt->sbt) != 0) goto fail;
+    VkDeviceSize ba = vio_vk.rt_base_alignment;
+    VkDeviceSize rec = vk_align_up(hs + (VkDeviceSize)desc->record_size, vio_vk.rt_handle_alignment);
+    VkDeviceSize off_miss = vk_align_up(rec, ba);
+    VkDeviceSize off_hit = off_miss + vk_align_up(rec * (VkDeviceSize)desc->miss_count, ba);
+    VkDeviceSize off_call = off_hit + vk_align_up(rec * (VkDeviceSize)desc->hit_count, ba);
+    VkDeviceSize total = off_call + vk_align_up(rec * (VkDeviceSize)(desc->callable_count > 0 ? desc->callable_count : 1), ba);
+    handles = malloc((size_t)group_count * hs);
+    if (!handles || ((PFN_vkGetRayTracingShaderGroupHandlesKHR)vio_vk.fn_get_rt_group_handles)(
+            vio_vk.device, rt->pipeline, 0, group_count, (size_t)group_count * hs, handles) != VK_SUCCESS) goto fail;
+    if (vk_as_buffer(total + ba, VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR, 1, &rt->sbt) != 0) goto fail;
     VkDeviceAddress base = vk_buffer_address(rt->sbt.buf);
-    VkDeviceAddress aligned = (VkDeviceAddress)vk_align_up(base, vio_vk.rt_base_alignment);
+    VkDeviceAddress aligned = (VkDeviceAddress)vk_align_up(base, ba);
     unsigned char *map = NULL;
     if (vkMapMemory(vio_vk.device, rt->sbt.mem, 0, VK_WHOLE_SIZE, 0, (void **)&map) != VK_SUCCESS || !map) goto fail;
-    for (int g = 0; g < 3; g++) memcpy(map + (aligned - base) + (VkDeviceSize)g * region, handles + (size_t)g * hs, hs);
+    unsigned char *at = map + (aligned - base);
+    memset(at, 0, (size_t)total);
+    for (uint32_t g = 0; g < group_count; g++) {
+        VkDeviceSize o;
+        if (g == 0) o = 0;
+        else if (g <= (uint32_t)desc->miss_count) o = off_miss + (g - 1) * rec;
+        else if (g <= (uint32_t)(desc->miss_count + desc->hit_count)) o = off_hit + (g - 1 - desc->miss_count) * rec;
+        else o = off_call + (g - 1 - desc->miss_count - desc->hit_count) * rec;
+        memcpy(at + o, handles + (size_t)g * hs, hs);
+        if (desc->record_size > 0) memcpy(at + o + hs, group_src[g]->record, (size_t)desc->record_size);
+    }
     vkUnmapMemory(vio_vk.device, rt->sbt.mem);
+    free(handles);
+    handles = NULL;
     rt->rgen.deviceAddress = aligned;
-    rt->rgen.stride = region;          /* raygen: size == stride */
-    rt->rgen.size = region;
-    rt->miss.deviceAddress = aligned + region;
-    rt->miss.stride = stride;
-    rt->miss.size = region;
-    rt->hit.deviceAddress = aligned + 2 * region;
-    rt->hit.stride = stride;
-    rt->hit.size = region;
+    rt->rgen.stride = rec;          /* raygen: size == stride */
+    rt->rgen.size = rec;
+    rt->miss.deviceAddress = aligned + off_miss;
+    rt->miss.stride = rec;
+    rt->miss.size = rec * (VkDeviceSize)desc->miss_count;
+    rt->hit.deviceAddress = aligned + off_hit;
+    rt->hit.stride = rec;
+    rt->hit.size = rec * (VkDeviceSize)desc->hit_count;
+    if (desc->callable_count > 0) {
+        rt->call.deviceAddress = aligned + off_call;
+        rt->call.stride = rec;
+        rt->call.size = rec * (VkDeviceSize)desc->callable_count;
+    }
 
-    for (int st = 0; st < VIO_RT_STAGE_COUNT; st++) if (mods[st]) vkDestroyShaderModule(vio_vk.device, mods[st], NULL);
+    for (uint32_t s = 0; s < stage_count; s++) if (mods[s]) vkDestroyShaderModule(vio_vk.device, mods[s], NULL);
     rt->next = vk_live_rtp;
     if (vk_live_rtp) vk_live_rtp->prev = rt;
     vk_live_rtp = rt;
     return rt;
 
 fail:
-    for (int st = 0; st < VIO_RT_STAGE_COUNT; st++) if (mods[st]) vkDestroyShaderModule(vio_vk.device, mods[st], NULL);
+    free(handles);
+    for (uint32_t s = 0; s < MAX_STAGES; s++) if (mods[s]) vkDestroyShaderModule(vio_vk.device, mods[s], NULL);
     vk_rt_release_gpu(rt);
     free(rt);
     return NULL;
