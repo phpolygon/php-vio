@@ -934,7 +934,8 @@ jobs:
             tests/core/212_audit_gate_no_glfw_outside_platform.phpt `
             tests/window/213_win32_platform.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt `
-            tests/backends/168_d3d12_pipeline_freed_after_frame.phpt
+            tests/backends/168_d3d12_pipeline_freed_after_frame.phpt `
+            tests/backends/221_d3d12_capture_mid_frame_keeps_list_state.phpt
 
       - name: Package binary
         shell: pwsh
