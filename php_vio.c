@@ -4,6 +4,7 @@
  */
 
 #include "php_vio.h"
+#include "zend_exceptions.h"   /* zend_clear_exception: clang rejects the implicit declaration */
 
 #if defined(ZTS) && defined(COMPILE_DL_VIO)
 ZEND_TSRMLS_CACHE_DEFINE()
