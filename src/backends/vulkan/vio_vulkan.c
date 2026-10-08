@@ -1054,15 +1054,6 @@ static void cleanup_swapchain(void)
         vio_vk.depth_memory = VK_NULL_HANDLE;
     }
 
-    if (vio_vk.framebuffers) {
-        for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
-            if (vio_vk.framebuffers[i]) {
-                vkDestroyFramebuffer(vio_vk.device, vio_vk.framebuffers[i], NULL);
-            }
-        }
-        free(vio_vk.framebuffers);
-        vio_vk.framebuffers = NULL;
-    }
 
     if (vio_vk.swapchain_image_views) {
         for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
@@ -1508,26 +1499,6 @@ static int create_swapchain(void)
         goto fail_cleanup;
     }
 
-    /* Create framebuffers (calloc — see image-views note above). */
-    vio_vk.framebuffers = calloc(vio_vk.swapchain_image_count, sizeof(VkFramebuffer));
-    for (uint32_t i = 0; i < vio_vk.swapchain_image_count; i++) {
-        VkImageView attachments[] = { vio_vk.swapchain_image_views[i], vio_vk.depth_view };
-
-        VkFramebufferCreateInfo fb_info = {0};
-        fb_info.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        fb_info.renderPass      = vio_vk.render_pass;
-        fb_info.attachmentCount = 2;
-        fb_info.pAttachments    = attachments;
-        fb_info.width           = extent.width;
-        fb_info.height          = extent.height;
-        fb_info.layers          = 1;
-
-        if (vkCreateFramebuffer(vio_vk.device, &fb_info, NULL, &vio_vk.framebuffers[i]) != VK_SUCCESS) {
-            php_error_docref(NULL, E_WARNING, "Failed to create framebuffer %u", i);
-            goto fail_cleanup;
-        }
-    }
-
     /* Create one render_finished semaphore PER SWAPCHAIN IMAGE (see the field
      * comment in vio_vulkan.h). Sized to swapchain_image_count, which may differ
      * across recreates — cleanup_swapchain() destroys these, so the count is
@@ -1556,80 +1527,6 @@ fail_cleanup:
      * not proceed with half-built state. */
     cleanup_swapchain();
     return -1;
-}
-
-/* ── Render pass creation ────────────────────────────────────────── */
-
-static int create_render_pass(VkFormat color_format)
-{
-    VkFormat depth_format = find_depth_format();
-
-    VkAttachmentDescription attachments[2] = {0};
-    /* Color attachment */
-    attachments[0].format         = color_format;
-    attachments[0].samples        = VK_SAMPLE_COUNT_1_BIT;
-    attachments[0].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    attachments[0].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-    attachments[0].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachments[0].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-    attachments[0].finalLayout    = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-    /* Depth attachment */
-    attachments[1].format         = depth_format;
-    attachments[1].samples        = VK_SAMPLE_COUNT_1_BIT;
-    attachments[1].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    attachments[1].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;   /* kept across a pass restart */
-    attachments[1].stencilLoadOp  = vio_vk.depth_has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachments[1].stencilStoreOp = vio_vk.depth_has_stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachments[1].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-    attachments[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkAttachmentReference color_ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-    VkAttachmentReference depth_ref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
-
-    VkSubpassDescription subpass = {0};
-    subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount    = 1;
-    subpass.pColorAttachments       = &color_ref;
-    subpass.pDepthStencilAttachment = &depth_ref;
-
-    /* External dependency. The source scope MUST cover the PRIOR frame's
-     * attachment writes (color store at COLOR_ATTACHMENT_OUTPUT, depth store at
-     * LATE_FRAGMENT_TESTS) so they complete before this frame's loadOp clears /
-     * layout transitions write the same attachments. Omitting LATE_FRAGMENT_TESTS
-     * + the WRITE access bits from the source leaves a depth WRITE_AFTER_WRITE
-     * hazard across consecutive frames that synchronization validation flags.
-     * Both EARLY and LATE fragment-test stages are listed for depth; color uses
-     * COLOR_ATTACHMENT_OUTPUT for both load and store. */
-    VkSubpassDependency dep = {0};
-    dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
-    dep.dstSubpass    = 0;
-    dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-                      | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
-                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
-                      | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-                      | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
-                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-    VkRenderPassCreateInfo rp_info = {0};
-    rp_info.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    rp_info.attachmentCount = 2;
-    rp_info.pAttachments    = attachments;
-    rp_info.subpassCount    = 1;
-    rp_info.pSubpasses      = &subpass;
-    rp_info.dependencyCount = 1;
-    rp_info.pDependencies   = &dep;
-
-    if (vkCreateRenderPass(vio_vk.device, &rp_info, NULL, &vio_vk.render_pass) != VK_SUCCESS) {
-        php_error_docref(NULL, E_WARNING, "Failed to create Vulkan render pass");
-        return -1;
-    }
-
-    return 0;
 }
 
 /* ── Per-frame resources ─────────────────────────────────────────── */
@@ -1812,14 +1709,11 @@ int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
         return -1;
     }
 
-    /* 6. Render pass. The color format MUST match the swapchain format chosen
-     * in create_swapchain() (B8G8R8A8_UNORM preferred) so the framebuffers and
-     * the 2D pipelines are render-pass-compatible. */
-    VkFormat color_format = vk_choose_surface_format().format;
+    /* 6. Depth format (sets depth_has_stencil); passes are dynamic rendering
+     * (VULKAN-MODERN-PLAN phase 4), there is no render-pass object. */
+    (void)find_depth_format();
 
-    if (create_render_pass(color_format) != 0) return -1;
-
-    /* 7. Swapchain + framebuffers */
+    /* 7. Swapchain */
     if (create_swapchain() != 0) return -1;
 
     /* 8. Per-frame resources */
@@ -2051,14 +1945,7 @@ static void vulkan_shutdown(void)
         destroy_frame_resources();
         cleanup_swapchain();
 
-        if (vio_vk.swapchain_resume_render_pass) {
-            vkDestroyRenderPass(vio_vk.device, vio_vk.swapchain_resume_render_pass, NULL);
-            vio_vk.swapchain_resume_render_pass = VK_NULL_HANDLE;
-        }
-        if (vio_vk.render_pass) {
-            vkDestroyRenderPass(vio_vk.device, vio_vk.render_pass, NULL);
-            vio_vk.render_pass = VK_NULL_HANDLE;
-        }
+
     }
     if (vio_vk.device) {
         /* Bindless table (the pool frees its set). */
@@ -3122,17 +3009,14 @@ static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, in
     if (in_frame) {
         VkCommandBuffer fcmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
         /* No trace inside a render pass: close it, trace, resume with LOAD. */
-        int had_pass = vio_vk.cur_render_pass != VK_NULL_HANDLE;
+        int had_pass = vio_vk.in_pass;
         VkViewport vp[16];
         VkRect2D sc[16];
         uint32_t vp_count = vio_vk.cur_vp_count ? vio_vk.cur_vp_count : 1;
         if (vp_count > 16) vp_count = 16;
         memcpy(vp, vio_vk.cur_vp, sizeof(VkViewport) * vp_count);
         memcpy(sc, vio_vk.cur_sc, sizeof(VkRect2D) * vp_count);
-        if (had_pass) {
-            vkCmdEndRenderPass(fcmd);
-            vio_vk.cur_render_pass = VK_NULL_HANDLE;
-        }
+        vio_vk_pass_end(fcmd);
         VkMemoryBarrier fb = {0};
         fb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         fb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
@@ -3709,7 +3593,7 @@ static void vulkan_begin_frame(void)
     vio_2d_vulkan_reset_frame_descriptors(vio_vk.current_frame);
     vio_vk3d_begin_frame(vio_vk.current_frame);   /* 3D ring / pools / deferred destroys (Block 10) */
     vkc_pools_reset((int)vio_vk.current_frame);     /* compute descriptor sets of this slot */
-    vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vio_vk.in_pass = 0;
     vio_vk.acquire_consumed = 0;
 
     if (offscreen) {
@@ -3799,50 +3683,32 @@ static void vulkan_begin_frame(void)
         vkCmdWriteTimestamp(f->cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * VIO_GPU_TS_PER_FRAME);
     }
 
-    /* Begin render pass */
-    VkClearValue clear_values[2];
-    clear_values[0].color.float32[0] = vio_vk.clear_r;
-    clear_values[0].color.float32[1] = vio_vk.clear_g;
-    clear_values[0].color.float32[2] = vio_vk.clear_b;
-    clear_values[0].color.float32[3] = vio_vk.clear_a;
-    clear_values[1].depthStencil.depth   = 1.0f;
-    clear_values[1].depthStencil.stencil = 0;
-
-    VkRenderPassBeginInfo rp_begin = {0};
-    rp_begin.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp_begin.renderPass        = vio_vk.render_pass;
-    rp_begin.framebuffer       = vio_vk.framebuffers[vio_vk.current_image_index];
-    rp_begin.renderArea.offset = (VkOffset2D){0, 0};
-    rp_begin.renderArea.extent = vio_vk.swapchain_extent;
-    rp_begin.clearValueCount   = 2;
-    rp_begin.pClearValues      = clear_values;
-
-    vkCmdBeginRenderPass(f->cmd_buf, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
-    vio_vk.cur_render_pass      = vio_vk.render_pass;
-    vio_vk.cur_color_count      = 1;
-    vio_vk.cur_color_formats[0] = vio_vk.swapchain_format;
-    vio_vk.cur_samples          = 1;
-    vio_vk.cur_has_depth        = 1;
-    vio_vk.cur_width            = vio_vk.swapchain_extent.width;
-    vio_vk.cur_height           = vio_vk.swapchain_extent.height;
-    vio_vk.cur_layers           = 1;
-
-    /* Set dynamic viewport and scissor */
-    VkViewport viewport = {0};
-    viewport.x        = 0.0f;
-    viewport.y        = 0.0f;
-    viewport.width    = (float)vio_vk.swapchain_extent.width;
-    viewport.height   = (float)vio_vk.swapchain_extent.height;
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(f->cmd_buf, 0, 1, &viewport);
-
-    VkRect2D scissor = {0};
-    scissor.offset = (VkOffset2D){0, 0};
-    scissor.extent = vio_vk.swapchain_extent;
-    vkCmdSetScissor(f->cmd_buf, 0, 1, &scissor);
-    vio_vk_note_viewport(&viewport, &scissor);
-
+    /* The swapchain pass: CLEAR colour and depth (dynamic rendering). The depth
+     * image is shared by every frame: its clear must wait for the previous
+     * frame's depth writes, which a transition out of UNDEFINED with an empty
+     * source scope would not (a WRITE_AFTER_WRITE hazard for sync validation). */
+    {
+        VkImageMemoryBarrier db = {0};
+        db.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        db.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+        db.newLayout           = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        db.srcAccessMask       = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        db.dstAccessMask       = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        db.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        db.image               = vio_vk.depth_image;
+        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | (vio_vk.depth_has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+        db.subresourceRange.levelCount = 1;
+        db.subresourceRange.layerCount = 1;
+        vio_vk_pipeline_barrier(f->cmd_buf, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                0, 0, NULL, 0, NULL, 1, &db);
+        vio_vk_pass pass;
+        vio_vk_swapchain_pass(&pass, 1);
+        /* depth: now in the attachment layout, cleared by the pass */
+        pass.depth.rest = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        vio_vk_pass_begin(f->cmd_buf, &pass);
+    }
     vio_vk.in_frame = 1;
     /* B1 — a normal swapchain frame is now fully opened (image acquired, command
      * buffer begun, swapchain pass started): it is presentable. */
@@ -3872,6 +3738,17 @@ static void vulkan_capture_frame(VkCommandBuffer cmd)
         vio_vk.capture_size = need;
     }
     VkImage img = vio_vk.swapchain_images[vio_vk.current_image_index];
+    /* Every frame copies into the same buffer: order this copy after the
+     * previous frame's (a WRITE_AFTER_WRITE hazard for synchronization validation). */
+    VkBufferMemoryBarrier bb = {0};
+    bb.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bb.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bb.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer              = vio_vk.capture_buf;
+    bb.size                = VK_WHOLE_SIZE;
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
     vio_vk_image_barrier(cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy copy = {0};
     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -3880,6 +3757,9 @@ static void vulkan_capture_frame(VkCommandBuffer cmd)
     copy.imageExtent.height = h;
     copy.imageExtent.depth  = 1;
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vio_vk.capture_buf, 1, &copy);
+    /* ... and visible to vio_read_pixels on the host. */
+    bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
     vio_vk_image_barrier(cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     vio_vk.capture_w = w;
     vio_vk.capture_h = h;
@@ -3918,10 +3798,8 @@ static void vulkan_end_frame(void)
          * block; the warm unbind happens AFTER vio_end so it never ran yet). End
          * it only if it was actually opened (current_bound_rt set) — a deferred
          * bind that no-op'd on an invalid RT would leave no pass open. */
-        if (vio_vk.cur_render_pass) {
-            vkCmdEndRenderPass(f->cmd_buf);
-        }
-        vio_vk.cur_render_pass = VK_NULL_HANDLE;
+        vio_vk_pass_end(f->cmd_buf);
+
         vio_vk_fs_storage_host_barrier(f->cmd_buf);
         if (vio_vk.ts_pool) {
             vkCmdWriteTimestamp(f->cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * VIO_GPU_TS_PER_FRAME + 1);
@@ -3939,8 +3817,7 @@ static void vulkan_end_frame(void)
     }
 
     /* End render pass and command buffer */
-    if (vio_vk.cur_render_pass) vkCmdEndRenderPass(f->cmd_buf);
-    vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vio_vk_pass_end(f->cmd_buf);
     vio_vk_fs_storage_host_barrier(f->cmd_buf);
     vulkan_capture_frame(f->cmd_buf);
     if (vio_vk.ts_pool) {
@@ -4679,17 +4556,14 @@ static void vulkan_dispatch_compute(vio_compute_cmd *cmd)
         VkCommandBuffer fcmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
         /* A dispatch cannot run inside a render pass: close it, dispatch, then
          * resume the same target with LOAD (viewports restored). */
-        int had_pass = vio_vk.cur_render_pass != VK_NULL_HANDLE;
+        int had_pass = vio_vk.in_pass;
         VkViewport vp[16];
         VkRect2D sc[16];
         uint32_t vp_count = vio_vk.cur_vp_count ? vio_vk.cur_vp_count : 1;
         if (vp_count > 16) vp_count = 16;
         memcpy(vp, vio_vk.cur_vp, sizeof(VkViewport) * vp_count);
         memcpy(sc, vio_vk.cur_sc, sizeof(VkRect2D) * vp_count);
-        if (had_pass) {
-            vkCmdEndRenderPass(fcmd);
-            vio_vk.cur_render_pass = VK_NULL_HANDLE;
-        }
+        vio_vk_pass_end(fcmd);
         vio_vk_pipeline_barrier(fcmd, graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &pre, 0, NULL, 0, NULL);
         vkCmdBindPipeline(fcmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline);
@@ -4792,15 +4666,14 @@ void vio_vk_flush_frame(void)
     if (!vio_vk.in_frame) return;
     vio_vk_frame *f = &vio_vk.frames[vio_vk.current_frame];
     VkCommandBuffer cmd = f->cmd_buf;
-    int had_pass = vio_vk.cur_render_pass != VK_NULL_HANDLE;
+    int had_pass = vio_vk.in_pass;
     VkViewport vp[16];
     VkRect2D sc[16];
     uint32_t vp_count = vio_vk.cur_vp_count ? vio_vk.cur_vp_count : 1;
     if (vp_count > 16) vp_count = 16;
     memcpy(vp, vio_vk.cur_vp, sizeof(VkViewport) * vp_count);
     memcpy(sc, vio_vk.cur_sc, sizeof(VkRect2D) * vp_count);
-    if (had_pass) vkCmdEndRenderPass(cmd);
-    vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vio_vk_pass_end(cmd);
     vio_vk_fs_storage_host_barrier(cmd);
     vkEndCommandBuffer(cmd);
 
@@ -4843,13 +4716,12 @@ void vio_vk_flush_frame(void)
 static int vulkan_capture_midframe(void)
 {
     if (!vio_vk.headless || vio_vk.frame_is_offscreen || !vio_vk.frame_presentable ||
-        vio_vk.current_bound_rt || !vio_vk.cur_render_pass) {
+        vio_vk.current_bound_rt || !vio_vk.in_pass) {
         return -1;
     }
     vio_vk_frame *f = &vio_vk.frames[vio_vk.current_frame];
     VkCommandBuffer cmd = f->cmd_buf;
-    vkCmdEndRenderPass(cmd);
-    vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vio_vk_pass_end(cmd);
     vio_vk.capture_valid = 0;
     vulkan_capture_frame(cmd);
     vkEndCommandBuffer(cmd);

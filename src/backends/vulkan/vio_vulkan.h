@@ -75,10 +75,41 @@ typedef struct _vio_vulkan_compute_buffer {
     struct _vio_vulkan_compute_buffer *next, *prev;
 } vio_vulkan_compute_buffer;
 
+/* A pass on dynamic rendering (VULKAN-MODERN-PLAN phase 4): one attachment -
+ * the view drawn into, its image and subresource range, and the layout the
+ * image rests in between passes (SHADER_READ_ONLY for a sampled target,
+ * COLOR_ATTACHMENT for an MSAA colour image, READ_ONLY for a depth-only
+ * target, PRESENT_SRC for the swapchain). A multisampled colour attachment
+ * names its single-sample resolve target too. */
+typedef struct _vio_vk_pass_att {
+    VkImageView              view;
+    VkImage                  image;
+    VkImageSubresourceRange  range;
+    VkImageLayout            rest;
+    VkImageView              resolve_view;    /* VK_NULL_HANDLE: no resolve */
+    VkImage                  resolve_image;
+    VkImageSubresourceRange  resolve_range;
+    VkImageLayout            resolve_rest;
+} vio_vk_pass_att;
+
+typedef struct _vio_vk_pass {
+    int              count;              /* colour attachments, 0..4 */
+    vio_vk_pass_att  color[4];
+    VkFormat         color_format[4];
+    int              has_depth;
+    vio_vk_pass_att  depth;
+    int              samples;
+    uint32_t         width, height;
+    uint32_t         layers;             /* layered bind: every layer; 1 otherwise */
+    uint32_t         view_mask;          /* multiview: views 0..n-1; 0 = off */
+    int              clear;              /* CLEAR instead of LOAD (the swapchain's first pass of a frame) */
+    int              swapchain;          /* colour 0 is the acquired swapchain image */
+} vio_vk_pass;
+
 /* Render target resources (rt->vulkan_rt, vio_vulkan_rt.c, GAP-PHASE5 Block 10b). */
 typedef struct _vio_vk_rt {
     int            count;          /* colour attachments (0 = depth-only) */
-    int            cube;           /* 6-layer colour image, one framebuffer per (face, level) */
+    int            cube;           /* 6-layer colour image, a view per (face, level) */
     int            layers;         /* bindable layers: 6 (cube), N (array, 'layers' => N) or 1 */
     int            levels;         /* mip levels of the colour image */
     int            samples;        /* effective sample count (1 = off) */
@@ -96,33 +127,24 @@ typedef struct _vio_vk_rt {
     VkImage        msaa_depth_image;
     void          *msaa_depth_alloc;
     VkImageView    msaa_depth_view;
-    VkFramebuffer  dres_fb;
     VkDescriptorPool dres_pool;
     VkDescriptorSet  dres_set;
     VkImage        depth_image;
     void          *depth_alloc;
     VkImageView    depth_view;
-    VkRenderPass   pass;           /* colour (+ resolve) + depth, CLEAR */
-    VkRenderPass   pass_nodepth;   /* cube levels > 0 */
-    VkFramebuffer  fb;             /* 2D targets */
-    VkFramebuffer *face_fb;        /* cube / array: [layer * levels + level] */
-    VkImageView   *face_view;      /* colour view per (layer, level) */
+    VkImageView   *face_view;      /* cube / array: colour view per [layer * levels + level] */
     VkImageView   *depth_face_view;/* cube / array: depth view per layer (level 0) */
     VkImageView    cube_view;      /* colour CUBE view, or the colour 2D_ARRAY view of an array */
     VkImageView    all_color_view; /* layered bind: colour 2D_ARRAY over every layer, level 0 */
     VkImageView    all_depth_view; /* layered bind: depth 2D_ARRAY over every layer */
-    VkFramebuffer  all_fb;         /* layered bind: framebuffer with layers = N (VIO_RT_ALL_LAYERS) */
-    VkRenderPass   mv_pass[3];     /* multiview passes for 2 / 3 / 4 views (viewMask), lazily */
-    VkFramebuffer  mv_fb[3];       /* their framebuffers: the 2D_ARRAY views, layers = 1 */
     VkSampler      sampler;
     /* depth_only + 'mipmaps' (A26): the depth chain, a sampling view over every
      * level and, built on the first vio_generate_mipmaps, per level the
-     * attachment view, the source view, a framebuffer and a descriptor set. */
+     * attachment view, the source view and a descriptor set. */
     int            depth_levels;
     VkImageView    depth_sample_view;
     VkImageView   *dmip_att;
     VkImageView   *dmip_src;
-    VkFramebuffer *dmip_fb;
     VkDescriptorPool dmip_pool;
     VkDescriptorSet *dmip_set;
     struct _vio_vulkan_texture *wrap[4];   /* sampling wrappers (vio_render_target_texture) */
@@ -159,19 +181,6 @@ typedef struct _vio_vulkan_state {
      * (both recreate and shutdown wait the device idle first). */
     VkSemaphore             *render_finished_per_image;
 
-    /* Render pass & framebuffers */
-    VkRenderPass             render_pass;
-    VkFramebuffer           *framebuffers;
-
-    /* Swapchain "resume" render pass — render-pass-compatible with render_pass
-     * (identical attachment formats/samples) but with color/depth loadOp=LOAD and
-     * initialLayout matching what the primary pass leaves behind (color
-     * PRESENT_SRC_KHR, depth DEPTH_STENCIL_ATTACHMENT_OPTIMAL). Used by
-     * vio_unbind_render_target to re-open the swapchain pass mid-frame WITHOUT
-     * clearing prior swapchain draws after an offscreen pass ran. Created lazily
-     * on first mid-frame unbind, destroyed in vulkan_shutdown. NULL until then,
-     * so a normal frame (no offscreen RT) never touches it. */
-    VkRenderPass             swapchain_resume_render_pass;
 
     /* Depth buffer */
     VkImage                  depth_image;
@@ -279,10 +288,12 @@ typedef struct _vio_vulkan_state {
     int                      frame_presentable;
     float                    clear_r, clear_g, clear_b, clear_a;
 
-    /* 3D pipeline (GAP-PHASE5 Block 10): the render pass open on the frame
-     * command buffer and its attachment signature - pipeline variants are keyed
-     * by it. cur_render_pass is VK_NULL_HANDLE outside a pass. */
-    VkRenderPass             cur_render_pass;
+    /* The pass open on the frame command buffer (dynamic rendering,
+     * VULKAN-MODERN-PLAN phase 4) and its attachment signature - pipeline
+     * variants are keyed by the formats, samples, depth and view mask. */
+    int                      in_pass;
+    vio_vk_pass              cur_pass;
+    uint32_t                 cur_view_mask;
     int                      cur_color_count;
     VkFormat                 cur_color_formats[4];
     int                      cur_samples;
@@ -567,8 +578,18 @@ void vio_vk_image_barrier_range(VkCommandBuffer cmd, VkImage image, VkImageAspec
 void vio_vk_release_texture(vio_vulkan_texture *tex);   /* GPU objects (deferred mid-frame) + the wrapper */
 
 /* ── Render targets, cubemaps, mips (GAP-PHASE5 Block 10b, vio_vulkan_rt.c / vio_vulkan_cube.c) ── */
-VkRenderPass vio_vk_swapchain_resume_pass(void);
+/* Dynamic rendering (VULKAN-MODERN-PLAN phase 4): begin = attachments from
+ * their resting layouts into the attachment layouts + vkCmdBeginRendering +
+ * viewport / scissor over the pass + the cur_* signature; end =
+ * vkCmdEndRendering + back to the resting layouts. vio_vk_pass_end is a no-op
+ * without an open pass. */
+void  vio_vk_pass_begin(VkCommandBuffer cmd, const vio_vk_pass *pass);
+void  vio_vk_pass_end(VkCommandBuffer cmd);
+/* The swapchain pass of the acquired image (clear = the frame's first). */
+void  vio_vk_swapchain_pass(vio_vk_pass *pass, int clear);
 void  vio_vk_resume_swapchain_pass(VkCommandBuffer cmd);
+/* Attachment formats of a pipeline for the pass open now (VkPipelineRenderingCreateInfo). */
+void  vio_vk_pass_rendering_info(VkPipelineRenderingCreateInfo *info);
 /* Reopen the pass that was open before (bound render target layer / level, or the
  * swapchain) with LOAD, after vkCmdEndRenderPass for a compute dispatch or a flush. */
 void  vio_vk_resume_pass(VkCommandBuffer cmd);

@@ -670,7 +670,7 @@ void vio_2d_flush(vio_2d_state *state)
      * incompatible pass (HDR / depth-only target) instead of a validation error. */
     if (state->backend == VIO_2D_BACKEND_VULKAN && state->vulkan_state
             && vio_vk.initialized && vio_vk.in_frame
-            && (vio_vk.cur_render_pass == VK_NULL_HANDLE ||
+            && (!vio_vk.in_pass ||
                 (vio_vk.cur_color_count == 1 && vio_vk.cur_color_formats[0] == vio_vk.swapchain_format &&
                  vio_vk.cur_samples <= 1 && vio_vk.cur_has_depth))) {
         vio_2d_vulkan_state *vk = (vio_2d_vulkan_state *)state->vulkan_state;

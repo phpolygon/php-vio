@@ -846,11 +846,11 @@ static uint64_t vk3d_mix(uint64_t h, uint64_t v)
     return h;
 }
 
-/* The pipeline for the render pass currently open (attachment signature) and the
+/* The pipeline for the pass currently open (attachment signature) and the
  * mesh vertex stride, created on first use. */
 VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
 {
-    if (!p || p->dead || !p->shader || p->shader->dead || !vio_vk.cur_render_pass) return VK_NULL_HANDLE;
+    if (!p || p->dead || !p->shader || p->shader->dead || !vio_vk.in_pass) return VK_NULL_HANDLE;
     if (stride == 0) stride = p->vertex_stride;
     int cc = vio_vk.cur_color_count > 4 ? 4 : vio_vk.cur_color_count;
     uint64_t key = 1469598103934665603ULL;
@@ -862,6 +862,7 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     const vio_mesh_layout *ml = p->shader->is_mesh ? NULL : &vio_vk.mesh_layout;
     key = vk3d_mix(key, (uint64_t)(ml ? ml->key : 0));   /* the mesh's attribute offsets */
     key = vk3d_mix(key, (uint64_t)p->desc.view_count);   /* multiview pass (viewMask) */
+    key = vk3d_mix(key, (uint64_t)vio_vk.cur_view_mask);
     for (int i = 0; i < p->variant_count; i++) {
         if (p->variants[i].key == key) return p->variants[i].pipeline;
     }
@@ -1019,8 +1020,11 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     gi.pColorBlendState    = &cb;
     gi.pDynamicState       = &dyn;
     gi.layout              = p->shader->layout;
-    gi.renderPass          = vio_vk.cur_render_pass;
-    gi.subpass             = 0;
+    /* Dynamic rendering (VULKAN-MODERN-PLAN phase 4): the attachment formats
+     * of the open pass instead of a render-pass object. */
+    VkPipelineRenderingCreateInfo rendering;
+    vio_vk_pass_rendering_info(&rendering);
+    gi.pNext               = &rendering;
     gi.basePipelineIndex   = -1;
 
     VkPipeline pl = VK_NULL_HANDLE;

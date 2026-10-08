@@ -170,8 +170,15 @@ static VkPipeline vio_2d_vk_make_pipeline(vio_2d_vulkan_state *state, VkShaderMo
     info.pColorBlendState    = &cb;
     info.pDynamicState       = &dyn;
     info.layout              = state->pipeline_layout;
-    info.renderPass          = vio_vk.render_pass;
-    info.subpass             = 0;
+    /* The swapchain's attachments (render targets in RGBA8 share the format,
+     * VULKAN-MODERN-PLAN phase 4: dynamic rendering, no render pass). */
+    VkPipelineRenderingCreateInfo rendering = {0};
+    rendering.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rendering.colorAttachmentCount    = 1;
+    rendering.pColorAttachmentFormats = &vio_vk.swapchain_format;
+    rendering.depthAttachmentFormat   = vio_vk_depth_format();
+    rendering.stencilAttachmentFormat = vio_vk.depth_has_stencil ? rendering.depthAttachmentFormat : VK_FORMAT_UNDEFINED;
+    info.pNext               = &rendering;
     info.basePipelineIndex   = -1;
 
     VkPipeline pipeline = VK_NULL_HANDLE;

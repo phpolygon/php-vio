@@ -147,7 +147,9 @@ static void vk3d_layout_scope(VkImageLayout l, int src, VkPipelineStageFlags2 *s
              * nothing (the present waits a semaphore) */
             if (src) { *stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
                        *access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT; }
-            else     { *stage = VK_PIPELINE_STAGE_2_NONE; *access = VK_ACCESS_2_NONE; }
+            else     { /* no access, but the stages a later transition out of it chains from */
+                       *stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+                       *access = VK_ACCESS_2_NONE; }
             return;
         default:   /* GENERAL (storage images) and anything else */
             *stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -674,7 +676,7 @@ static VkRect2D vk3d_clamped_scissor(int x, int y, int w, int h)
 
 void vio_vk3d_set_viewport(int x, int y, int w, int h)
 {
-    if (!vio_vk.in_frame || !vio_vk.cur_render_pass || w <= 0 || h <= 0) return;
+    if (!vio_vk.in_frame || !vio_vk.in_pass || w <= 0 || h <= 0) return;
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
     VkViewport vp = { (float)x, (float)y, (float)w, (float)h, 0.0f, 1.0f };
     vkCmdSetViewport(cmd, 0, 1, &vp);
@@ -688,7 +690,7 @@ void vio_vk3d_set_viewport(int x, int y, int w, int h)
  * the pipeline's max_viewports viewports must be set. */
 int vio_vk3d_set_viewports(const int *rects, int count)
 {
-    if (!vio_vk.in_frame || !vio_vk.cur_render_pass || count < 1 || (uint32_t)count > vio_vk.max_viewports) return -1;
+    if (!vio_vk.in_frame || !vio_vk.in_pass || count < 1 || (uint32_t)count > vio_vk.max_viewports) return -1;
     for (int i = 0; i < count; i++) {
         int x = rects[i * 4], y = rects[i * 4 + 1], w = rects[i * 4 + 2], h = rects[i * 4 + 3];
         VkViewport vp = { (float)x, (float)y, (float)w, (float)h, 0.0f, 1.0f };
@@ -822,7 +824,7 @@ static VkDescriptorSet vk3d_descriptor_set(vio_vk3d_shader *sh)
 static int vk3d_prepare(uint32_t stride, VkBuffer inst_buf, VkDeviceSize inst_off)
 {
     vio_vk3d_pipeline *p = vk3d.pipeline;
-    if (!vio_vk.in_frame || !vio_vk.cur_render_pass || !p || p->dead || !p->shader || p->shader->dead) return -1;
+    if (!vio_vk.in_frame || !vio_vk.in_pass || !p || p->dead || !p->shader || p->shader->dead) return -1;
     vio_vk3d_shader *sh = p->shader;
     /* Multiview pipelines draw into a multiview pass over the layered target;
      * plain pipelines need the plain pass back. */
