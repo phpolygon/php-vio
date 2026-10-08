@@ -4566,6 +4566,20 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
         /* An outgoing multisampled target replaced without an unbind still gets
          * its resolve, so sampling it later sees what was drawn. */
         d3d12_rt_resolve_msaa(prev);
+        /* ...and a single-sampled colour target its SRV transition, as an unbind
+         * does: a chain of targets each sampling the previous one (vio_upscale's
+         * mid and history passes) read it in RENDER_TARGET state - undefined;
+         * WARP 1.0.21 returned black or the previous frame's texels (test 217). */
+        if (!prev->d3d12_msaa_color_resources[0] && !prev->d3d12_msaa_depth_only && !prev->d3d12_msaa_layered
+            && prev->d3d12_color_resource && !prev->depth_only && !prev->d3d12_color_is_srv) {
+            int n = prev->attachment_count > 0 ? prev->attachment_count : 1;
+            for (int ai = 0; ai < n && ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
+                ID3D12Resource *res = ai == 0 ? (ID3D12Resource *)prev->d3d12_color_resource
+                                              : (ID3D12Resource *)prev->d3d12_color_resources[ai];
+                if (res) d3d12_rt_barrier(vio_d3d12.cmd_list, res, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            }
+            prev->d3d12_color_is_srv = 1;
+        }
     }
 
     /* Colour attachments used as SRVs since the last bind go back to RENDER_TARGET
