@@ -5,13 +5,13 @@ Metal, Vulkan und OpenGL als portable vio-Features — GLSL bleibt die Quelle, j
 `VIO_FEATURE_*`-Flag, einen `_all_backends`-Test und läuft auf jedem Backend, das es kann. Arbeitsweise
 **TDD**: Test zuerst (rot), dann Implementierung, dann Flag in `074` pinnen.
 
-## Ausgangslage
+## Ausgangslage (2026-10-06, vor diesem Plan)
 
 | Baustein | Stand |
 |---|---|
 | OpenGL-Kontext-Leiter 4.6 → 3.0, `vio_gl.caps` | ✅ (`vio_window.c`, `vio_opengl.c`) |
 | **Metal-Versionsleiter** MSL 4.1 → 2.0, `vio_mtl.caps`, `vio_backend_info()` | ✅ `a17e588` (Tests 150, 151) |
-| **D3D12 Shader Model 6** (höchstes 6.x aus Device ∩ DXC, SPIRV-Cross auf dasselbe Profil, DXC-Stage-Probe, `VIO_FEATURE_SUBGROUP`) | 🚧 Branch `feat/d3d12-shader-model-6` (`b0fcfc1`, Test 149, CI erzwingt DXC) |
+| **D3D12 Shader Model 6** (höchstes 6.x aus Device ∩ DXC, SPIRV-Cross auf dasselbe Profil, DXC-Stage-Probe, `VIO_FEATURE_SUBGROUP`) | ✅ (Test 149, CI erzwingt DXC; Profil festlegbar per `shader_model => 6x`, Test 170) |
 | Vulkan: Instanz API 1.1, Device-Features einzeln abgefragt | ✅, aber keine Leiter-/Caps-Auskunft |
 
 Geprüft auf Apple M5 / macOS 27 (Metal 4, Apple10): GLSL → glslang → SPIRV-Cross → MSL → Treiber
@@ -45,9 +45,13 @@ Aufwand: **S** ≤ 1 Tag, **M** einige Tage, **L** eigener Sub-Plan.
   Extensions, Subgroup-Properties) und **OpenGL** (Version, GLSL, Caps — `vio_gl_info` bleibt).
 - **0c** D3D12-Leiter festnageln wie Metal: `vio_create(['shader_model' => 62])` / `VIO_D3D12_SHADER_MODEL`
   pinnt das Profil (6.0 … Maximum), damit Feature-Gates je Profil testbar sind.
-- **0d** **Agility SDK** (D3D12, optional): `D3D12SDKVersion`/`D3D12SDKPath`-Exporte über eine
-  Lader-DLL neben `php.exe`; Voraussetzung für SM 6.9 auf Windows-Builds ohne neueste Runtime.
-  Ohne Agility bleibt das Maximum, was die System-Runtime meldet.
+- **0d** **Agility SDK** (D3D12, optional) — **✅ umgesetzt (2026-10-07, Test 166).** Exporte aus einer
+  PHP-Extension gehen nicht; stattdessen `vio_create('d3d12', ['agility_sdk' => dir])` →
+  `ID3D12SDKConfiguration1::CreateDeviceFactory(version, dir)` → `ID3D12DeviceFactory::CreateDevice`
+  (Version aus `agility_sdk_version` oder dem Export von `D3D12Core.dll`), gemeldet als
+  `vio_swapchain_info()['agility_sdk']`. Ohne Option unverändert; jeder Fehlschlag fällt mit Warnung auf
+  die System-Runtime zurück. Die SM-Probe startet weiter bei 6.9 (Maximum des SDK). Nur Compile-geprüft
+  (mingw + DirectX-Headers); ausführbar erst auf Windows mit dem NuGet-Paket.
 - Tests: 150-Muster für D3D12/Vulkan/GL (`vio_backend_info` je Backend), Profil-Pinning wie 151.
 
 ## Phase 1 — Shader-Intrinsics über GLSL-Extensions (S je Feature)
@@ -171,14 +175,32 @@ Metal auf dem M5 ausgeführt (ab MSL 2.4); D3D12 per mingw + DXC geprüft, Vulka
 - OpenGL: 0.
 - Hardware: RTX 20+, RX 6000+, Arc, Apple M3+ (Apple ab M1 per Compute langsamer).
 
-**6b Raytracing-Pipeline (Raygen/Hit/Miss)** — SPIRV-Cross übersetzt `traceRayEXT` nicht (geprüft, MSL),
-HLSL-seitig ebenso nicht verlässlich ⇒ HLSL-/MSL-Quellen je Backend (wie der Stage-Override), D3D12
-State Objects + Shader Tables, Vulkan RT-Pipeline aus GLSL, Metal Intersection Functions + Visible
-Function Tables. Erst nach 6a und nur mit konkretem Bedarf (Path Tracing).
+**6b Raytracing-Pipeline (Raygen/Hit/Miss) ✅ (2026-10-07, `VIO_FEATURE_RAYTRACING`, Test 164)** — umgesetzt als
+`vio_rt_pipeline($ctx, ['raygen', 'miss', 'closest_hit', 'any_hit'?, 'max_recursion' = 1, 'payload_size' = 32, 'hlsl'?])`
+(Klasse `VioRtPipeline`), `vio_rt_bind_buffer($ctx, $p, $storageBuffer, $binding)` und
+`vio_trace_rays($ctx, $p, $w, $h, $d = 1)` (synchron, außerhalb eines Frames) gegen die per
+`vio_bind_acceleration_structure` gebundene Struktur. Eine Raygen-, eine Miss- und eine Dreiecks-Hit-Gruppe.
+`VIO_FEATURE_RAYTRACING` bleibt der Name (kein neues `RAYTRACING_PIPELINE`, 074 pinnt die 0 auf null).
+- Vulkan: `VK_KHR_ray_tracing_pipeline` auf dem Ray-Query-Satz, die GLSL-Stages gehen nativ als SPIR-V 1.4
+  (glslang Vulkan 1.2) in die Pipeline, Set 0 aus den Bindings der Stages (`vk_rt_scan`: Acceleration
+  Structures + Storage-Buffer), SBT in einem host-sichtbaren Buffer. **Auf lavapipe ausgeführt** (Mesa 25.0,
+  Debian trixie, Docker) — dort lief auch 163 auf Vulkan erstmals, nach zwei Korrekturen am 6a-Pfad
+  (GLSL 460 für die Vulkan-Rundreise von `rayQueryEXT`, SPIR-V 1.4 für `GL_EXT_ray_query`-Quellen).
+- D3D12: DXR 1.0 State Object (SM ≥ 6.3, Tier ≥ 1.0) aus der `'hlsl'`-Bibliothek (DXC `lib_6_x`, ohne `-E`),
+  Exports `vio_raygen`, `vio_miss`, `vio_closest_hit`, `vio_any_hit`; globale Root-Signatur TLAS `t0` +
+  Root-UAVs `u0..u15`; nur per mingw + DXC geprüft.
+- Metal: 0 — keine Raygen-/Hit-Stages, SPIRV-Cross übersetzt `traceRayEXT` nicht nach MSL; eine
+  Abbildung auf Intersection Functions + Visible Function Tables bräuchte eigene MSL-Quellen je Stage.
+- Offen: mehrere Miss-/Hit-Gruppen, Callable-Shader, Shader-Record-Daten, Texturen/UBOs in RT-Stages,
+  Trace im Frame.
 
 **6c SM 6.9 Shader Execution Reordering + Opacity Micromaps** — nur D3D12 (Agility SDK + DXC ≥ 1.9,
 Phase 0d) und Vulkan (`VK_EXT_ray_tracing_invocation_reorder`, `VK_EXT_opacity_micromap`); Metal hat
 kein Gegenstück ⇒ Flags dort 0. Nutzen auf RTX 40/50 (Hardware-Reorder, OMM-Traversal).
+
+**Stand 2026-10-08 — 6c ✅** (`SM69-PLAN.md` Phasen 3–4): `VIO_FEATURE_SHADER_EXECUTION_REORDER = 66` (Test 219),
+`VIO_FEATURE_OPACITY_MICROMAP = 67` (`'opacity_micromap'` je Mesh in `vio_acceleration_structure`, Test 220) auf
+D3D12 (Tier 1.2, SM 6.9) und Vulkan; belegt auf NuGet-WARP 1.0.21 (CI) und der RTX 2080.
 
 ## Phase 7 — Sampler Feedback / Texture Streaming (L)
 
@@ -226,14 +248,24 @@ Dispatch-API.
   ausgeführt (MSL 3.1 und 4.1), MSL 3.0 meldet nichts.
 - D3D12: 0. SPIRV-Cross übersetzt `coopmat` nicht nach HLSL („Access chains have no default expression
   representation"); SM 6.9 Wave-Matrix / Cooperative Vectors bleiben an Agility SDK + DXC-Quellen gebunden.
-- Offen: 8b Cooperative Vectors (`VK_NV_cooperative_vector`, D3D12 Preview), 8c Metal-Tensoren
+- Long Vectors ✅ (`VIO_FEATURE_LONG_VECTOR = 65`, `SM69-PLAN.md` Phase 2, Test 216): GLSL `GL_EXT_long_vector` auf
+  Vulkan, D3D12 über `vio_compute_pipeline(['hlsl' => …])`.
+- Offen: 8b Cooperative Vectors – im Retail-SM 6.9 gestrichen, auf D3D12 jetzt SM-6.10-Linearalgebra (`dx::linalg`,
+  `SPIRV-CROSS-HLSL-COOPMAT-PLAN.md`); Vulkan `VK_NV_cooperative_vector`. 8c Metal-Tensoren
   (`MTLTensor` + MPP `matmul2d`, MSL 4.0) über einen `'msl'`-Override — beides ohne portable GLSL-Form.
 
-## Phase 9 — Work Graphs (nur D3D12, zurückgestellt)
+## Phase 9 — Work Graphs (nur D3D12) — ✅ umgesetzt (2026-10-07, Test 166)
 
-SM 6.8, RDNA3/Ada. Kein Metal-/GL-Gegenstück, Vulkan nur `VK_AMDX_shader_enqueue`. Alternativen für
-GPU-getriebene Arbeit: Indirect Draw (✅), Metal Indirect Command Buffers, Vulkan Device-Generated
-Commands. Erst bei konkretem Bedarf.
+SM 6.8, RDNA3/Ada. Kein Metal-/GL-Gegenstück, Vulkan nur `VK_AMDX_shader_enqueue` (nicht angebunden).
+`VIO_FEATURE_WORK_GRAPHS = 58` (SM ≥ 6.8 + `OPTIONS21.WorkGraphsTier` ≥ 1.0), Klasse `VioWorkGraph`:
+`vio_work_graph($ctx, ['hlsl' => lib_6_8, 'entry' => Knoten, 'record_size' => n])` baut ein
+`EXECUTABLE`-State-Object (DXIL-Library, globale Root-Signatur mit 8 Root-UAVs `u0..u7`, `WORK_GRAPH` mit
+`INCLUDE_ALL_AVAILABLE_NODES`), prüft Einstieg und Record-Größe gegen `ID3D12WorkGraphProperties` und legt
+das Backing Memory an (Maximum, gedeckelt auf 64 MB); `vio_work_graph_bind_buffer` bindet Storage-Buffer,
+`vio_dispatch_graph` = `SetProgram` (erster Lauf `INITIALIZE`) + `DispatchGraph` mit CPU-Records auf
+`ID3D12GraphicsCommandList10` — außerhalb eines Frames synchron, im Frame auf der Frame-Liste. Danach sind
+die Buffer per `vio_storage_buffer_read` lesbar. Nur HLSL (GLSL hat keine Node-Shader). Nur Compile-/
+DXC-geprüft; Ausführung braucht Windows mit RDNA3/Ada+ und meist das Agility SDK (0d).
 
 ## Nicht übernommen
 

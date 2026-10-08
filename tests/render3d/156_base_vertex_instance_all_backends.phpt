@@ -9,8 +9,8 @@ vio
  * base vertex were ignored nothing would be drawn. The vertex stage passes
  * gl_BaseVertex / gl_BaseInstance on, the fragment stage writes green when they
  * are (4, 3). A plain vio_draw of a normal quad must see (0, 0).
- * D3D12 needs SM 6.8 (SV_StartVertexLocation / SV_StartInstanceLocation);
- * below that SPIRV-Cross would need a cbuffer vio cannot fill for indirect draws.
+ * D3D12 uses SV_StartVertexLocation / SV_StartInstanceLocation from SM 6.8 and
+ * root constants below (test 181).
  * VIO_REQUIRE_BASE_VERTEX=vulkan makes the listed backends mandatory. */
 /* #version 450 + GL_ARB_shader_draw_parameters (gl_BaseVertexARB) runs on
  * GL 4.5 contexts with the extension too - #version 460 would need GL 4.6. */

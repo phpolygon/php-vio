@@ -41,6 +41,8 @@ jobs:
           sudo apt-get update || (sleep 15 && sudo apt-get update)
           sudo apt-get install -y \
             libglfw3-dev \
+            libx11-dev libxrandr-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev weston \
             glslang-dev \
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
@@ -91,6 +93,29 @@ jobs:
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
+      - name: Run tests (Wayland, headless weston + Mesa software GL)
+        run: |
+          # The same suite on the native Wayland platform: a headless weston
+          # (pixman renderer - Mesa's software EGL and lavapipe hand it wl_shm
+          # buffers), no DISPLAY, so vio_platform() is "wayland".
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          export VK_DRIVER_FILES=/nonexistent/vio-no-vulkan.json
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          chmod 700 "$XDG_RUNTIME_DIR"
+          (weston --backend=headless --renderer=pixman --socket=wayland-vio --idle-time=0 \
+            || weston --backend=headless-backend.so --use-pixman --socket=wayland-vio --idle-time=0) > weston.log 2>&1 &
+          for i in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/wayland-vio" ] && break; sleep 0.2; done
+          if [ ! -S "$XDG_RUNTIME_DIR/wayland-vio" ]; then cat weston.log; exit 1; fi
+          export WAYLAND_DISPLAY=wayland-vio
+          unset DISPLAY
+          php -n -d extension_dir=$PWD/modules -d extension=vio.so -r 'echo "platform: ", vio_platform(), "\n";'
+          php -n run-tests.php -q --show-diff tests/
+          # Vulkan on Wayland (lavapipe through VK_KHR_wayland_surface)
+          VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1) \
+            php -n run-tests.php -q --show-diff tests/window/215_wayland_platform.phpt
+
       - name: Run required-feature tests (lavapipe Vulkan)
         run: |
           # Feature tests skip where a flag is 0, so a green suite cannot tell a
@@ -118,7 +143,7 @@ jobs:
               $i["features"]["float16"], $i["features"]["draw_parameters"], $i["features"]["compute_derivatives"],
               $i["features"]["atomic64"], $i["features"]["barycentrics"], $i["features"]["multiview"]);'
           # What lavapipe offers for the feature tests below.
-          vulkaninfo 2>/dev/null | grep -E "VK_EXT_mesh_shader|meshShader|taskShader|rayQuery|accelerationStructure\b|VK_KHR_ray_query|VK_KHR_acceleration_structure|runtimeDescriptorArray|shaderSampledImageArrayNonUniformIndexing|descriptorBindingPartiallyBound|descriptorBindingSampledImageUpdateAfterBind|VK_EXT_descriptor_indexing|FragmentShadingRate|fragment_shading_rate|NonTrivialCombinerOps|multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads|VK_KHR_cooperative_matrix|cooperativeMatrix|vulkanMemoryModel\b|storageBuffer16BitAccess" | sort -u || true
+          vulkaninfo 2>/dev/null | grep -E "VK_EXT_mesh_shader|meshShader|taskShader|rayQuery|rayTracingPipeline\b|VK_KHR_ray_tracing_pipeline|accelerationStructure\b|VK_KHR_ray_query|VK_KHR_acceleration_structure|runtimeDescriptorArray|shaderSampledImageArrayNonUniformIndexing|descriptorBindingPartiallyBound|descriptorBindingSampledImageUpdateAfterBind|VK_EXT_descriptor_indexing|FragmentShadingRate|fragment_shading_rate|NonTrivialCombinerOps|multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads|VK_KHR_cooperative_matrix|cooperativeMatrix|vulkanMemoryModel\b|storageBuffer16BitAccess" | sort -u || true
           # Barycentrics stay optional here: lavapipe (Mesa, Vulkan 1.4.318) has no
           # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
           export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_ATOMIC64=vulkan
@@ -147,7 +172,52 @@ jobs:
             tests/render3d/163_ray_query_all_backends.phpt \
             tests/render3d/162_mesh_shaders_all_backends.phpt \
             tests/render3d/165_sampler_feedback_d3d12.phpt \
-            tests/render3d/167_cooperative_matrix_all_backends.phpt
+            tests/render3d/167_cooperative_matrix_all_backends.phpt \
+            tests/render3d/164_raytracing_pipeline_all_backends.phpt \
+            tests/render3d/166_work_graphs_d3d12.phpt \
+            tests/render3d/169_submit_batch_parity_all_backends.phpt \
+            tests/core/171_feature_info_native_emulated.phpt \
+            tests/core/172_gpu_named_timestamps_all_backends.phpt \
+            tests/render3d/173_pipeline_survives_frame_all_backends.phpt \
+            tests/render3d/174_mesh_layout_input_layout_all_backends.phpt \
+            tests/render3d/175_uniform_buffer_graphics_all_backends.phpt \
+            tests/render3d/176_bindless_release_all_backends.phpt \
+            tests/render3d/177_bindless_samplers_all_backends.phpt \
+            tests/render3d/178_bindless_cubes_arrays_all_backends.phpt \
+            tests/render3d/179_bindless_compute_all_backends.phpt \
+            tests/render3d/180_separate_texture_sampler_all_backends.phpt \
+            tests/render3d/181_base_vertex_below_sm68.phpt \
+            tests/render3d/182_multiview_instancing_emulation.phpt \
+            tests/render3d/183_multiview_geometry_tessellation.phpt \
+            tests/core/184_backend_info_all_backends.phpt \
+            tests/core/185_adapters.phpt \
+            tests/core/186_backend_scoring.phpt \
+            tests/core/187_backend_benchmark.phpt \
+            tests/render3d/188_readback_latest_frame_all_backends.phpt \
+            tests/render2d/189_glyph_atlas_lazy_all_backends.phpt \
+            tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt \
+            tests/render3d/191_astc_textures_all_backends.phpt \
+            tests/render2d/192_vertical_text.phpt \
+            tests/render3d/193_depth_mipmaps_all_backends.phpt \
+            tests/render3d/194_msaa_mrt_all_backends.phpt \
+            tests/render3d/195_msaa_cube_array_all_backends.phpt \
+            tests/render3d/196_msaa_depth_only_all_backends.phpt \
+            tests/render3d/197_mesh_task_textures_all_backends.phpt \
+            tests/render3d/198_tess_varyings_all_backends.phpt \
+            tests/render3d/199_acceleration_structure_update_all_backends.phpt \
+            tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt \
+            tests/render3d/201_rt_pipeline_textures_all_backends.phpt \
+            tests/render3d/202_trace_rays_in_frame_all_backends.phpt \
+            tests/render3d/203_fragment_storage_all_backends.phpt \
+            tests/render3d/204_sampler_feedback_emulated_all_backends.phpt \
+            tests/render3d/205_geometry_stage_gaps_all_backends.phpt \
+            tests/backends/206_pass_switches_vulkan_core_all_backends.phpt \
+            tests/render3d/207_bundle_all_backends.phpt \
+            tests/render3d/208_upscale_all_backends.phpt \
+            tests/media/209_recorder_encoders_all_backends.phpt \
+            tests/render3d/210_compute_msl_override_all_backends.phpt \
+            tests/render3d/211_rate_map_all_backends.phpt \
+            tests/core/212_audit_gate_no_glfw_outside_platform.phpt
 
       - name: Package binary
         run: |
@@ -190,6 +260,8 @@ jobs:
           sudo apt-get update || (sleep 15 && sudo apt-get update)
           sudo apt-get install -y \
             libglfw3-dev \
+            libx11-dev libxrandr-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev weston \
             glslang-dev \
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
@@ -236,6 +308,29 @@ jobs:
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
+      - name: Run tests (Wayland, headless weston + Mesa software GL)
+        run: |
+          # The same suite on the native Wayland platform: a headless weston
+          # (pixman renderer - Mesa's software EGL and lavapipe hand it wl_shm
+          # buffers), no DISPLAY, so vio_platform() is "wayland".
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          export VK_DRIVER_FILES=/nonexistent/vio-no-vulkan.json
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          chmod 700 "$XDG_RUNTIME_DIR"
+          (weston --backend=headless --renderer=pixman --socket=wayland-vio --idle-time=0 \
+            || weston --backend=headless-backend.so --use-pixman --socket=wayland-vio --idle-time=0) > weston.log 2>&1 &
+          for i in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/wayland-vio" ] && break; sleep 0.2; done
+          if [ ! -S "$XDG_RUNTIME_DIR/wayland-vio" ]; then cat weston.log; exit 1; fi
+          export WAYLAND_DISPLAY=wayland-vio
+          unset DISPLAY
+          php -n -d extension_dir=$PWD/modules -d extension=vio.so -r 'echo "platform: ", vio_platform(), "\n";'
+          php -n run-tests.php -q --show-diff tests/
+          # Vulkan on Wayland (lavapipe through VK_KHR_wayland_surface)
+          VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1) \
+            php -n run-tests.php -q --show-diff tests/window/215_wayland_platform.phpt
+
       - name: Run required-feature tests (lavapipe Vulkan)
         run: |
           # Feature tests skip where a flag is 0, so a green suite cannot tell a
@@ -263,7 +358,7 @@ jobs:
               $i["features"]["float16"], $i["features"]["draw_parameters"], $i["features"]["compute_derivatives"],
               $i["features"]["atomic64"], $i["features"]["barycentrics"], $i["features"]["multiview"]);'
           # What lavapipe offers for the feature tests below.
-          vulkaninfo 2>/dev/null | grep -E "VK_EXT_mesh_shader|meshShader|taskShader|rayQuery|accelerationStructure\b|VK_KHR_ray_query|VK_KHR_acceleration_structure|runtimeDescriptorArray|shaderSampledImageArrayNonUniformIndexing|descriptorBindingPartiallyBound|descriptorBindingSampledImageUpdateAfterBind|VK_EXT_descriptor_indexing|FragmentShadingRate|fragment_shading_rate|NonTrivialCombinerOps|multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads|VK_KHR_cooperative_matrix|cooperativeMatrix|vulkanMemoryModel\b|storageBuffer16BitAccess" | sort -u || true
+          vulkaninfo 2>/dev/null | grep -E "VK_EXT_mesh_shader|meshShader|taskShader|rayQuery|rayTracingPipeline\b|VK_KHR_ray_tracing_pipeline|accelerationStructure\b|VK_KHR_ray_query|VK_KHR_acceleration_structure|runtimeDescriptorArray|shaderSampledImageArrayNonUniformIndexing|descriptorBindingPartiallyBound|descriptorBindingSampledImageUpdateAfterBind|VK_EXT_descriptor_indexing|FragmentShadingRate|fragment_shading_rate|NonTrivialCombinerOps|multiview|deviceName|apiVersion|VK_KHR_fragment_shader_barycentric|fragmentShaderBarycentric|shaderInt64|shaderBufferInt64Atomics|shaderFloat16|shaderDrawParameters|drawIndirectFirstInstance|compute_shader_derivatives|computeDerivativeGroupQuads|VK_KHR_cooperative_matrix|cooperativeMatrix|vulkanMemoryModel\b|storageBuffer16BitAccess" | sort -u || true
           # Barycentrics stay optional here: lavapipe (Mesa, Vulkan 1.4.318) has no
           # VK_KHR_fragment_shader_barycentric. They are mandatory on WARP instead.
           export VIO_REQUIRE_SUBGROUP=vulkan VIO_REQUIRE_SUBGROUP_QUAD=vulkan VIO_REQUIRE_ATOMIC64=vulkan
@@ -292,7 +387,52 @@ jobs:
             tests/render3d/163_ray_query_all_backends.phpt \
             tests/render3d/162_mesh_shaders_all_backends.phpt \
             tests/render3d/165_sampler_feedback_d3d12.phpt \
-            tests/render3d/167_cooperative_matrix_all_backends.phpt
+            tests/render3d/167_cooperative_matrix_all_backends.phpt \
+            tests/render3d/164_raytracing_pipeline_all_backends.phpt \
+            tests/render3d/166_work_graphs_d3d12.phpt \
+            tests/render3d/169_submit_batch_parity_all_backends.phpt \
+            tests/core/171_feature_info_native_emulated.phpt \
+            tests/core/172_gpu_named_timestamps_all_backends.phpt \
+            tests/render3d/173_pipeline_survives_frame_all_backends.phpt \
+            tests/render3d/174_mesh_layout_input_layout_all_backends.phpt \
+            tests/render3d/175_uniform_buffer_graphics_all_backends.phpt \
+            tests/render3d/176_bindless_release_all_backends.phpt \
+            tests/render3d/177_bindless_samplers_all_backends.phpt \
+            tests/render3d/178_bindless_cubes_arrays_all_backends.phpt \
+            tests/render3d/179_bindless_compute_all_backends.phpt \
+            tests/render3d/180_separate_texture_sampler_all_backends.phpt \
+            tests/render3d/181_base_vertex_below_sm68.phpt \
+            tests/render3d/182_multiview_instancing_emulation.phpt \
+            tests/render3d/183_multiview_geometry_tessellation.phpt \
+            tests/core/184_backend_info_all_backends.phpt \
+            tests/core/185_adapters.phpt \
+            tests/core/186_backend_scoring.phpt \
+            tests/core/187_backend_benchmark.phpt \
+            tests/render3d/188_readback_latest_frame_all_backends.phpt \
+            tests/render2d/189_glyph_atlas_lazy_all_backends.phpt \
+            tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt \
+            tests/render3d/191_astc_textures_all_backends.phpt \
+            tests/render2d/192_vertical_text.phpt \
+            tests/render3d/193_depth_mipmaps_all_backends.phpt \
+            tests/render3d/194_msaa_mrt_all_backends.phpt \
+            tests/render3d/195_msaa_cube_array_all_backends.phpt \
+            tests/render3d/196_msaa_depth_only_all_backends.phpt \
+            tests/render3d/197_mesh_task_textures_all_backends.phpt \
+            tests/render3d/198_tess_varyings_all_backends.phpt \
+            tests/render3d/199_acceleration_structure_update_all_backends.phpt \
+            tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt \
+            tests/render3d/201_rt_pipeline_textures_all_backends.phpt \
+            tests/render3d/202_trace_rays_in_frame_all_backends.phpt \
+            tests/render3d/203_fragment_storage_all_backends.phpt \
+            tests/render3d/204_sampler_feedback_emulated_all_backends.phpt \
+            tests/render3d/205_geometry_stage_gaps_all_backends.phpt \
+            tests/backends/206_pass_switches_vulkan_core_all_backends.phpt \
+            tests/render3d/207_bundle_all_backends.phpt \
+            tests/render3d/208_upscale_all_backends.phpt \
+            tests/media/209_recorder_encoders_all_backends.phpt \
+            tests/render3d/210_compute_msl_override_all_backends.phpt \
+            tests/render3d/211_rate_map_all_backends.phpt \
+            tests/core/212_audit_gate_no_glfw_outside_platform.phpt
 
       - name: Package binary
         run: |
@@ -319,10 +459,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: ${{ matrix.php }}
+      - name: Setup PHP (Homebrew)
+        run: |
+          # shivammathur/setup-php stopped installing PHP 8.5 on the macOS runners
+          # (2026-10-08: "php: command not found" right after its install step).
+          # The Homebrew formula php is 8.5 and brings phpize / php-config.
+          brew update --quiet
+          # The runner image links openssl@1.1 into /opt/homebrew/bin; installing php
+          # upgrades openssl@3, whose link step then fails and fails the install.
+          brew unlink openssl@1.1 2>/dev/null || true
+          brew install php || true
+          brew link --overwrite openssl@3 || true
+          brew link --overwrite php || true   # "already linked" exits 1
+          php -v
+          have=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
+          if [ "$have" != "${{ matrix.php }}" ]; then
+            echo "::error::Homebrew php is $have, the matrix wants ${{ matrix.php }}"
+            exit 1
+          fi
+          which phpize php-config
 
       - name: Install dependencies
         run: |
@@ -393,10 +548,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: ${{ matrix.php }}
+      - name: Setup PHP (Homebrew)
+        run: |
+          # shivammathur/setup-php stopped installing PHP 8.5 on the macOS runners
+          # (2026-10-08: "php: command not found" right after its install step).
+          # The Homebrew formula php is 8.5 and brings phpize / php-config.
+          brew update --quiet
+          # The runner image links openssl@1.1 into /opt/homebrew/bin; installing php
+          # upgrades openssl@3, whose link step then fails and fails the install.
+          brew unlink openssl@1.1 2>/dev/null || true
+          brew install php || true
+          brew link --overwrite openssl@3 || true
+          brew link --overwrite php || true   # "already linked" exits 1
+          php -v
+          have=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
+          if [ "$have" != "${{ matrix.php }}" ]; then
+            echo "::error::Homebrew php is $have, the matrix wants ${{ matrix.php }}"
+            exit 1
+          fi
+          which phpize php-config
 
       - name: Install dependencies
         run: |
@@ -555,6 +725,42 @@ jobs:
             --with-prefix=${{ steps.php-sdk.outputs.prefix }}
           nmake
 
+      # SM69-PLAN 0d: the OS WARP of this runner stops at Shader Model 6.2. The
+      # Microsoft.Direct3D.WARP NuGet package (1.0.18+) is SM 6.9 on feature
+      # level 12.2 with DXR 1.2: under it, the Agility SDK and DXC 1.9 the whole
+      # suite runs with every D3D12 shader feature required (measured locally:
+      # 0 failed). Versions are pinned; NTS only (setup-php's php on PATH).
+      - name: Run tests (D3D12 on NuGet WARP + Agility SDK + DXC 1.9)
+        if: matrix.ts == 'nts'
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Recurse -Filter php_vio.dll | Select-Object -First 1
+          if (-not $dll) { throw "php_vio.dll not found after build" }
+          $dllDir = $dll.Directory.FullName
+          $vkBin = if ($env:VULKAN_SDK) { "$env:VULKAN_SDK\Bin" } else { "" }
+          $env:PATH = "$PWD\deps\bin;$PWD\deps\lib;$vkBin;$env:PATH"
+          $pk = Join-Path $env:RUNNER_TEMP "sm69"
+          New-Item -ItemType Directory -Force $pk | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/1.0.21/microsoft.direct3d.warp.1.0.21.nupkg -OutFile "$pk\warp.zip"
+          Invoke-WebRequest https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.619.6/microsoft.direct3d.d3d12.1.619.6.nupkg -OutFile "$pk\d3d12.zip"
+          Invoke-WebRequest https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip -OutFile "$pk\dxc.zip"
+          foreach ($n in 'warp', 'd3d12', 'dxc') { Expand-Archive -Force "$pk\$n.zip" "$pk\$n" }
+          $env:VIO_D3D_WARP = "$pk\warp\build\native\bin\x64\d3d10warp.dll"
+          $env:VIO_D3D12_AGILITY_SDK = "$pk\d3d12\build\native\bin\x64"
+          $env:VIO_DXC_DIR = "$pk\dxc\bin\x64"
+          php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r '$c = vio_create("d3d12", ["width" => 8, "height" => 8, "headless" => true, "shader_model" => 6]); $i = vio_backend_info($c); $s = vio_swapchain_info($c); printf("D3D12 %s driver %s, SM %d, Agility %d\n", $i["device"], $i["driver"], $i["shading_language_version"], $s["agility_sdk"]); if ($i["shading_language_version"] < 69 || $s["agility_sdk"] < 619) exit(1);'
+          if ($LASTEXITCODE -ne 0) { throw "NuGet WARP / Agility SDK / DXC 1.9 not in effect" }
+          $env:VIO_REQUIRE_SM6 = "1"
+          foreach ($f in 'SUBGROUP', 'SUBGROUP_QUAD', 'BARYCENTRICS', 'ATOMIC64', 'SHADER_FLOAT16', 'BASE_VERTEX', 'COMPUTE_DERIVATIVES',
+                         'MULTIVIEW', 'MULTIVIEW_STAGES', 'SHADING_RATE_PRIMITIVE', 'SHADING_RATE_IMAGE', 'BINDLESS', 'MESH_SHADER',
+                         'RAY_QUERY', 'RAYTRACING', 'SAMPLER_FEEDBACK', 'WORK_GRAPHS', 'LONG_VECTOR', 'SHADER_EXECUTION_REORDER', 'OPACITY_MICROMAP') {
+            Set-Item "env:VIO_REQUIRE_$f" "d3d12"
+          }
+          $env:NO_INTERACTION = "1"
+          $env:REPORT_EXIT_STATUS = "1"
+          $env:TEST_PHP_ARGS = "-n -d extension_dir=$dllDir -d extension=php_vio.dll"
+          php -n run-tests.php -q --show-diff tests/
       # Run the Path B vertex-storage tests on the native Windows backends
       # (D3D11/D3D12 via WARP). Only the NTS variant: shivammathur/setup-php
       # provides an NTS php on PATH, which matches the NTS DLL's ABI. The
@@ -592,7 +798,16 @@ jobs:
           $env:VIO_REQUIRE_BINDLESS = "d3d12"
           Write-Host "VIO_DXC_DIR=$env:VIO_DXC_DIR"
           # Which shader-model features WARP offers (tests skip what it lacks).
-          php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r '$c = vio_create("d3d12", ["width" => 8, "height" => 8, "headless" => true, "shader_model" => 6, "dxc_dir" => getenv("VIO_DXC_DIR")]); $i = vio_swapchain_info($c); printf("D3D12 SM %d (%d) subgroup=%d quad=%d barycentrics=%d atomic64=%d float16=%d base_vertex=%d compute_derivatives=%d multiview=%d shading_rate_image=%d bindless=%d ray_query=%d mesh_shader=%d sampler_feedback=%d cooperative_matrix=%d\n", $i["shader_model"], $i["shader_model_version"], vio_supports_feature($c, VIO_FEATURE_SUBGROUP), vio_supports_feature($c, VIO_FEATURE_SUBGROUP_QUAD), vio_supports_feature($c, VIO_FEATURE_BARYCENTRICS), vio_supports_feature($c, VIO_FEATURE_ATOMIC64), vio_supports_feature($c, VIO_FEATURE_SHADER_FLOAT16), vio_supports_feature($c, VIO_FEATURE_BASE_VERTEX), vio_supports_feature($c, VIO_FEATURE_COMPUTE_DERIVATIVES), vio_supports_feature($c, VIO_FEATURE_MULTIVIEW), vio_supports_feature($c, VIO_FEATURE_SHADING_RATE_IMAGE), vio_supports_feature($c, VIO_FEATURE_BINDLESS), vio_supports_feature($c, VIO_FEATURE_RAY_QUERY), vio_supports_feature($c, VIO_FEATURE_MESH_SHADER), vio_supports_feature($c, VIO_FEATURE_SAMPLER_FEEDBACK), vio_supports_feature($c, VIO_FEATURE_COOPERATIVE_MATRIX));'
+          php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r '$c = vio_create("d3d12", ["width" => 8, "height" => 8, "headless" => true, "shader_model" => 6, "dxc_dir" => getenv("VIO_DXC_DIR")]); $i = vio_swapchain_info($c); printf("D3D12 SM %d (%d) subgroup=%d quad=%d barycentrics=%d atomic64=%d float16=%d base_vertex=%d compute_derivatives=%d multiview=%d shading_rate_image=%d bindless=%d ray_query=%d mesh_shader=%d sampler_feedback=%d cooperative_matrix=%d raytracing=%d work_graphs=%d\n", $i["shader_model"], $i["shader_model_version"], vio_supports_feature($c, VIO_FEATURE_SUBGROUP), vio_supports_feature($c, VIO_FEATURE_SUBGROUP_QUAD), vio_supports_feature($c, VIO_FEATURE_BARYCENTRICS), vio_supports_feature($c, VIO_FEATURE_ATOMIC64), vio_supports_feature($c, VIO_FEATURE_SHADER_FLOAT16), vio_supports_feature($c, VIO_FEATURE_BASE_VERTEX), vio_supports_feature($c, VIO_FEATURE_COMPUTE_DERIVATIVES), vio_supports_feature($c, VIO_FEATURE_MULTIVIEW), vio_supports_feature($c, VIO_FEATURE_SHADING_RATE_IMAGE), vio_supports_feature($c, VIO_FEATURE_BINDLESS), vio_supports_feature($c, VIO_FEATURE_RAY_QUERY), vio_supports_feature($c, VIO_FEATURE_MESH_SHADER), vio_supports_feature($c, VIO_FEATURE_SAMPLER_FEEDBACK), vio_supports_feature($c, VIO_FEATURE_COOPERATIVE_MATRIX), vio_supports_feature($c, VIO_FEATURE_RAYTRACING), vio_supports_feature($c, VIO_FEATURE_WORK_GRAPHS));'
+          # Agility SDK (diagnostic only, not required): the latest Microsoft.Direct3D.D3D12 NuGet
+          # package, device from its factory - what it reports on the runner.
+          try {
+            $ag = Join-Path $env:RUNNER_TEMP "agility"
+            Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12" -OutFile "$ag.zip"
+            Expand-Archive -Path "$ag.zip" -DestinationPath $ag -Force
+            $env:VIO_AGILITY_DIAG = Join-Path $ag "build\native\bin\x64"
+            php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r '$c = vio_create("d3d12", ["width" => 8, "height" => 8, "headless" => true, "shader_model" => 6, "dxc_dir" => getenv("VIO_DXC_DIR"), "agility_sdk" => getenv("VIO_AGILITY_DIAG")]); $i = vio_swapchain_info($c); printf("D3D12 Agility agility_sdk=%d SM %d work_graphs=%d mesh_shader=%d\n", $i["agility_sdk"], $i["shader_model_version"], vio_supports_feature($c, VIO_FEATURE_WORK_GRAPHS), vio_supports_feature($c, VIO_FEATURE_MESH_SHADER));'
+          } catch { Write-Host "Agility SDK diagnostic skipped: $_" }
           $env:NO_INTERACTION = "1"
           $env:REPORT_EXIT_STATUS = "1"
           $env:TEST_PHP_ARGS = "-n -d extension_dir=$dllDir -d extension=php_vio.dll"
@@ -671,7 +886,55 @@ jobs:
             tests/render3d/163_ray_query_all_backends.phpt `
             tests/render3d/162_mesh_shaders_all_backends.phpt `
             tests/render3d/165_sampler_feedback_d3d12.phpt `
-            tests/render3d/167_cooperative_matrix_all_backends.phpt
+            tests/render3d/167_cooperative_matrix_all_backends.phpt `
+            tests/render3d/164_raytracing_pipeline_all_backends.phpt `
+            tests/render3d/166_work_graphs_d3d12.phpt `
+            tests/render3d/169_submit_batch_parity_all_backends.phpt `
+            tests/core/171_feature_info_native_emulated.phpt `
+            tests/core/172_gpu_named_timestamps_all_backends.phpt `
+            tests/render3d/173_pipeline_survives_frame_all_backends.phpt `
+            tests/render3d/174_mesh_layout_input_layout_all_backends.phpt `
+            tests/render3d/175_uniform_buffer_graphics_all_backends.phpt `
+            tests/render3d/176_bindless_release_all_backends.phpt `
+            tests/render3d/177_bindless_samplers_all_backends.phpt `
+            tests/render3d/178_bindless_cubes_arrays_all_backends.phpt `
+            tests/render3d/179_bindless_compute_all_backends.phpt `
+            tests/render3d/180_separate_texture_sampler_all_backends.phpt `
+            tests/render3d/181_base_vertex_below_sm68.phpt `
+            tests/render3d/182_multiview_instancing_emulation.phpt `
+            tests/render3d/183_multiview_geometry_tessellation.phpt `
+            tests/core/184_backend_info_all_backends.phpt `
+            tests/core/185_adapters.phpt `
+            tests/core/186_backend_scoring.phpt `
+            tests/core/187_backend_benchmark.phpt `
+            tests/render3d/188_readback_latest_frame_all_backends.phpt `
+            tests/render2d/189_glyph_atlas_lazy_all_backends.phpt `
+            tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt `
+            tests/render3d/191_astc_textures_all_backends.phpt `
+            tests/render2d/192_vertical_text.phpt `
+            tests/render3d/193_depth_mipmaps_all_backends.phpt `
+            tests/render3d/194_msaa_mrt_all_backends.phpt `
+            tests/render3d/195_msaa_cube_array_all_backends.phpt `
+            tests/render3d/196_msaa_depth_only_all_backends.phpt `
+            tests/render3d/197_mesh_task_textures_all_backends.phpt `
+            tests/render3d/198_tess_varyings_all_backends.phpt `
+            tests/render3d/199_acceleration_structure_update_all_backends.phpt `
+            tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt `
+            tests/render3d/201_rt_pipeline_textures_all_backends.phpt `
+            tests/render3d/202_trace_rays_in_frame_all_backends.phpt `
+            tests/render3d/203_fragment_storage_all_backends.phpt `
+            tests/render3d/204_sampler_feedback_emulated_all_backends.phpt `
+            tests/render3d/205_geometry_stage_gaps_all_backends.phpt `
+            tests/backends/206_pass_switches_vulkan_core_all_backends.phpt `
+            tests/render3d/207_bundle_all_backends.phpt `
+            tests/render3d/208_upscale_all_backends.phpt `
+            tests/media/209_recorder_encoders_all_backends.phpt `
+            tests/render3d/210_compute_msl_override_all_backends.phpt `
+            tests/render3d/211_rate_map_all_backends.phpt `
+            tests/core/212_audit_gate_no_glfw_outside_platform.phpt `
+            tests/window/213_win32_platform.phpt `
+            tests/core/170_d3d12_shader_model_pin.phpt `
+            tests/backends/168_d3d12_pipeline_freed_after_frame.phpt
 
       - name: Package binary
         shell: pwsh

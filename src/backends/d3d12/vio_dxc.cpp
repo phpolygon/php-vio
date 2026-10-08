@@ -110,7 +110,15 @@ extern "C" int vio_dxc_compile(const char *hlsl, const char *entry, const char *
     std::wstring wentry = widen(entry ? entry : "main");
     std::wstring wprofile = widen(profile ? profile : "vs_6_0");
     std::vector<LPCWSTR> args;
-    args.push_back(L"-E"); args.push_back(wentry.c_str());
+    /* A library (lib_6_x, ray tracing) has exports instead of one entry point. */
+    if (!profile || std::strncmp(profile, "lib_", 4) != 0) {
+        args.push_back(L"-E"); args.push_back(wentry.c_str());
+    } else {
+        /* From lib_6_7 on DXC requires [raypayload] + read/write qualifiers on
+         * every payload struct; neither SPIRV-Cross nor GLSL ray payloads carry
+         * them, so keep the pre-6.7 payload rules. */
+        args.push_back(L"-disable-payload-qualifiers");
+    }
     args.push_back(L"-T"); args.push_back(wprofile.c_str());
     if (debug) {
         args.push_back(L"-Zi");

@@ -43,6 +43,7 @@ static void vio_buffer_free_object(zend_object *obj)
         }
     }
 
+    if (buf->shadow) { efree(buf->shadow); buf->shadow = NULL; }
     zend_object_std_dtor(&buf->std);
 }
 

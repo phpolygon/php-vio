@@ -40,6 +40,8 @@ static void vio_texture_free_object(zend_object *obj)
 
     if (tex->backend) {
         const vio_backend *be = (const vio_backend *)tex->backend;
+        if (tex->fb_emul && be->destroy_buffer) be->destroy_buffer(tex->fb_emul);
+        tex->fb_emul = NULL;
         if (be->destroy_texture_obj) {
             be->destroy_texture_obj(tex);
         }

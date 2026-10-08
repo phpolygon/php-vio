@@ -19,7 +19,10 @@ if (PHP_VIO != "no") {
         "src\\vio_context.c " +
         "src\\vio_backend_registry.c " +
         "src\\vio_resource.c " +
-        "src\\vio_window.c " +
+        "src\\vio_platform_registry.c " +
+        "src\\platform\\null\\vio_platform_null.c " +
+        "src\\platform\\glfw\\vio_platform_glfw.c " +
+        "src\\platform\\win32\\vio_platform_win32.c " +
         "src\\vio_mesh.c " +
         "src\\vio_input.c " +
         "src\\vio_shader.c " +
@@ -32,6 +35,9 @@ if (PHP_VIO != "no") {
         "src\\vio_buffer.c " +
         "src\\vio_compute_pipeline.c " +
         "src\\vio_acceleration_structure.c " +
+        "src\\vio_bundle.c " +
+        "src\\vio_rt_pipeline.c " +
+        "src\\vio_work_graph.c " +
         "src\\vio_2d.c " +
         "src\\vio_2d_d3d11.c " +
         "src\\vio_2d_d3d12.c " +
@@ -235,6 +241,9 @@ if (PHP_VIO != "no") {
     // ── Windows system libraries ──────────────────────────────────────
     // OpenGL32 needed by GLAD at runtime for wglGetProcAddress
     CHECK_LIB("opengl32.lib", "vio");
+    // The OpenGL backend: the Win32 platform creates WGL contexts itself, so
+    // it is built with or without GLFW.
+    AC_DEFINE("HAVE_OPENGL", 1, "Whether the OpenGL backend is built");
     // dxguid needed for COM interface IDs (IID_ID3D11Device, etc.)
     CHECK_LIB("dxguid.lib", "vio");
     CHECK_LIB("gdi32.lib", "vio");

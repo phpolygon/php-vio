@@ -110,6 +110,13 @@ int vio_shader_cache_store(uint64_t key, const char *ext, const void *data, size
     return 0;
 }
 
+void vio_shader_cache_note(int hits, int misses, int stores)
+{
+    vio_cache_hits += hits;
+    vio_cache_misses += misses;
+    vio_cache_stores += stores;
+}
+
 void vio_shader_cache_stats(long *hits, long *misses, long *stores)
 {
     if (hits) *hits = vio_cache_hits;

@@ -14,18 +14,35 @@
 #include <stddef.h>
 #include "../include/vio_types.h"
 
-static inline int vio_texfmt_is_compressed(int f)
+static inline int vio_texfmt_is_astc(int f)
 {
-    return f >= VIO_FORMAT_BC1 && f <= VIO_FORMAT_BC7;
+    return f >= VIO_FORMAT_ASTC_4x4 && f <= VIO_FORMAT_ASTC_8x8;
 }
 
-/* Bytes per 4x4 block, 0 for uncompressed formats. */
+static inline int vio_texfmt_is_compressed(int f)
+{
+    return (f >= VIO_FORMAT_BC1 && f <= VIO_FORMAT_BC7) || vio_texfmt_is_astc(f);
+}
+
+/* Bytes per block, 0 for uncompressed formats. */
 static inline int vio_texfmt_block_bytes(int f)
 {
     switch (f) {
         case VIO_FORMAT_BC1: case VIO_FORMAT_BC4: return 8;
         case VIO_FORMAT_BC3: case VIO_FORMAT_BC5: case VIO_FORMAT_BC7: return 16;
+        case VIO_FORMAT_ASTC_4x4: case VIO_FORMAT_ASTC_5x5: case VIO_FORMAT_ASTC_6x6: case VIO_FORMAT_ASTC_8x8: return 16;
         default: return 0;
+    }
+}
+
+/* Block edge in texels: 4 for BC, N for ASTC NxN, 1 uncompressed. */
+static inline int vio_texfmt_block_dim(int f)
+{
+    switch (f) {
+        case VIO_FORMAT_ASTC_5x5: return 5;
+        case VIO_FORMAT_ASTC_6x6: return 6;
+        case VIO_FORMAT_ASTC_8x8: return 8;
+        default: return vio_texfmt_block_bytes(f) ? 4 : 1;
     }
 }
 
@@ -42,15 +59,16 @@ static inline int vio_texfmt_channels(int f)
 /* Bytes per row of texels (uncompressed) or per row of blocks (compressed). */
 static inline size_t vio_texfmt_row_pitch(int f, int w)
 {
-    int bb = vio_texfmt_block_bytes(f);
-    if (bb) return (size_t)((w + 3) / 4) * (size_t)bb;
+    int bb = vio_texfmt_block_bytes(f), bd = vio_texfmt_block_dim(f);
+    if (bb) return (size_t)((w + bd - 1) / bd) * (size_t)bb;
     return (size_t)w * (f == VIO_FORMAT_R8 ? 1u : 4u);
 }
 
 /* Rows in one image: texel rows, or block rows for compressed formats. */
 static inline size_t vio_texfmt_rows(int f, int h)
 {
-    return vio_texfmt_block_bytes(f) ? (size_t)((h + 3) / 4) : (size_t)h;
+    int bd = vio_texfmt_block_dim(f);
+    return vio_texfmt_block_bytes(f) ? (size_t)((h + bd - 1) / bd) : (size_t)h;
 }
 
 static inline size_t vio_texfmt_image_size(int f, int w, int h)
