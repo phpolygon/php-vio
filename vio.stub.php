@@ -1144,6 +1144,30 @@ function vio_set_uniforms(VioContext $context, array $uniforms): void {}
 function vio_submit_batch(VioContext $context, array $draws): void {}
 
 /**
+ * Record a static draw sequence once (OPEN-ITEMS A38, BUNDLE-PLAN.md). $records
+ * are vio_submit_batch records ('mesh' required; 'pipeline', 'textures' =>
+ * [slot => VioTexture], 'uniforms' => [name => value] optional); the objects are
+ * held by the bundle. A record sets every uniform it relies on: values no
+ * record sets are undefined when the bundle plays, and uniforms set between
+ * recording and vio_draw_bundle do not change it. A malformed record throws a
+ * ValueError naming its index.
+ */
+function vio_bundle(VioContext $context, array $records): VioBundle|false {}
+
+/**
+ * Play a bundle inside a frame, into the pass open now (swapchain or render
+ * target). Backends with a native recording (vio_bundle_info()['native']) record
+ * it for the pass's attachment formats on first use; the others replay the
+ * records through the common draw path. Returns false outside a frame.
+ */
+function vio_draw_bundle(VioContext $context, VioBundle $bundle): bool {}
+
+/**
+ * ['draws' => int, 'native' => bool, 'method' => 'replay' | the backend's mechanism].
+ * 'native' becomes true after the first vio_draw_bundle on a backend that records natively.
+ */
+function vio_bundle_info(VioBundle $bundle): array {}
+/**
  * Get the name of the backend in use.
  */
 function vio_backend_name(VioContext $context): string {}

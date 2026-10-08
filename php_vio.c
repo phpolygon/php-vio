@@ -24,6 +24,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_buffer.h"
 #include "src/vio_compute_pipeline.h"
 #include "src/vio_acceleration_structure.h"
+#include "src/vio_bundle.h"
 #include "src/vio_rt_pipeline.h"
 #include "src/vio_work_graph.h"
 #include "src/vio_font_face.h"
@@ -6469,8 +6470,187 @@ ZEND_FUNCTION(vio_submit_batch)
     } ZEND_HASH_FOREACH_END();
 }
 
-/* ── Phase 5: 2D API functions ───────────────────────────────────── */
+/* ── Recorded draw sequences (vio_bundle, OPEN-ITEMS A38, BUNDLE-PLAN.md) ── */
 
+/* Parse one vio_submit_batch record into r; on a malformed record throw a
+ * ValueError naming it and return -1. */
+static int vio_bundle_parse_record(vio_bundle_record *r, zval *rec, zend_ulong index)
+{
+    memset(r, 0, sizeof(*r));
+    if (Z_TYPE_P(rec) != IS_ARRAY) {
+        zend_value_error("vio_bundle(): record %lu is not an array", (unsigned long)index);
+        return -1;
+    }
+    HashTable *h = Z_ARRVAL_P(rec);
+    zval *mz = zend_hash_str_find(h, "mesh", sizeof("mesh") - 1);
+    if (!mz || Z_TYPE_P(mz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(mz), vio_mesh_ce)) {
+        zend_value_error("vio_bundle(): record %lu needs a VioMesh under 'mesh'", (unsigned long)index);
+        return -1;
+    }
+    zval *pz = zend_hash_str_find(h, "pipeline", sizeof("pipeline") - 1);
+    if (pz && (Z_TYPE_P(pz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(pz), vio_pipeline_ce))) {
+        zend_value_error("vio_bundle(): record %lu: 'pipeline' must be a VioPipeline", (unsigned long)index);
+        return -1;
+    }
+    zval *tz = zend_hash_str_find(h, "textures", sizeof("textures") - 1);
+    if (tz && Z_TYPE_P(tz) != IS_ARRAY) {
+        zend_value_error("vio_bundle(): record %lu: 'textures' must be an array of slot => VioTexture", (unsigned long)index);
+        return -1;
+    }
+    zval *uz = zend_hash_str_find(h, "uniforms", sizeof("uniforms") - 1);
+    if (uz && Z_TYPE_P(uz) != IS_ARRAY) {
+        zend_value_error("vio_bundle(): record %lu: 'uniforms' must be an array of name => value", (unsigned long)index);
+        return -1;
+    }
+    if (tz) {
+        zend_ulong slot;
+        zend_string *skey;
+        zval *tv;
+        ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(tz), slot, skey, tv) {
+            if (skey || Z_TYPE_P(tv) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(tv), vio_texture_ce) || slot > 31) {
+                zend_value_error("vio_bundle(): record %lu: 'textures' must map slots 0..31 to VioTexture objects", (unsigned long)index);
+                return -1;
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+    if (uz) {
+        zend_string *ukey;
+        zval *uv;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(uz), ukey, uv) {
+            if (!ukey || (Z_TYPE_P(uv) != IS_LONG && Z_TYPE_P(uv) != IS_DOUBLE && Z_TYPE_P(uv) != IS_ARRAY)) {
+                zend_value_error("vio_bundle(): record %lu: uniforms map names to int, float or array values", (unsigned long)index);
+                return -1;
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+    /* valid: take references */
+    r->mesh = Z_OBJ_P(mz);
+    GC_ADDREF(r->mesh);
+    if (pz) { r->pipeline = Z_OBJ_P(pz); GC_ADDREF(r->pipeline); }
+    if (tz && zend_hash_num_elements(Z_ARRVAL_P(tz)) > 0) {
+        r->textures = ecalloc(zend_hash_num_elements(Z_ARRVAL_P(tz)), sizeof(vio_bundle_texture));
+        zend_ulong slot;
+        zval *tv;
+        ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(tz), slot, tv) {
+            r->textures[r->texture_count].slot = (int)slot;
+            r->textures[r->texture_count].texture = Z_OBJ_P(tv);
+            GC_ADDREF(Z_OBJ_P(tv));
+            r->texture_count++;
+        } ZEND_HASH_FOREACH_END();
+    }
+    if (uz && zend_hash_num_elements(Z_ARRVAL_P(uz)) > 0) {
+        r->uniforms = ecalloc(zend_hash_num_elements(Z_ARRVAL_P(uz)), sizeof(vio_bundle_uniform));
+        zend_string *ukey;
+        zval *uv;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(uz), ukey, uv) {
+            r->uniforms[r->uniform_count].name = zend_string_copy(ukey);
+            ZVAL_COPY(&r->uniforms[r->uniform_count].value, uv);
+            r->uniform_count++;
+        } ZEND_HASH_FOREACH_END();
+    }
+    return 0;
+}
+
+ZEND_FUNCTION(vio_bundle)
+{
+    zval *ctx_zval;
+    HashTable *records;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(records)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "vio_bundle: context is not initialized");
+        RETURN_FALSE;
+    }
+    uint32_t n = zend_hash_num_elements(records);
+    if (n == 0) {
+        zend_argument_value_error(2, "must contain at least one record");
+        RETURN_THROWS();
+    }
+    object_init_ex(return_value, vio_bundle_ce);
+    vio_bundle_object *b = Z_VIO_BUNDLE_P(return_value);
+    b->records = ecalloc(n, sizeof(vio_bundle_record));
+    zend_ulong idx;
+    zval *rec;
+    ZEND_HASH_FOREACH_NUM_KEY_VAL(records, idx, rec) {
+        if (vio_bundle_parse_record(&b->records[b->count], rec, idx) != 0) {
+            zval_ptr_dtor(return_value);
+            ZVAL_UNDEF(return_value);
+            RETURN_THROWS();
+        }
+        b->count++;
+    } ZEND_HASH_FOREACH_END();
+}
+
+ZEND_FUNCTION(vio_draw_bundle)
+{
+    zval *ctx_zval, *bundle_zval;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(bundle_zval, vio_bundle_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_bundle_object *b = Z_VIO_BUNDLE_P(bundle_zval);
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_draw_bundle between vio_begin and vio_end");
+        RETURN_FALSE;
+    }
+    /* A native recording for the pass open now (BUNDLE-PLAN phases 2-4). */
+    if (ctx->backend->draw_bundle && ctx->backend->create_bundle) {
+        if (b->backend_bundle && b->backend == ctx->backend && ctx->backend->draw_bundle(b->backend_bundle) == 0) RETURN_TRUE;
+        if (b->backend_bundle && b->backend && ((const vio_backend *)b->backend)->destroy_bundle)
+            ((const vio_backend *)b->backend)->destroy_bundle(b->backend_bundle);
+        b->backend_bundle = ctx->backend->create_bundle(b);
+        b->backend = b->backend_bundle ? ctx->backend : NULL;
+        if (b->backend_bundle && ctx->backend->draw_bundle(b->backend_bundle) == 0) RETURN_TRUE;
+    }
+    /* The generic replay: the records through the vio_submit_batch core. */
+    vio_pipeline_object *last_pipeline = NULL;
+    for (int i = 0; i < b->count; i++) {
+        vio_bundle_record *r = &b->records[i];
+        if (r->pipeline) {
+            vio_pipeline_object *pipe = vio_pipeline_from_obj(r->pipeline);
+            if (pipe->valid && pipe != last_pipeline) {
+                vio_bind_pipeline_core(ctx, pipe);
+                last_pipeline = pipe;
+            }
+        }
+        for (int t = 0; t < r->texture_count; t++) {
+            vio_texture_object *tex = vio_texture_from_obj(r->textures[t].texture);
+            if (tex->valid) vio_bind_texture_internal(ctx, tex, (zend_long)r->textures[t].slot);
+        }
+        for (int u = 0; u < r->uniform_count; u++) {
+            vio_apply_uniform(ctx, ZSTR_VAL(r->uniforms[u].name), &r->uniforms[u].value);
+        }
+        vio_submit_one(ctx, vio_mesh_from_obj(r->mesh));
+    }
+    RETURN_TRUE;
+}
+
+ZEND_FUNCTION(vio_bundle_info)
+{
+    zval *bundle_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(bundle_zval, vio_bundle_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_bundle_object *b = Z_VIO_BUNDLE_P(bundle_zval);
+    const vio_backend *be = (const vio_backend *)b->backend;
+    array_init(return_value);
+    add_assoc_long(return_value, "draws", (zend_long)b->count);
+    add_assoc_bool(return_value, "native", b->backend_bundle != NULL);
+    add_assoc_string(return_value, "method",
+                     (b->backend_bundle && be && be->bundle_method) ? (char *)be->bundle_method() : "replay");
+}
+
+/* ── Phase 5: 2D API functions ───────────────────────────────────── */
 ZEND_FUNCTION(vio_rect)
 {
     zval *ctx_zval;
@@ -13420,6 +13600,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_buffer_register();
     vio_compute_pipeline_register();
     vio_acceleration_structure_register();
+    vio_bundle_register();
     vio_rt_pipeline_register();
     vio_work_graph_register();
     vio_font_register();
