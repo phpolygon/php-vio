@@ -12,18 +12,21 @@ vio
  * A 256x256 texture with a full mip chain drawn onto a 32x32 target samples
  * mip 3 (256 / 32 = 8 texels per pixel); every region of the map must report
  * a mip near 3, and after a clear none may report anything. Backends without
- * the feature refuse the three functions (false + warning).
+ * either feedback path refuse the three functions (false + warning); the GLSL
+ * path has its own test (204).
  * VIO_REQUIRE_SAMPLER_FEEDBACK=d3d12 makes the backend mandatory. */
 $W = 32;
 $VS = "#version 450\nlayout(location=0) in vec3 aPos;\nlayout(location=0) out vec2 uv;\n"
     . "void main(){ uv = aPos.xy * 0.5 + 0.5; gl_Position = vec4(aPos, 1.0); }";
 $FS = "#version 450\nlayout(location=0) in vec2 uv;\nlayout(location=0) out vec4 o;\nuniform sampler2D u_tex;\n"
     . "void main(){ o = texture(u_tex, uv); }";
-/* Same interface as the GLSL stage: t0 / s0 (vio's register scheme), TEXCOORD0. */
+/* Same interface as the GLSL stage: t0 / s0 (vio's register scheme), and the
+ * input struct in the order of the transpiled vertex output (TEXCOORD0, then
+ * SV_Position) - D3D12 links the signatures by register, not by name. */
 $PS_HLSL = "Texture2D<float4> u_tex : register(t0);\n"
     . "SamplerState _u_tex_sampler : register(s0);\n"
     . "FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> vio_feedback : register(u0, space2);\n"
-    . "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    . "struct PSIn { float2 uv : TEXCOORD0; float4 pos : SV_Position; };\n"
     . "float4 main(PSIn i) : SV_Target0 {\n"
     . "  vio_feedback.WriteSamplerFeedback(u_tex, _u_tex_sampler, i.uv);\n"
     . "  return u_tex.Sample(_u_tex_sampler, i.uv);\n"
@@ -42,6 +45,11 @@ function run_backend(string $name): string {
     if ($ctx && vio_backend_name($ctx) !== $name) { vio_destroy($ctx); $ctx = null; }
     if (!$ctx) return $req ? "FAIL\n  required but unavailable" : "skip (unavailable)";
     $tex = vio_texture($ctx, ['data' => str_repeat("\x80\x40\x20\xFF", 256 * 256), 'width' => 256, 'height' => 256, 'mipmaps' => true]);
+    if (!vio_supports_feature($ctx, VIO_FEATURE_SAMPLER_FEEDBACK) && vio_supports_feature($ctx, VIO_FEATURE_SAMPLER_FEEDBACK_GLSL)) {
+        /* The GLSL path drives the functions here (test 204); this test is the hardware path. */
+        vio_destroy($ctx);
+        return $req ? "FAIL\n  required but VIO_FEATURE_SAMPLER_FEEDBACK is 0" : "skip (no hardware sampler feedback)";
+    }
     if (!vio_supports_feature($ctx, VIO_FEATURE_SAMPLER_FEEDBACK)) {
         $fail = [];
         if (@vio_sampler_feedback_bind($ctx, $tex) !== false) $fail[] = "bind succeeded without the feature";

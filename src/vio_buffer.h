@@ -22,6 +22,9 @@ typedef struct _vio_buffer_object {
     int                 stride;        /* structured element stride (bytes) for
                                           STORAGE buffers; 0 => raw/4. */
     int                 valid;
+    /* Uniform buffers: CPU copy of the contents. A graphics shader's uniform
+     * block reads it at draw time (vio_apply_bound_ubos), on every backend. */
+    unsigned char      *shadow;
     unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
     zend_object         std;
 } vio_buffer_object;

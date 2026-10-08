@@ -13,6 +13,20 @@ PHP_ARG_WITH([glfw],
   [yes],
   [no])
 
+PHP_ARG_WITH([x11],
+  [for the native X11 platform (Linux)],
+  [AS_HELP_STRING([--with-x11],
+    [Native X11 window, input and GLX platform on Linux (default yes; needs the x11 and xrandr headers)])],
+  [yes],
+  [no])
+
+PHP_ARG_WITH([wayland],
+  [for the native Wayland platform (Linux)],
+  [AS_HELP_STRING([--with-wayland],
+    [Native Wayland window, input and EGL platform on Linux (default yes; needs wayland-client, wayland-cursor, xkbcommon, wayland-scanner and wayland-protocols)])],
+  [yes],
+  [no])
+
 PHP_ARG_WITH([glslang],
   [for glslang (GLSL to SPIR-V compiler) support],
   [AS_HELP_STRING([--with-glslang@<:@=DIR@:>@],
@@ -94,6 +108,7 @@ if test "$PHP_VIO" != "no"; then
         PHP_EVAL_INCLINE($GLFW_CFLAGS)
         PHP_EVAL_LIBLINE($GLFW_LIBS, VIO_SHARED_LIBADD)
         AC_DEFINE(HAVE_GLFW, 1, [Whether GLFW is available])
+        AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from GLFW)])
       ], [
         dnl Try common paths
         for dir in /usr/local /usr /opt/homebrew; do
@@ -101,6 +116,7 @@ if test "$PHP_VIO" != "no"; then
             PHP_ADD_INCLUDE($dir/include)
             PHP_ADD_LIBRARY_WITH_PATH(glfw, $dir/lib, VIO_SHARED_LIBADD)
             AC_DEFINE(HAVE_GLFW, 1, [Whether GLFW is available])
+            AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from GLFW)])
             break
           fi
         done
@@ -111,10 +127,30 @@ if test "$PHP_VIO" != "no"; then
         PHP_ADD_INCLUDE($PHP_GLFW/include)
         PHP_ADD_LIBRARY_WITH_PATH(glfw, $PHP_GLFW/lib, VIO_SHARED_LIBADD)
         AC_DEFINE(HAVE_GLFW, 1, [Whether GLFW is available])
+        AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from GLFW)])
       else
         AC_MSG_ERROR([GLFW not found at $PHP_GLFW])
       fi
     fi
+  fi
+
+  dnl ── Native X11 platform (Linux) ─────────────────────────────────
+  dnl Window, input, monitors and GLX without GLFW (src/platform/x11/). libGL
+  dnl is opened at run time, so only Xlib and XRandR are linked; with them the
+  dnl OpenGL backend is built even without GLFW.
+  if test "$PHP_X11" != "no"; then
+    case $host_os in
+      linux*)
+        PKG_CHECK_MODULES([VIO_X11], [x11 xrandr], [
+          PHP_EVAL_INCLINE($VIO_X11_CFLAGS)
+          PHP_EVAL_LIBLINE($VIO_X11_LIBS, VIO_SHARED_LIBADD)
+          AC_DEFINE(HAVE_X11, 1, [Whether the native X11 platform is built])
+          AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from GLX)])
+        ], [
+          AC_MSG_WARN([x11 / xrandr not found: no native X11 platform])
+        ])
+        ;;
+    esac
   fi
 
   dnl ── glslang detection ────────────────────────────────────────────
@@ -307,6 +343,14 @@ if test "$PHP_VIO" != "no"; then
         VIO_HAS_METAL=yes
         PHP_ADD_FRAMEWORK(Metal)
         PHP_ADD_FRAMEWORK(QuartzCore)
+        dnl MetalFX (vio_upscale, UPSCALE-PLAN phase 3): weak, so the module also
+        dnl loads where the framework is missing (macOS < 13).
+        VIO_SDK_PATH=`xcrun --show-sdk-path 2>/dev/null`
+        if test -n "$VIO_SDK_PATH" && test -d "$VIO_SDK_PATH/System/Library/Frameworks/MetalFX.framework"; then
+          AC_DEFINE(HAVE_METALFX, 1, [Whether the SDK has MetalFX])
+          VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD -Wl,-weak_framework,MetalFX"
+          AC_MSG_RESULT([MetalFX upscaling enabled])
+        fi
         AC_MSG_RESULT([Metal backend enabled])
         ;;
       *)
@@ -340,7 +384,17 @@ if test "$PHP_VIO" != "no"; then
         PHP_ADD_FRAMEWORK(CoreAudio)
         PHP_ADD_FRAMEWORK(CoreFoundation)
         dnl OpenGL framework NOT linked here - GLAD provides declarations,
-        dnl functions are loaded via glfwGetProcAddress at runtime
+        dnl functions are loaded through the platform's proc-address lookup
+        dnl Native Cocoa platform (src/platform/cocoa/): windows, input,
+        dnl NSOpenGLContext - the OpenGL backend no longer needs GLFW here.
+        PHP_ADD_FRAMEWORK(QuartzCore)
+        PHP_ADD_FRAMEWORK(GameController)
+        dnl PHP_ADD_FRAMEWORK does not reach a phpize extension's link line; AppKit
+        dnl used to come in through libglfw. Link them on the module itself.
+        VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD -Wl,-framework,Cocoa -Wl,-framework,QuartzCore -Wl,-framework,IOKit -Wl,-weak_framework,GameController"
+        VIO_HAS_COCOA=yes
+        AC_DEFINE(HAVE_COCOA, 1, [Whether the native Cocoa platform is built])
+        AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from NSOpenGL)])
       fi
       ;;
     linux*)
@@ -367,14 +421,20 @@ if test "$PHP_VIO" != "no"; then
     src/vio_context.c \
     src/vio_backend_registry.c \
     src/vio_resource.c \
-    src/vio_window.c \
+    src/vio_platform_registry.c \
+    src/platform/null/vio_platform_null.c \
+    src/platform/glfw/vio_platform_glfw.c \
+    src/platform/x11/vio_platform_x11.c \
+    src/platform/wayland/vio_platform_wayland.c \
     src/vio_mesh.c \
     src/vio_input.c \
     src/vio_shader.c \
     src/vio_pipeline.c \
     src/vio_compute_pipeline.c \
     src/vio_acceleration_structure.c \
+    src/vio_bundle.c \
     src/vio_rt_pipeline.c \
+    src/vio_work_graph.c \
     src/vio_texture.c \
     src/vio_render_target.c \
     src/vio_shader_cache.c \
@@ -410,6 +470,49 @@ if test "$PHP_VIO" != "no"; then
     vendor/miniaudio/miniaudio_impl.c \
     vendor/sheenbidi/Source/SheenBidi.c,
     $ext_shared,, $VIO_EXTRA_CFLAGS)
+
+  dnl ── Native Wayland platform (Linux) ─────────────────────────────
+  dnl Window, input, outputs and EGL without GLFW (src/platform/wayland/).
+  dnl wayland-scanner generates the protocol glue (xdg-shell, xdg-decoration,
+  dnl relative-pointer, pointer-constraints) into gen/, which the platform
+  dnl source compiles in; libEGL and libwayland-egl are opened at run time.
+  dnl Here, after PHP_NEW_EXTENSION, because $ext_srcdir is set from there on.
+  if test "$PHP_WAYLAND" != "no"; then
+    case $host_os in
+      linux*)
+        PKG_CHECK_MODULES([VIO_WAYLAND], [wayland-client wayland-cursor xkbcommon], [
+          VIO_WL_SCANNER=`$PKG_CONFIG --variable=wayland_scanner wayland-scanner 2>/dev/null`
+          test -z "$VIO_WL_SCANNER" && VIO_WL_SCANNER=`command -v wayland-scanner 2>/dev/null`
+          VIO_WL_PROTOCOLS=`$PKG_CONFIG --variable=pkgdatadir wayland-protocols 2>/dev/null`
+          VIO_WL_GEN="$ext_srcdir/src/platform/wayland/gen"
+          if test -n "$VIO_WL_SCANNER" && test -x "$VIO_WL_SCANNER" && test -f "$VIO_WL_PROTOCOLS/stable/xdg-shell/xdg-shell.xml"; then
+            mkdir -p "$VIO_WL_GEN"
+            vio_wl_ok=yes
+            for vio_wl_p in stable/xdg-shell/xdg-shell \
+                            unstable/xdg-decoration/xdg-decoration-unstable-v1 \
+                            unstable/relative-pointer/relative-pointer-unstable-v1 \
+                            unstable/pointer-constraints/pointer-constraints-unstable-v1; do
+              vio_wl_n=`basename $vio_wl_p`
+              "$VIO_WL_SCANNER" client-header "$VIO_WL_PROTOCOLS/$vio_wl_p.xml" "$VIO_WL_GEN/$vio_wl_n-client-protocol.h" || vio_wl_ok=no
+              "$VIO_WL_SCANNER" private-code "$VIO_WL_PROTOCOLS/$vio_wl_p.xml" "$VIO_WL_GEN/$vio_wl_n-protocol.c" || vio_wl_ok=no
+            done
+            if test "$vio_wl_ok" = "yes"; then
+              PHP_EVAL_INCLINE($VIO_WAYLAND_CFLAGS)
+              PHP_EVAL_LIBLINE($VIO_WAYLAND_LIBS, VIO_SHARED_LIBADD)
+              AC_DEFINE(HAVE_WAYLAND, 1, [Whether the native Wayland platform is built])
+              AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from EGL)])
+            else
+              AC_MSG_WARN([wayland-scanner failed: no native Wayland platform])
+            fi
+          else
+            AC_MSG_WARN([wayland-scanner or wayland-protocols not found: no native Wayland platform])
+          fi
+        ], [
+          AC_MSG_WARN([wayland-client / wayland-cursor / xkbcommon not found: no native Wayland platform])
+        ])
+        ;;
+    esac
+  fi
 
   dnl ── Special-flag sources (Issue #2) ─────────────────────────────
   dnl
@@ -457,6 +560,21 @@ if test "$PHP_VIO" != "no"; then
     fi
   fi
 
+  dnl ── Cocoa platform source (macOS) ─────────────────────────────────
+  dnl Same .c shim pattern as Metal.
+  if test "$VIO_HAS_COCOA" = "yes"; then
+    if test "$ext_shared" != "shared" && test "$ext_shared" != "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/platform/cocoa/vio_platform_cocoa.c],
+        -x objective-c -fobjc-arc $VIO_EXTRA_CFLAGS_RESOLVED,
+        PHP_GLOBAL_OBJS)
+    fi
+    if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/platform/cocoa/vio_platform_cocoa.c],
+        -x objective-c -fobjc-arc $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
+        shared_objects_vio, yes)
+    fi
+  fi
+
   dnl ── iOS backend source ─────────────────────────────────────────────
   dnl Same .c shim pattern as Metal: PHP_ADD_SOURCES_X handles .c only,
   dnl so vio_ios.c is an empty wrapper that #include's vio_ios.m. Both
@@ -492,6 +610,9 @@ if test "$PHP_VIO" != "no"; then
 
   dnl ── Build directories ──────────────────────────────────────────
   PHP_ADD_BUILD_DIR($ext_builddir/src)
+  PHP_ADD_BUILD_DIR($ext_builddir/src/platform/x11)
+  PHP_ADD_BUILD_DIR($ext_builddir/src/platform/wayland)
+  PHP_ADD_BUILD_DIR($ext_builddir/src/platform/cocoa)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/opengl)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/vulkan)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/metal)

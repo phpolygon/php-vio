@@ -199,6 +199,15 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_gpu_frame_time, 0, 1, IS_DOU
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_gpu_timestamp, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_gpu_timings, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_shader_cache_stats, 0, 0, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
@@ -206,9 +215,14 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_swapchain_info, 0, 1, IS_ARR
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_texture_release_index, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, texture, VioTexture|VioCubemap, 0, NULL)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_texture_index, 0, 2, MAY_BE_LONG|MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
-	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, texture, VioTexture|VioCubemap, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_sampler_feedback_bind, 0, 2, _IS_BOOL, 0)
@@ -230,6 +244,20 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_backend_info, 0, 1, MAY_BE_A
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_font_info, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, font, VioFont, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_rank_backends, 0, 0, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
+#define arginfo_vio_benchmark_backends arginfo_vio_rank_backends
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_adapters, 0, 0, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, backend, IS_STRING, 1, "null")
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_shading_rate_image, 0, 2, _IS_BOOL, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, rates, IS_STRING, 1)
@@ -247,6 +275,12 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_acceleration_structure, 0, 2, VioAccelerationStructure, MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, instances, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_acceleration_structure_update, 0, 3, MAY_BE_STRING|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, accelerationStructure, VioAccelerationStructure, 0)
 	ZEND_ARG_TYPE_INFO(0, instances, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
@@ -275,10 +309,22 @@ ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_rt_pipeline, 0, 2, VioRt
 	ZEND_ARG_TYPE_INFO(0, desc, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_work_graph, 0, 2, VioWorkGraph, MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, desc, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_rt_bind_buffer, 0, 4, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_OBJ_INFO(0, pipeline, VioRtPipeline, 0)
 	ZEND_ARG_OBJ_INFO(0, buffer, VioBuffer, 0)
+	ZEND_ARG_TYPE_INFO(0, binding, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_rt_bind_texture, 0, 4, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, pipeline, VioRtPipeline, 0)
+	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
 	ZEND_ARG_TYPE_INFO(0, binding, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
@@ -288,6 +334,20 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_trace_rays, 0, 4, IS_VOID, 0
 	ZEND_ARG_TYPE_INFO(0, width, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, height, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, depth, IS_LONG, 0, "1")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_work_graph_bind_buffer, 0, 4, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, graph, VioWorkGraph, 0)
+	ZEND_ARG_OBJ_INFO(0, buffer, VioBuffer, 0)
+	ZEND_ARG_TYPE_INFO(0, slot, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_dispatch_graph, 0, 4, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, graph, VioWorkGraph, 0)
+	ZEND_ARG_TYPE_INFO(0, records, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, count, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_shading_rate, 0, 2, _IS_BOOL, 0)
@@ -329,7 +389,7 @@ ZEND_END_ARG_INFO()
 
 #define arginfo_vio_texture_3d arginfo_vio_texture
 
-ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_texture_ktx2, 0, 2, VioTexture, MAY_BE_FALSE)
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_texture_ktx2, 0, 2, VioTexture|VioCubemap, MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, bytes, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 1, "null")
@@ -412,6 +472,12 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_storage_buffer_read, 0, 2, M
 	ZEND_ARG_OBJ_INFO(0, buffer, VioBuffer, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bind_fragment_storage_buffer, 0, 3, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, buffer, VioBuffer, 1)
+	ZEND_ARG_TYPE_INFO(0, binding, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bind_storage_buffer, 0, 4, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_OBJ_INFO(0, buffer, VioBuffer, 0)
@@ -441,6 +507,35 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_submit_batch, 0, 2, IS_VOID,
 	ZEND_ARG_TYPE_INFO(0, draws, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_bundle, 0, 2, VioBundle, MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, records, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_draw_bundle, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, bundle, VioBundle, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bundle_info, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, bundle, VioBundle, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscale, 0, 3, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, source, VioRenderTarget|VioTexture, 0, NULL)
+	ZEND_ARG_OBJ_INFO(0, target, VioRenderTarget, 1)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 1, "[]")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscale_jitter, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO(0, frame, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, phases, IS_LONG, 0, "8")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscale_info, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
 /* ── 2D API functions ────────────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_rect, 0, 5, IS_VOID, 0)
@@ -720,6 +815,19 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_recorder_stop, 0, 1, IS_VOID
 	ZEND_ARG_OBJ_INFO(0, recorder, VioRecorder, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_recorder_info, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, recorder, VioRecorder, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_video_info, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_video_frame, 0, 2, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, index, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
 /* ── Streaming functions ──────────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_stream, 0, 2, VioStream, MAY_BE_FALSE)
@@ -769,6 +877,9 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_backend_count, 0, 0, IS_LONG
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_backends, 0, 0, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_platform, 0, 0, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_thermal_state, 0, 0, IS_STRING, 0)
@@ -880,6 +991,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_render_target_texture, 0
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, attachment, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_render_target_size, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, target, VioRenderTarget, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_cubemap, 0, 2, VioCubemap, MAY_BE_FALSE)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, config, IS_ARRAY, 0)
@@ -902,6 +1017,11 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_gl_info, 0, 1, MAY_BE_ARRAY|
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_supports_feature, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, feature, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_feature_info, 0, 2, IS_ARRAY, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, feature, IS_LONG, 0)
 ZEND_END_ARG_INFO()
@@ -978,20 +1098,31 @@ ZEND_FUNCTION(vio_mesh);
 ZEND_FUNCTION(vio_draw);
 ZEND_FUNCTION(vio_mesh_index_bytes);
 ZEND_FUNCTION(vio_gpu_frame_time);
+ZEND_FUNCTION(vio_gpu_timestamp);
+ZEND_FUNCTION(vio_gpu_timings);
 ZEND_FUNCTION(vio_shader_cache_stats);
 ZEND_FUNCTION(vio_swapchain_info);
 ZEND_FUNCTION(vio_backend_info);
+ZEND_FUNCTION(vio_adapters);
+ZEND_FUNCTION(vio_rank_backends);
+ZEND_FUNCTION(vio_benchmark_backends);
 ZEND_FUNCTION(vio_texture_index);
+ZEND_FUNCTION(vio_texture_release_index);
 ZEND_FUNCTION(vio_sampler_feedback_bind);
 ZEND_FUNCTION(vio_sampler_feedback_read);
 ZEND_FUNCTION(vio_sampler_feedback_clear);
 ZEND_FUNCTION(vio_acceleration_structure);
+ZEND_FUNCTION(vio_acceleration_structure_update);
 ZEND_FUNCTION(vio_bind_acceleration_structure);
 ZEND_FUNCTION(vio_draw_mesh_tasks);
 ZEND_FUNCTION(vio_draw_mesh_tasks_indirect);
 ZEND_FUNCTION(vio_rt_pipeline);
 ZEND_FUNCTION(vio_rt_bind_buffer);
+ZEND_FUNCTION(vio_rt_bind_texture);
 ZEND_FUNCTION(vio_trace_rays);
+ZEND_FUNCTION(vio_work_graph);
+ZEND_FUNCTION(vio_work_graph_bind_buffer);
+ZEND_FUNCTION(vio_dispatch_graph);
 ZEND_FUNCTION(vio_draw_indirect);
 ZEND_FUNCTION(vio_set_shading_rate);
 ZEND_FUNCTION(vio_set_shading_rate_image);
@@ -1007,6 +1138,7 @@ ZEND_FUNCTION(vio_draw_2d);
 ZEND_FUNCTION(vio_rounded_rect);
 ZEND_FUNCTION(vio_text_measure);
 ZEND_FUNCTION(vio_font_has_glyph);
+ZEND_FUNCTION(vio_font_info);
 ZEND_FUNCTION(vio_font_face);
 ZEND_FUNCTION(vio_font_face_has_glyph);
 ZEND_FUNCTION(vio_text_bitmap);
@@ -1032,11 +1164,18 @@ ZEND_FUNCTION(vio_compute_set_uniforms);
 ZEND_FUNCTION(vio_compute_dispatch);
 ZEND_FUNCTION(vio_compute_wait);
 ZEND_FUNCTION(vio_storage_buffer_read);
+ZEND_FUNCTION(vio_bind_fragment_storage_buffer);
 ZEND_FUNCTION(vio_bind_storage_buffer);
 ZEND_FUNCTION(vio_draw_instanced_from_buffer);
 ZEND_FUNCTION(vio_set_uniform);
 ZEND_FUNCTION(vio_set_uniforms);
 ZEND_FUNCTION(vio_submit_batch);
+ZEND_FUNCTION(vio_bundle);
+ZEND_FUNCTION(vio_draw_bundle);
+ZEND_FUNCTION(vio_bundle_info);
+ZEND_FUNCTION(vio_upscale);
+ZEND_FUNCTION(vio_upscale_jitter);
+ZEND_FUNCTION(vio_upscale_info);
 ZEND_FUNCTION(vio_shader_reflect);
 ZEND_FUNCTION(vio_audio_load);
 ZEND_FUNCTION(vio_audio_play);
@@ -1050,6 +1189,9 @@ ZEND_FUNCTION(vio_audio_listener);
 ZEND_FUNCTION(vio_recorder);
 ZEND_FUNCTION(vio_recorder_capture);
 ZEND_FUNCTION(vio_recorder_stop);
+ZEND_FUNCTION(vio_recorder_info);
+ZEND_FUNCTION(vio_video_info);
+ZEND_FUNCTION(vio_video_frame);
 ZEND_FUNCTION(vio_stream);
 ZEND_FUNCTION(vio_stream_push);
 ZEND_FUNCTION(vio_stream_stop);
@@ -1081,6 +1223,7 @@ ZEND_FUNCTION(vio_gamepad_triggers);
 ZEND_FUNCTION(vio_backend_name);
 ZEND_FUNCTION(vio_backend_count);
 ZEND_FUNCTION(vio_backends);
+ZEND_FUNCTION(vio_platform);
 ZEND_FUNCTION(vio_thermal_state);
 ZEND_FUNCTION(vio_plugins);
 ZEND_FUNCTION(vio_plugin_info);
@@ -1097,6 +1240,7 @@ ZEND_FUNCTION(vio_render_target);
 ZEND_FUNCTION(vio_bind_render_target);
 ZEND_FUNCTION(vio_unbind_render_target);
 ZEND_FUNCTION(vio_render_target_texture);
+ZEND_FUNCTION(vio_render_target_size);
 ZEND_FUNCTION(vio_render_target_cubemap);
 ZEND_FUNCTION(vio_read_render_target);
 ZEND_FUNCTION(vio_texture_update);
@@ -1106,6 +1250,7 @@ ZEND_FUNCTION(vio_bind_cubemap);
 ZEND_FUNCTION(vio_set_window_size);
 ZEND_FUNCTION(vio_gl_info);
 ZEND_FUNCTION(vio_supports_feature);
+ZEND_FUNCTION(vio_feature_info);
 ZEND_FUNCTION(vio_create_render_target);
 ZEND_FUNCTION(vio_set_render_target);
 ZEND_FUNCTION(vio_destroy_render_target);
@@ -1158,20 +1303,31 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_draw, arginfo_vio_draw)
 	ZEND_FE(vio_mesh_index_bytes, arginfo_vio_mesh_index_bytes)
 	ZEND_FE(vio_gpu_frame_time, arginfo_vio_gpu_frame_time)
+	ZEND_FE(vio_gpu_timestamp, arginfo_vio_gpu_timestamp)
+	ZEND_FE(vio_gpu_timings, arginfo_vio_gpu_timings)
 	ZEND_FE(vio_shader_cache_stats, arginfo_vio_shader_cache_stats)
 	ZEND_FE(vio_swapchain_info, arginfo_vio_swapchain_info)
 	ZEND_FE(vio_backend_info, arginfo_vio_backend_info)
+	ZEND_FE(vio_adapters, arginfo_vio_adapters)
+	ZEND_FE(vio_rank_backends, arginfo_vio_rank_backends)
+	ZEND_FE(vio_benchmark_backends, arginfo_vio_benchmark_backends)
 	ZEND_FE(vio_texture_index, arginfo_vio_texture_index)
+	ZEND_FE(vio_texture_release_index, arginfo_vio_texture_release_index)
 	ZEND_FE(vio_sampler_feedback_bind, arginfo_vio_sampler_feedback_bind)
 	ZEND_FE(vio_sampler_feedback_read, arginfo_vio_sampler_feedback_read)
 	ZEND_FE(vio_sampler_feedback_clear, arginfo_vio_sampler_feedback_clear)
 	ZEND_FE(vio_acceleration_structure, arginfo_vio_acceleration_structure)
+	ZEND_FE(vio_acceleration_structure_update, arginfo_vio_acceleration_structure_update)
 	ZEND_FE(vio_bind_acceleration_structure, arginfo_vio_bind_acceleration_structure)
 	ZEND_FE(vio_draw_mesh_tasks, arginfo_vio_draw_mesh_tasks)
 	ZEND_FE(vio_draw_mesh_tasks_indirect, arginfo_vio_draw_mesh_tasks_indirect)
 	ZEND_FE(vio_rt_pipeline, arginfo_vio_rt_pipeline)
 	ZEND_FE(vio_rt_bind_buffer, arginfo_vio_rt_bind_buffer)
+	ZEND_FE(vio_rt_bind_texture, arginfo_vio_rt_bind_texture)
 	ZEND_FE(vio_trace_rays, arginfo_vio_trace_rays)
+	ZEND_FE(vio_work_graph, arginfo_vio_work_graph)
+	ZEND_FE(vio_work_graph_bind_buffer, arginfo_vio_work_graph_bind_buffer)
+	ZEND_FE(vio_dispatch_graph, arginfo_vio_dispatch_graph)
 	ZEND_FE(vio_draw_indirect, arginfo_vio_draw_indirect)
 	ZEND_FE(vio_set_shading_rate, arginfo_vio_set_shading_rate)
 	ZEND_FE(vio_set_shading_rate_image, arginfo_vio_set_shading_rate_image)
@@ -1187,6 +1343,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_rounded_rect, arginfo_vio_rounded_rect)
 	ZEND_FE(vio_text_measure, arginfo_vio_text_measure)
 	ZEND_FE(vio_font_has_glyph, arginfo_vio_font_has_glyph)
+	ZEND_FE(vio_font_info, arginfo_vio_font_info)
 	ZEND_FE(vio_font_face, arginfo_vio_font_face)
 	ZEND_FE(vio_font_face_has_glyph, arginfo_vio_font_face_has_glyph)
 	ZEND_FE(vio_text_bitmap, arginfo_vio_text_bitmap)
@@ -1212,11 +1369,18 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_compute_dispatch, arginfo_vio_compute_dispatch)
 	ZEND_FE(vio_compute_wait, arginfo_vio_compute_wait)
 	ZEND_FE(vio_storage_buffer_read, arginfo_vio_storage_buffer_read)
+	ZEND_FE(vio_bind_fragment_storage_buffer, arginfo_vio_bind_fragment_storage_buffer)
 	ZEND_FE(vio_bind_storage_buffer, arginfo_vio_bind_storage_buffer)
 	ZEND_FE(vio_draw_instanced_from_buffer, arginfo_vio_draw_instanced_from_buffer)
 	ZEND_FE(vio_set_uniform, arginfo_vio_set_uniform)
 	ZEND_FE(vio_set_uniforms, arginfo_vio_set_uniforms)
 	ZEND_FE(vio_submit_batch, arginfo_vio_submit_batch)
+	ZEND_FE(vio_bundle, arginfo_vio_bundle)
+	ZEND_FE(vio_draw_bundle, arginfo_vio_draw_bundle)
+	ZEND_FE(vio_bundle_info, arginfo_vio_bundle_info)
+	ZEND_FE(vio_upscale, arginfo_vio_upscale)
+	ZEND_FE(vio_upscale_jitter, arginfo_vio_upscale_jitter)
+	ZEND_FE(vio_upscale_info, arginfo_vio_upscale_info)
 	ZEND_FE(vio_shader_reflect, arginfo_vio_shader_reflect)
 	ZEND_FE(vio_audio_load, arginfo_vio_audio_load)
 	ZEND_FE(vio_audio_play, arginfo_vio_audio_play)
@@ -1230,6 +1394,9 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_recorder, arginfo_vio_recorder)
 	ZEND_FE(vio_recorder_capture, arginfo_vio_recorder_capture)
 	ZEND_FE(vio_recorder_stop, arginfo_vio_recorder_stop)
+	ZEND_FE(vio_recorder_info, arginfo_vio_recorder_info)
+	ZEND_FE(vio_video_info, arginfo_vio_video_info)
+	ZEND_FE(vio_video_frame, arginfo_vio_video_frame)
 	ZEND_FE(vio_stream, arginfo_vio_stream)
 	ZEND_FE(vio_stream_push, arginfo_vio_stream_push)
 	ZEND_FE(vio_stream_stop, arginfo_vio_stream_stop)
@@ -1261,6 +1428,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_backend_name, arginfo_vio_backend_name)
 	ZEND_FE(vio_backend_count, arginfo_vio_backend_count)
 	ZEND_FE(vio_backends, arginfo_vio_backends)
+	ZEND_FE(vio_platform, arginfo_vio_platform)
 	ZEND_FE(vio_thermal_state, arginfo_vio_thermal_state)
 	ZEND_FE(vio_plugins, arginfo_vio_plugins)
 	ZEND_FE(vio_plugin_info, arginfo_vio_plugin_info)
@@ -1277,6 +1445,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_bind_render_target, arginfo_vio_bind_render_target)
 	ZEND_FE(vio_unbind_render_target, arginfo_vio_unbind_render_target)
 	ZEND_FE(vio_render_target_texture, arginfo_vio_render_target_texture)
+	ZEND_FE(vio_render_target_size, arginfo_vio_render_target_size)
 	ZEND_FE(vio_render_target_cubemap, arginfo_vio_render_target_cubemap)
 	ZEND_FE(vio_read_render_target, arginfo_vio_read_render_target)
 	ZEND_FE(vio_texture_update, arginfo_vio_texture_update)
@@ -1286,6 +1455,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_set_window_size, arginfo_vio_set_window_size)
 	ZEND_FE(vio_gl_info, arginfo_vio_gl_info)
 	ZEND_FE(vio_supports_feature, arginfo_vio_supports_feature)
+	ZEND_FE(vio_feature_info, arginfo_vio_feature_info)
 	ZEND_FE(vio_create_render_target, arginfo_vio_create_render_target)
 	ZEND_FE(vio_set_render_target, arginfo_vio_set_render_target)
 	ZEND_FE(vio_destroy_render_target, arginfo_vio_destroy_render_target)
