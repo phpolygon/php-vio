@@ -4352,29 +4352,11 @@ ZEND_FUNCTION(vio_pipeline)
     RETURN_COPY_VALUE(&pipe_zval);
 }
 
-ZEND_FUNCTION(vio_bind_pipeline)
+/* Bind a pipeline: vio_bind_pipeline and every record of vio_submit_batch go
+ * through here, so a batch's pipeline switch does exactly what the single call
+ * does (Metal: the shader's cbuffers, found missing by test 169 on the CI). */
+static void vio_bind_pipeline_core(vio_context_object *ctx, vio_pipeline_object *pipe)
 {
-    zval *ctx_zval;
-    zval *pipe_zval;
-
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
-        Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_pipeline_ce)
-    ZEND_PARSE_PARAMETERS_END();
-
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-
-    if (!ctx->initialized || !ctx->in_frame) {
-        php_error_docref(NULL, E_WARNING, "Must call vio_bind_pipeline between vio_begin and vio_end");
-        return;
-    }
-
-    vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pipe_zval);
-    if (!pipe->valid) {
-        php_error_docref(NULL, E_WARNING, "Pipeline is not valid");
-        return;
-    }
-
     /* Track bound shader in context for vio_draw() and uniform cbuffer */
     ctx->bound_shader_program = pipe->shader_program;
     ctx->bound_shader_object = pipe->shader_ref;
@@ -4399,6 +4381,32 @@ ZEND_FUNCTION(vio_bind_pipeline)
         vio_metal_set_shader_cbuffers(msh->cbuffer_backend, msh->frag_cbuffer_backend);
     }
 #endif
+}
+
+ZEND_FUNCTION(vio_bind_pipeline)
+{
+    zval *ctx_zval;
+    zval *pipe_zval;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_pipeline_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_bind_pipeline between vio_begin and vio_end");
+        return;
+    }
+
+    vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pipe_zval);
+    if (!pipe->valid) {
+        php_error_docref(NULL, E_WARNING, "Pipeline is not valid");
+        return;
+    }
+
+    vio_bind_pipeline_core(ctx, pipe);
 }
 
 /* GAP-PHASE5 Block 9: texture arrays, block-compressed data and pre-built mip
@@ -6330,13 +6338,7 @@ ZEND_FUNCTION(vio_submit_batch)
             instanceof_function(Z_OBJCE_P(pz), vio_pipeline_ce)) {
             vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pz);
             if (pipe->valid && pipe != last_pipeline) {
-                ctx->bound_shader_program = pipe->shader_program;
-                ctx->bound_shader_object = pipe->shader_ref;
-                if (ctx->backend->bind_pipeline_state) {
-                    ctx->backend->bind_pipeline_state(pipe);
-                } else if (pipe->backend_pipeline && ctx->backend->bind_pipeline) {
-                    ctx->backend->bind_pipeline(pipe->backend_pipeline);
-                }
+                vio_bind_pipeline_core(ctx, pipe);
                 last_pipeline = pipe;
             }
         }
