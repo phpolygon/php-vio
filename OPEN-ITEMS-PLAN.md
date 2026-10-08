@@ -43,7 +43,7 @@ A33 Sub-Image-Uploads für den Glyph-Atlas ✅ (Test 189) · A34 Vertikaltext �
 `vkDeviceWaitIdle` ✅ (Test 188; Nebenbefund: D3D11 las mitten im Frame den vorigen Frame).
 
 ## Batch 5 — Lücken der Shader-Stages
-A29 Hull/Domain-Generator (Interface-Blöcke, Struct-/Matrix-Varyings, `gl_ClipDistance`, fremde Kontrollpunkte) ·
+A29 Hull/Domain-Generator (Interface-Blöcke, Struct-/Matrix-Varyings, `gl_ClipDistance`, fremde Kontrollpunkte) ✅ (Test 198; Nebenbefund: GL schaltete `GL_CLIP_DISTANCEi` nie ein) ·
 A28 Metal-GS-Emulation (Sampler, Interface-Blöcke, GS hinter Tess, Strip-Adjacency, `gl_PrimitiveID`) (CI) ·
 A30 Texturen in Mesh-/Task-Stages ✅ (Test 197; Nebenbefund: Sampler-Register je Stage folgten der Reihenfolge der ersten Benutzung – jetzt ein shaderweiter Plan nach Namen) · A13 RT-Pipeline (mehrere Gruppen, Callables, Shader-Records, Ressourcen, Trace im Frame) ·
 A14 TLAS-Objekt mit Rebuild/Refit · A15 Sampler-Feedback-Emulation · A18 Vulkan-Shading-Rate-Bild (nur kompiliert, kein Treiber).
