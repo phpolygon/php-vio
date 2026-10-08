@@ -37,6 +37,7 @@ $exempt_dirs = [
     "$root/src/backends/opengl",
     "$root/vendor",
     "$root/.deps",   // third-party sources built locally (SPIRV-Cross), not vio code
+    "$root/deps",    // the Windows CI unpacks its SDKs (glslang headers, ...) into the checkout
     "$root/src/platform",   // window systems: GL context creation (GLFW hints, WGL / CGL / GLX)
 ];
 $exempt_files = [
