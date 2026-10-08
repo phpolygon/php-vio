@@ -532,6 +532,14 @@ typedef struct _vio_backend {
      * target inside the frame (0 = done, else the portable passes run). */
     const char *(*upscale_method)(int mode);
     int         (*upscale_native)(void *src_backend_texture, void *dst_render_target, int mode);
+
+    /* GPU video encoding without a CPU copy (VIDEO-ENCODE-PLAN phase 2):
+     * encode_device hands out the native device an FFmpeg hardware device can
+     * wrap (*api = VIO_ENCODE_API_*); encode_copy_frame copies the last finished
+     * frame (the one vio_read_pixels returns) into slice `slice` of a texture of
+     * that device, same size and format as the swapchain (0 = done). */
+    void       *(*encode_device)(int *api);
+    int         (*encode_copy_frame)(void *dst_texture, int slice, int width, int height);
 } vio_backend;
 
 #define VIO_MAX_FRAGMENT_STORAGE 4

@@ -815,6 +815,19 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_recorder_stop, 0, 1, IS_VOID
 	ZEND_ARG_OBJ_INFO(0, recorder, VioRecorder, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_recorder_info, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, recorder, VioRecorder, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_video_info, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_video_frame, 0, 2, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, index, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
 /* ── Streaming functions ──────────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_stream, 0, 2, VioStream, MAY_BE_FALSE)
@@ -1169,6 +1182,9 @@ ZEND_FUNCTION(vio_audio_listener);
 ZEND_FUNCTION(vio_recorder);
 ZEND_FUNCTION(vio_recorder_capture);
 ZEND_FUNCTION(vio_recorder_stop);
+ZEND_FUNCTION(vio_recorder_info);
+ZEND_FUNCTION(vio_video_info);
+ZEND_FUNCTION(vio_video_frame);
 ZEND_FUNCTION(vio_stream);
 ZEND_FUNCTION(vio_stream_push);
 ZEND_FUNCTION(vio_stream_stop);
@@ -1369,6 +1385,9 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_recorder, arginfo_vio_recorder)
 	ZEND_FE(vio_recorder_capture, arginfo_vio_recorder_capture)
 	ZEND_FE(vio_recorder_stop, arginfo_vio_recorder_stop)
+	ZEND_FE(vio_recorder_info, arginfo_vio_recorder_info)
+	ZEND_FE(vio_video_info, arginfo_vio_video_info)
+	ZEND_FE(vio_video_frame, arginfo_vio_video_frame)
 	ZEND_FE(vio_stream, arginfo_vio_stream)
 	ZEND_FE(vio_stream_push, arginfo_vio_stream_push)
 	ZEND_FE(vio_stream_stop, arginfo_vio_stream_stop)

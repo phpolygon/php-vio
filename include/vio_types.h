@@ -441,6 +441,9 @@ typedef struct _vio_coopmat_shape {
  * cube or array target at once (VIO_FEATURE_LAYERED_RENDER). */
 #define VIO_RT_ALL_LAYERS (-2)
 
+/* Native device APIs a video encoder can share (VIDEO-ENCODE-PLAN.md) */
+#define VIO_ENCODE_API_D3D11 1
+
 /* vio_upscale modes (UPSCALE-PLAN.md) */
 #define VIO_UPSCALE_SPATIAL  0
 #define VIO_UPSCALE_TEMPORAL 1

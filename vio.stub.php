@@ -1233,7 +1233,12 @@ function vio_thermal_state(): string {}
 /**
  * Create a video recorder for capturing frames to a video file.
  *
- * @param array $config ['path' => string, 'fps' => int (default 30), 'codec' => string (optional)]
+ * @param array $config ['path' => string, 'fps' => int (default 30),
+ *   'encoder' => 'auto' (default: the platform's hardware encoders - Windows NVENC, AMF, QSV,
+ *   Media Foundation; Apple VideoToolbox; Linux NVENC - then libx264) | 'hardware' (no software
+ *   fallback) | 'software' (libx264) | an FFmpeg encoder name; 'codec' is the old spelling]
+ *   On D3D11 a hardware encoder that takes D3D11 frames gets the frame without a CPU copy
+ *   (vio_recorder_info()['zero_copy']).
  * @return VioRecorder|false Recorder object or false on failure
  */
 function vio_recorder(VioContext $context, array $config): VioRecorder|false {}
@@ -1247,6 +1252,23 @@ function vio_recorder_capture(VioRecorder $recorder, VioContext $context): bool 
  * Stop recording and finalize the video file.
  */
 function vio_recorder_stop(VioRecorder $recorder): void {}
+
+/**
+ * ['encoder' => FFmpeg name, 'hardware' => bool, 'zero_copy' => bool, 'frames' => int,
+ *  'width' => int, 'height' => int, 'fps' => int, 'recording' => bool]
+ */
+function vio_recorder_info(VioRecorder $recorder): array|false {}
+
+/**
+ * Facts of a video file: ['width', 'height', 'frames' (decoded and counted), 'fps', 'codec'],
+ * false when it is no video FFmpeg can read.
+ */
+function vio_video_info(string $path): array|false {}
+
+/**
+ * Frame $index of a video decoded to RGBA: ['width', 'height', 'data'], false past the end.
+ */
+function vio_video_frame(string $path, int $index): array|false {}
 
 /**
  * Create a live stream to an RTMP or SRT endpoint.

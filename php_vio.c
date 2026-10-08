@@ -10932,7 +10932,11 @@ ZEND_FUNCTION(vio_recorder)
         fps = (int)zval_get_long(val);
         if (fps <= 0) fps = 30;
     }
-    if ((val = zend_hash_str_find(config_ht, "codec", sizeof("codec") - 1)) != NULL) {
+    if ((val = zend_hash_str_find(config_ht, "codec", sizeof("codec") - 1)) != NULL && Z_TYPE_P(val) == IS_STRING) {
+        codec = Z_STRVAL_P(val);
+    }
+    /* 'encoder': auto | hardware | software | an FFmpeg encoder name ('codec' is the old spelling) */
+    if ((val = zend_hash_str_find(config_ht, "encoder", sizeof("encoder") - 1)) != NULL && Z_TYPE_P(val) == IS_STRING) {
         codec = Z_STRVAL_P(val);
     }
 
@@ -10941,7 +10945,7 @@ ZEND_FUNCTION(vio_recorder)
     object_init_ex(&obj, vio_recorder_ce);
     vio_recorder_object *rec = Z_VIO_RECORDER_P(&obj);
 
-    int ret = vio_recorder_init(rec, path, ctx->config.width, ctx->config.height, fps, codec);
+    int ret = vio_recorder_init(rec, path, ctx->config.width, ctx->config.height, fps, codec, ctx->backend);
     if (ret != 0) {
         php_error_docref(NULL, E_WARNING, "Failed to initialize recorder (error %d)", ret);
         zval_ptr_dtor(&obj);
@@ -10970,6 +10974,20 @@ ZEND_FUNCTION(vio_recorder_capture)
 
     int w = ctx->config.width;
     int h = ctx->config.height;
+
+    /* Zero copy: the GPU copies the frame into the encoder's texture. */
+    if (rec->zero_copy && rec->backend == ctx->backend) {
+        int zret = vio_recorder_write_gpu(rec);
+        if (zret < 0) {
+            php_error_docref(NULL, E_WARNING, "Failed to encode frame (error %d)", zret);
+            RETURN_FALSE;
+        }
+        RETURN_TRUE;
+    }
+    if (rec->zero_copy) {
+        php_error_docref(NULL, E_WARNING, "vio_recorder_capture: this recorder encodes the frames of the context it was made for");
+        RETURN_FALSE;
+    }
 
     size_t size = (size_t)w * h * 4;
     unsigned char *pixels = emalloc(size);
@@ -11002,6 +11020,71 @@ ZEND_FUNCTION(vio_recorder_stop)
         vio_recorder_finalize(rec);
     }
 }
+
+ZEND_FUNCTION(vio_recorder_info)
+{
+    zval *rec_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(rec_zval, vio_recorder_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_recorder_object *rec = Z_VIO_RECORDER_P(rec_zval);
+    array_init(return_value);
+    add_assoc_string(return_value, "encoder", rec->encoder);
+    add_assoc_bool(return_value, "hardware", rec->hardware);
+    add_assoc_bool(return_value, "zero_copy", rec->zero_copy);
+    add_assoc_long(return_value, "frames", (zend_long)rec->frame_count);
+    add_assoc_long(return_value, "width", rec->width);
+    add_assoc_long(return_value, "height", rec->height);
+    add_assoc_long(return_value, "fps", rec->fps);
+    add_assoc_bool(return_value, "recording", rec->recording);
+}
+
+ZEND_FUNCTION(vio_video_info)
+{
+    zend_string *path;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_PATH_STR(path)
+    ZEND_PARSE_PARAMETERS_END();
+
+    int w = 0, h = 0, frames = 0;
+    double fps = 0.0;
+    char codec[64];
+    if (vio_video_probe(ZSTR_VAL(path), &w, &h, &frames, &fps, codec, sizeof(codec)) != 0) RETURN_FALSE;
+    array_init(return_value);
+    add_assoc_long(return_value, "width", w);
+    add_assoc_long(return_value, "height", h);
+    add_assoc_long(return_value, "frames", frames);
+    add_assoc_double(return_value, "fps", fps);
+    add_assoc_string(return_value, "codec", codec);
+}
+
+ZEND_FUNCTION(vio_video_frame)
+{
+    zend_string *path;
+    zend_long index;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_PATH_STR(path)
+        Z_PARAM_LONG(index)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (index < 0 || index > INT_MAX) {
+        zend_argument_value_error(2, "must be a frame index >= 0");
+        RETURN_THROWS();
+    }
+    int w = 0, h = 0;
+    unsigned char *rgba = vio_video_decode(ZSTR_VAL(path), (int)index, &w, &h);
+    if (!rgba) RETURN_FALSE;
+    array_init(return_value);
+    add_assoc_long(return_value, "width", w);
+    add_assoc_long(return_value, "height", h);
+    add_assoc_stringl(return_value, "data", (char *)rgba, (size_t)w * h * 4);
+    efree(rgba);
+}
+
 /* ── Network streaming functions ──────────────────────────────────── */
 
 ZEND_FUNCTION(vio_stream)
@@ -11130,6 +11213,21 @@ ZEND_FUNCTION(vio_recorder_capture)
 ZEND_FUNCTION(vio_recorder_stop)
 {
     php_error_docref(NULL, E_WARNING, "Video recording requires FFmpeg (compile with --with-ffmpeg)");
+}
+ZEND_FUNCTION(vio_recorder_info)
+{
+    php_error_docref(NULL, E_WARNING, "Video recording requires FFmpeg (compile with --with-ffmpeg)");
+    RETURN_FALSE;
+}
+ZEND_FUNCTION(vio_video_info)
+{
+    php_error_docref(NULL, E_WARNING, "Reading video requires FFmpeg (compile with --with-ffmpeg)");
+    RETURN_FALSE;
+}
+ZEND_FUNCTION(vio_video_frame)
+{
+    php_error_docref(NULL, E_WARNING, "Reading video requires FFmpeg (compile with --with-ffmpeg)");
+    RETURN_FALSE;
 }
 ZEND_FUNCTION(vio_stream)
 {

@@ -2139,6 +2139,10 @@ static const char *d3d11_dmip_resolve_src =
     "    return d;\n"
     "}\n";
 
+static const char *d3d11_copy_ps_src =
+    "Texture2D<float4> src : register(t0);\n"
+    "float4 main(float4 pos : SV_Position) : SV_Target { return src.Load(int3(int2(pos.xy), 0)); }\n";
+
 static int d3d11_dmip_init(void)
 {
     if (vio_d3d11.dmip_ps) return 0;
@@ -2154,6 +2158,11 @@ static int d3d11_dmip_init(void)
     if (SUCCEEDED(hr) && SUCCEEDED(d3d11_compile_cached(d3d11_dmip_resolve_src, "vio_depth_resolve_ps", "ps_5_0", flags, &rps))) {
         ID3D11Device_CreatePixelShader(vio_d3d11.device, ID3D10Blob_GetBufferPointer(rps), ID3D10Blob_GetBufferSize(rps), NULL, &vio_d3d11.dmip_resolve_ps);
         ID3D10Blob_Release(rps);
+    }
+    ID3DBlob *cps = NULL;
+    if (SUCCEEDED(hr) && SUCCEEDED(d3d11_compile_cached(d3d11_copy_ps_src, "vio_texel_copy_ps", "ps_5_0", flags, &cps))) {
+        ID3D11Device_CreatePixelShader(vio_d3d11.device, ID3D10Blob_GetBufferPointer(cps), ID3D10Blob_GetBufferSize(cps), NULL, &vio_d3d11.dmip_copy_ps);
+        ID3D10Blob_Release(cps);
     }
     D3D11_BUFFER_DESC bd = {0};
     bd.ByteWidth = 32;
@@ -2183,6 +2192,7 @@ static void d3d11_dmip_release(void)
     if (vio_d3d11.dmip_vs)  { ID3D11VertexShader_Release(vio_d3d11.dmip_vs); vio_d3d11.dmip_vs = NULL; }
     if (vio_d3d11.dmip_ps)  { ID3D11PixelShader_Release(vio_d3d11.dmip_ps); vio_d3d11.dmip_ps = NULL; }
     if (vio_d3d11.dmip_resolve_ps) { ID3D11PixelShader_Release(vio_d3d11.dmip_resolve_ps); vio_d3d11.dmip_resolve_ps = NULL; }
+    if (vio_d3d11.dmip_copy_ps) { ID3D11PixelShader_Release(vio_d3d11.dmip_copy_ps); vio_d3d11.dmip_copy_ps = NULL; }
     if (vio_d3d11.dmip_cb)  { ID3D11Buffer_Release(vio_d3d11.dmip_cb); vio_d3d11.dmip_cb = NULL; }
     if (vio_d3d11.dmip_dss) { ID3D11DepthStencilState_Release(vio_d3d11.dmip_dss); vio_d3d11.dmip_dss = NULL; }
     if (vio_d3d11.dmip_rs)  { ID3D11RasterizerState_Release(vio_d3d11.dmip_rs); vio_d3d11.dmip_rs = NULL; }
@@ -2198,6 +2208,7 @@ typedef struct {
     ID3D11DepthStencilState *dss; UINT ref;
     ID3D11RasterizerState *rs;
     ID3D11ShaderResourceView *srv; ID3D11Buffer *cb;
+    ID3D11BlendState *bs; FLOAT bf[4]; UINT mask;
     D3D11_VIEWPORT vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]; UINT vp_n;
 } d3d11_saved_state;
 
@@ -2219,6 +2230,7 @@ static void d3d11_state_save(d3d11_saved_state *s)
     ID3D11DeviceContext_PSGetShaderResources(c, 0, 1, &s->srv);
     ID3D11DeviceContext_PSGetConstantBuffers(c, 0, 1, &s->cb);
     ID3D11DeviceContext_RSGetViewports(c, &s->vp_n, s->vp);
+    ID3D11DeviceContext_OMGetBlendState(c, &s->bs, s->bf, &s->mask);
 }
 
 static void d3d11_state_restore(d3d11_saved_state *s)
@@ -2237,6 +2249,8 @@ static void d3d11_state_restore(d3d11_saved_state *s)
     ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &s->srv);
     ID3D11DeviceContext_PSSetConstantBuffers(c, 0, 1, &s->cb);
     if (s->vp_n) ID3D11DeviceContext_RSSetViewports(c, s->vp_n, s->vp);
+    ID3D11DeviceContext_OMSetBlendState(c, s->bs, s->bf, s->mask);
+    if (s->bs) ID3D11BlendState_Release(s->bs);
     for (int i = 0; i < VIO_MAX_COLOR_ATTACHMENTS; i++) if (s->rtvs[i]) ID3D11RenderTargetView_Release(s->rtvs[i]);
     if (s->dsv) ID3D11DepthStencilView_Release(s->dsv);
     if (s->vs) ID3D11VertexShader_Release(s->vs);
@@ -4348,6 +4362,78 @@ static void d3d11_bundles_sweep(void)
 
 static const char *d3d11_bundle_method(void) { return "deferred_context"; }
 
+/* ── GPU video encoding interop (VIDEO-ENCODE-PLAN phase 2) ──────── */
+
+static void *d3d11_encode_device(int *api)
+{
+    if (!vio_d3d11.initialized || !vio_d3d11.device) return NULL;
+    *api = VIO_ENCODE_API_D3D11;
+    return vio_d3d11.device;
+}
+
+/* The frame vio_read_pixels would return - the GPU-local mirror end_frame
+ * keeps (mid-frame: the frame so far) - into the encoder's pool texture. */
+static int d3d11_encode_copy_frame(void *dst_texture, int slice, int width, int height)
+{
+    ID3D11Texture2D *dst = (ID3D11Texture2D *)dst_texture;
+    if (!dst || !vio_d3d11.context || d3d11_rec) return -1;
+    if (vio_d3d11.in_frame && !vio_d3d11.current_bound_rt) d3d11_mirror_backbuffer();
+    if (!vio_d3d11.readback_mirror) return -1;
+    D3D11_TEXTURE2D_DESC sd, dd;
+    ID3D11Texture2D_GetDesc(vio_d3d11.readback_mirror, &sd);
+    ID3D11Texture2D_GetDesc(dst, &dd);
+    if (slice < 0 || (UINT)slice >= dd.ArraySize
+        || (int)sd.Width < width || (int)sd.Height < height || (int)dd.Width < width || (int)dd.Height < height) return -1;
+    if (sd.Format == dd.Format) {
+        D3D11_BOX box = { 0, 0, 0, (UINT)width, (UINT)height, 1 };
+        ID3D11DeviceContext_CopySubresourceRegion(vio_d3d11.context, (ID3D11Resource *)dst, (UINT)slice * dd.MipLevels, 0, 0, 0,
+                                                  (ID3D11Resource *)vio_d3d11.readback_mirror, 0, &box);
+        return 0;
+    }
+    /* Another format (the encoder's BGRA pool): a texel copy into a render
+     * target view of the slice - the output merger converts. */
+    if (!(dd.BindFlags & D3D11_BIND_RENDER_TARGET) || d3d11_dmip_init() != 0 || !vio_d3d11.dmip_copy_ps) return -1;
+    D3D11_RENDER_TARGET_VIEW_DESC rv = {0};
+    rv.Format = dd.Format;
+    if (dd.ArraySize > 1) {
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+        rv.Texture2DArray.FirstArraySlice = (UINT)slice;
+        rv.Texture2DArray.ArraySize = 1;
+    } else {
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    }
+    ID3D11RenderTargetView *rtv = NULL;
+    ID3D11ShaderResourceView *srv = NULL, *null_srv = NULL;
+    if (FAILED(ID3D11Device_CreateRenderTargetView(vio_d3d11.device, (ID3D11Resource *)dst, &rv, &rtv))
+        || FAILED(ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)vio_d3d11.readback_mirror, NULL, &srv))) {
+        if (rtv) ID3D11RenderTargetView_Release(rtv);
+        return -1;
+    }
+    ID3D11DeviceContext *c = vio_d3d11.context;
+    d3d11_saved_state saved;
+    d3d11_state_save(&saved);
+    D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f };
+    ID3D11DeviceContext_VSSetShader(c, vio_d3d11.dmip_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, vio_d3d11.dmip_copy_ps, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(c, NULL, NULL, 0);
+    ID3D11DeviceContext_HSSetShader(c, NULL, NULL, 0);
+    ID3D11DeviceContext_DSSetShader(c, NULL, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(c, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_OMSetDepthStencilState(c, NULL, 0);
+    ID3D11DeviceContext_OMSetBlendState(c, NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_RSSetState(c, vio_d3d11.dmip_rs);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 1, &rtv, NULL);
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &srv);
+    ID3D11DeviceContext_RSSetViewports(c, 1, &vp);
+    ID3D11DeviceContext_Draw(c, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &null_srv);
+    d3d11_state_restore(&saved);
+    ID3D11RenderTargetView_Release(rtv);
+    ID3D11ShaderResourceView_Release(srv);
+    return 0;
+}
+
 /* ── Setup context (called from vio_create after window creation) ── */
 
 int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg)
@@ -4438,6 +4524,8 @@ static const vio_backend d3d11_backend = {
     .draw_bundle             = d3d11_draw_bundle,
     .destroy_bundle          = d3d11_destroy_bundle,
     .bundle_method           = d3d11_bundle_method,
+    .encode_device           = d3d11_encode_device,
+    .encode_copy_frame       = d3d11_encode_copy_frame,
     .rt_origin_top     = 1,
 };
 

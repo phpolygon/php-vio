@@ -304,6 +304,7 @@ typedef struct _vio_d3d11_state {
     ID3D11VertexShader      *dmip_vs;
     ID3D11PixelShader       *dmip_ps;
     ID3D11PixelShader       *dmip_resolve_ps;   /* depth_only MSAA resolve (A24) */
+    ID3D11PixelShader       *dmip_copy_ps;      /* texel copy into another format (video encoding, A39) */
     ID3D11Buffer            *dmip_cb;
     ID3D11DepthStencilState *dmip_dss;
     ID3D11RasterizerState   *dmip_rs;
