@@ -1188,6 +1188,7 @@ static int d3d12_init(vio_config *cfg)
     IDXGIAdapter1 *adapter = NULL;
     const char *hw_env = getenv("VIO_D3D_HEADLESS_HARDWARE");
     if (cfg->headless && !cfg->headless_hardware && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)) {
+        vio_d3d_load_warp();
         hr = IDXGIFactory4_EnumWarpAdapter(vio_d3d12.factory, &IID_IDXGIAdapter1, (void **)&adapter);
         if (FAILED(hr)) {
             php_error_docref(NULL, E_WARNING, "D3D12: WARP adapter not available (0x%08lx)", hr);

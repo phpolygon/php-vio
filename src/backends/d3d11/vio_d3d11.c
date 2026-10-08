@@ -188,6 +188,7 @@ static int d3d11_init(vio_config *cfg)
     D3D_DRIVER_TYPE driver_type = cfg->headless && !cfg->headless_hardware && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)
         ? D3D_DRIVER_TYPE_WARP
         : D3D_DRIVER_TYPE_HARDWARE;
+    if (driver_type == D3D_DRIVER_TYPE_WARP) vio_d3d_load_warp();
 
     hr = D3D11CreateDevice(
         NULL,                           /* adapter (NULL = default) */

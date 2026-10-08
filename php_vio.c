@@ -776,6 +776,22 @@ pick_backend:
         }
     }
 
+    /* VIO_D3D12_AGILITY_SDK / _VERSION: the same for every context without the
+     * option, so a whole test run uses the Agility runtime (SM69-PLAN 0a). */
+    if (!ctx->config.agility_sdk[0]) {
+        const char *env = getenv("VIO_D3D12_AGILITY_SDK");
+        if (env && *env && strlen(env) < sizeof(ctx->config.agility_sdk)) {
+            memcpy(ctx->config.agility_sdk, env, strlen(env) + 1);
+            const char *ev = getenv("VIO_D3D12_AGILITY_SDK_VERSION");
+            if (ev && *ev && ctx->config.agility_sdk_version == 0) ctx->config.agility_sdk_version = atoi(ev);
+        }
+    }
+    /* VIO_DXC_DIR: dxcompiler.dll + dxil.dll for every context without 'dxc_dir'. */
+    if (!ctx->config.dxc_dir[0]) {
+        const char *env = getenv("VIO_DXC_DIR");
+        if (env && *env && strlen(env) < sizeof(ctx->config.dxc_dir)) memcpy(ctx->config.dxc_dir, env, strlen(env) + 1);
+    }
+
     /* Initialize backend */
     if (ctx->backend->init && ctx->backend->init(&ctx->config) != 0) {
         php_error_docref(NULL, E_WARNING, "Failed to initialize backend \"%s\"", ctx->backend->name);
