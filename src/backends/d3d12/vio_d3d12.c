@@ -8806,6 +8806,10 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_DEPTH_MIPMAPS: return 1;   /* d3d12_generate_depth_mips (A26) */
         /* SM 6.9 vector<T, N> (N <= 1024) through the compute 'hlsl' override */
         case VIO_FEATURE_LONG_VECTOR: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 69;
+        /* DXR 1.2 (D3D12_RAYTRACING_TIER_1_2 = 12) + SM 6.9: the lib_6_9 library may use
+         * dx::HitObject / dx::MaybeReorderThread (the profile follows the device). */
+        case VIO_FEATURE_SHADER_EXECUTION_REORDER: return vio_d3d12.raytracing_tier >= 12 && vio_d3d12.shader_model == 6
+                                                          && vio_d3d12.shader_model_version >= 69;
         case VIO_FEATURE_SHADING_RATE:        return vio_d3d12.vrs_tier > 0; /* RSSetShadingRate, VRS Tier 1+ (GAP-PHASE5 12) */
         /* SV_ShadingRate (SM 6.4) + the OVERRIDE combiner (Tier 2). */
         case VIO_FEATURE_MESH_SHADER:  return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 65 && vio_d3d12.mesh_tier > 0;
