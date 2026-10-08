@@ -38,6 +38,7 @@ $exempt_dirs = [
     "$root/vendor",
     "$root/.deps",   // third-party sources built locally (SPIRV-Cross), not vio code
     "$root/deps",    // the Windows CI unpacks its SDKs (glslang headers, ...) into the checkout
+    "$root/VULKAN_SDK",   // humbletim/setup-vulkan-sdk installs the SDK into the Windows CI checkout
     "$root/src/platform",   // window systems: GL context creation (GLFW hints, WGL / CGL / GLX)
 ];
 $exempt_files = [
