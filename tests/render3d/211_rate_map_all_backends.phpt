@@ -44,7 +44,9 @@ function run_backend(string $name): string {
     $plain = vio_render_target_size($ref);
     if ($plain['rate_map'] || $plain['physical_width'] !== $S) $fail[] = "plain target " . json_encode($plain);
 
-    foreach ([$ref, $rm] as $rt) {
+    /* full quality everywhere: the rate-mapped path must reproduce the picture */
+    $full = vio_render_target($ctx, ['width' => $S, 'height' => $S, 'rate_map' => ['x' => [1.0, 1.0], 'y' => [1.0, 1.0]]]);
+    foreach ([$ref, $rm, $full] as $rt) {
         vio_begin($ctx);
         vio_bind_render_target($ctx, $rt);
         vio_viewport($ctx, 0, 0, $S, $S);
@@ -60,8 +62,11 @@ function run_backend(string $name): string {
     $corner = region_mae($a, $b, $S, 4, 4, $z - 4, $z - 4);          /* quality 1 x 1 */
     $centre = region_mae($a, $b, $S, $z + 4, $z + 4, 2 * $z - 4, 2 * $z - 4);   /* quality 0.25 x 0.25 */
     if (getenv('VIO_RATE_MAP_DEBUG')) fprintf(STDERR, "$name: feature %d corner %.2f centre %.2f size %s\n", $has, $corner, $centre, json_encode($sz));
+    $eFull = region_mae($a, vio_read_render_target($full), $S, 0, 0, $S, $S);
+    if ($eFull > 1.0) $fail[] = sprintf("a full-quality rate map differs from the plain target (%.2f, size %s)", $eFull, json_encode(vio_render_target_size($full)));
     if ($has) {
-        if ($corner > 12.0) $fail[] = sprintf("full-quality corner differs from the full-rate picture (%.2f)", $corner);
+        if ($corner > 12.0) $fail[] = sprintf("full-quality corner differs from the full-rate picture (%.2f; inner corner %.2f, size %s)",
+                                              $corner, region_mae($a, $b, $S, 8, 8, $z - 16, $z - 16), json_encode($sz));
         if ($centre <= $corner) $fail[] = sprintf("the low-quality centre is not coarser (centre %.2f, corner %.2f)", $centre, $corner);
     } elseif ($a !== $b) {
         $fail[] = sprintf("without the feature the picture differs (corner %.2f, centre %.2f)", $corner, $centre);

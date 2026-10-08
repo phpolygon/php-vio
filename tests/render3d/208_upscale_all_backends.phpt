@@ -112,15 +112,23 @@ function run_backend(string $name): string {
     if (getenv('VIO_UPSCALE_DEBUG')) fprintf(STDERR, "$name: temporal mae %.2f grad %.0f\n", $eTp, sharp($tp, $HI, $HI));
     if (!($eTp < $eSp0 * 0.5)) $fail[] = sprintf("temporal error %.2f not below spatial %.2f", $eTp, $eSp0);
     /* reset drops the history at once */
-    $frame(function () use ($ctx, $draw, $lo, $LO, $out) {
+    $okReset = null;
+    $frame(function () use ($ctx, $draw, $lo, $LO, $out, &$okReset) {
         $draw($lo, $LO, [0, 0], [0.4, 0.6, 0.2, 1]);
-        vio_upscale($ctx, $lo, $out, ['mode' => VIO_UPSCALE_TEMPORAL, 'reset' => true, 'sharpness' => 0.0]);
+        $okReset = vio_upscale($ctx, $lo, $out, ['mode' => VIO_UPSCALE_TEMPORAL, 'reset' => true, 'sharpness' => 0.0]);
     });
     $rs = vio_read_render_target($out);
     if (mae($rs, $flat) > 0.5) {
         $c = fn(string $p, int $w) => bin2hex(substr($p, ((intdiv($w, 2)) * $w + intdiv($w, 2)) * 4, 4));
-        $fail[] = sprintf("temporal reset kept history (mae %.2f to the flat picture; centre out %s, flat %s, source %s)",
-                          mae($rs, $flat), $c($rs, $HI), $c($flat, $HI), $c(vio_read_render_target($lo), $LO));
+        /* a second reset frame: is the picture one frame late, or never written? */
+        $frame(function () use ($ctx, $draw, $lo, $LO, $out) {
+            $draw($lo, $LO, [0, 0], [0.4, 0.6, 0.2, 1]);
+            vio_upscale($ctx, $lo, $out, ['mode' => VIO_UPSCALE_TEMPORAL, 'reset' => true, 'sharpness' => 0.0]);
+        });
+        $rs2 = vio_read_render_target($out);
+        $fail[] = sprintf("temporal reset kept history (returned %s; mae %.2f to the flat picture, %.2f after a second reset frame; centre out %s / %s, flat %s, source %s)",
+                          var_export($okReset, true), mae($rs, $flat), mae($rs2, $flat), $c($rs, $HI), $c($rs2, $HI), $c($flat, $HI),
+                          $c(vio_read_render_target($lo), $LO));
     }
 
     /* A panning camera (1.37 / 0.61 source pixels per frame, not in step with
@@ -131,7 +139,8 @@ function run_backend(string $name): string {
      * reach of spatial there, its gain is the still / slow picture above. */
     $motionRt = vio_render_target($ctx, ['width' => $LO, 'height' => $LO, 'hdr' => true]);
     $stepX = 1.37 / $LO * 2.0; $stepY = 0.61 / $LO * 2.0;   /* NDC per frame */
-    $pan = function (?bool $withMotion) use ($ctx, $draw, $lo, $LO, $HI, $out, $motionRt, $stepX, $stepY, $ref): float {
+    $panLate = [];
+    $pan = function (?bool $withMotion) use ($ctx, $draw, $lo, $LO, $HI, $out, $motionRt, $stepX, $stepY, $ref, &$panLate): float {
         for ($f = 0; $f < 24; $f++) {
             if ($withMotion === null && $f < 23) continue;   /* spatial at the final position */
             $j = vio_upscale_jitter($f, 8);
@@ -150,14 +159,19 @@ function run_backend(string $name): string {
             vio_unbind_render_target($ctx);
             vio_end($ctx);
         }
+        $o = vio_read_render_target($out);
         vio_begin($ctx); $draw($ref, $HI, [0, 0], [0, 0, 0, 0], $p); vio_unbind_render_target($ctx); vio_end($ctx);
-        return mae(vio_read_render_target($out), vio_read_render_target($ref));
+        $e = mae($o, vio_read_render_target($ref));
+        /* the error against the previous frame's position too (a late picture shows there) */
+        vio_begin($ctx); $draw($ref, $HI, [0, 0], [0, 0, 0, 0], [$p[0] - $stepX, $p[1] - $stepY]); vio_unbind_render_target($ctx); vio_end($ctx);
+        $panLate[] = sprintf('%.2f', mae($o, vio_read_render_target($ref)));
+        return $e;
     };
     $eMo = $pan(true);
     $eNo = $pan(false);
     $ePs = $pan(null);
     if (getenv('VIO_UPSCALE_DEBUG')) fprintf(STDERR, "$name: pan with motion %.2f, without %.2f, spatial %.2f\n", $eMo, $eNo, $ePs);
-    if (!($eMo < $ePs * 1.75)) $fail[] = sprintf("panning with motion vectors: error %.2f far above spatial %.2f", $eMo, $ePs);
+    if (!($eMo < $ePs * 1.75)) $fail[] = sprintf("panning with motion vectors: error %.2f far above spatial %.2f (against the previous frame's position: %s)", $eMo, $ePs, implode(' / ', $panLate));
     if (!($eMo < $eNo * 0.5)) $fail[] = sprintf("motion vectors did not help (%.2f vs %.2f without)", $eMo, $eNo);
 
     /* the swapchain as target: the same picture as a render target */
