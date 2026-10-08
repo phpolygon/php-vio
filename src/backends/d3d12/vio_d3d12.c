@@ -7066,6 +7066,8 @@ static void d3d12_present(void)
  * Size is taken from the source resource desc, so it always tracks the live
  * (resized) swapchain dimensions.
  */
+static void d3d12_reopen_frame_list(void);   /* defined with d3d12_compute_wait */
+
 unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
 {
     if (!vio_d3d12.initialized || !vio_d3d12.device) return NULL;
@@ -7156,18 +7158,12 @@ unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
 
         /* Re-open the frame command list so subsequent draws + vio_end work.
          * Safe to Reset the allocator: we just waited for the GPU to drain it.
-         * Re-arm render target binding + viewport/scissor exactly as
-         * d3d12_begin_frame did; the RT is already in RENDER_TARGET state (we
-         * transitioned it back above) so no entry barrier is needed here. */
-        ID3D12CommandAllocator_Reset(frame->cmd_allocator);
-        ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
-        if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1 || vio_d3d12.vrs_image_active) d3d12_apply_shading_rate();   /* VRS is list state */
-        ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1,
-            &vio_d3d12.current_rtv, FALSE, &vio_d3d12.current_dsv);
-        D3D12_VIEWPORT vp = {0, 0, (float)vio_d3d12.width, (float)vio_d3d12.height, 0.0f, 1.0f};
-        ID3D12GraphicsCommandList_RSSetViewports(vio_d3d12.cmd_list, 1, &vp);
-        D3D12_RECT sc = {0, 0, vio_d3d12.width, vio_d3d12.height};
-        ID3D12GraphicsCommandList_RSSetScissorRects(vio_d3d12.cmd_list, 1, &sc);
+         * The backbuffer is already back in RENDER_TARGET state (transitioned
+         * above), so no entry barrier is needed. The reset list carries no
+         * target, root signature, heaps or PSO any more: re-arm all of it, or
+         * the next re-arm of the bound pipeline (a target switch sets root
+         * arguments) runs without a root signature and the driver crashes. */
+        d3d12_reopen_frame_list();
     } else {
         /* Post-present: use a transient command list so we don't disturb the
          * frame's own list (which is closed/idle at this point). */
@@ -7680,17 +7676,25 @@ static void d3d12_compute_wait(void)
         vio_d3d12_wait_for_gpu();
         return;
     }
-    vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
     ID3D12GraphicsCommandList_Close(vio_d3d12.cmd_list);
     ID3D12CommandList *lists[] = { (ID3D12CommandList *)vio_d3d12.cmd_list };
     ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
     vio_d3d12_wait_for_gpu();
 
+    d3d12_reopen_frame_list();
+}
+
+/* Reopen the frame list after it was closed, executed and waited on mid-frame
+ * (d3d12_compute_wait, vio_d3d12_capture_frame): reset it on this slot's
+ * allocator and re-arm what the frame had on it - shading rate, the bound
+ * target (swapchain or RT), viewport, scissor, and the graphics heaps, root
+ * signature and PSO of the bound pipeline. */
+static void d3d12_reopen_frame_list(void)
+{
+    vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
     ID3D12CommandAllocator_Reset(frame->cmd_allocator);
     ID3D12GraphicsCommandList_Reset(vio_d3d12.cmd_list, frame->cmd_allocator, NULL);
     if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1 || vio_d3d12.vrs_image_active) d3d12_apply_shading_rate();   /* VRS is list state */
-    /* Re-arm the bound target (swapchain or RT), viewport, scissor and the
-     * graphics pipeline state exactly as the frame had them. */
     if (vio_d3d12.current_has_rtv) {
         int n = vio_d3d12.current_rtv_count > 0 ? vio_d3d12.current_rtv_count : 1;
         ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, (UINT)n,
