@@ -1160,176 +1160,9 @@ static void x11_set_window_monitor(vio_window_handle h, int monitor, int x, int 
     XSync(x11_dpy, False);
 }
 
-/* ── Gamepads: evdev ──────────────────────────────────────────────── */
+/* ── Gamepads: evdev (shared with Wayland) ───────────────────────── */
 
-#define X11_PADS 16
-#define X11_BITS(n) (((n) + 8 * sizeof(unsigned long) - 1) / (8 * sizeof(unsigned long)))
-
-typedef struct {
-    int           fd;
-    char          path[64];
-    char          name[128];
-    unsigned char buttons[15];
-    float         axes[6];
-    int           hat_x, hat_y;
-    struct input_absinfo abs[ABS_CNT];
-    int           has_abs[ABS_CNT];
-} x11_pad;
-
-static x11_pad x11_pads[X11_PADS];
-static double  x11_pad_scan_time = -10.0;
-
-static double x11_now(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
-static int x11_test_bit(const unsigned long *bits, int n)
-{
-    return (bits[n / (8 * sizeof(unsigned long))] >> (n % (8 * sizeof(unsigned long)))) & 1;
-}
-
-static void x11_pad_close(x11_pad *p)
-{
-    if (p->fd > 0) close(p->fd);
-    memset(p, 0, sizeof(*p));
-}
-
-/* Opens new gamepads at most once a second (vio_gamepads() asks every frame). */
-static void x11_pads_scan(void)
-{
-    double now = x11_now();
-    if (now - x11_pad_scan_time < 1.0) return;
-    x11_pad_scan_time = now;
-    DIR *dir = opendir("/dev/input");
-    if (!dir) return;
-    struct dirent *e;
-    while ((e = readdir(dir)) != NULL) {
-        if (strncmp(e->d_name, "event", 5) != 0) continue;
-        char path[64];
-        snprintf(path, sizeof(path), "/dev/input/%s", e->d_name);
-        int known = 0;
-        for (int i = 0; i < X11_PADS && !known; i++) known = x11_pads[i].fd > 0 && strcmp(x11_pads[i].path, path) == 0;
-        if (known) continue;
-        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0) continue;
-        unsigned long keys[X11_BITS(KEY_CNT)], abs[X11_BITS(ABS_CNT)];
-        memset(keys, 0, sizeof(keys));
-        memset(abs, 0, sizeof(abs));
-        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys);
-        ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs)), abs);
-        if (!x11_test_bit(keys, BTN_GAMEPAD) || !x11_test_bit(abs, ABS_X)) { close(fd); continue; }
-        int slot = -1;
-        for (int i = 0; i < X11_PADS && slot < 0; i++) if (x11_pads[i].fd <= 0) slot = i;
-        if (slot < 0) { close(fd); break; }
-        x11_pad *p = &x11_pads[slot];
-        memset(p, 0, sizeof(*p));
-        p->fd = fd;
-        snprintf(p->path, sizeof(p->path), "%s", path);
-        if (ioctl(fd, EVIOCGNAME(sizeof(p->name) - 1), p->name) < 0) snprintf(p->name, sizeof(p->name), "Gamepad");
-        for (int a = 0; a < ABS_CNT; a++) {
-            if (x11_test_bit(abs, a) && ioctl(fd, EVIOCGABS(a), &p->abs[a]) == 0) p->has_abs[a] = 1;
-        }
-        p->axes[4] = p->axes[5] = -1.0f;   /* released triggers */
-    }
-    closedir(dir);
-}
-
-static float x11_pad_norm(x11_pad *p, int code, int value)
-{
-    const struct input_absinfo *ai = &p->abs[code];
-    if (ai->maximum == ai->minimum) return 0.0f;
-    float v = 2.0f * (float)(value - ai->minimum) / (float)(ai->maximum - ai->minimum) - 1.0f;
-    return v < -1.0f ? -1.0f : v > 1.0f ? 1.0f : v;
-}
-
-/* Kernel gamepad layout (xpad convention: BTN_X is X, BTN_Y is Y) -> VIO_GAMEPAD_* order. */
-static void x11_pad_key(x11_pad *p, int code, int value)
-{
-    int b = -1;
-    switch (code) {
-        case BTN_A: b = 0; break;       case BTN_B: b = 1; break;
-        case BTN_X: b = 2; break;       case BTN_Y: b = 3; break;
-        case BTN_TL: b = 4; break;      case BTN_TR: b = 5; break;
-        case BTN_SELECT: b = 6; break;  case BTN_START: b = 7; break;
-        case BTN_MODE: b = 8; break;    case BTN_THUMBL: b = 9; break;
-        case BTN_THUMBR: b = 10; break;
-        case BTN_DPAD_UP: b = 11; break; case BTN_DPAD_RIGHT: b = 12; break;
-        case BTN_DPAD_DOWN: b = 13; break; case BTN_DPAD_LEFT: b = 14; break;
-    }
-    if (b >= 0) p->buttons[b] = value ? 1 : 0;
-}
-
-static void x11_pad_abs(x11_pad *p, int code, int value)
-{
-    switch (code) {
-        case ABS_X:  p->axes[0] = x11_pad_norm(p, code, value); break;
-        case ABS_Y:  p->axes[1] = x11_pad_norm(p, code, value); break;   /* down positive: up = -1 */
-        case ABS_RX: p->axes[2] = x11_pad_norm(p, code, value); break;
-        case ABS_RY: p->axes[3] = x11_pad_norm(p, code, value); break;
-        case ABS_Z: case ABS_BRAKE: p->axes[4] = x11_pad_norm(p, code, value); break;
-        case ABS_RZ: case ABS_GAS:  p->axes[5] = x11_pad_norm(p, code, value); break;
-        case ABS_HAT0X: p->hat_x = value; p->buttons[14] = value < 0; p->buttons[12] = value > 0; break;
-        case ABS_HAT0Y: p->hat_y = value; p->buttons[11] = value < 0; p->buttons[13] = value > 0; break;
-    }
-}
-
-/* Drain the pad's pending events; 0 when it is gone. */
-static int x11_pad_update(int id)
-{
-    if (id < 0 || id >= X11_PADS) return 0;
-    x11_pads_scan();
-    x11_pad *p = &x11_pads[id];
-    if (p->fd <= 0) return 0;
-    struct input_event ev[32];
-    for (;;) {
-        ssize_t n = read(p->fd, ev, sizeof(ev));
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EINTR) break;
-            x11_pad_close(p);   /* unplugged */
-            return 0;
-        }
-        if (n == 0) break;
-        for (size_t i = 0; i < (size_t)n / sizeof(ev[0]); i++) {
-            if (ev[i].type == EV_KEY) x11_pad_key(p, ev[i].code, ev[i].value);
-            else if (ev[i].type == EV_ABS) x11_pad_abs(p, ev[i].code, ev[i].value);
-        }
-    }
-    return 1;
-}
-
-static int x11_joystick_present(int id) { return x11_pad_update(id); }
-
-static const char *x11_pad_name(int id)
-{
-    return x11_pad_update(id) ? x11_pads[id].name : NULL;
-}
-
-static int x11_gamepad_state(int id, unsigned char buttons[15], float axes[6])
-{
-    if (!x11_pad_update(id)) return 0;
-    memcpy(buttons, x11_pads[id].buttons, 15);
-    memcpy(axes, x11_pads[id].axes, sizeof(float) * 6);
-    return 1;
-}
-
-static const unsigned char *x11_joystick_buttons(int id, int *count)
-{
-    *count = 0;
-    if (!x11_pad_update(id)) return NULL;
-    *count = 15;
-    return x11_pads[id].buttons;
-}
-
-static const float *x11_joystick_axes(int id, int *count)
-{
-    *count = 0;
-    if (!x11_pad_update(id)) return NULL;
-    *count = 6;
-    return x11_pads[id].axes;
-}
+#include "../linux/vio_evdev_gamepad.h"
 
 /* ── Native handles, Vulkan, input ────────────────────────────────── */
 
@@ -1402,13 +1235,13 @@ static const vio_platform vio_platform_x11 = {
     .primary_monitor      = x11_primary_monitor,
     .monitor_desc         = x11_monitor_desc,
     .video_modes          = x11_video_modes,
-    .joystick_present     = x11_joystick_present,
-    .joystick_is_gamepad  = x11_joystick_present,
-    .joystick_name        = x11_pad_name,
-    .gamepad_name         = x11_pad_name,
-    .gamepad_state        = x11_gamepad_state,
-    .joystick_buttons     = x11_joystick_buttons,
-    .joystick_axes        = x11_joystick_axes,
+    .joystick_present     = evdev_joystick_present,
+    .joystick_is_gamepad  = evdev_joystick_present,
+    .joystick_name        = evdev_pad_name,
+    .gamepad_name         = evdev_pad_name,
+    .gamepad_state        = evdev_gamepad_state,
+    .joystick_buttons     = evdev_joystick_buttons,
+    .joystick_axes        = evdev_joystick_axes,
     .native_handle        = x11_native_handle,
 #ifdef HAVE_VULKAN
     .vk_instance_extensions = x11_vk_instance_extensions,
