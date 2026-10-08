@@ -1503,6 +1503,13 @@ static void metal_open_encoder(int load_clear)
              * depth and 3D draws after the switch would fail the depth test. */
             desc.depthAttachment.storeAction = MTLStoreActionStore;
             desc.depthAttachment.clearDepth = 1.0;
+            if (rt_ms && current_bound_rt->depth_only && current_bound_rt->metal_depth_texture) {
+                /* depth_only MSAA (A24): resolve into the sampled depth at every pass end. */
+                desc.depthAttachment.resolveTexture = (__bridge id<MTLTexture>)current_bound_rt->metal_depth_texture;
+                desc.depthAttachment.depthResolveFilter = current_bound_rt->depth_reduction == VIO_DEPTH_REDUCE_MIN
+                    ? MTLMultisampleDepthResolveFilterMin : MTLMultisampleDepthResolveFilterMax;
+                desc.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+            }
         }
 
         vio_mtl.current_encoder = [vio_mtl.current_cmd_buf
@@ -2270,6 +2277,10 @@ static void metal_rt_initial_clear(vio_render_target_object *rt)
             d.depthAttachment.loadAction = MTLLoadActionClear;
             d.depthAttachment.storeAction = MTLStoreActionStore;
             d.depthAttachment.clearDepth = 1.0;
+            if (rt->depth_only && rt->metal_msaa_depth_texture && rt->metal_depth_texture) {
+                d.depthAttachment.resolveTexture = (__bridge id<MTLTexture>)rt->metal_depth_texture;
+                d.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+            }
             if (depth.pixelFormat == VIO_METAL_DEPTH_STENCIL) {
                 d.stencilAttachment.texture = depth;
                 d.stencilAttachment.loadAction = MTLLoadActionClear;
@@ -2342,7 +2353,9 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
          * pair and resolve into the plain textures every pass end
          * (StoreAndMultisampleResolve), so metal_color_texture stays the one
          * thing wrappers / the 2D registry / readback see. */
-        int samples = depth_only ? 1 : metal_clamp_sample_count(rt->samples);
+        /* depth_only targets multisample as plain 2D targets (A24): Metal resolves
+         * the depth itself (depthResolveFilter Max / Min) into the sampled texture. */
+        int samples = (depth_only && (rt->is_cube || rt->layers > 1 || rt->mip_levels > 1)) ? 1 : metal_clamp_sample_count(rt->samples);
         rt->samples = samples;
 
         int n_color = metal_rt_attachment_count(rt);
@@ -2507,6 +2520,16 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             rt->metal_msaa_color_texture = rt->metal_msaa_color_textures[0];
             rt->metal_msaa_depth_texture = (void *)CFBridgingRetain(depth_tex);
             rt->metal_depth_texture = NULL;  /* no single-sample depth to sample */
+            if (depth_only) {
+                /* The resolve target of the multisampled depth: what sampling and readback see. */
+                MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL
+                                                width:(NSUInteger)width height:(NSUInteger)height mipmapped:NO];
+                rd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                rd.storageMode = MTLStorageModePrivate;
+                id<MTLTexture> resolved = [vio_mtl.device newTextureWithDescriptor:rd];
+                if (!resolved) return -1;
+                rt->metal_depth_texture = (void *)CFBridgingRetain(resolved);
+            }
         } else {
             rt->metal_depth_texture = (void *)CFBridgingRetain(depth_tex);
         }
