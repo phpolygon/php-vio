@@ -524,6 +524,16 @@ function vio_rt_pipeline(VioContext $context, array $desc): VioRtPipeline|false 
 function vio_rt_bind_buffer(VioContext $context, VioRtPipeline $pipeline, VioBuffer $buffer, int $binding): void {}
 
 /**
+ * Bind a texture at $binding (1..15; 0 is the acceleration structure) for the
+ * following vio_trace_rays of $pipeline: the stages read it as layout(binding =
+ * $binding) uniform sampler2D with its own filter / wrap (textureLod - ray tracing
+ * stages have no derivatives). D3D12: Texture2D at t<$binding> with a linear /
+ * repeat SamplerState at s<$binding>. Rebinding replaces; up to 16 resources
+ * (buffers and textures) per pipeline; the pipeline keeps a reference.
+ */
+function vio_rt_bind_texture(VioContext $context, VioRtPipeline $pipeline, VioTexture $texture, int $binding): void {}
+
+/**
  * Launch $width * $height * $depth raygen invocations (gl_LaunchIDEXT /
  * DispatchRaysIndex) against the acceleration structure bound with
  * vio_bind_acceleration_structure(). Synchronous: the buffers are complete on

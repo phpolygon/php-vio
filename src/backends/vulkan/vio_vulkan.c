@@ -2610,8 +2610,9 @@ static int vk_rt_scan(const uint32_t *spv, size_t bytes, VkShaderStageFlags stag
     int32_t *set = malloc(sizeof(int32_t) * bound);
     uint32_t *ptr_type = calloc(bound, sizeof(uint32_t));
     unsigned char *is_as = calloc(bound, 1);
-    if (!binding || !set || !ptr_type || !is_as) {
-        free(binding); free(set); free(ptr_type); free(is_as);
+    unsigned char *is_img = calloc(bound, 1);   /* OpTypeSampledImage: a combined sampler (A13) */
+    if (!binding || !set || !ptr_type || !is_as || !is_img) {
+        free(binding); free(set); free(ptr_type); free(is_as); free(is_img);
         return -1;
     }
     for (uint32_t i = 0; i < bound; i++) { binding[i] = -1; set[i] = 0; }
@@ -2626,6 +2627,8 @@ static int vk_rt_scan(const uint32_t *spv, size_t bytes, VkShaderStageFlags stag
             ptr_type[spv[i + 1]] = spv[i + 3];
         } else if (op == 5341 && n >= 2 && spv[i + 1] < bound) {        /* OpTypeAccelerationStructureKHR */
             is_as[spv[i + 1]] = 1;
+        } else if (op == 27 && n >= 2 && spv[i + 1] < bound) {          /* OpTypeSampledImage */
+            is_img[spv[i + 1]] = 1;
         }
         i += n;
     }
@@ -2641,6 +2644,7 @@ static int vk_rt_scan(const uint32_t *spv, size_t bytes, VkShaderStageFlags stag
         uint32_t pointee = ptr_type[spv[i + 1]];
         if (cls == 12) type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         else if (cls == 0 && pointee < bound && is_as[pointee]) type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        else if (cls == 0 && pointee < bound && is_img[pointee]) type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         else { rc = -1; continue; }
         if (set[id] != 0) { rc = -1; continue; }
         int k;
@@ -2657,7 +2661,7 @@ static int vk_rt_scan(const uint32_t *spv, size_t bytes, VkShaderStageFlags stag
         }
         rt->bindings[k].stageFlags |= stage;
     }
-    free(binding); free(set); free(ptr_type); free(is_as);
+    free(binding); free(set); free(ptr_type); free(is_as); free(is_img);
     return rc;
 }
 
@@ -2686,8 +2690,8 @@ static int vk_rt_add_stage(vio_vk_rtp *rt, const uint32_t *spv, size_t size, VkS
                            VkShaderModule *mods, VkPipelineShaderStageCreateInfo *si, uint32_t *count)
 {
     if (vk_rt_scan(spv, size, stage, rt) != 0) {
-        php_error_docref(NULL, E_WARNING, "Vulkan: ray tracing %s stage: only acceleration structures and storage buffers "
-                         "in set 0 are supported (at most %d bindings)", label, VK_RT_MAX_BINDINGS);
+        php_error_docref(NULL, E_WARNING, "Vulkan: ray tracing %s stage: only acceleration structures, storage buffers "
+                         "and sampler2D in set 0 are supported (at most %d bindings)", label, VK_RT_MAX_BINDINGS);
         return -1;
     }
     VkShaderModuleCreateInfo mi = {0};
@@ -2777,13 +2781,16 @@ static void *vulkan_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
     pl.pSetLayouts = &rt->set_layout;
     if (vkCreatePipelineLayout(vio_vk.device, &pl, NULL, &rt->layout) != VK_SUCCESS) goto fail;
     if (rt->binding_count > 0) {
-        VkDescriptorPoolSize ps[2];
-        uint32_t psn = 0, n_sb = 0, n_as = 0;
+        VkDescriptorPoolSize ps[3];
+        uint32_t psn = 0, n_sb = 0, n_as = 0, n_img = 0;
         for (int k = 0; k < rt->binding_count; k++) {
-            if (rt->bindings[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) n_sb++; else n_as++;
+            if (rt->bindings[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) n_sb++;
+            else if (rt->bindings[k].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) n_img++;
+            else n_as++;
         }
         if (n_sb) { ps[psn].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; ps[psn].descriptorCount = n_sb; psn++; }
         if (n_as) { ps[psn].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; ps[psn].descriptorCount = n_as; psn++; }
+        if (n_img) { ps[psn].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[psn].descriptorCount = n_img; psn++; }
         VkDescriptorPoolCreateInfo pi = {0};
         pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pi.maxSets = 1;
@@ -2894,6 +2901,7 @@ static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, in
     VkWriteDescriptorSet wr[VK_RT_MAX_BINDINGS];
     VkDescriptorBufferInfo bi[VK_RT_MAX_BINDINGS];
     VkWriteDescriptorSetAccelerationStructureKHR ai[VK_RT_MAX_BINDINGS];
+    VkDescriptorImageInfo ii[VK_RT_MAX_BINDINGS];
     VkAccelerationStructureKHR tlas = (VkAccelerationStructureKHR)(uintptr_t)vio_vk.bound_accel;
     memset(wr, 0, sizeof(wr));
     for (int k = 0; k < rt->binding_count; k++) {
@@ -2912,10 +2920,25 @@ static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, in
             ai[k].accelerationStructureCount = 1;
             ai[k].pAccelerationStructures = &tlas;
             wr[k].pNext = &ai[k];
+        } else if (rt->bindings[k].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+            vio_vulkan_texture *tex = NULL;
+            for (int i = 0; i < count; i++)
+                if (buffers[i].kind == VIO_RT_BIND_TEXTURE && (uint32_t)buffers[i].binding == rt->bindings[k].binding)
+                    tex = (vio_vulkan_texture *)buffers[i].backend_buffer;
+            if (!tex || !tex->view || !tex->sampler) {
+                php_error_docref(NULL, E_WARNING, "vio_trace_rays: no texture bound at binding %u (vio_rt_bind_texture)",
+                                 rt->bindings[k].binding);
+                return -1;
+            }
+            ii[k].sampler = tex->sampler;
+            ii[k].imageView = tex->view;
+            ii[k].imageLayout = tex->layout ? (VkImageLayout)tex->layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            wr[k].pImageInfo = &ii[k];
         } else {
             vio_vulkan_compute_buffer *buf = NULL;
             for (int i = 0; i < count; i++)
-                if ((uint32_t)buffers[i].binding == rt->bindings[k].binding) buf = (vio_vulkan_compute_buffer *)buffers[i].backend_buffer;
+                if (buffers[i].kind == VIO_RT_BIND_BUFFER && (uint32_t)buffers[i].binding == rt->bindings[k].binding)
+                    buf = (vio_vulkan_compute_buffer *)buffers[i].backend_buffer;
             if (!buf || !buf->buffer) {
                 php_error_docref(NULL, E_WARNING, "vio_trace_rays: no buffer bound at binding %u (vio_rt_bind_buffer)",
                                  rt->bindings[k].binding);

@@ -9769,6 +9769,26 @@ ZEND_FUNCTION(vio_rt_pipeline)
     p->valid = 1;
 }
 
+/* One resource per binding, replaced on rebind; the pipeline keeps a reference. */
+static void vio_rt_bind_resource(vio_rt_pipeline_object *p, zend_object *obj, int binding, int kind, const char *fn)
+{
+    int slot = -1;
+    for (int i = 0; i < p->buffer_count; i++) if (p->bindings[i] == binding) { slot = i; break; }
+    if (slot < 0) {
+        if (p->buffer_count >= VIO_RT_MAX_BUFFERS) {
+            php_error_docref(NULL, E_WARNING, "%s: at most %d resources per pipeline", fn, VIO_RT_MAX_BUFFERS);
+            return;
+        }
+        slot = p->buffer_count++;
+    } else {
+        OBJ_RELEASE(p->buffers[slot]);
+    }
+    GC_ADDREF(obj);
+    p->buffers[slot] = obj;
+    p->bindings[slot] = binding;
+    p->kinds[slot] = kind;
+}
+
 /* vio_rt_bind_buffer($ctx, $pipeline, $storage_buffer, $binding): one buffer
  * per binding, replaced on rebind; the pipeline keeps a reference. */
 ZEND_FUNCTION(vio_rt_bind_buffer)
@@ -9796,20 +9816,37 @@ ZEND_FUNCTION(vio_rt_bind_buffer)
         php_error_docref(NULL, E_WARNING, "vio_rt_bind_buffer: needs a storage buffer (vio_storage_buffer)");
         return;
     }
-    int slot = -1;
-    for (int i = 0; i < p->buffer_count; i++) if (p->bindings[i] == (int)binding) { slot = i; break; }
-    if (slot < 0) {
-        if (p->buffer_count >= VIO_RT_MAX_BUFFERS) {
-            php_error_docref(NULL, E_WARNING, "vio_rt_bind_buffer: at most %d buffers per pipeline", VIO_RT_MAX_BUFFERS);
-            return;
-        }
-        slot = p->buffer_count++;
-    } else {
-        OBJ_RELEASE(p->buffers[slot]);
+    vio_rt_bind_resource(p, Z_OBJ_P(buf_zval), (int)binding, VIO_RT_BIND_BUFFER, "vio_rt_bind_buffer");
+}
+
+/* vio_rt_bind_texture($ctx, $pipeline, $texture, $binding) (A13): a sampled
+ * texture for the stages' sampler2D at $binding (D3D12: t / s<binding>). */
+ZEND_FUNCTION(vio_rt_bind_texture)
+{
+    zval *ctx_zval, *p_zval, *tex_zval;
+    zend_long binding;
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(p_zval, vio_rt_pipeline_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+        Z_PARAM_LONG(binding)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_rt_pipeline_object *p = Z_VIO_RT_PIPELINE_P(p_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (binding < 1 || binding > 15) {
+        zend_argument_value_error(4, "must be 1..15 (binding 0 is the acceleration structure)");
+        RETURN_THROWS();
     }
-    GC_ADDREF(Z_OBJ_P(buf_zval));
-    p->buffers[slot] = Z_OBJ_P(buf_zval);
-    p->bindings[slot] = (int)binding;
+    if (!ctx->initialized || !p->valid || p->backend != ctx->backend) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_bind_texture: the pipeline was not built on this context's backend");
+        return;
+    }
+    if (!tex->backend_texture) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_bind_texture: the texture has no backend image on this context");
+        return;
+    }
+    vio_rt_bind_resource(p, Z_OBJ_P(tex_zval), (int)binding, VIO_RT_BIND_TEXTURE, "vio_rt_bind_texture");
 }
 
 /* vio_trace_rays($ctx, $pipeline, $w, $h, $d = 1): synchronous launch against
@@ -9842,9 +9879,10 @@ ZEND_FUNCTION(vio_trace_rays)
     }
     vio_rt_buffer_binding b[VIO_RT_MAX_BUFFERS];
     for (int i = 0; i < p->buffer_count; i++) {
-        vio_buffer_object *buf = vio_buffer_from_obj(p->buffers[i]);
-        b[i].backend_buffer = buf->backend_buffer;
         b[i].binding = p->bindings[i];
+        b[i].kind = p->kinds[i];
+        if (p->kinds[i] == VIO_RT_BIND_TEXTURE) b[i].backend_buffer = vio_texture_from_obj(p->buffers[i])->backend_texture;
+        else b[i].backend_buffer = vio_buffer_from_obj(p->buffers[i])->backend_buffer;
     }
     if (ctx->backend->trace_rays(p->backend_pipeline, b, p->buffer_count, (int)w, (int)h, (int)d) != 0) {
         php_error_docref(NULL, E_WARNING, "vio_trace_rays: the backend could not trace");

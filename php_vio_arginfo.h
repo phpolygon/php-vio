@@ -321,6 +321,13 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_rt_bind_buffer, 0, 4, IS_VOI
 	ZEND_ARG_TYPE_INFO(0, binding, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_rt_bind_texture, 0, 4, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, pipeline, VioRtPipeline, 0)
+	ZEND_ARG_OBJ_INFO(0, texture, VioTexture, 0)
+	ZEND_ARG_TYPE_INFO(0, binding, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_trace_rays, 0, 4, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_OBJ_INFO(0, pipeline, VioRtPipeline, 0)
@@ -1056,6 +1063,7 @@ ZEND_FUNCTION(vio_draw_mesh_tasks);
 ZEND_FUNCTION(vio_draw_mesh_tasks_indirect);
 ZEND_FUNCTION(vio_rt_pipeline);
 ZEND_FUNCTION(vio_rt_bind_buffer);
+ZEND_FUNCTION(vio_rt_bind_texture);
 ZEND_FUNCTION(vio_trace_rays);
 ZEND_FUNCTION(vio_work_graph);
 ZEND_FUNCTION(vio_work_graph_bind_buffer);
@@ -1248,6 +1256,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_draw_mesh_tasks_indirect, arginfo_vio_draw_mesh_tasks_indirect)
 	ZEND_FE(vio_rt_pipeline, arginfo_vio_rt_pipeline)
 	ZEND_FE(vio_rt_bind_buffer, arginfo_vio_rt_bind_buffer)
+	ZEND_FE(vio_rt_bind_texture, arginfo_vio_rt_bind_texture)
 	ZEND_FE(vio_trace_rays, arginfo_vio_trace_rays)
 	ZEND_FE(vio_work_graph, arginfo_vio_work_graph)
 	ZEND_FE(vio_work_graph_bind_buffer, arginfo_vio_work_graph_bind_buffer)

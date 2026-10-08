@@ -696,11 +696,14 @@ typedef struct _vio_rt_pipeline_desc {
 
 /* A storage buffer bound for vio_trace_rays (vio_rt_bind_buffer). */
 typedef struct _vio_rt_buffer_binding {
-    void *backend_buffer;          /* create_storage_buffer handle */
-    int   binding;                 /* GLSL binding / HLSL u register */
+    void *backend_buffer;          /* create_storage_buffer handle, or the backend texture (kind 1) */
+    int   binding;                 /* GLSL binding / HLSL u register (t + s register for a texture) */
+    int   kind;                    /* VIO_RT_BIND_BUFFER / VIO_RT_BIND_TEXTURE (A13) */
 } vio_rt_buffer_binding;
 
-#define VIO_RT_MAX_BUFFERS 8
+#define VIO_RT_BIND_BUFFER  0
+#define VIO_RT_BIND_TEXTURE 1
+#define VIO_RT_MAX_BUFFERS 16       /* bound resources per pipeline, buffers and textures */
 
 /* ── Descriptor structs ───────────────────────────────────────────── */
 
