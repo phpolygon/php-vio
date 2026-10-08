@@ -3923,6 +3923,30 @@ static void metal_bind_as_for_draw(id<MTLRenderCommandEncoder> enc, vio_metal_sh
     if (used) metal_use_as(enc, nil, metal_bound_as);
 }
 
+/* Fragment storage buffers (A15): bound per draw at the fragment stage's
+ * pinned [[buffer(n)]] of the SSBO with that GLSL binding. */
+static vio_metal_compute_buffer *metal_fs_storage[VIO_MAX_FRAGMENT_STORAGE];
+static int metal_fs_storage_used;
+
+static int metal_bind_fragment_storage(void *backend_buffer, int binding)
+{
+    if (binding < 0 || binding >= VIO_MAX_FRAGMENT_STORAGE) return -1;
+    metal_fs_storage[binding] = (vio_metal_compute_buffer *)backend_buffer;
+    return 0;
+}
+
+static void metal_bind_fs_storage(id<MTLRenderCommandEncoder> enc, vio_metal_shader *sh)
+{
+    for (int i = 0; i < sh->fs.buffer_count; i++) {
+        const vio_metal_res_buffer *rb = &sh->fs.buffers[i];
+        if (rb->kind != 1 || rb->binding < 0 || rb->binding >= VIO_MAX_FRAGMENT_STORAGE) continue;
+        vio_metal_compute_buffer *b = metal_fs_storage[rb->binding];
+        if (!b || !b->buffer) continue;
+        [enc setFragmentBuffer:(__bridge id<MTLBuffer>)b->buffer offset:0 atIndex:(NSUInteger)rb->msl_index];
+        metal_fs_storage_used = 1;
+    }
+}
+
 static int metal_prepare_draw(int stride)
 {
     vio_metal_pipeline *p = metal_current_pipeline;
@@ -4000,6 +4024,7 @@ static int metal_prepare_draw(int stride)
         [enc setVertexBuffer:metal_identity_instance offset:0 atIndex:VIO_METAL_VB_INSTANCE];
     }
     metal_bind_as_for_draw(enc, sh);
+    metal_bind_fs_storage(enc, sh);
     metal_bindless_bind(enc, sh->vs.uses_bindless, sh->fs.uses_bindless);
     if (sh->view_count > 1) {
         /* SPIRV-Cross's multiview view mask: {base view, view count}. */
@@ -6272,6 +6297,16 @@ static size_t metal_read_buffer(void *backend_buffer, void *out, size_t size)
 {
     vio_metal_compute_buffer *buf = (vio_metal_compute_buffer *)backend_buffer;
     if (!buf || !buf->buffer || !out || size == 0) return 0;
+    if (metal_fs_storage_used) {
+        /* Draws may have written it (A15): the frame so far, or every committed one. */
+        metal_fs_storage_used = 0;
+        if (vio_mtl.current_cmd_buf) metal_flush_for_readback();
+        else @autoreleasepool {
+            id<MTLCommandBuffer> cb = [vio_mtl.command_queue commandBuffer];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+    }
     metal_compute_wait();   /* async dispatches must have landed before the memcpy */
 
     size_t n = size < buf->size ? size : buf->size;
@@ -6460,6 +6495,7 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_COMPUTE:
     case VIO_FEATURE_3D_PIPELINE:
     case VIO_FEATURE_VERTEX_STORAGE:
+    case VIO_FEATURE_FRAGMENT_STORAGE:
     case VIO_FEATURE_STORAGE_IMAGE:
 #ifdef HAVE_SPIRV_CROSS
         /* Every shader stage reaches the GPU through GLSL -> SPIR-V -> MSL, so
@@ -6745,6 +6781,7 @@ static const vio_backend metal_backend = {
     /* Path B: vertex-stage SSBO bound at its pinned MSL index, drawn with
      * instance_count instances and no per-instance vertex buffer. */
     .bind_storage_buffer         = metal_bind_storage_buffer,
+    .bind_fragment_storage       = metal_bind_fragment_storage,
     .draw_instanced_from_storage = metal_draw_instanced_from_storage,
     .draw_indirect     = metal_draw_indirect,
     .draw_mesh_tasks          = metal_draw_mesh_tasks,

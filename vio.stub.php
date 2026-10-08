@@ -1083,6 +1083,17 @@ function vio_storage_buffer_read(VioContext $context, VioBuffer $buffer): string
  * vio_draw_instanced_from_buffer. $access is VIO_COMPUTE_READ (read-only).
  * No-op (E_NOTICE) when the backend lacks VIO_FEATURE_VERTEX_STORAGE.
  */
+/**
+ * Writable storage buffer for the fragment stage (VIO_FEATURE_FRAGMENT_STORAGE,
+ * OPEN-ITEMS-PLAN A15): $buffer (vio_storage_buffer) at the fragment shader's
+ * layout(std430, binding = $binding) buffer block (0..3; writes and atomics), for
+ * every following draw until changed; null unbinds. vio_storage_buffer_read waits
+ * for the draws that wrote it (mid-frame: the frame so far). D3D: the block is a
+ * RWByteAddressBuffer at u($binding + 4). The context keeps a reference. False +
+ * warning without the feature.
+ */
+function vio_bind_fragment_storage_buffer(VioContext $context, ?VioBuffer $buffer, int $binding): bool {}
+
 function vio_bind_storage_buffer(VioContext $context, VioBuffer $buffer, int $binding, int $access): void {}
 
 /**

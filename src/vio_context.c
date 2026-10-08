@@ -52,10 +52,23 @@ void vio_context_bindless_clear(vio_context_object *ctx)
     ctx->bindless_free_count = 0;
 }
 
+/* Unbind and release the fragment-stage storage buffers (A15): the backend
+ * keeps raw pointers to them, which must not outlive the context. */
+void vio_context_release_fragment_storage(vio_context_object *ctx)
+{
+    for (int i = 0; i < 4; i++) {
+        if (!ctx->frag_storage[i]) continue;
+        if (ctx->initialized && ctx->backend && ctx->backend->bind_fragment_storage)
+            ctx->backend->bind_fragment_storage(NULL, i);
+        OBJ_RELEASE(ctx->frag_storage[i]);
+        ctx->frag_storage[i] = NULL;
+    }
+}
+
 static void vio_context_free_object(zend_object *obj)
 {
     vio_context_object *ctx = vio_context_from_obj(obj);
-
+    vio_context_release_fragment_storage(ctx);
     /* The table's textures free their GPU objects through the backend: before it shuts down. */
     vio_context_bindless_clear(ctx);
     if (ctx->candidates) {

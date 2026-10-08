@@ -500,8 +500,16 @@ typedef struct _vio_backend {
      * same instance count and geometries, only transforms change - update the top
      * level in place; 0: rebuild it. Outside a frame; synchronous. 0 = done. */
     int (*update_acceleration_structure)(void *as, const vio_as_instance *instances, int count, int refit);
+
+    /* vio_bind_fragment_storage_buffer (VIO_FEATURE_FRAGMENT_STORAGE, A15): the
+     * storage buffer (create_buffer handle, NULL unbinds) for the fragment stage's
+     * writable std430 block at `binding` (0..VIO_MAX_FRAGMENT_STORAGE-1), for
+     * every following draw until changed. read_buffer of a buffer a draw wrote
+     * waits for those draws (mid-frame: the frame so far). 0 = done. */
+    int (*bind_fragment_storage)(void *backend_buffer, int binding);
 } vio_backend;
 
+#define VIO_MAX_FRAGMENT_STORAGE 4
 /*
  * Backend extensions call this in their MINIT to register themselves.
  * Returns 0 on success, -1 on failure (e.g., registry full, version mismatch).

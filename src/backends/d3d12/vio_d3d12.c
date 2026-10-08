@@ -760,6 +760,15 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     memcpy(all_samplers, static_samplers, sizeof(static_samplers));
     d3d12_bindless_static_samplers(&all_samplers[4]);
 
+    /* [16..19] Fragment storage buffers (A15): root UAVs u4..u7 for the pixel
+     * stage (vio_shader_reflect.c moves fragment SSBO binding b to u(b + 4)). */
+    for (int i = 0; i < VIO_MAX_FRAGMENT_STORAGE; i++) {
+        params[VIO_D3D12_RP_PS_UAV + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[VIO_D3D12_RP_PS_UAV + i].Descriptor.ShaderRegister = (UINT)(4 + i);
+        params[VIO_D3D12_RP_PS_UAV + i].Descriptor.RegisterSpace = 0;
+        params[VIO_D3D12_RP_PS_UAV + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+
     /* [15] Draw parameters (OPEN-ITEMS-PLAN A11): gl_BaseVertex / gl_BaseInstance as
      * two root constants at b13 for vertex stages below SM 6.8, set per draw
      * (0 for direct draws, from the copied records for indirect ones). */
@@ -2442,8 +2451,35 @@ static void d3d12_bind_acceleration_structure(void *ptr, int binding)
 
 /* Graphics draws: the bound top level at root SRV [14] (root arguments reset
  * with every SetGraphicsRootSignature, so every draw re-arms it). */
+/* Fragment storage buffers (A15): root UAVs [16..19], re-armed on every draw
+ * like the acceleration structure; the buffers are marked for readback. */
+static vio_d3d12_buffer *d3d12_fs_storage[VIO_MAX_FRAGMENT_STORAGE];
+
+static int d3d12_bind_fragment_storage(void *backend_buffer, int binding)
+{
+    if (binding < 0 || binding >= VIO_MAX_FRAGMENT_STORAGE) return -1;
+    vio_d3d12_buffer *buf = (vio_d3d12_buffer *)backend_buffer;
+    if (buf && !buf->resource) return -1;
+    d3d12_fs_storage[binding] = buf;
+    return 0;
+}
+
+static void d3d12_apply_fs_storage(void)
+{
+    if (!vio_d3d12.cmd_list) return;
+    for (int i = 0; i < VIO_MAX_FRAGMENT_STORAGE; i++) {
+        vio_d3d12_buffer *buf = d3d12_fs_storage[i];
+        if (!buf || !buf->resource) continue;
+        ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(vio_d3d12.cmd_list, (UINT)(VIO_D3D12_RP_PS_UAV + i),
+                                                                    ID3D12Resource_GetGPUVirtualAddress(buf->resource));
+        buf->fs_dirty = 1;
+        buf->uav_live_serial = vio_d3d12.frame_serial;   /* UNORDERED_ACCESS on this frame's list */
+    }
+}
+
 static void d3d12_apply_accel(void)
 {
+    d3d12_apply_fs_storage();
     if (!d3d12_bound_as || !d3d12_bound_as->tlas || !vio_d3d12.cmd_list) return;
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(vio_d3d12.cmd_list, VIO_D3D12_RP_ACCEL,
         ID3D12Resource_GetGPUVirtualAddress(d3d12_bound_as->tlas));
@@ -7787,6 +7823,40 @@ static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
 {
     vio_d3d12_buffer *buf = (vio_d3d12_buffer *)backend_buffer;
     if (!buf || !out || size == 0) return 0;
+    if (buf->fs_dirty && buf->resource) {
+        /* Written by draws (A15): copy it out now - on the frame list mid-frame
+         * (the wait below submits it), else on its own list after the frames. */
+        buf->fs_dirty = 0;
+        if (vio_d3d12.in_frame && vio_d3d12.cmd_list) {
+            d3d12_buffer_to_readback(vio_d3d12.cmd_list, buf);
+            vio_d3d12.compute_async_pending++;
+        } else {
+            vio_d3d12_wait_for_gpu();
+            ID3D12CommandAllocator *alloc = NULL;
+            ID3D12GraphicsCommandList *list = NULL;
+            if (SUCCEEDED(ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                               &IID_ID3D12CommandAllocator, (void **)&alloc))
+                && SUCCEEDED(ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                                            &IID_ID3D12GraphicsCommandList, (void **)&list))) {
+                /* The buffer decayed to COMMON: promote it to UNORDERED_ACCESS
+                 * with a no-op UAV barrier path - d3d12_buffer_to_readback expects that. */
+                D3D12_RESOURCE_BARRIER tb = {0};
+                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb.Transition.pResource = buf->resource;
+                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &tb);
+                d3d12_buffer_to_readback(list, buf);
+                ID3D12GraphicsCommandList_Close(list);
+                ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+                ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+                vio_d3d12_wait_for_gpu();
+            }
+            if (list) ID3D12GraphicsCommandList_Release(list);
+            if (alloc) ID3D12CommandAllocator_Release(alloc);
+        }
+    }
     d3d12_compute_wait();   /* async dispatches (and their staging copies) must have executed */
     if (!buf->readback_resource) {
         php_error_docref(NULL, E_WARNING,
@@ -8704,6 +8774,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* vio_2d_d3d12_* */
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* TEXTURE3D resource + SRV */
         case VIO_FEATURE_VERTEX_STORAGE: return 1; /* VS-visible root SRV in the shared root signature */
+        case VIO_FEATURE_FRAGMENT_STORAGE: return 1; /* pixel root UAVs u4..u7 */
         case VIO_FEATURE_STORAGE_IMAGE:  return 1; /* texture UAV in the compute UAV table */
         case VIO_FEATURE_MRT:            return 1; /* per-RT RTV heap with up to 4 descriptors, PSO 'attachments' */
         default:                       return 0;
@@ -9482,6 +9553,7 @@ static const vio_backend d3d12_backend = {
     .enumerate_adapters      = d3d12_enumerate_adapters,
     .create_acceleration_structure  = d3d12_create_acceleration_structure,
     .update_acceleration_structure  = d3d12_update_acceleration_structure,
+    .bind_fragment_storage          = d3d12_bind_fragment_storage,
     .destroy_acceleration_structure = d3d12_destroy_acceleration_structure,
     .bind_acceleration_structure    = d3d12_bind_acceleration_structure,
     .sampler_feedback_bind          = d3d12_sampler_feedback_bind,

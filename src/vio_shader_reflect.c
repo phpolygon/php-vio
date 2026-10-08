@@ -1019,6 +1019,10 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
     if (vio_hlsl_16bit_types && shader_model >= 62)
         spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_ENABLE_16BIT_TYPES, SPVC_TRUE);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT, SPVC_TRUE);
+    /* Fragment storage buffers (A15) are always UAVs, also the readonly ones:
+     * they live at u(binding + 4) next to the render targets (see below). */
+    if (spvc_compiler_get_execution_model(compiler) == SpvExecutionModelFragment)
+        spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_FORCE_STORAGE_BUFFER_AS_UAV, SPVC_TRUE);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_COORD_COMPAT, SPVC_TRUE);
     /* Map OpenGL clip space z [-1,1] to D3D11 clip space z [0,1]:
      * Emits gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5.
@@ -1110,25 +1114,22 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
 
         /* Mesh / task stages also see the texture table (OPEN-ITEMS-PLAN A30): their
          * storage buffers move to register space 2, where the D3D12 mesh root
-         * signature puts its root SRV, so t0 of the table stays the texture's. */
+         * signature puts its root SRV, so t0 of the table stays the texture's.
+         * Fragment storage buffers (A15) move to u(binding + 4): D3D11 shares the
+         * output-merger slots between render targets (up to 4) and UAVs, D3D12
+         * has its pixel root UAVs there. */
         {
             SpvExecutionModel em = spvc_compiler_get_execution_model(compiler);
-            if (em == SpvExecutionModelMeshEXT || em == SpvExecutionModelTaskEXT) {
+            if (em == SpvExecutionModelFragment) {
                 const spvc_reflected_resource *ssbos;
                 size_t ssbo_count;
                 spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STORAGE_BUFFER, &ssbos, &ssbo_count);
                 for (size_t i = 0; i < ssbo_count; i++) {
-                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationDescriptorSet, 2);
-                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, (unsigned int)i);
+                    unsigned b = spvc_compiler_get_decoration(compiler, ssbos[i].id, SpvDecorationBinding);
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationDescriptorSet, 0);
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, b + 4);
                 }
             }
-        }
-
-        /* Mesh / task stages also see the texture table (OPEN-ITEMS-PLAN A30): their
-         * storage buffers move to register space 2, where the D3D12 mesh root
-         * signature puts its root SRV, so t0 of the table stays the texture's. */
-        {
-            SpvExecutionModel em = spvc_compiler_get_execution_model(compiler);
             if (em == SpvExecutionModelMeshEXT || em == SpvExecutionModelTaskEXT) {
                 const spvc_reflected_resource *ssbos;
                 size_t ssbo_count;

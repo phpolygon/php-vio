@@ -1045,6 +1045,8 @@ static size_t opengl_read_buffer(void *backend_buffer, void *out, size_t size)
     if (!buf || !buf->ssbo || !out || size == 0 || !vio_gl.initialized) return 0;
 
     size_t n = size < buf->size ? size : buf->size;
+    /* Draws that wrote it through a fragment storage block (A15). */
+    if (glMemoryBarrier) glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf->ssbo);
     /* glGetBufferSubData blocks until prior GPU writes (made visible by the
      * dispatch's glMemoryBarrier) complete, then copies into out. */
@@ -2364,10 +2366,35 @@ static void gl_clip_end(void)
     gl_clip_active = 0;
 }
 
+/* Fragment storage buffers (A15): SSBO binding points, re-bound before every
+ * draw (compute dispatches use the same binding points). */
+static GLuint gl_fs_storage[VIO_MAX_FRAGMENT_STORAGE];
+static unsigned int gl_fs_storage_gen;
+static int gl_fs_storage_used;
+
+static int opengl_bind_fragment_storage(void *backend_buffer, int binding)
+{
+    if (binding < 0 || binding >= VIO_MAX_FRAGMENT_STORAGE) return -1;
+    vio_opengl_compute_buffer *buf = (vio_opengl_compute_buffer *)backend_buffer;
+    if (gl_fs_storage_gen != gl_context_generation) { memset(gl_fs_storage, 0, sizeof(gl_fs_storage)); gl_fs_storage_gen = gl_context_generation; }
+    gl_fs_storage[binding] = buf ? buf->ssbo : 0;
+    return 0;
+}
+
+static void gl_fs_storage_apply(void)
+{
+    if (gl_fs_storage_gen != gl_context_generation) return;
+    for (int i = 0; i < VIO_MAX_FRAGMENT_STORAGE; i++) {
+        if (!gl_fs_storage[i]) continue;
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)i, gl_fs_storage[i]);
+        gl_fs_storage_used = 1;
+    }
+}
+
 static unsigned gl_shadow_begin(void)
 {
-    GLint program = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    gl_fs_storage_apply();
+    GLint program = 0;    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
     gl_clip_begin(program);
     if (!glBindSampler || !glGenSamplers) return 0;
     if (program <= 0) return 0;
@@ -3269,6 +3296,7 @@ static int opengl_supports_feature(vio_feature feature)
          * has_compute_shader tracks exactly that tier. GL < 4.3 -> 0, callers
          * stay on the readback path. */
         case VIO_FEATURE_VERTEX_STORAGE: return vio_gl.caps.has_compute_shader;
+        case VIO_FEATURE_FRAGMENT_STORAGE: return vio_gl.caps.has_compute_shader;   /* GL 4.3: >= 8 fragment SSBOs */
         case VIO_FEATURE_STORAGE_IMAGE:  return vio_gl.caps.has_compute_shader; /* image load/store is 4.2, compute 4.3 */
         case VIO_FEATURE_MRT:            return 1;  /* glDrawBuffers, core since 3.0 */
         default:                         return 0;
@@ -3309,6 +3337,7 @@ static const vio_backend opengl_backend = {
     .compute_set_uniforms     = opengl_compute_set_uniforms,
     .read_buffer              = opengl_read_buffer,
     .bind_storage_buffer          = opengl_bind_storage_buffer,
+    .bind_fragment_storage        = opengl_bind_fragment_storage,
     .draw_instanced_from_storage  = opengl_draw_instanced_from_storage,
     .supports_feature  = opengl_supports_feature,
     .feature_emulation = opengl_feature_emulation,

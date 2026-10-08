@@ -952,6 +952,7 @@ ZEND_FUNCTION(vio_destroy)
     /* Release the draw-time bind table before the GPU objects behind it go away. */
     vio_pending_textures_clear(ctx);
     vio_context_bindless_clear(ctx);
+    vio_context_release_fragment_storage(ctx);
 
     /* A replay holds process-global virtual gamepads and hides the physical
      * ones; a destroyed context must give them back even while PHP still holds
@@ -5711,6 +5712,45 @@ static int vio_vertex_storage_supported(vio_context_object *ctx)
     if (!ctx || !ctx->initialized || !ctx->backend) return 0;
     if (!ctx->backend->supports_feature) return 0;
     return ctx->backend->supports_feature(VIO_FEATURE_VERTEX_STORAGE) ? 1 : 0;
+}
+
+/* vio_bind_fragment_storage_buffer($ctx, ?$buffer, $binding) (OPEN-ITEMS-PLAN A15):
+ * a writable std430 buffer for the fragment stage at $binding (0..3), for every
+ * following draw until changed; null unbinds. The context keeps a reference. */
+ZEND_FUNCTION(vio_bind_fragment_storage_buffer)
+{
+    zval *ctx_zval, *buf_zval = NULL;
+    zend_long binding;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS_OR_NULL(buf_zval, vio_buffer_ce)
+        Z_PARAM_LONG(binding)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (binding < 0 || binding >= VIO_MAX_FRAGMENT_STORAGE) {
+        zend_argument_value_error(3, "must be 0..%d", VIO_MAX_FRAGMENT_STORAGE - 1);
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !ctx->backend || !ctx->backend->supports_feature
+        || !ctx->backend->supports_feature(VIO_FEATURE_FRAGMENT_STORAGE) || !ctx->backend->bind_fragment_storage) {
+        php_error_docref(NULL, E_WARNING, "vio_bind_fragment_storage_buffer: backend '%s' has no fragment-stage storage buffers "
+                         "(VIO_FEATURE_FRAGMENT_STORAGE = 0)", ctx->backend ? ctx->backend->name : "none");
+        RETURN_FALSE;
+    }
+    vio_buffer_object *buf = buf_zval ? Z_VIO_BUFFER_P(buf_zval) : NULL;
+    if (buf && (!buf->valid || !buf->backend_buffer || buf->type != VIO_BUFFER_STORAGE)) {
+        php_error_docref(NULL, E_WARNING, "vio_bind_fragment_storage_buffer: needs a storage buffer (vio_storage_buffer)");
+        RETURN_FALSE;
+    }
+    if (ctx->backend->bind_fragment_storage(buf ? buf->backend_buffer : NULL, (int)binding) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_bind_fragment_storage_buffer: the backend refused the buffer");
+        RETURN_FALSE;
+    }
+    zend_object *old = ctx->frag_storage[binding];
+    if (buf) GC_ADDREF(Z_OBJ_P(buf_zval));
+    ctx->frag_storage[binding] = buf ? Z_OBJ_P(buf_zval) : NULL;
+    if (old) OBJ_RELEASE(old);
+    RETURN_TRUE;
 }
 
 ZEND_FUNCTION(vio_bind_storage_buffer)
@@ -10710,6 +10750,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FORMAT_R32F", VIO_FORMAT_R32F, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_R8", VIO_FORMAT_R8, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STORAGE_IMAGE", VIO_FEATURE_STORAGE_IMAGE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_FRAGMENT_STORAGE", VIO_FEATURE_FRAGMENT_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_STORAGE", VIO_FEATURE_VERTEX_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STENCIL", VIO_FEATURE_STENCIL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_GPU_TIMESTAMP", VIO_FEATURE_GPU_TIMESTAMP, CONST_CS | CONST_PERSISTENT);

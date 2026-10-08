@@ -453,6 +453,8 @@ static int create_logical_device(void)
         /* 3D pipeline (GAP-PHASE5 Block 10): per-attachment blend states and
          * multi-draw indirect when available (both have fallbacks). */
         if (avail.independentBlend)  { features.independentBlend = VK_TRUE;  vio_vk.independent_blend = 1; }
+        vio_vk.fragment_stores = 0;
+        if (avail.fragmentStoresAndAtomics) { features.fragmentStoresAndAtomics = VK_TRUE; vio_vk.fragment_stores = 1; }   /* A15 */
         if (avail.multiDrawIndirect) { features.multiDrawIndirect = VK_TRUE; vio_vk.multi_draw_indirect = 1; }
         /* Optional shader stages (vio_shader 'geometry' / 'tess_control' +
          * 'tess_eval'); PointSize in those stages when the device allows it. */
@@ -3778,6 +3780,7 @@ static void vulkan_end_frame(void)
             vkCmdEndRenderPass(f->cmd_buf);
         }
         vio_vk.cur_render_pass = VK_NULL_HANDLE;
+        vio_vk_fs_storage_host_barrier(f->cmd_buf);
         if (vio_vk.ts_pool) {
             vkCmdWriteTimestamp(f->cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * VIO_GPU_TS_PER_FRAME + 1);
             vio_vk.ts_pending[vio_vk.current_frame] = 1;
@@ -3807,6 +3810,7 @@ static void vulkan_end_frame(void)
     /* End render pass and command buffer */
     if (vio_vk.cur_render_pass) vkCmdEndRenderPass(f->cmd_buf);
     vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vio_vk_fs_storage_host_barrier(f->cmd_buf);
     vulkan_capture_frame(f->cmd_buf);
     if (vio_vk.ts_pool) {
         vkCmdWriteTimestamp(f->cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, vio_vk.ts_pool, (uint32_t)vio_vk.current_frame * VIO_GPU_TS_PER_FRAME + 1);
@@ -4608,11 +4612,31 @@ static void vulkan_dispatch_compute(vio_compute_cmd *cmd)
 /* GPU->CPU readback of a storage buffer. Async dispatches are waited for first;
  * the dispatch barriers make the writes visible to the host, and the buffer is
  * HOST_COHERENT, so map + memcpy is enough. */
+/* Fragment storage buffers (A15): the 3D path's storage table (the stages share
+ * the GLSL binding space); while one is bound, readbacks wait for the draws. */
+static int vk_fs_storage_bound[VIO_MAX_FRAGMENT_STORAGE];
+
+static int vulkan_bind_fragment_storage(void *backend_buffer, int binding)
+{
+    if (binding < 0 || binding >= VIO_MAX_FRAGMENT_STORAGE) return -1;
+    vio_vk3d_bind_storage_buffer(backend_buffer, binding, 1, 0, 4);
+    vk_fs_storage_bound[binding] = backend_buffer != NULL;
+    vio_vk.fs_storage_active = 0;
+    for (int i = 0; i < VIO_MAX_FRAGMENT_STORAGE; i++) if (vk_fs_storage_bound[i]) vio_vk.fs_storage_active = 1;
+    return 0;
+}
+
 static size_t vulkan_read_buffer(void *backend_buffer, void *out, size_t size)
 {
     vio_vulkan_compute_buffer *buf = (vio_vulkan_compute_buffer *)backend_buffer;
     if (!buf || !buf->buffer || !out || size == 0 || !vio_vk.initialized || !vio_vk.vma_allocator)
         return 0;
+    if (vio_vk.fs_storage_active || vio_vk.fs_storage_pending) {
+        /* Draws may have written it (A15): the frame so far, or every submitted one. */
+        if (vio_vk.in_frame) vio_vk_flush_frame();
+        else vkQueueWaitIdle(vio_vk.graphics_queue);
+        vio_vk.fs_storage_pending = 0;
+    }
     vulkan_compute_wait();
 
     size_t n = size < (size_t)buf->size ? size : (size_t)buf->size;
@@ -4629,6 +4653,19 @@ static size_t vulkan_read_buffer(void *backend_buffer, void *out, size_t size)
 /* Submit what the open frame recorded so far, wait for it and reopen the frame
  * command buffer with the same pass (LOAD). Used by vio_compute_wait inside a
  * frame. The acquire semaphore is waited by the first submit only. */
+/* Fragment-stage storage writes (A15) visible to the host and to later work. */
+void vio_vk_fs_storage_host_barrier(VkCommandBuffer cmd)
+{
+    if (!vio_vk.fs_storage_active) return;
+    VkMemoryBarrier mb = {0};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    vio_vk.fs_storage_pending = 1;
+}
+
 void vio_vk_flush_frame(void)
 {
     if (!vio_vk.in_frame) return;
@@ -4643,6 +4680,7 @@ void vio_vk_flush_frame(void)
     memcpy(sc, vio_vk.cur_sc, sizeof(VkRect2D) * vp_count);
     if (had_pass) vkCmdEndRenderPass(cmd);
     vio_vk.cur_render_pass = VK_NULL_HANDLE;
+    vio_vk_fs_storage_host_barrier(cmd);
     vkEndCommandBuffer(cmd);
 
     if (!vio_vk.midframe_fence) {
@@ -5115,6 +5153,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* Vulkan 2D path (shapes/sprites/text) */
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* VK_IMAGE_TYPE_3D */
         case VIO_FEATURE_VERTEX_STORAGE: return vio_vk3d_available(); /* storage bindings 18.. in the vertex stage */
+        case VIO_FEATURE_FRAGMENT_STORAGE: return vio_vk3d_available() && vio_vk.fragment_stores;
         case VIO_FEATURE_INDIRECT_DRAW:  return vio_vk3d_available(); /* vkCmdDraw(Indexed)Indirect (GAP-PHASE5 Block 8) */
         case VIO_FEATURE_RENDER_TARGET_CUBE: return vio_vk3d_available(); /* framebuffer per (face, level) (Block 10b) */
         case VIO_FEATURE_RENDER_TARGET_LAYERED: return vio_vk3d_available(); /* array / depth-cube images, framebuffer per layer */
@@ -5176,6 +5215,7 @@ static const vio_backend vulkan_backend = {
     .enumerate_adapters = vulkan_enumerate_adapters,
     .draw_mesh_instanced = vio_vk3d_draw_mesh_instanced,
     .bind_storage_buffer = vio_vk3d_bind_storage_buffer,
+    .bind_fragment_storage = vulkan_bind_fragment_storage,
     .draw_instanced_from_storage = vio_vk3d_draw_instanced_from_storage,
     .draw_mesh_tasks          = vio_vk3d_draw_mesh_tasks,
     .draw_mesh_tasks_indirect = vio_vk3d_draw_mesh_tasks_indirect,

@@ -290,6 +290,9 @@ typedef struct _vio_vulkan_state {
     int                      depth_has_stencil;    /* depth attachments carry 8 stencil bits */
     int                      multi_draw_indirect;  /* device feature enabled */
     int                      independent_blend;    /* device feature enabled */
+    int                      fragment_stores;      /* fragmentStoresAndAtomics enabled (A15) */
+    int                      fs_storage_active;    /* a fragment storage buffer is bound */
+    int                      fs_storage_pending;   /* a frame wrote one: readbacks drain the queue first */
     int                      geometry_supported;   /* geometryShader enabled (vio_shader 'geometry') */
     int                      tessellation_supported; /* tessellationShader enabled */
     int                      vertex_layer_supported; /* VK_EXT_shader_viewport_index_layer enabled (gl_Layer in the VS) */
@@ -552,6 +555,7 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void);
 int   vio_vk_rt_ensure_views(int views);
 /* Submit the open frame's commands so far, wait, and reopen it (vio_compute_wait). */
 void  vio_vk_flush_frame(void);
+void  vio_vk_fs_storage_host_barrier(VkCommandBuffer cmd);
 int   vio_vk_bind_render_target_face(void *rt, int face, int level);
 void  vio_vk_clear_attachments(float r, float g, float b, float a);
 int   vio_vk_render_target_cubemap(void *rt, void *cm_obj);

@@ -85,6 +85,8 @@ typedef struct _vio_d3d11_buffer {
      * created on first dispatch that writes this buffer. */
     ID3D11Buffer *readback_staging;
     size_t        readback_size; /* allocated bytes of readback_staging */
+    ID3D11UnorderedAccessView *fs_uav;   /* raw UAV for the fragment stage (A15), created on first bind */
+    int           fs_dirty;              /* written by a draw since the last readback */
 } vio_d3d11_buffer;
 
 /* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */

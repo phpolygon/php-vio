@@ -101,9 +101,10 @@
 #define VIO_D3D12_RP_DS_SAMPLER   13
 #define VIO_D3D12_RP_ACCEL        14  /* root SRV t0, space9: ray-query acceleration structure (all stages) */
 #define VIO_D3D12_RP_DRAW_PARAMS  15  /* 2 root constants b13 (VERTEX): gl_BaseVertex / gl_BaseInstance below SM 6.8 */
-#define VIO_D3D12_RP_BINDLESS     16  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
-#define VIO_D3D12_RP_FEEDBACK     17  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
-#define VIO_D3D12_RP_COUNT        18
+#define VIO_D3D12_RP_PS_UAV       16  /* [16..19] root UAVs u4..u7 (PIXEL): fragment storage buffers 0..3 (A15) */
+#define VIO_D3D12_RP_BINDLESS     20  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
+#define VIO_D3D12_RP_FEEDBACK     21  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
+#define VIO_D3D12_RP_COUNT        22
 
 /* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
  * bytecode (NULL when the vio_shader has no such stage). */
@@ -185,6 +186,7 @@ typedef struct _vio_d3d12_buffer {
      * indirect draw must transition it (GAP-PHASE5 Block 8). Otherwise it rests in
      * COMMON / GENERIC_READ, which promote implicitly. */
     UINT64           uav_live_serial;
+    int              fs_dirty;          /* written by a draw since the last readback (A15) */
 } vio_d3d12_buffer;
 
 /* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */

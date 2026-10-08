@@ -401,6 +401,22 @@ static VkBuffer vk3d_zero_buffer(void)
     return vk3d.zero_buf;
 }
 
+static VkBuffer   vk3d_scratch_buf;
+static void      *vk3d_scratch_alloc;
+
+static VkBuffer vk3d_scratch_storage(void)
+{
+    if (!vk3d_scratch_buf) {
+        if (vio_vma_create_buffer(vio_vk.vma_allocator, VK3D_ZERO_BUF_SIZE, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  &vk3d_scratch_buf, &vk3d_scratch_alloc) != 0) {
+            vk3d_scratch_buf = VK_NULL_HANDLE;
+            return vk3d_zero_buffer();
+        }
+    }
+    return vk3d_scratch_buf;
+}
+
 static VkBuffer vk3d_identity_buffer(void)
 {
     if (!vk3d.identity_buf) {
@@ -447,6 +463,9 @@ void vio_vk3d_shutdown(void)
     for (int i = 0; i < VK3D_DUMMY_COUNT; i++) vk3d_free_texture_now(vk3d.dummy[i]);
     if (vk3d.zero_buf)     vio_vma_destroy_buffer(vio_vk.vma_allocator, vk3d.zero_buf, vk3d.zero_alloc);
     if (vk3d.identity_buf) vio_vma_destroy_buffer(vio_vk.vma_allocator, vk3d.identity_buf, vk3d.identity_alloc);
+    if (vk3d_scratch_buf) vio_vma_destroy_buffer(vio_vk.vma_allocator, vk3d_scratch_buf, vk3d_scratch_alloc);
+    vk3d_scratch_buf = VK_NULL_HANDLE;
+    vk3d_scratch_alloc = NULL;
     memset(&vk3d, 0, sizeof(vk3d));
 }
 
@@ -622,7 +641,7 @@ static void vk3d_resolve(vio_vk3d_shader *sh, vk3d_res *out)
                 break;
             case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
                 vio_vulkan_compute_buffer *sb = vk3d.storage[(b->binding - VK3D_B_STORAGE0) % VK3D_MAX_STORAGE];
-                r->buf = (sb && sb->buffer) ? sb->buffer : vk3d_zero_buffer();
+                r->buf = (sb && sb->buffer) ? sb->buffer : vk3d_scratch_storage();
                 r->range = VK_WHOLE_SIZE;
                 break;
             }

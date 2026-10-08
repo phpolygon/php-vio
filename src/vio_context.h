@@ -35,6 +35,7 @@ typedef struct _vio_context_object {
      * the bound shader's uniform blocks at each draw. */
 #define VIO_MAX_UBO_BINDINGS 16
     zend_object       *bound_ubo[VIO_MAX_UBO_BINDINGS];
+    zend_object       *frag_storage[4];   /* vio_bind_fragment_storage_buffer (A15), held */
     /* Metal: last object bound per GL texture unit. Resolved against the
      * shader bound AT DRAW TIME (vio_flush_pending_textures), so vio_bind_texture
      * may precede vio_set_uniform('u_sampler', unit) and pipeline switches, the
@@ -78,6 +79,7 @@ typedef struct _vio_context_object {
 
 /* Drop the vio_texture_index() references (before the backend shuts down). */
 void vio_context_bindless_clear(vio_context_object *ctx);
+void vio_context_release_fragment_storage(vio_context_object *ctx);
 
 extern zend_class_entry *vio_context_ce;
 

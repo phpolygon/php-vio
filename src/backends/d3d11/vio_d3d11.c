@@ -960,6 +960,7 @@ static void d3d11_destroy_buffer(void *buffer_ptr)
     if (!buf) return;
 
     if (buf->readback_staging) ID3D11Buffer_Release(buf->readback_staging);
+    if (buf->fs_uav) ID3D11UnorderedAccessView_Release(buf->fs_uav);
     if (buf->buffer) ID3D11Buffer_Release(buf->buffer);
     free(buf);
 }
@@ -3032,8 +3033,56 @@ static void d3d11_bind_vertex_slots(ID3D11Buffer *mesh_vb, UINT mesh_stride)
                                            buffers, strides, offsets);
 }
 
+/* Fragment storage buffers (A15): output-merger UAVs u4..u7 (render targets
+ * take slots 0..3), re-applied before every draw - a render-target bind
+ * resets the output merger. */
+static vio_d3d11_buffer *d3d11_fs_storage[VIO_MAX_FRAGMENT_STORAGE];
+static int d3d11_fs_storage_any;
+
+static int d3d11_bind_fragment_storage(void *backend_buffer, int binding)
+{
+    if (binding < 0 || binding >= VIO_MAX_FRAGMENT_STORAGE) return -1;
+    vio_d3d11_buffer *buf = (vio_d3d11_buffer *)backend_buffer;
+    if (buf && !buf->buffer) return -1;
+    if (buf && !buf->fs_uav) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {0};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.FirstElement = 0;
+        ud.Buffer.NumElements = (UINT)(buf->size / 4);
+        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        if (FAILED(ID3D11Device_CreateUnorderedAccessView(vio_d3d11.device, (ID3D11Resource *)buf->buffer, &ud, &buf->fs_uav))) {
+            buf->fs_uav = NULL;
+            php_error_docref(NULL, E_WARNING, "D3D11: fragment storage UAV failed (the buffer needs a stride of 4 / raw views)");
+            return -1;
+        }
+    }
+    d3d11_fs_storage[binding] = buf;
+    d3d11_fs_storage_any = 0;
+    for (int i = 0; i < VIO_MAX_FRAGMENT_STORAGE; i++) if (d3d11_fs_storage[i]) d3d11_fs_storage_any = 1;
+    if (!d3d11_fs_storage_any && vio_d3d11.context) {
+        ID3D11UnorderedAccessView *none[VIO_MAX_FRAGMENT_STORAGE] = { NULL };
+        ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(vio_d3d11.context, D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL,
+                                                                      NULL, NULL, 4, VIO_MAX_FRAGMENT_STORAGE, none, NULL);
+    }
+    return 0;
+}
+
+static void d3d11_apply_fs_storage(void)
+{
+    if (!d3d11_fs_storage_any || !vio_d3d11.context) return;
+    ID3D11UnorderedAccessView *uavs[VIO_MAX_FRAGMENT_STORAGE];
+    for (int i = 0; i < VIO_MAX_FRAGMENT_STORAGE; i++) {
+        uavs[i] = d3d11_fs_storage[i] ? d3d11_fs_storage[i]->fs_uav : NULL;
+        if (d3d11_fs_storage[i]) d3d11_fs_storage[i]->fs_dirty = 1;
+    }
+    ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(vio_d3d11.context, D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL,
+                                                                  NULL, NULL, 4, VIO_MAX_FRAGMENT_STORAGE, uavs, NULL);
+}
+
 static void d3d11_draw(vio_draw_cmd *cmd)
 {
+    d3d11_apply_fs_storage();
     if (!cmd) return;
     /* Nothing bound yet: no vertex shader on the context. WARP draws nothing,
      * hardware drivers remove the device (test 173). */
@@ -3055,6 +3104,7 @@ static void d3d11_draw(vio_draw_cmd *cmd)
 
 static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
 {
+    d3d11_apply_fs_storage();
     if (!cmd) return;
     if (!d3d11_current_pipeline) return;   /* see d3d11_draw */
 
@@ -3155,6 +3205,7 @@ static void d3d11_bind_storage_buffer(void *backend_buffer, int binding, int acc
  * harmless). Cbuffer flushing is done by the caller (vio_draw_instanced_from_buffer). */
 static void d3d11_draw_instanced_from_storage(void *mesh_obj, int instance_count)
 {
+    d3d11_apply_fs_storage();
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!vio_d3d11.initialized || !mesh || instance_count <= 0) return;
     if (!d3d11_current_pipeline) return;   /* see d3d11_draw */
@@ -3182,6 +3233,7 @@ static void d3d11_draw_instanced_from_storage(void *mesh_obj, int instance_count
  * DrawInstancedIndirect per record (D3D11 has no multi-draw). */
 static void d3d11_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
 {
+    d3d11_apply_fs_storage();
     if (!d3d11_current_pipeline) return;   /* see d3d11_draw */
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_d3d11_buffer *args = (vio_d3d11_buffer *)args_buffer;
@@ -3730,6 +3782,25 @@ static size_t d3d11_read_buffer(void *backend_buffer, void *out, size_t size)
 {
     vio_d3d11_buffer *buf = (vio_d3d11_buffer *)backend_buffer;
     if (!buf || !out || size == 0) return 0;
+    if (buf->fs_dirty && buf->buffer) {
+        /* Written by draws (A15): leave the output merger (the next draw binds
+         * it again) and copy into the staging buffer, ordered after the draws. */
+        buf->fs_dirty = 0;
+        ID3D11UnorderedAccessView *none[VIO_MAX_FRAGMENT_STORAGE] = { NULL };
+        ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(vio_d3d11.context, D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL,
+                                                                      NULL, NULL, 4, VIO_MAX_FRAGMENT_STORAGE, none, NULL);
+        if (!buf->readback_staging || buf->readback_size < buf->size) {
+            if (buf->readback_staging) { ID3D11Buffer_Release(buf->readback_staging); buf->readback_staging = NULL; }
+            D3D11_BUFFER_DESC sd = {0};
+            sd.ByteWidth = (UINT)buf->size;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(ID3D11Device_CreateBuffer(vio_d3d11.device, &sd, NULL, &buf->readback_staging))) buf->readback_staging = NULL;
+            else buf->readback_size = buf->size;
+        }
+        if (buf->readback_staging)
+            ID3D11DeviceContext_CopyResource(vio_d3d11.context, (ID3D11Resource *)buf->readback_staging, (ID3D11Resource *)buf->buffer);
+    }
     if (!buf->readback_staging) {
         php_error_docref(NULL, E_WARNING,
             "D3D11: read_buffer before any compute dispatch produced a staging copy");
@@ -3964,6 +4035,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* vio_2d_d3d11_* */
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* ID3D11Texture3D */
         case VIO_FEATURE_VERTEX_STORAGE: return 1; /* SM5 reads SRV/StructuredBuffer in the VS */
+        case VIO_FEATURE_FRAGMENT_STORAGE: return 1; /* output-merger UAVs u4..u7 (feature level 11) */
         case VIO_FEATURE_STORAGE_IMAGE:  return 1; /* RWTexture2D/3D UAV on storage textures */
         case VIO_FEATURE_MRT:            return 1; /* OMSetRenderTargets with up to 4 RTVs */
         default:                       return 0;
@@ -4174,6 +4246,7 @@ static const vio_backend d3d11_backend = {
     .compute_set_uniforms     = d3d11_compute_set_uniforms,
     .read_buffer              = d3d11_read_buffer,
     .bind_storage_buffer          = d3d11_bind_storage_buffer,
+    .bind_fragment_storage        = d3d11_bind_fragment_storage,
     .draw_instanced_from_storage  = d3d11_draw_instanced_from_storage,
     .supports_feature  = d3d11_supports_feature,
     .feature_emulation = d3d11_feature_emulation,
