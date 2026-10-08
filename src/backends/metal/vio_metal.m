@@ -16,6 +16,9 @@
 #include <os/lock.h>
 #include <stdatomic.h>
 
+#ifndef HAVE_IOS
+#import <AppKit/AppKit.h>   /* NSWindow / NSView / NSScreen (came in through GLFW's Cocoa header before) */
+#endif
 #include "../../../include/vio_platform.h"
 #include "vio_metal.h"
 
@@ -771,6 +774,15 @@ void vio_metal_handle_resize(int width, int height)
     metal_resize(width, height);
 }
 
+#ifdef HAVE_IOS
+/* iOS has no NSWindow: vio_ios.m builds the layer and calls
+ * vio_metal_setup_context_native() itself. */
+int vio_metal_setup_context(void *platform_window, vio_config *cfg)
+{
+    (void)platform_window; (void)cfg;
+    return -1;
+}
+#else
 int vio_metal_setup_context(void *platform_window, vio_config *cfg)
 {
     @autoreleasepool {
@@ -836,6 +848,7 @@ int vio_metal_setup_context(void *platform_window, vio_config *cfg)
 
     return 0;
 }
+#endif /* HAVE_IOS */
 
 void vio_metal_shutdown_context(void)
 {
