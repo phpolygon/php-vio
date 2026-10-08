@@ -1,3 +1,10 @@
+## [2.31.3](https://github.com/phpolygon/php-vio/compare/v2.31.2...v2.31.3) (2026-10-08)
+
+
+### Bug Fixes
+
+* **opengl:** load glFramebufferTextureMultiviewOVR without GLAD ([4a1a809](https://github.com/phpolygon/php-vio/commit/4a1a80911c9e6452250ef9c7e75608f1232d661c))
+
 ## [2.31.2](https://github.com/phpolygon/php-vio/compare/v2.31.1...v2.31.2) (2026-10-08)
 
 
