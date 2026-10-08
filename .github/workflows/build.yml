@@ -365,7 +365,11 @@ jobs:
           # (2026-10-08: "php: command not found" right after its install step).
           # The Homebrew formula php is 8.5 and brings phpize / php-config.
           brew update --quiet
-          brew install php
+          # The runner image links openssl@1.1 into /opt/homebrew/bin; installing php
+          # upgrades openssl@3, whose link step then fails and fails the install.
+          brew unlink openssl@1.1 2>/dev/null || true
+          brew install php || true
+          brew link --overwrite openssl@3 || true
           brew link --overwrite php || true   # "already linked" exits 1
           php -v
           have=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
@@ -450,7 +454,11 @@ jobs:
           # (2026-10-08: "php: command not found" right after its install step).
           # The Homebrew formula php is 8.5 and brings phpize / php-config.
           brew update --quiet
-          brew install php
+          # The runner image links openssl@1.1 into /opt/homebrew/bin; installing php
+          # upgrades openssl@3, whose link step then fails and fails the install.
+          brew unlink openssl@1.1 2>/dev/null || true
+          brew install php || true
+          brew link --overwrite openssl@3 || true
           brew link --overwrite php || true   # "already linked" exits 1
           php -v
           have=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
