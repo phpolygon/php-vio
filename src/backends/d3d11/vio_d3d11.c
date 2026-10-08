@@ -3194,9 +3194,11 @@ static void d3d11_bind_storage_buffer(void *backend_buffer, int binding, int acc
         return;
     }
 
-    ID3D11DeviceContext_VSSetShaderResources(vio_d3d11.context, (UINT)binding, 1, &srv);
+    /* t16 + binding: vio_shader_reflect.c moves vertex storage buffers out of the
+     * texture registers (A28). */
+    ID3D11DeviceContext_VSSetShaderResources(vio_d3d11.context, (UINT)(16 + binding), 1, &srv);
     s_vs_storage_srv = srv;
-    s_vs_storage_slot = binding;
+    s_vs_storage_slot = 16 + binding;
 }
 
 /* Instanced draw whose per-instance data comes from the bound storage buffer
@@ -4117,6 +4119,11 @@ static void d3d11_bind_texture(void *texture, int slot)
      * domain shader can read a displacement map (same register as the
      * fragment-stage map resolves the unit to). */
     vio_d3d11_pipeline *p = d3d11_current_pipeline;
+    if (tex->srv) {
+        /* Vertex textures (A28): the plan gives every stage the same register. */
+        ID3D11DeviceContext_VSSetShaderResources(vio_d3d11.context, (UINT)slot, 1, &tex->srv);
+        if (tex->sampler) ID3D11DeviceContext_VSSetSamplers(vio_d3d11.context, (UINT)slot, 1, &tex->sampler);
+    }
     if (p && tex->srv) {
         if (p->gs) {
             ID3D11DeviceContext_GSSetShaderResources(vio_d3d11.context, (UINT)slot, 1, &tex->srv);

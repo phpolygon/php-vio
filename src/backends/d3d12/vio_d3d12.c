@@ -659,7 +659,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     params[3].Descriptor.ShaderRegister = 0;
     /* Mesh variant: space 2 (vio_shader_reflect.c moves mesh / task storage
      * buffers there), since the mesh stage also sees the SRV table at t0. */
-    params[3].Descriptor.RegisterSpace = mesh ? 2 : 0;
+    params[3].Descriptor.RegisterSpace = 2;   /* vertex / mesh storage buffers live in space 2 (A28) */
     params[3].ShaderVisibility = mesh ? D3D12_SHADER_VISIBILITY_MESH : D3D12_SHADER_VISIBILITY_VERTEX;
 
     /* [4] Sampler table s0..s7 — one per regular texture register (GAP-PLAN
@@ -731,7 +731,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
         static_samplers[s].MaxLOD = D3D12_FLOAT32_MAX;
         static_samplers[s].ShaderRegister = 8 + s;
         static_samplers[s].RegisterSpace = 0;
-        static_samplers[s].ShaderVisibility = mesh ? D3D12_SHADER_VISIBILITY_ALL : D3D12_SHADER_VISIBILITY_PIXEL;
+        static_samplers[s].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;   /* shadow samplers in every stage */
     }
 
     /* [14] root SRV t0, space9: the ray-query acceleration structure (vio_shader_reflect.c
@@ -759,6 +759,17 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     D3D12_STATIC_SAMPLER_DESC all_samplers[8];
     memcpy(all_samplers, static_samplers, sizeof(static_samplers));
     d3d12_bindless_static_samplers(&all_samplers[4]);
+
+    /* [20] / [21] Vertex textures (A28): the SRV and sampler tables for the
+     * vertex stage (its storage buffer moved to t0, space2 for that). */
+    params[VIO_D3D12_RP_VS_SRV].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[VIO_D3D12_RP_VS_SRV].DescriptorTable.NumDescriptorRanges = 1;
+    params[VIO_D3D12_RP_VS_SRV].DescriptorTable.pDescriptorRanges = &srv_range;
+    params[VIO_D3D12_RP_VS_SRV].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    params[VIO_D3D12_RP_VS_SAMPLER].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[VIO_D3D12_RP_VS_SAMPLER].DescriptorTable.NumDescriptorRanges = 1;
+    params[VIO_D3D12_RP_VS_SAMPLER].DescriptorTable.pDescriptorRanges = &sampler_range;
+    params[VIO_D3D12_RP_VS_SAMPLER].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
     /* [16..19] Fragment storage buffers (A15): root UAVs u4..u7 for the pixel
      * stage (vio_shader_reflect.c moves fragment SSBO binding b to u(b + 4)). */
@@ -9244,6 +9255,7 @@ static void d3d12_bind_texture(void *texture, int slot)
 static void d3d12_set_srv_tables(D3D12_GPU_DESCRIPTOR_HANDLE gpu)
 {
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_PS_SRV, gpu);
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_VS_SRV, gpu);
     vio_d3d12_pipeline *p = d3d12_current_pipeline;
     if (!p) return;
     if (p->has_gs || p->is_mesh) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_GS_SRV, gpu);
@@ -9254,6 +9266,7 @@ static void d3d12_set_srv_tables(D3D12_GPU_DESCRIPTOR_HANDLE gpu)
 static void d3d12_set_sampler_tables(D3D12_GPU_DESCRIPTOR_HANDLE gpu)
 {
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_PS_SAMPLER, gpu);
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_VS_SAMPLER, gpu);
     vio_d3d12_pipeline *p = d3d12_current_pipeline;
     if (!p) return;
     if (p->has_gs || p->is_mesh) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_GS_SAMPLER, gpu);

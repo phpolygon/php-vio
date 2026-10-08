@@ -614,12 +614,11 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
     }
     /* Samplers only an optional stage declares extend the GL-unit map after the
      * fragment ones, in php_vio.c's merge order (geometry, tess control, tess
-     * eval, then mesh and task - OPEN-ITEMS-PLAN A30), so vio_set_uniform('u_height',
-     * unit) + vio_bind_texture reach them. Index 1 is the vertex stage of a
-     * vertex pipeline: its samplers are not in the map, so only mesh pipelines merge it. */
+     * eval, then the vertex / mesh stage and task - OPEN-ITEMS-PLAN A30 / A28), so
+     * vio_set_uniform('u_height', unit) + vio_bind_texture reach them. */
     {
         static const int merge_order[5] = { 4, 2, 3, 1, 0 };
-        int merge_count = is_mesh ? 5 : 3;
+        int merge_count = 5;
         for (int k = 0; k < merge_count; k++) {
             const vk3d_stage_samplers *s = &smp[merge_order[k]];
             for (int j = 0; j < s->count && sh->fs_sampler_count < VK3D_MAX_SAMPLERS; j++) {

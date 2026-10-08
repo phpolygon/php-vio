@@ -102,9 +102,11 @@
 #define VIO_D3D12_RP_ACCEL        14  /* root SRV t0, space9: ray-query acceleration structure (all stages) */
 #define VIO_D3D12_RP_DRAW_PARAMS  15  /* 2 root constants b13 (VERTEX): gl_BaseVertex / gl_BaseInstance below SM 6.8 */
 #define VIO_D3D12_RP_PS_UAV       16  /* [16..19] root UAVs u4..u7 (PIXEL): fragment storage buffers 0..3 (A15) */
-#define VIO_D3D12_RP_BINDLESS     20  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
-#define VIO_D3D12_RP_FEEDBACK     21  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
-#define VIO_D3D12_RP_COUNT        22
+#define VIO_D3D12_RP_VS_SRV       20  /* SRV table t0.. (VERTEX): vertex textures (A28) */
+#define VIO_D3D12_RP_VS_SAMPLER   21  /* sampler table s0.. (VERTEX) */
+#define VIO_D3D12_RP_BINDLESS     22  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
+#define VIO_D3D12_RP_FEEDBACK     23  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
+#define VIO_D3D12_RP_COUNT        24
 
 /* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
  * bytecode (NULL when the vio_shader has no such stage). */

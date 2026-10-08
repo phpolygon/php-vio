@@ -185,7 +185,18 @@ typedef struct _vio_sampler_plan {
     char names[VIO_SAMPLER_PLAN_MAX][64];
     int  reg[VIO_SAMPLER_PLAN_MAX];
     int  is_depth[VIO_SAMPLER_PLAN_MAX];
+    /* The geometry stage writes gl_PrimitiveID (A28): it travels to the fragment
+     * stage as a flat int varying at VIO_PRIMID_LOCATION (D3D, Metal). */
+    int  gs_writes_primid;
 } vio_sampler_plan;
+
+#define VIO_PRIMID_LOCATION 30
+/* 1 when the module writes the BuiltIn `builtin` through an Output variable. */
+int vio_spirv_writes_builtin(const uint32_t *spirv, size_t spirv_size, uint32_t builtin);
+/* A copy of the module with the variable decorated BuiltIn `builtin` in `storage`
+ * (1 Input, 3 Output) moved to Location `location` (+ Flat), or NULL if none. */
+uint32_t *vio_spirv_builtin_to_location(const uint32_t *spirv, size_t words, uint32_t builtin, uint32_t storage,
+                                        uint32_t location, int flat, size_t *out_words);
 
 /* spirv[0] is the fragment stage; NULL entries are skipped. */
 void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv, const size_t *size, int n);

@@ -3733,7 +3733,7 @@ ZEND_FUNCTION(vio_shader)
                 shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)],
                 shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)],
                 shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)],
-                shader->is_mesh ? shader->vert_spirv : NULL,
+                shader->vert_spirv,   /* vertex or mesh stage: vertex textures too (A28) */
                 shader->is_mesh ? shader->task_spirv : NULL,
             };
             const size_t sz[6] = {
@@ -3741,10 +3741,11 @@ ZEND_FUNCTION(vio_shader)
                 shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)],
                 shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)],
                 shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)],
-                shader->is_mesh ? shader->vert_spirv_size : 0,
+                shader->vert_spirv_size,
                 shader->is_mesh ? shader->task_spirv_size : 0,
             };
             vio_sampler_plan_build(&shader->sampler_plan, ps, sz, 6);
+            shader->sampler_plan.gs_writes_primid = ps[1] && vio_spirv_writes_builtin(ps[1], sz[1], 7);
         }
         vio_sampler_plan_use(&shader->sampler_plan);
         shader->backend_shader = ctx->backend->compile_shader(&desc);
@@ -3869,10 +3870,8 @@ ZEND_FUNCTION(vio_shader)
         /* Mesh pipelines (OPEN-ITEMS-PLAN A30): the mesh stage (in vert_spirv)
          * and the task stage read textures too; their samplers follow, mesh
          * first. Every backend replays this order. */
-        if (shader->is_mesh) {
-            if (shader->vert_spirv) vio_shader_merge_stage_samplers(shader, shader->vert_spirv, shader->vert_spirv_size);
-            if (shader->task_spirv) vio_shader_merge_stage_samplers(shader, shader->task_spirv, shader->task_spirv_size);
-        }
+        if (shader->vert_spirv) vio_shader_merge_stage_samplers(shader, shader->vert_spirv, shader->vert_spirv_size);
+        if (shader->is_mesh && shader->task_spirv) vio_shader_merge_stage_samplers(shader, shader->task_spirv, shader->task_spirv_size);
         /* Registers from the shader-wide plan the backend compiled with. */
         for (int s = 0; s < shader->sampler_count; s++) {
             for (int k = 0; k < shader->sampler_plan.count; k++) {
