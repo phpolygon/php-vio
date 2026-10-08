@@ -74,6 +74,9 @@ int vio_window_init(void)
 #ifdef HAVE_X11
     vio_platform_x11_register();
 #endif
+#if defined(HAVE_COCOA) && !defined(HAVE_IOS)
+    vio_platform_cocoa_register();
+#endif
     vio_platform_current = NULL;   /* choose among everything registered now */
     return vio_platform_active()->init();
 }

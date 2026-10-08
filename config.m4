@@ -377,7 +377,14 @@ if test "$PHP_VIO" != "no"; then
         PHP_ADD_FRAMEWORK(CoreAudio)
         PHP_ADD_FRAMEWORK(CoreFoundation)
         dnl OpenGL framework NOT linked here - GLAD provides declarations,
-        dnl functions are loaded via glfwGetProcAddress at runtime
+        dnl functions are loaded through the platform's proc-address lookup
+        dnl Native Cocoa platform (src/platform/cocoa/): windows, input,
+        dnl NSOpenGLContext - the OpenGL backend no longer needs GLFW here.
+        PHP_ADD_FRAMEWORK(QuartzCore)
+        PHP_ADD_FRAMEWORK(GameController)
+        VIO_HAS_COCOA=yes
+        AC_DEFINE(HAVE_COCOA, 1, [Whether the native Cocoa platform is built])
+        AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from NSOpenGL)])
       fi
       ;;
     linux*)
@@ -499,6 +506,21 @@ if test "$PHP_VIO" != "no"; then
     fi
   fi
 
+  dnl ── Cocoa platform source (macOS) ─────────────────────────────────
+  dnl Same .c shim pattern as Metal.
+  if test "$VIO_HAS_COCOA" = "yes"; then
+    if test "$ext_shared" != "shared" && test "$ext_shared" != "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/platform/cocoa/vio_platform_cocoa.c],
+        -x objective-c -fobjc-arc $VIO_EXTRA_CFLAGS_RESOLVED,
+        PHP_GLOBAL_OBJS)
+    fi
+    if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/platform/cocoa/vio_platform_cocoa.c],
+        -x objective-c -fobjc-arc $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
+        shared_objects_vio, yes)
+    fi
+  fi
+
   dnl ── iOS backend source ─────────────────────────────────────────────
   dnl Same .c shim pattern as Metal: PHP_ADD_SOURCES_X handles .c only,
   dnl so vio_ios.c is an empty wrapper that #include's vio_ios.m. Both
@@ -535,6 +557,7 @@ if test "$PHP_VIO" != "no"; then
   dnl ── Build directories ──────────────────────────────────────────
   PHP_ADD_BUILD_DIR($ext_builddir/src)
   PHP_ADD_BUILD_DIR($ext_builddir/src/platform/x11)
+  PHP_ADD_BUILD_DIR($ext_builddir/src/platform/cocoa)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/opengl)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/vulkan)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/metal)
