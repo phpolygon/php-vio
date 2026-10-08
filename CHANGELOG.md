@@ -1,3 +1,10 @@
+## [2.31.2](https://github.com/phpolygon/php-vio/compare/v2.31.1...v2.31.2) (2026-10-08)
+
+
+### Bug Fixes
+
+* **d3d12:** re-arm the frame list after a mid-frame capture ([90205ab](https://github.com/phpolygon/php-vio/commit/90205ab151b7a36a674e82b008727d344c618e3c))
+
 ## [2.31.1](https://github.com/phpolygon/php-vio/compare/v2.31.0...v2.31.1) (2026-10-08)
 
 
