@@ -63,6 +63,12 @@ void vio_context_release_fragment_storage(vio_context_object *ctx)
         OBJ_RELEASE(ctx->frag_storage[i]);
         ctx->frag_storage[i] = NULL;
     }
+    if (ctx->fb_texture) {
+        if (ctx->initialized && ctx->backend && ctx->backend->bind_fragment_storage)
+            ctx->backend->bind_fragment_storage(NULL, 3);
+        OBJ_RELEASE(ctx->fb_texture);
+        ctx->fb_texture = NULL;
+    }
 }
 
 static void vio_context_free_object(zend_object *obj)

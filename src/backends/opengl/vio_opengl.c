@@ -2378,6 +2378,9 @@ static int opengl_bind_fragment_storage(void *backend_buffer, int binding)
     vio_opengl_compute_buffer *buf = (vio_opengl_compute_buffer *)backend_buffer;
     if (gl_fs_storage_gen != gl_context_generation) { memset(gl_fs_storage, 0, sizeof(gl_fs_storage)); gl_fs_storage_gen = gl_context_generation; }
     gl_fs_storage[binding] = buf ? buf->ssbo : 0;
+    /* Unbinding releases the binding point now: a shader that still declares
+     * the block must not keep writing into the old buffer. */
+    if (!buf && vio_gl.initialized) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)binding, 0);
     return 0;
 }
 
@@ -3297,6 +3300,7 @@ static int opengl_supports_feature(vio_feature feature)
          * stay on the readback path. */
         case VIO_FEATURE_VERTEX_STORAGE: return vio_gl.caps.has_compute_shader;
         case VIO_FEATURE_FRAGMENT_STORAGE: return vio_gl.caps.has_compute_shader;   /* GL 4.3: >= 8 fragment SSBOs */
+        case VIO_FEATURE_SAMPLER_FEEDBACK_GLSL: return vio_gl.caps.has_compute_shader;
         case VIO_FEATURE_STORAGE_IMAGE:  return vio_gl.caps.has_compute_shader; /* image load/store is 4.2, compute 4.3 */
         case VIO_FEATURE_MRT:            return 1;  /* glDrawBuffers, core since 3.0 */
         default:                         return 0;

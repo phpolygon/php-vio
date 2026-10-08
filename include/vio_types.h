@@ -246,6 +246,7 @@ typedef enum _vio_feature {
      * SRV-in-VS), D3D12, Vulkan and Metal; on OpenGL only from 4.3 (SSBOs are
      * core 4.3), so GL < 4.3 reports 0 and callers stay on the readback path.
      * Value 30 (leaves 23-29 free for unrelated features). */
+    VIO_FEATURE_SAMPLER_FEEDBACK_GLSL = 28,  /* vio_write_feedback() from VIO_SAMPLER_FEEDBACK_GLSL feeds vio_sampler_feedback_* (A15) */
     VIO_FEATURE_FRAGMENT_STORAGE = 27,  /* writable std430 buffers (and atomics) in the fragment stage: vio_bind_fragment_storage_buffer (A15) */
     VIO_FEATURE_VERTEX_STORAGE     = 30,
     /* Stencil test / write through vio_pipeline(['stencil' => [...]]) — the

@@ -2464,12 +2464,32 @@ static int d3d12_bind_fragment_storage(void *backend_buffer, int binding)
     return 0;
 }
 
+/* What an unbound slot points at: a pixel shader that writes a declared but
+ * unbound root UAV removes the device on hardware (WARP shrugs it off). */
+static ID3D12Resource *d3d12_fs_scratch;
+static ID3D12Device   *d3d12_fs_scratch_dev;
+
+static D3D12_GPU_VIRTUAL_ADDRESS d3d12_fs_scratch_va(void)
+{
+    if (!d3d12_fs_scratch || d3d12_fs_scratch_dev != vio_d3d12.device) {
+        if (d3d12_fs_scratch) ID3D12Resource_Release(d3d12_fs_scratch);
+        d3d12_fs_scratch = d3d12_as_buffer(65536, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                           D3D12_RESOURCE_STATE_COMMON);
+        d3d12_fs_scratch_dev = vio_d3d12.device;
+    }
+    return d3d12_fs_scratch ? ID3D12Resource_GetGPUVirtualAddress(d3d12_fs_scratch) : 0;
+}
+
 static void d3d12_apply_fs_storage(void)
 {
     if (!vio_d3d12.cmd_list) return;
     for (int i = 0; i < VIO_MAX_FRAGMENT_STORAGE; i++) {
         vio_d3d12_buffer *buf = d3d12_fs_storage[i];
-        if (!buf || !buf->resource) continue;
+        if (!buf || !buf->resource) {
+            D3D12_GPU_VIRTUAL_ADDRESS va = d3d12_fs_scratch_va();
+            if (va) ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(vio_d3d12.cmd_list, (UINT)(VIO_D3D12_RP_PS_UAV + i), va);
+            continue;
+        }
         ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(vio_d3d12.cmd_list, (UINT)(VIO_D3D12_RP_PS_UAV + i),
                                                                     ID3D12Resource_GetGPUVirtualAddress(buf->resource));
         buf->fs_dirty = 1;
@@ -3165,6 +3185,7 @@ static void d3d12_update_buffer(void *buffer_ptr, const void *data, size_t size,
     vio_d3d12_buffer *buf = (vio_d3d12_buffer *)buffer_ptr;
     if (!buf || !buf->resource || !data || offset >= buf->size) return;
     if (size > buf->size - offset) size = buf->size - offset;
+    buf->fs_dirty = 1;   /* the next read_buffer copies it again instead of an old readback */
 
     if (buf->default_heap) {
         /* GPU-local buffer: staging copy on the upload queue (ordered before
@@ -8775,6 +8796,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* TEXTURE3D resource + SRV */
         case VIO_FEATURE_VERTEX_STORAGE: return 1; /* VS-visible root SRV in the shared root signature */
         case VIO_FEATURE_FRAGMENT_STORAGE: return 1; /* pixel root UAVs u4..u7 */
+        case VIO_FEATURE_SAMPLER_FEEDBACK_GLSL: return 1;
         case VIO_FEATURE_STORAGE_IMAGE:  return 1; /* texture UAV in the compute UAV table */
         case VIO_FEATURE_MRT:            return 1; /* per-RT RTV heap with up to 4 descriptors, PSO 'attachments' */
         default:                       return 0;

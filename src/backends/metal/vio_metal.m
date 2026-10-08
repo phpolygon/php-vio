@@ -3941,7 +3941,13 @@ static void metal_bind_fs_storage(id<MTLRenderCommandEncoder> enc, vio_metal_sha
         const vio_metal_res_buffer *rb = &sh->fs.buffers[i];
         if (rb->kind != 1 || rb->binding < 0 || rb->binding >= VIO_MAX_FRAGMENT_STORAGE) continue;
         vio_metal_compute_buffer *b = metal_fs_storage[rb->binding];
-        if (!b || !b->buffer) continue;
+        if (!b || !b->buffer) {
+            /* A declared but unbound block writes into a scratch buffer, never off the end of nothing. */
+            static id<MTLBuffer> scratch = nil;
+            if (!scratch) scratch = [vio_mtl.device newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+            if (scratch) [enc setFragmentBuffer:scratch offset:0 atIndex:(NSUInteger)rb->msl_index];
+            continue;
+        }
         [enc setFragmentBuffer:(__bridge id<MTLBuffer>)b->buffer offset:0 atIndex:(NSUInteger)rb->msl_index];
         metal_fs_storage_used = 1;
     }
@@ -6496,6 +6502,7 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_3D_PIPELINE:
     case VIO_FEATURE_VERTEX_STORAGE:
     case VIO_FEATURE_FRAGMENT_STORAGE:
+    case VIO_FEATURE_SAMPLER_FEEDBACK_GLSL:
     case VIO_FEATURE_STORAGE_IMAGE:
 #ifdef HAVE_SPIRV_CROSS
         /* Every shader stage reaches the GPU through GLSL -> SPIR-V -> MSL, so

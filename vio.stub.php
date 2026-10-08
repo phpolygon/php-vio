@@ -570,7 +570,11 @@ function vio_texture_index(VioContext $context, VioTexture|VioCubemap $texture):
 function vio_texture_release_index(VioContext $context, VioTexture|VioCubemap $texture): bool {}
 
 /**
- * Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK; D3D12 with SM 6.5 + SamplerFeedbackTier 0.9):
+ * Sampler feedback. Two paths, used together where both exist (A15):
+ *   - GLSL (VIO_FEATURE_SAMPLER_FEEDBACK_GLSL, every backend with fragment storage): prepend
+ *     VIO_SAMPLER_FEEDBACK_GLSL to the fragment source and call vio_write_feedback($sampler, $uv)
+ *     next to the sample; the map lives at fragment storage binding 3.
+ *   - hardware (VIO_FEATURE_SAMPLER_FEEDBACK; D3D12 with SM 6.5 + SamplerFeedbackTier 0.9):
  * bind the MinMip feedback map paired with $texture (created on first use) for the
  * following draws; null unbinds. GLSL has no sampler feedback, so the fragment stage is an
  * HLSL override, vio_shader(['vertex' => …, 'fragment' => $glsl, 'hlsl' => ['fragment' => $ps]]),

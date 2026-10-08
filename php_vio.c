@@ -9140,19 +9140,79 @@ ZEND_FUNCTION(vio_texture_release_index)
 
 /* ── Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK) ───────────────────── */
 
+/* Two paths (OPEN-ITEMS-PLAN A15): the hardware map (D3D12 FeedbackTexture2D from
+ * an HLSL override) and the GLSL map that vio_write_feedback() of
+ * VIO_SAMPLER_FEEDBACK_GLSL fills through fragment storage binding 3. The
+ * functions drive whichever the backend has; read merges both (min per region).
+ * Bit 0 = hardware, bit 1 = GLSL; 0 warns. */
+#define VIO_FB_BINDING 3
+static const char vio_fb_glsl[] =
+    "layout(std430, binding = 3) buffer VioFeedbackMap { uint vio_fb_info[4]; uint vio_fb[]; } vio_fbm;\n"
+    "void vio_write_feedback(sampler2D s, vec2 uv) {\n"
+    "    uint rx = vio_fbm.vio_fb_info[0], ry = vio_fbm.vio_fb_info[1];\n"
+    "    int region = int(vio_fbm.vio_fb_info[2]);\n"
+    "    if (rx == 0u || region <= 0) return;\n"
+    "    vec2 size = vec2(textureSize(s, 0));\n"
+    "    uint mip = uint(max(floor(textureQueryLod(s, uv).x), 0.0));\n"
+    "    ivec2 t = clamp(ivec2(fract(uv) * size) / region, ivec2(0), ivec2(int(rx) - 1, int(ry) - 1));\n"
+    "    atomicMin(vio_fbm.vio_fb[uint(t.y) * rx + uint(t.x)], mip);\n"
+    "}\n";
+
 static int vio_sampler_feedback_ready(vio_context_object *ctx, const char *fn, int has_slot)
 {
-    if (!ctx->initialized || !ctx->backend || !has_slot
-        || !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_SAMPLER_FEEDBACK))) {
-        php_error_docref(NULL, E_WARNING, "%s: backend has no sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK = 0)", fn);
-        return 0;
+    int paths = 0;
+    if (ctx->initialized && ctx->backend && ctx->backend->supports_feature) {
+        if (has_slot && ctx->backend->supports_feature(VIO_FEATURE_SAMPLER_FEEDBACK)) paths |= 1;
+        if (ctx->backend->supports_feature(VIO_FEATURE_SAMPLER_FEEDBACK_GLSL) && ctx->backend->bind_fragment_storage
+            && ctx->backend->create_buffer && ctx->backend->update_buffer && ctx->backend->read_buffer) paths |= 2;
     }
-    return 1;
+    if (!paths) php_error_docref(NULL, E_WARNING, "%s: backend has no sampler feedback "
+                                 "(VIO_FEATURE_SAMPLER_FEEDBACK = VIO_FEATURE_SAMPLER_FEEDBACK_GLSL = 0)", fn);
+    return paths;
+}
+
+/* The hardware path's region: the largest power of two <= half the shorter
+ * side, 4..128 texels. */
+static int vio_fb_region(int w, int h)
+{
+    int half = (w < h ? w : h) / 2, r = 4;
+    while (r * 2 <= half && r < 128) r *= 2;
+    return r;
+}
+
+/* Reset (creating it on first use) the texture's GLSL map to "never sampled". */
+static int vio_fb_emul_reset(vio_context_object *ctx, vio_texture_object *tex)
+{
+    int region = vio_fb_region(tex->width, tex->height);
+    int rx = (tex->width + region - 1) / region, ry = (tex->height + region - 1) / region;
+    size_t n = 4 + (size_t)rx * (size_t)ry;
+    uint32_t *init = emalloc(n * sizeof(uint32_t));
+    init[0] = (uint32_t)rx; init[1] = (uint32_t)ry; init[2] = (uint32_t)region; init[3] = 0;
+    for (size_t i = 4; i < n; i++) init[i] = 0xFFFFFFFFu;
+    int rc = 0;
+    if (!tex->fb_emul) {
+        vio_buffer_desc d;
+        memset(&d, 0, sizeof(d));
+        d.type = VIO_BUFFER_STORAGE;
+        d.data = init;
+        d.size = n * sizeof(uint32_t);
+        d.stride = 4;
+        tex->fb_emul = ctx->backend->create_buffer(&d);
+        if (!tex->fb_emul) rc = -1;
+        tex->fb_rx = rx; tex->fb_ry = ry; tex->fb_region = region;
+    } else {
+        /* Draws in flight may still write it: a read waits for them first. */
+        uint32_t probe[4];
+        ctx->backend->read_buffer(tex->fb_emul, probe, sizeof(probe));
+        ctx->backend->update_buffer(tex->fb_emul, init, n * sizeof(uint32_t), 0);
+    }
+    efree(init);
+    return rc;
 }
 
 static int vio_sampler_feedback_texture_ok(vio_texture_object *tex, const char *fn)
 {
-    if (!tex->valid || !tex->backend_texture || tex->is_3d || tex->layers > 1 || tex->borrowed) {
+    if (!tex->valid || (!tex->backend_texture && !tex->texture_id) || tex->is_3d || tex->layers > 1 || tex->borrowed) {
         php_error_docref(NULL, E_WARNING, "%s: sampler feedback needs a plain 2D texture", fn);
         return 0;
     }
@@ -9169,14 +9229,29 @@ ZEND_FUNCTION(vio_sampler_feedback_bind)
         Z_PARAM_OBJECT_OF_CLASS_OR_NULL(tex_zval, vio_texture_ce)
     ZEND_PARSE_PARAMETERS_END();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_bind", ctx->backend && ctx->backend->sampler_feedback_bind)) RETURN_FALSE;
-    void *bt = NULL;
+    int paths = vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_bind", ctx->backend && ctx->backend->sampler_feedback_bind);
+    if (!paths) RETURN_FALSE;
+    vio_texture_object *tex = NULL;
     if (tex_zval) {
-        vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+        tex = Z_VIO_TEXTURE_P(tex_zval);
         if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_bind")) RETURN_FALSE;
-        bt = tex->backend_texture;
     }
-    RETURN_BOOL(ctx->backend->sampler_feedback_bind(bt) == 0);
+    int ok = 1;
+    if (paths & 1) ok = ctx->backend->sampler_feedback_bind(tex ? tex->backend_texture : NULL) == 0;
+    if (paths & 2) {
+        if (tex && !tex->fb_emul && vio_fb_emul_reset(ctx, tex) != 0) RETURN_FALSE;
+        /* Binding 3 carries the map now (a buffer bound there before is dropped). */
+        if (ctx->frag_storage[VIO_FB_BINDING]) {
+            OBJ_RELEASE(ctx->frag_storage[VIO_FB_BINDING]);
+            ctx->frag_storage[VIO_FB_BINDING] = NULL;
+        }
+        if (ctx->backend->bind_fragment_storage(tex ? tex->fb_emul : NULL, VIO_FB_BINDING) != 0) ok = 0;
+        zend_object *old = ctx->fb_texture;
+        if (tex) GC_ADDREF(&tex->std);
+        ctx->fb_texture = tex ? &tex->std : NULL;
+        if (old) OBJ_RELEASE(old);
+    }
+    RETURN_BOOL(ok);
 }
 
 /* Decode the feedback map: ['regions_x', 'regions_y', 'region' (mip-0 texels per
@@ -9190,13 +9265,32 @@ ZEND_FUNCTION(vio_sampler_feedback_read)
     ZEND_PARSE_PARAMETERS_END();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
-    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_read", ctx->backend && ctx->backend->sampler_feedback_read)) RETURN_FALSE;
+    int paths = vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_read", ctx->backend && ctx->backend->sampler_feedback_read);
+    if (!paths) RETURN_FALSE;
     if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_read")) RETURN_FALSE;
     unsigned char *mips = NULL;
     int rx = 0, ry = 0, region = 0;
-    if (ctx->backend->sampler_feedback_read(tex->backend_texture, &mips, &rx, &ry, &region) != 0 || !mips) {
-        php_error_docref(NULL, E_WARNING, "vio_sampler_feedback_read: the texture has no feedback map (bind or clear it first)");
+    if ((paths & 1) && (ctx->backend->sampler_feedback_read(tex->backend_texture, &mips, &rx, &ry, &region) != 0 || !mips)) {
         free(mips);
+        mips = NULL;
+    }
+    if ((paths & 2) && tex->fb_emul) {
+        size_t n = 4 + (size_t)tex->fb_rx * (size_t)tex->fb_ry;
+        uint32_t *m = emalloc(n * sizeof(uint32_t));
+        if (ctx->backend->read_buffer(tex->fb_emul, m, n * sizeof(uint32_t)) == n * sizeof(uint32_t)) {
+            if (!mips) {
+                rx = tex->fb_rx; ry = tex->fb_ry; region = tex->fb_region;
+                mips = malloc((size_t)rx * (size_t)ry);
+                if (mips) memset(mips, 0xFF, (size_t)rx * (size_t)ry);
+            }
+            if (mips && rx == tex->fb_rx && ry == tex->fb_ry) {
+                for (int i = 0; i < rx * ry; i++) if (m[4 + i] < 0xFF && m[4 + i] < mips[i]) mips[i] = (unsigned char)m[4 + i];
+            }
+        }
+        efree(m);
+    }
+    if (!mips) {
+        php_error_docref(NULL, E_WARNING, "vio_sampler_feedback_read: the texture has no feedback map (bind or clear it first)");
         RETURN_FALSE;
     }
     array_init(return_value);
@@ -9223,9 +9317,13 @@ ZEND_FUNCTION(vio_sampler_feedback_clear)
     ZEND_PARSE_PARAMETERS_END();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
-    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_clear", ctx->backend && ctx->backend->sampler_feedback_clear)) RETURN_FALSE;
+    int paths = vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_clear", ctx->backend && ctx->backend->sampler_feedback_clear);
+    if (!paths) RETURN_FALSE;
     if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_clear")) RETURN_FALSE;
-    RETURN_BOOL(ctx->backend->sampler_feedback_clear(tex->backend_texture) == 0);
+    int ok = 1;
+    if (paths & 1) ok = ctx->backend->sampler_feedback_clear(tex->backend_texture) == 0;
+    if ((paths & 2) && vio_fb_emul_reset(ctx, tex) != 0) ok = 0;
+    RETURN_BOOL(ok);
 }
 
 ZEND_FUNCTION(vio_backend_info)
@@ -10751,6 +10849,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FORMAT_R8", VIO_FORMAT_R8, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STORAGE_IMAGE", VIO_FEATURE_STORAGE_IMAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_FRAGMENT_STORAGE", VIO_FEATURE_FRAGMENT_STORAGE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SAMPLER_FEEDBACK_GLSL", VIO_FEATURE_SAMPLER_FEEDBACK_GLSL, CONST_CS | CONST_PERSISTENT);
+    REGISTER_STRING_CONSTANT("VIO_SAMPLER_FEEDBACK_GLSL", (char *)vio_fb_glsl, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_STORAGE", VIO_FEATURE_VERTEX_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STENCIL", VIO_FEATURE_STENCIL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_GPU_TIMESTAMP", VIO_FEATURE_GPU_TIMESTAMP, CONST_CS | CONST_PERSISTENT);

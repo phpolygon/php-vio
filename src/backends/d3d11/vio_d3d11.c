@@ -926,6 +926,7 @@ static void d3d11_update_buffer(void *buffer_ptr, const void *data, size_t size,
 {
     vio_d3d11_buffer *buf = (vio_d3d11_buffer *)buffer_ptr;
     if (!buf || !buf->buffer || !data || size == 0) return;
+    if (buf->type != VIO_BUFFER_UNIFORM) buf->fs_dirty = 1;   /* the next read_buffer copies it again */
 
     if (buf->type == VIO_BUFFER_UNIFORM) {
         /* A dynamic constant buffer is only ever written whole (WRITE_DISCARD
@@ -4036,6 +4037,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* ID3D11Texture3D */
         case VIO_FEATURE_VERTEX_STORAGE: return 1; /* SM5 reads SRV/StructuredBuffer in the VS */
         case VIO_FEATURE_FRAGMENT_STORAGE: return 1; /* output-merger UAVs u4..u7 (feature level 11) */
+        case VIO_FEATURE_SAMPLER_FEEDBACK_GLSL: return 1;
         case VIO_FEATURE_STORAGE_IMAGE:  return 1; /* RWTexture2D/3D UAV on storage textures */
         case VIO_FEATURE_MRT:            return 1; /* OMSetRenderTargets with up to 4 RTVs */
         default:                       return 0;
