@@ -687,10 +687,13 @@ static uint32_t *vio_flatten_io_blocks(const uint32_t *spv, size_t words, size_t
     size_t *def = (size_t *)calloc(bound, sizeof(size_t));
     unsigned char *block = (unsigned char *)calloc(bound, 1), *bi_struct = (unsigned char *)calloc(bound, 1);
     int32_t *loc = (int32_t *)malloc(bound * sizeof(int32_t));
+    /* variable decorations a member variable inherits: NoPerspective (13),
+     * Flat (14), Patch (15), Centroid (16), Sample (17) as bits 0..4 */
+    unsigned char *vflags = (unsigned char *)calloc(bound, 1);
     uint32_t mdec[256][4];   /* struct, member, decoration, value */
     int nmdec = 0, is_geometry = 0;
     uint32_t *res = NULL;
-    if (!def || !block || !bi_struct || !loc) goto done;
+    if (!def || !block || !bi_struct || !loc || !vflags) goto done;
     for (uint32_t i = 0; i < bound; i++) loc[i] = -1;
     for (size_t i = 5; i < words; ) {
         uint32_t op = spv[i] & 0xFFFF, wc = spv[i] >> 16;
@@ -699,9 +702,10 @@ static uint32_t *vio_flatten_io_blocks(const uint32_t *spv, size_t words, size_t
         else if (op == 71 && wc >= 3 && spv[i + 1] < bound) {
             if (spv[i + 2] == 2) block[spv[i + 1]] = 1;
             else if (spv[i + 2] == 30 && wc >= 4) loc[spv[i + 1]] = (int32_t)spv[i + 3];
+            else if (spv[i + 2] >= 13 && spv[i + 2] <= 17) vflags[spv[i + 1]] |= (unsigned char)(1u << (spv[i + 2] - 13));
         } else if (op == 72 && wc >= 4 && spv[i + 1] < bound) {
             if (spv[i + 3] == 11) bi_struct[spv[i + 1]] = 1;
-            else if (nmdec < 256 && (spv[i + 3] == 30 || spv[i + 3] == 14 || spv[i + 3] == 13)) {
+            else if (nmdec < 256 && (spv[i + 3] == 30 || (spv[i + 3] >= 13 && spv[i + 3] <= 17))) {   /* Location, NoPerspective, Flat, Patch, Centroid, Sample */
                 mdec[nmdec][0] = spv[i + 1]; mdec[nmdec][1] = spv[i + 2]; mdec[nmdec][2] = spv[i + 3];
                 mdec[nmdec][3] = wc >= 5 ? spv[i + 4] : 0;
                 nmdec++;
@@ -794,6 +798,16 @@ static uint32_t *vio_flatten_io_blocks(const uint32_t *spv, size_t words, size_t
                         uint32_t f[2] = { mvar[b][k], mdec[m][2] };
                         spv_inst(&out, 71, f, 2);
                     }
+                    /* the block variable's Patch / interpolation decorations */
+                    for (uint32_t bit = 0; bit < 5; bit++) {
+                        if (!(vflags[bvar[b]] & (1u << bit))) continue;
+                        int dup = 0;
+                        for (int m = 0; m < nmdec; m++)
+                            if (mdec[m][0] == bst[b] && mdec[m][1] == k && mdec[m][2] == 13 + bit) dup = 1;
+                        if (dup) continue;
+                        uint32_t f[2] = { mvar[b][k], 13 + bit };
+                        spv_inst(&out, 71, f, 2);
+                    }
                 }
             annotations_done = 1;
         }
@@ -854,7 +868,7 @@ static uint32_t *vio_flatten_io_blocks(const uint32_t *spv, size_t words, size_t
     *out_words = out.n;
     res = out.w;
 done:
-    free(def); free(block); free(bi_struct); free(loc);
+    free(def); free(block); free(bi_struct); free(loc); free(vflags);
     return res;
 }
 
