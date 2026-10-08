@@ -687,7 +687,9 @@ static void opengl_begin_frame(void)
                     glGetQueryObjectui64v(vio_gl.ts_query[slot][i], GL_QUERY_RESULT, &v);
                     ticks[i] = (uint64_t)v;
                 }
-                if (ticks[1] > ticks[0]) {
+                /* >=: a frame shorter than the timer resolution reads 0 ms; skipping
+                 * it kept the previous frame's sections (test 172, unmarked frames) */
+                if (ticks[1] >= ticks[0]) {
                     vio_gl.last_gpu_ms = (double)(ticks[1] - ticks[0]) / 1.0e6;
                     vio_gpu_mark_resolve(&vio_gl.ts_result, &vio_gl.ts_marks[slot], ticks, 1.0e-6);
                     vio_gl.ts_result_valid = 1;
