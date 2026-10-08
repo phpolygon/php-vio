@@ -289,6 +289,38 @@ static void d3d12_handle_device_removed(const char *context, HRESULT present_hr)
 /* Forward declarations */
 extern char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size,
                                 int shader_model, char **error_msg);
+
+/* SM69-PLAN Phase 4: on a device with opacity micromaps (DXR 1.2, SM 6.9)
+ * every inline ray query is declared with RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS -
+ * without it D3D12 ignores the micromaps and OMM geometry is plain non-opaque,
+ * so a query commits nothing there (test 220 D). SPIRV-Cross writes
+ * RayQuery<FLAGS>; Vulkan honours micromaps in queries without a flag. Takes
+ * and returns a malloc'd string. */
+static char *d3d12_hlsl_post(char *hlsl)
+{
+    if (!hlsl || vio_d3d12.raytracing_tier < 12 || vio_d3d12.shader_model != 6 || vio_d3d12.shader_model_version < 69
+        || !strstr(hlsl, "RayQuery<")) return hlsl;
+    static const char add[] = ", RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS";
+    size_t n = 0;
+    for (const char *p = hlsl; (p = strstr(p, "RayQuery<")) != NULL; p++) n++;
+    char *out = malloc(strlen(hlsl) + n * (sizeof(add) - 1) + 1);
+    if (!out) return hlsl;
+    char *o = out;
+    const char *p = hlsl;
+    for (;;) {
+        const char *q = strstr(p, "RayQuery<");
+        if (!q) { strcpy(o, p); break; }
+        q += 9;
+        memcpy(o, p, (size_t)(q - p)); o += q - p;
+        const char *e = strchr(q, '>');
+        if (!e) { strcpy(o, q); break; }
+        memcpy(o, q, (size_t)(e - q)); o += e - q;
+        if (!memchr(q, ',', (size_t)(e - q))) { memcpy(o, add, sizeof(add) - 1); o += sizeof(add) - 1; }
+        p = e;
+    }
+    free(hlsl);
+    return out;
+}
 extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
                                             size_t *out_size, char **error_msg);
 extern uint32_t *vio_compile_glsl_compute_to_spirv(const char *source,
@@ -2190,6 +2222,10 @@ typedef struct _vio_d3d12_as {
     ID3D12Resource  *tlas_scratch;
     ID3D12Resource  *instances;      /* upload buffer, instance_cap descriptors */
     int              instance_cap, instance_count;
+    /* Opacity micromaps (SM69-PLAN Phase 4): the OMM array a bottom level links
+     * (kept as long as the level), and which levels are non-opaque OMM geometry. */
+    ID3D12Resource **omm;
+    int             *blas_omm;
 } vio_d3d12_as;
 static vio_d3d12_as *d3d12_bound_as = NULL;
 
@@ -2235,8 +2271,13 @@ static void d3d12_as_free(vio_d3d12_as *as)
     if (as->tlas) ID3D12Resource_Release(as->tlas);
     if (as->tlas_scratch) ID3D12Resource_Release(as->tlas_scratch);
     if (as->instances) ID3D12Resource_Release(as->instances);
-    for (int i = 0; i < as->blas_count; i++) if (as->blas[i]) ID3D12Resource_Release(as->blas[i]);
+    for (int i = 0; i < as->blas_count; i++) {
+        if (as->blas[i]) ID3D12Resource_Release(as->blas[i]);
+        if (as->omm && as->omm[i]) ID3D12Resource_Release(as->omm[i]);
+    }
     free(as->blas);
+    free(as->omm);
+    free(as->blas_omm);
     free(as);
 }
 
@@ -2266,7 +2307,9 @@ static int d3d12_as_record_tlas(ID3D12Device5 *dev5, ID3D12GraphicsCommandList4 
         ids[i].InstanceID = (UINT)i;
         ids[i].InstanceMask = (UINT)(src->mask & 0xFF);
         ids[i].InstanceContributionToHitGroupIndex = (UINT)src->hit_group;
-        ids[i].Flags = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+        /* OMM geometry decides per micro-triangle; everything else stays opaque. */
+        ids[i].Flags = (as->blas_omm && as->blas_omm[src->geometry]) ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
+                                                                     : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
         ids[i].AccelerationStructure = ID3D12Resource_GetGPUVirtualAddress(as->blas[src->geometry]);
     }
     ID3D12Resource_Unmap(as->instances, 0, NULL);
@@ -2317,14 +2360,16 @@ static void *d3d12_create_acceleration_structure(const vio_as_desc *desc)
     ID3D12Device5 *dev5 = NULL;
     if (FAILED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device5, (void **)&dev5)) || !dev5) return NULL;
     vio_d3d12_as *as = calloc(1, sizeof(vio_d3d12_as));
-    ID3D12Resource **tmp = calloc((size_t)desc->geometry_count * 3 + 4, sizeof(ID3D12Resource *));
+    ID3D12Resource **tmp = calloc((size_t)desc->geometry_count * 7 + 4, sizeof(ID3D12Resource *));
     int tmp_count = 0;
     ID3D12CommandAllocator *alloc = NULL;
     ID3D12GraphicsCommandList *list = NULL;
     ID3D12GraphicsCommandList4 *list4 = NULL;
     if (!as || !tmp) goto fail;
     as->blas = calloc((size_t)desc->geometry_count, sizeof(ID3D12Resource *));
-    if (!as->blas) goto fail;
+    as->omm = calloc((size_t)desc->geometry_count, sizeof(ID3D12Resource *));
+    as->blas_omm = calloc((size_t)desc->geometry_count, sizeof(int));
+    if (!as->blas || !as->omm || !as->blas_omm) goto fail;
     if (FAILED(ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                    &IID_ID3D12CommandAllocator, (void **)&alloc))) goto fail;
     if (FAILED(ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
@@ -2340,6 +2385,8 @@ static void *d3d12_create_acceleration_structure(const vio_as_desc *desc)
         memset(&gd, 0, sizeof(gd));
         gd.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
         gd.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+        D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC omm_tri;
+        D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC omm_link;
         gd.Triangles.VertexBuffer.StartAddress = ID3D12Resource_GetGPUVirtualAddress(vb);
         gd.Triangles.VertexBuffer.StrideInBytes = 12;
         gd.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
@@ -2351,6 +2398,84 @@ static void *d3d12_create_acceleration_structure(const vio_as_desc *desc)
             gd.Triangles.IndexBuffer = ID3D12Resource_GetGPUVirtualAddress(ib);
             gd.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
             gd.Triangles.IndexCount = (UINT)geo->index_count;
+        }
+        if (geo->omm_format && geo->omm_data && geo->omm_count > 0) {
+            /* One OMM per triangle (index buffer 0..n-1), built into an OMM array
+             * first; the bottom level links it and becomes non-opaque. */
+            D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT fmt = geo->omm_format == 4 ? D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE
+                                                                                : D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_2_STATE;
+            size_t n = (size_t)geo->omm_count;
+            D3D12_RAYTRACING_OPACITY_MICROMAP_DESC *descs = calloc(n, sizeof(*descs));
+            uint32_t *ommi = calloc(n, sizeof(uint32_t));
+            if (!descs || !ommi) { free(descs); free(ommi); goto fail; }
+            for (size_t k = 0; k < n; k++) {
+                descs[k].ByteOffset = (UINT)(k * (size_t)geo->omm_bytes);
+                descs[k].SubdivisionLevel = (UINT)geo->omm_subdivision;
+                descs[k].Format = fmt;
+                ommi[k] = (uint32_t)k;
+            }
+            ID3D12Resource *odata = d3d12_as_upload(geo->omm_data, n * (size_t)geo->omm_bytes);
+            ID3D12Resource *odesc = d3d12_as_upload(descs, n * sizeof(*descs));
+            ID3D12Resource *oidx = d3d12_as_upload(ommi, n * sizeof(uint32_t));
+            free(descs); free(ommi);
+            if (odata) tmp[tmp_count++] = odata;
+            if (odesc) tmp[tmp_count++] = odesc;
+            if (oidx) tmp[tmp_count++] = oidx;
+            if (!odata || !odesc || !oidx) goto fail;
+            D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY hist;
+            hist.Count = (UINT)n;
+            hist.SubdivisionLevel = (UINT)geo->omm_subdivision;
+            hist.Format = fmt;
+            D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC oad;
+            memset(&oad, 0, sizeof(oad));
+            oad.NumOmmHistogramEntries = 1;
+            oad.pOmmHistogram = &hist;
+            oad.InputBuffer = ID3D12Resource_GetGPUVirtualAddress(odata);
+            oad.PerOmmDescs.StartAddress = ID3D12Resource_GetGPUVirtualAddress(odesc);
+            oad.PerOmmDescs.StrideInBytes = sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC);
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS oin;
+            memset(&oin, 0, sizeof(oin));
+            oin.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY;
+            oin.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+            oin.NumDescs = 1;
+            oin.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+            oin.pOpacityMicromapArrayDesc = &oad;
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO opre;
+            memset(&opre, 0, sizeof(opre));
+            ID3D12Device5_GetRaytracingAccelerationStructurePrebuildInfo(dev5, &oin, &opre);
+            ID3D12Resource *omm = d3d12_as_buffer(opre.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                  D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+            ID3D12Resource *oscratch = d3d12_as_buffer(opre.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (oscratch) tmp[tmp_count++] = oscratch;
+            if (!omm || !oscratch) { if (omm) ID3D12Resource_Release(omm); goto fail; }
+            as->omm[g] = omm;
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC obd;
+            memset(&obd, 0, sizeof(obd));
+            obd.Inputs = oin;
+            obd.DestAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(omm);
+            obd.ScratchAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(oscratch);
+            ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(list4, &obd, 0, NULL);
+            D3D12_RESOURCE_BARRIER ouav;
+            memset(&ouav, 0, sizeof(ouav));
+            ouav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            ouav.UAV.pResource = omm;   /* the bottom level reads the finished array */
+            ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &ouav);
+
+            omm_tri = gd.Triangles;
+            memset(&omm_link, 0, sizeof(omm_link));
+            omm_link.OpacityMicromapIndexBuffer.StartAddress = ID3D12Resource_GetGPUVirtualAddress(oidx);
+            omm_link.OpacityMicromapIndexBuffer.StrideInBytes = sizeof(uint32_t);
+            omm_link.OpacityMicromapIndexFormat = DXGI_FORMAT_R32_UINT;
+            omm_link.OpacityMicromapBaseLocation = 0;
+            omm_link.OpacityMicromapArray = ID3D12Resource_GetGPUVirtualAddress(omm);
+            memset(&gd, 0, sizeof(gd));
+            gd.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES;
+            gd.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+            gd.OmmTriangles.pTriangles = &omm_tri;
+            gd.OmmTriangles.pOmmLinkage = &omm_link;
+            as->blas_omm[g] = 1;
         }
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in;
         memset(&in, 0, sizeof(in));
@@ -6067,7 +6192,7 @@ static ID3DBlob *d3d12_compile_stage_blob(const void *data, size_t size, int sta
             }
             free_spirv = 1;
         }
-        allocated = vio_spirv_to_hlsl_ex(spirv, spirv_size, d3d12_hlsl_target(), fixup_depth, &err);
+        allocated = d3d12_hlsl_post(vio_spirv_to_hlsl_ex(spirv, spirv_size, d3d12_hlsl_target(), fixup_depth, &err));
         if (free_spirv) free(spirv);
         if (!allocated) {
             php_error_docref(NULL, E_WARNING, "D3D12: %s SPIR-V->HLSL failed: %s", label, err ? err : "unknown");
@@ -6110,15 +6235,15 @@ static void *d3d12_compile_mesh_shader(vio_shader_desc *desc, vio_d3d12_shader *
         php_error_docref(NULL, E_WARNING, "D3D12: mesh pipeline stages must reach the backend as SPIR-V");
         goto fail;
     }
-    ms = vio_spirv_to_hlsl_ex((const uint32_t *)desc->vertex_data, desc->vertex_size, d3d12_hlsl_target(), 0, &err);
+    ms = d3d12_hlsl_post(vio_spirv_to_hlsl_ex((const uint32_t *)desc->vertex_data, desc->vertex_size, d3d12_hlsl_target(), 0, &err));
     if (!ms) goto translate_fail;
     ms = vio_mesh_fix_positions(ms, 0, 1, "float4");
     what = "fragment";
-    ps = vio_spirv_to_hlsl((const uint32_t *)desc->fragment_data, desc->fragment_size, d3d12_hlsl_target(), &err);
+    ps = d3d12_hlsl_post(vio_spirv_to_hlsl((const uint32_t *)desc->fragment_data, desc->fragment_size, d3d12_hlsl_target(), &err));
     if (!ps) goto translate_fail;
     if (desc->task_data) {
         what = "task";
-        as = vio_spirv_to_hlsl_ex((const uint32_t *)desc->task_data, desc->task_size, d3d12_hlsl_target(), 0, &err);
+        as = d3d12_hlsl_post(vio_spirv_to_hlsl_ex((const uint32_t *)desc->task_data, desc->task_size, d3d12_hlsl_target(), 0, &err));
         if (!as) goto translate_fail;
     }
     if (getenv("VIO_DUMP_HLSL")) {
@@ -6206,7 +6331,7 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
         /* SPIR-V -> HLSL SM 5.1. The GL->D3D depth fixup goes on the LAST
          * stage that writes gl_Position (GS, else DS, else VS). */
         int vs_is_last = !desc->geometry_data && !desc->tess_eval_data;
-        allocated_vs = vio_spirv_to_hlsl_ex(vs_spirv, vs_spirv_size, d3d12_hlsl_target(), vs_is_last, &err);
+        allocated_vs = d3d12_hlsl_post(vio_spirv_to_hlsl_ex(vs_spirv, vs_spirv_size, d3d12_hlsl_target(), vs_is_last, &err));
         if (free_vs_spirv) free(vs_spirv);
         if (!allocated_vs) {
             php_error_docref(NULL, E_WARNING, "D3D12: VS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -6216,7 +6341,7 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
             return NULL;
         }
 
-        allocated_ps = vio_spirv_to_hlsl(ps_spirv, ps_spirv_size, d3d12_hlsl_target(), &err);
+        allocated_ps = d3d12_hlsl_post(vio_spirv_to_hlsl(ps_spirv, ps_spirv_size, d3d12_hlsl_target(), &err));
         if (free_ps_spirv) free(ps_spirv);
         if (!allocated_ps) {
             php_error_docref(NULL, E_WARNING, "D3D12: PS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -7358,6 +7483,7 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
      * long vectors and fails on them). */
     char *hlsl = desc->compute_hlsl ? strdup(desc->compute_hlsl)
                                     : vio_spirv_to_hlsl(spirv, spirv_size, d3d12_hlsl_target(), &err);
+    hlsl = d3d12_hlsl_post(hlsl);
     if (free_spirv) free(spirv);
     if (!hlsl) {
         php_error_docref(NULL, E_WARNING, "D3D12: CS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -8103,6 +8229,11 @@ static void *d3d12_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
     lrs.pLocalRootSignature = p->local_sig;
     D3D12_RAYTRACING_PIPELINE_CONFIG pc = {0};
     pc.MaxTraceRecursionDepth = (UINT)desc->max_recursion;
+    /* DXR 1.2: a pipeline that may trace OMM geometry says so (SM69-PLAN Phase 4). */
+    D3D12_RAYTRACING_PIPELINE_CONFIG1 pc1 = {0};
+    pc1.MaxTraceRecursionDepth = (UINT)desc->max_recursion;
+    pc1.Flags = D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS;
+    int use_pc1 = vio_d3d12.raytracing_tier >= 12;
     LPCWSTR assoc_exports[1 + 3 * VIO_RT_MAX_GROUPS];
     UINT assoc_n = 0;
     D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION assoc = {0};
@@ -8118,7 +8249,8 @@ static void *d3d12_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
     }
     sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG; sub[ns].pDesc = &sc; ns++;
     sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;  sub[ns].pDesc = &grs; ns++;
-    sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG; sub[ns].pDesc = &pc; ns++;
+    if (use_pc1) { sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1; sub[ns].pDesc = &pc1; ns++; }
+    else { sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG; sub[ns].pDesc = &pc; ns++; }
     if (p->local_sig) {
         UINT li = ns;
         sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE; sub[ns].pDesc = &lrs; ns++;
@@ -8810,6 +8942,8 @@ static int d3d12_supports_feature(vio_feature feature)
          * dx::HitObject / dx::MaybeReorderThread (the profile follows the device). */
         case VIO_FEATURE_SHADER_EXECUTION_REORDER: return vio_d3d12.raytracing_tier >= 12 && vio_d3d12.shader_model == 6
                                                           && vio_d3d12.shader_model_version >= 69;
+        /* DXR 1.2 OMM arrays + OMM_TRIANGLES geometry (needs the ray tracing pipeline). */
+        case VIO_FEATURE_OPACITY_MICROMAP: return vio_d3d12.raytracing_tier >= 12;
         case VIO_FEATURE_SHADING_RATE:        return vio_d3d12.vrs_tier > 0; /* RSSetShadingRate, VRS Tier 1+ (GAP-PHASE5 12) */
         /* SV_ShadingRate (SM 6.4) + the OVERRIDE combiner (Tier 2). */
         case VIO_FEATURE_MESH_SHADER:  return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 65 && vio_d3d12.mesh_tier > 0;

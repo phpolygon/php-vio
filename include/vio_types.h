@@ -671,6 +671,16 @@ typedef struct _vio_as_geometry {
     int             vertex_count;
     const uint32_t *indices;       /* index_count uint32 (NULL: non-indexed triangle list) */
     int             index_count;
+    /* Opacity micromap (VIO_FEATURE_OPACITY_MICROMAP, SM69-PLAN Phase 4): one OMM
+     * per triangle in the OC1 layout both APIs share - 4^subdivision micro-
+     * triangles, 1 (2-state) or 2 (4-state) bits each, LSB first - packed by vio,
+     * omm_bytes per OMM. The geometry is then non-opaque: transparent micro-
+     * triangles are skipped, unknown ones run the any-hit shader. */
+    int                  omm_format;       /* 0 = none, 2 = 2-state, 4 = 4-state */
+    int                  omm_subdivision;  /* 0..12 */
+    const unsigned char *omm_data;         /* omm_count * omm_bytes */
+    int                  omm_count;        /* = the geometry's triangle count */
+    int                  omm_bytes;
 } vio_as_geometry;
 
 typedef struct _vio_as_instance {
