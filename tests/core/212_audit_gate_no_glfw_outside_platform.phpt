@@ -15,11 +15,10 @@ if (!is_dir(__DIR__ . '/../../src/platform')) die('skip source tree not availabl
 function norm(string $p): string { return str_replace('\\', '/', $p); }
 
 $root = norm(realpath(__DIR__ . '/../..'));
+/* vio's own sources only: CI extracts third-party SDKs into the tree (deps/) */
+$scan = ["$root/php_vio.c", "$root/php_vio.h", "$root/include", "$root/src"];
 $exempt_dirs = [
     "$root/src/platform/glfw",
-    "$root/vendor",
-    "$root/.deps",
-    "$root/x64",
 ];
 
 function strip_comments(string $code): string {
@@ -28,10 +27,15 @@ function strip_comments(string $code): string {
 }
 
 $violations = [];
-$it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS));
-foreach ($it as $file) {
-    if (!$file->isFile()) continue;
-    $path = norm($file->getPathname());
+$files = [];
+foreach ($scan as $p) {
+    if (is_file($p)) { $files[] = $p; continue; }
+    if (!is_dir($p)) continue;
+    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($p, FilesystemIterator::SKIP_DOTS)) as $f) {
+        if ($f->isFile()) $files[] = norm($f->getPathname());
+    }
+}
+foreach ($files as $path) {
     if (!preg_match('/\.(c|m|h|cpp)$/', $path)) continue;
     foreach ($exempt_dirs as $d) if (str_starts_with($path, $d . '/')) continue 2;
     $code = strip_comments(file_get_contents($path));
