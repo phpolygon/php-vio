@@ -1,3 +1,10 @@
+## [2.31.1](https://github.com/phpolygon/php-vio/compare/v2.31.0...v2.31.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* **build:** static builds pick vio's own GLAD, recorder D3D11 include only with FFmpeg ([d1c536b](https://github.com/phpolygon/php-vio/commit/d1c536b1515d0865d5b26b99a9e84d94aa0047dc))
+
 # [2.31.0](https://github.com/phpolygon/php-vio/compare/v2.30.0...v2.31.0) (2026-10-08)
 
 
