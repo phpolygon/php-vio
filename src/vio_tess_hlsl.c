@@ -19,6 +19,14 @@
  *      that loads the output patch and runs the body for every invocation,
  *      plus a control point function that runs it for its own invocation.
  *
+ * Varyings are lists of fields (OPEN-ITEMS-PLAN A29): a plain varying is one
+ * field, an interface block or struct varying one field per member (its
+ * location), matrices take one location per column. gl_ClipDistance travels
+ * through gl_out / gl_in as packed SV_ClipDistance vectors when the stages
+ * use it. A control stage with barrier() runs every invocation once per
+ * barrier phase in each control point, so reads of other control points see
+ * their writes.
+ *
  * The control-point struct and the patch-constant struct are built from the
  * control stage's outputs and are identical in hull and domain shader, so
  * the two signatures always link, even when the evaluation stage reads only
@@ -98,16 +106,25 @@ static char *tess_error(char **error_msg, const char *fmt, ...)
 enum {
     SPV_EXEC_TESS_CONTROL = 1, SPV_EXEC_TESS_EVAL = 2,
     SPV_STORAGE_INPUT = 1, SPV_STORAGE_OUTPUT = 3, SPV_STORAGE_PRIVATE = 6,
-    SPV_BUILTIN_POSITION = 0, SPV_BUILTIN_PRIMITIVE_ID = 7, SPV_BUILTIN_INVOCATION_ID = 8,
+    SPV_BUILTIN_POSITION = 0, SPV_BUILTIN_CLIP_DISTANCE = 3, SPV_BUILTIN_PRIMITIVE_ID = 7, SPV_BUILTIN_INVOCATION_ID = 8,
     SPV_BUILTIN_TESS_LEVEL_OUTER = 11, SPV_BUILTIN_TESS_LEVEL_INNER = 12,
     SPV_BUILTIN_TESS_COORD = 13, SPV_BUILTIN_PATCH_VERTICES = 14
 };
 
 enum { TESS_DOMAIN_NONE = 0, TESS_DOMAIN_TRI, TESS_DOMAIN_QUAD, TESS_DOMAIN_ISO };
-enum { TV_USER = 0, TV_PERVERTEX, TV_BUILTIN };
+enum { TV_USER = 0, TV_PERVERTEX, TV_BUILTIN, TV_STRUCT };
 
 #define TESS_MAX_VARS 96
+#define TESS_MAX_FIELDS 160
 
+/* One location range of a user varying: the varying itself, or one member of
+ * an interface block / struct varying. */
+typedef struct {
+    int  location;
+    char type[24];            /* HLSL element type */
+    char dims[32];            /* array dimensions behind the name */
+    char access[16];          /* "" or ".vio_m<k>" (struct member) */
+} tess_field;
 typedef struct {
     uint32_t id, storage;
     int      kind;            /* TV_USER / TV_PERVERTEX / TV_BUILTIN */
@@ -119,6 +136,9 @@ typedef struct {
     char     type[24];        /* TV_USER: HLSL element type (per control point) */
     char     dims[32];        /* TV_USER: array dimensions behind the name, e.g. "[2]" */
     char     name[128];       /* final HLSL name of the static (after compile) */
+    int      first_field, field_count;   /* TV_USER / TV_STRUCT: its fields in tess_module.fields */
+    int      clip_member, clip_len;      /* TV_PERVERTEX: gl_ClipDistance member, -1 if none */
+    int      clip_used;                  /* TV_PERVERTEX: the stage accesses gl_ClipDistance */
 } tess_var;
 
 typedef struct {
@@ -131,16 +151,24 @@ typedef struct {
     unsigned char  *patch;        /* id -> Patch decoration */
     unsigned char  *pv;           /* struct id -> has a BuiltIn member */
     int32_t        *pv_pos;       /* struct id -> member index of BuiltIn Position, -1 */
+    int32_t        *pv_clip;      /* struct id -> member index of BuiltIn ClipDistance, -1 */
+    unsigned char  *spatch;       /* struct id -> a member carries Patch */
+    uint32_t       *mloc;         /* (struct, member, location) triples */
+    int             mloc_count, mloc_cap;
+    int             barriers;     /* OpControlBarrier count */
     uint32_t        model, ep;
     int             domain, spacing, order, point_mode;
     uint32_t        output_vertices;
     tess_var        vars[TESS_MAX_VARS];
     int             var_count;
+    tess_field      fields[TESS_MAX_FIELDS];
+    int             field_count;
 } tess_module;
 
 static void tess_module_free(tess_module *m)
 {
     free(m->def); free(m->builtin); free(m->location); free(m->patch); free(m->pv); free(m->pv_pos);
+    free(m->pv_clip); free(m->spatch); free(m->mloc);
     memset(m, 0, sizeof(*m));
 }
 
@@ -158,6 +186,16 @@ static int tess_scalar_vector(const tess_module *m, uint32_t id, char *out, size
     if (!t) return 0;
     uint32_t op = m->w[t] & 0xFFFF;
     uint32_t count = 1;
+    if (op == 24 /* OpTypeMatrix: floatCxR like SPIRV-Cross (columns x column size) */) {
+        uint32_t cols = m->w[t + 3];
+        size_t ct = m->w[t + 2] < m->bound ? m->def[m->w[t + 2]] : 0;
+        if (!ct || (m->w[ct] & 0xFFFF) != 23) return 0;
+        uint32_t rows = m->w[ct + 3];
+        size_t ft = m->w[ct + 2] < m->bound ? m->def[m->w[ct + 2]] : 0;
+        if (!ft || (m->w[ft] & 0xFFFF) != 22 || m->w[ft + 2] != 32) return 0;
+        snprintf(out, cap, "float%ux%u", cols, rows);
+        return 1;
+    }
     if (op == 23 /* OpTypeVector */) {
         count = m->w[t + 3];
         t = m->w[t + 2] < m->bound ? m->def[m->w[t + 2]] : 0;
@@ -217,6 +255,56 @@ static const char *tess_name_of(const tess_module *m, uint32_t id)
     return "?";
 }
 
+static int tess_is_converted(const tess_module *m, uint32_t id);
+
+static int tess_member_location(const tess_module *m, uint32_t st, uint32_t mem)
+{
+    for (int i = 0; i < m->mloc_count; i++)
+        if (m->mloc[3 * i] == st && m->mloc[3 * i + 1] == mem) return (int)m->mloc[3 * i + 2];
+    return -1;
+}
+
+/* Locations a type takes: one per column of a matrix, times every array length. */
+static int tess_type_locations(const tess_module *m, uint32_t t)
+{
+    size_t d = t < m->bound ? m->def[t] : 0;
+    if (!d) return 1;
+    uint32_t op = m->w[d] & 0xFFFF;
+    if (op == 28) return (int)tess_constant_u32(m, m->w[d + 3]) * tess_type_locations(m, m->w[d + 2]);
+    if (op == 24) return (int)m->w[d + 3];
+    return 1;
+}
+
+/* The fields of an interface block / struct varying: members in order, each at
+ * its Location decoration or right behind the previous member. */
+static int tess_struct_fields(tess_module *m, tess_var *v, char **error_msg)
+{
+    size_t d = m->def[v->pv_struct];
+    uint32_t members = (m->w[d] >> 16) - 2;
+    int loc = v->location;
+    v->first_field = m->field_count;
+    for (uint32_t k = 0; k < members; k++) {
+        uint32_t mt = m->w[d + 2 + k];
+        int ml = tess_member_location(m, v->pv_struct, k);
+        if (ml >= 0) loc = ml;
+        if (loc < 0) { tess_error(error_msg, "'%s': tessellation varyings need a location", tess_name_of(m, v->id)); return 0; }
+        if (m->field_count >= TESS_MAX_FIELDS) { tess_error(error_msg, "too many tessellation varyings"); return 0; }
+        tess_field *f = &m->fields[m->field_count];
+        uint32_t nested = 0;
+        if (!tess_var_type(m, mt, 0, f->type, sizeof(f->type), f->dims, sizeof(f->dims), &nested) || nested) {
+            tess_error(error_msg, "'%s': member %u: unsupported varying type (scalars, vectors, matrices and arrays of them)",
+                       tess_name_of(m, v->id), k);
+            return 0;
+        }
+        f->location = loc;
+        snprintf(f->access, sizeof(f->access), ".vio_m%u", k);
+        m->field_count++;
+        loc += tess_type_locations(m, mt);
+    }
+    v->field_count = m->field_count - v->first_field;
+    return 1;
+}
+
 static int tess_parse(tess_module *m, const uint32_t *w, size_t n, char **error_msg)
 {
     memset(m, 0, sizeof(*m));
@@ -230,12 +318,14 @@ static int tess_parse(tess_module *m, const uint32_t *w, size_t n, char **error_
     m->patch = (unsigned char *)calloc(m->bound, 1);
     m->pv = (unsigned char *)calloc(m->bound, 1);
     m->pv_pos = (int32_t *)malloc(m->bound * sizeof(int32_t));
-    if (!m->def || !m->builtin || !m->location || !m->patch || !m->pv || !m->pv_pos) {
+    m->pv_clip = (int32_t *)malloc(m->bound * sizeof(int32_t));
+    m->spatch = (unsigned char *)calloc(m->bound, 1);
+    if (!m->def || !m->builtin || !m->location || !m->patch || !m->pv || !m->pv_pos || !m->pv_clip || !m->spatch) {
         tess_module_free(m);
         tess_error(error_msg, "out of memory");
         return 0;
     }
-    for (uint32_t i = 0; i < m->bound; i++) { m->builtin[i] = -1; m->location[i] = -1; m->pv_pos[i] = -1; }
+    for (uint32_t i = 0; i < m->bound; i++) { m->builtin[i] = -1; m->location[i] = -1; m->pv_pos[i] = -1; m->pv_clip[i] = -1; }
 
     for (size_t i = 5; i < n; ) {
         uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
@@ -270,10 +360,31 @@ static int tess_parse(tess_module *m, const uint32_t *w, size_t n, char **error_
                 }
                 break;
             case 72: /* OpMemberDecorate struct member decoration literals... */
-                if (wc >= 5 && w[i + 1] < m->bound && w[i + 3] == 11) {
-                    m->pv[w[i + 1]] = 1;
-                    if (w[i + 4] == SPV_BUILTIN_POSITION) m->pv_pos[w[i + 1]] = (int32_t)w[i + 2];
+                if (wc >= 4 && w[i + 1] < m->bound) {
+                    uint32_t st = w[i + 1], mem = w[i + 2], dec = w[i + 3];
+                    if (dec == 11 && wc >= 5) {
+                        m->pv[st] = 1;
+                        if (w[i + 4] == SPV_BUILTIN_POSITION) m->pv_pos[st] = (int32_t)mem;
+                        else if (w[i + 4] == SPV_BUILTIN_CLIP_DISTANCE) m->pv_clip[st] = (int32_t)mem;
+                    } else if (dec == 15) {
+                        m->spatch[st] = 1;
+                    } else if (dec == 30 && wc >= 5) {
+                        if (m->mloc_count == m->mloc_cap) {
+                            int cap = m->mloc_cap ? m->mloc_cap * 2 : 32;
+                            uint32_t *g = (uint32_t *)realloc(m->mloc, (size_t)cap * 3 * sizeof(uint32_t));
+                            if (!g) { tess_module_free(m); tess_error(error_msg, "out of memory"); return 0; }
+                            m->mloc = g;
+                            m->mloc_cap = cap;
+                        }
+                        m->mloc[3 * m->mloc_count] = st;
+                        m->mloc[3 * m->mloc_count + 1] = mem;
+                        m->mloc[3 * m->mloc_count + 2] = w[i + 4];
+                        m->mloc_count++;
+                    }
                 }
+                break;
+            case 224: /* OpControlBarrier */
+                m->barriers++;
                 break;
             case 19: case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27:
             case 28: case 29: case 30: case 32: /* types: result id is operand 1 */
@@ -326,22 +437,45 @@ static int tess_parse(tess_module *m, const uint32_t *w, size_t n, char **error_
             continue;
         }
 
+        /* A patch block may carry Patch on its members instead of the variable. */
+        {
+            size_t pd = pointee < m->bound ? m->def[pointee] : 0;
+            if (pd && (w[pd] & 0xFFFF) == 30 && m->spatch[pointee]) v->patch = 1;
+        }
         int per_cp = !v->patch;
         uint32_t st = 0;
+        v->clip_member = -1;
         if (!tess_var_type(m, pointee, per_cp, v->type, sizeof(v->type), v->dims, sizeof(v->dims), &st)) {
-            tess_error(error_msg, "'%s': unsupported varying type (scalars, vectors and arrays of them)", tess_name_of(m, v->id));
+            tess_error(error_msg, "'%s': unsupported varying type (scalars, vectors, matrices and arrays of them)", tess_name_of(m, v->id));
             tess_module_free(m);
             return 0;
         }
-        if (st) {
-            if (!m->pv[st] || v->patch) {
-                tess_error(error_msg, "'%s': interface blocks and struct varyings are not supported between tessellation stages", tess_name_of(m, v->id));
+        if (st && m->pv[st]) {
+            if (v->patch) {
+                tess_error(error_msg, "'%s': gl_PerVertex cannot be a patch varying", tess_name_of(m, v->id));
                 tess_module_free(m);
                 return 0;
             }
             v->kind = TV_PERVERTEX;
             v->pv_struct = st;
             v->pv_pos = m->pv_pos[st];
+            v->clip_member = m->pv_clip[st];
+            if (v->clip_member >= 0) {
+                size_t sd = m->def[st];
+                uint32_t ct = m->w[sd + 2 + v->clip_member];
+                size_t ad = ct < m->bound ? m->def[ct] : 0;
+                v->clip_len = ad && (m->w[ad] & 0xFFFF) == 28 ? (int)tess_constant_u32(m, m->w[ad + 3]) : 1;
+            }
+        } else if (st) {
+            /* Interface block or struct varying: one field per member. */
+            if (v->dims[0]) {
+                tess_error(error_msg, "'%s': arrays of blocks / structs are not supported between tessellation stages", tess_name_of(m, v->id));
+                tess_module_free(m);
+                return 0;
+            }
+            v->kind = TV_STRUCT;
+            v->pv_struct = st;
+            if (!tess_struct_fields(m, v, error_msg)) { tess_module_free(m); return 0; }
         } else {
             v->kind = TV_USER;
             if (v->location < 0) {
@@ -349,8 +483,47 @@ static int tess_parse(tess_module *m, const uint32_t *w, size_t n, char **error_
                 tess_module_free(m);
                 return 0;
             }
+            if (m->field_count >= TESS_MAX_FIELDS) {
+                tess_error(error_msg, "too many tessellation varyings");
+                tess_module_free(m);
+                return 0;
+            }
+            tess_field *f = &m->fields[m->field_count];
+            f->location = v->location;
+            snprintf(f->type, sizeof(f->type), "%s", v->type);
+            snprintf(f->dims, sizeof(f->dims), "%s", v->dims);
+            f->access[0] = '\0';
+            v->first_field = m->field_count++;
+            v->field_count = 1;
         }
         m->var_count++;
+    }
+
+    /* Which gl_PerVertex variables touch gl_ClipDistance (access chains through it). */
+    for (size_t i = 5; i < n; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if ((op != 65 && op != 66) || wc < 6) continue;   /* OpAccessChain / OpInBoundsAccessChain base cp member */
+        for (int k = 0; k < m->var_count; k++) {
+            tess_var *v = &m->vars[k];
+            if (v->kind != TV_PERVERTEX || v->id != w[i + 3] || v->clip_member < 0) continue;
+            if (tess_constant_u32(m, w[i + 5]) == (uint32_t)v->clip_member) v->clip_used = 1;
+        }
+    }
+
+    /* A struct type that became Private must not also type a real output (its
+     * member decorations are dropped). */
+    for (size_t i = 5; i < n; i += w[i] >> 16) {
+        if ((w[i] & 0xFFFF) != 59 || (w[i] >> 16) < 4 || w[i + 3] != SPV_STORAGE_OUTPUT || tess_is_converted(m, w[i + 2])) continue;
+        size_t pt = w[i + 1] < m->bound ? m->def[w[i + 1]] : 0;
+        uint32_t t = pt ? w[pt + 3] : 0;
+        for (size_t d = t < m->bound ? m->def[t] : 0; d && (w[d] & 0xFFFF) == 28; d = t < m->bound ? m->def[t] : 0) t = w[d + 2];
+        for (int k = 0; k < m->var_count; k++) {
+            if (m->vars[k].kind == TV_STRUCT && m->vars[k].pv_struct == t) {
+                tess_error(error_msg, "'%s': the evaluation stage's struct type is used for an input and an output", tess_name_of(m, m->vars[k].id));
+                tess_module_free(m);
+                return 0;
+            }
+        }
     }
     return 1;
 }
@@ -375,7 +548,9 @@ static int tess_is_converted(const tess_module *m, uint32_t id)
 
 static int tess_is_converted_struct(const tess_module *m, uint32_t id)
 {
-    for (int i = 0; i < m->var_count; i++) if (m->vars[i].kind == TV_PERVERTEX && m->vars[i].pv_struct == id) return 1;
+    for (int i = 0; i < m->var_count; i++)
+        if ((m->vars[i].kind == TV_PERVERTEX || m->vars[i].kind == TV_STRUCT) && m->vars[i].pv_struct == id)
+            return m->vars[i].kind;
     return 0;
 }
 
@@ -415,12 +590,16 @@ static uint32_t *tess_rewrite(const tess_module *m, size_t *out_n)
                  * became Private gets its own name in the module itself
                  * (spvc_compiler_set_name comes after parsing). */
                 if (wc >= 2 && tess_is_converted_struct(m, w[i + 1])) {
-                    static const char name[] = "vio_PerVertex";   /* 13 chars + NUL = 4 words */
-                    out[o++] = (6u << 16) | 5u;
+                    char name[24];
+                    if (tess_is_converted_struct(m, w[i + 1]) == TV_PERVERTEX) snprintf(name, sizeof(name), "vio_PerVertex");
+                    else snprintf(name, sizeof(name), "vio_S%u", w[i + 1]);
+                    size_t len = strlen(name) + 1;
+                    uint32_t words = (uint32_t)((len + 3) / 4);
+                    out[o++] = ((2u + words) << 16) | 5u;
                     out[o++] = w[i + 1];
-                    uint32_t packed[4] = { 0, 0, 0, 0 };
-                    memcpy(packed, name, sizeof(name));
-                    for (int k = 0; k < 4; k++) out[o++] = packed[k];
+                    uint32_t packed[6] = { 0, 0, 0, 0, 0, 0 };
+                    memcpy(packed, name, len);
+                    for (uint32_t k = 0; k < words; k++) out[o++] = packed[k];
                     drop = 1;
                 }
                 break;
@@ -471,6 +650,14 @@ static void tess_configure(spvc_compiler c, spvc_compiler_options options, void 
     for (int i = 0; i < t->self->var_count; i++) {
         tess_var *v = &t->self->vars[i];
         if (v->kind == TV_BUILTIN) spvc_compiler_set_name(c, v->id, tess_builtin_name(v->builtin));
+        else if (v->kind == TV_STRUCT) {
+            uint32_t members = (t->self->w[t->self->def[v->pv_struct]] >> 16) - 2;
+            for (uint32_t k = 0; k < members; k++) {
+                char nm[16];
+                snprintf(nm, sizeof(nm), "vio_m%u", k);
+                spvc_compiler_set_member_name(c, v->pv_struct, k, nm);
+            }
+        }
         else if (v->kind == TV_PERVERTEX) {
             spvc_compiler_set_name(c, v->id, v->storage == SPV_STORAGE_INPUT ? "vio_gl_in" : "vio_gl_out");
             spvc_compiler_set_name(c, v->pv_struct, v->storage == SPV_STORAGE_INPUT ? "vio_PerVertexIn" : "vio_PerVertexOut");
@@ -489,57 +676,95 @@ static void tess_configure(spvc_compiler c, spvc_compiler_options options, void 
 
 static int tess_outer_count(int domain) { return domain == TESS_DOMAIN_QUAD ? 4 : domain == TESS_DOMAIN_ISO ? 2 : 3; }
 
-/* Sorted (by location) indices of a module's user varyings with the given storage / patch flag. */
-static int tess_sorted_user(const tess_module *m, uint32_t storage, int patch, int *idx)
+/* The fields of a module's user varyings (plain ones and struct / block
+ * members) with the given storage / patch flag, sorted by location. */
+typedef struct { const tess_var *v; const tess_field *f; } tess_fref;
+
+static int tess_sorted_fields(const tess_module *m, uint32_t storage, int patch, tess_fref *out)
 {
     int n = 0;
     for (int i = 0; i < m->var_count; i++) {
         const tess_var *v = &m->vars[i];
-        if (v->kind != TV_USER || v->storage != storage || v->patch != patch) continue;
-        int k = n++;
-        while (k > 0 && m->vars[idx[k - 1]].location > v->location) { idx[k] = idx[k - 1]; k--; }
-        idx[k] = i;
+        if ((v->kind != TV_USER && v->kind != TV_STRUCT) || v->storage != storage || v->patch != patch) continue;
+        for (int j = 0; j < v->field_count && n < TESS_MAX_FIELDS; j++) {
+            const tess_field *f = &m->fields[v->first_field + j];
+            int k = n++;
+            while (k > 0 && out[k - 1].f->location > f->location) { out[k] = out[k - 1]; k--; }
+            out[k].v = v;
+            out[k].f = f;
+        }
     }
     return n;
+}
+
+static const tess_field *tess_find_field(const tess_module *m, uint32_t storage, int location, int patch)
+{
+    tess_fref fr[TESS_MAX_FIELDS];
+    int n = tess_sorted_fields(m, storage, patch, fr);
+    for (int i = 0; i < n; i++) if (fr[i].f->location == location) return fr[i].f;
+    return NULL;
+}
+
+/* gl_ClipDistance as SPIRV-Cross packs it: float / float2..4 vectors, index c / 4. */
+static void tess_emit_clip_fields(tess_sb *b, int len, const char *semantic)
+{
+    for (int c = 0; c < len; c += 4) {
+        int k = len - c > 4 ? 4 : len - c;
+        if (k == 1) sb_printf(b, "    float vio_clip%d : %s%d;\n", c / 4, semantic, c / 4);
+        else sb_printf(b, "    float%d vio_clip%d : %s%d;\n", k, c / 4, semantic, c / 4);
+    }
+}
+
+static void tess_clip_ref(char *out, size_t cap, int len, int c)
+{
+    int width = len - (c / 4) * 4;
+    if (width > 4) width = 4;
+    if (width == 1) snprintf(out, cap, "vio_clip%d", c / 4);
+    else snprintf(out, cap, "vio_clip%d.%c", c / 4, "xyzw"[c % 4]);
+}
+
+/* The control stage's gl_out, when it carries gl_ClipDistance to the evaluation stage. */
+static const tess_var *tess_clip_out(const tess_module *c)
+{
+    const tess_var *pv = tess_find(c, SPV_STORAGE_OUTPUT, TV_PERVERTEX, 0, 0);
+    return pv && pv->clip_used ? pv : NULL;
 }
 
 /* The shared control-point and patch-constant structs (from the control
  * stage's outputs), and in a hull shader also its input struct. */
 static void tess_emit_structs(tess_sb *b, const tess_ctx *t)
 {
-    int idx[TESS_MAX_VARS], n;
+    tess_fref fr[TESS_MAX_FIELDS];
+    int n;
     const tess_module *c = t->tcs;
     int domain = t->tes->domain;
 
     if (t->stage == VIO_STAGE_TESS_CONTROL) {
         sb_cat(b, "struct VIO_HS_Input\n{\n");
-        n = tess_sorted_user(c, SPV_STORAGE_INPUT, 0, idx);
-        for (int i = 0; i < n; i++) {
-            const tess_var *v = &c->vars[idx[i]];
-            sb_printf(b, "    %s vio_l%d%s : TEXCOORD%d;\n", v->type, v->location, v->dims, v->location);
-        }
-        if (tess_find(c, SPV_STORAGE_INPUT, TV_PERVERTEX, 0, 0)) sb_cat(b, "    float4 vio_pos : SV_Position;\n");
+        n = tess_sorted_fields(c, SPV_STORAGE_INPUT, 0, fr);
+        for (int i = 0; i < n; i++)
+            sb_printf(b, "    %s vio_l%d%s : TEXCOORD%d;\n", fr[i].f->type, fr[i].f->location, fr[i].f->dims, fr[i].f->location);
+        const tess_var *pv = tess_find(c, SPV_STORAGE_INPUT, TV_PERVERTEX, 0, 0);
+        if (pv) sb_cat(b, "    float4 vio_pos : SV_Position;\n");
+        if (pv && pv->clip_used) tess_emit_clip_fields(b, pv->clip_len, "SV_ClipDistance");
         sb_cat(b, "};\n\n");
     }
 
     sb_cat(b, "struct VIO_ControlPoint\n{\n");
-    n = tess_sorted_user(c, SPV_STORAGE_OUTPUT, 0, idx);
-    for (int i = 0; i < n; i++) {
-        const tess_var *v = &c->vars[idx[i]];
-        sb_printf(b, "    %s vio_l%d%s : TEXCOORD%d;\n", v->type, v->location, v->dims, v->location);
-    }
+    n = tess_sorted_fields(c, SPV_STORAGE_OUTPUT, 0, fr);
+    for (int i = 0; i < n; i++)
+        sb_printf(b, "    %s vio_l%d%s : TEXCOORD%d;\n", fr[i].f->type, fr[i].f->location, fr[i].f->dims, fr[i].f->location);
     if (tess_find(c, SPV_STORAGE_OUTPUT, TV_PERVERTEX, 0, 0)) sb_cat(b, "    float4 vio_pos : SV_Position;\n");
+    if (tess_clip_out(c)) tess_emit_clip_fields(b, tess_clip_out(c)->clip_len, "VIO_CLIP");
     sb_cat(b, "};\n\n");
 
     sb_cat(b, "struct VIO_PatchConstant\n{\n");
     sb_printf(b, "    float vio_outer[%d] : SV_TessFactor;\n", tess_outer_count(domain));
     if (domain == TESS_DOMAIN_QUAD) sb_cat(b, "    float vio_inner[2] : SV_InsideTessFactor;\n");
     else if (domain == TESS_DOMAIN_TRI) sb_cat(b, "    float vio_inner : SV_InsideTessFactor;\n");
-    n = tess_sorted_user(c, SPV_STORAGE_OUTPUT, 1, idx);
-    for (int i = 0; i < n; i++) {
-        const tess_var *v = &c->vars[idx[i]];
-        sb_printf(b, "    %s vio_p%d%s : PATCH%d;\n", v->type, v->location, v->dims, v->location);
-    }
+    n = tess_sorted_fields(c, SPV_STORAGE_OUTPUT, 1, fr);
+    for (int i = 0; i < n; i++)
+        sb_printf(b, "    %s vio_p%d%s : PATCH%d;\n", fr[i].f->type, fr[i].f->location, fr[i].f->dims, fr[i].f->location);
     sb_cat(b, "};\n\n");
 }
 
@@ -547,7 +772,7 @@ static int tess_has_control_point_outputs(const tess_module *c)
 {
     for (int i = 0; i < c->var_count; i++) {
         const tess_var *v = &c->vars[i];
-        if (v->storage == SPV_STORAGE_OUTPUT && !v->patch && (v->kind == TV_USER || v->kind == TV_PERVERTEX)) return 1;
+        if (v->storage == SPV_STORAGE_OUTPUT && !v->patch && (v->kind == TV_USER || v->kind == TV_STRUCT || v->kind == TV_PERVERTEX)) return 1;
     }
     return 0;
 }
@@ -561,16 +786,22 @@ static void tess_hs_input_copies(tess_sb *b, const tess_ctx *t)
         sb_printf(b, "    %s = int(vio_prim);\n", v->name);
     if ((v = tess_find(c, SPV_STORAGE_INPUT, TV_BUILTIN, SPV_BUILTIN_PATCH_VERTICES, 0)))
         sb_printf(b, "    %s = %u;\n", v->name, t->input_points);
-    int any = 0;
-    for (int i = 0; i < c->var_count; i++) {
-        v = &c->vars[i];
-        if (v->storage != SPV_STORAGE_INPUT || v->kind == TV_BUILTIN) continue;
-        if (v->kind == TV_PERVERTEX && v->pv_pos < 0) continue;
-        if (!any) { sb_printf(b, "    for (int i = 0; i < %u; i++)\n    {\n", t->input_points); any = 1; }
-        if (v->kind == TV_USER) sb_printf(b, "        %s[i] = stage_input[i].vio_l%d;\n", v->name, v->location);
-        else sb_printf(b, "        %s[i].vio_Position = stage_input[i].vio_pos;\n", v->name);
+    tess_fref fr[TESS_MAX_FIELDS];
+    int n = tess_sorted_fields(c, SPV_STORAGE_INPUT, 0, fr);
+    const tess_var *pv = tess_find(c, SPV_STORAGE_INPUT, TV_PERVERTEX, 0, 0);
+    if (!n && !(pv && (pv->pv_pos >= 0 || pv->clip_used))) return;
+    sb_printf(b, "    for (int i = 0; i < %u; i++)\n    {\n", t->input_points);
+    for (int i = 0; i < n; i++)
+        sb_printf(b, "        %s[i]%s = stage_input[i].vio_l%d;\n", fr[i].v->name, fr[i].f->access, fr[i].f->location);
+    if (pv && pv->pv_pos >= 0) sb_printf(b, "        %s[i].vio_Position = stage_input[i].vio_pos;\n", pv->name);
+    if (pv && pv->clip_used) {
+        for (int k = 0; k < pv->clip_len; k++) {
+            char ref[24];
+            tess_clip_ref(ref, sizeof(ref), pv->clip_len, k);
+            sb_printf(b, "        %s[i].vio_m%d[%d] = stage_input[i].%s;\n", pv->name, pv->clip_member, k, ref);
+        }
     }
-    if (any) sb_cat(b, "    }\n");
+    sb_cat(b, "    }\n");
 }
 
 static char *tess_finish_hull(spvc_compiler compiler, char *hlsl, char **error_msg, tess_ctx *t)
@@ -611,11 +842,18 @@ static char *tess_finish_hull(spvc_compiler compiler, char *hlsl, char **error_m
     tess_hs_input_copies(&b, t);
     if (cp_outputs) {
         sb_printf(&b, "    for (int j = 0; j < %u; j++)\n    {\n", t->output_points);
-        for (int i = 0; i < c->var_count; i++) {
-            const tess_var *v = &c->vars[i];
-            if (v->storage != SPV_STORAGE_OUTPUT || v->patch) continue;
-            if (v->kind == TV_USER) sb_printf(&b, "        %s[j] = stage_output[j].vio_l%d;\n", v->name, v->location);
-            else if (v->kind == TV_PERVERTEX && v->pv_pos >= 0) sb_printf(&b, "        %s[j].vio_Position = stage_output[j].vio_pos;\n", v->name);
+        tess_fref fr[TESS_MAX_FIELDS];
+        int nf = tess_sorted_fields(c, SPV_STORAGE_OUTPUT, 0, fr);
+        for (int i = 0; i < nf; i++)
+            sb_printf(&b, "        %s[j]%s = stage_output[j].vio_l%d;\n", fr[i].v->name, fr[i].f->access, fr[i].f->location);
+        const tess_var *pvo = tess_find(c, SPV_STORAGE_OUTPUT, TV_PERVERTEX, 0, 0);
+        if (pvo && pvo->pv_pos >= 0) sb_printf(&b, "        %s[j].vio_Position = stage_output[j].vio_pos;\n", pvo->name);
+        if (pvo && pvo->clip_used) {
+            for (int k = 0; k < pvo->clip_len; k++) {
+                char ref[24];
+                tess_clip_ref(ref, sizeof(ref), pvo->clip_len, k);
+                sb_printf(&b, "        %s[j].vio_m%d[%d] = stage_output[j].%s;\n", pvo->name, pvo->clip_member, k, ref);
+            }
         }
         sb_cat(&b, "    }\n");
     }
@@ -636,10 +874,11 @@ static char *tess_finish_hull(spvc_compiler compiler, char *hlsl, char **error_m
         if (inner) sb_printf(&b, "    patch_output.vio_inner = %s[0];\n", inner->name);
         else sb_cat(&b, "    patch_output.vio_inner = 0.0f;\n");
     }
-    for (int i = 0; i < c->var_count; i++) {
-        const tess_var *v = &c->vars[i];
-        if (v->kind == TV_USER && v->storage == SPV_STORAGE_OUTPUT && v->patch)
-            sb_printf(&b, "    patch_output.vio_p%d = %s;\n", v->location, v->name);
+    {
+        tess_fref fr[TESS_MAX_FIELDS];
+        int nf = tess_sorted_fields(c, SPV_STORAGE_OUTPUT, 1, fr);
+        for (int i = 0; i < nf; i++)
+            sb_printf(&b, "    patch_output.vio_p%d = %s%s;\n", fr[i].f->location, fr[i].v->name, fr[i].f->access);
     }
     sb_cat(&b, "    return patch_output;\n}\n\n");
 
@@ -652,15 +891,32 @@ static char *tess_finish_hull(spvc_compiler compiler, char *hlsl, char **error_m
     if (prim) sb_cat(&b, ", uint vio_prim : SV_PrimitiveID");
     sb_cat(&b, ")\n{\n");
     tess_hs_input_copies(&b, t);
-    if (inv) sb_printf(&b, "    %s = int(vio_cp);\n", inv->name);
-    sb_cat(&b, "    vert_main();\n");
+    if (c->barriers > 0) {
+        /* barrier(): a control point may read what other invocations wrote
+         * before it. Run every invocation once per barrier phase - the last
+         * pass sees all writes of the one before - then keep this one's. */
+        sb_printf(&b, "    for (int vio_pass = 0; vio_pass <= %d; vio_pass++)\n", c->barriers);
+        sb_printf(&b, "        for (int vio_invocation = 0; vio_invocation < %u; vio_invocation++)\n        {\n", t->output_points);
+        if (inv) sb_printf(&b, "            %s = vio_invocation;\n", inv->name);
+        sb_cat(&b, "            vert_main();\n        }\n");
+    } else {
+        if (inv) sb_printf(&b, "    %s = int(vio_cp);\n", inv->name);
+        sb_cat(&b, "    vert_main();\n");
+    }
     if (cp_outputs) {
         sb_cat(&b, "    VIO_ControlPoint stage_output;\n");
-        for (int i = 0; i < c->var_count; i++) {
-            const tess_var *v = &c->vars[i];
-            if (v->storage != SPV_STORAGE_OUTPUT || v->patch) continue;
-            if (v->kind == TV_USER) sb_printf(&b, "    stage_output.vio_l%d = %s[vio_cp];\n", v->location, v->name);
-            else if (v->kind == TV_PERVERTEX && v->pv_pos >= 0) sb_printf(&b, "    stage_output.vio_pos = %s[vio_cp].vio_Position;\n", v->name);
+        tess_fref fr[TESS_MAX_FIELDS];
+        int nf = tess_sorted_fields(c, SPV_STORAGE_OUTPUT, 0, fr);
+        for (int i = 0; i < nf; i++)
+            sb_printf(&b, "    stage_output.vio_l%d = %s[vio_cp]%s;\n", fr[i].f->location, fr[i].v->name, fr[i].f->access);
+        const tess_var *pvo = tess_find(c, SPV_STORAGE_OUTPUT, TV_PERVERTEX, 0, 0);
+        if (pvo && pvo->pv_pos >= 0) sb_printf(&b, "    stage_output.vio_pos = %s[vio_cp].vio_Position;\n", pvo->name);
+        if (pvo && pvo->clip_used) {
+            for (int k = 0; k < pvo->clip_len; k++) {
+                char ref[24];
+                tess_clip_ref(ref, sizeof(ref), pvo->clip_len, k);
+                sb_printf(&b, "    stage_output.%s = %s[vio_cp].vio_m%d[%d];\n", ref, pvo->name, pvo->clip_member, k);
+            }
         }
         sb_cat(&b, "    return stage_output;\n");
     }
@@ -686,22 +942,27 @@ static char *tess_finish_domain(spvc_compiler compiler, char *hlsl, char **error
     /* Everything the evaluation stage reads must come from the control stage. */
     for (int i = 0; i < e->var_count; i++) {
         const tess_var *v = &e->vars[i];
-        if (v->kind == TV_USER && !tess_find(c, SPV_STORAGE_OUTPUT, TV_USER, v->location, v->patch)) {
-            free(hlsl);
-            return tess_error(error_msg, "the evaluation stage reads %s location %d, which the control stage does not write",
-                              v->patch ? "patch" : "per-vertex", v->location);
-        }
-        if (v->kind == TV_USER) {
-            const tess_var *src = tess_find(c, SPV_STORAGE_OUTPUT, TV_USER, v->location, v->patch);
-            if (strcmp(src->type, v->type) != 0 || strcmp(src->dims, v->dims) != 0) {
+        for (int j = 0; (v->kind == TV_USER || v->kind == TV_STRUCT) && j < v->field_count; j++) {
+            const tess_field *f = &e->fields[v->first_field + j];
+            const tess_field *src = tess_find_field(c, SPV_STORAGE_OUTPUT, f->location, v->patch);
+            if (!src) {
+                free(hlsl);
+                return tess_error(error_msg, "the evaluation stage reads %s location %d, which the control stage does not write",
+                                  v->patch ? "patch" : "per-vertex", f->location);
+            }
+            if (strcmp(src->type, f->type) != 0 || strcmp(src->dims, f->dims) != 0) {
                 free(hlsl);
                 return tess_error(error_msg, "location %d is %s%s in the control stage but %s%s in the evaluation stage",
-                                  v->location, src->type, src->dims, v->type, v->dims);
+                                  f->location, src->type, src->dims, f->type, f->dims);
             }
         }
         if (v->kind == TV_PERVERTEX && v->pv_pos >= 0 && !tess_find(c, SPV_STORAGE_OUTPUT, TV_PERVERTEX, 0, 0)) {
             free(hlsl);
             return tess_error(error_msg, "the evaluation stage reads gl_in[].gl_Position, which the control stage does not write");
+        }
+        if (v->kind == TV_PERVERTEX && v->clip_used && (!tess_clip_out(c) || tess_clip_out(c)->clip_len < v->clip_len)) {
+            free(hlsl);
+            return tess_error(error_msg, "the evaluation stage reads gl_in[].gl_ClipDistance, which the control stage does not write");
         }
     }
 
@@ -741,19 +1002,29 @@ static char *tess_finish_domain(spvc_compiler compiler, char *hlsl, char **error
             sb_printf(&b, "    %s[1] = patch_input.vio_inner[1];\n", inner->name);
         } else if (e->domain == TESS_DOMAIN_TRI) sb_printf(&b, "    %s[0] = patch_input.vio_inner;\n", inner->name);
     }
-    int any = 0;
-    for (int i = 0; i < e->var_count; i++) {
-        const tess_var *v = &e->vars[i];
-        if (v->kind == TV_USER && v->patch) sb_printf(&b, "    %s = patch_input.vio_p%d;\n", v->name, v->location);
+    {
+        tess_fref fr[TESS_MAX_FIELDS];
+        int nf = tess_sorted_fields(e, SPV_STORAGE_INPUT, 1, fr);
+        for (int i = 0; i < nf; i++)
+            sb_printf(&b, "    %s%s = patch_input.vio_p%d;\n", fr[i].v->name, fr[i].f->access, fr[i].f->location);
+        nf = tess_sorted_fields(e, SPV_STORAGE_INPUT, 0, fr);
+        const tess_var *pv = tess_find(e, SPV_STORAGE_INPUT, TV_PERVERTEX, 0, 0);
+        if (nf || (pv && (pv->pv_pos >= 0 || pv->clip_used))) {
+            sb_printf(&b, "    for (int i = 0; i < %u; i++)\n    {\n", t->output_points);
+            for (int i = 0; i < nf; i++)
+                sb_printf(&b, "        %s[i]%s = stage_input[i].vio_l%d;\n", fr[i].v->name, fr[i].f->access, fr[i].f->location);
+            if (pv && pv->pv_pos >= 0) sb_printf(&b, "        %s[i].vio_Position = stage_input[i].vio_pos;\n", pv->name);
+            if (pv && pv->clip_used) {
+                int src_len = tess_clip_out(c)->clip_len;
+                for (int k = 0; k < pv->clip_len; k++) {
+                    char ref[24];
+                    tess_clip_ref(ref, sizeof(ref), src_len, k);
+                    sb_printf(&b, "        %s[i].vio_m%d[%d] = stage_input[i].%s;\n", pv->name, pv->clip_member, k, ref);
+                }
+            }
+            sb_cat(&b, "    }\n");
+        }
     }
-    for (int i = 0; i < e->var_count; i++) {
-        const tess_var *v = &e->vars[i];
-        if (v->kind == TV_BUILTIN || v->patch || (v->kind == TV_PERVERTEX && v->pv_pos < 0)) continue;
-        if (!any) { sb_printf(&b, "    for (int i = 0; i < %u; i++)\n    {\n", t->output_points); any = 1; }
-        if (v->kind == TV_USER) sb_printf(&b, "        %s[i] = stage_input[i].vio_l%d;\n", v->name, v->location);
-        else sb_printf(&b, "        %s[i].vio_Position = stage_input[i].vio_pos;\n", v->name);
-    }
-    if (any) sb_cat(&b, "    }\n");
     /* The rest of SPIRV-Cross's main: vert_main(), outputs, return. */
     sb_cat(&b, at + strlen(sig));
     free(hlsl);

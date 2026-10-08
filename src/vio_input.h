@@ -202,6 +202,8 @@ void vio_input_key_event(vio_input_state *state, int key, int action, int mods);
 void vio_input_cursor_event(vio_input_state *state, double x, double y);
 void vio_input_button_event(vio_input_state *state, int button, int action);
 void vio_input_scroll_event(vio_input_state *state, double dx, double dy);
+/* Framebuffer resized (platform layer): fires the on_resize callback. */
+void vio_input_resize_event(vio_input_state *state, int width, int height);
 
 /* ── Virtual gamepads (process-global) ─────────────────────────────── */
 
@@ -241,13 +243,5 @@ void vio_input_record_stop(vio_input_state *state, vio_input_event_list *out);
  * ones immediately. Stops a running replay first. */
 void vio_input_replay_start(vio_input_state *state, vio_input_event_list *events);
 void vio_input_replay_stop(vio_input_state *state);
-
-#ifdef HAVE_GLFW
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-
-/* Install GLFW callbacks on a window, associating it with an input state */
-void vio_input_install_callbacks(GLFWwindow *window, vio_input_state *state);
-#endif
 
 #endif /* VIO_INPUT_H */

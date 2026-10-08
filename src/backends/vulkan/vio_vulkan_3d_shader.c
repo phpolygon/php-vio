@@ -248,6 +248,8 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
         int is_depth = 0;
         VkImageViewType dim = vk3d_sampler_dim(c, list[i].type_id, &is_depth);
         int reg = is_depth ? shadow++ : regular++;
+        int planned = vio_sampler_plan_reg(list[i].name);   /* shader-wide by name (A30) */
+        if (planned >= 0) reg = planned;
         if (reg >= VK3D_MAX_SAMPLERS) continue;
         uint32_t binding = (uint32_t)(VK3D_B_SAMPLER0 + reg);
         spvc_compiler_set_decoration(c, list[i].id, SpvDecorationDescriptorSet, 0);
@@ -421,6 +423,8 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     uint64_t key = vio_shader_cache_hash(tag, spirv, spirv_bytes);
     key = vio_shader_cache_hash_more(key, &upstream, sizeof(upstream));
     key = vio_shader_cache_hash_more(key, &is_last, sizeof(is_last));
+    if (vio_sampler_plan_current())   /* sampler bindings come from the whole shader */
+        key = vio_shader_cache_hash_more(key, vio_sampler_plan_current(), sizeof(vio_sampler_plan));
     if (vio_shader_cache_dir()) {
         size_t len = 0;
         void *data = vio_shader_cache_load(key, "vkspv", &len);
@@ -610,10 +614,12 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
     }
     /* Samplers only an optional stage declares extend the GL-unit map after the
      * fragment ones, in php_vio.c's merge order (geometry, tess control, tess
-     * eval), so vio_set_uniform('u_height', unit) + vio_bind_texture reach them. */
+     * eval, then the vertex / mesh stage and task - OPEN-ITEMS-PLAN A30 / A28), so
+     * vio_set_uniform('u_height', unit) + vio_bind_texture reach them. */
     {
-        static const int merge_order[3] = { 4, 2, 3 };
-        for (int k = 0; k < 3; k++) {
+        static const int merge_order[5] = { 4, 2, 3, 1, 0 };
+        int merge_count = 5;
+        for (int k = 0; k < merge_count; k++) {
             const vk3d_stage_samplers *s = &smp[merge_order[k]];
             for (int j = 0; j < s->count && sh->fs_sampler_count < VK3D_MAX_SAMPLERS; j++) {
                 int known = 0;
@@ -840,11 +846,11 @@ static uint64_t vk3d_mix(uint64_t h, uint64_t v)
     return h;
 }
 
-/* The pipeline for the render pass currently open (attachment signature) and the
+/* The pipeline for the pass currently open (attachment signature) and the
  * mesh vertex stride, created on first use. */
 VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
 {
-    if (!p || p->dead || !p->shader || p->shader->dead || !vio_vk.cur_render_pass) return VK_NULL_HANDLE;
+    if (!p || p->dead || !p->shader || p->shader->dead || !vio_vk.in_pass) return VK_NULL_HANDLE;
     if (stride == 0) stride = p->vertex_stride;
     int cc = vio_vk.cur_color_count > 4 ? 4 : vio_vk.cur_color_count;
     uint64_t key = 1469598103934665603ULL;
@@ -856,6 +862,7 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     const vio_mesh_layout *ml = p->shader->is_mesh ? NULL : &vio_vk.mesh_layout;
     key = vk3d_mix(key, (uint64_t)(ml ? ml->key : 0));   /* the mesh's attribute offsets */
     key = vk3d_mix(key, (uint64_t)p->desc.view_count);   /* multiview pass (viewMask) */
+    key = vk3d_mix(key, (uint64_t)vio_vk.cur_view_mask);
     for (int i = 0; i < p->variant_count; i++) {
         if (p->variants[i].key == key) return p->variants[i].pipeline;
     }
@@ -1013,8 +1020,12 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     gi.pColorBlendState    = &cb;
     gi.pDynamicState       = &dyn;
     gi.layout              = p->shader->layout;
-    gi.renderPass          = vio_vk.cur_render_pass;
-    gi.subpass             = 0;
+    /* Dynamic rendering (VULKAN-MODERN-PLAN phase 4): the attachment formats
+     * of the open pass instead of a render-pass object. */
+    VkPipelineRenderingCreateInfo rendering;
+    vio_vk_pass_rendering_info(&rendering);
+    gi.pNext               = &rendering;
+    if (vio_vk.vrs_attachment) gi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;   /* A18 */
     gi.basePipelineIndex   = -1;
 
     VkPipeline pl = VK_NULL_HANDLE;

@@ -30,6 +30,10 @@ void       *vio_shader_cache_load(uint64_t key, const char *ext, size_t *out_len
 /* Store bytes as <dir>/<key>.<ext> (written to a temp name, then renamed). */
 int         vio_shader_cache_store(uint64_t key, const char *ext, const void *data, size_t len);
 
+/* Count a lookup / store a backend made without the load / store helpers
+ * (Metal's MTLBinaryArchive keeps one file of its own). */
+void        vio_shader_cache_note(int hits, int misses, int stores);
+
 /* Cumulative counters for tests / diagnostics (vio_shader_cache_stats()). */
 void        vio_shader_cache_stats(long *hits, long *misses, long *stores);
 

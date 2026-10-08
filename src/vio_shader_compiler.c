@@ -199,6 +199,7 @@ uint32_t *vio_compile_glsl_rt_stage_to_spirv(const char *source, int rt_stage,
         case VIO_RT_STAGE_MISS:        gs = GLSLANG_STAGE_MISS; break;
         case VIO_RT_STAGE_CLOSEST_HIT: gs = GLSLANG_STAGE_CLOSESTHIT; break;
         case VIO_RT_STAGE_ANY_HIT:     gs = GLSLANG_STAGE_ANYHIT; break;
+        case VIO_RT_STAGE_CALLABLE:    gs = GLSLANG_STAGE_CALLABLE; break;
         default:
             if (error_msg) *error_msg = strdup("unknown ray tracing stage");
             return NULL;

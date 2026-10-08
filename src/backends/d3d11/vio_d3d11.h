@@ -85,6 +85,8 @@ typedef struct _vio_d3d11_buffer {
      * created on first dispatch that writes this buffer. */
     ID3D11Buffer *readback_staging;
     size_t        readback_size; /* allocated bytes of readback_staging */
+    ID3D11UnorderedAccessView *fs_uav;   /* raw UAV for the fragment stage (A15), created on first bind */
+    int           fs_dirty;              /* written by a draw since the last readback */
 } vio_d3d11_buffer;
 
 /* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */
@@ -289,7 +291,7 @@ typedef struct _vio_d3d11_state {
     double       last_gpu_ms;
 
     /* Window reference */
-    void *glfw_window;
+    void *platform_window;
 
     /* Adapter of the device, for vio_gpu_info(): UTF-8 description (WARP reports
      * "Microsoft Basic Render Driver") and DedicatedVideoMemory. */
@@ -298,6 +300,14 @@ typedef struct _vio_d3d11_state {
     uint32_t vendor_id;        /* vio_backend_info (A4) */
     char     driver[32];
     int      software_adapter; /* WARP */
+    /* Depth mip reduction (A26), built on first use. */
+    ID3D11VertexShader      *dmip_vs;
+    ID3D11PixelShader       *dmip_ps;
+    ID3D11PixelShader       *dmip_resolve_ps;   /* depth_only MSAA resolve (A24) */
+    ID3D11PixelShader       *dmip_copy_ps;      /* texel copy into another format (video encoding, A39) */
+    ID3D11Buffer            *dmip_cb;
+    ID3D11DepthStencilState *dmip_dss;
+    ID3D11RasterizerState   *dmip_rs;
 } vio_d3d11_state;
 
 extern vio_d3d11_state vio_d3d11;
@@ -306,7 +316,7 @@ extern vio_d3d11_state vio_d3d11;
 void vio_backend_d3d11_register(void);
 
 /* Called after GLFW window creation to set up D3D11 */
-int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg);
+int vio_d3d11_setup_context(void *platform_window, vio_config *cfg);
 
 /* Re-apply a render-target bind that vio_bind_render_target deferred because
  * it was called before vio_begin() (d3d11_begin_frame resets the backbuffer

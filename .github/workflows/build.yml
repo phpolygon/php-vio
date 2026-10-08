@@ -41,6 +41,8 @@ jobs:
           sudo apt-get update || (sleep 15 && sudo apt-get update)
           sudo apt-get install -y \
             libglfw3-dev \
+            libx11-dev libxrandr-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev weston \
             glslang-dev \
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
@@ -90,6 +92,29 @@ jobs:
           # miniaudio opens it silently.
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
+
+      - name: Run tests (Wayland, headless weston + Mesa software GL)
+        run: |
+          # The same suite on the native Wayland platform: a headless weston
+          # (pixman renderer - Mesa's software EGL and lavapipe hand it wl_shm
+          # buffers), no DISPLAY, so vio_platform() is "wayland".
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          export VK_DRIVER_FILES=/nonexistent/vio-no-vulkan.json
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          chmod 700 "$XDG_RUNTIME_DIR"
+          (weston --backend=headless --renderer=pixman --socket=wayland-vio --idle-time=0 \
+            || weston --backend=headless-backend.so --use-pixman --socket=wayland-vio --idle-time=0) > weston.log 2>&1 &
+          for i in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/wayland-vio" ] && break; sleep 0.2; done
+          if [ ! -S "$XDG_RUNTIME_DIR/wayland-vio" ]; then cat weston.log; exit 1; fi
+          export WAYLAND_DISPLAY=wayland-vio
+          unset DISPLAY
+          php -n -d extension_dir=$PWD/modules -d extension=vio.so -r 'echo "platform: ", vio_platform(), "\n";'
+          php -n run-tests.php -q --show-diff tests/
+          # Vulkan on Wayland (lavapipe through VK_KHR_wayland_surface)
+          VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1) \
+            php -n run-tests.php -q --show-diff tests/window/215_wayland_platform.phpt
 
       - name: Run required-feature tests (lavapipe Vulkan)
         run: |
@@ -167,7 +192,32 @@ jobs:
             tests/core/184_backend_info_all_backends.phpt \
             tests/core/185_adapters.phpt \
             tests/core/186_backend_scoring.phpt \
-            tests/core/187_backend_benchmark.phpt
+            tests/core/187_backend_benchmark.phpt \
+            tests/render3d/188_readback_latest_frame_all_backends.phpt \
+            tests/render2d/189_glyph_atlas_lazy_all_backends.phpt \
+            tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt \
+            tests/render3d/191_astc_textures_all_backends.phpt \
+            tests/render2d/192_vertical_text.phpt \
+            tests/render3d/193_depth_mipmaps_all_backends.phpt \
+            tests/render3d/194_msaa_mrt_all_backends.phpt \
+            tests/render3d/195_msaa_cube_array_all_backends.phpt \
+            tests/render3d/196_msaa_depth_only_all_backends.phpt \
+            tests/render3d/197_mesh_task_textures_all_backends.phpt \
+            tests/render3d/198_tess_varyings_all_backends.phpt \
+            tests/render3d/199_acceleration_structure_update_all_backends.phpt \
+            tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt \
+            tests/render3d/201_rt_pipeline_textures_all_backends.phpt \
+            tests/render3d/202_trace_rays_in_frame_all_backends.phpt \
+            tests/render3d/203_fragment_storage_all_backends.phpt \
+            tests/render3d/204_sampler_feedback_emulated_all_backends.phpt \
+            tests/render3d/205_geometry_stage_gaps_all_backends.phpt \
+            tests/backends/206_pass_switches_vulkan_core_all_backends.phpt \
+            tests/render3d/207_bundle_all_backends.phpt \
+            tests/render3d/208_upscale_all_backends.phpt \
+            tests/media/209_recorder_encoders_all_backends.phpt \
+            tests/render3d/210_compute_msl_override_all_backends.phpt \
+            tests/render3d/211_rate_map_all_backends.phpt \
+            tests/core/212_audit_gate_no_glfw_outside_platform.phpt
 
       - name: Package binary
         run: |
@@ -210,6 +260,8 @@ jobs:
           sudo apt-get update || (sleep 15 && sudo apt-get update)
           sudo apt-get install -y \
             libglfw3-dev \
+            libx11-dev libxrandr-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev weston \
             glslang-dev \
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
@@ -255,6 +307,29 @@ jobs:
           # miniaudio opens it silently.
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
+
+      - name: Run tests (Wayland, headless weston + Mesa software GL)
+        run: |
+          # The same suite on the native Wayland platform: a headless weston
+          # (pixman renderer - Mesa's software EGL and lavapipe hand it wl_shm
+          # buffers), no DISPLAY, so vio_platform() is "wayland".
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          export VK_DRIVER_FILES=/nonexistent/vio-no-vulkan.json
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          chmod 700 "$XDG_RUNTIME_DIR"
+          (weston --backend=headless --renderer=pixman --socket=wayland-vio --idle-time=0 \
+            || weston --backend=headless-backend.so --use-pixman --socket=wayland-vio --idle-time=0) > weston.log 2>&1 &
+          for i in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/wayland-vio" ] && break; sleep 0.2; done
+          if [ ! -S "$XDG_RUNTIME_DIR/wayland-vio" ]; then cat weston.log; exit 1; fi
+          export WAYLAND_DISPLAY=wayland-vio
+          unset DISPLAY
+          php -n -d extension_dir=$PWD/modules -d extension=vio.so -r 'echo "platform: ", vio_platform(), "\n";'
+          php -n run-tests.php -q --show-diff tests/
+          # Vulkan on Wayland (lavapipe through VK_KHR_wayland_surface)
+          VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1) \
+            php -n run-tests.php -q --show-diff tests/window/215_wayland_platform.phpt
 
       - name: Run required-feature tests (lavapipe Vulkan)
         run: |
@@ -332,7 +407,32 @@ jobs:
             tests/core/184_backend_info_all_backends.phpt \
             tests/core/185_adapters.phpt \
             tests/core/186_backend_scoring.phpt \
-            tests/core/187_backend_benchmark.phpt
+            tests/core/187_backend_benchmark.phpt \
+            tests/render3d/188_readback_latest_frame_all_backends.phpt \
+            tests/render2d/189_glyph_atlas_lazy_all_backends.phpt \
+            tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt \
+            tests/render3d/191_astc_textures_all_backends.phpt \
+            tests/render2d/192_vertical_text.phpt \
+            tests/render3d/193_depth_mipmaps_all_backends.phpt \
+            tests/render3d/194_msaa_mrt_all_backends.phpt \
+            tests/render3d/195_msaa_cube_array_all_backends.phpt \
+            tests/render3d/196_msaa_depth_only_all_backends.phpt \
+            tests/render3d/197_mesh_task_textures_all_backends.phpt \
+            tests/render3d/198_tess_varyings_all_backends.phpt \
+            tests/render3d/199_acceleration_structure_update_all_backends.phpt \
+            tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt \
+            tests/render3d/201_rt_pipeline_textures_all_backends.phpt \
+            tests/render3d/202_trace_rays_in_frame_all_backends.phpt \
+            tests/render3d/203_fragment_storage_all_backends.phpt \
+            tests/render3d/204_sampler_feedback_emulated_all_backends.phpt \
+            tests/render3d/205_geometry_stage_gaps_all_backends.phpt \
+            tests/backends/206_pass_switches_vulkan_core_all_backends.phpt \
+            tests/render3d/207_bundle_all_backends.phpt \
+            tests/render3d/208_upscale_all_backends.phpt \
+            tests/media/209_recorder_encoders_all_backends.phpt \
+            tests/render3d/210_compute_msl_override_all_backends.phpt \
+            tests/render3d/211_rate_map_all_backends.phpt \
+            tests/core/212_audit_gate_no_glfw_outside_platform.phpt
 
       - name: Package binary
         run: |
@@ -625,6 +725,42 @@ jobs:
             --with-prefix=${{ steps.php-sdk.outputs.prefix }}
           nmake
 
+      # SM69-PLAN 0d: the OS WARP of this runner stops at Shader Model 6.2. The
+      # Microsoft.Direct3D.WARP NuGet package (1.0.18+) is SM 6.9 on feature
+      # level 12.2 with DXR 1.2: under it, the Agility SDK and DXC 1.9 the whole
+      # suite runs with every D3D12 shader feature required (measured locally:
+      # 0 failed). Versions are pinned; NTS only (setup-php's php on PATH).
+      - name: Run tests (D3D12 on NuGet WARP + Agility SDK + DXC 1.9)
+        if: matrix.ts == 'nts'
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Recurse -Filter php_vio.dll | Select-Object -First 1
+          if (-not $dll) { throw "php_vio.dll not found after build" }
+          $dllDir = $dll.Directory.FullName
+          $vkBin = if ($env:VULKAN_SDK) { "$env:VULKAN_SDK\Bin" } else { "" }
+          $env:PATH = "$PWD\deps\bin;$PWD\deps\lib;$vkBin;$env:PATH"
+          $pk = Join-Path $env:RUNNER_TEMP "sm69"
+          New-Item -ItemType Directory -Force $pk | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/1.0.21/microsoft.direct3d.warp.1.0.21.nupkg -OutFile "$pk\warp.zip"
+          Invoke-WebRequest https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.619.6/microsoft.direct3d.d3d12.1.619.6.nupkg -OutFile "$pk\d3d12.zip"
+          Invoke-WebRequest https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip -OutFile "$pk\dxc.zip"
+          foreach ($n in 'warp', 'd3d12', 'dxc') { Expand-Archive -Force "$pk\$n.zip" "$pk\$n" }
+          $env:VIO_D3D_WARP = "$pk\warp\build\native\bin\x64\d3d10warp.dll"
+          $env:VIO_D3D12_AGILITY_SDK = "$pk\d3d12\build\native\bin\x64"
+          $env:VIO_DXC_DIR = "$pk\dxc\bin\x64"
+          php -n -d extension_dir="$dllDir" -d extension=php_vio.dll -r '$c = vio_create("d3d12", ["width" => 8, "height" => 8, "headless" => true, "shader_model" => 6]); $i = vio_backend_info($c); $s = vio_swapchain_info($c); printf("D3D12 %s driver %s, SM %d, Agility %d\n", $i["device"], $i["driver"], $i["shading_language_version"], $s["agility_sdk"]); if ($i["shading_language_version"] < 69 || $s["agility_sdk"] < 619) exit(1);'
+          if ($LASTEXITCODE -ne 0) { throw "NuGet WARP / Agility SDK / DXC 1.9 not in effect" }
+          $env:VIO_REQUIRE_SM6 = "1"
+          foreach ($f in 'SUBGROUP', 'SUBGROUP_QUAD', 'BARYCENTRICS', 'ATOMIC64', 'SHADER_FLOAT16', 'BASE_VERTEX', 'COMPUTE_DERIVATIVES',
+                         'MULTIVIEW', 'MULTIVIEW_STAGES', 'SHADING_RATE_PRIMITIVE', 'SHADING_RATE_IMAGE', 'BINDLESS', 'MESH_SHADER',
+                         'RAY_QUERY', 'RAYTRACING', 'SAMPLER_FEEDBACK', 'WORK_GRAPHS', 'LONG_VECTOR', 'SHADER_EXECUTION_REORDER', 'OPACITY_MICROMAP') {
+            Set-Item "env:VIO_REQUIRE_$f" "d3d12"
+          }
+          $env:NO_INTERACTION = "1"
+          $env:REPORT_EXIT_STATUS = "1"
+          $env:TEST_PHP_ARGS = "-n -d extension_dir=$dllDir -d extension=php_vio.dll"
+          php -n run-tests.php -q --show-diff tests/
       # Run the Path B vertex-storage tests on the native Windows backends
       # (D3D11/D3D12 via WARP). Only the NTS variant: shivammathur/setup-php
       # provides an NTS php on PATH, which matches the NTS DLL's ABI. The
@@ -771,7 +907,34 @@ jobs:
             tests/core/185_adapters.phpt `
             tests/core/186_backend_scoring.phpt `
             tests/core/187_backend_benchmark.phpt `
-            tests/core/170_d3d12_shader_model_pin.phpt
+            tests/render3d/188_readback_latest_frame_all_backends.phpt `
+            tests/render2d/189_glyph_atlas_lazy_all_backends.phpt `
+            tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt `
+            tests/render3d/191_astc_textures_all_backends.phpt `
+            tests/render2d/192_vertical_text.phpt `
+            tests/render3d/193_depth_mipmaps_all_backends.phpt `
+            tests/render3d/194_msaa_mrt_all_backends.phpt `
+            tests/render3d/195_msaa_cube_array_all_backends.phpt `
+            tests/render3d/196_msaa_depth_only_all_backends.phpt `
+            tests/render3d/197_mesh_task_textures_all_backends.phpt `
+            tests/render3d/198_tess_varyings_all_backends.phpt `
+            tests/render3d/199_acceleration_structure_update_all_backends.phpt `
+            tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt `
+            tests/render3d/201_rt_pipeline_textures_all_backends.phpt `
+            tests/render3d/202_trace_rays_in_frame_all_backends.phpt `
+            tests/render3d/203_fragment_storage_all_backends.phpt `
+            tests/render3d/204_sampler_feedback_emulated_all_backends.phpt `
+            tests/render3d/205_geometry_stage_gaps_all_backends.phpt `
+            tests/backends/206_pass_switches_vulkan_core_all_backends.phpt `
+            tests/render3d/207_bundle_all_backends.phpt `
+            tests/render3d/208_upscale_all_backends.phpt `
+            tests/media/209_recorder_encoders_all_backends.phpt `
+            tests/render3d/210_compute_msl_override_all_backends.phpt `
+            tests/render3d/211_rate_map_all_backends.phpt `
+            tests/core/212_audit_gate_no_glfw_outside_platform.phpt `
+            tests/window/213_win32_platform.phpt `
+            tests/core/170_d3d12_shader_model_pin.phpt `
+            tests/backends/168_d3d12_pipeline_freed_after_frame.phpt
 
       - name: Package binary
         shell: pwsh

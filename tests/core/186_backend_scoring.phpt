@@ -39,6 +39,9 @@ sim('linux', ['vulkan' => [$lavapipe], 'opengl' => []]);
 echo "lavapipe:    ", order(['prefer' => 'performance']), "\n";
 sim('macos', ['metal' => [gpu(0x106B, 'integrated', $rich)], 'opengl' => []]);
 echo "apple:       ", order(['prefer' => 'quality']), "\n";
+/* flags past 63 (the feature set has two words): require and adapter lists carry them */
+sim('macos', ['metal' => [gpu(0x106B, 'integrated', array_merge($base, [VIO_FEATURE_RASTER_RATE_MAP]))], 'opengl' => [gpu(0x106B, 'integrated', $base)]]);
+echo "require 64+: ", order(['require' => [VIO_FEATURE_RASTER_RATE_MAP]]), "\n";
 $r = vio_rank_backends(['require' => [VIO_FEATURE_RAY_QUERY]]);
 echo "keys:        ", implode(',', array_keys($r[0])), "\n";
 
@@ -72,6 +75,7 @@ require rq:  vulkan > d3d12 (x) > d3d11 (x)
 warp last:   vulkan > d3d12 > d3d11
 lavapipe:    opengl > vulkan
 apple:       metal > opengl
+require 64+: metal > opengl (x)
 keys:        backend,adapter,vendor,device_type,score,eligible,reason,benchmark_ms
 bool(false)
 %Sno backend provides the required features%S
