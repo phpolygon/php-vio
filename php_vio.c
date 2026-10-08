@@ -5345,6 +5345,15 @@ ZEND_FUNCTION(vio_compute_pipeline)
         }
         desc.compute_msl = Z_STRVAL_P(msl_zval);
     }
+    /* 'hlsl' => kernel source: D3D11 / D3D12 compile it instead of the translated GLSL */
+    zval *hlsl_zval = zend_hash_str_find(config_ht, "hlsl", sizeof("hlsl") - 1);
+    if (hlsl_zval && Z_TYPE_P(hlsl_zval) != IS_NULL) {
+        if (Z_TYPE_P(hlsl_zval) != IS_STRING || Z_STRLEN_P(hlsl_zval) == 0) {
+            zend_value_error("vio_compute_pipeline(): 'hlsl' must be a non-empty HLSL kernel source");
+            RETURN_THROWS();
+        }
+        desc.compute_hlsl = Z_STRVAL_P(hlsl_zval);
+    }
 
     void *backend_pipeline = ctx->backend->create_compute_pipeline(&desc);
     if (!backend_pipeline) {
@@ -11539,6 +11548,9 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_COMPRESSION_ASTC", VIO_FEATURE_TEXTURE_COMPRESSION_ASTC, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_DEPTH_MIPMAPS", VIO_FEATURE_DEPTH_MIPMAPS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RASTER_RATE_MAP", VIO_FEATURE_RASTER_RATE_MAP, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_LONG_VECTOR", VIO_FEATURE_LONG_VECTOR, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADER_EXECUTION_REORDER", VIO_FEATURE_SHADER_EXECUTION_REORDER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_OPACITY_MICROMAP", VIO_FEATURE_OPACITY_MICROMAP, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_DEPTH_REDUCE_MAX", VIO_DEPTH_REDUCE_MAX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_DEPTH_REDUCE_MIN", VIO_DEPTH_REDUCE_MIN, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);

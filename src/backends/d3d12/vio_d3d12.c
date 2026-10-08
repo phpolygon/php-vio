@@ -7339,7 +7339,11 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
     int srv_base_reg = storage_min_binding >= 0 ? storage_min_binding : 0;
     int uav_base_reg = storage_min_binding >= 0 ? storage_min_binding : 0;
 
-    char *hlsl = vio_spirv_to_hlsl(spirv, spirv_size, d3d12_hlsl_target(), &err);
+    /* 'hlsl' override (SM69-PLAN Phase 2): the caller's kernel with the GLSL
+     * kernel's reflection; no translation (SPIRV-Cross has no HLSL form for
+     * long vectors and fails on them). */
+    char *hlsl = desc->compute_hlsl ? strdup(desc->compute_hlsl)
+                                    : vio_spirv_to_hlsl(spirv, spirv_size, d3d12_hlsl_target(), &err);
     if (free_spirv) free(spirv);
     if (!hlsl) {
         php_error_docref(NULL, E_WARNING, "D3D12: CS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -8786,6 +8790,8 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_TEXTURE_ARRAY:       return 1; /* DepthOrArraySize > 1 + TEXTURE2DARRAY SRV */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return 1; /* BC1-BC7 mandatory on every D3D12 device */
         case VIO_FEATURE_DEPTH_MIPMAPS: return 1;   /* d3d12_generate_depth_mips (A26) */
+        /* SM 6.9 vector<T, N> (N <= 1024) through the compute 'hlsl' override */
+        case VIO_FEATURE_LONG_VECTOR: return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 69;
         case VIO_FEATURE_SHADING_RATE:        return vio_d3d12.vrs_tier > 0; /* RSSetShadingRate, VRS Tier 1+ (GAP-PHASE5 12) */
         /* SV_ShadingRate (SM 6.4) + the OVERRIDE combiner (Tier 2). */
         case VIO_FEATURE_MESH_SHADER:  return vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version >= 65 && vio_d3d12.mesh_tier > 0;

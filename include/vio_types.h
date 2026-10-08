@@ -402,6 +402,14 @@ typedef enum _vio_feature {
      * resolved when the pass leaves the target. 0 = the option renders at full
      * rate. Past the 64-bit adapter masks: vio_adapters() never lists it. */
     VIO_FEATURE_RASTER_RATE_MAP = 64,
+    /* Shader Model 6.9 (SM69-PLAN): vectors of 5..1024 components (GLSL
+     * GL_EXT_long_vector on Vulkan; HLSL vector<T, N> through the compute 'hlsl'
+     * override on D3D12 - SPIRV-Cross has no HLSL form for them), Shader
+     * Execution Reordering (DXR 1.2 / VK_EXT_ray_tracing_invocation_reorder) and
+     * Opacity Micromaps (DXR 1.2 / VK_EXT_opacity_micromap). */
+    VIO_FEATURE_LONG_VECTOR = 65,
+    VIO_FEATURE_SHADER_EXECUTION_REORDER = 66,
+    VIO_FEATURE_OPACITY_MICROMAP = 67,
 } vio_feature;
 
 /* Zones per axis of a rate map. */
@@ -935,6 +943,11 @@ typedef struct _vio_shader_desc {
      * Primitives have no GLSL form). The GLSL kernel stays required: its
      * reflection gives local_size and the bindings (binding N = buffer / texture N). */
     const char       *compute_msl;
+    /* vio_compute_pipeline(['hlsl' => ...]) (SM69-PLAN Phase 2): D3D11 / D3D12
+     * compile this HLSL kernel (entry main) instead of the translated GLSL, with
+     * the GLSL kernel's reflection: Params UBO binding N = bN, storage buffers
+     * and images binding N = tN / uN. */
+    const char       *compute_hlsl;
     /* vio_shader(['view_count' => N]) (VIO_FEATURE_MULTIVIEW): the stages use
      * gl_ViewIndex and every draw runs N times, view v into layer v of a target
      * bound with VIO_RT_ALL_LAYERS. 0 = not a multiview shader. */

@@ -338,7 +338,7 @@ static int create_logical_device(void)
     int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0, has_di = 0, has_m3 = 0;
     int has_as = 0, has_rq = 0, has_dho = 0, has_bda = 0, has_spv14 = 0, has_sfc = 0;
     int has_rtp = 0;
-    int has_mesh = 0, has_fc = 0, has_cm = 0, has_vmm = 0, has_ssc = 0;
+    int has_mesh = 0, has_fc = 0, has_cm = 0, has_vmm = 0, has_ssc = 0, has_lv = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
@@ -361,6 +361,7 @@ static int create_logical_device(void)
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_sfc = 1;
         if (strcmp(ext_props[i].extensionName, "VK_EXT_mesh_shader") == 0) has_mesh = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_cooperative_matrix") == 0) has_cm = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_shader_long_vector") == 0) has_lv = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_vulkan_memory_model") == 0) has_vmm = 1;
         if (strcmp(ext_props[i].extensionName, "VK_EXT_subgroup_size_control") == 0) has_ssc = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_fc = 1;
@@ -849,6 +850,28 @@ static int create_logical_device(void)
     (void)has_cm; (void)has_vmm;
 #endif
 
+    /* VIO_FEATURE_LONG_VECTOR: VK_EXT_shader_long_vector (GL_EXT_long_vector kernels). */
+    vio_vk.long_vector_supported = 0;
+#ifdef VK_EXT_SHADER_LONG_VECTOR_EXTENSION_NAME
+    VkPhysicalDeviceShaderLongVectorFeaturesEXT lv_enable = {0};
+    lv_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_LONG_VECTOR_FEATURES_EXT;
+    if (has_lv && vio_vk.instance_api_11 && device_ext_count < (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
+        VkPhysicalDeviceShaderLongVectorFeaturesEXT lv_avail = {0};
+        lv_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_LONG_VECTOR_FEATURES_EXT;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &lv_avail;
+        vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+        if (lv_avail.longVector) {
+            lv_enable.longVector = VK_TRUE;
+            vio_vk.long_vector_supported = 1;
+            VIO_VK_ADD_DEVICE_EXT("VK_EXT_shader_long_vector");
+        }
+    }
+#else
+    (void)has_lv;
+#endif
+
     VkDeviceCreateInfo create_info = {0};
     create_info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     create_info.queueCreateInfoCount    = unique_count;
@@ -890,6 +913,9 @@ static int create_logical_device(void)
     }
 #endif
     (void)coopmat_f16;
+#ifdef VK_EXT_SHADER_LONG_VECTOR_EXTENSION_NAME
+    if (vio_vk.long_vector_supported) { lv_enable.pNext = feature_chain; feature_chain = &lv_enable; }
+#endif
     /* VULKAN-MODERN-PLAN: the three required features (checked at selection). */
     VkPhysicalDeviceTimelineSemaphoreFeatures tl_enable = {0};
     tl_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
@@ -5223,6 +5249,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_3D_PIPELINE:  return vio_vk3d_available(); /* GAP-PHASE5 Block 10 */
         case VIO_FEATURE_MESH_SHADER:  return vio_vk3d_available() && vio_vk.device && vio_vk.mesh_supported; /* VK_EXT_mesh_shader */
         case VIO_FEATURE_COOPERATIVE_MATRIX: return vio_vk.device && vio_vk.coopmat_shape_count > 0; /* VK_KHR_cooperative_matrix */
+        case VIO_FEATURE_LONG_VECTOR: return vio_vk.device && vio_vk.long_vector_supported; /* VK_EXT_shader_long_vector */
         case VIO_FEATURE_RAYTRACING:   return vio_vk3d_available() && vio_vk.device && vio_vk.rt_pipeline_supported; /* VK_KHR_ray_tracing_pipeline */
         case VIO_FEATURE_MULTIVIEW:    return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_supported; /* VkRenderPassMultiviewCreateInfo */
         case VIO_FEATURE_MULTIVIEW_GEOMETRY:     return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_geometry;

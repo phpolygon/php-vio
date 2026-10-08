@@ -3461,7 +3461,8 @@ static void *d3d11_create_compute_pipeline(vio_shader_desc *desc)
         }
     }
 
-    char *hlsl = vio_spirv_to_hlsl(spirv, spirv_size, 50, &err);
+    /* 'hlsl' override: the caller's kernel with the GLSL kernel's reflection */
+    char *hlsl = desc->compute_hlsl ? strdup(desc->compute_hlsl) : vio_spirv_to_hlsl(spirv, spirv_size, 50, &err);
     if (free_spirv) free(spirv);
     if (!hlsl) {
         php_error_docref(NULL, E_WARNING, "D3D11: CS SPIR-V->HLSL failed: %s", err ? err : "unknown");
