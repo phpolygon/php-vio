@@ -2280,6 +2280,10 @@ static const gl_shadow_entry *gl_shadow_entry_for(GLuint program)
  * attachments back. */
 #define GL_MV_MAX_PROGRAMS 64
 static struct { GLuint program; int views; unsigned int gen; } gl_mv_programs[GL_MV_MAX_PROGRAMS];
+/* Loaded by vio itself, not through GLAD: a static build with ext/glfw
+ * (static-php-cli) drops vio's glad.c and links ext/glfw's, which predates
+ * GL_OVR_multiview - its glad_glFramebufferTextureMultiviewOVR does not exist. */
+static PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC vio_glFramebufferTextureMultiviewOVR;
 
 void vio_opengl_set_program_views(unsigned int program, int views)
 {
@@ -2341,8 +2345,8 @@ static void gl_mv_prepare(void)
     }
     if (views > 1 && rt && rt->bound_face == VIO_RT_ALL_LAYERS && rt->layers >= views && !gl_mv_rt) {
         glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
-        if (!rt->depth_only) glFramebufferTextureMultiviewOVR(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rt->color_texture, 0, 0, views);
-        glFramebufferTextureMultiviewOVR(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, rt->depth_texture, 0, 0, views);
+        if (!rt->depth_only) vio_glFramebufferTextureMultiviewOVR(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, rt->color_texture, 0, 0, views);
+        vio_glFramebufferTextureMultiviewOVR(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, rt->depth_texture, 0, 0, views);
         gl_mv_rt = rt;
         gl_mv_views = views;
     }
@@ -3413,6 +3417,8 @@ int vio_opengl_setup_context(void)
         php_error_docref(NULL, E_WARNING, "Failed to initialize GLAD");
         return -1;
     }
+    vio_glFramebufferTextureMultiviewOVR = (PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC)
+        vio_plat()->gl_get_proc_address("glFramebufferTextureMultiviewOVR");
 
     /* Detect what we actually got. The window system negotiates the highest
      * available core context (4.6 → 3.3 ladder), so the numbers reflect the
@@ -3485,7 +3491,7 @@ int vio_opengl_setup_context(void)
     vio_gl.caps.has_draw_parameters = (gl_ge(4, 6) || gl_has_ext("GL_ARB_shader_draw_parameters"))
                                    && (gl_ge(4, 2) || gl_has_ext("GL_ARB_base_instance"));
     vio_gl.caps.has_compute_derivatives = vio_gl.caps.has_compute_shader && gl_has_ext("GL_NV_compute_shader_derivatives");
-    vio_gl.caps.has_multiview = gl_ge(3, 2) && gl_has_ext("GL_OVR_multiview2") && glFramebufferTextureMultiviewOVR != NULL;
+    vio_gl.caps.has_multiview = gl_ge(3, 2) && gl_has_ext("GL_OVR_multiview2") && vio_glFramebufferTextureMultiviewOVR != NULL;
     vio_gl.caps.has_vertex_layer = gl_ge(3, 2) && gl_has_ext("GL_ARB_shader_viewport_layer_array");
     {
         /* Test knob: run multiview by instancing on a driver with OVR_multiview2. */
