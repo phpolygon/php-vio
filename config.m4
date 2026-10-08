@@ -382,6 +382,9 @@ if test "$PHP_VIO" != "no"; then
         dnl NSOpenGLContext - the OpenGL backend no longer needs GLFW here.
         PHP_ADD_FRAMEWORK(QuartzCore)
         PHP_ADD_FRAMEWORK(GameController)
+        dnl PHP_ADD_FRAMEWORK does not reach a phpize extension's link line; AppKit
+        dnl used to come in through libglfw. Link them on the module itself.
+        VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD -Wl,-framework,Cocoa -Wl,-framework,QuartzCore -Wl,-framework,IOKit -Wl,-weak_framework,GameController"
         VIO_HAS_COCOA=yes
         AC_DEFINE(HAVE_COCOA, 1, [Whether the native Cocoa platform is built])
         AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from NSOpenGL)])
