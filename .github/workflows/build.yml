@@ -359,10 +359,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: ${{ matrix.php }}
+      - name: Setup PHP (Homebrew)
+        run: |
+          # shivammathur/setup-php stopped installing PHP 8.5 on the macOS runners
+          # (2026-10-08: "php: command not found" right after its install step).
+          # The Homebrew formula php is 8.5 and brings phpize / php-config.
+          brew update --quiet
+          brew install php
+          brew link --overwrite php
+          php -v
+          have=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
+          if [ "$have" != "${{ matrix.php }}" ]; then
+            echo "::error::Homebrew php is $have, the matrix wants ${{ matrix.php }}"
+            exit 1
+          fi
+          which phpize php-config
 
       - name: Install dependencies
         run: |
@@ -433,10 +444,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: ${{ matrix.php }}
+      - name: Setup PHP (Homebrew)
+        run: |
+          # shivammathur/setup-php stopped installing PHP 8.5 on the macOS runners
+          # (2026-10-08: "php: command not found" right after its install step).
+          # The Homebrew formula php is 8.5 and brings phpize / php-config.
+          brew update --quiet
+          brew install php
+          brew link --overwrite php
+          php -v
+          have=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
+          if [ "$have" != "${{ matrix.php }}" ]; then
+            echo "::error::Homebrew php is $have, the matrix wants ${{ matrix.php }}"
+            exit 1
+          fi
+          which phpize php-config
 
       - name: Install dependencies
         run: |
