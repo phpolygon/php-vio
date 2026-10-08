@@ -4,6 +4,7 @@
  */
 
 #include "php_vio.h"
+#include "zend_exceptions.h"   /* zend_clear_exception: clang rejects the implicit declaration */
 
 #if defined(ZTS) && defined(COMPILE_DL_VIO)
 ZEND_TSRMLS_CACHE_DEFINE()
@@ -23,6 +24,9 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_buffer.h"
 #include "src/vio_compute_pipeline.h"
 #include "src/vio_acceleration_structure.h"
+#include "src/vio_bundle.h"
+#include "src/vio_rt_pipeline.h"
+#include "src/vio_work_graph.h"
 #include "src/vio_font_face.h"
 #include "src/vio_2d.h"
 #include "src/vio_font.h"
@@ -58,8 +62,13 @@ ZEND_TSRMLS_CACHE_DEFINE()
 
 #include <string.h>
 #include <stdlib.h>
+#include "ext/json/php_json.h"
+#include "zend_smart_str.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
 #include <glad/glad.h>
 #include "src/backends/opengl/vio_opengl.h"
 int vio_opengl_setup_context(void);
@@ -99,6 +108,507 @@ PHP_INI_END()
 
 /* ── PHP function implementations ─────────────────────────────────── */
 
+/* ── Backend scoring for 'auto' (OPEN-ITEMS-PLAN A7) ────────────────── */
+
+/* 1 = 'prefer' / 'require' / 'benchmark' given (scored 'auto'), 0 = plain 'auto', -1 = bad option (warned). */
+static int vio_select_options(HashTable *opts, int *prefer, vio_feature_set *require, int *benchmark)
+{
+    zval *v;
+    int scored = 0;
+    *prefer = VIO_PREFER_PERFORMANCE;
+    memset(require, 0, sizeof(*require));
+    *benchmark = 0;
+    if (!opts) return 0;
+    /* A8: calibration run among the top candidates (implies the ranking). */
+    if ((v = zend_hash_str_find(opts, "benchmark", sizeof("benchmark") - 1)) != NULL && zend_is_true(v)) {
+        *benchmark = 1;
+        scored = 1;
+    }
+    if ((v = zend_hash_str_find(opts, "prefer", sizeof("prefer") - 1)) != NULL) {
+        scored = 1;
+        if (Z_TYPE_P(v) == IS_STRING && strcmp(Z_STRVAL_P(v), "performance") == 0) *prefer = VIO_PREFER_PERFORMANCE;
+        else if (Z_TYPE_P(v) == IS_STRING && strcmp(Z_STRVAL_P(v), "quality") == 0) *prefer = VIO_PREFER_QUALITY;
+        else if (Z_TYPE_P(v) == IS_STRING && strcmp(Z_STRVAL_P(v), "compat") == 0) *prefer = VIO_PREFER_COMPAT;
+        else {
+            php_error_docref(NULL, E_WARNING, "'prefer' must be one of performance, quality, compat");
+            return -1;
+        }
+    }
+    if ((v = zend_hash_str_find(opts, "require", sizeof("require") - 1)) != NULL) {
+        zval *f;
+        scored = 1;
+        if (Z_TYPE_P(v) != IS_ARRAY) {
+            php_error_docref(NULL, E_WARNING, "'require' must be an array of VIO_FEATURE_* constants");
+            return -1;
+        }
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(v), f) {
+            zend_long x = zval_get_long(f);
+            if (x < 0 || x >= VIO_FEATURE_SET_MAX) {
+                php_error_docref(NULL, E_WARNING, "'require' must be an array of VIO_FEATURE_* constants");
+                return -1;
+            }
+            vio_featset_add(require, (int)x);
+        } ZEND_HASH_FOREACH_END();
+    }
+    return scored;
+}
+
+/* Test hook: the variable is read at call time (putenv in the same process works). */
+static int vio_select_env(const char *name, char *buf, size_t size)
+{
+#ifdef _WIN32
+    DWORD n = GetEnvironmentVariableA(name, buf, (DWORD)size);
+    return n > 0 && n < size;
+#else
+    const char *v = getenv(name);
+    if (!v || !*v || strlen(v) >= size) return 0;
+    memcpy(buf, v, strlen(v) + 1);
+    return 1;
+#endif
+}
+
+static void vio_select_adapter_from_zval(vio_adapter_info *a, zval *z)
+{
+    zval *v;
+    memset(a, 0, sizeof(*a));
+    if (Z_TYPE_P(z) != IS_ARRAY) return;
+    if ((v = zend_hash_str_find(Z_ARRVAL_P(z), "name", 4)) && Z_TYPE_P(v) == IS_STRING)
+        snprintf(a->name, sizeof(a->name), "%s", Z_STRVAL_P(v));
+    if ((v = zend_hash_str_find(Z_ARRVAL_P(z), "vendor_id", 9))) a->vendor_id = (uint32_t)zval_get_long(v);
+    if ((v = zend_hash_str_find(Z_ARRVAL_P(z), "vram_bytes", 10))) a->vram_bytes = (uint64_t)zval_get_long(v);
+    if ((v = zend_hash_str_find(Z_ARRVAL_P(z), "device_type", 11)) && Z_TYPE_P(v) == IS_STRING) {
+        if (strcmp(Z_STRVAL_P(v), "discrete") == 0) a->device_type = "discrete";
+        else if (strcmp(Z_STRVAL_P(v), "integrated") == 0) a->device_type = "integrated";
+        else if (strcmp(Z_STRVAL_P(v), "software") == 0) a->device_type = "software";
+    }
+    if ((v = zend_hash_str_find(Z_ARRVAL_P(z), "features", 8)) && Z_TYPE_P(v) == IS_ARRAY) {
+        zval *f;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(v), f) {
+            zend_long x = zval_get_long(f);
+            vio_featset_add(&a->features, (int)x);
+        } ZEND_HASH_FOREACH_END();
+    }
+}
+
+/* One candidate per backend with its preferred adapter: from the backends, or
+ * simulated from VIO_TEST_ADAPTERS = {"platform": "windows"|"macos"|"linux",
+ * "adapters": {"<backend>": [{name, vendor_id, device_type, vram_bytes,
+ * features}], ...}} so the ranking is testable without the GPUs. */
+static int vio_select_collect(vio_select_candidate *c, int max, int *platform)
+{
+    char *env = (char *)emalloc(65536);
+    int n = 0;
+    *platform = vio_select_host_platform();
+    if (vio_select_env("VIO_TEST_ADAPTERS", env, 65536)) {
+        zval root;
+        if (php_json_decode_ex(&root, env, strlen(env), PHP_JSON_OBJECT_AS_ARRAY, 16) == SUCCESS) {
+            if (Z_TYPE(root) == IS_ARRAY) {
+                zval *pv = zend_hash_str_find(Z_ARRVAL(root), "platform", 8), *ad, *list;
+                zend_string *key;
+                if (pv && Z_TYPE_P(pv) == IS_STRING) {
+                    if (strcmp(Z_STRVAL_P(pv), "windows") == 0) *platform = VIO_PLATFORM_WINDOWS;
+                    else if (strcmp(Z_STRVAL_P(pv), "macos") == 0) *platform = VIO_PLATFORM_MACOS;
+                    else if (strcmp(Z_STRVAL_P(pv), "linux") == 0) *platform = VIO_PLATFORM_LINUX;
+                }
+                ad = zend_hash_str_find(Z_ARRVAL(root), "adapters", 8);
+                if (ad && Z_TYPE_P(ad) == IS_ARRAY) {
+                    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(ad), key, list) {
+                        if (!key || n >= max) continue;
+                        vio_select_candidate *k = &c[n++];
+                        memset(k, 0, sizeof(*k));
+                        snprintf(k->backend, sizeof(k->backend), "%s", ZSTR_VAL(key));
+                        k->be = vio_find_backend(k->backend);
+                        zval *first = Z_TYPE_P(list) == IS_ARRAY ? zend_hash_index_find(Z_ARRVAL_P(list), 0) : NULL;
+                        if (first) {
+                            vio_select_adapter_from_zval(&k->adapter, first);
+                            k->has_adapter = 1;
+                        }
+                    } ZEND_HASH_FOREACH_END();
+                }
+            }
+            zval_ptr_dtor(&root);
+        }
+    } else {
+        vio_adapter_info *list = (vio_adapter_info *)ecalloc(VIO_MAX_ADAPTERS, sizeof(vio_adapter_info));
+        for (int b = 0; b < vio_backend_count() && n < max; b++) {
+            const char *name = vio_get_backend_name(b);
+            const vio_backend *be = name ? vio_find_backend(name) : NULL;
+            if (!be || strcmp(name, "null") == 0) continue;
+            vio_select_candidate *k = &c[n++];
+            memset(k, 0, sizeof(*k));
+            snprintf(k->backend, sizeof(k->backend), "%s", name);
+            k->be = be;
+            if (be->enumerate_adapters && be->enumerate_adapters(list, VIO_MAX_ADAPTERS) > 0) {
+                k->adapter = list[0];
+                k->has_adapter = 1;
+            }
+        }
+        efree(list);
+    }
+    efree(env);
+    return n;
+}
+
+static const vio_backend *vio_select_next(const vio_select_candidate *c, int n, const vio_backend **tried, int tried_n)
+{
+    for (int i = 0; i < n; i++) {
+        int seen = 0;
+        if (!c[i].eligible || !c[i].be) continue;
+        for (int t = 0; t < tried_n; t++) if (tried[t] == c[i].be) seen = 1;
+        if (!seen) return c[i].be;
+    }
+    return NULL;
+}
+
+static void vio_select_to_zval(zval *out, const vio_select_candidate *c, int n)
+{
+    array_init(out);
+    for (int i = 0; i < n; i++) {
+        zval e;
+        array_init(&e);
+        add_assoc_string(&e, "backend", (char *)c[i].backend);
+        if (c[i].has_adapter) add_assoc_string(&e, "adapter", (char *)c[i].adapter.name);
+        else add_assoc_null(&e, "adapter");
+        add_assoc_string(&e, "vendor", (char *)vio_vendor_name(c[i].has_adapter ? c[i].adapter.vendor_id : 0));
+        add_assoc_string(&e, "device_type", (char *)(c[i].has_adapter && c[i].adapter.device_type ? c[i].adapter.device_type : "unknown"));
+        add_assoc_long(&e, "score", c[i].score);
+        add_assoc_bool(&e, "eligible", c[i].eligible);
+        if (c[i].reason[0]) add_assoc_string(&e, "reason", (char *)c[i].reason);
+        else add_assoc_null(&e, "reason");
+        if (c[i].bench_state > 0) add_assoc_double(&e, "benchmark_ms", c[i].bench_ms);
+        else add_assoc_null(&e, "benchmark_ms");
+        add_next_index_zval(out, &e);
+    }
+}
+
+/* vio_rank_backends(array $options = []): the ranking a scored 'auto' would use. */
+ZEND_FUNCTION(vio_rank_backends)
+{
+    HashTable *opts = NULL;
+    int prefer, platform, bench;
+    vio_feature_set require;
+    vio_select_candidate rank[VIO_MAX_BACKENDS];
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+    if (vio_select_options(opts, &prefer, &require, &bench) < 0) RETURN_FALSE;
+    int n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
+    vio_select_rank(rank, n, platform, prefer, &require);
+    vio_select_to_zval(return_value, rank, n);
+}
+
+/* ── Calibration run (OPEN-ITEMS-PLAN A8) ────────────────────────────────
+ *
+ * The same scene on every candidate, through the public API only: 64 draws of a
+ * 2k-triangle grid with per-draw uniforms into a render target, a 25-tap
+ * post pass to the backbuffer and an async compute dispatch (when the backend
+ * has compute). Headless on the GPU (headless_hardware), 256 x 256. */
+static const char vio_bench_scene_src[] =
+    "function (string $backend, int $frames): array|false {\n"
+    "    $size = 256;\n"
+    "    $ctx = @vio_create($backend, ['width' => $size, 'height' => $size, 'headless' => true,\n"
+    "                                  'headless_hardware' => true, 'vsync' => false]);\n"
+    "    if (!$ctx) return false;\n"
+    "    if (vio_backend_name($ctx) !== $backend || !vio_supports_feature($ctx, VIO_FEATURE_3D_PIPELINE)) {\n"
+    "        vio_destroy($ctx);\n"
+    "        return false;\n"
+    "    }\n"
+    "    $scene = vio_shader($ctx, ['vertex' => '#version 330 core\n"
+    "layout(location = 0) in vec3 aPos;\n"
+    "uniform vec4 u_xform;\n"
+    "out vec2 v_p;\n"
+    "void main() { v_p = aPos.xy; gl_Position = vec4(aPos.xy * u_xform.z + u_xform.xy, aPos.z, 1.0); }',\n"
+    "        'fragment' => '#version 330 core\n"
+    "in vec2 v_p;\n"
+    "uniform vec4 u_color;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "void main() { float s = 0.0; for (int k = 0; k < 16; k++) s += sin(v_p.x * float(k) + v_p.y); o = u_color * (0.5 + 0.03 * s); }']);\n"
+    "    $post = vio_shader($ctx, ['vertex' => '#version 330 core\n"
+    "layout(location = 0) in vec3 aPos;\n"
+    "out vec2 v_uv;\n"
+    "void main() { v_uv = aPos.xy * 0.5 + 0.5; gl_Position = vec4(aPos, 1.0); }',\n"
+    "        'fragment' => '#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "uniform sampler2D u_tex;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "void main() { vec4 c = vec4(0.0); for (int y = -2; y <= 2; y++) for (int x = -2; x <= 2; x++) c += texture(u_tex, v_uv + vec2(x, y) / 256.0); o = c / 25.0; }']);\n"
+    "    if (!$scene || !$post) { vio_destroy($ctx); return false; }\n"
+    "    $pScene = vio_pipeline($ctx, ['shader' => $scene, 'depth_test' => true]);\n"
+    "    $pPost = vio_pipeline($ctx, ['shader' => $post, 'depth_test' => false]);\n"
+    "    $v = [];\n"
+    "    $idx = [];\n"
+    "    $n = 32;\n"
+    "    for ($y = 0; $y <= $n; $y++) for ($x = 0; $x <= $n; $x++) { $v[] = $x / $n * 2 - 1; $v[] = $y / $n * 2 - 1; $v[] = 0.5; }\n"
+    "    for ($y = 0; $y < $n; $y++) for ($x = 0; $x < $n; $x++) {\n"
+    "        $a = $y * ($n + 1) + $x;\n"
+    "        array_push($idx, $a, $a + 1, $a + $n + 2, $a, $a + $n + 2, $a + $n + 1);\n"
+    "    }\n"
+    "    $grid = vio_mesh($ctx, ['vertices' => $v, 'indices' => $idx, 'layout' => [VIO_FLOAT3]]);\n"
+    "    $full = vio_mesh($ctx, ['vertices' => [-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0], 'indices' => [0, 1, 2, 0, 2, 3], 'layout' => [VIO_FLOAT3]]);\n"
+    "    $rt = vio_render_target($ctx, ['width' => $size, 'height' => $size]);\n"
+    "    $cp = null;\n"
+    "    if (vio_supports_feature($ctx, VIO_FEATURE_COMPUTE)) {\n"
+    "        $cp = @vio_compute_pipeline($ctx, ['source' => '#version 450\n"
+    "layout(local_size_x = 64) in;\n"
+    "layout(std430, binding = 0) buffer Data { float v[]; };\n"
+    "void main() { uint i = gl_GlobalInvocationID.x; float x = v[i]; for (int k = 0; k < 32; k++) x = sin(x) * 0.999 + 0.5; v[i] = x; }']);\n"
+    "        $buf = $cp ? @vio_storage_buffer($ctx, ['size' => 65536 * 4]) : null;\n"
+    "        if ($buf) vio_compute_bind_buffer($ctx, $cp, $buf, 0, VIO_COMPUTE_WRITE);\n"
+    "        else $cp = null;\n"
+    "    }\n"
+    "    if (!$pScene || !$pPost || !$grid || !$full || !$rt) { vio_destroy($ctx); return false; }\n"
+    "    $frame = function () use ($ctx, $pScene, $pPost, $grid, $full, $rt, $cp) {\n"
+    "        vio_begin($ctx);\n"
+    "        if ($cp) vio_compute_dispatch($ctx, $cp, 1024, 1, 1, ['async' => true]);\n"
+    "        vio_bind_render_target($ctx, $rt);\n"
+    "        vio_clear($ctx, 0.1, 0.1, 0.1, 1.0);\n"
+    "        vio_bind_pipeline($ctx, $pScene);\n"
+    "        for ($i = 0; $i < 64; $i++) {\n"
+    "            vio_set_uniform($ctx, 'u_xform', [($i % 8) / 4.0 - 0.875, intdiv($i, 8) / 4.0 - 0.875, 0.12, 0.0]);\n"
+    "            vio_set_uniform($ctx, 'u_color', [($i % 3) / 2.0, ($i % 5) / 4.0, ($i % 7) / 6.0, 1.0]);\n"
+    "            vio_draw($ctx, $grid);\n"
+    "        }\n"
+    "        vio_unbind_render_target($ctx);\n"
+    "        vio_bind_pipeline($ctx, $pPost);\n"
+    "        vio_set_uniform($ctx, 'u_tex', 0);\n"
+    "        vio_bind_texture($ctx, vio_render_target_texture($rt), 0);\n"
+    "        vio_draw($ctx, $full);\n"
+    "        vio_end($ctx);\n"
+    "    };\n"
+    "    for ($i = 0; $i < 3; $i++) $frame();\n"
+    "    vio_read_pixels($ctx);\n"
+    "    $gpu = [];\n"
+    "    $t = hrtime(true);\n"
+    "    for ($i = 0; $i < $frames; $i++) {\n"
+    "        $frame();\n"
+    "        $g = vio_gpu_frame_time($ctx);\n"
+    "        if ($g >= 0) $gpu[] = $g;\n"
+    "    }\n"
+    "    vio_read_pixels($ctx);\n"
+    "    $ms = (hrtime(true) - $t) / 1e6 / max(1, $frames);\n"
+    "    vio_destroy($ctx);\n"
+    "    sort($gpu);\n"
+    "    return ['ms' => $ms, 'gpu_ms' => $gpu ? (float)$gpu[intdiv(count($gpu), 2)] : -1.0];\n"
+    "}\n";
+
+static int vio_bench_run(const char *backend, int frames, double *ms, double *gpu_ms)
+{
+    zval fn, ret, args[2];
+    int ok = 0;
+    int saved_er = (int)EG(error_reporting);
+    if (zend_eval_stringl(vio_bench_scene_src, sizeof(vio_bench_scene_src) - 1, &fn, "vio calibration scene") != SUCCESS)
+        return 0;
+    ZVAL_STRING(&args[0], backend);
+    ZVAL_LONG(&args[1], frames);
+    EG(error_reporting) &= ~(E_WARNING | E_NOTICE);
+    if (call_user_function(NULL, NULL, &fn, &ret, 2, args) == SUCCESS) {
+        if (!EG(exception) && Z_TYPE(ret) == IS_ARRAY) {
+            zval *m = zend_hash_str_find(Z_ARRVAL(ret), "ms", 2);
+            zval *g = zend_hash_str_find(Z_ARRVAL(ret), "gpu_ms", 6);
+            if (m) {
+                *ms = zval_get_double(m);
+                *gpu_ms = g ? zval_get_double(g) : -1.0;
+                ok = *ms > 0;
+            }
+        }
+        zval_ptr_dtor(&ret);
+    }
+    /* A candidate that throws simply did not run the scene. */
+    if (EG(exception)) zend_clear_exception();
+    EG(error_reporting) = saved_er;
+    zval_ptr_dtor(&args[0]);
+    zval_ptr_dtor(&fn);
+    return ok;
+}
+
+/* Cache key: a driver update or a new vio version measures again. */
+static void vio_bench_key(char *out, size_t size, const vio_select_candidate *c)
+{
+    snprintf(out, size, "%s|%s|%s|%s", c->backend, c->has_adapter ? c->adapter.name : "",
+             c->has_adapter ? c->adapter.driver : "", PHP_VIO_VERSION);
+}
+
+static void vio_bench_path(char *out, size_t size, const char *dir)
+{
+    size_t n = strlen(dir);
+    int sep = n && (dir[n - 1] == '/' || dir[n - 1] == '\\');
+    snprintf(out, size, "%s%svio-benchmark.json", dir, sep ? "" : "/");
+}
+
+/* {"version": 1, "entries": {key: {"ms", "gpu_ms"}}}; UNDEF when absent / unreadable. */
+static void vio_bench_load(zval *root, const char *dir)
+{
+    char path[1100];
+    ZVAL_UNDEF(root);
+    vio_bench_path(path, sizeof(path), dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len > 0 && len < (16 << 20)) {
+        char *buf = (char *)emalloc((size_t)len + 1);
+        size_t got = fread(buf, 1, (size_t)len, f);
+        buf[got] = '\0';
+        if (php_json_decode_ex(root, buf, got, PHP_JSON_OBJECT_AS_ARRAY, 8) != SUCCESS || Z_TYPE_P(root) != IS_ARRAY) {
+            zval_ptr_dtor(root);
+            ZVAL_UNDEF(root);
+        }
+        efree(buf);
+    }
+    fclose(f);
+}
+
+static void vio_bench_save(zval *entries, const char *dir)
+{
+    char path[1100];
+    smart_str out = {0};
+    zval root, ver;
+    array_init(&root);
+    ZVAL_LONG(&ver, 1);
+    add_assoc_zval(&root, "version", &ver);
+    Z_TRY_ADDREF_P(entries);
+    add_assoc_zval(&root, "entries", entries);
+    if (php_json_encode(&out, &root, PHP_JSON_PRETTY_PRINT | PHP_JSON_UNESCAPED_SLASHES) == SUCCESS && out.s) {
+        vio_bench_path(path, sizeof(path), dir);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(ZSTR_VAL(out.s), 1, ZSTR_LEN(out.s), f);
+            fclose(f);
+        }
+    }
+    smart_str_free(&out);
+    zval_ptr_dtor(&root);
+}
+
+/* Measure (or read from the cache) the first `max` eligible registered
+ * candidates of the ranking. */
+static void vio_bench_candidates(vio_select_candidate *c, int n, int max, int frames, const char *dir)
+{
+    zval root, entries;
+    int dirty = 0, done = 0;
+    char key[600];
+    array_init(&entries);
+    if (dir && *dir) {
+        vio_bench_load(&root, dir);
+        if (Z_TYPE(root) == IS_ARRAY) {
+            zval *e = zend_hash_str_find(Z_ARRVAL(root), "entries", 7);
+            zval *v = zend_hash_str_find(Z_ARRVAL(root), "version", 7);
+            if (e && Z_TYPE_P(e) == IS_ARRAY && v && zval_get_long(v) == 1) {
+                zval_ptr_dtor(&entries);
+                ZVAL_ARR(&entries, zend_array_dup(Z_ARRVAL_P(e)));
+            }
+            zval_ptr_dtor(&root);
+        }
+    }
+    for (int i = 0; i < n && done < max; i++) {
+        vio_select_candidate *k = &c[i];
+        double ms = 0, gpu = -1;
+        if (!k->eligible || !k->be) continue;
+        done++;
+        vio_bench_key(key, sizeof(key), k);
+        zval *hit = zend_hash_str_find(Z_ARRVAL(entries), key, strlen(key));
+        zval *hm = hit && Z_TYPE_P(hit) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(hit), "ms", 2) : NULL;
+        if (hm && zval_get_double(hm) > 0) {
+            zval *hg = zend_hash_str_find(Z_ARRVAL_P(hit), "gpu_ms", 6);
+            k->bench_state = 2;
+            k->bench_ms = zval_get_double(hm);
+            k->bench_gpu_ms = hg ? zval_get_double(hg) : -1.0;
+            continue;
+        }
+        if (vio_bench_run(k->backend, frames, &ms, &gpu)) {
+            zval e;
+            k->bench_state = 1;
+            k->bench_ms = ms;
+            k->bench_gpu_ms = gpu;
+            array_init(&e);
+            add_assoc_double(&e, "ms", ms);
+            add_assoc_double(&e, "gpu_ms", gpu);
+            zend_hash_str_update(Z_ARRVAL(entries), key, strlen(key), &e);
+            dirty = 1;
+        } else {
+            k->bench_state = -1;
+            k->bench_ms = -1.0;
+            k->bench_gpu_ms = -1.0;
+        }
+    }
+    if (dirty && dir && *dir) vio_bench_save(&entries, dir);
+    zval_ptr_dtor(&entries);
+}
+
+/* Measured candidates first, fastest first; the rest keep the ranking. */
+static void vio_bench_reorder(vio_select_candidate *c, int n)
+{
+    for (int i = 1; i < n; i++) {
+        vio_select_candidate tmp = c[i];
+        int j = i - 1;
+        int tm = tmp.bench_state > 0;
+        while (j >= 0) {
+            int cm = c[j].bench_state > 0;
+            if (!(tm && (!cm || c[j].bench_ms > tmp.bench_ms))) break;
+            c[j + 1] = c[j];
+            j--;
+        }
+        c[j + 1] = tmp;
+    }
+}
+
+static const char *vio_bench_dir(HashTable *opts, const char *key)
+{
+    zval *v = opts ? zend_hash_str_find(opts, key, strlen(key)) : NULL;
+    if (v && Z_TYPE_P(v) == IS_STRING && Z_STRLEN_P(v)) return Z_STRVAL_P(v);
+    v = opts ? zend_hash_str_find(opts, "shader_cache", sizeof("shader_cache") - 1) : NULL;
+    if (v && Z_TYPE_P(v) == IS_STRING && Z_STRLEN_P(v)) return Z_STRVAL_P(v);
+    return vio_shader_cache_dir();
+}
+
+static int vio_bench_frames(HashTable *opts, const char *key)
+{
+    zval *v = opts ? zend_hash_str_find(opts, key, strlen(key)) : NULL;
+    zend_long f = v ? zval_get_long(v) : 120;
+    return f < 1 ? 1 : (f > 2000 ? 2000 : (int)f);
+}
+
+/* vio_benchmark_backends(array $options = []): the calibration table, no selection. */
+ZEND_FUNCTION(vio_benchmark_backends)
+{
+    HashTable *opts = NULL;
+    int prefer, platform, bench;
+    vio_feature_set require;
+    vio_select_candidate rank[VIO_MAX_BACKENDS];
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+    if (vio_select_options(opts, &prefer, &require, &bench) < 0) RETURN_FALSE;
+    zval *mv = opts ? zend_hash_str_find(opts, "max", 3) : NULL;
+    zend_long max = mv ? zval_get_long(mv) : 3;
+    if (max < 1) max = 1;
+    if (max > VIO_MAX_BACKENDS) max = VIO_MAX_BACKENDS;
+    int n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
+    vio_select_rank(rank, n, platform, prefer, &require);
+    vio_bench_candidates(rank, n, (int)max, vio_bench_frames(opts, "frames"), vio_bench_dir(opts, "cache"));
+    vio_bench_reorder(rank, n);
+    array_init(return_value);
+    /* Measured first (fastest first), failed runs last. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < n; i++) {
+            zval e;
+            if (rank[i].bench_state == 0 || (pass == 0) != (rank[i].bench_state > 0)) continue;
+            array_init(&e);
+            add_assoc_string(&e, "backend", rank[i].backend);
+            if (rank[i].has_adapter) add_assoc_string(&e, "adapter", rank[i].adapter.name);
+            else add_assoc_null(&e, "adapter");
+            add_assoc_string(&e, "driver", rank[i].has_adapter ? rank[i].adapter.driver : "");
+            add_assoc_double(&e, "ms", rank[i].bench_ms);
+            add_assoc_double(&e, "gpu_ms", rank[i].bench_gpu_ms);
+            add_assoc_bool(&e, "cached", rank[i].bench_state == 2);
+            add_next_index_zval(return_value, &e);
+        }
+    }
+}
+
 /* vio_create('auto') (GAP-PHASE5 Block 10c): a registered backend that cannot open a
  * device on this machine (a Vulkan loader without a driver, ...) hands over to the
  * next candidate instead of failing the whole call. While another candidate remains,
@@ -122,16 +632,40 @@ ZEND_FUNCTION(vio_create)
     const vio_backend *tried[8];
     int tried_n = 0;
 
+    /* 'prefer' / 'require' turn 'auto' into a ranking (A7); plain 'auto' keeps
+     * the platform priority list. */
+    int select_prefer = VIO_PREFER_PERFORMANCE, rank_n = 0, benchmark = 0;
+    vio_feature_set select_require = {{0}};
+    vio_select_candidate rank[VIO_MAX_BACKENDS];
+    int scored = auto_pick ? vio_select_options(options_ht, &select_prefer, &select_require, &benchmark) : 0;
+    if (scored < 0) RETURN_FALSE;
+    if (scored) {
+        int platform;
+        rank_n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
+        vio_select_rank(rank, rank_n, platform, select_prefer, &select_require);
+        /* A8: the calibration run decides among the top three; cached per adapter + driver. */
+        if (benchmark) {
+            vio_bench_candidates(rank, rank_n, 3, vio_bench_frames(options_ht, "benchmark_frames"),
+                                 vio_bench_dir(options_ht, "benchmark_cache"));
+            vio_bench_reorder(rank, rank_n);
+            benchmark = rank_n > 0 && rank[0].bench_state > 0;
+        }
+    }
+
     /* Find backend */
     const vio_backend *backend;
 pick_backend:
     if (auto_pick) {
-        backend = vio_get_auto_backend_skip(tried, tried_n);
+        backend = scored ? vio_select_next(rank, rank_n, tried, tried_n) : vio_get_auto_backend_skip(tried, tried_n);
     } else {
         backend = vio_find_backend(backend_name);
     }
 
     if (!backend) {
+        if (scored) {
+            php_error_docref(NULL, E_WARNING, "'auto': no backend provides the required features or opens a device");
+            RETURN_FALSE;
+        }
         if (backend_name && strcmp(backend_name, "auto") != 0) {
             php_error_docref(NULL, E_WARNING, "Backend \"%s\" is not available", backend_name);
         } else {
@@ -144,7 +678,7 @@ pick_backend:
     int vio_saved_er = (int)EG(error_reporting);
     if (auto_pick && tried_n < 8) {
         tried[tried_n] = backend;
-        if (vio_get_auto_backend_skip(tried, tried_n + 1) != NULL) {
+        if ((scored ? vio_select_next(rank, rank_n, tried, tried_n + 1) : vio_get_auto_backend_skip(tried, tried_n + 1)) != NULL) {
             vio_quiet = 1;
             EG(error_reporting) &= ~(E_WARNING | E_NOTICE);
         }
@@ -195,7 +729,7 @@ pick_backend:
         if ((val = zend_hash_str_find(options_ht, "hdr_paper_white", sizeof("hdr_paper_white") - 1)) != NULL) {
             ctx->config.hdr_paper_white = (float)zval_get_double(val);
         }
-        /* D3D12 shader model: 6 => DXC / DXIL (opt-in), default FXC 5.1. */
+        /* D3D12 shader model: 6 => DXC / DXIL (opt-in), 60..69 pins the profile, default FXC 5.1. */
         if ((val = zend_hash_str_find(options_ht, "shader_model", sizeof("shader_model") - 1)) != NULL) {
             ctx->config.shader_model = (int)zval_get_long(val);
         }
@@ -208,6 +742,15 @@ pick_backend:
             size_t n = Z_STRLEN_P(val);
             if (n < sizeof(ctx->config.dxc_dir)) memcpy(ctx->config.dxc_dir, Z_STRVAL_P(val), n + 1);
         }
+        /* D3D12 Agility SDK: directory with D3D12Core.dll (+ optional version). */
+        if ((val = zend_hash_str_find(options_ht, "agility_sdk", sizeof("agility_sdk") - 1)) != NULL && Z_TYPE_P(val) == IS_STRING) {
+            size_t n = Z_STRLEN_P(val);
+            if (n < sizeof(ctx->config.agility_sdk)) memcpy(ctx->config.agility_sdk, Z_STRVAL_P(val), n + 1);
+        }
+        if ((val = zend_hash_str_find(options_ht, "agility_sdk_version", sizeof("agility_sdk_version") - 1)) != NULL) {
+            zend_long av = zval_get_long(val);
+            ctx->config.agility_sdk_version = av < 0 ? 0 : (int)av;
+        }
         /* Waitable swapchain: cap the CPU's run-ahead at n frames (D3D11 / D3D12). */
         if ((val = zend_hash_str_find(options_ht, "frame_latency", sizeof("frame_latency") - 1)) != NULL) {
             zend_long fl = zval_get_long(val);
@@ -219,6 +762,11 @@ pick_backend:
         if ((val = zend_hash_str_find(options_ht, "headless", sizeof("headless") - 1)) != NULL) {
             ctx->config.headless = zend_is_true(val);
         }
+        /* D3D11 / D3D12 run headless contexts on WARP; this keeps the GPU
+         * (like VIO_D3D_HEADLESS_HARDWARE=1, per context). */
+        if ((val = zend_hash_str_find(options_ht, "headless_hardware", sizeof("headless_hardware") - 1)) != NULL) {
+            ctx->config.headless_hardware = zend_is_true(val);
+        }
         /* On-disk shader / pipeline cache directory (GAP-PHASE5 Block 4): DXBC per
          * HLSL stage on D3D11/D3D12, GL program binaries, the Vulkan pipeline
          * cache. Process-wide; absent or '' keeps everything compiled per run. */
@@ -228,6 +776,22 @@ pick_backend:
         }
     }
 
+    /* VIO_D3D12_AGILITY_SDK / _VERSION: the same for every context without the
+     * option, so a whole test run uses the Agility runtime (SM69-PLAN 0a). */
+    if (!ctx->config.agility_sdk[0]) {
+        const char *env = getenv("VIO_D3D12_AGILITY_SDK");
+        if (env && *env && strlen(env) < sizeof(ctx->config.agility_sdk)) {
+            memcpy(ctx->config.agility_sdk, env, strlen(env) + 1);
+            const char *ev = getenv("VIO_D3D12_AGILITY_SDK_VERSION");
+            if (ev && *ev && ctx->config.agility_sdk_version == 0) ctx->config.agility_sdk_version = atoi(ev);
+        }
+    }
+    /* VIO_DXC_DIR: dxcompiler.dll + dxil.dll for every context without 'dxc_dir'. */
+    if (!ctx->config.dxc_dir[0]) {
+        const char *env = getenv("VIO_DXC_DIR");
+        if (env && *env && strlen(env) < sizeof(ctx->config.dxc_dir)) memcpy(ctx->config.dxc_dir, env, strlen(env) + 1);
+    }
+
     /* Initialize backend */
     if (ctx->backend->init && ctx->backend->init(&ctx->config) != 0) {
         php_error_docref(NULL, E_WARNING, "Failed to initialize backend \"%s\"", ctx->backend->name);
@@ -235,9 +799,9 @@ pick_backend:
         VIO_CREATE_FAIL();
     }
 
-#ifdef HAVE_GLFW
-    /* Create GLFW window (unless null/headless backend) */
-    if (strcmp(ctx->backend->name, "null") != 0) {
+    /* Create the platform window (not for the null backend, not without a
+     * window system - the null platform). */
+    if (strcmp(ctx->backend->name, "null") != 0 && vio_platform_has_windows()) {
         ctx->window = vio_window_create(&ctx->config, ctx->backend->name);
         if (!ctx->window) {
             if (ctx->backend->shutdown) {
@@ -247,9 +811,10 @@ pick_backend:
             VIO_CREATE_FAIL();
         }
 
-        /* Install input callbacks */
-        vio_input_install_callbacks(ctx->window, &ctx->input);
+        /* Route the window's input events into the context */
+        vio_plat()->install_input(ctx->window, &ctx->input);
 
+#ifdef HAVE_OPENGL
         /* OpenGL: load GL functions and compile default shaders */
         if (strcmp(ctx->backend->name, "opengl") == 0) {
             if (vio_opengl_setup_context() != 0) {
@@ -278,6 +843,7 @@ pick_backend:
                 }
             }
         }
+#endif
 
 #ifdef HAVE_VULKAN
         /* Vulkan: create instance, device, swapchain, etc. */
@@ -310,7 +876,7 @@ pick_backend:
 #endif
 
 #ifdef HAVE_D3D11
-        /* D3D11: set GLFW window handle and create swapchain */
+        /* D3D11: the window's HWND gets the swapchain */
         if (strcmp(ctx->backend->name, "d3d11") == 0) {
             if (vio_d3d11_setup_context(ctx->window, &ctx->config) != 0) {
                 vio_window_destroy(ctx->window);
@@ -325,7 +891,7 @@ pick_backend:
 #endif
 
 #ifdef HAVE_D3D12
-        /* D3D12: set GLFW window handle and create swapchain */
+        /* D3D12: the window's HWND gets the swapchain */
         if (strcmp(ctx->backend->name, "d3d12") == 0) {
             if (vio_d3d12_setup_context(ctx->window, &ctx->config) != 0) {
                 vio_window_destroy(ctx->window);
@@ -339,7 +905,6 @@ pick_backend:
         }
 #endif
     }
-#endif
 
 #ifdef HAVE_IOS
     /* iOS path: there is no GLFW window. The iOS backend creates a
@@ -373,6 +938,21 @@ pick_backend:
 #endif
 
     ctx->initialized = 1;
+    /* A required feature the ranking could not see before the device opened
+     * (OpenGL, shader-toolchain flags): next candidate. */
+    for (int f = 0; scored && f < VIO_FEATURE_SET_MAX; f++) {
+        if (vio_featset_has(&select_require, f)
+            && !(ctx->backend->supports_feature && ctx->backend->supports_feature((vio_feature)f))) {
+            zval_ptr_dtor(&obj);
+            VIO_CREATE_FAIL();
+        }
+    }
+    ctx->selected_by = !auto_pick ? "explicit" : (benchmark && backend == rank[0].be ? "benchmark" : (scored ? "score" : "priority"));
+    if (scored) {
+        zval cand;
+        vio_select_to_zval(&cand, rank, rank_n);
+        ctx->candidates = Z_ARR(cand);
+    }
     RETURN_COPY_VALUE(&obj);
 }
 
@@ -391,6 +971,8 @@ ZEND_FUNCTION(vio_destroy)
     /* Release the draw-time bind table before the GPU objects behind it go away. */
     vio_pending_textures_clear(ctx);
     vio_context_bindless_clear(ctx);
+    vio_context_release_fragment_storage(ctx);
+    vio_upscale_release(ctx);
 
     /* A replay holds process-global virtual gamepads and hides the physical
      * ones; a destroyed context must give them back even while PHP still holds
@@ -418,12 +1000,10 @@ ZEND_FUNCTION(vio_destroy)
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }
-#ifdef HAVE_GLFW
         if (ctx->window) {
             vio_window_destroy(ctx->window);
             ctx->window = NULL;
         }
-#endif
 #ifdef HAVE_IOS
         /* Tear down the iOS render view; the Metal context is shut down
          * via ctx->backend->shutdown above. */
@@ -447,12 +1027,10 @@ ZEND_FUNCTION(vio_should_close)
         RETURN_TRUE;
     }
 
-#ifdef HAVE_GLFW
     if (ctx->window && vio_window_should_close(ctx->window)) {
         ctx->should_close = 1;
         RETURN_TRUE;
     }
-#endif
 
     RETURN_FALSE;
 }
@@ -468,11 +1046,9 @@ ZEND_FUNCTION(vio_close)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     ctx->should_close = 1;
 
-#ifdef HAVE_GLFW
     if (ctx->window) {
         vio_window_set_should_close(ctx->window, 1);
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_poll_events)
@@ -488,9 +1064,7 @@ ZEND_FUNCTION(vio_poll_events)
     /* The record/replay clock ticks once per poll; replayed events are
      * delivered after the OS ones, at the point real ones would arrive. */
     vio_input_poll_begin(&ctx->input);
-#ifdef HAVE_GLFW
     vio_window_poll_events();
-#endif
 #ifdef HAVE_IOS
     /* No OS event pump on iOS (UIKit drives that). Drain the soft-keyboard
      * codepoints queued by the UIKeyInput view on the main thread, emitting
@@ -505,7 +1079,6 @@ ZEND_FUNCTION(vio_poll_events)
 
 
 
-#ifdef HAVE_GLFW
 /* ── Window content scale ──────────────────────────────────────────────
  *
  * Every DPI-dependent path here derives from the window's content scale: the
@@ -517,7 +1090,7 @@ ZEND_FUNCTION(vio_poll_events)
  * VIO_FORCE_CONTENT_SCALE overrides it so the scaled paths are testable on any
  * machine. Accepts "1.5" for a uniform scale or "1.5x2" for an asymmetric one.
  * Read once per process; unset or unparsable means no override. */
-static void vio_window_content_scale(GLFWwindow *window, float *sx, float *sy)
+static void vio_window_content_scale(vio_window_handle window, float *sx, float *sy)
 {
     static int   checked = 0;
     static float forced_x = 0.0f, forced_y = 0.0f;
@@ -541,9 +1114,22 @@ static void vio_window_content_scale(GLFWwindow *window, float *sx, float *sy)
         return;
     }
 
-    glfwGetWindowContentScale(window, sx, sy);
+    vio_plat()->get_content_scale(window, sx, sy);
 }
-#endif
+
+/* Released bindless slots whose frames have finished: clear the entry, drop the
+ * table's reference, and hand the slot out again. Between frames. */
+static void vio_bindless_retire(vio_context_object *ctx)
+{
+    if (!ctx->bindless) return;
+    for (int i = 0; i < ctx->bindless_count; i++) {
+        if (!ctx->bindless_retire[i] || ctx->bindless_retire[i] > ctx->frame_no) continue;
+        if (ctx->backend && ctx->backend->bindless_set) ctx->backend->bindless_set(i, NULL, ctx->bindless_kind[i]);
+        if (ctx->bindless[i]) { OBJ_RELEASE(ctx->bindless[i]); ctx->bindless[i] = NULL; }
+        ctx->bindless_retire[i] = 0;
+        ctx->bindless_free[ctx->bindless_free_count++] = i;
+    }
+}
 
 ZEND_FUNCTION(vio_begin)
 {
@@ -565,9 +1151,11 @@ ZEND_FUNCTION(vio_begin)
         return;
     }
 
+    ctx->frame_no++;
+    vio_bindless_retire(ctx);
+
     vio_input_update(&ctx->input);
 
-#ifdef HAVE_GLFW
     /* Sync 2D projection and viewport to current window size.
      * Projection (state_2d.width/height) is in LOGICAL coords: framebuffer/scale.
      * Viewport (state_2d.fb_width/height) is in PHYSICAL pixels.
@@ -582,7 +1170,7 @@ ZEND_FUNCTION(vio_begin)
             fb_w = ctx->config.width;
             fb_h = ctx->config.height;
         } else {
-            glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+            vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
             vio_window_content_scale(ctx->window, &sx, &sy);
         }
         if (sx <= 0.0f) sx = 1.0f;
@@ -599,14 +1187,12 @@ ZEND_FUNCTION(vio_begin)
         ctx->state_2d.fb_width  = fb_w;
         ctx->state_2d.fb_height = fb_h;
     }
-#endif
 
 #ifdef HAVE_METAL
     if (strcmp(ctx->backend->name, "metal") == 0) {
         int fb_w = 0, fb_h = 0;
         float sx = 1.0f, sy = 1.0f;
         int have_size = 0;
-#ifdef HAVE_GLFW
         if (ctx->window) {
             if (ctx->config.headless) {
                 /* Headless renders into a 1:1 offscreen texture (sized from the
@@ -615,15 +1201,14 @@ ZEND_FUNCTION(vio_begin)
                  * viewport/scissor scale stays 1 — otherwise the Retina
                  * framebuffer (2x) would scale scissors to 2x screen positions
                  * against a 1x target, clipping content at double coordinates. */
-                glfwGetWindowSize((GLFWwindow *)ctx->window, &fb_w, &fb_h);
+                vio_plat()->get_window_size(ctx->window, &fb_w, &fb_h);
                 sx = sy = 1.0f;
             } else {
-                glfwGetFramebufferSize((GLFWwindow *)ctx->window, &fb_w, &fb_h);
-                vio_window_content_scale((GLFWwindow *)ctx->window, &sx, &sy);
+                vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
+                vio_window_content_scale(ctx->window, &sx, &sy);
             }
             have_size = 1;
         }
-#endif
 #ifdef HAVE_IOS
         /* iOS: derive the LOGICAL window size (physical framebuffer / content
          * scale), exactly like the GLFW retina path. The game lays out in
@@ -652,7 +1237,7 @@ ZEND_FUNCTION(vio_begin)
     }
 #endif
 
-#if (defined(HAVE_D3D11) || defined(HAVE_D3D12)) && defined(HAVE_GLFW)
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
     if (ctx->window && (strcmp(ctx->backend->name, "d3d11") == 0
                      || strcmp(ctx->backend->name, "d3d12") == 0)) {
         int fb_w, fb_h;
@@ -668,7 +1253,7 @@ ZEND_FUNCTION(vio_begin)
             fb_w = ctx->config.width  > 0 ? ctx->config.width  : 800;
             fb_h = ctx->config.height > 0 ? ctx->config.height : 600;
         } else {
-            glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+            vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
             vio_window_content_scale(ctx->window, &sx, &sy);
         }
         if (sx <= 0.0f) sx = 1.0f;
@@ -821,12 +1406,10 @@ ZEND_FUNCTION(vio_end)
         ctx->backend->present();
     }
 
-#ifdef HAVE_GLFW
-    /* Only OpenGL uses GLFW swap buffers; Vulkan presents via vkQueuePresentKHR */
+    /* Only OpenGL swaps through the platform; the other backends present themselves */
     if (ctx->window && strcmp(ctx->backend->name, "opengl") == 0) {
         vio_window_swap_buffers(ctx->window);
     }
-#endif
 
     vio_pending_textures_clear(ctx);
     ctx->in_frame = 0;
@@ -944,7 +1527,6 @@ ZEND_FUNCTION(vio_key_released)
  * desktop, which is the case that was broken. */
 static double vio_input_logical_scale(vio_context_object *ctx, int horizontal)
 {
-#if defined(HAVE_GLFW)
     /* Headless contexts are 1:1 (vio_content_scale == 1) and injected cursor
      * coordinates are already logical — the monitor DPI of the hidden window
      * must not scale them (15.5 came back as 5.17 on a 300 % display). */
@@ -952,8 +1534,8 @@ static double vio_input_logical_scale(vio_context_object *ctx, int horizontal)
         int scr_w = 0, scr_h = 0, fb_w = 0, fb_h = 0;
         float sx = 1.0f, sy = 1.0f;
 
-        glfwGetWindowSize(ctx->window, &scr_w, &scr_h);
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+        vio_plat()->get_window_size(ctx->window, &scr_w, &scr_h);
+        vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
         vio_window_content_scale(ctx->window, &sx, &sy);
 
         int scr   = horizontal ? scr_w : scr_h;
@@ -965,7 +1547,6 @@ static double vio_input_logical_scale(vio_context_object *ctx, int horizontal)
             if (logical > 0.0) return (double)scr / logical;
         }
     }
-#endif
     (void)ctx;
     (void)horizontal;
     return 1.0;
@@ -1172,22 +1753,11 @@ ZEND_FUNCTION(vio_set_cursor_mode)
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
-#ifdef HAVE_GLFW
+    /* VIO_CURSOR_NORMAL (0) / DISABLED (1, raw motion where available) / HIDDEN (2) */
     if (ctx->window) {
-        int glfw_mode;
-        switch (mode) {
-            case 1:  glfw_mode = GLFW_CURSOR_DISABLED; break;  /* VIO_CURSOR_DISABLED */
-            case 2:  glfw_mode = GLFW_CURSOR_HIDDEN; break;    /* VIO_CURSOR_HIDDEN */
-            default: glfw_mode = GLFW_CURSOR_NORMAL; break;    /* VIO_CURSOR_NORMAL */
-        }
-        glfwSetInputMode(ctx->window, GLFW_CURSOR, glfw_mode);
-
-        /* When switching to disabled mode, enable raw mouse motion if available */
-        if (mode == 1 && glfwRawMouseMotionSupported()) {
-            glfwSetInputMode(ctx->window, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
-        }
+        vio_plat()->set_cursor_mode(ctx->window, mode == 1 ? VIO_PLATFORM_CURSOR_DISABLED
+                                               : mode == 2 ? VIO_PLATFORM_CURSOR_HIDDEN : VIO_PLATFORM_CURSOR_NORMAL);
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_on_key)
@@ -1338,23 +1908,23 @@ ZEND_FUNCTION(vio_toggle_fullscreen)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
 
-    GLFWmonitor *monitor = glfwGetWindowMonitor(ctx->window);
-    if (monitor) {
+    const vio_platform *plat = vio_plat();
+    if (plat->window_monitor(ctx->window) >= 0) {
         /* Currently fullscreen -> go windowed */
-        glfwSetWindowMonitor(ctx->window, NULL,
-            100, 100, ctx->config.width, ctx->config.height, GLFW_DONT_CARE);
+        plat->set_window_monitor(ctx->window, -1,
+            100, 100, ctx->config.width, ctx->config.height, VIO_PLATFORM_DONT_CARE);
     } else {
         /* Currently windowed -> go fullscreen */
-        monitor = glfwGetPrimaryMonitor();
-        const GLFWvidmode *mode = glfwGetVideoMode(monitor);
-        glfwSetWindowMonitor(ctx->window, monitor,
-            0, 0, mode->width, mode->height, mode->refreshRate);
+        vio_monitor_desc md;
+        int primary = plat->primary_monitor();
+        if (primary >= 0 && plat->monitor_desc(primary, &md) == 0) {
+            plat->set_window_monitor(ctx->window, primary,
+                0, 0, md.mode.width, md.mode.height, md.mode.refresh_hz);
+        }
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_set_title)
@@ -1367,12 +1937,10 @@ ZEND_FUNCTION(vio_set_title)
         Z_PARAM_STR(title)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
 
-    glfwSetWindowTitle(ctx->window, ZSTR_VAL(title));
-#endif
+    vio_plat()->set_title(ctx->window, ZSTR_VAL(title));
 }
 
 ZEND_FUNCTION(vio_set_borderless)
@@ -1383,23 +1951,22 @@ ZEND_FUNCTION(vio_set_borderless)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
+    const vio_platform *plat = vio_plat();
 
     /* Capture the current windowed rect (only when we're actually a normal
      * window, not already fullscreen or maximized) so vio_set_windowed can
      * return to it. */
-    if (glfwGetWindowMonitor(ctx->window) == NULL
-        && !glfwGetWindowAttrib(ctx->window, GLFW_MAXIMIZED)) {
-        glfwGetWindowPos(ctx->window, &ctx->saved_win_x, &ctx->saved_win_y);
-        glfwGetWindowSize(ctx->window, &ctx->saved_win_w, &ctx->saved_win_h);
+    if (plat->window_monitor(ctx->window) < 0
+        && !plat->get_attrib(ctx->window, VIO_WINDOW_MAXIMIZED)) {
+        plat->get_window_pos(ctx->window, &ctx->saved_win_x, &ctx->saved_win_y);
+        plat->get_window_size(ctx->window, &ctx->saved_win_w, &ctx->saved_win_h);
         ctx->has_saved_win_geometry = 1;
     }
 
-    glfwSetWindowAttrib(ctx->window, GLFW_DECORATED, GLFW_FALSE);
-    glfwMaximizeWindow(ctx->window);
-#endif
+    plat->set_attrib(ctx->window, VIO_WINDOW_DECORATED, 0);
+    plat->maximize(ctx->window);
 }
 
 ZEND_FUNCTION(vio_set_windowed)
@@ -1410,9 +1977,9 @@ ZEND_FUNCTION(vio_set_windowed)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
+    const vio_platform *plat = vio_plat();
 
     int rx = ctx->has_saved_win_geometry ? ctx->saved_win_x : 100;
     int ry = ctx->has_saved_win_geometry ? ctx->saved_win_y : 100;
@@ -1421,23 +1988,22 @@ ZEND_FUNCTION(vio_set_windowed)
     int rh = ctx->has_saved_win_geometry ? ctx->saved_win_h
            : (ctx->config.height > 0 ? ctx->config.height : 720);
 
-    if (glfwGetWindowMonitor(ctx->window) != NULL) {
-        /* Real (monitor) fullscreen — glfwRestoreWindow does NOT exit this.
+    if (plat->window_monitor(ctx->window) >= 0) {
+        /* Real (monitor) fullscreen — restoring does NOT exit this.
          * Detach the monitor to return to a windowed rect. Without this the
          * window stays fullscreen and a follow-up glfwSetWindowSize merely
          * switches the fullscreen video mode (the "back to windowed doesn't
          * work" bug). */
-        glfwSetWindowMonitor(ctx->window, NULL, rx, ry, rw, rh, GLFW_DONT_CARE);
+        plat->set_window_monitor(ctx->window, -1, rx, ry, rw, rh, VIO_PLATFORM_DONT_CARE);
     } else {
         /* Borderless / maximized — un-maximize, then restore the saved rect. */
-        glfwRestoreWindow(ctx->window);
+        plat->restore(ctx->window);
         if (ctx->has_saved_win_geometry) {
-            glfwSetWindowSize(ctx->window, rw, rh);
-            glfwSetWindowPos(ctx->window, rx, ry);
+            plat->set_window_size(ctx->window, rw, rh);
+            plat->set_window_pos(ctx->window, rx, ry);
         }
     }
-    glfwSetWindowAttrib(ctx->window, GLFW_DECORATED, GLFW_TRUE);
-#endif
+    plat->set_attrib(ctx->window, VIO_WINDOW_DECORATED, 1);
 }
 
 ZEND_FUNCTION(vio_set_fullscreen)
@@ -1457,55 +2023,45 @@ ZEND_FUNCTION(vio_set_fullscreen)
         Z_PARAM_LONG(req_refresh)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
+    const vio_platform *plat = vio_plat();
 
     /* Capture the windowed rect before leaving it so the round-trip back to
      * windowed lands at the same pos/size. */
-    if (glfwGetWindowMonitor(ctx->window) == NULL) {
-        glfwGetWindowPos(ctx->window, &ctx->saved_win_x, &ctx->saved_win_y);
-        glfwGetWindowSize(ctx->window, &ctx->saved_win_w, &ctx->saved_win_h);
+    if (plat->window_monitor(ctx->window) < 0) {
+        plat->get_window_pos(ctx->window, &ctx->saved_win_x, &ctx->saved_win_y);
+        plat->get_window_size(ctx->window, &ctx->saved_win_w, &ctx->saved_win_h);
         ctx->has_saved_win_geometry = 1;
     }
 
     /* Pick the requested monitor by index; fall back to primary for -1 or an
      * out-of-range index (e.g. a monitor that was unplugged since selection). */
-    GLFWmonitor *monitor = NULL;
-    if (monitor_index >= 0) {
-        int count = 0;
-        GLFWmonitor **mons = glfwGetMonitors(&count);
-        if (mons && monitor_index < count) {
-            monitor = mons[monitor_index];
-        }
-    }
-    if (!monitor) {
-        monitor = glfwGetPrimaryMonitor();
-    }
-    const GLFWvidmode *mode = glfwGetVideoMode(monitor);
+    int monitor = (monitor_index >= 0 && monitor_index < plat->monitor_count()) ? (int)monitor_index : plat->primary_monitor();
+    vio_monitor_desc md;
+    const vio_video_mode *mode = (monitor >= 0 && plat->monitor_desc(monitor, &md) == 0) ? &md.mode : NULL;
 
     /* A caller-supplied resolution (req_w/req_h > 0) switches the display to
      * that exclusive-fullscreen video mode instead of the native one. Callers
      * are expected to pass a mode enumerated by vio_video_modes(); GLFW picks
      * the closest supported mode if it does not match exactly. Otherwise we
      * keep the native mode. Refresh falls back to the chosen mode's rate, then
-     * to GLFW_DONT_CARE. */
+     * to the platform's choice. */
     int out_w = (mode ? mode->width : 0);
     int out_h = (mode ? mode->height : 0);
-    int out_refresh = (mode ? mode->refreshRate : GLFW_DONT_CARE);
+    int out_refresh = (mode ? mode->refresh_hz : VIO_PLATFORM_DONT_CARE);
     if (req_w > 0 && req_h > 0) {
         out_w = (int)req_w;
         out_h = (int)req_h;
-        out_refresh = (req_refresh > 0) ? (int)req_refresh : GLFW_DONT_CARE;
+        out_refresh = (req_refresh > 0) ? (int)req_refresh : VIO_PLATFORM_DONT_CARE;
     } else if (req_refresh > 0) {
         out_refresh = (int)req_refresh;
     }
 
-    if (out_w > 0 && out_h > 0) {
-        glfwSetWindowMonitor(ctx->window, monitor,
+    if (monitor >= 0 && out_w > 0 && out_h > 0) {
+        plat->set_window_monitor(ctx->window, monitor,
             0, 0, out_w, out_h, out_refresh);
     }
-#endif
 }
 
 /* Report whether the window auto-minimizes when a fullscreen window loses focus.
@@ -1520,13 +2076,11 @@ ZEND_FUNCTION(vio_get_auto_iconify)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (ctx->window) {
-        RETURN_BOOL(glfwGetWindowAttrib(ctx->window, GLFW_AUTO_ICONIFY) != 0);
+        RETURN_BOOL(vio_plat()->get_attrib(ctx->window, VIO_WINDOW_AUTO_ICONIFY) != 0);
     }
-#endif
-    /* No GLFW window (null backend): report GLFW's default of "on". */
+    /* No window (null backend): report the platforms' default of "on". */
     RETURN_TRUE;
 }
 
@@ -1541,7 +2095,6 @@ ZEND_FUNCTION(vio_window_size)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
     array_init(return_value);
-#ifdef HAVE_GLFW
     if (ctx->window) {
         /* Return the LOGICAL window size (framebuffer divided by content
          * scale). This gives a DPI-independent layout space across platforms:
@@ -1559,7 +2112,7 @@ ZEND_FUNCTION(vio_window_size)
             add_next_index_long(return_value, ctx->config.height);
             return;
         }
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+        vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
         vio_window_content_scale(ctx->window, &sx, &sy);
         if (sx <= 0.0f) sx = 1.0f;
         if (sy <= 0.0f) sy = 1.0f;
@@ -1569,7 +2122,6 @@ ZEND_FUNCTION(vio_window_size)
         add_next_index_long(return_value, logical_h);
         return;
     }
-#endif
 #ifdef HAVE_IOS
     {
         int fb_w = 0, fb_h = 0;
@@ -1586,20 +2138,6 @@ ZEND_FUNCTION(vio_window_size)
     add_next_index_long(return_value, ctx->config.width > 0 ? ctx->config.width : 800);
     add_next_index_long(return_value, ctx->config.height > 0 ? ctx->config.height : 600);
 }
-
-#ifdef HAVE_GLFW
-/* Pull in native handle accessors from GLFW. We define platform macros
- * conditionally so this compiles on every host: only the matching
- * accessor (Cocoa on macOS, Win32 on Windows, X11 on Linux) is exposed. */
-#if defined(__APPLE__)
-#  define GLFW_EXPOSE_NATIVE_COCOA
-#elif defined(_WIN32)
-#  define GLFW_EXPOSE_NATIVE_WIN32
-#elif defined(__linux__)
-#  define GLFW_EXPOSE_NATIVE_X11
-#endif
-#include <GLFW/glfw3native.h>
-#endif
 
 /*
  * vio_native_window_handle($ctx): int
@@ -1628,16 +2166,17 @@ ZEND_FUNCTION(vio_native_window_handle)
         RETURN_LONG(0);
     }
 
-#ifdef HAVE_GLFW
-#  if defined(__APPLE__)
-    RETURN_LONG((zend_long)(uintptr_t)glfwGetCocoaWindow(ctx->window));
-#  elif defined(_WIN32)
-    RETURN_LONG((zend_long)(uintptr_t)glfwGetWin32Window(ctx->window));
-#  elif defined(__linux__)
-    RETURN_LONG((zend_long)(uintptr_t)glfwGetX11Window(ctx->window));
-#  else
-    RETURN_LONG(0);
-#  endif
+#if defined(__APPLE__)
+    RETURN_LONG((zend_long)(uintptr_t)vio_plat()->native_handle(ctx->window, VIO_NATIVE_NSWINDOW));
+#elif defined(_WIN32)
+    RETURN_LONG((zend_long)(uintptr_t)vio_plat()->native_handle(ctx->window, VIO_NATIVE_HWND));
+#elif defined(__linux__)
+    {
+        /* the X window id, or the wl_surface pointer on Wayland */
+        void *h = vio_plat()->native_handle(ctx->window, VIO_NATIVE_XLIB_WINDOW);
+        if (!h) h = vio_plat()->native_handle(ctx->window, VIO_NATIVE_WAYLAND_SURFACE);
+        RETURN_LONG((zend_long)(uintptr_t)h);
+    }
 #else
     RETURN_LONG(0);
 #endif
@@ -1663,12 +2202,10 @@ static void vio_surface_size(vio_context_object *ctx, int *out_w, int *out_h)
      * framebuffer says — report THAT size, so callers' viewports and readback
      * buffers match the pixels they get. */
     if (!ctx->config.headless) {
-#ifdef HAVE_GLFW
         if (ctx->window) {
             /* 0x0 while minimised — reported as such; readback refuses it. */
-            glfwGetFramebufferSize(ctx->window, &w, &h);
+            vio_plat()->get_framebuffer_size(ctx->window, &w, &h);
         }
-#endif
 #ifdef HAVE_IOS
         if (!ctx->window) {
             int fw = 0, fh = 0;
@@ -1711,7 +2248,6 @@ ZEND_FUNCTION(vio_content_scale)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
     array_init(return_value);
-#ifdef HAVE_GLFW
     /* Headless: the offscreen target is 1:1 with the logical size (see
      * vio_framebuffer_size), so the effective content scale is 1. */
     if (ctx->window && !ctx->config.headless) {
@@ -1721,7 +2257,6 @@ ZEND_FUNCTION(vio_content_scale)
         add_next_index_double(return_value, (double)sy);
         return;
     }
-#endif
     add_next_index_double(return_value, 1.0);
     add_next_index_double(return_value, 1.0);
 }
@@ -1737,28 +2272,21 @@ ZEND_FUNCTION(vio_monitor_info)
     (void)ctx_zval; /* monitor info is window-independent; ctx just guards init */
 
     array_init(return_value);
-#ifdef HAVE_GLFW
-    GLFWmonitor *monitor = glfwGetPrimaryMonitor();
-    if (monitor) {
-        const GLFWvidmode *mode = glfwGetVideoMode(monitor);
-        int wx = 0, wy = 0, ww = 0, wh = 0;
-        float sx = 1.0f, sy = 1.0f;
-        const char *name = glfwGetMonitorName(monitor);
-        glfwGetMonitorWorkarea(monitor, &wx, &wy, &ww, &wh);
-        glfwGetMonitorContentScale(monitor, &sx, &sy);
-        add_assoc_long(return_value, "width", mode ? mode->width : 0);
-        add_assoc_long(return_value, "height", mode ? mode->height : 0);
-        add_assoc_long(return_value, "refresh_rate", mode ? mode->refreshRate : 0);
-        add_assoc_long(return_value, "work_x", wx);
-        add_assoc_long(return_value, "work_y", wy);
-        add_assoc_long(return_value, "work_width", ww);
-        add_assoc_long(return_value, "work_height", wh);
-        add_assoc_double(return_value, "scale_x", (double)sx);
-        add_assoc_double(return_value, "scale_y", (double)sy);
-        add_assoc_string(return_value, "name", name ? name : "");
+    vio_monitor_desc md;
+    int primary = vio_plat()->primary_monitor();
+    if (primary >= 0 && vio_plat()->monitor_desc(primary, &md) == 0) {
+        add_assoc_long(return_value, "width", md.mode.width);
+        add_assoc_long(return_value, "height", md.mode.height);
+        add_assoc_long(return_value, "refresh_rate", md.mode.refresh_hz);
+        add_assoc_long(return_value, "work_x", md.work_x);
+        add_assoc_long(return_value, "work_y", md.work_y);
+        add_assoc_long(return_value, "work_width", md.work_width);
+        add_assoc_long(return_value, "work_height", md.work_height);
+        add_assoc_double(return_value, "scale_x", (double)md.scale_x);
+        add_assoc_double(return_value, "scale_y", (double)md.scale_y);
+        add_assoc_string(return_value, "name", md.name);
         return;
     }
-#endif
     add_assoc_long(return_value, "width", 0);
     add_assoc_long(return_value, "height", 0);
     add_assoc_long(return_value, "refresh_rate", 0);
@@ -1782,39 +2310,29 @@ ZEND_FUNCTION(vio_monitors)
     (void)ctx_zval;
 
     array_init(return_value);
-#ifdef HAVE_GLFW
-    int count = 0;
-    GLFWmonitor **mons = glfwGetMonitors(&count);
-    GLFWmonitor *primary = glfwGetPrimaryMonitor();
+    int count = vio_plat()->monitor_count();
     for (int i = 0; i < count; i++) {
-        GLFWmonitor *m = mons[i];
-        const GLFWvidmode *mode = glfwGetVideoMode(m);
-        int mx = 0, my = 0, wx = 0, wy = 0, ww = 0, wh = 0;
-        float sx = 1.0f, sy = 1.0f;
-        const char *name = glfwGetMonitorName(m);
-        glfwGetMonitorPos(m, &mx, &my);
-        glfwGetMonitorWorkarea(m, &wx, &wy, &ww, &wh);
-        glfwGetMonitorContentScale(m, &sx, &sy);
+        vio_monitor_desc md;
+        if (vio_plat()->monitor_desc(i, &md) != 0) continue;
 
         zval entry;
         array_init(&entry);
         add_assoc_long(&entry, "index", i);
-        add_assoc_string(&entry, "name", name ? name : "");
-        add_assoc_bool(&entry, "primary", m == primary);
-        add_assoc_long(&entry, "x", mx);
-        add_assoc_long(&entry, "y", my);
-        add_assoc_long(&entry, "width", mode ? mode->width : 0);
-        add_assoc_long(&entry, "height", mode ? mode->height : 0);
-        add_assoc_long(&entry, "refresh_rate", mode ? mode->refreshRate : 0);
-        add_assoc_long(&entry, "work_x", wx);
-        add_assoc_long(&entry, "work_y", wy);
-        add_assoc_long(&entry, "work_width", ww);
-        add_assoc_long(&entry, "work_height", wh);
-        add_assoc_double(&entry, "scale_x", (double)sx);
-        add_assoc_double(&entry, "scale_y", (double)sy);
+        add_assoc_string(&entry, "name", md.name);
+        add_assoc_bool(&entry, "primary", md.primary);
+        add_assoc_long(&entry, "x", md.x);
+        add_assoc_long(&entry, "y", md.y);
+        add_assoc_long(&entry, "width", md.mode.width);
+        add_assoc_long(&entry, "height", md.mode.height);
+        add_assoc_long(&entry, "refresh_rate", md.mode.refresh_hz);
+        add_assoc_long(&entry, "work_x", md.work_x);
+        add_assoc_long(&entry, "work_y", md.work_y);
+        add_assoc_long(&entry, "work_width", md.work_width);
+        add_assoc_long(&entry, "work_height", md.work_height);
+        add_assoc_double(&entry, "scale_x", (double)md.scale_x);
+        add_assoc_double(&entry, "scale_y", (double)md.scale_y);
         add_next_index_zval(return_value, &entry);
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_video_modes)
@@ -1831,34 +2349,23 @@ ZEND_FUNCTION(vio_video_modes)
     (void)ctx_zval;
 
     array_init(return_value);
-#ifdef HAVE_GLFW
     /* Resolve the monitor the same way vio_set_fullscreen does. */
-    GLFWmonitor *monitor = NULL;
-    if (monitor_index >= 0) {
-        int mcount = 0;
-        GLFWmonitor **mons = glfwGetMonitors(&mcount);
-        if (mons && monitor_index < mcount) {
-            monitor = mons[monitor_index];
-        }
-    }
-    if (!monitor) {
-        monitor = glfwGetPrimaryMonitor();
-    }
-    if (!monitor) return;
+    const vio_platform *plat = vio_plat();
+    int monitor = (monitor_index >= 0 && monitor_index < plat->monitor_count()) ? (int)monitor_index : plat->primary_monitor();
+    if (monitor < 0) return;
 
-    int count = 0;
-    const GLFWvidmode *modes = glfwGetVideoModes(monitor, &count);
-    if (!modes) return;
+    vio_video_mode modes[512];
+    int count = plat->video_modes(monitor, modes, (int)(sizeof(modes) / sizeof(modes[0])));
 
-    /* GLFW returns modes sorted ascending and may list the same (width,height,
+    /* Modes come sorted ascending and may list the same (width,height,
      * refresh) several times for different bit depths. Collapse duplicates so
      * the picker shows each resolution/refresh combination once. */
     for (int i = 0; i < count; i++) {
-        const GLFWvidmode *m = &modes[i];
+        const vio_video_mode *m = &modes[i];
         if (i > 0) {
-            const GLFWvidmode *p = &modes[i - 1];
+            const vio_video_mode *p = &modes[i - 1];
             if (p->width == m->width && p->height == m->height
-                && p->refreshRate == m->refreshRate) {
+                && p->refresh_hz == m->refresh_hz) {
                 continue;
             }
         }
@@ -1866,10 +2373,9 @@ ZEND_FUNCTION(vio_video_modes)
         array_init(&entry);
         add_assoc_long(&entry, "width", m->width);
         add_assoc_long(&entry, "height", m->height);
-        add_assoc_long(&entry, "refresh_rate", m->refreshRate);
+        add_assoc_long(&entry, "refresh_rate", m->refresh_hz);
         add_next_index_zval(return_value, &entry);
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_pixel_ratio)
@@ -1882,16 +2388,14 @@ ZEND_FUNCTION(vio_pixel_ratio)
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
-#ifdef HAVE_GLFW
     if (ctx->window && !ctx->config.headless) {   /* headless targets are 1:1, see vio_framebuffer_size */
         int fb_w = 0, win_w = 0, fb_h = 0, win_h = 0;
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        glfwGetWindowSize(ctx->window, &win_w, &win_h);
+        vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
+        vio_plat()->get_window_size(ctx->window, &win_w, &win_h);
         if (win_w > 0) {
             RETURN_DOUBLE((double)fb_w / (double)win_w);
         }
     }
-#endif
     RETURN_DOUBLE(1.0);
 }
 
@@ -2195,7 +2699,7 @@ ZEND_FUNCTION(vio_mesh)
     /* Ray tracing: keep the positions (the first three floats of a vertex,
      * location 0) and the indices for vio_acceleration_structure(). */
     if (floats_per_vertex >= 3 && vertex_count > 0 && ctx->backend->supports_feature
-        && ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY)) {
+        && (ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY) || ctx->backend->supports_feature(VIO_FEATURE_RAYTRACING))) {
         mesh->rt_positions = emalloc(sizeof(float) * 3 * (size_t)vertex_count);
         for (int v = 0; v < vertex_count; v++) memcpy(&mesh->rt_positions[v * 3], &data[v * floats_per_vertex], sizeof(float) * 3);
         if (indices && index_count > 0) {
@@ -2210,6 +2714,8 @@ ZEND_FUNCTION(vio_mesh)
      * legacy "pos-only" / "pos+color" shapes inside the backend. */
     vio_mesh_attrib normalized_layout[VIO_MAX_VERTEX_ATTRIBS];
     int normalized_layout_count = 0;
+    for (int l = 0; l < VIO_MESH_MAX_LOCATIONS; l++) mesh->layout.offset[l] = -1;
+    mesh->layout.key = 0;
     if (has_explicit_layout && parsed_layout_count > 0) {
         int offset = 0;
         for (int a = 0; a < parsed_layout_count; a++) {
@@ -2219,6 +2725,17 @@ ZEND_FUNCTION(vio_mesh)
             offset += parsed_layout[a].components;
         }
         normalized_layout_count = parsed_layout_count;
+        /* FNV-1a over (location, offset); never 0, which means "no layout". */
+        uint32_t h = 2166136261u;
+        for (int a = 0; a < parsed_layout_count; a++) {
+            int loc = normalized_layout[a].location;
+            if (loc < 0 || loc >= VIO_MESH_MAX_LOCATIONS) continue;
+            mesh->layout.offset[loc] = (int16_t)normalized_layout[a].offset;
+            h = (h ^ (uint32_t)loc) * 16777619u;
+            h = (h ^ (uint32_t)normalized_layout[a].offset) * 16777619u;
+        }
+        h = (h ^ (uint32_t)mesh->stride) * 16777619u;
+        mesh->layout.key = h ? h : 1u;
     } else if (has_colors && floats_per_vertex >= 7) {
         normalized_layout[0] = (vio_mesh_attrib){0, 3, 0};
         normalized_layout[1] = (vio_mesh_attrib){1, 4, 3 * (int)sizeof(float)};
@@ -2398,10 +2915,86 @@ static int vio_bound_shader_is_mesh(vio_context_object *ctx, const char *fn)
     return 1;
 }
 
+/* OpenGL: set the members of a uniform block from the buffer bytes one by one
+ * (the SPIR-V path flattens blocks into plain uniforms). std140 arrays and
+ * mat3 columns are padded to 16 bytes; glUniform* wants them tight. */
+static void vio_gl_block_from_bytes(vio_context_object *ctx, const vio_uniform_entry *ents, int n,
+                                    const unsigned char *src, size_t len)
+{
+    float f[64];
+    for (int k = 0; k < n; k++) {
+        const vio_uniform_entry *e = &ents[k];
+        if (e->offset < 0 || (size_t)(e->offset + e->size) > len || e->size <= 0) continue;
+        int elems = e->stride > 0 ? e->size / e->stride : 1;
+        int step = e->stride > 0 ? e->stride : e->size;
+        const unsigned char *p = src + e->offset;
+        int vec = e->vecsize, cols = e->columns > 0 ? e->columns : 1;
+        int per = vec * cols, type;
+        if (e->base_type == 1 && cols == 1 && vec >= 1 && vec <= 4)
+            type = vec == 1 ? VIO_UNIFORM_FLOAT : vec == 2 ? VIO_UNIFORM_VEC2 : vec == 3 ? VIO_UNIFORM_VEC3 : VIO_UNIFORM_VEC4;
+        else if (e->base_type == 1 && cols == 4 && vec == 4) type = VIO_UNIFORM_MAT4;
+        else if (e->base_type == 1 && cols == 3 && vec == 3) type = VIO_UNIFORM_MAT3;
+        else if (e->base_type == 2 && cols == 1 && vec == 1) type = VIO_UNIFORM_INT;
+        else continue;   /* ivecN / other matrices: not reachable through set_uniform */
+        if (elems * per > 64) elems = 64 / per;
+        for (int a = 0; a < elems; a++)
+            for (int c = 0; c < cols; c++)
+                memcpy(&f[a * per + c * vec], p + (size_t)a * step + (size_t)c * 16, sizeof(float) * (size_t)vec);
+        ctx->backend->set_uniform(e->name, f, elems, type);
+    }
+}
+
+/* One stage: the block at `binding` reads the buffer bound there. */
+static void vio_apply_ubo_stage(vio_context_object *ctx, int binding, const vio_uniform_entry *ents, int n,
+                                unsigned char *cb, int cb_size, int *dirty)
+{
+    if (binding < 0 || binding >= VIO_MAX_UBO_BINDINGS || !ctx->bound_ubo[binding]) return;
+    vio_buffer_object *buf = vio_buffer_from_obj(ctx->bound_ubo[binding]);
+    if (!buf->shadow) return;
+    if (cb) {
+        size_t len = buf->size < (size_t)cb_size ? buf->size : (size_t)cb_size;
+        if (len > VIO_CBUFFER_SIZE) len = VIO_CBUFFER_SIZE;
+        if (len && memcmp(cb, buf->shadow, len) != 0) { memcpy(cb, buf->shadow, len); *dirty = 1; }
+    } else if (ctx->backend->set_uniform) {
+        vio_gl_block_from_bytes(ctx, ents, n, buf->shadow, buf->size);
+    }
+}
+
+/* vio_bind_buffer for graphics shaders (OPEN-ITEMS-PLAN A32): every named uniform
+ * block of the bound shader takes the contents of the uniform buffer bound at its
+ * binding, as of this draw. On the cbuffer backends the block is the stage's
+ * constant buffer; OpenGL sets its members. Runs before the cbuffer push. */
+static void vio_apply_bound_ubos(vio_context_object *ctx)
+{
+    vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+    if (!sh) return;
+    int gl = sh->backend_shader == NULL;
+    vio_apply_ubo_stage(ctx, sh->block_binding, sh->uniforms, sh->uniform_count,
+                        gl ? NULL : sh->cbuffer_data, sh->cbuffer_total_size, &sh->cbuffer_dirty);
+    if (!(gl && sh->frag_block_binding == sh->block_binding))   /* GL: one program, same names */
+        vio_apply_ubo_stage(ctx, sh->frag_block_binding, sh->frag_uniforms, sh->frag_uniform_count,
+                            gl ? NULL : sh->frag_cbuffer_data, sh->frag_cbuffer_total_size, &sh->frag_cbuffer_dirty);
+    if (!gl) {
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+            vio_shader_stage_cb *cb = sh->stage_cb[i];
+            if (cb) vio_apply_ubo_stage(ctx, cb->block_binding, cb->uniforms, cb->uniform_count, cb->data, cb->total_size, &cb->dirty);
+        }
+    }
+}
+
+/* Before every mesh draw: the mesh's vertex layout (A31) and the bound uniform
+ * buffers (A32). */
+static void vio_apply_mesh_layout(vio_context_object *ctx, vio_mesh_object *mesh)
+{
+    if (ctx->backend->apply_mesh_layout) ctx->backend->apply_mesh_layout(mesh ? &mesh->layout : NULL);
+    vio_apply_bound_ubos(ctx);
+}
+
 static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
 {
     if (vio_bound_shader_is_mesh(ctx, "vio_draw")) return;
     vio_flush_pending_textures(ctx);
+    vio_apply_mesh_layout(ctx, mesh);
     if (ctx->backend->draw_mesh) {
         ctx->backend->draw_mesh(mesh);
     }
@@ -2476,7 +3069,8 @@ static int vio_shader_compile_extra_stages(vio_shader_object *shader, zval **ext
         if (!extra_zv[i] || shader->stage_spirv[i]) continue;
         char *error_msg = NULL;
         shader->stage_spirv[i] = vio_compile_glsl_stage_to_spirv(
-            Z_STRVAL_P(extra_zv[i]), VIO_STAGE_GEOMETRY + i, &shader->stage_spirv_size[i], &error_msg);
+            shader->mv_stage_src[i] ? shader->mv_stage_src[i] : Z_STRVAL_P(extra_zv[i]),
+            VIO_STAGE_GEOMETRY + i, &shader->stage_spirv_size[i], &error_msg);
         if (!shader->stage_spirv[i]) {
             php_error_docref(NULL, E_WARNING, "%s shader compilation failed: %s",
                 vio_extra_stage_labels[i], error_msg ? error_msg : "unknown error");
@@ -2734,8 +3328,10 @@ ZEND_FUNCTION(vio_shader)
                                  ctx->backend->name);
                 RETURN_FALSE;
             }
-            if (want_geometry || want_tess) {
-                php_error_docref(NULL, E_WARNING, "vio_shader: 'view_count' with geometry / tessellation stages is not supported");
+            if ((want_geometry && !ctx->backend->supports_feature(VIO_FEATURE_MULTIVIEW_GEOMETRY))
+                || (want_tess && !ctx->backend->supports_feature(VIO_FEATURE_MULTIVIEW_TESSELLATION))) {
+                php_error_docref(NULL, E_WARNING, "vio_shader: 'view_count' with %s stages needs VIO_FEATURE_MULTIVIEW_%s on backend '%s'",
+                                 want_geometry ? "geometry" : "tessellation", want_geometry ? "GEOMETRY" : "TESSELLATION", ctx->backend->name);
                 RETURN_FALSE;
             }
             view_count = (int)n;
@@ -2762,7 +3358,7 @@ ZEND_FUNCTION(vio_shader)
      * for a GLSL version higher than the runtime context provides, the driver
      * would emit a cryptic shader-compile error inside vio_opengl_compile_*.
      * Catch it up front. Only relevant for OpenGL backends with text GLSL. */
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized &&
         (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW)) {
         int runtime_glsl = vio_opengl_get_glsl_version();
@@ -2807,6 +3403,47 @@ ZEND_FUNCTION(vio_shader)
     shader->view_count = view_count;
     shader->is_mesh = want_mesh;
 
+    /* Multiview by instancing (OPEN-ITEMS-PLAN A10): the backend has no views of
+     * its own, so the GLSL itself splits gl_InstanceIndex into view and instance. */
+    if (view_count > 1 && ctx->backend->multiview_via_instancing && ctx->backend->multiview_via_instancing()) {
+        if (format != VIO_SHADER_GLSL) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: 'view_count' on backend '%s' needs GLSL source (multiview by instancing)", ctx->backend->name);
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
+        shader->mv_src[0] = vio_glsl_multiview_instancing(Z_STRVAL_P(vert_zval), 0, view_count);
+        shader->mv_src[1] = vio_glsl_multiview_instancing(Z_STRVAL_P(frag_zval), 1, view_count);
+        if (!shader->mv_src[0] || !shader->mv_src[1]) {
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
+        shader->view_emulated = 1;
+    }
+    /* gl_ViewIndex in geometry / tessellation stages that the backend can only give
+     * the vertex stage (A27): the vertex stage forwards it. */
+    if (view_count > 1 && (want_geometry || want_tess) && !shader->view_emulated
+        && ctx->backend->multiview_view_from_vertex && ctx->backend->multiview_view_from_vertex()) {
+        if (format != VIO_SHADER_GLSL) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: 'view_count' with geometry / tessellation stages on backend '%s' needs GLSL source", ctx->backend->name);
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
+        shader->mv_src[0] = vio_glsl_multiview_forward(Z_STRVAL_P(vert_zval), VIO_STAGE_VERTEX);
+        int ok = shader->mv_src[0] != NULL;
+        for (int i = 0; i < VIO_EXTRA_STAGE_COUNT && ok; i++) {
+            if (!extra_zv[i]) continue;
+            shader->mv_stage_src[i] = vio_glsl_multiview_forward(Z_STRVAL_P(extra_zv[i]), VIO_STAGE_GEOMETRY + i);
+            ok = shader->mv_stage_src[i] != NULL;
+        }
+        if (!ok) {
+            php_error_docref(NULL, E_WARNING, "vio_shader: could not forward gl_ViewIndex to the geometry / tessellation stages");
+            zval_ptr_dtor(&shader_zval);
+            RETURN_FALSE;
+        }
+    }
+    const char *vert_src = shader->mv_src[0] ? shader->mv_src[0] : Z_STRVAL_P(vert_zval);
+    const char *frag_src = shader->mv_src[1] ? shader->mv_src[1] : Z_STRVAL_P(frag_zval);
+
     /* --- SPIR-V input: store directly --- */
     if (format == VIO_SHADER_SPIRV) {
         shader->vert_spirv_size = Z_STRLEN_P(vert_zval);
@@ -2835,7 +3472,7 @@ ZEND_FUNCTION(vio_shader)
 
         shader->vert_spirv = want_mesh
             ? vio_compile_glsl_stage_to_spirv(Z_STRVAL_P(vert_zval), VIO_STAGE_MESH, &shader->vert_spirv_size, &error_msg)
-            : vio_compile_glsl_to_spirv(Z_STRVAL_P(vert_zval), 0, &shader->vert_spirv_size, &error_msg);
+            : vio_compile_glsl_to_spirv(vert_src, 0, &shader->vert_spirv_size, &error_msg);
         if (!shader->vert_spirv) {
             php_error_docref(NULL, E_WARNING, "%s shader compilation failed: %s", want_mesh ? "Mesh" : "Vertex",
                 error_msg ? error_msg : "unknown error");
@@ -2855,7 +3492,7 @@ ZEND_FUNCTION(vio_shader)
         }
 
         shader->frag_spirv = vio_compile_glsl_to_spirv(
-            Z_STRVAL_P(frag_zval), 1, &shader->frag_spirv_size, &error_msg);
+            frag_src, 1, &shader->frag_spirv_size, &error_msg);
         if (!shader->frag_spirv) {
             php_error_docref(NULL, E_WARNING, "Fragment shader compilation failed: %s",
                 error_msg ? error_msg : "unknown error");
@@ -2871,7 +3508,7 @@ ZEND_FUNCTION(vio_shader)
     }
 
     /* --- For OpenGL backend --- */
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
         if (format == VIO_SHADER_GLSL_RAW) {
             /* Raw GLSL: compile directly, no SPIR-V round-trip */
@@ -2905,20 +3542,42 @@ ZEND_FUNCTION(vio_shader)
                 if (!spv[s]) continue;
                 /* GL_OVR_multiview2 needs the view count in the GLSL (num_views);
                  * SPIRV-Cross takes it for the vertex stage only. */
-                vio_glsl_set_ovr_view_count(s == VIO_STAGE_VERTEX ? view_count : 0);
+                vio_glsl_set_ovr_view_count(s == VIO_STAGE_VERTEX && !shader->view_emulated ? view_count : 0);
                 glsl[s] = vio_spirv_to_glsl(spv[s], spv_size[s], glsl_version, &error_msg);
                 vio_glsl_set_ovr_view_count(0);
-                if (!glsl[s]) {
-                    php_error_docref(NULL, E_WARNING, "%s SPIR-V to GLSL transpilation failed: %s",
-                        stage_labels[s], error_msg ? error_msg : "unknown error");
-                    free(error_msg);
-                    for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);
-                    zval_ptr_dtor(&shader_zval);
-                    RETURN_FALSE;
-                }
+                if (!glsl[s]) break;
             }
 
-            shader->program = vio_opengl_compile_program(glsl[0], glsl[1], glsl[2], glsl[3], glsl[4]);
+            int failed = -1;
+            for (int s = 0; s < VIO_STAGE_COUNT; s++) if (spv[s] && !glsl[s]) { failed = s; break; }
+            if (failed >= 0 && format == VIO_SHADER_GLSL && view_count <= 1) {
+                /* SPIRV-Cross refuses some GLSL outside Vulkan semantics (subgroup
+                 * shuffle, min / max, quad operations). The caller's own GLSL can
+                 * still suit the driver (GL_KHR_shader_subgroup): compile the text
+                 * as it is (OPEN-ITEMS-PLAN B4/B5). Uniforms keep their names. */
+                for (int k = 0; k < VIO_STAGE_COUNT; k++) { free(glsl[k]); glsl[k] = NULL; }
+                shader->program = vio_opengl_compile_program(
+                    Z_STRVAL_P(vert_zval), Z_STRVAL_P(frag_zval),
+                    extra_zv[0] ? Z_STRVAL_P(extra_zv[0]) : NULL,
+                    extra_zv[1] ? Z_STRVAL_P(extra_zv[1]) : NULL,
+                    extra_zv[2] ? Z_STRVAL_P(extra_zv[2]) : NULL);
+                if (shader->program) {
+                    shader->gl_generation = vio_opengl_context_generation();
+                    free(error_msg);
+                    error_msg = NULL;
+                    failed = -1;
+                }
+            }
+            if (failed >= 0) {
+                php_error_docref(NULL, E_WARNING, "%s SPIR-V to GLSL transpilation failed: %s",
+                    stage_labels[failed], error_msg ? error_msg : "unknown error");
+                free(error_msg);
+                for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
+
+            if (!shader->program) shader->program = vio_opengl_compile_program(glsl[0], glsl[1], glsl[2], glsl[3], glsl[4]);
             if (view_count > 1) vio_opengl_set_program_views(shader->program, view_count);
             shader->gl_generation = vio_opengl_context_generation();
             for (int k = 0; k < VIO_STAGE_COUNT; k++) free(glsl[k]);
@@ -2938,7 +3597,7 @@ ZEND_FUNCTION(vio_shader)
             char *error_msg = NULL;
             shader->vert_spirv = want_mesh
                 ? vio_compile_glsl_stage_to_spirv(Z_STRVAL_P(vert_zval), VIO_STAGE_MESH, &shader->vert_spirv_size, &error_msg)
-                : vio_compile_glsl_to_spirv(Z_STRVAL_P(vert_zval), 0, &shader->vert_spirv_size, &error_msg);
+                : vio_compile_glsl_to_spirv(vert_src, 0, &shader->vert_spirv_size, &error_msg);
             if (shader->vert_spirv && task_zval && !shader->task_spirv) {
                 shader->task_spirv = vio_compile_glsl_stage_to_spirv(Z_STRVAL_P(task_zval), VIO_STAGE_TASK,
                                                                      &shader->task_spirv_size, &error_msg);
@@ -2955,7 +3614,7 @@ ZEND_FUNCTION(vio_shader)
             }
 
             shader->frag_spirv = vio_compile_glsl_to_spirv(
-                Z_STRVAL_P(frag_zval), 1, &shader->frag_spirv_size, &error_msg);
+                frag_src, 1, &shader->frag_spirv_size, &error_msg);
             if (!shader->frag_spirv) {
                 php_error_docref(NULL, E_WARNING, "FS GLSL->SPIR-V failed: %s", error_msg ? error_msg : "unknown");
                 free(error_msg);
@@ -2990,7 +3649,32 @@ ZEND_FUNCTION(vio_shader)
         desc.task_data         = shader->task_spirv;
         desc.task_size         = shader->task_spirv_size;
 
+        /* Sampler registers by name across all stages (OPEN-ITEMS-PLAN A30), in
+         * the sampler-map order: fragment, geometry, tess control, tess eval,
+         * mesh, task. */
+        {
+            const uint32_t *ps[6] = {
+                shader->frag_spirv,
+                shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)],
+                shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)],
+                shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)],
+                shader->vert_spirv,   /* vertex or mesh stage: vertex textures too (A28) */
+                shader->is_mesh ? shader->task_spirv : NULL,
+            };
+            const size_t sz[6] = {
+                shader->frag_spirv_size,
+                shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)],
+                shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)],
+                shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)],
+                shader->vert_spirv_size,
+                shader->is_mesh ? shader->task_spirv_size : 0,
+            };
+            vio_sampler_plan_build(&shader->sampler_plan, ps, sz, 6);
+            shader->sampler_plan.gs_writes_primid = ps[1] && vio_spirv_writes_builtin(ps[1], sz[1], 7);
+        }
+        vio_sampler_plan_use(&shader->sampler_plan);
         shader->backend_shader = ctx->backend->compile_shader(&desc);
+        vio_sampler_plan_use(NULL);
         if (!shader->backend_shader) {
             php_error_docref(NULL, E_WARNING, "Backend shader compilation failed");
             zval_ptr_dtor(&shader_zval);
@@ -3078,6 +3762,17 @@ ZEND_FUNCTION(vio_shader)
                         shader->sampler_is_depth[s] = is_depth;
                         shader->sampler_hlsl_reg[s] = is_depth ? shadow_reg++ : regular_reg++;
                     }
+                    /* Separate textures (texture(sampler2D(u_tex, u_smp), uv), OPEN-ITEMS-PLAN
+                     * A23) follow, in reflection order: HLSL gives them t{sampled count + j},
+                     * Vulkan and Metal put them at the same list positions. */
+                    char sep[VIO_MAX_SAMPLERS][64];
+                    int nsep = vio_spirv_separate_images(shader->frag_spirv, shader->frag_spirv_size, sep, VIO_MAX_SAMPLERS);
+                    for (int j = 0; j < nsep && shader->sampler_count < VIO_MAX_SAMPLERS; j++) {
+                        int s = shader->sampler_count++;
+                        snprintf(shader->sampler_names[s], sizeof(shader->sampler_names[s]), "%s", sep[j]);
+                        shader->sampler_is_depth[s] = 0;
+                        shader->sampler_hlsl_reg[s] = frag_reflect.texture_count + j;
+                    }
                     vio_reflect_free(&frag_reflect);
                 }
                 if (err) free(err);
@@ -3097,6 +3792,37 @@ ZEND_FUNCTION(vio_shader)
                 vio_shader_merge_stage_samplers(shader, shader->stage_spirv[i], shader->stage_spirv_size[i]);
             }
         }
+        /* Mesh pipelines (OPEN-ITEMS-PLAN A30): the mesh stage (in vert_spirv)
+         * and the task stage read textures too; their samplers follow, mesh
+         * first. Every backend replays this order. */
+        if (shader->vert_spirv) vio_shader_merge_stage_samplers(shader, shader->vert_spirv, shader->vert_spirv_size);
+        if (shader->is_mesh && shader->task_spirv) vio_shader_merge_stage_samplers(shader, shader->task_spirv, shader->task_spirv_size);
+        /* Registers from the shader-wide plan the backend compiled with. */
+        for (int s = 0; s < shader->sampler_count; s++) {
+            for (int k = 0; k < shader->sampler_plan.count; k++) {
+                if (strcmp(shader->sampler_plan.names[k], shader->sampler_names[s]) == 0) {
+                    shader->sampler_hlsl_reg[s] = shader->sampler_plan.reg[k];
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Named uniform blocks per stage, fed by vio_bind_buffer (OPEN-ITEMS-PLAN A32).
+     * OpenGL sets their members one by one, so it needs the member table too. */
+    shader->block_binding = shader->vert_spirv ? vio_spirv_uniform_block_binding(shader->vert_spirv, shader->vert_spirv_size) : -1;
+    shader->frag_block_binding = shader->frag_spirv ? vio_spirv_uniform_block_binding(shader->frag_spirv, shader->frag_spirv_size) : -1;
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
+        if (shader->stage_cb[i] && shader->stage_spirv[i])
+            shader->stage_cb[i]->block_binding = vio_spirv_uniform_block_binding(shader->stage_spirv[i], shader->stage_spirv_size[i]);
+    }
+    if (!shader->backend_shader) {
+        if (shader->vert_spirv && shader->block_binding >= 0)
+            shader->uniform_count = vio_spirv_get_uniform_offsets(shader->vert_spirv, shader->vert_spirv_size,
+                shader->uniforms, VIO_MAX_UNIFORMS, &shader->cbuffer_total_size);
+        if (shader->frag_spirv && shader->frag_block_binding >= 0)
+            shader->frag_uniform_count = vio_spirv_get_uniform_offsets(shader->frag_spirv, shader->frag_spirv_size,
+                shader->frag_uniforms, VIO_MAX_UNIFORMS, &shader->frag_cbuffer_total_size);
     }
 
     shader->valid = 1;
@@ -3574,36 +4300,29 @@ ZEND_FUNCTION(vio_pipeline)
         desc.patch_vertices = pipe->patch_vertices;
         desc.view_count = shader->view_count;
 
+        vio_sampler_plan_use(&shader->sampler_plan);   /* HS variants translate here */
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
+        vio_sampler_plan_use(NULL);
+        /* The backend has warned (e.g. a PSO the driver rejects). Returning the
+         * object anyway let callers draw with no pipeline state bound, which
+         * crashed D3D12 at the end of the frame. Backends without a 3D
+         * pipeline (null) return NULL by design and keep the old behaviour. */
+        if (!pipe->backend_pipeline && ctx->backend->supports_feature
+            && ctx->backend->supports_feature(VIO_FEATURE_3D_PIPELINE)) {
+            zval_ptr_dtor(&pipe_zval);
+            RETURN_FALSE;
+        }
     }
 
     pipe->valid = 1;
     RETURN_COPY_VALUE(&pipe_zval);
 }
 
-ZEND_FUNCTION(vio_bind_pipeline)
+/* Bind a pipeline: vio_bind_pipeline and every record of vio_submit_batch go
+ * through here, so a batch's pipeline switch does exactly what the single call
+ * does (Metal: the shader's cbuffers, found missing by test 169 on the CI). */
+static void vio_bind_pipeline_core(vio_context_object *ctx, vio_pipeline_object *pipe)
 {
-    zval *ctx_zval;
-    zval *pipe_zval;
-
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
-        Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_pipeline_ce)
-    ZEND_PARSE_PARAMETERS_END();
-
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-
-    if (!ctx->initialized || !ctx->in_frame) {
-        php_error_docref(NULL, E_WARNING, "Must call vio_bind_pipeline between vio_begin and vio_end");
-        return;
-    }
-
-    vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pipe_zval);
-    if (!pipe->valid) {
-        php_error_docref(NULL, E_WARNING, "Pipeline is not valid");
-        return;
-    }
-
     /* Track bound shader in context for vio_draw() and uniform cbuffer */
     ctx->bound_shader_program = pipe->shader_program;
     ctx->bound_shader_object = pipe->shader_ref;
@@ -3630,6 +4349,32 @@ ZEND_FUNCTION(vio_bind_pipeline)
 #endif
 }
 
+ZEND_FUNCTION(vio_bind_pipeline)
+{
+    zval *ctx_zval;
+    zval *pipe_zval;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(pipe_zval, vio_pipeline_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_bind_pipeline between vio_begin and vio_end");
+        return;
+    }
+
+    vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pipe_zval);
+    if (!pipe->valid) {
+        php_error_docref(NULL, E_WARNING, "Pipeline is not valid");
+        return;
+    }
+
+    vio_bind_pipeline_core(ctx, pipe);
+}
+
 /* GAP-PHASE5 Block 9: texture arrays, block-compressed data and pre-built mip
  * chains take the descriptor path on every backend - OpenGL through
  * upload_texture_ex (writes texture_id), the others through create_texture.
@@ -3641,7 +4386,12 @@ static int vio_texture_create_extended(vio_context_object *ctx, vio_texture_obje
         php_error_docref(NULL, E_WARNING, "vio_texture: texture arrays are not supported on backend '%s' (VIO_FEATURE_TEXTURE_ARRAY)", ctx->backend->name);
         return -1;
     }
-    if (compressed && !ctx->backend->supports_feature(VIO_FEATURE_TEXTURE_COMPRESSION_BC)) {
+    if (vio_texfmt_is_astc(desc->format)) {
+        if (!ctx->backend->supports_feature(VIO_FEATURE_TEXTURE_COMPRESSION_ASTC)) {
+            php_error_docref(NULL, E_WARNING, "vio_texture: ASTC textures are not supported on backend '%s' (VIO_FEATURE_TEXTURE_COMPRESSION_ASTC)", ctx->backend->name);
+            return -1;
+        }
+    } else if (compressed && !ctx->backend->supports_feature(VIO_FEATURE_TEXTURE_COMPRESSION_BC)) {
         php_error_docref(NULL, E_WARNING, "vio_texture: block-compressed textures are not supported on backend '%s' (VIO_FEATURE_TEXTURE_COMPRESSION_BC)", ctx->backend->name);
         return -1;
     }
@@ -3676,7 +4426,8 @@ static int vio_texture_create_extended(vio_context_object *ctx, vio_texture_obje
 
 /* vio_texture_ktx2(ctx, bytes, options): a KTX2 container (R8 / RGBA8 / BC1 /
  * BC3 / BC4 / BC5 / BC7, 2D or 2D array, no supercompression) becomes a
- * texture with its stored mip chain. 'mip_offset' drops the N largest levels
+ * texture with its stored mip chain; six faces a VioCubemap, a depth a 3D
+ * texture (uncompressed). 'mip_offset' drops the N largest levels
  * (texture-quality tiers), 'filter' / 'wrap' / 'anisotropy' as vio_texture,
  * 'mipmaps' => true generates a chain for single-level uncompressed files. */
 ZEND_FUNCTION(vio_texture_ktx2)
@@ -3713,6 +4464,61 @@ ZEND_FUNCTION(vio_texture_ktx2)
             anisotropy = a < 1 ? 1 : (a > 16 ? 16 : a);
         }
         if ((val = zend_hash_str_find(opts, "mipmaps", sizeof("mipmaps") - 1)) != NULL) want_mipmaps = zend_is_true(val);
+    }
+    /* Six faces -> VioCubemap, a depth -> 3D VioTexture (OPEN-ITEMS-PLAN A35), both
+     * through the public constructors so every backend path stays the same.
+     * Uncompressed only (RGBA8; R8 expands to grey); the base is level
+     * 'mip_offset', further cube levels are rebuilt by 'mipmaps'. */
+    if (info.faces == 6 || info.depth > 1) {
+        int cube = info.faces == 6;
+        if (info.vio_format != VIO_FORMAT_RGBA8 && info.vio_format != VIO_FORMAT_R8) {
+            php_error_docref(NULL, E_WARNING, "vio_texture_ktx2: %s KTX2 files must be RGBA8 or R8 (block-compressed %s are not supported)",
+                             cube ? "cubemap" : "3D", cube ? "cubemaps" : "volumes");
+            RETURN_FALSE;
+        }
+        int lvl = (int)(mip_offset < 0 ? 0 : (mip_offset > info.levels - 1 ? info.levels - 1 : mip_offset));
+        int lw = info.width, lh = info.height, ld = info.depth;
+        for (int l = 0; l < lvl; l++) { lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1; ld = ld > 1 ? ld / 2 : 1; }
+        size_t texels = (size_t)lw * (size_t)lh * (size_t)(cube ? 6 : ld);
+        const uint8_t *src = (const uint8_t *)ZSTR_VAL(bytes) + info.level_offset[lvl];
+        zend_string *rgba = zend_string_alloc(texels * 4, 0);
+        uint8_t *dst = (uint8_t *)ZSTR_VAL(rgba);
+        if (info.vio_format == VIO_FORMAT_R8) {
+            for (size_t i = 0; i < texels; i++) { dst[i * 4] = dst[i * 4 + 1] = dst[i * 4 + 2] = src[i]; dst[i * 4 + 3] = 255; }
+        } else {
+            memcpy(dst, src, texels * 4);
+        }
+        ZSTR_VAL(rgba)[texels * 4] = '\0';
+        zval cfg, fn, args[2];
+        array_init(&cfg);
+        if (cube) {
+            zval faces;
+            size_t face_bytes = (size_t)lw * (size_t)lh * 4;
+            array_init(&faces);
+            for (int f = 0; f < 6; f++) add_next_index_stringl(&faces, ZSTR_VAL(rgba) + (size_t)f * face_bytes, face_bytes);
+            add_assoc_zval(&cfg, "faces", &faces);
+            add_assoc_long(&cfg, "width", lw);
+            add_assoc_long(&cfg, "height", lh);
+            add_assoc_bool(&cfg, "mipmaps", want_mipmaps || info.levels - lvl > 1);
+            ZVAL_STRING(&fn, "vio_cubemap");
+        } else {
+            add_assoc_str(&cfg, "data", zend_string_copy(rgba));
+            add_assoc_long(&cfg, "width", lw);
+            add_assoc_long(&cfg, "height", lh);
+            add_assoc_long(&cfg, "depth", ld);
+            add_assoc_long(&cfg, "filter", filter);
+            add_assoc_long(&cfg, "wrap", wrap);
+            add_assoc_long(&cfg, "anisotropy", anisotropy);
+            ZVAL_STRING(&fn, "vio_texture_3d");
+        }
+        zend_string_release(rgba);
+        ZVAL_COPY(&args[0], ctx_zval);
+        ZVAL_COPY_VALUE(&args[1], &cfg);
+        if (call_user_function(NULL, NULL, &fn, return_value, 2, args) != SUCCESS) RETVAL_FALSE;
+        zval_ptr_dtor(&fn);
+        zval_ptr_dtor(&args[0]);
+        zval_ptr_dtor(&cfg);
+        return;
     }
     uint8_t *data = NULL;
     size_t data_len = 0;
@@ -4342,12 +5148,14 @@ ZEND_FUNCTION(vio_uniform_buffer)
     buf->type    = VIO_BUFFER_UNIFORM;
     buf->size    = size;
     buf->binding = binding;
+    buf->shadow  = size > 0 ? ecalloc(1, size) : NULL;
 
     /* Get optional initial data */
     zval *data_zval = zend_hash_str_find(config_ht, "data", sizeof("data") - 1);
     const void *init_data = NULL;
     if (data_zval && Z_TYPE_P(data_zval) == IS_STRING) {
         init_data = Z_STRVAL_P(data_zval);
+        if (buf->shadow) memcpy(buf->shadow, init_data, Z_STRLEN_P(data_zval) < size ? Z_STRLEN_P(data_zval) : size);
     }
 
     buf->backend = ctx->backend;
@@ -4390,6 +5198,8 @@ ZEND_FUNCTION(vio_update_buffer)
         php_error_docref(NULL, E_WARNING, "Data exceeds buffer size");
         return;
     }
+
+    if (buf->shadow) memcpy(buf->shadow + offset, data, data_len);
 
     /* OpenGL stores its handle in buf->buffer_id and goes through
      * update_uniform_buffer; D3D / Vulkan use the backend handle path. */
@@ -4434,6 +5244,15 @@ ZEND_FUNCTION(vio_bind_buffer)
     }
 
     int bind_point = (binding >= 0) ? (int)binding : buf->binding;
+
+    /* Graphics shaders read the buffer at draw time (vio_apply_bound_ubos). */
+    if (buf->type == VIO_BUFFER_UNIFORM && bind_point >= 0 && bind_point < VIO_MAX_UBO_BINDINGS) {
+        if (ctx->bound_ubo[bind_point] != &buf->std) {
+            GC_ADDREF(&buf->std);
+            if (ctx->bound_ubo[bind_point]) OBJ_RELEASE(ctx->bound_ubo[bind_point]);
+            ctx->bound_ubo[bind_point] = &buf->std;
+        }
+    }
 
     if (ctx->backend->bind_uniform_buffer && buf->buffer_id) {
         ctx->backend->bind_uniform_buffer(buf, bind_point);
@@ -4517,6 +5336,24 @@ ZEND_FUNCTION(vio_compute_pipeline)
     desc.fragment_data = Z_STRVAL_P(src_zval);
     desc.fragment_size = Z_STRLEN_P(src_zval);
     desc.format = VIO_SHADER_GLSL;
+    /* 'msl' => kernel source: Metal compiles it instead of the translated GLSL */
+    zval *msl_zval = zend_hash_str_find(config_ht, "msl", sizeof("msl") - 1);
+    if (msl_zval && Z_TYPE_P(msl_zval) != IS_NULL) {
+        if (Z_TYPE_P(msl_zval) != IS_STRING || Z_STRLEN_P(msl_zval) == 0) {
+            zend_value_error("vio_compute_pipeline(): 'msl' must be a non-empty MSL kernel source");
+            RETURN_THROWS();
+        }
+        desc.compute_msl = Z_STRVAL_P(msl_zval);
+    }
+    /* 'hlsl' => kernel source: D3D11 / D3D12 compile it instead of the translated GLSL */
+    zval *hlsl_zval = zend_hash_str_find(config_ht, "hlsl", sizeof("hlsl") - 1);
+    if (hlsl_zval && Z_TYPE_P(hlsl_zval) != IS_NULL) {
+        if (Z_TYPE_P(hlsl_zval) != IS_STRING || Z_STRLEN_P(hlsl_zval) == 0) {
+            zend_value_error("vio_compute_pipeline(): 'hlsl' must be a non-empty HLSL kernel source");
+            RETURN_THROWS();
+        }
+        desc.compute_hlsl = Z_STRVAL_P(hlsl_zval);
+    }
 
     void *backend_pipeline = ctx->backend->create_compute_pipeline(&desc);
     if (!backend_pipeline) {
@@ -4827,6 +5664,45 @@ static int vio_vertex_storage_supported(vio_context_object *ctx)
     return ctx->backend->supports_feature(VIO_FEATURE_VERTEX_STORAGE) ? 1 : 0;
 }
 
+/* vio_bind_fragment_storage_buffer($ctx, ?$buffer, $binding) (OPEN-ITEMS-PLAN A15):
+ * a writable std430 buffer for the fragment stage at $binding (0..3), for every
+ * following draw until changed; null unbinds. The context keeps a reference. */
+ZEND_FUNCTION(vio_bind_fragment_storage_buffer)
+{
+    zval *ctx_zval, *buf_zval = NULL;
+    zend_long binding;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS_OR_NULL(buf_zval, vio_buffer_ce)
+        Z_PARAM_LONG(binding)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (binding < 0 || binding >= VIO_MAX_FRAGMENT_STORAGE) {
+        zend_argument_value_error(3, "must be 0..%d", VIO_MAX_FRAGMENT_STORAGE - 1);
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !ctx->backend || !ctx->backend->supports_feature
+        || !ctx->backend->supports_feature(VIO_FEATURE_FRAGMENT_STORAGE) || !ctx->backend->bind_fragment_storage) {
+        php_error_docref(NULL, E_WARNING, "vio_bind_fragment_storage_buffer: backend '%s' has no fragment-stage storage buffers "
+                         "(VIO_FEATURE_FRAGMENT_STORAGE = 0)", ctx->backend ? ctx->backend->name : "none");
+        RETURN_FALSE;
+    }
+    vio_buffer_object *buf = buf_zval ? Z_VIO_BUFFER_P(buf_zval) : NULL;
+    if (buf && (!buf->valid || !buf->backend_buffer || buf->type != VIO_BUFFER_STORAGE)) {
+        php_error_docref(NULL, E_WARNING, "vio_bind_fragment_storage_buffer: needs a storage buffer (vio_storage_buffer)");
+        RETURN_FALSE;
+    }
+    if (ctx->backend->bind_fragment_storage(buf ? buf->backend_buffer : NULL, (int)binding) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_bind_fragment_storage_buffer: the backend refused the buffer");
+        RETURN_FALSE;
+    }
+    zend_object *old = ctx->frag_storage[binding];
+    if (buf) GC_ADDREF(Z_OBJ_P(buf_zval));
+    ctx->frag_storage[binding] = buf ? Z_OBJ_P(buf_zval) : NULL;
+    if (old) OBJ_RELEASE(old);
+    RETURN_TRUE;
+}
+
 ZEND_FUNCTION(vio_bind_storage_buffer)
 {
     zval *ctx_zval;
@@ -4891,6 +5767,7 @@ ZEND_FUNCTION(vio_draw_instanced_from_buffer)
     }
 
     vio_flush_pending_textures(ctx);
+    vio_apply_mesh_layout(ctx, mesh);
 
     /* Same cbuffer push + root-CBV bind as vio_draw / vio_draw_instanced. */
     vio_push_shader_cbuffers(ctx);   /* no-op on OpenGL (no cbuffer_backend) */
@@ -4946,6 +5823,7 @@ ZEND_FUNCTION(vio_draw_indirect)
         return;
     }
     vio_flush_pending_textures(ctx);
+    vio_apply_mesh_layout(ctx, mesh);
     vio_push_shader_cbuffers(ctx);   /* no-op on OpenGL (no cbuffer_backend) */
     ctx->backend->draw_indirect(mesh, buf->backend_buffer, (int)max_draws, (size_t)offset);
 }
@@ -5078,6 +5956,42 @@ ZEND_FUNCTION(vio_shading_rate_tile_size)
         RETURN_LONG(0);
     }
     RETURN_LONG(ctx->backend->shading_rate_tile_size());
+}
+
+/* VIO_FEATURE_COOPERATIVE_MATRIX: the subgroup-scope coopmat shapes the device
+ * multiplies, [['m', 'n', 'k', 'a', 'b', 'c', 'result'], ...] with component
+ * types as strings ('float16', 'float32', 'sint8', ...). [] without the feature. */
+ZEND_FUNCTION(vio_cooperative_matrix_shapes)
+{
+    static const char *const type_names[] = {
+        "float16", "float32", "float64", "sint8", "sint16", "sint32", "sint64",
+        "uint8", "uint16", "uint32", "uint64", "bfloat16",
+    };
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    array_init(return_value);
+    if (!ctx->initialized || !ctx->backend->cooperative_matrix_shapes || !ctx->backend->supports_feature
+        || !ctx->backend->supports_feature(VIO_FEATURE_COOPERATIVE_MATRIX)) {
+        return;
+    }
+    vio_coopmat_shape shapes[VIO_COOPMAT_MAX_SHAPES];
+    int n = ctx->backend->cooperative_matrix_shapes(shapes, VIO_COOPMAT_MAX_SHAPES);
+    for (int i = 0; i < n; i++) {
+        const vio_coopmat_type t[4] = { shapes[i].a, shapes[i].b, shapes[i].c, shapes[i].result };
+        const char *keys[4] = { "a", "b", "c", "result" };
+        zval s;
+        array_init(&s);
+        add_assoc_long(&s, "m", shapes[i].m);
+        add_assoc_long(&s, "n", shapes[i].n);
+        add_assoc_long(&s, "k", shapes[i].k);
+        for (int j = 0; j < 4; j++) {
+            add_assoc_string(&s, keys[j], (unsigned)t[j] < sizeof(type_names) / sizeof(type_names[0]) ? type_names[t[j]] : "unknown");
+        }
+        add_next_index_zval(return_value, &s);
+    }
 }
 
 ZEND_FUNCTION(vio_set_shading_rate)
@@ -5447,13 +6361,7 @@ ZEND_FUNCTION(vio_submit_batch)
             instanceof_function(Z_OBJCE_P(pz), vio_pipeline_ce)) {
             vio_pipeline_object *pipe = Z_VIO_PIPELINE_P(pz);
             if (pipe->valid && pipe != last_pipeline) {
-                ctx->bound_shader_program = pipe->shader_program;
-                ctx->bound_shader_object = pipe->shader_ref;
-                if (ctx->backend->bind_pipeline_state) {
-                    ctx->backend->bind_pipeline_state(pipe);
-                } else if (pipe->backend_pipeline && ctx->backend->bind_pipeline) {
-                    ctx->backend->bind_pipeline(pipe->backend_pipeline);
-                }
+                vio_bind_pipeline_core(ctx, pipe);
                 last_pipeline = pipe;
             }
         }
@@ -5503,8 +6411,625 @@ ZEND_FUNCTION(vio_submit_batch)
     } ZEND_HASH_FOREACH_END();
 }
 
-/* ── Phase 5: 2D API functions ───────────────────────────────────── */
+/* ── Recorded draw sequences (vio_bundle, OPEN-ITEMS A38, BUNDLE-PLAN.md) ── */
 
+/* Parse one vio_submit_batch record into r; on a malformed record throw a
+ * ValueError naming it and return -1. */
+static int vio_bundle_parse_record(vio_bundle_record *r, zval *rec, zend_ulong index)
+{
+    memset(r, 0, sizeof(*r));
+    if (Z_TYPE_P(rec) != IS_ARRAY) {
+        zend_value_error("vio_bundle(): record %lu is not an array", (unsigned long)index);
+        return -1;
+    }
+    HashTable *h = Z_ARRVAL_P(rec);
+    zval *mz = zend_hash_str_find(h, "mesh", sizeof("mesh") - 1);
+    if (!mz || Z_TYPE_P(mz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(mz), vio_mesh_ce)) {
+        zend_value_error("vio_bundle(): record %lu needs a VioMesh under 'mesh'", (unsigned long)index);
+        return -1;
+    }
+    zval *pz = zend_hash_str_find(h, "pipeline", sizeof("pipeline") - 1);
+    if (pz && (Z_TYPE_P(pz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(pz), vio_pipeline_ce))) {
+        zend_value_error("vio_bundle(): record %lu: 'pipeline' must be a VioPipeline", (unsigned long)index);
+        return -1;
+    }
+    zval *tz = zend_hash_str_find(h, "textures", sizeof("textures") - 1);
+    if (tz && Z_TYPE_P(tz) != IS_ARRAY) {
+        zend_value_error("vio_bundle(): record %lu: 'textures' must be an array of slot => VioTexture", (unsigned long)index);
+        return -1;
+    }
+    zval *uz = zend_hash_str_find(h, "uniforms", sizeof("uniforms") - 1);
+    if (uz && Z_TYPE_P(uz) != IS_ARRAY) {
+        zend_value_error("vio_bundle(): record %lu: 'uniforms' must be an array of name => value", (unsigned long)index);
+        return -1;
+    }
+    if (tz) {
+        zend_ulong slot;
+        zend_string *skey;
+        zval *tv;
+        ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(tz), slot, skey, tv) {
+            if (skey || Z_TYPE_P(tv) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(tv), vio_texture_ce) || slot > 31) {
+                zend_value_error("vio_bundle(): record %lu: 'textures' must map slots 0..31 to VioTexture objects", (unsigned long)index);
+                return -1;
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+    if (uz) {
+        zend_string *ukey;
+        zval *uv;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(uz), ukey, uv) {
+            if (!ukey || (Z_TYPE_P(uv) != IS_LONG && Z_TYPE_P(uv) != IS_DOUBLE && Z_TYPE_P(uv) != IS_ARRAY)) {
+                zend_value_error("vio_bundle(): record %lu: uniforms map names to int, float or array values", (unsigned long)index);
+                return -1;
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+    /* valid: take references */
+    r->mesh = Z_OBJ_P(mz);
+    GC_ADDREF(r->mesh);
+    if (pz) { r->pipeline = Z_OBJ_P(pz); GC_ADDREF(r->pipeline); }
+    if (tz && zend_hash_num_elements(Z_ARRVAL_P(tz)) > 0) {
+        r->textures = ecalloc(zend_hash_num_elements(Z_ARRVAL_P(tz)), sizeof(vio_bundle_texture));
+        zend_ulong slot;
+        zval *tv;
+        ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(tz), slot, tv) {
+            r->textures[r->texture_count].slot = (int)slot;
+            r->textures[r->texture_count].texture = Z_OBJ_P(tv);
+            GC_ADDREF(Z_OBJ_P(tv));
+            r->texture_count++;
+        } ZEND_HASH_FOREACH_END();
+    }
+    if (uz && zend_hash_num_elements(Z_ARRVAL_P(uz)) > 0) {
+        r->uniforms = ecalloc(zend_hash_num_elements(Z_ARRVAL_P(uz)), sizeof(vio_bundle_uniform));
+        zend_string *ukey;
+        zval *uv;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(uz), ukey, uv) {
+            r->uniforms[r->uniform_count].name = zend_string_copy(ukey);
+            ZVAL_COPY(&r->uniforms[r->uniform_count].value, uv);
+            r->uniform_count++;
+        } ZEND_HASH_FOREACH_END();
+    }
+    return 0;
+}
+
+ZEND_FUNCTION(vio_bundle)
+{
+    zval *ctx_zval;
+    HashTable *records;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(records)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "vio_bundle: context is not initialized");
+        RETURN_FALSE;
+    }
+    uint32_t n = zend_hash_num_elements(records);
+    if (n == 0) {
+        zend_argument_value_error(2, "must contain at least one record");
+        RETURN_THROWS();
+    }
+    object_init_ex(return_value, vio_bundle_ce);
+    vio_bundle_object *b = Z_VIO_BUNDLE_P(return_value);
+    b->records = ecalloc(n, sizeof(vio_bundle_record));
+    zend_ulong idx;
+    zval *rec;
+    ZEND_HASH_FOREACH_NUM_KEY_VAL(records, idx, rec) {
+        if (vio_bundle_parse_record(&b->records[b->count], rec, idx) != 0) {
+            zval_ptr_dtor(return_value);
+            ZVAL_UNDEF(return_value);
+            RETURN_THROWS();
+        }
+        b->count++;
+    } ZEND_HASH_FOREACH_END();
+}
+
+/* Native bundles (BUNDLE-PLAN phases 2-4) bake the shader cbuffers in while
+ * recording and leave the backend's buffers in an undefined state for the
+ * draws after them: every shader the bundle touches uploads again. */
+static void vio_shader_cbuffers_dirty(vio_shader_object *sh)
+{
+    if (!sh) return;
+    sh->cbuffer_dirty = 1;
+    sh->frag_cbuffer_dirty = 1;
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) if (sh->stage_cb[i]) sh->stage_cb[i]->dirty = 1;
+}
+
+static void vio_bundle_cbuffers_dirty(vio_context_object *ctx, vio_bundle_object *b)
+{
+    vio_shader_cbuffers_dirty((vio_shader_object *)ctx->bound_shader_object);
+    for (int i = 0; i < b->count; i++) {
+        if (!b->records[i].pipeline) continue;
+        vio_pipeline_object *pipe = vio_pipeline_from_obj(b->records[i].pipeline);
+        vio_shader_cbuffers_dirty((vio_shader_object *)pipe->shader_ref);
+    }
+}
+
+ZEND_FUNCTION(vio_draw_bundle)
+{
+    zval *ctx_zval, *bundle_zval;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(bundle_zval, vio_bundle_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_bundle_object *b = Z_VIO_BUNDLE_P(bundle_zval);
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_draw_bundle between vio_begin and vio_end");
+        RETURN_FALSE;
+    }
+    /* A native recording for the pass open now (BUNDLE-PLAN phases 2-4): play
+     * it, or record it once - the backend records while the records run
+     * through the common draw path below - and play that. */
+    const vio_backend *be = ctx->backend;
+    if (b->backend_bundle && b->backend == be && be->draw_bundle && be->draw_bundle(b->backend_bundle) == 0) {
+        vio_bundle_cbuffers_dirty(ctx, b);
+        RETURN_TRUE;
+    }
+    if (b->backend_bundle && b->backend && ((const vio_backend *)b->backend)->destroy_bundle)
+        ((const vio_backend *)b->backend)->destroy_bundle(b->backend_bundle);
+    b->backend_bundle = NULL;
+    b->backend = NULL;
+    void *rec = (be->begin_bundle && be->end_bundle && be->draw_bundle) ? be->begin_bundle() : NULL;
+    /* A native recording starts from the shadow values (a recording backend
+     * uploads on the first draw of each shader) and leaves the pipeline bound
+     * before it in place, like its later plays. */
+    unsigned int saved_program = ctx->bound_shader_program;
+    void *saved_shader = ctx->bound_shader_object;
+    if (rec) vio_bundle_cbuffers_dirty(ctx, b);    for (int pass = rec ? 0 : 1; pass < 2; pass++) {
+    /* The records through the vio_submit_batch core (pass 0: recording). */
+    vio_pipeline_object *last_pipeline = NULL;
+    for (int i = 0; i < b->count; i++) {
+        vio_bundle_record *r = &b->records[i];
+        if (r->pipeline) {
+            vio_pipeline_object *pipe = vio_pipeline_from_obj(r->pipeline);
+            if (pipe->valid && pipe != last_pipeline) {
+                vio_bind_pipeline_core(ctx, pipe);
+                last_pipeline = pipe;
+            }
+        }
+        for (int t = 0; t < r->texture_count; t++) {
+            vio_texture_object *tex = vio_texture_from_obj(r->textures[t].texture);
+            if (tex->valid) vio_bind_texture_internal(ctx, tex, (zend_long)r->textures[t].slot);
+        }
+        for (int u = 0; u < r->uniform_count; u++) {
+            vio_apply_uniform(ctx, ZSTR_VAL(r->uniforms[u].name), &r->uniforms[u].value);
+        }
+        vio_submit_one(ctx, vio_mesh_from_obj(r->mesh));
+    }
+    if (pass == 0) {
+        int ok = be->end_bundle(rec) == 0;
+        ctx->bound_shader_program = saved_program;
+        ctx->bound_shader_object = saved_shader;
+        if (ok && be->draw_bundle(rec) == 0) {
+            b->backend_bundle = rec;
+            b->backend = be;
+            vio_bundle_cbuffers_dirty(ctx, b);
+            RETURN_TRUE;
+        }
+        if (be->destroy_bundle) be->destroy_bundle(rec);   /* replay instead */
+        vio_bundle_cbuffers_dirty(ctx, b);    }
+    }
+    RETURN_TRUE;
+}
+
+ZEND_FUNCTION(vio_bundle_info)
+{
+    zval *bundle_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(bundle_zval, vio_bundle_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_bundle_object *b = Z_VIO_BUNDLE_P(bundle_zval);
+    const vio_backend *be = (const vio_backend *)b->backend;
+    array_init(return_value);
+    add_assoc_long(return_value, "draws", (zend_long)b->count);
+    add_assoc_bool(return_value, "native", b->backend_bundle != NULL);
+    add_assoc_string(return_value, "method",
+                     (b->backend_bundle && be && be->bundle_method) ? (char *)be->bundle_method() : "replay");
+}
+
+/* ── Upscaling (UPSCALE-PLAN, OPEN-ITEMS A21) ─────────────────────── */
+
+#include "src/shaders/upscale_shaders.h"
+
+/* Fragment passes over the public draw API: shaders, pipelines and targets are
+ * ordinary vio objects, created once per context through the PHP functions
+ * (every backend detail stays where vio_shader / vio_render_target put it). */
+enum { VIO_UP_SPATIAL, VIO_UP_SHARPEN, VIO_UP_TEMPORAL, VIO_UP_COPY, VIO_UP_PASSES };
+
+typedef struct _vio_upscale_state {
+    zval mesh;
+    zval pipe[VIO_UP_PASSES];
+    zval mid;                    /* spatial -> sharpen, target size, RGBA16F */
+    int  mid_w, mid_h;
+    zval hist[2];                /* temporal history ping-pong, target size, RGBA16F */
+    zval hist_tex[2];
+    int  hist_w, hist_h, hist_cur, hist_valid;
+    zval none;                   /* 1x1 texture for an absent motion input */
+} vio_upscale_state;
+
+static int vio_up_call(const char *fn, zval *ret, uint32_t argc, zval *argv)
+{
+    zval fname;
+    ZVAL_STRING(&fname, fn);
+    ZVAL_UNDEF(ret);
+    int ok = call_user_function(NULL, NULL, &fname, ret, argc, argv) == SUCCESS && !EG(exception)
+             && Z_TYPE_P(ret) != IS_FALSE && Z_TYPE_P(ret) != IS_NULL;
+    zval_ptr_dtor(&fname);
+    if (!ok) { zval_ptr_dtor(ret); ZVAL_UNDEF(ret); }
+    return ok ? 0 : -1;
+}
+
+/* A call whose return value does not matter (binds, viewport). */
+static int vio_up_do(const char *fn, uint32_t argc, zval *argv)
+{
+    zval fname, ret;
+    ZVAL_STRING(&fname, fn);
+    ZVAL_UNDEF(&ret);
+    int ok = call_user_function(NULL, NULL, &fname, &ret, argc, argv) == SUCCESS && !EG(exception);
+    zval_ptr_dtor(&fname);
+    zval_ptr_dtor(&ret);
+    return ok ? 0 : -1;
+}
+
+void vio_upscale_release(vio_context_object *ctx)
+{
+    vio_upscale_state *u = (vio_upscale_state *)ctx->upscale;
+    if (!u) return;
+    ctx->upscale = NULL;
+    zval_ptr_dtor(&u->mesh);
+    for (int i = 0; i < VIO_UP_PASSES; i++) zval_ptr_dtor(&u->pipe[i]);
+    zval_ptr_dtor(&u->mid);
+    for (int i = 0; i < 2; i++) { zval_ptr_dtor(&u->hist_tex[i]); zval_ptr_dtor(&u->hist[i]); }
+    zval_ptr_dtor(&u->none);
+    efree(u);
+}
+
+static vio_upscale_state *vio_upscale_state_for(vio_context_object *ctx, zval *ctx_zval)
+{
+    if (ctx->upscale) return (vio_upscale_state *)ctx->upscale;
+    vio_upscale_state *u = ecalloc(1, sizeof(vio_upscale_state));
+    ctx->upscale = u;
+    zval args[2], opts, arr;
+
+    array_init(&opts);
+    array_init(&arr);
+    add_next_index_double(&arr, -1.0); add_next_index_double(&arr, -1.0);
+    add_next_index_double(&arr,  3.0); add_next_index_double(&arr, -1.0);
+    add_next_index_double(&arr, -1.0); add_next_index_double(&arr,  3.0);
+    add_assoc_zval(&opts, "vertices", &arr);
+    array_init(&arr);
+    add_next_index_long(&arr, VIO_FLOAT2);
+    add_assoc_zval(&opts, "layout", &arr);
+    ZVAL_COPY_VALUE(&args[0], ctx_zval);
+    ZVAL_COPY_VALUE(&args[1], &opts);
+    int fail = vio_up_call("vio_mesh", &u->mesh, 2, args);
+    zval_ptr_dtor(&opts);
+
+    const char *fs[VIO_UP_PASSES] = { vio_upscale_spatial_fs, vio_upscale_sharpen_fs, vio_upscale_temporal_fs, vio_upscale_copy_fs };
+    for (int i = 0; i < VIO_UP_PASSES && !fail; i++) {
+        zval shader;
+        array_init(&opts);
+        add_assoc_string(&opts, "vertex", (char *)vio_upscale_vs);
+        add_assoc_string(&opts, "fragment", (char *)fs[i]);
+        ZVAL_COPY_VALUE(&args[1], &opts);
+        fail = vio_up_call("vio_shader", &shader, 2, args);
+        zval_ptr_dtor(&opts);
+        if (fail) break;
+        array_init(&opts);
+        add_assoc_zval(&opts, "shader", &shader);   /* the pipeline array takes the reference */
+        add_assoc_bool(&opts, "depth_test", 0);
+        add_assoc_bool(&opts, "depth_write", 0);
+        add_assoc_long(&opts, "cull_mode", VIO_CULL_NONE);
+        add_assoc_long(&opts, "blend", VIO_BLEND_NONE);   /* the history alpha is a weight, not coverage */
+        ZVAL_COPY_VALUE(&args[1], &opts);
+        fail = vio_up_call("vio_pipeline", &u->pipe[i], 2, args);
+        zval_ptr_dtor(&opts);
+    }
+    if (!fail) {
+        static const unsigned char black[4] = { 0, 0, 0, 0 };
+        array_init(&opts);
+        add_assoc_stringl(&opts, "data", (char *)black, 4);
+        add_assoc_long(&opts, "width", 1);
+        add_assoc_long(&opts, "height", 1);
+        ZVAL_COPY_VALUE(&args[1], &opts);
+        fail = vio_up_call("vio_texture", &u->none, 2, args);
+        zval_ptr_dtor(&opts);
+    }
+    if (fail) {
+        vio_upscale_release(ctx);
+        return NULL;
+    }
+    return u;
+}
+
+/* A target-sized RGBA16F render target (and its texture); kept while the size holds. */
+static int vio_up_target_rt(zval *ctx_zval, zval *rt, zval *tex, int *cw, int *ch, int w, int h)
+{
+    if (Z_TYPE_P(rt) == IS_OBJECT && *cw == w && *ch == h) return 0;
+    zval_ptr_dtor(rt); ZVAL_UNDEF(rt);
+    if (tex) { zval_ptr_dtor(tex); ZVAL_UNDEF(tex); }
+    zval args[2], opts;
+    array_init(&opts);
+    add_assoc_long(&opts, "width", w);
+    add_assoc_long(&opts, "height", h);
+    add_assoc_bool(&opts, "hdr", 1);
+    ZVAL_COPY_VALUE(&args[0], ctx_zval);
+    ZVAL_COPY_VALUE(&args[1], &opts);
+    int fail = vio_up_call("vio_render_target", rt, 2, args);
+    zval_ptr_dtor(&opts);
+    if (fail) return -1;
+    if (tex && vio_up_call("vio_render_target_texture", tex, 1, rt) != 0) return -1;
+    *cw = w; *ch = h;
+    return 0;
+}
+
+/* Bind `rt` (NULL: the swapchain) and a full viewport. */
+static int vio_up_bind(zval *ctx_zval, zval *rt, int w, int h)
+{
+    zval args[5];
+    ZVAL_COPY_VALUE(&args[0], ctx_zval);
+    if (rt) {
+        ZVAL_COPY_VALUE(&args[1], rt);
+        if (vio_up_do("vio_bind_render_target", 2, args) != 0) return -1;
+    } else if (vio_up_do("vio_unbind_render_target", 1, args) != 0) {
+        return -1;
+    }
+    ZVAL_LONG(&args[1], 0); ZVAL_LONG(&args[2], 0); ZVAL_LONG(&args[3], w); ZVAL_LONG(&args[4], h);
+    return vio_up_do("vio_viewport", 5, args);
+}
+
+static void vio_up_vec4(vio_context_object *ctx, const char *name, double a, double b, double c, double d)
+{
+    zval v;
+    array_init(&v);
+    add_next_index_double(&v, a); add_next_index_double(&v, b);
+    add_next_index_double(&v, c); add_next_index_double(&v, d);
+    vio_apply_uniform(ctx, name, &v);
+    zval_ptr_dtor(&v);
+}
+
+static void vio_up_sampler(vio_context_object *ctx, const char *name, zval *tex, int unit)
+{
+    zval v;
+    vio_bind_texture_internal(ctx, Z_VIO_TEXTURE_P(tex), unit);
+    ZVAL_LONG(&v, unit);
+    vio_apply_uniform(ctx, name, &v);
+}
+
+static void vio_up_pass(vio_context_object *ctx, vio_upscale_state *u, int pass)
+{
+    vio_bind_pipeline_core(ctx, Z_VIO_PIPELINE_P(&u->pipe[pass]));
+}
+
+ZEND_FUNCTION(vio_upscale)
+{
+    zval *ctx_zval, *src_zval, *dst_zval = NULL;
+    HashTable *opts = NULL;
+
+    ZEND_PARSE_PARAMETERS_START(3, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(src_zval)
+        Z_PARAM_OBJECT_OF_CLASS_OR_NULL(dst_zval, vio_render_target_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT_OR_NULL(opts)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    int src_is_rt = instanceof_function(Z_OBJCE_P(src_zval), vio_render_target_ce);
+    if (!src_is_rt && !instanceof_function(Z_OBJCE_P(src_zval), vio_texture_ce)) {
+        zend_argument_type_error(2, "must be of type VioRenderTarget|VioTexture, %s given", zend_zval_value_name(src_zval));
+        RETURN_THROWS();
+    }
+    zend_long mode = VIO_UPSCALE_SPATIAL;
+    double sharp = 0.25, jx = 0.0, jy = 0.0;
+    zval *motion = NULL;
+    int reset = 0, native = 1;
+    if (opts) {
+        zval *z;
+        if ((z = zend_hash_str_find(opts, "mode", sizeof("mode") - 1))) mode = zval_get_long(z);
+        if ((z = zend_hash_str_find(opts, "sharpness", sizeof("sharpness") - 1))) sharp = zval_get_double(z);
+        if ((z = zend_hash_str_find(opts, "reset", sizeof("reset") - 1))) reset = zend_is_true(z);
+        if ((z = zend_hash_str_find(opts, "native", sizeof("native") - 1))) native = zend_is_true(z);
+        if ((z = zend_hash_str_find(opts, "jitter", sizeof("jitter") - 1))) {
+            zval *x, *y;
+            if (Z_TYPE_P(z) != IS_ARRAY || !(x = zend_hash_index_find(Z_ARRVAL_P(z), 0)) || !(y = zend_hash_index_find(Z_ARRVAL_P(z), 1))) {
+                zend_argument_value_error(4, "'jitter' must be [x, y] in source pixels");
+                RETURN_THROWS();
+            }
+            jx = zval_get_double(x);
+            jy = zval_get_double(y);
+        }
+        if ((z = zend_hash_str_find(opts, "motion", sizeof("motion") - 1)) && Z_TYPE_P(z) != IS_NULL) {
+            if (Z_TYPE_P(z) != IS_OBJECT || (!instanceof_function(Z_OBJCE_P(z), vio_render_target_ce)
+                                             && !instanceof_function(Z_OBJCE_P(z), vio_texture_ce))) {
+                zend_argument_value_error(4, "'motion' must be a VioRenderTarget or VioTexture");
+                RETURN_THROWS();
+            }
+            motion = z;
+        }
+    }
+    if (mode != VIO_UPSCALE_SPATIAL && mode != VIO_UPSCALE_TEMPORAL) {
+        zend_argument_value_error(4, "'mode' must be VIO_UPSCALE_SPATIAL or VIO_UPSCALE_TEMPORAL");
+        RETURN_THROWS();
+    }
+    if (sharp < 0.0 || sharp > 1.0) {
+        zend_argument_value_error(4, "'sharpness' must be 0..1");
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_upscale between vio_begin and vio_end");
+        RETURN_FALSE;
+    }
+    if (!ctx->backend->supports_feature || !ctx->backend->supports_feature(VIO_FEATURE_3D_PIPELINE)
+        || !ctx->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_HDR)) {
+        php_error_docref(NULL, E_WARNING, "vio_upscale: backend '%s' has no 3D pipeline with HDR render targets", ctx->backend->name);
+        RETURN_FALSE;
+    }
+
+    /* source texture and sizes */
+    zval src_tex, motion_tex;
+    ZVAL_UNDEF(&src_tex);
+    ZVAL_UNDEF(&motion_tex);
+    int sw, sh, dw, dh;
+    if (src_is_rt) {
+        vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(src_zval);
+        sw = rt->width; sh = rt->height;
+        if (vio_up_call("vio_render_target_texture", &src_tex, 1, src_zval) != 0) RETURN_FALSE;
+    } else {
+        vio_texture_object *t = Z_VIO_TEXTURE_P(src_zval);
+        sw = t->width; sh = t->height;
+        ZVAL_COPY(&src_tex, src_zval);
+    }
+    if (motion) {
+        if (instanceof_function(Z_OBJCE_P(motion), vio_render_target_ce)) {
+            if (vio_up_call("vio_render_target_texture", &motion_tex, 1, motion) != 0) { zval_ptr_dtor(&src_tex); RETURN_FALSE; }
+        } else {
+            ZVAL_COPY(&motion_tex, motion);
+        }
+    }
+    if (dst_zval) {
+        vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(dst_zval);
+        dw = rt->width; dh = rt->height;
+    } else {
+        zval fb;
+        dw = ctx->config.width; dh = ctx->config.height;
+        if (vio_up_call("vio_framebuffer_size", &fb, 1, ctx_zval) == 0 && Z_TYPE(fb) == IS_ARRAY) {
+            zval *w = zend_hash_index_find(Z_ARRVAL(fb), 0), *h = zend_hash_index_find(Z_ARRVAL(fb), 1);
+            if (w && h) { dw = (int)zval_get_long(w); dh = (int)zval_get_long(h); }
+        }
+        zval_ptr_dtor(&fb);
+    }
+    int ok = 0;
+    vio_upscale_state *u = (sw > 0 && sh > 0 && dw > 0 && dh > 0) ? vio_upscale_state_for(ctx, ctx_zval) : NULL;
+    if (!u) goto done;
+    vio_mesh_object *mesh = Z_VIO_MESH_P(&u->mesh);
+
+    /* The platform's own scaler (MetalFX), into a render target. */
+    if (native && dst_zval && ctx->backend->upscale_native && ctx->backend->upscale_method
+        && ctx->backend->upscale_method((int)mode)
+        && ctx->backend->upscale_native(Z_VIO_TEXTURE_P(&src_tex)->backend_texture, Z_VIO_RENDER_TARGET_P(dst_zval), (int)mode) == 0) {
+        ok = vio_up_bind(ctx_zval, dst_zval, dw, dh) == 0;
+        goto done;
+    }
+
+    if (mode == VIO_UPSCALE_SPATIAL) {
+        if (sharp > 0.0) {
+            zval mid_tex;
+            ZVAL_UNDEF(&mid_tex);
+            if (vio_up_target_rt(ctx_zval, &u->mid, NULL, &u->mid_w, &u->mid_h, dw, dh) != 0
+                || vio_up_call("vio_render_target_texture", &mid_tex, 1, &u->mid) != 0
+                || vio_up_bind(ctx_zval, &u->mid, dw, dh) != 0) { zval_ptr_dtor(&mid_tex); goto done; }
+            vio_up_pass(ctx, u, VIO_UP_SPATIAL);
+            vio_up_sampler(ctx, "u_src", &src_tex, 0);
+            vio_up_vec4(ctx, "u_size", sw, sh, dw, dh);
+            vio_up_vec4(ctx, "u_rect", 0, 0, 0, 0);
+            vio_submit_one(ctx, mesh);
+            if (vio_up_bind(ctx_zval, dst_zval, dw, dh) != 0) { zval_ptr_dtor(&mid_tex); goto done; }
+            vio_up_pass(ctx, u, VIO_UP_SHARPEN);
+            vio_up_sampler(ctx, "u_src", &mid_tex, 0);
+            vio_up_vec4(ctx, "u_size", dw, dh, dw, dh);
+            vio_up_vec4(ctx, "u_rect", 0, 0, sharp, 0);
+            vio_submit_one(ctx, mesh);
+            zval_ptr_dtor(&mid_tex);
+        } else {
+            if (vio_up_bind(ctx_zval, dst_zval, dw, dh) != 0) goto done;
+            vio_up_pass(ctx, u, VIO_UP_SPATIAL);
+            vio_up_sampler(ctx, "u_src", &src_tex, 0);
+            vio_up_vec4(ctx, "u_size", sw, sh, dw, dh);
+            vio_up_vec4(ctx, "u_rect", 0, 0, 0, 0);
+            vio_submit_one(ctx, mesh);
+        }
+    } else {
+        int sizes_changed = u->hist_w != dw || u->hist_h != dh;
+        for (int i = 0; i < 2; i++) {
+            int cw = u->hist_w, ch = u->hist_h;
+            if (vio_up_target_rt(ctx_zval, &u->hist[i], &u->hist_tex[i], &cw, &ch, dw, dh) != 0) goto done;
+        }
+        u->hist_w = dw; u->hist_h = dh;
+        if (sizes_changed || reset) u->hist_valid = 0;
+        int rd = u->hist_cur, wr = u->hist_cur ^ 1;
+        /* NDC-space jitter and motion (y up) -> storage space */
+        double flip = ctx->backend->rt_origin_top ? -1.0 : 1.0;
+        if (vio_up_bind(ctx_zval, &u->hist[wr], dw, dh) != 0) goto done;
+        vio_up_pass(ctx, u, VIO_UP_TEMPORAL);
+        vio_up_sampler(ctx, "u_src", &src_tex, 0);
+        vio_up_sampler(ctx, "u_hist", &u->hist_tex[rd], 1);
+        vio_up_sampler(ctx, "u_motion", motion ? &motion_tex : &u->none, 2);
+        vio_up_vec4(ctx, "u_size", sw, sh, dw, dh);
+        vio_up_vec4(ctx, "u_ctl", u->hist_valid ? 0.0 : 1.0, motion ? 1.0 : 0.0, -jx, -flip * jy);
+        vio_up_vec4(ctx, "u_misc", 1.0, flip, 0, 0);
+        vio_submit_one(ctx, mesh);
+        if (vio_up_bind(ctx_zval, dst_zval, dw, dh) != 0) goto done;
+        vio_up_pass(ctx, u, sharp > 0.0 ? VIO_UP_SHARPEN : VIO_UP_COPY);
+        vio_up_sampler(ctx, "u_src", &u->hist_tex[wr], 0);
+        vio_up_vec4(ctx, "u_size", dw, dh, dw, dh);
+        vio_up_vec4(ctx, "u_rect", 0, 0, sharp, 1);   /* the history alpha is its weight: opaque out */
+        vio_submit_one(ctx, mesh);
+        u->hist_cur = wr;
+        u->hist_valid = 1;
+    }
+    ok = 1;
+done:
+    zval_ptr_dtor(&src_tex);
+    zval_ptr_dtor(&motion_tex);
+    if (EG(exception)) RETURN_THROWS();
+    if (!ok) php_error_docref(NULL, E_WARNING, "vio_upscale: a pass could not be set up on backend '%s'", ctx->backend->name);
+    RETURN_BOOL(ok);
+}
+
+ZEND_FUNCTION(vio_upscale_jitter)
+{
+    zend_long frame, phases = 8;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_LONG(frame)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(phases)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (phases < 1 || phases > 1024) {
+        zend_argument_value_error(2, "must be 1..1024");
+        RETURN_THROWS();
+    }
+    zend_long n = (frame % phases + phases) % phases + 1;   /* Halton index 1.. */
+    double r[2];
+    int bases[2] = { 2, 3 };
+    for (int k = 0; k < 2; k++) {
+        double f = 1.0, v = 0.0;
+        for (zend_long i = n; i > 0; i /= bases[k]) { f /= bases[k]; v += f * (double)(i % bases[k]); }
+        r[k] = v - 0.5;
+    }
+    array_init(return_value);
+    add_next_index_double(return_value, r[0]);
+    add_next_index_double(return_value, r[1]);
+}
+
+ZEND_FUNCTION(vio_upscale_info)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    const vio_backend *be = ctx->backend;
+    const char *sp = (ctx->initialized && be && be->upscale_method) ? be->upscale_method(VIO_UPSCALE_SPATIAL) : NULL;
+    const char *tp = (ctx->initialized && be && be->upscale_method) ? be->upscale_method(VIO_UPSCALE_TEMPORAL) : NULL;
+    array_init(return_value);
+    add_assoc_string(return_value, "spatial", (char *)(sp ? sp : "portable"));
+    add_assoc_string(return_value, "temporal", (char *)(tp ? tp : "portable"));
+}
+
+/* ── Phase 5: 2D API functions ───────────────────────────────────── */
 ZEND_FUNCTION(vio_rect)
 {
     zval *ctx_zval;
@@ -6118,6 +7643,7 @@ ZEND_FUNCTION(vio_text)
     float cr = 1.0f, cg = 1.0f, cb = 1.0f, ca = 1.0f;
     float z = 0.0f;
     float max_width = 0.0f, line_height = 0.0f;
+    int vertical = 0;
 
     if (opts_ht) {
         zval *val;
@@ -6135,16 +7661,25 @@ ZEND_FUNCTION(vio_text)
         if ((val = zend_hash_str_find(opts_ht, "line_height", sizeof("line_height") - 1)) != NULL) {
             line_height = (float)zval_get_double(val);
         }
+        /* Top-to-bottom columns (A34): (x, y) = top-right corner, '\n' starts
+         * the next column to the left, line_height = column pitch. */
+        if ((val = zend_hash_str_find(opts_ht, "vertical", sizeof("vertical") - 1)) != NULL) {
+            vertical = zend_is_true(val);
+        }
     }
 
 #ifdef HAVE_HARFBUZZ
     if (vio_text_shape_available(font)) {
         vio_text_shape_draw(ctx, font, text, text_len,
                             (float)x, (float)y, z, cr, cg, cb, ca,
-                            max_width, line_height);
+                            max_width, line_height, vertical);
         return;
     }
 #endif
+    if (vertical) {
+        php_error_docref(NULL, E_WARNING, "vio_text: 'vertical' needs text shaping (HarfBuzz, VIO_HAS_SHAPING)");
+        return;
+    }
 
     float fx = (float)x, fy = (float)y;
     float inv_w = 1.0f / (float)font->atlas_w;
@@ -6406,6 +7941,7 @@ ZEND_FUNCTION(vio_text_measure)
     }
 
     float max_width = 0.0f, line_height = 0.0f;
+    int vertical = 0;
     if (opts_ht) {
         zval *val;
         if ((val = zend_hash_str_find(opts_ht, "max_width", sizeof("max_width") - 1)) != NULL) {
@@ -6414,6 +7950,9 @@ ZEND_FUNCTION(vio_text_measure)
         if ((val = zend_hash_str_find(opts_ht, "line_height", sizeof("line_height") - 1)) != NULL) {
             line_height = (float)zval_get_double(val);
         }
+        if ((val = zend_hash_str_find(opts_ht, "vertical", sizeof("vertical") - 1)) != NULL) {
+            vertical = zend_is_true(val);
+        }
     }
 
 #ifdef HAVE_HARFBUZZ
@@ -6421,7 +7960,7 @@ ZEND_FUNCTION(vio_text_measure)
         float w = 0.0f, h = 0.0f;
         int lines = 0;
         vio_text_shape_measure(font, text, text_len, max_width, line_height,
-                               &w, &h, &lines);
+                               &w, &h, &lines, vertical);
         array_init(return_value);
         add_assoc_double(return_value, "width", (double)w);
         add_assoc_double(return_value, "height", (double)h);
@@ -6464,6 +8003,26 @@ ZEND_FUNCTION(vio_text_measure)
  * Reliable coverage detection for fallback-chain routing: unlike advance width
  * (a font's .notdef box can measure non-zero), this reports actual glyph
  * presence, so callers never let a primary font claim an uncovered codepoint. */
+/* vio_font_info(VioFont): ['glyphs', 'rasterized', 'atlas_size', 'lazy'] (A33). */
+ZEND_FUNCTION(vio_font_info)
+{
+    zval *font_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(font_zval, vio_font_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_font_object *font = Z_VIO_FONT_P(font_zval);
+    if (!font->valid) RETURN_FALSE;
+    int glyphs = (int)zend_hash_num_elements(&font->glyph_map), rasterized = glyphs, side = font->atlas_w, lazy = 0;
+#ifdef HAVE_HARFBUZZ
+    if (vio_text_shape_available(font)) vio_text_shape_stats(font, &glyphs, &rasterized, &side, &lazy);
+#endif
+    array_init(return_value);
+    add_assoc_long(return_value, "glyphs", glyphs);
+    add_assoc_long(return_value, "rasterized", rasterized);
+    add_assoc_long(return_value, "atlas_size", side);
+    add_assoc_bool(return_value, "lazy", lazy);
+}
+
 ZEND_FUNCTION(vio_font_has_glyph)
 {
     zval *font_zval;
@@ -6727,6 +8286,14 @@ ZEND_FUNCTION(vio_backend_count)
 {
     ZEND_PARSE_PARAMETERS_NONE();
     RETURN_LONG(vio_backend_count());
+}
+
+/* The window system vio runs on (include/vio_platform.h): "glfw", a native
+ * layer ("win32", "cocoa", "x11"), or "null" without one. */
+ZEND_FUNCTION(vio_platform)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_STRING(vio_plat()->name);
 }
 
 ZEND_FUNCTION(vio_backends)
@@ -7955,6 +9522,50 @@ ZEND_FUNCTION(vio_gpu_frame_time)
     RETURN_DOUBLE(ctx->backend->gpu_frame_time());
 }
 
+/* Named GPU timestamps (OPEN-ITEMS-PLAN A19): a mark closes the section that
+ * began at the previous mark (or at the frame start). */
+static int vio_has_gpu_marks(vio_context_object *ctx)
+{
+    return ctx->initialized && ctx->backend && ctx->backend->gpu_mark && ctx->backend->gpu_marks
+        && ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_GPU_TIMESTAMP);
+}
+
+ZEND_FUNCTION(vio_gpu_timestamp)
+{
+    zval *ctx_zval;
+    zend_string *name;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR(name)
+    ZEND_PARSE_PARAMETERS_END();
+    if (ZSTR_LEN(name) == 0 || ZSTR_LEN(name) >= VIO_GPU_MARK_NAME_MAX || memchr(ZSTR_VAL(name), 0, ZSTR_LEN(name))) {
+        zend_argument_value_error(2, "must be 1 to %d bytes without NUL", VIO_GPU_MARK_NAME_MAX - 1);
+        RETURN_THROWS();
+    }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_has_gpu_marks(ctx)) RETURN_FALSE;
+    RETURN_BOOL(ctx->backend->gpu_mark(ZSTR_VAL(name)) != 0);
+}
+
+ZEND_FUNCTION(vio_gpu_timings)
+{
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_has_gpu_marks(ctx)) RETURN_FALSE;
+    array_init(return_value);
+    const vio_gpu_mark_result *r = ctx->backend->gpu_marks();
+    if (!r) return;
+    for (int i = 0; i < r->count && i < VIO_GPU_MARKS_MAX; i++) {
+        /* A name used twice in a frame adds up. */
+        zval *prev = zend_hash_str_find(Z_ARRVAL_P(return_value), r->name[i], strlen(r->name[i]));
+        if (prev) ZVAL_DOUBLE(prev, Z_DVAL_P(prev) + r->ms[i]);
+        else add_assoc_double(return_value, r->name[i], r->ms[i]);
+    }
+}
+
 /* Shader-cache counters (GAP-PHASE5 Block 4): ['dir' => string|null, 'hits' => n,
  * 'misses' => n, 'stores' => n], cumulative for the process. */
 ZEND_FUNCTION(vio_shader_cache_stats)
@@ -7991,63 +9602,186 @@ ZEND_FUNCTION(vio_swapchain_info)
     add_assoc_long(return_value, "format", info.format);
     add_assoc_long(return_value, "shader_model", info.shader_model);
     add_assoc_long(return_value, "shader_model_version", info.shader_model_version);
+    add_assoc_long(return_value, "agility_sdk", info.agility_sdk);
 }
 
 /* vio_texture_index(): the texture's slot in the context's bindless table
  * (BINDLESS-PLAN.md). The first call takes a slot and a reference; later calls
  * return the same slot. */
+/* What a VioTexture / VioCubemap enters the bindless table as: its kind and the
+ * handle bindless_set takes. 0 when it cannot enter. */
+static int vio_bindless_entry(zend_object *obj, int *kind, void **handle)
+{
+    if (obj->ce == vio_texture_ce) {
+        vio_texture_object *t = vio_texture_from_obj(obj);
+        if (!t->valid || !t->backend_texture || t->is_3d || t->borrowed) return 0;
+        *kind = t->layers > 1 ? VIO_BINDLESS_KIND_ARRAY : VIO_BINDLESS_KIND_2D;
+        *handle = t->backend_texture;
+        return 1;
+    }
+    if (obj->ce == vio_cubemap_ce) {
+        vio_cubemap_object *cm = vio_cubemap_from_obj(obj);
+        if (!cm->valid || cm->borrowed) return 0;
+        *kind = VIO_BINDLESS_KIND_CUBE;
+        *handle = cm;
+        return 1;
+    }
+    return 0;
+}
+
 ZEND_FUNCTION(vio_texture_index)
 {
-    zval *ctx_zval, *tex_zval;
+    zval *ctx_zval;
+    zend_object *tex_obj;
     ZEND_PARSE_PARAMETERS_START(2, 2)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
-        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+        Z_PARAM_OBJ(tex_obj)
     ZEND_PARSE_PARAMETERS_END();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (tex_obj->ce != vio_texture_ce && tex_obj->ce != vio_cubemap_ce) {
+        zend_argument_type_error(2, "must be of type VioTexture|VioCubemap, %s given", ZSTR_VAL(tex_obj->ce->name));
+        RETURN_THROWS();
+    }
     if (!ctx->initialized || !ctx->backend || !ctx->backend->bindless_set
         || !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_BINDLESS))) {
         php_error_docref(NULL, E_WARNING, "vio_texture_index: backend has no bindless textures (VIO_FEATURE_BINDLESS = 0)");
         RETURN_FALSE;
     }
-    if (!tex->valid || !tex->backend_texture || tex->is_3d || tex->layers > 1 || tex->borrowed) {
-        php_error_docref(NULL, E_WARNING, "vio_texture_index: only plain 2D textures can enter the table");
+    int kind = 0;
+    void *handle = NULL;
+    if (!vio_bindless_entry(tex_obj, &kind, &handle)) {
+        php_error_docref(NULL, E_WARNING, "vio_texture_index: only 2D textures, texture arrays and cubemaps of their own can enter the table");
         RETURN_FALSE;
     }
     for (int i = 0; i < ctx->bindless_count; i++) {
-        if (ctx->bindless[i] == &tex->std) RETURN_LONG(i);
+        if (ctx->bindless[i] == tex_obj && !ctx->bindless_retire[i]) RETURN_LONG(i);
     }
-    if (ctx->bindless_count >= VIO_BINDLESS_MAX) {
+    if (!ctx->bindless_free_count && ctx->bindless_count >= VIO_BINDLESS_MAX) {
         php_error_docref(NULL, E_WARNING, "vio_texture_index: the table is full (%d textures)", VIO_BINDLESS_MAX);
         RETURN_FALSE;
     }
-    if (!ctx->bindless) ctx->bindless = ecalloc(VIO_BINDLESS_MAX, sizeof(zend_object *));
-    int slot = ctx->bindless_count;
-    if (ctx->backend->bindless_set(slot, tex->backend_texture) != 0) {
+    if (!ctx->bindless) {
+        ctx->bindless = ecalloc(VIO_BINDLESS_MAX, sizeof(zend_object *));
+        ctx->bindless_retire = ecalloc(VIO_BINDLESS_MAX, sizeof(unsigned int));
+        ctx->bindless_free = ecalloc(VIO_BINDLESS_MAX, sizeof(int));
+        ctx->bindless_kind = ecalloc(VIO_BINDLESS_MAX, 1);
+    }
+    /* Retired slots first (vio_bindless_retire); they hold a null entry. */
+    int reuse = ctx->bindless_free_count > 0;
+    int slot = reuse ? ctx->bindless_free[ctx->bindless_free_count - 1] : ctx->bindless_count;
+    if (ctx->backend->bindless_set(slot, handle, kind) != 0) {
         php_error_docref(NULL, E_WARNING, "vio_texture_index: the backend could not add the texture");
         RETURN_FALSE;
     }
-    GC_ADDREF(&tex->std);
-    ctx->bindless[slot] = &tex->std;
-    ctx->bindless_count++;
+    GC_ADDREF(tex_obj);
+    ctx->bindless[slot] = tex_obj;
+    ctx->bindless_kind[slot] = (unsigned char)kind;
+    if (reuse) ctx->bindless_free_count--;
+    else ctx->bindless_count++;
     RETURN_LONG(slot);
+}
+
+/* Free the slot of a texture (BINDLESS-PLAN 4b). Frames already recorded may still
+ * read it, so the entry and the texture stay until VIO_BINDLESS_RETIRE_FRAMES
+ * more vio_begin calls (vio_bindless_retire); then the slot is cleared and reused. */
+ZEND_FUNCTION(vio_texture_release_index)
+{
+    zval *ctx_zval;
+    zend_object *tex_obj;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJ(tex_obj)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (tex_obj->ce != vio_texture_ce && tex_obj->ce != vio_cubemap_ce) {
+        zend_argument_type_error(2, "must be of type VioTexture|VioCubemap, %s given", ZSTR_VAL(tex_obj->ce->name));
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !ctx->bindless) RETURN_FALSE;
+    for (int i = 0; i < ctx->bindless_count; i++) {
+        if (ctx->bindless[i] == tex_obj && !ctx->bindless_retire[i]) {
+            ctx->bindless_retire[i] = ctx->frame_no + VIO_BINDLESS_RETIRE_FRAMES;
+            RETURN_TRUE;
+        }
+    }
+    RETURN_FALSE;
 }
 
 /* ── Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK) ───────────────────── */
 
+/* Two paths (OPEN-ITEMS-PLAN A15): the hardware map (D3D12 FeedbackTexture2D from
+ * an HLSL override) and the GLSL map that vio_write_feedback() of
+ * VIO_SAMPLER_FEEDBACK_GLSL fills through fragment storage binding 3. The
+ * functions drive whichever the backend has; read merges both (min per region).
+ * Bit 0 = hardware, bit 1 = GLSL; 0 warns. */
+#define VIO_FB_BINDING 3
+static const char vio_fb_glsl[] =
+    "layout(std430, binding = 3) buffer VioFeedbackMap { uint vio_fb_info[4]; uint vio_fb[]; } vio_fbm;\n"
+    "void vio_write_feedback(sampler2D s, vec2 uv) {\n"
+    "    uint rx = vio_fbm.vio_fb_info[0], ry = vio_fbm.vio_fb_info[1];\n"
+    "    int region = int(vio_fbm.vio_fb_info[2]);\n"
+    "    if (rx == 0u || region <= 0) return;\n"
+    "    vec2 size = vec2(textureSize(s, 0));\n"
+    "    uint mip = uint(max(floor(textureQueryLod(s, uv).x), 0.0));\n"
+    "    ivec2 t = clamp(ivec2(fract(uv) * size) / region, ivec2(0), ivec2(int(rx) - 1, int(ry) - 1));\n"
+    "    atomicMin(vio_fbm.vio_fb[uint(t.y) * rx + uint(t.x)], mip);\n"
+    "}\n";
+
 static int vio_sampler_feedback_ready(vio_context_object *ctx, const char *fn, int has_slot)
 {
-    if (!ctx->initialized || !ctx->backend || !has_slot
-        || !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_SAMPLER_FEEDBACK))) {
-        php_error_docref(NULL, E_WARNING, "%s: backend has no sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK = 0)", fn);
-        return 0;
+    int paths = 0;
+    if (ctx->initialized && ctx->backend && ctx->backend->supports_feature) {
+        if (has_slot && ctx->backend->supports_feature(VIO_FEATURE_SAMPLER_FEEDBACK)) paths |= 1;
+        if (ctx->backend->supports_feature(VIO_FEATURE_SAMPLER_FEEDBACK_GLSL) && ctx->backend->bind_fragment_storage
+            && ctx->backend->create_buffer && ctx->backend->update_buffer && ctx->backend->read_buffer) paths |= 2;
     }
-    return 1;
+    if (!paths) php_error_docref(NULL, E_WARNING, "%s: backend has no sampler feedback "
+                                 "(VIO_FEATURE_SAMPLER_FEEDBACK = VIO_FEATURE_SAMPLER_FEEDBACK_GLSL = 0)", fn);
+    return paths;
+}
+
+/* The hardware path's region: the largest power of two <= half the shorter
+ * side, 4..128 texels. */
+static int vio_fb_region(int w, int h)
+{
+    int half = (w < h ? w : h) / 2, r = 4;
+    while (r * 2 <= half && r < 128) r *= 2;
+    return r;
+}
+
+/* Reset (creating it on first use) the texture's GLSL map to "never sampled". */
+static int vio_fb_emul_reset(vio_context_object *ctx, vio_texture_object *tex)
+{
+    int region = vio_fb_region(tex->width, tex->height);
+    int rx = (tex->width + region - 1) / region, ry = (tex->height + region - 1) / region;
+    size_t n = 4 + (size_t)rx * (size_t)ry;
+    uint32_t *init = emalloc(n * sizeof(uint32_t));
+    init[0] = (uint32_t)rx; init[1] = (uint32_t)ry; init[2] = (uint32_t)region; init[3] = 0;
+    for (size_t i = 4; i < n; i++) init[i] = 0xFFFFFFFFu;
+    int rc = 0;
+    if (!tex->fb_emul) {
+        vio_buffer_desc d;
+        memset(&d, 0, sizeof(d));
+        d.type = VIO_BUFFER_STORAGE;
+        d.data = init;
+        d.size = n * sizeof(uint32_t);
+        d.stride = 4;
+        tex->fb_emul = ctx->backend->create_buffer(&d);
+        if (!tex->fb_emul) rc = -1;
+        tex->fb_rx = rx; tex->fb_ry = ry; tex->fb_region = region;
+    } else {
+        /* Draws in flight may still write it: a read waits for them first. */
+        uint32_t probe[4];
+        ctx->backend->read_buffer(tex->fb_emul, probe, sizeof(probe));
+        ctx->backend->update_buffer(tex->fb_emul, init, n * sizeof(uint32_t), 0);
+    }
+    efree(init);
+    return rc;
 }
 
 static int vio_sampler_feedback_texture_ok(vio_texture_object *tex, const char *fn)
 {
-    if (!tex->valid || !tex->backend_texture || tex->is_3d || tex->layers > 1 || tex->borrowed) {
+    if (!tex->valid || (!tex->backend_texture && !tex->texture_id) || tex->is_3d || tex->layers > 1 || tex->borrowed) {
         php_error_docref(NULL, E_WARNING, "%s: sampler feedback needs a plain 2D texture", fn);
         return 0;
     }
@@ -8064,14 +9798,29 @@ ZEND_FUNCTION(vio_sampler_feedback_bind)
         Z_PARAM_OBJECT_OF_CLASS_OR_NULL(tex_zval, vio_texture_ce)
     ZEND_PARSE_PARAMETERS_END();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_bind", ctx->backend && ctx->backend->sampler_feedback_bind)) RETURN_FALSE;
-    void *bt = NULL;
+    int paths = vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_bind", ctx->backend && ctx->backend->sampler_feedback_bind);
+    if (!paths) RETURN_FALSE;
+    vio_texture_object *tex = NULL;
     if (tex_zval) {
-        vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+        tex = Z_VIO_TEXTURE_P(tex_zval);
         if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_bind")) RETURN_FALSE;
-        bt = tex->backend_texture;
     }
-    RETURN_BOOL(ctx->backend->sampler_feedback_bind(bt) == 0);
+    int ok = 1;
+    if (paths & 1) ok = ctx->backend->sampler_feedback_bind(tex ? tex->backend_texture : NULL) == 0;
+    if (paths & 2) {
+        if (tex && !tex->fb_emul && vio_fb_emul_reset(ctx, tex) != 0) RETURN_FALSE;
+        /* Binding 3 carries the map now (a buffer bound there before is dropped). */
+        if (ctx->frag_storage[VIO_FB_BINDING]) {
+            OBJ_RELEASE(ctx->frag_storage[VIO_FB_BINDING]);
+            ctx->frag_storage[VIO_FB_BINDING] = NULL;
+        }
+        if (ctx->backend->bind_fragment_storage(tex ? tex->fb_emul : NULL, VIO_FB_BINDING) != 0) ok = 0;
+        zend_object *old = ctx->fb_texture;
+        if (tex) GC_ADDREF(&tex->std);
+        ctx->fb_texture = tex ? &tex->std : NULL;
+        if (old) OBJ_RELEASE(old);
+    }
+    RETURN_BOOL(ok);
 }
 
 /* Decode the feedback map: ['regions_x', 'regions_y', 'region' (mip-0 texels per
@@ -8085,13 +9834,32 @@ ZEND_FUNCTION(vio_sampler_feedback_read)
     ZEND_PARSE_PARAMETERS_END();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
-    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_read", ctx->backend && ctx->backend->sampler_feedback_read)) RETURN_FALSE;
+    int paths = vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_read", ctx->backend && ctx->backend->sampler_feedback_read);
+    if (!paths) RETURN_FALSE;
     if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_read")) RETURN_FALSE;
     unsigned char *mips = NULL;
     int rx = 0, ry = 0, region = 0;
-    if (ctx->backend->sampler_feedback_read(tex->backend_texture, &mips, &rx, &ry, &region) != 0 || !mips) {
-        php_error_docref(NULL, E_WARNING, "vio_sampler_feedback_read: the texture has no feedback map (bind or clear it first)");
+    if ((paths & 1) && (ctx->backend->sampler_feedback_read(tex->backend_texture, &mips, &rx, &ry, &region) != 0 || !mips)) {
         free(mips);
+        mips = NULL;
+    }
+    if ((paths & 2) && tex->fb_emul) {
+        size_t n = 4 + (size_t)tex->fb_rx * (size_t)tex->fb_ry;
+        uint32_t *m = emalloc(n * sizeof(uint32_t));
+        if (ctx->backend->read_buffer(tex->fb_emul, m, n * sizeof(uint32_t)) == n * sizeof(uint32_t)) {
+            if (!mips) {
+                rx = tex->fb_rx; ry = tex->fb_ry; region = tex->fb_region;
+                mips = malloc((size_t)rx * (size_t)ry);
+                if (mips) memset(mips, 0xFF, (size_t)rx * (size_t)ry);
+            }
+            if (mips && rx == tex->fb_rx && ry == tex->fb_ry) {
+                for (int i = 0; i < rx * ry; i++) if (m[4 + i] < 0xFF && m[4 + i] < mips[i]) mips[i] = (unsigned char)m[4 + i];
+            }
+        }
+        efree(m);
+    }
+    if (!mips) {
+        php_error_docref(NULL, E_WARNING, "vio_sampler_feedback_read: the texture has no feedback map (bind or clear it first)");
         RETURN_FALSE;
     }
     array_init(return_value);
@@ -8118,9 +9886,13 @@ ZEND_FUNCTION(vio_sampler_feedback_clear)
     ZEND_PARSE_PARAMETERS_END();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
-    if (!vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_clear", ctx->backend && ctx->backend->sampler_feedback_clear)) RETURN_FALSE;
+    int paths = vio_sampler_feedback_ready(ctx, "vio_sampler_feedback_clear", ctx->backend && ctx->backend->sampler_feedback_clear);
+    if (!paths) RETURN_FALSE;
     if (!vio_sampler_feedback_texture_ok(tex, "vio_sampler_feedback_clear")) RETURN_FALSE;
-    RETURN_BOOL(ctx->backend->sampler_feedback_clear(tex->backend_texture) == 0);
+    int ok = 1;
+    if (paths & 1) ok = ctx->backend->sampler_feedback_clear(tex->backend_texture) == 0;
+    if ((paths & 2) && vio_fb_emul_reset(ctx, tex) != 0) ok = 0;
+    RETURN_BOOL(ok);
 }
 
 ZEND_FUNCTION(vio_backend_info)
@@ -8154,6 +9926,62 @@ ZEND_FUNCTION(vio_backend_info)
         if (d.cap_names[i]) add_assoc_bool(&caps, (char *)d.cap_names[i], d.cap_values[i] ? 1 : 0);
     }
     add_assoc_zval(return_value, "caps", &caps);
+    add_assoc_long(return_value, "vendor_id", (zend_long)d.vendor_id);
+    add_assoc_string(return_value, "vendor", (char *)vio_vendor_name(d.vendor_id));
+    add_assoc_string(return_value, "driver", (char *)(d.driver ? d.driver : ""));
+    add_assoc_string(return_value, "device_type", (char *)(d.device_type ? d.device_type : "unknown"));
+    add_assoc_long(return_value, "vram_bytes", (zend_long)d.vram_bytes);
+    add_assoc_string(return_value, "selected_by", (char *)(ctx->selected_by ? ctx->selected_by : "explicit"));
+    zval cand;
+    if (ctx->candidates) ZVAL_ARR(&cand, zend_array_dup(ctx->candidates));
+    else array_init(&cand);
+    add_assoc_zval(return_value, "candidates", &cand);
+}
+
+/* vio_adapters(?string $backend = null): ['<backend>' => [adapter, ...], ...]
+ * for every registered backend that can list its adapters (OPEN-ITEMS-PLAN A6). */
+ZEND_FUNCTION(vio_adapters)
+{
+    zend_string *only = NULL;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STR_OR_NULL(only)
+    ZEND_PARSE_PARAMETERS_END();
+    if (only && !vio_find_backend(ZSTR_VAL(only))) {
+        zend_argument_value_error(1, "must be a registered backend name");
+        RETURN_THROWS();
+    }
+    vio_adapter_info *list = (vio_adapter_info *)ecalloc(VIO_MAX_ADAPTERS, sizeof(vio_adapter_info));
+    array_init(return_value);
+    for (int b = 0; b < vio_backend_count(); b++) {
+        const char *name = vio_get_backend_name(b);
+        const vio_backend *be = name ? vio_find_backend(name) : NULL;
+        if (!be || !be->enumerate_adapters) continue;
+        if (only && strcmp(ZSTR_VAL(only), name) != 0) continue;
+        int n = be->enumerate_adapters(list, VIO_MAX_ADAPTERS);
+        zval adapters;
+        array_init(&adapters);
+        for (int i = 0; i < n && i < VIO_MAX_ADAPTERS; i++) {
+            const vio_adapter_info *a = &list[i];
+            zval entry, features;
+            array_init(&entry);
+            add_assoc_long(&entry, "index", i);
+            add_assoc_string(&entry, "name", (char *)a->name);
+            add_assoc_long(&entry, "vendor_id", (zend_long)a->vendor_id);
+            add_assoc_string(&entry, "vendor", (char *)vio_vendor_name(a->vendor_id));
+            add_assoc_long(&entry, "device_id", (zend_long)a->device_id);
+            add_assoc_string(&entry, "driver", (char *)a->driver);
+            add_assoc_string(&entry, "device_type", (char *)(a->device_type ? a->device_type : "unknown"));
+            add_assoc_long(&entry, "vram_bytes", (zend_long)a->vram_bytes);
+            array_init(&features);
+            for (int f = 0; f < VIO_FEATURE_SET_MAX; f++)
+                if (vio_featset_has(&a->features, f)) add_next_index_long(&features, f);
+            add_assoc_zval(&entry, "features", &features);
+            add_next_index_zval(&adapters, &entry);
+        }
+        add_assoc_zval(return_value, name, &adapters);
+    }
+    efree(list);
 }
 
 /* ── Inline ray tracing (VIO_FEATURE_RAY_QUERY) ──────────────────── */
@@ -8162,6 +9990,16 @@ ZEND_FUNCTION(vio_backend_info)
  * one bottom-level structure per distinct mesh (its CPU positions / indices),
  * one top-level structure over the instances; transform is column-major 4x4
  * (the last row is ignored), identity when absent. */
+static int vio_as_parse(const char *fn, HashTable *list, vio_as_instance **inst_out, vio_as_geometry **geo_out,
+                        vio_mesh_object ***mesh_out, int *geo_count_out);
+static void vio_as_keep(vio_acceleration_structure_object *as, const vio_as_instance *inst, int n,
+                        vio_mesh_object **geo_mesh, int geo_count);
+/* The packed opacity micromaps of parsed geometries (emalloc). */
+static void vio_as_geo_free(vio_as_geometry *geo, int n)
+{
+    for (int i = 0; i < n; i++) if (geo[i].omm_data) { efree((void *)geo[i].omm_data); geo[i].omm_data = NULL; }
+}
+
 ZEND_FUNCTION(vio_acceleration_structure)
 {
     zval *ctx_zval;
@@ -8176,9 +10014,11 @@ ZEND_FUNCTION(vio_acceleration_structure)
         php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: context not initialized");
         RETURN_FALSE;
     }
-    if (!(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY))
+    /* Ray queries and the ray tracing pipeline both trace against it. */
+    if (!(ctx->backend->supports_feature && (ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY)
+                                             || ctx->backend->supports_feature(VIO_FEATURE_RAYTRACING)))
         || !ctx->backend->create_acceleration_structure) {
-        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: backend '%s' has no ray queries (VIO_FEATURE_RAY_QUERY = 0)",
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: backend '%s' has no ray tracing (VIO_FEATURE_RAY_QUERY = VIO_FEATURE_RAYTRACING = 0)",
                          ctx->backend->name);
         RETURN_FALSE;
     }
@@ -8187,6 +10027,49 @@ ZEND_FUNCTION(vio_acceleration_structure)
         zend_argument_value_error(2, "must contain at least one instance");
         RETURN_THROWS();
     }
+    vio_as_instance *inst;
+    vio_as_geometry *geo;
+    vio_mesh_object **geo_mesh;
+    int geo_count = 0;
+    int pr = vio_as_parse("vio_acceleration_structure", list, &inst, &geo, &geo_mesh, &geo_count);
+    if (pr == 0) RETURN_THROWS();
+    if (pr < 0) RETURN_FALSE;
+    for (int g = 0; g < geo_count; g++) {
+        if (geo[g].omm_format && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_OPACITY_MICROMAP))) {
+            vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+            php_error_docref(NULL, E_WARNING, "%s: backend '%s' has no opacity micromaps (VIO_FEATURE_OPACITY_MICROMAP = 0)", "vio_acceleration_structure", ctx->backend->name);
+            RETURN_FALSE;
+        }
+    }
+
+    vio_as_desc desc;
+    desc.geometries = geo;
+    desc.geometry_count = geo_count;
+    desc.instances = inst;
+    desc.instance_count = n;
+    void *handle = ctx->backend->create_acceleration_structure(&desc);
+    if (!handle) {
+        vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: the backend could not build it");
+        RETURN_FALSE;
+    }
+    object_init_ex(return_value, vio_acceleration_structure_ce);
+    vio_acceleration_structure_object *as = Z_VIO_ACCELERATION_STRUCTURE_P(return_value);
+    as->backend_as = handle;
+    as->backend = ctx->backend;
+    as->valid = 1;
+    vio_as_keep(as, inst, n, geo_mesh, geo_count);
+    vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+}
+
+/* Parse an instance list (vio_acceleration_structure / _update): the
+ * instances, the distinct meshes (one geometry each) and their CPU triangles.
+ * 1 = parsed (the caller efree()s the three arrays), 0 = an exception was
+ * thrown, -1 = a warning was raised (return false). */
+static int vio_as_parse(const char *fn, HashTable *list, vio_as_instance **inst_out, vio_as_geometry **geo_out,
+                        vio_mesh_object ***mesh_out, int *geo_count_out)
+{
+    int n = (int)zend_hash_num_elements(list);
     vio_as_instance *inst = ecalloc((size_t)n, sizeof(vio_as_instance));
     vio_as_geometry *geo = ecalloc((size_t)n, sizeof(vio_as_geometry));
     vio_mesh_object **geo_mesh = ecalloc((size_t)n, sizeof(vio_mesh_object *));
@@ -8195,16 +10078,16 @@ ZEND_FUNCTION(vio_acceleration_structure)
     ZEND_HASH_FOREACH_VAL(list, entry) {
         zval *mz = Z_TYPE_P(entry) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(entry), "mesh", sizeof("mesh") - 1) : NULL;
         if (!mz || Z_TYPE_P(mz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(mz), vio_mesh_ce)) {
-            efree(inst); efree(geo); efree(geo_mesh);
-            zend_argument_value_error(2, "instance %d needs 'mesh' => VioMesh", idx);
-            RETURN_THROWS();
+            vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+            zend_argument_value_error(strlen(fn) > 26 ? 3 : 2, "instance %d needs 'mesh' => VioMesh", idx);
+            return 0;
         }
         vio_mesh_object *mesh = Z_VIO_MESH_P(mz);
         if (!mesh->rt_positions || mesh->vertex_count < 3) {
-            efree(inst); efree(geo); efree(geo_mesh);
-            php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: instance %d: the mesh has no triangle positions "
-                             "(create it on this context, location 0 at least float3)", idx);
-            RETURN_FALSE;
+            vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+            php_error_docref(NULL, E_WARNING, "%s: instance %d: the mesh has no triangle positions "
+                             "(create it on this context, location 0 at least float3)", fn, idx);
+            return -1;
         }
         int g = -1;
         for (int k = 0; k < geo_count; k++) if (geo_mesh[k] == mesh) { g = k; break; }
@@ -8217,13 +10100,82 @@ ZEND_FUNCTION(vio_acceleration_structure)
             geo[g].index_count = mesh->rt_indices ? mesh->rt_index_count : 0;
         }
         inst[idx].geometry = g;
+        inst[idx].mask = 0xFF;
+        /* 'opacity_micromap' => ['subdivision' => L, 'format' => 2|4, 'states' => string]:
+         * one byte per micro-triangle (0 transparent, 1 opaque, 2 unknown-transparent,
+         * 3 unknown-opaque), 4^L per triangle in index order; packed here (OC1). */
+        zval *oz = zend_hash_str_find(Z_ARRVAL_P(entry), "opacity_micromap", sizeof("opacity_micromap") - 1);
+        if (oz && Z_TYPE_P(oz) != IS_NULL) {
+            int argn = strlen(fn) > 26 ? 3 : 2;
+            zval *lz = Z_TYPE_P(oz) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(oz), "subdivision", sizeof("subdivision") - 1) : NULL;
+            zval *fz = Z_TYPE_P(oz) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(oz), "format", sizeof("format") - 1) : NULL;
+            zval *sz = Z_TYPE_P(oz) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(oz), "states", sizeof("states") - 1) : NULL;
+            zend_long lv = lz ? zval_get_long(lz) : 0, fv = fz ? zval_get_long(fz) : 2;
+            int tris = geo[g].indices ? geo[g].index_count / 3 : geo[g].vertex_count / 3;
+            size_t per = (size_t)1 << (2 * (lv >= 0 && lv <= 12 ? lv : 0));
+            if (Z_TYPE_P(oz) != IS_ARRAY || !sz || Z_TYPE_P(sz) != IS_STRING || lv < 0 || lv > 12 || (fv != 2 && fv != 4)) {
+                vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+                zend_argument_value_error(argn, "instance %d: 'opacity_micromap' needs 'subdivision' 0..12, 'format' 2 or 4 and a 'states' string", idx);
+                return 0;
+            }
+            if (Z_STRLEN_P(sz) != per * (size_t)tris) {
+                vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+                zend_argument_value_error(argn, "instance %d: 'opacity_micromap' 'states' must hold %zu bytes (%d triangles x 4^%d)",
+                                          idx, per * (size_t)tris, tris, (int)lv);
+                return 0;
+            }
+            const unsigned char *st = (const unsigned char *)Z_STRVAL_P(sz);
+            for (size_t k = 0; k < Z_STRLEN_P(sz); k++) {
+                if (st[k] > (fv == 2 ? 1 : 3)) {
+                    vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+                    zend_argument_value_error(argn, "instance %d: 'opacity_micromap' state %zu is %d - %s", idx, k, (int)st[k],
+                                              fv == 2 ? "2-state maps take 0 (transparent) or 1 (opaque)" : "states are 0..3");
+                    return 0;
+                }
+            }
+            int bits = fv == 2 ? 1 : 2;
+            int bytes = (int)(((per * (size_t)bits + 7) / 8 + 3) & ~(size_t)3);   /* 4-aligned per OMM */
+            if (geo[g].omm_format) {
+                /* the same mesh again: the same map or none */
+                if (geo[g].omm_format != (int)fv || geo[g].omm_subdivision != (int)lv) {
+                    vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+                    zend_argument_value_error(argn, "instance %d: a mesh carries one opacity micromap (another instance gave a different one)", idx);
+                    return 0;
+                }
+            } else {
+                unsigned char *packed = ecalloc((size_t)tris * (size_t)bytes + 4, 1);
+                for (int t = 0; t < tris; t++) {
+                    for (size_t m = 0; m < per; m++) {
+                        size_t bit = m * (size_t)bits;
+                        packed[(size_t)t * bytes + bit / 8] |= (unsigned char)(st[(size_t)t * per + m] << (bit % 8));
+                    }
+                }
+                geo[g].omm_format = (int)fv;
+                geo[g].omm_subdivision = (int)lv;
+                geo[g].omm_data = packed;
+                geo[g].omm_count = tris;
+                geo[g].omm_bytes = bytes;
+            }
+        }
+        {
+            zval *hz = zend_hash_str_find(Z_ARRVAL_P(entry), "hit_group", sizeof("hit_group") - 1);
+            zval *kz = zend_hash_str_find(Z_ARRVAL_P(entry), "mask", sizeof("mask") - 1);
+            zend_long hg = hz ? zval_get_long(hz) : 0, mk = kz ? zval_get_long(kz) : 0xFF;
+            if (hg < 0 || hg >= VIO_RT_MAX_GROUPS || mk < 0 || mk > 255) {
+                vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+                zend_argument_value_error(strlen(fn) > 26 ? 3 : 2, "instance %d: 'hit_group' must be 0..%d and 'mask' 0..255", idx, VIO_RT_MAX_GROUPS - 1);
+                return 0;
+            }
+            inst[idx].hit_group = (int)hg;
+            inst[idx].mask = (int)mk;
+        }
         float m[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         zval *tz = zend_hash_str_find(Z_ARRVAL_P(entry), "transform", sizeof("transform") - 1);
         if (tz) {
             if (Z_TYPE_P(tz) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(tz)) != 16) {
-                efree(inst); efree(geo); efree(geo_mesh);
-                zend_argument_value_error(2, "instance %d: 'transform' must be 16 floats (column-major 4x4)", idx);
-                RETURN_THROWS();
+                vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+                zend_argument_value_error(strlen(fn) > 26 ? 3 : 2, "instance %d: 'transform' must be 16 floats (column-major 4x4)", idx);
+                return 0;
             }
             int c = 0;
             zval *f;
@@ -8234,24 +10186,115 @@ ZEND_FUNCTION(vio_acceleration_structure)
             for (int col = 0; col < 4; col++) inst[idx].transform[r * 4 + col] = m[col * 4 + r];
         idx++;
     } ZEND_HASH_FOREACH_END();
+    *inst_out = inst;
+    *geo_out = geo;
+    *mesh_out = geo_mesh;
+    *geo_count_out = geo_count;
+    return 1;
+}
 
-    vio_as_desc desc;
-    desc.geometries = geo;
-    desc.geometry_count = geo_count;
-    desc.instances = inst;
-    desc.instance_count = n;
-    void *handle = ctx->backend->create_acceleration_structure(&desc);
-    efree(inst); efree(geo); efree(geo_mesh);
-    if (!handle) {
-        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: the backend could not build it");
+/* Hold the meshes of a structure's bottom levels and its instance geometries. */
+static void vio_as_keep(vio_acceleration_structure_object *as, const vio_as_instance *inst, int n,
+                        vio_mesh_object **geo_mesh, int geo_count)
+{
+    zend_object **objs = ecalloc((size_t)(geo_count > 0 ? geo_count : 1), sizeof(zend_object *));
+    int *ig = ecalloc((size_t)n, sizeof(int));
+    for (int g = 0; g < geo_count; g++) objs[g] = &geo_mesh[g]->std;
+    for (int i = 0; i < n; i++) ig[i] = inst[i].geometry;
+    vio_acceleration_structure_keep(as, objs, geo_count, ig, n);
+    efree(objs);
+    efree(ig);
+}
+
+/* vio_acceleration_structure_update($ctx, $as, $instances) (OPEN-ITEMS-PLAN A14):
+ * the same instance format. Every mesh already in $as and the same mesh per
+ * instance -> 'refit' (transforms only, the top level updated in place); every
+ * mesh known but a different list -> 'rebuild' (a new top level over the
+ * existing bottom levels); a new mesh -> 'full' (everything built again).
+ * Outside vio_begin / vio_end; synchronous like the first build. */
+ZEND_FUNCTION(vio_acceleration_structure_update)
+{
+    zval *ctx_zval, *as_zval;
+    HashTable *list;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(as_zval, vio_acceleration_structure_ce)
+        Z_PARAM_ARRAY_HT(list)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_acceleration_structure_object *as = Z_VIO_ACCELERATION_STRUCTURE_P(as_zval);
+    if (!ctx->initialized || !ctx->backend || !as->valid || as->backend != ctx->backend
+        || !ctx->backend->create_acceleration_structure) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure_update: not built on this context's backend");
         RETURN_FALSE;
     }
-    object_init_ex(return_value, vio_acceleration_structure_ce);
-    vio_acceleration_structure_object *as = Z_VIO_ACCELERATION_STRUCTURE_P(return_value);
-    as->backend_as = handle;
-    as->backend = ctx->backend;
-    as->instance_count = n;
-    as->valid = 1;
+    if (ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure_update: call it outside vio_begin / vio_end");
+        RETURN_FALSE;
+    }
+    int n = (int)zend_hash_num_elements(list);
+    if (n < 1) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure_update: at least one instance is needed");
+        RETURN_FALSE;
+    }
+    vio_as_instance *inst;
+    vio_as_geometry *geo;
+    vio_mesh_object **geo_mesh;
+    int geo_count = 0;
+    int pr = vio_as_parse("vio_acceleration_structure_update", list, &inst, &geo, &geo_mesh, &geo_count);
+    if (pr == 0) RETURN_THROWS();
+    if (pr < 0) RETURN_FALSE;
+    for (int g = 0; g < geo_count; g++) {
+        if (geo[g].omm_format && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_OPACITY_MICROMAP))) {
+            vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+            php_error_docref(NULL, E_WARNING, "%s: backend '%s' has no opacity micromaps (VIO_FEATURE_OPACITY_MICROMAP = 0)", "vio_acceleration_structure_update", ctx->backend->name);
+            RETURN_FALSE;
+        }
+    }
+
+    /* The parsed geometries onto the structure's bottom levels. */
+    int known = 1;
+    int *map = ecalloc((size_t)geo_count, sizeof(int));
+    for (int g = 0; g < geo_count; g++) {
+        map[g] = -1;
+        for (int k = 0; k < as->mesh_count; k++) if (as->meshes[k] == &geo_mesh[g]->std) { map[g] = k; break; }
+        if (map[g] < 0) known = 0;
+    }
+    const char *kind = NULL;
+    if (known && ctx->backend->update_acceleration_structure) {
+        int refit = n == as->instance_count;
+        for (int i = 0; i < n; i++) {
+            inst[i].geometry = map[inst[i].geometry];
+            if (refit && inst[i].geometry != as->inst_geo[i]) refit = 0;
+        }
+        if (ctx->backend->update_acceleration_structure(as->backend_as, inst, n, refit) == 0) {
+            int *ig = ecalloc((size_t)n, sizeof(int));
+            for (int i = 0; i < n; i++) ig[i] = inst[i].geometry;
+            vio_acceleration_structure_keep(as, as->meshes, as->mesh_count, ig, n);
+            efree(ig);
+            kind = refit ? "refit" : "rebuild";
+        }
+    } else {
+        vio_as_desc desc;
+        desc.geometries = geo;
+        desc.geometry_count = geo_count;
+        desc.instances = inst;
+        desc.instance_count = n;
+        void *handle = ctx->backend->create_acceleration_structure(&desc);
+        if (handle) {
+            const vio_backend *be = (const vio_backend *)as->backend;
+            if (as->backend_as && be->destroy_acceleration_structure) be->destroy_acceleration_structure(as->backend_as);
+            as->backend_as = handle;
+            vio_as_keep(as, inst, n, geo_mesh, geo_count);
+            kind = "full";
+        }
+    }
+    efree(map); vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+    if (!kind) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure_update: the backend could not update it");
+        RETURN_FALSE;
+    }
+    RETURN_STRING(kind);
 }
 
 /* vio_bind_acceleration_structure($ctx, $as, $binding): the following draws and
@@ -8277,6 +10320,470 @@ ZEND_FUNCTION(vio_bind_acceleration_structure)
         return;
     }
     ctx->backend->bind_acceleration_structure(as->backend_as, (int)binding);
+}
+
+/* ── vio_rt_pipeline groups (OPEN-ITEMS-PLAN A13) ── */
+
+static void vio_rt_free_groups(vio_rt_pipeline_desc *d)
+{
+    vio_rt_group_src *all[1 + 3 * VIO_RT_MAX_GROUPS];
+    int n = 0;
+    all[n++] = &d->raygen;
+    for (int i = 0; i < d->miss_count; i++) all[n++] = &d->miss[i];
+    for (int i = 0; i < d->hit_count; i++) all[n++] = &d->hit[i];
+    for (int i = 0; i < d->callable_count; i++) all[n++] = &d->callable[i];
+    for (int i = 0; i < n; i++) for (int k = 0; k < 2; k++) { free((void *)all[i]->spirv[k]); all[i]->spirv[k] = NULL; }
+}
+
+/* Compile one GLSL stage into g->spirv[slot]. 0 ok, 1 thrown, -1 warned. */
+static int vio_rt_compile_into(zval *z, int stage, const char *label, vio_rt_group_src *g, int slot)
+{
+    if (!z || Z_TYPE_P(z) != IS_STRING) {
+        zend_argument_value_error(2, "%s must be a GLSL source string", label);
+        return 1;
+    }
+    char *err = NULL;
+    size_t size = 0;
+    uint32_t *spv = vio_compile_glsl_rt_stage_to_spirv(Z_STRVAL_P(z), stage, &size, &err);
+    if (!spv) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: %s: %s", label, err ? err : "compile failed");
+        free(err);
+        return -1;
+    }
+    free(err);
+    g->spirv[slot] = spv;
+    g->spirv_size[slot] = size;
+    return 0;
+}
+
+/* A list (or, where `single` allows, one string) of 1..VIO_RT_MAX_GROUPS entries. */
+static int vio_rt_list(zval *z, const char *key, int min, HashTable **out, int *count)
+{
+    *out = NULL;
+    *count = 0;
+    if (!z) return 0;
+    if (Z_TYPE_P(z) != IS_ARRAY) return 0;
+    int n = (int)zend_hash_num_elements(Z_ARRVAL_P(z));
+    if (n < min || n > VIO_RT_MAX_GROUPS) {
+        zend_argument_value_error(2, "'%s' must hold %d..%d entries", key, min, VIO_RT_MAX_GROUPS);
+        return 1;
+    }
+    *out = Z_ARRVAL_P(z);
+    *count = n;
+    return 0;
+}
+
+/* Shader records: ['raygen' => bytes, 'miss' => [bytes], 'hit_groups' => [bytes], 'callables' => [bytes]]. */
+static int vio_rt_records(HashTable *desc_ht, vio_rt_pipeline_desc *d)
+{
+    zval *rz = zend_hash_str_find(desc_ht, "records", sizeof("records") - 1);
+    if (!rz) return 0;
+    if (Z_TYPE_P(rz) != IS_ARRAY) { zend_argument_value_error(2, "'records' must be an array"); return 1; }
+    static const char *keys[4] = { "raygen", "miss", "hit_groups", "callables" };
+    vio_rt_group_src *base[4] = { &d->raygen, d->miss, d->hit, d->callable };
+    int counts[4] = { 1, d->miss_count, d->hit_count, d->callable_count };
+    int max = 0;
+    for (int k = 0; k < 4; k++) {
+        zval *z = zend_hash_str_find(Z_ARRVAL_P(rz), keys[k], strlen(keys[k]));
+        if (!z) continue;
+        zval single, *e;
+        HashTable *list;
+        if (k == 0) {
+            array_init(&single);
+            Z_TRY_ADDREF_P(z);
+            add_next_index_zval(&single, z);
+            list = Z_ARRVAL(single);
+        } else if (Z_TYPE_P(z) == IS_ARRAY) {
+            list = Z_ARRVAL_P(z);
+        } else {
+            zend_argument_value_error(2, "'records' => '%s' must be a list of byte strings", keys[k]);
+            return 1;
+        }
+        int i = 0, bad = 0;
+        ZEND_HASH_FOREACH_VAL(list, e) {
+            if (i >= counts[k] || Z_TYPE_P(e) != IS_STRING || Z_STRLEN_P(e) > VIO_RT_MAX_RECORD) { bad = 1; break; }
+            memcpy(base[k][i].record, Z_STRVAL_P(e), Z_STRLEN_P(e));
+            if ((int)Z_STRLEN_P(e) > max) max = (int)Z_STRLEN_P(e);
+            i++;
+        } ZEND_HASH_FOREACH_END();
+        if (k == 0) zval_ptr_dtor(&single);
+        if (bad) {
+            zend_argument_value_error(2, "'records' => '%s': one string of at most %d bytes per group", keys[k], VIO_RT_MAX_RECORD);
+            return 1;
+        }
+    }
+    d->record_size = (max + 3) & ~3;
+    return 0;
+}
+
+/* raygen; miss (string or list); hit groups ('hit_groups' => [['closest_hit', 'any_hit'?]]
+ * or the legacy 'closest_hit' / 'any_hit'); callables; records.
+ * 0 ok, 1 thrown, -1 warned (stages compiled so far stay in d for vio_rt_free_groups). */
+static int vio_rt_parse_groups(HashTable *desc_ht, vio_rt_pipeline_desc *d)
+{
+    int rc;
+    zval *z = zend_hash_str_find(desc_ht, "raygen", sizeof("raygen") - 1);
+    if (!z) { zend_argument_value_error(2, "needs 'raygen' (GLSL source)"); return 1; }
+    if ((rc = vio_rt_compile_into(z, VIO_RT_STAGE_RAYGEN, "raygen", &d->raygen, 0)) != 0) return rc;
+
+    z = zend_hash_str_find(desc_ht, "miss", sizeof("miss") - 1);
+    if (!z) { zend_argument_value_error(2, "needs 'miss' (GLSL source or a list of them)"); return 1; }
+    if (Z_TYPE_P(z) == IS_STRING) {
+        if ((rc = vio_rt_compile_into(z, VIO_RT_STAGE_MISS, "miss", &d->miss[0], 0)) != 0) return rc;
+        d->miss_count = 1;
+    } else {
+        HashTable *list;
+        int n;
+        if ((rc = vio_rt_list(z, "miss", 1, &list, &n)) != 0) return rc;
+        if (!list) { zend_argument_value_error(2, "'miss' must be a GLSL source or a list of them"); return 1; }
+        zval *e;
+        ZEND_HASH_FOREACH_VAL(list, e) {
+            char label[32];
+            snprintf(label, sizeof(label), "miss %d", d->miss_count);
+            if ((rc = vio_rt_compile_into(e, VIO_RT_STAGE_MISS, label, &d->miss[d->miss_count], 0)) != 0) return rc;
+            d->miss_count++;
+        } ZEND_HASH_FOREACH_END();
+    }
+
+    z = zend_hash_str_find(desc_ht, "hit_groups", sizeof("hit_groups") - 1);
+    if (z) {
+        HashTable *list;
+        int n;
+        if ((rc = vio_rt_list(z, "hit_groups", 1, &list, &n)) != 0) return rc;
+        if (!list) { zend_argument_value_error(2, "'hit_groups' must be a list of ['closest_hit' => glsl, 'any_hit' => glsl?]"); return 1; }
+        zval *e;
+        ZEND_HASH_FOREACH_VAL(list, e) {
+            char label[40];
+            vio_rt_group_src *g = &d->hit[d->hit_count];
+            if (Z_TYPE_P(e) != IS_ARRAY) { zend_argument_value_error(2, "hit group %d must be an array", d->hit_count); return 1; }
+            snprintf(label, sizeof(label), "hit group %d closest_hit", d->hit_count);
+            if ((rc = vio_rt_compile_into(zend_hash_str_find(Z_ARRVAL_P(e), "closest_hit", sizeof("closest_hit") - 1),
+                                          VIO_RT_STAGE_CLOSEST_HIT, label, g, 0)) != 0) return rc;
+            d->hit_count++;
+            zval *ah = zend_hash_str_find(Z_ARRVAL_P(e), "any_hit", sizeof("any_hit") - 1);
+            snprintf(label, sizeof(label), "hit group %d any_hit", d->hit_count - 1);
+            if (ah && (rc = vio_rt_compile_into(ah, VIO_RT_STAGE_ANY_HIT, label, g, 1)) != 0) return rc;
+        } ZEND_HASH_FOREACH_END();
+    } else {
+        z = zend_hash_str_find(desc_ht, "closest_hit", sizeof("closest_hit") - 1);
+        if (!z) { zend_argument_value_error(2, "needs 'closest_hit' (GLSL source) or 'hit_groups'"); return 1; }
+        if ((rc = vio_rt_compile_into(z, VIO_RT_STAGE_CLOSEST_HIT, "closest_hit", &d->hit[0], 0)) != 0) return rc;
+        d->hit_count = 1;
+        zval *ah = zend_hash_str_find(desc_ht, "any_hit", sizeof("any_hit") - 1);
+        if (ah && (rc = vio_rt_compile_into(ah, VIO_RT_STAGE_ANY_HIT, "any_hit", &d->hit[0], 1)) != 0) return rc;
+    }
+
+    z = zend_hash_str_find(desc_ht, "callables", sizeof("callables") - 1);
+    if (z) {
+        HashTable *list;
+        int n;
+        if ((rc = vio_rt_list(z, "callables", 0, &list, &n)) != 0) return rc;
+        if (!list) { zend_argument_value_error(2, "'callables' must be a list of GLSL sources"); return 1; }
+        zval *e;
+        ZEND_HASH_FOREACH_VAL(list, e) {
+            char label[32];
+            snprintf(label, sizeof(label), "callable %d", d->callable_count);
+            if ((rc = vio_rt_compile_into(e, VIO_RT_STAGE_CALLABLE, label, &d->callable[d->callable_count], 0)) != 0) return rc;
+            d->callable_count++;
+        } ZEND_HASH_FOREACH_END();
+    }
+    if ((rc = vio_rt_records(desc_ht, d)) != 0) return rc;
+
+    /* The legacy single-group view. */
+    d->spirv[VIO_RT_STAGE_RAYGEN] = d->raygen.spirv[0];       d->spirv_size[VIO_RT_STAGE_RAYGEN] = d->raygen.spirv_size[0];
+    d->spirv[VIO_RT_STAGE_MISS] = d->miss[0].spirv[0];        d->spirv_size[VIO_RT_STAGE_MISS] = d->miss[0].spirv_size[0];
+    d->spirv[VIO_RT_STAGE_CLOSEST_HIT] = d->hit[0].spirv[0];  d->spirv_size[VIO_RT_STAGE_CLOSEST_HIT] = d->hit[0].spirv_size[0];
+    d->spirv[VIO_RT_STAGE_ANY_HIT] = d->hit[0].spirv[1];      d->spirv_size[VIO_RT_STAGE_ANY_HIT] = d->hit[0].spirv_size[1];
+    return 0;
+}
+
+/* vio_rt_pipeline($ctx, ['raygen' => glsl, 'miss' => glsl, 'closest_hit' => glsl,
+ * 'any_hit' => glsl?, 'max_recursion' => 1, 'payload_size' => 32, 'hlsl' => lib?]):
+ * the GLSL stages go to SPIR-V here (they are the portable contract); the
+ * backend takes the SPIR-V (Vulkan) or the HLSL library (D3D12). */
+ZEND_FUNCTION(vio_rt_pipeline)
+{
+    zval *ctx_zval;
+    HashTable *desc_ht;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(desc_ht)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: context not initialized");
+        RETURN_FALSE;
+    }
+    if (!(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_RAYTRACING))
+        || !ctx->backend->create_rt_pipeline || !ctx->backend->trace_rays) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: backend '%s' has no ray tracing pipeline (VIO_FEATURE_RAYTRACING = 0)",
+                         ctx->backend->name);
+        RETURN_FALSE;
+    }
+    vio_rt_pipeline_desc *desc = ecalloc(1, sizeof(vio_rt_pipeline_desc));
+    desc->max_recursion = 1;
+    desc->payload_size = 32;
+    int rc = vio_rt_parse_groups(desc_ht, desc);
+    if (rc == 0) {
+        zval *z;
+        if ((z = zend_hash_str_find(desc_ht, "max_recursion", sizeof("max_recursion") - 1))) desc->max_recursion = (int)zval_get_long(z);
+        if ((z = zend_hash_str_find(desc_ht, "payload_size", sizeof("payload_size") - 1))) desc->payload_size = (int)zval_get_long(z);
+        if ((z = zend_hash_str_find(desc_ht, "hlsl", sizeof("hlsl") - 1)) && Z_TYPE_P(z) == IS_STRING) desc->hlsl = Z_STRVAL_P(z);
+        if (desc->max_recursion < 1 || desc->max_recursion > 31 || desc->payload_size < 4 || desc->payload_size > 4096) {
+            zend_argument_value_error(2, "'max_recursion' must be 1..31 and 'payload_size' 4..4096");
+            rc = 1;
+        }
+    }
+    void *handle = rc == 0 ? ctx->backend->create_rt_pipeline(desc) : NULL;
+    vio_rt_free_groups(desc);
+    efree(desc);
+    if (rc == 1) RETURN_THROWS();
+    if (rc < 0) RETURN_FALSE;
+    if (!handle) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_pipeline: the backend could not build the pipeline");
+        RETURN_FALSE;
+    }
+    object_init_ex(return_value, vio_rt_pipeline_ce);
+    vio_rt_pipeline_object *p = Z_VIO_RT_PIPELINE_P(return_value);
+    p->backend_pipeline = handle;
+    p->backend = ctx->backend;
+    p->valid = 1;
+}
+
+/* One resource per binding, replaced on rebind; the pipeline keeps a reference. */
+static void vio_rt_bind_resource(vio_rt_pipeline_object *p, zend_object *obj, int binding, int kind, const char *fn)
+{
+    int slot = -1;
+    for (int i = 0; i < p->buffer_count; i++) if (p->bindings[i] == binding) { slot = i; break; }
+    if (slot < 0) {
+        if (p->buffer_count >= VIO_RT_MAX_BUFFERS) {
+            php_error_docref(NULL, E_WARNING, "%s: at most %d resources per pipeline", fn, VIO_RT_MAX_BUFFERS);
+            return;
+        }
+        slot = p->buffer_count++;
+    } else {
+        OBJ_RELEASE(p->buffers[slot]);
+    }
+    GC_ADDREF(obj);
+    p->buffers[slot] = obj;
+    p->bindings[slot] = binding;
+    p->kinds[slot] = kind;
+}
+
+/* vio_rt_bind_buffer($ctx, $pipeline, $storage_buffer, $binding): one buffer
+ * per binding, replaced on rebind; the pipeline keeps a reference. */
+ZEND_FUNCTION(vio_rt_bind_buffer)
+{
+    zval *ctx_zval, *p_zval, *buf_zval;
+    zend_long binding;
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(p_zval, vio_rt_pipeline_ce)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_buffer_ce)
+        Z_PARAM_LONG(binding)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_rt_pipeline_object *p = Z_VIO_RT_PIPELINE_P(p_zval);
+    vio_buffer_object *buf = Z_VIO_BUFFER_P(buf_zval);
+    if (binding < 0 || binding > 15) {
+        zend_argument_value_error(4, "must be 0..15");
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !p->valid || p->backend != ctx->backend) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_bind_buffer: the pipeline was not built on this context's backend");
+        return;
+    }
+    if (!buf->valid || !buf->backend_buffer || buf->type != VIO_BUFFER_STORAGE) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_bind_buffer: needs a storage buffer (vio_storage_buffer)");
+        return;
+    }
+    vio_rt_bind_resource(p, Z_OBJ_P(buf_zval), (int)binding, VIO_RT_BIND_BUFFER, "vio_rt_bind_buffer");
+}
+
+/* vio_rt_bind_texture($ctx, $pipeline, $texture, $binding) (A13): a sampled
+ * texture for the stages' sampler2D at $binding (D3D12: t / s<binding>). */
+ZEND_FUNCTION(vio_rt_bind_texture)
+{
+    zval *ctx_zval, *p_zval, *tex_zval;
+    zend_long binding;
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(p_zval, vio_rt_pipeline_ce)
+        Z_PARAM_OBJECT_OF_CLASS(tex_zval, vio_texture_ce)
+        Z_PARAM_LONG(binding)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_rt_pipeline_object *p = Z_VIO_RT_PIPELINE_P(p_zval);
+    vio_texture_object *tex = Z_VIO_TEXTURE_P(tex_zval);
+    if (binding < 1 || binding > 15) {
+        zend_argument_value_error(4, "must be 1..15 (binding 0 is the acceleration structure)");
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !p->valid || p->backend != ctx->backend) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_bind_texture: the pipeline was not built on this context's backend");
+        return;
+    }
+    if (!tex->backend_texture) {
+        php_error_docref(NULL, E_WARNING, "vio_rt_bind_texture: the texture has no backend image on this context");
+        return;
+    }
+    vio_rt_bind_resource(p, Z_OBJ_P(tex_zval), (int)binding, VIO_RT_BIND_TEXTURE, "vio_rt_bind_texture");
+}
+
+/* vio_trace_rays($ctx, $pipeline, $w, $h, $d = 1) against the bound acceleration
+ * structure: synchronous outside a frame, recorded in order with the frame's
+ * draws and dispatches inside one (A13); vio_storage_buffer_read waits. */
+ZEND_FUNCTION(vio_trace_rays)
+{
+    zval *ctx_zval, *p_zval;
+    zend_long w, h, d = 1;
+    ZEND_PARSE_PARAMETERS_START(4, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(p_zval, vio_rt_pipeline_ce)
+        Z_PARAM_LONG(w)
+        Z_PARAM_LONG(h)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(d)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_rt_pipeline_object *p = Z_VIO_RT_PIPELINE_P(p_zval);
+    if (w < 1 || h < 1 || d < 1 || w > 65536 || h > 65536 || d > 65536 || w * h * d > (zend_long)1 << 30) {
+        zend_argument_value_error(3, "width, height and depth must be >= 1 (at most 2^30 rays)");
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !p->valid || p->backend != ctx->backend || !ctx->backend->trace_rays) {
+        php_error_docref(NULL, E_WARNING, "vio_trace_rays: the pipeline was not built on this context's backend");
+        return;
+    }
+    vio_rt_buffer_binding b[VIO_RT_MAX_BUFFERS];
+    for (int i = 0; i < p->buffer_count; i++) {
+        b[i].binding = p->bindings[i];
+        b[i].kind = p->kinds[i];
+        if (p->kinds[i] == VIO_RT_BIND_TEXTURE) b[i].backend_buffer = vio_texture_from_obj(p->buffers[i])->backend_texture;
+        else b[i].backend_buffer = vio_buffer_from_obj(p->buffers[i])->backend_buffer;
+    }
+    if (ctx->backend->trace_rays(p->backend_pipeline, b, p->buffer_count, (int)w, (int)h, (int)d) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_trace_rays: the backend could not trace");
+    }
+}
+
+/* ── Work graphs (VIO_FEATURE_WORK_GRAPHS) ──────────────────────────── */
+
+/* vio_work_graph($ctx, ['hlsl' => lib_6_8 source, 'entry' => node name,
+ * 'record_size' => bytes]): an executable graph over every node of the
+ * library; `entry` is the node vio_dispatch_graph() feeds with CPU records. */
+ZEND_FUNCTION(vio_work_graph)
+{
+    zval *ctx_zval;
+    HashTable *desc;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(desc)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend) {
+        php_error_docref(NULL, E_WARNING, "vio_work_graph: context not initialized");
+        RETURN_FALSE;
+    }
+    if (!(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_WORK_GRAPHS))
+        || !ctx->backend->create_work_graph) {
+        php_error_docref(NULL, E_WARNING, "vio_work_graph: backend '%s' has no work graphs (VIO_FEATURE_WORK_GRAPHS = 0)",
+                         ctx->backend->name);
+        RETURN_FALSE;
+    }
+    zval *hz = zend_hash_str_find(desc, "hlsl", sizeof("hlsl") - 1);
+    if (!hz || Z_TYPE_P(hz) != IS_STRING || Z_STRLEN_P(hz) == 0) {
+        zend_argument_value_error(2, "needs 'hlsl' => lib_6_8 source");
+        RETURN_THROWS();
+    }
+    zval *ez = zend_hash_str_find(desc, "entry", sizeof("entry") - 1);
+    if (!ez || Z_TYPE_P(ez) != IS_STRING || Z_STRLEN_P(ez) == 0 || Z_STRLEN_P(ez) > 255) {
+        zend_argument_value_error(2, "needs 'entry' => the name of the node that takes CPU records");
+        RETURN_THROWS();
+    }
+    zval *rz = zend_hash_str_find(desc, "record_size", sizeof("record_size") - 1);
+    zend_long record_size = rz ? zval_get_long(rz) : 0;
+    if (record_size < 1 || record_size > 32768) {
+        zend_argument_value_error(2, "'record_size' must be 1..32768 bytes");
+        RETURN_THROWS();
+    }
+    char *error = NULL;
+    void *graph = ctx->backend->create_work_graph(Z_STRVAL_P(hz), Z_STRVAL_P(ez), (int)record_size, &error);
+    if (!graph) {
+        php_error_docref(NULL, E_WARNING, "vio_work_graph: %s", error ? error : "the backend could not build it");
+        if (error) efree(error);
+        RETURN_FALSE;
+    }
+    object_init_ex(return_value, vio_work_graph_ce);
+    vio_work_graph_object *g = Z_VIO_WORK_GRAPH_P(return_value);
+    g->backend_graph = graph;
+    g->backend = ctx->backend;
+    g->record_size = (int)record_size;
+    g->valid = 1;
+}
+
+/* vio_work_graph_bind_buffer($ctx, $graph, $buffer, $slot): the graph's nodes
+ * see $buffer as RW(ByteAddress|Structured)Buffer at register(u<slot>). */
+ZEND_FUNCTION(vio_work_graph_bind_buffer)
+{
+    zval *ctx_zval, *g_zval, *buf_zval;
+    zend_long slot;
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(g_zval, vio_work_graph_ce)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_buffer_ce)
+        Z_PARAM_LONG(slot)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_work_graph_object *g = Z_VIO_WORK_GRAPH_P(g_zval);
+    vio_buffer_object *buf = Z_VIO_BUFFER_P(buf_zval);
+    if (slot < 0 || slot >= VIO_WORK_GRAPH_MAX_BUFFERS) {
+        zend_argument_value_error(4, "must be 0..%d", VIO_WORK_GRAPH_MAX_BUFFERS - 1);
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !ctx->backend || !g->valid || g->backend != ctx->backend
+        || !ctx->backend->work_graph_bind_buffer || !buf->valid || !buf->backend_buffer) {
+        php_error_docref(NULL, E_WARNING, "vio_work_graph_bind_buffer: graph or buffer not from this context's backend");
+        return;
+    }
+    /* The graph keeps the buffer alive while it is bound. */
+    if (g->buffers[slot]) OBJ_RELEASE(g->buffers[slot]);
+    g->buffers[slot] = Z_OBJ_P(buf_zval);
+    GC_ADDREF(g->buffers[slot]);
+    ctx->backend->work_graph_bind_buffer(g->backend_graph, buf->backend_buffer, (int)slot);
+}
+
+/* vio_dispatch_graph($ctx, $graph, $records, $count): $count records of the
+ * graph's record_size bytes each go to the entry node. Outside a frame the
+ * call waits for the graph; inside one it runs in order with the frame. */
+ZEND_FUNCTION(vio_dispatch_graph)
+{
+    zval *ctx_zval, *g_zval;
+    zend_string *records;
+    zend_long count;
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(g_zval, vio_work_graph_ce)
+        Z_PARAM_STR(records)
+        Z_PARAM_LONG(count)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_work_graph_object *g = Z_VIO_WORK_GRAPH_P(g_zval);
+    if (count < 1 || count > 0xFFFFFF) {
+        zend_argument_value_error(4, "must be 1..16777215");
+        RETURN_THROWS();
+    }
+    if (!g->valid || ZSTR_LEN(records) < (size_t)count * (size_t)g->record_size) {
+        zend_argument_value_error(3, "must hold %d records of %d bytes", (int)count, g->record_size);
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !ctx->backend || g->backend != ctx->backend || !ctx->backend->dispatch_graph) {
+        php_error_docref(NULL, E_WARNING, "vio_dispatch_graph: graph not built on this context's backend");
+        return;
+    }
+    ctx->backend->dispatch_graph(g->backend_graph, ZSTR_VAL(records), (int)count);
 }
 
 /* ── Image comparison (VRT) ───────────────────────────────────────── */
@@ -8448,7 +10955,11 @@ ZEND_FUNCTION(vio_recorder)
         fps = (int)zval_get_long(val);
         if (fps <= 0) fps = 30;
     }
-    if ((val = zend_hash_str_find(config_ht, "codec", sizeof("codec") - 1)) != NULL) {
+    if ((val = zend_hash_str_find(config_ht, "codec", sizeof("codec") - 1)) != NULL && Z_TYPE_P(val) == IS_STRING) {
+        codec = Z_STRVAL_P(val);
+    }
+    /* 'encoder': auto | hardware | software | an FFmpeg encoder name ('codec' is the old spelling) */
+    if ((val = zend_hash_str_find(config_ht, "encoder", sizeof("encoder") - 1)) != NULL && Z_TYPE_P(val) == IS_STRING) {
         codec = Z_STRVAL_P(val);
     }
 
@@ -8457,7 +10968,7 @@ ZEND_FUNCTION(vio_recorder)
     object_init_ex(&obj, vio_recorder_ce);
     vio_recorder_object *rec = Z_VIO_RECORDER_P(&obj);
 
-    int ret = vio_recorder_init(rec, path, ctx->config.width, ctx->config.height, fps, codec);
+    int ret = vio_recorder_init(rec, path, ctx->config.width, ctx->config.height, fps, codec, ctx->backend);
     if (ret != 0) {
         php_error_docref(NULL, E_WARNING, "Failed to initialize recorder (error %d)", ret);
         zval_ptr_dtor(&obj);
@@ -8486,6 +10997,20 @@ ZEND_FUNCTION(vio_recorder_capture)
 
     int w = ctx->config.width;
     int h = ctx->config.height;
+
+    /* Zero copy: the GPU copies the frame into the encoder's texture. */
+    if (rec->zero_copy && rec->backend == ctx->backend) {
+        int zret = vio_recorder_write_gpu(rec);
+        if (zret < 0) {
+            php_error_docref(NULL, E_WARNING, "Failed to encode frame (error %d)", zret);
+            RETURN_FALSE;
+        }
+        RETURN_TRUE;
+    }
+    if (rec->zero_copy) {
+        php_error_docref(NULL, E_WARNING, "vio_recorder_capture: this recorder encodes the frames of the context it was made for");
+        RETURN_FALSE;
+    }
 
     size_t size = (size_t)w * h * 4;
     unsigned char *pixels = emalloc(size);
@@ -8518,6 +11043,71 @@ ZEND_FUNCTION(vio_recorder_stop)
         vio_recorder_finalize(rec);
     }
 }
+
+ZEND_FUNCTION(vio_recorder_info)
+{
+    zval *rec_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(rec_zval, vio_recorder_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_recorder_object *rec = Z_VIO_RECORDER_P(rec_zval);
+    array_init(return_value);
+    add_assoc_string(return_value, "encoder", rec->encoder);
+    add_assoc_bool(return_value, "hardware", rec->hardware);
+    add_assoc_bool(return_value, "zero_copy", rec->zero_copy);
+    add_assoc_long(return_value, "frames", (zend_long)rec->frame_count);
+    add_assoc_long(return_value, "width", rec->width);
+    add_assoc_long(return_value, "height", rec->height);
+    add_assoc_long(return_value, "fps", rec->fps);
+    add_assoc_bool(return_value, "recording", rec->recording);
+}
+
+ZEND_FUNCTION(vio_video_info)
+{
+    zend_string *path;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_PATH_STR(path)
+    ZEND_PARSE_PARAMETERS_END();
+
+    int w = 0, h = 0, frames = 0;
+    double fps = 0.0;
+    char codec[64];
+    if (vio_video_probe(ZSTR_VAL(path), &w, &h, &frames, &fps, codec, sizeof(codec)) != 0) RETURN_FALSE;
+    array_init(return_value);
+    add_assoc_long(return_value, "width", w);
+    add_assoc_long(return_value, "height", h);
+    add_assoc_long(return_value, "frames", frames);
+    add_assoc_double(return_value, "fps", fps);
+    add_assoc_string(return_value, "codec", codec);
+}
+
+ZEND_FUNCTION(vio_video_frame)
+{
+    zend_string *path;
+    zend_long index;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_PATH_STR(path)
+        Z_PARAM_LONG(index)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (index < 0 || index > INT_MAX) {
+        zend_argument_value_error(2, "must be a frame index >= 0");
+        RETURN_THROWS();
+    }
+    int w = 0, h = 0;
+    unsigned char *rgba = vio_video_decode(ZSTR_VAL(path), (int)index, &w, &h);
+    if (!rgba) RETURN_FALSE;
+    array_init(return_value);
+    add_assoc_long(return_value, "width", w);
+    add_assoc_long(return_value, "height", h);
+    add_assoc_stringl(return_value, "data", (char *)rgba, (size_t)w * h * 4);
+    efree(rgba);
+}
+
 /* ── Network streaming functions ──────────────────────────────────── */
 
 ZEND_FUNCTION(vio_stream)
@@ -8647,6 +11237,21 @@ ZEND_FUNCTION(vio_recorder_stop)
 {
     php_error_docref(NULL, E_WARNING, "Video recording requires FFmpeg (compile with --with-ffmpeg)");
 }
+ZEND_FUNCTION(vio_recorder_info)
+{
+    php_error_docref(NULL, E_WARNING, "Video recording requires FFmpeg (compile with --with-ffmpeg)");
+    RETURN_FALSE;
+}
+ZEND_FUNCTION(vio_video_info)
+{
+    php_error_docref(NULL, E_WARNING, "Reading video requires FFmpeg (compile with --with-ffmpeg)");
+    RETURN_FALSE;
+}
+ZEND_FUNCTION(vio_video_frame)
+{
+    php_error_docref(NULL, E_WARNING, "Reading video requires FFmpeg (compile with --with-ffmpeg)");
+    RETURN_FALSE;
+}
 ZEND_FUNCTION(vio_stream)
 {
     php_error_docref(NULL, E_WARNING, "Streaming requires FFmpeg (compile with --with-ffmpeg)");
@@ -8676,11 +11281,9 @@ ZEND_FUNCTION(vio_gamepads)
             add_next_index_long(return_value, jid);
             continue;
         }
-#ifdef HAVE_GLFW
-        if (!vio_gamepad_physical_hidden() && glfwJoystickPresent(jid)) {
+        if (!vio_gamepad_physical_hidden() && vio_plat()->joystick_present(jid)) {
             add_next_index_long(return_value, jid);
         }
-#endif
     }
 }
 
@@ -8695,11 +11298,9 @@ ZEND_FUNCTION(vio_gamepad_connected)
     if (id >= 0 && id < VIO_GAMEPAD_SLOTS && vio_virtual_gamepad_get((int)id)) {
         RETURN_TRUE;
     }
-#ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
-        RETURN_BOOL(glfwJoystickPresent((int)id));
+    if (id >= 0 && id <= VIO_PLATFORM_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
+        RETURN_BOOL(vio_plat()->joystick_present((int)id));
     }
-#endif
     RETURN_FALSE;
 }
 
@@ -8715,16 +11316,14 @@ ZEND_FUNCTION(vio_gamepad_name)
     if (vpad) {
         RETURN_STRING(vpad->name);
     }
-#ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden() && glfwJoystickPresent((int)id)) {
-        const char *name = glfwJoystickIsGamepad((int)id)
-            ? glfwGetGamepadName((int)id)
-            : glfwGetJoystickName((int)id);
+    if (id >= 0 && id <= VIO_PLATFORM_JOYSTICK_LAST && !vio_gamepad_physical_hidden() && vio_plat()->joystick_present((int)id)) {
+        const char *name = vio_plat()->joystick_is_gamepad((int)id)
+            ? vio_plat()->gamepad_name((int)id)
+            : vio_plat()->joystick_name((int)id);
         if (name) {
             RETURN_STRING(name);
         }
     }
-#endif
     RETURN_NULL();
 }
 
@@ -8745,25 +11344,24 @@ ZEND_FUNCTION(vio_gamepad_buttons)
         }
         return;
     }
-#ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
-        GLFWgamepadstate state;
-        if (glfwGetGamepadState((int)id, &state)) {
-            for (int i = 0; i <= GLFW_GAMEPAD_BUTTON_LAST; i++) {
-                add_index_bool(return_value, i, state.buttons[i] == GLFW_PRESS);
+    if (id >= 0 && id <= VIO_PLATFORM_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
+        unsigned char buttons[VIO_GAMEPAD_BUTTON_COUNT];
+        float axes[VIO_GAMEPAD_AXIS_COUNT];
+        if (vio_plat()->gamepad_state((int)id, buttons, axes)) {
+            for (int i = 0; i < VIO_GAMEPAD_BUTTON_COUNT; i++) {
+                add_index_bool(return_value, i, buttons[i]);
             }
             return;
         }
         /* Fallback: raw joystick buttons */
         int count = 0;
-        const unsigned char *buttons = glfwGetJoystickButtons((int)id, &count);
-        if (buttons) {
+        const unsigned char *raw = vio_plat()->joystick_buttons((int)id, &count);
+        if (raw) {
             for (int i = 0; i < count; i++) {
-                add_index_bool(return_value, i, buttons[i] == GLFW_PRESS);
+                add_index_bool(return_value, i, raw[i] != 0);
             }
         }
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_gamepad_axes)
@@ -8783,25 +11381,24 @@ ZEND_FUNCTION(vio_gamepad_axes)
         }
         return;
     }
-#ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
-        GLFWgamepadstate state;
-        if (glfwGetGamepadState((int)id, &state)) {
-            for (int i = 0; i <= GLFW_GAMEPAD_AXIS_LAST; i++) {
-                add_index_double(return_value, i, (double)state.axes[i]);
+    if (id >= 0 && id <= VIO_PLATFORM_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
+        unsigned char buttons[VIO_GAMEPAD_BUTTON_COUNT];
+        float axes[VIO_GAMEPAD_AXIS_COUNT];
+        if (vio_plat()->gamepad_state((int)id, buttons, axes)) {
+            for (int i = 0; i < VIO_GAMEPAD_AXIS_COUNT; i++) {
+                add_index_double(return_value, i, (double)axes[i]);
             }
             return;
         }
         /* Fallback: raw joystick axes */
         int count = 0;
-        const float *axes = glfwGetJoystickAxes((int)id, &count);
-        if (axes) {
+        const float *raw = vio_plat()->joystick_axes((int)id, &count);
+        if (raw) {
             for (int i = 0; i < count; i++) {
-                add_index_double(return_value, i, (double)axes[i]);
+                add_index_double(return_value, i, (double)raw[i]);
             }
         }
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_gamepad_triggers)
@@ -8820,16 +11417,15 @@ ZEND_FUNCTION(vio_gamepad_triggers)
         add_assoc_double(return_value, "right", (double)vpad->axes[VIO_GAMEPAD_AXIS_RIGHT_TRIGGER]);
         return;
     }
-#ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
-        GLFWgamepadstate state;
-        if (glfwGetGamepadState((int)id, &state)) {
-            add_assoc_double(return_value, "left", (double)state.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER]);
-            add_assoc_double(return_value, "right", (double)state.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER]);
+    if (id >= 0 && id <= VIO_PLATFORM_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
+        unsigned char buttons[VIO_GAMEPAD_BUTTON_COUNT];
+        float axes[VIO_GAMEPAD_AXIS_COUNT];
+        if (vio_plat()->gamepad_state((int)id, buttons, axes)) {
+            add_assoc_double(return_value, "left", (double)axes[VIO_GAMEPAD_AXIS_LEFT_TRIGGER]);
+            add_assoc_double(return_value, "right", (double)axes[VIO_GAMEPAD_AXIS_RIGHT_TRIGGER]);
             return;
         }
     }
-#endif
     add_assoc_double(return_value, "left", 0.0);
     add_assoc_double(return_value, "right", 0.0);
 }
@@ -8985,6 +11581,9 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FORMAT_R32F", VIO_FORMAT_R32F, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_R8", VIO_FORMAT_R8, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STORAGE_IMAGE", VIO_FEATURE_STORAGE_IMAGE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_FRAGMENT_STORAGE", VIO_FEATURE_FRAGMENT_STORAGE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SAMPLER_FEEDBACK_GLSL", VIO_FEATURE_SAMPLER_FEEDBACK_GLSL, CONST_CS | CONST_PERSISTENT);
+    REGISTER_STRING_CONSTANT("VIO_SAMPLER_FEEDBACK_GLSL", (char *)vio_fb_glsl, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_STORAGE", VIO_FEATURE_VERTEX_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_STENCIL", VIO_FEATURE_STENCIL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_GPU_TIMESTAMP", VIO_FEATURE_GPU_TIMESTAMP, CONST_CS | CONST_PERSISTENT);
@@ -8998,6 +11597,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_LAYERED_RENDER", VIO_FEATURE_LAYERED_RENDER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_LAYER", VIO_FEATURE_VERTEX_LAYER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_RT_ALL_LAYERS", VIO_RT_ALL_LAYERS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_SPATIAL", VIO_UPSCALE_SPATIAL, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_TEMPORAL", VIO_UPSCALE_TEMPORAL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_VIEWPORT", VIO_FEATURE_MULTI_VIEWPORT, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_MAX_VIEWPORTS", VIO_MAX_VIEWPORTS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_GEOMETRY_INSTANCING", VIO_FEATURE_GEOMETRY_INSTANCING, CONST_CS | CONST_PERSISTENT);
@@ -9015,6 +11616,18 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RAY_QUERY", VIO_FEATURE_RAY_QUERY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MESH_SHADER", VIO_FEATURE_MESH_SHADER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_SAMPLER_FEEDBACK", VIO_FEATURE_SAMPLER_FEEDBACK, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_COOPERATIVE_MATRIX", VIO_FEATURE_COOPERATIVE_MATRIX, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_WORK_GRAPHS", VIO_FEATURE_WORK_GRAPHS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTIVIEW_GEOMETRY", VIO_FEATURE_MULTIVIEW_GEOMETRY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTIVIEW_TESSELLATION", VIO_FEATURE_MULTIVIEW_TESSELLATION, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_COMPRESSION_ASTC", VIO_FEATURE_TEXTURE_COMPRESSION_ASTC, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_DEPTH_MIPMAPS", VIO_FEATURE_DEPTH_MIPMAPS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_RASTER_RATE_MAP", VIO_FEATURE_RASTER_RATE_MAP, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_LONG_VECTOR", VIO_FEATURE_LONG_VECTOR, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADER_EXECUTION_REORDER", VIO_FEATURE_SHADER_EXECUTION_REORDER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_OPACITY_MICROMAP", VIO_FEATURE_OPACITY_MICROMAP, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_DEPTH_REDUCE_MAX", VIO_DEPTH_REDUCE_MAX, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_DEPTH_REDUCE_MIN", VIO_DEPTH_REDUCE_MIN, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINE_STRIP_ADJACENCY", VIO_LINE_STRIP_ADJACENCY, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_TRIANGLES_ADJACENCY", VIO_TRIANGLES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
@@ -9030,6 +11643,10 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FORMAT_BC4", VIO_FORMAT_BC4, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_BC5", VIO_FORMAT_BC5, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_BC7", VIO_FORMAT_BC7, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_ASTC_4x4", VIO_FORMAT_ASTC_4x4, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_ASTC_5x5", VIO_FORMAT_ASTC_5x5, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_ASTC_6x6", VIO_FORMAT_ASTC_6x6, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FORMAT_ASTC_8x8", VIO_FORMAT_ASTC_8x8, CONST_CS | CONST_PERSISTENT);
 
     /* Actions */
     REGISTER_LONG_CONSTANT("VIO_RELEASE", VIO_RELEASE, CONST_CS | CONST_PERSISTENT);
@@ -9858,6 +12475,7 @@ ZEND_FUNCTION(vio_draw_instanced)
         return;
     }
     vio_flush_pending_textures(ctx);
+    vio_apply_mesh_layout(ctx, mesh);
 
     /* Resolve matrix data (fast binary or slow array path) */
     const float *mat_data = NULL;
@@ -9874,7 +12492,9 @@ ZEND_FUNCTION(vio_draw_instanced)
     }
 
     /* Backend instanced draw (D3D11/D3D12/Vulkan) */
-    if (strcmp(ctx->backend->name, "opengl") != 0 && mesh->backend_vb) {
+    /* Without a bound pipeline the typed backends have no shaders on the
+     * context; GL alone falls back to its built-in shader (test 173). */
+    if (strcmp(ctx->backend->name, "opengl") != 0 && mesh->backend_vb && ctx->bound_shader_object) {
 
 #ifdef HAVE_D3D11
         if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
@@ -9949,10 +12569,10 @@ ZEND_FUNCTION(vio_draw_instanced)
                     ID3D11DeviceContext_IASetIndexBuffer(vio_d3d11.context, ib->buffer,
                                                          mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
                     ID3D11DeviceContext_DrawIndexedInstanced(vio_d3d11.context,
-                        mesh->index_count, (UINT)instance_count, 0, 0, 0);
+                        mesh->index_count, (UINT)instance_count * vio_d3d11_multiview_instances(), 0, 0, 0);
                 } else {
                     ID3D11DeviceContext_DrawInstanced(vio_d3d11.context,
-                        mesh->vertex_count, (UINT)instance_count, 0, 0);
+                        mesh->vertex_count, (UINT)instance_count * vio_d3d11_multiview_instances(), 0, 0);
                 }
             }
         } else
@@ -10249,8 +12869,8 @@ ZEND_FUNCTION(vio_render_target)
             php_error_docref(NULL, E_WARNING, "vio_render_target: 'layers' cannot be combined with 'cube'");
             RETURN_FALSE;
         }
-        if (attachment_count > 1 || samples > 1) {
-            php_error_docref(NULL, E_WARNING, "vio_render_target: array targets support a single, single-sampled attachment");
+        if (attachment_count > 1) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: array targets support a single attachment");
             RETURN_FALSE;
         }
         if (!ctx->backend->supports_feature ||
@@ -10262,18 +12882,82 @@ ZEND_FUNCTION(vio_render_target)
         }
     }
 
+    /* Depth target with a mip chain (A26): 'mipmaps' => true on a plain 2D
+     * depth_only target; vio_generate_mipmaps reduces each level from the one
+     * below ('depth_reduction' => VIO_DEPTH_REDUCE_MAX (default) / _MIN). */
+    int depth_reduction = VIO_DEPTH_REDUCE_MAX;
+    /* Also the resolve of a multisampled depth_only target (A24). */
+    if (depth_only && (val = zend_hash_str_find(config_ht, "depth_reduction", sizeof("depth_reduction") - 1)) != NULL) {
+        zend_long r = zval_get_long(val);
+        if (r != VIO_DEPTH_REDUCE_MAX && r != VIO_DEPTH_REDUCE_MIN) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'depth_reduction' must be VIO_DEPTH_REDUCE_MAX or VIO_DEPTH_REDUCE_MIN");
+            RETURN_FALSE;
+        }
+        depth_reduction = (int)r;
+    }
+    if (depth_only && !is_cube && layers <= 1 &&
+        (val = zend_hash_str_find(config_ht, "mipmaps", sizeof("mipmaps") - 1)) != NULL && zend_is_true(val)) {
+        if (!ctx->backend->supports_feature || !ctx->backend->supports_feature(VIO_FEATURE_DEPTH_MIPMAPS)) {
+            php_error_docref(NULL, E_WARNING,
+                "vio_render_target: depth targets with mipmaps are not supported on backend '%s' (VIO_FEATURE_DEPTH_MIPMAPS)", ctx->backend->name);
+            RETURN_FALSE;
+        }
+        mip_levels = 1;
+        for (int d = width > height ? width : height; d > 1; d >>= 1) mip_levels++;
+        samples = 1;
+    }
+
+    /* Rate map (A16): 'rate_map' => ['x' => [q, ...], 'y' => [q, ...]], the
+     * sampling quality (0 < q <= 1) of equal zones per axis. Backends with
+     * VIO_FEATURE_RASTER_RATE_MAP render the low-quality zones with fewer
+     * samples; the others at full rate. Plain 2D colour targets only. */
+    float rate_x[VIO_RATE_MAP_MAX], rate_y[VIO_RATE_MAP_MAX];
+    int rate_nx = 0, rate_ny = 0;
+    if ((val = zend_hash_str_find(config_ht, "rate_map", sizeof("rate_map") - 1)) != NULL && Z_TYPE_P(val) != IS_NULL) {
+        for (int axis = 0; axis < 2; axis++) {
+            zval *a = Z_TYPE_P(val) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(val), axis ? "y" : "x", 1) : NULL;
+            float *dst = axis ? rate_y : rate_x;
+            int *n = axis ? &rate_ny : &rate_nx;
+            if (!a || Z_TYPE_P(a) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(a)) < 1
+                || zend_hash_num_elements(Z_ARRVAL_P(a)) > VIO_RATE_MAP_MAX) {
+                zend_value_error("vio_render_target(): 'rate_map' needs 'x' and 'y', each 1..%d qualities", VIO_RATE_MAP_MAX);
+                RETURN_THROWS();
+            }
+            zval *q;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(a), q) {
+                double d = zval_get_double(q);
+                if (!(d > 0.0 && d <= 1.0)) {
+                    zend_value_error("vio_render_target(): 'rate_map' qualities must be in (0, 1]");
+                    RETURN_THROWS();
+                }
+                dst[(*n)++] = (float)d;
+            } ZEND_HASH_FOREACH_END();
+        }
+        if (is_cube || layers > 1 || depth_only || samples > 1 || attachment_count > 1) {
+            zend_value_error("vio_render_target(): 'rate_map' is for plain 2D colour targets (no cube, layers, depth_only, samples or MRT)");
+            RETURN_THROWS();
+        }
+    }
+
     /* Create VioRenderTarget object */
     zval rt_zval;
     object_init_ex(&rt_zval, vio_render_target_ce);
     vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(&rt_zval);
+    rt->rate_nx = rate_nx;
+    rt->rate_ny = rate_ny;
+    memcpy(rt->rate_x, rate_x, sizeof(float) * (size_t)rate_nx);
+    memcpy(rt->rate_y, rate_y, sizeof(float) * (size_t)rate_ny);
+    rt->physical_width = width;
+    rt->physical_height = height;
 
     rt->width      = width;
     rt->height     = height;
     rt->depth_only = depth_only;
-    rt->samples    = layers > 1 ? 1 : samples;
+    rt->samples    = samples;   /* backends clamp (and write back) what they can do */
     rt->is_cube    = is_cube;
     rt->layers     = layers;
     rt->mip_levels = mip_levels;
+    rt->depth_reduction = depth_reduction;
     rt->backend    = ctx->backend;
     rt->attachment_count = attachment_count;
     memcpy(rt->formats, formats, sizeof(formats));
@@ -10408,12 +13092,8 @@ ZEND_FUNCTION(vio_unbind_render_target)
         unsigned int default_fbo = ctx->headless_fbo;
         int w = ctx->config.width;
         int h = ctx->config.height;
-        if (!default_fbo) {
-#ifdef HAVE_GLFW
-            if (ctx->window) {
-                glfwGetFramebufferSize(ctx->window, &w, &h);
-            }
-#endif
+        if (!default_fbo && ctx->window) {
+            vio_plat()->get_framebuffer_size(ctx->window, &w, &h);
         }
         ctx->backend->unbind_render_target(default_fbo, w, h);
     }
@@ -10428,11 +13108,9 @@ ZEND_FUNCTION(vio_unbind_render_target)
 
         int w = ctx->config.width;
         int h = ctx->config.height;
-#ifdef HAVE_GLFW
         if (ctx->window) {
-            glfwGetFramebufferSize(ctx->window, &w, &h);
+            vio_plat()->get_framebuffer_size(ctx->window, &w, &h);
         }
-#endif
         ctx->backend->unbind_render_target(0, w, h);
     }
 
@@ -10485,7 +13163,8 @@ ZEND_FUNCTION(vio_generate_mipmaps)
     int kind = -1;
     if (instanceof_function(Z_OBJCE_P(obj_zval), vio_render_target_ce)) {
         vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(obj_zval);
-        if (!rt->valid || rt->depth_only || rt->layers > 1) RETURN_FALSE;   /* array targets have no mip chain */
+        /* Array targets have no mip chain; a depth target only with 'mipmaps' (A26). */
+        if (!rt->valid || rt->layers > 1 || (rt->depth_only && (rt->mip_levels < 2 || rt->is_cube))) RETURN_FALSE;
         obj = rt; kind = 0;
     } else if (instanceof_function(Z_OBJCE_P(obj_zval), vio_texture_ce)) {
         vio_texture_object *t = Z_VIO_TEXTURE_P(obj_zval);
@@ -10637,6 +13316,23 @@ ZEND_FUNCTION(vio_read_render_target)
     zend_string_release(buf);
     php_error_docref(NULL, E_WARNING, "vio_read_render_target: not supported on backend '%s'", rt->backend->name);
     RETURN_FALSE;
+}
+
+ZEND_FUNCTION(vio_render_target_size)
+{
+    zval *rt_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rt_zval);
+    array_init(return_value);
+    add_assoc_long(return_value, "width", rt->width);
+    add_assoc_long(return_value, "height", rt->height);
+    add_assoc_long(return_value, "physical_width", rt->rate_active ? rt->physical_width : rt->width);
+    add_assoc_long(return_value, "physical_height", rt->rate_active ? rt->physical_height : rt->height);
+    add_assoc_bool(return_value, "rate_map", rt->rate_active);
 }
 
 ZEND_FUNCTION(vio_render_target_texture)
@@ -10894,6 +13590,11 @@ ZEND_FUNCTION(vio_cubemap)
     /* Every backend with an upload_cubemap slot (OpenGL, Metal, D3D11, D3D12). */
     int cm_is_metal = strcmp(ctx->backend->name, "metal") == 0;
     if (ctx->backend->upload_cubemap) {
+        /* 'faces' entries are file paths, or raw RGBA8 strings of
+         * 'width' x 'height' x 4 bytes when both keys are given. */
+        zval *raw_w_zv = zend_hash_str_find(config_ht, "width", sizeof("width") - 1);
+        zval *raw_h_zv = zend_hash_str_find(config_ht, "height", sizeof("height") - 1);
+        zend_long raw_w = raw_w_zv ? zval_get_long(raw_w_zv) : 0, raw_h = raw_h_zv ? zval_get_long(raw_h_zv) : 0;
 
         /* Marshal source data: 6 RGBA8 buffers of (face_w, face_h). The
          * vtable assumes uniform face dimensions — file-based loads use
@@ -10917,6 +13618,12 @@ ZEND_FUNCTION(vio_cubemap)
                     php_error_docref(NULL, E_WARNING, "cubemap face %d must be a string path", face_idx);
                     ok = 0;
                     break;
+                }
+                if (raw_w > 0 && raw_h > 0 && Z_STRLEN_P(face_path) == (size_t)raw_w * (size_t)raw_h * 4) {
+                    if (face_idx == 0) { face_w = (int)raw_w; face_h = (int)raw_h; cm->resolution = (int)raw_w; }
+                    faces[face_idx] = Z_STRVAL_P(face_path);
+                    face_idx++;
+                    continue;
                 }
                 int w, h, ch;
                 unsigned char *data = stbi_load(Z_STRVAL_P(face_path), &w, &h, &ch, 4);
@@ -11128,10 +13835,9 @@ ZEND_FUNCTION(vio_set_window_size)
         return;
     }
 
-#ifdef HAVE_GLFW
     if (ctx->window && !ctx->config.headless) {
         /* The size is LOGICAL, matching what vio_window_size reports and what
-         * the create config takes. glfwSetWindowSize speaks screen coordinates,
+         * the create config takes. The platform speaks screen coordinates,
          * which stop being the same thing once the monitor scales:
          *
          *   logical = framebuffer / contentScale          (vio_window_size)
@@ -11149,8 +13855,8 @@ ZEND_FUNCTION(vio_set_window_size)
          * one, and looks to the player like it jumped back an entry. */
         int fb_w = 0, fb_h = 0, scr_w = 0, scr_h = 0;
         float sx = 1.0f, sy = 1.0f;
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        glfwGetWindowSize(ctx->window, &scr_w, &scr_h);
+        vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
+        vio_plat()->get_window_size(ctx->window, &scr_w, &scr_h);
         vio_window_content_scale(ctx->window, &sx, &sy);
         if (sx <= 0.0f) sx = 1.0f;
         if (sy <= 0.0f) sy = 1.0f;
@@ -11158,14 +13864,13 @@ ZEND_FUNCTION(vio_set_window_size)
         float rx = (fb_w > 0 && scr_w > 0) ? (float)scr_w / (float)fb_w : 1.0f;
         float ry = (fb_h > 0 && scr_h > 0) ? (float)scr_h / (float)fb_h : 1.0f;
 
-        glfwSetWindowSize(ctx->window,
-                          (int)((float)width  * sx * rx + 0.5f),
-                          (int)((float)height * sy * ry + 0.5f));
+        vio_plat()->set_window_size(ctx->window,
+                                    (int)((float)width  * sx * rx + 0.5f),
+                                    (int)((float)height * sy * ry + 0.5f));
     } else if (ctx->window) {
         /* Headless targets are 1:1 (see vio_window_size), so no conversion. */
-        glfwSetWindowSize(ctx->window, (int)width, (int)height);
+        vio_plat()->set_window_size(ctx->window, (int)width, (int)height);
     }
-#endif
 
     /* Store the logical size: vio_window_size falls back to it when there is no
      * window, so it has to stay in the same space. */
@@ -11192,6 +13897,30 @@ ZEND_FUNCTION(vio_supports_feature)
     RETURN_BOOL(ctx->backend->supports_feature((vio_feature)feature) != 0);
 }
 
+/* supported / emulated / method of one VIO_FEATURE_* (OPEN-ITEMS-PLAN A9). */
+ZEND_FUNCTION(vio_feature_info)
+{
+    zval *ctx_zval;
+    zend_long feature;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(feature)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    int supported = ctx->backend && ctx->backend->supports_feature
+        && ctx->backend->supports_feature((vio_feature)feature) != 0;
+    const char *method = supported && ctx->backend->feature_emulation
+        ? ctx->backend->feature_emulation((vio_feature)feature) : NULL;
+
+    array_init(return_value);
+    add_assoc_bool(return_value, "supported", supported);
+    add_assoc_bool(return_value, "emulated", method != NULL);
+    if (method) add_assoc_string(return_value, "method", method);
+    else add_assoc_null(return_value, "method");
+}
+
 /* ── OpenGL diagnostics (Issue #3 part 3) ─────────────────────────── */
 
 ZEND_FUNCTION(vio_gl_info)
@@ -11207,7 +13936,7 @@ ZEND_FUNCTION(vio_gl_info)
         RETURN_FALSE;
     }
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     if (!vio_gl.initialized) {
         RETURN_FALSE;
     }
@@ -11451,7 +14180,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_plugin_registry_init();
     vio_backend_registry_init();
     vio_backend_null_register();
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     vio_backend_opengl_register();
 #endif
 #ifdef HAVE_VULKAN
@@ -11475,6 +14204,9 @@ PHP_MINIT_FUNCTION(vio)
     vio_buffer_register();
     vio_compute_pipeline_register();
     vio_acceleration_structure_register();
+    vio_bundle_register();
+    vio_rt_pipeline_register();
+    vio_work_graph_register();
     vio_font_register();
     vio_font_face_register();
     vio_sound_register();
@@ -11532,6 +14264,7 @@ PHP_MINFO_FUNCTION(vio)
 #else
     php_info_print_table_row(2, "GLFW", "not available");
 #endif
+    php_info_print_table_row(2, "Platform", vio_plat()->name);
 #ifdef HAVE_GLSLANG
     php_info_print_table_row(2, "glslang (GLSL->SPIR-V)", "available");
 #else

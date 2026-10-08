@@ -2,6 +2,7 @@
  * php-vio - KTX2 container reader (GAP-PHASE5 Block 9)
  *
  * Reads the subset a GPU texture loader needs: 2D textures and 2D arrays in
+ * (and, uncompressed, cubemaps with six faces and 3D textures)
  * R8 / RGBA8 / BC1 / BC3 / BC4 / BC5 / BC7 without supercompression (Basis /
  * zstd payloads are rejected - decode them offline). sRGB variants load as
  * their UNORM twin (the sampler does not linearise). The level index is
@@ -21,6 +22,8 @@ typedef struct _vio_ktx2_info {
     int      vio_format;                      /* VIO_FORMAT_RGBA8 / R8 / BC* */
     int      width, height;
     int      layers;                          /* 1 for a plain 2D texture */
+    int      faces;                           /* 6 for a cubemap, else 1 */
+    int      depth;                           /* > 1 for a 3D texture, else 1 */
     int      levels;                          /* >= 1 */
     uint64_t level_offset[VIO_KTX2_MAX_LEVELS];
     uint64_t level_length[VIO_KTX2_MAX_LEVELS];

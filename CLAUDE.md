@@ -4,8 +4,8 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.8.0**, 145 PHP-Funktionen, 14 Zend-Klassen,
-6 Backends, 98 PHPT-Tests. Releases laufen über semantic-release
+für die PHPolygon Game Engine. Aktuell **v2.30.0**, 202 PHP-Funktionen, 18 Zend-Klassen,
+6 Backends, 227 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
 ## Build
@@ -51,7 +51,8 @@ FFmpeg ab) ist nur für Cross-Builds gegen das iOS-SDK gedacht.
 # Dependencies (Ubuntu/Debian)
 sudo apt install php-dev libglfw3-dev glslang-dev libvulkan-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-  spirv-cross libspirv-cross-c-shared-dev libharfbuzz-dev
+  spirv-cross libspirv-cross-c-shared-dev libharfbuzz-dev libx11-dev libxrandr-dev \
+  libwayland-dev wayland-protocols libxkbcommon-dev
 
 # Build (kein --with-metal auf Linux)
 phpize && \
@@ -90,18 +91,84 @@ Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompilier
 NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-153 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+**Hardware-Lauf auf Windows**: headless D3D11/D3D12 nehmen WARP, die Windows-CI (Windows Server, SM 6.2) meldet
+Mesh-Shader, DXR, Sampler Feedback, VRS Tier 2 und Work Graphs deshalb als 0. `VIO_D3D_HEADLESS_HARDWARE=1` hält
+headless Kontexte auf der GPU; mit den `VIO_REQUIRE_*`-Variablen der Feature-Tests werden Skips zu Fehlern
+(RTX 2080: `VIO_REQUIRE_{SUBGROUP,SUBGROUP_QUAD}=opengl,d3d12,vulkan`, `VIO_REQUIRE_{BARYCENTRICS,ATOMIC64,SHADER_FLOAT16,BASE_VERTEX,COMPUTE_DERIVATIVES,
+SHADING_RATE_PRIMITIVE,SHADING_RATE_IMAGE,BINDLESS,MESH_SHADER,RAY_QUERY,RAYTRACING}=d3d12,vulkan`, `VIO_REQUIRE_MULTIVIEW=opengl,d3d11,d3d12,vulkan`,
+`SAMPLER_FEEDBACK`/`WORK_GRAPHS=d3d12`, `LONG_VECTOR`/`SHADER_EXECUTION_REORDER`/`OPACITY_MICROMAP=d3d12,vulkan` (mit Agility 1.619), `COOPERATIVE_MATRIX=vulkan`, `VIO_REQUIRE_SM6=1`). Zusätzlich lohnt ein Lauf
+mit `-d vio.debug=1` (D3D12-Debug-Layer, Vulkan-Validation): mehrere Befunde zeigten sich nur dort. Die
+Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` setzen.
+
+227 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/220` | Opacity Micromaps (`VIO_FEATURE_OPACITY_MICROMAP`, SM69-PLAN Phase 4): der 164-Verdecker längs der Diagonale geteilt – 2-State-Map ohne Any-Hit (transparente Hälfte wird durchschossen), 4-State mit ignorierendem Any-Hit (Unbekannt-Zustände rufen ihn), `RAY_FLAG_FORCE_OMM_2_STATE`, dasselbe als Inline-Ray-Query im Compute-Kernel (D3D12 braucht `RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS`, ohne trifft die Query nichts), Argument-Vertrag (Länge, Format, Subdivision → `ValueError`; Map ohne Flag → Warning + `false`). `VIO_REQUIRE_OPACITY_MICROMAP`. |
+| `tests/render3d/219` | Shader Execution Reordering (`VIO_FEATURE_SHADER_EXECUTION_REORDER`, Phase 3): Raygen über `hitObjectEXT` / `reorderThreadEXT` (D3D12: HLSL `dx::HitObject` + `dx::MaybeReorderThread` unter `lib_6_9`) schreibt dasselbe Bild wie der gewöhnliche Trace der 164-Szene; der Reorder-Hinweis ändert kein Ergebnis. `VIO_REQUIRE_SHADER_EXECUTION_REORDER`. |
+| `tests/render3d/218` | 16-Bit-Sonderwerte (Phase 1, Vertragstest): `isnan`/`isinf` auf `float16_t` aus Bitmustern (NaN, ±Inf, 1.0, Denormale, 0, größtes Half) klassifizieren im Compute-Kernel auf jedem Backend mit `SHADER_FLOAT16` richtig; Eingaben über `unpackHalf2x16` (NVIDIA-GL kennt `uint16BitsToFloat16` nicht). |
+| `tests/render3d/217` | Kette von Render-Targets ohne Unbind dazwischen: Target k sampelt Target k−1 (+0,1 Rot), mehrere Frames mit verschiedenen Startfarben. D3D12 ließ das abgehende Target im Zustand `RENDER_TARGET` (NuGet-WARP 1.0.21 las schwarz/veraltet, `vio_upscale`-Passes in 208 trafen es) – `d3d12_record_bind_render_target` überführt seine Farbe nach `PIXEL_SHADER_RESOURCE`. |
+| `tests/render3d/216` | Long Vectors (`VIO_FEATURE_LONG_VECTOR`, Phase 2): GLSL-Kernel mit `GL_EXT_long_vector` (`vector<float, 12>`) lädt, rechnet elementweise, speichert – Ergebnis wie CPU auf Vulkan; D3D12 über `vio_compute_pipeline(['hlsl' => …])` mit `vector<float, 12>` (SPIRV-Cross schreibt für Vektoren > 4 ungültiges HLSL), der Override wird wirklich genommen. `VIO_REQUIRE_LONG_VECTOR`. |
+| `tests/window/215` | Wayland-Plattform (A3, nur mit `vio_platform() === 'wayland'`): OpenGL (EGL, Core ≥ 3.3) und Vulkan headless exakt 48×32 auf einem xdg-Toplevel mit Clear-Readback, `wl_surface` als natives Handle, Outputs als Monitore mit sortierten Modi, `vio_set_window_size` außerhalb des Vollbilds. Eingaben kann ein Wayland-Client keinem anderen schicken – die Linux-CI fährt dafür die ganze Suite (Injection-Tests) auf einem headless weston. |
+| `tests/window/214` | X11-Plattform (A3, nur mit `vio_platform() === 'x11'` und `DISPLAY`): OpenGL (GLX, Core ≥ 3.3) und Vulkan headless exakt 48×32 mit Clear-Readback, X-Fenster-ID, Monitore/Videomodi aus XRandR; echte X-Ereignisse aus einer zweiten Display-Verbindung (`XSendEvent` per FFI im Kindprozess): Taste mit Auto-Repeat, Text über die Eingabemethode, Maustasten, Räder als Buttons 4/6. Ohne FFI meldet der Eingabeteil einen Skip. |
+| `tests/window/213` | Win32-Plattform (A2, nur mit `vio_platform() === 'win32'`): OpenGL (WGL-Leiter, Core ≥ 3.3), D3D11, D3D12 und Vulkan öffnen headless exakt 48×32 und lesen ihren Clear zurück; echte Fenster-Nachrichten per `PostMessageW` (FFI im Kindprozess): Tasten nach Scancode samt Extended-Bit (rechtes Strg) und Auto-Repeat, Text als UTF-16-Surrogatpaar (U+1F600), Maustasten inkl. X1, beide Räder (Neigung rechts = −x wie GLFW); Monitore (primärer zuerst) und aufsteigende Videomodi aus den Display-APIs. |
+| `tests/core/212` | Audit-Gate der Plattformschicht (A1): kein `glfwXxx`/`GLFW_*` außerhalb `src/platform/glfw/` (Kommentare ausgenommen); `vio_platform()` nennt eine bekannte Plattform, ein headless Kontext meldet seine Größe, Monitore und Gamepads sind Arrays. |
+| `tests/render3d/205` | Lücken der Geometry-Stage auf jedem Backend mit GS: `VIO_TRIANGLE_STRIP_ADJACENCY` (GL-Tabelle 10.1, Paare (Vertex, Nachbar) bis auf Rotation – Vulkan rotiert ungerade Dreiecke), `gl_PrimitiveID` aus dem GS im Fragment-Shader, Texturen in VS und GS, Interface-Blöcke VS → GS → FS, GS hinter Tessellation (Metal lehnt das ab). Auf D3D: `gl_PrimitiveID` läuft als flaches Varying auf Location 30, GS-Eingangsblöcke werden je Member aufgeteilt, Vertex-Texturen binden auf D3D11 auch an den VS und auf D3D12 über eigene VS-Tabellen (Root-Parameter 20/21). |
+| `tests/render3d/211` | Rate Maps (A16): 192er-Ziel mit Qualität 1 / 0,25 / 1 je Achse – mit `VIO_FEATURE_RASTER_RATE_MAP` kleinere physische Größe, in der Ecke (Qualität 1) liegt jeder Pixel am Ort des Vollraten-Bilds (NDC-Gradient in Rot/Grün; Metal glättet die Zonengrenzen – 149 statt 144 physische Pixel – und resampelt auch Qualität-1-Zonen, harte Kanten verwischen dort leicht), die Streifen (Blau) sind in der Mitte gröber; ohne Feature identisches Bild; fehlerhafte Maps → `ValueError`. |
+| `tests/render3d/210` | `vio_compute_pipeline(['msl' => …])` (A17): auf Metal läuft der MSL-Kernel (Ergebnis ×3+1 statt ×2), anderswo die GLSL; kaputtes MSL wird abgelehnt; mit `caps['tensors']` ein `tensor_inline`-Kernel. |
+| `tests/media/209` | Recorder-Encoder (VIDEO-ENCODE-PLAN, A39): 24 Frames 256×144 mit `software` und `auto` auf jedem Backend, zurückgelesen mit `vio_video_info` / `vio_video_frame` – Frame-Zahl, Größe, wandernde und stehende Fläche an ihrem Ort in ihrer Farbe; `vio_recorder_info` nennt den Encoder; `VIO_REQUIRE_ZERO_COPY=d3d11` verlangt auf dem Hardware-Host D3D11 ohne CPU-Kopie. |
+| `tests/render3d/208` | `vio_upscale` (UPSCALE-PLAN, A21) 32→64 gegen dieselbe Szene in 64: spatial (kantenadaptives Lanczos-2) halbiert den Fehler gegenüber bilinear und hat die doppelte Kantenenergie, Schärfen schärft, Flächen bleiben exakt; temporal mit 16 gejitterten Frames ≈ ein Drittel des spatial-Fehlers, `reset` verwirft die Historie, Kameraschwenk mit Bewegungsvektoren ohne Geisterbilder; Swapchain-Ziel = RT-Ziel, Argument-Vertrag; auf Metal (macOS 13+) zusätzlich MetalFX. |
+| `tests/render3d/207` | Aufgezeichnete Draw-Folgen (`vio_bundle` / `vio_draw_bundle` / `vio_bundle_info`, BUNDLE-PLAN, A38): ein Bundle rendert byte-gleich wie dieselben Einzel-Draws (Pipeline-Wechsel, Texturen je Record), in Swapchain und RT, Uniforms nach dem Aufzeichnen wirken nicht, es hält seine Objekte, ein großes Bundle (1200 Records) fällt bei der ersten nativen Aufnahme auf das Abspielen zurück und ist danach nativ, Freigabe mitten im Frame; Vulkan, D3D11 und D3D12 zeichnen nativ auf. |
+| `tests/backends/206` | Pass-Wechsel in einem Frame auf jedem Backend: 32 Schritte zwischen Swapchain (Spalten müssen über jede Rückkehr erhalten bleiben), 4x-MSAA-Target (Readback mitten im Frame), Cube-Faces, Array-Layern und depth_only-Target, mit async Compute und `vio_compute_wait` dazwischen. Vulkan meldet `dynamic_rendering`, `synchronization2`, `timeline_semaphore` in `vio_backend_info()['caps']` (VULKAN-MODERN-PLAN, A37); vorher lehnte Vulkan `vio_read_render_target` im Frame ab. |
+| `tests/render3d/204` | Sampler-Feedback aus GLSL: `VIO_SAMPLER_FEEDBACK_GLSL` voranstellen, `vio_write_feedback(u_tex, uv)` aufrufen – 256er-Mip-Kette auf 32×32 meldet Mip 3 je Region (Kartenform wie der Hardware-Pfad), Clear leert, ein Viertel vergrößert gezeichnet meldet nur Region 0 mit Mip 2, ungebunden wird nichts geschrieben. Nebenbefunde: `vio_update_buffer` + `vio_storage_buffer_read` lieferte auf D3D11/D3D12 die alte Readback-Kopie; ein ungebundener Pixel-Root-UAV beim Schreiben entfernte auf Hardware das D3D12-Gerät. |
+| `tests/render3d/203` | Fragment-Storage-Buffer: `atomicAdd`-Zähler und ein Wert je Pixel über `vio_bind_fragment_storage_buffer` (zwei Bindings gleichzeitig), Readback mitten im Frame und danach, zweiter Draw im selben Frame, Binding 4 → `ValueError`, `null` löst. |
+| `tests/render3d/202` | `vio_trace_rays` innerhalb von `vio_begin`/`vio_end`: in die Frame-Liste bzw. den Frame-Command-Buffer aufgezeichnet (D3D12 wie async Compute, Vulkan Pass schließen → Trace → mit LOAD fortsetzen, Set aus den Per-Frame-Compute-Pools), ein folgender async Compute-Dispatch sieht die Trace-Schreibzugriffe, Readback mitten im Frame und danach, Zeichnungen vor und nach dem Trace bleiben im Bild, Pipeline-Freigabe direkt danach. |
+| `tests/render3d/201` | `vio_rt_bind_texture`: Raygen und Closest-Hit sampeln Texturen (`sampler2D` an Binding 2/3; D3D12 `Texture2D t<N>` + statischer Sampler `s<N>`), Rebind ersetzt, Binding 16 → `ValueError`. |
+| `tests/render3d/200` | RT-Pipeline-Gruppen: zwei Miss-Shader (`missIndex`), zwei Hit-Gruppen (Instanz-`hit_group`), ein Callable, Shader-Records je Gruppe (`shaderRecordEXT` / D3D12-Root-Konstanten `b0, space1`), Instanz-`mask` gegen die Cull-Maske; leere Miss-Liste → `ValueError`. |
+| `tests/render3d/199` | `vio_acceleration_structure_update`: nur Transforms ändern sich → `'refit'` (TLAS in place, `ALLOW_UPDATE`), andere Instanzliste mit bekannten Meshes → `'rebuild'` (neuer TLAS über die vorhandenen BLAS), neues Mesh → `'full'`; 20 Refits hintereinander, im Frame → `false` (Struktur unverändert), leere Liste → `false`. |
+| `tests/render3d/198` | Tessellations-Varyings auf jedem Backend: Interface-Blöcke VS → TCS → TES, Struct-, `mat2`- und Patch-Block-Varyings, Lesen fremder Kontrollpunkte nach `barrier()`, `gl_ClipDistance` durch beide Tess-Stages (linke Hälfte geclippt). Vorher lehnte D3D Blöcke/Structs ab, las nach `barrier()` Nullen und verlor die Clip-Distanz; GL schaltete Clip-Planes nie ein. |
+| `tests/render3d/197` | Texturen in Mesh- und Task-Stages: ein Mesh-Shader liest `sampler2D` und `sampler2DArray`, ein Task-Shader entscheidet über eine Maskentextur, welche Mesh-Gruppen starten, der Fragment-Shader teilt sich dieselbe Textur. Task und Mesh benutzen ihre Sampler in anderer Reihenfolge – vorher landete der Task-Sampler auf dem Register des anderen (Register je Stage nach SPIR-V-Id gezählt). |
+| `tests/render3d/196` | Multisampled Depth-only-Targets (`'depth_only' => true, 'samples' => 4`): Tiefe wird multisampled gerendert und zum Sampeln mit der `'depth_reduction'` des Targets aufgelöst (MAX/MIN über die Samples; GL/D3D11/D3D12/Vulkan per Vollbild-Pass, Metal per `depthResolveFilter`); MIN hält mehr Kantentexel nah als MAX, keine Zwischenwerte. |
+| `tests/render3d/195` | Multisampled Cube- und Array-Targets: jede Face/Schicht behält eigene Samples und Tiefe (MS-Array), wird beim Verlassen aufgelöst, Rebind behält den Inhalt, andere Schichten bleiben unberührt, die Diagonale ist geglättet. |
+| `tests/render3d/194` | Multisampled MRT-Targets: jedes Attachment wird aufgelöst (Kante geglättet). Vorher zeichnete D3D11 mit MSAA-MRT gar nichts (nur Attachment 0 war multisampled) und GL renderte MRT stillschweigend single-sampled. |
+| `tests/render3d/193` | Tiefen-Targets mit Mip-Kette (`'depth_only' => true, 'mipmaps' => true`, `'depth_reduction' => VIO_DEPTH_REDUCE_MAX`/`_MIN`, `VIO_FEATURE_DEPTH_MIPMAPS`): `vio_generate_mipmaps` baut jede Stufe als Max/Min der 2×2-Texel darunter (Hi-Z); Stufe 1 und 4 per `texelFetch` gegen die eigenen Level-0-Werte, eine Kette im Frame, eine danach; Targets ohne Kette lehnen ab. |
+| `tests/render2d/192` | Vertikaltext (`'vertical' => true`, HarfBuzz TTB): Spalten von oben nach unten ab (x = rechter Rand, y = oben), `'\n'` beginnt die nächste Spalte links, vertikale Formen der Interpunktion; `vio_text_measure` tauscht die Achsen (Breite = Spalten × Zeilenhöhe). Braucht einen CJK-Systemfont. |
+| `tests/render3d/191` | ASTC (`VIO_FORMAT_ASTC_4x4/5x5/6x6/8x8`, `VIO_FEATURE_TEXTURE_COMPRESSION_ASTC`): ein handkodierter Void-Extent-Block dekodiert in jeder Blockgröße und aus KTX2, wo das Flag gesetzt ist (Apple-GPUs, Vulkan/GL mit ASTC-LDR); sonst lehnt `vio_texture` mit Warnung ab. |
+| `tests/render3d/190` | KTX2 mit sechs Faces → `VioCubemap`, mit Tiefe → 3D-`VioTexture` (RGBA8 / R8, `mip_offset`), BC-Cubes werden abgelehnt; `vio_cubemap(['faces' => [RGBA-Strings], 'width', 'height'])`. |
+| `tests/render2d/189` | Glyph-Atlas füllt sich bei Bedarf: `vio_font` rasterisiert nichts, `vio_text` nur die neuen Glyphen (Teilrechteck-Upload über `update_font_atlas`), `vio_text_measure` gar nichts (`vio_font_info`); über mehrere Frames angekommener Text gleicht pixelgenau einem frischen Font. |
+| `tests/render3d/188` | `vio_read_pixels` liefert auf jedem Backend den neuesten Frame: nach jedem Frame, nach mehreren ungelesenen Frames in flight, nach einem Offscreen-Frame und mitten im Frame (D3D11 lieferte dort den vorigen Frame). Vulkan wartet nur noch auf den Fence des kopierenden Frames statt `vkDeviceWaitIdle`. |
+| `tests/core/187` | Kalibrierlauf (`vio_benchmark_backends`, `vio_create('auto', ['benchmark' => true])`): dieselbe Szene (64 Draws in ein RT, Post-Pass, async Compute; headless auf der GPU) auf den drei besten Kandidaten, Ergebnis nach ms sortiert, Cache `vio-benchmark.json` je (Backend, Adapter, Treiber, vio-Version) – ein Treffer überspringt den Lauf; ein im Cache schnellster Kandidat gewinnt `auto` (`selected_by` = `benchmark`, `benchmark_ms` je Kandidat). |
+| `tests/core/186` | Scoring für `auto` (`prefer`, `require`, `vio_rank_backends`): Herstellerprofil (NVIDIA d3d12 > vulkan > d3d11, AMD vulkan > d3d12, ältere Intel-iGPUs d3d11, Apple metal, Linux vulkan > opengl, `compat` d3d11/opengl vorn), Software-Rasterizer zuletzt, `require` filtert; simuliert über `VIO_TEST_ADAPTERS` (JSON mit Plattform), unerfüllbares `require` → `false` mit Warnung; `vio_backend_info` meldet `selected_by` und die Kandidaten. |
+| `tests/core/185` | `vio_adapters()` ohne Kontext: je Backend die Adapter (Name, PCI-Vendor/-Device, Treiber, Gerätetyp, VRAM, Hardware-Features als `VIO_FEATURE_*`), diskrete zuerst, WARP/Software zuletzt; der Adapter eines geöffneten Kontexts ist dabei; GL kennt nur den Adapter des lebenden Kontexts; unbekanntes Backend → `ValueError`. |
+| `tests/core/184` | `vio_backend_info` auf jedem Backend (vorher nur Metal): API, Gerät, Shading-Sprache mit Stufe in Benutzung und Maximum (HLSL-Shader-Model, SPIR-V der Instanz/des Device, GLSL), Familien, Caps, PCI-Vendor + Name, Treiber, Gerätetyp, VRAM. |
+| `tests/render3d/183` | Multiview mit Geometry- und Tessellations-Stages (`VIO_FEATURE_MULTIVIEW_GEOMETRY` / `_TESSELLATION`): `gl_ViewIndex` im GS bzw. in der TES färbt je View, jede View landet in ihrem Layer; ohne Flag lehnt `vio_shader` die Kombination ab. Vulkan nativ (`multiviewGeometryShader`/`multiviewTessellationShader`), D3D12 reicht die View vom Vertex-Shader durch (SPIRV-Cross nimmt `SV_ViewID` nur in VS/PS). |
+| `tests/render3d/182` | Multiview per Instancing auf D3D11 und auf GL ohne `GL_OVR_multiview2` (`VIO_GL_EMULATE_MULTIVIEW=1` erzwingt es): Views × Instanzen je Draw, `gl_ViewIndex` in beiden Stages, Instanzdaten je Nutzer-Instanz, indirekte Datensätze, `vio_feature_info` meldet die Emulation, SPIR-V-Eingabe wird abgelehnt. |
+| `tests/render3d/181` | Draw-Parameter auf D3D12 unter SM 6.8: `gl_BaseVertex`/`gl_BaseInstance` über die `b13`-Root-Konstanten – je Datensatz eines indirekten Multi-Draws (4/3 und 8/5), 0 bei `vio_draw` – unter FXC 5.1, festgelegtem SM 6.0/6.5 und SM 6.8; Vulkan und GL als Referenz. |
+| `tests/render3d/180` | Getrennte Textur- und Sampler-Objekte in Set 0 (`texture(sampler2D(u_tex, u_smp), uv)`) auf jedem Backend; die Textur nimmt die Unit aus `vio_set_uniform`, auch gegen die Deklarationsreihenfolge. Vorher zeichnete Vulkan nichts (Notice) und GL lehnte den Shader ab. |
+| `tests/render3d/179` | Bindless in Compute-Kernels: ein Kernel liest `vio_textures[]` und `vio_cubes[]` über Slots aus einem Storage-Buffer, synchron und als async-Dispatch im Frame (D3D12, Vulkan, Metal). |
+| `tests/render3d/178` | Bindless-Cubemaps und -Texture-Arrays: `vio_texture_index` nimmt `VioCubemap` (`vio_cubes[]`, Set 1 Binding 5) und Array-Texturen (`vio_texture_arrays[]`, Binding 6) im selben Slot-Raum wie 2D; Faces und Layer stimmen, ein freigegebener Cube-Slot kommt als 2D-Slot zurück, 3D-Texturen bleiben draußen. |
+| `tests/render3d/177` | Bindless-Sampler-Varianten: Set 1 Binding 1–4 = linear/repeat, nearest/repeat, linear/clamp, nearest/clamp; eine 2×1-Textur (rot \| blau) bei u = 0,4 und 1,1 liefert je Variante Mischung, Rot oder Blau (D3D12, Vulkan, Metal). |
+| `tests/render3d/176` | `vio_texture_release_index`: ein freigegebener Bindless-Slot bleibt 4 `vio_begin` lang reserviert (Tabelle hält die Textur), danach Null-Eintrag und Wiedervergabe; die freigegebene Textur kann sofort unter neuem Slot zurück, andere Slots bleiben unberührt; doppelte Freigabe / fremde Textur → `false`. |
+| `tests/render3d/175` | `vio_uniform_buffer` + `vio_bind_buffer` für Grafik-Shader: Vertex-Block an Binding 0, Fragment-Block an Binding 1, Update zwischen zwei Draws eines Frames (links rot, rechts grün), ein Puffer an einem ungenutzten Binding ändert nichts. Vorher schwarz auf GL und D3D11, D3D12 lehnte die Pipeline ab (Vulkan lief im Ausgangslauf nicht mehr). |
+| `tests/render3d/174` | Das Vertex-Input-Layout folgt dem Mesh-Layout: Attribute gegen die Location-Reihenfolge (`[[loc 1, 3], [loc 0, 2]]`), ein vom Shader ungelesenes Attribut (Location 7) zwischen zwei gelesenen und das flache Layout liefern jeweils die richtige Farbe; vorher falsch auf D3D11, D3D12 und Vulkan. |
+| `tests/render3d/173` | Eine gebundene Pipeline bleibt über `vio_end`/`vio_begin` gebunden (auf D3D12 bindet `begin_frame` sie auf der zurückgesetzten Liste neu), und `vio_draw` vor jedem `vio_bind_pipeline` scheitert nicht (D3D11/D3D12/Vulkan zeichnen nichts, GL nimmt den eingebauten Shader). Vorher zeichnete D3D12 ohne PSO und entfernte das Device. |
+| `tests/core/172` | Benannte GPU-Zeitmarken: `vio_gpu_timestamp($ctx, 'name')` schließt einen Abschnitt (ab der vorigen Marke bzw. `vio_begin`), `vio_gpu_timings($ctx)` liefert `name => ms` des zuletzt fertigen Frames in Markenreihenfolge; ein schwerer Abschnitt wiegt mehr als ein leichter, doppelte Namen addieren sich, die Summe passt in `vio_gpu_frame_time`, höchstens 32 Marken, ohne Frame / ohne Feature `false`, Frames ohne Marken → `[]`. |
+| `tests/core/171` | `vio_feature_info($ctx, VIO_FEATURE_*)` → `['supported', 'emulated', 'method']` für jede Konstante auf jedem Backend: `supported` = `vio_supports_feature`, `emulated` nur bei unterstützten Features und genau dann mit `method`; Metal emuliert Geometry-Stage, GS-Instancing und Multiview, GL/D3D/Vulkan führen GS/Tess/Multiview/Ray-Query nativ aus; unbekannte Konstante → alles `false`/`null`. |
+| `tests/core/170` | Shader Model auf D3D12 festlegen: `shader_model => 60..69` liefert genau dieses DXC-Profil (über dem Maximum aus Device und DXC wird geklemmt, `5`/`51` bleiben FXC), versionsgebundene Flags (`SHADER_FLOAT16` ab 6.2, `COMPUTE_DERIVATIVES` ab 6.6) folgen, ein Draw unter 6.0 läuft; `VIO_D3D12_SHADER_MODEL` greift ohne Option, die Option gewinnt. |
+| `tests/render3d/169` | `vio_submit_batch` rendert byte-gleich zu denselben Einzel-Draws (Pipeline-Wechsel, Datensatz ohne Pipeline/Texturen, Textur vor dem Batch gebunden, `u_tint` bleibt stehen, `u_offset` je Draw) auf jedem Backend (BATCH-SUBMIT-PLAN Phase 0). |
 | `tests/render3d/165` | Sampler Feedback (`VIO_FEATURE_SAMPLER_FEEDBACK`, nur D3D12, SM 6.5 + Tier 0.9): Fragment-Stage als HLSL-Override (`'hlsl' => ['fragment' => …]`) mit `FeedbackTexture2D<SAMPLER_FEEDBACK_MIN_MIP> vio_feedback : register(u0, space2)` + `WriteSamplerFeedback`; eine 256²-Textur mit Mip-Kette auf ein 32²-Ziel gezeichnet meldet in jeder Region Mip ≈ 3, nach `vio_sampler_feedback_clear` keine; ohne Flag liefern bind/read/clear `false`. `VIO_REQUIRE_SAMPLER_FEEDBACK=d3d12` macht das Backend Pflicht. |
-| `tests/render3d/160` | Shading-Rate-Bild (`VIO_FEATURE_SHADING_RATE_IMAGE`, `vio_set_shading_rate_image`, `vio_shading_rate_tile_size`): 2X2-Kacheln links, 1X1 rechts → links grob, rechts fein; Bild klebt über Frames, `null` löscht; falsche Byte-Zahl / Rate 99 → `false`; ohne Feature Kachelgröße 0 und `false`. Nur D3D12 (Tier 2) — in der CI nicht ausführbar (WARP-Tier unbekannt, Diagnose druckt `shading_rate_image`). |
+| `tests/render3d/160` | Shading-Rate-Bild (`VIO_FEATURE_SHADING_RATE_IMAGE`, `vio_set_shading_rate_image`, `vio_shading_rate_tile_size`): 2X2-Kacheln links, 1X1 rechts → links grob, rechts fein; Bild klebt über Frames, `null` löscht; falsche Byte-Zahl / Rate 99 → `false`; ohne Feature Kachelgröße 0 und `false`. D3D12 (Tier 2) und Vulkan (`attachmentFragmentShadingRate`, A18) — in der CI nicht ausführbar (WARP-Tier unbekannt, Diagnose druckt `shading_rate_image`). |
 | `tests/render3d/161` | Bindless-Texturtabelle (`VIO_FEATURE_BINDLESS`, `vio_texture_index()`, BINDLESS-PLAN.md): 64 einfarbige Texturen, ein Draw mit 64 Quads, Slot als Vertex-Attribut → nicht-uniformer Index in `vio_textures[]` (Set 1) im Fragment-Shader; Slot stabil und eindeutig, die Tabelle hält die Texturen am Leben (PHP-Variablen vor dem Draw verworfen); ohne Flag `false`. Liest ein Render-Target (MoltenVK-Swapchain-Readback auf Retina ist nicht exakt). |
+| `tests/render3d/163` | Inline-Raytracing (`VIO_FEATURE_RAY_QUERY`): `vio_acceleration_structure` (BLAS je Mesh, TLAS über Instanzen mit Transform) + `vio_bind_acceleration_structure`; `rayQueryEXT` im Fragment-Shader (Verdecker links / per Transform rechts / beide) und im Compute-Shader (4 Strahlen → 1 1 0 0); ohne Flag liefert `vio_acceleration_structure` `false`. Metal ab MSL 2.4 (M5: ausgeführt), D3D12 DXR 1.1 + SM 6.5, Vulkan `VK_KHR_ray_query` (lavapipe: ausgeführt; die Vulkan-Rundreise übersetzt `rayQueryEXT` mit GLSL 460). |
+| `tests/render3d/164` | Raytracing-Pipeline (`VIO_FEATURE_RAYTRACING`): `vio_rt_pipeline` (Raygen / Miss / Closest-Hit, optional Any-Hit) gegen `vio_acceleration_structure`; `vio_trace_rays` (16×4, auch Tiefe 2) schreibt je Strahl den Payload über `vio_rt_bind_buffer` in einen Storage-Buffer: Treffer 100 + 10·`gl_HitTEXT` = 105 links, Miss 0 rechts, per Transform gespiegelt, Any-Hit mit `ignoreIntersectionEXT` + erzwungen nicht-opak → alles 0; ohne Flag `false`. Vulkan (GLSL `GL_EXT_ray_tracing`) auf lavapipe (Mesa 25.0, Debian trixie) ausgeführt, D3D12 (DXR 1.0, HLSL-Bibliothek `lib_6_3`) nur per DXC + mingw geprüft, Metal 0. `VIO_REQUIRE_RAYTRACING`. |
 | `tests/render3d/163` | Inline-Raytracing (`VIO_FEATURE_RAY_QUERY`): `vio_acceleration_structure` (BLAS je Mesh, TLAS über Instanzen mit Transform) + `vio_bind_acceleration_structure`; `rayQueryEXT` im Fragment-Shader (Verdecker links / per Transform rechts / beide) und im Compute-Shader (4 Strahlen → 1 1 0 0); ohne Flag liefert `vio_acceleration_structure` `false`. Metal ab MSL 2.4 (M5: ausgeführt), D3D12 DXR 1.1 + SM 6.5, Vulkan `VK_KHR_ray_query`. |
+| `tests/render3d/166` | Work Graphs (`VIO_FEATURE_WORK_GRAPHS`, `vio_work_graph` / `vio_work_graph_bind_buffer` / `vio_dispatch_graph`): zweiknotiger `lib_6_8`-Graph, der Einstiegsknoten verteilt je CPU-Record `count` Records an einen Thread-Knoten, der atomar in einen Storage-Buffer addiert (Summe + Startzahl, zweiter Dispatch auf demselben Backing Memory, Dispatch im Frame); Vertrag (ohne `hlsl`, `record_size` 0, unbekannter Einstieg, zu kurze Records); `vio_swapchain_info()['agility_sdk']` auf jedem Backend (null: 0). Nur D3D12 (Agility SDK ≥ 1.613 über `VIO_AGILITY_SDK`, WorkGraphsTier 1.0); HLSL nur per DXC geprüft. `VIO_REQUIRE_WORK_GRAPHS`. |
 | `tests/render3d/162` | Mesh- und Task-Shader (`VIO_FEATURE_MESH_SHADER`, `vio_shader(['task' => …, 'mesh' => …, 'fragment' => …])`, `vio_draw_mesh_tasks`/`_indirect`): Task-Stage startet Mesh-Gruppen nur für gerade Gruppen-IDs (Payload), Mesh-Stage emittiert je Gruppe ein Quad mit Per-Primitiv-Farbe × Mesh-Uniform; nur Mesh; indirekt (3 × uint32); Orientierung gleich einer Vertex-Pipeline; Vertrag (`vertex` + `mesh`, `task` ohne `mesh`, ohne Flag abgelehnt). Ausgeführt auf Metal (M-Serie, MSL ≥ 3.0); D3D12 (SM 6.5 + `MeshShaderTier`, nicht auf WARP) und Vulkan (`VK_EXT_mesh_shader`, nicht MoltenVK) nur Text-/Compile-geprüft. `VIO_REQUIRE_MESH_SHADER`. |
+| `tests/backends/168` | D3D12 mit `vio.debug=1`: eine direkt nach `vio_end` freigegebene Pipeline wird erst nach dem Fence ihres Frames freigegeben; vorher beendete der Debug-Layer den Prozess (PSO gelöscht, während die GPU ihn noch nutzt). Ohne installierten Debug-Layer läuft der Test einfach mit. (149–167 sind vom Feature-Stack #50–#65 belegt.) |
+| `tests/render3d/167` | Kooperative Matrizen (`VIO_FEATURE_COOPERATIVE_MATRIX`, `vio_cooperative_matrix_shapes`, `GL_KHR_cooperative_matrix`): ein Compute-Kernel rechnet D = A·B + C als 2×2-Kacheln mit `coopMatMulAdd` (K = 2 Kacheln) in einer gelisteten Form (float16/float32 oder float32), ganzzahlige Werte → bitgenau gleich der CPU; Liste ohne Flag (oder Flag ohne Liste) ist ein Fehler, Metal unter MSL 3.1 meldet nichts. Ausgeführt auf Metal (M-Serie, 8×8×8 half/half, half/float, float/float über SPIRV-Cross → `simdgroup_matrix`); Vulkan (`VK_KHR_cooperative_matrix`, nicht MoltenVK) nur kompiliert; D3D12 0. `VIO_REQUIRE_COOPERATIVE_MATRIX`. |
 | `tests/render3d/159` | Shading-Rate pro Primitiv (`VIO_FEATURE_SHADING_RATE_PRIMITIVE`): Vertex-Stage schreibt `gl_PrimitiveShadingRateEXT` (2×2 = 5, auf Vulkan und D3D12 gleich kodiert) und überschreibt `vio_set_shading_rate`; Pipelines ohne den Write behalten die gesetzte Rate. **Nirgends ausführbar** (lavapipe ohne VRS, WARP nur SM 6.2, MoltenVK/Metal ohne VRS) — D3D12-HLSL nur per DXC geprüft. |
 | `tests/render3d/158` | Multiview (`VIO_FEATURE_MULTIVIEW`, `vio_shader(['view_count' => N])`): ein Draw rendert jede View in Layer `gl_ViewIndex` eines mit `VIO_RT_ALL_LAYERS` gebundenen Layered-RTs — Fragment- und Vertex-Arbeit je View, Instancing (Instanz-Attribute stepen je Instanz, nicht je (Instanz, View)), 4 Views, indirekter Draw, Optionsvertrag (2..4, ohne Flag abgelehnt). CI-Pflicht auf allen vier Backends: OpenGL (llvmpipe, `GL_OVR_multiview2`), Vulkan (lavapipe), D3D12 (WARP, SM 6.2), Metal (macOS-Runner). |
-| `tests/render3d/155` | 16-Bit-Floats (`VIO_FEATURE_SHADER_FLOAT16`): `float16_t` zur Laufzeit gerundet (2049 → 2048, 0.1 → 0.0999755859375) — beweist echte halbe Genauigkeit (HLSL `min16float` wäre nur ein Hinweis). |
+| `tests/render3d/155` | 16-Bit-Floats (`VIO_FEATURE_SHADER_FLOAT16`): Half-Addition auf exakten Eingaben (`half(2048) + 1` rundet auf 2048, Summe 2048.75; mit 32 Bit 2049.75) — beweist echte halbe Genauigkeit (HLSL `min16float` wäre nur ein Hinweis). Ungenaue float→half-Konvertierungen sind kein Beweis: Treiber falten sie weg (lavapipe, NVIDIA behält `half(2049)` = 2049). |
 | `tests/render3d/156` | Draw-Parameter (`VIO_FEATURE_BASE_VERTEX`): indirekter Draw mit baseVertex 4 / firstInstance 3 liefert `gl_BaseVertex`/`gl_BaseInstance` = (4, 3), `vio_draw` (0, 0); Vertices 0..3 sind degeneriert, ein ignorierter Base Vertex zeichnet nichts. |
 | `tests/render3d/157` | Compute-Derivate (`VIO_FEATURE_COMPUTE_DERIVATIVES`): `derivative_group_quadsNV`, `dFdx`/`dFdy` von 3x + 5y ergeben überall (3, 5); Metal muss 0 melden. |
 | `tests/render3d/154` | 64-Bit-Atomics (`VIO_FEATURE_ATOMIC64`): 64 Threads rennen mit (Tiefe << 32 \| ID)-Schlüsseln auf vier `uint64_t`-Slots (`atomicMax`, `atomicMin`, `atomicAdd` über 2³⁹, `atomicCompSwap` mit genau einem Gewinner) — jede 32-Bit-Kürzung fällt auf; Metal muss 0 melden. CI-Pflicht auf lavapipe. |
@@ -140,7 +207,7 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) php run-tests.php -d extension
 | `tests/core/118` | HDR10-Ausgabe erzwungen (`hdr_output => 2`): D3D11/D3D12/Vulkan/Metal melden Format RGB10A2 + `hdr_output`, ein weisses 2D-Rechteck kommt PQ-kodiert hell zurueck (Readback expandiert 10 Bit), 3D-Draws laufen ueber die PSO-Format-Variante. |
 | `tests/core/117` | `frame_latency => 1`: D3D11/D3D12/Metal melden `waitable` + Latenz 1 in `vio_swapchain_info`, Frames laufen; Backends ohne Feature melden 0 und ignorieren die Option. |
 | `tests/core/116` | Shader-Cache: zweiter Kontext im selben Verzeichnis kompiliert denselben Shader aus dem Cache (`stores` > 0 beim ersten, `hits` > 0 beim zweiten Lauf); Vulkan schreibt seine Pipeline-Cache-Datei beim Destroy. |
-| `tests/core/115` | `vio_gpu_frame_time`: nach drei gerenderten Frames liefert jedes Backend mit dem Feature eine plausible GPU-Zeit (0 ≤ ms < 5000), ohne Feature −1. |
+| `tests/core/115` | `vio_gpu_frame_time`: nach drei gerenderten Frames liefert jedes Backend mit dem Feature eine plausible GPU-Zeit (0 ≤ ms < 5000), ohne Feature −1. GL und D3D11 warten dafür in `vio_begin` auf den drei Frames alten Slot (wie der Fence auf D3D12/Vulkan); vorher verwarfen sie unfertige Frames, ohne Present-Drosselung blieb der Wert stehen. |
 | `tests/render3d/114` | 16-Bit-Indices: kleines Mesh bekommt 2 Bytes je Index und zeichnet auf jedem Backend korrekt; ein Index ≥ 65536 oder `index_type => VIO_INDEX_UINT32` erzwingt 4 Bytes. |
 | `tests/render3d/113` | Stencil: ein Markierungs-Pass (Farbe maskiert, REPLACE ref 1) auf der linken Hälfte, dann EQUAL-/NOTEQUAL-Passes – links grün, rechts rot, keine Farbe aus dem Markierungs-Pass. |
 | `tests/render3d/111` | Draw-time-Bind-Tabelle haelt Referenzen: eine als Temporary gebundene RT-Textur (`vio_bind_texture(\, vio_render_target_texture(\), 6)`) ueberlebt bis zum Draw, auch wenn danach weitere Texturobjekte entstehen (D3D11/D3D12/Metal; Regression aus 2.9: recycelter Objektspeicher legte die AO-Karte auf das Schatten-Register). |
@@ -176,6 +243,16 @@ Alle GPU-Operationen gehen durch `vio_backend` Vtable in `include/vio_backend.h`
 - Windows: D3D12 > D3D11 > Vulkan > OpenGL
 - Linux: Vulkan > OpenGL
 
+Mit `vio_create('auto', ['prefer' => 'performance' | 'quality' | 'compat', 'require' => [VIO_FEATURE_*…]])`
+rankt `auto` stattdessen je Backend den bevorzugten Adapter (`vio_rank_backends`, `src/vio_backend_registry.c`):
+Herstellerprofil des besten Hardware-Adapters (NVIDIA d3d12 > vulkan > d3d11, AMD vulkan > d3d12, Intel ohne
+Mesh-Shader d3d11 zuerst, Apple metal, Linux vulkan > opengl), diskret vor integriert, WARP/llvmpipe/lavapipe nur
+als letzter Ausweg, Feature-Punkte nach `prefer`; `require` filtert über die Adapter-Features (`vio_adapters`,
+Vtable-Slot `enumerate_adapters`) und nach dem Öffnen noch einmal über die echten Flags. `'benchmark' => true`
+misst die drei besten Kandidaten mit einer Kalibrierszene (Cache `vio-benchmark.json` je Adapter + Treiber,
+`vio_benchmark_backends`). `vio_backend_info()['selected_by']` = `explicit` / `priority` / `score` / `benchmark`.
+`VIO_TEST_ADAPTERS` (JSON) simuliert die Adapter für Tests.
+
 `null` wird nie auto-gewählt. iOS (`--with-ios`) ist kein GPU-Backend, sondern
 ersetzt die GLFW-Fenster/Input-Hälfte (`src/backends/ios/`) und rendert über Metal.
 
@@ -198,44 +275,61 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | Cubemap | ✅ | ✅ | ✅† (seit 2.9: Upload war vorher nicht implementiert) | ✅ (6-Layer-Image, Block 10b) | ✅ |
 | Compute (`vio_compute_*`) | ✅ (GL ≥ 4.3 → auf macOS nie) | ✅ | ✅ | ✅ | ✅ |
 | Vertex-Storage (`vio_draw_instanced_from_buffer`) | ✅ (wenn Compute) | ✅ | ✅ | ✅ | ✅ |
+| Fragment-Storage (`vio_bind_fragment_storage_buffer`, Binding 0..3, Schreiben + Atomics; `VIO_FEATURE_FRAGMENT_STORAGE`) | ✅ (GL ≥ 4.3) | ✅ (OM-UAVs u4..u7) | ✅ (Pixel-Root-UAVs u4..u7) | ✅ (`fragmentStoresAndAtomics`) | ✅ (`setFragmentBuffer`, CI) |
+| Sampler-Feedback aus GLSL (`VIO_SAMPLER_FEEDBACK_GLSL` + `vio_write_feedback`, `VIO_FEATURE_SAMPLER_FEEDBACK_GLSL`) | ✅ | ✅ | ✅ (+ Hardware-Karte, zusammengeführt) | ✅ | ✅ (CI) |
 | Texture 3D | ✅ | ✅ | ✅ | ✅ | ✅ |
 | read_pixels | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Texture Swizzle | ✅ (3.3+) | ❌ (CPU-Expand) | ❌ (CPU-Expand) | ✅ | ✅ |
-| Layered RTs (`'layers' => N`-Arrays, Depth-Cube; `VIO_FEATURE_RENDER_TARGET_LAYERED`) | ✅ (`GL_TEXTURE_2D_ARRAY` / Depth-Cubemap, `glFramebufferTextureLayer`) | ✅ (RTV/DSV je Slice) | ✅ (RTV/DSV je Slice) | ✅ (Framebuffer je Layer, `2D_ARRAY`/`CUBE`-Views) | ✅ (`MTLTextureType2DArray` Farbe + Tiefe, Depth32Float-Cube; Slice je Bind) |
+| Layered RTs (`'layers' => N`-Arrays, Depth-Cube; `VIO_FEATURE_RENDER_TARGET_LAYERED`) | ✅ (`GL_TEXTURE_2D_ARRAY` / Depth-Cubemap, `glFramebufferTextureLayer`) | ✅ (RTV/DSV je Slice) | ✅ (RTV/DSV je Slice) | ✅ (View je Layer, `2D_ARRAY`/`CUBE`-Views) | ✅ (`MTLTextureType2DArray` Farbe + Tiefe, Depth32Float-Cube; Slice je Bind) |
 | Layered Rendering (`VIO_RT_ALL_LAYERS`, `gl_Layer`; `VIO_FEATURE_LAYERED_RENDER` / `_VERTEX_LAYER`) | ✅ (`glFramebufferTexture`; VS-Layer mit `GL_ARB_shader_viewport_layer_array`) | ✅ (RTV/DSV über alle Slices; GS per Probe, VS-Layer per `D3D11_OPTIONS3`) | ✅ (dto.; VS-Layer immer) | ✅ (Framebuffer `layers = N`; VS-Layer mit `VK_EXT_shader_viewport_index_layer`) | ✅ (`renderTargetArrayLength`, `[[render_target_array_index]]` aus VS oder emuliertem GS; Mac2/Apple5) |
 | Mehrere Viewports (`vio_viewports`, `gl_ViewportIndex`; `VIO_FEATURE_MULTI_VIEWPORT`) | ✅ (GL 4.1 / `ARB_viewport_array`, `glViewportIndexedf`) | ✅ (`RSSetViewports(n)`, 3D ohne Scissor) | ✅ (Viewport + Scissor je Eintrag) | ✅ (`multiViewport`; 3D-Pipelines tragen immer `max_viewports` Viewports, `vk3d_prepare` setzt alle) | ✅ (`setViewports:count:` + Scissor je Eintrag, `[[viewport_array_index]]` im VS; Mac2/Apple5) |
 | GS-Instancing (`layout(invocations = N)`, `VIO_FEATURE_GEOMETRY_INSTANCING`) | ✅ (GL ≥ 4.0 / `ARB_gpu_shader5`) | ✅‡ (GLSL über SPIR-V-Umbau: `SV_GSInstanceID` + `[instance(N)]`) | ✅‡ | ✅ | ✅ (emuliert: Thread je Primitiv × Invocation) |
-| Adjacency-Topologien (`VIO_*_ADJACENCY`, `vio_mesh(['adjacency' => true])`) | ✅ | ✅ | ✅ | ✅ | ✅ (emuliert; ohne `TRIANGLE_STRIP_ADJACENCY`) |
+| Adjacency-Topologien (`VIO_*_ADJACENCY`, `vio_mesh(['adjacency' => true])`) | ✅ | ✅ | ✅ | ✅ | ✅ (emuliert) |
 | HLSL-Stage-Override (`'hlsl' => [stage => src]`, `VIO_FEATURE_HLSL_STAGE_OVERRIDE`) | — | ✅ | ✅ (auch DXIL / SM 6) | — | — |
-| Cubemap-RT + `vio_generate_mipmaps` | ✅ | ✅ (`GenerateMips`) | ✅ (Compute-Downsample, CPU-Fallback) | ✅ (Framebuffer je Face/Level, `vkCmdBlitImage`-Kette) | ✅ |
+| MSL-Override für Compute (`vio_compute_pipeline(['msl' => src])`, MSL-4-Tensoren per `tensor_inline`, A17) | — (GLSL) | — (GLSL) | — (GLSL) | — (GLSL) | ✅ (Bindings + `local_size` aus der GLSL-Reflection) |
+| Cubemap-RT + `vio_generate_mipmaps` | ✅ | ✅ (`GenerateMips`) | ✅ (Compute-Downsample, CPU-Fallback) | ✅ (View je Face/Level, `vkCmdBlitImage`-Kette) | ✅ |
+| Tiefen-Mips / Hi-Z (`'depth_only' => true, 'mipmaps' => true`, `'depth_reduction'`, `VIO_FEATURE_DEPTH_MIPMAPS`) | ✅ (Vollbild-Dreieck schreibt `gl_FragDepth`, Basis-Level auf die Quelle gepinnt) | ✅ (DSV je Stufe + Ein-Mip-SRV, Zustand wird wiederhergestellt) | ✅ (Grafik-PSO, beide Ebenen je Stufe `PIXEL_SHADER_RESOURCE`/`DEPTH_WRITE`, im Frame auf der Frame-Liste) | ✅ (Depth-only-Pass je Stufe, Ressourcen je Target gecacht) | ✅ (`Depth32Float`-Kette, Pass je Stufe, `[[depth(any)]]`) |
 | `vio_read_render_target` | ✅ | ✅ | ✅† | ✅ (nach `vio_end`, Face und Attachment) | ✅ |
 | `vio_texture_update` | ✅ | ✅ | ✅ | ✅ (Staging-Buffer + Transient-Command-Buffer, Level 0) | ✅ |
 | `depth_write` / `color_mask` / Blend-Modi | ✅ | ✅ | ✅ | ✅ | ✅ |
 | MRT (`'attachments' => [VIO_FORMAT_*…]`, bis 4) | ✅ | ✅† | ✅† | ✅ (Block 10b) | ✅ |
 | Blend/Write-Mask je Attachment (`attachment_blend`, `attachment_color_mask`) | ✅ (GL ≥ 4.0, indexed) | ✅ (IndependentBlend) | ✅ (IndependentBlend) | ✅ (`independentBlend`) | ✅ (per colorAttachment) |
 | uint16-Indices (automatisch, `vio_mesh_index_bytes`) | ✅ | ✅ (R16_UINT) | ✅ (R16_UINT) | ✅ (`VK_INDEX_TYPE_UINT16`) | ✅ (MTLIndexTypeUInt16) |
-| Shader-/Pipeline-Cache auf Platte (`vio_create(['shader_cache' => dir])`, `vio_shader_cache_stats`) | ✅ (GL ≥ 4.1 Program-Binary) | ✅ (DXBC je Stage) | ✅ (DXBC je Stage) | ✅ (`VkPipelineCache`) | — (Metal cacht selbst) |
+| Shader-/Pipeline-Cache auf Platte (`vio_create(['shader_cache' => dir])`, `vio_shader_cache_stats`) | ✅ (GL ≥ 4.1 Program-Binary) | ✅ (DXBC je Stage) | ✅ (DXBC je Stage) | ✅ (`VkPipelineCache`) | ✅ (`MTLBinaryArchive` je Gerät + OS, Treffer über `FailOnBinaryArchiveMiss`, A22) |
 | Indirect Draw (`vio_draw_indirect`, `vio_storage_buffer(['indirect' => true])`, `VIO_FEATURE_INDIRECT_DRAW`) | ✅ (GL ≥ 4.0 `glDraw*Indirect`) | ✅ (`Draw*InstancedIndirect`) | ✅ (`ExecuteIndirect`) | ✅ (`vkCmdDraw(Indexed)Indirect`, Multi-Draw wenn verfügbar) | ✅ (`indirectBuffer:`) |
 | Texture-Arrays + BC + KTX2 (`vio_texture(['layers', 'format' => VIO_FORMAT_BC*, 'mip_levels'])`, `vio_texture_ktx2`, `VIO_FEATURE_TEXTURE_ARRAY` / `_TEXTURE_COMPRESSION_BC`) | ✅ (`GL_TEXTURE_2D_ARRAY`, S3TC/RGTC/BPTC) | ✅ | ✅ | ✅ (2D-Array-Views, `textureCompressionBC`, Block 10c) | ✅ (`MTLTextureType2DArray`, BC-Formate) |
+| KTX2-Cubemaps / -3D (`vio_texture_ktx2` → `VioCubemap` bzw. 3D-`VioTexture`, unkomprimiert) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| ASTC (`VIO_FORMAT_ASTC_4x4/5x5/6x6/8x8`, `VIO_FEATURE_TEXTURE_COMPRESSION_ASTC`) | ✅ mit `GL_KHR_texture_compression_astc_ldr` | ❌ | ❌ | ✅ mit `textureCompressionASTC_LDR` | ✅ (Apple2+, nicht auf Intel-/AMD-Macs) |
+| Rate Maps (`vio_render_target(['rate_map' => ['x' => […], 'y' => […]]])`, `vio_render_target_size`, `VIO_FEATURE_RASTER_RATE_MAP`, A16) | — (volle Rate) | — (volle Rate) | — (volle Rate) | — (volle Rate) | ✅ (`MTLRasterizationRateMap`, physisch kleinere Attachments, Resolve beim Verlassen des Ziels) |
 | Variable Rate Shading (`vio_set_shading_rate`, `VIO_SHADING_RATE_*`, `VIO_FEATURE_SHADING_RATE`) | ❌ | ❌ | ✅ (`RSSetShadingRate`, Tier 1+; 4X4 nur mit Additional Rates) | ✅ (`VK_KHR_fragment_shading_rate`, Pipeline-Rate als Dynamic State, Block 10c) | ❌ |
 | VRS pro Primitiv (`gl_PrimitiveShadingRateEXT`, `VIO_FEATURE_SHADING_RATE_PRIMITIVE`) | ❌ (SPIRV-Cross: nur Vulkan-GLSL) | ❌ | ✅ (Tier 2 + SM 6.4 `SV_ShadingRate`, Combiner OVERRIDE für Pipelines, deren VS die Rate schreibt) | ✅ (`primitiveFragmentShadingRate`, Combiner REPLACE je Pipeline) | ❌ |
-| VRS-Bild (`vio_set_shading_rate_image`, `VIO_FEATURE_SHADING_RATE_IMAGE`) | ❌ | ❌ | ✅ (Tier 2: R8_UINT-Textur in `SHADING_RATE_SOURCE`, `RSSetShadingRateImage`, Combiner MAX; nach jedem Listen-Reset neu gesetzt) | ❌ (bräuchte `vkCreateRenderPass2` + Fragment-Shading-Rate-Attachment in jedem Pass; kein Treiber in CI/lokal) | ❌ (Rasterization Rate Maps sind ein anderes Modell) |
+| VRS-Bild (`vio_set_shading_rate_image`, `VIO_FEATURE_SHADING_RATE_IMAGE`) | ❌ | ❌ | ✅ (Tier 2: R8_UINT-Textur in `SHADING_RATE_SOURCE`, `RSSetShadingRateImage`, Combiner MAX; nach jedem Listen-Reset neu gesetzt) | ✅ (A18: R8_UINT-Bild als `VkRenderingFragmentShadingRateAttachmentInfoKHR` an jedem Pass der Anwendung, Kachel = `minFragmentShadingRateAttachmentTexelSize`, Combiner MAX; braucht `attachmentFragmentShadingRate` + nicht-triviale Combiner) | ❌ (Rasterization Rate Maps sind ein anderes Modell) |
 | Bindless-Texturtabelle (`vio_texture_index`, `texture2D vio_textures[]` + `sampler vio_sampler` in Set 1, `VIO_FEATURE_BINDLESS`) | ❌ (GL-GLSL hat keine getrennten Texturen; `ARB_bindless_texture` nicht gewired) | ❌ | ✅ (Resource Binding Tier 2+: Root-Parameter [15] unbegrenzter SRV-Bereich `t0, space1`, statischer Sampler `s1, space1`, 1024 reservierte Deskriptoren oben im shader-sichtbaren SRV-Heap; FXC 5.1 und DXC) | ✅ (`VK_EXT_descriptor_indexing`: globales Set 1, 1024 Sampled Images `PARTIALLY_BOUND` + `UPDATE_AFTER_BIND`, unveränderlicher Sampler) | ✅ (SPIRV-Cross-Argument-Buffer nur für Set 1, `device`-Adressraum, `gpuResourceID`s auf `[[buffer(21)]]`, `useResources` je Draw, `constexpr`-Sampler; Cap `bindless`: Metal3 + Tier 2 + MSL 3.0) |
 | Sampler Feedback (`vio_sampler_feedback_bind/read/clear`, HLSL-Fragment-Override, `VIO_FEATURE_SAMPLER_FEEDBACK`) | ❌ | ❌ | ✅ (SM 6.5 + `OPTIONS7.SamplerFeedbackTier ≥ 0.9` + `ID3D12Device8` + Bindless-Layout: MinMip-Map je Textur über `CreateCommittedResource2`, UAV-Table `u0, space2` als Root-Parameter [16] (PIXEL), Decode per `ResolveSubresourceRegion(DECODE_SAMPLER_FEEDBACK)` nach R8_UINT) | ❌ (Sparse Residency liefert Residenz, kein Zugriffs-Feedback) | ❌ (Sparse Textures: dto.) |
 | Ray Query (`vio_acceleration_structure`, `rayQueryEXT`, `VIO_FEATURE_RAY_QUERY`) | ❌ | ❌ | ✅ (DXR Tier 1.1 + SM 6.5 `RayQuery<>`; TLAS als Root-SRV `t0, space9` — Grafik-Root-Parameter [14], Compute-Parameter [3]; Bau synchron über `ID3D12GraphicsCommandList4`) | ✅ (`VK_KHR_acceleration_structure` + `VK_KHR_ray_query` + Abhängigkeiten als Extensions auf der 1.1-Instanz; Binding 33 im 3D-Set, Compute an der GLSL-Binding; Bau im Transient-Command-Buffer) | ✅ (`MTLPrimitive`/`MTLInstanceAccelerationStructureDescriptor`, `set*AccelerationStructure` + `useResource` der BLAS; MSL 2.4) |
-| Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model' / 'shader_model_version']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Profil = höchstes 6.x, das Device **und** DXC/dxil.dll können; SPIRV-Cross übersetzt auf dasselbe Profil; Fallback FXC 5.1) | — | — |
-| Subgroups (`GL_KHR_shader_subgroup_*` in Compute + Fragment, `VIO_FEATURE_SUBGROUP`) | ✅ (`GL_KHR_shader_subgroup`, Stages/Features per `glGetIntegerv`; braucht Compute) | ❌ | ✅ (nur mit SM 6 + `OPTIONS1.WaveOps`: Wave-Intrinsics) | ✅ (`VkPhysicalDeviceSubgroupProperties`: Compute + Fragment, basic/vote/ballot/arithmetic/shuffle) | ✅ (`simd_group`: MSL 2.2, Mac2/Apple7) |
-| Quad-Ops im Fragment-Shader (`GL_KHR_shader_subgroup_quad`, `VIO_FEATURE_SUBGROUP_QUAD`) | ✅ (`GL_SUBGROUP_FEATURE_QUAD_BIT_KHR` + Fragment-Stage) | ❌ | ✅ (SM 6 + `WaveOps`, `QuadReadAcross*`) | ✅ (`VK_SUBGROUP_FEATURE_QUAD_BIT`) | ✅ (`quad_group`: MSL 2.1, Mac2/Apple4) |
+| Raytracing-Pipeline (`vio_rt_pipeline`, `vio_rt_bind_buffer`, `vio_trace_rays`, `VIO_FEATURE_RAYTRACING`) | ❌ | ❌ | ✅ (DXR 1.0 State Object, SM ≥ 6.3 + Tier 1.0; `'hlsl'`-Bibliothek per DXC `lib_6_x` mit den Exports `vio_raygen`, `vio_miss`, `vio_closest_hit`, `vio_any_hit`; globale Root-Signatur: TLAS Root-SRV `t0`, Buffer Root-UAV `u0..u15`; Shader-Tabelle im Upload-Heap, `DispatchRays` auf eigener Liste + Readback-Kopie) | ✅ (`VK_KHR_ray_tracing_pipeline` auf dem Ray-Query-Satz; GLSL-Stages nativ als SPIR-V 1.4, Set 0 aus den Bindings der Stages (Acceleration Structures + Storage-Buffer), SBT in einem host-sichtbaren Buffer, `vkCmdTraceRaysKHR` im Transient-Command-Buffer) | ❌ (keine Raygen-/Hit-Stages; SPIRV-Cross übersetzt `traceRayEXT` nicht nach MSL) |
+| Shader Model 6 / DXC (`vio_create(['shader_model' => 6, 'dxc_dir' => …])`, `vio_swapchain_info()['shader_model' / 'shader_model_version']`) | — | — (FXC 5.0) | ✅ (DXIL via `dxcompiler.dll` + `dxil.dll`, Profil = höchstes 6.x, das Device **und** DXC/dxil.dll können, `shader_model => 62` bzw. `VIO_D3D12_SHADER_MODEL=62` legt ein niedrigeres fest (Test 170); SPIRV-Cross übersetzt auf dasselbe Profil; Fallback FXC 5.1) | — | — |
+| Subgroups (`GL_KHR_shader_subgroup_*` in Compute + Fragment, `VIO_FEATURE_SUBGROUP`) | ✅ (`GL_KHR_shader_subgroup` laut Treiber: Compute + Fragment, basic/vote/ballot/arithmetic/shuffle; SPIRV-Cross lehnt shuffle, min/max und Quad-Ops ohne Vulkan-Semantik ab, solche Shader gehen als GLSL-Text des Aufrufers an den Treiber) | ❌ | ✅ (nur mit SM 6 + `OPTIONS1.WaveOps`: Wave-Intrinsics) | ✅ (`VkPhysicalDeviceSubgroupProperties`: Compute + Fragment, basic/vote/ballot/arithmetic/shuffle) | ✅ (`simd_group`: MSL 2.2, Mac2/Apple7) |
+| Quad-Ops im Fragment-Shader (`GL_KHR_shader_subgroup_quad`, `VIO_FEATURE_SUBGROUP_QUAD`) | ✅ (Quad-Bit von `GL_KHR_shader_subgroup` im Fragment-Stage; Text-Fallback wie oben) | ❌ | ✅ (SM 6 + `WaveOps`, `QuadReadAcross*`) | ✅ (`VK_SUBGROUP_FEATURE_QUAD_BIT`) | ✅ (`quad_group`: MSL 2.1, Mac2/Apple4) |
 | Barycentrics (`gl_BaryCoordEXT`, `VIO_FEATURE_BARYCENTRICS`) | ✅ (`GL_EXT_fragment_shader_barycentric`) | ❌ | ✅ (SM 6.1 + `OPTIONS3.BarycentricsSupported`, `SV_Barycentrics`) | ✅ (`VK_KHR_fragment_shader_barycentric`, Feature im pNext-Chain) | ✅ (`barycentrics`: MSL 2.2) |
-| 64-Bit-Atomics auf Storage-Buffern (`GL_EXT_shader_atomic_int64`, `VIO_FEATURE_ATOMIC64`) | ✅ (Compute + `GL_ARB_gpu_shader_int64` + `GL_NV_shader_atomic_int64`) | ❌ | ✅ (SM 6.6 + `Int64ShaderOps`; vio benennt SPIRV-Cross' `.InterlockedX(` mit 64-Bit-Operand in `.InterlockedX64(` um — sonst kürzt DXC still auf 32 Bit) | ✅ (`shaderInt64` + `VK_KHR_shader_atomic_int64`) | ❌ (Metal nur min/max, SPIRV-Cross lehnt 64-Bit-Atomics für MSL ab) |
+| 64-Bit-Atomics auf Storage-Buffern (`GL_EXT_shader_atomic_int64`, `VIO_FEATURE_ATOMIC64`) | ❌ (SPIRV-Cross schreibt `GL_EXT_shader_atomic_int64`, das kein GL-Treiber kennt; NVIDIAs `GL_NV_shader_atomic_int64` hat für `uint64_t` kein `atomicAdd`/`atomicExchange`/`atomicCompSwap`, gemessen RTX 2080) | ❌ | ✅ (SM 6.6 + `Int64ShaderOps`; vio benennt SPIRV-Cross' `.InterlockedX(` mit 64-Bit-Operand in `.InterlockedX64(` um — sonst kürzt DXC still auf 32 Bit) | ✅ (`shaderInt64` + `VK_KHR_shader_atomic_int64`) | ❌ (Metal nur min/max, SPIRV-Cross lehnt 64-Bit-Atomics für MSL ab) |
 | 16-Bit-Floats (`float16_t`, `VIO_FEATURE_SHADER_FLOAT16`) | ✅ (`GL_AMD_gpu_shader_half_float` / `GL_NV_gpu_shader5`) | ❌ | ✅ (SM 6.2 + `Native16BitShaderOpsSupported`: SPIRV-Cross-Option 16-Bit-Typen → `half`, DXC `-enable-16bit-types`; vorher `min16float`) | ✅ (`VK_KHR_shader_float16_int8` `shaderFloat16`) | ✅ (`half`) |
-| Draw-Parameter (`gl_BaseVertex`/`gl_BaseInstance`, `VIO_FEATURE_BASE_VERTEX`) | ✅ (4.6 / `ARB_shader_draw_parameters` + Base Instance 4.2) | ❌ | ✅ (SM 6.8 `SV_StartVertexLocation`/`SV_StartInstanceLocation`; darunter bräuchte SPIRV-Cross einen cbuffer, den indirekte Draws nicht füllen können) | ✅ (`shaderDrawParameters` + `drawIndirectFirstInstance`, letzteres war vorher nie aktiviert) | ✅ (`[[base_vertex]]`/`[[base_instance]]`, Mac2/Apple3; nicht in emulierten GS/Tess-Pipelines) |
+| Draw-Parameter (`gl_BaseVertex`/`gl_BaseInstance`, `VIO_FEATURE_BASE_VERTEX`) | ✅ (4.6 / `ARB_shader_draw_parameters` + Base Instance 4.2) | ❌ | ✅ (SM 6.8 `SV_StartVertexLocation`/`SV_StartInstanceLocation`; darunter – auch FXC 5.1 – zwei Root-Konstanten an `b13` (`cbuffer SPIRV_Cross_VertexInfo`): direkte Draws 0, indirekte Draws kopieren je Datensatz Basiswerte + Argumente in einen Frame-Ring, Command-Signatur mit `CONSTANT`-Argument; Test 181) | ✅ (`shaderDrawParameters` + `drawIndirectFirstInstance`, letzteres war vorher nie aktiviert) | ✅ (`[[base_vertex]]`/`[[base_instance]]`, Mac2/Apple3; nicht in emulierten GS/Tess-Pipelines) |
 | Compute-Derivate (`derivative_group_quadsNV`, `VIO_FEATURE_COMPUTE_DERIVATIVES`) | ✅ (`GL_NV_compute_shader_derivatives`; SPIRV-Cross verliert den Ausführungsmodus, `vio_spirv_to_glsl_compute` setzt Extension + Layout wieder ein) | ❌ | ✅ (SM 6.6) | ✅ (`VK_NV`/`VK_KHR_compute_shader_derivatives`) | ❌ (Kernel ohne Derivate) |
-| Multiview (`vio_shader(['view_count' => 2..4])`, `gl_ViewIndex`, `VIO_FEATURE_MULTIVIEW`) | ✅ (`GL_OVR_multiview2`: SPIRV-Cross `num_views`, Attachments je Draw per `glFramebufferTextureMultiviewOVR`, View-Zahl je Programm) | ❌ | ✅ (SM 6.1 + `ViewInstancingTier`: PSO über Pipeline-State-Stream mit `VIEW_INSTANCING`, `SetViewInstanceMask` vor jedem Draw) | ✅ (Render-Pass mit `viewMask` je RT lazily, `vk3d_prepare` schaltet zwischen Multiview- und Layered-Pass um) | ✅ (SPIRV-Cross-Instancing-Emulation: Instanzen × N, Instanz-Attribute `stepRate` N, `spvViewMask` auf Buffer 23, indirekte Draws über die CPU; Mac2/Apple5) |
+| Multiview (`vio_shader(['view_count' => 2..4])`, `gl_ViewIndex`, `VIO_FEATURE_MULTIVIEW`) | ✅ (`GL_OVR_multiview2`: SPIRV-Cross `num_views`, Attachments je Draw per `glFramebufferTextureMultiviewOVR`, View-Zahl je Programm; ohne OVR per Instancing mit `GL_ARB_shader_viewport_layer_array`, s. D3D11) | ✅ emuliert (Instancing: `vio_shader` baut das GLSL um – Views × Instanzen, `gl_ViewIndex = gl_InstanceIndex % N`, `gl_Layer` aus der Vertex-Stage, View als flaches Varying an Location 31 –, Step-Rate N für Instanzdaten, indirekte Datensätze werden zurückgelesen; braucht `D3D11_OPTIONS3`-Vertex-Layer; Tests 158 / 182) | ✅ (SM 6.1 + `ViewInstancingTier`: PSO über Pipeline-State-Stream mit `VIEW_INSTANCING`, `SetViewInstanceMask` vor jedem Draw) | ✅ (Render-Pass mit `viewMask` je RT lazily, `vk3d_prepare` schaltet zwischen Multiview- und Layered-Pass um) | ✅ (SPIRV-Cross-Instancing-Emulation: Instanzen × N, Instanz-Attribute `stepRate` N, `spvViewMask` auf Buffer 23, indirekte Draws über die CPU; Mac2/Apple5) |
 | Mesh-/Task-Shader (`vio_shader(['mesh', 'task'])`, `vio_draw_mesh_tasks(_indirect)`, `VIO_FEATURE_MESH_SHADER`) | ❌ (`GL_NV_mesh_shader` nicht über SPIRV-Cross) | ❌ | ✅ (SM 6.5 + `OPTIONS7.MeshShaderTier`: AS/MS-PSO über den Pipeline-State-Stream, Root-Signatur-Variante mit MESH-/AMPLIFICATION-Sichtbarkeit, `DispatchMesh`, `ExecuteIndirect` `DISPATCH_MESH`) | ✅ (`VK_EXT_mesh_shader` + `VK_KHR_spirv_1_4`, Pipeline ohne Vertex-Input, `vkCmdDrawMeshTasks(Indirect)EXT`) | ✅ (`MTLMeshRenderPipelineDescriptor`, `drawMeshThreadgroups`; Metal 3 + Apple7/Mac2, MSL ≥ 3.0) |
+| Kooperative Matrizen (`GL_KHR_cooperative_matrix` im Compute-Kernel, `vio_cooperative_matrix_shapes`, `VIO_FEATURE_COOPERATIVE_MATRIX`) | ❌ | ❌ | ❌ (SPIRV-Cross übersetzt `coopmat` nicht nach HLSL; das D3D-Gegenstück ist die SM-6.10-Linearalgebra, `SPIRV-CROSS-HLSL-COOPMAT-PLAN.md`) | ✅ (`VK_KHR_cooperative_matrix` + `VK_KHR_vulkan_memory_model`, float16 mit `shaderFloat16` + `storageBuffer16BitAccess`; Formen aus `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`, nur Subgroup-Scope mit float16/float32) | ✅ (SPIRV-Cross → `simdgroup_matrix` 8×8, MSL ≥ 3.1, Apple7+; Cap `cooperative_matrix`) |
+| Long Vectors (`vector<T, N>` 5 ≤ N ≤ 1024, GLSL `GL_EXT_long_vector`, `VIO_FEATURE_LONG_VECTOR`) | ❌ | ❌ | ✅ (SM 6.9; nur über den HLSL-Compute-Override `vio_compute_pipeline(['hlsl' => …])` – SPIRV-Cross schreibt `float8` und 8-Buchstaben-Swizzles) | ✅ (`VK_EXT_shader_long_vector`, Kernel unverändert) | ❌ (max. 4 Komponenten) |
+| Shader Execution Reordering (`hitObjectEXT`/`reorderThreadEXT`, `VIO_FEATURE_SHADER_EXECUTION_REORDER`) | ❌ | ❌ | ✅ (DXR 1.2: `RaytracingTier ≥ 1_2` + SM 6.9; RT-Bibliotheken `lib_6_9`, HLSL-Stages mit `dx::HitObject` / `dx::MaybeReorderThread` – SPIRV-Cross übersetzt SER nicht) | ✅ (`VK_EXT_ray_tracing_invocation_reorder`, GLSL `GL_EXT_shader_invocation_reorder`) | ❌ |
+| Opacity Micromaps (`vio_acceleration_structure` `'opacity_micromap' => ['subdivision', 'format' => 2\|4, 'states']`, `VIO_FEATURE_OPACITY_MICROMAP`) | ❌ | ❌ | ✅ (DXR 1.2: OMM-Array je Mesh, `OMM_TRIANGLES`-Geometrie, Instanzen ohne `FORCE_OPAQUE`, `RAYTRACING_PIPELINE_CONFIG1` mit `ALLOW_OPACITY_MICROMAPS`; jedes `RayQuery<>` bekommt `RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS` (`d3d12_hlsl_post`)) | ✅ (`VK_EXT_opacity_micromap`: `vkCmdBuildMicromapsEXT`, Sync2-Barriere vor dem BLAS-Bau, Micromap im pNext der Dreiecke, Pipeline-Flag `…_OPACITY_MICROMAP_BIT_EXT`) | ❌ |
+| HLSL-Override für Compute (`vio_compute_pipeline(['hlsl' => src])`, Gegenstück zu `'msl'`) | — (GLSL) | ✅ | ✅ (DXC-Profil des Kontexts, z. B. `cs_6_9`) | — (GLSL) | — (GLSL) |
+| Work Graphs (`vio_work_graph`, `vio_dispatch_graph`, nur HLSL `lib_6_8`, `VIO_FEATURE_WORK_GRAPHS`) | ❌ | ❌ | ✅ (SM 6.8 + `OPTIONS21.WorkGraphsTier` ≥ 1.0, meist nur mit Agility SDK: State Object `EXECUTABLE` mit DXIL-Library + globaler Root-Signatur aus 8 Root-UAVs + `WORK_GRAPH`-Subobjekt, Backing Memory aus `GetWorkGraphMemoryRequirements`, `SetProgram` + `DispatchGraph` mit CPU-Records) | ❌ (`VK_AMDX_shader_enqueue` nicht angebunden) | ❌ |
 | HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | ✅ (10-Bit-Surface-Format + `VK_EXT_swapchain_colorspace` HDR10 ST 2084, Block 10d) | ✅ (`CAMetalLayer` RGB10A2 im BT.2100-PQ-Farbraum, `hdr_output => 1` nur auf EDR-Displays) |
+| Aufgezeichnete Draw-Folgen (`vio_bundle`, `vio_draw_bundle`, `vio_bundle_info()['method']`; BUNDLE-PLAN, A38) | ✅ Abspielen (C-Schleife über den Draw-Kern) | ✅ (Deferred Context → `ID3D11CommandList`, `ExecuteCommandList` mit Zustands-Restore) | ✅ (Bundle-Command-List: Root-CBVs in einem bundle-eigenen Upload-Puffer, SRV-Tabellen in einem eigenen Bereich des Heaps, Sampler-Tabellen aus einer Reserve oben im Sampler-Heap) | ✅ (Secondary Command Buffer, eigener Upload-Ring und Descriptor-Pools, Pass-Instanz mit `SECONDARY_COMMAND_BUFFERS`) | ✅ Abspielen |
+| Upscaling (`vio_upscale`, `vio_upscale_jitter`, `vio_upscale_info`; UPSCALE-PLAN, A21) | ✅ portabel | ✅ portabel | ✅ portabel | ✅ portabel | ✅ MetalFX spatial (macOS 13+, in ein RT; sonst portabel) |
+| Video-Encoding (`vio_recorder(['encoder' => …])`, `vio_recorder_info`; VIDEO-ENCODE-PLAN, A39) | ✅ HW-Encoder, Readback | ✅ HW-Encoder **ohne CPU-Kopie** (D3D11VA-Pool um vios Gerät, BGRA-Kopierpass) | ✅ HW-Encoder, Readback | ✅ HW-Encoder, Readback | ✅ VideoToolbox, Readback |
 | Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | ✅ (Dispatch-Semaphore über die Frames in Flight, 1..3) |
-| GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`) |
+| GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) und je benanntem Abschnitt (`vio_gpu_timestamp` / `vio_gpu_timings`, bis 32 Marken) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`; eine Marke schließt den Command-Buffer des Abschnitts und setzt auf einem neuen mit Load fort) |
 | Stencil (`'stencil' => [...]`, `VIO_FEATURE_STENCIL`) | ✅ (DEPTH24_STENCIL8) | ✅ (D24S8) | ✅ (D24S8, `OMSetStencilRef`) | ✅ (D32S8 / D24S8) | ✅ (`Depth32Float_Stencil8` auf Swapchain und allen RTs, auch depth_only/Cube/Array; Test 147) |
 | Geometry-Stage (`vio_shader(['geometry' => …])`, `VIO_FEATURE_GEOMETRY`) | ✅ (GL ≥ 3.2) | ✅‡ | ✅‡ | ✅ (`geometryShader`) | ✅ (Compute-Emulation, `METAL-GEOMETRY-PLAN.md`) |
 | Tessellation (`tess_control` + `tess_eval`, `VIO_PATCHES`, `VIO_FEATURE_TESSELLATION`) | ✅ (GL ≥ 4.0) | ✅‡ (GLSL über vios Hull/Domain-Generator `vio_tess_hlsl.c`, oder HLSL-Override) | ✅‡ (dto., auch DXIL / SM 6) | ✅ (`tessellationShader`, Domain-Ursprung unten links) | ✅ (VS/TCS als Compute-Kernel + `drawPatches`; Isolines/`point_mode` emuliert, Test 148) |
@@ -256,30 +350,55 @@ fügen es hinzu). Bis dahin baut vio Hull- und Domain-Shader selbst (`vio_tess_h
 jedem SPIRV-Cross 1. Der HLSL-Stage-Override (`'hlsl' => [...]`, Test 140) bleibt und hat Vorrang. Die SPIRV-Cross-Libs in `C:\php-sdk\vio-build-deps` (SDK
 1.4.341) können Geometry, die Windows-CI nutzt dasselbe SDK (seit v2.30; mit 1.3.296 waren `GEOMETRY` = 0 und GS-Tests auf D3D übersprungen, auch in den Release-DLLs).
 
-† D3D11/D3D12: implementiert, aber ohne Windows-Build hier nur blind editiert — Windows-CI
-(WARP) ist der Beleg (`tests/render3d/096`, `097`). Die frueher dort beobachtete "veraltete
+† D3D11/D3D12: ursprünglich ohne Windows-Build blind editiert; v2.30.0 ist lokal auf Windows
+gebaut und mit der vollen Suite geprüft (0 FAIL; jeder `*_all_backends`-Test meldet auf
+opengl/d3d11/d3d12/vulkan `OK`; headless-D3D läuft dabei wie in der CI auf WARP). Die frueher dort beobachtete "veraltete
 Textur nach GPU-Schreibzugriff" auf D3D12 war KEIN Barrier-Problem, sondern die Pending-Bind-
 Tabelle ohne Referenz (Test 111): `vio_render_target_texture()` liefert ein Temporary, dessen
 Speicher die naechste VioTexture wiederverwendete. Seit dem Fix laufen die D3D12-Pixel-Checks
 in 096/097 wieder mit.
 
-MSAA-Render-Targets (`'samples' => N`) resolven auf jedem Backend; Depth-only-, Cube-, Array- und
-(auf GL/D3D11) MRT-Targets bleiben single-sampled.
+MSAA-Render-Targets (`'samples' => N`) resolven auf jedem Backend, auch MRT (jedes Attachment), Cube- und
+Array-Targets (Multisample-Array, eine Schicht je Face; Resolve beim Verlassen der Face, Mip-Stufen > 0 rendern
+single-sampled) und Depth-only-Targets (Resolve mit `'depth_reduction'` MAX/MIN in die gesampelte Tiefe;
+OPEN-ITEMS-PLAN A24, Tests 194–196). Single-sampled bleiben Depth-Targets mit Mip-Kette und Depth-only-Cubes/-Arrays.
 
 Vulkan-3D (GAP-PHASE5 Block 10, `src/backends/vulkan/vio_vulkan_3d*.c`): Shader gehen GLSL →
 SPIR-V → Vulkan-GLSL (SPIRV-Cross, Bindings umgelegt: Set 0, 0/1 = Default-Uniform-Block VS/FS
 als `UNIFORM_BUFFER_DYNAMIC` im Frame-Upload-Ring, 2–17 = Sampler im D3D12-Register-Schema,
 18–25 = Storage-Buffer) → SPIR-V; der Vertex-Stage wird `y = -y; z = (z + w) / 2` angehängt,
 Varyings bekommen Locations über den Namen. Damit gilt die D3D-Konvention: NDC +Y = RT-Zeile 0,
-Tiefe 0..1, `frontFace` CCW (Test `123`). Pipelines sind Varianten je Render-Pass-Signatur und
-Vertex-Stride; Freigaben mitten im Frame parken bis zum Fence des Slots. Headless-Kontexte
-kopieren jedes präsentierte Bild in einen Host-Buffer (`vio_read_pixels` auch mitten im Frame).
+Tiefe 0..1, `frontFace` CCW (Test `123`). Pipelines sind Varianten je Attachment-Signatur (Formate,
+Samples, Tiefe, View-Maske) und Vertex-Stride; Freigaben mitten im Frame parken bis zum Timeline-Wert
+des Slots. Headless-Kontexte kopieren jedes präsentierte Bild in einen Host-Buffer (`vio_read_pixels`
+auch mitten im Frame).
+**Vulkan-Kern (VULKAN-MODERN-PLAN, A37)**: Vulkan 1.3 oder 1.2 mit `VK_KHR_dynamic_rendering` +
+`VK_KHR_synchronization2` (Timeline-Semaphoren sind 1.2-Kern) ist Pflicht; ein Gerät ohne wird nicht
+gewählt. Jede Übergabe läuft über `vio_vk_submit` (`vkQueueSubmit2`) und signalisiert den nächsten Wert
+einer Timeline-Semaphore, Warten heißt `vio_vk_wait_value` – binäre Semaphoren nur noch für
+Acquire/Present. Barrieren sind `vkCmdPipelineBarrier2`; Layout-Übergänge (`vio_vk_image_barrier*`)
+leiten Stages/Accesses aus den Layouts ab. Passes sind Dynamic Rendering: `vio_vk_pass` beschreibt die
+Attachments (View, Bild, Bereich, Ruhe-Layout, Resolve-Ziel), `vio_vk_pass_begin`/`_end` erledigen die
+Übergänge, die früher Initial-/Final-Layouts der Render-Passes taten; ein Resume ist derselbe Pass mit
+LOAD. Es gibt keine Render-Pass- oder Framebuffer-Objekte mehr. `vio_read_render_target` geht auch im
+Frame (Frame bis dahin übergeben, warten, Pass mit LOAD fortsetzen).
+**Bundles (BUNDLE-PLAN, A38)**: `vio_draw_bundle` lässt die Records einmal durch den gemeinsamen
+Draw-Kern laufen, während das Backend aufzeichnet (Vtable `begin_bundle`/`end_bundle`), und spielt danach
+nur noch die Aufnahme ab. Aufgenommen wird je Attachment-Signatur (Vulkan: Formate/Samples/Tiefe/
+View-Maske/Größe, D3D11: RTVs/DSV/Viewports/Scissor, D3D12: PSO-Variante); eine andere Signatur nimmt neu
+auf. Während der Aufnahme sind Command-Buffer/-List, Uniform-Ring und Descriptor-Allokatoren
+bundle-eigen. Nach einem nativen Bundle bleibt die vorher gebundene Pipeline gebunden, nach dem
+Abspielen die des letzten Records – der Vertrag: vor dem nächsten Draw neu binden. Was eine Aufnahme nicht
+tragen kann (Vulkan: Shading-Rate-Bild, andere View-Zahl; D3D12: Multiview, `SV_ShadingRate`, Sampler-
+Feedback, Shading-Rate-Bild; übergelaufene Puffer), läuft über das Abspielen – ein Überlauf vergrößert
+die nächste Aufnahme. 2000 Draws (RTX 2080, CPU je Frame): D3D12 3,9 → 0,75 ms, Vulkan 5,4 → 1,3 ms,
+D3D11 1,7 → 1,6 ms (`examples/bench_open_items.php`).
 Render-Targets (Block 10b, `vio_vulkan_rt.c`): bis 4 Attachments in jedem `VIO_FORMAT_*` (RGBA8 =
-B8G8R8A8, damit der 2D-Batch passt), MSAA mit Resolve-Attachments im Pass, Cube-Targets mit einem
-Framebuffer je (Face, Level), Level > 0 ohne Tiefe. Cubemaps und Mip-Ketten (`'mipmaps' => true`,
+B8G8R8A8, damit der 2D-Batch passt), MSAA mit Resolve-Attachments im Pass, Cube-Targets mit einer
+View je (Face, Level), Level > 0 ohne Tiefe. Cubemaps und Mip-Ketten (`'mipmaps' => true`,
 `vio_generate_mipmaps`) laufen über `vkCmdBlitImage` (`vio_vulkan_cube.c`). `vio_clear` im Frame
 löscht die Attachments des offenen Passes (`vkCmdClearAttachments`, wie D3D12). Ein Bind
-behält den Inhalt (`loadOp LOAD` für Farbe und Tiefe, Bilder beim Anlegen initialisiert) wie auf
+behält den Inhalt (LOAD für Farbe und Tiefe, Bilder beim Anlegen initialisiert) wie auf
 GL/D3D – vorher löschte jeder Bind mit der zuletzt gesetzten Clear-Farbe (Test 142). Freigaben mitten im
 Frame parken auch hier bis zum Fence. Compute: das Descriptor-Set-Layout kommt aus der Reflection des Kernels
 (Storage-Buffer, Storage-Images, Params-UBO), jeder Dispatch bekommt ein eigenes Set aus Per-Frame-Pools und
@@ -344,9 +463,15 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   dieselben Domain-Koordinaten und Faktor-Kanten wie GL, nur die Winding ist umgekehrt → `outputtopology`
   wird gedreht, `gl_TessCoord` nie gespiegelt (auf WARP gemessen, Test 144). Das Shader-Objekt behält
   beide SPIR-V-Module: weicht `patch_vertices` von `layout(vertices = N)` ab, baut `vio_pipeline` eine
-  HS-Variante (D3D11 eigenes `ID3D11HullShader`, D3D12 `hs_variant`-Blob der PSO). Grenzen (Warnung,
-  Override als Ausweg): Interface-Blöcke, Matrix-/Struct-Varyings, `gl_ClipDistance`, Lesen fremder
-  Kontrollpunkte in der Kontrollpunkt-Phase. `VIO_DUMP_TESS_SPV=<prefix>` schreibt das umgebaute SPIR-V.
+  HS-Variante (D3D11 eigenes `ID3D11HullShader`, D3D12 `hs_variant`-Blob der PSO). Varyings sind Feldlisten
+  (OPEN-ITEMS-PLAN A29, Test 198): ein Interface-Block oder Struct-Varying ergibt ein Feld je Member (an seiner
+  Location, sonst hinter dem vorigen), Matrizen belegen eine Location je Spalte (`floatCxR` wie SPIRV-Cross),
+  Patch-Blöcke landen als `PATCH<loc>` im Patch-Struct. `gl_ClipDistance` läuft, wenn die Stages es benutzen,
+  als gepackte Vektoren (`SV_ClipDistance<n>` vom VS, `VIO_CLIP<n>` zwischen HS und DS) durch `gl_out`/`gl_in`.
+  Eine TCS mit `barrier()` rechnet in jeder Kontrollpunkt-Funktion alle Invocations einmal je Barrier-Phase und
+  behält dann die eigene – Lesen fremder Kontrollpunkte sieht deren Schreibzugriffe. Grenzen (Fehler, Override
+  als Ausweg): Arrays von Blöcken, verschachtelte Structs, ein Struct-Typ, der in der TES Ein- und Ausgang
+  typisiert. `VIO_DUMP_TESS_SPV=<prefix>` schreibt das umgebaute SPIR-V.
 - **Tiefe im GS (D3D)**: SPIRV-Cross setzt den GL→D3D-Depth-Fixup ans Ende des GS-Einstiegs, hinter
   jedes `Append` — wirkungslos. `vio_spirv_to_hlsl_ex` rechnet deshalb jede ausgegebene Kopie
   (`stage_output.gl_Position`) selbst um (Test 109: Punkt bei z = −0.5).
@@ -357,8 +482,13 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   das Varying (SPIRV-Cross-Limitierung, s. ‡). Test 109 zeigt das Muster.
 - **Texturen in Extra-Stages**: Sampler, die nur eine Extra-Stage deklariert, hängen sich hinter
   die Fragment-Sampler an die GL-Unit-Map (`vio_shader_merge_stage_samplers`, Reihenfolge GS,
-  TCS, TES; Vulkan spiegelt das in `fs_sampler_binding`). Sampler in allen Stages in derselben
-  Reihenfolge deklarieren.
+  TCS, TES, dann Mesh und Task; Vulkan spiegelt das in `fs_sampler_binding`). Die Register vergibt ein
+  shaderweiter **Sampler-Plan nach Namen** (`vio_sampler_plan_build` in `vio_shader_reflect.c`, OPEN-ITEMS-PLAN
+  A30): Fragment-Sampler behalten ihre Register (regulär 0.., Depth 8.., getrennte Texturen dahinter), jeder
+  weitere Name bekommt das niedrigste freie Register seiner Art; `vio_spirv_to_hlsl` (SM 5.0: Plan-Index) und
+  der Vulkan-Stage-Umbau lesen ihn, solange `php_vio.c` ihn um `compile_shader`/`create_pipeline` aktiviert.
+  Vorher zählte jede Stage selbst – in SPIR-V-Id-Reihenfolge, also der Reihenfolge der *ersten Benutzung* –,
+  und eine Stage, die ihre Sampler anders benutzte, las die Textur eines anderen Samplers (Test 197).
 - **Alle Draw-Pfade** (`vio_draw`, `vio_draw_instanced`, `vio_submit_batch`, `vio_draw_indirect`,
   `vio_draw_instanced_from_buffer`) pushen die Extra-Stage-Constants über
   `vio_push_extra_stage_constants` (Test 135).
@@ -403,8 +533,9 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   erhalten. Der 2D-Batch hat denselben Varianten-Cache (Format × Samples).
 - **MSAA-RTs** (`'samples' => 2|4|8`, auf unterstützte Werte geclamped): 2DMultisample-
   Paar für Farbe+Depth, `StoreAndMultisampleResolve` in die Single-Sample-Textur, die
-  Wrapper/2D-Registry/Readback sehen. Depth-only-RTs bleiben single-sampled (Depth wird
-  gesampelt). `vio_create_render_target` reicht `samples` ebenfalls durch.
+  Wrapper/2D-Registry/Readback sehen. Depth-only-RTs resolven per `depthResolveFilter` (Max/Min) in eine
+  sampelbare Tiefe, Cube-/Array-Targets über ein 2DMultisampleArray mit `resolveSlice`.
+  `vio_create_render_target` reicht `samples` ebenfalls durch.
 - **`vio_clear` ist eager** wie auf D3D11: im Frame wird der Pass mit Clear-Actions neu
   geöffnet (Swapchain oder gebundenes RT); vor `vio_begin` wird die Farbe gelatcht.
 - **Texturen werden erst beim Draw gebunden** (gilt für alle Typed-Register-Backends:
@@ -412,7 +543,9 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   nur das Objekt (`ctx->pending_tex_*`, pro Frame geleert); `vio_flush_pending_textures()`
   löst die Unit beim Draw über die Sampler-Map des *dann* gebundenen Shaders in den
   `[[texture(n)]]`- bzw. `t#`-Index auf. Damit sind — wie auf OpenGL — „bind vor
-  `vio_set_uniform('u_tex', unit)`" und „bind unter anderer Pipeline" korrekt (Test 095). Ein GL-Unit darf dabei nur **einen** Sampler
+  `vio_set_uniform('u_tex', unit)`" und „bind unter anderer Pipeline" korrekt (Test 095). Units, die der Shader nicht
+  sampelt, bleiben auf Metal ungebunden: Buffer und Texturen teilen sich den umnummerierten Index-Raum, die rohe
+  Unit-Nummer traf sonst einen echten `[[texture(n)]]` (095 „stray-units"; `vio_upscale` las so die vorige History). Ein GL-Unit darf dabei nur **einen** Sampler
   tragen; PHPolygon nutzt 0 Albedo, 1 SSAO, 2 SDF-AO, 3–5 Probe-3D, 6/8/9 CSM,
   7 Legacy-Shadow, 10 Environment-Cube.
 - **Render-Target-Orientierung**: ein RT, das mit GL-UVs gesampelt wird, ist auf Metal
@@ -482,7 +615,7 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   Command-Buffer jedes Frames beim Abschluss signalisiert; `vio_swapchain_info()` meldet beides.
 - Tests: `tests/backends/089_metal_3d_pipeline.phpt` (Pixel-Kontrakt), `088` läuft jetzt auch auf Metal.
 
-### Zend-Objekte (14 Klassen)
+### Zend-Objekte (15 Klassen)
 
 | Klasse | Header | Zweck |
 |--------|--------|-------|
@@ -495,7 +628,9 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
 | VioRenderTarget | src/vio_render_target.h | Offscreen-Target (Color/HDR/Depth-only/MSAA) |
 | VioCubemap | src/vio_cubemap.h | 6-Face-Cubemap |
 | VioComputePipeline | src/vio_compute_pipeline.h | Compute-Shader + gebundene Storage-Buffer/Params |
-| VioAccelerationStructure | src/vio_acceleration_structure.h | Ray Query: BLAS je Mesh + TLAS über die Instanzen (`vio_acceleration_structure`) |
+| VioAccelerationStructure | src/vio_acceleration_structure.h | Ray Query: BLAS je Mesh + TLAS über die Instanzen (`vio_acceleration_structure`); hält seine Meshes, `vio_acceleration_structure_update` refittet / baut neu (A14) |
+| VioRtPipeline | src/vio_rt_pipeline.h | Raytracing-Pipeline: Raygen/Miss/Hit-Gruppe + Shader-Tabelle, gebundene Storage-Buffer (`vio_rt_pipeline`) |
+| VioWorkGraph | src/vio_work_graph.h | Work Graph (D3D12, SM 6.8): State Object + Backing Memory, gebundene Storage-Buffer (`vio_work_graph`) |
 | VioFont | src/vio_font.h | TTF-Font (stb_truetype Atlas, glyph-index-keyed mit HarfBuzz) |
 | VioSound | src/vio_audio.h | Audio-Quelle (miniaudio) |
 | VioRecorder | src/vio_recorder.h | Video-Encoder (FFmpeg) |
@@ -509,7 +644,7 @@ Alle folgen dem gleichen Muster: `zend_object std` als letztes Feld, `Z_VIO_*_P(
 php_vio.c                   # Alle PHP-Funktionen (~9000 Zeilen, monolithisch)
 php_vio.h                   # Module-Globals (default_backend, debug, vsync)
 php_vio_arginfo.h           # Arginfo + Funktionstabelle (generiert aus vio.stub.php)
-vio.stub.php                # PHP-Stubs für IDE-Support (145 Funktionen)
+vio.stub.php                # PHP-Stubs für IDE-Support (202 Funktionen)
 config.m4 / config.w32      # Autotools- bzw. Windows-Build-Konfiguration
 configure.ac                # PHP-freier Autotools-Einstieg (CI-Permutationen)
 CMakeLists.txt              # IDE-Support (CLion/PhpStorm), kein Release-Build
@@ -527,7 +662,10 @@ src/
   vio_backend_registry.c    # Backend-Registry + Auto-Auswahl
   vio_backend_null.c        # No-Op Backend für Tests
   vio_resource.c            # Resource-Lifecycle
-  vio_window.c              # GLFW Fenster-Management (GL-Ladder 4.6→3.0, Fullscreen, Monitore)
+  vio_platform_registry.c   # Plattform-Registry (VIO_PLATFORM env, sonst win32 > cocoa > x11 > glfw > null)
+  vio_window.h              # Inline-Wrapper über vio_plat() (Fenster, Größen, GL-Kontext)
+  platform/glfw/            # GLFW-Plattform (GL-Ladder 4.6→3.0, Fullscreen, Monitore, Input-Callbacks)
+  platform/null/            # Null-Plattform (keine Fenster, nur headless/offscreen)
   vio_input.c               # Input-State + Callbacks (Keys, Mouse, Touch, Chars/IME)
   vio_mesh.c / vio_shader.c / vio_pipeline.c / vio_texture.c / vio_buffer.c
   vio_render_target.c       # Render-Target-Objekt + Stack
@@ -577,7 +715,9 @@ vendor/
 
 | Lib | Zweck | config.m4 Flag |
 |-----|-------|----------------|
-| GLFW 3.4 | Windowing, Input, Gamepad | --with-glfw |
+| GLFW 3.4 | Windowing, Input, Gamepad (optional: die Win32-, X11-, Wayland- und Cocoa-Plattform ersetzen es) | --with-glfw |
+| Xlib + XRandR | X11-Plattform (Linux; libGL zur Laufzeit) | --with-x11 |
+| wayland-client/-cursor, xkbcommon, wayland-scanner/-protocols | Wayland-Plattform (Linux; libEGL zur Laufzeit) | --with-wayland |
 | glslang | GLSL→SPIR-V Kompilierung | --with-glslang |
 | SPIRV-Cross | Shader-Reflection + Transpilation | --with-spirv-cross |
 | Vulkan Loader | Vulkan API | --with-vulkan |
@@ -591,7 +731,7 @@ Vendored (kein Homebrew): GLAD, stb_image/truetype/write/rect_pack, VMA,
 miniaudio, **SheenBidi** (BiDi, Apache-2.0, `vendor/sheenbidi/`, UNITY-Build via
 `-DSB_CONFIG_UNITY`).
 
-## PHP API (145 Funktionen)
+## PHP API (202 Funktionen)
 
 Vollständige Signaturen in `vio.stub.php`. Die Beispiele hier zeigen die Gruppen.
 
@@ -614,7 +754,34 @@ vio_close($ctx); vio_destroy($ctx);
 | `debug` | 0 | Validation Layers / Debug Output (D3D Debug Layer, Vulkan Validation, Metal API-Validation + Command-Buffer-Fault-Log) |
 | `headless` | 0 | Offscreen, kein sichtbares Fenster |
 | `frame_count` | 2 (**nur D3D12**) | In-Flight-Frames, siehe unten |
+| `headless_hardware` | false (**D3D11/D3D12**) | Headless-Kontext auf der GPU statt WARP (wie `VIO_D3D_HEADLESS_HARDWARE=1`, je Kontext) |
+| `prefer` / `require` | — (**nur `auto`**) | Backend-Ranking statt fester Prioritätsliste, siehe „Backend-Dispatch“ |
+| `benchmark` / `benchmark_cache` / `benchmark_frames` | false / Shader-Cache-Verzeichnis / 120 (**nur `auto`**) | Kalibrierlauf unter den drei besten Kandidaten, Ergebnis gecacht |
+| `agility_sdk` / `agility_sdk_version` | — (**nur D3D12**) | Agility SDK statt System-Runtime, siehe unten |
 | `msl_version` | 0 = Maximum (bzw. `VIO_METAL_MSL_VERSION`) | **nur Metal**: MSL-Stufe festnageln (`21` = MSL 2.1), siehe „Metal-Feature-Ladder" |
+
+##### `agility_sdk` — D3D12 Agility SDK
+
+Eine Anwendung aktiviert das Agility SDK, indem ihre `.exe` `D3D12SDKVersion`/`D3D12SDKPath`
+exportiert — eine PHP-Extension kann das nicht. vio holt das Device deshalb aus einer Device-Factory
+der SDK-Runtime: `D3D12GetInterface(CLSID_D3D12SDKConfiguration)` → `ID3D12SDKConfiguration1::
+CreateDeviceFactory(version, pfad)` → `ID3D12DeviceFactory::CreateDevice` (der Debug-Layer kommt dann
+aus derselben Factory). `'agility_sdk' => 'D3D12'` nennt das Verzeichnis mit `D3D12Core.dll`
+(+ `d3d12SDKLayers.dll` für `debug`) relativ zum Verzeichnis von `php.exe` oder absolut;
+`'agility_sdk_version'` ist die Version, die die DLL exportiert (ohne Angabe liest vio sie aus
+`D3D12Core.dll`). Empfohlenes Deployment: NuGet-Paket `Microsoft.Direct3D.D3D12`, `build/native/bin/x64/*`
+nach `<php-dir>\D3D12\`, `vio_create('d3d12', ['agility_sdk' => 'D3D12', 'shader_model' => 6])`.
+`vio_swapchain_info()['agility_sdk']` meldet die aktive Version (0 = System-Runtime). Scheitert ein
+Schritt (alte `d3d12.dll` ohne `ID3D12SDKConfiguration1`, falsche Version, kein Pfad), warnt vio und
+nimmt die System-Runtime. Die Shader-Model-Probe beginnt weiter bei 6.9 (höchste Stufe, die das SDK
+kennt); Work Graphs (SM 6.8) brauchen auf den meisten Windows-Builds dieses SDK.
+
+**Umgebungs-Defaults (SM69-PLAN Phase 0)**: `VIO_D3D12_AGILITY_SDK` / `VIO_D3D12_AGILITY_SDK_VERSION` gelten für jeden
+`vio_create` ohne `agility_sdk`-Option (damit läuft die ganze Suite auf der Agility-Runtime), `VIO_DXC_DIR` ersetzt
+`dxc_dir`. `VIO_D3D_WARP=<pfad\d3d10warp.dll>` lädt vor dem ersten D3D11-/D3D12-Device diese WARP-DLL
+(`LoadLibraryW`, einmal je Prozess) – so nimmt man das NuGet-Paket `Microsoft.Direct3D.WARP` statt des System-WARP.
+NuGet-WARP 1.0.21 + Agility 1.619.6 + DXC 1.9.2609 liefern SM 6.9 auf Feature-Level 12.2 mit DXR 1.2 (SER, OMM) und
+Long Vectors; die RTX 2080 (Treiber 617.42) meldet unter Agility 1.619 ebenfalls Tier 1.2 und SM 6.9.
 
 ##### `frame_count` — Pipeline-Tiefe (D3D12)
 
@@ -680,7 +847,11 @@ vio_get_auto_iconify($ctx);             // seit v2.7.4 false: Fullscreen minimie
 vio_monitors($ctx); vio_monitor_info($ctx); vio_video_modes($ctx, $monitor = -1);
 vio_native_window_handle($ctx);         // NSWindow*/HWND als int — für Standalone-Renderer (php-metal-gpu)
 vio_backend_name($ctx); vio_backends(); vio_backend_count();
+vio_backend_info($ctx);                 // API, Gerät, Shading-Sprache + Stufen, Familien, Caps, Vendor, Treiber, Gerätetyp, VRAM, selected_by
+vio_adapters();                         // ['d3d12' => [['name', 'vendor_id', 'driver', 'device_type', 'features', …]], …] ohne Kontext
+vio_rank_backends(['prefer' => 'quality']); vio_benchmark_backends(['frames' => 120]);  // Ranking / Kalibrierlauf für `auto`
 vio_gpu_info(); vio_gl_info($ctx); vio_thermal_state(); vio_supports_feature($ctx, VIO_FEATURE_COMPUTE);
+vio_feature_info($ctx, VIO_FEATURE_GEOMETRY);  // ['supported' => true, 'emulated' => true, 'method' => 'compute kernels …'] auf Metal
 ```
 
 ### 3D Rendering
@@ -746,6 +917,21 @@ vio_bind_render_target($ctx, $shadowCube, VIO_RT_ALL_LAYERS);   // GS / VS schre
 vio_viewports($ctx, [[0, 0, 1024, 1024], [1024, 0, 1024, 1024]]);  // gl_ViewportIndex wählt
 $depthArray = vio_render_target_texture($cascades);            // sampler2DArray
 ```
+
+### Upscaling
+```php
+// spatial: kantenadaptives Lanczos-2 + kontrastadaptives Schärfen, portabel (Fragment-Passes über die Draw-API)
+vio_upscale($ctx, $lowRt, $outRt, ['sharpness' => 0.25]);          // $outRt = null: Swapchain
+// temporal: Projektion je Frame um vio_upscale_jitter($frame) Quellpixel versetzen, Bewegung in UV (y oben)
+$j = vio_upscale_jitter($frame);                                     // Halton(2,3), -0.5..0.5
+vio_upscale($ctx, $lowRt, $outRt, ['mode' => VIO_UPSCALE_TEMPORAL, 'jitter' => $j, 'motion' => $motionRt, 'reset' => $cut]);
+vio_upscale_info($ctx);   // ['spatial' => 'portable'|'metalfx', 'temporal' => 'portable']
+```
+Alle Passes adressieren über `gl_FragCoord` (Speicherzeile r ← Zeile r, unabhängig von der RT-Orientierung);
+Jitter und Bewegung kommen in NDC-Richtung, `vio_backend.rt_origin_top` dreht sie in den Speicherraum. Temporal hält
+je Kontext eine RGBA16F-Historie (Alpha = akkumuliertes Gewicht), Catmull-Rom-Rückprojektion, YCoCg-Clamp auf die
+3×3-Quellnachbarschaft. Unter Subpixel-Bewegung wird die Historie jeden Frame neu abgetastet und weicher – dort
+liegt temporal etwa bei spatial, sein Gewinn ist das ruhige / langsame Bild.
 
 ### Compute & Storage Buffers
 ```php
@@ -822,14 +1008,24 @@ vio_audio_position($sound, $x, $y, $z); vio_audio_listener($x, $y, $z, $fx, $fy,
 
 ### Video Recording & Streaming
 ```php
-$rec = vio_recorder($ctx, ["path" => "out.mp4", "fps" => 30]);
-vio_recorder_capture($rec, $ctx);  // pro Frame
+$rec = vio_recorder($ctx, ["path" => "out.mp4", "fps" => 30, "encoder" => "auto"]);  // auto | hardware | software | FFmpeg-Name
+vio_recorder_capture($rec, $ctx);  // pro Frame (nach vio_end)
+vio_recorder_info($rec);           // ['encoder' => 'h264_nvenc', 'hardware' => true, 'zero_copy' => true, …]
 vio_recorder_stop($rec);
+vio_video_info("out.mp4"); vio_video_frame("out.mp4", 12);   // zurücklesen: Größe/Frames/fps/codec, RGBA eines Frames
 
 $stream = vio_stream($ctx, ["url" => "rtmp://server/live", "fps" => 30]);
 vio_stream_push($stream, $ctx);
 vio_stream_stop($stream);
 ```
+
+`auto` probiert die Hardware-Encoder der Plattform (Windows NVENC → AMF → QSV → Media Foundation, Apple VideoToolbox,
+Linux NVENC), dann libx264; Proben laufen mit stummem FFmpeg-Log (`VIO_DEBUG_ENCODE=1` zeigt, warum ein Encoder oder
+der Null-Kopie-Pfad nicht aufging). Auf **D3D11** bekommt ein Encoder, der D3D11-Frames nimmt (NVENC, AMF), einen
+D3D11VA-Frame-Pool um vios Gerät; je Capture zeichnet der Backend-Slot `encode_copy_frame` den Spiegel des letzten
+Frames per Kopier-Pixelshader in die BGRA-Pool-Textur (D3D11VA kennt kein RGBA). 1920×1080 auf RTX 2080, Capture +
+Kodieren je Frame: libx264 16,3 ms, NVENC mit Readback 10,7–16,4 ms, NVENC ohne CPU-Kopie 2,9 ms – der Readback ist der
+teure Teil. D3D12/Vulkan/GL bleiben beim Readback (NVENC nimmt keine D3D12-Frames, `h264_d3d12va` will NV12).
 
 ### Headless / VRT
 
@@ -904,11 +1100,13 @@ through a full shaping pipeline instead of the legacy codepoint-per-glyph path �
 this is what makes Arabic (RTL + joining), Thai (clustering), and ligatures
 render correctly. Implementation: `src/vio_text_shape.c`.
 
-- **Atlas**: switches from codepoint-keyed to **glyph-index-keyed**. Every glyph
-  the font has (0..numGlyphs) is packed once at `vio_font()` creation via
-  `stb_rect_pack` + `stbtt_MakeGlyphBitmap`, then uploaded once — so the GPU
-  atlas handle is **stable for the font's life** (no runtime re-upload, no
-  destroy race on deferred backends). Glyph-index keying is required because
+- **Atlas**: switches from codepoint-keyed to **glyph-index-keyed**. The atlas
+  texture is created once at `vio_font()` (its GPU handle is **stable for the
+  font's life**) and **fills on demand** (OPEN-ITEMS-PLAN A33): `vio_text`
+  rasterizes a glyph the first time it draws it into a CPU copy of the atlas and
+  uploads the rectangle its new glyphs dirtied through the vtable slot
+  `update_font_atlas`; `vio_text_measure` rasterizes nothing; `vio_font_info()`
+  reports glyphs / rasterized / atlas size. Glyph-index keying is required because
   HarfBuzz emits glyphs (ligatures, positional forms) that no codepoint reaches.
 - **Pipeline** per string: SheenBidi resolves BiDi levels and returns runs in
   *visual* order (`SBLine`) → each run is shaped by HarfBuzz with the
@@ -928,7 +1126,10 @@ render correctly. Implementation: `src/vio_text_shape.c`.
   leading-vowel starts a cluster; combining vowels/tones stay attached). Thai is
   dictionary-free, so it breaks at clusters, not true word boundaries; a segment
   wider than `max_width` still overflows (no mid-cluster/mid-word split).
-  Vertical text is out of scope.
+  **Vertical text** (`'vertical' => true` on `vio_text` / `vio_text_measure`,
+  A34): each column is shaped top to bottom (HB_DIRECTION_TTB, vertical forms),
+  glyphs upright, (x, y) = top-right corner, `'\n'` starts the next column to the
+  left; soft wrapping stays horizontal only.
 
 ## PIE Installation
 
@@ -970,7 +1171,7 @@ Auswertung pro Lauf offen.
 | `VIO_FEATURE_SCISSOR`         | 3.0      | —                                   | **1**     |
 | `VIO_FEATURE_NATIVE_2D_BATCH` | —        | —                                   | **1** (immer, vio_2d_opengl.c) |
 | `VIO_FEATURE_RAYTRACING`      | —        | nur via NV/EXT-Vendor-Ext           | 0         |
-| `VIO_FEATURE_MULTIVIEW`       | —        | `GL_OVR_multiview` (nicht gewired)  | 0         |
+| `VIO_FEATURE_MULTIVIEW`       | —        | `GL_OVR_multiview2`                 | 0         |
 
 **macOS-Hinweis:** Apple's Legacy-GL liefert maximal 4.1 Core. Compute /
 Tessellation / DSA / Buffer-Storage / Texture-Storage > 4.2 sind dort
@@ -1021,8 +1222,50 @@ nicht an `@available` im Feature-Code.
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 160 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 vio_submit_batch-Parität, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 221 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess, 184 `vio_backend_info` auf allen Backends, 185 `vio_adapters`, 186 Scoring für `auto`, 187 Kalibrierlauf, 188 Readback des neuesten Frames, 189 Glyph-Atlas bei Bedarf, 190 KTX2-Cubemaps/-3D, 191 ASTC, 192 Vertikaltext, 193 Tiefen-Mips, 194 MSAA-MRT, 195 MSAA-Cube/-Array, 196 MSAA-Depth-only, 197 Texturen in Mesh-/Task-Stages, 198 Tess-Varyings, 199 TLAS-Update, 200 RT-Gruppen + Records, 201 RT-Texturen, 202 Trace im Frame, 203 Fragment-Storage, 204 Sampler-Feedback aus GLSL, 205 Lücken der Geometry-Stage, 206 Pass-Wechsel / Vulkan-Kern, 212 Audit-Gate Plattformschicht, 213 Win32-Plattform, 214 X11-Plattform, 215 Wayland-Plattform, 216 Long Vectors, 217 RT-Wechsel ohne Unbind, 218 Float16-Sonderwerte, 219 SER, 220 Opacity Micromaps)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
+- **Audit-Gate Plattform**: `tests/core/212_audit_gate_no_glfw_outside_platform.phpt` — kein `glfwXxx`/`GLFW_*` außerhalb
+  `src/platform/glfw/`. Fenster, Input, Monitore, Gamepads, GL-Kontext und Vulkan-Surface laufen über die
+  `vio_platform`-Vtable (`include/vio_platform.h`, `vio_plat()`); Backends holen HWND/NSWindow über `native_handle`.
+  `vio_platform()` liefert den Namen der aktiven Plattform, `VIO_PLATFORM=<name>` erzwingt eine.
+- **Win32-Plattform** (`src/platform/win32/vio_platform_win32.c`, WIN32-PLATFORM-PLAN Phase 1, Test 213): auf Windows
+  Default vor GLFW. Eigene Fensterklasse + WndProc, DPI-Awareness Per-Monitor V2 (sichtbare Fenster skalieren mit
+  dem Monitor wie `GLFW_SCALE_TO_MONITOR`, headless ist ein `WS_POPUP` in exakt der Pixelgröße), Tasten über GLFWs
+  Scancode-Tabelle (Extended-Bit, AltGr-Fake-Ctrl, Shift-Release beider Seiten), Text mit Surrogatpaaren, Raw Input
+  bei `VIO_CURSOR_DISABLED`, Vollbild über `ChangeDisplaySettingsExW`, Monitore primär zuerst, XInput zur Laufzeit
+  geladen (GLFW-Konvention: Y oben = −1, Trigger −1..1). OpenGL über WGL: Dummy-Fenster für die ARB-Einstiege,
+  Leiter 4.6 → 3.0 (Core ab 3.2), kombinierter Loader (`wglGetProcAddress`, GL 1.0/1.1 aus `opengl32.dll`); Kontexte
+  unter 3.0 werden abgelehnt (ohne Grafiktreiber liefert Windows nur Microsofts GDI-GL 1.1 – das GL-Backend riefe
+  fehlende Einstiege auf, `0xC0000409` auf der CI). Damit hängt das GL-Backend an `HAVE_OPENGL` statt `HAVE_GLFW`: ein
+  Windows-Build ohne `--with-glfw` hat alle Backends (`config.w32` definiert `HAVE_OPENGL` immer).
+- **X11-Plattform** (`src/platform/x11/vio_platform_x11.c`, A3, Test 214): auf Linux Default vor GLFW, gebaut wenn
+  pkg-config `x11` und `xrandr` findet (`--with-x11`, Default an). Tasten über die XKB-Tastennamen (physische Lage,
+  GLFWs Abbildung, Keysym-Fallback), Text über XIM/`Xutf8LookupString`, erkennbares Auto-Repeat, Buttons 4–7 als Räder,
+  gegriffener und zurückgesetzter Zeiger bei `VIO_CURSOR_DISABLED`, Monitore/Modi über XRandR 1.3 (ohne: ein Monitor
+  in Bildschirmgröße), Vollbild über `_NET_WM_STATE_FULLSCREEN` + XRandR-Moduswechsel, Gamepads über evdev
+  (xpad-Konvention), Vulkan über `VK_KHR_xlib_surface`. GLX: `libGL.so.1` per `dlopen`, Leiter über
+  `glXCreateContextAttribsARB`, Boden 3.0; ein eigener X-Error-Handler nimmt fehlgeschlagene Sprossen auf (Xlibs
+  Standard-Handler beendet den Prozess). `vio_poll_events` macht vorher einen Round-Trip (`XSync`), sonst kamen per
+  `XSendEvent` gesendete Ereignisse einen Poll zu spät. Mit X11 definiert `config.m4` `HAVE_OPENGL`.
+- **Cocoa-Plattform** (`src/platform/cocoa/vio_platform_cocoa.m`, über den `.c`-Shim wie Metal, A3): auf macOS Default
+  vor GLFW. NSWindow mit eigener View als First Responder, Tasten über die virtuellen Keycodes (GLFWs Tabelle),
+  Modifier über `flagsChanged`, Text aus den Zeichen des Events (keine IME-Komposition), präzises Scrollen mit GLFWs
+  Faktor 0,1, Zeiger-Deltas bei `VIO_CURSOR_DISABLED`; Größen in Punkten, Framebuffer in Pixeln, y ab oben. Monitore
+  über NSScreen/CoreGraphics, Vollbild über ein randloses Fenster über der Menüleiste + `CGDisplaySetDisplayMode`,
+  Gamepads über GameController, OpenGL über `NSOpenGLContext` (4.1 Core, dann 3.2 Core), Vulkan über
+  `VK_EXT_metal_surface`. Die Frameworks (Cocoa, QuartzCore, IOKit, GameController schwach) hängen direkt am Modul –
+  `PHP_ADD_FRAMEWORK` erreicht die phpize-Linkzeile nicht, AppKit kam früher über libglfw.
+- **Wayland-Plattform** (`src/platform/wayland/vio_platform_wayland.c`, A3, Test 215): auf Linux vor X11, wenn
+  `WAYLAND_DISPLAY` gesetzt ist (wie GLFW 3.4; `VIO_PLATFORM=x11` nimmt XWayland). xdg-shell-Toplevels, Server-Rahmen
+  über xdg-decoration, Buffer-Scale aus den Outputs; Tasten über evdev-Keycodes, Text/Modifier/Wiederholrate über
+  xkbcommon (Wiederholung clientseitig), gesperrter Zeiger + relative Bewegung bei `VIO_CURSOR_DISABLED`, Pfeil aus dem
+  Cursor-Theme (wayland-cursor); Outputs als Monitore, Vollbild auf einem Output ohne Moduswechsel, keine
+  Fensterpositionen (Wayland-Grenze, immer 0,0). OpenGL über EGL auf `wl_egl_window` (libEGL/libwayland-egl per `dlopen`,
+  Leiter 4.6 → 3.0), Vulkan über `VK_KHR_wayland_surface`. Headless-Fenster swappen ohne Vsync (verborgene Surfaces
+  bekommen keine Frame-Callbacks). `config.m4` erzeugt die Protokoll-Glue (xdg-shell, xdg-decoration, relative-pointer,
+  pointer-constraints) mit `wayland-scanner` nach `gen/` (`--with-wayland`, Default an). Gamepads teilen sich X11 und
+  Wayland über `src/platform/linux/vio_evdev_gamepad.h`. Die Linux-CI fährt die Suite zweimal: Xvfb (X11) und headless
+  weston (Wayland, pixman).
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
 - **2D Farben**: ARGB als uint32 (0xAARRGGBB), z.B. `0xFF0000FF` = rot, alpha=FF.
@@ -1056,7 +1299,20 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   signieren (`vio_dxc_highest_minor`, Probe-Compute-Shader). `d3d12_hlsl_target()` gibt SPIRV-Cross
   dasselbe Ziel (ab 60 Wave-Intrinsics, ab 62 templated `Load/Store<T>`), `d3d12_stage_supported`
   probt GS/HS/DS mit dem Compiler, der später kompiliert (DXC unter SM 6), Cache je Ziel. GLSL mit
-  `GL_KHR_shader_subgroup` kompiliert glslang gegen Vulkan 1.1 / SPIR-V 1.3, alles andere bleibt 1.0.
+  `GL_KHR_shader_subgroup` kompiliert glslang gegen Vulkan 1.1 / SPIR-V 1.3, `GL_EXT_ray_query` und die
+  Raytracing-Stages gegen Vulkan 1.2 / SPIR-V 1.4, alles andere bleibt 1.0.
+- **`SM69-PLAN.md` — ✅ umgesetzt (2026-10-08).** Shader Model 6.9 komplett: Phase 0 CI-Beleg auf NuGet-WARP +
+  Agility 1.619 + DXC 1.9 (`VIO_D3D_WARP`, `VIO_D3D12_AGILITY_SDK`, `VIO_DXC_DIR`), 1 16-Bit-Sonderwerte (218),
+  2 Long Vectors (216, D3D12 über den HLSL-Compute-Override), 3 SER (219), 4 Opacity Micromaps (220). Nebenbefund:
+  D3D12-RT-Wechsel ohne Unbind (217). Feature-Flags sind seitdem ein 128-Bit-Satz (`vio_feature_set`).
+  Cooperative Vectors sind nicht in 6.9 – sie wandern in die SM-6.10-Linearalgebra (`SPIRV-CROSS-HLSL-COOPMAT-PLAN.md`).
+- **`BACKEND-SELECTION-PLAN.md` — 📋 geplant (2026-10-07).** Die Stärken aller Backends bündeln, ohne
+  mehrere APIs parallel zu betreiben: `describe` + Adapter-Scan (`vio_adapters`), Scoring für `auto`
+  (`prefer` / `require`, Herstellerprofile), Kalibrierlauf mit Cache, Technik-Ketten je Effekt in PHPolygon,
+  `native`/`emulated` in den Caps, Interop nur als Brücke (z. B. GPU-Encoding für `vio_recorder`).
+- **`VULKAN-MODERN-PLAN.md` — ✅ umgesetzt (2026-10-08, A37 + A18).** Vulkan 1.2+/1.3-Kern: Timeline-Semaphore
+  für alle Übergaben, Synchronization2-Barrieren, Dynamic Rendering statt Render-Pass-/Framebuffer-Objekten,
+  darauf das Shading-Rate-Bild (Test 160 auf Vulkan, Test 206).
 - `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
 - `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
 - **`METAL-GEOMETRY-PLAN.md` — ✅ umgesetzt (2026-10-05).** Geometry-Stage auf Metal per Compute-
@@ -1075,15 +1331,17 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   Mesh-Shader/Ray-Tracing/Upscaling. Immer für Metal+GL+D3D11+D3D12 gleichzeitig.
 - Metal-3D-Pipeline: ✅ implementiert, Feature-Parität mit D3D11/D3D12 (siehe
   „Metal-3D-Pipeline" oben). PHPolygons Standalone-`MetalRenderer3D` (ext-metal /
-  php-metal-gpu) ist damit auf macOS nicht mehr nötig. Offen: Vulkan-3D, Vulkan-Cubemap,
-  Vulkan-HDR/Depth/MSAA-RT; echtes MSAA für OpenGL/D3D (melden 1, tun nichts).
+  php-metal-gpu) ist damit auf macOS nicht mehr nötig. Vulkan-3D, -Cubemaps, -HDR/Depth/MSAA-RTs und echtes
+  RT-MSAA auf OpenGL/D3D sind inzwischen umgesetzt (siehe Feature-Matrix).
 
 ### Verifikation / CI
 
 - `.github/workflows/build.yml` — Tri-Platform Build+Test+Package (Linux
   x86_64/arm64, macOS x86_64/arm64, Windows x64; PHP 8.5). Linux/macOS fahren die volle
   Test-Suite; Linux headless via **Xvfb + Mesa-Software-GL** (`LIBGL_ALWAYS_SOFTWARE=1`);
-  Windows testet die D3D-Backends auf **WARP**.
+  Windows testet die D3D-Backends auf **WARP** – einmal auf dem System-WARP (SM 6.2, Untergrenze) und
+  einmal die ganze Suite auf **NuGet-WARP 1.0.21 + Agility SDK 1.619.6 + DXC 1.9** (SM 6.9, FL 12.2, DXR 1.2)
+  mit `VIO_REQUIRE_*=d3d12` für alles, was dort gemeldet wird (Subgroups … Work Graphs, Long Vectors, SER, OMM).
 - `.github/workflows/release.yml` — semantic-release auf `main`: ruft build.yml als
   Gate, taggt, schreibt CHANGELOG.md, triggert den Release-Build der Binaries.
 - `configure.ac` erlaubt einen PHP-freien Autotools-Durchlauf, um die „kompiliert ohne
@@ -1141,7 +1399,7 @@ Aufrufer geändert hat:
   $face)` auf D3D11. `vio_texture_update` auf D3D12.
 - **RT-MSAA** (`'samples' => N`) ist auf D3D11 (Resolve beim Unbind/Readback) und OpenGL
   (Multisample-Renderbuffer + Blit) implementiert; vorher ignorierten beide `samples`
-  bei `RENDER_TARGET_MSAA = 1`. Depth-only-/Cube-/MRT-Targets bleiben single-sample.
+  bei `RENDER_TARGET_MSAA = 1`. Seit A24 auch MRT, Cube/Array und Depth-only (siehe oben).
 - **Vulkan `vsync: false`** wählt `IMMEDIATE` (Fallback MAILBOX → FIFO); `true` = FIFO.
 - **Headless-Fenster sind undekoriert** und `vio_begin` resized D3D-Swapchains im
   Headless-Modus nicht mehr auf die Fenstergröße: vorher war ein 32×32-Headless-Backbuffer
@@ -1179,19 +1437,25 @@ Aufrufer geändert hat:
   baut beim Binden lazily die Variante für die Sample-Zahl des gebundenen Targets (2/4/8);
   die RT-Farbe liegt in multisampled Ressourcen, die Resolve-Ziele (SRV/Readback) werden beim
   Unbind per `ResolveSubresource` gefüllt. Kein `'samples'` auf der Pipeline nötig.
-- **Input-Layout auf D3D/Metal** kommt aus der Shader-Reflection (Attribute dicht gepackt in
-  Location-Reihenfolge), nicht aus dem Mesh-Layout: ein Mesh mit Lücken/anderer Reihenfolge
-  (`['location' => 7, …]` zwischen 0 und 1) liest auf D3D falsche Offsets; OpenGL nutzt das
-  Mesh-VAO. Meshes in Location-Reihenfolge ohne Lücken anlegen.
+- **Input-Layout auf D3D/Vulkan/Metal** folgt dem Mesh-Layout (OPEN-ITEMS-PLAN A31, Test 174): `vio_mesh`
+  merkt sich je Location den Byte-Offset (`vio_mesh_layout`, Schlüssel = Hash der Offsets), `php_vio.c`
+  reicht ihn vor jedem Draw-Pfad über den Vtable-Slot `apply_mesh_layout` weiter, und die Backends wählen
+  eine Variante je Layout (D3D11 Input-Layout, D3D12/Metal PSO-Variante, Vulkan Pipeline-Variante).
+  Eingänge, die das Mesh nicht hat, behalten den dichten Offset; Meshes ohne `layout` laufen unverändert.
+  Vorher lasen Meshes mit Lücken oder anderer Reihenfolge auf D3D **und Vulkan** falsche Offsets. Grenze:
+  die emulierte Geometry-Stage auf Metal backt dichte Offsets in ihren Vertex-Kernel.
 - `vio_mouse_position`/`vio_mouse_delta` teilen auf Windows durch den GLFW-Content-Scale
   (physische → logische Cursor-Pixel); im Headless-Modus ist der Scale 1 (injizierte
   Koordinaten sind logisch) — vorher schlug `026` auf jedem HiDPI-Windows-Host fehl.
 - Metal: max. 8 PSO-Varianten (Zielformat × Mesh-Stride × Samples) pro Pipeline und 8
   2D-Varianten; Texturen sind `MTLStorageModeShared` (Apple Silicon); Geometry- und Tessellation-
   Stages laufen über Compute-Kernel (siehe „Metal-3D-Pipeline"). Grenzen der GS-Emulation (Warning
-  bei `vio_shader`): Sampler in VS/GS einer GS-Pipeline, Interface-Blöcke/Struct-Varyings, GS hinter
-  Tessellation, `TRIANGLE_STRIP_ADJACENCY`; ein vom GS geschriebenes `gl_PrimitiveID` erreicht den
-  Fragment-Shader nicht. Variable Rate Shading gibt es nicht: Metals Rasterization-Rate-Maps
+  bei `vio_shader`): GS hinter Tessellation (Metals Tessellator gibt die erzeugten Dreiecke nicht
+  heraus, die Emulation bräuchte einen eigenen Tessellator), Struct-Varyings außerhalb von
+  Interface-Blöcken. Seit A28 (Test 205) laufen Strip-Adjacency (Assembly nach GL-Tabelle 10.1),
+  Texturen in VS/GS (die Kernel-Encoder binden sie nach Namen aus der Sampler-Map: Fragment, GS, VS),
+  Interface-Blöcke (`vio_spirv_flatten_io_blocks` teilt sie vor dem Umbau je Member auf, auch im
+  Fragment-Shader) und `gl_PrimitiveID` aus dem GS (Record-Slot 1.w → flaches `int` auf Location 30). Variable Rate Shading gibt es nicht: Metals Rasterization-Rate-Maps
   verkleinern das physische Target und lassen sich nicht transparent auf `vio_set_shading_rate` abbilden.
 - `vio_clear`: vor `vio_begin` wird die Farbe gelatcht und beim Frame-Start angewendet; **im
   Frame cleart jedes Backend sofort** das gebundene Ziel (Swapchain oder RT) — OpenGL seit
@@ -1206,11 +1470,19 @@ Aufrufer geändert hat:
   Element), gecacht pro (Programm, Name), Cache-Einträge sterben mit `glDeleteProgram`. Vorher wurde
   **jedes** `vio_set_uniform` eines nicht-RAW-Shaders auf GL still verworfen (Test 108). Auf den cbuffer-Backends
   hält die Reflection ein Array von Skalaren/Vektoren/Matrizen als einen Eintrag mit Schrittweite
-  (`vio_uniform_entry.stride`); `vio_uniform_lookup` löst `name[i]` daraus auf (Test 146). Weiterhin nicht
-  portabel: `vio_uniform_buffer` + `vio_bind_buffer` für Grafik-Shader (GL: Block ist geflattet, kein
-  UBO; D3D12: Root-CBV wird vom Shader-Cbuffer-Push überschrieben) — Aufrufer nehmen `vio_set_uniform`.
+  (`vio_uniform_entry.stride`); `vio_uniform_lookup` löst `name[i]` daraus auf (Test 146). `vio_uniform_buffer`
+  + `vio_bind_buffer` speisen benannte Uniform-Blöcke von Grafik-Shadern auf jedem Backend (OPEN-ITEMS-PLAN A32,
+  Test 175): der Puffer hält eine CPU-Kopie, `vio_bind_buffer` merkt ihn je Binding (0–15), und vor jedem Draw
+  übernimmt jeder Block den Inhalt des Puffers an seinem Binding (cbuffer-Backends: Kopie in den Stage-cbuffer;
+  GL: Member einzeln über `set_uniform`, float/vecN/mat3/mat4/int samt Arrays). Ein gebundener Puffer gewinnt
+  also gegen `vio_set_uniform` auf denselben Membern. Der erste UBO jeder Grafik-Stage liegt im HLSL auf `b0`,
+  egal welches GLSL-Binding (vorher lehnte D3D12 `layout(binding = 1)` ab); nur der erste Block je Stage.
   Sampler-Unit ist auf D3D/Metal der Wert aus `vio_set_uniform('u_tex', unit)` (GL-Konvention), nicht
-  das `layout(binding)`; ohne Set gilt Unit 0.
+  das `layout(binding)`; ohne Set gilt Unit 0. Getrennte Texturen + Sampler in Set 0 (`texture(sampler2D(u_tex,
+  u_smp), uv)`, Test 180): GL und Vulkan verschmelzen jedes Paar zu einem Sampler mit dem Namen der Textur
+  (`vio_spvc_combine_separate`), D3D bindet die Textur über ihre Unit, Metal behält sie getrennt; in der
+  Sampler-Liste stehen sie hinter den kombinierten Samplern (HLSL `t{sampled + j}`). Der Sampler-Zustand ist der
+  der Textur, auf Metal linear/repeat. Neben der Bindless-Tabelle (Set 1) wird nicht verschmolzen.
 - **Vergleichs-Sampling auf OpenGL**: Tiefentexturen tragen kein `GL_TEXTURE_COMPARE_MODE` (sie werden
   auch roh per `sampler2D` gelesen). Vor jedem 3D-Draw bindet das Backend stattdessen an jede Unit, die
   ein `sampler*Shadow` des aktuellen Programms liest, ein Sampler-Objekt mit `GL_COMPARE_REF_TO_TEXTURE`
@@ -1232,6 +1504,8 @@ Aufrufer geändert hat:
 - **Vulkan headless auf macOS (MoltenVK, Retina)** rendert in doppelter Größe; `vio_read_pixels` liefert nur
   das obere linke Viertel (bei Test 153 entdeckt; die CI fährt Vulkan nicht auf macOS). Pixel-Tests mit
   Vulkan lokal auf dem Mac deshalb nur mit symmetrischen/positionsunabhängigen Prüfungen bewerten.
+- Vulkan braucht 1.3 oder 1.2 mit `VK_KHR_dynamic_rendering` + `VK_KHR_synchronization2` (VULKAN-MODERN-PLAN);
+  ältere Treiber/Loader bekommen eine Warnung, `auto` nimmt dann das nächste Backend.
 - Vulkan auf macOS braucht `VK_DRIVER_FILES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json` + `DYLD_LIBRARY_PATH=/usr/local/lib` (SIP blockiert letzteres in Subprozessen). Auto-Auswahl vermeidet Vulkan auf macOS zugunsten von Metal.
 - VideoToolbox-Encoder kann in headless fehlschlagen → Fallback auf libx264
 - `php_vio.c` ist monolithisch (~9050 Zeilen) — alle PHP-Funktionen in einer Datei; Audit-Gate
@@ -1250,7 +1524,7 @@ Aufrufer geändert hat:
   Laufzeit neben `php.exe` liegen. Für ein self-contained `vio.dll` wäre
   `harfbuzz[core]:x64-windows-static-md` (ohne FreeType, statisch, /MD) die
   sauberere Deployment-Variante.
-- Shaping: horizontal only. Vertikaler Text (CJK vertical) ist Folgearbeit.
+- Shaping: Vertikaltext (`'vertical' => true`) ohne weichen Umbruch und ohne seitlich gedrehte Latein-Läufe (alles aufrecht).
 - **Tessellierte Isolines auf WARP**: Der Software-Rasterizer (vios Headless-D3D11/D3D12-Device und die
   Windows-CI) verliert die Linien-Primitive tessellierter Isolines – ein eigenständiges D3D11-Programm ohne vio
   zeichnet dort nichts, in vio kommen je Frame zufällig Linien an. Der Tessellator selbst stimmt (Punkt-Ausgabe
@@ -1268,7 +1542,10 @@ Aufrufer geändert hat:
 - **Mesh-Shader**: Die Mesh-Stage belegt den Vertex-Slot des Shader-Objekts (Uniforms/Reflection wie ein
   Vertex-Shader; eine Task-Stage liest denselben Block: D3D12 über den GS-CBV-Slot der Mesh-Root-Signatur,
   Metal `setObjectBuffer`). SPIRV-Cross wendet auf `gl_MeshVerticesEXT[i].gl_Position` keinen Clip-Fixup an;
-  `vio_mesh_fix_positions` schreibt jede Zuweisung um (Vulkan y-Flip + z, D3D12 nur z). Texturen nur im
-  Fragment-Shader. MSL reserviert `quad` (u. a.) – eine GLSL-Funktion dieses Namens bricht den Metal-Compile.
+  `vio_mesh_fix_positions` schreibt jede Zuweisung um (Vulkan y-Flip + z, D3D12 nur z). Texturen in Mesh- und
+  Task-Stage (A30, Test 197): Sampler-Map und Register wie bei den Extra-Stages; D3D12-Mesh-Root-Signatur mit
+  SRV-/Sampler-Tabellen für AMPLIFICATION (GS-Slots) und MESH (HS-Slots), Vergleichs-Sampler für alle Stages,
+  Storage-Buffer der Mesh-/Task-Stage in Register-Space 2 (Root-SRV [3] dort); Metal bindet per Name über
+  `setMeshTexture`/`setObjectTexture`. MSL reserviert `quad` (u. a.) – eine GLSL-Funktion dieses Namens bricht den Metal-Compile.
 - **`gl_PatchVerticesIn` auf OpenGL** mit SPIRV-Cross vor `vulkan-sdk-1.3.275` (Ubuntu 24.04: 1.3.268): das
   GLSL-Backend schreibt `gl_BuiltIn_14`; `vio_spirv_to_glsl` ersetzt es (`vio_glsl_fix_patch_vertices`).

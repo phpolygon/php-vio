@@ -1,6 +1,6 @@
 # API-ROADMAP — vio-API über den GL-3.3-Kern hinaus (alle Backends)
 
-Status: 🚧 R1, R2, R7 (inkl. Async) umgesetzt (2026-09-08, php-vio 2.10-Paket); R3–R9 offen. Ergänzt `METALGPU-REPLACEMENT-PLAN.md`
+Status: ✅ R1–R8 umgesetzt — R1, R2, R7 (inkl. Async) im 2.10-Paket (2026-09-08), R3 Stencil, R4 uint16-Indices / Texture-Arrays / BC / KTX2, R5 GPU-Timestamps, R6 Indirect Draw und R8 Pipeline-Cache mit GAP-PHASE5 (Tests 113–121). Aus R9 sind Mesh-Shader und Ray-Tracing (Query und Pipeline) umgesetzt (SHADER-FEATURES-PLAN, Tests 162–164); Upscaling ist offen (OPEN-ITEMS-PLAN A21). Die Abschnitte unten beschreiben den Plan von 2026-09. Ergänzt `METALGPU-REPLACEMENT-PLAN.md`
 (dessen Phase 1 zuerst läuft — Cube-RT, `depth_write`, RT-Readback, Headless-Größen,
 Pipeline-Destruktor). Diese Roadmap enthält die Features, die **kein** vio-Backend heute
 exponiert, obwohl Metal, D3D11/12, Vulkan und (meist) OpenGL sie nativ können.

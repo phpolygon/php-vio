@@ -10,7 +10,7 @@
 #ifndef VIO_2D_OPENGL_H
 #define VIO_2D_OPENGL_H
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
 
 #include "../../vio_2d.h"
 
@@ -26,5 +26,5 @@ int  vio_2d_opengl_init(vio_2d_opengl_state *state, int vertex_capacity);
 void vio_2d_opengl_shutdown(vio_2d_opengl_state *state);
 void vio_2d_opengl_flush(vio_2d_state *state);
 
-#endif /* HAVE_GLFW */
+#endif /* HAVE_OPENGL */
 #endif /* VIO_2D_OPENGL_H */
