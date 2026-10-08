@@ -384,7 +384,7 @@ jobs:
           # The Homebrew formula php is 8.5 and brings phpize / php-config.
           brew update --quiet
           brew install php
-          brew link --overwrite php
+          brew link --overwrite php || true   # "already linked" exits 1
           php -v
           have=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
           if [ "$have" != "${{ matrix.php }}" ]; then
@@ -469,7 +469,7 @@ jobs:
           # The Homebrew formula php is 8.5 and brings phpize / php-config.
           brew update --quiet
           brew install php
-          brew link --overwrite php
+          brew link --overwrite php || true   # "already linked" exits 1
           php -v
           have=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
           if [ "$have" != "${{ matrix.php }}" ]; then
