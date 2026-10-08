@@ -349,6 +349,12 @@ if test "$PHP_VIO" != "no"; then
         if test -n "$VIO_SDK_PATH" && test -d "$VIO_SDK_PATH/System/Library/Frameworks/MetalFX.framework"; then
           AC_DEFINE(HAVE_METALFX, 1, [Whether the SDK has MetalFX])
           VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD -Wl,-weak_framework,MetalFX"
+          dnl A static build (static-php-cli) never sees VIO_SHARED_LIBADD; its
+          dnl program link line takes PHP_FRAMEWORKS (what PHP_ADD_FRAMEWORK
+          dnl fills, which has no weak form), so the weak framework goes there.
+          if test "$ext_shared" = "no"; then
+            PHP_FRAMEWORKS="$PHP_FRAMEWORKS -weak_framework MetalFX"
+          fi
           AC_MSG_RESULT([MetalFX upscaling enabled])
         fi
         AC_MSG_RESULT([Metal backend enabled])
