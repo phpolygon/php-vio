@@ -878,13 +878,15 @@ static void x11_dispatch(XEvent *ev)
 static void x11_poll_events(void)
 {
     if (!x11_dpy) return;
-    XPending(x11_dpy);
-    while (QLength(x11_dpy)) {
+    /* A round trip first: every event the server generated before it is in
+     * the queue afterwards. XPending alone left events another client had
+     * sent (XSendEvent) for the next poll (test 214). */
+    XSync(x11_dpy, False);
+    while (XPending(x11_dpy)) {
         XEvent ev;
         XNextEvent(x11_dpy, &ev);
         x11_dispatch(&ev);
     }
-    XFlush(x11_dpy);
 }
 
 static void x11_wait_events(void)
