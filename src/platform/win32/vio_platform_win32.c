@@ -495,7 +495,20 @@ static int w32_gl_create(vio_win32_window *w, int samples)
     }
     if (!w->glrc) w->glrc = wglCreateContext(w->hdc);   /* legacy drivers: whatever the driver has */
     if (!w->glrc) return -1;
-    return wglMakeCurrent(w->hdc, w->glrc) ? 0 : -1;
+    if (!wglMakeCurrent(w->hdc, w->glrc)) return -1;
+    /* The floor is 3.0, like GLFW's ladder: a legacy context can be Microsoft's
+     * GDI renderer (GL 1.1, every machine without a GPU driver), and the GL
+     * backend would call entry points that do not exist. */
+    typedef const unsigned char *(WINAPI *w32_glGetString_t)(unsigned int);
+    w32_glGetString_t get_string = (w32_glGetString_t)w32_gl_get_proc_address("glGetString");
+    const char *version = get_string ? (const char *)get_string(0x1F02 /* GL_VERSION */) : NULL;
+    if (!version || atoi(version) < 3) {
+        wglMakeCurrent(NULL, NULL);
+        wglDeleteContext(w->glrc);
+        w->glrc = NULL;
+        return -1;
+    }
+    return 0;
 }
 
 /* ── Monitors ─────────────────────────────────────────────────────── */
