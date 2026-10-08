@@ -2590,9 +2590,15 @@ typedef struct _vio_vk_rtp {
     VkStridedDeviceAddressRegionKHR rgen, miss, hit, call;
     VkDescriptorSetLayoutBinding bindings[VK_RT_MAX_BINDINGS];
     int                   binding_count;
+    int                   used_in_frame;   /* traced into a frame command buffer: drain before freeing */
     int                   dead;
     struct _vio_vk_rtp    *next, *prev;
 } vio_vk_rtp;
+
+/* Frame-recorded traces (A13) take their sets from the compute pools and flag
+ * themselves like async dispatches (defined with the compute primitive). */
+static VkDescriptorSet vkc_alloc_set(int slot, VkDescriptorSetLayout layout);
+static int vkc_async_open;
 
 static vio_vk_rtp *vk_live_rtp = NULL;
 
@@ -2888,7 +2894,12 @@ static void vulkan_destroy_rt_pipeline(void *ptr)
     vio_vk_rtp *rt = (vio_vk_rtp *)ptr;
     if (!rt) return;
     if (!rt->dead) {
-        vk_rt_release_gpu(rt);   /* traces are synchronous: nothing in flight */
+        if (rt->used_in_frame && vio_vk.device) {
+            /* A trace in a frame command buffer may still be recorded or in flight. */
+            if (vio_vk.in_frame) vio_vk_flush_frame();
+            else vkDeviceWaitIdle(vio_vk.device);
+        }
+        vk_rt_release_gpu(rt);
         vk_rt_unlink(rt);
     }
     free(rt);
@@ -2897,7 +2908,15 @@ static void vulkan_destroy_rt_pipeline(void *ptr)
 static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int count, int w, int h, int d)
 {
     vio_vk_rtp *rt = (vio_vk_rtp *)ptr;
-    if (!rt || rt->dead || !vio_vk.device || vio_vk.in_frame) return -1;
+    if (!rt || rt->dead || !vio_vk.device) return -1;
+    /* Inside a frame (A13) the trace is recorded into the frame command buffer
+     * with a set of its own (a recorded command keeps its set's contents). */
+    int in_frame = vio_vk.in_frame;
+    VkDescriptorSet set = rt->set;
+    if (in_frame && rt->binding_count > 0) {
+        set = vkc_alloc_set((int)vio_vk.current_frame, rt->set_layout);
+        if (!set) return -1;
+    }
     VkWriteDescriptorSet wr[VK_RT_MAX_BINDINGS];
     VkDescriptorBufferInfo bi[VK_RT_MAX_BINDINGS];
     VkWriteDescriptorSetAccelerationStructureKHR ai[VK_RT_MAX_BINDINGS];
@@ -2906,7 +2925,7 @@ static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, in
     memset(wr, 0, sizeof(wr));
     for (int k = 0; k < rt->binding_count; k++) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[k].dstSet = rt->set;
+        wr[k].dstSet = set;
         wr[k].dstBinding = rt->bindings[k].binding;
         wr[k].descriptorCount = 1;
         wr[k].descriptorType = rt->bindings[k].descriptorType;
@@ -2951,6 +2970,50 @@ static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, in
         }
     }
     if (rt->binding_count > 0) vkUpdateDescriptorSets(vio_vk.device, (uint32_t)rt->binding_count, wr, 0, NULL);
+
+    if (in_frame) {
+        VkCommandBuffer fcmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+        /* No trace inside a render pass: close it, trace, resume with LOAD. */
+        int had_pass = vio_vk.cur_render_pass != VK_NULL_HANDLE;
+        VkViewport vp[16];
+        VkRect2D sc[16];
+        uint32_t vp_count = vio_vk.cur_vp_count ? vio_vk.cur_vp_count : 1;
+        if (vp_count > 16) vp_count = 16;
+        memcpy(vp, vio_vk.cur_vp, sizeof(VkViewport) * vp_count);
+        memcpy(sc, vio_vk.cur_sc, sizeof(VkRect2D) * vp_count);
+        if (had_pass) {
+            vkCmdEndRenderPass(fcmd);
+            vio_vk.cur_render_pass = VK_NULL_HANDLE;
+        }
+        VkMemoryBarrier fb = {0};
+        fb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        fb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                           VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        fb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        vkCmdPipelineBarrier(fcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0, 1, &fb, 0, NULL, 0, NULL);
+        vkCmdBindPipeline(fcmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt->pipeline);
+        if (rt->binding_count > 0)
+            vkCmdBindDescriptorSets(fcmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt->layout, 0, 1, &set, 0, NULL);
+        ((PFN_vkCmdTraceRaysKHR)vio_vk.fn_cmd_trace_rays)(fcmd, &rt->rgen, &rt->miss, &rt->hit, &rt->call,
+                                                           (uint32_t)w, (uint32_t)h, (uint32_t)d);
+        fb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        fb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT |
+                           VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+        vkCmdPipelineBarrier(fcmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &fb, 0, NULL, 0, NULL);
+        if (had_pass) {
+            vio_vk_resume_pass(fcmd);
+            memcpy(vio_vk.cur_vp, vp, sizeof(VkViewport) * vp_count);
+            memcpy(vio_vk.cur_sc, sc, sizeof(VkRect2D) * vp_count);
+            vio_vk.cur_vp_count = vp_count;
+            vkCmdSetViewport(fcmd, 0, 1, &vp[0]);
+            vkCmdSetScissor(fcmd, 0, 1, &sc[0]);
+        }
+        rt->used_in_frame = 1;
+        vkc_async_open = 1;   /* vulkan_read_buffer / compute_wait flush the frame */
+        return 0;
+    }
 
     VkCommandPool pool;
     VkCommandBuffer cmd;
@@ -4009,16 +4072,17 @@ static VkDescriptorSet vkc_alloc_set(int slot, VkDescriptorSetLayout layout)
             php_error_docref(NULL, E_WARNING, "Vulkan: compute descriptor pools exhausted for this frame");
             return VK_NULL_HANDLE;
         }
-        VkDescriptorPoolSize sizes[4] = {
+        VkDescriptorPoolSize sizes[5] = {
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VKC_SETS_PER_POOL * VIO_VK_COMPUTE_MAX_BINDINGS },
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  VKC_SETS_PER_POOL * VIO_VK_COMPUTE_MAX_IMAGES },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VKC_SETS_PER_POOL * 2 },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VKC_SETS_PER_POOL * 4 },   /* traces in a frame (A13) */
             { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VKC_SETS_PER_POOL },
         };
         VkDescriptorPoolCreateInfo pi = {0};
         pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pi.maxSets       = VKC_SETS_PER_POOL;
-        pi.poolSizeCount = vio_vk.ray_query_supported ? 4 : 3;   /* the type is only valid with the extension */
+        pi.poolSizeCount = vio_vk.ray_query_supported ? 5 : 4;   /* the last type is only valid with the extension */
         pi.pPoolSizes    = sizes;
         if (vkCreateDescriptorPool(vio_vk.device, &pi, NULL, &vkc.pools[slot][vkc.count[slot]]) != VK_SUCCESS) {
             return VK_NULL_HANDLE;
@@ -4029,7 +4093,7 @@ static VkDescriptorSet vkc_alloc_set(int slot, VkDescriptorSetLayout layout)
 
 /* Async dispatches recorded into the open frame / submitted with a frame but
  * not yet waited for (vulkan_compute_wait, vulkan_read_buffer). */
-static int vkc_async_open = 0;
+static int vkc_async_open = 0;   /* also set by traces in a frame */
 static int vkc_async_submitted = 0;
 
 /* end_frame: async dispatches of the frame are now on the queue. */

@@ -9849,8 +9849,9 @@ ZEND_FUNCTION(vio_rt_bind_texture)
     vio_rt_bind_resource(p, Z_OBJ_P(tex_zval), (int)binding, VIO_RT_BIND_TEXTURE, "vio_rt_bind_texture");
 }
 
-/* vio_trace_rays($ctx, $pipeline, $w, $h, $d = 1): synchronous launch against
- * the bound acceleration structure. */
+/* vio_trace_rays($ctx, $pipeline, $w, $h, $d = 1) against the bound acceleration
+ * structure: synchronous outside a frame, recorded in order with the frame's
+ * draws and dispatches inside one (A13); vio_storage_buffer_read waits. */
 ZEND_FUNCTION(vio_trace_rays)
 {
     zval *ctx_zval, *p_zval;
@@ -9871,10 +9872,6 @@ ZEND_FUNCTION(vio_trace_rays)
     }
     if (!ctx->initialized || !p->valid || p->backend != ctx->backend || !ctx->backend->trace_rays) {
         php_error_docref(NULL, E_WARNING, "vio_trace_rays: the pipeline was not built on this context's backend");
-        return;
-    }
-    if (ctx->in_frame) {
-        php_error_docref(NULL, E_WARNING, "vio_trace_rays: call it outside vio_begin / vio_end");
         return;
     }
     vio_rt_buffer_binding b[VIO_RT_MAX_BUFFERS];

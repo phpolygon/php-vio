@@ -536,8 +536,10 @@ function vio_rt_bind_texture(VioContext $context, VioRtPipeline $pipeline, VioTe
 /**
  * Launch $width * $height * $depth raygen invocations (gl_LaunchIDEXT /
  * DispatchRaysIndex) against the acceleration structure bound with
- * vio_bind_acceleration_structure(). Synchronous: the buffers are complete on
- * return. Outside vio_begin / vio_end.
+ * vio_bind_acceleration_structure(). Outside vio_begin / vio_end it is
+ * synchronous (the buffers are complete on return); inside a frame it is recorded
+ * in order with the frame's draws and async compute dispatches - later work of the
+ * frame sees its writes, vio_storage_buffer_read() waits for it (mid-frame too).
  */
 function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width, int $height, int $depth = 1): void {}
 

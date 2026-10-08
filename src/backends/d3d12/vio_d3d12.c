@@ -7827,6 +7827,7 @@ typedef struct _vio_d3d12_rtp {
     UINT64               stride;        /* one record: identifier + record data, 32-byte aligned */
     UINT64               off_miss, off_hit, off_call;
     int                  miss_count, hit_count, callable_count;
+    int                  used_in_frame;   /* traced on a frame list: drain before freeing */
 } vio_d3d12_rtp;
 
 static void d3d12_rtp_free(vio_d3d12_rtp *p)
@@ -8069,9 +8070,18 @@ fail:
 
 static void d3d12_destroy_rt_pipeline(void *ptr)
 {
-    d3d12_rtp_free((vio_d3d12_rtp *)ptr);   /* traces wait for the GPU: nothing in flight */
+    vio_d3d12_rtp *p = (vio_d3d12_rtp *)ptr;
+    if (p && p->used_in_frame) {
+        /* A trace on a frame list may still be recorded or in flight. */
+        if (vio_d3d12.in_frame && vio_d3d12.cmd_list) {
+            vio_d3d12.compute_async_pending++;
+            d3d12_compute_wait();   /* submits the open frame so far and reopens it */
+        } else {
+            vio_d3d12_wait_for_gpu();
+        }
+    }
+    d3d12_rtp_free(p);
 }
-
 /* Bound textures PIXEL_SHADER_RESOURCE <-> PIXEL | NON_PIXEL for a trace. */
 static void d3d12_rt_texture_states(ID3D12GraphicsCommandList *list, const vio_rt_buffer_binding *b, int count, int before)
 {
@@ -8093,7 +8103,8 @@ static void d3d12_rt_texture_states(ID3D12GraphicsCommandList *list, const vio_r
 static int d3d12_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int count, int w, int h, int d)
 {
     vio_d3d12_rtp *p = (vio_d3d12_rtp *)ptr;
-    if (!p || !p->state || !vio_d3d12.device || vio_d3d12.in_frame) return -1;
+    if (!p || !p->state || !vio_d3d12.device) return -1;
+    int in_frame = vio_d3d12.in_frame && vio_d3d12.cmd_list != NULL;
     if (!d3d12_bound_as || !d3d12_bound_as->tlas) {
         php_error_docref(NULL, E_WARNING, "vio_trace_rays: no acceleration structure bound (vio_bind_acceleration_structure)");
         return -1;
@@ -8106,7 +8117,7 @@ static int d3d12_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int
         }
     }
     if (d3d12_ensure_compute_srv_heap() != 0) return -1;
-    d3d12_compute_wait();
+    if (!in_frame) d3d12_compute_wait();   /* in a frame the list keeps the order */
     /* Textures (A13): SRVs t1..t15 in a block of the compute heap, null views
      * where nothing is bound. */
     D3D12_GPU_DESCRIPTOR_HANDLE tex_gpu;
@@ -8137,11 +8148,24 @@ static int d3d12_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int
     ID3D12GraphicsCommandList *list = NULL;
     ID3D12GraphicsCommandList4 *list4 = NULL;
     int rc = -1;
-    if (FAILED(ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                   &IID_ID3D12CommandAllocator, (void **)&alloc))) goto done;
-    if (FAILED(ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
-                                              &IID_ID3D12GraphicsCommandList, (void **)&list))) goto done;
+    if (in_frame) {
+        /* Inside a frame (A13): record onto the frame list, in order with the
+         * draws and async dispatches around it. */
+        list = vio_d3d12.cmd_list;
+    } else {
+        if (FAILED(ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       &IID_ID3D12CommandAllocator, (void **)&alloc))) goto done;
+        if (FAILED(ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                                  &IID_ID3D12GraphicsCommandList, (void **)&list))) goto done;
+    }
     if (FAILED(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList4, (void **)&list4))) goto done;
+    if (in_frame) {
+        /* Earlier UAV writes of the frame (async dispatches, traces) first. */
+        D3D12_RESOURCE_BARRIER uav;
+        memset(&uav, 0, sizeof(uav));
+        uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &uav);
+    }
 
     ID3D12GraphicsCommandList_SetComputeRootSignature(list, p->root_sig);
     ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(list, 0, ID3D12Resource_GetGPUVirtualAddress(d3d12_bound_as->tlas));
@@ -8183,6 +8207,18 @@ static int d3d12_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int
     d3d12_rt_texture_states(list, buffers, count, 0);
     for (int i = 0; i < count; i++)
         if (buffers[i].kind == VIO_RT_BIND_BUFFER) d3d12_buffer_to_readback(list, (vio_d3d12_buffer *)buffers[i].backend_buffer);
+    if (in_frame) {
+        for (int i = 0; i < count; i++) {
+            vio_d3d12_buffer *buf = (vio_d3d12_buffer *)buffers[i].backend_buffer;
+            if (buffers[i].kind == VIO_RT_BIND_BUFFER && buf) buf->uav_live_serial = vio_d3d12.frame_serial;
+        }
+        p->used_in_frame = 1;
+        /* Back to the frame's graphics state; readbacks wait for the frame so far. */
+        d3d12_restore_graphics_state_after_compute();
+        vio_d3d12.compute_async_pending++;
+        rc = 0;
+        goto done;
+    }
     if (FAILED(ID3D12GraphicsCommandList_Close(list))) goto done;
     {
         ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
@@ -8193,7 +8229,7 @@ static int d3d12_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int
     rc = 0;
 done:
     if (list4) ID3D12GraphicsCommandList4_Release(list4);
-    if (list) ID3D12GraphicsCommandList_Release(list);
+    if (list && !in_frame) ID3D12GraphicsCommandList_Release(list);
     if (alloc) ID3D12CommandAllocator_Release(alloc);
     return rc;
 }
