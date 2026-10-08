@@ -6781,14 +6781,20 @@ static int metal_enumerate_adapters(vio_adapter_info *out, int max)
                          : strstr(a->name, "NVIDIA") ? 0x10DE : 0x106B;
             a->device_type = dev.hasUnifiedMemory ? "integrated" : "discrete";
             a->vram_bytes = (uint64_t)dev.recommendedMaxWorkingSetSize;
-            a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
-                        | VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION) | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW);
+            memset(&a->features, 0, sizeof(a->features));
+            vio_featset_add(&a->features, VIO_FEATURE_COMPUTE);
+            vio_featset_add(&a->features, VIO_FEATURE_3D_PIPELINE);
+            vio_featset_add(&a->features, VIO_FEATURE_TESSELLATION);
+            vio_featset_add(&a->features, VIO_FEATURE_INDIRECT_DRAW);
             if ([dev respondsToSelector:@selector(supportsRaytracing)] && dev.supportsRaytracing)
-                a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAY_QUERY);
+                vio_featset_add(&a->features, VIO_FEATURE_RAY_QUERY);
             if ([dev supportsFamily:MTLGPUFamilyApple2])
-                a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
+                vio_featset_add(&a->features, VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
             if ([dev supportsFamily:MTLGPUFamilyApple7] || [dev supportsFamily:MTLGPUFamilyMac2])
-                a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MESH_SHADER) | VIO_FEATURE_BIT(VIO_FEATURE_SUBGROUP);
+            {
+                vio_featset_add(&a->features, VIO_FEATURE_MESH_SHADER);
+                vio_featset_add(&a->features, VIO_FEATURE_SUBGROUP);
+            }
         }
     }
     return n;

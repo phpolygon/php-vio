@@ -130,6 +130,24 @@ static inline const char *vio_usage_to_semantic(vio_usage u)
     }
 }
 
+/* VIO_D3D_WARP=<path to d3d10warp.dll>: a WARP from the Microsoft.Direct3D.WARP
+ * NuGet package instead of the one in System32 (SM6PLAN 0b). Loaded once, before
+ * the first WARP device: D3D11 and D3D12 load "d3d10warp.dll" by name and get the
+ * module already in the process. The OS WARP of a CI runner stops at SM 6.2;
+ * the NuGet WARP (1.0.18+) has SM 6.9 with DXR 1.2. */
+static inline void vio_d3d_load_warp(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    const char *path = getenv("VIO_D3D_WARP");
+    if (!path || !*path) return;
+    WCHAR wpath[MAX_PATH];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH) || !LoadLibraryW(wpath)) {
+        php_error_docref(NULL, E_WARNING, "VIO_D3D_WARP: cannot load '%s' (%lu); using the system WARP", path, GetLastError());
+    }
+}
+
 #endif /* HAVE_D3D11 || HAVE_D3D12 */
 
 /* Stencil state mapping shared by D3D11 / D3D12. Only dxgiformat.h is included

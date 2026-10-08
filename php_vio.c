@@ -111,12 +111,12 @@ PHP_INI_END()
 /* ── Backend scoring for 'auto' (OPEN-ITEMS-PLAN A7) ────────────────── */
 
 /* 1 = 'prefer' / 'require' / 'benchmark' given (scored 'auto'), 0 = plain 'auto', -1 = bad option (warned). */
-static int vio_select_options(HashTable *opts, int *prefer, uint64_t *require, int *benchmark)
+static int vio_select_options(HashTable *opts, int *prefer, vio_feature_set *require, int *benchmark)
 {
     zval *v;
     int scored = 0;
     *prefer = VIO_PREFER_PERFORMANCE;
-    *require = 0;
+    memset(require, 0, sizeof(*require));
     *benchmark = 0;
     if (!opts) return 0;
     /* A8: calibration run among the top candidates (implies the ranking). */
@@ -143,11 +143,11 @@ static int vio_select_options(HashTable *opts, int *prefer, uint64_t *require, i
         }
         ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(v), f) {
             zend_long x = zval_get_long(f);
-            if (x < 0 || x > 63) {
+            if (x < 0 || x >= VIO_FEATURE_SET_MAX) {
                 php_error_docref(NULL, E_WARNING, "'require' must be an array of VIO_FEATURE_* constants");
                 return -1;
             }
-            *require |= VIO_FEATURE_BIT(x);
+            vio_featset_add(require, (int)x);
         } ZEND_HASH_FOREACH_END();
     }
     return scored;
@@ -185,7 +185,7 @@ static void vio_select_adapter_from_zval(vio_adapter_info *a, zval *z)
         zval *f;
         ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(v), f) {
             zend_long x = zval_get_long(f);
-            if (x >= 0 && x < 64) a->features |= VIO_FEATURE_BIT(x);
+            vio_featset_add(&a->features, (int)x);
         } ZEND_HASH_FOREACH_END();
     }
 }
@@ -286,7 +286,7 @@ ZEND_FUNCTION(vio_rank_backends)
 {
     HashTable *opts = NULL;
     int prefer, platform, bench;
-    uint64_t require;
+    vio_feature_set require;
     vio_select_candidate rank[VIO_MAX_BACKENDS];
     ZEND_PARSE_PARAMETERS_START(0, 1)
         Z_PARAM_OPTIONAL
@@ -294,7 +294,7 @@ ZEND_FUNCTION(vio_rank_backends)
     ZEND_PARSE_PARAMETERS_END();
     if (vio_select_options(opts, &prefer, &require, &bench) < 0) RETURN_FALSE;
     int n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
-    vio_select_rank(rank, n, platform, prefer, require);
+    vio_select_rank(rank, n, platform, prefer, &require);
     vio_select_to_zval(return_value, rank, n);
 }
 
@@ -575,7 +575,7 @@ ZEND_FUNCTION(vio_benchmark_backends)
 {
     HashTable *opts = NULL;
     int prefer, platform, bench;
-    uint64_t require;
+    vio_feature_set require;
     vio_select_candidate rank[VIO_MAX_BACKENDS];
     ZEND_PARSE_PARAMETERS_START(0, 1)
         Z_PARAM_OPTIONAL
@@ -587,7 +587,7 @@ ZEND_FUNCTION(vio_benchmark_backends)
     if (max < 1) max = 1;
     if (max > VIO_MAX_BACKENDS) max = VIO_MAX_BACKENDS;
     int n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
-    vio_select_rank(rank, n, platform, prefer, require);
+    vio_select_rank(rank, n, platform, prefer, &require);
     vio_bench_candidates(rank, n, (int)max, vio_bench_frames(opts, "frames"), vio_bench_dir(opts, "cache"));
     vio_bench_reorder(rank, n);
     array_init(return_value);
@@ -635,14 +635,14 @@ ZEND_FUNCTION(vio_create)
     /* 'prefer' / 'require' turn 'auto' into a ranking (A7); plain 'auto' keeps
      * the platform priority list. */
     int select_prefer = VIO_PREFER_PERFORMANCE, rank_n = 0, benchmark = 0;
-    uint64_t select_require = 0;
+    vio_feature_set select_require = {{0}};
     vio_select_candidate rank[VIO_MAX_BACKENDS];
     int scored = auto_pick ? vio_select_options(options_ht, &select_prefer, &select_require, &benchmark) : 0;
     if (scored < 0) RETURN_FALSE;
     if (scored) {
         int platform;
         rank_n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
-        vio_select_rank(rank, rank_n, platform, select_prefer, select_require);
+        vio_select_rank(rank, rank_n, platform, select_prefer, &select_require);
         /* A8: the calibration run decides among the top three; cached per adapter + driver. */
         if (benchmark) {
             vio_bench_candidates(rank, rank_n, 3, vio_bench_frames(options_ht, "benchmark_frames"),
@@ -774,6 +774,22 @@ pick_backend:
             && Z_TYPE_P(val) == IS_STRING) {
             vio_shader_cache_set_dir(Z_STRVAL_P(val));
         }
+    }
+
+    /* VIO_D3D12_AGILITY_SDK / _VERSION: the same for every context without the
+     * option, so a whole test run uses the Agility runtime (SM69-PLAN 0a). */
+    if (!ctx->config.agility_sdk[0]) {
+        const char *env = getenv("VIO_D3D12_AGILITY_SDK");
+        if (env && *env && strlen(env) < sizeof(ctx->config.agility_sdk)) {
+            memcpy(ctx->config.agility_sdk, env, strlen(env) + 1);
+            const char *ev = getenv("VIO_D3D12_AGILITY_SDK_VERSION");
+            if (ev && *ev && ctx->config.agility_sdk_version == 0) ctx->config.agility_sdk_version = atoi(ev);
+        }
+    }
+    /* VIO_DXC_DIR: dxcompiler.dll + dxil.dll for every context without 'dxc_dir'. */
+    if (!ctx->config.dxc_dir[0]) {
+        const char *env = getenv("VIO_DXC_DIR");
+        if (env && *env && strlen(env) < sizeof(ctx->config.dxc_dir)) memcpy(ctx->config.dxc_dir, env, strlen(env) + 1);
     }
 
     /* Initialize backend */
@@ -924,8 +940,8 @@ pick_backend:
     ctx->initialized = 1;
     /* A required feature the ranking could not see before the device opened
      * (OpenGL, shader-toolchain flags): next candidate. */
-    for (int f = 0; scored && f < 64; f++) {
-        if ((select_require & VIO_FEATURE_BIT(f))
+    for (int f = 0; scored && f < VIO_FEATURE_SET_MAX; f++) {
+        if (vio_featset_has(&select_require, f)
             && !(ctx->backend->supports_feature && ctx->backend->supports_feature((vio_feature)f))) {
             zval_ptr_dtor(&obj);
             VIO_CREATE_FAIL();
@@ -5328,6 +5344,15 @@ ZEND_FUNCTION(vio_compute_pipeline)
             RETURN_THROWS();
         }
         desc.compute_msl = Z_STRVAL_P(msl_zval);
+    }
+    /* 'hlsl' => kernel source: D3D11 / D3D12 compile it instead of the translated GLSL */
+    zval *hlsl_zval = zend_hash_str_find(config_ht, "hlsl", sizeof("hlsl") - 1);
+    if (hlsl_zval && Z_TYPE_P(hlsl_zval) != IS_NULL) {
+        if (Z_TYPE_P(hlsl_zval) != IS_STRING || Z_STRLEN_P(hlsl_zval) == 0) {
+            zend_value_error("vio_compute_pipeline(): 'hlsl' must be a non-empty HLSL kernel source");
+            RETURN_THROWS();
+        }
+        desc.compute_hlsl = Z_STRVAL_P(hlsl_zval);
     }
 
     void *backend_pipeline = ctx->backend->create_compute_pipeline(&desc);
@@ -9949,8 +9974,8 @@ ZEND_FUNCTION(vio_adapters)
             add_assoc_string(&entry, "device_type", (char *)(a->device_type ? a->device_type : "unknown"));
             add_assoc_long(&entry, "vram_bytes", (zend_long)a->vram_bytes);
             array_init(&features);
-            for (int f = 0; f < 64; f++)
-                if (a->features & VIO_FEATURE_BIT(f)) add_next_index_long(&features, f);
+            for (int f = 0; f < VIO_FEATURE_SET_MAX; f++)
+                if (vio_featset_has(&a->features, f)) add_next_index_long(&features, f);
             add_assoc_zval(&entry, "features", &features);
             add_next_index_zval(&adapters, &entry);
         }
@@ -9969,6 +9994,11 @@ static int vio_as_parse(const char *fn, HashTable *list, vio_as_instance **inst_
                         vio_mesh_object ***mesh_out, int *geo_count_out);
 static void vio_as_keep(vio_acceleration_structure_object *as, const vio_as_instance *inst, int n,
                         vio_mesh_object **geo_mesh, int geo_count);
+/* The packed opacity micromaps of parsed geometries (emalloc). */
+static void vio_as_geo_free(vio_as_geometry *geo, int n)
+{
+    for (int i = 0; i < n; i++) if (geo[i].omm_data) { efree((void *)geo[i].omm_data); geo[i].omm_data = NULL; }
+}
 
 ZEND_FUNCTION(vio_acceleration_structure)
 {
@@ -10004,6 +10034,13 @@ ZEND_FUNCTION(vio_acceleration_structure)
     int pr = vio_as_parse("vio_acceleration_structure", list, &inst, &geo, &geo_mesh, &geo_count);
     if (pr == 0) RETURN_THROWS();
     if (pr < 0) RETURN_FALSE;
+    for (int g = 0; g < geo_count; g++) {
+        if (geo[g].omm_format && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_OPACITY_MICROMAP))) {
+            vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+            php_error_docref(NULL, E_WARNING, "%s: backend '%s' has no opacity micromaps (VIO_FEATURE_OPACITY_MICROMAP = 0)", "vio_acceleration_structure", ctx->backend->name);
+            RETURN_FALSE;
+        }
+    }
 
     vio_as_desc desc;
     desc.geometries = geo;
@@ -10012,7 +10049,7 @@ ZEND_FUNCTION(vio_acceleration_structure)
     desc.instance_count = n;
     void *handle = ctx->backend->create_acceleration_structure(&desc);
     if (!handle) {
-        efree(inst); efree(geo); efree(geo_mesh);
+        vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
         php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: the backend could not build it");
         RETURN_FALSE;
     }
@@ -10022,7 +10059,7 @@ ZEND_FUNCTION(vio_acceleration_structure)
     as->backend = ctx->backend;
     as->valid = 1;
     vio_as_keep(as, inst, n, geo_mesh, geo_count);
-    efree(inst); efree(geo); efree(geo_mesh);
+    vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
 }
 
 /* Parse an instance list (vio_acceleration_structure / _update): the
@@ -10041,13 +10078,13 @@ static int vio_as_parse(const char *fn, HashTable *list, vio_as_instance **inst_
     ZEND_HASH_FOREACH_VAL(list, entry) {
         zval *mz = Z_TYPE_P(entry) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(entry), "mesh", sizeof("mesh") - 1) : NULL;
         if (!mz || Z_TYPE_P(mz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(mz), vio_mesh_ce)) {
-            efree(inst); efree(geo); efree(geo_mesh);
+            vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
             zend_argument_value_error(strlen(fn) > 26 ? 3 : 2, "instance %d needs 'mesh' => VioMesh", idx);
             return 0;
         }
         vio_mesh_object *mesh = Z_VIO_MESH_P(mz);
         if (!mesh->rt_positions || mesh->vertex_count < 3) {
-            efree(inst); efree(geo); efree(geo_mesh);
+            vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
             php_error_docref(NULL, E_WARNING, "%s: instance %d: the mesh has no triangle positions "
                              "(create it on this context, location 0 at least float3)", fn, idx);
             return -1;
@@ -10064,12 +10101,68 @@ static int vio_as_parse(const char *fn, HashTable *list, vio_as_instance **inst_
         }
         inst[idx].geometry = g;
         inst[idx].mask = 0xFF;
+        /* 'opacity_micromap' => ['subdivision' => L, 'format' => 2|4, 'states' => string]:
+         * one byte per micro-triangle (0 transparent, 1 opaque, 2 unknown-transparent,
+         * 3 unknown-opaque), 4^L per triangle in index order; packed here (OC1). */
+        zval *oz = zend_hash_str_find(Z_ARRVAL_P(entry), "opacity_micromap", sizeof("opacity_micromap") - 1);
+        if (oz && Z_TYPE_P(oz) != IS_NULL) {
+            int argn = strlen(fn) > 26 ? 3 : 2;
+            zval *lz = Z_TYPE_P(oz) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(oz), "subdivision", sizeof("subdivision") - 1) : NULL;
+            zval *fz = Z_TYPE_P(oz) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(oz), "format", sizeof("format") - 1) : NULL;
+            zval *sz = Z_TYPE_P(oz) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(oz), "states", sizeof("states") - 1) : NULL;
+            zend_long lv = lz ? zval_get_long(lz) : 0, fv = fz ? zval_get_long(fz) : 2;
+            int tris = geo[g].indices ? geo[g].index_count / 3 : geo[g].vertex_count / 3;
+            size_t per = (size_t)1 << (2 * (lv >= 0 && lv <= 12 ? lv : 0));
+            if (Z_TYPE_P(oz) != IS_ARRAY || !sz || Z_TYPE_P(sz) != IS_STRING || lv < 0 || lv > 12 || (fv != 2 && fv != 4)) {
+                vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+                zend_argument_value_error(argn, "instance %d: 'opacity_micromap' needs 'subdivision' 0..12, 'format' 2 or 4 and a 'states' string", idx);
+                return 0;
+            }
+            if (Z_STRLEN_P(sz) != per * (size_t)tris) {
+                vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+                zend_argument_value_error(argn, "instance %d: 'opacity_micromap' 'states' must hold %zu bytes (%d triangles x 4^%d)",
+                                          idx, per * (size_t)tris, tris, (int)lv);
+                return 0;
+            }
+            const unsigned char *st = (const unsigned char *)Z_STRVAL_P(sz);
+            for (size_t k = 0; k < Z_STRLEN_P(sz); k++) {
+                if (st[k] > (fv == 2 ? 1 : 3)) {
+                    vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+                    zend_argument_value_error(argn, "instance %d: 'opacity_micromap' state %zu is %d - %s", idx, k, (int)st[k],
+                                              fv == 2 ? "2-state maps take 0 (transparent) or 1 (opaque)" : "states are 0..3");
+                    return 0;
+                }
+            }
+            int bits = fv == 2 ? 1 : 2;
+            int bytes = (int)(((per * (size_t)bits + 7) / 8 + 3) & ~(size_t)3);   /* 4-aligned per OMM */
+            if (geo[g].omm_format) {
+                /* the same mesh again: the same map or none */
+                if (geo[g].omm_format != (int)fv || geo[g].omm_subdivision != (int)lv) {
+                    vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+                    zend_argument_value_error(argn, "instance %d: a mesh carries one opacity micromap (another instance gave a different one)", idx);
+                    return 0;
+                }
+            } else {
+                unsigned char *packed = ecalloc((size_t)tris * (size_t)bytes + 4, 1);
+                for (int t = 0; t < tris; t++) {
+                    for (size_t m = 0; m < per; m++) {
+                        size_t bit = m * (size_t)bits;
+                        packed[(size_t)t * bytes + bit / 8] |= (unsigned char)(st[(size_t)t * per + m] << (bit % 8));
+                    }
+                }
+                geo[g].omm_format = (int)fv;
+                geo[g].omm_subdivision = (int)lv;
+                geo[g].omm_data = packed;
+                geo[g].omm_count = tris;
+                geo[g].omm_bytes = bytes;
+            }
+        }
         {
             zval *hz = zend_hash_str_find(Z_ARRVAL_P(entry), "hit_group", sizeof("hit_group") - 1);
             zval *kz = zend_hash_str_find(Z_ARRVAL_P(entry), "mask", sizeof("mask") - 1);
             zend_long hg = hz ? zval_get_long(hz) : 0, mk = kz ? zval_get_long(kz) : 0xFF;
             if (hg < 0 || hg >= VIO_RT_MAX_GROUPS || mk < 0 || mk > 255) {
-                efree(inst); efree(geo); efree(geo_mesh);
+                vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
                 zend_argument_value_error(strlen(fn) > 26 ? 3 : 2, "instance %d: 'hit_group' must be 0..%d and 'mask' 0..255", idx, VIO_RT_MAX_GROUPS - 1);
                 return 0;
             }
@@ -10080,7 +10173,7 @@ static int vio_as_parse(const char *fn, HashTable *list, vio_as_instance **inst_
         zval *tz = zend_hash_str_find(Z_ARRVAL_P(entry), "transform", sizeof("transform") - 1);
         if (tz) {
             if (Z_TYPE_P(tz) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(tz)) != 16) {
-                efree(inst); efree(geo); efree(geo_mesh);
+                vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
                 zend_argument_value_error(strlen(fn) > 26 ? 3 : 2, "instance %d: 'transform' must be 16 floats (column-major 4x4)", idx);
                 return 0;
             }
@@ -10151,6 +10244,13 @@ ZEND_FUNCTION(vio_acceleration_structure_update)
     int pr = vio_as_parse("vio_acceleration_structure_update", list, &inst, &geo, &geo_mesh, &geo_count);
     if (pr == 0) RETURN_THROWS();
     if (pr < 0) RETURN_FALSE;
+    for (int g = 0; g < geo_count; g++) {
+        if (geo[g].omm_format && !(ctx->backend->supports_feature && ctx->backend->supports_feature(VIO_FEATURE_OPACITY_MICROMAP))) {
+            vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
+            php_error_docref(NULL, E_WARNING, "%s: backend '%s' has no opacity micromaps (VIO_FEATURE_OPACITY_MICROMAP = 0)", "vio_acceleration_structure_update", ctx->backend->name);
+            RETURN_FALSE;
+        }
+    }
 
     /* The parsed geometries onto the structure's bottom levels. */
     int known = 1;
@@ -10189,7 +10289,7 @@ ZEND_FUNCTION(vio_acceleration_structure_update)
             kind = "full";
         }
     }
-    efree(map); efree(inst); efree(geo); efree(geo_mesh);
+    efree(map); vio_as_geo_free(geo, geo_count); efree(inst); efree(geo); efree(geo_mesh);
     if (!kind) {
         php_error_docref(NULL, E_WARNING, "vio_acceleration_structure_update: the backend could not update it");
         RETURN_FALSE;
@@ -11523,6 +11623,9 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_COMPRESSION_ASTC", VIO_FEATURE_TEXTURE_COMPRESSION_ASTC, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_DEPTH_MIPMAPS", VIO_FEATURE_DEPTH_MIPMAPS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RASTER_RATE_MAP", VIO_FEATURE_RASTER_RATE_MAP, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_LONG_VECTOR", VIO_FEATURE_LONG_VECTOR, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_SHADER_EXECUTION_REORDER", VIO_FEATURE_SHADER_EXECUTION_REORDER, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_OPACITY_MICROMAP", VIO_FEATURE_OPACITY_MICROMAP, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_DEPTH_REDUCE_MAX", VIO_DEPTH_REDUCE_MAX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_DEPTH_REDUCE_MIN", VIO_DEPTH_REDUCE_MIN, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);

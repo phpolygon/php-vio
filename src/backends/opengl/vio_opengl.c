@@ -459,8 +459,8 @@ static int opengl_enumerate_adapters(vio_adapter_info *out, int max)
     snprintf(out->driver, sizeof(out->driver), "%s", d.driver ? d.driver : "");
     out->vendor_id = d.vendor_id;
     out->device_type = d.device_type;
-    for (int f = 0; f < 64; f++)
-        if (opengl_supports_feature((vio_feature)f)) out->features |= VIO_FEATURE_BIT(f);
+    for (int f = 0; f < VIO_FEATURE_SET_MAX; f++)
+        if (opengl_supports_feature((vio_feature)f)) vio_featset_add(&out->features, f);
     return 1;
 }
 

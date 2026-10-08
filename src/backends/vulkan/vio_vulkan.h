@@ -340,6 +340,10 @@ typedef struct _vio_vulkan_state {
     int                      subgroup_quad_supported;   /* QUAD operations in the fragment stage */
     int                      barycentrics_supported;    /* VK_KHR_fragment_shader_barycentric enabled */
     int                      atomic64_supported;        /* shaderInt64 + shaderBufferInt64Atomics enabled */
+    int                      long_vector_supported;     /* VK_EXT_shader_long_vector: longVector enabled (SM69-PLAN) */
+    int                      ser_supported;             /* VK_EXT_ray_tracing_invocation_reorder enabled (SM69-PLAN) */
+    int                      omm_supported;             /* VK_EXT_opacity_micromap enabled (SM69-PLAN) */
+    void                    *fn_create_micromap, *fn_destroy_micromap, *fn_cmd_build_micromaps, *fn_get_micromap_sizes;
     int                      float16_supported;         /* VK_KHR_shader_float16_int8 shaderFloat16 enabled */
     int                      draw_parameters_supported; /* shaderDrawParameters + drawIndirectFirstInstance enabled */
     int                      compute_derivatives_supported; /* VK_NV / KHR_compute_shader_derivatives (quads) enabled */

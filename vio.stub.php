@@ -1020,7 +1020,16 @@ function vio_bind_buffer(VioContext $context, VioBuffer $buffer, int $binding = 
 /**
  * Create a GPU compute pipeline from a GLSL compute shader.
  *
- * @param array $config ['source' => string]  // GLSL `#version 450` compute source
+ * Optional backend-native kernels replace the translated GLSL where a feature
+ * has no portable form; the GLSL kernel stays required (its reflection gives
+ * local_size and the bindings):
+ * - 'msl'  => Metal compiles this MSL kernel (MSL 4 tensors, OPEN-ITEMS A17).
+ * - 'hlsl' => D3D11 / D3D12 compile this HLSL kernel, entry `main`
+ *             (Shader Model 6.9 long vectors, VIO_FEATURE_LONG_VECTOR). Registers
+ *             follow the GLSL bindings: Params UBO binding N = bN, storage buffers
+ *             and images binding N = tN (VIO_COMPUTE_READ) / uN (writable).
+ *
+ * @param array $config ['source' => string, 'msl' => ?string, 'hlsl' => ?string]
  * @return VioComputePipeline|false
  */
 function vio_compute_pipeline(VioContext $context, array $config): VioComputePipeline|false {}
