@@ -30,8 +30,8 @@ typedef struct _vio_select_candidate {
 } vio_select_candidate;
 
 int vio_select_host_platform(void);
-/* Score, filter by `require` (VIO_FEATURE_BIT mask) and sort: eligible first,
+/* Score, filter by `require` (a vio_feature_set) and sort: eligible first,
  * then by score, ties in the given order. */
-void vio_select_rank(vio_select_candidate *c, int n, int platform, int prefer, uint64_t require);
+void vio_select_rank(vio_select_candidate *c, int n, int platform, int prefer, const vio_feature_set *require);
 
 #endif /* VIO_BACKEND_REGISTRY_H */

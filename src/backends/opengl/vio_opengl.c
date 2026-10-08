@@ -13,12 +13,10 @@
 
 #include "php.h"
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
 
 #include <glad/glad.h>
 #include "../../vio_shader_cache.h"
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
 
 #include "vio_opengl.h"
 #include "../../shaders/default_shaders.h"
@@ -461,8 +459,8 @@ static int opengl_enumerate_adapters(vio_adapter_info *out, int max)
     snprintf(out->driver, sizeof(out->driver), "%s", d.driver ? d.driver : "");
     out->vendor_id = d.vendor_id;
     out->device_type = d.device_type;
-    for (int f = 0; f < 64; f++)
-        if (opengl_supports_feature((vio_feature)f)) out->features |= VIO_FEATURE_BIT(f);
+    for (int f = 0; f < VIO_FEATURE_SET_MAX; f++)
+        if (opengl_supports_feature((vio_feature)f)) vio_featset_add(&out->features, f);
     return 1;
 }
 
@@ -689,7 +687,9 @@ static void opengl_begin_frame(void)
                     glGetQueryObjectui64v(vio_gl.ts_query[slot][i], GL_QUERY_RESULT, &v);
                     ticks[i] = (uint64_t)v;
                 }
-                if (ticks[1] > ticks[0]) {
+                /* >=: a frame shorter than the timer resolution reads 0 ms; skipping
+                 * it kept the previous frame's sections (test 172, unmarked frames) */
+                if (ticks[1] >= ticks[0]) {
                     vio_gl.last_gpu_ms = (double)(ticks[1] - ticks[0]) / 1.0e6;
                     vio_gpu_mark_resolve(&vio_gl.ts_result, &vio_gl.ts_marks[slot], ticks, 1.0e-6);
                     vio_gl.ts_result_valid = 1;
@@ -3408,7 +3408,8 @@ int vio_opengl_get_glsl_version(void)
 
 int vio_opengl_setup_context(void)
 {
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+    /* The GL entry points of the context the platform made current */
+    if (!vio_plat()->gl_get_proc_address || !gladLoadGLLoader((GLADloadproc)vio_plat()->gl_get_proc_address)) {
         php_error_docref(NULL, E_WARNING, "Failed to initialize GLAD");
         return -1;
     }
@@ -3539,4 +3540,4 @@ int vio_opengl_setup_context(void)
     return 0;
 }
 
-#endif /* HAVE_GLFW */
+#endif /* HAVE_OPENGL */

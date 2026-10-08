@@ -1020,7 +1020,16 @@ function vio_bind_buffer(VioContext $context, VioBuffer $buffer, int $binding = 
 /**
  * Create a GPU compute pipeline from a GLSL compute shader.
  *
- * @param array $config ['source' => string]  // GLSL `#version 450` compute source
+ * Optional backend-native kernels replace the translated GLSL where a feature
+ * has no portable form; the GLSL kernel stays required (its reflection gives
+ * local_size and the bindings):
+ * - 'msl'  => Metal compiles this MSL kernel (MSL 4 tensors, OPEN-ITEMS A17).
+ * - 'hlsl' => D3D11 / D3D12 compile this HLSL kernel, entry `main`
+ *             (Shader Model 6.9 long vectors, VIO_FEATURE_LONG_VECTOR). Registers
+ *             follow the GLSL bindings: Params UBO binding N = bN, storage buffers
+ *             and images binding N = tN (VIO_COMPUTE_READ) / uN (writable).
+ *
+ * @param array $config ['source' => string, 'msl' => ?string, 'hlsl' => ?string]
  * @return VioComputePipeline|false
  */
 function vio_compute_pipeline(VioContext $context, array $config): VioComputePipeline|false {}
@@ -1144,6 +1153,67 @@ function vio_set_uniforms(VioContext $context, array $uniforms): void {}
 function vio_submit_batch(VioContext $context, array $draws): void {}
 
 /**
+ * Record a static draw sequence once (OPEN-ITEMS A38, BUNDLE-PLAN.md). $records
+ * are vio_submit_batch records ('mesh' required; 'pipeline', 'textures' =>
+ * [slot => VioTexture], 'uniforms' => [name => value] optional); the objects are
+ * held by the bundle. A record sets every uniform it relies on: values no
+ * record sets are undefined when the bundle plays, and uniforms set between
+ * recording and vio_draw_bundle do not change it. A malformed record throws a
+ * ValueError naming its index.
+ */
+function vio_bundle(VioContext $context, array $records): VioBundle|false {}
+
+/**
+ * Play a bundle inside a frame, into the pass open now (swapchain or render
+ * target). Backends with a native recording (vio_bundle_info()['native']) record
+ * it for the pass's attachment formats on first use; the others replay the
+ * records through the common draw path. The pipeline bound afterwards is
+ * undefined: bind one before the next draw. Returns false outside a frame.
+ */
+function vio_draw_bundle(VioContext $context, VioBundle $bundle): bool {}
+
+/**
+ * ['draws' => int, 'native' => bool, 'method' => 'replay' | 'secondary_command_buffer' (Vulkan) |
+ * 'bundle' (D3D12) | 'deferred_context' (D3D11)].
+ * 'native' becomes true after the first vio_draw_bundle on a backend that records natively.
+ */
+function vio_bundle_info(VioBundle $bundle): array {}
+
+/**
+ * Upscale $source (a render target's attachment 0 or a texture) to $target (a
+ * render target, or null for the swapchain) inside a frame (OPEN-ITEMS A21,
+ * UPSCALE-PLAN.md). Portable fragment passes on every backend with a 3D pipeline.
+ *
+ * Options:
+ *   'mode'      => VIO_UPSCALE_SPATIAL (default: edge-adaptive Lanczos-2) |
+ *                  VIO_UPSCALE_TEMPORAL (jittered frames accumulated into a history
+ *                  kept per context; output alpha is 1)
+ *   'sharpness' => 0..1 (default 0.25): contrast-adaptive sharpening, 0 = off
+ *   'jitter'    => [x, y]: temporal - the sub-pixel offset this frame's projection
+ *                  was shifted by, in source pixels (NDC directions, y up), e.g.
+ *                  vio_upscale_jitter($frame)
+ *   'motion'    => VioRenderTarget|VioTexture at source size: temporal - per pixel
+ *                  the UV now minus the UV in the previous frame (y up, = half the
+ *                  NDC delta) in .rg
+ *   'reset'     => true: temporal - drop the history (camera cut)
+ *   'native'    => false: skip the platform scaler (MetalFX on Metal, spatial into a
+ *                  render target; vio_upscale_info() names it) and run the portable passes
+ *
+ * The target stays bound afterwards (the swapchain for null); the bound pipeline
+ * is undefined. Returns false outside a frame.
+ */
+function vio_upscale(VioContext $context, VioRenderTarget|VioTexture $source, ?VioRenderTarget $target, ?array $options = []): bool {}
+
+/**
+ * Sub-pixel jitter for frame $frame of a $phases-long cycle: [x, y] in source
+ * pixels (-0.5..0.5), Halton(2, 3). Offset the projection by it (clip.xy +=
+ * 2 * jitter / sourceSize * clip.w) and pass it as vio_upscale's 'jitter'.
+ */
+function vio_upscale_jitter(int $frame, int $phases = 8): array {}
+
+/** ['spatial' => 'portable' | 'metalfx', 'temporal' => 'portable' | 'metalfx'] */
+function vio_upscale_info(VioContext $context): array {}
+/**
  * Get the name of the backend in use.
  */
 function vio_backend_name(VioContext $context): string {}
@@ -1161,6 +1231,13 @@ function vio_backend_count(): int {}
 function vio_backends(): array {}
 
 /**
+ * The window system vio runs on (OPEN-ITEMS A1, NATIVE-PLATFORM-PLAN): "glfw", a native
+ * layer ("win32", "cocoa", "x11") or "null" (no window system: headless / offscreen only).
+ * VIO_PLATFORM=<name> in the environment picks one of the built-in platforms.
+ */
+function vio_platform(): string {}
+
+/**
  * Read the host's thermal pressure level.
  *
  * On macOS / iOS this maps NSProcessInfo.thermalState to the string tokens
@@ -1172,7 +1249,12 @@ function vio_thermal_state(): string {}
 /**
  * Create a video recorder for capturing frames to a video file.
  *
- * @param array $config ['path' => string, 'fps' => int (default 30), 'codec' => string (optional)]
+ * @param array $config ['path' => string, 'fps' => int (default 30),
+ *   'encoder' => 'auto' (default: the platform's hardware encoders - Windows NVENC, AMF, QSV,
+ *   Media Foundation; Apple VideoToolbox; Linux NVENC - then libx264) | 'hardware' (no software
+ *   fallback) | 'software' (libx264) | an FFmpeg encoder name; 'codec' is the old spelling]
+ *   On D3D11 a hardware encoder that takes D3D11 frames gets the frame without a CPU copy
+ *   (vio_recorder_info()['zero_copy']).
  * @return VioRecorder|false Recorder object or false on failure
  */
 function vio_recorder(VioContext $context, array $config): VioRecorder|false {}
@@ -1186,6 +1268,23 @@ function vio_recorder_capture(VioRecorder $recorder, VioContext $context): bool 
  * Stop recording and finalize the video file.
  */
 function vio_recorder_stop(VioRecorder $recorder): void {}
+
+/**
+ * ['encoder' => FFmpeg name, 'hardware' => bool, 'zero_copy' => bool, 'frames' => int,
+ *  'width' => int, 'height' => int, 'fps' => int, 'recording' => bool]
+ */
+function vio_recorder_info(VioRecorder $recorder): array|false {}
+
+/**
+ * Facts of a video file: ['width', 'height', 'frames' (decoded and counted), 'fps', 'codec'],
+ * false when it is no video FFmpeg can read.
+ */
+function vio_video_info(string $path): array|false {}
+
+/**
+ * Frame $index of a video decoded to RGBA: ['width', 'height', 'data'], false past the end.
+ */
+function vio_video_frame(string $path, int $index): array|false {}
 
 /**
  * Create a live stream to an RTMP or SRT endpoint.
@@ -1616,9 +1715,21 @@ function vio_draw_instanced(VioContext $context, VioMesh $mesh, array|string $ma
  *                                               //   sampler2DArray via vio_render_target_texture(). 'cube' + 'depth_only'
  *                                               //   gives a depth cube (vio_render_target_cubemap). Both need
  *                                               //   VIO_FEATURE_RENDER_TARGET_LAYERED.
+ *   'rate_map' => ['x' => [q, ...], 'y' => [q, ...]] // sampling quality 0 < q <= 1 of 1..16 equal zones per
+ *                                               //   axis (OPEN-ITEMS A16). With VIO_FEATURE_RASTER_RATE_MAP
+ *                                               //   (Metal) low-quality zones render with fewer samples into a
+ *                                               //   smaller physical target, resolved into the texture when the
+ *                                               //   pass leaves the target; elsewhere full rate. Plain 2D colour
+ *                                               //   targets only (ValueError otherwise).
  * @return VioRenderTarget|false Render target or false on failure
  */
 function vio_render_target(VioContext $context, array $config): VioRenderTarget|false {}
+
+/**
+ * ['width', 'height', 'physical_width', 'physical_height', 'rate_map' => bool]: the logical
+ * size and the size the GPU renders at (smaller with an active rate map).
+ */
+function vio_render_target_size(VioRenderTarget $target): array {}
 
 /**
  * Bind a render target for subsequent draw calls (redirects rendering to FBO).

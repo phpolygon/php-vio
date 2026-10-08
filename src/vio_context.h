@@ -19,9 +19,9 @@ typedef struct _vio_context_object {
     const vio_backend *backend;
     vio_config         config;
     void              *surface;
-    /* GLFWwindow* — typed as void* so this header doesn't depend on
-     * HAVE_GLFW being visible to every translation unit that includes it.
-     * Only translation units that actually drive GLFW need the cast. */
+    /* vio_window_handle (include/vio_platform.h): whatever the active
+     * platform created - a GLFWwindow* behind the GLFW platform, a native
+     * window state behind the others. Opaque everywhere else. */
     void              *window;
     vio_input_state    input;
     vio_2d_state       state_2d;
@@ -75,12 +75,16 @@ typedef struct _vio_context_object {
      * "score") and the ranked candidates of a scored 'auto' (NULL otherwise). */
     const char        *selected_by;
     zend_array        *candidates;
+    /* vio_upscale: passes, history and intermediates (php_vio.c), released
+     * before the backend shuts down. */
+    void              *upscale;
     zend_object        std;
 } vio_context_object;
 
 /* Drop the vio_texture_index() references (before the backend shuts down). */
 void vio_context_bindless_clear(vio_context_object *ctx);
 void vio_context_release_fragment_storage(vio_context_object *ctx);
+void vio_upscale_release(vio_context_object *ctx);
 
 extern zend_class_entry *vio_context_ce;
 

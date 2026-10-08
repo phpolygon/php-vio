@@ -507,6 +507,39 @@ typedef struct _vio_backend {
      * every following draw until changed. read_buffer of a buffer a draw wrote
      * waits for those draws (mid-frame: the frame so far). 0 = done. */
     int (*bind_fragment_storage)(void *backend_buffer, int binding);
+
+    /* Recorded draw sequences (vio_bundle, BUNDLE-PLAN.md, OPEN-ITEMS A38). A
+     * backend that records natively starts a recording for the pass open now
+     * (begin_bundle; NULL = no native recording, the records are replayed through
+     * the common draw path), during which the draw path records instead of
+     * drawing; end_bundle closes it (0 = usable). draw_bundle plays it inside a
+     * frame (0 = done, -1 = does not fit the open pass: record again);
+     * destroy_bundle frees it. bundle_method names the mechanism. */
+    void       *(*begin_bundle)(void);
+    int         (*end_bundle)(void *backend_bundle);
+    int         (*draw_bundle)(void *backend_bundle);
+    void        (*destroy_bundle)(void *backend_bundle);
+    const char *(*bundle_method)(void);
+
+    /* 1 when NDC +Y lands in row 0 of a target (D3D, Vulkan in vio, Metal), 0 on
+     * OpenGL (row 0 = NDC -Y). vio_upscale turns NDC-space jitter and motion
+     * into storage space with it. */
+    int         rt_origin_top;
+
+    /* vio_upscale through the platform's own scaler (UPSCALE-PLAN phase 3,
+     * MetalFX): upscale_method names it for a mode (NULL = portable passes);
+     * upscale_native scales the backend texture into attachment 0 of a render
+     * target inside the frame (0 = done, else the portable passes run). */
+    const char *(*upscale_method)(int mode);
+    int         (*upscale_native)(void *src_backend_texture, void *dst_render_target, int mode);
+
+    /* GPU video encoding without a CPU copy (VIDEO-ENCODE-PLAN phase 2):
+     * encode_device hands out the native device an FFmpeg hardware device can
+     * wrap (*api = VIO_ENCODE_API_*); encode_copy_frame copies the last finished
+     * frame (the one vio_read_pixels returns) into slice `slice` of a texture of
+     * that device, same size and format as the swapchain (0 = done). */
+    void       *(*encode_device)(int *api);
+    int         (*encode_copy_frame)(void *dst_texture, int slice, int width, int height);
 } vio_backend;
 
 #define VIO_MAX_FRAGMENT_STORAGE 4

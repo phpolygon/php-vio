@@ -12,6 +12,13 @@ when the draw is recorded.
 Three orders are checked, each must sample the intended texture on every backend
 with a 3D pipeline: (a) bind, then set sampler uniforms; (b) bind while an
 unrelated pipeline is bound, then switch; (c) the reference order.
+
+(d) Units the bound shader does not sample must not reach it: textures left on
+units 1-4 (an earlier pass of the frame, or stray binds) next to a shader with a
+uniform block and one sampler on unit 0. Metal bound such a unit at its raw
+number, and its renumbering puts that sampler at [[texture(1)]] behind the
+block: the stray texture replaced it (vio_upscale's copy pass read the previous
+history that way, one frame late).
 --EXTENSIONS--
 vio
 --SKIPIF--
@@ -62,6 +69,7 @@ void main() {
 }
 GLSL;
 $fsOther = "#version 330 core\nuniform sampler2D u_x;\nlayout(location=0) out vec4 o;\nvoid main(){ o = texture(u_x, vec2(0.5)); }";
+$fsTinted = "#version 330 core\nuniform vec4 u_tint;\nuniform sampler2D u_c;\nlayout(location=0) out vec4 o;\nvoid main(){ o = texture(u_c, vec2(0.5)) * u_tint; }";
 
 $solid = fn(int $r, int $g, int $b) => str_repeat(pack('C4', $r, $g, $b, 255), 16);
 $face = fn(int $r, int $g, int $b) => array_merge(...array_fill(0, 16, [$r, $g, $b, 255]));
@@ -79,6 +87,9 @@ foreach ($backends as $be) {
     $fmt = $name === 'opengl' ? VIO_SHADER_GLSL_RAW : VIO_SHADER_GLSL;
     $pipe  = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs, 'fragment' => $fs, 'format' => $fmt]), 'depth_test' => false, 'cull_mode' => VIO_CULL_NONE]);
     $other = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs, 'fragment' => $fsOther, 'format' => $fmt]), 'depth_test' => false, 'cull_mode' => VIO_CULL_NONE]);
+    $tinted = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs, 'fragment' => $fsTinted, 'format' => $fmt]), 'depth_test' => false, 'cull_mode' => VIO_CULL_NONE]);
+    $texC = vio_texture($ctx, ['data' => $solid(200, 100, 50), 'width' => 4, 'height' => 4]);
+    $texW = vio_texture($ctx, ['data' => $solid(255, 255, 255), 'width' => 4, 'height' => 4]);
     $quad = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0, 1,1,0, -1,1,0], 'indices' => [0,1,2,0,2,3], 'layout' => [VIO_FLOAT3]]);
     $texA = vio_texture($ctx, ['data' => $solid(200, 0, 0), 'width' => 4, 'height' => 4]);
     $texB = vio_texture($ctx, ['data' => $solid(0, 100, 0), 'width' => 4, 'height' => 4]);
@@ -101,6 +112,13 @@ foreach ($backends as $be) {
         'bind-then-set' => function () use ($ctx, $pipe, $bind, $set) { vio_bind_pipeline($ctx, $pipe); $bind(); $set(); },
         'bind-under-other-pipeline' => function () use ($ctx, $pipe, $other, $bind, $set) { vio_bind_pipeline($ctx, $other); $bind(); vio_bind_pipeline($ctx, $pipe); $set(); },
         'set-then-bind' => function () use ($ctx, $pipe, $bind, $set) { vio_bind_pipeline($ctx, $pipe); $set(); $bind(); },
+        'stray-units' => function () use ($ctx, $tinted, $texC, $texW) {
+            vio_bind_pipeline($ctx, $tinted);
+            vio_bind_texture($ctx, $texC, 0);
+            for ($u = 1; $u <= 4; $u++) vio_bind_texture($ctx, $texW, $u);
+            vio_set_uniform($ctx, 'u_c', 0);
+            vio_set_uniform($ctx, 'u_tint', [1.0, 1.0, 1.0, 1.0]);
+        },
     ];
     foreach ($orders as $label => $prepare) {
         vio_begin($ctx);

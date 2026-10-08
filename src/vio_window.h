@@ -1,46 +1,55 @@
 /*
- * php-vio - GLFW window management
+ * php-vio - Window helpers over the active platform (include/vio_platform.h)
+ *
+ * The window system lives behind the vio_platform vtable (GLFW in
+ * src/platform/glfw/, native layers next to it); these names stay as the
+ * short spelling the callers already use.
  */
 
 #ifndef VIO_WINDOW_H
 #define VIO_WINDOW_H
 
 #include "../include/vio_types.h"
+#include "../include/vio_platform.h"
 
-#ifdef HAVE_GLFW
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-#endif
-
-/* Initialize GLFW globally (call once in MINIT) */
-int vio_window_init(void);
-
-/* Shutdown GLFW globally (call once in MSHUTDOWN) */
+/* Register the built-in platforms and initialise the active one (MINIT). */
+int  vio_window_init(void);
+/* Shut the active platform down (MSHUTDOWN). */
 void vio_window_shutdown(void);
 
-#ifdef HAVE_GLFW
+static inline vio_window_handle vio_window_create(vio_config *cfg, const char *backend_name)
+{
+    return vio_plat()->create_window(cfg, backend_name);
+}
 
-/* Create a GLFW window. backend_name determines API hints (e.g., "opengl"). */
-GLFWwindow *vio_window_create(vio_config *cfg, const char *backend_name);
+static inline void vio_window_destroy(vio_window_handle window)
+{
+    vio_plat()->destroy_window(window);
+}
 
-/* Destroy a GLFW window. */
-void vio_window_destroy(GLFWwindow *window);
+static inline int vio_window_should_close(vio_window_handle window)
+{
+    return vio_plat()->should_close(window);
+}
 
-/* Check if window should close. */
-int vio_window_should_close(GLFWwindow *window);
+static inline void vio_window_set_should_close(vio_window_handle window, int value)
+{
+    vio_plat()->set_should_close(window, value);
+}
 
-/* Set window should close flag. */
-void vio_window_set_should_close(GLFWwindow *window, int value);
+static inline void vio_window_poll_events(void)
+{
+    vio_plat()->poll_events();
+}
 
-/* Poll all pending events. */
-void vio_window_poll_events(void);
+static inline void vio_window_swap_buffers(vio_window_handle window)
+{
+    vio_plat()->swap_buffers(window);
+}
 
-/* Swap buffers (for OpenGL). */
-void vio_window_swap_buffers(GLFWwindow *window);
-
-/* Get framebuffer size. */
-void vio_window_get_framebuffer_size(GLFWwindow *window, int *width, int *height);
-
-#endif /* HAVE_GLFW */
+static inline void vio_window_get_framebuffer_size(vio_window_handle window, int *width, int *height)
+{
+    vio_plat()->get_framebuffer_size(window, width, height);
+}
 
 #endif /* VIO_WINDOW_H */
