@@ -909,6 +909,11 @@ typedef struct _vio_shader_desc {
      * sampler feedback has no GLSL form). The GLSL fragment stage stays required
      * and defines the cbuffer layout. */
     const char       *fragment_hlsl;
+    /* vio_compute_pipeline(['msl' => src]) (OPEN-ITEMS A17): Metal compiles this
+     * kernel instead of the translated GLSL (MSL 4 tensors / Metal Performance
+     * Primitives have no GLSL form). The GLSL kernel stays required: its
+     * reflection gives local_size and the bindings (binding N = buffer / texture N). */
+    const char       *compute_msl;
     /* vio_shader(['view_count' => N]) (VIO_FEATURE_MULTIVIEW): the stages use
      * gl_ViewIndex and every draw runs N times, view v into layer v of a target
      * bound with VIO_RT_ALL_LAYERS. 0 = not a multiview shader. */

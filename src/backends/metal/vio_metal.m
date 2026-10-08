@@ -6254,6 +6254,13 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
 
     vio_metal_compute_pipeline *cp = NULL;
 
+    /* 'msl' override (A17): the caller's kernel with the GLSL kernel's
+     * reflection (local_size, params index, binding N = buffer / texture N). */
+    if (desc->compute_msl) {
+        free(msl);
+        msl = strdup(desc->compute_msl);
+        if (!msl) return NULL;
+    }
     int uses_as = msl && strstr(msl, "acceleration_structure") != NULL;
     @autoreleasepool {
         NSString *msl_src = [NSString stringWithUTF8String:msl];

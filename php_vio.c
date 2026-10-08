@@ -5414,6 +5414,15 @@ ZEND_FUNCTION(vio_compute_pipeline)
     desc.fragment_data = Z_STRVAL_P(src_zval);
     desc.fragment_size = Z_STRLEN_P(src_zval);
     desc.format = VIO_SHADER_GLSL;
+    /* 'msl' => kernel source: Metal compiles it instead of the translated GLSL */
+    zval *msl_zval = zend_hash_str_find(config_ht, "msl", sizeof("msl") - 1);
+    if (msl_zval && Z_TYPE_P(msl_zval) != IS_NULL) {
+        if (Z_TYPE_P(msl_zval) != IS_STRING || Z_STRLEN_P(msl_zval) == 0) {
+            zend_value_error("vio_compute_pipeline(): 'msl' must be a non-empty MSL kernel source");
+            RETURN_THROWS();
+        }
+        desc.compute_msl = Z_STRVAL_P(msl_zval);
+    }
 
     void *backend_pipeline = ctx->backend->create_compute_pipeline(&desc);
     if (!backend_pipeline) {
