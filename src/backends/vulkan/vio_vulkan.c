@@ -1219,6 +1219,8 @@ static int vulkan_enumerate_adapters(vio_adapter_info *out, int max)
     return n;
 }
 
+static int vulkan_update_texture(void *tex_obj, const void *pixels, int x, int y, int w, int h);
+
 /* Glyph atlas filled on demand (A33): the atlas is an R8 texture from
  * create_texture (single_channel); the sub-region upload is update_texture's. */
 static int vulkan_update_font_atlas(void *font_obj, const unsigned char *r8, int x, int y, int w, int h)
