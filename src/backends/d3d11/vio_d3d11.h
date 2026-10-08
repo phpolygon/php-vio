@@ -57,6 +57,19 @@ typedef struct _vio_d3d11_pipeline {
     D3D11_PRIMITIVE_TOPOLOGY topology;
     UINT                     vertex_stride;
     UINT                     stencil_ref;      /* OMSetDepthStencilState reference */
+    /* Input layouts per mesh layout (vio_mesh_layout.key, OPEN-ITEMS-PLAN A31):
+     * the element template with each element's location, the VS bytecode to
+     * validate against, and the variants built so far. */
+    D3D11_INPUT_ELEMENT_DESC *elements;
+    int                      *element_loc;
+    char                    (*sem_names)[24];
+    int                       element_count;
+    ID3DBlob                 *vs_blob;
+    struct { uint32_t key; ID3D11InputLayout *il; } il_variants[8];
+    int                       il_variant_count;
+    /* Multiview by instancing (OPEN-ITEMS-PLAN A10): instances per user instance
+     * (the views), 1 without multiview; per-instance data steps every `views`. */
+    UINT                      views;
 } vio_d3d11_pipeline;
 
 /* Buffer wrapper */
@@ -72,6 +85,8 @@ typedef struct _vio_d3d11_buffer {
      * created on first dispatch that writes this buffer. */
     ID3D11Buffer *readback_staging;
     size_t        readback_size; /* allocated bytes of readback_staging */
+    ID3D11UnorderedAccessView *fs_uav;   /* raw UAV for the fragment stage (A15), created on first bind */
+    int           fs_dirty;              /* written by a draw since the last readback */
 } vio_d3d11_buffer;
 
 /* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */
@@ -276,12 +291,23 @@ typedef struct _vio_d3d11_state {
     double       last_gpu_ms;
 
     /* Window reference */
-    void *glfw_window;
+    void *platform_window;
 
     /* Adapter of the device, for vio_gpu_info(): UTF-8 description (WARP reports
      * "Microsoft Basic Render Driver") and DedicatedVideoMemory. */
     char     gpu_name[256];
     uint64_t vram_bytes;
+    uint32_t vendor_id;        /* vio_backend_info (A4) */
+    char     driver[32];
+    int      software_adapter; /* WARP */
+    /* Depth mip reduction (A26), built on first use. */
+    ID3D11VertexShader      *dmip_vs;
+    ID3D11PixelShader       *dmip_ps;
+    ID3D11PixelShader       *dmip_resolve_ps;   /* depth_only MSAA resolve (A24) */
+    ID3D11PixelShader       *dmip_copy_ps;      /* texel copy into another format (video encoding, A39) */
+    ID3D11Buffer            *dmip_cb;
+    ID3D11DepthStencilState *dmip_dss;
+    ID3D11RasterizerState   *dmip_rs;
 } vio_d3d11_state;
 
 extern vio_d3d11_state vio_d3d11;
@@ -290,13 +316,16 @@ extern vio_d3d11_state vio_d3d11;
 void vio_backend_d3d11_register(void);
 
 /* Called after GLFW window creation to set up D3D11 */
-int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg);
+int vio_d3d11_setup_context(void *platform_window, vio_config *cfg);
 
 /* Re-apply a render-target bind that vio_bind_render_target deferred because
  * it was called before vio_begin() (d3d11_begin_frame resets the backbuffer
  * binding, so the offscreen redirect has to be applied AFTER begin_frame).
  * No-op unless such a bind is pending. Called from vio_begin(). */
 void vio_d3d11_apply_pending_render_target(void);
+/* Instances per user instance of the bound pipeline (views under multiview by
+ * instancing, else 1): vio_draw_instanced's inline D3D11 path multiplies by it. */
+UINT vio_d3d11_multiview_instances(void);
 
 /* Resolve the GPU-local per-frame mirror (readback_mirror) into the CPU-readable
  * readback_staging texture, creating/resizing staging as needed. Call this

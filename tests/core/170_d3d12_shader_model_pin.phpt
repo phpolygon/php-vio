@@ -1,5 +1,5 @@
 --TEST--
-D3D12 shader model pinning: shader_model => 6x picks exactly that DXC profile (clamped to what device + DXC accept), version-gated features follow it, VIO_D3D12_SHADER_MODEL applies without the option, the option wins
+D3D12 shader model pinning: shader_model => 6x picks exactly that DXC profile (clamped to what device + DXC accept), version-gated features (SHADER_FLOAT16 from 6.2, COMPUTE_DERIVATIVES from 6.6) follow it, VIO_D3D12_SHADER_MODEL applies without the option, the option wins
 --EXTENSIONS--
 vio
 --SKIPIF--
@@ -43,10 +43,10 @@ for ($p = 60; $p <= $max; $p++) {
     $c = make(['shader_model' => $p]);
     $v = ver($c);
     $f16 = vio_supports_feature($c, VIO_FEATURE_SHADER_FLOAT16);
-    $bv = vio_supports_feature($c, VIO_FEATURE_BASE_VERTEX);
+    $cd = vio_supports_feature($c, VIO_FEATURE_COMPUTE_DERIVATIVES);
     if ($v !== $p) { echo "FAIL pin $p -> $v\n"; $ok = false; }
     if ($p < 62 && $f16) { echo "FAIL pin $p reports SHADER_FLOAT16\n"; $ok = false; }
-    if ($p < 68 && $bv)  { echo "FAIL pin $p reports BASE_VERTEX\n"; $ok = false; }
+    if ($p < 66 && $cd)  { echo "FAIL pin $p reports COMPUTE_DERIVATIVES\n"; $ok = false; }
     vio_destroy($c);
 }
 echo "pins: ", $ok ? "OK" : "FAIL", "\n";

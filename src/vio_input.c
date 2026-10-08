@@ -7,6 +7,7 @@
 #endif
 
 #include "vio_input.h"
+#include "../include/vio_platform.h"
 #include "../include/vio_types.h"
 #include <string.h>
 
@@ -264,72 +265,18 @@ void vio_input_scroll_event(vio_input_state *state, double dx, double dy)
     state->scroll_y += dy;
 }
 
-#ifdef HAVE_GLFW
-
-/* While a replay runs it owns the input: OS events are dropped, so a human
- * touching the mouse cannot knock a replayed run off course. */
-static vio_input_state *glfw_input_state(GLFWwindow *window)
+/* The window's framebuffer changed size (platform layer): fire on_resize.
+ * Not recorded - a replay does not resize the window. */
+void vio_input_resize_event(vio_input_state *state, int width, int height)
 {
-    vio_input_state *state = (vio_input_state *)glfwGetWindowUserPointer(window);
-    return (state && !state->replaying) ? state : NULL;
-}
-
-static void glfw_key_callback(GLFWwindow *window, int key, int scancode, int action, int mods)
-{
-    (void)scancode;
-    vio_input_key_event(glfw_input_state(window), key, action, mods);
-}
-
-static void glfw_char_callback(GLFWwindow *window, unsigned int codepoint)
-{
-    vio_input_emit_char(glfw_input_state(window), codepoint);
-}
-
-static void glfw_cursor_pos_callback(GLFWwindow *window, double xpos, double ypos)
-{
-    vio_input_cursor_event(glfw_input_state(window), xpos, ypos);
-}
-
-static void glfw_mouse_button_callback(GLFWwindow *window, int button, int action, int mods)
-{
-    (void)mods;
-    vio_input_button_event(glfw_input_state(window), button, action);
-}
-
-static void glfw_scroll_callback(GLFWwindow *window, double xoffset, double yoffset)
-{
-    vio_input_scroll_event(glfw_input_state(window), xoffset, yoffset);
-}
-
-static void glfw_framebuffer_size_callback(GLFWwindow *window, int width, int height)
-{
-    vio_input_state *state = (vio_input_state *)glfwGetWindowUserPointer(window);
-    if (!state) return;
-
-    /* Fire PHP callback if registered */
-    if (state->has_resize_callback) {
-        zval retval, args[2];
-        ZVAL_LONG(&args[0], width);
-        ZVAL_LONG(&args[1], height);
-
-        if (call_user_function(NULL, NULL, &state->on_resize_callback, &retval, 2, args) == SUCCESS) {
-            zval_ptr_dtor(&retval);
-        }
+    if (!state || !state->has_resize_callback) return;
+    zval retval, args[2];
+    ZVAL_LONG(&args[0], width);
+    ZVAL_LONG(&args[1], height);
+    if (call_user_function(NULL, NULL, &state->on_resize_callback, &retval, 2, args) == SUCCESS) {
+        zval_ptr_dtor(&retval);
     }
 }
-
-void vio_input_install_callbacks(GLFWwindow *window, vio_input_state *state)
-{
-    glfwSetWindowUserPointer(window, state);
-    glfwSetKeyCallback(window, glfw_key_callback);
-    glfwSetCharCallback(window, glfw_char_callback);
-    glfwSetCursorPosCallback(window, glfw_cursor_pos_callback);
-    glfwSetMouseButtonCallback(window, glfw_mouse_button_callback);
-    glfwSetScrollCallback(window, glfw_scroll_callback);
-    glfwSetFramebufferSizeCallback(window, glfw_framebuffer_size_callback);
-}
-
-#endif /* HAVE_GLFW */
 
 /* ── Touch push API ─────────────────────────────────────────────────
  *
@@ -544,20 +491,12 @@ int vio_gamepad_read(int id, vio_gamepad_snapshot *out)
     }
     if (vio_physical_hidden) return 0;
 
-#ifdef HAVE_GLFW
-    GLFWgamepadstate gs;
-    if (glfwJoystickPresent(id) && glfwGetGamepadState(id, &gs)) {
-        const char *name = glfwGetGamepadName(id);
+    const vio_platform *plat = vio_plat();
+    if (plat->joystick_present(id) && plat->gamepad_state(id, out->buttons, out->axes)) {
+        const char *name = plat->gamepad_name(id);
         out->connected = 1;
         snprintf(out->name, sizeof(out->name), "%s", name ? name : "");
-        for (int i = 0; i < VIO_GAMEPAD_BUTTON_COUNT; i++) {
-            out->buttons[i] = gs.buttons[i] == GLFW_PRESS;
-        }
-        for (int i = 0; i < VIO_GAMEPAD_AXIS_COUNT; i++) {
-            out->axes[i] = gs.axes[i];
-        }
     }
-#endif
     return out->connected;
 }
 

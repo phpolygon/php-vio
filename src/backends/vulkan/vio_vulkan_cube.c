@@ -82,10 +82,9 @@ static int vkc_run_mips(VkImage img, int w, int h, int layers, int levels)
     /* The frame's draws into the image are recorded on the frame command buffer,
      * so the blits must follow them there. */
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
-    int had_pass = vio_vk.cur_render_pass != VK_NULL_HANDLE;
+    int had_pass = vio_vk.in_pass;
     if (had_pass) {
-        vkCmdEndRenderPass(cmd);
-        vio_vk.cur_render_pass = VK_NULL_HANDLE;
+        vio_vk_pass_end(cmd);
     }
     vio_vk_record_mips(cmd, img, w, h, layers, levels);
     if (had_pass && !vio_vk.frame_is_offscreen) vio_vk_resume_swapchain_pass(cmd);
@@ -113,6 +112,7 @@ int vio_vk_generate_mipmaps(void *obj, int kind)
             vio_render_target_object *rt = (vio_render_target_object *)obj;
             vio_vk_rt *x = (vio_vk_rt *)rt->vulkan_rt;
             if (!x) return -1;
+            if (rt->depth_only) return vio_vk_generate_depth_mips(rt);
             if (!x->cube || x->levels <= 1) return 0;
             return vkc_run_mips(x->color_image[0], rt->width, rt->height, 6, x->levels);
         }
@@ -269,6 +269,10 @@ static VkFormat vkc_tex_format(int f)
         case VIO_FORMAT_BC4: return VK_FORMAT_BC4_UNORM_BLOCK;
         case VIO_FORMAT_BC5: return VK_FORMAT_BC5_UNORM_BLOCK;
         case VIO_FORMAT_BC7: return VK_FORMAT_BC7_UNORM_BLOCK;
+        case VIO_FORMAT_ASTC_4x4: return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+        case VIO_FORMAT_ASTC_5x5: return VK_FORMAT_ASTC_5x5_UNORM_BLOCK;
+        case VIO_FORMAT_ASTC_6x6: return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+        case VIO_FORMAT_ASTC_8x8: return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
         case VIO_FORMAT_RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
         default: return VK_FORMAT_UNDEFINED;
     }
@@ -280,7 +284,8 @@ void *vio_vk_create_texture_ex(vio_texture_desc *desc)
     int f = desc->format;
     VkFormat fmt = vkc_tex_format(f);
     int compressed = vio_texfmt_is_compressed(f);
-    if (fmt == VK_FORMAT_UNDEFINED || (compressed && !vio_vk.bc_supported)) return NULL;
+    if (fmt == VK_FORMAT_UNDEFINED) return NULL;
+    if (vio_texfmt_is_astc(f) ? !vio_vk.astc_supported : (compressed && !vio_vk.bc_supported)) return NULL;
     int w = desc->width, h = desc->height;
     int layers = desc->layers > 1 ? desc->layers : 1;
     int stored = desc->mip_levels > 1 ? desc->mip_levels : 1;

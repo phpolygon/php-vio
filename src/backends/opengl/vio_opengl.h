@@ -15,6 +15,8 @@ typedef struct _vio_opengl_state {
     unsigned int default_shader_pos_only;
     int          initialized;
     int          in_frame;      /* between begin_frame and end_frame: vio_clear clears eagerly */
+    unsigned int clip_program;  /* program of the bound pipeline and the gl_ClipDistance */
+    int          clip_count;    /* planes its last geometry stage writes (A29) */
     float        clear_r, clear_g, clear_b, clear_a;
 
     /* Runtime-detected capabilities. Filled by vio_opengl_setup_context()
@@ -57,6 +59,8 @@ typedef struct _vio_opengl_state {
         int has_draw_parameters;         /* GL 4.6 / GL_ARB_shader_draw_parameters + base instance (4.2) */
         int has_compute_derivatives;     /* compute + GL_NV_compute_shader_derivatives */
         int has_multiview;               /* GL_OVR_multiview2 + layered attachments (3.2) */
+        int has_vertex_layer;            /* GL_ARB_shader_viewport_layer_array: gl_Layer from the vertex stage */
+        int multiview_emulate;           /* views by instancing although OVR is there (VIO_GL_EMULATE_MULTIVIEW=1) */
     } caps;
 
     /* Cached extension list. NULL until setup; freed in shutdown. */

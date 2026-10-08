@@ -56,12 +56,13 @@ configure.bat
 configure.js
 
 # run-tests.php artifacts (regenerated per run)
-tests/*.sh
-tests/*.diff
-tests/*.log
-tests/*.out
-tests/*.php
-tests/*.skip.php
+tests/**/*.sh
+tests/**/*.diff
+tests/**/*.log
+tests/**/*.out
+tests/**/*.php
+tests/**/*.exp
+tests/**/*.mem
 
 # Ad-hoc debug output
 /debug.log
@@ -74,3 +75,6 @@ Thumbs.db
 # Local build/diagnostic artifacts
 build_*.log
 x64/
+
+# wayland-scanner output (config.m4)
+src/platform/wayland/gen/
