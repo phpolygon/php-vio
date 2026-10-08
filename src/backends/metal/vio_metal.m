@@ -29,9 +29,9 @@ static void metal_marks_reset(void);
 static void metal_archive_close(void);
 static void metal_upscale_release(void);
 static void metal_rrm_release(void);
-static void metal_rrm_resolve(vio_render_target_object *rt);
 #include "../../shaders/shaders_2d.h"
 #include "../../vio_render_target.h"
+static void metal_rrm_resolve(vio_render_target_object *rt);
 #include "../../vio_texfmt.h"
 #include "../../vio_buffer.h"   /* vio_buffer_object — compute storage-buffer free path */
 #include "../../vio_shader_cache.h"
