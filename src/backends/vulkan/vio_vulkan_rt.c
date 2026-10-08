@@ -35,6 +35,7 @@
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
+
 static VkAccessFlags vkrt_access(VkImageLayout l)
 {
     switch (l) {
@@ -70,7 +71,6 @@ void vio_vk_image_barrier_range(VkCommandBuffer cmd, VkImage image, VkImageAspec
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          0, 0, NULL, 0, NULL, 1, &b);
 }
-
 static VkImageAspectFlags vkrt_depth_aspect(void)
 {
     return VK_IMAGE_ASPECT_DEPTH_BIT | (vio_vk.depth_has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
@@ -1265,10 +1265,13 @@ int vio_vk_read_render_target(void *rt_ptr, int face, int attachment, void *out_
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     vio_vk_rt *x = rt ? (vio_vk_rt *)rt->vulkan_rt : NULL;
     if (!x || !out_rgba || !vio_vk.device) return -1;
-    if (vio_vk.in_frame) {
-        php_error_docref(NULL, E_WARNING, "vio_read_render_target: call it after vio_end on Vulkan");
-        return -1;
-    }
+    /* Inside a frame: submit what the frame recorded so far and wait for it
+     * (the open pass ends, the target is back in its resting layout and the
+     * pass is reopened with LOAD on the frame command buffer), then read with a
+     * transient submission, which the queue runs before the rest of the frame.
+     * Outside a frame: wait for the last submission (VULKAN-MODERN-PLAN). */
+    if (vio_vk.in_frame) vio_vk_flush_frame();
+    else vio_vk_wait_value(vio_vk.timeline_value);
     int depth = rt->depth_only;
     if (!depth && (attachment < 0 || attachment >= x->count)) return -1;
     uint32_t layer = 0;
@@ -1282,7 +1285,6 @@ int vio_vk_read_render_target(void *rt_ptr, int face, int attachment, void *out_
     uint32_t w = (uint32_t)rt->width, h = (uint32_t)rt->height;
     VkDeviceSize bytes = (VkDeviceSize)w * h * (VkDeviceSize)bpp;
 
-    vkDeviceWaitIdle(vio_vk.device);
     VkBuffer staging = VK_NULL_HANDLE;
     void *alloc = NULL;
     if (vio_vma_create_buffer(vio_vk.vma_allocator, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,

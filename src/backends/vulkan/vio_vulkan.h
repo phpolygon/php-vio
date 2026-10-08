@@ -57,7 +57,10 @@ typedef struct _vio_vk_frame {
     VkCommandPool   cmd_pool;
     VkCommandBuffer cmd_buf;
     VkSemaphore     image_available;
-    VkFence         in_flight;
+    /* Timeline value of the slot's last submission (VULKAN-MODERN-PLAN phase 2):
+     * begin_frame waits it before reusing the command buffer, pools and ring
+     * slices of the slot. 0 = never submitted. */
+    uint64_t        value;
 } vio_vk_frame;
 
 /* Buffer wrapper for every vio buffer type on this backend: compute / graphics
@@ -225,10 +228,15 @@ typedef struct _vio_vulkan_state {
      * physical device offers it; max_anisotropy is the device limit. */
     int                      anisotropy_supported;
     float                    max_anisotropy;
-    /* Persistent pool + fence for one-shot uploads / compute dispatches
-     * (GAP-PLAN 4.4); lazily created, destroyed in vulkan_shutdown. */
+    /* Persistent pool for one-shot uploads / compute dispatches (GAP-PLAN 4.4);
+     * lazily created, destroyed in vulkan_shutdown. */
     VkCommandPool            transient_pool;
-    VkFence                  transient_fence;
+    /* VULKAN-MODERN-PLAN phase 2: every queue submission signals the next value
+     * of this timeline semaphore (vio_vk_submit); waiting for work means waiting
+     * for its value (vio_vk_wait_value). Binary semaphores remain only for
+     * acquire / present. */
+    VkSemaphore              timeline;
+    uint64_t                 timeline_value;   /* last value a submission signals */
     /* GPU timestamps (GAP-PHASE5 Block 3): two queries per frame in flight,
      * reset + written in the frame's command buffer, read after its fence. */
     /* On-disk pipeline cache (GAP-PHASE5 Block 4): loaded at init from the
@@ -381,11 +389,9 @@ typedef struct _vio_vulkan_state {
     uint32_t                 capture_w, capture_h;
     int                      capture_valid;
     int                      acquire_consumed;   /* a mid-frame readback submit already waited image_available */
-    VkFence                  midframe_fence;
-    /* The in_flight fence of the submit that carries the newest capture copy
-     * (A36): vio_read_pixels waits it instead of vkDeviceWaitIdle. Cleared once
-     * begin_frame has waited that fence (the copy is done). */
-    VkFence                  capture_fence;
+    /* Timeline value of the submission that carries the newest capture copy
+     * (A36): vio_read_pixels waits it instead of vkDeviceWaitIdle. */
+    uint64_t                 capture_value;
 
     /* Offscreen render-target binding (mirrors vio_d3d12). current_bound_rt is
      * the vio_render_target_object* whose render pass is active, or NULL =
@@ -521,6 +527,11 @@ void vulkan_record_unbind_render_target(void);
 int vulkan_read_pixels(int width, int height, void *out_rgba);
 
 /* ── Shared helpers (vio_vulkan.c) ── */
+/* Submit `cmd` (may be NULL) on the graphics queue: waits `wait_bin` at
+ * `wait_stage` when set, signals `signal_bin` when set, and always the next
+ * timeline value, which it returns (0 when the submission failed). */
+uint64_t vio_vk_submit(VkCommandBuffer cmd, VkSemaphore wait_bin, VkPipelineStageFlags2 wait_stage, VkSemaphore signal_bin);
+void     vio_vk_wait_value(uint64_t value);   /* host wait until the timeline reaches value */
 VkFormat vio_vk_depth_format(void);
 int      vio_vk_begin_transient(VkCommandBuffer *out_cmd);
 int      vio_vk_submit_transient(VkCommandBuffer cmd);

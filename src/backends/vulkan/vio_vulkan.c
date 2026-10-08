@@ -1634,6 +1634,27 @@ static int create_render_pass(VkFormat color_format)
 
 /* ── Per-frame resources ─────────────────────────────────────────── */
 
+/* The timeline semaphore every submission signals (created on first use, so
+ * uploads before the frame resources exist work too). */
+static int vk_ensure_timeline(void)
+{
+    if (vio_vk.timeline) return 0;
+    if (!vio_vk.device) return -1;
+    VkSemaphoreTypeCreateInfo type = {0};
+    type.sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    type.initialValue  = 0;
+    VkSemaphoreCreateInfo tci = {0};
+    tci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    tci.pNext = &type;
+    if (vkCreateSemaphore(vio_vk.device, &tci, NULL, &vio_vk.timeline) != VK_SUCCESS) {
+        vio_vk.timeline = VK_NULL_HANDLE;
+        return -1;
+    }
+    vio_vk.timeline_value = 0;
+    return 0;
+}
+
 static int create_frame_resources(void)
 {
     for (int i = 0; i < VIO_VK_MAX_FRAMES_IN_FLIGHT; i++) {
@@ -1665,14 +1686,54 @@ static int create_frame_resources(void)
         VkSemaphoreCreateInfo sem_info = {0};
         sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         vkCreateSemaphore(vio_vk.device, &sem_info, NULL, &f->image_available);
-
-        VkFenceCreateInfo fence_info = {0};
-        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        vkCreateFence(vio_vk.device, &fence_info, NULL, &f->in_flight);
+        f->value = 0;
     }
 
-    return 0;
+    return vk_ensure_timeline();
+}
+
+uint64_t vio_vk_submit(VkCommandBuffer cmd, VkSemaphore wait_bin, VkPipelineStageFlags2 wait_stage, VkSemaphore signal_bin)
+{
+    if (vk_ensure_timeline() != 0 || !vio_vk.fn_submit2) return 0;
+    uint64_t value = vio_vk.timeline_value + 1;
+    VkSemaphoreSubmitInfo wait = {0};
+    wait.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    wait.semaphore = wait_bin;
+    wait.stageMask = wait_stage;
+    VkSemaphoreSubmitInfo sig[2];
+    memset(sig, 0, sizeof(sig));
+    sig[0].sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    sig[0].semaphore = vio_vk.timeline;
+    sig[0].value     = value;
+    sig[0].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    sig[1].sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    sig[1].semaphore = signal_bin;
+    sig[1].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkCommandBufferSubmitInfo cb = {0};
+    cb.sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cb.commandBuffer = cmd;
+    VkSubmitInfo2 si = {0};
+    si.sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    si.waitSemaphoreInfoCount   = wait_bin ? 1 : 0;
+    si.pWaitSemaphoreInfos      = wait_bin ? &wait : NULL;
+    si.commandBufferInfoCount   = cmd ? 1 : 0;
+    si.pCommandBufferInfos      = cmd ? &cb : NULL;
+    si.signalSemaphoreInfoCount = signal_bin ? 2 : 1;
+    si.pSignalSemaphoreInfos    = sig;
+    if (((PFN_vkQueueSubmit2)vio_vk.fn_submit2)(vio_vk.graphics_queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) return 0;
+    vio_vk.timeline_value = value;
+    return value;
+}
+
+void vio_vk_wait_value(uint64_t value)
+{
+    if (!value || !vio_vk.timeline || !vio_vk.fn_wait_semaphores) return;
+    VkSemaphoreWaitInfo wi = {0};
+    wi.sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    wi.semaphoreCount = 1;
+    wi.pSemaphores    = &vio_vk.timeline;
+    wi.pValues        = &value;
+    ((PFN_vkWaitSemaphores)vio_vk.fn_wait_semaphores)(vio_vk.device, &wi, UINT64_MAX);
 }
 
 static void destroy_frame_resources(void)
@@ -1683,11 +1744,12 @@ static void destroy_frame_resources(void)
     }
     for (int i = 0; i < VIO_VK_MAX_FRAMES_IN_FLIGHT; i++) {
         vio_vk_frame *f = &vio_vk.frames[i];
-        if (f->in_flight) vkDestroyFence(vio_vk.device, f->in_flight, NULL);
         if (f->image_available) vkDestroySemaphore(vio_vk.device, f->image_available, NULL);
         if (f->cmd_pool) vkDestroyCommandPool(vio_vk.device, f->cmd_pool, NULL);
+        f->value = 0;
     }
-    vio_vk.capture_fence = VK_NULL_HANDLE;
+    if (vio_vk.timeline) { vkDestroySemaphore(vio_vk.device, vio_vk.timeline, NULL); vio_vk.timeline = VK_NULL_HANDLE; }
+    vio_vk.capture_value = 0;
 }
 
 /* ── Swapchain recreation ────────────────────────────────────────── */
@@ -1933,10 +1995,6 @@ static void vulkan_shutdown(void)
         vio_vma_destroy_buffer(vio_vk.vma_allocator, vio_vk.capture_buf, vio_vk.capture_alloc);
         vio_vk.capture_buf = VK_NULL_HANDLE;
     }
-    if (vio_vk.midframe_fence && vio_vk.device) {
-        vkDestroyFence(vio_vk.device, vio_vk.midframe_fence, NULL);
-        vio_vk.midframe_fence = VK_NULL_HANDLE;
-    }
 
     /* Sweep any backend textures whose owning PHP object outlived vio_destroy()
      * (the Zend free handlers run during request shutdown, AFTER this). Without
@@ -2013,7 +2071,6 @@ static void vulkan_shutdown(void)
         vio_vk.bindless_set = VK_NULL_HANDLE;
     }
     if (vio_vk.vma_allocator) { vio_vma_destroy(vio_vk.vma_allocator); vio_vk.vma_allocator = NULL; }
-    if (vio_vk.device && vio_vk.transient_fence) { vkDestroyFence(vio_vk.device, vio_vk.transient_fence, NULL); vio_vk.transient_fence = VK_NULL_HANDLE; }
     vulkan_release_rt_pipelines();
     vulkan_release_acceleration_structures();
     if (vio_vk.device && vio_vk.transient_pool)  { vkDestroyCommandPool(vio_vk.device, vio_vk.transient_pool, NULL); vio_vk.transient_pool = VK_NULL_HANDLE; }
@@ -2226,16 +2283,8 @@ static int vulkan_ensure_transient_pool(void)
             return -1;
         }
     }
-    if (!vio_vk.transient_fence) {
-        VkFenceCreateInfo fci = {0};
-        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        if (vkCreateFence(vio_vk.device, &fci, NULL, &vio_vk.transient_fence) != VK_SUCCESS) {
-            vio_vk.transient_fence = VK_NULL_HANDLE;
-            php_error_docref(NULL, E_WARNING, "Vulkan: failed to create transient fence");
-            return -1;
-        }
-    }
     return 0;
+
 }
 
 static int vulkan_begin_transient_commands(VkCommandPool *out_pool, VkCommandBuffer *out_cmd)
@@ -2284,19 +2333,14 @@ static int vulkan_submit_transient_commands(VkCommandPool pool, VkCommandBuffer 
         return -1;
     }
 
-    vkResetFences(vio_vk.device, 1, &vio_vk.transient_fence);
-    VkSubmitInfo submit = {0};
-    submit.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers    = &cmd;
-    if (vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, vio_vk.transient_fence) != VK_SUCCESS) {
+    uint64_t value = vio_vk_submit(cmd, VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    if (!value) {
         php_error_docref(NULL, E_WARNING, "Vulkan: failed to submit transient commands");
-        /* The submit did not take; do NOT wait the (never-signalled) fence.
-         * Best-effort drain so the cmd buffer is not in flight. */
+        /* The submit did not take; best-effort drain so the cmd buffer is not in flight. */
         vkDeviceWaitIdle(vio_vk.device);
         rc = -1;
     } else {
-        vkWaitForFences(vio_vk.device, 1, &vio_vk.transient_fence, VK_TRUE, UINT64_MAX);
+        vio_vk_wait_value(value);
     }
     vkFreeCommandBuffers(vio_vk.device, vio_vk.transient_pool, 1, &cmd);
     return rc;
@@ -3638,9 +3682,8 @@ static void vulkan_begin_frame(void)
      * leaves this 0 so vulkan_present skips. */
     vio_vk.frame_presentable = 0;
 
-    /* Wait for this frame's previous work to finish */
-    vkWaitForFences(vio_vk.device, 1, &f->in_flight, VK_TRUE, UINT64_MAX);
-    if (vio_vk.capture_fence == f->in_flight) vio_vk.capture_fence = VK_NULL_HANDLE;   /* copy retired; the fence is reset below */
+    /* Wait for this frame slot's previous work to finish */
+    vio_vk_wait_value(f->value);
 
     /* GPU timestamps: this slot's previous frame has retired — read its pair. */
     if (vio_vk.ts_pool && vio_vk.ts_pending[vio_vk.current_frame]) {
@@ -3672,10 +3715,8 @@ static void vulkan_begin_frame(void)
     if (offscreen) {
         /* OFFSCREEN-ONLY: no acquire, no swapchain pass. Reset+begin the command
          * buffer (same as the normal path) so the offscreen pass + 2D draws can
-         * record onto it, and reset the in_flight fence (the end-of-frame submit
-         * still signals it). current_image_index is intentionally NOT touched —
-         * no swapchain image participates in this frame. */
-        vkResetFences(vio_vk.device, 1, &f->in_flight);
+         * record onto it. current_image_index is intentionally NOT touched — no
+         * swapchain image participates in this frame. */
         vkResetCommandBuffer(f->cmd_buf, 0);
 
         VkCommandBufferBeginInfo begin_info = {0};
@@ -3746,7 +3787,6 @@ static void vulkan_begin_frame(void)
         vio_vk.swapchain_needs_recreate = 1;
     }
 
-    vkResetFences(vio_vk.device, 1, &f->in_flight);
     vkResetCommandBuffer(f->cmd_buf, 0);
 
     /* Begin command buffer */
@@ -3889,20 +3929,9 @@ static void vulkan_end_frame(void)
         }
         vkEndCommandBuffer(f->cmd_buf);
 
-        VkSubmitInfo submit = {0};
-        submit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit.waitSemaphoreCount   = 0;
-        submit.pWaitSemaphores      = NULL;
-        submit.pWaitDstStageMask    = NULL;
-        submit.commandBufferCount   = 1;
-        submit.pCommandBuffers      = &f->cmd_buf;
-        submit.signalSemaphoreCount = 0;
-        submit.pSignalSemaphores    = NULL;
-
-        /* Submit on the in_flight fence: vulkan_begin_frame waits it before reusing
-         * this frame's command buffer / descriptor pool / VBO slice, and
-         * vulkan_destroy_render_target's vkDeviceWaitIdle (4c) also gates on it. */
-        vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, f->in_flight);
+        /* The slot's timeline value: vulkan_begin_frame waits it before reusing
+         * this frame's command buffer / descriptor pool / VBO slice. */
+        f->value = vio_vk_submit(f->cmd_buf, VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
         vkc_frame_submitted();
 
         vio_vk.in_frame = 0;
@@ -3920,26 +3949,16 @@ static void vulkan_end_frame(void)
     }
     vkEndCommandBuffer(f->cmd_buf);
 
-    /* Submit */
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-
-    VkSubmitInfo submit = {0};
-    submit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    /* A mid-frame readback may already have waited the acquire semaphore. */
-    submit.waitSemaphoreCount   = vio_vk.acquire_consumed ? 0 : 1;
-    submit.pWaitSemaphores      = vio_vk.acquire_consumed ? NULL : &f->image_available;
-    submit.pWaitDstStageMask    = vio_vk.acquire_consumed ? NULL : &wait_stage;
-    submit.commandBufferCount   = 1;
-    submit.pCommandBuffers      = &f->cmd_buf;
-    submit.signalSemaphoreCount = 1;
-    /* Signal the render_finished tied to the swapchain IMAGE being rendered, not
-     * the frame-in-flight (avoids VUID-vkQueueSubmit-pSignalSemaphores-00067). */
-    submit.pSignalSemaphores    = &vio_vk.render_finished_per_image[vio_vk.current_image_index];
-
-    vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, f->in_flight);
+    /* Submit: wait the acquire (unless a mid-frame readback already did), signal
+     * the render_finished tied to the swapchain IMAGE being rendered, not the
+     * frame-in-flight (avoids VUID-vkQueueSubmit-pSignalSemaphores-00067), and
+     * the slot's timeline value. */
+    f->value = vio_vk_submit(f->cmd_buf, vio_vk.acquire_consumed ? VK_NULL_HANDLE : f->image_available,
+                             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             vio_vk.render_finished_per_image[vio_vk.current_image_index]);
     vkc_frame_submitted();
     vio_vk.acquire_consumed = 0;
-    if (vio_vk.capture_valid) vio_vk.capture_fence = f->in_flight;
+    if (vio_vk.capture_valid) vio_vk.capture_value = f->value;
 
     vio_vk.in_frame = 0;
 }
@@ -4785,32 +4804,15 @@ void vio_vk_flush_frame(void)
     vio_vk_fs_storage_host_barrier(cmd);
     vkEndCommandBuffer(cmd);
 
-    if (!vio_vk.midframe_fence) {
-        VkFenceCreateInfo fci = {0};
-        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        if (vkCreateFence(vio_vk.device, &fci, NULL, &vio_vk.midframe_fence) != VK_SUCCESS) vio_vk.midframe_fence = VK_NULL_HANDLE;
+    int wait_acquire = !vio_vk.frame_is_offscreen && vio_vk.frame_presentable && !vio_vk.acquire_consumed;
+    uint64_t value = vio_vk_submit(cmd, wait_acquire ? f->image_available : VK_NULL_HANDLE,
+                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_NULL_HANDLE);
+    if (value) {
+        vio_vk_wait_value(value);
+        if (wait_acquire) vio_vk.acquire_consumed = 1;
+    } else {
+        vkDeviceWaitIdle(vio_vk.device);
     }
-    int ok = 0;
-    if (vio_vk.midframe_fence) {
-        vkResetFences(vio_vk.device, 1, &vio_vk.midframe_fence);
-        VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        VkSubmitInfo si = {0};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        int wait_acquire = !vio_vk.frame_is_offscreen && vio_vk.frame_presentable && !vio_vk.acquire_consumed;
-        if (wait_acquire) {
-            si.waitSemaphoreCount = 1;
-            si.pWaitSemaphores    = &f->image_available;
-            si.pWaitDstStageMask  = &ws;
-        }
-        si.commandBufferCount = 1;
-        si.pCommandBuffers    = &cmd;
-        if (vkQueueSubmit(vio_vk.graphics_queue, 1, &si, vio_vk.midframe_fence) == VK_SUCCESS) {
-            vkWaitForFences(vio_vk.device, 1, &vio_vk.midframe_fence, VK_TRUE, UINT64_MAX);
-            if (wait_acquire) vio_vk.acquire_consumed = 1;
-            ok = 1;
-        }
-    }
-    if (!ok) vkDeviceWaitIdle(vio_vk.device);
 
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo bi = {0};
@@ -4852,32 +4854,16 @@ static int vulkan_capture_midframe(void)
     vulkan_capture_frame(cmd);
     vkEndCommandBuffer(cmd);
 
-    if (!vio_vk.midframe_fence) {
-        VkFenceCreateInfo fci = {0};
-        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        if (vkCreateFence(vio_vk.device, &fci, NULL, &vio_vk.midframe_fence) != VK_SUCCESS) vio_vk.midframe_fence = VK_NULL_HANDLE;
+    uint64_t value = vio_vk_submit(cmd, vio_vk.acquire_consumed ? VK_NULL_HANDLE : f->image_available,
+                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_NULL_HANDLE);
+    int ok = value != 0;
+    if (ok) {
+        vio_vk_wait_value(value);
+        vio_vk.acquire_consumed = 1;
+    } else {
+        vkDeviceWaitIdle(vio_vk.device);
     }
-    int ok = 0;
-    if (vio_vk.midframe_fence) {
-        vkResetFences(vio_vk.device, 1, &vio_vk.midframe_fence);
-        VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        VkSubmitInfo si = {0};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        if (!vio_vk.acquire_consumed) {
-            si.waitSemaphoreCount = 1;
-            si.pWaitSemaphores    = &f->image_available;
-            si.pWaitDstStageMask  = &ws;
-        }
-        si.commandBufferCount = 1;
-        si.pCommandBuffers    = &cmd;
-        if (vkQueueSubmit(vio_vk.graphics_queue, 1, &si, vio_vk.midframe_fence) == VK_SUCCESS) {
-            vkWaitForFences(vio_vk.device, 1, &vio_vk.midframe_fence, VK_TRUE, UINT64_MAX);
-            vio_vk.acquire_consumed = 1;
-            ok = 1;
-        }
-    }
-    if (!ok) vkDeviceWaitIdle(vio_vk.device);
-    vio_vk.capture_fence = VK_NULL_HANDLE;   /* the copy above is complete */
+    vio_vk.capture_value = 0;   /* the copy above is complete */
 
     /* Reopen the frame command buffer and resume the swapchain pass (LOAD). */
     vkResetCommandBuffer(cmd, 0);
@@ -4901,7 +4887,7 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
     if (vio_vk.headless && vio_vk.capture_valid && vio_vk.capture_buf) {
         /* Only the submit that copied the newest frame (A36); earlier copies into
          * the same buffer retire before it on the one graphics queue. */
-        if (vio_vk.capture_fence) vkWaitForFences(vio_vk.device, 1, &vio_vk.capture_fence, VK_TRUE, UINT64_MAX);
+        vio_vk_wait_value(vio_vk.capture_value);
         unsigned char *src = (unsigned char *)vio_vma_map(vio_vk.vma_allocator, vio_vk.capture_alloc);
         if (!src) return -1;
         uint32_t cw = vio_vk.capture_w, ch = vio_vk.capture_h;
@@ -4938,13 +4924,7 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
      * device (A36). Outside a frame every in_flight fence is signalled or
      * belongs to a submitted batch (begin_frame resets it only on a path that
      * reaches end_frame). */
-    {
-        VkFence fences[VIO_VK_MAX_FRAMES_IN_FLIGHT];
-        uint32_t nf = 0;
-        for (int i = 0; i < VIO_VK_MAX_FRAMES_IN_FLIGHT; i++)
-            if (vio_vk.frames[i].in_flight) fences[nf++] = vio_vk.frames[i].in_flight;
-        if (nf) vkWaitForFences(vio_vk.device, nf, fences, VK_TRUE, UINT64_MAX);
-    }
+    vio_vk_wait_value(vio_vk.timeline_value);
 
     /* Re-acquire a swapchain image to read from. This is REQUIRED for sync
      * correctness, not just convenience: after vio_end the just-rendered image
@@ -5095,10 +5075,6 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
 
     vkEndCommandBuffer(cmd);
 
-    VkFence fence = VK_NULL_HANDLE;
-    VkFenceCreateInfo fci = {0};
-    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    vkCreateFence(vio_vk.device, &fci, NULL, &fence);
 
     /* Semaphore signalled by the readback submit and waited by the re-present,
      * so the presentation engine does not read the image until the copy + the
@@ -5109,18 +5085,8 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
     /* Wait the acquire semaphore at TRANSFER (the stage of our first barrier +
      * copy): the present -> acquire -> copy dependency that resolves the
      * WRITE_AFTER_PRESENT hazard. */
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo submit = {0};
-    submit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.waitSemaphoreCount   = 1;
-    submit.pWaitSemaphores      = &acq_sem;
-    submit.pWaitDstStageMask    = &wait_stage;
-    submit.commandBufferCount   = 1;
-    submit.pCommandBuffers      = &cmd;
-    submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores    = &done_sem;
-    vkQueueSubmit(vio_vk.graphics_queue, 1, &submit, fence);
-    vkWaitForFences(vio_vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    uint64_t rb_value = vio_vk_submit(cmd, acq_sem, VK_PIPELINE_STAGE_2_TRANSFER_BIT, done_sem);
+    if (rb_value) vio_vk_wait_value(rb_value); else vkDeviceWaitIdle(vio_vk.device);
 
     /* Map + copy out. The swapchain is B8G8R8A8_UNORM, so the buffer holds
      * B,G,R,A per pixel; D3D12's readback is R8G8B8A8_UNORM (R,G,B,A). Swap the
@@ -5179,7 +5145,6 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
 
     vkDestroySemaphore(vio_vk.device, done_sem, NULL);
     vkDestroySemaphore(vio_vk.device, acq_sem, NULL);
-    vkDestroyFence(vio_vk.device, fence, NULL);
     vkDestroyCommandPool(vio_vk.device, pool, NULL); /* frees cmd */
     vio_vma_destroy_buffer(vio_vk.vma_allocator, rb_buf, rb_alloc);
 
