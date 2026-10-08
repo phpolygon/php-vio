@@ -93,7 +93,7 @@ jobs:
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
-      - name: Run tests (Wayland: headless weston + Mesa software GL)
+      - name: Run tests (Wayland, headless weston + Mesa software GL)
         run: |
           # The same suite on the native Wayland platform: a headless weston
           # (pixman renderer - Mesa's software EGL and lavapipe hand it wl_shm
@@ -308,7 +308,7 @@ jobs:
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
-      - name: Run tests (Wayland: headless weston + Mesa software GL)
+      - name: Run tests (Wayland, headless weston + Mesa software GL)
         run: |
           # The same suite on the native Wayland platform: a headless weston
           # (pixman renderer - Mesa's software EGL and lavapipe hand it wl_shm
