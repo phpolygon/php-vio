@@ -30,17 +30,108 @@
 typedef struct {
     unsigned short x, y, w, h;   /* atlas rect; w==h==0 for blank glyphs (space) */
     short bearing_x, bearing_y;  /* stbtt_GetGlyphBitmapBox ix0 / iy0 (y-down) */
+    unsigned char state;         /* VIO_GLYPH_* */
 } vio_glyph_slot;
 
-/* Per-font atlas state kept behind font->shape_atlas after the one-time build.
- * The atlas is packed once (all glyphs, by index) at font creation and uploaded
- * exactly like the legacy path — so the GPU texture handle is stable for the
- * font's whole life. No runtime rasterization, no re-upload, no destroy race
- * (which would be unsafe on deferred backends like D3D12/Vulkan). */
+#define VIO_GLYPH_METRICS 0   /* box known (w/h = bitmap size), not in the atlas yet */
+#define VIO_GLYPH_READY   1   /* in the atlas, or blank */
+
+/* Per-font atlas state behind font->shape_atlas. The atlas texture is created
+ * once at font creation (its GPU handle is stable for the font's life). With a
+ * backend that has update_font_atlas (A33) glyphs are rasterized the first time
+ * vio_text draws them, into a CPU copy of the atlas, and each vio_text call
+ * uploads the rectangle its new glyphs dirtied — no re-upload, no new texture.
+ * Without the slot every glyph is rasterized and uploaded up front. Measuring
+ * needs only the glyph box and rasterizes nothing. */
 typedef struct {
     HashTable glyphs;      /* glyph_id (zend_long) -> vio_glyph_slot blob */
     float     line_height; /* natural line advance, physical px (asc-desc+gap) */
+    stbtt_fontinfo info;   /* over font->ttf_data (lives as long as the font) */
+    float     scale;
+    int       side, num_glyphs, rasterized, lazy;
+    stbrp_context packer;
+    stbrp_node   *nodes;
+    unsigned char *shadow; /* side * side R8 copy of the atlas (lazy only) */
+    int       dirty, dx0, dy0, dx1, dy1;
 } vio_shape_atlas;
+
+/* The glyph's slot with its box; created on first use (lazy) or by the up-front
+ * build. NULL for an id beyond the font. */
+static vio_glyph_slot *shape_slot_metrics(vio_shape_atlas *a, unsigned int gid)
+{
+    zval *found = zend_hash_index_find(&a->glyphs, (zend_long)gid);
+    if (found) return (vio_glyph_slot *)Z_STRVAL_P(found);
+    if ((int)gid >= a->num_glyphs) return NULL;
+    int ix0, iy0, ix1, iy1;
+    stbtt_GetGlyphBitmapBox(&a->info, (int)gid, a->scale, a->scale, &ix0, &iy0, &ix1, &iy1);
+    vio_glyph_slot slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.bearing_x = (short)ix0;
+    slot.bearing_y = (short)iy0;
+    if (ix1 - ix0 <= 0 || iy1 - iy0 <= 0) {
+        slot.state = VIO_GLYPH_READY;            /* blank (space, control) */
+    } else {
+        slot.w = (unsigned short)(ix1 - ix0);
+        slot.h = (unsigned short)(iy1 - iy0);
+        slot.state = VIO_GLYPH_METRICS;
+    }
+    zval zv;
+    ZVAL_STRINGL(&zv, (char *)&slot, sizeof(slot));
+    zval *p = zend_hash_index_update(&a->glyphs, (zend_long)gid, &zv);
+    return (vio_glyph_slot *)Z_STRVAL_P(p);
+}
+
+/* The glyph in the atlas: packed and rasterized into `bmp` (row stride a->side)
+ * if it is not there yet. A full atlas drops the glyph (blank slot). */
+static const vio_glyph_slot *shape_slot_raster(vio_shape_atlas *a, unsigned int gid, unsigned char *bmp)
+{
+    vio_glyph_slot *s = shape_slot_metrics(a, gid);
+    if (!s || s->state != VIO_GLYPH_METRICS || !bmp) return s;
+    stbrp_rect r;                            /* 1px gutter vs bleed */
+    r.id = (int)gid; r.w = (stbrp_coord)(s->w + 1); r.h = (stbrp_coord)(s->h + 1);
+    r.x = r.y = 0; r.was_packed = 0;
+    stbrp_pack_rects(&a->packer, &r, 1);
+    s->state = VIO_GLYPH_READY;
+    if (!r.was_packed) {
+        s->w = s->h = 0;                     /* atlas full: drop (no retry), lookups still hit */
+        return s;
+    }
+    stbtt_MakeGlyphBitmap(&a->info, bmp + (size_t)r.y * a->side + r.x, s->w, s->h, a->side, a->scale, a->scale, (int)gid);
+    s->x = (unsigned short)r.x;
+    s->y = (unsigned short)r.y;
+    a->rasterized++;
+    if (!a->dirty) { a->dx0 = r.x; a->dy0 = r.y; a->dx1 = r.x + s->w; a->dy1 = r.y + s->h; a->dirty = 1; }
+    else {
+        if (r.x < a->dx0) a->dx0 = r.x;
+        if (r.y < a->dy0) a->dy0 = r.y;
+        if (r.x + s->w > a->dx1) a->dx1 = r.x + s->w;
+        if (r.y + s->h > a->dy1) a->dy1 = r.y + s->h;
+    }
+    return s;
+}
+
+/* Upload the rectangle the new glyphs of one vio_text call dirtied. */
+static void shape_atlas_flush(vio_font_object *font, vio_shape_atlas *a)
+{
+    if (!a->dirty || !a->shadow) return;
+    int w = a->dx1 - a->dx0, h = a->dy1 - a->dy0;
+    a->dirty = 0;
+    if (w <= 0 || h <= 0 || !font->backend || !font->backend->update_font_atlas) return;
+    unsigned char *rect = (unsigned char *)emalloc((size_t)w * (size_t)h);
+    for (int row = 0; row < h; row++)
+        memcpy(rect + (size_t)row * w, a->shadow + (size_t)(a->dy0 + row) * a->side + a->dx0, (size_t)w);
+    font->backend->update_font_atlas(font, rect, a->dx0, a->dy0, w, h);
+    efree(rect);
+}
+
+void vio_text_shape_stats(const vio_font_object *font, int *glyphs, int *rasterized, int *side, int *lazy)
+{
+    const vio_shape_atlas *a = (const vio_shape_atlas *)font->shape_atlas;
+    *glyphs = a ? a->num_glyphs : 0;
+    *rasterized = a ? a->rasterized : 0;
+    *side = a ? a->side : 0;
+    *lazy = a ? a->lazy : 0;
+}
 
 /* Choose the smallest power-of-two atlas side (>=512, <=4096) that comfortably
  * holds `num_glyphs` glyphs at `size` px. Mirrors the legacy dynamic sizing. */
@@ -77,26 +168,28 @@ int vio_text_shape_init_font(vio_font_object *font)
     int px64 = (int)(font->font_size * 64.0f + 0.5f);
     hb_font_set_scale(hbf, px64, px64);
 
-    stbtt_fontinfo info;
-    if (!stbtt_InitFont(&info, font->ttf_data,
+    vio_shape_atlas *a = (vio_shape_atlas *)ecalloc(1, sizeof(vio_shape_atlas));
+    if (!stbtt_InitFont(&a->info, font->ttf_data,
                         stbtt_GetFontOffsetForIndex(font->ttf_data, 0))) {
+        efree(a);
         hb_font_destroy(hbf);
         return 0;
     }
-    float scale = stbtt_ScaleForPixelHeight(&info, font->font_size);
-    int num_glyphs = info.numGlyphs > 0 ? info.numGlyphs : 1;
+    float scale = stbtt_ScaleForPixelHeight(&a->info, font->font_size);
+    int num_glyphs = a->info.numGlyphs > 0 ? a->info.numGlyphs : 1;
     int side = shape_atlas_side(num_glyphs, font->font_size);
+    a->scale = scale;
+    a->side = side;
+    a->num_glyphs = num_glyphs;
+    a->lazy = font->backend && font->backend->update_font_atlas;
 
-    unsigned char *bmp   = (unsigned char *)ecalloc(1, (size_t)side * (size_t)side);
-    stbrp_node    *nodes = (stbrp_node *)emalloc(sizeof(stbrp_node) * (size_t)side);
-    stbrp_context  packer;
-    stbrp_init_target(&packer, side, side, nodes, side);
+    unsigned char *bmp = (unsigned char *)ecalloc(1, (size_t)side * (size_t)side);
+    a->nodes = (stbrp_node *)emalloc(sizeof(stbrp_node) * (size_t)side);
+    stbrp_init_target(&a->packer, side, side, a->nodes, side);
 
     /* Natural line height (physical px): ascent - descent + line gap. */
     int v_asc, v_desc, v_gap;
-    stbtt_GetFontVMetrics(&info, &v_asc, &v_desc, &v_gap);
-
-    vio_shape_atlas *a = (vio_shape_atlas *)ecalloc(1, sizeof(vio_shape_atlas));
+    stbtt_GetFontVMetrics(&a->info, &v_asc, &v_desc, &v_gap);
     a->line_height = (float)(v_asc - v_desc + v_gap) * scale;
     /* ZVAL_PTR_DTOR so zend_hash_destroy() in vio_text_shape_free_font() frees
      * each per-glyph slot zend_string. With a NULL destructor those strings —
@@ -105,50 +198,25 @@ int vio_text_shape_init_font(vio_font_object *font)
      * graphics/display-mode changes). */
     zend_hash_init(&a->glyphs, num_glyphs < 4096 ? num_glyphs : 4096, NULL, ZVAL_PTR_DTOR, 0);
 
-    /* Rasterize every glyph the font has, keyed by glyph index — this is the
-     * one layout that can hold HarfBuzz output (ligatures, positional forms)
-     * since those glyphs have indices but no addressing codepoint. */
-    for (int gid = 0; gid < num_glyphs; gid++) {
-        int ix0, iy0, ix1, iy1;
-        stbtt_GetGlyphBitmapBox(&info, gid, scale, scale, &ix0, &iy0, &ix1, &iy1);
-        int gw = ix1 - ix0, gh = iy1 - iy0;
-
-        vio_glyph_slot slot;
-        slot.bearing_x = (short)ix0;
-        slot.bearing_y = (short)iy0;
-
-        if (gw <= 0 || gh <= 0) {
-            slot.x = slot.y = slot.w = slot.h = 0;  /* blank (space, control) */
-        } else {
-            stbrp_rect r;                            /* 1px gutter vs bleed */
-            r.id = gid; r.w = (stbrp_coord)(gw + 1); r.h = (stbrp_coord)(gh + 1);
-            r.x = r.y = 0; r.was_packed = 0;
-            stbrp_pack_rects(&packer, &r, 1);
-            if (!r.was_packed) {
-                /* Atlas full — drop this glyph (same "no retry" bound as the
-                 * legacy CJK path). Store a blank slot so lookups still hit. */
-                slot.x = slot.y = slot.w = slot.h = 0;
-            } else {
-                stbtt_MakeGlyphBitmap(&info, bmp + (size_t)r.y * side + r.x,
-                                      gw, gh, side, scale, scale, gid);
-                slot.x = (unsigned short)r.x; slot.y = (unsigned short)r.y;
-                slot.w = (unsigned short)gw;  slot.h = (unsigned short)gh;
-            }
-        }
-        zval zv;
-        ZVAL_STRINGL(&zv, (char *)&slot, sizeof(slot));
-        zend_hash_index_update(&a->glyphs, (zend_long)gid, &zv);
-    }
+    /* Keyed by glyph index — the one layout that can hold HarfBuzz output
+     * (ligatures, positional forms): those glyphs have indices but no
+     * addressing codepoint. Without update_font_atlas every glyph goes in now. */
+    for (int gid = 0; !a->lazy && gid < num_glyphs; gid++) shape_slot_raster(a, (unsigned int)gid, bmp);
+    a->dirty = 0;
 
     font->hb_font     = hbf;
     font->shape_atlas = a;
     font->atlas_w = font->atlas_h = side;
 
-    /* Single upload, exactly like the legacy path — stable handle thereafter. */
+    /* One texture for the font's life: all glyphs (eager) or empty (lazy). */
     vio_font_upload_atlas_to_gpu(font, font->backend, bmp);
 
-    efree(nodes);
-    efree(bmp);
+    if (a->lazy) a->shadow = bmp;
+    else {
+        efree(bmp);
+        efree(a->nodes);
+        a->nodes = NULL;
+    }
     return 1;
 }
 
@@ -157,6 +225,8 @@ void vio_text_shape_free_font(vio_font_object *font)
     if (font->shape_atlas) {
         vio_shape_atlas *a = (vio_shape_atlas *)font->shape_atlas;
         zend_hash_destroy(&a->glyphs);
+        if (a->nodes) efree(a->nodes);
+        if (a->shadow) efree(a->shadow);
         efree(a);
         font->shape_atlas = NULL;
     }
@@ -182,13 +252,6 @@ int vio_text_shape_has_glyph(const vio_font_object *font, uint32_t codepoint)
     return hb_font_get_nominal_glyph((hb_font_t *)font->hb_font, codepoint, &glyph) ? 1 : 0;
 }
 
-/* Look up a glyph slot (always present after build; NULL only if the id somehow
- * exceeds numGlyphs). */
-static const vio_glyph_slot *shape_atlas_glyph(vio_shape_atlas *a, unsigned int gid)
-{
-    zval *found = zend_hash_index_find(&a->glyphs, (zend_long)gid);
-    return found ? (const vio_glyph_slot *)Z_STRVAL_P(found) : NULL;
-}
 
 /* ── BiDi + shaping ─────────────────────────────────────────────────── */
 
@@ -445,16 +508,16 @@ typedef struct {
     float cr, cg, cb, ca;
 } vio_draw_ctx;
 
-static void draw_emit(void *user, unsigned int gid, float pen_x, float y_off)
+/* One glyph whose horizontal origin (pen on the baseline) lies at the logical
+ * point (ox, oy). */
+static void draw_glyph_at(vio_draw_ctx *d, unsigned int gid, float ox, float oy)
 {
-    vio_draw_ctx *d = (vio_draw_ctx *)user;
-    const vio_glyph_slot *s = shape_atlas_glyph(d->atlas, gid);
-    if (!s || s->w == 0 || s->h == 0) return; /* blank / dropped */
+    const vio_glyph_slot *s = shape_slot_raster(d->atlas, gid, d->atlas->shadow);
+    if (!s || s->state != VIO_GLYPH_READY || s->w == 0 || s->h == 0) return; /* blank / dropped */
 
-    /* Baseline convention matches the legacy path: y is the baseline, glyph
-     * top = baseline + bearing_y. HarfBuzz y_offset is y-up, so it subtracts. */
-    float px = d->pen_x + (pen_x + s->bearing_x) * d->inv_rs;
-    float py = d->baseline_y + (s->bearing_y - y_off) * d->inv_rs;
+    /* Glyph top = baseline + bearing_y (y-down), as on the legacy path. */
+    float px = ox + s->bearing_x * d->inv_rs;
+    float py = oy + s->bearing_y * d->inv_rs;
     float pw = s->w * d->inv_rs;
     float ph = s->h * d->inv_rs;
 
@@ -487,6 +550,72 @@ static void draw_emit(void *user, unsigned int gid, float pen_x, float y_off)
                                d->font->atlas_texture, d->font->atlas_backend_texture,
                                start, 6, &d->font->std);
     }
+}
+
+static void draw_emit(void *user, unsigned int gid, float pen_x, float y_off)
+{
+    vio_draw_ctx *d = (vio_draw_ctx *)user;
+    /* HarfBuzz y_offset is y-up, so it subtracts from the y-down baseline. */
+    draw_glyph_at(d, gid, d->pen_x + pen_x * d->inv_rs, d->baseline_y - y_off * d->inv_rs);
+}
+
+/* ── Vertical text (A34) ─────────────────────────────────────────────
+ *
+ * One column, top to bottom: HarfBuzz shapes it with HB_DIRECTION_TTB (vertical
+ * alternates via 'vert'/'vrt2', vertical advances from vmtx or synthesized),
+ * glyphs stay upright. HarfBuzz already folds each glyph's vertical origin into
+ * x_offset / y_offset, so they place the horizontal origin the atlas metrics
+ * use. With d == NULL it only measures. Returns the
+ * column length in physical px. */
+static float shape_column(vio_draw_ctx *d, hb_font_t *hbf, const char *text, size_t n,
+                          float center_x, float top_y, float *max_x_extent)
+{
+    if (n == 0) return 0.0f;
+    hb_buffer_t *buf = hb_buffer_create();
+    hb_buffer_add_utf8(buf, text, (int)n, 0, (int)n);
+    hb_buffer_guess_segment_properties(buf);
+    hb_buffer_set_direction(buf, HB_DIRECTION_TTB);
+    hb_shape(hbf, buf, NULL, 0);
+    unsigned int count = 0;
+    hb_glyph_info_t     *info = hb_buffer_get_glyph_infos(buf, &count);
+    hb_glyph_position_t *pos  = hb_buffer_get_glyph_positions(buf, &count);
+    float pen = 0.0f;   /* y-up, runs negative */
+    for (unsigned int i = 0; i < count; i++) {
+        float hx = pos[i].x_offset / 64.0f;
+        float hy = pen + pos[i].y_offset / 64.0f;
+        if (max_x_extent && -hx > *max_x_extent) *max_x_extent = -hx;
+        if (d) draw_glyph_at(d, info[i].codepoint, center_x + hx * d->inv_rs, top_y - hy * d->inv_rs);
+        pen += pos[i].y_advance / 64.0f;
+    }
+    hb_buffer_destroy(buf);
+    return -pen;
+}
+
+/* Columns split at '\n'; calls cb(user, text, n, index) per column. */
+static int vertical_columns(const char *text, size_t len, void (*cb)(void *, const char *, size_t, int), void *user)
+{
+    int index = 0;
+    size_t start = 0;
+    for (size_t i = 0; i <= len; i++) {
+        if (i == len || text[i] == '\n') {
+            size_t n = i - start;
+            if (n && text[start + n - 1] == '\r') n--;
+            cb(user, text + start, n, index++);
+            start = i + 1;
+        }
+    }
+    return index;
+}
+
+typedef struct { vio_draw_ctx *d; hb_font_t *hbf; float right, top, step, longest; } vio_column_ctx;
+
+static void column_cb(void *user, const char *text, size_t n, int index)
+{
+    vio_column_ctx *c = (vio_column_ctx *)user;
+    /* Columns run right to left; (right, top) is the block's top-right corner. */
+    float center = c->right - c->step * ((float)index + 0.5f);
+    float len = shape_column(c->d, c->hbf, text, n, center, c->top, NULL);
+    if (len > c->longest) c->longest = len;
 }
 
 /* Shape one already-broken line (sub-buffer [text, text+n)) and emit its glyphs
@@ -534,7 +663,7 @@ void vio_text_shape_draw(vio_context_object *ctx, vio_font_object *font,
                          const char *text, size_t len,
                          float x, float y, float z,
                          float cr, float cg, float cb, float ca,
-                         float max_width, float line_height)
+                         float max_width, float line_height, int vertical)
 {
     vio_shape_atlas *a = (vio_shape_atlas *)font->shape_atlas;
     if (!a || len == 0) return;
@@ -552,11 +681,18 @@ void vio_text_shape_draw(vio_context_object *ctx, vio_font_object *font,
     float max_w_phys = (max_width > 0.0f) ? max_width * rs : 0.0f;
     float step = (line_height > 0.0f) ? line_height : (a->line_height * d.inv_rs);
 
+    if (vertical) {
+        vio_column_ctx vc;
+        vc.d = &d; vc.hbf = hbf; vc.right = x; vc.top = y; vc.step = step; vc.longest = 0.0f;
+        vertical_columns(text, len, column_cb, &vc);
+        shape_atlas_flush(font, a);
+        return;
+    }
     vio_draw_lines_ctx c;
     c.d = &d; c.hbf = hbf; c.x = x; c.y0 = y; c.step = step;
     break_lines(hbf, text, len, max_w_phys, draw_line_cb, &c);
-    /* No upload here: the atlas was fully built + uploaded once at font
-     * creation, so its GPU handle is stable and already holds every glyph. */
+    /* Glyphs new to the atlas: one sub-rectangle upload before the batch draws. */
+    shape_atlas_flush(font, a);
 }
 
 /* ── Measure ────────────────────────────────────────────────────────── */
@@ -569,7 +705,7 @@ static void measure_emit(void *user, unsigned int gid, float pen_x, float y_off)
     vio_measure_ctx *m = (vio_measure_ctx *)user;
     /* Vertical extents from the glyph's stored slot metrics (y-down): top =
      * bearing_y, bottom = bearing_y + h. */
-    const vio_glyph_slot *s = shape_atlas_glyph(m->atlas, gid);
+    const vio_glyph_slot *s = shape_slot_metrics(m->atlas, gid);
     if (!s) return;
     float top = (float)s->bearing_y;
     float bot = (float)s->bearing_y + (float)s->h;
@@ -606,7 +742,7 @@ static void measure_line_cb(void *user, const char *text, size_t off, size_t n, 
 void vio_text_shape_measure(vio_font_object *font,
                             const char *text, size_t len,
                             float max_width, float line_height,
-                            float *out_width, float *out_height, int *out_lines)
+                            float *out_width, float *out_height, int *out_lines, int vertical)
 {
     *out_width = 0.0f; *out_height = 0.0f;
     if (out_lines) *out_lines = 0;
@@ -618,6 +754,17 @@ void vio_text_shape_measure(vio_font_object *font,
     float inv_rs = 1.0f / rs;
     float max_w_phys = (max_width > 0.0f) ? max_width * rs : 0.0f;
 
+    if (vertical) {
+        /* Columns of `step` width; height = the longest column. */
+        float vstep = (line_height > 0.0f) ? line_height : (a->line_height * inv_rs);
+        vio_column_ctx vc;
+        vc.d = NULL; vc.hbf = hbf; vc.right = 0.0f; vc.top = 0.0f; vc.step = vstep; vc.longest = 0.0f;
+        int cols = vertical_columns(text, len, column_cb, &vc);
+        *out_width = (float)cols * vstep;
+        *out_height = vc.longest * inv_rs;
+        if (out_lines) *out_lines = cols;
+        return;
+    }
     vio_measure_lines_ctx c;
     c.atlas = a; c.hbf = hbf; c.text = text; c.len = len; c.inv_rs = inv_rs;
     c.max_line_w = 0.0f; c.min_y = 0.0f; c.max_y = 0.0f;

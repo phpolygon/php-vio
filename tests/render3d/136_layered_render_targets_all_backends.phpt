@@ -25,7 +25,8 @@ if (!$any) die("skip no backend with layered render targets");
  *      layer; readback (grey ramp) and sampler2DArray .r
  *   C. a depth_only cube: a different depth per face; readback per face and
  *      samplerCube .r through vio_render_target_cubemap()
- *   D. the option contract (layers + cube, layers + samples, bind out of range)
+ *   D. the option contract (layers + cube, layers + MRT, bind out of range;
+ *      layers + samples is a multisampled array since A24, Test 195)
  * Every check reads either a whole uniformly filled layer or the centre of a
  * centred quad, so the row order of the backend does not matter. */
 $W = 16;
@@ -197,7 +198,7 @@ function run_backend(string $name): string {
 
     /* ---- D: option contract --------------------------------------------- */
     if (@vio_render_target($ctx, ['cube' => true, 'size' => 8, 'layers' => 2]) !== false) $fail[] = "D: layers + cube accepted";
-    if (@vio_render_target($ctx, ['width' => 8, 'height' => 8, 'layers' => 2, 'samples' => 4]) !== false) $fail[] = "D: layers + samples accepted";
+    if (@vio_render_target($ctx, ['width' => 8, 'height' => 8, 'layers' => 2, 'attachments' => [VIO_FORMAT_RGBA8, VIO_FORMAT_RGBA8]]) !== false) $fail[] = "D: layers + MRT accepted";
     if (@vio_render_target($ctx, ['width' => 8, 'height' => 8, 'layers' => 65]) !== false) $fail[] = "D: 65 layers accepted";
     if ($arr instanceof VioRenderTarget) {
         $warned = false;

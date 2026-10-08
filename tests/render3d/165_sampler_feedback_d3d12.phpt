@@ -12,7 +12,8 @@ vio
  * A 256x256 texture with a full mip chain drawn onto a 32x32 target samples
  * mip 3 (256 / 32 = 8 texels per pixel); every region of the map must report
  * a mip near 3, and after a clear none may report anything. Backends without
- * the feature refuse the three functions (false + warning).
+ * either feedback path refuse the three functions (false + warning); the GLSL
+ * path has its own test (204).
  * VIO_REQUIRE_SAMPLER_FEEDBACK=d3d12 makes the backend mandatory. */
 $W = 32;
 $VS = "#version 450\nlayout(location=0) in vec3 aPos;\nlayout(location=0) out vec2 uv;\n"
@@ -44,6 +45,11 @@ function run_backend(string $name): string {
     if ($ctx && vio_backend_name($ctx) !== $name) { vio_destroy($ctx); $ctx = null; }
     if (!$ctx) return $req ? "FAIL\n  required but unavailable" : "skip (unavailable)";
     $tex = vio_texture($ctx, ['data' => str_repeat("\x80\x40\x20\xFF", 256 * 256), 'width' => 256, 'height' => 256, 'mipmaps' => true]);
+    if (!vio_supports_feature($ctx, VIO_FEATURE_SAMPLER_FEEDBACK) && vio_supports_feature($ctx, VIO_FEATURE_SAMPLER_FEEDBACK_GLSL)) {
+        /* The GLSL path drives the functions here (test 204); this test is the hardware path. */
+        vio_destroy($ctx);
+        return $req ? "FAIL\n  required but VIO_FEATURE_SAMPLER_FEEDBACK is 0" : "skip (no hardware sampler feedback)";
+    }
     if (!vio_supports_feature($ctx, VIO_FEATURE_SAMPLER_FEEDBACK)) {
         $fail = [];
         if (@vio_sampler_feedback_bind($ctx, $tex) !== false) $fail[] = "bind succeeded without the feature";

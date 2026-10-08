@@ -57,7 +57,10 @@ typedef struct _vio_vk_frame {
     VkCommandPool   cmd_pool;
     VkCommandBuffer cmd_buf;
     VkSemaphore     image_available;
-    VkFence         in_flight;
+    /* Timeline value of the slot's last submission (VULKAN-MODERN-PLAN phase 2):
+     * begin_frame waits it before reusing the command buffer, pools and ring
+     * slices of the slot. 0 = never submitted. */
+    uint64_t        value;
 } vio_vk_frame;
 
 /* Buffer wrapper for every vio buffer type on this backend: compute / graphics
@@ -72,10 +75,43 @@ typedef struct _vio_vulkan_compute_buffer {
     struct _vio_vulkan_compute_buffer *next, *prev;
 } vio_vulkan_compute_buffer;
 
+/* A pass on dynamic rendering (VULKAN-MODERN-PLAN phase 4): one attachment -
+ * the view drawn into, its image and subresource range, and the layout the
+ * image rests in between passes (SHADER_READ_ONLY for a sampled target,
+ * COLOR_ATTACHMENT for an MSAA colour image, READ_ONLY for a depth-only
+ * target, PRESENT_SRC for the swapchain). A multisampled colour attachment
+ * names its single-sample resolve target too. */
+typedef struct _vio_vk_pass_att {
+    VkImageView              view;
+    VkImage                  image;
+    VkImageSubresourceRange  range;
+    VkImageLayout            rest;
+    VkImageView              resolve_view;    /* VK_NULL_HANDLE: no resolve */
+    VkImage                  resolve_image;
+    VkImageSubresourceRange  resolve_range;
+    VkImageLayout            resolve_rest;
+} vio_vk_pass_att;
+
+typedef struct _vio_vk_pass {
+    int              count;              /* colour attachments, 0..4 */
+    vio_vk_pass_att  color[4];
+    VkFormat         color_format[4];
+    int              has_depth;
+    vio_vk_pass_att  depth;
+    int              samples;
+    uint32_t         width, height;
+    uint32_t         layers;             /* layered bind: every layer; 1 otherwise */
+    uint32_t         view_mask;          /* multiview: views 0..n-1; 0 = off */
+    int              clear;              /* CLEAR instead of LOAD (the swapchain's first pass of a frame) */
+    int              internal;           /* vio's own pass (depth mips / resolve): no shading-rate image */
+    int              secondary;          /* the pass executes secondary command buffers (vio_draw_bundle) */
+    int              swapchain;          /* colour 0 is the acquired swapchain image */
+} vio_vk_pass;
+
 /* Render target resources (rt->vulkan_rt, vio_vulkan_rt.c, GAP-PHASE5 Block 10b). */
 typedef struct _vio_vk_rt {
     int            count;          /* colour attachments (0 = depth-only) */
-    int            cube;           /* 6-layer colour image, one framebuffer per (face, level) */
+    int            cube;           /* 6-layer colour image, a view per (face, level) */
     int            layers;         /* bindable layers: 6 (cube), N (array, 'layers' => N) or 1 */
     int            levels;         /* mip levels of the colour image */
     int            samples;        /* effective sample count (1 = off) */
@@ -86,22 +122,33 @@ typedef struct _vio_vk_rt {
     VkImage        msaa_image[4];
     void          *msaa_alloc[4];
     VkImageView    msaa_view[4];
+    VkImageView   *msaa_face_view; /* cube / array MSAA (A24): MS colour view per layer */
+    VkImageView    msaa_all_view;  /* ... and over every layer (VIO_RT_ALL_LAYERS) */
+    /* depth_only MSAA (A24): the multisampled depth drawn into, resolved into
+     * depth_image (max / min of the samples) when the binding leaves it. */
+    VkImage        msaa_depth_image;
+    void          *msaa_depth_alloc;
+    VkImageView    msaa_depth_view;
+    VkDescriptorPool dres_pool;
+    VkDescriptorSet  dres_set;
     VkImage        depth_image;
     void          *depth_alloc;
     VkImageView    depth_view;
-    VkRenderPass   pass;           /* colour (+ resolve) + depth, CLEAR */
-    VkRenderPass   pass_nodepth;   /* cube levels > 0 */
-    VkFramebuffer  fb;             /* 2D targets */
-    VkFramebuffer *face_fb;        /* cube / array: [layer * levels + level] */
-    VkImageView   *face_view;      /* colour view per (layer, level) */
+    VkImageView   *face_view;      /* cube / array: colour view per [layer * levels + level] */
     VkImageView   *depth_face_view;/* cube / array: depth view per layer (level 0) */
     VkImageView    cube_view;      /* colour CUBE view, or the colour 2D_ARRAY view of an array */
     VkImageView    all_color_view; /* layered bind: colour 2D_ARRAY over every layer, level 0 */
     VkImageView    all_depth_view; /* layered bind: depth 2D_ARRAY over every layer */
-    VkFramebuffer  all_fb;         /* layered bind: framebuffer with layers = N (VIO_RT_ALL_LAYERS) */
-    VkRenderPass   mv_pass[3];     /* multiview passes for 2 / 3 / 4 views (viewMask), lazily */
-    VkFramebuffer  mv_fb[3];       /* their framebuffers: the 2D_ARRAY views, layers = 1 */
     VkSampler      sampler;
+    /* depth_only + 'mipmaps' (A26): the depth chain, a sampling view over every
+     * level and, built on the first vio_generate_mipmaps, per level the
+     * attachment view, the source view and a descriptor set. */
+    int            depth_levels;
+    VkImageView    depth_sample_view;
+    VkImageView   *dmip_att;
+    VkImageView   *dmip_src;
+    VkDescriptorPool dmip_pool;
+    VkDescriptorSet *dmip_set;
     struct _vio_vulkan_texture *wrap[4];   /* sampling wrappers (vio_render_target_texture) */
     struct _vio_vulkan_texture *cube_wrap; /* vio_render_target_cubemap */
 } vio_vk_rt;
@@ -136,19 +183,6 @@ typedef struct _vio_vulkan_state {
      * (both recreate and shutdown wait the device idle first). */
     VkSemaphore             *render_finished_per_image;
 
-    /* Render pass & framebuffers */
-    VkRenderPass             render_pass;
-    VkFramebuffer           *framebuffers;
-
-    /* Swapchain "resume" render pass — render-pass-compatible with render_pass
-     * (identical attachment formats/samples) but with color/depth loadOp=LOAD and
-     * initialLayout matching what the primary pass leaves behind (color
-     * PRESENT_SRC_KHR, depth DEPTH_STENCIL_ATTACHMENT_OPTIMAL). Used by
-     * vio_unbind_render_target to re-open the swapchain pass mid-frame WITHOUT
-     * clearing prior swapchain draws after an offscreen pass ran. Created lazily
-     * on first mid-frame unbind, destroyed in vulkan_shutdown. NULL until then,
-     * so a normal frame (no offscreen RT) never touches it. */
-    VkRenderPass             swapchain_resume_render_pass;
 
     /* Depth buffer */
     VkImage                  depth_image;
@@ -205,10 +239,15 @@ typedef struct _vio_vulkan_state {
      * physical device offers it; max_anisotropy is the device limit. */
     int                      anisotropy_supported;
     float                    max_anisotropy;
-    /* Persistent pool + fence for one-shot uploads / compute dispatches
-     * (GAP-PLAN 4.4); lazily created, destroyed in vulkan_shutdown. */
+    /* Persistent pool for one-shot uploads / compute dispatches (GAP-PLAN 4.4);
+     * lazily created, destroyed in vulkan_shutdown. */
     VkCommandPool            transient_pool;
-    VkFence                  transient_fence;
+    /* VULKAN-MODERN-PLAN phase 2: every queue submission signals the next value
+     * of this timeline semaphore (vio_vk_submit); waiting for work means waiting
+     * for its value (vio_vk_wait_value). Binary semaphores remain only for
+     * acquire / present. */
+    VkSemaphore              timeline;
+    uint64_t                 timeline_value;   /* last value a submission signals */
     /* GPU timestamps (GAP-PHASE5 Block 3): two queries per frame in flight,
      * reset + written in the frame's command buffer, read after its fence. */
     /* On-disk pipeline cache (GAP-PHASE5 Block 4): loaded at init from the
@@ -251,10 +290,12 @@ typedef struct _vio_vulkan_state {
     int                      frame_presentable;
     float                    clear_r, clear_g, clear_b, clear_a;
 
-    /* 3D pipeline (GAP-PHASE5 Block 10): the render pass open on the frame
-     * command buffer and its attachment signature - pipeline variants are keyed
-     * by it. cur_render_pass is VK_NULL_HANDLE outside a pass. */
-    VkRenderPass             cur_render_pass;
+    /* The pass open on the frame command buffer (dynamic rendering,
+     * VULKAN-MODERN-PLAN phase 4) and its attachment signature - pipeline
+     * variants are keyed by the formats, samples, depth and view mask. */
+    int                      in_pass;
+    vio_vk_pass              cur_pass;
+    uint32_t                 cur_view_mask;
     int                      cur_color_count;
     VkFormat                 cur_color_formats[4];
     int                      cur_samples;
@@ -270,12 +311,25 @@ typedef struct _vio_vulkan_state {
     int                      depth_has_stencil;    /* depth attachments carry 8 stencil bits */
     int                      multi_draw_indirect;  /* device feature enabled */
     int                      independent_blend;    /* device feature enabled */
+    int                      fragment_stores;      /* fragmentStoresAndAtomics enabled (A15) */
+    int                      fs_storage_active;    /* a fragment storage buffer is bound */
+    int                      fs_storage_pending;   /* a frame wrote one: readbacks drain the queue first */
     int                      geometry_supported;   /* geometryShader enabled (vio_shader 'geometry') */
     int                      tessellation_supported; /* tessellationShader enabled */
     int                      vertex_layer_supported; /* VK_EXT_shader_viewport_index_layer enabled (gl_Layer in the VS) */
     /* Block 10c: textureCompressionBC, VK_KHR_fragment_shading_rate (pipeline rate). */
     int                      instance_api_11;      /* instance created with apiVersion 1.1 */
+    /* VULKAN-MODERN-PLAN (A37): the instance API version (1.2 or 1.3), whether the
+     * device runs the 1.3 core entry points, and the entry points of timeline
+     * semaphores, synchronization2 and dynamic rendering (core or KHR names).
+     * A device without the three features is never selected. */
+    uint32_t                 instance_api;
+    int                      core13;
+    void                    *fn_begin_rendering, *fn_end_rendering;   /* vkCmdBeginRendering / vkCmdEndRendering */
+    void                    *fn_barrier2, *fn_submit2;                /* vkCmdPipelineBarrier2 / vkQueueSubmit2 */
+    void                    *fn_wait_semaphores, *fn_counter_value;   /* vkWaitSemaphores / vkGetSemaphoreCounterValue */
     int                      bc_supported;
+    int                      astc_supported;   /* textureCompressionASTC_LDR enabled (A20) */
     int                      vrs_supported;
     int                      vrs_primitive;        /* primitiveFragmentShadingRate enabled */
     int                      vrs_primitive_multi_viewport;   /* primitiveFragmentShadingRateWithMultipleViewports */
@@ -286,6 +340,10 @@ typedef struct _vio_vulkan_state {
     int                      subgroup_quad_supported;   /* QUAD operations in the fragment stage */
     int                      barycentrics_supported;    /* VK_KHR_fragment_shader_barycentric enabled */
     int                      atomic64_supported;        /* shaderInt64 + shaderBufferInt64Atomics enabled */
+    int                      long_vector_supported;     /* VK_EXT_shader_long_vector: longVector enabled (SM69-PLAN) */
+    int                      ser_supported;             /* VK_EXT_ray_tracing_invocation_reorder enabled (SM69-PLAN) */
+    int                      omm_supported;             /* VK_EXT_opacity_micromap enabled (SM69-PLAN) */
+    void                    *fn_create_micromap, *fn_destroy_micromap, *fn_cmd_build_micromaps, *fn_get_micromap_sizes;
     int                      float16_supported;         /* VK_KHR_shader_float16_int8 shaderFloat16 enabled */
     int                      draw_parameters_supported; /* shaderDrawParameters + drawIndirectFirstInstance enabled */
     int                      compute_derivatives_supported; /* VK_NV / KHR_compute_shader_derivatives (quads) enabled */
@@ -318,7 +376,17 @@ typedef struct _vio_vulkan_state {
     int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
     int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
     void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */
-    /* VK_EXT_mesh_shader (VIO_FEATURE_MESH_SHADER): meshShader + taskShader
+    /* Shading-rate image (A18, VIO_FEATURE_SHADING_RATE_IMAGE): attachmentFragmentShadingRate
+     * with non-trivial combiners; an R8_UINT image of one rate per vrs_tile x vrs_tile
+     * tile, attached to every application pass (dynamic rendering) while active. */
+    int                      vrs_attachment;
+    uint32_t                 vrs_tile;
+    VkImage                  vrs_image;
+    void                    *vrs_image_alloc;
+    VkImageView              vrs_image_view;
+    int                      vrs_image_w, vrs_image_h;
+    int                      vrs_image_active;
+    int                      cur_pass_vrs;         /* the open pass carries the image */    /* VK_EXT_mesh_shader (VIO_FEATURE_MESH_SHADER): meshShader + taskShader
      * enabled, draw entry points via vkGetDeviceProcAddr. */
     int                      mesh_supported;
     void                    *mesh_cmd_draw;          /* vkCmdDrawMeshTasksEXT */
@@ -348,7 +416,9 @@ typedef struct _vio_vulkan_state {
     uint32_t                 capture_w, capture_h;
     int                      capture_valid;
     int                      acquire_consumed;   /* a mid-frame readback submit already waited image_available */
-    VkFence                  midframe_fence;
+    /* Timeline value of the submission that carries the newest capture copy
+     * (A36): vio_read_pixels waits it instead of vkDeviceWaitIdle. */
+    uint64_t                 capture_value;
 
     /* Offscreen render-target binding (mirrors vio_d3d12). current_bound_rt is
      * the vio_render_target_object* whose render pass is active, or NULL =
@@ -362,7 +432,7 @@ typedef struct _vio_vulkan_state {
     int                      debug_enabled;
 
     /* Window reference (for surface creation and resize) */
-    void                    *glfw_window;
+    void                    *platform_window;
     int                      framebuffer_width;
     int                      framebuffer_height;
 } vio_vulkan_state;
@@ -373,7 +443,7 @@ extern vio_vulkan_state vio_vk;
 void vio_backend_vulkan_register(void);
 
 /* Called after GLFW window creation to set up Vulkan */
-int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg);
+int vio_vulkan_setup_context(void *platform_window, vio_config *cfg);
 
 /* Swapchain recreation (on resize) */
 int vio_vulkan_recreate_swapchain(void);
@@ -484,6 +554,11 @@ void vulkan_record_unbind_render_target(void);
 int vulkan_read_pixels(int width, int height, void *out_rgba);
 
 /* ── Shared helpers (vio_vulkan.c) ── */
+/* Submit `cmd` (may be NULL) on the graphics queue: waits `wait_bin` at
+ * `wait_stage` when set, signals `signal_bin` when set, and always the next
+ * timeline value, which it returns (0 when the submission failed). */
+uint64_t vio_vk_submit(VkCommandBuffer cmd, VkSemaphore wait_bin, VkPipelineStageFlags2 wait_stage, VkSemaphore signal_bin);
+void     vio_vk_wait_value(uint64_t value);   /* host wait until the timeline reaches value */
 VkFormat vio_vk_depth_format(void);
 int      vio_vk_begin_transient(VkCommandBuffer *out_cmd);
 int      vio_vk_submit_transient(VkCommandBuffer cmd);
@@ -502,7 +577,16 @@ void    *vulkan_rt_sampling_texture(void *rt, int attachment);
 #define VIO_VK_GRAVE_SHADER_MODULE   8
 #define VIO_VK_GRAVE_FRAMEBUFFER     9
 #define VIO_VK_GRAVE_RENDER_PASS     10
+#define VIO_VK_GRAVE_DESCRIPTOR_POOL 11
+#define VIO_VK_GRAVE_COMMAND_POOL    12
 void vio_vk_defer_destroy(int kind, uint64_t handle, void *allocation);
+/* synchronization2 (VULKAN-MODERN-PLAN phase 3): the vkCmdPipelineBarrier
+ * signature, recorded as vkCmdPipelineBarrier2 (the 1.0 stage / access bits
+ * have the same values in the *2 flags). Layout transitions go through
+ * vio_vk_image_barrier*, whose scopes follow the layouts. */
+void vio_vk_pipeline_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep,
+                             uint32_t nmem, const VkMemoryBarrier *mem, uint32_t nbuf, const VkBufferMemoryBarrier *buf,
+                             uint32_t nimg, const VkImageMemoryBarrier *img);
 void vio_vk_image_barrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, uint32_t layers,
                           VkImageLayout from, VkImageLayout to);
 void vio_vk_image_barrier_range(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
@@ -511,8 +595,18 @@ void vio_vk_image_barrier_range(VkCommandBuffer cmd, VkImage image, VkImageAspec
 void vio_vk_release_texture(vio_vulkan_texture *tex);   /* GPU objects (deferred mid-frame) + the wrapper */
 
 /* ── Render targets, cubemaps, mips (GAP-PHASE5 Block 10b, vio_vulkan_rt.c / vio_vulkan_cube.c) ── */
-VkRenderPass vio_vk_swapchain_resume_pass(void);
+/* Dynamic rendering (VULKAN-MODERN-PLAN phase 4): begin = attachments from
+ * their resting layouts into the attachment layouts + vkCmdBeginRendering +
+ * viewport / scissor over the pass + the cur_* signature; end =
+ * vkCmdEndRendering + back to the resting layouts. vio_vk_pass_end is a no-op
+ * without an open pass. */
+void  vio_vk_pass_begin(VkCommandBuffer cmd, const vio_vk_pass *pass);
+void  vio_vk_pass_end(VkCommandBuffer cmd);
+/* The swapchain pass of the acquired image (clear = the frame's first). */
+void  vio_vk_swapchain_pass(vio_vk_pass *pass, int clear);
 void  vio_vk_resume_swapchain_pass(VkCommandBuffer cmd);
+/* Attachment formats of a pipeline for the pass open now (VkPipelineRenderingCreateInfo). */
+void  vio_vk_pass_rendering_info(VkPipelineRenderingCreateInfo *info);
 /* Reopen the pass that was open before (bound render target layer / level, or the
  * swapchain) with LOAD, after vkCmdEndRenderPass for a compute dispatch or a flush. */
 void  vio_vk_resume_pass(VkCommandBuffer cmd);
@@ -526,6 +620,7 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void);
 int   vio_vk_rt_ensure_views(int views);
 /* Submit the open frame's commands so far, wait, and reopen it (vio_compute_wait). */
 void  vio_vk_flush_frame(void);
+void  vio_vk_fs_storage_host_barrier(VkCommandBuffer cmd);
 int   vio_vk_bind_render_target_face(void *rt, int face, int level);
 void  vio_vk_clear_attachments(float r, float g, float b, float a);
 int   vio_vk_render_target_cubemap(void *rt, void *cm_obj);
@@ -533,6 +628,8 @@ int   vio_vk_read_render_target(void *rt, int face, int attachment, void *out_rg
 int   vio_vk_record_mips(VkCommandBuffer cmd, VkImage img, int w, int h, int layers, int levels);
 void  vio_vk_texture_finish_mips(vio_vulkan_texture *tex);
 int   vio_vk_generate_mipmaps(void *obj, int kind);
+int   vio_vk_generate_depth_mips(void *rt_obj);   /* depth_only + 'mipmaps' (A26) */
+void  vio_vk_depth_mip_shutdown(void);
 int   vio_vk_upload_cubemap(void *cm_obj, int width, int height, const void *faces[6]);
 void  vio_vk_destroy_cubemap(void *cm_obj);
 void  vio_vk_bind_cubemap(void *cm_obj, int slot);
@@ -542,7 +639,11 @@ void  vio_vk_apply_shading_rate(VkCommandBuffer cmd, int primitive);   /* after 
                                                                         primitive: its VS writes the rate */
 
 /* ── 3D pipeline (GAP-PHASE5 Block 10, vio_vulkan_3d*.c) ── */
-int   vio_vk3d_available(void);
+/* Recorded draw sequences (BUNDLE-PLAN phase 2): secondary command buffers. */
+void       *vio_vk3d_begin_bundle(void);
+int         vio_vk3d_end_bundle(void *bundle);
+int         vio_vk3d_draw_bundle(void *bundle);
+void        vio_vk3d_destroy_bundle(void *bundle);int   vio_vk3d_available(void);
 void  vio_vk3d_begin_frame(uint32_t frame_slot);
 VkImageView vio_vk3d_dummy_view(int bindless_kind);   /* 1x1 2D / 2D array / cube view (cleared bindless slots) */
 /* Copy bytes into the current frame's upload ring (uniform-buffer aligned). */

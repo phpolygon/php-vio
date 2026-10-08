@@ -29,7 +29,7 @@ typedef struct _vio_2d_vulkan_state {
     VkDescriptorSetLayout  set_layout;
     VkPipelineLayout       pipeline_layout;
 
-    /* Two pipelines built against vio_vk.render_pass, subpass 0. */
+    /* Two pipelines for the swapchain's attachment formats (dynamic rendering). */
     VkPipeline             pipeline_shapes;
     VkPipeline             pipeline_sprites;
 

@@ -72,7 +72,7 @@ void vio_text_shape_draw(vio_context_object *ctx, vio_font_object *font,
                          const char *text, size_t len,
                          float x, float y, float z,
                          float cr, float cg, float cb, float ca,
-                         float max_width, float line_height);
+                         float max_width, float line_height, int vertical);
 
 /* Measure `text` without drawing (same wrapping rules as the draw path). Writes
  * logical width (widest line) + total height, and the line count when out_lines
@@ -80,12 +80,16 @@ void vio_text_shape_draw(vio_context_object *ctx, vio_font_object *font,
 void vio_text_shape_measure(vio_font_object *font,
                             const char *text, size_t len,
                             float max_width, float line_height,
-                            float *out_width, float *out_height, int *out_lines);
+                            float *out_width, float *out_height, int *out_lines, int vertical);
 
 /* Resolve `text` into bidi runs in visual order (SheenBidi) for callers that
  * lay text out themselves (vio_text_bitmap). Returns the run count and an
  * emalloc'd array in *out the caller efree()s; 0 when resolution fails. */
 int  vio_text_bidi_spans(const char *text, size_t len, vio_text_bidi_span **out);
+
+/* vio_font_info: glyph count, glyphs in the atlas so far, atlas side, and
+ * whether the atlas fills on demand (A33). */
+void vio_text_shape_stats(const vio_font_object *font, int *glyphs, int *rasterized, int *side, int *lazy);
 
 #endif /* HAVE_HARFBUZZ */
 

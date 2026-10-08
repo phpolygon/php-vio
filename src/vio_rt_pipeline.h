@@ -19,6 +19,7 @@ typedef struct _vio_rt_pipeline_object {
      * one per binding; the objects are referenced while bound. */
     zend_object *buffers[VIO_RT_MAX_BUFFERS];
     int          bindings[VIO_RT_MAX_BUFFERS];
+    int          kinds[VIO_RT_MAX_BUFFERS];      /* VIO_RT_BIND_* (buffers[] holds VioBuffer or VioTexture) */
     int          buffer_count;
     int          valid;
     zend_object  std;

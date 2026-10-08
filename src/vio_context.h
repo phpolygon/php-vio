@@ -19,9 +19,9 @@ typedef struct _vio_context_object {
     const vio_backend *backend;
     vio_config         config;
     void              *surface;
-    /* GLFWwindow* — typed as void* so this header doesn't depend on
-     * HAVE_GLFW being visible to every translation unit that includes it.
-     * Only translation units that actually drive GLFW need the cast. */
+    /* vio_window_handle (include/vio_platform.h): whatever the active
+     * platform created - a GLFWwindow* behind the GLFW platform, a native
+     * window state behind the others. Opaque everywhere else. */
     void              *window;
     vio_input_state    input;
     vio_2d_state       state_2d;
@@ -35,6 +35,8 @@ typedef struct _vio_context_object {
      * the bound shader's uniform blocks at each draw. */
 #define VIO_MAX_UBO_BINDINGS 16
     zend_object       *bound_ubo[VIO_MAX_UBO_BINDINGS];
+    zend_object       *frag_storage[4];   /* vio_bind_fragment_storage_buffer (A15), held */
+    zend_object       *fb_texture;        /* texture whose GLSL feedback map is bound (A15), held */
     /* Metal: last object bound per GL texture unit. Resolved against the
      * shader bound AT DRAW TIME (vio_flush_pending_textures), so vio_bind_texture
      * may precede vio_set_uniform('u_sampler', unit) and pipeline switches, the
@@ -69,11 +71,20 @@ typedef struct _vio_context_object {
     int               *bindless_free;
     int                bindless_free_count;
     unsigned int       frame_no;   /* vio_begin calls on this context */
+    /* vio_backend_info: how vio_create chose the backend ("explicit", "priority",
+     * "score") and the ranked candidates of a scored 'auto' (NULL otherwise). */
+    const char        *selected_by;
+    zend_array        *candidates;
+    /* vio_upscale: passes, history and intermediates (php_vio.c), released
+     * before the backend shuts down. */
+    void              *upscale;
     zend_object        std;
 } vio_context_object;
 
 /* Drop the vio_texture_index() references (before the backend shuts down). */
 void vio_context_bindless_clear(vio_context_object *ctx);
+void vio_context_release_fragment_storage(vio_context_object *ctx);
+void vio_upscale_release(vio_context_object *ctx);
 
 extern zend_class_entry *vio_context_ce;
 
