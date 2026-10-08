@@ -426,6 +426,11 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
     /* gl_ViewIndex -> gl_ViewID_OVR + layout(num_views = N) (vio_shader 'view_count'). */
     if (vio_glsl_ovr_views > 0)
         spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_GLSL_OVR_MULTIVIEW_VIEW_COUNT, (unsigned)vio_glsl_ovr_views);
+    /* Every stage redeclares gl_PerVertex in full (in and out): otherwise a
+     * vertex stage writes `out float gl_ClipDistance[1]` while the
+     * tessellation / geometry stages read an implicit gl_in block, and strict
+     * linkers (Mesa) refuse the mismatched blocks. Redeclaring needs GLSL 4.10. */
+    if (version >= 410) spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_GLSL_SEPARATE_SHADER_OBJECTS, SPVC_TRUE);
     spvc_compiler_install_compiler_options(compiler, options);
     /* GLSL for OpenGL has no separate textures / samplers. */
     vio_spvc_combine_separate(compiler);
@@ -447,6 +452,10 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
     SpvExecutionModel model = spvc_compiler_get_execution_model(compiler);
     if (model == SpvExecutionModelVertex || model == SpvExecutionModelTessellationEvaluation) {
         output = vio_glsl_require_viewport_layer_ext(output);
+    }
+    if (getenv("VIO_DUMP_GLSL") && output) {
+        fprintf(stderr, "==== OpenGL GLSL (model %d) ====\n%s\n==== end ====\n", (int)model, output);
+        fflush(stderr);
     }
     spvc_context_destroy(ctx);
     return output;
