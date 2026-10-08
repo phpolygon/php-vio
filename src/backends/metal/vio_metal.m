@@ -5567,7 +5567,11 @@ static int metal_resolve_fs_texture(int slot, int *is_depth)
 {
     *is_depth = 0;
     vio_metal_pipeline *p = metal_current_pipeline;
-    if (p && p->shader && slot >= 0 && slot < p->shader->fs.texture_count) {
+    if (p && p->shader) {
+        /* A unit the fragment stage does not sample stays unbound: buffers and
+         * textures share one renumbered index space, so its raw number can be
+         * a real sampler's [[texture(n)]] (test 095, "stray-units"). */
+        if (slot < 0 || slot >= p->shader->fs.texture_count) return -1;
         *is_depth = p->shader->fs.textures[slot].is_depth;
         return p->shader->fs.textures[slot].msl_index;
     }
