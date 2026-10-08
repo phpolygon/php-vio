@@ -1,6 +1,7 @@
 # BACKEND-SELECTION-PLAN — die Vorteile aller Backends in einem Renderer bündeln
 
-Stand 2026-10-07. Ziel: Eine PHPolygon-Anwendung bekommt auf jedem Gerät das Backend und je Effekt die
+Stand 2026-10-08: **Phasen 0–2 umgesetzt** (OPEN-ITEMS-PLAN Batch 3, Tests 184–187); Phase 3 lebt in PHPolygon,
+Phase 4 ist mit `vio_feature_info` (native/emulated) abgedeckt. Ziel: Eine PHPolygon-Anwendung bekommt auf jedem Gerät das Backend und je Effekt die
 Technik, die dort am besten läuft — ohne mehrere Grafik-APIs gleichzeitig zu betreiben.
 
 ## Entscheidung: kein Multi-API-Rendering

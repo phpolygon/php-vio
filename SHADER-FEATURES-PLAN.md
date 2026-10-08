@@ -5,13 +5,13 @@ Metal, Vulkan und OpenGL als portable vio-Features — GLSL bleibt die Quelle, j
 `VIO_FEATURE_*`-Flag, einen `_all_backends`-Test und läuft auf jedem Backend, das es kann. Arbeitsweise
 **TDD**: Test zuerst (rot), dann Implementierung, dann Flag in `074` pinnen.
 
-## Ausgangslage
+## Ausgangslage (2026-10-06, vor diesem Plan)
 
 | Baustein | Stand |
 |---|---|
 | OpenGL-Kontext-Leiter 4.6 → 3.0, `vio_gl.caps` | ✅ (`vio_window.c`, `vio_opengl.c`) |
 | **Metal-Versionsleiter** MSL 4.1 → 2.0, `vio_mtl.caps`, `vio_backend_info()` | ✅ `a17e588` (Tests 150, 151) |
-| **D3D12 Shader Model 6** (höchstes 6.x aus Device ∩ DXC, SPIRV-Cross auf dasselbe Profil, DXC-Stage-Probe, `VIO_FEATURE_SUBGROUP`) | 🚧 Branch `feat/d3d12-shader-model-6` (`b0fcfc1`, Test 149, CI erzwingt DXC) |
+| **D3D12 Shader Model 6** (höchstes 6.x aus Device ∩ DXC, SPIRV-Cross auf dasselbe Profil, DXC-Stage-Probe, `VIO_FEATURE_SUBGROUP`) | ✅ (Test 149, CI erzwingt DXC; Profil festlegbar per `shader_model => 6x`, Test 170) |
 | Vulkan: Instanz API 1.1, Device-Features einzeln abgefragt | ✅, aber keine Leiter-/Caps-Auskunft |
 
 Geprüft auf Apple M5 / macOS 27 (Metal 4, Apple10): GLSL → glslang → SPIRV-Cross → MSL → Treiber
@@ -198,6 +198,10 @@ Metal auf dem M5 ausgeführt (ab MSL 2.4); D3D12 per mingw + DXC geprüft, Vulka
 Phase 0d) und Vulkan (`VK_EXT_ray_tracing_invocation_reorder`, `VK_EXT_opacity_micromap`); Metal hat
 kein Gegenstück ⇒ Flags dort 0. Nutzen auf RTX 40/50 (Hardware-Reorder, OMM-Traversal).
 
+**Stand 2026-10-08 — 6c ✅** (`SM69-PLAN.md` Phasen 3–4): `VIO_FEATURE_SHADER_EXECUTION_REORDER = 66` (Test 219),
+`VIO_FEATURE_OPACITY_MICROMAP = 67` (`'opacity_micromap'` je Mesh in `vio_acceleration_structure`, Test 220) auf
+D3D12 (Tier 1.2, SM 6.9) und Vulkan; belegt auf NuGet-WARP 1.0.21 (CI) und der RTX 2080.
+
 ## Phase 7 — Sampler Feedback / Texture Streaming (L)
 
 `VIO_FEATURE_SAMPLER_FEEDBACK`: welche Mips/Kacheln tatsächlich gelesen wurden.
@@ -244,7 +248,10 @@ Dispatch-API.
   ausgeführt (MSL 3.1 und 4.1), MSL 3.0 meldet nichts.
 - D3D12: 0. SPIRV-Cross übersetzt `coopmat` nicht nach HLSL („Access chains have no default expression
   representation"); SM 6.9 Wave-Matrix / Cooperative Vectors bleiben an Agility SDK + DXC-Quellen gebunden.
-- Offen: 8b Cooperative Vectors (`VK_NV_cooperative_vector`, D3D12 Preview), 8c Metal-Tensoren
+- Long Vectors ✅ (`VIO_FEATURE_LONG_VECTOR = 65`, `SM69-PLAN.md` Phase 2, Test 216): GLSL `GL_EXT_long_vector` auf
+  Vulkan, D3D12 über `vio_compute_pipeline(['hlsl' => …])`.
+- Offen: 8b Cooperative Vectors – im Retail-SM 6.9 gestrichen, auf D3D12 jetzt SM-6.10-Linearalgebra (`dx::linalg`,
+  `SPIRV-CROSS-HLSL-COOPMAT-PLAN.md`); Vulkan `VK_NV_cooperative_vector`. 8c Metal-Tensoren
   (`MTLTensor` + MPP `matmul2d`, MSL 4.0) über einen `'msl'`-Override — beides ohne portable GLSL-Form.
 
 ## Phase 9 — Work Graphs (nur D3D12) — ✅ umgesetzt (2026-10-07, Test 166)

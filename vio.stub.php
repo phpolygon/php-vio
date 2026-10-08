@@ -20,7 +20,9 @@
  *                       hdr_paper_white => nits that display white maps to (default 200),
  *                       shader_model => 6: compile D3D12 shaders with DXC to DXIL (needs dxcompiler.dll +
  *                       dxil.dll, optionally located via dxc_dir => directory; falls back to FXC 5.1). The
- *                       profile is the highest 6.x the device and DXC accept; it enables subgroup
+ *                       profile is the highest 6.x the device and DXC accept; 60..69 pins it
+ *                       (62 = SM 6.2, clamped to that maximum; 50..59 = FXC 5.1; without the option the
+ *                       environment variable VIO_D3D12_SHADER_MODEL applies). SM 6 enables subgroup
  *                       operations (VIO_FEATURE_SUBGROUP) on devices with wave ops),
  *                       msl_version => 21: pin the Metal Shading Language version (major * 10 + minor,
  *                       2.0 .. the OS maximum; default the maximum, or VIO_METAL_MSL_VERSION),
@@ -353,6 +355,32 @@ function vio_mesh_index_bytes(VioMesh $mesh): int {}
 function vio_gpu_frame_time(VioContext $context): float {}
 
 /**
+ * Named GPU timestamp inside the open frame. It closes a section that began at
+ * the previous vio_gpu_timestamp of the frame (or at vio_begin):
+ *
+ *   vio_begin($ctx);
+ *   ... shadow passes ...   vio_gpu_timestamp($ctx, 'shadows');
+ *   ... main pass ...       vio_gpu_timestamp($ctx, 'main');
+ *   vio_end($ctx);
+ *
+ * Up to 32 marks per frame. Returns false outside a frame, past the limit, or
+ * when the backend has no GPU timestamps (VIO_FEATURE_GPU_TIMESTAMP). Names are
+ * 1 to 47 bytes (ValueError otherwise).
+ */
+function vio_gpu_timestamp(VioContext $context, string $name): bool {}
+
+/**
+ * GPU milliseconds of each named section of the most recently completed frame,
+ * in mark order: ['shadows' => 1.8, 'main' => 4.2]. A name used twice in one
+ * frame adds up. Like vio_gpu_frame_time() it trails the CPU by one to two
+ * frames; [] until such a frame has completed, false when the backend has no
+ * GPU timestamps.
+ *
+ * @return array<string, float>|false
+ */
+function vio_gpu_timings(VioContext $context): array|false {}
+
+/**
  * Counters of the on-disk shader cache (vio_create 'shader_cache'), cumulative
  * for the process: ['dir' => ?string, 'hits' => int, 'misses' => int, 'stores' => int].
  */
@@ -377,19 +405,81 @@ function vio_swapchain_info(VioContext $context): array {}
  * 'shading_language_version' => int (in use, major * 10 + minor),
  * 'shading_language_max' => int (highest the OS accepts), 'families' => string[]
  * ('apple7', 'mac2', 'metal3', ...), 'caps' => array<string, bool> (device support
- * AND minimum language version)]. False for backends without the report.
+ * AND minimum language version), 'vendor_id' => int (PCI vendor, 0x10005 = Mesa,
+ * 0 = unknown), 'vendor' => string, 'driver' => string, 'device_type' => string
+ * ('discrete' | 'integrated' | 'software' | 'unknown'), 'vram_bytes' => int].
+ * D3D11 / D3D12 report the feature level and HLSL shader model, Vulkan the SPIR-V
+ * version of the instance / device API, OpenGL the GLSL version. False without a
+ * device. 'selected_by' => 'explicit' | 'priority' (plain 'auto') | 'score' | 'benchmark'
+ * ('auto' with prefer / require), 'candidates' => the vio_rank_backends()
+ * ranking of a scored 'auto' ([] otherwise).
  */
 function vio_backend_info(VioContext $context): array|false {}
+
+/**
+ * Adapters each registered backend can open, without a context:
+ * ['<backend>' => [['index' => int, 'name' => string, 'vendor_id' => int,
+ * 'vendor' => string, 'device_id' => int, 'driver' => string, 'device_type' =>
+ * 'discrete' | 'integrated' | 'software' | 'unknown', 'vram_bytes' => int,
+ * 'features' => int[] (VIO_FEATURE_* the hardware supports)], ...], ...].
+ * Preferred (discrete) adapters first. OpenGL lists only the adapter of its
+ * live context. A backend name limits the scan; an unknown one is a ValueError.
+ */
+function vio_adapters(?string $backend = null): array {}
+
+/**
+ * The ranking vio_create('auto', ['prefer' => ..., 'require' => [...]]) uses:
+ * one candidate per backend with its preferred adapter, eligible ones first,
+ * then by score - vendor profile (NVIDIA d3d12 > vulkan > d3d11, AMD vulkan >
+ * d3d12, older Intel iGPUs d3d11, Apple metal, Linux vulkan > opengl), discrete
+ * before integrated, software rasterizers last, feature points by 'prefer'
+ * ('performance' default, 'quality', 'compat' = d3d11 / opengl first, no
+ * feature points). 'require' (VIO_FEATURE_* list) filters; a feature the
+ * backend cannot tell before a context is checked when vio_create opens it.
+ * Entries: ['backend', 'adapter' => ?string, 'vendor', 'device_type', 'score',
+ * 'eligible' => bool, 'reason' => ?string, 'benchmark_ms' => ?float]. False on
+ * a bad option (warning).
+ */
+function vio_rank_backends(array $options = []): array|false {}
+
+/**
+ * Calibration run without a selection (settings menus, tools): the same scene
+ * (64 draws into a render target, a post pass, async compute; headless on the
+ * GPU, 256 x 256) on the top 'max' (default 3) candidates of the ranking
+ * ('prefer' / 'require' as for vio_rank_backends). 'frames' (default 120) per
+ * candidate; 'cache' => dir (default: the shader cache directory) keeps the
+ * result per (backend, adapter, driver, vio version) in vio-benchmark.json and
+ * a hit skips the run. Entries ['backend', 'adapter' => ?string, 'driver',
+ * 'ms' (wall time per frame, -1 = failed), 'gpu_ms' (median GPU time, -1
+ * unknown), 'cached' => bool], fastest first, failed runs last.
+ * vio_create('auto', ['benchmark' => true, 'benchmark_cache' => dir,
+ * 'benchmark_frames' => n]) picks the fastest (selected_by 'benchmark').
+ */
+function vio_benchmark_backends(array $options = []): array|false {}
 
 /**
  * Inline ray tracing (VIO_FEATURE_RAY_QUERY): build a bottom-level acceleration
  * structure per distinct mesh (its location-0 positions and indices) and a
  * top-level structure over the instances. Each instance is
  * ['mesh' => VioMesh, 'transform' => float[16]] (column-major 4x4, optional,
- * identity). Shaders query it with GL_EXT_ray_query (rayQueryEXT) in the
+ * identity), optional 'hit_group' (0..7, the RT pipeline hit group) and 'mask'
+ * (0..255, default 0xFF: rays skip it when mask & cull mask is 0). Shaders query
+ * it with GL_EXT_ray_query (rayQueryEXT) in the
  * fragment and compute stages. False + warning where the feature is 0.
  */
 function vio_acceleration_structure(VioContext $context, array $instances): VioAccelerationStructure|false {}
+
+/**
+ * Update an acceleration structure with a new instance list (same format as
+ * vio_acceleration_structure). Returns what it did: 'refit' when every instance
+ * keeps its mesh and only transforms change (the top level is updated in place -
+ * the cheap per-frame path for moving objects), 'rebuild' when the list changes
+ * but all meshes are already in the structure (a new top level over the existing
+ * bottom levels), 'full' when a mesh is new (everything is built again). The
+ * structure keeps its meshes alive for that. Outside vio_begin / vio_end (false +
+ * warning inside); synchronous, waits for frames still using it.
+ */
+function vio_acceleration_structure_update(VioContext $context, VioAccelerationStructure $accelerationStructure, array $instances): string|false {}
 
 /**
  * Bind an acceleration structure for the following draws and compute
@@ -398,8 +488,18 @@ function vio_acceleration_structure(VioContext $context, array $instances): VioA
 function vio_bind_acceleration_structure(VioContext $context, VioAccelerationStructure $accelerationStructure, int $binding): void {}
 
 /**
- * Ray tracing pipeline (VIO_FEATURE_RAYTRACING): one raygen shader, one miss
- * shader and one triangle hit group (closest hit + optional any hit).
+ * Ray tracing pipeline (VIO_FEATURE_RAYTRACING): one raygen shader, one or more
+ * miss shaders, triangle hit groups and callables (OPEN-ITEMS-PLAN A13).
+ * 'miss' => glsl | list<glsl> (traceRayEXT's missIndex picks one), 'hit_groups' =>
+ * list<['closest_hit' => glsl, 'any_hit' => glsl?]> (or the single-group keys
+ * 'closest_hit' / 'any_hit'; an instance's 'hit_group' plus sbtRecordOffset picks
+ * one), 'callables' => list<glsl> (executeCallableEXT(index)), 'records' =>
+ * ['raygen' => bytes, 'miss' => list<bytes>, 'hit_groups' => list<bytes>,
+ * 'callables' => list<bytes>] - each group's shader record, up to 256 bytes, read
+ * as layout(shaderRecordEXT) buffer (D3D12: root constants of a local root
+ * signature, ConstantBuffer<T> : register(b0, space1)). At most 8 of each kind.
+ * D3D12 exports: vio_raygen, vio_miss / vio_miss<k>, vio_closest_hit /
+ * vio_closest_hit<k> (+ vio_any_hit / vio_any_hit<k>), vio_callable<k>.
  * $desc keys: 'raygen', 'miss', 'closest_hit' (GLSL, GL_EXT_ray_tracing,
  * required), 'any_hit' (GLSL, optional), 'max_recursion' (int, default 1),
  * 'payload_size' (bytes, default 32, D3D12 only), 'hlsl' (string, D3D12).
@@ -424,10 +524,22 @@ function vio_rt_pipeline(VioContext $context, array $desc): VioRtPipeline|false 
 function vio_rt_bind_buffer(VioContext $context, VioRtPipeline $pipeline, VioBuffer $buffer, int $binding): void {}
 
 /**
+ * Bind a texture at $binding (1..15; 0 is the acceleration structure) for the
+ * following vio_trace_rays of $pipeline: the stages read it as layout(binding =
+ * $binding) uniform sampler2D with its own filter / wrap (textureLod - ray tracing
+ * stages have no derivatives). D3D12: Texture2D at t<$binding> with a linear /
+ * repeat SamplerState at s<$binding>. Rebinding replaces; up to 16 resources
+ * (buffers and textures) per pipeline; the pipeline keeps a reference.
+ */
+function vio_rt_bind_texture(VioContext $context, VioRtPipeline $pipeline, VioTexture $texture, int $binding): void {}
+
+/**
  * Launch $width * $height * $depth raygen invocations (gl_LaunchIDEXT /
  * DispatchRaysIndex) against the acceleration structure bound with
- * vio_bind_acceleration_structure(). Synchronous: the buffers are complete on
- * return. Outside vio_begin / vio_end.
+ * vio_bind_acceleration_structure(). Outside vio_begin / vio_end it is
+ * synchronous (the buffers are complete on return); inside a frame it is recorded
+ * in order with the frame's draws and async compute dispatches - later work of the
+ * frame sees its writes, vio_storage_buffer_read() waits for it (mid-frame too).
  */
 function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width, int $height, int $depth = 1): void {}
 
@@ -436,14 +548,33 @@ function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width
  * BINDLESS-PLAN.md). Shaders read the table as
  *   layout(set = 1, binding = 0) uniform texture2D vio_textures[];
  *   layout(set = 1, binding = 1) uniform sampler vio_sampler;   // linear, repeat
+ *   layout(set = 1, binding = 2) uniform sampler vio_sampler_nearest;         // optional
+ *   layout(set = 1, binding = 3) uniform sampler vio_sampler_clamp;           // optional
+ *   layout(set = 1, binding = 4) uniform sampler vio_sampler_nearest_clamp;   // optional
+ *   layout(set = 1, binding = 5) uniform textureCube vio_cubes[];             // VioCubemap slots
+ *   layout(set = 1, binding = 6) uniform texture2DArray vio_texture_arrays[]; // layered VioTexture slots
  * and index it with nonuniformEXT (GL_EXT_nonuniform_qualifier). The first call adds
- * the texture and keeps it alive until vio_destroy; later calls return the same slot.
- * Plain 2D textures only, up to 1024. False (with a warning) without the feature.
+ * the texture and keeps it alive until vio_texture_release_index or vio_destroy; later
+ * calls return the same slot. 2D textures, texture arrays and cubemaps share the
+ * 1024 slots; a slot is read through the array of its kind. 3D textures and
+ * render-target wrappers stay out. False (with a warning) without the feature.
  */
-function vio_texture_index(VioContext $context, VioTexture $texture): int|false {}
+function vio_texture_index(VioContext $context, VioTexture|VioCubemap $texture): int|false {}
 
 /**
- * Sampler feedback (VIO_FEATURE_SAMPLER_FEEDBACK; D3D12 with SM 6.5 + SamplerFeedbackTier 0.9):
+ * Free the bindless slot of $texture. Frames already recorded may still read it, so
+ * the table keeps the entry and the texture for 4 more vio_begin calls; after that
+ * the slot is cleared and vio_texture_index hands it out again. The texture can
+ * re-enter the table at once (under a new slot). False when it is not in the table.
+ */
+function vio_texture_release_index(VioContext $context, VioTexture|VioCubemap $texture): bool {}
+
+/**
+ * Sampler feedback. Two paths, used together where both exist (A15):
+ *   - GLSL (VIO_FEATURE_SAMPLER_FEEDBACK_GLSL, every backend with fragment storage): prepend
+ *     VIO_SAMPLER_FEEDBACK_GLSL to the fragment source and call vio_write_feedback($sampler, $uv)
+ *     next to the sample; the map lives at fragment storage binding 3.
+ *   - hardware (VIO_FEATURE_SAMPLER_FEEDBACK; D3D12 with SM 6.5 + SamplerFeedbackTier 0.9):
  * bind the MinMip feedback map paired with $texture (created on first use) for the
  * following draws; null unbinds. GLSL has no sampler feedback, so the fragment stage is an
  * HLSL override, vio_shader(['vertex' => …, 'fragment' => $glsl, 'hlsl' => ['fragment' => $ps]]),
@@ -615,7 +746,10 @@ function vio_font(VioContext $context, string $path, float $size = 24.0, float $
  * With HarfBuzz shaping enabled (VIO_HAS_SHAPING === 1), '\n' always starts a
  * new line and 'max_width' turns on word wrapping.
  *
- * @param array|null $options ['color' => int, 'z' => float, 'max_width' => float, 'line_height' => float]
+ * @param array|null $options ['color' => int, 'z' => float, 'max_width' => float, 'line_height' => float,
+ *                            'vertical' => bool (HarfBuzz: top-to-bottom columns, upright glyphs with
+ *                            vertical forms; (x, y) = top-right corner, '\n' starts the next column to
+ *                            the left, line_height = column pitch, max_width is ignored)]
  */
 function vio_text(VioContext $context, VioFont $font, string $text, float $x, float $y, ?array $options = null): void {}
 
@@ -632,7 +766,8 @@ function vio_rounded_rect(VioContext $context, float $x, float $y, float $width,
  * Pass the same wrapping options as vio_text() ('max_width', 'line_height') to
  * measure wrapped/multi-line text. 'lines' is only meaningful with shaping.
  *
- * @param array|null $options ['max_width' => float, 'line_height' => float]
+ * @param array|null $options ['max_width' => float, 'line_height' => float, 'vertical' => bool
+ *                            (width = columns x line height, height = longest column, lines = columns)]
  * @return array{width: float, height: float, lines: int}|false
  */
 function vio_text_measure(VioFont $font, string $text, ?array $options = null): array|false {}
@@ -646,6 +781,15 @@ function vio_text_measure(VioFont $font, string $text, ?array $options = null): 
  * fallback chain never lets the primary font claim an uncovered codepoint.
  */
 function vio_font_has_glyph(VioFont $font, int $codepoint): bool {}
+
+/**
+ * Glyph atlas of a font: ['glyphs' => int (glyphs in the face; legacy path: packed
+ * codepoints), 'rasterized' => int (glyphs in the atlas so far), 'atlas_size' =>
+ * int (side in px), 'lazy' => bool]. With HarfBuzz the atlas fills on demand on
+ * every backend: vio_text rasterizes new glyphs and uploads only the rectangle
+ * they dirtied; vio_text_measure rasterizes nothing. False for an invalid font.
+ */
+function vio_font_info(VioFont $font): array|false {}
 
 /**
  * Load a font file as a VioFontFace for vio_text_bitmap().
@@ -830,9 +974,12 @@ function vio_texture_3d(VioContext $context, array $config): VioTexture|false {}
  *                            'filter' (default VIO_FILTER_LINEAR), 'wrap' (default VIO_WRAP_REPEAT),
  *                            'anisotropy' (1..16), 'mipmaps' (bool: generate a chain for a
  *                            single-level uncompressed file)
- * @return VioTexture|false false (with a warning) for unsupported containers or formats
+ * A cubemap file (faceCount 6) returns a VioCubemap, a 3D file (pixelDepth > 1) a 3D
+ * VioTexture - both uncompressed (RGBA8, R8 expands to grey), base = level 'mip_offset';
+ * a cube with more levels gets its chain rebuilt.
+ * @return VioTexture|VioCubemap|false false (with a warning) for unsupported containers or formats
  */
-function vio_texture_ktx2(VioContext $context, string $bytes, ?array $options = null): VioTexture|false {}
+function vio_texture_ktx2(VioContext $context, string $bytes, ?array $options = null): VioTexture|VioCubemap|false {}
 
 /**
  * Bind a texture to a texture slot.
@@ -854,6 +1001,12 @@ function vio_update_buffer(VioBuffer $buffer, string $data, int $offset = 0): vo
 
 /**
  * Bind a buffer to a binding point.
+ *
+ * A uniform buffer feeds the named uniform block declared at that binding
+ * (`layout(std140, binding = N) uniform Block { ... }`) in every stage of the
+ * bound graphics shader, on every backend; each draw reads the contents as of
+ * that draw, so vio_update_buffer between two draws gives them different
+ * values. Bindings 0..15; the binding defaults to the buffer's 'binding'.
  */
 function vio_bind_buffer(VioContext $context, VioBuffer $buffer, int $binding = -1): void {}
 
@@ -867,7 +1020,16 @@ function vio_bind_buffer(VioContext $context, VioBuffer $buffer, int $binding = 
 /**
  * Create a GPU compute pipeline from a GLSL compute shader.
  *
- * @param array $config ['source' => string]  // GLSL `#version 450` compute source
+ * Optional backend-native kernels replace the translated GLSL where a feature
+ * has no portable form; the GLSL kernel stays required (its reflection gives
+ * local_size and the bindings):
+ * - 'msl'  => Metal compiles this MSL kernel (MSL 4 tensors, OPEN-ITEMS A17).
+ * - 'hlsl' => D3D11 / D3D12 compile this HLSL kernel, entry `main`
+ *             (Shader Model 6.9 long vectors, VIO_FEATURE_LONG_VECTOR). Registers
+ *             follow the GLSL bindings: Params UBO binding N = bN, storage buffers
+ *             and images binding N = tN (VIO_COMPUTE_READ) / uN (writable).
+ *
+ * @param array $config ['source' => string, 'msl' => ?string, 'hlsl' => ?string]
  * @return VioComputePipeline|false
  */
 function vio_compute_pipeline(VioContext $context, array $config): VioComputePipeline|false {}
@@ -934,6 +1096,17 @@ function vio_storage_buffer_read(VioContext $context, VioBuffer $buffer): string
  * vio_draw_instanced_from_buffer. $access is VIO_COMPUTE_READ (read-only).
  * No-op (E_NOTICE) when the backend lacks VIO_FEATURE_VERTEX_STORAGE.
  */
+/**
+ * Writable storage buffer for the fragment stage (VIO_FEATURE_FRAGMENT_STORAGE,
+ * OPEN-ITEMS-PLAN A15): $buffer (vio_storage_buffer) at the fragment shader's
+ * layout(std430, binding = $binding) buffer block (0..3; writes and atomics), for
+ * every following draw until changed; null unbinds. vio_storage_buffer_read waits
+ * for the draws that wrote it (mid-frame: the frame so far). D3D: the block is a
+ * RWByteAddressBuffer at u($binding + 4). The context keeps a reference. False +
+ * warning without the feature.
+ */
+function vio_bind_fragment_storage_buffer(VioContext $context, ?VioBuffer $buffer, int $binding): bool {}
+
 function vio_bind_storage_buffer(VioContext $context, VioBuffer $buffer, int $binding, int $access): void {}
 
 /**
@@ -980,6 +1153,67 @@ function vio_set_uniforms(VioContext $context, array $uniforms): void {}
 function vio_submit_batch(VioContext $context, array $draws): void {}
 
 /**
+ * Record a static draw sequence once (OPEN-ITEMS A38, BUNDLE-PLAN.md). $records
+ * are vio_submit_batch records ('mesh' required; 'pipeline', 'textures' =>
+ * [slot => VioTexture], 'uniforms' => [name => value] optional); the objects are
+ * held by the bundle. A record sets every uniform it relies on: values no
+ * record sets are undefined when the bundle plays, and uniforms set between
+ * recording and vio_draw_bundle do not change it. A malformed record throws a
+ * ValueError naming its index.
+ */
+function vio_bundle(VioContext $context, array $records): VioBundle|false {}
+
+/**
+ * Play a bundle inside a frame, into the pass open now (swapchain or render
+ * target). Backends with a native recording (vio_bundle_info()['native']) record
+ * it for the pass's attachment formats on first use; the others replay the
+ * records through the common draw path. The pipeline bound afterwards is
+ * undefined: bind one before the next draw. Returns false outside a frame.
+ */
+function vio_draw_bundle(VioContext $context, VioBundle $bundle): bool {}
+
+/**
+ * ['draws' => int, 'native' => bool, 'method' => 'replay' | 'secondary_command_buffer' (Vulkan) |
+ * 'bundle' (D3D12) | 'deferred_context' (D3D11)].
+ * 'native' becomes true after the first vio_draw_bundle on a backend that records natively.
+ */
+function vio_bundle_info(VioBundle $bundle): array {}
+
+/**
+ * Upscale $source (a render target's attachment 0 or a texture) to $target (a
+ * render target, or null for the swapchain) inside a frame (OPEN-ITEMS A21,
+ * UPSCALE-PLAN.md). Portable fragment passes on every backend with a 3D pipeline.
+ *
+ * Options:
+ *   'mode'      => VIO_UPSCALE_SPATIAL (default: edge-adaptive Lanczos-2) |
+ *                  VIO_UPSCALE_TEMPORAL (jittered frames accumulated into a history
+ *                  kept per context; output alpha is 1)
+ *   'sharpness' => 0..1 (default 0.25): contrast-adaptive sharpening, 0 = off
+ *   'jitter'    => [x, y]: temporal - the sub-pixel offset this frame's projection
+ *                  was shifted by, in source pixels (NDC directions, y up), e.g.
+ *                  vio_upscale_jitter($frame)
+ *   'motion'    => VioRenderTarget|VioTexture at source size: temporal - per pixel
+ *                  the UV now minus the UV in the previous frame (y up, = half the
+ *                  NDC delta) in .rg
+ *   'reset'     => true: temporal - drop the history (camera cut)
+ *   'native'    => false: skip the platform scaler (MetalFX on Metal, spatial into a
+ *                  render target; vio_upscale_info() names it) and run the portable passes
+ *
+ * The target stays bound afterwards (the swapchain for null); the bound pipeline
+ * is undefined. Returns false outside a frame.
+ */
+function vio_upscale(VioContext $context, VioRenderTarget|VioTexture $source, ?VioRenderTarget $target, ?array $options = []): bool {}
+
+/**
+ * Sub-pixel jitter for frame $frame of a $phases-long cycle: [x, y] in source
+ * pixels (-0.5..0.5), Halton(2, 3). Offset the projection by it (clip.xy +=
+ * 2 * jitter / sourceSize * clip.w) and pass it as vio_upscale's 'jitter'.
+ */
+function vio_upscale_jitter(int $frame, int $phases = 8): array {}
+
+/** ['spatial' => 'portable' | 'metalfx', 'temporal' => 'portable' | 'metalfx'] */
+function vio_upscale_info(VioContext $context): array {}
+/**
  * Get the name of the backend in use.
  */
 function vio_backend_name(VioContext $context): string {}
@@ -997,6 +1231,13 @@ function vio_backend_count(): int {}
 function vio_backends(): array {}
 
 /**
+ * The window system vio runs on (OPEN-ITEMS A1, NATIVE-PLATFORM-PLAN): "glfw", a native
+ * layer ("win32", "cocoa", "x11") or "null" (no window system: headless / offscreen only).
+ * VIO_PLATFORM=<name> in the environment picks one of the built-in platforms.
+ */
+function vio_platform(): string {}
+
+/**
  * Read the host's thermal pressure level.
  *
  * On macOS / iOS this maps NSProcessInfo.thermalState to the string tokens
@@ -1008,7 +1249,12 @@ function vio_thermal_state(): string {}
 /**
  * Create a video recorder for capturing frames to a video file.
  *
- * @param array $config ['path' => string, 'fps' => int (default 30), 'codec' => string (optional)]
+ * @param array $config ['path' => string, 'fps' => int (default 30),
+ *   'encoder' => 'auto' (default: the platform's hardware encoders - Windows NVENC, AMF, QSV,
+ *   Media Foundation; Apple VideoToolbox; Linux NVENC - then libx264) | 'hardware' (no software
+ *   fallback) | 'software' (libx264) | an FFmpeg encoder name; 'codec' is the old spelling]
+ *   On D3D11 a hardware encoder that takes D3D11 frames gets the frame without a CPU copy
+ *   (vio_recorder_info()['zero_copy']).
  * @return VioRecorder|false Recorder object or false on failure
  */
 function vio_recorder(VioContext $context, array $config): VioRecorder|false {}
@@ -1022,6 +1268,23 @@ function vio_recorder_capture(VioRecorder $recorder, VioContext $context): bool 
  * Stop recording and finalize the video file.
  */
 function vio_recorder_stop(VioRecorder $recorder): void {}
+
+/**
+ * ['encoder' => FFmpeg name, 'hardware' => bool, 'zero_copy' => bool, 'frames' => int,
+ *  'width' => int, 'height' => int, 'fps' => int, 'recording' => bool]
+ */
+function vio_recorder_info(VioRecorder $recorder): array|false {}
+
+/**
+ * Facts of a video file: ['width', 'height', 'frames' (decoded and counted), 'fps', 'codec'],
+ * false when it is no video FFmpeg can read.
+ */
+function vio_video_info(string $path): array|false {}
+
+/**
+ * Frame $index of a video decoded to RGBA: ['width', 'height', 'data'], false past the end.
+ */
+function vio_video_frame(string $path, int $index): array|false {}
 
 /**
  * Create a live stream to an RTMP or SRT endpoint.
@@ -1452,9 +1715,21 @@ function vio_draw_instanced(VioContext $context, VioMesh $mesh, array|string $ma
  *                                               //   sampler2DArray via vio_render_target_texture(). 'cube' + 'depth_only'
  *                                               //   gives a depth cube (vio_render_target_cubemap). Both need
  *                                               //   VIO_FEATURE_RENDER_TARGET_LAYERED.
+ *   'rate_map' => ['x' => [q, ...], 'y' => [q, ...]] // sampling quality 0 < q <= 1 of 1..16 equal zones per
+ *                                               //   axis (OPEN-ITEMS A16). With VIO_FEATURE_RASTER_RATE_MAP
+ *                                               //   (Metal) low-quality zones render with fewer samples into a
+ *                                               //   smaller physical target, resolved into the texture when the
+ *                                               //   pass leaves the target; elsewhere full rate. Plain 2D colour
+ *                                               //   targets only (ValueError otherwise).
  * @return VioRenderTarget|false Render target or false on failure
  */
 function vio_render_target(VioContext $context, array $config): VioRenderTarget|false {}
+
+/**
+ * ['width', 'height', 'physical_width', 'physical_height', 'rate_map' => bool]: the logical
+ * size and the size the GPU renders at (smaller with an active rate map).
+ */
+function vio_render_target_size(VioRenderTarget $target): array {}
 
 /**
  * Bind a render target for subsequent draw calls (redirects rendering to FBO).
@@ -1552,6 +1827,18 @@ function vio_gl_info(VioContext $context): array|false {}
  * unrecognized constants.
  */
 function vio_supports_feature(VioContext $context, int $feature): bool {}
+
+/**
+ * How the context's backend provides a VIO_FEATURE_* capability.
+ * 'supported' equals vio_supports_feature(); 'emulated' is true when the feature
+ * is reached by other means than the API's own stage or call (e.g. Metal runs a
+ * GLSL geometry shader as compute kernels, Metal multiview draws instances), and
+ * 'method' then names how. Emulated paths work, but usually cost more than on a
+ * backend that has the feature natively.
+ *
+ * @return array{supported: bool, emulated: bool, method: ?string}
+ */
+function vio_feature_info(VioContext $context, int $feature): array {}
 
 /**
  * Convenience alias for vio_render_target() with explicit option keys

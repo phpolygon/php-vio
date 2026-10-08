@@ -9,6 +9,65 @@
 
 #include <dxgiformat.h>
 #include <dxgi1_6.h>
+#include <stdio.h>
+
+/* vio_backend_info (A4): PCI vendor, user-mode driver version and whether the
+ * adapter is the software rasterizer (WARP / Microsoft Basic Render Driver). */
+static inline void vio_dxgi_adapter_identity(IDXGIAdapter *adapter, uint32_t *vendor_id,
+                                             char *driver, size_t driver_size, int *software)
+{
+    DXGI_ADAPTER_DESC d;
+    LARGE_INTEGER umd;
+    *vendor_id = 0;
+    *software = 0;
+    if (driver_size) driver[0] = '\0';
+    if (!adapter) return;
+    if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &d))) {
+        *vendor_id = d.VendorId;
+        *software = d.VendorId == 0x1414 && d.DeviceId == 0x8C;
+    }
+    if (driver_size && SUCCEEDED(IDXGIAdapter_CheckInterfaceSupport(adapter, &IID_IDXGIDevice, &umd)))
+        snprintf(driver, driver_size, "%u.%u.%u.%u",
+                 (unsigned)HIWORD(umd.HighPart), (unsigned)LOWORD(umd.HighPart),
+                 (unsigned)HIWORD(umd.LowPart), (unsigned)LOWORD(umd.LowPart));
+}
+
+/* vio_adapters (A6): DXGI adapters in high-performance order (the software
+ * adapter last). `probe` adds the API's features and device type and returns
+ * 0 when the API can open the adapter. */
+typedef int (*vio_dxgi_probe_fn)(IDXGIAdapter1 *adapter, vio_adapter_info *a);
+static inline int vio_dxgi_enumerate_adapters(vio_adapter_info *out, int max, vio_dxgi_probe_fn probe)
+{
+    IDXGIFactory1 *f1 = NULL;
+    IDXGIFactory6 *f6 = NULL;
+    int n = 0;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) return 0;
+    if (FAILED(IDXGIFactory1_QueryInterface(f1, &IID_IDXGIFactory6, (void **)&f6))) f6 = NULL;
+    for (UINT i = 0; n < max; i++) {
+        IDXGIAdapter1 *ad = NULL;
+        HRESULT hr = f6 ? IDXGIFactory6_EnumAdapterByGpuPreference(f6, i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                                  &IID_IDXGIAdapter1, (void **)&ad)
+                        : IDXGIFactory1_EnumAdapters1(f1, i, &ad);
+        if (FAILED(hr) || !ad) break;
+        vio_adapter_info *a = &out[n];
+        DXGI_ADAPTER_DESC1 d;
+        int sw = 0;
+        memset(a, 0, sizeof(*a));
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(ad, &d))) {
+            if (WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, a->name, (int)sizeof(a->name), NULL, NULL) <= 0)
+                a->name[0] = '\0';
+            a->device_id = d.DeviceId;
+            a->vram_bytes = (uint64_t)d.DedicatedVideoMemory;
+        }
+        vio_dxgi_adapter_identity((IDXGIAdapter *)ad, &a->vendor_id, a->driver, sizeof(a->driver), &sw);
+        a->device_type = sw ? "software" : NULL;
+        if (probe(ad, a) == 0) n++;
+        IDXGIAdapter1_Release(ad);
+    }
+    if (f6) IDXGIFactory6_Release(f6);
+    IDXGIFactory1_Release(f1);
+    return n;
+}
 #include <windows.h>
 #include "../../include/vio_types.h"
 
@@ -68,6 +127,24 @@ static inline const char *vio_usage_to_semantic(vio_usage u)
         case VIO_NORMAL:   return "NORMAL";
         case VIO_TANGENT:  return "TANGENT";
         default:           return "TEXCOORD";
+    }
+}
+
+/* VIO_D3D_WARP=<path to d3d10warp.dll>: a WARP from the Microsoft.Direct3D.WARP
+ * NuGet package instead of the one in System32 (SM6PLAN 0b). Loaded once, before
+ * the first WARP device: D3D11 and D3D12 load "d3d10warp.dll" by name and get the
+ * module already in the process. The OS WARP of a CI runner stops at SM 6.2;
+ * the NuGet WARP (1.0.18+) has SM 6.9 with DXR 1.2. */
+static inline void vio_d3d_load_warp(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    const char *path = getenv("VIO_D3D_WARP");
+    if (!path || !*path) return;
+    WCHAR wpath[MAX_PATH];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH) || !LoadLibraryW(wpath)) {
+        php_error_docref(NULL, E_WARNING, "VIO_D3D_WARP: cannot load '%s' (%lu); using the system WARP", path, GetLastError());
     }
 }
 

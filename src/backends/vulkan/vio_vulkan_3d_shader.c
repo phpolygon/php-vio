@@ -210,22 +210,55 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
                          stage, VK_IMAGE_VIEW_TYPE_2D, 0, (uint32_t)size);
     }
 
+    /* Separate textures combined by vio_spvc_combine_separate take the list positions
+     * php_vio.c gives them: behind the shader's own combined samplers, in the order
+     * of the original separate images (OPEN-ITEMS-PLAN A23). */
+    const spvc_combined_image_sampler *cis = NULL;
+    size_t cis_n = 0;
+    spvc_compiler_get_combined_image_samplers(c, &cis, &cis_n);
+    const spvc_reflected_resource *sep_list = NULL;
+    size_t sep_n = 0;
+    spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &sep_list, &sep_n);
     /* Samplers: regular 0.., shadow 8.. (the D3D12 register replay in php_vio.c). */
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, &list, &n);
     int regular = 0, shadow = 8;
+    size_t own = 0;   /* combined samplers the shader declared itself */
     for (size_t i = 0; i < n; i++) {
+        int combined = 0;
+        for (size_t k = 0; k < cis_n; k++) if (cis[k].combined_id == list[i].id) combined = 1;
+        if (!combined) own++;
+    }
+    size_t own_seen = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t fi = own_seen;   /* position in php_vio.c's sampler list */
+        int from_separate = 0;
+        for (size_t k = 0; k < cis_n; k++) {
+            if (cis[k].combined_id != list[i].id) continue;
+            from_separate = 1;
+            size_t j = 0, at = (size_t)-1;
+            for (size_t q = 0; q < sep_n; q++) {
+                if (spvc_compiler_get_decoration(c, sep_list[q].id, SpvDecorationDescriptorSet) == 1) continue;
+                if (sep_list[q].id == cis[k].image_id) { at = j; break; }
+                j++;
+            }
+            fi = at == (size_t)-1 ? (size_t)VK3D_MAX_SAMPLERS : own + at;
+            break;
+        }
+        if (!from_separate) own_seen++;
         int is_depth = 0;
         VkImageViewType dim = vk3d_sampler_dim(c, list[i].type_id, &is_depth);
         int reg = is_depth ? shadow++ : regular++;
+        int planned = vio_sampler_plan_reg(list[i].name);   /* shader-wide by name (A30) */
+        if (planned >= 0) reg = planned;
         if (reg >= VK3D_MAX_SAMPLERS) continue;
         uint32_t binding = (uint32_t)(VK3D_B_SAMPLER0 + reg);
         spvc_compiler_set_decoration(c, list[i].id, SpvDecorationDescriptorSet, 0);
         spvc_compiler_set_decoration(c, list[i].id, SpvDecorationBinding, binding);
         vk3d_add_binding(sh, binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, dim, is_depth, 0);
-        if (is_fragment && i < VK3D_MAX_SAMPLERS) {
-            sh->fs_sampler_binding[i] = (int)binding;
-            sh->fs_sampler_depth[i] = is_depth;
-            if ((int)i + 1 > sh->fs_sampler_count) sh->fs_sampler_count = (int)i + 1;
+        if (is_fragment && fi < VK3D_MAX_SAMPLERS) {
+            sh->fs_sampler_binding[fi] = (int)binding;
+            sh->fs_sampler_depth[fi] = is_depth;
+            if ((int)fi + 1 > sh->fs_sampler_count) sh->fs_sampler_count = (int)fi + 1;
         }
         if (smp && smp->count < VK3D_MAX_SAMPLERS) {
             snprintf(smp->names[smp->count], sizeof(smp->names[0]), "%s", list[i].name ? list[i].name : "");
@@ -255,15 +288,16 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
     }
 
     /* Set 1 is the bindless table (vio_texture_index): it keeps its set and
-     * bindings; any other separate texture / sampler is unsupported. */
+     * bindings. Other separate textures / samplers were combined before
+     * (vio_spvc_combine_separate) - except next to the bindless table. */
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &n);
     int other = 0;
     for (size_t i = 0; i < n; i++) {
         if (spvc_compiler_get_decoration(c, list[i].id, SpvDecorationDescriptorSet) == 1) sh->uses_bindless = 1;
         else other = 1;
     }
-    if (other) {
-        php_error_docref(NULL, E_NOTICE, "Vulkan: separate texture/sampler objects are not supported by the 3D pipeline; use combined samplers");
+    if (other && sh->uses_bindless) {
+        php_error_docref(NULL, E_NOTICE, "Vulkan: separate texture/sampler objects next to the bindless table are not supported; use combined samplers there");
     }
     return 0;
 }
@@ -376,6 +410,7 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     if (spvc_context_create(&ctx) != SPVC_SUCCESS) return NULL;
     if (spvc_context_parse_spirv(ctx, spirv, spirv_bytes / sizeof(uint32_t), &ir) != SPVC_SUCCESS ||
         spvc_context_create_compiler(ctx, SPVC_BACKEND_GLSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &c) != SPVC_SUCCESS ||
+        (vio_spvc_combine_separate(c), 0) ||   /* separate texture + sampler -> combined (OPEN-ITEMS-PLAN A23) */
         vk3d_remap_stage(c, stage_id, sh, vt_in, vt_out, smp) != 0) {
         php_error_docref(NULL, E_WARNING, "Vulkan: %s SPIR-V reflection failed: %s", stage_name,
                          spvc_context_get_last_error_string(ctx));
@@ -388,6 +423,8 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     uint64_t key = vio_shader_cache_hash(tag, spirv, spirv_bytes);
     key = vio_shader_cache_hash_more(key, &upstream, sizeof(upstream));
     key = vio_shader_cache_hash_more(key, &is_last, sizeof(is_last));
+    if (vio_sampler_plan_current())   /* sampler bindings come from the whole shader */
+        key = vio_shader_cache_hash_more(key, vio_sampler_plan_current(), sizeof(vio_sampler_plan));
     if (vio_shader_cache_dir()) {
         size_t len = 0;
         void *data = vio_shader_cache_load(key, "vkspv", &len);
@@ -577,10 +614,12 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
     }
     /* Samplers only an optional stage declares extend the GL-unit map after the
      * fragment ones, in php_vio.c's merge order (geometry, tess control, tess
-     * eval), so vio_set_uniform('u_height', unit) + vio_bind_texture reach them. */
+     * eval, then the vertex / mesh stage and task - OPEN-ITEMS-PLAN A30 / A28), so
+     * vio_set_uniform('u_height', unit) + vio_bind_texture reach them. */
     {
-        static const int merge_order[3] = { 4, 2, 3 };
-        for (int k = 0; k < 3; k++) {
+        static const int merge_order[5] = { 4, 2, 3, 1, 0 };
+        int merge_count = 5;
+        for (int k = 0; k < merge_count; k++) {
             const vk3d_stage_samplers *s = &smp[merge_order[k]];
             for (int j = 0; j < s->count && sh->fs_sampler_count < VK3D_MAX_SAMPLERS; j++) {
                 int known = 0;
@@ -807,11 +846,11 @@ static uint64_t vk3d_mix(uint64_t h, uint64_t v)
     return h;
 }
 
-/* The pipeline for the render pass currently open (attachment signature) and the
+/* The pipeline for the pass currently open (attachment signature) and the
  * mesh vertex stride, created on first use. */
 VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
 {
-    if (!p || p->dead || !p->shader || p->shader->dead || !vio_vk.cur_render_pass) return VK_NULL_HANDLE;
+    if (!p || p->dead || !p->shader || p->shader->dead || !vio_vk.in_pass) return VK_NULL_HANDLE;
     if (stride == 0) stride = p->vertex_stride;
     int cc = vio_vk.cur_color_count > 4 ? 4 : vio_vk.cur_color_count;
     uint64_t key = 1469598103934665603ULL;
@@ -820,7 +859,10 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     key = vk3d_mix(key, (uint64_t)vio_vk.cur_samples);
     key = vk3d_mix(key, (uint64_t)vio_vk.cur_has_depth);
     key = vk3d_mix(key, (uint64_t)stride);
+    const vio_mesh_layout *ml = p->shader->is_mesh ? NULL : &vio_vk.mesh_layout;
+    key = vk3d_mix(key, (uint64_t)(ml ? ml->key : 0));   /* the mesh's attribute offsets */
     key = vk3d_mix(key, (uint64_t)p->desc.view_count);   /* multiview pass (viewMask) */
+    key = vk3d_mix(key, (uint64_t)vio_vk.cur_view_mask);
     for (int i = 0; i < p->variant_count; i++) {
         if (p->variants[i].key == key) return p->variants[i].pipeline;
     }
@@ -871,7 +913,7 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
             va[i].offset  = (uint32_t)(loc - 3) * 16u;
         } else {
             va[i].binding = 0;
-            va[i].offset  = off;
+            va[i].offset  = (uint32_t)vio_mesh_layout_offset(ml, loc, (int)off);
             off += vk3d_format_size(p->attribs[i].format);
         }
     }
@@ -978,8 +1020,12 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     gi.pColorBlendState    = &cb;
     gi.pDynamicState       = &dyn;
     gi.layout              = p->shader->layout;
-    gi.renderPass          = vio_vk.cur_render_pass;
-    gi.subpass             = 0;
+    /* Dynamic rendering (VULKAN-MODERN-PLAN phase 4): the attachment formats
+     * of the open pass instead of a render-pass object. */
+    VkPipelineRenderingCreateInfo rendering;
+    vio_vk_pass_rendering_info(&rendering);
+    gi.pNext               = &rendering;
+    if (vio_vk.vrs_attachment) gi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;   /* A18 */
     gi.basePipelineIndex   = -1;
 
     VkPipeline pl = VK_NULL_HANDLE;

@@ -8,7 +8,7 @@
 
 #include "php.h"
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
 
 #include <glad/glad.h>
 #include <stddef.h>
@@ -154,4 +154,4 @@ void vio_2d_opengl_flush(vio_2d_state *state)
     if (depth_was_enabled) glEnable(GL_DEPTH_TEST);
 }
 
-#endif /* HAVE_GLFW */
+#endif /* HAVE_OPENGL */
