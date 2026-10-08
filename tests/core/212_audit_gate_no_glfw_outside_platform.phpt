@@ -55,7 +55,7 @@ if ($violations) {
 /* The active platform answers through the API: a headless context reports its
  * own size whatever the window system says, monitors / gamepads are arrays. */
 /* the active platform: GLFW in a build with it (until a native layer takes over), else null */
-if (!in_array(vio_platform(), ['glfw', 'win32', 'cocoa', 'x11', 'null'], true)) echo "platform ", vio_platform(), "\n";
+if (!in_array(vio_platform(), ['glfw', 'win32', 'cocoa', 'x11', 'wayland', 'null'], true)) echo "platform ", vio_platform(), "\n";
 $ctx = @vio_create('auto', ['width' => 48, 'height' => 32, 'headless' => true]);
 if ($ctx) {
     var_dump(vio_window_size($ctx) === [48, 32], vio_framebuffer_size($ctx) === [48, 32], is_array(vio_monitors($ctx)), is_array(vio_gamepads()));
