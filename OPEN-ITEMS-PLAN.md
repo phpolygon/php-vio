@@ -52,7 +52,7 @@ A14 TLAS-Objekt mit Rebuild/Refit ✅ (`vio_acceleration_structure_update`, Test
 A37 Vulkan 1.2+ (Timeline-Semaphores, Dynamic Rendering, Sync2) ✅ (VULKAN-MODERN-PLAN, Test 206; Nebenbefunde: Vulkan lehnte `vio_read_render_target` im Frame ab; der headless Capture-Puffer hatte keine Abhängigkeit zwischen den Frames – Sync-Validierung) ·
 A18 Vulkan-Shading-Rate-Bild ✅ (Test 160 auf Vulkan) · A38 Recording über Secondary Command Buffers ✅ (BUNDLE-PLAN, Test 207: `vio_bundle` mit nativer Aufnahme auf Vulkan (Secondary Command Buffer), D3D12 (Bundle-Command-List) und D3D11 (Deferred Context), Abspielen auf GL/Metal; 2000 Draws D3D12 3,9 → 0,75 ms, Vulkan 5,4 → 1,3 ms) ·
 A21 Upscaling `vio_upscale` ✅ (UPSCALE-PLAN, Test 208: portable Fragment-Passes statt Compute – laufen auch auf GL 3.3 –, spatial + temporal; MetalFX spatial dahinter, nur über die macOS-CI belegt; DirectSR erst mit Retail-SDK) ·
-A39 GPU-Video-Encoding über Interop (FFmpeg-Hardware-Encoder) · A22 Metal `MTLBinaryArchive` (CI) ·
+A39 GPU-Video-Encoding über Interop (FFmpeg-Hardware-Encoder) ✅ (VIDEO-ENCODE-PLAN, Test 209: Encoder-Wahl `auto`/`hardware`/`software`, D3D11 ohne CPU-Kopie über einen D3D11VA-Pool, `vio_video_info`/`vio_video_frame` zum Zurücklesen; 1080p NVENC 2,9 statt 16 ms je Frame) · A22 Metal `MTLBinaryArchive` (CI) ·
 A16 Rate Maps (CI) · A17 Metal-Tensoren über `'msl'`-Override (CI, M5-Hardware nicht lokal).
 
 ## Batch 7 — eigene Plattformschicht (NATIVE-/WIN32-PLATFORM-PLAN)
