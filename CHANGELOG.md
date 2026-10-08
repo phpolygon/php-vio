@@ -1,3 +1,10 @@
+## [2.31.4](https://github.com/phpolygon/php-vio/compare/v2.31.3...v2.31.4) (2026-10-08)
+
+
+### Bug Fixes
+
+* **build:** weak-link MetalFX into static macOS builds ([8da83b7](https://github.com/phpolygon/php-vio/commit/8da83b7b3db7c8a9d0e880956bd604c2a3d58d8f))
+
 ## [2.31.3](https://github.com/phpolygon/php-vio/compare/v2.31.2...v2.31.3) (2026-10-08)
 
 
