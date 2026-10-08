@@ -1299,29 +1299,31 @@ static int vulkan_enumerate_adapters(vio_adapter_info *out, int max)
             }
             VkPhysicalDeviceFeatures f;
             vkGetPhysicalDeviceFeatures(pds[i], &f);
-            a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
-                        | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW);
-            if (f.geometryShader)       a->features |= VIO_FEATURE_BIT(VIO_FEATURE_GEOMETRY);
-            if (f.tessellationShader)   a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION);
-            if (f.multiViewport)        a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MULTI_VIEWPORT);
-            if (f.textureCompressionBC) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_BC);
-            if (f.textureCompressionASTC_LDR) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
-            if (p.apiVersion >= VK_API_VERSION_1_1) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MULTIVIEW);
+            memset(&a->features, 0, sizeof(a->features));
+            vio_featset_add(&a->features, VIO_FEATURE_COMPUTE);
+            vio_featset_add(&a->features, VIO_FEATURE_3D_PIPELINE);
+            vio_featset_add(&a->features, VIO_FEATURE_INDIRECT_DRAW);
+            if (f.geometryShader)       vio_featset_add(&a->features, VIO_FEATURE_GEOMETRY);
+            if (f.tessellationShader)   vio_featset_add(&a->features, VIO_FEATURE_TESSELLATION);
+            if (f.multiViewport)        vio_featset_add(&a->features, VIO_FEATURE_MULTI_VIEWPORT);
+            if (f.textureCompressionBC) vio_featset_add(&a->features, VIO_FEATURE_TEXTURE_COMPRESSION_BC);
+            if (f.textureCompressionASTC_LDR) vio_featset_add(&a->features, VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
+            if (p.apiVersion >= VK_API_VERSION_1_1) vio_featset_add(&a->features, VIO_FEATURE_MULTIVIEW);
             uint32_t ne = 0;
             vkEnumerateDeviceExtensionProperties(pds[i], NULL, &ne, NULL);
             VkExtensionProperties *ext = ne ? (VkExtensionProperties *)calloc(ne, sizeof(*ext)) : NULL;
             if (ext && vkEnumerateDeviceExtensionProperties(pds[i], NULL, &ne, ext) == VK_SUCCESS) {
-                if (vulkan_has_device_ext(ext, ne, "VK_KHR_ray_query")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAY_QUERY);
-                if (vulkan_has_device_ext(ext, ne, "VK_KHR_ray_tracing_pipeline")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAYTRACING);
-                if (vulkan_has_device_ext(ext, ne, "VK_EXT_mesh_shader")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MESH_SHADER);
-                if (vulkan_has_device_ext(ext, ne, "VK_KHR_fragment_shading_rate")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_SHADING_RATE);
-                if (vulkan_has_device_ext(ext, ne, "VK_KHR_fragment_shader_barycentric")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_BARYCENTRICS);
-                if (vulkan_has_device_ext(ext, ne, "VK_KHR_cooperative_matrix")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_COOPERATIVE_MATRIX);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_ray_query")) vio_featset_add(&a->features, VIO_FEATURE_RAY_QUERY);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_ray_tracing_pipeline")) vio_featset_add(&a->features, VIO_FEATURE_RAYTRACING);
+                if (vulkan_has_device_ext(ext, ne, "VK_EXT_mesh_shader")) vio_featset_add(&a->features, VIO_FEATURE_MESH_SHADER);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_fragment_shading_rate")) vio_featset_add(&a->features, VIO_FEATURE_SHADING_RATE);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_fragment_shader_barycentric")) vio_featset_add(&a->features, VIO_FEATURE_BARYCENTRICS);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_cooperative_matrix")) vio_featset_add(&a->features, VIO_FEATURE_COOPERATIVE_MATRIX);
                 if (p.apiVersion >= VK_API_VERSION_1_2 || vulkan_has_device_ext(ext, ne, "VK_EXT_descriptor_indexing"))
-                    a->features |= VIO_FEATURE_BIT(VIO_FEATURE_BINDLESS);
+                    vio_featset_add(&a->features, VIO_FEATURE_BINDLESS);
             }
             free(ext);
-            if (p.apiVersion >= VK_API_VERSION_1_1) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_SUBGROUP);
+            if (p.apiVersion >= VK_API_VERSION_1_1) vio_featset_add(&a->features, VIO_FEATURE_SUBGROUP);
         }
     }
     free(pds);

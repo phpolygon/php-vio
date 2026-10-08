@@ -111,12 +111,12 @@ PHP_INI_END()
 /* ── Backend scoring for 'auto' (OPEN-ITEMS-PLAN A7) ────────────────── */
 
 /* 1 = 'prefer' / 'require' / 'benchmark' given (scored 'auto'), 0 = plain 'auto', -1 = bad option (warned). */
-static int vio_select_options(HashTable *opts, int *prefer, uint64_t *require, int *benchmark)
+static int vio_select_options(HashTable *opts, int *prefer, vio_feature_set *require, int *benchmark)
 {
     zval *v;
     int scored = 0;
     *prefer = VIO_PREFER_PERFORMANCE;
-    *require = 0;
+    memset(require, 0, sizeof(*require));
     *benchmark = 0;
     if (!opts) return 0;
     /* A8: calibration run among the top candidates (implies the ranking). */
@@ -143,11 +143,11 @@ static int vio_select_options(HashTable *opts, int *prefer, uint64_t *require, i
         }
         ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(v), f) {
             zend_long x = zval_get_long(f);
-            if (x < 0 || x > 63) {
+            if (x < 0 || x >= VIO_FEATURE_SET_MAX) {
                 php_error_docref(NULL, E_WARNING, "'require' must be an array of VIO_FEATURE_* constants");
                 return -1;
             }
-            *require |= VIO_FEATURE_BIT(x);
+            vio_featset_add(require, (int)x);
         } ZEND_HASH_FOREACH_END();
     }
     return scored;
@@ -185,7 +185,7 @@ static void vio_select_adapter_from_zval(vio_adapter_info *a, zval *z)
         zval *f;
         ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(v), f) {
             zend_long x = zval_get_long(f);
-            if (x >= 0 && x < 64) a->features |= VIO_FEATURE_BIT(x);
+            vio_featset_add(&a->features, (int)x);
         } ZEND_HASH_FOREACH_END();
     }
 }
@@ -286,7 +286,7 @@ ZEND_FUNCTION(vio_rank_backends)
 {
     HashTable *opts = NULL;
     int prefer, platform, bench;
-    uint64_t require;
+    vio_feature_set require;
     vio_select_candidate rank[VIO_MAX_BACKENDS];
     ZEND_PARSE_PARAMETERS_START(0, 1)
         Z_PARAM_OPTIONAL
@@ -294,7 +294,7 @@ ZEND_FUNCTION(vio_rank_backends)
     ZEND_PARSE_PARAMETERS_END();
     if (vio_select_options(opts, &prefer, &require, &bench) < 0) RETURN_FALSE;
     int n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
-    vio_select_rank(rank, n, platform, prefer, require);
+    vio_select_rank(rank, n, platform, prefer, &require);
     vio_select_to_zval(return_value, rank, n);
 }
 
@@ -575,7 +575,7 @@ ZEND_FUNCTION(vio_benchmark_backends)
 {
     HashTable *opts = NULL;
     int prefer, platform, bench;
-    uint64_t require;
+    vio_feature_set require;
     vio_select_candidate rank[VIO_MAX_BACKENDS];
     ZEND_PARSE_PARAMETERS_START(0, 1)
         Z_PARAM_OPTIONAL
@@ -587,7 +587,7 @@ ZEND_FUNCTION(vio_benchmark_backends)
     if (max < 1) max = 1;
     if (max > VIO_MAX_BACKENDS) max = VIO_MAX_BACKENDS;
     int n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
-    vio_select_rank(rank, n, platform, prefer, require);
+    vio_select_rank(rank, n, platform, prefer, &require);
     vio_bench_candidates(rank, n, (int)max, vio_bench_frames(opts, "frames"), vio_bench_dir(opts, "cache"));
     vio_bench_reorder(rank, n);
     array_init(return_value);
@@ -635,14 +635,14 @@ ZEND_FUNCTION(vio_create)
     /* 'prefer' / 'require' turn 'auto' into a ranking (A7); plain 'auto' keeps
      * the platform priority list. */
     int select_prefer = VIO_PREFER_PERFORMANCE, rank_n = 0, benchmark = 0;
-    uint64_t select_require = 0;
+    vio_feature_set select_require = {{0}};
     vio_select_candidate rank[VIO_MAX_BACKENDS];
     int scored = auto_pick ? vio_select_options(options_ht, &select_prefer, &select_require, &benchmark) : 0;
     if (scored < 0) RETURN_FALSE;
     if (scored) {
         int platform;
         rank_n = vio_select_collect(rank, VIO_MAX_BACKENDS, &platform);
-        vio_select_rank(rank, rank_n, platform, select_prefer, select_require);
+        vio_select_rank(rank, rank_n, platform, select_prefer, &select_require);
         /* A8: the calibration run decides among the top three; cached per adapter + driver. */
         if (benchmark) {
             vio_bench_candidates(rank, rank_n, 3, vio_bench_frames(options_ht, "benchmark_frames"),
@@ -924,8 +924,8 @@ pick_backend:
     ctx->initialized = 1;
     /* A required feature the ranking could not see before the device opened
      * (OpenGL, shader-toolchain flags): next candidate. */
-    for (int f = 0; scored && f < 64; f++) {
-        if ((select_require & VIO_FEATURE_BIT(f))
+    for (int f = 0; scored && f < VIO_FEATURE_SET_MAX; f++) {
+        if (vio_featset_has(&select_require, f)
             && !(ctx->backend->supports_feature && ctx->backend->supports_feature((vio_feature)f))) {
             zval_ptr_dtor(&obj);
             VIO_CREATE_FAIL();
@@ -9949,8 +9949,8 @@ ZEND_FUNCTION(vio_adapters)
             add_assoc_string(&entry, "device_type", (char *)(a->device_type ? a->device_type : "unknown"));
             add_assoc_long(&entry, "vram_bytes", (zend_long)a->vram_bytes);
             array_init(&features);
-            for (int f = 0; f < 64; f++)
-                if (a->features & VIO_FEATURE_BIT(f)) add_next_index_long(&features, f);
+            for (int f = 0; f < VIO_FEATURE_SET_MAX; f++)
+                if (vio_featset_has(&a->features, f)) add_next_index_long(&features, f);
             add_assoc_zval(&entry, "features", &features);
             add_next_index_zval(&adapters, &entry);
         }

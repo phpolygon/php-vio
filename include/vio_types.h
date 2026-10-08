@@ -575,7 +575,19 @@ typedef struct _vio_backend_description {
  * the backend can tell without opening its own device (hardware support; the
  * flag of a context may still depend on the shader toolchain). */
 #define VIO_MAX_ADAPTERS 16
-#define VIO_FEATURE_BIT(f) (1ull << (unsigned)(f))
+/* A set of VIO_FEATURE_* flags (adapter descriptions, 'require' / 'prefer').
+ * Two words: the flags passed 63 with VIO_FEATURE_RASTER_RATE_MAP, and a plain
+ * uint64_t mask could neither carry them nor let 'require' name them. */
+#define VIO_FEATURE_SET_MAX 128
+typedef struct _vio_feature_set { uint64_t w[VIO_FEATURE_SET_MAX / 64]; } vio_feature_set;
+static inline void vio_featset_add(vio_feature_set *s, int f)
+{
+    if (f >= 0 && f < VIO_FEATURE_SET_MAX) s->w[f >> 6] |= 1ull << (f & 63);
+}
+static inline int vio_featset_has(const vio_feature_set *s, int f)
+{
+    return f >= 0 && f < VIO_FEATURE_SET_MAX && ((s->w[f >> 6] >> (f & 63)) & 1);
+}
 typedef struct _vio_adapter_info {
     char        name[256];
     uint32_t    vendor_id;
@@ -583,7 +595,7 @@ typedef struct _vio_adapter_info {
     char        driver[64];
     const char *device_type;   /* "discrete" / "integrated" / "software", NULL = unknown */
     uint64_t    vram_bytes;
-    uint64_t    features;
+    vio_feature_set features;
 } vio_adapter_info;
 
 /* Depth mip reduction (A26). */

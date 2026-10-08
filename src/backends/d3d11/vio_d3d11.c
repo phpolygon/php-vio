@@ -3856,10 +3856,10 @@ static int d3d11_probe_adapter(IDXGIAdapter1 *adapter, vio_adapter_info *a)
         hr = D3D11CreateDevice((IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, levels + 1, 1,
                                D3D11_SDK_VERSION, &dev, NULL, NULL);
     if (FAILED(hr) || !dev) return -1;
-    a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
-                | VIO_FEATURE_BIT(VIO_FEATURE_GEOMETRY) | VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION)
-                | VIO_FEATURE_BIT(VIO_FEATURE_MULTI_VIEWPORT) | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW)
-                | VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_BC);
+    static const int base[] = { VIO_FEATURE_COMPUTE, VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_GEOMETRY, VIO_FEATURE_TESSELLATION,
+                                VIO_FEATURE_MULTI_VIEWPORT, VIO_FEATURE_INDIRECT_DRAW, VIO_FEATURE_TEXTURE_COMPRESSION_BC };
+    memset(&a->features, 0, sizeof(a->features));
+    for (size_t i = 0; i < sizeof(base) / sizeof(base[0]); i++) vio_featset_add(&a->features, base[i]);
     if (!a->device_type) {
         D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2 = {0};
         if (SUCCEEDED(ID3D11Device_CheckFeatureSupport(dev, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof(o2))))
