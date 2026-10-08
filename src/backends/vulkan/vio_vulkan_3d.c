@@ -1071,8 +1071,11 @@ static void vk3d_bundle_release(vk3d_bundle *b)
     int defer = vio_vk.in_frame;   /* the frame may execute it: park until its timeline value */
     for (int i = 0; i < r->chunk_count; i++) {
         if (!r->chunks[i].buf) continue;
+        /* The chunk is persistently mapped: unmap now (CPU side only, the GPU may
+         * still read it), destroy once the frame's timeline value passed. */
+        vio_vma_unmap(vio_vk.vma_allocator, r->chunks[i].alloc);
         if (defer) vio_vk_defer_destroy(VIO_VK_GRAVE_BUFFER, (uint64_t)r->chunks[i].buf, r->chunks[i].alloc);
-        else { vio_vma_unmap(vio_vk.vma_allocator, r->chunks[i].alloc); vio_vma_destroy_buffer(vio_vk.vma_allocator, r->chunks[i].buf, r->chunks[i].alloc); }
+        else vio_vma_destroy_buffer(vio_vk.vma_allocator, r->chunks[i].buf, r->chunks[i].alloc);
     }
     for (int i = 0; i < r->pool_count; i++) {
         if (defer) vio_vk_defer_destroy(VIO_VK_GRAVE_DESCRIPTOR_POOL, (uint64_t)r->pools[i], NULL);
