@@ -62,7 +62,14 @@ int vio_vma_create_buffer(void *allocator, VkDeviceSize size, VkBufferUsageFlags
     alloc_info.requiredFlags = mem_props;
     if (mem_props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-        alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+        /* A buffer that is only ever a copy destination is a readback buffer:
+         * the CPU reads it, so it must be cached host memory. With
+         * SEQUENTIAL_WRITE VMA picks write-combined memory (on NVIDIA with
+         * ReBAR the device-local BAR), where CPU reads are uncached - a
+         * 256x256 vio_read_pixels took 20 ms instead of well under one. */
+        alloc_info.flags = usage == VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                         ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                         : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
     } else {
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     }
