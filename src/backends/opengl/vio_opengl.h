@@ -15,6 +15,8 @@ typedef struct _vio_opengl_state {
     unsigned int default_shader_pos_only;
     int          initialized;
     int          in_frame;      /* between begin_frame and end_frame: vio_clear clears eagerly */
+    unsigned int clip_program;  /* program of the bound pipeline and the gl_ClipDistance */
+    int          clip_count;    /* planes its last geometry stage writes (A29) */
     float        clear_r, clear_g, clear_b, clear_a;
 
     /* Runtime-detected capabilities. Filled by vio_opengl_setup_context()
@@ -45,6 +47,20 @@ typedef struct _vio_opengl_state {
         int has_buffer_storage;          /* core 4.4 / GL_ARB_buffer_storage */
         int has_texture_storage;         /* core 4.2 / GL_ARB_texture_storage */
         int has_texture_swizzle;         /* core 3.3 / GL_ARB_texture_swizzle */
+        int has_subgroup;                /* GL_KHR_shader_subgroup: basic / vote / ballot / arithmetic /
+                                          * shuffle in compute + fragment (needs compute) */
+        int subgroup_stages;             /* raw GL_SUBGROUP_SUPPORTED_STAGES_KHR (vio_gl_info) */
+        int subgroup_features;           /* raw GL_SUBGROUP_SUPPORTED_FEATURES_KHR */
+        int subgroup_size;               /* raw GL_SUBGROUP_SIZE_KHR */
+        int has_subgroup_quad;           /* GL_KHR_shader_subgroup quad operations in the fragment stage */
+        int has_barycentrics;            /* GL_EXT_fragment_shader_barycentric */
+        int has_atomic64;                /* compute + GL_ARB_gpu_shader_int64 + GL_NV_shader_atomic_int64 */
+        int has_float16;                 /* GL_AMD_gpu_shader_half_float / GL_NV_gpu_shader5 (SPIRV-Cross's choices) */
+        int has_draw_parameters;         /* GL 4.6 / GL_ARB_shader_draw_parameters + base instance (4.2) */
+        int has_compute_derivatives;     /* compute + GL_NV_compute_shader_derivatives */
+        int has_multiview;               /* GL_OVR_multiview2 + layered attachments (3.2) */
+        int has_vertex_layer;            /* GL_ARB_shader_viewport_layer_array: gl_Layer from the vertex stage */
+        int multiview_emulate;           /* views by instancing although OVR is there (VIO_GL_EMULATE_MULTIVIEW=1) */
     } caps;
 
     /* Cached extension list. NULL until setup; freed in shutdown. */
@@ -58,7 +74,10 @@ typedef struct _vio_opengl_state {
 
     /* GPU timestamps (GAP-PHASE5 Block 3, GL >= 3.3 GL_TIMESTAMP queries): a
      * ring of begin/end query pairs, harvested when the slot is reused. */
-    unsigned int ts_query[3][2];
+    unsigned int ts_query[3][VIO_GPU_TS_PER_FRAME];   /* begin, end, named marks */
+    vio_gpu_mark_names  ts_marks[3];
+    vio_gpu_mark_result ts_result;
+    int                 ts_result_valid;
     int          ts_pending[3];
     int          ts_slot;
     unsigned int ts_generation;   /* context generation the query names belong to */
@@ -83,6 +102,10 @@ extern vio_opengl_state vio_gl;
 unsigned int vio_opengl_compile_shader_source(const char *vert_src, const char *frag_src);
 /* Link a program from vertex + fragment plus optional geometry / tessellation
  * control / tessellation evaluation sources (NULL = stage absent). */
+/* Multiview (vio_shader 'view_count'): remember a program's view count so the
+ * draws attach the layered target with glFramebufferTextureMultiviewOVR. */
+void vio_opengl_set_program_views(unsigned int program, int views);
+
 unsigned int vio_opengl_compile_program(const char *vert_src, const char *frag_src,
                                         const char *geom_src, const char *tesc_src,
                                         const char *tese_src);

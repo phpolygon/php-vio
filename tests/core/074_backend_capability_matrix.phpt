@@ -57,7 +57,7 @@ probe("opengl", [
     VIO_FEATURE_MRT                => 1,
     VIO_FEATURE_RENDER_TARGET_LAYERED => 1,   /* GL_TEXTURE_2D_ARRAY / depth cubemaps (GEOMETRY-STAGES-PLAN 1a) */
     VIO_FEATURE_RAYTRACING         => 0,
-    VIO_FEATURE_MULTIVIEW          => 0,
+    /* MULTIVIEW is device dependent here (GL_OVR_multiview2 / VkPhysicalDeviceMultiviewFeatures): test 158. */
 ]);
 
 /* Null: always 0 — it's the no-op test backend */
@@ -83,6 +83,21 @@ probe("null", [
     VIO_FEATURE_MULTI_VIEWPORT     => 0,
     VIO_FEATURE_GEOMETRY_INSTANCING => 0,
     VIO_FEATURE_HLSL_STAGE_OVERRIDE => 0,
+    VIO_FEATURE_SUBGROUP           => 0,
+    VIO_FEATURE_SUBGROUP_QUAD      => 0,
+    VIO_FEATURE_BARYCENTRICS       => 0,
+    VIO_FEATURE_ATOMIC64           => 0,
+    VIO_FEATURE_SHADER_FLOAT16     => 0,
+    VIO_FEATURE_BASE_VERTEX        => 0,
+    VIO_FEATURE_COMPUTE_DERIVATIVES => 0,
+    VIO_FEATURE_SHADING_RATE_PRIMITIVE => 0,
+    VIO_FEATURE_SHADING_RATE_IMAGE => 0,
+    VIO_FEATURE_BINDLESS           => 0,
+    VIO_FEATURE_RAY_QUERY          => 0,
+    VIO_FEATURE_MESH_SHADER        => 0,
+    VIO_FEATURE_SAMPLER_FEEDBACK   => 0,
+    VIO_FEATURE_COOPERATIVE_MATRIX => 0,
+    VIO_FEATURE_WORK_GRAPHS        => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -140,10 +155,12 @@ $d3d_common = [
      * for them (vio_hlsl_stage_supported - older Vulkan-SDK builds cannot).
      * tests/render3d/109 + 110 are the contract: flag = 1 => the stage renders. */
     VIO_FEATURE_RAYTRACING         => 0,
-    VIO_FEATURE_MULTIVIEW          => 0,
+    /* MULTIVIEW: D3D11 by instancing wherever the vertex stage can pick the
+     * layer (D3D11_OPTIONS3, device dependent: tests 158 / 182); D3D12 below. */
 ];
 probe_fold("d3d11", $d3d_common + [
     VIO_FEATURE_TEXTURE_SWIZZLE    => 0,   /* D3D11 SRVs have no component mapping */
+    VIO_FEATURE_SUBGROUP           => 0,   /* wave intrinsics need SM 6 (D3D12 only); D3D11 is FXC 5.0 */
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,   /* GAP-PLAN 2.2 */
     VIO_FEATURE_MIPMAP_GEN         => 1,   /* GenerateMips (GAP-PLAN 2.3) */
 ]);
@@ -151,6 +168,8 @@ probe_fold("d3d12", $d3d_common + [
     VIO_FEATURE_TEXTURE_SWIZZLE    => 1,   /* Shader4ComponentMapping */
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,   /* GAP-PLAN 2.2 */
     VIO_FEATURE_MIPMAP_GEN         => 1,   /* compute downsample, CPU box filter fallback (GAP-PHASE5 11) */
+    VIO_FEATURE_SUBGROUP           => 0,   /* default context is FXC 5.1; SM 6 + WaveOps: test 149 */
+    VIO_FEATURE_MULTIVIEW          => 0,   /* view instancing needs SM 6.1: test 158 */
 ]);
 
 /* Vulkan: 3D pipeline since GAP-PHASE5 Block 10 (SPIR-V round trip, frame upload
@@ -186,8 +205,8 @@ probe_fold("vulkan", [
     VIO_FEATURE_TEXTURE_SWIZZLE    => 1,
     VIO_FEATURE_NATIVE_2D_BATCH    => 1,
     VIO_FEATURE_TEXTURE_3D         => 1,
-    VIO_FEATURE_RAYTRACING         => 0,
-    VIO_FEATURE_MULTIVIEW          => 0,
+    /* RAYTRACING follows VK_KHR_ray_tracing_pipeline (1 on RTX, 0 on lavapipe): test 164. */
+    /* MULTIVIEW is device dependent here (GL_OVR_multiview2 / VkPhysicalDeviceMultiviewFeatures): test 158. */
 ]);
 
 /* Metal (macOS) — full 3D pipeline + RT + 2D-batch + swizzle */

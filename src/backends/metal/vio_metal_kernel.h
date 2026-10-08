@@ -22,7 +22,7 @@
  * vio_metal.m only (after vio_metal_msl.h); every function is static.
  *
  * Record layout (vec4 slots): 0 gl_Position, 1 (gl_Layer, gl_ViewportIndex as
- * int bits, gl_PointSize, -), then every user output in location order,
+ * int bits, gl_PointSize, gl_PrimitiveID as int bits), then every user output in location order,
  * ceil(components / 4) x columns x array length slots each.
  */
 
@@ -831,8 +831,17 @@ static void mk_emit_store_builtins(mk_sb *b, const mk_module *m, const char *buf
     const mk_builtin *vp    = mk_find_builtin(m, MK_ST_OUTPUT, MK_BI_VIEWPORT_INDEX);
     char psize[64] = "1.0";
     if (ps >= 0) { mk_member_name(nm, sizeof(nm), &m->pv_out, (uint32_t)ps); snprintf(psize, sizeof(psize), "vio_gl_out.%s", nm); }
-    mk_printf(b, "    %s.r[%s + 1u] = vec4(intBitsToFloat(%s), intBitsToFloat(%s), %s, 0.0);\n", buf, rec,
-              layer ? "vio_b9_out" : "0", vp ? "vio_b10_out" : "0", psize);
+    const mk_builtin *prim  = mk_find_builtin(m, MK_ST_OUTPUT, MK_BI_PRIMITIVE_ID);
+    mk_printf(b, "    %s.r[%s + 1u] = vec4(intBitsToFloat(%s), intBitsToFloat(%s), %s, intBitsToFloat(%s));\n", buf, rec,
+              layer ? "vio_b9_out" : "0", vp ? "vio_b10_out" : "0", psize, prim ? "vio_b7_out" : "0");
+}
+
+/* The geometry stage writes gl_PrimitiveID (A28): the pass-through vertex
+ * stage hands it to the fragment stage as a flat int at this location
+ * (VIO_PRIMID_LOCATION; the fragment input is moved there). */
+static int mk_gs_writes_primid(const mk_module *gs)
+{
+    return mk_find_builtin(gs, MK_ST_OUTPUT, MK_BI_PRIMITIVE_ID) != NULL;
 }
 
 /* gl_PointSize is 1.0 unless the stage writes it (GL's default size). */
@@ -860,7 +869,7 @@ static int mk_user_cbuffer(const vio_metal_stage_res *res)
 {
     for (int i = 0; i < res->buffer_count; i++) {
         const vio_metal_res_buffer *b = &res->buffers[i];
-        if (b->kind == 1) continue;
+        if (b->kind == 1 || b->kind == 3) continue;
         if (b->kind == 0 && b->binding >= VIO_MK_BIND_IN && b->binding <= VIO_MK_BIND_IDX) continue;
         return b->msl_index;
     }
@@ -1162,12 +1171,14 @@ static char *mk_passthrough_vs_glsl(const mk_module *gs)
         if (v->count > 1) mk_printf(&b, "[%d]", v->count);
         mk_cat(&b, ";\n");
     }
+    if (mk_gs_writes_primid(gs)) mk_printf(&b, "layout(location = %d) flat out int vio_primid;\n", VIO_PRIMID_LOCATION);
     mk_cat(&b, "void main()\n{\n");
     mk_printf(&b, "    uint vio_r = uint(gl_VertexIndex) * %du;\n", gs->out_slots);
     mk_cat(&b, "    gl_Position = vio_rec.r[vio_r];\n");
     if (gs->out_prim == MK_PRIM_POINTS) mk_cat(&b, "    gl_PointSize = vio_rec.r[vio_r + 1u].z;\n");
     if (layer) mk_cat(&b, "    gl_Layer = floatBitsToInt(vio_rec.r[vio_r + 1u].x);\n");
     if (vp) mk_cat(&b, "    gl_ViewportIndex = floatBitsToInt(vio_rec.r[vio_r + 1u].y);\n");
+    if (mk_gs_writes_primid(gs)) mk_cat(&b, "    vio_primid = floatBitsToInt(vio_rec.r[vio_r + 1u].w);\n");
     for (int k = 0; k < gs->out_count; k++) {
         char nm[32];
         snprintf(nm, sizeof(nm), "vio_o%d", gs->out[k].location);

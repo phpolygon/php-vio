@@ -15,7 +15,7 @@ typedef struct vio_tess_hlsl_desc {
     size_t      tes_size;
     uint32_t    input_points;   /* control points per input patch (the draw's patch size);
                                    0 = the control stage's output vertices */
-    int         shader_model;   /* 50 / 51 / 60 */
+    int         shader_model;   /* SPIRV-Cross HLSL target: 50 / 51 / 60..69 */
     int         fixup_depth;    /* domain shader: GL -> D3D clip-space depth fixup, set when
                                    the domain shader is the last stage writing gl_Position */
 } vio_tess_hlsl_desc;

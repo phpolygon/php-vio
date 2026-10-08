@@ -13,9 +13,7 @@ static zend_object *vio_context_create_object(zend_class_entry *ce)
 
     ctx->backend      = NULL;
     ctx->surface      = NULL;
-#ifdef HAVE_GLFW
     ctx->window       = NULL;
-#endif
     ctx->initialized  = 0;
     ctx->should_close = 0;
     ctx->in_frame     = 0;
@@ -27,6 +25,8 @@ static zend_object *vio_context_create_object(zend_class_entry *ce)
     ctx->saved_win_x = ctx->saved_win_y = 0;
     ctx->saved_win_w = ctx->saved_win_h = 0;
     ctx->has_saved_win_geometry = 0;
+    ctx->selected_by = NULL;
+    ctx->candidates = NULL;
 
     zend_object_std_init(&ctx->std, ce);
     object_properties_init(&ctx->std, ce);
@@ -35,9 +35,54 @@ static zend_object *vio_context_create_object(zend_class_entry *ce)
     return &ctx->std;
 }
 
+void vio_context_bindless_clear(vio_context_object *ctx)
+{
+    if (!ctx->bindless) return;
+    for (int i = 0; i < ctx->bindless_count; i++) {
+        if (ctx->bindless[i]) OBJ_RELEASE(ctx->bindless[i]);
+    }
+    efree(ctx->bindless);
+    ctx->bindless = NULL;
+    ctx->bindless_count = 0;
+    if (ctx->bindless_retire) { efree(ctx->bindless_retire); ctx->bindless_retire = NULL; }
+    if (ctx->bindless_kind) { efree(ctx->bindless_kind); ctx->bindless_kind = NULL; }
+    if (ctx->bindless_free) { efree(ctx->bindless_free); ctx->bindless_free = NULL; }
+    ctx->bindless_free_count = 0;
+}
+
+/* Unbind and release the fragment-stage storage buffers (A15): the backend
+ * keeps raw pointers to them, which must not outlive the context. */
+void vio_context_release_fragment_storage(vio_context_object *ctx)
+{
+    for (int i = 0; i < 4; i++) {
+        if (!ctx->frag_storage[i]) continue;
+        if (ctx->initialized && ctx->backend && ctx->backend->bind_fragment_storage)
+            ctx->backend->bind_fragment_storage(NULL, i);
+        OBJ_RELEASE(ctx->frag_storage[i]);
+        ctx->frag_storage[i] = NULL;
+    }
+    if (ctx->fb_texture) {
+        if (ctx->initialized && ctx->backend && ctx->backend->bind_fragment_storage)
+            ctx->backend->bind_fragment_storage(NULL, 3);
+        OBJ_RELEASE(ctx->fb_texture);
+        ctx->fb_texture = NULL;
+    }
+}
+
 static void vio_context_free_object(zend_object *obj)
 {
     vio_context_object *ctx = vio_context_from_obj(obj);
+    vio_context_release_fragment_storage(ctx);
+    vio_upscale_release(ctx);
+    /* The table's textures free their GPU objects through the backend: before it shuts down. */
+    vio_context_bindless_clear(ctx);
+    if (ctx->candidates) {
+        if (GC_DELREF(ctx->candidates) == 0) zend_array_destroy(ctx->candidates);
+        ctx->candidates = NULL;
+    }
+    for (int i = 0; i < VIO_MAX_UBO_BINDINGS; i++) {
+        if (ctx->bound_ubo[i]) { OBJ_RELEASE(ctx->bound_ubo[i]); ctx->bound_ubo[i] = NULL; }
+    }
 
     /* Backend / surface / window cleanup runs only when the ctx is still
      * initialised — vio_destroy may have already run these, in which case
@@ -55,12 +100,10 @@ static void vio_context_free_object(zend_object *obj)
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }
-#ifdef HAVE_GLFW
         if (ctx->window) {
             vio_window_destroy(ctx->window);
             ctx->window = NULL;
         }
-#endif
         ctx->initialized = 0;
     }
 

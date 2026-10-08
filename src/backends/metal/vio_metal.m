@@ -12,19 +12,26 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <objc/message.h>
+#include <os/lock.h>
+#include <stdatomic.h>
 
-#ifdef HAVE_GLFW
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-#define GLFW_EXPOSE_NATIVE_COCOA
-#include <GLFW/glfw3native.h>
+#ifndef HAVE_IOS
+#import <AppKit/AppKit.h>   /* NSWindow / NSView / NSScreen (came in through GLFW's Cocoa header before) */
 #endif
-
+#include "../../../include/vio_platform.h"
 #include "vio_metal.h"
+
+static void metal_marks_reset(void);
+static void metal_archive_close(void);
+static void metal_upscale_release(void);
+static void metal_rrm_release(void);
 #include "../../shaders/shaders_2d.h"
 #include "../../vio_render_target.h"
+static void metal_rrm_resolve(vio_render_target_object *rt);
 #include "../../vio_texfmt.h"
 #include "../../vio_buffer.h"   /* vio_buffer_object — compute storage-buffer free path */
+#include "../../vio_shader_cache.h"
 
 /* SPIRV-Cross C API — used by the compute path to transpile the SDF compute
  * SPIR-V to MSL with EXPLICIT MSL buffer indices (see metal_cs_spirv_to_msl).
@@ -37,6 +44,37 @@
 /* stb_image_write for screenshot PNG export (implementation in stb_image_write_impl.c) */
 #include "../../../vendor/stb/stb_image_write.h"
 
+/* ── Version ladder / capabilities ───────────────────────────────── */
+
+/* What the device can do at the Metal Shading Language version the context
+ * runs at - the Metal counterpart of vio_gl.caps. Filled once per context in
+ * metal_detect_caps(); every version-gated flag is (device support AND
+ * msl_version >= its minimum), so pinning a lower rung switches it off. */
+typedef struct _vio_metal_caps {
+    int msl_version;            /* rung in use, major * 10 + minor (20 .. 41) */
+    int msl_max;                /* highest rung the OS compiles */
+    int apple_family;           /* highest MTLGPUFamilyAppleN, 0 = none */
+    int mac2, metal3, metal4;   /* MTLGPUFamilyMac2 / Metal3 / Metal4 */
+    int tessellation;           /* MSL 2.1: [[patch]] + tessellation kernels */
+    int layered_vertex;         /* [[render_target_array_index]] from the VS: Mac2 / Apple5 */
+    int quad_group;             /* quad_* permutes, MSL 2.1 (SPIRV-Cross on macOS): Mac2 / Apple4 */
+    int simd_group;             /* simd_* reductions / ballot, MSL 2.2 (threads_per_simdgroup in fragment functions): Mac2 / Apple7 */
+    int barycentrics;           /* [[barycentric_coord]], MSL 2.2 */
+    int vertex_amplification;   /* [[amplification_id]], MSL 2.2 */
+    int argument_buffers_tier2; /* bindless-style argument buffers */
+    int raytracing;             /* intersection queries, MSL 2.3 */
+    int function_pointers;      /* visible / intersection function tables, MSL 2.3 */
+    int raytracing_from_render; /* ray queries in render pipelines, MSL 2.4 */
+    int cooperative_matrix;     /* GL_KHR_cooperative_matrix -> simdgroup_matrix 8x8; SPIRV-Cross needs MSL 3.1: Apple7+ */
+    int mesh_shaders;           /* object / mesh stages, MSL 3.0: Metal3 + (Apple7 / Mac2) */
+    int atomic64;               /* 64-bit atomic min / max, MSL 3.1: Apple9 */
+    int tensors;                /* MTLTensor + Metal Performance Primitives, MSL 4.0: Metal4 */
+    int bindless;               /* texture-handle argument buffers (gpuResourceID), MSL 3.0: Metal3 + tier 2 */
+    int rasterization_rate_map;
+    int bc_texture_compression;
+    int unified_memory;
+} vio_metal_caps;
+
 /* ── Metal state ─────────────────────────────────────────────────── */
 
 typedef struct _vio_metal_state {
@@ -47,6 +85,7 @@ typedef struct _vio_metal_state {
     id<MTLCommandBuffer>       current_cmd_buf;
     id<MTLRenderCommandEncoder> current_encoder;
     double                     last_gpu_ms;     /* GPUEndTime - GPUStartTime of the last completed frame */
+    void                      *cur_marks;       /* metal_mark_frame of the open frame (vio_gpu_timestamp), NULL = no mark yet */
     MTLRenderPassDescriptor   *render_pass_desc;
     id<MTLTexture>             depth_texture;
     int                        width;
@@ -64,6 +103,8 @@ typedef struct _vio_metal_state {
     int                        debug;            /* vio_create 'debug': per-command-buffer error reporting */
     int                        unified_memory;   /* Apple silicon: Shared textures OK; Intel: Managed */
     char                       gpu_name[256];
+    vio_metal_caps             caps;             /* version ladder + device capabilities */
+    char                       api_name[16];     /* "Metal 4" (vio_backend_info) */
     /* Swapchain colour format: BGRA8Unorm, or RGB10A2Unorm with the layer in
      * the ITU-R 2100 PQ colour space for vio_create(['hdr_output' => ...]). The
      * offscreen / MSAA swapchain textures, the 2D swapchain variant and the PSO
@@ -77,16 +118,16 @@ typedef struct _vio_metal_state {
     dispatch_semaphore_t       frame_semaphore;
     int                        frame_latency;
     int                        frame_semaphore_held; /* begin_frame took a slot present has not handed on yet */
-#ifdef HAVE_GLFW
     /* When the backend was bootstrapped via vio_metal_setup_context() the
-     * GLFW window is polled each frame to discover resizes. Pure-native
+     * platform window is polled each frame to discover resizes. Pure-native
      * setups (iOS, headless) leave this NULL and call
      * vio_metal_handle_resize() externally instead. */
-    GLFWwindow                *glfw_window;
-#endif
+    void                      *platform_window;
 } vio_metal_state;
 
 static vio_metal_state vio_mtl = {0};
+static void metal_bindless_release(void);
+static void metal_bindless_bind(id<MTLRenderCommandEncoder> enc, int vertex, int fragment);
 
 /* Keep reference to last presented frame for read_pixels/screenshot */
 static id<MTLTexture>       last_presented_texture = nil;
@@ -203,6 +244,12 @@ static int            metal_vp_has_scissor = 0;  /* vio_viewports sets a scissor
 static id<MTLTexture>      metal_fs_tex[VIO_METAL_FS_SLOTS];
 static id<MTLSamplerState> metal_fs_smp[VIO_METAL_FS_SLOTS];
 
+/* Textures of the compute kernels of an emulated geometry stage (A28) by MSL
+ * index: [0] vertex kernel, [1] geometry kernel (metal_bind_gs_stage_texture,
+ * set on the kernel encoders by metal_draw_gs). */
+static id<MTLTexture>      metal_gs_tex[2][VIO_METAL_FS_SLOTS];
+static id<MTLSamplerState> metal_gs_smp[2][VIO_METAL_FS_SLOTS];
+
 static void metal_fs_shadow_reset(void)
 {
     for (int i = 0; i < VIO_METAL_FS_SLOTS; i++) { metal_fs_tex[i] = nil; metal_fs_smp[i] = nil; }
@@ -243,12 +290,7 @@ static void metal_apply_viewports(void)
  * setViewports:count: (layered rendering, multiple viewports). */
 static int metal_supports_layered_vertex(void)
 {
-    if (!vio_mtl.device) return 0;
-    if (@available(macOS 10.15, iOS 13.0, *)) {
-        return [vio_mtl.device supportsFamily:MTLGPUFamilyMac2] ||
-               [vio_mtl.device supportsFamily:MTLGPUFamilyApple5];
-    }
-    return 0;
+    return vio_mtl.device ? vio_mtl.caps.layered_vertex : 0;
 }
 static void metal_ring_begin_frame(void);
 static void metal_ring_end_frame(id<MTLCommandBuffer> cb);
@@ -373,6 +415,253 @@ static void metal_configure_layer_format(vio_config *cfg)
     vio_mtl.metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 }
 
+/* ── Version ladder ──────────────────────────────────────────────── */
+
+static int  metal_supports_bc(void);
+static void metal_msl_set_target(int version, int ios);   /* vio_metal_msl.h */
+
+/* Metal Shading Language rungs, newest first - the counterpart of the OpenGL
+ * context ladder (vio_window.c). The values are major * 10 + minor; the
+ * MTLLanguageVersion is built numerically ((major << 16) | minor) so an older
+ * SDK still compiles and the OS decides at runtime what it accepts. */
+static const int metal_msl_ladder[] = { 41, 40, 32, 31, 30, 24, 23, 22, 21, 20 };
+#define METAL_MSL_LADDER_N ((int)(sizeof(metal_msl_ladder) / sizeof(metal_msl_ladder[0])))
+#define METAL_MSL_FLOOR 20
+
+static MTLLanguageVersion metal_language_version(int v)
+{
+    return (MTLLanguageVersion)(((NSUInteger)(v / 10) << 16) | (NSUInteger)(v % 10));
+}
+
+/* MTLCompileOptions for every library of the context: the ladder rung. */
+static MTLCompileOptions *metal_compile_options(void)
+{
+    MTLCompileOptions *opts = [MTLCompileOptions new];
+    opts.languageVersion = metal_language_version(vio_mtl.caps.msl_version > 0 ? vio_mtl.caps.msl_version : 21);
+    return opts;
+}
+
+/* 1 when the OS compiles a trivial kernel at MSL `v`. An unknown language
+ * version fails the compile (older OS) or raises (older framework). */
+static int metal_probe_msl(id<MTLDevice> device, int v)
+{
+    @autoreleasepool {
+        MTLCompileOptions *opts = [MTLCompileOptions new];
+        id<MTLLibrary> lib = nil;
+        @try {
+            opts.languageVersion = metal_language_version(v);
+            NSError *err = nil;
+            lib = [device newLibraryWithSource:@"kernel void vio_probe(device uint *b [[buffer(0)]]) { b[0] = 1u; }\n"
+                                       options:opts error:&err];
+        } @catch (NSException *e) {
+            lib = nil;
+        }
+        return lib != nil;
+    }
+}
+
+/* Highest rung the OS accepts (cached: it depends on the OS, not the context). */
+static int metal_msl_max(id<MTLDevice> device)
+{
+    static int cached = 0;
+    if (cached) return cached;
+    cached = METAL_MSL_FLOOR;
+    for (int i = 0; i < METAL_MSL_LADDER_N; i++) {
+        if (metal_probe_msl(device, metal_msl_ladder[i])) { cached = metal_msl_ladder[i]; break; }
+    }
+    return cached;
+}
+
+/* Rung for a request (major * 10 + minor; 0 = the maximum): the highest rung
+ * <= the request, clamped to [floor, max]. */
+static int metal_select_msl_version(int requested, int max)
+{
+    if (requested <= 0 || requested >= max) return max;
+    for (int i = 0; i < METAL_MSL_LADDER_N; i++) {
+        if (metal_msl_ladder[i] <= requested && metal_msl_ladder[i] <= max) return metal_msl_ladder[i];
+    }
+    return METAL_MSL_FLOOR;
+}
+
+static int metal_has_family(long family)
+{
+    if (@available(macOS 10.15, iOS 13.0, *)) {
+        @try {
+            return [vio_mtl.device supportsFamily:(MTLGPUFamily)family] ? 1 : 0;
+        } @catch (NSException *e) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+#define METAL_DEVICE_BOOL(sel) \
+    ([vio_mtl.device respondsToSelector:@selector(sel)] && ((BOOL (*)(id, SEL))objc_msgSend)(vio_mtl.device, @selector(sel)))
+
+/* Fill vio_mtl.caps for the rung `msl` (the device is open). */
+static void metal_detect_caps(int msl, int max)
+{
+    vio_metal_caps *c = &vio_mtl.caps;
+    memset(c, 0, sizeof(*c));
+    c->msl_version = msl;
+    c->msl_max = max;
+    for (int a = 11; a >= 1; a--) {
+        if (metal_has_family(1000 + a)) { c->apple_family = a; break; }
+    }
+    c->mac2   = metal_has_family(2002);
+    c->metal3 = metal_has_family(5001);
+    c->metal4 = metal_has_family(5002);
+    snprintf(vio_mtl.api_name, sizeof(vio_mtl.api_name), "Metal %d", c->metal4 ? 4 : (c->metal3 ? 3 : 2));
+
+    int spirv_cross = 0;
+#ifdef HAVE_SPIRV_CROSS
+    spirv_cross = 1;
+#endif
+    c->tessellation   = spirv_cross && msl >= 21;
+    c->layered_vertex = c->mac2 || c->apple_family >= 5;
+    c->quad_group     = msl >= 21 && (c->mac2 || c->apple_family >= 4);
+    c->simd_group     = msl >= 22 && (c->mac2 || c->apple_family >= 7);   /* gl_SubgroupSize in a fragment shader needs 2.2 */
+    c->barycentrics   = msl >= 22 && METAL_DEVICE_BOOL(supportsShaderBarycentricCoordinates);
+    if (msl >= 22 && [vio_mtl.device respondsToSelector:@selector(supportsVertexAmplificationCount:)]) {
+        if (@available(macOS 10.15.4, iOS 13.0, *)) c->vertex_amplification = [vio_mtl.device supportsVertexAmplificationCount:2] ? 1 : 0;
+    }
+    if ([vio_mtl.device respondsToSelector:@selector(argumentBuffersSupport)]) {
+        c->argument_buffers_tier2 = vio_mtl.device.argumentBuffersSupport == MTLArgumentBuffersTier2;
+    }
+    c->raytracing             = msl >= 23 && METAL_DEVICE_BOOL(supportsRaytracing);
+    c->function_pointers      = msl >= 23 && METAL_DEVICE_BOOL(supportsFunctionPointers);
+    c->raytracing_from_render = msl >= 24 && METAL_DEVICE_BOOL(supportsRaytracingFromRender);
+    c->cooperative_matrix     = spirv_cross && msl >= 31 && c->apple_family >= 7;
+    c->mesh_shaders           = msl >= 30 && c->metal3 && (c->apple_family >= 7 || c->mac2);
+    c->atomic64               = msl >= 31 && c->apple_family >= 9;
+    c->tensors                = msl >= 40 && c->metal4;
+    c->bindless               = msl >= 30 && c->metal3 && c->argument_buffers_tier2;
+    if ([vio_mtl.device respondsToSelector:@selector(supportsRasterizationRateMapWithLayerCount:)]) {
+        if (@available(macOS 10.15.4, iOS 13.0, *)) c->rasterization_rate_map = [vio_mtl.device supportsRasterizationRateMapWithLayerCount:1] ? 1 : 0;
+    }
+    c->bc_texture_compression = metal_supports_bc();
+    c->unified_memory         = vio_mtl.unified_memory;
+
+#if TARGET_OS_IPHONE
+    metal_msl_set_target(msl, 1);
+#else
+    metal_msl_set_target(msl, 0);
+#endif
+}
+
+/* Requested rung: vio_create(['msl_version' => n]), else VIO_METAL_MSL_VERSION. */
+static int metal_requested_msl(const vio_config *cfg)
+{
+    if (cfg && cfg->msl_version > 0) return cfg->msl_version;
+    const char *env = getenv("VIO_METAL_MSL_VERSION");
+    return env && *env ? atoi(env) : 0;
+}
+
+/* ── Pipeline binary archive (OPEN-ITEMS A22) ─────────────────────── */
+
+/* vio_create(['shader_cache' => dir]) on Metal: one MTLBinaryArchive per device
+ * and OS build in the cache directory. A pipeline is first made with
+ * FailOnBinaryArchiveMiss (a hit: no GPU compile); on a miss its functions go
+ * into the archive, which is written when the context shuts down. */
+static id    metal_archive;         /* id<MTLBinaryArchive> */
+static NSURL *metal_archive_url;
+static int   metal_archive_dirty;
+static int   metal_archive_tried;
+
+static void metal_archive_open(void)
+{
+    if (metal_archive || metal_archive_tried || !vio_mtl.device || !vio_shader_cache_dir()) return;
+    metal_archive_tried = 1;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        NSString *os = [[NSProcessInfo processInfo] operatingSystemVersionString];
+        NSString *who = [NSString stringWithFormat:@"%@|%@", vio_mtl.device.name, os];
+        const char *w = [who UTF8String];
+        uint64_t key = vio_shader_cache_hash("metal-archive", w, strlen(w));
+        NSString *path = [NSString stringWithFormat:@"%s/%016llx.metalar", vio_shader_cache_dir(), (unsigned long long)key];
+        metal_archive_url = [NSURL fileURLWithPath:path];
+        MTLBinaryArchiveDescriptor *d = [MTLBinaryArchiveDescriptor new];
+        NSError *e = nil;
+        id<MTLBinaryArchive> a = nil;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            d.url = metal_archive_url;
+            a = [vio_mtl.device newBinaryArchiveWithDescriptor:d error:&e];
+        }
+        if (!a) {   /* none yet, or one this device / OS cannot read: start empty */
+            d.url = nil;
+            a = [vio_mtl.device newBinaryArchiveWithDescriptor:d error:&e];
+        }
+        metal_archive = a;
+    }
+}
+
+static void metal_archive_close(void)
+{
+    if (metal_archive && metal_archive_dirty && metal_archive_url) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            /* A cache directory removed before shutdown just leaves the archive unwritten. */
+            NSError *e = nil;
+            [(id<MTLBinaryArchive>)metal_archive serializeToURL:metal_archive_url error:&e];
+        }
+    }
+    metal_archive = nil;
+    metal_archive_url = nil;
+    metal_archive_dirty = 0;
+    metal_archive_tried = 0;
+}
+
+static id<MTLRenderPipelineState> metal_archived_render_pso(MTLRenderPipelineDescriptor *d, NSError **err)
+{
+    metal_archive_open();
+    if (metal_archive) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            id<MTLBinaryArchive> a = (id<MTLBinaryArchive>)metal_archive;
+            d.binaryArchives = @[a];
+            NSError *miss = nil;
+            id<MTLRenderPipelineState> pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:d
+                                                  options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&miss];
+            if (pso) {
+                vio_shader_cache_note(1, 0, 0);
+                return pso;
+            }
+            vio_shader_cache_note(0, 1, 0);
+            if ([a addRenderPipelineFunctionsWithDescriptor:d error:nil]) {
+                vio_shader_cache_note(0, 0, 1);
+                metal_archive_dirty = 1;
+            }
+            d.binaryArchives = nil;
+        }
+    }
+    return [vio_mtl.device newRenderPipelineStateWithDescriptor:d error:err];
+}
+
+static id<MTLComputePipelineState> metal_archived_compute_pso(id<MTLFunction> fn, NSError **err)
+{
+    metal_archive_open();
+    if (metal_archive) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            id<MTLBinaryArchive> a = (id<MTLBinaryArchive>)metal_archive;
+            MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
+            cd.computeFunction = fn;
+            cd.binaryArchives = @[a];
+            NSError *miss = nil;
+            id<MTLComputePipelineState> pso = [vio_mtl.device newComputePipelineStateWithDescriptor:cd
+                                                   options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&miss];
+            if (pso) {
+                vio_shader_cache_note(1, 0, 0);
+                return pso;
+            }
+            vio_shader_cache_note(0, 1, 0);
+            if ([a addComputePipelineFunctionsWithDescriptor:cd error:nil]) {
+                vio_shader_cache_note(0, 0, 1);
+                metal_archive_dirty = 1;
+            }
+            cd.binaryArchives = nil;
+            return [vio_mtl.device newComputePipelineStateWithDescriptor:cd options:MTLPipelineOptionNone reflection:nil error:err];
+        }
+    }
+    return [vio_mtl.device newComputePipelineStateWithFunction:fn error:err];
+}
+
 int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
                                    vio_config *cfg)
 {
@@ -402,6 +691,13 @@ int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
         vio_mtl.unified_memory = vio_mtl.device.hasUnifiedMemory ? 1 : 0;
         snprintf(vio_mtl.gpu_name, sizeof(vio_mtl.gpu_name), "%s", [vio_mtl.device.name UTF8String]);
         vio_mtl.samples = metal_clamp_sample_count(cfg->samples);
+
+        /* Version ladder: the highest MSL the OS compiles, or the pinned rung;
+         * every shader of the context is built for it. */
+        {
+            int max = metal_msl_max(vio_mtl.device);
+            metal_detect_caps(metal_select_msl_version(metal_requested_msl(cfg), max), max);
+        }
 
         /* Create command queue */
         vio_mtl.command_queue = [vio_mtl.device newCommandQueue];
@@ -464,6 +760,7 @@ int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
         vio_mtl.clear_b = 0.1f;
         vio_mtl.clear_a = 1.0f;
 
+        metal_marks_reset();   /* a new context starts without named GPU sections */
         vio_mtl.initialized = 1;
     }
 
@@ -477,18 +774,26 @@ void vio_metal_handle_resize(int width, int height)
     metal_resize(width, height);
 }
 
-#ifdef HAVE_GLFW
-int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
+#ifdef HAVE_IOS
+/* iOS has no NSWindow: vio_ios.m builds the layer and calls
+ * vio_metal_setup_context_native() itself. */
+int vio_metal_setup_context(void *platform_window, vio_config *cfg)
+{
+    (void)platform_window; (void)cfg;
+    return -1;
+}
+#else
+int vio_metal_setup_context(void *platform_window, vio_config *cfg)
 {
     @autoreleasepool {
-        GLFWwindow *win = (GLFWwindow *)glfw_window;
+        void *win = platform_window;
         if (!win) {
-            php_error_docref(NULL, E_WARNING, "Metal: setup_context called with NULL GLFW window");
+            php_error_docref(NULL, E_WARNING, "Metal: setup_context called without a window");
             return -1;
         }
 
-        /* Get NSWindow from GLFW */
-        NSWindow *ns_window = (NSWindow *)glfwGetCocoaWindow(win);
+        /* The platform window's NSWindow */
+        NSWindow *ns_window = (__bridge NSWindow *)vio_plat()->native_handle(win, VIO_NATIVE_NSWINDOW);
         if (!ns_window) {
             php_error_docref(NULL, E_WARNING, "Metal: failed to get Cocoa window");
             return -1;
@@ -520,9 +825,9 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
              * readback return only the top-left (logical-sized) quadrant. There
              * is no display to match offscreen, so size it 1:1 with the request
              * using the logical window size. */
-            glfwGetWindowSize(win, &fb_w, &fb_h);
+            vio_plat()->get_window_size(win, &fb_w, &fb_h);
         } else {
-            glfwGetFramebufferSize(win, &fb_w, &fb_h);
+            vio_plat()->get_framebuffer_size(win, &fb_w, &fb_h);
         }
 
         if (vio_metal_setup_context_native((__bridge void *)layer, fb_w, fb_h, cfg) != 0) {
@@ -536,19 +841,21 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
          * Headless renders to a fixed-size offscreen texture (sized 1:1 with the
          * logical request above). Polling the window each frame would read the
          * Retina framebuffer size and resize the offscreen back to 2x, so leave
-         * glfw_window NULL for headless — matching the "headless leaves this
+         * platform_window NULL for headless — matching the "headless leaves this
          * NULL" contract documented on the struct field. */
-        vio_mtl.glfw_window = cfg->headless ? NULL : win;
+        vio_mtl.platform_window = cfg->headless ? NULL : win;
     }
 
     return 0;
 }
-#endif /* HAVE_GLFW */
+#endif /* HAVE_IOS */
 
 void vio_metal_shutdown_context(void)
 {
     @autoreleasepool {
         if (!vio_mtl.initialized) return;
+        metal_archive_close();
+        metal_bindless_release();
 
         /* Shutdown 2D pipeline */
         if (mtl_2d.initialized) {
@@ -697,7 +1004,7 @@ int vio_metal_2d_init(int width, int height)
         NSError *error = nil;
         NSString *source = [NSString stringWithUTF8String:vio_2d_metal_shader_source];
         id<MTLLibrary> library = [vio_mtl.device newLibraryWithSource:source
-                                                              options:nil
+                                                              options:metal_compile_options()
                                                                 error:&error];
         if (!library) {
             php_error_docref(NULL, E_WARNING, "Metal 2D: shader compilation failed: %s",
@@ -1151,6 +1458,8 @@ static int metal_init(vio_config *cfg)
 
 static void metal_shutdown(void)
 {
+    metal_upscale_release();
+    metal_rrm_release();
     vio_metal_shutdown_context();
 }
 
@@ -1189,6 +1498,119 @@ static void metal_resize(int width, int height)
     }
 }
 
+/* ── Rasterization rate maps (OPEN-ITEMS A16) ─────────────────────── */
+
+static id<MTLRenderPipelineState> metal_rrm_pso;   /* the resolve, for metal_rrm_fmt */
+static MTLPixelFormat             metal_rrm_fmt;
+
+static void metal_rrm_release(void)
+{
+    metal_rrm_pso = nil;
+    metal_rrm_fmt = MTLPixelFormatInvalid;
+}
+
+/* A plain 2D colour target with 'rate_map': the map, physical colour + depth
+ * and the map's parameter buffer for the resolve. Without device support the
+ * target simply renders at full rate. */
+static void metal_rt_rate_map_setup(vio_render_target_object *rt)
+{
+    if (rt->rate_nx < 1 || rt->rate_ny < 1 || !rt->metal_color_texture || rt->depth_only || rt->samples > 1) return;
+    if (@available(macOS 10.15.4, iOS 13.0, *)) {
+        if (![vio_mtl.device supportsRasterizationRateMapWithLayerCount:1]) return;
+        MTLRasterizationRateLayerDescriptor *ld =
+            [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake((NSUInteger)rt->rate_nx, (NSUInteger)rt->rate_ny, 0)];
+        for (int i = 0; i < rt->rate_nx; i++) ld.horizontalSampleStorage[i] = rt->rate_x[i];
+        for (int i = 0; i < rt->rate_ny; i++) ld.verticalSampleStorage[i] = rt->rate_y[i];
+        MTLRasterizationRateMapDescriptor *md =
+            [MTLRasterizationRateMapDescriptor rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake((NSUInteger)rt->width, (NSUInteger)rt->height, 0)
+                                                                                      layer:ld];
+        id<MTLRasterizationRateMap> map = [vio_mtl.device newRasterizationRateMapWithDescriptor:md];
+        if (!map) return;
+        MTLSize phys = [map physicalSizeForLayer:0];
+        if (phys.width < 1 || phys.height < 1) return;
+        id<MTLTexture> logical = (__bridge id<MTLTexture>)rt->metal_color_texture;
+        MTLTextureDescriptor *cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:logical.pixelFormat
+                                                                                       width:phys.width height:phys.height mipmapped:NO];
+        cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        cd.storageMode = MTLStorageModePrivate;
+        MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL
+                                                                                       width:phys.width height:phys.height mipmapped:NO];
+        dd.usage = MTLTextureUsageRenderTarget;
+        dd.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> color = [vio_mtl.device newTextureWithDescriptor:cd];
+        id<MTLTexture> depth = [vio_mtl.device newTextureWithDescriptor:dd];
+        MTLSizeAndAlign sa = map.parameterBufferSizeAndAlign;
+        id<MTLBuffer> params = [vio_mtl.device newBufferWithLength:(sa.size ? sa.size : 16) options:MTLResourceStorageModeShared];
+        if (!color || !depth || !params) return;
+        [map copyParameterDataToBuffer:params offset:0];
+        rt->metal_rrm        = (void *)CFBridgingRetain(map);
+        rt->metal_rrm_color  = (void *)CFBridgingRetain(color);
+        rt->metal_rrm_depth  = (void *)CFBridgingRetain(depth);
+        rt->metal_rrm_params = (void *)CFBridgingRetain(params);
+        rt->physical_width   = (int)phys.width;
+        rt->physical_height  = (int)phys.height;
+        rt->rate_active      = 1;
+        rt->rrm_dirty        = 0;
+    }
+}
+
+static const char *metal_rrm_msl =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VioRrmOut { float4 pos [[position]]; };\n"
+    "vertex VioRrmOut vio_rrm_vs(uint vid [[vertex_id]]) {\n"
+    "    float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
+    "    VioRrmOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;\n"
+    "}\n"
+    "fragment float4 vio_rrm_fs(VioRrmOut in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
+    "                           constant rasterization_rate_map_data &map [[buffer(0)]]) {\n"
+    "    rasterization_rate_map_decoder dec(map);\n"
+    "    float2 phys = dec.map_screen_to_physical_coordinates(in.pos.xy);\n"
+    "    constexpr sampler s(coord::pixel, filter::linear, address::clamp_to_edge);\n"
+    "    return src.sample(s, phys);\n"
+    "}\n";
+
+/* Physical colour -> logical texture through the map: every logical pixel reads
+ * the physical position the map gives it. Called with no encoder open. */
+static void metal_rrm_resolve(vio_render_target_object *rt)
+{
+    if (!rt || !rt->rrm_dirty || !rt->metal_rrm_color || !rt->metal_color_texture || !vio_mtl.current_cmd_buf) return;
+    @autoreleasepool {
+        id<MTLTexture> logical = (__bridge id<MTLTexture>)rt->metal_color_texture;
+        if (!metal_rrm_pso || metal_rrm_fmt != logical.pixelFormat) {
+            NSError *e = nil;
+            id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:[NSString stringWithUTF8String:metal_rrm_msl]
+                                                              options:metal_compile_options() error:&e];
+            if (!lib) {
+                php_error_docref(NULL, E_WARNING, "Metal: rate map resolve shader: %s", e ? [[e localizedDescription] UTF8String] : "unknown");
+                rt->rrm_dirty = 0;
+                return;
+            }
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+            pd.vertexFunction = [lib newFunctionWithName:@"vio_rrm_vs"];
+            pd.fragmentFunction = [lib newFunctionWithName:@"vio_rrm_fs"];
+            pd.colorAttachments[0].pixelFormat = logical.pixelFormat;
+            metal_rrm_pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:pd error:&e];
+            metal_rrm_fmt = logical.pixelFormat;
+            if (!metal_rrm_pso) {
+                rt->rrm_dirty = 0;
+                return;
+            }
+        }
+        MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+        d.colorAttachments[0].texture = logical;
+        d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        d.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [vio_mtl.current_cmd_buf renderCommandEncoderWithDescriptor:d];
+        [enc setRenderPipelineState:metal_rrm_pso];
+        [enc setFragmentTexture:(__bridge id<MTLTexture>)rt->metal_rrm_color atIndex:0];
+        [enc setFragmentBuffer:(__bridge id<MTLBuffer>)rt->metal_rrm_params offset:0 atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        rt->rrm_dirty = 0;
+    }
+}
+
 /* The colour texture the open frame renders into: bound RT > vsync-off
  * offscreen > swapchain drawable. nil for a depth-only RT / no drawable. */
 static id<MTLTexture> metal_current_color_texture(void)
@@ -1222,6 +1644,9 @@ static void metal_open_encoder(int load_clear)
         id<MTLTexture> resolve_targets[VIO_MAX_COLOR_ATTACHMENTS] = {nil, nil, nil, nil};
         int n_color = 0;
         NSUInteger cube_slice = 0, cube_level = 0, all_layers = 0;
+        /* A layered target multisamples at level 0 only (A24). */
+        int rt_ms = current_bound_rt && current_bound_rt->samples > 1 &&
+                    !((current_bound_rt->is_cube || current_bound_rt->layers > 1) && current_bound_level > 0);
         if (current_bound_rt) {
             depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_depth_texture;
             target_w = current_bound_rt->width;
@@ -1231,7 +1656,7 @@ static void metal_open_encoder(int load_clear)
                 for (int i = 0; i < n_color; i++) {
                     id<MTLTexture> c = i == 0 ? metal_current_color_texture()
                                               : (__bridge id<MTLTexture>)current_bound_rt->metal_color_textures[i];
-                    if (current_bound_rt->samples > 1) {
+                    if (rt_ms) {
                         /* MSAA: render into the multisample pair, resolve into the
                          * single-sample colour texture at every pass end. */
                         resolve_targets[i] = c;
@@ -1252,7 +1677,7 @@ static void metal_open_encoder(int load_clear)
                 /* The shared depth texture only matches level 0. */
                 if (cube_level > 0) depth_target = nil;
             }
-            if (current_bound_rt->samples > 1) {
+            if (rt_ms) {
                 depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_msaa_depth_texture;
             }
         } else {
@@ -1273,6 +1698,18 @@ static void metal_open_encoder(int load_clear)
 
         MTLRenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
 
+        /* Rate map (A16): the physical attachments, sampled by the map; the
+         * viewport stays in logical (screen) pixels. Resolved into the logical
+         * texture when the pass leaves the target. */
+        if (current_bound_rt && current_bound_rt->metal_rrm && current_bound_rt->metal_rrm_color && n_color == 1 && !rt_ms) {
+            if (@available(macOS 10.15.4, iOS 13.0, *)) {
+                color_targets[0] = (__bridge id<MTLTexture>)current_bound_rt->metal_rrm_color;
+                depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_rrm_depth;
+                desc.rasterizationRateMap = (__bridge id<MTLRasterizationRateMap>)current_bound_rt->metal_rrm;
+                current_bound_rt->rrm_dirty = 1;
+            }
+        }
+
         for (int i = 0; i < n_color; i++) {
             if (!color_targets[i]) continue;
             MTLRenderPassColorAttachmentDescriptor *ca = desc.colorAttachments[i];
@@ -1282,6 +1719,8 @@ static void metal_open_encoder(int load_clear)
             ca.loadAction = load_clear ? MTLLoadActionClear : MTLLoadActionLoad;
             if (resolve_targets[i]) {
                 ca.resolveTexture = resolve_targets[i];
+                ca.resolveSlice = cube_slice;
+                ca.resolveLevel = cube_level;
                 /* Keep the MSAA contents too, so a reopened pass (RT bind /
                  * unbind / eager clear / mid-frame readback) can Load them. */
                 ca.storeAction = MTLStoreActionStoreAndMultisampleResolve;
@@ -1294,7 +1733,8 @@ static void metal_open_encoder(int load_clear)
         if (all_layers > 1) desc.renderTargetArrayLength = all_layers;
         if (depth_target) {
             int depth_layered = depth_target.textureType == MTLTextureTypeCube ||
-                                depth_target.textureType == MTLTextureType2DArray;
+                                depth_target.textureType == MTLTextureType2DArray ||
+                                depth_target.textureType == MTLTextureType2DMultisampleArray;
             desc.depthAttachment.texture = depth_target;
             if (depth_layered) desc.depthAttachment.slice = cube_slice;
             if (depth_target.pixelFormat == VIO_METAL_DEPTH_STENCIL) {
@@ -1310,6 +1750,13 @@ static void metal_open_encoder(int load_clear)
              * depth and 3D draws after the switch would fail the depth test. */
             desc.depthAttachment.storeAction = MTLStoreActionStore;
             desc.depthAttachment.clearDepth = 1.0;
+            if (rt_ms && current_bound_rt->depth_only && current_bound_rt->metal_depth_texture) {
+                /* depth_only MSAA (A24): resolve into the sampled depth at every pass end. */
+                desc.depthAttachment.resolveTexture = (__bridge id<MTLTexture>)current_bound_rt->metal_depth_texture;
+                desc.depthAttachment.depthResolveFilter = current_bound_rt->depth_reduction == VIO_DEPTH_REDUCE_MIN
+                    ? MTLMultisampleDepthResolveFilterMin : MTLMultisampleDepthResolveFilterMax;
+                desc.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+            }
         }
 
         vio_mtl.current_encoder = [vio_mtl.current_cmd_buf
@@ -1332,18 +1779,16 @@ static void metal_begin_frame(void)
     @autoreleasepool {
         if (!vio_mtl.initialized) return;
 
-#ifdef HAVE_GLFW
-        /* GLFW path: poll the window for resize each frame. Native callers
+        /* Platform window: poll it for resize each frame. Native callers
          * (iOS UIView) push resizes through vio_metal_handle_resize() and
-         * leave glfw_window NULL, so we skip the poll in that case. */
-        if (vio_mtl.glfw_window) {
+         * leave platform_window NULL, so we skip the poll in that case. */
+        if (vio_mtl.platform_window) {
             int fb_w, fb_h;
-            glfwGetFramebufferSize(vio_mtl.glfw_window, &fb_w, &fb_h);
+            vio_plat()->get_framebuffer_size(vio_mtl.platform_window, &fb_w, &fb_h);
             if (fb_w != vio_mtl.width || fb_h != vio_mtl.height) {
                 metal_resize(fb_w, fb_h);
             }
         }
-#endif
 
         /* DO NOT reset current_bound_rt here. The persistent-bind contract
          * mirrored from D3D11/D3D12 (vio_d3d11.current_rtv survives across
@@ -1390,6 +1835,68 @@ static void metal_end_frame(void)
 
         [vio_mtl.current_encoder endEncoding];
         vio_mtl.current_encoder = nil;
+        /* a rate-mapped target still bound: its logical texture for the readback */
+        if (current_bound_rt && current_bound_rt->rrm_dirty) metal_rrm_resolve(current_bound_rt);
+    }
+}
+
+/* ── Named GPU timestamps (vio_gpu_timestamp, OPEN-ITEMS-PLAN A19) ──────
+ * Metal has no timestamp at an arbitrary point of a command buffer, so a mark
+ * ends a section: the frame's command buffer so far is committed (no CPU
+ * wait) and the frame continues on a new one, reopened with Load like the
+ * mid-frame readback. A section lasts from the previous section's GPUEndTime
+ * (the first one from its buffer's GPUStartTime) to its buffer's GPUEndTime.
+ * The completion handlers run on Metal threads; whichever finishes last
+ * publishes the frame. The upload ring fences on the frame's last buffer
+ * (metal_ring_end_frame), so splitting the frame keeps its memory alive.
+ * A section never starts before its own buffer's GPUStartTime: the idle gap
+ * between two buffers is no work of the later section (on the virtualised
+ * CI GPU the gap was larger than a light section, test 172). */
+typedef struct {
+    vio_gpu_mark_names names;
+    double             start;
+    double             begin[VIO_GPU_MARKS_MAX];   /* each section buffer's GPUStartTime */
+    double             end[VIO_GPU_MARKS_MAX];
+    atomic_int         remaining;   /* section buffers + the frame's last buffer */
+} metal_mark_frame;
+
+static os_unfair_lock      metal_marks_lock = OS_UNFAIR_LOCK_INIT;
+static vio_gpu_mark_result metal_marks_result;
+static vio_gpu_mark_result metal_marks_snapshot;
+static int                 metal_marks_valid;
+
+static void metal_marks_publish(const metal_mark_frame *mf)
+{
+    vio_gpu_mark_result r;
+    r.count = mf ? mf->names.count : 0;
+    double prev = mf ? mf->start : 0.0;
+    for (int i = 0; i < r.count; i++) {
+        memcpy(r.name[i], mf->names.name[i], VIO_GPU_MARK_NAME_MAX);
+        double t = mf->end[i];
+        double from = mf->begin[i] > prev ? mf->begin[i] : prev;
+        r.ms[i] = t > from ? (t - from) * 1000.0 : 0.0;
+        if (t > prev) prev = t;
+    }
+    os_unfair_lock_lock(&metal_marks_lock);
+    metal_marks_result = r;
+    metal_marks_valid = 1;
+    os_unfair_lock_unlock(&metal_marks_lock);
+}
+
+static void metal_marks_reset(void)
+{
+    os_unfair_lock_lock(&metal_marks_lock);
+    metal_marks_valid = 0;
+    os_unfair_lock_unlock(&metal_marks_lock);
+    vio_mtl.cur_marks = NULL;   /* an unfinished frame's set is owned by its handlers */
+}
+
+/* The section buffer or the frame's last buffer completed. */
+static void metal_marks_done(metal_mark_frame *mf)
+{
+    if (atomic_fetch_sub(&mf->remaining, 1) == 1) {
+        metal_marks_publish(mf);
+        free(mf);
     }
 }
 
@@ -1398,11 +1905,20 @@ static void metal_present(void)
     @autoreleasepool {
         if (!vio_mtl.current_cmd_buf) return;
 
-        /* GPU timestamps (GAP-PHASE5 Block 3): the command buffer reports its
-         * own GPU span once it completes. */
+        /* GPU timestamps (GAP-PHASE5 Block 3) and named sections: the frame
+         * completes with its last buffer. vio_gpu_timestamp splits the frame
+         * into several buffers (the queue runs them in order), so the frame
+         * spans from the first section's start to this buffer's end - before,
+         * only the last buffer counted and the sections outgrew the frame (test
+         * 172 on the CI). A frame without marks publishes an empty set. */
+        metal_mark_frame *mf = (metal_mark_frame *)vio_mtl.cur_marks;
+        vio_mtl.cur_marks = NULL;
         [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            double ms = (done.GPUEndTime - done.GPUStartTime) * 1000.0;
+            double start = (mf && mf->start > 0.0) ? mf->start : done.GPUStartTime;
+            double ms = (done.GPUEndTime - start) * 1000.0;
             if (ms >= 0.0) vio_mtl.last_gpu_ms = ms;
+            if (mf) metal_marks_done(mf);
+            else metal_marks_publish(NULL);
         }];
         if (vio_mtl.frame_semaphore_held) {
             /* The frame's slot frees up when its command buffer retires. */
@@ -1476,6 +1992,7 @@ extern uint32_t *vio_compile_glsl_to_spirv(const char *source, int stage,
 
 #include "../../vio_mesh.h"
 #include "../../vio_shader.h"
+#include "../../vio_shader_reflect.h"   /* vio_spirv_execution_model */
 #include "../../vio_cubemap.h"
 #include "../../vio_texture.h"
 
@@ -1525,13 +2042,22 @@ typedef struct _vio_metal_shader {
     void               *vs_kernel_fn;  /* id<MTLFunction> kernel, +1 retained */
     void               *tcs_pso;       /* id<MTLComputePipelineState>, +1 retained */
     struct {
-        int   stride;
-        void *pso;                     /* id<MTLComputePipelineState>, +1 retained */
+        int      stride;
+        uint32_t layout;               /* vio_mesh_layout.key of the mesh */
+        void    *pso;                  /* id<MTLComputePipelineState>, +1 retained */
     } vs_kernel_variants[VIO_METAL_TESS_VS_VARIANTS];
     int                 vs_kernel_variant_count;
     /* Isolines / point_mode (metal_tess_emul_msl): vert_fn is vio_pass, the
      * TES runs as the capture function of an extra pass without rasterization. */
     int                 tess_emul;
+    int                 view_count;      /* multiview views (instancing emulation), 0 = off */
+    /* Mesh pipeline (VIO_FEATURE_MESH_SHADER): vert_fn is the [[mesh]] function
+     * (the mesh stage takes the vertex slot), object_fn the optional [[object]]
+     * function; threads per threadgroup from each stage's LocalSize. */
+    int                 mesh;
+    void               *object_fn;       /* id<MTLFunction>, +1 retained, NULL without a task stage */
+    unsigned            mesh_tpg[3], object_tpg[3];
+    vio_metal_stage_res obj;             /* task stage resources (its uniform block shares the mesh stage's) */
     int                 tess_emul_domain;  /* VIO_MSL_DOMAIN_* of the GLSL (isolines compiled as quads) */
     void               *tess_cap_fn;       /* id<MTLFunction>, +1 retained */
     void               *tess_cap_pso;      /* id<MTLRenderPipelineState>, +1 retained, built lazily */
@@ -1555,8 +2081,7 @@ typedef struct _vio_metal_shader {
 static id<MTLLibrary> metal_build_library(const char *msl, char **error_out)
 {
     NSError *err = nil;
-    MTLCompileOptions *opts = [MTLCompileOptions new];
-    opts.languageVersion = MTLLanguageVersion2_1;
+    MTLCompileOptions *opts = metal_compile_options();
     id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:[NSString stringWithUTF8String:msl] options:opts error:&err];
     if (!lib && error_out) *error_out = strdup(err ? [[err localizedDescription] UTF8String] : "unknown MSL compile error");
     return lib;
@@ -1567,8 +2092,7 @@ static id<MTLFunction> metal_build_function(const char *msl, char **error_out)
     @autoreleasepool {
         NSString *src = [NSString stringWithUTF8String:msl];
         NSError *err = nil;
-        MTLCompileOptions *opts = [MTLCompileOptions new];
-        opts.languageVersion = MTLLanguageVersion2_1;  /* 2.1: [[patch]] / tessellation kernels */
+        MTLCompileOptions *opts = metal_compile_options();   /* the ladder rung (tessellation needs 2.1) */
         id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:src options:opts error:&err];
         if (!lib) {
             if (error_out) {
@@ -1597,6 +2121,7 @@ static void metal_destroy_shader(void *s)
     if (!s) return;
     vio_metal_shader *sh = (vio_metal_shader *)s;
     if (sh->vert_fn) { CFRelease((CFTypeRef)sh->vert_fn); sh->vert_fn = NULL; }
+    if (sh->object_fn) { CFRelease((CFTypeRef)sh->object_fn); sh->object_fn = NULL; }
     if (sh->frag_fn) { CFRelease((CFTypeRef)sh->frag_fn); sh->frag_fn = NULL; }
     if (sh->frag_fn_noout) { CFRelease((CFTypeRef)sh->frag_fn_noout); sh->frag_fn_noout = NULL; }
     if (sh->vs_kernel_fn) { CFRelease((CFTypeRef)sh->vs_kernel_fn); sh->vs_kernel_fn = NULL; }
@@ -1661,14 +2186,18 @@ static char *metal_gs_prepare(vio_metal_shader *sh, const uint32_t *vs_spirv, si
     size_t pt_size = 0;
     char *warn = NULL;
     id<MTLComputePipelineState> vs_pso = nil, gs_pso = nil;
-    if (mk_parse(&mv, vs_spirv, vs_size, err) != 0) return NULL;
-    if (mk_parse(&mg, (const uint32_t *)gs_data, gs_size, err) != 0) { mk_free(&mv); return NULL; }
+    /* Interface blocks (A28): one varying per member, linked by location like
+     * the fragment stage (metal_compile_shader flattens it too). The parsed
+     * modules point into these copies, freed after the kernels are built. */
+    size_t vs_flat_words = 0, gs_flat_words = 0;
+    uint32_t *vs_flat = vio_spirv_flatten_io_blocks(vs_spirv, vs_size / 4, &vs_flat_words);
+    uint32_t *gs_flat = vio_spirv_flatten_io_blocks((const uint32_t *)gs_data, gs_size / 4, &gs_flat_words);
+    if (vs_flat) { vs_spirv = vs_flat; vs_size = vs_flat_words * 4; }
+    if (gs_flat) { gs_data = gs_flat; gs_size = gs_flat_words * 4; }
+    if (mk_parse(&mv, vs_spirv, vs_size, err) != 0) { free(vs_flat); free(gs_flat); return NULL; }
+    if (mk_parse(&mg, (const uint32_t *)gs_data, gs_size, err) != 0) { mk_free(&mv); free(vs_flat); free(gs_flat); return NULL; }
     if (mv.model != MK_MODEL_VERTEX || mg.model != MK_MODEL_GEOMETRY) {
         *err = strdup("expected a vertex and a geometry stage");
-        goto done;
-    }
-    if (mv.has_samplers || mg.has_samplers) {
-        *err = strdup("textures in the vertex / geometry stage of a geometry pipeline are not supported on Metal");
         goto done;
     }
     vk = mk_vs_kernel_glsl(&mv, err);
@@ -1711,6 +2240,7 @@ static char *metal_gs_prepare(vio_metal_shader *sh, const uint32_t *vs_spirv, si
 done:
     mk_free(&mv);
     mk_free(&mg);
+    free(vs_flat); free(gs_flat);
     free(vk); free(gk); free(pt); free(pt_spv);
     if (!sh->gs) { free(msl); return NULL; }
     return msl;
@@ -1751,10 +2281,11 @@ static void *metal_compile_shader(vio_shader_desc *desc)
 
     char *err = NULL;
     const char *what = NULL;
+    metal_msl_multiview = desc->view_count > 1;   /* reset at the end and on failure */
     size_t vs_size = 0, fs_size = 0;
     int vs_owned = 0, fs_owned = 0;
     uint32_t *vs_spirv = NULL, *fs_spirv = NULL;
-    char *vs_msl = NULL, *fs_msl = NULL, *fs_msl_noout = NULL, *tcs_msl = NULL, *tes_msl = NULL;
+    char *vs_msl = NULL, *fs_msl = NULL, *fs_msl_noout = NULL, *tcs_msl = NULL, *tes_msl = NULL, *task_msl = NULL;
     id<MTLFunction> vfn = nil, ffn = nil, ffn_noout = nil, kfn = nil, tcsfn = nil, cap_fn = nil;
     id<MTLComputePipelineState> tcs_pso = nil;
 
@@ -1795,14 +2326,33 @@ static void *metal_compile_shader(vio_shader_desc *desc)
                 tes_words = tes_copy;
             }
         }
-        vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_VERTEX_TESS, &sh->vs, &sh->vl,
+        /* The stages hand their varyings over in buffers whose structs are
+         * built per stage: interface blocks become one varying per member on
+         * every stage (a patch block's member read through the block came out
+         * as a thread -> device cast, test 198 B), and the control and
+         * evaluation stages use every input they declare (test 198 C). */
+        size_t nw = 0;
+        uint32_t *vs_flat = vio_spirv_flatten_io_blocks(vs_spirv, vs_size / 4, &nw);
+        size_t vs_flat_bytes = vs_flat ? nw * 4 : vs_size;
+        uint32_t *tcs_words = (uint32_t *)desc->tess_control_data, *tcs_own = NULL, *t;
+        size_t tcs_bytes = desc->tess_control_size;
+        if ((t = vio_spirv_flatten_io_blocks(tcs_words, tcs_bytes / 4, &nw)) != NULL) { tcs_own = t; tcs_words = t; tcs_bytes = nw * 4; }
+        if ((t = metal_spirv_use_all_inputs(tcs_words, tcs_bytes / 4, &nw)) != NULL) { free(tcs_own); tcs_own = t; tcs_words = t; tcs_bytes = nw * 4; }
+        uint32_t *tes_own = NULL;
+        if ((t = vio_spirv_flatten_io_blocks(tes_words, tes_bytes / 4, &nw)) != NULL) { tes_own = t; tes_words = t; tes_bytes = nw * 4; }
+        if ((t = metal_spirv_use_all_inputs(tes_words, tes_bytes / 4, &nw)) != NULL) { free(tes_own); tes_own = t; tes_words = t; tes_bytes = nw * 4; }
+
+        vs_msl = metal_gfx_spirv_to_msl(vs_flat ? vs_flat : vs_spirv, vs_flat_bytes, VIO_MSL_VERTEX_TESS, &sh->vs, &sh->vl,
                                         0xFFFFFFFFu, &sh->tess_info, &err);
-        if (!vs_msl) { what = "VS SPIR-V→MSL kernel"; goto fail; }
-        tcs_msl = metal_gfx_spirv_to_msl((const uint32_t *)desc->tess_control_data, desc->tess_control_size,
+        free(vs_flat);
+        if (!vs_msl) { free(tcs_own); free(tes_own); free(tes_copy); what = "VS SPIR-V→MSL kernel"; goto fail; }
+        tcs_msl = metal_gfx_spirv_to_msl(tcs_words, tcs_bytes,
                                          VIO_MSL_TESS_CONTROL, &sh->tcs, NULL, 0xFFFFFFFFu, &sh->tess_info, &err);
-        if (!tcs_msl) { what = "TCS SPIR-V→MSL"; goto fail; }
+        free(tcs_own);
+        if (!tcs_msl) { free(tes_own); free(tes_copy); what = "TCS SPIR-V→MSL"; goto fail; }
         tes_msl = metal_gfx_spirv_to_msl(tes_words, tes_bytes,
                                          VIO_MSL_TESS_EVAL, &sh->tes, NULL, 0xFFFFFFFFu, &sh->tess_info, &err);
+        free(tes_own);
         free(tes_copy);
         if (!tes_msl) { what = "TES SPIR-V→MSL"; goto fail; }
         if (sh->tess_emul) {
@@ -1811,9 +2361,36 @@ static void *metal_compile_shader(vio_shader_desc *desc)
             tes_msl = emul;
             if (!tes_msl) { what = "TES capture MSL"; goto fail; }
         }
+    } else if (vio_spirv_execution_model(vs_spirv, vs_size) == VIO_SPIRV_MODEL_MESH_EXT) {
+        /* Mesh pipeline: the mesh stage arrives in the vertex slot. */
+        sh->mesh = 1;
+        metal_spirv_local_size(vs_spirv, vs_size, sh->mesh_tpg);
+        vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_MESH, &sh->vs, NULL, 0xFFFFFFFFu, NULL, &err);
+        if (!vs_msl) { what = "mesh SPIR-V→MSL"; goto fail; }
+        if (desc->task_data) {
+            if (desc->task_size < 20 || *(const uint32_t *)desc->task_data != 0x07230203) { err = strdup("not SPIR-V"); what = "task stage"; goto fail; }
+            metal_spirv_local_size((const uint32_t *)desc->task_data, desc->task_size, sh->object_tpg);
+            task_msl = metal_gfx_spirv_to_msl((const uint32_t *)desc->task_data, desc->task_size, VIO_MSL_TASK,
+                                              &sh->obj, NULL, 0xFFFFFFFFu, NULL, &err);
+            if (!task_msl) { what = "task SPIR-V→MSL"; goto fail; }
+        }
     } else if (desc->geometry_data) {
         vs_msl = metal_gs_prepare(sh, vs_spirv, vs_size, desc->geometry_data, desc->geometry_size, &err);
         if (!vs_msl) { what = "geometry stage"; goto fail; }
+        /* Fragment inputs as the pass-through stage writes them (A28): blocks
+         * split per member, gl_PrimitiveID from the geometry stage as a flat
+         * int at VIO_PRIMID_LOCATION. */
+        size_t nw = 0;
+        uint32_t *nf = vio_spirv_flatten_io_blocks(fs_spirv, fs_size / 4, &nw);
+        if (nf) {
+            if (fs_owned) free(fs_spirv);
+            fs_spirv = nf; fs_size = nw * 4; fs_owned = 1;
+        }
+        if (vio_spirv_writes_builtin((const uint32_t *)desc->geometry_data, desc->geometry_size, 7) &&
+            (nf = vio_spirv_builtin_to_location(fs_spirv, fs_size / 4, 7, 1, VIO_PRIMID_LOCATION, 1, &nw)) != NULL) {
+            if (fs_owned) free(fs_spirv);
+            fs_spirv = nf; fs_size = nw * 4; fs_owned = 1;
+        }
     } else {
         vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_VERTEX, &sh->vs, &sh->vl,
                                         0xFFFFFFFFu, NULL, &err);
@@ -1830,6 +2407,8 @@ static void *metal_compile_shader(vio_shader_desc *desc)
         fs_msl_noout = metal_gfx_spirv_to_msl(fs_spirv, fs_size, VIO_MSL_FRAGMENT, &scratch, NULL, 0u, NULL, &err2);
         free(err2);
     }
+    metal_msl_multiview = 0;
+    sh->view_count = desc->view_count > 1 ? desc->view_count : 0;
 
     if (tess) {
         kfn = metal_build_function(vs_msl, &err);
@@ -1856,7 +2435,12 @@ static void *metal_compile_shader(vio_shader_desc *desc)
         }
     } else {
         vfn = metal_build_function(vs_msl, &err);
-        if (!vfn) { what = "VS MSL→MTLFunction"; goto fail; }
+        if (!vfn) { what = sh->mesh ? "mesh MSL→MTLFunction" : "VS MSL→MTLFunction"; goto fail; }
+        if (task_msl) {
+            id<MTLFunction> ofn = metal_build_function(task_msl, &err);
+            if (!ofn) { what = "task MSL→MTLFunction"; goto fail; }
+            sh->object_fn = (void *)CFBridgingRetain(ofn);
+        }
     }
     ffn = metal_build_function(fs_msl, &err);
     if (!ffn) { what = "FS MSL→MTLFunction"; goto fail; }
@@ -1876,15 +2460,16 @@ static void *metal_compile_shader(vio_shader_desc *desc)
     }
     if (vs_owned) free(vs_spirv);
     if (fs_owned) free(fs_spirv);
-    free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl);
+    free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl); free(task_msl);
     return sh;
 
 fail:
+    metal_msl_multiview = 0;
     php_error_docref(NULL, E_WARNING, "Metal: %s failed: %s", what ? what : "shader compile", err ? err : "unknown");
     free(err);
     if (vs_owned) free(vs_spirv);
     if (fs_owned) free(fs_spirv);
-    free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl);
+    free(vs_msl); free(fs_msl); free(fs_msl_noout); free(tcs_msl); free(tes_msl); free(task_msl);
     metal_destroy_shader(sh);   /* kernel PSOs of a geometry stage */
     return NULL;
 #endif /* HAVE_SPIRV_CROSS */
@@ -1951,12 +2536,13 @@ static int metal_vio_format(MTLPixelFormat f, int *bgra)
 static void metal_rt_initial_clear(vio_render_target_object *rt)
 {
     int n_color = rt->depth_only ? 0 : metal_rt_attachment_count(rt);
-    id<MTLTexture> depth = rt->metal_depth_texture ? (__bridge id<MTLTexture>)rt->metal_depth_texture
-                         : (rt->metal_msaa_depth_texture ? (__bridge id<MTLTexture>)rt->metal_msaa_depth_texture : nil);
+    id<MTLTexture> depth = rt->metal_msaa_depth_texture ? (__bridge id<MTLTexture>)rt->metal_msaa_depth_texture
+                         : (rt->metal_depth_texture ? (__bridge id<MTLTexture>)rt->metal_depth_texture : nil);
     if (!rt->metal_color_texture && !depth) return;
     id<MTLCommandBuffer> cb = metal_new_command_buffer();
     int slices = vio_rt_layer_count(rt);
-    int depth_layered = depth && (depth.textureType == MTLTextureTypeCube || depth.textureType == MTLTextureType2DArray);
+    int depth_layered = depth && (depth.textureType == MTLTextureTypeCube || depth.textureType == MTLTextureType2DArray ||
+                                  depth.textureType == MTLTextureType2DMultisampleArray);
     for (int s = 0; s < slices; s++) {
         MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
         for (int i = 0; i < n_color; i++) {
@@ -1969,6 +2555,7 @@ static void metal_rt_initial_clear(vio_render_target_object *rt)
             d.colorAttachments[i].clearColor = MTLClearColorMake(0, 0, 0, 0);
             if (msaa) {
                 d.colorAttachments[i].resolveTexture = color;
+                d.colorAttachments[i].resolveSlice = (NSUInteger)s;
                 d.colorAttachments[i].storeAction = MTLStoreActionStoreAndMultisampleResolve;
             } else {
                 d.colorAttachments[i].storeAction = MTLStoreActionStore;
@@ -1980,6 +2567,10 @@ static void metal_rt_initial_clear(vio_render_target_object *rt)
             d.depthAttachment.loadAction = MTLLoadActionClear;
             d.depthAttachment.storeAction = MTLStoreActionStore;
             d.depthAttachment.clearDepth = 1.0;
+            if (rt->depth_only && rt->metal_msaa_depth_texture && rt->metal_depth_texture) {
+                d.depthAttachment.resolveTexture = (__bridge id<MTLTexture>)rt->metal_depth_texture;
+                d.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+            }
             if (depth.pixelFormat == VIO_METAL_DEPTH_STENCIL) {
                 d.stencilAttachment.texture = depth;
                 d.stencilAttachment.loadAction = MTLLoadActionClear;
@@ -2009,6 +2600,36 @@ static int metal_clamp_sample_count(int requested)
     return 1;
 }
 
+/* Cube / array MSAA (A24, blind - macOS CI): a 2DMultisampleArray colour + depth
+ * pair; level-0 passes render into the face's slice and resolve into the same
+ * slice of the cube / array (StoreAndMultisampleResolve), levels > 0 render
+ * single-sampled into the face. */
+static void metal_rt_layered_msaa(vio_render_target_object *rt, MTLPixelFormat fmt, int w, int h)
+{
+    int layers = vio_rt_layer_count(rt);
+    if (rt->samples <= 1) return;
+    MTLTextureDescriptor *cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                    width:(NSUInteger)w height:(NSUInteger)h mipmapped:NO];
+    cd.textureType = MTLTextureType2DMultisampleArray;
+    cd.sampleCount = (NSUInteger)rt->samples;
+    cd.arrayLength = (NSUInteger)layers;
+    cd.usage = MTLTextureUsageRenderTarget;
+    cd.storageMode = MTLStorageModePrivate;
+    MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL
+                                    width:(NSUInteger)w height:(NSUInteger)h mipmapped:NO];
+    dd.textureType = MTLTextureType2DMultisampleArray;
+    dd.sampleCount = (NSUInteger)rt->samples;
+    dd.arrayLength = (NSUInteger)layers;
+    dd.usage = MTLTextureUsageRenderTarget;
+    dd.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> c = [vio_mtl.device newTextureWithDescriptor:cd];
+    id<MTLTexture> d = [vio_mtl.device newTextureWithDescriptor:dd];
+    if (!c || !d) { rt->samples = 1; return; }
+    rt->metal_msaa_color_texture = (void *)CFBridgingRetain(c);
+    rt->metal_msaa_color_textures[0] = rt->metal_msaa_color_texture;
+    rt->metal_msaa_depth_texture = (void *)CFBridgingRetain(d);
+}
+
 static int metal_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
 {
     @autoreleasepool {
@@ -2022,7 +2643,9 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
          * pair and resolve into the plain textures every pass end
          * (StoreAndMultisampleResolve), so metal_color_texture stays the one
          * thing wrappers / the 2D registry / readback see. */
-        int samples = (depth_only || rt->is_cube) ? 1 : metal_clamp_sample_count(rt->samples);
+        /* depth_only targets multisample as plain 2D targets (A24): Metal resolves
+         * the depth itself (depthResolveFilter Max / Min) into the sampled texture. */
+        int samples = (depth_only && (rt->is_cube || rt->layers > 1 || rt->mip_levels > 1)) ? 1 : metal_clamp_sample_count(rt->samples);
         rt->samples = samples;
 
         int n_color = metal_rt_attachment_count(rt);
@@ -2079,6 +2702,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             if (carr) {
                 rt->metal_color_textures[0] = (void *)CFBridgingRetain(carr);
                 rt->metal_color_texture = rt->metal_color_textures[0];
+                metal_rt_layered_msaa(rt, color_fmt, width, height);
             }
             rt->metal_depth_texture = (void *)CFBridgingRetain(darr);
             rt->backend_type = VIO_RT_BACKEND_METAL;
@@ -2113,6 +2737,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             rt->metal_color_texture = (void *)CFBridgingRetain(cube);
             rt->metal_color_textures[0] = rt->metal_color_texture;
             rt->metal_depth_texture = (void *)CFBridgingRetain(cube_depth);
+            metal_rt_layered_msaa(rt, color_fmt, width, width);
             rt->backend_type = VIO_RT_BACKEND_METAL;
             metal_rt_initial_clear(rt);
             return 0;
@@ -2120,9 +2745,11 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
 
         /* Depth texture — always created (parallel to OpenGL's "always create
          * depth attachment" pattern so shadow-map RTs work uniformly). */
+        /* depth_only + 'mipmaps' (A26): a Depth32Float chain (no stencil plane). */
+        int depth_mips = depth_only && rt->mip_levels > 1 && samples <= 1;
         MTLTextureDescriptor *depth_desc = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL
-            width:width height:height mipmapped:NO];
+            texture2DDescriptorWithPixelFormat:(depth_mips ? MTLPixelFormatDepth32Float : VIO_METAL_DEPTH_STENCIL)
+            width:width height:height mipmapped:(depth_mips ? YES : NO)];
         depth_desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         depth_desc.storageMode = MTLStorageModePrivate;
         if (samples > 1) {
@@ -2183,10 +2810,21 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             rt->metal_msaa_color_texture = rt->metal_msaa_color_textures[0];
             rt->metal_msaa_depth_texture = (void *)CFBridgingRetain(depth_tex);
             rt->metal_depth_texture = NULL;  /* no single-sample depth to sample */
+            if (depth_only) {
+                /* The resolve target of the multisampled depth: what sampling and readback see. */
+                MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL
+                                                width:(NSUInteger)width height:(NSUInteger)height mipmapped:NO];
+                rd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                rd.storageMode = MTLStorageModePrivate;
+                id<MTLTexture> resolved = [vio_mtl.device newTextureWithDescriptor:rd];
+                if (!resolved) return -1;
+                rt->metal_depth_texture = (void *)CFBridgingRetain(resolved);
+            }
         } else {
             rt->metal_depth_texture = (void *)CFBridgingRetain(depth_tex);
         }
         rt->backend_type = VIO_RT_BACKEND_METAL;
+        metal_rt_rate_map_setup(rt);
         metal_rt_initial_clear(rt);
 
         return 0;
@@ -2198,6 +2836,7 @@ static void metal_bind_render_target_at(vio_render_target_object *rt, int face, 
     @autoreleasepool {
         if (rt->backend_type != VIO_RT_BACKEND_METAL || !vio_mtl.initialized) return;
 
+        vio_render_target_object *left = current_bound_rt;
         current_bound_rt    = rt;
         current_bound_face  = face;
         current_bound_level = level;
@@ -2215,6 +2854,7 @@ static void metal_bind_render_target_at(vio_render_target_object *rt, int face, 
                 [vio_mtl.current_encoder endEncoding];
                 vio_mtl.current_encoder = nil;
             }
+            if (left && left->rrm_dirty) metal_rrm_resolve(left);
             metal_open_encoder(/*load_clear=*/0);
         }
     }
@@ -2251,6 +2891,7 @@ static void metal_unbind_render_target(unsigned int default_fbo, int width, int 
          * stash keeps a dangling pointer to a release()'d RT object and the
          * next metal_begin_frame opens an encoder on freed Metal textures.
          * Symptom: every-few-frames flicker after a warmRender pass. */
+        vio_render_target_object *left = current_bound_rt;
         current_bound_rt    = NULL;
         current_bound_face  = -1;
         current_bound_level = 0;
@@ -2265,6 +2906,7 @@ static void metal_unbind_render_target(unsigned int default_fbo, int width, int 
             [vio_mtl.current_encoder endEncoding];
             vio_mtl.current_encoder = nil;
         }
+        if (left && left->rrm_dirty) metal_rrm_resolve(left);
 
         /* Restore swapchain — load existing contents so previously drawn
          * geometry isn't wiped when the consumer bounces between RT and
@@ -2284,6 +2926,11 @@ static void metal_destroy_render_target(void *rt_ptr)
     if (current_bound_rt == rt) {
         current_bound_rt = NULL;
     }
+    if (rt->metal_rrm)        { CFBridgingRelease(rt->metal_rrm);        rt->metal_rrm = NULL; }
+    if (rt->metal_rrm_color)  { CFBridgingRelease(rt->metal_rrm_color);  rt->metal_rrm_color = NULL; }
+    if (rt->metal_rrm_depth)  { CFBridgingRelease(rt->metal_rrm_depth);  rt->metal_rrm_depth = NULL; }
+    if (rt->metal_rrm_params) { CFBridgingRelease(rt->metal_rrm_params); rt->metal_rrm_params = NULL; }
+    rt->rate_active = 0;
 
     /* MRT attachments 1..n; index 0 is released through the scalar below. */
     for (int i = 1; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
@@ -2648,6 +3295,10 @@ static MTLPixelFormat metal_texfmt(int fmt)
         case VIO_FORMAT_BC4: return MTLPixelFormatBC4_RUnorm;
         case VIO_FORMAT_BC5: return MTLPixelFormatBC5_RGUnorm;
         case VIO_FORMAT_BC7: return MTLPixelFormatBC7_RGBAUnorm;
+        case VIO_FORMAT_ASTC_4x4: return MTLPixelFormatASTC_4x4_LDR;
+        case VIO_FORMAT_ASTC_5x5: return MTLPixelFormatASTC_5x5_LDR;
+        case VIO_FORMAT_ASTC_6x6: return MTLPixelFormatASTC_6x6_LDR;
+        case VIO_FORMAT_ASTC_8x8: return MTLPixelFormatASTC_8x8_LDR;
         case VIO_FORMAT_R8:  return MTLPixelFormatR8Unorm;
         default:             return MTLPixelFormatRGBA8Unorm;
     }
@@ -2674,7 +3325,7 @@ static void *metal_create_texture_ex(vio_texture_desc *desc)
     int levels = desc->mip_levels > 1 ? desc->mip_levels : 1;
     int compressed = vio_texfmt_is_compressed(desc->format);
     int gen = !compressed && desc->mipmaps && levels == 1;
-    if (compressed && !metal_supports_bc()) return NULL;
+    if (vio_texfmt_is_astc(desc->format) ? vio_mtl.caps.apple_family < 2 : (compressed && !metal_supports_bc())) return NULL;
     @autoreleasepool {
         MTLTextureDescriptor *td = [[MTLTextureDescriptor alloc] init];
         td.textureType = layers > 1 ? MTLTextureType2DArray : MTLTextureType2D;
@@ -2826,11 +3477,23 @@ typedef struct _vio_metal_pso_variant {
     int   color_fmts[VIO_MAX_COLOR_ATTACHMENTS]; /* MTLPixelFormat per attachment */
     int   color_count; /* 0 for depth-only targets */
     int   stride;      /* mesh vertex stride baked into the vertex descriptor */
+    uint32_t layout;   /* vio_mesh_layout.key whose offsets the descriptor uses (0 = dense) */
     int   samples;     /* raster sample count of the target (1 or the RT's MSAA count) */
     int   has_depth;   /* 0 when the target has no depth attachment (cube-RT mip > 0) */
     int   has_stencil; /* depth attachment carries stencil */
     void *pso;         /* id<MTLRenderPipelineState>, +1 retained */
 } vio_metal_pso_variant;
+
+/* Layout of the mesh being drawn (apply_mesh_layout, OPEN-ITEMS-PLAN A31): the
+ * vertex descriptors read each input at the mesh's offset. The emulated
+ * geometry stage bakes dense offsets into its vertex kernel and keeps them. */
+static vio_mesh_layout metal_mesh_layout;
+
+static void metal_apply_mesh_layout(const vio_mesh_layout *ml)
+{
+    if (ml) metal_mesh_layout = *ml;
+    else metal_mesh_layout.key = 0;
+}
 
 typedef struct _vio_metal_pipeline {
     vio_metal_shader *shader;       /* borrowed — the VioPipeline holds a strong ref to its VioShader */
@@ -3067,9 +3730,11 @@ static void metal_current_target(vio_metal_target_desc *t)
     t->has_depth = 1;
     if (current_bound_rt) {
         if ((current_bound_rt->is_cube || current_bound_rt->layers > 1) && current_bound_level > 0) t->has_depth = 0;
-        void *dt = current_bound_rt->samples > 1 ? current_bound_rt->metal_msaa_depth_texture : current_bound_rt->metal_depth_texture;
+        int rt_ms = current_bound_rt->samples > 1 && t->has_depth;   /* layered levels > 0: single-sample (A24) */
+        if (current_bound_rt->samples > 1 && !(current_bound_rt->is_cube || current_bound_rt->layers > 1)) rt_ms = 1;
+        void *dt = rt_ms ? current_bound_rt->metal_msaa_depth_texture : current_bound_rt->metal_depth_texture;
         t->has_stencil = t->has_depth && dt && ((__bridge id<MTLTexture>)dt).pixelFormat == VIO_METAL_DEPTH_STENCIL;
-        if (current_bound_rt->samples > 1) t->samples = current_bound_rt->samples;
+        if (rt_ms) t->samples = current_bound_rt->samples;
         if (current_bound_rt->depth_only || !current_bound_rt->metal_color_texture) {
             t->count = 0;
             return;
@@ -3097,11 +3762,13 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
     int has_depth = t->has_depth;
     int has_stencil = t->has_stencil;
     int has_color = t->count > 0;
+    const vio_mesh_layout *ml = &metal_mesh_layout;
+    uint32_t want_layout = ml->key;
 
     for (int i = 0; i < p->variant_count; i++) {
         vio_metal_pso_variant *v = &p->variants[i];
         if (v->color_count != t->count || v->stride != stride || v->samples != samples || v->has_depth != has_depth ||
-            v->has_stencil != has_stencil) continue;
+            v->has_stencil != has_stencil || v->layout != want_layout) continue;
         int same = 1;
         for (int k = 0; k < t->count; k++) if (v->color_fmts[k] != (int)t->fmts[k]) { same = 0; break; }
         if (same) return (__bridge id<MTLRenderPipelineState>)v->pso;
@@ -3152,7 +3819,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
                     has_inst_attr = 1;
                 } else {
                     vd.attributes[loc].format = metal_vertex_format(in->components);
-                    vd.attributes[loc].offset = mesh_offset;
+                    vd.attributes[loc].offset = (NSUInteger)vio_mesh_layout_offset(ml, loc, (int)mesh_offset);
                     vd.attributes[loc].bufferIndex = VIO_METAL_VB_MESH;
                     mesh_offset += (NSUInteger)in->components * sizeof(float);
                     has_mesh_attr = 1;
@@ -3167,7 +3834,8 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
         if (has_inst_attr) {
             vd.layouts[VIO_METAL_VB_INSTANCE].stride = 64;
             vd.layouts[VIO_METAL_VB_INSTANCE].stepFunction = MTLVertexStepFunctionPerInstance;
-            vd.layouts[VIO_METAL_VB_INSTANCE].stepRate = 1;
+            /* Multiview draws N emulated instances per real one. */
+            vd.layouts[VIO_METAL_VB_INSTANCE].stepRate = sh->view_count > 1 ? (NSUInteger)sh->view_count : 1;
         }
         if (sh->tess && !sh->tess_emul) {
             /* vert_fn is the TES: it reads the control points from the TCS
@@ -3266,7 +3934,38 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
         }
 
         NSError *err = nil;
-        id<MTLRenderPipelineState> pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:d error:&err];
+        id<MTLRenderPipelineState> pso = nil;
+        if (sh->mesh) {
+            /* Mesh pipeline: same attachments / blend state, object + mesh
+             * functions instead of the vertex stage. */
+            MTLMeshRenderPipelineDescriptor *md = [[MTLMeshRenderPipelineDescriptor alloc] init];
+            md.objectFunction = sh->object_fn ? (__bridge id<MTLFunction>)sh->object_fn : nil;
+            md.meshFunction = (__bridge id<MTLFunction>)p->vert_fn;
+            md.fragmentFunction = d.fragmentFunction;
+            md.rasterSampleCount = d.rasterSampleCount;
+            md.rasterizationEnabled = YES;
+            if (sh->object_fn) md.payloadMemoryLength = 16384;
+            for (int k = 0; k < 8; k++) {
+                MTLRenderPipelineColorAttachmentDescriptor *src = d.colorAttachments[k];
+                if (src.pixelFormat == MTLPixelFormatInvalid) continue;
+                MTLRenderPipelineColorAttachmentDescriptor *dst = md.colorAttachments[k];
+                dst.pixelFormat = src.pixelFormat;
+                dst.writeMask = src.writeMask;
+                dst.blendingEnabled = src.blendingEnabled;
+                dst.rgbBlendOperation = src.rgbBlendOperation;
+                dst.alphaBlendOperation = src.alphaBlendOperation;
+                dst.sourceRGBBlendFactor = src.sourceRGBBlendFactor;
+                dst.destinationRGBBlendFactor = src.destinationRGBBlendFactor;
+                dst.sourceAlphaBlendFactor = src.sourceAlphaBlendFactor;
+                dst.destinationAlphaBlendFactor = src.destinationAlphaBlendFactor;
+            }
+            md.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat;
+            md.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+            pso = [vio_mtl.device newRenderPipelineStateWithMeshDescriptor:md options:MTLPipelineOptionNone
+                                                                reflection:nil error:&err];
+        } else {
+            pso = metal_archived_render_pso(d, &err);
+        }
         if (!pso) {
             php_error_docref(NULL, E_WARNING, "Metal: render pipeline creation failed: %s",
                 err ? [[err localizedDescription] UTF8String] : "unknown");
@@ -3276,6 +3975,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
         v->color_count = t->count;
         for (int k = 0; k < t->count; k++) v->color_fmts[k] = (int)t->fmts[k];
         v->stride    = stride;
+        v->layout    = want_layout;
         v->samples   = samples;
         v->has_depth = has_depth;
         v->has_stencil = has_stencil;
@@ -3287,6 +3987,272 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
 /* Apply everything a draw needs on the open encoder: PSO variant for the
  * current target, depth/cull/bias state, this draw's cbuffer slices and the
  * identity instance buffer. Returns 0 when there is nothing to draw into. */
+/* ── Inline ray tracing (VIO_FEATURE_RAY_QUERY) ─────────────────────
+ * One primitive acceleration structure per geometry, one instance structure
+ * over the instances, built synchronously on their own command buffer. The
+ * structure bound with vio_bind_acceleration_structure reaches the shader at
+ * the [[buffer(n)]] index its acceleration_structure parameter was renumbered
+ * to (vertex / fragment), or at the GLSL binding (compute); the instance
+ * structure only references the primitive ones, so every draw / dispatch that
+ * binds it declares them with useResource. */
+typedef struct _vio_metal_as {
+    void  *tlas;          /* id<MTLAccelerationStructure>, +1 */
+    void **blas;          /* id<MTLAccelerationStructure>[blas_count], +1 each */
+    int    blas_count;
+    void  *instances;     /* id<MTLBuffer> of instance descriptors, +1 */
+    int    instance_count;
+} vio_metal_as;
+
+static vio_metal_as *metal_bound_as = NULL;
+static int           metal_bound_as_binding = 0;
+
+static void metal_use_as(id<MTLRenderCommandEncoder> renc, id<MTLComputeCommandEncoder> cenc, vio_metal_as *as)
+{
+    if (!as) return;
+    for (int i = 0; i < as->blas_count; i++) {
+        id<MTLResource> r = (__bridge id<MTLResource>)as->blas[i];
+        if (renc) {
+            if (@available(macOS 13.0, iOS 16.0, *)) [renc useResource:r usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+            else [renc useResource:r usage:MTLResourceUsageRead];
+        }
+        if (cenc) [cenc useResource:r usage:MTLResourceUsageRead];
+    }
+}
+
+/* Instance descriptors: the row-major 3x4 transform as four packed columns. */
+static id<MTLBuffer> metal_as_instance_buffer(id<MTLDevice> dev, const vio_as_instance *inst, int count, int blas_count)
+{
+    id<MTLBuffer> ibuf = [dev newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor) * (NSUInteger)count
+                                          options:MTLResourceStorageModeShared];
+    if (!ibuf) return nil;
+    MTLAccelerationStructureInstanceDescriptor *ids = (MTLAccelerationStructureInstanceDescriptor *)[ibuf contents];
+    for (int i = 0; i < count; i++) {
+        const vio_as_instance *in = &inst[i];
+        if (in->geometry < 0 || in->geometry >= blas_count) return nil;
+        memset(&ids[i], 0, sizeof(ids[i]));
+        for (int c = 0; c < 4; c++) {
+            ids[i].transformationMatrix.columns[c].x = in->transform[0 * 4 + c];
+            ids[i].transformationMatrix.columns[c].y = in->transform[1 * 4 + c];
+            ids[i].transformationMatrix.columns[c].z = in->transform[2 * 4 + c];
+        }
+        ids[i].options = MTLAccelerationStructureInstanceOptionOpaque;
+        ids[i].mask = (uint32_t)(in->mask & 0xFF);
+        ids[i].intersectionFunctionTableOffset = 0;
+        ids[i].accelerationStructureIndex = (uint32_t)in->geometry;
+    }
+    return ibuf;
+}
+
+/* The instance-structure descriptor over the kept primitive structures; refit
+ * usage so vio_acceleration_structure_update can update it in place (A14). */
+static MTLInstanceAccelerationStructureDescriptor *metal_as_instance_desc(vio_metal_as *as, id<MTLBuffer> ibuf, int count)
+    API_AVAILABLE(macos(11.0), ios(14.0))
+{
+    NSMutableArray *blases = [NSMutableArray arrayWithCapacity:(NSUInteger)as->blas_count];
+    for (int i = 0; i < as->blas_count; i++) [blases addObject:(__bridge id<MTLAccelerationStructure>)as->blas[i]];
+    MTLInstanceAccelerationStructureDescriptor *idesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
+    idesc.instancedAccelerationStructures = blases;
+    idesc.instanceCount = (NSUInteger)count;
+    idesc.instanceDescriptorBuffer = ibuf;
+    idesc.usage = MTLAccelerationStructureUsageRefit;
+    return idesc;
+}
+
+static void *metal_create_acceleration_structure(const vio_as_desc *desc)
+{
+    if (!desc || desc->geometry_count < 1 || desc->instance_count < 1 || !vio_mtl.device) return NULL;
+    if (!vio_mtl.caps.raytracing) return NULL;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        vio_metal_as *as = calloc(1, sizeof(vio_metal_as));
+        if (!as) return NULL;
+        as->blas = calloc((size_t)desc->geometry_count, sizeof(void *));
+        if (!as->blas) { free(as); return NULL; }
+        @autoreleasepool {
+            id<MTLDevice> dev = vio_mtl.device;
+            id<MTLCommandBuffer> cb = [vio_mtl.command_queue commandBuffer];
+            id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
+            NSMutableArray *keep = [NSMutableArray array];   /* geometry + scratch buffers live until the wait */
+            NSMutableArray *blases = [NSMutableArray array];
+            for (int g = 0; g < desc->geometry_count; g++) {
+                const vio_as_geometry *geo = &desc->geometries[g];
+                id<MTLBuffer> vb = [dev newBufferWithBytes:geo->positions length:(NSUInteger)geo->vertex_count * 12
+                                                   options:MTLResourceStorageModeShared];
+                MTLAccelerationStructureTriangleGeometryDescriptor *tri = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+                tri.vertexBuffer = vb;
+                tri.vertexStride = 12;
+                tri.opaque = YES;
+                if (geo->indices && geo->index_count >= 3) {
+                    id<MTLBuffer> ib = [dev newBufferWithBytes:geo->indices length:(NSUInteger)geo->index_count * 4
+                                                       options:MTLResourceStorageModeShared];
+                    tri.indexBuffer = ib;
+                    tri.indexType = MTLIndexTypeUInt32;
+                    tri.triangleCount = (NSUInteger)geo->index_count / 3;
+                    [keep addObject:ib];
+                } else {
+                    tri.triangleCount = (NSUInteger)geo->vertex_count / 3;
+                }
+                [keep addObject:vb];
+                MTLPrimitiveAccelerationStructureDescriptor *pd = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+                pd.geometryDescriptors = @[ tri ];
+                MTLAccelerationStructureSizes sz = [dev accelerationStructureSizesWithDescriptor:pd];
+                id<MTLAccelerationStructure> blas = [dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
+                id<MTLBuffer> scratch = [dev newBufferWithLength:sz.buildScratchBufferSize > 0 ? sz.buildScratchBufferSize : 16
+                                                         options:MTLResourceStorageModePrivate];
+                if (!blas || !scratch) { [enc endEncoding]; goto fail; }
+                [enc buildAccelerationStructure:blas descriptor:pd scratchBuffer:scratch scratchBufferOffset:0];
+                [keep addObject:scratch];
+                [blases addObject:blas];
+                as->blas[as->blas_count++] = (void *)CFBridgingRetain(blas);
+            }
+            [enc endEncoding];
+
+            id<MTLBuffer> ibuf = metal_as_instance_buffer(dev, desc->instances, desc->instance_count, as->blas_count);
+            if (!ibuf) goto fail;
+            MTLInstanceAccelerationStructureDescriptor *idesc = metal_as_instance_desc(as, ibuf, desc->instance_count);
+            (void)blases;
+            MTLAccelerationStructureSizes isz = [dev accelerationStructureSizesWithDescriptor:idesc];
+            id<MTLAccelerationStructure> tlas = [dev newAccelerationStructureWithSize:isz.accelerationStructureSize];
+            id<MTLBuffer> iscratch = [dev newBufferWithLength:isz.buildScratchBufferSize > 0 ? isz.buildScratchBufferSize : 16
+                                                      options:MTLResourceStorageModePrivate];
+            if (!tlas || !iscratch) goto fail;
+            /* A second encoder: the instance build reads the finished primitive structures. */
+            id<MTLAccelerationStructureCommandEncoder> ienc = [cb accelerationStructureCommandEncoder];
+            [ienc buildAccelerationStructure:tlas descriptor:idesc scratchBuffer:iscratch scratchBufferOffset:0];
+            [ienc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) goto fail;
+            as->tlas = (void *)CFBridgingRetain(tlas);
+            as->instances = (void *)CFBridgingRetain(ibuf);
+            as->instance_count = desc->instance_count;
+            (void)keep;
+            return as;
+        }
+fail:
+        for (int i = 0; i < as->blas_count; i++) CFRelease(as->blas[i]);
+        free(as->blas);
+        free(as);
+        return NULL;
+    }
+    return NULL;
+}
+
+static int metal_update_acceleration_structure(void *ptr, const vio_as_instance *inst, int count, int refit)
+{
+    vio_metal_as *as = (vio_metal_as *)ptr;
+    if (!as || !inst || count < 1 || !vio_mtl.device || !as->tlas) return -1;
+    if (refit && count != as->instance_count) return -1;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        @autoreleasepool {
+            id<MTLDevice> dev = vio_mtl.device;
+            id<MTLBuffer> ibuf = metal_as_instance_buffer(dev, inst, count, as->blas_count);
+            if (!ibuf) return -1;
+            MTLInstanceAccelerationStructureDescriptor *idesc = metal_as_instance_desc(as, ibuf, count);
+            MTLAccelerationStructureSizes sz = [dev accelerationStructureSizesWithDescriptor:idesc];
+            id<MTLCommandBuffer> cb = [vio_mtl.command_queue commandBuffer];
+            id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
+            id<MTLAccelerationStructure> fresh = nil;
+            if (refit) {
+                /* In place (destination nil); the queue orders it after frames that read it. */
+                id<MTLBuffer> s = [dev newBufferWithLength:sz.refitScratchBufferSize > 0 ? sz.refitScratchBufferSize : 16
+                                                   options:MTLResourceStorageModePrivate];
+                if (!s) { [enc endEncoding]; return -1; }
+                [enc refitAccelerationStructure:(__bridge id<MTLAccelerationStructure>)as->tlas descriptor:idesc
+                                    destination:nil scratchBuffer:s scratchBufferOffset:0];
+            } else {
+                fresh = [dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
+                id<MTLBuffer> s = [dev newBufferWithLength:sz.buildScratchBufferSize > 0 ? sz.buildScratchBufferSize : 16
+                                                   options:MTLResourceStorageModePrivate];
+                if (!fresh || !s) { [enc endEncoding]; return -1; }
+                [enc buildAccelerationStructure:fresh descriptor:idesc scratchBuffer:s scratchBufferOffset:0];
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) return -1;
+            if (fresh) {
+                CFRelease(as->tlas);   /* command buffers that used it retain it */
+                as->tlas = (void *)CFBridgingRetain(fresh);
+            }
+            if (as->instances) CFRelease(as->instances);
+            as->instances = (void *)CFBridgingRetain(ibuf);
+            as->instance_count = count;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void metal_destroy_acceleration_structure(void *ptr)
+{
+    vio_metal_as *as = (vio_metal_as *)ptr;
+    if (!as) return;
+    if (metal_bound_as == as) metal_bound_as = NULL;
+    /* Command buffers retain what they reference: releasing now is safe. */
+    if (as->tlas) CFRelease(as->tlas);
+    if (as->instances) CFRelease(as->instances);
+    for (int i = 0; i < as->blas_count; i++) if (as->blas[i]) CFRelease(as->blas[i]);
+    free(as->blas);
+    free(as);
+}
+
+static void metal_bind_acceleration_structure(void *ptr, int binding)
+{
+    metal_bound_as = (vio_metal_as *)ptr;
+    metal_bound_as_binding = binding;
+}
+
+/* Bind the bound acceleration structure to the stages of the current draw. */
+static void metal_bind_as_for_draw(id<MTLRenderCommandEncoder> enc, vio_metal_shader *sh)
+{
+    if (!metal_bound_as || !metal_bound_as->tlas || !sh) return;
+    int used = 0;
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        id<MTLAccelerationStructure> tlas = (__bridge id<MTLAccelerationStructure>)metal_bound_as->tlas;
+        for (int i = 0; i < sh->vs.buffer_count; i++) {
+            if (sh->vs.buffers[i].kind != 3) continue;
+            [enc setVertexAccelerationStructure:tlas atBufferIndex:(NSUInteger)sh->vs.buffers[i].msl_index];
+            used = 1;
+        }
+        for (int i = 0; i < sh->fs.buffer_count; i++) {
+            if (sh->fs.buffers[i].kind != 3) continue;
+            [enc setFragmentAccelerationStructure:tlas atBufferIndex:(NSUInteger)sh->fs.buffers[i].msl_index];
+            used = 1;
+        }
+    }
+    if (used) metal_use_as(enc, nil, metal_bound_as);
+}
+
+/* Fragment storage buffers (A15): bound per draw at the fragment stage's
+ * pinned [[buffer(n)]] of the SSBO with that GLSL binding. */
+static vio_metal_compute_buffer *metal_fs_storage[VIO_MAX_FRAGMENT_STORAGE];
+static int metal_fs_storage_used;
+
+static int metal_bind_fragment_storage(void *backend_buffer, int binding)
+{
+    if (binding < 0 || binding >= VIO_MAX_FRAGMENT_STORAGE) return -1;
+    metal_fs_storage[binding] = (vio_metal_compute_buffer *)backend_buffer;
+    return 0;
+}
+
+static void metal_bind_fs_storage(id<MTLRenderCommandEncoder> enc, vio_metal_shader *sh)
+{
+    for (int i = 0; i < sh->fs.buffer_count; i++) {
+        const vio_metal_res_buffer *rb = &sh->fs.buffers[i];
+        if (rb->kind != 1 || rb->binding < 0 || rb->binding >= VIO_MAX_FRAGMENT_STORAGE) continue;
+        vio_metal_compute_buffer *b = metal_fs_storage[rb->binding];
+        if (!b || !b->buffer) {
+            /* A declared but unbound block writes into a scratch buffer, never off the end of nothing. */
+            static id<MTLBuffer> scratch = nil;
+            if (!scratch) scratch = [vio_mtl.device newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+            if (scratch) [enc setFragmentBuffer:scratch offset:0 atIndex:(NSUInteger)rb->msl_index];
+            continue;
+        }
+        [enc setFragmentBuffer:(__bridge id<MTLBuffer>)b->buffer offset:0 atIndex:(NSUInteger)rb->msl_index];
+        metal_fs_storage_used = 1;
+    }
+}
+
 static int metal_prepare_draw(int stride)
 {
     vio_metal_pipeline *p = metal_current_pipeline;
@@ -3318,6 +4284,24 @@ static int metal_prepare_draw(int stride)
      * but got no separate cbuffer object shares the vertex data (D3D11 binds
      * the VS cbuffer to PS b0 in that case). */
     vio_metal_shader *sh = p->shader;
+    if (sh->mesh) {
+        /* The mesh stage owns the "vertex" uniform block; a task stage that
+         * declares the same block reads the same slice. */
+        vio_metal_buffer *mcb = metal_current_vs_cb;
+        if (mcb && mcb->shadow && mcb->shadow_size > 0) {
+            NSUInteger off = 0;
+            id<MTLBuffer> rb = metal_ring_alloc(mcb->shadow_size, &off);
+            if (rb) {
+                memcpy((char *)[rb contents] + off, mcb->shadow, mcb->shadow_size);
+                if (sh->vs.cbuffer_index >= 0) [enc setMeshBuffer:rb offset:off atIndex:(NSUInteger)sh->vs.cbuffer_index];
+                if (sh->object_fn && sh->obj.cbuffer_index >= 0) [enc setObjectBuffer:rb offset:off atIndex:(NSUInteger)sh->obj.cbuffer_index];
+            }
+        }
+        vio_metal_buffer *fcb = metal_current_fs_cb ? metal_current_fs_cb : NULL;
+        if (fcb) metal_bind_uniform_slice(fcb, -1, sh->fs.cbuffer_index);
+        else if (mcb && sh->fs.cbuffer_index >= 0) metal_bind_uniform_slice(mcb, -1, sh->fs.cbuffer_index);
+        return 1;
+    }
     if (sh->tess) {
         /* The vertex function is the TES (its own block); the vertex stage's
          * block goes to the vertex kernel in metal_draw_tess. */
@@ -3345,7 +4329,118 @@ static int metal_prepare_draw(int stride)
     if (sh->vl.uses_instance_attribs && metal_identity_instance) {
         [enc setVertexBuffer:metal_identity_instance offset:0 atIndex:VIO_METAL_VB_INSTANCE];
     }
+    metal_bind_as_for_draw(enc, sh);
+    metal_bind_fs_storage(enc, sh);
+    metal_bindless_bind(enc, sh->vs.uses_bindless, sh->fs.uses_bindless);
+    if (sh->view_count > 1) {
+        /* SPIRV-Cross's multiview view mask: {base view, view count}. */
+        uint32_t mask[2] = { 0u, (uint32_t)sh->view_count };
+        [enc setVertexBytes:mask length:sizeof(mask) atIndex:VIO_METAL_VIEW_MASK_INDEX];
+        [enc setFragmentBytes:mask length:sizeof(mask) atIndex:VIO_METAL_VIEW_MASK_INDEX];
+    }
     return 1;
+}
+
+/* ── Bindless table (vio_texture_index, BINDLESS-PLAN.md) ──────────────
+ * One Shared buffer of MTLResourceIDs per kind - vio_textures (2D), vio_texture_arrays
+ * and vio_cubes - that the shader's Set 1 / 2 / 3 argument buffers read (the MSL
+ * translation moves vio_cubes / vio_texture_arrays to sets 2 / 3, each an unsized
+ * array at offset 0), plus the textures themselves so every draw can make them
+ * resident (useResources). The slot space is shared: a slot has one kind. */
+static id<MTLBuffer>   metal_bindless_bufs[3] = { nil, nil, nil };   /* per VIO_BINDLESS_KIND_* */
+static const NSUInteger metal_bindless_index[3] = {
+    VIO_METAL_BINDLESS_INDEX, VIO_METAL_BINDLESS_ARRAY_INDEX, VIO_METAL_BINDLESS_CUBE_INDEX };
+static id<MTLResource> metal_bindless_res[VIO_BINDLESS_MAX];
+static int             metal_bindless_count = 0;
+/* The live entries, packed for useResources (released slots are nil). */
+static id<MTLResource> metal_bindless_live[VIO_BINDLESS_MAX];
+static int             metal_bindless_live_count = 0;
+
+static void metal_bindless_pack(void)
+{
+    metal_bindless_live_count = 0;
+    for (int i = 0; i < metal_bindless_count; i++)
+        if (metal_bindless_res[i]) metal_bindless_live[metal_bindless_live_count++] = metal_bindless_res[i];
+    for (int i = metal_bindless_live_count; i < VIO_BINDLESS_MAX && metal_bindless_live[i]; i++) metal_bindless_live[i] = nil;
+}
+
+static int metal_bindless_set(int slot, void *backend_texture, int kind)
+{
+    if (slot < 0 || slot >= VIO_BINDLESS_MAX || kind < VIO_BINDLESS_KIND_2D || kind > VIO_BINDLESS_KIND_CUBE) return -1;
+    if (!backend_texture) {
+        /* Released: a zero resource ID, and no longer resident. */
+        if (metal_bindless_bufs[kind]) memset((char *)[metal_bindless_bufs[kind] contents] + (size_t)slot * 8, 0, 8);
+        metal_bindless_res[slot] = nil;
+        metal_bindless_pack();
+        return 0;
+    }
+    if (!vio_mtl.device || !vio_mtl.caps.bindless) return -1;
+    id<MTLTexture> tex = nil;
+    if (kind == VIO_BINDLESS_KIND_CUBE) {
+        vio_cubemap_object *cm = (vio_cubemap_object *)backend_texture;
+        if (cm->metal_texture) tex = (__bridge id<MTLTexture>)cm->metal_texture;
+    } else {
+        vio_metal_texture *mt = (vio_metal_texture *)backend_texture;
+        if (mt->tex) tex = (__bridge id<MTLTexture>)mt->tex;
+    }
+    if (!tex) return -1;
+    if (@available(macOS 13.0, iOS 16.0, *)) {
+        if (!metal_bindless_bufs[kind]) {
+            metal_bindless_bufs[kind] = [vio_mtl.device newBufferWithLength:VIO_BINDLESS_MAX * sizeof(MTLResourceID)
+                                                                    options:MTLResourceStorageModeShared];
+            if (!metal_bindless_bufs[kind]) return -1;
+            memset([metal_bindless_bufs[kind] contents], 0, VIO_BINDLESS_MAX * sizeof(MTLResourceID));
+        }
+        MTLResourceID rid = tex.gpuResourceID;
+        memcpy((char *)[metal_bindless_bufs[kind] contents] + (size_t)slot * sizeof(MTLResourceID), &rid, sizeof(rid));
+        metal_bindless_res[slot] = tex;
+        if (slot + 1 > metal_bindless_count) metal_bindless_count = slot + 1;
+        metal_bindless_pack();
+        return 0;
+    }
+    return -1;
+}
+
+static void metal_bindless_release(void)
+{
+    for (int i = 0; i < metal_bindless_count; i++) metal_bindless_res[i] = nil;
+    metal_bindless_count = 0;
+    metal_bindless_pack();
+    for (int k = 0; k < 3; k++) metal_bindless_bufs[k] = nil;
+}
+
+/* Bind the tables' argument buffers to the stages that read them and make
+ * their textures resident for this draw. */
+static void metal_bindless_bind(id<MTLRenderCommandEncoder> enc, int vertex, int fragment)
+{
+    if (!vertex && !fragment) return;
+    for (int k = 0; k < 3; k++) {
+        if (!metal_bindless_bufs[k]) continue;
+        if (vertex)   [enc setVertexBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+        if (fragment) [enc setFragmentBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+    }
+    if (metal_bindless_live_count > 0) {
+        MTLRenderStages stages = (vertex ? MTLRenderStageVertex : 0) | (fragment ? MTLRenderStageFragment : 0);
+        [enc useResources:metal_bindless_live count:(NSUInteger)metal_bindless_live_count usage:MTLResourceUsageRead stages:stages];
+    }
+}
+
+/* The same for a compute kernel. */
+static void metal_bindless_bind_compute(id<MTLComputeCommandEncoder> enc)
+{
+    for (int k = 0; k < 3; k++) {
+        if (metal_bindless_bufs[k]) [enc setBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+    }
+    if (metal_bindless_live_count > 0)
+        [enc useResources:metal_bindless_live count:(NSUInteger)metal_bindless_live_count usage:MTLResourceUsageRead];
+}
+
+/* Instances to issue for `n` user instances: x views under multiview. */
+static NSUInteger metal_mv_instances(NSUInteger n)
+{
+    vio_metal_pipeline *p = metal_current_pipeline;
+    int v = (p && p->shader) ? p->shader->view_count : 0;
+    return v > 1 ? n * (NSUInteger)v : n;
 }
 
 static void metal_bind_mesh_vb(void *vertex_buffer)
@@ -3390,8 +4485,9 @@ static MTLAttributeFormat metal_attribute_format(int components)
  * along grid X and per instance along grid Y. */
 static id<MTLComputePipelineState> metal_tess_vs_pso(vio_metal_shader *sh, int stride)
 {
+    const vio_mesh_layout *ml = &metal_mesh_layout;
     for (int i = 0; i < sh->vs_kernel_variant_count; i++) {
-        if (sh->vs_kernel_variants[i].stride == stride) {
+        if (sh->vs_kernel_variants[i].stride == stride && sh->vs_kernel_variants[i].layout == ml->key) {
             return (__bridge id<MTLComputePipelineState>)sh->vs_kernel_variants[i].pso;
         }
     }
@@ -3425,7 +4521,7 @@ static id<MTLComputePipelineState> metal_tess_vs_pso(vio_metal_shader *sh, int s
                     sd.attributes[loc].bufferIndex = VIO_METAL_VB_INSTANCE;
                     has_inst_attr = 1;
                 } else {
-                    sd.attributes[loc].offset = mesh_offset;
+                    sd.attributes[loc].offset = (NSUInteger)vio_mesh_layout_offset(ml, loc, (int)mesh_offset);
                     sd.attributes[loc].bufferIndex = VIO_METAL_VB_MESH;
                     mesh_offset += (NSUInteger)in->components * sizeof(float);
                     has_mesh_attr = 1;
@@ -3457,6 +4553,7 @@ static id<MTLComputePipelineState> metal_tess_vs_pso(vio_metal_shader *sh, int s
             return nil;
         }
         sh->vs_kernel_variants[sh->vs_kernel_variant_count].stride = stride;
+        sh->vs_kernel_variants[sh->vs_kernel_variant_count].layout = ml->key;
         sh->vs_kernel_variants[sh->vs_kernel_variant_count].pso = (void *)CFBridgingRetain(pso);
         sh->vs_kernel_variant_count++;
         return pso;
@@ -3899,8 +4996,18 @@ static void metal_draw_tess(vio_metal_buffer *vb, int stride, int first_vertex, 
 
 /* Source position of vertex k of primitive `prim` for the pipeline topology,
  * -1 when the topology cannot feed this input primitive. */
-static long metal_gs_assemble(vio_topology topo, int n_in, long prim, int k)
+static long metal_gs_assemble(vio_topology topo, int n_in, long prim, long n_prims, int k)
 {
+    if (topo == VIO_TRIANGLE_STRIP_ADJACENCY && n_in == 6) {
+        /* GL 10.1.12, table 10.1 (1-based), in GS order v1, a12, v2, a23, v3, a31 */
+        long i = prim, t[6];
+        int last = i == n_prims - 1;
+        if (n_prims == 1) { t[0] = 1; t[1] = 2; t[2] = 3; t[3] = 6; t[4] = 5; t[5] = 4; }
+        else if (i == 0)  { t[0] = 1; t[1] = 2; t[2] = 3; t[3] = 7; t[4] = 5; t[5] = 4; }
+        else if (i & 1)   { t[0] = 2*i+3; t[1] = 2*i-1; t[2] = 2*i+1; t[3] = 2*i+4; t[4] = 2*i+5; t[5] = last ? 2*i+6 : 2*i+7; }
+        else              { t[0] = 2*i+1; t[1] = 2*i-1; t[2] = 2*i+3; t[3] = last ? 2*i+6 : 2*i+7; t[4] = 2*i+5; t[5] = 2*i+4; }
+        return t[k] - 1;
+    }
     switch (topo) {
         case VIO_LINE_STRIP:
             if (n_in == 2) return prim + k;
@@ -3918,8 +5025,6 @@ static long metal_gs_assemble(vio_topology topo, int n_in, long prim, int k)
         case VIO_LINE_STRIP_ADJACENCY:
             if (n_in == 4) return prim + k;
             break;
-        case VIO_TRIANGLE_STRIP_ADJACENCY:
-            return -1;
         default:
             break;
     }
@@ -3933,10 +5038,20 @@ static long metal_gs_prim_count(vio_topology topo, int n_in, long n_src)
         case VIO_TRIANGLE_STRIP:
         case VIO_TRIANGLE_FAN:          if (n_in == 3) return n_src - 2; break;
         case VIO_LINE_STRIP_ADJACENCY:  if (n_in == 4) return n_src - 3; break;
-        case VIO_TRIANGLE_STRIP_ADJACENCY: return -1;
+        case VIO_TRIANGLE_STRIP_ADJACENCY: if (n_in == 6) return n_src >= 6 ? (n_src - 4) / 2 : 0; break;
         default: break;
     }
     return n_src / n_in;
+}
+
+static void metal_gs_kernel_textures(id<MTLComputeCommandEncoder> ce, const vio_metal_stage_res *res, int k)
+{
+    for (int i = 0; i < res->texture_count; i++) {
+        int ix = res->textures[i].msl_index;
+        if (ix < 0 || ix >= VIO_METAL_FS_SLOTS || !metal_gs_tex[k][ix]) continue;
+        [ce setTexture:metal_gs_tex[k][ix] atIndex:(NSUInteger)ix];
+        if (metal_gs_smp[k][ix]) [ce setSamplerState:metal_gs_smp[k][ix] atIndex:(NSUInteger)ix];
+    }
 }
 
 static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, int vertex_count,
@@ -3955,11 +5070,7 @@ static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, in
         long n_src = indexed ? index_count : vertex_count;
         size_t vb_count = stride > 0 ? vb->size / (size_t)stride : 1;
         long prims = metal_gs_prim_count(p->topology, sh->gs_in_vertices, n_src);
-        if (prims < 0) {
-            php_error_docref(NULL, E_WARNING, "Metal: triangle strips with adjacency are not supported by the geometry emulation");
-            return;
-        }
-        if (prims == 0 || sh->gs_idx_per == 0) return;
+        if (prims <= 0 || sh->gs_idx_per == 0) return;
         NSUInteger stream = (NSUInteger)prims * (NSUInteger)sh->gs_in_vertices;
         NSUInteger total_inv = (NSUInteger)prims * (NSUInteger)sh->gs_invocations * (NSUInteger)instances;
 
@@ -3986,7 +5097,7 @@ static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, in
             size_t ib_count = indexed ? ib->size / (index_bytes == 2 ? 2 : 4) : 0;
             for (long pr = 0; pr < prims; pr++) {
                 for (int k = 0; k < sh->gs_in_vertices; k++) {
-                    long s = metal_gs_assemble(p->topology, sh->gs_in_vertices, pr, k);
+                    long s = metal_gs_assemble(p->topology, sh->gs_in_vertices, pr, prims, k);
                     long long v;
                     if (indexed) {
                         size_t at = (size_t)first_index + (size_t)s;
@@ -4055,6 +5166,7 @@ static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, in
             (ix = mk_user_storage(&sh->gs_vsk, metal_pending_storage_binding)) >= 0) {
             [ce setBuffer:(__bridge id<MTLBuffer>)metal_pending_storage->buffer offset:0 atIndex:(NSUInteger)ix];
         }
+        metal_gs_kernel_textures(ce, &sh->gs_vsk, 0);
         NSUInteger tw = vs_pso.maxTotalThreadsPerThreadgroup < VIO_MK_LOCAL_SIZE ? vs_pso.maxTotalThreadsPerThreadgroup : VIO_MK_LOCAL_SIZE;
         [ce dispatchThreads:MTLSizeMake(stream, (NSUInteger)instances, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
         [ce endEncoding];
@@ -4078,6 +5190,7 @@ static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, in
                 [ce setBytes:zero_block length:sizeof(zero_block) atIndex:(NSUInteger)sh->gs_gs_cb];
             }
         }
+        metal_gs_kernel_textures(ce, &sh->gs_gsk, 1);
         NSUInteger gx = (NSUInteger)prims * (NSUInteger)sh->gs_invocations;
         tw = gs_pso.maxTotalThreadsPerThreadgroup < VIO_MK_LOCAL_SIZE ? gs_pso.maxTotalThreadsPerThreadgroup : VIO_MK_LOCAL_SIZE;
         [ce dispatchThreads:MTLSizeMake(gx, (NSUInteger)instances, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
@@ -4133,7 +5246,7 @@ static void metal_draw(vio_draw_cmd *cmd)
     @autoreleasepool {
         if (!metal_prepare_draw(cmd->vertex_stride)) return;
         metal_bind_mesh_vb(cmd->vertex_buffer);
-        NSUInteger instances = cmd->instance_count > 0 ? (NSUInteger)cmd->instance_count : 1;
+        NSUInteger instances = metal_mv_instances(cmd->instance_count > 0 ? (NSUInteger)cmd->instance_count : 1);
         [vio_mtl.current_encoder drawPrimitives:metal_current_pipeline->primitive
                                     vertexStart:(NSUInteger)cmd->first_vertex
                                     vertexCount:(NSUInteger)cmd->vertex_count
@@ -4161,7 +5274,7 @@ static void metal_draw_indexed(vio_draw_indexed_cmd *cmd)
     @autoreleasepool {
         if (!metal_prepare_draw(cmd->vertex_stride)) return;
         metal_bind_mesh_vb(cmd->vertex_buffer);
-        NSUInteger instances = cmd->instance_count > 0 ? (NSUInteger)cmd->instance_count : 1;
+        NSUInteger instances = metal_mv_instances(cmd->instance_count > 0 ? (NSUInteger)cmd->instance_count : 1);
         [vio_mtl.current_encoder drawIndexedPrimitives:metal_current_pipeline->primitive
                                             indexCount:(NSUInteger)cmd->index_count
                                              indexType:(cmd->index_bytes == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32)
@@ -4184,14 +5297,14 @@ static void metal_draw_mesh_instances(vio_mesh_object *mesh, int instance_count)
                                              indexType:(mesh->index_bytes == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32)
                                            indexBuffer:(__bridge id<MTLBuffer>)ib->buffer
                                      indexBufferOffset:0
-                                         instanceCount:(NSUInteger)instance_count
+                                         instanceCount:metal_mv_instances((NSUInteger)instance_count)
                                             baseVertex:0
                                           baseInstance:0];
     } else if (mesh->vertex_count > 0) {
         [vio_mtl.current_encoder drawPrimitives:metal_current_pipeline->primitive
                                     vertexStart:0
                                     vertexCount:(NSUInteger)mesh->vertex_count
-                                  instanceCount:(NSUInteger)instance_count];
+                                  instanceCount:metal_mv_instances((NSUInteger)instance_count)];
     }
 }
 
@@ -4239,12 +5352,32 @@ static void metal_bind_storage_buffer(void *backend_buffer, int binding, int acc
 /* Indirect draw (GAP-PHASE5 Block 8): Metal's indirect argument structs share the
  * 5 / 4 uint32 layout, one draw per record. Per-instance storage binding as in
  * metal_draw_instanced_from_storage. */
+/* vio_bind_storage_buffer's buffer at the vertex stage's SSBO slot (its GLSL
+ * binding, else the first SSBO) - the indirect draws read per-instance data there. */
+static void metal_bind_pending_storage_vs(void)
+{
+    vio_metal_buffer *sb = metal_pending_storage;
+    if (!sb || !sb->buffer || !metal_current_pipeline || !metal_current_pipeline->shader) return;
+    vio_metal_stage_res *vs = &metal_current_pipeline->shader->vs;
+    int idx = -1;
+    for (int i = 0; i < vs->buffer_count; i++) {
+        if (vs->buffers[i].kind == 1 && vs->buffers[i].binding == metal_pending_storage_binding) { idx = vs->buffers[i].msl_index; break; }
+    }
+    if (idx < 0) {
+        for (int i = 0; i < vs->buffer_count; i++) { if (vs->buffers[i].kind == 1) { idx = vs->buffers[i].msl_index; break; } }
+    }
+    if (idx >= 0) {
+        [vio_mtl.current_encoder setVertexBuffer:(__bridge id<MTLBuffer>)sb->buffer offset:0 atIndex:(NSUInteger)idx];
+    }
+}
+
 static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
 {
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_metal_buffer *args = (vio_metal_buffer *)args_buffer;
     if (!mesh || !args || !args->buffer || max_draws <= 0) return;
-    if (metal_tess_bound() || metal_gs_bound()) {
+    int mv = metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->view_count > 1;
+    if (metal_tess_bound() || metal_gs_bound() || mv) {
         int gs = metal_gs_bound();
         /* The tessellation / geometry kernels need the vertex and instance counts when they
          * are encoded, so the argument records are read on the CPU (the buffer
@@ -4281,6 +5414,30 @@ static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
                 uint32_t r[5];
                 memcpy(r, a + o, rec);
                 if (r[0] == 0 || r[1] == 0) continue;
+                if (mv) {
+                    /* Multiview: the GPU records hold the user's instance count;
+                     * issue the draw with it multiplied by the views. */
+                    if (!metal_prepare_draw(mesh->stride)) break;
+                    metal_bind_pending_storage_vs();
+                    metal_bind_mesh_vb(mesh->backend_vb);
+                    if (indexed) {
+                        [vio_mtl.current_encoder drawIndexedPrimitives:metal_current_pipeline->primitive
+                                                            indexCount:r[0]
+                                                             indexType:(mesh->index_bytes == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32)
+                                                           indexBuffer:(__bridge id<MTLBuffer>)tib->buffer
+                                                     indexBufferOffset:(NSUInteger)r[2] * (mesh->index_bytes == 2 ? 2 : 4)
+                                                         instanceCount:metal_mv_instances(r[1])
+                                                            baseVertex:(NSInteger)(int32_t)r[3]
+                                                          baseInstance:r[4]];
+                    } else {
+                        [vio_mtl.current_encoder drawPrimitives:metal_current_pipeline->primitive
+                                                    vertexStart:r[2]
+                                                    vertexCount:r[0]
+                                                  instanceCount:metal_mv_instances(r[1])
+                                                   baseInstance:r[3]];
+                    }
+                    continue;
+                }
                 void (*draw)(vio_metal_buffer *, int, int, int, vio_metal_buffer *, int, int, int, int,
                              const float *, int, int) = gs ? metal_draw_gs : metal_draw_tess;
                 if (indexed) {
@@ -4296,20 +5453,7 @@ static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
     }
     @autoreleasepool {
         if (!metal_prepare_draw(mesh->stride)) return;
-        vio_metal_buffer *sb = metal_pending_storage;
-        if (sb && sb->buffer) {
-            vio_metal_stage_res *vs = &metal_current_pipeline->shader->vs;
-            int idx = -1;
-            for (int i = 0; i < vs->buffer_count; i++) {
-                if (vs->buffers[i].kind == 1 && vs->buffers[i].binding == metal_pending_storage_binding) { idx = vs->buffers[i].msl_index; break; }
-            }
-            if (idx < 0) {
-                for (int i = 0; i < vs->buffer_count; i++) { if (vs->buffers[i].kind == 1) { idx = vs->buffers[i].msl_index; break; } }
-            }
-            if (idx >= 0) {
-                [vio_mtl.current_encoder setVertexBuffer:(__bridge id<MTLBuffer>)sb->buffer offset:0 atIndex:(NSUInteger)idx];
-            }
-        }
+        metal_bind_pending_storage_vs();
         metal_bind_mesh_vb(mesh->backend_vb);
         vio_metal_buffer *ib = (vio_metal_buffer *)mesh->backend_ib;
         id<MTLBuffer> argbuf = (__bridge id<MTLBuffer>)args->buffer;
@@ -4328,6 +5472,46 @@ static void metal_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
                                          indirectBuffer:argbuf
                                    indirectBufferOffset:(NSUInteger)(offset + (size_t)i * 16)];
             }
+        }
+    }
+}
+
+/* Mesh pipelines: x * y * z object (task) threadgroups, or mesh threadgroups
+ * when the pipeline has no task stage. */
+static int metal_mesh_bound(void)
+{
+    return metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->mesh;
+}
+
+static void metal_draw_mesh_tasks(uint32_t x, uint32_t y, uint32_t z)
+{
+    if (!metal_mesh_bound() || !x || !y || !z) return;
+    @autoreleasepool {
+        if (!metal_prepare_draw(0)) return;
+        vio_metal_shader *sh = metal_current_pipeline->shader;
+        const unsigned *ot = sh->object_tpg, *mt = sh->mesh_tpg;
+        [vio_mtl.current_encoder drawMeshThreadgroups:MTLSizeMake(x, y, z)
+                          threadsPerObjectThreadgroup:MTLSizeMake(ot[0], ot[1], ot[2])
+                            threadsPerMeshThreadgroup:MTLSizeMake(mt[0], mt[1], mt[2])];
+    }
+}
+
+static void metal_draw_mesh_tasks_indirect(void *args_buffer, int max_draws, size_t offset)
+{
+    vio_metal_buffer *args = (vio_metal_buffer *)args_buffer;
+    if (!metal_mesh_bound() || !args || !args->buffer || max_draws <= 0) return;
+    @autoreleasepool {
+        if (!metal_prepare_draw(0)) return;
+        vio_metal_shader *sh = metal_current_pipeline->shader;
+        const unsigned *ot = sh->object_tpg, *mt = sh->mesh_tpg;
+        id<MTLBuffer> argbuf = (__bridge id<MTLBuffer>)args->buffer;
+        for (int i = 0; i < max_draws; i++) {
+            size_t o = offset + (size_t)i * 12;   /* MTLDispatchThreadgroupsIndirectArguments */
+            if (o + 12 > args->size) break;
+            [vio_mtl.current_encoder drawMeshThreadgroupsWithIndirectBuffer:argbuf
+                                                       indirectBufferOffset:(NSUInteger)o
+                                                threadsPerObjectThreadgroup:MTLSizeMake(ot[0], ot[1], ot[2])
+                                                  threadsPerMeshThreadgroup:MTLSizeMake(mt[0], mt[1], mt[2])];
         }
     }
 }
@@ -4389,11 +5573,83 @@ static int metal_resolve_fs_texture(int slot, int *is_depth)
 {
     *is_depth = 0;
     vio_metal_pipeline *p = metal_current_pipeline;
-    if (p && p->shader && slot >= 0 && slot < p->shader->fs.texture_count) {
+    if (p && p->shader) {
+        /* A unit the fragment stage does not sample stays unbound: buffers and
+         * textures share one renumbered index space, so its raw number can be
+         * a real sampler's [[texture(n)]] (test 095, "stray-units"). */
+        if (slot < 0 || slot >= p->shader->fs.texture_count) return -1;
         *is_depth = p->shader->fs.textures[slot].is_depth;
         return p->shader->fs.textures[slot].msl_index;
     }
     return slot;
+}
+
+/* Mesh pipelines (OPEN-ITEMS-PLAN A30): the PHP sampler map lists the fragment
+ * samplers, then the mesh stage's new names, then the task stage's
+ * (vio_shader_merge_stage_samplers). Resolve `slot` to its name and bind the
+ * texture wherever the mesh ([[mesh]], vs table) or object stage declares it. */
+static void metal_bind_mesh_stage_texture(int slot, id<MTLTexture> tex, id<MTLSamplerState> smp, id<MTLSamplerState> cmp)
+{
+    vio_metal_pipeline *p = metal_current_pipeline;
+    if (!p || !p->shader || !p->shader->mesh || slot < 0) return;
+    const vio_metal_stage_res *stages[3] = { &p->shader->fs, &p->shader->vs, p->shader->object_fn ? &p->shader->obj : NULL };
+    const char *names[3 * VIO_METAL_MAX_RES];
+    int n = 0;
+    for (int s = 0; s < 3; s++) {
+        if (!stages[s]) continue;
+        for (int i = 0; i < stages[s]->texture_count; i++) {
+            const char *nm = stages[s]->textures[i].name;
+            int known = 0;
+            for (int k = 0; k < n && !known; k++) known = strcmp(names[k], nm) == 0;
+            if (!known) names[n++] = nm;
+        }
+    }
+    if (slot >= n) return;
+    for (int s = 1; s < 3; s++) {
+        if (!stages[s]) continue;
+        for (int i = 0; i < stages[s]->texture_count; i++) {
+            const vio_metal_res_texture *rt = &stages[s]->textures[i];
+            if (strcmp(rt->name, names[slot]) != 0 || rt->msl_index < 0 || rt->msl_index > 30) continue;
+            id<MTLSamplerState> use = rt->is_depth && cmp ? cmp : smp;
+            if (s == 1) {
+                [vio_mtl.current_encoder setMeshTexture:tex atIndex:(NSUInteger)rt->msl_index];
+                if (use) [vio_mtl.current_encoder setMeshSamplerState:use atIndex:(NSUInteger)rt->msl_index];
+            } else {
+                [vio_mtl.current_encoder setObjectTexture:tex atIndex:(NSUInteger)rt->msl_index];
+                if (use) [vio_mtl.current_encoder setObjectSamplerState:use atIndex:(NSUInteger)rt->msl_index];
+            }
+        }
+    }
+}
+
+/* Emulated geometry stage (A28): the sampler map lists the fragment samplers,
+ * then the geometry stage's new names, then the vertex stage's. Samplers the
+ * kernels declare are remembered by MSL index for metal_draw_gs. */
+static void metal_bind_gs_stage_texture(int slot, id<MTLTexture> tex, id<MTLSamplerState> smp, id<MTLSamplerState> cmp)
+{
+    vio_metal_pipeline *p = metal_current_pipeline;
+    if (!p || !p->shader || !p->shader->gs || slot < 0) return;
+    const vio_metal_stage_res *stages[3] = { &p->shader->fs, &p->shader->gs_gsk, &p->shader->gs_vsk };
+    const char *names[3 * VIO_METAL_MAX_RES];
+    int n = 0;
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < stages[s]->texture_count; i++) {
+            const char *nm = stages[s]->textures[i].name;
+            int known = 0;
+            for (int k = 0; k < n && !known; k++) known = strcmp(names[k], nm) == 0;
+            if (!known) names[n++] = nm;
+        }
+    }
+    if (slot >= n) return;
+    for (int s = 1; s < 3; s++) {
+        for (int i = 0; i < stages[s]->texture_count; i++) {
+            const vio_metal_res_texture *rt = &stages[s]->textures[i];
+            if (strcmp(rt->name, names[slot]) != 0 || rt->msl_index < 0 || rt->msl_index >= VIO_METAL_FS_SLOTS) continue;
+            int k = s == 2 ? 0 : 1;
+            metal_gs_tex[k][rt->msl_index] = tex;
+            metal_gs_smp[k][rt->msl_index] = rt->is_depth && cmp ? cmp : smp;
+        }
+    }
 }
 
 static void metal_bind_texture(void *texture, int slot)
@@ -4401,6 +5657,9 @@ static void metal_bind_texture(void *texture, int slot)
     vio_metal_texture *t = (vio_metal_texture *)texture;
     if (!t || !t->tex || !vio_mtl.current_encoder || slot < 0) return;
     @autoreleasepool {
+        if (metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->gs)
+            metal_bind_gs_stage_texture(slot, (__bridge id<MTLTexture>)t->tex,
+                                        (__bridge id<MTLSamplerState>)t->sampler, metal_texture_cmp_sampler(t));
         int is_depth = 0;
         int idx = metal_resolve_fs_texture(slot, &is_depth);
         if (idx < 0 || idx > 30) return;
@@ -4409,6 +5668,9 @@ static void metal_bind_texture(void *texture, int slot)
         [vio_mtl.current_encoder setFragmentTexture:(__bridge id<MTLTexture>)t->tex atIndex:(NSUInteger)idx];
         if (s) [vio_mtl.current_encoder setFragmentSamplerState:s atIndex:(NSUInteger)idx];
         metal_fs_shadow_set(idx, (__bridge id<MTLTexture>)t->tex, s);
+        if (metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->mesh)
+            metal_bind_mesh_stage_texture(slot, (__bridge id<MTLTexture>)t->tex,
+                                          (__bridge id<MTLSamplerState>)t->sampler, metal_texture_cmp_sampler(t));
     }
 }
 
@@ -4594,6 +5856,122 @@ static int metal_update_texture(void *tex_obj, const void *pixels, int x, int y,
 /* Build the mip chain of an RT colour texture / texture / cubemap. Inside a
  * frame the open pass is closed first so the blit is ordered after the draws
  * that produced level 0, then reopened with Load. */
+/* Depth mip chain (A26, blind - the macOS CI is the check): each level is the
+ * max / min of the 2x2 texels below (odd sizes fold the extra column / row
+ * into the last texel), written as [[depth(any)]] by a full-screen triangle in
+ * one render pass per level; the source is a single-level view of the level
+ * below. Mipmapped depth targets are Depth32Float (no stencil plane). */
+static const char *metal_dmip_msl =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VOut { float4 pos [[position]]; };\n"
+    "struct P { int4 sizes; int4 mode; };\n"
+    "struct FOut { float depth [[depth(any)]]; };\n"
+    "vertex VOut vio_dmip_vs(uint vid [[vertex_id]]) {\n"
+    "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+    "    VOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;\n"
+    "}\n"
+    "fragment FOut vio_dmip_fs(VOut in [[stage_in]], depth2d<float> src [[texture(0)]], constant P& p [[buffer(0)]]) {\n"
+    "    int2 o = int2(in.pos.xy);\n"
+    "    int2 n = int2((o.x == p.sizes.z - 1 && (p.sizes.x & 1) == 1 && p.sizes.x > 1) ? 3 : 2,\n"
+    "                  (o.y == p.sizes.w - 1 && (p.sizes.y & 1) == 1 && p.sizes.y > 1) ? 3 : 2);\n"
+    "    float d = p.mode.x == 0 ? 0.0 : 1.0;\n"
+    "    for (int y = 0; y < 3; y++) for (int x = 0; x < 3; x++) {\n"
+    "        if (x >= n.x || y >= n.y) continue;\n"
+    "        int2 c = min(o * 2 + int2(x, y), p.sizes.xy - 1);\n"
+    "        float s = src.read(uint2(c), 0);\n"
+    "        d = p.mode.x == 0 ? max(d, s) : min(d, s);\n"
+    "    }\n"
+    "    FOut r; r.depth = d; return r;\n"
+    "}\n";
+
+static id<MTLRenderPipelineState> metal_dmip_pso = nil;
+static id<MTLDepthStencilState>   metal_dmip_dss = nil;
+static id<MTLDevice>              metal_dmip_device = nil;
+
+static int metal_generate_depth_mips(vio_render_target_object *rt)
+{
+    if (!rt->metal_depth_texture || rt->mip_levels < 2) return -1;
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)rt->metal_depth_texture;
+    if (tex.mipmapLevelCount < 2) return -1;
+    if (metal_dmip_device != vio_mtl.device || !metal_dmip_pso) {
+        metal_dmip_pso = nil;
+        metal_dmip_dss = nil;
+        metal_dmip_device = vio_mtl.device;
+        char *err = NULL;
+        id<MTLLibrary> lib = metal_build_library(metal_dmip_msl, &err);
+        if (!lib) {
+            php_error_docref(NULL, E_WARNING, "Metal: depth mip shader: %s", err ? err : "compile failed");
+            free(err);
+            return -1;
+        }
+        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = [lib newFunctionWithName:@"vio_dmip_vs"];
+        pd.fragmentFunction = [lib newFunctionWithName:@"vio_dmip_fs"];
+        pd.depthAttachmentPixelFormat = tex.pixelFormat;
+        if (tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) pd.stencilAttachmentPixelFormat = tex.pixelFormat;
+        NSError *e = nil;
+        metal_dmip_pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:pd error:&e];
+        MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = YES;
+        metal_dmip_dss = [vio_mtl.device newDepthStencilStateWithDescriptor:dd];
+        if (!metal_dmip_pso || !metal_dmip_dss) {
+            php_error_docref(NULL, E_WARNING, "Metal: depth mip pipeline: %s", e ? e.localizedDescription.UTF8String : "failed");
+            metal_dmip_pso = nil;
+            return -1;
+        }
+    }
+    int in_frame = vio_mtl.current_cmd_buf != nil;
+    id<MTLCommandBuffer> cb = in_frame ? vio_mtl.current_cmd_buf : metal_new_command_buffer();
+    if (in_frame && vio_mtl.current_encoder) {
+        [vio_mtl.current_encoder endEncoding];
+        vio_mtl.current_encoder = nil;
+    }
+    for (int l = 1; l < rt->mip_levels; l++) {
+        int sw = rt->width >> (l - 1), sh = rt->height >> (l - 1), dw = rt->width >> l, dh = rt->height >> l;
+        if (sw < 1) sw = 1;
+        if (sh < 1) sh = 1;
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        id<MTLTexture> src = [tex newTextureViewWithPixelFormat:tex.pixelFormat textureType:MTLTextureType2D
+                                                         levels:NSMakeRange((NSUInteger)(l - 1), 1) slices:NSMakeRange(0, 1)];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.depthAttachment.texture = tex;
+        rp.depthAttachment.level = (NSUInteger)l;
+        rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        if (tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+            rp.stencilAttachment.texture = tex;
+            rp.stencilAttachment.level = (NSUInteger)l;
+            rp.stencilAttachment.loadAction = MTLLoadActionDontCare;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        if (!src || !enc) {
+            if (enc) [enc endEncoding];
+            break;
+        }
+        MTLViewport vp = { 0.0, 0.0, (double)dw, (double)dh, 0.0, 1.0 };
+        [enc setViewport:vp];
+        [enc setRenderPipelineState:metal_dmip_pso];
+        [enc setDepthStencilState:metal_dmip_dss];
+        [enc setCullMode:MTLCullModeNone];
+        int32_t pc[8] = { sw, sh, dw, dh, rt->depth_reduction == VIO_DEPTH_REDUCE_MIN ? 1 : 0, 0, 0, 0 };
+        [enc setFragmentBytes:pc length:sizeof(pc) atIndex:0];
+        [enc setFragmentTexture:src atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+    }
+    if (in_frame) {
+        metal_open_encoder(/*load_clear=*/0);
+    } else {
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    return 0;
+}
+
 static int metal_generate_mipmaps(void *obj, int kind)
 {
     if (!obj || !vio_mtl.device) return -1;
@@ -4602,6 +5980,7 @@ static int metal_generate_mipmaps(void *obj, int kind)
         switch (kind) {
             case 0: {
                 vio_render_target_object *rt = (vio_render_target_object *)obj;
+                if (rt->backend_type == VIO_RT_BACKEND_METAL && rt->depth_only) return metal_generate_depth_mips(rt);
                 if (rt->backend_type != VIO_RT_BACKEND_METAL || !rt->metal_color_texture || rt->layers > 1) return -1;
                 tex = (__bridge id<MTLTexture>)rt->metal_color_texture;
                 break;
@@ -4670,6 +6049,7 @@ void vio_metal_bind_cubemap(void *cubemap_obj, int slot)
         [vio_mtl.current_encoder setFragmentTexture:ctex atIndex:(NSUInteger)idx];
         if (csmp) [vio_mtl.current_encoder setFragmentSamplerState:csmp atIndex:(NSUInteger)idx];
         metal_fs_shadow_set(idx, ctex, csmp);
+        metal_bind_mesh_stage_texture(slot, ctex, csmp, csmp);
     }
 }
 
@@ -4837,6 +6217,8 @@ typedef struct _vio_metal_compute_pipeline {
     /* local_size_{x,y,z} reflected from the SPIR-V ExecutionMode so 2D/3D
      * kernels dispatch with the right threadsPerThreadgroup (0 => 64,1,1). */
     unsigned                  local_size[3];
+    int                       uses_as;   /* the kernel declares an acceleration structure (ray query) */
+    int                       uses_bindless;   /* reads the bindless table (metal_bindless_bind_compute) */
 } vio_metal_compute_pipeline;
 
 #ifdef HAVE_SPIRV_CROSS
@@ -4847,7 +6229,7 @@ typedef struct _vio_metal_compute_pipeline {
  * (the explicit binding we installed for it, canonical 2). */
 static char *metal_cs_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
                                    int *params_index_out, unsigned local_size_out[3],
-                                   char **error_msg)
+                                   int *uses_bindless_out, char **error_msg)
 {
     spvc_context  ctx = NULL;
     spvc_parsed_ir ir = NULL;
@@ -4856,6 +6238,7 @@ static char *metal_cs_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
     char         *output = NULL;
 
     if (params_index_out) *params_index_out = 2; /* canonical default */
+    if (uses_bindless_out) *uses_bindless_out = 0;
 
     if (spvc_context_create(&ctx) != SPVC_SUCCESS) {
         if (error_msg) *error_msg = strdup("Failed to create SPIRV-Cross context");
@@ -4884,6 +6267,14 @@ static char *metal_cs_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
         }
     }
 
+    {
+        spvc_compiler_options cs_opts = NULL;
+        if (spvc_compiler_create_compiler_options(compiler, &cs_opts) == SPVC_SUCCESS) {
+            metal_msl_apply_target(cs_opts, METAL_MSL_FLOOR);   /* the ladder rung (was SPIRV-Cross's default 1.2) */
+            spvc_compiler_install_compiler_options(compiler, cs_opts);
+        }
+    }
+
     /* Install explicit MSL resource bindings for (set 0, binding N) ->
      * msl_buffer N / msl_texture N. This removes the dependency on SPIRV-Cross's
      * automatic index assignment entirely: whatever the shader declares at GLSL
@@ -4901,6 +6292,15 @@ static char *metal_cs_spirv_to_msl(const uint32_t *spirv, size_t spirv_size,
         rb.msl_texture = b;   /* unused for buffers; set for completeness */
         rb.msl_sampler = b;
         spvc_compiler_msl_add_resource_binding(compiler, &rb);
+    }
+
+    /* The bindless table (Set 1..3 argument buffers), as in the graphics stages. */
+    {
+        spvc_resources resources = NULL;
+        if (spvc_compiler_create_shader_resources(compiler, &resources) == SPVC_SUCCESS) {
+            int uses = metal_msl_bindless(compiler, resources, SpvExecutionModelGLCompute);
+            if (uses_bindless_out) *uses_bindless_out = uses;
+        }
     }
 
     if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS) {
@@ -4990,7 +6390,8 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
 
     int params_index = 2;
     unsigned local_size[3] = {0, 0, 0};
-    char *msl = metal_cs_spirv_to_msl(spirv, spirv_size, &params_index, local_size, &err);
+    int uses_bindless = 0;
+    char *msl = metal_cs_spirv_to_msl(spirv, spirv_size, &params_index, local_size, &uses_bindless, &err);
     if (free_spirv) free(spirv);
     if (!msl) {
         php_error_docref(NULL, E_WARNING, "Metal: CS SPIR-V->MSL failed: %s",
@@ -5001,14 +6402,21 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
 
     vio_metal_compute_pipeline *cp = NULL;
 
+    /* 'msl' override (A17): the caller's kernel with the GLSL kernel's
+     * reflection (local_size, params index, binding N = buffer / texture N). */
+    if (desc->compute_msl) {
+        free(msl);
+        msl = strdup(desc->compute_msl);
+        if (!msl) return NULL;
+    }
+    int uses_as = msl && strstr(msl, "acceleration_structure") != NULL;
     @autoreleasepool {
         NSString *msl_src = [NSString stringWithUTF8String:msl];
         free(msl);
         msl = NULL;
 
         NSError *nerr = nil;
-        MTLCompileOptions *opts = [MTLCompileOptions new];
-        opts.languageVersion = MTLLanguageVersion2_0;
+        MTLCompileOptions *opts = metal_compile_options();
         id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:msl_src options:opts error:&nerr];
         if (!lib) {
             php_error_docref(NULL, E_WARNING, "Metal: CS MSL compile failed: %s",
@@ -5023,8 +6431,7 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
         }
 
         NSError *perr = nil;
-        id<MTLComputePipelineState> pso =
-            [vio_mtl.device newComputePipelineStateWithFunction:fn error:&perr];
+        id<MTLComputePipelineState> pso = metal_archived_compute_pso(fn, &perr);
         if (!pso) {
             php_error_docref(NULL, E_WARNING, "Metal: newComputePipelineStateWithFunction failed: %s",
                              perr ? [[perr localizedDescription] UTF8String] : "unknown");
@@ -5038,6 +6445,8 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
         }
         cp->pso          = (void *)CFBridgingRetain(pso);
         cp->params_index = params_index;
+        cp->uses_as      = uses_as;
+        cp->uses_bindless = uses_bindless;
         memcpy(cp->local_size, local_size, sizeof(local_size));
     }
 
@@ -5172,6 +6581,18 @@ static void metal_dispatch_compute(vio_compute_cmd *cmd)
         id<MTLComputeCommandEncoder> enc = [cbuf computeCommandEncoder];
         [enc setComputePipelineState:pso];
 
+        /* Ray query: the bound acceleration structure at its GLSL binding (the
+         * compute remap pins binding n to [[buffer(n)]]). */
+        if (cp->uses_as && metal_bound_as && metal_bound_as->tlas) {
+            if (@available(macOS 11.0, iOS 14.0, *)) {
+                [enc setAccelerationStructure:(__bridge id<MTLAccelerationStructure>)metal_bound_as->tlas
+                                atBufferIndex:(NSUInteger)metal_bound_as_binding];
+                metal_use_as(nil, enc, metal_bound_as);
+            }
+        }
+
+        if (cp->uses_bindless) metal_bindless_bind_compute(enc);
+
         /* Bind each storage buffer at its MSL buffer index (== GLSL binding,
          * guaranteed by the explicit resource-binding remap at compile time). */
         for (int i = 0; i < cp->binding_count; i++) {
@@ -5241,6 +6662,16 @@ static size_t metal_read_buffer(void *backend_buffer, void *out, size_t size)
 {
     vio_metal_compute_buffer *buf = (vio_metal_compute_buffer *)backend_buffer;
     if (!buf || !buf->buffer || !out || size == 0) return 0;
+    if (metal_fs_storage_used) {
+        /* Draws may have written it (A15): the frame so far, or every committed one. */
+        metal_fs_storage_used = 0;
+        if (vio_mtl.current_cmd_buf) metal_flush_for_readback();
+        else @autoreleasepool {
+            id<MTLCommandBuffer> cb = [vio_mtl.command_queue commandBuffer];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+    }
     metal_compute_wait();   /* async dispatches must have landed before the memcpy */
 
     size_t n = size < buf->size ? size : buf->size;
@@ -5257,6 +6688,47 @@ static double metal_gpu_frame_time(void)
     return vio_mtl.initialized && vio_mtl.last_gpu_ms > 0.0 ? vio_mtl.last_gpu_ms : -1.0;
 }
 
+static int metal_gpu_mark(const char *name)
+{
+    if (!vio_mtl.initialized || !vio_mtl.current_cmd_buf) return 0;
+    @autoreleasepool {
+        metal_mark_frame *mf = (metal_mark_frame *)vio_mtl.cur_marks;
+        if (!mf) {
+            mf = calloc(1, sizeof(*mf));
+            if (!mf) return 0;
+            atomic_init(&mf->remaining, 1);   /* the frame's last buffer (metal_present) */
+            vio_mtl.cur_marks = mf;
+        }
+        int i = vio_gpu_mark_push(&mf->names, name);
+        if (i < 0) return 0;
+        if (vio_mtl.current_encoder) {
+            [vio_mtl.current_encoder endEncoding];
+            vio_mtl.current_encoder = nil;
+        }
+        atomic_fetch_add(&mf->remaining, 1);
+        [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if (i == 0) mf->start = done.GPUStartTime;
+            mf->begin[i] = done.GPUStartTime;
+            mf->end[i] = done.GPUEndTime;
+            metal_marks_done(mf);
+        }];
+        [vio_mtl.current_cmd_buf commit];
+        vio_mtl.current_cmd_buf = metal_new_command_buffer();
+        metal_open_encoder(/*load_clear=*/0);
+    }
+    return 1;
+}
+
+static const vio_gpu_mark_result *metal_gpu_marks(void)
+{
+    int valid;
+    os_unfair_lock_lock(&metal_marks_lock);
+    valid = metal_marks_valid;
+    if (valid) metal_marks_snapshot = metal_marks_result;
+    os_unfair_lock_unlock(&metal_marks_lock);
+    return vio_mtl.initialized && valid ? &metal_marks_snapshot : NULL;
+}
+
 /* vio_swapchain_info(): drawables, frames in flight (frame_latency semaphore),
  * HDR10 layer. */
 static void metal_swapchain_info(vio_swapchain_info *out)
@@ -5269,20 +6741,194 @@ static void metal_swapchain_info(vio_swapchain_info *out)
     out->format        = vio_mtl.swap_format == MTLPixelFormatRGB10A2Unorm ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
 }
 
+/* VIO_FEATURE_COOPERATIVE_MATRIX: simdgroup_matrix comes in 8x8 half and
+ * float; simdgroup_multiply_accumulate also takes half A / B with a float
+ * accumulator. */
+static int metal_cooperative_matrix_shapes(vio_coopmat_shape *out, int max)
+{
+    static const vio_coopmat_type types[][2] = {
+        { VIO_COOPMAT_FLOAT16, VIO_COOPMAT_FLOAT16 },
+        { VIO_COOPMAT_FLOAT16, VIO_COOPMAT_FLOAT32 },
+        { VIO_COOPMAT_FLOAT32, VIO_COOPMAT_FLOAT32 },
+    };
+    if (!vio_mtl.caps.cooperative_matrix || !out) return 0;
+    int n = 0;
+    for (int i = 0; i < 3 && n < max; i++, n++) {
+        out[n].m = out[n].n = out[n].k = 8;
+        out[n].a = out[n].b = types[i][0];
+        out[n].c = out[n].result = types[i][1];
+    }
+    return n;
+}
+
+/* vio_adapters (A6): every Metal device (MTLCopyAllDevices on macOS). */
+static int metal_enumerate_adapters(vio_adapter_info *out, int max)
+{
+    int n = 0;
+    @autoreleasepool {
+#if TARGET_OS_OSX
+        NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+#else
+        id<MTLDevice> one = MTLCreateSystemDefaultDevice();
+        NSArray<id<MTLDevice>> *devices = one ? @[ one ] : @[];
+#endif
+        for (id<MTLDevice> dev in devices) {
+            if (n >= max) break;
+            vio_adapter_info *a = &out[n++];
+            memset(a, 0, sizeof(*a));
+            snprintf(a->name, sizeof(a->name), "%s", dev.name.UTF8String ? dev.name.UTF8String : "Metal");
+            a->vendor_id = strstr(a->name, "AMD") ? 0x1002 : strstr(a->name, "Intel") ? 0x8086
+                         : strstr(a->name, "NVIDIA") ? 0x10DE : 0x106B;
+            a->device_type = dev.hasUnifiedMemory ? "integrated" : "discrete";
+            a->vram_bytes = (uint64_t)dev.recommendedMaxWorkingSetSize;
+            memset(&a->features, 0, sizeof(a->features));
+            vio_featset_add(&a->features, VIO_FEATURE_COMPUTE);
+            vio_featset_add(&a->features, VIO_FEATURE_3D_PIPELINE);
+            vio_featset_add(&a->features, VIO_FEATURE_TESSELLATION);
+            vio_featset_add(&a->features, VIO_FEATURE_INDIRECT_DRAW);
+            if ([dev respondsToSelector:@selector(supportsRaytracing)] && dev.supportsRaytracing)
+                vio_featset_add(&a->features, VIO_FEATURE_RAY_QUERY);
+            if ([dev supportsFamily:MTLGPUFamilyApple2])
+                vio_featset_add(&a->features, VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
+            if ([dev supportsFamily:MTLGPUFamilyApple7] || [dev supportsFamily:MTLGPUFamilyMac2])
+            {
+                vio_featset_add(&a->features, VIO_FEATURE_MESH_SHADER);
+                vio_featset_add(&a->features, VIO_FEATURE_SUBGROUP);
+            }
+        }
+    }
+    return n;
+}
+
+/* vio_backend_info(): the version ladder rung and the capability set. */
+static int metal_describe(vio_backend_description *out)
+{
+    if (!vio_mtl.initialized || !vio_mtl.device || !out) return -1;
+    static const char *apple_names[] = { "apple1", "apple2", "apple3", "apple4", "apple5", "apple6",
+                                         "apple7", "apple8", "apple9", "apple10", "apple11" };
+    const vio_metal_caps *c = &vio_mtl.caps;
+    out->api = vio_mtl.api_name;
+    out->device = vio_mtl.gpu_name;
+    out->shading_language = "MSL";
+    out->shading_language_version = c->msl_version;
+    out->shading_language_max = c->msl_max;
+    out->family_count = 0;
+    for (int a = 1; a <= 11; a++) {
+        if (metal_has_family(1000 + a)) out->families[out->family_count++] = apple_names[a - 1];
+    }
+    if (metal_has_family(2001)) out->families[out->family_count++] = "mac1";
+    if (c->mac2)                out->families[out->family_count++] = "mac2";
+    if (metal_has_family(3001)) out->families[out->family_count++] = "common1";
+    if (metal_has_family(3002)) out->families[out->family_count++] = "common2";
+    if (metal_has_family(3003)) out->families[out->family_count++] = "common3";
+    if (c->metal3)              out->families[out->family_count++] = "metal3";
+    if (c->metal4)              out->families[out->family_count++] = "metal4";
+#define CAP(n) do { out->cap_names[out->cap_count] = #n; out->cap_values[out->cap_count++] = c->n; } while (0)
+    out->cap_count = 0;
+    CAP(tessellation); CAP(layered_vertex); CAP(quad_group); CAP(simd_group);
+    CAP(barycentrics); CAP(vertex_amplification); CAP(argument_buffers_tier2);
+    CAP(raytracing); CAP(function_pointers); CAP(raytracing_from_render); CAP(cooperative_matrix);
+    CAP(mesh_shaders); CAP(atomic64); CAP(tensors); CAP(bindless);
+    CAP(rasterization_rate_map); CAP(bc_texture_compression); CAP(unified_memory);
+#undef CAP
+    /* Metal has no PCI vendor id: Intel Macs carry AMD / Intel GPUs. */
+    const char *nm = vio_mtl.gpu_name;
+    out->vendor_id = strstr(nm, "AMD") ? 0x1002 : strstr(nm, "Intel") ? 0x8086
+                   : strstr(nm, "NVIDIA") ? 0x10DE : 0x106B;
+    out->driver = "";
+    out->device_type = c->unified_memory ? "integrated" : "discrete";
+    const char *unused = NULL;
+    vio_metal_gpu_info(&unused, &out->vram_bytes);
+    return 0;
+}
+
+/* vio_feature_info: features metal_supports_feature reports that Metal has no
+ * stage or call for. */
+static const char *metal_feature_emulation(vio_feature f)
+{
+    switch (f) {
+    case VIO_FEATURE_GEOMETRY:
+    case VIO_FEATURE_GEOMETRY_INSTANCING:
+        return "compute kernels (vertex + geometry) and a pass-through vertex function";
+    case VIO_FEATURE_MULTIVIEW:
+        return "instancing, one instance per view ([[render_target_array_index]])";
+    case VIO_FEATURE_RAY_QUERY:
+        /* Hardware ray tracing from Apple9 on; older GPUs run Metal's own
+         * software intersector behind the same API. */
+        return vio_mtl.caps.apple_family >= 9 ? NULL : "Metal software intersector (no ray tracing hardware)";
+    default:
+        return NULL;
+    }
+}
+
 static int metal_supports_feature(vio_feature f)
 {
     switch (f) {
     case VIO_FEATURE_COMPUTE:
     case VIO_FEATURE_3D_PIPELINE:
     case VIO_FEATURE_VERTEX_STORAGE:
+    case VIO_FEATURE_FRAGMENT_STORAGE:
+    case VIO_FEATURE_SAMPLER_FEEDBACK_GLSL:
     case VIO_FEATURE_STORAGE_IMAGE:
-    case VIO_FEATURE_TESSELLATION:  /* vertex + control kernels, then drawPatches (metal_draw_tess) */
 #ifdef HAVE_SPIRV_CROSS
         /* Every shader stage reaches the GPU through GLSL -> SPIR-V -> MSL, so
          * compute, the 3D draw pipeline and the vertex-stage SSBO path (Path B)
          * all hinge on SPIRV-Cross. Without it the engine stays on the CPU /
          * OpenGL fallbacks. */
         return 1;
+#else
+        return 0;
+#endif
+    case VIO_FEATURE_SHADER_FLOAT16:
+        /* float16_t -> MSL half, native on every Metal GPU. */
+#ifdef HAVE_SPIRV_CROSS
+        return 1;
+#else
+        return 0;
+#endif
+    case VIO_FEATURE_BASE_VERTEX:
+        /* [[base_vertex]] / [[base_instance]] (Mac2 / Apple3); the indirect
+         * argument records carry both. Not in the emulated GS / tessellation
+         * pipelines (their vertex stage runs as a kernel). */
+        return vio_mtl.caps.mac2 || vio_mtl.caps.apple_family >= 3;
+    case VIO_FEATURE_COMPUTE_DERIVATIVES:
+        /* Kernel functions have no dfdx / dfdy (the driver rejects them). */
+        return 0;
+    case VIO_FEATURE_RAY_QUERY:
+        /* Ray queries in compute (MSL 2.3) and fragment functions (2.4, ray
+         * tracing from render pipelines); hardware RT on Apple9+, else emulated. */
+#ifdef HAVE_SPIRV_CROSS
+        return vio_mtl.caps.raytracing && vio_mtl.caps.raytracing_from_render;
+#else
+        return 0;
+#endif
+    case VIO_FEATURE_ATOMIC64:
+        /* Metal has 64-bit atomic min / max only (atomic64 cap, MSL 3.1) and
+         * SPIRV-Cross refuses 64-bit atomics for MSL: not offered. */
+        return 0;
+    case VIO_FEATURE_SUBGROUP_QUAD:
+        /* quad_shuffle / quad_broadcast in fragment functions (Mac2 / Apple4, MSL 2.1). */
+        return vio_mtl.caps.quad_group;
+    case VIO_FEATURE_BARYCENTRICS:
+        /* [[barycentric_coord]] (MSL 2.2, supportsShaderBarycentricCoordinates). */
+        return vio_mtl.caps.barycentrics;
+    case VIO_FEATURE_SUBGROUP:
+        /* GL_KHR_shader_subgroup_* -> SPIRV-Cross simd_* / quad_* functions
+         * in compute and fragment stages (MSL 2.2+, SIMD-group reductions on
+         * Mac2 / Apple7). */
+        return vio_mtl.caps.simd_group;
+    case VIO_FEATURE_TESSELLATION:
+        /* vertex + control kernels, then drawPatches (metal_draw_tess); the
+         * [[patch]] functions need MSL 2.1 (version ladder). */
+        return vio_mtl.caps.tessellation;
+    case VIO_FEATURE_COOPERATIVE_MATRIX:
+        /* coopmat -> simdgroup_matrix (SPIRV-Cross, 8x8 only, MSL 3.1, Apple7+). */
+        return vio_mtl.caps.cooperative_matrix;
+    case VIO_FEATURE_MESH_SHADER:
+        /* MTLMeshRenderPipelineDescriptor + drawMeshThreadgroups: Metal 3 on
+         * Apple7 / Mac2, MSL 3.0 rung. */
+#ifdef HAVE_SPIRV_CROSS
+        return vio_mtl.caps.mesh_shaders;
 #else
         return 0;
 #endif
@@ -5336,6 +6982,12 @@ static int metal_supports_feature(vio_feature f)
         return 1;
     case VIO_FEATURE_TEXTURE_ARRAY: /* MTLTextureType2DArray */
         return 1;
+    case VIO_FEATURE_DEPTH_MIPMAPS: /* metal_generate_depth_mips (A26) */
+        return 1;
+    case VIO_FEATURE_RASTER_RATE_MAP: /* metal_rt_rate_map_setup + metal_rrm_resolve (A16) */
+        return vio_mtl.caps.rasterization_rate_map;
+    case VIO_FEATURE_TEXTURE_COMPRESSION_ASTC: /* ASTC LDR on Apple GPUs (Apple2+), not on Intel / AMD Macs */
+        return vio_mtl.caps.apple_family >= 2;
     case VIO_FEATURE_TEXTURE_COMPRESSION_BC: /* BC1-BC7 pixel formats (macOS) */
         return metal_supports_bc();
     case VIO_FEATURE_STENCIL:
@@ -5361,8 +7013,29 @@ static int metal_supports_feature(vio_feature f)
 #else
         return 0;
 #endif
-    case VIO_FEATURE_RAYTRACING:
+    case VIO_FEATURE_BINDLESS:
+        /* Texture handles (gpuResourceID) in a Set 1 argument buffer: Metal3 +
+         * argument buffers tier 2, MSL 3.0 (caps.bindless). */
+#ifdef HAVE_SPIRV_CROSS
+        return vio_mtl.caps.bindless;
+#else
+        return 0;
+#endif
     case VIO_FEATURE_MULTIVIEW:
+        /* SPIRV-Cross's instancing emulation writes [[render_target_array_index]]
+         * from the vertex stage (Mac2 / Apple5). */
+#ifdef HAVE_SPIRV_CROSS
+        return vio_mtl.caps.layered_vertex;
+#else
+        return 0;
+#endif
+    case VIO_FEATURE_RAYTRACING:
+        /* No ray tracing pipeline: Metal has no raygen / miss / hit stages
+         * (an intersector in a compute kernel plus intersection function
+         * tables), and SPIRV-Cross cannot translate traceRayEXT or the
+         * payload / hit attribute storage classes to MSL. Ray queries
+         * (VIO_FEATURE_RAY_QUERY) cover inline tracing. */
+        return 0;
     default:
         return 0;
     }
@@ -5411,7 +7084,122 @@ static int metal_upload_font_atlas(void *font_obj, int width, int height,
     return font->atlas_texture ? 0 : -1;
 }
 
+/* Glyph atlas filled on demand (A33): replaceRegion on the R8 atlas texture. */
+static int metal_update_font_atlas(void *font_obj, const unsigned char *r8, int x, int y, int w, int h)
+{
+    vio_font_object *font = (vio_font_object *)font_obj;
+    if (!font || !r8 || font->atlas_texture == 0 || font->atlas_texture >= VIO_METAL_MAX_TEXTURES) return -1;
+    @autoreleasepool {
+        id<MTLTexture> tex = metal_textures[font->atlas_texture];
+        if (!tex) return -1;
+        [tex replaceRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0 withBytes:r8 bytesPerRow:w];
+    }
+    return 0;
+}
+
 /* ── Backend registration ────────────────────────────────────────── */
+
+/* ── MetalFX spatial upscaling (UPSCALE-PLAN phase 3) ─────────────── */
+
+#if defined(HAVE_METALFX) && __has_include(<MetalFX/MetalFX.h>)
+#import <MetalFX/MetalFX.h>
+#define VIO_METAL_HAS_FX 1
+static id             metal_fx_scaler;   /* id<MTLFXSpatialScaler> for metal_fx_key */
+static NSUInteger     metal_fx_key[6];   /* in w, h, format, out w, h, format */
+static id<MTLTexture> metal_fx_out;      /* when the target lacks the scaler's output usage */
+#endif
+
+static void metal_upscale_release(void)
+{
+#ifdef VIO_METAL_HAS_FX
+    metal_fx_scaler = nil;
+    metal_fx_out = nil;
+    memset(metal_fx_key, 0, sizeof(metal_fx_key));
+#endif
+}
+
+static const char *metal_upscale_method(int mode)
+{
+#ifdef VIO_METAL_HAS_FX
+    if (mode == VIO_UPSCALE_SPATIAL && vio_mtl.device) {
+        if (@available(macOS 13.0, iOS 16.0, *)) {
+            if ([MTLFXSpatialScalerDescriptor supportsDevice:vio_mtl.device]) return "metalfx";
+        }
+    }
+#endif
+    (void)mode;
+    return NULL;
+}
+
+/* The scaler runs between render passes: the open encoder ends, MetalFX (and a
+ * copy when the target texture lacks the scaler's output usage) is encoded
+ * into the frame's command buffer, and the bound target opens again with Load. */
+static int metal_upscale_native(void *src_texture, void *dst_rt_ptr, int mode)
+{
+#ifdef VIO_METAL_HAS_FX
+    if (!metal_upscale_method(mode) || !src_texture || !dst_rt_ptr || !vio_mtl.current_cmd_buf) return -1;
+    if (@available(macOS 13.0, iOS 16.0, *)) {
+        @autoreleasepool {
+            vio_render_target_object *rt = (vio_render_target_object *)dst_rt_ptr;
+            vio_metal_texture *st = (vio_metal_texture *)src_texture;
+            if (rt->backend_type != VIO_RT_BACKEND_METAL || !rt->metal_color_texture || rt->metal_msaa_color_texture
+                || rt->is_cube || rt->layers > 1 || !st->tex) return -1;
+            id<MTLTexture> in  = (__bridge id<MTLTexture>)st->tex;
+            id<MTLTexture> dst = (__bridge id<MTLTexture>)rt->metal_color_texture;
+            NSUInteger key[6] = { in.width, in.height, (NSUInteger)in.pixelFormat, dst.width, dst.height, (NSUInteger)dst.pixelFormat };
+            if (!metal_fx_scaler || memcmp(key, metal_fx_key, sizeof(key)) != 0) {
+                MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
+                d.inputWidth          = in.width;
+                d.inputHeight         = in.height;
+                d.outputWidth         = dst.width;
+                d.outputHeight        = dst.height;
+                d.colorTextureFormat  = in.pixelFormat;
+                d.outputTextureFormat = dst.pixelFormat;
+                d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+                id<MTLFXSpatialScaler> made = [d newSpatialScalerWithDevice:vio_mtl.device];
+                if (!made) return -1;
+                metal_fx_scaler = made;
+                metal_fx_out = nil;
+                memcpy(metal_fx_key, key, sizeof(key));
+            }
+            id<MTLFXSpatialScaler> s = (id<MTLFXSpatialScaler>)metal_fx_scaler;
+            if ((in.usage & s.colorTextureUsage) != s.colorTextureUsage) return -1;
+            id<MTLTexture> out = dst;
+            if ((dst.usage & s.outputTextureUsage) != s.outputTextureUsage || dst.storageMode != MTLStorageModePrivate) {
+                if (!metal_fx_out) {
+                    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat
+                                                                                                  width:dst.width
+                                                                                                 height:dst.height
+                                                                                              mipmapped:NO];
+                    td.usage = s.outputTextureUsage;
+                    td.storageMode = MTLStorageModePrivate;
+                    metal_fx_out = [vio_mtl.device newTextureWithDescriptor:td];
+                    if (!metal_fx_out) return -1;
+                }
+                out = metal_fx_out;
+            }
+            if (vio_mtl.current_encoder) {
+                [vio_mtl.current_encoder endEncoding];
+                vio_mtl.current_encoder = nil;
+            }
+            s.colorTexture       = in;
+            s.outputTexture      = out;
+            s.inputContentWidth  = in.width;
+            s.inputContentHeight = in.height;
+            [s encodeToCommandBuffer:vio_mtl.current_cmd_buf];
+            if (out != dst) {
+                id<MTLBlitCommandEncoder> blit = [vio_mtl.current_cmd_buf blitCommandEncoder];
+                [blit copyFromTexture:out toTexture:dst];
+                [blit endEncoding];
+            }
+            metal_open_encoder(/*load_clear=*/0);
+            return 0;
+        }
+    }
+#endif
+    (void)src_texture; (void)dst_rt_ptr; (void)mode;
+    return -1;
+}
 
 static const vio_backend metal_backend = {
     .name              = "metal",
@@ -5445,8 +7233,19 @@ static const vio_backend metal_backend = {
     .set_viewports     = metal_set_viewports,
     .dispatch_compute  = metal_dispatch_compute,
     .supports_feature  = metal_supports_feature,
+    .apply_mesh_layout = metal_apply_mesh_layout,
+    .feature_emulation = metal_feature_emulation,
     .gpu_frame_time    = metal_gpu_frame_time,
+    .gpu_mark          = metal_gpu_mark,
+    .gpu_marks         = metal_gpu_marks,
     .swapchain_info    = metal_swapchain_info,
+    .describe          = metal_describe,
+    .enumerate_adapters = metal_enumerate_adapters,
+    .create_acceleration_structure  = metal_create_acceleration_structure,
+    .update_acceleration_structure  = metal_update_acceleration_structure,
+    .destroy_acceleration_structure = metal_destroy_acceleration_structure,
+    .bind_acceleration_structure    = metal_bind_acceleration_structure,
+    .bindless_set      = metal_bindless_set,
     .destroy_mesh      = metal_destroy_mesh,
     .destroy_shader_obj = metal_destroy_shader_obj,
     .upload_cubemap    = metal_upload_cubemap,
@@ -5459,12 +7258,17 @@ static const vio_backend metal_backend = {
     /* Path B: vertex-stage SSBO bound at its pinned MSL index, drawn with
      * instance_count instances and no per-instance vertex buffer. */
     .bind_storage_buffer         = metal_bind_storage_buffer,
+    .bind_fragment_storage       = metal_bind_fragment_storage,
     .draw_instanced_from_storage = metal_draw_instanced_from_storage,
     .draw_indirect     = metal_draw_indirect,
+    .draw_mesh_tasks          = metal_draw_mesh_tasks,
+    .draw_mesh_tasks_indirect = metal_draw_mesh_tasks_indirect,
+    .cooperative_matrix_shapes = metal_cooperative_matrix_shapes,
     .bind_stage_constants = metal_bind_stage_constants,
     .gpu_info           = vio_metal_gpu_info,
     .destroy_font_atlas = metal_destroy_font_atlas,
     .upload_font_atlas  = metal_upload_font_atlas,
+    .update_font_atlas  = metal_update_font_atlas,
     .destroy_texture_obj = metal_destroy_texture_obj,
     .destroy_buffer_obj  = metal_destroy_buffer_obj,
     .create_render_target  = metal_create_render_target,
@@ -5482,6 +7286,9 @@ static const vio_backend metal_backend = {
     .compute_bind_image       = metal_compute_bind_image,
     .compute_wait             = metal_compute_wait,
     .read_buffer              = metal_read_buffer,
+    .rt_origin_top            = 1,
+    .upscale_method           = metal_upscale_method,
+    .upscale_native           = metal_upscale_native,
 };
 
 void vio_backend_metal_register(void)

@@ -153,6 +153,10 @@ static VkShaderStageFlags vk3d_stage_bit(int stage)
         case VIO_STAGE_GEOMETRY:     return VK_SHADER_STAGE_GEOMETRY_BIT;
         case VIO_STAGE_TESS_CONTROL: return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
         case VIO_STAGE_TESS_EVAL:    return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+#ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
+        case VIO_STAGE_MESH:         return VK_SHADER_STAGE_MESH_BIT_EXT;
+        case VIO_STAGE_TASK:         return VK_SHADER_STAGE_TASK_BIT_EXT;
+#endif
         default:                     return VK_SHADER_STAGE_VERTEX_BIT;
     }
 }
@@ -164,6 +168,8 @@ static const char *vk3d_stage_name(int stage)
         case VIO_STAGE_GEOMETRY:     return "geometry";
         case VIO_STAGE_TESS_CONTROL: return "tess_control";
         case VIO_STAGE_TESS_EVAL:    return "tess_eval";
+        case VIO_STAGE_MESH:         return "mesh";
+        case VIO_STAGE_TASK:         return "task";
         default:                     return "vertex";
     }
 }
@@ -183,8 +189,11 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
     if (is_fragment) vk3d_assign_locations(c, res, SPVC_RESOURCE_TYPE_STAGE_OUTPUT, NULL, 0, 0);
     else             vk3d_assign_locations(c, res, SPVC_RESOURCE_TYPE_STAGE_OUTPUT, vt_out, 1, 0);
     VkShaderStageFlags stage = vk3d_stage_bit(stage_id);
+    /* Mesh / task stages share the vertex stage's block: the mesh stage takes
+     * the vertex slot of the shader object (uniform reflection, cbuffer). */
     uint32_t default_block = stage_id == VIO_STAGE_FRAGMENT ? VK3D_B_FS_UBO
-                           : stage_id == VIO_STAGE_VERTEX   ? VK3D_B_VS_UBO
+                           : (stage_id == VIO_STAGE_VERTEX || stage_id == VIO_STAGE_MESH ||
+                              stage_id == VIO_STAGE_TASK) ? VK3D_B_VS_UBO
                            : (uint32_t)(VK3D_B_STAGE_UBO0 + (stage_id - VIO_STAGE_GEOMETRY));
     const spvc_reflected_resource *list;
     size_t n;
@@ -201,22 +210,55 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
                          stage, VK_IMAGE_VIEW_TYPE_2D, 0, (uint32_t)size);
     }
 
+    /* Separate textures combined by vio_spvc_combine_separate take the list positions
+     * php_vio.c gives them: behind the shader's own combined samplers, in the order
+     * of the original separate images (OPEN-ITEMS-PLAN A23). */
+    const spvc_combined_image_sampler *cis = NULL;
+    size_t cis_n = 0;
+    spvc_compiler_get_combined_image_samplers(c, &cis, &cis_n);
+    const spvc_reflected_resource *sep_list = NULL;
+    size_t sep_n = 0;
+    spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &sep_list, &sep_n);
     /* Samplers: regular 0.., shadow 8.. (the D3D12 register replay in php_vio.c). */
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, &list, &n);
     int regular = 0, shadow = 8;
+    size_t own = 0;   /* combined samplers the shader declared itself */
     for (size_t i = 0; i < n; i++) {
+        int combined = 0;
+        for (size_t k = 0; k < cis_n; k++) if (cis[k].combined_id == list[i].id) combined = 1;
+        if (!combined) own++;
+    }
+    size_t own_seen = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t fi = own_seen;   /* position in php_vio.c's sampler list */
+        int from_separate = 0;
+        for (size_t k = 0; k < cis_n; k++) {
+            if (cis[k].combined_id != list[i].id) continue;
+            from_separate = 1;
+            size_t j = 0, at = (size_t)-1;
+            for (size_t q = 0; q < sep_n; q++) {
+                if (spvc_compiler_get_decoration(c, sep_list[q].id, SpvDecorationDescriptorSet) == 1) continue;
+                if (sep_list[q].id == cis[k].image_id) { at = j; break; }
+                j++;
+            }
+            fi = at == (size_t)-1 ? (size_t)VK3D_MAX_SAMPLERS : own + at;
+            break;
+        }
+        if (!from_separate) own_seen++;
         int is_depth = 0;
         VkImageViewType dim = vk3d_sampler_dim(c, list[i].type_id, &is_depth);
         int reg = is_depth ? shadow++ : regular++;
+        int planned = vio_sampler_plan_reg(list[i].name);   /* shader-wide by name (A30) */
+        if (planned >= 0) reg = planned;
         if (reg >= VK3D_MAX_SAMPLERS) continue;
         uint32_t binding = (uint32_t)(VK3D_B_SAMPLER0 + reg);
         spvc_compiler_set_decoration(c, list[i].id, SpvDecorationDescriptorSet, 0);
         spvc_compiler_set_decoration(c, list[i].id, SpvDecorationBinding, binding);
         vk3d_add_binding(sh, binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, dim, is_depth, 0);
-        if (is_fragment && i < VK3D_MAX_SAMPLERS) {
-            sh->fs_sampler_binding[i] = (int)binding;
-            sh->fs_sampler_depth[i] = is_depth;
-            if ((int)i + 1 > sh->fs_sampler_count) sh->fs_sampler_count = (int)i + 1;
+        if (is_fragment && fi < VK3D_MAX_SAMPLERS) {
+            sh->fs_sampler_binding[fi] = (int)binding;
+            sh->fs_sampler_depth[fi] = is_depth;
+            if ((int)fi + 1 > sh->fs_sampler_count) sh->fs_sampler_count = (int)fi + 1;
         }
         if (smp && smp->count < VK3D_MAX_SAMPLERS) {
             snprintf(smp->names[smp->count], sizeof(smp->names[0]), "%s", list[i].name ? list[i].name : "");
@@ -236,9 +278,26 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
         vk3d_add_binding(sh, binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, VK_IMAGE_VIEW_TYPE_2D, 0, 0);
     }
 
+    /* Ray query (GL_EXT_ray_query): the acceleration structure of any stage
+     * sits at one fixed binding; vio_bind_acceleration_structure fills it. */
+    spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_ACCELERATION_STRUCTURE, &list, &n);
+    for (size_t i = 0; i < n && i < 1; i++) {
+        spvc_compiler_set_decoration(c, list[i].id, SpvDecorationDescriptorSet, 0);
+        spvc_compiler_set_decoration(c, list[i].id, SpvDecorationBinding, VK3D_B_ACCEL);
+        vk3d_add_binding(sh, VK3D_B_ACCEL, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, stage, VK_IMAGE_VIEW_TYPE_2D, 0, 0);
+    }
+
+    /* Set 1 is the bindless table (vio_texture_index): it keeps its set and
+     * bindings. Other separate textures / samplers were combined before
+     * (vio_spvc_combine_separate) - except next to the bindless table. */
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &n);
-    if (n > 0) {
-        php_error_docref(NULL, E_NOTICE, "Vulkan: separate texture/sampler objects are not supported by the 3D pipeline; use combined samplers");
+    int other = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (spvc_compiler_get_decoration(c, list[i].id, SpvDecorationDescriptorSet) == 1) sh->uses_bindless = 1;
+        else other = 1;
+    }
+    if (other && sh->uses_bindless) {
+        php_error_docref(NULL, E_NOTICE, "Vulkan: separate texture/sampler objects next to the bindless table are not supported; use combined samplers there");
     }
     return 0;
 }
@@ -300,6 +359,41 @@ static char *vk3d_gs_fixup(const char *glsl)
     return out;
 }
 
+/* With shaderTessellationAndGeometryPointSize enabled, a point_mode evaluation
+ * stage feeding the rasterizer must write PointSize (VUID-07723, before
+ * maintenance5). GLSL TES rarely do, so the stage gets gl_PointSize = 1.0 at
+ * the top of main - GL's default size. Takes ownership of `glsl`. */
+static char *vk3d_tes_point_size(char *glsl)
+{
+    if (!glsl || !strstr(glsl, "point_mode") || strstr(glsl, "gl_PointSize")) return glsl;
+    const char *m = strstr(glsl, "void main()");
+    const char *brace = m ? strchr(m, '{') : NULL;
+    if (!brace) return glsl;
+    static const char ins[] = "\n    gl_PointSize = 1.0;";
+    size_t head = (size_t)(brace + 1 - glsl), len = strlen(glsl);
+    char *out = (char *)malloc(len + sizeof(ins));
+    if (!out) return glsl;
+    memcpy(out, glsl, head);
+    memcpy(out + head, ins, sizeof(ins) - 1);
+    memcpy(out + head + sizeof(ins) - 1, glsl + head, len - head + 1);
+    free(glsl);
+    return out;
+}
+
+/* OpCapability RayQueryKHR (4472) in the module. */
+static int vk3d_uses_ray_query(const uint32_t *code, size_t bytes)
+{
+    size_t words = bytes / 4, i = 5;
+    while (i < words) {
+        uint32_t op = code[i] & 0xFFFF, count = code[i] >> 16;
+        if (count == 0) break;
+        if (op == 17 && count >= 2 && code[i + 1] == 4472) return 1;
+        if (op != 17 && op != 11 && op != 14 && op != 10) break;   /* capabilities come first */
+        i += count;
+    }
+    return 0;
+}
+
 /* One stage of the round trip. `upstream` hashes the SPIR-V of every earlier
  * stage (input locations follow their outputs' names); `is_last` marks the
  * stage that carries the clip-space fixup. Both are part of the cache key: the
@@ -316,6 +410,7 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     if (spvc_context_create(&ctx) != SPVC_SUCCESS) return NULL;
     if (spvc_context_parse_spirv(ctx, spirv, spirv_bytes / sizeof(uint32_t), &ir) != SPVC_SUCCESS ||
         spvc_context_create_compiler(ctx, SPVC_BACKEND_GLSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &c) != SPVC_SUCCESS ||
+        (vio_spvc_combine_separate(c), 0) ||   /* separate texture + sampler -> combined (OPEN-ITEMS-PLAN A23) */
         vk3d_remap_stage(c, stage_id, sh, vt_in, vt_out, smp) != 0) {
         php_error_docref(NULL, E_WARNING, "Vulkan: %s SPIR-V reflection failed: %s", stage_name,
                          spvc_context_get_last_error_string(ctx));
@@ -324,10 +419,12 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     }
 
     char tag[24];
-    snprintf(tag, sizeof(tag), "vk3d-%s-3", stage_name);
+    snprintf(tag, sizeof(tag), "vk3d-%s-4", stage_name);   /* -4: point_mode TES write gl_PointSize */
     uint64_t key = vio_shader_cache_hash(tag, spirv, spirv_bytes);
     key = vio_shader_cache_hash_more(key, &upstream, sizeof(upstream));
     key = vio_shader_cache_hash_more(key, &is_last, sizeof(is_last));
+    if (vio_sampler_plan_current())   /* sampler bindings come from the whole shader */
+        key = vio_shader_cache_hash_more(key, vio_sampler_plan_current(), sizeof(vio_sampler_plan));
     if (vio_shader_cache_dir()) {
         size_t len = 0;
         void *data = vio_shader_cache_load(key, "vkspv", &len);
@@ -341,7 +438,8 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
 
     spvc_compiler_options opts = NULL;
     spvc_compiler_create_compiler_options(c, &opts);
-    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_GLSL_VERSION, 450);
+    /* rayQueryEXT needs GLSL 460 (SPIRV-Cross refuses it below). */
+    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_GLSL_VERSION, vk3d_uses_ray_query(spirv, spirv_bytes) ? 460 : 450);
     spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_GLSL_ES, SPVC_FALSE);
     spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_GLSL_VULKAN_SEMANTICS, SPVC_TRUE);
     spvc_compiler_install_compiler_options(c, opts);
@@ -354,10 +452,13 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
         return NULL;
     }
     char *src = !is_last ? strdup(glsl)
+              : stage_id == VIO_STAGE_MESH ? vio_mesh_fix_positions(strdup(glsl), 1, 1, "vec4")
               : stage_id == VIO_STAGE_GEOMETRY ? vk3d_gs_fixup(glsl) : vk3d_vs_fixup(glsl);
     spvc_context_destroy(ctx);
     if (!src) return NULL;
+    if (stage_id == VIO_STAGE_TESS_EVAL && is_last && vio_vk.tess_geometry_point_size) src = vk3d_tes_point_size(src);
     if (stage_id == VIO_STAGE_VERTEX || stage_id == VIO_STAGE_TESS_EVAL) src = vio_glsl_require_viewport_layer_ext(src);
+    if (stage_id == VIO_STAGE_FRAGMENT) src = vio_glsl_require_mesh_shader_ext(src);
     if (getenv("VIO_DUMP_VK_GLSL")) {
         fprintf(stderr, "==== Vulkan %s GLSL ====\n%s\n==== end ====\n", stage_name, src);
         fflush(stderr);
@@ -427,11 +528,12 @@ void vk3d_shader_release_gpu(vio_vk3d_shader *sh)
         if (sh->gs)         vio_vk_defer_destroy(VIO_VK_GRAVE_SHADER_MODULE, (uint64_t)sh->gs, NULL);
         if (sh->tcs)        vio_vk_defer_destroy(VIO_VK_GRAVE_SHADER_MODULE, (uint64_t)sh->tcs, NULL);
         if (sh->tes)        vio_vk_defer_destroy(VIO_VK_GRAVE_SHADER_MODULE, (uint64_t)sh->tes, NULL);
+        if (sh->ts)         vio_vk_defer_destroy(VIO_VK_GRAVE_SHADER_MODULE, (uint64_t)sh->ts, NULL);
     }
     sh->layout = VK_NULL_HANDLE;
     sh->set_layout = VK_NULL_HANDLE;
     sh->vs = sh->fs = VK_NULL_HANDLE;
-    sh->gs = sh->tcs = sh->tes = VK_NULL_HANDLE;
+    sh->gs = sh->tcs = sh->tes = sh->ts = VK_NULL_HANDLE;
     sh->dead = 1;
 }
 
@@ -449,14 +551,21 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
     }
     /* Pipeline order VS -> TCS -> TES -> GS -> FS; tess control + eval come as
      * a pair (vio_shader guarantees it). */
-    struct { int id; const void *data; size_t size; VkShaderModule *module; } st[5] = {
-        { VIO_STAGE_VERTEX,       desc->vertex_data,       desc->vertex_size,       NULL },
+    /* Mesh pipelines: task -> mesh (in the vertex slot) -> fragment. */
+    int is_mesh = vio_spirv_execution_model(desc->vertex_data, desc->vertex_size) == VIO_SPIRV_MODEL_MESH_EXT;
+    if (desc->task_data && (!is_mesh || desc->task_size < 20 || *(const uint32_t *)desc->task_data != 0x07230203)) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: a task stage needs a mesh stage, both as SPIR-V");
+        return NULL;
+    }
+    struct { int id; const void *data; size_t size; VkShaderModule *module; } st[6] = {
+        { VIO_STAGE_TASK,         desc->task_data,         desc->task_size,         NULL },
+        { is_mesh ? VIO_STAGE_MESH : VIO_STAGE_VERTEX, desc->vertex_data, desc->vertex_size, NULL },
         { VIO_STAGE_TESS_CONTROL, desc->tess_control_data, desc->tess_control_size, NULL },
         { VIO_STAGE_TESS_EVAL,    desc->tess_eval_data,    desc->tess_eval_size,    NULL },
         { VIO_STAGE_GEOMETRY,     desc->geometry_data,     desc->geometry_size,     NULL },
         { VIO_STAGE_FRAGMENT,     desc->fragment_data,     desc->fragment_size,     NULL },
     };
-    for (int i = 1; i < 4; i++) {
+    for (int i = 2; i < 5; i++) {
         if (st[i].data && (st[i].size < 20 || *(const uint32_t *)st[i].data != 0x07230203)) {
             php_error_docref(NULL, E_WARNING, "Vulkan: %s stage must reach the backend as SPIR-V", vk3d_stage_name(st[i].id));
             return NULL;
@@ -467,20 +576,23 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
         return NULL;
     }
     vio_vk3d_shader *sh = (vio_vk3d_shader *)calloc(1, sizeof(vio_vk3d_shader));
+    if (sh) sh->writes_shading_rate = vio_spirv_has_builtin(desc->vertex_data, desc->vertex_size, 4432);   /* PrimitiveShadingRateKHR */
     if (!sh) return NULL;
-    st[0].module = &sh->vs; st[1].module = &sh->tcs; st[2].module = &sh->tes;
-    st[3].module = &sh->gs; st[4].module = &sh->fs;
+    sh->is_mesh = is_mesh;
+    st[0].module = &sh->ts; st[1].module = &sh->vs; st[2].module = &sh->tcs; st[3].module = &sh->tes;
+    st[4].module = &sh->gs; st[5].module = &sh->fs;
 
     /* The last stage before the rasterizer owns the clip-space fixup. */
-    int last_geo = desc->geometry_data ? VIO_STAGE_GEOMETRY
+    int last_geo = is_mesh ? VIO_STAGE_MESH
+                 : desc->geometry_data ? VIO_STAGE_GEOMETRY
                  : desc->tess_eval_data ? VIO_STAGE_TESS_EVAL : VIO_STAGE_VERTEX;
     vk3d_varyings vt[2];
     memset(vt, 0, sizeof(vt));
-    vk3d_stage_samplers smp[5];
+    vk3d_stage_samplers smp[6];
     memset(smp, 0, sizeof(smp));
     uint64_t upstream = 0;
     int cur = 0, ok = 1;
-    for (int i = 0; i < 5 && ok; i++) {
+    for (int i = 0; i < 6 && ok; i++) {
         if (!st[i].data) continue;
         vk3d_varyings *in = &vt[cur], *out = &vt[cur ^ 1];
         memset(out, 0, sizeof(*out));
@@ -502,14 +614,16 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
     }
     /* Samplers only an optional stage declares extend the GL-unit map after the
      * fragment ones, in php_vio.c's merge order (geometry, tess control, tess
-     * eval), so vio_set_uniform('u_height', unit) + vio_bind_texture reach them. */
+     * eval, then the vertex / mesh stage and task - OPEN-ITEMS-PLAN A30 / A28), so
+     * vio_set_uniform('u_height', unit) + vio_bind_texture reach them. */
     {
-        static const int merge_order[3] = { 3, 1, 2 };
-        for (int k = 0; k < 3; k++) {
+        static const int merge_order[5] = { 4, 2, 3, 1, 0 };
+        int merge_count = 5;
+        for (int k = 0; k < merge_count; k++) {
             const vk3d_stage_samplers *s = &smp[merge_order[k]];
             for (int j = 0; j < s->count && sh->fs_sampler_count < VK3D_MAX_SAMPLERS; j++) {
                 int known = 0;
-                for (int f = 0; f < smp[4].count && !known; f++) known = strcmp(smp[4].names[f], s->names[j]) == 0;
+                for (int f = 0; f < smp[5].count && !known; f++) known = strcmp(smp[5].names[f], s->names[j]) == 0;
                 for (int q = 0; q < k && !known; q++) {
                     const vk3d_stage_samplers *e = &smp[merge_order[q]];
                     for (int f = 0; f < e->count && !known; f++) known = strcmp(e->names[f], s->names[j]) == 0;
@@ -546,9 +660,16 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
          vkCreateDescriptorSetLayout(vio_vk.device, &dsl, NULL, &sh->set_layout) == VK_SUCCESS;
     if (ok) {
         VkPipelineLayoutCreateInfo pl = {0};
+        VkDescriptorSetLayout sets[2] = { sh->set_layout, VK_NULL_HANDLE };
         pl.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pl.setLayoutCount = 1;
-        pl.pSetLayouts    = &sh->set_layout;
+        pl.pSetLayouts    = sets;
+        if (sh->uses_bindless) {
+            /* Set 1: the context's bindless table (vio_texture_index). */
+            sets[1] = vio_vk_bindless_layout();
+            if (sets[1]) pl.setLayoutCount = 2;
+            else php_error_docref(NULL, E_WARNING, "Vulkan: the shader reads vio_textures[] but the device has no descriptor indexing");
+        }
         ok = vkCreatePipelineLayout(vio_vk.device, &pl, NULL, &sh->layout) == VK_SUCCESS;
     }
     if (!ok) {
@@ -725,11 +846,11 @@ static uint64_t vk3d_mix(uint64_t h, uint64_t v)
     return h;
 }
 
-/* The pipeline for the render pass currently open (attachment signature) and the
+/* The pipeline for the pass currently open (attachment signature) and the
  * mesh vertex stride, created on first use. */
 VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
 {
-    if (!p || p->dead || !p->shader || p->shader->dead || !vio_vk.cur_render_pass) return VK_NULL_HANDLE;
+    if (!p || p->dead || !p->shader || p->shader->dead || !vio_vk.in_pass) return VK_NULL_HANDLE;
     if (stride == 0) stride = p->vertex_stride;
     int cc = vio_vk.cur_color_count > 4 ? 4 : vio_vk.cur_color_count;
     uint64_t key = 1469598103934665603ULL;
@@ -738,6 +859,10 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     key = vk3d_mix(key, (uint64_t)vio_vk.cur_samples);
     key = vk3d_mix(key, (uint64_t)vio_vk.cur_has_depth);
     key = vk3d_mix(key, (uint64_t)stride);
+    const vio_mesh_layout *ml = p->shader->is_mesh ? NULL : &vio_vk.mesh_layout;
+    key = vk3d_mix(key, (uint64_t)(ml ? ml->key : 0));   /* the mesh's attribute offsets */
+    key = vk3d_mix(key, (uint64_t)p->desc.view_count);   /* multiview pass (viewMask) */
+    key = vk3d_mix(key, (uint64_t)vio_vk.cur_view_mask);
     for (int i = 0; i < p->variant_count; i++) {
         if (p->variants[i].key == key) return p->variants[i].pipeline;
     }
@@ -746,17 +871,25 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     const vio_vk3d_shader *sh = p->shader;
     /* Depth-only passes skip a fragment stage that could only write colour. */
     int with_fs = !(cc == 0 && !sh->fs_needed_without_color);
-    const struct { VkShaderStageFlagBits bit; VkShaderModule m; } order[5] = {
-        { VK_SHADER_STAGE_VERTEX_BIT,                  sh->vs  },
+#ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
+    const VkShaderStageFlagBits first_bit = sh->is_mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT;
+    const VkShaderStageFlagBits task_bit = VK_SHADER_STAGE_TASK_BIT_EXT;
+#else
+    const VkShaderStageFlagBits first_bit = VK_SHADER_STAGE_VERTEX_BIT;
+    const VkShaderStageFlagBits task_bit = VK_SHADER_STAGE_VERTEX_BIT;
+#endif
+    const struct { VkShaderStageFlagBits bit; VkShaderModule m; } order[6] = {
+        { task_bit,                                    sh->ts  },
+        { first_bit,                                   sh->vs  },
         { VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,    sh->tcs },
         { VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, sh->tes },
         { VK_SHADER_STAGE_GEOMETRY_BIT,                sh->gs  },
         { VK_SHADER_STAGE_FRAGMENT_BIT,                with_fs ? sh->fs : VK_NULL_HANDLE },
     };
-    VkPipelineShaderStageCreateInfo stages[5];
+    VkPipelineShaderStageCreateInfo stages[6];
     memset(stages, 0, sizeof(stages));
     uint32_t stage_count = 0;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         if (!order[i].m) continue;
         stages[stage_count].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[stage_count].stage  = order[i].bit;
@@ -780,7 +913,7 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
             va[i].offset  = (uint32_t)(loc - 3) * 16u;
         } else {
             va[i].binding = 0;
-            va[i].offset  = off;
+            va[i].offset  = (uint32_t)vio_mesh_layout_offset(ml, loc, (int)off);
             off += vk3d_format_size(p->attribs[i].format);
         }
     }
@@ -813,6 +946,9 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     VkPipelineViewportStateCreateInfo vp = {0};
     vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     vp.viewportCount = vio_vk.max_viewports > 1 ? vio_vk.max_viewports : 1;   /* vio_viewports */
+    /* A per-primitive shading rate needs a single viewport unless the device has
+     * primitiveFragmentShadingRateWithMultipleViewports (VUID-04503). */
+    if (sh->writes_shading_rate && !vio_vk.vrs_primitive_multi_viewport) vp.viewportCount = 1;
     vp.scissorCount  = vp.viewportCount;
 
     VkPipelineRasterizationStateCreateInfo rs = {0};
@@ -874,8 +1010,8 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     gi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     gi.stageCount          = stage_count;
     gi.pStages             = stages;
-    gi.pVertexInputState   = &vi;
-    gi.pInputAssemblyState = &ia;
+    gi.pVertexInputState   = sh->is_mesh ? NULL : &vi;   /* mesh pipelines have no vertex input */
+    gi.pInputAssemblyState = sh->is_mesh ? NULL : &ia;
     gi.pTessellationState  = tess ? &ts : NULL;
     gi.pViewportState      = &vp;
     gi.pRasterizationState = &rs;
@@ -884,8 +1020,12 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     gi.pColorBlendState    = &cb;
     gi.pDynamicState       = &dyn;
     gi.layout              = p->shader->layout;
-    gi.renderPass          = vio_vk.cur_render_pass;
-    gi.subpass             = 0;
+    /* Dynamic rendering (VULKAN-MODERN-PLAN phase 4): the attachment formats
+     * of the open pass instead of a render-pass object. */
+    VkPipelineRenderingCreateInfo rendering;
+    vio_vk_pass_rendering_info(&rendering);
+    gi.pNext               = &rendering;
+    if (vio_vk.vrs_attachment) gi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;   /* A18 */
     gi.basePipelineIndex   = -1;
 
     VkPipeline pl = VK_NULL_HANDLE;

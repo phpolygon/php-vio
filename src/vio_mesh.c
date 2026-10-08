@@ -26,6 +26,9 @@ static zend_object *vio_mesh_create_object(zend_class_entry *ce)
     mesh->has_colors   = 0;
     mesh->stride       = 0;
     mesh->backend      = NULL;
+    mesh->rt_positions = NULL;
+    mesh->rt_indices   = NULL;
+    mesh->rt_index_count = 0;
 
     zend_object_std_init(&mesh->std, ce);
     object_properties_init(&mesh->std, ce);
@@ -41,6 +44,8 @@ static void vio_mesh_free_object(zend_object *obj)
     if (mesh->backend && mesh->backend->destroy_mesh) {
         mesh->backend->destroy_mesh(mesh);
     }
+    if (mesh->rt_positions) efree(mesh->rt_positions);
+    if (mesh->rt_indices) efree(mesh->rt_indices);
 
     zend_object_std_dtor(&mesh->std);
 }

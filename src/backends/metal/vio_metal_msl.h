@@ -18,9 +18,38 @@
 
 #define VIO_METAL_MAX_RES 16
 
+/* MSL target of every transpile (graphics stages, kernels, compute): the rung
+ * of the version ladder the device context picked (major * 10 + minor, see
+ * metal_select_msl_version in vio_metal.m), and the platform. Set once per
+ * context before any shader is built. */
+static int metal_msl_target_version = 21;
+static int metal_msl_target_ios = 0;
+/* Multiview (vio_shader 'view_count'): set around the transpile of a multiview
+ * shader's vertex / fragment stage. SPIRV-Cross emulates the views with
+ * instancing - instance count x views, gl_ViewIndex from the instance, written
+ * to [[render_target_array_index]] - and reads {base view, view count} from
+ * [[buffer(VIO_METAL_VIEW_MASK_INDEX)]] (its default 24 is a tessellation slot). */
+static int metal_msl_multiview = 0;
+#define VIO_METAL_VIEW_MASK_INDEX 23
+
+static void metal_msl_set_target(int version, int ios)
+{
+    metal_msl_target_version = version;
+    metal_msl_target_ios = ios;
+}
+
+/* SPIRV-Cross encoding (major * 10000 + minor * 100) of the target, never
+ * below `floor` (major * 10 + minor) - the tessellation stages need 2.1. */
+static unsigned metal_msl_spvc_version(int floor)
+{
+    int v = metal_msl_target_version < floor ? floor : metal_msl_target_version;
+    return (unsigned)((v / 10) * 10000 + (v % 10) * 100);
+}
+
+
 /* One buffer-like resource of a shader stage after the MSL renumbering. */
 typedef struct _vio_metal_res_buffer {
-    int kind;       /* 0 = UBO, 1 = SSBO, 2 = push-constant block */
+    int kind;       /* 0 = UBO, 1 = SSBO, 2 = push-constant block, 3 = acceleration structure (ray query) */
     int set;        /* original GLSL descriptor set */
     int binding;    /* original GLSL binding (what vio_bind_buffer / vio_bind_storage_buffer pass) */
     int msl_index;  /* [[buffer(N)]] the resource was pinned to */
@@ -34,6 +63,7 @@ typedef struct _vio_metal_res_texture {
     int msl_index;  /* [[texture(N)]] == [[sampler(N)]] */
     int is_depth;   /* sampler2DShadow -> needs a compare sampler */
     int is_cube;    /* samplerCube */
+    char name[64];  /* GLSL name: matches the PHP sampler map across stages */
 } vio_metal_res_texture;
 
 typedef struct _vio_metal_vs_input {
@@ -61,7 +91,17 @@ typedef struct _vio_metal_stage_res {
      * vio_spirv_get_uniform_offsets() reflects into sh->cbuffer_data, so the
      * per-draw cbuffer slice is bound here. */
     int                   cbuffer_index;
+    /* The stage reads the bindless table (Set 1: texture2D vio_textures[] +
+     * sampler vio_sampler, BINDLESS-PLAN.md): an argument buffer at
+     * [[buffer(VIO_METAL_BINDLESS_INDEX)]] holding texture handles. */
+    int                   uses_bindless;
 } vio_metal_stage_res;
+
+#define VIO_METAL_BINDLESS_INDEX 21
+/* vio_cubes / vio_texture_arrays (Set 1 bindings 5 / 6): their own argument
+ * buffers, the MSL translation moves them to sets 2 / 3 (BINDLESS-PLAN 4b). */
+#define VIO_METAL_BINDLESS_CUBE_INDEX  17
+#define VIO_METAL_BINDLESS_ARRAY_INDEX 18
 
 /* What one SPIR-V module is transpiled into. Metal has no hull / domain
  * stages: tessellation runs the vertex and control stages as compute kernels
@@ -74,8 +114,28 @@ typedef enum {
     VIO_MSL_VERTEX_TESS,   /* vertex stage as a kernel, one thread per (vertex, instance) */
     VIO_MSL_TESS_CONTROL,  /* tess control as a kernel, one thread per output control point */
     VIO_MSL_TESS_EVAL,     /* tess evaluation as a [[patch]] vertex function */
-    VIO_MSL_KERNEL         /* vertex / geometry stage rebuilt as a GLSL compute kernel (vio_metal_kernel.h) */
+    VIO_MSL_KERNEL,        /* vertex / geometry stage rebuilt as a GLSL compute kernel (vio_metal_kernel.h) */
+    VIO_MSL_MESH,          /* mesh stage ([[mesh]], MSL 3.0) */
+    VIO_MSL_TASK           /* task stage ([[object]], MSL 3.0) */
 } vio_msl_stage;
+
+/* LocalSize execution mode of a compute-like module (mesh / task stages):
+ * the threads per threadgroup drawMeshThreadgroups needs. 1x1x1 when absent. */
+static void metal_spirv_local_size(const uint32_t *w, size_t bytes, unsigned out[3])
+{
+    out[0] = out[1] = out[2] = 1;
+    size_t n = bytes / 4;
+    if (!w || n < 5 || w[0] != 0x07230203u) return;
+    for (size_t i = 5; i < n; ) {
+        uint32_t count = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (count == 0) break;
+        if (op == 16 && count >= 6 && w[i + 2] == 17) {   /* OpExecutionMode %entry LocalSize x y z */
+            out[0] = w[i + 3]; out[1] = w[i + 4]; out[2] = w[i + 5];
+            return;
+        }
+        i += count;
+    }
+}
 
 /* Buffer indices of the tessellation plumbing. Resources of every stage are
  * renumbered to 0..N-1 (N <= 2 * VIO_METAL_MAX_RES), so they stay below 19. */
@@ -109,6 +169,13 @@ typedef struct _vio_metal_tess_info {
 } vio_metal_tess_info;
 
 #ifdef HAVE_SPIRV_CROSS
+static void metal_msl_apply_target(spvc_compiler_options opts, int floor)
+{
+    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_VERSION, metal_msl_spvc_version(floor));
+    spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_PLATFORM,
+                                   metal_msl_target_ios ? SPVC_MSL_PLATFORM_IOS : SPVC_MSL_PLATFORM_MACOS);
+}
+
 
 static void metal_gfx_add_binding(spvc_compiler compiler, SpvExecutionModel stage,
                                   unsigned desc_set, unsigned binding, unsigned msl_index)
@@ -238,6 +305,181 @@ static int vio_metal_tess_reflect(const uint32_t *tcs, size_t tcs_size,
     return 0;
 }
 
+/* Bindless table (Set 1, BINDLESS-PLAN): Set 1 becomes a device-address argument
+ * buffer of texture handles at [[buffer(VIO_METAL_BINDLESS_INDEX)]] (vio_cubes /
+ * vio_texture_arrays move to sets 2 / 3 with their own buffers), every other set
+ * stays discrete, and the table's samplers are constexpr samplers - so nothing
+ * but the buffers has to be bound. Graphics stages and compute kernels share it.
+ * Returns 1 when the module reads the table. */
+static int metal_msl_bindless(spvc_compiler compiler, spvc_resources resources, SpvExecutionModel em)
+{
+    int uses = 0;
+    {
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &count);
+        for (size_t i = 0; i < count; i++) {
+            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 1) continue;
+            uses = 1;
+            /* Unsized arrays share one argument buffer badly (each member is one
+             * element long), so vio_cubes / vio_texture_arrays get sets 2 / 3. */
+            unsigned b = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            if (b == 5 || b == 6) {
+                spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, b == 5 ? 2 : 3);
+                spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, 0);
+            }
+        }
+    }
+    if (uses) {
+        spvc_compiler_options bopts = NULL;
+        if (spvc_compiler_create_compiler_options(compiler, &bopts) == SPVC_SUCCESS) {
+            spvc_compiler_options_set_bool(bopts, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_TRUE);
+            spvc_compiler_options_set_uint(bopts, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER, 1);   /* tier 2 */
+            spvc_compiler_install_compiler_options(compiler, bopts);
+        }
+        for (unsigned s = 0; s < 8; s++) if (s < 1 || s > 3) spvc_compiler_msl_add_discrete_descriptor_set(compiler, s);
+        spvc_compiler_msl_add_discrete_descriptor_set(compiler, SPVC_MSL_PUSH_CONSTANT_DESC_SET);
+        for (unsigned s = 1; s <= 3; s++) spvc_compiler_msl_set_argument_buffer_device_address_space(compiler, s, SPVC_TRUE);
+        for (unsigned s = 2; s <= 3; s++) {
+            spvc_msl_resource_binding_2 sb;
+            spvc_msl_resource_binding_init_2(&sb);
+            sb.stage      = em;
+            sb.desc_set   = s;
+            sb.binding    = SPVC_MSL_ARGUMENT_BUFFER_BINDING;
+            sb.msl_buffer = s == 2 ? VIO_METAL_BINDLESS_CUBE_INDEX : VIO_METAL_BINDLESS_ARRAY_INDEX;
+            spvc_compiler_msl_add_resource_binding_2(compiler, &sb);
+        }
+        spvc_msl_resource_binding_2 ab;
+        spvc_msl_resource_binding_init_2(&ab);
+        ab.stage      = em;
+        ab.desc_set   = 1;
+        ab.binding    = SPVC_MSL_ARGUMENT_BUFFER_BINDING;
+        ab.msl_buffer = VIO_METAL_BINDLESS_INDEX;
+        spvc_compiler_msl_add_resource_binding_2(compiler, &ab);
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS, &list, &count);
+        for (size_t i = 0; i < count; i++) {
+            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 1) continue;
+            /* Bindings 1..4: vio_sampler (linear, repeat), vio_sampler_nearest,
+             * vio_sampler_clamp, vio_sampler_nearest_clamp (BINDLESS-PLAN). */
+            unsigned v = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            v = (v >= 1 && v <= 4) ? v - 1 : 0;
+            spvc_msl_constexpr_sampler cs;
+            spvc_msl_constexpr_sampler_init(&cs);
+            cs.min_filter = (v & 1) ? SPVC_MSL_SAMPLER_FILTER_NEAREST : SPVC_MSL_SAMPLER_FILTER_LINEAR;
+            cs.mag_filter = cs.min_filter;
+            cs.s_address  = (v & 2) ? SPVC_MSL_SAMPLER_ADDRESS_CLAMP_TO_EDGE : SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
+            cs.t_address  = cs.s_address;
+            spvc_compiler_msl_remap_constexpr_sampler(compiler, list[i].id, &cs);
+        }
+    }
+
+    return uses;
+}
+
+/* The tessellation stages read their inputs from buffers whose structs
+ * SPIRV-Cross builds from the inputs a stage USES: an evaluation stage that
+ * declares `v` and `w` but reads only `w` gets {w, gl_Position} while the
+ * control stage writes {v, w, gl_Position}, and `w` reads `v` (test 198 C on
+ * the macOS CI). A copy of the module whose entry point loads every
+ * location-decorated input once makes all of them active, so both sides lay
+ * out the same members. NULL when there is nothing to add. */
+static uint32_t *metal_spirv_use_all_inputs(const uint32_t *w, size_t words, size_t *out_words)
+{
+    if (words < 5 || w[0] != 0x07230203) return NULL;
+    uint32_t bound = w[3], ep = 0;
+    size_t *def = (size_t *)calloc(bound ? bound : 1, sizeof(size_t));
+    unsigned char *has_loc = (unsigned char *)calloc(bound ? bound : 1, 1);
+    uint32_t vars[64], types[64];
+    int nv = 0;
+    size_t insert = 0;
+    uint32_t *out = NULL;
+    if (!def || !has_loc) goto done;
+    for (size_t i = 5; i < words; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if (!wc || i + wc > words) goto done;
+        if (op == 15 && wc >= 3 && !ep) ep = w[i + 2];
+        else if (op == 71 && wc >= 4 && w[i + 2] == 30 && w[i + 1] < bound) has_loc[w[i + 1]] = 1;
+        else if (op == 32 && wc >= 4 && w[i + 1] < bound) def[w[i + 1]] = i;           /* OpTypePointer */
+    }
+    for (size_t i = 5; i < words; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if (op == 59 && wc >= 4 && w[i + 3] == 1 /* Input */ && w[i + 2] < bound && has_loc[w[i + 2]]
+            && w[i + 1] < bound && def[w[i + 1]] && nv < 64) {
+            vars[nv] = w[i + 2];
+            types[nv] = w[def[w[i + 1]] + 3];   /* the pointee */
+            nv++;
+        }
+        if (op == 54 && wc >= 3 && w[i + 2] == ep) {
+            /* after the entry block's label and its OpVariables */
+            size_t j = i + wc;
+            while (j < words && (w[j] & 0xFFFF) != 248 /* OpLabel */) j += w[j] >> 16;
+            if (j >= words) goto done;
+            j += w[j] >> 16;
+            while (j < words && (w[j] & 0xFFFF) == 59) j += w[j] >> 16;
+            insert = j;
+        }
+    }
+    if (!nv || !insert) goto done;
+    out = (uint32_t *)malloc((words + (size_t)nv * 4) * sizeof(uint32_t));
+    if (!out) goto done;
+    memcpy(out, w, insert * sizeof(uint32_t));
+    size_t o = insert;
+    for (int k = 0; k < nv; k++) {
+        out[o++] = (4u << 16) | 61;   /* OpLoad type result pointer */
+        out[o++] = types[k];
+        out[o++] = bound++;
+        out[o++] = vars[k];
+    }
+    memcpy(out + o, w + insert, (words - insert) * sizeof(uint32_t));
+    o += words - insert;
+    out[3] = bound;
+    *out_words = o;
+done:
+    free(def);
+    free(has_loc);
+    return out;
+}
+
+/* Functions whose GLSL name is a type or keyword of the Metal language
+ * (`quad` is metal::quad): SPIRV-Cross keeps the name and the Metal compiler
+ * rejects it ("redefinition of 'quad' as different kind of symbol", test 205
+ * on the macOS CI). They get a suffix before the MSL is written. */
+static void metal_msl_rename_reserved(spvc_compiler compiler, const uint32_t *w, size_t words)
+{
+    static const char *reserved[] = {
+        "quad", "simd", "simdgroup", "quadgroup", "vec", "matrix", "array", "sampler", "texture",
+        "kernel", "vertex", "fragment", "mesh", "object", "device", "constant", "thread", "threadgroup",
+        "half", "uchar", "ushort", "ulong", "size_t", "ptrdiff_t", "visible", "intersection", NULL };
+    if (words < 5 || w[0] != 0x07230203) return;
+    uint32_t bound = w[3];
+    unsigned char *is_fn = (unsigned char *)calloc(bound ? bound : 1, 1);
+    if (!is_fn) return;
+    for (size_t i = 5; i < words && (w[i] >> 16); i += w[i] >> 16) {
+        if ((w[i] & 0xFFFF) == 54 /* OpFunction */ && (w[i] >> 16) >= 3 && w[i + 2] < bound) is_fn[w[i + 2]] = 1;
+    }
+    for (size_t i = 5; i < words && (w[i] >> 16); i += w[i] >> 16) {
+        if ((w[i] & 0xFFFF) != 5 /* OpName */ || (w[i] >> 16) < 3 || w[i + 1] >= bound || !is_fn[w[i + 1]]) continue;
+        const char *name = (const char *)&w[i + 2];
+        size_t len = strnlen(name, ((size_t)(w[i] >> 16) - 2) * 4);
+        char base[64];
+        if (len == 0 || len >= sizeof(base)) continue;
+        memcpy(base, name, len);
+        base[len] = '\0';
+        char *paren = strchr(base, '(');   /* glslang names functions "quad(f1;f1;" */
+        if (paren) *paren = '\0';
+        for (int r = 0; reserved[r]; r++) {
+            if (strcmp(base, reserved[r]) != 0) continue;
+            char renamed[80];
+            snprintf(renamed, sizeof(renamed), "%s_vio", base);
+            spvc_compiler_set_name(compiler, w[i + 1], renamed);
+            break;
+        }
+    }
+    free(is_fn);
+}
+
 /* Transpile one GRAPHICS stage to MSL with deterministic resource indices.
  *
  * glslang's AUTO_MAP_BINDINGS leaves every resource of an OpenGL-style shader
@@ -287,11 +529,17 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
         spvc_context_destroy(ctx);
         return NULL;
     }
+    metal_msl_rename_reserved(compiler, spirv, spirv_size / sizeof(uint32_t));
 
     if (spvc_compiler_create_compiler_options(compiler, &opts) == SPVC_SUCCESS) {
-        spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_VERSION,
-                                       is_tess ? SPVC_MAKE_MSL_VERSION(2, 1, 0) : SPVC_MAKE_MSL_VERSION(2, 0, 0));
-        spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_PLATFORM, SPVC_MSL_PLATFORM_MACOS);
+        /* Mesh / task stages need MSL 3.0 (the ladder only reports the
+         * capability from that rung). */
+        metal_msl_apply_target(opts, (stage == VIO_MSL_MESH || stage == VIO_MSL_TASK) ? 30 : (is_tess ? 21 : 20));
+        if (metal_msl_multiview && (stage == VIO_MSL_VERTEX || stage == VIO_MSL_FRAGMENT)) {
+            spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_MSL_MULTIVIEW, SPVC_TRUE);
+            spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_MSL_MULTIVIEW_LAYERED_RENDERING, SPVC_TRUE);
+            spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_VIEW_MASK_BUFFER_INDEX, VIO_METAL_VIEW_MASK_INDEX);
+        }
         if (stage == VIO_MSL_FRAGMENT) {
             spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_ENABLE_FRAG_OUTPUT_MASK, frag_output_mask);
         }
@@ -344,6 +592,8 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
     SpvExecutionModel em = spvc_compiler_get_execution_model(compiler);
     unsigned next = 0;
 
+    res->uses_bindless = metal_msl_bindless(compiler, resources, em);
+
     /* Buffers: UBOs first so ubos[0] becomes the default cbuffer (the block
      * vio_spirv_get_uniform_offsets picks), then SSBOs, then push constants. */
     static const struct { spvc_resource_type type; int kind; } buffer_kinds[] = {
@@ -385,12 +635,68 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
             vio_metal_res_texture *t = &res->textures[res->texture_count++];
             t->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
             t->msl_index = (int)next;
+            snprintf(t->name, sizeof(t->name), "%s", list[i].name ? list[i].name : "");
             spvc_type type = spvc_compiler_get_type_handle(compiler, list[i].type_id);
             spvc_type image = type ? spvc_compiler_get_type_handle(compiler, spvc_type_get_base_type_id(type)) : NULL;
             if (image) {
                 t->is_depth = spvc_type_get_image_is_depth(image) ? 1 : 0;
                 t->is_cube  = (spvc_type_get_image_dimension(image) == SpvDimCube) ? 1 : 0;
             }
+            spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
+            spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
+            metal_gfx_add_binding(compiler, em, 0, next, next);
+            next++;
+        }
+    }
+
+    /* Separate textures in set 0 (texture(sampler2D(u_tex, u_smp), uv), OPEN-ITEMS-PLAN
+     * A23): texture slots after the combined samplers, in reflection order, so a
+     * GL unit reaches them like a sampler2D. MSL keeps the pair separate, so their
+     * samplers become constexpr samplers (linear, repeat) instead of the texture's
+     * own sampler state (OpenGL / Vulkan / D3D combine them). */
+    {
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &count);
+        for (size_t i = 0; i < count && res->texture_count < VIO_METAL_MAX_RES; i++) {
+            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 0) continue;
+            vio_metal_res_texture *t = &res->textures[res->texture_count++];
+            t->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            t->msl_index = (int)next;
+            snprintf(t->name, sizeof(t->name), "%s", list[i].name ? list[i].name : "");
+            spvc_type image = spvc_compiler_get_type_handle(compiler, list[i].type_id);
+            if (image) {
+                t->is_depth = spvc_type_get_image_is_depth(image) ? 1 : 0;
+                t->is_cube  = (spvc_type_get_image_dimension(image) == SpvDimCube) ? 1 : 0;
+            }
+            spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
+            spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
+            metal_gfx_add_binding(compiler, em, 0, next, next);
+            next++;
+        }
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS, &list, &count);
+        for (size_t i = 0; i < count; i++) {
+            if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 0) continue;
+            spvc_msl_constexpr_sampler cs;
+            spvc_msl_constexpr_sampler_init(&cs);
+            cs.min_filter = cs.mag_filter = SPVC_MSL_SAMPLER_FILTER_LINEAR;
+            cs.s_address = cs.t_address = SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
+            spvc_compiler_msl_remap_constexpr_sampler(compiler, list[i].id, &cs);
+        }
+    }
+
+    /* Acceleration structures (GL_EXT_ray_query): renumbered into the buffer
+     * table like a UBO, bound with set*AccelerationStructure at draw time. */
+    {
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_ACCELERATION_STRUCTURE, &list, &count);
+        for (size_t i = 0; i < count && res->buffer_count < VIO_METAL_MAX_RES; i++) {
+            vio_metal_res_buffer *b = &res->buffers[res->buffer_count++];
+            b->kind      = 3;
+            b->set       = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet);
+            b->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            b->msl_index = (int)next;
             spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
             spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
             metal_gfx_add_binding(compiler, em, 0, next, next);
@@ -441,7 +747,7 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
     if (getenv("VIO_DUMP_MSL")) {
         static const char *labels[] = { "vertex", "fragment", "vertex (tessellation kernel)",
                                         "tessellation control", "tessellation evaluation",
-                                        "stage kernel" };
+                                        "stage kernel", "mesh", "task" };
         fprintf(stderr, "==== Metal %s MSL ====\n%s\n==== end ====\n", labels[stage], result);
         fflush(stderr);
     }

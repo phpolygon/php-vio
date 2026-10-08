@@ -13,7 +13,9 @@ vio_destroy($c);
 /* GAP-PHASE5-PLAN Block 7. DXC lives in dxcompiler.dll + dxil.dll; the test
  * points vio at them via VIO_DXC_DIR, the Windows SDK's bin directory, or the
  * default search path. Without them the request falls back to FXC 5.1 and
- * vio_gpu_info() says so — that is the honest outcome, not a failure. */
+ * vio_swapchain_info() says so — the honest outcome, not a failure, unless
+ * VIO_REQUIRE_SM6=1 (Windows CI): then the fallback fails the test, so a
+ * green run proves the DXC path actually ran. */
 function px(string $p, int $x, int $y, int $w): array { $o = ($y*$w+$x)*4; return [ord($p[$o]), ord($p[$o+1]), ord($p[$o+2])]; }
 
 $dir = getenv('VIO_DXC_DIR') ?: '';
@@ -29,7 +31,12 @@ $ctx = vio_create('d3d12', $opts);
 if (!$ctx) { echo "FAIL create\n"; exit; }
 $info = vio_swapchain_info($ctx);
 $sm = $info['shader_model'] ?? 0;
+$ver = $info['shader_model_version'] ?? 0;
+if (getenv('VIO_REQUIRE_SM6') && $sm !== 6) echo "FAIL: VIO_REQUIRE_SM6 set but shader_model is $sm (dxc_dir '$dir')\n";
 echo "shader_model: ", $sm === 6 ? "6" : ($sm === 5 ? "5 (DXC unavailable, FXC fallback)" : "unexpected $sm"), "\n";
+/* The profile is the highest 6.x device and DXC agree on; FXC reports 5.1. */
+$verOk = $sm === 6 ? ($ver >= 60 && $ver <= 69) : $ver === 51;
+echo "version: ", $verOk ? "OK" : "FAIL $ver", "\n";
 
 /* Graphics: a green quad through the requested shader model. */
 $vs = "#version 330 core\nlayout(location=0) in vec3 aPos;\nvoid main(){ gl_Position = vec4(aPos, 1.0); }";
@@ -63,6 +70,7 @@ echo "DONE\n";
 ?>
 --EXPECTF--
 shader_model: %s
+version: OK
 graphics: OK
 compute: %s
 DONE

@@ -18,7 +18,7 @@ if (!$any) die("skip no GPU backend");
  * artifact (DXBC per stage on D3D11/D3D12, a program binary on GL >= 4.1).
  * Second context in the same directory: the same source is a cache hit and the
  * shader still draws. Vulkan (2D only) writes its VkPipelineCache blob when the
- * context is destroyed; OpenGL below 4.1 has no program binaries and is
+ * context is destroyed, Metal its MTLBinaryArchive (OPEN-ITEMS A22); OpenGL below 4.1 has no program binaries and is
  * reported as such. */
 $dir = sys_get_temp_dir() . '/vio-shader-cache-' . getmypid();
 @mkdir($dir);
@@ -76,7 +76,7 @@ function run_backend(string $name, string $dir): string {
     return $fail ? "FAIL\n  " . implode("\n  ", $fail) : ($glNoBinary ? "OK (no program binaries below GL 4.1)" : "OK");
 }
 
-foreach (['opengl', 'd3d11', 'd3d12', 'vulkan'] as $b) {
+foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
     echo "$b: ", run_backend($b, $dir), "\n";
 }
 foreach (glob($dir . '/*') ?: [] as $f) @unlink($f);
@@ -88,4 +88,5 @@ opengl: %s
 d3d11: %s
 d3d12: %s
 vulkan: %s
+metal: %s
 DONE

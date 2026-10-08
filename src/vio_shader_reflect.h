@@ -20,6 +20,7 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
  * source that uses gl_Layer / gl_ViewportIndex without declaring it. Takes
  * ownership of the malloc'd source, returns the (possibly new) string. */
 char *vio_glsl_require_viewport_layer_ext(char *glsl);
+char *vio_glsl_require_mesh_shader_ext(char *glsl);
 
 /* Transpile a COMPUTE SPIR-V module to GLSL (target version >= 430, clamped).
  * Unlike vio_spirv_to_glsl(), keeps UBOs as std140 blocks and SSBOs as std430
@@ -34,6 +35,34 @@ char *vio_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, char **error_ms
 /* Transpile SPIR-V to HLSL (target shader_model e.g. 50=SM5.0, 51=SM5.1).
  * Returns malloc'd string (caller frees). NULL on failure. */
 char *vio_spirv_to_hlsl(const uint32_t *spirv, size_t spirv_size, int shader_model, char **error_msg);
+/* Native 16-bit types in the HLSL (`half` / int16_t instead of min16float):
+ * set by D3D12 under SM 6.2+ with Native16BitShaderOpsSupported, cleared by
+ * every other D3D context. Process-wide, like the D3D backends themselves. */
+void vio_hlsl_set_16bit_types(int enable);
+/* 1 when the SPIR-V module decorates a variable with BuiltIn `builtin`
+ * (e.g. 4432 PrimitiveShadingRateKHR). Plain word scan, no SPIRV-Cross. */
+int vio_spirv_has_builtin(const void *spirv, size_t bytes, uint32_t builtin);
+int vio_spirv_has_capability(const void *spirv, size_t bytes, uint32_t capability);
+/* 1 when any resource of the module is decorated with descriptor set `set`
+ * (set 1 = the bindless table). */
+int vio_spirv_uses_descriptor_set(const void *spirv, size_t bytes, uint32_t set);
+uint32_t vio_spirv_local_size_x(const void *spirv, size_t bytes);   /* 0 when not a literal LocalSize */
+/* Execution model of the module's first OpEntryPoint (0 = Vertex, 4 = Fragment,
+ * 5364 = TaskEXT, 5365 = MeshEXT, ...), -1 when the words are no SPIR-V. */
+int vio_spirv_execution_model(const void *spirv, size_t bytes);
+#define VIO_SPIRV_MODEL_TASK_EXT 5364
+#define VIO_SPIRV_MODEL_MESH_EXT 5365
+/* Mesh stages: SPIRV-Cross applies no clip-space fixup to gl_MeshVerticesEXT
+ * positions. Rewrites every `gl_MeshVerticesEXT[i].gl_Position = e;` of the
+ * transpiled source to store the GL position converted for the backend:
+ * flip_y negates y (Vulkan), fix_z maps z from [-w, w] to [0, w] (D3D, Vulkan).
+ * `vec4` names the target language's vector type. Takes ownership of `src`. */
+char *vio_mesh_fix_positions(char *src, int flip_y, int fix_z, const char *vec4);
+/* Binding of the module's first acceleration-structure variable (GL_EXT_ray_query),
+ * -1 when it has none. Plain word scan. */
+int vio_spirv_accel_binding(const void *spirv, size_t bytes);
+/* GL_OVR_multiview2: views of the next vio_spirv_to_glsl calls (0 = off). */
+void vio_glsl_set_ovr_view_count(int views);
 
 /* Same, with explicit control over the GL -> D3D clip-space depth fixup
  * (z' = (z + w) / 2 on gl_Position writes). SPIRV-Cross applies it to EVERY
@@ -112,4 +141,73 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
                                    vio_uniform_entry *entries, int max_entries,
                                    int *total_size);
 
+/* Binding of the uniform block vio_spirv_get_uniform_offsets reads (the first
+ * one) when it is a named block; -1 for loose uniforms (glslang's default
+ * uniform block), push constants or no block. */
+int vio_spirv_uniform_block_binding(const uint32_t *spirv, size_t spirv_size);
+
+/* GLSL targets that need combined samplers (OpenGL, the Vulkan round trip):
+ * turn separate textures + samplers (texture(sampler2D(u_tex, u_smp), uv)) into
+ * one combined sampler per pair, named after the texture so
+ * vio_set_uniform('u_tex', unit) and vio_bind_texture reach it. The bindless
+ * table (set 1) stays separate: then nothing is combined. `compiler` is an
+ * spvc_compiler before compile; returns the number of combined samplers. */
+int vio_spvc_combine_separate(void *compiler);
+
+/* Names of the separate textures in set 0, in reflection order (the order the
+ * HLSL translation gives them t-registers after the combined samplers).
+ * Returns the count (<= max). */
+int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*names)[64], int max);
+
+/* Entries of gl_ClipDistance a stage writes through its outputs (the array
+ * length of the gl_PerVertex member or variable it accesses), 0 if none.
+ * Plain SPIR-V parsing, also without SPIRV-Cross. */
+int vio_spirv_output_clip_distances(const uint32_t *spirv, size_t spirv_size);
+/* 1 when the stage reads or writes gl_ClipDistance. */
+int vio_spirv_uses_clip_distance(const uint32_t *spirv, size_t spirv_size);
+
+/* Shader-wide sampler registers by NAME (OPEN-ITEMS-PLAN A30). Every stage of a
+ * D3D / Vulkan shader shares one texture table, so a sampler must land on the
+ * same register in every stage that declares it. Counting per stage broke that
+ * whenever stages listed their samplers in a different order - and SPIRV-Cross
+ * lists them in SPIR-V id order, i.e. glslang's order of first use, not the
+ * declaration order. The plan walks the stages in the sampler-map order of
+ * php_vio.c (fragment, geometry, tess control, tess eval, mesh, task): the
+ * fragment stage keeps its replayed registers (regular 0.., depth 8..,
+ * separate textures after the combined ones), every later name takes the lowest
+ * free register of its kind. vio_spirv_to_hlsl and the Vulkan stage rewrite
+ * look names up while a plan is in use (vio_sampler_plan_use around the
+ * backend's compile_shader / create_pipeline); names outside it keep the
+ * per-stage counter. */
+#define VIO_SAMPLER_PLAN_MAX 32
+typedef struct _vio_sampler_plan {
+    int  count;
+    char names[VIO_SAMPLER_PLAN_MAX][64];
+    int  reg[VIO_SAMPLER_PLAN_MAX];
+    int  is_depth[VIO_SAMPLER_PLAN_MAX];
+    /* The geometry stage writes gl_PrimitiveID (A28): it travels to the fragment
+     * stage as a flat int varying at VIO_PRIMID_LOCATION (D3D, Metal). */
+    int  gs_writes_primid;
+} vio_sampler_plan;
+
+#define VIO_PRIMID_LOCATION 30
+/* 1 when the module writes the BuiltIn `builtin` through an Output variable. */
+int vio_spirv_writes_builtin(const uint32_t *spirv, size_t spirv_size, uint32_t builtin);
+/* A copy of the module with the variable decorated BuiltIn `builtin` in `storage`
+ * (1 Input, 3 Output) moved to Location `location` (+ Flat), or NULL if none. */
+uint32_t *vio_spirv_builtin_to_location(const uint32_t *spirv, size_t words, uint32_t builtin, uint32_t storage,
+                                        uint32_t location, int flat, size_t *out_words);
+/* A copy of the module with every Input / Output interface block without
+ * built-ins (arrayed or not) split into one variable per member at the member's
+ * location, or NULL when there is none or a use it cannot rewrite. */
+uint32_t *vio_spirv_flatten_io_blocks(const uint32_t *spirv, size_t words, size_t *out_words);
+
+/* spirv[0] is the fragment stage; NULL entries are skipped. */
+void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv, const size_t *size, int n);
+void vio_sampler_plan_use(const vio_sampler_plan *plan);   /* NULL ends it */
+const vio_sampler_plan *vio_sampler_plan_current(void);
+int  vio_sampler_plan_reg(const char *name);   /* -1: no plan in use or name not listed */
+/* Position in the plan = position in php_vio.c's sampler map: the register of
+ * SM 5.0 (D3D11), which numbers every sampler in one sequence and binds by index. */
+int  vio_sampler_plan_index(const char *name);
 #endif /* VIO_SHADER_REFLECT_H */

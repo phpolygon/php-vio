@@ -43,7 +43,8 @@
 #define VK3D_B_EXTRA_UBO0   26
 #define VK3D_MAX_EXTRA_UBO  4
 #define VK3D_B_STAGE_UBO0   30   /* + VIO_EXTRA_STAGE_INDEX(stage): GS 30, TCS 31, TES 32 */
-#define VK3D_MAX_BINDINGS   33
+#define VK3D_B_ACCEL        33   /* ray query: the acceleration structure (vio_bind_acceleration_structure) */
+#define VK3D_MAX_BINDINGS   34
 #define VK3D_DYN_UBOS       5    /* dynamic default blocks: VS, FS, GS, TCS, TES */
 #define VK3D_MAX_VARIANTS   12
 
@@ -65,6 +66,10 @@ typedef struct _vk3d_binding {
 typedef struct _vio_vk3d_shader {
     VkShaderModule        vs, fs;
     VkShaderModule        gs, tcs, tes;   /* optional stages, VK_NULL_HANDLE when absent */
+    /* Mesh pipeline (VIO_FEATURE_MESH_SHADER): vs holds the MESH stage, ts the
+     * optional task stage; no vertex input / input assembly. */
+    int                   is_mesh;
+    VkShaderModule        ts;
     VkDescriptorSetLayout set_layout;
     VkPipelineLayout      layout;
     vk3d_binding          bindings[VK3D_MAX_BINDINGS];
@@ -75,6 +80,8 @@ typedef struct _vio_vk3d_shader {
     int                   fs_sampler_depth[VK3D_MAX_SAMPLERS];
     int                   fs_sampler_count;
     int                   fs_needed_without_color; /* fragment stage discards or writes depth */
+    int                   uses_bindless;           /* reads the bindless table (Set 1, BINDLESS-PLAN.md) */
+    int                   writes_shading_rate;     /* the vertex stage writes gl_PrimitiveShadingRateEXT */
     int                   dead;       /* GPU objects released (context torn down) */
     struct _vio_vk3d_shader *next, *prev;
 } vio_vk3d_shader;

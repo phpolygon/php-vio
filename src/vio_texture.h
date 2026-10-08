@@ -34,6 +34,10 @@ typedef struct _vio_texture_object {
     int          mip_levels;    /* levels uploaded explicitly (1 = base only / driver-generated) */
     const struct _vio_backend *backend;
     unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
+    /* Sampler feedback from GLSL (A15): the map, a storage buffer of
+     * [regions_x, regions_y, region, 0] + one uint (lowest mip, ~0 = never) per region. */
+    void        *fb_emul;
+    int          fb_rx, fb_ry, fb_region;
     zend_object  std;
 } vio_texture_object;
 
