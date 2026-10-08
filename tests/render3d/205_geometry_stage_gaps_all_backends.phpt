@@ -89,6 +89,7 @@ function run_backend(string $name): string {
     if ($ctx && vio_backend_name($ctx) !== $name) { vio_destroy($ctx); $ctx = null; }
     if (!$ctx) return "skip (unavailable)";
     if (!vio_supports_feature($ctx, VIO_FEATURE_GEOMETRY)) { vio_destroy($ctx); return "skip (no geometry stage)"; }
+    error_clear_last();   /* an earlier backend's failed vio_create */
     $tess = vio_supports_feature($ctx, VIO_FEATURE_TESSELLATION);
     $tex = vio_texture($ctx, ['data' => pack('C*', 0, 0, 0, 255, 40, 0, 0, 255, 80, 0, 0, 255, 0, 0, 0, 255), 'width' => 4, 'height' => 1, 'filter' => VIO_FILTER_NEAREST]);
     $full = vio_mesh($ctx, ['vertices' => $FULL, 'layout' => [VIO_FLOAT3]]);
@@ -105,8 +106,11 @@ function run_backend(string $name): string {
             error_clear_last();
             continue;
         }
-        $sh = @vio_shader($ctx, $stages);
-        if (!$sh) { $fail[] = "$id: shader not created" . (($e = error_get_last()) ? ": " . $e['message'] : ''); error_clear_last(); continue; }
+        $GLOBALS['WARN'] = [];
+        set_error_handler(function ($no, $msg) { $GLOBALS['WARN'][] = $msg; return true; });
+        $sh = vio_shader($ctx, $stages);
+        restore_error_handler();
+        if (!$sh) { $fail[] = "$id: shader not created: " . implode(' | ', $GLOBALS['WARN']); $GLOBALS['WARN'] = []; continue; }
         $po = ['shader' => $sh, 'depth_test' => false, 'cull_mode' => VIO_CULL_NONE];
         if (isset($c['topology'])) $po['topology'] = $c['topology'];
         if (isset($c['patch_vertices'])) $po['patch_vertices'] = $c['patch_vertices'];

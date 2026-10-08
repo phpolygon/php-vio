@@ -93,8 +93,11 @@ function run_backend(string $name): string {
     $quad = vio_mesh($ctx, ['vertices' => [-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0], 'layout' => [VIO_FLOAT3]]);
     $fail = [];
     foreach ($CASES as $id => $c) {
-        $sh = @vio_shader($ctx, ['vertex' => $c['vertex'], 'tess_control' => $c['tess_control'], 'tess_eval' => $c['tess_eval'], 'fragment' => $FS]);
-        if (!$sh) { $fail[] = "$id: shader not created" . (($e = error_get_last()) ? ": " . $e['message'] : ''); error_clear_last(); continue; }
+        $GLOBALS['WARN'] = [];
+        set_error_handler(function ($no, $msg) { $GLOBALS['WARN'][] = $msg; return true; });
+        $sh = vio_shader($ctx, ['vertex' => $c['vertex'], 'tess_control' => $c['tess_control'], 'tess_eval' => $c['tess_eval'], 'fragment' => $FS]);
+        restore_error_handler();
+        if (!$sh) { $fail[] = "$id: shader not created: " . implode(' | ', $GLOBALS['WARN']); $GLOBALS['WARN'] = []; continue; }
         $pipe = vio_pipeline($ctx, ['shader' => $sh, 'patch_vertices' => 4, 'depth_test' => false, 'cull_mode' => VIO_CULL_NONE]);
         if (!$pipe) { $fail[] = "$id: pipeline not created"; continue; }
         vio_clear($ctx, 0, 0, 0, 1);
