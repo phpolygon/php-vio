@@ -1848,10 +1848,14 @@ static void metal_end_frame(void)
  * (the first one from its buffer's GPUStartTime) to its buffer's GPUEndTime.
  * The completion handlers run on Metal threads; whichever finishes last
  * publishes the frame. The upload ring fences on the frame's last buffer
- * (metal_ring_end_frame), so splitting the frame keeps its memory alive. */
+ * (metal_ring_end_frame), so splitting the frame keeps its memory alive.
+ * A section never starts before its own buffer's GPUStartTime: the idle gap
+ * between two buffers is no work of the later section (on the virtualised
+ * CI GPU the gap was larger than a light section, test 172). */
 typedef struct {
     vio_gpu_mark_names names;
     double             start;
+    double             begin[VIO_GPU_MARKS_MAX];   /* each section buffer's GPUStartTime */
     double             end[VIO_GPU_MARKS_MAX];
     atomic_int         remaining;   /* section buffers + the frame's last buffer */
 } metal_mark_frame;
@@ -1869,7 +1873,8 @@ static void metal_marks_publish(const metal_mark_frame *mf)
     for (int i = 0; i < r.count; i++) {
         memcpy(r.name[i], mf->names.name[i], VIO_GPU_MARK_NAME_MAX);
         double t = mf->end[i];
-        r.ms[i] = t > prev ? (t - prev) * 1000.0 : 0.0;
+        double from = mf->begin[i] > prev ? mf->begin[i] : prev;
+        r.ms[i] = t > from ? (t - from) * 1000.0 : 0.0;
         if (t > prev) prev = t;
     }
     os_unfair_lock_lock(&metal_marks_lock);
@@ -6703,6 +6708,7 @@ static int metal_gpu_mark(const char *name)
         atomic_fetch_add(&mf->remaining, 1);
         [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
             if (i == 0) mf->start = done.GPUStartTime;
+            mf->begin[i] = done.GPUStartTime;
             mf->end[i] = done.GPUEndTime;
             metal_marks_done(mf);
         }];
