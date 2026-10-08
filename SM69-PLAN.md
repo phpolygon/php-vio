@@ -1,5 +1,13 @@
 # SM69-PLAN — Shader Model 6.9 vollständig, Windows-CI auf aktuellem WARP
 
+> **Status 2026-10-08: ✅ Phasen 0–4 umgesetzt.** Tests 216 (Long Vectors), 217 (D3D12-RT-Wechsel, Nebenbefund),
+> 218 (16-Bit-Sonderwerte), 219 (SER), 220 (OMM). Belegt auf NuGet-WARP 1.0.21 + Agility 1.619.6 + DXC 1.9 (lokal
+> und CI, `VIO_REQUIRE_*=d3d12`) sowie auf der RTX 2080 unter D3D12 (Agility 619) und Vulkan. Abweichungen vom Plan:
+> die WARP-Variable heißt `VIO_D3D_WARP` (gilt für D3D11 und D3D12); Long Vectors laufen auf D3D12 über den
+> HLSL-Compute-Override (`'hlsl' => …`), nicht über einen SPIRV-Cross-Patch; SER-HLSL ebenso nur als HLSL-Stage
+> (SPIRV-Cross stürzt an `hitObjectEXT` ab); `RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS` fügt vio selbst in die
+> SPIRV-Cross-Ausgabe ein. OMM-API: `'format' => 2|4` statt Konstanten.
+
 Stand 2026-10-08. Ziel: alles, was das **finale** Shader Model 6.9 (Agility SDK 1.619, DXC 1.9.2602) bringt, als
 portable vio-Features – GLSL bleibt die Quelle, wo es eine GLSL-Form gibt – und ein CI-Beleg dafür, der über
 SM 6.2 hinausgeht. Fortsetzung von `SHADER-FEATURES-PLAN.md` (Phasen 6c, 8b).
