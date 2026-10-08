@@ -15,7 +15,7 @@
 
 #ifdef HAVE_OPENGL
 
-#include <glad/glad.h>
+#include "../../../vendor/glad/include/glad/glad.h"   /* by path, see php_vio.c */
 #include "../../vio_shader_cache.h"
 
 #include "vio_opengl.h"
