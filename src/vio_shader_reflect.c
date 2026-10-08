@@ -426,11 +426,14 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
     /* gl_ViewIndex -> gl_ViewID_OVR + layout(num_views = N) (vio_shader 'view_count'). */
     if (vio_glsl_ovr_views > 0)
         spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_GLSL_OVR_MULTIVIEW_VIEW_COUNT, (unsigned)vio_glsl_ovr_views);
-    /* Every stage redeclares gl_PerVertex in full (in and out): otherwise a
-     * vertex stage writes `out float gl_ClipDistance[1]` while the
-     * tessellation / geometry stages read an implicit gl_in block, and strict
-     * linkers (Mesa) refuse the mismatched blocks. Redeclaring needs GLSL 4.10. */
-    if (version >= 410) spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_GLSL_SEPARATE_SHADER_OBJECTS, SPVC_TRUE);
+    /* A stage that touches gl_ClipDistance redeclares gl_PerVertex in full (in
+     * and out): otherwise a vertex stage writes `out float gl_ClipDistance[1]`
+     * while the tessellation / geometry stages read an implicit gl_in block, and
+     * strict linkers (Mesa) refuse the mismatched blocks. Only those stages:
+     * Mesa then drops gl_Layer / gl_ViewportIndex from the vertex stage.
+     * Redeclaring needs GLSL 4.10. */
+    if (version >= 410 && vio_spirv_uses_clip_distance(spirv, spirv_size))
+        spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_GLSL_SEPARATE_SHADER_OBJECTS, SPVC_TRUE);
     spvc_compiler_install_compiler_options(compiler, options);
     /* GLSL for OpenGL has no separate textures / samplers. */
     vio_spvc_combine_separate(compiler);
@@ -1715,7 +1718,20 @@ void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv
 
 /* ── gl_ClipDistance outputs (OPEN-ITEMS-PLAN A29) ──────────────────── */
 
+static int vio_spirv_clip_distances_ex(const uint32_t *w, size_t size, int outputs_only);
+
 int vio_spirv_output_clip_distances(const uint32_t *w, size_t size)
+{
+    return vio_spirv_clip_distances_ex(w, size, 1);
+}
+
+/* Any access to gl_ClipDistance, input or output. */
+int vio_spirv_uses_clip_distance(const uint32_t *w, size_t size)
+{
+    return vio_spirv_clip_distances_ex(w, size, 0) > 0;
+}
+
+static int vio_spirv_clip_distances_ex(const uint32_t *w, size_t size, int outputs_only)
 {
     size_t n = size / 4;
     if (!w || n < 5 || w[0] != 0x07230203) return 0;
@@ -1742,7 +1758,7 @@ int vio_spirv_output_clip_distances(const uint32_t *w, size_t size)
         if ((op != 65 && op != 66) || wc < 4) continue;   /* OpAccessChain / OpInBoundsAccessChain */
         uint32_t base = w[i + 3];
         size_t vd = base < bound ? def[base] : 0;
-        if (!vd || (w[vd] & 0xFFFF) != 59 || w[vd + 3] != 3 /* Output */) continue;
+        if (!vd || (w[vd] & 0xFFFF) != 59 || (outputs_only && w[vd + 3] != 3 /* Output */)) continue;
         size_t pd = w[vd + 1] < bound ? def[w[vd + 1]] : 0;
         if (!pd || (w[pd] & 0xFFFF) != 32) continue;
         uint32_t t = w[pd + 3];

@@ -163,6 +163,8 @@ int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*n
  * length of the gl_PerVertex member or variable it accesses), 0 if none.
  * Plain SPIR-V parsing, also without SPIRV-Cross. */
 int vio_spirv_output_clip_distances(const uint32_t *spirv, size_t spirv_size);
+/* 1 when the stage reads or writes gl_ClipDistance. */
+int vio_spirv_uses_clip_distance(const uint32_t *spirv, size_t spirv_size);
 
 /* Shader-wide sampler registers by NAME (OPEN-ITEMS-PLAN A30). Every stage of a
  * D3D / Vulkan shader shares one texture table, so a sampler must land on the
