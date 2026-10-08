@@ -87,6 +87,7 @@ $send = function (int $type, int $mask, int $code, int $px = 0, int $py = 0) use
 const KeyPress = 2, KeyRelease = 3, ButtonPress = 4, ButtonRelease = 5, MotionNotify = 6;
 const KeyPressMask = 1, KeyReleaseMask = 2, ButtonPressMask = 4, ButtonReleaseMask = 8, PointerMotionMask = 64;
 
+$out = [];
 $log = [];
 vio_on_key($ctx, function ($key, $action, $mods) use (&$log) { $log[] = "$key/$action"; });
 $poll = function () use ($ctx, $x, $dpy, &$log) { $x->XFlush($dpy); usleep(100000); $log = []; vio_poll_events($ctx); return implode(' ', $log); };
@@ -96,9 +97,9 @@ $kc = $x->XKeysymToKeycode($dpy, 0x61);
 vio_begin($ctx); vio_end($ctx);
 $send(KeyPress, KeyPressMask, $kc);
 $send(KeyPress, KeyPressMask, $kc);
-echo "keys: ", $poll(), " A=", json_encode(vio_key_pressed($ctx, VIO_KEY_A)), " text=", bin2hex(vio_chars_typed($ctx)), "\n";
+$out[] = "keys: " . $poll() . " A=" . json_encode(vio_key_pressed($ctx, VIO_KEY_A)) . " text=" . bin2hex(vio_chars_typed($ctx));
 $send(KeyRelease, KeyReleaseMask, $kc);
-echo "keys up: ", $poll(), "\n";
+$out[] = "keys up: " . $poll();
 
 /* mouse: position, left and right buttons, wheel up (4) and right (6) */
 vio_begin($ctx); vio_end($ctx);
@@ -108,12 +109,14 @@ $send(ButtonPress, ButtonPressMask, 3, 21, 13);
 $send(ButtonPress, ButtonPressMask, 4, 21, 13);
 $send(ButtonPress, ButtonPressMask, 6, 21, 13);
 $poll();
-echo "mouse: pos=", json_encode(vio_mouse_position($ctx)), " L=", json_encode(vio_mouse_button($ctx, VIO_MOUSE_LEFT)),
-     " R=", json_encode(vio_mouse_button($ctx, VIO_MOUSE_RIGHT)), " scroll=", json_encode(vio_mouse_scroll($ctx)), "\n";
+$out[] = "mouse: pos=" . json_encode(vio_mouse_position($ctx)) . " L=" . json_encode(vio_mouse_button($ctx, VIO_MOUSE_LEFT))
+     . " R=" . json_encode(vio_mouse_button($ctx, VIO_MOUSE_RIGHT)) . " scroll=" . json_encode(vio_mouse_scroll($ctx));
 $send(ButtonRelease, ButtonReleaseMask, 1, 21, 13);
 $poll();
-echo "mouse up: L=", json_encode(vio_mouse_button($ctx, VIO_MOUSE_LEFT)), "\n";
+$out[] = "mouse up: L=" . json_encode(vio_mouse_button($ctx, VIO_MOUSE_LEFT));
 $x->XCloseDisplay($dpy);
+$want = ["keys: 65/1 65/2 A=true text=6161", "keys up: 65/0", "mouse: pos=[21,13] L=true R=true scroll=[1,1]", "mouse up: L=false"];
+echo "input: ", $out === $want ? "OK" : "FAIL\n  " . implode("\n  ", $out), "\n";
 vio_destroy($ctx);
 PHP;
 
@@ -132,7 +135,4 @@ opengl: %r(OK|skip)%r
 vulkan: %r(OK|skip)%r
 window: true
 monitors: true modes: true
-%r(input: skip \(no FFI\)|keys: 65/1 65/2 A=true text=6161
-keys up: 65/0
-mouse: pos=\[21,13\] L=true R=true scroll=\[1,1\]
-mouse up: L=false)%r
+input: %r(OK|skip \(no FFI\))%r
