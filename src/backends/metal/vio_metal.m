@@ -244,6 +244,12 @@ static int            metal_vp_has_scissor = 0;  /* vio_viewports sets a scissor
 static id<MTLTexture>      metal_fs_tex[VIO_METAL_FS_SLOTS];
 static id<MTLSamplerState> metal_fs_smp[VIO_METAL_FS_SLOTS];
 
+/* Textures of the compute kernels of an emulated geometry stage (A28) by MSL
+ * index: [0] vertex kernel, [1] geometry kernel (metal_bind_gs_stage_texture,
+ * set on the kernel encoders by metal_draw_gs). */
+static id<MTLTexture>      metal_gs_tex[2][VIO_METAL_FS_SLOTS];
+static id<MTLSamplerState> metal_gs_smp[2][VIO_METAL_FS_SLOTS];
+
 static void metal_fs_shadow_reset(void)
 {
     for (int i = 0; i < VIO_METAL_FS_SLOTS; i++) { metal_fs_tex[i] = nil; metal_fs_smp[i] = nil; }
@@ -1934,14 +1940,18 @@ static char *metal_gs_prepare(vio_metal_shader *sh, const uint32_t *vs_spirv, si
     size_t pt_size = 0;
     char *warn = NULL;
     id<MTLComputePipelineState> vs_pso = nil, gs_pso = nil;
-    if (mk_parse(&mv, vs_spirv, vs_size, err) != 0) return NULL;
-    if (mk_parse(&mg, (const uint32_t *)gs_data, gs_size, err) != 0) { mk_free(&mv); return NULL; }
+    /* Interface blocks (A28): one varying per member, linked by location like
+     * the fragment stage (metal_compile_shader flattens it too). The parsed
+     * modules point into these copies, freed after the kernels are built. */
+    size_t vs_flat_words = 0, gs_flat_words = 0;
+    uint32_t *vs_flat = vio_spirv_flatten_io_blocks(vs_spirv, vs_size / 4, &vs_flat_words);
+    uint32_t *gs_flat = vio_spirv_flatten_io_blocks((const uint32_t *)gs_data, gs_size / 4, &gs_flat_words);
+    if (vs_flat) { vs_spirv = vs_flat; vs_size = vs_flat_words * 4; }
+    if (gs_flat) { gs_data = gs_flat; gs_size = gs_flat_words * 4; }
+    if (mk_parse(&mv, vs_spirv, vs_size, err) != 0) { free(vs_flat); free(gs_flat); return NULL; }
+    if (mk_parse(&mg, (const uint32_t *)gs_data, gs_size, err) != 0) { mk_free(&mv); free(vs_flat); free(gs_flat); return NULL; }
     if (mv.model != MK_MODEL_VERTEX || mg.model != MK_MODEL_GEOMETRY) {
         *err = strdup("expected a vertex and a geometry stage");
-        goto done;
-    }
-    if (mv.has_samplers || mg.has_samplers) {
-        *err = strdup("textures in the vertex / geometry stage of a geometry pipeline are not supported on Metal");
         goto done;
     }
     vk = mk_vs_kernel_glsl(&mv, err);
@@ -1984,6 +1994,7 @@ static char *metal_gs_prepare(vio_metal_shader *sh, const uint32_t *vs_spirv, si
 done:
     mk_free(&mv);
     mk_free(&mg);
+    free(vs_flat); free(gs_flat);
     free(vk); free(gk); free(pt); free(pt_spv);
     if (!sh->gs) { free(msl); return NULL; }
     return msl;
@@ -2101,6 +2112,20 @@ static void *metal_compile_shader(vio_shader_desc *desc)
     } else if (desc->geometry_data) {
         vs_msl = metal_gs_prepare(sh, vs_spirv, vs_size, desc->geometry_data, desc->geometry_size, &err);
         if (!vs_msl) { what = "geometry stage"; goto fail; }
+        /* Fragment inputs as the pass-through stage writes them (A28): blocks
+         * split per member, gl_PrimitiveID from the geometry stage as a flat
+         * int at VIO_PRIMID_LOCATION. */
+        size_t nw = 0;
+        uint32_t *nf = vio_spirv_flatten_io_blocks(fs_spirv, fs_size / 4, &nw);
+        if (nf) {
+            if (fs_owned) free(fs_spirv);
+            fs_spirv = nf; fs_size = nw * 4; fs_owned = 1;
+        }
+        if (vio_spirv_writes_builtin((const uint32_t *)desc->geometry_data, desc->geometry_size, 7) &&
+            (nf = vio_spirv_builtin_to_location(fs_spirv, fs_size / 4, 7, 1, VIO_PRIMID_LOCATION, 1, &nw)) != NULL) {
+            if (fs_owned) free(fs_spirv);
+            fs_spirv = nf; fs_size = nw * 4; fs_owned = 1;
+        }
     } else {
         vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_VERTEX, &sh->vs, &sh->vl,
                                         0xFFFFFFFFu, NULL, &err);
@@ -4696,8 +4721,18 @@ static void metal_draw_tess(vio_metal_buffer *vb, int stride, int first_vertex, 
 
 /* Source position of vertex k of primitive `prim` for the pipeline topology,
  * -1 when the topology cannot feed this input primitive. */
-static long metal_gs_assemble(vio_topology topo, int n_in, long prim, int k)
+static long metal_gs_assemble(vio_topology topo, int n_in, long prim, long n_prims, int k)
 {
+    if (topo == VIO_TRIANGLE_STRIP_ADJACENCY && n_in == 6) {
+        /* GL 10.1.12, table 10.1 (1-based), in GS order v1, a12, v2, a23, v3, a31 */
+        long i = prim, t[6];
+        int last = i == n_prims - 1;
+        if (n_prims == 1) { t[0] = 1; t[1] = 2; t[2] = 3; t[3] = 6; t[4] = 5; t[5] = 4; }
+        else if (i == 0)  { t[0] = 1; t[1] = 2; t[2] = 3; t[3] = 7; t[4] = 5; t[5] = 4; }
+        else if (i & 1)   { t[0] = 2*i+3; t[1] = 2*i-1; t[2] = 2*i+1; t[3] = 2*i+4; t[4] = 2*i+5; t[5] = last ? 2*i+6 : 2*i+7; }
+        else              { t[0] = 2*i+1; t[1] = 2*i-1; t[2] = 2*i+3; t[3] = last ? 2*i+6 : 2*i+7; t[4] = 2*i+5; t[5] = 2*i+4; }
+        return t[k] - 1;
+    }
     switch (topo) {
         case VIO_LINE_STRIP:
             if (n_in == 2) return prim + k;
@@ -4715,8 +4750,6 @@ static long metal_gs_assemble(vio_topology topo, int n_in, long prim, int k)
         case VIO_LINE_STRIP_ADJACENCY:
             if (n_in == 4) return prim + k;
             break;
-        case VIO_TRIANGLE_STRIP_ADJACENCY:
-            return -1;
         default:
             break;
     }
@@ -4730,10 +4763,20 @@ static long metal_gs_prim_count(vio_topology topo, int n_in, long n_src)
         case VIO_TRIANGLE_STRIP:
         case VIO_TRIANGLE_FAN:          if (n_in == 3) return n_src - 2; break;
         case VIO_LINE_STRIP_ADJACENCY:  if (n_in == 4) return n_src - 3; break;
-        case VIO_TRIANGLE_STRIP_ADJACENCY: return -1;
+        case VIO_TRIANGLE_STRIP_ADJACENCY: if (n_in == 6) return n_src >= 6 ? (n_src - 4) / 2 : 0; break;
         default: break;
     }
     return n_src / n_in;
+}
+
+static void metal_gs_kernel_textures(id<MTLComputeCommandEncoder> ce, const vio_metal_stage_res *res, int k)
+{
+    for (int i = 0; i < res->texture_count; i++) {
+        int ix = res->textures[i].msl_index;
+        if (ix < 0 || ix >= VIO_METAL_FS_SLOTS || !metal_gs_tex[k][ix]) continue;
+        [ce setTexture:metal_gs_tex[k][ix] atIndex:(NSUInteger)ix];
+        if (metal_gs_smp[k][ix]) [ce setSamplerState:metal_gs_smp[k][ix] atIndex:(NSUInteger)ix];
+    }
 }
 
 static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, int vertex_count,
@@ -4752,11 +4795,7 @@ static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, in
         long n_src = indexed ? index_count : vertex_count;
         size_t vb_count = stride > 0 ? vb->size / (size_t)stride : 1;
         long prims = metal_gs_prim_count(p->topology, sh->gs_in_vertices, n_src);
-        if (prims < 0) {
-            php_error_docref(NULL, E_WARNING, "Metal: triangle strips with adjacency are not supported by the geometry emulation");
-            return;
-        }
-        if (prims == 0 || sh->gs_idx_per == 0) return;
+        if (prims <= 0 || sh->gs_idx_per == 0) return;
         NSUInteger stream = (NSUInteger)prims * (NSUInteger)sh->gs_in_vertices;
         NSUInteger total_inv = (NSUInteger)prims * (NSUInteger)sh->gs_invocations * (NSUInteger)instances;
 
@@ -4783,7 +4822,7 @@ static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, in
             size_t ib_count = indexed ? ib->size / (index_bytes == 2 ? 2 : 4) : 0;
             for (long pr = 0; pr < prims; pr++) {
                 for (int k = 0; k < sh->gs_in_vertices; k++) {
-                    long s = metal_gs_assemble(p->topology, sh->gs_in_vertices, pr, k);
+                    long s = metal_gs_assemble(p->topology, sh->gs_in_vertices, pr, prims, k);
                     long long v;
                     if (indexed) {
                         size_t at = (size_t)first_index + (size_t)s;
@@ -4852,6 +4891,7 @@ static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, in
             (ix = mk_user_storage(&sh->gs_vsk, metal_pending_storage_binding)) >= 0) {
             [ce setBuffer:(__bridge id<MTLBuffer>)metal_pending_storage->buffer offset:0 atIndex:(NSUInteger)ix];
         }
+        metal_gs_kernel_textures(ce, &sh->gs_vsk, 0);
         NSUInteger tw = vs_pso.maxTotalThreadsPerThreadgroup < VIO_MK_LOCAL_SIZE ? vs_pso.maxTotalThreadsPerThreadgroup : VIO_MK_LOCAL_SIZE;
         [ce dispatchThreads:MTLSizeMake(stream, (NSUInteger)instances, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
         [ce endEncoding];
@@ -4875,6 +4915,7 @@ static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, in
                 [ce setBytes:zero_block length:sizeof(zero_block) atIndex:(NSUInteger)sh->gs_gs_cb];
             }
         }
+        metal_gs_kernel_textures(ce, &sh->gs_gsk, 1);
         NSUInteger gx = (NSUInteger)prims * (NSUInteger)sh->gs_invocations;
         tw = gs_pso.maxTotalThreadsPerThreadgroup < VIO_MK_LOCAL_SIZE ? gs_pso.maxTotalThreadsPerThreadgroup : VIO_MK_LOCAL_SIZE;
         [ce dispatchThreads:MTLSizeMake(gx, (NSUInteger)instances, 1) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
@@ -5302,11 +5343,44 @@ static void metal_bind_mesh_stage_texture(int slot, id<MTLTexture> tex, id<MTLSa
     }
 }
 
+/* Emulated geometry stage (A28): the sampler map lists the fragment samplers,
+ * then the geometry stage's new names, then the vertex stage's. Samplers the
+ * kernels declare are remembered by MSL index for metal_draw_gs. */
+static void metal_bind_gs_stage_texture(int slot, id<MTLTexture> tex, id<MTLSamplerState> smp, id<MTLSamplerState> cmp)
+{
+    vio_metal_pipeline *p = metal_current_pipeline;
+    if (!p || !p->shader || !p->shader->gs || slot < 0) return;
+    const vio_metal_stage_res *stages[3] = { &p->shader->fs, &p->shader->gs_gsk, &p->shader->gs_vsk };
+    const char *names[3 * VIO_METAL_MAX_RES];
+    int n = 0;
+    for (int s = 0; s < 3; s++) {
+        for (int i = 0; i < stages[s]->texture_count; i++) {
+            const char *nm = stages[s]->textures[i].name;
+            int known = 0;
+            for (int k = 0; k < n && !known; k++) known = strcmp(names[k], nm) == 0;
+            if (!known) names[n++] = nm;
+        }
+    }
+    if (slot >= n) return;
+    for (int s = 1; s < 3; s++) {
+        for (int i = 0; i < stages[s]->texture_count; i++) {
+            const vio_metal_res_texture *rt = &stages[s]->textures[i];
+            if (strcmp(rt->name, names[slot]) != 0 || rt->msl_index < 0 || rt->msl_index >= VIO_METAL_FS_SLOTS) continue;
+            int k = s == 2 ? 0 : 1;
+            metal_gs_tex[k][rt->msl_index] = tex;
+            metal_gs_smp[k][rt->msl_index] = rt->is_depth && cmp ? cmp : smp;
+        }
+    }
+}
+
 static void metal_bind_texture(void *texture, int slot)
 {
     vio_metal_texture *t = (vio_metal_texture *)texture;
     if (!t || !t->tex || !vio_mtl.current_encoder || slot < 0) return;
     @autoreleasepool {
+        if (metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->gs)
+            metal_bind_gs_stage_texture(slot, (__bridge id<MTLTexture>)t->tex,
+                                        (__bridge id<MTLSamplerState>)t->sampler, metal_texture_cmp_sampler(t));
         int is_depth = 0;
         int idx = metal_resolve_fs_texture(slot, &is_depth);
         if (idx < 0 || idx > 30) return;

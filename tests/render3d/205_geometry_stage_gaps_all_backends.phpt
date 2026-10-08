@@ -15,7 +15,8 @@ vio
  *      same texture -> red 40 + 80 = 120.
  *   D. VS -> GS -> FS through interface blocks (vec3 + float) -> (255, 128, 64).
  *   E. VS -> TCS -> TES -> GS -> FS: one quad patch, the GS passes the triangles
- *      through and paints green. */
+ *      through and paints green. Metal refuses it (the emulated geometry stage
+ *      would need the tessellator's triangles, which Metal does not expose). */
 $W = 8; $H = 4;
 $FS_COL = "#version 450\nlayout(location = 0) in vec4 vcol;\nlayout(location = 0) out vec4 o;\nvoid main(){ o = vcol; }";
 
@@ -97,6 +98,13 @@ function run_backend(string $name): string {
         if ($id === 'E' && !$tess) continue;
         $stages = ['vertex' => $c['vertex'], 'geometry' => $c['geometry'], 'fragment' => $c['fragment']];
         if (isset($c['tess_control'])) { $stages['tess_control'] = $c['tess_control']; $stages['tess_eval'] = $c['tess_eval']; }
+        if ($id === 'E' && $name === 'metal') {
+            /* Metal's tessellator does not hand out the triangles it generates,
+             * which the emulated geometry stage would need: refused with a warning. */
+            if (@vio_shader($ctx, $stages)) $fail[] = "E: Metal accepted a geometry stage behind tessellation";
+            error_clear_last();
+            continue;
+        }
         $sh = @vio_shader($ctx, $stages);
         if (!$sh) { $fail[] = "$id: shader not created" . (($e = error_get_last()) ? ": " . $e['message'] : ''); error_clear_last(); continue; }
         $po = ['shader' => $sh, 'depth_test' => false, 'cull_mode' => VIO_CULL_NONE];

@@ -676,7 +676,11 @@ static uint32_t vio_gs_loc_count(const uint32_t *spv, const size_t *def, uint32_
 #define VIO_GS_MAX_BLOCKS 8
 #define VIO_GS_MAX_MEMBERS 16
 
-static uint32_t *vio_gs_flatten_input_blocks(const uint32_t *spv, size_t words, size_t *out_words)
+/* `outputs` also flattens Output blocks, `any_model` every stage, not only
+ * geometry (the Metal geometry emulation, which turns the stages into compute
+ * kernels and links varyings by location). Blocks may be arrayed (per-vertex
+ * inputs) or not: block.member... becomes member... . */
+static uint32_t *vio_flatten_io_blocks(const uint32_t *spv, size_t words, size_t *out_words, int outputs, int any_model)
 {
     if (words < 5 || spv[0] != 0x07230203) return NULL;
     uint32_t bound = spv[3];
@@ -706,20 +710,30 @@ static uint32_t *vio_gs_flatten_input_blocks(const uint32_t *spv, size_t words, 
         else if ((op == 43 || op == 59) && wc >= 3 && spv[i + 2] < bound) def[spv[i + 2]] = i;
         i += wc;
     }
-    if (!is_geometry) goto done;
+    if (!is_geometry && !any_model) goto done;
 
-    /* Candidates: Input arrays of Block structs without built-ins. */
+    /* Candidates: Input (and Output) Block structs, or arrays of them, without built-ins. */
     uint32_t bvar[VIO_GS_MAX_BLOCKS], bst[VIO_GS_MAX_BLOCKS], blen[VIO_GS_MAX_BLOCKS], nmem[VIO_GS_MAX_BLOCKS];
+    uint32_t bstorage[VIO_GS_MAX_BLOCKS];
     uint32_t mvar[VIO_GS_MAX_BLOCKS][VIO_GS_MAX_MEMBERS], mloc[VIO_GS_MAX_BLOCKS][VIO_GS_MAX_MEMBERS];
     int nb = 0;
     for (uint32_t id = 1; id < bound; id++) {
         size_t vd = def[id];
-        if (!vd || (spv[vd] & 0xFFFF) != 59 || spv[vd + 3] != 1) continue;
+        if (!vd || (spv[vd] & 0xFFFF) != 59) continue;
+        if (spv[vd + 3] != 1 && !(outputs && spv[vd + 3] == 3)) continue;
         size_t pt = spv[vd + 1] < bound ? def[spv[vd + 1]] : 0;
         if (!pt || (spv[pt] & 0xFFFF) != 32) continue;
         size_t at = spv[pt + 3] < bound ? def[spv[pt + 3]] : 0;
-        if (!at || (spv[at] & 0xFFFF) != 28) continue;
-        uint32_t st = spv[at + 2];
+        if (!at) continue;
+        uint32_t st, len = 0;
+        if ((spv[at] & 0xFFFF) == 28) {
+            size_t c = spv[at + 3] < bound ? def[spv[at + 3]] : 0;
+            if (!c || (spv[c] & 0xFFFF) != 43) continue;
+            st = spv[at + 2];
+            len = spv[at + 3];
+        } else if ((spv[at] & 0xFFFF) == 30) {
+            st = spv[pt + 3];
+        } else continue;
         size_t sd = st < bound ? def[st] : 0;
         if (!sd || (spv[sd] & 0xFFFF) != 30 || !block[st] || bi_struct[st]) continue;
         uint32_t members = (spv[sd] >> 16) - 2;
@@ -733,20 +747,22 @@ static uint32_t *vio_gs_flatten_input_blocks(const uint32_t *spv, size_t words, 
             mloc[nb][k] = (uint32_t)running;
             running += (int32_t)vio_gs_loc_count(spv, def, bound, spv[sd + 2 + k]);
         }
-        bvar[nb] = id; bst[nb] = st; blen[nb] = spv[at + 3]; nmem[nb] = members;
+        bvar[nb] = id; bst[nb] = st; blen[nb] = len; nmem[nb] = members; bstorage[nb] = spv[vd + 3];
         nb++;
     }
     if (!nb) goto done;
 
-    /* Every use must be an access chain block[i].member...; anything else stays. */
+    /* Every use must be an access chain block[i].member... (block.member... when
+     * not arrayed); anything else stays. */
     for (size_t i = 5; i < words; i += spv[i] >> 16) {
         uint32_t op = spv[i] & 0xFFFF, wc = spv[i] >> 16;
         if (op == 15 || op == 5 || op == 71 || op == 59) continue;
         for (uint32_t k = 1; k < wc; k++) {
             for (int b = 0; b < nb; b++) {
                 if (spv[i + k] != bvar[b]) continue;
-                if (!((op == 65 || op == 66) && k == 3 && wc >= 6)) goto done;
-                size_t c = spv[i + 5] < bound ? def[spv[i + 5]] : 0;
+                uint32_t mi = blen[b] ? 5 : 4;
+                if (!((op == 65 || op == 66) && k == 3 && wc >= mi + 1)) goto done;
+                size_t c = spv[i + mi] < bound ? def[spv[i + mi]] : 0;
                 if (!c || (spv[c] & 0xFFFF) != 43 || spv[c + 3] >= nmem[b]) goto done;
             }
         }
@@ -785,11 +801,15 @@ static uint32_t *vio_gs_flatten_input_blocks(const uint32_t *spv, size_t words, 
             for (int b = 0; b < nb; b++) {
                 size_t sd = def[bst[b]];
                 for (uint32_t k = 0; k < nmem[b]; k++) {
-                    uint32_t a[3] = { marr[b][k], spv[sd + 2 + k], blen[b] };
-                    spv_inst(&out, 28, a, 3);
-                    uint32_t p[3] = { mptr[b][k], 1, marr[b][k] };
+                    uint32_t pointee = spv[sd + 2 + k];
+                    if (blen[b]) {
+                        uint32_t a[3] = { marr[b][k], spv[sd + 2 + k], blen[b] };
+                        spv_inst(&out, 28, a, 3);
+                        pointee = marr[b][k];
+                    }
+                    uint32_t p[3] = { mptr[b][k], bstorage[b], pointee };
                     spv_inst(&out, 32, p, 3);
-                    uint32_t v[3] = { mptr[b][k], mvar[b][k], 1 };
+                    uint32_t v[3] = { mptr[b][k], mvar[b][k], bstorage[b] };
                     spv_inst(&out, 59, v, 3);
                 }
             }
@@ -809,18 +829,19 @@ static uint32_t *vio_gs_flatten_input_blocks(const uint32_t *spv, size_t words, 
             }
             spv_inst(&out, 15, ep.w, (uint32_t)ep.n);
             free(ep.w);
-        } else if ((op == 65 || op == 66) && wc >= 6) {
+        } else if ((op == 65 || op == 66) && wc >= 5) {
             int b2 = -1;
             for (int b = 0; b < nb; b++) if (spv[i + 3] == bvar[b]) b2 = b;
             if (b2 < 0) { for (uint32_t j = 0; j < wc; j++) spv_push(&out, spv[i + j]); }
             else {
-                uint32_t member = spv[def[spv[i + 5]] + 3];
+                uint32_t mi = blen[b2] ? 5 : 4;
+                uint32_t member = spv[def[spv[i + mi]] + 3];
                 vio_spv_words ac = { NULL, 0, 0, 0 };
                 spv_push(&ac, spv[i + 1]);
                 spv_push(&ac, spv[i + 2]);
                 spv_push(&ac, mvar[b2][member]);
-                spv_push(&ac, spv[i + 4]);
-                for (uint32_t j = 6; j < wc; j++) spv_push(&ac, spv[i + j]);
+                if (blen[b2]) spv_push(&ac, spv[i + 4]);
+                for (uint32_t j = mi + 1; j < wc; j++) spv_push(&ac, spv[i + j]);
                 spv_inst(&out, op, ac.w, (uint32_t)ac.n);
                 free(ac.w);
             }
@@ -836,6 +857,17 @@ done:
     free(def); free(block); free(bi_struct); free(loc);
     return res;
 }
+
+static uint32_t *vio_gs_flatten_input_blocks(const uint32_t *spv, size_t words, size_t *out_words)
+{
+    return vio_flatten_io_blocks(spv, words, out_words, 0, 0);
+}
+
+uint32_t *vio_spirv_flatten_io_blocks(const uint32_t *spv, size_t words, size_t *out_words)
+{
+    return vio_flatten_io_blocks(spv, words, out_words, 1, 1);
+}
+
 /* Returns a rewritten module (malloc'd, *out_words set) or NULL when nothing
  * had to change. *pos_location receives the location of the position input
  * (VIO_GS_POS_LOCATION_NONE if none), *invocation 1 when gl_InvocationID was

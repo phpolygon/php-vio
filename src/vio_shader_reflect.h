@@ -197,6 +197,10 @@ int vio_spirv_writes_builtin(const uint32_t *spirv, size_t spirv_size, uint32_t 
  * (1 Input, 3 Output) moved to Location `location` (+ Flat), or NULL if none. */
 uint32_t *vio_spirv_builtin_to_location(const uint32_t *spirv, size_t words, uint32_t builtin, uint32_t storage,
                                         uint32_t location, int flat, size_t *out_words);
+/* A copy of the module with every Input / Output interface block without
+ * built-ins (arrayed or not) split into one variable per member at the member's
+ * location, or NULL when there is none or a use it cannot rewrite. */
+uint32_t *vio_spirv_flatten_io_blocks(const uint32_t *spirv, size_t words, size_t *out_words);
 
 /* spirv[0] is the fragment stage; NULL entries are skipped. */
 void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv, const size_t *size, int n);
