@@ -49,7 +49,8 @@ A30 Texturen in Mesh-/Task-Stages ✅ (Test 197; Nebenbefund: Sampler-Register j
 A14 TLAS-Objekt mit Rebuild/Refit ✅ (`vio_acceleration_structure_update`, Test 199; Nebenbefunde: `vio_mesh` hielt die Dreiecke nur bei `RAY_QUERY`, nicht bei `RAYTRACING` – ein DXR-1.0-Gerät konnte keine Struktur bauen; D3D12-Debug-Warnung 1328 bei jedem Build) · A15 Sampler-Feedback-Emulation ✅ (Tests 203/204: zuerst Fragment-Storage-Buffer auf allen Backends, darauf `VIO_SAMPLER_FEEDBACK_GLSL`; auf D3D12 werden Hardware- und GLSL-Karte zusammengeführt) · A18 Vulkan-Shading-Rate-Bild → **verschoben hinter A37** (Batch 6): die RTX 2080 kann es (`attachmentFragmentShadingRate`), aber das Bild ist ein Attachment des Render-Passes; vio legt alle Passes mit `vkCreateRenderPass` (v1) an und baut Pipelines je Pass-Signatur. Mit Dynamic Rendering (A37) ist es ein Feld von `vkCmdBeginRendering` statt einer zweiten Varianten-Achse über alle Passes.
 
 ## Batch 6 — große Pakete
-A37 Vulkan 1.2+ (Timeline-Semaphores, Dynamic Rendering, Sync2) · A38 Recording über Secondary Command Buffers ·
+A37 Vulkan 1.2+ (Timeline-Semaphores, Dynamic Rendering, Sync2) ✅ (VULKAN-MODERN-PLAN, Test 206; Nebenbefunde: Vulkan lehnte `vio_read_render_target` im Frame ab; der headless Capture-Puffer hatte keine Abhängigkeit zwischen den Frames – Sync-Validierung) ·
+A18 Vulkan-Shading-Rate-Bild ✅ (Test 160 auf Vulkan) · A38 Recording über Secondary Command Buffers ·
 A21 Upscaling `vio_upscale` (eigener portabler Compute-Pfad; MetalFX dahinter (CI); DirectSR erst mit Retail-SDK) ·
 A39 GPU-Video-Encoding über Interop (FFmpeg-Hardware-Encoder) · A22 Metal `MTLBinaryArchive` (CI) ·
 A16 Rate Maps (CI) · A17 Metal-Tensoren über `'msl'`-Override (CI, M5-Hardware nicht lokal).

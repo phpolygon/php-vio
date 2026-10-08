@@ -1,5 +1,8 @@
 # Vulkan 1.2+ — Timeline-Semaphores, Synchronization2, Dynamic Rendering (OPEN-ITEMS A37, danach A18)
 
+> **Status: ✅ umgesetzt (2026-10-08), Phasen 1–5.** Abweichung vom Kontrakt: `pipeline_variants` in
+> `vio_backend_info` entfällt (die Caps sind Booleans); der Varianten-Schlüssel war schon die Attachment-Signatur.
+
 > Stand 2026-10-08. Ziel: das Vulkan-Backend auf den Kern moderner Treiber stellen. Mindestanforderung wird
 > **Vulkan 1.3**, oder **1.2 mit `VK_KHR_dynamic_rendering` + `VK_KHR_synchronization2`** (Timeline-Semaphores
 > sind Kern 1.2). Alle Desktop-Treiber seit 2022 und MoltenVK erfüllen das. Ein Gerät ohne die drei Features wird
