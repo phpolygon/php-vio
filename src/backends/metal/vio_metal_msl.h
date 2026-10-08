@@ -378,6 +378,108 @@ static int metal_msl_bindless(spvc_compiler compiler, spvc_resources resources, 
     return uses;
 }
 
+/* The tessellation stages read their inputs from buffers whose structs
+ * SPIRV-Cross builds from the inputs a stage USES: an evaluation stage that
+ * declares `v` and `w` but reads only `w` gets {w, gl_Position} while the
+ * control stage writes {v, w, gl_Position}, and `w` reads `v` (test 198 C on
+ * the macOS CI). A copy of the module whose entry point loads every
+ * location-decorated input once makes all of them active, so both sides lay
+ * out the same members. NULL when there is nothing to add. */
+static uint32_t *metal_spirv_use_all_inputs(const uint32_t *w, size_t words, size_t *out_words)
+{
+    if (words < 5 || w[0] != 0x07230203) return NULL;
+    uint32_t bound = w[3], ep = 0;
+    size_t *def = (size_t *)calloc(bound ? bound : 1, sizeof(size_t));
+    unsigned char *has_loc = (unsigned char *)calloc(bound ? bound : 1, 1);
+    uint32_t vars[64], types[64];
+    int nv = 0;
+    size_t insert = 0;
+    uint32_t *out = NULL;
+    if (!def || !has_loc) goto done;
+    for (size_t i = 5; i < words; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if (!wc || i + wc > words) goto done;
+        if (op == 15 && wc >= 3 && !ep) ep = w[i + 2];
+        else if (op == 71 && wc >= 4 && w[i + 2] == 30 && w[i + 1] < bound) has_loc[w[i + 1]] = 1;
+        else if (op == 32 && wc >= 4 && w[i + 1] < bound) def[w[i + 1]] = i;           /* OpTypePointer */
+    }
+    for (size_t i = 5; i < words; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if (op == 59 && wc >= 4 && w[i + 3] == 1 /* Input */ && w[i + 2] < bound && has_loc[w[i + 2]]
+            && w[i + 1] < bound && def[w[i + 1]] && nv < 64) {
+            vars[nv] = w[i + 2];
+            types[nv] = w[def[w[i + 1]] + 3];   /* the pointee */
+            nv++;
+        }
+        if (op == 54 && wc >= 3 && w[i + 2] == ep) {
+            /* after the entry block's label and its OpVariables */
+            size_t j = i + wc;
+            while (j < words && (w[j] & 0xFFFF) != 248 /* OpLabel */) j += w[j] >> 16;
+            if (j >= words) goto done;
+            j += w[j] >> 16;
+            while (j < words && (w[j] & 0xFFFF) == 59) j += w[j] >> 16;
+            insert = j;
+        }
+    }
+    if (!nv || !insert) goto done;
+    out = (uint32_t *)malloc((words + (size_t)nv * 4) * sizeof(uint32_t));
+    if (!out) goto done;
+    memcpy(out, w, insert * sizeof(uint32_t));
+    size_t o = insert;
+    for (int k = 0; k < nv; k++) {
+        out[o++] = (4u << 16) | 61;   /* OpLoad type result pointer */
+        out[o++] = types[k];
+        out[o++] = bound++;
+        out[o++] = vars[k];
+    }
+    memcpy(out + o, w + insert, (words - insert) * sizeof(uint32_t));
+    o += words - insert;
+    out[3] = bound;
+    *out_words = o;
+done:
+    free(def);
+    free(has_loc);
+    return out;
+}
+
+/* Functions whose GLSL name is a type or keyword of the Metal language
+ * (`quad` is metal::quad): SPIRV-Cross keeps the name and the Metal compiler
+ * rejects it ("redefinition of 'quad' as different kind of symbol", test 205
+ * on the macOS CI). They get a suffix before the MSL is written. */
+static void metal_msl_rename_reserved(spvc_compiler compiler, const uint32_t *w, size_t words)
+{
+    static const char *reserved[] = {
+        "quad", "simd", "simdgroup", "quadgroup", "vec", "matrix", "array", "sampler", "texture",
+        "kernel", "vertex", "fragment", "mesh", "object", "device", "constant", "thread", "threadgroup",
+        "half", "uchar", "ushort", "ulong", "size_t", "ptrdiff_t", "visible", "intersection", NULL };
+    if (words < 5 || w[0] != 0x07230203) return;
+    uint32_t bound = w[3];
+    unsigned char *is_fn = (unsigned char *)calloc(bound ? bound : 1, 1);
+    if (!is_fn) return;
+    for (size_t i = 5; i < words && (w[i] >> 16); i += w[i] >> 16) {
+        if ((w[i] & 0xFFFF) == 54 /* OpFunction */ && (w[i] >> 16) >= 3 && w[i + 2] < bound) is_fn[w[i + 2]] = 1;
+    }
+    for (size_t i = 5; i < words && (w[i] >> 16); i += w[i] >> 16) {
+        if ((w[i] & 0xFFFF) != 5 /* OpName */ || (w[i] >> 16) < 3 || w[i + 1] >= bound || !is_fn[w[i + 1]]) continue;
+        const char *name = (const char *)&w[i + 2];
+        size_t len = strnlen(name, ((size_t)(w[i] >> 16) - 2) * 4);
+        char base[64];
+        if (len == 0 || len >= sizeof(base)) continue;
+        memcpy(base, name, len);
+        base[len] = '\0';
+        char *paren = strchr(base, '(');   /* glslang names functions "quad(f1;f1;" */
+        if (paren) *paren = '\0';
+        for (int r = 0; reserved[r]; r++) {
+            if (strcmp(base, reserved[r]) != 0) continue;
+            char renamed[80];
+            snprintf(renamed, sizeof(renamed), "%s_vio", base);
+            spvc_compiler_set_name(compiler, w[i + 1], renamed);
+            break;
+        }
+    }
+    free(is_fn);
+}
+
 /* Transpile one GRAPHICS stage to MSL with deterministic resource indices.
  *
  * glslang's AUTO_MAP_BINDINGS leaves every resource of an OpenGL-style shader
@@ -427,6 +529,7 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
         spvc_context_destroy(ctx);
         return NULL;
     }
+    metal_msl_rename_reserved(compiler, spirv, spirv_size / sizeof(uint32_t));
 
     if (spvc_compiler_create_compiler_options(compiler, &opts) == SPVC_SUCCESS) {
         /* Mesh / task stages need MSL 3.0 (the ladder only reports the
