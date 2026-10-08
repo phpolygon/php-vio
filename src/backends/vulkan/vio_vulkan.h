@@ -298,6 +298,15 @@ typedef struct _vio_vulkan_state {
     int                      vertex_layer_supported; /* VK_EXT_shader_viewport_index_layer enabled (gl_Layer in the VS) */
     /* Block 10c: textureCompressionBC, VK_KHR_fragment_shading_rate (pipeline rate). */
     int                      instance_api_11;      /* instance created with apiVersion 1.1 */
+    /* VULKAN-MODERN-PLAN (A37): the instance API version (1.2 or 1.3), whether the
+     * device runs the 1.3 core entry points, and the entry points of timeline
+     * semaphores, synchronization2 and dynamic rendering (core or KHR names).
+     * A device without the three features is never selected. */
+    uint32_t                 instance_api;
+    int                      core13;
+    void                    *fn_begin_rendering, *fn_end_rendering;   /* vkCmdBeginRendering / vkCmdEndRendering */
+    void                    *fn_barrier2, *fn_submit2;                /* vkCmdPipelineBarrier2 / vkQueueSubmit2 */
+    void                    *fn_wait_semaphores, *fn_counter_value;   /* vkWaitSemaphores / vkGetSemaphoreCounterValue */
     int                      bc_supported;
     int                      astc_supported;   /* textureCompressionASTC_LDR enabled (A20) */
     int                      vrs_supported;

@@ -99,12 +99,19 @@ static int create_instance(int debug)
     app_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
     app_info.pEngineName        = "php-vio";
     app_info.engineVersion      = VK_MAKE_VERSION(0, 1, 0);
-    /* 1.1 when the loader offers it: VkPhysicalDeviceFeatures2 for
-     * VK_KHR_fragment_shading_rate (Block 10c). Everything else stays 1.0 API. */
+    /* Vulkan 1.3 when the loader offers it, else 1.2: timeline semaphores,
+     * synchronization2 and dynamic rendering are required (VULKAN-MODERN-PLAN).
+     * An older loader cannot run the backend. */
     uint32_t loader_version = VK_API_VERSION_1_0;
     if (vkEnumerateInstanceVersion(&loader_version) != VK_SUCCESS) loader_version = VK_API_VERSION_1_0;
-    vio_vk.instance_api_11 = loader_version >= VK_API_VERSION_1_1;
-    app_info.apiVersion         = vio_vk.instance_api_11 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
+    if (loader_version < VK_API_VERSION_1_2) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: the loader offers Vulkan %u.%u, vio needs 1.2 or newer",
+                         VK_VERSION_MAJOR(loader_version), VK_VERSION_MINOR(loader_version));
+        return -1;
+    }
+    vio_vk.instance_api = loader_version >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_2;
+    vio_vk.instance_api_11 = 1;
+    app_info.apiVersion         = vio_vk.instance_api;
 
     /* Required extensions from GLFW + portability */
     uint32_t glfw_ext_count = 0;
@@ -193,6 +200,47 @@ static int create_instance(int debug)
 
 /* ── Physical device selection ───────────────────────────────────── */
 
+static int vk_device_has_ext(VkPhysicalDevice dev, const char *name)
+{
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(dev, NULL, &n, NULL);
+    VkExtensionProperties *e = n ? (VkExtensionProperties *)malloc(n * sizeof(*e)) : NULL;
+    int found = 0;
+    if (e) {
+        vkEnumerateDeviceExtensionProperties(dev, NULL, &n, e);
+        for (uint32_t i = 0; i < n && !found; i++) found = strcmp(e[i].extensionName, name) == 0;
+        free(e);
+    }
+    return found;
+}
+
+/* VULKAN-MODERN-PLAN: timeline semaphores (core 1.2), synchronization2 and
+ * dynamic rendering (core 1.3, or the KHR extensions on 1.2). Returns 1 when
+ * the 1.3 core runs them, 2 when the extensions do, 0 when the device lacks one. */
+static int vk_device_modern(VkPhysicalDevice dev)
+{
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(dev, &p);
+    if (p.apiVersion < VK_API_VERSION_1_2) return 0;
+    int core13 = p.apiVersion >= VK_API_VERSION_1_3 && vio_vk.instance_api >= VK_API_VERSION_1_3;
+    if (!core13 && (!vk_device_has_ext(dev, "VK_KHR_dynamic_rendering") || !vk_device_has_ext(dev, "VK_KHR_synchronization2")))
+        return 0;
+    VkPhysicalDeviceTimelineSemaphoreFeatures tl = {0};
+    tl.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+    VkPhysicalDeviceSynchronization2Features s2 = {0};
+    s2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
+    VkPhysicalDeviceDynamicRenderingFeatures dr = {0};
+    dr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
+    tl.pNext = &s2;
+    s2.pNext = &dr;
+    VkPhysicalDeviceFeatures2 f2 = {0};
+    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    f2.pNext = &tl;
+    vkGetPhysicalDeviceFeatures2(dev, &f2);
+    if (!tl.timelineSemaphore || !s2.synchronization2 || !dr.dynamicRendering) return 0;
+    return core13 ? 1 : 2;
+}
+
 static int select_physical_device(void)
 {
     uint32_t count = 0;
@@ -205,8 +253,13 @@ static int select_physical_device(void)
     VkPhysicalDevice *devices = malloc(count * sizeof(VkPhysicalDevice));
     vkEnumeratePhysicalDevices(vio_vk.instance, &count, devices);
 
-    /* Pick first device with graphics + present queue support */
+    /* Pick the first device with the modern core and graphics + present queues */
+    int modern_seen = 0;
     for (uint32_t i = 0; i < count; i++) {
+        int modern = vk_device_modern(devices[i]);
+        if (!modern) continue;
+        modern_seen = 1;
+        vio_vk.core13 = modern == 1;
         uint32_t qf_count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &qf_count, NULL);
         VkQueueFamilyProperties *qf_props = malloc(qf_count * sizeof(VkQueueFamilyProperties));
@@ -240,7 +293,11 @@ static int select_physical_device(void)
     }
 
     free(devices);
-    php_error_docref(NULL, E_WARNING, "No suitable Vulkan GPU found (need graphics + present queue)");
+    if (!modern_seen)
+        php_error_docref(NULL, E_WARNING, "No suitable Vulkan GPU found: vio needs Vulkan 1.3, or 1.2 with "
+                         "VK_KHR_dynamic_rendering and VK_KHR_synchronization2 (plus timeline semaphores)");
+    else
+        php_error_docref(NULL, E_WARNING, "No suitable Vulkan GPU found (need graphics + present queue)");
     return -1;
 }
 
@@ -818,6 +875,25 @@ static int create_logical_device(void)
     }
 #endif
     (void)coopmat_f16;
+    /* VULKAN-MODERN-PLAN: the three required features (checked at selection). */
+    VkPhysicalDeviceTimelineSemaphoreFeatures tl_enable = {0};
+    tl_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+    tl_enable.timelineSemaphore = VK_TRUE;
+    VkPhysicalDeviceSynchronization2Features s2_enable = {0};
+    s2_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
+    s2_enable.synchronization2 = VK_TRUE;
+    VkPhysicalDeviceDynamicRenderingFeatures dr_enable = {0};
+    dr_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
+    dr_enable.dynamicRendering = VK_TRUE;
+    tl_enable.pNext = feature_chain;
+    s2_enable.pNext = &tl_enable;
+    dr_enable.pNext = &s2_enable;
+    feature_chain = &dr_enable;
+    if (!vio_vk.core13) {
+        VIO_VK_ADD_DEVICE_EXT("VK_KHR_dynamic_rendering");
+        VIO_VK_ADD_DEVICE_EXT("VK_KHR_synchronization2");
+        create_info.enabledExtensionCount = device_ext_count;
+    }
     create_info.pNext = feature_chain;
 
     VkResult result = vkCreateDevice(vio_vk.physical_device, &create_info, NULL, &vio_vk.device);
@@ -827,6 +903,26 @@ static int create_logical_device(void)
     }
 
     vkGetDeviceQueue(vio_vk.device, vio_vk.graphics_family, 0, &vio_vk.graphics_queue);
+    {
+        /* core names on a 1.3 device (1.2 for the timeline), KHR names otherwise */
+        const char *names[6][2] = {
+            { "vkCmdBeginRendering", "vkCmdBeginRenderingKHR" }, { "vkCmdEndRendering", "vkCmdEndRenderingKHR" },
+            { "vkCmdPipelineBarrier2", "vkCmdPipelineBarrier2KHR" }, { "vkQueueSubmit2", "vkQueueSubmit2KHR" },
+            { "vkWaitSemaphores", "vkWaitSemaphoresKHR" }, { "vkGetSemaphoreCounterValue", "vkGetSemaphoreCounterValueKHR" } };
+        void **slots[6] = { &vio_vk.fn_begin_rendering, &vio_vk.fn_end_rendering, &vio_vk.fn_barrier2,
+                            &vio_vk.fn_submit2, &vio_vk.fn_wait_semaphores, &vio_vk.fn_counter_value };
+        for (int i = 0; i < 6; i++) {
+            int core = i >= 4 || vio_vk.core13;
+            *slots[i] = (void *)vkGetDeviceProcAddr(vio_vk.device, names[i][core ? 0 : 1]);
+            if (!*slots[i]) *slots[i] = (void *)vkGetDeviceProcAddr(vio_vk.device, names[i][core ? 1 : 0]);
+            if (!*slots[i]) {
+                php_error_docref(NULL, E_WARNING, "Vulkan: %s is missing", names[i][0]);
+                vkDestroyDevice(vio_vk.device, NULL);
+                vio_vk.device = VK_NULL_HANDLE;
+                return -1;
+            }
+        }
+    }
     if (vio_vk.vrs_supported) {
         vio_vk.vrs_cmd_set = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCmdSetFragmentShadingRateKHR");
         if (!vio_vk.vrs_cmd_set) vio_vk.vrs_supported = 0;   /* pipelines are only built with the dynamic state when this is set */
@@ -1095,7 +1191,7 @@ static int vulkan_describe(vio_backend_description *out)
     if (!vio_vk.initialized || !vio_vk.physical_device || !out) return -1;
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(vio_vk.physical_device, &props);
-    uint32_t inst = vio_vk.instance_api_11 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
+    uint32_t inst = vio_vk.instance_api;
     uint32_t used = props.apiVersion < inst ? props.apiVersion : inst;
     snprintf(api, sizeof(api), "Vulkan %u.%u", VK_VERSION_MAJOR(used), VK_VERSION_MINOR(used));
     snprintf(core, sizeof(core), "core_%u_%u", VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion));
@@ -1119,6 +1215,12 @@ static int vulkan_describe(vio_backend_description *out)
     out->families[out->family_count++] = core;
     out->cap_count = 0;
     vio_describe_feature_caps(out, vulkan_supports_feature);
+    /* VULKAN-MODERN-PLAN: required at device selection, so always on here. */
+    static const char *modern[] = { "dynamic_rendering", "synchronization2", "timeline_semaphore" };
+    for (int i = 0; i < 3 && out->cap_count < VIO_BACKEND_INFO_MAX_CAPS; i++) {
+        out->cap_names[out->cap_count] = modern[i];
+        out->cap_values[out->cap_count++] = 1;
+    }
     out->vendor_id = props.vendorID;
     out->driver = driver;
     switch (props.deviceType) {
