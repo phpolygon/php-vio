@@ -1,6 +1,0 @@
-     opengl: %s
-002+   no GPU time after 7 frames (-1)
-     d3d11: %s
-     d3d12: %s
-     vulkan: %s
---

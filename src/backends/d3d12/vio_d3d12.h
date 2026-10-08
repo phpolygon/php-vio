@@ -88,7 +88,7 @@
 #define VIO_D3D12_RP_VS_CBV       0
 #define VIO_D3D12_RP_PS_CBV       1
 #define VIO_D3D12_RP_PS_SRV       2
-#define VIO_D3D12_RP_VS_SRV       3   /* root SRV t0, vertex storage (Path B) */
+#define VIO_D3D12_RP_VS_STORAGE   3   /* root SRV t0, vertex storage (Path B) */
 #define VIO_D3D12_RP_PS_SAMPLER   4
 #define VIO_D3D12_RP_GS_CBV       5
 #define VIO_D3D12_RP_HS_CBV       6
@@ -101,9 +101,12 @@
 #define VIO_D3D12_RP_DS_SAMPLER   13
 #define VIO_D3D12_RP_ACCEL        14  /* root SRV t0, space9: ray-query acceleration structure (all stages) */
 #define VIO_D3D12_RP_DRAW_PARAMS  15  /* 2 root constants b13 (VERTEX): gl_BaseVertex / gl_BaseInstance below SM 6.8 */
-#define VIO_D3D12_RP_BINDLESS     16  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
-#define VIO_D3D12_RP_FEEDBACK     17  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
-#define VIO_D3D12_RP_COUNT        18
+#define VIO_D3D12_RP_PS_UAV       16  /* [16..19] root UAVs u4..u7 (PIXEL): fragment storage buffers 0..3 (A15) */
+#define VIO_D3D12_RP_VS_SRV       20  /* SRV table t0.. (VERTEX): vertex textures (A28) */
+#define VIO_D3D12_RP_VS_SAMPLER   21  /* sampler table s0.. (VERTEX) */
+#define VIO_D3D12_RP_BINDLESS     22  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
+#define VIO_D3D12_RP_FEEDBACK     23  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
+#define VIO_D3D12_RP_COUNT        24
 
 /* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
  * bytecode (NULL when the vio_shader has no such stage). */
@@ -185,6 +188,7 @@ typedef struct _vio_d3d12_buffer {
      * indirect draw must transition it (GAP-PHASE5 Block 8). Otherwise it rests in
      * COMMON / GENERIC_READ, which promote implicitly. */
     UINT64           uav_live_serial;
+    int              fs_dirty;          /* written by a draw since the last readback (A15) */
 } vio_d3d12_buffer;
 
 /* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */
@@ -668,7 +672,7 @@ typedef struct _vio_d3d12_state {
     int                 ts_result_valid;
 
     /* Window reference */
-    void *glfw_window;
+    void *platform_window;
 } vio_d3d12_state;
 
 extern vio_d3d12_state vio_d3d12;
@@ -677,7 +681,7 @@ extern vio_d3d12_state vio_d3d12;
 void vio_backend_d3d12_register(void);
 
 /* Called after GLFW window creation to set up D3D12 */
-int vio_d3d12_setup_context(void *glfw_window, vio_config *cfg);
+int vio_d3d12_setup_context(void *platform_window, vio_config *cfg);
 
 /* Flush pending texture bindings into a contiguous SRV block (call before draw) */
 void vio_d3d12_flush_srv_table(void);

@@ -13,9 +13,7 @@ static zend_object *vio_context_create_object(zend_class_entry *ce)
 
     ctx->backend      = NULL;
     ctx->surface      = NULL;
-#ifdef HAVE_GLFW
     ctx->window       = NULL;
-#endif
     ctx->initialized  = 0;
     ctx->should_close = 0;
     ctx->in_frame     = 0;
@@ -52,10 +50,30 @@ void vio_context_bindless_clear(vio_context_object *ctx)
     ctx->bindless_free_count = 0;
 }
 
+/* Unbind and release the fragment-stage storage buffers (A15): the backend
+ * keeps raw pointers to them, which must not outlive the context. */
+void vio_context_release_fragment_storage(vio_context_object *ctx)
+{
+    for (int i = 0; i < 4; i++) {
+        if (!ctx->frag_storage[i]) continue;
+        if (ctx->initialized && ctx->backend && ctx->backend->bind_fragment_storage)
+            ctx->backend->bind_fragment_storage(NULL, i);
+        OBJ_RELEASE(ctx->frag_storage[i]);
+        ctx->frag_storage[i] = NULL;
+    }
+    if (ctx->fb_texture) {
+        if (ctx->initialized && ctx->backend && ctx->backend->bind_fragment_storage)
+            ctx->backend->bind_fragment_storage(NULL, 3);
+        OBJ_RELEASE(ctx->fb_texture);
+        ctx->fb_texture = NULL;
+    }
+}
+
 static void vio_context_free_object(zend_object *obj)
 {
     vio_context_object *ctx = vio_context_from_obj(obj);
-
+    vio_context_release_fragment_storage(ctx);
+    vio_upscale_release(ctx);
     /* The table's textures free their GPU objects through the backend: before it shuts down. */
     vio_context_bindless_clear(ctx);
     if (ctx->candidates) {
@@ -82,12 +100,10 @@ static void vio_context_free_object(zend_object *obj)
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }
-#ifdef HAVE_GLFW
         if (ctx->window) {
             vio_window_destroy(ctx->window);
             ctx->window = NULL;
         }
-#endif
         ctx->initialized = 0;
     }
 

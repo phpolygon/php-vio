@@ -157,6 +157,21 @@ typedef struct _vio_render_target_object {
     void        *d3d12_color_backend_texture; /* vio_d3d12_texture* */
     void        *d3d12_depth_backend_texture; /* vio_d3d12_texture* */
 
+    /* 'rate_map' (VIO_FEATURE_RASTER_RATE_MAP, A16): quality 0..1 per zone and
+     * axis; the backend renders into physical_width x physical_height and sets
+     * rate_active. Metal: the rate map, its physical attachments and parameter
+     * buffer, and rrm_dirty while the physical colour is newer than the logical. */
+    float        rate_x[VIO_RATE_MAP_MAX];
+    float        rate_y[VIO_RATE_MAP_MAX];
+    int          rate_nx, rate_ny;
+    int          rate_active;
+    int          physical_width, physical_height;
+    void        *metal_rrm;
+    void        *metal_rrm_color;
+    void        *metal_rrm_depth;
+    void        *metal_rrm_params;
+    int          rrm_dirty;
+
     const struct _vio_backend *backend;  /* Backend that owns the resources above */
     unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
     zend_object  std;

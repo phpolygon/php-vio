@@ -246,6 +246,8 @@ typedef enum _vio_feature {
      * SRV-in-VS), D3D12, Vulkan and Metal; on OpenGL only from 4.3 (SSBOs are
      * core 4.3), so GL < 4.3 reports 0 and callers stay on the readback path.
      * Value 30 (leaves 23-29 free for unrelated features). */
+    VIO_FEATURE_SAMPLER_FEEDBACK_GLSL = 28,  /* vio_write_feedback() from VIO_SAMPLER_FEEDBACK_GLSL feeds vio_sampler_feedback_* (A15) */
+    VIO_FEATURE_FRAGMENT_STORAGE = 27,  /* writable std430 buffers (and atomics) in the fragment stage: vio_bind_fragment_storage_buffer (A15) */
     VIO_FEATURE_VERTEX_STORAGE     = 30,
     /* Stencil test / write through vio_pipeline(['stencil' => [...]]) — the
      * depth attachment carries 8 stencil bits and the pipeline state exposes
@@ -394,7 +396,24 @@ typedef enum _vio_feature {
     /* depth_only render targets with a mip chain built by vio_generate_mipmaps as
      * a max / min reduction of the 2x2 texels below (Hi-Z, OPEN-ITEMS-PLAN A26). */
     VIO_FEATURE_DEPTH_MIPMAPS = 63,
+    /* vio_render_target(['rate_map' => ['x' => [...], 'y' => [...]]]) renders into
+     * a physically smaller target with fewer samples where the quality is lower
+     * (Metal rasterization rate maps, OPEN-ITEMS A16); the logical texture is
+     * resolved when the pass leaves the target. 0 = the option renders at full
+     * rate. Past the 64-bit adapter masks: vio_adapters() never lists it. */
+    VIO_FEATURE_RASTER_RATE_MAP = 64,
+    /* Shader Model 6.9 (SM69-PLAN): vectors of 5..1024 components (GLSL
+     * GL_EXT_long_vector on Vulkan; HLSL vector<T, N> through the compute 'hlsl'
+     * override on D3D12 - SPIRV-Cross has no HLSL form for them), Shader
+     * Execution Reordering (DXR 1.2 / VK_EXT_ray_tracing_invocation_reorder) and
+     * Opacity Micromaps (DXR 1.2 / VK_EXT_opacity_micromap). */
+    VIO_FEATURE_LONG_VECTOR = 65,
+    VIO_FEATURE_SHADER_EXECUTION_REORDER = 66,
+    VIO_FEATURE_OPACITY_MICROMAP = 67,
 } vio_feature;
+
+/* Zones per axis of a rate map. */
+#define VIO_RATE_MAP_MAX 16
 
 /* Component types of a cooperative-matrix shape. */
 typedef enum _vio_coopmat_type {
@@ -438,6 +457,13 @@ typedef struct _vio_coopmat_shape {
 /* vio_bind_render_target() face / layer argument that binds every layer of a
  * cube or array target at once (VIO_FEATURE_LAYERED_RENDER). */
 #define VIO_RT_ALL_LAYERS (-2)
+
+/* Native device APIs a video encoder can share (VIDEO-ENCODE-PLAN.md) */
+#define VIO_ENCODE_API_D3D11 1
+
+/* vio_upscale modes (UPSCALE-PLAN.md) */
+#define VIO_UPSCALE_SPATIAL  0
+#define VIO_UPSCALE_TEMPORAL 1
 
 /* vio_set_shading_rate() rates (GAP-PHASE5 Block 12). 4X4 needs the device's
  * additional-rates capability; the call returns false otherwise. */
@@ -557,7 +583,19 @@ typedef struct _vio_backend_description {
  * the backend can tell without opening its own device (hardware support; the
  * flag of a context may still depend on the shader toolchain). */
 #define VIO_MAX_ADAPTERS 16
-#define VIO_FEATURE_BIT(f) (1ull << (unsigned)(f))
+/* A set of VIO_FEATURE_* flags (adapter descriptions, 'require' / 'prefer').
+ * Two words: the flags passed 63 with VIO_FEATURE_RASTER_RATE_MAP, and a plain
+ * uint64_t mask could neither carry them nor let 'require' name them. */
+#define VIO_FEATURE_SET_MAX 128
+typedef struct _vio_feature_set { uint64_t w[VIO_FEATURE_SET_MAX / 64]; } vio_feature_set;
+static inline void vio_featset_add(vio_feature_set *s, int f)
+{
+    if (f >= 0 && f < VIO_FEATURE_SET_MAX) s->w[f >> 6] |= 1ull << (f & 63);
+}
+static inline int vio_featset_has(const vio_feature_set *s, int f)
+{
+    return f >= 0 && f < VIO_FEATURE_SET_MAX && ((s->w[f >> 6] >> (f & 63)) & 1);
+}
 typedef struct _vio_adapter_info {
     char        name[256];
     uint32_t    vendor_id;
@@ -565,7 +603,7 @@ typedef struct _vio_adapter_info {
     char        driver[64];
     const char *device_type;   /* "discrete" / "integrated" / "software", NULL = unknown */
     uint64_t    vram_bytes;
-    uint64_t    features;
+    vio_feature_set features;
 } vio_adapter_info;
 
 /* Depth mip reduction (A26). */
@@ -633,11 +671,23 @@ typedef struct _vio_as_geometry {
     int             vertex_count;
     const uint32_t *indices;       /* index_count uint32 (NULL: non-indexed triangle list) */
     int             index_count;
+    /* Opacity micromap (VIO_FEATURE_OPACITY_MICROMAP, SM69-PLAN Phase 4): one OMM
+     * per triangle in the OC1 layout both APIs share - 4^subdivision micro-
+     * triangles, 1 (2-state) or 2 (4-state) bits each, LSB first - packed by vio,
+     * omm_bytes per OMM. The geometry is then non-opaque: transparent micro-
+     * triangles are skipped, unknown ones run the any-hit shader. */
+    int                  omm_format;       /* 0 = none, 2 = 2-state, 4 = 4-state */
+    int                  omm_subdivision;  /* 0..12 */
+    const unsigned char *omm_data;         /* omm_count * omm_bytes */
+    int                  omm_count;        /* = the geometry's triangle count */
+    int                  omm_bytes;
 } vio_as_geometry;
 
 typedef struct _vio_as_instance {
     int   geometry;                /* index into geometries */
     float transform[12];           /* row-major 3x4 object -> world */
+    int   hit_group;               /* hit group of the RT pipeline (A13; SBT offset / contribution) */
+    int   mask;                    /* instance mask, 0..255 (rays skip it when mask & cull mask == 0) */
 } vio_as_instance;
 
 typedef struct _vio_as_desc {
@@ -659,21 +709,49 @@ typedef enum {
     VIO_RT_STAGE_COUNT       = 4
 } vio_rt_stage;
 
+#define VIO_RT_STAGE_CALLABLE 4     /* not in spirv[]: vio_rt_pipeline_desc.callable */
+#define VIO_RT_MAX_GROUPS     8     /* miss shaders, hit groups, callables (each) */
+#define VIO_RT_MAX_RECORD     256   /* bytes of shader record data per group */
+
+/* One shader group (A13): a general group (raygen / miss / callable) has its
+ * shader in spirv[0]; a triangle hit group the closest hit in spirv[0] and the
+ * optional any hit in spirv[1]. record = the group's shader record data. */
+typedef struct _vio_rt_group_src {
+    const uint32_t *spirv[2];
+    size_t          spirv_size[2];
+    unsigned char   record[VIO_RT_MAX_RECORD];
+} vio_rt_group_src;
+
 typedef struct _vio_rt_pipeline_desc {
-    const uint32_t *spirv[VIO_RT_STAGE_COUNT];      /* NULL: stage absent (any hit) */
+    const uint32_t *spirv[VIO_RT_STAGE_COUNT];      /* raygen / miss 0 / hit group 0 (legacy view) */
     size_t          spirv_size[VIO_RT_STAGE_COUNT]; /* bytes */
     const char     *hlsl;                           /* D3D12 library source, NULL when not given */
     int             max_recursion;                  /* >= 1 */
     int             payload_size;                   /* bytes, D3D12 shader config */
+    /* Every group (A13): traceRayEXT's missIndex picks a miss shader, the
+     * instance's hit_group (+ sbtRecordOffset) a hit group, executeCallableEXT's
+     * index a callable. record_size bytes of record data follow each handle
+     * (GLSL shaderRecordEXT buffer; D3D12 root constants at b0, space1). */
+    vio_rt_group_src raygen;
+    vio_rt_group_src miss[VIO_RT_MAX_GROUPS];
+    int              miss_count;
+    vio_rt_group_src hit[VIO_RT_MAX_GROUPS];
+    int              hit_count;
+    vio_rt_group_src callable[VIO_RT_MAX_GROUPS];
+    int              callable_count;
+    int              record_size;                   /* multiple of 4, 0 = no records */
 } vio_rt_pipeline_desc;
 
 /* A storage buffer bound for vio_trace_rays (vio_rt_bind_buffer). */
 typedef struct _vio_rt_buffer_binding {
-    void *backend_buffer;          /* create_storage_buffer handle */
-    int   binding;                 /* GLSL binding / HLSL u register */
+    void *backend_buffer;          /* create_storage_buffer handle, or the backend texture (kind 1) */
+    int   binding;                 /* GLSL binding / HLSL u register (t + s register for a texture) */
+    int   kind;                    /* VIO_RT_BIND_BUFFER / VIO_RT_BIND_TEXTURE (A13) */
 } vio_rt_buffer_binding;
 
-#define VIO_RT_MAX_BUFFERS 8
+#define VIO_RT_BIND_BUFFER  0
+#define VIO_RT_BIND_TEXTURE 1
+#define VIO_RT_MAX_BUFFERS 16       /* bound resources per pipeline, buffers and textures */
 
 /* ── Descriptor structs ───────────────────────────────────────────── */
 
@@ -870,6 +948,16 @@ typedef struct _vio_shader_desc {
      * sampler feedback has no GLSL form). The GLSL fragment stage stays required
      * and defines the cbuffer layout. */
     const char       *fragment_hlsl;
+    /* vio_compute_pipeline(['msl' => src]) (OPEN-ITEMS A17): Metal compiles this
+     * kernel instead of the translated GLSL (MSL 4 tensors / Metal Performance
+     * Primitives have no GLSL form). The GLSL kernel stays required: its
+     * reflection gives local_size and the bindings (binding N = buffer / texture N). */
+    const char       *compute_msl;
+    /* vio_compute_pipeline(['hlsl' => ...]) (SM69-PLAN Phase 2): D3D11 / D3D12
+     * compile this HLSL kernel (entry main) instead of the translated GLSL, with
+     * the GLSL kernel's reflection: Params UBO binding N = bN, storage buffers
+     * and images binding N = tN / uN. */
+    const char       *compute_hlsl;
     /* vio_shader(['view_count' => N]) (VIO_FEATURE_MULTIVIEW): the stages use
      * gl_ViewIndex and every draw runs N times, view v into layer v of a target
      * bound with VIO_RT_ALL_LAYERS. 0 = not a multiview shader. */

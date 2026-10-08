@@ -82,10 +82,9 @@ static int vkc_run_mips(VkImage img, int w, int h, int layers, int levels)
     /* The frame's draws into the image are recorded on the frame command buffer,
      * so the blits must follow them there. */
     VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
-    int had_pass = vio_vk.cur_render_pass != VK_NULL_HANDLE;
+    int had_pass = vio_vk.in_pass;
     if (had_pass) {
-        vkCmdEndRenderPass(cmd);
-        vio_vk.cur_render_pass = VK_NULL_HANDLE;
+        vio_vk_pass_end(cmd);
     }
     vio_vk_record_mips(cmd, img, w, h, layers, levels);
     if (had_pass && !vio_vk.frame_is_offscreen) vio_vk_resume_swapchain_pass(cmd);

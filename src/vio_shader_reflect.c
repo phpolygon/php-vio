@@ -426,6 +426,14 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
     /* gl_ViewIndex -> gl_ViewID_OVR + layout(num_views = N) (vio_shader 'view_count'). */
     if (vio_glsl_ovr_views > 0)
         spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_GLSL_OVR_MULTIVIEW_VIEW_COUNT, (unsigned)vio_glsl_ovr_views);
+    /* A stage that touches gl_ClipDistance redeclares gl_PerVertex in full (in
+     * and out): otherwise a vertex stage writes `out float gl_ClipDistance[1]`
+     * while the tessellation / geometry stages read an implicit gl_in block, and
+     * strict linkers (Mesa) refuse the mismatched blocks. Only those stages:
+     * Mesa then drops gl_Layer / gl_ViewportIndex from the vertex stage.
+     * Redeclaring needs GLSL 4.10. */
+    if (version >= 410 && vio_spirv_uses_clip_distance(spirv, spirv_size))
+        spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_GLSL_SEPARATE_SHADER_OBJECTS, SPVC_TRUE);
     spvc_compiler_install_compiler_options(compiler, options);
     /* GLSL for OpenGL has no separate textures / samplers. */
     vio_spvc_combine_separate(compiler);
@@ -447,6 +455,10 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
     SpvExecutionModel model = spvc_compiler_get_execution_model(compiler);
     if (model == SpvExecutionModelVertex || model == SpvExecutionModelTessellationEvaluation) {
         output = vio_glsl_require_viewport_layer_ext(output);
+    }
+    if (getenv("VIO_DUMP_GLSL") && output) {
+        fprintf(stderr, "==== OpenGL GLSL (model %d) ====\n%s\n==== end ====\n", (int)model, output);
+        fflush(stderr);
     }
     spvc_context_destroy(ctx);
     return output;
@@ -640,16 +652,247 @@ static void spv_name(vio_spv_words *v, uint32_t id, const char *name)
 
 #define VIO_GS_POS_LOCATION_NONE 0xFFFFFFFFu
 
+/* Geometry-stage input interface blocks (A28). SPIRV-Cross's HLSL geometry path
+ * copies a per-vertex block array without the vertex index (`vIn.col =
+ * stage_input.V_col`), which FXC refuses. Each such block (no built-in members)
+ * becomes one input array per member at the member's location before
+ * transpiling; access chains block[i].m... become member_m[i]... . Returns the
+ * new module, or NULL when there is nothing to do (or a use it cannot rewrite:
+ * then the old path reports the problem). */
+static uint32_t vio_gs_loc_count(const uint32_t *spv, const size_t *def, uint32_t bound, uint32_t t)
+{
+    size_t d = t < bound ? def[t] : 0;
+    if (!d) return 1;
+    uint32_t op = spv[d] & 0xFFFF;
+    if (op == 28) {
+        size_t c = spv[d + 3] < bound ? def[spv[d + 3]] : 0;
+        uint32_t len = (c && (spv[c] & 0xFFFF) == 43) ? spv[c + 3] : 1;
+        return len * vio_gs_loc_count(spv, def, bound, spv[d + 2]);
+    }
+    if (op == 24) return spv[d + 3];   /* matrix: a location per column */
+    return 1;
+}
+
+#define VIO_GS_MAX_BLOCKS 8
+#define VIO_GS_MAX_MEMBERS 16
+
+/* `outputs` also flattens Output blocks, `any_model` every stage, not only
+ * geometry (the Metal geometry emulation, which turns the stages into compute
+ * kernels and links varyings by location). Blocks may be arrayed (per-vertex
+ * inputs) or not: block.member... becomes member... . */
+static uint32_t *vio_flatten_io_blocks(const uint32_t *spv, size_t words, size_t *out_words, int outputs, int any_model)
+{
+    if (words < 5 || spv[0] != 0x07230203) return NULL;
+    uint32_t bound = spv[3];
+    size_t *def = (size_t *)calloc(bound, sizeof(size_t));
+    unsigned char *block = (unsigned char *)calloc(bound, 1), *bi_struct = (unsigned char *)calloc(bound, 1);
+    int32_t *loc = (int32_t *)malloc(bound * sizeof(int32_t));
+    /* variable decorations a member variable inherits: NoPerspective (13),
+     * Flat (14), Patch (15), Centroid (16), Sample (17) as bits 0..4 */
+    unsigned char *vflags = (unsigned char *)calloc(bound, 1);
+    uint32_t mdec[256][4];   /* struct, member, decoration, value */
+    int nmdec = 0, is_geometry = 0;
+    uint32_t *res = NULL;
+    if (!def || !block || !bi_struct || !loc || !vflags) goto done;
+    for (uint32_t i = 0; i < bound; i++) loc[i] = -1;
+    for (size_t i = 5; i < words; ) {
+        uint32_t op = spv[i] & 0xFFFF, wc = spv[i] >> 16;
+        if (!wc || i + wc > words) goto done;
+        if (op == 15 && wc >= 2 && spv[i + 1] == 3) is_geometry = 1;
+        else if (op == 71 && wc >= 3 && spv[i + 1] < bound) {
+            if (spv[i + 2] == 2) block[spv[i + 1]] = 1;
+            else if (spv[i + 2] == 30 && wc >= 4) loc[spv[i + 1]] = (int32_t)spv[i + 3];
+            else if (spv[i + 2] >= 13 && spv[i + 2] <= 17) vflags[spv[i + 1]] |= (unsigned char)(1u << (spv[i + 2] - 13));
+        } else if (op == 72 && wc >= 4 && spv[i + 1] < bound) {
+            if (spv[i + 3] == 11) bi_struct[spv[i + 1]] = 1;
+            else if (nmdec < 256 && (spv[i + 3] == 30 || (spv[i + 3] >= 13 && spv[i + 3] <= 17))) {   /* Location, NoPerspective, Flat, Patch, Centroid, Sample */
+                mdec[nmdec][0] = spv[i + 1]; mdec[nmdec][1] = spv[i + 2]; mdec[nmdec][2] = spv[i + 3];
+                mdec[nmdec][3] = wc >= 5 ? spv[i + 4] : 0;
+                nmdec++;
+            }
+        } else if (op >= 19 && op <= 32 && wc >= 2 && spv[i + 1] < bound) def[spv[i + 1]] = i;
+        else if ((op == 43 || op == 59) && wc >= 3 && spv[i + 2] < bound) def[spv[i + 2]] = i;
+        i += wc;
+    }
+    if (!is_geometry && !any_model) goto done;
+
+    /* Candidates: Input (and Output) Block structs, or arrays of them, without built-ins. */
+    uint32_t bvar[VIO_GS_MAX_BLOCKS], bst[VIO_GS_MAX_BLOCKS], blen[VIO_GS_MAX_BLOCKS], nmem[VIO_GS_MAX_BLOCKS];
+    uint32_t bstorage[VIO_GS_MAX_BLOCKS];
+    uint32_t mvar[VIO_GS_MAX_BLOCKS][VIO_GS_MAX_MEMBERS], mloc[VIO_GS_MAX_BLOCKS][VIO_GS_MAX_MEMBERS];
+    int nb = 0;
+    for (uint32_t id = 1; id < bound; id++) {
+        size_t vd = def[id];
+        if (!vd || (spv[vd] & 0xFFFF) != 59) continue;
+        if (spv[vd + 3] != 1 && !(outputs && spv[vd + 3] == 3)) continue;
+        size_t pt = spv[vd + 1] < bound ? def[spv[vd + 1]] : 0;
+        if (!pt || (spv[pt] & 0xFFFF) != 32) continue;
+        size_t at = spv[pt + 3] < bound ? def[spv[pt + 3]] : 0;
+        if (!at) continue;
+        uint32_t st, len = 0;
+        if ((spv[at] & 0xFFFF) == 28) {
+            size_t c = spv[at + 3] < bound ? def[spv[at + 3]] : 0;
+            if (!c || (spv[c] & 0xFFFF) != 43) continue;
+            st = spv[at + 2];
+            len = spv[at + 3];
+        } else if ((spv[at] & 0xFFFF) == 30) {
+            st = spv[pt + 3];
+        } else continue;
+        size_t sd = st < bound ? def[st] : 0;
+        if (!sd || (spv[sd] & 0xFFFF) != 30 || !block[st] || bi_struct[st]) continue;
+        uint32_t members = (spv[sd] >> 16) - 2;
+        if (nb >= VIO_GS_MAX_BLOCKS || members > VIO_GS_MAX_MEMBERS) goto done;
+        int32_t running = loc[id];
+        for (uint32_t k = 0; k < members; k++) {
+            int32_t ml = -1;
+            for (int d = 0; d < nmdec; d++) if (mdec[d][0] == st && mdec[d][1] == k && mdec[d][2] == 30) ml = (int32_t)mdec[d][3];
+            if (ml >= 0) running = ml;
+            if (running < 0) goto done;   /* no location: leave it to the old path */
+            mloc[nb][k] = (uint32_t)running;
+            running += (int32_t)vio_gs_loc_count(spv, def, bound, spv[sd + 2 + k]);
+        }
+        bvar[nb] = id; bst[nb] = st; blen[nb] = len; nmem[nb] = members; bstorage[nb] = spv[vd + 3];
+        nb++;
+    }
+    if (!nb) goto done;
+
+    /* Every use must be an access chain block[i].member... (block.member... when
+     * not arrayed); anything else stays. */
+    for (size_t i = 5; i < words; i += spv[i] >> 16) {
+        uint32_t op = spv[i] & 0xFFFF, wc = spv[i] >> 16;
+        if (op == 15 || op == 5 || op == 71 || op == 59) continue;
+        for (uint32_t k = 1; k < wc; k++) {
+            for (int b = 0; b < nb; b++) {
+                if (spv[i + k] != bvar[b]) continue;
+                uint32_t mi = blen[b] ? 5 : 4;
+                if (!((op == 65 || op == 66) && k == 3 && wc >= mi + 1)) goto done;
+                size_t c = spv[i + mi] < bound ? def[spv[i + mi]] : 0;
+                if (!c || (spv[c] & 0xFFFF) != 43 || spv[c + 3] >= nmem[b]) goto done;
+            }
+        }
+    }
+
+    uint32_t new_bound = bound;
+    uint32_t marr[VIO_GS_MAX_BLOCKS][VIO_GS_MAX_MEMBERS], mptr[VIO_GS_MAX_BLOCKS][VIO_GS_MAX_MEMBERS];
+    for (int b = 0; b < nb; b++)
+        for (uint32_t k = 0; k < nmem[b]; k++) { marr[b][k] = new_bound++; mptr[b][k] = new_bound++; mvar[b][k] = new_bound++; }
+
+    vio_spv_words out = { NULL, 0, 0, 0 };
+    for (int h = 0; h < 5; h++) spv_push(&out, spv[h]);
+    out.w[3] = new_bound;
+    int annotations_done = 0, globals_done = 0;
+    for (size_t i = 5; i < words; ) {
+        uint32_t op = spv[i] & 0xFFFF, wc = spv[i] >> 16;
+        int blk = -1;
+        for (int b = 0; b < nb; b++) {
+            if ((op == 5 || op == 71) && wc >= 2 && spv[i + 1] == bvar[b]) blk = b;
+            if (op == 59 && wc >= 3 && spv[i + 2] == bvar[b]) blk = b;
+        }
+        if (!annotations_done && (op == 71 || op == 72)) {
+            for (int b = 0; b < nb; b++)
+                for (uint32_t k = 0; k < nmem[b]; k++) {
+                    uint32_t d[3] = { mvar[b][k], 30, mloc[b][k] };
+                    spv_inst(&out, 71, d, 3);
+                    for (int m = 0; m < nmdec; m++) {
+                        if (mdec[m][0] != bst[b] || mdec[m][1] != k || mdec[m][2] == 30) continue;
+                        uint32_t f[2] = { mvar[b][k], mdec[m][2] };
+                        spv_inst(&out, 71, f, 2);
+                    }
+                    /* the block variable's Patch / interpolation decorations */
+                    for (uint32_t bit = 0; bit < 5; bit++) {
+                        if (!(vflags[bvar[b]] & (1u << bit))) continue;
+                        int dup = 0;
+                        for (int m = 0; m < nmdec; m++)
+                            if (mdec[m][0] == bst[b] && mdec[m][1] == k && mdec[m][2] == 13 + bit) dup = 1;
+                        if (dup) continue;
+                        uint32_t f[2] = { mvar[b][k], 13 + bit };
+                        spv_inst(&out, 71, f, 2);
+                    }
+                }
+            annotations_done = 1;
+        }
+        if (!globals_done && op == 54) {
+            for (int b = 0; b < nb; b++) {
+                size_t sd = def[bst[b]];
+                for (uint32_t k = 0; k < nmem[b]; k++) {
+                    uint32_t pointee = spv[sd + 2 + k];
+                    if (blen[b]) {
+                        uint32_t a[3] = { marr[b][k], spv[sd + 2 + k], blen[b] };
+                        spv_inst(&out, 28, a, 3);
+                        pointee = marr[b][k];
+                    }
+                    uint32_t p[3] = { mptr[b][k], bstorage[b], pointee };
+                    spv_inst(&out, 32, p, 3);
+                    uint32_t v[3] = { mptr[b][k], mvar[b][k], bstorage[b] };
+                    spv_inst(&out, 59, v, 3);
+                }
+            }
+            globals_done = 1;
+        }
+        if (blk >= 0) { i += wc; continue; }   /* the block variable, its name and decorations go */
+        if (op == 15) {
+            uint32_t k = 3;
+            while (k < wc) { uint32_t w = spv[i + k++]; if ((w >> 24) == 0 || ((w >> 16) & 0xFF) == 0 || ((w >> 8) & 0xFF) == 0 || (w & 0xFF) == 0) break; }
+            vio_spv_words ep = { NULL, 0, 0, 0 };
+            for (uint32_t j = 1; j < k; j++) spv_push(&ep, spv[i + j]);
+            for (uint32_t j = k; j < wc; j++) {
+                int b2 = -1;
+                for (int b = 0; b < nb; b++) if (spv[i + j] == bvar[b]) b2 = b;
+                if (b2 < 0) { spv_push(&ep, spv[i + j]); continue; }
+                for (uint32_t m = 0; m < nmem[b2]; m++) spv_push(&ep, mvar[b2][m]);
+            }
+            spv_inst(&out, 15, ep.w, (uint32_t)ep.n);
+            free(ep.w);
+        } else if ((op == 65 || op == 66) && wc >= 5) {
+            int b2 = -1;
+            for (int b = 0; b < nb; b++) if (spv[i + 3] == bvar[b]) b2 = b;
+            if (b2 < 0) { for (uint32_t j = 0; j < wc; j++) spv_push(&out, spv[i + j]); }
+            else {
+                uint32_t mi = blen[b2] ? 5 : 4;
+                uint32_t member = spv[def[spv[i + mi]] + 3];
+                vio_spv_words ac = { NULL, 0, 0, 0 };
+                spv_push(&ac, spv[i + 1]);
+                spv_push(&ac, spv[i + 2]);
+                spv_push(&ac, mvar[b2][member]);
+                if (blen[b2]) spv_push(&ac, spv[i + 4]);
+                for (uint32_t j = mi + 1; j < wc; j++) spv_push(&ac, spv[i + j]);
+                spv_inst(&out, op, ac.w, (uint32_t)ac.n);
+                free(ac.w);
+            }
+        } else {
+            for (uint32_t j = 0; j < wc; j++) spv_push(&out, spv[i + j]);
+        }
+        i += wc;
+    }
+    if (out.oom || !annotations_done || !globals_done) { free(out.w); goto done; }
+    *out_words = out.n;
+    res = out.w;
+done:
+    free(def); free(block); free(bi_struct); free(loc); free(vflags);
+    return res;
+}
+
+static uint32_t *vio_gs_flatten_input_blocks(const uint32_t *spv, size_t words, size_t *out_words)
+{
+    return vio_flatten_io_blocks(spv, words, out_words, 0, 0);
+}
+
+uint32_t *vio_spirv_flatten_io_blocks(const uint32_t *spv, size_t words, size_t *out_words)
+{
+    return vio_flatten_io_blocks(spv, words, out_words, 1, 1);
+}
+
 /* Returns a rewritten module (malloc'd, *out_words set) or NULL when nothing
  * had to change. *pos_location receives the location of the position input
  * (VIO_GS_POS_LOCATION_NONE if none), *invocation 1 when gl_InvocationID was
  * replaced, *invocations the layout(invocations = N) count. */
 static uint32_t *vio_gs_hlsl_rewrite(const uint32_t *spv, size_t words, size_t *out_words,
-                                     uint32_t *pos_location, int *invocation, uint32_t *invocations)
+                                     uint32_t *pos_location, int *invocation, uint32_t *invocations, int *primitive)
 {
     *pos_location = VIO_GS_POS_LOCATION_NONE;
     *invocation = 0;
     *invocations = 1;
+    *primitive = 0;
     if (words < 5 || spv[0] != 0x07230203) return NULL;
 
     uint32_t bound = spv[3];
@@ -659,6 +902,9 @@ static uint32_t *vio_gs_hlsl_rewrite(const uint32_t *spv, size_t words, size_t *
     if (!def || !pervertex) { free(def); free(pervertex); return NULL; }
 
     uint32_t inv_var = 0, max_location = 0, glin_var = 0;
+    /* gl_PrimitiveIDIn (A28): SPIRV-Cross puts SV_PrimitiveID into the per-vertex
+     * input struct; it becomes a Private variable fed from a main() parameter. */
+    uint32_t prim_cand[2] = { 0, 0 }, prim_var = 0;
     int has_location = 0, is_geometry = 0;
     for (size_t i = 5; i < words; ) {
         uint32_t op = spv[i] & 0xFFFF, wc = spv[i] >> 16;
@@ -669,6 +915,7 @@ static uint32_t *vio_gs_hlsl_rewrite(const uint32_t *spv, size_t words, size_t *
                 break;
             case 71: /* OpDecorate id dec ... */
                 if (wc >= 4 && spv[i + 2] == 11 && spv[i + 3] == 8) inv_var = spv[i + 1];
+                if (wc >= 4 && spv[i + 2] == 11 && spv[i + 3] == 7) { if (!prim_cand[0]) prim_cand[0] = spv[i + 1]; else prim_cand[1] = spv[i + 1]; }
                 if (wc >= 4 && spv[i + 2] == 30) { has_location = 1; if (spv[i + 3] > max_location) max_location = spv[i + 3]; }
                 break;
             case 72: /* OpMemberDecorate struct member BuiltIn Position */
@@ -699,6 +946,10 @@ static uint32_t *vio_gs_hlsl_rewrite(const uint32_t *spv, size_t words, size_t *
     }
 
     if (!is_geometry) { free(def); free(pervertex); return NULL; }
+    for (int k = 0; k < 2; k++) {
+        uint32_t id = prim_cand[k];
+        if (id && id < bound && def[id] && (spv[def[id]] & 0xFFFF) == 59 && spv[def[id] + 3] == 1 /* Input */) prim_var = id;
+    }
 
     /* gl_in[i].gl_Position: access chains with member index constant 0. */
     uint32_t vec4_type = 0, len_id = 0;
@@ -723,18 +974,23 @@ static uint32_t *vio_gs_hlsl_rewrite(const uint32_t *spv, size_t words, size_t *
         }
         if (!vec4_type || !glin_rewrites) glin_var = 0;
     }
-    if (!glin_var && !inv_var) { free(def); free(pervertex); return NULL; }
+    if (!glin_var && !inv_var && !prim_var) { free(def); free(pervertex); return NULL; }
 
-    uint32_t inv_int_type = 0;
+    uint32_t inv_int_type = 0, prim_int_type = 0;
     if (inv_var) {
         size_t pt = def[spv[def[inv_var] + 1]];
         inv_int_type = spv[pt + 3];
+    }
+    if (prim_var) {
+        size_t pt = def[spv[def[prim_var] + 1]];
+        prim_int_type = spv[pt + 3];
     }
 
     uint32_t new_bound = bound;
     uint32_t arr_id = 0, arr_ptr_id = 0, pos_var = 0, priv_ptr_id = 0;
     if (glin_var) { arr_id = new_bound++; arr_ptr_id = new_bound++; pos_var = new_bound++; }
     if (inv_var) priv_ptr_id = new_bound++;
+    uint32_t prim_ptr_id = prim_var ? new_bound++ : 0;
     uint32_t loc = has_location ? max_location + 1 : 0;
 
     vio_spv_words out = { NULL, 0, 0, 0 };
@@ -751,6 +1007,7 @@ static uint32_t *vio_gs_hlsl_rewrite(const uint32_t *spv, size_t words, size_t *
                 spv_inst(&out, 71, d, 3);
             }
             if (inv_var) spv_name(&out, inv_var, "vio_gs_invocation");
+            if (prim_var) spv_name(&out, prim_var, "vio_gs_primitive");
             annotations_done = 1;
         }
         if (!globals_done && op == 54 /* OpFunction */) {
@@ -768,6 +1025,12 @@ static uint32_t *vio_gs_hlsl_rewrite(const uint32_t *spv, size_t words, size_t *
                 uint32_t v[3] = { priv_ptr_id, inv_var, 6 };
                 spv_inst(&out, 59, v, 3);
             }
+            if (prim_var) {
+                uint32_t p[3] = { prim_ptr_id, 6 /* Private */, prim_int_type };
+                spv_inst(&out, 32, p, 3);
+                uint32_t v[3] = { prim_ptr_id, prim_var, 6 };
+                spv_inst(&out, 59, v, 3);
+            }
             globals_done = 1;
         }
         if (op == 15) {
@@ -779,16 +1042,19 @@ static uint32_t *vio_gs_hlsl_rewrite(const uint32_t *spv, size_t words, size_t *
             for (uint32_t j = k; j < wc; j++) {
                 uint32_t id = spv[i + j];
                 if (inv_var && id == inv_var) continue;
+                if (prim_var && id == prim_var) continue;
                 if (glin_var && id == glin_var && !glin_other_uses) continue;
                 spv_push(&ep, id);
             }
             if (pos_var) spv_push(&ep, pos_var);
             spv_inst(&out, 15, ep.w, (uint32_t)ep.n);
             free(ep.w);
-        } else if (op == 5 && inv_var && wc >= 2 && spv[i + 1] == inv_var) {
+        } else if (op == 5 && ((inv_var && wc >= 2 && spv[i + 1] == inv_var) || (prim_var && wc >= 2 && spv[i + 1] == prim_var))) {
             /* drop: renamed above */
-        } else if (op == 71 && inv_var && wc >= 3 && spv[i + 1] == inv_var) {
-            /* drop the BuiltIn InvocationId decoration */
+        } else if (op == 71 && ((inv_var && wc >= 3 && spv[i + 1] == inv_var) || (prim_var && wc >= 3 && spv[i + 1] == prim_var))) {
+            /* drop the BuiltIn InvocationId / PrimitiveId decoration */
+        } else if (op == 59 && prim_var && wc >= 3 && spv[i + 2] == prim_var) {
+            /* re-declared as Private before the first function */
         } else if (op == 59 && inv_var && wc >= 3 && spv[i + 2] == inv_var) {
             /* re-declared as Private before the first function */
         } else if (glin_var && (op == 65 || op == 66) && wc >= 6 && spv[i + 3] == glin_var &&
@@ -814,6 +1080,7 @@ static uint32_t *vio_gs_hlsl_rewrite(const uint32_t *spv, size_t words, size_t *
     *out_words = out.n;
     if (pos_var) *pos_location = loc;
     if (inv_var) *invocation = 1;
+    if (prim_var) *primitive = 1;
     return out.w;
 }
 
@@ -831,10 +1098,28 @@ static char *vio_str_insert(char *s, size_t at, const char *ins)
 }
 
 /* Patch the transpiled GS for the rewrites of vio_gs_hlsl_rewrite. */
-static char *vio_gs_hlsl_patch(char *hlsl, uint32_t pos_location, int invocation, uint32_t invocations)
+static char *vio_gs_hlsl_patch(char *hlsl, uint32_t pos_location, int invocation, uint32_t invocations, int primitive)
 {
     if (!hlsl) return NULL;
-    if (pos_location != VIO_GS_POS_LOCATION_NONE) {
+    if (primitive) {
+        char *m = strstr(hlsl, "void main(");
+        char *close = m ? strchr(m, ')') : NULL;
+        if (close) {
+            hlsl = vio_str_insert(hlsl, (size_t)(close - hlsl), ", uint vio_gs_prim : SV_PrimitiveID");
+            m = strstr(hlsl, "void main(");
+            char *brace = m ? strchr(m, '{') : NULL;
+            if (brace) hlsl = vio_str_insert(hlsl, (size_t)(brace - hlsl) + 1, "\n    vio_gs_primitive = int(vio_gs_prim);");
+        }
+    }
+    /* A written gl_PrimitiveID output (A28): SPIRV-Cross copies it into the
+     * output struct but never declares the variable. */
+    {
+        char *st = strstr(hlsl, "struct SPIRV_Cross_Output");
+        char *end = st ? strstr(st, "};") : NULL;
+        char *f = st ? strstr(st, " gl_PrimitiveID : SV_PrimitiveID;") : NULL;
+        if (f && (!end || f < end) && !strstr(hlsl, "static uint gl_PrimitiveID;") && !strstr(hlsl, "static int gl_PrimitiveID;"))
+            hlsl = vio_str_insert(hlsl, (size_t)(st - hlsl), "static uint gl_PrimitiveID;\n\n");
+    }    if (pos_location != VIO_GS_POS_LOCATION_NONE) {
         char sem[32];
         snprintf(sem, sizeof(sem), ": TEXCOORD%u;", pos_location);
         char *st = strstr(hlsl, "struct SPIRV_Cross_Input");
@@ -988,14 +1273,35 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
 
     /* Geometry stages: gl_in[].gl_Position / gl_InvocationID (see vio_gs_hlsl_rewrite). */
     uint32_t gs_pos_location = VIO_GS_POS_LOCATION_NONE, gs_invocations = 1;
-    int gs_invocation = 0;
-    size_t rewritten_words = 0;
-    uint32_t *rewritten = vio_gs_hlsl_rewrite(spirv, word_count, &rewritten_words,
-                                              &gs_pos_location, &gs_invocation, &gs_invocations);
+    int gs_invocation = 0, gs_primitive = 0;
+    size_t flat_words = 0, rewritten_words = 0, primid_words = 0;
+    /* gl_PrimitiveID written by a geometry stage (A28): a flat varying at
+     * VIO_PRIMID_LOCATION on both sides - D3D links SV_PrimitiveID by register,
+     * and the fragment input would not line up with the GS output. */
+    uint32_t *primid = NULL;
+    {
+        uint32_t model = 0;
+        for (size_t i = 5; i < word_count; i += spirv[i] >> 16) {
+            if ((spirv[i] >> 16) == 0) break;
+            if ((spirv[i] & 0xFFFF) == 15) { model = spirv[i + 1]; break; }
+        }
+        if (model == 3 /* Geometry */)
+            primid = vio_spirv_builtin_to_location(spirv, word_count, 7, 3, VIO_PRIMID_LOCATION, 0, &primid_words);
+        else if (model == 4 /* Fragment */ && vio_sampler_plan_current() && vio_sampler_plan_current()->gs_writes_primid)
+            primid = vio_spirv_builtin_to_location(spirv, word_count, 7, 1, VIO_PRIMID_LOCATION, 1, &primid_words);
+        if (primid) { spirv = primid; word_count = primid_words; }
+    }
+    uint32_t *flat = vio_gs_flatten_input_blocks(spirv, word_count, &flat_words);
+    const uint32_t *gs_src = flat ? flat : spirv;
+    size_t gs_words = flat ? flat_words : word_count;
+    uint32_t *rewritten = vio_gs_hlsl_rewrite(gs_src, gs_words, &rewritten_words,
+                                              &gs_pos_location, &gs_invocation, &gs_invocations, &gs_primitive);
 
-    spvc_result parsed = spvc_context_parse_spirv(ctx, rewritten ? rewritten : spirv,
-                                                  rewritten ? rewritten_words : word_count, &ir);
+    spvc_result parsed = spvc_context_parse_spirv(ctx, rewritten ? rewritten : gs_src,
+                                                  rewritten ? rewritten_words : gs_words, &ir);
     free(rewritten);   /* the parsed IR holds its own copy */
+    free(flat);
+    free(primid);
     if (parsed != SPVC_SUCCESS) {
         if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
         spvc_context_destroy(ctx);
@@ -1019,6 +1325,10 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
     if (vio_hlsl_16bit_types && shader_model >= 62)
         spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_ENABLE_16BIT_TYPES, SPVC_TRUE);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT, SPVC_TRUE);
+    /* Fragment storage buffers (A15) are always UAVs, also the readonly ones:
+     * they live at u(binding + 4) next to the render targets (see below). */
+    if (spvc_compiler_get_execution_model(compiler) == SpvExecutionModelFragment)
+        spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_FORCE_STORAGE_BUFFER_AS_UAV, SPVC_TRUE);
     spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_POINT_COORD_COMPAT, SPVC_TRUE);
     /* Map OpenGL clip space z [-1,1] to D3D11 clip space z [0,1]:
      * Emits gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5.
@@ -1067,6 +1377,9 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
                 }
             }
             unsigned int binding = is_depth_sampler ? shadow_idx++ : regular_idx++;
+            int planned = shader_model >= 51 ? vio_sampler_plan_reg(sampled_images[i].name)
+                                             : vio_sampler_plan_index(sampled_images[i].name);
+            if (planned >= 0) binding = (unsigned int)planned;
             spvc_compiler_set_decoration(compiler, sampled_images[i].id,
                                           SpvDecorationBinding, binding);
         }
@@ -1103,6 +1416,52 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
             size_t ubo_count;
             spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, &ubos, &ubo_count);
             if (ubo_count > 0) spvc_compiler_set_decoration(compiler, ubos[0].id, SpvDecorationBinding, 0);
+        }
+
+        /* Mesh / task stages also see the texture table (OPEN-ITEMS-PLAN A30): their
+         * storage buffers move to register space 2, where the D3D12 mesh root
+         * signature puts its root SRV, so t0 of the table stays the texture's.
+         * Fragment storage buffers (A15) move to u(binding + 4): D3D11 shares the
+         * output-merger slots between render targets (up to 4) and UAVs, D3D12
+         * has its pixel root UAVs there. */
+        {
+            SpvExecutionModel em = spvc_compiler_get_execution_model(compiler);
+            if (em == SpvExecutionModelFragment) {
+                const spvc_reflected_resource *ssbos;
+                size_t ssbo_count;
+                spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STORAGE_BUFFER, &ssbos, &ssbo_count);
+                for (size_t i = 0; i < ssbo_count; i++) {
+                    unsigned b = spvc_compiler_get_decoration(compiler, ssbos[i].id, SpvDecorationBinding);
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationDescriptorSet, 0);
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, b + 4);
+                }
+            }
+            /* Vertex-stage storage buffers (Path B) leave t0.. to the vertex
+             * textures (A28): space 2 on SM 5.1+ (the D3D12 root SRV), t16+ on
+             * SM 5.0 (D3D11 binds them at 16 + binding). */
+            if (em == SpvExecutionModelVertex) {
+                const spvc_reflected_resource *ssbos;
+                size_t ssbo_count;
+                spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STORAGE_BUFFER, &ssbos, &ssbo_count);
+                for (size_t i = 0; i < ssbo_count; i++) {
+                    unsigned b = spvc_compiler_get_decoration(compiler, ssbos[i].id, SpvDecorationBinding);
+                    if (shader_model >= 51) {
+                        spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationDescriptorSet, 2);
+                        spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, (unsigned int)i);
+                    } else {
+                        spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, 16 + b);
+                    }
+                }
+            }
+            if (em == SpvExecutionModelMeshEXT || em == SpvExecutionModelTaskEXT) {
+                const spvc_reflected_resource *ssbos;
+                size_t ssbo_count;
+                spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STORAGE_BUFFER, &ssbos, &ssbo_count);
+                for (size_t i = 0; i < ssbo_count; i++) {
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationDescriptorSet, 2);
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, (unsigned int)i);
+                }
+            }
         }
 
         /* Ray query (GL_EXT_ray_query): the acceleration structure moves to its
@@ -1165,7 +1524,7 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
     } else {
         output = strdup(result);
     }
-    if (is_geometry) output = vio_gs_hlsl_patch(output, gs_pos_location, gs_invocation, gs_invocations);
+    if (is_geometry) output = vio_gs_hlsl_patch(output, gs_pos_location, gs_invocation, gs_invocations, gs_primitive);
     output = vio_hlsl_fix_int64_buffer_atomics(output);
     output = vio_hlsl_pin_vertex_info(output);
     if (output && hooks && hooks->finish) output = hooks->finish(compiler, output, error_msg, hooks->user);
@@ -1588,3 +1947,197 @@ int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*n
 }
 
 #endif /* HAVE_SPIRV_CROSS */
+
+/* ── Shader-wide sampler plan (OPEN-ITEMS-PLAN A30) ─────────────────── */
+
+static const vio_sampler_plan *vio_sampler_plan_active = NULL;
+
+void vio_sampler_plan_use(const vio_sampler_plan *plan) { vio_sampler_plan_active = plan; }
+const vio_sampler_plan *vio_sampler_plan_current(void) { return vio_sampler_plan_active; }
+
+int vio_sampler_plan_reg(const char *name)
+{
+    const vio_sampler_plan *p = vio_sampler_plan_active;
+    if (!p || !name) return -1;
+    for (int i = 0; i < p->count; i++) if (strcmp(p->names[i], name) == 0) return p->reg[i];
+    return -1;
+}
+
+int vio_sampler_plan_index(const char *name)
+{
+    const vio_sampler_plan *p = vio_sampler_plan_active;
+    if (!p || !name) return -1;
+    for (int i = 0; i < p->count; i++) if (strcmp(p->names[i], name) == 0) return i;
+    return -1;
+}
+
+static int vio_sampler_plan_find(const vio_sampler_plan *p, const char *name)
+{
+    for (int i = 0; i < p->count; i++) if (strcmp(p->names[i], name) == 0) return i;
+    return -1;
+}
+
+static void vio_sampler_plan_add(vio_sampler_plan *p, const char *name, int reg, int is_depth)
+{
+    if (p->count >= VIO_SAMPLER_PLAN_MAX || reg < 0) return;
+    snprintf(p->names[p->count], sizeof(p->names[0]), "%s", name ? name : "");
+    p->reg[p->count] = reg;
+    p->is_depth[p->count] = is_depth;
+    p->count++;
+}
+
+/* Lowest register in [lo, hi) no planned sampler holds; -1 when full. */
+static int vio_sampler_plan_free_reg(const vio_sampler_plan *p, int lo, int hi)
+{
+    for (int r = lo; r < hi; r++) {
+        int used = 0;
+        for (int i = 0; i < p->count && !used; i++) used = p->reg[i] == r;
+        if (!used) return r;
+    }
+    return -1;
+}
+
+void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv, const size_t *size, int n)
+{
+    memset(plan, 0, sizeof(*plan));
+    for (int s = 0; s < n; s++) {
+        if (!spirv[s] || !size[s]) continue;
+        vio_reflect_result r = {0};
+        char *err = NULL;
+        if (vio_spirv_reflect(spirv[s], size[s], &r, &err) != 0) { free(err); continue; }
+        if (s == 0) {
+            /* The fragment stage: the replay php_vio.c always did. */
+            int regular = 0, shadow = 8;
+            for (int t = 0; t < r.texture_count; t++) {
+                int d = r.textures[t].is_depth ? 1 : 0;
+                vio_sampler_plan_add(plan, r.textures[t].name, d ? shadow++ : regular++, d);
+            }
+            char sep[VIO_SAMPLER_PLAN_MAX][64];
+            int nsep = vio_spirv_separate_images(spirv[s], size[s], sep, VIO_SAMPLER_PLAN_MAX);
+            for (int j = 0; j < nsep; j++) vio_sampler_plan_add(plan, sep[j], r.texture_count + j, 0);
+        } else {
+            for (int t = 0; t < r.texture_count; t++) {
+                if (vio_sampler_plan_find(plan, r.textures[t].name) >= 0) continue;
+                int d = r.textures[t].is_depth ? 1 : 0;
+                vio_sampler_plan_add(plan, r.textures[t].name, d ? vio_sampler_plan_free_reg(plan, 8, 16)
+                                                                 : vio_sampler_plan_free_reg(plan, 0, 8), d);
+            }
+        }
+        vio_reflect_free(&r);
+    }
+}
+
+/* ── gl_ClipDistance outputs (OPEN-ITEMS-PLAN A29) ──────────────────── */
+
+static int vio_spirv_clip_distances_ex(const uint32_t *w, size_t size, int outputs_only);
+
+int vio_spirv_output_clip_distances(const uint32_t *w, size_t size)
+{
+    return vio_spirv_clip_distances_ex(w, size, 1);
+}
+
+/* Any access to gl_ClipDistance, input or output. */
+int vio_spirv_uses_clip_distance(const uint32_t *w, size_t size)
+{
+    return vio_spirv_clip_distances_ex(w, size, 0) > 0;
+}
+
+static int vio_spirv_clip_distances_ex(const uint32_t *w, size_t size, int outputs_only)
+{
+    size_t n = size / 4;
+    if (!w || n < 5 || w[0] != 0x07230203) return 0;
+    uint32_t bound = w[3];
+    size_t *def = (size_t *)calloc(bound, sizeof(size_t));
+    int32_t *member = (int32_t *)malloc(bound * sizeof(int32_t));   /* struct -> ClipDistance member */
+    unsigned char *var = (unsigned char *)calloc(bound, 1);          /* variable decorated ClipDistance */
+    int result = 0;
+    if (!def || !member || !var) goto done;
+    for (uint32_t i = 0; i < bound; i++) member[i] = -1;
+    for (size_t i = 5; i < n; ) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if (!wc || i + wc > n) goto done;
+        if (op == 71 && wc >= 4 && w[i + 1] < bound && w[i + 2] == 11 && w[i + 3] == 3) var[w[i + 1]] = 1;
+        else if (op == 72 && wc >= 5 && w[i + 1] < bound && w[i + 3] == 11 && w[i + 4] == 3) member[w[i + 1]] = (int32_t)w[i + 2];
+        else if (op >= 19 && op <= 32 && wc >= 2 && w[i + 1] < bound) def[w[i + 1]] = i;
+        else if ((op == 43 || op == 59) && wc >= 3 && w[i + 2] < bound) def[w[i + 2]] = i;
+        i += wc;
+    }
+#define CLIP_CONST(id) ((id) < bound && def[id] && (w[def[id]] & 0xFFFF) == 43 ? w[def[id] + 3] : 0xFFFFFFFFu)
+#define CLIP_ALEN(t) ((t) < bound && def[t] && (w[def[t]] & 0xFFFF) == 28 ? (int)CLIP_CONST(w[def[t] + 3]) : 1)
+    for (size_t i = 5; i < n; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if ((op != 65 && op != 66) || wc < 4) continue;   /* OpAccessChain / OpInBoundsAccessChain */
+        uint32_t base = w[i + 3];
+        size_t vd = base < bound ? def[base] : 0;
+        if (!vd || (w[vd] & 0xFFFF) != 59 || (outputs_only && w[vd + 3] != 3 /* Output */)) continue;
+        size_t pd = w[vd + 1] < bound ? def[w[vd + 1]] : 0;
+        if (!pd || (w[pd] & 0xFFFF) != 32) continue;
+        uint32_t t = w[pd + 3];
+        int len = 0;
+        if (var[base]) len = CLIP_ALEN(t);
+        else {
+            size_t idx = i + 4;
+            if (t < bound && def[t] && (w[def[t]] & 0xFFFF) == 28) { t = w[def[t] + 2]; idx++; }   /* arrayed (mesh) outputs */
+            if (t < bound && member[t] >= 0 && idx < i + wc && CLIP_CONST(w[idx]) == (uint32_t)member[t])
+                len = CLIP_ALEN(w[def[t] + 2 + member[t]]);
+        }
+        if (len > result) result = len;
+    }
+#undef CLIP_CONST
+#undef CLIP_ALEN
+done:
+    free(def);
+    free(member);
+    free(var);
+    return result;
+}
+
+/* ── Built-in output -> varying (A28) ───────────────────────────────── */
+
+int vio_spirv_writes_builtin(const uint32_t *w, size_t size, uint32_t builtin)
+{
+    size_t n = size / 4;
+    if (!w || n < 5 || w[0] != 0x07230203) return 0;
+    uint32_t cand[8];
+    int nc = 0;
+    for (size_t i = 5; i < n; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if (!wc) return 0;
+        if (op == 71 && wc >= 4 && w[i + 2] == 11 && w[i + 3] == builtin && nc < 8) cand[nc++] = w[i + 1];
+        if (op == 59 && wc >= 4 && w[i + 3] == 3)
+            for (int k = 0; k < nc; k++) if (cand[k] == w[i + 2]) return 1;
+    }
+    return 0;
+}
+
+uint32_t *vio_spirv_builtin_to_location(const uint32_t *w, size_t n, uint32_t builtin, uint32_t storage,
+                                        uint32_t location, int flat, size_t *out_words)
+{
+    if (!w || n < 5 || w[0] != 0x07230203) return NULL;
+    uint32_t target = 0, cand[8];
+    int nc = 0;
+    for (size_t i = 5; i < n; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if (!wc || i + wc > n) return NULL;
+        if (op == 71 && wc >= 4 && w[i + 2] == 11 && w[i + 3] == builtin && nc < 8) cand[nc++] = w[i + 1];
+        if (op == 59 && wc >= 4 && w[i + 3] == storage)
+            for (int k = 0; k < nc; k++) if (cand[k] == w[i + 2]) target = w[i + 2];
+    }
+    if (!target) return NULL;
+    uint32_t *out = (uint32_t *)malloc((n + 8) * sizeof(uint32_t));
+    if (!out) return NULL;
+    size_t o = 0;
+    for (size_t i = 0; i < 5; i++) out[o++] = w[i];
+    for (size_t i = 5; i < n; ) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if (op == 71 && wc == 4 && w[i + 1] == target && w[i + 2] == 11) {
+            out[o++] = (4u << 16) | 71u; out[o++] = target; out[o++] = 30; out[o++] = location;
+            if (flat) { out[o++] = (3u << 16) | 71u; out[o++] = target; out[o++] = 14; }
+        } else {
+            for (uint32_t k = 0; k < wc; k++) out[o++] = w[i + k];
+        }
+        i += wc;
+    }
+    *out_words = o;
+    return out;
+}

@@ -13,12 +13,10 @@
 
 #include "php.h"
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
 
 #include <glad/glad.h>
 #include "../../vio_shader_cache.h"
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
 
 #include "vio_opengl.h"
 #include "../../shaders/default_shaders.h"
@@ -461,8 +459,8 @@ static int opengl_enumerate_adapters(vio_adapter_info *out, int max)
     snprintf(out->driver, sizeof(out->driver), "%s", d.driver ? d.driver : "");
     out->vendor_id = d.vendor_id;
     out->device_type = d.device_type;
-    for (int f = 0; f < 64; f++)
-        if (opengl_supports_feature((vio_feature)f)) out->features |= VIO_FEATURE_BIT(f);
+    for (int f = 0; f < VIO_FEATURE_SET_MAX; f++)
+        if (opengl_supports_feature((vio_feature)f)) vio_featset_add(&out->features, f);
     return 1;
 }
 
@@ -689,7 +687,9 @@ static void opengl_begin_frame(void)
                     glGetQueryObjectui64v(vio_gl.ts_query[slot][i], GL_QUERY_RESULT, &v);
                     ticks[i] = (uint64_t)v;
                 }
-                if (ticks[1] > ticks[0]) {
+                /* >=: a frame shorter than the timer resolution reads 0 ms; skipping
+                 * it kept the previous frame's sections (test 172, unmarked frames) */
+                if (ticks[1] >= ticks[0]) {
                     vio_gl.last_gpu_ms = (double)(ticks[1] - ticks[0]) / 1.0e6;
                     vio_gpu_mark_resolve(&vio_gl.ts_result, &vio_gl.ts_marks[slot], ticks, 1.0e-6);
                     vio_gl.ts_result_valid = 1;
@@ -1045,6 +1045,8 @@ static size_t opengl_read_buffer(void *backend_buffer, void *out, size_t size)
     if (!buf || !buf->ssbo || !out || size == 0 || !vio_gl.initialized) return 0;
 
     size_t n = size < buf->size ? size : buf->size;
+    /* Draws that wrote it through a fragment storage block (A15). */
+    if (glMemoryBarrier) glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf->ssbo);
     /* glGetBufferSubData blocks until prior GPU writes (made visible by the
      * dispatch's glMemoryBarrier) complete, then copies into out. */
@@ -2346,11 +2348,58 @@ static void gl_mv_prepare(void)
     }
 }
 
+/* gl_ClipDistance (OPEN-ITEMS-PLAN A29): the planes the bound pipeline's last
+ * geometry stage writes are enabled around each of its draws only, so the 2D
+ * batch and vio's own passes never clip against stale distances. */
+static int gl_clip_active;
+
+static void gl_clip_begin(GLint program)
+{
+    if (program <= 0 || (GLuint)program != vio_gl.clip_program || vio_gl.clip_count <= 0) return;
+    for (int i = 0; i < vio_gl.clip_count; i++) glEnable(GL_CLIP_DISTANCE0 + i);
+    gl_clip_active = vio_gl.clip_count;
+}
+
+static void gl_clip_end(void)
+{
+    for (int i = 0; i < gl_clip_active; i++) glDisable(GL_CLIP_DISTANCE0 + i);
+    gl_clip_active = 0;
+}
+
+/* Fragment storage buffers (A15): SSBO binding points, re-bound before every
+ * draw (compute dispatches use the same binding points). */
+static GLuint gl_fs_storage[VIO_MAX_FRAGMENT_STORAGE];
+static unsigned int gl_fs_storage_gen;
+static int gl_fs_storage_used;
+
+static int opengl_bind_fragment_storage(void *backend_buffer, int binding)
+{
+    if (binding < 0 || binding >= VIO_MAX_FRAGMENT_STORAGE) return -1;
+    vio_opengl_compute_buffer *buf = (vio_opengl_compute_buffer *)backend_buffer;
+    if (gl_fs_storage_gen != gl_context_generation) { memset(gl_fs_storage, 0, sizeof(gl_fs_storage)); gl_fs_storage_gen = gl_context_generation; }
+    gl_fs_storage[binding] = buf ? buf->ssbo : 0;
+    /* Unbinding releases the binding point now: a shader that still declares
+     * the block must not keep writing into the old buffer. */
+    if (!buf && vio_gl.initialized) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)binding, 0);
+    return 0;
+}
+
+static void gl_fs_storage_apply(void)
+{
+    if (gl_fs_storage_gen != gl_context_generation) return;
+    for (int i = 0; i < VIO_MAX_FRAGMENT_STORAGE; i++) {
+        if (!gl_fs_storage[i]) continue;
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)i, gl_fs_storage[i]);
+        gl_fs_storage_used = 1;
+    }
+}
+
 static unsigned gl_shadow_begin(void)
 {
+    gl_fs_storage_apply();
+    GLint program = 0;    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    gl_clip_begin(program);
     if (!glBindSampler || !glGenSamplers) return 0;
-    GLint program = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
     if (program <= 0) return 0;
     const gl_shadow_entry *e = gl_shadow_entry_for((GLuint)program);
     if (e->count == 0) return 0;
@@ -2381,6 +2430,7 @@ static unsigned gl_shadow_begin(void)
 
 static void gl_shadow_end(unsigned mask)
 {
+    gl_clip_end();
     for (GLuint unit = 0; mask; unit++, mask >>= 1) {
         if (mask & 1u) glBindSampler(unit, 0);
     }
@@ -2881,6 +2931,27 @@ static void opengl_bind_pipeline_state(void *pipe_ptr)
 
     glUseProgram(pipe->shader_program);
 
+    /* Clip planes of this pipeline, applied per draw (gl_clip_begin). */
+    {
+        vio_shader_object *sh = (vio_shader_object *)pipe->shader_ref;
+        if (sh && !sh->clip_known) {
+            const uint32_t *spv = sh->vert_spirv;
+            size_t sz = sh->vert_spirv_size;
+            if (sh->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)]) {
+                spv = sh->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)];
+                sz = sh->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)];
+            } else if (sh->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)]) {
+                spv = sh->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
+                sz = sh->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
+            }
+            int nclip = spv ? vio_spirv_output_clip_distances(spv, sz) : 0;
+            sh->clip_distances = nclip > 8 ? 8 : nclip;
+            sh->clip_known = 1;
+        }
+        vio_gl.clip_program = pipe->shader_program;
+        vio_gl.clip_count = sh ? sh->clip_distances : 0;
+    }
+
     /* Primitive mode for the following draws. A shader with a tessellation
      * control stage only accepts patches, whatever 'topology' says. */
     {
@@ -3228,6 +3299,8 @@ static int opengl_supports_feature(vio_feature feature)
          * has_compute_shader tracks exactly that tier. GL < 4.3 -> 0, callers
          * stay on the readback path. */
         case VIO_FEATURE_VERTEX_STORAGE: return vio_gl.caps.has_compute_shader;
+        case VIO_FEATURE_FRAGMENT_STORAGE: return vio_gl.caps.has_compute_shader;   /* GL 4.3: >= 8 fragment SSBOs */
+        case VIO_FEATURE_SAMPLER_FEEDBACK_GLSL: return vio_gl.caps.has_compute_shader;
         case VIO_FEATURE_STORAGE_IMAGE:  return vio_gl.caps.has_compute_shader; /* image load/store is 4.2, compute 4.3 */
         case VIO_FEATURE_MRT:            return 1;  /* glDrawBuffers, core since 3.0 */
         default:                         return 0;
@@ -3268,6 +3341,7 @@ static const vio_backend opengl_backend = {
     .compute_set_uniforms     = opengl_compute_set_uniforms,
     .read_buffer              = opengl_read_buffer,
     .bind_storage_buffer          = opengl_bind_storage_buffer,
+    .bind_fragment_storage        = opengl_bind_fragment_storage,
     .draw_instanced_from_storage  = opengl_draw_instanced_from_storage,
     .supports_feature  = opengl_supports_feature,
     .feature_emulation = opengl_feature_emulation,
@@ -3334,7 +3408,8 @@ int vio_opengl_get_glsl_version(void)
 
 int vio_opengl_setup_context(void)
 {
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+    /* The GL entry points of the context the platform made current */
+    if (!vio_plat()->gl_get_proc_address || !gladLoadGLLoader((GLADloadproc)vio_plat()->gl_get_proc_address)) {
         php_error_docref(NULL, E_WARNING, "Failed to initialize GLAD");
         return -1;
     }
@@ -3465,4 +3540,4 @@ int vio_opengl_setup_context(void)
     return 0;
 }
 
-#endif /* HAVE_GLFW */
+#endif /* HAVE_OPENGL */

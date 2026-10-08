@@ -19,12 +19,7 @@
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
 
-#ifdef HAVE_GLFW
-#define GLFW_INCLUDE_NONE
-#define GLFW_EXPOSE_NATIVE_WIN32
-#include <GLFW/glfw3.h>
-#include <GLFW/glfw3native.h>
-#endif
+#include "../../../include/vio_platform.h"
 
 #include "vio_d3d11.h"
 #include "../vio_d3d_common.h"
@@ -193,6 +188,7 @@ static int d3d11_init(vio_config *cfg)
     D3D_DRIVER_TYPE driver_type = cfg->headless && !cfg->headless_hardware && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)
         ? D3D_DRIVER_TYPE_WARP
         : D3D_DRIVER_TYPE_HARDWARE;
+    if (driver_type == D3D_DRIVER_TYPE_WARP) vio_d3d_load_warp();
 
     hr = D3D11CreateDevice(
         NULL,                           /* adapter (NULL = default) */
@@ -309,9 +305,11 @@ static int d3d11_init(vio_config *cfg)
 }
 
 static void d3d11_dmip_release(void);
+static void d3d11_bundles_sweep(void);
 
 static void d3d11_shutdown(void)
 {
+    d3d11_bundles_sweep();
     d3d11_dmip_release();
     if (vio_d3d11.frame_latency_waitable) { CloseHandle(vio_d3d11.frame_latency_waitable); vio_d3d11.frame_latency_waitable = NULL; }
     for (int i = 0; i < 3; i++) {
@@ -374,13 +372,12 @@ static void d3d11_shutdown(void)
 
 static void *d3d11_create_surface(vio_config *cfg)
 {
-#ifdef HAVE_GLFW
-    if (!vio_d3d11.glfw_window) {
-        php_error_docref(NULL, E_WARNING, "D3D11: No GLFW window set");
+    /* The platform window's HWND carries the swapchain. */
+    HWND hwnd = vio_d3d11.platform_window ? (HWND)vio_plat()->native_handle(vio_d3d11.platform_window, VIO_NATIVE_HWND) : NULL;
+    if (!hwnd) {
+        php_error_docref(NULL, E_WARNING, "D3D11: no window to present into");
         return NULL;
     }
-
-    HWND hwnd = glfwGetWin32Window((GLFWwindow *)vio_d3d11.glfw_window);
 
     /* HDR10 (GAP-PHASE5 Block 6): 10-bit backbuffer when asked for and the
      * window's display is in HDR mode (or forced). */
@@ -473,11 +470,6 @@ static void *d3d11_create_surface(vio_config *cfg)
     }
 
     return vio_d3d11.swapchain;
-#else
-    (void)cfg;
-    php_error_docref(NULL, E_WARNING, "D3D11: Built without GLFW, cannot create surface");
-    return NULL;
-#endif
 }
 
 static void d3d11_destroy_surface(void *surface)
@@ -926,6 +918,7 @@ static void d3d11_update_buffer(void *buffer_ptr, const void *data, size_t size,
 {
     vio_d3d11_buffer *buf = (vio_d3d11_buffer *)buffer_ptr;
     if (!buf || !buf->buffer || !data || size == 0) return;
+    if (buf->type != VIO_BUFFER_UNIFORM) buf->fs_dirty = 1;   /* the next read_buffer copies it again */
 
     if (buf->type == VIO_BUFFER_UNIFORM) {
         /* A dynamic constant buffer is only ever written whole (WRITE_DISCARD
@@ -960,6 +953,7 @@ static void d3d11_destroy_buffer(void *buffer_ptr)
     if (!buf) return;
 
     if (buf->readback_staging) ID3D11Buffer_Release(buf->readback_staging);
+    if (buf->fs_uav) ID3D11UnorderedAccessView_Release(buf->fs_uav);
     if (buf->buffer) ID3D11Buffer_Release(buf->buffer);
     free(buf);
 }
@@ -2135,6 +2129,10 @@ static const char *d3d11_dmip_resolve_src =
     "    return d;\n"
     "}\n";
 
+static const char *d3d11_copy_ps_src =
+    "Texture2D<float4> src : register(t0);\n"
+    "float4 main(float4 pos : SV_Position) : SV_Target { return src.Load(int3(int2(pos.xy), 0)); }\n";
+
 static int d3d11_dmip_init(void)
 {
     if (vio_d3d11.dmip_ps) return 0;
@@ -2150,6 +2148,11 @@ static int d3d11_dmip_init(void)
     if (SUCCEEDED(hr) && SUCCEEDED(d3d11_compile_cached(d3d11_dmip_resolve_src, "vio_depth_resolve_ps", "ps_5_0", flags, &rps))) {
         ID3D11Device_CreatePixelShader(vio_d3d11.device, ID3D10Blob_GetBufferPointer(rps), ID3D10Blob_GetBufferSize(rps), NULL, &vio_d3d11.dmip_resolve_ps);
         ID3D10Blob_Release(rps);
+    }
+    ID3DBlob *cps = NULL;
+    if (SUCCEEDED(hr) && SUCCEEDED(d3d11_compile_cached(d3d11_copy_ps_src, "vio_texel_copy_ps", "ps_5_0", flags, &cps))) {
+        ID3D11Device_CreatePixelShader(vio_d3d11.device, ID3D10Blob_GetBufferPointer(cps), ID3D10Blob_GetBufferSize(cps), NULL, &vio_d3d11.dmip_copy_ps);
+        ID3D10Blob_Release(cps);
     }
     D3D11_BUFFER_DESC bd = {0};
     bd.ByteWidth = 32;
@@ -2179,6 +2182,7 @@ static void d3d11_dmip_release(void)
     if (vio_d3d11.dmip_vs)  { ID3D11VertexShader_Release(vio_d3d11.dmip_vs); vio_d3d11.dmip_vs = NULL; }
     if (vio_d3d11.dmip_ps)  { ID3D11PixelShader_Release(vio_d3d11.dmip_ps); vio_d3d11.dmip_ps = NULL; }
     if (vio_d3d11.dmip_resolve_ps) { ID3D11PixelShader_Release(vio_d3d11.dmip_resolve_ps); vio_d3d11.dmip_resolve_ps = NULL; }
+    if (vio_d3d11.dmip_copy_ps) { ID3D11PixelShader_Release(vio_d3d11.dmip_copy_ps); vio_d3d11.dmip_copy_ps = NULL; }
     if (vio_d3d11.dmip_cb)  { ID3D11Buffer_Release(vio_d3d11.dmip_cb); vio_d3d11.dmip_cb = NULL; }
     if (vio_d3d11.dmip_dss) { ID3D11DepthStencilState_Release(vio_d3d11.dmip_dss); vio_d3d11.dmip_dss = NULL; }
     if (vio_d3d11.dmip_rs)  { ID3D11RasterizerState_Release(vio_d3d11.dmip_rs); vio_d3d11.dmip_rs = NULL; }
@@ -2194,6 +2198,7 @@ typedef struct {
     ID3D11DepthStencilState *dss; UINT ref;
     ID3D11RasterizerState *rs;
     ID3D11ShaderResourceView *srv; ID3D11Buffer *cb;
+    ID3D11BlendState *bs; FLOAT bf[4]; UINT mask;
     D3D11_VIEWPORT vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]; UINT vp_n;
 } d3d11_saved_state;
 
@@ -2215,6 +2220,7 @@ static void d3d11_state_save(d3d11_saved_state *s)
     ID3D11DeviceContext_PSGetShaderResources(c, 0, 1, &s->srv);
     ID3D11DeviceContext_PSGetConstantBuffers(c, 0, 1, &s->cb);
     ID3D11DeviceContext_RSGetViewports(c, &s->vp_n, s->vp);
+    ID3D11DeviceContext_OMGetBlendState(c, &s->bs, s->bf, &s->mask);
 }
 
 static void d3d11_state_restore(d3d11_saved_state *s)
@@ -2233,6 +2239,8 @@ static void d3d11_state_restore(d3d11_saved_state *s)
     ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &s->srv);
     ID3D11DeviceContext_PSSetConstantBuffers(c, 0, 1, &s->cb);
     if (s->vp_n) ID3D11DeviceContext_RSSetViewports(c, s->vp_n, s->vp);
+    ID3D11DeviceContext_OMSetBlendState(c, s->bs, s->bf, s->mask);
+    if (s->bs) ID3D11BlendState_Release(s->bs);
     for (int i = 0; i < VIO_MAX_COLOR_ATTACHMENTS; i++) if (s->rtvs[i]) ID3D11RenderTargetView_Release(s->rtvs[i]);
     if (s->dsv) ID3D11DepthStencilView_Release(s->dsv);
     if (s->vs) ID3D11VertexShader_Release(s->vs);
@@ -3032,8 +3040,56 @@ static void d3d11_bind_vertex_slots(ID3D11Buffer *mesh_vb, UINT mesh_stride)
                                            buffers, strides, offsets);
 }
 
+/* Fragment storage buffers (A15): output-merger UAVs u4..u7 (render targets
+ * take slots 0..3), re-applied before every draw - a render-target bind
+ * resets the output merger. */
+static vio_d3d11_buffer *d3d11_fs_storage[VIO_MAX_FRAGMENT_STORAGE];
+static int d3d11_fs_storage_any;
+
+static int d3d11_bind_fragment_storage(void *backend_buffer, int binding)
+{
+    if (binding < 0 || binding >= VIO_MAX_FRAGMENT_STORAGE) return -1;
+    vio_d3d11_buffer *buf = (vio_d3d11_buffer *)backend_buffer;
+    if (buf && !buf->buffer) return -1;
+    if (buf && !buf->fs_uav) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {0};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.FirstElement = 0;
+        ud.Buffer.NumElements = (UINT)(buf->size / 4);
+        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        if (FAILED(ID3D11Device_CreateUnorderedAccessView(vio_d3d11.device, (ID3D11Resource *)buf->buffer, &ud, &buf->fs_uav))) {
+            buf->fs_uav = NULL;
+            php_error_docref(NULL, E_WARNING, "D3D11: fragment storage UAV failed (the buffer needs a stride of 4 / raw views)");
+            return -1;
+        }
+    }
+    d3d11_fs_storage[binding] = buf;
+    d3d11_fs_storage_any = 0;
+    for (int i = 0; i < VIO_MAX_FRAGMENT_STORAGE; i++) if (d3d11_fs_storage[i]) d3d11_fs_storage_any = 1;
+    if (!d3d11_fs_storage_any && vio_d3d11.context) {
+        ID3D11UnorderedAccessView *none[VIO_MAX_FRAGMENT_STORAGE] = { NULL };
+        ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(vio_d3d11.context, D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL,
+                                                                      NULL, NULL, 4, VIO_MAX_FRAGMENT_STORAGE, none, NULL);
+    }
+    return 0;
+}
+
+static void d3d11_apply_fs_storage(void)
+{
+    if (!d3d11_fs_storage_any || !vio_d3d11.context) return;
+    ID3D11UnorderedAccessView *uavs[VIO_MAX_FRAGMENT_STORAGE];
+    for (int i = 0; i < VIO_MAX_FRAGMENT_STORAGE; i++) {
+        uavs[i] = d3d11_fs_storage[i] ? d3d11_fs_storage[i]->fs_uav : NULL;
+        if (d3d11_fs_storage[i]) d3d11_fs_storage[i]->fs_dirty = 1;
+    }
+    ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(vio_d3d11.context, D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL,
+                                                                  NULL, NULL, 4, VIO_MAX_FRAGMENT_STORAGE, uavs, NULL);
+}
+
 static void d3d11_draw(vio_draw_cmd *cmd)
 {
+    d3d11_apply_fs_storage();
     if (!cmd) return;
     /* Nothing bound yet: no vertex shader on the context. WARP draws nothing,
      * hardware drivers remove the device (test 173). */
@@ -3055,6 +3111,7 @@ static void d3d11_draw(vio_draw_cmd *cmd)
 
 static void d3d11_draw_indexed(vio_draw_indexed_cmd *cmd)
 {
+    d3d11_apply_fs_storage();
     if (!cmd) return;
     if (!d3d11_current_pipeline) return;   /* see d3d11_draw */
 
@@ -3143,9 +3200,11 @@ static void d3d11_bind_storage_buffer(void *backend_buffer, int binding, int acc
         return;
     }
 
-    ID3D11DeviceContext_VSSetShaderResources(vio_d3d11.context, (UINT)binding, 1, &srv);
+    /* t16 + binding: vio_shader_reflect.c moves vertex storage buffers out of the
+     * texture registers (A28). */
+    ID3D11DeviceContext_VSSetShaderResources(vio_d3d11.context, (UINT)(16 + binding), 1, &srv);
     s_vs_storage_srv = srv;
-    s_vs_storage_slot = binding;
+    s_vs_storage_slot = 16 + binding;
 }
 
 /* Instanced draw whose per-instance data comes from the bound storage buffer
@@ -3155,6 +3214,7 @@ static void d3d11_bind_storage_buffer(void *backend_buffer, int binding, int acc
  * harmless). Cbuffer flushing is done by the caller (vio_draw_instanced_from_buffer). */
 static void d3d11_draw_instanced_from_storage(void *mesh_obj, int instance_count)
 {
+    d3d11_apply_fs_storage();
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     if (!vio_d3d11.initialized || !mesh || instance_count <= 0) return;
     if (!d3d11_current_pipeline) return;   /* see d3d11_draw */
@@ -3182,6 +3242,7 @@ static void d3d11_draw_instanced_from_storage(void *mesh_obj, int instance_count
  * DrawInstancedIndirect per record (D3D11 has no multi-draw). */
 static void d3d11_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset)
 {
+    d3d11_apply_fs_storage();
     if (!d3d11_current_pipeline) return;   /* see d3d11_draw */
     vio_mesh_object *mesh = (vio_mesh_object *)mesh_obj;
     vio_d3d11_buffer *args = (vio_d3d11_buffer *)args_buffer;
@@ -3400,7 +3461,8 @@ static void *d3d11_create_compute_pipeline(vio_shader_desc *desc)
         }
     }
 
-    char *hlsl = vio_spirv_to_hlsl(spirv, spirv_size, 50, &err);
+    /* 'hlsl' override: the caller's kernel with the GLSL kernel's reflection */
+    char *hlsl = desc->compute_hlsl ? strdup(desc->compute_hlsl) : vio_spirv_to_hlsl(spirv, spirv_size, 50, &err);
     if (free_spirv) free(spirv);
     if (!hlsl) {
         php_error_docref(NULL, E_WARNING, "D3D11: CS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -3730,6 +3792,25 @@ static size_t d3d11_read_buffer(void *backend_buffer, void *out, size_t size)
 {
     vio_d3d11_buffer *buf = (vio_d3d11_buffer *)backend_buffer;
     if (!buf || !out || size == 0) return 0;
+    if (buf->fs_dirty && buf->buffer) {
+        /* Written by draws (A15): leave the output merger (the next draw binds
+         * it again) and copy into the staging buffer, ordered after the draws. */
+        buf->fs_dirty = 0;
+        ID3D11UnorderedAccessView *none[VIO_MAX_FRAGMENT_STORAGE] = { NULL };
+        ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(vio_d3d11.context, D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL,
+                                                                      NULL, NULL, 4, VIO_MAX_FRAGMENT_STORAGE, none, NULL);
+        if (!buf->readback_staging || buf->readback_size < buf->size) {
+            if (buf->readback_staging) { ID3D11Buffer_Release(buf->readback_staging); buf->readback_staging = NULL; }
+            D3D11_BUFFER_DESC sd = {0};
+            sd.ByteWidth = (UINT)buf->size;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(ID3D11Device_CreateBuffer(vio_d3d11.device, &sd, NULL, &buf->readback_staging))) buf->readback_staging = NULL;
+            else buf->readback_size = buf->size;
+        }
+        if (buf->readback_staging)
+            ID3D11DeviceContext_CopyResource(vio_d3d11.context, (ID3D11Resource *)buf->readback_staging, (ID3D11Resource *)buf->buffer);
+    }
     if (!buf->readback_staging) {
         php_error_docref(NULL, E_WARNING,
             "D3D11: read_buffer before any compute dispatch produced a staging copy");
@@ -3777,10 +3858,10 @@ static int d3d11_probe_adapter(IDXGIAdapter1 *adapter, vio_adapter_info *a)
         hr = D3D11CreateDevice((IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, levels + 1, 1,
                                D3D11_SDK_VERSION, &dev, NULL, NULL);
     if (FAILED(hr) || !dev) return -1;
-    a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
-                | VIO_FEATURE_BIT(VIO_FEATURE_GEOMETRY) | VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION)
-                | VIO_FEATURE_BIT(VIO_FEATURE_MULTI_VIEWPORT) | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW)
-                | VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_BC);
+    static const int base[] = { VIO_FEATURE_COMPUTE, VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_GEOMETRY, VIO_FEATURE_TESSELLATION,
+                                VIO_FEATURE_MULTI_VIEWPORT, VIO_FEATURE_INDIRECT_DRAW, VIO_FEATURE_TEXTURE_COMPRESSION_BC };
+    memset(&a->features, 0, sizeof(a->features));
+    for (size_t i = 0; i < sizeof(base) / sizeof(base[0]); i++) vio_featset_add(&a->features, base[i]);
     if (!a->device_type) {
         D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2 = {0};
         if (SUCCEEDED(ID3D11Device_CheckFeatureSupport(dev, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof(o2))))
@@ -3964,6 +4045,8 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_NATIVE_2D_BATCH: return 1; /* vio_2d_d3d11_* */
         case VIO_FEATURE_TEXTURE_3D:   return 1; /* ID3D11Texture3D */
         case VIO_FEATURE_VERTEX_STORAGE: return 1; /* SM5 reads SRV/StructuredBuffer in the VS */
+        case VIO_FEATURE_FRAGMENT_STORAGE: return 1; /* output-merger UAVs u4..u7 (feature level 11) */
+        case VIO_FEATURE_SAMPLER_FEEDBACK_GLSL: return 1;
         case VIO_FEATURE_STORAGE_IMAGE:  return 1; /* RWTexture2D/3D UAV on storage textures */
         case VIO_FEATURE_MRT:            return 1; /* OMSetRenderTargets with up to 4 RTVs */
         default:                       return 0;
@@ -4043,6 +4126,11 @@ static void d3d11_bind_texture(void *texture, int slot)
      * domain shader can read a displacement map (same register as the
      * fragment-stage map resolves the unit to). */
     vio_d3d11_pipeline *p = d3d11_current_pipeline;
+    if (tex->srv) {
+        /* Vertex textures (A28): the plan gives every stage the same register. */
+        ID3D11DeviceContext_VSSetShaderResources(vio_d3d11.context, (UINT)slot, 1, &tex->srv);
+        if (tex->sampler) ID3D11DeviceContext_VSSetSamplers(vio_d3d11.context, (UINT)slot, 1, &tex->sampler);
+    }
     if (p && tex->srv) {
         if (p->gs) {
             ID3D11DeviceContext_GSSetShaderResources(vio_d3d11.context, (UINT)slot, 1, &tex->srv);
@@ -4118,11 +4206,230 @@ static int d3d11_set_viewports(const int *rects, int count)
     return 0;
 }
 
+/* ── Recorded draw sequences (BUNDLE-PLAN phase 4) ─────────────────── */
+
+/* A bundle is a command list recorded on a deferred context. While one is
+ * recorded, vio_d3d11.context IS the deferred context: the common draw path
+ * (pipeline binds, the Map(WRITE_DISCARD) of the shader cbuffers, texture
+ * flushes, draws) records into it unchanged, and the command list keeps the
+ * discarded constant-buffer contents. A command list inherits no state, so the
+ * recording starts with the open target, viewports, scissors and pipeline;
+ * those belong to its signature. ExecuteCommandList restores the immediate
+ * context afterwards, so the state from before the bundle stays bound. */
+typedef struct _vio_d3d11_bundle {
+    ID3D11CommandList      *list;
+    ID3D11RenderTargetView *rtvs[VIO_MAX_COLOR_ATTACHMENTS];   /* signature; the list holds the references */
+    UINT                    rtv_count;
+    ID3D11DepthStencilView *dsv;
+    D3D11_VIEWPORT          vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT                    vp_count;
+    D3D11_RECT              sc[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT                    sc_count;
+    struct _vio_d3d11_bundle *prev, *next;   /* live bundles, swept at shutdown */
+} vio_d3d11_bundle;
+
+static ID3D11DeviceContext *d3d11_deferred;      /* created on first recording */
+static ID3D11DeviceContext *d3d11_rec_immediate; /* the immediate context while recording */
+static vio_d3d11_bundle    *d3d11_rec;
+static vio_d3d11_bundle    *d3d11_bundles;
+static struct { vio_d3d11_pipeline *pipe, *il_owner; ID3D11InputLayout *il; } d3d11_rec_saved;
+
+/* The immediate context's target, viewports and scissors (read before a
+ * recording swaps the context). */
+static void d3d11_bundle_signature(vio_d3d11_bundle *s)
+{
+    ID3D11DeviceContext *c = d3d11_rec ? d3d11_rec_immediate : vio_d3d11.context;
+    memset(s->rtvs, 0, sizeof(s->rtvs));
+    s->rtv_count = vio_d3d11.current_rtv_count < 0 ? 0 : (UINT)vio_d3d11.current_rtv_count;
+    if (s->rtv_count > VIO_MAX_COLOR_ATTACHMENTS) s->rtv_count = VIO_MAX_COLOR_ATTACHMENTS;
+    for (UINT i = 0; i < s->rtv_count; i++) s->rtvs[i] = vio_d3d11.current_rtvs[i];
+    if (s->rtv_count == 0 && vio_d3d11.current_rtv) { s->rtvs[0] = vio_d3d11.current_rtv; s->rtv_count = 1; }
+    s->dsv = vio_d3d11.current_dsv;
+    s->vp_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    ID3D11DeviceContext_RSGetViewports(c, &s->vp_count, s->vp);
+    s->sc_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    ID3D11DeviceContext_RSGetScissorRects(c, &s->sc_count, s->sc);
+}
+
+static int d3d11_bundle_matches(const vio_d3d11_bundle *b, const vio_d3d11_bundle *now)
+{
+    return b->rtv_count == now->rtv_count && b->dsv == now->dsv
+        && memcmp(b->rtvs, now->rtvs, sizeof(b->rtvs)) == 0
+        && b->vp_count == now->vp_count && memcmp(b->vp, now->vp, sizeof(D3D11_VIEWPORT) * b->vp_count) == 0
+        && b->sc_count == now->sc_count && memcmp(b->sc, now->sc, sizeof(D3D11_RECT) * b->sc_count) == 0;
+}
+
+static void d3d11_bundle_release(vio_d3d11_bundle *b)
+{
+    if (b->list) { ID3D11CommandList_Release(b->list); b->list = NULL; }
+    if (b->prev) b->prev->next = b->next; else if (d3d11_bundles == b) d3d11_bundles = b->next;
+    if (b->next) b->next->prev = b->prev;
+    b->prev = b->next = NULL;
+}
+
+/* Leave a recording: the immediate context and the caches that describe it
+ * come back; the deferred context is reset. */
+static void d3d11_bundle_stop(ID3D11CommandList **out)
+{
+    vio_d3d11.context        = d3d11_rec_immediate;
+    d3d11_current_pipeline   = d3d11_rec_saved.pipe;
+    d3d11_current_il         = d3d11_rec_saved.il;
+    d3d11_current_il_owner   = d3d11_rec_saved.il_owner;
+    d3d11_rec = NULL;
+    d3d11_rec_immediate = NULL;
+    ID3D11CommandList *list = NULL;
+    HRESULT hr = ID3D11DeviceContext_FinishCommandList(d3d11_deferred, FALSE, &list);
+    if (out && SUCCEEDED(hr)) *out = list;
+    else if (list) ID3D11CommandList_Release(list);
+}
+
+static void *d3d11_begin_bundle(void)
+{
+    if (!vio_d3d11.initialized || !vio_d3d11.device || !vio_d3d11.context || !vio_d3d11.in_frame || d3d11_rec) return NULL;
+    if (!d3d11_deferred && FAILED(ID3D11Device_CreateDeferredContext(vio_d3d11.device, 0, &d3d11_deferred))) {
+        d3d11_deferred = NULL;
+        return NULL;
+    }
+    vio_d3d11_bundle *b = (vio_d3d11_bundle *)calloc(1, sizeof(vio_d3d11_bundle));
+    if (!b) return NULL;
+    d3d11_bundle_signature(b);
+    b->next = d3d11_bundles;
+    if (d3d11_bundles) d3d11_bundles->prev = b;
+    d3d11_bundles = b;
+
+    ID3D11DeviceContext *dc = d3d11_deferred;
+    ID3D11DeviceContext_OMSetRenderTargets(dc, b->rtv_count, b->rtv_count ? b->rtvs : NULL, b->dsv);
+    if (b->vp_count) ID3D11DeviceContext_RSSetViewports(dc, b->vp_count, b->vp);
+    if (b->sc_count) ID3D11DeviceContext_RSSetScissorRects(dc, b->sc_count, b->sc);
+    d3d11_rec_saved.pipe     = d3d11_current_pipeline;
+    d3d11_rec_saved.il       = d3d11_current_il;
+    d3d11_rec_saved.il_owner = d3d11_current_il_owner;
+    d3d11_rec_immediate = vio_d3d11.context;
+    vio_d3d11.context   = dc;
+    d3d11_rec = b;
+    /* the pipeline bound now, for records without their own */
+    d3d11_current_il = NULL;
+    d3d11_current_il_owner = NULL;
+    if (d3d11_current_pipeline) d3d11_bind_pipeline(d3d11_current_pipeline);
+    return b;
+}
+
+static int d3d11_end_bundle(void *bundle)
+{
+    vio_d3d11_bundle *b = (vio_d3d11_bundle *)bundle;
+    if (!b || d3d11_rec != b) return -1;
+    d3d11_bundle_stop(&b->list);
+    return b->list ? 0 : -1;
+}
+
+static int d3d11_draw_bundle(void *bundle)
+{
+    vio_d3d11_bundle *b = (vio_d3d11_bundle *)bundle;
+    if (!b || !b->list || d3d11_rec || !vio_d3d11.in_frame || !vio_d3d11.context) return -1;
+    vio_d3d11_bundle now;
+    d3d11_bundle_signature(&now);
+    if (!d3d11_bundle_matches(b, &now)) return -1;   /* another target: recorded again */
+    ID3D11DeviceContext_ExecuteCommandList(vio_d3d11.context, b->list, TRUE);
+    return 0;
+}
+
+static void d3d11_destroy_bundle(void *bundle)
+{
+    vio_d3d11_bundle *b = (vio_d3d11_bundle *)bundle;
+    if (!b) return;
+    if (d3d11_rec == b) d3d11_bundle_stop(NULL);
+    d3d11_bundle_release(b);
+    free(b);
+}
+
+/* Device shutdown: no command list outlives the device (the PHP objects free
+ * the structs later). */
+static void d3d11_bundles_sweep(void)
+{
+    if (d3d11_rec) d3d11_bundle_stop(NULL);
+    while (d3d11_bundles) d3d11_bundle_release(d3d11_bundles);
+    if (d3d11_deferred) { ID3D11DeviceContext_Release(d3d11_deferred); d3d11_deferred = NULL; }
+}
+
+static const char *d3d11_bundle_method(void) { return "deferred_context"; }
+
+/* ── GPU video encoding interop (VIDEO-ENCODE-PLAN phase 2) ──────── */
+
+static void *d3d11_encode_device(int *api)
+{
+    if (!vio_d3d11.initialized || !vio_d3d11.device) return NULL;
+    *api = VIO_ENCODE_API_D3D11;
+    return vio_d3d11.device;
+}
+
+/* The frame vio_read_pixels would return - the GPU-local mirror end_frame
+ * keeps (mid-frame: the frame so far) - into the encoder's pool texture. */
+static int d3d11_encode_copy_frame(void *dst_texture, int slice, int width, int height)
+{
+    ID3D11Texture2D *dst = (ID3D11Texture2D *)dst_texture;
+    if (!dst || !vio_d3d11.context || d3d11_rec) return -1;
+    if (vio_d3d11.in_frame && !vio_d3d11.current_bound_rt) d3d11_mirror_backbuffer();
+    if (!vio_d3d11.readback_mirror) return -1;
+    D3D11_TEXTURE2D_DESC sd, dd;
+    ID3D11Texture2D_GetDesc(vio_d3d11.readback_mirror, &sd);
+    ID3D11Texture2D_GetDesc(dst, &dd);
+    if (slice < 0 || (UINT)slice >= dd.ArraySize
+        || (int)sd.Width < width || (int)sd.Height < height || (int)dd.Width < width || (int)dd.Height < height) return -1;
+    if (sd.Format == dd.Format) {
+        D3D11_BOX box = { 0, 0, 0, (UINT)width, (UINT)height, 1 };
+        ID3D11DeviceContext_CopySubresourceRegion(vio_d3d11.context, (ID3D11Resource *)dst, (UINT)slice * dd.MipLevels, 0, 0, 0,
+                                                  (ID3D11Resource *)vio_d3d11.readback_mirror, 0, &box);
+        return 0;
+    }
+    /* Another format (the encoder's BGRA pool): a texel copy into a render
+     * target view of the slice - the output merger converts. */
+    if (!(dd.BindFlags & D3D11_BIND_RENDER_TARGET) || d3d11_dmip_init() != 0 || !vio_d3d11.dmip_copy_ps) return -1;
+    D3D11_RENDER_TARGET_VIEW_DESC rv = {0};
+    rv.Format = dd.Format;
+    if (dd.ArraySize > 1) {
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+        rv.Texture2DArray.FirstArraySlice = (UINT)slice;
+        rv.Texture2DArray.ArraySize = 1;
+    } else {
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    }
+    ID3D11RenderTargetView *rtv = NULL;
+    ID3D11ShaderResourceView *srv = NULL, *null_srv = NULL;
+    if (FAILED(ID3D11Device_CreateRenderTargetView(vio_d3d11.device, (ID3D11Resource *)dst, &rv, &rtv))
+        || FAILED(ID3D11Device_CreateShaderResourceView(vio_d3d11.device, (ID3D11Resource *)vio_d3d11.readback_mirror, NULL, &srv))) {
+        if (rtv) ID3D11RenderTargetView_Release(rtv);
+        return -1;
+    }
+    ID3D11DeviceContext *c = vio_d3d11.context;
+    d3d11_saved_state saved;
+    d3d11_state_save(&saved);
+    D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f };
+    ID3D11DeviceContext_VSSetShader(c, vio_d3d11.dmip_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, vio_d3d11.dmip_copy_ps, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(c, NULL, NULL, 0);
+    ID3D11DeviceContext_HSSetShader(c, NULL, NULL, 0);
+    ID3D11DeviceContext_DSSetShader(c, NULL, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(c, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_OMSetDepthStencilState(c, NULL, 0);
+    ID3D11DeviceContext_OMSetBlendState(c, NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_RSSetState(c, vio_d3d11.dmip_rs);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 1, &rtv, NULL);
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &srv);
+    ID3D11DeviceContext_RSSetViewports(c, 1, &vp);
+    ID3D11DeviceContext_Draw(c, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &null_srv);
+    d3d11_state_restore(&saved);
+    ID3D11RenderTargetView_Release(rtv);
+    ID3D11ShaderResourceView_Release(srv);
+    return 0;
+}
+
 /* ── Setup context (called from vio_create after window creation) ── */
 
-int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg)
+int vio_d3d11_setup_context(void *platform_window, vio_config *cfg)
 {
-    vio_d3d11.glfw_window = glfw_window;
+    vio_d3d11.platform_window = platform_window;
 
     /* Create surface (swapchain + render targets) */
     void *surface = d3d11_create_surface(cfg);
@@ -4174,6 +4481,7 @@ static const vio_backend d3d11_backend = {
     .compute_set_uniforms     = d3d11_compute_set_uniforms,
     .read_buffer              = d3d11_read_buffer,
     .bind_storage_buffer          = d3d11_bind_storage_buffer,
+    .bind_fragment_storage        = d3d11_bind_fragment_storage,
     .draw_instanced_from_storage  = d3d11_draw_instanced_from_storage,
     .supports_feature  = d3d11_supports_feature,
     .feature_emulation = d3d11_feature_emulation,
@@ -4202,6 +4510,14 @@ static const vio_backend d3d11_backend = {
     .gpu_info                = d3d11_gpu_info,
     .describe                = d3d11_describe,
     .enumerate_adapters      = d3d11_enumerate_adapters,
+    .begin_bundle            = d3d11_begin_bundle,
+    .end_bundle              = d3d11_end_bundle,
+    .draw_bundle             = d3d11_draw_bundle,
+    .destroy_bundle          = d3d11_destroy_bundle,
+    .bundle_method           = d3d11_bundle_method,
+    .encode_device           = d3d11_encode_device,
+    .encode_copy_frame       = d3d11_encode_copy_frame,
+    .rt_origin_top     = 1,
 };
 
 void vio_backend_d3d11_register(void)
