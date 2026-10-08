@@ -185,6 +185,7 @@ jobs:
             tests/render3d/202_trace_rays_in_frame_all_backends.phpt \
             tests/render3d/203_fragment_storage_all_backends.phpt \
             tests/render3d/204_sampler_feedback_emulated_all_backends.phpt
+            tests/render3d/205_geometry_stage_gaps_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -367,6 +368,7 @@ jobs:
             tests/render3d/202_trace_rays_in_frame_all_backends.phpt \
             tests/render3d/203_fragment_storage_all_backends.phpt \
             tests/render3d/204_sampler_feedback_emulated_all_backends.phpt
+            tests/render3d/205_geometry_stage_gaps_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -814,6 +816,7 @@ jobs:
             tests/render3d/202_trace_rays_in_frame_all_backends.phpt `
             tests/render3d/203_fragment_storage_all_backends.phpt `
             tests/render3d/204_sampler_feedback_emulated_all_backends.phpt `
+            tests/render3d/205_geometry_stage_gaps_all_backends.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt
 
       - name: Package binary

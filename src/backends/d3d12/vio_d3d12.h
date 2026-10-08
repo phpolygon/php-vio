@@ -88,7 +88,7 @@
 #define VIO_D3D12_RP_VS_CBV       0
 #define VIO_D3D12_RP_PS_CBV       1
 #define VIO_D3D12_RP_PS_SRV       2
-#define VIO_D3D12_RP_VS_SRV       3   /* root SRV t0, vertex storage (Path B) */
+#define VIO_D3D12_RP_VS_STORAGE   3   /* root SRV t0, vertex storage (Path B) */
 #define VIO_D3D12_RP_PS_SAMPLER   4
 #define VIO_D3D12_RP_GS_CBV       5
 #define VIO_D3D12_RP_HS_CBV       6
