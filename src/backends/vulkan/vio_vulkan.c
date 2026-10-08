@@ -420,6 +420,27 @@ static int create_logical_device(void)
                 if (vio_vk.vrs_rates & (1 << VIO_SHADING_RATE_2X2)) {
                     vio_vk.vrs_supported = 1;
                     vrs_enable.pipelineFragmentShadingRate = VK_TRUE;
+                    /* A18: a shading-rate image, combined with the set rate by MAX
+                     * (non-trivial combiner ops), with a square tile the device allows. */
+                    vio_vk.vrs_attachment = 0;
+                    vio_vk.vrs_tile = 0;
+                    if (vrs_avail.attachmentFragmentShadingRate) {
+                        VkPhysicalDeviceFragmentShadingRatePropertiesKHR ap = {0};
+                        ap.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR;
+                        VkPhysicalDeviceProperties2 ap2 = {0};
+                        ap2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                        ap2.pNext = &ap;
+                        vkGetPhysicalDeviceProperties2(vio_vk.physical_device, &ap2);
+                        uint32_t lo = ap.minFragmentShadingRateAttachmentTexelSize.width > ap.minFragmentShadingRateAttachmentTexelSize.height
+                                    ? ap.minFragmentShadingRateAttachmentTexelSize.width : ap.minFragmentShadingRateAttachmentTexelSize.height;
+                        uint32_t hi = ap.maxFragmentShadingRateAttachmentTexelSize.width < ap.maxFragmentShadingRateAttachmentTexelSize.height
+                                    ? ap.maxFragmentShadingRateAttachmentTexelSize.width : ap.maxFragmentShadingRateAttachmentTexelSize.height;
+                        if (ap.fragmentShadingRateNonTrivialCombinerOps && lo >= 1 && lo <= hi) {
+                            vrs_enable.attachmentFragmentShadingRate = VK_TRUE;
+                            vio_vk.vrs_attachment = 1;
+                            vio_vk.vrs_tile = lo;
+                        }
+                    }
                     /* gl_PrimitiveShadingRateEXT from the vertex stage (VIO_FEATURE_SHADING_RATE_PRIMITIVE). */
                     if (vrs_avail.primitiveFragmentShadingRate) {
                         vrs_enable.primitiveFragmentShadingRate = VK_TRUE;
@@ -1889,6 +1910,13 @@ static void vulkan_shutdown(void)
         vio_vma_destroy_buffer(vio_vk.vma_allocator, vio_vk.capture_buf, vio_vk.capture_alloc);
         vio_vk.capture_buf = VK_NULL_HANDLE;
     }
+    /* the shading-rate image (A18) */
+    if (vio_vk.vrs_image_view && vio_vk.device) vkDestroyImageView(vio_vk.device, vio_vk.vrs_image_view, NULL);
+    if (vio_vk.vrs_image && vio_vk.vma_allocator) vio_vma_destroy_image(vio_vk.vma_allocator, vio_vk.vrs_image, vio_vk.vrs_image_alloc);
+    vio_vk.vrs_image_view = VK_NULL_HANDLE;
+    vio_vk.vrs_image = VK_NULL_HANDLE;
+    vio_vk.vrs_image_alloc = NULL;
+    vio_vk.vrs_image_active = 0;
 
     /* Sweep any backend textures whose owning PHP object outlived vio_destroy()
      * (the Zend free handlers run during request shutdown, AFTER this). Without
@@ -3909,6 +3937,130 @@ static void vulkan_present(void)
 
 /* Variable rate shading (GAP-PHASE5 Block 10c): the rate is a dynamic state of
  * every 3D pipeline, re-applied after each 3D pipeline bind. */
+/* Vulkan's attachment texel value: log2(width) << 2 | log2(height). */
+static uint8_t vk_rate_texel(int rate)
+{
+    switch (rate) {
+        case VIO_SHADING_RATE_1X2: return 0x1;
+        case VIO_SHADING_RATE_2X1: return 0x4;
+        case VIO_SHADING_RATE_2X2: return 0x5;
+        case VIO_SHADING_RATE_4X4: return 0xA;
+        default:                   return 0x0;
+    }
+}
+
+/* Shading-rate image (A18): one rate per tile. A new tile count recreates the
+ * image (the old one is parked until the frames that used it retire), the
+ * same tile count re-uploads in queue order. An open pass is restarted so the
+ * change applies to the next draw, as RSSetShadingRateImage does on D3D12. */
+static int vulkan_set_shading_rate_image(const unsigned char *rates, int tiles_x, int tiles_y)
+{
+    if (!vio_vk.vrs_attachment || !vio_vk.vrs_tile) return -1;
+    VkCommandBuffer fcmd = vio_vk.in_frame ? vio_vk.frames[vio_vk.current_frame].cmd_buf : VK_NULL_HANDLE;
+    if (!rates) {
+        vio_vk.vrs_image_active = 0;
+        if (fcmd && vio_vk.in_pass && vio_vk.cur_pass_vrs) { vio_vk_pass_end(fcmd); vio_vk_resume_pass(fcmd); }
+        return 0;
+    }
+    if (tiles_x <= 0 || tiles_y <= 0) return -1;
+    size_t n = (size_t)tiles_x * (size_t)tiles_y;
+    for (size_t i = 0; i < n; i++) if (!(vio_vk.vrs_rates & (1 << rates[i]))) return -1;
+    /* the pass must not hold the image while it is replaced or re-uploaded */
+    int reopen = fcmd && vio_vk.in_pass && vio_vk.cur_pass_vrs;
+    if (reopen) vio_vk_pass_end(fcmd);
+    if (vio_vk.vrs_image && (vio_vk.vrs_image_w != tiles_x || vio_vk.vrs_image_h != tiles_y)) {
+        if (vio_vk.in_frame) {
+            vio_vk_defer_destroy(VIO_VK_GRAVE_VIEW, (uint64_t)vio_vk.vrs_image_view, NULL);
+            vio_vk_defer_destroy(VIO_VK_GRAVE_IMAGE, (uint64_t)vio_vk.vrs_image, vio_vk.vrs_image_alloc);
+        } else {
+            vio_vk_wait_value(vio_vk.timeline_value);
+            vkDestroyImageView(vio_vk.device, vio_vk.vrs_image_view, NULL);
+            vio_vma_destroy_image(vio_vk.vma_allocator, vio_vk.vrs_image, vio_vk.vrs_image_alloc);
+        }
+        vio_vk.vrs_image = VK_NULL_HANDLE;
+        vio_vk.vrs_image_view = VK_NULL_HANDLE;
+        vio_vk.vrs_image_alloc = NULL;
+    }
+    int fresh = 0;
+    if (!vio_vk.vrs_image) {
+        VkImageCreateInfo ci = {0};
+        ci.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ci.imageType     = VK_IMAGE_TYPE_2D;
+        ci.format        = VK_FORMAT_R8_UINT;
+        ci.extent.width  = (uint32_t)tiles_x;
+        ci.extent.height = (uint32_t)tiles_y;
+        ci.extent.depth  = 1;
+        ci.mipLevels     = 1;
+        ci.arrayLayers   = 1;
+        ci.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage         = VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vio_vma_create_image(vio_vk.vma_allocator, &ci, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                 &vio_vk.vrs_image, &vio_vk.vrs_image_alloc) != 0) {
+            vio_vk.vrs_image = VK_NULL_HANDLE;
+            if (reopen) vio_vk_resume_pass(fcmd);
+            return -1;
+        }
+        VkImageViewCreateInfo iv = {0};
+        iv.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        iv.image    = vio_vk.vrs_image;
+        iv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        iv.format   = VK_FORMAT_R8_UINT;
+        iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        iv.subresourceRange.levelCount = 1;
+        iv.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(vio_vk.device, &iv, NULL, &vio_vk.vrs_image_view) != VK_SUCCESS) {
+            vio_vma_destroy_image(vio_vk.vma_allocator, vio_vk.vrs_image, vio_vk.vrs_image_alloc);
+            vio_vk.vrs_image = VK_NULL_HANDLE;
+            if (reopen) vio_vk_resume_pass(fcmd);
+            return -1;
+        }
+        vio_vk.vrs_image_w = tiles_x;
+        vio_vk.vrs_image_h = tiles_y;
+        fresh = 1;
+    }
+    VkBuffer staging = VK_NULL_HANDLE;
+    void *salloc = NULL;
+    int rc = -1;
+    if (vio_vma_create_buffer(vio_vk.vma_allocator, (VkDeviceSize)n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              &staging, &salloc) == 0) {
+        uint8_t *dst = (uint8_t *)vio_vma_map(vio_vk.vma_allocator, salloc);
+        if (dst) {
+            for (size_t i = 0; i < n; i++) dst[i] = vk_rate_texel(rates[i]);
+            vio_vma_unmap(vio_vk.vma_allocator, salloc);
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            if (vio_vk_begin_transient(&cmd) == 0) {
+                VkImageLayout from = fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+                vio_vk_image_barrier(cmd, vio_vk.vrs_image, VK_IMAGE_ASPECT_COLOR_BIT, 1, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VkBufferImageCopy copy = {0};
+                copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                copy.imageSubresource.layerCount = 1;
+                copy.imageExtent.width  = (uint32_t)tiles_x;
+                copy.imageExtent.height = (uint32_t)tiles_y;
+                copy.imageExtent.depth  = 1;
+                vkCmdCopyBufferToImage(cmd, staging, vio_vk.vrs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                vio_vk_image_barrier(cmd, vio_vk.vrs_image, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR);
+                rc = vio_vk_submit_transient(cmd);
+            }
+        }
+        vio_vma_destroy_buffer(vio_vk.vma_allocator, staging, salloc);
+    }
+    if (rc == 0) vio_vk.vrs_image_active = 1;
+    if (reopen || (fcmd && vio_vk.in_pass && rc == 0)) {
+        vio_vk_pass_end(fcmd);
+        vio_vk_resume_pass(fcmd);
+    }
+    return rc;
+}
+
+static int vulkan_shading_rate_tile_size(void)
+{
+    return vio_vk.vrs_attachment ? (int)vio_vk.vrs_tile : 0;
+}
+
 int vio_vk_set_shading_rate(int rate)
 {
     if (!vio_vk.vrs_supported || rate < VIO_SHADING_RATE_1X1 || rate > VIO_SHADING_RATE_4X4) return -1;
@@ -3934,7 +4086,9 @@ void vio_vk_apply_shading_rate(VkCommandBuffer cmd, int primitive)
     VkFragmentShadingRateCombinerOpKHR ops[2] = {
         (primitive && vio_vk.vrs_primitive) ? VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR
                                             : VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
-        VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR };
+        /* the shading-rate image (A18): the coarser rate wins, as on D3D12 */
+        (vio_vk.in_pass && vio_vk.cur_pass_vrs) ? VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MAX_KHR
+                                                : VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR };
     typedef void (VKAPI_PTR *vio_vk_fsr_set_fn)(VkCommandBuffer, const VkExtent2D *, const VkFragmentShadingRateCombinerOpKHR[2]);
     ((vio_vk_fsr_set_fn)vio_vk.vrs_cmd_set)(cmd, &size, ops);
 #else
@@ -5108,6 +5262,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_DEPTH_MIPMAPS: return vio_vk3d_available() && vio_vk.device != VK_NULL_HANDLE;   /* vio_vk_generate_depth_mips (A26) */
         case VIO_FEATURE_SHADING_RATE:   return vio_vk3d_available() && vio_vk.vrs_supported; /* VK_KHR_fragment_shading_rate, pipeline rate */
         case VIO_FEATURE_SHADING_RATE_PRIMITIVE: return vio_vk3d_available() && vio_vk.vrs_supported && vio_vk.vrs_primitive;
+        case VIO_FEATURE_SHADING_RATE_IMAGE: return vio_vk3d_available() && vio_vk.vrs_supported && vio_vk.vrs_attachment;   /* A18 */
         case VIO_FEATURE_SUBGROUP:       return vio_vk.device && vio_vk.subgroup_supported; /* core 1.1 subgroup properties, compute + fragment */
         case VIO_FEATURE_SUBGROUP_QUAD:  return vio_vk.device && vio_vk.subgroup_quad_supported;
         case VIO_FEATURE_BARYCENTRICS:   return vio_vk.device && vio_vk.barycentrics_supported; /* VK_KHR_fragment_shader_barycentric */
@@ -5169,6 +5324,8 @@ static const vio_backend vulkan_backend = {
     .destroy_cubemap   = vio_vk_destroy_cubemap,
     .bind_cubemap      = vio_vk_bind_cubemap,
     .set_shading_rate  = vio_vk_set_shading_rate,
+    .set_shading_rate_image = vulkan_set_shading_rate_image,
+    .shading_rate_tile_size = vulkan_shading_rate_tile_size,
     .swapchain_info    = vulkan_swapchain_info,
     .bindless_set      = vulkan_bindless_set,
     .present           = vulkan_present,

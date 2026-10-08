@@ -181,7 +181,24 @@ void vio_vk_pass_begin(VkCommandBuffer cmd, const vio_vk_pass *p)
     ri.pColorAttachments    = count ? ca : NULL;
     ri.pDepthAttachment     = p->has_depth ? &da : NULL;
     ri.pStencilAttachment   = (p->has_depth && vio_vk.depth_has_stencil) ? &sa : NULL;
+    /* Shading-rate image (A18) on the application's passes it covers: not on
+     * vio's own depth passes, layered or multiview passes, or a target larger
+     * than the image's tiles. */
+    VkRenderingFragmentShadingRateAttachmentInfoKHR fsr = {0};
+    int vrs = vio_vk.vrs_image_active && vio_vk.vrs_image_view && !p->internal && !p->view_mask
+           && ri.layerCount == 1 && vio_vk.vrs_tile
+           && (uint32_t)vio_vk.vrs_image_w * vio_vk.vrs_tile >= p->width
+           && (uint32_t)vio_vk.vrs_image_h * vio_vk.vrs_tile >= p->height;
+    if (vrs) {
+        fsr.sType       = VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR;
+        fsr.imageView   = vio_vk.vrs_image_view;
+        fsr.imageLayout = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+        fsr.shadingRateAttachmentTexelSize.width  = vio_vk.vrs_tile;
+        fsr.shadingRateAttachmentTexelSize.height = vio_vk.vrs_tile;
+        ri.pNext = &fsr;
+    }
     ((PFN_vkCmdBeginRendering)vio_vk.fn_begin_rendering)(cmd, &ri);
+    vio_vk.cur_pass_vrs = vrs;
 
     VkViewport vp = { 0.0f, 0.0f, (float)p->width, (float)p->height, 0.0f, 1.0f };
     vkCmdSetViewport(cmd, 0, 1, &vp);
@@ -612,6 +629,7 @@ static void vk_dmip_record(VkCommandBuffer cmd, vio_render_target_object *rt, vi
         vio_vk_pass pass;
         memset(&pass, 0, sizeof(pass));
         pass.has_depth = 1;
+        pass.internal  = 1;
         vkpass_att(&pass.depth, x->dmip_att[l], x->depth_image, da, (uint32_t)l, 0, 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
         pass.samples = 1;
         pass.width   = (uint32_t)dw;
@@ -983,6 +1001,7 @@ static void vk_dres_record(VkCommandBuffer cmd, vio_render_target_object *rt, vi
     vio_vk_pass pass;
     memset(&pass, 0, sizeof(pass));
     pass.has_depth = 1;
+    pass.internal  = 1;
     vkpass_att(&pass.depth, x->depth_view, x->depth_image, da, 0, 0, 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
     pass.samples = 1;
     pass.width   = (uint32_t)rt->width;

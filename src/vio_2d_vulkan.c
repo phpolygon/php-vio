@@ -179,6 +179,7 @@ static VkPipeline vio_2d_vk_make_pipeline(vio_2d_vulkan_state *state, VkShaderMo
     rendering.depthAttachmentFormat   = vio_vk_depth_format();
     rendering.stencilAttachmentFormat = vio_vk.depth_has_stencil ? rendering.depthAttachmentFormat : VK_FORMAT_UNDEFINED;
     info.pNext               = &rendering;
+    if (vio_vk.vrs_attachment) info.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;   /* A18 */
     info.basePipelineIndex   = -1;
 
     VkPipeline pipeline = VK_NULL_HANDLE;

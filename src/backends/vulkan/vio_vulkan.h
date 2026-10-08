@@ -103,6 +103,7 @@ typedef struct _vio_vk_pass {
     uint32_t         layers;             /* layered bind: every layer; 1 otherwise */
     uint32_t         view_mask;          /* multiview: views 0..n-1; 0 = off */
     int              clear;              /* CLEAR instead of LOAD (the swapchain's first pass of a frame) */
+    int              internal;           /* vio's own pass (depth mips / resolve): no shading-rate image */
     int              swapchain;          /* colour 0 is the acquired swapchain image */
 } vio_vk_pass;
 
@@ -370,7 +371,17 @@ typedef struct _vio_vulkan_state {
     int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
     int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
     void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */
-    /* VK_EXT_mesh_shader (VIO_FEATURE_MESH_SHADER): meshShader + taskShader
+    /* Shading-rate image (A18, VIO_FEATURE_SHADING_RATE_IMAGE): attachmentFragmentShadingRate
+     * with non-trivial combiners; an R8_UINT image of one rate per vrs_tile x vrs_tile
+     * tile, attached to every application pass (dynamic rendering) while active. */
+    int                      vrs_attachment;
+    uint32_t                 vrs_tile;
+    VkImage                  vrs_image;
+    void                    *vrs_image_alloc;
+    VkImageView              vrs_image_view;
+    int                      vrs_image_w, vrs_image_h;
+    int                      vrs_image_active;
+    int                      cur_pass_vrs;         /* the open pass carries the image */    /* VK_EXT_mesh_shader (VIO_FEATURE_MESH_SHADER): meshShader + taskShader
      * enabled, draw entry points via vkGetDeviceProcAddr. */
     int                      mesh_supported;
     void                    *mesh_cmd_draw;          /* vkCmdDrawMeshTasksEXT */

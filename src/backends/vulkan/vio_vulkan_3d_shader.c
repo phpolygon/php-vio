@@ -1025,6 +1025,7 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
     VkPipelineRenderingCreateInfo rendering;
     vio_vk_pass_rendering_info(&rendering);
     gi.pNext               = &rendering;
+    if (vio_vk.vrs_attachment) gi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;   /* A18 */
     gi.basePipelineIndex   = -1;
 
     VkPipeline pl = VK_NULL_HANDLE;
