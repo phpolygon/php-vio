@@ -468,6 +468,18 @@ function vio_benchmark_backends(array $options = []): array|false {}
 function vio_acceleration_structure(VioContext $context, array $instances): VioAccelerationStructure|false {}
 
 /**
+ * Update an acceleration structure with a new instance list (same format as
+ * vio_acceleration_structure). Returns what it did: 'refit' when every instance
+ * keeps its mesh and only transforms change (the top level is updated in place -
+ * the cheap per-frame path for moving objects), 'rebuild' when the list changes
+ * but all meshes are already in the structure (a new top level over the existing
+ * bottom levels), 'full' when a mesh is new (everything is built again). The
+ * structure keeps its meshes alive for that. Outside vio_begin / vio_end (false +
+ * warning inside); synchronous, waits for frames still using it.
+ */
+function vio_acceleration_structure_update(VioContext $context, VioAccelerationStructure $accelerationStructure, array $instances): string|false {}
+
+/**
  * Bind an acceleration structure for the following draws and compute
  * dispatches at the GLSL binding of the shader's accelerationStructureEXT.
  */

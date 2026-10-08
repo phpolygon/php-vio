@@ -494,6 +494,12 @@ typedef struct _vio_backend {
      * tightly packed, top-down) into font_obj's atlas at (x, y). NULL => the
      * shaping path rasterizes every glyph up front, as before. */
     int (*update_font_atlas)(void *font_obj, const unsigned char *r8, int x, int y, int w, int h);
+
+    /* vio_acceleration_structure_update (A14): new instances over the structure's
+     * existing bottom levels (vio_as_instance.geometry indexes them). refit = 1:
+     * same instance count and geometries, only transforms change - update the top
+     * level in place; 0: rebuild it. Outside a frame; synchronous. 0 = done. */
+    int (*update_acceleration_structure)(void *as, const vio_as_instance *instances, int count, int refit);
 } vio_backend;
 
 /*

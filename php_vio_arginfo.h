@@ -278,6 +278,12 @@ ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_acceleration_structure, 
 	ZEND_ARG_TYPE_INFO(0, instances, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_acceleration_structure_update, 0, 3, MAY_BE_STRING|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, accelerationStructure, VioAccelerationStructure, 0)
+	ZEND_ARG_TYPE_INFO(0, instances, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bind_acceleration_structure, 0, 3, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_OBJ_INFO(0, accelerationStructure, VioAccelerationStructure, 0)
@@ -1044,6 +1050,7 @@ ZEND_FUNCTION(vio_sampler_feedback_bind);
 ZEND_FUNCTION(vio_sampler_feedback_read);
 ZEND_FUNCTION(vio_sampler_feedback_clear);
 ZEND_FUNCTION(vio_acceleration_structure);
+ZEND_FUNCTION(vio_acceleration_structure_update);
 ZEND_FUNCTION(vio_bind_acceleration_structure);
 ZEND_FUNCTION(vio_draw_mesh_tasks);
 ZEND_FUNCTION(vio_draw_mesh_tasks_indirect);
@@ -1235,6 +1242,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_sampler_feedback_read, arginfo_vio_sampler_feedback_read)
 	ZEND_FE(vio_sampler_feedback_clear, arginfo_vio_sampler_feedback_clear)
 	ZEND_FE(vio_acceleration_structure, arginfo_vio_acceleration_structure)
+	ZEND_FE(vio_acceleration_structure_update, arginfo_vio_acceleration_structure_update)
 	ZEND_FE(vio_bind_acceleration_structure, arginfo_vio_bind_acceleration_structure)
 	ZEND_FE(vio_draw_mesh_tasks, arginfo_vio_draw_mesh_tasks)
 	ZEND_FE(vio_draw_mesh_tasks_indirect, arginfo_vio_draw_mesh_tasks_indirect)

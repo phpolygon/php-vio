@@ -2162,8 +2162,13 @@ typedef struct _vio_d3d12_as {
     ID3D12Resource  *tlas;
     ID3D12Resource **blas;
     int              blas_count;
+    /* Kept for vio_acceleration_structure_update (A14): the top level is built
+     * with ALLOW_UPDATE, its scratch and instance descriptors stay. */
+    UINT64           tlas_size, scratch_size;
+    ID3D12Resource  *tlas_scratch;
+    ID3D12Resource  *instances;      /* upload buffer, instance_cap descriptors */
+    int              instance_cap, instance_count;
 } vio_d3d12_as;
-
 static vio_d3d12_as *d3d12_bound_as = NULL;
 
 static ID3D12Resource *d3d12_as_buffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags,
@@ -2180,6 +2185,9 @@ static ID3D12Resource *d3d12_as_buffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_
     rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     rd.Flags = flags;
+    /* Buffers start in COMMON whatever is asked (the debug layer warns); scratch
+     * buffers promote to UNORDERED_ACCESS on first use. */
+    if (state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) state = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource *r = NULL;
     if (FAILED(ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, state, NULL,
                                                     &IID_ID3D12Resource, (void **)&r))) return NULL;
@@ -2203,9 +2211,82 @@ static void d3d12_as_free(vio_d3d12_as *as)
 {
     if (!as) return;
     if (as->tlas) ID3D12Resource_Release(as->tlas);
+    if (as->tlas_scratch) ID3D12Resource_Release(as->tlas_scratch);
+    if (as->instances) ID3D12Resource_Release(as->instances);
     for (int i = 0; i < as->blas_count; i++) if (as->blas[i]) ID3D12Resource_Release(as->blas[i]);
     free(as->blas);
     free(as);
+}
+
+/* Record the top-level build over `count` instances (A14). Built with
+ * ALLOW_UPDATE: refit = 1 (same count and geometries) updates it in place, a
+ * rebuild reuses the result / scratch resources while they are big enough.
+ * The GPU must not be using the structure (create, or after a drain). */
+static int d3d12_as_record_tlas(ID3D12Device5 *dev5, ID3D12GraphicsCommandList4 *list4, vio_d3d12_as *as,
+                                const vio_as_instance *inst, int count, int refit)
+{
+    if (count > as->instance_cap) {
+        if (as->instances) ID3D12Resource_Release(as->instances);
+        as->instances = d3d12_as_buffer(sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * (UINT64)count, D3D12_HEAP_TYPE_UPLOAD,
+                                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        as->instance_cap = as->instances ? count : 0;
+        if (!as->instances) return -1;
+    }
+    D3D12_RAYTRACING_INSTANCE_DESC *ids = NULL;
+    D3D12_RANGE none = { 0, 0 };
+    if (FAILED(ID3D12Resource_Map(as->instances, 0, &none, (void **)&ids)) || !ids) return -1;
+    for (int i = 0; i < count; i++) {
+        const vio_as_instance *src = &inst[i];
+        if (src->geometry < 0 || src->geometry >= as->blas_count) { ID3D12Resource_Unmap(as->instances, 0, NULL); return -1; }
+        memset(&ids[i], 0, sizeof(ids[i]));
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 4; c++) ids[i].Transform[r][c] = src->transform[r * 4 + c];
+        ids[i].InstanceID = (UINT)i;
+        ids[i].InstanceMask = 0xFF;
+        ids[i].InstanceContributionToHitGroupIndex = 0;
+        ids[i].Flags = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+        ids[i].AccelerationStructure = ID3D12Resource_GetGPUVirtualAddress(as->blas[src->geometry]);
+    }
+    ID3D12Resource_Unmap(as->instances, 0, NULL);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in;
+    memset(&in, 0, sizeof(in));
+    in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+             | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+    in.NumDescs = (UINT)count;
+    in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    in.InstanceDescs = ID3D12Resource_GetGPUVirtualAddress(as->instances);
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pre;
+    memset(&pre, 0, sizeof(pre));
+    ID3D12Device5_GetRaytracingAccelerationStructurePrebuildInfo(dev5, &in, &pre);
+    UINT64 scratch = refit ? pre.UpdateScratchDataSizeInBytes : pre.ScratchDataSizeInBytes;
+    if (refit && !as->tlas) return -1;
+    if (!refit && (!as->tlas || pre.ResultDataMaxSizeInBytes > as->tlas_size)) {
+        if (as->tlas) ID3D12Resource_Release(as->tlas);
+        as->tlas = d3d12_as_buffer(pre.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+        as->tlas_size = as->tlas ? pre.ResultDataMaxSizeInBytes : 0;
+        if (!as->tlas) return -1;
+    }
+    if (!as->tlas_scratch || scratch > as->scratch_size) {
+        if (as->tlas_scratch) ID3D12Resource_Release(as->tlas_scratch);
+        as->tlas_scratch = d3d12_as_buffer(scratch, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        as->scratch_size = as->tlas_scratch ? scratch : 0;
+        if (!as->tlas_scratch) return -1;
+    }
+    if (refit) in.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd;
+    memset(&bd, 0, sizeof(bd));
+    bd.Inputs = in;
+    bd.DestAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(as->tlas);
+    if (refit) bd.SourceAccelerationStructureData = bd.DestAccelerationStructureData;
+    bd.ScratchAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(as->tlas_scratch);
+    ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(list4, &bd, 0, NULL);
+    as->instance_count = count;
+    return 0;
 }
 
 static void *d3d12_create_acceleration_structure(const vio_as_desc *desc)
@@ -2283,48 +2364,7 @@ static void *d3d12_create_acceleration_structure(const vio_as_desc *desc)
         uav.UAV.pResource = NULL;   /* all UAV accesses */
         ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &uav);
     }
-    {
-        D3D12_RAYTRACING_INSTANCE_DESC *ids = calloc((size_t)desc->instance_count, sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
-        if (!ids) goto fail;
-        for (int i = 0; i < desc->instance_count; i++) {
-            const vio_as_instance *src = &desc->instances[i];
-            for (int r = 0; r < 3; r++)
-                for (int c = 0; c < 4; c++) ids[i].Transform[r][c] = src->transform[r * 4 + c];
-            ids[i].InstanceID = (UINT)i;
-            ids[i].InstanceMask = 0xFF;
-            ids[i].InstanceContributionToHitGroupIndex = 0;
-            ids[i].Flags = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
-            ids[i].AccelerationStructure = ID3D12Resource_GetGPUVirtualAddress(as->blas[src->geometry]);
-        }
-        ID3D12Resource *ibuf = d3d12_as_upload(ids, sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * (size_t)desc->instance_count);
-        free(ids);
-        if (!ibuf) goto fail;
-        tmp[tmp_count++] = ibuf;
-        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in;
-        memset(&in, 0, sizeof(in));
-        in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
-        in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-        in.NumDescs = (UINT)desc->instance_count;
-        in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-        in.InstanceDescs = ID3D12Resource_GetGPUVirtualAddress(ibuf);
-        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pre;
-        memset(&pre, 0, sizeof(pre));
-        ID3D12Device5_GetRaytracingAccelerationStructurePrebuildInfo(dev5, &in, &pre);
-        as->tlas = d3d12_as_buffer(pre.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
-                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                   D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
-        ID3D12Resource *scratch = d3d12_as_buffer(pre.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
-                                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (!as->tlas || !scratch) { if (scratch) ID3D12Resource_Release(scratch); goto fail; }
-        tmp[tmp_count++] = scratch;
-        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd;
-        memset(&bd, 0, sizeof(bd));
-        bd.Inputs = in;
-        bd.DestAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(as->tlas);
-        bd.ScratchAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(scratch);
-        ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(list4, &bd, 0, NULL);
-    }
+    if (d3d12_as_record_tlas(dev5, list4, as, desc->instances, desc->instance_count, 0) != 0) goto fail;
     if (FAILED(ID3D12GraphicsCommandList_Close(list))) goto fail;
     {
         ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
@@ -2348,6 +2388,40 @@ fail:
     d3d12_as_free(as);
     ID3D12Device5_Release(dev5);
     return NULL;
+}
+
+static int d3d12_update_acceleration_structure(void *ptr, const vio_as_instance *inst, int count, int refit)
+{
+    vio_d3d12_as *as = (vio_d3d12_as *)ptr;
+    if (!as || !inst || count < 1 || !vio_d3d12.device || vio_d3d12.in_frame) return -1;
+    if (refit && count != as->instance_count) return -1;
+    ID3D12Device5 *dev5 = NULL;
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    ID3D12GraphicsCommandList4 *list4 = NULL;
+    int rc = -1;
+    if (FAILED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device5, (void **)&dev5)) || !dev5) return -1;
+    /* Frames in flight may still read the structure and its instance buffer. */
+    vio_d3d12_wait_for_gpu();
+    if (FAILED(ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   &IID_ID3D12CommandAllocator, (void **)&alloc))) goto done;
+    if (FAILED(ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                              &IID_ID3D12GraphicsCommandList, (void **)&list))) goto done;
+    if (FAILED(ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList4, (void **)&list4))) goto done;
+    if (d3d12_as_record_tlas(dev5, list4, as, inst, count, refit) != 0) goto done;
+    if (FAILED(ID3D12GraphicsCommandList_Close(list))) goto done;
+    {
+        ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        vio_d3d12_wait_for_gpu();
+    }
+    rc = 0;
+done:
+    if (list4) ID3D12GraphicsCommandList4_Release(list4);
+    if (list) ID3D12GraphicsCommandList_Release(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    ID3D12Device5_Release(dev5);
+    return rc;
 }
 
 static void d3d12_destroy_acceleration_structure(void *ptr)
@@ -9193,6 +9267,7 @@ static const vio_backend d3d12_backend = {
     .describe                = d3d12_describe,
     .enumerate_adapters      = d3d12_enumerate_adapters,
     .create_acceleration_structure  = d3d12_create_acceleration_structure,
+    .update_acceleration_structure  = d3d12_update_acceleration_structure,
     .destroy_acceleration_structure = d3d12_destroy_acceleration_structure,
     .bind_acceleration_structure    = d3d12_bind_acceleration_structure,
     .sampler_feedback_bind          = d3d12_sampler_feedback_bind,

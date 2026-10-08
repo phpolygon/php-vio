@@ -2216,6 +2216,12 @@ typedef struct _vio_vk_as {
     VkAccelerationStructureKHR *blas;
     vio_vk_as_buf              *blas_buf;
     int                         blas_count;
+    /* Kept for vio_acceleration_structure_update (A14): the top level is built
+     * with ALLOW_UPDATE, its scratch and instance buffer stay. */
+    VkDeviceSize                tlas_size, scratch_size;
+    vio_vk_as_buf               tlas_scratch;
+    vio_vk_as_buf               instances;      /* host visible, instance_cap records */
+    int                         instance_cap, instance_count;
     int                         dead;
     struct _vio_vk_as          *next, *prev;
 } vio_vk_as;
@@ -2300,6 +2306,8 @@ static void vk_as_release_gpu(vio_vk_as *as)
     PFN_vkDestroyAccelerationStructureKHR destroy = (PFN_vkDestroyAccelerationStructureKHR)vio_vk.fn_destroy_as;
     if (as->tlas && destroy) destroy(vio_vk.device, as->tlas, NULL);
     vk_as_buffer_free(&as->tlas_buf);
+    vk_as_buffer_free(&as->tlas_scratch);
+    vk_as_buffer_free(&as->instances);
     for (int i = 0; i < as->blas_count; i++) {
         if (as->blas[i] && destroy) destroy(vio_vk.device, as->blas[i], NULL);
         vk_as_buffer_free(&as->blas_buf[i]);
@@ -2312,6 +2320,90 @@ static void vk_as_unlink(vio_vk_as *as)
     if (as->prev) as->prev->next = as->next; else if (vk_live_as == as) vk_live_as = as->next;
     if (as->next) as->next->prev = as->prev;
     as->next = as->prev = NULL;
+}
+
+/* Record the top-level build over `count` instances (A14). Built with
+ * ALLOW_UPDATE: refit = 1 (same count and geometries) updates it in place, a
+ * rebuild reuses the structure / scratch while they are big enough. The GPU must
+ * not be using it (create, or after a drain). */
+static int vk_as_record_tlas(VkCommandBuffer cmd, vio_vk_as *as, const vio_as_instance *inst, int count, int refit)
+{
+    PFN_vkGetAccelerationStructureBuildSizesKHR sizes_fn = (PFN_vkGetAccelerationStructureBuildSizesKHR)vio_vk.fn_get_as_build_sizes;
+    PFN_vkCmdBuildAccelerationStructuresKHR build_fn = (PFN_vkCmdBuildAccelerationStructuresKHR)vio_vk.fn_cmd_build_as;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR addr_fn = (PFN_vkGetAccelerationStructureDeviceAddressKHR)vio_vk.fn_get_as_address;
+    PFN_vkDestroyAccelerationStructureKHR destroy = (PFN_vkDestroyAccelerationStructureKHR)vio_vk.fn_destroy_as;
+    const VkBufferUsageFlags input = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    if (count > as->instance_cap) {
+        vk_as_buffer_free(&as->instances);
+        as->instance_cap = 0;
+        if (vk_as_buffer(sizeof(VkAccelerationStructureInstanceKHR) * (VkDeviceSize)count, input, 1, &as->instances) != 0) return -1;
+        as->instance_cap = count;
+    }
+    VkAccelerationStructureInstanceKHR *ins = NULL;
+    if (vkMapMemory(vio_vk.device, as->instances.mem, 0, VK_WHOLE_SIZE, 0, (void **)&ins) != VK_SUCCESS || !ins) return -1;
+    for (int i = 0; i < count; i++) {
+        const vio_as_instance *src = &inst[i];
+        if (src->geometry < 0 || src->geometry >= as->blas_count) { vkUnmapMemory(vio_vk.device, as->instances.mem); return -1; }
+        memset(&ins[i], 0, sizeof(ins[i]));
+        memcpy(ins[i].transform.matrix, src->transform, sizeof(float) * 12);   /* row-major 3x4 */
+        ins[i].instanceCustomIndex = (uint32_t)i;
+        ins[i].mask = 0xFF;
+        ins[i].instanceShaderBindingTableRecordOffset = 0;
+        ins[i].flags = VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+        VkAccelerationStructureDeviceAddressInfoKHR ai = {0};
+        ai.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+        ai.accelerationStructure = as->blas[src->geometry];
+        ins[i].accelerationStructureReference = addr_fn(vio_vk.device, &ai);
+    }
+    vkUnmapMemory(vio_vk.device, as->instances.mem);
+
+    VkAccelerationStructureGeometryKHR gm = {0};
+    gm.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    gm.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    gm.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    gm.geometry.instances.arrayOfPointers = VK_FALSE;
+    gm.geometry.instances.data.deviceAddress = vk_buffer_address(as->instances.buf);
+    VkAccelerationStructureBuildGeometryInfoKHR bg = {0};
+    bg.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    bg.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    bg.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+    bg.mode = refit ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    bg.geometryCount = 1;
+    bg.pGeometries = &gm;
+    uint32_t n = (uint32_t)count;
+    VkAccelerationStructureBuildSizesInfoKHR sz = {0};
+    sz.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    sizes_fn(vio_vk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bg, &n, &sz);
+    VkDeviceSize scratch = refit ? sz.updateScratchSize : sz.buildScratchSize;
+    if (refit && !as->tlas) return -1;
+    if (!refit && (!as->tlas || sz.accelerationStructureSize > as->tlas_size)) {
+        VkAccelerationStructureKHR old = as->tlas;
+        if (old && destroy) destroy(vio_vk.device, old, NULL);
+        vk_as_buffer_free(&as->tlas_buf);
+        as->tlas = VK_NULL_HANDLE;
+        as->tlas_size = 0;
+        if (vk_as_create(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sz.accelerationStructureSize, &as->tlas, &as->tlas_buf) != 0) {
+            if (old && vio_vk.bound_accel == (uint64_t)old) vio_vk.bound_accel = 0;
+            return -1;
+        }
+        as->tlas_size = sz.accelerationStructureSize;
+        /* A bound structure keeps its binding across the new handle. */
+        if (old && vio_vk.bound_accel == (uint64_t)old) vio_vk.bound_accel = (uint64_t)as->tlas;
+    }
+    if (!as->tlas_scratch.buf || scratch > as->scratch_size) {
+        vk_as_buffer_free(&as->tlas_scratch);
+        as->scratch_size = 0;
+        if (vk_as_buffer(scratch, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 0, &as->tlas_scratch) != 0) return -1;
+        as->scratch_size = scratch;
+    }
+    bg.dstAccelerationStructure = as->tlas;
+    if (refit) bg.srcAccelerationStructure = as->tlas;
+    bg.scratchData.deviceAddress = vk_buffer_address(as->tlas_scratch.buf);
+    VkAccelerationStructureBuildRangeInfoKHR range = { n, 0, 0, 0 };
+    const VkAccelerationStructureBuildRangeInfoKHR *ranges[1] = { &range };
+    build_fn(cmd, 1, &bg, ranges);
+    as->instance_count = count;
+    return 0;
 }
 
 static void *vulkan_create_acceleration_structure(const vio_as_desc *desc)
@@ -2386,52 +2478,7 @@ static void *vulkan_create_acceleration_structure(const vio_as_desc *desc)
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                              VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &mb, 0, NULL, 0, NULL);
     }
-    {
-        VkAccelerationStructureInstanceKHR *ins = calloc((size_t)desc->instance_count, sizeof(VkAccelerationStructureInstanceKHR));
-        if (!ins) goto fail_cmd;
-        for (int i = 0; i < desc->instance_count; i++) {
-            const vio_as_instance *src = &desc->instances[i];
-            memcpy(ins[i].transform.matrix, src->transform, sizeof(float) * 12);   /* row-major 3x4 */
-            ins[i].instanceCustomIndex = (uint32_t)i;
-            ins[i].mask = 0xFF;
-            ins[i].instanceShaderBindingTableRecordOffset = 0;
-            ins[i].flags = VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
-            VkAccelerationStructureDeviceAddressInfoKHR ai = {0};
-            ai.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-            ai.accelerationStructure = as->blas[src->geometry];
-            ins[i].accelerationStructureReference = addr_fn(vio_vk.device, &ai);
-        }
-        vio_vk_as_buf *ibuf = &temps[temps_n++];
-        int ok = vk_as_upload(ins, sizeof(VkAccelerationStructureInstanceKHR) * (size_t)desc->instance_count, input, ibuf) == 0;
-        free(ins);
-        if (!ok) goto fail_cmd;
-        VkAccelerationStructureGeometryKHR gm = {0};
-        gm.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-        gm.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-        gm.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-        gm.geometry.instances.arrayOfPointers = VK_FALSE;
-        gm.geometry.instances.data.deviceAddress = vk_buffer_address(ibuf->buf);
-        VkAccelerationStructureBuildGeometryInfoKHR bg = {0};
-        bg.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
-        bg.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-        bg.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-        bg.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-        bg.geometryCount = 1;
-        bg.pGeometries = &gm;
-        uint32_t count = (uint32_t)desc->instance_count;
-        VkAccelerationStructureBuildSizesInfoKHR sz = {0};
-        sz.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-        sizes_fn(vio_vk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bg, &count, &sz);
-        if (vk_as_create(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sz.accelerationStructureSize,
-                         &as->tlas, &as->tlas_buf) != 0) goto fail_cmd;
-        vio_vk_as_buf *scratch = &temps[temps_n++];
-        if (vk_as_buffer(sz.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 0, scratch) != 0) goto fail_cmd;
-        bg.dstAccelerationStructure = as->tlas;
-        bg.scratchData.deviceAddress = vk_buffer_address(scratch->buf);
-        VkAccelerationStructureBuildRangeInfoKHR range = { count, 0, 0, 0 };
-        const VkAccelerationStructureBuildRangeInfoKHR *ranges[1] = { &range };
-        build_fn(cmd, 1, &bg, ranges);
-    }
+    if (vk_as_record_tlas(cmd, as, desc->instances, desc->instance_count, 0) != 0) goto fail_cmd;
     /* Shaders of later submissions read the structure. */
     {
         VkMemoryBarrier mb = {0};
@@ -2464,6 +2511,30 @@ fail:
         free(as);
     }
     return NULL;
+}
+
+static int vulkan_update_acceleration_structure(void *ptr, const vio_as_instance *inst, int count, int refit)
+{
+    vio_vk_as *as = (vio_vk_as *)ptr;
+    if (!as || as->dead || !inst || count < 1 || !vio_vk.device || vio_vk.in_frame) return -1;
+    if (refit && count != as->instance_count) return -1;
+    /* Frames in flight may still read the structure and its instance buffer. */
+    vkDeviceWaitIdle(vio_vk.device);
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vulkan_begin_transient_commands(&pool, &cmd) != 0) return -1;
+    if (vk_as_record_tlas(cmd, as, inst, count, refit) != 0) {
+        vkEndCommandBuffer(cmd);
+        vkFreeCommandBuffers(vio_vk.device, vio_vk.transient_pool, 1, &cmd);
+        return -1;
+    }
+    VkMemoryBarrier mb = {0};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    return vulkan_submit_transient_commands(pool, cmd) == 0 ? 0 : -1;
 }
 
 static void vulkan_destroy_acceleration_structure(void *ptr)
@@ -5012,6 +5083,7 @@ static const vio_backend vulkan_backend = {
     .create_render_target  = vulkan_create_render_target,
     .destroy_render_target = vulkan_destroy_render_target,
     .create_acceleration_structure  = vulkan_create_acceleration_structure,
+    .update_acceleration_structure  = vulkan_update_acceleration_structure,
     .destroy_acceleration_structure = vulkan_destroy_acceleration_structure,
     .bind_acceleration_structure    = vulkan_bind_acceleration_structure,
     .create_rt_pipeline             = vulkan_create_rt_pipeline,

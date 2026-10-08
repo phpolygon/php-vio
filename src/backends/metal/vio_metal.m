@@ -3700,6 +3700,7 @@ typedef struct _vio_metal_as {
     void **blas;          /* id<MTLAccelerationStructure>[blas_count], +1 each */
     int    blas_count;
     void  *instances;     /* id<MTLBuffer> of instance descriptors, +1 */
+    int    instance_count;
 } vio_metal_as;
 
 static vio_metal_as *metal_bound_as = NULL;
@@ -3716,6 +3717,45 @@ static void metal_use_as(id<MTLRenderCommandEncoder> renc, id<MTLComputeCommandE
         }
         if (cenc) [cenc useResource:r usage:MTLResourceUsageRead];
     }
+}
+
+/* Instance descriptors: the row-major 3x4 transform as four packed columns. */
+static id<MTLBuffer> metal_as_instance_buffer(id<MTLDevice> dev, const vio_as_instance *inst, int count, int blas_count)
+{
+    id<MTLBuffer> ibuf = [dev newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor) * (NSUInteger)count
+                                          options:MTLResourceStorageModeShared];
+    if (!ibuf) return nil;
+    MTLAccelerationStructureInstanceDescriptor *ids = (MTLAccelerationStructureInstanceDescriptor *)[ibuf contents];
+    for (int i = 0; i < count; i++) {
+        const vio_as_instance *in = &inst[i];
+        if (in->geometry < 0 || in->geometry >= blas_count) return nil;
+        memset(&ids[i], 0, sizeof(ids[i]));
+        for (int c = 0; c < 4; c++) {
+            ids[i].transformationMatrix.columns[c].x = in->transform[0 * 4 + c];
+            ids[i].transformationMatrix.columns[c].y = in->transform[1 * 4 + c];
+            ids[i].transformationMatrix.columns[c].z = in->transform[2 * 4 + c];
+        }
+        ids[i].options = MTLAccelerationStructureInstanceOptionOpaque;
+        ids[i].mask = 0xFF;
+        ids[i].intersectionFunctionTableOffset = 0;
+        ids[i].accelerationStructureIndex = (uint32_t)in->geometry;
+    }
+    return ibuf;
+}
+
+/* The instance-structure descriptor over the kept primitive structures; refit
+ * usage so vio_acceleration_structure_update can update it in place (A14). */
+static MTLInstanceAccelerationStructureDescriptor *metal_as_instance_desc(vio_metal_as *as, id<MTLBuffer> ibuf, int count)
+    API_AVAILABLE(macos(11.0), ios(14.0))
+{
+    NSMutableArray *blases = [NSMutableArray arrayWithCapacity:(NSUInteger)as->blas_count];
+    for (int i = 0; i < as->blas_count; i++) [blases addObject:(__bridge id<MTLAccelerationStructure>)as->blas[i]];
+    MTLInstanceAccelerationStructureDescriptor *idesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
+    idesc.instancedAccelerationStructures = blases;
+    idesc.instanceCount = (NSUInteger)count;
+    idesc.instanceDescriptorBuffer = ibuf;
+    idesc.usage = MTLAccelerationStructureUsageRefit;
+    return idesc;
 }
 
 static void *metal_create_acceleration_structure(const vio_as_desc *desc)
@@ -3766,27 +3806,10 @@ static void *metal_create_acceleration_structure(const vio_as_desc *desc)
             }
             [enc endEncoding];
 
-            /* Instance descriptors: the row-major 3x4 transform as four packed columns. */
-            id<MTLBuffer> ibuf = [dev newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor) * (NSUInteger)desc->instance_count
-                                                  options:MTLResourceStorageModeShared];
-            MTLAccelerationStructureInstanceDescriptor *ids = (MTLAccelerationStructureInstanceDescriptor *)[ibuf contents];
-            for (int i = 0; i < desc->instance_count; i++) {
-                const vio_as_instance *in = &desc->instances[i];
-                memset(&ids[i], 0, sizeof(ids[i]));
-                for (int c = 0; c < 4; c++) {
-                    ids[i].transformationMatrix.columns[c].x = in->transform[0 * 4 + c];
-                    ids[i].transformationMatrix.columns[c].y = in->transform[1 * 4 + c];
-                    ids[i].transformationMatrix.columns[c].z = in->transform[2 * 4 + c];
-                }
-                ids[i].options = MTLAccelerationStructureInstanceOptionOpaque;
-                ids[i].mask = 0xFF;
-                ids[i].intersectionFunctionTableOffset = 0;
-                ids[i].accelerationStructureIndex = (uint32_t)in->geometry;
-            }
-            MTLInstanceAccelerationStructureDescriptor *idesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
-            idesc.instancedAccelerationStructures = blases;
-            idesc.instanceCount = (NSUInteger)desc->instance_count;
-            idesc.instanceDescriptorBuffer = ibuf;
+            id<MTLBuffer> ibuf = metal_as_instance_buffer(dev, desc->instances, desc->instance_count, as->blas_count);
+            if (!ibuf) goto fail;
+            MTLInstanceAccelerationStructureDescriptor *idesc = metal_as_instance_desc(as, ibuf, desc->instance_count);
+            (void)blases;
             MTLAccelerationStructureSizes isz = [dev accelerationStructureSizesWithDescriptor:idesc];
             id<MTLAccelerationStructure> tlas = [dev newAccelerationStructureWithSize:isz.accelerationStructureSize];
             id<MTLBuffer> iscratch = [dev newBufferWithLength:isz.buildScratchBufferSize > 0 ? isz.buildScratchBufferSize : 16
@@ -3801,6 +3824,7 @@ static void *metal_create_acceleration_structure(const vio_as_desc *desc)
             if (cb.status != MTLCommandBufferStatusCompleted) goto fail;
             as->tlas = (void *)CFBridgingRetain(tlas);
             as->instances = (void *)CFBridgingRetain(ibuf);
+            as->instance_count = desc->instance_count;
             (void)keep;
             return as;
         }
@@ -3811,6 +3835,52 @@ fail:
         return NULL;
     }
     return NULL;
+}
+
+static int metal_update_acceleration_structure(void *ptr, const vio_as_instance *inst, int count, int refit)
+{
+    vio_metal_as *as = (vio_metal_as *)ptr;
+    if (!as || !inst || count < 1 || !vio_mtl.device || !as->tlas) return -1;
+    if (refit && count != as->instance_count) return -1;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        @autoreleasepool {
+            id<MTLDevice> dev = vio_mtl.device;
+            id<MTLBuffer> ibuf = metal_as_instance_buffer(dev, inst, count, as->blas_count);
+            if (!ibuf) return -1;
+            MTLInstanceAccelerationStructureDescriptor *idesc = metal_as_instance_desc(as, ibuf, count);
+            MTLAccelerationStructureSizes sz = [dev accelerationStructureSizesWithDescriptor:idesc];
+            id<MTLCommandBuffer> cb = [vio_mtl.command_queue commandBuffer];
+            id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
+            id<MTLAccelerationStructure> fresh = nil;
+            if (refit) {
+                /* In place (destination nil); the queue orders it after frames that read it. */
+                id<MTLBuffer> s = [dev newBufferWithLength:sz.refitScratchBufferSize > 0 ? sz.refitScratchBufferSize : 16
+                                                   options:MTLResourceStorageModePrivate];
+                if (!s) { [enc endEncoding]; return -1; }
+                [enc refitAccelerationStructure:(__bridge id<MTLAccelerationStructure>)as->tlas descriptor:idesc
+                                    destination:nil scratchBuffer:s scratchBufferOffset:0];
+            } else {
+                fresh = [dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
+                id<MTLBuffer> s = [dev newBufferWithLength:sz.buildScratchBufferSize > 0 ? sz.buildScratchBufferSize : 16
+                                                   options:MTLResourceStorageModePrivate];
+                if (!fresh || !s) { [enc endEncoding]; return -1; }
+                [enc buildAccelerationStructure:fresh descriptor:idesc scratchBuffer:s scratchBufferOffset:0];
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) return -1;
+            if (fresh) {
+                CFRelease(as->tlas);   /* command buffers that used it retain it */
+                as->tlas = (void *)CFBridgingRetain(fresh);
+            }
+            if (as->instances) CFRelease(as->instances);
+            as->instances = (void *)CFBridgingRetain(ibuf);
+            as->instance_count = count;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 static void metal_destroy_acceleration_structure(void *ptr)
@@ -6659,6 +6729,7 @@ static const vio_backend metal_backend = {
     .describe          = metal_describe,
     .enumerate_adapters = metal_enumerate_adapters,
     .create_acceleration_structure  = metal_create_acceleration_structure,
+    .update_acceleration_structure  = metal_update_acceleration_structure,
     .destroy_acceleration_structure = metal_destroy_acceleration_structure,
     .bind_acceleration_structure    = metal_bind_acceleration_structure,
     .bindless_set      = metal_bindless_set,

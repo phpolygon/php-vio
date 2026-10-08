@@ -2773,7 +2773,7 @@ ZEND_FUNCTION(vio_mesh)
     /* Ray tracing: keep the positions (the first three floats of a vertex,
      * location 0) and the indices for vio_acceleration_structure(). */
     if (floats_per_vertex >= 3 && vertex_count > 0 && ctx->backend->supports_feature
-        && ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY)) {
+        && (ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY) || ctx->backend->supports_feature(VIO_FEATURE_RAYTRACING))) {
         mesh->rt_positions = emalloc(sizeof(float) * 3 * (size_t)vertex_count);
         for (int v = 0; v < vertex_count; v++) memcpy(&mesh->rt_positions[v * 3], &data[v * floats_per_vertex], sizeof(float) * 3);
         if (indices && index_count > 0) {
@@ -9283,6 +9283,11 @@ ZEND_FUNCTION(vio_adapters)
  * one bottom-level structure per distinct mesh (its CPU positions / indices),
  * one top-level structure over the instances; transform is column-major 4x4
  * (the last row is ignored), identity when absent. */
+static int vio_as_parse(const char *fn, HashTable *list, vio_as_instance **inst_out, vio_as_geometry **geo_out,
+                        vio_mesh_object ***mesh_out, int *geo_count_out);
+static void vio_as_keep(vio_acceleration_structure_object *as, const vio_as_instance *inst, int n,
+                        vio_mesh_object **geo_mesh, int geo_count);
+
 ZEND_FUNCTION(vio_acceleration_structure)
 {
     zval *ctx_zval;
@@ -9310,6 +9315,42 @@ ZEND_FUNCTION(vio_acceleration_structure)
         zend_argument_value_error(2, "must contain at least one instance");
         RETURN_THROWS();
     }
+    vio_as_instance *inst;
+    vio_as_geometry *geo;
+    vio_mesh_object **geo_mesh;
+    int geo_count = 0;
+    int pr = vio_as_parse("vio_acceleration_structure", list, &inst, &geo, &geo_mesh, &geo_count);
+    if (pr == 0) RETURN_THROWS();
+    if (pr < 0) RETURN_FALSE;
+
+    vio_as_desc desc;
+    desc.geometries = geo;
+    desc.geometry_count = geo_count;
+    desc.instances = inst;
+    desc.instance_count = n;
+    void *handle = ctx->backend->create_acceleration_structure(&desc);
+    if (!handle) {
+        efree(inst); efree(geo); efree(geo_mesh);
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: the backend could not build it");
+        RETURN_FALSE;
+    }
+    object_init_ex(return_value, vio_acceleration_structure_ce);
+    vio_acceleration_structure_object *as = Z_VIO_ACCELERATION_STRUCTURE_P(return_value);
+    as->backend_as = handle;
+    as->backend = ctx->backend;
+    as->valid = 1;
+    vio_as_keep(as, inst, n, geo_mesh, geo_count);
+    efree(inst); efree(geo); efree(geo_mesh);
+}
+
+/* Parse an instance list (vio_acceleration_structure / _update): the
+ * instances, the distinct meshes (one geometry each) and their CPU triangles.
+ * 1 = parsed (the caller efree()s the three arrays), 0 = an exception was
+ * thrown, -1 = a warning was raised (return false). */
+static int vio_as_parse(const char *fn, HashTable *list, vio_as_instance **inst_out, vio_as_geometry **geo_out,
+                        vio_mesh_object ***mesh_out, int *geo_count_out)
+{
+    int n = (int)zend_hash_num_elements(list);
     vio_as_instance *inst = ecalloc((size_t)n, sizeof(vio_as_instance));
     vio_as_geometry *geo = ecalloc((size_t)n, sizeof(vio_as_geometry));
     vio_mesh_object **geo_mesh = ecalloc((size_t)n, sizeof(vio_mesh_object *));
@@ -9319,15 +9360,15 @@ ZEND_FUNCTION(vio_acceleration_structure)
         zval *mz = Z_TYPE_P(entry) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(entry), "mesh", sizeof("mesh") - 1) : NULL;
         if (!mz || Z_TYPE_P(mz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(mz), vio_mesh_ce)) {
             efree(inst); efree(geo); efree(geo_mesh);
-            zend_argument_value_error(2, "instance %d needs 'mesh' => VioMesh", idx);
-            RETURN_THROWS();
+            zend_argument_value_error(strlen(fn) > 26 ? 3 : 2, "instance %d needs 'mesh' => VioMesh", idx);
+            return 0;
         }
         vio_mesh_object *mesh = Z_VIO_MESH_P(mz);
         if (!mesh->rt_positions || mesh->vertex_count < 3) {
             efree(inst); efree(geo); efree(geo_mesh);
-            php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: instance %d: the mesh has no triangle positions "
-                             "(create it on this context, location 0 at least float3)", idx);
-            RETURN_FALSE;
+            php_error_docref(NULL, E_WARNING, "%s: instance %d: the mesh has no triangle positions "
+                             "(create it on this context, location 0 at least float3)", fn, idx);
+            return -1;
         }
         int g = -1;
         for (int k = 0; k < geo_count; k++) if (geo_mesh[k] == mesh) { g = k; break; }
@@ -9345,8 +9386,8 @@ ZEND_FUNCTION(vio_acceleration_structure)
         if (tz) {
             if (Z_TYPE_P(tz) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(tz)) != 16) {
                 efree(inst); efree(geo); efree(geo_mesh);
-                zend_argument_value_error(2, "instance %d: 'transform' must be 16 floats (column-major 4x4)", idx);
-                RETURN_THROWS();
+                zend_argument_value_error(strlen(fn) > 26 ? 3 : 2, "instance %d: 'transform' must be 16 floats (column-major 4x4)", idx);
+                return 0;
             }
             int c = 0;
             zval *f;
@@ -9357,24 +9398,108 @@ ZEND_FUNCTION(vio_acceleration_structure)
             for (int col = 0; col < 4; col++) inst[idx].transform[r * 4 + col] = m[col * 4 + r];
         idx++;
     } ZEND_HASH_FOREACH_END();
+    *inst_out = inst;
+    *geo_out = geo;
+    *mesh_out = geo_mesh;
+    *geo_count_out = geo_count;
+    return 1;
+}
 
-    vio_as_desc desc;
-    desc.geometries = geo;
-    desc.geometry_count = geo_count;
-    desc.instances = inst;
-    desc.instance_count = n;
-    void *handle = ctx->backend->create_acceleration_structure(&desc);
-    efree(inst); efree(geo); efree(geo_mesh);
-    if (!handle) {
-        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure: the backend could not build it");
+/* Hold the meshes of a structure's bottom levels and its instance geometries. */
+static void vio_as_keep(vio_acceleration_structure_object *as, const vio_as_instance *inst, int n,
+                        vio_mesh_object **geo_mesh, int geo_count)
+{
+    zend_object **objs = ecalloc((size_t)(geo_count > 0 ? geo_count : 1), sizeof(zend_object *));
+    int *ig = ecalloc((size_t)n, sizeof(int));
+    for (int g = 0; g < geo_count; g++) objs[g] = &geo_mesh[g]->std;
+    for (int i = 0; i < n; i++) ig[i] = inst[i].geometry;
+    vio_acceleration_structure_keep(as, objs, geo_count, ig, n);
+    efree(objs);
+    efree(ig);
+}
+
+/* vio_acceleration_structure_update($ctx, $as, $instances) (OPEN-ITEMS-PLAN A14):
+ * the same instance format. Every mesh already in $as and the same mesh per
+ * instance -> 'refit' (transforms only, the top level updated in place); every
+ * mesh known but a different list -> 'rebuild' (a new top level over the
+ * existing bottom levels); a new mesh -> 'full' (everything built again).
+ * Outside vio_begin / vio_end; synchronous like the first build. */
+ZEND_FUNCTION(vio_acceleration_structure_update)
+{
+    zval *ctx_zval, *as_zval;
+    HashTable *list;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(as_zval, vio_acceleration_structure_ce)
+        Z_PARAM_ARRAY_HT(list)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_acceleration_structure_object *as = Z_VIO_ACCELERATION_STRUCTURE_P(as_zval);
+    if (!ctx->initialized || !ctx->backend || !as->valid || as->backend != ctx->backend
+        || !ctx->backend->create_acceleration_structure) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure_update: not built on this context's backend");
         RETURN_FALSE;
     }
-    object_init_ex(return_value, vio_acceleration_structure_ce);
-    vio_acceleration_structure_object *as = Z_VIO_ACCELERATION_STRUCTURE_P(return_value);
-    as->backend_as = handle;
-    as->backend = ctx->backend;
-    as->instance_count = n;
-    as->valid = 1;
+    if (ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure_update: call it outside vio_begin / vio_end");
+        RETURN_FALSE;
+    }
+    int n = (int)zend_hash_num_elements(list);
+    if (n < 1) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure_update: at least one instance is needed");
+        RETURN_FALSE;
+    }
+    vio_as_instance *inst;
+    vio_as_geometry *geo;
+    vio_mesh_object **geo_mesh;
+    int geo_count = 0;
+    int pr = vio_as_parse("vio_acceleration_structure_update", list, &inst, &geo, &geo_mesh, &geo_count);
+    if (pr == 0) RETURN_THROWS();
+    if (pr < 0) RETURN_FALSE;
+
+    /* The parsed geometries onto the structure's bottom levels. */
+    int known = 1;
+    int *map = ecalloc((size_t)geo_count, sizeof(int));
+    for (int g = 0; g < geo_count; g++) {
+        map[g] = -1;
+        for (int k = 0; k < as->mesh_count; k++) if (as->meshes[k] == &geo_mesh[g]->std) { map[g] = k; break; }
+        if (map[g] < 0) known = 0;
+    }
+    const char *kind = NULL;
+    if (known && ctx->backend->update_acceleration_structure) {
+        int refit = n == as->instance_count;
+        for (int i = 0; i < n; i++) {
+            inst[i].geometry = map[inst[i].geometry];
+            if (refit && inst[i].geometry != as->inst_geo[i]) refit = 0;
+        }
+        if (ctx->backend->update_acceleration_structure(as->backend_as, inst, n, refit) == 0) {
+            int *ig = ecalloc((size_t)n, sizeof(int));
+            for (int i = 0; i < n; i++) ig[i] = inst[i].geometry;
+            vio_acceleration_structure_keep(as, as->meshes, as->mesh_count, ig, n);
+            efree(ig);
+            kind = refit ? "refit" : "rebuild";
+        }
+    } else {
+        vio_as_desc desc;
+        desc.geometries = geo;
+        desc.geometry_count = geo_count;
+        desc.instances = inst;
+        desc.instance_count = n;
+        void *handle = ctx->backend->create_acceleration_structure(&desc);
+        if (handle) {
+            const vio_backend *be = (const vio_backend *)as->backend;
+            if (as->backend_as && be->destroy_acceleration_structure) be->destroy_acceleration_structure(as->backend_as);
+            as->backend_as = handle;
+            vio_as_keep(as, inst, n, geo_mesh, geo_count);
+            kind = "full";
+        }
+    }
+    efree(map); efree(inst); efree(geo); efree(geo_mesh);
+    if (!kind) {
+        php_error_docref(NULL, E_WARNING, "vio_acceleration_structure_update: the backend could not update it");
+        RETURN_FALSE;
+    }
+    RETURN_STRING(kind);
 }
 
 /* vio_bind_acceleration_structure($ctx, $as, $binding): the following draws and
