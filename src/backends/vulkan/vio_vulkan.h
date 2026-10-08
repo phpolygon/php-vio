@@ -428,7 +428,7 @@ typedef struct _vio_vulkan_state {
     int                      debug_enabled;
 
     /* Window reference (for surface creation and resize) */
-    void                    *glfw_window;
+    void                    *platform_window;
     int                      framebuffer_width;
     int                      framebuffer_height;
 } vio_vulkan_state;
@@ -439,7 +439,7 @@ extern vio_vulkan_state vio_vk;
 void vio_backend_vulkan_register(void);
 
 /* Called after GLFW window creation to set up Vulkan */
-int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg);
+int vio_vulkan_setup_context(void *platform_window, vio_config *cfg);
 
 /* Swapchain recreation (on resize) */
 int vio_vulkan_recreate_swapchain(void);

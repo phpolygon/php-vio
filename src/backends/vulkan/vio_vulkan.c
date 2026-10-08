@@ -12,11 +12,7 @@
 
 #include <vulkan/vulkan.h>
 
-#ifdef HAVE_GLFW
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-#endif
-
+#include "../../../include/vio_platform.h"
 #include "vio_vulkan.h"
 #include "../../vio_cubemap.h"   /* bindless cube slots */
 #include "../../vio_shader_cache.h"
@@ -113,12 +109,10 @@ static int create_instance(int debug)
     vio_vk.instance_api_11 = 1;
     app_info.apiVersion         = vio_vk.instance_api;
 
-    /* Required extensions from GLFW + portability */
+    /* Required extensions from the platform (surface) + portability */
     uint32_t glfw_ext_count = 0;
     const char **glfw_extensions = NULL;
-#ifdef HAVE_GLFW
-    glfw_extensions = glfwGetRequiredInstanceExtensions(&glfw_ext_count);
-#endif
+    if (vio_plat()->vk_instance_extensions) glfw_extensions = vio_plat()->vk_instance_extensions(&glfw_ext_count);
 
     /* Build extension list */
     uint32_t ext_count = glfw_ext_count;
@@ -1674,16 +1668,16 @@ static void destroy_frame_resources(void)
 
 int vio_vulkan_recreate_swapchain(void)
 {
-#ifdef HAVE_GLFW
-    int w = 0, h = 0;
-    glfwGetFramebufferSize((GLFWwindow *)vio_vk.glfw_window, &w, &h);
-    while (w == 0 || h == 0) {
-        glfwGetFramebufferSize((GLFWwindow *)vio_vk.glfw_window, &w, &h);
-        glfwWaitEvents();
+    if (vio_vk.platform_window) {
+        int w = 0, h = 0;
+        vio_plat()->get_framebuffer_size(vio_vk.platform_window, &w, &h);
+        while (w == 0 || h == 0) {   /* minimised: wait until there is something to present into */
+            vio_plat()->get_framebuffer_size(vio_vk.platform_window, &w, &h);
+            vio_plat()->wait_events();
+        }
+        vio_vk.framebuffer_width  = w;
+        vio_vk.framebuffer_height = h;
     }
-    vio_vk.framebuffer_width  = w;
-    vio_vk.framebuffer_height = h;
-#endif
 
     vkDeviceWaitIdle(vio_vk.device);
     cleanup_swapchain();
@@ -1692,10 +1686,10 @@ int vio_vulkan_recreate_swapchain(void)
 
 /* ── Full Vulkan setup ───────────────────────────────────────────── */
 
-int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
+int vio_vulkan_setup_context(void *platform_window, vio_config *cfg)
 {
     memset(&vio_vk, 0, sizeof(vio_vk));
-    vio_vk.glfw_window = glfw_window;
+    vio_vk.platform_window = platform_window;
     vio_vk.clear_r = 0.1f;
     vio_vk.clear_g = 0.1f;
     vio_vk.clear_b = 0.1f;
@@ -1708,15 +1702,14 @@ int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
     /* 1. Instance */
     if (create_instance(cfg->debug) != 0) return -1;
 
-    /* 2. Surface (via GLFW) */
-#ifdef HAVE_GLFW
-    if (glfwCreateWindowSurface(vio_vk.instance, (GLFWwindow *)glfw_window, NULL, &vio_vk.surface) != VK_SUCCESS) {
+    /* 2. Surface (from the platform window) */
+    if (!vio_plat()->vk_create_surface
+        || vio_plat()->vk_create_surface(platform_window, (void *)vio_vk.instance, (void *)&vio_vk.surface) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Failed to create Vulkan window surface");
         return -1;
     }
 
-    glfwGetFramebufferSize((GLFWwindow *)glfw_window, &vio_vk.framebuffer_width, &vio_vk.framebuffer_height);
-#endif
+    vio_plat()->get_framebuffer_size(platform_window, &vio_vk.framebuffer_width, &vio_vk.framebuffer_height);
 
     /* 3. Physical device */
     if (select_physical_device() != 0) return -1;

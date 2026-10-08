@@ -16,13 +16,7 @@
 #include <os/lock.h>
 #include <stdatomic.h>
 
-#ifdef HAVE_GLFW
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-#define GLFW_EXPOSE_NATIVE_COCOA
-#include <GLFW/glfw3native.h>
-#endif
-
+#include "../../../include/vio_platform.h"
 #include "vio_metal.h"
 
 static void metal_marks_reset(void);
@@ -121,13 +115,11 @@ typedef struct _vio_metal_state {
     dispatch_semaphore_t       frame_semaphore;
     int                        frame_latency;
     int                        frame_semaphore_held; /* begin_frame took a slot present has not handed on yet */
-#ifdef HAVE_GLFW
     /* When the backend was bootstrapped via vio_metal_setup_context() the
-     * GLFW window is polled each frame to discover resizes. Pure-native
+     * platform window is polled each frame to discover resizes. Pure-native
      * setups (iOS, headless) leave this NULL and call
      * vio_metal_handle_resize() externally instead. */
-    GLFWwindow                *glfw_window;
-#endif
+    void                      *platform_window;
 } vio_metal_state;
 
 static vio_metal_state vio_mtl = {0};
@@ -779,18 +771,17 @@ void vio_metal_handle_resize(int width, int height)
     metal_resize(width, height);
 }
 
-#ifdef HAVE_GLFW
-int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
+int vio_metal_setup_context(void *platform_window, vio_config *cfg)
 {
     @autoreleasepool {
-        GLFWwindow *win = (GLFWwindow *)glfw_window;
+        void *win = platform_window;
         if (!win) {
-            php_error_docref(NULL, E_WARNING, "Metal: setup_context called with NULL GLFW window");
+            php_error_docref(NULL, E_WARNING, "Metal: setup_context called without a window");
             return -1;
         }
 
-        /* Get NSWindow from GLFW */
-        NSWindow *ns_window = (NSWindow *)glfwGetCocoaWindow(win);
+        /* The platform window's NSWindow */
+        NSWindow *ns_window = (__bridge NSWindow *)vio_plat()->native_handle(win, VIO_NATIVE_NSWINDOW);
         if (!ns_window) {
             php_error_docref(NULL, E_WARNING, "Metal: failed to get Cocoa window");
             return -1;
@@ -822,9 +813,9 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
              * readback return only the top-left (logical-sized) quadrant. There
              * is no display to match offscreen, so size it 1:1 with the request
              * using the logical window size. */
-            glfwGetWindowSize(win, &fb_w, &fb_h);
+            vio_plat()->get_window_size(win, &fb_w, &fb_h);
         } else {
-            glfwGetFramebufferSize(win, &fb_w, &fb_h);
+            vio_plat()->get_framebuffer_size(win, &fb_w, &fb_h);
         }
 
         if (vio_metal_setup_context_native((__bridge void *)layer, fb_w, fb_h, cfg) != 0) {
@@ -838,14 +829,13 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
          * Headless renders to a fixed-size offscreen texture (sized 1:1 with the
          * logical request above). Polling the window each frame would read the
          * Retina framebuffer size and resize the offscreen back to 2x, so leave
-         * glfw_window NULL for headless — matching the "headless leaves this
+         * platform_window NULL for headless — matching the "headless leaves this
          * NULL" contract documented on the struct field. */
-        vio_mtl.glfw_window = cfg->headless ? NULL : win;
+        vio_mtl.platform_window = cfg->headless ? NULL : win;
     }
 
     return 0;
 }
-#endif /* HAVE_GLFW */
 
 void vio_metal_shutdown_context(void)
 {
@@ -1776,18 +1766,16 @@ static void metal_begin_frame(void)
     @autoreleasepool {
         if (!vio_mtl.initialized) return;
 
-#ifdef HAVE_GLFW
-        /* GLFW path: poll the window for resize each frame. Native callers
+        /* Platform window: poll it for resize each frame. Native callers
          * (iOS UIView) push resizes through vio_metal_handle_resize() and
-         * leave glfw_window NULL, so we skip the poll in that case. */
-        if (vio_mtl.glfw_window) {
+         * leave platform_window NULL, so we skip the poll in that case. */
+        if (vio_mtl.platform_window) {
             int fb_w, fb_h;
-            glfwGetFramebufferSize(vio_mtl.glfw_window, &fb_w, &fb_h);
+            vio_plat()->get_framebuffer_size(vio_mtl.platform_window, &fb_w, &fb_h);
             if (fb_w != vio_mtl.width || fb_h != vio_mtl.height) {
                 metal_resize(fb_w, fb_h);
             }
         }
-#endif
 
         /* DO NOT reset current_bound_rt here. The persistent-bind contract
          * mirrored from D3D11/D3D12 (vio_d3d11.current_rtv survives across

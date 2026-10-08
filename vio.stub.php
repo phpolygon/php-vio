@@ -1222,6 +1222,13 @@ function vio_backend_count(): int {}
 function vio_backends(): array {}
 
 /**
+ * The window system vio runs on (OPEN-ITEMS A1, NATIVE-PLATFORM-PLAN): "glfw", a native
+ * layer ("win32", "cocoa", "x11") or "null" (no window system: headless / offscreen only).
+ * VIO_PLATFORM=<name> in the environment picks one of the built-in platforms.
+ */
+function vio_platform(): string {}
+
+/**
  * Read the host's thermal pressure level.
  *
  * On macOS / iOS this maps NSProcessInfo.thermalState to the string tokens

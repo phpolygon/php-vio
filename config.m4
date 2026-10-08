@@ -375,7 +375,9 @@ if test "$PHP_VIO" != "no"; then
     src/vio_context.c \
     src/vio_backend_registry.c \
     src/vio_resource.c \
-    src/vio_window.c \
+    src/vio_platform_registry.c \
+    src/platform/null/vio_platform_null.c \
+    src/platform/glfw/vio_platform_glfw.c \
     src/vio_mesh.c \
     src/vio_input.c \
     src/vio_shader.c \

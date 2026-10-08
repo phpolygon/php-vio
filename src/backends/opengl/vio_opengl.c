@@ -17,8 +17,6 @@
 
 #include <glad/glad.h>
 #include "../../vio_shader_cache.h"
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
 
 #include "vio_opengl.h"
 #include "../../shaders/default_shaders.h"
@@ -3408,7 +3406,8 @@ int vio_opengl_get_glsl_version(void)
 
 int vio_opengl_setup_context(void)
 {
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+    /* The GL entry points of the context the platform made current */
+    if (!vio_plat()->gl_get_proc_address || !gladLoadGLLoader((GLADloadproc)vio_plat()->gl_get_proc_address)) {
         php_error_docref(NULL, E_WARNING, "Failed to initialize GLAD");
         return -1;
     }

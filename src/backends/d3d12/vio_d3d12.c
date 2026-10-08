@@ -26,12 +26,7 @@
 #define VIO_D3D12_HAS_WORK_GRAPHS 1
 #endif
 
-#ifdef HAVE_GLFW
-#define GLFW_INCLUDE_NONE
-#define GLFW_EXPOSE_NATIVE_WIN32
-#include <GLFW/glfw3.h>
-#include <GLFW/glfw3native.h>
-#endif
+#include "../../../include/vio_platform.h"
 
 #include "vio_d3d12.h"
 #include "../../vio_cubemap.h"   /* bindless cube slots */
@@ -1906,13 +1901,12 @@ static void d3d12_shutdown(void)
 
 static void *d3d12_create_surface(vio_config *cfg)
 {
-#ifdef HAVE_GLFW
-    if (!vio_d3d12.glfw_window) {
-        php_error_docref(NULL, E_WARNING, "D3D12: No GLFW window set");
+    /* The platform window's HWND carries the swapchain. */
+    HWND hwnd = vio_d3d12.platform_window ? (HWND)vio_plat()->native_handle(vio_d3d12.platform_window, VIO_NATIVE_HWND) : NULL;
+    if (!hwnd) {
+        php_error_docref(NULL, E_WARNING, "D3D12: no window to present into");
         return NULL;
     }
-
-    HWND hwnd = glfwGetWin32Window((GLFWwindow *)vio_d3d12.glfw_window);
 
     /* HDR10 (GAP-PHASE5 Block 6): 10-bit backbuffer when asked for and the
      * window's display is in HDR mode (or forced); colour space set below. */
@@ -2009,11 +2003,6 @@ static void *d3d12_create_surface(vio_config *cfg)
     }
 
     return vio_d3d12.swapchain;
-#else
-    (void)cfg;
-    php_error_docref(NULL, E_WARNING, "D3D12: Built without GLFW, cannot create surface");
-    return NULL;
-#endif
 }
 
 static void d3d12_destroy_surface(void *surface)
@@ -9519,9 +9508,9 @@ static int d3d12_set_viewports(const int *rects, int count)
 
 /* ── Setup context (called from vio_create after window creation) ── */
 
-int vio_d3d12_setup_context(void *glfw_window, vio_config *cfg)
+int vio_d3d12_setup_context(void *platform_window, vio_config *cfg)
 {
-    vio_d3d12.glfw_window = glfw_window;
+    vio_d3d12.platform_window = platform_window;
 
     /* Create surface (swapchain + render targets + depth buffer) */
     void *surface = d3d12_create_surface(cfg);

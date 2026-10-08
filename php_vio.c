@@ -783,9 +783,9 @@ pick_backend:
         VIO_CREATE_FAIL();
     }
 
-#ifdef HAVE_GLFW
-    /* Create GLFW window (unless null/headless backend) */
-    if (strcmp(ctx->backend->name, "null") != 0) {
+    /* Create the platform window (not for the null backend, not without a
+     * window system - the null platform). */
+    if (strcmp(ctx->backend->name, "null") != 0 && vio_platform_has_windows()) {
         ctx->window = vio_window_create(&ctx->config, ctx->backend->name);
         if (!ctx->window) {
             if (ctx->backend->shutdown) {
@@ -795,9 +795,10 @@ pick_backend:
             VIO_CREATE_FAIL();
         }
 
-        /* Install input callbacks */
-        vio_input_install_callbacks(ctx->window, &ctx->input);
+        /* Route the window's input events into the context */
+        vio_plat()->install_input(ctx->window, &ctx->input);
 
+#ifdef HAVE_GLFW
         /* OpenGL: load GL functions and compile default shaders */
         if (strcmp(ctx->backend->name, "opengl") == 0) {
             if (vio_opengl_setup_context() != 0) {
@@ -826,6 +827,7 @@ pick_backend:
                 }
             }
         }
+#endif
 
 #ifdef HAVE_VULKAN
         /* Vulkan: create instance, device, swapchain, etc. */
@@ -858,7 +860,7 @@ pick_backend:
 #endif
 
 #ifdef HAVE_D3D11
-        /* D3D11: set GLFW window handle and create swapchain */
+        /* D3D11: the window's HWND gets the swapchain */
         if (strcmp(ctx->backend->name, "d3d11") == 0) {
             if (vio_d3d11_setup_context(ctx->window, &ctx->config) != 0) {
                 vio_window_destroy(ctx->window);
@@ -873,7 +875,7 @@ pick_backend:
 #endif
 
 #ifdef HAVE_D3D12
-        /* D3D12: set GLFW window handle and create swapchain */
+        /* D3D12: the window's HWND gets the swapchain */
         if (strcmp(ctx->backend->name, "d3d12") == 0) {
             if (vio_d3d12_setup_context(ctx->window, &ctx->config) != 0) {
                 vio_window_destroy(ctx->window);
@@ -887,7 +889,6 @@ pick_backend:
         }
 #endif
     }
-#endif
 
 #ifdef HAVE_IOS
     /* iOS path: there is no GLFW window. The iOS backend creates a
@@ -983,12 +984,10 @@ ZEND_FUNCTION(vio_destroy)
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }
-#ifdef HAVE_GLFW
         if (ctx->window) {
             vio_window_destroy(ctx->window);
             ctx->window = NULL;
         }
-#endif
 #ifdef HAVE_IOS
         /* Tear down the iOS render view; the Metal context is shut down
          * via ctx->backend->shutdown above. */
@@ -1012,12 +1011,10 @@ ZEND_FUNCTION(vio_should_close)
         RETURN_TRUE;
     }
 
-#ifdef HAVE_GLFW
     if (ctx->window && vio_window_should_close(ctx->window)) {
         ctx->should_close = 1;
         RETURN_TRUE;
     }
-#endif
 
     RETURN_FALSE;
 }
@@ -1033,11 +1030,9 @@ ZEND_FUNCTION(vio_close)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     ctx->should_close = 1;
 
-#ifdef HAVE_GLFW
     if (ctx->window) {
         vio_window_set_should_close(ctx->window, 1);
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_poll_events)
@@ -1053,9 +1048,7 @@ ZEND_FUNCTION(vio_poll_events)
     /* The record/replay clock ticks once per poll; replayed events are
      * delivered after the OS ones, at the point real ones would arrive. */
     vio_input_poll_begin(&ctx->input);
-#ifdef HAVE_GLFW
     vio_window_poll_events();
-#endif
 #ifdef HAVE_IOS
     /* No OS event pump on iOS (UIKit drives that). Drain the soft-keyboard
      * codepoints queued by the UIKeyInput view on the main thread, emitting
@@ -1070,7 +1063,6 @@ ZEND_FUNCTION(vio_poll_events)
 
 
 
-#ifdef HAVE_GLFW
 /* ── Window content scale ──────────────────────────────────────────────
  *
  * Every DPI-dependent path here derives from the window's content scale: the
@@ -1082,7 +1074,7 @@ ZEND_FUNCTION(vio_poll_events)
  * VIO_FORCE_CONTENT_SCALE overrides it so the scaled paths are testable on any
  * machine. Accepts "1.5" for a uniform scale or "1.5x2" for an asymmetric one.
  * Read once per process; unset or unparsable means no override. */
-static void vio_window_content_scale(GLFWwindow *window, float *sx, float *sy)
+static void vio_window_content_scale(vio_window_handle window, float *sx, float *sy)
 {
     static int   checked = 0;
     static float forced_x = 0.0f, forced_y = 0.0f;
@@ -1106,9 +1098,8 @@ static void vio_window_content_scale(GLFWwindow *window, float *sx, float *sy)
         return;
     }
 
-    glfwGetWindowContentScale(window, sx, sy);
+    vio_plat()->get_content_scale(window, sx, sy);
 }
-#endif
 
 /* Released bindless slots whose frames have finished: clear the entry, drop the
  * table's reference, and hand the slot out again. Between frames. */
@@ -1149,7 +1140,6 @@ ZEND_FUNCTION(vio_begin)
 
     vio_input_update(&ctx->input);
 
-#ifdef HAVE_GLFW
     /* Sync 2D projection and viewport to current window size.
      * Projection (state_2d.width/height) is in LOGICAL coords: framebuffer/scale.
      * Viewport (state_2d.fb_width/height) is in PHYSICAL pixels.
@@ -1164,7 +1154,7 @@ ZEND_FUNCTION(vio_begin)
             fb_w = ctx->config.width;
             fb_h = ctx->config.height;
         } else {
-            glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+            vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
             vio_window_content_scale(ctx->window, &sx, &sy);
         }
         if (sx <= 0.0f) sx = 1.0f;
@@ -1181,14 +1171,12 @@ ZEND_FUNCTION(vio_begin)
         ctx->state_2d.fb_width  = fb_w;
         ctx->state_2d.fb_height = fb_h;
     }
-#endif
 
 #ifdef HAVE_METAL
     if (strcmp(ctx->backend->name, "metal") == 0) {
         int fb_w = 0, fb_h = 0;
         float sx = 1.0f, sy = 1.0f;
         int have_size = 0;
-#ifdef HAVE_GLFW
         if (ctx->window) {
             if (ctx->config.headless) {
                 /* Headless renders into a 1:1 offscreen texture (sized from the
@@ -1197,15 +1185,14 @@ ZEND_FUNCTION(vio_begin)
                  * viewport/scissor scale stays 1 — otherwise the Retina
                  * framebuffer (2x) would scale scissors to 2x screen positions
                  * against a 1x target, clipping content at double coordinates. */
-                glfwGetWindowSize((GLFWwindow *)ctx->window, &fb_w, &fb_h);
+                vio_plat()->get_window_size(ctx->window, &fb_w, &fb_h);
                 sx = sy = 1.0f;
             } else {
-                glfwGetFramebufferSize((GLFWwindow *)ctx->window, &fb_w, &fb_h);
-                vio_window_content_scale((GLFWwindow *)ctx->window, &sx, &sy);
+                vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
+                vio_window_content_scale(ctx->window, &sx, &sy);
             }
             have_size = 1;
         }
-#endif
 #ifdef HAVE_IOS
         /* iOS: derive the LOGICAL window size (physical framebuffer / content
          * scale), exactly like the GLFW retina path. The game lays out in
@@ -1234,7 +1221,7 @@ ZEND_FUNCTION(vio_begin)
     }
 #endif
 
-#if (defined(HAVE_D3D11) || defined(HAVE_D3D12)) && defined(HAVE_GLFW)
+#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
     if (ctx->window && (strcmp(ctx->backend->name, "d3d11") == 0
                      || strcmp(ctx->backend->name, "d3d12") == 0)) {
         int fb_w, fb_h;
@@ -1250,7 +1237,7 @@ ZEND_FUNCTION(vio_begin)
             fb_w = ctx->config.width  > 0 ? ctx->config.width  : 800;
             fb_h = ctx->config.height > 0 ? ctx->config.height : 600;
         } else {
-            glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+            vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
             vio_window_content_scale(ctx->window, &sx, &sy);
         }
         if (sx <= 0.0f) sx = 1.0f;
@@ -1403,12 +1390,10 @@ ZEND_FUNCTION(vio_end)
         ctx->backend->present();
     }
 
-#ifdef HAVE_GLFW
-    /* Only OpenGL uses GLFW swap buffers; Vulkan presents via vkQueuePresentKHR */
+    /* Only OpenGL swaps through the platform; the other backends present themselves */
     if (ctx->window && strcmp(ctx->backend->name, "opengl") == 0) {
         vio_window_swap_buffers(ctx->window);
     }
-#endif
 
     vio_pending_textures_clear(ctx);
     ctx->in_frame = 0;
@@ -1526,7 +1511,6 @@ ZEND_FUNCTION(vio_key_released)
  * desktop, which is the case that was broken. */
 static double vio_input_logical_scale(vio_context_object *ctx, int horizontal)
 {
-#if defined(HAVE_GLFW)
     /* Headless contexts are 1:1 (vio_content_scale == 1) and injected cursor
      * coordinates are already logical — the monitor DPI of the hidden window
      * must not scale them (15.5 came back as 5.17 on a 300 % display). */
@@ -1534,8 +1518,8 @@ static double vio_input_logical_scale(vio_context_object *ctx, int horizontal)
         int scr_w = 0, scr_h = 0, fb_w = 0, fb_h = 0;
         float sx = 1.0f, sy = 1.0f;
 
-        glfwGetWindowSize(ctx->window, &scr_w, &scr_h);
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+        vio_plat()->get_window_size(ctx->window, &scr_w, &scr_h);
+        vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
         vio_window_content_scale(ctx->window, &sx, &sy);
 
         int scr   = horizontal ? scr_w : scr_h;
@@ -1547,7 +1531,6 @@ static double vio_input_logical_scale(vio_context_object *ctx, int horizontal)
             if (logical > 0.0) return (double)scr / logical;
         }
     }
-#endif
     (void)ctx;
     (void)horizontal;
     return 1.0;
@@ -1754,22 +1737,11 @@ ZEND_FUNCTION(vio_set_cursor_mode)
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
-#ifdef HAVE_GLFW
+    /* VIO_CURSOR_NORMAL (0) / DISABLED (1, raw motion where available) / HIDDEN (2) */
     if (ctx->window) {
-        int glfw_mode;
-        switch (mode) {
-            case 1:  glfw_mode = GLFW_CURSOR_DISABLED; break;  /* VIO_CURSOR_DISABLED */
-            case 2:  glfw_mode = GLFW_CURSOR_HIDDEN; break;    /* VIO_CURSOR_HIDDEN */
-            default: glfw_mode = GLFW_CURSOR_NORMAL; break;    /* VIO_CURSOR_NORMAL */
-        }
-        glfwSetInputMode(ctx->window, GLFW_CURSOR, glfw_mode);
-
-        /* When switching to disabled mode, enable raw mouse motion if available */
-        if (mode == 1 && glfwRawMouseMotionSupported()) {
-            glfwSetInputMode(ctx->window, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
-        }
+        vio_plat()->set_cursor_mode(ctx->window, mode == 1 ? VIO_PLATFORM_CURSOR_DISABLED
+                                               : mode == 2 ? VIO_PLATFORM_CURSOR_HIDDEN : VIO_PLATFORM_CURSOR_NORMAL);
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_on_key)
@@ -1920,23 +1892,23 @@ ZEND_FUNCTION(vio_toggle_fullscreen)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
 
-    GLFWmonitor *monitor = glfwGetWindowMonitor(ctx->window);
-    if (monitor) {
+    const vio_platform *plat = vio_plat();
+    if (plat->window_monitor(ctx->window) >= 0) {
         /* Currently fullscreen -> go windowed */
-        glfwSetWindowMonitor(ctx->window, NULL,
-            100, 100, ctx->config.width, ctx->config.height, GLFW_DONT_CARE);
+        plat->set_window_monitor(ctx->window, -1,
+            100, 100, ctx->config.width, ctx->config.height, VIO_PLATFORM_DONT_CARE);
     } else {
         /* Currently windowed -> go fullscreen */
-        monitor = glfwGetPrimaryMonitor();
-        const GLFWvidmode *mode = glfwGetVideoMode(monitor);
-        glfwSetWindowMonitor(ctx->window, monitor,
-            0, 0, mode->width, mode->height, mode->refreshRate);
+        vio_monitor_desc md;
+        int primary = plat->primary_monitor();
+        if (primary >= 0 && plat->monitor_desc(primary, &md) == 0) {
+            plat->set_window_monitor(ctx->window, primary,
+                0, 0, md.mode.width, md.mode.height, md.mode.refresh_hz);
+        }
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_set_title)
@@ -1949,12 +1921,10 @@ ZEND_FUNCTION(vio_set_title)
         Z_PARAM_STR(title)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
 
-    glfwSetWindowTitle(ctx->window, ZSTR_VAL(title));
-#endif
+    vio_plat()->set_title(ctx->window, ZSTR_VAL(title));
 }
 
 ZEND_FUNCTION(vio_set_borderless)
@@ -1965,23 +1935,22 @@ ZEND_FUNCTION(vio_set_borderless)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
+    const vio_platform *plat = vio_plat();
 
     /* Capture the current windowed rect (only when we're actually a normal
      * window, not already fullscreen or maximized) so vio_set_windowed can
      * return to it. */
-    if (glfwGetWindowMonitor(ctx->window) == NULL
-        && !glfwGetWindowAttrib(ctx->window, GLFW_MAXIMIZED)) {
-        glfwGetWindowPos(ctx->window, &ctx->saved_win_x, &ctx->saved_win_y);
-        glfwGetWindowSize(ctx->window, &ctx->saved_win_w, &ctx->saved_win_h);
+    if (plat->window_monitor(ctx->window) < 0
+        && !plat->get_attrib(ctx->window, VIO_WINDOW_MAXIMIZED)) {
+        plat->get_window_pos(ctx->window, &ctx->saved_win_x, &ctx->saved_win_y);
+        plat->get_window_size(ctx->window, &ctx->saved_win_w, &ctx->saved_win_h);
         ctx->has_saved_win_geometry = 1;
     }
 
-    glfwSetWindowAttrib(ctx->window, GLFW_DECORATED, GLFW_FALSE);
-    glfwMaximizeWindow(ctx->window);
-#endif
+    plat->set_attrib(ctx->window, VIO_WINDOW_DECORATED, 0);
+    plat->maximize(ctx->window);
 }
 
 ZEND_FUNCTION(vio_set_windowed)
@@ -1992,9 +1961,9 @@ ZEND_FUNCTION(vio_set_windowed)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
+    const vio_platform *plat = vio_plat();
 
     int rx = ctx->has_saved_win_geometry ? ctx->saved_win_x : 100;
     int ry = ctx->has_saved_win_geometry ? ctx->saved_win_y : 100;
@@ -2003,23 +1972,22 @@ ZEND_FUNCTION(vio_set_windowed)
     int rh = ctx->has_saved_win_geometry ? ctx->saved_win_h
            : (ctx->config.height > 0 ? ctx->config.height : 720);
 
-    if (glfwGetWindowMonitor(ctx->window) != NULL) {
-        /* Real (monitor) fullscreen — glfwRestoreWindow does NOT exit this.
+    if (plat->window_monitor(ctx->window) >= 0) {
+        /* Real (monitor) fullscreen — restoring does NOT exit this.
          * Detach the monitor to return to a windowed rect. Without this the
          * window stays fullscreen and a follow-up glfwSetWindowSize merely
          * switches the fullscreen video mode (the "back to windowed doesn't
          * work" bug). */
-        glfwSetWindowMonitor(ctx->window, NULL, rx, ry, rw, rh, GLFW_DONT_CARE);
+        plat->set_window_monitor(ctx->window, -1, rx, ry, rw, rh, VIO_PLATFORM_DONT_CARE);
     } else {
         /* Borderless / maximized — un-maximize, then restore the saved rect. */
-        glfwRestoreWindow(ctx->window);
+        plat->restore(ctx->window);
         if (ctx->has_saved_win_geometry) {
-            glfwSetWindowSize(ctx->window, rw, rh);
-            glfwSetWindowPos(ctx->window, rx, ry);
+            plat->set_window_size(ctx->window, rw, rh);
+            plat->set_window_pos(ctx->window, rx, ry);
         }
     }
-    glfwSetWindowAttrib(ctx->window, GLFW_DECORATED, GLFW_TRUE);
-#endif
+    plat->set_attrib(ctx->window, VIO_WINDOW_DECORATED, 1);
 }
 
 ZEND_FUNCTION(vio_set_fullscreen)
@@ -2039,55 +2007,45 @@ ZEND_FUNCTION(vio_set_fullscreen)
         Z_PARAM_LONG(req_refresh)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (!ctx->window) return;
+    const vio_platform *plat = vio_plat();
 
     /* Capture the windowed rect before leaving it so the round-trip back to
      * windowed lands at the same pos/size. */
-    if (glfwGetWindowMonitor(ctx->window) == NULL) {
-        glfwGetWindowPos(ctx->window, &ctx->saved_win_x, &ctx->saved_win_y);
-        glfwGetWindowSize(ctx->window, &ctx->saved_win_w, &ctx->saved_win_h);
+    if (plat->window_monitor(ctx->window) < 0) {
+        plat->get_window_pos(ctx->window, &ctx->saved_win_x, &ctx->saved_win_y);
+        plat->get_window_size(ctx->window, &ctx->saved_win_w, &ctx->saved_win_h);
         ctx->has_saved_win_geometry = 1;
     }
 
     /* Pick the requested monitor by index; fall back to primary for -1 or an
      * out-of-range index (e.g. a monitor that was unplugged since selection). */
-    GLFWmonitor *monitor = NULL;
-    if (monitor_index >= 0) {
-        int count = 0;
-        GLFWmonitor **mons = glfwGetMonitors(&count);
-        if (mons && monitor_index < count) {
-            monitor = mons[monitor_index];
-        }
-    }
-    if (!monitor) {
-        monitor = glfwGetPrimaryMonitor();
-    }
-    const GLFWvidmode *mode = glfwGetVideoMode(monitor);
+    int monitor = (monitor_index >= 0 && monitor_index < plat->monitor_count()) ? (int)monitor_index : plat->primary_monitor();
+    vio_monitor_desc md;
+    const vio_video_mode *mode = (monitor >= 0 && plat->monitor_desc(monitor, &md) == 0) ? &md.mode : NULL;
 
     /* A caller-supplied resolution (req_w/req_h > 0) switches the display to
      * that exclusive-fullscreen video mode instead of the native one. Callers
      * are expected to pass a mode enumerated by vio_video_modes(); GLFW picks
      * the closest supported mode if it does not match exactly. Otherwise we
      * keep the native mode. Refresh falls back to the chosen mode's rate, then
-     * to GLFW_DONT_CARE. */
+     * to the platform's choice. */
     int out_w = (mode ? mode->width : 0);
     int out_h = (mode ? mode->height : 0);
-    int out_refresh = (mode ? mode->refreshRate : GLFW_DONT_CARE);
+    int out_refresh = (mode ? mode->refresh_hz : VIO_PLATFORM_DONT_CARE);
     if (req_w > 0 && req_h > 0) {
         out_w = (int)req_w;
         out_h = (int)req_h;
-        out_refresh = (req_refresh > 0) ? (int)req_refresh : GLFW_DONT_CARE;
+        out_refresh = (req_refresh > 0) ? (int)req_refresh : VIO_PLATFORM_DONT_CARE;
     } else if (req_refresh > 0) {
         out_refresh = (int)req_refresh;
     }
 
-    if (out_w > 0 && out_h > 0) {
-        glfwSetWindowMonitor(ctx->window, monitor,
+    if (monitor >= 0 && out_w > 0 && out_h > 0) {
+        plat->set_window_monitor(ctx->window, monitor,
             0, 0, out_w, out_h, out_refresh);
     }
-#endif
 }
 
 /* Report whether the window auto-minimizes when a fullscreen window loses focus.
@@ -2102,13 +2060,11 @@ ZEND_FUNCTION(vio_get_auto_iconify)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
     ZEND_PARSE_PARAMETERS_END();
 
-#ifdef HAVE_GLFW
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     if (ctx->window) {
-        RETURN_BOOL(glfwGetWindowAttrib(ctx->window, GLFW_AUTO_ICONIFY) != 0);
+        RETURN_BOOL(vio_plat()->get_attrib(ctx->window, VIO_WINDOW_AUTO_ICONIFY) != 0);
     }
-#endif
-    /* No GLFW window (null backend): report GLFW's default of "on". */
+    /* No window (null backend): report the platforms' default of "on". */
     RETURN_TRUE;
 }
 
@@ -2123,7 +2079,6 @@ ZEND_FUNCTION(vio_window_size)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
     array_init(return_value);
-#ifdef HAVE_GLFW
     if (ctx->window) {
         /* Return the LOGICAL window size (framebuffer divided by content
          * scale). This gives a DPI-independent layout space across platforms:
@@ -2141,7 +2096,7 @@ ZEND_FUNCTION(vio_window_size)
             add_next_index_long(return_value, ctx->config.height);
             return;
         }
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
+        vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
         vio_window_content_scale(ctx->window, &sx, &sy);
         if (sx <= 0.0f) sx = 1.0f;
         if (sy <= 0.0f) sy = 1.0f;
@@ -2151,7 +2106,6 @@ ZEND_FUNCTION(vio_window_size)
         add_next_index_long(return_value, logical_h);
         return;
     }
-#endif
 #ifdef HAVE_IOS
     {
         int fb_w = 0, fb_h = 0;
@@ -2168,20 +2122,6 @@ ZEND_FUNCTION(vio_window_size)
     add_next_index_long(return_value, ctx->config.width > 0 ? ctx->config.width : 800);
     add_next_index_long(return_value, ctx->config.height > 0 ? ctx->config.height : 600);
 }
-
-#ifdef HAVE_GLFW
-/* Pull in native handle accessors from GLFW. We define platform macros
- * conditionally so this compiles on every host: only the matching
- * accessor (Cocoa on macOS, Win32 on Windows, X11 on Linux) is exposed. */
-#if defined(__APPLE__)
-#  define GLFW_EXPOSE_NATIVE_COCOA
-#elif defined(_WIN32)
-#  define GLFW_EXPOSE_NATIVE_WIN32
-#elif defined(__linux__)
-#  define GLFW_EXPOSE_NATIVE_X11
-#endif
-#include <GLFW/glfw3native.h>
-#endif
 
 /*
  * vio_native_window_handle($ctx): int
@@ -2210,16 +2150,12 @@ ZEND_FUNCTION(vio_native_window_handle)
         RETURN_LONG(0);
     }
 
-#ifdef HAVE_GLFW
-#  if defined(__APPLE__)
-    RETURN_LONG((zend_long)(uintptr_t)glfwGetCocoaWindow(ctx->window));
-#  elif defined(_WIN32)
-    RETURN_LONG((zend_long)(uintptr_t)glfwGetWin32Window(ctx->window));
-#  elif defined(__linux__)
-    RETURN_LONG((zend_long)(uintptr_t)glfwGetX11Window(ctx->window));
-#  else
-    RETURN_LONG(0);
-#  endif
+#if defined(__APPLE__)
+    RETURN_LONG((zend_long)(uintptr_t)vio_plat()->native_handle(ctx->window, VIO_NATIVE_NSWINDOW));
+#elif defined(_WIN32)
+    RETURN_LONG((zend_long)(uintptr_t)vio_plat()->native_handle(ctx->window, VIO_NATIVE_HWND));
+#elif defined(__linux__)
+    RETURN_LONG((zend_long)(uintptr_t)vio_plat()->native_handle(ctx->window, VIO_NATIVE_XLIB_WINDOW));
 #else
     RETURN_LONG(0);
 #endif
@@ -2245,12 +2181,10 @@ static void vio_surface_size(vio_context_object *ctx, int *out_w, int *out_h)
      * framebuffer says — report THAT size, so callers' viewports and readback
      * buffers match the pixels they get. */
     if (!ctx->config.headless) {
-#ifdef HAVE_GLFW
         if (ctx->window) {
             /* 0x0 while minimised — reported as such; readback refuses it. */
-            glfwGetFramebufferSize(ctx->window, &w, &h);
+            vio_plat()->get_framebuffer_size(ctx->window, &w, &h);
         }
-#endif
 #ifdef HAVE_IOS
         if (!ctx->window) {
             int fw = 0, fh = 0;
@@ -2293,7 +2227,6 @@ ZEND_FUNCTION(vio_content_scale)
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
     array_init(return_value);
-#ifdef HAVE_GLFW
     /* Headless: the offscreen target is 1:1 with the logical size (see
      * vio_framebuffer_size), so the effective content scale is 1. */
     if (ctx->window && !ctx->config.headless) {
@@ -2303,7 +2236,6 @@ ZEND_FUNCTION(vio_content_scale)
         add_next_index_double(return_value, (double)sy);
         return;
     }
-#endif
     add_next_index_double(return_value, 1.0);
     add_next_index_double(return_value, 1.0);
 }
@@ -2319,28 +2251,21 @@ ZEND_FUNCTION(vio_monitor_info)
     (void)ctx_zval; /* monitor info is window-independent; ctx just guards init */
 
     array_init(return_value);
-#ifdef HAVE_GLFW
-    GLFWmonitor *monitor = glfwGetPrimaryMonitor();
-    if (monitor) {
-        const GLFWvidmode *mode = glfwGetVideoMode(monitor);
-        int wx = 0, wy = 0, ww = 0, wh = 0;
-        float sx = 1.0f, sy = 1.0f;
-        const char *name = glfwGetMonitorName(monitor);
-        glfwGetMonitorWorkarea(monitor, &wx, &wy, &ww, &wh);
-        glfwGetMonitorContentScale(monitor, &sx, &sy);
-        add_assoc_long(return_value, "width", mode ? mode->width : 0);
-        add_assoc_long(return_value, "height", mode ? mode->height : 0);
-        add_assoc_long(return_value, "refresh_rate", mode ? mode->refreshRate : 0);
-        add_assoc_long(return_value, "work_x", wx);
-        add_assoc_long(return_value, "work_y", wy);
-        add_assoc_long(return_value, "work_width", ww);
-        add_assoc_long(return_value, "work_height", wh);
-        add_assoc_double(return_value, "scale_x", (double)sx);
-        add_assoc_double(return_value, "scale_y", (double)sy);
-        add_assoc_string(return_value, "name", name ? name : "");
+    vio_monitor_desc md;
+    int primary = vio_plat()->primary_monitor();
+    if (primary >= 0 && vio_plat()->monitor_desc(primary, &md) == 0) {
+        add_assoc_long(return_value, "width", md.mode.width);
+        add_assoc_long(return_value, "height", md.mode.height);
+        add_assoc_long(return_value, "refresh_rate", md.mode.refresh_hz);
+        add_assoc_long(return_value, "work_x", md.work_x);
+        add_assoc_long(return_value, "work_y", md.work_y);
+        add_assoc_long(return_value, "work_width", md.work_width);
+        add_assoc_long(return_value, "work_height", md.work_height);
+        add_assoc_double(return_value, "scale_x", (double)md.scale_x);
+        add_assoc_double(return_value, "scale_y", (double)md.scale_y);
+        add_assoc_string(return_value, "name", md.name);
         return;
     }
-#endif
     add_assoc_long(return_value, "width", 0);
     add_assoc_long(return_value, "height", 0);
     add_assoc_long(return_value, "refresh_rate", 0);
@@ -2364,39 +2289,29 @@ ZEND_FUNCTION(vio_monitors)
     (void)ctx_zval;
 
     array_init(return_value);
-#ifdef HAVE_GLFW
-    int count = 0;
-    GLFWmonitor **mons = glfwGetMonitors(&count);
-    GLFWmonitor *primary = glfwGetPrimaryMonitor();
+    int count = vio_plat()->monitor_count();
     for (int i = 0; i < count; i++) {
-        GLFWmonitor *m = mons[i];
-        const GLFWvidmode *mode = glfwGetVideoMode(m);
-        int mx = 0, my = 0, wx = 0, wy = 0, ww = 0, wh = 0;
-        float sx = 1.0f, sy = 1.0f;
-        const char *name = glfwGetMonitorName(m);
-        glfwGetMonitorPos(m, &mx, &my);
-        glfwGetMonitorWorkarea(m, &wx, &wy, &ww, &wh);
-        glfwGetMonitorContentScale(m, &sx, &sy);
+        vio_monitor_desc md;
+        if (vio_plat()->monitor_desc(i, &md) != 0) continue;
 
         zval entry;
         array_init(&entry);
         add_assoc_long(&entry, "index", i);
-        add_assoc_string(&entry, "name", name ? name : "");
-        add_assoc_bool(&entry, "primary", m == primary);
-        add_assoc_long(&entry, "x", mx);
-        add_assoc_long(&entry, "y", my);
-        add_assoc_long(&entry, "width", mode ? mode->width : 0);
-        add_assoc_long(&entry, "height", mode ? mode->height : 0);
-        add_assoc_long(&entry, "refresh_rate", mode ? mode->refreshRate : 0);
-        add_assoc_long(&entry, "work_x", wx);
-        add_assoc_long(&entry, "work_y", wy);
-        add_assoc_long(&entry, "work_width", ww);
-        add_assoc_long(&entry, "work_height", wh);
-        add_assoc_double(&entry, "scale_x", (double)sx);
-        add_assoc_double(&entry, "scale_y", (double)sy);
+        add_assoc_string(&entry, "name", md.name);
+        add_assoc_bool(&entry, "primary", md.primary);
+        add_assoc_long(&entry, "x", md.x);
+        add_assoc_long(&entry, "y", md.y);
+        add_assoc_long(&entry, "width", md.mode.width);
+        add_assoc_long(&entry, "height", md.mode.height);
+        add_assoc_long(&entry, "refresh_rate", md.mode.refresh_hz);
+        add_assoc_long(&entry, "work_x", md.work_x);
+        add_assoc_long(&entry, "work_y", md.work_y);
+        add_assoc_long(&entry, "work_width", md.work_width);
+        add_assoc_long(&entry, "work_height", md.work_height);
+        add_assoc_double(&entry, "scale_x", (double)md.scale_x);
+        add_assoc_double(&entry, "scale_y", (double)md.scale_y);
         add_next_index_zval(return_value, &entry);
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_video_modes)
@@ -2413,34 +2328,23 @@ ZEND_FUNCTION(vio_video_modes)
     (void)ctx_zval;
 
     array_init(return_value);
-#ifdef HAVE_GLFW
     /* Resolve the monitor the same way vio_set_fullscreen does. */
-    GLFWmonitor *monitor = NULL;
-    if (monitor_index >= 0) {
-        int mcount = 0;
-        GLFWmonitor **mons = glfwGetMonitors(&mcount);
-        if (mons && monitor_index < mcount) {
-            monitor = mons[monitor_index];
-        }
-    }
-    if (!monitor) {
-        monitor = glfwGetPrimaryMonitor();
-    }
-    if (!monitor) return;
+    const vio_platform *plat = vio_plat();
+    int monitor = (monitor_index >= 0 && monitor_index < plat->monitor_count()) ? (int)monitor_index : plat->primary_monitor();
+    if (monitor < 0) return;
 
-    int count = 0;
-    const GLFWvidmode *modes = glfwGetVideoModes(monitor, &count);
-    if (!modes) return;
+    vio_video_mode modes[512];
+    int count = plat->video_modes(monitor, modes, (int)(sizeof(modes) / sizeof(modes[0])));
 
-    /* GLFW returns modes sorted ascending and may list the same (width,height,
+    /* Modes come sorted ascending and may list the same (width,height,
      * refresh) several times for different bit depths. Collapse duplicates so
      * the picker shows each resolution/refresh combination once. */
     for (int i = 0; i < count; i++) {
-        const GLFWvidmode *m = &modes[i];
+        const vio_video_mode *m = &modes[i];
         if (i > 0) {
-            const GLFWvidmode *p = &modes[i - 1];
+            const vio_video_mode *p = &modes[i - 1];
             if (p->width == m->width && p->height == m->height
-                && p->refreshRate == m->refreshRate) {
+                && p->refresh_hz == m->refresh_hz) {
                 continue;
             }
         }
@@ -2448,10 +2352,9 @@ ZEND_FUNCTION(vio_video_modes)
         array_init(&entry);
         add_assoc_long(&entry, "width", m->width);
         add_assoc_long(&entry, "height", m->height);
-        add_assoc_long(&entry, "refresh_rate", m->refreshRate);
+        add_assoc_long(&entry, "refresh_rate", m->refresh_hz);
         add_next_index_zval(return_value, &entry);
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_pixel_ratio)
@@ -2464,16 +2367,14 @@ ZEND_FUNCTION(vio_pixel_ratio)
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
-#ifdef HAVE_GLFW
     if (ctx->window && !ctx->config.headless) {   /* headless targets are 1:1, see vio_framebuffer_size */
         int fb_w = 0, win_w = 0, fb_h = 0, win_h = 0;
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        glfwGetWindowSize(ctx->window, &win_w, &win_h);
+        vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
+        vio_plat()->get_window_size(ctx->window, &win_w, &win_h);
         if (win_w > 0) {
             RETURN_DOUBLE((double)fb_w / (double)win_w);
         }
     }
-#endif
     RETURN_DOUBLE(1.0);
 }
 
@@ -8357,6 +8258,14 @@ ZEND_FUNCTION(vio_backend_count)
     RETURN_LONG(vio_backend_count());
 }
 
+/* The window system vio runs on (include/vio_platform.h): "glfw", a native
+ * layer ("win32", "cocoa", "x11"), or "null" without one. */
+ZEND_FUNCTION(vio_platform)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_STRING(vio_plat()->name);
+}
+
 ZEND_FUNCTION(vio_backends)
 {
     ZEND_PARSE_PARAMETERS_NONE();
@@ -11267,11 +11176,9 @@ ZEND_FUNCTION(vio_gamepads)
             add_next_index_long(return_value, jid);
             continue;
         }
-#ifdef HAVE_GLFW
-        if (!vio_gamepad_physical_hidden() && glfwJoystickPresent(jid)) {
+        if (!vio_gamepad_physical_hidden() && vio_plat()->joystick_present(jid)) {
             add_next_index_long(return_value, jid);
         }
-#endif
     }
 }
 
@@ -11286,11 +11193,9 @@ ZEND_FUNCTION(vio_gamepad_connected)
     if (id >= 0 && id < VIO_GAMEPAD_SLOTS && vio_virtual_gamepad_get((int)id)) {
         RETURN_TRUE;
     }
-#ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
-        RETURN_BOOL(glfwJoystickPresent((int)id));
+    if (id >= 0 && id <= VIO_PLATFORM_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
+        RETURN_BOOL(vio_plat()->joystick_present((int)id));
     }
-#endif
     RETURN_FALSE;
 }
 
@@ -11306,16 +11211,14 @@ ZEND_FUNCTION(vio_gamepad_name)
     if (vpad) {
         RETURN_STRING(vpad->name);
     }
-#ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden() && glfwJoystickPresent((int)id)) {
-        const char *name = glfwJoystickIsGamepad((int)id)
-            ? glfwGetGamepadName((int)id)
-            : glfwGetJoystickName((int)id);
+    if (id >= 0 && id <= VIO_PLATFORM_JOYSTICK_LAST && !vio_gamepad_physical_hidden() && vio_plat()->joystick_present((int)id)) {
+        const char *name = vio_plat()->joystick_is_gamepad((int)id)
+            ? vio_plat()->gamepad_name((int)id)
+            : vio_plat()->joystick_name((int)id);
         if (name) {
             RETURN_STRING(name);
         }
     }
-#endif
     RETURN_NULL();
 }
 
@@ -11336,25 +11239,24 @@ ZEND_FUNCTION(vio_gamepad_buttons)
         }
         return;
     }
-#ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
-        GLFWgamepadstate state;
-        if (glfwGetGamepadState((int)id, &state)) {
-            for (int i = 0; i <= GLFW_GAMEPAD_BUTTON_LAST; i++) {
-                add_index_bool(return_value, i, state.buttons[i] == GLFW_PRESS);
+    if (id >= 0 && id <= VIO_PLATFORM_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
+        unsigned char buttons[VIO_GAMEPAD_BUTTON_COUNT];
+        float axes[VIO_GAMEPAD_AXIS_COUNT];
+        if (vio_plat()->gamepad_state((int)id, buttons, axes)) {
+            for (int i = 0; i < VIO_GAMEPAD_BUTTON_COUNT; i++) {
+                add_index_bool(return_value, i, buttons[i]);
             }
             return;
         }
         /* Fallback: raw joystick buttons */
         int count = 0;
-        const unsigned char *buttons = glfwGetJoystickButtons((int)id, &count);
-        if (buttons) {
+        const unsigned char *raw = vio_plat()->joystick_buttons((int)id, &count);
+        if (raw) {
             for (int i = 0; i < count; i++) {
-                add_index_bool(return_value, i, buttons[i] == GLFW_PRESS);
+                add_index_bool(return_value, i, raw[i] != 0);
             }
         }
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_gamepad_axes)
@@ -11374,25 +11276,24 @@ ZEND_FUNCTION(vio_gamepad_axes)
         }
         return;
     }
-#ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
-        GLFWgamepadstate state;
-        if (glfwGetGamepadState((int)id, &state)) {
-            for (int i = 0; i <= GLFW_GAMEPAD_AXIS_LAST; i++) {
-                add_index_double(return_value, i, (double)state.axes[i]);
+    if (id >= 0 && id <= VIO_PLATFORM_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
+        unsigned char buttons[VIO_GAMEPAD_BUTTON_COUNT];
+        float axes[VIO_GAMEPAD_AXIS_COUNT];
+        if (vio_plat()->gamepad_state((int)id, buttons, axes)) {
+            for (int i = 0; i < VIO_GAMEPAD_AXIS_COUNT; i++) {
+                add_index_double(return_value, i, (double)axes[i]);
             }
             return;
         }
         /* Fallback: raw joystick axes */
         int count = 0;
-        const float *axes = glfwGetJoystickAxes((int)id, &count);
-        if (axes) {
+        const float *raw = vio_plat()->joystick_axes((int)id, &count);
+        if (raw) {
             for (int i = 0; i < count; i++) {
-                add_index_double(return_value, i, (double)axes[i]);
+                add_index_double(return_value, i, (double)raw[i]);
             }
         }
     }
-#endif
 }
 
 ZEND_FUNCTION(vio_gamepad_triggers)
@@ -11411,16 +11312,15 @@ ZEND_FUNCTION(vio_gamepad_triggers)
         add_assoc_double(return_value, "right", (double)vpad->axes[VIO_GAMEPAD_AXIS_RIGHT_TRIGGER]);
         return;
     }
-#ifdef HAVE_GLFW
-    if (id >= GLFW_JOYSTICK_1 && id <= GLFW_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
-        GLFWgamepadstate state;
-        if (glfwGetGamepadState((int)id, &state)) {
-            add_assoc_double(return_value, "left", (double)state.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER]);
-            add_assoc_double(return_value, "right", (double)state.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER]);
+    if (id >= 0 && id <= VIO_PLATFORM_JOYSTICK_LAST && !vio_gamepad_physical_hidden()) {
+        unsigned char buttons[VIO_GAMEPAD_BUTTON_COUNT];
+        float axes[VIO_GAMEPAD_AXIS_COUNT];
+        if (vio_plat()->gamepad_state((int)id, buttons, axes)) {
+            add_assoc_double(return_value, "left", (double)axes[VIO_GAMEPAD_AXIS_LEFT_TRIGGER]);
+            add_assoc_double(return_value, "right", (double)axes[VIO_GAMEPAD_AXIS_RIGHT_TRIGGER]);
             return;
         }
     }
-#endif
     add_assoc_double(return_value, "left", 0.0);
     add_assoc_double(return_value, "right", 0.0);
 }
@@ -13084,12 +12984,8 @@ ZEND_FUNCTION(vio_unbind_render_target)
         unsigned int default_fbo = ctx->headless_fbo;
         int w = ctx->config.width;
         int h = ctx->config.height;
-        if (!default_fbo) {
-#ifdef HAVE_GLFW
-            if (ctx->window) {
-                glfwGetFramebufferSize(ctx->window, &w, &h);
-            }
-#endif
+        if (!default_fbo && ctx->window) {
+            vio_plat()->get_framebuffer_size(ctx->window, &w, &h);
         }
         ctx->backend->unbind_render_target(default_fbo, w, h);
     }
@@ -13104,11 +13000,9 @@ ZEND_FUNCTION(vio_unbind_render_target)
 
         int w = ctx->config.width;
         int h = ctx->config.height;
-#ifdef HAVE_GLFW
         if (ctx->window) {
-            glfwGetFramebufferSize(ctx->window, &w, &h);
+            vio_plat()->get_framebuffer_size(ctx->window, &w, &h);
         }
-#endif
         ctx->backend->unbind_render_target(0, w, h);
     }
 
@@ -13833,10 +13727,9 @@ ZEND_FUNCTION(vio_set_window_size)
         return;
     }
 
-#ifdef HAVE_GLFW
     if (ctx->window && !ctx->config.headless) {
         /* The size is LOGICAL, matching what vio_window_size reports and what
-         * the create config takes. glfwSetWindowSize speaks screen coordinates,
+         * the create config takes. The platform speaks screen coordinates,
          * which stop being the same thing once the monitor scales:
          *
          *   logical = framebuffer / contentScale          (vio_window_size)
@@ -13854,8 +13747,8 @@ ZEND_FUNCTION(vio_set_window_size)
          * one, and looks to the player like it jumped back an entry. */
         int fb_w = 0, fb_h = 0, scr_w = 0, scr_h = 0;
         float sx = 1.0f, sy = 1.0f;
-        glfwGetFramebufferSize(ctx->window, &fb_w, &fb_h);
-        glfwGetWindowSize(ctx->window, &scr_w, &scr_h);
+        vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
+        vio_plat()->get_window_size(ctx->window, &scr_w, &scr_h);
         vio_window_content_scale(ctx->window, &sx, &sy);
         if (sx <= 0.0f) sx = 1.0f;
         if (sy <= 0.0f) sy = 1.0f;
@@ -13863,14 +13756,13 @@ ZEND_FUNCTION(vio_set_window_size)
         float rx = (fb_w > 0 && scr_w > 0) ? (float)scr_w / (float)fb_w : 1.0f;
         float ry = (fb_h > 0 && scr_h > 0) ? (float)scr_h / (float)fb_h : 1.0f;
 
-        glfwSetWindowSize(ctx->window,
-                          (int)((float)width  * sx * rx + 0.5f),
-                          (int)((float)height * sy * ry + 0.5f));
+        vio_plat()->set_window_size(ctx->window,
+                                    (int)((float)width  * sx * rx + 0.5f),
+                                    (int)((float)height * sy * ry + 0.5f));
     } else if (ctx->window) {
         /* Headless targets are 1:1 (see vio_window_size), so no conversion. */
-        glfwSetWindowSize(ctx->window, (int)width, (int)height);
+        vio_plat()->set_window_size(ctx->window, (int)width, (int)height);
     }
-#endif
 
     /* Store the logical size: vio_window_size falls back to it when there is no
      * window, so it has to stay in the same space. */
@@ -14264,6 +14156,7 @@ PHP_MINFO_FUNCTION(vio)
 #else
     php_info_print_table_row(2, "GLFW", "not available");
 #endif
+    php_info_print_table_row(2, "Platform", vio_plat()->name);
 #ifdef HAVE_GLSLANG
     php_info_print_table_row(2, "glslang (GLSL->SPIR-V)", "available");
 #else

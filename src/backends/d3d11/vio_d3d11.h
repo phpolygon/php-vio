@@ -291,7 +291,7 @@ typedef struct _vio_d3d11_state {
     double       last_gpu_ms;
 
     /* Window reference */
-    void *glfw_window;
+    void *platform_window;
 
     /* Adapter of the device, for vio_gpu_info(): UTF-8 description (WARP reports
      * "Microsoft Basic Render Driver") and DedicatedVideoMemory. */
@@ -316,7 +316,7 @@ extern vio_d3d11_state vio_d3d11;
 void vio_backend_d3d11_register(void);
 
 /* Called after GLFW window creation to set up D3D11 */
-int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg);
+int vio_d3d11_setup_context(void *platform_window, vio_config *cfg);
 
 /* Re-apply a render-target bind that vio_bind_render_target deferred because
  * it was called before vio_begin() (d3d11_begin_frame resets the backbuffer
