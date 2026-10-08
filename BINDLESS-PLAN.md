@@ -21,6 +21,11 @@ GLSL-Vertrag (fest, alle Backends):
 #extension GL_EXT_nonuniform_qualifier : require
 layout(set = 1, binding = 0) uniform texture2D vio_textures[];
 layout(set = 1, binding = 1) uniform sampler   vio_sampler;     // linear, repeat
+layout(set = 1, binding = 2) uniform sampler   vio_sampler_nearest;         // 4b: nearest, repeat
+layout(set = 1, binding = 3) uniform sampler   vio_sampler_clamp;           // 4b: linear, clamp
+layout(set = 1, binding = 4) uniform sampler   vio_sampler_nearest_clamp;   // 4b: nearest, clamp
+layout(set = 1, binding = 5) uniform textureCube    vio_cubes[];            // 4b: VioCubemap-Slots
+layout(set = 1, binding = 6) uniform texture2DArray vio_texture_arrays[];   // 4b: Slots von Array-Texturen
 ... texture(sampler2D(vio_textures[nonuniformEXT(i)], vio_sampler), uv)
 ```
 
@@ -40,7 +45,24 @@ Texturen + Sampler, weil SPIRV-Cross-MSL kombinierte `sampler2D[]` mit Laufzeitg
 Test 161: 64 einfarbige Texturen, ein Quad je Textur, Index pro Instanz → nicht-uniformer Index im
 Fragment-Shader; dazu der Vertrag (Slot stabil, Referenz hält die Textur, ohne Flag abgelehnt).
 
-## Phase 4b (offen)
+## Phase 4b
 
-Freigabe von Slots (`vio_texture_release_index`), Samplerwahl je Eintrag, Arrays/Cubes, Compute-Stages,
+- ✅ Freigabe von Slots (`vio_texture_release_index`, Test 176): der Slot bleibt `VIO_BINDLESS_RETIRE_FRAMES` (4)
+  `vio_begin` lang reserviert, dann schreibt das Backend einen leeren Eintrag (D3D12 Null-SRV, Vulkan 1×1-Dummy,
+  Metal Null-Resource-ID) und der Slot wird neu vergeben.
+- ✅ Samplerwahl (Test 177): Set 1 Binding 2–4 sind feste Varianten (nearest / clamp / nearest + clamp); der
+  Shader wählt je Zugriff. D3D12 statische Sampler `s1`–`s4, space1`, Vulkan unveränderliche Sampler im Set-1-
+  Layout, Metal `constexpr`-Sampler je Binding.
+- ✅ Cubemaps und Texture-Arrays (Test 178): `vio_texture_index` nimmt `VioCubemap` und Array-Texturen in denselben
+  Slot-Raum; der Shader liest einen Slot über das Array seiner Art. D3D12: dieselbe Tabelle zusätzlich als
+  `TextureCube[]` (`t0, space3`) und `Texture2DArray[]` (`t0, space4`) — drei unbegrenzte Bereiche mit Offset 0;
+  Vulkan: Bindings 5/6 im Set-1-Layout; Metal: die MSL-Übersetzung legt sie in Set 2/3, je ein Argument-Buffer
+  (`[[buffer(17)]]` / `[[buffer(18)]]`), weil unbegrenzte Arrays sich keinen Argument-Buffer teilen können.
+- ✅ Compute-Stages (Test 179, synchron und async im Frame): D3D12 spiegelt die Tabelle über eine CPU-Kopie
+  (`bindless_cpu_heap`) in einen Block hinter den Dispatch-Blöcken des Compute-Heaps, Kernels mit Set 1 bekommen
+  Root-Tabelle [4] und die vier statischen Sampler; Vulkan hängt das Set-1-Layout an das Compute-Pipeline-Layout
+  (Stage-Flags jetzt mit COMPUTE); Metal teilt den Bindless-Teil der MSL-Übersetzung (`metal_msl_bindless`) mit
+  den Grafik-Stages und bindet die Puffer am Compute-Encoder.
+
+Offen (Metal 4, nicht ohne neuere macOS-Runner prüfbar): Samplerwahl je Eintrag, Arrays/Cubes, Compute-Stages,
 Vertex-Stage-Zugriff auf Metal ohne `useResources`-Kosten (Residency Sets, Metal 4).

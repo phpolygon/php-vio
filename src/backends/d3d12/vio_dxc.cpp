@@ -113,6 +113,11 @@ extern "C" int vio_dxc_compile(const char *hlsl, const char *entry, const char *
     /* A library (lib_6_x, ray tracing) has exports instead of one entry point. */
     if (!profile || std::strncmp(profile, "lib_", 4) != 0) {
         args.push_back(L"-E"); args.push_back(wentry.c_str());
+    } else {
+        /* From lib_6_7 on DXC requires [raypayload] + read/write qualifiers on
+         * every payload struct; neither SPIRV-Cross nor GLSL ray payloads carry
+         * them, so keep the pre-6.7 payload rules. */
+        args.push_back(L"-disable-payload-qualifiers");
     }
     args.push_back(L"-T"); args.push_back(wprofile.c_str());
     if (debug) {

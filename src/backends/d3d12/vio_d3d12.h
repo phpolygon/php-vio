@@ -88,7 +88,7 @@
 #define VIO_D3D12_RP_VS_CBV       0
 #define VIO_D3D12_RP_PS_CBV       1
 #define VIO_D3D12_RP_PS_SRV       2
-#define VIO_D3D12_RP_VS_SRV       3   /* root SRV t0, vertex storage (Path B) */
+#define VIO_D3D12_RP_VS_STORAGE   3   /* root SRV t0, vertex storage (Path B) */
 #define VIO_D3D12_RP_PS_SAMPLER   4
 #define VIO_D3D12_RP_GS_CBV       5
 #define VIO_D3D12_RP_HS_CBV       6
@@ -100,9 +100,13 @@
 #define VIO_D3D12_RP_HS_SAMPLER   12
 #define VIO_D3D12_RP_DS_SAMPLER   13
 #define VIO_D3D12_RP_ACCEL        14  /* root SRV t0, space9: ray-query acceleration structure (all stages) */
-#define VIO_D3D12_RP_BINDLESS     15  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
-#define VIO_D3D12_RP_FEEDBACK     16  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
-#define VIO_D3D12_RP_COUNT        17
+#define VIO_D3D12_RP_DRAW_PARAMS  15  /* 2 root constants b13 (VERTEX): gl_BaseVertex / gl_BaseInstance below SM 6.8 */
+#define VIO_D3D12_RP_PS_UAV       16  /* [16..19] root UAVs u4..u7 (PIXEL): fragment storage buffers 0..3 (A15) */
+#define VIO_D3D12_RP_VS_SRV       20  /* SRV table t0.. (VERTEX): vertex textures (A28) */
+#define VIO_D3D12_RP_VS_SAMPLER   21  /* sampler table s0.. (VERTEX) */
+#define VIO_D3D12_RP_BINDLESS     22  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
+#define VIO_D3D12_RP_FEEDBACK     23  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
+#define VIO_D3D12_RP_COUNT        24
 
 /* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
  * bytecode (NULL when the vio_shader has no such stage). */
@@ -125,6 +129,7 @@ typedef struct _vio_d3d12_shader {
     int       is_mesh;
     ID3DBlob *as_blob;
     int       uses_bindless;         /* reads the bindless table (register space 1, BINDLESS-PLAN.md) */
+    int       uses_draw_params;      /* reads gl_BaseVertex / gl_BaseInstance from the b13 root constants */
     int       uses_feedback;         /* the pixel stage writes a FeedbackTexture2D (u0, space2) */
 } vio_d3d12_shader;
 
@@ -137,10 +142,13 @@ typedef struct _vio_d3d12_pipeline {
      * into a target with 2 / 4 / 8 samples needs its own variant. Built lazily
      * from pso_desc (SampleDesc.Count = 1 template) the first time the pipeline
      * is bound while such a target is bound; index = log2(samples). */
-    struct { DXGI_FORMAT fmt; UINT samples; ID3D12PipelineState *pso; } pso_variants[8];
+    /* ... and per mesh layout (vio_mesh_layout.key, 0 = dense; OPEN-ITEMS-PLAN A31). */
+    struct { DXGI_FORMAT fmt; UINT samples; uint32_t layout; ID3D12PipelineState *pso; } pso_variants[16];
     int                      pso_variant_count;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;
     D3D12_INPUT_ELEMENT_DESC *input_elements;  /* owned; referenced by pso_desc */
+    int                     *input_locations;  /* owned; vertex location of each element */
+    int                      input_count;
     char                   (*sem_names)[24];   /* owned; semantic names of matrix columns */
     UINT                     stencil_ref;      /* OMSetStencilRef */
     int                      has_gs, has_hs, has_ds;  /* replicate SRV / sampler tables */
@@ -153,6 +161,7 @@ typedef struct _vio_d3d12_pipeline {
     int                      is_mesh;
     ID3DBlob                *as_blob;
     int                      uses_bindless;    /* the shader reads the bindless table */
+    int                      uses_draw_params; /* the vertex stage reads the draw-parameter root constants */
     int                      uses_feedback;    /* the pixel stage writes sampler feedback */
 } vio_d3d12_pipeline;
 
@@ -179,10 +188,13 @@ typedef struct _vio_d3d12_buffer {
      * indirect draw must transition it (GAP-PHASE5 Block 8). Otherwise it rests in
      * COMMON / GENERIC_READ, which promote implicitly. */
     UINT64           uav_live_serial;
+    int              fs_dirty;          /* written by a draw since the last readback (A15) */
 } vio_d3d12_buffer;
 
 /* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */
 #define VIO_D3D12_COMPUTE_MAX_BINDINGS 8
+/* Dispatch descriptor blocks in the compute heap (a ring, one block per dispatch). */
+#define VIO_D3D12_COMPUTE_HEAP_BLOCKS 16
 
 /* One recorded storage-buffer binding on a compute pipeline. */
 typedef struct _vio_d3d12_compute_binding {
@@ -223,6 +235,7 @@ typedef struct _vio_d3d12_compute_pipeline {
     int                 srv_base_reg;
     int                 uav_base_reg;
     int                 uses_accel;   /* the kernel queries an acceleration structure: root SRV [3] t0, space9 */
+    int                 uses_bindless; /* reads the bindless table (spaces 1 / 3 / 4): root table [4] */
     /* Params constant block. An UPLOAD-heap buffer, persistently re-mapped by
      * compute_set_uniforms (256-byte aligned per the CB requirement). Bound to
      * the reflected cbv_register. */
@@ -340,15 +353,22 @@ typedef struct _vio_d3d12_state {
      * SRV heap are reserved for it (root parameter [14]). */
     int                        bindless;
     UINT                       bindless_base;
+    /* CPU-only mirror of the bindless table: the source every copy into a
+     * shader-visible heap reads (graphics block and the compute heap's block). */
+    ID3D12DescriptorHeap      *bindless_cpu_heap;
     int                        view_instancing; /* OPTIONS3.ViewInstancingTier (multiview, SV_ViewID needs SM 6.1) */
     int                        raytracing_tier; /* OPTIONS5.RaytracingTier (ray query needs 1.1 + SM 6.5) */
     /* Sampler feedback: OPTIONS7.SamplerFeedbackTier >= 0.9, SM 6.5, ID3D12Device8 and
      * the bindless root layout (root parameter [16] follows [15]). fb_bound is the
-     * texture whose map vio_sampler_feedback_bind() selected; fb_null_gpu a null
-     * feedback UAV for feedback shaders drawn without one (created on demand). */
+     * texture whose map vio_sampler_feedback_bind() selected; fb_null_gpu the
+     * feedback UAV of a private 8x8 texture / map pair (fb_null_tex / fb_null_map)
+     * for feedback shaders drawn without one - D3D12 has no null feedback UAV
+     * (created on demand). */
     int                        sampler_feedback;
     struct _vio_d3d12_texture *fb_bound;
     D3D12_GPU_DESCRIPTOR_HANDLE fb_null_gpu;
+    ID3D12Resource            *fb_null_tex;
+    ID3D12Resource            *fb_null_map;
     /* Variable rate shading (GAP-PHASE5 Block 12): D3D12_VARIABLE_SHADING_RATE_TIER
      * (0 = none), the additional-rates cap (2x4 / 4x2 / 4x4), the sticky rate
      * (vio_shading_rate) and the ID3D12GraphicsCommandList5 view of the frame list. */
@@ -385,6 +405,13 @@ typedef struct _vio_d3d12_state {
      * (stride 20) and Draw (stride 16) arguments, created on first use. */
     ID3D12CommandSignature    *cmdsig_indexed;
     ID3D12CommandSignature    *cmdsig_plain;
+    /* ... and with the draw-parameter root constants in front (strides 28 / 24),
+     * over records copied into a per-frame ring (OPEN-ITEMS-PLAN A11). */
+    ID3D12CommandSignature    *cmdsig_indexed_dp;
+    ID3D12CommandSignature    *cmdsig_plain_dp;
+    ID3D12Resource            *dp_buf[VIO_D3D12_MAX_FRAME_COUNT];
+    UINT64                     dp_cap[VIO_D3D12_MAX_FRAME_COUNT];
+    UINT64                     dp_used[VIO_D3D12_MAX_FRAME_COUNT];
     /* Counts begin_frame() calls (never 0 inside a frame): buffers remember the
      * serial of the frame whose list holds them in UNORDERED_ACCESS. */
     UINT64                     frame_serial;
@@ -396,6 +423,9 @@ typedef struct _vio_d3d12_state {
     ID3D12DescriptorHeap      *mipgen_heap;
     int                        mipgen_failed;
     UINT                       mipgen_block;   /* next descriptor block of the mipgen_heap ring */
+    ID3D12RootSignature       *dmip_rs;        /* depth mip reduction (A26) */
+    ID3D12PipelineState       *dmip_pso;
+    ID3D12PipelineState       *dmip_resolve_pso; /* depth_only MSAA resolve (A24) */
 
     /* Debug-layer InfoQueue, resolved ONCE at init and owned for the device's
      * lifetime (released in shutdown). NULL whenever the debug layer is inactive,
@@ -413,6 +443,9 @@ typedef struct _vio_d3d12_state {
      * vram_bytes = DedicatedVideoMemory; 0 if unknown (e.g. WARP/headless). */
     char                       gpu_name[256];
     uint64_t                   vram_bytes;
+    uint32_t                   vendor_id;        /* vio_backend_info (A4) */
+    char                       driver[32];
+    int                        software_adapter; /* WARP */
 
     /* Index of the most recently presented backbuffer. frame_index is
      * updated to the NEXT buffer right after Present(), so code paths
@@ -522,7 +555,9 @@ typedef struct _vio_d3d12_state {
     int                        upload_alloc_idx;
     ID3D12GraphicsCommandList *upload_list;
     UINT64                     upload_last_fence;
-    struct { ID3D12Resource *res; UINT64 fence; } *upload_retire;
+    /* Any COM object (staging buffers, PSOs freed after vio_end) released once
+     * the fence passes. */
+    struct { IUnknown *res; UINT64 fence; } *upload_retire;
     int                        upload_retire_count;
     int                        upload_retire_cap;
 
@@ -626,9 +661,18 @@ typedef struct _vio_d3d12_state {
     UINT64           ts_frequency;
     int              ts_pending[VIO_D3D12_MAX_FRAME_COUNT];
     double           last_gpu_ms;
+    /* Layout of the mesh being drawn (apply_mesh_layout); PSOs pick their
+     * input-layout variant from it. */
+    vio_mesh_layout  mesh_layout;
+    uint32_t         applied_layout_key;
+    /* Named marks (vio_gpu_timestamp) after the pair: VIO_GPU_TS_PER_FRAME
+     * queries per slot. */
+    vio_gpu_mark_names  ts_marks[VIO_D3D12_MAX_FRAME_COUNT];
+    vio_gpu_mark_result ts_result;
+    int                 ts_result_valid;
 
     /* Window reference */
-    void *glfw_window;
+    void *platform_window;
 } vio_d3d12_state;
 
 extern vio_d3d12_state vio_d3d12;
@@ -637,7 +681,7 @@ extern vio_d3d12_state vio_d3d12;
 void vio_backend_d3d12_register(void);
 
 /* Called after GLFW window creation to set up D3D12 */
-int vio_d3d12_setup_context(void *glfw_window, vio_config *cfg);
+int vio_d3d12_setup_context(void *platform_window, vio_config *cfg);
 
 /* Flush pending texture bindings into a contiguous SRV block (call before draw) */
 void vio_d3d12_flush_srv_table(void);

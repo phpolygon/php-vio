@@ -7,6 +7,7 @@
 #define VIO_BACKEND_H
 
 #include "vio_types.h"
+#include "vio_gpu_marks.h"
 
 #define VIO_BACKEND_API_VERSION 1
 #define VIO_MAX_BACKENDS 8
@@ -404,7 +405,9 @@ typedef struct _vio_backend {
      * (create_texture's handle, 2D) into slot 0..VIO_BINDLESS_MAX-1 of the
      * context's texture table that shaders read as Set 1 binding 0. The
      * frontend owns slot allocation and keeps the texture alive. 0 = ok. */
-    int   (*bindless_set)(int slot, void *backend_texture);
+    /* texture: the backend texture for VIO_BINDLESS_KIND_2D / _ARRAY, the
+     * vio_cubemap_object for _CUBE; NULL clears the slot (released, retired). */
+    int   (*bindless_set)(int slot, void *texture, int kind);
     /* Inline ray tracing (VIO_FEATURE_RAY_QUERY): build the bottom- and
      * top-level structures of `desc` (returns the backend handle or NULL),
      * free them (deferred while a frame may still use them), and bind one for
@@ -449,8 +452,97 @@ typedef struct _vio_backend {
     void  (*destroy_work_graph)(void *graph);
     void  (*work_graph_bind_buffer)(void *graph, void *buffer, int slot);
     void  (*dispatch_graph)(void *graph, const void *records, int count);
+
+    /* How a supported feature is reached when it is not the API's own stage or
+     * call (vio_feature_info): a short static description such as "compute
+     * kernels", or NULL when the feature is native or unsupported. NULL slot =>
+     * everything the backend reports is native. */
+    const char *(*feature_emulation)(vio_feature feature);
+
+    /* Named GPU timestamp in the open frame (vio_gpu_timestamp): 1 = recorded,
+     * 0 = no frame open, no timestamps or VIO_GPU_MARKS_MAX reached. gpu_marks
+     * returns the marks of the most recently completed frame (NULL = none yet).
+     * NULL slots => no named timestamps. */
+    int (*gpu_mark)(const char *name);
+    const vio_gpu_mark_result *(*gpu_marks)(void);
+
+    /* Called before every mesh draw (vio_draw, vio_draw_instanced,
+     * vio_submit_batch, vio_draw_indirect, vio_draw_instanced_from_buffer)
+     * with the mesh's layout: the backend reads each vertex input at the mesh's
+     * offset (input layout / PSO variant). NULL slot => the backend uses the
+     * mesh's own vertex description already (OpenGL VAOs). */
+    void (*apply_mesh_layout)(const vio_mesh_layout *layout);
+
+    /* 1 when VIO_FEATURE_MULTIVIEW is reached by instancing that vio_shader
+     * sets up in the GLSL (vio_glsl_multiview_instancing): views x instances
+     * per draw, per-instance data stepping every `views` instances, the view's
+     * layer from the vertex stage. NULL / 0 => native views (or SPIRV-Cross's
+     * own emulation on Metal). */
+    int (*multiview_via_instancing)(void);
+
+    /* 1 when geometry / tessellation stages cannot read the view themselves
+     * (SPIRV-Cross' HLSL backend takes SV_ViewID in VS and PS only): vio_shader
+     * then forwards it from the vertex stage (vio_glsl_multiview_forward). */
+    int (*multiview_view_from_vertex)(void);
+
+    /* vio_adapters() (A6): the adapters this backend can open, without a context
+     * (OpenGL: the live context's only). Fills up to `max` entries, preferred
+     * (discrete) first, and returns the count. */
+    int (*enumerate_adapters)(vio_adapter_info *out, int max);
+
+    /* Glyph atlas filled on demand (A33): upload an R8 sub-rectangle (w*h bytes,
+     * tightly packed, top-down) into font_obj's atlas at (x, y). NULL => the
+     * shaping path rasterizes every glyph up front, as before. */
+    int (*update_font_atlas)(void *font_obj, const unsigned char *r8, int x, int y, int w, int h);
+
+    /* vio_acceleration_structure_update (A14): new instances over the structure's
+     * existing bottom levels (vio_as_instance.geometry indexes them). refit = 1:
+     * same instance count and geometries, only transforms change - update the top
+     * level in place; 0: rebuild it. Outside a frame; synchronous. 0 = done. */
+    int (*update_acceleration_structure)(void *as, const vio_as_instance *instances, int count, int refit);
+
+    /* vio_bind_fragment_storage_buffer (VIO_FEATURE_FRAGMENT_STORAGE, A15): the
+     * storage buffer (create_buffer handle, NULL unbinds) for the fragment stage's
+     * writable std430 block at `binding` (0..VIO_MAX_FRAGMENT_STORAGE-1), for
+     * every following draw until changed. read_buffer of a buffer a draw wrote
+     * waits for those draws (mid-frame: the frame so far). 0 = done. */
+    int (*bind_fragment_storage)(void *backend_buffer, int binding);
+
+    /* Recorded draw sequences (vio_bundle, BUNDLE-PLAN.md, OPEN-ITEMS A38). A
+     * backend that records natively starts a recording for the pass open now
+     * (begin_bundle; NULL = no native recording, the records are replayed through
+     * the common draw path), during which the draw path records instead of
+     * drawing; end_bundle closes it (0 = usable). draw_bundle plays it inside a
+     * frame (0 = done, -1 = does not fit the open pass: record again);
+     * destroy_bundle frees it. bundle_method names the mechanism. */
+    void       *(*begin_bundle)(void);
+    int         (*end_bundle)(void *backend_bundle);
+    int         (*draw_bundle)(void *backend_bundle);
+    void        (*destroy_bundle)(void *backend_bundle);
+    const char *(*bundle_method)(void);
+
+    /* 1 when NDC +Y lands in row 0 of a target (D3D, Vulkan in vio, Metal), 0 on
+     * OpenGL (row 0 = NDC -Y). vio_upscale turns NDC-space jitter and motion
+     * into storage space with it. */
+    int         rt_origin_top;
+
+    /* vio_upscale through the platform's own scaler (UPSCALE-PLAN phase 3,
+     * MetalFX): upscale_method names it for a mode (NULL = portable passes);
+     * upscale_native scales the backend texture into attachment 0 of a render
+     * target inside the frame (0 = done, else the portable passes run). */
+    const char *(*upscale_method)(int mode);
+    int         (*upscale_native)(void *src_backend_texture, void *dst_render_target, int mode);
+
+    /* GPU video encoding without a CPU copy (VIDEO-ENCODE-PLAN phase 2):
+     * encode_device hands out the native device an FFmpeg hardware device can
+     * wrap (*api = VIO_ENCODE_API_*); encode_copy_frame copies the last finished
+     * frame (the one vio_read_pixels returns) into slice `slice` of a texture of
+     * that device, same size and format as the swapchain (0 = done). */
+    void       *(*encode_device)(int *api);
+    int         (*encode_copy_frame)(void *dst_texture, int slice, int width, int height);
 } vio_backend;
 
+#define VIO_MAX_FRAGMENT_STORAGE 4
 /*
  * Backend extensions call this in their MINIT to register themselves.
  * Returns 0 on success, -1 on failure (e.g., registry full, version mismatch).

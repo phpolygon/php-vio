@@ -1,6 +1,6 @@
 /*
  * php-vio - Resource management implementation
- * Stub for Phase 0 - will be expanded in later phases
+ * No module-wide resource state at the moment; MINIT / MSHUTDOWN keep the hooks.
  */
 
 #include "vio_resource.h"

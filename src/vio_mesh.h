@@ -25,6 +25,7 @@ typedef struct _vio_mesh_object {
     int          index_bytes;     /* 2 (uint16, every index < 65536) or 4 (uint32); 0 when unindexed */
     int          has_colors;      /* 1 if vertex data includes colors */
     int          stride;          /* bytes per vertex */
+    vio_mesh_layout layout;       /* per-location offsets for the typed-layout backends (key 0 = none) */
     const struct _vio_backend *backend;  /* Backend that owns vao/vbo/ebo / backend_vb / backend_ib */
     unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
     /* Ray tracing (VIO_FEATURE_RAY_QUERY): CPU copies of the positions

@@ -25,6 +25,11 @@ typedef struct _vio_render_target_object {
      * glBlitFramebuffer on unbind / readback. */
     unsigned int gl_msaa_fbo;
     unsigned int gl_msaa_color_rb;
+    unsigned int gl_msaa_color_rbs[4];   /* MRT: attachments 1..3 ([0] unused, see gl_msaa_color_rb) */
+    unsigned int gl_msaa_color_arr;      /* cube / array MSAA (A24): GL_TEXTURE_2D_MULTISAMPLE_ARRAY, a layer per face */
+    unsigned int gl_msaa_depth_arr;
+    int          gl_msaa_layer;          /* layer the MSAA FBO renders into (-1 = all) */
+    unsigned int gl_msaa_depth_tex;      /* depth_only MSAA (A24): GL_TEXTURE_2D_MULTISAMPLE depth, resolved by a shader */
     unsigned int gl_msaa_depth_rb;
     int          gl_msaa_dirty;
 
@@ -53,6 +58,12 @@ typedef struct _vio_render_target_object {
     /* MSAA (samples > 1): the multisampled colour texture rendered into;
      * d3d11_color_tex is then the single-sample RESOLVE texture the SRV reads. */
     void        *d3d11_msaa_color_tex;        /* ID3D11Texture2D* (multisampled) */
+    void        *d3d11_msaa_color_texs[4];    /* MRT: attachments 1..3 ([0] = d3d11_msaa_color_tex) */
+    void        *d3d11_msaa_face_rtvs;        /* cube / array MSAA (A24): RTV per layer of the MS array, + all layers */
+    void        *d3d11_msaa_face_dsvs;        /* ... and the DSVs of the MS depth array */
+    int          d3d11_msaa_layer;            /* layer the MS views render into (-1 = all) */
+    void        *d3d11_msaa_dsv;              /* depth_only MSAA (A24): DSV / SRV of the MS depth (d3d11_msaa_depth_tex) */
+    void        *d3d11_msaa_depth_srv;
     void        *d3d11_msaa_depth_tex;        /* ID3D11Texture2D* (multisampled) */
     int          d3d11_msaa_dirty;            /* 1 => resolve needed before sampling / readback */
 
@@ -67,6 +78,14 @@ typedef struct _vio_render_target_object {
      * the bound target's count (vio_d3d12_pipeline.pso_ms). */
     void        *d3d12_msaa_color_resources[VIO_MAX_COLOR_ATTACHMENTS]; /* ID3D12Resource* */
     int          d3d12_msaa_dirty;      /* 1 => drawn into since the last resolve */
+    /* Cube / array MSAA (A24): d3d12_msaa_color_resources[0] is a multisampled
+     * array with a depth array beside it, RTVs / DSVs per layer + all layers. */
+    int          d3d12_msaa_layered;
+    int          d3d12_msaa_layer;      /* layer drawn into (-1 = all) */
+    void        *d3d12_msaa_depth_resource;
+    void        *d3d12_msaa_rtv_heap;
+    void        *d3d12_msaa_dsv_heap;
+    int          d3d12_msaa_depth_only;  /* depth_only MSAA (A24): d3d12_msaa_depth_resource + its DSV heap */
 
     /* Metal (opaque pointers — actual types are id<MTLTexture> CFBridgeRetained).
      * Stored as opaque void * so the public header doesn't pull in Metal
@@ -120,6 +139,7 @@ typedef struct _vio_render_target_object {
     int          layers;              /* > 1 => 2D array target with this many layers ('layers' => N);
                                          colour and depth both carry every layer. 0/1 = plain 2D. */
     int          mip_levels;          /* 1, or floor(log2(size)) + 1 when created with 'mipmaps' */
+    int          depth_reduction;     /* depth_only + mipmaps: VIO_DEPTH_REDUCE_MAX (0) / _MIN (1) */
     int          bound_face;          /* cube / array: face or layer currently bound (-1 = none) */
     int          bound_level;         /* cube: mip level currently bound */
     int          samples;             /* requested by vio_render_target(); backends clamp to what
@@ -136,6 +156,21 @@ typedef struct _vio_render_target_object {
     /* Cached vio_d3d12_texture wrapper, same lifecycle as the D3D11 pair. */
     void        *d3d12_color_backend_texture; /* vio_d3d12_texture* */
     void        *d3d12_depth_backend_texture; /* vio_d3d12_texture* */
+
+    /* 'rate_map' (VIO_FEATURE_RASTER_RATE_MAP, A16): quality 0..1 per zone and
+     * axis; the backend renders into physical_width x physical_height and sets
+     * rate_active. Metal: the rate map, its physical attachments and parameter
+     * buffer, and rrm_dirty while the physical colour is newer than the logical. */
+    float        rate_x[VIO_RATE_MAP_MAX];
+    float        rate_y[VIO_RATE_MAP_MAX];
+    int          rate_nx, rate_ny;
+    int          rate_active;
+    int          physical_width, physical_height;
+    void        *metal_rrm;
+    void        *metal_rrm_color;
+    void        *metal_rrm_depth;
+    void        *metal_rrm_params;
+    int          rrm_dirty;
 
     const struct _vio_backend *backend;  /* Backend that owns the resources above */
     unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
