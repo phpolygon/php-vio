@@ -75,6 +75,7 @@ static void vio_context_free_object(zend_object *obj)
 {
     vio_context_object *ctx = vio_context_from_obj(obj);
     vio_context_release_fragment_storage(ctx);
+    vio_upscale_release(ctx);
     /* The table's textures free their GPU objects through the backend: before it shuts down. */
     vio_context_bindless_clear(ctx);
     if (ctx->candidates) {

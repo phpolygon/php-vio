@@ -5332,6 +5332,7 @@ static const vio_backend vulkan_backend = {
     .draw_bundle       = vio_vk3d_draw_bundle,
     .destroy_bundle    = vio_vk3d_destroy_bundle,
     .bundle_method     = vulkan_bundle_method,
+    .rt_origin_top     = 1,
     .shading_rate_tile_size = vulkan_shading_rate_tile_size,
     .swapchain_info    = vulkan_swapchain_info,
     .bindless_set      = vulkan_bindless_set,

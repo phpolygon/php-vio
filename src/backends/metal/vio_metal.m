@@ -26,6 +26,7 @@
 #include "vio_metal.h"
 
 static void metal_marks_reset(void);
+static void metal_upscale_release(void);
 #include "../../shaders/shaders_2d.h"
 #include "../../vio_render_target.h"
 #include "../../vio_texfmt.h"
@@ -1344,6 +1345,7 @@ static int metal_init(vio_config *cfg)
 
 static void metal_shutdown(void)
 {
+    metal_upscale_release();
     vio_metal_shutdown_context();
 }
 
@@ -6824,6 +6826,108 @@ static int metal_update_font_atlas(void *font_obj, const unsigned char *r8, int 
 
 /* ── Backend registration ────────────────────────────────────────── */
 
+/* ── MetalFX spatial upscaling (UPSCALE-PLAN phase 3) ─────────────── */
+
+#if defined(HAVE_METALFX) && __has_include(<MetalFX/MetalFX.h>)
+#import <MetalFX/MetalFX.h>
+#define VIO_METAL_HAS_FX 1
+static id             metal_fx_scaler;   /* id<MTLFXSpatialScaler> for metal_fx_key */
+static NSUInteger     metal_fx_key[6];   /* in w, h, format, out w, h, format */
+static id<MTLTexture> metal_fx_out;      /* when the target lacks the scaler's output usage */
+#endif
+
+static void metal_upscale_release(void)
+{
+#ifdef VIO_METAL_HAS_FX
+    metal_fx_scaler = nil;
+    metal_fx_out = nil;
+    memset(metal_fx_key, 0, sizeof(metal_fx_key));
+#endif
+}
+
+static const char *metal_upscale_method(int mode)
+{
+#ifdef VIO_METAL_HAS_FX
+    if (mode == VIO_UPSCALE_SPATIAL && vio_mtl.device) {
+        if (@available(macOS 13.0, iOS 16.0, *)) {
+            if ([MTLFXSpatialScalerDescriptor supportsDevice:vio_mtl.device]) return "metalfx";
+        }
+    }
+#endif
+    (void)mode;
+    return NULL;
+}
+
+/* The scaler runs between render passes: the open encoder ends, MetalFX (and a
+ * copy when the target texture lacks the scaler's output usage) is encoded
+ * into the frame's command buffer, and the bound target opens again with Load. */
+static int metal_upscale_native(void *src_texture, void *dst_rt_ptr, int mode)
+{
+#ifdef VIO_METAL_HAS_FX
+    if (!metal_upscale_method(mode) || !src_texture || !dst_rt_ptr || !vio_mtl.current_cmd_buf) return -1;
+    if (@available(macOS 13.0, iOS 16.0, *)) {
+        @autoreleasepool {
+            vio_render_target_object *rt = (vio_render_target_object *)dst_rt_ptr;
+            vio_metal_texture *st = (vio_metal_texture *)src_texture;
+            if (rt->backend_type != VIO_RT_BACKEND_METAL || !rt->metal_color_texture || rt->metal_msaa_color_texture
+                || rt->is_cube || rt->layers > 1 || !st->tex) return -1;
+            id<MTLTexture> in  = (__bridge id<MTLTexture>)st->tex;
+            id<MTLTexture> dst = (__bridge id<MTLTexture>)rt->metal_color_texture;
+            NSUInteger key[6] = { in.width, in.height, (NSUInteger)in.pixelFormat, dst.width, dst.height, (NSUInteger)dst.pixelFormat };
+            if (!metal_fx_scaler || memcmp(key, metal_fx_key, sizeof(key)) != 0) {
+                MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
+                d.inputWidth          = in.width;
+                d.inputHeight         = in.height;
+                d.outputWidth         = dst.width;
+                d.outputHeight        = dst.height;
+                d.colorTextureFormat  = in.pixelFormat;
+                d.outputTextureFormat = dst.pixelFormat;
+                d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+                id<MTLFXSpatialScaler> made = [d newSpatialScalerWithDevice:vio_mtl.device];
+                if (!made) return -1;
+                metal_fx_scaler = made;
+                metal_fx_out = nil;
+                memcpy(metal_fx_key, key, sizeof(key));
+            }
+            id<MTLFXSpatialScaler> s = (id<MTLFXSpatialScaler>)metal_fx_scaler;
+            if ((in.usage & s.colorTextureUsage) != s.colorTextureUsage) return -1;
+            id<MTLTexture> out = dst;
+            if ((dst.usage & s.outputTextureUsage) != s.outputTextureUsage || dst.storageMode != MTLStorageModePrivate) {
+                if (!metal_fx_out) {
+                    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat
+                                                                                                  width:dst.width
+                                                                                                 height:dst.height
+                                                                                              mipmapped:NO];
+                    td.usage = s.outputTextureUsage;
+                    td.storageMode = MTLStorageModePrivate;
+                    metal_fx_out = [vio_mtl.device newTextureWithDescriptor:td];
+                    if (!metal_fx_out) return -1;
+                }
+                out = metal_fx_out;
+            }
+            if (vio_mtl.current_encoder) {
+                [vio_mtl.current_encoder endEncoding];
+                vio_mtl.current_encoder = nil;
+            }
+            s.colorTexture       = in;
+            s.outputTexture      = out;
+            s.inputContentWidth  = in.width;
+            s.inputContentHeight = in.height;
+            [s encodeToCommandBuffer:vio_mtl.current_cmd_buf];
+            if (out != dst) {
+                id<MTLBlitCommandEncoder> blit = [vio_mtl.current_cmd_buf blitCommandEncoder];
+                [blit copyFromTexture:out toTexture:dst];
+                [blit endEncoding];
+            }
+            metal_open_encoder(/*load_clear=*/0);
+            return 0;
+        }
+    }
+#endif
+    (void)src_texture; (void)dst_rt_ptr; (void)mode;
+    return -1;
+}
+
 static const vio_backend metal_backend = {
     .name              = "metal",
     .api_version       = VIO_BACKEND_API_VERSION,
@@ -6909,6 +7013,9 @@ static const vio_backend metal_backend = {
     .compute_bind_image       = metal_compute_bind_image,
     .compute_wait             = metal_compute_wait,
     .read_buffer              = metal_read_buffer,
+    .rt_origin_top            = 1,
+    .upscale_method           = metal_upscale_method,
+    .upscale_native           = metal_upscale_native,
 };
 
 void vio_backend_metal_register(void)

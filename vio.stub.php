@@ -1169,6 +1169,41 @@ function vio_draw_bundle(VioContext $context, VioBundle $bundle): bool {}
  * 'native' becomes true after the first vio_draw_bundle on a backend that records natively.
  */
 function vio_bundle_info(VioBundle $bundle): array {}
+
+/**
+ * Upscale $source (a render target's attachment 0 or a texture) to $target (a
+ * render target, or null for the swapchain) inside a frame (OPEN-ITEMS A21,
+ * UPSCALE-PLAN.md). Portable fragment passes on every backend with a 3D pipeline.
+ *
+ * Options:
+ *   'mode'      => VIO_UPSCALE_SPATIAL (default: edge-adaptive Lanczos-2) |
+ *                  VIO_UPSCALE_TEMPORAL (jittered frames accumulated into a history
+ *                  kept per context; output alpha is 1)
+ *   'sharpness' => 0..1 (default 0.25): contrast-adaptive sharpening, 0 = off
+ *   'jitter'    => [x, y]: temporal - the sub-pixel offset this frame's projection
+ *                  was shifted by, in source pixels (NDC directions, y up), e.g.
+ *                  vio_upscale_jitter($frame)
+ *   'motion'    => VioRenderTarget|VioTexture at source size: temporal - per pixel
+ *                  the UV now minus the UV in the previous frame (y up, = half the
+ *                  NDC delta) in .rg
+ *   'reset'     => true: temporal - drop the history (camera cut)
+ *   'native'    => false: skip the platform scaler (MetalFX on Metal, spatial into a
+ *                  render target; vio_upscale_info() names it) and run the portable passes
+ *
+ * The target stays bound afterwards (the swapchain for null); the bound pipeline
+ * is undefined. Returns false outside a frame.
+ */
+function vio_upscale(VioContext $context, VioRenderTarget|VioTexture $source, ?VioRenderTarget $target, ?array $options = []): bool {}
+
+/**
+ * Sub-pixel jitter for frame $frame of a $phases-long cycle: [x, y] in source
+ * pixels (-0.5..0.5), Halton(2, 3). Offset the projection by it (clip.xy +=
+ * 2 * jitter / sourceSize * clip.w) and pass it as vio_upscale's 'jitter'.
+ */
+function vio_upscale_jitter(int $frame, int $phases = 8): array {}
+
+/** ['spatial' => 'portable' | 'metalfx', 'temporal' => 'portable' | 'metalfx'] */
+function vio_upscale_info(VioContext $context): array {}
 /**
  * Get the name of the backend in use.
  */

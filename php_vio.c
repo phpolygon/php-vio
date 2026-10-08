@@ -955,6 +955,7 @@ ZEND_FUNCTION(vio_destroy)
     vio_pending_textures_clear(ctx);
     vio_context_bindless_clear(ctx);
     vio_context_release_fragment_storage(ctx);
+    vio_upscale_release(ctx);
 
     /* A replay holds process-global virtual gamepads and hides the physical
      * ones; a destroyed context must give them back even while PHP still holds
@@ -6694,6 +6695,400 @@ ZEND_FUNCTION(vio_bundle_info)
                      (b->backend_bundle && be && be->bundle_method) ? (char *)be->bundle_method() : "replay");
 }
 
+/* ── Upscaling (UPSCALE-PLAN, OPEN-ITEMS A21) ─────────────────────── */
+
+#include "src/shaders/upscale_shaders.h"
+
+/* Fragment passes over the public draw API: shaders, pipelines and targets are
+ * ordinary vio objects, created once per context through the PHP functions
+ * (every backend detail stays where vio_shader / vio_render_target put it). */
+enum { VIO_UP_SPATIAL, VIO_UP_SHARPEN, VIO_UP_TEMPORAL, VIO_UP_COPY, VIO_UP_PASSES };
+
+typedef struct _vio_upscale_state {
+    zval mesh;
+    zval pipe[VIO_UP_PASSES];
+    zval mid;                    /* spatial -> sharpen, target size, RGBA16F */
+    int  mid_w, mid_h;
+    zval hist[2];                /* temporal history ping-pong, target size, RGBA16F */
+    zval hist_tex[2];
+    int  hist_w, hist_h, hist_cur, hist_valid;
+    zval none;                   /* 1x1 texture for an absent motion input */
+} vio_upscale_state;
+
+static int vio_up_call(const char *fn, zval *ret, uint32_t argc, zval *argv)
+{
+    zval fname;
+    ZVAL_STRING(&fname, fn);
+    ZVAL_UNDEF(ret);
+    int ok = call_user_function(NULL, NULL, &fname, ret, argc, argv) == SUCCESS && !EG(exception)
+             && Z_TYPE_P(ret) != IS_FALSE && Z_TYPE_P(ret) != IS_NULL;
+    zval_ptr_dtor(&fname);
+    if (!ok) { zval_ptr_dtor(ret); ZVAL_UNDEF(ret); }
+    return ok ? 0 : -1;
+}
+
+/* A call whose return value does not matter (binds, viewport). */
+static int vio_up_do(const char *fn, uint32_t argc, zval *argv)
+{
+    zval fname, ret;
+    ZVAL_STRING(&fname, fn);
+    ZVAL_UNDEF(&ret);
+    int ok = call_user_function(NULL, NULL, &fname, &ret, argc, argv) == SUCCESS && !EG(exception);
+    zval_ptr_dtor(&fname);
+    zval_ptr_dtor(&ret);
+    return ok ? 0 : -1;
+}
+
+void vio_upscale_release(vio_context_object *ctx)
+{
+    vio_upscale_state *u = (vio_upscale_state *)ctx->upscale;
+    if (!u) return;
+    ctx->upscale = NULL;
+    zval_ptr_dtor(&u->mesh);
+    for (int i = 0; i < VIO_UP_PASSES; i++) zval_ptr_dtor(&u->pipe[i]);
+    zval_ptr_dtor(&u->mid);
+    for (int i = 0; i < 2; i++) { zval_ptr_dtor(&u->hist_tex[i]); zval_ptr_dtor(&u->hist[i]); }
+    zval_ptr_dtor(&u->none);
+    efree(u);
+}
+
+static vio_upscale_state *vio_upscale_state_for(vio_context_object *ctx, zval *ctx_zval)
+{
+    if (ctx->upscale) return (vio_upscale_state *)ctx->upscale;
+    vio_upscale_state *u = ecalloc(1, sizeof(vio_upscale_state));
+    ctx->upscale = u;
+    zval args[2], opts, arr;
+
+    array_init(&opts);
+    array_init(&arr);
+    add_next_index_double(&arr, -1.0); add_next_index_double(&arr, -1.0);
+    add_next_index_double(&arr,  3.0); add_next_index_double(&arr, -1.0);
+    add_next_index_double(&arr, -1.0); add_next_index_double(&arr,  3.0);
+    add_assoc_zval(&opts, "vertices", &arr);
+    array_init(&arr);
+    add_next_index_long(&arr, VIO_FLOAT2);
+    add_assoc_zval(&opts, "layout", &arr);
+    ZVAL_COPY_VALUE(&args[0], ctx_zval);
+    ZVAL_COPY_VALUE(&args[1], &opts);
+    int fail = vio_up_call("vio_mesh", &u->mesh, 2, args);
+    zval_ptr_dtor(&opts);
+
+    const char *fs[VIO_UP_PASSES] = { vio_upscale_spatial_fs, vio_upscale_sharpen_fs, vio_upscale_temporal_fs, vio_upscale_copy_fs };
+    for (int i = 0; i < VIO_UP_PASSES && !fail; i++) {
+        zval shader;
+        array_init(&opts);
+        add_assoc_string(&opts, "vertex", (char *)vio_upscale_vs);
+        add_assoc_string(&opts, "fragment", (char *)fs[i]);
+        ZVAL_COPY_VALUE(&args[1], &opts);
+        fail = vio_up_call("vio_shader", &shader, 2, args);
+        zval_ptr_dtor(&opts);
+        if (fail) break;
+        array_init(&opts);
+        add_assoc_zval(&opts, "shader", &shader);   /* the pipeline array takes the reference */
+        add_assoc_bool(&opts, "depth_test", 0);
+        add_assoc_bool(&opts, "depth_write", 0);
+        add_assoc_long(&opts, "cull_mode", VIO_CULL_NONE);
+        add_assoc_long(&opts, "blend", VIO_BLEND_NONE);   /* the history alpha is a weight, not coverage */
+        ZVAL_COPY_VALUE(&args[1], &opts);
+        fail = vio_up_call("vio_pipeline", &u->pipe[i], 2, args);
+        zval_ptr_dtor(&opts);
+    }
+    if (!fail) {
+        static const unsigned char black[4] = { 0, 0, 0, 0 };
+        array_init(&opts);
+        add_assoc_stringl(&opts, "data", (char *)black, 4);
+        add_assoc_long(&opts, "width", 1);
+        add_assoc_long(&opts, "height", 1);
+        ZVAL_COPY_VALUE(&args[1], &opts);
+        fail = vio_up_call("vio_texture", &u->none, 2, args);
+        zval_ptr_dtor(&opts);
+    }
+    if (fail) {
+        vio_upscale_release(ctx);
+        return NULL;
+    }
+    return u;
+}
+
+/* A target-sized RGBA16F render target (and its texture); kept while the size holds. */
+static int vio_up_target_rt(zval *ctx_zval, zval *rt, zval *tex, int *cw, int *ch, int w, int h)
+{
+    if (Z_TYPE_P(rt) == IS_OBJECT && *cw == w && *ch == h) return 0;
+    zval_ptr_dtor(rt); ZVAL_UNDEF(rt);
+    if (tex) { zval_ptr_dtor(tex); ZVAL_UNDEF(tex); }
+    zval args[2], opts;
+    array_init(&opts);
+    add_assoc_long(&opts, "width", w);
+    add_assoc_long(&opts, "height", h);
+    add_assoc_bool(&opts, "hdr", 1);
+    ZVAL_COPY_VALUE(&args[0], ctx_zval);
+    ZVAL_COPY_VALUE(&args[1], &opts);
+    int fail = vio_up_call("vio_render_target", rt, 2, args);
+    zval_ptr_dtor(&opts);
+    if (fail) return -1;
+    if (tex && vio_up_call("vio_render_target_texture", tex, 1, rt) != 0) return -1;
+    *cw = w; *ch = h;
+    return 0;
+}
+
+/* Bind `rt` (NULL: the swapchain) and a full viewport. */
+static int vio_up_bind(zval *ctx_zval, zval *rt, int w, int h)
+{
+    zval args[5];
+    ZVAL_COPY_VALUE(&args[0], ctx_zval);
+    if (rt) {
+        ZVAL_COPY_VALUE(&args[1], rt);
+        if (vio_up_do("vio_bind_render_target", 2, args) != 0) return -1;
+    } else if (vio_up_do("vio_unbind_render_target", 1, args) != 0) {
+        return -1;
+    }
+    ZVAL_LONG(&args[1], 0); ZVAL_LONG(&args[2], 0); ZVAL_LONG(&args[3], w); ZVAL_LONG(&args[4], h);
+    return vio_up_do("vio_viewport", 5, args);
+}
+
+static void vio_up_vec4(vio_context_object *ctx, const char *name, double a, double b, double c, double d)
+{
+    zval v;
+    array_init(&v);
+    add_next_index_double(&v, a); add_next_index_double(&v, b);
+    add_next_index_double(&v, c); add_next_index_double(&v, d);
+    vio_apply_uniform(ctx, name, &v);
+    zval_ptr_dtor(&v);
+}
+
+static void vio_up_sampler(vio_context_object *ctx, const char *name, zval *tex, int unit)
+{
+    zval v;
+    vio_bind_texture_internal(ctx, Z_VIO_TEXTURE_P(tex), unit);
+    ZVAL_LONG(&v, unit);
+    vio_apply_uniform(ctx, name, &v);
+}
+
+static void vio_up_pass(vio_context_object *ctx, vio_upscale_state *u, int pass)
+{
+    vio_bind_pipeline_core(ctx, Z_VIO_PIPELINE_P(&u->pipe[pass]));
+}
+
+ZEND_FUNCTION(vio_upscale)
+{
+    zval *ctx_zval, *src_zval, *dst_zval = NULL;
+    HashTable *opts = NULL;
+
+    ZEND_PARSE_PARAMETERS_START(3, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(src_zval)
+        Z_PARAM_OBJECT_OF_CLASS_OR_NULL(dst_zval, vio_render_target_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT_OR_NULL(opts)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    int src_is_rt = instanceof_function(Z_OBJCE_P(src_zval), vio_render_target_ce);
+    if (!src_is_rt && !instanceof_function(Z_OBJCE_P(src_zval), vio_texture_ce)) {
+        zend_argument_type_error(2, "must be of type VioRenderTarget|VioTexture, %s given", zend_zval_value_name(src_zval));
+        RETURN_THROWS();
+    }
+    zend_long mode = VIO_UPSCALE_SPATIAL;
+    double sharp = 0.25, jx = 0.0, jy = 0.0;
+    zval *motion = NULL;
+    int reset = 0, native = 1;
+    if (opts) {
+        zval *z;
+        if ((z = zend_hash_str_find(opts, "mode", sizeof("mode") - 1))) mode = zval_get_long(z);
+        if ((z = zend_hash_str_find(opts, "sharpness", sizeof("sharpness") - 1))) sharp = zval_get_double(z);
+        if ((z = zend_hash_str_find(opts, "reset", sizeof("reset") - 1))) reset = zend_is_true(z);
+        if ((z = zend_hash_str_find(opts, "native", sizeof("native") - 1))) native = zend_is_true(z);
+        if ((z = zend_hash_str_find(opts, "jitter", sizeof("jitter") - 1))) {
+            zval *x, *y;
+            if (Z_TYPE_P(z) != IS_ARRAY || !(x = zend_hash_index_find(Z_ARRVAL_P(z), 0)) || !(y = zend_hash_index_find(Z_ARRVAL_P(z), 1))) {
+                zend_argument_value_error(4, "'jitter' must be [x, y] in source pixels");
+                RETURN_THROWS();
+            }
+            jx = zval_get_double(x);
+            jy = zval_get_double(y);
+        }
+        if ((z = zend_hash_str_find(opts, "motion", sizeof("motion") - 1)) && Z_TYPE_P(z) != IS_NULL) {
+            if (Z_TYPE_P(z) != IS_OBJECT || (!instanceof_function(Z_OBJCE_P(z), vio_render_target_ce)
+                                             && !instanceof_function(Z_OBJCE_P(z), vio_texture_ce))) {
+                zend_argument_value_error(4, "'motion' must be a VioRenderTarget or VioTexture");
+                RETURN_THROWS();
+            }
+            motion = z;
+        }
+    }
+    if (mode != VIO_UPSCALE_SPATIAL && mode != VIO_UPSCALE_TEMPORAL) {
+        zend_argument_value_error(4, "'mode' must be VIO_UPSCALE_SPATIAL or VIO_UPSCALE_TEMPORAL");
+        RETURN_THROWS();
+    }
+    if (sharp < 0.0 || sharp > 1.0) {
+        zend_argument_value_error(4, "'sharpness' must be 0..1");
+        RETURN_THROWS();
+    }
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_upscale between vio_begin and vio_end");
+        RETURN_FALSE;
+    }
+    if (!ctx->backend->supports_feature || !ctx->backend->supports_feature(VIO_FEATURE_3D_PIPELINE)
+        || !ctx->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_HDR)) {
+        php_error_docref(NULL, E_WARNING, "vio_upscale: backend '%s' has no 3D pipeline with HDR render targets", ctx->backend->name);
+        RETURN_FALSE;
+    }
+
+    /* source texture and sizes */
+    zval src_tex, motion_tex;
+    ZVAL_UNDEF(&src_tex);
+    ZVAL_UNDEF(&motion_tex);
+    int sw, sh, dw, dh;
+    if (src_is_rt) {
+        vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(src_zval);
+        sw = rt->width; sh = rt->height;
+        if (vio_up_call("vio_render_target_texture", &src_tex, 1, src_zval) != 0) RETURN_FALSE;
+    } else {
+        vio_texture_object *t = Z_VIO_TEXTURE_P(src_zval);
+        sw = t->width; sh = t->height;
+        ZVAL_COPY(&src_tex, src_zval);
+    }
+    if (motion) {
+        if (instanceof_function(Z_OBJCE_P(motion), vio_render_target_ce)) {
+            if (vio_up_call("vio_render_target_texture", &motion_tex, 1, motion) != 0) { zval_ptr_dtor(&src_tex); RETURN_FALSE; }
+        } else {
+            ZVAL_COPY(&motion_tex, motion);
+        }
+    }
+    if (dst_zval) {
+        vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(dst_zval);
+        dw = rt->width; dh = rt->height;
+    } else {
+        zval fb;
+        dw = ctx->config.width; dh = ctx->config.height;
+        if (vio_up_call("vio_framebuffer_size", &fb, 1, ctx_zval) == 0 && Z_TYPE(fb) == IS_ARRAY) {
+            zval *w = zend_hash_index_find(Z_ARRVAL(fb), 0), *h = zend_hash_index_find(Z_ARRVAL(fb), 1);
+            if (w && h) { dw = (int)zval_get_long(w); dh = (int)zval_get_long(h); }
+        }
+        zval_ptr_dtor(&fb);
+    }
+    int ok = 0;
+    vio_upscale_state *u = (sw > 0 && sh > 0 && dw > 0 && dh > 0) ? vio_upscale_state_for(ctx, ctx_zval) : NULL;
+    if (!u) goto done;
+    vio_mesh_object *mesh = Z_VIO_MESH_P(&u->mesh);
+
+    /* The platform's own scaler (MetalFX), into a render target. */
+    if (native && dst_zval && ctx->backend->upscale_native && ctx->backend->upscale_method
+        && ctx->backend->upscale_method((int)mode)
+        && ctx->backend->upscale_native(Z_VIO_TEXTURE_P(&src_tex)->backend_texture, Z_VIO_RENDER_TARGET_P(dst_zval), (int)mode) == 0) {
+        ok = vio_up_bind(ctx_zval, dst_zval, dw, dh) == 0;
+        goto done;
+    }
+
+    if (mode == VIO_UPSCALE_SPATIAL) {
+        if (sharp > 0.0) {
+            zval mid_tex;
+            ZVAL_UNDEF(&mid_tex);
+            if (vio_up_target_rt(ctx_zval, &u->mid, NULL, &u->mid_w, &u->mid_h, dw, dh) != 0
+                || vio_up_call("vio_render_target_texture", &mid_tex, 1, &u->mid) != 0
+                || vio_up_bind(ctx_zval, &u->mid, dw, dh) != 0) { zval_ptr_dtor(&mid_tex); goto done; }
+            vio_up_pass(ctx, u, VIO_UP_SPATIAL);
+            vio_up_sampler(ctx, "u_src", &src_tex, 0);
+            vio_up_vec4(ctx, "u_size", sw, sh, dw, dh);
+            vio_up_vec4(ctx, "u_rect", 0, 0, 0, 0);
+            vio_submit_one(ctx, mesh);
+            if (vio_up_bind(ctx_zval, dst_zval, dw, dh) != 0) { zval_ptr_dtor(&mid_tex); goto done; }
+            vio_up_pass(ctx, u, VIO_UP_SHARPEN);
+            vio_up_sampler(ctx, "u_src", &mid_tex, 0);
+            vio_up_vec4(ctx, "u_size", dw, dh, dw, dh);
+            vio_up_vec4(ctx, "u_rect", 0, 0, sharp, 0);
+            vio_submit_one(ctx, mesh);
+            zval_ptr_dtor(&mid_tex);
+        } else {
+            if (vio_up_bind(ctx_zval, dst_zval, dw, dh) != 0) goto done;
+            vio_up_pass(ctx, u, VIO_UP_SPATIAL);
+            vio_up_sampler(ctx, "u_src", &src_tex, 0);
+            vio_up_vec4(ctx, "u_size", sw, sh, dw, dh);
+            vio_up_vec4(ctx, "u_rect", 0, 0, 0, 0);
+            vio_submit_one(ctx, mesh);
+        }
+    } else {
+        int sizes_changed = u->hist_w != dw || u->hist_h != dh;
+        for (int i = 0; i < 2; i++) {
+            int cw = u->hist_w, ch = u->hist_h;
+            if (vio_up_target_rt(ctx_zval, &u->hist[i], &u->hist_tex[i], &cw, &ch, dw, dh) != 0) goto done;
+        }
+        u->hist_w = dw; u->hist_h = dh;
+        if (sizes_changed || reset) u->hist_valid = 0;
+        int rd = u->hist_cur, wr = u->hist_cur ^ 1;
+        /* NDC-space jitter and motion (y up) -> storage space */
+        double flip = ctx->backend->rt_origin_top ? -1.0 : 1.0;
+        if (vio_up_bind(ctx_zval, &u->hist[wr], dw, dh) != 0) goto done;
+        vio_up_pass(ctx, u, VIO_UP_TEMPORAL);
+        vio_up_sampler(ctx, "u_src", &src_tex, 0);
+        vio_up_sampler(ctx, "u_hist", &u->hist_tex[rd], 1);
+        vio_up_sampler(ctx, "u_motion", motion ? &motion_tex : &u->none, 2);
+        vio_up_vec4(ctx, "u_size", sw, sh, dw, dh);
+        vio_up_vec4(ctx, "u_ctl", u->hist_valid ? 0.0 : 1.0, motion ? 1.0 : 0.0, -jx, -flip * jy);
+        vio_up_vec4(ctx, "u_misc", 1.0, flip, 0, 0);
+        vio_submit_one(ctx, mesh);
+        if (vio_up_bind(ctx_zval, dst_zval, dw, dh) != 0) goto done;
+        vio_up_pass(ctx, u, sharp > 0.0 ? VIO_UP_SHARPEN : VIO_UP_COPY);
+        vio_up_sampler(ctx, "u_src", &u->hist_tex[wr], 0);
+        vio_up_vec4(ctx, "u_size", dw, dh, dw, dh);
+        vio_up_vec4(ctx, "u_rect", 0, 0, sharp, 1);   /* the history alpha is its weight: opaque out */
+        vio_submit_one(ctx, mesh);
+        u->hist_cur = wr;
+        u->hist_valid = 1;
+    }
+    ok = 1;
+done:
+    zval_ptr_dtor(&src_tex);
+    zval_ptr_dtor(&motion_tex);
+    if (EG(exception)) RETURN_THROWS();
+    if (!ok) php_error_docref(NULL, E_WARNING, "vio_upscale: a pass could not be set up on backend '%s'", ctx->backend->name);
+    RETURN_BOOL(ok);
+}
+
+ZEND_FUNCTION(vio_upscale_jitter)
+{
+    zend_long frame, phases = 8;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_LONG(frame)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(phases)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (phases < 1 || phases > 1024) {
+        zend_argument_value_error(2, "must be 1..1024");
+        RETURN_THROWS();
+    }
+    zend_long n = (frame % phases + phases) % phases + 1;   /* Halton index 1.. */
+    double r[2];
+    int bases[2] = { 2, 3 };
+    for (int k = 0; k < 2; k++) {
+        double f = 1.0, v = 0.0;
+        for (zend_long i = n; i > 0; i /= bases[k]) { f /= bases[k]; v += f * (double)(i % bases[k]); }
+        r[k] = v - 0.5;
+    }
+    array_init(return_value);
+    add_next_index_double(return_value, r[0]);
+    add_next_index_double(return_value, r[1]);
+}
+
+ZEND_FUNCTION(vio_upscale_info)
+{
+    zval *ctx_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    const vio_backend *be = ctx->backend;
+    const char *sp = (ctx->initialized && be && be->upscale_method) ? be->upscale_method(VIO_UPSCALE_SPATIAL) : NULL;
+    const char *tp = (ctx->initialized && be && be->upscale_method) ? be->upscale_method(VIO_UPSCALE_TEMPORAL) : NULL;
+    array_init(return_value);
+    add_assoc_string(return_value, "spatial", (char *)(sp ? sp : "portable"));
+    add_assoc_string(return_value, "temporal", (char *)(tp ? tp : "portable"));
+}
+
 /* ── Phase 5: 2D API functions ───────────────────────────────────── */
 ZEND_FUNCTION(vio_rect)
 {
@@ -11090,6 +11485,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_LAYERED_RENDER", VIO_FEATURE_LAYERED_RENDER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_LAYER", VIO_FEATURE_VERTEX_LAYER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_RT_ALL_LAYERS", VIO_RT_ALL_LAYERS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_SPATIAL", VIO_UPSCALE_SPATIAL, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_TEMPORAL", VIO_UPSCALE_TEMPORAL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_VIEWPORT", VIO_FEATURE_MULTI_VIEWPORT, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_MAX_VIEWPORTS", VIO_MAX_VIEWPORTS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_GEOMETRY_INSTANCING", VIO_FEATURE_GEOMETRY_INSTANCING, CONST_CS | CONST_PERSISTENT);

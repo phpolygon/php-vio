@@ -441,6 +441,10 @@ typedef struct _vio_coopmat_shape {
  * cube or array target at once (VIO_FEATURE_LAYERED_RENDER). */
 #define VIO_RT_ALL_LAYERS (-2)
 
+/* vio_upscale modes (UPSCALE-PLAN.md) */
+#define VIO_UPSCALE_SPATIAL  0
+#define VIO_UPSCALE_TEMPORAL 1
+
 /* vio_set_shading_rate() rates (GAP-PHASE5 Block 12). 4X4 needs the device's
  * additional-rates capability; the call returns false otherwise. */
 typedef enum _vio_shading_rate {

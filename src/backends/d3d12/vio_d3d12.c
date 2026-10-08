@@ -9918,6 +9918,7 @@ static const vio_backend d3d12_backend = {
     .draw_bundle                    = d3d12_draw_bundle,
     .destroy_bundle                 = d3d12_destroy_bundle,
     .bundle_method                  = d3d12_bundle_method,
+    .rt_origin_top     = 1,
 };
 
 void vio_backend_d3d12_register(void)

@@ -520,6 +520,18 @@ typedef struct _vio_backend {
     int         (*draw_bundle)(void *backend_bundle);
     void        (*destroy_bundle)(void *backend_bundle);
     const char *(*bundle_method)(void);
+
+    /* 1 when NDC +Y lands in row 0 of a target (D3D, Vulkan in vio, Metal), 0 on
+     * OpenGL (row 0 = NDC -Y). vio_upscale turns NDC-space jitter and motion
+     * into storage space with it. */
+    int         rt_origin_top;
+
+    /* vio_upscale through the platform's own scaler (UPSCALE-PLAN phase 3,
+     * MetalFX): upscale_method names it for a mode (NULL = portable passes);
+     * upscale_native scales the backend texture into attachment 0 of a render
+     * target inside the frame (0 = done, else the portable passes run). */
+    const char *(*upscale_method)(int mode);
+    int         (*upscale_native)(void *src_backend_texture, void *dst_render_target, int mode);
 } vio_backend;
 
 #define VIO_MAX_FRAGMENT_STORAGE 4

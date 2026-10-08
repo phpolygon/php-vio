@@ -75,12 +75,16 @@ typedef struct _vio_context_object {
      * "score") and the ranked candidates of a scored 'auto' (NULL otherwise). */
     const char        *selected_by;
     zend_array        *candidates;
+    /* vio_upscale: passes, history and intermediates (php_vio.c), released
+     * before the backend shuts down. */
+    void              *upscale;
     zend_object        std;
 } vio_context_object;
 
 /* Drop the vio_texture_index() references (before the backend shuts down). */
 void vio_context_bindless_clear(vio_context_object *ctx);
 void vio_context_release_fragment_storage(vio_context_object *ctx);
+void vio_upscale_release(vio_context_object *ctx);
 
 extern zend_class_entry *vio_context_ce;
 

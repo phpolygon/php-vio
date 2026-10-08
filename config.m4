@@ -307,6 +307,14 @@ if test "$PHP_VIO" != "no"; then
         VIO_HAS_METAL=yes
         PHP_ADD_FRAMEWORK(Metal)
         PHP_ADD_FRAMEWORK(QuartzCore)
+        dnl MetalFX (vio_upscale, UPSCALE-PLAN phase 3): weak, so the module also
+        dnl loads where the framework is missing (macOS < 13).
+        VIO_SDK_PATH=`xcrun --show-sdk-path 2>/dev/null`
+        if test -n "$VIO_SDK_PATH" && test -d "$VIO_SDK_PATH/System/Library/Frameworks/MetalFX.framework"; then
+          AC_DEFINE(HAVE_METALFX, 1, [Whether the SDK has MetalFX])
+          VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD -Wl,-weak_framework,MetalFX"
+          AC_MSG_RESULT([MetalFX upscaling enabled])
+        fi
         AC_MSG_RESULT([Metal backend enabled])
         ;;
       *)

@@ -520,6 +520,22 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bundle_info, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_OBJ_INFO(0, bundle, VioBundle, 0)
 ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscale, 0, 3, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, source, VioRenderTarget|VioTexture, 0, NULL)
+	ZEND_ARG_OBJ_INFO(0, target, VioRenderTarget, 1)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 1, "[]")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscale_jitter, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO(0, frame, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, phases, IS_LONG, 0, "8")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscale_info, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
 /* ── 2D API functions ────────────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_rect, 0, 5, IS_VOID, 0)
@@ -1137,6 +1153,9 @@ ZEND_FUNCTION(vio_submit_batch);
 ZEND_FUNCTION(vio_bundle);
 ZEND_FUNCTION(vio_draw_bundle);
 ZEND_FUNCTION(vio_bundle_info);
+ZEND_FUNCTION(vio_upscale);
+ZEND_FUNCTION(vio_upscale_jitter);
+ZEND_FUNCTION(vio_upscale_info);
 ZEND_FUNCTION(vio_shader_reflect);
 ZEND_FUNCTION(vio_audio_load);
 ZEND_FUNCTION(vio_audio_play);
@@ -1334,6 +1353,9 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_bundle, arginfo_vio_bundle)
 	ZEND_FE(vio_draw_bundle, arginfo_vio_draw_bundle)
 	ZEND_FE(vio_bundle_info, arginfo_vio_bundle_info)
+	ZEND_FE(vio_upscale, arginfo_vio_upscale)
+	ZEND_FE(vio_upscale_jitter, arginfo_vio_upscale_jitter)
+	ZEND_FE(vio_upscale_info, arginfo_vio_upscale_info)
 	ZEND_FE(vio_shader_reflect, arginfo_vio_shader_reflect)
 	ZEND_FE(vio_audio_load, arginfo_vio_audio_load)
 	ZEND_FE(vio_audio_play, arginfo_vio_audio_play)
