@@ -104,6 +104,7 @@ typedef struct _vio_vk_pass {
     uint32_t         view_mask;          /* multiview: views 0..n-1; 0 = off */
     int              clear;              /* CLEAR instead of LOAD (the swapchain's first pass of a frame) */
     int              internal;           /* vio's own pass (depth mips / resolve): no shading-rate image */
+    int              secondary;          /* the pass executes secondary command buffers (vio_draw_bundle) */
     int              swapchain;          /* colour 0 is the acquired swapchain image */
 } vio_vk_pass;
 
@@ -573,6 +574,7 @@ void    *vulkan_rt_sampling_texture(void *rt, int attachment);
 #define VIO_VK_GRAVE_FRAMEBUFFER     9
 #define VIO_VK_GRAVE_RENDER_PASS     10
 #define VIO_VK_GRAVE_DESCRIPTOR_POOL 11
+#define VIO_VK_GRAVE_COMMAND_POOL    12
 void vio_vk_defer_destroy(int kind, uint64_t handle, void *allocation);
 /* synchronization2 (VULKAN-MODERN-PLAN phase 3): the vkCmdPipelineBarrier
  * signature, recorded as vkCmdPipelineBarrier2 (the 1.0 stage / access bits
@@ -633,7 +635,11 @@ void  vio_vk_apply_shading_rate(VkCommandBuffer cmd, int primitive);   /* after 
                                                                         primitive: its VS writes the rate */
 
 /* ── 3D pipeline (GAP-PHASE5 Block 10, vio_vulkan_3d*.c) ── */
-int   vio_vk3d_available(void);
+/* Recorded draw sequences (BUNDLE-PLAN phase 2): secondary command buffers. */
+void       *vio_vk3d_begin_bundle(void);
+int         vio_vk3d_end_bundle(void *bundle);
+int         vio_vk3d_draw_bundle(void *bundle);
+void        vio_vk3d_destroy_bundle(void *bundle);int   vio_vk3d_available(void);
 void  vio_vk3d_begin_frame(uint32_t frame_slot);
 VkImageView vio_vk3d_dummy_view(int bindless_kind);   /* 1x1 2D / 2D array / cube view (cleared bindless slots) */
 /* Copy bytes into the current frame's upload ring (uniform-buffer aligned). */

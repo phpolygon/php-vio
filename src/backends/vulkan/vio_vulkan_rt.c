@@ -177,6 +177,7 @@ void vio_vk_pass_begin(VkCommandBuffer cmd, const vio_vk_pass *p)
     ri.renderArea.extent.height = p->height;
     ri.layerCount           = p->view_mask ? 1u : (p->layers ? p->layers : 1u);
     ri.viewMask             = p->view_mask;
+    ri.flags                = p->secondary ? VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT : 0;
     ri.colorAttachmentCount = (uint32_t)count;
     ri.pColorAttachments    = count ? ca : NULL;
     ri.pDepthAttachment     = p->has_depth ? &da : NULL;
@@ -200,14 +201,18 @@ void vio_vk_pass_begin(VkCommandBuffer cmd, const vio_vk_pass *p)
     ((PFN_vkCmdBeginRendering)vio_vk.fn_begin_rendering)(cmd, &ri);
     vio_vk.cur_pass_vrs = vrs;
 
-    VkViewport vp = { 0.0f, 0.0f, (float)p->width, (float)p->height, 0.0f, 1.0f };
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc = { { 0, 0 }, { p->width, p->height } };
-    vkCmdSetScissor(cmd, 0, 1, &sc);
-    vio_vk_note_viewport(&vp, &sc);
+    /* a pass instance for secondary command buffers records nothing inline */
+    if (!p->secondary) {
+        VkViewport vp = { 0.0f, 0.0f, (float)p->width, (float)p->height, 0.0f, 1.0f };
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        VkRect2D sc = { { 0, 0 }, { p->width, p->height } };
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        vio_vk_note_viewport(&vp, &sc);
+    }
 
     vio_vk.cur_pass        = *p;
     vio_vk.cur_pass.clear  = 0;   /* a resume of this pass loads */
+    vio_vk.cur_pass.secondary = 0;
     vio_vk.in_pass         = 1;
     vio_vk.cur_color_count = count;
     for (int i = 0; i < count; i++) vio_vk.cur_color_formats[i] = p->color_format[i];

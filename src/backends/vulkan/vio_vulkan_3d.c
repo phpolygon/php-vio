@@ -70,6 +70,34 @@ static struct {
     vk3d_res                    last_res[VK3D_MAX_BINDINGS];
 } vk3d;
 
+/* A recorded draw sequence (BUNDLE-PLAN phase 2): a secondary command buffer
+ * for one attachment signature, with its own upload chunks and descriptor
+ * pools (a vk3d_frame that no frame resets), so it can be played in any frame. */
+typedef struct {
+    VkCommandPool   pool;
+    VkCommandBuffer cmd;
+    vk3d_frame      res;
+    int             count, samples, has_depth;
+    VkFormat        formats[4];
+    uint32_t        view_mask, width, height;
+    int             failed;          /* something could not be recorded: replay instead */
+    int             released;        /* GPU objects freed at device shutdown, struct left for the PHP object */
+    struct vk3d_bundle_link { void *prev, *next; } link;   /* live bundles, swept at shutdown */
+} vk3d_bundle;
+
+static vk3d_bundle *vk3d_rec;    /* the bundle being recorded, NULL otherwise */
+static vk3d_bundle *vk3d_live;   /* every bundle with GPU objects */
+static void vk3d_bundles_sweep(void);
+static vk3d_frame *vk3d_cur_frame(void)
+{
+    return vk3d_rec ? &vk3d_rec->res : &vk3d.frames[vio_vk.current_frame % VIO_VK_MAX_FRAMES_IN_FLIGHT];
+}
+
+static VkCommandBuffer vk3d_cmd(void)
+{
+    return vk3d_rec ? vk3d_rec->cmd : vio_vk.frames[vio_vk.current_frame].cmd_buf;
+}
+
 /* ── Formats ───────────────────────────────────────────────────────── */
 
 VkFormat vk3d_format_from_vio(vio_format f)
@@ -253,6 +281,7 @@ static void vk3d_destroy_now(int kind, uint64_t h, void *alloc)
         case VIO_VK_GRAVE_SHADER_MODULE:   vkDestroyShaderModule(d, (VkShaderModule)h, NULL); break;
         case VIO_VK_GRAVE_FRAMEBUFFER:     vkDestroyFramebuffer(d, (VkFramebuffer)h, NULL); break;
         case VIO_VK_GRAVE_RENDER_PASS:     vkDestroyRenderPass(d, (VkRenderPass)h, NULL); break;
+        case VIO_VK_GRAVE_COMMAND_POOL:    vkDestroyCommandPool(d, (VkCommandPool)h, NULL); break;
         case VIO_VK_GRAVE_DESCRIPTOR_POOL: vkDestroyDescriptorPool(d, (VkDescriptorPool)h, NULL); break;
         default: break;
     }
@@ -305,7 +334,7 @@ static VkDeviceSize vk3d_ubo_align(void)
 static int vk3d_upload(const void *data, VkDeviceSize data_size, VkDeviceSize total, VkDeviceSize align,
                        VkBuffer *out_buf, VkDeviceSize *out_off)
 {
-    vk3d_frame *f = &vk3d.frames[vio_vk.current_frame % VIO_VK_MAX_FRAMES_IN_FLIGHT];
+    vk3d_frame *f = vk3d_cur_frame();
     if (total == 0) total = 4;
     if (data_size > total) data_size = total;
     if (align == 0) align = 1;
@@ -354,7 +383,7 @@ int vio_vk3d_upload_bytes(const void *data, VkDeviceSize size, VkBuffer *out_buf
 
 static VkDescriptorSet vk3d_alloc_set(VkDescriptorSetLayout layout)
 {
-    vk3d_frame *f = &vk3d.frames[vio_vk.current_frame % VIO_VK_MAX_FRAMES_IN_FLIGHT];
+    vk3d_frame *f = vk3d_cur_frame();
     for (;;) {
         if (f->cur_pool < f->pool_count) {
             VkDescriptorSetAllocateInfo ai = {0};
@@ -544,6 +573,7 @@ static void vk3d_free_texture_now(vio_vulkan_texture *t)
 
 void vio_vk3d_shutdown(void)
 {
+    vk3d_bundles_sweep();
     if (!vio_vk.device) { memset(&vk3d, 0, sizeof(vk3d)); return; }
     vk3d.shutting_down = 1;
     vkDeviceWaitIdle(vio_vk.device);
@@ -680,7 +710,7 @@ static VkRect2D vk3d_clamped_scissor(int x, int y, int w, int h)
 void vio_vk3d_set_viewport(int x, int y, int w, int h)
 {
     if (!vio_vk.in_frame || !vio_vk.in_pass || w <= 0 || h <= 0) return;
-    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    VkCommandBuffer cmd = vk3d_cmd();
     VkViewport vp = { (float)x, (float)y, (float)w, (float)h, 0.0f, 1.0f };
     vkCmdSetViewport(cmd, 0, 1, &vp);
     VkRect2D sc = vk3d_clamped_scissor(x, y, w, h);
@@ -831,14 +861,18 @@ static int vk3d_prepare(uint32_t stride, VkBuffer inst_buf, VkDeviceSize inst_of
     vio_vk3d_shader *sh = p->shader;
     /* Multiview pipelines draw into a multiview pass over the layered target;
      * plain pipelines need the plain pass back. */
-    if (vio_vk_rt_ensure_views(p->desc.view_count > 1 ? p->desc.view_count : 0) != 0) {
+    if (vk3d_rec) {
+        /* a recording cannot restart the pass for another view count */
+        uint32_t want = p->desc.view_count > 1 ? (1u << p->desc.view_count) - 1u : 0u;
+        if (want != vio_vk.cur_view_mask) { vk3d_rec->failed = 1; return -1; }
+    } else    if (vio_vk_rt_ensure_views(p->desc.view_count > 1 ? p->desc.view_count : 0) != 0) {
         php_error_docref(NULL, E_WARNING, "Vulkan: a multiview pipeline (view_count %d) needs a layered render target "
                          "with at least that many layers bound with VIO_RT_ALL_LAYERS", p->desc.view_count);
         return -1;
     }
     VkPipeline pl = vk3d_pipeline_variant(p, stride);
     if (!pl) return -1;
-    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    VkCommandBuffer cmd = vk3d_cmd();
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
     vio_vk_apply_shading_rate(cmd, sh->writes_shading_rate);
     if (vio_vk.max_viewports > 1) {
@@ -907,7 +941,7 @@ static int vk3d_bind_mesh(VkCommandBuffer cmd, void *vb_ptr, void *ib_ptr, int i
 void vio_vk3d_draw(vio_draw_cmd *c)
 {
     if (!c || !c->vertex_buffer || vk3d_prepare((uint32_t)c->vertex_stride, VK_NULL_HANDLE, 0) != 0) { vk3d_after_draw(); return; }
-    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    VkCommandBuffer cmd = vk3d_cmd();
     if (vk3d_bind_mesh(cmd, c->vertex_buffer, NULL, 0) == 0) {
         vkCmdDraw(cmd, (uint32_t)c->vertex_count, (uint32_t)(c->instance_count > 0 ? c->instance_count : 1),
                   (uint32_t)c->first_vertex, 0);
@@ -919,7 +953,7 @@ void vio_vk3d_draw_indexed(vio_draw_indexed_cmd *c)
 {
     if (!c || !c->vertex_buffer || !c->index_buffer ||
         vk3d_prepare((uint32_t)c->vertex_stride, VK_NULL_HANDLE, 0) != 0) { vk3d_after_draw(); return; }
-    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    VkCommandBuffer cmd = vk3d_cmd();
     if (vk3d_bind_mesh(cmd, c->vertex_buffer, c->index_buffer, c->index_bytes) == 0) {
         vkCmdDrawIndexed(cmd, (uint32_t)c->index_count, (uint32_t)(c->instance_count > 0 ? c->instance_count : 1),
                          (uint32_t)c->first_index, c->vertex_offset, 0);
@@ -930,7 +964,7 @@ void vio_vk3d_draw_indexed(vio_draw_indexed_cmd *c)
 static void vk3d_draw_mesh(vio_mesh_object *mesh, uint32_t instances, VkBuffer inst_buf, VkDeviceSize inst_off)
 {
     if (!mesh || !mesh->backend_vb || vk3d_prepare((uint32_t)mesh->stride, inst_buf, inst_off) != 0) { vk3d_after_draw(); return; }
-    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    VkCommandBuffer cmd = vk3d_cmd();
     int indexed = mesh->index_count > 0 && mesh->backend_ib;
     if (vk3d_bind_mesh(cmd, mesh->backend_vb, indexed ? mesh->backend_ib : NULL, mesh->index_bytes) == 0) {
         if (indexed) vkCmdDrawIndexed(cmd, (uint32_t)mesh->index_count, instances, 0, 0, 0);
@@ -961,7 +995,7 @@ void vio_vk3d_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, si
     vio_vulkan_compute_buffer *args = (vio_vulkan_compute_buffer *)args_buffer;
     if (!mesh || !mesh->backend_vb || !args || !args->buffer || max_draws <= 0) return;
     if (vk3d_prepare((uint32_t)mesh->stride, VK_NULL_HANDLE, 0) != 0) { vk3d_after_draw(); return; }
-    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    VkCommandBuffer cmd = vk3d_cmd();
     int indexed = mesh->index_count > 0 && mesh->backend_ib;
     if (vk3d_bind_mesh(cmd, mesh->backend_vb, indexed ? mesh->backend_ib : NULL, mesh->index_bytes) == 0) {
         uint32_t stride = indexed ? 20u : 16u;
@@ -991,7 +1025,7 @@ void vio_vk3d_draw_mesh_tasks(uint32_t x, uint32_t y, uint32_t z)
     if (!vk3d_mesh_bound() || !x || !y || !z) return;
     if (vk3d_prepare(0, VK_NULL_HANDLE, 0) != 0) { vk3d_after_draw(); return; }
 #ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
-    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    VkCommandBuffer cmd = vk3d_cmd();
     ((PFN_vkCmdDrawMeshTasksEXT)vio_vk.mesh_cmd_draw)(cmd, x, y, z);
 #endif
     vk3d_after_draw();
@@ -1003,7 +1037,7 @@ void vio_vk3d_draw_mesh_tasks_indirect(void *args_buffer, int max_draws, size_t 
     if (!vk3d_mesh_bound() || !args || !args->buffer || max_draws <= 0) return;
     if (vk3d_prepare(0, VK_NULL_HANDLE, 0) != 0) { vk3d_after_draw(); return; }
 #ifdef VK_EXT_MESH_SHADER_EXTENSION_NAME
-    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    VkCommandBuffer cmd = vk3d_cmd();
     PFN_vkCmdDrawMeshTasksIndirectEXT fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vio_vk.mesh_cmd_draw_indirect;
     const uint32_t stride = 12u;   /* VkDrawMeshTasksIndirectCommandEXT */
     if (vio_vk.multi_draw_indirect) {
@@ -1015,4 +1049,166 @@ void vio_vk3d_draw_mesh_tasks_indirect(void *args_buffer, int max_draws, size_t 
     vk3d_after_draw();
 }
 
+/* ── Recorded draw sequences (BUNDLE-PLAN phase 2) ─────────────────── */
+
+static void vk3d_bundle_unlink(vk3d_bundle *b)
+{
+    vk3d_bundle *prev = (vk3d_bundle *)b->link.prev, *next = (vk3d_bundle *)b->link.next;
+    if (prev) prev->link.next = next; else if (vk3d_live == b) vk3d_live = next;
+    if (next) next->link.prev = prev;
+    b->link.prev = b->link.next = NULL;
+}
+
+/* Free the bundle's GPU objects (parked until the frame's timeline value
+ * inside a frame); the struct stays. */
+static void vk3d_bundle_release(vk3d_bundle *b)
+{
+    if (!b || b->released) return;
+    vk3d_bundle_unlink(b);
+    b->released = 1;
+    vk3d_frame *r = &b->res;
+    int defer = vio_vk.in_frame;   /* the frame may execute it: park until its timeline value */
+    for (int i = 0; i < r->chunk_count; i++) {
+        if (!r->chunks[i].buf) continue;
+        if (defer) vio_vk_defer_destroy(VIO_VK_GRAVE_BUFFER, (uint64_t)r->chunks[i].buf, r->chunks[i].alloc);
+        else { vio_vma_unmap(vio_vk.vma_allocator, r->chunks[i].alloc); vio_vma_destroy_buffer(vio_vk.vma_allocator, r->chunks[i].buf, r->chunks[i].alloc); }
+    }
+    for (int i = 0; i < r->pool_count; i++) {
+        if (defer) vio_vk_defer_destroy(VIO_VK_GRAVE_DESCRIPTOR_POOL, (uint64_t)r->pools[i], NULL);
+        else vkDestroyDescriptorPool(vio_vk.device, r->pools[i], NULL);
+    }
+    if (b->pool) {
+        if (defer) vio_vk_defer_destroy(VIO_VK_GRAVE_COMMAND_POOL, (uint64_t)b->pool, NULL);
+        else vkDestroyCommandPool(vio_vk.device, b->pool, NULL);
+    }
+    memset(r, 0, sizeof(*r));
+    b->pool = VK_NULL_HANDLE;
+    b->cmd = VK_NULL_HANDLE;
+}
+
+static void vk3d_bundle_free(vk3d_bundle *b)
+{
+    if (!b) return;
+    vk3d_bundle_release(b);
+    free(b);
+}
+
+/* Device shutdown: no bundle keeps a GPU object past vkDestroyDevice (the PHP
+ * objects are freed later and only free the struct then). */
+static void vk3d_bundles_sweep(void)
+{
+    while (vk3d_live) vk3d_bundle_release(vk3d_live);
+    vk3d_rec = NULL;
+}
+
+void *vio_vk3d_begin_bundle(void)
+{
+    if (!vio_vk.in_frame || !vio_vk.in_pass || vk3d_rec || !vio_vk.device) return NULL;
+    if (vio_vk.cur_pass_vrs) return NULL;   /* a pass with a shading-rate image: replay */
+    vk3d_bundle *b = (vk3d_bundle *)calloc(1, sizeof(vk3d_bundle));
+    if (!b) return NULL;
+    VkCommandPoolCreateInfo pci = {0};
+    pci.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pci.queueFamilyIndex = vio_vk.graphics_family;
+    if (vkCreateCommandPool(vio_vk.device, &pci, NULL, &b->pool) != VK_SUCCESS) { free(b); return NULL; }
+    b->link.next = vk3d_live;
+    if (vk3d_live) vk3d_live->link.prev = b;
+    vk3d_live = b;
+    VkCommandBufferAllocateInfo ai = {0};
+    ai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool        = b->pool;
+    ai.level              = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+    ai.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(vio_vk.device, &ai, &b->cmd) != VK_SUCCESS) { vk3d_bundle_free(b); return NULL; }
+    b->count     = vio_vk.cur_color_count > 4 ? 4 : vio_vk.cur_color_count;
+    for (int i = 0; i < b->count; i++) b->formats[i] = vio_vk.cur_color_formats[i];
+    b->samples   = vio_vk.cur_samples;
+    b->has_depth = vio_vk.cur_has_depth;
+    b->view_mask = vio_vk.cur_view_mask;
+    b->width     = vio_vk.cur_width;
+    b->height    = vio_vk.cur_height;
+    VkCommandBufferInheritanceRenderingInfo rin = {0};
+    rin.sType                   = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO;
+    rin.viewMask                = b->view_mask;
+    rin.colorAttachmentCount    = (uint32_t)b->count;
+    rin.pColorAttachmentFormats = b->formats;
+    rin.depthAttachmentFormat   = b->has_depth ? vio_vk_depth_format() : VK_FORMAT_UNDEFINED;
+    rin.stencilAttachmentFormat = (b->has_depth && vio_vk.depth_has_stencil) ? vio_vk_depth_format() : VK_FORMAT_UNDEFINED;
+    rin.rasterizationSamples    = (VkSampleCountFlagBits)(b->samples > 1 ? b->samples : 1);
+    VkCommandBufferInheritanceInfo inh = {0};
+    inh.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
+    inh.pNext = &rin;
+    VkCommandBufferBeginInfo bi = {0};
+    bi.sType            = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    /* played in later frames while earlier ones may still run it */
+    bi.flags            = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT | VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+    bi.pInheritanceInfo = &inh;
+    if (vkBeginCommandBuffer(b->cmd, &bi) != VK_SUCCESS) { vk3d_bundle_free(b); return NULL; }
+    /* a secondary command buffer inherits no dynamic state */
+    uint32_t n = vio_vk.cur_vp_count ? vio_vk.cur_vp_count : 1;
+    vkCmdSetViewport(b->cmd, 0, 1, &vio_vk.cur_vp[0]);
+    vkCmdSetScissor(b->cmd, 0, 1, &vio_vk.cur_sc[0]);
+    (void)n;
+    vk3d.last_set = VK_NULL_HANDLE;   /* no frame descriptor set inside the bundle */
+    memset(vk3d.ubo_buf, 0, sizeof(vk3d.ubo_buf));
+    vk3d_rec = b;
+    return b;
+}
+
+int vio_vk3d_end_bundle(void *bundle)
+{
+    vk3d_bundle *b = (vk3d_bundle *)bundle;
+    if (!b || vk3d_rec != b) return -1;
+    vk3d_rec = NULL;
+    vk3d.last_set = VK_NULL_HANDLE;   /* no bundle descriptor set in the frame either */
+    memset(vk3d.ubo_buf, 0, sizeof(vk3d.ubo_buf));
+    if (vkEndCommandBuffer(b->cmd) != VK_SUCCESS || b->failed) return -1;
+    return 0;
+}
+
+int vio_vk3d_draw_bundle(void *bundle)
+{
+    vk3d_bundle *b = (vk3d_bundle *)bundle;
+    if (!b || b->released || !vio_vk.in_frame || !vio_vk.in_pass || vk3d_rec) return -1;
+    /* the signature it was recorded for */
+    if (b->count != vio_vk.cur_color_count || b->samples != vio_vk.cur_samples || b->has_depth != vio_vk.cur_has_depth
+        || b->view_mask != vio_vk.cur_view_mask || b->width != vio_vk.cur_width || b->height != vio_vk.cur_height
+        || vio_vk.cur_pass_vrs) return -1;
+    for (int i = 0; i < b->count; i++) if (b->formats[i] != vio_vk.cur_color_formats[i]) return -1;
+    /* A pass instance runs either inline draws or secondary command buffers
+     * (without VK_KHR_maintenance7): close it, run the bundle in an instance of
+     * the same pass, reopen it with LOAD. The viewports of the open pass stay. */
+    VkCommandBuffer cmd = vio_vk.frames[vio_vk.current_frame].cmd_buf;
+    VkViewport vp[16];
+    VkRect2D sc[16];
+    uint32_t vp_count = vio_vk.cur_vp_count ? vio_vk.cur_vp_count : 1;
+    if (vp_count > 16) vp_count = 16;
+    memcpy(vp, vio_vk.cur_vp, sizeof(VkViewport) * vp_count);
+    memcpy(sc, vio_vk.cur_sc, sizeof(VkRect2D) * vp_count);
+    vio_vk_pass pass = vio_vk.cur_pass;
+    vio_vk_pass_end(cmd);
+    pass.secondary = 1;
+    vio_vk_pass_begin(cmd, &pass);
+    vkCmdExecuteCommands(cmd, 1, &b->cmd);
+    vio_vk_pass_end(cmd);
+    pass.secondary = 0;
+    vio_vk_pass_begin(cmd, &pass);
+    memcpy(vio_vk.cur_vp, vp, sizeof(VkViewport) * vp_count);
+    memcpy(vio_vk.cur_sc, sc, sizeof(VkRect2D) * vp_count);
+    vio_vk.cur_vp_count = vp_count;
+    vkCmdSetViewport(cmd, 0, 1, &vp[0]);
+    vkCmdSetScissor(cmd, 0, 1, &sc[0]);
+    vk3d.last_set = VK_NULL_HANDLE;
+    return 0;
+}
+
+void vio_vk3d_destroy_bundle(void *bundle)
+{
+    vk3d_bundle *b = (vk3d_bundle *)bundle;
+    if (!b) return;
+    if (vk3d_rec == b) { vk3d_rec = NULL; vkEndCommandBuffer(b->cmd); }
+    if (b->released || !vio_vk.device) { free(b); return; }
+    if (!vio_vk.in_frame) vio_vk_wait_value(vio_vk.timeline_value);
+    vk3d_bundle_free(b);
+}
 #endif /* HAVE_VULKAN */

@@ -509,12 +509,14 @@ typedef struct _vio_backend {
     int (*bind_fragment_storage)(void *backend_buffer, int binding);
 
     /* Recorded draw sequences (vio_bundle, BUNDLE-PLAN.md, OPEN-ITEMS A38). A
-     * backend that records natively turns the parsed bundle (vio_bundle_object*)
-     * into its own object for the pass open now (create_bundle; NULL = replay the
-     * records through the common draw path), plays it inside a frame (draw_bundle,
-     * 0 = done, -1 = record again for this pass) and frees it (destroy_bundle).
-     * bundle_method names the native mechanism for vio_bundle_info. */
-    void       *(*create_bundle)(void *bundle_obj);
+     * backend that records natively starts a recording for the pass open now
+     * (begin_bundle; NULL = no native recording, the records are replayed through
+     * the common draw path), during which the draw path records instead of
+     * drawing; end_bundle closes it (0 = usable). draw_bundle plays it inside a
+     * frame (0 = done, -1 = does not fit the open pass: record again);
+     * destroy_bundle frees it. bundle_method names the mechanism. */
+    void       *(*begin_bundle)(void);
+    int         (*end_bundle)(void *backend_bundle);
     int         (*draw_bundle)(void *backend_bundle);
     void        (*destroy_bundle)(void *backend_bundle);
     const char *(*bundle_method)(void);

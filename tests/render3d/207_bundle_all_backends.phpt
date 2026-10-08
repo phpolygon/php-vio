@@ -71,6 +71,10 @@ function run_backend(string $name): string {
         if (!vio_draw_bundle($ctx, $bundle)) throw new Exception('vio_draw_bundle returned false');
     });
     if ($got !== $want) $fail[] = "swapchain: bundle differs from the one-by-one draws";
+    /* backends that record natively (BUNDLE-PLAN phases 2-4) */
+    $info = vio_bundle_info($bundle);
+    if (in_array($name, ['vulkan'], true) && ($info['native'] !== true || $info['method'] === 'replay'))
+        $fail[] = "$name: not recorded natively: " . json_encode($info);
     /* a second frame plays it again */
     if ($frame(fn() => vio_draw_bundle($ctx, $bundle)) !== $want) $fail[] = "second frame differs";
 

@@ -171,6 +171,13 @@ function run_backend(string $name, int $N, int $frames, int $warmup, string $loa
     $out['scenarios']['submit: vio_submit_batch'] = measure($ctx, function () use ($ctx, $records) {
         vio_submit_batch($ctx, $records);
     }, $frames, $warmup);
+    /* A38: the same records recorded once, played every frame */
+    if (function_exists('vio_bundle')) {
+        $bundle = vio_bundle($ctx, $records);
+        $out['scenarios']['submit: vio_draw_bundle'] = measure($ctx, function () use ($ctx, $bundle) {
+            vio_draw_bundle($ctx, $bundle);
+        }, $frames, $warmup);
+    }
     $VS_I = "#version 450\nlayout(location=0) in vec3 aPos;\nlayout(location=3) in mat4 aModel;\n"
           . "void main(){ gl_Position = aModel * vec4(aPos, 1.0); }";
     $FS_I = "#version 450\nlayout(location=0) out vec4 o;\n{$COST}void main(){ o = vio_cost(vec4(0.4, 0.7, 1.0, 1.0)); }";

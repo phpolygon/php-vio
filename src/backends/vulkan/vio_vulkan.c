@@ -4056,6 +4056,8 @@ static int vulkan_set_shading_rate_image(const unsigned char *rates, int tiles_x
     return rc;
 }
 
+static const char *vulkan_bundle_method(void) { return "secondary_command_buffer"; }
+
 static int vulkan_shading_rate_tile_size(void)
 {
     return vio_vk.vrs_attachment ? (int)vio_vk.vrs_tile : 0;
@@ -5325,6 +5327,11 @@ static const vio_backend vulkan_backend = {
     .bind_cubemap      = vio_vk_bind_cubemap,
     .set_shading_rate  = vio_vk_set_shading_rate,
     .set_shading_rate_image = vulkan_set_shading_rate_image,
+    .begin_bundle      = vio_vk3d_begin_bundle,
+    .end_bundle        = vio_vk3d_end_bundle,
+    .draw_bundle       = vio_vk3d_draw_bundle,
+    .destroy_bundle    = vio_vk3d_destroy_bundle,
+    .bundle_method     = vulkan_bundle_method,
     .shading_rate_tile_size = vulkan_shading_rate_tile_size,
     .swapchain_info    = vulkan_swapchain_info,
     .bindless_set      = vulkan_bindless_set,

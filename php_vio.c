@@ -6601,16 +6601,18 @@ ZEND_FUNCTION(vio_draw_bundle)
         php_error_docref(NULL, E_WARNING, "Must call vio_draw_bundle between vio_begin and vio_end");
         RETURN_FALSE;
     }
-    /* A native recording for the pass open now (BUNDLE-PLAN phases 2-4). */
-    if (ctx->backend->draw_bundle && ctx->backend->create_bundle) {
-        if (b->backend_bundle && b->backend == ctx->backend && ctx->backend->draw_bundle(b->backend_bundle) == 0) RETURN_TRUE;
-        if (b->backend_bundle && b->backend && ((const vio_backend *)b->backend)->destroy_bundle)
-            ((const vio_backend *)b->backend)->destroy_bundle(b->backend_bundle);
-        b->backend_bundle = ctx->backend->create_bundle(b);
-        b->backend = b->backend_bundle ? ctx->backend : NULL;
-        if (b->backend_bundle && ctx->backend->draw_bundle(b->backend_bundle) == 0) RETURN_TRUE;
-    }
-    /* The generic replay: the records through the vio_submit_batch core. */
+    /* A native recording for the pass open now (BUNDLE-PLAN phases 2-4): play
+     * it, or record it once - the backend records while the records run
+     * through the common draw path below - and play that. */
+    const vio_backend *be = ctx->backend;
+    if (b->backend_bundle && b->backend == be && be->draw_bundle && be->draw_bundle(b->backend_bundle) == 0) RETURN_TRUE;
+    if (b->backend_bundle && b->backend && ((const vio_backend *)b->backend)->destroy_bundle)
+        ((const vio_backend *)b->backend)->destroy_bundle(b->backend_bundle);
+    b->backend_bundle = NULL;
+    b->backend = NULL;
+    void *rec = (be->begin_bundle && be->end_bundle && be->draw_bundle) ? be->begin_bundle() : NULL;
+    for (int pass = rec ? 0 : 1; pass < 2; pass++) {
+    /* The records through the vio_submit_batch core (pass 0: recording). */
     vio_pipeline_object *last_pipeline = NULL;
     for (int i = 0; i < b->count; i++) {
         vio_bundle_record *r = &b->records[i];
@@ -6629,6 +6631,15 @@ ZEND_FUNCTION(vio_draw_bundle)
             vio_apply_uniform(ctx, ZSTR_VAL(r->uniforms[u].name), &r->uniforms[u].value);
         }
         vio_submit_one(ctx, vio_mesh_from_obj(r->mesh));
+    }
+    if (pass == 0) {
+        if (be->end_bundle(rec) == 0 && be->draw_bundle(rec) == 0) {
+            b->backend_bundle = rec;
+            b->backend = be;
+            RETURN_TRUE;
+        }
+        if (be->destroy_bundle) be->destroy_bundle(rec);   /* replay instead */
+    }
     }
     RETURN_TRUE;
 }
