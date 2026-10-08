@@ -42,6 +42,7 @@ jobs:
           sudo apt-get install -y \
             libglfw3-dev \
             libx11-dev libxrandr-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev weston \
             glslang-dev \
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
@@ -91,6 +92,29 @@ jobs:
           # miniaudio opens it silently.
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
+
+      - name: Run tests (Wayland: headless weston + Mesa software GL)
+        run: |
+          # The same suite on the native Wayland platform: a headless weston
+          # (pixman renderer - Mesa's software EGL and lavapipe hand it wl_shm
+          # buffers), no DISPLAY, so vio_platform() is "wayland".
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          export VK_DRIVER_FILES=/nonexistent/vio-no-vulkan.json
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          chmod 700 "$XDG_RUNTIME_DIR"
+          (weston --backend=headless --renderer=pixman --socket=wayland-vio --idle-time=0 \
+            || weston --backend=headless-backend.so --use-pixman --socket=wayland-vio --idle-time=0) > weston.log 2>&1 &
+          for i in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/wayland-vio" ] && break; sleep 0.2; done
+          if [ ! -S "$XDG_RUNTIME_DIR/wayland-vio" ]; then cat weston.log; exit 1; fi
+          export WAYLAND_DISPLAY=wayland-vio
+          unset DISPLAY
+          php -n -d extension_dir=$PWD/modules -d extension=vio.so -r 'echo "platform: ", vio_platform(), "\n";'
+          php -n run-tests.php -q --show-diff tests/
+          # Vulkan on Wayland (lavapipe through VK_KHR_wayland_surface)
+          VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1) \
+            php -n run-tests.php -q --show-diff tests/window/215_wayland_platform.phpt
 
       - name: Run required-feature tests (lavapipe Vulkan)
         run: |
@@ -237,6 +261,7 @@ jobs:
           sudo apt-get install -y \
             libglfw3-dev \
             libx11-dev libxrandr-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev weston \
             glslang-dev \
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
@@ -282,6 +307,29 @@ jobs:
           # miniaudio opens it silently.
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
+
+      - name: Run tests (Wayland: headless weston + Mesa software GL)
+        run: |
+          # The same suite on the native Wayland platform: a headless weston
+          # (pixman renderer - Mesa's software EGL and lavapipe hand it wl_shm
+          # buffers), no DISPLAY, so vio_platform() is "wayland".
+          export NO_INTERACTION=1 REPORT_EXIT_STATUS=1 LIBGL_ALWAYS_SOFTWARE=1
+          export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          export VK_DRIVER_FILES=/nonexistent/vio-no-vulkan.json
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          chmod 700 "$XDG_RUNTIME_DIR"
+          (weston --backend=headless --renderer=pixman --socket=wayland-vio --idle-time=0 \
+            || weston --backend=headless-backend.so --use-pixman --socket=wayland-vio --idle-time=0) > weston.log 2>&1 &
+          for i in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/wayland-vio" ] && break; sleep 0.2; done
+          if [ ! -S "$XDG_RUNTIME_DIR/wayland-vio" ]; then cat weston.log; exit 1; fi
+          export WAYLAND_DISPLAY=wayland-vio
+          unset DISPLAY
+          php -n -d extension_dir=$PWD/modules -d extension=vio.so -r 'echo "platform: ", vio_platform(), "\n";'
+          php -n run-tests.php -q --show-diff tests/
+          # Vulkan on Wayland (lavapipe through VK_KHR_wayland_surface)
+          VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1) \
+            php -n run-tests.php -q --show-diff tests/window/215_wayland_platform.phpt
 
       - name: Run required-feature tests (lavapipe Vulkan)
         run: |

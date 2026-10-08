@@ -2155,7 +2155,12 @@ ZEND_FUNCTION(vio_native_window_handle)
 #elif defined(_WIN32)
     RETURN_LONG((zend_long)(uintptr_t)vio_plat()->native_handle(ctx->window, VIO_NATIVE_HWND));
 #elif defined(__linux__)
-    RETURN_LONG((zend_long)(uintptr_t)vio_plat()->native_handle(ctx->window, VIO_NATIVE_XLIB_WINDOW));
+    {
+        /* the X window id, or the wl_surface pointer on Wayland */
+        void *h = vio_plat()->native_handle(ctx->window, VIO_NATIVE_XLIB_WINDOW);
+        if (!h) h = vio_plat()->native_handle(ctx->window, VIO_NATIVE_WAYLAND_SURFACE);
+        RETURN_LONG((zend_long)(uintptr_t)h);
+    }
 #else
     RETURN_LONG(0);
 #endif

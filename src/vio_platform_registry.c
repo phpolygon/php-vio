@@ -38,13 +38,14 @@ const vio_platform *vio_find_platform(const char *name)
 }
 
 /* VIO_PLATFORM=<name> picks one explicitly; otherwise the native platform of
- * the OS when it is built in, then GLFW, then null. */
+ * the OS when it is built in, then GLFW, then null. On Linux, Wayland comes
+ * before X11 when it is registered (WAYLAND_DISPLAY set, as GLFW 3.4). */
 const vio_platform *vio_platform_active(void)
 {
     if (vio_platform_current) return vio_platform_current;
     const char *env = getenv("VIO_PLATFORM");
     const vio_platform *p = (env && *env) ? vio_find_platform(env) : NULL;
-    static const char *order[] = { "win32", "cocoa", "x11", "glfw", "null" };
+    static const char *order[] = { "win32", "cocoa", "wayland", "x11", "glfw", "null" };
     for (size_t i = 0; !p && i < sizeof(order) / sizeof(order[0]); i++) p = vio_find_platform(order[i]);
     if (!p) {
         vio_platform_null_register();
@@ -73,6 +74,13 @@ int vio_window_init(void)
 #endif
 #ifdef HAVE_X11
     vio_platform_x11_register();
+#endif
+#ifdef HAVE_WAYLAND
+    /* only inside a Wayland session (or when asked for): otherwise X11 */
+    {
+        const char *wd = getenv("WAYLAND_DISPLAY"), *want = getenv("VIO_PLATFORM");
+        if ((wd && *wd) || (want && strcmp(want, "wayland") == 0)) vio_platform_wayland_register();
+    }
 #endif
 #if defined(HAVE_COCOA) && !defined(HAVE_IOS)
     vio_platform_cocoa_register();

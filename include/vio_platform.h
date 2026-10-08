@@ -167,6 +167,9 @@ void vio_platform_win32_register(void);
 #ifdef HAVE_X11
 void vio_platform_x11_register(void);
 #endif
+#ifdef HAVE_WAYLAND
+void vio_platform_wayland_register(void);
+#endif
 #if defined(HAVE_COCOA) && !defined(HAVE_IOS)
 void vio_platform_cocoa_register(void);
 #endif

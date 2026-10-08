@@ -74,3 +74,6 @@ Thumbs.db
 # Local build/diagnostic artifacts
 build_*.log
 x64/
+
+# wayland-scanner output (config.m4)
+src/platform/wayland/gen/

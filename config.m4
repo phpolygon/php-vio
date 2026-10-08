@@ -20,6 +20,13 @@ PHP_ARG_WITH([x11],
   [yes],
   [no])
 
+PHP_ARG_WITH([wayland],
+  [for the native Wayland platform (Linux)],
+  [AS_HELP_STRING([--with-wayland],
+    [Native Wayland window, input and EGL platform on Linux (default yes; needs wayland-client, wayland-cursor, xkbcommon, wayland-scanner and wayland-protocols)])],
+  [yes],
+  [no])
+
 PHP_ARG_WITH([glslang],
   [for glslang (GLSL to SPIR-V compiler) support],
   [AS_HELP_STRING([--with-glslang@<:@=DIR@:>@],
@@ -418,6 +425,7 @@ if test "$PHP_VIO" != "no"; then
     src/platform/null/vio_platform_null.c \
     src/platform/glfw/vio_platform_glfw.c \
     src/platform/x11/vio_platform_x11.c \
+    src/platform/wayland/vio_platform_wayland.c \
     src/vio_mesh.c \
     src/vio_input.c \
     src/vio_shader.c \
@@ -462,6 +470,49 @@ if test "$PHP_VIO" != "no"; then
     vendor/miniaudio/miniaudio_impl.c \
     vendor/sheenbidi/Source/SheenBidi.c,
     $ext_shared,, $VIO_EXTRA_CFLAGS)
+
+  dnl ── Native Wayland platform (Linux) ─────────────────────────────
+  dnl Window, input, outputs and EGL without GLFW (src/platform/wayland/).
+  dnl wayland-scanner generates the protocol glue (xdg-shell, xdg-decoration,
+  dnl relative-pointer, pointer-constraints) into gen/, which the platform
+  dnl source compiles in; libEGL and libwayland-egl are opened at run time.
+  dnl Here, after PHP_NEW_EXTENSION, because $ext_srcdir is set from there on.
+  if test "$PHP_WAYLAND" != "no"; then
+    case $host_os in
+      linux*)
+        PKG_CHECK_MODULES([VIO_WAYLAND], [wayland-client wayland-cursor xkbcommon], [
+          VIO_WL_SCANNER=`$PKG_CONFIG --variable=wayland_scanner wayland-scanner 2>/dev/null`
+          test -z "$VIO_WL_SCANNER" && VIO_WL_SCANNER=`command -v wayland-scanner 2>/dev/null`
+          VIO_WL_PROTOCOLS=`$PKG_CONFIG --variable=pkgdatadir wayland-protocols 2>/dev/null`
+          VIO_WL_GEN="$ext_srcdir/src/platform/wayland/gen"
+          if test -n "$VIO_WL_SCANNER" && test -x "$VIO_WL_SCANNER" && test -f "$VIO_WL_PROTOCOLS/stable/xdg-shell/xdg-shell.xml"; then
+            mkdir -p "$VIO_WL_GEN"
+            vio_wl_ok=yes
+            for vio_wl_p in stable/xdg-shell/xdg-shell \
+                            unstable/xdg-decoration/xdg-decoration-unstable-v1 \
+                            unstable/relative-pointer/relative-pointer-unstable-v1 \
+                            unstable/pointer-constraints/pointer-constraints-unstable-v1; do
+              vio_wl_n=`basename $vio_wl_p`
+              "$VIO_WL_SCANNER" client-header "$VIO_WL_PROTOCOLS/$vio_wl_p.xml" "$VIO_WL_GEN/$vio_wl_n-client-protocol.h" || vio_wl_ok=no
+              "$VIO_WL_SCANNER" private-code "$VIO_WL_PROTOCOLS/$vio_wl_p.xml" "$VIO_WL_GEN/$vio_wl_n-protocol.c" || vio_wl_ok=no
+            done
+            if test "$vio_wl_ok" = "yes"; then
+              PHP_EVAL_INCLINE($VIO_WAYLAND_CFLAGS)
+              PHP_EVAL_LIBLINE($VIO_WAYLAND_LIBS, VIO_SHARED_LIBADD)
+              AC_DEFINE(HAVE_WAYLAND, 1, [Whether the native Wayland platform is built])
+              AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from EGL)])
+            else
+              AC_MSG_WARN([wayland-scanner failed: no native Wayland platform])
+            fi
+          else
+            AC_MSG_WARN([wayland-scanner or wayland-protocols not found: no native Wayland platform])
+          fi
+        ], [
+          AC_MSG_WARN([wayland-client / wayland-cursor / xkbcommon not found: no native Wayland platform])
+        ])
+        ;;
+    esac
+  fi
 
   dnl ── Special-flag sources (Issue #2) ─────────────────────────────
   dnl
@@ -560,6 +611,7 @@ if test "$PHP_VIO" != "no"; then
   dnl ── Build directories ──────────────────────────────────────────
   PHP_ADD_BUILD_DIR($ext_builddir/src)
   PHP_ADD_BUILD_DIR($ext_builddir/src/platform/x11)
+  PHP_ADD_BUILD_DIR($ext_builddir/src/platform/wayland)
   PHP_ADD_BUILD_DIR($ext_builddir/src/platform/cocoa)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/opengl)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/vulkan)
