@@ -1158,12 +1158,14 @@ function vio_bundle(VioContext $context, array $records): VioBundle|false {}
  * Play a bundle inside a frame, into the pass open now (swapchain or render
  * target). Backends with a native recording (vio_bundle_info()['native']) record
  * it for the pass's attachment formats on first use; the others replay the
- * records through the common draw path. Returns false outside a frame.
+ * records through the common draw path. The pipeline bound afterwards is
+ * undefined: bind one before the next draw. Returns false outside a frame.
  */
 function vio_draw_bundle(VioContext $context, VioBundle $bundle): bool {}
 
 /**
- * ['draws' => int, 'native' => bool, 'method' => 'replay' | the backend's mechanism].
+ * ['draws' => int, 'native' => bool, 'method' => 'replay' | 'secondary_command_buffer' (Vulkan) |
+ * 'bundle' (D3D12) | 'deferred_context' (D3D11)].
  * 'native' becomes true after the first vio_draw_bundle on a backend that records natively.
  */
 function vio_bundle_info(VioBundle $bundle): array {}
