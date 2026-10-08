@@ -45,7 +45,7 @@ A33 Sub-Image-Uploads für den Glyph-Atlas ✅ (Test 189) · A34 Vertikaltext �
 ## Batch 5 — Lücken der Shader-Stages
 A29 Hull/Domain-Generator (Interface-Blöcke, Struct-/Matrix-Varyings, `gl_ClipDistance`, fremde Kontrollpunkte) ·
 A28 Metal-GS-Emulation (Sampler, Interface-Blöcke, GS hinter Tess, Strip-Adjacency, `gl_PrimitiveID`) (CI) ·
-A30 Texturen in Mesh-/Task-Stages · A13 RT-Pipeline (mehrere Gruppen, Callables, Shader-Records, Ressourcen, Trace im Frame) ·
+A30 Texturen in Mesh-/Task-Stages ✅ (Test 197; Nebenbefund: Sampler-Register je Stage folgten der Reihenfolge der ersten Benutzung – jetzt ein shaderweiter Plan nach Namen) · A13 RT-Pipeline (mehrere Gruppen, Callables, Shader-Records, Ressourcen, Trace im Frame) ·
 A14 TLAS-Objekt mit Rebuild/Refit · A15 Sampler-Feedback-Emulation · A18 Vulkan-Shading-Rate-Bild (nur kompiliert, kein Treiber).
 
 ## Batch 6 — große Pakete
