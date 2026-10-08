@@ -1,6 +1,6 @@
 # Native Platform Layer — GLFW-Ablöse-Plan
 
-> **Stand (2026-10-08):** Phase 0 und Phase 1 (Win32) umgesetzt, siehe `WIN32-PLATFORM-PLAN.md` und OPEN-ITEMS A1/A2.
+> **Stand (2026-10-08):** Phase 0, Phase 1 (Win32), Phase 2 (Cocoa) und Phase 3 für X11 umgesetzt (OPEN-ITEMS A1–A3, Tests 212–214); Wayland und Phase 4 (GLFW entfernen) offen. Cocoa und X11 sind nur über die CI belegt.
 
 > **Status:** 📋 **Entwurf / geplant** — noch kein Branch, keine Commits.
 > **Ziel-Issue:** _(anzulegen)_ „Eigene Windowing/Input-Schicht, GLFW optional bzw. entfernbar".
