@@ -5,19 +5,24 @@ vio
 --FILE--
 <?php
 /* A 192x192 target, quality 1 / 0.25 / 1 in both directions: the centre zone
- * is rendered with a quarter of the samples. Fine diagonal stripes from NDC,
- * the same scene rendered into a plain target as the reference. */
+ * is rendered with a quarter of the samples. Red / green carry a smooth NDC
+ * gradient (where each pixel lands), blue fine diagonal stripes (detail); the
+ * same scene rendered into a plain target is the reference. Metal smooths the
+ * zone borders (192 -> 149 physical pixels, not 144), so even a quality-1
+ * zone is resampled in the resolve: hard stripes there differ by a blur
+ * (mae ~17), the gradient must not move. */
 $S = 192;
 $VS = "#version 450\nlayout(location=0) in vec2 aPos;\nlayout(location=0) out vec2 ndc;\n"
     . "void main(){ ndc = aPos; gl_Position = vec4(aPos, 0.0, 1.0); }";
 $FS = "#version 450\nlayout(location=0) in vec2 ndc;\nlayout(location=0) out vec4 o;\n"
-    . "void main(){ float s = step(0.5, fract((ndc.x + ndc.y) * 12.0)); o = vec4(mix(vec3(0.1, 0.2, 0.7), vec3(0.95, 0.9, 0.2), s), 1.0); }";
+    . "void main(){ float s = step(0.5, fract((ndc.x + ndc.y) * 12.0)); o = vec4(ndc * 0.5 + 0.5, mix(0.1, 0.9, s), 1.0); }";
 
-function region_mae(string $a, string $b, int $w, int $x0, int $y0, int $x1, int $y1): float {
+/* channels: 0..2 (default), [0, 1] position, [2] detail */
+function region_mae(string $a, string $b, int $w, int $x0, int $y0, int $x1, int $y1, array $ch = [0, 1, 2]): float {
     $s = 0; $n = 0;
     for ($y = $y0; $y < $y1; $y++) for ($x = $x0; $x < $x1; $x++) {
         $i = ($y * $w + $x) * 4;
-        for ($c = 0; $c < 3; $c++) { $s += abs(ord($a[$i + $c]) - ord($b[$i + $c])); $n++; }
+        foreach ($ch as $c) { $s += abs(ord($a[$i + $c]) - ord($b[$i + $c])); $n++; }
     }
     return $s / $n;
 }
@@ -59,17 +64,18 @@ function run_backend(string $name): string {
     $a = vio_read_render_target($ref);
     $b = vio_read_render_target($rm);
     $z = intdiv($S, 3);
-    $corner = region_mae($a, $b, $S, 4, 4, $z - 4, $z - 4);          /* quality 1 x 1 */
-    $centre = region_mae($a, $b, $S, $z + 4, $z + 4, 2 * $z - 4, 2 * $z - 4);   /* quality 0.25 x 0.25 */
-    if (getenv('VIO_RATE_MAP_DEBUG')) fprintf(STDERR, "$name: feature %d corner %.2f centre %.2f size %s\n", $has, $corner, $centre, json_encode($sz));
+    $corner = region_mae($a, $b, $S, 4, 4, $z - 4, $z - 4, [0, 1]);                      /* quality 1 x 1: position */
+    $cornerD = region_mae($a, $b, $S, 4, 4, $z - 4, $z - 4, [2]);                        /* ... and detail */
+    $centre = region_mae($a, $b, $S, $z + 4, $z + 4, 2 * $z - 4, 2 * $z - 4, [2]);       /* quality 0.25 x 0.25: detail */
+    if (getenv('VIO_RATE_MAP_DEBUG')) fprintf(STDERR, "$name: feature %d corner %.2f / %.2f centre %.2f size %s\n", $has, $corner, $cornerD, $centre, json_encode($sz));
     $eFull = region_mae($a, vio_read_render_target($full), $S, 0, 0, $S, $S);
     if ($eFull > 1.0) $fail[] = sprintf("a full-quality rate map differs from the plain target (%.2f, size %s)", $eFull, json_encode(vio_render_target_size($full)));
     if ($has) {
-        if ($corner > 12.0) $fail[] = sprintf("full-quality corner differs from the full-rate picture (%.2f; inner corner %.2f, size %s)",
-                                              $corner, region_mae($a, $b, $S, 8, 8, $z - 16, $z - 16), json_encode($sz));
-        if ($centre <= $corner) $fail[] = sprintf("the low-quality centre is not coarser (centre %.2f, corner %.2f)", $centre, $corner);
+        if ($corner > 3.0) $fail[] = sprintf("full-quality corner is not where the full-rate picture has it (gradient mae %.2f, stripes %.2f, size %s)",
+                                             $corner, $cornerD, json_encode($sz));
+        if ($centre <= $cornerD) $fail[] = sprintf("the low-quality centre is not coarser (stripes: centre %.2f, corner %.2f)", $centre, $cornerD);
     } elseif ($a !== $b) {
-        $fail[] = sprintf("without the feature the picture differs (corner %.2f, centre %.2f)", $corner, $centre);
+        $fail[] = sprintf("without the feature the picture differs (corner %.2f / %.2f, centre %.2f)", $corner, $cornerD, $centre);
     }
 
     foreach ([['x' => [1.0]], ['x' => [1.0], 'y' => []], ['x' => [0.0], 'y' => [1.0]], ['x' => [1.5], 'y' => [1.0]], 'zones'] as $k => $bad) {

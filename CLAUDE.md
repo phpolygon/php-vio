@@ -104,7 +104,7 @@ Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONO
 | Ordner | Inhalt |
 |---|---|
 | `tests/render3d/205` | Lücken der Geometry-Stage auf jedem Backend mit GS: `VIO_TRIANGLE_STRIP_ADJACENCY` (GL-Tabelle 10.1, Paare (Vertex, Nachbar) bis auf Rotation – Vulkan rotiert ungerade Dreiecke), `gl_PrimitiveID` aus dem GS im Fragment-Shader, Texturen in VS und GS, Interface-Blöcke VS → GS → FS, GS hinter Tessellation (Metal lehnt das ab). Auf D3D: `gl_PrimitiveID` läuft als flaches Varying auf Location 30, GS-Eingangsblöcke werden je Member aufgeteilt, Vertex-Texturen binden auf D3D11 auch an den VS und auf D3D12 über eigene VS-Tabellen (Root-Parameter 20/21). |
-| `tests/render3d/211` | Rate Maps (A16): 192er-Ziel mit Qualität 1 / 0,25 / 1 je Achse – mit `VIO_FEATURE_RASTER_RATE_MAP` kleinere physische Größe, die Ecke (Qualität 1) gleicht dem Vollraten-Bild, die Mitte ist gröber; ohne Feature identisches Bild; fehlerhafte Maps → `ValueError`. |
+| `tests/render3d/211` | Rate Maps (A16): 192er-Ziel mit Qualität 1 / 0,25 / 1 je Achse – mit `VIO_FEATURE_RASTER_RATE_MAP` kleinere physische Größe, in der Ecke (Qualität 1) liegt jeder Pixel am Ort des Vollraten-Bilds (NDC-Gradient in Rot/Grün; Metal glättet die Zonengrenzen – 149 statt 144 physische Pixel – und resampelt auch Qualität-1-Zonen, harte Kanten verwischen dort leicht), die Streifen (Blau) sind in der Mitte gröber; ohne Feature identisches Bild; fehlerhafte Maps → `ValueError`. |
 | `tests/render3d/210` | `vio_compute_pipeline(['msl' => …])` (A17): auf Metal läuft der MSL-Kernel (Ergebnis ×3+1 statt ×2), anderswo die GLSL; kaputtes MSL wird abgelehnt; mit `caps['tensors']` ein `tensor_inline`-Kernel. |
 | `tests/media/209` | Recorder-Encoder (VIDEO-ENCODE-PLAN, A39): 24 Frames 256×144 mit `software` und `auto` auf jedem Backend, zurückgelesen mit `vio_video_info` / `vio_video_frame` – Frame-Zahl, Größe, wandernde und stehende Fläche an ihrem Ort in ihrer Farbe; `vio_recorder_info` nennt den Encoder; `VIO_REQUIRE_ZERO_COPY=d3d11` verlangt auf dem Hardware-Host D3D11 ohne CPU-Kopie. |
 | `tests/render3d/208` | `vio_upscale` (UPSCALE-PLAN, A21) 32→64 gegen dieselbe Szene in 64: spatial (kantenadaptives Lanczos-2) halbiert den Fehler gegenüber bilinear und hat die doppelte Kantenenergie, Schärfen schärft, Flächen bleiben exakt; temporal mit 16 gejitterten Frames ≈ ein Drittel des spatial-Fehlers, `reset` verwirft die Historie, Kameraschwenk mit Bewegungsvektoren ohne Geisterbilder; Swapchain-Ziel = RT-Ziel, Argument-Vertrag; auf Metal (macOS 13+) zusätzlich MetalFX. |
@@ -527,7 +527,9 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   nur das Objekt (`ctx->pending_tex_*`, pro Frame geleert); `vio_flush_pending_textures()`
   löst die Unit beim Draw über die Sampler-Map des *dann* gebundenen Shaders in den
   `[[texture(n)]]`- bzw. `t#`-Index auf. Damit sind — wie auf OpenGL — „bind vor
-  `vio_set_uniform('u_tex', unit)`" und „bind unter anderer Pipeline" korrekt (Test 095). Ein GL-Unit darf dabei nur **einen** Sampler
+  `vio_set_uniform('u_tex', unit)`" und „bind unter anderer Pipeline" korrekt (Test 095). Units, die der Shader nicht
+  sampelt, bleiben auf Metal ungebunden: Buffer und Texturen teilen sich den umnummerierten Index-Raum, die rohe
+  Unit-Nummer traf sonst einen echten `[[texture(n)]]` (095 „stray-units"; `vio_upscale` las so die vorige History). Ein GL-Unit darf dabei nur **einen** Sampler
   tragen; PHPolygon nutzt 0 Albedo, 1 SSAO, 2 SDF-AO, 3–5 Probe-3D, 6/8/9 CSM,
   7 Legacy-Shadow, 10 Environment-Cube.
 - **Render-Target-Orientierung**: ein RT, das mit GL-UVs gesampelt wird, ist auf Metal
