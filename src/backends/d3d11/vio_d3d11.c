@@ -309,9 +309,11 @@ static int d3d11_init(vio_config *cfg)
 }
 
 static void d3d11_dmip_release(void);
+static void d3d11_bundles_sweep(void);
 
 static void d3d11_shutdown(void)
 {
+    d3d11_bundles_sweep();
     d3d11_dmip_release();
     if (vio_d3d11.frame_latency_waitable) { CloseHandle(vio_d3d11.frame_latency_waitable); vio_d3d11.frame_latency_waitable = NULL; }
     for (int i = 0; i < 3; i++) {
@@ -4199,6 +4201,153 @@ static int d3d11_set_viewports(const int *rects, int count)
     return 0;
 }
 
+/* ── Recorded draw sequences (BUNDLE-PLAN phase 4) ─────────────────── */
+
+/* A bundle is a command list recorded on a deferred context. While one is
+ * recorded, vio_d3d11.context IS the deferred context: the common draw path
+ * (pipeline binds, the Map(WRITE_DISCARD) of the shader cbuffers, texture
+ * flushes, draws) records into it unchanged, and the command list keeps the
+ * discarded constant-buffer contents. A command list inherits no state, so the
+ * recording starts with the open target, viewports, scissors and pipeline;
+ * those belong to its signature. ExecuteCommandList restores the immediate
+ * context afterwards, so the state from before the bundle stays bound. */
+typedef struct _vio_d3d11_bundle {
+    ID3D11CommandList      *list;
+    ID3D11RenderTargetView *rtvs[VIO_MAX_COLOR_ATTACHMENTS];   /* signature; the list holds the references */
+    UINT                    rtv_count;
+    ID3D11DepthStencilView *dsv;
+    D3D11_VIEWPORT          vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT                    vp_count;
+    D3D11_RECT              sc[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT                    sc_count;
+    struct _vio_d3d11_bundle *prev, *next;   /* live bundles, swept at shutdown */
+} vio_d3d11_bundle;
+
+static ID3D11DeviceContext *d3d11_deferred;      /* created on first recording */
+static ID3D11DeviceContext *d3d11_rec_immediate; /* the immediate context while recording */
+static vio_d3d11_bundle    *d3d11_rec;
+static vio_d3d11_bundle    *d3d11_bundles;
+static struct { vio_d3d11_pipeline *pipe, *il_owner; ID3D11InputLayout *il; } d3d11_rec_saved;
+
+/* The immediate context's target, viewports and scissors (read before a
+ * recording swaps the context). */
+static void d3d11_bundle_signature(vio_d3d11_bundle *s)
+{
+    ID3D11DeviceContext *c = d3d11_rec ? d3d11_rec_immediate : vio_d3d11.context;
+    memset(s->rtvs, 0, sizeof(s->rtvs));
+    s->rtv_count = vio_d3d11.current_rtv_count < 0 ? 0 : (UINT)vio_d3d11.current_rtv_count;
+    if (s->rtv_count > VIO_MAX_COLOR_ATTACHMENTS) s->rtv_count = VIO_MAX_COLOR_ATTACHMENTS;
+    for (UINT i = 0; i < s->rtv_count; i++) s->rtvs[i] = vio_d3d11.current_rtvs[i];
+    if (s->rtv_count == 0 && vio_d3d11.current_rtv) { s->rtvs[0] = vio_d3d11.current_rtv; s->rtv_count = 1; }
+    s->dsv = vio_d3d11.current_dsv;
+    s->vp_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    ID3D11DeviceContext_RSGetViewports(c, &s->vp_count, s->vp);
+    s->sc_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    ID3D11DeviceContext_RSGetScissorRects(c, &s->sc_count, s->sc);
+}
+
+static int d3d11_bundle_matches(const vio_d3d11_bundle *b, const vio_d3d11_bundle *now)
+{
+    return b->rtv_count == now->rtv_count && b->dsv == now->dsv
+        && memcmp(b->rtvs, now->rtvs, sizeof(b->rtvs)) == 0
+        && b->vp_count == now->vp_count && memcmp(b->vp, now->vp, sizeof(D3D11_VIEWPORT) * b->vp_count) == 0
+        && b->sc_count == now->sc_count && memcmp(b->sc, now->sc, sizeof(D3D11_RECT) * b->sc_count) == 0;
+}
+
+static void d3d11_bundle_release(vio_d3d11_bundle *b)
+{
+    if (b->list) { ID3D11CommandList_Release(b->list); b->list = NULL; }
+    if (b->prev) b->prev->next = b->next; else if (d3d11_bundles == b) d3d11_bundles = b->next;
+    if (b->next) b->next->prev = b->prev;
+    b->prev = b->next = NULL;
+}
+
+/* Leave a recording: the immediate context and the caches that describe it
+ * come back; the deferred context is reset. */
+static void d3d11_bundle_stop(ID3D11CommandList **out)
+{
+    vio_d3d11.context        = d3d11_rec_immediate;
+    d3d11_current_pipeline   = d3d11_rec_saved.pipe;
+    d3d11_current_il         = d3d11_rec_saved.il;
+    d3d11_current_il_owner   = d3d11_rec_saved.il_owner;
+    d3d11_rec = NULL;
+    d3d11_rec_immediate = NULL;
+    ID3D11CommandList *list = NULL;
+    HRESULT hr = ID3D11DeviceContext_FinishCommandList(d3d11_deferred, FALSE, &list);
+    if (out && SUCCEEDED(hr)) *out = list;
+    else if (list) ID3D11CommandList_Release(list);
+}
+
+static void *d3d11_begin_bundle(void)
+{
+    if (!vio_d3d11.initialized || !vio_d3d11.device || !vio_d3d11.context || !vio_d3d11.in_frame || d3d11_rec) return NULL;
+    if (!d3d11_deferred && FAILED(ID3D11Device_CreateDeferredContext(vio_d3d11.device, 0, &d3d11_deferred))) {
+        d3d11_deferred = NULL;
+        return NULL;
+    }
+    vio_d3d11_bundle *b = (vio_d3d11_bundle *)calloc(1, sizeof(vio_d3d11_bundle));
+    if (!b) return NULL;
+    d3d11_bundle_signature(b);
+    b->next = d3d11_bundles;
+    if (d3d11_bundles) d3d11_bundles->prev = b;
+    d3d11_bundles = b;
+
+    ID3D11DeviceContext *dc = d3d11_deferred;
+    ID3D11DeviceContext_OMSetRenderTargets(dc, b->rtv_count, b->rtv_count ? b->rtvs : NULL, b->dsv);
+    if (b->vp_count) ID3D11DeviceContext_RSSetViewports(dc, b->vp_count, b->vp);
+    if (b->sc_count) ID3D11DeviceContext_RSSetScissorRects(dc, b->sc_count, b->sc);
+    d3d11_rec_saved.pipe     = d3d11_current_pipeline;
+    d3d11_rec_saved.il       = d3d11_current_il;
+    d3d11_rec_saved.il_owner = d3d11_current_il_owner;
+    d3d11_rec_immediate = vio_d3d11.context;
+    vio_d3d11.context   = dc;
+    d3d11_rec = b;
+    /* the pipeline bound now, for records without their own */
+    d3d11_current_il = NULL;
+    d3d11_current_il_owner = NULL;
+    if (d3d11_current_pipeline) d3d11_bind_pipeline(d3d11_current_pipeline);
+    return b;
+}
+
+static int d3d11_end_bundle(void *bundle)
+{
+    vio_d3d11_bundle *b = (vio_d3d11_bundle *)bundle;
+    if (!b || d3d11_rec != b) return -1;
+    d3d11_bundle_stop(&b->list);
+    return b->list ? 0 : -1;
+}
+
+static int d3d11_draw_bundle(void *bundle)
+{
+    vio_d3d11_bundle *b = (vio_d3d11_bundle *)bundle;
+    if (!b || !b->list || d3d11_rec || !vio_d3d11.in_frame || !vio_d3d11.context) return -1;
+    vio_d3d11_bundle now;
+    d3d11_bundle_signature(&now);
+    if (!d3d11_bundle_matches(b, &now)) return -1;   /* another target: recorded again */
+    ID3D11DeviceContext_ExecuteCommandList(vio_d3d11.context, b->list, TRUE);
+    return 0;
+}
+
+static void d3d11_destroy_bundle(void *bundle)
+{
+    vio_d3d11_bundle *b = (vio_d3d11_bundle *)bundle;
+    if (!b) return;
+    if (d3d11_rec == b) d3d11_bundle_stop(NULL);
+    d3d11_bundle_release(b);
+    free(b);
+}
+
+/* Device shutdown: no command list outlives the device (the PHP objects free
+ * the structs later). */
+static void d3d11_bundles_sweep(void)
+{
+    if (d3d11_rec) d3d11_bundle_stop(NULL);
+    while (d3d11_bundles) d3d11_bundle_release(d3d11_bundles);
+    if (d3d11_deferred) { ID3D11DeviceContext_Release(d3d11_deferred); d3d11_deferred = NULL; }
+}
+
+static const char *d3d11_bundle_method(void) { return "deferred_context"; }
+
 /* ── Setup context (called from vio_create after window creation) ── */
 
 int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg)
@@ -4284,6 +4433,11 @@ static const vio_backend d3d11_backend = {
     .gpu_info                = d3d11_gpu_info,
     .describe                = d3d11_describe,
     .enumerate_adapters      = d3d11_enumerate_adapters,
+    .begin_bundle            = d3d11_begin_bundle,
+    .end_bundle              = d3d11_end_bundle,
+    .draw_bundle             = d3d11_draw_bundle,
+    .destroy_bundle          = d3d11_destroy_bundle,
+    .bundle_method           = d3d11_bundle_method,
 };
 
 void vio_backend_d3d11_register(void)

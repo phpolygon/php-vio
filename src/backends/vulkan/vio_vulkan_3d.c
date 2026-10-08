@@ -87,6 +87,7 @@ typedef struct {
 
 static vk3d_bundle *vk3d_rec;    /* the bundle being recorded, NULL otherwise */
 static vk3d_bundle *vk3d_live;   /* every bundle with GPU objects */
+static vio_vk3d_pipeline *vk3d_rec_saved_pipeline;   /* bound before the recording, bound again after it */
 static void vk3d_bundles_sweep(void);
 static vk3d_frame *vk3d_cur_frame(void)
 {
@@ -1151,6 +1152,7 @@ void *vio_vk3d_begin_bundle(void)
     (void)n;
     vk3d.last_set = VK_NULL_HANDLE;   /* no frame descriptor set inside the bundle */
     memset(vk3d.ubo_buf, 0, sizeof(vk3d.ubo_buf));
+    vk3d_rec_saved_pipeline = vk3d.pipeline;
     vk3d_rec = b;
     return b;
 }
@@ -1160,6 +1162,7 @@ int vio_vk3d_end_bundle(void *bundle)
     vk3d_bundle *b = (vk3d_bundle *)bundle;
     if (!b || vk3d_rec != b) return -1;
     vk3d_rec = NULL;
+    vk3d.pipeline = vk3d_rec_saved_pipeline;   /* the state from before the bundle stays */
     vk3d.last_set = VK_NULL_HANDLE;   /* no bundle descriptor set in the frame either */
     memset(vk3d.ubo_buf, 0, sizeof(vk3d.ubo_buf));
     if (vkEndCommandBuffer(b->cmd) != VK_SUCCESS || b->failed) return -1;

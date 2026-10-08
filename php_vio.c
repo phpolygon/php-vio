@@ -6586,6 +6586,27 @@ ZEND_FUNCTION(vio_bundle)
     } ZEND_HASH_FOREACH_END();
 }
 
+/* Native bundles (BUNDLE-PLAN phases 2-4) bake the shader cbuffers in while
+ * recording and leave the backend's buffers in an undefined state for the
+ * draws after them: every shader the bundle touches uploads again. */
+static void vio_shader_cbuffers_dirty(vio_shader_object *sh)
+{
+    if (!sh) return;
+    sh->cbuffer_dirty = 1;
+    sh->frag_cbuffer_dirty = 1;
+    for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) if (sh->stage_cb[i]) sh->stage_cb[i]->dirty = 1;
+}
+
+static void vio_bundle_cbuffers_dirty(vio_context_object *ctx, vio_bundle_object *b)
+{
+    vio_shader_cbuffers_dirty((vio_shader_object *)ctx->bound_shader_object);
+    for (int i = 0; i < b->count; i++) {
+        if (!b->records[i].pipeline) continue;
+        vio_pipeline_object *pipe = vio_pipeline_from_obj(b->records[i].pipeline);
+        vio_shader_cbuffers_dirty((vio_shader_object *)pipe->shader_ref);
+    }
+}
+
 ZEND_FUNCTION(vio_draw_bundle)
 {
     zval *ctx_zval, *bundle_zval;
@@ -6605,13 +6626,21 @@ ZEND_FUNCTION(vio_draw_bundle)
      * it, or record it once - the backend records while the records run
      * through the common draw path below - and play that. */
     const vio_backend *be = ctx->backend;
-    if (b->backend_bundle && b->backend == be && be->draw_bundle && be->draw_bundle(b->backend_bundle) == 0) RETURN_TRUE;
+    if (b->backend_bundle && b->backend == be && be->draw_bundle && be->draw_bundle(b->backend_bundle) == 0) {
+        vio_bundle_cbuffers_dirty(ctx, b);
+        RETURN_TRUE;
+    }
     if (b->backend_bundle && b->backend && ((const vio_backend *)b->backend)->destroy_bundle)
         ((const vio_backend *)b->backend)->destroy_bundle(b->backend_bundle);
     b->backend_bundle = NULL;
     b->backend = NULL;
     void *rec = (be->begin_bundle && be->end_bundle && be->draw_bundle) ? be->begin_bundle() : NULL;
-    for (int pass = rec ? 0 : 1; pass < 2; pass++) {
+    /* A native recording starts from the shadow values (a recording backend
+     * uploads on the first draw of each shader) and leaves the pipeline bound
+     * before it in place, like its later plays. */
+    unsigned int saved_program = ctx->bound_shader_program;
+    void *saved_shader = ctx->bound_shader_object;
+    if (rec) vio_bundle_cbuffers_dirty(ctx, b);    for (int pass = rec ? 0 : 1; pass < 2; pass++) {
     /* The records through the vio_submit_batch core (pass 0: recording). */
     vio_pipeline_object *last_pipeline = NULL;
     for (int i = 0; i < b->count; i++) {
@@ -6633,13 +6662,17 @@ ZEND_FUNCTION(vio_draw_bundle)
         vio_submit_one(ctx, vio_mesh_from_obj(r->mesh));
     }
     if (pass == 0) {
-        if (be->end_bundle(rec) == 0 && be->draw_bundle(rec) == 0) {
+        int ok = be->end_bundle(rec) == 0;
+        ctx->bound_shader_program = saved_program;
+        ctx->bound_shader_object = saved_shader;
+        if (ok && be->draw_bundle(rec) == 0) {
             b->backend_bundle = rec;
             b->backend = be;
+            vio_bundle_cbuffers_dirty(ctx, b);
             RETURN_TRUE;
         }
         if (be->destroy_bundle) be->destroy_bundle(rec);   /* replay instead */
-    }
+        vio_bundle_cbuffers_dirty(ctx, b);    }
     }
     RETURN_TRUE;
 }

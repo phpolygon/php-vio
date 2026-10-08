@@ -423,6 +423,17 @@ static void d3d12_retire_later(ID3D12Resource *res, UINT64 fence);
 static void d3d12_retire_object_later(IUnknown *obj, UINT64 fence);
 static void d3d12_release_parked(UINT slot);
 static void d3d12_release_parked_all(void);
+/* Recorded draw sequences (BUNDLE-PLAN phase 3), defined with the draw code. */
+typedef struct _vio_d3d12_bundle vio_d3d12_bundle;
+static vio_d3d12_bundle *d3d12_brec;   /* the bundle being recorded, NULL otherwise */
+static void d3d12_brec_fail(void);
+static int  d3d12_brec_sampler_table(const int *combos, D3D12_GPU_DESCRIPTOR_HANDLE *out);
+static void d3d12_bundles_sweep(void);
+static void d3d12_bundle_graves_collect(int force);
+/* The top of the sampler heap holds the sampler tables of bundles (one per
+ * distinct set, kept for the device's life); the frame rings share the rest. */
+#define VIO_D3D12_BUNDLE_SAMPLER_SETS    32
+#define VIO_D3D12_BUNDLE_SAMPLER_RESERVE (VIO_D3D12_BUNDLE_SAMPLER_SETS * VIO_D3D12_SAMPLER_TABLE_SIZE)
 
 /* Shading-rate image (VIO_FEATURE_SHADING_RATE_IMAGE, Tier 2): an R8_UINT
  * texture with one D3D12_SHADING_RATE per tile. A new tile count recreates it -
@@ -1786,6 +1797,7 @@ static void d3d12_shutdown(void)
 
     /* Wait for GPU to finish all work */
     vio_d3d12_wait_for_gpu();
+    d3d12_bundles_sweep();
 
     if (vio_d3d12.vrs_image) { ID3D12Resource_Release(vio_d3d12.vrs_image); vio_d3d12.vrs_image = NULL; }
     vio_d3d12.vrs_image_active = 0;
@@ -3042,6 +3054,9 @@ static void d3d12_bind_pipeline(void *pipeline_ptr)
     if (!p) return;
 
     d3d12_current_pipeline = p;
+    /* A bundle inherits the shading rate and cannot set the view mask; a
+     * pipeline that needs either (or sampler feedback) is replayed instead. */
+    if (d3d12_brec && (p->view_count > 1 || p->writes_shading_rate || p->uses_feedback || p->is_mesh)) d3d12_brec_fail();
     ID3D12GraphicsCommandList_SetPipelineState(vio_d3d12.cmd_list,
         d3d12_pipeline_pso_for_target(p, vio_d3d12.current_rt_samples, vio_d3d12.current_rt_format));
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(vio_d3d12.cmd_list,
@@ -3049,7 +3064,7 @@ static void d3d12_bind_pipeline(void *pipeline_ptr)
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(vio_d3d12.cmd_list, p->topology);
     ID3D12GraphicsCommandList_OMSetStencilRef(vio_d3d12.cmd_list, p->stencil_ref);
     d3d12_apply_view_mask();   /* also covers vio_draw_instanced's draw in php_vio.c */
-    if (vio_d3d12.vrs_tier >= 2) d3d12_apply_shading_rate();   /* the combiner follows the pipeline */
+    if (vio_d3d12.vrs_tier >= 2 && !d3d12_brec) d3d12_apply_shading_rate();   /* the combiner follows the pipeline */
 
     /* Bind SRV + sampler heaps. Also invalidates the cached root arguments for
      * params 2 / 4 (SetGraphicsRootSignature / SetDescriptorHeaps may reset
@@ -6494,6 +6509,7 @@ static void d3d12_begin_frame(void)
      * event log. Drain on every frame; the InfoQueue normally only fills up
      * on real errors, so the spam stays bounded in practice. */
     d3d12_drain_info_queue("begin_frame");
+    d3d12_bundle_graves_collect(0);
 
     /* Waitable swapchain: block until DXGI has a backbuffer for us (caps the
      * CPU at frame_latency frames ahead — the input-latency control). A bounded
@@ -6700,7 +6716,7 @@ static void d3d12_begin_frame(void)
      * is stale. Force the first flush of THIS frame to rebuild. */
     vio_d3d12.srv_table_bound = 0;
     /* Same for the sampler ring + its per-frame set cache. */
-    vio_d3d12.sampler_frame_capacity = VIO_D3D12_SAMPLER_HEAP_CAPACITY / vio_d3d12.frame_count;
+    vio_d3d12.sampler_frame_capacity = (VIO_D3D12_SAMPLER_HEAP_CAPACITY - VIO_D3D12_BUNDLE_SAMPLER_RESERVE) / vio_d3d12.frame_count;
     vio_d3d12.sampler_frame_base     = vio_d3d12.frame_index * vio_d3d12.sampler_frame_capacity;
     vio_d3d12.sampler_frame_offset   = vio_d3d12.sampler_frame_base;
     vio_d3d12.sampler_set_count      = 0;
@@ -9283,6 +9299,14 @@ static void d3d12_flush_sampler_table(void)
         combos[i] = vio_d3d12.pending_srv_valid[i] ? vio_d3d12.pending_samplers[i] : 0;
     }
 
+    /* Recording a bundle: a table outside the frame rings. */
+    if (d3d12_brec) {
+        D3D12_GPU_DESCRIPTOR_HANDLE g;
+        if (d3d12_brec_sampler_table(combos, &g) == 0) d3d12_set_sampler_tables(g);
+        else d3d12_brec_fail();
+        return;
+    }
+
     /* Already bound with this exact set? */
     if (vio_d3d12.sampler_table_bound &&
         memcmp(combos, vio_d3d12.sampler_set_cache[0].combos, sizeof(combos)) == 0) {
@@ -9397,7 +9421,10 @@ void vio_d3d12_flush_srv_table(void)
      * heap) so we can't bleed into another frame's slice. */
     UINT base_idx = vio_d3d12.srv_frame_offset;
     UINT region_end = vio_d3d12.srv_frame_base + vio_d3d12.srv_frame_capacity;
-    if (base_idx + VIO_D3D12_SRV_TABLE_SIZE > region_end) return; /* out of space in this frame's region */
+    if (base_idx + VIO_D3D12_SRV_TABLE_SIZE > region_end) {   /* out of space in this frame's region */
+        if (d3d12_brec) d3d12_brec_fail();                      /* the bundle's range: record it again larger */
+        return;
+    }
     vio_d3d12.srv_frame_offset += VIO_D3D12_SRV_TABLE_SIZE;
 
     D3D12_CPU_DESCRIPTOR_HANDLE dst_cpu;
@@ -9505,6 +9532,295 @@ int vio_d3d12_setup_context(void *glfw_window, vio_config *cfg)
     return 0;
 }
 
+/* ── Recorded draw sequences (BUNDLE-PLAN phase 3) ─────────────────── */
+
+/* A bundle is a D3D12 bundle command list. While one is recorded the draw
+ * path records into it unchanged: vio_d3d12.cmd_list is the bundle list, the
+ * cbuffer ring is a bundle-owned upload buffer (the root CBVs point into it in
+ * every later frame), the SRV ring a bundle-owned range of the shader-visible
+ * heap and sampler tables come from a reserve at the top of the sampler heap.
+ * A bundle inherits the target, viewports and heaps of the list that runs it,
+ * so its signature is the PSO variant (samples, format); after it the bound
+ * pipeline is armed again (a bundle leaks its PSO and root arguments). */
+struct _vio_d3d12_bundle {
+    ID3D12CommandAllocator    *alloc;
+    ID3D12GraphicsCommandList *list;
+    ID3D12Resource            *cb;
+    unsigned char             *cb_mapped;
+    D3D12_GPU_VIRTUAL_ADDRESS  cb_gpu;
+    UINT                       cb_size;
+    UINT                       srv_base, srv_count;
+    UINT                       samples;
+    DXGI_FORMAT                format;
+    int                        failed;
+    int                        released;    /* GPU objects gone with the device */
+    UINT64                     grave_fence; /* destroyed: free once this passed (0 = in the open frame) */
+    struct _vio_d3d12_bundle  *prev, *next;
+};
+
+static vio_d3d12_bundle *d3d12_bundles;   /* live bundles */
+static vio_d3d12_bundle *d3d12_graves;    /* destroyed, waiting for their fence */
+static UINT d3d12_bundle_cb_hint  = 256 * 1024;
+static UINT d3d12_bundle_srv_hint = 64;   /* tables */
+static struct { int combos[VIO_D3D12_SAMPLER_TABLE_SIZE]; } d3d12_bundle_samplers[VIO_D3D12_BUNDLE_SAMPLER_SETS];
+static int d3d12_bundle_sampler_count;
+/* freed SRV ranges, reused for a range of the same size */
+static struct { UINT base, count; } d3d12_srv_free[32];
+static int d3d12_srv_free_count;
+static struct {
+    ID3D12GraphicsCommandList *cmd_list;
+    ID3D12Resource            *cb_heap;
+    unsigned char             *cb_mapped;
+    D3D12_GPU_VIRTUAL_ADDRESS  cb_gpu;
+    UINT                       cb_offset, cb_capacity, cb_base, cb_end;
+    UINT                       srv_offset, srv_base, srv_capacity;
+    vio_d3d12_pipeline        *pipe;
+} d3d12_brec_saved;
+
+static void d3d12_brec_fail(void) { if (d3d12_brec) d3d12_brec->failed = 1; }
+
+static int d3d12_brec_sampler_table(const int *combos, D3D12_GPU_DESCRIPTOR_HANDLE *out)
+{
+    if (!vio_d3d12.sampler_heap || !vio_d3d12.sampler_combo_heap) return -1;
+    int i;
+    for (i = 0; i < d3d12_bundle_sampler_count; i++)
+        if (memcmp(d3d12_bundle_samplers[i].combos, combos, sizeof(d3d12_bundle_samplers[i].combos)) == 0) break;
+    UINT base = VIO_D3D12_SAMPLER_HEAP_CAPACITY - VIO_D3D12_BUNDLE_SAMPLER_RESERVE + (UINT)i * VIO_D3D12_SAMPLER_TABLE_SIZE;
+    if (i == d3d12_bundle_sampler_count) {
+        if (i >= VIO_D3D12_BUNDLE_SAMPLER_SETS) return -1;
+        D3D12_CPU_DESCRIPTOR_HANDLE dst, combo_base, srcs[VIO_D3D12_SAMPLER_TABLE_SIZE];
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.sampler_heap, &dst);
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.sampler_combo_heap, &combo_base);
+        dst.ptr += (SIZE_T)base * vio_d3d12.sampler_descriptor_size;
+        for (int s = 0; s < VIO_D3D12_SAMPLER_TABLE_SIZE; s++)
+            srcs[s].ptr = combo_base.ptr + (SIZE_T)combos[s] * vio_d3d12.sampler_descriptor_size;
+        UINT n = VIO_D3D12_SAMPLER_TABLE_SIZE;
+        ID3D12Device_CopyDescriptors(vio_d3d12.device, 1, &dst, &n, VIO_D3D12_SAMPLER_TABLE_SIZE, srcs, NULL,
+                                     D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        memcpy(d3d12_bundle_samplers[i].combos, combos, sizeof(d3d12_bundle_samplers[i].combos));
+        d3d12_bundle_sampler_count++;
+    }
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.sampler_heap, out);
+    out->ptr += (UINT64)base * vio_d3d12.sampler_descriptor_size;
+    return 0;
+}
+
+/* A contiguous range of the shader-visible SRV heap that outlives frames: a
+ * freed one of the same size, else carved from the static (downward) region. */
+static int d3d12_bundle_srv_alloc(UINT count, UINT *base)
+{
+    for (int i = 0; i < d3d12_srv_free_count; i++) {
+        if (d3d12_srv_free[i].count != count) continue;
+        *base = d3d12_srv_free[i].base;
+        d3d12_srv_free[i] = d3d12_srv_free[--d3d12_srv_free_count];
+        return 0;
+    }
+    if (vio_d3d12.srv_heap.count + count > vio_d3d12.srv_heap.capacity) return -1;
+    vio_d3d12.srv_heap.count += count;
+    *base = vio_d3d12.srv_heap.capacity - vio_d3d12.srv_heap.count;
+    return 0;
+}
+
+static void d3d12_bundle_unlink(vio_d3d12_bundle *b)
+{
+    if (b->prev) b->prev->next = b->next; else if (d3d12_bundles == b) d3d12_bundles = b->next;
+    if (b->next) b->next->prev = b->prev;
+    b->prev = b->next = NULL;
+}
+
+/* Release the GPU objects (the GPU is done with them); the range goes back to
+ * the free list unless the device is going away. */
+static void d3d12_bundle_release(vio_d3d12_bundle *b, int keep_range)
+{
+    if (b->list)  { ID3D12GraphicsCommandList_Release(b->list); b->list = NULL; }
+    if (b->alloc) { ID3D12CommandAllocator_Release(b->alloc); b->alloc = NULL; }
+    if (b->cb)    { ID3D12Resource_Release(b->cb); b->cb = NULL; b->cb_mapped = NULL; }
+    if (keep_range && b->srv_count && d3d12_srv_free_count < (int)(sizeof(d3d12_srv_free) / sizeof(d3d12_srv_free[0]))) {
+        d3d12_srv_free[d3d12_srv_free_count].base = b->srv_base;
+        d3d12_srv_free[d3d12_srv_free_count].count = b->srv_count;
+        d3d12_srv_free_count++;
+    }
+    b->srv_count = 0;
+    b->released = 1;
+}
+
+static void d3d12_bundle_graves_collect(int force)
+{
+    UINT64 done = vio_d3d12.fence ? ID3D12Fence_GetCompletedValue(vio_d3d12.fence) : UINT64_MAX;
+    vio_d3d12_bundle **pp = &d3d12_graves;
+    while (*pp) {
+        vio_d3d12_bundle *b = *pp;
+        /* the frame it died in is submitted now: its signal is at most fence_value */
+        if (!force && b->grave_fence == 0) b->grave_fence = vio_d3d12.fence_value;
+        if (force || b->grave_fence <= done) {
+            *pp = b->next;
+            d3d12_bundle_release(b, !force);
+            free(b);
+        } else {
+            pp = &b->next;
+        }
+    }
+}
+
+/* Leave a recording: the frame's list, rings and pipeline come back. */
+static void d3d12_bundle_stop(void)
+{
+    vio_d3d12.cmd_list              = d3d12_brec_saved.cmd_list;
+    vio_d3d12.cbuffer_heap          = d3d12_brec_saved.cb_heap;
+    vio_d3d12.cbuffer_heap_mapped   = d3d12_brec_saved.cb_mapped;
+    vio_d3d12.cbuffer_heap_gpu      = d3d12_brec_saved.cb_gpu;
+    vio_d3d12.cbuffer_heap_offset   = d3d12_brec_saved.cb_offset;
+    vio_d3d12.cbuffer_heap_capacity = d3d12_brec_saved.cb_capacity;
+    vio_d3d12.cbuffer_frame_base    = d3d12_brec_saved.cb_base;
+    vio_d3d12.cbuffer_frame_end     = d3d12_brec_saved.cb_end;
+    vio_d3d12.srv_frame_offset      = d3d12_brec_saved.srv_offset;
+    vio_d3d12.srv_frame_base        = d3d12_brec_saved.srv_base;
+    vio_d3d12.srv_frame_capacity    = d3d12_brec_saved.srv_capacity;
+    d3d12_current_pipeline          = d3d12_brec_saved.pipe;
+    vio_d3d12.srv_table_bound       = 0;
+    vio_d3d12.sampler_table_bound   = 0;
+    d3d12_brec = NULL;
+}
+
+static void *d3d12_begin_bundle(void)
+{
+    if (!vio_d3d12.initialized || !vio_d3d12.in_frame || !vio_d3d12.cmd_list || vio_d3d12.device_lost
+        || d3d12_brec || !vio_d3d12.cbuffer_heap || !vio_d3d12.srv_heap.heap) return NULL;
+    if (vio_d3d12.vrs_image_active) return NULL;   /* bundles cannot carry the shading-rate image combiner */
+    vio_d3d12_bundle *b = (vio_d3d12_bundle *)calloc(1, sizeof(vio_d3d12_bundle));
+    if (!b) return NULL;
+    b->samples = vio_d3d12.current_rt_samples;
+    b->format  = vio_d3d12.current_rt_format;
+    b->cb_size = d3d12_bundle_cb_hint + 65536;   /* + one maximal CBV: an allocation never runs out unseen */
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = b->cb_size;
+    rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_RANGE none = {0, 0};
+    if (FAILED(ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                   &IID_ID3D12CommandAllocator, (void **)&b->alloc))
+        || FAILED(ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, b->alloc, NULL,
+                                                 &IID_ID3D12GraphicsCommandList, (void **)&b->list))
+        || FAILED(ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                       D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                                                       &IID_ID3D12Resource, (void **)&b->cb))
+        || FAILED(ID3D12Resource_Map(b->cb, 0, &none, (void **)&b->cb_mapped))
+        || d3d12_bundle_srv_alloc(d3d12_bundle_srv_hint * VIO_D3D12_SRV_TABLE_SIZE, &b->srv_base) != 0) {
+        d3d12_bundle_release(b, 0);
+        free(b);
+        return NULL;
+    }
+    b->srv_count = d3d12_bundle_srv_hint * VIO_D3D12_SRV_TABLE_SIZE;
+    b->cb_gpu = ID3D12Resource_GetGPUVirtualAddress(b->cb);
+    b->next = d3d12_bundles;
+    if (d3d12_bundles) d3d12_bundles->prev = b;
+    d3d12_bundles = b;
+
+    d3d12_brec_saved.cmd_list     = vio_d3d12.cmd_list;
+    d3d12_brec_saved.cb_heap      = vio_d3d12.cbuffer_heap;
+    d3d12_brec_saved.cb_mapped    = vio_d3d12.cbuffer_heap_mapped;
+    d3d12_brec_saved.cb_gpu       = vio_d3d12.cbuffer_heap_gpu;
+    d3d12_brec_saved.cb_offset    = vio_d3d12.cbuffer_heap_offset;
+    d3d12_brec_saved.cb_capacity  = vio_d3d12.cbuffer_heap_capacity;
+    d3d12_brec_saved.cb_base      = vio_d3d12.cbuffer_frame_base;
+    d3d12_brec_saved.cb_end       = vio_d3d12.cbuffer_frame_end;
+    d3d12_brec_saved.srv_offset   = vio_d3d12.srv_frame_offset;
+    d3d12_brec_saved.srv_base     = vio_d3d12.srv_frame_base;
+    d3d12_brec_saved.srv_capacity = vio_d3d12.srv_frame_capacity;
+    d3d12_brec_saved.pipe         = d3d12_current_pipeline;
+    vio_d3d12.cmd_list              = b->list;
+    vio_d3d12.cbuffer_heap          = b->cb;
+    vio_d3d12.cbuffer_heap_mapped   = b->cb_mapped;
+    vio_d3d12.cbuffer_heap_gpu      = b->cb_gpu;
+    vio_d3d12.cbuffer_heap_offset   = 0;
+    vio_d3d12.cbuffer_heap_capacity = b->cb_size;
+    vio_d3d12.cbuffer_frame_base    = 0;
+    vio_d3d12.cbuffer_frame_end     = b->cb_size;
+    vio_d3d12.srv_frame_offset      = b->srv_base;
+    vio_d3d12.srv_frame_base        = b->srv_base;
+    vio_d3d12.srv_frame_capacity    = b->srv_count;
+    vio_d3d12.srv_table_bound       = 0;
+    vio_d3d12.sampler_table_bound   = 0;
+    d3d12_brec = b;
+    /* the pipeline bound now, for records without their own (also sets the
+     * root signature and the heaps, which must equal the caller's) */
+    if (d3d12_current_pipeline) d3d12_bind_pipeline(d3d12_current_pipeline);
+    else vio_d3d12_bind_graphics_heaps(b->list);
+    return b;
+}
+
+static int d3d12_end_bundle(void *bundle)
+{
+    vio_d3d12_bundle *b = (vio_d3d12_bundle *)bundle;
+    if (!b || d3d12_brec != b) return -1;
+    UINT cb_used  = vio_d3d12.cbuffer_heap_offset;
+    UINT srv_used = vio_d3d12.srv_frame_offset - b->srv_base;
+    d3d12_bundle_stop();
+    HRESULT hr = ID3D12GraphicsCommandList_Close(b->list);
+    /* Out of room: the next recording of a bundle gets more. */
+    if (cb_used + 65536 > b->cb_size) {
+        b->failed = 1;
+        if (d3d12_bundle_cb_hint < cb_used * 2) d3d12_bundle_cb_hint = cb_used * 2;
+    }
+    if (b->failed && srv_used + VIO_D3D12_SRV_TABLE_SIZE > b->srv_count && d3d12_bundle_srv_hint < 4096)
+        d3d12_bundle_srv_hint *= 2;
+    return (FAILED(hr) || b->failed) ? -1 : 0;
+}
+
+static int d3d12_draw_bundle(void *bundle)
+{
+    vio_d3d12_bundle *b = (vio_d3d12_bundle *)bundle;
+    if (!b || !b->list || b->failed || b->released || d3d12_brec || !vio_d3d12.in_frame || !vio_d3d12.cmd_list
+        || vio_d3d12.device_lost) return -1;
+    if (b->samples != vio_d3d12.current_rt_samples || b->format != vio_d3d12.current_rt_format
+        || vio_d3d12.vrs_image_active) return -1;   /* recorded again */
+    /* the bundle sets the graphics root signature and heaps: the caller's must match */
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(vio_d3d12.cmd_list, vio_d3d12.root_signature);
+    vio_d3d12_bind_graphics_heaps(vio_d3d12.cmd_list);
+    ID3D12GraphicsCommandList_ExecuteBundle(vio_d3d12.cmd_list, b->list);
+    /* the bundle's PSO, topology and root arguments stay on the list */
+    if (d3d12_current_pipeline) d3d12_bind_pipeline(d3d12_current_pipeline);
+    vio_d3d12.srv_table_bound = 0;
+    vio_d3d12.sampler_table_bound = 0;
+    return 0;
+}
+
+static void d3d12_destroy_bundle(void *bundle)
+{
+    vio_d3d12_bundle *b = (vio_d3d12_bundle *)bundle;
+    if (!b) return;
+    if (d3d12_brec == b) { d3d12_bundle_stop(); ID3D12GraphicsCommandList_Close(b->list); }
+    if (b->released || !vio_d3d12.device) { d3d12_bundle_release(b, 0); free(b); return; }
+    d3d12_bundle_unlink(b);
+    /* In the open frame its list may run in this frame: the fence of this frame
+     * is known once it is submitted (begin_frame). */
+    b->grave_fence = vio_d3d12.in_frame ? 0 : vio_d3d12.fence_value;
+    b->next = d3d12_graves;
+    d3d12_graves = b;
+    if (!vio_d3d12.in_frame) d3d12_bundle_graves_collect(0);
+}
+
+/* Device shutdown (GPU idle): no bundle object outlives the device; the PHP
+ * objects free their structs later. */
+static void d3d12_bundles_sweep(void)
+{
+    if (d3d12_brec) { vio_d3d12_bundle *b = d3d12_brec; d3d12_bundle_stop(); ID3D12GraphicsCommandList_Close(b->list); }
+    d3d12_bundle_graves_collect(1);
+    while (d3d12_bundles) {
+        vio_d3d12_bundle *b = d3d12_bundles;
+        d3d12_bundle_unlink(b);
+        d3d12_bundle_release(b, 0);
+    }
+    d3d12_bundle_sampler_count = 0;
+    d3d12_srv_free_count = 0;
+}
+
+static const char *d3d12_bundle_method(void) { return "bundle"; }
+
 /* ── Backend registration ─────────────────────────────────────────── */
 
 static const vio_backend d3d12_backend = {
@@ -9597,6 +9913,11 @@ static const vio_backend d3d12_backend = {
     .create_rt_pipeline             = d3d12_create_rt_pipeline,
     .destroy_rt_pipeline            = d3d12_destroy_rt_pipeline,
     .trace_rays                     = d3d12_trace_rays,
+    .begin_bundle                   = d3d12_begin_bundle,
+    .end_bundle                     = d3d12_end_bundle,
+    .draw_bundle                    = d3d12_draw_bundle,
+    .destroy_bundle                 = d3d12_destroy_bundle,
+    .bundle_method                  = d3d12_bundle_method,
 };
 
 void vio_backend_d3d12_register(void)

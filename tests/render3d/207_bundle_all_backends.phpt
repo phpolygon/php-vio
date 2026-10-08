@@ -73,7 +73,7 @@ function run_backend(string $name): string {
     if ($got !== $want) $fail[] = "swapchain: bundle differs from the one-by-one draws";
     /* backends that record natively (BUNDLE-PLAN phases 2-4) */
     $info = vio_bundle_info($bundle);
-    if (in_array($name, ['vulkan'], true) && ($info['native'] !== true || $info['method'] === 'replay'))
+    if (in_array($name, ['vulkan', 'd3d11', 'd3d12'], true) && ($info['native'] !== true || $info['method'] === 'replay'))
         $fail[] = "$name: not recorded natively: " . json_encode($info);
     /* a second frame plays it again */
     if ($frame(fn() => vio_draw_bundle($ctx, $bundle)) !== $want) $fail[] = "second frame differs";
@@ -103,6 +103,28 @@ function run_backend(string $name): string {
         $rows = fn(string $p): array => str_split($p, $W * 4);
         if ($rows($a) !== $rows($want) && array_reverse($rows($a)) !== $rows($want)) $fail[] = "render target: differs from the swapchain picture";
     }
+
+    /* A large bundle (more uniform bytes than a first native recording reserves)
+     * and a bundle freed inside the frame that drew it. */
+    $flat2 = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $VS, 'fragment' => $FS_FLAT])] + $base);
+    $quad2 = vio_mesh($ctx, ['vertices' => [-1,-1, 1,-1, 1,1, -1,1], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT2]]);
+    $many = [];
+    for ($i = 0; $i < 1200; $i++) {
+        $many[] = ['mesh' => $quad2, 'pipeline' => $flat2, 'uniforms' => [
+            'u_tint' => [($i % 7) / 6, ($i % 5) / 4, ($i % 3) / 2, 1.0],
+            'u_offset' => [-0.66 + 0.66 * ($i % 3), $i % 2 ? 0.5 : -0.5]]];
+    }
+    $big = vio_bundle($ctx, $many);
+    $wantBig = $frame(function () use ($ctx, $many) {
+        foreach ($many as $r) { vio_bind_pipeline($ctx, $r['pipeline']); vio_set_uniforms($ctx, $r['uniforms']); vio_draw($ctx, $r['mesh']); }
+    });
+    for ($k = 0; $k < 3; $k++) {
+        if ($frame(fn() => vio_draw_bundle($ctx, $big)) !== $wantBig) { $fail[] = "large bundle differs in frame $k"; break; }
+    }
+    if (in_array($name, ['vulkan', 'd3d11', 'd3d12'], true) && vio_bundle_info($big)['native'] !== true)
+        $fail[] = "$name: large bundle not native after three frames";
+    $frame(function () use ($ctx, &$big) { vio_draw_bundle($ctx, $big); $big = null; gc_collect_cycles(); });
+    if ($frame(fn() => vio_draw_bundle($ctx, $bundle)) !== $want) $fail[] = "after freeing a bundle mid-frame: differs";
 
     /* contract */
     if (@vio_draw_bundle($ctx, $bundle) !== false) $fail[] = "vio_draw_bundle outside a frame accepted";
