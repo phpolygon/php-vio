@@ -15,6 +15,8 @@ typedef struct _vio_opengl_state {
     unsigned int default_shader_pos_only;
     int          initialized;
     int          in_frame;      /* between begin_frame and end_frame: vio_clear clears eagerly */
+    unsigned int clip_program;  /* program of the bound pipeline and the gl_ClipDistance */
+    int          clip_count;    /* planes its last geometry stage writes (A29) */
     float        clear_r, clear_g, clear_b, clear_a;
 
     /* Runtime-detected capabilities. Filled by vio_opengl_setup_context()

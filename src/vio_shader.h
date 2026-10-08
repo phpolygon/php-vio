@@ -67,6 +67,7 @@ typedef struct _vio_shader_object {
     vio_shader_stage_cb *stage_cb[VIO_EXTRA_STAGE_COUNT];
     int               has_geometry;  /* 1 => geometry stage present */
     int               has_tessellation; /* 1 => tess control + eval present */
+    int               clip_distances, clip_known;  /* gl_ClipDistance entries of the last geometry stage (OpenGL, lazy) */
     int               view_count;    /* multiview views (2..4), 0 = off */
     /* Multiview by instancing (OPEN-ITEMS-PLAN A10, backends without views of
      * their own): the rewritten vertex / fragment GLSL that was compiled. */

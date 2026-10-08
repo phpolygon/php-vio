@@ -1702,3 +1702,55 @@ void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv
         vio_reflect_free(&r);
     }
 }
+
+/* ── gl_ClipDistance outputs (OPEN-ITEMS-PLAN A29) ──────────────────── */
+
+int vio_spirv_output_clip_distances(const uint32_t *w, size_t size)
+{
+    size_t n = size / 4;
+    if (!w || n < 5 || w[0] != 0x07230203) return 0;
+    uint32_t bound = w[3];
+    size_t *def = (size_t *)calloc(bound, sizeof(size_t));
+    int32_t *member = (int32_t *)malloc(bound * sizeof(int32_t));   /* struct -> ClipDistance member */
+    unsigned char *var = (unsigned char *)calloc(bound, 1);          /* variable decorated ClipDistance */
+    int result = 0;
+    if (!def || !member || !var) goto done;
+    for (uint32_t i = 0; i < bound; i++) member[i] = -1;
+    for (size_t i = 5; i < n; ) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if (!wc || i + wc > n) goto done;
+        if (op == 71 && wc >= 4 && w[i + 1] < bound && w[i + 2] == 11 && w[i + 3] == 3) var[w[i + 1]] = 1;
+        else if (op == 72 && wc >= 5 && w[i + 1] < bound && w[i + 3] == 11 && w[i + 4] == 3) member[w[i + 1]] = (int32_t)w[i + 2];
+        else if (op >= 19 && op <= 32 && wc >= 2 && w[i + 1] < bound) def[w[i + 1]] = i;
+        else if ((op == 43 || op == 59) && wc >= 3 && w[i + 2] < bound) def[w[i + 2]] = i;
+        i += wc;
+    }
+#define CLIP_CONST(id) ((id) < bound && def[id] && (w[def[id]] & 0xFFFF) == 43 ? w[def[id] + 3] : 0xFFFFFFFFu)
+#define CLIP_ALEN(t) ((t) < bound && def[t] && (w[def[t]] & 0xFFFF) == 28 ? (int)CLIP_CONST(w[def[t] + 3]) : 1)
+    for (size_t i = 5; i < n; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xFFFF, wc = w[i] >> 16;
+        if ((op != 65 && op != 66) || wc < 4) continue;   /* OpAccessChain / OpInBoundsAccessChain */
+        uint32_t base = w[i + 3];
+        size_t vd = base < bound ? def[base] : 0;
+        if (!vd || (w[vd] & 0xFFFF) != 59 || w[vd + 3] != 3 /* Output */) continue;
+        size_t pd = w[vd + 1] < bound ? def[w[vd + 1]] : 0;
+        if (!pd || (w[pd] & 0xFFFF) != 32) continue;
+        uint32_t t = w[pd + 3];
+        int len = 0;
+        if (var[base]) len = CLIP_ALEN(t);
+        else {
+            size_t idx = i + 4;
+            if (t < bound && def[t] && (w[def[t]] & 0xFFFF) == 28) { t = w[def[t] + 2]; idx++; }   /* arrayed (mesh) outputs */
+            if (t < bound && member[t] >= 0 && idx < i + wc && CLIP_CONST(w[idx]) == (uint32_t)member[t])
+                len = CLIP_ALEN(w[def[t] + 2 + member[t]]);
+        }
+        if (len > result) result = len;
+    }
+#undef CLIP_CONST
+#undef CLIP_ALEN
+done:
+    free(def);
+    free(member);
+    free(var);
+    return result;
+}

@@ -2346,11 +2346,30 @@ static void gl_mv_prepare(void)
     }
 }
 
+/* gl_ClipDistance (OPEN-ITEMS-PLAN A29): the planes the bound pipeline's last
+ * geometry stage writes are enabled around each of its draws only, so the 2D
+ * batch and vio's own passes never clip against stale distances. */
+static int gl_clip_active;
+
+static void gl_clip_begin(GLint program)
+{
+    if (program <= 0 || (GLuint)program != vio_gl.clip_program || vio_gl.clip_count <= 0) return;
+    for (int i = 0; i < vio_gl.clip_count; i++) glEnable(GL_CLIP_DISTANCE0 + i);
+    gl_clip_active = vio_gl.clip_count;
+}
+
+static void gl_clip_end(void)
+{
+    for (int i = 0; i < gl_clip_active; i++) glDisable(GL_CLIP_DISTANCE0 + i);
+    gl_clip_active = 0;
+}
+
 static unsigned gl_shadow_begin(void)
 {
-    if (!glBindSampler || !glGenSamplers) return 0;
     GLint program = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    gl_clip_begin(program);
+    if (!glBindSampler || !glGenSamplers) return 0;
     if (program <= 0) return 0;
     const gl_shadow_entry *e = gl_shadow_entry_for((GLuint)program);
     if (e->count == 0) return 0;
@@ -2381,6 +2400,7 @@ static unsigned gl_shadow_begin(void)
 
 static void gl_shadow_end(unsigned mask)
 {
+    gl_clip_end();
     for (GLuint unit = 0; mask; unit++, mask >>= 1) {
         if (mask & 1u) glBindSampler(unit, 0);
     }
@@ -2880,6 +2900,27 @@ static void opengl_bind_pipeline_state(void *pipe_ptr)
     if (!vio_gl.initialized || !pipe) return;
 
     glUseProgram(pipe->shader_program);
+
+    /* Clip planes of this pipeline, applied per draw (gl_clip_begin). */
+    {
+        vio_shader_object *sh = (vio_shader_object *)pipe->shader_ref;
+        if (sh && !sh->clip_known) {
+            const uint32_t *spv = sh->vert_spirv;
+            size_t sz = sh->vert_spirv_size;
+            if (sh->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)]) {
+                spv = sh->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)];
+                sz = sh->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)];
+            } else if (sh->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)]) {
+                spv = sh->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
+                sz = sh->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)];
+            }
+            int nclip = spv ? vio_spirv_output_clip_distances(spv, sz) : 0;
+            sh->clip_distances = nclip > 8 ? 8 : nclip;
+            sh->clip_known = 1;
+        }
+        vio_gl.clip_program = pipe->shader_program;
+        vio_gl.clip_count = sh ? sh->clip_distances : 0;
+    }
 
     /* Primitive mode for the following draws. A shader with a tessellation
      * control stage only accepts patches, whatever 'topology' says. */

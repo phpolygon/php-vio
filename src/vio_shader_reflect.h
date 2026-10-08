@@ -159,6 +159,11 @@ int vio_spvc_combine_separate(void *compiler);
  * Returns the count (<= max). */
 int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*names)[64], int max);
 
+/* Entries of gl_ClipDistance a stage writes through its outputs (the array
+ * length of the gl_PerVertex member or variable it accesses), 0 if none.
+ * Plain SPIR-V parsing, also without SPIRV-Cross. */
+int vio_spirv_output_clip_distances(const uint32_t *spirv, size_t spirv_size);
+
 /* Shader-wide sampler registers by NAME (OPEN-ITEMS-PLAN A30). Every stage of a
  * D3D / Vulkan shader shares one texture table, so a sampler must land on the
  * same register in every stage that declares it. Counting per stage broke that
