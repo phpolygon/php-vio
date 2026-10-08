@@ -189,7 +189,9 @@ jobs:
             tests/backends/206_pass_switches_vulkan_core_all_backends.phpt \
             tests/render3d/207_bundle_all_backends.phpt \
             tests/render3d/208_upscale_all_backends.phpt \
-            tests/media/209_recorder_encoders_all_backends.phpt
+            tests/media/209_recorder_encoders_all_backends.phpt \
+            tests/render3d/210_compute_msl_override_all_backends.phpt \
+            tests/render3d/211_rate_map_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -376,7 +378,9 @@ jobs:
             tests/backends/206_pass_switches_vulkan_core_all_backends.phpt \
             tests/render3d/207_bundle_all_backends.phpt \
             tests/render3d/208_upscale_all_backends.phpt \
-            tests/media/209_recorder_encoders_all_backends.phpt
+            tests/media/209_recorder_encoders_all_backends.phpt \
+            tests/render3d/210_compute_msl_override_all_backends.phpt \
+            tests/render3d/211_rate_map_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -837,6 +841,8 @@ jobs:
             tests/render3d/207_bundle_all_backends.phpt `
             tests/render3d/208_upscale_all_backends.phpt `
             tests/media/209_recorder_encoders_all_backends.phpt `
+            tests/render3d/210_compute_msl_override_all_backends.phpt `
+            tests/render3d/211_rate_map_all_backends.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt
 
       - name: Package binary
