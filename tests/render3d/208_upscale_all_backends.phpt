@@ -18,9 +18,12 @@ $FS = "#version 450\nlayout(location=0) in vec2 ndc;\nlayout(location=0) out vec
     . "  float d = step(length(ndc - vec2(0.1, -0.05)), 0.45);\n"
     . "  o = vec4(mix(c, vec3(0.95, 0.2, 0.15), d), 1.0);\n"
     . "}";
-/* bilinear baseline, addressed like vio_upscale (storage row r <- row r) */
+/* bilinear baseline, addressed like vio_upscale (storage row r <- row r); the
+ * interpolation is explicit - render-target textures sample nearest on Metal */
 $FS_BI = "#version 450\nlayout(location=0) in vec2 ndc;\nlayout(location=0) out vec4 o;\nuniform sampler2D u_tex;\nuniform vec2 u_dst;\n"
-       . "void main(){ o = texture(u_tex, gl_FragCoord.xy / u_dst); }";
+       . "vec4 t(ivec2 p) { ivec2 s = textureSize(u_tex, 0); return texelFetch(u_tex, clamp(p, ivec2(0), s - 1), 0); }\n"
+       . "void main(){ vec2 p = gl_FragCoord.xy / u_dst * vec2(textureSize(u_tex, 0)) - 0.5; vec2 f = fract(p); ivec2 b = ivec2(floor(p));\n"
+       . "  o = mix(mix(t(b), t(b + ivec2(1, 0)), f.x), mix(t(b + ivec2(0, 1)), t(b + ivec2(1, 1)), f.x), f.y); }";
 
 function mae(string $a, string $b): float {
     $s = 0; $n = strlen($a);
@@ -114,7 +117,11 @@ function run_backend(string $name): string {
         vio_upscale($ctx, $lo, $out, ['mode' => VIO_UPSCALE_TEMPORAL, 'reset' => true, 'sharpness' => 0.0]);
     });
     $rs = vio_read_render_target($out);
-    if (mae($rs, $flat) > 0.5) $fail[] = sprintf("temporal reset kept history (mae %.2f to the flat picture)", mae($rs, $flat));
+    if (mae($rs, $flat) > 0.5) {
+        $c = fn(string $p, int $w) => bin2hex(substr($p, ((intdiv($w, 2)) * $w + intdiv($w, 2)) * 4, 4));
+        $fail[] = sprintf("temporal reset kept history (mae %.2f to the flat picture; centre out %s, flat %s, source %s)",
+                          mae($rs, $flat), $c($rs, $HI), $c($flat, $HI), $c(vio_read_render_target($lo), $LO));
+    }
 
     /* A panning camera (1.37 / 0.61 source pixels per frame, not in step with
      * the jitter sequence): with motion vectors the history follows the

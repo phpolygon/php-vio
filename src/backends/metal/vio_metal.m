@@ -603,11 +603,9 @@ static void metal_archive_close(void)
 {
     if (metal_archive && metal_archive_dirty && metal_archive_url) {
         if (@available(macOS 11.0, iOS 14.0, *)) {
+            /* A cache directory removed before shutdown just leaves the archive unwritten. */
             NSError *e = nil;
-            if (![(id<MTLBinaryArchive>)metal_archive serializeToURL:metal_archive_url error:&e]) {
-                php_error_docref(NULL, E_NOTICE, "Metal: pipeline archive not written: %s",
-                                 e ? [[e localizedDescription] UTF8String] : "unknown");
-            }
+            [(id<MTLBinaryArchive>)metal_archive serializeToURL:metal_archive_url error:&e];
         }
     }
     metal_archive = nil;

@@ -8,6 +8,10 @@
 
 #include "vio_recorder.h"
 #include "../include/vio_backend.h"
+#ifdef __APPLE__
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #if defined(_WIN32) && defined(HAVE_D3D11)
 #define COBJMACROS
 #include <d3d11.h>
@@ -259,6 +263,13 @@ int vio_recorder_init(vio_recorder_object *rec, const char *path,
     /* Probing hardware encoders that cannot open (no such GPU) logs errors. */
     int level = av_log_get_level();
     av_log_set_level(AV_LOG_QUIET);
+#ifdef __APPLE__
+    /* VideoToolbox writes system diagnostics (IOServiceMatching... on a VM)
+     * straight to stderr while a session opens. */
+    fflush(stderr);
+    int saved_err = dup(2), devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) { dup2(devnull, 2); close(devnull); }
+#endif
     const AVCodec *codec = NULL;
     for (int i = 0; i < n && !rec->codec_ctx; i++) {
         codec = avcodec_find_encoder_by_name(names[i]);
@@ -276,6 +287,9 @@ int vio_recorder_init(vio_recorder_object *rec, const char *path,
         if (codec && vio_rec_open(rec, codec, 0) != 0) codec = NULL;
     }
     av_log_set_level(level);
+#ifdef __APPLE__
+    if (saved_err >= 0) { fflush(stderr); dup2(saved_err, 2); close(saved_err); }
+#endif
     if (!rec->codec_ctx) {
         vio_rec_fail(rec);
         return -2;
