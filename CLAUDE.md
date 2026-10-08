@@ -102,6 +102,9 @@ mit `-d vio.debug=1` (D3D12-Debug-Layer, Vulkan-Validation): mehrere Befunde zei
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/196` | Multisampled Depth-only-Targets (`'depth_only' => true, 'samples' => 4`): Tiefe wird multisampled gerendert und zum Sampeln mit der `'depth_reduction'` des Targets aufgelöst (MAX/MIN über die Samples; GL/D3D11/D3D12/Vulkan per Vollbild-Pass, Metal per `depthResolveFilter`); MIN hält mehr Kantentexel nah als MAX, keine Zwischenwerte. |
+| `tests/render3d/195` | Multisampled Cube- und Array-Targets: jede Face/Schicht behält eigene Samples und Tiefe (MS-Array), wird beim Verlassen aufgelöst, Rebind behält den Inhalt, andere Schichten bleiben unberührt, die Diagonale ist geglättet. |
+| `tests/render3d/194` | Multisampled MRT-Targets: jedes Attachment wird aufgelöst (Kante geglättet). Vorher zeichnete D3D11 mit MSAA-MRT gar nichts (nur Attachment 0 war multisampled) und GL renderte MRT stillschweigend single-sampled. |
 | `tests/render3d/193` | Tiefen-Targets mit Mip-Kette (`'depth_only' => true, 'mipmaps' => true`, `'depth_reduction' => VIO_DEPTH_REDUCE_MAX`/`_MIN`, `VIO_FEATURE_DEPTH_MIPMAPS`): `vio_generate_mipmaps` baut jede Stufe als Max/Min der 2×2-Texel darunter (Hi-Z); Stufe 1 und 4 per `texelFetch` gegen die eigenen Level-0-Werte, eine Kette im Frame, eine danach; Targets ohne Kette lehnen ab. |
 | `tests/render2d/192` | Vertikaltext (`'vertical' => true`, HarfBuzz TTB): Spalten von oben nach unten ab (x = rechter Rand, y = oben), `'\n'` beginnt die nächste Spalte links, vertikale Formen der Interpunktion; `vio_text_measure` tauscht die Achsen (Breite = Spalten × Zeilenhöhe). Braucht einen CJK-Systemfont. |
 | `tests/render3d/191` | ASTC (`VIO_FORMAT_ASTC_4x4/5x5/6x6/8x8`, `VIO_FEATURE_TEXTURE_COMPRESSION_ASTC`): ein handkodierter Void-Extent-Block dekodiert in jeder Blockgröße und aus KTX2, wo das Flag gesetzt ist (Apple-GPUs, Vulkan/GL mit ASTC-LDR); sonst lehnt `vio_texture` mit Warnung ab. |
@@ -316,8 +319,10 @@ Tabelle ohne Referenz (Test 111): `vio_render_target_texture()` liefert ein Temp
 Speicher die naechste VioTexture wiederverwendete. Seit dem Fix laufen die D3D12-Pixel-Checks
 in 096/097 wieder mit.
 
-MSAA-Render-Targets (`'samples' => N`) resolven auf jedem Backend; Depth-only-, Cube-, Array- und
-(auf GL/D3D11) MRT-Targets bleiben single-sampled.
+MSAA-Render-Targets (`'samples' => N`) resolven auf jedem Backend, auch MRT (jedes Attachment), Cube- und
+Array-Targets (Multisample-Array, eine Schicht je Face; Resolve beim Verlassen der Face, Mip-Stufen > 0 rendern
+single-sampled) und Depth-only-Targets (Resolve mit `'depth_reduction'` MAX/MIN in die gesampelte Tiefe;
+OPEN-ITEMS-PLAN A24, Tests 194–196). Single-sampled bleiben Depth-Targets mit Mip-Kette und Depth-only-Cubes/-Arrays.
 
 Vulkan-3D (GAP-PHASE5 Block 10, `src/backends/vulkan/vio_vulkan_3d*.c`): Shader gehen GLSL →
 SPIR-V → Vulkan-GLSL (SPIRV-Cross, Bindings umgelegt: Set 0, 0/1 = Default-Uniform-Block VS/FS
@@ -456,8 +461,9 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   erhalten. Der 2D-Batch hat denselben Varianten-Cache (Format × Samples).
 - **MSAA-RTs** (`'samples' => 2|4|8`, auf unterstützte Werte geclamped): 2DMultisample-
   Paar für Farbe+Depth, `StoreAndMultisampleResolve` in die Single-Sample-Textur, die
-  Wrapper/2D-Registry/Readback sehen. Depth-only-RTs bleiben single-sampled (Depth wird
-  gesampelt). `vio_create_render_target` reicht `samples` ebenfalls durch.
+  Wrapper/2D-Registry/Readback sehen. Depth-only-RTs resolven per `depthResolveFilter` (Max/Min) in eine
+  sampelbare Tiefe, Cube-/Array-Targets über ein 2DMultisampleArray mit `resolveSlice`.
+  `vio_create_render_target` reicht `samples` ebenfalls durch.
 - **`vio_clear` ist eager** wie auf D3D11: im Frame wird der Pass mit Clear-Actions neu
   geöffnet (Swapchain oder gebundenes RT); vor `vio_begin` wird die Farbe gelatcht.
 - **Texturen werden erst beim Draw gebunden** (gilt für alle Typed-Register-Backends:
@@ -1105,7 +1111,7 @@ nicht an `@available` im Feature-Code.
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 194 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess, 184 `vio_backend_info` auf allen Backends, 185 `vio_adapters`, 186 Scoring für `auto`, 187 Kalibrierlauf, 188 Readback des neuesten Frames, 189 Glyph-Atlas bei Bedarf, 190 KTX2-Cubemaps/-3D, 191 ASTC, 192 Vertikaltext, 193 Tiefen-Mips)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 197 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess, 184 `vio_backend_info` auf allen Backends, 185 `vio_adapters`, 186 Scoring für `auto`, 187 Kalibrierlauf, 188 Readback des neuesten Frames, 189 Glyph-Atlas bei Bedarf, 190 KTX2-Cubemaps/-3D, 191 ASTC, 192 Vertikaltext, 193 Tiefen-Mips, 194 MSAA-MRT, 195 MSAA-Cube/-Array, 196 MSAA-Depth-only)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
@@ -1230,7 +1236,7 @@ Aufrufer geändert hat:
   $face)` auf D3D11. `vio_texture_update` auf D3D12.
 - **RT-MSAA** (`'samples' => N`) ist auf D3D11 (Resolve beim Unbind/Readback) und OpenGL
   (Multisample-Renderbuffer + Blit) implementiert; vorher ignorierten beide `samples`
-  bei `RENDER_TARGET_MSAA = 1`. Depth-only-/Cube-/MRT-Targets bleiben single-sample.
+  bei `RENDER_TARGET_MSAA = 1`. Seit A24 auch MRT, Cube/Array und Depth-only (siehe oben).
 - **Vulkan `vsync: false`** wählt `IMMEDIATE` (Fallback MAILBOX → FIFO); `true` = FIFO.
 - **Headless-Fenster sind undekoriert** und `vio_begin` resized D3D-Swapchains im
   Headless-Modus nicht mehr auf die Fenstergröße: vorher war ein 32×32-Headless-Backbuffer

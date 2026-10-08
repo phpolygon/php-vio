@@ -37,7 +37,7 @@ A4 `describe` für D3D12/D3D11/Vulkan/GL (Test 184) ✅ · A6 `vio_adapters()` (
 `vio_benchmark_backends`, `headless_hardware`; Test 187) ✅.
 
 ## Batch 4 — Render-Features
-A24 MSAA für Depth-only/Cube/Array/MRT · A26 Tiefentexturen mit Mip-Kette ✅ (Test 193) · A35 KTX2-Cubemaps und -3D ✅ (Test 190)
+A24 MSAA für Depth-only/Cube/Array/MRT ✅ (Tests 194–196; Nebenbefund: D3D11 zeichnete MSAA-MRT gar nicht) · A26 Tiefentexturen mit Mip-Kette ✅ (Test 193) · A35 KTX2-Cubemaps und -3D ✅ (Test 190)
 (Supercompression braucht zstd/Basis → **nicht** in diesem Plan) · A20 ASTC ✅ (Test 191; Dekodierung belegt nur die macOS-CI) ·
 A33 Sub-Image-Uploads für den Glyph-Atlas ✅ (Test 189) · A34 Vertikaltext ✅ (Test 192) · A36 Vulkan `read_pixels` ohne
 `vkDeviceWaitIdle` ✅ (Test 188; Nebenbefund: D3D11 las mitten im Frame den vorigen Frame).
@@ -67,4 +67,4 @@ und Feature-Matrix im selben Batch nachziehen.
 - [x] Batch 1 (Branch `feat/open-items-batch1`): A40 Test 169, A5 Test 170, A9 Test 171, A19 Test 172, E/F;
   Nebenbefund beim Schreiben von 172: D3D12 verlor die gebundene Pipeline über die Frame-Grenze und entfernte
   beim nächsten Draw das Device (Fix + Test 173).
-- [x] Batch 2 (Branch `feat/open-items-batch2`): A31, A32, A12, A23, B4/B5, A11, A10, A27 — Tests 174–183. · [x] Batch 3 (Branch `feat/open-items-batch3`): A4, A6, A7, A8 — Tests 184–187. · [ ] Batch 4 · [ ] Batch 5 · [ ] Batch 6 · [ ] Batch 7
+- [x] Batch 2 (Branch `feat/open-items-batch2`): A31, A32, A12, A23, B4/B5, A11, A10, A27 — Tests 174–183. · [x] Batch 3 (Branch `feat/open-items-batch3`): A4, A6, A7, A8 — Tests 184–187. · [x] Batch 4 (Branch `feat/open-items-batch4`): A36, A33, A35, A20, A34, A26, A24 — Tests 188–196. · [ ] Batch 5 · [ ] Batch 6 · [ ] Batch 7

@@ -173,7 +173,10 @@ jobs:
             tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt \
             tests/render3d/191_astc_textures_all_backends.phpt \
             tests/render2d/192_vertical_text.phpt \
-            tests/render3d/193_depth_mipmaps_all_backends.phpt
+            tests/render3d/193_depth_mipmaps_all_backends.phpt \
+            tests/render3d/194_msaa_mrt_all_backends.phpt \
+            tests/render3d/195_msaa_cube_array_all_backends.phpt \
+            tests/render3d/196_msaa_depth_only_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -344,7 +347,10 @@ jobs:
             tests/render3d/190_ktx2_cubemap_3d_all_backends.phpt \
             tests/render3d/191_astc_textures_all_backends.phpt \
             tests/render2d/192_vertical_text.phpt \
-            tests/render3d/193_depth_mipmaps_all_backends.phpt
+            tests/render3d/193_depth_mipmaps_all_backends.phpt \
+            tests/render3d/194_msaa_mrt_all_backends.phpt \
+            tests/render3d/195_msaa_cube_array_all_backends.phpt \
+            tests/render3d/196_msaa_depth_only_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -759,6 +765,9 @@ jobs:
             tests/render3d/191_astc_textures_all_backends.phpt `
             tests/render2d/192_vertical_text.phpt `
             tests/render3d/193_depth_mipmaps_all_backends.phpt `
+            tests/render3d/194_msaa_mrt_all_backends.phpt `
+            tests/render3d/195_msaa_cube_array_all_backends.phpt `
+            tests/render3d/196_msaa_depth_only_all_backends.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt
 
       - name: Package binary
