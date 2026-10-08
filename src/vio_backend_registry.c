@@ -182,7 +182,7 @@ static const char *const *vio_select_profile(int platform, int prefer, const vio
         case 0x10DE: return vio_prof_nvidia;
         case 0x1002: case 0x1022: return vio_prof_amd;
         /* Intel: Arc / Xe (mesh shaders) like NVIDIA, older iGPUs run D3D11 best. */
-        case 0x8086: return (sys->features & VIO_FEATURE_BIT(VIO_FEATURE_MESH_SHADER)) ? vio_prof_nvidia : vio_prof_intel_old;
+        case 0x8086: return vio_featset_has(&sys->features, VIO_FEATURE_MESH_SHADER) ? vio_prof_nvidia : vio_prof_intel_old;
         default: break;
         }
     }
@@ -221,7 +221,7 @@ static int vio_select_type_rank(const char *t)
     return 2;
 }
 
-void vio_select_rank(vio_select_candidate *c, int n, int platform, int prefer, uint64_t require)
+void vio_select_rank(vio_select_candidate *c, int n, int platform, int prefer, const vio_feature_set *require)
 {
     const vio_adapter_info *sys = NULL;
     int sys_rank = 3;
@@ -242,17 +242,17 @@ void vio_select_rank(vio_select_candidate *c, int n, int platform, int prefer, u
         if (k->has_adapter) {
             int r = vio_select_type_rank(k->adapter.device_type);
             s += r == 0 ? 60 : r == 1 ? 30 : r == 3 ? -1000 : 0;
-            if (!(k->adapter.features & VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE))) s -= 500;
-            for (int f = 0; f < 64; f++)
-                if (k->adapter.features & VIO_FEATURE_BIT(f)) s += vio_select_weight(prefer, f);
+            if (!vio_featset_has(&k->adapter.features, VIO_FEATURE_3D_PIPELINE)) s -= 500;
+            for (int f = 0; f < VIO_FEATURE_SET_MAX; f++)
+                if (vio_featset_has(&k->adapter.features, f)) s += vio_select_weight(prefer, f);
         }
         k->score = s;
         k->eligible = 1;
         k->reason[0] = '\0';
         /* Unknown before a context (no adapter info): vio_create checks the
          * flags once the device is open. */
-        for (int f = 0; f < 64 && k->has_adapter; f++) {
-            if (!(require & VIO_FEATURE_BIT(f)) || (k->adapter.features & VIO_FEATURE_BIT(f))) continue;
+        for (int f = 0; f < VIO_FEATURE_SET_MAX && k->has_adapter; f++) {
+            if (!vio_featset_has(require, f) || vio_featset_has(&k->adapter.features, f)) continue;
             if (k->be && k->be->supports_feature && k->be->supports_feature((vio_feature)f)) continue;
             k->eligible = 0;
             snprintf(k->reason, sizeof(k->reason), "feature %d not supported", f);

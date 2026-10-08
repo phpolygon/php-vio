@@ -12,11 +12,7 @@
 
 #include <vulkan/vulkan.h>
 
-#ifdef HAVE_GLFW
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-#endif
-
+#include "../../../include/vio_platform.h"
 #include "vio_vulkan.h"
 #include "../../vio_cubemap.h"   /* bindless cube slots */
 #include "../../vio_shader_cache.h"
@@ -113,12 +109,10 @@ static int create_instance(int debug)
     vio_vk.instance_api_11 = 1;
     app_info.apiVersion         = vio_vk.instance_api;
 
-    /* Required extensions from GLFW + portability */
+    /* Required extensions from the platform (surface) + portability */
     uint32_t glfw_ext_count = 0;
     const char **glfw_extensions = NULL;
-#ifdef HAVE_GLFW
-    glfw_extensions = glfwGetRequiredInstanceExtensions(&glfw_ext_count);
-#endif
+    if (vio_plat()->vk_instance_extensions) glfw_extensions = vio_plat()->vk_instance_extensions(&glfw_ext_count);
 
     /* Build extension list */
     uint32_t ext_count = glfw_ext_count;
@@ -344,7 +338,7 @@ static int create_logical_device(void)
     int has_f16 = 0, has_cd_nv = 0, has_cd_khr = 0, has_di = 0, has_m3 = 0;
     int has_as = 0, has_rq = 0, has_dho = 0, has_bda = 0, has_spv14 = 0, has_sfc = 0;
     int has_rtp = 0;
-    int has_mesh = 0, has_fc = 0, has_cm = 0, has_vmm = 0, has_ssc = 0;
+    int has_mesh = 0, has_fc = 0, has_cm = 0, has_vmm = 0, has_ssc = 0, has_lv = 0, has_ser = 0, has_omm = 0;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, "VK_KHR_portability_subset") == 0) has_portability = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_create_renderpass2") == 0) has_rp2 = 1;
@@ -367,6 +361,9 @@ static int create_logical_device(void)
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_sfc = 1;
         if (strcmp(ext_props[i].extensionName, "VK_EXT_mesh_shader") == 0) has_mesh = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_cooperative_matrix") == 0) has_cm = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_shader_long_vector") == 0) has_lv = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_ray_tracing_invocation_reorder") == 0) has_ser = 1;
+        if (strcmp(ext_props[i].extensionName, "VK_EXT_opacity_micromap") == 0) has_omm = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_vulkan_memory_model") == 0) has_vmm = 1;
         if (strcmp(ext_props[i].extensionName, "VK_EXT_subgroup_size_control") == 0) has_ssc = 1;
         if (strcmp(ext_props[i].extensionName, "VK_KHR_shader_float_controls") == 0) has_fc = 1;
@@ -855,6 +852,73 @@ static int create_logical_device(void)
     (void)has_cm; (void)has_vmm;
 #endif
 
+    /* VIO_FEATURE_SHADER_EXECUTION_REORDER: VK_EXT_ray_tracing_invocation_reorder on top of
+     * the ray tracing pipeline (GL_EXT_shader_invocation_reorder: hitObjectEXT, reorderThreadEXT). */
+    vio_vk.ser_supported = 0;
+#ifdef VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT ser_enable = {0};
+    ser_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT;
+    if (has_ser && vio_vk.rt_pipeline_supported && device_ext_count < (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
+        VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT ser_avail = {0};
+        ser_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &ser_avail;
+        vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+        if (ser_avail.rayTracingInvocationReorder) {
+            ser_enable.rayTracingInvocationReorder = VK_TRUE;
+            vio_vk.ser_supported = 1;
+            VIO_VK_ADD_DEVICE_EXT("VK_EXT_ray_tracing_invocation_reorder");
+        }
+    }
+#else
+    (void)has_ser;
+#endif
+
+    /* VIO_FEATURE_OPACITY_MICROMAP: VK_EXT_opacity_micromap on top of the ray tracing pipeline. */
+    vio_vk.omm_supported = 0;
+#ifdef VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME
+    VkPhysicalDeviceOpacityMicromapFeaturesEXT omm_enable = {0};
+    omm_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+    if (has_omm && vio_vk.rt_pipeline_supported && device_ext_count < (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
+        VkPhysicalDeviceOpacityMicromapFeaturesEXT omm_avail = {0};
+        omm_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &omm_avail;
+        vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+        if (omm_avail.micromap) {
+            omm_enable.micromap = VK_TRUE;
+            vio_vk.omm_supported = 1;
+            VIO_VK_ADD_DEVICE_EXT("VK_EXT_opacity_micromap");
+        }
+    }
+#else
+    (void)has_omm;
+#endif
+
+    /* VIO_FEATURE_LONG_VECTOR: VK_EXT_shader_long_vector (GL_EXT_long_vector kernels). */
+    vio_vk.long_vector_supported = 0;
+#ifdef VK_EXT_SHADER_LONG_VECTOR_EXTENSION_NAME
+    VkPhysicalDeviceShaderLongVectorFeaturesEXT lv_enable = {0};
+    lv_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_LONG_VECTOR_FEATURES_EXT;
+    if (has_lv && vio_vk.instance_api_11 && device_ext_count < (uint32_t)(sizeof(device_extensions) / sizeof(device_extensions[0]))) {
+        VkPhysicalDeviceShaderLongVectorFeaturesEXT lv_avail = {0};
+        lv_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_LONG_VECTOR_FEATURES_EXT;
+        VkPhysicalDeviceFeatures2 f2 = {0};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &lv_avail;
+        vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &f2);
+        if (lv_avail.longVector) {
+            lv_enable.longVector = VK_TRUE;
+            vio_vk.long_vector_supported = 1;
+            VIO_VK_ADD_DEVICE_EXT("VK_EXT_shader_long_vector");
+        }
+    }
+#else
+    (void)has_lv;
+#endif
+
     VkDeviceCreateInfo create_info = {0};
     create_info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     create_info.queueCreateInfoCount    = unique_count;
@@ -896,6 +960,15 @@ static int create_logical_device(void)
     }
 #endif
     (void)coopmat_f16;
+#ifdef VK_EXT_SHADER_LONG_VECTOR_EXTENSION_NAME
+    if (vio_vk.long_vector_supported) { lv_enable.pNext = feature_chain; feature_chain = &lv_enable; }
+#endif
+#ifdef VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME
+    if (vio_vk.ser_supported) { ser_enable.pNext = feature_chain; feature_chain = &ser_enable; }
+#endif
+#ifdef VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME
+    if (vio_vk.omm_supported) { omm_enable.pNext = feature_chain; feature_chain = &omm_enable; }
+#endif
     /* VULKAN-MODERN-PLAN: the three required features (checked at selection). */
     VkPhysicalDeviceTimelineSemaphoreFeatures tl_enable = {0};
     tl_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
@@ -981,6 +1054,14 @@ static int create_logical_device(void)
         vio_vk.rt_max_recursion    = rtp_props.maxRayRecursionDepth;
         if (!vio_vk.fn_create_rt_pipelines || !vio_vk.fn_get_rt_group_handles || !vio_vk.fn_cmd_trace_rays
             || vio_vk.rt_handle_size == 0 || vio_vk.rt_max_recursion == 0) vio_vk.rt_pipeline_supported = 0;
+    }
+    if (vio_vk.omm_supported) {
+        vio_vk.fn_create_micromap     = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCreateMicromapEXT");
+        vio_vk.fn_destroy_micromap    = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkDestroyMicromapEXT");
+        vio_vk.fn_cmd_build_micromaps = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkCmdBuildMicromapsEXT");
+        vio_vk.fn_get_micromap_sizes  = (void *)vkGetDeviceProcAddr(vio_vk.device, "vkGetMicromapBuildSizesEXT");
+        if (!vio_vk.fn_create_micromap || !vio_vk.fn_destroy_micromap || !vio_vk.fn_cmd_build_micromaps
+            || !vio_vk.fn_get_micromap_sizes || !vio_vk.rt_pipeline_supported) vio_vk.omm_supported = 0;
     }
 
     /* On-disk pipeline cache (GAP-PHASE5 Block 4): keyed by the device so a
@@ -1305,29 +1386,31 @@ static int vulkan_enumerate_adapters(vio_adapter_info *out, int max)
             }
             VkPhysicalDeviceFeatures f;
             vkGetPhysicalDeviceFeatures(pds[i], &f);
-            a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
-                        | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW);
-            if (f.geometryShader)       a->features |= VIO_FEATURE_BIT(VIO_FEATURE_GEOMETRY);
-            if (f.tessellationShader)   a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION);
-            if (f.multiViewport)        a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MULTI_VIEWPORT);
-            if (f.textureCompressionBC) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_BC);
-            if (f.textureCompressionASTC_LDR) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
-            if (p.apiVersion >= VK_API_VERSION_1_1) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MULTIVIEW);
+            memset(&a->features, 0, sizeof(a->features));
+            vio_featset_add(&a->features, VIO_FEATURE_COMPUTE);
+            vio_featset_add(&a->features, VIO_FEATURE_3D_PIPELINE);
+            vio_featset_add(&a->features, VIO_FEATURE_INDIRECT_DRAW);
+            if (f.geometryShader)       vio_featset_add(&a->features, VIO_FEATURE_GEOMETRY);
+            if (f.tessellationShader)   vio_featset_add(&a->features, VIO_FEATURE_TESSELLATION);
+            if (f.multiViewport)        vio_featset_add(&a->features, VIO_FEATURE_MULTI_VIEWPORT);
+            if (f.textureCompressionBC) vio_featset_add(&a->features, VIO_FEATURE_TEXTURE_COMPRESSION_BC);
+            if (f.textureCompressionASTC_LDR) vio_featset_add(&a->features, VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
+            if (p.apiVersion >= VK_API_VERSION_1_1) vio_featset_add(&a->features, VIO_FEATURE_MULTIVIEW);
             uint32_t ne = 0;
             vkEnumerateDeviceExtensionProperties(pds[i], NULL, &ne, NULL);
             VkExtensionProperties *ext = ne ? (VkExtensionProperties *)calloc(ne, sizeof(*ext)) : NULL;
             if (ext && vkEnumerateDeviceExtensionProperties(pds[i], NULL, &ne, ext) == VK_SUCCESS) {
-                if (vulkan_has_device_ext(ext, ne, "VK_KHR_ray_query")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAY_QUERY);
-                if (vulkan_has_device_ext(ext, ne, "VK_KHR_ray_tracing_pipeline")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAYTRACING);
-                if (vulkan_has_device_ext(ext, ne, "VK_EXT_mesh_shader")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MESH_SHADER);
-                if (vulkan_has_device_ext(ext, ne, "VK_KHR_fragment_shading_rate")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_SHADING_RATE);
-                if (vulkan_has_device_ext(ext, ne, "VK_KHR_fragment_shader_barycentric")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_BARYCENTRICS);
-                if (vulkan_has_device_ext(ext, ne, "VK_KHR_cooperative_matrix")) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_COOPERATIVE_MATRIX);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_ray_query")) vio_featset_add(&a->features, VIO_FEATURE_RAY_QUERY);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_ray_tracing_pipeline")) vio_featset_add(&a->features, VIO_FEATURE_RAYTRACING);
+                if (vulkan_has_device_ext(ext, ne, "VK_EXT_mesh_shader")) vio_featset_add(&a->features, VIO_FEATURE_MESH_SHADER);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_fragment_shading_rate")) vio_featset_add(&a->features, VIO_FEATURE_SHADING_RATE);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_fragment_shader_barycentric")) vio_featset_add(&a->features, VIO_FEATURE_BARYCENTRICS);
+                if (vulkan_has_device_ext(ext, ne, "VK_KHR_cooperative_matrix")) vio_featset_add(&a->features, VIO_FEATURE_COOPERATIVE_MATRIX);
                 if (p.apiVersion >= VK_API_VERSION_1_2 || vulkan_has_device_ext(ext, ne, "VK_EXT_descriptor_indexing"))
-                    a->features |= VIO_FEATURE_BIT(VIO_FEATURE_BINDLESS);
+                    vio_featset_add(&a->features, VIO_FEATURE_BINDLESS);
             }
             free(ext);
-            if (p.apiVersion >= VK_API_VERSION_1_1) a->features |= VIO_FEATURE_BIT(VIO_FEATURE_SUBGROUP);
+            if (p.apiVersion >= VK_API_VERSION_1_1) vio_featset_add(&a->features, VIO_FEATURE_SUBGROUP);
         }
     }
     free(pds);
@@ -1674,16 +1757,16 @@ static void destroy_frame_resources(void)
 
 int vio_vulkan_recreate_swapchain(void)
 {
-#ifdef HAVE_GLFW
-    int w = 0, h = 0;
-    glfwGetFramebufferSize((GLFWwindow *)vio_vk.glfw_window, &w, &h);
-    while (w == 0 || h == 0) {
-        glfwGetFramebufferSize((GLFWwindow *)vio_vk.glfw_window, &w, &h);
-        glfwWaitEvents();
+    if (vio_vk.platform_window) {
+        int w = 0, h = 0;
+        vio_plat()->get_framebuffer_size(vio_vk.platform_window, &w, &h);
+        while (w == 0 || h == 0) {   /* minimised: wait until there is something to present into */
+            vio_plat()->get_framebuffer_size(vio_vk.platform_window, &w, &h);
+            vio_plat()->wait_events();
+        }
+        vio_vk.framebuffer_width  = w;
+        vio_vk.framebuffer_height = h;
     }
-    vio_vk.framebuffer_width  = w;
-    vio_vk.framebuffer_height = h;
-#endif
 
     vkDeviceWaitIdle(vio_vk.device);
     cleanup_swapchain();
@@ -1692,10 +1775,10 @@ int vio_vulkan_recreate_swapchain(void)
 
 /* ── Full Vulkan setup ───────────────────────────────────────────── */
 
-int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
+int vio_vulkan_setup_context(void *platform_window, vio_config *cfg)
 {
     memset(&vio_vk, 0, sizeof(vio_vk));
-    vio_vk.glfw_window = glfw_window;
+    vio_vk.platform_window = platform_window;
     vio_vk.clear_r = 0.1f;
     vio_vk.clear_g = 0.1f;
     vio_vk.clear_b = 0.1f;
@@ -1708,15 +1791,14 @@ int vio_vulkan_setup_context(void *glfw_window, vio_config *cfg)
     /* 1. Instance */
     if (create_instance(cfg->debug) != 0) return -1;
 
-    /* 2. Surface (via GLFW) */
-#ifdef HAVE_GLFW
-    if (glfwCreateWindowSurface(vio_vk.instance, (GLFWwindow *)glfw_window, NULL, &vio_vk.surface) != VK_SUCCESS) {
+    /* 2. Surface (from the platform window) */
+    if (!vio_plat()->vk_create_surface
+        || vio_plat()->vk_create_surface(platform_window, (void *)vio_vk.instance, (void *)&vio_vk.surface) != VK_SUCCESS) {
         php_error_docref(NULL, E_WARNING, "Failed to create Vulkan window surface");
         return -1;
     }
 
-    glfwGetFramebufferSize((GLFWwindow *)glfw_window, &vio_vk.framebuffer_width, &vio_vk.framebuffer_height);
-#endif
+    vio_plat()->get_framebuffer_size(platform_window, &vio_vk.framebuffer_width, &vio_vk.framebuffer_height);
 
     /* 3. Physical device */
     if (select_physical_device() != 0) return -1;
@@ -2285,6 +2367,13 @@ typedef struct _vio_vk_as {
     vio_vk_as_buf               tlas_scratch;
     vio_vk_as_buf               instances;      /* host visible, instance_cap records */
     int                         instance_cap, instance_count;
+#ifdef VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME
+    /* Opacity micromaps (SM69-PLAN Phase 4): the micromap a bottom level links
+     * (kept as long as the level) and which levels are non-opaque OMM geometry. */
+    VkMicromapEXT              *omm;
+    vio_vk_as_buf              *omm_buf;
+#endif
+    int                        *blas_omm;
     int                         dead;
     struct _vio_vk_as          *next, *prev;
 } vio_vk_as;
@@ -2374,6 +2463,11 @@ static void vk_as_release_gpu(vio_vk_as *as)
     for (int i = 0; i < as->blas_count; i++) {
         if (as->blas[i] && destroy) destroy(vio_vk.device, as->blas[i], NULL);
         vk_as_buffer_free(&as->blas_buf[i]);
+#ifdef VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME
+        if (as->omm && as->omm[i] && vio_vk.fn_destroy_micromap)
+            ((PFN_vkDestroyMicromapEXT)vio_vk.fn_destroy_micromap)(vio_vk.device, as->omm[i], NULL);
+        if (as->omm_buf) vk_as_buffer_free(&as->omm_buf[i]);
+#endif
     }
     as->dead = 1;
 }
@@ -2412,7 +2506,8 @@ static int vk_as_record_tlas(VkCommandBuffer cmd, vio_vk_as *as, const vio_as_in
         ins[i].instanceCustomIndex = (uint32_t)i;
         ins[i].mask = (uint32_t)(src->mask & 0xFF);
         ins[i].instanceShaderBindingTableRecordOffset = (uint32_t)src->hit_group;
-        ins[i].flags = VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+        /* OMM geometry decides per micro-triangle; everything else stays opaque. */
+        ins[i].flags = (as->blas_omm && as->blas_omm[src->geometry]) ? 0 : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
         VkAccelerationStructureDeviceAddressInfoKHR ai = {0};
         ai.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
         ai.accelerationStructure = as->blas[src->geometry];
@@ -2476,14 +2571,20 @@ static void *vulkan_create_acceleration_structure(const vio_as_desc *desc)
     PFN_vkCmdBuildAccelerationStructuresKHR build_fn = (PFN_vkCmdBuildAccelerationStructuresKHR)vio_vk.fn_cmd_build_as;
     PFN_vkGetAccelerationStructureDeviceAddressKHR addr_fn = (PFN_vkGetAccelerationStructureDeviceAddressKHR)vio_vk.fn_get_as_address;
     vio_vk_as *as = calloc(1, sizeof(vio_vk_as));
-    int temps_cap = desc->geometry_count * 3 + 4, temps_n = 0;
+    int temps_cap = desc->geometry_count * 7 + 4, temps_n = 0;
     vio_vk_as_buf *temps = calloc((size_t)temps_cap, sizeof(vio_vk_as_buf));
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     if (!as || !temps) goto fail;
     as->blas = calloc((size_t)desc->geometry_count, sizeof(VkAccelerationStructureKHR));
     as->blas_buf = calloc((size_t)desc->geometry_count, sizeof(vio_vk_as_buf));
-    if (!as->blas || !as->blas_buf) goto fail;
+    as->blas_omm = calloc((size_t)desc->geometry_count, sizeof(int));
+#ifdef VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME
+    as->omm = calloc((size_t)desc->geometry_count, sizeof(VkMicromapEXT));
+    as->omm_buf = calloc((size_t)desc->geometry_count, sizeof(vio_vk_as_buf));
+    if (!as->omm || !as->omm_buf) goto fail;
+#endif
+    if (!as->blas || !as->blas_buf || !as->blas_omm) goto fail;
     if (vulkan_begin_transient_commands(&pool, &cmd) != 0) goto fail;
 
     const VkBufferUsageFlags input = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
@@ -2511,6 +2612,85 @@ static void *vulkan_create_acceleration_structure(const vio_as_desc *desc)
             gm.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
             prims = (uint32_t)geo->vertex_count / 3;
         }
+#ifdef VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME
+        /* One micromap entry per triangle (index buffer 0..n-1), built first; the
+         * triangles link it through pNext and the geometry turns non-opaque. */
+        VkMicromapUsageEXT omm_usage;
+        VkAccelerationStructureTrianglesOpacityMicromapEXT omm_link;
+        if (geo->omm_format && geo->omm_data && geo->omm_count > 0 && vio_vk.omm_supported) {
+            size_t n = (size_t)geo->omm_count;
+            VkOpacityMicromapFormatEXT fmt = geo->omm_format == 4 ? VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT : VK_OPACITY_MICROMAP_FORMAT_2_STATE_EXT;
+            VkMicromapTriangleEXT *tri = calloc(n, sizeof(*tri));
+            uint32_t *ommi = calloc(n, sizeof(uint32_t));
+            if (!tri || !ommi) { free(tri); free(ommi); goto fail_cmd; }
+            for (size_t k = 0; k < n; k++) {
+                tri[k].dataOffset = (uint32_t)(k * (size_t)geo->omm_bytes);
+                tri[k].subdivisionLevel = (uint16_t)geo->omm_subdivision;
+                tri[k].format = (uint16_t)fmt;
+                ommi[k] = (uint32_t)k;
+            }
+            const VkBufferUsageFlags minput = VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT;
+            vio_vk_as_buf *odata = &temps[temps_n++], *otri = &temps[temps_n++], *oidx = &temps[temps_n++];
+            int up = vk_as_upload(geo->omm_data, n * (size_t)geo->omm_bytes, minput, odata) == 0
+                  && vk_as_upload(tri, n * sizeof(*tri), minput, otri) == 0
+                  && vk_as_upload(ommi, n * sizeof(uint32_t), input, oidx) == 0;
+            free(tri); free(ommi);
+            if (!up) goto fail_cmd;
+            omm_usage.count = (uint32_t)n;
+            omm_usage.subdivisionLevel = (uint32_t)geo->omm_subdivision;
+            omm_usage.format = (uint32_t)fmt;
+            VkMicromapBuildInfoEXT mb = {0};
+            mb.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_INFO_EXT;
+            mb.type = VK_MICROMAP_TYPE_OPACITY_MICROMAP_EXT;
+            mb.flags = VK_BUILD_MICROMAP_PREFER_FAST_TRACE_BIT_EXT;
+            mb.mode = VK_BUILD_MICROMAP_MODE_BUILD_EXT;
+            mb.usageCountsCount = 1;
+            mb.pUsageCounts = &omm_usage;
+            mb.data.deviceAddress = vk_buffer_address(odata->buf);
+            mb.triangleArray.deviceAddress = vk_buffer_address(otri->buf);
+            mb.triangleArrayStride = sizeof(VkMicromapTriangleEXT);
+            VkMicromapBuildSizesInfoEXT msz = {0};
+            msz.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_SIZES_INFO_EXT;
+            ((PFN_vkGetMicromapBuildSizesEXT)vio_vk.fn_get_micromap_sizes)(vio_vk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &mb, &msz);
+            if (vk_as_buffer(msz.micromapSize, VK_BUFFER_USAGE_MICROMAP_STORAGE_BIT_EXT, 0, &as->omm_buf[g]) != 0) goto fail_cmd;
+            VkMicromapCreateInfoEXT mci = {0};
+            mci.sType = VK_STRUCTURE_TYPE_MICROMAP_CREATE_INFO_EXT;
+            mci.buffer = as->omm_buf[g].buf;
+            mci.size = msz.micromapSize;
+            mci.type = VK_MICROMAP_TYPE_OPACITY_MICROMAP_EXT;
+            if (((PFN_vkCreateMicromapEXT)vio_vk.fn_create_micromap)(vio_vk.device, &mci, NULL, &as->omm[g]) != VK_SUCCESS) goto fail_cmd;
+            vio_vk_as_buf *oscratch = &temps[temps_n++];
+            if (vk_as_buffer(msz.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 0, oscratch) != 0) goto fail_cmd;
+            mb.dstMicromap = as->omm[g];
+            mb.scratchData.deviceAddress = vk_buffer_address(oscratch->buf);
+            ((PFN_vkCmdBuildMicromapsEXT)vio_vk.fn_cmd_build_micromaps)(cmd, 1, &mb);
+            /* the bottom-level build reads the finished micromap (micromap stages are sync2 only) */
+            VkMemoryBarrier2 mbar = {0};
+            mbar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            mbar.srcStageMask = VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT;
+            mbar.srcAccessMask = VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT;
+            mbar.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+            mbar.dstAccessMask = VK_ACCESS_2_MICROMAP_READ_BIT_EXT;
+            VkDependencyInfo dep = {0};
+            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            dep.memoryBarrierCount = 1;
+            dep.pMemoryBarriers = &mbar;
+            vkCmdPipelineBarrier2(cmd, &dep);
+
+            memset(&omm_link, 0, sizeof(omm_link));
+            omm_link.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT;
+            omm_link.indexType = VK_INDEX_TYPE_UINT32;
+            omm_link.indexBuffer.deviceAddress = vk_buffer_address(oidx->buf);
+            omm_link.indexStride = sizeof(uint32_t);
+            omm_link.baseTriangle = 0;
+            omm_link.usageCountsCount = 1;
+            omm_link.pUsageCounts = &omm_usage;
+            omm_link.micromap = as->omm[g];
+            gm.geometry.triangles.pNext = &omm_link;
+            gm.flags = 0;
+            as->blas_omm[g] = 1;
+        }
+#endif
         VkAccelerationStructureBuildGeometryInfoKHR bg = {0};
         bg.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
         bg.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
@@ -2571,6 +2751,11 @@ fail:
         vk_as_release_gpu(as);
         free(as->blas);
         free(as->blas_buf);
+        free(as->blas_omm);
+#ifdef VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME
+        free(as->omm);
+        free(as->omm_buf);
+#endif
         free(as);
     }
     return NULL;
@@ -2613,6 +2798,11 @@ static void vulkan_destroy_acceleration_structure(void *ptr)
     }
     free(as->blas);
     free(as->blas_buf);
+    free(as->blas_omm);
+#ifdef VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME
+    free(as->omm);
+    free(as->omm_buf);
+#endif
     free(as);
 }
 
@@ -2883,6 +3073,10 @@ static void *vulkan_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
     ci.maxPipelineRayRecursionDepth = (uint32_t)desc->max_recursion < vio_vk.rt_max_recursion
                                     ? (uint32_t)desc->max_recursion : vio_vk.rt_max_recursion;
     ci.layout = rt->layout;
+#ifdef VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME
+    /* a pipeline that may trace OMM geometry says so (SM69-PLAN Phase 4) */
+    if (vio_vk.omm_supported) ci.flags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+#endif
     VkResult vr = ((PFN_vkCreateRayTracingPipelinesKHR)vio_vk.fn_create_rt_pipelines)(
         vio_vk.device, VK_NULL_HANDLE, vio_vk.pipeline_cache, 1, &ci, NULL, &rt->pipeline);
     if (vr != VK_SUCCESS) {
@@ -5228,6 +5422,9 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_3D_PIPELINE:  return vio_vk3d_available(); /* GAP-PHASE5 Block 10 */
         case VIO_FEATURE_MESH_SHADER:  return vio_vk3d_available() && vio_vk.device && vio_vk.mesh_supported; /* VK_EXT_mesh_shader */
         case VIO_FEATURE_COOPERATIVE_MATRIX: return vio_vk.device && vio_vk.coopmat_shape_count > 0; /* VK_KHR_cooperative_matrix */
+        case VIO_FEATURE_LONG_VECTOR: return vio_vk.device && vio_vk.long_vector_supported; /* VK_EXT_shader_long_vector */
+        case VIO_FEATURE_SHADER_EXECUTION_REORDER: return vio_vk.device && vio_vk.ser_supported && vio_vk.rt_pipeline_supported;
+        case VIO_FEATURE_OPACITY_MICROMAP: return vio_vk.device && vio_vk.omm_supported && vio_vk.rt_pipeline_supported;
         case VIO_FEATURE_RAYTRACING:   return vio_vk3d_available() && vio_vk.device && vio_vk.rt_pipeline_supported; /* VK_KHR_ray_tracing_pipeline */
         case VIO_FEATURE_MULTIVIEW:    return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_supported; /* VkRenderPassMultiviewCreateInfo */
         case VIO_FEATURE_MULTIVIEW_GEOMETRY:     return vio_vk3d_available() && vio_vk.device && vio_vk.multiview_geometry;

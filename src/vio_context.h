@@ -19,9 +19,9 @@ typedef struct _vio_context_object {
     const vio_backend *backend;
     vio_config         config;
     void              *surface;
-    /* GLFWwindow* — typed as void* so this header doesn't depend on
-     * HAVE_GLFW being visible to every translation unit that includes it.
-     * Only translation units that actually drive GLFW need the cast. */
+    /* vio_window_handle (include/vio_platform.h): whatever the active
+     * platform created - a GLFWwindow* behind the GLFW platform, a native
+     * window state behind the others. Opaque everywhere else. */
     void              *window;
     vio_input_state    input;
     vio_2d_state       state_2d;

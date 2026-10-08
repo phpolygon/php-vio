@@ -28,17 +28,15 @@ void vio_backend_metal_register(void);
 int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
                                    vio_config *cfg);
 
-#ifdef HAVE_GLFW
 /*
- * GLFW convenience wrapper (macOS-only). Extracts NSWindow -> contentView,
- * attaches a freshly-created CAMetalLayer, then delegates to
- * vio_metal_setup_context_native(). Pulls framebuffer size via GLFW and
- * registers GLFW for pull-based resize polling in metal_begin_frame.
+ * Platform-window wrapper (macOS). Takes the window's NSWindow from the active
+ * platform (include/vio_platform.h), attaches a freshly-created CAMetalLayer to
+ * its content view, then delegates to vio_metal_setup_context_native(). Polls
+ * the window's framebuffer size for resizes in metal_begin_frame.
  *
  * Returns 0 on success, -1 on failure.
  */
-int vio_metal_setup_context(void *glfw_window, vio_config *cfg);
-#endif
+int vio_metal_setup_context(void *window, vio_config *cfg);
 
 /*
  * Push-based resize notification used by platforms without a polling-friendly

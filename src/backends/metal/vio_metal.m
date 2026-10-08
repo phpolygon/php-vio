@@ -16,13 +16,10 @@
 #include <os/lock.h>
 #include <stdatomic.h>
 
-#ifdef HAVE_GLFW
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-#define GLFW_EXPOSE_NATIVE_COCOA
-#include <GLFW/glfw3native.h>
+#ifndef HAVE_IOS
+#import <AppKit/AppKit.h>   /* NSWindow / NSView / NSScreen (came in through GLFW's Cocoa header before) */
 #endif
-
+#include "../../../include/vio_platform.h"
 #include "vio_metal.h"
 
 static void metal_marks_reset(void);
@@ -121,13 +118,11 @@ typedef struct _vio_metal_state {
     dispatch_semaphore_t       frame_semaphore;
     int                        frame_latency;
     int                        frame_semaphore_held; /* begin_frame took a slot present has not handed on yet */
-#ifdef HAVE_GLFW
     /* When the backend was bootstrapped via vio_metal_setup_context() the
-     * GLFW window is polled each frame to discover resizes. Pure-native
+     * platform window is polled each frame to discover resizes. Pure-native
      * setups (iOS, headless) leave this NULL and call
      * vio_metal_handle_resize() externally instead. */
-    GLFWwindow                *glfw_window;
-#endif
+    void                      *platform_window;
 } vio_metal_state;
 
 static vio_metal_state vio_mtl = {0};
@@ -779,18 +774,26 @@ void vio_metal_handle_resize(int width, int height)
     metal_resize(width, height);
 }
 
-#ifdef HAVE_GLFW
-int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
+#ifdef HAVE_IOS
+/* iOS has no NSWindow: vio_ios.m builds the layer and calls
+ * vio_metal_setup_context_native() itself. */
+int vio_metal_setup_context(void *platform_window, vio_config *cfg)
+{
+    (void)platform_window; (void)cfg;
+    return -1;
+}
+#else
+int vio_metal_setup_context(void *platform_window, vio_config *cfg)
 {
     @autoreleasepool {
-        GLFWwindow *win = (GLFWwindow *)glfw_window;
+        void *win = platform_window;
         if (!win) {
-            php_error_docref(NULL, E_WARNING, "Metal: setup_context called with NULL GLFW window");
+            php_error_docref(NULL, E_WARNING, "Metal: setup_context called without a window");
             return -1;
         }
 
-        /* Get NSWindow from GLFW */
-        NSWindow *ns_window = (NSWindow *)glfwGetCocoaWindow(win);
+        /* The platform window's NSWindow */
+        NSWindow *ns_window = (__bridge NSWindow *)vio_plat()->native_handle(win, VIO_NATIVE_NSWINDOW);
         if (!ns_window) {
             php_error_docref(NULL, E_WARNING, "Metal: failed to get Cocoa window");
             return -1;
@@ -822,9 +825,9 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
              * readback return only the top-left (logical-sized) quadrant. There
              * is no display to match offscreen, so size it 1:1 with the request
              * using the logical window size. */
-            glfwGetWindowSize(win, &fb_w, &fb_h);
+            vio_plat()->get_window_size(win, &fb_w, &fb_h);
         } else {
-            glfwGetFramebufferSize(win, &fb_w, &fb_h);
+            vio_plat()->get_framebuffer_size(win, &fb_w, &fb_h);
         }
 
         if (vio_metal_setup_context_native((__bridge void *)layer, fb_w, fb_h, cfg) != 0) {
@@ -838,14 +841,14 @@ int vio_metal_setup_context(void *glfw_window, vio_config *cfg)
          * Headless renders to a fixed-size offscreen texture (sized 1:1 with the
          * logical request above). Polling the window each frame would read the
          * Retina framebuffer size and resize the offscreen back to 2x, so leave
-         * glfw_window NULL for headless — matching the "headless leaves this
+         * platform_window NULL for headless — matching the "headless leaves this
          * NULL" contract documented on the struct field. */
-        vio_mtl.glfw_window = cfg->headless ? NULL : win;
+        vio_mtl.platform_window = cfg->headless ? NULL : win;
     }
 
     return 0;
 }
-#endif /* HAVE_GLFW */
+#endif /* HAVE_IOS */
 
 void vio_metal_shutdown_context(void)
 {
@@ -1776,18 +1779,16 @@ static void metal_begin_frame(void)
     @autoreleasepool {
         if (!vio_mtl.initialized) return;
 
-#ifdef HAVE_GLFW
-        /* GLFW path: poll the window for resize each frame. Native callers
+        /* Platform window: poll it for resize each frame. Native callers
          * (iOS UIView) push resizes through vio_metal_handle_resize() and
-         * leave glfw_window NULL, so we skip the poll in that case. */
-        if (vio_mtl.glfw_window) {
+         * leave platform_window NULL, so we skip the poll in that case. */
+        if (vio_mtl.platform_window) {
             int fb_w, fb_h;
-            glfwGetFramebufferSize(vio_mtl.glfw_window, &fb_w, &fb_h);
+            vio_plat()->get_framebuffer_size(vio_mtl.platform_window, &fb_w, &fb_h);
             if (fb_w != vio_mtl.width || fb_h != vio_mtl.height) {
                 metal_resize(fb_w, fb_h);
             }
         }
-#endif
 
         /* DO NOT reset current_bound_rt here. The persistent-bind contract
          * mirrored from D3D11/D3D12 (vio_d3d11.current_rtv survives across
@@ -1847,10 +1848,14 @@ static void metal_end_frame(void)
  * (the first one from its buffer's GPUStartTime) to its buffer's GPUEndTime.
  * The completion handlers run on Metal threads; whichever finishes last
  * publishes the frame. The upload ring fences on the frame's last buffer
- * (metal_ring_end_frame), so splitting the frame keeps its memory alive. */
+ * (metal_ring_end_frame), so splitting the frame keeps its memory alive.
+ * A section never starts before its own buffer's GPUStartTime: the idle gap
+ * between two buffers is no work of the later section (on the virtualised
+ * CI GPU the gap was larger than a light section, test 172). */
 typedef struct {
     vio_gpu_mark_names names;
     double             start;
+    double             begin[VIO_GPU_MARKS_MAX];   /* each section buffer's GPUStartTime */
     double             end[VIO_GPU_MARKS_MAX];
     atomic_int         remaining;   /* section buffers + the frame's last buffer */
 } metal_mark_frame;
@@ -1868,7 +1873,8 @@ static void metal_marks_publish(const metal_mark_frame *mf)
     for (int i = 0; i < r.count; i++) {
         memcpy(r.name[i], mf->names.name[i], VIO_GPU_MARK_NAME_MAX);
         double t = mf->end[i];
-        r.ms[i] = t > prev ? (t - prev) * 1000.0 : 0.0;
+        double from = mf->begin[i] > prev ? mf->begin[i] : prev;
+        r.ms[i] = t > from ? (t - from) * 1000.0 : 0.0;
         if (t > prev) prev = t;
     }
     os_unfair_lock_lock(&metal_marks_lock);
@@ -6702,6 +6708,7 @@ static int metal_gpu_mark(const char *name)
         atomic_fetch_add(&mf->remaining, 1);
         [vio_mtl.current_cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
             if (i == 0) mf->start = done.GPUStartTime;
+            mf->begin[i] = done.GPUStartTime;
             mf->end[i] = done.GPUEndTime;
             metal_marks_done(mf);
         }];
@@ -6774,14 +6781,20 @@ static int metal_enumerate_adapters(vio_adapter_info *out, int max)
                          : strstr(a->name, "NVIDIA") ? 0x10DE : 0x106B;
             a->device_type = dev.hasUnifiedMemory ? "integrated" : "discrete";
             a->vram_bytes = (uint64_t)dev.recommendedMaxWorkingSetSize;
-            a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
-                        | VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION) | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW);
+            memset(&a->features, 0, sizeof(a->features));
+            vio_featset_add(&a->features, VIO_FEATURE_COMPUTE);
+            vio_featset_add(&a->features, VIO_FEATURE_3D_PIPELINE);
+            vio_featset_add(&a->features, VIO_FEATURE_TESSELLATION);
+            vio_featset_add(&a->features, VIO_FEATURE_INDIRECT_DRAW);
             if ([dev respondsToSelector:@selector(supportsRaytracing)] && dev.supportsRaytracing)
-                a->features |= VIO_FEATURE_BIT(VIO_FEATURE_RAY_QUERY);
+                vio_featset_add(&a->features, VIO_FEATURE_RAY_QUERY);
             if ([dev supportsFamily:MTLGPUFamilyApple2])
-                a->features |= VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
+                vio_featset_add(&a->features, VIO_FEATURE_TEXTURE_COMPRESSION_ASTC);
             if ([dev supportsFamily:MTLGPUFamilyApple7] || [dev supportsFamily:MTLGPUFamilyMac2])
-                a->features |= VIO_FEATURE_BIT(VIO_FEATURE_MESH_SHADER) | VIO_FEATURE_BIT(VIO_FEATURE_SUBGROUP);
+            {
+                vio_featset_add(&a->features, VIO_FEATURE_MESH_SHADER);
+                vio_featset_add(&a->features, VIO_FEATURE_SUBGROUP);
+            }
         }
     }
     return n;

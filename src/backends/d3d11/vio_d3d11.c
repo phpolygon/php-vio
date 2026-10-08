@@ -19,12 +19,7 @@
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
 
-#ifdef HAVE_GLFW
-#define GLFW_INCLUDE_NONE
-#define GLFW_EXPOSE_NATIVE_WIN32
-#include <GLFW/glfw3.h>
-#include <GLFW/glfw3native.h>
-#endif
+#include "../../../include/vio_platform.h"
 
 #include "vio_d3d11.h"
 #include "../vio_d3d_common.h"
@@ -193,6 +188,7 @@ static int d3d11_init(vio_config *cfg)
     D3D_DRIVER_TYPE driver_type = cfg->headless && !cfg->headless_hardware && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)
         ? D3D_DRIVER_TYPE_WARP
         : D3D_DRIVER_TYPE_HARDWARE;
+    if (driver_type == D3D_DRIVER_TYPE_WARP) vio_d3d_load_warp();
 
     hr = D3D11CreateDevice(
         NULL,                           /* adapter (NULL = default) */
@@ -376,13 +372,12 @@ static void d3d11_shutdown(void)
 
 static void *d3d11_create_surface(vio_config *cfg)
 {
-#ifdef HAVE_GLFW
-    if (!vio_d3d11.glfw_window) {
-        php_error_docref(NULL, E_WARNING, "D3D11: No GLFW window set");
+    /* The platform window's HWND carries the swapchain. */
+    HWND hwnd = vio_d3d11.platform_window ? (HWND)vio_plat()->native_handle(vio_d3d11.platform_window, VIO_NATIVE_HWND) : NULL;
+    if (!hwnd) {
+        php_error_docref(NULL, E_WARNING, "D3D11: no window to present into");
         return NULL;
     }
-
-    HWND hwnd = glfwGetWin32Window((GLFWwindow *)vio_d3d11.glfw_window);
 
     /* HDR10 (GAP-PHASE5 Block 6): 10-bit backbuffer when asked for and the
      * window's display is in HDR mode (or forced). */
@@ -475,11 +470,6 @@ static void *d3d11_create_surface(vio_config *cfg)
     }
 
     return vio_d3d11.swapchain;
-#else
-    (void)cfg;
-    php_error_docref(NULL, E_WARNING, "D3D11: Built without GLFW, cannot create surface");
-    return NULL;
-#endif
 }
 
 static void d3d11_destroy_surface(void *surface)
@@ -3471,7 +3461,8 @@ static void *d3d11_create_compute_pipeline(vio_shader_desc *desc)
         }
     }
 
-    char *hlsl = vio_spirv_to_hlsl(spirv, spirv_size, 50, &err);
+    /* 'hlsl' override: the caller's kernel with the GLSL kernel's reflection */
+    char *hlsl = desc->compute_hlsl ? strdup(desc->compute_hlsl) : vio_spirv_to_hlsl(spirv, spirv_size, 50, &err);
     if (free_spirv) free(spirv);
     if (!hlsl) {
         php_error_docref(NULL, E_WARNING, "D3D11: CS SPIR-V->HLSL failed: %s", err ? err : "unknown");
@@ -3867,10 +3858,10 @@ static int d3d11_probe_adapter(IDXGIAdapter1 *adapter, vio_adapter_info *a)
         hr = D3D11CreateDevice((IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, levels + 1, 1,
                                D3D11_SDK_VERSION, &dev, NULL, NULL);
     if (FAILED(hr) || !dev) return -1;
-    a->features = VIO_FEATURE_BIT(VIO_FEATURE_COMPUTE) | VIO_FEATURE_BIT(VIO_FEATURE_3D_PIPELINE)
-                | VIO_FEATURE_BIT(VIO_FEATURE_GEOMETRY) | VIO_FEATURE_BIT(VIO_FEATURE_TESSELLATION)
-                | VIO_FEATURE_BIT(VIO_FEATURE_MULTI_VIEWPORT) | VIO_FEATURE_BIT(VIO_FEATURE_INDIRECT_DRAW)
-                | VIO_FEATURE_BIT(VIO_FEATURE_TEXTURE_COMPRESSION_BC);
+    static const int base[] = { VIO_FEATURE_COMPUTE, VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_GEOMETRY, VIO_FEATURE_TESSELLATION,
+                                VIO_FEATURE_MULTI_VIEWPORT, VIO_FEATURE_INDIRECT_DRAW, VIO_FEATURE_TEXTURE_COMPRESSION_BC };
+    memset(&a->features, 0, sizeof(a->features));
+    for (size_t i = 0; i < sizeof(base) / sizeof(base[0]); i++) vio_featset_add(&a->features, base[i]);
     if (!a->device_type) {
         D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2 = {0};
         if (SUCCEEDED(ID3D11Device_CheckFeatureSupport(dev, D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof(o2))))
@@ -4436,9 +4427,9 @@ static int d3d11_encode_copy_frame(void *dst_texture, int slice, int width, int 
 
 /* ── Setup context (called from vio_create after window creation) ── */
 
-int vio_d3d11_setup_context(void *glfw_window, vio_config *cfg)
+int vio_d3d11_setup_context(void *platform_window, vio_config *cfg)
 {
-    vio_d3d11.glfw_window = glfw_window;
+    vio_d3d11.platform_window = platform_window;
 
     /* Create surface (swapchain + render targets) */
     void *surface = d3d11_create_surface(cfg);

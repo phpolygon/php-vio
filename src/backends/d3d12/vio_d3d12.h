@@ -672,7 +672,7 @@ typedef struct _vio_d3d12_state {
     int                 ts_result_valid;
 
     /* Window reference */
-    void *glfw_window;
+    void *platform_window;
 } vio_d3d12_state;
 
 extern vio_d3d12_state vio_d3d12;
@@ -681,7 +681,7 @@ extern vio_d3d12_state vio_d3d12;
 void vio_backend_d3d12_register(void);
 
 /* Called after GLFW window creation to set up D3D12 */
-int vio_d3d12_setup_context(void *glfw_window, vio_config *cfg);
+int vio_d3d12_setup_context(void *platform_window, vio_config *cfg);
 
 /* Flush pending texture bindings into a contiguous SRV block (call before draw) */
 void vio_d3d12_flush_srv_table(void);
