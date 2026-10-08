@@ -12,7 +12,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
-#if defined(_WIN32) && defined(HAVE_D3D11)
+#if defined(_WIN32) && defined(HAVE_D3D11) && defined(HAVE_FFMPEG)
 #define COBJMACROS
 #include <d3d11.h>
 #include <libavutil/hwcontext_d3d11va.h>

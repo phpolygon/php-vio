@@ -10,7 +10,7 @@
 
 #ifdef HAVE_OPENGL
 
-#include <glad/glad.h>
+#include "../../../vendor/glad/include/glad/glad.h"   /* by path, see php_vio.c */
 #include <stddef.h>
 
 #include "vio_2d_opengl.h"

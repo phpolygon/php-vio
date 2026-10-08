@@ -69,7 +69,9 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #endif
 
 #ifdef HAVE_OPENGL
-#include <glad/glad.h>
+/* vio's own GLAD by path: a static build (static-php-cli) puts other
+ * extensions' include dirs - ext/glfw ships an older GLAD - ahead of ours. */
+#include "vendor/glad/include/glad/glad.h"
 #include "src/backends/opengl/vio_opengl.h"
 int vio_opengl_setup_context(void);
 #endif
