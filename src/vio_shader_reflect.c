@@ -1067,6 +1067,9 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
                 }
             }
             unsigned int binding = is_depth_sampler ? shadow_idx++ : regular_idx++;
+            int planned = shader_model >= 51 ? vio_sampler_plan_reg(sampled_images[i].name)
+                                             : vio_sampler_plan_index(sampled_images[i].name);
+            if (planned >= 0) binding = (unsigned int)planned;
             spvc_compiler_set_decoration(compiler, sampled_images[i].id,
                                           SpvDecorationBinding, binding);
         }
@@ -1103,6 +1106,38 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
             size_t ubo_count;
             spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, &ubos, &ubo_count);
             if (ubo_count > 0) spvc_compiler_set_decoration(compiler, ubos[0].id, SpvDecorationBinding, 0);
+        }
+
+        /* Mesh / task stages also see the texture table (OPEN-ITEMS-PLAN A30): their
+         * storage buffers move to register space 2, where the D3D12 mesh root
+         * signature puts its root SRV, so t0 of the table stays the texture's. */
+        {
+            SpvExecutionModel em = spvc_compiler_get_execution_model(compiler);
+            if (em == SpvExecutionModelMeshEXT || em == SpvExecutionModelTaskEXT) {
+                const spvc_reflected_resource *ssbos;
+                size_t ssbo_count;
+                spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STORAGE_BUFFER, &ssbos, &ssbo_count);
+                for (size_t i = 0; i < ssbo_count; i++) {
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationDescriptorSet, 2);
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, (unsigned int)i);
+                }
+            }
+        }
+
+        /* Mesh / task stages also see the texture table (OPEN-ITEMS-PLAN A30): their
+         * storage buffers move to register space 2, where the D3D12 mesh root
+         * signature puts its root SRV, so t0 of the table stays the texture's. */
+        {
+            SpvExecutionModel em = spvc_compiler_get_execution_model(compiler);
+            if (em == SpvExecutionModelMeshEXT || em == SpvExecutionModelTaskEXT) {
+                const spvc_reflected_resource *ssbos;
+                size_t ssbo_count;
+                spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STORAGE_BUFFER, &ssbos, &ssbo_count);
+                for (size_t i = 0; i < ssbo_count; i++) {
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationDescriptorSet, 2);
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, (unsigned int)i);
+                }
+            }
         }
 
         /* Ray query (GL_EXT_ray_query): the acceleration structure moves to its
@@ -1588,3 +1623,82 @@ int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*n
 }
 
 #endif /* HAVE_SPIRV_CROSS */
+
+/* ── Shader-wide sampler plan (OPEN-ITEMS-PLAN A30) ─────────────────── */
+
+static const vio_sampler_plan *vio_sampler_plan_active = NULL;
+
+void vio_sampler_plan_use(const vio_sampler_plan *plan) { vio_sampler_plan_active = plan; }
+const vio_sampler_plan *vio_sampler_plan_current(void) { return vio_sampler_plan_active; }
+
+int vio_sampler_plan_reg(const char *name)
+{
+    const vio_sampler_plan *p = vio_sampler_plan_active;
+    if (!p || !name) return -1;
+    for (int i = 0; i < p->count; i++) if (strcmp(p->names[i], name) == 0) return p->reg[i];
+    return -1;
+}
+
+int vio_sampler_plan_index(const char *name)
+{
+    const vio_sampler_plan *p = vio_sampler_plan_active;
+    if (!p || !name) return -1;
+    for (int i = 0; i < p->count; i++) if (strcmp(p->names[i], name) == 0) return i;
+    return -1;
+}
+
+static int vio_sampler_plan_find(const vio_sampler_plan *p, const char *name)
+{
+    for (int i = 0; i < p->count; i++) if (strcmp(p->names[i], name) == 0) return i;
+    return -1;
+}
+
+static void vio_sampler_plan_add(vio_sampler_plan *p, const char *name, int reg, int is_depth)
+{
+    if (p->count >= VIO_SAMPLER_PLAN_MAX || reg < 0) return;
+    snprintf(p->names[p->count], sizeof(p->names[0]), "%s", name ? name : "");
+    p->reg[p->count] = reg;
+    p->is_depth[p->count] = is_depth;
+    p->count++;
+}
+
+/* Lowest register in [lo, hi) no planned sampler holds; -1 when full. */
+static int vio_sampler_plan_free_reg(const vio_sampler_plan *p, int lo, int hi)
+{
+    for (int r = lo; r < hi; r++) {
+        int used = 0;
+        for (int i = 0; i < p->count && !used; i++) used = p->reg[i] == r;
+        if (!used) return r;
+    }
+    return -1;
+}
+
+void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv, const size_t *size, int n)
+{
+    memset(plan, 0, sizeof(*plan));
+    for (int s = 0; s < n; s++) {
+        if (!spirv[s] || !size[s]) continue;
+        vio_reflect_result r = {0};
+        char *err = NULL;
+        if (vio_spirv_reflect(spirv[s], size[s], &r, &err) != 0) { free(err); continue; }
+        if (s == 0) {
+            /* The fragment stage: the replay php_vio.c always did. */
+            int regular = 0, shadow = 8;
+            for (int t = 0; t < r.texture_count; t++) {
+                int d = r.textures[t].is_depth ? 1 : 0;
+                vio_sampler_plan_add(plan, r.textures[t].name, d ? shadow++ : regular++, d);
+            }
+            char sep[VIO_SAMPLER_PLAN_MAX][64];
+            int nsep = vio_spirv_separate_images(spirv[s], size[s], sep, VIO_SAMPLER_PLAN_MAX);
+            for (int j = 0; j < nsep; j++) vio_sampler_plan_add(plan, sep[j], r.texture_count + j, 0);
+        } else {
+            for (int t = 0; t < r.texture_count; t++) {
+                if (vio_sampler_plan_find(plan, r.textures[t].name) >= 0) continue;
+                int d = r.textures[t].is_depth ? 1 : 0;
+                vio_sampler_plan_add(plan, r.textures[t].name, d ? vio_sampler_plan_free_reg(plan, 8, 16)
+                                                                 : vio_sampler_plan_free_reg(plan, 0, 8), d);
+            }
+        }
+        vio_reflect_free(&r);
+    }
+}

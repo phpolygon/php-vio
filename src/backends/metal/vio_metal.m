@@ -5163,6 +5163,44 @@ static int metal_resolve_fs_texture(int slot, int *is_depth)
     return slot;
 }
 
+/* Mesh pipelines (OPEN-ITEMS-PLAN A30): the PHP sampler map lists the fragment
+ * samplers, then the mesh stage's new names, then the task stage's
+ * (vio_shader_merge_stage_samplers). Resolve `slot` to its name and bind the
+ * texture wherever the mesh ([[mesh]], vs table) or object stage declares it. */
+static void metal_bind_mesh_stage_texture(int slot, id<MTLTexture> tex, id<MTLSamplerState> smp, id<MTLSamplerState> cmp)
+{
+    vio_metal_pipeline *p = metal_current_pipeline;
+    if (!p || !p->shader || !p->shader->mesh || slot < 0) return;
+    const vio_metal_stage_res *stages[3] = { &p->shader->fs, &p->shader->vs, p->shader->object_fn ? &p->shader->obj : NULL };
+    const char *names[3 * VIO_METAL_MAX_RES];
+    int n = 0;
+    for (int s = 0; s < 3; s++) {
+        if (!stages[s]) continue;
+        for (int i = 0; i < stages[s]->texture_count; i++) {
+            const char *nm = stages[s]->textures[i].name;
+            int known = 0;
+            for (int k = 0; k < n && !known; k++) known = strcmp(names[k], nm) == 0;
+            if (!known) names[n++] = nm;
+        }
+    }
+    if (slot >= n) return;
+    for (int s = 1; s < 3; s++) {
+        if (!stages[s]) continue;
+        for (int i = 0; i < stages[s]->texture_count; i++) {
+            const vio_metal_res_texture *rt = &stages[s]->textures[i];
+            if (strcmp(rt->name, names[slot]) != 0 || rt->msl_index < 0 || rt->msl_index > 30) continue;
+            id<MTLSamplerState> use = rt->is_depth && cmp ? cmp : smp;
+            if (s == 1) {
+                [vio_mtl.current_encoder setMeshTexture:tex atIndex:(NSUInteger)rt->msl_index];
+                if (use) [vio_mtl.current_encoder setMeshSamplerState:use atIndex:(NSUInteger)rt->msl_index];
+            } else {
+                [vio_mtl.current_encoder setObjectTexture:tex atIndex:(NSUInteger)rt->msl_index];
+                if (use) [vio_mtl.current_encoder setObjectSamplerState:use atIndex:(NSUInteger)rt->msl_index];
+            }
+        }
+    }
+}
+
 static void metal_bind_texture(void *texture, int slot)
 {
     vio_metal_texture *t = (vio_metal_texture *)texture;
@@ -5176,6 +5214,9 @@ static void metal_bind_texture(void *texture, int slot)
         [vio_mtl.current_encoder setFragmentTexture:(__bridge id<MTLTexture>)t->tex atIndex:(NSUInteger)idx];
         if (s) [vio_mtl.current_encoder setFragmentSamplerState:s atIndex:(NSUInteger)idx];
         metal_fs_shadow_set(idx, (__bridge id<MTLTexture>)t->tex, s);
+        if (metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->mesh)
+            metal_bind_mesh_stage_texture(slot, (__bridge id<MTLTexture>)t->tex,
+                                          (__bridge id<MTLSamplerState>)t->sampler, metal_texture_cmp_sampler(t));
     }
 }
 
@@ -5554,6 +5595,7 @@ void vio_metal_bind_cubemap(void *cubemap_obj, int slot)
         [vio_mtl.current_encoder setFragmentTexture:ctex atIndex:(NSUInteger)idx];
         if (csmp) [vio_mtl.current_encoder setFragmentSamplerState:csmp atIndex:(NSUInteger)idx];
         metal_fs_shadow_set(idx, ctex, csmp);
+        metal_bind_mesh_stage_texture(slot, ctex, csmp, csmp);
     }
 }
 

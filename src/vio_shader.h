@@ -11,6 +11,7 @@
 
 #include "php.h"
 #include "../include/vio_types.h"
+#include "vio_shader_reflect.h"
 
 #define VIO_MAX_UNIFORMS 256
 #define VIO_CBUFFER_SIZE 4096
@@ -59,6 +60,8 @@ typedef struct _vio_shader_object {
     uint32_t         *frag_spirv;    /* SPIR-V binary for fragment shader */
     size_t            frag_spirv_size;
     /* Optional geometry / tess-control / tess-eval stages (NULL = absent). */
+    /* Shader-wide sampler registers by name (vio_sampler_plan, A30). */
+    vio_sampler_plan  sampler_plan;
     uint32_t         *stage_spirv[VIO_EXTRA_STAGE_COUNT];
     size_t            stage_spirv_size[VIO_EXTRA_STAGE_COUNT];
     vio_shader_stage_cb *stage_cb[VIO_EXTRA_STAGE_COUNT];

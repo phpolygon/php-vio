@@ -248,6 +248,8 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
         int is_depth = 0;
         VkImageViewType dim = vk3d_sampler_dim(c, list[i].type_id, &is_depth);
         int reg = is_depth ? shadow++ : regular++;
+        int planned = vio_sampler_plan_reg(list[i].name);   /* shader-wide by name (A30) */
+        if (planned >= 0) reg = planned;
         if (reg >= VK3D_MAX_SAMPLERS) continue;
         uint32_t binding = (uint32_t)(VK3D_B_SAMPLER0 + reg);
         spvc_compiler_set_decoration(c, list[i].id, SpvDecorationDescriptorSet, 0);
@@ -421,6 +423,8 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     uint64_t key = vio_shader_cache_hash(tag, spirv, spirv_bytes);
     key = vio_shader_cache_hash_more(key, &upstream, sizeof(upstream));
     key = vio_shader_cache_hash_more(key, &is_last, sizeof(is_last));
+    if (vio_sampler_plan_current())   /* sampler bindings come from the whole shader */
+        key = vio_shader_cache_hash_more(key, vio_sampler_plan_current(), sizeof(vio_sampler_plan));
     if (vio_shader_cache_dir()) {
         size_t len = 0;
         void *data = vio_shader_cache_load(key, "vkspv", &len);
@@ -610,10 +614,13 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
     }
     /* Samplers only an optional stage declares extend the GL-unit map after the
      * fragment ones, in php_vio.c's merge order (geometry, tess control, tess
-     * eval), so vio_set_uniform('u_height', unit) + vio_bind_texture reach them. */
+     * eval, then mesh and task - OPEN-ITEMS-PLAN A30), so vio_set_uniform('u_height',
+     * unit) + vio_bind_texture reach them. Index 1 is the vertex stage of a
+     * vertex pipeline: its samplers are not in the map, so only mesh pipelines merge it. */
     {
-        static const int merge_order[3] = { 4, 2, 3 };
-        for (int k = 0; k < 3; k++) {
+        static const int merge_order[5] = { 4, 2, 3, 1, 0 };
+        int merge_count = is_mesh ? 5 : 3;
+        for (int k = 0; k < merge_count; k++) {
             const vk3d_stage_samplers *s = &smp[merge_order[k]];
             for (int j = 0; j < s->count && sh->fs_sampler_count < VK3D_MAX_SAMPLERS; j++) {
                 int known = 0;

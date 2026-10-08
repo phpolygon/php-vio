@@ -3723,7 +3723,31 @@ ZEND_FUNCTION(vio_shader)
         desc.task_data         = shader->task_spirv;
         desc.task_size         = shader->task_spirv_size;
 
+        /* Sampler registers by name across all stages (OPEN-ITEMS-PLAN A30), in
+         * the sampler-map order: fragment, geometry, tess control, tess eval,
+         * mesh, task. */
+        {
+            const uint32_t *ps[6] = {
+                shader->frag_spirv,
+                shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)],
+                shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)],
+                shader->stage_spirv[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)],
+                shader->is_mesh ? shader->vert_spirv : NULL,
+                shader->is_mesh ? shader->task_spirv : NULL,
+            };
+            const size_t sz[6] = {
+                shader->frag_spirv_size,
+                shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY)],
+                shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL)],
+                shader->stage_spirv_size[VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL)],
+                shader->is_mesh ? shader->vert_spirv_size : 0,
+                shader->is_mesh ? shader->task_spirv_size : 0,
+            };
+            vio_sampler_plan_build(&shader->sampler_plan, ps, sz, 6);
+        }
+        vio_sampler_plan_use(&shader->sampler_plan);
         shader->backend_shader = ctx->backend->compile_shader(&desc);
+        vio_sampler_plan_use(NULL);
         if (!shader->backend_shader) {
             php_error_docref(NULL, E_WARNING, "Backend shader compilation failed");
             zval_ptr_dtor(&shader_zval);
@@ -3839,6 +3863,22 @@ ZEND_FUNCTION(vio_shader)
         for (int i = 0; i < VIO_EXTRA_STAGE_COUNT; i++) {
             if (shader->stage_spirv[i]) {
                 vio_shader_merge_stage_samplers(shader, shader->stage_spirv[i], shader->stage_spirv_size[i]);
+            }
+        }
+        /* Mesh pipelines (OPEN-ITEMS-PLAN A30): the mesh stage (in vert_spirv)
+         * and the task stage read textures too; their samplers follow, mesh
+         * first. Every backend replays this order. */
+        if (shader->is_mesh) {
+            if (shader->vert_spirv) vio_shader_merge_stage_samplers(shader, shader->vert_spirv, shader->vert_spirv_size);
+            if (shader->task_spirv) vio_shader_merge_stage_samplers(shader, shader->task_spirv, shader->task_spirv_size);
+        }
+        /* Registers from the shader-wide plan the backend compiled with. */
+        for (int s = 0; s < shader->sampler_count; s++) {
+            for (int k = 0; k < shader->sampler_plan.count; k++) {
+                if (strcmp(shader->sampler_plan.names[k], shader->sampler_names[s]) == 0) {
+                    shader->sampler_hlsl_reg[s] = shader->sampler_plan.reg[k];
+                    break;
+                }
             }
         }
     }
@@ -4335,7 +4375,9 @@ ZEND_FUNCTION(vio_pipeline)
         desc.patch_vertices = pipe->patch_vertices;
         desc.view_count = shader->view_count;
 
+        vio_sampler_plan_use(&shader->sampler_plan);   /* HS variants translate here */
         pipe->backend_pipeline = ctx->backend->create_pipeline(&desc);
+        vio_sampler_plan_use(NULL);
         /* The backend has warned (e.g. a PSO the driver rejects). Returning the
          * object anyway let callers draw with no pipeline state bound, which
          * crashed D3D12 at the end of the frame. Backends without a 3D

@@ -63,6 +63,7 @@ typedef struct _vio_metal_res_texture {
     int msl_index;  /* [[texture(N)]] == [[sampler(N)]] */
     int is_depth;   /* sampler2DShadow -> needs a compare sampler */
     int is_cube;    /* samplerCube */
+    char name[64];  /* GLSL name: matches the PHP sampler map across stages */
 } vio_metal_res_texture;
 
 typedef struct _vio_metal_vs_input {
@@ -531,6 +532,7 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
             vio_metal_res_texture *t = &res->textures[res->texture_count++];
             t->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
             t->msl_index = (int)next;
+            snprintf(t->name, sizeof(t->name), "%s", list[i].name ? list[i].name : "");
             spvc_type type = spvc_compiler_get_type_handle(compiler, list[i].type_id);
             spvc_type image = type ? spvc_compiler_get_type_handle(compiler, spvc_type_get_base_type_id(type)) : NULL;
             if (image) {
@@ -558,6 +560,7 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
             vio_metal_res_texture *t = &res->textures[res->texture_count++];
             t->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
             t->msl_index = (int)next;
+            snprintf(t->name, sizeof(t->name), "%s", list[i].name ? list[i].name : "");
             spvc_type image = spvc_compiler_get_type_handle(compiler, list[i].type_id);
             if (image) {
                 t->is_depth = spvc_type_get_image_is_depth(image) ? 1 : 0;

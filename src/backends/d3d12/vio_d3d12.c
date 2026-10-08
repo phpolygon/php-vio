@@ -657,7 +657,9 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     /* [3] Root SRV t0 — vertex-stage storage buffer (Path B). */
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[3].Descriptor.ShaderRegister = 0;
-    params[3].Descriptor.RegisterSpace = 0;
+    /* Mesh variant: space 2 (vio_shader_reflect.c moves mesh / task storage
+     * buffers there), since the mesh stage also sees the SRV table at t0. */
+    params[3].Descriptor.RegisterSpace = mesh ? 2 : 0;
     params[3].ShaderVisibility = mesh ? D3D12_SHADER_VISIBILITY_MESH : D3D12_SHADER_VISIBILITY_VERTEX;
 
     /* [4] Sampler table s0..s7 — one per regular texture register (GAP-PLAN
@@ -703,6 +705,13 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
             smp->DescriptorTable.NumDescriptorRanges = 1;
             smp->DescriptorTable.pDescriptorRanges = &sampler_range;
             smp->ShaderVisibility = vis[s];
+            /* Mesh variant: the GS tables serve the amplification stage, the HS
+             * tables the mesh stage (textures in mesh / task, OPEN-ITEMS-PLAN A30). */
+            if (mesh && s < 2) {
+                D3D12_SHADER_VISIBILITY mv = s == 0 ? D3D12_SHADER_VISIBILITY_AMPLIFICATION : D3D12_SHADER_VISIBILITY_MESH;
+                srv->ShaderVisibility = mv;
+                smp->ShaderVisibility = mv;
+            }
         }
     }
 
@@ -722,7 +731,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
         static_samplers[s].MaxLOD = D3D12_FLOAT32_MAX;
         static_samplers[s].ShaderRegister = 8 + s;
         static_samplers[s].RegisterSpace = 0;
-        static_samplers[s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        static_samplers[s].ShaderVisibility = mesh ? D3D12_SHADER_VISIBILITY_ALL : D3D12_SHADER_VISIBILITY_PIXEL;
     }
 
     /* [14] root SRV t0, space9: the ray-query acceleration structure (vio_shader_reflect.c
@@ -8856,8 +8865,8 @@ static void d3d12_set_srv_tables(D3D12_GPU_DESCRIPTOR_HANDLE gpu)
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_PS_SRV, gpu);
     vio_d3d12_pipeline *p = d3d12_current_pipeline;
     if (!p) return;
-    if (p->has_gs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_GS_SRV, gpu);
-    if (p->has_hs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_HS_SRV, gpu);
+    if (p->has_gs || p->is_mesh) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_GS_SRV, gpu);
+    if (p->has_hs || p->is_mesh) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_HS_SRV, gpu);
     if (p->has_ds) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_DS_SRV, gpu);
 }
 
@@ -8866,8 +8875,8 @@ static void d3d12_set_sampler_tables(D3D12_GPU_DESCRIPTOR_HANDLE gpu)
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_PS_SAMPLER, gpu);
     vio_d3d12_pipeline *p = d3d12_current_pipeline;
     if (!p) return;
-    if (p->has_gs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_GS_SAMPLER, gpu);
-    if (p->has_hs) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_HS_SAMPLER, gpu);
+    if (p->has_gs || p->is_mesh) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_GS_SAMPLER, gpu);
+    if (p->has_hs || p->is_mesh) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_HS_SAMPLER, gpu);
     if (p->has_ds) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_DS_SAMPLER, gpu);
 }
 

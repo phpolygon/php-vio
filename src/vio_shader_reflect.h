@@ -159,4 +159,33 @@ int vio_spvc_combine_separate(void *compiler);
  * Returns the count (<= max). */
 int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*names)[64], int max);
 
+/* Shader-wide sampler registers by NAME (OPEN-ITEMS-PLAN A30). Every stage of a
+ * D3D / Vulkan shader shares one texture table, so a sampler must land on the
+ * same register in every stage that declares it. Counting per stage broke that
+ * whenever stages listed their samplers in a different order - and SPIRV-Cross
+ * lists them in SPIR-V id order, i.e. glslang's order of first use, not the
+ * declaration order. The plan walks the stages in the sampler-map order of
+ * php_vio.c (fragment, geometry, tess control, tess eval, mesh, task): the
+ * fragment stage keeps its replayed registers (regular 0.., depth 8..,
+ * separate textures after the combined ones), every later name takes the lowest
+ * free register of its kind. vio_spirv_to_hlsl and the Vulkan stage rewrite
+ * look names up while a plan is in use (vio_sampler_plan_use around the
+ * backend's compile_shader / create_pipeline); names outside it keep the
+ * per-stage counter. */
+#define VIO_SAMPLER_PLAN_MAX 32
+typedef struct _vio_sampler_plan {
+    int  count;
+    char names[VIO_SAMPLER_PLAN_MAX][64];
+    int  reg[VIO_SAMPLER_PLAN_MAX];
+    int  is_depth[VIO_SAMPLER_PLAN_MAX];
+} vio_sampler_plan;
+
+/* spirv[0] is the fragment stage; NULL entries are skipped. */
+void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv, const size_t *size, int n);
+void vio_sampler_plan_use(const vio_sampler_plan *plan);   /* NULL ends it */
+const vio_sampler_plan *vio_sampler_plan_current(void);
+int  vio_sampler_plan_reg(const char *name);   /* -1: no plan in use or name not listed */
+/* Position in the plan = position in php_vio.c's sampler map: the register of
+ * SM 5.0 (D3D11), which numbers every sampler in one sequence and binds by index. */
+int  vio_sampler_plan_index(const char *name);
 #endif /* VIO_SHADER_REFLECT_H */
