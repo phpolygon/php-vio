@@ -28,6 +28,8 @@
 static void metal_marks_reset(void);
 static void metal_archive_close(void);
 static void metal_upscale_release(void);
+static void metal_rrm_release(void);
+static void metal_rrm_resolve(vio_render_target_object *rt);
 #include "../../shaders/shaders_2d.h"
 #include "../../vio_render_target.h"
 #include "../../vio_texfmt.h"
@@ -1456,6 +1458,7 @@ static int metal_init(vio_config *cfg)
 static void metal_shutdown(void)
 {
     metal_upscale_release();
+    metal_rrm_release();
     vio_metal_shutdown_context();
 }
 
@@ -1491,6 +1494,119 @@ static void metal_resize(int width, int height)
             offDesc.storageMode = MTLStorageModePrivate;
             vio_mtl.offscreen_texture = [vio_mtl.device newTextureWithDescriptor:offDesc];
         }
+    }
+}
+
+/* ── Rasterization rate maps (OPEN-ITEMS A16) ─────────────────────── */
+
+static id<MTLRenderPipelineState> metal_rrm_pso;   /* the resolve, for metal_rrm_fmt */
+static MTLPixelFormat             metal_rrm_fmt;
+
+static void metal_rrm_release(void)
+{
+    metal_rrm_pso = nil;
+    metal_rrm_fmt = MTLPixelFormatInvalid;
+}
+
+/* A plain 2D colour target with 'rate_map': the map, physical colour + depth
+ * and the map's parameter buffer for the resolve. Without device support the
+ * target simply renders at full rate. */
+static void metal_rt_rate_map_setup(vio_render_target_object *rt)
+{
+    if (rt->rate_nx < 1 || rt->rate_ny < 1 || !rt->metal_color_texture || rt->depth_only || rt->samples > 1) return;
+    if (@available(macOS 10.15.4, iOS 13.0, *)) {
+        if (![vio_mtl.device supportsRasterizationRateMapWithLayerCount:1]) return;
+        MTLRasterizationRateLayerDescriptor *ld =
+            [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake((NSUInteger)rt->rate_nx, (NSUInteger)rt->rate_ny, 0)];
+        for (int i = 0; i < rt->rate_nx; i++) ld.horizontalSampleStorage[i] = rt->rate_x[i];
+        for (int i = 0; i < rt->rate_ny; i++) ld.verticalSampleStorage[i] = rt->rate_y[i];
+        MTLRasterizationRateMapDescriptor *md =
+            [MTLRasterizationRateMapDescriptor rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake((NSUInteger)rt->width, (NSUInteger)rt->height, 0)
+                                                                                      layer:ld];
+        id<MTLRasterizationRateMap> map = [vio_mtl.device newRasterizationRateMapWithDescriptor:md];
+        if (!map) return;
+        MTLSize phys = [map physicalSizeForLayer:0];
+        if (phys.width < 1 || phys.height < 1) return;
+        id<MTLTexture> logical = (__bridge id<MTLTexture>)rt->metal_color_texture;
+        MTLTextureDescriptor *cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:logical.pixelFormat
+                                                                                       width:phys.width height:phys.height mipmapped:NO];
+        cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        cd.storageMode = MTLStorageModePrivate;
+        MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:VIO_METAL_DEPTH_STENCIL
+                                                                                       width:phys.width height:phys.height mipmapped:NO];
+        dd.usage = MTLTextureUsageRenderTarget;
+        dd.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> color = [vio_mtl.device newTextureWithDescriptor:cd];
+        id<MTLTexture> depth = [vio_mtl.device newTextureWithDescriptor:dd];
+        MTLSizeAndAlign sa = map.parameterBufferSizeAndAlign;
+        id<MTLBuffer> params = [vio_mtl.device newBufferWithLength:(sa.size ? sa.size : 16) options:MTLResourceStorageModeShared];
+        if (!color || !depth || !params) return;
+        [map copyParameterDataToBuffer:params offset:0];
+        rt->metal_rrm        = (void *)CFBridgingRetain(map);
+        rt->metal_rrm_color  = (void *)CFBridgingRetain(color);
+        rt->metal_rrm_depth  = (void *)CFBridgingRetain(depth);
+        rt->metal_rrm_params = (void *)CFBridgingRetain(params);
+        rt->physical_width   = (int)phys.width;
+        rt->physical_height  = (int)phys.height;
+        rt->rate_active      = 1;
+        rt->rrm_dirty        = 0;
+    }
+}
+
+static const char *metal_rrm_msl =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VioRrmOut { float4 pos [[position]]; };\n"
+    "vertex VioRrmOut vio_rrm_vs(uint vid [[vertex_id]]) {\n"
+    "    float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
+    "    VioRrmOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;\n"
+    "}\n"
+    "fragment float4 vio_rrm_fs(VioRrmOut in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
+    "                           constant rasterization_rate_map_data &map [[buffer(0)]]) {\n"
+    "    rasterization_rate_map_decoder dec(map);\n"
+    "    float2 phys = dec.map_screen_to_physical_coordinates(in.pos.xy);\n"
+    "    constexpr sampler s(coord::pixel, filter::linear, address::clamp_to_edge);\n"
+    "    return src.sample(s, phys);\n"
+    "}\n";
+
+/* Physical colour -> logical texture through the map: every logical pixel reads
+ * the physical position the map gives it. Called with no encoder open. */
+static void metal_rrm_resolve(vio_render_target_object *rt)
+{
+    if (!rt || !rt->rrm_dirty || !rt->metal_rrm_color || !rt->metal_color_texture || !vio_mtl.current_cmd_buf) return;
+    @autoreleasepool {
+        id<MTLTexture> logical = (__bridge id<MTLTexture>)rt->metal_color_texture;
+        if (!metal_rrm_pso || metal_rrm_fmt != logical.pixelFormat) {
+            NSError *e = nil;
+            id<MTLLibrary> lib = [vio_mtl.device newLibraryWithSource:[NSString stringWithUTF8String:metal_rrm_msl]
+                                                              options:metal_compile_options() error:&e];
+            if (!lib) {
+                php_error_docref(NULL, E_WARNING, "Metal: rate map resolve shader: %s", e ? [[e localizedDescription] UTF8String] : "unknown");
+                rt->rrm_dirty = 0;
+                return;
+            }
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+            pd.vertexFunction = [lib newFunctionWithName:@"vio_rrm_vs"];
+            pd.fragmentFunction = [lib newFunctionWithName:@"vio_rrm_fs"];
+            pd.colorAttachments[0].pixelFormat = logical.pixelFormat;
+            metal_rrm_pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:pd error:&e];
+            metal_rrm_fmt = logical.pixelFormat;
+            if (!metal_rrm_pso) {
+                rt->rrm_dirty = 0;
+                return;
+            }
+        }
+        MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+        d.colorAttachments[0].texture = logical;
+        d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        d.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [vio_mtl.current_cmd_buf renderCommandEncoderWithDescriptor:d];
+        [enc setRenderPipelineState:metal_rrm_pso];
+        [enc setFragmentTexture:(__bridge id<MTLTexture>)rt->metal_rrm_color atIndex:0];
+        [enc setFragmentBuffer:(__bridge id<MTLBuffer>)rt->metal_rrm_params offset:0 atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        rt->rrm_dirty = 0;
     }
 }
 
@@ -1580,6 +1696,18 @@ static void metal_open_encoder(int load_clear)
         }
 
         MTLRenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
+
+        /* Rate map (A16): the physical attachments, sampled by the map; the
+         * viewport stays in logical (screen) pixels. Resolved into the logical
+         * texture when the pass leaves the target. */
+        if (current_bound_rt && current_bound_rt->metal_rrm && current_bound_rt->metal_rrm_color && n_color == 1 && !rt_ms) {
+            if (@available(macOS 10.15.4, iOS 13.0, *)) {
+                color_targets[0] = (__bridge id<MTLTexture>)current_bound_rt->metal_rrm_color;
+                depth_target = (__bridge id<MTLTexture>)current_bound_rt->metal_rrm_depth;
+                desc.rasterizationRateMap = (__bridge id<MTLRasterizationRateMap>)current_bound_rt->metal_rrm;
+                current_bound_rt->rrm_dirty = 1;
+            }
+        }
 
         for (int i = 0; i < n_color; i++) {
             if (!color_targets[i]) continue;
@@ -1708,6 +1836,8 @@ static void metal_end_frame(void)
 
         [vio_mtl.current_encoder endEncoding];
         vio_mtl.current_encoder = nil;
+        /* a rate-mapped target still bound: its logical texture for the readback */
+        if (current_bound_rt && current_bound_rt->rrm_dirty) metal_rrm_resolve(current_bound_rt);
     }
 }
 
@@ -2690,6 +2820,7 @@ static int metal_create_render_target(void *rt_ptr, int width, int height, int h
             rt->metal_depth_texture = (void *)CFBridgingRetain(depth_tex);
         }
         rt->backend_type = VIO_RT_BACKEND_METAL;
+        metal_rt_rate_map_setup(rt);
         metal_rt_initial_clear(rt);
 
         return 0;
@@ -2701,6 +2832,7 @@ static void metal_bind_render_target_at(vio_render_target_object *rt, int face, 
     @autoreleasepool {
         if (rt->backend_type != VIO_RT_BACKEND_METAL || !vio_mtl.initialized) return;
 
+        vio_render_target_object *left = current_bound_rt;
         current_bound_rt    = rt;
         current_bound_face  = face;
         current_bound_level = level;
@@ -2718,6 +2850,7 @@ static void metal_bind_render_target_at(vio_render_target_object *rt, int face, 
                 [vio_mtl.current_encoder endEncoding];
                 vio_mtl.current_encoder = nil;
             }
+            if (left && left->rrm_dirty) metal_rrm_resolve(left);
             metal_open_encoder(/*load_clear=*/0);
         }
     }
@@ -2754,6 +2887,7 @@ static void metal_unbind_render_target(unsigned int default_fbo, int width, int 
          * stash keeps a dangling pointer to a release()'d RT object and the
          * next metal_begin_frame opens an encoder on freed Metal textures.
          * Symptom: every-few-frames flicker after a warmRender pass. */
+        vio_render_target_object *left = current_bound_rt;
         current_bound_rt    = NULL;
         current_bound_face  = -1;
         current_bound_level = 0;
@@ -2768,6 +2902,7 @@ static void metal_unbind_render_target(unsigned int default_fbo, int width, int 
             [vio_mtl.current_encoder endEncoding];
             vio_mtl.current_encoder = nil;
         }
+        if (left && left->rrm_dirty) metal_rrm_resolve(left);
 
         /* Restore swapchain — load existing contents so previously drawn
          * geometry isn't wiped when the consumer bounces between RT and
@@ -2787,6 +2922,11 @@ static void metal_destroy_render_target(void *rt_ptr)
     if (current_bound_rt == rt) {
         current_bound_rt = NULL;
     }
+    if (rt->metal_rrm)        { CFBridgingRelease(rt->metal_rrm);        rt->metal_rrm = NULL; }
+    if (rt->metal_rrm_color)  { CFBridgingRelease(rt->metal_rrm_color);  rt->metal_rrm_color = NULL; }
+    if (rt->metal_rrm_depth)  { CFBridgingRelease(rt->metal_rrm_depth);  rt->metal_rrm_depth = NULL; }
+    if (rt->metal_rrm_params) { CFBridgingRelease(rt->metal_rrm_params); rt->metal_rrm_params = NULL; }
+    rt->rate_active = 0;
 
     /* MRT attachments 1..n; index 0 is released through the scalar below. */
     for (int i = 1; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
@@ -6829,6 +6969,8 @@ static int metal_supports_feature(vio_feature f)
         return 1;
     case VIO_FEATURE_DEPTH_MIPMAPS: /* metal_generate_depth_mips (A26) */
         return 1;
+    case VIO_FEATURE_RASTER_RATE_MAP: /* metal_rt_rate_map_setup + metal_rrm_resolve (A16) */
+        return vio_mtl.caps.rasterization_rate_map;
     case VIO_FEATURE_TEXTURE_COMPRESSION_ASTC: /* ASTC LDR on Apple GPUs (Apple2+), not on Intel / AMD Macs */
         return vio_mtl.caps.apple_family >= 2;
     case VIO_FEATURE_TEXTURE_COMPRESSION_BC: /* BC1-BC7 pixel formats (macOS) */

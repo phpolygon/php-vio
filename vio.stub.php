@@ -1699,9 +1699,21 @@ function vio_draw_instanced(VioContext $context, VioMesh $mesh, array|string $ma
  *                                               //   sampler2DArray via vio_render_target_texture(). 'cube' + 'depth_only'
  *                                               //   gives a depth cube (vio_render_target_cubemap). Both need
  *                                               //   VIO_FEATURE_RENDER_TARGET_LAYERED.
+ *   'rate_map' => ['x' => [q, ...], 'y' => [q, ...]] // sampling quality 0 < q <= 1 of 1..16 equal zones per
+ *                                               //   axis (OPEN-ITEMS A16). With VIO_FEATURE_RASTER_RATE_MAP
+ *                                               //   (Metal) low-quality zones render with fewer samples into a
+ *                                               //   smaller physical target, resolved into the texture when the
+ *                                               //   pass leaves the target; elsewhere full rate. Plain 2D colour
+ *                                               //   targets only (ValueError otherwise).
  * @return VioRenderTarget|false Render target or false on failure
  */
 function vio_render_target(VioContext $context, array $config): VioRenderTarget|false {}
+
+/**
+ * ['width', 'height', 'physical_width', 'physical_height', 'rate_map' => bool]: the logical
+ * size and the size the GPU renders at (smaller with an active rate map).
+ */
+function vio_render_target_size(VioRenderTarget $target): array {}
 
 /**
  * Bind a render target for subsequent draw calls (redirects rendering to FBO).

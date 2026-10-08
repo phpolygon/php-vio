@@ -396,7 +396,16 @@ typedef enum _vio_feature {
     /* depth_only render targets with a mip chain built by vio_generate_mipmaps as
      * a max / min reduction of the 2x2 texels below (Hi-Z, OPEN-ITEMS-PLAN A26). */
     VIO_FEATURE_DEPTH_MIPMAPS = 63,
+    /* vio_render_target(['rate_map' => ['x' => [...], 'y' => [...]]]) renders into
+     * a physically smaller target with fewer samples where the quality is lower
+     * (Metal rasterization rate maps, OPEN-ITEMS A16); the logical texture is
+     * resolved when the pass leaves the target. 0 = the option renders at full
+     * rate. Past the 64-bit adapter masks: vio_adapters() never lists it. */
+    VIO_FEATURE_RASTER_RATE_MAP = 64,
 } vio_feature;
+
+/* Zones per axis of a rate map. */
+#define VIO_RATE_MAP_MAX 16
 
 /* Component types of a cooperative-matrix shape. */
 typedef enum _vio_coopmat_type {

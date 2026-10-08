@@ -11617,6 +11617,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTIVIEW_TESSELLATION", VIO_FEATURE_MULTIVIEW_TESSELLATION, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_TEXTURE_COMPRESSION_ASTC", VIO_FEATURE_TEXTURE_COMPRESSION_ASTC, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_DEPTH_MIPMAPS", VIO_FEATURE_DEPTH_MIPMAPS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_RASTER_RATE_MAP", VIO_FEATURE_RASTER_RATE_MAP, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_DEPTH_REDUCE_MAX", VIO_DEPTH_REDUCE_MAX, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_DEPTH_REDUCE_MIN", VIO_DEPTH_REDUCE_MIN, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_LINES_ADJACENCY", VIO_LINES_ADJACENCY, CONST_CS | CONST_PERSISTENT);
@@ -12898,10 +12899,48 @@ ZEND_FUNCTION(vio_render_target)
         samples = 1;
     }
 
+    /* Rate map (A16): 'rate_map' => ['x' => [q, ...], 'y' => [q, ...]], the
+     * sampling quality (0 < q <= 1) of equal zones per axis. Backends with
+     * VIO_FEATURE_RASTER_RATE_MAP render the low-quality zones with fewer
+     * samples; the others at full rate. Plain 2D colour targets only. */
+    float rate_x[VIO_RATE_MAP_MAX], rate_y[VIO_RATE_MAP_MAX];
+    int rate_nx = 0, rate_ny = 0;
+    if ((val = zend_hash_str_find(config_ht, "rate_map", sizeof("rate_map") - 1)) != NULL && Z_TYPE_P(val) != IS_NULL) {
+        for (int axis = 0; axis < 2; axis++) {
+            zval *a = Z_TYPE_P(val) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(val), axis ? "y" : "x", 1) : NULL;
+            float *dst = axis ? rate_y : rate_x;
+            int *n = axis ? &rate_ny : &rate_nx;
+            if (!a || Z_TYPE_P(a) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(a)) < 1
+                || zend_hash_num_elements(Z_ARRVAL_P(a)) > VIO_RATE_MAP_MAX) {
+                zend_value_error("vio_render_target(): 'rate_map' needs 'x' and 'y', each 1..%d qualities", VIO_RATE_MAP_MAX);
+                RETURN_THROWS();
+            }
+            zval *q;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(a), q) {
+                double d = zval_get_double(q);
+                if (!(d > 0.0 && d <= 1.0)) {
+                    zend_value_error("vio_render_target(): 'rate_map' qualities must be in (0, 1]");
+                    RETURN_THROWS();
+                }
+                dst[(*n)++] = (float)d;
+            } ZEND_HASH_FOREACH_END();
+        }
+        if (is_cube || layers > 1 || depth_only || samples > 1 || attachment_count > 1) {
+            zend_value_error("vio_render_target(): 'rate_map' is for plain 2D colour targets (no cube, layers, depth_only, samples or MRT)");
+            RETURN_THROWS();
+        }
+    }
+
     /* Create VioRenderTarget object */
     zval rt_zval;
     object_init_ex(&rt_zval, vio_render_target_ce);
     vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(&rt_zval);
+    rt->rate_nx = rate_nx;
+    rt->rate_ny = rate_ny;
+    memcpy(rt->rate_x, rate_x, sizeof(float) * (size_t)rate_nx);
+    memcpy(rt->rate_y, rate_y, sizeof(float) * (size_t)rate_ny);
+    rt->physical_width = width;
+    rt->physical_height = height;
 
     rt->width      = width;
     rt->height     = height;
@@ -13275,6 +13314,23 @@ ZEND_FUNCTION(vio_read_render_target)
     zend_string_release(buf);
     php_error_docref(NULL, E_WARNING, "vio_read_render_target: not supported on backend '%s'", rt->backend->name);
     RETURN_FALSE;
+}
+
+ZEND_FUNCTION(vio_render_target_size)
+{
+    zval *rt_zval;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rt_zval);
+    array_init(return_value);
+    add_assoc_long(return_value, "width", rt->width);
+    add_assoc_long(return_value, "height", rt->height);
+    add_assoc_long(return_value, "physical_width", rt->rate_active ? rt->physical_width : rt->width);
+    add_assoc_long(return_value, "physical_height", rt->rate_active ? rt->physical_height : rt->height);
+    add_assoc_bool(return_value, "rate_map", rt->rate_active);
 }
 
 ZEND_FUNCTION(vio_render_target_texture)
