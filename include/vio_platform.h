@@ -164,5 +164,8 @@ void vio_platform_glfw_register(void);
 #ifdef _WIN32
 void vio_platform_win32_register(void);
 #endif
+#ifdef HAVE_X11
+void vio_platform_x11_register(void);
+#endif
 
 #endif /* VIO_PLATFORM_H */

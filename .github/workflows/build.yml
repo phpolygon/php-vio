@@ -41,6 +41,7 @@ jobs:
           sudo apt-get update || (sleep 15 && sudo apt-get update)
           sudo apt-get install -y \
             libglfw3-dev \
+            libx11-dev libxrandr-dev \
             glslang-dev \
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
@@ -235,6 +236,7 @@ jobs:
           sudo apt-get update || (sleep 15 && sudo apt-get update)
           sudo apt-get install -y \
             libglfw3-dev \
+            libx11-dev libxrandr-dev \
             glslang-dev \
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \

@@ -71,6 +71,9 @@ int vio_window_init(void)
 #ifdef _WIN32
     vio_platform_win32_register();
 #endif
+#ifdef HAVE_X11
+    vio_platform_x11_register();
+#endif
     vio_platform_current = NULL;   /* choose among everything registered now */
     return vio_platform_active()->init();
 }

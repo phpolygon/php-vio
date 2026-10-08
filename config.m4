@@ -13,6 +13,13 @@ PHP_ARG_WITH([glfw],
   [yes],
   [no])
 
+PHP_ARG_WITH([x11],
+  [for the native X11 platform (Linux)],
+  [AS_HELP_STRING([--with-x11],
+    [Native X11 window, input and GLX platform on Linux (default yes; needs the x11 and xrandr headers)])],
+  [yes],
+  [no])
+
 PHP_ARG_WITH([glslang],
   [for glslang (GLSL to SPIR-V compiler) support],
   [AS_HELP_STRING([--with-glslang@<:@=DIR@:>@],
@@ -118,6 +125,25 @@ if test "$PHP_VIO" != "no"; then
         AC_MSG_ERROR([GLFW not found at $PHP_GLFW])
       fi
     fi
+  fi
+
+  dnl ── Native X11 platform (Linux) ─────────────────────────────────
+  dnl Window, input, monitors and GLX without GLFW (src/platform/x11/). libGL
+  dnl is opened at run time, so only Xlib and XRandR are linked; with them the
+  dnl OpenGL backend is built even without GLFW.
+  if test "$PHP_X11" != "no"; then
+    case $host_os in
+      linux*)
+        PKG_CHECK_MODULES([VIO_X11], [x11 xrandr], [
+          PHP_EVAL_INCLINE($VIO_X11_CFLAGS)
+          PHP_EVAL_LIBLINE($VIO_X11_LIBS, VIO_SHARED_LIBADD)
+          AC_DEFINE(HAVE_X11, 1, [Whether the native X11 platform is built])
+          AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from GLX)])
+        ], [
+          AC_MSG_WARN([x11 / xrandr not found: no native X11 platform])
+        ])
+        ;;
+    esac
   fi
 
   dnl ── glslang detection ────────────────────────────────────────────
@@ -381,6 +407,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_platform_registry.c \
     src/platform/null/vio_platform_null.c \
     src/platform/glfw/vio_platform_glfw.c \
+    src/platform/x11/vio_platform_x11.c \
     src/vio_mesh.c \
     src/vio_input.c \
     src/vio_shader.c \
@@ -507,6 +534,7 @@ if test "$PHP_VIO" != "no"; then
 
   dnl ── Build directories ──────────────────────────────────────────
   PHP_ADD_BUILD_DIR($ext_builddir/src)
+  PHP_ADD_BUILD_DIR($ext_builddir/src/platform/x11)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/opengl)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/vulkan)
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/metal)
