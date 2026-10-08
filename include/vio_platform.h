@@ -161,5 +161,8 @@ void vio_platform_null_register(void);
 #ifdef HAVE_GLFW
 void vio_platform_glfw_register(void);
 #endif
+#ifdef _WIN32
+void vio_platform_win32_register(void);
+#endif
 
 #endif /* VIO_PLATFORM_H */

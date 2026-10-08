@@ -94,6 +94,7 @@ if test "$PHP_VIO" != "no"; then
         PHP_EVAL_INCLINE($GLFW_CFLAGS)
         PHP_EVAL_LIBLINE($GLFW_LIBS, VIO_SHARED_LIBADD)
         AC_DEFINE(HAVE_GLFW, 1, [Whether GLFW is available])
+        AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from GLFW)])
       ], [
         dnl Try common paths
         for dir in /usr/local /usr /opt/homebrew; do
@@ -101,6 +102,7 @@ if test "$PHP_VIO" != "no"; then
             PHP_ADD_INCLUDE($dir/include)
             PHP_ADD_LIBRARY_WITH_PATH(glfw, $dir/lib, VIO_SHARED_LIBADD)
             AC_DEFINE(HAVE_GLFW, 1, [Whether GLFW is available])
+            AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from GLFW)])
             break
           fi
         done
@@ -111,6 +113,7 @@ if test "$PHP_VIO" != "no"; then
         PHP_ADD_INCLUDE($PHP_GLFW/include)
         PHP_ADD_LIBRARY_WITH_PATH(glfw, $PHP_GLFW/lib, VIO_SHARED_LIBADD)
         AC_DEFINE(HAVE_GLFW, 1, [Whether GLFW is available])
+        AC_DEFINE(HAVE_OPENGL, 1, [Whether the OpenGL backend is built (its context comes from GLFW)])
       else
         AC_MSG_ERROR([GLFW not found at $PHP_GLFW])
       fi

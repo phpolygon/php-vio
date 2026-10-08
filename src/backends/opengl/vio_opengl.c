@@ -13,7 +13,7 @@
 
 #include "php.h"
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
 
 #include <glad/glad.h>
 #include "../../vio_shader_cache.h"
@@ -3540,4 +3540,4 @@ int vio_opengl_setup_context(void)
     return 0;
 }
 
-#endif /* HAVE_GLFW */
+#endif /* HAVE_OPENGL */

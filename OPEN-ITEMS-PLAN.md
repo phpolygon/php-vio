@@ -56,7 +56,7 @@ A39 GPU-Video-Encoding über Interop (FFmpeg-Hardware-Encoder) ✅ (VIDEO-ENCODE
 A16 Rate Maps ✅ (Test 211: eigenes Feature `VIO_FEATURE_RASTER_RATE_MAP`, `'rate_map'` an Render-Targets, Resolve beim Verlassen; nur die macOS-CI) · A17 Metal-Tensoren über `'msl'`-Override ✅ (Test 210: `vio_compute_pipeline(['msl' => …])`, Tensoren per `tensor_inline` ohne Host-Objekte; der Tensor-Teil braucht Metal 4).
 
 ## Batch 7 — eigene Plattformschicht (NATIVE-/WIN32-PLATFORM-PLAN)
-A1 Phase 0: `vio_platform.h`, GLFW dahinter, Null-Plattform, Audit-Gate ✅ (Test 212: ~45 Slots, GLFW nur noch in `src/platform/glfw/`, `vio_platform()`; Nebenbefund: ohne `php.h` im Registry fehlte `HAVE_GLFW`, die Null-Plattform übernahm still) · A2 Win32 (Fenster, Input, WGL-Leiter, XInput) ·
+A1 Phase 0: `vio_platform.h`, GLFW dahinter, Null-Plattform, Audit-Gate ✅ (Test 212: ~45 Slots, GLFW nur noch in `src/platform/glfw/`, `vio_platform()`; Nebenbefund: ohne `php.h` im Registry fehlte `HAVE_GLFW`, die Null-Plattform übernahm still) · A2 Win32 (Fenster, Input, WGL-Leiter, XInput) ✅ (Test 213: Default-Plattform auf Windows, volle Suite auf WARP und RTX grün; ein Build ohne GLFW hat alle Backends, das GL-Backend hängt an `HAVE_OPENGL`) ·
 A3 Cocoa und X11/Wayland (CI).
 
 ## Arbeitsweise je Punkt

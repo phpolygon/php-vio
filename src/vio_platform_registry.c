@@ -68,6 +68,9 @@ int vio_window_init(void)
 #ifdef HAVE_GLFW
     vio_platform_glfw_register();
 #endif
+#ifdef _WIN32
+    vio_platform_win32_register();
+#endif
     vio_platform_current = NULL;   /* choose among everything registered now */
     return vio_platform_active()->init();
 }

@@ -68,7 +68,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include <windows.h>
 #endif
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
 #include <glad/glad.h>
 #include "src/backends/opengl/vio_opengl.h"
 int vio_opengl_setup_context(void);
@@ -798,7 +798,7 @@ pick_backend:
         /* Route the window's input events into the context */
         vio_plat()->install_input(ctx->window, &ctx->input);
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
         /* OpenGL: load GL functions and compile default shaders */
         if (strcmp(ctx->backend->name, "opengl") == 0) {
             if (vio_opengl_setup_context() != 0) {
@@ -3337,7 +3337,7 @@ ZEND_FUNCTION(vio_shader)
      * for a GLSL version higher than the runtime context provides, the driver
      * would emit a cryptic shader-compile error inside vio_opengl_compile_*.
      * Catch it up front. Only relevant for OpenGL backends with text GLSL. */
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized &&
         (format == VIO_SHADER_GLSL || format == VIO_SHADER_GLSL_RAW)) {
         int runtime_glsl = vio_opengl_get_glsl_version();
@@ -3487,7 +3487,7 @@ ZEND_FUNCTION(vio_shader)
     }
 
     /* --- For OpenGL backend --- */
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     if (strcmp(ctx->backend->name, "opengl") == 0 && vio_gl.initialized) {
         if (format == VIO_SHADER_GLSL_RAW) {
             /* Raw GLSL: compile directly, no SPIR-V round-trip */
@@ -13828,7 +13828,7 @@ ZEND_FUNCTION(vio_gl_info)
         RETURN_FALSE;
     }
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     if (!vio_gl.initialized) {
         RETURN_FALSE;
     }
@@ -14072,7 +14072,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_plugin_registry_init();
     vio_backend_registry_init();
     vio_backend_null_register();
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     vio_backend_opengl_register();
 #endif
 #ifdef HAVE_VULKAN

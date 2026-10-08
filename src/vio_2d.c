@@ -11,7 +11,7 @@
 #include <string.h>
 #include <math.h>
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
 #include "backends/opengl/vio_opengl.h"
 #include "backends/opengl/vio_2d_opengl.h"
 #endif
@@ -237,7 +237,7 @@ int vio_2d_init(vio_2d_state *state, int width, int height)
 
     vio_2d_ortho(state->projection, 0, (float)width, (float)height, 0);
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     if (vio_gl.initialized) {
         vio_2d_opengl_state *gl = calloc(1, sizeof(vio_2d_opengl_state));
         if (gl && vio_2d_opengl_init(gl, state->vertex_capacity) == 0) {
@@ -295,7 +295,7 @@ void vio_2d_shutdown(vio_2d_state *state)
     if (!state->initialized) return;
     vio_2d_release_owners(state);
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     if (state->backend == VIO_2D_BACKEND_OPENGL && state->opengl_state) {
         vio_2d_opengl_shutdown((vio_2d_opengl_state *)state->opengl_state);
         free(state->opengl_state);
@@ -422,7 +422,7 @@ void vio_2d_flush(vio_2d_state *state)
     }
 #endif
 
-#ifdef HAVE_GLFW
+#ifdef HAVE_OPENGL
     if (state->backend == VIO_2D_BACKEND_OPENGL && vio_gl.initialized) {
         vio_2d_opengl_flush(state);
     }
