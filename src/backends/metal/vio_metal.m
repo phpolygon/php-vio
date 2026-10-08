@@ -2080,14 +2080,33 @@ static void *metal_compile_shader(vio_shader_desc *desc)
                 tes_words = tes_copy;
             }
         }
-        vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_VERTEX_TESS, &sh->vs, &sh->vl,
+        /* The stages hand their varyings over in buffers whose structs are
+         * built per stage: interface blocks become one varying per member on
+         * every stage (a patch block's member read through the block came out
+         * as a thread -> device cast, test 198 B), and the control and
+         * evaluation stages use every input they declare (test 198 C). */
+        size_t nw = 0;
+        uint32_t *vs_flat = vio_spirv_flatten_io_blocks(vs_spirv, vs_size / 4, &nw);
+        size_t vs_flat_bytes = vs_flat ? nw * 4 : vs_size;
+        uint32_t *tcs_words = (uint32_t *)desc->tess_control_data, *tcs_own = NULL, *t;
+        size_t tcs_bytes = desc->tess_control_size;
+        if ((t = vio_spirv_flatten_io_blocks(tcs_words, tcs_bytes / 4, &nw)) != NULL) { tcs_own = t; tcs_words = t; tcs_bytes = nw * 4; }
+        if ((t = metal_spirv_use_all_inputs(tcs_words, tcs_bytes / 4, &nw)) != NULL) { free(tcs_own); tcs_own = t; tcs_words = t; tcs_bytes = nw * 4; }
+        uint32_t *tes_own = NULL;
+        if ((t = vio_spirv_flatten_io_blocks(tes_words, tes_bytes / 4, &nw)) != NULL) { tes_own = t; tes_words = t; tes_bytes = nw * 4; }
+        if ((t = metal_spirv_use_all_inputs(tes_words, tes_bytes / 4, &nw)) != NULL) { free(tes_own); tes_own = t; tes_words = t; tes_bytes = nw * 4; }
+
+        vs_msl = metal_gfx_spirv_to_msl(vs_flat ? vs_flat : vs_spirv, vs_flat_bytes, VIO_MSL_VERTEX_TESS, &sh->vs, &sh->vl,
                                         0xFFFFFFFFu, &sh->tess_info, &err);
-        if (!vs_msl) { what = "VS SPIR-V→MSL kernel"; goto fail; }
-        tcs_msl = metal_gfx_spirv_to_msl((const uint32_t *)desc->tess_control_data, desc->tess_control_size,
+        free(vs_flat);
+        if (!vs_msl) { free(tcs_own); free(tes_own); free(tes_copy); what = "VS SPIR-V→MSL kernel"; goto fail; }
+        tcs_msl = metal_gfx_spirv_to_msl(tcs_words, tcs_bytes,
                                          VIO_MSL_TESS_CONTROL, &sh->tcs, NULL, 0xFFFFFFFFu, &sh->tess_info, &err);
-        if (!tcs_msl) { what = "TCS SPIR-V→MSL"; goto fail; }
+        free(tcs_own);
+        if (!tcs_msl) { free(tes_own); free(tes_copy); what = "TCS SPIR-V→MSL"; goto fail; }
         tes_msl = metal_gfx_spirv_to_msl(tes_words, tes_bytes,
                                          VIO_MSL_TESS_EVAL, &sh->tes, NULL, 0xFFFFFFFFu, &sh->tess_info, &err);
+        free(tes_own);
         free(tes_copy);
         if (!tes_msl) { what = "TES SPIR-V→MSL"; goto fail; }
         if (sh->tess_emul) {
