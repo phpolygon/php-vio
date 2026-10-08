@@ -36,41 +36,6 @@
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
 
-static VkAccessFlags vkrt_access(VkImageLayout l)
-{
-    switch (l) {
-        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:            return VK_ACCESS_TRANSFER_WRITE_BIT;
-        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:            return VK_ACCESS_TRANSFER_READ_BIT;
-        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: return VK_ACCESS_SHADER_READ_BIT;
-        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:        return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-            return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        default:                                              return 0;
-    }
-}
-
-void vio_vk_image_barrier_range(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
-                                uint32_t base_level, uint32_t levels, uint32_t base_layer, uint32_t layers,
-                                VkImageLayout from, VkImageLayout to)
-{
-    VkImageMemoryBarrier b = {0};
-    b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    b.oldLayout           = from;
-    b.newLayout           = to;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image               = image;
-    b.subresourceRange.aspectMask     = aspect;
-    b.subresourceRange.baseMipLevel   = base_level;
-    b.subresourceRange.levelCount     = levels ? levels : 1;
-    b.subresourceRange.baseArrayLayer = base_layer;
-    b.subresourceRange.layerCount     = layers ? layers : 1;
-    b.srcAccessMask = vkrt_access(from);
-    b.dstAccessMask = vkrt_access(to);
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         0, 0, NULL, 0, NULL, 1, &b);
-}
 static VkImageAspectFlags vkrt_depth_aspect(void)
 {
     return VK_IMAGE_ASPECT_DEPTH_BIT | (vio_vk.depth_has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
@@ -660,7 +625,7 @@ static void vk_dmip_record(VkCommandBuffer cmd, vio_render_target_object *rt, vi
         b.subresourceRange.baseMipLevel = (uint32_t)(l - 1);
         b.subresourceRange.levelCount = 1;
         b.subresourceRange.layerCount = 1;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
         VkRenderPassBeginInfo rb = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
         rb.renderPass = vk_dmip.pass;
@@ -688,7 +653,7 @@ static void vk_dmip_record(VkCommandBuffer cmd, vio_render_target_object *rt, vi
     b.subresourceRange.aspectMask = da;
     b.subresourceRange.levelCount = (uint32_t)x->depth_levels;
     b.subresourceRange.layerCount = 1;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                          VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
@@ -1042,7 +1007,7 @@ static void vk_dres_record(VkCommandBuffer cmd, vio_render_target_object *rt, vi
     b.subresourceRange.aspectMask = da;
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.layerCount = 1;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     VkRenderPassBeginInfo rb = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rb.renderPass = vk_dmip.pass;
@@ -1061,7 +1026,7 @@ static void vk_dres_record(VkCommandBuffer cmd, vio_render_target_object *rt, vi
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
     b.image = x->depth_image;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                          VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
 

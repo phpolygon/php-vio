@@ -552,6 +552,13 @@ void    *vulkan_rt_sampling_texture(void *rt, int attachment);
 #define VIO_VK_GRAVE_RENDER_PASS     10
 #define VIO_VK_GRAVE_DESCRIPTOR_POOL 11
 void vio_vk_defer_destroy(int kind, uint64_t handle, void *allocation);
+/* synchronization2 (VULKAN-MODERN-PLAN phase 3): the vkCmdPipelineBarrier
+ * signature, recorded as vkCmdPipelineBarrier2 (the 1.0 stage / access bits
+ * have the same values in the *2 flags). Layout transitions go through
+ * vio_vk_image_barrier*, whose scopes follow the layouts. */
+void vio_vk_pipeline_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep,
+                             uint32_t nmem, const VkMemoryBarrier *mem, uint32_t nbuf, const VkBufferMemoryBarrier *buf,
+                             uint32_t nimg, const VkImageMemoryBarrier *img);
 void vio_vk_image_barrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, uint32_t layers,
                           VkImageLayout from, VkImageLayout to);
 void vio_vk_image_barrier_range(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,

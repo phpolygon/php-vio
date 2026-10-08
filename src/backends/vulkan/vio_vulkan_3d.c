@@ -105,36 +105,130 @@ static VkImageAspectFlags vk3d_depth_aspect(void)
     return VK_IMAGE_ASPECT_DEPTH_BIT | (vio_vk.depth_has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
 }
 
-static VkAccessFlags vk3d_layout_access(VkImageLayout l)
+/* ── Barriers (synchronization2, VULKAN-MODERN-PLAN phase 3) ───────── */
+
+/* Every shader stage that can sample an image on this device. */
+static VkPipelineStageFlags2 vk3d_shader_stages(void)
+{
+    VkPipelineStageFlags2 s = VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                            | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    if (vio_vk.rt_pipeline_supported) s |= VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    return s;
+}
+
+/* The stages and accesses that use an image in `l`: the source scope of a
+ * transition out of the layout (the work that last used it) and the
+ * destination scope of a transition into it (the work that will). */
+static void vk3d_layout_scope(VkImageLayout l, int src, VkPipelineStageFlags2 *stage, VkAccessFlags2 *access)
 {
     switch (l) {
-        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:             return VK_ACCESS_TRANSFER_WRITE_BIT;
-        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:             return VK_ACCESS_TRANSFER_READ_BIT;
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+        case VK_IMAGE_LAYOUT_PREINITIALIZED:
+            *stage = VK_PIPELINE_STAGE_2_NONE; *access = VK_ACCESS_2_NONE; return;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            *stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT; *access = VK_ACCESS_2_TRANSFER_WRITE_BIT; return;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            *stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT; *access = VK_ACCESS_2_TRANSFER_READ_BIT; return;
         case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:  return VK_ACCESS_SHADER_READ_BIT;
-        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:         return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        default:                                               return 0;
+            *stage = vk3d_shader_stages(); *access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT; return;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+            /* sampled, or a read-only depth attachment */
+            *stage  = vk3d_shader_stages() | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+            *access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+            return;
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            *stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            *access = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT; return;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+            *stage = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+            *access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT; return;
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+            /* out of it: the frame's colour writes that left it there; into it:
+             * nothing (the present waits a semaphore) */
+            if (src) { *stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+                       *access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT; }
+            else     { *stage = VK_PIPELINE_STAGE_2_NONE; *access = VK_ACCESS_2_NONE; }
+            return;
+        default:   /* GENERAL (storage images) and anything else */
+            *stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            *access = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT; return;
     }
 }
 
-void vio_vk_image_barrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, uint32_t layers,
-                          VkImageLayout from, VkImageLayout to)
+void vio_vk_image_barrier_range(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
+                                uint32_t base_level, uint32_t levels, uint32_t base_layer, uint32_t layers,
+                                VkImageLayout from, VkImageLayout to)
 {
-    VkImageMemoryBarrier b = {0};
-    b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    VkImageMemoryBarrier2 b = {0};
+    b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    vk3d_layout_scope(from, 1, &b.srcStageMask, &b.srcAccessMask);
+    vk3d_layout_scope(to, 0, &b.dstStageMask, &b.dstAccessMask);
     b.oldLayout           = from;
     b.newLayout           = to;
     b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image               = image;
-    b.subresourceRange.aspectMask = aspect;
-    b.subresourceRange.levelCount = 1;
-    b.subresourceRange.layerCount = layers ? layers : 1;
-    b.srcAccessMask       = vk3d_layout_access(from);
-    b.dstAccessMask       = vk3d_layout_access(to);
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         0, 0, NULL, 0, NULL, 1, &b);
+    b.subresourceRange.aspectMask     = aspect;
+    b.subresourceRange.baseMipLevel   = base_level;
+    b.subresourceRange.levelCount     = levels ? levels : 1;
+    b.subresourceRange.baseArrayLayer = base_layer;
+    b.subresourceRange.layerCount     = layers ? layers : 1;
+    VkDependencyInfo di = {0};
+    di.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers    = &b;
+    ((PFN_vkCmdPipelineBarrier2)vio_vk.fn_barrier2)(cmd, &di);
+}
+
+void vio_vk_image_barrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, uint32_t layers,
+                          VkImageLayout from, VkImageLayout to)
+{
+    vio_vk_image_barrier_range(cmd, image, aspect, 0, 1, 0, layers, from, to);
+}
+
+void vio_vk_pipeline_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep,
+                             uint32_t nmem, const VkMemoryBarrier *mem, uint32_t nbuf, const VkBufferMemoryBarrier *buf,
+                             uint32_t nimg, const VkImageMemoryBarrier *img)
+{
+    VkMemoryBarrier2 m2[4];
+    VkBufferMemoryBarrier2 b2[4];
+    VkImageMemoryBarrier2 i2[8];
+    if (nmem > 4 || nbuf > 4 || nimg > 8) return;
+    /* TOP_OF_PIPE as a source and BOTTOM_OF_PIPE as a destination mean "none" */
+    VkPipelineStageFlags2 s2 = src == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT ? VK_PIPELINE_STAGE_2_NONE : (VkPipelineStageFlags2)src;
+    VkPipelineStageFlags2 d2 = dst == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT ? VK_PIPELINE_STAGE_2_NONE : (VkPipelineStageFlags2)dst;
+    for (uint32_t i = 0; i < nmem; i++) {
+        memset(&m2[i], 0, sizeof(m2[i]));
+        m2[i].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        m2[i].srcStageMask = s2; m2[i].srcAccessMask = mem[i].srcAccessMask;
+        m2[i].dstStageMask = d2; m2[i].dstAccessMask = mem[i].dstAccessMask;
+    }
+    for (uint32_t i = 0; i < nbuf; i++) {
+        memset(&b2[i], 0, sizeof(b2[i]));
+        b2[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+        b2[i].srcStageMask = s2; b2[i].srcAccessMask = buf[i].srcAccessMask;
+        b2[i].dstStageMask = d2; b2[i].dstAccessMask = buf[i].dstAccessMask;
+        b2[i].srcQueueFamilyIndex = buf[i].srcQueueFamilyIndex;
+        b2[i].dstQueueFamilyIndex = buf[i].dstQueueFamilyIndex;
+        b2[i].buffer = buf[i].buffer; b2[i].offset = buf[i].offset; b2[i].size = buf[i].size;
+    }
+    for (uint32_t i = 0; i < nimg; i++) {
+        memset(&i2[i], 0, sizeof(i2[i]));
+        i2[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        i2[i].srcStageMask = s2; i2[i].srcAccessMask = img[i].srcAccessMask;
+        i2[i].dstStageMask = d2; i2[i].dstAccessMask = img[i].dstAccessMask;
+        i2[i].oldLayout = img[i].oldLayout; i2[i].newLayout = img[i].newLayout;
+        i2[i].srcQueueFamilyIndex = img[i].srcQueueFamilyIndex;
+        i2[i].dstQueueFamilyIndex = img[i].dstQueueFamilyIndex;
+        i2[i].image = img[i].image; i2[i].subresourceRange = img[i].subresourceRange;
+    }
+    VkDependencyInfo di = {0};
+    di.sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    di.dependencyFlags          = dep;
+    di.memoryBarrierCount       = nmem;  di.pMemoryBarriers       = nmem ? m2 : NULL;
+    di.bufferMemoryBarrierCount = nbuf;  di.pBufferMemoryBarriers = nbuf ? b2 : NULL;
+    di.imageMemoryBarrierCount  = nimg;  di.pImageMemoryBarriers  = nimg ? i2 : NULL;
+    ((PFN_vkCmdPipelineBarrier2)vio_vk.fn_barrier2)(cmd, &di);
 }
 
 /* ── Deferred destruction ──────────────────────────────────────────── */

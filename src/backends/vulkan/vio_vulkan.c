@@ -2623,7 +2623,7 @@ static void *vulkan_create_acceleration_structure(const vio_as_desc *desc)
         mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
         mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                              VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &mb, 0, NULL, 0, NULL);
     }
     if (vk_as_record_tlas(cmd, as, desc->instances, desc->instance_count, 0) != 0) goto fail_cmd;
@@ -2633,7 +2633,7 @@ static void *vulkan_create_acceleration_structure(const vio_as_desc *desc)
         mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
         mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
     if (vulkan_submit_transient_commands(pool, cmd) != 0) { cmd = VK_NULL_HANDLE; goto fail; }
@@ -2680,7 +2680,7 @@ static int vulkan_update_acceleration_structure(void *ptr, const vio_as_instance
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     return vulkan_submit_transient_commands(pool, cmd) == 0 ? 0 : -1;
 }
@@ -3138,7 +3138,7 @@ static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, in
         fb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
                            VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
         fb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-        vkCmdPipelineBarrier(fcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        vio_vk_pipeline_barrier(fcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0, 1, &fb, 0, NULL, 0, NULL);
         vkCmdBindPipeline(fcmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt->pipeline);
         if (rt->binding_count > 0)
@@ -3148,7 +3148,7 @@ static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, in
         fb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         fb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT |
                            VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT;
-        vkCmdPipelineBarrier(fcmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        vio_vk_pipeline_barrier(fcmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &fb, 0, NULL, 0, NULL);
         if (had_pass) {
             vio_vk_resume_pass(fcmd);
@@ -3172,7 +3172,7 @@ static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, in
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
     /* HOST_WRITE belongs to the host stage, which ALL_COMMANDS does not cover. */
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0, 1, &mb, 0, NULL, 0, NULL);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rt->pipeline);
     if (rt->binding_count > 0)
@@ -3181,7 +3181,7 @@ static int vulkan_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, in
                                                        (uint32_t)w, (uint32_t)h, (uint32_t)d);
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                          VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     return vulkan_submit_transient_commands(pool, cmd);
 }
@@ -3324,7 +3324,7 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
         to_dst.subresourceRange.layerCount = 1;
         to_dst.srcAccessMask       = 0;
         to_dst.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(up_cmd,
+        vio_vk_pipeline_barrier(up_cmd,
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, NULL, 0, NULL, 1, &to_dst);
@@ -3354,7 +3354,7 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
         to_read.subresourceRange.layerCount = 1;
         to_read.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
         to_read.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT | (storage ? VK_ACCESS_SHADER_WRITE_BIT : 0);
-        vkCmdPipelineBarrier(up_cmd,
+        vio_vk_pipeline_barrier(up_cmd,
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
                              storage ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, NULL, 0, NULL, 1, &to_read);
@@ -3391,7 +3391,7 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
             to_gen.subresourceRange.levelCount = 1;
             to_gen.subresourceRange.layerCount = 1;
             to_gen.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
-            vkCmdPipelineBarrier(up_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            vio_vk_pipeline_barrier(up_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  0, 0, NULL, 0, NULL, 1, &to_gen);
             VkClearColorValue zero = {{0.0f, 0.0f, 0.0f, 0.0f}};
             VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -3399,7 +3399,7 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
             to_gen.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
             to_gen.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             to_gen.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(up_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            vio_vk_pipeline_barrier(up_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                  0, 0, NULL, 0, NULL, 1, &to_gen);
         } else {
         VkImageMemoryBarrier to_read = {0};
@@ -3414,7 +3414,7 @@ static void *vulkan_create_texture(vio_texture_desc *desc)
         to_read.subresourceRange.layerCount = 1;
         to_read.srcAccessMask       = 0;
         to_read.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(up_cmd,
+        vio_vk_pipeline_barrier(up_cmd,
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 0, NULL, 0, NULL, 1, &to_read);
@@ -3590,7 +3590,7 @@ static int vulkan_update_texture(void *tex_obj, const void *pixels, int x, int y
     b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, NULL, 0, NULL, 1, &b);
 
     VkBufferImageCopy copy = {0};
@@ -3607,7 +3607,7 @@ static int vulkan_update_texture(void *tex_obj, const void *pixels, int x, int y
     b.newLayout = steady;
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          0, 0, NULL, 0, NULL, 1, &b);
     int rc = vulkan_submit_transient_commands(pool, cmd);
     vio_vma_destroy_buffer(vio_vk.vma_allocator, staging, staging_alloc);
@@ -4690,14 +4690,14 @@ static void vulkan_dispatch_compute(vio_compute_cmd *cmd)
             vkCmdEndRenderPass(fcmd);
             vio_vk.cur_render_pass = VK_NULL_HANDLE;
         }
-        vkCmdPipelineBarrier(fcmd, graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT,
+        vio_vk_pipeline_barrier(fcmd, graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &pre, 0, NULL, 0, NULL);
         vkCmdBindPipeline(fcmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline);
         vkCmdBindDescriptorSets(fcmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout, 0, 1, &set, 0, NULL);
         if (cp->uses_bindless)
             vkCmdBindDescriptorSets(fcmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout, 1, 1, &vio_vk.bindless_set, 0, NULL);
         vkCmdDispatch(fcmd, gx, gy, gz);
-        vkCmdPipelineBarrier(fcmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        vio_vk_pipeline_barrier(fcmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &post, 0, NULL, 0, NULL);
         if (had_pass) {
             vio_vk_resume_pass(fcmd);
@@ -4715,14 +4715,14 @@ static void vulkan_dispatch_compute(vio_compute_cmd *cmd)
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cbuf = VK_NULL_HANDLE;
     if (vulkan_begin_transient_commands(&pool, &cbuf) != 0) { vkc_pools_reset(VKC_SYNC_SLOT); return; }
-    vkCmdPipelineBarrier(cbuf, graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT,
+    vio_vk_pipeline_barrier(cbuf, graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &pre, 0, NULL, 0, NULL);
     vkCmdBindPipeline(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline);
     vkCmdBindDescriptorSets(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout, 0, 1, &set, 0, NULL);
     if (cp->uses_bindless)
         vkCmdBindDescriptorSets(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipeline_layout, 1, 1, &vio_vk.bindless_set, 0, NULL);
     vkCmdDispatch(cbuf, gx, gy, gz);
-    vkCmdPipelineBarrier(cbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vio_vk_pipeline_barrier(cbuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          graphics_and_compute | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &post, 0, NULL, 0, NULL);
     /* End + submit on a fence + BLOCK until complete. The set's pool is free
      * again afterwards. */
@@ -4782,7 +4782,7 @@ void vio_vk_fs_storage_host_barrier(VkCommandBuffer cmd)
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     vio_vk.fs_storage_pending = 1;
 }
@@ -5035,7 +5035,7 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
     to_src.subresourceRange.layerCount = 1;
     to_src.srcAccessMask       = 0;
     to_src.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(cmd,
+    vio_vk_pipeline_barrier(cmd,
                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, NULL, 0, NULL, 1, &to_src);
@@ -5068,7 +5068,7 @@ int vulkan_read_pixels(int width, int height, void *out_rgba)
     to_present.subresourceRange.layerCount = 1;
     to_present.srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
     to_present.dstAccessMask       = 0;
-    vkCmdPipelineBarrier(cmd,
+    vio_vk_pipeline_barrier(cmd,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                          0, 0, NULL, 0, NULL, 1, &to_present);
