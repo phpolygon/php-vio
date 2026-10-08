@@ -182,7 +182,9 @@ jobs:
             tests/render3d/199_acceleration_structure_update_all_backends.phpt \
             tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt \
             tests/render3d/201_rt_pipeline_textures_all_backends.phpt \
-            tests/render3d/202_trace_rays_in_frame_all_backends.phpt
+            tests/render3d/202_trace_rays_in_frame_all_backends.phpt \
+            tests/render3d/203_fragment_storage_all_backends.phpt \
+            tests/render3d/204_sampler_feedback_emulated_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -362,7 +364,9 @@ jobs:
             tests/render3d/199_acceleration_structure_update_all_backends.phpt \
             tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt \
             tests/render3d/201_rt_pipeline_textures_all_backends.phpt \
-            tests/render3d/202_trace_rays_in_frame_all_backends.phpt
+            tests/render3d/202_trace_rays_in_frame_all_backends.phpt \
+            tests/render3d/203_fragment_storage_all_backends.phpt \
+            tests/render3d/204_sampler_feedback_emulated_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -808,6 +812,8 @@ jobs:
             tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt `
             tests/render3d/201_rt_pipeline_textures_all_backends.phpt `
             tests/render3d/202_trace_rays_in_frame_all_backends.phpt `
+            tests/render3d/203_fragment_storage_all_backends.phpt `
+            tests/render3d/204_sampler_feedback_emulated_all_backends.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt
 
       - name: Package binary
