@@ -26,11 +26,13 @@
 #include "vio_metal.h"
 
 static void metal_marks_reset(void);
+static void metal_archive_close(void);
 static void metal_upscale_release(void);
 #include "../../shaders/shaders_2d.h"
 #include "../../vio_render_target.h"
 #include "../../vio_texfmt.h"
 #include "../../vio_buffer.h"   /* vio_buffer_object — compute storage-buffer free path */
+#include "../../vio_shader_cache.h"
 
 /* SPIRV-Cross C API — used by the compute path to transpile the SDF compute
  * SPIR-V to MSL with EXPLICIT MSL buffer indices (see metal_cs_spirv_to_msl).
@@ -558,6 +560,113 @@ static int metal_requested_msl(const vio_config *cfg)
     return env && *env ? atoi(env) : 0;
 }
 
+/* ── Pipeline binary archive (OPEN-ITEMS A22) ─────────────────────── */
+
+/* vio_create(['shader_cache' => dir]) on Metal: one MTLBinaryArchive per device
+ * and OS build in the cache directory. A pipeline is first made with
+ * FailOnBinaryArchiveMiss (a hit: no GPU compile); on a miss its functions go
+ * into the archive, which is written when the context shuts down. */
+static id    metal_archive;         /* id<MTLBinaryArchive> */
+static NSURL *metal_archive_url;
+static int   metal_archive_dirty;
+static int   metal_archive_tried;
+
+static void metal_archive_open(void)
+{
+    if (metal_archive || metal_archive_tried || !vio_mtl.device || !vio_shader_cache_dir()) return;
+    metal_archive_tried = 1;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        NSString *os = [[NSProcessInfo processInfo] operatingSystemVersionString];
+        NSString *who = [NSString stringWithFormat:@"%@|%@", vio_mtl.device.name, os];
+        const char *w = [who UTF8String];
+        uint64_t key = vio_shader_cache_hash("metal-archive", w, strlen(w));
+        NSString *path = [NSString stringWithFormat:@"%s/%016llx.metalar", vio_shader_cache_dir(), (unsigned long long)key];
+        metal_archive_url = [NSURL fileURLWithPath:path];
+        MTLBinaryArchiveDescriptor *d = [MTLBinaryArchiveDescriptor new];
+        NSError *e = nil;
+        id<MTLBinaryArchive> a = nil;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            d.url = metal_archive_url;
+            a = [vio_mtl.device newBinaryArchiveWithDescriptor:d error:&e];
+        }
+        if (!a) {   /* none yet, or one this device / OS cannot read: start empty */
+            d.url = nil;
+            a = [vio_mtl.device newBinaryArchiveWithDescriptor:d error:&e];
+        }
+        metal_archive = a;
+    }
+}
+
+static void metal_archive_close(void)
+{
+    if (metal_archive && metal_archive_dirty && metal_archive_url) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            NSError *e = nil;
+            if (![(id<MTLBinaryArchive>)metal_archive serializeToURL:metal_archive_url error:&e]) {
+                php_error_docref(NULL, E_NOTICE, "Metal: pipeline archive not written: %s",
+                                 e ? [[e localizedDescription] UTF8String] : "unknown");
+            }
+        }
+    }
+    metal_archive = nil;
+    metal_archive_url = nil;
+    metal_archive_dirty = 0;
+    metal_archive_tried = 0;
+}
+
+static id<MTLRenderPipelineState> metal_archived_render_pso(MTLRenderPipelineDescriptor *d, NSError **err)
+{
+    metal_archive_open();
+    if (metal_archive) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            id<MTLBinaryArchive> a = (id<MTLBinaryArchive>)metal_archive;
+            d.binaryArchives = @[a];
+            NSError *miss = nil;
+            id<MTLRenderPipelineState> pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:d
+                                                  options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&miss];
+            if (pso) {
+                vio_shader_cache_note(1, 0, 0);
+                return pso;
+            }
+            vio_shader_cache_note(0, 1, 0);
+            if ([a addRenderPipelineFunctionsWithDescriptor:d error:nil]) {
+                vio_shader_cache_note(0, 0, 1);
+                metal_archive_dirty = 1;
+            }
+            d.binaryArchives = nil;
+        }
+    }
+    return [vio_mtl.device newRenderPipelineStateWithDescriptor:d error:err];
+}
+
+static id<MTLComputePipelineState> metal_archived_compute_pso(id<MTLFunction> fn, NSError **err)
+{
+    metal_archive_open();
+    if (metal_archive) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            id<MTLBinaryArchive> a = (id<MTLBinaryArchive>)metal_archive;
+            MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
+            cd.computeFunction = fn;
+            cd.binaryArchives = @[a];
+            NSError *miss = nil;
+            id<MTLComputePipelineState> pso = [vio_mtl.device newComputePipelineStateWithDescriptor:cd
+                                                   options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&miss];
+            if (pso) {
+                vio_shader_cache_note(1, 0, 0);
+                return pso;
+            }
+            vio_shader_cache_note(0, 1, 0);
+            if ([a addComputePipelineFunctionsWithDescriptor:cd error:nil]) {
+                vio_shader_cache_note(0, 0, 1);
+                metal_archive_dirty = 1;
+            }
+            cd.binaryArchives = nil;
+            return [vio_mtl.device newComputePipelineStateWithDescriptor:cd options:MTLPipelineOptionNone reflection:nil error:err];
+        }
+    }
+    return [vio_mtl.device newComputePipelineStateWithFunction:fn error:err];
+}
+
 int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
                                    vio_config *cfg)
 {
@@ -742,6 +851,7 @@ void vio_metal_shutdown_context(void)
 {
     @autoreleasepool {
         if (!vio_mtl.initialized) return;
+        metal_archive_close();
         metal_bindless_release();
 
         /* Shutdown 2D pipeline */
@@ -3710,7 +3820,7 @@ static id<MTLRenderPipelineState> metal_pipeline_pso(vio_metal_pipeline *p, cons
             pso = [vio_mtl.device newRenderPipelineStateWithMeshDescriptor:md options:MTLPipelineOptionNone
                                                                 reflection:nil error:&err];
         } else {
-            pso = [vio_mtl.device newRenderPipelineStateWithDescriptor:d error:&err];
+            pso = metal_archived_render_pso(d, &err);
         }
         if (!pso) {
             php_error_docref(NULL, E_WARNING, "Metal: render pipeline creation failed: %s",
@@ -6166,8 +6276,7 @@ static void *metal_create_compute_pipeline(vio_shader_desc *desc)
         }
 
         NSError *perr = nil;
-        id<MTLComputePipelineState> pso =
-            [vio_mtl.device newComputePipelineStateWithFunction:fn error:&perr];
+        id<MTLComputePipelineState> pso = metal_archived_compute_pso(fn, &perr);
         if (!pso) {
             php_error_docref(NULL, E_WARNING, "Metal: newComputePipelineStateWithFunction failed: %s",
                              perr ? [[perr localizedDescription] UTF8String] : "unknown");
