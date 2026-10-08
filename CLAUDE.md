@@ -4,8 +4,8 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.8.0**, 192 PHP-Funktionen, 16 Zend-Klassen,
-6 Backends, 98 PHPT-Tests. Releases laufen über semantic-release
+für die PHPolygon Game Engine. Aktuell **v2.30.0**, 202 PHP-Funktionen, 18 Zend-Klassen,
+6 Backends, 227 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
 ## Build
@@ -100,7 +100,7 @@ SHADING_RATE_PRIMITIVE,SHADING_RATE_IMAGE,BINDLESS,MESH_SHADER,RAY_QUERY,RAYTRAC
 mit `-d vio.debug=1` (D3D12-Debug-Layer, Vulkan-Validation): mehrere Befunde zeigten sich nur dort. Die
 Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` setzen.
 
-153 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+227 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
@@ -350,8 +350,9 @@ fügen es hinzu). Bis dahin baut vio Hull- und Domain-Shader selbst (`vio_tess_h
 jedem SPIRV-Cross 1. Der HLSL-Stage-Override (`'hlsl' => [...]`, Test 140) bleibt und hat Vorrang. Die SPIRV-Cross-Libs in `C:\php-sdk\vio-build-deps` (SDK
 1.4.341) können Geometry, die Windows-CI nutzt dasselbe SDK (seit v2.30; mit 1.3.296 waren `GEOMETRY` = 0 und GS-Tests auf D3D übersprungen, auch in den Release-DLLs).
 
-† D3D11/D3D12: implementiert, aber ohne Windows-Build hier nur blind editiert — Windows-CI
-(WARP) ist der Beleg (`tests/render3d/096`, `097`). Die frueher dort beobachtete "veraltete
+† D3D11/D3D12: ursprünglich ohne Windows-Build blind editiert; v2.30.0 ist lokal auf Windows
+gebaut und mit der vollen Suite geprüft (0 FAIL; jeder `*_all_backends`-Test meldet auf
+opengl/d3d11/d3d12/vulkan `OK`; headless-D3D läuft dabei wie in der CI auf WARP). Die frueher dort beobachtete "veraltete
 Textur nach GPU-Schreibzugriff" auf D3D12 war KEIN Barrier-Problem, sondern die Pending-Bind-
 Tabelle ohne Referenz (Test 111): `vio_render_target_texture()` liefert ein Temporary, dessen
 Speicher die naechste VioTexture wiederverwendete. Seit dem Fix laufen die D3D12-Pixel-Checks
@@ -643,7 +644,7 @@ Alle folgen dem gleichen Muster: `zend_object std` als letztes Feld, `Z_VIO_*_P(
 php_vio.c                   # Alle PHP-Funktionen (~9000 Zeilen, monolithisch)
 php_vio.h                   # Module-Globals (default_backend, debug, vsync)
 php_vio_arginfo.h           # Arginfo + Funktionstabelle (generiert aus vio.stub.php)
-vio.stub.php                # PHP-Stubs für IDE-Support (152 Funktionen)
+vio.stub.php                # PHP-Stubs für IDE-Support (202 Funktionen)
 config.m4 / config.w32      # Autotools- bzw. Windows-Build-Konfiguration
 configure.ac                # PHP-freier Autotools-Einstieg (CI-Permutationen)
 CMakeLists.txt              # IDE-Support (CLion/PhpStorm), kein Release-Build
@@ -730,7 +731,7 @@ Vendored (kein Homebrew): GLAD, stb_image/truetype/write/rect_pack, VMA,
 miniaudio, **SheenBidi** (BiDi, Apache-2.0, `vendor/sheenbidi/`, UNITY-Build via
 `-DSB_CONFIG_UNITY`).
 
-## PHP API (152 Funktionen)
+## PHP API (202 Funktionen)
 
 Vollständige Signaturen in `vio.stub.php`. Die Beispiele hier zeigen die Gruppen.
 
@@ -1330,8 +1331,8 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   Mesh-Shader/Ray-Tracing/Upscaling. Immer für Metal+GL+D3D11+D3D12 gleichzeitig.
 - Metal-3D-Pipeline: ✅ implementiert, Feature-Parität mit D3D11/D3D12 (siehe
   „Metal-3D-Pipeline" oben). PHPolygons Standalone-`MetalRenderer3D` (ext-metal /
-  php-metal-gpu) ist damit auf macOS nicht mehr nötig. Vulkan-3D, -Cubemaps und HDR-/Depth-/MSAA-RTs
-  kamen mit GAP-PHASE5 Block 10, RT-MSAA auf OpenGL/D3D löst auf (siehe Feature-Matrix).
+  php-metal-gpu) ist damit auf macOS nicht mehr nötig. Vulkan-3D, -Cubemaps, -HDR/Depth/MSAA-RTs und echtes
+  RT-MSAA auf OpenGL/D3D sind inzwischen umgesetzt (siehe Feature-Matrix).
 
 ### Verifikation / CI
 
