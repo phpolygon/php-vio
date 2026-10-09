@@ -75,6 +75,17 @@ PHP_ARG_WITH([ffx],
   [no],
   [no])
 
+dnl NVIDIA DLSS Super Resolution through NGX (TEMPORAL-S4): DIR is the DLSS SDK
+dnl (include/nvsdk_ngx*.h, lib/Linux_x86_64/libnvsdk_ngx.a) - under the NVIDIA
+dnl RTX SDK licence, never part of php-vio. Off by default; the runtime
+dnl libnvidia-ngx-dlss.so.<version> ships with the game and is loaded by NGX.
+PHP_ARG_WITH([dlss],
+  [for NVIDIA DLSS upscaler support],
+  [AS_HELP_STRING([--with-dlss=DIR],
+    [NVIDIA DLSS Super Resolution through NGX, DIR = the DLSS SDK. Off unless requested.])],
+  [no],
+  [no])
+
 PHP_ARG_WITH([metal],
   [for Metal (macOS GPU backend) support],
   [AS_HELP_STRING([--with-metal],
@@ -594,6 +605,35 @@ if test "$PHP_VIO" != "no"; then
     if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
       PHP_ADD_SOURCES_X($ext_dir, [src/upscale/vio_upscale_ffx.cpp src/upscale/vio_upscale_ffx_dx12.cpp src/upscale/vio_upscale_ffx_vk.cpp],
         $VIO_FFX_CFLAGS $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
+        shared_objects_vio, yes)
+    fi
+  fi
+
+  dnl ── NVIDIA DLSS provider (--with-dlss=DIR, C++, NGX static library) ───
+  if test "$PHP_DLSS" != "no"; then
+    VIO_DLSS_DIR="$PHP_DLSS"
+    case `uname -m` in
+      aarch64|arm64) VIO_DLSS_ARCH=Linux_aarch64 ;;
+      *)             VIO_DLSS_ARCH=Linux_x86_64 ;;
+    esac
+    if test "$VIO_DLSS_DIR" = "yes" || test ! -f "$VIO_DLSS_DIR/include/nvsdk_ngx.h" \
+       || test ! -f "$VIO_DLSS_DIR/lib/$VIO_DLSS_ARCH/libnvsdk_ngx.a"; then
+      AC_MSG_ERROR([--with-dlss=DIR: DIR must be the DLSS SDK (include/nvsdk_ngx.h, lib/$VIO_DLSS_ARCH/libnvsdk_ngx.a)])
+    fi
+    PHP_REQUIRE_CXX()
+    AC_DEFINE(HAVE_DLSS, 1, [Whether the NVIDIA DLSS upscaler provider is built])
+    PHP_ADD_LIBRARY(dl, 1, VIO_SHARED_LIBADD)
+    PHP_ADD_LIBRARY(stdc++, 1, VIO_SHARED_LIBADD)
+    PHP_ADD_LIBRARY_WITH_PATH(nvsdk_ngx, $VIO_DLSS_DIR/lib/$VIO_DLSS_ARCH, VIO_SHARED_LIBADD)
+    VIO_DLSS_CFLAGS="-std=c++17 -DHAVE_DLSS=1 -I$VIO_DLSS_DIR/include -I$ext_srcdir/src/upscale"
+    if test "$ext_shared" != "shared" && test "$ext_shared" != "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/upscale/vio_upscale_dlss.cpp src/upscale/vio_upscale_dlss_dx12.cpp src/upscale/vio_upscale_dlss_vk.cpp],
+        $VIO_DLSS_CFLAGS $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED,
+        PHP_GLOBAL_OBJS)
+    fi
+    if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/upscale/vio_upscale_dlss.cpp src/upscale/vio_upscale_dlss_dx12.cpp src/upscale/vio_upscale_dlss_vk.cpp],
+        $VIO_DLSS_CFLAGS $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
         shared_objects_vio, yes)
     fi
   fi

@@ -11,6 +11,7 @@ ARG_WITH("harfbuzz", "for HarfBuzz (text shaping: Arabic, Thai, BiDi) support", 
 ARG_WITH("d3d11", "for Direct3D 11 support", "yes");
 ARG_WITH("d3d12", "for Direct3D 12 support", "yes");
 ARG_WITH("ffx", "for the AMD FidelityFX FSR 3.1 upscaler (amd_fidelityfx_*.dll loaded at run time, no link dependency)", "yes");
+ARG_WITH("dlss", "for the NVIDIA DLSS Super Resolution upscaler through NGX (DIR = the DLSS SDK, nvngx_dlss.dll ships with the game)", "no");
 
 if (PHP_VIO != "no") {
 
@@ -268,6 +269,25 @@ if (PHP_VIO != "no") {
     if (PHP_FFX != "no") {
         vio_sources += " src\\upscale\\vio_upscale_ffx.cpp src\\upscale\\vio_upscale_ffx_dx12.cpp src\\upscale\\vio_upscale_ffx_vk.cpp";
         ADD_FLAG("CFLAGS_VIO", "/DHAVE_FFX=1 /I" + configure_module_dirname + "\\vendor\\ffx-api\\include");
+    }
+
+    // ── NVIDIA DLSS Super Resolution provider (TEMPORAL-S4) ─────────────
+    // NGX directly, against the DLSS SDK the option points at (its headers and
+    // the static NGX library are under the NVIDIA RTX SDK licence and are never
+    // part of php-vio). Off by default: without the option nothing of NGX is
+    // compiled and VIO_UPSCALER_DLSS reports "built without DLSS". The DLSS
+    // runtime nvngx_dlss.dll is loaded by NGX at run time (vio.dlss_path, next
+    // to php.exe / php_vio.dll, PATH) and ships with the game.
+    if (PHP_DLSS != "no") {
+        var dlss_dir = PHP_DLSS == "yes" ? "" : PHP_DLSS;
+        if (dlss_dir != "" && FSO.FileExists(dlss_dir + "\\include\\nvsdk_ngx.h")
+            && CHECK_LIB("nvsdk_ngx_d.lib", "vio", dlss_dir + "\\lib\\Windows_x86_64\\x64")
+            && CHECK_LIB("version.lib", "vio")) {
+            vio_sources += " src\\upscale\\vio_upscale_dlss.cpp src\\upscale\\vio_upscale_dlss_dx12.cpp src\\upscale\\vio_upscale_dlss_vk.cpp";
+            ADD_FLAG("CFLAGS_VIO", "/DHAVE_DLSS=1 /I\"" + dlss_dir + "\\include\"");
+        } else {
+            ERROR("--with-dlss=DIR: DIR must be the DLSS SDK (include\\nvsdk_ngx.h, lib\\Windows_x86_64\\x64\\nvsdk_ngx_d.lib)");
+        }
     }
 
     // ── Register extension ────────────────────────────────────────────

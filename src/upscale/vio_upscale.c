@@ -324,6 +324,9 @@ const vio_upscale_provider *vio_upscale_provider_get(int provider)
 #ifdef HAVE_FFX
         case VIO_UPSCALER_FSR3: return &vio_upscale_provider_ffx;
 #endif
+#ifdef HAVE_DLSS
+        case VIO_UPSCALER_DLSS: return &vio_upscale_provider_dlss;
+#endif
         default: return NULL;
     }
 }
@@ -385,7 +388,7 @@ int vio_upscale_supported_on(const vio_upscale_device *dev, int provider, char *
                 snprintf(reason, reason_len, "php-vio was built without FidelityFX (configure --with-ffx)");
                 break;
             case VIO_UPSCALER_DLSS:
-                snprintf(reason, reason_len, "php-vio was built without DLSS");
+                snprintf(reason, reason_len, "php-vio was built without DLSS (configure --with-dlss=DIR)");
                 break;
             default:
                 snprintf(reason, reason_len, "php-vio was built without XeSS");

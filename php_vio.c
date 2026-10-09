@@ -110,6 +110,14 @@ PHP_INI_BEGIN()
     /* Where amd_fidelityfx_dx12.dll / amd_fidelityfx_vk.dll live (a directory or
      * the file itself); when set, the only place searched (vio_upscaler_*). */
     PHP_INI_ENTRY("vio.ffx_path", "", PHP_INI_ALL, NULL)
+    /* DLSS (TEMPORAL-S4, --with-dlss): where nvngx_dlss.dll / libnvidia-ngx-dlss.so
+     * lives (a directory or the file; when set, the only place searched), and how
+     * NGX identifies the application (NVSDK_NGX_*_Init_with_ProjectID, engine type
+     * CUSTOM): a GUID-like project id and an engine version. A game sets its own
+     * id; the default only identifies php-vio. */
+    PHP_INI_ENTRY("vio.dlss_path", "", PHP_INI_ALL, NULL)
+    PHP_INI_ENTRY("vio.dlss_project_id", "f2602eff-4605-46cb-82c5-cb557d9b7281", PHP_INI_ALL, NULL)
+    PHP_INI_ENTRY("vio.dlss_engine_version", PHP_VIO_VERSION, PHP_INI_ALL, NULL)
 PHP_INI_END()
 
 /* ── PHP function implementations ─────────────────────────────────── */
