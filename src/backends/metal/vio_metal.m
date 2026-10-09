@@ -5830,8 +5830,9 @@ static int metal_read_render_target(void *rt_ptr, int face, int attachment, void
                 out[i*4+0] = out[i*4+1] = out[i*4+2] = g; out[i*4+3] = 255;
             }
         } else {
-            /* Shared converter: every colour format -> RGBA8 (BGRA swizzled). */
-            vio_rt_convert_to_rgba8(vfmt, bgra, s, (size_t)bpr, w, h, out);
+            /* Shared converter: every colour format -> RGBA8 (BGRA swizzled), or the
+             * 'raw' texels (RGBA8 still swizzled to R, G, B, A). */
+            vio_rt_copy_texels(rt, vfmt, bgra, s, (size_t)bpr, w, h, out);
         }
     }
     return 0;

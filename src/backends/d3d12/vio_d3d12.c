@@ -4437,7 +4437,7 @@ static unsigned char *d3d12_readback_subresource(ID3D12Resource *src, UINT subre
 static int d3d12_rt_mips(const vio_render_target_object *rt);
 
 /* vio_read_render_target on D3D12: colour attachment (any vio_pixel_format,
- * converted to RGBA8 by the shared converter) or the depth buffer
+ * converted to RGBA8 by the shared converter, or raw) or the depth buffer
  * (R24G8_TYPELESS -> grey ramp). Cube targets are not available on D3D12. */
 static int d3d12_read_render_target(void *rt_ptr, int face, int attachment, void *out_rgba)
 {
@@ -4481,7 +4481,7 @@ static int d3d12_read_render_target(void *rt_ptr, int face, int attachment, void
             }
         }
     } else {
-        vio_rt_convert_to_rgba8(rt->formats[attachment], 0, raw, (size_t)pitch, w, h, out);
+        vio_rt_copy_texels(rt, rt->formats[attachment], 0, raw, (size_t)pitch, w, h, out);   /* RGBA8, or 'raw' texels */
     }
     free(raw);
     return 0;

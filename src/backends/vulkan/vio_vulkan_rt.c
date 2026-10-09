@@ -1307,7 +1307,7 @@ int vio_vk_read_render_target(void *rt_ptr, int face, int attachment, void *out_
             }
         } else {
             int bgra = x->color_format[attachment] == VK_FORMAT_B8G8R8A8_UNORM;
-            vio_rt_convert_to_rgba8(vfmt, bgra, src, (size_t)w * (size_t)bpp, (int)w, (int)h, out);
+            vio_rt_copy_texels(rt, vfmt, bgra, src, (size_t)w * (size_t)bpp, (int)w, (int)h, out);   /* RGBA8, or 'raw' texels */
         }
         vio_vma_unmap(vio_vk.vma_allocator, alloc);
     }

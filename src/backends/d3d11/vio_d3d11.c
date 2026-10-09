@@ -2433,7 +2433,7 @@ static int d3d11_read_render_target(void *rt_ptr, int face, int attachment, void
             }
         }
     } else {
-        vio_rt_convert_to_rgba8(rt->formats[attachment], 0, m.pData, (size_t)m.RowPitch, w, h, out);
+        vio_rt_copy_texels(rt, rt->formats[attachment], 0, m.pData, (size_t)m.RowPitch, w, h, out);   /* RGBA8, or 'raw' texels */
     }
     ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)staging, 0);
     ID3D11Texture2D_Release(staging);

@@ -196,6 +196,25 @@ void vio_rt_convert_to_rgba8(int format, int bgra, const void *src, size_t src_p
     }
 }
 
+void vio_rt_copy_texels(const vio_render_target_object *rt, int format, int bgra, const void *src,
+                        size_t src_pitch, int w, int h, unsigned char *out)
+{
+    if (!rt->read_raw) {
+        vio_rt_convert_to_rgba8(format, bgra, src, src_pitch, w, h, out);
+        return;
+    }
+    size_t row = (size_t)w * (size_t)vio_rt_format_bpp(format);
+    for (int y = 0; y < h; y++) {
+        unsigned char *dst = out + (size_t)y * row;
+        memcpy(dst, (const unsigned char *)src + (size_t)y * src_pitch, row);
+        if (bgra && format == VIO_FORMAT_RGBA8) {
+            for (int x = 0; x < w; x++) {
+                unsigned char t = dst[x * 4]; dst[x * 4] = dst[x * 4 + 2]; dst[x * 4 + 2] = t;
+            }
+        }
+    }
+}
+
 static void vio_render_target_free_object(zend_object *obj)
 {
     vio_render_target_object *rt = vio_render_target_from_obj(obj);

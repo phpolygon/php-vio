@@ -13281,13 +13281,24 @@ ZEND_FUNCTION(vio_read_render_target)
     zval *rt_zval;
     zend_long face = -1;
     zend_long attachment = 0;
+    HashTable *options = NULL;
 
-    ZEND_PARSE_PARAMETERS_START(1, 3)
+    ZEND_PARSE_PARAMETERS_START(1, 4)
         Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
         Z_PARAM_OPTIONAL
         Z_PARAM_LONG(face)
         Z_PARAM_LONG(attachment)
+        Z_PARAM_ARRAY_HT_OR_NULL(options)
     ZEND_PARSE_PARAMETERS_END();
+
+    /* 'raw' => true: the texels in the attachment's own format (RGBA16F halves,
+     * R32F floats, packed R11G11B10F / RGB10A2, ...) instead of clamped RGBA8 -
+     * motion vectors and history buffers compared bit for bit. */
+    int raw = 0;
+    if (options) {
+        zval *rz = zend_hash_str_find(options, "raw", sizeof("raw") - 1);
+        raw = rz && zend_is_true(rz);
+    }
 
     vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rt_zval);
     if (!rt->valid || !rt->backend) {
@@ -13305,12 +13316,20 @@ ZEND_FUNCTION(vio_read_render_target)
         RETURN_FALSE;
     }
 
-    size_t size = (size_t)rt->width * rt->height * 4;
+    if (raw && rt->depth_only) {
+        php_error_docref(NULL, E_WARNING, "vio_read_render_target: 'raw' reads colour attachments (a depth_only target has none)");
+        RETURN_FALSE;
+    }
+
+    size_t size = (size_t)rt->width * rt->height * (raw ? (size_t)vio_rt_format_bpp(rt->formats[attachment]) : 4);
     zend_string *buf = zend_string_alloc(size, 0);
     ZSTR_VAL(buf)[size] = '\0';
 
     if (rt->backend->read_render_target) {
-        if (rt->backend->read_render_target(rt, (int)face, (int)attachment, ZSTR_VAL(buf)) == 0) {
+        rt->read_raw = raw;
+        int rc = rt->backend->read_render_target(rt, (int)face, (int)attachment, ZSTR_VAL(buf));
+        rt->read_raw = 0;
+        if (rc == 0) {
             RETURN_NEW_STR(buf);
         }
         zend_string_release(buf);
