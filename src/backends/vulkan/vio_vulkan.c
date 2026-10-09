@@ -5435,6 +5435,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET:       return 1; /* offscreen RT + render-to-texture (Phase 3) */
         case VIO_FEATURE_RENDER_TARGET_HDR:   return vio_vk3d_available(); /* R16G16B16A16_SFLOAT colour target */
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return vio_vk3d_available(); /* depth-only target, sampled (compare sampler) */
+        case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return vio_vk3d_available(); /* SAMPLED depth resting in DEPTH_STENCIL_READ_ONLY */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return vio_vk3d_available(); /* multisampled attachments resolved by the pass (Block 10b) */
         case VIO_FEATURE_STENCIL:             return vio_vk3d_available() && (!vio_vk.device || vio_vk.depth_has_stencil); /* D32S8 / D24S8 attachments */
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_vk.ts_pool != VK_NULL_HANDLE; /* vkCmdWriteTimestamp per frame */

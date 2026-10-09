@@ -56,6 +56,7 @@ probe("opengl", [
     VIO_FEATURE_MIPMAP_GEN         => 1,
     VIO_FEATURE_MRT                => 1,
     VIO_FEATURE_RENDER_TARGET_LAYERED => 1,   /* GL_TEXTURE_2D_ARRAY / depth cubemaps (GEOMETRY-STAGES-PLAN 1a) */
+    VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE => 1,   /* every target's depth is a texture (test 223) */
     VIO_FEATURE_RAYTRACING         => 0,
     /* MULTIVIEW is device dependent here (GL_OVR_multiview2 / VkPhysicalDeviceMultiviewFeatures): test 158. */
 ]);
@@ -98,6 +99,7 @@ probe("null", [
     VIO_FEATURE_SAMPLER_FEEDBACK   => 0,
     VIO_FEATURE_COOPERATIVE_MATRIX => 0,
     VIO_FEATURE_WORK_GRAPHS        => 0,
+    VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -150,6 +152,7 @@ $d3d_common = [
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1, /* BC1-BC7 (GAP-PHASE5 9) */
     VIO_FEATURE_HLSL_STAGE_OVERRIDE => 1, /* 'hlsl' => [stage => src] (GEOMETRY-STAGES-PLAN 3) */
     VIO_FEATURE_RENDER_TARGET_LAYERED => 1, /* RTV / DSV per array slice (GEOMETRY-STAGES-PLAN 1a) */
+    VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE => 1, /* R24G8 typeless depth + SRV (test 223) */
     /* TESSELLATION / GEOMETRY are not pinned for D3D: the GPU side always has
      * the stages, but the flag also requires a SPIRV-Cross that can emit HLSL
      * for them (vio_hlsl_stage_supported - older Vulkan-SDK builds cannot).
@@ -192,6 +195,7 @@ probe_fold("vulkan", [
     VIO_FEATURE_TEXTURE_ARRAY      => 1,   /* GAP-PHASE5 10c */
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1,   /* textureCompressionBC (every desktop GPU) */
     VIO_FEATURE_RENDER_TARGET_LAYERED => 1,   /* framebuffer per array layer (GEOMETRY-STAGES-PLAN 1a) */
+    VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE => 1,   /* SAMPLED depth, DEPTH_STENCIL_READ_ONLY between passes (test 223) */
     VIO_FEATURE_INSTANCED_DRAW     => 1,
     VIO_FEATURE_DEPTH_BIAS         => 1,
     /* TESSELLATION / GEOMETRY follow the device features geometryShader /
@@ -231,6 +235,7 @@ if ($mtl) {
        /* Depth32Float_Stencil8 on swapchain / colour targets; 2DArray + depth cubes */
        && vio_supports_feature($mtl, VIO_FEATURE_STENCIL) === true
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET_LAYERED) === true
+       && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE) === true
        /* vertex-stage layer / viewport index travel together (Mac2 / Apple5) */
        && vio_supports_feature($mtl, VIO_FEATURE_LAYERED_RENDER) === vio_supports_feature($mtl, VIO_FEATURE_VERTEX_LAYER)
        && vio_supports_feature($mtl, VIO_FEATURE_MULTI_VIEWPORT) === vio_supports_feature($mtl, VIO_FEATURE_VERTEX_LAYER)

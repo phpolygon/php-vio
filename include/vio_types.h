@@ -413,6 +413,10 @@ typedef enum _vio_feature {
     VIO_FEATURE_LONG_VECTOR = 65,
     VIO_FEATURE_SHADER_EXECUTION_REORDER = 66,
     VIO_FEATURE_OPACITY_MICROMAP = 67,
+    /* vio_render_target_texture($rt, VIO_RT_DEPTH): the depth of a single-sample
+     * 2D colour target (plain or MRT) as a samplable texture - the scene depth a
+     * temporal resolve / motion-vector dilation reads next to the G-buffer. */
+    VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE = 68,
 } vio_feature;
 
 /* Zones per axis of a rate map. */
@@ -460,6 +464,10 @@ typedef struct _vio_coopmat_shape {
 /* vio_bind_render_target() face / layer argument that binds every layer of a
  * cube or array target at once (VIO_FEATURE_LAYERED_RENDER). */
 #define VIO_RT_ALL_LAYERS (-2)
+
+/* vio_render_target_texture() attachment argument that selects the depth
+ * attachment instead of a colour attachment (VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE). */
+#define VIO_RT_DEPTH (-1)
 
 /* Native device APIs a video encoder can share (VIDEO-ENCODE-PLAN.md) */
 #define VIO_ENCODE_API_D3D11 1

@@ -8,7 +8,9 @@
  *     single-sample images that are sampled and read back,
  *   - cube targets: one 6-layer image with a mip chain, a framebuffer per
  *     (face, level) - level 0 with the depth attachment, the others without,
- *   - depth-only targets store and sample their depth (DEPTH_STENCIL_READ_ONLY).
+ *   - depth-only targets store and sample their depth (DEPTH_STENCIL_READ_ONLY),
+ *     and so do single-sample 2D colour targets (vio_render_target_texture
+ *     with VIO_RT_DEPTH).
  * Binding a target keeps its contents (loadOp LOAD for colour and depth, like
  * OpenGL / D3D); vio_clear is the only clear (vkCmdClearAttachments). Every
  * image is initialised at creation and stays in a steady layout between
@@ -364,6 +366,8 @@ static void vkrt_free(vio_vk_rt *x)
     if (!x) return;
     for (int i = 0; i < VIO_MAX_COLOR_ATTACHMENTS; i++) vkrt_free_wrapper(x->wrap[i]);
     vkrt_free_wrapper(x->cube_wrap);
+    vkrt_free_wrapper(x->depth_wrap);
+    vkrt_kill(VIO_VK_GRAVE_SAMPLER, (uint64_t)x->depth_sampler, NULL);
     int faces = (x->layers > 0 ? x->layers : 1) * (x->levels > 0 ? x->levels : 1);
     if (x->face_view) for (int i = 0; i < faces; i++) vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->face_view[i], NULL);
     if (x->depth_face_view) for (int i = 0; i < x->layers; i++) vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->depth_face_view[i], NULL);
@@ -741,9 +745,11 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
     x->depth_levels = (depth_only && !layered && rt->mip_levels > 1) ? rt->mip_levels : 1;
     /* depth_only MSAA (A24): the sampled depth stays single-sample. */
     int depth_ms = (depth_only && !layered && x->depth_levels == 1 && want_ms > 1) ? vkrt_supported_samples(want_ms) : 1;
+    x->depth_sampled = !depth_only && !layered && x->samples == 1;
     if (vkrt_image(df, width, height, x->depth_levels, layers, x->samples,
                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                   (depth_only ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) : 0),
+                   (depth_only ? (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) : 0) |
+                   (x->depth_sampled ? VK_IMAGE_USAGE_SAMPLED_BIT : 0),
                    x->cube && x->samples == 1, &x->depth_image, &x->depth_alloc) != 0) goto fail;   /* MS images cannot be cube-compatible */
     /* depth_view: the 2D attachment / sampling view, or for a layered
      * depth_only target the whole-image CUBE / 2D_ARRAY sampling view. */
@@ -818,6 +824,15 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
             sci.maxLod = (float)x->levels;
         }
         if (vkCreateSampler(vio_vk.device, &sci, NULL, &x->sampler) != VK_SUCCESS) goto fail;
+        if (x->depth_sampled) {
+            /* the depth_only sampler: depth is not linearly filterable everywhere */
+            VkSamplerCreateInfo dsi = {0};
+            dsi.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            dsi.magFilter = dsi.minFilter = VK_FILTER_NEAREST;
+            dsi.addressModeU = dsi.addressModeV = dsi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+            dsi.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+            if (vkCreateSampler(vio_vk.device, &dsi, NULL, &x->depth_sampler) != VK_SUCCESS) goto fail;
+        }
     }
 
     /* Defined initial contents in the steady (samplable) layouts. */
@@ -849,8 +864,8 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
                 VkImageAspectFlags da = vkrt_depth_aspect();
                 VkImageSubresourceRange r = { da, 0, (uint32_t)x->depth_levels, 0, (uint32_t)layers };
                 VkClearDepthStencilValue dv = { 1.0f, 0 };
-                VkImageLayout steady = depth_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                                  : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                VkImageLayout steady = (depth_only || x->depth_sampled) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                                        : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
                 vio_vk_image_barrier_range(cmd, x->depth_image, da, 0, (uint32_t)x->depth_levels, 0, (uint32_t)layers, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 vkCmdClearDepthStencilImage(cmd, x->depth_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1, &r);
                 vio_vk_image_barrier_range(cmd, x->depth_image, da, 0, (uint32_t)x->depth_levels, 0, (uint32_t)layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, steady);
@@ -907,7 +922,8 @@ static void vkrt_fill(vio_vk_pass *p, vio_render_target_object *rt, int face, in
     int f = (layered && !all) ? face : 0;
     int ms = x->samples > 1 && l == 0;   /* layered levels > 0 are single-sampled */
     VkImageLayout color_rest = ms ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkImageLayout depth_rest = rt->depth_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkImageLayout depth_rest = (rt->depth_only || x->depth_sampled) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                                    : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     memset(p, 0, sizeof(*p));
     p->width   = (uint32_t)(rt->width >> l) > 0 ? (uint32_t)(rt->width >> l) : 1u;
     p->height  = (uint32_t)(rt->height >> l) > 0 ? (uint32_t)(rt->height >> l) : 1u;
@@ -1151,6 +1167,25 @@ void *vulkan_rt_sampling_texture(void *rt_ptr, int attachment)
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     vio_vk_rt *x = rt ? (vio_vk_rt *)rt->vulkan_rt : NULL;
     if (!x) return NULL;
+    if (attachment == VIO_RT_DEPTH && !rt->depth_only) {
+        /* The depth of a colour target (VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE). */
+        if (!x->depth_sampled || !x->depth_sampler) return NULL;
+        if (x->depth_wrap) return x->depth_wrap;
+        vio_vulkan_texture *w = (vio_vulkan_texture *)calloc(1, sizeof(vio_vulkan_texture));
+        if (!w) return NULL;
+        w->image      = x->depth_image;      /* borrowed */
+        w->view       = x->depth_view;       /* borrowed, DEPTH aspect */
+        w->sampler    = x->depth_sampler;    /* borrowed */
+        w->width      = rt->width;
+        w->height     = rt->height;
+        w->view_type  = VK_IMAGE_VIEW_TYPE_2D;
+        w->is_depth   = 1;
+        w->layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        w->mip_levels = 1;
+        x->depth_wrap = w;
+        return w;
+    }
+    if (attachment == VIO_RT_DEPTH) attachment = 0;   /* depth_only: attachment 0 is the depth */
     int i = rt->depth_only ? 0 : attachment;
     if (i < 0 || i >= (rt->depth_only ? 1 : x->count)) return NULL;
     if (x->wrap[i]) return x->wrap[i];

@@ -4613,6 +4613,16 @@ static int d3d12_rt_mips(const vio_render_target_object *rt)
     return rt->is_cube && rt->mip_levels > 0 ? rt->mip_levels : 1;
 }
 
+/* The target's depth is sampled between binds: depth_only targets (shadow
+ * maps) and single-sample 2D colour targets, whose typeless depth carries an
+ * SRV for vio_render_target_texture($rt, VIO_RT_DEPTH). Such a depth rests in
+ * PIXEL_SHADER_RESOURCE once a bind moves away from it and goes back to
+ * DEPTH_WRITE when the target is bound again. */
+static int d3d12_rt_depth_sampled(const vio_render_target_object *rt)
+{
+    return rt->d3d12_depth_resource && (rt->depth_only || rt->d3d12_depth_srv_gpu);
+}
+
 /* Resolve a multisampled target into its single-sample resolve resources so
  * the SRVs / readback see the final image (D3D11 twin: d3d11_rt_resolve_msaa).
  * Afterwards the resolve resources sit in PIXEL_SHADER_RESOURCE (color_is_srv)
@@ -4680,10 +4690,11 @@ static void d3d12_record_bind_render_target(vio_render_target_object *rt, int fa
 {
     /* Transition the OUTGOING target's depth back to a samplable state before
      * binding the new one, so a chain of depth-only binds (CSM cascades) with a
-     * single unbind at the end leaves every cascade readable. */
+     * single unbind at the end leaves every cascade readable - and a G-buffer
+     * target followed by a shadow pass keeps its scene depth samplable. */
     if (vio_d3d12.current_bound_rt && vio_d3d12.current_bound_rt != rt) {
         vio_render_target_object *prev = (vio_render_target_object *)vio_d3d12.current_bound_rt;
-        if (prev->d3d12_depth_resource && prev->depth_only && !prev->d3d12_depth_is_srv) {
+        if (d3d12_rt_depth_sampled(prev) && !prev->d3d12_depth_is_srv) {
             d3d12_rt_barrier(vio_d3d12.cmd_list, (ID3D12Resource *)prev->d3d12_depth_resource,
                              D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             prev->d3d12_depth_is_srv = 1;
@@ -4875,7 +4886,7 @@ static void d3d12_unbind_render_target(unsigned int default_fbo, int width, int 
      * (unless a later bind already did it), colour attachments -> SRV. */
     if (vio_d3d12.current_bound_rt) {
         vio_render_target_object *bound_rt = (vio_render_target_object *)vio_d3d12.current_bound_rt;
-        if (bound_rt->d3d12_depth_resource && bound_rt->depth_only && !bound_rt->d3d12_depth_is_srv) {
+        if (d3d12_rt_depth_sampled(bound_rt) && !bound_rt->d3d12_depth_is_srv) {
             d3d12_rt_barrier(vio_d3d12.cmd_list, (ID3D12Resource *)bound_rt->d3d12_depth_resource,
                              D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             bound_rt->d3d12_depth_is_srv = 1;
@@ -5114,7 +5125,10 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     depth_res_desc.Height = height;
     depth_res_desc.DepthOrArraySize = (UINT16)layers;
     depth_res_desc.MipLevels = (UINT16)depth_mips;
-    depth_res_desc.Format = depth_only ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_D24_UNORM_S8_UINT;
+    /* Typeless where the depth gets an SRV: depth_only targets and single-sample
+     * 2D colour targets (VIO_RT_DEPTH); the DSVs stay D24_UNORM_S8_UINT. */
+    int depth_srv = depth_only || (!layered && samples == 1);
+    depth_res_desc.Format = depth_srv ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_D24_UNORM_S8_UINT;
     depth_res_desc.SampleDesc.Count = samples;   /* multisampled with the colour (DSV infers 2DMS) */
     depth_res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE depth_clear = {0};
@@ -5153,7 +5167,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
             ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, &dd, h);
         }
     } else {
-        ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, depth_only ? &dsv_view_desc : NULL, dsv_handle);
+        ID3D12Device_CreateDepthStencilView(vio_d3d12.device, depth_res, depth_srv ? &dsv_view_desc : NULL, dsv_handle);
         for (int m = 1; m < depth_mips; m++) {
             D3D12_DEPTH_STENCIL_VIEW_DESC dd = dsv_view_desc;
             dd.Texture2D.MipSlice = (UINT)m;
@@ -5163,7 +5177,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
     }
 
     /* Static SRVs (staging heap) for sampling the target later. */
-    if (depth_only) {
+    if (depth_srv) {
         uint64_t cpu, gpu;
         if (d3d12_rt_alloc_srv(&cpu, &gpu) == 0) {
             D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
@@ -5185,7 +5199,8 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
             rt->d3d12_depth_srv_gpu = gpu;
             rt->d3d12_depth_srv_cpu = cpu;
         }
-    } else if (layered) {
+    }
+    if (!depth_only && layered) {
         uint64_t cpu, gpu;
         if (d3d12_rt_alloc_srv(&cpu, &gpu) == 0) {
             D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
@@ -5204,7 +5219,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
             rt->d3d12_color_srv_gpus[0] = rt->d3d12_color_srv_gpu = gpu;
             rt->d3d12_color_srv_cpus[0] = rt->d3d12_color_srv_cpu = cpu;
         }
-    } else {
+    } else if (!depth_only) {
         for (int ai = 0; ai < attachment_count; ai++) {
             if (!rt->d3d12_color_resources[ai]) break;
             uint64_t cpu, gpu;
@@ -8928,6 +8943,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET:       return 1;
         case VIO_FEATURE_RENDER_TARGET_HDR:   return 1;
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 1;
+        case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return 1; /* typeless R24G8 depth + SRV, PIXEL_SHADER_RESOURCE between binds */
         /* Multisampled colour + depth resources per target, PSO SampleDesc
          * variants picked at bind time, ResolveSubresource on unbind (GAP-PHASE5
          * Block 1). */

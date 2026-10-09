@@ -4014,6 +4014,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET:       return 1;
         case VIO_FEATURE_RENDER_TARGET_HDR:   return 1;
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 1;
+        case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return 1; /* R24G8 depth with an SRV on every single-sample target */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1; /* multisampled colour + ResolveSubresource on unbind (GAP-PLAN Phase 3) */
         case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + depth-stencil state (GAP-PHASE5 Block 1) */
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d11.ts_available; /* TIMESTAMP + DISJOINT query ring */

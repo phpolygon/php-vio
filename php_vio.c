@@ -11600,6 +11600,8 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_LAYERED_RENDER", VIO_FEATURE_LAYERED_RENDER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_LAYER", VIO_FEATURE_VERTEX_LAYER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_RT_ALL_LAYERS", VIO_RT_ALL_LAYERS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_RT_DEPTH", VIO_RT_DEPTH, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE", VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALE_SPATIAL", VIO_UPSCALE_SPATIAL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALE_TEMPORAL", VIO_UPSCALE_TEMPORAL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_VIEWPORT", VIO_FEATURE_MULTI_VIEWPORT, CONST_CS | CONST_PERSISTENT);
@@ -13356,11 +13358,29 @@ ZEND_FUNCTION(vio_render_target_texture)
         RETURN_FALSE;
     }
     int rt_attachments = rt->attachment_count > 0 ? rt->attachment_count : 1;
-    if (attachment < 0 || attachment >= rt_attachments || (rt->depth_only && attachment != 0)) {
-        php_error_docref(NULL, E_WARNING, "vio_render_target_texture: attachment must be 0..%d", rt_attachments - 1);
+    /* VIO_RT_DEPTH: the depth attachment. On a depth_only target that is what
+     * attachment 0 already is; on a colour target it needs
+     * VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE and a single-sample plain 2D target
+     * (a multisampled, layered or rate-mapped depth has no samplable twin). */
+    int want_depth = rt->depth_only || attachment == VIO_RT_DEPTH;
+    if (attachment != VIO_RT_DEPTH &&
+        (attachment < 0 || attachment >= rt_attachments || (rt->depth_only && attachment != 0))) {
+        php_error_docref(NULL, E_WARNING, "vio_render_target_texture: attachment must be 0..%d or VIO_RT_DEPTH", rt_attachments - 1);
         RETURN_FALSE;
     }
-    int att = (int)attachment;   /* MRT colour attachment index (0 == the legacy scalar fields) */
+    if (want_depth && !rt->depth_only) {
+        if (!rt->backend || !rt->backend->supports_feature ||
+            !rt->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE)) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target_texture: sampling the depth of a colour target is not supported on backend '%s' (VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE)",
+                             rt->backend ? rt->backend->name : "?");
+            RETURN_FALSE;
+        }
+        if (rt->samples > 1 || rt->is_cube || rt->layers > 1 || rt->rate_active) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target_texture: VIO_RT_DEPTH needs a single-sample 2D target (no 'samples', 'cube', 'layers' or active 'rate_map')");
+            RETURN_FALSE;
+        }
+    }
+    int att = want_depth ? 0 : (int)attachment;   /* MRT colour attachment index (0 == the legacy scalar fields) */
     if (rt->is_cube) {
         php_error_docref(NULL, E_WARNING, "vio_render_target_texture: sample a cube target through vio_render_target_cubemap()");
         RETURN_FALSE;
@@ -13374,14 +13394,14 @@ ZEND_FUNCTION(vio_render_target_texture)
 
     tex->width    = rt->width;
     tex->height   = rt->height;
-    tex->channels = rt->depth_only ? 1 : 4;
+    tex->channels = want_depth ? 1 : 4;
     tex->filter   = VIO_FILTER_NEAREST;
     tex->wrap     = VIO_WRAP_CLAMP;
     tex->layers   = rt->layers > 1 ? rt->layers : 1;
     tex->is_array = rt->layers > 1;   /* sampler2DArray; the backend views below are arrays too */
 
-    /* Return depth texture for depth-only targets, color texture otherwise */
-    tex->texture_id = rt->depth_only ? rt->depth_texture : (att == 0 ? rt->color_texture : rt->color_textures[att]);
+    /* The depth texture for depth-only targets and VIO_RT_DEPTH, colour otherwise */
+    tex->texture_id = want_depth ? rt->depth_texture : (att == 0 ? rt->color_texture : rt->color_textures[att]);
     tex->valid    = 1;
     tex->borrowed = 1;  /* GL resource owned by render target, don't double-delete */
 
@@ -13395,13 +13415,13 @@ ZEND_FUNCTION(vio_render_target_texture)
      * vio_render_target_texture call started returning garbage SRV
      * handles, which crashed the next sampler bind. */
     if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
-        vio_d3d11_texture **cache_slot = rt->depth_only
+        vio_d3d11_texture **cache_slot = want_depth
             ? (vio_d3d11_texture **)&rt->d3d11_depth_backend_texture
             : (att == 0 ? (vio_d3d11_texture **)&rt->d3d11_color_backend_texture
                         : (vio_d3d11_texture **)&rt->d3d11_color_backend_textures[att]);
 
         if (*cache_slot == NULL) {
-            ID3D11ShaderResourceView *srv = rt->depth_only
+            ID3D11ShaderResourceView *srv = want_depth
                 ? (ID3D11ShaderResourceView *)rt->d3d11_depth_srv
                 : (att == 0 ? (ID3D11ShaderResourceView *)rt->d3d11_color_srv
                             : (ID3D11ShaderResourceView *)rt->d3d11_color_srvs[att]);
@@ -13412,7 +13432,7 @@ ZEND_FUNCTION(vio_render_target_texture)
                 d3d_tex->width = rt->width;
                 d3d_tex->height = rt->height;
 
-                if (rt->depth_only) {
+                if (want_depth) {
                     /* Regular sampler for sampler2D + texture() (manual shadow comparison) */
                     D3D11_SAMPLER_DESC sampler_desc = {0};
                     sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -13464,7 +13484,7 @@ ZEND_FUNCTION(vio_render_target_texture)
      * here (the SRV descriptors are owned by the RT), so the cached
      * wrapper is freed in the RT's free handler alongside its descriptors. */
     if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized) {
-        vio_d3d12_texture **cache_slot = rt->depth_only
+        vio_d3d12_texture **cache_slot = want_depth
             ? (vio_d3d12_texture **)&rt->d3d12_depth_backend_texture
             : (att == 0 ? (vio_d3d12_texture **)&rt->d3d12_color_backend_texture
                         : (vio_d3d12_texture **)&rt->d3d12_color_backend_textures[att]);
@@ -13472,7 +13492,7 @@ ZEND_FUNCTION(vio_render_target_texture)
         uint64_t color_srv_cpu = att == 0 ? rt->d3d12_color_srv_cpu : rt->d3d12_color_srv_cpus[att];
 
         if (*cache_slot == NULL) {
-            if (rt->depth_only && rt->d3d12_depth_srv_gpu) {
+            if (want_depth && rt->d3d12_depth_srv_gpu) {
                 vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
                 d3d_tex->resource = NULL;
                 d3d_tex->width = rt->width;
@@ -13484,7 +13504,7 @@ ZEND_FUNCTION(vio_render_target_texture)
                  * comparison samplers s8+ regardless). */
                 d3d_tex->sampler_index = vio_d3d12_sampler_combo(VIO_FILTER_NEAREST, VIO_WRAP_CLAMP, 1);
                 *cache_slot = d3d_tex;
-            } else if (!rt->depth_only && color_srv_gpu) {
+            } else if (!want_depth && color_srv_gpu) {
                 vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
                 d3d_tex->resource = NULL;
                 d3d_tex->width = rt->width;
@@ -13510,7 +13530,7 @@ ZEND_FUNCTION(vio_render_target_texture)
      * wrapper. The registry slot is cleared lazily by other deletes; the actual
      * MTLTexture lifetime stays with the RT (CFBridgingRelease in destroy). */
     if (rt->backend_type == VIO_RT_BACKEND_METAL) {
-        void *cf_tex = rt->depth_only ? rt->metal_depth_texture
+        void *cf_tex = want_depth ? rt->metal_depth_texture
                      : (att == 0 ? rt->metal_color_texture : rt->metal_color_textures[att]);
         if (cf_tex) {
             tex->texture_id = vio_metal_register_external_texture(cf_tex);
@@ -13518,11 +13538,11 @@ ZEND_FUNCTION(vio_render_target_texture)
 
             /* 3D sampling path: cached wrapper owned by the RT, built once
              * (same rationale as the D3D11 cache — a wrapper per call leaked). */
-            void **cache_slot = rt->depth_only ? &rt->metal_depth_backend_texture
+            void **cache_slot = want_depth ? &rt->metal_depth_backend_texture
                               : (att == 0 ? &rt->metal_color_backend_texture
                                           : &rt->metal_color_backend_textures[att]);
             if (*cache_slot == NULL) {
-                *cache_slot = vio_metal_wrap_rt_texture(cf_tex, rt->depth_only);
+                *cache_slot = vio_metal_wrap_rt_texture(cf_tex, want_depth);
             }
             tex->backend_texture = *cache_slot;
         }
@@ -13546,7 +13566,7 @@ ZEND_FUNCTION(vio_render_target_texture)
      * on the borrowed handles, we leave tex->backend = NULL (the texture free
      * handler short-circuits when backend is NULL) and mark it borrowed. */
     if (rt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.initialized) {
-        void *wrapper = vulkan_rt_sampling_texture(rt, att);   /* colour attachment att, or depth for depth_only targets */
+        void *wrapper = vulkan_rt_sampling_texture(rt, want_depth ? VIO_RT_DEPTH : att);   /* colour attachment att, or the depth */
         if (wrapper) {
             tex->backend_texture = wrapper;
             tex->backend         = NULL; /* the RT owns the wrapper and its handles */
@@ -13555,6 +13575,15 @@ ZEND_FUNCTION(vio_render_target_texture)
     }
 #endif
 
+    /* A colour target's depth the backend could not wrap (no SRV / view for it)
+     * is an error, not an unbound texture. */
+    if (want_depth && !rt->depth_only && !tex->backend_texture &&
+        !(rt->backend_type == VIO_RT_BACKEND_OPENGL && tex->texture_id)) {
+        zval_ptr_dtor(&tex_zval);
+        php_error_docref(NULL, E_WARNING, "vio_render_target_texture: the depth of this target is not samplable on backend '%s'",
+                         rt->backend ? rt->backend->name : "?");
+        RETURN_FALSE;
+    }
     RETURN_COPY_VALUE(&tex_zval);
 }
 

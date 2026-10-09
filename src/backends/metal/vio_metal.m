@@ -6958,6 +6958,7 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_RENDER_TARGET:
     case VIO_FEATURE_RENDER_TARGET_HDR:
     case VIO_FEATURE_RENDER_TARGET_DEPTH:
+    case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE:   /* the single-sample depth texture is ShaderRead */
     case VIO_FEATURE_RENDER_TARGET_MSAA:
     case VIO_FEATURE_RENDER_TARGET_CUBE:
     case VIO_FEATURE_MIPMAP_GEN:

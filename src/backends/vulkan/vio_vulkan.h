@@ -151,6 +151,12 @@ typedef struct _vio_vk_rt {
     VkDescriptorSet *dmip_set;
     struct _vio_vulkan_texture *wrap[VIO_MAX_COLOR_ATTACHMENTS];   /* sampling wrappers (vio_render_target_texture) */
     struct _vio_vulkan_texture *cube_wrap; /* vio_render_target_cubemap */
+    /* VIO_RT_DEPTH on a single-sample 2D colour target: the depth is SAMPLED and
+     * rests in DEPTH_STENCIL_READ_ONLY between passes (like a depth_only one),
+     * sampled NEAREST / white border through its own wrapper. */
+    int            depth_sampled;
+    VkSampler      depth_sampler;
+    struct _vio_vulkan_texture *depth_wrap;
 } vio_vk_rt;
 
 /* Global Vulkan state */

@@ -3258,6 +3258,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET:        return 1;
         case VIO_FEATURE_RENDER_TARGET_HDR:    return 1;       /* RGBA16F since 3.0 */
         case VIO_FEATURE_RENDER_TARGET_DEPTH:  return 1;
+        case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return 1;   /* every target carries a DEPTH24_STENCIL8 texture */
         case VIO_FEATURE_RENDER_TARGET_MSAA:   return 1;
         case VIO_FEATURE_STENCIL:        return 1;             /* DEPTH24_STENCIL8 attachments + glStencil* state */
         case VIO_FEATURE_GPU_TIMESTAMP:  return opengl_has_timer_query(); /* GL_TIMESTAMP queries, core 3.3 */
