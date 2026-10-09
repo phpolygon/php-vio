@@ -226,10 +226,10 @@ jobs:
             tests/render3d/227_upscaler_fsr3_converges.phpt \
             tests/render3d/228_upscaler_lifecycle_no_leak.phpt \
             tests/render3d/229_upscaler_dlss_unavailable_all_backends.phpt \
-            tests/render3d/230_upscaler_dlss_converges.phpt \
-            tests/render3d/231_upscaler_dlss_lifecycle_no_leak.phpt \
             tests/render3d/232_vulkan_stale_texture_binding_validation_clean.phpt \
-            tests/render3d/233_upscaler_dlss_preset.phpt
+            tests/render3d/234_upscaler_plugin_missing_all_backends.phpt \
+            tests/render3d/235_upscaler_plugin_abi_refused.phpt \
+            tests/render3d/236_upscaler_plugin_dispatch_states.phpt
 
       - name: Package binary
         run: |
@@ -453,10 +453,10 @@ jobs:
             tests/render3d/227_upscaler_fsr3_converges.phpt \
             tests/render3d/228_upscaler_lifecycle_no_leak.phpt \
             tests/render3d/229_upscaler_dlss_unavailable_all_backends.phpt \
-            tests/render3d/230_upscaler_dlss_converges.phpt \
-            tests/render3d/231_upscaler_dlss_lifecycle_no_leak.phpt \
             tests/render3d/232_vulkan_stale_texture_binding_validation_clean.phpt \
-            tests/render3d/233_upscaler_dlss_preset.phpt
+            tests/render3d/234_upscaler_plugin_missing_all_backends.phpt \
+            tests/render3d/235_upscaler_plugin_abi_refused.phpt \
+            tests/render3d/236_upscaler_plugin_dispatch_states.phpt
 
       - name: Package binary
         run: |
@@ -968,10 +968,10 @@ jobs:
             tests/render3d/227_upscaler_fsr3_converges.phpt `
             tests/render3d/228_upscaler_lifecycle_no_leak.phpt `
             tests/render3d/229_upscaler_dlss_unavailable_all_backends.phpt `
-            tests/render3d/230_upscaler_dlss_converges.phpt `
-            tests/render3d/231_upscaler_dlss_lifecycle_no_leak.phpt `
             tests/render3d/232_vulkan_stale_texture_binding_validation_clean.phpt `
-            tests/render3d/233_upscaler_dlss_preset.phpt
+            tests/render3d/234_upscaler_plugin_missing_all_backends.phpt `
+            tests/render3d/235_upscaler_plugin_abi_refused.phpt `
+            tests/render3d/236_upscaler_plugin_dispatch_states.phpt
 
       - name: Package binary
         shell: pwsh
