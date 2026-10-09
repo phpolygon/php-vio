@@ -10,6 +10,7 @@ ARG_WITH("ffmpeg", "for FFmpeg (video recording) support", "no");
 ARG_WITH("harfbuzz", "for HarfBuzz (text shaping: Arabic, Thai, BiDi) support", "no");
 ARG_WITH("d3d11", "for Direct3D 11 support", "yes");
 ARG_WITH("d3d12", "for Direct3D 12 support", "yes");
+ARG_WITH("ffx", "for the AMD FidelityFX FSR 3.1 upscaler (amd_fidelityfx_*.dll loaded at run time, no link dependency)", "yes");
 
 if (PHP_VIO != "no") {
 
@@ -258,6 +259,16 @@ if (PHP_VIO != "no") {
     // thermal-sensor read in vio_thermal.c (MSAcpi_ThermalZoneTemperature).
     CHECK_LIB("oleaut32.lib", "vio");
     CHECK_LIB("wbemuuid.lib", "vio");
+
+    // ── FidelityFX FSR 3.1 provider (vio_upscaler_*, TEMPORAL-S3) ───────
+    // Compiled against the vendored ffx-api headers (MIT); the signed
+    // amd_fidelityfx_dx12.dll / amd_fidelityfx_vk.dll are loaded at run time
+    // (vio.ffx_path, next to php.exe / php_vio.dll, PATH), so the build needs
+    // no SDK and the extension loads without them. On by default.
+    if (PHP_FFX != "no") {
+        vio_sources += " src\\upscale\\vio_upscale_ffx.cpp src\\upscale\\vio_upscale_ffx_dx12.cpp src\\upscale\\vio_upscale_ffx_vk.cpp";
+        ADD_FLAG("CFLAGS_VIO", "/DHAVE_FFX=1 /I" + configure_module_dirname + "\\vendor\\ffx-api\\include");
+    }
 
     // ── Register extension ────────────────────────────────────────────
     EXTENSION("vio",

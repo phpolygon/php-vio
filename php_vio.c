@@ -7310,7 +7310,12 @@ ZEND_FUNCTION(vio_upscaler_dispatch)
     vio_upscale_dispatch_desc d;
     memset(&d, 0, sizeof(d));
     if (vio_upscaler_image_arg(in, "color", 1, 0, be, &d.color) < 0) RETURN_THROWS();
-    if (vio_upscaler_image_arg(in, "depth", 1, VIO_RT_DEPTH, be, &d.depth) < 0) RETURN_THROWS();
+    int has_depth = vio_upscaler_image_arg(in, "depth", 0, VIO_RT_DEPTH, be, &d.depth);
+    if (has_depth < 0) RETURN_THROWS();
+    if (has_depth == 0) {   /* the colour target's own depth */
+        d.depth.rt = d.color.rt;
+        d.depth.attachment = VIO_RT_DEPTH;
+    }
     if (vio_upscaler_image_arg(in, "motion", 1, 0, be, &d.motion) < 0) RETURN_THROWS();
     if (vio_upscaler_image_arg(in, "output", 1, 0, be, &d.output) < 0) RETURN_THROWS();
     if (vio_upscaler_image_arg(in, "reactive", 0, 0, be, &d.reactive) < 0) RETURN_THROWS();

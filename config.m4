@@ -63,6 +63,18 @@ PHP_ARG_WITH([harfbuzz],
   [no],
   [no])
 
+dnl AMD FidelityFX FSR 3.1 (vio_upscaler_*, TEMPORAL-S3): compiled against the
+dnl vendored ffx-api headers, the runtime library is loaded with dlopen - no
+dnl link dependency. OPT-IN here (default no): FidelityFX ships Windows
+dnl libraries only, and static-php-cli builds stay unchanged. config.w32 turns
+dnl it on by default.
+PHP_ARG_WITH([ffx],
+  [for AMD FidelityFX FSR 3.1 upscaler support],
+  [AS_HELP_STRING([--with-ffx],
+    [AMD FidelityFX FSR 3.1 upscaler (runtime-loaded libamd_fidelityfx_vk.so). Opt-in: off unless requested.])],
+  [no],
+  [no])
+
 PHP_ARG_WITH([metal],
   [for Metal (macOS GPU backend) support],
   [AS_HELP_STRING([--with-metal],
@@ -564,6 +576,24 @@ if test "$PHP_VIO" != "no"; then
     if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
       PHP_ADD_SOURCES_X($ext_dir, [src/backends/vulkan/vio_vma_wrapper.cpp],
         -std=c++17 -DVMA_STATIC_VULKAN_FUNCTIONS=0 $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
+        shared_objects_vio, yes)
+    fi
+  fi
+
+  dnl ── FidelityFX FSR 3.1 provider (--with-ffx, C++) ──────────────────
+  if test "$PHP_FFX" != "no"; then
+    PHP_REQUIRE_CXX()
+    AC_DEFINE(HAVE_FFX, 1, [Whether the FidelityFX FSR 3.1 upscaler provider is built])
+    PHP_ADD_LIBRARY(dl, 1, VIO_SHARED_LIBADD)
+    VIO_FFX_CFLAGS="-std=c++17 -DHAVE_FFX=1 -I$ext_srcdir/vendor/ffx-api/include -I$ext_srcdir/src/upscale"
+    if test "$ext_shared" != "shared" && test "$ext_shared" != "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/upscale/vio_upscale_ffx.cpp src/upscale/vio_upscale_ffx_dx12.cpp src/upscale/vio_upscale_ffx_vk.cpp],
+        $VIO_FFX_CFLAGS $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED,
+        PHP_GLOBAL_OBJS)
+    fi
+    if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
+      PHP_ADD_SOURCES_X($ext_dir, [src/upscale/vio_upscale_ffx.cpp src/upscale/vio_upscale_ffx_dx12.cpp src/upscale/vio_upscale_ffx_vk.cpp],
+        $VIO_FFX_CFLAGS $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
         shared_objects_vio, yes)
     fi
   fi
