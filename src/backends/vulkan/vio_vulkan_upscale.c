@@ -188,7 +188,7 @@ int vulkan_upscaler_dispatch(void *upscaler, const vio_upscale_dispatch_desc *d,
     }
     vio_upscale_native_dispatch nd;
     memset(&nd, 0, sizeof(nd));
-    nd.desc = d;
+    nd.params = &d->params;
     const vio_upscale_image *src[7] = { &d->color, &d->depth, &d->motion, &d->reactive, &d->transparency, &d->exposure, &d->output };
     vio_upscale_native_image *dst[7] = { &nd.color, &nd.depth, &nd.motion, &nd.reactive, &nd.transparency, &nd.exposure, &nd.output };
     static const char *names[7] = { "color", "depth", "motion", "reactive", "transparency", "exposure", "output" };

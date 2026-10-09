@@ -110,13 +110,15 @@ PHP_INI_BEGIN()
     /* Where amd_fidelityfx_dx12.dll / amd_fidelityfx_vk.dll live (a directory or
      * the file itself); when set, the only place searched (vio_upscaler_*). */
     PHP_INI_ENTRY("vio.ffx_path", "", PHP_INI_ALL, NULL)
-    /* DLSS (TEMPORAL-S4, --with-dlss): where nvngx_dlss.dll / libnvidia-ngx-dlss.so
-     * lives (a directory or the file; when set, the only place searched), and how
-     * NGX identifies the application (NVSDK_NGX_*_Init_with_ProjectID, engine type
-     * CUSTOM): a GUID-like project id and an engine version. A game sets its own
-     * id; the default only identifies php-vio. */
+    /* DLSS (TEMPORAL-S4) is a plugin (include/vio_upscale_plugin.h): where
+     * vio_dlss.dll / libvio_dlss.so lives (a directory or the file; when set, the
+     * only place searched - read on first use, a loaded plugin stays). The other
+     * three are the plugin's, read through the host table: where its runtime
+     * lives, and how it identifies the application to the driver (a GUID-like
+     * project id - "" = the plugin's own - and an engine version). */
+    PHP_INI_ENTRY("vio.dlss_plugin_path", "", PHP_INI_ALL, NULL)
     PHP_INI_ENTRY("vio.dlss_path", "", PHP_INI_ALL, NULL)
-    PHP_INI_ENTRY("vio.dlss_project_id", "f2602eff-4605-46cb-82c5-cb557d9b7281", PHP_INI_ALL, NULL)
+    PHP_INI_ENTRY("vio.dlss_project_id", "", PHP_INI_ALL, NULL)
     PHP_INI_ENTRY("vio.dlss_engine_version", PHP_VIO_VERSION, PHP_INI_ALL, NULL)
 PHP_INI_END()
 
@@ -7127,6 +7129,8 @@ ZEND_FUNCTION(vio_upscaler_info)
     add_assoc_string(return_value, "version", q.version);
     add_assoc_string(return_value, "driver", q.driver);
     add_assoc_string(return_value, "library", q.library);
+    /* The plugin library the provider came from ('' = built in / none). */
+    add_assoc_string(return_value, "plugin", (char *)vio_upscale_plugin_path((int)provider));
     add_assoc_string(return_value, "device", device);
     add_assoc_long(return_value, "live", be ? vio_upscaler_live_count(be) : 0);
     add_assoc_long(return_value, "host_bytes", (zend_long)vio_upscale_host_bytes());
@@ -7408,32 +7412,32 @@ ZEND_FUNCTION(vio_upscaler_dispatch)
         RETURN_THROWS();
     }
     zval *v;
-    d.render_width = color->width < u->desc.render_width ? color->width : u->desc.render_width;
-    d.render_height = color->height < u->desc.render_height ? color->height : u->desc.render_height;
-    if ((v = zend_hash_str_find(in, "render_width", sizeof("render_width") - 1)) != NULL) d.render_width = (int)zval_get_long(v);
-    if ((v = zend_hash_str_find(in, "render_height", sizeof("render_height") - 1)) != NULL) d.render_height = (int)zval_get_long(v);
-    if (d.render_width < 1 || d.render_height < 1 || d.render_width > u->desc.render_width || d.render_height > u->desc.render_height
-        || d.render_width > color->width || d.render_height > color->height) {
+    d.params.render_width = color->width < u->desc.render_width ? color->width : u->desc.render_width;
+    d.params.render_height = color->height < u->desc.render_height ? color->height : u->desc.render_height;
+    if ((v = zend_hash_str_find(in, "render_width", sizeof("render_width") - 1)) != NULL) d.params.render_width = (int)zval_get_long(v);
+    if ((v = zend_hash_str_find(in, "render_height", sizeof("render_height") - 1)) != NULL) d.params.render_height = (int)zval_get_long(v);
+    if (d.params.render_width < 1 || d.params.render_height < 1 || d.params.render_width > u->desc.render_width || d.params.render_height > u->desc.render_height
+        || d.params.render_width > color->width || d.params.render_height > color->height) {
         zend_argument_value_error(3, "the render size %dx%d must fit the colour target and the upscaler's %dx%d",
-                                  d.render_width, d.render_height, u->desc.render_width, u->desc.render_height);
+                                  d.params.render_width, d.params.render_height, u->desc.render_width, u->desc.render_height);
         RETURN_THROWS();
     }
-    d.mv_scale_x = d.mv_scale_y = 1.0f;
-    if (!vio_upscaler_pair_arg(in, "jitter", &d.jitter_x, &d.jitter_y)) RETURN_THROWS();
-    if (!vio_upscaler_pair_arg(in, "mv_scale", &d.mv_scale_x, &d.mv_scale_y)) RETURN_THROWS();
-    d.reset = vio_upscaler_bool_opt(in, "reset");
-    d.sharpness = vio_upscaler_float_opt(in, "sharpness", 0.0f);
-    if (d.sharpness < 0.0f || d.sharpness > 1.0f) {
+    d.params.mv_scale_x = d.params.mv_scale_y = 1.0f;
+    if (!vio_upscaler_pair_arg(in, "jitter", &d.params.jitter_x, &d.params.jitter_y)) RETURN_THROWS();
+    if (!vio_upscaler_pair_arg(in, "mv_scale", &d.params.mv_scale_x, &d.params.mv_scale_y)) RETURN_THROWS();
+    d.params.reset = vio_upscaler_bool_opt(in, "reset");
+    d.params.sharpness = vio_upscaler_float_opt(in, "sharpness", 0.0f);
+    if (d.params.sharpness < 0.0f || d.params.sharpness > 1.0f) {
         zend_argument_value_error(3, "'sharpness' must be 0..1");
         RETURN_THROWS();
     }
-    d.frame_time_ms = vio_upscaler_float_opt(in, "frame_time_ms", 1000.0f / 60.0f);
-    d.camera_near = vio_upscaler_float_opt(in, "near", 0.1f);
-    d.camera_far = vio_upscaler_float_opt(in, "far", 1000.0f);
-    d.fov_y = vio_upscaler_float_opt(in, "fov_y", 1.0471976f);
-    d.pre_exposure = vio_upscaler_float_opt(in, "pre_exposure", 1.0f);
-    d.view_to_meters = vio_upscaler_float_opt(in, "view_to_meters", 1.0f);
-    if (d.pre_exposure <= 0.0f) {
+    d.params.frame_time_ms = vio_upscaler_float_opt(in, "frame_time_ms", 1000.0f / 60.0f);
+    d.params.camera_near = vio_upscaler_float_opt(in, "near", 0.1f);
+    d.params.camera_far = vio_upscaler_float_opt(in, "far", 1000.0f);
+    d.params.fov_y = vio_upscaler_float_opt(in, "fov_y", 1.0471976f);
+    d.params.pre_exposure = vio_upscaler_float_opt(in, "pre_exposure", 1.0f);
+    d.params.view_to_meters = vio_upscaler_float_opt(in, "view_to_meters", 1.0f);
+    if (d.params.pre_exposure <= 0.0f) {
         zend_argument_value_error(3, "'pre_exposure' must be > 0");
         RETURN_THROWS();
     }

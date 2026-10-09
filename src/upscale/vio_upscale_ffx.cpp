@@ -125,6 +125,13 @@ int ffx_supported(const vio_upscale_device *dev, char *reason, size_t reason_len
 {
     FfxLib *L = ffx_load(dev->api, reason, reason_len);
     if (!L) return 0;
+    /* WARP takes the FSR 3.1 context and dispatch, then faults while executing
+     * its compute passes (access violation in the WARP JIT, Windows 11 26200).
+     * A missing library is reported first. */
+    if (dev->software_adapter) {
+        snprintf(reason, reason_len, "FSR 3.1 needs a hardware GPU, not WARP (headless: 'headless_hardware' => true)");
+        return 0;
+    }
     uint64_t count = 0;
     ffxQueryDescGetVersions qv{};
     qv.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
@@ -199,7 +206,7 @@ void *ffx_create(const vio_upscale_device *dev, const vio_upscale_create_desc *d
 int ffx_dispatch(void *ctx, const vio_upscale_native_dispatch *nd, char *err, size_t err_len)
 {
     FfxCtx *c = static_cast<FfxCtx *>(ctx);
-    const vio_upscale_dispatch_desc *d = nd->desc;
+    const vio_upscale_dispatch_params *d = nd->params;
     ffxDispatchDescUpscale dd{};
     dd.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     dd.commandList = nd->command_list;
@@ -292,8 +299,11 @@ unsigned ffx_vk_device_needs(void *physical_device)
 } // namespace
 
 extern "C" const vio_upscale_provider vio_upscale_provider_ffx = {
+    VIO_UPSCALE_PLUGIN_ABI,
+    sizeof(vio_upscale_provider),
     VIO_UPSCALER_FSR3,
     "fsr3",
+    "",
     0,
     ffx_supported,
     ffx_create,

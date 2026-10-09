@@ -18,6 +18,7 @@
 #include "php.h"
 #include "php_ini.h"
 #include "vio_upscaler.h"
+#include "../../php_vio.h"
 #include "../../include/vio_backend.h"
 
 #include <math.h>
@@ -316,19 +317,155 @@ int64_t vio_upscale_host_bytes(void)
     return vio_upscale_host_total;
 }
 
+/* ── Plugins (include/vio_upscale_plugin.h) ─────────────────────────── */
+
+/* Messages of a plugin: errors / warnings as PHP warnings (the provider is
+ * called on the PHP thread), the rest on stderr when VIO_UPSCALE_PLUGIN_LOG is set. */
+static void vio_upscale_host_log(int level, const char *message)
+{
+    if (!message) return;
+    if (level <= VIO_UPSCALE_LOG_WARNING) {
+        php_error_docref(NULL, E_WARNING, "upscaler plugin: %s", message);
+        return;
+    }
+    const char *dbg = getenv("VIO_UPSCALE_PLUGIN_LOG");
+    if (dbg && dbg[0] && strcmp(dbg, "0") != 0) {
+        fprintf(stderr, "[vio upscaler plugin] %s\n", message);
+        fflush(stderr);
+    }
+}
+
+typedef struct _vio_upscale_plugin_slot {
+    int         id;              /* VIO_UPSCALER_* it provides */
+    const char *file;            /* library file name */
+    const char *ini_key;         /* explicit place (php.ini) */
+    const char *env_key;         /* explicit place (environment) */
+    void       *module;          /* loaded and accepted, kept for the process */
+    const vio_upscale_provider *provider;
+    char        path[1024];
+    vio_upscale_host_api host;
+} vio_upscale_plugin_slot;
+
+#if defined(_WIN32)
+#define VIO_DLSS_PLUGIN_FILE "vio_dlss.dll"
+#else
+#define VIO_DLSS_PLUGIN_FILE "libvio_dlss.so"
+#endif
+
+static vio_upscale_plugin_slot vio_upscale_plugins[] = {
+    { VIO_UPSCALER_DLSS, VIO_DLSS_PLUGIN_FILE, "vio.dlss_plugin_path", "VIO_DLSS_PLUGIN", NULL, NULL, "", { 0 } },
+};
+#define VIO_UPSCALE_PLUGIN_SLOTS ((int)(sizeof(vio_upscale_plugins) / sizeof(vio_upscale_plugins[0])))
+
+static vio_upscale_plugin_slot *vio_upscale_plugin_slot_of(int provider)
+{
+    for (int i = 0; i < VIO_UPSCALE_PLUGIN_SLOTS; i++) {
+        if (vio_upscale_plugins[i].id == provider) return &vio_upscale_plugins[i];
+    }
+    return NULL;
+}
+
+static void vio_upscale_unload(void *module)
+{
+    if (!module) return;
+#ifdef _WIN32
+    FreeLibrary((HMODULE)module);
+#else
+    dlclose(module);
+#endif
+}
+
+/* The slot's provider: loaded once and kept; a missing or refused library is
+ * looked for again on the next call (a game may set the path later, a test
+ * swaps it). NULL + reason, never a warning. */
+static const vio_upscale_provider *vio_upscale_plugin_load(vio_upscale_plugin_slot *s, char *reason, size_t reason_len)
+{
+    if (s->provider) return s->provider;
+    char path[1024], why[512];
+    void *m = vio_upscale_load_library(s->ini_key, s->env_key, s->file, path, sizeof(path), why, sizeof(why));
+    if (!m) {
+        snprintf(reason, reason_len, "%s", why);
+        return NULL;
+    }
+    vio_upscale_plugin_get_fn get = (vio_upscale_plugin_get_fn)vio_upscale_symbol(m, VIO_UPSCALE_PLUGIN_ENTRY);
+    if (!get) {
+        snprintf(reason, reason_len, "%s has no %s() - not a php-vio upscaler plugin", path, VIO_UPSCALE_PLUGIN_ENTRY);
+        vio_upscale_unload(m);
+        return NULL;
+    }
+    snprintf(s->path, sizeof(s->path), "%s", path);
+    memset(&s->host, 0, sizeof(s->host));
+    s->host.abi = VIO_UPSCALE_PLUGIN_ABI;
+    s->host.size = (uint32_t)sizeof(s->host);
+    s->host.host_version = PHP_VIO_VERSION;
+    s->host.plugin_path = s->path;
+    s->host.log = vio_upscale_host_log;
+    s->host.alloc = vio_upscale_host_alloc;
+    s->host.free = vio_upscale_host_free;
+    s->host.ini = vio_upscale_ini;
+    s->host.find_file = vio_upscale_find_file;
+    s->host.load_library = vio_upscale_load_library;
+    s->host.symbol = vio_upscale_symbol;
+
+    const vio_upscale_provider *p = get(VIO_UPSCALE_PLUGIN_ABI, &s->host);
+    if (!p) {
+        snprintf(reason, reason_len, "%s does not offer plugin ABI %d (php-vio %s) - it needs a php-vio it was built for",
+                 path, VIO_UPSCALE_PLUGIN_ABI, PHP_VIO_VERSION);
+    } else if (p->abi != VIO_UPSCALE_PLUGIN_ABI) {
+        snprintf(reason, reason_len, "%s was built for plugin ABI %u, php-vio %s has plugin ABI %d",
+                 path, (unsigned)p->abi, PHP_VIO_VERSION, VIO_UPSCALE_PLUGIN_ABI);
+    } else if (p->size < sizeof(vio_upscale_provider)) {
+        snprintf(reason, reason_len, "%s hands a provider table of %u bytes, plugin ABI %d has %u",
+                 path, (unsigned)p->size, VIO_UPSCALE_PLUGIN_ABI, (unsigned)sizeof(vio_upscale_provider));
+    } else if (p->id != s->id) {
+        snprintf(reason, reason_len, "%s provides '%s', not '%s'", path,
+                 vio_upscale_provider_name(p->id), vio_upscale_provider_name(s->id));
+    } else if (!p->supported || !p->create || !p->dispatch || !p->destroy) {
+        snprintf(reason, reason_len, "%s lacks supported / create / dispatch / destroy", path);
+    } else {
+        s->module = m;
+        s->provider = p;
+        return p;
+    }
+    s->path[0] = '\0';
+    vio_upscale_unload(m);
+    return NULL;
+}
+
+const char *vio_upscale_plugin_path(int provider)
+{
+    vio_upscale_plugin_slot *s = vio_upscale_plugin_slot_of(provider);
+    return s && s->provider ? s->path : "";
+}
+
 /* ── Providers ──────────────────────────────────────────────────────── */
+
+const vio_upscale_provider *vio_upscale_provider_resolve(int provider, char *reason, size_t reason_len)
+{
+    reason[0] = '\0';
+    vio_upscale_plugin_slot *s = vio_upscale_plugin_slot_of(provider);
+    if (s) return vio_upscale_plugin_load(s, reason, reason_len);
+    switch (provider) {
+        case VIO_UPSCALER_FSR3:
+#ifdef HAVE_FFX
+            return &vio_upscale_provider_ffx;
+#else
+            snprintf(reason, reason_len, "php-vio was built without FidelityFX (configure --with-ffx)");
+            return NULL;
+#endif
+        case VIO_UPSCALER_XESS:
+            snprintf(reason, reason_len, "php-vio has no XeSS provider yet");
+            return NULL;
+        default:
+            snprintf(reason, reason_len, "unknown upscaler provider %d", provider);
+            return NULL;
+    }
+}
 
 const vio_upscale_provider *vio_upscale_provider_get(int provider)
 {
-    switch (provider) {
-#ifdef HAVE_FFX
-        case VIO_UPSCALER_FSR3: return &vio_upscale_provider_ffx;
-#endif
-#ifdef HAVE_DLSS
-        case VIO_UPSCALER_DLSS: return &vio_upscale_provider_dlss;
-#endif
-        default: return NULL;
-    }
+    char reason[512];
+    return vio_upscale_provider_resolve(provider, reason, sizeof(reason));
 }
 
 unsigned vio_upscale_vk_device_needs(void *physical_device)
@@ -367,7 +504,9 @@ int vio_upscale_create_needs_commands(int provider)
 void vio_upscale_device_release(const vio_upscale_device *dev)
 {
     for (int p = 1; p <= VIO_UPSCALER_COUNT; p++) {
-        const vio_upscale_provider *pr = vio_upscale_provider_get(p);
+        /* Only what is loaded can hold device state: no plugin search at shutdown. */
+        vio_upscale_plugin_slot *s = vio_upscale_plugin_slot_of(p);
+        const vio_upscale_provider *pr = s ? s->provider : vio_upscale_provider_get(p);
         if (pr && pr->device_release) pr->device_release(dev);
     }
 }
@@ -380,22 +519,9 @@ typedef struct _vio_upscale_instance {
 
 int vio_upscale_supported_on(const vio_upscale_device *dev, int provider, char *reason, size_t reason_len, vio_upscale_query *q)
 {
-    const vio_upscale_provider *p = vio_upscale_provider_get(provider);
     if (q) memset(q, 0, sizeof(*q));
-    if (!p) {
-        switch (provider) {
-            case VIO_UPSCALER_FSR3:
-                snprintf(reason, reason_len, "php-vio was built without FidelityFX (configure --with-ffx)");
-                break;
-            case VIO_UPSCALER_DLSS:
-                snprintf(reason, reason_len, "php-vio was built without DLSS (configure --with-dlss=DIR)");
-                break;
-            default:
-                snprintf(reason, reason_len, "php-vio was built without XeSS");
-                break;
-        }
-        return 0;
-    }
+    const vio_upscale_provider *p = vio_upscale_provider_resolve(provider, reason, reason_len);
+    if (!p) return 0;
     vio_upscale_query tmp;
     return p->supported(dev, reason, reason_len, q ? q : &tmp);
 }

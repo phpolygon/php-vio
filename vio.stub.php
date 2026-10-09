@@ -1219,27 +1219,31 @@ function vio_upscale_info(VioContext $context): array {}
 
 /**
  * Native temporal upscalers on D3D12 and Vulkan (TEMPORAL-S3/S4):
- * AMD FidelityFX FSR 3.1 (VIO_UPSCALER_FSR3) and NVIDIA DLSS Super Resolution
- * through NGX (VIO_UPSCALER_DLSS, only in builds configured --with-dlss=DIR, on
- * NVIDIA RTX GPUs); VIO_UPSCALER_XESS is reserved. The provider's runtime library
- * (amd_fidelityfx_dx12.dll / amd_fidelityfx_vk.dll, nvngx_dlss.dll /
- * libnvidia-ngx-dlss.so - not shipped with php-vio, the game ships it) is looked
- * for on first use: from `vio.ffx_path` / VIO_FFX_PATH resp. `vio.dlss_path` /
- * VIO_DLSS_PATH when set (a directory or the file - then the only place
- * searched), otherwise next to the PHP executable, next to php_vio, then PATH.
- * Without it this returns false - never a warning; vio_upscaler_info()['reason']
- * says why. VIO_FEATURE_UPSCALER_NATIVE is set when any provider runs on the device.
- * DLSS identifies the application to NGX with `vio.dlss_project_id` (GUID-like)
- * and `vio.dlss_engine_version` (engine type CUSTOM).
+ * AMD FidelityFX FSR 3.1 (VIO_UPSCALER_FSR3, built in) and NVIDIA DLSS Super
+ * Resolution (VIO_UPSCALER_DLSS, NVIDIA RTX GPUs) - DLSS is not part of php-vio:
+ * it comes from a plugin library (vio_dlss.dll / libvio_dlss.so, the plugin ABI
+ * of include/vio_upscale_plugin.h) the game ships together with NVIDIA's
+ * nvngx_dlss.dll. VIO_UPSCALER_XESS is reserved. Libraries are looked for on
+ * first use: from `vio.ffx_path` / VIO_FFX_PATH (amd_fidelityfx_dx12.dll /
+ * amd_fidelityfx_vk.dll) resp. `vio.dlss_plugin_path` / VIO_DLSS_PLUGIN (the
+ * plugin) when set (a directory or the file - then the only place searched),
+ * otherwise next to the PHP executable, next to php_vio, then PATH; a plugin of
+ * another ABI is refused. Without them this returns false - never a warning;
+ * vio_upscaler_info()['reason'] says why. VIO_FEATURE_UPSCALER_NATIVE is set
+ * when any provider runs on the device. The DLSS plugin reads `vio.dlss_path`
+ * (where nvngx_dlss.dll is), `vio.dlss_project_id` (the game's GUID-like id)
+ * and `vio.dlss_engine_version`.
  */
 function vio_upscaler_supported(VioContext $context, int $provider = VIO_UPSCALER_FSR3): bool {}
 
 /**
  * State of a provider on this device: ['provider' => 'fsr3' | 'dlss', 'backend',
  * 'supported' => bool, 'reason' => why not ('' when supported; DLSS: missing
- * nvngx_dlss.dll, not an RTX GPU, driver too old with the version it needs),
- * 'version' (e.g. '3.1.4', DLSS '310.9.1'), 'driver' (graphics driver version
- * the provider checked, '' when none), 'library' (path loaded), 'device' (Vulkan
+ * plugin or plugin of another ABI, missing nvngx_dlss.dll, not an RTX GPU,
+ * driver too old with the version it needs), 'version' (e.g. '3.1.4', DLSS
+ * '310.9.1'), 'driver' (graphics driver version the provider checked, '' when
+ * none), 'library' (runtime loaded), 'plugin' (the plugin library the provider
+ * came from, '' when built in), 'device' (Vulkan
  * features / extensions device creation enabled for native upscalers), 'live'
  * (upscalers alive on the backend), 'host_bytes' (CPU memory the providers
  * hold)]. With a VioUpscaler also 'valid', 'quality', 'render_width',

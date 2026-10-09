@@ -11,9 +11,10 @@ ARG_WITH("harfbuzz", "for HarfBuzz (text shaping: Arabic, Thai, BiDi) support", 
 ARG_WITH("d3d11", "for Direct3D 11 support", "yes");
 ARG_WITH("d3d12", "for Direct3D 12 support", "yes");
 ARG_WITH("ffx", "for the AMD FidelityFX FSR 3.1 upscaler (amd_fidelityfx_*.dll loaded at run time, no link dependency)", "yes");
-ARG_WITH("dlss", "for the NVIDIA DLSS Super Resolution upscaler through NGX (DIR = the DLSS SDK, nvngx_dlss.dll ships with the game)", "no");
 
 if (PHP_VIO != "no") {
+
+    var vio_vulkan_include = "";   // set by the Vulkan detection below
 
     // ── Core source files ─────────────────────────────────────────────
     var vio_sources =
@@ -157,6 +158,7 @@ if (PHP_VIO != "no") {
         if (CHECK_HEADER_ADD_INCLUDE("vulkan/vulkan.h", "CFLAGS_VIO", PHP_VULKAN + "\\include")) {
             if (CHECK_LIB("vulkan-1.lib", "vio", PHP_VULKAN + "\\lib")) {
                 AC_DEFINE("HAVE_VULKAN", 1, "Whether Vulkan is available");
+                vio_vulkan_include = PHP_VULKAN + "\\include";
                 // The VMA wrapper guards its body with `#ifdef HAVE_VULKAN`, but it
                 // does not include php.h / config.h, so it never sees the AC_DEFINE.
                 // Pass the define explicitly so the wrapper's body is actually emitted.
@@ -271,37 +273,36 @@ if (PHP_VIO != "no") {
         ADD_FLAG("CFLAGS_VIO", "/DHAVE_FFX=1 /I" + configure_module_dirname + "\\vendor\\ffx-api\\include");
     }
 
-    // ── NVIDIA DLSS Super Resolution provider (TEMPORAL-S4) ─────────────
-    // NGX directly, against the DLSS SDK the option points at (its headers and
-    // the static NGX library are under the NVIDIA RTX SDK licence and are never
-    // part of php-vio). Off by default: without the option nothing of NGX is
-    // compiled and VIO_UPSCALER_DLSS reports "built without DLSS". The DLSS
-    // runtime nvngx_dlss.dll is loaded by NGX at run time (vio.dlss_path, next
-    // to php.exe / php_vio.dll, PATH) and ships with the game.
-    if (PHP_DLSS != "no") {
-        var dlss_dir = PHP_DLSS == "yes" ? "" : PHP_DLSS;
-        if (dlss_dir != "" && FSO.FileExists(dlss_dir + "\\include\\nvsdk_ngx.h")
-            && CHECK_LIB("nvsdk_ngx_d.lib", "vio", dlss_dir + "\\lib\\Windows_x86_64\\x64")
-            && CHECK_LIB("version.lib", "vio")) {
-            vio_sources += " src\\upscale\\vio_upscale_dlss.cpp src\\upscale\\vio_upscale_dlss_dx12.cpp src\\upscale\\vio_upscale_dlss_vk.cpp";
-            ADD_FLAG("CFLAGS_VIO", "/DHAVE_DLSS=1 /I\"" + dlss_dir + "\\include\"");
-        } else {
-            ERROR("--with-dlss=DIR: DIR must be the DLSS SDK (include\\nvsdk_ngx.h, lib\\Windows_x86_64\\x64\\nvsdk_ngx_d.lib)");
-        }
-    }
-
     // ── Register extension ────────────────────────────────────────────
     EXTENSION("vio",
         vio_sources,
         PHP_VIO_SHARED,
         vio_cflags);
 
+    // ── Test upscaler plugin (tests/render3d/235, 236) ──────────────────
+    // A provider behind the public plugin ABI (include/vio_upscale_plugin.h)
+    // that copies colour into the output: built next to php_vio.dll so the
+    // tests find it through extension_dir. Plain C, no library linked (D3D12
+    // through COM vtables, Vulkan through the host's vkGetDeviceProcAddr).
+    if (vio_vulkan_include != "") {
+        var vio_tp_src = configure_module_dirname + "\\tests\\upscale_plugin\\vio_test_upscaler.c";
+        var vio_tp_hdr = configure_module_dirname + "\\include\\vio_upscale_plugin.h";
+        MFO.WriteLine("$(BUILD_DIR)\\vio_test_upscaler.dll: " + vio_tp_src + " " + vio_tp_hdr);
+        MFO.WriteLine("\t@$(CC) /nologo /O2 /W3 /MD /LD /I\"" + vio_vulkan_include + "\" " + vio_tp_src
+                      + " /Fo$(BUILD_DIR)\\vio_test_upscaler.obj /Fe$(BUILD_DIR)\\vio_test_upscaler.dll /link /NOLOGO");
+        MFO.WriteBlankLines(1);
+        MFO.WriteLine("vio_test_upscaler.dll: $(BUILD_DIR)\\vio_test_upscaler.dll");
+        MFO.WriteBlankLines(1);
+        ADD_FLAG("EXT_TARGETS", "vio_test_upscaler.dll");
+    }
+
     PHP_INSTALL_HEADERS("ext/vio",
         "php_vio.h " +
         "include/vio_backend.h " +
         "include/vio_types.h " +
         "include/vio_constants.h " +
-        "include/vio_plugin.h"
+        "include/vio_plugin.h " +
+        "include/vio_upscale_plugin.h"
     );
 
     // Note: Metal backend is macOS-only, not compiled on Windows.

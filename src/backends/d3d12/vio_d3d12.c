@@ -7770,6 +7770,8 @@ static void d3d12_upscale_device(vio_upscale_device *dev)
     memset(dev, 0, sizeof(*dev));
     dev->api = VIO_UPSCALE_API_D3D12;
     dev->device = vio_d3d12.device;
+    /* WARP: providers that need a GPU say no (FSR 3.1 faults in WARP's JIT). */
+    dev->software_adapter = vio_d3d12.software_adapter;
 }
 
 static int d3d12_upscaler_supported(int provider, char *reason, size_t reason_len)
@@ -7778,18 +7780,10 @@ static int d3d12_upscaler_supported(int provider, char *reason, size_t reason_le
         snprintf(reason, reason_len, "no D3D12 device");
         return 0;
     }
-    /* WARP takes the FSR 3.1 context and dispatch, then faults while executing
-     * its compute passes (access violation in the WARP JIT, Windows 11 26200):
-     * native upscalers need a GPU. Headless contexts get one with
-     * 'headless_hardware' => true. A missing library is reported first. */
+    /* Whether WARP is enough is the provider's call (dev.software_adapter). */
     vio_upscale_device dev;
     d3d12_upscale_device(&dev);
-    if (!vio_upscale_supported_on(&dev, provider, reason, reason_len, NULL)) return 0;
-    if (vio_d3d12.software_adapter) {
-        snprintf(reason, reason_len, "native upscalers need a hardware GPU, not WARP (headless: 'headless_hardware' => true)");
-        return 0;
-    }
-    return 1;
+    return vio_upscale_supported_on(&dev, provider, reason, reason_len, NULL);
 }
 
 static int d3d12_upscaler_any(void)
@@ -7960,7 +7954,7 @@ static int d3d12_upscaler_dispatch(void *upscaler, const vio_upscale_dispatch_de
     vio_upscale_native_dispatch nd;
     memset(&nd, 0, sizeof(nd));
     nd.command_list = vio_d3d12.cmd_list;
-    nd.desc = d;
+    nd.params = &d->params;
     const vio_upscale_image *src[7] = { &d->color, &d->depth, &d->motion, &d->reactive, &d->transparency, &d->exposure, &d->output };
     vio_upscale_native_image *dst[7] = { &nd.color, &nd.depth, &nd.motion, &nd.reactive, &nd.transparency, &nd.exposure, &nd.output };
     static const char *names[7] = { "color", "depth", "motion", "reactive", "transparency", "exposure", "output" };

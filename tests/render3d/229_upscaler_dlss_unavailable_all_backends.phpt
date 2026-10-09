@@ -1,5 +1,5 @@
 --TEST--
-Native upscaler DLSS (VIO_UPSCALER_DLSS, TEMPORAL-S4) without its runtime: every backend reports supported = false with a reason (D3D12 / Vulkan name nvngx_dlss.dll or "built without DLSS") and no warning, vio_upscaler_render_size() is false without a warning, info() has its keys, create() refuses with a warning
+Native upscaler DLSS (VIO_UPSCALER_DLSS, TEMPORAL-S4) without its runtime: every backend reports supported = false with a reason (D3D12 / Vulkan name the missing plugin vio_dlss.dll / libvio_dlss.so or - with the plugin there - its runtime nvngx_dlss.dll) and no warning, vio_upscaler_render_size() is false without a warning, info() has its keys, create() refuses with a warning
 --EXTENSIONS--
 vio
 --INI--
@@ -9,8 +9,9 @@ vio.ffx_path={PWD}
 <?php
 /* vio.dlss_path points at the test directory, which holds no nvngx_dlss.dll:
  * an explicit path is the only place searched, so DLSS is missing on D3D12 /
- * Vulkan as well - also in a build with --with-dlss on an RTX GPU. Other
- * backends never have a native upscaler. Nothing may warn except create(). */
+ * Vulkan as well - also with the DLSS plugin installed on an RTX GPU. Without
+ * the plugin the reason names it. Other backends never have a native upscaler.
+ * Nothing may warn except create(). */
 echo function_exists('vio_upscaler_render_size') ? "render_size ok\n" : "FAIL no vio_upscaler_render_size\n";
 
 foreach (['null', 'opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
@@ -35,7 +36,7 @@ foreach (['null', 'opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
     if (($info['supported'] ?? null) !== false) $fail[] = "info supported";
     if (!is_string($info['reason'] ?? null) || $info['reason'] === '') $fail[] = "empty reason";
     if (in_array($b, ['d3d12', 'vulkan'], true) && PHP_OS_FAMILY !== 'Darwin'
-        && strpos($info['reason'], 'nvngx_dlss') === false && strpos($info['reason'], 'built without DLSS') === false
+        && strpos($info['reason'], 'nvngx_dlss') === false && strpos($info['reason'], 'vio_dlss') === false
         && strpos($info['reason'], 'not available') === false) {
         $fail[] = "reason: " . $info['reason'];
     }
