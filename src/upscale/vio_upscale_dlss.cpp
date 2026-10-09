@@ -271,6 +271,25 @@ NVSDK_NGX_PerfQuality_Value dlss_quality(int quality)
     }
 }
 
+/* 'preset' => letter to NGX's render preset. NGX's defaults (SDK 310.6) are the
+ * transformer presets - K for DLAA / Quality / Balanced, M for Performance, L
+ * for Ultra Performance - which cost on Turing 2-6x the CNN presets E / F
+ * (deprecated, still shipped); the programming guide's execution-time table,
+ * RTX 2080 Ti at 2560x1440: E/F 0.62 ms, J/K 1.80 ms, M 3.41 ms, L 5.45 ms.
+ * G, H, I, N, O are reserved. */
+int dlss_preset(char letter, unsigned int *out)
+{
+    switch (letter) {
+        case 'e': *out = NVSDK_NGX_DLSS_Hint_Render_Preset_E; return 1;
+        case 'f': *out = NVSDK_NGX_DLSS_Hint_Render_Preset_F; return 1;
+        case 'j': *out = NVSDK_NGX_DLSS_Hint_Render_Preset_J; return 1;
+        case 'k': *out = NVSDK_NGX_DLSS_Hint_Render_Preset_K; return 1;
+        case 'l': *out = NVSDK_NGX_DLSS_Hint_Render_Preset_L; return 1;
+        case 'm': *out = NVSDK_NGX_DLSS_Hint_Render_Preset_M; return 1;
+        default:  return 0;
+    }
+}
+
 const char *dlss_quality_name(int quality)
 {
     switch (quality) {
@@ -354,6 +373,11 @@ void *dlss_create(const vio_upscale_device *dev, const vio_upscale_create_desc *
     char lib[512];
     DlssDev *D = dlss_ready(dev, lib, sizeof(lib), reason, reason_len);
     if (!D) return nullptr;
+    unsigned int preset = NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
+    if (d->preset && !dlss_preset(d->preset, &preset)) {
+        snprintf(reason, reason_len, "DLSS has no preset '%c' (j, k, l, m; e and f are deprecated)", d->preset);
+        return nullptr;
+    }
     if (!dev->command_list) {
         snprintf(reason, reason_len, "no command list to create the DLSS feature on");
         return nullptr;
@@ -374,6 +398,15 @@ void *dlss_create(const vio_upscale_device *dev, const vio_upscale_create_desc *
     /* Free the feature's GPU memory on release, not at shutdown: resize and
      * settings changes create a new feature each time. */
     NVSDK_NGX_Parameter_SetI(c->params, NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
+    /* The model: NGX's default per mode unless the caller chose one. */
+    if (preset != NVSDK_NGX_DLSS_Hint_Render_Preset_Default) {
+        const char *const modes[] = {
+            NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+            NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
+            NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality,
+        };
+        for (const char *m : modes) NVSDK_NGX_Parameter_SetUI(c->params, m, preset);
+    }
     NVSDK_NGX_DLSS_Create_Params cp;
     memset(&cp, 0, sizeof(cp));
     cp.Feature.InWidth = (unsigned int)d->render_width;

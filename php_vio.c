@@ -7138,6 +7138,9 @@ ZEND_FUNCTION(vio_upscaler_info)
         add_assoc_long(return_value, "render_height", u->desc.render_height);
         add_assoc_long(return_value, "display_width", u->desc.display_width);
         add_assoc_long(return_value, "display_height", u->desc.display_height);
+        /* The model preset asked for, '' = the provider's default for the quality mode. */
+        char preset[2] = { u->desc.preset, '\0' };
+        add_assoc_string(return_value, "preset", preset);
         vio_upscale_query uq;
         memset(&uq, 0, sizeof(uq));
         uq.jitter_phases = vio_upscale_jitter_phases(u->desc.render_width, u->desc.display_width);
@@ -7157,7 +7160,7 @@ static int vio_upscaler_bool_opt(HashTable *ht, const char *key)
  * 'provider' => VIO_UPSCALER_FSR3, 'quality' => VIO_UPSCALE_QUALITY,
  * 'render_width' / 'render_height' (largest render size; default from quality),
  * 'hdr', 'depth_inverted', 'depth_infinite', 'auto_exposure',
- * 'dynamic_resolution', 'jittered_motion', 'debug' => bool]) */
+ * 'dynamic_resolution', 'jittered_motion', 'debug' => bool, 'preset' => letter]) */
 ZEND_FUNCTION(vio_upscaler_create)
 {
     zval *ctx_zval;
@@ -7216,6 +7219,16 @@ ZEND_FUNCTION(vio_upscaler_create)
     if (vio_upscaler_bool_opt(opts, "dynamic_resolution")) d.flags |= VIO_UPSCALE_FLAG_DYNAMIC_RES;
     if (vio_upscaler_bool_opt(opts, "jittered_motion"))    d.flags |= VIO_UPSCALE_FLAG_MV_JITTERED;
     if (vio_upscaler_bool_opt(opts, "debug"))              d.flags |= VIO_UPSCALE_FLAG_DEBUG;
+    /* The provider's model preset, one letter (DLSS: e, f, j, k, l, m); which
+     * letters exist is the provider's to say. */
+    if ((v = zend_hash_str_find(opts, "preset", sizeof("preset") - 1)) != NULL && Z_TYPE_P(v) != IS_NULL) {
+        if (Z_TYPE_P(v) != IS_STRING || Z_STRLEN_P(v) != 1
+            || !((Z_STRVAL_P(v)[0] >= 'a' && Z_STRVAL_P(v)[0] <= 'z') || (Z_STRVAL_P(v)[0] >= 'A' && Z_STRVAL_P(v)[0] <= 'Z'))) {
+            zend_argument_value_error(2, "'preset' must be one letter (the provider's model preset) or null");
+            RETURN_THROWS();
+        }
+        d.preset = (char)(Z_STRVAL_P(v)[0] | 0x20);
+    }
 
     char reason[512];
     if (!vio_upscaler_check(ctx, d.provider, reason, sizeof(reason)) || !ctx->backend->upscaler_create) {

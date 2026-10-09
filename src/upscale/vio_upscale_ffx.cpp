@@ -152,6 +152,10 @@ void *ffx_create(const vio_upscale_device *dev, const vio_upscale_create_desc *d
 {
     FfxLib *L = ffx_load(dev->api, reason, reason_len);
     if (!L) return nullptr;
+    if (d->preset) {
+        snprintf(reason, reason_len, "FSR 3.1 has no model presets ('preset' => '%c')", d->preset);
+        return nullptr;
+    }
     FfxCtx *c = new (std::nothrow) FfxCtx();
     if (!c) { snprintf(reason, reason_len, "out of memory"); return nullptr; }
     c->lib = L;

@@ -58,6 +58,7 @@ typedef struct _vio_upscale_create_desc {
     int      render_width, render_height;     /* largest render size dispatched */
     int      display_width, display_height;   /* output size */
     unsigned flags;
+    char     preset;                          /* the provider's model preset ('a'..'z'), 0 = its default */
 } vio_upscale_create_desc;
 
 /* A dispatch input / output: colour attachment `attachment` of a render target

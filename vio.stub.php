@@ -1244,8 +1244,9 @@ function vio_upscaler_supported(VioContext $context, int $provider = VIO_UPSCALE
  * (upscalers alive on the backend), 'host_bytes' (CPU memory the providers
  * hold)]. With a VioUpscaler also 'valid', 'quality', 'render_width',
  * 'render_height' (the size the provider chose for the quality mode - DLSS: NGX
- * optimal settings), 'display_width', 'display_height', 'jitter_phases' (length
- * of the jitter cycle) and 'gpu_memory' (bytes).
+ * optimal settings), 'display_width', 'display_height', 'preset' (the model
+ * preset asked for, '' = the provider's default), 'jitter_phases' (length of
+ * the jitter cycle) and 'gpu_memory' (bytes).
  */
 function vio_upscaler_info(VioContext $context, VioUpscaler|int $which = VIO_UPSCALER_FSR3): array {}
 
@@ -1261,6 +1262,15 @@ function vio_upscaler_info(VioContext $context, VioUpscaler|int $which = VIO_UPS
  *   'hdr' (linear HDR colour), 'depth_inverted' (1 = near), 'depth_infinite',
  *   'auto_exposure', 'dynamic_resolution', 'jittered_motion' (motion includes
  *   the jitter), 'debug' (the provider checks the API use; messages to stderr) => bool
+ *   'preset'     => one letter or null: the provider's model. DLSS: 'j' | 'k'
+ *                   (transformer), 'l' | 'm' (transformer for Ultra Performance /
+ *                   Performance), 'e' | 'f' (CNN, deprecated by NVIDIA); null = NGX's
+ *                   default per mode (SDK 310.6: K for DLAA / Quality / Balanced, M
+ *                   for Performance, L for Ultra Performance). The model is DLSS's
+ *                   cost: NVIDIA's table for an RTX 2080 Ti at 2560x1440 gives E/F
+ *                   0.62 ms, J/K 1.80 ms, M 3.41 ms, L 5.45 ms. A letter the provider
+ *                   does not have: false with a warning (FSR 3.1 has none);
+ *                   anything but one letter: ValueError.
  * False with a warning when the provider is not supported (see vio_upscaler_info).
  * Destroyed by unset() / vio_upscaler_destroy() / vio_destroy().
  */
