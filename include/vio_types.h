@@ -6,8 +6,11 @@
 #ifndef VIO_TYPES_H
 #define VIO_TYPES_H
 
-/* Maximum colour attachments of one render target (MRT). */
-#define VIO_MAX_COLOR_ATTACHMENTS 4
+/* Maximum colour attachments of one render target (MRT). Eight is the D3D11 /
+ * D3D12 / Metal limit and what desktop GL and Vulkan devices report; a Vulkan
+ * device with a lower maxColorAttachments refuses larger targets. A temporal
+ * G-buffer (colour planes + motion vectors + reactive mask) needs more than 4. */
+#define VIO_MAX_COLOR_ATTACHMENTS 8
 
 #include <stddef.h>
 #include <stdint.h>

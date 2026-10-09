@@ -1195,7 +1195,7 @@ static void opengl_destroy_render_target(void *rt_ptr)
         rt->gl_msaa_fbo = 0;
     }
     if (rt->gl_msaa_color_rb) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_color_rb); rt->gl_msaa_color_rb = 0; }
-    for (int i = 1; i < 4; i++)
+    for (int i = 1; i < VIO_MAX_COLOR_ATTACHMENTS; i++)
         if (rt->gl_msaa_color_rbs[i]) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_color_rbs[i]); rt->gl_msaa_color_rbs[i] = 0; }
     if (rt->gl_msaa_depth_rb) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_depth_rb); rt->gl_msaa_depth_rb = 0; }
     if (rt->gl_msaa_color_arr) { if (live) glDeleteTextures(1, &rt->gl_msaa_color_arr); rt->gl_msaa_color_arr = 0; }

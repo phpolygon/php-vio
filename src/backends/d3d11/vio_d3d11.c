@@ -1423,7 +1423,7 @@ static void d3d11_destroy_render_target(void *rt_ptr)
         ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_color_tex);
         rt->d3d11_msaa_color_tex = NULL;
     }
-    for (int i = 1; i < 4; i++) {
+    for (int i = 1; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
         if (rt->d3d11_msaa_color_texs[i]) { ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_color_texs[i]); rt->d3d11_msaa_color_texs[i] = NULL; }
     }
     if (rt->d3d11_msaa_dsv) { ID3D11DepthStencilView_Release((ID3D11DepthStencilView *)rt->d3d11_msaa_dsv); rt->d3d11_msaa_dsv = NULL; }
@@ -1498,7 +1498,7 @@ static void d3d11_rt_resolve_msaa(vio_render_target_object *rt)
     if (!rt->d3d11_msaa_color_tex || !rt->d3d11_color_tex || !rt->d3d11_msaa_dirty) return;
     /* Every attachment (A24: MRT targets are multisampled per attachment). */
     int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
-    for (int i = 0; i < n && i < 4; i++) {
+    for (int i = 0; i < n && i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
         void *ms = i == 0 ? rt->d3d11_msaa_color_tex : rt->d3d11_msaa_color_texs[i];
         if (!ms || !rt->d3d11_color_texs[i]) continue;
         ID3D11DeviceContext_ResolveSubresource(vio_d3d11.context,
@@ -1551,7 +1551,7 @@ static void d3d11_apply_render_target_bind(vio_render_target_object *rt)
         /* All colour attachments at once (MRT); index 0 == d3d11_rtv. */
         int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
         if (n > VIO_MAX_COLOR_ATTACHMENTS) n = VIO_MAX_COLOR_ATTACHMENTS;
-        ID3D11RenderTargetView *rtvs[VIO_MAX_COLOR_ATTACHMENTS] = { (ID3D11RenderTargetView *)rt->d3d11_rtv, NULL, NULL, NULL };
+        ID3D11RenderTargetView *rtvs[VIO_MAX_COLOR_ATTACHMENTS] = { (ID3D11RenderTargetView *)rt->d3d11_rtv };
         for (int ai = 1; ai < n; ai++) rtvs[ai] = (ID3D11RenderTargetView *)rt->d3d11_rtvs[ai];
         ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, (UINT)n, rtvs, dsv);
         vio_d3d11.current_rtv = rtvs[0];

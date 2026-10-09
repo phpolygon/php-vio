@@ -5453,7 +5453,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_LAYERED_RENDER: return vio_vk3d_available();        /* framebuffer with layers = N, gl_Layer in the GS */
         case VIO_FEATURE_VERTEX_LAYER:   return vio_vk3d_available() && vio_vk.device && vio_vk.vertex_layer_supported;
         case VIO_FEATURE_MULTI_VIEWPORT: return vio_vk3d_available() && vio_vk.device && vio_vk.max_viewports > 1;
-        case VIO_FEATURE_MRT:            return vio_vk3d_available(); /* up to 4 colour attachments (Block 10b) */
+        case VIO_FEATURE_MRT:            return vio_vk3d_available(); /* up to VIO_MAX_COLOR_ATTACHMENTS colour attachments (Block 10b) */
         case VIO_FEATURE_MIPMAP_GEN:     return vio_vk3d_available(); /* vkCmdBlitImage chain (Block 10b) */
         case VIO_FEATURE_TEXTURE_ARRAY:  return vio_vk3d_available(); /* 2D array views, stored chains (Block 10c) */
         case VIO_FEATURE_TEXTURE_COMPRESSION_BC: return vio_vk3d_available() && (!vio_vk.device || vio_vk.bc_supported); /* textureCompressionBC */

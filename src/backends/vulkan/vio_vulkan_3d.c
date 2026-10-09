@@ -78,7 +78,7 @@ typedef struct {
     VkCommandBuffer cmd;
     vk3d_frame      res;
     int             count, samples, has_depth;
-    VkFormat        formats[4];
+    VkFormat        formats[VIO_MAX_COLOR_ATTACHMENTS];
     uint32_t        view_mask, width, height;
     int             failed;          /* something could not be recorded: replay instead */
     int             released;        /* GPU objects freed at device shutdown, struct left for the PHP object */
@@ -1124,7 +1124,7 @@ void *vio_vk3d_begin_bundle(void)
     ai.level              = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
     ai.commandBufferCount = 1;
     if (vkAllocateCommandBuffers(vio_vk.device, &ai, &b->cmd) != VK_SUCCESS) { vk3d_bundle_free(b); return NULL; }
-    b->count     = vio_vk.cur_color_count > 4 ? 4 : vio_vk.cur_color_count;
+    b->count     = vio_vk.cur_color_count > VIO_MAX_COLOR_ATTACHMENTS ? VIO_MAX_COLOR_ATTACHMENTS : vio_vk.cur_color_count;
     for (int i = 0; i < b->count; i++) b->formats[i] = vio_vk.cur_color_formats[i];
     b->samples   = vio_vk.cur_samples;
     b->has_depth = vio_vk.cur_has_depth;

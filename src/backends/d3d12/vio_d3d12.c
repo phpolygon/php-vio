@@ -8977,7 +8977,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_FRAGMENT_STORAGE: return 1; /* pixel root UAVs u4..u7 */
         case VIO_FEATURE_SAMPLER_FEEDBACK_GLSL: return 1;
         case VIO_FEATURE_STORAGE_IMAGE:  return 1; /* texture UAV in the compute UAV table */
-        case VIO_FEATURE_MRT:            return 1; /* per-RT RTV heap with up to 4 descriptors, PSO 'attachments' */
+        case VIO_FEATURE_MRT:            return 1; /* per-RT RTV heap with up to VIO_MAX_COLOR_ATTACHMENTS descriptors, PSO 'attachments' */
         default:                       return 0;
     }
 }

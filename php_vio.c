@@ -11574,6 +11574,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_CUBE", VIO_FEATURE_RENDER_TARGET_CUBE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MIPMAP_GEN", VIO_FEATURE_MIPMAP_GEN, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MRT", VIO_FEATURE_MRT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_MAX_COLOR_ATTACHMENTS", VIO_MAX_COLOR_ATTACHMENTS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_RGBA8", VIO_FORMAT_RGBA8, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_RGBA16F", VIO_FORMAT_RGBA16F, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_RGBA32F", VIO_FORMAT_RGBA32F, CONST_CS | CONST_PERSISTENT);
@@ -12769,11 +12770,11 @@ ZEND_FUNCTION(vio_render_target)
     if ((val = zend_hash_str_find(config_ht, "hdr", sizeof("hdr") - 1)) != NULL) {
         hdr = zend_is_true(val);
     }
-    /* Colour attachments. 'attachments' => [VIO_FORMAT_*, ...] (1..4) enables
-     * MRT — fragment layout(location = i) out writes attachment i. Without it
-     * the classic single target is used, RGBA8 or RGBA16F via 'hdr'. */
+    /* Colour attachments. 'attachments' => [VIO_FORMAT_*, ...] (1..VIO_MAX_COLOR_ATTACHMENTS)
+     * enables MRT — fragment layout(location = i) out writes attachment i. Without
+     * it the classic single target is used, RGBA8 or RGBA16F via 'hdr'. */
     int attachment_count = 1;
-    int formats[VIO_MAX_COLOR_ATTACHMENTS] = { hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8, 0, 0, 0 };
+    int formats[VIO_MAX_COLOR_ATTACHMENTS] = { hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8 };
     if ((val = zend_hash_str_find(config_ht, "attachments", sizeof("attachments") - 1)) != NULL &&
         Z_TYPE_P(val) == IS_ARRAY) {
         int n = 0;

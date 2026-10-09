@@ -93,9 +93,9 @@ typedef struct _vio_vk_pass_att {
 } vio_vk_pass_att;
 
 typedef struct _vio_vk_pass {
-    int              count;              /* colour attachments, 0..4 */
-    vio_vk_pass_att  color[4];
-    VkFormat         color_format[4];
+    int              count;              /* colour attachments, 0..VIO_MAX_COLOR_ATTACHMENTS */
+    vio_vk_pass_att  color[VIO_MAX_COLOR_ATTACHMENTS];
+    VkFormat         color_format[VIO_MAX_COLOR_ATTACHMENTS];
     int              has_depth;
     vio_vk_pass_att  depth;
     int              samples;
@@ -115,13 +115,13 @@ typedef struct _vio_vk_rt {
     int            layers;         /* bindable layers: 6 (cube), N (array, 'layers' => N) or 1 */
     int            levels;         /* mip levels of the colour image */
     int            samples;        /* effective sample count (1 = off) */
-    VkFormat       color_format[4];
-    VkImage        color_image[4]; /* single-sample; the resolve target when MSAA */
-    void          *color_alloc[4];
-    VkImageView    color_view[4];
-    VkImage        msaa_image[4];
-    void          *msaa_alloc[4];
-    VkImageView    msaa_view[4];
+    VkFormat       color_format[VIO_MAX_COLOR_ATTACHMENTS];
+    VkImage        color_image[VIO_MAX_COLOR_ATTACHMENTS]; /* single-sample; the resolve target when MSAA */
+    void          *color_alloc[VIO_MAX_COLOR_ATTACHMENTS];
+    VkImageView    color_view[VIO_MAX_COLOR_ATTACHMENTS];
+    VkImage        msaa_image[VIO_MAX_COLOR_ATTACHMENTS];
+    void          *msaa_alloc[VIO_MAX_COLOR_ATTACHMENTS];
+    VkImageView    msaa_view[VIO_MAX_COLOR_ATTACHMENTS];
     VkImageView   *msaa_face_view; /* cube / array MSAA (A24): MS colour view per layer */
     VkImageView    msaa_all_view;  /* ... and over every layer (VIO_RT_ALL_LAYERS) */
     /* depth_only MSAA (A24): the multisampled depth drawn into, resolved into
@@ -149,7 +149,7 @@ typedef struct _vio_vk_rt {
     VkImageView   *dmip_src;
     VkDescriptorPool dmip_pool;
     VkDescriptorSet *dmip_set;
-    struct _vio_vulkan_texture *wrap[4];   /* sampling wrappers (vio_render_target_texture) */
+    struct _vio_vulkan_texture *wrap[VIO_MAX_COLOR_ATTACHMENTS];   /* sampling wrappers (vio_render_target_texture) */
     struct _vio_vulkan_texture *cube_wrap; /* vio_render_target_cubemap */
 } vio_vk_rt;
 
@@ -297,7 +297,7 @@ typedef struct _vio_vulkan_state {
     vio_vk_pass              cur_pass;
     uint32_t                 cur_view_mask;
     int                      cur_color_count;
-    VkFormat                 cur_color_formats[4];
+    VkFormat                 cur_color_formats[VIO_MAX_COLOR_ATTACHMENTS];
     int                      cur_samples;
     int                      cur_has_depth;
     uint32_t                 cur_width, cur_height;

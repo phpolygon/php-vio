@@ -2,7 +2,7 @@
  * php-vio - Vulkan render targets (GAP-PHASE5 Block 10b)
  *
  * One vio_vk_rt per vio_render_target_object (rt->vulkan_rt):
- *   - up to 4 colour attachments in any vio_pixel_format (RGBA8 = B8G8R8A8, the
+ *   - up to VIO_MAX_COLOR_ATTACHMENTS (8) colour attachments in any vio_pixel_format (RGBA8 = B8G8R8A8, the
  *     swapchain byte order, so the 2D pipelines stay compatible),
  *   - MSAA: multisampled colour + depth, resolved by the render pass into the
  *     single-sample images that are sampled and read back,
@@ -115,11 +115,11 @@ static void vkpass_transition(VkCommandBuffer cmd, VkImage img, const VkImageSub
 void vio_vk_pass_begin(VkCommandBuffer cmd, const vio_vk_pass *p)
 {
     if (!p || !vio_vk.fn_begin_rendering) return;
-    VkRenderingAttachmentInfo ca[4], da, sa;
+    VkRenderingAttachmentInfo ca[VIO_MAX_COLOR_ATTACHMENTS], da, sa;
     memset(ca, 0, sizeof(ca));
     memset(&da, 0, sizeof(da));
     memset(&sa, 0, sizeof(sa));
-    int count = p->count > 4 ? 4 : p->count;
+    int count = p->count > VIO_MAX_COLOR_ATTACHMENTS ? VIO_MAX_COLOR_ATTACHMENTS : p->count;
     for (int i = 0; i < count; i++) {
         const vio_vk_pass_att *a = &p->color[i];
         if (p->swapchain && i == 0) {
@@ -230,7 +230,7 @@ void vio_vk_pass_end(VkCommandBuffer cmd)
     ((PFN_vkCmdEndRendering)vio_vk.fn_end_rendering)(cmd);
     vio_vk.in_pass = 0;
     const vio_vk_pass *p = &vio_vk.cur_pass;
-    for (int i = 0; i < p->count && i < 4; i++) {
+    for (int i = 0; i < p->count && i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
         const vio_vk_pass_att *a = &p->color[i];
         vkpass_transition(cmd, a->image, &a->range, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, a->rest);
         if (a->resolve_view)
@@ -245,7 +245,7 @@ void vio_vk_pass_rendering_info(VkPipelineRenderingCreateInfo *info)
     memset(info, 0, sizeof(*info));
     info->sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     info->viewMask                = vio_vk.cur_view_mask;
-    info->colorAttachmentCount    = (uint32_t)(vio_vk.cur_color_count > 4 ? 4 : vio_vk.cur_color_count);
+    info->colorAttachmentCount    = (uint32_t)(vio_vk.cur_color_count > VIO_MAX_COLOR_ATTACHMENTS ? VIO_MAX_COLOR_ATTACHMENTS : vio_vk.cur_color_count);
     info->pColorAttachmentFormats = vio_vk.cur_color_formats;
     info->depthAttachmentFormat   = vio_vk.cur_has_depth ? vio_vk_depth_format() : VK_FORMAT_UNDEFINED;
     info->stencilAttachmentFormat = (vio_vk.cur_has_depth && vio_vk.depth_has_stencil) ? vio_vk_depth_format() : VK_FORMAT_UNDEFINED;
@@ -362,7 +362,7 @@ static void vkrt_free_wrapper(vio_vulkan_texture *w)
 static void vkrt_free(vio_vk_rt *x)
 {
     if (!x) return;
-    for (int i = 0; i < 4; i++) vkrt_free_wrapper(x->wrap[i]);
+    for (int i = 0; i < VIO_MAX_COLOR_ATTACHMENTS; i++) vkrt_free_wrapper(x->wrap[i]);
     vkrt_free_wrapper(x->cube_wrap);
     int faces = (x->layers > 0 ? x->layers : 1) * (x->levels > 0 ? x->levels : 1);
     if (x->face_view) for (int i = 0; i < faces; i++) vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->face_view[i], NULL);
@@ -376,7 +376,7 @@ static void vkrt_free(vio_vk_rt *x)
 
     vkrt_kill(VIO_VK_GRAVE_SAMPLER, (uint64_t)x->sampler, NULL);
     vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->cube_view, NULL);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
         vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->color_view[i], NULL);
         vkrt_kill(VIO_VK_GRAVE_IMAGE, (uint64_t)x->color_image[i], x->color_alloc[i]);
         vkrt_kill(VIO_VK_GRAVE_VIEW, (uint64_t)x->msaa_view[i], NULL);
@@ -694,7 +694,18 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
     if (!rt || !vio_vk.initialized || !vio_vk.device || width <= 0 || height <= 0) return -1;
     vio_vk_rt *x = (vio_vk_rt *)calloc(1, sizeof(vio_vk_rt));
     if (!x) return -1;
-    x->count   = depth_only ? 0 : (rt->attachment_count > 1 ? (rt->attachment_count > 4 ? 4 : rt->attachment_count) : 1);
+    x->count   = depth_only ? 0 : (rt->attachment_count > 1 ? (rt->attachment_count > VIO_MAX_COLOR_ATTACHMENTS ? VIO_MAX_COLOR_ATTACHMENTS : rt->attachment_count) : 1);
+    if (x->count > 4) {
+        /* 8 on every desktop driver; the spec minimum is 4. */
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(vio_vk.physical_device, &props);
+        if ((uint32_t)x->count > props.limits.maxColorAttachments) {
+            php_error_docref(NULL, E_WARNING, "Vulkan: %d colour attachments exceed the device limit of %u",
+                             x->count, props.limits.maxColorAttachments);
+            free(x);
+            return -1;
+        }
+    }
     x->cube    = rt->is_cube ? 1 : 0;
     x->layers  = vio_rt_layer_count(rt);
     int layered = x->layers > 1;
@@ -1110,10 +1121,10 @@ void vulkan_record_unbind_render_target(void)
 void vio_vk_clear_attachments(float r, float g, float b, float a)
 {
     if (!vio_vk.in_frame || !vio_vk.in_pass) return;
-    VkClearAttachment att[5];
+    VkClearAttachment att[VIO_MAX_COLOR_ATTACHMENTS + 1];
     uint32_t n = 0;
     memset(att, 0, sizeof(att));
-    for (int i = 0; i < vio_vk.cur_color_count && i < 4; i++) {
+    for (int i = 0; i < vio_vk.cur_color_count && i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
         att[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         att[n].colorAttachment = (uint32_t)i;
         att[n].clearValue.color.float32[0] = r;

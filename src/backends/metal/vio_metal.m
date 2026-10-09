@@ -1640,8 +1640,8 @@ static void metal_open_encoder(int load_clear)
         /* Colour attachments (one for the swapchain / classic RT, up to
          * VIO_MAX_COLOR_ATTACHMENTS for an MRT target) plus their MSAA resolve
          * partners. */
-        id<MTLTexture> color_targets[VIO_MAX_COLOR_ATTACHMENTS]  = {nil, nil, nil, nil};
-        id<MTLTexture> resolve_targets[VIO_MAX_COLOR_ATTACHMENTS] = {nil, nil, nil, nil};
+        id<MTLTexture> color_targets[VIO_MAX_COLOR_ATTACHMENTS]  = {nil};
+        id<MTLTexture> resolve_targets[VIO_MAX_COLOR_ATTACHMENTS] = {nil};
         int n_color = 0;
         NSUInteger cube_slice = 0, cube_level = 0, all_layers = 0;
         /* A layered target multisamples at level 0 only (A24). */
