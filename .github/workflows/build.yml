@@ -224,7 +224,10 @@ jobs:
             tests/render3d/225_rt_storage_compute_all_backends.phpt \
             tests/render3d/226_upscaler_unavailable_all_backends.phpt \
             tests/render3d/227_upscaler_fsr3_converges.phpt \
-            tests/render3d/228_upscaler_lifecycle_no_leak.phpt
+            tests/render3d/228_upscaler_lifecycle_no_leak.phpt \
+            tests/render3d/229_upscaler_dlss_unavailable_all_backends.phpt \
+            tests/render3d/230_upscaler_dlss_converges.phpt \
+            tests/render3d/231_upscaler_dlss_lifecycle_no_leak.phpt
 
       - name: Package binary
         run: |
@@ -446,7 +449,10 @@ jobs:
             tests/render3d/225_rt_storage_compute_all_backends.phpt \
             tests/render3d/226_upscaler_unavailable_all_backends.phpt \
             tests/render3d/227_upscaler_fsr3_converges.phpt \
-            tests/render3d/228_upscaler_lifecycle_no_leak.phpt
+            tests/render3d/228_upscaler_lifecycle_no_leak.phpt \
+            tests/render3d/229_upscaler_dlss_unavailable_all_backends.phpt \
+            tests/render3d/230_upscaler_dlss_converges.phpt \
+            tests/render3d/231_upscaler_dlss_lifecycle_no_leak.phpt
 
       - name: Package binary
         run: |
@@ -956,7 +962,10 @@ jobs:
             tests/render3d/225_rt_storage_compute_all_backends.phpt `
             tests/render3d/226_upscaler_unavailable_all_backends.phpt `
             tests/render3d/227_upscaler_fsr3_converges.phpt `
-            tests/render3d/228_upscaler_lifecycle_no_leak.phpt
+            tests/render3d/228_upscaler_lifecycle_no_leak.phpt `
+            tests/render3d/229_upscaler_dlss_unavailable_all_backends.phpt `
+            tests/render3d/230_upscaler_dlss_converges.phpt `
+            tests/render3d/231_upscaler_dlss_lifecycle_no_leak.phpt
 
       - name: Package binary
         shell: pwsh
