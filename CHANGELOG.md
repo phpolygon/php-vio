@@ -1,3 +1,28 @@
+# [2.32.0](https://github.com/phpolygon/php-vio/compare/v2.31.4...v2.32.0) (2026-10-09)
+
+
+### Bug Fixes
+
+* **metal:** map VIO_FORMAT_RGB10A2 render-target attachments to RGB10A2Unorm ([4c93cdb](https://github.com/phpolygon/php-vio/commit/4c93cdb38634d17454829d7ae653cc5371795899))
+* **upscale:** declare dladdr on glibc ([2bc698b](https://github.com/phpolygon/php-vio/commit/2bc698bce2fc1f434e5f7772dde88d9706ad1f7b))
+* **vulkan:** no sampler sees an attachment of the open pass; valid depth dummy ([b5d9520](https://github.com/phpolygon/php-vio/commit/b5d95203b0deb3a3fc7e055b9d3f3c4bfdba7774))
+
+
+### Features
+
+* **rt:** raw float readback of render-target attachments ([b2b6aa0](https://github.com/phpolygon/php-vio/commit/b2b6aa0cb8ff742ce84e87105f9333f0c35f90cc))
+* **rt:** render targets as compute storage images ('storage' => true) ([e47cbf2](https://github.com/phpolygon/php-vio/commit/e47cbf2e4de74d5faa8f5436197a4968ef2f5b86))
+* **rt:** sample the depth of a colour render target (VIO_RT_DEPTH) ([0c1356f](https://github.com/phpolygon/php-vio/commit/0c1356fb3e2a9a87b40644131053799315c5ed90))
+* **rt:** up to 8 colour attachments per render target ([497ad6e](https://github.com/phpolygon/php-vio/commit/497ad6e72b69890488040fb7a0f0148325561658))
+* **upscale:** AMD FidelityFX FSR 3.1 provider (--with-ffx) ([00994da](https://github.com/phpolygon/php-vio/commit/00994dacbc6528565bb477f2156f0040c468f445))
+* **upscale:** choose the DLSS model ('preset' => letter) ([bb8ea41](https://github.com/phpolygon/php-vio/commit/bb8ea41c8b5a03feae4b78d8f4575337b68a3017))
+* **upscale:** load DLSS from the vio_dlss plugin, no NVIDIA code in php-vio ([a44ca43](https://github.com/phpolygon/php-vio/commit/a44ca432287d31eaa40682edf9bbb3cc3ea6e824))
+* **upscale:** native upscaler API and provider abstraction ([10dfb6e](https://github.com/phpolygon/php-vio/commit/10dfb6e772f70bda2f4e70c15dba9dc46bae8d39))
+* **upscale:** NVIDIA DLSS Super Resolution through NGX (--with-dlss=DIR) ([c15d652](https://github.com/phpolygon/php-vio/commit/c15d6529423ead818c12e9dbcb522feddb622604))
+* **upscale:** provider-chosen render size, device release and Vulkan extension hooks ([e8d8b50](https://github.com/phpolygon/php-vio/commit/e8d8b50c94e81f06b0e97467d992c7eaa51f47b6))
+* **upscale:** versioned C ABI for upscaler plugins (include/vio_upscale_plugin.h) ([837e965](https://github.com/phpolygon/php-vio/commit/837e9657def080cf100e79e0b7dcbeaef8821be7))
+* **vulkan:** enable what native upscaler runtimes use at device creation ([fef80fc](https://github.com/phpolygon/php-vio/commit/fef80fcce0a0981639f97e3307a7d596c35a014e))
+
 ## [2.31.4](https://github.com/phpolygon/php-vio/compare/v2.31.3...v2.31.4) (2026-10-08)
 
 
