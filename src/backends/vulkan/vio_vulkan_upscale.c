@@ -34,6 +34,7 @@ static void vk_upscale_device(vio_upscale_device *dev)
     dev->physical_device = (void *)vio_vk.physical_device;
     dev->instance = (void *)vio_vk.instance;
     dev->get_device_proc_addr = (void *)vkGetDeviceProcAddr;
+    dev->get_instance_proc_addr = (void *)vkGetInstanceProcAddr;
 }
 
 int vulkan_upscaler_supported(int provider, char *reason, size_t reason_len)
@@ -60,11 +61,42 @@ int vulkan_upscaler_any(void)
     return 0;
 }
 
+int vulkan_upscaler_render_size(int provider, int quality, int display_w, int display_h,
+                                int *render_w, int *render_h, char *reason, size_t reason_len)
+{
+    *render_w = *render_h = 0;
+    if (!vulkan_upscaler_supported(provider, reason, reason_len)) return 0;
+    vio_upscale_device dev;
+    vk_upscale_device(&dev);
+    return vio_upscale_render_size_on(&dev, provider, quality, display_w, display_h, render_w, render_h, reason, reason_len);
+}
+
+/* A provider that records at creation (DLSS: NGX CreateFeature) gets a
+ * transient command buffer, submitted and waited for here - the frame's
+ * command buffer (and its open pass) stays untouched. */
 void *vulkan_upscaler_create(const vio_upscale_create_desc *desc, char *reason, size_t reason_len)
 {
     vio_upscale_device dev;
     vk_upscale_device(&dev);
-    return vio_upscale_create_on(&dev, desc, reason, reason_len);
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vio_upscale_create_needs_commands(desc->provider)) {
+        if (vio_vk_transient_begin(&cmd) != 0) {
+            snprintf(reason, reason_len, "could not open a command buffer for the upscaler");
+            return NULL;
+        }
+        dev.command_list = (void *)cmd;
+    }
+    void *u = vio_upscale_create_on(&dev, desc, reason, reason_len);
+    if (cmd != VK_NULL_HANDLE) vio_vk_transient_submit(cmd);
+    return u;
+}
+
+void vulkan_upscale_device_release(void)
+{
+    if (!vio_vk.device) return;
+    vio_upscale_device dev;
+    vk_upscale_device(&dev);
+    vio_upscale_device_release(&dev);
 }
 
 int vulkan_upscaler_query(void *upscaler, int provider, vio_upscale_query *q)
@@ -104,6 +136,9 @@ int vulkan_upscaler_device_requirements(int provider, char *out, size_t out_len)
         if (w < 0 || (size_t)w >= out_len - len) break;
         len += (size_t)w;
     }
+    if (vio_vk.upscale_extensions[0] && len < out_len) {
+        snprintf(out + len, out_len - len, "%s%s", len ? "," : "", vio_vk.upscale_extensions);
+    }
     return 0;
 }
 
@@ -126,6 +161,7 @@ static int vk_upscale_image(const vio_upscale_image *in, vio_upscale_native_imag
             return -1;
         }
         out->handle = (void *)x->depth_image;
+        out->view = (void *)x->depth_view;
         out->format = (uint32_t)vio_vk_depth_format();
         out->depth = 1;
         out->stencil = vio_vk.depth_has_stencil;
@@ -137,6 +173,7 @@ static int vk_upscale_image(const vio_upscale_image *in, vio_upscale_native_imag
         return -1;
     }
     out->handle = (void *)x->color_image[in->attachment];
+    out->view = (void *)x->color_view[in->attachment];
     out->format = (uint32_t)x->color_format[in->attachment];
     out->storage = x->storage;
     out->state = x->storage ? VIO_UPSCALE_STATE_GENERAL : VIO_UPSCALE_STATE_SHADER_READ;
@@ -177,12 +214,13 @@ int vulkan_upscaler_dispatch(void *upscaler, const vio_upscale_dispatch_desc *d,
     vio_vk_pass_end(cmd);
 
     /* Everything recorded so far (draws into the inputs, earlier compute) before
-     * the provider's compute passes. */
+     * the provider's work - its compute passes and also its own clears / copies
+     * (DLSS clears its history with vkCmdClearColorImage), so every stage. */
     VkMemoryBarrier pre = {0};
     pre.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     pre.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     pre.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                             1, &pre, 0, NULL, 0, NULL);
     VkImageAspectFlags da = VK_IMAGE_ASPECT_DEPTH_BIT | (vio_vk.depth_has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     if (nd.depth.handle) {
@@ -201,7 +239,7 @@ int vulkan_upscaler_dispatch(void *upscaler, const vio_upscale_dispatch_desc *d,
     post.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     post.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     post.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+    vio_vk_pipeline_barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                             1, &post, 0, NULL, 0, NULL);
 
     if (had_pass) {

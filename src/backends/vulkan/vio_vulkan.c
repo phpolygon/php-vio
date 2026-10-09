@@ -123,15 +123,19 @@ static int create_instance(int debug)
 
     /* Build extension list */
     uint32_t ext_count = glfw_ext_count;
-    const char *extra_exts[4];
+    const char *extra_exts[24];
     uint32_t extra_count = 0;
 
     if (debug) {
         extra_exts[extra_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     }
-    /* HDR10 colour spaces for the swapchain (Block 10d), when the loader has them. */
+    /* HDR10 colour spaces for the swapchain (Block 10d), when the loader has them.
+     * Native upscalers (TEMPORAL-S4, DLSS through NGX) name instance extensions
+     * they need when their runtime is present; enabled when the loader offers them. */
     vio_vk.colorspace_ext = 0;
     {
+        const char *ups_exts[16];
+        int ups_count = vio_upscale_vk_extensions(NULL, ups_exts, 16);
         uint32_t n = 0;
         vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
         VkExtensionProperties *props = n ? (VkExtensionProperties *)malloc(n * sizeof(VkExtensionProperties)) : NULL;
@@ -140,9 +144,16 @@ static int create_instance(int debug)
             for (uint32_t i = 0; i < n; i++) {
                 if (strcmp(props[i].extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0) vio_vk.colorspace_ext = 1;
             }
+            if (vio_vk.colorspace_ext) extra_exts[extra_count++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
+            for (int u = 0; u < ups_count && extra_count < 20; u++) {
+                int offered = 0, dup = 0;
+                for (uint32_t i = 0; i < n; i++) if (strcmp(props[i].extensionName, ups_exts[u]) == 0) offered = 1;
+                for (uint32_t i = 0; i < glfw_ext_count; i++) if (strcmp(glfw_extensions[i], ups_exts[u]) == 0) dup = 1;
+                for (uint32_t i = 0; i < extra_count; i++) if (strcmp(extra_exts[i], ups_exts[u]) == 0) dup = 1;
+                if (offered && !dup) extra_exts[extra_count++] = ups_exts[u];
+            }
             free(props);
         }
-        if (vio_vk.colorspace_ext) extra_exts[extra_count++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
     }
 #ifdef __APPLE__
     /* MoltenVK requires the portability enumeration extension + flag */
@@ -1004,6 +1015,59 @@ static int create_logical_device(void)
         if (has_amd_marker) VIO_VK_ADD_DEVICE_EXT("VK_AMD_buffer_marker");
     }
 
+    /* Native upscalers by extension name (TEMPORAL-S4, DLSS through NGX:
+     * VK_NVX_binary_import, VK_NVX_image_view_handle, VK_KHR_push_descriptor and
+     * buffer device addresses), when their runtime is present and the device
+     * offers them. VK_EXT_ and VK_KHR_buffer_device_address exclude each other:
+     * the KHR one (core in 1.2) is used - already on with ray query, else enabled
+     * here with its feature; the EXT one only where KHR is not offered. */
+    vio_vk.upscale_extensions[0] = '\0';
+    VkPhysicalDeviceBufferDeviceAddressFeaturesKHR ups_bda = {0};
+    ups_bda.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
+    int ups_bda_chain = 0;
+    {
+        const char *ups_dev[16];
+        int ups_n = vio_upscale_vk_extensions((void *)vio_vk.physical_device, ups_dev, 16);
+        if (ups_n > 0) {
+            uint32_t on = 0;
+            vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &on, NULL);
+            VkExtensionProperties *offer = on ? (VkExtensionProperties *)malloc(on * sizeof(VkExtensionProperties)) : NULL;
+            if (offer) vkEnumerateDeviceExtensionProperties(vio_vk.physical_device, NULL, &on, offer);
+            size_t ul = 0;
+            for (int u = 0; u < ups_n && offer; u++) {
+                const char *name = ups_dev[u];
+                int is_bda = strcmp(name, "VK_EXT_buffer_device_address") == 0 || strcmp(name, "VK_KHR_buffer_device_address") == 0;
+                const char *use = name;
+                if (is_bda) {
+                    if (vio_vk.ray_query_supported) use = "VK_KHR_buffer_device_address";   /* enabled with its feature */
+                    else if (has_bda) use = "VK_KHR_buffer_device_address";
+                    else use = "VK_EXT_buffer_device_address";
+                }
+                int offered = 0;
+                for (uint32_t i = 0; i < on; i++) if (strcmp(offer[i].extensionName, use) == 0) offered = 1;
+                if (!offered) continue;
+                if (is_bda && !vio_vk.ray_query_supported && !ups_bda_chain) {
+                    VkPhysicalDeviceBufferDeviceAddressFeaturesKHR bda_a = {0};
+                    bda_a.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;   /* EXT shares the layout */
+                    VkPhysicalDeviceFeatures2 bf2 = {0};
+                    bf2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                    bf2.pNext = &bda_a;
+                    vkGetPhysicalDeviceFeatures2(vio_vk.physical_device, &bf2);
+                    if (!bda_a.bufferDeviceAddress) continue;
+                    ups_bda.bufferDeviceAddress = VK_TRUE;
+                    if (strcmp(use, "VK_EXT_buffer_device_address") == 0) {
+                        ups_bda.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT;
+                    }
+                    ups_bda_chain = 1;
+                }
+                VIO_VK_ADD_DEVICE_EXT(use);
+                int w = snprintf(vio_vk.upscale_extensions + ul, sizeof(vio_vk.upscale_extensions) - ul, "%s%s", ul ? "," : "", use);
+                if (w > 0 && (size_t)w < sizeof(vio_vk.upscale_extensions) - ul) ul += (size_t)w;
+            }
+            free(offer);
+        }
+    }
+
     VkDeviceCreateInfo create_info = {0};
     create_info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     create_info.queueCreateInfoCount    = unique_count;
@@ -1057,6 +1121,7 @@ static int create_logical_device(void)
     if (ups_ssc_chain) { ups_ssc.pNext = feature_chain; feature_chain = &ups_ssc; }
     if (ups_s16_chain) { ups_s16.pNext = feature_chain; feature_chain = &ups_s16; }
     if (ups_sep_chain) { ups_sep.pNext = feature_chain; feature_chain = &ups_sep; }
+    if (ups_bda_chain) { ups_bda.pNext = feature_chain; feature_chain = &ups_bda; }
     /* VULKAN-MODERN-PLAN: the three required features (checked at selection). */
     VkPhysicalDeviceTimelineSemaphoreFeatures tl_enable = {0};
     tl_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
@@ -2073,6 +2138,8 @@ static void vulkan_shutdown(void)
     /* Only touch the device/queues if a device exists. */
     if (vio_vk.device) {
         vkDeviceWaitIdle(vio_vk.device);
+        /* Upscaler providers keep per-device state (DLSS: the NGX instance). */
+        vulkan_upscale_device_release();
     }
     vio_vk3d_shutdown();
     vio_vk_depth_mip_shutdown();
@@ -2429,6 +2496,17 @@ static int vulkan_submit_transient_commands(VkCommandPool pool, VkCommandBuffer 
     }
     vkFreeCommandBuffers(vio_vk.device, vio_vk.transient_pool, 1, &cmd);
     return rc;
+}
+
+int vio_vk_transient_begin(VkCommandBuffer *out_cmd)
+{
+    VkCommandPool pool;
+    return vulkan_begin_transient_commands(&pool, out_cmd);
+}
+
+int vio_vk_transient_submit(VkCommandBuffer cmd)
+{
+    return vulkan_submit_transient_commands(vio_vk.transient_pool, cmd);
 }
 
 /* ── Inline ray tracing (VIO_FEATURE_RAY_QUERY) ─────────────────────
@@ -5627,6 +5705,7 @@ static const vio_backend vulkan_backend = {
     .upscaler_query               = vulkan_upscaler_query,
     .upscaler_destroy             = vulkan_upscaler_destroy,
     .upscaler_device_requirements = vulkan_upscaler_device_requirements,
+    .upscaler_render_size         = vulkan_upscaler_render_size,
     .shading_rate_tile_size = vulkan_shading_rate_tile_size,
     .swapchain_info    = vulkan_swapchain_info,
     .bindless_set      = vulkan_bindless_set,

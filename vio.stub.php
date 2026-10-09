@@ -1218,36 +1218,45 @@ function vio_upscale_jitter(int $frame, int $phases = 8): array {}
 function vio_upscale_info(VioContext $context): array {}
 
 /**
- * Native temporal upscalers (TEMPORAL-S3): AMD FidelityFX FSR 3.1
- * (VIO_UPSCALER_FSR3) on D3D12 and Vulkan; VIO_UPSCALER_DLSS / VIO_UPSCALER_XESS
- * are reserved for further providers. The provider's runtime library
- * (amd_fidelityfx_dx12.dll / amd_fidelityfx_vk.dll, not shipped with php-vio)
- * is loaded on first use: from `vio.ffx_path` / VIO_FFX_PATH when set (a
- * directory or the file - then the only place searched), otherwise next to the
- * PHP executable, next to php_vio, then PATH. Without it this returns false -
- * never a warning; vio_upscaler_info()['reason'] says why.
- * VIO_FEATURE_UPSCALER_NATIVE is set when any provider runs on the device.
+ * Native temporal upscalers on D3D12 and Vulkan (TEMPORAL-S3/S4):
+ * AMD FidelityFX FSR 3.1 (VIO_UPSCALER_FSR3) and NVIDIA DLSS Super Resolution
+ * through NGX (VIO_UPSCALER_DLSS, only in builds configured --with-dlss=DIR, on
+ * NVIDIA RTX GPUs); VIO_UPSCALER_XESS is reserved. The provider's runtime library
+ * (amd_fidelityfx_dx12.dll / amd_fidelityfx_vk.dll, nvngx_dlss.dll /
+ * libnvidia-ngx-dlss.so - not shipped with php-vio, the game ships it) is looked
+ * for on first use: from `vio.ffx_path` / VIO_FFX_PATH resp. `vio.dlss_path` /
+ * VIO_DLSS_PATH when set (a directory or the file - then the only place
+ * searched), otherwise next to the PHP executable, next to php_vio, then PATH.
+ * Without it this returns false - never a warning; vio_upscaler_info()['reason']
+ * says why. VIO_FEATURE_UPSCALER_NATIVE is set when any provider runs on the device.
+ * DLSS identifies the application to NGX with `vio.dlss_project_id` (GUID-like)
+ * and `vio.dlss_engine_version` (engine type CUSTOM).
  */
 function vio_upscaler_supported(VioContext $context, int $provider = VIO_UPSCALER_FSR3): bool {}
 
 /**
- * State of a provider on this device: ['provider' => 'fsr3', 'backend',
- * 'supported' => bool, 'reason' => why not ('' when supported), 'version'
- * (e.g. 'FSR 3.1.4'), 'library' (path loaded), 'device' (Vulkan features device
- * creation enabled for it), 'live' (upscalers alive on the backend),
- * 'host_bytes' (CPU memory the providers hold)]. With a VioUpscaler also
- * 'valid', 'quality', 'render_width', 'render_height', 'display_width',
- * 'display_height', 'jitter_phases' (length of the jitter cycle) and
- * 'gpu_memory' (bytes).
+ * State of a provider on this device: ['provider' => 'fsr3' | 'dlss', 'backend',
+ * 'supported' => bool, 'reason' => why not ('' when supported; DLSS: missing
+ * nvngx_dlss.dll, not an RTX GPU, driver too old with the version it needs),
+ * 'version' (e.g. '3.1.4', DLSS '310.9.1'), 'driver' (graphics driver version
+ * the provider checked, '' when none), 'library' (path loaded), 'device' (Vulkan
+ * features / extensions device creation enabled for native upscalers), 'live'
+ * (upscalers alive on the backend), 'host_bytes' (CPU memory the providers
+ * hold)]. With a VioUpscaler also 'valid', 'quality', 'render_width',
+ * 'render_height' (the size the provider chose for the quality mode - DLSS: NGX
+ * optimal settings), 'display_width', 'display_height', 'jitter_phases' (length
+ * of the jitter cycle) and 'gpu_memory' (bytes).
  */
 function vio_upscaler_info(VioContext $context, VioUpscaler|int $which = VIO_UPSCALER_FSR3): array {}
 
 /**
  * Create an upscaler context. Options:
  *   'display_width', 'display_height' (required): output size
- *   'provider'   => VIO_UPSCALER_FSR3
- *   'quality'    => VIO_UPSCALE_NATIVE_AA (1.0) | QUALITY (1.5, default) | BALANCED (1.7) |
- *                   PERFORMANCE (2.0) | ULTRA_PERFORMANCE (3.0): display / render per axis
+ *   'provider'   => VIO_UPSCALER_FSR3 | VIO_UPSCALER_DLSS
+ *   'quality'    => VIO_UPSCALE_NATIVE_AA (1.0; DLSS: DLAA) | QUALITY (1.5, default) |
+ *                   BALANCED (1.7) | PERFORMANCE (2.0) | ULTRA_PERFORMANCE (3.0): display /
+ *                   render per axis for FSR; DLSS takes NGX's optimal render size
+ *                   (vio_upscaler_render_size)
  *   'render_width', 'render_height': largest render size (default from the quality)
  *   'hdr' (linear HDR colour), 'depth_inverted' (1 = near), 'depth_infinite',
  *   'auto_exposure', 'dynamic_resolution', 'jittered_motion' (motion includes
@@ -1282,6 +1291,16 @@ function vio_upscaler_dispatch(VioContext $context, VioUpscaler $upscaler, array
 
 /** Destroy an upscaler now (waits for the GPU work that uses it). */
 function vio_upscaler_destroy(VioUpscaler $upscaler): void {}
+
+/**
+ * The render size a provider wants for a quality mode at a display size on this
+ * device, before creating an upscaler: ['width' => , 'height' => ]. DLSS asks
+ * NGX for its optimal settings (VIO_UPSCALE_NATIVE_AA = DLAA, the display size);
+ * FSR 3.1 uses its fixed ratios. False when the provider is not usable here or
+ * does not offer the mode at that size - never a warning. vio_upscaler_create
+ * without 'render_width' / 'render_height' uses the same size.
+ */
+function vio_upscaler_render_size(VioContext $context, int $provider, int $quality, int $display_width, int $display_height): array|false {}
 /**
  * Get the name of the backend in use.
  */

@@ -290,10 +290,14 @@ unsigned ffx_vk_device_needs(void *physical_device)
 extern "C" const vio_upscale_provider vio_upscale_provider_ffx = {
     VIO_UPSCALER_FSR3,
     "fsr3",
+    0,
     ffx_supported,
     ffx_create,
     ffx_dispatch,
     ffx_query,
     ffx_destroy,
     ffx_vk_device_needs,
+    nullptr,   /* render_size: the fixed FSR ratios */
+    nullptr,   /* device_release: nothing per device */
+    nullptr,   /* vk_extensions: chosen through vk_device_needs */
 };

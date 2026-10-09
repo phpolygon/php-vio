@@ -565,6 +565,12 @@ typedef struct _vio_backend {
     int   (*upscaler_query)(void *upscaler, int provider, struct _vio_upscale_query *out);
     void  (*upscaler_destroy)(void *upscaler);
     int   (*upscaler_device_requirements)(int provider, char *out, size_t out_len);
+    /* TEMPORAL-S4, optional: the render size `provider` wants for `quality` at
+     * the display size on the open device (DLSS: NGX optimal settings, FSR: its
+     * fixed ratios). 1 = filled; 0 = provider not usable / mode not offered,
+     * reason filled, no warning. upscaler_create with render size 0 uses it. */
+    int   (*upscaler_render_size)(int provider, int quality, int display_w, int display_h,
+                                  int *render_w, int *render_h, char *reason, size_t reason_len);
 } vio_backend;
 
 #define VIO_MAX_FRAGMENT_STORAGE 4

@@ -80,6 +80,8 @@ foreach (['d3d12', 'vulkan'] as $b) {
     $info = vio_upscaler_info($ctx, $up);
     [$RW, $RH] = [$info['render_width'], $info['render_height']];
     if ([$RW, $RH] !== [32, 32]) $fail[] = "render size {$RW}x{$RH}";
+    $rs = vio_upscaler_render_size($ctx, VIO_UPSCALER_FSR3, VIO_UPSCALE_PERFORMANCE, DW, DH);
+    if ($rs !== ['width' => 32, 'height' => 32]) $fail[] = "vio_upscaler_render_size " . json_encode($rs);
     if ($info['jitter_phases'] !== 32) $fail[] = "jitter phases {$info['jitter_phases']}";
     if (!preg_match('/^\d+\.\d+/', $info['version']) || $info['library'] === '') $fail[] = "version/library " . json_encode([$info['version'], $info['library']]);
     if (vio_supports_feature($ctx, VIO_FEATURE_UPSCALER_NATIVE) !== true) $fail[] = "feature flag";

@@ -561,6 +561,14 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscaler_destroy, 0, 1, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, upscaler, VioUpscaler, 0)
 ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_upscaler_render_size, 0, 5, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, provider, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, quality, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, display_width, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, display_height, IS_LONG, 0)
+ZEND_END_ARG_INFO()
 /* ── 2D API functions ────────────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_rect, 0, 5, IS_VOID, 0)
@@ -1207,6 +1215,7 @@ ZEND_FUNCTION(vio_upscaler_info);
 ZEND_FUNCTION(vio_upscaler_create);
 ZEND_FUNCTION(vio_upscaler_dispatch);
 ZEND_FUNCTION(vio_upscaler_destroy);
+ZEND_FUNCTION(vio_upscaler_render_size);
 ZEND_FUNCTION(vio_shader_reflect);
 ZEND_FUNCTION(vio_audio_load);
 ZEND_FUNCTION(vio_audio_play);
@@ -1417,6 +1426,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_upscaler_create, arginfo_vio_upscaler_create)
 	ZEND_FE(vio_upscaler_dispatch, arginfo_vio_upscaler_dispatch)
 	ZEND_FE(vio_upscaler_destroy, arginfo_vio_upscaler_destroy)
+	ZEND_FE(vio_upscaler_render_size, arginfo_vio_upscaler_render_size)
 	ZEND_FE(vio_shader_reflect, arginfo_vio_shader_reflect)
 	ZEND_FE(vio_audio_load, arginfo_vio_audio_load)
 	ZEND_FE(vio_audio_play, arginfo_vio_audio_play)

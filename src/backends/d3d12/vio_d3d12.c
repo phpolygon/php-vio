@@ -975,6 +975,7 @@ static int d3d12_create_depth_buffer(int width, int height)
 /* ── Lifecycle ────────────────────────────────────────────────────── */
 
 static void d3d12_shutdown(void);
+static void d3d12_upscale_device_release(void);   /* native upscalers (TEMPORAL-S4) */
 static void d3d12_retire_uploads(int force);   /* upload queue, defined with the texture helpers */
 static int  d3d12_upload_buffer_region(ID3D12Resource *dst, const void *data, size_t size);
 static int  d3d12_upload_buffer_at(ID3D12Resource *dst, UINT64 offset, const void *data, size_t size);
@@ -1827,6 +1828,8 @@ static void d3d12_shutdown(void)
     /* Wait for GPU to finish all work */
     vio_d3d12_wait_for_gpu();
     d3d12_bundles_sweep();
+    /* Upscaler providers keep per-device state (DLSS: the NGX instance). */
+    d3d12_upscale_device_release();
 
     if (vio_d3d12.vrs_image) { ID3D12Resource_Release(vio_d3d12.vrs_image); vio_d3d12.vrs_image = NULL; }
     vio_d3d12.vrs_image_active = 0;
@@ -7798,13 +7801,57 @@ static int d3d12_upscaler_any(void)
     return 0;
 }
 
+static int d3d12_upscaler_render_size(int provider, int quality, int display_w, int display_h,
+                                      int *render_w, int *render_h, char *reason, size_t reason_len)
+{
+    *render_w = *render_h = 0;
+    if (!d3d12_upscaler_supported(provider, reason, reason_len)) return 0;
+    vio_upscale_device dev;
+    d3d12_upscale_device(&dev);
+    return vio_upscale_render_size_on(&dev, provider, quality, display_w, display_h, render_w, render_h, reason, reason_len);
+}
+
+/* A provider that records at creation (DLSS: NGX CreateFeature) gets its own
+ * list, executed and waited for here - inside a frame as well, the frame list
+ * stays untouched. */
 static void *d3d12_upscaler_create(const vio_upscale_create_desc *desc, char *reason, size_t reason_len)
 {
     vio_upscale_device dev;
     d3d12_upscale_device(&dev);
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    if (vio_upscale_create_needs_commands(desc->provider)) {
+        if (FAILED(ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       &IID_ID3D12CommandAllocator, (void **)&alloc))
+            || FAILED(ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                                     &IID_ID3D12GraphicsCommandList, (void **)&list))) {
+            if (alloc) ID3D12CommandAllocator_Release(alloc);
+            snprintf(reason, reason_len, "could not create a command list for the upscaler");
+            return NULL;
+        }
+        dev.command_list = list;
+    }
     void *u = vio_upscale_create_on(&dev, desc, reason, reason_len);
+    if (list) {
+        if (SUCCEEDED(ID3D12GraphicsCommandList_Close(list))) {
+            ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+            ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+            vio_d3d12_wait_for_gpu();
+        }
+        ID3D12GraphicsCommandList_Release(list);
+        ID3D12CommandAllocator_Release(alloc);
+    }
     d3d12_drain_info_queue("upscaler_create");
     return u;
+}
+
+/* Before the device goes (d3d12_shutdown): providers drop their device state. */
+static void d3d12_upscale_device_release(void)
+{
+    if (!vio_d3d12.device) return;
+    vio_upscale_device dev;
+    d3d12_upscale_device(&dev);
+    vio_upscale_device_release(&dev);
 }
 
 static int d3d12_upscaler_query(void *upscaler, int provider, vio_upscale_query *q)
@@ -10322,6 +10369,7 @@ static const vio_backend d3d12_backend = {
     .upscaler_query                 = d3d12_upscaler_query,
     .upscaler_destroy               = d3d12_upscaler_destroy,
     .upscaler_device_requirements   = d3d12_upscaler_device_requirements,
+    .upscaler_render_size           = d3d12_upscaler_render_size,
 };
 
 void vio_backend_d3d12_register(void)

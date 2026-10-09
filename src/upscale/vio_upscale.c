@@ -29,6 +29,8 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <dirent.h>
+#include <unistd.h>
 #endif
 
 /* ── Quality modes ──────────────────────────────────────────────────── */
@@ -165,6 +167,114 @@ void *vio_upscale_load_library(const char *ini_key, const char *env_key, const c
     return NULL;
 }
 
+/* Whether `dir` holds `file` (or is that file). Elsewhere than Windows `file`
+ * is a prefix: versioned libraries (libnvidia-ngx-dlss.so.310.9.1). */
+static int vio_upscale_has_file(const char *dir, const char *file, char *path, size_t path_len)
+{
+    size_t dl = dir ? strlen(dir) : 0;
+    if (dl == 0) return 0;
+    char full[1024];
+    const char *base = strrchr(dir, '/');
+#ifdef _WIN32
+    const char *bs = strrchr(dir, '\\');
+    if (bs && (!base || bs > base)) base = bs;
+#endif
+    base = base ? base + 1 : dir;
+    if (strncmp(base, file, strlen(file)) == 0) {   /* the file itself */
+        snprintf(full, sizeof(full), "%s", dir);
+#ifdef _WIN32
+        if (GetFileAttributesA(full) == INVALID_FILE_ATTRIBUTES) return 0;
+#else
+        if (access(full, R_OK) != 0) return 0;
+#endif
+        snprintf(path, path_len, "%s", full);
+        return 1;
+    }
+    char last = dir[dl - 1];
+    const char *sep = (last == '/' || last == '\\') ? "" : "/";
+#ifdef _WIN32
+    snprintf(full, sizeof(full), "%s%s%s", dir, sep, file);
+    for (char *c = full; *c; c++) if (*c == '/') *c = '\\';
+    DWORD attr = GetFileAttributesA(full);
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) return 0;
+    snprintf(path, path_len, "%s", full);
+    return 1;
+#else
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    int found = 0;
+    while (!found && (e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, file, strlen(file)) == 0) {
+            snprintf(path, path_len, "%s%s%s", dir, sep, e->d_name);
+            found = 1;
+        }
+    }
+    closedir(d);
+    return found;
+#endif
+}
+
+int vio_upscale_find_file(const char *ini_key, const char *env_key, const char *file,
+                          char *path, size_t path_len, char *reason, size_t reason_len)
+{
+    path[0] = '\0';
+    reason[0] = '\0';
+    const char *expl = ini_key ? zend_ini_string_ex((char *)ini_key, strlen(ini_key), 0, NULL) : NULL;
+    const char *src = ini_key;
+    if (!expl || !expl[0]) { expl = env_key ? getenv(env_key) : NULL; src = env_key; }
+    if (expl && expl[0]) {
+        if (vio_upscale_has_file(expl, file, path, path_len)) return 1;
+        snprintf(reason, reason_len, "%s not found (%s = '%s')", file, src, expl);
+        return 0;
+    }
+    char dir[1024];
+#ifdef _WIN32
+    DWORD n = GetModuleFileNameA(NULL, dir, (DWORD)sizeof(dir));
+    if (n > 0 && n < sizeof(dir)) {
+        vio_upscale_dirname(dir);
+        if (vio_upscale_has_file(dir, file, path, path_len)) return 1;
+    }
+    HMODULE self = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)(void *)&vio_upscale_find_file, &self) && self) {
+        n = GetModuleFileNameA(self, dir, (DWORD)sizeof(dir));
+        if (n > 0 && n < sizeof(dir)) {
+            vio_upscale_dirname(dir);
+            if (vio_upscale_has_file(dir, file, path, path_len)) return 1;
+        }
+    }
+    char *part = NULL;
+    if (SearchPathA(NULL, file, NULL, (DWORD)sizeof(dir), dir, &part) > 0) {
+        snprintf(path, path_len, "%s", dir);
+        return 1;
+    }
+#else
+    Dl_info info;
+    if (dladdr((void *)&vio_upscale_find_file, &info) && info.dli_fname) {
+        snprintf(dir, sizeof(dir), "%s", info.dli_fname);
+        vio_upscale_dirname(dir);
+        if (vio_upscale_has_file(dir, file, path, path_len)) return 1;
+    }
+    const char *ldp = getenv("LD_LIBRARY_PATH");
+    if (ldp) {
+        char list[2048];
+        snprintf(list, sizeof(list), "%s", ldp);
+        for (char *tok = strtok(list, ":"); tok; tok = strtok(NULL, ":")) {
+            if (vio_upscale_has_file(tok, file, path, path_len)) return 1;
+        }
+    }
+#endif
+    snprintf(reason, reason_len, "%s not found (next to the PHP executable, next to php_vio, on PATH; or set %s / %s)",
+             file, ini_key ? ini_key : "-", env_key ? env_key : "-");
+    return 0;
+}
+
+const char *vio_upscale_ini(const char *key)
+{
+    return zend_ini_string_ex((char *)key, strlen(key), 0, NULL);
+}
+
 void *vio_upscale_symbol(void *module, const char *name)
 {
     if (!module) return NULL;
@@ -228,6 +338,37 @@ unsigned vio_upscale_vk_device_needs(void *physical_device)
     return need;
 }
 
+int vio_upscale_vk_extensions(void *physical_device, const char **names, int max)
+{
+    int n = 0;
+    for (int p = 1; p <= VIO_UPSCALER_COUNT; p++) {
+        const vio_upscale_provider *pr = vio_upscale_provider_get(p);
+        if (!pr || !pr->vk_extensions) continue;
+        const char *mine[32];
+        int m = pr->vk_extensions(physical_device, mine, 32);
+        for (int i = 0; i < m && n < max; i++) {
+            int dup = 0;
+            for (int k = 0; k < n; k++) if (strcmp(names[k], mine[i]) == 0) dup = 1;
+            if (!dup) names[n++] = mine[i];
+        }
+    }
+    return n;
+}
+
+int vio_upscale_create_needs_commands(int provider)
+{
+    const vio_upscale_provider *p = vio_upscale_provider_get(provider);
+    return p && (p->flags & VIO_UPSCALE_PROVIDER_CREATE_COMMANDS);
+}
+
+void vio_upscale_device_release(const vio_upscale_device *dev)
+{
+    for (int p = 1; p <= VIO_UPSCALER_COUNT; p++) {
+        const vio_upscale_provider *pr = vio_upscale_provider_get(p);
+        if (pr && pr->device_release) pr->device_release(dev);
+    }
+}
+
 typedef struct _vio_upscale_instance {
     const vio_upscale_provider *provider;
     void                       *ctx;
@@ -256,17 +397,35 @@ int vio_upscale_supported_on(const vio_upscale_device *dev, int provider, char *
     return p->supported(dev, reason, reason_len, q ? q : &tmp);
 }
 
+int vio_upscale_render_size_on(const vio_upscale_device *dev, int provider, int quality, int display_w, int display_h,
+                               int *render_w, int *render_h, char *reason, size_t reason_len)
+{
+    *render_w = *render_h = 0;
+    if (!vio_upscale_supported_on(dev, provider, reason, reason_len, NULL)) return 0;
+    const vio_upscale_provider *p = vio_upscale_provider_get(provider);
+    if (p->render_size) return p->render_size(dev, quality, display_w, display_h, render_w, render_h, reason, reason_len);
+    vio_upscale_render_size(quality, display_w, display_h, render_w, render_h);
+    return 1;
+}
+
+/* desc->render_width / render_height 0: the provider's render size for the
+ * quality mode (vio_upscale_render_size_on). */
 void *vio_upscale_create_on(const vio_upscale_device *dev, const vio_upscale_create_desc *desc, char *reason, size_t reason_len)
 {
     if (!vio_upscale_supported_on(dev, desc->provider, reason, reason_len, NULL)) return NULL;
     const vio_upscale_provider *p = vio_upscale_provider_get(desc->provider);
-    void *ctx = p->create(dev, desc, reason, reason_len);
+    vio_upscale_create_desc d = *desc;
+    if (d.render_width <= 0 || d.render_height <= 0) {
+        if (!vio_upscale_render_size_on(dev, d.provider, d.quality, d.display_width, d.display_height,
+                                        &d.render_width, &d.render_height, reason, reason_len)) return NULL;
+    }
+    void *ctx = p->create(dev, &d, reason, reason_len);
     if (!ctx) return NULL;
     vio_upscale_instance *in = (vio_upscale_instance *)calloc(1, sizeof(*in));
     if (!in) { p->destroy(ctx); snprintf(reason, reason_len, "out of memory"); return NULL; }
     in->provider = p;
     in->ctx = ctx;
-    in->desc = *desc;
+    in->desc = d;
     return in;
 }
 

@@ -4,6 +4,7 @@ Native upscalers (vio_upscaler_*, TEMPORAL-S3): without the provider library eve
 vio
 --INI--
 vio.ffx_path={PWD}
+vio.dlss_path={PWD}
 --FILE--
 <?php
 /* vio.ffx_path points at the test directory, which holds no

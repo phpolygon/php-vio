@@ -7105,7 +7105,9 @@ ZEND_FUNCTION(vio_upscaler_info)
     int ok = vio_upscaler_check(ctx, (int)provider, reason, sizeof(reason));
     vio_upscale_query q;
     memset(&q, 0, sizeof(q));
-    if (ok && be->upscaler_query) be->upscaler_query(NULL, (int)provider, &q);
+    /* Also when unsupported: a provider may still name the driver it checked. */
+    if (be && be->upscaler_query) be->upscaler_query(NULL, (int)provider, &q);
+    if (!ok) q.version[0] = q.library[0] = '\0';
     char device[256] = "";
     if (be && be->upscaler_device_requirements) be->upscaler_device_requirements((int)provider, device, sizeof(device));
 
@@ -7115,6 +7117,7 @@ ZEND_FUNCTION(vio_upscaler_info)
     add_assoc_bool(return_value, "supported", ok);
     add_assoc_string(return_value, "reason", ok ? "" : reason);
     add_assoc_string(return_value, "version", q.version);
+    add_assoc_string(return_value, "driver", q.driver);
     add_assoc_string(return_value, "library", q.library);
     add_assoc_string(return_value, "device", device);
     add_assoc_long(return_value, "live", be ? vio_upscaler_live_count(be) : 0);
@@ -7122,6 +7125,7 @@ ZEND_FUNCTION(vio_upscaler_info)
     if (u) {
         add_assoc_bool(return_value, "valid", u->valid && u->backend == be);
         add_assoc_long(return_value, "quality", u->desc.quality);
+        /* The render size the provider chose (DLSS: NGX optimal settings). */
         add_assoc_long(return_value, "render_width", u->desc.render_width);
         add_assoc_long(return_value, "render_height", u->desc.render_height);
         add_assoc_long(return_value, "display_width", u->desc.display_width);
@@ -7181,11 +7185,15 @@ ZEND_FUNCTION(vio_upscaler_create)
     d.quality = (int)quality;
     d.display_width = (int)dwl;
     d.display_height = (int)dhl;
-    vio_upscale_render_size(d.quality, d.display_width, d.display_height, &d.render_width, &d.render_height);
+    /* Render size 0: the provider picks it for the quality mode (DLSS optimal
+     * settings, FSR's fixed ratios); read back after create. */
+    d.render_width = d.render_height = 0;
     zval *rw = zend_hash_str_find(opts, "render_width", sizeof("render_width") - 1);
     zval *rh = zend_hash_str_find(opts, "render_height", sizeof("render_height") - 1);
     if (rw || rh) {
-        zend_long rwl = rw ? zval_get_long(rw) : d.render_width, rhl = rh ? zval_get_long(rh) : d.render_height;
+        int fw, fh;
+        vio_upscale_render_size(d.quality, d.display_width, d.display_height, &fw, &fh);
+        zend_long rwl = rw ? zval_get_long(rw) : fw, rhl = rh ? zval_get_long(rh) : fh;
         if (rwl < 1 || rhl < 1 || rwl > dwl || rhl > dhl) {
             zend_argument_value_error(2, "'render_width' / 'render_height' must be 1..the display size");
             RETURN_THROWS();
@@ -7212,6 +7220,13 @@ ZEND_FUNCTION(vio_upscaler_create)
         php_error_docref(NULL, E_WARNING, "vio_upscaler_create: %s", reason[0] ? reason : "the provider could not create a context");
         RETURN_FALSE;
     }
+    if (d.render_width <= 0 || d.render_height <= 0) {
+        vio_upscale_query q;
+        memset(&q, 0, sizeof(q));
+        if (ctx->backend->upscaler_query) ctx->backend->upscaler_query(h, d.provider, &q);
+        if (q.render_width > 0 && q.render_height > 0) { d.render_width = q.render_width; d.render_height = q.render_height; }
+        else vio_upscale_render_size(d.quality, d.display_width, d.display_height, &d.render_width, &d.render_height);
+    }
     object_init_ex(return_value, vio_upscaler_ce);
     vio_upscaler_object *u = Z_VIO_UPSCALER_P(return_value);
     u->handle = h;
@@ -7219,6 +7234,40 @@ ZEND_FUNCTION(vio_upscaler_create)
     u->desc = d;
     u->valid = 1;
     vio_upscaler_track(u);
+}
+
+/* vio_upscaler_render_size($ctx, $provider, $quality, $display_width,
+ * $display_height): ['width' => , 'height' => ] the provider renders at for the
+ * quality mode on this device (DLSS: NGX optimal settings - VIO_UPSCALE_NATIVE_AA
+ * is DLAA at the display size; FSR: its fixed ratios), false when the provider
+ * is not usable or does not offer the mode. Never warns. */
+ZEND_FUNCTION(vio_upscaler_render_size)
+{
+    zval *ctx_zval;
+    zend_long provider, quality, dw, dh;
+    ZEND_PARSE_PARAMETERS_START(5, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(provider)
+        Z_PARAM_LONG(quality)
+        Z_PARAM_LONG(dw)
+        Z_PARAM_LONG(dh)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!vio_upscaler_provider_arg(provider, 2)) RETURN_THROWS();
+    if (quality < VIO_UPSCALE_NATIVE_AA || quality > VIO_UPSCALE_ULTRA_PERFORMANCE) {
+        zend_argument_value_error(3, "must be a VIO_UPSCALE_NATIVE_AA..VIO_UPSCALE_ULTRA_PERFORMANCE constant");
+        RETURN_THROWS();
+    }
+    if (dw < 1 || dw > 16384) { zend_argument_value_error(4, "must be 1..16384"); RETURN_THROWS(); }
+    if (dh < 1 || dh > 16384) { zend_argument_value_error(5, "must be 1..16384"); RETURN_THROWS(); }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    char reason[512];
+    if (!vio_upscaler_check(ctx, (int)provider, reason, sizeof(reason)) || !ctx->backend->upscaler_render_size) RETURN_FALSE;
+    int rw = 0, rh = 0;
+    if (!ctx->backend->upscaler_render_size((int)provider, (int)quality, (int)dw, (int)dh, &rw, &rh, reason, sizeof(reason))
+        || rw < 1 || rh < 1) RETURN_FALSE;
+    array_init(return_value);
+    add_assoc_long(return_value, "width", rw);
+    add_assoc_long(return_value, "height", rh);
 }
 
 /* One dispatch image: VioRenderTarget (attachment `def`) or [VioRenderTarget, attachment].

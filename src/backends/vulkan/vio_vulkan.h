@@ -410,6 +410,9 @@ typedef struct _vio_vulkan_state {
     /* VIO_UPSCALE_VK_* enabled at device creation because a native upscaler's
      * runtime was found (vio_upscale_vk_device_needs, TEMPORAL-S3). */
     unsigned                 upscale_features;
+    /* Device extensions enabled by name for them (vio_upscale_vk_extensions,
+     * TEMPORAL-S4), comma separated. */
+    char                     upscale_extensions[256];
     /* HDR10 output (GAP-PHASE5 Block 10d): vio_create(['hdr_output' => 1|2]). */
     int                      hdr_request;          /* 0 off, 1 when the surface offers HDR10 ST 2084, 2 forced 10-bit */
     int                      hdr_output;           /* 1 => 10-bit swapchain, the 2D batch PQ-encodes */
@@ -692,6 +695,13 @@ int   vulkan_upscaler_dispatch(void *upscaler, const struct _vio_upscale_dispatc
 int   vulkan_upscaler_query(void *upscaler, int provider, struct _vio_upscale_query *q);
 void  vulkan_upscaler_destroy(void *upscaler);
 int   vulkan_upscaler_device_requirements(int provider, char *out, size_t out_len);
+int   vulkan_upscaler_render_size(int provider, int quality, int display_w, int display_h,
+                                  int *render_w, int *render_h, char *reason, size_t reason_len);
+void  vulkan_upscale_device_release(void);   /* vulkan_shutdown, before the device goes */
+/* One-shot command buffer from the transient pool, submitted and waited for
+ * (vio_vulkan.c); also usable while a frame is open. 0 = ok. */
+int   vio_vk_transient_begin(VkCommandBuffer *out_cmd);
+int   vio_vk_transient_submit(VkCommandBuffer cmd);
 
 #endif /* HAVE_VULKAN */
 #endif /* VIO_VULKAN_H */

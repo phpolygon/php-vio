@@ -10,7 +10,8 @@
  *      (vio_upscale_native_dispatch) on the frame command list and restores
  *      its own state afterwards. It knows nothing about any SDK.
  *   3. A provider (vio_upscale_provider): one SDK - FidelityFX FSR 3.1
- *      (vio_upscale_ffx.c, --with-ffx), later DLSS / XeSS - loaded at run time.
+ *      (vio_upscale_ffx*.cpp, --with-ffx), NVIDIA DLSS Super Resolution through
+ *      NGX (vio_upscale_dlss*.cpp, --with-dlss=DIR, TEMPORAL-S4), later XeSS.
  *      Every provider takes the same inputs: colour, depth, motion in render
  *      pixels (scaled by mv_scale), jitter in render pixels, optional reactive /
  *      transparency / exposure, and a storage output at display size.
@@ -83,7 +84,8 @@ typedef struct _vio_upscale_dispatch_desc {
 
 /* What vio_upscaler_info() reports: provider level (ctx = NULL) or per upscaler. */
 typedef struct _vio_upscale_query {
-    char     version[64];      /* e.g. "FSR 3.1.4" */
+    char     version[64];      /* e.g. "3.1.4" (FSR) / "310.9.1" (DLSS) */
+    char     driver[64];       /* graphics driver version the provider checked ("" = none) */
     char     library[512];     /* the loaded runtime library */
     int      render_width, render_height;
     int      display_width, display_height;
@@ -102,6 +104,11 @@ typedef struct _vio_upscale_device {
     void *physical_device;        /* VkPhysicalDevice */
     void *instance;               /* VkInstance */
     void *get_device_proc_addr;   /* PFN_vkGetDeviceProcAddr */
+    void *get_instance_proc_addr; /* PFN_vkGetInstanceProcAddr */
+    /* create() only, for providers with VIO_UPSCALE_PROVIDER_CREATE_COMMANDS: an
+     * open ID3D12GraphicsCommandList* / VkCommandBuffer (outside any pass) the
+     * backend executes and waits for right after create() returns. */
+    void *command_list;
 } vio_upscale_device;
 
 /* Where an image rests when it is handed over; the provider leaves it there. */
@@ -110,6 +117,7 @@ typedef struct _vio_upscale_device {
 
 typedef struct _vio_upscale_native_image {
     void    *handle;              /* ID3D12Resource* / VkImage; NULL = not given */
+    void    *view;                /* Vulkan: a 2D single-level VkImageView of it (depth: depth aspect) */
     uint32_t format;              /* DXGI_FORMAT / VkFormat of the resource */
     uint32_t width, height;
     int      depth;               /* a depth(-stencil) resource */
@@ -132,9 +140,13 @@ typedef struct _vio_upscale_native_dispatch {
 #define VIO_UPSCALE_VK_STORAGE16             (1u << 3)
 #define VIO_UPSCALE_VK_SEPARATE_DEPTH_STENCIL (1u << 4)
 
+/* vio_upscale_provider.flags */
+#define VIO_UPSCALE_PROVIDER_CREATE_COMMANDS (1u << 0)   /* create() records into dev->command_list */
+
 typedef struct _vio_upscale_provider {
     int         id;               /* VIO_UPSCALER_* */
     const char *name;             /* "fsr3" */
+    unsigned    flags;            /* VIO_UPSCALE_PROVIDER_* */
     /* 1 = usable on the device (version / library filled), 0 = not, reason filled. */
     int   (*supported)(const vio_upscale_device *dev, char *reason, size_t reason_len, vio_upscale_query *q);
     void *(*create)(const vio_upscale_device *dev, const vio_upscale_create_desc *desc, char *reason, size_t reason_len);
@@ -144,6 +156,18 @@ typedef struct _vio_upscale_provider {
     /* VIO_UPSCALE_VK_* the provider may use on this VkPhysicalDevice (0 when its
      * library is missing: then nothing changes at device creation). */
     unsigned (*vk_device_needs)(void *physical_device);
+    /* Optional (NULL = the fixed ratios of vio_upscale_render_size). The render
+     * size the provider wants for `quality` at the display size; 1 = filled,
+     * 0 = the mode is not offered (reason filled). */
+    int   (*render_size)(const vio_upscale_device *dev, int quality, int display_w, int display_h,
+                         int *render_w, int *render_h, char *reason, size_t reason_len);
+    /* Optional: drop every per-device state before the device is destroyed. */
+    void  (*device_release)(const vio_upscale_device *dev);
+    /* Optional, Vulkan: extension names the provider needs enabled when they are
+     * offered - instance extensions with physical_device = NULL (read before
+     * vkCreateInstance), else device extensions (before vkCreateDevice). Up to
+     * `max` names into `names`; returns how many (0 when its runtime is missing). */
+    int   (*vk_extensions)(void *physical_device, const char **names, int max);
 } vio_upscale_provider;
 
 /* ── Shared helpers (vio_upscale.c) ─────────────────────────────────── */
@@ -161,6 +185,13 @@ int   vio_upscale_jitter_phases(int render_w, int display_w);
 void *vio_upscale_load_library(const char *ini_key, const char *env_key, const char *file,
                                char *path, size_t path_len, char *reason, size_t reason_len);
 void *vio_upscale_symbol(void *module, const char *name);
+/* A php.ini string (NULL when unknown), for providers written in C++. */
+const char *vio_upscale_ini(const char *key);
+/* The same search without loading (for runtimes the SDK loads itself, like
+ * nvngx_dlss.dll): 1 + `path`, or 0 + reason. Elsewhere than Windows `file` is
+ * matched as a prefix (versioned .so names); LD_LIBRARY_PATH replaces PATH. */
+int   vio_upscale_find_file(const char *ini_key, const char *env_key, const char *file,
+                            char *path, size_t path_len, char *reason, size_t reason_len);
 
 /* Host memory handed to providers, counted (vio_upscaler_info()['host_bytes']). */
 void   *vio_upscale_host_alloc(void *user, uint64_t size);
@@ -176,11 +207,26 @@ void  vio_upscale_destroy_instance(void *upscaler);
 const vio_upscale_create_desc *vio_upscale_instance_desc(void *upscaler);
 /* OR of every built provider's vk_device_needs. */
 unsigned vio_upscale_vk_device_needs(void *physical_device);
+/* Every built provider's vk_extensions, without duplicates (physical_device NULL:
+ * instance extensions). Returns how many names were written. */
+int vio_upscale_vk_extensions(void *physical_device, const char **names, int max);
+/* The render size of `provider` for `quality` at the display size on the device:
+ * its own (DLSS optimal settings) or the fixed ratios. 1 = filled; 0 = provider
+ * not usable or mode not offered (reason filled). */
+int vio_upscale_render_size_on(const vio_upscale_device *dev, int provider, int quality, int display_w, int display_h,
+                               int *render_w, int *render_h, char *reason, size_t reason_len);
+/* 1 when the provider's create() records into vio_upscale_device.command_list. */
+int vio_upscale_create_needs_commands(int provider);
+/* Before the device goes away: every provider drops its state for it. */
+void vio_upscale_device_release(const vio_upscale_device *dev);
 
 /* Built providers (NULL when not compiled in). */
 const vio_upscale_provider *vio_upscale_provider_get(int provider);
 #ifdef HAVE_FFX
 extern const vio_upscale_provider vio_upscale_provider_ffx;
+#endif
+#ifdef HAVE_DLSS
+extern const vio_upscale_provider vio_upscale_provider_dlss;
 #endif
 
 #endif /* VIO_UPSCALE_H */
