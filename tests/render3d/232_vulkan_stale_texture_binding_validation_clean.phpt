@@ -7,6 +7,11 @@ vio
 if (!extension_loaded('vio')) die('skip vio not loaded');
 $c = @vio_create('vulkan', ['width' => 16, 'height' => 16, 'headless' => true, 'vsync' => false]);
 if (!$c || vio_backend_name($c) !== 'vulkan') die('skip Vulkan unavailable');
+vio_destroy($c);
+// The test needs the validation layer: with 'debug' => true vio_create fails
+// when VK_LAYER_KHRONOS_validation is not installed (e.g. lavapipe-only CI).
+$c = @vio_create('vulkan', ['width' => 16, 'height' => 16, 'headless' => true, 'vsync' => false, 'debug' => true]);
+if (!$c || vio_backend_name($c) !== 'vulkan') die('skip Vulkan validation layer (VK_LAYER_KHRONOS_validation) not installed');
 if (!vio_supports_feature($c, VIO_FEATURE_3D_PIPELINE) || !vio_supports_feature($c, VIO_FEATURE_RENDER_TARGET)) die('skip no 3D pipeline / render targets');
 vio_destroy($c);
 ?>
