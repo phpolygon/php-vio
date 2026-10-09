@@ -11602,6 +11602,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_RT_ALL_LAYERS", VIO_RT_ALL_LAYERS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_RT_DEPTH", VIO_RT_DEPTH, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE", VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_STORAGE", VIO_FEATURE_RENDER_TARGET_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALE_SPATIAL", VIO_UPSCALE_SPATIAL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALE_TEMPORAL", VIO_UPSCALE_TEMPORAL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_VIEWPORT", VIO_FEATURE_MULTI_VIEWPORT, CONST_CS | CONST_PERSISTENT);
@@ -12944,6 +12945,22 @@ ZEND_FUNCTION(vio_render_target)
         }
     }
 
+    /* 'storage' => true: every colour attachment is also a compute storage image
+     * (vio_render_target_texture() + vio_compute_bind_image). Plain single-sample
+     * 2D colour targets; VIO_FEATURE_RENDER_TARGET_STORAGE (D3D12, Vulkan). */
+    int storage = 0;
+    if ((val = zend_hash_str_find(config_ht, "storage", sizeof("storage") - 1)) != NULL && zend_is_true(val)) {
+        if (!ctx->backend->supports_feature || !ctx->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_STORAGE)) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'storage' targets are not supported on backend '%s' (VIO_FEATURE_RENDER_TARGET_STORAGE)", ctx->backend->name);
+            RETURN_FALSE;
+        }
+        if (depth_only || is_cube || layers > 1 || samples > 1 || rate_nx > 0) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'storage' needs a single-sample 2D colour target (no depth_only, cube, layers, samples or rate_map)");
+            RETURN_FALSE;
+        }
+        storage = 1;
+    }
+
     /* Create VioRenderTarget object */
     zval rt_zval;
     object_init_ex(&rt_zval, vio_render_target_ce);
@@ -12963,6 +12980,7 @@ ZEND_FUNCTION(vio_render_target)
     rt->layers     = layers;
     rt->mip_levels = mip_levels;
     rt->depth_reduction = depth_reduction;
+    rt->storage    = storage;
     rt->backend    = ctx->backend;
     rt->attachment_count = attachment_count;
     memcpy(rt->formats, formats, sizeof(formats));
@@ -13423,6 +13441,7 @@ ZEND_FUNCTION(vio_render_target_texture)
     tex->texture_id = want_depth ? rt->depth_texture : (att == 0 ? rt->color_texture : rt->color_textures[att]);
     tex->valid    = 1;
     tex->borrowed = 1;  /* GL resource owned by render target, don't double-delete */
+    tex->storage  = rt->storage && !want_depth;   /* vio_compute_bind_image accepts it */
 
 #ifdef HAVE_D3D11
     /* For D3D11: hand out a cached backend-texture wrapper owned by the
@@ -13532,6 +13551,8 @@ ZEND_FUNCTION(vio_render_target_texture)
                 d3d_tex->srv_cpu.ptr = color_srv_cpu;
                 /* Colour attachments sample LINEAR / CLAMP like D3D11 + GL. */
                 d3d_tex->sampler_index = vio_d3d12_sampler_combo(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, 1);
+                d3d_tex->rt_owner = rt;            /* storage image binds resolve the resource / state here */
+                d3d_tex->rt_attachment = att;
                 *cache_slot = d3d_tex;
             }
         }

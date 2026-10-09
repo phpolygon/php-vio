@@ -155,6 +155,7 @@ typedef struct _vio_vk_rt {
      * rests in DEPTH_STENCIL_READ_ONLY between passes (like a depth_only one),
      * sampled NEAREST / white border through its own wrapper. */
     int            depth_sampled;
+    int            storage;        /* 'storage' => true: STORAGE colour images resting in GENERAL */
     VkSampler      depth_sampler;
     struct _vio_vulkan_texture *depth_wrap;
 } vio_vk_rt;

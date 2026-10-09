@@ -144,6 +144,8 @@ typedef struct _vio_render_target_object {
     int          bound_level;         /* cube: mip level currently bound */
     int          samples;             /* requested by vio_render_target(); backends clamp to what
                                          they support and write the effective count back (1 = off) */
+    int          storage;             /* 'storage' => true: colour attachments are compute storage
+                                         images too (VIO_FEATURE_RENDER_TARGET_STORAGE) */
     int          read_raw;            /* set by vio_read_render_target(['raw' => true]) around the
                                          read_render_target call: texels in their own format */
     int          valid;

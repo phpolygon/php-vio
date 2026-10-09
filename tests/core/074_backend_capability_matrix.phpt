@@ -57,6 +57,7 @@ probe("opengl", [
     VIO_FEATURE_MRT                => 1,
     VIO_FEATURE_RENDER_TARGET_LAYERED => 1,   /* GL_TEXTURE_2D_ARRAY / depth cubemaps (GEOMETRY-STAGES-PLAN 1a) */
     VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE => 1,   /* every target's depth is a texture (test 223) */
+    VIO_FEATURE_RENDER_TARGET_STORAGE => 0,   /* 'storage' targets: D3D12 / Vulkan only (test 225) */
     VIO_FEATURE_RAYTRACING         => 0,
     /* MULTIVIEW is device dependent here (GL_OVR_multiview2 / VkPhysicalDeviceMultiviewFeatures): test 158. */
 ]);
@@ -100,6 +101,7 @@ probe("null", [
     VIO_FEATURE_COOPERATIVE_MATRIX => 0,
     VIO_FEATURE_WORK_GRAPHS        => 0,
     VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE => 0,
+    VIO_FEATURE_RENDER_TARGET_STORAGE => 0,
 ]);
 
 /* D3D11 / D3D12 (Windows) and Vulkan — pinned by D3D-VULKAN-GAP-PLAN.md Phase 0.
@@ -166,6 +168,7 @@ probe_fold("d3d11", $d3d_common + [
     VIO_FEATURE_SUBGROUP           => 0,   /* wave intrinsics need SM 6 (D3D12 only); D3D11 is FXC 5.0 */
     VIO_FEATURE_RENDER_TARGET_CUBE => 1,   /* GAP-PLAN 2.2 */
     VIO_FEATURE_MIPMAP_GEN         => 1,   /* GenerateMips (GAP-PLAN 2.3) */
+    VIO_FEATURE_RENDER_TARGET_STORAGE => 0, /* 'storage' targets: D3D12 / Vulkan only (test 225) */
 ]);
 probe_fold("d3d12", $d3d_common + [
     VIO_FEATURE_TEXTURE_SWIZZLE    => 1,   /* Shader4ComponentMapping */
@@ -173,6 +176,7 @@ probe_fold("d3d12", $d3d_common + [
     VIO_FEATURE_MIPMAP_GEN         => 1,   /* compute downsample, CPU box filter fallback (GAP-PHASE5 11) */
     VIO_FEATURE_SUBGROUP           => 0,   /* default context is FXC 5.1; SM 6 + WaveOps: test 149 */
     VIO_FEATURE_MULTIVIEW          => 0,   /* view instancing needs SM 6.1: test 158 */
+    VIO_FEATURE_RENDER_TARGET_STORAGE => 1, /* ALLOW_UNORDERED_ACCESS attachments (test 225) */
 ]);
 
 /* Vulkan: 3D pipeline since GAP-PHASE5 Block 10 (SPIR-V round trip, frame upload
@@ -196,6 +200,7 @@ probe_fold("vulkan", [
     VIO_FEATURE_TEXTURE_COMPRESSION_BC => 1,   /* textureCompressionBC (every desktop GPU) */
     VIO_FEATURE_RENDER_TARGET_LAYERED => 1,   /* framebuffer per array layer (GEOMETRY-STAGES-PLAN 1a) */
     VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE => 1,   /* SAMPLED depth, DEPTH_STENCIL_READ_ONLY between passes (test 223) */
+    VIO_FEATURE_RENDER_TARGET_STORAGE => 1,   /* STORAGE colour images in GENERAL (test 225) */
     VIO_FEATURE_INSTANCED_DRAW     => 1,
     VIO_FEATURE_DEPTH_BIAS         => 1,
     /* TESSELLATION / GEOMETRY follow the device features geometryShader /
@@ -236,6 +241,7 @@ if ($mtl) {
        && vio_supports_feature($mtl, VIO_FEATURE_STENCIL) === true
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET_LAYERED) === true
        && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE) === true
+       && vio_supports_feature($mtl, VIO_FEATURE_RENDER_TARGET_STORAGE) === false
        /* vertex-stage layer / viewport index travel together (Mac2 / Apple5) */
        && vio_supports_feature($mtl, VIO_FEATURE_LAYERED_RENDER) === vio_supports_feature($mtl, VIO_FEATURE_VERTEX_LAYER)
        && vio_supports_feature($mtl, VIO_FEATURE_MULTI_VIEWPORT) === vio_supports_feature($mtl, VIO_FEATURE_VERTEX_LAYER)

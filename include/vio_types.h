@@ -417,6 +417,10 @@ typedef enum _vio_feature {
      * 2D colour target (plain or MRT) as a samplable texture - the scene depth a
      * temporal resolve / motion-vector dilation reads next to the G-buffer. */
     VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE = 68,
+    /* vio_render_target(['storage' => true]): the colour attachments double as
+     * compute storage images (vio_render_target_texture() + vio_compute_bind_image)
+     * - a TAA history or upscaler output written by a kernel and drawn into. */
+    VIO_FEATURE_RENDER_TARGET_STORAGE = 69,
 } vio_feature;
 
 /* Zones per axis of a rate map. */

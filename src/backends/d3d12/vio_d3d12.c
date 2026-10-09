@@ -5065,6 +5065,14 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
                 rd.Format = dxfmt;
                 rd.SampleDesc.Count = 1;
                 rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                if (rt->storage) {
+                    /* 'storage' => true: a compute storage image too (typed UAV store) */
+                    if (!d3d12_format_supports_uav(dxfmt)) {
+                        php_error_docref(NULL, E_WARNING, "D3D12: attachment %d's format has no typed UAV store for a 'storage' target", ai);
+                        return -1;
+                    }
+                    rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                }
                 D3D12_CLEAR_VALUE cv = {0};
                 cv.Format = dxfmt;
                 ID3D12Resource *color_res = NULL;
@@ -7648,12 +7656,33 @@ static void d3d12_compute_set_uniforms(void *pipeline_ptr, const void *data, int
     if (cp->params_cpu) memcpy(cp->params_cpu, data, (size_t)size);
 }
 
+/* The resource, UAV format and resting state of a storage-image binding: a
+ * 'storage' texture (RGBA8, PIXEL_SHADER_RESOURCE after its upload) or the
+ * colour attachment of a 'storage' render target (its own format; RENDER_TARGET
+ * while bound or left after vio_end, PIXEL_SHADER_RESOURCE after an unbind). */
+static ID3D12Resource *d3d12_image_target(const vio_d3d12_texture *dt, DXGI_FORMAT *fmt, D3D12_RESOURCE_STATES *state)
+{
+    *fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    *state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (!dt) return NULL;
+    if (dt->rt_owner) {
+        const vio_render_target_object *rt = (const vio_render_target_object *)dt->rt_owner;
+        int a = dt->rt_attachment;
+        if (!rt->storage || a < 0 || a >= VIO_MAX_COLOR_ATTACHMENTS) return NULL;
+        *fmt = vio_pixel_format_to_dxgi(rt->formats[a]);
+        *state = rt->d3d12_color_is_srv ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+        return (ID3D12Resource *)(a == 0 ? rt->d3d12_color_resource : rt->d3d12_color_resources[a]);
+    }
+    return dt->resource;
+}
+
 static void d3d12_compute_bind_image(void *pipeline_ptr, void *tex_obj, int slot, int access)
 {
     vio_d3d12_compute_pipeline *cp = (vio_d3d12_compute_pipeline *)pipeline_ptr;
     vio_texture_object *t = (vio_texture_object *)tex_obj;
     vio_d3d12_texture *dt = t ? (vio_d3d12_texture *)t->backend_texture : NULL;
-    if (!cp || !dt || !dt->resource) return;
+    DXGI_FORMAT ifmt; D3D12_RESOURCE_STATES ist;
+    if (!cp || !dt || !d3d12_image_target(dt, &ifmt, &ist)) return;
     for (int i = 0; i < cp->image_count; i++) {
         if (cp->images[i].slot == slot) { cp->images[i].tex = dt; cp->images[i].access = access; return; }
     }
@@ -7883,12 +7912,14 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
      * barrier. */
     for (int i = 0; i < cp->image_count; i++) {
         vio_d3d12_texture *dt = cp->images[i].tex;
-        if (!dt || !dt->resource) continue;
+        DXGI_FORMAT ifmt; D3D12_RESOURCE_STATES ist;
+        ID3D12Resource *ires = d3d12_image_target(dt, &ifmt, &ist);
+        if (!ires) continue;
         int rel = cp->images[i].slot - uav_reg_base;
         if (rel < 0 || rel >= VIO_D3D12_COMPUTE_MAX_BINDINGS) continue;
         UINT idx = UAV_BASE + (UINT)rel;
         D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
-        ud.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        ud.Format = ifmt;
         if (dt->depth > 0) {
             ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
             ud.Texture3D.MipSlice = 0;
@@ -7899,7 +7930,7 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
             ud.Texture2D.MipSlice = 0;
         }
         D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu_start.ptr + (SIZE_T)idx * dsz };
-        ID3D12Device_CreateUnorderedAccessView(vio_d3d12.device, dt->resource, NULL, &ud, h);
+        ID3D12Device_CreateUnorderedAccessView(vio_d3d12.device, ires, NULL, &ud, h);
     }
 
     /* Record onto a transient DIRECT command list. We never run inside an open
@@ -7962,15 +7993,17 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, srv_gpu);
     ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 2, uav_gpu);
 
-    /* Storage images: PIXEL_SHADER_RESOURCE -> UNORDERED_ACCESS for the dispatch. */
+    /* Storage images: resting state (PIXEL_SHADER_RESOURCE, or RENDER_TARGET for
+     * a storage render target) -> UNORDERED_ACCESS for the dispatch. */
     for (int i = 0; i < cp->image_count; i++) {
-        vio_d3d12_texture *dt = cp->images[i].tex;
-        if (!dt || !dt->resource) continue;
+        DXGI_FORMAT ifmt; D3D12_RESOURCE_STATES ist;
+        ID3D12Resource *ires = d3d12_image_target(cp->images[i].tex, &ifmt, &ist);
+        if (!ires) continue;
         D3D12_RESOURCE_BARRIER ib = {0};
         ib.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        ib.Transition.pResource = dt->resource;
+        ib.Transition.pResource = ires;
         ib.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        ib.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        ib.Transition.StateBefore = ist;
         ib.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &ib);
     }
@@ -7980,16 +8013,17 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     int gz = cmd->group_count_z > 0 ? cmd->group_count_z : 1;
     ID3D12GraphicsCommandList_Dispatch(list, (UINT)gx, (UINT)gy, (UINT)gz);
 
-    /* ...and back to PIXEL_SHADER_RESOURCE so the texture samples as before. */
+    /* ...and back to the resting state so the texture samples / the target binds as before. */
     for (int i = 0; i < cp->image_count; i++) {
-        vio_d3d12_texture *dt = cp->images[i].tex;
-        if (!dt || !dt->resource) continue;
+        DXGI_FORMAT ifmt; D3D12_RESOURCE_STATES ist;
+        ID3D12Resource *ires = d3d12_image_target(cp->images[i].tex, &ifmt, &ist);
+        if (!ires) continue;
         D3D12_RESOURCE_BARRIER ib = {0};
         ib.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        ib.Transition.pResource = dt->resource;
+        ib.Transition.pResource = ires;
         ib.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         ib.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        ib.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        ib.Transition.StateAfter  = ist;
         ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &ib);
     }
 
@@ -8944,6 +8978,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_HDR:   return 1;
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 1;
         case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return 1; /* typeless R24G8 depth + SRV, PIXEL_SHADER_RESOURCE between binds */
+        case VIO_FEATURE_RENDER_TARGET_STORAGE: return 1; /* ALLOW_UNORDERED_ACCESS attachments, typed UAVs in the compute table */
         /* Multisampled colour + depth resources per target, PSO SampleDesc
          * variants picked at bind time, ResolveSubresource on unbind (GAP-PHASE5
          * Block 1). */

@@ -8,6 +8,9 @@
  *     single-sample images that are sampled and read back,
  *   - cube targets: one 6-layer image with a mip chain, a framebuffer per
  *     (face, level) - level 0 with the depth attachment, the others without,
+ *   - 'storage' targets: STORAGE colour images resting in GENERAL (compute
+ *     storage images keep that layout), RGBA8 as R8G8B8A8 - a storage image
+ *     format GLSL can name (the 2D batch does not draw into them),
  *   - depth-only targets store and sample their depth (DEPTH_STENCIL_READ_ONLY),
  *     and so do single-sample 2D colour targets (vio_render_target_texture
  *     with VIO_RT_DEPTH).
@@ -43,6 +46,14 @@ static VkImageAspectFlags vkrt_depth_aspect(void)
 }
 
 
+
+/* Where a single-sample colour image rests between passes: SHADER_READ_ONLY
+ * (an unbind needs no barrier before sampling), GENERAL for a 'storage' target
+ * (compute storage images are bound in GENERAL; sampling works there too). */
+static VkImageLayout vkrt_color_rest(const vio_vk_rt *x)
+{
+    return x->storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
 
 static VkFormat vkrt_format(int f)
 {
@@ -723,11 +734,22 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
     int layers = x->layers;
     VkImageViewType all_view = x->cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
 
+    x->storage = rt->storage && !depth_only && !layered && x->samples == 1;
     for (int i = 0; i < x->count; i++) {
         x->color_format[i] = vkrt_format(rt->formats[i]);
+        if (x->storage) {
+            if (rt->formats[i] == VIO_FORMAT_RGBA8) x->color_format[i] = VK_FORMAT_R8G8B8A8_UNORM;
+            VkFormatProperties fp;
+            vkGetPhysicalDeviceFormatProperties(vio_vk.physical_device, x->color_format[i], &fp);
+            if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+                php_error_docref(NULL, E_WARNING, "Vulkan: attachment %d's format is no storage image format on this device", i);
+                goto fail;
+            }
+        }
         if (vkrt_image(x->color_format[i], width, height, x->levels, layers, 1,
                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                       (x->storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0),
                        x->cube, &x->color_image[i], &x->color_alloc[i]) != 0) goto fail;
         x->color_view[i] = vkrt_view(x->color_image[i], x->color_format[i], VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
         if (!x->color_view[i]) goto fail;
@@ -846,7 +868,7 @@ int vulkan_create_render_target(void *rt_ptr, int width, int height, int hdr, in
                                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 vkCmdClearColorImage(cmd, x->color_image[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &r);
                 vio_vk_image_barrier_range(cmd, x->color_image[i], VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)x->levels, 0, (uint32_t)layers,
-                                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vkrt_color_rest(x));
             }
             for (int i = 0; i < x->count && x->samples > 1; i++) {
                 uint32_t ml = layered ? (uint32_t)layers : 1u;
@@ -921,7 +943,7 @@ static void vkrt_fill(vio_vk_pass *p, vio_render_target_object *rt, int face, in
     int l = (layered && !all) ? level : 0;
     int f = (layered && !all) ? face : 0;
     int ms = x->samples > 1 && l == 0;   /* layered levels > 0 are single-sampled */
-    VkImageLayout color_rest = ms ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkImageLayout color_rest = ms ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : vkrt_color_rest(x);
     VkImageLayout depth_rest = (rt->depth_only || x->depth_sampled) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
                                                                     : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     memset(p, 0, sizeof(*p));
@@ -1201,7 +1223,7 @@ void *vulkan_rt_sampling_texture(void *rt_ptr, int attachment)
     w->height     = rt->height;
     w->view_type  = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     w->is_depth   = rt->depth_only;
-    w->layout     = rt->depth_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    w->layout     = rt->depth_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : vkrt_color_rest(x);
     w->mip_levels = rt->depth_only ? x->depth_levels : 1;
     x->wrap[i] = w;
     return w;
@@ -1275,7 +1297,7 @@ int vio_vk_read_render_target(void *rt_ptr, int face, int attachment, void *out_
         return -1;
     }
     VkImageAspectFlags full = depth ? vkrt_depth_aspect() : VK_IMAGE_ASPECT_COLOR_BIT;
-    VkImageLayout rest = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkImageLayout rest = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : vkrt_color_rest(x);
     vio_vk_image_barrier_range(cmd, image, full, 0, 1, layer, 1, rest, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy copy = {0};
     copy.imageSubresource.aspectMask     = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
