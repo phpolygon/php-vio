@@ -5437,6 +5437,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return vio_vk3d_available(); /* depth-only target, sampled (compare sampler) */
         case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return vio_vk3d_available(); /* SAMPLED depth resting in DEPTH_STENCIL_READ_ONLY */
         case VIO_FEATURE_RENDER_TARGET_STORAGE: return vio_vk3d_available(); /* STORAGE colour images resting in GENERAL */
+        case VIO_FEATURE_UPSCALER_NATIVE:       return vulkan_upscaler_any();  /* FSR 3.1 runtime found + accepts the device */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return vio_vk3d_available(); /* multisampled attachments resolved by the pass (Block 10b) */
         case VIO_FEATURE_STENCIL:             return vio_vk3d_available() && (!vio_vk.device || vio_vk.depth_has_stencil); /* D32S8 / D24S8 attachments */
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_vk.ts_pool != VK_NULL_HANDLE; /* vkCmdWriteTimestamp per frame */
@@ -5532,6 +5533,12 @@ static const vio_backend vulkan_backend = {
     .destroy_bundle    = vio_vk3d_destroy_bundle,
     .bundle_method     = vulkan_bundle_method,
     .rt_origin_top     = 1,
+    .upscaler_supported           = vulkan_upscaler_supported,
+    .upscaler_create              = vulkan_upscaler_create,
+    .upscaler_dispatch            = vulkan_upscaler_dispatch,
+    .upscaler_query               = vulkan_upscaler_query,
+    .upscaler_destroy             = vulkan_upscaler_destroy,
+    .upscaler_device_requirements = vulkan_upscaler_device_requirements,
     .shading_rate_tile_size = vulkan_shading_rate_tile_size,
     .swapchain_info    = vulkan_swapchain_info,
     .bindless_set      = vulkan_bindless_set,

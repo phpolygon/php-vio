@@ -407,6 +407,9 @@ typedef struct _vio_vulkan_state {
     int                      full_subgroups;
     uint32_t                 max_subgroup_size;
     vio_coopmat_shape        coopmat_shapes[VIO_COOPMAT_MAX_SHAPES];
+    /* VIO_UPSCALE_VK_* enabled at device creation because a native upscaler's
+     * runtime was found (vio_upscale_vk_device_needs, TEMPORAL-S3). */
+    unsigned                 upscale_features;
     /* HDR10 output (GAP-PHASE5 Block 10d): vio_create(['hdr_output' => 1|2]). */
     int                      hdr_request;          /* 0 off, 1 when the surface offers HDR10 ST 2084, 2 forced 10-bit */
     int                      hdr_output;           /* 1 => 10-bit swapchain, the 2D batch PQ-encodes */
@@ -677,6 +680,18 @@ void  vio_vk3d_draw_instanced_from_storage(void *mesh_obj, int count);
 void  vio_vk3d_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset);
 void  vio_vk3d_draw_mesh_tasks(uint32_t x, uint32_t y, uint32_t z);
 void  vio_vk3d_draw_mesh_tasks_indirect(void *args_buffer, int max_draws, size_t offset);
+
+/* ── Native upscalers (vio_vulkan_upscale.c, TEMPORAL-S3) ── */
+struct _vio_upscale_create_desc;
+struct _vio_upscale_dispatch_desc;
+struct _vio_upscale_query;
+int   vulkan_upscaler_supported(int provider, char *reason, size_t reason_len);
+int   vulkan_upscaler_any(void);
+void *vulkan_upscaler_create(const struct _vio_upscale_create_desc *desc, char *reason, size_t reason_len);
+int   vulkan_upscaler_dispatch(void *upscaler, const struct _vio_upscale_dispatch_desc *desc, char *err, size_t err_len);
+int   vulkan_upscaler_query(void *upscaler, int provider, struct _vio_upscale_query *q);
+void  vulkan_upscaler_destroy(void *upscaler);
+int   vulkan_upscaler_device_requirements(int provider, char *out, size_t out_len);
 
 #endif /* HAVE_VULKAN */
 #endif /* VIO_VULKAN_H */

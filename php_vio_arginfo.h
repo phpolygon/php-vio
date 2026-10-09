@@ -536,6 +536,31 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscale_info, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscaler_supported, 0, 1, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, provider, IS_LONG, 0, "VIO_UPSCALER_FSR3")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscaler_info, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, which, VioUpscaler, MAY_BE_LONG, "VIO_UPSCALER_FSR3")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_upscaler_create, 0, 2, VioUpscaler, MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, options, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscaler_dispatch, 0, 3, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_INFO(0, upscaler, VioUpscaler, 0)
+	ZEND_ARG_TYPE_INFO(0, inputs, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscaler_destroy, 0, 1, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, upscaler, VioUpscaler, 0)
+ZEND_END_ARG_INFO()
 /* ── 2D API functions ────────────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_rect, 0, 5, IS_VOID, 0)
@@ -1177,6 +1202,11 @@ ZEND_FUNCTION(vio_bundle_info);
 ZEND_FUNCTION(vio_upscale);
 ZEND_FUNCTION(vio_upscale_jitter);
 ZEND_FUNCTION(vio_upscale_info);
+ZEND_FUNCTION(vio_upscaler_supported);
+ZEND_FUNCTION(vio_upscaler_info);
+ZEND_FUNCTION(vio_upscaler_create);
+ZEND_FUNCTION(vio_upscaler_dispatch);
+ZEND_FUNCTION(vio_upscaler_destroy);
 ZEND_FUNCTION(vio_shader_reflect);
 ZEND_FUNCTION(vio_audio_load);
 ZEND_FUNCTION(vio_audio_play);
@@ -1382,6 +1412,11 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_upscale, arginfo_vio_upscale)
 	ZEND_FE(vio_upscale_jitter, arginfo_vio_upscale_jitter)
 	ZEND_FE(vio_upscale_info, arginfo_vio_upscale_info)
+	ZEND_FE(vio_upscaler_supported, arginfo_vio_upscaler_supported)
+	ZEND_FE(vio_upscaler_info, arginfo_vio_upscaler_info)
+	ZEND_FE(vio_upscaler_create, arginfo_vio_upscaler_create)
+	ZEND_FE(vio_upscaler_dispatch, arginfo_vio_upscaler_dispatch)
+	ZEND_FE(vio_upscaler_destroy, arginfo_vio_upscaler_destroy)
 	ZEND_FE(vio_shader_reflect, arginfo_vio_shader_reflect)
 	ZEND_FE(vio_audio_load, arginfo_vio_audio_load)
 	ZEND_FE(vio_audio_play, arginfo_vio_audio_play)

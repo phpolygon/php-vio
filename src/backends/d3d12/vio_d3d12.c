@@ -35,6 +35,7 @@
 #include "../../vio_texfmt.h"
 #include "../../vio_shader_cache.h"
 #include "../../vio_render_target.h"
+#include "../../upscale/vio_upscale.h"   /* native upscalers (TEMPORAL-S3) */
 
 /* DXC front end (vio_dxc.cpp, GAP-PHASE5 Block 7). */
 int  vio_dxc_available(void);
@@ -7753,6 +7754,189 @@ static void d3d12_reopen_frame_list(void)
     d3d12_restore_graphics_state_after_compute();
 }
 
+/* ── Native upscalers (vio_upscaler_*, TEMPORAL-S3) ─────────────────────
+ * The provider (src/upscale/, FSR 3.1 ...) records its compute passes on the
+ * frame list. This side hands it the native resources in
+ * PIXEL_SHADER_RESOURCE - where colour attachments and sampled depths rest
+ * between binds anyway; the provider returns them there - and re-arms the
+ * graphics state afterwards. A bound target that takes part goes back to
+ * RENDER_TARGET / DEPTH_WRITE, so the binding stays usable. */
+
+static void d3d12_upscale_device(vio_upscale_device *dev)
+{
+    memset(dev, 0, sizeof(*dev));
+    dev->api = VIO_UPSCALE_API_D3D12;
+    dev->device = vio_d3d12.device;
+}
+
+static int d3d12_upscaler_supported(int provider, char *reason, size_t reason_len)
+{
+    if (!vio_d3d12.device) {
+        snprintf(reason, reason_len, "no D3D12 device");
+        return 0;
+    }
+    vio_upscale_device dev;
+    d3d12_upscale_device(&dev);
+    return vio_upscale_supported_on(&dev, provider, reason, reason_len, NULL);
+}
+
+static int d3d12_upscaler_any(void)
+{
+    char reason[256];
+    for (int p = 1; p <= VIO_UPSCALER_COUNT; p++) {
+        if (d3d12_upscaler_supported(p, reason, sizeof(reason))) return 1;
+    }
+    return 0;
+}
+
+static void *d3d12_upscaler_create(const vio_upscale_create_desc *desc, char *reason, size_t reason_len)
+{
+    vio_upscale_device dev;
+    d3d12_upscale_device(&dev);
+    void *u = vio_upscale_create_on(&dev, desc, reason, reason_len);
+    d3d12_drain_info_queue("upscaler_create");
+    return u;
+}
+
+static int d3d12_upscaler_query(void *upscaler, int provider, vio_upscale_query *q)
+{
+    if (upscaler) return vio_upscale_query_instance(upscaler, q);
+    char reason[256];
+    vio_upscale_device dev;
+    d3d12_upscale_device(&dev);
+    return vio_upscale_supported_on(&dev, provider, reason, sizeof(reason), q) ? 0 : -1;
+}
+
+static void d3d12_upscaler_destroy(void *upscaler)
+{
+    if (!upscaler) return;
+    /* Its resources may sit on the open frame list or on frames in flight. */
+    if (vio_d3d12.in_frame && vio_d3d12.cmd_list) {
+        vio_d3d12.compute_async_pending = 1;
+        d3d12_compute_wait();
+    } else if (vio_d3d12.device) {
+        vio_d3d12_wait_for_gpu();
+    }
+    vio_upscale_destroy_instance(upscaler);
+    d3d12_drain_info_queue("upscaler_destroy");
+}
+
+static int d3d12_upscaler_device_requirements(int provider, char *out, size_t out_len)
+{
+    (void)provider;
+    if (out_len) out[0] = '\0';   /* a D3D12 device needs nothing enabled up front */
+    return 0;
+}
+
+/* Every colour attachment of a single-sample target from one state to another. */
+static void d3d12_rt_colors_barrier(vio_render_target_object *rt, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+    int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
+    for (int ai = 0; ai < n && ai < VIO_MAX_COLOR_ATTACHMENTS; ai++) {
+        ID3D12Resource *res = ai == 0 ? (ID3D12Resource *)rt->d3d12_color_resource : (ID3D12Resource *)rt->d3d12_color_resources[ai];
+        if (res) d3d12_rt_barrier(vio_d3d12.cmd_list, res, from, to);
+    }
+}
+
+/* The native view of one dispatch image, moved to PIXEL_SHADER_RESOURCE.
+ * 1 = filled, 0 = not given, -1 = unusable (err filled). */
+static int d3d12_upscale_image(const vio_upscale_image *in, vio_upscale_native_image *out, const char *what, char *err, size_t err_len)
+{
+    memset(out, 0, sizeof(*out));
+    vio_render_target_object *rt = (vio_render_target_object *)in->rt;
+    if (!rt) return 0;
+    if (!rt->valid || rt->backend_type != VIO_RT_BACKEND_D3D12 || rt->d3d12_msaa_color_resources[0]
+        || rt->d3d12_msaa_layered || rt->d3d12_msaa_depth_only) {
+        snprintf(err, err_len, "'%s' is not a single-sample D3D12 render target", what);
+        return -1;
+    }
+    ID3D12Resource *res;
+    if (in->attachment == VIO_RT_DEPTH) {
+        if (!d3d12_rt_depth_sampled(rt)) {
+            snprintf(err, err_len, "'%s': the target's depth cannot be sampled", what);
+            return -1;
+        }
+        if (!rt->d3d12_depth_is_srv) {
+            d3d12_rt_barrier(vio_d3d12.cmd_list, (ID3D12Resource *)rt->d3d12_depth_resource,
+                             D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            rt->d3d12_depth_is_srv = 1;
+        }
+        res = (ID3D12Resource *)rt->d3d12_depth_resource;
+        out->depth = 1;
+    } else {
+        if (rt->depth_only) {
+            snprintf(err, err_len, "'%s': a depth_only target has no colour attachment", what);
+            return -1;
+        }
+        if (!rt->d3d12_color_is_srv) {
+            d3d12_rt_colors_barrier(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            rt->d3d12_color_is_srv = 1;
+        }
+        res = (ID3D12Resource *)(in->attachment == 0 ? rt->d3d12_color_resource : rt->d3d12_color_resources[in->attachment]);
+    }
+    if (!res) {
+        snprintf(err, err_len, "'%s' has no D3D12 resource", what);
+        return -1;
+    }
+    D3D12_RESOURCE_DESC rd;
+    ID3D12Resource_GetDesc(res, &rd);
+    out->handle  = res;
+    out->format  = (uint32_t)rd.Format;
+    out->width   = (uint32_t)rd.Width;
+    out->height  = (uint32_t)rd.Height;
+    out->storage = (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+    out->stencil = out->depth && (rd.Format == DXGI_FORMAT_R24G8_TYPELESS || rd.Format == DXGI_FORMAT_D24_UNORM_S8_UINT
+                                  || rd.Format == DXGI_FORMAT_R32G8X24_TYPELESS || rd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+    out->state   = VIO_UPSCALE_STATE_SHADER_READ;
+    return 1;
+}
+
+static int d3d12_upscaler_dispatch(void *upscaler, const vio_upscale_dispatch_desc *d, char *err, size_t err_len)
+{
+    if (!vio_d3d12.in_frame || !vio_d3d12.cmd_list) {
+        snprintf(err, err_len, "only between vio_begin and vio_end");
+        return -1;
+    }
+    vio_render_target_object *bound = (vio_render_target_object *)vio_d3d12.current_bound_rt;
+    int bound_color_srv = bound ? bound->d3d12_color_is_srv : 1;
+    int bound_depth_srv = bound ? bound->d3d12_depth_is_srv : 1;
+
+    vio_upscale_native_dispatch nd;
+    memset(&nd, 0, sizeof(nd));
+    nd.command_list = vio_d3d12.cmd_list;
+    nd.desc = d;
+    const vio_upscale_image *src[7] = { &d->color, &d->depth, &d->motion, &d->reactive, &d->transparency, &d->exposure, &d->output };
+    vio_upscale_native_image *dst[7] = { &nd.color, &nd.depth, &nd.motion, &nd.reactive, &nd.transparency, &nd.exposure, &nd.output };
+    static const char *names[7] = { "color", "depth", "motion", "reactive", "transparency", "exposure", "output" };
+    int rc = 0;
+    for (int i = 0; i < 7 && rc == 0; i++) {
+        if (d3d12_upscale_image(src[i], dst[i], names[i], err, err_len) < 0) rc = -1;
+    }
+    if (rc == 0 && !nd.output.storage) {
+        snprintf(err, err_len, "'output' was not created with 'storage' => true");
+        rc = -1;
+    }
+    if (rc == 0) {
+        rc = vio_upscale_dispatch_native(upscaler, &nd, err, err_len);
+        /* The provider set its own heaps, root signature and PSO. */
+        d3d12_restore_graphics_state_after_compute();
+    }
+    /* A bound target that took part is drawn into again. */
+    if (bound && vio_d3d12.current_bound_rt == bound) {
+        if (!bound_color_srv && bound->d3d12_color_is_srv) {
+            d3d12_rt_colors_barrier(bound, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            bound->d3d12_color_is_srv = 0;
+        }
+        if (!bound_depth_srv && bound->d3d12_depth_is_srv) {
+            d3d12_rt_barrier(vio_d3d12.cmd_list, (ID3D12Resource *)bound->d3d12_depth_resource,
+                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            bound->d3d12_depth_is_srv = 0;
+        }
+    }
+    d3d12_drain_info_queue("upscaler_dispatch");
+    return rc;
+}
+
 /* After a kernel / ray tracing launch on `list`: UAV barrier on a STORAGE
  * buffer (UNORDERED_ACCESS by promotion), then copy it into its lazily created
  * READBACK staging buffer, so a later vio_storage_buffer_read just maps it. */
@@ -8979,6 +9163,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 1;
         case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return 1; /* typeless R24G8 depth + SRV, PIXEL_SHADER_RESOURCE between binds */
         case VIO_FEATURE_RENDER_TARGET_STORAGE: return 1; /* ALLOW_UNORDERED_ACCESS attachments, typed UAVs in the compute table */
+        case VIO_FEATURE_UPSCALER_NATIVE:       return d3d12_upscaler_any();   /* FSR 3.1 runtime found + accepts the device */
         /* Multisampled colour + depth resources per target, PSO SampleDesc
          * variants picked at bind time, ResolveSubresource on unbind (GAP-PHASE5
          * Block 1). */
@@ -10122,6 +10307,12 @@ static const vio_backend d3d12_backend = {
     .destroy_bundle                 = d3d12_destroy_bundle,
     .bundle_method                  = d3d12_bundle_method,
     .rt_origin_top     = 1,
+    .upscaler_supported             = d3d12_upscaler_supported,
+    .upscaler_create                = d3d12_upscaler_create,
+    .upscaler_dispatch              = d3d12_upscaler_dispatch,
+    .upscaler_query                 = d3d12_upscaler_query,
+    .upscaler_destroy               = d3d12_upscaler_destroy,
+    .upscaler_device_requirements   = d3d12_upscaler_device_requirements,
 };
 
 void vio_backend_d3d12_register(void)

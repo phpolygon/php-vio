@@ -42,6 +42,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_recorder.h"
 #include "src/vio_stream.h"
 #include "src/vio_thermal.h"
+#include "src/upscale/vio_upscaler.h"
 #include "include/vio_constants.h"
 #include "include/vio_plugin.h"
 #include "vendor/stb/stb_image.h"
@@ -106,6 +107,9 @@ PHP_INI_BEGIN()
     STD_PHP_INI_ENTRY("vio.default_backend", "auto", PHP_INI_ALL, OnUpdateString, default_backend, zend_vio_globals, vio_globals)
     STD_PHP_INI_BOOLEAN("vio.debug", "0", PHP_INI_ALL, OnUpdateBool, debug, zend_vio_globals, vio_globals)
     STD_PHP_INI_BOOLEAN("vio.vsync", "1", PHP_INI_ALL, OnUpdateBool, vsync, zend_vio_globals, vio_globals)
+    /* Where amd_fidelityfx_dx12.dll / amd_fidelityfx_vk.dll live (a directory or
+     * the file itself); when set, the only place searched (vio_upscaler_*). */
+    PHP_INI_ENTRY("vio.ffx_path", "", PHP_INI_ALL, NULL)
 PHP_INI_END()
 
 /* ── PHP function implementations ─────────────────────────────────── */
@@ -999,6 +1003,8 @@ ZEND_FUNCTION(vio_destroy)
          * at vkDestroyDevice (validation error). vio_2d_shutdown is idempotent,
          * so the free handler's later call is a no-op. */
         vio_2d_shutdown(&ctx->state_2d);
+        /* Upscaler contexts hold device objects: gone before the device. */
+        vio_upscaler_sweep(ctx->backend);
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }
@@ -7031,6 +7037,349 @@ ZEND_FUNCTION(vio_upscale_info)
     add_assoc_string(return_value, "temporal", (char *)(tp ? tp : "portable"));
 }
 
+/* ── Native upscalers (vio_upscaler_*, TEMPORAL-S3) ─────────────────────
+ * FSR 3.1 (later DLSS / XeSS) through the backend's upscaler_* slots and the
+ * provider layer in src/upscale/. A missing runtime library is not an error:
+ * supported() is false and info() says why. */
+
+static int vio_upscaler_provider_arg(zend_long provider, uint32_t arg)
+{
+    if (provider < 1 || provider > VIO_UPSCALER_COUNT) {
+        zend_argument_value_error(arg, "must be a VIO_UPSCALER_* constant");
+        return 0;
+    }
+    return 1;
+}
+
+/* 1 = provider usable on the context's device; 0 with the reason otherwise. */
+static int vio_upscaler_check(vio_context_object *ctx, int provider, char *reason, size_t reason_len)
+{
+    reason[0] = '\0';
+    if (!ctx->initialized || !ctx->backend) {
+        snprintf(reason, reason_len, "context not initialized");
+        return 0;
+    }
+    if (!ctx->backend->upscaler_supported) {
+        snprintf(reason, reason_len, "backend '%s' has no native upscaler (D3D12 and Vulkan only)", ctx->backend->name);
+        return 0;
+    }
+    if (ctx->backend->upscaler_supported(provider, reason, reason_len)) return 1;
+    if (!reason[0]) snprintf(reason, reason_len, "not supported on this device");
+    return 0;
+}
+
+/* vio_upscaler_supported($ctx, $provider = VIO_UPSCALER_FSR3): never warns. */
+ZEND_FUNCTION(vio_upscaler_supported)
+{
+    zval *ctx_zval;
+    zend_long provider = VIO_UPSCALER_FSR3;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(provider)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!vio_upscaler_provider_arg(provider, 2)) RETURN_THROWS();
+    char reason[512];
+    RETURN_BOOL(vio_upscaler_check(Z_VIO_CONTEXT_P(ctx_zval), (int)provider, reason, sizeof(reason)));
+}
+
+/* vio_upscaler_info($ctx, VioUpscaler|int $which = VIO_UPSCALER_FSR3): the
+ * provider's state on this device; with an upscaler also its sizes. */
+ZEND_FUNCTION(vio_upscaler_info)
+{
+    zval *ctx_zval;
+    zend_object *u_obj = NULL;
+    zend_long provider = VIO_UPSCALER_FSR3;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_OBJ_OF_CLASS_OR_LONG(u_obj, vio_upscaler_ce, provider)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_upscaler_object *u = u_obj ? vio_upscaler_from_obj(u_obj) : NULL;
+    if (u) provider = u->desc.provider;
+    else if (!vio_upscaler_provider_arg(provider, 2)) RETURN_THROWS();
+
+    const vio_backend *be = ctx->initialized ? ctx->backend : NULL;
+    char reason[512];
+    int ok = vio_upscaler_check(ctx, (int)provider, reason, sizeof(reason));
+    vio_upscale_query q;
+    memset(&q, 0, sizeof(q));
+    if (ok && be->upscaler_query) be->upscaler_query(NULL, (int)provider, &q);
+    char device[256] = "";
+    if (be && be->upscaler_device_requirements) be->upscaler_device_requirements((int)provider, device, sizeof(device));
+
+    array_init(return_value);
+    add_assoc_string(return_value, "provider", (char *)vio_upscale_provider_name((int)provider));
+    add_assoc_string(return_value, "backend", (char *)(be ? be->name : ""));
+    add_assoc_bool(return_value, "supported", ok);
+    add_assoc_string(return_value, "reason", ok ? "" : reason);
+    add_assoc_string(return_value, "version", q.version);
+    add_assoc_string(return_value, "library", q.library);
+    add_assoc_string(return_value, "device", device);
+    add_assoc_long(return_value, "live", be ? vio_upscaler_live_count(be) : 0);
+    add_assoc_long(return_value, "host_bytes", (zend_long)vio_upscale_host_bytes());
+    if (u) {
+        add_assoc_bool(return_value, "valid", u->valid && u->backend == be);
+        add_assoc_long(return_value, "quality", u->desc.quality);
+        add_assoc_long(return_value, "render_width", u->desc.render_width);
+        add_assoc_long(return_value, "render_height", u->desc.render_height);
+        add_assoc_long(return_value, "display_width", u->desc.display_width);
+        add_assoc_long(return_value, "display_height", u->desc.display_height);
+        vio_upscale_query uq;
+        memset(&uq, 0, sizeof(uq));
+        uq.jitter_phases = vio_upscale_jitter_phases(u->desc.render_width, u->desc.display_width);
+        if (u->valid && u->backend == be && be->upscaler_query) be->upscaler_query(u->handle, (int)provider, &uq);
+        add_assoc_long(return_value, "jitter_phases", uq.jitter_phases);
+        add_assoc_long(return_value, "gpu_memory", (zend_long)uq.gpu_memory);
+    }
+}
+
+static int vio_upscaler_bool_opt(HashTable *ht, const char *key)
+{
+    zval *v = zend_hash_str_find(ht, key, strlen(key));
+    return v && zend_is_true(v);
+}
+
+/* vio_upscaler_create($ctx, ['display_width' => W, 'display_height' => H,
+ * 'provider' => VIO_UPSCALER_FSR3, 'quality' => VIO_UPSCALE_QUALITY,
+ * 'render_width' / 'render_height' (largest render size; default from quality),
+ * 'hdr', 'depth_inverted', 'depth_infinite', 'auto_exposure',
+ * 'dynamic_resolution', 'jittered_motion', 'debug' => bool]) */
+ZEND_FUNCTION(vio_upscaler_create)
+{
+    zval *ctx_zval;
+    HashTable *opts;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    vio_upscale_create_desc d;
+    memset(&d, 0, sizeof(d));
+    zval *v;
+    zend_long provider = VIO_UPSCALER_FSR3, quality = VIO_UPSCALE_QUALITY;
+    if ((v = zend_hash_str_find(opts, "provider", sizeof("provider") - 1)) != NULL) provider = zval_get_long(v);
+    if (provider < 1 || provider > VIO_UPSCALER_COUNT) {
+        zend_argument_value_error(2, "'provider' must be a VIO_UPSCALER_* constant");
+        RETURN_THROWS();
+    }
+    if ((v = zend_hash_str_find(opts, "quality", sizeof("quality") - 1)) != NULL) quality = zval_get_long(v);
+    if (quality < VIO_UPSCALE_NATIVE_AA || quality > VIO_UPSCALE_ULTRA_PERFORMANCE) {
+        zend_argument_value_error(2, "'quality' must be a VIO_UPSCALE_NATIVE_AA..VIO_UPSCALE_ULTRA_PERFORMANCE constant");
+        RETURN_THROWS();
+    }
+    zval *dw = zend_hash_str_find(opts, "display_width", sizeof("display_width") - 1);
+    zval *dh = zend_hash_str_find(opts, "display_height", sizeof("display_height") - 1);
+    zend_long dwl = dw ? zval_get_long(dw) : 0, dhl = dh ? zval_get_long(dh) : 0;
+    if (dwl < 1 || dhl < 1 || dwl > 16384 || dhl > 16384) {
+        zend_argument_value_error(2, "needs 'display_width' and 'display_height' (1..16384)");
+        RETURN_THROWS();
+    }
+    d.provider = (int)provider;
+    d.quality = (int)quality;
+    d.display_width = (int)dwl;
+    d.display_height = (int)dhl;
+    vio_upscale_render_size(d.quality, d.display_width, d.display_height, &d.render_width, &d.render_height);
+    zval *rw = zend_hash_str_find(opts, "render_width", sizeof("render_width") - 1);
+    zval *rh = zend_hash_str_find(opts, "render_height", sizeof("render_height") - 1);
+    if (rw || rh) {
+        zend_long rwl = rw ? zval_get_long(rw) : d.render_width, rhl = rh ? zval_get_long(rh) : d.render_height;
+        if (rwl < 1 || rhl < 1 || rwl > dwl || rhl > dhl) {
+            zend_argument_value_error(2, "'render_width' / 'render_height' must be 1..the display size");
+            RETURN_THROWS();
+        }
+        d.render_width = (int)rwl;
+        d.render_height = (int)rhl;
+    }
+    if (vio_upscaler_bool_opt(opts, "hdr"))                d.flags |= VIO_UPSCALE_FLAG_HDR;
+    if (vio_upscaler_bool_opt(opts, "depth_inverted"))     d.flags |= VIO_UPSCALE_FLAG_DEPTH_INVERTED;
+    if (vio_upscaler_bool_opt(opts, "depth_infinite"))     d.flags |= VIO_UPSCALE_FLAG_DEPTH_INFINITE;
+    if (vio_upscaler_bool_opt(opts, "auto_exposure"))      d.flags |= VIO_UPSCALE_FLAG_AUTO_EXPOSURE;
+    if (vio_upscaler_bool_opt(opts, "dynamic_resolution")) d.flags |= VIO_UPSCALE_FLAG_DYNAMIC_RES;
+    if (vio_upscaler_bool_opt(opts, "jittered_motion"))    d.flags |= VIO_UPSCALE_FLAG_MV_JITTERED;
+    if (vio_upscaler_bool_opt(opts, "debug"))              d.flags |= VIO_UPSCALE_FLAG_DEBUG;
+
+    char reason[512];
+    if (!vio_upscaler_check(ctx, d.provider, reason, sizeof(reason)) || !ctx->backend->upscaler_create) {
+        php_error_docref(NULL, E_WARNING, "vio_upscaler_create: %s", reason[0] ? reason : "not supported");
+        RETURN_FALSE;
+    }
+    reason[0] = '\0';
+    void *h = ctx->backend->upscaler_create(&d, reason, sizeof(reason));
+    if (!h) {
+        php_error_docref(NULL, E_WARNING, "vio_upscaler_create: %s", reason[0] ? reason : "the provider could not create a context");
+        RETURN_FALSE;
+    }
+    object_init_ex(return_value, vio_upscaler_ce);
+    vio_upscaler_object *u = Z_VIO_UPSCALER_P(return_value);
+    u->handle = h;
+    u->backend = ctx->backend;
+    u->desc = d;
+    u->valid = 1;
+    vio_upscaler_track(u);
+}
+
+/* One dispatch image: VioRenderTarget (attachment `def`) or [VioRenderTarget, attachment].
+ * 1 = set, 0 = not given, -1 = exception thrown. */
+static int vio_upscaler_image_arg(HashTable *in, const char *key, int required, int def,
+                                  const vio_backend *be, vio_upscale_image *out)
+{
+    zval *v = zend_hash_str_find(in, key, strlen(key));
+    out->rt = NULL;
+    out->attachment = def;
+    if (!v || Z_TYPE_P(v) == IS_NULL) {
+        if (required) {
+            zend_argument_value_error(3, "needs '%s' => VioRenderTarget | [VioRenderTarget, attachment]", key);
+            return -1;
+        }
+        return 0;
+    }
+    zval *rtz = v;
+    zend_long att = def;
+    if (Z_TYPE_P(v) == IS_ARRAY) {
+        rtz = zend_hash_index_find(Z_ARRVAL_P(v), 0);
+        zval *az = zend_hash_index_find(Z_ARRVAL_P(v), 1);
+        if (az) att = zval_get_long(az);
+    }
+    if (!rtz || Z_TYPE_P(rtz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(rtz), vio_render_target_ce)) {
+        zend_argument_type_error(3, "'%s' must be VioRenderTarget | [VioRenderTarget, attachment]", key);
+        return -1;
+    }
+    vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rtz);
+    if (!rt->valid || rt->backend != be) {
+        zend_argument_value_error(3, "'%s' is not a live render target of this context", key);
+        return -1;
+    }
+    if (rt->samples > 1 || rt->is_cube || rt->layers > 1 || rt->rate_active) {
+        zend_argument_value_error(3, "'%s' must be a single-sample 2D render target", key);
+        return -1;
+    }
+    int count = rt->depth_only ? 0 : (rt->attachment_count > 0 ? rt->attachment_count : 1);
+    if (att != VIO_RT_DEPTH && (att < 0 || att >= count)) {
+        zend_argument_value_error(3, "'%s': attachment %d does not exist (VIO_RT_DEPTH or 0..%d)", key, (int)att, count - 1);
+        return -1;
+    }
+    out->rt = rt;
+    out->attachment = (int)att;
+    return 1;
+}
+
+static int vio_upscaler_pair_arg(HashTable *in, const char *key, float *x, float *y)
+{
+    zval *v = zend_hash_str_find(in, key, strlen(key));
+    if (!v) return 1;
+    zval *a, *b;
+    if (Z_TYPE_P(v) != IS_ARRAY || !(a = zend_hash_index_find(Z_ARRVAL_P(v), 0)) || !(b = zend_hash_index_find(Z_ARRVAL_P(v), 1))) {
+        zend_argument_value_error(3, "'%s' must be [x, y]", key);
+        return 0;
+    }
+    *x = (float)zval_get_double(a);
+    *y = (float)zval_get_double(b);
+    return 1;
+}
+
+static float vio_upscaler_float_opt(HashTable *in, const char *key, float def)
+{
+    zval *v = zend_hash_str_find(in, key, strlen(key));
+    return v ? (float)zval_get_double(v) : def;
+}
+
+/* vio_upscaler_dispatch($ctx, $upscaler, ['color' =>, 'depth' =>, 'motion' =>,
+ * 'output' => storage target at display size, 'reactive' / 'transparency' /
+ * 'exposure' =>, 'jitter' => [x, y] render px, 'mv_scale' => [x, y], 'reset',
+ * 'sharpness' => 0..1, 'frame_time_ms', 'near', 'far', 'fov_y', 'pre_exposure',
+ * 'view_to_meters', 'render_width' / 'render_height']) - inside a frame. */
+ZEND_FUNCTION(vio_upscaler_dispatch)
+{
+    zval *ctx_zval, *u_zval;
+    HashTable *in;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(u_zval, vio_upscaler_ce)
+        Z_PARAM_ARRAY_HT(in)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_upscaler_object *u = Z_VIO_UPSCALER_P(u_zval);
+    if (!u->valid || !ctx->initialized || u->backend != ctx->backend || !ctx->backend->upscaler_dispatch) {
+        php_error_docref(NULL, E_WARNING, "vio_upscaler_dispatch: the upscaler is destroyed or belongs to another context");
+        RETURN_FALSE;
+    }
+    const vio_backend *be = ctx->backend;
+    vio_upscale_dispatch_desc d;
+    memset(&d, 0, sizeof(d));
+    if (vio_upscaler_image_arg(in, "color", 1, 0, be, &d.color) < 0) RETURN_THROWS();
+    if (vio_upscaler_image_arg(in, "depth", 1, VIO_RT_DEPTH, be, &d.depth) < 0) RETURN_THROWS();
+    if (vio_upscaler_image_arg(in, "motion", 1, 0, be, &d.motion) < 0) RETURN_THROWS();
+    if (vio_upscaler_image_arg(in, "output", 1, 0, be, &d.output) < 0) RETURN_THROWS();
+    if (vio_upscaler_image_arg(in, "reactive", 0, 0, be, &d.reactive) < 0) RETURN_THROWS();
+    if (vio_upscaler_image_arg(in, "transparency", 0, 0, be, &d.transparency) < 0) RETURN_THROWS();
+    if (vio_upscaler_image_arg(in, "exposure", 0, 0, be, &d.exposure) < 0) RETURN_THROWS();
+
+    vio_render_target_object *color = (vio_render_target_object *)d.color.rt;
+    vio_render_target_object *out = (vio_render_target_object *)d.output.rt;
+    if (d.color.attachment == VIO_RT_DEPTH || d.motion.attachment == VIO_RT_DEPTH || d.output.attachment == VIO_RT_DEPTH) {
+        zend_argument_value_error(3, "'color', 'motion' and 'output' are colour attachments");
+        RETURN_THROWS();
+    }
+    if (!out->storage) {
+        zend_argument_value_error(3, "'output' must be created with 'storage' => true (VIO_FEATURE_RENDER_TARGET_STORAGE)");
+        RETURN_THROWS();
+    }
+    if (out->width != u->desc.display_width || out->height != u->desc.display_height) {
+        zend_argument_value_error(3, "'output' must be %dx%d (the display size), is %dx%d",
+                                  u->desc.display_width, u->desc.display_height, out->width, out->height);
+        RETURN_THROWS();
+    }
+    zval *v;
+    d.render_width = color->width < u->desc.render_width ? color->width : u->desc.render_width;
+    d.render_height = color->height < u->desc.render_height ? color->height : u->desc.render_height;
+    if ((v = zend_hash_str_find(in, "render_width", sizeof("render_width") - 1)) != NULL) d.render_width = (int)zval_get_long(v);
+    if ((v = zend_hash_str_find(in, "render_height", sizeof("render_height") - 1)) != NULL) d.render_height = (int)zval_get_long(v);
+    if (d.render_width < 1 || d.render_height < 1 || d.render_width > u->desc.render_width || d.render_height > u->desc.render_height
+        || d.render_width > color->width || d.render_height > color->height) {
+        zend_argument_value_error(3, "the render size %dx%d must fit the colour target and the upscaler's %dx%d",
+                                  d.render_width, d.render_height, u->desc.render_width, u->desc.render_height);
+        RETURN_THROWS();
+    }
+    d.mv_scale_x = d.mv_scale_y = 1.0f;
+    if (!vio_upscaler_pair_arg(in, "jitter", &d.jitter_x, &d.jitter_y)) RETURN_THROWS();
+    if (!vio_upscaler_pair_arg(in, "mv_scale", &d.mv_scale_x, &d.mv_scale_y)) RETURN_THROWS();
+    d.reset = vio_upscaler_bool_opt(in, "reset");
+    d.sharpness = vio_upscaler_float_opt(in, "sharpness", 0.0f);
+    if (d.sharpness < 0.0f || d.sharpness > 1.0f) {
+        zend_argument_value_error(3, "'sharpness' must be 0..1");
+        RETURN_THROWS();
+    }
+    d.frame_time_ms = vio_upscaler_float_opt(in, "frame_time_ms", 1000.0f / 60.0f);
+    d.camera_near = vio_upscaler_float_opt(in, "near", 0.1f);
+    d.camera_far = vio_upscaler_float_opt(in, "far", 1000.0f);
+    d.fov_y = vio_upscaler_float_opt(in, "fov_y", 1.0471976f);
+    d.pre_exposure = vio_upscaler_float_opt(in, "pre_exposure", 1.0f);
+    d.view_to_meters = vio_upscaler_float_opt(in, "view_to_meters", 1.0f);
+    if (d.pre_exposure <= 0.0f) {
+        zend_argument_value_error(3, "'pre_exposure' must be > 0");
+        RETURN_THROWS();
+    }
+    char err[512] = "";
+    if (be->upscaler_dispatch(u->handle, &d, err, sizeof(err)) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_upscaler_dispatch: %s", err[0] ? err : "failed");
+        RETURN_FALSE;
+    }
+    RETURN_TRUE;
+}
+
+/* vio_upscaler_destroy($upscaler): frees it now (unset() does the same later). */
+ZEND_FUNCTION(vio_upscaler_destroy)
+{
+    zval *u_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(u_zval, vio_upscaler_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_upscaler_release(Z_VIO_UPSCALER_P(u_zval));
+}
+
 /* ── Phase 5: 2D API functions ───────────────────────────────────── */
 ZEND_FUNCTION(vio_rect)
 {
@@ -11603,6 +11952,15 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_RT_DEPTH", VIO_RT_DEPTH, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE", VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_STORAGE", VIO_FEATURE_RENDER_TARGET_STORAGE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_UPSCALER_NATIVE", VIO_FEATURE_UPSCALER_NATIVE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALER_FSR3", VIO_UPSCALER_FSR3, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALER_DLSS", VIO_UPSCALER_DLSS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALER_XESS", VIO_UPSCALER_XESS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_NATIVE_AA", VIO_UPSCALE_NATIVE_AA, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_QUALITY", VIO_UPSCALE_QUALITY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_BALANCED", VIO_UPSCALE_BALANCED, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_PERFORMANCE", VIO_UPSCALE_PERFORMANCE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_ULTRA_PERFORMANCE", VIO_UPSCALE_ULTRA_PERFORMANCE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALE_SPATIAL", VIO_UPSCALE_SPATIAL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALE_TEMPORAL", VIO_UPSCALE_TEMPORAL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_VIEWPORT", VIO_FEATURE_MULTI_VIEWPORT, CONST_CS | CONST_PERSISTENT);
@@ -14279,6 +14637,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_bundle_register();
     vio_rt_pipeline_register();
     vio_work_graph_register();
+    vio_upscaler_register();
     vio_font_register();
     vio_font_face_register();
     vio_sound_register();

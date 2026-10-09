@@ -52,6 +52,7 @@ if (PHP_VIO != "no") {
         "src\\vio_recorder.c " +
         "src\\vio_stream.c " +
         "src\\vio_thermal.c " +
+        "src\\upscale\\vio_upscale.c " +
         "src\\vio_plugin_registry.c " +
         "src\\vio_backend_null.c " +
         "src\\backends\\opengl\\vio_opengl.c " +
@@ -61,6 +62,7 @@ if (PHP_VIO != "no") {
         "src\\backends\\vulkan\\vio_vulkan_3d_shader.c " +
         "src\\backends\\vulkan\\vio_vulkan_rt.c " +
         "src\\backends\\vulkan\\vio_vulkan_cube.c " +
+        "src\\backends\\vulkan\\vio_vulkan_upscale.c " +
         "src\\backends\\d3d11\\vio_d3d11.c " +
         "src\\backends\\d3d12\\vio_d3d12.c " +
         "src\\backends\\d3d12\\vio_dxc.cpp " +

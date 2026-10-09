@@ -459,6 +459,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_recorder.c \
     src/vio_stream.c \
     src/vio_thermal.c \
+    src/upscale/vio_upscale.c \
     src/vio_plugin_registry.c \
     src/vio_backend_null.c \
     src/backends/opengl/vio_opengl.c \
@@ -468,6 +469,7 @@ if test "$PHP_VIO" != "no"; then
     src/backends/vulkan/vio_vulkan_3d_shader.c \
     src/backends/vulkan/vio_vulkan_rt.c \
     src/backends/vulkan/vio_vulkan_cube.c \
+    src/backends/vulkan/vio_vulkan_upscale.c \
     vendor/glad/src/glad.c \
     vendor/stb/stb_image_impl.c \
     vendor/stb/stb_truetype_impl.c \
@@ -616,6 +618,7 @@ if test "$PHP_VIO" != "no"; then
 
   dnl ── Build directories ──────────────────────────────────────────
   PHP_ADD_BUILD_DIR($ext_builddir/src)
+  PHP_ADD_BUILD_DIR($ext_builddir/src/upscale)
   PHP_ADD_BUILD_DIR($ext_builddir/src/platform/x11)
   PHP_ADD_BUILD_DIR($ext_builddir/src/platform/wayland)
   PHP_ADD_BUILD_DIR($ext_builddir/src/platform/cocoa)

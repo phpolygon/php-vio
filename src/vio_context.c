@@ -3,6 +3,7 @@
  */
 
 #include "vio_context.h"
+#include "upscale/vio_upscaler.h"
 
 zend_class_entry *vio_context_ce = NULL;
 static zend_object_handlers vio_context_handlers;
@@ -97,6 +98,7 @@ static void vio_context_free_object(zend_object *obj)
          * unconditional call below — needed when vio_destroy already ran the
          * backend teardown — is a harmless no-op. */
         vio_2d_shutdown(&ctx->state_2d);
+        vio_upscaler_sweep(ctx->backend);   /* upscaler contexts hold device objects */
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }

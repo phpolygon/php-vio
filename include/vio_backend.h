@@ -12,6 +12,11 @@
 #define VIO_BACKEND_API_VERSION 1
 #define VIO_MAX_BACKENDS 8
 
+/* src/upscale/vio_upscale.h (upscaler_* slots at the end of the vtable). */
+struct _vio_upscale_create_desc;
+struct _vio_upscale_dispatch_desc;
+struct _vio_upscale_query;
+
 typedef struct _vio_backend {
     const char *name;   /* "opengl", "vulkan", "metal" */
     int api_version;    /* Must match VIO_BACKEND_API_VERSION */
@@ -540,6 +545,26 @@ typedef struct _vio_backend {
      * that device, same size and format as the swapchain (0 = done). */
     void       *(*encode_device)(int *api);
     int         (*encode_copy_frame)(void *dst_texture, int slice, int width, int height);
+
+    /* Native temporal upscalers (vio_upscaler_*, TEMPORAL-S3; types and the
+     * provider layer in src/upscale/vio_upscale.h). All optional: NULL = the
+     * backend has none (vio_upscaler_supported() is false with a reason).
+     * upscaler_supported: 1 when provider `provider` (VIO_UPSCALER_*) runs on the
+     *   open device, else 0 and `reason` says why (missing library, ...). No warning.
+     * upscaler_create: a provider context for the description, NULL + reason.
+     * upscaler_dispatch: records the upscale on the frame's command list (only
+     *   between begin_frame and end_frame); the bound target stays bound. 0 = done.
+     * upscaler_query: version / library (upscaler NULL: of `provider`) or the
+     *   upscaler's sizes and GPU memory. 0 = filled.
+     * upscaler_destroy: waits for the GPU work that references it, then frees it.
+     * upscaler_device_requirements: what device creation enabled for `provider`
+     *   (Vulkan: features a provider uses when present), comma separated. */
+    int   (*upscaler_supported)(int provider, char *reason, size_t reason_len);
+    void *(*upscaler_create)(const struct _vio_upscale_create_desc *desc, char *reason, size_t reason_len);
+    int   (*upscaler_dispatch)(void *upscaler, const struct _vio_upscale_dispatch_desc *desc, char *err, size_t err_len);
+    int   (*upscaler_query)(void *upscaler, int provider, struct _vio_upscale_query *out);
+    void  (*upscaler_destroy)(void *upscaler);
+    int   (*upscaler_device_requirements)(int provider, char *out, size_t out_len);
 } vio_backend;
 
 #define VIO_MAX_FRAGMENT_STORAGE 4

@@ -1216,6 +1216,72 @@ function vio_upscale_jitter(int $frame, int $phases = 8): array {}
 
 /** ['spatial' => 'portable' | 'metalfx', 'temporal' => 'portable' | 'metalfx'] */
 function vio_upscale_info(VioContext $context): array {}
+
+/**
+ * Native temporal upscalers (TEMPORAL-S3): AMD FidelityFX FSR 3.1
+ * (VIO_UPSCALER_FSR3) on D3D12 and Vulkan; VIO_UPSCALER_DLSS / VIO_UPSCALER_XESS
+ * are reserved for further providers. The provider's runtime library
+ * (amd_fidelityfx_dx12.dll / amd_fidelityfx_vk.dll, not shipped with php-vio)
+ * is loaded on first use: from `vio.ffx_path` / VIO_FFX_PATH when set (a
+ * directory or the file - then the only place searched), otherwise next to the
+ * PHP executable, next to php_vio, then PATH. Without it this returns false -
+ * never a warning; vio_upscaler_info()['reason'] says why.
+ * VIO_FEATURE_UPSCALER_NATIVE is set when any provider runs on the device.
+ */
+function vio_upscaler_supported(VioContext $context, int $provider = VIO_UPSCALER_FSR3): bool {}
+
+/**
+ * State of a provider on this device: ['provider' => 'fsr3', 'backend',
+ * 'supported' => bool, 'reason' => why not ('' when supported), 'version'
+ * (e.g. 'FSR 3.1.4'), 'library' (path loaded), 'device' (Vulkan features device
+ * creation enabled for it), 'live' (upscalers alive on the backend),
+ * 'host_bytes' (CPU memory the providers hold)]. With a VioUpscaler also
+ * 'valid', 'quality', 'render_width', 'render_height', 'display_width',
+ * 'display_height', 'jitter_phases' (length of the jitter cycle) and
+ * 'gpu_memory' (bytes).
+ */
+function vio_upscaler_info(VioContext $context, VioUpscaler|int $which = VIO_UPSCALER_FSR3): array {}
+
+/**
+ * Create an upscaler context. Options:
+ *   'display_width', 'display_height' (required): output size
+ *   'provider'   => VIO_UPSCALER_FSR3
+ *   'quality'    => VIO_UPSCALE_NATIVE_AA (1.0) | QUALITY (1.5, default) | BALANCED (1.7) |
+ *                   PERFORMANCE (2.0) | ULTRA_PERFORMANCE (3.0): display / render per axis
+ *   'render_width', 'render_height': largest render size (default from the quality)
+ *   'hdr' (linear HDR colour), 'depth_inverted' (1 = near), 'depth_infinite',
+ *   'auto_exposure', 'dynamic_resolution', 'jittered_motion' (motion includes
+ *   the jitter), 'debug' (the provider checks the API use; messages to stderr) => bool
+ * False with a warning when the provider is not supported (see vio_upscaler_info).
+ * Destroyed by unset() / vio_upscaler_destroy() / vio_destroy().
+ */
+function vio_upscaler_create(VioContext $context, array $options): VioUpscaler|false {}
+
+/**
+ * Upscale this frame, between vio_begin and vio_end (recorded on the frame;
+ * the bound target stays bound, the bound pipeline too). Inputs are render
+ * targets - VioRenderTarget (attachment 0; for 'depth' its depth) or
+ * [VioRenderTarget, attachment | VIO_RT_DEPTH] - single-sample 2D:
+ *   'color'   render-size colour (jittered)
+ *   'depth'   render-size depth (default [$colorTarget, VIO_RT_DEPTH])
+ *   'motion'  RG16F: per pixel the previous minus the current position in render
+ *             pixels (x right, y down), times 'mv_scale' => [x, y] (default [1, 1])
+ *   'output'  display-size target created with 'storage' => true
+ *   'reactive', 'transparency' (R8, optional), 'exposure' (1x1 R32F, optional)
+ *   'jitter'  => [x, y]: the projection offset this frame in render pixels (x right,
+ *                y down; a pixel samples the scene at its centre - jitter), e.g.
+ *                vio_upscale_jitter($frame, $info['jitter_phases'])
+ *   'reset'   => true on a camera cut
+ *   'sharpness' => 0..1 (0 = no sharpening pass), 'frame_time_ms', 'near', 'far',
+ *   'fov_y' (radians), 'pre_exposure' (> 0), 'view_to_meters',
+ *   'render_width', 'render_height' (default: the colour target, at most the
+ *   upscaler's render size)
+ * False with a warning when the dispatch fails (outside a frame, wrong targets).
+ */
+function vio_upscaler_dispatch(VioContext $context, VioUpscaler $upscaler, array $inputs): bool {}
+
+/** Destroy an upscaler now (waits for the GPU work that uses it). */
+function vio_upscaler_destroy(VioUpscaler $upscaler): void {}
 /**
  * Get the name of the backend in use.
  */

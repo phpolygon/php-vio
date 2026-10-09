@@ -421,6 +421,10 @@ typedef enum _vio_feature {
      * compute storage images (vio_render_target_texture() + vio_compute_bind_image)
      * - a TAA history or upscaler output written by a kernel and drawn into. */
     VIO_FEATURE_RENDER_TARGET_STORAGE = 69,
+    /* vio_upscaler_*: a native temporal upscaler (FSR 3.1, later DLSS / XeSS)
+     * runs on this device - its runtime library was found and accepts the
+     * device (TEMPORAL-S3, D3D12 / Vulkan). */
+    VIO_FEATURE_UPSCALER_NATIVE = 70,
 } vio_feature;
 
 /* Zones per axis of a rate map. */
