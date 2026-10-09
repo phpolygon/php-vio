@@ -2506,6 +2506,7 @@ static MTLPixelFormat metal_pixel_format(int vio_fmt)
         case VIO_FORMAT_RGBA16F:    return MTLPixelFormatRGBA16Float;
         case VIO_FORMAT_RGBA32F:    return MTLPixelFormatRGBA32Float;
         case VIO_FORMAT_R11G11B10F: return MTLPixelFormatRG11B10Float;
+        case VIO_FORMAT_RGB10A2:    return MTLPixelFormatRGB10A2Unorm;
         case VIO_FORMAT_RG16F:      return MTLPixelFormatRG16Float;
         case VIO_FORMAT_R16F:       return MTLPixelFormatR16Float;
         case VIO_FORMAT_R32F:       return MTLPixelFormatR32Float;
@@ -2525,6 +2526,7 @@ static int metal_vio_format(MTLPixelFormat f, int *bgra)
         case MTLPixelFormatRGBA16Float: return VIO_FORMAT_RGBA16F;
         case MTLPixelFormatRGBA32Float: return VIO_FORMAT_RGBA32F;
         case MTLPixelFormatRG11B10Float:return VIO_FORMAT_R11G11B10F;
+        case MTLPixelFormatRGB10A2Unorm:return VIO_FORMAT_RGB10A2;
         case MTLPixelFormatRG16Float:   return VIO_FORMAT_RG16F;
         case MTLPixelFormatR16Float:    return VIO_FORMAT_R16F;
         case MTLPixelFormatR32Float:    return VIO_FORMAT_R32F;
