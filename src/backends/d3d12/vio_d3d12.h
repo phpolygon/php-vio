@@ -276,6 +276,11 @@ typedef struct _vio_d3d12_texture {
     D3D12_CPU_DESCRIPTOR_HANDLE fb_uav_cpu;
     D3D12_GPU_DESCRIPTOR_HANDLE fb_uav_gpu;
     int                         fb_region, fb_rx, fb_ry;
+    /* Colour attachment wrappers (vio_render_target_texture): the owning
+     * vio_render_target_object and the attachment, so a 'storage' target binds
+     * as a compute storage image in its own format and resource state. */
+    void                       *rt_owner;
+    int                         rt_attachment;
 } vio_d3d12_texture;
 
 /* Per-frame resources */

@@ -1195,7 +1195,7 @@ static void opengl_destroy_render_target(void *rt_ptr)
         rt->gl_msaa_fbo = 0;
     }
     if (rt->gl_msaa_color_rb) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_color_rb); rt->gl_msaa_color_rb = 0; }
-    for (int i = 1; i < 4; i++)
+    for (int i = 1; i < VIO_MAX_COLOR_ATTACHMENTS; i++)
         if (rt->gl_msaa_color_rbs[i]) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_color_rbs[i]); rt->gl_msaa_color_rbs[i] = 0; }
     if (rt->gl_msaa_depth_rb) { if (live) glDeleteRenderbuffers(1, &rt->gl_msaa_depth_rb); rt->gl_msaa_depth_rb = 0; }
     if (rt->gl_msaa_color_arr) { if (live) glDeleteTextures(1, &rt->gl_msaa_color_arr); rt->gl_msaa_color_arr = 0; }
@@ -1765,9 +1765,30 @@ static int opengl_read_render_target(void *rt_ptr, int face, int attachment, voi
         efree(depth);
     } else {
         /* GL clamps + quantises float formats to UNSIGNED_BYTE for us; the
-         * missing channels of R/RG formats read back as 0 (G/B) and 1 (A). */
-        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out);
+         * missing channels of R/RG formats read back as 0 (G/B) and 1 (A).
+         * 'raw': the attachment's own components and type, packed rows. */
+        int fmt = rt->formats[attachment];
         int stride = w * 4;
+        if (rt->read_raw) {
+            GLenum base = GL_RGBA, type = GL_UNSIGNED_BYTE;
+            switch (fmt) {
+                case VIO_FORMAT_RGBA16F:    base = GL_RGBA; type = GL_HALF_FLOAT; break;
+                case VIO_FORMAT_RGBA32F:    base = GL_RGBA; type = GL_FLOAT; break;
+                case VIO_FORMAT_R11G11B10F: base = GL_RGB;  type = GL_UNSIGNED_INT_10F_11F_11F_REV; break;
+                case VIO_FORMAT_RGB10A2:    base = GL_RGBA; type = GL_UNSIGNED_INT_2_10_10_10_REV; break;
+                case VIO_FORMAT_RG16F:      base = GL_RG;   type = GL_HALF_FLOAT; break;
+                case VIO_FORMAT_R16F:       base = GL_RED;  type = GL_HALF_FLOAT; break;
+                case VIO_FORMAT_R32F:       base = GL_RED;  type = GL_FLOAT; break;
+                case VIO_FORMAT_R8:         base = GL_RED;  type = GL_UNSIGNED_BYTE; break;
+                default: break;
+            }
+            stride = w * vio_rt_format_bpp(fmt);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, w, h, base, type, out);
+            glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        } else {
+            glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out);
+        }
         unsigned char *tmp = (unsigned char *)emalloc(stride);
         for (int y = 0; y < h / 2; y++) {
             unsigned char *top = out + y * stride, *bot = out + (h - 1 - y) * stride;
@@ -3258,6 +3279,7 @@ static int opengl_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET:        return 1;
         case VIO_FEATURE_RENDER_TARGET_HDR:    return 1;       /* RGBA16F since 3.0 */
         case VIO_FEATURE_RENDER_TARGET_DEPTH:  return 1;
+        case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return 1;   /* every target carries a DEPTH24_STENCIL8 texture */
         case VIO_FEATURE_RENDER_TARGET_MSAA:   return 1;
         case VIO_FEATURE_STENCIL:        return 1;             /* DEPTH24_STENCIL8 attachments + glStencil* state */
         case VIO_FEATURE_GPU_TIMESTAMP:  return opengl_has_timer_query(); /* GL_TIMESTAMP queries, core 3.3 */

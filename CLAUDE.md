@@ -4,8 +4,8 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.30.0**, 202 PHP-Funktionen, 18 Zend-Klassen,
-6 Backends, 227 PHPT-Tests. Releases laufen über semantic-release
+für die PHPolygon Game Engine. Aktuell **v2.30.0**, 209 PHP-Funktionen, 18 Zend-Klassen,
+6 Backends, 240 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
 ## Build
@@ -83,6 +83,28 @@ configure --enable-vio --with-glfw=C:\deps\glfw ^
 nmake
 ```
 
+FidelityFX FSR 3.1 (`--with-ffx`, auf Windows Standard an, keine Link-Abhängigkeit): kompiliert gegen `vendor/ffx-api`;
+`amd_fidelityfx_dx12.dll` / `amd_fidelityfx_vk.dll` (aus `PrebuiltSignedDLL/` des FidelityFX-SDK v1.1.4) kommen zur
+Laufzeit neben `php.exe` / `php_vio.dll` oder über `vio.ffx_path` / `VIO_FFX_PATH`. Tests 227/228 skippen ohne sie.
+
+NVIDIA DLSS ist **nicht Teil von php-vio** (TEMPORAL-S4, Plugin): kein NVIDIA-Code, keine NVIDIA-Header, kein Build-Schalter.
+php-vio hat nur die öffentliche, versionierte Plugin-Schnittstelle `include/vio_upscale_plugin.h` (`VIO_UPSCALE_PLUGIN_ABI = 1`,
+Export `vio_upscale_plugin_get(abi, host) → provider`). Der DLSS-Provider ist `vio_dlss.dll` / `libvio_dlss.so` aus dem
+**privaten** Repo `phpolygon/php-vio-dlss` (lokal `D:\PhpstormProjects\php-vio-dlss`, dort die zum Bauen nötigen SDK-Teile;
+SDK selbst: `D:\PhpstormProjects\sdks\DLSS`, v310.9.1). Grund: NVIDIA-RTX-SDK-Lizenz §1c/§2a/§3e – SDK-Teile nur als
+Objektcode innerhalb einer Anwendung weitergeben, nie unter einer Open-Source-Lizenz; php-vio bleibt öffentlich.
+Plugin-Suche: `vio.dlss_plugin_path` / `VIO_DLSS_PLUGIN` (gesetzt: einziger Ort, Verzeichnis oder Datei), sonst neben
+`php.exe`, neben `php_vio.dll`, PATH. Fehlt es oder passt die ABI nicht: `supported = false` mit Grund, keine Warnung.
+Die NVIDIA-Laufzeit `nvngx_dlss.dll` sucht das Plugin selbst (`vio.dlss_path` / `VIO_DLSS_PATH`, sonst neben `php.exe`,
+`php_vio.dll`, dem Plugin, PATH). **Pflichten eines Spiels:** Plugin + `nvngx_dlss.dll` nur mit dem Spiel ausliefern (nie
+mit php-vio), DLSS bzw. „NVIDIA RTX“ in Splash/Credits nennen, das Spiel vor dem Release an NVIDIA melden, eine eigene
+NGX-Projekt-ID (`vio.dlss_project_id`, zufällige GUID) setzen.
+
+Test-Plugin: `nmake` baut `tests/upscale_plugin/vio_test_upscaler.c` (reines C gegen den öffentlichen Header, keine
+Bibliothek gelinkt) als `x64\Release_TS\vio_test_upscaler.dll` neben `php_vio.dll`; Tests 235/236 finden es über
+`extension_dir` (sonst Skip). Unter Linux/macOS von Hand: `cc -shared -fPIC -I include -I <vulkan>/include
+tests/upscale_plugin/vio_test_upscaler.c -o modules/vio_test_upscaler.so`.
+
 Hinweis: Metal-Backend ist macOS-only und wird auf Windows/Linux nicht kompiliert. Alle Backend-Sources sind in `#ifdef HAVE_*` Guards, daher kompiliert ein Build ohne bestimmte Dependencies problemlos — die Features sind dann einfach nicht verfügbar.
 
 ## Tests
@@ -100,10 +122,22 @@ SHADING_RATE_PRIMITIVE,SHADING_RATE_IMAGE,BINDLESS,MESH_SHADER,RAY_QUERY,RAYTRAC
 mit `-d vio.debug=1` (D3D12-Debug-Layer, Vulkan-Validation): mehrere Befunde zeigten sich nur dort. Die
 Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` setzen.
 
-227 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+240 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
+| `tests/render3d/236` | Upscaler-Plugin Ende zu Ende (TEMPORAL-S4, braucht das Test-Plugin `vio_test_upscaler.dll` neben `php_vio`, sonst Skip): als `VIO_UPSCALER_DLSS` geladen meldet es Version/Bibliothek/Treiber/`'plugin'`-Pfad, wählt die Render-Größe (Ultra Performance verweigert: `false` ohne Warnung), bekommt beim Create eine aufnehmende Kommandoliste (auch im offenen Frame), loggt über den Host (Warnung), zählt seinen Hostspeicher (`host_bytes` zurück auf den Ausgangswert), bekommt die nativen Bilder und bringt sie für eine Kopie in COPY_SOURCE/COPY_DEST bzw. TRANSFER_SRC/DST und zurück – die Kopie landet in der Ausgabe (dynamische Render-Größe 16×12), Plugin-Fehler bei Dispatch/Preset kommen als Warnung, die Vulkan-Erweiterung des Plugins (`VK_KHR_push_descriptor`) wird eingeschaltet; D3D12 WARP + GPU und Vulkan mit `'debug' => true`, jede Debug-Layer-/Validation-Zeile bricht den Test (`VIO_TEST_UPSCALER_NO_RESTORE=1` lässt die Zustände bewusst falsch – beide Layer schlagen an). |
+| `tests/render3d/235` | Plugin-ABI (TEMPORAL-S4, braucht das Test-Plugin, sonst Skip): eine Bibliothek ohne `vio_upscale_plugin_get`, ein Plugin, das ABI 1 ablehnt, eines für ABI 2, eines mit zu kleiner Provider-Tabelle und eines für einen anderen Provider werden abgelehnt – `supported = false` mit Grund, keine Warnung, `'plugin'` leer – und nicht behalten: das passende lädt danach im selben Prozess (Steuerung über `VIO_TEST_UPSCALER_*`). |
+| `tests/render3d/234` | Upscaler-Plugin fehlt (TEMPORAL-S4): mit `VIO_DLSS_PLUGIN` bzw. `vio.dlss_plugin_path` (gewinnt) auf einem Ort ohne `vio_dlss.dll` meldet jedes Backend DLSS `supported = false` ohne Warnung, der Grund nennt Datei und Einstellung, `vio_upscaler_info()['plugin']` ist `''` (FSR 3.1 nie ein Plugin), `render_size` `false`, `create` warnt. |
+| `tests/render3d/232` | Vulkan-Validation bei nicht gebundenen Samplern (`'debug' => true`, jede Meldung bricht den Test): ein Textur-Slot hält noch einen Anhang des Ziels, in das der nächste Pass zeichnet (Post sampelt Anhang 1, nächster Frame/gleicher Frame zeichnet wieder hinein, Shader deklariert Sampler, bindet nichts) → Dummy statt Feedback-Loop (`VUID-vkCmdDrawIndexed-imageLayout-00344`); ungebundener Schatten-Sampler → Tiefen-Dummy mit Depth-Attachment-Usage (`VUID-VkImageMemoryBarrier2-oldLayout-01210`); dasselbe um einen nativen Upscaler-Dispatch (falls vorhanden). Auslöser: Engine-`VioNativeUpscalerTest` – deren TAA-Pass band den Slot zufällig neu, der native Pfad nicht. |
+| `tests/render3d/229` | DLSS ohne Laufzeit (TEMPORAL-S4): mit `vio.dlss_path` auf einem Verzeichnis ohne `nvngx_dlss.dll` meldet jedes Backend `supported = false` mit Grund (D3D12/Vulkan: das fehlende Plugin `vio_dlss.dll` bzw. – mit Plugin – die fehlende `nvngx_dlss.dll`) **ohne Warnung**, `vio_upscaler_render_size()` ist `false`, `vio_upscaler_info()` hat `driver`, `create` warnt, Argumentvertrag von `render_size`. Gilt auch mit installiertem DLSS-Plugin auf einer RTX. Die DLSS-Tests mit Laufzeit (Konvergenz, Lebenszyklus, Preset – früher 230, 231, 233) laufen im Repo `php-vio-dlss` gegen php-vio + Plugin. |
+| `tests/render3d/228` | Upscaler-Lebenszyklus (`vio_upscaler_*`, TEMPORAL-S3, braucht die FidelityFX-Laufzeit, sonst Skip): 100 Runden create / 3 Frames dispatch (wechselnde Anzeigegrößen, Qualitätsstufen, dynamische Auflösung, HDR, Reset, Schärfe, Pre-Exposure) / destroy außerhalb und innerhalb des Frames, der ihn benutzt hat – danach kein lebender Upscaler und kein Provider-Hostspeicher (`live`, `host_bytes`), ein zerstörter wird beim Dispatch abgelehnt; `vio_destroy` räumt einen lebenden ab. Sauber unter D3D12-Debug-Layer, Vulkan-Validation (+ Sync) und FSRs eigenem Debug-Checking (`'debug' => true`). |
+| `tests/render3d/227` | FSR 3.1 konvergiert (`VIO_UPSCALER_FSR3`, TEMPORAL-S3, braucht die Laufzeit, sonst Skip): bekanntes Muster in 32×32 mit FSRs Jitter-Folge (`vio_upscale_jitter`, 32 Phasen) und ruhender Kamera auf 64×64 – RMSE gegen die Referenz in Anzeigeauflösung 0,0841 nach 1 Frame, 0,0637 nach einem Jitter-Zyklus, 0,0384 nach vier (bilinear 0,0741), auf D3D12 (Hardware, `headless_hardware`) und Vulkan bitgleich; das während des Dispatch gebundene Target nimmt danach einen Draw; außerhalb eines Frames / Ausgabe ohne `storage` abgelehnt. |
+| `tests/render3d/226` | Native Upscaler ohne Laufzeit (TEMPORAL-S3): mit `vio.ffx_path` auf einem Verzeichnis ohne `amd_fidelityfx_*.dll` meldet jedes Backend (null, GL, D3D11, D3D12, Vulkan, Metal) `supported = false` mit Grund und **ohne Warnung**, `vio_upscaler_info()` hat seine Schlüssel (D3D12/Vulkan nennen die fehlende DLL bzw. „built without“), `vio_upscaler_create` lehnt mit Warnung ab, Argumentvertrag (Provider, Qualitätsstufe, Anzeigegröße → `ValueError`). |
+| `tests/render3d/225` | Render-Targets als Storage-Images (`'storage' => true`, `VIO_FEATURE_RENDER_TARGET_STORAGE`, TEMPORAL-S0): RGBA16F + RGBA8 gezeichnet, ein Kernel liest/schreibt beide über `vio_render_target_texture()` + `vio_compute_bind_image` im Frame (async, ein späterer Draw sampelt das Ergebnis) und ein zweiter danach (sync); das Target bleibt Render-Target (zweiter Draw ohne Clear) und raw lesbar. D3D12 (`ALLOW_UNORDERED_ACCESS`, UAV im eigenen Format, Übergang aus `RENDER_TARGET`/`PIXEL_SHADER_RESOURCE`) und Vulkan (`STORAGE`, ruht in `GENERAL`, RGBA8 als R8G8B8A8); GL/D3D11/Metal lehnen die Option ab. |
+| `tests/render3d/224` | Raw-Readback (`vio_read_render_target($rt, -1, $i, ['raw' => true])`, TEMPORAL-S0): sieben Attachments (RGBA16F, RG16F, R16F, R32F, RGBA8, R11G11B10F, RGB10A2) mit exakt darstellbaren Werten inner- und außerhalb [0, 1], obere Hälfte anders: Bytes bitgenau, oben zuerst wie beim RGBA8-Readback, RGBA8 überall in R, G, B, A. |
+| `tests/render3d/223` | Tiefe eines Farb-Targets sampeln (`vio_render_target_texture($rt, VIO_RT_DEPTH)`, `VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE`, TEMPORAL-S0): gleich der Tiefe eines depth_only-Targets aus denselben Draws in derselben Bind-Kette (Farb-Target → MRT → Schatten), im Frame und danach; Re-Bind ohne Clear testet weiter gegen sie; das Schatten-Target bleibt unberührt; MSAA-Targets lehnen ab. |
+| `tests/render3d/222` | MRT mit mehr als vier Attachments (`VIO_MAX_COLOR_ATTACHMENTS` = 8, TEMPORAL-S0): 4 × RGBA16F + RG16F + R8 in einem Draw, Readback je Attachment, das sechste gesampelt; acht RGBA8-Attachments, ein neuntes wird abgelehnt. |
 | `tests/render3d/220` | Opacity Micromaps (`VIO_FEATURE_OPACITY_MICROMAP`, SM69-PLAN Phase 4): der 164-Verdecker längs der Diagonale geteilt – 2-State-Map ohne Any-Hit (transparente Hälfte wird durchschossen), 4-State mit ignorierendem Any-Hit (Unbekannt-Zustände rufen ihn), `RAY_FLAG_FORCE_OMM_2_STATE`, dasselbe als Inline-Ray-Query im Compute-Kernel (D3D12 braucht `RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS`, ohne trifft die Query nichts), Argument-Vertrag (Länge, Format, Subdivision → `ValueError`; Map ohne Flag → Warning + `false`). `VIO_REQUIRE_OPACITY_MICROMAP`. |
 | `tests/render3d/219` | Shader Execution Reordering (`VIO_FEATURE_SHADER_EXECUTION_REORDER`, Phase 3): Raygen über `hitObjectEXT` / `reorderThreadEXT` (D3D12: HLSL `dx::HitObject` + `dx::MaybeReorderThread` unter `lib_6_9`) schreibt dasselbe Bild wie der gewöhnliche Trace der 164-Szene; der Reorder-Hinweis ändert kein Ergebnis. `VIO_REQUIRE_SHADER_EXECUTION_REORDER`. |
 | `tests/render3d/218` | 16-Bit-Sonderwerte (Phase 1, Vertragstest): `isnan`/`isinf` auf `float16_t` aus Bitmustern (NaN, ±Inf, 1.0, Denormale, 0, größtes Half) klassifizieren im Compute-Kernel auf jedem Backend mit `SHADER_FLOAT16` richtig; Eingaben über `unpackHalf2x16` (NVIDIA-GL kennt `uint16BitsToFloat16` nicht). |
@@ -292,7 +326,10 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | `vio_read_render_target` | ✅ | ✅ | ✅† | ✅ (nach `vio_end`, Face und Attachment) | ✅ |
 | `vio_texture_update` | ✅ | ✅ | ✅ | ✅ (Staging-Buffer + Transient-Command-Buffer, Level 0) | ✅ |
 | `depth_write` / `color_mask` / Blend-Modi | ✅ | ✅ | ✅ | ✅ | ✅ |
-| MRT (`'attachments' => [VIO_FORMAT_*…]`, bis 4) | ✅ | ✅† | ✅† | ✅ (Block 10b) | ✅ |
+| MRT (`'attachments' => [VIO_FORMAT_*…]`, bis `VIO_MAX_COLOR_ATTACHMENTS` = 8) | ✅ | ✅† | ✅† | ✅ (Block 10b; mehr als 4 nur bis `maxColorAttachments`) | ✅ (Code, ungetestet) |
+| Tiefe eines Farb-Targets (`vio_render_target_texture($rt, VIO_RT_DEPTH)`, `VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE`; einfach-gesampelte 2D-Targets) | ✅ (Tiefe ist immer Textur) | ✅ (R24G8 + SRV) | ✅ (R24G8_TYPELESS + SRV, ruht zwischen Binds in `PIXEL_SHADER_RESOURCE`) | ✅ (`SAMPLED`, ruht in `DEPTH_STENCIL_READ_ONLY`) | ✅ (ShaderRead, ungetestet) |
+| Raw-Readback (`vio_read_render_target(…, ['raw' => true])`) | ✅ (`glReadPixels` im Format des Attachments) | ✅ | ✅ | ✅ | ✅ (Code, ungetestet) |
+| Render-Target als Storage-Image (`'storage' => true`, `VIO_FEATURE_RENDER_TARGET_STORAGE`) | ❌ | ❌ | ✅ (`ALLOW_UNORDERED_ACCESS`) | ✅ (`STORAGE`, `GENERAL`) | ❌ |
 | Blend/Write-Mask je Attachment (`attachment_blend`, `attachment_color_mask`) | ✅ (GL ≥ 4.0, indexed) | ✅ (IndependentBlend) | ✅ (IndependentBlend) | ✅ (`independentBlend`) | ✅ (per colorAttachment) |
 | uint16-Indices (automatisch, `vio_mesh_index_bytes`) | ✅ | ✅ (R16_UINT) | ✅ (R16_UINT) | ✅ (`VK_INDEX_TYPE_UINT16`) | ✅ (MTLIndexTypeUInt16) |
 | Shader-/Pipeline-Cache auf Platte (`vio_create(['shader_cache' => dir])`, `vio_shader_cache_stats`) | ✅ (GL ≥ 4.1 Program-Binary) | ✅ (DXBC je Stage) | ✅ (DXBC je Stage) | ✅ (`VkPipelineCache`) | ✅ (`MTLBinaryArchive` je Gerät + OS, Treffer über `FailOnBinaryArchiveMiss`, A22) |
@@ -327,6 +364,7 @@ liefert das zur Laufzeit; `tests/core/074_backend_capability_matrix.phpt` pinnt 
 | HDR10-Ausgabe (`vio_create(['hdr_output' => 1])`, RGB10A2 + ST 2084, 2D-Batch PQ-kodiert, `VIO_FEATURE_HDR_OUTPUT`) | — | ✅ | ✅ (PSO-Format-Varianten) | ✅ (10-Bit-Surface-Format + `VK_EXT_swapchain_colorspace` HDR10 ST 2084, Block 10d) | ✅ (`CAMetalLayer` RGB10A2 im BT.2100-PQ-Farbraum, `hdr_output => 1` nur auf EDR-Displays) |
 | Aufgezeichnete Draw-Folgen (`vio_bundle`, `vio_draw_bundle`, `vio_bundle_info()['method']`; BUNDLE-PLAN, A38) | ✅ Abspielen (C-Schleife über den Draw-Kern) | ✅ (Deferred Context → `ID3D11CommandList`, `ExecuteCommandList` mit Zustands-Restore) | ✅ (Bundle-Command-List: Root-CBVs in einem bundle-eigenen Upload-Puffer, SRV-Tabellen in einem eigenen Bereich des Heaps, Sampler-Tabellen aus einer Reserve oben im Sampler-Heap) | ✅ (Secondary Command Buffer, eigener Upload-Ring und Descriptor-Pools, Pass-Instanz mit `SECONDARY_COMMAND_BUFFERS`) | ✅ Abspielen |
 | Upscaling (`vio_upscale`, `vio_upscale_jitter`, `vio_upscale_info`; UPSCALE-PLAN, A21) | ✅ portabel | ✅ portabel | ✅ portabel | ✅ portabel | ✅ MetalFX spatial (macOS 13+, in ein RT; sonst portabel) |
+| Native Upscaler (`vio_upscaler_*`, FSR 3.1 über die FidelityFX-Laufzeit, DLSS über das Plugin `vio_dlss.dll`, `VIO_FEATURE_UPSCALER_NATIVE`; TEMPORAL-S3/S4) | — | — | ✅ (FSR/DLSS: Hardware-GPU, WARP lehnen die Provider ab) | ✅ (Instanz-/Geräte-Hook vor `vkCreateInstance`/`vkCreateDevice`) | — |
 | Video-Encoding (`vio_recorder(['encoder' => …])`, `vio_recorder_info`; VIDEO-ENCODE-PLAN, A39) | ✅ HW-Encoder, Readback | ✅ HW-Encoder **ohne CPU-Kopie** (D3D11VA-Pool um vios Gerät, BGRA-Kopierpass) | ✅ HW-Encoder, Readback | ✅ HW-Encoder, Readback | ✅ VideoToolbox, Readback |
 | Waitable Swapchain (`vio_create(['frame_latency' => n])`, `vio_swapchain_info`, `VIO_FEATURE_FRAME_LATENCY`) | — | ✅ (`FRAME_LATENCY_WAITABLE_OBJECT`) | ✅ | — (Präsentmodus) | ✅ (Dispatch-Semaphore über die Frames in Flight, 1..3) |
 | GPU-Zeit je Frame (`vio_gpu_frame_time`, `VIO_FEATURE_GPU_TIMESTAMP`) und je benanntem Abschnitt (`vio_gpu_timestamp` / `vio_gpu_timings`, bis 32 Marken) | ✅ (GL ≥ 3.3 `GL_TIMESTAMP`) | ✅ (TIMESTAMP + DISJOINT) | ✅ (Query-Heap + Readback) | ✅ (`vkCmdWriteTimestamp`) | ✅ (`GPUStartTime/GPUEndTime`; eine Marke schließt den Command-Buffer des Abschnitts und setzt auf einem neuen mit Load fort) |
@@ -615,7 +653,7 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   Command-Buffer jedes Frames beim Abschluss signalisiert; `vio_swapchain_info()` meldet beides.
 - Tests: `tests/backends/089_metal_3d_pipeline.phpt` (Pixel-Kontrakt), `088` läuft jetzt auch auf Metal.
 
-### Zend-Objekte (15 Klassen)
+### Zend-Objekte (16 Klassen)
 
 | Klasse | Header | Zweck |
 |--------|--------|-------|
@@ -631,6 +669,7 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
 | VioAccelerationStructure | src/vio_acceleration_structure.h | Ray Query: BLAS je Mesh + TLAS über die Instanzen (`vio_acceleration_structure`); hält seine Meshes, `vio_acceleration_structure_update` refittet / baut neu (A14) |
 | VioRtPipeline | src/vio_rt_pipeline.h | Raytracing-Pipeline: Raygen/Miss/Hit-Gruppe + Shader-Tabelle, gebundene Storage-Buffer (`vio_rt_pipeline`) |
 | VioWorkGraph | src/vio_work_graph.h | Work Graph (D3D12, SM 6.8): State Object + Backing Memory, gebundene Storage-Buffer (`vio_work_graph`) |
+| VioUpscaler | src/upscale/vio_upscaler.h | Natives Upscaler-Kontext (FSR 3.1): Provider-Kontext + Beschreibung, Live-Liste (vor dem Geräte-Shutdown abgeräumt) |
 | VioFont | src/vio_font.h | TTF-Font (stb_truetype Atlas, glyph-index-keyed mit HarfBuzz) |
 | VioSound | src/vio_audio.h | Audio-Quelle (miniaudio) |
 | VioRecorder | src/vio_recorder.h | Video-Encoder (FFmpeg) |
@@ -644,7 +683,7 @@ Alle folgen dem gleichen Muster: `zend_object std` als letztes Feld, `Z_VIO_*_P(
 php_vio.c                   # Alle PHP-Funktionen (~9000 Zeilen, monolithisch)
 php_vio.h                   # Module-Globals (default_backend, debug, vsync)
 php_vio_arginfo.h           # Arginfo + Funktionstabelle (generiert aus vio.stub.php)
-vio.stub.php                # PHP-Stubs für IDE-Support (202 Funktionen)
+vio.stub.php                # PHP-Stubs für IDE-Support (207 Funktionen)
 config.m4 / config.w32      # Autotools- bzw. Windows-Build-Konfiguration
 configure.ac                # PHP-freier Autotools-Einstieg (CI-Permutationen)
 CMakeLists.txt              # IDE-Support (CLion/PhpStorm), kein Release-Build
@@ -656,6 +695,7 @@ include/
   vio_types.h               # Enums, Structs, Deskriptoren, VIO_FEATURE_*
   vio_constants.h           # Keyboard/Mouse/Gamepad Konstanten (GLFW-kompatibel)
   vio_plugin.h              # Plugin-System (Output/Input/Filter)
+  vio_upscale_plugin.h      # Upscaler-Plugin-ABI (C, versioniert: VIO_UPSCALE_PLUGIN_ABI, Host-Tabelle, Provider-Tabelle)
 
 src/
   vio_context.c             # VioContext Objekt
@@ -681,6 +721,9 @@ src/
   vio_recorder.c            # Video-Recording (FFmpeg H.264)
   vio_stream.c              # Network-Streaming (FFmpeg RTMP/SRT)
   vio_thermal.c             # Thermal-State (macOS/iOS ProcessInfo)
+  upscale/vio_upscale.c     # Native Upscaler: Provider-Schicht, Laufzeit-DLL-Suche, VioUpscaler (TEMPORAL-S3)
+  upscale/vio_upscale_ffx*.cpp # FidelityFX-FSR-3.1-Provider (--with-ffx; D3D12- und Vulkan-Teil getrennt)
+                            # DLSS: kein Quelltext hier – Plugin vio_dlss.dll (privates Repo php-vio-dlss) über include/vio_upscale_plugin.h
   vio_plugin_registry.c     # Plugin-Registry
   shaders/
     default_shaders.h       # Built-in 3D Shader
@@ -693,6 +736,7 @@ src/
     vulkan/vio_vulkan_3d*.c # Vulkan-3D: Shader-Rundreise, Pipeline-Varianten, Frame-Ring, Draws (Block 10)
     vulkan/vio_vulkan_rt.c  # Vulkan-Render-Targets: MRT, MSAA-Resolve, Cube-Faces, Readback, Mid-Frame-Clear (Block 10b)
     vulkan/vio_vulkan_cube.c # Vulkan-Cubemaps und Mip-Ketten per Blit (Block 10b)
+    vulkan/vio_vulkan_upscale.c # Vulkan-Seite der nativen Upscaler (Pass-Wechsel, Layouts, Barrieren)
     vulkan/vio_vma_wrapper.cpp  # VMA C++17 Wrapper
     metal/vio_metal.m       # Metal (ObjC, CAMetalLayer) — 2D, 3D, RT, Compute, Tessellation, emulierte GS
     metal/vio_metal_msl.h   # SPIR-V → MSL (Umnummerierung, Tess-Stages, Isolines/point_mode-Capture), reines C
@@ -709,6 +753,7 @@ vendor/
   vma/                      # Vulkan Memory Allocator
   miniaudio/                # Audio-Engine
   sheenbidi/                # SheenBidi (Unicode BiDi, Apache-2.0), UNITY-Build
+  ffx-api/                  # FidelityFX-API-Header (MIT, SDK v1.1.4) – nur Header, die DLLs liefert das Spiel
 ```
 
 ### Dependencies (Homebrew)
@@ -731,7 +776,7 @@ Vendored (kein Homebrew): GLAD, stb_image/truetype/write/rect_pack, VMA,
 miniaudio, **SheenBidi** (BiDi, Apache-2.0, `vendor/sheenbidi/`, UNITY-Build via
 `-DSB_CONFIG_UNITY`).
 
-## PHP API (202 Funktionen)
+## PHP API (207 Funktionen)
 
 Vollständige Signaturen in `vio.stub.php`. Die Beispiele hier zeigen die Gruppen.
 
@@ -888,14 +933,19 @@ $envCube = vio_render_target_cubemap($env);       // samplerCube, textureLod(dir
 
 // Readback eines RTs (auch mid-frame): Farbe, HDR (auf 8 Bit), Depth-only (Grau-Rampe), Cube-Face
 $rgba = vio_read_render_target($rt);  $face = vio_read_render_target($env, 3);
+$half = vio_read_render_target($rt, -1, 0, ['raw' => true]);   // Texel im eigenen Format, bitgenau (RGBA16F: 8 Byte)
 
-// Multiple Render Targets (G-Buffer): bis 4 Farb-Attachments, Fragment layout(location = i) out
+// Multiple Render Targets (G-Buffer): bis VIO_MAX_COLOR_ATTACHMENTS (8) Farb-Attachments, Fragment layout(location = i) out
 $gb = vio_render_target($ctx, ["width" => $w, "height" => $h,
         "attachments" => [VIO_FORMAT_RGBA8, VIO_FORMAT_RGBA16F, VIO_FORMAT_RG16F]]);
 $gbPipe = vio_pipeline($ctx, ["shader" => $s, "attachments" => [VIO_FORMAT_RGBA8, VIO_FORMAT_RGBA16F, VIO_FORMAT_RG16F]]); // Formate nur für D3D12-PSO nötig
 vio_bind_render_target($ctx, $gb); /* ... */ vio_unbind_render_target($ctx);
 $normals = vio_render_target_texture($gb, 1);          // Attachment-Index
-$rg      = vio_read_render_target($gb, -1, 2);          // (rt, face, attachment) → immer RGBA8
+$rg      = vio_read_render_target($gb, -1, 2);          // (rt, face, attachment) → RGBA8 (oder ['raw' => true])
+$depth   = vio_render_target_texture($gb, VIO_RT_DEPTH);  // Szenentiefe des Farb-Targets (VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE)
+// 'storage' => true: Attachments auch als Compute-Storage-Image (D3D12, Vulkan; VIO_FEATURE_RENDER_TARGET_STORAGE)
+$hist = vio_render_target($ctx, ['width' => $w, 'height' => $h, 'attachments' => [VIO_FORMAT_RGBA16F], 'storage' => true]);
+vio_compute_bind_image($ctx, $taa, vio_render_target_texture($hist, 0), 0, VIO_COMPUTE_WRITE);   // image2D rgba16f
 // Formate: VIO_FORMAT_RGBA8, RGBA16F, RGBA32F, R11G11B10F, RG16F, R16F, R32F, R8
 
 // Pipeline-State
@@ -932,6 +982,74 @@ Jitter und Bewegung kommen in NDC-Richtung, `vio_backend.rt_origin_top` dreht si
 je Kontext eine RGBA16F-Historie (Alpha = akkumuliertes Gewicht), Catmull-Rom-Rückprojektion, YCoCg-Clamp auf die
 3×3-Quellnachbarschaft. Unter Subpixel-Bewegung wird die Historie jeden Frame neu abgetastet und weicher – dort
 liegt temporal etwa bei spatial, sein Gewinn ist das ruhige / langsame Bild.
+
+### Native Upscaler (FSR 3.1; TEMPORAL-S3)
+```php
+// FSR 3.1 über das FidelityFX-API, D3D12 + Vulkan; die DLL liefert das Spiel (siehe unten)
+vio_upscaler_supported($ctx);                         // false ohne Laufzeit/auf WARP/anderen Backends - nie eine Warnung
+vio_upscaler_info($ctx);                              // ['provider' => 'fsr3', 'supported', 'reason', 'version' => '3.1.4', 'library', 'device', 'live', 'host_bytes']
+$up = vio_upscaler_create($ctx, ['display_width' => 1920, 'display_height' => 1080, 'quality' => VIO_UPSCALE_QUALITY]);
+$i = vio_upscaler_info($ctx, $up);                    // + render_width/height, jitter_phases, gpu_memory
+$j = vio_upscale_jitter($frame, $i['jitter_phases']); // Projektion um 2*j/renderSize versetzen (Pixel, y unten)
+vio_upscaler_dispatch($ctx, $up, ['color' => $gbuf, 'depth' => [$gbuf, VIO_RT_DEPTH], 'motion' => [$gbuf, 4],
+    'output' => $out /* 'storage' => true, Anzeigegröße */, 'jitter' => $j, 'reset' => $cut, 'sharpness' => 0.2,
+    'frame_time_ms' => $dt, 'near' => 0.1, 'far' => 1000, 'fov_y' => 1.05]);
+```
+Schichten: `php_vio.c` (Argumente, Render-Targets → `vio_upscale_image`) → Backend-Slots `upscaler_*` am Vtable-Ende
+(D3D12: Ressourcen in `PIXEL_SHADER_RESOURCE`, danach `d3d12_restore_graphics_state_after_compute()`, ein beteiligtes
+gebundenes Target geht zurück nach `RENDER_TARGET`/`DEPTH_WRITE`; Vulkan: Pass zu/LOAD-Resume, gesampelte Tiefe
+`DEPTH_STENCIL_READ_ONLY` ↔ `SHADER_READ_ONLY`, Memory-Barrieren) → Provider `src/upscale/` (`vio_upscale_provider`:
+gleiche Eingaben für FSR/DLSS/XeSS – Bewegung = vorige − aktuelle Position in Renderpixeln × `mv_scale`, Jitter in
+Renderpixeln, x rechts/y unten). FSR: `vio_upscale_ffx*.cpp` gegen die vendorten MIT-Header `vendor/ffx-api`
+(SDK v1.1.4); `amd_fidelityfx_dx12.dll` / `amd_fidelityfx_vk.dll` werden zur Laufzeit geladen, nie gelinkt. Suche:
+`vio.ffx_path` (ini) / `VIO_FFX_PATH` (env) – gesetzt ist das der einzige Ort (Verzeichnis oder Datei) –, sonst neben
+der PHP-Exe, neben `php_vio.dll`, PATH. Vulkan: vor `vkCreateDevice` fragt das Backend `vio_upscale_vk_device_needs()`
+und schaltet bei vorhandener Laufzeit ein, was FFX aus dem *Angebot* des Geräts wählt (subgroup size control, int16,
+16-Bit-Storage, separate Depth/Stencil-Layouts, `VK_KHR_get_memory_requirements2`/`dedicated_allocation`,
+`VK_AMD_buffer_marker`); `vio_upscaler_info()['device']` listet es.
+
+**Plugin-ABI** (`include/vio_upscale_plugin.h`, TEMPORAL-S4): ein Provider kann außerhalb von php-vio liegen. Die Bibliothek
+exportiert `vio_upscale_plugin_get(uint32_t abi, const vio_upscale_host_api *host)` und gibt ihre `vio_upscale_provider`-Tabelle
+zurück (`abi`, `size`, `id`, `name`, `version`, `flags`, `supported`/`create`/`dispatch`/`query`/`destroy`, optional
+`vk_device_needs`/`render_size`/`device_release`/`vk_extensions`). Der Host gibt `log` (Fehler/Warnung → PHP-Warnung, Info/Debug
+→ stderr bei `VIO_UPSCALE_PLUGIN_LOG`), `alloc`/`free` (gezählt in `host_bytes`), `ini`, `find_file`, `load_library`, `symbol`,
+`host_version`, `plugin_path`. Gerät/Bilder kommen nativ als `void *` (`ID3D12Device*`/`ID3D12Resource*`/Kommandoliste;
+`VkInstance`/`VkPhysicalDevice`/`VkDevice`/`vkGet*ProcAddr`/`VkImage`/`VkImageView`/`VkCommandBuffer`) mit Format, Größe und
+Ruhezustand (`VIO_UPSCALE_STATE_SHADER_READ`/`GENERAL`); der Provider stellt jeden Zustand/Layout, den er ändert, wieder her,
+der Host räumt Pipeline-/Heap-/Root-Zustand und Pass-Grenzen selbst. `software_adapter` (WARP) entscheidet der Provider – FSR
+lehnt ab, das Test-Plugin nicht. Abgelehnt (Grund in `reason`, keine Warnung, Bibliothek wieder entladen und beim nächsten Aufruf
+neu gesucht): kein Export, `NULL` (ABI nicht angeboten), andere `abi`, zu kleine `size`, falsche `id`, fehlende Pflicht-Slots.
+Ein angenommenes Plugin bleibt für den Prozess. FSR 3.1 (in-tree) benutzt dieselben Typen und dieselbe Tabelle.
+
+DLSS (TEMPORAL-S4, Plugin `vio_dlss.dll` aus dem privaten Repo `php-vio-dlss`): der Adapter spricht NGX direkt (kein
+Streamline), gleiche Eingaben/Konventionen – NGX hat vios Jitter-Vorzeichen (gemessen, Test 230), Bewegung unverändert, `mv_scale` durchgereicht.
+```php
+vio_upscaler_info($ctx, VIO_UPSCALER_DLSS);   // ['version' => '310.9.1', 'driver' => '617.42', 'library' => …\nvngx_dlss.dll, 'reason' => …]
+vio_upscaler_render_size($ctx, VIO_UPSCALER_DLSS, VIO_UPSCALE_QUALITY, 1920, 1080);   // ['width' => 1280, 'height' => 720] (NGX Optimal Settings)
+$up = vio_upscaler_create($ctx, ['provider' => VIO_UPSCALER_DLSS, 'display_width' => 1920, 'display_height' => 1080,
+                                 'quality' => VIO_UPSCALE_NATIVE_AA]);   // DLAA: Render = Anzeige
+```
+Provider-Schicht dafür (generisch): `render_size` (NGX Optimal Settings statt fester FSR-Tabelle; `vio_upscaler_create`
+ohne Render-Größe nimmt sie, Vtable-Slot `upscaler_render_size`), `CREATE_COMMANDS` (Backend gibt beim Create eine eigene
+Kommandoliste/Transient-Command-Buffer, ausgeführt + abgewartet, auch im offenen Frame), `device_release` (aus
+`d3d12_shutdown`/`vulkan_shutdown`: NGX `Shutdown1`), `vk_extensions` (Instanz- und Geräte-Erweiterungen nach Namen, nur
+bei vorhandener Laufzeit: `VK_NVX_binary_import`, `VK_NVX_image_view_handle`, `VK_KHR_push_descriptor`, Buffer Device
+Address – EXT und KHR schließen sich aus, vio nimmt KHR). NGX-Init je Gerät beim ersten `supported` mit
+`NVSDK_NGX_*_Init_with_ProjectID` (Engine CUSTOM, `vio.dlss_project_id` – leer: die GUID des Plugins, ein Spiel setzt
+seine eigene –, `vio.dlss_engine_version`), Capability-Parameter → `SuperSampling.Available`, Treiber-
+Mindestversion im Grund. D3D12: Eingaben `PIXEL_SHADER_RESOURCE` → `NON_PIXEL_SHADER_RESOURCE`, Ausgabe → `UNORDERED_ACCESS`
+und zurück; Vulkan: Image-Views, Storage-Eingaben `GENERAL` → `SHADER_READ_ONLY` und zurück.
+
+**Kosten = Modell** (gemessen Test 233 / Bench mit `vio_gpu_timestamp` um den Dispatch, RTX 2080): NGXs Standard
+(SDK 310.6) sind Transformer-Presets – K für DLAA/Quality/Balanced, M für Performance, L für Ultra Performance –, auf
+Turing 2–6× so teuer wie die (von NVIDIA abgekündigten) CNN-Presets E/F. NVIDIA-Tabelle RTX 2080 Ti 1440p: E/F 0,62 ms,
+J/K 1,80 ms, M 3,41 ms, L 5,45 ms; gemessen RTX 2080 (p10, GPU parallel von einem Spiel belegt) 1440p Quality K 2,25 ms,
+E 0,82 ms, 1080p K 1,41 ms, E 0,50 ms ≈ Tabelle × 1,25. Performance ist teurer als Quality, weil M teurer ist als K.
+vio selbst kostet nichts Messbares (kein Feature/Parameter je Frame, kein Fence-Warten, keine Kopie, `rel`-DLL,
+MVLowRes/IsHDR; Vulkan-Barrieren und Tiefen-Übergänge weggelassen: 0,903 vs. 0,908 ms). Vulkan liegt ~10 % über D3D12
+(NGX-intern). `'preset' => 'e'|'f'|'j'|'k'|'l'|'m'` setzt den Render-Preset-Hinweis für alle Modi, `null` = NGX-Standard;
+`vio_upscaler_info()['preset']` meldet ihn. `reactive` geht als `pInBiasCurrentColorMask` an NGX – laut Leitfaden
+(Abschnitt 3.15) nutzen die aktuellen Modelle ihn nicht (nur F); kostet nichts Messbares.
 
 ### Compute & Storage Buffers
 ```php
@@ -1222,7 +1340,7 @@ nicht an `@available` im Feature-Code.
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`.
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 221 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess, 184 `vio_backend_info` auf allen Backends, 185 `vio_adapters`, 186 Scoring für `auto`, 187 Kalibrierlauf, 188 Readback des neuesten Frames, 189 Glyph-Atlas bei Bedarf, 190 KTX2-Cubemaps/-3D, 191 ASTC, 192 Vertikaltext, 193 Tiefen-Mips, 194 MSAA-MRT, 195 MSAA-Cube/-Array, 196 MSAA-Depth-only, 197 Texturen in Mesh-/Task-Stages, 198 Tess-Varyings, 199 TLAS-Update, 200 RT-Gruppen + Records, 201 RT-Texturen, 202 Trace im Frame, 203 Fragment-Storage, 204 Sampler-Feedback aus GLSL, 205 Lücken der Geometry-Stage, 206 Pass-Wechsel / Vulkan-Kern, 212 Audit-Gate Plattformschicht, 213 Win32-Plattform, 214 X11-Plattform, 215 Wayland-Plattform, 216 Long Vectors, 217 RT-Wechsel ohne Unbind, 218 Float16-Sonderwerte, 219 SER, 220 Opacity Micromaps)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 237 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess, 184 `vio_backend_info` auf allen Backends, 185 `vio_adapters`, 186 Scoring für `auto`, 187 Kalibrierlauf, 188 Readback des neuesten Frames, 189 Glyph-Atlas bei Bedarf, 190 KTX2-Cubemaps/-3D, 191 ASTC, 192 Vertikaltext, 193 Tiefen-Mips, 194 MSAA-MRT, 195 MSAA-Cube/-Array, 196 MSAA-Depth-only, 197 Texturen in Mesh-/Task-Stages, 198 Tess-Varyings, 199 TLAS-Update, 200 RT-Gruppen + Records, 201 RT-Texturen, 202 Trace im Frame, 203 Fragment-Storage, 204 Sampler-Feedback aus GLSL, 205 Lücken der Geometry-Stage, 206 Pass-Wechsel / Vulkan-Kern, 212 Audit-Gate Plattformschicht, 213 Win32-Plattform, 214 X11-Plattform, 215 Wayland-Plattform, 216 Long Vectors, 217 RT-Wechsel ohne Unbind, 218 Float16-Sonderwerte, 219 SER, 220 Opacity Micromaps, 221 D3D12-Capture mitten im Frame, 222 MRT mit 8 Attachments, 223 Tiefe eines Farb-Targets, 224 Raw-Readback, 225 RT als Storage-Image, 226 Upscaler ohne Laufzeit, 227 FSR-3.1-Konvergenz, 228 Upscaler-Lebenszyklus, 229 DLSS ohne Laufzeit, 230/231/233 DLSS-Konvergenz/-Lebenszyklus/-Preset (jetzt im Repo php-vio-dlss), 232 Vulkan: kein Sampler auf einem Anhang des offenen Passes, 234 Upscaler-Plugin fehlt, 235 Plugin-ABI abgelehnt, 236 Test-Plugin Ende zu Ende)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Audit-Gate Plattform**: `tests/core/212_audit_gate_no_glfw_outside_platform.phpt` — kein `glfwXxx`/`GLFW_*` außerhalb
   `src/platform/glfw/`. Fenster, Input, Monitore, Gamepads, GL-Kontext und Vulkan-Surface laufen über die
@@ -1275,6 +1393,12 @@ nicht an `@available` im Feature-Code.
 Größere Umbauten werden vor der Umsetzung als `*-PLAN.md` im Wurzelverzeichnis
 festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
 
+- **Temporale Hochskalierung (TAA → FSR 3.1 → DLSS)** – S0 (8 Attachments, `VIO_RT_DEPTH`, Raw-Readback,
+  `'storage'`-Targets, Tests 222–225) und S3 (native Upscaler: Provider-Schicht `src/upscale/`, Vtable-Slots
+  `upscaler_*`, FSR 3.1 auf D3D12 + Vulkan, `--with-ffx`, Tests 226–228) und S4 (DLSS Super Resolution über NGX als
+  Plugin `vio_dlss.dll` hinter der Plugin-ABI `include/vio_upscale_plugin.h`, Adapter im privaten Repo `php-vio-dlss`,
+  Provider-Render-Größe `vio_upscaler_render_size`, Modellwahl `'preset'`, Tests 229, 234–236 hier, DLSS-Tests im Plugin-Repo) umgesetzt.
+  Offen: S1/S2 (Engine), S5 XeSS.
 - `OPENGL-REFACTOR-PLAN.md` — ✅ implementiert. OpenGL als echtes Backend hinter
   der Vtable; erzwungen durch `tests/core/070_audit_gate_no_gl_outside_backend.phpt`
   (kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`).
@@ -1427,6 +1551,20 @@ Aufrufer geändert hat:
 
 ## Bekannte Einschränkungen
 
+- **Native Upscaler (FSR 3.1, TEMPORAL-S3)**: nur D3D12 und Vulkan, nur mit Hardware-GPU – WARP nimmt Kontext und
+  Dispatch an und stürzt beim Ausführen der FSR-Compute-Pässe ab, daher `supported = false` (headless:
+  `'headless_hardware' => true`). Dispatch nur zwischen `vio_begin`/`vio_end`. Die FidelityFX-Laufzeit 3.1.4 selbst
+  erzeugt je Dispatch eine Vulkan-Validation-Meldung (Shader deklariert `rw_luma_history` als `rgba8`, das SDK legt
+  RGBA16F an) – vios Messenger filtert genau diese. FidelityFX liefert nur Windows-DLLs: `config.m4` hat `--with-ffx`
+  opt-in, spc-Builds bleiben ohne.
+- **DLSS (TEMPORAL-S4)**: nur D3D12/Vulkan, nur NVIDIA RTX, nur mit dem Plugin `vio_dlss.dll` (privates Repo, nie in
+  php-vio oder dessen Releases; die CI kennt es nicht). Linux-Plugin (`libvio_dlss.so`, `libnvidia-ngx-dlss.so.*`-Suche)
+  ist ungetestet; macOS/D3D11/GL haben kein DLSS. Die Projekt-ID muss wie eine zufällige GUID aussehen – der Treiber
+  lehnt „sprechende“ IDs mit `invalid parameter` ab (Grund nennt `vio.dlss_project_id`). Die Vulkan-
+  Synchronisations-Validierung meldet bei Reset-Frames WRITE_AFTER_WRITE-Hazards **innerhalb** von NGX
+  (`vkCmdPipelineBarrier[nv.ngx.dlss.Evaluate]` → `vkCmdClearColorImage` auf `nv.ngx.dlss.resource`) – NVIDIA-intern,
+  nicht von vio behebbar; die normale Validation ist sauber. `sharpness` ignoriert DLSS (seit 2.5.1 entfernt);
+  `reactive` geht als „Bias Current Color Mask“ an NGX, `transparency` wird nicht benutzt.
 - **Vulkan-3D** (GAP-PHASE5 Block 10a–10c) hat den vollständigen Satz: 3D-Pipeline, Instancing,
   Depth-Bias, Stencil, Vertex-Storage, Indirect Draw, HDR-/Depth-only-/MSAA-/Cube-Targets, MRT,
   Cubemaps, Mipmaps, Texture-Arrays/BC/KTX2 und Variable Rate Shading (wenn das Device

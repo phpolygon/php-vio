@@ -42,6 +42,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_recorder.h"
 #include "src/vio_stream.h"
 #include "src/vio_thermal.h"
+#include "src/upscale/vio_upscaler.h"
 #include "include/vio_constants.h"
 #include "include/vio_plugin.h"
 #include "vendor/stb/stb_image.h"
@@ -106,6 +107,19 @@ PHP_INI_BEGIN()
     STD_PHP_INI_ENTRY("vio.default_backend", "auto", PHP_INI_ALL, OnUpdateString, default_backend, zend_vio_globals, vio_globals)
     STD_PHP_INI_BOOLEAN("vio.debug", "0", PHP_INI_ALL, OnUpdateBool, debug, zend_vio_globals, vio_globals)
     STD_PHP_INI_BOOLEAN("vio.vsync", "1", PHP_INI_ALL, OnUpdateBool, vsync, zend_vio_globals, vio_globals)
+    /* Where amd_fidelityfx_dx12.dll / amd_fidelityfx_vk.dll live (a directory or
+     * the file itself); when set, the only place searched (vio_upscaler_*). */
+    PHP_INI_ENTRY("vio.ffx_path", "", PHP_INI_ALL, NULL)
+    /* DLSS (TEMPORAL-S4) is a plugin (include/vio_upscale_plugin.h): where
+     * vio_dlss.dll / libvio_dlss.so lives (a directory or the file; when set, the
+     * only place searched - read on first use, a loaded plugin stays). The other
+     * three are the plugin's, read through the host table: where its runtime
+     * lives, and how it identifies the application to the driver (a GUID-like
+     * project id - "" = the plugin's own - and an engine version). */
+    PHP_INI_ENTRY("vio.dlss_plugin_path", "", PHP_INI_ALL, NULL)
+    PHP_INI_ENTRY("vio.dlss_path", "", PHP_INI_ALL, NULL)
+    PHP_INI_ENTRY("vio.dlss_project_id", "", PHP_INI_ALL, NULL)
+    PHP_INI_ENTRY("vio.dlss_engine_version", PHP_VIO_VERSION, PHP_INI_ALL, NULL)
 PHP_INI_END()
 
 /* ── PHP function implementations ─────────────────────────────────── */
@@ -999,6 +1013,8 @@ ZEND_FUNCTION(vio_destroy)
          * at vkDestroyDevice (validation error). vio_2d_shutdown is idempotent,
          * so the free handler's later call is a no-op. */
         vio_2d_shutdown(&ctx->state_2d);
+        /* Upscaler contexts hold device objects: gone before the device. */
+        vio_upscaler_sweep(ctx->backend);
         if (ctx->backend->shutdown) {
             ctx->backend->shutdown();
         }
@@ -7031,6 +7047,418 @@ ZEND_FUNCTION(vio_upscale_info)
     add_assoc_string(return_value, "temporal", (char *)(tp ? tp : "portable"));
 }
 
+/* ── Native upscalers (vio_upscaler_*, TEMPORAL-S3) ─────────────────────
+ * FSR 3.1 (later DLSS / XeSS) through the backend's upscaler_* slots and the
+ * provider layer in src/upscale/. A missing runtime library is not an error:
+ * supported() is false and info() says why. */
+
+static int vio_upscaler_provider_arg(zend_long provider, uint32_t arg)
+{
+    if (provider < 1 || provider > VIO_UPSCALER_COUNT) {
+        zend_argument_value_error(arg, "must be a VIO_UPSCALER_* constant");
+        return 0;
+    }
+    return 1;
+}
+
+/* 1 = provider usable on the context's device; 0 with the reason otherwise. */
+static int vio_upscaler_check(vio_context_object *ctx, int provider, char *reason, size_t reason_len)
+{
+    reason[0] = '\0';
+    if (!ctx->initialized || !ctx->backend) {
+        snprintf(reason, reason_len, "context not initialized");
+        return 0;
+    }
+    if (!ctx->backend->upscaler_supported) {
+        snprintf(reason, reason_len, "backend '%s' has no native upscaler (D3D12 and Vulkan only)", ctx->backend->name);
+        return 0;
+    }
+    if (ctx->backend->upscaler_supported(provider, reason, reason_len)) return 1;
+    if (!reason[0]) snprintf(reason, reason_len, "not supported on this device");
+    return 0;
+}
+
+/* vio_upscaler_supported($ctx, $provider = VIO_UPSCALER_FSR3): never warns. */
+ZEND_FUNCTION(vio_upscaler_supported)
+{
+    zval *ctx_zval;
+    zend_long provider = VIO_UPSCALER_FSR3;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(provider)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!vio_upscaler_provider_arg(provider, 2)) RETURN_THROWS();
+    char reason[512];
+    RETURN_BOOL(vio_upscaler_check(Z_VIO_CONTEXT_P(ctx_zval), (int)provider, reason, sizeof(reason)));
+}
+
+/* vio_upscaler_info($ctx, VioUpscaler|int $which = VIO_UPSCALER_FSR3): the
+ * provider's state on this device; with an upscaler also its sizes. */
+ZEND_FUNCTION(vio_upscaler_info)
+{
+    zval *ctx_zval;
+    zend_object *u_obj = NULL;
+    zend_long provider = VIO_UPSCALER_FSR3;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_OBJ_OF_CLASS_OR_LONG(u_obj, vio_upscaler_ce, provider)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_upscaler_object *u = u_obj ? vio_upscaler_from_obj(u_obj) : NULL;
+    if (u) provider = u->desc.provider;
+    else if (!vio_upscaler_provider_arg(provider, 2)) RETURN_THROWS();
+
+    const vio_backend *be = ctx->initialized ? ctx->backend : NULL;
+    char reason[512];
+    int ok = vio_upscaler_check(ctx, (int)provider, reason, sizeof(reason));
+    vio_upscale_query q;
+    memset(&q, 0, sizeof(q));
+    /* Also when unsupported: a provider may still name the driver it checked. */
+    if (be && be->upscaler_query) be->upscaler_query(NULL, (int)provider, &q);
+    if (!ok) q.version[0] = q.library[0] = '\0';
+    char device[256] = "";
+    if (be && be->upscaler_device_requirements) be->upscaler_device_requirements((int)provider, device, sizeof(device));
+
+    array_init(return_value);
+    add_assoc_string(return_value, "provider", (char *)vio_upscale_provider_name((int)provider));
+    add_assoc_string(return_value, "backend", (char *)(be ? be->name : ""));
+    add_assoc_bool(return_value, "supported", ok);
+    add_assoc_string(return_value, "reason", ok ? "" : reason);
+    add_assoc_string(return_value, "version", q.version);
+    add_assoc_string(return_value, "driver", q.driver);
+    add_assoc_string(return_value, "library", q.library);
+    /* The plugin library the provider came from ('' = built in / none). */
+    add_assoc_string(return_value, "plugin", (char *)vio_upscale_plugin_path((int)provider));
+    add_assoc_string(return_value, "device", device);
+    add_assoc_long(return_value, "live", be ? vio_upscaler_live_count(be) : 0);
+    add_assoc_long(return_value, "host_bytes", (zend_long)vio_upscale_host_bytes());
+    if (u) {
+        add_assoc_bool(return_value, "valid", u->valid && u->backend == be);
+        add_assoc_long(return_value, "quality", u->desc.quality);
+        /* The render size the provider chose (DLSS: NGX optimal settings). */
+        add_assoc_long(return_value, "render_width", u->desc.render_width);
+        add_assoc_long(return_value, "render_height", u->desc.render_height);
+        add_assoc_long(return_value, "display_width", u->desc.display_width);
+        add_assoc_long(return_value, "display_height", u->desc.display_height);
+        /* The model preset asked for, '' = the provider's default for the quality mode. */
+        char preset[2] = { u->desc.preset, '\0' };
+        add_assoc_string(return_value, "preset", preset);
+        vio_upscale_query uq;
+        memset(&uq, 0, sizeof(uq));
+        uq.jitter_phases = vio_upscale_jitter_phases(u->desc.render_width, u->desc.display_width);
+        if (u->valid && u->backend == be && be->upscaler_query) be->upscaler_query(u->handle, (int)provider, &uq);
+        add_assoc_long(return_value, "jitter_phases", uq.jitter_phases);
+        add_assoc_long(return_value, "gpu_memory", (zend_long)uq.gpu_memory);
+    }
+}
+
+static int vio_upscaler_bool_opt(HashTable *ht, const char *key)
+{
+    zval *v = zend_hash_str_find(ht, key, strlen(key));
+    return v && zend_is_true(v);
+}
+
+/* vio_upscaler_create($ctx, ['display_width' => W, 'display_height' => H,
+ * 'provider' => VIO_UPSCALER_FSR3, 'quality' => VIO_UPSCALE_QUALITY,
+ * 'render_width' / 'render_height' (largest render size; default from quality),
+ * 'hdr', 'depth_inverted', 'depth_infinite', 'auto_exposure',
+ * 'dynamic_resolution', 'jittered_motion', 'debug' => bool, 'preset' => letter]) */
+ZEND_FUNCTION(vio_upscaler_create)
+{
+    zval *ctx_zval;
+    HashTable *opts;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    vio_upscale_create_desc d;
+    memset(&d, 0, sizeof(d));
+    zval *v;
+    zend_long provider = VIO_UPSCALER_FSR3, quality = VIO_UPSCALE_QUALITY;
+    if ((v = zend_hash_str_find(opts, "provider", sizeof("provider") - 1)) != NULL) provider = zval_get_long(v);
+    if (provider < 1 || provider > VIO_UPSCALER_COUNT) {
+        zend_argument_value_error(2, "'provider' must be a VIO_UPSCALER_* constant");
+        RETURN_THROWS();
+    }
+    if ((v = zend_hash_str_find(opts, "quality", sizeof("quality") - 1)) != NULL) quality = zval_get_long(v);
+    if (quality < VIO_UPSCALE_NATIVE_AA || quality > VIO_UPSCALE_ULTRA_PERFORMANCE) {
+        zend_argument_value_error(2, "'quality' must be a VIO_UPSCALE_NATIVE_AA..VIO_UPSCALE_ULTRA_PERFORMANCE constant");
+        RETURN_THROWS();
+    }
+    zval *dw = zend_hash_str_find(opts, "display_width", sizeof("display_width") - 1);
+    zval *dh = zend_hash_str_find(opts, "display_height", sizeof("display_height") - 1);
+    zend_long dwl = dw ? zval_get_long(dw) : 0, dhl = dh ? zval_get_long(dh) : 0;
+    if (dwl < 1 || dhl < 1 || dwl > 16384 || dhl > 16384) {
+        zend_argument_value_error(2, "needs 'display_width' and 'display_height' (1..16384)");
+        RETURN_THROWS();
+    }
+    d.provider = (int)provider;
+    d.quality = (int)quality;
+    d.display_width = (int)dwl;
+    d.display_height = (int)dhl;
+    /* Render size 0: the provider picks it for the quality mode (DLSS optimal
+     * settings, FSR's fixed ratios); read back after create. */
+    d.render_width = d.render_height = 0;
+    zval *rw = zend_hash_str_find(opts, "render_width", sizeof("render_width") - 1);
+    zval *rh = zend_hash_str_find(opts, "render_height", sizeof("render_height") - 1);
+    if (rw || rh) {
+        int fw, fh;
+        vio_upscale_render_size(d.quality, d.display_width, d.display_height, &fw, &fh);
+        zend_long rwl = rw ? zval_get_long(rw) : fw, rhl = rh ? zval_get_long(rh) : fh;
+        if (rwl < 1 || rhl < 1 || rwl > dwl || rhl > dhl) {
+            zend_argument_value_error(2, "'render_width' / 'render_height' must be 1..the display size");
+            RETURN_THROWS();
+        }
+        d.render_width = (int)rwl;
+        d.render_height = (int)rhl;
+    }
+    if (vio_upscaler_bool_opt(opts, "hdr"))                d.flags |= VIO_UPSCALE_FLAG_HDR;
+    if (vio_upscaler_bool_opt(opts, "depth_inverted"))     d.flags |= VIO_UPSCALE_FLAG_DEPTH_INVERTED;
+    if (vio_upscaler_bool_opt(opts, "depth_infinite"))     d.flags |= VIO_UPSCALE_FLAG_DEPTH_INFINITE;
+    if (vio_upscaler_bool_opt(opts, "auto_exposure"))      d.flags |= VIO_UPSCALE_FLAG_AUTO_EXPOSURE;
+    if (vio_upscaler_bool_opt(opts, "dynamic_resolution")) d.flags |= VIO_UPSCALE_FLAG_DYNAMIC_RES;
+    if (vio_upscaler_bool_opt(opts, "jittered_motion"))    d.flags |= VIO_UPSCALE_FLAG_MV_JITTERED;
+    if (vio_upscaler_bool_opt(opts, "debug"))              d.flags |= VIO_UPSCALE_FLAG_DEBUG;
+    /* The provider's model preset, one letter (DLSS: e, f, j, k, l, m); which
+     * letters exist is the provider's to say. */
+    if ((v = zend_hash_str_find(opts, "preset", sizeof("preset") - 1)) != NULL && Z_TYPE_P(v) != IS_NULL) {
+        if (Z_TYPE_P(v) != IS_STRING || Z_STRLEN_P(v) != 1
+            || !((Z_STRVAL_P(v)[0] >= 'a' && Z_STRVAL_P(v)[0] <= 'z') || (Z_STRVAL_P(v)[0] >= 'A' && Z_STRVAL_P(v)[0] <= 'Z'))) {
+            zend_argument_value_error(2, "'preset' must be one letter (the provider's model preset) or null");
+            RETURN_THROWS();
+        }
+        d.preset = (char)(Z_STRVAL_P(v)[0] | 0x20);
+    }
+
+    char reason[512];
+    if (!vio_upscaler_check(ctx, d.provider, reason, sizeof(reason)) || !ctx->backend->upscaler_create) {
+        php_error_docref(NULL, E_WARNING, "vio_upscaler_create: %s", reason[0] ? reason : "not supported");
+        RETURN_FALSE;
+    }
+    reason[0] = '\0';
+    void *h = ctx->backend->upscaler_create(&d, reason, sizeof(reason));
+    if (!h) {
+        php_error_docref(NULL, E_WARNING, "vio_upscaler_create: %s", reason[0] ? reason : "the provider could not create a context");
+        RETURN_FALSE;
+    }
+    if (d.render_width <= 0 || d.render_height <= 0) {
+        vio_upscale_query q;
+        memset(&q, 0, sizeof(q));
+        if (ctx->backend->upscaler_query) ctx->backend->upscaler_query(h, d.provider, &q);
+        if (q.render_width > 0 && q.render_height > 0) { d.render_width = q.render_width; d.render_height = q.render_height; }
+        else vio_upscale_render_size(d.quality, d.display_width, d.display_height, &d.render_width, &d.render_height);
+    }
+    object_init_ex(return_value, vio_upscaler_ce);
+    vio_upscaler_object *u = Z_VIO_UPSCALER_P(return_value);
+    u->handle = h;
+    u->backend = ctx->backend;
+    u->desc = d;
+    u->valid = 1;
+    vio_upscaler_track(u);
+}
+
+/* vio_upscaler_render_size($ctx, $provider, $quality, $display_width,
+ * $display_height): ['width' => , 'height' => ] the provider renders at for the
+ * quality mode on this device (DLSS: NGX optimal settings - VIO_UPSCALE_NATIVE_AA
+ * is DLAA at the display size; FSR: its fixed ratios), false when the provider
+ * is not usable or does not offer the mode. Never warns. */
+ZEND_FUNCTION(vio_upscaler_render_size)
+{
+    zval *ctx_zval;
+    zend_long provider, quality, dw, dh;
+    ZEND_PARSE_PARAMETERS_START(5, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(provider)
+        Z_PARAM_LONG(quality)
+        Z_PARAM_LONG(dw)
+        Z_PARAM_LONG(dh)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!vio_upscaler_provider_arg(provider, 2)) RETURN_THROWS();
+    if (quality < VIO_UPSCALE_NATIVE_AA || quality > VIO_UPSCALE_ULTRA_PERFORMANCE) {
+        zend_argument_value_error(3, "must be a VIO_UPSCALE_NATIVE_AA..VIO_UPSCALE_ULTRA_PERFORMANCE constant");
+        RETURN_THROWS();
+    }
+    if (dw < 1 || dw > 16384) { zend_argument_value_error(4, "must be 1..16384"); RETURN_THROWS(); }
+    if (dh < 1 || dh > 16384) { zend_argument_value_error(5, "must be 1..16384"); RETURN_THROWS(); }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    char reason[512];
+    if (!vio_upscaler_check(ctx, (int)provider, reason, sizeof(reason)) || !ctx->backend->upscaler_render_size) RETURN_FALSE;
+    int rw = 0, rh = 0;
+    if (!ctx->backend->upscaler_render_size((int)provider, (int)quality, (int)dw, (int)dh, &rw, &rh, reason, sizeof(reason))
+        || rw < 1 || rh < 1) RETURN_FALSE;
+    array_init(return_value);
+    add_assoc_long(return_value, "width", rw);
+    add_assoc_long(return_value, "height", rh);
+}
+
+/* One dispatch image: VioRenderTarget (attachment `def`) or [VioRenderTarget, attachment].
+ * 1 = set, 0 = not given, -1 = exception thrown. */
+static int vio_upscaler_image_arg(HashTable *in, const char *key, int required, int def,
+                                  const vio_backend *be, vio_upscale_image *out)
+{
+    zval *v = zend_hash_str_find(in, key, strlen(key));
+    out->rt = NULL;
+    out->attachment = def;
+    if (!v || Z_TYPE_P(v) == IS_NULL) {
+        if (required) {
+            zend_argument_value_error(3, "needs '%s' => VioRenderTarget | [VioRenderTarget, attachment]", key);
+            return -1;
+        }
+        return 0;
+    }
+    zval *rtz = v;
+    zend_long att = def;
+    if (Z_TYPE_P(v) == IS_ARRAY) {
+        rtz = zend_hash_index_find(Z_ARRVAL_P(v), 0);
+        zval *az = zend_hash_index_find(Z_ARRVAL_P(v), 1);
+        if (az) att = zval_get_long(az);
+    }
+    if (!rtz || Z_TYPE_P(rtz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(rtz), vio_render_target_ce)) {
+        zend_argument_type_error(3, "'%s' must be VioRenderTarget | [VioRenderTarget, attachment]", key);
+        return -1;
+    }
+    vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rtz);
+    if (!rt->valid || rt->backend != be) {
+        zend_argument_value_error(3, "'%s' is not a live render target of this context", key);
+        return -1;
+    }
+    if (rt->samples > 1 || rt->is_cube || rt->layers > 1 || rt->rate_active) {
+        zend_argument_value_error(3, "'%s' must be a single-sample 2D render target", key);
+        return -1;
+    }
+    int count = rt->depth_only ? 0 : (rt->attachment_count > 0 ? rt->attachment_count : 1);
+    if (att != VIO_RT_DEPTH && (att < 0 || att >= count)) {
+        zend_argument_value_error(3, "'%s': attachment %d does not exist (VIO_RT_DEPTH or 0..%d)", key, (int)att, count - 1);
+        return -1;
+    }
+    out->rt = rt;
+    out->attachment = (int)att;
+    return 1;
+}
+
+static int vio_upscaler_pair_arg(HashTable *in, const char *key, float *x, float *y)
+{
+    zval *v = zend_hash_str_find(in, key, strlen(key));
+    if (!v) return 1;
+    zval *a, *b;
+    if (Z_TYPE_P(v) != IS_ARRAY || !(a = zend_hash_index_find(Z_ARRVAL_P(v), 0)) || !(b = zend_hash_index_find(Z_ARRVAL_P(v), 1))) {
+        zend_argument_value_error(3, "'%s' must be [x, y]", key);
+        return 0;
+    }
+    *x = (float)zval_get_double(a);
+    *y = (float)zval_get_double(b);
+    return 1;
+}
+
+static float vio_upscaler_float_opt(HashTable *in, const char *key, float def)
+{
+    zval *v = zend_hash_str_find(in, key, strlen(key));
+    return v ? (float)zval_get_double(v) : def;
+}
+
+/* vio_upscaler_dispatch($ctx, $upscaler, ['color' =>, 'depth' =>, 'motion' =>,
+ * 'output' => storage target at display size, 'reactive' / 'transparency' /
+ * 'exposure' =>, 'jitter' => [x, y] render px, 'mv_scale' => [x, y], 'reset',
+ * 'sharpness' => 0..1, 'frame_time_ms', 'near', 'far', 'fov_y', 'pre_exposure',
+ * 'view_to_meters', 'render_width' / 'render_height']) - inside a frame. */
+ZEND_FUNCTION(vio_upscaler_dispatch)
+{
+    zval *ctx_zval, *u_zval;
+    HashTable *in;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(u_zval, vio_upscaler_ce)
+        Z_PARAM_ARRAY_HT(in)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_upscaler_object *u = Z_VIO_UPSCALER_P(u_zval);
+    if (!u->valid || !ctx->initialized || u->backend != ctx->backend || !ctx->backend->upscaler_dispatch) {
+        php_error_docref(NULL, E_WARNING, "vio_upscaler_dispatch: the upscaler is destroyed or belongs to another context");
+        RETURN_FALSE;
+    }
+    const vio_backend *be = ctx->backend;
+    vio_upscale_dispatch_desc d;
+    memset(&d, 0, sizeof(d));
+    if (vio_upscaler_image_arg(in, "color", 1, 0, be, &d.color) < 0) RETURN_THROWS();
+    int has_depth = vio_upscaler_image_arg(in, "depth", 0, VIO_RT_DEPTH, be, &d.depth);
+    if (has_depth < 0) RETURN_THROWS();
+    if (has_depth == 0) {   /* the colour target's own depth */
+        d.depth.rt = d.color.rt;
+        d.depth.attachment = VIO_RT_DEPTH;
+    }
+    if (vio_upscaler_image_arg(in, "motion", 1, 0, be, &d.motion) < 0) RETURN_THROWS();
+    if (vio_upscaler_image_arg(in, "output", 1, 0, be, &d.output) < 0) RETURN_THROWS();
+    if (vio_upscaler_image_arg(in, "reactive", 0, 0, be, &d.reactive) < 0) RETURN_THROWS();
+    if (vio_upscaler_image_arg(in, "transparency", 0, 0, be, &d.transparency) < 0) RETURN_THROWS();
+    if (vio_upscaler_image_arg(in, "exposure", 0, 0, be, &d.exposure) < 0) RETURN_THROWS();
+
+    vio_render_target_object *color = (vio_render_target_object *)d.color.rt;
+    vio_render_target_object *out = (vio_render_target_object *)d.output.rt;
+    if (d.color.attachment == VIO_RT_DEPTH || d.motion.attachment == VIO_RT_DEPTH || d.output.attachment == VIO_RT_DEPTH) {
+        zend_argument_value_error(3, "'color', 'motion' and 'output' are colour attachments");
+        RETURN_THROWS();
+    }
+    if (!out->storage) {
+        zend_argument_value_error(3, "'output' must be created with 'storage' => true (VIO_FEATURE_RENDER_TARGET_STORAGE)");
+        RETURN_THROWS();
+    }
+    if (out->width != u->desc.display_width || out->height != u->desc.display_height) {
+        zend_argument_value_error(3, "'output' must be %dx%d (the display size), is %dx%d",
+                                  u->desc.display_width, u->desc.display_height, out->width, out->height);
+        RETURN_THROWS();
+    }
+    zval *v;
+    d.params.render_width = color->width < u->desc.render_width ? color->width : u->desc.render_width;
+    d.params.render_height = color->height < u->desc.render_height ? color->height : u->desc.render_height;
+    if ((v = zend_hash_str_find(in, "render_width", sizeof("render_width") - 1)) != NULL) d.params.render_width = (int)zval_get_long(v);
+    if ((v = zend_hash_str_find(in, "render_height", sizeof("render_height") - 1)) != NULL) d.params.render_height = (int)zval_get_long(v);
+    if (d.params.render_width < 1 || d.params.render_height < 1 || d.params.render_width > u->desc.render_width || d.params.render_height > u->desc.render_height
+        || d.params.render_width > color->width || d.params.render_height > color->height) {
+        zend_argument_value_error(3, "the render size %dx%d must fit the colour target and the upscaler's %dx%d",
+                                  d.params.render_width, d.params.render_height, u->desc.render_width, u->desc.render_height);
+        RETURN_THROWS();
+    }
+    d.params.mv_scale_x = d.params.mv_scale_y = 1.0f;
+    if (!vio_upscaler_pair_arg(in, "jitter", &d.params.jitter_x, &d.params.jitter_y)) RETURN_THROWS();
+    if (!vio_upscaler_pair_arg(in, "mv_scale", &d.params.mv_scale_x, &d.params.mv_scale_y)) RETURN_THROWS();
+    d.params.reset = vio_upscaler_bool_opt(in, "reset");
+    d.params.sharpness = vio_upscaler_float_opt(in, "sharpness", 0.0f);
+    if (d.params.sharpness < 0.0f || d.params.sharpness > 1.0f) {
+        zend_argument_value_error(3, "'sharpness' must be 0..1");
+        RETURN_THROWS();
+    }
+    d.params.frame_time_ms = vio_upscaler_float_opt(in, "frame_time_ms", 1000.0f / 60.0f);
+    d.params.camera_near = vio_upscaler_float_opt(in, "near", 0.1f);
+    d.params.camera_far = vio_upscaler_float_opt(in, "far", 1000.0f);
+    d.params.fov_y = vio_upscaler_float_opt(in, "fov_y", 1.0471976f);
+    d.params.pre_exposure = vio_upscaler_float_opt(in, "pre_exposure", 1.0f);
+    d.params.view_to_meters = vio_upscaler_float_opt(in, "view_to_meters", 1.0f);
+    if (d.params.pre_exposure <= 0.0f) {
+        zend_argument_value_error(3, "'pre_exposure' must be > 0");
+        RETURN_THROWS();
+    }
+    char err[512] = "";
+    if (be->upscaler_dispatch(u->handle, &d, err, sizeof(err)) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_upscaler_dispatch: %s", err[0] ? err : "failed");
+        RETURN_FALSE;
+    }
+    RETURN_TRUE;
+}
+
+/* vio_upscaler_destroy($upscaler): frees it now (unset() does the same later). */
+ZEND_FUNCTION(vio_upscaler_destroy)
+{
+    zval *u_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(u_zval, vio_upscaler_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_upscaler_release(Z_VIO_UPSCALER_P(u_zval));
+}
+
 /* ── Phase 5: 2D API functions ───────────────────────────────────── */
 ZEND_FUNCTION(vio_rect)
 {
@@ -11574,6 +12002,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_CUBE", VIO_FEATURE_RENDER_TARGET_CUBE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MIPMAP_GEN", VIO_FEATURE_MIPMAP_GEN, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MRT", VIO_FEATURE_MRT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_MAX_COLOR_ATTACHMENTS", VIO_MAX_COLOR_ATTACHMENTS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_RGBA8", VIO_FORMAT_RGBA8, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_RGBA16F", VIO_FORMAT_RGBA16F, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FORMAT_RGBA32F", VIO_FORMAT_RGBA32F, CONST_CS | CONST_PERSISTENT);
@@ -11599,6 +12028,18 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_LAYERED_RENDER", VIO_FEATURE_LAYERED_RENDER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_VERTEX_LAYER", VIO_FEATURE_VERTEX_LAYER, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_RT_ALL_LAYERS", VIO_RT_ALL_LAYERS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_RT_DEPTH", VIO_RT_DEPTH, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE", VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_STORAGE", VIO_FEATURE_RENDER_TARGET_STORAGE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_UPSCALER_NATIVE", VIO_FEATURE_UPSCALER_NATIVE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALER_FSR3", VIO_UPSCALER_FSR3, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALER_DLSS", VIO_UPSCALER_DLSS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALER_XESS", VIO_UPSCALER_XESS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_NATIVE_AA", VIO_UPSCALE_NATIVE_AA, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_QUALITY", VIO_UPSCALE_QUALITY, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_BALANCED", VIO_UPSCALE_BALANCED, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_PERFORMANCE", VIO_UPSCALE_PERFORMANCE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_UPSCALE_ULTRA_PERFORMANCE", VIO_UPSCALE_ULTRA_PERFORMANCE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALE_SPATIAL", VIO_UPSCALE_SPATIAL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALE_TEMPORAL", VIO_UPSCALE_TEMPORAL, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_VIEWPORT", VIO_FEATURE_MULTI_VIEWPORT, CONST_CS | CONST_PERSISTENT);
@@ -12769,11 +13210,11 @@ ZEND_FUNCTION(vio_render_target)
     if ((val = zend_hash_str_find(config_ht, "hdr", sizeof("hdr") - 1)) != NULL) {
         hdr = zend_is_true(val);
     }
-    /* Colour attachments. 'attachments' => [VIO_FORMAT_*, ...] (1..4) enables
-     * MRT — fragment layout(location = i) out writes attachment i. Without it
-     * the classic single target is used, RGBA8 or RGBA16F via 'hdr'. */
+    /* Colour attachments. 'attachments' => [VIO_FORMAT_*, ...] (1..VIO_MAX_COLOR_ATTACHMENTS)
+     * enables MRT — fragment layout(location = i) out writes attachment i. Without
+     * it the classic single target is used, RGBA8 or RGBA16F via 'hdr'. */
     int attachment_count = 1;
-    int formats[VIO_MAX_COLOR_ATTACHMENTS] = { hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8, 0, 0, 0 };
+    int formats[VIO_MAX_COLOR_ATTACHMENTS] = { hdr ? VIO_FORMAT_RGBA16F : VIO_FORMAT_RGBA8 };
     if ((val = zend_hash_str_find(config_ht, "attachments", sizeof("attachments") - 1)) != NULL &&
         Z_TYPE_P(val) == IS_ARRAY) {
         int n = 0;
@@ -12941,6 +13382,22 @@ ZEND_FUNCTION(vio_render_target)
         }
     }
 
+    /* 'storage' => true: every colour attachment is also a compute storage image
+     * (vio_render_target_texture() + vio_compute_bind_image). Plain single-sample
+     * 2D colour targets; VIO_FEATURE_RENDER_TARGET_STORAGE (D3D12, Vulkan). */
+    int storage = 0;
+    if ((val = zend_hash_str_find(config_ht, "storage", sizeof("storage") - 1)) != NULL && zend_is_true(val)) {
+        if (!ctx->backend->supports_feature || !ctx->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_STORAGE)) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'storage' targets are not supported on backend '%s' (VIO_FEATURE_RENDER_TARGET_STORAGE)", ctx->backend->name);
+            RETURN_FALSE;
+        }
+        if (depth_only || is_cube || layers > 1 || samples > 1 || rate_nx > 0) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target: 'storage' needs a single-sample 2D colour target (no depth_only, cube, layers, samples or rate_map)");
+            RETURN_FALSE;
+        }
+        storage = 1;
+    }
+
     /* Create VioRenderTarget object */
     zval rt_zval;
     object_init_ex(&rt_zval, vio_render_target_ce);
@@ -12960,6 +13417,7 @@ ZEND_FUNCTION(vio_render_target)
     rt->layers     = layers;
     rt->mip_levels = mip_levels;
     rt->depth_reduction = depth_reduction;
+    rt->storage    = storage;
     rt->backend    = ctx->backend;
     rt->attachment_count = attachment_count;
     memcpy(rt->formats, formats, sizeof(formats));
@@ -13278,13 +13736,24 @@ ZEND_FUNCTION(vio_read_render_target)
     zval *rt_zval;
     zend_long face = -1;
     zend_long attachment = 0;
+    HashTable *options = NULL;
 
-    ZEND_PARSE_PARAMETERS_START(1, 3)
+    ZEND_PARSE_PARAMETERS_START(1, 4)
         Z_PARAM_OBJECT_OF_CLASS(rt_zval, vio_render_target_ce)
         Z_PARAM_OPTIONAL
         Z_PARAM_LONG(face)
         Z_PARAM_LONG(attachment)
+        Z_PARAM_ARRAY_HT_OR_NULL(options)
     ZEND_PARSE_PARAMETERS_END();
+
+    /* 'raw' => true: the texels in the attachment's own format (RGBA16F halves,
+     * R32F floats, packed R11G11B10F / RGB10A2, ...) instead of clamped RGBA8 -
+     * motion vectors and history buffers compared bit for bit. */
+    int raw = 0;
+    if (options) {
+        zval *rz = zend_hash_str_find(options, "raw", sizeof("raw") - 1);
+        raw = rz && zend_is_true(rz);
+    }
 
     vio_render_target_object *rt = Z_VIO_RENDER_TARGET_P(rt_zval);
     if (!rt->valid || !rt->backend) {
@@ -13302,12 +13771,20 @@ ZEND_FUNCTION(vio_read_render_target)
         RETURN_FALSE;
     }
 
-    size_t size = (size_t)rt->width * rt->height * 4;
+    if (raw && rt->depth_only) {
+        php_error_docref(NULL, E_WARNING, "vio_read_render_target: 'raw' reads colour attachments (a depth_only target has none)");
+        RETURN_FALSE;
+    }
+
+    size_t size = (size_t)rt->width * rt->height * (raw ? (size_t)vio_rt_format_bpp(rt->formats[attachment]) : 4);
     zend_string *buf = zend_string_alloc(size, 0);
     ZSTR_VAL(buf)[size] = '\0';
 
     if (rt->backend->read_render_target) {
-        if (rt->backend->read_render_target(rt, (int)face, (int)attachment, ZSTR_VAL(buf)) == 0) {
+        rt->read_raw = raw;
+        int rc = rt->backend->read_render_target(rt, (int)face, (int)attachment, ZSTR_VAL(buf));
+        rt->read_raw = 0;
+        if (rc == 0) {
             RETURN_NEW_STR(buf);
         }
         zend_string_release(buf);
@@ -13355,11 +13832,29 @@ ZEND_FUNCTION(vio_render_target_texture)
         RETURN_FALSE;
     }
     int rt_attachments = rt->attachment_count > 0 ? rt->attachment_count : 1;
-    if (attachment < 0 || attachment >= rt_attachments || (rt->depth_only && attachment != 0)) {
-        php_error_docref(NULL, E_WARNING, "vio_render_target_texture: attachment must be 0..%d", rt_attachments - 1);
+    /* VIO_RT_DEPTH: the depth attachment. On a depth_only target that is what
+     * attachment 0 already is; on a colour target it needs
+     * VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE and a single-sample plain 2D target
+     * (a multisampled, layered or rate-mapped depth has no samplable twin). */
+    int want_depth = rt->depth_only || attachment == VIO_RT_DEPTH;
+    if (attachment != VIO_RT_DEPTH &&
+        (attachment < 0 || attachment >= rt_attachments || (rt->depth_only && attachment != 0))) {
+        php_error_docref(NULL, E_WARNING, "vio_render_target_texture: attachment must be 0..%d or VIO_RT_DEPTH", rt_attachments - 1);
         RETURN_FALSE;
     }
-    int att = (int)attachment;   /* MRT colour attachment index (0 == the legacy scalar fields) */
+    if (want_depth && !rt->depth_only) {
+        if (!rt->backend || !rt->backend->supports_feature ||
+            !rt->backend->supports_feature(VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE)) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target_texture: sampling the depth of a colour target is not supported on backend '%s' (VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE)",
+                             rt->backend ? rt->backend->name : "?");
+            RETURN_FALSE;
+        }
+        if (rt->samples > 1 || rt->is_cube || rt->layers > 1 || rt->rate_active) {
+            php_error_docref(NULL, E_WARNING, "vio_render_target_texture: VIO_RT_DEPTH needs a single-sample 2D target (no 'samples', 'cube', 'layers' or active 'rate_map')");
+            RETURN_FALSE;
+        }
+    }
+    int att = want_depth ? 0 : (int)attachment;   /* MRT colour attachment index (0 == the legacy scalar fields) */
     if (rt->is_cube) {
         php_error_docref(NULL, E_WARNING, "vio_render_target_texture: sample a cube target through vio_render_target_cubemap()");
         RETURN_FALSE;
@@ -13373,16 +13868,17 @@ ZEND_FUNCTION(vio_render_target_texture)
 
     tex->width    = rt->width;
     tex->height   = rt->height;
-    tex->channels = rt->depth_only ? 1 : 4;
+    tex->channels = want_depth ? 1 : 4;
     tex->filter   = VIO_FILTER_NEAREST;
     tex->wrap     = VIO_WRAP_CLAMP;
     tex->layers   = rt->layers > 1 ? rt->layers : 1;
     tex->is_array = rt->layers > 1;   /* sampler2DArray; the backend views below are arrays too */
 
-    /* Return depth texture for depth-only targets, color texture otherwise */
-    tex->texture_id = rt->depth_only ? rt->depth_texture : (att == 0 ? rt->color_texture : rt->color_textures[att]);
+    /* The depth texture for depth-only targets and VIO_RT_DEPTH, colour otherwise */
+    tex->texture_id = want_depth ? rt->depth_texture : (att == 0 ? rt->color_texture : rt->color_textures[att]);
     tex->valid    = 1;
     tex->borrowed = 1;  /* GL resource owned by render target, don't double-delete */
+    tex->storage  = rt->storage && !want_depth;   /* vio_compute_bind_image accepts it */
 
 #ifdef HAVE_D3D11
     /* For D3D11: hand out a cached backend-texture wrapper owned by the
@@ -13394,13 +13890,13 @@ ZEND_FUNCTION(vio_render_target_texture)
      * vio_render_target_texture call started returning garbage SRV
      * handles, which crashed the next sampler bind. */
     if (rt->backend_type == VIO_RT_BACKEND_D3D11 && vio_d3d11.initialized) {
-        vio_d3d11_texture **cache_slot = rt->depth_only
+        vio_d3d11_texture **cache_slot = want_depth
             ? (vio_d3d11_texture **)&rt->d3d11_depth_backend_texture
             : (att == 0 ? (vio_d3d11_texture **)&rt->d3d11_color_backend_texture
                         : (vio_d3d11_texture **)&rt->d3d11_color_backend_textures[att]);
 
         if (*cache_slot == NULL) {
-            ID3D11ShaderResourceView *srv = rt->depth_only
+            ID3D11ShaderResourceView *srv = want_depth
                 ? (ID3D11ShaderResourceView *)rt->d3d11_depth_srv
                 : (att == 0 ? (ID3D11ShaderResourceView *)rt->d3d11_color_srv
                             : (ID3D11ShaderResourceView *)rt->d3d11_color_srvs[att]);
@@ -13411,7 +13907,7 @@ ZEND_FUNCTION(vio_render_target_texture)
                 d3d_tex->width = rt->width;
                 d3d_tex->height = rt->height;
 
-                if (rt->depth_only) {
+                if (want_depth) {
                     /* Regular sampler for sampler2D + texture() (manual shadow comparison) */
                     D3D11_SAMPLER_DESC sampler_desc = {0};
                     sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -13463,7 +13959,7 @@ ZEND_FUNCTION(vio_render_target_texture)
      * here (the SRV descriptors are owned by the RT), so the cached
      * wrapper is freed in the RT's free handler alongside its descriptors. */
     if (rt->backend_type == VIO_RT_BACKEND_D3D12 && vio_d3d12.initialized) {
-        vio_d3d12_texture **cache_slot = rt->depth_only
+        vio_d3d12_texture **cache_slot = want_depth
             ? (vio_d3d12_texture **)&rt->d3d12_depth_backend_texture
             : (att == 0 ? (vio_d3d12_texture **)&rt->d3d12_color_backend_texture
                         : (vio_d3d12_texture **)&rt->d3d12_color_backend_textures[att]);
@@ -13471,7 +13967,7 @@ ZEND_FUNCTION(vio_render_target_texture)
         uint64_t color_srv_cpu = att == 0 ? rt->d3d12_color_srv_cpu : rt->d3d12_color_srv_cpus[att];
 
         if (*cache_slot == NULL) {
-            if (rt->depth_only && rt->d3d12_depth_srv_gpu) {
+            if (want_depth && rt->d3d12_depth_srv_gpu) {
                 vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
                 d3d_tex->resource = NULL;
                 d3d_tex->width = rt->width;
@@ -13483,7 +13979,7 @@ ZEND_FUNCTION(vio_render_target_texture)
                  * comparison samplers s8+ regardless). */
                 d3d_tex->sampler_index = vio_d3d12_sampler_combo(VIO_FILTER_NEAREST, VIO_WRAP_CLAMP, 1);
                 *cache_slot = d3d_tex;
-            } else if (!rt->depth_only && color_srv_gpu) {
+            } else if (!want_depth && color_srv_gpu) {
                 vio_d3d12_texture *d3d_tex = calloc(1, sizeof(vio_d3d12_texture));
                 d3d_tex->resource = NULL;
                 d3d_tex->width = rt->width;
@@ -13492,6 +13988,8 @@ ZEND_FUNCTION(vio_render_target_texture)
                 d3d_tex->srv_cpu.ptr = color_srv_cpu;
                 /* Colour attachments sample LINEAR / CLAMP like D3D11 + GL. */
                 d3d_tex->sampler_index = vio_d3d12_sampler_combo(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, 1);
+                d3d_tex->rt_owner = rt;            /* storage image binds resolve the resource / state here */
+                d3d_tex->rt_attachment = att;
                 *cache_slot = d3d_tex;
             }
         }
@@ -13509,7 +14007,7 @@ ZEND_FUNCTION(vio_render_target_texture)
      * wrapper. The registry slot is cleared lazily by other deletes; the actual
      * MTLTexture lifetime stays with the RT (CFBridgingRelease in destroy). */
     if (rt->backend_type == VIO_RT_BACKEND_METAL) {
-        void *cf_tex = rt->depth_only ? rt->metal_depth_texture
+        void *cf_tex = want_depth ? rt->metal_depth_texture
                      : (att == 0 ? rt->metal_color_texture : rt->metal_color_textures[att]);
         if (cf_tex) {
             tex->texture_id = vio_metal_register_external_texture(cf_tex);
@@ -13517,11 +14015,11 @@ ZEND_FUNCTION(vio_render_target_texture)
 
             /* 3D sampling path: cached wrapper owned by the RT, built once
              * (same rationale as the D3D11 cache — a wrapper per call leaked). */
-            void **cache_slot = rt->depth_only ? &rt->metal_depth_backend_texture
+            void **cache_slot = want_depth ? &rt->metal_depth_backend_texture
                               : (att == 0 ? &rt->metal_color_backend_texture
                                           : &rt->metal_color_backend_textures[att]);
             if (*cache_slot == NULL) {
-                *cache_slot = vio_metal_wrap_rt_texture(cf_tex, rt->depth_only);
+                *cache_slot = vio_metal_wrap_rt_texture(cf_tex, want_depth);
             }
             tex->backend_texture = *cache_slot;
         }
@@ -13545,7 +14043,7 @@ ZEND_FUNCTION(vio_render_target_texture)
      * on the borrowed handles, we leave tex->backend = NULL (the texture free
      * handler short-circuits when backend is NULL) and mark it borrowed. */
     if (rt->backend_type == VIO_RT_BACKEND_VULKAN && vio_vk.initialized) {
-        void *wrapper = vulkan_rt_sampling_texture(rt, att);   /* colour attachment att, or depth for depth_only targets */
+        void *wrapper = vulkan_rt_sampling_texture(rt, want_depth ? VIO_RT_DEPTH : att);   /* colour attachment att, or the depth */
         if (wrapper) {
             tex->backend_texture = wrapper;
             tex->backend         = NULL; /* the RT owns the wrapper and its handles */
@@ -13554,6 +14052,15 @@ ZEND_FUNCTION(vio_render_target_texture)
     }
 #endif
 
+    /* A colour target's depth the backend could not wrap (no SRV / view for it)
+     * is an error, not an unbound texture. */
+    if (want_depth && !rt->depth_only && !tex->backend_texture &&
+        !(rt->backend_type == VIO_RT_BACKEND_OPENGL && tex->texture_id)) {
+        zval_ptr_dtor(&tex_zval);
+        php_error_docref(NULL, E_WARNING, "vio_render_target_texture: the depth of this target is not samplable on backend '%s'",
+                         rt->backend ? rt->backend->name : "?");
+        RETURN_FALSE;
+    }
     RETURN_COPY_VALUE(&tex_zval);
 }
 
@@ -14209,6 +14716,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_bundle_register();
     vio_rt_pipeline_register();
     vio_work_graph_register();
+    vio_upscaler_register();
     vio_font_register();
     vio_font_face_register();
     vio_sound_register();

@@ -217,7 +217,19 @@ jobs:
             tests/media/209_recorder_encoders_all_backends.phpt \
             tests/render3d/210_compute_msl_override_all_backends.phpt \
             tests/render3d/211_rate_map_all_backends.phpt \
-            tests/core/212_audit_gate_no_glfw_outside_platform.phpt
+            tests/core/212_audit_gate_no_glfw_outside_platform.phpt \
+            tests/render3d/222_mrt_6_attachments_all_backends.phpt \
+            tests/render3d/223_rt_depth_sample_all_backends.phpt \
+            tests/render3d/224_rt_raw_readback_all_backends.phpt \
+            tests/render3d/225_rt_storage_compute_all_backends.phpt \
+            tests/render3d/226_upscaler_unavailable_all_backends.phpt \
+            tests/render3d/227_upscaler_fsr3_converges.phpt \
+            tests/render3d/228_upscaler_lifecycle_no_leak.phpt \
+            tests/render3d/229_upscaler_dlss_unavailable_all_backends.phpt \
+            tests/render3d/232_vulkan_stale_texture_binding_validation_clean.phpt \
+            tests/render3d/234_upscaler_plugin_missing_all_backends.phpt \
+            tests/render3d/235_upscaler_plugin_abi_refused.phpt \
+            tests/render3d/236_upscaler_plugin_dispatch_states.phpt
 
       - name: Package binary
         run: |
@@ -432,7 +444,19 @@ jobs:
             tests/media/209_recorder_encoders_all_backends.phpt \
             tests/render3d/210_compute_msl_override_all_backends.phpt \
             tests/render3d/211_rate_map_all_backends.phpt \
-            tests/core/212_audit_gate_no_glfw_outside_platform.phpt
+            tests/core/212_audit_gate_no_glfw_outside_platform.phpt \
+            tests/render3d/222_mrt_6_attachments_all_backends.phpt \
+            tests/render3d/223_rt_depth_sample_all_backends.phpt \
+            tests/render3d/224_rt_raw_readback_all_backends.phpt \
+            tests/render3d/225_rt_storage_compute_all_backends.phpt \
+            tests/render3d/226_upscaler_unavailable_all_backends.phpt \
+            tests/render3d/227_upscaler_fsr3_converges.phpt \
+            tests/render3d/228_upscaler_lifecycle_no_leak.phpt \
+            tests/render3d/229_upscaler_dlss_unavailable_all_backends.phpt \
+            tests/render3d/232_vulkan_stale_texture_binding_validation_clean.phpt \
+            tests/render3d/234_upscaler_plugin_missing_all_backends.phpt \
+            tests/render3d/235_upscaler_plugin_abi_refused.phpt \
+            tests/render3d/236_upscaler_plugin_dispatch_states.phpt
 
       - name: Package binary
         run: |
@@ -935,7 +959,19 @@ jobs:
             tests/window/213_win32_platform.phpt `
             tests/core/170_d3d12_shader_model_pin.phpt `
             tests/backends/168_d3d12_pipeline_freed_after_frame.phpt `
-            tests/backends/221_d3d12_capture_mid_frame_keeps_list_state.phpt
+            tests/backends/221_d3d12_capture_mid_frame_keeps_list_state.phpt `
+            tests/render3d/222_mrt_6_attachments_all_backends.phpt `
+            tests/render3d/223_rt_depth_sample_all_backends.phpt `
+            tests/render3d/224_rt_raw_readback_all_backends.phpt `
+            tests/render3d/225_rt_storage_compute_all_backends.phpt `
+            tests/render3d/226_upscaler_unavailable_all_backends.phpt `
+            tests/render3d/227_upscaler_fsr3_converges.phpt `
+            tests/render3d/228_upscaler_lifecycle_no_leak.phpt `
+            tests/render3d/229_upscaler_dlss_unavailable_all_backends.phpt `
+            tests/render3d/232_vulkan_stale_texture_binding_validation_clean.phpt `
+            tests/render3d/234_upscaler_plugin_missing_all_backends.phpt `
+            tests/render3d/235_upscaler_plugin_abi_refused.phpt `
+            tests/render3d/236_upscaler_plugin_dispatch_states.phpt
 
       - name: Package binary
         shell: pwsh

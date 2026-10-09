@@ -25,7 +25,7 @@ typedef struct _vio_render_target_object {
      * glBlitFramebuffer on unbind / readback. */
     unsigned int gl_msaa_fbo;
     unsigned int gl_msaa_color_rb;
-    unsigned int gl_msaa_color_rbs[4];   /* MRT: attachments 1..3 ([0] unused, see gl_msaa_color_rb) */
+    unsigned int gl_msaa_color_rbs[VIO_MAX_COLOR_ATTACHMENTS];   /* MRT: attachments 1..n ([0] unused, see gl_msaa_color_rb) */
     unsigned int gl_msaa_color_arr;      /* cube / array MSAA (A24): GL_TEXTURE_2D_MULTISAMPLE_ARRAY, a layer per face */
     unsigned int gl_msaa_depth_arr;
     int          gl_msaa_layer;          /* layer the MSAA FBO renders into (-1 = all) */
@@ -58,7 +58,7 @@ typedef struct _vio_render_target_object {
     /* MSAA (samples > 1): the multisampled colour texture rendered into;
      * d3d11_color_tex is then the single-sample RESOLVE texture the SRV reads. */
     void        *d3d11_msaa_color_tex;        /* ID3D11Texture2D* (multisampled) */
-    void        *d3d11_msaa_color_texs[4];    /* MRT: attachments 1..3 ([0] = d3d11_msaa_color_tex) */
+    void        *d3d11_msaa_color_texs[VIO_MAX_COLOR_ATTACHMENTS];    /* MRT: attachments 1..n ([0] = d3d11_msaa_color_tex) */
     void        *d3d11_msaa_face_rtvs;        /* cube / array MSAA (A24): RTV per layer of the MS array, + all layers */
     void        *d3d11_msaa_face_dsvs;        /* ... and the DSVs of the MS depth array */
     int          d3d11_msaa_layer;            /* layer the MS views render into (-1 = all) */
@@ -144,6 +144,10 @@ typedef struct _vio_render_target_object {
     int          bound_level;         /* cube: mip level currently bound */
     int          samples;             /* requested by vio_render_target(); backends clamp to what
                                          they support and write the effective count back (1 = off) */
+    int          storage;             /* 'storage' => true: colour attachments are compute storage
+                                         images too (VIO_FEATURE_RENDER_TARGET_STORAGE) */
+    int          read_raw;            /* set by vio_read_render_target(['raw' => true]) around the
+                                         read_render_target call: texels in their own format */
     int          valid;
     int          backend_type;        /* 0=none, 1=opengl, 2=d3d11, 3=d3d12, 4=metal, 5=vulkan */
     int          d3d12_depth_is_srv;  /* 1 if depth resource is in SRV state (needs barrier to DEPTH_WRITE) */
@@ -202,6 +206,12 @@ int  vio_rt_format_bpp(int format);
 void vio_rt_rgb10a2_to_rgba8_inplace(unsigned char *buf, size_t count);
 void vio_rt_convert_to_rgba8(int format, int bgra, const void *src, size_t src_pitch,
                              int w, int h, unsigned char *out);
+/* What read_render_target writes for a colour attachment: RGBA8 via
+ * vio_rt_convert_to_rgba8, or with rt->read_raw the texels themselves - rows of
+ * w * vio_rt_format_bpp(format) bytes, top-down, RGBA8 in R, G, B, A order
+ * (bgra sources swizzled), everything else bit for bit. */
+void vio_rt_copy_texels(const vio_render_target_object *rt, int format, int bgra, const void *src,
+                        size_t src_pitch, int w, int h, unsigned char *out);
 
 extern zend_class_entry *vio_render_target_ce;
 

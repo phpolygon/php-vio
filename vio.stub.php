@@ -1056,6 +1056,9 @@ function vio_compute_bind_buffer(VioContext $context, VioComputePipeline $pipeli
  * Bind a storage image (a VioTexture created with 'storage' => true) to a
  * compute pipeline slot — GLSL `layout(binding = $slot, rgba8) uniform image2D`
  * (or image3D for vio_texture_3d). Requires VIO_FEATURE_STORAGE_IMAGE.
+ * vio_render_target_texture() of a render target created with 'storage' => true
+ * binds too, in the attachment's own format (`rgba16f`, `r32f`, ...;
+ * VIO_FEATURE_RENDER_TARGET_STORAGE).
  *
  * @param int $access VIO_COMPUTE_READ or VIO_COMPUTE_WRITE
  */
@@ -1213,6 +1216,105 @@ function vio_upscale_jitter(int $frame, int $phases = 8): array {}
 
 /** ['spatial' => 'portable' | 'metalfx', 'temporal' => 'portable' | 'metalfx'] */
 function vio_upscale_info(VioContext $context): array {}
+
+/**
+ * Native temporal upscalers on D3D12 and Vulkan (TEMPORAL-S3/S4):
+ * AMD FidelityFX FSR 3.1 (VIO_UPSCALER_FSR3, built in) and NVIDIA DLSS Super
+ * Resolution (VIO_UPSCALER_DLSS, NVIDIA RTX GPUs) - DLSS is not part of php-vio:
+ * it comes from a plugin library (vio_dlss.dll / libvio_dlss.so, the plugin ABI
+ * of include/vio_upscale_plugin.h) the game ships together with NVIDIA's
+ * nvngx_dlss.dll. VIO_UPSCALER_XESS is reserved. Libraries are looked for on
+ * first use: from `vio.ffx_path` / VIO_FFX_PATH (amd_fidelityfx_dx12.dll /
+ * amd_fidelityfx_vk.dll) resp. `vio.dlss_plugin_path` / VIO_DLSS_PLUGIN (the
+ * plugin) when set (a directory or the file - then the only place searched),
+ * otherwise next to the PHP executable, next to php_vio, then PATH; a plugin of
+ * another ABI is refused. Without them this returns false - never a warning;
+ * vio_upscaler_info()['reason'] says why. VIO_FEATURE_UPSCALER_NATIVE is set
+ * when any provider runs on the device. The DLSS plugin reads `vio.dlss_path`
+ * (where nvngx_dlss.dll is), `vio.dlss_project_id` (the game's GUID-like id)
+ * and `vio.dlss_engine_version`.
+ */
+function vio_upscaler_supported(VioContext $context, int $provider = VIO_UPSCALER_FSR3): bool {}
+
+/**
+ * State of a provider on this device: ['provider' => 'fsr3' | 'dlss', 'backend',
+ * 'supported' => bool, 'reason' => why not ('' when supported; DLSS: missing
+ * plugin or plugin of another ABI, missing nvngx_dlss.dll, not an RTX GPU,
+ * driver too old with the version it needs), 'version' (e.g. '3.1.4', DLSS
+ * '310.9.1'), 'driver' (graphics driver version the provider checked, '' when
+ * none), 'library' (runtime loaded), 'plugin' (the plugin library the provider
+ * came from, '' when built in), 'device' (Vulkan
+ * features / extensions device creation enabled for native upscalers), 'live'
+ * (upscalers alive on the backend), 'host_bytes' (CPU memory the providers
+ * hold)]. With a VioUpscaler also 'valid', 'quality', 'render_width',
+ * 'render_height' (the size the provider chose for the quality mode - DLSS: NGX
+ * optimal settings), 'display_width', 'display_height', 'preset' (the model
+ * preset asked for, '' = the provider's default), 'jitter_phases' (length of
+ * the jitter cycle) and 'gpu_memory' (bytes).
+ */
+function vio_upscaler_info(VioContext $context, VioUpscaler|int $which = VIO_UPSCALER_FSR3): array {}
+
+/**
+ * Create an upscaler context. Options:
+ *   'display_width', 'display_height' (required): output size
+ *   'provider'   => VIO_UPSCALER_FSR3 | VIO_UPSCALER_DLSS
+ *   'quality'    => VIO_UPSCALE_NATIVE_AA (1.0; DLSS: DLAA) | QUALITY (1.5, default) |
+ *                   BALANCED (1.7) | PERFORMANCE (2.0) | ULTRA_PERFORMANCE (3.0): display /
+ *                   render per axis for FSR; DLSS takes NGX's optimal render size
+ *                   (vio_upscaler_render_size)
+ *   'render_width', 'render_height': largest render size (default from the quality)
+ *   'hdr' (linear HDR colour), 'depth_inverted' (1 = near), 'depth_infinite',
+ *   'auto_exposure', 'dynamic_resolution', 'jittered_motion' (motion includes
+ *   the jitter), 'debug' (the provider checks the API use; messages to stderr) => bool
+ *   'preset'     => one letter or null: the provider's model. DLSS: 'j' | 'k'
+ *                   (transformer), 'l' | 'm' (transformer for Ultra Performance /
+ *                   Performance), 'e' | 'f' (CNN, deprecated by NVIDIA); null = NGX's
+ *                   default per mode (SDK 310.6: K for DLAA / Quality / Balanced, M
+ *                   for Performance, L for Ultra Performance). The model is DLSS's
+ *                   cost: NVIDIA's table for an RTX 2080 Ti at 2560x1440 gives E/F
+ *                   0.62 ms, J/K 1.80 ms, M 3.41 ms, L 5.45 ms. A letter the provider
+ *                   does not have: false with a warning (FSR 3.1 has none);
+ *                   anything but one letter: ValueError.
+ * False with a warning when the provider is not supported (see vio_upscaler_info).
+ * Destroyed by unset() / vio_upscaler_destroy() / vio_destroy().
+ */
+function vio_upscaler_create(VioContext $context, array $options): VioUpscaler|false {}
+
+/**
+ * Upscale this frame, between vio_begin and vio_end (recorded on the frame;
+ * the bound target stays bound, the bound pipeline too). Inputs are render
+ * targets - VioRenderTarget (attachment 0; for 'depth' its depth) or
+ * [VioRenderTarget, attachment | VIO_RT_DEPTH] - single-sample 2D:
+ *   'color'   render-size colour (jittered)
+ *   'depth'   render-size depth (default [$colorTarget, VIO_RT_DEPTH])
+ *   'motion'  RG16F: per pixel the previous minus the current position in render
+ *             pixels (x right, y down), times 'mv_scale' => [x, y] (default [1, 1])
+ *   'output'  display-size target created with 'storage' => true
+ *   'reactive', 'transparency' (R8, optional), 'exposure' (1x1 R32F, optional)
+ *   'jitter'  => [x, y]: the projection offset this frame in render pixels (x right,
+ *                y down; a pixel samples the scene at its centre - jitter), e.g.
+ *                vio_upscale_jitter($frame, $info['jitter_phases'])
+ *   'reset'   => true on a camera cut
+ *   'sharpness' => 0..1 (0 = no sharpening pass), 'frame_time_ms', 'near', 'far',
+ *   'fov_y' (radians), 'pre_exposure' (> 0), 'view_to_meters',
+ *   'render_width', 'render_height' (default: the colour target, at most the
+ *   upscaler's render size)
+ * False with a warning when the dispatch fails (outside a frame, wrong targets).
+ */
+function vio_upscaler_dispatch(VioContext $context, VioUpscaler $upscaler, array $inputs): bool {}
+
+/** Destroy an upscaler now (waits for the GPU work that uses it). */
+function vio_upscaler_destroy(VioUpscaler $upscaler): void {}
+
+/**
+ * The render size a provider wants for a quality mode at a display size on this
+ * device, before creating an upscaler: ['width' => , 'height' => ]. DLSS asks
+ * NGX for its optimal settings (VIO_UPSCALE_NATIVE_AA = DLAA, the display size);
+ * FSR 3.1 uses its fixed ratios. False when the provider is not usable here or
+ * does not offer the mode at that size - never a warning. vio_upscaler_create
+ * without 'render_width' / 'render_height' uses the same size.
+ */
+function vio_upscaler_render_size(VioContext $context, int $provider, int $quality, int $display_width, int $display_height): array|false {}
 /**
  * Get the name of the backend in use.
  */
@@ -1706,8 +1808,16 @@ function vio_draw_instanced(VioContext $context, VioMesh $mesh, array|string $ma
  *
  * @param array $config ['width' => int, 'height' => int, 'depth_only' => bool, 'hdr' => bool,
  *                      'samples' => int, 'cube' => bool, 'size' => int, 'mipmaps' => bool,
- *                      'attachments' => int[],  // MRT: 1..4 VIO_FORMAT_* colour attachments
- *                                               //      (fragment layout(location = i) out); needs VIO_FEATURE_MRT
+ *                      'attachments' => int[],  // MRT: 1..VIO_MAX_COLOR_ATTACHMENTS (8) VIO_FORMAT_* colour
+ *                                               //      attachments (fragment layout(location = i) out); needs
+ *                                               //      VIO_FEATURE_MRT (Vulkan: maxColorAttachments of the device)
+ *                      'storage' => bool,       // colour attachments double as compute storage images:
+ *                                               //   vio_compute_bind_image($ctx, $cp, vio_render_target_texture($rt, $i), ...)
+ *                                               //   (GLSL image2D with the attachment's format qualifier, e.g.
+ *                                               //   rgba16f). Single-sample 2D colour targets only; needs
+ *                                               //   VIO_FEATURE_RENDER_TARGET_STORAGE (D3D12, Vulkan). Dispatch
+ *                                               //   async inside the frame or sync outside it. Vulkan stores
+ *                                               //   RGBA8 as R8G8B8A8 there (the 2D batch skips such targets).
  *                      'layers' => int]         // 2..64: 2D array target (colour or depth_only, every layer with its
  *                                               //   own depth; single attachment, single-sampled, no mips). Bind one
  *                                               //   layer with vio_bind_render_target($ctx, $rt, $layer), read it with
@@ -1751,8 +1861,14 @@ function vio_unbind_render_target(VioContext $context): void {}
 /**
  * Get the depth or color texture from a render target for sampling.
  *
- * Returns the depth texture for depth-only targets, color texture otherwise.
+ * Returns the depth texture for depth-only targets, colour attachment $attachment
+ * otherwise. VIO_RT_DEPTH selects the depth of a colour target (plain or MRT):
+ * VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE, single-sample 2D targets only (no
+ * 'samples', 'cube', 'layers', active 'rate_map'); sampled NEAREST with a white
+ * border like a shadow map, readable after the target is unbound or another one
+ * is bound. The texture is borrowed: the render target owns it.
  *
+ * @param int $attachment 0..n-1, or VIO_RT_DEPTH
  * @return VioTexture|false Texture object or false on failure
  */
 function vio_render_target_texture(VioRenderTarget $target, int $attachment = 0): VioTexture|false {}
@@ -1767,8 +1883,16 @@ function vio_render_target_cubemap(VioRenderTarget $target): VioCubemap|false {}
  * CPU readback of a render target as top-down RGBA8 (width*height*4 bytes).
  * Depth-only targets return depth as a grey ramp; cube targets read one face.
  * Works inside a frame.
+ *
+ * ['raw' => true]: the colour attachment's texels in its own format instead -
+ * width * height * bytes-per-texel (RGBA16F 8, RGBA32F 16, RG16F / R32F /
+ * R11G11B10F / RGB10A2 / RGBA8 4, R16F 2, R8 1), top-down, bit-exact and
+ * unclamped (halves / floats little endian, packed formats as one uint32,
+ * RGBA8 in R, G, B, A order on every backend). Not for depth_only targets.
+ *
+ * @param array|null $options ['raw' => bool]
  */
-function vio_read_render_target(VioRenderTarget $target, int $face = -1, int $attachment = 0): string|false {}
+function vio_read_render_target(VioRenderTarget $target, int $face = -1, int $attachment = 0, ?array $options = null): string|false {}
 
 /**
  * Build the full mip chain of a texture, cubemap or render-target colour

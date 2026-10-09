@@ -1640,8 +1640,8 @@ static void metal_open_encoder(int load_clear)
         /* Colour attachments (one for the swapchain / classic RT, up to
          * VIO_MAX_COLOR_ATTACHMENTS for an MRT target) plus their MSAA resolve
          * partners. */
-        id<MTLTexture> color_targets[VIO_MAX_COLOR_ATTACHMENTS]  = {nil, nil, nil, nil};
-        id<MTLTexture> resolve_targets[VIO_MAX_COLOR_ATTACHMENTS] = {nil, nil, nil, nil};
+        id<MTLTexture> color_targets[VIO_MAX_COLOR_ATTACHMENTS]  = {nil};
+        id<MTLTexture> resolve_targets[VIO_MAX_COLOR_ATTACHMENTS] = {nil};
         int n_color = 0;
         NSUInteger cube_slice = 0, cube_level = 0, all_layers = 0;
         /* A layered target multisamples at level 0 only (A24). */
@@ -2506,6 +2506,7 @@ static MTLPixelFormat metal_pixel_format(int vio_fmt)
         case VIO_FORMAT_RGBA16F:    return MTLPixelFormatRGBA16Float;
         case VIO_FORMAT_RGBA32F:    return MTLPixelFormatRGBA32Float;
         case VIO_FORMAT_R11G11B10F: return MTLPixelFormatRG11B10Float;
+        case VIO_FORMAT_RGB10A2:    return MTLPixelFormatRGB10A2Unorm;
         case VIO_FORMAT_RG16F:      return MTLPixelFormatRG16Float;
         case VIO_FORMAT_R16F:       return MTLPixelFormatR16Float;
         case VIO_FORMAT_R32F:       return MTLPixelFormatR32Float;
@@ -2525,6 +2526,7 @@ static int metal_vio_format(MTLPixelFormat f, int *bgra)
         case MTLPixelFormatRGBA16Float: return VIO_FORMAT_RGBA16F;
         case MTLPixelFormatRGBA32Float: return VIO_FORMAT_RGBA32F;
         case MTLPixelFormatRG11B10Float:return VIO_FORMAT_R11G11B10F;
+        case MTLPixelFormatRGB10A2Unorm:return VIO_FORMAT_RGB10A2;
         case MTLPixelFormatRG16Float:   return VIO_FORMAT_RG16F;
         case MTLPixelFormatR16Float:    return VIO_FORMAT_R16F;
         case MTLPixelFormatR32Float:    return VIO_FORMAT_R32F;
@@ -5830,8 +5832,9 @@ static int metal_read_render_target(void *rt_ptr, int face, int attachment, void
                 out[i*4+0] = out[i*4+1] = out[i*4+2] = g; out[i*4+3] = 255;
             }
         } else {
-            /* Shared converter: every colour format -> RGBA8 (BGRA swizzled). */
-            vio_rt_convert_to_rgba8(vfmt, bgra, s, (size_t)bpr, w, h, out);
+            /* Shared converter: every colour format -> RGBA8 (BGRA swizzled), or the
+             * 'raw' texels (RGBA8 still swizzled to R, G, B, A). */
+            vio_rt_copy_texels(rt, vfmt, bgra, s, (size_t)bpr, w, h, out);
         }
     }
     return 0;
@@ -6958,6 +6961,7 @@ static int metal_supports_feature(vio_feature f)
     case VIO_FEATURE_RENDER_TARGET:
     case VIO_FEATURE_RENDER_TARGET_HDR:
     case VIO_FEATURE_RENDER_TARGET_DEPTH:
+    case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE:   /* the single-sample depth texture is ShaderRead */
     case VIO_FEATURE_RENDER_TARGET_MSAA:
     case VIO_FEATURE_RENDER_TARGET_CUBE:
     case VIO_FEATURE_MIPMAP_GEN:

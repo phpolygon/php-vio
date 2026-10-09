@@ -1423,7 +1423,7 @@ static void d3d11_destroy_render_target(void *rt_ptr)
         ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_color_tex);
         rt->d3d11_msaa_color_tex = NULL;
     }
-    for (int i = 1; i < 4; i++) {
+    for (int i = 1; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
         if (rt->d3d11_msaa_color_texs[i]) { ID3D11Texture2D_Release((ID3D11Texture2D *)rt->d3d11_msaa_color_texs[i]); rt->d3d11_msaa_color_texs[i] = NULL; }
     }
     if (rt->d3d11_msaa_dsv) { ID3D11DepthStencilView_Release((ID3D11DepthStencilView *)rt->d3d11_msaa_dsv); rt->d3d11_msaa_dsv = NULL; }
@@ -1498,7 +1498,7 @@ static void d3d11_rt_resolve_msaa(vio_render_target_object *rt)
     if (!rt->d3d11_msaa_color_tex || !rt->d3d11_color_tex || !rt->d3d11_msaa_dirty) return;
     /* Every attachment (A24: MRT targets are multisampled per attachment). */
     int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
-    for (int i = 0; i < n && i < 4; i++) {
+    for (int i = 0; i < n && i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
         void *ms = i == 0 ? rt->d3d11_msaa_color_tex : rt->d3d11_msaa_color_texs[i];
         if (!ms || !rt->d3d11_color_texs[i]) continue;
         ID3D11DeviceContext_ResolveSubresource(vio_d3d11.context,
@@ -1551,7 +1551,7 @@ static void d3d11_apply_render_target_bind(vio_render_target_object *rt)
         /* All colour attachments at once (MRT); index 0 == d3d11_rtv. */
         int n = rt->attachment_count > 0 ? rt->attachment_count : 1;
         if (n > VIO_MAX_COLOR_ATTACHMENTS) n = VIO_MAX_COLOR_ATTACHMENTS;
-        ID3D11RenderTargetView *rtvs[VIO_MAX_COLOR_ATTACHMENTS] = { (ID3D11RenderTargetView *)rt->d3d11_rtv, NULL, NULL, NULL };
+        ID3D11RenderTargetView *rtvs[VIO_MAX_COLOR_ATTACHMENTS] = { (ID3D11RenderTargetView *)rt->d3d11_rtv };
         for (int ai = 1; ai < n; ai++) rtvs[ai] = (ID3D11RenderTargetView *)rt->d3d11_rtvs[ai];
         ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, (UINT)n, rtvs, dsv);
         vio_d3d11.current_rtv = rtvs[0];
@@ -2433,7 +2433,7 @@ static int d3d11_read_render_target(void *rt_ptr, int face, int attachment, void
             }
         }
     } else {
-        vio_rt_convert_to_rgba8(rt->formats[attachment], 0, m.pData, (size_t)m.RowPitch, w, h, out);
+        vio_rt_copy_texels(rt, rt->formats[attachment], 0, m.pData, (size_t)m.RowPitch, w, h, out);   /* RGBA8, or 'raw' texels */
     }
     ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)staging, 0);
     ID3D11Texture2D_Release(staging);
@@ -4014,6 +4014,7 @@ static int d3d11_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET:       return 1;
         case VIO_FEATURE_RENDER_TARGET_HDR:   return 1;
         case VIO_FEATURE_RENDER_TARGET_DEPTH: return 1;
+        case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return 1; /* R24G8 depth with an SRV on every single-sample target */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return 1; /* multisampled colour + ResolveSubresource on unbind (GAP-PLAN Phase 3) */
         case VIO_FEATURE_STENCIL:             return 1; /* D24S8 everywhere + depth-stencil state (GAP-PHASE5 Block 1) */
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_d3d11.ts_available; /* TIMESTAMP + DISJOINT query ring */

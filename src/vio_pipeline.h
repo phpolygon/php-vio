@@ -41,10 +41,10 @@ typedef struct _vio_pipeline_object {
                                          D3D12 PSO is built with (0 => single target from
                                          hdr_output). Other backends derive them from the
                                          bound render target. */
-    int            color_formats[4];  /* vio_pixel_format, VIO_MAX_COLOR_ATTACHMENTS */
+    int            color_formats[VIO_MAX_COLOR_ATTACHMENTS];    /* vio_pixel_format */
     int            per_attachment;    /* 'attachment_blend' / 'attachment_color_mask' given */
-    int            attachment_blend[4]; /* vio_blend_mode per colour attachment */
-    int            attachment_mask[4];  /* VIO_COLOR_* bits per colour attachment */
+    int            attachment_blend[VIO_MAX_COLOR_ATTACHMENTS]; /* vio_blend_mode per colour attachment */
+    int            attachment_mask[VIO_MAX_COLOR_ATTACHMENTS];  /* VIO_COLOR_* bits per colour attachment */
     /* 'stencil' => [...] (see vio_pipeline_desc). */
     int            stencil_enable;
     int            stencil_func;

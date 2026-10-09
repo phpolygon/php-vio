@@ -93,9 +93,9 @@ typedef struct _vio_vk_pass_att {
 } vio_vk_pass_att;
 
 typedef struct _vio_vk_pass {
-    int              count;              /* colour attachments, 0..4 */
-    vio_vk_pass_att  color[4];
-    VkFormat         color_format[4];
+    int              count;              /* colour attachments, 0..VIO_MAX_COLOR_ATTACHMENTS */
+    vio_vk_pass_att  color[VIO_MAX_COLOR_ATTACHMENTS];
+    VkFormat         color_format[VIO_MAX_COLOR_ATTACHMENTS];
     int              has_depth;
     vio_vk_pass_att  depth;
     int              samples;
@@ -115,13 +115,13 @@ typedef struct _vio_vk_rt {
     int            layers;         /* bindable layers: 6 (cube), N (array, 'layers' => N) or 1 */
     int            levels;         /* mip levels of the colour image */
     int            samples;        /* effective sample count (1 = off) */
-    VkFormat       color_format[4];
-    VkImage        color_image[4]; /* single-sample; the resolve target when MSAA */
-    void          *color_alloc[4];
-    VkImageView    color_view[4];
-    VkImage        msaa_image[4];
-    void          *msaa_alloc[4];
-    VkImageView    msaa_view[4];
+    VkFormat       color_format[VIO_MAX_COLOR_ATTACHMENTS];
+    VkImage        color_image[VIO_MAX_COLOR_ATTACHMENTS]; /* single-sample; the resolve target when MSAA */
+    void          *color_alloc[VIO_MAX_COLOR_ATTACHMENTS];
+    VkImageView    color_view[VIO_MAX_COLOR_ATTACHMENTS];
+    VkImage        msaa_image[VIO_MAX_COLOR_ATTACHMENTS];
+    void          *msaa_alloc[VIO_MAX_COLOR_ATTACHMENTS];
+    VkImageView    msaa_view[VIO_MAX_COLOR_ATTACHMENTS];
     VkImageView   *msaa_face_view; /* cube / array MSAA (A24): MS colour view per layer */
     VkImageView    msaa_all_view;  /* ... and over every layer (VIO_RT_ALL_LAYERS) */
     /* depth_only MSAA (A24): the multisampled depth drawn into, resolved into
@@ -149,8 +149,15 @@ typedef struct _vio_vk_rt {
     VkImageView   *dmip_src;
     VkDescriptorPool dmip_pool;
     VkDescriptorSet *dmip_set;
-    struct _vio_vulkan_texture *wrap[4];   /* sampling wrappers (vio_render_target_texture) */
+    struct _vio_vulkan_texture *wrap[VIO_MAX_COLOR_ATTACHMENTS];   /* sampling wrappers (vio_render_target_texture) */
     struct _vio_vulkan_texture *cube_wrap; /* vio_render_target_cubemap */
+    /* VIO_RT_DEPTH on a single-sample 2D colour target: the depth is SAMPLED and
+     * rests in DEPTH_STENCIL_READ_ONLY between passes (like a depth_only one),
+     * sampled NEAREST / white border through its own wrapper. */
+    int            depth_sampled;
+    int            storage;        /* 'storage' => true: STORAGE colour images resting in GENERAL */
+    VkSampler      depth_sampler;
+    struct _vio_vulkan_texture *depth_wrap;
 } vio_vk_rt;
 
 /* Global Vulkan state */
@@ -297,7 +304,7 @@ typedef struct _vio_vulkan_state {
     vio_vk_pass              cur_pass;
     uint32_t                 cur_view_mask;
     int                      cur_color_count;
-    VkFormat                 cur_color_formats[4];
+    VkFormat                 cur_color_formats[VIO_MAX_COLOR_ATTACHMENTS];
     int                      cur_samples;
     int                      cur_has_depth;
     uint32_t                 cur_width, cur_height;
@@ -400,6 +407,12 @@ typedef struct _vio_vulkan_state {
     int                      full_subgroups;
     uint32_t                 max_subgroup_size;
     vio_coopmat_shape        coopmat_shapes[VIO_COOPMAT_MAX_SHAPES];
+    /* VIO_UPSCALE_VK_* enabled at device creation because a native upscaler's
+     * runtime was found (vio_upscale_vk_device_needs, TEMPORAL-S3). */
+    unsigned                 upscale_features;
+    /* Device extensions enabled by name for them (vio_upscale_vk_extensions,
+     * TEMPORAL-S4), comma separated. */
+    char                     upscale_extensions[256];
     /* HDR10 output (GAP-PHASE5 Block 10d): vio_create(['hdr_output' => 1|2]). */
     int                      hdr_request;          /* 0 off, 1 when the surface offers HDR10 ST 2084, 2 forced 10-bit */
     int                      hdr_output;           /* 1 => 10-bit swapchain, the 2D batch PQ-encodes */
@@ -610,6 +623,9 @@ void  vio_vk_pass_rendering_info(VkPipelineRenderingCreateInfo *info);
 /* Reopen the pass that was open before (bound render target layer / level, or the
  * swapchain) with LOAD, after vkCmdEndRenderPass for a compute dispatch or a flush. */
 void  vio_vk_resume_pass(VkCommandBuffer cmd);
+/* 1 when mips [0, levels) of image are written by the open pass (a colour,
+ * resolve or depth attachment) - a sampler must not see them then. */
+int   vio_vk_pass_writes_image(VkImage image, uint32_t levels);
 /* The bindless Set 1 layout (created with its pool / set on first use);
  * VK_NULL_HANDLE without descriptor indexing. */
 VkDescriptorSetLayout vio_vk_bindless_layout(void);
@@ -670,6 +686,25 @@ void  vio_vk3d_draw_instanced_from_storage(void *mesh_obj, int count);
 void  vio_vk3d_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws, size_t offset);
 void  vio_vk3d_draw_mesh_tasks(uint32_t x, uint32_t y, uint32_t z);
 void  vio_vk3d_draw_mesh_tasks_indirect(void *args_buffer, int max_draws, size_t offset);
+
+/* ── Native upscalers (vio_vulkan_upscale.c, TEMPORAL-S3) ── */
+struct _vio_upscale_create_desc;
+struct _vio_upscale_dispatch_desc;
+struct _vio_upscale_query;
+int   vulkan_upscaler_supported(int provider, char *reason, size_t reason_len);
+int   vulkan_upscaler_any(void);
+void *vulkan_upscaler_create(const struct _vio_upscale_create_desc *desc, char *reason, size_t reason_len);
+int   vulkan_upscaler_dispatch(void *upscaler, const struct _vio_upscale_dispatch_desc *desc, char *err, size_t err_len);
+int   vulkan_upscaler_query(void *upscaler, int provider, struct _vio_upscale_query *q);
+void  vulkan_upscaler_destroy(void *upscaler);
+int   vulkan_upscaler_device_requirements(int provider, char *out, size_t out_len);
+int   vulkan_upscaler_render_size(int provider, int quality, int display_w, int display_h,
+                                  int *render_w, int *render_h, char *reason, size_t reason_len);
+void  vulkan_upscale_device_release(void);   /* vulkan_shutdown, before the device goes */
+/* One-shot command buffer from the transient pool, submitted and waited for
+ * (vio_vulkan.c); also usable while a frame is open. 0 = ok. */
+int   vio_vk_transient_begin(VkCommandBuffer *out_cmd);
+int   vio_vk_transient_submit(VkCommandBuffer cmd);
 
 #endif /* HAVE_VULKAN */
 #endif /* VIO_VULKAN_H */

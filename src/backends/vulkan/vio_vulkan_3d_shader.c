@@ -852,7 +852,7 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
 {
     if (!p || p->dead || !p->shader || p->shader->dead || !vio_vk.in_pass) return VK_NULL_HANDLE;
     if (stride == 0) stride = p->vertex_stride;
-    int cc = vio_vk.cur_color_count > 4 ? 4 : vio_vk.cur_color_count;
+    int cc = vio_vk.cur_color_count > VIO_MAX_COLOR_ATTACHMENTS ? VIO_MAX_COLOR_ATTACHMENTS : vio_vk.cur_color_count;
     uint64_t key = 1469598103934665603ULL;
     key = vk3d_mix(key, (uint64_t)cc);
     for (int i = 0; i < cc; i++) key = vk3d_mix(key, (uint64_t)vio_vk.cur_color_formats[i]);
@@ -985,7 +985,7 @@ VkPipeline vk3d_pipeline_variant(vio_vk3d_pipeline *p, uint32_t stride)
         ds.back = ds.front;
     }
 
-    VkPipelineColorBlendAttachmentState att[4];
+    VkPipelineColorBlendAttachmentState att[VIO_MAX_COLOR_ATTACHMENTS];
     for (int i = 0; i < cc; i++) {
         if (d->per_attachment) vk3d_blend(&att[i], d->attachment_blend[i], d->attachment_mask[i]);
         else vk3d_blend(&att[i], (int)d->blend, d->color_mask ? d->color_mask : VIO_COLOR_RGBA);

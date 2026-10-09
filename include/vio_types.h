@@ -6,8 +6,11 @@
 #ifndef VIO_TYPES_H
 #define VIO_TYPES_H
 
-/* Maximum colour attachments of one render target (MRT). */
-#define VIO_MAX_COLOR_ATTACHMENTS 4
+/* Maximum colour attachments of one render target (MRT). Eight is the D3D11 /
+ * D3D12 / Metal limit and what desktop GL and Vulkan devices report; a Vulkan
+ * device with a lower maxColorAttachments refuses larger targets. A temporal
+ * G-buffer (colour planes + motion vectors + reactive mask) needs more than 4. */
+#define VIO_MAX_COLOR_ATTACHMENTS 8
 
 #include <stddef.h>
 #include <stdint.h>
@@ -410,6 +413,18 @@ typedef enum _vio_feature {
     VIO_FEATURE_LONG_VECTOR = 65,
     VIO_FEATURE_SHADER_EXECUTION_REORDER = 66,
     VIO_FEATURE_OPACITY_MICROMAP = 67,
+    /* vio_render_target_texture($rt, VIO_RT_DEPTH): the depth of a single-sample
+     * 2D colour target (plain or MRT) as a samplable texture - the scene depth a
+     * temporal resolve / motion-vector dilation reads next to the G-buffer. */
+    VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE = 68,
+    /* vio_render_target(['storage' => true]): the colour attachments double as
+     * compute storage images (vio_render_target_texture() + vio_compute_bind_image)
+     * - a TAA history or upscaler output written by a kernel and drawn into. */
+    VIO_FEATURE_RENDER_TARGET_STORAGE = 69,
+    /* vio_upscaler_*: a native temporal upscaler (FSR 3.1, later DLSS / XeSS)
+     * runs on this device - its runtime library was found and accepts the
+     * device (TEMPORAL-S3, D3D12 / Vulkan). */
+    VIO_FEATURE_UPSCALER_NATIVE = 70,
 } vio_feature;
 
 /* Zones per axis of a rate map. */
@@ -457,6 +472,10 @@ typedef struct _vio_coopmat_shape {
 /* vio_bind_render_target() face / layer argument that binds every layer of a
  * cube or array target at once (VIO_FEATURE_LAYERED_RENDER). */
 #define VIO_RT_ALL_LAYERS (-2)
+
+/* vio_render_target_texture() attachment argument that selects the depth
+ * attachment instead of a colour attachment (VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE). */
+#define VIO_RT_DEPTH (-1)
 
 /* Native device APIs a video encoder can share (VIDEO-ENCODE-PLAN.md) */
 #define VIO_ENCODE_API_D3D11 1
