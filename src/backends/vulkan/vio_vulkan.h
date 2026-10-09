@@ -623,6 +623,9 @@ void  vio_vk_pass_rendering_info(VkPipelineRenderingCreateInfo *info);
 /* Reopen the pass that was open before (bound render target layer / level, or the
  * swapchain) with LOAD, after vkCmdEndRenderPass for a compute dispatch or a flush. */
 void  vio_vk_resume_pass(VkCommandBuffer cmd);
+/* 1 when mips [0, levels) of image are written by the open pass (a colour,
+ * resolve or depth attachment) - a sampler must not see them then. */
+int   vio_vk_pass_writes_image(VkImage image, uint32_t levels);
 /* The bindless Set 1 layout (created with its pool / set on first use);
  * VK_NULL_HANDLE without descriptor indexing. */
 VkDescriptorSetLayout vio_vk_bindless_layout(void);

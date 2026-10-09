@@ -463,7 +463,10 @@ static vio_vulkan_texture *vk3d_dummy(int which)
     ci.arrayLayers   = cube ? 6 : 1;
     ci.samples       = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    /* The depth dummy rests in DEPTH_STENCIL_READ_ONLY, which needs the
+     * depth-attachment usage (VUID-VkImageMemoryBarrier2-oldLayout-01210). */
+    ci.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                     | (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
     ci.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     ci.flags         = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
@@ -778,6 +781,10 @@ static void vk3d_resolve(vio_vk3d_shader *sh, vk3d_res *out)
             default: {
                 vio_vulkan_texture *t = vk3d.tex[(b->binding - VK3D_B_SAMPLER0) % VK3D_MAX_SAMPLERS];
                 int vt = t ? (t->view_type ? t->view_type : VK_IMAGE_VIEW_TYPE_2D) : -1;
+                /* A slot still naming an image the open pass renders into (a
+                 * target sampled by an earlier pass, bound for drawing again):
+                 * a feedback loop in the wrong layout - the dummy instead. */
+                if (t && vio_vk_pass_writes_image(t->image, (uint32_t)(t->mip_levels > 0 ? t->mip_levels : 1))) t = NULL;
                 if (t && t->view && vt == (int)b->dim && (!b->is_depth || t->is_depth)) {
                     r->view = t->view;
                     r->sampler = b->is_depth ? vk3d_cmp_sampler(t) : t->sampler;

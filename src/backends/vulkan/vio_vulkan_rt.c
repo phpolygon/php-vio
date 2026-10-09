@@ -253,6 +253,23 @@ void vio_vk_pass_end(VkCommandBuffer cmd)
         vkpass_transition(cmd, p->depth.image, &p->depth.range, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, p->depth.rest);
 }
 
+static int vkpass_range_hits(VkImage att, const VkImageSubresourceRange *r, VkImage image, uint32_t levels)
+{
+    return att == image && r->baseMipLevel < (levels ? levels : 1u);
+}
+
+int vio_vk_pass_writes_image(VkImage image, uint32_t levels)
+{
+    if (!vio_vk.in_pass || image == VK_NULL_HANDLE) return 0;
+    const vio_vk_pass *p = &vio_vk.cur_pass;
+    for (int i = 0; i < p->count && i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
+        const vio_vk_pass_att *a = &p->color[i];
+        if (vkpass_range_hits(a->image, &a->range, image, levels)) return 1;
+        if (a->resolve_view && vkpass_range_hits(a->resolve_image, &a->resolve_range, image, levels)) return 1;
+    }
+    return p->has_depth && vkpass_range_hits(p->depth.image, &p->depth.range, image, levels);
+}
+
 void vio_vk_pass_rendering_info(VkPipelineRenderingCreateInfo *info)
 {
     memset(info, 0, sizeof(*info));
