@@ -7,6 +7,10 @@
  * SDK calls.
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* dladdr / Dl_info (glibc) */
+#endif
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
