@@ -1,3 +1,10 @@
+## [2.32.2](https://github.com/phpolygon/php-vio/compare/v2.32.1...v2.32.2) (2026-10-10)
+
+
+### Bug Fixes
+
+* **d3d12:** never reuse mip generation descriptor blocks the GPU still needs ([7de9efb](https://github.com/phpolygon/php-vio/commit/7de9efbec7deda9c3518f9a742f8bda6fce083a9))
+
 ## [2.32.1](https://github.com/phpolygon/php-vio/compare/v2.32.0...v2.32.1) (2026-10-10)
 
 
