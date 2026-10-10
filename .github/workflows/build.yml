@@ -230,7 +230,8 @@ jobs:
             tests/render3d/234_upscaler_plugin_missing_all_backends.phpt \
             tests/render3d/235_upscaler_plugin_abi_refused.phpt \
             tests/render3d/236_upscaler_plugin_dispatch_states.phpt \
-            tests/render3d/237_compute_many_dispatches_per_frame_all_backends.phpt
+            tests/render3d/237_compute_many_dispatches_per_frame_all_backends.phpt \
+            tests/render3d/238_generate_mipmaps_many_per_frame_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -458,7 +459,8 @@ jobs:
             tests/render3d/234_upscaler_plugin_missing_all_backends.phpt \
             tests/render3d/235_upscaler_plugin_abi_refused.phpt \
             tests/render3d/236_upscaler_plugin_dispatch_states.phpt \
-            tests/render3d/237_compute_many_dispatches_per_frame_all_backends.phpt
+            tests/render3d/237_compute_many_dispatches_per_frame_all_backends.phpt \
+            tests/render3d/238_generate_mipmaps_many_per_frame_all_backends.phpt
 
       - name: Package binary
         run: |
@@ -974,7 +976,8 @@ jobs:
             tests/render3d/234_upscaler_plugin_missing_all_backends.phpt `
             tests/render3d/235_upscaler_plugin_abi_refused.phpt `
             tests/render3d/236_upscaler_plugin_dispatch_states.phpt `
-            tests/render3d/237_compute_many_dispatches_per_frame_all_backends.phpt
+            tests/render3d/237_compute_many_dispatches_per_frame_all_backends.phpt `
+            tests/render3d/238_generate_mipmaps_many_per_frame_all_backends.phpt
 
       - name: Package binary
         shell: pwsh
