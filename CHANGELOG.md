@@ -1,3 +1,10 @@
+## [2.32.1](https://github.com/phpolygon/php-vio/compare/v2.32.0...v2.32.1) (2026-10-10)
+
+
+### Bug Fixes
+
+* **d3d12:** never reuse compute descriptor blocks the GPU still needs ([3f2bb21](https://github.com/phpolygon/php-vio/commit/3f2bb211af5475dce3c0a55be7808e6e14bf5281))
+
 # [2.32.0](https://github.com/phpolygon/php-vio/compare/v2.31.4...v2.32.0) (2026-10-09)
 
 
