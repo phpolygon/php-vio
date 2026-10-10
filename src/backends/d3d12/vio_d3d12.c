@@ -451,7 +451,8 @@ static void d3d12_retire_later(ID3D12Resource *res, UINT64 fence);
 static void d3d12_retire_object_later(IUnknown *obj, UINT64 fence);
 static void d3d12_release_parked(UINT slot);
 static void d3d12_release_parked_all(void);
-static void d3d12_compute_release_blocks(UINT slot);
+static void d3d12_descriptor_blocks_release(UINT slot);
+static void d3d12_block_heap_destroy(vio_d3d12_block_heap *bh);
 /* Recorded draw sequences (BUNDLE-PLAN phase 3), defined with the draw code. */
 typedef struct _vio_d3d12_bundle vio_d3d12_bundle;
 static vio_d3d12_bundle *d3d12_brec;   /* the bundle being recorded, NULL otherwise */
@@ -1880,13 +1881,7 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.root_signature) ID3D12RootSignature_Release(vio_d3d12.root_signature);
     if (vio_d3d12.compute_root_signature) ID3D12RootSignature_Release(vio_d3d12.compute_root_signature);
     if (vio_d3d12.bindless_cpu_heap) { ID3D12DescriptorHeap_Release(vio_d3d12.bindless_cpu_heap); vio_d3d12.bindless_cpu_heap = NULL; }
-    if (vio_d3d12.compute_srv_heap) ID3D12DescriptorHeap_Release(vio_d3d12.compute_srv_heap);
-    vio_d3d12.compute_srv_heap = NULL;
-    free(vio_d3d12.compute_block_owner);
-    vio_d3d12.compute_block_owner = NULL;
-    vio_d3d12.compute_heap_blocks = 0;
-    vio_d3d12.compute_heap_block = 0;
-    memset(vio_d3d12.compute_blocks_held, 0, sizeof(vio_d3d12.compute_blocks_held));
+    d3d12_block_heap_destroy(&vio_d3d12.compute_heap);
     if (vio_d3d12.cmdsig_indexed)ID3D12CommandSignature_Release(vio_d3d12.cmdsig_indexed);
     if (vio_d3d12.cmdsig_plain)   ID3D12CommandSignature_Release(vio_d3d12.cmdsig_plain);
     if (vio_d3d12.cmdsig_indexed_dp) ID3D12CommandSignature_Release(vio_d3d12.cmdsig_indexed_dp);
@@ -1903,7 +1898,7 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.dmip_rs)        { ID3D12RootSignature_Release(vio_d3d12.dmip_rs); vio_d3d12.dmip_rs = NULL; }
     if (vio_d3d12.mipgen_pso)     ID3D12PipelineState_Release(vio_d3d12.mipgen_pso);
     if (vio_d3d12.mipgen_rs)      ID3D12RootSignature_Release(vio_d3d12.mipgen_rs);
-    if (vio_d3d12.mipgen_heap)    ID3D12DescriptorHeap_Release(vio_d3d12.mipgen_heap);
+    d3d12_block_heap_destroy(&vio_d3d12.mipgen_heap);
     if (vio_d3d12.cmd_list5)      ID3D12GraphicsCommandList5_Release(vio_d3d12.cmd_list5);
     if (vio_d3d12.cmd_list1)      ID3D12GraphicsCommandList1_Release(vio_d3d12.cmd_list1);
     vio_d3d12.cmd_list1 = NULL;
@@ -3070,7 +3065,7 @@ static void d3d12_apply_bindless(void)
 }
 
 /* Index of the bindless block in the compute heap: behind the dispatch blocks. */
-#define VIO_D3D12_COMPUTE_BINDLESS_BASE (VIO_D3D12_COMPUTE_MAX_BINDINGS * 2 * vio_d3d12.compute_heap_blocks)
+#define VIO_D3D12_COMPUTE_BINDLESS_BASE (VIO_D3D12_COMPUTE_MAX_BINDINGS * 2 * vio_d3d12.compute_heap.blocks)
 
 /* Copy slot `slot` of the CPU mirror into the shader-visible blocks: the
  * graphics heap's and, once it exists, the compute heap's. */
@@ -3083,9 +3078,9 @@ static void d3d12_bindless_publish(int slot)
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &g);
     g.ptr += (SIZE_T)(vio_d3d12.bindless_base + (UINT)slot) * inc;
     ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, g, m, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    if (vio_d3d12.compute_srv_heap) {
+    if (vio_d3d12.compute_heap.heap) {
         D3D12_CPU_DESCRIPTOR_HANDLE c;
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &c);
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_heap.heap, &c);
         c.ptr += (SIZE_T)(VIO_D3D12_COMPUTE_BINDLESS_BASE + (UINT)slot) * vio_d3d12.compute_srv_descriptor_size;
         ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, c, m, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
@@ -5501,18 +5496,144 @@ static const char *d3d12_mipgen_hlsl =
 
 static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, const char *profile, UINT flags, ID3DBlob **out);
 
+/* ── Fenced descriptor blocks (vio_d3d12_block_heap) ───────────────────── */
+
+static void d3d12_park_object(IUnknown *obj);
+
+/* (Re)create bh's heap with `blocks` free blocks plus `extra` descriptors
+ * behind them. The caller has dealt with a previous heap. */
+static int d3d12_block_heap_create(vio_d3d12_block_heap *bh, UINT block_descs, UINT blocks, UINT max_blocks, UINT extra)
+{
+    unsigned char *owner = (unsigned char *)calloc(blocks, 1);
+    if (!owner) return -1;
+    ID3D12DescriptorHeap *heap = NULL;
+    if (d3d12_create_descriptor_heap(&heap, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, block_descs * blocks + extra,
+                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+        free(owner);
+        return -1;
+    }
+    bh->heap = heap;
+    free(bh->owner);
+    bh->owner = owner;
+    bh->block_descs = block_descs;
+    bh->blocks = blocks;
+    bh->max_blocks = max_blocks;
+    bh->next = 0;
+    memset(bh->held, 0, sizeof(bh->held));
+    return 0;
+}
+
+static void d3d12_block_heap_destroy(vio_d3d12_block_heap *bh)
+{
+    if (bh->heap) ID3D12DescriptorHeap_Release(bh->heap);
+    free(bh->owner);
+    memset(bh, 0, sizeof(*bh));
+}
+
+/* Frame slot `slot` has retired (begin_frame waited for its fence): the blocks
+ * its list recorded are free again. */
+static void d3d12_block_heap_release_slot(vio_d3d12_block_heap *bh, UINT slot)
+{
+    if (slot >= VIO_D3D12_MAX_FRAME_COUNT || !bh->held[slot]) return;
+    unsigned char tag = (unsigned char)(slot + 1);
+    for (UINT b = 0; b < bh->blocks; b++)
+        if (bh->owner[b] == tag) bh->owner[b] = 0;
+    bh->held[slot] = 0;
+}
+
+static void d3d12_descriptor_blocks_release(UINT slot)
+{
+    d3d12_block_heap_release_slot(&vio_d3d12.compute_heap, slot);
+    d3d12_block_heap_release_slot(&vio_d3d12.mipgen_heap, slot);
+}
+
+/* A free block of bh (its heap exists). A block recorded into the open frame
+ * list (frame_owned) stays taken until that frame slot's fence has passed; a
+ * job that waits for the GPU before it returns keeps nothing. Blocks still in
+ * use are never handed out again: with none free, `recreate` builds a heap of
+ * twice the blocks - the old heap stays alive (parked) until the lists that
+ * reference it have executed - so jobs never wait on the GPU here. Only at
+ * max_blocks is the GPU flushed (mid-frame: the open list is submitted and
+ * reopened, as by d3d12_compute_wait). Returns the block index, or -1. */
+static void d3d12_compute_wait(void);
+static int d3d12_block_heap_alloc(vio_d3d12_block_heap *bh, int frame_owned, int (*recreate)(UINT blocks))
+{
+    if (!bh->heap) return -1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        UINT n = bh->blocks;
+        for (UINT k = 0; k < n; k++) {
+            UINT b = (bh->next + k) % n;
+            if (bh->owner[b]) continue;
+            bh->next = (b + 1) % n;
+            if (frame_owned) {
+                UINT slot = vio_d3d12.frame_index < VIO_D3D12_MAX_FRAME_COUNT ? vio_d3d12.frame_index : 0;
+                bh->owner[b] = (unsigned char)(slot + 1);
+                bh->held[slot]++;
+            }
+            return (int)b;
+        }
+        /* Every block is still referenced by a frame list in flight. */
+        UINT grown = n * 2;
+        ID3D12DescriptorHeap *old = bh->heap;
+        if (grown <= bh->max_blocks) {
+            bh->heap = NULL;
+            if (recreate(grown) == 0) {
+                /* Lists recorded so far still point into the old heap. In a frame
+                 * the open list does (released once this slot's fence passed);
+                 * outside, only submitted frames, all signalled by now. */
+                if (vio_d3d12.in_frame) d3d12_park_object((IUnknown *)old);
+                else d3d12_retire_object_later((IUnknown *)old, vio_d3d12.fence_value);
+                continue;
+            }
+            bh->heap = old;   /* out of memory: keep the heap, flush below */
+        }
+        /* At the bound: let the GPU catch up instead (mid-frame this submits the
+         * open list and reopens it), then every block is free. */
+        if (vio_d3d12.in_frame && vio_d3d12.cmd_list) {
+            vio_d3d12.compute_async_pending = 1;
+            d3d12_compute_wait();
+        } else {
+            vio_d3d12_wait_for_gpu();
+        }
+        memset(bh->owner, 0, bh->blocks);
+        memset(bh->held, 0, sizeof(bh->held));
+    }
+    return -1;
+}
+
 #define VIO_D3D12_MIPGEN_MAX_LEVELS 16
-/* mipgen_heap is a ring of blocks (one per vio_generate_mipmaps call, each
- * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS descriptors): a call recorded on the frame
- * list must not overwrite descriptors of a frame still in flight. 64 blocks
- * cover 21 calls per frame at three frames in flight. */
+/* mipgen_heap: one block of 2 * VIO_D3D12_MIPGEN_MAX_LEVELS descriptors per
+ * vio_generate_mipmaps / depth-mip / depth-resolve call, held by the frame that
+ * recorded it until its fence passed (vio_d3d12_block_heap). Starts with 64
+ * blocks and doubles while all are in flight, up to 8192 (262144 descriptors). */
 #define VIO_D3D12_MIPGEN_BLOCKS 64
+#define VIO_D3D12_MIPGEN_MAX_BLOCKS 8192
 
 static void d3d12_restore_graphics_state_after_compute(void);
 
+static int d3d12_create_mipgen_heap(UINT blocks)
+{
+    return d3d12_block_heap_create(&vio_d3d12.mipgen_heap, 2 * VIO_D3D12_MIPGEN_MAX_LEVELS, blocks,
+                                   VIO_D3D12_MIPGEN_MAX_BLOCKS, 0);
+}
+
+/* CPU + GPU handle of a free mipgen block, or -1. Taken before the caller
+ * picks up vio_d3d12.cmd_list: at the growth bound the open list is flushed. */
+static int d3d12_mipgen_alloc_block(int frame_owned, D3D12_CPU_DESCRIPTOR_HANDLE *cpu, D3D12_GPU_DESCRIPTOR_HANDLE *gpu)
+{
+    int block = d3d12_block_heap_alloc(&vio_d3d12.mipgen_heap, frame_owned, d3d12_create_mipgen_heap);
+    if (block < 0) return -1;
+    UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap.heap, cpu);
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap.heap, gpu);
+    cpu->ptr += (SIZE_T)block * vio_d3d12.mipgen_heap.block_descs * inc;
+    gpu->ptr += (UINT64)block * vio_d3d12.mipgen_heap.block_descs * inc;
+    return block;
+}
+
 static int d3d12_ensure_mipgen(void)
 {
-    if (vio_d3d12.mipgen_pso && vio_d3d12.mipgen_heap) return 0;
+    if (vio_d3d12.mipgen_pso && vio_d3d12.mipgen_heap.heap) return 0;
     if (vio_d3d12.mipgen_failed || !vio_d3d12.device) return -1;
     vio_d3d12.mipgen_failed = 1;   /* cleared on success: a failing setup is not retried per call */
 
@@ -5563,11 +5684,7 @@ static int d3d12_ensure_mipgen(void)
     ID3D10Blob_Release(cs);
     if (FAILED(hr)) { vio_d3d12.mipgen_pso = NULL; return -1; }
 
-    if (d3d12_create_descriptor_heap(&vio_d3d12.mipgen_heap, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                                     2 * VIO_D3D12_MIPGEN_MAX_LEVELS * VIO_D3D12_MIPGEN_BLOCKS,
-                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
-        return -1;
-    }
+    if (!vio_d3d12.mipgen_heap.heap && d3d12_create_mipgen_heap(VIO_D3D12_MIPGEN_BLOCKS) != 0) return -1;
     vio_d3d12.mipgen_failed = 0;
     return 0;
 }
@@ -5593,6 +5710,14 @@ static int d3d12_generate_mips_gpu(ID3D12Resource *res, int slices, int levels, 
      * stuttered, D3D12-MIPGEN-STALL-PLAN). Outside a frame (loading, tests) a
      * transient list executes and waits as before. */
     int in_frame = vio_d3d12.in_frame && vio_d3d12.cmd_list;
+    /* SRV of level l and UAV of level l + 1, all slices, at block slots 2l / 2l+1.
+     * Recorded into the frame list, the block stays reserved until that frame
+     * has executed (before 2.32.2 a 64-block ring without a fence: from the 65th
+     * call per frame, or once a frame in flight still needed its block, a call
+     * read and wrote another call's views). */
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    if (d3d12_mipgen_alloc_block(in_frame, &cpu, &gpu) < 0) return -1;
     ID3D12CommandAllocator *alloc = NULL;
     ID3D12GraphicsCommandList *list = NULL;
     if (in_frame) {
@@ -5618,16 +5743,7 @@ static int d3d12_generate_mips_gpu(ID3D12Resource *res, int slices, int levels, 
         return -1;
     }
 
-    /* SRV of level l and UAV of level l + 1, all slices, at heap slots 2l / 2l+1. */
     UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
-    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &cpu);
-    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &gpu);
-    UINT block = vio_d3d12.mipgen_block;
-    vio_d3d12.mipgen_block = (block + 1) % VIO_D3D12_MIPGEN_BLOCKS;
-    cpu.ptr += (SIZE_T)block * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS * inc;
-    gpu.ptr += (UINT64)block * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS * inc;
     for (int l = 0; l < levels - 1; l++) {
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
         sd.Format = rd.Format;
@@ -5662,7 +5778,7 @@ static int d3d12_generate_mips_gpu(ID3D12Resource *res, int slices, int levels, 
     }
     ID3D12GraphicsCommandList_ResourceBarrier(list, (UINT)n, b);
 
-    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.mipgen_heap };
+    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.mipgen_heap.heap };
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
     ID3D12GraphicsCommandList_SetComputeRootSignature(list, vio_d3d12.mipgen_rs);
     ID3D12GraphicsCommandList_SetPipelineState(list, vio_d3d12.mipgen_pso);
@@ -5843,10 +5959,9 @@ static const char *d3d12_dmip_resolve_src =
 
 static int d3d12_resolve_depth_msaa(vio_render_target_object *rt)
 {
-    ID3D12GraphicsCommandList *list = vio_d3d12.cmd_list;
     ID3D12Resource *ms = (ID3D12Resource *)rt->d3d12_msaa_depth_resource;
     ID3D12Resource *dst = (ID3D12Resource *)rt->d3d12_depth_resource;
-    if (!list || !ms || !dst || d3d12_ensure_depth_mip() != 0) return -1;
+    if (!vio_d3d12.cmd_list || !ms || !dst || d3d12_ensure_depth_mip() != 0) return -1;
     if (!vio_d3d12.dmip_resolve_pso) {
         ID3DBlob *ps = NULL;
         if (FAILED(d3d12_compile_cached(d3d12_dmip_resolve_src, "vio_depth_resolve_ps", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, &ps)) || !ps) return -1;
@@ -5874,16 +5989,12 @@ static int d3d12_resolve_depth_msaa(vio_render_target_object *rt)
         ID3D10Blob_Release(ps);
         if (FAILED(hr)) { vio_d3d12.dmip_resolve_pso = NULL; return -1; }
     }
-    UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    /* The resolve is recorded into the frame list: its block belongs to the frame. */
     D3D12_CPU_DESCRIPTOR_HANDLE cpu, dsv;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu;
-    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &cpu);
-    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &gpu);
+    if (d3d12_mipgen_alloc_block(1, &cpu, &gpu) < 0) return -1;
+    ID3D12GraphicsCommandList *list = vio_d3d12.cmd_list;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_dsv_heap, &dsv);
-    UINT block = vio_d3d12.mipgen_block;
-    vio_d3d12.mipgen_block = (block + 1) % VIO_D3D12_MIPGEN_BLOCKS;
-    cpu.ptr += (SIZE_T)block * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS * inc;
-    gpu.ptr += (UINT64)block * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS * inc;
     D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
     sd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
     sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
@@ -5893,7 +6004,7 @@ static int d3d12_resolve_depth_msaa(vio_render_target_object *rt)
     int dst_srv = rt->d3d12_depth_is_srv;
     d3d12_rt_barrier(list, ms, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (dst_srv) d3d12_rt_barrier(list, dst, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.mipgen_heap };
+    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.mipgen_heap.heap };
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, vio_d3d12.dmip_rs);
     ID3D12GraphicsCommandList_SetPipelineState(list, vio_d3d12.dmip_resolve_pso);
@@ -5924,6 +6035,9 @@ static int d3d12_generate_depth_mips(vio_render_target_object *rt)
     D3D12_RESOURCE_STATES steady = rt->d3d12_depth_is_srv ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
                                                           : D3D12_RESOURCE_STATE_DEPTH_WRITE;
     int in_frame = vio_d3d12.in_frame && vio_d3d12.cmd_list;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu, dsv0;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    if (d3d12_mipgen_alloc_block(in_frame, &cpu, &gpu) < 0) return -1;
     ID3D12CommandAllocator *alloc = NULL;
     ID3D12GraphicsCommandList *list = NULL;
     if (in_frame) {
@@ -5940,20 +6054,12 @@ static int d3d12_generate_depth_mips(vio_render_target_object *rt)
     }
 
     UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu, dsv0;
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
-    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &cpu);
-    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.mipgen_heap, &gpu);
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap *)rt->d3d12_dsv_heap, &dsv0);
-    UINT block = vio_d3d12.mipgen_block;
-    vio_d3d12.mipgen_block = (block + 1) % VIO_D3D12_MIPGEN_BLOCKS;
-    cpu.ptr += (SIZE_T)block * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS * inc;
-    gpu.ptr += (UINT64)block * 2 * VIO_D3D12_MIPGEN_MAX_LEVELS * inc;
 
     /* Every level readable first; each target level goes to DEPTH_WRITE for its pass. */
     if (steady != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
         for (int m = 0; m < levels; m++) d3d12_dmip_barrier(list, res, levels, m, steady, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.mipgen_heap };
+    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.mipgen_heap.heap };
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, vio_d3d12.dmip_rs);
     ID3D12GraphicsCommandList_SetPipelineState(list, vio_d3d12.dmip_pso);
@@ -6687,7 +6793,7 @@ static void d3d12_begin_frame(void)
      * recording can go now (see d3d12_destroy_pipeline). */
     d3d12_release_pending_psos(vio_d3d12.frame_index);
     d3d12_release_parked(vio_d3d12.frame_index);
-    d3d12_compute_release_blocks(vio_d3d12.frame_index);   /* its compute descriptor blocks too */
+    d3d12_descriptor_blocks_release(vio_d3d12.frame_index);   /* its compute / mipgen descriptor blocks too */
     vio_d3d12.dp_used[vio_d3d12.frame_index] = 0;
     /* Staging buffers of uploads whose fence has passed (GAP-PLAN 4.1). */
     d3d12_retire_uploads(0);
@@ -7402,10 +7508,8 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
 /* Dedicated shader-visible CBV/SRV/UAV heap for compute dispatches. Layout per
  * dispatch block: [0..VIO_D3D12_COMPUTE_MAX_BINDINGS) SRVs, then the same many
  * UAVs; behind the blocks the bindless table. Created lazily, grown by
- * d3d12_compute_alloc_block. Separate from the graphics srv_heap so the complex
+ * d3d12_block_heap_alloc. Separate from the graphics srv_heap so the complex
  * per-frame partitioning there is untouched. */
-
-static void d3d12_park_object(IUnknown *obj);
 
 /* Create the compute heap with `blocks` dispatch blocks (all free). The caller
  * has dealt with a previous heap. */
@@ -7414,26 +7518,15 @@ static int d3d12_create_compute_srv_heap(UINT blocks)
     /* Behind the dispatch blocks: the bindless table, copied from its CPU mirror
      * (d3d12_bindless_publish keeps it current). */
     UINT extra = (vio_d3d12.bindless && vio_d3d12.bindless_cpu_heap) ? VIO_BINDLESS_MAX : 0;
-    unsigned char *owner = (unsigned char *)calloc(blocks, 1);
-    if (!owner) return -1;
-    ID3D12DescriptorHeap *heap = NULL;
-    if (d3d12_create_descriptor_heap(&heap, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                                     VIO_D3D12_COMPUTE_MAX_BINDINGS * 2 * blocks + extra,
-                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
-        free(owner);
+    if (d3d12_block_heap_create(&vio_d3d12.compute_heap, VIO_D3D12_COMPUTE_MAX_BINDINGS * 2, blocks,
+                                VIO_D3D12_COMPUTE_HEAP_MAX_BLOCKS, extra) != 0) {
         return -1;
     }
-    vio_d3d12.compute_srv_heap = heap;
-    free(vio_d3d12.compute_block_owner);
-    vio_d3d12.compute_block_owner = owner;
-    vio_d3d12.compute_heap_blocks = blocks;
-    vio_d3d12.compute_heap_block = 0;
-    memset(vio_d3d12.compute_blocks_held, 0, sizeof(vio_d3d12.compute_blocks_held));
     vio_d3d12.compute_srv_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (extra) {
         D3D12_CPU_DESCRIPTOR_HANDLE c, m;
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &c);
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_heap.heap, &c);
         c.ptr += (SIZE_T)VIO_D3D12_COMPUTE_BINDLESS_BASE * vio_d3d12.compute_srv_descriptor_size;
         ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.bindless_cpu_heap, &m);
         ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, VIO_BINDLESS_MAX, c, m, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -7441,73 +7534,12 @@ static int d3d12_create_compute_srv_heap(UINT blocks)
     return 0;
 }
 
-static int d3d12_ensure_compute_srv_heap(void)
-{
-    if (vio_d3d12.compute_srv_heap) return 0;
-    return d3d12_create_compute_srv_heap(VIO_D3D12_COMPUTE_HEAP_BLOCKS);
-}
-
-/* Frame slot `slot` has retired (begin_frame waited for its fence): the blocks
- * its list recorded are free again. */
-static void d3d12_compute_release_blocks(UINT slot)
-{
-    if (slot >= VIO_D3D12_MAX_FRAME_COUNT || !vio_d3d12.compute_blocks_held[slot]) return;
-    unsigned char tag = (unsigned char)(slot + 1);
-    for (UINT b = 0; b < vio_d3d12.compute_heap_blocks; b++)
-        if (vio_d3d12.compute_block_owner[b] == tag) vio_d3d12.compute_block_owner[b] = 0;
-    vio_d3d12.compute_blocks_held[slot] = 0;
-}
-
-/* Descriptor block for one compute dispatch / ray trace. A block recorded into
- * the open frame list (frame_owned) stays taken until that frame slot's fence
- * has passed; a synchronous dispatch waits for the GPU before it returns and
- * keeps nothing. Blocks still in use are never handed out again: with none
- * free the heap doubles - the old heap stays alive (parked) until the lists
- * that reference it have executed - so dispatches never wait on the GPU here.
- * Returns the block index, or -1. */
+/* Descriptor block for one compute dispatch / ray trace (see
+ * vio_d3d12_block_heap). Returns the block index, or -1. */
 static int d3d12_compute_alloc_block(int frame_owned)
 {
-    if (d3d12_ensure_compute_srv_heap() != 0) return -1;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        UINT n = vio_d3d12.compute_heap_blocks;
-        for (UINT k = 0; k < n; k++) {
-            UINT b = (vio_d3d12.compute_heap_block + k) % n;
-            if (vio_d3d12.compute_block_owner[b]) continue;
-            vio_d3d12.compute_heap_block = (b + 1) % n;
-            if (frame_owned) {
-                UINT slot = vio_d3d12.frame_index < VIO_D3D12_MAX_FRAME_COUNT ? vio_d3d12.frame_index : 0;
-                vio_d3d12.compute_block_owner[b] = (unsigned char)(slot + 1);
-                vio_d3d12.compute_blocks_held[slot]++;
-            }
-            return (int)b;
-        }
-        /* Every block is still referenced by a frame list in flight. */
-        UINT grown = n * 2;
-        ID3D12DescriptorHeap *old = vio_d3d12.compute_srv_heap;
-        if (grown <= VIO_D3D12_COMPUTE_HEAP_MAX_BLOCKS) {
-            vio_d3d12.compute_srv_heap = NULL;
-            if (d3d12_create_compute_srv_heap(grown) == 0) {
-                /* Lists recorded so far still point into the old heap. In a frame
-                 * the open list does (released once this slot's fence passed);
-                 * outside, only submitted frames, all signalled by now. */
-                if (vio_d3d12.in_frame) d3d12_park_object((IUnknown *)old);
-                else d3d12_retire_object_later((IUnknown *)old, vio_d3d12.fence_value);
-                continue;
-            }
-            vio_d3d12.compute_srv_heap = old;   /* out of memory: keep the heap, flush below */
-        }
-        /* At the bound: let the GPU catch up instead (mid-frame this submits the
-         * open list and reopens it), then every block is free. */
-        if (vio_d3d12.in_frame && vio_d3d12.cmd_list) {
-            vio_d3d12.compute_async_pending = 1;
-            d3d12_compute_wait();
-        } else {
-            vio_d3d12_wait_for_gpu();
-        }
-        memset(vio_d3d12.compute_block_owner, 0, vio_d3d12.compute_heap_blocks);
-        memset(vio_d3d12.compute_blocks_held, 0, sizeof(vio_d3d12.compute_blocks_held));
-    }
-    return -1;
+    if (!vio_d3d12.compute_heap.heap && d3d12_create_compute_srv_heap(VIO_D3D12_COMPUTE_HEAP_BLOCKS) != 0) return -1;
+    return d3d12_block_heap_alloc(&vio_d3d12.compute_heap, frame_owned, d3d12_create_compute_srv_heap);
 }
 
 static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
@@ -8161,8 +8193,8 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
      * hardcoded t0/u0. */
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_start;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_start;
-    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &cpu_start);
-    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &gpu_start);
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_heap.heap, &cpu_start);
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.compute_heap.heap, &gpu_start);
     UINT dsz = vio_d3d12.compute_srv_descriptor_size;
     cpu_start.ptr += (SIZE_T)block * (2 * VIO_D3D12_COMPUTE_MAX_BINDINGS) * dsz;
     gpu_start.ptr += (UINT64)block * (2 * VIO_D3D12_COMPUTE_MAX_BINDINGS) * dsz;
@@ -8287,11 +8319,11 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     ID3D12GraphicsCommandList_SetPipelineState(list, cp->pso);
     if (cp->uses_accel && d3d12_bound_as && d3d12_bound_as->tlas)
         ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(list, 3, ID3D12Resource_GetGPUVirtualAddress(d3d12_bound_as->tlas));
-    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.compute_srv_heap };
+    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.compute_heap.heap };
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
     if (cp->uses_bindless) {
         D3D12_GPU_DESCRIPTOR_HANDLE bt;
-        ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &bt);
+        ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.compute_heap.heap, &bt);
         bt.ptr += (UINT64)VIO_D3D12_COMPUTE_BINDLESS_BASE * vio_d3d12.compute_srv_descriptor_size;
         ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 4, bt);
     }
@@ -8763,8 +8795,8 @@ static int d3d12_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int
     D3D12_GPU_DESCRIPTOR_HANDLE tex_gpu;
     {
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
-        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &cpu);
-        ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.compute_srv_heap, &tex_gpu);
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.compute_heap.heap, &cpu);
+        ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.compute_heap.heap, &tex_gpu);
         UINT dsz = vio_d3d12.compute_srv_descriptor_size;
         cpu.ptr +=(SIZE_T)block * (2 * VIO_D3D12_COMPUTE_MAX_BINDINGS) * dsz;
         tex_gpu.ptr += (UINT64)block * (2 * VIO_D3D12_COMPUTE_MAX_BINDINGS) * dsz;
@@ -8808,7 +8840,7 @@ static int d3d12_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int
     ID3D12GraphicsCommandList_SetComputeRootSignature(list, p->root_sig);
     ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(list, 0, ID3D12Resource_GetGPUVirtualAddress(d3d12_bound_as->tlas));
     {
-        ID3D12DescriptorHeap *heaps[] = { vio_d3d12.compute_srv_heap };
+        ID3D12DescriptorHeap *heaps[] = { vio_d3d12.compute_heap.heap };
         ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
         ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1 + VIO_D3D12_RT_UAVS, tex_gpu);
     }

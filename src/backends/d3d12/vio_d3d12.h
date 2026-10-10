@@ -304,6 +304,26 @@ typedef struct _vio_d3d12_descriptor_heap {
     UINT                  count;
 } vio_d3d12_descriptor_heap;
 
+/* Shader-visible CBV/SRV/UAV heap carved into equal blocks, one block per GPU
+ * job recorded with its own descriptors (compute dispatch, ray trace, mip
+ * generation). A block recorded into the open frame list belongs to that frame
+ * slot (owner = slot + 1) until begin_frame has waited for the slot's fence; a
+ * job that executes and waits on its own list keeps none. With no free block
+ * the heap doubles (the old heap is parked until the GPU is done with it), so
+ * descriptors still in flight are never overwritten and no job waits; only at
+ * the growth bound is the GPU flushed once. Descriptors behind the blocks
+ * (`extra`) belong to the owner (the compute heap keeps the bindless table
+ * there). */
+typedef struct _vio_d3d12_block_heap {
+    ID3D12DescriptorHeap *heap;
+    UINT                  block_descs;  /* descriptors per block */
+    UINT                  blocks;       /* blocks in the current heap */
+    UINT                  max_blocks;   /* growth bound */
+    UINT                  next;         /* next block to try */
+    unsigned char        *owner;        /* [blocks]: 0 free, else slot + 1 */
+    UINT                  held[VIO_D3D12_MAX_FRAME_COUNT];
+} vio_d3d12_block_heap;
+
 /* Global D3D12 state */
 typedef struct _vio_d3d12_state {
     /* Device & queues */
@@ -430,9 +450,10 @@ typedef struct _vio_d3d12_state {
      * SRV/UAV pair per level in a small dedicated shader-visible heap. */
     ID3D12RootSignature       *mipgen_rs;
     ID3D12PipelineState       *mipgen_pso;
-    ID3D12DescriptorHeap      *mipgen_heap;
+    /* One block (2 * VIO_D3D12_MIPGEN_MAX_LEVELS descriptors) per generate /
+     * depth-mip / depth-resolve call, fenced like the compute heap. */
+    vio_d3d12_block_heap       mipgen_heap;
     int                        mipgen_failed;
-    UINT                       mipgen_block;   /* next descriptor block of the mipgen_heap ring */
     ID3D12RootSignature       *dmip_rs;        /* depth mip reduction (A26) */
     ID3D12PipelineState       *dmip_pso;
     ID3D12PipelineState       *dmip_resolve_pso; /* depth_only MSAA resolve (A24) */
@@ -504,20 +525,10 @@ typedef struct _vio_d3d12_state {
      * solely by compute dispatches, kept fully separate from the graphics
      * srv_heap and its per-frame partitioning. */
     ID3D12RootSignature       *compute_root_signature;
-    ID3D12DescriptorHeap      *compute_srv_heap;     /* shader-visible, compute-only */
+    /* Shader-visible, compute-only: one block (MAX SRVs + MAX UAVs) per
+     * dispatch / ray trace, then the bindless table. */
+    vio_d3d12_block_heap       compute_heap;
     UINT                       compute_srv_descriptor_size;
-    /* The compute heap holds compute_heap_blocks descriptor blocks (each MAX
-     * SRVs + MAX UAVs), then the bindless table. Every dispatch takes a free
-     * block. A block recorded into a frame list belongs to that frame slot
-     * (compute_block_owner = slot + 1) until begin_frame has waited for the
-     * slot's fence; synchronous dispatches wait for the GPU themselves and
-     * never hold one. With no free block the heap doubles (the old one is
-     * parked until the GPU is done with it): descriptors still in flight are
-     * never overwritten and no dispatch waits. */
-    UINT                       compute_heap_blocks;  /* blocks in the current heap */
-    UINT                       compute_heap_block;   /* next block to try */
-    unsigned char             *compute_block_owner;  /* [compute_heap_blocks]: 0 free, else slot + 1 */
-    UINT                       compute_blocks_held[VIO_D3D12_MAX_FRAME_COUNT];
     int                        compute_async_pending;/* async dispatches recorded, not yet waited */
 
     /* Currently bound render target (NULL = backbuffer). current_rtv is
