@@ -193,8 +193,13 @@ typedef struct _vio_d3d12_buffer {
 
 /* Max storage-buffer bindings per compute pipeline (SRV t# + UAV u#). */
 #define VIO_D3D12_COMPUTE_MAX_BINDINGS 8
-/* Dispatch descriptor blocks in the compute heap (a ring, one block per dispatch). */
-#define VIO_D3D12_COMPUTE_HEAP_BLOCKS 16
+/* Dispatch descriptor blocks the compute heap starts with (one block per
+ * dispatch; the heap doubles while every block is still in use by the GPU). */
+#define VIO_D3D12_COMPUTE_HEAP_BLOCKS 64
+/* Upper bound for the growth (x 2*MAX_BINDINGS descriptors, far below the
+ * 1,000,000 of resource binding tier 1). At the bound the frame list is
+ * flushed instead. */
+#define VIO_D3D12_COMPUTE_HEAP_MAX_BLOCKS 16384
 
 /* One recorded storage-buffer binding on a compute pipeline. */
 typedef struct _vio_d3d12_compute_binding {
@@ -501,11 +506,18 @@ typedef struct _vio_d3d12_state {
     ID3D12RootSignature       *compute_root_signature;
     ID3D12DescriptorHeap      *compute_srv_heap;     /* shader-visible, compute-only */
     UINT                       compute_srv_descriptor_size;
-    /* The compute heap is a ring of VIO_D3D12_COMPUTE_HEAP_BLOCKS descriptor
-     * blocks (each MAX SRVs + MAX UAVs); every dispatch takes the next block so
-     * async dispatches recorded into one frame do not overwrite each other's
-     * descriptors before the GPU consumes them. */
-    UINT                       compute_heap_block;   /* next block index */
+    /* The compute heap holds compute_heap_blocks descriptor blocks (each MAX
+     * SRVs + MAX UAVs), then the bindless table. Every dispatch takes a free
+     * block. A block recorded into a frame list belongs to that frame slot
+     * (compute_block_owner = slot + 1) until begin_frame has waited for the
+     * slot's fence; synchronous dispatches wait for the GPU themselves and
+     * never hold one. With no free block the heap doubles (the old one is
+     * parked until the GPU is done with it): descriptors still in flight are
+     * never overwritten and no dispatch waits. */
+    UINT                       compute_heap_blocks;  /* blocks in the current heap */
+    UINT                       compute_heap_block;   /* next block to try */
+    unsigned char             *compute_block_owner;  /* [compute_heap_blocks]: 0 free, else slot + 1 */
+    UINT                       compute_blocks_held[VIO_D3D12_MAX_FRAME_COUNT];
     int                        compute_async_pending;/* async dispatches recorded, not yet waited */
 
     /* Currently bound render target (NULL = backbuffer). current_rtv is
