@@ -1,3 +1,10 @@
+# [2.33.0](https://github.com/phpolygon/php-vio/compare/v2.32.2...v2.33.0) (2026-10-11)
+
+
+### Features
+
+* **input:** system clipboard and layout key names ([9650c03](https://github.com/phpolygon/php-vio/commit/9650c038a0810cbab9c4d213654da58ada2a6e96))
+
 ## [2.32.2](https://github.com/phpolygon/php-vio/compare/v2.32.1...v2.32.2) (2026-10-10)
 
 
