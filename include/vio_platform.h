@@ -141,6 +141,24 @@ typedef struct _vio_platform {
 
     /* ── Input: route the window's events into the context's input state ── */
     void  (*install_input)(vio_window_handle w, struct _vio_input_state *state);
+
+    /* ── Clipboard (process-wide UTF-8 text, no window needed) ─────────
+     * NULL slots: no system clipboard on this platform - vio_clipboard_*
+     * then keep a process-local one. Both return 0 when the system
+     * clipboard cannot be reached right now (no display yet), so the
+     * caller falls back the same way.
+     * clipboard_get: 1 = answered; *out_utf8 is malloc'd (caller free()s)
+     * or NULL when the clipboard is empty / holds no text. */
+    int   (*clipboard_get)(char **out_utf8);
+    int   (*clipboard_set)(const char *utf8);
+
+    /* ── Keyboard layout ──────────────────────────────────────────────
+     * What printable key $key (VIO_KEY_*: physical position, US names)
+     * types in the current layout without modifiers, lower case UTF-8 in a
+     * static buffer (valid until the next call), NULL when it types nothing
+     * printable. NULL slot: the layout is unknown (vio_key_name -> null).
+     * GLFW's glfwGetKeyName semantics. */
+    const char *(*key_name)(int key);
 } vio_platform;
 
 /* Registry (src/vio_platform_registry.c): platforms register in MINIT; the

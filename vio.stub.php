@@ -182,6 +182,39 @@ function vio_chars_typed(VioContext $context): string {}
 function vio_ime_backspaces(VioContext $context): int {}
 
 /**
+ * Read the clipboard as UTF-8 text. Process-wide, no context needed.
+ *
+ * The active platform's system clipboard (Win32, Cocoa, X11, GLFW); "" when
+ * it is empty or holds no text. Platforms without one (null, Wayland, iOS)
+ * and a system clipboard that cannot be reached use a process-local
+ * clipboard that vio_clipboard_set() writes to. Line endings are not
+ * converted (text copied in Windows apps usually carries "\r\n").
+ */
+function vio_clipboard_get(): string {}
+
+/**
+ * Write UTF-8 text to the clipboard. Process-wide, no context needed.
+ *
+ * Writes the system clipboard where the platform has one and always the
+ * process-local fallback. C-string semantics: the text ends at the first NUL
+ * byte. On X11 the clipboard is served by this process - other clients can
+ * paste it while the game keeps polling events and until it exits.
+ */
+function vio_clipboard_set(string $text): bool {}
+
+/**
+ * The character a printable key types in the current keyboard layout, lower
+ * case and without modifiers (glfwGetKeyName semantics).
+ *
+ * VIO_KEY_* constants name physical key positions after the US layout; this
+ * maps them back to the keycap - VIO_KEY_Y is "z" on a German layout - so
+ * shortcuts like Ctrl+Z can follow the layout. Returns null for keys that type
+ * nothing printable (Shift, arrows, dead keys) and on platforms that do not
+ * know the layout (null, Wayland, iOS). Process-wide, no context needed.
+ */
+function vio_key_name(int $key): ?string {}
+
+/**
  * Show the on-screen keyboard (iOS). No-op on desktop. Call on text-field focus.
  */
 function vio_keyboard_show(VioContext $context): void {}

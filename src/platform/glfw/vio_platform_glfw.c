@@ -656,6 +656,46 @@ static void glfw_install_input(vio_window_handle w, vio_input_state *state)
     glfwSetFramebufferSizeCallback(window, glfw_framebuffer_size_callback);
 }
 
+/* GLFW reports an empty / non-text clipboard as an error; for the clipboard
+ * that is an ordinary state, so the PHP-warning callback is muted around it. */
+static void glfw_silent_error_callback(int error, const char *description)
+{
+    (void)error; (void)description;
+}
+
+static int glfw_clipboard_get(char **out_utf8)
+{
+    *out_utf8 = NULL;
+    if (!glfw_initialized) return 0;
+    GLFWerrorfun prev = glfwSetErrorCallback(glfw_silent_error_callback);
+    const char *text = glfwGetClipboardString(NULL);   /* the window argument is unused since 3.3 */
+    if (text) {
+        size_t n = strlen(text);
+        char *s = (char *)malloc(n + 1);
+        if (s) { memcpy(s, text, n + 1); *out_utf8 = s; }
+    }
+    glfwSetErrorCallback(prev);
+    return 1;
+}
+
+static const char *glfw_key_name(int key)
+{
+    if (!glfw_initialized) return NULL;
+    GLFWerrorfun prev = glfwSetErrorCallback(glfw_silent_error_callback);
+    const char *name = glfwGetKeyName(key, 0);
+    glfwSetErrorCallback(prev);
+    return name;
+}
+
+static int glfw_clipboard_set(const char *utf8)
+{
+    if (!glfw_initialized) return 0;
+    GLFWerrorfun prev = glfwSetErrorCallback(glfw_silent_error_callback);
+    glfwSetClipboardString(NULL, utf8 ? utf8 : "");
+    glfwSetErrorCallback(prev);
+    return 1;
+}
+
 static const vio_platform vio_platform_glfw = {
     .name                 = "glfw",
     .init                 = glfw_init,
@@ -702,6 +742,9 @@ static const vio_platform vio_platform_glfw = {
     .vk_create_surface      = glfw_vk_create_surface,
 #endif
     .install_input        = glfw_install_input,
+    .clipboard_get        = glfw_clipboard_get,
+    .clipboard_set        = glfw_clipboard_set,
+    .key_name             = glfw_key_name,
 };
 
 void vio_platform_glfw_register(void)

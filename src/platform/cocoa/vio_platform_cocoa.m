@@ -926,6 +926,101 @@ static void cocoa_install_input(vio_window_handle h, vio_input_state *state)
     if (w) w->input = state;
 }
 
+/* ── Keyboard layout: UCKeyTranslate on the current layout ────────────
+ * HIToolbox is loaded at run time (as GLFW does), so the build links no
+ * Carbon. Any missing piece reads as "layout unknown" (NULL). */
+
+typedef void *(*cocoa_TISCopy_t)(void);
+typedef void *(*cocoa_TISGetProp_t)(void *source, CFStringRef key);
+typedef int32_t (*cocoa_UCKeyTranslate_t)(const void *layout, uint16_t vk, uint16_t action, uint32_t mods,
+                                          uint32_t kbd_type, uint32_t options, uint32_t *dead_state,
+                                          unsigned long max_len, unsigned long *actual_len, uint16_t *chars);
+typedef uint8_t (*cocoa_LMGetKbdType_t)(void);
+
+static const char *cocoa_key_name(int key)
+{
+    static void *hitoolbox;
+    static cocoa_TISCopy_t tis_copy;
+    static cocoa_TISGetProp_t tis_prop;
+    static cocoa_UCKeyTranslate_t uc_translate;
+    static cocoa_LMGetKbdType_t kbd_type;
+    static CFStringRef *layout_data_key;
+    static char name[16];
+
+    if (!hitoolbox) {
+        hitoolbox = dlopen("/System/Library/Frameworks/Carbon.framework/Frameworks/HIToolbox.framework/HIToolbox", RTLD_LAZY);
+        if (!hitoolbox) return NULL;
+        tis_copy = (cocoa_TISCopy_t)dlsym(hitoolbox, "TISCopyCurrentKeyboardLayoutInputSource");
+        tis_prop = (cocoa_TISGetProp_t)dlsym(hitoolbox, "TISGetInputSourceProperty");
+        layout_data_key = (CFStringRef *)dlsym(hitoolbox, "kTISPropertyUnicodeKeyLayoutData");
+        kbd_type = (cocoa_LMGetKbdType_t)dlsym(hitoolbox, "LMGetKbdType");
+        uc_translate = (cocoa_UCKeyTranslate_t)dlsym(RTLD_DEFAULT, "UCKeyTranslate");
+        if (!uc_translate) uc_translate = (cocoa_UCKeyTranslate_t)dlsym(hitoolbox, "UCKeyTranslate");
+    }
+    if (!tis_copy || !tis_prop || !layout_data_key || !kbd_type || !uc_translate) return NULL;
+
+    int keycode = -1;
+    for (int kc = 0; kc < 256; kc++) {
+        if (cocoa_keycodes[kc] == key) { keycode = kc; break; }
+    }
+    if (keycode < 0) return NULL;
+
+    void *source = tis_copy();
+    if (!source) return NULL;
+    CFDataRef data = (CFDataRef)tis_prop(source, *layout_data_key);
+    const char *result = NULL;
+    if (data) {
+        uint32_t dead = 0;
+        unsigned long len = 0;
+        uint16_t chars[4];
+        /* kUCKeyActionDisplay = 3, kUCKeyTranslateNoDeadKeysMask = 1 */
+        if (uc_translate(CFDataGetBytePtr(data), (uint16_t)keycode, 3, 0, kbd_type(), 1,
+                         &dead, 4, &len, chars) == 0 && len > 0) {
+            CFStringRef s = CFStringCreateWithCharacters(kCFAllocatorDefault, chars, (CFIndex)len);
+            if (s) {
+                CFMutableStringRef m = CFStringCreateMutableCopy(kCFAllocatorDefault, 0, s);
+                if (m) {
+                    CFStringLowercase(m, NULL);
+                    if (CFStringGetCString(m, name, sizeof(name), kCFStringEncodingUTF8)
+                        && (unsigned char)name[0] >= 32 && name[0] != 127) result = name;
+                    CFRelease(m);
+                }
+                CFRelease(s);
+            }
+        }
+    }
+    CFRelease((CFTypeRef)source);
+    return result;
+}
+
+/* ── Clipboard: the general NSPasteboard, plain UTF-8 text ─────────── */
+
+static int cocoa_clipboard_get(char **out_utf8)
+{
+    *out_utf8 = NULL;
+    @autoreleasepool {
+        NSString *s = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
+        const char *u = s ? [s UTF8String] : NULL;
+        if (u) {
+            size_t n = strlen(u);
+            char *copy = (char *)malloc(n + 1);
+            if (copy) { memcpy(copy, u, n + 1); *out_utf8 = copy; }
+        }
+    }
+    return 1;
+}
+
+static int cocoa_clipboard_set(const char *utf8)
+{
+    @autoreleasepool {
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        NSString *s = [NSString stringWithUTF8String:(utf8 ? utf8 : "")];
+        if (!s) return 0;
+        [pb clearContents];
+        return [pb setString:s forType:NSPasteboardTypeString] ? 1 : 0;
+    }
+}
+
 static const vio_platform vio_platform_cocoa = {
     .name                 = "cocoa",
     .init                 = cocoa_init,
@@ -972,6 +1067,9 @@ static const vio_platform vio_platform_cocoa = {
     .vk_create_surface      = cocoa_vk_create_surface,
 #endif
     .install_input        = cocoa_install_input,
+    .clipboard_get        = cocoa_clipboard_get,
+    .clipboard_set        = cocoa_clipboard_set,
+    .key_name             = cocoa_key_name,
 };
 
 void vio_platform_cocoa_register(void)

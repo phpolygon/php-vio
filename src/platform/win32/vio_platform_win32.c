@@ -70,6 +70,7 @@ typedef struct _vio_win32_window {
 static HINSTANCE        w32_instance;
 static ATOM             w32_class;
 static int              w32_initialized;
+static HWND             w32_clip_owner;   /* clipboard owner: SetClipboardData fails without one */
 static const WCHAR      w32_class_name[] = L"vio_window";
 
 /* ── DPI ──────────────────────────────────────────────────────────── */
@@ -673,6 +674,7 @@ static int w32_init(void)
 static void w32_shutdown(void)
 {
     if (!w32_initialized) return;
+    if (w32_clip_owner) { DestroyWindow(w32_clip_owner); w32_clip_owner = NULL; }
     UnregisterClassW(w32_class_name, w32_instance);
     w32_initialized = 0;
     w32_wgl_probed = 0;
@@ -1134,6 +1136,90 @@ static void w32_install_input(vio_window_handle h, vio_input_state *state)
     if (w) w->input = state;
 }
 
+/* ── Keyboard layout: the unshifted character of a physical key ──── */
+
+static const char *w32_key_name(int key)
+{
+    static char name[8];
+    int scancode = -1;
+    for (int sc = 0; sc < 512; sc++) {
+        if (w32_keycodes[sc] == key) { scancode = sc; break; }
+    }
+    if (scancode < 0) return NULL;
+    HKL layout = GetKeyboardLayout(0);
+    UINT vk = MapVirtualKeyExW((UINT)(scancode & 0xff) | ((scancode & 0x100) ? 0xE000 : 0), MAPVK_VSC_TO_VK_EX, layout);
+    if (!vk) return NULL;
+    /* MAPVK_VK_TO_CHAR: upper case for letters, the high bit marks a dead key */
+    UINT ch = MapVirtualKeyExW(vk, MAPVK_VK_TO_CHAR, layout) & 0x7FFFFFFF;
+    if (ch < 32 || ch == 127) return NULL;
+    WCHAR w[2] = { (WCHAR)ch, 0 };
+    CharLowerBuffW(w, 1);
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, 1, name, (int)sizeof(name) - 1, NULL, NULL);
+    if (n <= 0) return NULL;
+    name[n] = 0;
+    return name;
+}
+
+/* ── Clipboard: CF_UNICODETEXT through a message-only owner window ──── */
+
+
+static int w32_clip_open(void)
+{
+    if (!w32_clip_owner) {
+        w32_clip_owner = CreateWindowExW(0, L"STATIC", L"vio clipboard", 0, 0, 0, 0, 0,
+                                         HWND_MESSAGE, NULL, GetModuleHandleW(NULL), NULL);
+        if (!w32_clip_owner) return 0;
+    }
+    /* another process may hold the clipboard for a moment */
+    for (int i = 0; i < 10; i++) {
+        if (OpenClipboard(w32_clip_owner)) return 1;
+        Sleep(2);
+    }
+    return 0;
+}
+
+static int w32_clipboard_set(const char *utf8)
+{
+    if (!utf8) utf8 = "";
+    int wn = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (wn <= 0) return 0;
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)wn * sizeof(WCHAR));
+    if (!mem) return 0;
+    WCHAR *dst = (WCHAR *)GlobalLock(mem);
+    if (!dst) { GlobalFree(mem); return 0; }
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, dst, wn);
+    GlobalUnlock(mem);
+    if (!w32_clip_open()) { GlobalFree(mem); return 0; }
+    EmptyClipboard();
+    int ok = SetClipboardData(CF_UNICODETEXT, mem) != NULL;
+    CloseClipboard();
+    if (!ok) GlobalFree(mem);   /* on success the system owns it */
+    return ok;
+}
+
+static int w32_clipboard_get(char **out_utf8)
+{
+    *out_utf8 = NULL;
+    if (!w32_clip_open()) return 0;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        const WCHAR *src = (const WCHAR *)GlobalLock(h);
+        if (src) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, src, -1, NULL, 0, NULL, NULL);
+            if (n > 0) {
+                char *s = (char *)malloc((size_t)n);
+                if (s) {
+                    WideCharToMultiByte(CP_UTF8, 0, src, -1, s, n, NULL, NULL);
+                    *out_utf8 = s;
+                }
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return 1;
+}
+
 static const vio_platform vio_platform_win32 = {
     .name                 = "win32",
     .init                 = w32_init,
@@ -1180,6 +1266,9 @@ static const vio_platform vio_platform_win32 = {
     .vk_create_surface      = w32_vk_create_surface,
 #endif
     .install_input        = w32_install_input,
+    .clipboard_get        = w32_clipboard_get,
+    .clipboard_set        = w32_clipboard_set,
+    .key_name             = w32_key_name,
 };
 
 void vio_platform_win32_register(void)

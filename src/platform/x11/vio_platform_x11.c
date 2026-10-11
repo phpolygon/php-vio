@@ -564,9 +564,12 @@ static int x11_init(void)
     return 1;
 }
 
+static void x11_clip_shutdown(void);
+
 static void x11_shutdown(void)
 {
     if (!x11_dpy) return;
+    x11_clip_shutdown();
     if (x11_im) { XCloseIM(x11_im); x11_im = NULL; }
     if (x11_blank_cursor) { XFreeCursor(x11_dpy, x11_blank_cursor); x11_blank_cursor = 0; }
     XCloseDisplay(x11_dpy);
@@ -841,9 +844,12 @@ static void x11_motion_event(vio_x11_window *w, XMotionEvent *me)
     vio_input_cursor_event(x11_input(w), (double)me->x, (double)me->y);
 }
 
+static int x11_clip_event(XEvent *ev);
+
 static void x11_dispatch(XEvent *ev)
 {
     if (XFilterEvent(ev, None)) return;   /* input method */
+    if (x11_clip_event(ev)) return;       /* clipboard requests to the helper window */
     vio_x11_window *w = NULL;
     if (XFindContext(x11_dpy, ev->xany.window, x11_ctx, (XPointer *)&w) != 0 || !w) return;
     switch (ev->type) {
@@ -1202,6 +1208,161 @@ static void x11_install_input(vio_window_handle h, vio_input_state *state)
     if (w) w->input = state;
 }
 
+/* ── Clipboard: the CLIPBOARD selection (ICCCM) ───────────────────────
+ * An unmapped helper window owns the selection while vio holds the text and
+ * answers other clients' SelectionRequests from x11_dispatch (TARGETS,
+ * UTF8_STRING, STRING) - so they are served while the game polls events.
+ * Reading a foreign selection converts it to UTF8_STRING on the helper and
+ * waits up to 500 ms for the SelectionNotify; INCR transfers (> ~256 KB)
+ * are not supported and read as empty. */
+
+static Window x11_clip_win;
+static char  *x11_clip_text;
+static Atom   x11_clip_atom, x11_clip_utf8, x11_clip_targets, x11_clip_prop, x11_clip_incr;
+
+static int x11_clip_ready(void)
+{
+    if (!x11_dpy && !x11_open()) return 0;
+    if (!x11_clip_win) {
+        x11_clip_atom    = XInternAtom(x11_dpy, "CLIPBOARD", False);
+        x11_clip_utf8    = XInternAtom(x11_dpy, "UTF8_STRING", False);
+        x11_clip_targets = XInternAtom(x11_dpy, "TARGETS", False);
+        x11_clip_prop    = XInternAtom(x11_dpy, "VIO_CLIPBOARD", False);
+        x11_clip_incr    = XInternAtom(x11_dpy, "INCR", False);
+        x11_clip_win = XCreateSimpleWindow(x11_dpy, x11_root, 0, 0, 1, 1, 0, 0, 0);
+        if (!x11_clip_win) return 0;
+    }
+    return 1;
+}
+
+static void x11_clip_shutdown(void)
+{
+    if (x11_clip_win) { XDestroyWindow(x11_dpy, x11_clip_win); x11_clip_win = 0; }
+    free(x11_clip_text);
+    x11_clip_text = NULL;
+}
+
+static int x11_clip_event(XEvent *ev)
+{
+    if (!x11_clip_win) return 0;
+    if (ev->type == SelectionClear && ev->xselectionclear.window == x11_clip_win) {
+        free(x11_clip_text);   /* another client took the clipboard */
+        x11_clip_text = NULL;
+        return 1;
+    }
+    if (ev->type != SelectionRequest || ev->xselectionrequest.owner != x11_clip_win) return 0;
+    XSelectionRequestEvent *rq = &ev->xselectionrequest;
+    XSelectionEvent reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.type = SelectionNotify;
+    reply.display = rq->display;
+    reply.requestor = rq->requestor;
+    reply.selection = rq->selection;
+    reply.target = rq->target;
+    reply.time = rq->time;
+    reply.property = None;
+    Atom prop = rq->property != None ? rq->property : rq->target;   /* obsolete clients */
+    if (x11_clip_text && rq->selection == x11_clip_atom) {
+        if (rq->target == x11_clip_targets) {
+            Atom targets[3] = { x11_clip_targets, x11_clip_utf8, XA_STRING };
+            XChangeProperty(x11_dpy, rq->requestor, prop, XA_ATOM, 32, PropModeReplace,
+                            (unsigned char *)targets, 3);
+            reply.property = prop;
+        } else if (rq->target == x11_clip_utf8 || rq->target == XA_STRING) {
+            XChangeProperty(x11_dpy, rq->requestor, prop, rq->target, 8, PropModeReplace,
+                            (unsigned char *)x11_clip_text, (int)strlen(x11_clip_text));
+            reply.property = prop;
+        }
+    }
+    XSendEvent(x11_dpy, rq->requestor, False, 0, (XEvent *)&reply);
+    XFlush(x11_dpy);
+    return 1;
+}
+
+static int x11_clipboard_set(const char *utf8)
+{
+    if (!x11_clip_ready()) return 0;
+    size_t n = strlen(utf8 ? utf8 : "");
+    char *copy = (char *)malloc(n + 1);
+    if (!copy) return 0;
+    memcpy(copy, utf8 ? utf8 : "", n + 1);
+    free(x11_clip_text);
+    x11_clip_text = copy;
+    XSetSelectionOwner(x11_dpy, x11_clip_atom, x11_clip_win, CurrentTime);
+    XFlush(x11_dpy);
+    return XGetSelectionOwner(x11_dpy, x11_clip_atom) == x11_clip_win;
+}
+
+static int x11_clipboard_get(char **out_utf8)
+{
+    *out_utf8 = NULL;
+    if (!x11_clip_ready()) return 0;
+    Window owner = XGetSelectionOwner(x11_dpy, x11_clip_atom);
+    if (owner == None) return 1;
+    if (owner == x11_clip_win) {
+        if (x11_clip_text) {
+            size_t n = strlen(x11_clip_text);
+            char *copy = (char *)malloc(n + 1);
+            if (copy) { memcpy(copy, x11_clip_text, n + 1); *out_utf8 = copy; }
+        }
+        return 1;
+    }
+    XDeleteProperty(x11_dpy, x11_clip_win, x11_clip_prop);
+    XConvertSelection(x11_dpy, x11_clip_atom, x11_clip_utf8, x11_clip_prop, x11_clip_win, CurrentTime);
+    XFlush(x11_dpy);
+    XEvent ev;
+    int got = 0;
+    for (int i = 0; i < 500 && !got; i++) {
+        if (XCheckTypedWindowEvent(x11_dpy, x11_clip_win, SelectionNotify, &ev)) { got = 1; break; }
+        struct timespec ts = { 0, 1000000 };
+        nanosleep(&ts, NULL);
+    }
+    if (!got || ev.xselection.property == None) return 1;
+    Atom type = None;
+    int format = 0;
+    unsigned long count = 0, rest = 0;
+    unsigned char *data = NULL;
+    if (XGetWindowProperty(x11_dpy, x11_clip_win, x11_clip_prop, 0, 0x7FFFFFF, True, AnyPropertyType,
+                           &type, &format, &count, &rest, &data) == Success && data) {
+        if (type != x11_clip_incr && format == 8) {
+            char *copy = (char *)malloc(count + 1);
+            if (copy) { memcpy(copy, data, count); copy[count] = 0; *out_utf8 = copy; }
+        }
+        XFree(data);
+    }
+    return 1;
+}
+
+/* ── Keyboard layout: the level-0 keysym of the key in the active group.
+ * Latin-1 and Unicode keysyms only; legacy non-Latin keysyms read as NULL. */
+static const char *x11_key_name(int key)
+{
+    static char name[8];
+    if (!x11_dpy) return NULL;
+    int keycode = -1;
+    for (int kc = 0; kc < 256; kc++) {
+        if (x11_keycodes[kc] == key) { keycode = kc; break; }
+    }
+    if (keycode < 0) return NULL;
+    XkbStateRec state;
+    memset(&state, 0, sizeof(state));
+    XkbGetState(x11_dpy, XkbUseCoreKbd, &state);
+    KeySym ks = XkbKeycodeToKeysym(x11_dpy, (KeyCode)keycode, state.group, 0);
+    unsigned long cp;
+    if ((ks >= 0x20 && ks <= 0x7e) || (ks >= 0xa0 && ks <= 0xff)) cp = (unsigned long)ks;
+    else if (ks >= 0x1000100 && ks <= 0x110ffff) cp = (unsigned long)(ks - 0x1000000);
+    else return NULL;
+    if (cp >= 'A' && cp <= 'Z') cp += 32;
+    else if (cp >= 0xc0 && cp <= 0xde && cp != 0xd7) cp += 32;
+    int n = 0;
+    if (cp < 0x80) { name[n++] = (char)cp; }
+    else if (cp < 0x800) { name[n++] = (char)(0xc0 | (cp >> 6)); name[n++] = (char)(0x80 | (cp & 0x3f)); }
+    else if (cp < 0x10000) { name[n++] = (char)(0xe0 | (cp >> 12)); name[n++] = (char)(0x80 | ((cp >> 6) & 0x3f)); name[n++] = (char)(0x80 | (cp & 0x3f)); }
+    else { name[n++] = (char)(0xf0 | (cp >> 18)); name[n++] = (char)(0x80 | ((cp >> 12) & 0x3f)); name[n++] = (char)(0x80 | ((cp >> 6) & 0x3f)); name[n++] = (char)(0x80 | (cp & 0x3f)); }
+    name[n] = 0;
+    return name;
+}
+
 static const vio_platform vio_platform_x11 = {
     .name                 = "x11",
     .init                 = x11_init,
@@ -1248,6 +1409,9 @@ static const vio_platform vio_platform_x11 = {
     .vk_create_surface      = x11_vk_create_surface,
 #endif
     .install_input        = x11_install_input,
+    .clipboard_get        = x11_clipboard_get,
+    .clipboard_set        = x11_clipboard_set,
+    .key_name             = x11_key_name,
 };
 
 void vio_platform_x11_register(void)
