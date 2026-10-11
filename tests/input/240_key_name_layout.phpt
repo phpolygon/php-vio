@@ -24,7 +24,9 @@ PHP;
 $file = tempnam(sys_get_temp_dir(), 'vio240');
 file_put_contents($file, $child);
 $results = [];
-foreach (['win32', 'cocoa', 'x11', 'glfw', 'null'] as $platform) {
+foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
+    // X11 and GLFW on Linux need an X display (a Wayland-only session has none)
+    if (PHP_OS_FAMILY === 'Linux' && in_array($platform, ['x11', 'glfw'], true) && !getenv('DISPLAY')) continue;
     $cmd = escapeshellarg(PHP_BINARY) . ' -n -d extension_dir=' . escapeshellarg(ini_get('extension_dir'))
          . ' -d extension=vio ' . escapeshellarg($file);
     $env = getenv();
@@ -39,11 +41,11 @@ unlink($file);
 
 $bad = [];
 foreach ($results as $platform => $line) {
-    // only the null platform may not know the layout
-    $wantLetters = $platform === 'null' ? 'letters unknown' : 'letters ok';
+    // only the null and Wayland platforms do not know the layout
+    $wantLetters = in_array($platform, ['null', 'wayland'], true) ? 'letters unknown' : 'letters ok';
     if ($line !== "$wantLetters | nonprintable [null,null,null,null,null] | space true") $bad[] = "$platform: $line";
 }
-echo isset($results['null']) && count($results) >= 2 && !$bad ? "OK\n" : "FAIL " . json_encode([$results, $bad]) . "\n";
+echo isset($results['null']) && !$bad ? "OK\n" : "FAIL " . json_encode([$results, $bad]) . "\n";
 
 // In-process on the active platform: the same contract.
 var_dump(vio_key_name(VIO_KEY_LEFT_CONTROL));

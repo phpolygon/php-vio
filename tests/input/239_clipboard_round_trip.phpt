@@ -74,7 +74,9 @@ $finish = function (array $proc): string {
 };
 $bad = [];
 $tested = 0;
-foreach (['win32', 'cocoa', 'x11', 'glfw', 'null'] as $platform) {
+foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
+    // X11 and GLFW on Linux need an X display (a Wayland-only session has none)
+    if (PHP_OS_FAMILY === 'Linux' && in_array($platform, ['x11', 'glfw'], true) && !getenv('DISPLAY')) continue;
     $tag = $platform . '-' . mt_rand();
     $flag = sys_get_temp_dir() . '/vio239-' . $tag . '.done';
     $writer = $start($platform, 'set', $tag, $flag);
@@ -85,7 +87,8 @@ foreach (['win32', 'cocoa', 'x11', 'glfw', 'null'] as $platform) {
     unlink($flag);
     if (!str_starts_with($set, $platform . ' ')) continue;   /* not built in / no display */
     $tested++;
-    $want = $platform === 'null' ? "null local" : "$platform shared";
+    // null and Wayland keep a process-local clipboard
+    $want = in_array($platform, ['null', 'wayland'], true) ? "$platform local" : "$platform shared";
     if ($set !== "$platform roundtrip" || $get !== $want) $bad[] = "$platform: $set / $get";
 }
 unlink($file);
