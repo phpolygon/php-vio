@@ -1883,6 +1883,92 @@ ZEND_FUNCTION(vio_ime_backspaces)
 }
 
 /*
+ * vio_clipboard_get(): string
+ * vio_clipboard_set(string $text): bool
+ *
+ * Process-wide UTF-8 clipboard. The active platform's system clipboard when
+ * it has one (clipboard_* slots); otherwise - null platform, Wayland, iOS,
+ * no display yet - a process-local clipboard, so set/get still round-trip.
+ */
+static char *vio_clipboard_local = NULL;
+
+static void vio_clipboard_local_store(const char *text)
+{
+    size_t n = strlen(text);
+    char *copy = (char *)malloc(n + 1);
+    if (!copy) return;
+    memcpy(copy, text, n + 1);
+    free(vio_clipboard_local);
+    vio_clipboard_local = copy;
+}
+
+static void vio_clipboard_shutdown(void)
+{
+    free(vio_clipboard_local);
+    vio_clipboard_local = NULL;
+}
+
+ZEND_FUNCTION(vio_clipboard_get)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    const vio_platform *plat = vio_plat();
+    char *text = NULL;
+    if (plat->clipboard_get && plat->clipboard_get(&text)) {
+        if (!text) RETURN_EMPTY_STRING();
+        RETVAL_STRING(text);
+        free(text);
+        return;
+    }
+    if (vio_clipboard_local) RETURN_STRING(vio_clipboard_local);
+    RETURN_EMPTY_STRING();
+}
+
+ZEND_FUNCTION(vio_clipboard_set)
+{
+    char *text;
+    size_t text_len;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(text, text_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    (void) text_len;   /* C-string semantics: ends at the first NUL */
+    const vio_platform *plat = vio_plat();
+    vio_clipboard_local_store(text);
+    if (plat->clipboard_set) plat->clipboard_set(text);
+    RETURN_TRUE;
+}
+
+/*
+ * vio_key_name(int $key): ?string
+ *
+ * The character printable key $key types in the current keyboard layout,
+ * lower case, without modifiers (glfwGetKeyName semantics). VIO_KEY_* name
+ * physical positions after the US layout; this maps them back to what the
+ * keycap says - e.g. VIO_KEY_Y is "z" on a German layout, so Ctrl+Z
+ * shortcuts can follow the layout. null for non-printable keys, dead keys
+ * and when the platform does not know the layout (null, Wayland, iOS).
+ */
+ZEND_FUNCTION(vio_key_name)
+{
+    zend_long key;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(key)
+    ZEND_PARSE_PARAMETERS_END();
+
+    /* printable keys only: SPACE .. WORLD_2 and the keypad digits/operators */
+    if (!((key >= VIO_KEY_SPACE && key <= 162) || (key >= VIO_KEY_KP_0 && key <= VIO_KEY_KP_EQUAL))) {
+        RETURN_NULL();
+    }
+    const vio_platform *plat = vio_plat();
+    const char *name = plat->key_name ? plat->key_name((int) key) : NULL;
+    if (!name || !*name) RETURN_NULL();
+    RETURN_STRING(name);
+}
+
+/*
  * vio_keyboard_show(VioContext $ctx): void
  * vio_keyboard_hide(VioContext $ctx): void
  *
@@ -14739,6 +14825,7 @@ PHP_MSHUTDOWN_FUNCTION(vio)
     vio_audio_engine_shutdown();
     vio_shader_compiler_shutdown();
     vio_window_shutdown();
+    vio_clipboard_shutdown();
     vio_resource_shutdown();
     vio_backend_registry_shutdown();
     return SUCCESS;
