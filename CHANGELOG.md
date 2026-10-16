@@ -1,3 +1,10 @@
+# [2.34.0](https://github.com/phpolygon/php-vio/compare/v2.33.0...v2.34.0) (2026-10-16)
+
+
+### Features
+
+* **audio:** Ogg Opus and Ogg Vorbis playback, decode, encode ([49b371a](https://github.com/phpolygon/php-vio/commit/49b371ac7ecef590372d2e89d217cdcb030c15b1))
+
 # [2.33.0](https://github.com/phpolygon/php-vio/compare/v2.32.2...v2.33.0) (2026-10-11)
 
 
