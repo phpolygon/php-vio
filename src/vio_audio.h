@@ -14,10 +14,16 @@
 
 /* ── VioSound zend_object ────────────────────────────────────────── */
 
+struct vio_audio_source;
+
 typedef struct _vio_sound_object {
     ma_sound    sound;
     int         loaded;
     int         playing;
+    /* Sounds decoded from memory (Ogg, stream wrappers, vio_audio_load_data):
+     * the decoder and the encoded bytes it reads, both outlive `sound`. */
+    struct vio_audio_source *source;
+    zend_string *data;
     zend_object std;
 } vio_sound_object;
 

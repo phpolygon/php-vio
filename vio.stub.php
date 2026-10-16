@@ -1679,8 +1679,9 @@ function vio_gamepad_axes(int $id): array {}
 function vio_gamepad_triggers(int $id): array {}
 
 /**
- * Load an audio file (WAV, MP3, FLAC, OGG).
- * Lazily initializes the audio engine on first call.
+ * Load an audio file (WAV, MP3, FLAC, Ogg Vorbis, Ogg Opus).
+ * Lazily initializes the audio engine on first call. Ogg files and paths with a
+ * stream wrapper (e.g. phar://) are read into memory and decoded from there.
  *
  * @return VioSound|false Sound object or false on failure
  */
@@ -1727,6 +1728,57 @@ function vio_audio_position(VioSound $sound, float $x, float $y, float $z): void
  * Set the audio listener position and facing direction.
  */
 function vio_audio_listener(float $x, float $y, float $z, float $fx, float $fy, float $fz): void {}
+
+/**
+ * Load a sound from encoded bytes in memory (any format vio_audio_load() reads).
+ * The bytes are kept by the sound until it is freed.
+ *
+ * @return VioSound|false Sound object or false on failure
+ */
+function vio_audio_load_data(string $data): VioSound|false {}
+
+/**
+ * Audio formats this build decodes and encodes, plus the codec library versions.
+ * Lets callers check whether the runtime plays Opus / Vorbis before choosing a format.
+ *
+ * @return array{decode: list<string>, encode: list<string>, versions: array<string, string>}
+ *   e.g. ['decode' => ['wav','flac','mp3','vorbis','opus'], 'encode' => ['opus','vorbis'], 'versions' => [...]]
+ */
+function vio_audio_formats(): array {}
+
+/**
+ * Probe an audio file without an audio device.
+ *
+ * @param string $source Path (any PHP stream wrapper, e.g. phar://) or, with ['data' => true], the encoded bytes
+ * @param array $options ['data' => bool]
+ * @return array|false ['format' => 'wav'|'flac'|'mp3'|'vorbis'|'opus', 'channels' => int,
+ *   'sample_rate' => int (decoded rate; Opus always 48000), 'input_sample_rate' => int (Opus: rate fed to the encoder),
+ *   'frames' => int, 'duration' => float] or false if the data cannot be decoded
+ */
+function vio_audio_info(string $source, array $options = []): array|false {}
+
+/**
+ * Decode an audio file to interleaved PCM without an audio device.
+ *
+ * @param string $source Path (any PHP stream wrapper) or, with ['data' => true], the encoded bytes
+ * @param array $options ['data' => bool, 'format' => 's16' (default, signed 16-bit LE) | 'f32' (32-bit float LE)]
+ * @return array|false vio_audio_info() fields plus 'pcm' => string, or false on failure
+ */
+function vio_audio_decode(string $source, array $options = []): array|false {}
+
+/**
+ * Encode interleaved signed 16-bit little-endian PCM (pack('v*') / pack('s*')) to Ogg Opus or Ogg Vorbis.
+ * Output is deterministic for identical input and options.
+ *
+ * Opus: $sampleRate must be 8000, 12000, 16000, 24000 or 48000 (resample first).
+ *   Options: 'bitrate' => int bits/s (default 48000 mono / 96000 stereo), 'application' => 'audio'|'voip'|'lowdelay',
+ *   'signal' => 'auto'|'voice'|'music', 'complexity' => 0..10 (10), 'vbr' => bool (true), 'frame_ms' => 10|20|40|60 (20), 'serial' => int.
+ * Vorbis: any rate. Options: 'quality' => -0.1..1.0 (0.5 = oggenc -q5), 'bitrate' => int (managed ABR instead of quality), 'serial' => int.
+ *
+ * @param string $codec 'opus' or 'vorbis'
+ * @return string|false The .opus / .ogg file bytes, or false (with a warning) on failure
+ */
+function vio_audio_encode(string $pcm, int $sampleRate, int $channels, string $codec = 'opus', array $options = []): string|false {}
 
 /**
  * List all registered plugin names.

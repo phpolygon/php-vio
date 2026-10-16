@@ -746,6 +746,28 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_listener, 0, 6, IS_VOI
 	ZEND_ARG_TYPE_INFO(0, forward_z, IS_DOUBLE, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_audio_load_data, 0, 1, VioSound, MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO(0, data, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_formats, 0, 0, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_audio_info, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO(0, source, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
+#define arginfo_vio_audio_decode arginfo_vio_audio_info
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_audio_encode, 0, 3, MAY_BE_STRING|MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO(0, pcm, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, sampleRate, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, channels, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, codec, IS_STRING, 0, "\"opus\"")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
 /* ── Input injection functions ────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_key, 0, 3, IS_VOID, 0)
@@ -1240,6 +1262,11 @@ ZEND_FUNCTION(vio_audio_volume);
 ZEND_FUNCTION(vio_audio_playing);
 ZEND_FUNCTION(vio_audio_position);
 ZEND_FUNCTION(vio_audio_listener);
+ZEND_FUNCTION(vio_audio_load_data);
+ZEND_FUNCTION(vio_audio_formats);
+ZEND_FUNCTION(vio_audio_info);
+ZEND_FUNCTION(vio_audio_decode);
+ZEND_FUNCTION(vio_audio_encode);
 ZEND_FUNCTION(vio_recorder);
 ZEND_FUNCTION(vio_recorder_capture);
 ZEND_FUNCTION(vio_recorder_stop);
@@ -1454,6 +1481,11 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_audio_playing, arginfo_vio_audio_playing)
 	ZEND_FE(vio_audio_position, arginfo_vio_audio_position)
 	ZEND_FE(vio_audio_listener, arginfo_vio_audio_listener)
+	ZEND_FE(vio_audio_load_data, arginfo_vio_audio_load_data)
+	ZEND_FE(vio_audio_formats, arginfo_vio_audio_formats)
+	ZEND_FE(vio_audio_info, arginfo_vio_audio_info)
+	ZEND_FE(vio_audio_decode, arginfo_vio_audio_decode)
+	ZEND_FE(vio_audio_encode, arginfo_vio_audio_encode)
 	ZEND_FE(vio_recorder, arginfo_vio_recorder)
 	ZEND_FE(vio_recorder_capture, arginfo_vio_recorder_capture)
 	ZEND_FE(vio_recorder_stop, arginfo_vio_recorder_stop)

@@ -52,6 +52,7 @@ if (PHP_VIO != "no") {
         "src\\vio_shader_reflect.c " +
         "src\\vio_tess_hlsl.c " +
         "src\\vio_audio.c " +
+        "src\\vio_audio_codec.c " +
         "src\\vio_recorder.c " +
         "src\\vio_stream.c " +
         "src\\vio_thermal.c " +
@@ -90,6 +91,37 @@ if (PHP_VIO != "no") {
         "/I" + configure_module_dirname + "\\vendor\\stb " +
         "/I" + configure_module_dirname + "\\vendor\\sheenbidi\\Headers " +
         "/I" + configure_module_dirname + "\\vendor\\sheenbidi\\Source";
+
+    // ── Audio codecs: Ogg Opus + Ogg Vorbis (decode and encode) ─────────
+    // Vendored Xiph libraries (BSD-3-Clause): libopus (float build, no SIMD),
+    // libogg, opusfile (no HTTP), libvorbis (+ vorbisenc, vorbisfile).
+    // vendor\ holds exactly the compiled subset, so every .c in these
+    // directories is built. Compiled into the extension, they need nothing
+    // from the PHP build or static-php-cli.
+    var vio_codec_dirs = [
+        "vendor\\opus\\src", "vendor\\opus\\celt", "vendor\\opus\\silk", "vendor\\opus\\silk\\float",
+        "vendor\\ogg\\src", "vendor\\opusfile\\src", "vendor\\vorbis\\lib"
+    ];
+    for (var vio_cdi = 0; vio_cdi < vio_codec_dirs.length; vio_cdi++) {
+        var vio_cdir = FSO.GetFolder(configure_module_dirname + "\\" + vio_codec_dirs[vio_cdi]);
+        for (var vio_cfe = new Enumerator(vio_cdir.Files); !vio_cfe.atEnd(); vio_cfe.moveNext()) {
+            var vio_cfn = vio_cfe.item().Name;
+            if (/\.c$/i.test(vio_cfn)) {
+                vio_sources += " " + vio_codec_dirs[vio_cdi] + "\\" + vio_cfn;
+            }
+        }
+    }
+    // Public headers for everyone; the private libopus directories (celt,
+    // silk, silk\float) are needed by its own sources only.
+    vio_cflags += " /DOPUS_BUILD /DUSE_ALLOCA /DOPUS_EXPORT= " +
+        "/I" + configure_module_dirname + "\\vendor\\opus\\include " +
+        "/I" + configure_module_dirname + "\\vendor\\opus " +
+        "/I" + configure_module_dirname + "\\vendor\\opus\\celt " +
+        "/I" + configure_module_dirname + "\\vendor\\opus\\silk " +
+        "/I" + configure_module_dirname + "\\vendor\\opus\\silk\\float " +
+        "/I" + configure_module_dirname + "\\vendor\\ogg\\include " +
+        "/I" + configure_module_dirname + "\\vendor\\opusfile\\include " +
+        "/I" + configure_module_dirname + "\\vendor\\vorbis\\include";
 
     // ── GLFW detection ─────────────────────────────────────────────
     if (PHP_GLFW != "no") {

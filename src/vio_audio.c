@@ -7,6 +7,7 @@
 #endif
 
 #include "vio_audio.h"
+#include "vio_audio_codec.h"
 
 /* ── Global audio state ──────────────────────────────────────────── */
 
@@ -48,6 +49,8 @@ static zend_object *vio_sound_create_object(zend_class_entry *ce)
 
     snd->loaded  = 0;
     snd->playing = 0;
+    snd->source  = NULL;
+    snd->data    = NULL;
 
     zend_object_std_init(&snd->std, ce);
     object_properties_init(&snd->std, ce);
@@ -63,6 +66,14 @@ static void vio_sound_free_object(zend_object *obj)
     if (snd->loaded) {
         ma_sound_uninit(&snd->sound);
         snd->loaded = 0;
+    }
+    if (snd->source) {
+        vio_audio_source_close(snd->source);
+        snd->source = NULL;
+    }
+    if (snd->data) {
+        zend_string_release(snd->data);
+        snd->data = NULL;
     }
 
     zend_object_std_dtor(&snd->std);

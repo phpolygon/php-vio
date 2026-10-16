@@ -34,6 +34,8 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_shader_compiler.h"
 #include "src/vio_shader_reflect.h"
 #include "src/vio_audio.h"
+#include "src/vio_audio_codec.h"
+#include <opus.h>
 #include "src/vio_render_target.h"
 #include "src/vio_shader_cache.h"
 #include "src/vio_texfmt.h"
@@ -8834,6 +8836,33 @@ ZEND_FUNCTION(vio_thermal_state)
 
 /* ── Audio functions ──────────────────────────────────────────────── */
 
+/* Builds a VioSound that decodes `data` (ownership moves to the sound). */
+static void vio_audio_sound_from_bytes(zend_string *data, const char *label, zval *return_value)
+{
+    vio_audio_source *src = NULL;
+    ma_result result = vio_audio_source_open_memory(ZSTR_VAL(data), ZSTR_LEN(data), ma_format_f32, &src);
+    if (result != MA_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Failed to load audio file \"%s\" (error %d)", label, result);
+        zend_string_release(data);
+        RETURN_FALSE;
+    }
+
+    zval snd_zval;
+    object_init_ex(&snd_zval, vio_sound_ce);
+    vio_sound_object *snd = Z_VIO_SOUND_P(&snd_zval);
+    snd->source = src;   /* freed by the object from here on */
+    snd->data = data;
+
+    result = ma_sound_init_from_data_source(&vio_audio.engine, vio_audio_source_ds(src), 0, NULL, &snd->sound);
+    if (result != MA_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Failed to load audio file \"%s\" (error %d)", label, result);
+        zval_ptr_dtor(&snd_zval);
+        RETURN_FALSE;
+    }
+    snd->loaded = 1;
+    RETURN_COPY_VALUE(&snd_zval);
+}
+
 ZEND_FUNCTION(vio_audio_load)
 {
     char *path;
@@ -8848,6 +8877,34 @@ ZEND_FUNCTION(vio_audio_load)
         if (vio_audio_engine_init() != 0) {
             php_error_docref(NULL, E_WARNING, "Failed to initialize audio engine");
             RETURN_FALSE;
+        }
+    }
+
+    /* Ogg (Vorbis/Opus) and stream-wrapper paths (phar://, ...) are decoded
+     * from memory; miniaudio's file path keeps WAV/FLAC/MP3 on disk. */
+    {
+        zend_string *data = NULL;
+        int wrapper = strstr(path, "://") != NULL;
+        php_stream *st = php_stream_open_wrapper(path, "rb", 0, NULL);
+        if (st) {
+            unsigned char head[64];
+            ssize_t n = php_stream_read(st, (char *)head, sizeof(head));
+            vio_audio_format fmt = vio_audio_sniff(head, n > 0 ? (size_t)n : 0);
+            if (wrapper || fmt == VIO_AUDIO_FMT_OPUS || fmt == VIO_AUDIO_FMT_VORBIS) {
+                if (php_stream_seek(st, 0, SEEK_SET) == 0) {
+                    data = php_stream_copy_to_mem(st, PHP_STREAM_COPY_ALL, 0);
+                }
+                if (!data) {
+                    php_stream_close(st);
+                    php_error_docref(NULL, E_WARNING, "Failed to load audio file \"%s\" (cannot read it)", path);
+                    RETURN_FALSE;
+                }
+            }
+            php_stream_close(st);
+        }
+        if (data) {
+            vio_audio_sound_from_bytes(data, path, return_value);
+            return;
         }
     }
 
@@ -9023,6 +9080,290 @@ ZEND_FUNCTION(vio_audio_listener)
 
     ma_engine_listener_set_position(&vio_audio.engine, 0, (float)x, (float)y, (float)z);
     ma_engine_listener_set_direction(&vio_audio.engine, 0, (float)fx, (float)fy, (float)fz);
+}
+
+ZEND_FUNCTION(vio_audio_load_data)
+{
+    zend_string *data;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(data)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (ZSTR_LEN(data) == 0) {
+        zend_argument_value_error(1, "must not be empty");
+        RETURN_THROWS();
+    }
+    if (!vio_audio.initialized && vio_audio_engine_init() != 0) {
+        php_error_docref(NULL, E_WARNING, "Failed to initialize audio engine");
+        RETURN_FALSE;
+    }
+    vio_audio_sound_from_bytes(zend_string_copy(data), "(memory)", return_value);
+}
+
+ZEND_FUNCTION(vio_audio_formats)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    zval decode, encode, versions;
+    array_init(&decode);
+    add_next_index_string(&decode, "wav");
+    add_next_index_string(&decode, "flac");
+    add_next_index_string(&decode, "mp3");
+    add_next_index_string(&decode, "vorbis");
+    add_next_index_string(&decode, "opus");
+    array_init(&encode);
+    add_next_index_string(&encode, "opus");
+    add_next_index_string(&encode, "vorbis");
+    array_init(&versions);
+    add_assoc_string(&versions, "opus", (char *)vio_audio_opus_version());
+    add_assoc_string(&versions, "vorbis", (char *)vio_audio_vorbis_version());
+
+    array_init(return_value);
+    add_assoc_zval(return_value, "decode", &decode);
+    add_assoc_zval(return_value, "encode", &encode);
+    add_assoc_zval(return_value, "versions", &versions);
+}
+
+static zval *vio_opt(HashTable *ht, const char *key)
+{
+    return ht ? zend_hash_str_find_deref(ht, key, strlen(key)) : NULL;
+}
+
+/* Opens a decoder for vio_audio_info/decode: $source is a path or, with
+ * ['data' => true], the bytes. Returns the bytes the decoder reads (to be
+ * released after closing it) or NULL after a warning. */
+static zend_string *vio_audio_open_source(zend_string *source, HashTable *opts, ma_format fmt, vio_audio_source **src)
+{
+    zval *zd = vio_opt(opts, "data");
+    zend_string *data;
+    ma_result result;
+
+    if (zd && zend_is_true(zd)) {
+        data = zend_string_copy(source);
+    } else {
+        php_stream *st = php_stream_open_wrapper(ZSTR_VAL(source), "rb", REPORT_ERRORS, NULL);
+        if (!st) return NULL;
+        data = php_stream_copy_to_mem(st, PHP_STREAM_COPY_ALL, 0);
+        php_stream_close(st);
+        if (!data) {
+            php_error_docref(NULL, E_WARNING, "\"%s\" is empty", ZSTR_VAL(source));
+            return NULL;
+        }
+    }
+    result = vio_audio_source_open_memory(ZSTR_VAL(data), ZSTR_LEN(data), fmt, src);
+    if (result != MA_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "Cannot decode audio (unsupported or corrupt data, error %d)", result);
+        zend_string_release(data);
+        return NULL;
+    }
+    return data;
+}
+
+static void vio_audio_info_array(vio_audio_source *src, zval *arr)
+{
+    vio_audio_source_info info;
+    vio_audio_source_get_info(src, &info);
+    add_assoc_string(arr, "format", (char *)vio_audio_format_name(info.format));
+    add_assoc_long(arr, "channels", (zend_long)info.channels);
+    add_assoc_long(arr, "sample_rate", (zend_long)info.sample_rate);
+    add_assoc_long(arr, "input_sample_rate", (zend_long)info.input_sample_rate);
+    add_assoc_long(arr, "frames", (zend_long)info.frames);
+    add_assoc_double(arr, "duration", info.sample_rate ? (double)info.frames / (double)info.sample_rate : 0.0);
+}
+
+ZEND_FUNCTION(vio_audio_info)
+{
+    zend_string *source;
+    HashTable *opts = NULL;
+    vio_audio_source *src = NULL;
+    zend_string *data;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STR(source)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+
+    data = vio_audio_open_source(source, opts, ma_format_s16, &src);
+    if (!data) RETURN_FALSE;
+    array_init(return_value);
+    vio_audio_info_array(src, return_value);
+    vio_audio_source_close(src);
+    zend_string_release(data);
+}
+
+ZEND_FUNCTION(vio_audio_decode)
+{
+    zend_string *source;
+    HashTable *opts = NULL;
+    vio_audio_source *src = NULL;
+    zend_string *data, *pcm;
+    ma_format fmt = ma_format_s16;
+    zval *zf;
+    size_t frame_bytes, cap, used = 0;
+    vio_audio_source_info info;
+    ma_result r = MA_SUCCESS;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STR(source)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zf = vio_opt(opts, "format");
+    if (zf) {
+        if (Z_TYPE_P(zf) == IS_STRING && zend_string_equals_literal(Z_STR_P(zf), "f32")) {
+            fmt = ma_format_f32;
+        } else if (!(Z_TYPE_P(zf) == IS_STRING && zend_string_equals_literal(Z_STR_P(zf), "s16"))) {
+            zend_argument_value_error(2, "option \"format\" must be \"s16\" or \"f32\"");
+            RETURN_THROWS();
+        }
+    }
+
+    data = vio_audio_open_source(source, opts, fmt, &src);
+    if (!data) RETURN_FALSE;
+    vio_audio_source_get_info(src, &info);
+    frame_bytes = (size_t)info.channels * (fmt == ma_format_f32 ? 4 : 2);
+    cap = (info.frames ? (size_t)info.frames : (size_t)info.sample_rate) * frame_bytes;
+    if (cap < frame_bytes * 4096) cap = frame_bytes * 4096;
+    pcm = zend_string_alloc(cap, 0);
+
+    while (r == MA_SUCCESS) {
+        ma_uint64 got = 0;
+        size_t want;
+        if (cap - used < frame_bytes * 4096) {
+            cap *= 2;
+            pcm = zend_string_extend(pcm, cap, 0);
+        }
+        want = (cap - used) / frame_bytes;
+        r = ma_data_source_read_pcm_frames(vio_audio_source_ds(src), ZSTR_VAL(pcm) + used, want, &got);
+        used += (size_t)got * frame_bytes;
+        if (got == 0 && r == MA_SUCCESS) break;
+    }
+    vio_audio_source_close(src);
+    zend_string_release(data);
+    if (r != MA_SUCCESS && r != MA_AT_END) {
+        zend_string_efree(pcm);
+        php_error_docref(NULL, E_WARNING, "Decoding failed mid-stream (error %d)", r);
+        RETURN_FALSE;
+    }
+    pcm = zend_string_truncate(pcm, used, 0);
+    ZSTR_VAL(pcm)[used] = '\0';
+
+    array_init(return_value);
+    info.frames = (ma_uint64)(used / frame_bytes);
+    add_assoc_string(return_value, "format", (char *)vio_audio_format_name(info.format));
+    add_assoc_long(return_value, "channels", (zend_long)info.channels);
+    add_assoc_long(return_value, "sample_rate", (zend_long)info.sample_rate);
+    add_assoc_long(return_value, "input_sample_rate", (zend_long)info.input_sample_rate);
+    add_assoc_long(return_value, "frames", (zend_long)info.frames);
+    add_assoc_double(return_value, "duration", info.sample_rate ? (double)info.frames / (double)info.sample_rate : 0.0);
+    add_assoc_str(return_value, "pcm", pcm);
+}
+
+static int vio_opt_long(HashTable *opts, const char *key, zend_long def, zend_long *out)
+{
+    zval *z = vio_opt(opts, key);
+    if (!z) { *out = def; return 1; }
+    if (Z_TYPE_P(z) != IS_LONG) {
+        zend_argument_type_error(5, "option \"%s\" must be of type int, %s given", key, zend_zval_value_name(z));
+        return 0;
+    }
+    *out = Z_LVAL_P(z);
+    return 1;
+}
+
+ZEND_FUNCTION(vio_audio_encode)
+{
+    zend_string *pcm;
+    zend_long rate, channels;
+    zend_string *codec = NULL;
+    HashTable *opts = NULL;
+    vio_audio_bytes out;
+    char err[256] = {0};
+    int rc;
+    size_t frames;
+
+    ZEND_PARSE_PARAMETERS_START(3, 5)
+        Z_PARAM_STR(pcm)
+        Z_PARAM_LONG(rate)
+        Z_PARAM_LONG(channels)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STR(codec)
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (channels < 1 || channels > 2) {
+        zend_argument_value_error(3, "must be 1 or 2");
+        RETURN_THROWS();
+    }
+    if (ZSTR_LEN(pcm) % (size_t)(2 * channels) != 0) {
+        zend_argument_value_error(1, "length must be a multiple of 2 * $channels bytes (interleaved signed 16-bit)");
+        RETURN_THROWS();
+    }
+    frames = ZSTR_LEN(pcm) / (size_t)(2 * channels);
+
+    if (!codec || zend_string_equals_literal(codec, "opus")) {
+        vio_opus_encode_options o;
+        zend_long v;
+        zval *z;
+        memset(&o, 0, sizeof(o));
+        o.application = OPUS_APPLICATION_AUDIO;
+        o.signal = OPUS_AUTO;
+        if (!vio_opt_long(opts, "bitrate", 0, &v)) RETURN_THROWS();
+        o.bitrate = (int)v;
+        if (!vio_opt_long(opts, "complexity", 10, &v)) RETURN_THROWS();
+        o.complexity = (int)v;
+        if (!vio_opt_long(opts, "frame_ms", 20, &v)) RETURN_THROWS();
+        o.frame_ms = (int)v;
+        if (!vio_opt_long(opts, "serial", 0, &v)) RETURN_THROWS();
+        o.serial = (uint32_t)v;
+        z = vio_opt(opts, "vbr");
+        o.vbr = z ? zend_is_true(z) : 1;
+        z = vio_opt(opts, "application");
+        if (z) {
+            if (Z_TYPE_P(z) == IS_STRING && zend_string_equals_literal(Z_STR_P(z), "voip")) o.application = OPUS_APPLICATION_VOIP;
+            else if (Z_TYPE_P(z) == IS_STRING && zend_string_equals_literal(Z_STR_P(z), "lowdelay")) o.application = OPUS_APPLICATION_RESTRICTED_LOWDELAY;
+            else if (!(Z_TYPE_P(z) == IS_STRING && zend_string_equals_literal(Z_STR_P(z), "audio"))) {
+                zend_argument_value_error(5, "option \"application\" must be \"audio\", \"voip\" or \"lowdelay\"");
+                RETURN_THROWS();
+            }
+        }
+        z = vio_opt(opts, "signal");
+        if (z) {
+            if (Z_TYPE_P(z) == IS_STRING && zend_string_equals_literal(Z_STR_P(z), "voice")) o.signal = OPUS_SIGNAL_VOICE;
+            else if (Z_TYPE_P(z) == IS_STRING && zend_string_equals_literal(Z_STR_P(z), "music")) o.signal = OPUS_SIGNAL_MUSIC;
+            else if (!(Z_TYPE_P(z) == IS_STRING && zend_string_equals_literal(Z_STR_P(z), "auto"))) {
+                zend_argument_value_error(5, "option \"signal\" must be \"auto\", \"voice\" or \"music\"");
+                RETURN_THROWS();
+            }
+        }
+        rc = vio_audio_encode_opus((const int16_t *)ZSTR_VAL(pcm), frames, (int)rate, (int)channels, &o, &out, err, sizeof(err));
+    } else if (zend_string_equals_literal(codec, "vorbis")) {
+        vio_vorbis_encode_options o;
+        zend_long v;
+        zval *z;
+        memset(&o, 0, sizeof(o));
+        o.quality = 0.5f;
+        z = vio_opt(opts, "quality");
+        if (z) o.quality = (float)zval_get_double(z);
+        if (!vio_opt_long(opts, "bitrate", 0, &v)) RETURN_THROWS();
+        o.bitrate = (int)v;
+        if (!vio_opt_long(opts, "serial", 0, &v)) RETURN_THROWS();
+        o.serial = (uint32_t)v;
+        rc = vio_audio_encode_vorbis((const int16_t *)ZSTR_VAL(pcm), frames, (int)rate, (int)channels, &o, &out, err, sizeof(err));
+    } else {
+        zend_argument_value_error(4, "must be \"opus\" or \"vorbis\"");
+        RETURN_THROWS();
+    }
+
+    if (rc != 0) {
+        php_error_docref(NULL, E_WARNING, "%s", err);
+        RETURN_FALSE;
+    }
+    RETVAL_STRINGL((const char *)out.data, out.len);
+    vio_audio_bytes_free(&out);
 }
 
 /* ── Input injection functions ────────────────────────────────────────
