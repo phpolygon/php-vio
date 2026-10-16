@@ -1730,6 +1730,38 @@ function vio_audio_position(VioSound $sound, float $x, float $y, float $z): void
 function vio_audio_listener(float $x, float $y, float $z, float $fx, float $fy, float $fz): void {}
 
 /**
+ * Initialize the audio engine explicitly, before the first sound (vio_audio_load*
+ * otherwise initializes it lazily with the default backends).
+ *
+ * Options: 'backends' => list of miniaudio backends to try in order:
+ *   'wasapi', 'dsound', 'winmm', 'coreaudio', 'sndio', 'audio4', 'oss', 'pulseaudio',
+ *   'alsa', 'jack', 'aaudio', 'opensl', 'webaudio', 'null'.
+ * 'null' is a device without hardware: it consumes audio on its own clock in real
+ * time, so loading, decoding and mixing run exactly as with a sound card (headless
+ * servers, CI). Without 'backends' the environment variable VIO_AUDIO_BACKEND
+ * (comma list, e.g. "null" or "pulseaudio,alsa,null") is used, else miniaudio's
+ * default order.
+ *
+ * @param array $options ['backends' => list<string>]
+ * @return bool true when the engine runs; false (with a warning) when it could not
+ *   start, or when it already runs and 'backends' was given
+ */
+function vio_audio_init(array $options = []): bool {}
+
+/**
+ * The backend the audio engine plays through ('wasapi', 'coreaudio', 'pulseaudio',
+ * 'alsa', 'null', ...), or false before the engine is initialized.
+ */
+function vio_audio_backend(): string|false {}
+
+/**
+ * The miniaudio backends compiled into this build, in default priority order.
+ *
+ * @return list<string>
+ */
+function vio_audio_backends(): array {}
+
+/**
  * Load a sound from encoded bytes in memory (any format vio_audio_load() reads).
  * The bytes are kept by the sound until it is freed.
  *

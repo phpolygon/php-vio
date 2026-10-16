@@ -980,7 +980,8 @@ jobs:
             tests/render3d/238_generate_mipmaps_many_per_frame_all_backends.phpt `
             tests/media/241_audio_decode_opus_vorbis.phpt `
             tests/media/242_audio_encode_opus_vorbis.phpt `
-            tests/media/243_audio_load_opus_vorbis.phpt
+            tests/media/243_audio_load_opus_vorbis.phpt `
+            tests/media/244_audio_init_backends.phpt
 
       - name: Package binary
         shell: pwsh

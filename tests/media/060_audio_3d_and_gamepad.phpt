@@ -6,6 +6,8 @@ vio
 <?php
 require __DIR__ . '/../skipif_gl.inc';
 ?>
+--ENV--
+VIO_AUDIO_BACKEND=null
 --FILE--
 <?php
 $ctx = vio_create("opengl", ["width" => 64, "height" => 64, "headless" => true]);

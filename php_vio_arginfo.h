@@ -746,6 +746,16 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_listener, 0, 6, IS_VOI
 	ZEND_ARG_TYPE_INFO(0, forward_z, IS_DOUBLE, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_init, 0, 0, _IS_BOOL, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_audio_backend, 0, 0, MAY_BE_STRING|MAY_BE_FALSE)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_backends, 0, 0, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_audio_load_data, 0, 1, VioSound, MAY_BE_FALSE)
 	ZEND_ARG_TYPE_INFO(0, data, IS_STRING, 0)
 ZEND_END_ARG_INFO()
@@ -1262,6 +1272,9 @@ ZEND_FUNCTION(vio_audio_volume);
 ZEND_FUNCTION(vio_audio_playing);
 ZEND_FUNCTION(vio_audio_position);
 ZEND_FUNCTION(vio_audio_listener);
+ZEND_FUNCTION(vio_audio_init);
+ZEND_FUNCTION(vio_audio_backend);
+ZEND_FUNCTION(vio_audio_backends);
 ZEND_FUNCTION(vio_audio_load_data);
 ZEND_FUNCTION(vio_audio_formats);
 ZEND_FUNCTION(vio_audio_info);
@@ -1481,6 +1494,9 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_audio_playing, arginfo_vio_audio_playing)
 	ZEND_FE(vio_audio_position, arginfo_vio_audio_position)
 	ZEND_FE(vio_audio_listener, arginfo_vio_audio_listener)
+	ZEND_FE(vio_audio_init, arginfo_vio_audio_init)
+	ZEND_FE(vio_audio_backend, arginfo_vio_audio_backend)
+	ZEND_FE(vio_audio_backends, arginfo_vio_audio_backends)
 	ZEND_FE(vio_audio_load_data, arginfo_vio_audio_load_data)
 	ZEND_FE(vio_audio_formats, arginfo_vio_audio_formats)
 	ZEND_FE(vio_audio_info, arginfo_vio_audio_info)

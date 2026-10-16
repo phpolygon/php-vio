@@ -9082,6 +9082,78 @@ ZEND_FUNCTION(vio_audio_listener)
     ma_engine_listener_set_direction(&vio_audio.engine, 0, (float)fx, (float)fy, (float)fz);
 }
 
+ZEND_FUNCTION(vio_audio_init)
+{
+    HashTable *opts = NULL;
+    ma_backend backends[16];
+    ma_uint32 count = 0;
+    zval *zb;
+
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zb = opts ? zend_hash_str_find_deref(opts, "backends", sizeof("backends") - 1) : NULL;
+    if (zb) {
+        zval *item;
+        if (Z_TYPE_P(zb) != IS_ARRAY) {
+            zend_argument_type_error(1, "option \"backends\" must be of type array, %s given", zend_zval_value_name(zb));
+            RETURN_THROWS();
+        }
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zb), item) {
+            ZVAL_DEREF(item);
+            if (Z_TYPE_P(item) != IS_STRING
+                || !vio_audio_backend_from_name(Z_STRVAL_P(item), Z_STRLEN_P(item), &backends[count])) {
+                zend_argument_value_error(1, "option \"backends\" contains an unknown audio backend (known: wasapi, dsound, winmm, coreaudio, sndio, audio4, oss, pulseaudio, alsa, jack, aaudio, opensl, webaudio, null)");
+                RETURN_THROWS();
+            }
+            if (++count == 16) break;
+        } ZEND_HASH_FOREACH_END();
+        if (count == 0) {
+            zend_argument_value_error(1, "option \"backends\" must not be empty");
+            RETURN_THROWS();
+        }
+    }
+
+    if (vio_audio.initialized) {
+        if (count > 0) {
+            const char *cur = vio_audio_engine_backend();
+            php_error_docref(NULL, E_WARNING, "Audio engine already initialized (backend \"%s\"); vio_audio_init() must come before the first sound",
+                             cur ? cur : "?");
+            RETURN_FALSE;
+        }
+        RETURN_TRUE;
+    }
+    if (vio_audio_engine_init_ex(backends, count) != 0) {
+        php_error_docref(NULL, E_WARNING, "Failed to initialize audio engine");
+        RETURN_FALSE;
+    }
+    RETURN_TRUE;
+}
+
+ZEND_FUNCTION(vio_audio_backend)
+{
+    const char *name;
+    ZEND_PARSE_PARAMETERS_NONE();
+    name = vio_audio_engine_backend();
+    if (!name) RETURN_FALSE;
+    RETURN_STRING(name);
+}
+
+ZEND_FUNCTION(vio_audio_backends)
+{
+    ma_backend list[MA_BACKEND_COUNT];
+    size_t n = 0, i;
+    ZEND_PARSE_PARAMETERS_NONE();
+    array_init(return_value);
+    if (ma_get_enabled_backends(list, MA_BACKEND_COUNT, &n) != MA_SUCCESS) return;
+    for (i = 0; i < n; i++) {
+        if (list[i] == ma_backend_custom) continue;
+        add_next_index_string(return_value, vio_audio_backend_name(list[i]));
+    }
+}
+
 ZEND_FUNCTION(vio_audio_load_data)
 {
     zend_string *data;

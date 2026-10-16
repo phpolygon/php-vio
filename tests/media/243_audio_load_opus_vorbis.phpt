@@ -2,6 +2,11 @@
 vio_audio_load / vio_audio_load_data play Ogg Opus, Ogg Vorbis and stream-wrapper paths
 --EXTENSIONS--
 vio
+phar
+--INI--
+phar.readonly=0
+--ENV--
+VIO_AUDIO_BACKEND=null
 --FILE--
 <?php
 $fx = __DIR__ . '/fixtures';
@@ -34,14 +39,40 @@ vio_audio_resume($s);
 vio_audio_stop($s);
 var_dump(vio_audio_playing($s));
 // the audio thread decodes a 0.5 s file to its end and the sound stops by itself
-$o = $sounds['opus bytes'];
-vio_audio_play($o, ['volume' => 0.0]);
-$t = microtime(true);
-while (vio_audio_playing($o) && microtime(true) - $t < 5.0) usleep(10000);
-var_dump(!vio_audio_playing($o), microtime(true) - $t > 0.3);
+function play_until_end(VioSound $s): float {
+    vio_audio_play($s, ['volume' => 0.0]);
+    $t = microtime(true);
+    while (vio_audio_playing($s) && microtime(true) - $t < 5.0) usleep(10000);
+    if (vio_audio_playing($s)) return -1.0;
+    return microtime(true) - $t;
+}
+// the null backend clocks the mixer in real time: a 0.5 s source is pulled
+// through decoder and mixer for ~0.5 s and then stops by itself
+var_dump(vio_audio_backend());
+$n2 = 22050;
+$wavHalf = 'RIFF' . pack('V', 36 + $n2 * 2) . 'WAVE' . 'fmt ' . pack('VvvVVvv', 16, 1, 1, 44100, 88200, 2, 16)
+         . 'data' . pack('V', $n2 * 2) . str_repeat("\x00\x00", $n2);
+foreach (['wav (control)' => vio_audio_load_data($wavHalf), 'opus' => $sounds['opus bytes'], 'vorbis' => $sounds['vorbis file']] as $name => $snd) {
+    $t = play_until_end($snd);
+    echo $name, ': ', $t > 0.35 && $t < 3.0 ? 'played ~0.5 s' : sprintf('%.3f s', $t), "\n";
+}
 vio_audio_play($sounds['vorbis bytes'], ['volume' => 0.0]);
 usleep(20000);
 unset($sounds); // frees sounds while one plays
+
+// PHAR: info, decode and load read through the stream wrapper
+$pharPath = sys_get_temp_dir() . '/vio_audio_243_' . getmypid() . '.phar';
+@unlink($pharPath);
+$phar = new Phar($pharPath);
+$phar['voice/line.opus'] = file_get_contents("$fx/tone440_mono_24k.opus");
+$phar['music/theme.ogg'] = file_get_contents("$fx/tone440_stereo_44k.ogg");
+unset($phar);
+$i = vio_audio_info("phar://$pharPath/voice/line.opus");
+echo 'phar opus: ', $i['format'], ' ', $i['frames'], "\n";
+$d = vio_audio_decode("phar://$pharPath/music/theme.ogg");
+echo 'phar vorbis: ', $d['format'], ' ', $d['channels'], ' ', strlen($d['pcm']), "\n";
+var_dump(vio_audio_load("phar://$pharPath/voice/line.opus") instanceof VioSound);
+Phar::unlinkArchive($pharPath);
 
 // errors
 var_dump(vio_audio_load_data('not audio at all'));
@@ -64,7 +95,12 @@ wav data://: VioSound
 bool(true)
 bool(false)
 bool(false)
-bool(true)
+string(4) "null"
+wav (control): played ~0.5 s
+opus: played ~0.5 s
+vorbis: played ~0.5 s
+phar opus: opus 24000
+phar vorbis: vorbis 2 88200
 bool(true)
 
 Warning: vio_audio_load_data(): Failed to load audio file "(memory)" (error %i) in %s on line %d

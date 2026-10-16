@@ -2,6 +2,8 @@
 VioSound class and audio API basics
 --EXTENSIONS--
 vio
+--ENV--
+VIO_AUDIO_BACKEND=null
 --FILE--
 <?php
 // VioSound class should exist

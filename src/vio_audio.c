@@ -13,16 +13,94 @@
 
 vio_audio_state vio_audio = {0};
 
-int vio_audio_engine_init(void)
+/* Names used by vio_audio_init(['backends' => ...]) / VIO_AUDIO_BACKEND.
+ * The ma_backend enum is identical across the miniaudio 0.11 line. */
+static const struct { const char *name; ma_backend backend; } vio_audio_backend_names[] = {
+    { "wasapi", ma_backend_wasapi },     { "dsound", ma_backend_dsound },
+    { "winmm", ma_backend_winmm },       { "coreaudio", ma_backend_coreaudio },
+    { "sndio", ma_backend_sndio },       { "audio4", ma_backend_audio4 },
+    { "oss", ma_backend_oss },           { "pulseaudio", ma_backend_pulseaudio },
+    { "alsa", ma_backend_alsa },         { "jack", ma_backend_jack },
+    { "aaudio", ma_backend_aaudio },     { "opensl", ma_backend_opensl },
+    { "webaudio", ma_backend_webaudio }, { "null", ma_backend_null },
+};
+
+int vio_audio_backend_from_name(const char *name, size_t len, ma_backend *out)
 {
+    size_t i;
+    for (i = 0; i < sizeof(vio_audio_backend_names) / sizeof(vio_audio_backend_names[0]); i++) {
+        const char *n = vio_audio_backend_names[i].name;
+        if (zend_binary_strncasecmp(n, strlen(n), name, len, len) == 0 && strlen(n) == len) {
+            *out = vio_audio_backend_names[i].backend;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+const char *vio_audio_backend_name(ma_backend backend)
+{
+    size_t i;
+    for (i = 0; i < sizeof(vio_audio_backend_names) / sizeof(vio_audio_backend_names[0]); i++) {
+        if (vio_audio_backend_names[i].backend == backend) return vio_audio_backend_names[i].name;
+    }
+    return "custom";
+}
+
+/* VIO_AUDIO_BACKEND="null" or "pulseaudio,alsa,null": the backends to try, in order. */
+static ma_uint32 vio_audio_backends_from_env(ma_backend *out, ma_uint32 cap)
+{
+    const char *env = getenv("VIO_AUDIO_BACKEND");
+    ma_uint32 count = 0;
+    if (!env) return 0;
+    while (*env && count < cap) {
+        const char *end = env;
+        while (*end && *end != ',' && *end != ' ') end++;
+        if (end > env && !vio_audio_backend_from_name(env, (size_t)(end - env), &out[count])) {
+            php_error_docref(NULL, E_WARNING, "VIO_AUDIO_BACKEND: unknown audio backend \"%.*s\" ignored",
+                             (int)(end - env), env);
+        } else if (end > env) {
+            count++;
+        }
+        env = *end ? end + 1 : end;
+    }
+    return count;
+}
+
+int vio_audio_engine_init_ex(const ma_backend *backends, ma_uint32 count)
+{
+    ma_backend env_backends[16];
+    ma_engine_config config;
+    ma_result result;
+
     if (vio_audio.initialized) return 0;
 
-    ma_engine_config config = ma_engine_config_init();
+    if (count == 0) {
+        count = vio_audio_backends_from_env(env_backends, 16);
+        backends = env_backends;
+    }
+
+    config = ma_engine_config_init();
     config.channels   = 2;
     config.sampleRate = 44100;
 
-    ma_result result = ma_engine_init(&config, &vio_audio.engine);
+    /* Without a backend list the engine opens its own context (miniaudio's
+     * default order, unchanged). With one, vio owns the context: pContext
+     * sits at the same offset in every 0.11 ma_engine_config. */
+    if (count > 0) {
+        if (ma_context_init(backends, count, NULL, &vio_audio.context) != MA_SUCCESS) {
+            return -1;
+        }
+        vio_audio.has_context = 1;
+        config.pContext = &vio_audio.context;
+    }
+
+    result = ma_engine_init(&config, &vio_audio.engine);
     if (result != MA_SUCCESS) {
+        if (vio_audio.has_context) {
+            ma_context_uninit(&vio_audio.context);
+            vio_audio.has_context = 0;
+        }
         return -1;
     }
 
@@ -30,11 +108,31 @@ int vio_audio_engine_init(void)
     return 0;
 }
 
+int vio_audio_engine_init(void)
+{
+    return vio_audio_engine_init_ex(NULL, 0);
+}
+
+const char *vio_audio_engine_backend(void)
+{
+    ma_device *dev;
+    if (!vio_audio.initialized) return NULL;
+    /* pContext is the first member of ma_device and backend follows the
+     * callbacks table in ma_context – same in every 0.11 release. */
+    dev = ma_engine_get_device(&vio_audio.engine);
+    if (!dev || !dev->pContext) return NULL;
+    return vio_audio_backend_name(dev->pContext->backend);
+}
+
 void vio_audio_engine_shutdown(void)
 {
     if (vio_audio.initialized) {
         ma_engine_uninit(&vio_audio.engine);
         vio_audio.initialized = 0;
+    }
+    if (vio_audio.has_context) {
+        ma_context_uninit(&vio_audio.context);
+        vio_audio.has_context = 0;
     }
 }
 
