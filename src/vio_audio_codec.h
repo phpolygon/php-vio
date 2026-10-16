@@ -15,7 +15,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "../vendor/miniaudio/miniaudio.h"
+#include "vio_miniaudio.h"
 
 typedef enum {
     VIO_AUDIO_FMT_UNKNOWN = 0,

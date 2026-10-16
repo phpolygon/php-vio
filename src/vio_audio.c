@@ -75,6 +75,18 @@ int vio_audio_engine_init_ex(const ma_backend *backends, ma_uint32 count)
 
     if (vio_audio.initialized) return 0;
 
+    /* The rename in vio_miniaudio.h makes a foreign miniaudio unreachable;
+     * should a build ever bypass it, refuse audio rather than run the
+     * engine against structs of another layout. */
+    if (!vio_miniaudio_version_matches()) {
+        ma_uint32 major = 0, minor = 0, revision = 0;
+        ma_version(&major, &minor, &revision);
+        php_error_docref(NULL, E_WARNING,
+            "miniaudio version mismatch: compiled against %s, linked %u.%u.%u - audio disabled",
+            MA_VERSION_STRING, (unsigned)major, (unsigned)minor, (unsigned)revision);
+        return -1;
+    }
+
     if (count == 0) {
         count = vio_audio_backends_from_env(env_backends, 16);
         backends = env_backends;
@@ -85,8 +97,9 @@ int vio_audio_engine_init_ex(const ma_backend *backends, ma_uint32 count)
     config.sampleRate = 44100;
 
     /* Without a backend list the engine opens its own context (miniaudio's
-     * default order, unchanged). With one, vio owns the context: pContext
-     * sits at the same offset in every 0.11 ma_engine_config. */
+     * default order, unchanged). With one, vio owns the context. ma_context
+     * and ma_engine_config are vio's own miniaudio's (vio_miniaudio.h), so
+     * their layout always matches the implementation that reads them. */
     if (count > 0) {
         if (ma_context_init(backends, count, NULL, &vio_audio.context) != MA_SUCCESS) {
             return -1;
