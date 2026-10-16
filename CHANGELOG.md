@@ -1,3 +1,10 @@
+## [2.34.1](https://github.com/phpolygon/php-vio/compare/v2.34.0...v2.34.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* **audio:** give php-vio's miniaudio its own symbol names (vio_ma_*) ([8ddb75a](https://github.com/phpolygon/php-vio/commit/8ddb75ae88fe82e5fbe14a293ad9b0073fa175a0)), closes [#errors](https://github.com/phpolygon/php-vio/issues/errors)
+
 # [2.34.0](https://github.com/phpolygon/php-vio/compare/v2.33.0...v2.34.0) (2026-10-16)
 
 
