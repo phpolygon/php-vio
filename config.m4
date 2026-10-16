@@ -432,7 +432,7 @@ if test "$PHP_VIO" != "no"; then
   dnl SheenBidi is vendored and compiled as a single UNITY translation unit
   dnl (Source/SheenBidi.c #include's every .c when SB_CONFIG_UNITY is set).
   dnl Its includes need both Headers/ (<SheenBidi/...>) and Source/ (<API/...>).
-  VIO_EXTRA_CFLAGS="-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DGL_SILENCE_DEPRECATION -DSB_CONFIG_UNITY -I@ext_srcdir@/vendor/glad/include -I@ext_srcdir@/include -I@ext_srcdir@/vendor/vma -I@ext_srcdir@/vendor/miniaudio -I@ext_srcdir@/vendor/sheenbidi/Headers -I@ext_srcdir@/vendor/sheenbidi/Source"
+  VIO_EXTRA_CFLAGS="-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DGL_SILENCE_DEPRECATION -DSB_CONFIG_UNITY -I@ext_srcdir@/vendor/glad/include -I@ext_srcdir@/include -I@ext_srcdir@/vendor/vma -I@ext_srcdir@/vendor/miniaudio -I@ext_srcdir@/vendor/sheenbidi/Headers -I@ext_srcdir@/vendor/sheenbidi/Source -I@ext_srcdir@/vendor/opus/include -I@ext_srcdir@/vendor/ogg/include -I@ext_srcdir@/vendor/opusfile/include -I@ext_srcdir@/vendor/vorbis/include"
 
   PHP_NEW_EXTENSION(vio,
     php_vio.c \
@@ -468,6 +468,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_shader_reflect.c \
     src/vio_tess_hlsl.c \
     src/vio_audio.c \
+    src/vio_audio_codec.c \
     src/vio_recorder.c \
     src/vio_stream.c \
     src/vio_thermal.c \
@@ -596,6 +597,37 @@ if test "$PHP_VIO" != "no"; then
         $VIO_FFX_CFLAGS $VIO_VULKAN_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
         shared_objects_vio, yes)
     fi
+  fi
+
+  dnl ── Audio codecs: Ogg Opus + Ogg Vorbis (decode and encode) ────────
+  dnl Vendored Xiph libraries (BSD-3-Clause): libopus (float build, no SIMD),
+  dnl libogg, opusfile (no HTTP), libvorbis (+ vorbisenc, vorbisfile).
+  dnl vendor/ holds exactly the compiled subset, so every .c in these
+  dnl directories is built. They are compiled into the extension and need no
+  dnl system library, so static-php-cli builds them with the rest of vio.
+  dnl Kept out of the PHP_NEW_EXTENSION list on purpose: static-php-cli strips
+  dnl "vendor/..." entries from that list when php-glfw is built alongside
+  dnl (to drop vio's copy of miniaudio/glad/stb); these have no duplicate there.
+  dnl -fvisibility=hidden + OPUS_EXPORT= keep the libopus/libogg/libvorbis symbols
+  dnl private, so a system copy pulled in by FFmpeg cannot bind to them (opusfile.h
+  dnl forces default visibility for its op_* API; nothing else defines those).
+  VIO_CODEC_SOURCES=""
+  for vio_codec_dir in opus/src opus/celt opus/silk opus/silk/float ogg/src opusfile/src vorbis/lib; do
+    for vio_codec_c in $ext_srcdir/vendor/$vio_codec_dir/*.c; do
+      VIO_CODEC_SOURCES="$VIO_CODEC_SOURCES vendor/$vio_codec_dir/`basename $vio_codec_c`"
+    done
+    PHP_ADD_BUILD_DIR($ext_builddir/vendor/$vio_codec_dir)
+  done
+  VIO_CODEC_CFLAGS="-w -fvisibility=hidden -DOPUS_BUILD -DVAR_ARRAYS -DHAVE_LRINTF -DOPUS_EXPORT= -I$ext_srcdir/vendor/opus -I$ext_srcdir/vendor/opus/celt -I$ext_srcdir/vendor/opus/silk -I$ext_srcdir/vendor/opus/silk/float -I$ext_srcdir/vendor/vorbis/lib"
+  if test "$ext_shared" != "shared" && test "$ext_shared" != "yes"; then
+    PHP_ADD_SOURCES_X($ext_dir, [$VIO_CODEC_SOURCES],
+      $VIO_CODEC_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED,
+      PHP_GLOBAL_OBJS)
+  fi
+  if test "$ext_shared" = "shared" || test "$ext_shared" = "yes"; then
+    PHP_ADD_SOURCES_X($ext_dir, [$VIO_CODEC_SOURCES],
+      $VIO_CODEC_CFLAGS $VIO_EXTRA_CFLAGS_RESOLVED -DZEND_COMPILE_DL_EXT=1,
+      shared_objects_vio, yes)
   fi
 
   dnl ── Cocoa platform source (macOS) ─────────────────────────────────

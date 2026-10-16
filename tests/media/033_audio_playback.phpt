@@ -2,6 +2,8 @@
 Audio playback lifecycle: load, play, pause, resume, stop, volume
 --EXTENSIONS--
 vio
+--ENV--
+VIO_AUDIO_BACKEND=null
 --FILE--
 <?php
 // Generate a minimal WAV file (44100Hz, mono, 16-bit, 0.1 sec silence)
