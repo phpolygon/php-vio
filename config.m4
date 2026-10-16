@@ -483,12 +483,12 @@ if test "$PHP_VIO" != "no"; then
     src/backends/vulkan/vio_vulkan_rt.c \
     src/backends/vulkan/vio_vulkan_cube.c \
     src/backends/vulkan/vio_vulkan_upscale.c \
+    src/vio_miniaudio_impl.c \
     vendor/glad/src/glad.c \
     vendor/stb/stb_image_impl.c \
     vendor/stb/stb_truetype_impl.c \
     vendor/stb/stb_rect_pack_impl.c \
     vendor/stb/stb_image_write_impl.c \
-    vendor/miniaudio/miniaudio_impl.c \
     vendor/sheenbidi/Source/SheenBidi.c,
     $ext_shared,, $VIO_EXTRA_CFLAGS)
 
@@ -689,7 +689,6 @@ if test "$PHP_VIO" != "no"; then
   PHP_ADD_BUILD_DIR($ext_builddir/src/backends/metal)
   PHP_ADD_BUILD_DIR($ext_builddir/vendor/glad/src)
   PHP_ADD_BUILD_DIR($ext_builddir/vendor/stb)
-  PHP_ADD_BUILD_DIR($ext_builddir/vendor/miniaudio)
   PHP_ADD_BUILD_DIR($ext_builddir/vendor/sheenbidi/Source)
 
   dnl ── C++ linker (needed for glslang/spirv-cross/VMA static libs) ─
