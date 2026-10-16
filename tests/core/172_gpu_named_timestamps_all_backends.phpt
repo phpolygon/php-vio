@@ -31,6 +31,7 @@ function run_backend(string $name): string {
     $pipe = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $VS, 'fragment' => $FS]), 'depth_test' => false, 'cull_mode' => VIO_CULL_NONE]);
 
     $limitOk = true;
+    $sum = ['heavy' => 0.0, 'light' => 0.0];
     for ($f = 0; $f < 8; $f++) {
         vio_begin($ctx);
         vio_bind_pipeline($ctx, $pipe);
@@ -48,13 +49,16 @@ function run_backend(string $name): string {
             if (vio_gpu_timestamp($ctx, 'over') !== false) $limitOk = false;
         }
         vio_end($ctx);
+        /* One frame alone is noise on a shared virtual GPU (CI macOS); compare the totals. */
+        $seen = vio_gpu_timings($ctx);
+        if (is_array($seen) && isset($seen['heavy'], $seen['light'])) { $sum['heavy'] += $seen['heavy']; $sum['light'] += $seen['light']; }
     }
     $t = vio_gpu_timings($ctx);
     $ft = vio_gpu_frame_time($ctx);
     if (!is_array($t) || array_slice(array_keys($t), 0, 3) !== ['heavy', 'light', 'dup']) $err[] = "keys " . json_encode($t);
     else {
         foreach ($t as $k => $v) if (!is_float($v) || $v < 0) $err[] = "$k = " . json_encode($v);
-        if (!($t['heavy'] > $t['light'])) $err[] = sprintf("heavy %.4f ms not above light %.4f ms", $t['heavy'], $t['light']);
+        if (!($sum['heavy'] > $sum['light'])) $err[] = sprintf("heavy %.4f ms not above light %.4f ms over the frames", $sum['heavy'], $sum['light']);
         if ($ft > 0 && array_sum($t) > $ft + 1e-3) $err[] = sprintf("sections %.4f ms exceed the frame %.4f ms", array_sum($t), $ft);
     }
     if (!$limitOk) $err[] = "32-mark limit not honoured";
