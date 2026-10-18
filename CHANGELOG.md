@@ -1,3 +1,10 @@
+# [2.35.0](https://github.com/phpolygon/php-vio/compare/v2.34.1...v2.35.0) (2026-10-18)
+
+
+### Features
+
+* **input:** register keypad key constants, declare vio_gpu_flush in the stub ([2e31fe9](https://github.com/phpolygon/php-vio/commit/2e31fe9e47a2035513ca61632db85550e11c8fc1))
+
 ## [2.34.1](https://github.com/phpolygon/php-vio/compare/v2.34.0...v2.34.1) (2026-10-16)
 
 
