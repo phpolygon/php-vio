@@ -67,6 +67,15 @@ function vio_begin(VioContext $context): void {}
 function vio_end(VioContext $context): void {}
 
 /**
+ * Block until the GPU has finished all submitted work (like glFinish): OpenGL
+ * glFinish, D3D11 event query, D3D12 fence wait, Metal waitUntilCompleted on the
+ * last presented command buffer. A no-op on Vulkan and the null backend. Use it
+ * for CPU-side timing or before reading results the GPU wrote; not needed per
+ * frame. Warns when the context is not initialized.
+ */
+function vio_gpu_flush(VioContext $context): void {}
+
+/**
  * Clear the framebuffer with a color.
  */
 function vio_clear(VioContext $context, float $r = 0.1, float $g = 0.1, float $b = 0.1, float $a = 1.0): void {}

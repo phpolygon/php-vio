@@ -17,6 +17,14 @@
 
 /* ── Vertex format enums ──────────────────────────────────────────── */
 
+/* VIO_UINT1..4 are deliberately NOT registered as PHP constants: vio_mesh()
+ * stores every vertex as 32-bit floats and its layout parser only knows
+ * VIO_FLOAT1..4, and the D3D / Vulkan input layouts are built from SPIR-V
+ * reflection, which yields FLOAT1..4 by component count. The UINT entries
+ * exist so the backend format tables (DXGI / VkFormat) are complete for a
+ * future integer vertex path; exposing them today would accept a layout
+ * that silently uploads floats. */
+
 typedef enum _vio_format {
     VIO_FLOAT1 = 1,
     VIO_FLOAT2 = 2,
@@ -125,6 +133,14 @@ typedef enum _vio_shader_format {
     VIO_SHADER_GLSL_RAW  = 4,  /* GLSL -> compile directly (OpenGL only, no SPIR-V) */
     VIO_SHADER_HLSL      = 5,  /* HLSL -> compile directly (D3D11/D3D12 only) */
 } vio_shader_format;
+
+/* VIO_SHADER_HLSL is backend-internal and deliberately not a PHP constant:
+ * vio_shader() always hands the backends SPIR-V (desc.format = GLSL), because
+ * the D3D input layout, cbuffer layout and sampler registers all come from
+ * SPIR-V reflection. Hand-written HLSL enters through the per-stage 'hlsl'
+ * override instead (VIO_FEATURE_HLSL_STAGE_OVERRIDE), which keeps the GLSL /
+ * SPIR-V stage for reflection. A whole-shader 'format' => 5 from PHP would
+ * reach the backends without SPIR-V and fail. */
 
 /* ── Texture filter / wrap ────────────────────────────────────────── */
 
