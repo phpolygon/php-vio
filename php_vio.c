@@ -8836,6 +8836,8 @@ ZEND_FUNCTION(vio_thermal_state)
 
 /* ── Audio functions ──────────────────────────────────────────────── */
 
+static int vio_audio_apply_play_options(vio_sound_object *snd, HashTable *ht);
+
 /* Builds a VioSound that decodes `data` (ownership moves to the sound). */
 static void vio_audio_sound_from_bytes(zend_string *data, const char *label, zval *return_value)
 {
@@ -8942,9 +8944,11 @@ ZEND_FUNCTION(vio_audio_play)
         return;
     }
 
-    /* Parse options */
+    /* Parse options; the spatial ones are validated first so a rejected
+     * call neither changes nor starts the sound. */
     if (options_ht) {
         zval *val;
+        if (!vio_audio_apply_play_options(snd, options_ht)) RETURN_THROWS();
         if ((val = zend_hash_str_find(options_ht, "volume", sizeof("volume") - 1)) != NULL) {
             ma_sound_set_volume(&snd->sound, (float)zval_get_double(val));
         }
@@ -9062,16 +9066,30 @@ ZEND_FUNCTION(vio_audio_position)
 
 ZEND_FUNCTION(vio_audio_listener)
 {
-    double x, y, z, fx, fy, fz;
+    double x, y, z, fx, fy, fz, ux = 0, uy = 0, uz = 0;
+    bool ux_null = 1, uy_null = 1, uz_null = 1;
 
-    ZEND_PARSE_PARAMETERS_START(6, 6)
+    ZEND_PARSE_PARAMETERS_START(6, 9)
         Z_PARAM_DOUBLE(x)
         Z_PARAM_DOUBLE(y)
         Z_PARAM_DOUBLE(z)
         Z_PARAM_DOUBLE(fx)
         Z_PARAM_DOUBLE(fy)
         Z_PARAM_DOUBLE(fz)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_DOUBLE_OR_NULL(ux, ux_null)
+        Z_PARAM_DOUBLE_OR_NULL(uy, uy_null)
+        Z_PARAM_DOUBLE_OR_NULL(uz, uz_null)
     ZEND_PARSE_PARAMETERS_END();
+
+    if (ux_null != uy_null || ux_null != uz_null) {
+        zend_argument_value_error(7, "the up vector needs all three of $up_x, $up_y, $up_z (or none)");
+        RETURN_THROWS();
+    }
+    if (!ux_null && ux == 0.0 && uy == 0.0 && uz == 0.0) {
+        zend_argument_value_error(7, "the up vector must not be zero");
+        RETURN_THROWS();
+    }
 
     if (!vio_audio.initialized) {
         php_error_docref(NULL, E_WARNING, "Audio engine not initialized");
@@ -9080,6 +9098,478 @@ ZEND_FUNCTION(vio_audio_listener)
 
     ma_engine_listener_set_position(&vio_audio.engine, 0, (float)x, (float)y, (float)z);
     ma_engine_listener_set_direction(&vio_audio.engine, 0, (float)fx, (float)fy, (float)fz);
+    if (!ux_null) {
+        ma_engine_listener_set_world_up(&vio_audio.engine, 0, (float)ux, (float)uy, (float)uz);
+    }
+}
+
+/* ── Live sound parameters (spatial audio) ───────────────────────── */
+
+#include <float.h>
+
+static const char *const vio_audio_model_names[] = { "none", "inverse", "linear", "exponential" };
+
+static int vio_audio_model_from_name(const char *name, size_t len, ma_attenuation_model *out)
+{
+    int i;
+    for (i = 0; i < 4; i++) {
+        if (strlen(vio_audio_model_names[i]) == len
+            && zend_binary_strncasecmp(vio_audio_model_names[i], len, name, len, len) == 0) {
+            *out = (ma_attenuation_model)i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const char *vio_audio_model_name(ma_attenuation_model m)
+{
+    return ((int)m >= 0 && (int)m < 4) ? vio_audio_model_names[(int)m] : "inverse";
+}
+
+/* Each check names the PHP argument (or option) it rejects and throws. */
+static int vio_audio_check_positive(uint32_t arg, const char *what, double v)
+{
+    if (!(v > 0.0) || !zend_finite(v)) {
+        zend_argument_value_error(arg, "%s%smust be a finite number greater than 0", what ? what : "", what ? " " : "");
+        return 0;
+    }
+    return 1;
+}
+
+static int vio_audio_check_nonneg(uint32_t arg, const char *what, double v, int allow_inf)
+{
+    if (!(v >= 0.0) || (!allow_inf && !zend_finite(v))) {
+        zend_argument_value_error(arg, "%s%smust be %s", what ? what : "", what ? " " : "",
+                                  allow_inf ? "greater than or equal to 0" : "a finite number greater than or equal to 0");
+        return 0;
+    }
+    return 1;
+}
+
+static void vio_audio_vec3_to_array(zval *out, ma_vec3f v)
+{
+    array_init_size(out, 3);
+    add_next_index_double(out, v.x);
+    add_next_index_double(out, v.y);
+    add_next_index_double(out, v.z);
+}
+
+/* [x, y, z] (list or 'x'/'y'/'z' keys) from a play option. */
+static int vio_audio_vec3_from_zval(uint32_t arg, const char *what, zval *zv, float out[3])
+{
+    static const char *const keys[3] = { "x", "y", "z" };
+    int i;
+    ZVAL_DEREF(zv);
+    if (Z_TYPE_P(zv) != IS_ARRAY) {
+        zend_argument_type_error(arg, "option \"%s\" must be of type array, %s given", what, zend_zval_value_name(zv));
+        return 0;
+    }
+    for (i = 0; i < 3; i++) {
+        zval *c = zend_hash_index_find_deref(Z_ARRVAL_P(zv), i);
+        if (!c) c = zend_hash_str_find_deref(Z_ARRVAL_P(zv), keys[i], 1);
+        if (!c) {
+            zend_argument_value_error(arg, "option \"%s\" must be [x, y, z]", what);
+            return 0;
+        }
+        out[i] = (float)zval_get_double(c);
+    }
+    return 1;
+}
+
+/* min/max distance and gain: NULL keeps the current value; the resulting
+ * pairs must stay ordered. Validates before touching the sound. Shared by
+ * vio_audio_attenuation and vio_audio_play. */
+static int vio_audio_apply_attenuation(vio_sound_object *snd, const uint32_t arg[5], int has_model, ma_attenuation_model model,
+                                       const double *min_d, const double *max_d, const double *rolloff,
+                                       const double *min_g, const double *max_g)
+{
+    double nmin_d = min_d ? *min_d : ma_sound_get_min_distance(&snd->sound);
+    double nmax_d = max_d ? *max_d : ma_sound_get_max_distance(&snd->sound);
+    double nmin_g = min_g ? *min_g : ma_sound_get_min_gain(&snd->sound);
+    double nmax_g = max_g ? *max_g : ma_sound_get_max_gain(&snd->sound);
+
+    if (min_d && !vio_audio_check_nonneg(arg[0], arg[0] == arg[1] ? "min_distance" : NULL, *min_d, 0)) return 0;
+    if (max_d && !vio_audio_check_nonneg(arg[1], arg[0] == arg[1] ? "max_distance" : NULL, *max_d, 1)) return 0;
+    if (rolloff && !vio_audio_check_nonneg(arg[2], arg[0] == arg[1] ? "rolloff" : NULL, *rolloff, 0)) return 0;
+    if (min_g && !vio_audio_check_nonneg(arg[3], arg[0] == arg[1] ? "min_gain" : NULL, *min_g, 0)) return 0;
+    if (max_g && !vio_audio_check_nonneg(arg[4], arg[0] == arg[1] ? "max_gain" : NULL, *max_g, 1)) return 0;
+    if ((min_d || max_d) && nmax_d < nmin_d) {
+        zend_argument_value_error(max_d ? arg[1] : arg[0], "max_distance (%g) must not be less than min_distance (%g)", nmax_d, nmin_d);
+        return 0;
+    }
+    if ((min_g || max_g) && nmax_g < nmin_g) {
+        zend_argument_value_error(max_g ? arg[4] : arg[3], "max_gain (%g) must not be less than min_gain (%g)", nmax_g, nmin_g);
+        return 0;
+    }
+
+    if (has_model) ma_sound_set_attenuation_model(&snd->sound, model);
+    if (min_d) ma_sound_set_min_distance(&snd->sound, (float)*min_d);
+    if (max_d) ma_sound_set_max_distance(&snd->sound, zend_finite(*max_d) ? (float)*max_d : FLT_MAX);
+    if (rolloff) ma_sound_set_rolloff(&snd->sound, (float)*rolloff);
+    if (min_g) ma_sound_set_min_gain(&snd->sound, (float)*min_g);
+    if (max_g) ma_sound_set_max_gain(&snd->sound, zend_finite(*max_g) ? (float)*max_g : FLT_MAX);
+    return 1;
+}
+
+/* The spatial options of vio_audio_play (argument 2). Validates everything
+ * before touching the sound, so a rejected call changes nothing. */
+static int vio_audio_apply_play_options(vio_sound_object *snd, HashTable *ht)
+{
+    zval *v;
+    float pos[3], vel[3], dir[3];
+    int has_pos = 0, has_vel = 0, has_dir = 0, has_model = 0, has_doppler = 0;
+    int spatial = -1, relative = -1, i;
+    ma_attenuation_model model = ma_attenuation_model_inverse;
+    double doppler = 1.0, d[5] = { 0, 0, 0, 0, 0 };
+    const double *dp[5] = { NULL, NULL, NULL, NULL, NULL };
+    static const char *const dkeys[5] = { "min_distance", "max_distance", "rolloff", "min_gain", "max_gain" };
+
+    if ((v = zend_hash_str_find_deref(ht, "spatial", sizeof("spatial") - 1)) != NULL) spatial = zend_is_true(v);
+    if ((v = zend_hash_str_find_deref(ht, "relative", sizeof("relative") - 1)) != NULL) relative = zend_is_true(v);
+    if ((v = zend_hash_str_find(ht, "position", sizeof("position") - 1)) != NULL) {
+        if (!vio_audio_vec3_from_zval(2, "position", v, pos)) return 0;
+        has_pos = 1;
+    }
+    if ((v = zend_hash_str_find(ht, "velocity", sizeof("velocity") - 1)) != NULL) {
+        if (!vio_audio_vec3_from_zval(2, "velocity", v, vel)) return 0;
+        has_vel = 1;
+    }
+    if ((v = zend_hash_str_find(ht, "direction", sizeof("direction") - 1)) != NULL) {
+        if (!vio_audio_vec3_from_zval(2, "direction", v, dir)) return 0;
+        has_dir = 1;
+    }
+    if ((v = zend_hash_str_find_deref(ht, "doppler", sizeof("doppler") - 1)) != NULL) {
+        doppler = zval_get_double(v);
+        if (!vio_audio_check_nonneg(2, "option \"doppler\"", doppler, 0)) return 0;
+        has_doppler = 1;
+    }
+    if ((v = zend_hash_str_find_deref(ht, "attenuation", sizeof("attenuation") - 1)) != NULL) {
+        if (Z_TYPE_P(v) != IS_STRING || !vio_audio_model_from_name(Z_STRVAL_P(v), Z_STRLEN_P(v), &model)) {
+            zend_argument_value_error(2, "option \"attenuation\" must be one of \"none\", \"inverse\", \"linear\", \"exponential\"");
+            return 0;
+        }
+        has_model = 1;
+    }
+    for (i = 0; i < 5; i++) {
+        if ((v = zend_hash_str_find_deref(ht, dkeys[i], strlen(dkeys[i]))) != NULL) {
+            d[i] = zval_get_double(v);
+            dp[i] = &d[i];
+        }
+    }
+    {
+        static const uint32_t args[5] = { 2, 2, 2, 2, 2 };
+        if (!vio_audio_apply_attenuation(snd, args, has_model, model, dp[0], dp[1], dp[2], dp[3], dp[4])) return 0;
+    }
+
+    if (spatial >= 0) ma_sound_set_spatialization_enabled(&snd->sound, spatial ? MA_TRUE : MA_FALSE);
+    if (relative >= 0) ma_sound_set_positioning(&snd->sound, relative ? ma_positioning_relative : ma_positioning_absolute);
+    if (has_pos) ma_sound_set_position(&snd->sound, pos[0], pos[1], pos[2]);
+    if (has_vel) ma_sound_set_velocity(&snd->sound, vel[0], vel[1], vel[2]);
+    if (has_dir) ma_sound_set_direction(&snd->sound, dir[0], dir[1], dir[2]);
+    if (has_doppler) ma_sound_set_doppler_factor(&snd->sound, (float)doppler);
+    return 1;
+}
+
+ZEND_FUNCTION(vio_audio_pitch)
+{
+    zval *snd_zval;
+    double pitch;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(snd_zval, vio_sound_ce)
+        Z_PARAM_DOUBLE(pitch)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!vio_audio_check_positive(2, NULL, pitch)) RETURN_THROWS();
+    vio_sound_object *snd = Z_VIO_SOUND_P(snd_zval);
+    if (snd->loaded) ma_sound_set_pitch(&snd->sound, (float)pitch);
+}
+
+ZEND_FUNCTION(vio_audio_pan)
+{
+    zval *snd_zval;
+    double pan;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(snd_zval, vio_sound_ce)
+        Z_PARAM_DOUBLE(pan)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (zend_isnan(pan)) {
+        zend_argument_value_error(2, "must not be NAN");
+        RETURN_THROWS();
+    }
+    vio_sound_object *snd = Z_VIO_SOUND_P(snd_zval);
+    if (snd->loaded) ma_sound_set_pan(&snd->sound, (float)(pan < -1.0 ? -1.0 : pan > 1.0 ? 1.0 : pan));
+}
+
+ZEND_FUNCTION(vio_audio_velocity)
+{
+    zval *snd_zval;
+    double x, y, z;
+
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(snd_zval, vio_sound_ce)
+        Z_PARAM_DOUBLE(x)
+        Z_PARAM_DOUBLE(y)
+        Z_PARAM_DOUBLE(z)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_sound_object *snd = Z_VIO_SOUND_P(snd_zval);
+    if (snd->loaded) ma_sound_set_velocity(&snd->sound, (float)x, (float)y, (float)z);
+}
+
+ZEND_FUNCTION(vio_audio_direction)
+{
+    zval *snd_zval;
+    double x, y, z;
+
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(snd_zval, vio_sound_ce)
+        Z_PARAM_DOUBLE(x)
+        Z_PARAM_DOUBLE(y)
+        Z_PARAM_DOUBLE(z)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_sound_object *snd = Z_VIO_SOUND_P(snd_zval);
+    if (snd->loaded) ma_sound_set_direction(&snd->sound, (float)x, (float)y, (float)z);
+}
+
+ZEND_FUNCTION(vio_audio_doppler)
+{
+    zval *snd_zval;
+    double factor;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(snd_zval, vio_sound_ce)
+        Z_PARAM_DOUBLE(factor)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!vio_audio_check_nonneg(2, NULL, factor, 0)) RETURN_THROWS();
+    vio_sound_object *snd = Z_VIO_SOUND_P(snd_zval);
+    if (snd->loaded) ma_sound_set_doppler_factor(&snd->sound, (float)factor);
+}
+
+ZEND_FUNCTION(vio_audio_attenuation)
+{
+    zval *snd_zval;
+    zend_string *model_name;
+    double v[5] = { 0, 0, 0, 0, 0 };
+    bool is_null[5] = { 1, 1, 1, 1, 1 };
+    const double *p[5];
+    ma_attenuation_model model;
+    int i;
+
+    ZEND_PARSE_PARAMETERS_START(2, 7)
+        Z_PARAM_OBJECT_OF_CLASS(snd_zval, vio_sound_ce)
+        Z_PARAM_STR(model_name)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_DOUBLE_OR_NULL(v[0], is_null[0])
+        Z_PARAM_DOUBLE_OR_NULL(v[1], is_null[1])
+        Z_PARAM_DOUBLE_OR_NULL(v[2], is_null[2])
+        Z_PARAM_DOUBLE_OR_NULL(v[3], is_null[3])
+        Z_PARAM_DOUBLE_OR_NULL(v[4], is_null[4])
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!vio_audio_model_from_name(ZSTR_VAL(model_name), ZSTR_LEN(model_name), &model)) {
+        zend_argument_value_error(2, "must be one of \"none\", \"inverse\", \"linear\", \"exponential\"");
+        RETURN_THROWS();
+    }
+    for (i = 0; i < 5; i++) p[i] = is_null[i] ? NULL : &v[i];
+
+    vio_sound_object *snd = Z_VIO_SOUND_P(snd_zval);
+    if (!snd->loaded) return;
+    {
+        static const uint32_t args[5] = { 3, 4, 5, 6, 7 };
+        if (!vio_audio_apply_attenuation(snd, args, 1, model, p[0], p[1], p[2], p[3], p[4])) RETURN_THROWS();
+    }
+}
+
+ZEND_FUNCTION(vio_audio_spatial)
+{
+    zval *snd_zval;
+    bool enabled, relative = 0, relative_null = 1;
+
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_OBJECT_OF_CLASS(snd_zval, vio_sound_ce)
+        Z_PARAM_BOOL(enabled)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(relative, relative_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_sound_object *snd = Z_VIO_SOUND_P(snd_zval);
+    if (!snd->loaded) return;
+    ma_sound_set_spatialization_enabled(&snd->sound, enabled ? MA_TRUE : MA_FALSE);
+    if (!relative_null) {
+        ma_sound_set_positioning(&snd->sound, relative ? ma_positioning_relative : ma_positioning_absolute);
+    }
+}
+
+ZEND_FUNCTION(vio_audio_cone)
+{
+    zval *snd_zval;
+    double inner, outer, outer_gain;
+
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(snd_zval, vio_sound_ce)
+        Z_PARAM_DOUBLE(inner)
+        Z_PARAM_DOUBLE(outer)
+        Z_PARAM_DOUBLE(outer_gain)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!(inner >= 0.0 && inner <= 6.2831853072)) {
+        zend_argument_value_error(2, "must be between 0 and 2*M_PI (radians)");
+        RETURN_THROWS();
+    }
+    if (!(outer >= inner && outer <= 6.2831853072)) {
+        zend_argument_value_error(3, "must be between $inner_angle and 2*M_PI (radians)");
+        RETURN_THROWS();
+    }
+    if (!(outer_gain >= 0.0 && outer_gain <= 1.0)) {
+        zend_argument_value_error(4, "must be between 0 and 1");
+        RETURN_THROWS();
+    }
+    vio_sound_object *snd = Z_VIO_SOUND_P(snd_zval);
+    if (snd->loaded) ma_sound_set_cone(&snd->sound, (float)inner, (float)outer, (float)outer_gain);
+}
+
+ZEND_FUNCTION(vio_audio_state)
+{
+    zval *snd_zval, vec;
+    float inner = 0, outer = 0, outer_gain = 0, t = 0, max_d, max_g;
+    ma_sound *s;
+    vio_sound_object *snd;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(snd_zval, vio_sound_ce)
+    ZEND_PARSE_PARAMETERS_END();
+
+    snd = Z_VIO_SOUND_P(snd_zval);
+    array_init(return_value);
+    add_assoc_bool(return_value, "loaded", snd->loaded);
+    if (!snd->loaded) return;
+
+    s = &snd->sound;
+    max_d = ma_sound_get_max_distance(s);
+    max_g = ma_sound_get_max_gain(s);
+    add_assoc_bool(return_value, "playing", ma_sound_is_playing(s));
+    add_assoc_bool(return_value, "looping", ma_sound_is_looping(s));
+    add_assoc_double(return_value, "volume", ma_sound_get_volume(s));
+    add_assoc_double(return_value, "pitch", ma_sound_get_pitch(s));
+    add_assoc_double(return_value, "pan", ma_sound_get_pan(s));
+    add_assoc_bool(return_value, "spatial", ma_sound_is_spatialization_enabled(s));
+    add_assoc_bool(return_value, "relative", ma_sound_get_positioning(s) == ma_positioning_relative);
+    vio_audio_vec3_to_array(&vec, ma_sound_get_position(s));
+    add_assoc_zval(return_value, "position", &vec);
+    vio_audio_vec3_to_array(&vec, ma_sound_get_velocity(s));
+    add_assoc_zval(return_value, "velocity", &vec);
+    vio_audio_vec3_to_array(&vec, ma_sound_get_direction(s));
+    add_assoc_zval(return_value, "direction", &vec);
+    add_assoc_double(return_value, "doppler", ma_sound_get_doppler_factor(s));
+    add_assoc_string(return_value, "attenuation", (char *)vio_audio_model_name(ma_sound_get_attenuation_model(s)));
+    add_assoc_double(return_value, "min_distance", ma_sound_get_min_distance(s));
+    add_assoc_double(return_value, "max_distance", max_d >= FLT_MAX ? ZEND_INFINITY : max_d);
+    add_assoc_double(return_value, "rolloff", ma_sound_get_rolloff(s));
+    add_assoc_double(return_value, "min_gain", ma_sound_get_min_gain(s));
+    add_assoc_double(return_value, "max_gain", max_g >= FLT_MAX ? ZEND_INFINITY : max_g);
+    ma_sound_get_cone(s, &inner, &outer, &outer_gain);
+    array_init_size(&vec, 3);
+    add_assoc_double(&vec, "inner_angle", inner);
+    add_assoc_double(&vec, "outer_angle", outer);
+    add_assoc_double(&vec, "outer_gain", outer_gain);
+    add_assoc_zval(return_value, "cone", &vec);
+    if (ma_sound_get_cursor_in_seconds(s, &t) != MA_SUCCESS) t = 0;
+    add_assoc_double(return_value, "cursor", t);
+    if (ma_sound_get_length_in_seconds(s, &t) != MA_SUCCESS) t = 0;
+    add_assoc_double(return_value, "length", t);
+}
+
+ZEND_FUNCTION(vio_audio_listener_velocity)
+{
+    double x, y, z;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_DOUBLE(x)
+        Z_PARAM_DOUBLE(y)
+        Z_PARAM_DOUBLE(z)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!vio_audio.initialized) {
+        php_error_docref(NULL, E_WARNING, "Audio engine not initialized");
+        return;
+    }
+    ma_engine_listener_set_velocity(&vio_audio.engine, 0, (float)x, (float)y, (float)z);
+}
+
+ZEND_FUNCTION(vio_audio_speed_of_sound)
+{
+    double speed;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_DOUBLE(speed)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!vio_audio_check_positive(1, NULL, speed)) RETURN_THROWS();
+    if (!vio_audio.initialized) {
+        php_error_docref(NULL, E_WARNING, "Audio engine not initialized");
+        return;
+    }
+    ma_spatializer_listener_set_speed_of_sound(&vio_audio.engine.listeners[0], (float)speed);
+}
+
+ZEND_FUNCTION(vio_audio_listener_state)
+{
+    zval vec;
+
+    ZEND_PARSE_PARAMETERS_NONE();
+    if (!vio_audio.initialized) RETURN_FALSE;
+
+    array_init(return_value);
+    vio_audio_vec3_to_array(&vec, ma_engine_listener_get_position(&vio_audio.engine, 0));
+    add_assoc_zval(return_value, "position", &vec);
+    vio_audio_vec3_to_array(&vec, ma_engine_listener_get_direction(&vio_audio.engine, 0));
+    add_assoc_zval(return_value, "direction", &vec);
+    vio_audio_vec3_to_array(&vec, ma_engine_listener_get_world_up(&vio_audio.engine, 0));
+    add_assoc_zval(return_value, "up", &vec);
+    vio_audio_vec3_to_array(&vec, ma_engine_listener_get_velocity(&vio_audio.engine, 0));
+    add_assoc_zval(return_value, "velocity", &vec);
+    add_assoc_double(return_value, "speed_of_sound", ma_spatializer_listener_get_speed_of_sound(&vio_audio.engine.listeners[0]));
+    add_assoc_long(return_value, "sample_rate", (zend_long)ma_engine_get_sample_rate(&vio_audio.engine));
+    add_assoc_long(return_value, "channels", (zend_long)ma_engine_get_channels(&vio_audio.engine));
+}
+
+ZEND_FUNCTION(vio_audio_render)
+{
+    zend_long frames;
+    ma_uint64 got = 0;
+    ma_uint32 channels;
+    size_t frame_bytes;
+    zend_string *out;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(frames)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (frames < 0 || frames > 2880000) {
+        zend_argument_value_error(1, "must be between 0 and 2880000");
+        RETURN_THROWS();
+    }
+    if (!vio_audio.initialized || !vio_audio.offline) {
+        php_error_docref(NULL, E_WARNING, "vio_audio_render() needs an offline engine: vio_audio_init(['device' => false]) before the first sound");
+        RETURN_FALSE;
+    }
+    channels = ma_engine_get_channels(&vio_audio.engine);
+    frame_bytes = (size_t)channels * sizeof(float);
+    out = zend_string_alloc((size_t)frames * frame_bytes, 0);
+    if (frames > 0 && ma_engine_read_pcm_frames(&vio_audio.engine, ZSTR_VAL(out), (ma_uint64)frames, &got) != MA_SUCCESS) {
+        got = 0;
+    }
+    if (got < (ma_uint64)frames) {
+        memset(ZSTR_VAL(out) + (size_t)got * frame_bytes, 0, (size_t)((ma_uint64)frames - got) * frame_bytes);
+    }
+    ZSTR_VAL(out)[ZSTR_LEN(out)] = '\0';
+    RETURN_NEW_STR(out);
 }
 
 ZEND_FUNCTION(vio_audio_init)
@@ -9116,11 +9606,51 @@ ZEND_FUNCTION(vio_audio_init)
         }
     }
 
+    /* 'device' => false: offline engine, mixed on demand by vio_audio_render() */
+    int offline = 0, device_given = 0;
+    zend_long sample_rate = 0, channels = 0;
+    if (opts) {
+        zval *zv;
+        if ((zv = zend_hash_str_find_deref(opts, "device", sizeof("device") - 1)) != NULL) {
+            offline = !zend_is_true(zv);
+            device_given = 1;
+        }
+        if ((zv = zend_hash_str_find_deref(opts, "sample_rate", sizeof("sample_rate") - 1)) != NULL) {
+            sample_rate = zval_get_long(zv);
+            if (sample_rate < 8000 || sample_rate > 384000) {
+                zend_argument_value_error(1, "option \"sample_rate\" must be between 8000 and 384000");
+                RETURN_THROWS();
+            }
+        }
+        if ((zv = zend_hash_str_find_deref(opts, "channels", sizeof("channels") - 1)) != NULL) {
+            channels = zval_get_long(zv);
+            if (channels < 1 || channels > 8) {
+                zend_argument_value_error(1, "option \"channels\" must be between 1 and 8");
+                RETURN_THROWS();
+            }
+        }
+        if (offline && count > 0) {
+            zend_argument_value_error(1, "options \"backends\" and \"device\" => false exclude each other");
+            RETURN_THROWS();
+        }
+        if (!offline && (sample_rate || channels)) {
+            zend_argument_value_error(1, "options \"sample_rate\" and \"channels\" need \"device\" => false");
+            RETURN_THROWS();
+        }
+    }
+
     if (vio_audio.initialized) {
-        if (count > 0) {
+        if (count > 0 || (device_given && offline != vio_audio.offline)) {
             const char *cur = vio_audio_engine_backend();
             php_error_docref(NULL, E_WARNING, "Audio engine already initialized (backend \"%s\"); vio_audio_init() must come before the first sound",
                              cur ? cur : "?");
+            RETURN_FALSE;
+        }
+        RETURN_TRUE;
+    }
+    if (offline) {
+        if (vio_audio_engine_init_offline((ma_uint32)sample_rate, (ma_uint32)channels) != 0) {
+            php_error_docref(NULL, E_WARNING, "Failed to initialize audio engine");
             RETURN_FALSE;
         }
         RETURN_TRUE;
