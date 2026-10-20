@@ -8,7 +8,7 @@ A PHP extension that brings GPU rendering, audio, video recording, streaming, an
 - **2D Batch Renderer** — Rects, circles, lines, sprites, text (z-sorted, up to 4096 items)
 - **3D Pipeline** — Meshes, shaders, pipelines, textures, uniform/storage buffers
 - **Shader Toolchain** — GLSL to SPIR-V compilation, reflection, cross-compilation
-- **Audio** — Playback via miniaudio (MP3, WAV, FLAC)
+- **Audio** — Playback via miniaudio (MP3, WAV, FLAC, Ogg Vorbis/Opus), 3D audio with live pitch/pan, distance attenuation models, Doppler, cones, 2D/3D switch per sound, offline rendering
 - **Video Recording** — H.264 encoding via FFmpeg (with VideoToolbox HW acceleration)
 - **Network Streaming** — RTMP and SRT via FFmpeg
 - **Input** — Keyboard, mouse, and gamepad support via GLFW
@@ -146,7 +146,7 @@ vio_destroy($ctx);
 | Textures | `vio_texture`, `vio_bind_texture`, `vio_texture_load_async` |
 | Fonts | `vio_font`, `vio_text`, `vio_text_measure`, `vio_font_load_async` |
 | Buffers | `vio_uniform_buffer`, `vio_update_buffer` |
-| Audio | `vio_audio_load`, `vio_audio_play`, `vio_audio_pause`, `vio_audio_stop` |
+| Audio | `vio_audio_load`, `vio_audio_play`, `vio_audio_pause`, `vio_audio_stop`, `vio_audio_pitch`, `vio_audio_pan`, `vio_audio_spatial`, `vio_audio_attenuation`, `vio_audio_velocity`, `vio_audio_doppler`, `vio_audio_listener`, `vio_audio_render` |
 | Recording | `vio_recorder`, `vio_recorder_capture`, `vio_recorder_stop` |
 | Streaming | `vio_stream`, `vio_stream_push`, `vio_stream_stop` |
 | Headless | `vio_read_pixels`, `vio_save_screenshot`, `vio_compare_images` |
