@@ -744,6 +744,71 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_listener, 0, 6, IS_VOI
 	ZEND_ARG_TYPE_INFO(0, forward_x, IS_DOUBLE, 0)
 	ZEND_ARG_TYPE_INFO(0, forward_y, IS_DOUBLE, 0)
 	ZEND_ARG_TYPE_INFO(0, forward_z, IS_DOUBLE, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, up_x, IS_DOUBLE, 1, "null")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, up_y, IS_DOUBLE, 1, "null")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, up_z, IS_DOUBLE, 1, "null")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_pitch, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, sound, VioSound, 0)
+	ZEND_ARG_TYPE_INFO(0, pitch, IS_DOUBLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_pan, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, sound, VioSound, 0)
+	ZEND_ARG_TYPE_INFO(0, pan, IS_DOUBLE, 0)
+ZEND_END_ARG_INFO()
+
+#define arginfo_vio_audio_velocity arginfo_vio_audio_position
+#define arginfo_vio_audio_direction arginfo_vio_audio_position
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_doppler, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, sound, VioSound, 0)
+	ZEND_ARG_TYPE_INFO(0, factor, IS_DOUBLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_attenuation, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, sound, VioSound, 0)
+	ZEND_ARG_TYPE_INFO(0, model, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, min_distance, IS_DOUBLE, 1, "null")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, max_distance, IS_DOUBLE, 1, "null")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, rolloff, IS_DOUBLE, 1, "null")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, min_gain, IS_DOUBLE, 1, "null")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, max_gain, IS_DOUBLE, 1, "null")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_spatial, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, sound, VioSound, 0)
+	ZEND_ARG_TYPE_INFO(0, enabled, _IS_BOOL, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, relative, _IS_BOOL, 1, "null")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_cone, 0, 4, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, sound, VioSound, 0)
+	ZEND_ARG_TYPE_INFO(0, inner_angle, IS_DOUBLE, 0)
+	ZEND_ARG_TYPE_INFO(0, outer_angle, IS_DOUBLE, 0)
+	ZEND_ARG_TYPE_INFO(0, outer_gain, IS_DOUBLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_state, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, sound, VioSound, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_listener_velocity, 0, 3, IS_VOID, 0)
+	ZEND_ARG_TYPE_INFO(0, x, IS_DOUBLE, 0)
+	ZEND_ARG_TYPE_INFO(0, y, IS_DOUBLE, 0)
+	ZEND_ARG_TYPE_INFO(0, z, IS_DOUBLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_speed_of_sound, 0, 1, IS_VOID, 0)
+	ZEND_ARG_TYPE_INFO(0, speed, IS_DOUBLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_audio_listener_state, 0, 0, MAY_BE_ARRAY|MAY_BE_FALSE)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_audio_render, 0, 1, MAY_BE_STRING|MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO(0, frames, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_audio_init, 0, 0, _IS_BOOL, 0)
@@ -1280,6 +1345,19 @@ ZEND_FUNCTION(vio_audio_formats);
 ZEND_FUNCTION(vio_audio_info);
 ZEND_FUNCTION(vio_audio_decode);
 ZEND_FUNCTION(vio_audio_encode);
+ZEND_FUNCTION(vio_audio_pitch);
+ZEND_FUNCTION(vio_audio_pan);
+ZEND_FUNCTION(vio_audio_velocity);
+ZEND_FUNCTION(vio_audio_direction);
+ZEND_FUNCTION(vio_audio_doppler);
+ZEND_FUNCTION(vio_audio_attenuation);
+ZEND_FUNCTION(vio_audio_spatial);
+ZEND_FUNCTION(vio_audio_cone);
+ZEND_FUNCTION(vio_audio_state);
+ZEND_FUNCTION(vio_audio_listener_velocity);
+ZEND_FUNCTION(vio_audio_speed_of_sound);
+ZEND_FUNCTION(vio_audio_listener_state);
+ZEND_FUNCTION(vio_audio_render);
 ZEND_FUNCTION(vio_recorder);
 ZEND_FUNCTION(vio_recorder_capture);
 ZEND_FUNCTION(vio_recorder_stop);
@@ -1502,6 +1580,19 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_audio_info, arginfo_vio_audio_info)
 	ZEND_FE(vio_audio_decode, arginfo_vio_audio_decode)
 	ZEND_FE(vio_audio_encode, arginfo_vio_audio_encode)
+	ZEND_FE(vio_audio_pitch, arginfo_vio_audio_pitch)
+	ZEND_FE(vio_audio_pan, arginfo_vio_audio_pan)
+	ZEND_FE(vio_audio_velocity, arginfo_vio_audio_velocity)
+	ZEND_FE(vio_audio_direction, arginfo_vio_audio_direction)
+	ZEND_FE(vio_audio_doppler, arginfo_vio_audio_doppler)
+	ZEND_FE(vio_audio_attenuation, arginfo_vio_audio_attenuation)
+	ZEND_FE(vio_audio_spatial, arginfo_vio_audio_spatial)
+	ZEND_FE(vio_audio_cone, arginfo_vio_audio_cone)
+	ZEND_FE(vio_audio_state, arginfo_vio_audio_state)
+	ZEND_FE(vio_audio_listener_velocity, arginfo_vio_audio_listener_velocity)
+	ZEND_FE(vio_audio_speed_of_sound, arginfo_vio_audio_speed_of_sound)
+	ZEND_FE(vio_audio_listener_state, arginfo_vio_audio_listener_state)
+	ZEND_FE(vio_audio_render, arginfo_vio_audio_render)
 	ZEND_FE(vio_recorder, arginfo_vio_recorder)
 	ZEND_FE(vio_recorder_capture, arginfo_vio_recorder_capture)
 	ZEND_FE(vio_recorder_stop, arginfo_vio_recorder_stop)

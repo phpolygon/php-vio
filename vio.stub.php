@@ -1699,7 +1699,15 @@ function vio_audio_load(string $path): VioSound|false {}
 /**
  * Play a loaded sound.
  *
- * @param array|null $options ['volume' => float, 'loop' => bool, 'pan' => float, 'pitch' => float]
+ * Spatial options are applied before the sound starts (same rules as the live
+ * setters below): 'spatial' => bool (false = plain 2D sound, the listener does not
+ * attenuate or pan it), 'relative' => bool (position relative to the listener),
+ * 'position' / 'velocity' / 'direction' => [x, y, z], 'doppler' => float,
+ * 'attenuation' => 'none'|'inverse'|'linear'|'exponential', 'min_distance',
+ * 'max_distance', 'rolloff', 'min_gain', 'max_gain' => float. Invalid spatial
+ * options throw a ValueError/TypeError and leave the sound untouched.
+ *
+ * @param array|null $options ['volume' => float, 'loop' => bool, 'pan' => float, 'pitch' => float, + spatial options]
  */
 function vio_audio_play(VioSound $sound, ?array $options = null): void {}
 
@@ -1734,9 +1742,98 @@ function vio_audio_playing(VioSound $sound): bool {}
 function vio_audio_position(VioSound $sound, float $x, float $y, float $z): void {}
 
 /**
- * Set the audio listener position and facing direction.
+ * Set the audio listener position and facing direction, optionally its up vector
+ * (world up, default +Y; give all three components or none – without them the
+ * current up vector stays).
  */
-function vio_audio_listener(float $x, float $y, float $z, float $fx, float $fy, float $fz): void {}
+function vio_audio_listener(float $x, float $y, float $z, float $forward_x, float $forward_y, float $forward_z, ?float $up_x = null, ?float $up_y = null, ?float $up_z = null): void {}
+
+/**
+ * Change the pitch of a sound while it plays (1.0 = original, 2.0 = one octave up).
+ * Throws a ValueError unless $pitch is finite and > 0.
+ */
+function vio_audio_pitch(VioSound $sound, float $pitch): void {}
+
+/**
+ * Change the stereo pan of a sound while it plays (-1.0 = left, 0.0 = centre,
+ * 1.0 = right; values outside are clamped). Applies after spatialization.
+ */
+function vio_audio_pan(VioSound $sound, float $pan): void {}
+
+/**
+ * Set the velocity of a sound source in world units per second (Doppler effect).
+ */
+function vio_audio_velocity(VioSound $sound, float $x, float $y, float $z): void {}
+
+/**
+ * Set the direction a sound source faces (used with vio_audio_cone()).
+ */
+function vio_audio_direction(VioSound $sound, float $x, float $y, float $z): void {}
+
+/**
+ * Set the Doppler factor of a sound (0.0 = off, 1.0 = physical, default 1.0).
+ */
+function vio_audio_doppler(VioSound $sound, float $factor): void {}
+
+/**
+ * Set the distance attenuation of a sound. Arguments left null keep their value.
+ * Models (OpenAL-style, clamped): 'none', 'inverse' (default), 'linear', 'exponential'.
+ * Defaults: min_distance 1, max_distance INF, rolloff 1, min_gain 0, max_gain 1.
+ * Throws a ValueError on an unknown model, negative values or max < min.
+ */
+function vio_audio_attenuation(VioSound $sound, string $model, ?float $min_distance = null, ?float $max_distance = null, ?float $rolloff = null, ?float $min_gain = null, ?float $max_gain = null): void {}
+
+/**
+ * Switch 3D spatialization of a sound on or off. Off = plain 2D sound: the listener
+ * neither attenuates nor pans it (music, UI, voice-over). $relative = true places
+ * the sound relative to the listener (position follows the listener); null keeps it.
+ */
+function vio_audio_spatial(VioSound $sound, bool $enabled, ?bool $relative = null): void {}
+
+/**
+ * Directional sound cone in radians: full volume inside $inner_angle, $outer_gain
+ * outside $outer_angle, interpolated between (direction from vio_audio_direction()).
+ */
+function vio_audio_cone(VioSound $sound, float $inner_angle, float $outer_angle, float $outer_gain): void {}
+
+/**
+ * Current parameters of a sound.
+ *
+ * @return array{loaded: bool, playing?: bool, looping?: bool, volume?: float, pitch?: float, pan?: float,
+ *   spatial?: bool, relative?: bool, position?: array{float, float, float}, velocity?: array{float, float, float},
+ *   direction?: array{float, float, float}, doppler?: float, attenuation?: string, min_distance?: float,
+ *   max_distance?: float, rolloff?: float, min_gain?: float, max_gain?: float,
+ *   cone?: array{inner_angle: float, outer_angle: float, outer_gain: float}, cursor?: float, length?: float}
+ */
+function vio_audio_state(VioSound $sound): array {}
+
+/**
+ * Set the listener velocity in world units per second (Doppler effect).
+ */
+function vio_audio_listener_velocity(float $x, float $y, float $z): void {}
+
+/**
+ * Speed of sound for the Doppler effect in world units per second (default 343.3).
+ */
+function vio_audio_speed_of_sound(float $speed): void {}
+
+/**
+ * Current listener parameters, or false before the audio engine is initialized.
+ *
+ * @return array{position: array{float, float, float}, direction: array{float, float, float},
+ *   up: array{float, float, float}, velocity: array{float, float, float}, speed_of_sound: float,
+ *   sample_rate: int, channels: int}|false
+ */
+function vio_audio_listener_state(): array|false {}
+
+/**
+ * Mix the next $frames frames of an offline engine (vio_audio_init(['device' => false]))
+ * and return them as interleaved 32-bit float PCM (unpack('g*')). The mix advances only
+ * through this call – deterministic, for tests and offline rendering.
+ *
+ * @return string|false false (with a warning) when the engine is not offline
+ */
+function vio_audio_render(int $frames): string|false {}
 
 /**
  * Initialize the audio engine explicitly, before the first sound (vio_audio_load*
@@ -1750,10 +1847,13 @@ function vio_audio_listener(float $x, float $y, float $z, float $fx, float $fy, 
  * servers, CI). Without 'backends' the environment variable VIO_AUDIO_BACKEND
  * (comma list, e.g. "null" or "pulseaudio,alsa,null") is used, else miniaudio's
  * default order.
+ * 'device' => false starts an offline engine without any device: the mix advances
+ * only through vio_audio_render() ('sample_rate' 8000..384000, default 44100;
+ * 'channels' 1..8, default 2); vio_audio_backend() then returns 'offline'.
  *
- * @param array $options ['backends' => list<string>]
+ * @param array $options ['backends' => list<string>, 'device' => bool, 'sample_rate' => int, 'channels' => int]
  * @return bool true when the engine runs; false (with a warning) when it could not
- *   start, or when it already runs and 'backends' was given
+ *   start, or when it already runs and 'backends' or a different 'device' was given
  */
 function vio_audio_init(array $options = []): bool {}
 

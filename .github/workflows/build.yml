@@ -982,7 +982,9 @@ jobs:
             tests/media/242_audio_encode_opus_vorbis.phpt `
             tests/media/243_audio_load_opus_vorbis.phpt `
             tests/media/244_audio_init_backends.phpt `
-            tests/media/245_audio_phar_opus_vorbis.phpt
+            tests/media/245_audio_phar_opus_vorbis.phpt `
+            tests/media/248_audio_live_spatial.phpt `
+            tests/media/249_audio_live_device.phpt
 
       - name: Package binary
         shell: pwsh

@@ -67,6 +67,42 @@ static ma_uint32 vio_audio_backends_from_env(ma_backend *out, ma_uint32 cap)
     return count;
 }
 
+/* The rename in vio_miniaudio.h makes a foreign miniaudio unreachable;
+ * should a build ever bypass it, refuse audio rather than run the
+ * engine against structs of another layout. */
+static int vio_audio_check_version(void)
+{
+    if (!vio_miniaudio_version_matches()) {
+        ma_uint32 major = 0, minor = 0, revision = 0;
+        ma_version(&major, &minor, &revision);
+        php_error_docref(NULL, E_WARNING,
+            "miniaudio version mismatch: compiled against %s, linked %u.%u.%u - audio disabled",
+            MA_VERSION_STRING, (unsigned)major, (unsigned)minor, (unsigned)revision);
+        return 0;
+    }
+    return 1;
+}
+
+int vio_audio_engine_init_offline(ma_uint32 sample_rate, ma_uint32 channels)
+{
+    ma_engine_config config;
+
+    if (vio_audio.initialized) return 0;
+    if (!vio_audio_check_version()) return -1;
+
+    config = ma_engine_config_init();
+    config.noDevice   = MA_TRUE;
+    config.channels   = channels ? channels : 2;
+    config.sampleRate = sample_rate ? sample_rate : 44100;
+
+    if (ma_engine_init(&config, &vio_audio.engine) != MA_SUCCESS) {
+        return -1;
+    }
+    vio_audio.initialized = 1;
+    vio_audio.offline = 1;
+    return 0;
+}
+
 int vio_audio_engine_init_ex(const ma_backend *backends, ma_uint32 count)
 {
     ma_backend env_backends[16];
@@ -75,17 +111,7 @@ int vio_audio_engine_init_ex(const ma_backend *backends, ma_uint32 count)
 
     if (vio_audio.initialized) return 0;
 
-    /* The rename in vio_miniaudio.h makes a foreign miniaudio unreachable;
-     * should a build ever bypass it, refuse audio rather than run the
-     * engine against structs of another layout. */
-    if (!vio_miniaudio_version_matches()) {
-        ma_uint32 major = 0, minor = 0, revision = 0;
-        ma_version(&major, &minor, &revision);
-        php_error_docref(NULL, E_WARNING,
-            "miniaudio version mismatch: compiled against %s, linked %u.%u.%u - audio disabled",
-            MA_VERSION_STRING, (unsigned)major, (unsigned)minor, (unsigned)revision);
-        return -1;
-    }
+    if (!vio_audio_check_version()) return -1;
 
     if (count == 0) {
         count = vio_audio_backends_from_env(env_backends, 16);
@@ -130,6 +156,7 @@ const char *vio_audio_engine_backend(void)
 {
     ma_device *dev;
     if (!vio_audio.initialized) return NULL;
+    if (vio_audio.offline) return "offline";
     /* pContext is the first member of ma_device and backend follows the
      * callbacks table in ma_context – same in every 0.11 release. */
     dev = ma_engine_get_device(&vio_audio.engine);
@@ -142,6 +169,7 @@ void vio_audio_engine_shutdown(void)
     if (vio_audio.initialized) {
         ma_engine_uninit(&vio_audio.engine);
         vio_audio.initialized = 0;
+        vio_audio.offline = 0;
     }
     if (vio_audio.has_context) {
         ma_context_uninit(&vio_audio.context);
