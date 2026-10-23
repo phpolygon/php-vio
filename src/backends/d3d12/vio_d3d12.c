@@ -61,6 +61,17 @@ vio_d3d12_state vio_d3d12 = {0};
 /* Currently bound pipeline (for vertex stride in draw calls) */
 static vio_d3d12_pipeline *d3d12_current_pipeline = NULL;
 static void d3d12_compute_wait(void);   /* defined with the compute path; used by the readback helper */
+static void d3d12_ubatch_flush(void);   /* submits the open buffer upload batch (upload helpers) */
+
+/* Every ExecuteCommandLists on the queue goes through here: the open buffer
+ * upload batch is submitted first, so buffer writes staged before this point
+ * execute before the lists submitted now (frame list, sync dispatch, readback,
+ * texture upload) - the order the old per-call upload submission had. */
+static void d3d12_execute_lists(UINT count, ID3D12CommandList *const *lists)
+{
+    d3d12_ubatch_flush();
+    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, count, lists);
+}
 
 /* Pull pending validation messages out of the D3D12 InfoQueue and forward them
  * to PHP's error log. No-op when the debug layer is not active. Called after
@@ -377,6 +388,7 @@ void vio_d3d12_wait_for_gpu(void)
 {
     if (!vio_d3d12.cmd_queue || !vio_d3d12.fence) return;
 
+    d3d12_ubatch_flush();   /* staged buffer writes are part of "all pending work" */
     vio_d3d12.fence_value++;
     ID3D12CommandQueue_Signal(vio_d3d12.cmd_queue, vio_d3d12.fence, vio_d3d12.fence_value);
 
@@ -449,6 +461,8 @@ static int d3d12_upload_subresources(ID3D12Resource *dst, const D3D12_RESOURCE_D
                                      UINT dst_x, UINT dst_y, UINT dst_z);
 static void d3d12_retire_later(ID3D12Resource *res, UINT64 fence);
 static void d3d12_retire_object_later(IUnknown *obj, UINT64 fence);
+static int  d3d12_ubatch_targets(ID3D12Resource *res);
+static void d3d12_ubatch_shutdown(void);
 static void d3d12_release_parked(UINT slot);
 static void d3d12_release_parked_all(void);
 static void d3d12_descriptor_blocks_release(UINT slot);
@@ -1837,6 +1851,7 @@ static void d3d12_shutdown(void)
     vio_d3d12.vrs_image_active = 0;
 
     /* Upload queue: every submission is complete now, release all staging. */
+    d3d12_ubatch_shutdown();
     d3d12_retire_uploads(1);
     free(vio_d3d12.upload_retire);
     vio_d3d12.upload_retire = NULL;
@@ -2521,7 +2536,7 @@ static void *d3d12_create_acceleration_structure(const vio_as_desc *desc)
     if (FAILED(ID3D12GraphicsCommandList_Close(list))) goto fail;
     {
         ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        d3d12_execute_lists(1, lists);
         vio_d3d12_wait_for_gpu();   /* the temporaries below are freed right after */
     }
     for (int i = 0; i < tmp_count; i++) ID3D12Resource_Release(tmp[i]);
@@ -2565,7 +2580,7 @@ static int d3d12_update_acceleration_structure(void *ptr, const vio_as_instance 
     if (FAILED(ID3D12GraphicsCommandList_Close(list))) goto done;
     {
         ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        d3d12_execute_lists(1, lists);
         vio_d3d12_wait_for_gpu();
     }
     rc = 0;
@@ -3335,8 +3350,10 @@ static void d3d12_update_buffer(void *buffer_ptr, const void *data, size_t size,
     buf->fs_dirty = 1;   /* the next read_buffer copies it again instead of an old readback */
 
     if (buf->default_heap) {
-        /* GPU-local buffer: staging copy on the upload queue (ordered before
-         * the next frame list on the same queue). */
+        /* GPU-local buffer: staged in the upload ring, copied by the buffer
+         * upload batch, which is submitted ahead of the next list on the queue
+         * (the frame list, a sync dispatch, a readback) - no resource and no
+         * submission per call. */
         d3d12_upload_buffer_at(buf->resource, (UINT64)offset, data, size);
         return;
     }
@@ -3356,6 +3373,13 @@ static void d3d12_destroy_buffer(void *buffer_ptr)
     if (!buf) return;
     if (buf->readback_resource) ID3D12Resource_Release(buf->readback_resource);
     if (buf->upload_resource) ID3D12Resource_Release(buf->upload_resource);
+    if (buf->resource && d3d12_ubatch_targets(buf->resource)) {
+        /* A staged copy still writes it: submit the batch and release the
+         * buffer once that has executed. */
+        d3d12_ubatch_flush();
+        d3d12_retire_later(buf->resource, vio_d3d12.upload_last_fence);
+        buf->resource = NULL;
+    }
     if (buf->resource) ID3D12Resource_Release(buf->resource);
     free(buf);
 }
@@ -3462,7 +3486,7 @@ static int d3d12_submit_upload(void (*record)(ID3D12GraphicsCommandList *, void 
     record(vio_d3d12.upload_list, user);
     ID3D12GraphicsCommandList_Close(vio_d3d12.upload_list);
     ID3D12CommandList *lists[] = { (ID3D12CommandList *)vio_d3d12.upload_list };
-    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    d3d12_execute_lists(1, lists);
 
     vio_d3d12.fence_value++;
     ID3D12CommandQueue_Signal(vio_d3d12.cmd_queue, vio_d3d12.fence, vio_d3d12.fence_value);
@@ -3618,8 +3642,266 @@ static int d3d12_upload_buffer_region(ID3D12Resource *dst, const void *data, siz
     return d3d12_upload_buffer_at(dst, 0, data, size);
 }
 
-/* Staging copy of `data` into `dst` at byte `offset`, on the upload queue. */
+/* ── Buffer upload batch (see vio_d3d12_state.uring / ubatch_*) ──────── */
+
+static void d3d12_uring_reclaim(void)
+{
+    if (!vio_d3d12.uring_span_count) return;
+    UINT64 done = ID3D12Fence_GetCompletedValue(vio_d3d12.fence);
+    int i = 0;
+    while (i < vio_d3d12.uring_span_count && vio_d3d12.uring_spans[i].fence <= done) {
+        vio_d3d12.uring_tail = vio_d3d12.uring_spans[i].end;
+        i++;
+    }
+    if (i) {
+        vio_d3d12.uring_span_count -= i;
+        memmove(vio_d3d12.uring_spans, vio_d3d12.uring_spans + i,
+                (size_t)vio_d3d12.uring_span_count * sizeof(*vio_d3d12.uring_spans));
+    }
+}
+
+/* Replace the ring by one of `cap` bytes. The open batch is submitted first
+ * (its copies read the old ring); the old ring is released once the GPU has
+ * passed everything submitted so far. */
+static int d3d12_uring_resize(UINT64 cap)
+{
+    d3d12_ubatch_flush();
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = cap;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource *ring = NULL;
+    HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void **)&ring);
+    if (FAILED(hr) || !ring) return -1;
+    void *mapped = NULL;
+    D3D12_RANGE none = {0, 0};
+    if (FAILED(ID3D12Resource_Map(ring, 0, &none, &mapped)) || !mapped) {
+        ID3D12Resource_Release(ring);
+        return -1;
+    }
+    if (vio_d3d12.uring) {
+        /* Upload heaps may stay mapped until release. */
+        d3d12_retire_later(vio_d3d12.uring, vio_d3d12.fence_value);
+    }
+    vio_d3d12.uring = ring;
+    vio_d3d12.uring_mapped = (unsigned char *)mapped;
+    vio_d3d12.uring_cap = cap;
+    vio_d3d12.uring_head = vio_d3d12.uring_tail = 0;
+    vio_d3d12.uring_span_count = 0;   /* the spans described the old ring */
+    return 0;
+}
+
+/* Place `size` bytes at the ring head (16-byte aligned, never across the end).
+ * Returns the byte offset into uring, or -1 when the free part is too small. */
+static INT64 d3d12_uring_try_place(UINT64 size)
+{
+    UINT64 cap = vio_d3d12.uring_cap;
+    UINT64 at = (vio_d3d12.uring_head + 15) & ~(UINT64)15;
+    UINT64 phys = at % cap;
+    if (phys + size > cap) at += cap - phys;   /* does not fit before the end: wrap */
+    if (at + size - vio_d3d12.uring_tail > cap) return -1;
+    vio_d3d12.uring_head = at + size;
+    return (INT64)(at % cap);
+}
+
+/* `size` bytes in the ring; returns the byte offset into uring, or -1 (then
+ * the caller takes its own staging buffer). Never waits unless the ring is at
+ * its size bound and every byte of it is still in flight. */
+static INT64 d3d12_uring_alloc(UINT64 size)
+{
+    if (size == 0 || size > VIO_D3D12_URING_MAX_COPY) return -1;
+    if (!vio_d3d12.uring && d3d12_uring_resize(VIO_D3D12_URING_INITIAL) != 0) return -1;
+    for (int attempt = 0; attempt < 64; attempt++) {
+        INT64 at = d3d12_uring_try_place(size);
+        if (at >= 0) return at;
+        d3d12_uring_reclaim();
+        at = d3d12_uring_try_place(size);
+        if (at >= 0) return at;
+        if (vio_d3d12.uring_cap < VIO_D3D12_URING_MAX) {
+            UINT64 grown = vio_d3d12.uring_cap * 2;
+            while (grown < size * 4 && grown < VIO_D3D12_URING_MAX) grown *= 2;
+            if (d3d12_uring_resize(grown) == 0) continue;
+        }
+        /* At the bound: submit what is staged and wait for the oldest span. */
+        d3d12_ubatch_flush();
+        if (!vio_d3d12.uring_span_count) return -1;
+        UINT64 f = vio_d3d12.uring_spans[0].fence;
+        if (ID3D12Fence_GetCompletedValue(vio_d3d12.fence) < f) {
+            ID3D12Fence_SetEventOnCompletion(vio_d3d12.fence, f, vio_d3d12.fence_event);
+            WaitForSingleObject(vio_d3d12.fence_event, INFINITE);
+        }
+    }
+    return -1;
+}
+
+/* Open the batch list on a free allocator (lazily, at the first staged copy). */
+static int d3d12_ubatch_begin(void)
+{
+    if (vio_d3d12.ubatch_open) return 0;
+    int slot = vio_d3d12.ubatch_alloc_idx;
+    ID3D12CommandAllocator *alloc = vio_d3d12.ubatch_allocs[slot];
+    HRESULT hr;
+    if (!alloc) {
+        hr = ID3D12Device_CreateCommandAllocator(vio_d3d12.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                 &IID_ID3D12CommandAllocator, (void **)&alloc);
+        if (FAILED(hr)) return -1;
+        vio_d3d12.ubatch_allocs[slot] = alloc;
+    } else {
+        if (ID3D12Fence_GetCompletedValue(vio_d3d12.fence) < vio_d3d12.ubatch_alloc_fence[slot]) {
+            /* More than VIO_D3D12_UBATCH_ALLOCATORS batches in flight. */
+            ID3D12Fence_SetEventOnCompletion(vio_d3d12.fence, vio_d3d12.ubatch_alloc_fence[slot], vio_d3d12.fence_event);
+            WaitForSingleObject(vio_d3d12.fence_event, INFINITE);
+        }
+        ID3D12CommandAllocator_Reset(alloc);
+    }
+    if (!vio_d3d12.ubatch_list) {
+        hr = ID3D12Device_CreateCommandList(vio_d3d12.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                                            &IID_ID3D12GraphicsCommandList, (void **)&vio_d3d12.ubatch_list);
+        if (FAILED(hr)) return -1;
+    } else if (FAILED(ID3D12GraphicsCommandList_Reset(vio_d3d12.ubatch_list, alloc, NULL))) {
+        return -1;
+    }
+    vio_d3d12.ubatch_open = 1;
+    vio_d3d12.ubatch_range_count = 0;
+    return 0;
+}
+
+static void d3d12_ubatch_flush(void)
+{
+    if (!vio_d3d12.ubatch_open) return;
+    vio_d3d12.ubatch_open = 0;
+    vio_d3d12.ubatch_range_count = 0;
+    int slot = vio_d3d12.ubatch_alloc_idx;
+    ID3D12GraphicsCommandList_Close(vio_d3d12.ubatch_list);
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)vio_d3d12.ubatch_list };
+    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    vio_d3d12.fence_value++;
+    ID3D12CommandQueue_Signal(vio_d3d12.cmd_queue, vio_d3d12.fence, vio_d3d12.fence_value);
+    vio_d3d12.ubatch_alloc_fence[slot] = vio_d3d12.fence_value;
+    vio_d3d12.ubatch_alloc_idx = (slot + 1) % VIO_D3D12_UBATCH_ALLOCATORS;
+    vio_d3d12.upload_last_fence = vio_d3d12.fence_value;
+
+    /* The ring bytes staged so far are read by this submission. */
+    if (vio_d3d12.uring_span_count >= vio_d3d12.uring_span_cap) {
+        int cap = vio_d3d12.uring_span_cap ? vio_d3d12.uring_span_cap * 2 : 16;
+        void *grown = realloc(vio_d3d12.uring_spans, (size_t)cap * sizeof(*vio_d3d12.uring_spans));
+        if (!grown) {
+            /* No bookkeeping memory: let the GPU finish, then nothing is in flight. */
+            vio_d3d12_wait_for_gpu();
+            vio_d3d12.uring_tail = vio_d3d12.uring_head;
+            vio_d3d12.uring_span_count = 0;
+            return;
+        }
+        vio_d3d12.uring_spans = grown;
+        vio_d3d12.uring_span_cap = cap;
+    }
+    vio_d3d12.uring_spans[vio_d3d12.uring_span_count].fence = vio_d3d12.fence_value;
+    vio_d3d12.uring_spans[vio_d3d12.uring_span_count].end = vio_d3d12.uring_head;
+    vio_d3d12.uring_span_count++;
+}
+
+/* Is `res` the target of a copy in the open batch? */
+static int d3d12_ubatch_targets(ID3D12Resource *res)
+{
+    if (!vio_d3d12.ubatch_open) return 0;
+    for (int i = 0; i < vio_d3d12.ubatch_range_count; i++)
+        if (vio_d3d12.ubatch_ranges[i].res == res) return 1;
+    return 0;
+}
+
+/* Record "ring[src_off .. +size) -> dst[offset ..)" into the open batch. The
+ * buffer starts the batch in COMMON (buffers decay at every ExecuteCommandLists)
+ * and the copy promotes it to COPY_DEST. A copy into a buffer that overlaps an
+ * earlier copy of this batch is ordered by a COPY_DEST -> COMMON transition
+ * first (D3D12 does not order two writes without a barrier); the copy then
+ * promotes it again. Returns 0 on success. */
+static int d3d12_ubatch_copy(ID3D12Resource *dst, UINT64 offset, UINT64 src_off, UINT64 size)
+{
+    if (vio_d3d12.ubatch_range_count >= vio_d3d12.ubatch_range_cap) {
+        int cap = vio_d3d12.ubatch_range_cap ? vio_d3d12.ubatch_range_cap * 2 : 64;
+        void *grown = realloc(vio_d3d12.ubatch_ranges, (size_t)cap * sizeof(*vio_d3d12.ubatch_ranges));
+        if (!grown) return -1;
+        vio_d3d12.ubatch_ranges = grown;
+        vio_d3d12.ubatch_range_cap = cap;
+    }
+    int overlap = 0;
+    for (int i = 0; i < vio_d3d12.ubatch_range_count; i++) {
+        if (vio_d3d12.ubatch_ranges[i].res == dst &&
+            vio_d3d12.ubatch_ranges[i].begin < offset + size && offset < vio_d3d12.ubatch_ranges[i].end) {
+            overlap = 1;
+            break;
+        }
+    }
+    if (overlap) {
+        D3D12_RESOURCE_BARRIER b = {0};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = dst;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.ubatch_list, 1, &b);
+        /* Every copy into dst so far is now ordered before what follows. */
+        int kept = 0;
+        for (int i = 0; i < vio_d3d12.ubatch_range_count; i++)
+            if (vio_d3d12.ubatch_ranges[i].res != dst) vio_d3d12.ubatch_ranges[kept++] = vio_d3d12.ubatch_ranges[i];
+        vio_d3d12.ubatch_range_count = kept;
+    }
+    vio_d3d12.ubatch_ranges[vio_d3d12.ubatch_range_count].res = dst;
+    vio_d3d12.ubatch_ranges[vio_d3d12.ubatch_range_count].begin = offset;
+    vio_d3d12.ubatch_ranges[vio_d3d12.ubatch_range_count].end = offset + size;
+    vio_d3d12.ubatch_range_count++;
+    ID3D12GraphicsCommandList_CopyBufferRegion(vio_d3d12.ubatch_list, dst, offset, vio_d3d12.uring, src_off, size);
+    return 0;
+}
+
+static void d3d12_ubatch_shutdown(void)
+{
+    /* The caller waited for the GPU: nothing staged is in flight any more. */
+    if (vio_d3d12.ubatch_open && vio_d3d12.ubatch_list) ID3D12GraphicsCommandList_Close(vio_d3d12.ubatch_list);
+    vio_d3d12.ubatch_open = 0;
+    if (vio_d3d12.ubatch_list) { ID3D12GraphicsCommandList_Release(vio_d3d12.ubatch_list); vio_d3d12.ubatch_list = NULL; }
+    for (int i = 0; i < VIO_D3D12_UBATCH_ALLOCATORS; i++) {
+        if (vio_d3d12.ubatch_allocs[i]) { ID3D12CommandAllocator_Release(vio_d3d12.ubatch_allocs[i]); vio_d3d12.ubatch_allocs[i] = NULL; }
+        vio_d3d12.ubatch_alloc_fence[i] = 0;
+    }
+    if (vio_d3d12.uring) { ID3D12Resource_Release(vio_d3d12.uring); vio_d3d12.uring = NULL; }
+    vio_d3d12.uring_mapped = NULL;
+    vio_d3d12.uring_cap = vio_d3d12.uring_head = vio_d3d12.uring_tail = 0;
+    free(vio_d3d12.uring_spans);
+    vio_d3d12.uring_spans = NULL;
+    vio_d3d12.uring_span_count = vio_d3d12.uring_span_cap = 0;
+    free(vio_d3d12.ubatch_ranges);
+    vio_d3d12.ubatch_ranges = NULL;
+    vio_d3d12.ubatch_range_count = vio_d3d12.ubatch_range_cap = 0;
+    vio_d3d12.ubatch_alloc_idx = 0;
+}
+
+static int d3d12_upload_buffer_dedicated(ID3D12Resource *dst, UINT64 offset, const void *data, size_t size);
+
+/* Copy `data` into `dst` at byte `offset`: staged in the upload ring and
+ * recorded into the buffer upload batch, which executes before any list
+ * submitted after this call. Copies above VIO_D3D12_URING_MAX_COPY (or with the
+ * ring unavailable) take their own staging buffer on the upload queue. */
 static int d3d12_upload_buffer_at(ID3D12Resource *dst, UINT64 offset, const void *data, size_t size)
+{
+    if (!dst || !data || size == 0) return -1;
+    if (vio_d3d12.fence && vio_d3d12.cmd_queue && vio_d3d12.fence_event) {
+        INT64 at = d3d12_uring_alloc((UINT64)size);
+        if (at >= 0 && d3d12_ubatch_begin() == 0) {
+            memcpy(vio_d3d12.uring_mapped + at, data, size);
+            if (d3d12_ubatch_copy(dst, offset, (UINT64)at, (UINT64)size) == 0) return 0;
+        }
+    }
+    return d3d12_upload_buffer_dedicated(dst, offset, data, size);
+}
+
+/* Own staging buffer + one submission on the upload queue (large copies). */
+static int d3d12_upload_buffer_dedicated(ID3D12Resource *dst, UINT64 offset, const void *data, size_t size)
 {
     if (!dst || !data || size == 0) return -1;
     D3D12_HEAP_PROPERTIES hp = {0};
@@ -4420,7 +4702,7 @@ static unsigned char *d3d12_readback_subresource(ID3D12Resource *src, UINT subre
         ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
         ID3D12GraphicsCommandList_Close(list);
         ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        d3d12_execute_lists(1, lists);
         vio_d3d12_wait_for_gpu();
         ID3D12GraphicsCommandList_Release(list);
         ID3D12CommandAllocator_Release(alloc);
@@ -5822,7 +6104,7 @@ static int d3d12_generate_mips_gpu(ID3D12Resource *res, int slices, int levels, 
 
     ID3D12GraphicsCommandList_Close(list);
     ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    d3d12_execute_lists(1, lists);
     vio_d3d12_wait_for_gpu();
     d3d12_drain_info_queue("generate_mipmaps");
     ID3D12GraphicsCommandList_Release(list);
@@ -6113,7 +6395,7 @@ static int d3d12_generate_depth_mips(vio_render_target_object *rt)
     }
     ID3D12GraphicsCommandList_Close(list);
     ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    d3d12_execute_lists(1, lists);
     vio_d3d12_wait_for_gpu();
     d3d12_drain_info_queue("generate_mipmaps (depth)");
     ID3D12GraphicsCommandList_Release(list);
@@ -7044,7 +7326,7 @@ static void d3d12_end_frame(void)
     vio_d3d12.in_frame = 0;
 
     ID3D12CommandList *cmd_lists[] = { (ID3D12CommandList *)vio_d3d12.cmd_list };
-    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, cmd_lists);
+    d3d12_execute_lists(1, cmd_lists);
 }
 
 static void d3d12_draw(vio_draw_cmd *cmd)
@@ -7292,7 +7574,7 @@ unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
 
         ID3D12GraphicsCommandList_Close(vio_d3d12.cmd_list);
         ID3D12CommandList *lists[] = { (ID3D12CommandList *)vio_d3d12.cmd_list };
-        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        d3d12_execute_lists(1, lists);
 
         /* Wait for the copy (and all preceding frame work) to finish. */
         vio_d3d12_wait_for_gpu();
@@ -7335,7 +7617,7 @@ unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
 
         ID3D12GraphicsCommandList_Close(list);
         ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        d3d12_execute_lists(1, lists);
         vio_d3d12_wait_for_gpu();
 
         ID3D12GraphicsCommandList_Release(list);
@@ -7848,7 +8130,7 @@ static void d3d12_compute_wait(void)
     }
     ID3D12GraphicsCommandList_Close(vio_d3d12.cmd_list);
     ID3D12CommandList *lists[] = { (ID3D12CommandList *)vio_d3d12.cmd_list };
-    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    d3d12_execute_lists(1, lists);
     vio_d3d12_wait_for_gpu();
 
     d3d12_reopen_frame_list();
@@ -7951,7 +8233,7 @@ static void *d3d12_upscaler_create(const vio_upscale_create_desc *desc, char *re
     if (list) {
         if (SUCCEEDED(ID3D12GraphicsCommandList_Close(list))) {
             ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-            ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+            d3d12_execute_lists(1, lists);
             vio_d3d12_wait_for_gpu();
         }
         ID3D12GraphicsCommandList_Release(list);
@@ -8401,7 +8683,7 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
 
     ID3D12GraphicsCommandList_Close(list);
     ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    d3d12_execute_lists(1, lists);
     vio_d3d12_wait_for_gpu();
 
     d3d12_drain_info_queue("dispatch_compute");
@@ -8444,7 +8726,7 @@ static size_t d3d12_read_buffer(void *backend_buffer, void *out, size_t size)
                 d3d12_buffer_to_readback(list, buf);
                 ID3D12GraphicsCommandList_Close(list);
                 ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-                ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+                d3d12_execute_lists(1, lists);
                 vio_d3d12_wait_for_gpu();
             }
             if (list) ID3D12GraphicsCommandList_Release(list);
@@ -8892,7 +9174,7 @@ static int d3d12_trace_rays(void *ptr, const vio_rt_buffer_binding *buffers, int
     if (FAILED(ID3D12GraphicsCommandList_Close(list))) goto done;
     {
         ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-        ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+        d3d12_execute_lists(1, lists);
         vio_d3d12_wait_for_gpu();
     }
     d3d12_drain_info_queue("trace_rays");
@@ -9195,7 +9477,7 @@ static void d3d12_dispatch_graph(void *ptr, const void *records, int count)
     }
     ID3D12GraphicsCommandList_Close(list);
     ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
-    ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, 1, lists);
+    d3d12_execute_lists(1, lists);
     vio_d3d12_wait_for_gpu();
     d3d12_drain_info_queue("dispatch_graph");
     ID3D12GraphicsCommandList_Release(list);
