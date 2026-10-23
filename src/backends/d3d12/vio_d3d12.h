@@ -81,6 +81,16 @@
  * wait for its own previous upload. */
 #define VIO_D3D12_UPLOAD_ALLOCATORS    3
 
+/* Buffer upload batch (vio_update_buffer and buffer seed data): a persistently
+ * mapped UPLOAD ring the copies are staged in, and the allocators the batch
+ * list cycles through. The ring starts at URING_INITIAL bytes and doubles up to
+ * URING_MAX while every byte is still in flight; a single copy above
+ * URING_MAX_COPY takes its own staging buffer as before. */
+#define VIO_D3D12_UBATCH_ALLOCATORS    8
+#define VIO_D3D12_URING_INITIAL        (1u << 20)
+#define VIO_D3D12_URING_MAX            (64u << 20)
+#define VIO_D3D12_URING_MAX_COPY       (8u << 20)
+
 /* Graphics root-signature parameter indices (d3d12_create_root_signature).
  * [0..4] is the long-standing layout; [5..13] mirror the per-stage cbuffer,
  * SRV table and sampler table for the optional geometry / hull / domain
@@ -588,6 +598,36 @@ typedef struct _vio_d3d12_state {
     struct { IUnknown *res; UINT64 fence; } *upload_retire;
     int                        upload_retire_count;
     int                        upload_retire_cap;
+
+    /* Buffer upload batch. vio_update_buffer on a DEFAULT-heap buffer used to
+     * create a committed UPLOAD resource, record one copy on the upload list and
+     * submit it - per call (~0.5 ms on an RTX 2080). Now the bytes go into a
+     * persistently mapped UPLOAD ring (uring) and the copy is recorded into an
+     * open batch list (ubatch_list); the batch is submitted once, right before
+     * the next ExecuteCommandLists of any kind (d3d12_execute_lists) or GPU
+     * wait. So it still executes before the frame list of the frame it was
+     * written in - and before a sync dispatch / readback that follows - exactly
+     * like the old per-call submission, without a resource or a submit per call.
+     * Ring bytes are counted monotonically (offset = counter % uring_cap); each
+     * submitted batch leaves a span {fence, end} and the tail advances past it
+     * once the fence has passed. ubatch_ranges: the copies of the open batch,
+     * to order overlapping writes into the same buffer. */
+    ID3D12Resource            *uring;
+    unsigned char             *uring_mapped;
+    UINT64                     uring_cap;
+    UINT64                     uring_head;
+    UINT64                     uring_tail;
+    struct { UINT64 fence; UINT64 end; } *uring_spans;
+    int                        uring_span_count;
+    int                        uring_span_cap;
+    ID3D12GraphicsCommandList *ubatch_list;
+    ID3D12CommandAllocator    *ubatch_allocs[VIO_D3D12_UBATCH_ALLOCATORS];
+    UINT64                     ubatch_alloc_fence[VIO_D3D12_UBATCH_ALLOCATORS];
+    int                        ubatch_alloc_idx;
+    int                        ubatch_open;
+    struct { ID3D12Resource *res; UINT64 begin, end; } *ubatch_ranges;
+    int                        ubatch_range_count;
+    int                        ubatch_range_cap;
 
     /* Pre-built block of VIO_D3D12_SRV_TABLE_SIZE null SRVs in the staging heap
      * (GAP-PLAN 4.3): flush_srv_table copies it with one CopyDescriptorsSimple
