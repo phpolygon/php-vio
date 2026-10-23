@@ -1,3 +1,10 @@
+# [2.36.0](https://github.com/phpolygon/php-vio/compare/v2.35.0...v2.36.0) (2026-10-23)
+
+
+### Features
+
+* **audio:** live pitch/pan, 2D/3D switch, attenuation, Doppler, cones, listener up vector, offline render ([31e6a19](https://github.com/phpolygon/php-vio/commit/31e6a190db441df22245dcbe0f6efe17853948b5))
+
 # [2.35.0](https://github.com/phpolygon/php-vio/compare/v2.34.1...v2.35.0) (2026-10-18)
 
 
