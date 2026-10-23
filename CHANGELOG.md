@@ -1,3 +1,10 @@
+## [2.36.1](https://github.com/phpolygon/php-vio/compare/v2.36.0...v2.36.1) (2026-10-23)
+
+
+### Bug Fixes
+
+* **d3d12:** stage buffer updates in an upload ring, one batch per frame ([eb65bb8](https://github.com/phpolygon/php-vio/commit/eb65bb831aa8d91cda95f532c5c40768a311f0f0))
+
 # [2.36.0](https://github.com/phpolygon/php-vio/compare/v2.35.0...v2.36.0) (2026-10-23)
 
 
