@@ -378,6 +378,18 @@ typedef struct _vio_d3d12_state {
     DXGI_FORMAT                swapchain_format;
     int                        hdr_output;
     float                      hdr_paper_white;
+    /* HDR composite (vio_create 'hdr_composite', needs hdr_output): every draw to
+     * the screen lands in hdr_layer (swapchain format, display-referred values
+     * blended like an SDR backbuffer); end_frame PQ-encodes it into the
+     * swapchain buffer in one fullscreen pass. The layer stays in
+     * RENDER_TARGET state outside that pass. */
+    int                        hdr_composite;
+    ID3D12Resource            *hdr_layer;
+    ID3D12DescriptorHeap      *hdr_layer_rtv_heap;
+    D3D12_CPU_DESCRIPTOR_HANDLE hdr_layer_rtv;
+    ID3D12DescriptorHeap      *hdr_encode_heap;   /* shader-visible, one SRV: the layer */
+    ID3D12RootSignature       *hdr_encode_rs;
+    ID3D12PipelineState       *hdr_encode_pso;
     /* Shader model in use (GAP-PHASE5 Block 7): 6 => DXC / DXIL, else FXC 5.1.
      * shader_model_version is the profile as major * 10 + minor (60..69 with
      * DXC: the highest the device and DXC / dxil.dll accept; 51 with FXC) and

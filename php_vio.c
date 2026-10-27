@@ -747,6 +747,10 @@ pick_backend:
         if ((val = zend_hash_str_find(options_ht, "hdr_paper_white", sizeof("hdr_paper_white") - 1)) != NULL) {
             ctx->config.hdr_paper_white = (float)zval_get_double(val);
         }
+        /* HDR composite (D3D12): blend in an SDR layer, PQ-encode once at vio_end. */
+        if ((val = zend_hash_str_find(options_ht, "hdr_composite", sizeof("hdr_composite") - 1)) != NULL) {
+            ctx->config.hdr_composite = zend_is_true(val) ? 1 : 0;
+        }
         /* D3D12 shader model: 6 => DXC / DXIL (opt-in), 60..69 pins the profile, default FXC 5.1. */
         if ((val = zend_hash_str_find(options_ht, "shader_model", sizeof("shader_model") - 1)) != NULL) {
             ctx->config.shader_model = (int)zval_get_long(val);
@@ -11060,6 +11064,7 @@ ZEND_FUNCTION(vio_swapchain_info)
     add_assoc_bool(return_value, "hdr_output", info.hdr_output ? 1 : 0);
     add_assoc_long(return_value, "format", info.format);
     add_assoc_long(return_value, "shader_model", info.shader_model);
+    add_assoc_bool(return_value, "hdr_composite", info.hdr_composite ? 1 : 0);
     add_assoc_long(return_value, "shader_model_version", info.shader_model_version);
     add_assoc_long(return_value, "agility_sdk", info.agility_sdk);
 }
