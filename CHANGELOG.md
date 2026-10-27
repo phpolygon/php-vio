@@ -1,3 +1,10 @@
+# [2.37.0](https://github.com/phpolygon/php-vio/compare/v2.36.1...v2.37.0) (2026-10-27)
+
+
+### Features
+
+* **d3d12:** HDR composite – blend in an SDR layer, PQ-encode once at vio_end ([fe8e0b6](https://github.com/phpolygon/php-vio/commit/fe8e0b6d873f17c9b197cd846bc70cbd0eb7a126))
+
 ## [2.36.1](https://github.com/phpolygon/php-vio/compare/v2.36.0...v2.36.1) (2026-10-23)
 
 
