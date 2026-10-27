@@ -673,6 +673,30 @@ jobs:
         with:
           php-version: ${{ matrix.php }}
 
+      # php/setup-php-sdk v0.12 (archived) renames "php-<revision>-devel-vs17-x64"
+      # after unpacking the devel pack. Since the Windows builds carry a build
+      # suffix (revision "8.5.12-1") the pack unpacks without it
+      # ("php-8.5.12-devel-vs17-x64") and the rename fails. The action skips the
+      # pack when php-dev already exists, so unpack it here and find the folder
+      # by pattern.
+      - name: Install PHP devel pack (setup-php-sdk revision suffix workaround)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $base = "https://downloads.php.net/~windows/releases"
+          $revision = (Invoke-RestMethod -Uri "$base/releases.json" -UseBasicParsing)."${{ matrix.php }}".version
+          if (-not $revision) { throw "no Windows release for PHP ${{ matrix.php }}" }
+          $tspart = if ("${{ matrix.ts }}" -eq "nts") { "nts-Win32" } else { "Win32" }
+          $zip = "$env:RUNNER_TEMP\php-devel.zip"
+          Invoke-WebRequest "$base/php-devel-pack-$revision-$tspart-vs17-x64.zip" -OutFile $zip
+          $out = "$env:RUNNER_TEMP\php-devel"
+          Expand-Archive $zip $out
+          $dir = Get-ChildItem $out -Directory | Where-Object Name -like "php-*-devel-vs17-x64" | Select-Object -First 1
+          if (-not $dir) { throw "devel pack folder not found in $(Get-ChildItem $out | Out-String)" }
+          Move-Item $dir.FullName "php-dev"
+          Write-Output "devel pack $revision -> php-dev ($($dir.Name))"
+
       - name: Setup PHP SDK
         id: php-sdk
         uses: php/setup-php-sdk@v0.12
@@ -875,6 +899,7 @@ jobs:
             tests/core/116_shader_cache_all_backends.phpt `
             tests/core/117_frame_latency_all_backends.phpt `
             tests/core/118_hdr_output_d3d.phpt `
+            tests/core/251_hdr_composite_d3d12.phpt `
             tests/core/119_shader_model_6_d3d12.phpt `
             tests/render3d/120_indirect_draw_all_backends.phpt `
             tests/render3d/121_texture_array_bc_ktx2_all_backends.phpt `

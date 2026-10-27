@@ -18,6 +18,10 @@
  *                       hdr_output => true|1|2: HDR10 backbuffer (RGB10A2, ST 2084) on D3D11 / D3D12 when the
  *                       display is in HDR mode (2 = force); the 2D batch PQ-encodes its output,
  *                       hdr_paper_white => nits that display white maps to (default 200),
+ *                       hdr_composite => true: with HDR10 active (D3D12), draws to the screen blend in an
+ *                       SDR layer that vio_end PQ-encodes once, so alpha blending (antialiased text) looks
+ *                       as on SDR; the 2D batch and the application's own resolve must then not encode.
+ *                       vio_swapchain_info()['hdr_composite'] says whether it is in use,
  *                       shader_model => 6: compile D3D12 shaders with DXC to DXIL (needs dxcompiler.dll +
  *                       dxil.dll, optionally located via dxc_dir => directory; falls back to FXC 5.1). The
  *                       profile is the highest 6.x the device and DXC accept; 60..69 pins it

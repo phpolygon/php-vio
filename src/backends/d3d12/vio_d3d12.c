@@ -904,6 +904,211 @@ static int d3d12_create_root_signature(void)
  * argument push stays the same). */
 static ID3D12RootSignature *d3d12_graphics_root_signature(void);
 
+/* ── HDR composite ────────────────────────────────────────────────────
+ *
+ * With HDR10 the 2D batch used to PQ-encode every fragment itself, so alpha
+ * blending ran on PQ values: an antialiased glyph edge at 50 % coverage over a
+ * dark panel landed near 12 instead of ~40 nits, and small text read thin and
+ * dim. With vio_create('hdr_composite' => true) the frame is drawn into
+ * hdr_layer (same format as the swapchain, display-referred values exactly as
+ * on an SDR backbuffer) and end_frame encodes it once; the 2D batch and the
+ * application's resolve then must not encode (vio_swapchain_info tells). */
+
+/* Same curve as the 2D batch (vio_2d_hlsl_cb): gamma 2.2 to linear, BT.709 ->
+ * BT.2020, paper-white nits, ST 2084. */
+static const char *d3d12_hdr_encode_vs =
+    "struct VSOut { float4 pos : SV_Position; };\n"
+    "VSOut main(uint id : SV_VertexID) {\n"
+    "    VSOut o;\n"
+    "    float2 uv = float2((id << 1) & 2, id & 2);\n"
+    "    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+
+static const char *d3d12_hdr_encode_ps =
+    "Texture2D<float4> layer : register(t0);\n"
+    "cbuffer P : register(b0) { float paperWhite; float3 pad; };\n"
+    "struct VSOut { float4 pos : SV_Position; };\n"
+    "float4 main(VSOut i) : SV_Target {\n"
+    "    float3 c = layer.Load(int3(int2(i.pos.xy), 0)).rgb;\n"
+    "    float3 lin = pow(max(c, 0.0), 2.2);\n"
+    "    float3 bt2020 = float3(dot(lin, float3(0.6274, 0.3293, 0.0433)), dot(lin, float3(0.0691, 0.9195, 0.0114)), dot(lin, float3(0.0164, 0.0880, 0.8956)));\n"
+    "    float3 y = pow(max(bt2020 * (paperWhite / 10000.0), 0.0), 0.1593017578125);\n"
+    "    return float4(pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375), 1.0);\n"
+    "}\n";
+
+static HRESULT d3d12_compile_cached(const char *src, const char *entry_tag, const char *profile, UINT flags, ID3DBlob **out);
+
+/* Root signature + PSO of the encode pass, created once with the swapchain. */
+static int d3d12_ensure_hdr_encode(void)
+{
+    if (vio_d3d12.hdr_encode_pso) return 0;
+
+    D3D12_DESCRIPTOR_RANGE range = {0};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_ROOT_PARAMETER params[2] = {0};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;   /* b0: paper white */
+    params[0].Constants.Num32BitValues = 4;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;  /* t0: the layer */
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &range;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rs = {0};
+    rs.NumParameters = 2;
+    rs.pParameters = params;
+
+    ID3DBlob *sig = NULL, *err = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) || !sig) {
+        if (err) ID3D10Blob_Release(err);
+        return -1;
+    }
+    HRESULT hr = ID3D12Device_CreateRootSignature(vio_d3d12.device, 0, ID3D10Blob_GetBufferPointer(sig),
+                                                  ID3D10Blob_GetBufferSize(sig), &IID_ID3D12RootSignature,
+                                                  (void **)&vio_d3d12.hdr_encode_rs);
+    ID3D10Blob_Release(sig);
+    if (FAILED(hr)) { vio_d3d12.hdr_encode_rs = NULL; return -1; }
+
+    ID3DBlob *vs = NULL, *ps = NULL;
+    if (FAILED(d3d12_compile_cached(d3d12_hdr_encode_vs, "hdr_encode_vs", "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, &vs)) || !vs
+        || FAILED(d3d12_compile_cached(d3d12_hdr_encode_ps, "hdr_encode_ps", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, &ps)) || !ps) {
+        if (vs) ID3D10Blob_Release(vs);
+        return -1;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = vio_d3d12.hdr_encode_rs;
+    pd.VS.pShaderBytecode = ID3D10Blob_GetBufferPointer(vs);
+    pd.VS.BytecodeLength = ID3D10Blob_GetBufferSize(vs);
+    pd.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(ps);
+    pd.PS.BytecodeLength = ID3D10Blob_GetBufferSize(ps);
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = vio_d3d12.swapchain_format;
+    pd.SampleDesc.Count = 1;
+    hr = ID3D12Device_CreateGraphicsPipelineState(vio_d3d12.device, &pd, &IID_ID3D12PipelineState,
+                                                  (void **)&vio_d3d12.hdr_encode_pso);
+    ID3D10Blob_Release(vs);
+    ID3D10Blob_Release(ps);
+    if (FAILED(hr)) { vio_d3d12.hdr_encode_pso = NULL; return -1; }
+
+    if (d3d12_create_descriptor_heap(&vio_d3d12.hdr_encode_heap, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0
+        || d3d12_create_descriptor_heap(&vio_d3d12.hdr_layer_rtv_heap, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void d3d12_release_hdr_encode(void)
+{
+    if (vio_d3d12.hdr_encode_pso)     { ID3D12PipelineState_Release(vio_d3d12.hdr_encode_pso); vio_d3d12.hdr_encode_pso = NULL; }
+    if (vio_d3d12.hdr_encode_rs)      { ID3D12RootSignature_Release(vio_d3d12.hdr_encode_rs); vio_d3d12.hdr_encode_rs = NULL; }
+    if (vio_d3d12.hdr_encode_heap)    { ID3D12DescriptorHeap_Release(vio_d3d12.hdr_encode_heap); vio_d3d12.hdr_encode_heap = NULL; }
+    if (vio_d3d12.hdr_layer_rtv_heap) { ID3D12DescriptorHeap_Release(vio_d3d12.hdr_layer_rtv_heap); vio_d3d12.hdr_layer_rtv_heap = NULL; }
+}
+
+/* The layer at the swapchain size, with its RTV and the encode pass's SRV. */
+static int d3d12_create_hdr_layer(void)
+{
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = (UINT64)vio_d3d12.width;
+    rd.Height = (UINT)vio_d3d12.height;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = vio_d3d12.swapchain_format;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv = {0};
+    cv.Format = rd.Format;
+    HRESULT hr = ID3D12Device_CreateCommittedResource(vio_d3d12.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
+                                                      &IID_ID3D12Resource, (void **)&vio_d3d12.hdr_layer);
+    if (FAILED(hr)) {
+        vio_d3d12.hdr_layer = NULL;
+        php_error_docref(NULL, E_WARNING, "D3D12: HDR composite layer %dx%d failed (0x%08lx)",
+                         vio_d3d12.width, vio_d3d12.height, hr);
+        return -1;
+    }
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.hdr_layer_rtv_heap, &vio_d3d12.hdr_layer_rtv);
+    ID3D12Device_CreateRenderTargetView(vio_d3d12.device, vio_d3d12.hdr_layer, NULL, vio_d3d12.hdr_layer_rtv);
+    D3D12_CPU_DESCRIPTOR_HANDLE srv;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.hdr_encode_heap, &srv);
+    ID3D12Device_CreateShaderResourceView(vio_d3d12.device, vio_d3d12.hdr_layer, NULL, srv);
+    return 0;
+}
+
+/* Where draws to the screen go: the layer with the HDR composite, else the
+ * frame's swapchain buffer. */
+static D3D12_CPU_DESCRIPTOR_HANDLE d3d12_screen_rtv(vio_d3d12_frame *frame)
+{
+    return vio_d3d12.hdr_composite ? vio_d3d12.hdr_layer_rtv : frame->rtv_handle;
+}
+
+/* End of frame with the HDR composite: layer -> PQ -> swapchain buffer, which
+ * leaves in PRESENT state as on the plain path. Recorded last on the list. */
+static void d3d12_hdr_encode(vio_d3d12_frame *frame)
+{
+    ID3D12GraphicsCommandList *l = vio_d3d12.cmd_list;
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.pResource = vio_d3d12.hdr_layer;
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[1].Transition.pResource = frame->render_target;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    ID3D12GraphicsCommandList_ResourceBarrier(l, 2, b);
+
+    ID3D12GraphicsCommandList_OMSetRenderTargets(l, 1, &frame->rtv_handle, FALSE, NULL);
+    D3D12_VIEWPORT vp = {0, 0, (float)vio_d3d12.width, (float)vio_d3d12.height, 0.0f, 1.0f};
+    ID3D12GraphicsCommandList_RSSetViewports(l, 1, &vp);
+    D3D12_RECT sc = {0, 0, vio_d3d12.width, vio_d3d12.height};
+    ID3D12GraphicsCommandList_RSSetScissorRects(l, 1, &sc);
+    if (vio_d3d12.shading_rate != VIO_SHADING_RATE_1X1 && vio_d3d12.cmd_list5 && vio_d3d12.vrs_tier > 0) {
+        /* The encode reads every pixel once: never coarse. */
+        if (vio_d3d12.vrs_tier >= 2) {
+            D3D12_SHADING_RATE_COMBINER comb[2] = { D3D12_SHADING_RATE_COMBINER_PASSTHROUGH, D3D12_SHADING_RATE_COMBINER_PASSTHROUGH };
+            ID3D12GraphicsCommandList5_RSSetShadingRate(vio_d3d12.cmd_list5, D3D12_SHADING_RATE_1X1, comb);
+            ID3D12GraphicsCommandList5_RSSetShadingRateImage(vio_d3d12.cmd_list5, NULL);
+        } else {
+            ID3D12GraphicsCommandList5_RSSetShadingRate(vio_d3d12.cmd_list5, D3D12_SHADING_RATE_1X1, NULL);
+        }
+    }
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(l, vio_d3d12.hdr_encode_rs);
+    ID3D12GraphicsCommandList_SetPipelineState(l, vio_d3d12.hdr_encode_pso);
+    ID3D12DescriptorHeap *heaps[] = { vio_d3d12.hdr_encode_heap };
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(l, 1, heaps);
+    float pc[4] = { vio_d3d12.hdr_paper_white > 0.0f ? vio_d3d12.hdr_paper_white : 200.0f, 0.0f, 0.0f, 0.0f };
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(l, 0, 4, pc, 0);
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.hdr_encode_heap, &gpu);
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(l, 1, gpu);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(l, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_DrawInstanced(l, 3, 1, 0, 0);
+
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    ID3D12GraphicsCommandList_ResourceBarrier(l, 2, b);
+}
+
 /* ── Render target views ──────────────────────────────────────────── */
 
 static int d3d12_create_render_targets(void)
@@ -927,6 +1132,10 @@ static int d3d12_create_render_targets(void)
         rtv_handle.ptr += vio_d3d12.rtv_descriptor_size;
     }
 
+    if (vio_d3d12.hdr_composite && d3d12_create_hdr_layer() != 0) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -937,6 +1146,10 @@ static void d3d12_release_render_targets(void)
             ID3D12Resource_Release(vio_d3d12.frames[i].render_target);
             vio_d3d12.frames[i].render_target = NULL;
         }
+    }
+    if (vio_d3d12.hdr_layer) {
+        ID3D12Resource_Release(vio_d3d12.hdr_layer);
+        vio_d3d12.hdr_layer = NULL;
     }
 }
 
@@ -1913,6 +2126,7 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.dmip_rs)        { ID3D12RootSignature_Release(vio_d3d12.dmip_rs); vio_d3d12.dmip_rs = NULL; }
     if (vio_d3d12.mipgen_pso)     ID3D12PipelineState_Release(vio_d3d12.mipgen_pso);
     if (vio_d3d12.mipgen_rs)      ID3D12RootSignature_Release(vio_d3d12.mipgen_rs);
+    d3d12_release_hdr_encode();
     d3d12_block_heap_destroy(&vio_d3d12.mipgen_heap);
     if (vio_d3d12.cmd_list5)      ID3D12GraphicsCommandList5_Release(vio_d3d12.cmd_list5);
     if (vio_d3d12.cmd_list1)      ID3D12GraphicsCommandList1_Release(vio_d3d12.cmd_list1);
@@ -2029,6 +2243,15 @@ static void *d3d12_create_surface(vio_config *cfg)
             vio_d3d12.hdr_output = 1;
         } else if (cfg->hdr_output == 2) {
             vio_d3d12.hdr_output = 1;   /* forced: encode PQ anyway (test path) */
+        }
+    }
+    vio_d3d12.hdr_composite = 0;
+    if (vio_d3d12.hdr_output && cfg->hdr_composite) {
+        if (d3d12_ensure_hdr_encode() == 0) {
+            vio_d3d12.hdr_composite = 1;
+        } else {
+            d3d12_release_hdr_encode();
+            php_error_docref(NULL, E_WARNING, "D3D12: HDR composite unavailable, the 2D batch encodes PQ itself");
         }
     }
     if (cfg->frame_latency > 0) {
@@ -5197,9 +5420,10 @@ static void d3d12_unbind_render_target(unsigned int default_fbo, int width, int 
     vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.dsv_heap, &dsv_handle);
-    ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1, &frame->rtv_handle, FALSE, &dsv_handle);
-    vio_d3d12.current_rtv = frame->rtv_handle;
-    vio_d3d12.current_rtvs[0] = frame->rtv_handle;
+    D3D12_CPU_DESCRIPTOR_HANDLE screen_rtv = d3d12_screen_rtv(frame);
+    ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1, &screen_rtv, FALSE, &dsv_handle);
+    vio_d3d12.current_rtv = screen_rtv;
+    vio_d3d12.current_rtvs[0] = screen_rtv;
     vio_d3d12.current_rtv_count = 1;
     vio_d3d12.current_dsv = dsv_handle;
     vio_d3d12.current_rt_width = vio_d3d12.width;
@@ -7114,26 +7338,31 @@ static void d3d12_begin_frame(void)
                                            (UINT)vio_d3d12.frame_index * VIO_GPU_TS_PER_FRAME);
     }
 
-    /* Transition render target: PRESENT -> RENDER_TARGET */
-    D3D12_RESOURCE_BARRIER barrier = {0};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = frame->render_target;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+    /* Transition render target: PRESENT -> RENDER_TARGET. With the HDR
+     * composite the frame draws into the layer (always RENDER_TARGET) and the
+     * swapchain buffer stays PRESENT until end_frame encodes into it. */
+    if (!vio_d3d12.hdr_composite) {
+        D3D12_RESOURCE_BARRIER barrier = {0};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = frame->render_target;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+    }
 
     /* Set render target */
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.dsv_heap, &dsv_handle);
+    D3D12_CPU_DESCRIPTOR_HANDLE screen_rtv = d3d12_screen_rtv(frame);
     ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1,
-                                                  &frame->rtv_handle, FALSE, &dsv_handle);
+                                                  &screen_rtv, FALSE, &dsv_handle);
 
     /* Track current render target */
     vio_d3d12.current_rt_samples = 1;
     vio_d3d12.current_rt_format = vio_d3d12.swapchain_format;
-    vio_d3d12.current_rtv = frame->rtv_handle;
-    vio_d3d12.current_rtvs[0] = frame->rtv_handle;
+    vio_d3d12.current_rtv = screen_rtv;
+    vio_d3d12.current_rtvs[0] = screen_rtv;
     vio_d3d12.current_rtv_count = 1;
     vio_d3d12.current_dsv = dsv_handle;
     vio_d3d12.current_rt_width = vio_d3d12.width;
@@ -7144,7 +7373,7 @@ static void d3d12_begin_frame(void)
     if (vio_d3d12.clear_pending) {
         vio_d3d12.clear_pending = 0;
         float color[4] = {vio_d3d12.clear_r, vio_d3d12.clear_g, vio_d3d12.clear_b, vio_d3d12.clear_a};
-        ID3D12GraphicsCommandList_ClearRenderTargetView(vio_d3d12.cmd_list, frame->rtv_handle, color, 0, NULL);
+        ID3D12GraphicsCommandList_ClearRenderTargetView(vio_d3d12.cmd_list, screen_rtv, color, 0, NULL);
         ID3D12GraphicsCommandList_ClearDepthStencilView(vio_d3d12.cmd_list, dsv_handle,
             D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
     }
@@ -7301,14 +7530,20 @@ static void d3d12_end_frame(void)
 
     vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
 
-    /* Transition render target: RENDER_TARGET -> PRESENT */
-    D3D12_RESOURCE_BARRIER barrier = {0};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = frame->render_target;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+    if (vio_d3d12.hdr_composite) {
+        /* Layer -> PQ -> swapchain buffer (PRESENT afterwards). A frame that
+         * ended on an offscreen target is not presented; nothing to encode. */
+        if (!vio_d3d12.current_bound_rt) d3d12_hdr_encode(frame);
+    } else {
+        /* Transition render target: RENDER_TARGET -> PRESENT */
+        D3D12_RESOURCE_BARRIER barrier = {0};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = frame->render_target;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 1, &barrier);
+    }
 
     /* GPU timestamp: end of the frame's command stream, resolved into this
      * slot's readback range; begin_frame reads it once the fence has passed. */
@@ -7499,7 +7734,9 @@ unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
     UINT read_idx = mid_frame ? vio_d3d12.frame_index
                               : vio_d3d12.last_presented_frame_idx;
     vio_d3d12_frame *frame = &vio_d3d12.frames[read_idx];
-    ID3D12Resource *src = frame->render_target;
+    /* Mid-frame with the HDR composite the drawing lives in the layer (SDR
+     * values, RENDER_TARGET state); after vio_end the encoded buffer is read. */
+    ID3D12Resource *src = (mid_frame && vio_d3d12.hdr_composite) ? vio_d3d12.hdr_layer : frame->render_target;
     if (!src) return NULL;
 
     /* The source's current resource state: a buffer being drawn this frame is
@@ -9495,6 +9732,7 @@ static void d3d12_swapchain_info(vio_swapchain_info *out)
     out->frame_latency = vio_d3d12.frame_latency;
     out->waitable      = vio_d3d12.frame_latency_waitable != NULL;
     out->hdr_output    = vio_d3d12.hdr_output;
+    out->hdr_composite = vio_d3d12.hdr_composite;
     out->format        = vio_d3d12.swapchain_format == DXGI_FORMAT_R10G10B10A2_UNORM ? VIO_FORMAT_RGB10A2 : VIO_FORMAT_RGBA8;
     out->shader_model  = vio_d3d12.shader_model == 6 ? 6 : 5;
     out->shader_model_version = vio_d3d12.shader_model_version;

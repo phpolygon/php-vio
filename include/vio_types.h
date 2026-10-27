@@ -553,6 +553,12 @@ typedef struct _vio_config {
      * (nits) that display-referred white (1.0) maps to; 0 => 200. */
     int         hdr_output;
     float       hdr_paper_white;
+    /* vio_create(['hdr_composite' => true]) with HDR10 active (D3D12): draws to the
+     * screen land in an SDR layer (blended like an SDR backbuffer) that vio_end
+     * PQ-encodes into the swapchain in one pass; the 2D batch does not encode.
+     * Without it alpha blending runs on PQ values (antialiased text thins out).
+     * vio_swapchain_info()['hdr_composite'] says whether it is in use. */
+    int         hdr_composite;
     /* D3D12 shader model (GAP-PHASE5 Block 7): 6 compiles the SPIRV-Cross HLSL
      * with DXC to DXIL (dxcompiler.dll + dxil.dll must be loadable, the device
      * must report SM 6.0); 0 / 5 / 50..59 = FXC 5.1 as before. The profile is the
@@ -583,6 +589,7 @@ typedef struct _vio_swapchain_info {
     int hdr_output;      /* 1 = HDR10 (10-bit, ST 2084) output active (GAP-PHASE5 Block 6) */
     int format;          /* vio_pixel_format-like code of the backbuffer: 0 RGBA8, 8 RGB10A2 */
     int shader_model;    /* D3D: 6 = DXC / DXIL, 5 = FXC; 0 elsewhere (GAP-PHASE5 Block 7) */
+    int hdr_composite;   /* 1 = screen draws go through the SDR layer, encoded at vio_end */
     int shader_model_version; /* compile profile as major * 10 + minor: D3D12 60..69 (DXC) or 51,
                                * D3D11 50; 0 elsewhere */
     int agility_sdk;     /* D3D12: the Agility SDK version the device runs on, 0 = OS runtime */

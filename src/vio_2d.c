@@ -577,7 +577,8 @@ void vio_2d_flush(vio_2d_state *state)
         {
             float cb[20];
             memcpy(cb, state->projection, sizeof(float) * 16);
-            cb[16] = vio_d3d12.hdr_output ? 1.0f : 0.0f;
+            /* With the HDR composite the layer is SDR: vio_end encodes it. */
+            cb[16] = (vio_d3d12.hdr_output && !vio_d3d12.hdr_composite) ? 1.0f : 0.0f;
             cb[17] = vio_d3d12.hdr_paper_white > 0.0f ? vio_d3d12.hdr_paper_white : 200.0f;
             cb[18] = 0.0f; cb[19] = 0.0f;
             memcpy(vio_d3d12.cbuffer_heap_mapped + cb_offset, cb, sizeof(cb));
