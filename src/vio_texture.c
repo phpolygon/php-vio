@@ -25,6 +25,7 @@ static zend_object *vio_texture_create_object(zend_class_entry *ce)
     tex->wrap       = VIO_WRAP_REPEAT;
     tex->valid      = 0;
     tex->borrowed   = 0;
+    tex->owner      = NULL;
     tex->backend    = NULL;
 
     zend_object_std_init(&tex->std, ce);
@@ -46,6 +47,7 @@ static void vio_texture_free_object(zend_object *obj)
             be->destroy_texture_obj(tex);
         }
     }
+    if (tex->owner) OBJ_RELEASE(tex->owner);
 
     zend_object_std_dtor(&tex->std);
 }

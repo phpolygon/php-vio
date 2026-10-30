@@ -29,6 +29,7 @@ static zend_object *vio_cubemap_create_object(zend_class_entry *ce)
     cm->backend_type  = 0;
     cm->mipmaps       = 0;
     cm->borrowed      = 0;
+    cm->owner         = NULL;
     cm->resolution    = 0;
     cm->valid         = 0;
     cm->backend       = NULL;
@@ -47,6 +48,7 @@ static void vio_cubemap_free_object(zend_object *obj)
     if (cm->backend && cm->backend->destroy_cubemap) {
         cm->backend->destroy_cubemap(cm);
     }
+    if (cm->owner) OBJ_RELEASE(cm->owner);
 
     zend_object_std_dtor(&cm->std);
 }

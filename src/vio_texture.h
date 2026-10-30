@@ -27,6 +27,7 @@ typedef struct _vio_texture_object {
     int          anisotropy;    /* vio_texture(['anisotropy' => N]), 0/1 = off */
     int          valid;
     int          borrowed;      /* 1 if texture_id is owned by another object (e.g. render target) */
+    zend_object *owner;         /* the VioRenderTarget a borrowed view points into, kept alive */
     int          storage;       /* 1 => created with 'storage' => true (compute image2D/3D target) */
     int          layers;        /* 1, or the array size for vio_texture(['layers' => N]) */
     int          is_array;      /* 1 => GL_TEXTURE_2D_ARRAY target (OpenGL bind path) */

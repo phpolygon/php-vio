@@ -937,6 +937,8 @@ void vulkan_destroy_render_target(void *rt_ptr)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
     if (!rt || rt->backend_type != VIO_RT_BACKEND_VULKAN) return;
+    /* Still the open pass: later draws of this frame belong to the swapchain again. */
+    if (vio_vk.in_frame && vio_vk.current_bound_rt == rt) vulkan_record_unbind_render_target();
     vulkan_rt_untrack(rt);
     if (vio_vk.current_bound_rt == rt) vio_vk.current_bound_rt = NULL;
     if (vio_vk.pending_bound_rt == rt) vio_vk.pending_bound_rt = NULL;
