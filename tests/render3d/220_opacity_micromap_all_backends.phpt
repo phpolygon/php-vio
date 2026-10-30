@@ -18,6 +18,10 @@ vio
  *   D. A as an inline ray query in a compute kernel (no any-hit stage there:
  *      only the opaque triangle is committed). D3D12 has to declare the query
  *      with RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS, or it ignores the map.
+ *   E/F. D3D12 pinned below SM 6.9 on Agility >= 1.620: the same query in a
+ *      compute kernel and a fragment shader. The HLSL flag does not exist there,
+ *      the PSO opts in. This pins that such PSOs are accepted and the result
+ *      stays right; an RTX 2080 honours the map without the opt-in as well.
  * VIO_REQUIRE_OPACITY_MICROMAP makes backends mandatory. */
 $W = 16; $H = 4;
 $HDR = "#version 460\n#extension GL_EXT_ray_tracing : require\n#extension GL_EXT_opacity_micromap : require\n";
@@ -139,7 +143,61 @@ function run_backend(string $name): string {
     return $fail ? "FAIL\n  " . implode("\n  ", $fail) : "OK";
 }
 
+function run_pre_sm69(): string {
+    global $W, $H, $CS, $opts;
+    $ctx = @vio_create('d3d12', ['shader_model' => 66] + $opts);
+    if (!$ctx || vio_backend_name($ctx) !== 'd3d12') return "skip (unavailable)";
+    $info = vio_swapchain_info($ctx);
+    if (($info['agility_sdk'] ?? 0) < 620) { vio_destroy($ctx); return "skip (needs Agility 1.620)"; }
+    if (($info['shader_model_version'] ?? 0) !== 66 || !vio_supports_feature($ctx, VIO_FEATURE_OPACITY_MICROMAP)
+        || !vio_supports_feature($ctx, VIO_FEATURE_RAY_QUERY)) { vio_destroy($ctx); return "skip (no SM 6.6 ray query with micromaps)"; }
+    $fail = [];
+    $occ = vio_mesh($ctx, ['vertices' => [-1,-1,0.5, 0,-1,0.5, 0,1,0.5, -1,1,0.5], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT3]]);
+    $as = vio_acceleration_structure($ctx, [['mesh' => $occ, 'opacity_micromap' => ['subdivision' => 0, 'format' => 2, 'states' => "\1\0"]]]);
+    $want = expect($W, $H, [0]);
+    $cp = vio_compute_pipeline($ctx, ['source' => $CS]);
+    if (!$cp) $fail[] = "E: compute pipeline not created";
+    else {
+        $buf = vio_storage_buffer($ctx, ['size' => $W * $H * 4]);
+        vio_compute_bind_buffer($ctx, $cp, $buf, 1, VIO_COMPUTE_WRITE);
+        vio_bind_acceleration_structure($ctx, $as, 0);
+        vio_compute_dispatch($ctx, $cp, 1, 1, 1);
+        $got = array_values(unpack('V*', vio_storage_buffer_read($ctx, $buf)));
+        if ($got !== $want) $fail[] = "E: ray query hits " . implode('', array_map(fn($v) => $v === 105 ? '#' : '.', $got));
+    }
+    $sh = vio_shader($ctx, [
+        'vertex' => "#version 460\nlayout(location = 0) in vec3 a_pos;\nvoid main(){ gl_Position = vec4(a_pos, 1.0); }",
+        'fragment' => "#version 460\n#extension GL_EXT_ray_query : require\n"
+            . "layout(binding = 0) uniform accelerationStructureEXT u_tlas;\nlayout(location = 0) out vec4 o;\n"
+            . "void main(){ vec2 uv = gl_FragCoord.xy / vec2(16.0, 4.0) * 2.0 - 1.0; rayQueryEXT q;\n"
+            . "  rayQueryInitializeEXT(q, u_tlas, gl_RayFlagsNoneEXT, 0xFF, vec3(uv, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0);\n"
+            . "  while (rayQueryProceedEXT(q)) {}\n"
+            . "  o = vec4(rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0, 0.0, 0.0, 1.0); }"]);
+    $pipe = $sh ? vio_pipeline($ctx, ['shader' => $sh, 'depth_test' => false, 'cull_mode' => VIO_CULL_NONE]) : null;
+    if (!$pipe) $fail[] = "F: graphics pipeline not created";
+    else {
+        $quad = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0, 1,1,0, -1,1,0], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT3]]);
+        $rt = vio_render_target($ctx, ['width' => $W, 'height' => $H]);
+        vio_begin($ctx);
+        vio_bind_render_target($ctx, $rt);
+        vio_viewport($ctx, 0, 0, $W, $H);
+        vio_clear($ctx, 0, 0, 0, 1);
+        vio_bind_pipeline($ctx, $pipe);
+        vio_bind_acceleration_structure($ctx, $as, 0);
+        vio_draw($ctx, $quad);
+        vio_unbind_render_target($ctx);
+        vio_end($ctx);
+        $px = array_values(unpack('C*', vio_read_render_target($rt)));
+        $got = [];
+        for ($i = 0; $i < $W * $H; $i++) $got[] = $px[$i * 4] > 127 ? 105 : 0;
+        if ($got !== $want) $fail[] = "F: ray query hits " . implode('', array_map(fn($v) => $v === 105 ? '#' : '.', $got));
+    }
+    vio_destroy($ctx);
+    return $fail ? "FAIL\n  " . implode("\n  ", $fail) : "OK";
+}
+
 foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) echo "$b: ", run_backend($b), "\n";
+echo "d3d12 below SM 6.9: ", run_pre_sm69(), "\n";
 echo "DONE\n";
 ?>
 --EXPECTF--
@@ -148,4 +206,5 @@ d3d11: %r(OK|skip \(.*\))%r
 d3d12: %r(OK|skip \(.*\))%r
 vulkan: %r(OK|skip \(.*\))%r
 metal: %r(OK|skip \(.*\))%r
+d3d12 below SM 6.9: %r(OK|skip \(.*\))%r
 DONE

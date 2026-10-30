@@ -18,6 +18,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_input.h"
 #include "src/vio_backend_null.h"
 #include "src/vio_mesh.h"
+#include "src/vio_opacity_micromap.h"
 #include "src/vio_shader.h"
 #include "src/vio_pipeline.h"
 #include "src/vio_texture.h"
@@ -11676,6 +11677,110 @@ static void vio_as_keep(vio_acceleration_structure_object *as, const vio_as_inst
  * mesh known but a different list -> 'rebuild' (a new top level over the
  * existing bottom levels); a new mesh -> 'full' (everything built again).
  * Outside vio_begin / vio_end; synchronous like the first build. */
+static zend_long vio_omm_opt_long(HashTable *o, const char *key, size_t len, zend_long def)
+{
+    zval *z = zend_hash_str_find(o, key, len);
+    return z ? zval_get_long(z) : def;
+}
+
+ZEND_FUNCTION(vio_opacity_micromap_bake)
+{
+    HashTable *o;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ARRAY_HT(o)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zval *uz = zend_hash_str_find(o, "uvs", sizeof("uvs") - 1);
+    zval *dz = zend_hash_str_find(o, "data", sizeof("data") - 1);
+    zval *iz = zend_hash_str_find(o, "indices", sizeof("indices") - 1);
+    zval *tz = zend_hash_str_find(o, "threshold", sizeof("threshold") - 1);
+    zval *cz = zend_hash_str_find(o, "clamp", sizeof("clamp") - 1);
+    zend_long w = vio_omm_opt_long(o, "width", sizeof("width") - 1, 0);
+    zend_long h = vio_omm_opt_long(o, "height", sizeof("height") - 1, 0);
+    zend_long ch = vio_omm_opt_long(o, "channels", sizeof("channels") - 1, 4);
+    zend_long lv = vio_omm_opt_long(o, "subdivision", sizeof("subdivision") - 1, 4);
+    zend_long fv = vio_omm_opt_long(o, "format", sizeof("format") - 1, 4);
+    double thr = tz ? zval_get_double(tz) : 0.5;
+
+    if (!uz || Z_TYPE_P(uz) != IS_ARRAY || !dz || Z_TYPE_P(dz) != IS_STRING) {
+        zend_argument_value_error(1, "needs 'uvs' (array) and 'data' (string)");
+        RETURN_THROWS();
+    }
+    if (w <= 0 || h <= 0 || w > 65536 || h > 65536 || (ch != 1 && ch != 4)) {
+        zend_argument_value_error(1, "'width' and 'height' must be 1..65536, 'channels' 1 or 4");
+        RETURN_THROWS();
+    }
+    if (Z_STRLEN_P(dz) != (size_t)w * (size_t)h * (size_t)ch) {
+        zend_argument_value_error(1, "'data' must hold %zu bytes", (size_t)w * (size_t)h * (size_t)ch);
+        RETURN_THROWS();
+    }
+    if (lv < 0 || lv > 12 || (fv != 2 && fv != 4) || !(thr >= 0.0 && thr <= 1.0)) {
+        zend_argument_value_error(1, "'subdivision' must be 0..12, 'format' 2 or 4, 'threshold' 0..1");
+        RETURN_THROWS();
+    }
+    uint32_t uv_count = zend_hash_num_elements(Z_ARRVAL_P(uz));
+    if (uv_count < 6 || (uv_count & 1)) {
+        zend_argument_value_error(1, "'uvs' must hold u, v per vertex, at least three vertices");
+        RETURN_THROWS();
+    }
+    uint32_t vertices = uv_count / 2;
+    uint32_t index_count = iz ? (Z_TYPE_P(iz) == IS_ARRAY ? zend_hash_num_elements(Z_ARRVAL_P(iz)) : 1) : vertices;
+    if ((iz && Z_TYPE_P(iz) != IS_ARRAY) || index_count < 3 || index_count % 3) {
+        zend_argument_value_error(1, "%s must hold three entries per triangle", iz ? "'indices'" : "'uvs'");
+        RETURN_THROWS();
+    }
+    size_t per = (size_t)1 << (2 * lv);
+    int tris = (int)(index_count / 3);
+    if ((size_t)tris > ((size_t)256 << 20) / per) {
+        zend_argument_value_error(1, "%d triangles at subdivision %d need more than 256 MiB", tris, (int)lv);
+        RETURN_THROWS();
+    }
+
+    float *uvs = safe_emalloc(uv_count, sizeof(float), 0);
+    uint32_t *indices = safe_emalloc(index_count, sizeof(uint32_t), 0);
+    zval *e;
+    uint32_t n = 0;
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(uz), e) { uvs[n++] = (float)zval_get_double(e); } ZEND_HASH_FOREACH_END();
+    n = 0;
+    if (iz) {
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(iz), e) {
+            zend_long v = zval_get_long(e);
+            if (v < 0 || v >= (zend_long)vertices) {
+                efree(uvs); efree(indices);
+                zend_argument_value_error(1, "'indices' entry %u is " ZEND_LONG_FMT ", there are %u vertices", n, v, vertices);
+                RETURN_THROWS();
+            }
+            indices[n++] = (uint32_t)v;
+        } ZEND_HASH_FOREACH_END();
+    } else {
+        for (n = 0; n < index_count; n++) indices[n] = n;
+    }
+
+    vio_omm_bake_desc d;
+    d.uvs = uvs; d.indices = indices; d.tri_count = tris;
+    d.pixels = (const unsigned char *)Z_STRVAL_P(dz);
+    d.width = (int)w; d.height = (int)h; d.stride = (int)ch; d.channel = (int)ch - 1;
+    d.level = (int)lv; d.format = (int)fv; d.threshold = (float)thr;
+    d.clamp = cz ? zend_is_true(cz) : 0;
+    zend_string *states = zend_string_alloc(per * (size_t)tris, 0);
+    uint64_t counts[4];
+    vio_omm_bake(&d, (unsigned char *)ZSTR_VAL(states), counts);
+    ZSTR_VAL(states)[ZSTR_LEN(states)] = '\0';
+    efree(uvs); efree(indices);
+
+    zval stats;
+    array_init(&stats);
+    add_assoc_long(&stats, "transparent", (zend_long)counts[VIO_OMM_STATE_TRANSPARENT]);
+    add_assoc_long(&stats, "opaque", (zend_long)counts[VIO_OMM_STATE_OPAQUE]);
+    add_assoc_long(&stats, "unknown_transparent", (zend_long)counts[VIO_OMM_STATE_UNKNOWN_TRANSPARENT]);
+    add_assoc_long(&stats, "unknown_opaque", (zend_long)counts[VIO_OMM_STATE_UNKNOWN_OPAQUE]);
+    array_init(return_value);
+    add_assoc_long(return_value, "subdivision", lv);
+    add_assoc_long(return_value, "format", fv);
+    add_assoc_str(return_value, "states", states);
+    add_assoc_zval(return_value, "stats", &stats);
+}
+
 ZEND_FUNCTION(vio_acceleration_structure_update)
 {
     zval *ctx_zval, *as_zval;

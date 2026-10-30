@@ -451,6 +451,11 @@ typedef struct _vio_d3d12_state {
      * device runs on (0 = OS runtime) and the ID3D12SDKConfiguration1 /
      * ID3D12DeviceFactory that made it (released after the device). */
     int                        agility_sdk;
+    /* Agility 1.620 capabilities; 0 on runtimes that do not know the queries. */
+    int                        async_commands;       /* D3D12_ASYNC_COMMANDS_IMPL */
+    int                        fence_barriers_tier;
+    int                        dump_file_tier;
+    int                        dump_file_os;
     IUnknown                  *agility_config;
     IUnknown                  *agility_factory;
     /* Indirect draws (GAP-PHASE5 Block 8): command signatures for DrawIndexed

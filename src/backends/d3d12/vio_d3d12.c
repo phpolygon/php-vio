@@ -73,6 +73,22 @@ static void d3d12_execute_lists(UINT count, ID3D12CommandList *const *lists)
     ID3D12CommandQueue_ExecuteCommandLists(vio_d3d12.cmd_queue, count, lists);
 }
 
+/* CheckFeatureSupport is deprecated from Agility 1.620 on (debug layer id=989).
+ * CheckFeatureSupport1 clamps the answer to the SDK version it is given: passing
+ * the active runtime's version keeps the real capabilities. Runtimes without
+ * ID3D12Device16 take the old call. */
+static HRESULT d3d12_check_feature(ID3D12Device *dev, D3D12_FEATURE feature, void *data, UINT size)
+{
+    ID3D12Device16 *dev16 = NULL;
+    if (vio_d3d12.agility_sdk > 0
+        && SUCCEEDED(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device16, (void **)&dev16)) && dev16) {
+        HRESULT hr = ID3D12Device16_CheckFeatureSupport1(dev16, feature, data, size, (UINT)vio_d3d12.agility_sdk);
+        ID3D12Device16_Release(dev16);
+        return hr;
+    }
+    return ID3D12Device_CheckFeatureSupport(dev, feature, data, size);
+}
+
 /* Pull pending validation messages out of the D3D12 InfoQueue and forward them
  * to PHP's error log. No-op when the debug layer is not active. Called after
  * any operation that might have triggered validation errors (resource creation
@@ -289,6 +305,17 @@ static void d3d12_handle_device_removed(const char *context, HRESULT present_hr)
     /* Surface any pending validation messages first, then the DRED payload. */
     d3d12_drain_info_queue(context);
     d3d12_dump_dred(context);
+
+    /* Agility 1.620: the driver's own classification of the loss. */
+    ID3D12DeviceDumpFile *dump = NULL;
+    if (vio_d3d12.device && SUCCEEDED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12DeviceDumpFile, (void **)&dump)) && dump) {
+        D3D12_DEVICE_ERROR_CODE code = ID3D12DeviceDumpFile_GetDeviceErrorCode(dump);
+        fprintf(stderr, "D3D12[%s]: device error code %s (0x%08x)\n", context ? context : "?",
+                code == D3D12_DEVICE_ERROR_DEVICE_HUNG ? "DEVICE_HUNG" :
+                code == D3D12_DEVICE_ERROR_PAGE_FAULT ? "PAGE_FAULT" :
+                code == D3D12_DEVICE_ERROR_NONE ? "NONE" : "UNKNOWN", (unsigned)code);
+        ID3D12DeviceDumpFile_Release(dump);
+    }
 
     fprintf(stderr,
         "D3D12[%s]: rendering halted after first device-removal "
@@ -1536,8 +1563,10 @@ static int d3d12_init(vio_config *cfg)
      *   id=820 CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE
      *   id=821 CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE
      * The clear still works correctly — these are pure perf hints — so we add a
-     * DENY *storage* filter for exactly these two IDs. The layer never queues
-     * them, so d3d12_drain_info_queue() never sees them. Every other message
+     * DENY *storage* filter for exactly these IDs. Agility 1.620 adds id=1477
+     * DEPTH_STENCIL_FORMAT_UNUSED: a PSO variant takes its DSV format from the
+     * bound target, whether or not the pipeline tests depth - also a hint.
+     * The layer never queues them, so d3d12_drain_info_queue() never sees them. Every other message
      * (all severities, every other ID — including the real validation errors
      * the drain exists to surface) is unaffected and still stored + emitted. */
     if (cfg->debug) {
@@ -1552,6 +1581,7 @@ static int d3d12_init(vio_config *cfg)
             D3D12_MESSAGE_ID deny_ids[] = {
                 D3D12_MESSAGE_ID_CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE,
                 D3D12_MESSAGE_ID_CLEARDEPTHSTENCILVIEW_MISMATCHINGCLEARVALUE,
+                D3D12_MESSAGE_ID_DEPTH_STENCIL_FORMAT_UNUSED,
             };
             D3D12_INFO_QUEUE_FILTER filter = {0};
             filter.DenyList.NumIDs = (UINT)(sizeof(deny_ids) / sizeof(deny_ids[0]));
@@ -1629,10 +1659,27 @@ static int d3d12_init(vio_config *cfg)
     vio_d3d12.mesh_tier = 0;
     vio_d3d12.raytracing_tier = 0;
     vio_d3d12.work_graphs_tier = 0;
+    /* Agility 1.620: older runtimes reject these queries, the zeroes stay. */
+    {
+        D3D12_FEATURE_DATA_ASYNC_COMMANDS ac;
+        memset(&ac, 0, sizeof(ac));
+        vio_d3d12.async_commands = SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_ASYNC_COMMANDS, &ac, sizeof(ac)))
+            ? (int)ac.Impl : 0;
+        D3D12_FEATURE_DATA_FENCE_BARRIERS fb;
+        memset(&fb, 0, sizeof(fb));
+        fb.CommandListType = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        vio_d3d12.fence_barriers_tier = SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_FENCE_BARRIERS, &fb, sizeof(fb)))
+            ? (int)fb.FenceBarriersTier : 0;
+        D3D12_FEATURE_DATA_DUMP_FILE df;
+        memset(&df, 0, sizeof(df));
+        int have_df = SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_DUMP_FILE, &df, sizeof(df)));
+        vio_d3d12.dump_file_os = have_df && df.SupportedByOS;
+        vio_d3d12.dump_file_tier = have_df ? (int)df.DumpFileDriverTier : 0;
+    }
     /* Variable rate shading capability (GAP-PHASE5 Block 12). */
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {0};
-        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6)))) {
+        if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6)))) {
             vio_d3d12.vrs_tier = (int)o6.VariableShadingRateTier;
             vio_d3d12.vrs_additional_rates = o6.AdditionalShadingRatesSupported ? 1 : 0;
             vio_d3d12.vrs_tile_size = (int)o6.ShadingRateImageTileSize;
@@ -1667,7 +1714,7 @@ static int d3d12_init(vio_config *cfg)
         int device_minor = -1;
         for (int v = 0x69; v >= 0x60 && device_minor < 0; v--) {
             D3D12_FEATURE_DATA_SHADER_MODEL sm = { (D3D_SHADER_MODEL)v };
-            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
+            if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
                 if ((int)sm.HighestShaderModel >= 0x60) device_minor = (int)sm.HighestShaderModel & 0xF;
                 break;
             }
@@ -1678,7 +1725,7 @@ static int d3d12_init(vio_config *cfg)
             vio_d3d12.shader_model = 6;
             vio_d3d12.shader_model_version = 60 + dxc_minor;
             D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {0};
-            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))))
+            if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))))
                 vio_d3d12.wave_ops = o1.WaveOps ? 1 : 0;
             vio_d3d12.int64_ops = o1.Int64ShaderOps ? 1 : 0;
             /* Native 16-bit shader ops (SM 6.2): SPIRV-Cross emits `half`, DXC gets
@@ -1686,17 +1733,17 @@ static int d3d12_init(vio_config *cfg)
              * two modes never mix. */
             D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4 = {0};
             if (vio_d3d12.shader_model_version >= 62
-                && SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof(o4))))
+                && SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof(o4))))
                 vio_d3d12.native16 = o4.Native16BitShaderOpsSupported ? 1 : 0;
             D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {0};
-            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
+            if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
                 vio_d3d12.barycentrics = o3.BarycentricsSupported ? 1 : 0;
-            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
+            if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
                 vio_d3d12.view_instancing = (int)o3.ViewInstancingTier;
             /* Mesh / amplification shaders (SM 6.5). */
             D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {0};
             if (vio_d3d12.shader_model_version >= 65
-                && SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7))))
+                && SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7))))
                 vio_d3d12.mesh_tier = (int)o7.MeshShaderTier;
 #ifdef VIO_D3D12_HAS_WORK_GRAPHS
             /* Work graphs (SM 6.8 node shaders); the OS runtime usually needs the
@@ -1704,12 +1751,12 @@ static int d3d12_init(vio_config *cfg)
             D3D12_FEATURE_DATA_D3D12_OPTIONS21 o21;
             memset(&o21, 0, sizeof(o21));
             if (vio_d3d12.shader_model_version >= 68
-                && SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS21, &o21, sizeof(o21))))
+                && SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS21, &o21, sizeof(o21))))
                 vio_d3d12.work_graphs_tier = (int)o21.WorkGraphsTier;
 #endif
             D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5;
             memset(&o5, 0, sizeof(o5));
-            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))))
+            if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))))
                 vio_d3d12.raytracing_tier = (int)o5.RaytracingTier;
             vio_hlsl_set_16bit_types(vio_d3d12.native16);
         } else {
@@ -1775,7 +1822,7 @@ static int d3d12_init(vio_config *cfg)
     vio_d3d12.bindless = 0;
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS o0 = {0};
-        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS, &o0, sizeof(o0))))
+        if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS, &o0, sizeof(o0))))
             vio_d3d12.bindless = o0.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2;
     }
 
@@ -1789,7 +1836,7 @@ static int d3d12_init(vio_config *cfg)
         D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7;
         memset(&o7, 0, sizeof(o7));
         ID3D12Device8 *dev8 = NULL;
-        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7)))
+        if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7)))
             && o7.SamplerFeedbackTier >= D3D12_SAMPLER_FEEDBACK_TIER_0_9
             && SUCCEEDED(ID3D12Device_QueryInterface(vio_d3d12.device, &IID_ID3D12Device8, (void **)&dev8)) && dev8) {
             vio_d3d12.sampler_feedback = 1;
@@ -2902,9 +2949,25 @@ static void d3d12_pss_add(unsigned char *buf, size_t *off, D3D12_PIPELINE_STATE_
     *off = (vo + size + 7) & ~(size_t)7;
 }
 
+/* A query in a shader below SM 6.9 cannot carry RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS
+ * (d3d12_hlsl_post); Agility 1.620 lets the PSO or state object opt in instead.
+ * No feature bit announces this, and older runtimes reject the flag - the SDK
+ * version of the active runtime decides. */
+static int d3d12_rayquery_omm_opt_in(void)
+{
+    return vio_d3d12.raytracing_tier >= 12 && vio_d3d12.agility_sdk >= 620
+        && vio_d3d12.shader_model == 6 && vio_d3d12.shader_model_version < 69;
+}
+
 static HRESULT d3d12_create_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d, int view_count,
                                 const vio_d3d12_pipeline *mesh, ID3D12PipelineState **out)
 {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC opt_in;
+    if (d3d12_rayquery_omm_opt_in()) {
+        opt_in = *d;
+        opt_in.Flags |= D3D12_PIPELINE_STATE_FLAG_RAYQUERY_ALLOW_OPACITY_MICROMAPS_ON_PRE_SM69_SHADERS;
+        d = &opt_in;
+    }
     if (view_count <= 1 && !mesh)
         return ID3D12Device_CreateGraphicsPipelineState(vio_d3d12.device, d, &IID_ID3D12PipelineState, (void **)out);
     ID3D12Device2 *dev2 = NULL;
@@ -4222,7 +4285,7 @@ static int d3d12_format_supports_uav(DXGI_FORMAT fmt)
     D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {0};
     fs.Format = fmt;
     if (!vio_d3d12.device) return 0;
-    if (FAILED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)))) return 0;
+    if (FAILED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)))) return 0;
     return (fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
            (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) ? 1 : 0;
 }
@@ -5492,7 +5555,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
             D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS mq = {0};
             mq.Format = vio_pixel_format_to_dxgi(rt->formats[0]);
             mq.SampleCount = s;
-            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mq, sizeof(mq)))
+            if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mq, sizeof(mq)))
                 && mq.NumQualityLevels > 0) {
                 samples = s;
                 break;
@@ -5782,7 +5845,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
             D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS mq = {0};
             mq.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
             mq.SampleCount = s;
-            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mq, sizeof(mq)))
+            if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mq, sizeof(mq)))
                 && mq.NumQualityLevels > 0) { ms = s; break; }
         }
         if (ms > 1) {
@@ -5835,7 +5898,7 @@ static int d3d12_create_render_target(void *rt_ptr, int width, int height, int h
             D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS mq = {0};
             mq.Format = cf;
             mq.SampleCount = s;
-            if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mq, sizeof(mq)))
+            if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mq, sizeof(mq)))
                 && mq.NumQualityLevels > 0) { ms = s; break; }
         }
         if (ms > 1) {
@@ -7125,36 +7188,36 @@ static int d3d12_probe_adapter(IDXGIAdapter1 *adapter, vio_adapter_info *a)
     memset(&a->features, 0, sizeof(a->features));
     for (size_t i = 0; i < sizeof(base) / sizeof(base[0]); i++) vio_featset_add(&a->features, base[i]);
     D3D12_FEATURE_DATA_D3D12_OPTIONS o = {0};
-    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o)))
+    if (SUCCEEDED(d3d12_check_feature(dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o)))
         && o.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3)
         vio_featset_add(&a->features, VIO_FEATURE_BINDLESS);
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {0};
-    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))) && o1.WaveOps)
+    if (SUCCEEDED(d3d12_check_feature(dev, D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))) && o1.WaveOps)
         vio_featset_add(&a->features, VIO_FEATURE_SUBGROUP);
     D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {0};
-    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3)))) {
+    if (SUCCEEDED(d3d12_check_feature(dev, D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3)))) {
         if (o3.ViewInstancingTier > D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED) vio_featset_add(&a->features, VIO_FEATURE_MULTIVIEW);
         if (o3.BarycentricsSupported) vio_featset_add(&a->features, VIO_FEATURE_BARYCENTRICS);
     }
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {0};
-    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5)))) {
+    if (SUCCEEDED(d3d12_check_feature(dev, D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5)))) {
         if (o5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0) vio_featset_add(&a->features, VIO_FEATURE_RAYTRACING);
         if (o5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1) vio_featset_add(&a->features, VIO_FEATURE_RAY_QUERY);
     }
     D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {0};
-    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6)))) {
+    if (SUCCEEDED(d3d12_check_feature(dev, D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6)))) {
         if (o6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_1) vio_featset_add(&a->features, VIO_FEATURE_SHADING_RATE);
         if (o6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2)
             { vio_featset_add(&a->features, VIO_FEATURE_SHADING_RATE_IMAGE); vio_featset_add(&a->features, VIO_FEATURE_SHADING_RATE_PRIMITIVE); }
     }
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {0};
-    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7)))) {
+    if (SUCCEEDED(d3d12_check_feature(dev, D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7)))) {
         if (o7.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1) vio_featset_add(&a->features, VIO_FEATURE_MESH_SHADER);
         if (o7.SamplerFeedbackTier >= D3D12_SAMPLER_FEEDBACK_TIER_0_9) vio_featset_add(&a->features, VIO_FEATURE_SAMPLER_FEEDBACK);
     }
     if (!a->device_type) {
         D3D12_FEATURE_DATA_ARCHITECTURE1 arch = {0};
-        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch))))
+        if (SUCCEEDED(d3d12_check_feature(dev, D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch))))
             a->device_type = arch.UMA ? "integrated" : "discrete";
     }
     ID3D12Device_Release(dev);
@@ -7178,7 +7241,7 @@ static int d3d12_describe(vio_backend_description *out)
     int flv = D3D_FEATURE_LEVEL_11_0;
     for (int first = 0; first < 2; first++) {
         D3D12_FEATURE_DATA_FEATURE_LEVELS fl = { (UINT)(5 - first), levels + first, D3D_FEATURE_LEVEL_11_0 };
-        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl)))) {
+        if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl)))) {
             flv = (int)fl.MaxSupportedFeatureLevel;
             break;
         }
@@ -7187,7 +7250,7 @@ static int d3d12_describe(vio_backend_description *out)
     int sm_max = 51;
     for (int v = 0x69; v >= 0x60; v--) {
         D3D12_FEATURE_DATA_SHADER_MODEL sm = { (D3D_SHADER_MODEL)v };
-        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
+        if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
             if ((int)sm.HighestShaderModel >= 0x60)
                 sm_max = ((int)sm.HighestShaderModel >> 4) * 10 + ((int)sm.HighestShaderModel & 0xF);
             break;
@@ -7204,13 +7267,16 @@ static int d3d12_describe(vio_backend_description *out)
     if (vio_d3d12.agility_sdk) out->families[out->family_count++] = "agility_sdk";
     out->cap_count = 0;
     vio_describe_feature_caps(out, d3d12_supports_feature);
+    out->cap_names[out->cap_count] = "async_commands";   out->cap_values[out->cap_count++] = vio_d3d12.async_commands != 0;
+    out->cap_names[out->cap_count] = "fence_barriers";   out->cap_values[out->cap_count++] = vio_d3d12.fence_barriers_tier != 0;
+    out->cap_names[out->cap_count] = "dump_file";        out->cap_values[out->cap_count++] = vio_d3d12.dump_file_os;
     out->vendor_id = vio_d3d12.vendor_id;
     out->driver = vio_d3d12.driver;
     out->vram_bytes = vio_d3d12.vram_bytes;
     if (vio_d3d12.software_adapter) out->device_type = "software";
     else {
         D3D12_FEATURE_DATA_ARCHITECTURE1 arch = {0};
-        out->device_type = SUCCEEDED(ID3D12Device_CheckFeatureSupport(vio_d3d12.device, D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch)))
+        out->device_type = SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch)))
             ? (arch.UMA ? "integrated" : "discrete") : NULL;
     }
     return 0;
@@ -8197,6 +8263,8 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
     pso_desc.pRootSignature = cp->root_signature;
     pso_desc.CS.pShaderBytecode = ID3D10Blob_GetBufferPointer(cp->cs_blob);
     pso_desc.CS.BytecodeLength = ID3D10Blob_GetBufferSize(cp->cs_blob);
+    if (d3d12_rayquery_omm_opt_in())
+        pso_desc.Flags |= D3D12_PIPELINE_STATE_FLAG_RAYQUERY_ALLOW_OPACITY_MICROMAPS_ON_PRE_SM69_SHADERS;
 
     hr = ID3D12Device_CreateComputePipelineState(vio_d3d12.device, &pso_desc,
                                                  &IID_ID3D12PipelineState, (void **)&cp->pso);
@@ -9182,6 +9250,9 @@ static void *d3d12_create_rt_pipeline(const vio_rt_pipeline_desc *desc)
     sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;  sub[ns].pDesc = &grs; ns++;
     if (use_pc1) { sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1; sub[ns].pDesc = &pc1; ns++; }
     else { sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG; sub[ns].pDesc = &pc; ns++; }
+    D3D12_STATE_OBJECT_CONFIG soc = {0};
+    soc.Flags = D3D12_STATE_OBJECT_FLAG_RAYQUERY_ALLOW_OPACITY_MICROMAPS_ON_PRE_SM69_SHADERS;
+    if (d3d12_rayquery_omm_opt_in()) { sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG; sub[ns].pDesc = &soc; ns++; }
     if (p->local_sig) {
         UINT li = ns;
         sub[ns].Type = D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE; sub[ns].pDesc = &lrs; ns++;

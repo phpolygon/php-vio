@@ -472,6 +472,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_recorder.c \
     src/vio_stream.c \
     src/vio_thermal.c \
+    src/vio_opacity_micromap.c \
     src/upscale/vio_upscale.c \
     src/vio_plugin_registry.c \
     src/vio_backend_null.c \

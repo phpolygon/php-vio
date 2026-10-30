@@ -509,11 +509,39 @@ function vio_benchmark_backends(array $options = []): array|false {}
  * top-level structure over the instances. Each instance is
  * ['mesh' => VioMesh, 'transform' => float[16]] (column-major 4x4, optional,
  * identity), optional 'hit_group' (0..7, the RT pipeline hit group) and 'mask'
- * (0..255, default 0xFF: rays skip it when mask & cull mask is 0). Shaders query
- * it with GL_EXT_ray_query (rayQueryEXT) in the
- * fragment and compute stages. False + warning where the feature is 0.
+ * (0..255, default 0xFF: rays skip it when mask & cull mask is 0) and
+ * 'opacity_micromap' (VIO_FEATURE_OPACITY_MICROMAP): ['subdivision' => 0..12,
+ * 'format' => 2|4, 'states' => one byte per micro-triangle], the result of
+ * vio_opacity_micromap_bake(). Shaders query it with GL_EXT_ray_query
+ * (rayQueryEXT) in the fragment and compute stages. False + warning where the
+ * feature is 0.
  */
 function vio_acceleration_structure(VioContext $context, array $instances): VioAccelerationStructure|false {}
+
+/**
+ * Bake an opacity micromap from an alpha texture, no GPU or context needed. Rays
+ * through alpha-tested geometry (leaves, fences) then skip the any-hit shader
+ * wherever the map already knows the answer.
+ *
+ * $options: 'uvs' (float[], u, v per vertex), 'indices' (int[], optional: the
+ * mesh's indices, without them vertices 0, 1, 2 form the first triangle),
+ * 'data' (string of width * height * channels bytes), 'width', 'height',
+ * 'channels' (1 or 4, default 4; the last one holds alpha), 'subdivision'
+ * (0..12, default 4: 4^n micro-triangles per triangle), 'format' (2 or 4,
+ * default 4), 'threshold' (0..1, default 0.5), 'clamp' (bool, default false:
+ * uvs repeat).
+ *
+ * Format 4 marks a micro-triangle known only if every texel a bilinear lookup
+ * inside it can reach lies on one side of the threshold; the rest is unknown
+ * and runs the any-hit shader, so the image stays exact. Format 2 needs no
+ * any-hit shader: the covered share decides, edges are as coarse as the
+ * subdivision. Reads level 0 only; the any-hit shader must not sample lower mips.
+ *
+ * Returns ['subdivision', 'format', 'states', 'stats' => ['transparent',
+ * 'opaque', 'unknown_transparent', 'unknown_opaque']]; pass it as
+ * 'opacity_micromap'. ValueError on malformed input or above 256 MiB of states.
+ */
+function vio_opacity_micromap_bake(array $options): array {}
 
 /**
  * Update an acceleration structure with a new instance list (same format as

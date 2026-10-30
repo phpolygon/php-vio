@@ -56,6 +56,7 @@ if (PHP_VIO != "no") {
         "src\\vio_recorder.c " +
         "src\\vio_stream.c " +
         "src\\vio_thermal.c " +
+        "src\\vio_opacity_micromap.c " +
         "src\\upscale\\vio_upscale.c " +
         "src\\vio_plugin_registry.c " +
         "src\\vio_backend_null.c " +
@@ -270,6 +271,9 @@ if (PHP_VIO != "no") {
                 CHECK_LIB("dxgi.lib", "vio") &&
                 CHECK_LIB("d3dcompiler.lib", "vio")) {
                 AC_DEFINE("HAVE_D3D12", 1, "Whether Direct3D 12 is available");
+                // Agility SDK headers (MIT) ahead of the Windows SDK: newer
+                // interfaces, every use is probed at run time.
+                ADD_FLAG("CFLAGS_VIO", "/I" + configure_module_dirname + "\\vendor\\agility");
             } else {
                 WARNING("Direct3D 12 libraries not found");
             }

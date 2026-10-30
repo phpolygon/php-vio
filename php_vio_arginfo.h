@@ -539,6 +539,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscale, 0, 3, _IS_BOOL, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 1, "[]")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_opacity_micromap_bake, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO(0, options, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_upscale_jitter, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO(0, frame, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, phases, IS_LONG, 0, "8")
@@ -1319,6 +1323,7 @@ ZEND_FUNCTION(vio_bundle);
 ZEND_FUNCTION(vio_draw_bundle);
 ZEND_FUNCTION(vio_bundle_info);
 ZEND_FUNCTION(vio_upscale);
+ZEND_FUNCTION(vio_opacity_micromap_bake);
 ZEND_FUNCTION(vio_upscale_jitter);
 ZEND_FUNCTION(vio_upscale_info);
 ZEND_FUNCTION(vio_upscaler_supported);
@@ -1554,6 +1559,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_draw_bundle, arginfo_vio_draw_bundle)
 	ZEND_FE(vio_bundle_info, arginfo_vio_bundle_info)
 	ZEND_FE(vio_upscale, arginfo_vio_upscale)
+	ZEND_FE(vio_opacity_micromap_bake, arginfo_vio_opacity_micromap_bake)
 	ZEND_FE(vio_upscale_jitter, arginfo_vio_upscale_jitter)
 	ZEND_FE(vio_upscale_info, arginfo_vio_upscale_info)
 	ZEND_FE(vio_upscaler_supported, arginfo_vio_upscaler_supported)
