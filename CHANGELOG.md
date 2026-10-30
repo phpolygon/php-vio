@@ -1,3 +1,10 @@
+## [2.38.1](https://github.com/phpolygon/php-vio/compare/v2.38.0...v2.38.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* **d3d12:** keep objects a command list still references until it retires ([e32e27e](https://github.com/phpolygon/php-vio/commit/e32e27e8faf1739f04a8c6337f45fbc88d03e212))
+
 # [2.38.0](https://github.com/phpolygon/php-vio/compare/v2.37.0...v2.38.0) (2026-10-30)
 
 
