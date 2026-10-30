@@ -1,3 +1,11 @@
+# [2.38.0](https://github.com/phpolygon/php-vio/compare/v2.37.0...v2.38.0) (2026-10-30)
+
+
+### Features
+
+* **d3d12:** Agility SDK 1.620 headers, capabilities and diagnostics ([3bc9e67](https://github.com/phpolygon/php-vio/commit/3bc9e67ec1ea37ce5c4e4a1e6e0852f767dd6fbf))
+* **raytracing:** bake opacity micromaps from an alpha texture ([60cd257](https://github.com/phpolygon/php-vio/commit/60cd257ee359b5ed42367a2a63b5802e487f83ea))
+
 # [2.37.0](https://github.com/phpolygon/php-vio/compare/v2.36.1...v2.37.0) (2026-10-27)
 
 
