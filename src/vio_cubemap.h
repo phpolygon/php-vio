@@ -28,6 +28,7 @@ typedef struct _vio_cubemap_object {
     int          backend_type;  /* 0=none, 1=opengl, 2=d3d11, 3=d3d12, 4=metal, 5=vulkan */
     int          mipmaps;       /* 1 => full mip chain (trilinear sampler, textureLod usable) */
     int          borrowed;      /* 1 => texture owned by a VioRenderTarget (vio_render_target_cubemap) */
+    zend_object *owner;         /* that VioRenderTarget, kept alive */
     int          resolution;
     int          valid;
     const struct _vio_backend *backend;  /* Backend that owns texture_id / d3d11_* / d3d12_* */

@@ -172,11 +172,11 @@ const FS_BLIT = "#version 330 core\nin vec2 vUv; uniform sampler2D u_tex;\nlayou
 
 /* ── Scene runner ───────────────────────────────────────────────────── */
 $results = [];
-function scene(string $name, array $features, callable $fn): void {
+function scene(string $name, array $features, callable $fn, array $opts = []): void {
     global $backend, $outdir, $results, $only;
     if ($only && !in_array($name, $only, true)) return;
     $t0 = microtime(true);
-    $ctx = vio_create($backend, ['width' => W, 'height' => H, 'headless' => true, 'vsync' => false]);
+    $ctx = vio_create($backend, $opts + ['width' => W, 'height' => H, 'headless' => true, 'vsync' => false]);
     if (!$ctx) { $results[$name] = 'no context'; return; }
     foreach ($features as $f) {
         if (!vio_supports_feature($ctx, $f)) { $results[$name] = "skipped (feature $f unavailable on " . vio_backend_name($ctx) . ")"; vio_destroy($ctx); return; }
@@ -536,8 +536,9 @@ scene('msaa_render_target', [VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_RENDER_TARGET_
     $ringMesh = vio_mesh($ctx, ['vertices' => $ring, 'indices' => $idx, 'layout' => [VIO_FLOAT3]]);
     vio_begin($ctx);
     vio_clear($ctx, 0.02, 0.02, 0.03, 1.0);
+    $targets = [];   // a target must outlive the frame that draws with it
     foreach ([[1, -1, 'samples => 1'], [4, 0, 'samples => 4 (resolved)']] as [$samples, $x0, $name]) {
-        $rt = vio_render_target($ctx, ['width' => 80, 'height' => 50, 'samples' => $samples]);
+        $rt = $targets[] = vio_render_target($ctx, ['width' => 80, 'height' => 50, 'samples' => $samples]);
         vio_bind_render_target($ctx, $rt);
         vio_clear($ctx, 0.12, 0.14, 0.2, 1.0);
         vio_bind_pipeline($ctx, $p);
@@ -1081,5 +1082,167 @@ GLSL;
 $probe = vio_create($backend, ['width' => 8, 'height' => 8, 'headless' => true, 'vsync' => false]);
 echo "backend: ", $probe ? vio_backend_name($probe) : 'n/a', "\n";
 if ($probe) vio_destroy($probe);
+/* ═══════════════════════════════════════════════════════════════════════
+ * Ray query — hard shadows traced from the fragment shader
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('ray_query_shadows', [VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_RAY_QUERY], function (VioContext $ctx, string $out) {
+    $vs = <<<'GLSL'
+#version 460
+layout(location=0) in vec3 a_pos;
+layout(location=1) in vec3 a_normal;
+uniform mat4 u_vp;
+uniform mat4 u_model;
+layout(location=0) out vec3 vW;
+layout(location=1) out vec3 vN;
+void main() {
+    vec4 w = u_model * vec4(a_pos, 1.0);
+    vW = w.xyz;
+    vN = mat3(u_model) * a_normal;
+    gl_Position = u_vp * w;
+}
+GLSL;
+    $fs = <<<'GLSL'
+#version 460
+#extension GL_EXT_ray_query : require
+layout(location=0) in vec3 vW;
+layout(location=1) in vec3 vN;
+layout(binding = 0) uniform accelerationStructureEXT u_tlas;
+uniform vec3 u_albedo;
+layout(location=0) out vec4 o;
+void main() {
+    vec3 n = normalize(vN);
+    vec3 sun = normalize(vec3(-0.55, 0.75, 0.45));
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, u_tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
+                          vW + n * 0.01, 0.001, sun, 100.0);
+    while (rayQueryProceedEXT(q)) {}
+    float lit = rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+    float d = max(dot(n, sun), 0.0) * lit;
+    vec3 c = u_albedo * (vec3(0.16, 0.19, 0.25) + vec3(1.0, 0.93, 0.8) * d);
+    o = vec4(pow(c, vec3(1.0 / 2.2)), 1.0);
+}
+GLSL;
+    $p = pipe($ctx, $vs, $fs, ['cull_mode' => VIO_CULL_NONE]);
+    $plane = mesh_plane($ctx, 8.0);
+    $cube = mesh_cube($ctx);
+    $sphere = mesh_sphere($ctx);
+    $objects = [
+        [$plane, m_identity(), [0.70, 0.70, 0.72]],
+        [$sphere, m_mul(m_translate(-1.45, 0.75, 0.2), m_scale(0.75)), [0.85, 0.25, 0.2]],
+        [$cube, m_mul(m_translate(0.15, 0.6, -0.5), m_mul(m_rot_y(0.6), m_scale(0.6))), [0.25, 0.55, 0.85]],
+        [$sphere, m_mul(m_translate(1.55, 0.5, 0.5), m_scale(0.5)), [0.9, 0.75, 0.25]],
+        [$cube, m_mul(m_translate(-0.2, 0.3, 1.1), m_mul(m_rot_y(-0.4), m_scale(0.3))), [0.4, 0.75, 0.45]],
+    ];
+    $as = vio_acceleration_structure($ctx, array_map(fn($o) => ['mesh' => $o[0], 'transform' => $o[1]], $objects));
+    if (!$as) throw new RuntimeException('acceleration structure failed');
+    $vp = m_mul(m_perspective(0.75, W / H, 0.1, 50.0), m_lookat([1.8, 3.0, 5.6], [0, 0.4, 0], [0, 1, 0]));
+    vio_begin($ctx);
+    vio_clear($ctx, 0.46, 0.58, 0.72, 1);
+    vio_viewport($ctx, 0, 0, W, H);
+    vio_bind_pipeline($ctx, $p);
+    vio_bind_acceleration_structure($ctx, $as, 0);
+    foreach ($objects as [$mesh, $model, $albedo]) {
+        vio_set_uniform($ctx, 'u_vp', $vp);
+        vio_set_uniform($ctx, 'u_model', $model);
+        vio_set_uniform($ctx, 'u_albedo', $albedo);
+        vio_draw($ctx, $mesh);
+    }
+    label($ctx, 'vio_acceleration_structure + rayQueryEXT: one shadow ray per pixel');
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    vio_save_screenshot($ctx, $out);
+}, ['shader_model' => 6]);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Opacity micromaps — what vio_opacity_micromap_bake knows about a leaf
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('opacity_micromap', [VIO_FEATURE_OPACITY_MICROMAP, VIO_FEATURE_RAYTRACING], function (VioContext $ctx, string $out) {
+    $leaf = function (float $u, float $v): bool {
+        $x = ($u - 0.5) * 2; $y = ($v - 0.5) * 2;
+        $w = 0.72 * (1 - $y * $y) * (1 + 0.35 * sin($y * 9.0) * 0.4);   // outline, slightly lobed
+        if (abs($x) > $w) return false;
+        if (abs($x + 0.05 * sin($y * 4)) < 0.018) return false;           // midrib
+        return abs(fmod($y + abs($x) * 0.7 + 2.0, 0.3)) > 0.022;          // side veins
+    };
+    $T = 256; $rgba = '';
+    for ($y = 0; $y < $T; $y++) for ($x = 0; $x < $T; $x++) {
+        $in = $leaf(($x + 0.5) / $T, ($y + 0.5) / $T);
+        $rgba .= $in ? "\x3C\xB3\x71\xFF" : "\x12\x18\x20\x00";
+    }
+    $uvs = [0, 0, 1, 0, 1, 1, 0, 1]; $idx = [0, 1, 2, 0, 2, 3];
+    $HDR = "#version 460\n#extension GL_EXT_ray_tracing : require\n";
+    $RGEN = $HDR . "layout(binding = 0) uniform accelerationStructureEXT u_tlas;\nlayout(std430, binding = 1) buffer B { uint v[]; } b;\n"
+        . "layout(location = 0) rayPayloadEXT uint hit;\nvoid main(){ uvec3 id = gl_LaunchIDEXT; uvec3 n = gl_LaunchSizeEXT;\n"
+        . "  vec2 uv = (vec2(id.xy) + 0.5) / vec2(n.xy) * 2.0 - 1.0; hit = 0u;\n"
+        . "  traceRayEXT(u_tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, vec3(uv, 0.0), 0.001, vec3(0.0, 0.0, 1.0), 100.0, 0);\n"
+        . "  b.v[id.y * n.x + id.x] = hit; }";
+    $MISS = $HDR . "layout(location = 0) rayPayloadInEXT uint hit;\nvoid main(){ hit = 0u; }";
+    $CHIT = $HDR . "layout(location = 0) rayPayloadInEXT uint hit;\nhitAttributeEXT vec2 bary;\nvoid main(){ hit = 1u; }";
+    $AHIT = fn(string $body) => $HDR . "layout(location = 0) rayPayloadInEXT uint hit;\nhitAttributeEXT vec2 bary;\nvoid main(){ $body }";
+    $HLSL = fn(string $body) => <<<HLSL
+RaytracingAccelerationStructure u_tlas : register(t0);
+RWStructuredBuffer<uint> b : register(u1);
+struct Payload { uint hit; };
+[shader("raygeneration")] void vio_raygen() {
+    uint3 id = DispatchRaysIndex(); uint3 n = DispatchRaysDimensions();
+    float2 uv = (float2(id.xy) + 0.5) / float2(n.xy) * 2.0 - 1.0;
+    RayDesc r; r.Origin = float3(uv, 0.0); r.Direction = float3(0.0, 0.0, 1.0); r.TMin = 0.001; r.TMax = 100.0;
+    Payload p; p.hit = 0;
+    TraceRay(u_tlas, RAY_FLAG_NONE, 0xFF, 0, 0, 0, r, p);
+    b[id.y * n.x + id.x] = p.hit;
+}
+[shader("miss")] void vio_miss(inout Payload p) { p.hit = 0; }
+[shader("closesthit")] void vio_closest_hit(inout Payload p, in BuiltInTriangleIntersectionAttributes a) { p.hit = 1; }
+[shader("anyhit")] void vio_any_hit(inout Payload p, in BuiltInTriangleIntersectionAttributes a) { $body }
+HLSL;
+    $ignore = vio_rt_pipeline($ctx, ['raygen' => $RGEN, 'miss' => $MISS, 'closest_hit' => $CHIT, 'any_hit' => $AHIT('ignoreIntersectionEXT;'), 'hlsl' => $HLSL('IgnoreHit();')]);
+    $accept = vio_rt_pipeline($ctx, ['raygen' => $RGEN, 'miss' => $MISS, 'closest_hit' => $CHIT, 'any_hit' => $AHIT(''), 'hlsl' => $HLSL('')]);
+    if (!$ignore || !$accept) throw new RuntimeException('rt pipeline failed');
+    $quad = vio_mesh($ctx, ['vertices' => [-1,-1,0.5, 1,-1,0.5, 1,1,0.5, -1,1,0.5], 'indices' => $idx, 'layout' => [VIO_FLOAT3]]);
+    $P = 190;
+    $trace = function ($pipe, $as) use ($ctx, $P) {
+        $buf = vio_storage_buffer($ctx, ['size' => $P * $P * 4]);
+        vio_rt_bind_buffer($ctx, $pipe, $buf, 1);
+        vio_bind_acceleration_structure($ctx, $as, 0);
+        vio_trace_rays($ctx, $pipe, $P, $P, 1);
+        return array_values(unpack('V*', vio_storage_buffer_read($ctx, $buf)));
+    };
+    $panels = [];
+    $small = '';   // the alpha mask at panel size
+    for ($y = 0; $y < $P; $y++) for ($x = 0; $x < $P; $x++)
+        $small .= $leaf(($x + 0.5) / $P, ($y + 0.5) / $P) ? "\x3C\xB3\x71\xFF" : "\x12\x18\x20\xFF";
+    $panels[] = [vio_texture($ctx, ['data' => $small, 'width' => $P, 'height' => $P]), 'alpha texture', 0];
+    foreach ([3, 5, 7] as $sub) {
+        $map = vio_opacity_micromap_bake(['uvs' => $uvs, 'indices' => $idx, 'data' => $rgba, 'width' => $T, 'height' => $T, 'subdivision' => $sub, 'format' => 4]);
+        $as = vio_acceleration_structure($ctx, [['mesh' => $quad, 'opacity_micromap' => $map]]);
+        if (!$as) throw new RuntimeException('acceleration structure failed');
+        $known = $trace($ignore, $as); $any = $trace($accept, $as);
+        $px = '';
+        foreach ($any as $i => $hit) $px .= !$hit ? "\x12\x18\x20\xFF" : ($known[$i] ? "\x3C\xB3\x71\xFF" : "\xF2\xA9\x3B\xFF");
+        $s = $map['stats'];
+        $panels[] = [vio_texture($ctx, ['data' => $px, 'width' => $P, 'height' => $P]), "subdivision $sub",
+                     100 * ($s['unknown_opaque'] + $s['unknown_transparent']) / array_sum($s)];
+    }
+    vio_begin($ctx);
+    vio_clear($ctx, 0.05, 0.06, 0.08, 1);
+    foreach ($panels as $i => [$tex, $name, $unknown]) {
+        $x = 8 + ($i % 2) * ($P + 8); $y = 8 + intdiv($i, 2) * ($P + 8);
+        vio_sprite($ctx, $tex, ['x' => $x, 'y' => $y]);
+        label($ctx, $name, $x + 6, $y + 20, 0xFFFFFFFF, 14);
+        if ($i) label($ctx, sprintf('%.1f %% unknown', $unknown), $x + 6, $y + $P - 8, 0xFFFFFFFF, 13);
+    }
+    $lx = 2 * ($P + 8) + 22;
+    label($ctx, 'vio_opacity_micromap_bake', $lx, 34, 0xFFFFFFFF, 17);
+    label($ctx, 'What rays learn without', $lx, 68, 0xFFB0BCC8, 14);
+    label($ctx, 'running a shader:', $lx, 88, 0xFFB0BCC8, 14);
+    foreach ([[0xFF3CB371, 'known opaque'], [0xFF121820, 'known transparent'], [0xFFF2A93B, 'unknown: any-hit decides']] as $i => [$c, $t]) {
+        vio_rect($ctx, $lx, 112 + $i * 28, 16, 16, ['color' => $c]);
+        label($ctx, $t, $lx + 24, 125 + $i * 28, 0xFFFFFFFF, 14);
+    }
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    vio_save_screenshot($ctx, $out);
+}, ['shader_model' => 6]);
+
 foreach ($results as $name => $r) echo str_pad($name, 28), " ", $r, "\n";
 echo "output: $outdir\n";

@@ -488,6 +488,7 @@ static int d3d12_upload_subresources(ID3D12Resource *dst, const D3D12_RESOURCE_D
                                      UINT dst_x, UINT dst_y, UINT dst_z);
 static void d3d12_retire_later(ID3D12Resource *res, UINT64 fence);
 static void d3d12_retire_object_later(IUnknown *obj, UINT64 fence);
+static void d3d12_release_when_idle(IUnknown *obj);
 static int  d3d12_ubatch_targets(ID3D12Resource *res);
 static void d3d12_ubatch_shutdown(void);
 static void d3d12_release_parked(UINT slot);
@@ -2867,8 +2868,13 @@ static void d3d12_destroy_acceleration_structure(void *ptr)
     vio_d3d12_as *as = (vio_d3d12_as *)ptr;
     if (!as) return;
     if (d3d12_bound_as == as) d3d12_bound_as = NULL;
-    /* A frame in flight may still read it: drain before releasing (rare). */
-    vio_d3d12_wait_for_gpu();
+    /* A frame may still read it, the open one included: drain before releasing (rare). */
+    if (vio_d3d12.in_frame && vio_d3d12.cmd_list) {
+        vio_d3d12.compute_async_pending++;
+        d3d12_compute_wait();   /* submits the open frame so far and reopens it */
+    } else {
+        vio_d3d12_wait_for_gpu();
+    }
     d3d12_as_free(as);
 }
 
@@ -3657,16 +3663,11 @@ static void d3d12_destroy_buffer(void *buffer_ptr)
 {
     vio_d3d12_buffer *buf = (vio_d3d12_buffer *)buffer_ptr;
     if (!buf) return;
-    if (buf->readback_resource) ID3D12Resource_Release(buf->readback_resource);
-    if (buf->upload_resource) ID3D12Resource_Release(buf->upload_resource);
-    if (buf->resource && d3d12_ubatch_targets(buf->resource)) {
-        /* A staged copy still writes it: submit the batch and release the
-         * buffer once that has executed. */
-        d3d12_ubatch_flush();
-        d3d12_retire_later(buf->resource, vio_d3d12.upload_last_fence);
-        buf->resource = NULL;
-    }
-    if (buf->resource) ID3D12Resource_Release(buf->resource);
+    if (buf->readback_resource) d3d12_release_when_idle((IUnknown *)buf->readback_resource);
+    if (buf->upload_resource) d3d12_release_when_idle((IUnknown *)buf->upload_resource);
+    /* A staged copy may still write it: the batch has to run before the frame list. */
+    if (buf->resource && d3d12_ubatch_targets(buf->resource)) d3d12_ubatch_flush();
+    if (buf->resource) d3d12_release_when_idle((IUnknown *)buf->resource);
     free(buf);
 }
 
@@ -4570,10 +4571,10 @@ static void d3d12_destroy_texture(void *texture_ptr)
     vio_d3d12_texture *tex = (vio_d3d12_texture *)texture_ptr;
     if (!tex) return;
     if (vio_d3d12.fb_bound == tex) vio_d3d12.fb_bound = NULL;
-    if (tex->fb_map) ID3D12Resource_Release(tex->fb_map);
-    if (tex->fb_decoded) ID3D12Resource_Release(tex->fb_decoded);
-    if (tex->upload_resource) ID3D12Resource_Release(tex->upload_resource);
-    if (tex->resource) ID3D12Resource_Release(tex->resource);
+    if (tex->fb_map) d3d12_release_when_idle((IUnknown *)tex->fb_map);
+    if (tex->fb_decoded) d3d12_release_when_idle((IUnknown *)tex->fb_decoded);
+    if (tex->upload_resource) d3d12_release_when_idle((IUnknown *)tex->upload_resource);
+    if (tex->resource) d3d12_release_when_idle((IUnknown *)tex->resource);
     /* Note: descriptor in SRV heap is leaked (linear allocator doesn't support free).
      * A proper free-list allocator would reclaim the slot. */
     free(tex);
@@ -5070,7 +5071,7 @@ static void d3d12_destroy_cubemap(void *cm_ptr)
         return;
     }
     if (cm->d3d12_resource) {
-        ID3D12Resource_Release((ID3D12Resource *)cm->d3d12_resource);
+        d3d12_release_when_idle((IUnknown *)cm->d3d12_resource);
         cm->d3d12_resource = NULL;
     }
 }
@@ -5095,14 +5096,6 @@ static void d3d12_destroy_render_target(void *rt_ptr)
     if (vio_d3d12.current_bound_rt == rt) vio_d3d12.current_bound_rt = NULL;
     if (vio_d3d12.pending_bound_rt == rt) vio_d3d12.pending_bound_rt = NULL;
 
-    /* Ensure the GPU is finished with these resources before releasing them.
-     * An offscreen target rendered to in a present-skipped frame (warm-render
-     * path) has no Present to implicitly throttle the CPU, so its command list
-     * may still be in flight here — releasing now would be a use-after-free
-     * (device-removed / crash). wait_for_gpu() is a no-op once the queue/fence
-     * are gone (shutdown), and destroy is rare, so the stall is harmless. */
-    vio_d3d12_wait_for_gpu();
-
     /* Cached backend-texture wrappers — descriptors are borrowed from the
      * RT's heap, so we just free the wrapper struct itself. */
     for (int i = 0; i < 2; i++) {
@@ -5115,7 +5108,7 @@ static void d3d12_destroy_render_target(void *rt_ptr)
     for (int i = 1; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
         if (rt->d3d12_color_backend_textures[i]) { free(rt->d3d12_color_backend_textures[i]); rt->d3d12_color_backend_textures[i] = NULL; }
         if (rt->d3d12_color_resources[i]) {
-            ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resources[i]);
+            d3d12_release_when_idle((IUnknown *)rt->d3d12_color_resources[i]);
             rt->d3d12_color_resources[i] = NULL;
         }
     }
@@ -5123,29 +5116,29 @@ static void d3d12_destroy_render_target(void *rt_ptr)
     rt->d3d12_color_resources[0] = NULL;
     for (int i = 0; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
         if (rt->d3d12_msaa_color_resources[i]) {
-            ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_msaa_color_resources[i]);
+            d3d12_release_when_idle((IUnknown *)rt->d3d12_msaa_color_resources[i]);
             rt->d3d12_msaa_color_resources[i] = NULL;
         }
     }
-    if (rt->d3d12_msaa_depth_resource) { ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_msaa_depth_resource); rt->d3d12_msaa_depth_resource = NULL; }
-    if (rt->d3d12_msaa_rtv_heap) { ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_msaa_rtv_heap); rt->d3d12_msaa_rtv_heap = NULL; }
-    if (rt->d3d12_msaa_dsv_heap) { ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_msaa_dsv_heap); rt->d3d12_msaa_dsv_heap = NULL; }
+    if (rt->d3d12_msaa_depth_resource) { d3d12_release_when_idle((IUnknown *)rt->d3d12_msaa_depth_resource); rt->d3d12_msaa_depth_resource = NULL; }
+    if (rt->d3d12_msaa_rtv_heap) { d3d12_release_when_idle((IUnknown *)rt->d3d12_msaa_rtv_heap); rt->d3d12_msaa_rtv_heap = NULL; }
+    if (rt->d3d12_msaa_dsv_heap) { d3d12_release_when_idle((IUnknown *)rt->d3d12_msaa_dsv_heap); rt->d3d12_msaa_dsv_heap = NULL; }
     rt->d3d12_msaa_layered = 0;
     rt->d3d12_msaa_depth_only = 0;
     if (rt->d3d12_color_resource) {
-        ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_color_resource);
+        d3d12_release_when_idle((IUnknown *)rt->d3d12_color_resource);
         rt->d3d12_color_resource = NULL;
     }
     if (rt->d3d12_depth_resource) {
-        ID3D12Resource_Release((ID3D12Resource *)rt->d3d12_depth_resource);
+        d3d12_release_when_idle((IUnknown *)rt->d3d12_depth_resource);
         rt->d3d12_depth_resource = NULL;
     }
     if (rt->d3d12_rtv_heap) {
-        ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_rtv_heap);
+        d3d12_release_when_idle((IUnknown *)rt->d3d12_rtv_heap);
         rt->d3d12_rtv_heap = NULL;
     }
     if (rt->d3d12_dsv_heap) {
-        ID3D12DescriptorHeap_Release((ID3D12DescriptorHeap *)rt->d3d12_dsv_heap);
+        d3d12_release_when_idle((IUnknown *)rt->d3d12_dsv_heap);
         rt->d3d12_dsv_heap = NULL;
     }
 }
@@ -8284,13 +8277,11 @@ static void d3d12_destroy_compute_pipeline(void *pipeline_ptr)
 {
     vio_d3d12_compute_pipeline *cp = (vio_d3d12_compute_pipeline *)pipeline_ptr;
     if (!cp) return;
-    /* The GPU may still reference this PSO if a dispatch is in flight. All vio
-     * compute dispatches are fully fenced (wait_for_gpu before returning), so by
-     * the time PHP drops the pipeline the GPU is idle — no extra wait needed. */
-    if (cp->params_buf) ID3D12Resource_Release(cp->params_buf);
+    /* An async dispatch may be recorded on the open frame list or in flight. */
+    if (cp->params_buf) d3d12_release_when_idle((IUnknown *)cp->params_buf);
     free(cp->params_cpu);
-    if (cp->pso) ID3D12PipelineState_Release(cp->pso);
-    if (cp->root_signature) ID3D12RootSignature_Release(cp->root_signature);
+    if (cp->pso) d3d12_release_when_idle((IUnknown *)cp->pso);
+    if (cp->root_signature) d3d12_release_when_idle((IUnknown *)cp->root_signature);
     if (cp->cs_blob) ID3D10Blob_Release(cp->cs_blob);
     free(cp);
 }
@@ -10069,12 +10060,12 @@ static ID3D12CommandSignature *d3d12_indirect_signature(int indexed)
     return *slot;
 }
 
-/* Objects replaced mid-frame (a grown draw-parameter ring): released once this
- * frame slot's fence has passed (begin_frame), like the parked PSOs. An upload
- * signal in between would come too early for the frame list. */
-#define VIO_D3D12_PARKED_MAX 16
-static IUnknown *d3d12_parked[VIO_D3D12_MAX_FRAME_COUNT][VIO_D3D12_PARKED_MAX];
-static int       d3d12_parked_count[VIO_D3D12_MAX_FRAME_COUNT];
+/* Objects the open frame may reference (replaced or released mid-frame): released
+ * once this frame slot's fence has passed (begin_frame), like the parked PSOs. An
+ * upload signal in between would come too early for the frame list. */
+static IUnknown **d3d12_parked[VIO_D3D12_MAX_FRAME_COUNT];
+static int        d3d12_parked_count[VIO_D3D12_MAX_FRAME_COUNT];
+static int        d3d12_parked_cap[VIO_D3D12_MAX_FRAME_COUNT];
 
 static void d3d12_release_parked(UINT slot)
 {
@@ -10088,18 +10079,37 @@ static void d3d12_release_parked(UINT slot)
 
 static void d3d12_release_parked_all(void)
 {
-    for (UINT s = 0; s < VIO_D3D12_MAX_FRAME_COUNT; s++) d3d12_release_parked(s);
+    for (UINT s = 0; s < VIO_D3D12_MAX_FRAME_COUNT; s++) {
+        d3d12_release_parked(s);
+        free(d3d12_parked[s]);
+        d3d12_parked[s] = NULL;
+        d3d12_parked_cap[s] = 0;
+    }
 }
 
 static void d3d12_park_object(IUnknown *obj)
 {
     UINT slot = vio_d3d12.frame_index < VIO_D3D12_MAX_FRAME_COUNT ? vio_d3d12.frame_index : 0;
-    if (d3d12_parked_count[slot] < VIO_D3D12_PARKED_MAX) {
-        d3d12_parked[slot][d3d12_parked_count[slot]++] = obj;
-    } else {
-        vio_d3d12_wait_for_gpu();   /* bookkeeping full: drain instead */
-        IUnknown_Release(obj);
+    if (d3d12_parked_count[slot] >= d3d12_parked_cap[slot]) {
+        /* Waiting would not help: the open frame list is not submitted yet. */
+        int cap = d3d12_parked_cap[slot] ? d3d12_parked_cap[slot] * 2 : 32;
+        IUnknown **grown = realloc(d3d12_parked[slot], (size_t)cap * sizeof(*grown));
+        if (!grown) return;   /* out of memory: a leak beats a use after free */
+        d3d12_parked[slot] = grown;
+        d3d12_parked_cap[slot] = cap;
     }
+    d3d12_parked[slot][d3d12_parked_count[slot]++] = obj;
+}
+
+/* Release what a command list may still reference: the open frame list holds it
+ * until this frame slot's fence, between frames everything signalled so far may
+ * still run. Without a device nothing is in flight. */
+static void d3d12_release_when_idle(IUnknown *obj)
+{
+    if (!obj) return;
+    if (!vio_d3d12.device || !vio_d3d12.fence) IUnknown_Release(obj);
+    else if (vio_d3d12.in_frame) d3d12_park_object(obj);
+    else d3d12_retire_object_later(obj, vio_d3d12.fence_value);
 }
 
 /* Draw parameters below SM 6.8 (OPEN-ITEMS-PLAN A11): command signatures that set

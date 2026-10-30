@@ -14832,6 +14832,8 @@ ZEND_FUNCTION(vio_render_target_cubemap)
         RETURN_FALSE;
     }
     cm->valid = 1;
+    cm->owner = &rt->std;   /* the wrapper points into the target */
+    GC_ADDREF(cm->owner);
     RETURN_COPY_VALUE(&cm_zval);
 }
 
@@ -15036,6 +15038,10 @@ ZEND_FUNCTION(vio_render_target_texture)
     tex->texture_id = want_depth ? rt->depth_texture : (att == 0 ? rt->color_texture : rt->color_textures[att]);
     tex->valid    = 1;
     tex->borrowed = 1;  /* GL resource owned by render target, don't double-delete */
+    /* The backend wrappers below die with the target, and the pending-bind table
+     * can hold this object past the last PHP reference to the target. */
+    tex->owner = &rt->std;
+    GC_ADDREF(tex->owner);
     tex->storage  = rt->storage && !want_depth;   /* vio_compute_bind_image accepts it */
 
 #ifdef HAVE_D3D11

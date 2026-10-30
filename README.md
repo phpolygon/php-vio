@@ -32,7 +32,8 @@ They double as a smoke test of each feature path on a real backend.
 | ![Compute storage image](docs/gallery/compute_storage_image.png) Compute shader → `image2D` storage texture | ![Compute vertex storage](docs/gallery/compute_vertex_storage.png) Compute writes instance matrices, the vertex stage reads them (no readback) |
 | ![3D texture](docs/gallery/texture_3d_volume.png) `vio_texture_3d` ray-marched via `sampler3D` | ![Shadow map](docs/gallery/shadow_map.png) Depth-only render target → PCF shadows |
 | ![HDR tone mapping](docs/gallery/hdr_tonemap.png) `['hdr' => true]` RGBA16F target + ACES | ![Geometry shader](docs/gallery/geometry_shader.png) `vio_shader(['geometry' => …])`: one vertex per point, the GS emits sprite quads |
-| ![Tessellation](docs/gallery/tessellation.png) `tess_control` + `tess_eval`, `VIO_PATCHES`: quad patches displaced in the evaluation stage, level 2 vs 18 | |
+| ![Tessellation](docs/gallery/tessellation.png) `tess_control` + `tess_eval`, `VIO_PATCHES`: quad patches displaced in the evaluation stage, level 2 vs 18 | ![Ray query shadows](docs/gallery/ray_query_shadows.png) `vio_acceleration_structure` + `rayQueryEXT`: one shadow ray per pixel |
+| ![Opacity micromaps](docs/gallery/opacity_micromap.png) `vio_opacity_micromap_bake`: what rays learn from an alpha texture without running a shader | |
 
 ## Requirements
 
