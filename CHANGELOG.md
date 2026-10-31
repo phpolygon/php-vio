@@ -1,3 +1,10 @@
+# [2.39.0](https://github.com/phpolygon/php-vio/compare/v2.38.1...v2.39.0) (2026-10-31)
+
+
+### Features
+
+* **upscale:** prepare providers on a worker thread, UTF-8 library paths ([d448190](https://github.com/phpolygon/php-vio/commit/d448190520f253cc7ff4ab1aac54210907d44708))
+
 ## [2.38.1](https://github.com/phpolygon/php-vio/compare/v2.38.0...v2.38.1) (2026-10-30)
 
 
