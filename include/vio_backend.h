@@ -16,6 +16,7 @@
 struct _vio_upscale_create_desc;
 struct _vio_upscale_dispatch_desc;
 struct _vio_upscale_query;
+struct _vio_upscale_timing;
 
 typedef struct _vio_backend {
     const char *name;   /* "opengl", "vulkan", "metal" */
@@ -571,6 +572,15 @@ typedef struct _vio_backend {
      * reason filled, no warning. upscaler_create with render size 0 uses it. */
     int   (*upscaler_render_size)(int provider, int quality, int display_w, int display_h,
                                   int *render_w, int *render_h, char *reason, size_t reason_len);
+    /* upscaler_prepare: starts `provider`'s first-use work on a worker thread and
+     * returns at once. 1 = started, running or already usable; 0 = not usable or the
+     * provider cannot prepare away from this thread (reason filled, upscaler_state
+     * tells which).
+     * upscaler_state: VIO_UPSCALE_PREPARE_*, never blocks and never starts anything.
+     * upscaler_timings: what host and provider measured, up to `max` entries. */
+    int   (*upscaler_prepare)(int provider, char *reason, size_t reason_len);
+    int   (*upscaler_state)(int provider, char *reason, size_t reason_len);
+    int   (*upscaler_timings)(int provider, struct _vio_upscale_timing *out, int max);
 } vio_backend;
 
 #define VIO_MAX_FRAGMENT_STORAGE 4

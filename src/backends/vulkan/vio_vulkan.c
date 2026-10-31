@@ -2137,6 +2137,7 @@ static void vulkan_shutdown(void)
 
     /* Only touch the device/queues if a device exists. */
     if (vio_vk.device) {
+        vulkan_upscale_device_wait();
         vkDeviceWaitIdle(vio_vk.device);
         /* Upscaler providers keep per-device state (DLSS: the NGX instance). */
         vulkan_upscale_device_release();
@@ -5604,6 +5605,7 @@ static int vulkan_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return vio_vk3d_available(); /* SAMPLED depth resting in DEPTH_STENCIL_READ_ONLY */
         case VIO_FEATURE_RENDER_TARGET_STORAGE: return vio_vk3d_available(); /* STORAGE colour images resting in GENERAL */
         case VIO_FEATURE_UPSCALER_NATIVE:       return vulkan_upscaler_any();  /* FSR 3.1 runtime found + accepts the device */
+        case VIO_FEATURE_UPSCALER_PREPARE:      return vulkan_upscaler_prepare_possible();  /* a provider with prepare slots that does not refuse */
         case VIO_FEATURE_RENDER_TARGET_MSAA:  return vio_vk3d_available(); /* multisampled attachments resolved by the pass (Block 10b) */
         case VIO_FEATURE_STENCIL:             return vio_vk3d_available() && (!vio_vk.device || vio_vk.depth_has_stencil); /* D32S8 / D24S8 attachments */
         case VIO_FEATURE_GPU_TIMESTAMP:       return vio_vk.ts_pool != VK_NULL_HANDLE; /* vkCmdWriteTimestamp per frame */
@@ -5706,6 +5708,9 @@ static const vio_backend vulkan_backend = {
     .upscaler_destroy             = vulkan_upscaler_destroy,
     .upscaler_device_requirements = vulkan_upscaler_device_requirements,
     .upscaler_render_size         = vulkan_upscaler_render_size,
+    .upscaler_prepare             = vulkan_upscaler_prepare,
+    .upscaler_state               = vulkan_upscaler_state,
+    .upscaler_timings             = vulkan_upscaler_timings,
     .shading_rate_tile_size = vulkan_shading_rate_tile_size,
     .swapchain_info    = vulkan_swapchain_info,
     .bindless_set      = vulkan_bindless_set,

@@ -7186,17 +7186,42 @@ ZEND_FUNCTION(vio_upscaler_supported)
     RETURN_BOOL(vio_upscaler_check(Z_VIO_CONTEXT_P(ctx_zval), (int)provider, reason, sizeof(reason)));
 }
 
-/* vio_upscaler_info($ctx, VioUpscaler|int $which = VIO_UPSCALER_FSR3): the
- * provider's state on this device; with an upscaler also its sizes. */
+/* vio_upscaler_prepare($ctx, $provider): starts the provider's first-use work on a
+ * worker thread and returns at once. true = started, running or already usable;
+ * false = not usable (info: 'failed') or this provider cannot prepare away from
+ * the render thread (info: 'idle' - a plugin built before the prepare slots, or
+ * FSR 3.1, which needs no preparation). Never warns. */
+ZEND_FUNCTION(vio_upscaler_prepare)
+{
+    zval *ctx_zval;
+    zend_long provider;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(provider)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!vio_upscaler_provider_arg(provider, 2)) RETURN_THROWS();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->backend || !ctx->backend->upscaler_prepare) RETURN_FALSE;
+    char reason[512];
+    RETURN_BOOL(ctx->backend->upscaler_prepare((int)provider, reason, sizeof(reason)));
+}
+
+/* vio_upscaler_info($ctx, VioUpscaler|int $which = VIO_UPSCALER_FSR3, bool $probe = true):
+ * the provider's state on this device; with an upscaler also its sizes. 'preparing'
+ * never blocks. $probe = false never starts a provider: only a 'ready' one is asked,
+ * an 'idle' one stays 'idle' and unsupported instead of doing its first-use work
+ * on this thread. */
 ZEND_FUNCTION(vio_upscaler_info)
 {
     zval *ctx_zval;
     zend_object *u_obj = NULL;
     zend_long provider = VIO_UPSCALER_FSR3;
-    ZEND_PARSE_PARAMETERS_START(1, 2)
+    bool probe = 1;
+    ZEND_PARSE_PARAMETERS_START(1, 3)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_OPTIONAL
         Z_PARAM_OBJ_OF_CLASS_OR_LONG(u_obj, vio_upscaler_ce, provider)
+        Z_PARAM_BOOL(probe)
     ZEND_PARSE_PARAMETERS_END();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     vio_upscaler_object *u = u_obj ? vio_upscaler_from_obj(u_obj) : NULL;
@@ -7205,20 +7230,47 @@ ZEND_FUNCTION(vio_upscaler_info)
 
     const vio_backend *be = ctx->initialized ? ctx->backend : NULL;
     char reason[512];
-    int ok = vio_upscaler_check(ctx, (int)provider, reason, sizeof(reason));
+    reason[0] = '\0';
+    int ok = 0;
+    /* Backends without native upscalers answer "unsupported" and stay 'idle'. */
+    int state = be && be->upscaler_state ? be->upscaler_state((int)provider, reason, sizeof(reason)) : VIO_UPSCALE_PREPARE_IDLE;
     vio_upscale_query q;
     memset(&q, 0, sizeof(q));
-    /* Also when unsupported: a provider may still name the driver it checked. */
-    if (be && be->upscaler_query) be->upscaler_query(NULL, (int)provider, &q);
-    if (!ok) q.version[0] = q.library[0] = '\0';
+    if (state == VIO_UPSCALE_PREPARE_PREPARING) {
+        snprintf(reason, sizeof(reason), "still preparing (vio_upscaler_prepare)");
+    } else if (!probe && be && be->upscaler_state && state != VIO_UPSCALE_PREPARE_READY) {
+        /* What is known, without asking the provider. */
+        if (!reason[0]) snprintf(reason, sizeof(reason), "not probed yet");
+    } else {
+        ok = vio_upscaler_check(ctx, (int)provider, reason, sizeof(reason));
+        /* Also when unsupported: a provider may still name the driver it checked. */
+        if (be && be->upscaler_query) be->upscaler_query(NULL, (int)provider, &q);
+        if (!ok) q.version[0] = '\0';   /* 'library' stays: found, but refused */
+        char unused[512];
+        if (be && be->upscaler_state) state = be->upscaler_state((int)provider, unused, sizeof(unused));
+    }
     char device[256] = "";
     if (be && be->upscaler_device_requirements) be->upscaler_device_requirements((int)provider, device, sizeof(device));
 
     array_init(return_value);
+    /* A provider's fixed buffers may have cut a path inside a character. */
+    vio_upscale_trim_utf8(q.library, sizeof(q.library));
+    vio_upscale_trim_utf8(reason, sizeof(reason));
     add_assoc_string(return_value, "provider", (char *)vio_upscale_provider_name((int)provider));
     add_assoc_string(return_value, "backend", (char *)(be ? be->name : ""));
     add_assoc_bool(return_value, "supported", ok);
     add_assoc_string(return_value, "reason", ok ? "" : reason);
+    /* idle | preparing | ready | failed */
+    add_assoc_string(return_value, "state", (char *)vio_upscale_state_name(state));
+    /* Milliseconds per step, what host and provider measured so far. */
+    zval timings;
+    array_init(&timings);
+    if (be && be->upscaler_timings) {
+        vio_upscale_timing t[24];
+        int n = be->upscaler_timings((int)provider, t, 24);
+        for (int i = 0; i < n; i++) add_assoc_double(&timings, t[i].name, t[i].ms);
+    }
+    add_assoc_zval(return_value, "timings", &timings);
     add_assoc_string(return_value, "version", q.version);
     add_assoc_string(return_value, "driver", q.driver);
     add_assoc_string(return_value, "library", q.library);
@@ -13171,6 +13223,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE", VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_STORAGE", VIO_FEATURE_RENDER_TARGET_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_UPSCALER_NATIVE", VIO_FEATURE_UPSCALER_NATIVE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_UPSCALER_PREPARE", VIO_FEATURE_UPSCALER_PREPARE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALER_FSR3", VIO_UPSCALER_FSR3, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALER_DLSS", VIO_UPSCALER_DLSS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALER_XESS", VIO_UPSCALER_XESS, CONST_CS | CONST_PERSISTENT);
@@ -15898,6 +15951,8 @@ PHP_MINIT_FUNCTION(vio)
 
 PHP_MSHUTDOWN_FUNCTION(vio)
 {
+    /* A leaked context can leave a preparation running: its code lives in this library. */
+    vio_upscale_shutdown();
     UNREGISTER_INI_ENTRIES();
     vio_plugin_registry_shutdown();
     vio_audio_engine_shutdown();

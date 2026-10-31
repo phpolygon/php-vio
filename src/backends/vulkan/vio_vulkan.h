@@ -701,6 +701,13 @@ int   vulkan_upscaler_device_requirements(int provider, char *out, size_t out_le
 int   vulkan_upscaler_render_size(int provider, int quality, int display_w, int display_h,
                                   int *render_w, int *render_h, char *reason, size_t reason_len);
 void  vulkan_upscale_device_release(void);   /* vulkan_shutdown, before the device goes */
+void  vulkan_upscale_device_wait(void);      /* a running preparation done: nothing else near the device-wide wait */
+struct _vio_upscale_timing;
+int   vulkan_upscaler_prepare(int provider, char *reason, size_t reason_len);
+int   vulkan_upscaler_state(int provider, char *reason, size_t reason_len);
+int   vulkan_upscaler_timings(int provider, struct _vio_upscale_timing *out, int max);
+int   vulkan_upscaler_prepare_possible(void);
+
 /* One-shot command buffer from the transient pool, submitted and waited for
  * (vio_vulkan.c); also usable while a frame is open. 0 = ok. */
 int   vio_vk_transient_begin(VkCommandBuffer *out_cmd);

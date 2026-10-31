@@ -8488,11 +8488,10 @@ static int d3d12_upscaler_supported(int provider, char *reason, size_t reason_le
 
 static int d3d12_upscaler_any(void)
 {
-    char reason[256];
-    for (int p = 1; p <= VIO_UPSCALER_COUNT; p++) {
-        if (d3d12_upscaler_supported(p, reason, sizeof(reason))) return 1;
-    }
-    return 0;
+    if (!vio_d3d12.device) return 0;
+    vio_upscale_device dev;
+    d3d12_upscale_device(&dev);
+    return vio_upscale_available_on(&dev);
 }
 
 static int d3d12_upscaler_render_size(int provider, int quality, int display_w, int display_h,
@@ -8569,6 +8568,39 @@ static void d3d12_upscaler_destroy(void *upscaler)
     }
     vio_upscale_destroy_instance(upscaler);
     d3d12_drain_info_queue("upscaler_destroy");
+}
+
+static int d3d12_upscaler_prepare(int provider, char *reason, size_t reason_len)
+{
+    if (!vio_d3d12.device) { snprintf(reason, reason_len, "no D3D12 device"); return 0; }
+    vio_upscale_device dev;
+    d3d12_upscale_device(&dev);
+    return vio_upscale_prepare_on(&dev, provider, reason, reason_len);
+}
+
+static int d3d12_upscaler_state(int provider, char *reason, size_t reason_len)
+{
+    if (reason_len) reason[0] = '\0';
+    if (!vio_d3d12.device) return VIO_UPSCALE_PREPARE_IDLE;
+    vio_upscale_device dev;
+    d3d12_upscale_device(&dev);
+    return vio_upscale_state_on(&dev, provider, reason, reason_len);
+}
+
+static int d3d12_upscaler_timings(int provider, vio_upscale_timing *out, int max)
+{
+    if (!vio_d3d12.device) return 0;
+    vio_upscale_device dev;
+    d3d12_upscale_device(&dev);
+    return vio_upscale_timings_on(&dev, provider, out, max);
+}
+
+static int d3d12_upscaler_prepare_possible(void)
+{
+    if (!vio_d3d12.device) return 0;
+    vio_upscale_device dev;
+    d3d12_upscale_device(&dev);
+    return vio_upscale_prepare_possible(&dev);
 }
 
 static int d3d12_upscaler_device_requirements(int provider, char *out, size_t out_len)
@@ -9921,6 +9953,7 @@ static int d3d12_supports_feature(vio_feature feature)
         case VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE: return 1; /* typeless R24G8 depth + SRV, PIXEL_SHADER_RESOURCE between binds */
         case VIO_FEATURE_RENDER_TARGET_STORAGE: return 1; /* ALLOW_UNORDERED_ACCESS attachments, typed UAVs in the compute table */
         case VIO_FEATURE_UPSCALER_NATIVE:       return d3d12_upscaler_any();   /* FSR 3.1 runtime found + accepts the device */
+        case VIO_FEATURE_UPSCALER_PREPARE:      return d3d12_upscaler_prepare_possible();   /* a provider with prepare slots that does not refuse */
         /* Multisampled colour + depth resources per target, PSO SampleDesc
          * variants picked at bind time, ResolveSubresource on unbind (GAP-PHASE5
          * Block 1). */
@@ -11090,6 +11123,9 @@ static const vio_backend d3d12_backend = {
     .upscaler_destroy               = d3d12_upscaler_destroy,
     .upscaler_device_requirements   = d3d12_upscaler_device_requirements,
     .upscaler_render_size           = d3d12_upscaler_render_size,
+    .upscaler_prepare               = d3d12_upscaler_prepare,
+    .upscaler_state                 = d3d12_upscaler_state,
+    .upscaler_timings               = d3d12_upscaler_timings,
 };
 
 void vio_backend_d3d12_register(void)
