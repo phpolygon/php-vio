@@ -35,7 +35,7 @@ struct FfxLib {
     PfnFfxConfigure      configure = nullptr;
     PfnFfxQuery          query = nullptr;
     PfnFfxDispatch       dispatch = nullptr;
-    char path[512] = "";
+    char path[1024] = "";
 };
 
 FfxLib g_lib[3];   /* indexed by VIO_UPSCALE_API_* */
@@ -60,7 +60,7 @@ FfxLib *ffx_load(int api, char *reason, size_t reason_len)
     }
     FfxLib *L = &g_lib[api];
     if (L->state == 1) return L;
-    char path[512], why[512];
+    char path[1024], why[512];
     void *m = vio_upscale_load_library("vio.ffx_path", "VIO_FFX_PATH", ffx_library_name(api),
                                        path, sizeof(path), why, sizeof(why));
     if (!m) {
@@ -125,6 +125,7 @@ int ffx_supported(const vio_upscale_device *dev, char *reason, size_t reason_len
 {
     FfxLib *L = ffx_load(dev->api, reason, reason_len);
     if (!L) return 0;
+    snprintf(q->library, sizeof(q->library), "%s", L->path);
     /* WARP takes the FSR 3.1 context and dispatch, then faults while executing
      * its compute passes (access violation in the WARP JIT, Windows 11 26200).
      * A missing library is reported first. */

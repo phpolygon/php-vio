@@ -54,11 +54,10 @@ int vulkan_upscaler_supported(int provider, char *reason, size_t reason_len)
 
 int vulkan_upscaler_any(void)
 {
-    char reason[256];
-    for (int p = 1; p <= VIO_UPSCALER_COUNT; p++) {
-        if (vulkan_upscaler_supported(p, reason, sizeof(reason))) return 1;
-    }
-    return 0;
+    if (!vio_vk.device || !vio_vk3d_available()) return 0;
+    vio_upscale_device dev;
+    vk_upscale_device(&dev);
+    return vio_upscale_available_on(&dev);
 }
 
 int vulkan_upscaler_render_size(int provider, int quality, int display_w, int display_h,
@@ -98,6 +97,49 @@ void vulkan_upscale_device_release(void)
     vk_upscale_device(&dev);
     vio_upscale_device_release(&dev);
 }
+
+void vulkan_upscale_device_wait(void)
+{
+    if (!vio_vk.device) return;
+    vio_upscale_device dev;
+    vk_upscale_device(&dev);
+    vio_upscale_device_wait(&dev);
+}
+
+int vulkan_upscaler_prepare(int provider, char *reason, size_t reason_len)
+{
+    if (!vio_vk.device) { snprintf(reason, reason_len, "no Vulkan device"); return 0; }
+    if (!vio_vk3d_available()) { snprintf(reason, reason_len, "the Vulkan 3D pipeline is not available"); return 0; }
+    vio_upscale_device dev;
+    vk_upscale_device(&dev);
+    return vio_upscale_prepare_on(&dev, provider, reason, reason_len);
+}
+
+int vulkan_upscaler_state(int provider, char *reason, size_t reason_len)
+{
+    if (reason_len) reason[0] = '\0';
+    if (!vio_vk.device) return VIO_UPSCALE_PREPARE_IDLE;
+    vio_upscale_device dev;
+    vk_upscale_device(&dev);
+    return vio_upscale_state_on(&dev, provider, reason, reason_len);
+}
+
+int vulkan_upscaler_timings(int provider, struct _vio_upscale_timing *out, int max)
+{
+    if (!vio_vk.device) return 0;
+    vio_upscale_device dev;
+    vk_upscale_device(&dev);
+    return vio_upscale_timings_on(&dev, provider, out, max);
+}
+
+int vulkan_upscaler_prepare_possible(void)
+{
+    if (!vio_vk.device || !vio_vk3d_available()) return 0;
+    vio_upscale_device dev;
+    vk_upscale_device(&dev);
+    return vio_upscale_prepare_possible(&dev);
+}
+
 
 int vulkan_upscaler_query(void *upscaler, int provider, vio_upscale_query *q)
 {

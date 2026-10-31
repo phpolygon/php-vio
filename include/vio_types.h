@@ -441,6 +441,10 @@ typedef enum _vio_feature {
      * runs on this device - its runtime library was found and accepts the
      * device (TEMPORAL-S3, D3D12 / Vulkan). */
     VIO_FEATURE_UPSCALER_NATIVE = 70,
+    /* vio_upscaler_prepare: a provider on this device can do its first-use work on a
+     * worker thread - it has the prepare slots and does not refuse the device.
+     * Off for a plugin built before them, the first call then blocks. */
+    VIO_FEATURE_UPSCALER_PREPARE = 71,
 } vio_feature;
 
 /* Zones per axis of a rate map. */

@@ -22,11 +22,17 @@
  * and vio_upscaler_info()['reason'] says why. A plugin is never unloaded.
  *
  * Every call into the provider comes from the thread that owns the graphics
- * context (the PHP thread). Strings handed out (reason, err, query) are
+ * context (the PHP thread), with one exception: prepare_run runs on a worker
+ * thread of the host. Strings handed out (reason, err, query) are
  * NUL-terminated within the given length.
  *
  * Bump VIO_UPSCALE_PLUGIN_ABI on any change that moves a field or changes a
- * meaning; new fields go at the end of a struct together with its `size`.
+ * meaning; new fields go at the end of a struct together with its `size`. The
+ * host takes any table of at least VIO_UPSCALE_PROVIDER_MIN_SIZE bytes and reads
+ * a later slot only when `size` covers it (VIO_UPSCALE_PROVIDER_HAS): a plugin
+ * built before a slot existed keeps working without it, and a newer plugin on
+ * an older host just is not asked. The host table (`vio_upscale_host_api`) and
+ * vio_upscale_query have no room to grow that way: plugins check host->size.
  *
  * Conventions (all providers):
  *   jitter : the sub-pixel offset applied to the projection this frame, in
@@ -34,6 +40,8 @@
  *            +jitter, so a pixel samples the scene at its centre - jitter.
  *   motion : per render pixel (motion.rg * mv_scale) = previous position -
  *            current position, in render pixels, x right / y down.
+ *   paths  : every path string host and provider exchange is UTF-8, also on
+ *            Windows (plugin_path, find_file, load_library, query.library).
  */
 
 #ifndef VIO_UPSCALE_PLUGIN_H
@@ -108,7 +116,8 @@ typedef struct _vio_upscale_dispatch_params {
 typedef struct _vio_upscale_query {
     char     version[64];      /* e.g. "3.1.4" (FSR) / "310.9.1" (DLSS) */
     char     driver[64];       /* graphics driver version the provider checked ("" = none) */
-    char     library[512];     /* the loaded runtime library */
+    char     library[512];     /* the runtime library - also when not usable, if it was found;
+                                * a path can be longer (1024): cut at a UTF-8 character */
     int      render_width, render_height;
     int      display_width, display_height;
     int      jitter_phases;
@@ -211,6 +220,12 @@ typedef struct _vio_upscale_host_api {
 /* vio_upscale_provider.flags */
 #define VIO_UPSCALE_PROVIDER_CREATE_COMMANDS (1u << 0)   /* create() records into dev->command_list */
 
+/* One measured step (vio_upscaler_info()['timings']). */
+typedef struct _vio_upscale_timing {
+    char   name[32];
+    double ms;
+} vio_upscale_timing;
+
 typedef struct _vio_upscale_provider {
     uint32_t    abi;              /* VIO_UPSCALE_PLUGIN_ABI the provider was built for */
     uint32_t    size;             /* sizeof(vio_upscale_provider) it was built with */
@@ -244,7 +259,41 @@ typedef struct _vio_upscale_provider {
      * `max` names into `names` (strings that stay valid); returns how many (0
      * when its runtime is missing). */
     int   (*vk_extensions)(void *physical_device, const char **names, int max);
+
+    /* ── Later slots: read only when `size` covers them (see the top) ──── */
+
+    /* Optional: what the provider measured on the device, up to `max` entries;
+     * returns how many. Never blocks, never initialises anything. */
+    int   (*timings)(const vio_upscale_device *dev, vio_upscale_timing *out, int max);
+    /* Optional, both or neither: first-use work of the device away from the render
+     * thread (vio_upscaler_prepare).
+     * prepare_begin: on the PHP thread, quick - what needs the host (ini, find_file)
+     * or decides without work. 1 = call prepare_run, 0 = already usable, -1 = not
+     * usable (reason filled).
+     * prepare_run: on a host worker thread, the device is rendering meanwhile. Only
+     * free-threaded use of the device: no queue, no command list, nothing of the
+     * host - no host function at all, this thread is not a PHP thread. 1 = usable,
+     * 0 = not (reason filled). The host keeps every other call for this device
+     * away until it has returned and the worker is joined; calls for ANOTHER device
+     * may come meanwhile, so state shared between devices (a library that is not
+     * thread safe) is the provider's to guard - without making that device's
+     * render thread wait for seconds where it can be avoided. Whatever still waits
+     * says so here: for the DLSS plugin a first synchronous use and a device_release
+     * wait for an initialisation running on the other API, and a second device of
+     * the same API shares its lock with the first; an initialised device on the
+     * other API, vk_extensions and prepare_begin never wait. prepare_begin also
+     * answers VIO_FEATURE_UPSCALER_NATIVE (>= 0 = available), so it must stay quick
+     * and may be called repeatedly. `dev` stays valid until prepare_run returns;
+     * dev->command_list is NULL. */
+    int   (*prepare_begin)(const vio_upscale_device *dev, char *reason, size_t reason_len);
+    int   (*prepare_run)(const vio_upscale_device *dev, char *reason, size_t reason_len);
 } vio_upscale_provider;
+
+/* The table a plugin of the first ABI 1 build hands over. */
+#define VIO_UPSCALE_PROVIDER_MIN_SIZE offsetof(vio_upscale_provider, timings)
+/* Whether the table `p` was built with holds `slot`, and sets it. */
+#define VIO_UPSCALE_PROVIDER_HAS(p, slot) \
+    ((p)->size >= offsetof(vio_upscale_provider, slot) + sizeof((p)->slot) && (p)->slot != NULL)
 
 /* The plugin's one export. */
 typedef const vio_upscale_provider *(*vio_upscale_plugin_get_fn)(uint32_t abi, const vio_upscale_host_api *host);

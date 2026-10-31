@@ -1,5 +1,5 @@
 /*
- * php-vio - test upscaler plugin (tests/render3d/234-236)
+ * php-vio - test upscaler plugin (tests/render3d/234-236, 254, 255)
  *
  * A provider behind the plugin ABI (include/vio_upscale_plugin.h) that does
  * what a real one does with the host's objects, minus the upscaling: it copies
@@ -19,6 +19,19 @@
  *   VIO_TEST_UPSCALER_ID=n       register for VIO_UPSCALER_n
  *   VIO_TEST_UPSCALER_NO_RESTORE=1  leave the images in the copy states (breaks
  *                                the contract: the debug layer / validation must object)
+ *   VIO_TEST_UPSCALER_OLD=1      hand the provider table of a plugin built before
+ *                                timings / prepare_begin / prepare_run
+ * Read when the call happens:
+ *   VIO_TEST_UPSCALER_PREPARE_MS=n     prepare_run works n milliseconds
+ *   VIO_TEST_UPSCALER_PREPARE_FAIL=1   prepare_run says no (a lost device, NGX refusing)
+ *   VIO_TEST_UPSCALER_PREPARE_REFUSE=1 prepare_begin says no
+ *   VIO_TEST_UPSCALER_UNSUPPORTED=1    supported() says no, but names its library
+ *   VIO_TEST_UPSCALER_FIND_SMALL=1     supported() asks the host for its file with a too small buffer
+ *
+ * timings reports test_worker = 1 when prepare_run ran on another thread than
+ * prepare_begin, test_overlap = how many calls reached the provider while
+ * prepare_run was running (the host must keep them away), test_supported = how
+ * often supported() ran.
  *
  * No SDK, no graphics library linked: D3D12 through its COM vtables, Vulkan
  * through the vkGetDeviceProcAddr the host hands over.
@@ -40,11 +53,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <pthread.h>
+#include <unistd.h>
+#endif
 
 #include "../../include/vio_upscale_plugin.h"
 
 static const vio_upscale_host_api *g_host = NULL;
 static int g_no_restore = 0;
+
+static int env_int(const char *name, int def);
+
+/* Preparation (the worker writes, the PHP thread reads after the join; g_running
+ * is the one word both touch meanwhile). */
+static volatile int g_running = 0;
+static int g_overlap = 0, g_worker = 0, g_prepare_ms = 0, g_prepare_fail = 0;
+static int g_failed = 0;   /* like NGX: a failed initialisation stays failed */
+static int g_supported = 0;
+#ifdef _WIN32
+static DWORD g_begin_thread;
+#else
+static pthread_t g_begin_thread;
+#endif
 
 typedef struct {
     int api;
@@ -66,6 +97,27 @@ static int test_supported(const vio_upscale_device *dev, char *reason, size_t re
 {
     if (dev->api != VIO_UPSCALE_API_D3D12 && dev->api != VIO_UPSCALE_API_VULKAN) {
         snprintf(reason, reason_len, "test upscaler: D3D12 and Vulkan only");
+        return 0;
+    }
+    if (g_running) g_overlap++;
+    g_supported++;
+    if (env_int("VIO_TEST_UPSCALER_FIND_SMALL", 0)) {
+        char tight[16];
+        const char *name = g_host->plugin_path ? strrchr(g_host->plugin_path, '\\') : NULL;
+        if (g_host->find_file("vio.dlss_plugin_path", "VIO_DLSS_PLUGIN", name ? name + 1 : "vio_dlss.dll",
+                              tight, sizeof(tight), reason, reason_len)) {
+            snprintf(reason, reason_len, "find_file returned a cut path");
+        }
+        return 0;
+    }
+    if (g_failed) {
+        snprintf(reason, reason_len, "test upscaler: preparation failed");
+        return 0;
+    }
+    if (env_int("VIO_TEST_UPSCALER_UNSUPPORTED", 0)) {
+        snprintf(q->library, sizeof(q->library), "%s", g_host && g_host->plugin_path ? g_host->plugin_path : "");
+        snprintf(q->driver, sizeof(q->driver), "test-driver");
+        snprintf(reason, reason_len, "test upscaler: not on this GPU");
         return 0;
     }
     snprintf(q->version, sizeof(q->version), "0.1.0-test");
@@ -91,6 +143,7 @@ static int test_render_size(const vio_upscale_device *dev, int quality, int disp
 
 static void *test_create(const vio_upscale_device *dev, const vio_upscale_create_desc *desc, char *reason, size_t reason_len)
 {
+    if (g_running) g_overlap++;
     if (!dev->command_list) {
         snprintf(reason, reason_len, "test upscaler: no command list at creation (VIO_UPSCALE_PROVIDER_CREATE_COMMANDS)");
         return NULL;
@@ -282,6 +335,10 @@ static int test_vk_extensions(void *physical_device, const char **names, int max
     return 1;
 }
 
+static int test_timings(const vio_upscale_device *dev, vio_upscale_timing *out, int max);
+static int test_prepare_begin(const vio_upscale_device *dev, char *reason, size_t reason_len);
+static int test_prepare_run(const vio_upscale_device *dev, char *reason, size_t reason_len);
+
 static vio_upscale_provider g_provider = {
     VIO_UPSCALE_PLUGIN_ABI,
     sizeof(vio_upscale_provider),
@@ -298,7 +355,65 @@ static vio_upscale_provider g_provider = {
     test_render_size,
     test_device_release,
     test_vk_extensions,
+    test_timings,
+    test_prepare_begin,
+    test_prepare_run,
 };
+
+static int test_timings(const vio_upscale_device *dev, vio_upscale_timing *out, int max)
+{
+    (void)dev;
+    if (max < 3) return 0;
+    snprintf(out[2].name, sizeof(out[2].name), "test_supported");
+    out[2].ms = g_supported;
+    snprintf(out[0].name, sizeof(out[0].name), "test_worker");
+    out[0].ms = g_worker;
+    snprintf(out[1].name, sizeof(out[1].name), "test_overlap");
+    out[1].ms = g_overlap;
+    return 3;
+}
+
+static int test_prepare_begin(const vio_upscale_device *dev, char *reason, size_t reason_len)
+{
+    g_failed = 0;
+    if (dev->api != VIO_UPSCALE_API_D3D12 && dev->api != VIO_UPSCALE_API_VULKAN) {
+        snprintf(reason, reason_len, "test upscaler: D3D12 and Vulkan only");
+        return -1;
+    }
+    if (env_int("VIO_TEST_UPSCALER_PREPARE_REFUSE", 0)) {
+        snprintf(reason, reason_len, "test upscaler: refuses to prepare");
+        return -1;
+    }
+    g_prepare_ms = env_int("VIO_TEST_UPSCALER_PREPARE_MS", 0);
+    g_prepare_fail = env_int("VIO_TEST_UPSCALER_PREPARE_FAIL", 0);
+#ifdef _WIN32
+    g_begin_thread = GetCurrentThreadId();
+#else
+    g_begin_thread = pthread_self();
+#endif
+    return 1;
+}
+
+/* Nothing of the host in here: this is not a PHP thread. */
+static int test_prepare_run(const vio_upscale_device *dev, char *reason, size_t reason_len)
+{
+    (void)dev;
+    g_running = 1;
+#ifdef _WIN32
+    g_worker = GetCurrentThreadId() != g_begin_thread;
+    Sleep((DWORD)g_prepare_ms);
+#else
+    g_worker = !pthread_equal(pthread_self(), g_begin_thread);
+    usleep((useconds_t)g_prepare_ms * 1000);
+#endif
+    g_running = 0;
+    if (g_prepare_fail) {
+        g_failed = 1;
+        snprintf(reason, reason_len, "test upscaler: preparation failed");
+        return 0;
+    }
+    return 1;
+}
 
 /* The process environment as it is now (PHP's putenv() may bypass the CRT copy). */
 static int env_int(const char *name, int def)
@@ -320,7 +435,8 @@ VIO_UPSCALE_PLUGIN_EXPORT const vio_upscale_provider *vio_upscale_plugin_get(uin
     g_host = host;
     g_no_restore = env_int("VIO_TEST_UPSCALER_NO_RESTORE", 0);
     g_provider.abi = (uint32_t)env_int("VIO_TEST_UPSCALER_ABI", VIO_UPSCALE_PLUGIN_ABI);
-    g_provider.size = (uint32_t)env_int("VIO_TEST_UPSCALER_SIZE", (int)sizeof(vio_upscale_provider));
+    g_provider.size = (uint32_t)env_int("VIO_TEST_UPSCALER_SIZE", env_int("VIO_TEST_UPSCALER_OLD", 0)
+                                        ? (int)VIO_UPSCALE_PROVIDER_MIN_SIZE : (int)sizeof(vio_upscale_provider));
     g_provider.id = env_int("VIO_TEST_UPSCALER_ID", VIO_UPSCALER_DLSS);
     return &g_provider;
 }

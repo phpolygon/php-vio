@@ -64,9 +64,12 @@ void *vio_upscale_load_library(const char *ini_key, const char *env_key, const c
 void *vio_upscale_symbol(void *module, const char *name);
 /* A php.ini string (NULL when unknown), for providers written in C++. */
 const char *vio_upscale_ini(const char *key);
+/* `s` filled up its buffer of `size` bytes: drop a UTF-8 character cut in two. */
+void vio_upscale_trim_utf8(char *s, size_t size);
 /* The same search without loading (for runtimes an SDK loads itself): 1 +
  * `path`, or 0 + reason. Elsewhere than Windows `file` is matched as a prefix
- * (versioned .so names); LD_LIBRARY_PATH replaces PATH. */
+ * (versioned .so names); LD_LIBRARY_PATH replaces PATH. A path that does not fit in
+ * `path_len` is 0 + reason, never a cut path. */
 int   vio_upscale_find_file(const char *ini_key, const char *env_key, const char *file,
                             char *path, size_t path_len, char *reason, size_t reason_len);
 
@@ -94,8 +97,37 @@ int vio_upscale_render_size_on(const vio_upscale_device *dev, int provider, int 
                                int *render_w, int *render_h, char *reason, size_t reason_len);
 /* 1 when the provider's create() records into vio_upscale_device.command_list. */
 int vio_upscale_create_needs_commands(int provider);
-/* Before the device goes away: every provider drops its state for it. */
+/* Before the device goes away: every provider drops its state for it (a running
+ * preparation is waited for first). */
 void vio_upscale_device_release(const vio_upscale_device *dev);
+/* Waits for a running preparation on the device, without releasing anything. */
+void vio_upscale_device_wait(const vio_upscale_device *dev);
+/* MSHUTDOWN: no worker outlives the library its code lives in. */
+void vio_upscale_shutdown(void);
+
+/* First-use work away from the render thread (vio_upscaler_prepare): the state of
+ * a provider on a device. */
+#define VIO_UPSCALE_PREPARE_IDLE      0   /* nothing started, nothing known */
+#define VIO_UPSCALE_PREPARE_PREPARING 1   /* a worker is on it */
+#define VIO_UPSCALE_PREPARE_READY     2   /* usable */
+#define VIO_UPSCALE_PREPARE_FAILED    3   /* not usable, reason says why */
+
+const char *vio_upscale_state_name(int state);
+/* Starts the worker and returns at once: 1 = started, running or already usable,
+ * 0 = not (reason filled; vio_upscale_state_on says which). While it runs
+ * vio_upscale_supported_on / _render_size_on / _create_on answer "not usable"
+ * with a reason instead of waiting - only device_release waits. */
+int vio_upscale_prepare_on(const vio_upscale_device *dev, int provider, char *reason, size_t reason_len);
+/* VIO_UPSCALE_PREPARE_*; never blocks, never starts anything. */
+int vio_upscale_state_on(const vio_upscale_device *dev, int provider, char *reason, size_t reason_len);
+/* 1 when a provider is usable on the device as far as can be told without its
+ * first-use work (VIO_FEATURE_UPSCALER_NATIVE): a provider with prepare slots is
+ * not initialised for this. Only one without them still is, on this thread. */
+int vio_upscale_available_on(const vio_upscale_device *dev);
+/* 1 when a provider can prepare on the device (the feature flag). */
+int vio_upscale_prepare_possible(const vio_upscale_device *dev);
+/* What host and provider measured so far (vio_upscaler_info()['timings']). */
+int vio_upscale_timings_on(const vio_upscale_device *dev, int provider, vio_upscale_timing *out, int max);
 
 /* The provider for VIO_UPSCALER_*: built in, or loaded from its plugin library
  * (VIO_UPSCALER_DLSS: vio_dlss.dll / libvio_dlss.so through vio.dlss_plugin_path

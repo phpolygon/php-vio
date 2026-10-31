@@ -1303,7 +1303,9 @@ function vio_upscale_info(VioContext $context): array {}
  * plugin) when set (a directory or the file - then the only place searched),
  * otherwise next to the PHP executable, next to php_vio, then PATH; a plugin of
  * another ABI is refused. Without them this returns false - never a warning;
- * vio_upscaler_info()['reason'] says why. VIO_FEATURE_UPSCALER_NATIVE is set
+ * vio_upscaler_info()['reason'] says why. VIO_FEATURE_UPSCALER_NATIVE does not
+ * initialise a provider that has vio_upscaler_prepare (it can then be true for a
+ * GPU NGX refuses later; state 'failed' turns it off); it is set
  * when any provider runs on the device. The DLSS plugin reads `vio.dlss_path`
  * (where nvngx_dlss.dll is), `vio.dlss_project_id` (the game's GUID-like id)
  * and `vio.dlss_engine_version`.
@@ -1317,16 +1319,39 @@ function vio_upscaler_supported(VioContext $context, int $provider = VIO_UPSCALE
  * driver too old with the version it needs), 'version' (e.g. '3.1.4', DLSS
  * '310.9.1'), 'driver' (graphics driver version the provider checked, '' when
  * none), 'library' (runtime loaded), 'plugin' (the plugin library the provider
- * came from, '' when built in), 'device' (Vulkan
+ * came from, '' when built in), 'state' ('idle' | 'preparing' | 'ready' | 'failed',
+ * see vio_upscaler_prepare), 'timings' (milliseconds per step, what php-vio and
+ * the provider measured so far: 'plugin_load', 'first_supported', 'prepare_begin',
+ * 'prepare_run', 'create' and the provider's own), 'device' (Vulkan
  * features / extensions device creation enabled for native upscalers), 'live'
  * (upscalers alive on the backend), 'host_bytes' (CPU memory the providers
  * hold)]. With a VioUpscaler also 'valid', 'quality', 'render_width',
  * 'render_height' (the size the provider chose for the quality mode - DLSS: NGX
  * optimal settings), 'display_width', 'display_height', 'preset' (the model
  * preset asked for, '' = the provider's default), 'jitter_phases' (length of
- * the jitter cycle) and 'gpu_memory' (bytes).
+ * the jitter cycle) and 'gpu_memory' (bytes). The first look at DLSS on a device
+ * initialises NGX for seconds on this thread: call vio_upscaler_prepare before,
+ * or pass $probe = false - that never touches the provider, an 'idle' one is
+ * reported unsupported and stays 'idle'. While 'preparing' this never blocks.
  */
-function vio_upscaler_info(VioContext $context, VioUpscaler|int $which = VIO_UPSCALER_FSR3): array {}
+function vio_upscaler_info(VioContext $context, VioUpscaler|int $which = VIO_UPSCALER_FSR3, bool $probe = true): array {}
+
+/**
+ * Start a provider's first-use work on a worker thread and return at once, so a
+ * running render loop does not stall (DLSS: NGX initialisation, seconds on the
+ * first use of a device). True when it started, is running or the provider is
+ * already usable; false when it is not usable (vio_upscaler_info: state 'failed'
+ * with the reason) or cannot prepare away from this thread (state 'idle': a plugin
+ * built before this function, the first supported / info call then blocks as
+ * ever; FSR 3.1 needs no preparation). Never a warning.
+ *
+ * Poll vio_upscaler_info($ctx, $provider)['state'] until it leaves 'preparing'.
+ * Until then vio_upscaler_supported / _render_size answer false and
+ * vio_upscaler_create fails with a warning - none of them waits. Destroying the
+ * context waits for the worker. VIO_FEATURE_UPSCALER_PREPARE tells whether a
+ * provider can do this on the device.
+ */
+function vio_upscaler_prepare(VioContext $context, int $provider): bool {}
 
 /**
  * Create an upscaler context. Options:
