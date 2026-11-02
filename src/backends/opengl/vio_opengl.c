@@ -758,21 +758,23 @@ static void opengl_gpu_flush(void)
 
 static void opengl_clear(float r, float g, float b, float a)
 {
-    vio_gl.clear_r = r;
-    vio_gl.clear_g = g;
-    vio_gl.clear_b = b;
-    vio_gl.clear_a = a;
-
     /* Eager inside a frame (D3D11 / Metal semantics): clears whatever
      * framebuffer is bound right now — the swapchain / headless FBO or a bound
      * render target. Before vio_begin the colour is latched for begin_frame.
      * Previously the in-frame call was a no-op, which left render targets that
-     * were bound and "cleared" mid-frame with undefined depth. */
+     * were bound and "cleared" mid-frame with undefined depth. An in-frame clear
+     * leaves the latch alone: a render target's clear colour must not become the
+     * next frame's swapchain clear (D3D12 semantics). */
     if (vio_gl.initialized && vio_gl.in_frame) {
         glClearColor(r, g, b, a);
         glDepthMask(GL_TRUE);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        return;
     }
+    vio_gl.clear_r = r;
+    vio_gl.clear_g = g;
+    vio_gl.clear_b = b;
+    vio_gl.clear_a = a;
 }
 
 /* ── Compute primitive: pipeline / bind / uniforms / dispatch / readback ──
