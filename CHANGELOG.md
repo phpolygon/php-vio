@@ -1,3 +1,10 @@
+## [2.40.3](https://github.com/phpolygon/php-vio/compare/v2.40.2...v2.40.3) (2026-11-02)
+
+
+### Bug Fixes
+
+* every sampler reads the texture on its own unit, as on OpenGL ([859bcd3](https://github.com/phpolygon/php-vio/commit/859bcd3cb2ae5d4b3509eaf28db03daae5c3fc59))
+
 ## [2.40.2](https://github.com/phpolygon/php-vio/compare/v2.40.1...v2.40.2) (2026-11-02)
 
 
