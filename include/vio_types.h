@@ -445,7 +445,16 @@ typedef enum _vio_feature {
      * worker thread - it has the prepare slots and does not refuse the device.
      * Off for a plugin built before them, the first call then blocks. */
     VIO_FEATURE_UPSCALER_PREPARE = 71,
+    /* vio_begin($ctx, ['present' => bool]): whether a frame reaches the screen is
+     * said explicitly, the same on every backend, instead of following where a
+     * render target was bound (vio itself, every backend). */
+    VIO_FEATURE_EXPLICIT_PRESENT = 72,
 } vio_feature;
+
+/* vio_begin 'present' (set_frame_present): no option = the backend's old rule. */
+#define VIO_PRESENT_AUTO (-1)
+#define VIO_PRESENT_NO     0
+#define VIO_PRESENT_YES    1
 
 /* Zones per axis of a rate map. */
 #define VIO_RATE_MAP_MAX 16

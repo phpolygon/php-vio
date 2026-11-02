@@ -93,12 +93,11 @@ function run_backend(string $name): string {
     if (!near(px($p, 32, 32, $W), [0, 255, 0])) $fail[] = "u_half=0.25: centre not green " . json_encode(px($p, 32, 32, $W));
     if (!near(px($p, 20, 20, $W), [0, 0, 0]))   $fail[] = "u_half=0.25: pixel 20,20 not black (GS uniform ignored?) " . json_encode(px($p, 20, 20, $W));
 
-    /* A point at z = -0.5: the GS output still needs the GL -> D3D / Vulkan
-     * depth remap (z' = (z + w) / 2). On D3D SPIRV-Cross used to place it after
-     * every Append, so anything with z < 0 was clipped. Metal has no remap on
-     * any stage (clip z is 0..1, BackendConventions::depthZeroToOne), so the
-     * same point sits at z = +0.5 there. */
-    $pointNeg = vio_mesh($ctx, ['vertices' => [0, 0, vio_backend_name($ctx) === 'metal' ? 0.5 : -0.5], 'layout' => [VIO_FLOAT3]]);
+    /* A point at z = -0.5: the GS output still needs the GL -> D3D / Vulkan /
+     * Metal depth remap (z' = (z + w) / 2). On D3D SPIRV-Cross used to place it
+     * after every Append, so anything with z < 0 was clipped; Metal had no remap
+     * at all until 2.40 (the emulated GS ends in a pass-through vertex function). */
+    $pointNeg = vio_mesh($ctx, ['vertices' => [0, 0, -0.5], 'layout' => [VIO_FLOAT3]]);
     vio_clear($ctx, 0, 0, 0, 1);
     vio_begin($ctx);
     vio_bind_pipeline($ctx, $p_gs);

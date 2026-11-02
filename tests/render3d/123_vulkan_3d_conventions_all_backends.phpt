@@ -146,10 +146,17 @@ function run_backend(string $name): string {
         if ($rb !== false) {
             $mid = px($rb, 16, 16, $W)[0];
             $corner = px($rb, 1, 1, $W)[0];
-            // Metal stores the GLSL clip z unchanged (no [-1, 1] -> [0, 1] remap), so z = 0 lands at depth 0 there.
-            $midOk = $name === 'metal' ? $mid < 10 : ($mid > 100 && $mid < 155);
+            // (ndc_z + 1) / 2 on every backend: Metal stored the GLSL clip z unchanged until 2.40.
+            $midOk = $mid > 100 && $mid < 155;
             if (!($midOk && $corner > 245)) $fail[] = "depth target: centre $mid corner $corner";
         }
+    }
+
+    // The conventions say so too (vio_backend_info()['conventions']).
+    $conv = vio_backend_info($ctx)['conventions'] ?? null;
+    if (!is_array($conv) || $conv['clip_z_remap'] !== ($name !== 'opengl') || $conv['rt_origin_top'] !== ($name !== 'opengl')
+        || $conv['depth_stored'] !== '(ndc_z + 1) / 2') {
+        $fail[] = "conventions " . json_encode($conv);
     }
 
     vio_destroy($ctx);

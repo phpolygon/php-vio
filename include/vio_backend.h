@@ -531,6 +531,26 @@ typedef struct _vio_backend {
      * OpenGL (row 0 = NDC -Y). vio_upscale turns NDC-space jitter and motion
      * into storage space with it. */
     int         rt_origin_top;
+    /* 1 when vio rewrites the GLSL clip z [-w, w] of the last vertex-processing
+     * stage to the API's [0, w] (D3D, Vulkan, Metal since 2.40): the depth buffer
+     * then holds (ndc_z + 1) / 2 on every backend, as on OpenGL. */
+    int         clip_z_remap;
+    /* First register of the comparison samplers when the backend splits the 16
+     * per-stage samplers (VIO_SHADOW_SAMPLER_BASE on D3D12 and Vulkan), 0 when
+     * regular and comparison samplers share them. vio_backend_info()['samplers']. */
+    int         shadow_sampler_base;
+    /* vio_begin(['present' => …]) (VIO_FEATURE_EXPLICIT_PRESENT), called right
+     * before begin_frame: VIO_PRESENT_YES presents the swapchain at vio_end even
+     * when a target was bound before vio_begin or is still bound at the end,
+     * VIO_PRESENT_NO neither acquires nor presents nor copies into the headless
+     * capture, VIO_PRESENT_AUTO keeps the backend's old rule. NULL: vio_end skips
+     * present (and the GL swap) for VIO_PRESENT_NO and does nothing else. */
+    void        (*set_frame_present)(int mode);
+    /* The render target an immediate-mode backend has bound right now (OpenGL),
+     * NULL = the screen. vio_begin unbinds it so begin_frame clears the screen,
+     * and binds it again afterwards: a bind before vio_begin acts like one right
+     * after it (it used to be dropped for the headless FBO, or cleared). */
+    void       *(*bound_render_target)(void);
 
     /* vio_upscale through the platform's own scaler (UPSCALE-PLAN phase 3,
      * MetalFX): upscale_method names it for a mode (NULL = portable passes);

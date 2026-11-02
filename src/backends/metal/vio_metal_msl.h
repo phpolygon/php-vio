@@ -543,6 +543,15 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
         if (stage == VIO_MSL_FRAGMENT) {
             spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_ENABLE_FRAG_OUTPUT_MASK, frag_output_mask);
         }
+        if (stage == VIO_MSL_VERTEX || stage == VIO_MSL_TESS_EVAL) {
+            /* GL clip z [-w, w] -> Metal's [0, w], z' = (z + w) / 2 at the end of
+             * the entry point, like D3D and Vulkan: the depth buffer holds
+             * (ndc_z + 1) / 2 on every backend. These are the stages that feed
+             * the rasterizer (the geometry emulation's pass-through vertex
+             * function, and the TES whose isolines / point_mode capture vio_pass
+             * copies unchanged); mesh stages get vio_mesh_fix_positions. */
+            spvc_compiler_options_set_bool(opts, SPVC_COMPILER_OPTION_FIXUP_DEPTH_CONVENTION, SPVC_TRUE);
+        }
         if (is_tess) {
             spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_INDIRECT_PARAMS_BUFFER_INDEX, VIO_METAL_TESS_PARAMS_INDEX);
             spvc_compiler_options_set_uint(opts, SPVC_COMPILER_OPTION_MSL_SHADER_INPUT_BUFFER_INDEX, VIO_METAL_TESS_IN_INDEX);

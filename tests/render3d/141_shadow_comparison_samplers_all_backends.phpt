@@ -21,8 +21,8 @@ if (!$any) die("skip no backend with depth targets");
  * the units a shadow sampler of the current program reads, for that draw only.
  * The other backends already pick a comparison sampler from the shader's
  * sampler type. Every depth here is uniform over the target, so the checks do
- * not depend on the row order. Stored depth = (z + 1) / 2 on GL / D3D / Vulkan
- * (vio's clip-space fixup), z itself on Metal (NDC z is 0..1 there).
+ * not depend on the row order. Stored depth = (z + 1) / 2 on every backend
+ * (vio's clip-space fixup; Metal stored z itself up to 2.39).
  *   A. sampler2DShadow: depth 0.5, ref 0.4 -> 1, ref 0.6 -> 0
  *   B. sampler2DArrayShadow: layer depths 0.5 / 0.75, refs around each
  *   C. samplerCubeShadow (VIO_FEATURE_RENDER_TARGET_LAYERED): a depth per face
@@ -42,7 +42,7 @@ function run_backend(string $name): string {
     }
     $fail = [];
     $layered = vio_supports_feature($ctx, VIO_FEATURE_RENDER_TARGET_LAYERED);
-    $depthOf = fn(float $z): float => vio_backend_name($ctx) === 'metal' ? $z : ($z + 1.0) / 2.0;   /* z stays in 0..1 throughout */
+    $depthOf = fn(float $z): float => ($z + 1.0) / 2.0;   /* every backend, Metal since 2.40 */
     $vs = "#version 450\nlayout(location=0) in vec3 aPos;\nuniform float u_z;\nvoid main(){ gl_Position = vec4(aPos.xy, u_z, 1.0); }";
     $fsDepth = "#version 450\nvoid main(){ }";
     $full = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0, 1,1,0, -1,1,0], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT3]]);
@@ -81,7 +81,7 @@ function run_backend(string $name): string {
     $p2 = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs, 'fragment' => $fs2])] + $base);
     $rt = vio_render_target($ctx, ['width' => $W, 'height' => $W, 'depth_only' => true]);
     $fill($rt, [-1 => 0.5]);
-    $dA = $depthOf(0.5);   /* 0.75, Metal 0.5 */
+    $dA = $depthOf(0.5);   /* 0.75 */
     $tex = vio_render_target_texture($rt);
     foreach ([[$dA - 0.1, 255], [$dA + 0.1, 0]] as [$ref, $want]) {
         $got = $sample($p2, function () use ($ctx, $tex) { vio_set_uniform($ctx, 'u_sh', 0); vio_bind_texture($ctx, $tex, 0); }, ['u_ref' => (float)$ref]);

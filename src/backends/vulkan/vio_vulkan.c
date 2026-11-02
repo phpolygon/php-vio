@@ -3928,6 +3928,12 @@ static void vulkan_destroy_font_atlas(void *font_ptr)
     }
 }
 
+/* vio_begin(['present' => …]) (VIO_FEATURE_EXPLICIT_PRESENT). */
+static void vulkan_set_frame_present(int mode)
+{
+    vio_vk.frame_present = mode;
+}
+
 static void vulkan_begin_frame(void)
 {
     if (!vio_vk.initialized) return;
@@ -3948,7 +3954,24 @@ static void vulkan_begin_frame(void)
      *
      * The normal path below (frame_is_offscreen==0) is byte-for-byte the
      * pre-Phase-4 flow. */
-    int offscreen = (vio_vk.pending_bound_rt != NULL);
+    /* vio_begin(['present' => …]) says it outright (VIO_FEATURE_EXPLICIT_PRESENT):
+     * false = this offscreen path, true = a normal frame - the pending target is
+     * then bound as if right after vio_begin. Only without the option does a
+     * target bound before vio_begin still mean "not presented", once deprecated:
+     * no other backend reads the bind order that way. */
+    int offscreen;
+    if (vio_vk.frame_present == VIO_PRESENT_AUTO) {
+        offscreen = (vio_vk.pending_bound_rt != NULL);
+        static int warned = 0;
+        if (offscreen && !warned) {
+            warned = 1;
+            php_error_docref(NULL, E_DEPRECATED,
+                "Vulkan: a render target bound before vio_begin() makes the frame not presented; "
+                "pass vio_begin($ctx, ['present' => false]) for that (or true to present it)");
+        }
+    } else {
+        offscreen = vio_vk.frame_present == VIO_PRESENT_NO;
+    }
     vio_vk.frame_is_offscreen = offscreen;
     /* B1 — assume not presentable until we successfully open the normal
      * swapchain path below. An offscreen-only frame, or an aborted acquire,
@@ -5701,6 +5724,9 @@ static const vio_backend vulkan_backend = {
     .destroy_bundle    = vio_vk3d_destroy_bundle,
     .bundle_method     = vulkan_bundle_method,
     .rt_origin_top     = 1,
+    .clip_z_remap      = 1,
+    .shadow_sampler_base = VIO_SHADOW_SAMPLER_BASE,
+    .set_frame_present = vulkan_set_frame_present,
     .upscaler_supported           = vulkan_upscaler_supported,
     .upscaler_create              = vulkan_upscaler_create,
     .upscaler_dispatch            = vulkan_upscaler_dispatch,

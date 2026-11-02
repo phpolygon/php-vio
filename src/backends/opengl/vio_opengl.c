@@ -2033,6 +2033,11 @@ static int opengl_generate_mipmaps(void *obj, int kind)
     return 0;
 }
 
+static void *opengl_bound_render_target(void)
+{
+    return vio_gl.initialized ? vio_gl.current_bound_rt : NULL;
+}
+
 static void opengl_unbind_render_target(unsigned int default_fbo, int width, int height)
 {
     if (!vio_gl.initialized) return;
@@ -3356,6 +3361,7 @@ static const vio_backend opengl_backend = {
     .draw              = opengl_draw,
     .draw_indexed      = opengl_draw_indexed,
     .present           = opengl_present,
+    .bound_render_target = opengl_bound_render_target,
     .clear             = opengl_clear,
     .gpu_flush         = opengl_gpu_flush,
     .dispatch_compute  = opengl_dispatch_compute,

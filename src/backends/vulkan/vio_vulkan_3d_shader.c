@@ -219,9 +219,9 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
     const spvc_reflected_resource *sep_list = NULL;
     size_t sep_n = 0;
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &sep_list, &sep_n);
-    /* Samplers: regular 0.., shadow 8.. (the D3D12 register replay in php_vio.c). */
+    /* Samplers: regular 0.., shadow VIO_SHADOW_SAMPLER_BASE.. (the D3D12 register replay in php_vio.c). */
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, &list, &n);
-    int regular = 0, shadow = 8;
+    int regular = 0, shadow = VIO_SHADOW_SAMPLER_BASE;
     size_t own = 0;   /* combined samplers the shader declared itself */
     for (size_t i = 0; i < n; i++) {
         int combined = 0;

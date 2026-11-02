@@ -2843,9 +2843,10 @@ static void d3d11_bind_stage_constants(int stage, void *backend_buffer,
 static void d3d11_begin_frame(void)
 {
     /* Waitable swapchain: block until a backbuffer is free (bounded wait). */
-    if (vio_d3d11.frame_latency_waitable) {
+    if (vio_d3d11.frame_latency_waitable && !vio_d3d11.latency_wait_skip) {
         WaitForSingleObjectEx(vio_d3d11.frame_latency_waitable, 1000, TRUE);
     }
+    vio_d3d11.latency_wait_skip = 0;   /* set by a present that skipped Present */
     /* Reset to backbuffer */
     vio_d3d11.current_rtv = vio_d3d11.rtv;
     vio_d3d11.current_rtvs[0] = vio_d3d11.rtv;
@@ -3022,8 +3023,15 @@ static void d3d11_end_frame(void)
     }
     vio_d3d11.in_frame = 0;
     /* Mirror the just-rendered backbuffer — before the caller's Present() /
-     * swap rotates FLIP_DISCARD buffers. GPU-local; no CPU transfer. */
-    d3d11_mirror_backbuffer();
+     * swap rotates FLIP_DISCARD buffers. GPU-local; no CPU transfer. A frame
+     * that is not presented leaves the last frame's mirror. */
+    if (vio_d3d11.frame_present != VIO_PRESENT_NO) d3d11_mirror_backbuffer();
+}
+
+/* vio_begin(['present' => …]) (VIO_FEATURE_EXPLICIT_PRESENT). */
+static void d3d11_set_frame_present(int mode)
+{
+    vio_d3d11.frame_present = mode;
 }
 
 /* Bind mesh vertex buffer to slot 0 and the identity instance buffer to
@@ -3311,7 +3319,13 @@ static void d3d11_present(void)
      * current_rtv = rtv every frame, so normal frames always present.
      * vio_unbind_render_target restores current_rtv = rtv. Mirrors metal_present /
      * d3d12_present offscreen handling. */
-    if (vio_d3d11.current_rtv != vio_d3d11.rtv) return;
+    /* 'present' => true / false (VIO_FEATURE_EXPLICIT_PRESENT) overrides that rule. */
+    int presents = vio_d3d11.frame_present == VIO_PRESENT_AUTO ? vio_d3d11.current_rtv == vio_d3d11.rtv
+                                                               : vio_d3d11.frame_present == VIO_PRESENT_YES;
+    if (!presents) {
+        vio_d3d11.latency_wait_skip = 1;   /* the frame-latency object is not signalled */
+        return;
+    }
 
     UINT sync_interval = vio_d3d11.vsync ? 1 : 0;
 
@@ -4519,6 +4533,8 @@ static const vio_backend d3d11_backend = {
     .encode_device           = d3d11_encode_device,
     .encode_copy_frame       = d3d11_encode_copy_frame,
     .rt_origin_top     = 1,
+    .clip_z_remap      = 1,
+    .set_frame_present = d3d11_set_frame_present,
 };
 
 void vio_backend_d3d11_register(void)

@@ -18,6 +18,7 @@ static zend_object *vio_context_create_object(zend_class_entry *ce)
     ctx->initialized  = 0;
     ctx->should_close = 0;
     ctx->in_frame     = 0;
+    ctx->frame_present = -1;   /* VIO_PRESENT_AUTO */
     memset(&ctx->config, 0, sizeof(vio_config));
     vio_input_init(&ctx->input);
     memset(&ctx->state_2d, 0, sizeof(vio_2d_state));

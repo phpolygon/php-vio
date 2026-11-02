@@ -216,6 +216,8 @@ typedef struct _vio_d3d11_state {
      * survives. NULL on a normal frame (strict no-op). Mirrors
      * vio_d3d12.pending_bound_rt. */
     void *pending_bound_rt;
+    int frame_present;      /* vio_begin 'present' of the open frame: VIO_PRESENT_* */
+    int latency_wait_skip;  /* the last frame was not presented: no frame-latency wait */
     /* vio_render_target_object* currently bound via bind_render_target /
      * bind_render_target_face (NULL = backbuffer). Used for the MSAA resolve on
      * unbind and the GenerateMips hazard check. */

@@ -47,6 +47,10 @@ typedef struct _vio_context_object {
     /* Backend-supplied offscreen render surface (OpenGL = FBO handle; other
      * backends leave 0 and use the swapchain backbuffer directly). */
     unsigned int       headless_fbo;
+    /* vio_begin 'present' of the open / last frame: VIO_PRESENT_AUTO / _NO / _YES.
+     * A _NO frame on OpenGL draws its screen part into the window's own back
+     * buffer, never swapped, instead of the headless FBO vio_read_pixels reads. */
+    int                frame_present;
     /* Push/pop stack for vio_push_render_target / vio_pop_render_target
      * (Issue #4). Stores zval references to VioRenderTarget objects (or
      * NULL for "default target"); depth is capped to keep recursion

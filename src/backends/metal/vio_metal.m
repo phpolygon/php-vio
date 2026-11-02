@@ -94,6 +94,7 @@ typedef struct _vio_metal_state {
     int                        initialized;
     int                        vsync;
     id<MTLTexture>             offscreen_texture; /* for vsync-off rendering */
+    id<MTLTexture>             discard_texture;   /* screen draws of a frame that is not presented */
     /* Swapchain MSAA (vio_create 'samples'): rendered into this 2DMultisample
      * pair and resolved into the drawable / offscreen texture at pass end. 1 =
      * off. Clamped to what the device supports. */
@@ -903,6 +904,7 @@ void vio_metal_shutdown_context(void)
             vio_mtl.frame_latency = 0;
         }
         vio_mtl.offscreen_texture = nil;
+        vio_mtl.discard_texture = nil;
 
         vio_mtl.depth_texture    = nil;
         vio_mtl.msaa_color       = nil;
@@ -1611,6 +1613,30 @@ static void metal_rrm_resolve(vio_render_target_object *rt)
     }
 }
 
+/* vio_begin(['present' => …]) of the open frame (VIO_PRESENT_*). A frame that
+ * is not presented draws its screen part into vio_mtl.discard_texture: no
+ * drawable, and the texture vio_read_pixels reads keeps the last frame. */
+static int metal_frame_present = VIO_PRESENT_AUTO;
+
+static void metal_set_frame_present(int mode)
+{
+    metal_frame_present = mode;
+}
+
+static id<MTLTexture> metal_discard_target(void)
+{
+    id<MTLTexture> t = vio_mtl.discard_texture;
+    if (!t || t.width != (NSUInteger)vio_mtl.width || t.height != (NSUInteger)vio_mtl.height
+        || t.pixelFormat != vio_mtl.swap_format) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:vio_mtl.swap_format
+            width:(NSUInteger)vio_mtl.width height:(NSUInteger)vio_mtl.height mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModePrivate;
+        vio_mtl.discard_texture = t = [vio_mtl.device newTextureWithDescriptor:d];
+    }
+    return t;
+}
+
 /* The colour texture the open frame renders into: bound RT > vsync-off
  * offscreen > swapchain drawable. nil for a depth-only RT / no drawable. */
 static id<MTLTexture> metal_current_color_texture(void)
@@ -1619,6 +1645,7 @@ static id<MTLTexture> metal_current_color_texture(void)
         if (current_bound_rt->depth_only) return nil;
         return (__bridge id<MTLTexture>)current_bound_rt->metal_color_texture;
     }
+    if (metal_frame_present == VIO_PRESENT_NO) return metal_discard_target();
     if (!vio_mtl.vsync && vio_mtl.offscreen_texture) return vio_mtl.offscreen_texture;
     if (vio_mtl.current_drawable) return vio_mtl.current_drawable.texture;
     return nil;
@@ -1807,7 +1834,10 @@ static void metal_begin_frame(void)
             vio_mtl.frame_semaphore_held = 1;
         }
 
-        if (current_bound_rt) {
+        /* No drawable for a frame that is not presented, nor (old rule, no
+         * 'present' option) for one that starts on a bound target. */
+        if (metal_frame_present == VIO_PRESENT_NO
+            || (current_bound_rt && metal_frame_present != VIO_PRESENT_YES)) {
             vio_mtl.current_drawable = nil;
         } else if (!vio_mtl.vsync && vio_mtl.offscreen_texture) {
             vio_mtl.current_drawable = nil;
@@ -1824,7 +1854,20 @@ static void metal_begin_frame(void)
 
         vio_mtl.current_cmd_buf = metal_new_command_buffer();
         metal_ring_begin_frame();
-        metal_open_encoder(/*load_clear=*/1);
+        if (current_bound_rt && metal_frame_present == VIO_PRESENT_YES) {
+            /* 'present' => true with a target bound before vio_begin: as if it
+             * were bound right after it - the screen is cleared, the target
+             * keeps its contents (a bind loads). */
+            vio_render_target_object *rt = current_bound_rt;
+            current_bound_rt = NULL;
+            metal_open_encoder(/*load_clear=*/1);
+            [vio_mtl.current_encoder endEncoding];
+            vio_mtl.current_encoder = nil;
+            current_bound_rt = rt;
+            metal_open_encoder(/*load_clear=*/0);
+        } else {
+            metal_open_encoder(/*load_clear=*/1);
+        }
     }
 }
 
@@ -1936,6 +1979,9 @@ static void metal_present(void)
             last_presented_cmd_buf = vio_mtl.current_cmd_buf;
 
             [vio_mtl.current_cmd_buf presentDrawable:vio_mtl.current_drawable];
+            [vio_mtl.current_cmd_buf commit];
+        } else if (metal_frame_present == VIO_PRESENT_NO) {
+            /* Not presented: vio_read_pixels keeps reading the last frame. */
             [vio_mtl.current_cmd_buf commit];
         } else {
             /* Vsync-off/offscreen path: commit without presenting.
@@ -2367,6 +2413,8 @@ static void *metal_compile_shader(vio_shader_desc *desc)
         metal_spirv_local_size(vs_spirv, vs_size, sh->mesh_tpg);
         vs_msl = metal_gfx_spirv_to_msl(vs_spirv, vs_size, VIO_MSL_MESH, &sh->vs, NULL, 0xFFFFFFFFu, NULL, &err);
         if (!vs_msl) { what = "mesh SPIR-V→MSL"; goto fail; }
+        /* SPIRV-Cross's depth fixup skips mesh stages: remap z like D3D12. */
+        vs_msl = vio_mesh_fix_positions(vs_msl, 0, 1, "float4");
         if (desc->task_data) {
             if (desc->task_size < 20 || *(const uint32_t *)desc->task_data != 0x07230203) { err = strdup("not SPIR-V"); what = "task stage"; goto fail; }
             metal_spirv_local_size((const uint32_t *)desc->task_data, desc->task_size, sh->object_tpg);
@@ -7291,6 +7339,8 @@ static const vio_backend metal_backend = {
     .compute_wait             = metal_compute_wait,
     .read_buffer              = metal_read_buffer,
     .rt_origin_top            = 1,
+    .clip_z_remap             = 1,
+    .set_frame_present        = metal_set_frame_present,
     .upscale_method           = metal_upscale_method,
     .upscale_native           = metal_upscale_native,
 };
