@@ -3244,6 +3244,7 @@ static void vio_shader_merge_stage_samplers(vio_shader_object *shader, const uin
         shader->sampler_names[s][sizeof(shader->sampler_names[s]) - 1] = '\0';
         shader->sampler_is_depth[s] = is_depth;
         shader->sampler_hlsl_reg[s] = reg;
+        shader->sampler_unit[s] = r.textures[t].binding < 16 ? (int)r.textures[t].binding : 0;
     }
     vio_reflect_free(&r);
 }
@@ -3898,6 +3899,7 @@ ZEND_FUNCTION(vio_shader)
                         int is_depth = frag_reflect.textures[s].is_depth ? 1 : 0;
                         shader->sampler_is_depth[s] = is_depth;
                         shader->sampler_hlsl_reg[s] = is_depth ? shadow_reg++ : regular_reg++;
+                        shader->sampler_unit[s] = frag_reflect.textures[s].binding < 16 ? (int)frag_reflect.textures[s].binding : 0;
                     }
                     /* Separate textures (texture(sampler2D(u_tex, u_smp), uv), OPEN-ITEMS-PLAN
                      * A23) follow, in reflection order: HLSL gives them t{sampled count + j},
@@ -3909,6 +3911,7 @@ ZEND_FUNCTION(vio_shader)
                         snprintf(shader->sampler_names[s], sizeof(shader->sampler_names[s]), "%s", sep[j]);
                         shader->sampler_is_depth[s] = 0;
                         shader->sampler_hlsl_reg[s] = frag_reflect.texture_count + j;
+                        shader->sampler_unit[s] = 0;
                     }
                     vio_reflect_free(&frag_reflect);
                 }
@@ -5072,8 +5075,16 @@ static int vio_resolve_sampler_slot(vio_context_object *ctx, zend_long slot, int
     return hlsl_slot;
 }
 
-static void vio_bind_texture_now(vio_context_object *ctx, vio_texture_object *tex, zend_long slot);
-static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm, zend_long slot);
+static void vio_bind_texture_now(vio_context_object *ctx, vio_texture_object *tex, zend_long slot, int sidx);
+static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm, zend_long slot, int sidx);
+
+/* The sampler of the bound shader a bind on GL unit `slot` goes to: `sidx`
+ * when the caller already resolved it, else the unit's map entry (-1 = none). */
+static int vio_unit_sampler(vio_shader_object *sh, zend_long slot, int sidx)
+{
+    if (sidx >= 0) return sidx;
+    return (slot >= 0 && slot < 16) ? sh->gl_to_hlsl_sampler[slot] : -1;
+}
 
 /* The typed-register backends (D3D11 / D3D12 / Metal / Vulkan) translate the GL
  * texture unit into a shader register through the BOUND shader's sampler map.
@@ -5123,13 +5134,34 @@ static void vio_pending_texture_set(vio_context_object *ctx, zend_long slot, int
 static void vio_flush_pending_textures(vio_context_object *ctx)
 {
     if (strcmp(ctx->backend->name, "opengl") == 0) return;
+    vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+    if (sh && sh->sampler_count > 0) {
+        /* GL semantics: every sampler reads the texture on ITS unit (layout
+         * binding, else 0, until vio_set_uniform moves it), two samplers may
+         * share a unit, and a unit no sampler reads binds nothing. Mapping the
+         * units instead sent an unnamed unit to the sampler with that index -
+         * a texture on unit 0 landed in the first declared sampler, and a
+         * sampler without vio_set_uniform read whatever its slot held. */
+        for (int s = 0; s < sh->sampler_count; s++) {
+            int unit = sh->sampler_unit[s];
+            if (unit < 0 || unit >= 16) continue;
+            int kind = ctx->pending_tex_kind[unit];
+            if (!kind || !ctx->pending_tex_obj[unit]) continue;
+            if (kind == 1) {
+                vio_bind_texture_now(ctx, (vio_texture_object *)ctx->pending_tex_obj[unit], unit, s);
+            } else if (kind == 2) {
+                vio_bind_cubemap_now(ctx, (vio_cubemap_object *)ctx->pending_tex_obj[unit], unit, s);
+            }
+        }
+        return;
+    }
     for (int slot = 0; slot < 16; slot++) {
         int kind = ctx->pending_tex_kind[slot];
         if (!kind || !ctx->pending_tex_obj[slot]) continue;
         if (kind == 1) {
-            vio_bind_texture_now(ctx, (vio_texture_object *)ctx->pending_tex_obj[slot], slot);
+            vio_bind_texture_now(ctx, (vio_texture_object *)ctx->pending_tex_obj[slot], slot, -1);
         } else if (kind == 2) {
-            vio_bind_cubemap_now(ctx, (vio_cubemap_object *)ctx->pending_tex_obj[slot], slot);
+            vio_bind_cubemap_now(ctx, (vio_cubemap_object *)ctx->pending_tex_obj[slot], slot, -1);
         }
     }
 }
@@ -5141,12 +5173,12 @@ static void vio_bind_texture_internal(vio_context_object *ctx, vio_texture_objec
         vio_pending_texture_set(ctx, slot, 1, tex);
         return;
     }
-    vio_bind_texture_now(ctx, tex, slot);
+    vio_bind_texture_now(ctx, tex, slot, -1);
 }
 
 /* Apply one texture bind to the backend right now (resolved against the shader
  * that is bound at this moment). */
-static void vio_bind_texture_now(vio_context_object *ctx, vio_texture_object *tex, zend_long slot)
+static void vio_bind_texture_now(vio_context_object *ctx, vio_texture_object *tex, zend_long slot, int sidx)
 {
 
     if (tex->is_array && tex->texture_id && ctx->backend->bind_texture_array_id) {
@@ -5177,8 +5209,8 @@ static void vio_bind_texture_now(vio_context_object *ctx, vio_texture_object *te
         /* Remap GL texture unit to HLSL register using sampler map */
         if (ctx->bound_shader_object) {
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
-                sampler_idx = sh->gl_to_hlsl_sampler[slot];
+            if (vio_unit_sampler(sh, slot, sidx) >= 0) {
+                sampler_idx = vio_unit_sampler(sh, slot, sidx);
                 hlsl_slot = sampler_idx;
                 if (sampler_idx >= 0 && sampler_idx < sh->sampler_count) {
                     shader_wants_depth = sh->sampler_is_depth[sampler_idx];
@@ -6290,7 +6322,11 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
             for (int s = 0; s < sh->sampler_count; s++) {
                 if (strcmp(sh->sampler_names[s], name) == 0) {
                     if (gl_slot >= 0 && gl_slot < 16) {
+                        /* The sampler leaves its old unit (a stale entry routed that
+                         * unit's texture into this sampler after a move). */
+                        for (int u = 0; u < 16; u++) if (sh->gl_to_hlsl_sampler[u] == s) sh->gl_to_hlsl_sampler[u] = -1;
                         sh->gl_to_hlsl_sampler[gl_slot] = s;  /* HLSL binding = index */
+                        sh->sampler_unit[s] = gl_slot;
                     }
                     break;
                 }
@@ -15514,7 +15550,7 @@ ZEND_FUNCTION(vio_bind_cubemap)
     vio_pending_texture_set(ctx, slot, 2, cm);
 }
 
-static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm, zend_long slot)
+static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm, zend_long slot, int sidx)
 {
     (void)ctx; (void)cm; (void)slot;
     if (ctx->backend->bind_cubemap) {   /* Vulkan */
@@ -15524,9 +15560,7 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
         int sampler_idx = (int)slot;
         if (ctx->bound_shader_object) {
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
-                sampler_idx = sh->gl_to_hlsl_sampler[slot];
-            }
+            if (vio_unit_sampler(sh, slot, sidx) >= 0) sampler_idx = vio_unit_sampler(sh, slot, sidx);
         }
         ctx->backend->bind_cubemap(cm, sampler_idx);
         return;
@@ -15537,9 +15571,7 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
         int hlsl_slot = (int)slot;
         if (ctx->bound_shader_object) {
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
-                hlsl_slot = sh->gl_to_hlsl_sampler[slot];
-            }
+            if (vio_unit_sampler(sh, slot, sidx) >= 0) hlsl_slot = vio_unit_sampler(sh, slot, sidx);
         }
         ID3D11ShaderResourceView *srv = (ID3D11ShaderResourceView *)cm->d3d11_srv;
         ID3D11SamplerState *sampler = (ID3D11SamplerState *)cm->d3d11_sampler;
@@ -15547,7 +15579,7 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
          * from the shader's sampler type like vio_bind_texture_now does. */
         if (cm->d3d11_sampler_cmp && ctx->bound_shader_object) {
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-            int idx = (slot >= 0 && slot < 16) ? sh->gl_to_hlsl_sampler[slot] : -1;
+            int idx = vio_unit_sampler(sh, slot, sidx);
             if (idx >= 0 && idx < sh->sampler_count && sh->sampler_is_depth[idx]) {
                 sampler = (ID3D11SamplerState *)cm->d3d11_sampler_cmp;
             }
@@ -15562,18 +15594,10 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
         cm->d3d12_srv_gpu) {
         int hlsl_slot = (int)slot;
         if (ctx->bound_shader_object) {
-            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
-                hlsl_slot = sh->gl_to_hlsl_sampler[slot];
-            }
-        }
-        if (ctx->bound_shader_object) {
             /* Same register recomputation as vio_bind_texture_now (regular 0.., shadow VIO_SHADOW_SAMPLER_BASE..). */
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0 &&
-                sh->gl_to_hlsl_sampler[slot] < sh->sampler_count) {
-                hlsl_slot = sh->sampler_hlsl_reg[sh->gl_to_hlsl_sampler[slot]];
-            }
+            int idx = vio_unit_sampler(sh, slot, sidx);
+            if (idx >= 0) hlsl_slot = idx < sh->sampler_count ? sh->sampler_hlsl_reg[idx] : idx;
         }
         if (hlsl_slot < 0 || hlsl_slot >= VIO_D3D12_SRV_TABLE_SIZE) return;
         D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
@@ -15590,9 +15614,7 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
         int msl_slot = (int)slot;
         if (ctx->bound_shader_object) {
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
-                msl_slot = sh->gl_to_hlsl_sampler[slot];
-            }
+            if (vio_unit_sampler(sh, slot, sidx) >= 0) msl_slot = vio_unit_sampler(sh, slot, sidx);
         }
         vio_metal_bind_cubemap(cm, msl_slot);
     }
