@@ -1,3 +1,10 @@
+## [2.40.1](https://github.com/phpolygon/php-vio/compare/v2.40.0...v2.40.1) (2026-11-02)
+
+
+### Bug Fixes
+
+* an in-frame vio_clear no longer becomes the next frame's screen clear ([0df5e8b](https://github.com/phpolygon/php-vio/commit/0df5e8b6ec3af261a998cacacca536b948e656c1))
+
 # [2.40.0](https://github.com/phpolygon/php-vio/compare/v2.39.0...v2.40.0) (2026-11-02)
 
 
