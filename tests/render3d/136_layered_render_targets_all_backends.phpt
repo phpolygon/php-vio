@@ -58,11 +58,9 @@ function run_backend(string $name): string {
     $pCube  = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs, 'fragment' => $fsCube])] + $base);
     $full  = vio_mesh($ctx, ['vertices' => [-1,-1,0, 1,-1,0, 1,1,0, -1,1,0], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT3]]);
     $small = vio_mesh($ctx, ['vertices' => [-0.5,-0.5,0, 0.5,-0.5,0, 0.5,0.5,0, -0.5,0.5,0], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT3]]);
-    /* NDC z -> stored depth: (z+1)/2 on GL / D3D / Vulkan (vio's clip-space
-     * fixup), z itself on Metal (NDC z is 0..1 there). The z values below stay
-     * in 0..1 so nothing is clipped on Metal. */
-    $metal = vio_backend_name($ctx) === 'metal';
-    $grey = fn(float $z): int => (int)round(($metal ? $z : ($z + 1.0) / 2.0) * 255);
+    /* NDC z -> stored depth: (z+1)/2 on every backend (vio's clip-space fixup,
+     * on Metal since 2.40). */
+    $grey = fn(float $z): int => (int)round(($z + 1.0) / 2.0 * 255);
 
     /* Sample one value into the swapchain and return the centre pixel. */
     $sample = function (callable $bind) use ($ctx, $full, $W): array {

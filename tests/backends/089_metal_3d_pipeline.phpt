@@ -192,9 +192,10 @@ foreach ([1, 4] as $smp) {
 echo "msaa: ", ($edge[1] === 0 && $edge[4] > 0) ? "OK" : "FAIL ({$edge[1]} / {$edge[4]})", "\n";
 
 // 11. Depth-only RT keeps the fragment stage: `discard` on the left half leaves
-//     depth at 1.0 (lit for a compare against 0.5), the right half writes 0.
+//     depth at 1.0 (lit for a compare against 0.6), the right half writes 0.5
+//     (NDC z 0, remapped like D3D / Vulkan since 2.40; it stored 0 before).
 $fs_disc = "#version 330 core\nlayout(location=0) out vec4 o;\nvoid main(){ if (gl_FragCoord.x < 32.0) discard; o = vec4(1.0); }";
-$fs_sh   = "#version 330 core\nin vec2 vUv; uniform sampler2DShadow u_shadow;\nlayout(location=0) out vec4 o;\nvoid main(){ float s = texture(u_shadow, vec3(vUv, 0.5)); o = vec4(s, s, s, 1.0); }";
+$fs_sh   = "#version 330 core\nin vec2 vUv; uniform sampler2DShadow u_shadow;\nlayout(location=0) out vec4 o;\nvoid main(){ float s = texture(u_shadow, vec3(vUv, 0.6)); o = vec4(s, s, s, 1.0); }";
 $p_disc = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs_plain, 'fragment' => $fs_disc])]);
 $p_sh   = vio_pipeline($ctx, ['shader' => vio_shader($ctx, ['vertex' => $vs_uv,    'fragment' => $fs_sh])]);
 $rtd = vio_render_target($ctx, ['width' => 64, 'height' => 64, 'depth_only' => true]);
