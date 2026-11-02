@@ -1,3 +1,10 @@
+# [2.40.0](https://github.com/phpolygon/php-vio/compare/v2.39.0...v2.40.0) (2026-11-02)
+
+
+### Features
+
+* explicit present, 12 + 4 sampler split, Metal clip z like D3D / Vulkan ([0fc38ba](https://github.com/phpolygon/php-vio/commit/0fc38bacd837ca5aabcc886ca036e47cbc434454))
+
 # [2.39.0](https://github.com/phpolygon/php-vio/compare/v2.38.1...v2.39.0) (2026-10-31)
 
 
