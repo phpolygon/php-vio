@@ -57,10 +57,11 @@
  * shadow registers, so no shadow SRV is ever dropped at bind time. */
 #define VIO_D3D12_SRV_TABLE_SIZE 16
 
-/* Per-draw SAMPLER descriptor table (root param [4], registers s0..s7). One
- * sampler per regular texture register t0..t7; the comparison samplers for
- * shadow maps stay STATIC at s8..s11 (SPIRV-Cross assigns depth samplers from
- * register 8 — see vio_shader_reflect.c).
+/* Per-draw SAMPLER descriptor table (root param [4], registers s0..s11). One
+ * sampler per regular texture register t0..t11; the comparison samplers for
+ * shadow maps stay STATIC at s12..s15 (SPIRV-Cross assigns depth samplers from
+ * VIO_SHADOW_SAMPLER_BASE = 12 — see vio_shader_reflect.h). Until 2.40 the
+ * split was 8 / 8..11.
  *
  * Before the GAP-PLAN (Phase 1) s0..s7 were static LINEAR/WRAP samplers, so a
  * texture's filter / wrap / anisotropy were silently ignored on D3D12 (NEAREST
@@ -68,7 +69,7 @@
  * a pre-built sampler combination (filter x wrap x anisotropy) in a CPU-only
  * "combo" heap and the per-draw flush copies the eight bound combos into a
  * shader-visible per-frame ring, exactly like the SRV table. */
-#define VIO_D3D12_SAMPLER_TABLE_SIZE  8
+#define VIO_D3D12_SAMPLER_TABLE_SIZE  12   /* == VIO_SHADOW_SAMPLER_BASE */
 #define VIO_D3D12_SAMPLER_ANISO_LEVELS 5     /* 1, 2, 4, 8, 16 */
 #define VIO_D3D12_SAMPLER_COMBOS      (2 * 3 * VIO_D3D12_SAMPLER_ANISO_LEVELS)
 /* Shader-visible sampler heaps are capped at 2048 descriptors by D3D12. */
@@ -574,6 +575,8 @@ typedef struct _vio_d3d12_state {
     void *pending_bound_rt; /* vio_render_target_object* requested via vio_bind_render_target
                              * while the command list was closed (before vio_begin); applied
                              * by vio_begin once the frame's command list is open. */
+    int frame_present;      /* vio_begin 'present' of the open frame: VIO_PRESENT_* */
+    int latency_wait_skip;  /* the last frame was not presented: no frame-latency wait */
 
     /* Pending texture bindings (flushed before each draw into a contiguous SRV block) */
     D3D12_CPU_DESCRIPTOR_HANDLE pending_srvs[VIO_D3D12_SRV_TABLE_SIZE]; /* CPU handles of bound textures */

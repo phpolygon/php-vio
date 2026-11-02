@@ -29,10 +29,11 @@ foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
     if (($got = center(vio_read_pixels($ctx), $W)) !== $colors[4]) $fail[] = "in flight " . json_encode($got);
     // Read twice without a frame in between: unchanged.
     if (($got = center(vio_read_pixels($ctx), $W)) !== $colors[4]) $fail[] = "reread " . json_encode($got);
-    // An offscreen-only frame does not replace the swapchain content.
+    // An offscreen-only frame does not replace the swapchain content (said
+    // explicitly since 2.40; Vulkan's bind-before-begin rule is deprecated).
     $rt = vio_render_target($ctx, ['width' => 8, 'height' => 8]);
     vio_bind_render_target($ctx, $rt);
-    vio_begin($ctx);
+    vio_begin($ctx, ['present' => false]);
     vio_clear($ctx, 1, 1, 1, 1);
     vio_unbind_render_target($ctx);
     vio_end($ctx);

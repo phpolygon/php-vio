@@ -62,8 +62,19 @@ function vio_poll_events(VioContext $context): void {}
 
 /**
  * Begin a new frame. Must be paired with vio_end().
+ *
+ * 'present' (VIO_FEATURE_EXPLICIT_PRESENT, every backend): true = vio_end puts
+ * the frame on the screen, also when a render target was bound before
+ * vio_begin (treated as bound right after it) or is still bound at the end;
+ * false = no swapchain image is acquired, nothing is presented and
+ * vio_read_pixels keeps returning the last presented frame - for frames that
+ * only render into targets (warm-up, probes). Without the option each backend
+ * keeps its old rule: a target still bound at vio_end skips the present, and on
+ * Vulkan a target bound before vio_begin does too (deprecated, E_DEPRECATED once).
+ *
+ * @param array{present?: bool} $options
  */
-function vio_begin(VioContext $context): void {}
+function vio_begin(VioContext $context, array $options = []): void {}
 
 /**
  * End the current frame, present to screen.
@@ -459,6 +470,15 @@ function vio_swapchain_info(VioContext $context): array {}
  * device. 'selected_by' => 'explicit' | 'priority' (plain 'auto') | 'score' | 'benchmark'
  * ('auto' with prefer / require), 'candidates' => the vio_rank_backends()
  * ranking of a scored 'auto' ([] otherwise).
+ * 'conventions' => ['rt_origin_top' => bool (row 0 of a target = NDC +Y),
+ * 'clip_z_remap' => bool (vio maps the GLSL clip z [-w, w] to the API's [0, w]:
+ * D3D, Vulkan, and Metal since 2.40), 'depth_stored' => '(ndc_z + 1) / 2' (what
+ * the depth buffer holds for GLSL clip z on every backend - no per-backend
+ * conversion)]. 'samplers' => ['total' => 16 per stage, 'regular' => how many
+ * non-comparison samplers fit (12 on D3D12 / Vulkan, 16 elsewhere), 'comparison'
+ * => sampler*Shadow slots (4 on D3D12 / Vulkan; elsewhere they share the 16),
+ * 'comparison_base' => their first register (12, 0 = no split)]; up to 2.39 the
+ * D3D12 / Vulkan split was 8 / 8. Absent keys = an older vio.
  */
 function vio_backend_info(VioContext $context): array|false {}
 

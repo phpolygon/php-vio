@@ -295,6 +295,7 @@ typedef struct _vio_vulkan_state {
      * before present runs, so present cannot key off in_frame. Cleared by
      * present (and by end_frame's early-out / offscreen path). */
     int                      frame_presentable;
+    int                      frame_present;   /* vio_begin 'present': VIO_PRESENT_* (set_frame_present) */
     float                    clear_r, clear_g, clear_b, clear_a;
 
     /* The pass open on the frame command buffer (dynamic rendering,

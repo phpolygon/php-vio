@@ -721,9 +721,9 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     params[1].Descriptor.RegisterSpace = 0;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    /* [2] SRV table t0..t(N-1). Regular textures occupy t0-t7, shadow/depth
-     * samplers t8-t11 (SPIRV-Cross assigns depth samplers from register 8 — see
-     * vio_shader_reflect.c). Sized to VIO_D3D12_SRV_TABLE_SIZE so high shadow
+    /* [2] SRV table t0..t(N-1). Regular textures occupy t0-t11, shadow/depth
+     * samplers t12-t15 (SPIRV-Cross assigns depth samplers from
+     * VIO_SHADOW_SAMPLER_BASE — see vio_shader_reflect.h). Sized to VIO_D3D12_SRV_TABLE_SIZE so high shadow
      * registers are always covered by the table and never dropped at bind. */
     D3D12_DESCRIPTOR_RANGE srv_range = {0};
     srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -798,13 +798,13 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
         }
     }
 
-    /* Static samplers: s8-s11 = comparison (shadow maps with sampler2DShadow).
-     * SPIRV-Cross assigns shadow samplers to s8+ and regular to s0+ (see
-     * vio_shader_reflect.c — the base is 8 so up to 8 regular samplers fit in
+    /* Static samplers: s12-s15 = comparison (shadow maps with sampler2DShadow).
+     * SPIRV-Cross assigns shadow samplers to s12+ and regular to s0+ (see
+     * vio_shader_reflect.c, VIO_SHADOW_SAMPLER_BASE — 12 regular samplers fit in
      * the table above). Static and table samplers may share a root signature as
      * long as their registers do not overlap. */
-    D3D12_STATIC_SAMPLER_DESC static_samplers[4] = {0};
-    for (int s = 0; s < 4; s++) {
+    D3D12_STATIC_SAMPLER_DESC static_samplers[VIO_SHADOW_SAMPLER_END - VIO_SHADOW_SAMPLER_BASE] = {0};
+    for (int s = 0; s < VIO_SHADOW_SAMPLER_END - VIO_SHADOW_SAMPLER_BASE; s++) {
         static_samplers[s].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
         static_samplers[s].AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
         static_samplers[s].AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
@@ -812,7 +812,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
         static_samplers[s].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
         static_samplers[s].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
         static_samplers[s].MaxLOD = D3D12_FLOAT32_MAX;
-        static_samplers[s].ShaderRegister = 8 + s;
+        static_samplers[s].ShaderRegister = VIO_SHADOW_SAMPLER_BASE + s;
         static_samplers[s].RegisterSpace = 0;
         static_samplers[s].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;   /* shadow samplers in every stage */
     }
@@ -7317,6 +7317,22 @@ static void d3d12_bind_stage_constants(int stage, void *backend_buffer,
 
 /* ── Drawing ──────────────────────────────────────────────────────── */
 
+/* vio_begin(['present' => …]) (VIO_FEATURE_EXPLICIT_PRESENT). */
+static void d3d12_set_frame_present(int mode)
+{
+    vio_d3d12.frame_present = mode;
+}
+
+/* Whether vio_end presents the open frame: as asked, or - without the option -
+ * unless an offscreen target is still bound at the end (an undrawn
+ * FLIP_DISCARD buffer would flash). */
+static int d3d12_frame_presents(void)
+{
+    if (vio_d3d12.frame_present == VIO_PRESENT_YES) return 1;
+    if (vio_d3d12.frame_present == VIO_PRESENT_NO) return 0;
+    return vio_d3d12.current_bound_rt == NULL;
+}
+
 static void d3d12_begin_frame(void)
 {
     vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
@@ -7348,9 +7364,10 @@ static void d3d12_begin_frame(void)
     /* Waitable swapchain: block until DXGI has a backbuffer for us (caps the
      * CPU at frame_latency frames ahead — the input-latency control). A bounded
      * wait so a stalled compositor cannot hang the process. */
-    if (vio_d3d12.frame_latency_waitable) {
+    if (vio_d3d12.frame_latency_waitable && !vio_d3d12.latency_wait_skip) {
         WaitForSingleObjectEx(vio_d3d12.frame_latency_waitable, 1000, TRUE);
     }
+    vio_d3d12.latency_wait_skip = 0;
 
     /* Wait for this frame's previous work to complete */
     d3d12_wait_for_frame(vio_d3d12.frame_index);
@@ -7592,7 +7609,7 @@ static void d3d12_end_frame(void)
     if (vio_d3d12.hdr_composite) {
         /* Layer -> PQ -> swapchain buffer (PRESENT afterwards). A frame that
          * ended on an offscreen target is not presented; nothing to encode. */
-        if (!vio_d3d12.current_bound_rt) d3d12_hdr_encode(frame);
+        if (d3d12_frame_presents()) d3d12_hdr_encode(frame);
     } else {
         /* Transition render target: RENDER_TARGET -> PRESENT */
         D3D12_RESOURCE_BARRIER barrier = {0};
@@ -7716,10 +7733,13 @@ static void d3d12_present(void)
      * d3d12_begin_frame()'s wait_for_frame() (which reuses this same frame_index
      * since we didn't rotate) must see that work complete before it resets the
      * allocator. Mirrors metal_present's offscreen (no-drawable) path. */
-    if (vio_d3d12.current_bound_rt) {
+    if (!d3d12_frame_presents()) {
         vio_d3d12.fence_value++;
         vio_d3d12.frames[vio_d3d12.frame_index].fence_value = vio_d3d12.fence_value;
         ID3D12CommandQueue_Signal(vio_d3d12.cmd_queue, vio_d3d12.fence, vio_d3d12.fence_value);
+        /* No Present, so the frame-latency object is not signalled for it:
+         * the next begin_frame must not wait for one (it would time out). */
+        vio_d3d12.latency_wait_skip = 1;
         return;
     }
 
@@ -11116,6 +11136,9 @@ static const vio_backend d3d12_backend = {
     .destroy_bundle                 = d3d12_destroy_bundle,
     .bundle_method                  = d3d12_bundle_method,
     .rt_origin_top     = 1,
+    .clip_z_remap      = 1,
+    .shadow_sampler_base = VIO_SHADOW_SAMPLER_BASE,
+    .set_frame_present = d3d12_set_frame_present,
     .upscaler_supported             = d3d12_upscaler_supported,
     .upscaler_create                = d3d12_upscaler_create,
     .upscaler_dispatch              = d3d12_upscaler_dispatch,

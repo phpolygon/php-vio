@@ -1355,14 +1355,14 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
         spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
                                                    &sampled_images, &sampled_count);
         /* Assign unique texture (t) and sampler (s) registers per combined image-sampler.
-         * For SM 5.1 (D3D12): depth/shadow samplers get registers 8+ so they map to
-         * comparison static samplers in the root signature. Regular samplers get 0+.
-         * The shadow base is 8 (not 4) so up to 8 regular samplers fit before the
-         * comparison range — the mesh shader uses 5 (albedo, ssao, sdf_ao, probe,
-         * environment cube). MUST stay in sync with the replay in php_vio.c and the
-         * root-signature static-sampler layout in vio_d3d12.c. */
+         * For SM 5.1 (D3D12): depth/shadow samplers get registers
+         * VIO_SHADOW_SAMPLER_BASE+ so they map to comparison static samplers in the
+         * root signature. Regular samplers get 0+, up to 12 before the comparison
+         * range (it was 8, which left an engine mesh shader one free slot). MUST
+         * stay in sync with the replay in php_vio.c and the root-signature
+         * static-sampler layout in vio_d3d12.c. */
         unsigned int regular_idx = 0;
-        unsigned int shadow_idx = 8; /* offset for comparison static samplers */
+        unsigned int shadow_idx = VIO_SHADOW_SAMPLER_BASE; /* comparison static samplers */
         for (size_t i = 0; i < sampled_count; i++) {
             /* Check if this is a depth sampler (sampler2DShadow) */
             int is_depth_sampler = 0;
@@ -2007,7 +2007,7 @@ void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv
         if (vio_spirv_reflect(spirv[s], size[s], &r, &err) != 0) { free(err); continue; }
         if (s == 0) {
             /* The fragment stage: the replay php_vio.c always did. */
-            int regular = 0, shadow = 8;
+            int regular = 0, shadow = VIO_SHADOW_SAMPLER_BASE;
             for (int t = 0; t < r.texture_count; t++) {
                 int d = r.textures[t].is_depth ? 1 : 0;
                 vio_sampler_plan_add(plan, r.textures[t].name, d ? shadow++ : regular++, d);
@@ -2019,8 +2019,8 @@ void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv
             for (int t = 0; t < r.texture_count; t++) {
                 if (vio_sampler_plan_find(plan, r.textures[t].name) >= 0) continue;
                 int d = r.textures[t].is_depth ? 1 : 0;
-                vio_sampler_plan_add(plan, r.textures[t].name, d ? vio_sampler_plan_free_reg(plan, 8, 16)
-                                                                 : vio_sampler_plan_free_reg(plan, 0, 8), d);
+                vio_sampler_plan_add(plan, r.textures[t].name, d ? vio_sampler_plan_free_reg(plan, VIO_SHADOW_SAMPLER_BASE, VIO_SHADOW_SAMPLER_END)
+                                                                 : vio_sampler_plan_free_reg(plan, 0, VIO_SHADOW_SAMPLER_BASE), d);
             }
         }
         vio_reflect_free(&r);

@@ -1156,12 +1156,23 @@ static void vio_bindless_retire(vio_context_object *ctx)
     }
 }
 
+/* Features vio provides itself on every backend, then the backend's own. */
+static int vio_ctx_supports_feature(vio_context_object *ctx, int feature)
+{
+    if (!ctx->backend) return 0;
+    if (feature == VIO_FEATURE_EXPLICIT_PRESENT) return 1;
+    return ctx->backend->supports_feature && ctx->backend->supports_feature((vio_feature)feature) != 0;
+}
+
 ZEND_FUNCTION(vio_begin)
 {
     zval *ctx_zval;
+    HashTable *opts = NULL;
 
-    ZEND_PARSE_PARAMETERS_START(1, 1)
+    ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
@@ -1175,6 +1186,15 @@ ZEND_FUNCTION(vio_begin)
         php_error_docref(NULL, E_WARNING, "Already in a frame (vio_begin called twice without vio_end)");
         return;
     }
+
+    /* 'present' (VIO_FEATURE_EXPLICIT_PRESENT): absent = the backend's old rule. */
+    int present = VIO_PRESENT_AUTO;
+    if (opts) {
+        zval *pv = zend_hash_str_find(opts, "present", sizeof("present") - 1);
+        if (pv && Z_TYPE_P(pv) != IS_NULL) present = zend_is_true(pv) ? VIO_PRESENT_YES : VIO_PRESENT_NO;
+    }
+    ctx->frame_present = present;
+    if (ctx->backend->set_frame_present) ctx->backend->set_frame_present(present);
 
     ctx->frame_no++;
     vio_bindless_retire(ctx);
@@ -1304,14 +1324,18 @@ ZEND_FUNCTION(vio_begin)
     /* Bind headless FBO before begin_frame so clear/draw go to offscreen
      * target. The unbind_render_target slot does exactly "bind default FBO
      * and set viewport"; reusing it keeps the dispatch consistent. */
-    if (ctx->headless_fbo && ctx->backend->unbind_render_target) {
-        ctx->backend->unbind_render_target(ctx->headless_fbo,
+    void *pre_rt = ctx->backend->bound_render_target ? ctx->backend->bound_render_target() : NULL;
+    if ((ctx->headless_fbo || pre_rt) && ctx->backend->unbind_render_target) {
+        /* A frame that is not presented keeps the capture vio_read_pixels reads. */
+        ctx->backend->unbind_render_target(present == VIO_PRESENT_NO ? 0 : ctx->headless_fbo,
             ctx->config.width, ctx->config.height);
     }
 
     if (ctx->backend->begin_frame) {
         ctx->backend->begin_frame();
     }
+    /* A target bound before vio_begin, as if bound right after it. */
+    if (pre_rt && ctx->backend->bind_render_target) ctx->backend->bind_render_target(pre_rt);
 
 #ifdef HAVE_D3D12
     /* Apply a render-target bind requested before vio_begin(): the command
@@ -1427,12 +1451,15 @@ ZEND_FUNCTION(vio_end)
         ctx->backend->end_frame();
     }
 
-    if (ctx->backend->present) {
+    /* A backend with set_frame_present decides in present(); without it a frame
+     * that is not presented skips present and the swap. */
+    int presents = ctx->frame_present != VIO_PRESENT_NO || ctx->backend->set_frame_present;
+    if (ctx->backend->present && presents) {
         ctx->backend->present();
     }
 
     /* Only OpenGL swaps through the platform; the other backends present themselves */
-    if (ctx->window && strcmp(ctx->backend->name, "opengl") == 0) {
+    if (ctx->window && ctx->frame_present != VIO_PRESENT_NO && strcmp(ctx->backend->name, "opengl") == 0) {
         vio_window_swap_buffers(ctx->window);
     }
 
@@ -3194,7 +3221,7 @@ static int vio_shader_compile_extra_stages(vio_shader_object *shader, zval **ext
 
 /* Add the sampled images of one optional stage to the shader's sampler map
  * (names not yet present only). Registers follow the same per-stage replay
- * scheme as the fragment stage (vio_spirv_to_hlsl: regular 0.., depth 8..). */
+ * scheme as the fragment stage (vio_spirv_to_hlsl: regular 0.., depth VIO_SHADOW_SAMPLER_BASE..). */
 static void vio_shader_merge_stage_samplers(vio_shader_object *shader, const uint32_t *spirv, size_t size)
 {
     vio_reflect_result r = {0};
@@ -3203,7 +3230,7 @@ static void vio_shader_merge_stage_samplers(vio_shader_object *shader, const uin
         if (err) free(err);
         return;
     }
-    int regular_reg = 0, shadow_reg = 8;
+    int regular_reg = 0, shadow_reg = VIO_SHADOW_SAMPLER_BASE;
     for (int t = 0; t < r.texture_count; t++) {
         int is_depth = r.textures[t].is_depth ? 1 : 0;
         int reg = is_depth ? shadow_reg++ : regular_reg++;
@@ -3860,12 +3887,11 @@ ZEND_FUNCTION(vio_shader)
                      * sampler. The reflection list here is the SAME sampled_images list,
                      * in the SAME order, that vio_spirv_to_hlsl walks when it assigns
                      * SpvDecorationBinding (vio_shader_reflect.c): regular samplers get
-                     * 0,1,2..; depth/shadow samplers get 4,5,6.. So we can reproduce the
-                     * exact register by replaying that counter scheme. This is correct by
-                     * construction and replaces the fragile "reflection index + 4" guess. */
-                    /* MUST match vio_shader_reflect.c: regular 0+, shadow 8+. */
+                     * 0,1,2..; depth/shadow samplers get VIO_SHADOW_SAMPLER_BASE.. So we can
+                     * reproduce the exact register by replaying that counter scheme. This is
+                     * correct by construction and replaces the fragile "reflection index + 4" guess. */
                     int regular_reg = 0;
-                    int shadow_reg = 8;
+                    int shadow_reg = VIO_SHADOW_SAMPLER_BASE;
                     for (int s = 0; s < shader->sampler_count; s++) {
                         strncpy(shader->sampler_names[s], frag_reflect.textures[s].name,
                                 sizeof(shader->sampler_names[s]) - 1);
@@ -11448,6 +11474,25 @@ ZEND_FUNCTION(vio_backend_info)
     add_assoc_string(return_value, "driver", (char *)(d.driver ? d.driver : ""));
     add_assoc_string(return_value, "device_type", (char *)(d.device_type ? d.device_type : "unknown"));
     add_assoc_long(return_value, "vram_bytes", (zend_long)d.vram_bytes);
+    /* Conventions the engine must know (one place instead of per-backend checks):
+     * row 0 of a target, and whether GLSL clip z is remapped - with it the depth
+     * buffer holds (ndc_z + 1) / 2 on every backend. */
+    zval conv;
+    array_init(&conv);
+    add_assoc_bool(&conv, "rt_origin_top", ctx->backend->rt_origin_top ? 1 : 0);
+    add_assoc_bool(&conv, "clip_z_remap", ctx->backend->clip_z_remap ? 1 : 0);
+    add_assoc_string(&conv, "depth_stored", "(ndc_z + 1) / 2");
+    add_assoc_zval(return_value, "conventions", &conv);
+    /* Samplers per stage: 16 in all (the D3D11 / Metal limit, GL's minimum);
+     * a split backend keeps the comparison ones from shadow_sampler_base on. */
+    zval smp;
+    array_init(&smp);
+    int sbase = ctx->backend->shadow_sampler_base;
+    add_assoc_long(&smp, "total", VIO_SHADOW_SAMPLER_END);
+    add_assoc_long(&smp, "regular", sbase > 0 ? sbase : VIO_SHADOW_SAMPLER_END);
+    add_assoc_long(&smp, "comparison", sbase > 0 ? VIO_SHADOW_SAMPLER_END - sbase : VIO_SHADOW_SAMPLER_END);
+    add_assoc_long(&smp, "comparison_base", sbase);
+    add_assoc_zval(return_value, "samplers", &smp);
     add_assoc_string(return_value, "selected_by", (char *)(ctx->selected_by ? ctx->selected_by : "explicit"));
     zval cand;
     if (ctx->candidates) ZVAL_ARR(&cand, zend_array_dup(ctx->candidates));
@@ -13224,6 +13269,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_RENDER_TARGET_STORAGE", VIO_FEATURE_RENDER_TARGET_STORAGE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_UPSCALER_NATIVE", VIO_FEATURE_UPSCALER_NATIVE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_UPSCALER_PREPARE", VIO_FEATURE_UPSCALER_PREPARE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_EXPLICIT_PRESENT", VIO_FEATURE_EXPLICIT_PRESENT, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALER_FSR3", VIO_UPSCALER_FSR3, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALER_DLSS", VIO_UPSCALER_DLSS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALER_XESS", VIO_UPSCALER_XESS, CONST_CS | CONST_PERSISTENT);
@@ -14760,7 +14806,7 @@ ZEND_FUNCTION(vio_unbind_render_target)
         strcmp(ctx->backend->name, "opengl") == 0) {
         /* For OpenGL the "default" target is the headless FBO when present;
          * otherwise FBO 0 with the current window's framebuffer dimensions. */
-        unsigned int default_fbo = ctx->headless_fbo;
+        unsigned int default_fbo = ctx->in_frame && ctx->frame_present == VIO_PRESENT_NO ? 0 : ctx->headless_fbo;
         int w = ctx->config.width;
         int h = ctx->config.height;
         if (!default_fbo && ctx->window) {
@@ -15512,7 +15558,7 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
             }
         }
         if (ctx->bound_shader_object) {
-            /* Same register recomputation as vio_bind_texture_now (regular 0.., shadow 8..). */
+            /* Same register recomputation as vio_bind_texture_now (regular 0.., shadow VIO_SHADOW_SAMPLER_BASE..). */
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
             if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0 &&
                 sh->gl_to_hlsl_sampler[slot] < sh->sampler_count) {
@@ -15617,10 +15663,7 @@ ZEND_FUNCTION(vio_supports_feature)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    if (!ctx->backend || !ctx->backend->supports_feature) {
-        RETURN_FALSE;
-    }
-    RETURN_BOOL(ctx->backend->supports_feature((vio_feature)feature) != 0);
+    RETURN_BOOL(vio_ctx_supports_feature(ctx, (int)feature));
 }
 
 /* supported / emulated / method of one VIO_FEATURE_* (OPEN-ITEMS-PLAN A9). */
@@ -15635,8 +15678,7 @@ ZEND_FUNCTION(vio_feature_info)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    int supported = ctx->backend && ctx->backend->supports_feature
-        && ctx->backend->supports_feature((vio_feature)feature) != 0;
+    int supported = vio_ctx_supports_feature(ctx, (int)feature);
     const char *method = supported && ctx->backend->feature_emulation
         ? ctx->backend->feature_emulation((vio_feature)feature) : NULL;
 

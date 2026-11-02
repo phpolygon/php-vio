@@ -173,13 +173,21 @@ int vio_spirv_uses_clip_distance(const uint32_t *spirv, size_t spirv_size);
  * lists them in SPIR-V id order, i.e. glslang's order of first use, not the
  * declaration order. The plan walks the stages in the sampler-map order of
  * php_vio.c (fragment, geometry, tess control, tess eval, mesh, task): the
- * fragment stage keeps its replayed registers (regular 0.., depth 8..,
+ * fragment stage keeps its replayed registers (regular 0.., depth VIO_SHADOW_SAMPLER_BASE..,
  * separate textures after the combined ones), every later name takes the lowest
  * free register of its kind. vio_spirv_to_hlsl and the Vulkan stage rewrite
  * look names up while a plan is in use (vio_sampler_plan_use around the
  * backend's compile_shader / create_pipeline); names outside it keep the
  * per-stage counter. */
 #define VIO_SAMPLER_PLAN_MAX 32
+/* Register split of a stage's combined samplers on the register backends
+ * (D3D12 SM 5.1+, Vulkan, which mirrors it): regular samplers take
+ * 0..VIO_SHADOW_SAMPLER_BASE-1 (the D3D12 sampler table), comparison samplers
+ * (sampler*Shadow) VIO_SHADOW_SAMPLER_BASE..VIO_SHADOW_SAMPLER_END-1 (the D3D12
+ * static comparison samplers). 16 in all: D3D11 and Metal bind at most 16
+ * samplers per stage. vio_backend_info()['samplers'] reports the split. */
+#define VIO_SHADOW_SAMPLER_BASE 12
+#define VIO_SHADOW_SAMPLER_END  16
 typedef struct _vio_sampler_plan {
     int  count;
     char names[VIO_SAMPLER_PLAN_MAX][64];
