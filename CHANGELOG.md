@@ -1,3 +1,10 @@
+## [2.40.2](https://github.com/phpolygon/php-vio/compare/v2.40.1...v2.40.2) (2026-11-02)
+
+
+### Bug Fixes
+
+* **vulkan:** vio_bind_cubemap resolves the GL unit to the shader's sampler ([d729496](https://github.com/phpolygon/php-vio/commit/d729496771fedce61fc831153cd8b93c8347222d))
+
 ## [2.40.1](https://github.com/phpolygon/php-vio/compare/v2.40.0...v2.40.1) (2026-11-02)
 
 
