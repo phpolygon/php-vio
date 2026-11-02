@@ -112,6 +112,10 @@ typedef struct _vio_shader_object {
     int               sampler_count;
     /* Runtime GL-slot to HLSL-binding remap: gl_to_hlsl[gl_slot] = hlsl_binding (-1 = unmapped) */
     int               gl_to_hlsl_sampler[16];
+    /* GL texture unit each sampler reads, as on OpenGL: the layout(binding)
+     * (0 without one) until vio_set_uniform(name, unit) sets it. The typed-
+     * register backends bind every sampler from its unit at draw time. */
+    int               sampler_unit[VIO_MAX_SAMPLERS];
     /* Lazily-built name -> (stage,offset,size) map for O(1) uniform lookup on the
      * hot draw path (replaces a linear strcmp scan run for every uniform set).
      * NULL until first use; freed in vio_shader_free_object. */
