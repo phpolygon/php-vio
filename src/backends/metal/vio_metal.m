@@ -2012,23 +2012,34 @@ static void metal_gpu_flush(void)
 
 static void metal_clear(float r, float g, float b, float a)
 {
-    vio_mtl.clear_r = r;
-    vio_mtl.clear_g = g;
-    vio_mtl.clear_b = b;
-    vio_mtl.clear_a = a;
-
     /* Eager clear, D3D11 semantics: inside a frame the currently bound target
      * (swapchain or RT) is cleared NOW — the pass is closed and reopened with
      * Clear load actions for colour + depth. Outside a frame the colour is
      * latched and applied when metal_begin_frame opens the first pass, so the
-     * portable "vio_clear before vio_begin" pattern keeps working too. */
+     * portable "vio_clear before vio_begin" pattern keeps working too. The
+     * in-frame clear restores the latch afterwards: a render target's clear
+     * colour must not become the next frame's swapchain clear (D3D12 semantics). */
     if (vio_mtl.current_cmd_buf && vio_mtl.current_encoder) {
+        float lr = vio_mtl.clear_r, lg = vio_mtl.clear_g, lb = vio_mtl.clear_b, la = vio_mtl.clear_a;
+        vio_mtl.clear_r = r;
+        vio_mtl.clear_g = g;
+        vio_mtl.clear_b = b;
+        vio_mtl.clear_a = a;
         @autoreleasepool {
             [vio_mtl.current_encoder endEncoding];
             vio_mtl.current_encoder = nil;
             metal_open_encoder(/*load_clear=*/1);
         }
+        vio_mtl.clear_r = lr;
+        vio_mtl.clear_g = lg;
+        vio_mtl.clear_b = lb;
+        vio_mtl.clear_a = la;
+        return;
     }
+    vio_mtl.clear_r = r;
+    vio_mtl.clear_g = g;
+    vio_mtl.clear_b = b;
+    vio_mtl.clear_a = a;
 }
 
 /* ── Shader compilation: SPIR-V → MSL → MTLLibrary ────────────────── */
