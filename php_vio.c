@@ -15518,7 +15518,17 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
 {
     (void)ctx; (void)cm; (void)slot;
     if (ctx->backend->bind_cubemap) {   /* Vulkan */
-        ctx->backend->bind_cubemap(cm, (int)slot);
+        /* The backend takes the shader's sampler index like bind_texture does
+         * (vio_bind_texture_now), not the GL unit: a cube on any unit but the
+         * one that happens to equal its sampler index read nothing. */
+        int sampler_idx = (int)slot;
+        if (ctx->bound_shader_object) {
+            vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
+            if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
+                sampler_idx = sh->gl_to_hlsl_sampler[slot];
+            }
+        }
+        ctx->backend->bind_cubemap(cm, sampler_idx);
         return;
     }
 #ifdef HAVE_D3D11
