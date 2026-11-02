@@ -4484,13 +4484,18 @@ void vio_vk_apply_shading_rate(VkCommandBuffer cmd, int primitive)
 
 static void vulkan_clear(float r, float g, float b, float a)
 {
+    /* Inside a frame vio_clear clears the open pass's attachments now and leaves
+     * the latched colour alone (D3D12 semantics): a clear of a render target must
+     * not become the swapchain clear of the next frame. Outside a frame it only
+     * latches the colour for the next frame's swapchain pass. */
+    if (vio_vk.in_frame) {
+        vio_vk_clear_attachments(r, g, b, a);
+        return;
+    }
     vio_vk.clear_r = r;
     vio_vk.clear_g = g;
     vio_vk.clear_b = b;
     vio_vk.clear_a = a;
-    /* Inside a frame vio_clear clears the open pass's attachments now (D3D12
-     * semantics); outside it only latches the colour for the next pass. */
-    vio_vk_clear_attachments(r, g, b, a);
 }
 
 /* ── GPU compute primitive ────────────────────────────────────────────
