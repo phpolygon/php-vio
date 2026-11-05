@@ -611,6 +611,9 @@ typedef struct _vio_backend {
     void *(*create_swapchain)(void *platform_window, const vio_config *cfg);
     void  (*set_swapchain)(void *swapchain);
     void  (*destroy_swapchain)(void *swapchain);
+    /* OpenGL: the framebuffer a window frame renders into (the frontend binds it
+     * like the headless FBO), resized to the window first. 0 = none. */
+    unsigned int (*swapchain_fbo)(void *swapchain);
 } vio_backend;
 
 #define VIO_MAX_FRAGMENT_STORAGE 4

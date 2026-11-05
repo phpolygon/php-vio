@@ -1333,6 +1333,9 @@ static void vio_window_enter(vio_context_object *ctx, vio_window_object *w)
     ctx->config.headless = w->view.config.headless;
     ctx->config.vsync = w->view.config.vsync;
     ctx->backend->set_swapchain(w->swapchain);
+    /* OpenGL: the frame renders into the window's FBO, bound like the headless one */
+    ctx->frame_saved_fbo = ctx->headless_fbo;
+    if (ctx->backend->swapchain_fbo) ctx->headless_fbo = ctx->backend->swapchain_fbo(w->swapchain);
 
     /* 2D projection in logical pixels, viewport in framebuffer pixels (headless: 1:1) */
     int fb_w = w->view.config.width, fb_h = w->view.config.height;
@@ -1353,6 +1356,11 @@ static void vio_window_leave(vio_context_object *ctx)
 {
     if (!ctx->frame_window) return;
     ctx->backend->set_swapchain(NULL);
+    if (ctx->backend->swapchain_fbo) {
+        ctx->headless_fbo = ctx->frame_saved_fbo;
+        if (ctx->backend->unbind_render_target)   /* the main frame's target again */
+            ctx->backend->unbind_render_target(ctx->headless_fbo, 0, 0);
+    }
     ctx->window = ctx->frame_saved_window;
     ctx->config = ctx->frame_saved_config;
     if (ctx->frame_saved_2d_w > 0 && ctx->frame_saved_2d_h > 0
@@ -1406,7 +1414,12 @@ ZEND_FUNCTION(vio_window)
         RETURN_THROWS();
     }
 
-    void *pw = vio_window_create(&cfg, ctx->backend->name);
+    /* OpenGL: a visible window gets a context sharing the main one's objects (its
+     * frames are blitted into it), a headless one none at all (only an FBO). */
+    int gl = ctx->backend->swapchain_fbo != NULL;
+    cfg.gl_share = ctx->window;
+    void *pw = vio_window_create(&cfg, gl && cfg.headless ? "none" : ctx->backend->name);
+    if (gl && vio_plat()->gl_make_current) vio_plat()->gl_make_current(ctx->window);
     if (!pw) RETURN_FALSE;
     void *sc = ctx->backend->create_swapchain(pw, &cfg);
     if (!sc) {
@@ -1628,7 +1641,8 @@ ZEND_FUNCTION(vio_begin)
     if ((ctx->headless_fbo || pre_rt) && ctx->backend->unbind_render_target) {
         /* A frame that is not presented keeps the capture vio_read_pixels reads. */
         ctx->backend->unbind_render_target(present == VIO_PRESENT_NO ? 0 : ctx->headless_fbo,
-            ctx->config.width, ctx->config.height);
+            ctx->state_2d.fb_width > 0 ? ctx->state_2d.fb_width : ctx->config.width,
+            ctx->state_2d.fb_height > 0 ? ctx->state_2d.fb_height : ctx->config.height);
     }
 
     if (ctx->backend->begin_frame) {
@@ -1758,8 +1772,9 @@ ZEND_FUNCTION(vio_end)
         ctx->backend->present();
     }
 
-    /* Only OpenGL swaps through the platform; the other backends present themselves */
-    if (ctx->window && ctx->frame_present != VIO_PRESENT_NO && strcmp(ctx->backend->name, "opengl") == 0) {
+    /* Only OpenGL swaps through the platform; the other backends present themselves
+     * (so does a further OpenGL window, from present above) */
+    if (ctx->window && !ctx->frame_window && ctx->frame_present != VIO_PRESENT_NO && strcmp(ctx->backend->name, "opengl") == 0) {
         vio_window_swap_buffers(ctx->window);
     }
 

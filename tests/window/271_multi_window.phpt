@@ -4,8 +4,8 @@ Multiple windows (DESKTOP-APP-PLAN Phase 4): vio_window() opens a second window 
 vio
 --FILE--
 <?php
-/* converted in 4a (Metal, D3D11), 4b (Vulkan) and 4c (D3D12); OpenGL follows (4d) */
-$required = ['metal', 'd3d11', 'vulkan', 'd3d12'];
+/* every backend: 4a Metal + D3D11, 4b Vulkan, 4c D3D12, 4d OpenGL */
+$required = ['opengl', 'metal', 'd3d11', 'vulkan', 'd3d12'];
 $px = function (string $rgba, int $w, int $x, int $y) { $o = ($y * $w + $x) * 4; return [ord($rgba[$o]), ord($rgba[$o + 1]), ord($rgba[$o + 2])]; };
 $near = fn(array $a, array $b) => max(array_map(fn($i) => abs($a[$i] - $b[$i]), [0, 1, 2])) <= 8;
 $err = function (callable $f) { try { $f(); return 'none'; } catch (ValueError $e) { return 'ValueError'; } };
@@ -76,7 +76,7 @@ foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
 echo "DONE\n";
 ?>
 --EXPECTF--
-opengl: %r(OK|unsupported|skip \(.*\))%r
+opengl: %r(OK|skip \(.*\))%r
 d3d11: %r(OK|skip \(.*\))%r
 d3d12: %r(OK|skip \(.*\))%r
 vulkan: %r(OK|skip \(.*\))%r

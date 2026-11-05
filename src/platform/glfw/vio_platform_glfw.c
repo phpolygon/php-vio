@@ -272,7 +272,7 @@ static vio_window_handle glfw_create_window(vio_config *cfg, const char *backend
                 glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
 #endif
             }
-            window = glfwCreateWindow(width, height, title, NULL, NULL);
+            window = glfwCreateWindow(width, height, title, NULL, (GLFWwindow *)cfg->gl_share);
         }
 
         glfwSetErrorCallback(prev_cb);

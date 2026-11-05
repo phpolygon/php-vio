@@ -1154,7 +1154,7 @@ static vio_window_handle wl_create_window(vio_config *cfg, const char *backend_n
                     WL_EGL_CONTEXT_MAJOR, ladder[i][0], WL_EGL_CONTEXT_MINOR, ladder[i][1],
                     core ? WL_EGL_CONTEXT_PROFILE : WL_EGL_NONE, WL_EGL_CONTEXT_CORE_BIT, WL_EGL_NONE
                 };
-                w->egl_context = egl.CreateContext(wl_egl_display, config, NULL, attrs);
+                w->egl_context = egl.CreateContext(wl_egl_display, config, cfg->gl_share ? ((vio_wl_window *)cfg->gl_share)->egl_context : NULL, attrs);
             }
             ok = w->egl_context != NULL;
         }
