@@ -15856,6 +15856,8 @@ ZEND_FUNCTION(vio_platform_info)
     add_assoc_bool(return_value, "open_url", p->open_url != NULL);
     add_assoc_bool(return_value, "reveal_file", p->reveal_file != NULL);
     add_assoc_bool(return_value, "file_drop", p->accepts_drops != 0);
+    add_assoc_bool(return_value, "file_dialog", p->file_dialog != NULL);
+    add_assoc_bool(return_value, "message_box", p->message_box != NULL);
 }
 
 ZEND_FUNCTION(vio_set_cursor)
@@ -16017,6 +16019,146 @@ ZEND_FUNCTION(vio_set_window_opacity)
     }
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
     RETURN_BOOL(VIO_PLAT_CALL(ctx, set_opacity, (float)a));
+}
+
+/* An optional string option; NULL when absent or null. ValueError when not a
+ * string or holding NUL (returns -1). */
+static int vio_opt_string(HashTable *opts, const char *key, uint32_t argn, const char **out)
+{
+    *out = NULL;
+    zval *z = opts ? zend_hash_str_find(opts, key, strlen(key)) : NULL;
+    if (!z || Z_TYPE_P(z) == IS_NULL) return 0;
+    if (Z_TYPE_P(z) != IS_STRING || memchr(Z_STRVAL_P(z), 0, Z_STRLEN_P(z))) {
+        zend_argument_value_error(argn, "option '%s' must be a string without NUL bytes", key);
+        return -1;
+    }
+    *out = Z_STRVAL_P(z);
+    return 0;
+}
+
+ZEND_FUNCTION(vio_file_dialog)
+{
+    zval *ctx_zval;
+    HashTable *opts = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_file_dialog_desc d;
+    memset(&d, 0, sizeof(d));
+    const char *mode = NULL;
+    if (vio_opt_string(opts, "mode", 2, &mode) < 0) RETURN_THROWS();
+    if (!mode || strcmp(mode, "open") == 0) d.mode = VIO_PLATFORM_DIALOG_OPEN;
+    else if (strcmp(mode, "save") == 0) d.mode = VIO_PLATFORM_DIALOG_SAVE;
+    else if (strcmp(mode, "folder") == 0) d.mode = VIO_PLATFORM_DIALOG_FOLDER;
+    else { zend_argument_value_error(2, "option 'mode' must be 'open', 'save' or 'folder'"); RETURN_THROWS(); }
+    zval *z = opts ? zend_hash_str_find(opts, "multiple", 8) : NULL;
+    d.multiple = z && zend_is_true(z);
+    if (d.multiple && d.mode == VIO_PLATFORM_DIALOG_SAVE) {
+        zend_argument_value_error(2, "option 'multiple' does not go with mode 'save'");
+        RETURN_THROWS();
+    }
+    if (vio_opt_string(opts, "title", 2, &d.title) < 0 || vio_opt_string(opts, "default_path", 2, &d.default_path) < 0) RETURN_THROWS();
+
+    /* filters: list of ['name' => string, 'extensions' => list<string>] */
+    vio_dialog_filter filters[32];
+    const char *exts[256];
+    int ext_n = 0;
+    zval *fz = opts ? zend_hash_str_find(opts, "filters", 7) : NULL;
+    if (fz && Z_TYPE_P(fz) != IS_NULL) {
+        if (Z_TYPE_P(fz) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(fz)) > 32) {
+            zend_argument_value_error(2, "option 'filters' must be a list of at most 32 filters");
+            RETURN_THROWS();
+        }
+        zval *f;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(fz), f) {
+            zval *nz = Z_TYPE_P(f) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(f), "name", 4) : NULL;
+            zval *ez = Z_TYPE_P(f) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(f), "extensions", 10) : NULL;
+            if (!nz || Z_TYPE_P(nz) != IS_STRING || !ez || Z_TYPE_P(ez) != IS_ARRAY || !zend_hash_num_elements(Z_ARRVAL_P(ez))) {
+                zend_argument_value_error(2, "each filter must be ['name' => string, 'extensions' => [string, ...]]");
+                RETURN_THROWS();
+            }
+            vio_dialog_filter *df = &filters[d.filter_count++];
+            df->name = Z_STRVAL_P(nz);
+            df->extensions = &exts[ext_n];
+            df->count = 0;
+            zval *e;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ez), e) {
+                if (Z_TYPE_P(e) != IS_STRING || !Z_STRLEN_P(e) || ext_n >= 256
+                    || strpbrk(Z_STRVAL_P(e), ";,*?./\\ ") || memchr(Z_STRVAL_P(e), 0, Z_STRLEN_P(e))) {
+                    zend_argument_value_error(2, "filter extensions must be bare names like 'png' (at most 256 in all)");
+                    RETURN_THROWS();
+                }
+                exts[ext_n++] = Z_STRVAL_P(e);
+                df->count++;
+            } ZEND_HASH_FOREACH_END();
+        } ZEND_HASH_FOREACH_END();
+        d.filters = filters;
+    }
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_plat()->file_dialog) RETURN_FALSE;
+    char **paths = NULL;
+    int n = 0;
+    if (!vio_plat()->file_dialog(ctx->window, &d, &paths, &n)) RETURN_FALSE;
+    if (n == 0) { free(paths); RETURN_NULL(); }
+    array_init_size(return_value, (uint32_t)n);
+    for (int i = 0; i < n; i++) { add_next_index_string(return_value, paths[i]); free(paths[i]); }
+    free(paths);
+}
+
+ZEND_FUNCTION(vio_message_box)
+{
+    zval *ctx_zval;
+    zend_string *title, *message;
+    HashTable *opts = NULL;
+    ZEND_PARSE_PARAMETERS_START(3, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR(title)
+        Z_PARAM_STR(message)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_message_box_desc d;
+    memset(&d, 0, sizeof(d));
+    d.title = ZSTR_VAL(title);
+    d.message = ZSTR_VAL(message);
+    const char *buttons[3] = { "OK", NULL, NULL };
+    d.buttons = buttons;
+    d.button_count = 1;
+    zval *bz = opts ? zend_hash_str_find(opts, "buttons", 7) : NULL;
+    if (bz && Z_TYPE_P(bz) != IS_NULL) {
+        uint32_t n = Z_TYPE_P(bz) == IS_ARRAY ? zend_hash_num_elements(Z_ARRVAL_P(bz)) : 0;
+        if (n < 1 || n > 3) {
+            zend_argument_value_error(4, "option 'buttons' must hold 1 to 3 labels");
+            RETURN_THROWS();
+        }
+        d.button_count = 0;
+        zval *b;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(bz), b) {
+            if (Z_TYPE_P(b) != IS_STRING || !Z_STRLEN_P(b)) {
+                zend_argument_value_error(4, "button labels must be non-empty strings");
+                RETURN_THROWS();
+            }
+            buttons[d.button_count++] = Z_STRVAL_P(b);
+        } ZEND_HASH_FOREACH_END();
+    }
+    const char *kind = NULL;
+    if (vio_opt_string(opts, "kind", 4, &kind) < 0) RETURN_THROWS();
+    if (!kind || strcmp(kind, "info") == 0) d.kind = VIO_PLATFORM_MESSAGE_INFO;
+    else if (strcmp(kind, "warning") == 0) d.kind = VIO_PLATFORM_MESSAGE_WARNING;
+    else if (strcmp(kind, "error") == 0) d.kind = VIO_PLATFORM_MESSAGE_ERROR;
+    else if (strcmp(kind, "question") == 0) d.kind = VIO_PLATFORM_MESSAGE_QUESTION;
+    else { zend_argument_value_error(4, "option 'kind' must be 'info', 'warning', 'error' or 'question'"); RETURN_THROWS(); }
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_plat()->message_box) RETURN_FALSE;
+    int r = vio_plat()->message_box(ctx->window, &d);
+    if (r < 0) RETURN_FALSE;
+    RETURN_LONG(r < d.button_count ? r : d.button_count - 1);
 }
 
 /* 1 when s holds a control character (also NUL inside the string). */

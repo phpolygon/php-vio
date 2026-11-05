@@ -1129,6 +1129,231 @@ static int w32_set_opacity(vio_window_handle h, float opacity)
     return 1;
 }
 
+/* ── Dialogs (DESKTOP-APP-PLAN Phase 2) ───────────────────────────── */
+
+/* The Common Item Dialog's GUIDs, local so the module needs no uuid.lib. */
+static const GUID w32_CLSID_FileOpenDialog = { 0xDC1C5A9C, 0xE88A, 0x4DDE, { 0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7 } };
+static const GUID w32_CLSID_FileSaveDialog = { 0xC0B4E2F3, 0xBA21, 0x4773, { 0x8D, 0xBA, 0x33, 0x5E, 0xC9, 0x46, 0xEB, 0x8B } };
+static const GUID w32_IID_IFileOpenDialog  = { 0xD57C7288, 0xD4AD, 0x4768, { 0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60 } };
+static const GUID w32_IID_IFileSaveDialog  = { 0x84BCCD23, 0x5FDE, 0x4CDB, { 0xAE, 0xA4, 0xAF, 0x64, 0xB8, 0x3D, 0x78, 0xAB } };
+static const GUID w32_IID_IShellItem       = { 0x43826D1E, 0xE718, 0x42EE, { 0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE } };
+
+/* VIO_TEST_DIALOG (tests only): a thread timer the dialog's modal loop
+ * dispatches; it posts the chosen command to the dialog once it is up. */
+static UINT w32_test_cmd;
+static UINT_PTR w32_test_timer;
+static BOOL CALLBACK w32_find_dialog(HWND hwnd, LPARAM lp)
+{
+    WCHAR cls[16];
+    if (IsWindowVisible(hwnd) && GetClassNameW(hwnd, cls, 16) && wcscmp(cls, L"#32770") == 0) { *(HWND *)lp = hwnd; return FALSE; }
+    return TRUE;
+}
+static VOID CALLBACK w32_test_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
+{
+    (void)hwnd; (void)msg; (void)time;
+    HWND dlg = NULL;
+    EnumThreadWindows(GetCurrentThreadId(), w32_find_dialog, (LPARAM)&dlg);
+    if (!dlg) return;   /* not up yet: the timer fires again */
+    KillTimer(NULL, id);
+    w32_test_timer = 0;
+    PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(w32_test_cmd, BN_CLICKED), 0);
+}
+static void w32_test_dialog_arm(UINT cmd_cancel, UINT cmd_accept, const UINT *buttons, int count)
+{
+    int ms = 0, action = 0;
+    if (!vio_platform_test_dialog(&ms, &action)) return;
+    w32_test_cmd = action == -1 ? cmd_cancel : action == -2 ? cmd_accept
+                 : (buttons && action >= 0 && action < count ? buttons[action] : cmd_cancel);
+    w32_test_timer = SetTimer(NULL, 0, (UINT)(ms > 0 ? ms : 1), w32_test_timer_proc);
+}
+static void w32_test_dialog_disarm(void)
+{
+    if (w32_test_timer) { KillTimer(NULL, w32_test_timer); w32_test_timer = 0; }
+}
+
+static char *w32_utf8(const WCHAR *w)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *u = n > 0 ? (char *)malloc((size_t)n) : NULL;
+    if (u && WideCharToMultiByte(CP_UTF8, 0, w, -1, u, n, NULL, NULL) <= 0) { free(u); u = NULL; }
+    return u;
+}
+
+static char *w32_item_path(IShellItem *item)
+{
+    PWSTR p = NULL;
+    char *u = NULL;
+    if (SUCCEEDED(item->lpVtbl->GetDisplayName(item, SIGDN_FILESYSPATH, &p)) && p) {
+        u = w32_utf8(p);
+        CoTaskMemFree(p);
+    }
+    return u;
+}
+
+static int w32_file_dialog(vio_window_handle h, const vio_file_dialog_desc *d, char ***out_paths, int *out_count)
+{
+    *out_paths = NULL;
+    *out_count = 0;
+    HWND owner = h ? ((vio_win32_window *)h)->hwnd : NULL;
+    int save = d->mode == VIO_PLATFORM_DIALOG_SAVE, ok = 0;
+    HRESULT co = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    IFileDialog *fd = NULL;
+    WCHAR *title = NULL, *path = NULL;
+    COMDLG_FILTERSPEC specs[32];
+    WCHAR *spec_mem[64];
+    int spec_n = 0, mem_n = 0;
+    if (FAILED(CoCreateInstance(save ? &w32_CLSID_FileSaveDialog : &w32_CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
+                                save ? &w32_IID_IFileSaveDialog : &w32_IID_IFileOpenDialog, (void **)&fd)) || !fd) goto done;
+
+    FILEOPENDIALOGOPTIONS opt = 0;
+    fd->lpVtbl->GetOptions(fd, &opt);
+    opt |= FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR;
+    if (d->mode == VIO_PLATFORM_DIALOG_FOLDER) opt |= FOS_PICKFOLDERS;
+    if (d->multiple && !save) opt |= FOS_ALLOWMULTISELECT;
+    if (save) opt |= FOS_OVERWRITEPROMPT;
+    fd->lpVtbl->SetOptions(fd, opt);
+    if (d->title && (title = vio_shell_wide(d->title))) fd->lpVtbl->SetTitle(fd, title);
+
+    if (d->filter_count > 0 && d->mode != VIO_PLATFORM_DIALOG_FOLDER) {
+        for (int i = 0; i < d->filter_count && i < 32; i++) {
+            size_t len = 1;
+            for (int k = 0; k < d->filters[i].count; k++) len += strlen(d->filters[i].extensions[k]) + 3;
+            char *spec = (char *)malloc(len);
+            if (!spec) break;
+            spec[0] = '\0';
+            for (int k = 0; k < d->filters[i].count; k++) {
+                if (k) strcat(spec, ";");
+                strcat(spec, "*.");
+                strcat(spec, d->filters[i].extensions[k]);
+            }
+            WCHAR *wn = vio_shell_wide(d->filters[i].name), *ws = vio_shell_wide(spec);
+            free(spec);
+            if (!wn || !ws) { free(wn); free(ws); break; }
+            spec_mem[mem_n++] = wn;
+            spec_mem[mem_n++] = ws;
+            specs[spec_n].pszName = wn;
+            specs[spec_n].pszSpec = ws;
+            spec_n++;
+        }
+        if (spec_n) fd->lpVtbl->SetFileTypes(fd, (UINT)spec_n, specs);
+        if (save && d->filters[0].count) {
+            WCHAR *ext = vio_shell_wide(d->filters[0].extensions[0]);
+            if (ext) { fd->lpVtbl->SetDefaultExtension(fd, ext); free(ext); }
+        }
+    }
+
+    if (d->default_path && (path = vio_shell_wide(d->default_path))) {
+        DWORD attr = GetFileAttributesW(path);
+        WCHAR *name = NULL;
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            WCHAR *slash = wcsrchr(path, L'\\');
+            WCHAR *fwd = wcsrchr(path, L'/');
+            if (fwd > slash) slash = fwd;
+            if (slash) { *slash = 0; name = slash + 1; } else { name = path; }
+        }
+        if (name != path) {
+            IShellItem *folder = NULL;
+            if (SUCCEEDED(SHCreateItemFromParsingName(path, NULL, &w32_IID_IShellItem, (void **)&folder)) && folder) {
+                fd->lpVtbl->SetFolder(fd, folder);
+                folder->lpVtbl->Release(folder);
+            }
+        }
+        if (save && name && *name) fd->lpVtbl->SetFileName(fd, name);
+    }
+
+    w32_test_dialog_arm(IDCANCEL, IDOK, NULL, 0);
+    HRESULT hr = fd->lpVtbl->Show(fd, owner);
+    w32_test_dialog_disarm();
+    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) { ok = 1; goto done; }
+    if (FAILED(hr)) goto done;
+
+    if (save) {
+        IShellItem *item = NULL;
+        if (SUCCEEDED(fd->lpVtbl->GetResult(fd, &item)) && item) {
+            char *u = w32_item_path(item);
+            item->lpVtbl->Release(item);
+            if (u && (*out_paths = (char **)malloc(sizeof(char *)))) { (*out_paths)[0] = u; *out_count = 1; ok = 1; }
+            else free(u);
+        }
+    } else {
+        IShellItemArray *items = NULL;
+        IFileOpenDialog *od = (IFileOpenDialog *)fd;
+        if (SUCCEEDED(od->lpVtbl->GetResults(od, &items)) && items) {
+            DWORD n = 0;
+            items->lpVtbl->GetCount(items, &n);
+            char **paths = n ? (char **)calloc(n, sizeof(char *)) : NULL;
+            int got = 0;
+            for (DWORD i = 0; paths && i < n; i++) {
+                IShellItem *item = NULL;
+                if (FAILED(items->lpVtbl->GetItemAt(items, i, &item)) || !item) continue;
+                char *u = w32_item_path(item);
+                item->lpVtbl->Release(item);
+                if (u) paths[got++] = u;
+            }
+            items->lpVtbl->Release(items);
+            *out_paths = paths;
+            *out_count = got;
+            ok = 1;
+        }
+    }
+done:
+    for (int i = 0; i < mem_n; i++) free(spec_mem[i]);
+    free(title);
+    free(path);
+    if (fd) fd->lpVtbl->Release(fd);
+    if (SUCCEEDED(co)) CoUninitialize();
+    return ok;
+}
+
+/* MessageBoxW with its buttons relabelled from a CBT hook (TaskDialog needs
+ * comctl32 v6, which php.exe's manifest does not ask for). */
+static struct { const vio_message_box_desc *d; HHOOK hook; UINT ids[3]; } w32_mb;
+static LRESULT CALLBACK w32_mb_hook(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HCBT_ACTIVATE && w32_mb.hook) {
+        HWND dlg = (HWND)wp;
+        for (int i = 0; i < w32_mb.d->button_count; i++) {
+            WCHAR *label = vio_shell_wide(w32_mb.d->buttons[i]);
+            if (label) { SetDlgItemTextW(dlg, (int)w32_mb.ids[i], label); free(label); }
+        }
+        UnhookWindowsHookEx(w32_mb.hook);
+        w32_mb.hook = NULL;
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+static int w32_message_box(vio_window_handle h, const vio_message_box_desc *d)
+{
+    HWND owner = h ? ((vio_win32_window *)h)->hwnd : NULL;
+    UINT type, ids[3] = { IDOK, IDCANCEL, IDCANCEL };
+    switch (d->button_count) {
+        case 1:  type = MB_OK; break;
+        case 2:  type = MB_OKCANCEL; break;
+        default: type = MB_YESNOCANCEL; ids[0] = IDYES; ids[1] = IDNO; ids[2] = IDCANCEL; break;
+    }
+    switch (d->kind) {
+        case VIO_PLATFORM_MESSAGE_WARNING:  type |= MB_ICONWARNING; break;
+        case VIO_PLATFORM_MESSAGE_ERROR:    type |= MB_ICONERROR; break;
+        case VIO_PLATFORM_MESSAGE_QUESTION: type |= MB_ICONQUESTION; break;
+        default:                            type |= MB_ICONINFORMATION; break;
+    }
+    WCHAR *title = vio_shell_wide(d->title), *text = vio_shell_wide(d->message);
+    if (!title || !text) { free(title); free(text); return -1; }
+    w32_mb.d = d;
+    memcpy(w32_mb.ids, ids, sizeof(ids));
+    w32_mb.hook = SetWindowsHookExW(WH_CBT, w32_mb_hook, NULL, GetCurrentThreadId());
+    int last = d->button_count - 1;
+    w32_test_dialog_arm(ids[last], ids[0], ids, d->button_count);
+    int r = MessageBoxW(owner, text, title, type | MB_SETFOREGROUND | (owner ? 0 : MB_TASKMODAL));
+    w32_test_dialog_disarm();
+    if (w32_mb.hook) { UnhookWindowsHookEx(w32_mb.hook); w32_mb.hook = NULL; }
+    free(title);
+    free(text);
+    if (r == 0) return -1;
+    for (int i = 0; i < d->button_count; i++) if ((UINT)r == ids[i]) return i;
+    return last;   /* IDCANCEL / closed */
+}
+
 static void w32_set_window_size(vio_window_handle h, int cw, int ch)
 {
     vio_win32_window *w = (vio_win32_window *)h;
@@ -1538,6 +1763,8 @@ static const vio_platform vio_platform_win32 = {
     .open_url             = vio_shell_open_url,
     .reveal_file          = vio_shell_reveal_file,
     .accepts_drops        = 1,
+    .file_dialog          = w32_file_dialog,
+    .message_box          = w32_message_box,
 };
 
 void vio_platform_win32_register(void)

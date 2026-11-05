@@ -160,6 +160,21 @@ void vio_platform_wait_wake_only(double timeout)
     vio_platform_wake_take();
 }
 
+int vio_platform_test_dialog(int *ms, int *action)
+{
+    const char *v = getenv("VIO_TEST_DIALOG");
+    if (!v || !*v) return 0;
+    char *end = NULL;
+    long t = strtol(v, &end, 10);
+    if (!end || *end != ':' || t < 0) return 0;
+    const char *a = end + 1;
+    *ms = (int)t;
+    if (strcmp(a, "cancel") == 0) *action = -1;
+    else if (strcmp(a, "accept") == 0) *action = -2;
+    else *action = atoi(a);
+    return 1;
+}
+
 int vio_platform_timeout_ms(double timeout)
 {
     if (timeout < 0.0) return -1;

@@ -130,6 +130,32 @@ function vio_open_url(string $url): bool {}
 function vio_reveal_file(string $path): bool {}
 
 /**
+ * Show the system's file dialog (modal) and return the chosen paths, null when
+ * the user cancels, false when the platform has none (vio_platform_info()
+ * ['file_dialog']; Linux comes with the portal in a later phase).
+ *
+ * Options: 'mode' => 'open' (default) | 'save' | 'folder', 'multiple' => bool
+ * (open/folder), 'title' => string, 'default_path' => a folder or (save) a
+ * file, 'filters' => [['name' => 'Images', 'extensions' => ['png', 'jpg']], ...]
+ * (bare extensions). Anything else throws a ValueError.
+ *
+ * @param array{mode?: string, multiple?: bool, title?: string, default_path?: string,
+ *              filters?: list<array{name: string, extensions: list<string>}>} $options
+ * @return list<string>|null|false
+ */
+function vio_file_dialog(VioContext $context, array $options = []): array|false|null {}
+
+/**
+ * Show a modal message box and return the index of the pressed button
+ * (closing it with Escape picks the last button), false when the platform has
+ * none. Options: 'buttons' => 1..3 labels (default ['OK']), 'kind' => 'info'
+ * (default) | 'warning' | 'error' | 'question'.
+ *
+ * @param array{buttons?: list<string>, kind?: string} $options
+ */
+function vio_message_box(VioContext $context, string $title, string $message, array $options = []): int|false {}
+
+/**
  * Like vio_poll_events(), but first blocks until an event arrives, $timeout
  * seconds pass (< 0: no timeout) or vio_wake() is called. An idle desktop app
  * loops on this instead of vio_poll_events() and renders only when something
