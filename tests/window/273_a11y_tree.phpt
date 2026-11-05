@@ -109,7 +109,7 @@ if win is None:
 else:
     kids = [win.get_child_at_index(i) for i in range(win.get_child_count())]
     def desc(k):
-        d = [k.get_name(), k.get_role_name()]
+        d = [k.get_name(), {'push button': 'button'}.get(k.get_role_name(), k.get_role_name())]   # older AT-SPI: 'push button'
         try: d.append(Atspi.Text.get_text(k, 0, -1) if 'Text' in k.get_interfaces() else None)
         except Exception as e: d.append(repr(e))
         d.append(k.get_state_set().contains(Atspi.StateType.CHECKED))
