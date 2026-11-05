@@ -229,6 +229,7 @@ PS1;
     @rmdir($dir);
     $j = json_decode($uia, true);
     $want = [[['Speichern', 'ControlType.Button', null, null], ['Name', 'ControlType.Edit', 'Hendrik', null], ['Zustimmen', 'ControlType.CheckBox', null, 'On']], 'invoked', 'Gespeichert'];
+    $php = array_values(array_filter($php, fn($l) => $l !== 'action save focus null'));   // UIA focuses before Invoke
     $win = $j === $want && $php === ['ready true', 'action save click null', 'updated'] ? 'OK' : 'FAIL ' . json_encode([$uia, $php]);
 }
 if ($win === 'n/a' && PHP_OS_FAMILY === 'Windows' && getenv('VIO_REQUIRE_A11Y')) $win = 'FAIL (required)';
