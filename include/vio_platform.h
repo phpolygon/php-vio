@@ -125,6 +125,7 @@ typedef struct _vio_menu_item {
 #define VIO_PLATFORM_FEATURE_FILE_DIALOG   1
 #define VIO_PLATFORM_FEATURE_NOTIFICATIONS 2
 #define VIO_PLATFORM_FEATURE_PROGRESS      3
+#define VIO_PLATFORM_FEATURE_TRAY          4
 
 /* vio_set_progress states */
 #define VIO_PLATFORM_PROGRESS_NORMAL        0
@@ -132,11 +133,21 @@ typedef struct _vio_menu_item {
 #define VIO_PLATFORM_PROGRESS_ERROR         2
 #define VIO_PLATFORM_PROGRESS_INDETERMINATE 3
 
+/* vio_tray (DESKTOP-APP-PLAN Phase 2c-2): one icon per process. */
+typedef struct _vio_platform_image vio_platform_image;
+typedef struct _vio_tray_desc {
+    const vio_platform_image *images;
+    int                       image_count;   /* 0: the platform's default icon */
+    const char               *tooltip;       /* NULL: none */
+    const vio_menu_item      *menu;          /* NULL: none */
+    int                       menu_count;
+} vio_tray_desc;
+
 /* An RGBA image (window icon), top row first. */
-typedef struct _vio_platform_image {
+struct _vio_platform_image {
     int width, height;
     const unsigned char *rgba;
-} vio_platform_image;
+};
 
 /* Joysticks: ids 0..VIO_PLATFORM_JOYSTICK_LAST (GLFW's 16 slots). */
 #define VIO_PLATFORM_JOYSTICK_LAST 15
@@ -283,7 +294,15 @@ typedef struct _vio_platform {
     int   (*notify)(const char *title, const char *body, const char *icon, const char *key);
     /* Taskbar / Dock progress: value 0..1, < 0 = hide; state VIO_PLATFORM_PROGRESS_*. */
     int   (*set_progress)(vio_window_handle w, double value, int state);
+    /* The process's tray icon: d = NULL removes it. Clicks and menu choices
+     * arrive through vio_tray_click_event / vio_tray_menu_event (from the
+     * event loop). 1 = shown. */
+    int   (*set_tray)(const vio_tray_desc *d);
 } vio_platform;
+
+/* Tray events, implemented in php_vio.c (PHP thread, inside poll/wait). */
+void vio_tray_click_event(void);
+void vio_tray_menu_event(int tag);
 
 /* Registry (src/vio_platform_registry.c): platforms register in MINIT; the
  * active one is chosen once (VIO_PLATFORM env or the first registered of

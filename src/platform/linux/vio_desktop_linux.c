@@ -78,9 +78,18 @@ static struct {
     DBusMessage *(*pop)(DBusConnection *);
     unsigned int (*is_signal)(DBusMessage *, const char *, const char *);
     const char *(*get_path)(DBusMessage *);
+    int (*request_name)(DBusConnection *, const char *, unsigned int, DBusError *);
+    int (*release_name)(DBusConnection *, const char *, DBusError *);
+    DBusMessage *(*new_return)(DBusMessage *);
+    DBusMessage *(*new_error)(DBusMessage *, const char *, const char *);
+    int (*get_type)(DBusMessage *);
+    const char *(*get_interface)(DBusMessage *);
+    const char *(*get_member)(DBusMessage *);
+    unsigned int (*get_unix_fd)(DBusConnection *, int *);
 } db;
 
 static DBusConnection *db_conn;
+void vio_linux_handle(DBusMessage *msg);
 
 static int db_load(void)
 {
@@ -103,6 +112,10 @@ static int db_load(void)
     DBL(flush, "dbus_connection_flush"); DBL(read_write, "dbus_connection_read_write");
     DBL(pop, "dbus_connection_pop_message"); DBL(is_signal, "dbus_message_is_signal");
     DBL(get_path, "dbus_message_get_path");
+    DBL(request_name, "dbus_bus_request_name"); DBL(release_name, "dbus_bus_release_name");
+    DBL(new_return, "dbus_message_new_method_return"); DBL(new_error, "dbus_message_new_error");
+    DBL(get_type, "dbus_message_get_type"); DBL(get_interface, "dbus_message_get_interface");
+    DBL(get_member, "dbus_message_get_member"); DBL(get_unix_fd, "dbus_connection_get_unix_fd");
 #undef DBL
     db.ok = 1;
     return 1;
@@ -159,6 +172,7 @@ int vio_linux_available(int feature)
         case VIO_PLATFORM_FEATURE_FILE_DIALOG:   return db_has_owner("org.freedesktop.portal.Desktop");
         case VIO_PLATFORM_FEATURE_NOTIFICATIONS: return db_has_owner("org.freedesktop.Notifications");
         case VIO_PLATFORM_FEATURE_PROGRESS:      return db_session() && vio_app_id();
+        case VIO_PLATFORM_FEATURE_TRAY:          return db_has_owner("org.kde.StatusNotifierWatcher");
     }
     return 0;
 }
@@ -355,7 +369,8 @@ int vio_linux_file_dialog(const vio_file_dialog_desc *d, char ***out_paths, int 
     if (!r) { db.error_init(&err); db.bus_remove_match(c, rule, &err); if (err.name) db.error_free(&err); return 0; }
     db.unref(r);   /* the handle is the path computed above (portal >= 0.9) */
 
-    /* wait for Response(u code, a{sv} results); the dialog is modal for us */
+    /* wait for Response(u code, a{sv} results); the dialog is modal for us,
+     * other calls (the tray's) are answered meanwhile */
     int ok = 0, done = 0;
     while (!done && db.read_write(c, 200)) {
         DBusMessage *msg;
@@ -393,6 +408,7 @@ int vio_linux_file_dialog(const vio_file_dialog_desc *d, char ***out_paths, int 
                     }
                 }
             }
+            else vio_linux_handle(msg);
             db.unref(msg);
         }
     }
@@ -400,6 +416,391 @@ int vio_linux_file_dialog(const vio_file_dialog_desc *d, char ***out_paths, int 
     db.bus_remove_match(c, rule, &err);
     if (err.name) db.error_free(&err);
     return ok;
+}
+
+/* ── Tray: StatusNotifierItem + com.canonical.dbusmenu ─────────────── */
+
+/* A copy of the menu tree as dbusmenu nodes: id = index (0 = root). */
+typedef struct { int parent, tag, separator, enabled, checked; char *label; } sni_node;
+static struct {
+    int        on;
+    char       service[96];
+    char      *title;
+    unsigned char *pixmap;   /* ARGB32 big-endian */
+    int        pw, ph;
+    sni_node  *nodes;
+    int        node_n;
+    uint32_t   revision;
+} sni;
+
+static void sni_free_nodes(void)
+{
+    for (int i = 0; i < sni.node_n; i++) free(sni.nodes[i].label);
+    free(sni.nodes);
+    sni.nodes = NULL;
+    sni.node_n = 0;
+}
+
+static void sni_add_nodes(const vio_menu_item *items, int n, int parent)
+{
+    for (int i = 0; i < n; i++) {
+        sni_node *grown = (sni_node *)realloc(sni.nodes, (size_t)(sni.node_n + 1) * sizeof(sni_node));
+        if (!grown) return;
+        sni.nodes = grown;
+        int id = sni.node_n++;
+        sni_node *nd = &sni.nodes[id];
+        memset(nd, 0, sizeof(*nd));
+        nd->parent = parent;
+        nd->tag = items[i].tag;
+        nd->separator = items[i].separator;
+        nd->enabled = items[i].enabled;
+        nd->checked = items[i].checked;
+        nd->label = items[i].label ? strdup(items[i].label) : NULL;
+        if (items[i].children) sni_add_nodes(items[i].children, items[i].child_count, id);
+    }
+}
+
+static void sni_variant_str(DBusMessageIter *it, const char *v)
+{
+    DBusMessageIter var;
+    db.open_container(it, DB_TYPE_VARIANT, "s", &var);
+    db.append_basic(&var, DB_TYPE_STRING, &v);
+    db.close_container(it, &var);
+}
+
+/* a(iiay) */
+static void sni_append_pixmaps(DBusMessageIter *it)
+{
+    DBusMessageIter arr, st, bytes;
+    db.open_container(it, DB_TYPE_ARRAY, "(iiay)", &arr);
+    if (sni.pixmap) {
+        int32_t w = sni.pw, h = sni.ph;
+        db.open_container(&arr, DB_TYPE_STRUCT, NULL, &st);
+        db.append_basic(&st, DB_TYPE_INT32, &w);
+        db.append_basic(&st, DB_TYPE_INT32, &h);
+        db.open_container(&st, DB_TYPE_ARRAY, "y", &bytes);
+        for (int i = 0; i < w * h * 4; i++) db.append_basic(&bytes, DB_TYPE_BYTE, &sni.pixmap[i]);
+        db.close_container(&st, &bytes);
+        db.close_container(&arr, &st);
+    }
+    db.close_container(it, &arr);
+}
+
+/* One StatusNotifierItem / dbusmenu property as a variant; 0 = unknown. */
+static int sni_append_prop(DBusMessageIter *it, const char *iface, const char *name)
+{
+    DBusMessageIter var, st, empty;
+    const char *s = NULL;
+    if (!strcmp(iface, "org.kde.StatusNotifierItem")) {
+        if (!strcmp(name, "Category")) s = "ApplicationStatus";
+        else if (!strcmp(name, "Id")) s = vio_app_id() ? vio_app_id() : "php-vio";
+        else if (!strcmp(name, "Title")) s = sni.title ? sni.title : "";
+        else if (!strcmp(name, "Status")) s = "Active";
+        else if (!strcmp(name, "IconName")) s = sni.pixmap ? "" : "application-x-executable";
+        else if (!strcmp(name, "IconPixmap")) {
+            db.open_container(it, DB_TYPE_VARIANT, "a(iiay)", &var);
+            sni_append_pixmaps(&var);
+            db.close_container(it, &var);
+            return 1;
+        } else if (!strcmp(name, "ToolTip")) {   /* (s icon, a(iiay) pixmaps, s title, s text) */
+            const char *e = "", *t = sni.title ? sni.title : "";
+            db.open_container(it, DB_TYPE_VARIANT, "(sa(iiay)ss)", &var);
+            db.open_container(&var, DB_TYPE_STRUCT, NULL, &st);
+            db.append_basic(&st, DB_TYPE_STRING, &e);
+            db.open_container(&st, DB_TYPE_ARRAY, "(iiay)", &empty);
+            db.close_container(&st, &empty);
+            db.append_basic(&st, DB_TYPE_STRING, &t);
+            db.append_basic(&st, DB_TYPE_STRING, &e);
+            db.close_container(&var, &st);
+            db.close_container(it, &var);
+            return 1;
+        } else if (!strcmp(name, "ItemIsMenu")) {
+            unsigned int b = sni.node_n > 1;
+            db.open_container(it, DB_TYPE_VARIANT, "b", &var);
+            db.append_basic(&var, DB_TYPE_BOOLEAN, &b);
+            db.close_container(it, &var);
+            return 1;
+        } else if (!strcmp(name, "Menu")) {
+            const char *path = sni.node_n > 1 ? "/MenuBar" : "/NO_DBUSMENU";
+            db.open_container(it, DB_TYPE_VARIANT, "o", &var);
+            db.append_basic(&var, DB_TYPE_OBJPATH, &path);
+            db.close_container(it, &var);
+            return 1;
+        } else return 0;
+    } else if (!strcmp(iface, "com.canonical.dbusmenu")) {
+        if (!strcmp(name, "Version")) {
+            uint32_t v = 3;
+            db.open_container(it, DB_TYPE_VARIANT, "u", &var);
+            db.append_basic(&var, DB_TYPE_UINT32, &v);
+            db.close_container(it, &var);
+            return 1;
+        }
+        if (!strcmp(name, "Status")) s = "normal";
+        else if (!strcmp(name, "TextDirection")) s = "ltr";
+        else return 0;
+    } else return 0;
+    sni_variant_str(it, s);
+    return 1;
+}
+
+static const char *sni_item_props[] = { "Category", "Id", "Title", "Status", "IconName", "IconPixmap", "ToolTip", "ItemIsMenu", "Menu" };
+static const char *sni_menu_props[] = { "Version", "Status", "TextDirection" };
+
+/* (i id, a{sv} props, av children) for node id */
+static void sni_append_layout(DBusMessageIter *it, int id, int depth)
+{
+    DBusMessageIter st, props, kids, var;
+    int32_t iid = id;
+    db.open_container(it, DB_TYPE_STRUCT, NULL, &st);
+    db.append_basic(&st, DB_TYPE_INT32, &iid);
+    db.open_container(&st, DB_TYPE_ARRAY, "{sv}", &props);
+    int has_kids = 0;
+    for (int i = 1; i < sni.node_n; i++) if (sni.nodes[i].parent == id) { has_kids = 1; break; }
+    if (id == 0 || has_kids) { const char *v = "submenu"; db_dict_entry(&props, "children-display", DB_TYPE_STRING, "s", &v); }
+    if (id > 0) {
+        sni_node *nd = &sni.nodes[id];
+        if (nd->separator) { const char *v = "separator"; db_dict_entry(&props, "type", DB_TYPE_STRING, "s", &v); }
+        else {
+            const char *l = nd->label ? nd->label : "";
+            db_dict_entry(&props, "label", DB_TYPE_STRING, "s", &l);
+            unsigned int en = nd->enabled != 0;
+            db_dict_entry(&props, "enabled", DB_TYPE_BOOLEAN, "b", &en);
+            if (nd->checked) {
+                const char *t = "checkmark";
+                int32_t st1 = 1;
+                db_dict_entry(&props, "toggle-type", DB_TYPE_STRING, "s", &t);
+                db_dict_entry(&props, "toggle-state", DB_TYPE_INT32, "i", &st1);
+            }
+        }
+    }
+    db.close_container(&st, &props);
+    db.open_container(&st, DB_TYPE_ARRAY, "v", &kids);
+    if (depth != 0) {
+        for (int i = 1; i < sni.node_n; i++) {
+            if (sni.nodes[i].parent != id) continue;
+            db.open_container(&kids, DB_TYPE_VARIANT, "(ia{sv}av)", &var);
+            sni_append_layout(&var, i, depth < 0 ? -1 : depth - 1);
+            db.close_container(&kids, &var);
+        }
+    }
+    db.close_container(&st, &kids);
+    db.close_container(it, &st);
+}
+
+static void sni_menu_event(int32_t id, const char *event)
+{
+    if (strcmp(event, "clicked") || id <= 0 || id >= sni.node_n || sni.nodes[id].tag < 0 || !sni.nodes[id].enabled) return;
+    vio_tray_menu_event(sni.nodes[id].tag);
+}
+
+/* Answers a method call for the tray's objects; others are dropped. */
+void vio_linux_handle(DBusMessage *msg)
+{
+    if (!sni.on || db.get_type(msg) != 1 /* method call */) return;
+    const char *iface = db.get_interface(msg), *member = db.get_member(msg), *path = db.get_path(msg);
+    if (!member || !path) return;
+    DBusMessage *r = NULL;
+    DBusMessageIter in, out, dict;
+    int have_in = db.iter_init(msg, &in);
+    if (iface && !strcmp(iface, "org.freedesktop.DBus.Properties") && (!strcmp(member, "Get") || !strcmp(member, "GetAll"))) {
+        const char *pi = NULL, *pn = NULL;
+        if (have_in && db.iter_type(&in) == DB_TYPE_STRING) { db.iter_basic(&in, &pi); if (db.iter_next(&in) && db.iter_type(&in) == DB_TYPE_STRING) db.iter_basic(&in, &pn); }
+        if (!pi) pi = "";
+        r = db.new_return(msg);
+        db.iter_init_append(r, &out);
+        if (!strcmp(member, "Get")) {
+            if (!pn || !sni_append_prop(&out, pi, pn)) { db.unref(r); r = db.new_error(msg, "org.freedesktop.DBus.Error.UnknownProperty", pn ? pn : ""); }
+        } else {
+            const char **names = !strcmp(pi, "com.canonical.dbusmenu") ? sni_menu_props : sni_item_props;
+            int n = names == sni_menu_props ? 3 : 9;
+            db.open_container(&out, DB_TYPE_ARRAY, "{sv}", &dict);
+            for (int i = 0; i < n; i++) {
+                DBusMessageIter e;
+                db.open_container(&dict, DB_TYPE_DICT, NULL, &e);
+                db.append_basic(&e, DB_TYPE_STRING, &names[i]);
+                sni_append_prop(&e, pi, names[i]);
+                db.close_container(&dict, &e);
+            }
+            db.close_container(&out, &dict);
+        }
+    } else if (iface && !strcmp(iface, "org.kde.StatusNotifierItem")) {
+        if (!strcmp(member, "Activate")) vio_tray_click_event();   /* ContextMenu / SecondaryActivate / Scroll: nothing */
+        r = db.new_return(msg);
+    } else if (iface && !strcmp(iface, "com.canonical.dbusmenu")) {
+        r = db.new_return(msg);
+        db.iter_init_append(r, &out);
+        if (!strcmp(member, "GetLayout")) {
+            int32_t parent = 0, depth = -1;
+            if (have_in && db.iter_type(&in) == DB_TYPE_INT32) { db.iter_basic(&in, &parent); if (db.iter_next(&in) && db.iter_type(&in) == DB_TYPE_INT32) db.iter_basic(&in, &depth); }
+            if (parent < 0 || parent >= (sni.node_n ? sni.node_n : 1)) parent = 0;
+            db.append_basic(&out, DB_TYPE_UINT32, &sni.revision);
+            sni_append_layout(&out, parent, depth);
+        } else if (!strcmp(member, "Event")) {
+            int32_t id = 0;
+            const char *ev = "";
+            if (have_in && db.iter_type(&in) == DB_TYPE_INT32) { db.iter_basic(&in, &id); if (db.iter_next(&in) && db.iter_type(&in) == DB_TYPE_STRING) db.iter_basic(&in, &ev); }
+            sni_menu_event(id, ev);
+        } else if (!strcmp(member, "EventGroup")) {   /* a(isvu) -> ai (ids not found) */
+            DBusMessageIter arr, st, none;
+            if (have_in && db.iter_type(&in) == DB_TYPE_ARRAY) {
+                db.iter_recurse(&in, &arr);
+                for (; db.iter_type(&arr) == DB_TYPE_STRUCT; db.iter_next(&arr)) {
+                    int32_t id = 0;
+                    const char *ev = "";
+                    db.iter_recurse(&arr, &st);
+                    db.iter_basic(&st, &id);
+                    if (db.iter_next(&st)) db.iter_basic(&st, &ev);
+                    sni_menu_event(id, ev);
+                }
+            }
+            db.open_container(&out, DB_TYPE_ARRAY, "i", &none);
+            db.close_container(&out, &none);
+        } else if (!strcmp(member, "AboutToShow")) {
+            unsigned int no = 0;
+            db.append_basic(&out, DB_TYPE_BOOLEAN, &no);
+        } else if (!strcmp(member, "AboutToShowGroup")) {
+            DBusMessageIter a1, a2;
+            db.open_container(&out, DB_TYPE_ARRAY, "i", &a1); db.close_container(&out, &a1);
+            db.open_container(&out, DB_TYPE_ARRAY, "i", &a2); db.close_container(&out, &a2);
+        } else if (!strcmp(member, "GetGroupProperties")) {   /* ai, as -> a(ia{sv}) with each id's layout props */
+            DBusMessageIter ids, arr, st, props;
+            db.open_container(&out, DB_TYPE_ARRAY, "(ia{sv})", &arr);
+            if (have_in && db.iter_type(&in) == DB_TYPE_ARRAY) {
+                db.iter_recurse(&in, &ids);
+                for (; db.iter_type(&ids) == DB_TYPE_INT32; db.iter_next(&ids)) {
+                    int32_t id = 0;
+                    db.iter_basic(&ids, &id);
+                    if (id <= 0 || id >= sni.node_n) continue;
+                    db.open_container(&arr, DB_TYPE_STRUCT, NULL, &st);
+                    db.append_basic(&st, DB_TYPE_INT32, &id);
+                    db.open_container(&st, DB_TYPE_ARRAY, "{sv}", &props);
+                    const char *l = sni.nodes[id].label ? sni.nodes[id].label : "";
+                    db_dict_entry(&props, "label", DB_TYPE_STRING, "s", &l);
+                    db.close_container(&st, &props);
+                    db.close_container(&arr, &st);
+                }
+            }
+            db.close_container(&out, &arr);
+        } else {
+            db.unref(r);
+            r = db.new_error(msg, "org.freedesktop.DBus.Error.UnknownMethod", member);
+        }
+    } else if (iface && !strcmp(iface, "org.freedesktop.DBus.Introspectable")) {
+        static const char *xml =
+            "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" "
+            "\"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\"><node>"
+            "<interface name=\"org.kde.StatusNotifierItem\"><method name=\"Activate\"><arg type=\"i\"/><arg type=\"i\"/></method></interface>"
+            "<interface name=\"com.canonical.dbusmenu\"><method name=\"GetLayout\"><arg type=\"i\" direction=\"in\"/>"
+            "<arg type=\"i\" direction=\"in\"/><arg type=\"as\" direction=\"in\"/><arg type=\"u\" direction=\"out\"/>"
+            "<arg type=\"(ia{sv}av)\" direction=\"out\"/></method></interface></node>";
+        r = db.new_return(msg);
+        db.iter_init_append(r, &out);
+        db.append_basic(&out, DB_TYPE_STRING, &xml);
+    } else {
+        r = db.new_error(msg, "org.freedesktop.DBus.Error.UnknownMethod", member);
+    }
+    if (r) { db.send(db_conn, r, NULL); db.unref(r); db.flush(db_conn); }
+}
+
+void vio_linux_dispatch(void)
+{
+    if (!db_conn) return;
+    db.read_write(db_conn, 0);
+    DBusMessage *m;
+    while ((m = db.pop(db_conn))) { vio_linux_handle(m); db.unref(m); }
+}
+
+int vio_linux_dbus_fd(void)
+{
+    int fd = -1;
+    if (!db_conn || !sni.on || !db.get_unix_fd(db_conn, &fd)) return -1;
+    return fd;
+}
+
+static void sni_signal(const char *path, const char *iface, const char *name)
+{
+    DBusMessage *m = db.new_signal(path, iface, name);
+    if (!m) return;
+    if (!strcmp(name, "LayoutUpdated")) {
+        DBusMessageIter it;
+        int32_t parent = 0;
+        db.iter_init_append(m, &it);
+        db.append_basic(&it, DB_TYPE_UINT32, &sni.revision);
+        db.append_basic(&it, DB_TYPE_INT32, &parent);
+    }
+    db.send(db_conn, m, NULL);
+    db.unref(m);
+}
+
+int vio_linux_set_tray(const vio_tray_desc *d)
+{
+    DBusConnection *c = db_session();
+    if (!c) return 0;
+    DBusError err;
+    if (!d) {
+        if (sni.on) {
+            db.error_init(&err);
+            db.release_name(c, sni.service, &err);   /* the watcher drops the item when its name goes */
+            if (err.name) db.error_free(&err);
+            db.flush(c);
+        }
+        sni.on = 0;
+        free(sni.title); sni.title = NULL;
+        free(sni.pixmap); sni.pixmap = NULL;
+        sni_free_nodes();
+        return 1;
+    }
+    if (!db_has_owner("org.kde.StatusNotifierWatcher")) return 0;
+    free(sni.title);
+    sni.title = d->tooltip ? strdup(d->tooltip) : NULL;
+    free(sni.pixmap);
+    sni.pixmap = NULL;
+    if (d->image_count > 0) {   /* the largest image, as ARGB32 in network order */
+        int best = 0;
+        for (int i = 1; i < d->image_count; i++) if (d->images[i].width > d->images[best].width) best = i;
+        const vio_platform_image *im = &d->images[best];
+        sni.pixmap = (unsigned char *)malloc((size_t)im->width * (size_t)im->height * 4);
+        if (sni.pixmap) {
+            sni.pw = im->width;
+            sni.ph = im->height;
+            for (int i = 0; i < im->width * im->height; i++) {
+                sni.pixmap[i * 4 + 0] = im->rgba[i * 4 + 3];
+                sni.pixmap[i * 4 + 1] = im->rgba[i * 4 + 0];
+                sni.pixmap[i * 4 + 2] = im->rgba[i * 4 + 1];
+                sni.pixmap[i * 4 + 3] = im->rgba[i * 4 + 2];
+            }
+        }
+    }
+    sni_free_nodes();
+    sni.nodes = (sni_node *)calloc(1, sizeof(sni_node));   /* the root */
+    if (sni.nodes) { sni.node_n = 1; sni.nodes[0].parent = -1; sni.nodes[0].tag = -1; }
+    if (d->menu_count > 0) sni_add_nodes(d->menu, d->menu_count, 0);
+    sni.revision++;
+    if (!sni.on) {
+        snprintf(sni.service, sizeof(sni.service), "org.kde.StatusNotifierItem-%d-1", (int)getpid());
+        db.error_init(&err);
+        int r = db.request_name(c, sni.service, 4 /* DO_NOT_QUEUE */, &err);
+        if (err.name) db.error_free(&err);
+        if (r != 1 && r != 4) return 0;   /* primary owner / already owner */
+        DBusMessage *m = db.new_method_call("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                                            "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem");
+        if (!m) return 0;
+        DBusMessageIter it;
+        const char *svc = sni.service;
+        db.iter_init_append(m, &it);
+        db.append_basic(&it, DB_TYPE_STRING, &svc);
+        sni.on = 1;   /* the watcher may ask for properties before it answers */
+        db.send(c, m, NULL);
+        db.unref(m);
+        db.flush(c);
+    } else {
+        sni_signal("/StatusNotifierItem", "org.kde.StatusNotifierItem", "NewTitle");
+        sni_signal("/StatusNotifierItem", "org.kde.StatusNotifierItem", "NewIcon");
+        sni_signal("/StatusNotifierItem", "org.kde.StatusNotifierItem", "NewToolTip");
+        sni_signal("/MenuBar", "com.canonical.dbusmenu", "LayoutUpdated");
+        db.flush(c);
+    }
+    return 1;
 }
 
 #endif /* __linux__ */

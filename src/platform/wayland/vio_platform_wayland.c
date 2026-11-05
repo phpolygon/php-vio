@@ -933,8 +933,9 @@ static void wl_dispatch(int timeout_ms)
     while (wl_display_prepare_read(wl.display) != 0) wl_display_dispatch_pending(wl.display);
     wl_display_flush(wl.display);
     /* the wake pipe ends a wait too (vio_wake) */
-    struct pollfd pfd[2] = { { wl_display_get_fd(wl.display), POLLIN, 0 }, { vio_platform_wake_fd(), POLLIN, 0 } };
-    int n = timeout_ms != 0 && pfd[1].fd >= 0 ? 2 : 1;
+    struct pollfd pfd[3] = { { wl_display_get_fd(wl.display), POLLIN, 0 }, { vio_platform_wake_fd(), POLLIN, 0 },
+                             { vio_linux_dbus_fd(), POLLIN, 0 } };   /* tray clicks */
+    int n = timeout_ms != 0 ? 3 : 1;
     while (poll(pfd, (nfds_t)n, timeout_ms) < 0 && errno == EINTR) {}
     if (pfd[0].revents & POLLIN) wl_display_read_events(wl.display);
     else wl_display_cancel_read(wl.display);
@@ -945,6 +946,7 @@ static void wl_poll_events(void)
 {
     wl_dispatch(0);
     wl_repeat_tick();
+    vio_linux_dispatch();   /* tray calls on the session bus */
 }
 
 static void wl_wait_events(double timeout)
@@ -959,6 +961,7 @@ static void wl_wait_events(double timeout)
     }
     wl_dispatch(ms);
     wl_repeat_tick();
+    vio_linux_dispatch();
     vio_platform_wake_take();
 }
 
@@ -1411,6 +1414,7 @@ static const vio_platform vio_platform_wayland = {
     .file_dialog          = lx_file_dialog,
     .notify               = vio_linux_notify,
     .set_progress         = lx_set_progress,
+    .set_tray             = vio_linux_set_tray,
 };
 
 void vio_platform_wayland_register(void)

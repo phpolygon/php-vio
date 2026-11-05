@@ -285,13 +285,20 @@ static void cocoa_report_size(vio_cocoa_window *w)
 @property (nonatomic, assign) vio_cocoa_window *owner;
 @property (nonatomic, assign) NSInteger chosen;
 @property (nonatomic, assign) BOOL popup;
+@property (nonatomic, assign) BOOL tray;
 @end
 
 @implementation VioCocoaMenuTarget
 - (void)vioMenu:(NSMenuItem *)item
 {
     if (self.popup) { self.chosen = item.tag; return; }
+    if (self.tray) { vio_tray_menu_event((int)item.tag); return; }
     if (self.owner) vio_input_menu_event(self.owner->input, (int)item.tag);
+}
+- (void)vioTrayClick:(id)sender
+{
+    (void)sender;
+    vio_tray_click_event();
 }
 - (void)vioQuit:(id)sender
 {
@@ -1291,6 +1298,62 @@ static int cocoa_notify(const char *title, const char *body, const char *icon, c
     return 1;
 }
 
+/* ── Tray (DESKTOP-APP-PLAN Phase 2c-2) ───────────────────────────── */
+
+static void *cocoa_status_item;   /* NSStatusItem, retained */
+static void *cocoa_tray_target;   /* VioCocoaMenuTarget for its menu, retained */
+
+static int cocoa_set_tray(const vio_tray_desc *d)
+{
+    if (!cocoa_initialized) return 0;
+    @autoreleasepool {
+        if (!d) {
+            if (cocoa_status_item) {
+                [[NSStatusBar systemStatusBar] removeStatusItem:(__bridge NSStatusItem *)cocoa_status_item];
+                CFRelease(cocoa_status_item);
+                cocoa_status_item = NULL;
+            }
+            if (cocoa_tray_target) { CFRelease(cocoa_tray_target); cocoa_tray_target = NULL; }
+            return 1;
+        }
+        if (!cocoa_tray_target) {
+            VioCocoaMenuTarget *t = [[VioCocoaMenuTarget alloc] init];
+            t.tray = YES;
+            cocoa_tray_target = (void *)CFBridgingRetain(t);
+        }
+        VioCocoaMenuTarget *target = (__bridge VioCocoaMenuTarget *)cocoa_tray_target;
+        if (!cocoa_status_item) {
+            NSStatusItem *it = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+            if (!it) return 0;
+            cocoa_status_item = (void *)CFBridgingRetain(it);
+        }
+        NSStatusItem *item = (__bridge NSStatusItem *)cocoa_status_item;
+        NSStatusBarButton *button = item.button;
+        if (d->image_count > 0) {
+            int best = 0;   /* the menu bar is 22 pt high: the image closest to 18 px */
+            for (int i = 1; i < d->image_count; i++) if (abs(d->images[i].height - 18) < abs(d->images[best].height - 18)) best = i;
+            NSImage *img = cocoa_image(d->images[best].rgba, d->images[best].width, d->images[best].height);
+            img.size = NSMakeSize(18.0 * d->images[best].width / d->images[best].height, 18.0);
+            button.image = img;
+            button.title = @"";
+        } else {
+            button.image = nil;
+            button.title = d->tooltip ? cocoa_str(d->tooltip) : @"\u25CF";
+        }
+        button.toolTip = cocoa_str(d->tooltip);
+        if (d->menu_count > 0) {
+            item.menu = cocoa_build_menu(@"", d->menu, d->menu_count, target);   /* a click opens it */
+            button.target = nil;
+            button.action = NULL;
+        } else {
+            item.menu = nil;
+            button.target = target;
+            button.action = @selector(vioTrayClick:);
+        }
+    }
+    return 1;
+}
+
 static int cocoa_window_monitor(vio_window_handle h)
 {
     return h ? ((vio_cocoa_window *)h)->monitor : -1;
@@ -1637,6 +1700,7 @@ static const vio_platform vio_platform_cocoa = {
     .available            = cocoa_available,
     .notify               = cocoa_notify,
     .set_progress         = cocoa_set_progress,
+    .set_tray             = cocoa_set_tray,
 };
 
 void vio_platform_cocoa_register(void)

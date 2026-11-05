@@ -15870,6 +15870,7 @@ ZEND_FUNCTION(vio_platform_info)
     add_assoc_bool(return_value, "popup_menu", p->popup_menu != NULL);
     add_assoc_bool(return_value, "notifications", vio_plat_can((const void *)p->notify, VIO_PLATFORM_FEATURE_NOTIFICATIONS));
     add_assoc_bool(return_value, "progress", vio_plat_can((const void *)p->set_progress, VIO_PLATFORM_FEATURE_PROGRESS));
+    add_assoc_bool(return_value, "tray", vio_plat_can((const void *)p->set_tray, VIO_PLATFORM_FEATURE_TRAY));
 }
 
 ZEND_FUNCTION(vio_set_cursor)
@@ -15918,6 +15919,41 @@ ZEND_FUNCTION(vio_set_cursor_image)
     RETURN_BOOL(VIO_PLAT_CALL(ctx, set_cursor_image, (const unsigned char *)ZSTR_VAL(rgba), (int)w, (int)h, (int)hx, (int)hy));
 }
 
+/* A list of ['data' => RGBA, 'width', 'height'] images (at most 16). 0 = fine,
+ * -1 = a ValueError has been thrown. */
+static int vio_parse_images(HashTable *list, vio_platform_image *imgs, int *count, uint32_t argn, const char *what)
+{
+    uint32_t n = zend_hash_num_elements(list);
+    *count = 0;
+    if (n > 16) {
+        zend_argument_value_error(argn, "%s must hold at most 16 images", what);
+        return -1;
+    }
+    uint32_t i = 0;
+    zval *entry;
+    ZEND_HASH_FOREACH_VAL(list, entry) {
+        zval *d, *wz, *hz;
+        if (Z_TYPE_P(entry) != IS_ARRAY
+            || !(d = zend_hash_str_find(Z_ARRVAL_P(entry), "data", 4)) || Z_TYPE_P(d) != IS_STRING
+            || !(wz = zend_hash_str_find(Z_ARRVAL_P(entry), "width", 5)) || Z_TYPE_P(wz) != IS_LONG
+            || !(hz = zend_hash_str_find(Z_ARRVAL_P(entry), "height", 6)) || Z_TYPE_P(hz) != IS_LONG) {
+            zend_argument_value_error(argn, "%s entry %u must be ['data' => string, 'width' => int, 'height' => int]", what, i);
+            return -1;
+        }
+        zend_long iw = Z_LVAL_P(wz), ih = Z_LVAL_P(hz);
+        if (iw < 1 || ih < 1 || iw > 1024 || ih > 1024 || Z_STRLEN_P(d) != (size_t)(iw * ih * 4)) {
+            zend_argument_value_error(argn, "%s entry %u must hold width * height * 4 bytes (RGBA), 1..1024 pixels a side", what, i);
+            return -1;
+        }
+        imgs[i].width = (int)iw;
+        imgs[i].height = (int)ih;
+        imgs[i].rgba = (const unsigned char *)Z_STRVAL_P(d);
+        i++;
+    } ZEND_HASH_FOREACH_END();
+    *count = (int)n;
+    return 0;
+}
+
 ZEND_FUNCTION(vio_set_window_icon)
 {
     zval *ctx_zval;
@@ -15927,36 +15963,11 @@ ZEND_FUNCTION(vio_set_window_icon)
         Z_PARAM_ARRAY_HT(list)
     ZEND_PARSE_PARAMETERS_END();
 
-    uint32_t n = zend_hash_num_elements(list);
-    if (n > 16) {
-        zend_argument_value_error(2, "must hold at most 16 images");
-        RETURN_THROWS();
-    }
     vio_platform_image imgs[16];
-    uint32_t i = 0;
-    zval *entry;
-    ZEND_HASH_FOREACH_VAL(list, entry) {
-        zval *d, *wz, *hz;
-        if (Z_TYPE_P(entry) != IS_ARRAY
-            || !(d = zend_hash_str_find(Z_ARRVAL_P(entry), "data", 4)) || Z_TYPE_P(d) != IS_STRING
-            || !(wz = zend_hash_str_find(Z_ARRVAL_P(entry), "width", 5)) || Z_TYPE_P(wz) != IS_LONG
-            || !(hz = zend_hash_str_find(Z_ARRVAL_P(entry), "height", 6)) || Z_TYPE_P(hz) != IS_LONG) {
-            zend_argument_value_error(2, "entry %u must be ['data' => string, 'width' => int, 'height' => int]", i);
-            RETURN_THROWS();
-        }
-        zend_long iw = Z_LVAL_P(wz), ih = Z_LVAL_P(hz);
-        if (iw < 1 || ih < 1 || iw > 1024 || ih > 1024 || Z_STRLEN_P(d) != (size_t)(iw * ih * 4)) {
-            zend_argument_value_error(2, "entry %u must hold width * height * 4 bytes (RGBA), 1..1024 pixels a side", i);
-            RETURN_THROWS();
-        }
-        imgs[i].width = (int)iw;
-        imgs[i].height = (int)ih;
-        imgs[i].rgba = (const unsigned char *)Z_STRVAL_P(d);
-        i++;
-    } ZEND_HASH_FOREACH_END();
-
+    int n;
+    if (vio_parse_images(list, imgs, &n, 2, "the list") < 0) RETURN_THROWS();
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_window_icon, (int)n, imgs));
+    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_window_icon, n, imgs));
 }
 
 ZEND_FUNCTION(vio_set_window_size_limits)
@@ -16433,6 +16444,90 @@ ZEND_FUNCTION(vio_set_progress)
     RETURN_BOOL(vio_plat()->set_progress(ctx->window, is_null ? -1.0 : value, is_null && st != VIO_PLATFORM_PROGRESS_INDETERMINATE ? VIO_PLATFORM_PROGRESS_NORMAL : st));
 }
 
+/* ── Tray (DESKTOP-APP-PLAN Phase 2c-2) ───────────────────────────────
+ * One icon per process; its callbacks and menu ids live here and are
+ * released at the end of the request. */
+static zval vio_tray_on_select, vio_tray_on_click, vio_tray_ids;
+static int vio_tray_shown;
+
+static void vio_tray_reset(void)
+{
+    zval_ptr_dtor(&vio_tray_on_select); ZVAL_UNDEF(&vio_tray_on_select);
+    zval_ptr_dtor(&vio_tray_on_click);  ZVAL_UNDEF(&vio_tray_on_click);
+    zval_ptr_dtor(&vio_tray_ids);       ZVAL_UNDEF(&vio_tray_ids);
+}
+
+void vio_tray_click_event(void)
+{
+    if (Z_TYPE(vio_tray_on_click) == IS_UNDEF) return;
+    zval retval;
+    if (call_user_function(NULL, NULL, &vio_tray_on_click, &retval, 0, NULL) == SUCCESS) zval_ptr_dtor(&retval);
+}
+
+void vio_tray_menu_event(int tag)
+{
+    if (Z_TYPE(vio_tray_on_select) == IS_UNDEF || Z_TYPE(vio_tray_ids) != IS_ARRAY) return;
+    zval *id = zend_hash_index_find(Z_ARRVAL(vio_tray_ids), (zend_ulong)tag);
+    if (!id) return;
+    zval retval, arg;
+    ZVAL_COPY(&arg, id);
+    if (call_user_function(NULL, NULL, &vio_tray_on_select, &retval, 1, &arg) == SUCCESS) zval_ptr_dtor(&retval);
+    zval_ptr_dtor(&arg);
+}
+
+ZEND_FUNCTION(vio_tray)
+{
+    HashTable *opts;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_tray_desc d;
+    memset(&d, 0, sizeof(d));
+    vio_platform_image imgs[16];
+    zval *z = zend_hash_str_find(opts, "icon", 4);
+    if (z && Z_TYPE_P(z) != IS_NULL) {
+        if (Z_TYPE_P(z) != IS_ARRAY) { zend_argument_value_error(1, "option 'icon' must be a list of images"); RETURN_THROWS(); }
+        if (vio_parse_images(Z_ARRVAL_P(z), imgs, &d.image_count, 1, "option 'icon'") < 0) RETURN_THROWS();
+        d.images = imgs;
+    }
+    if (vio_opt_string(opts, "tooltip", 1, &d.tooltip) < 0) RETURN_THROWS();
+    zval *sel = zend_hash_str_find(opts, "on_select", 9), *clk = zend_hash_str_find(opts, "on_click", 8);
+    if ((sel && Z_TYPE_P(sel) != IS_NULL && !zend_is_callable(sel, 0, NULL)) || (clk && Z_TYPE_P(clk) != IS_NULL && !zend_is_callable(clk, 0, NULL))) {
+        zend_argument_value_error(1, "options 'on_select' and 'on_click' must be callables");
+        RETURN_THROWS();
+    }
+    vio_menu_build b;
+    vio_menu_build_init(&b);
+    vio_menu_item *items = NULL;
+    zval *mz = zend_hash_str_find(opts, "menu", 4);
+    if (mz && Z_TYPE_P(mz) != IS_NULL) {
+        if (Z_TYPE_P(mz) != IS_ARRAY) { vio_menu_build_free(&b, 0); zend_argument_value_error(1, "option 'menu' must be a list of items"); RETURN_THROWS(); }
+        if (vio_menu_parse(&b, Z_ARRVAL_P(mz), 0, 0, &items, &d.menu_count, 1) < 0) { vio_menu_build_free(&b, 0); RETURN_THROWS(); }
+        d.menu = items;
+    }
+    if (!vio_plat_can((const void *)vio_plat()->set_tray, VIO_PLATFORM_FEATURE_TRAY)) { vio_menu_build_free(&b, 0); RETURN_FALSE; }
+    vio_tray_reset();
+    if (sel && Z_TYPE_P(sel) != IS_NULL) ZVAL_COPY(&vio_tray_on_select, sel);
+    if (clk && Z_TYPE_P(clk) != IS_NULL) ZVAL_COPY(&vio_tray_on_click, clk);
+    ZVAL_COPY(&vio_tray_ids, &b.ids);
+    int ok = vio_plat()->set_tray(&d);
+    vio_menu_build_free(&b, 0);
+    vio_tray_shown = ok;
+    if (!ok) vio_tray_reset();
+    RETURN_BOOL(ok);
+}
+
+ZEND_FUNCTION(vio_tray_remove)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    int was = vio_tray_shown;
+    if (vio_tray_shown && vio_plat()->set_tray) vio_plat()->set_tray(NULL);
+    vio_tray_shown = 0;
+    vio_tray_reset();
+    RETURN_BOOL(was);
+}
+
 /* 1 when s holds a control character (also NUL inside the string). */
 static int vio_has_control_chars(const zend_string *s)
 {
@@ -16852,6 +16947,10 @@ PHP_RSHUTDOWN_FUNCTION(vio)
     /* Virtual gamepads are process-global; a request must not leave one
      * behind for the next (FPM, long-running workers). */
     vio_virtual_gamepads_reset();
+    /* the tray icon and its callbacks belong to the request */
+    if (vio_tray_shown && vio_plat()->set_tray) vio_plat()->set_tray(NULL);
+    vio_tray_shown = 0;
+    vio_tray_reset();
     return SUCCESS;
 }
 

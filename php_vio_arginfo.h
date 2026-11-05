@@ -225,6 +225,13 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_progress, 0, 2, _IS_BOOL
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, state, IS_STRING, 0, "\"normal\"")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_tray, 0, 1, _IS_BOOL, 0)
+	ZEND_ARG_TYPE_INFO(0, options, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_tray_remove, 0, 0, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor_mode, 0, 2, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, mode, IS_LONG, 0)
@@ -1359,6 +1366,8 @@ ZEND_FUNCTION(vio_destroy);
 ZEND_FUNCTION(vio_should_close);
 ZEND_FUNCTION(vio_close);
 ZEND_FUNCTION(vio_poll_events);
+ZEND_FUNCTION(vio_tray_remove);
+ZEND_FUNCTION(vio_tray);
 ZEND_FUNCTION(vio_set_progress);
 ZEND_FUNCTION(vio_notify);
 ZEND_FUNCTION(vio_popup_menu);
@@ -1623,6 +1632,8 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_should_close, arginfo_vio_should_close)
 	ZEND_FE(vio_close, arginfo_vio_close)
 	ZEND_FE(vio_poll_events, arginfo_vio_poll_events)
+	ZEND_FE(vio_tray_remove, arginfo_vio_tray_remove)
+	ZEND_FE(vio_tray, arginfo_vio_tray)
 	ZEND_FE(vio_set_progress, arginfo_vio_set_progress)
 	ZEND_FE(vio_notify, arginfo_vio_notify)
 	ZEND_FE(vio_popup_menu, arginfo_vio_popup_menu)

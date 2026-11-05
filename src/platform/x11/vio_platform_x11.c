@@ -1050,6 +1050,7 @@ static void x11_poll_events(void)
         XNextEvent(x11_dpy, &ev);
         x11_dispatch(&ev);
     }
+    vio_linux_dispatch();   /* tray calls on the session bus */
 }
 
 static void x11_wait_events(double timeout)
@@ -1058,9 +1059,10 @@ static void x11_wait_events(double timeout)
     if (!vio_platform_wake_take()) {
         XFlush(x11_dpy);
         if (!XPending(x11_dpy)) {
-            struct pollfd fds[2] = { { .fd = ConnectionNumber(x11_dpy), .events = POLLIN },
-                                     { .fd = vio_platform_wake_fd(), .events = POLLIN } };
-            int n = fds[1].fd >= 0 ? 2 : 1, ms = vio_platform_timeout_ms(timeout);
+            struct pollfd fds[3] = { { .fd = ConnectionNumber(x11_dpy), .events = POLLIN },
+                                     { .fd = vio_platform_wake_fd(), .events = POLLIN },
+                                     { .fd = vio_linux_dbus_fd(), .events = POLLIN } };   /* tray clicks */
+            int n = 3, ms = vio_platform_timeout_ms(timeout);
             while (poll(fds, (nfds_t)n, ms) < 0 && errno == EINTR) {}
         }
         vio_platform_wake_take();
@@ -1802,6 +1804,7 @@ static const vio_platform vio_platform_x11 = {
     .file_dialog          = lx_file_dialog,
     .notify               = vio_linux_notify,
     .set_progress         = lx_set_progress,
+    .set_tray             = vio_linux_set_tray,
 };
 
 void vio_platform_x11_register(void)
