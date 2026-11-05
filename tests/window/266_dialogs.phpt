@@ -55,11 +55,18 @@ foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
     $env = getenv();
     $env['VIO_PLATFORM'] = $platform;
     $p = proc_open($cmd, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
-    $line = trim(stream_get_contents($pipes[1]));
-    $errout = trim(stream_get_contents($pipes[2]));
+    /* a dialog the hook cannot dismiss must not hang the suite: 30 s, then kill */
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+    $line = $errout = '';
+    $end = microtime(true) + 30;
+    while (proc_get_status($p)['running'] && microtime(true) < $end) { $line .= stream_get_contents($pipes[1]); $errout .= stream_get_contents($pipes[2]); usleep(50000); }
+    if (proc_get_status($p)['running']) { proc_terminate($p, 9); $errout .= ' (killed after 30 s: the dialog stayed open)'; }
+    $line = trim($line . stream_get_contents($pipes[1]));
+    $errout = trim($errout . stream_get_contents($pipes[2]));
     proc_close($p);
     if (str_starts_with($line, $platform . ' ')) $results[$platform] = substr($line, strlen($platform) + 1);
-    elseif ($platform === 'null') $results[$platform] = "no result: $line $errout";
+    elseif ($platform === 'null' || $platform === vio_platform()) $results[$platform] = "no result: $line $errout";
 }
 @unlink($file);
 @rmdir($dir);
