@@ -1,5 +1,5 @@
 --TEST--
-IME composition (DESKTOP-APP-PLAN Phase 3): vio_on_preedit gets the composition and its selection in codepoints ('' when done), vio_inject_preedit takes the same path, vio_ime_rect / vio_ime_enable return what the platform has; on Cocoa through the view's NSTextInputClient (setMarkedText -> preedit, insertText -> chars + '', firstRectForCharacterRange -> the vio_ime_rect size)
+IME composition (DESKTOP-APP-PLAN Phase 3): vio_on_preedit gets the composition and its selection in codepoints ('' when done), vio_inject_preedit takes the same path, vio_ime_rect / vio_ime_enable return what the platform has (Win32 IMM32, Cocoa, X11 XIM preedit callbacks, Wayland text-input-v3; not GLFW); on Cocoa through the view's NSTextInputClient (setMarkedText -> preedit, insertText -> chars + '', firstRectForCharacterRange -> the vio_ime_rect size)
 --EXTENSIONS--
 vio
 --FILE--
@@ -74,7 +74,7 @@ foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
 unlink($file);
 $bad = [];
 foreach ($results as $platform => $line) {
-    $has = in_array($platform, ['win32', 'cocoa'], true);
+    $has = in_array($platform, ['win32', 'cocoa', 'x11', 'wayland'], true);   // GLFW reports no composition
     $want = 'info ' . json_encode($has) . ' | inject [["にほ",1,2],["😀a",2,2],["",0,0]] ValueError ValueError | calls '
           . json_encode([$has, $has, $has]) . ' ValueError | os ';
     $os = str_starts_with($line, $want) ? substr($line, strlen($want)) : null;

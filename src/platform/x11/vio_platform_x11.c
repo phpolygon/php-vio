@@ -372,6 +372,10 @@ typedef struct _vio_x11_window {
     RRMode           saved_mode;
     unsigned char    keys_down[256];
     Cursor           cursor;                 /* client cursor, 0 = parent's */
+    unsigned int    *pre;                    /* IME composition (codepoints), XIM preedit callbacks */
+    int              pre_n, pre_cap, pre_caret;
+    int              ime_off;
+    XIMCallback      pre_cb[4];              /* start, done, draw, caret: client_data = this window */
     int              cursor_owned;           /* from an image: XFreeCursor */
     int              min_w, min_h, max_w, max_h, aspect_num, aspect_den;   /* 0 = none */
     vio_input_state *input;
@@ -577,6 +581,138 @@ static int x11_video_modes(int index, vio_video_mode *out, int max)
 /* ── Window lifecycle ─────────────────────────────────────────────── */
 
 static int x11_keytable_ready;
+
+/* ── IME composition: XIM preedit callbacks (DESKTOP-APP-PLAN Phase 3b) ── */
+
+static void x11_pre_report(vio_x11_window *w)
+{
+    char *u = (char *)malloc((size_t)w->pre_n * 4 + 1);
+    if (!u) return;
+    size_t k = 0;
+    for (int i = 0; i < w->pre_n; i++) {   /* UTF-32 -> UTF-8 */
+        unsigned int c = w->pre[i];
+        if (c < 0x80) u[k++] = (char)c;
+        else if (c < 0x800) { u[k++] = (char)(0xC0 | (c >> 6)); u[k++] = (char)(0x80 | (c & 0x3F)); }
+        else if (c < 0x10000) { u[k++] = (char)(0xE0 | (c >> 12)); u[k++] = (char)(0x80 | ((c >> 6) & 0x3F)); u[k++] = (char)(0x80 | (c & 0x3F)); }
+        else { u[k++] = (char)(0xF0 | (c >> 18)); u[k++] = (char)(0x80 | ((c >> 12) & 0x3F)); u[k++] = (char)(0x80 | ((c >> 6) & 0x3F)); u[k++] = (char)(0x80 | (c & 0x3F)); }
+    }
+    u[k] = 0;
+    int caret = w->pre_caret < 0 ? 0 : (w->pre_caret > w->pre_n ? w->pre_n : w->pre_caret);
+    vio_input_preedit_event(w->input, u, w->pre_n ? caret : 0, w->pre_n ? caret : 0);
+    free(u);
+}
+
+static int x11_pre_start(XIC ic, XPointer data, XPointer call)
+{
+    (void)ic; (void)call;
+    vio_x11_window *w = (vio_x11_window *)data;
+    w->pre_n = 0;
+    w->pre_caret = 0;
+    return -1;   /* no length limit */
+}
+
+static void x11_pre_done(XIC ic, XPointer data, XPointer call)
+{
+    (void)ic; (void)call;
+    vio_x11_window *w = (vio_x11_window *)data;
+    if (w->pre_n) { w->pre_n = 0; vio_input_preedit_event(w->input, "", 0, 0); }
+}
+
+/* replace chg_length characters at chg_first with the callback's text */
+static void x11_pre_draw(XIC ic, XPointer data, XPointer call)
+{
+    (void)ic;
+    vio_x11_window *w = (vio_x11_window *)data;
+    XIMPreeditDrawCallbackStruct *d = (XIMPreeditDrawCallbackStruct *)call;
+    if (!d) return;
+    unsigned int ins[256];
+    int ins_n = 0;
+    if (d->text) {
+        if (d->text->encoding_is_wchar) {
+            for (int i = 0; i < d->text->length && ins_n < 256 && d->text->string.wide_char; i++) ins[ins_n++] = (unsigned int)d->text->string.wide_char[i];
+        } else if (d->text->string.multi_byte) {   /* the locale's multibyte text */
+            wchar_t wc[256];
+            size_t n = mbstowcs(wc, d->text->string.multi_byte, 256);
+            for (size_t i = 0; n != (size_t)-1 && i < n && ins_n < 256; i++) ins[ins_n++] = (unsigned int)wc[i];
+        }
+    }
+    int first = d->chg_first < 0 ? 0 : (d->chg_first > w->pre_n ? w->pre_n : d->chg_first);
+    int del = d->chg_length < 0 ? 0 : (first + d->chg_length > w->pre_n ? w->pre_n - first : d->chg_length);
+    int n = w->pre_n - del + ins_n;
+    if (n > w->pre_cap) {
+        unsigned int *g = (unsigned int *)realloc(w->pre, (size_t)n * sizeof(unsigned int));
+        if (!g) return;
+        w->pre = g;
+        w->pre_cap = n;
+    }
+    memmove(w->pre + first + ins_n, w->pre + first + del, (size_t)(w->pre_n - first - del) * sizeof(unsigned int));
+    memcpy(w->pre + first, ins, (size_t)ins_n * sizeof(unsigned int));
+    w->pre_n = n;
+    w->pre_caret = d->caret;
+    x11_pre_report(w);
+}
+
+static void x11_pre_caret(XIC ic, XPointer data, XPointer call)
+{
+    (void)ic;
+    vio_x11_window *w = (vio_x11_window *)data;
+    XIMPreeditCaretCallbackStruct *c = (XIMPreeditCaretCallbackStruct *)call;
+    if (!c) return;
+    if (c->direction == XIMAbsolutePosition) w->pre_caret = c->position;
+    else if (c->direction == XIMForwardChar) w->pre_caret++;
+    else if (c->direction == XIMBackwardChar) w->pre_caret--;
+    x11_pre_report(w);
+}
+
+/* An input context with preedit callbacks when the input method offers
+ * them (the app draws the composition), else one that composes on its own. */
+static XIC x11_create_ic(vio_x11_window *w)
+{
+    XIMStyles *styles = NULL;
+    int callbacks = 0;
+    if (!XGetIMValues(x11_im, XNQueryInputStyle, &styles, NULL) && styles) {
+        for (int i = 0; i < styles->count_styles; i++)
+            if (styles->supported_styles[i] == (XIMPreeditCallbacks | XIMStatusNothing)) callbacks = 1;
+        XFree(styles);
+    }
+    if (callbacks) {
+        w->pre_cb[0].client_data = (XPointer)w; w->pre_cb[0].callback = (XIMProc)(void *)x11_pre_start;
+        w->pre_cb[1].client_data = (XPointer)w; w->pre_cb[1].callback = (XIMProc)x11_pre_done;
+        w->pre_cb[2].client_data = (XPointer)w; w->pre_cb[2].callback = (XIMProc)x11_pre_draw;
+        w->pre_cb[3].client_data = (XPointer)w; w->pre_cb[3].callback = (XIMProc)x11_pre_caret;
+        XVaNestedList attrs = XVaCreateNestedList(0, XNPreeditStartCallback, &w->pre_cb[0], XNPreeditDoneCallback, &w->pre_cb[1],
+                                                  XNPreeditDrawCallback, &w->pre_cb[2], XNPreeditCaretCallback, &w->pre_cb[3], NULL);
+        XIC ic = XCreateIC(x11_im, XNInputStyle, XIMPreeditCallbacks | XIMStatusNothing, XNClientWindow, w->win,
+                           XNFocusWindow, w->win, XNPreeditAttributes, attrs, NULL);
+        XFree(attrs);
+        if (ic) return ic;
+    }
+    return XCreateIC(x11_im, XNInputStyle, XIMPreeditNothing | XIMStatusNothing, XNClientWindow, w->win, XNFocusWindow, w->win, NULL);
+}
+
+static int x11_set_ime_rect(vio_window_handle h, int x, int y, int width, int height)
+{
+    vio_x11_window *w = (vio_x11_window *)h;
+    if (!w || !w->ic) return w != NULL;
+    (void)width;
+    XPoint spot = { (short)x, (short)(y + height) };   /* the baseline below the text */
+    XVaNestedList attrs = XVaCreateNestedList(0, XNSpotLocation, &spot, NULL);
+    XSetICValues(w->ic, XNPreeditAttributes, attrs, NULL);   /* honoured by input methods that place their window */
+    XFree(attrs);
+    return 1;
+}
+
+static int x11_set_ime_enabled(vio_window_handle h, int enabled)
+{
+    vio_x11_window *w = (vio_x11_window *)h;
+    if (!w) return 0;
+    w->ime_off = !enabled;
+    if (w->ic) {
+        if (enabled) XSetICFocus(w->ic);
+        else { XUnsetICFocus(w->ic); if (w->pre_n) { w->pre_n = 0; vio_input_preedit_event(w->input, "", 0, 0); } }
+    }
+    return 1;
+}
 static Cursor x11_shape_cursor[VIO_PLATFORM_SHAPE_COUNT];   /* shared standard cursors */
 
 static int x11_init(void)
@@ -691,8 +827,7 @@ static vio_window_handle x11_create_window(vio_config *cfg, const char *backend_
     Xutf8SetWMProperties(x11_dpy, w->win, title, title, NULL, 0, NULL, NULL, NULL);
     if (!w->decorated) x11_set_decorations(w, 0);
     if (x11_im) {
-        w->ic = XCreateIC(x11_im, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
-                          XNClientWindow, w->win, XNFocusWindow, w->win, NULL);
+        w->ic = x11_create_ic(w);
         if (w->ic) {
             unsigned long filter = 0;
             if (XGetICValues(w->ic, XNFilterEvents, &filter, NULL) == NULL) {
@@ -782,6 +917,7 @@ static void x11_destroy_window(vio_window_handle h)
     if (w->ic) XDestroyIC(w->ic);
     XDeleteContext(x11_dpy, w->win, x11_ctx);
     if (w->cursor_owned && w->cursor) XFreeCursor(x11_dpy, w->cursor);
+    free(w->pre);
     XDestroyWindow(x11_dpy, w->win);
     XFreeColormap(x11_dpy, w->cmap);
     XFlush(x11_dpy);
@@ -987,7 +1123,11 @@ static void x11_dnd_selection(vio_x11_window *w, XSelectionEvent *se)
 
 static void x11_dispatch(XEvent *ev)
 {
-    if (XFilterEvent(ev, None)) return;   /* input method */
+    vio_x11_window *fw = NULL;
+    if ((ev->type == KeyPress || ev->type == KeyRelease) && XFindContext(x11_dpy, ev->xany.window, x11_ctx, (XPointer *)&fw) == 0
+        && fw && fw->ime_off) {
+        /* IME off (vio_ime_enable): the key goes straight to the game */
+    } else if (XFilterEvent(ev, None)) return;   /* input method */
     if (x11_clip_event(ev)) return;       /* clipboard requests to the helper window */
     vio_x11_window *w = NULL;
     if (XFindContext(x11_dpy, ev->xany.window, x11_ctx, (XPointer *)&w) != 0 || !w) return;
@@ -1805,6 +1945,9 @@ static const vio_platform vio_platform_x11 = {
     .notify               = vio_linux_notify,
     .set_progress         = lx_set_progress,
     .set_tray             = vio_linux_set_tray,
+    .ime_preedit          = 1,
+    .set_ime_rect         = x11_set_ime_rect,
+    .set_ime_enabled      = x11_set_ime_enabled,
 };
 
 void vio_platform_x11_register(void)

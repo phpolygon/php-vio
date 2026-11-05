@@ -514,7 +514,8 @@ if test "$PHP_VIO" != "no"; then
             for vio_wl_p in stable/xdg-shell/xdg-shell \
                             unstable/xdg-decoration/xdg-decoration-unstable-v1 \
                             unstable/relative-pointer/relative-pointer-unstable-v1 \
-                            unstable/pointer-constraints/pointer-constraints-unstable-v1; do
+                            unstable/pointer-constraints/pointer-constraints-unstable-v1 \
+                            unstable/text-input/text-input-unstable-v3; do
               vio_wl_n=`basename $vio_wl_p`
               "$VIO_WL_SCANNER" client-header "$VIO_WL_PROTOCOLS/$vio_wl_p.xml" "$VIO_WL_GEN/$vio_wl_n-client-protocol.h" || vio_wl_ok=no
               "$VIO_WL_SCANNER" private-code "$VIO_WL_PROTOCOLS/$vio_wl_p.xml" "$VIO_WL_GEN/$vio_wl_n-protocol.c" || vio_wl_ok=no
