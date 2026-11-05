@@ -144,9 +144,13 @@ static int glfw_init(void)
 
     glfw_initialized = 1;
     /* GLFW has no window icons on macOS and Wayland (GLFW_FEATURE_UNAVAILABLE) */
+#ifdef GLFW_PLATFORM_COCOA   /* GLFW 3.4 */
     if (glfwGetPlatform() == GLFW_PLATFORM_COCOA || glfwGetPlatform() == GLFW_PLATFORM_WAYLAND) {
         vio_platform_glfw.set_window_icon = NULL;
     }
+#elif defined(__APPLE__)     /* GLFW 3.3 decides at build time: no icons on macOS */
+    vio_platform_glfw.set_window_icon = NULL;
+#endif
     return 1;
 }
 
@@ -469,11 +473,19 @@ static void glfw_restore(vio_window_handle w)
 static int glfw_set_cursor_shape(vio_window_handle w, int shape)
 {
     if (!w || shape < 0 || shape >= VIO_PLATFORM_SHAPE_COUNT) return 0;
+#ifdef GLFW_RESIZE_NWSE_CURSOR   /* GLFW 3.4 */
     static const int ids[VIO_PLATFORM_SHAPE_COUNT] = {
         GLFW_ARROW_CURSOR, GLFW_IBEAM_CURSOR, GLFW_CROSSHAIR_CURSOR, GLFW_POINTING_HAND_CURSOR,
         GLFW_RESIZE_EW_CURSOR, GLFW_RESIZE_NS_CURSOR, GLFW_RESIZE_NWSE_CURSOR, GLFW_RESIZE_NESW_CURSOR,
         GLFW_RESIZE_ALL_CURSOR, GLFW_NOT_ALLOWED_CURSOR,
     };
+#else                            /* GLFW 3.3: no diagonal, move or not-allowed cursors, the arrow stands in */
+    static const int ids[VIO_PLATFORM_SHAPE_COUNT] = {
+        GLFW_ARROW_CURSOR, GLFW_IBEAM_CURSOR, GLFW_CROSSHAIR_CURSOR, GLFW_HAND_CURSOR,
+        GLFW_HRESIZE_CURSOR, GLFW_VRESIZE_CURSOR, GLFW_ARROW_CURSOR, GLFW_ARROW_CURSOR,
+        GLFW_ARROW_CURSOR, GLFW_ARROW_CURSOR,
+    };
+#endif
     if (!glfw_std_cursor[shape]) {
         GLFWerrorfun prev = glfwSetErrorCallback(NULL);   /* shapes the system lacks are an error, not a warning */
         glfw_std_cursor[shape] = glfwCreateStandardCursor(ids[shape]);
