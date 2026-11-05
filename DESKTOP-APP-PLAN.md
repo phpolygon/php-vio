@@ -236,8 +236,11 @@ vio_key_pressed($tool, VIO_KEY_A);   // Eingabe-Funktionen nehmen VioContext|Vio
     in eine Warteschlange, `vio_poll_events` / `vio_wait_events` stellen sie zu (`vio_wake` weckt dafür). Linux: AT-SPI-
     Adapter (`accesskit_unix_adapter`, unabhängig von X11/Wayland/GLFW), Fensterlage über `set_root_window_bounds`,
     Fokus aus dem Input-Funnel. Ohne AccessKit wird der Vertrag geprüft und `false` geliefert.
-  - **5b:** Windows (UIA: `accesskit_windows_adapter`, `WM_GETOBJECT` und Fokus aus der WndProc, Bounds in physischen
-    Pixeln).
+  - **5b ✅:** Windows (UIA): `accesskit_windows_adapter` (der Subclassing-Adapter bricht bei sichtbaren Fenstern ab),
+    `WM_GETOBJECT` aus der WndProc der Win32-Plattform (`vio_a11y_win32_getobject`), Fokus aus dem Input-Funnel; GLFW auf
+    Windows meldet `accessibility` = false. Die Wurzel trägt den Content-Scale als Transformation (AccessKit rechnet in
+    Pixeln, vio logisch). `config.w32` `--with-accesskit=DIR` (statische MSVC-Bibliothek + `bcrypt`, `ntdll`, `propsys`,
+    `runtimeobject`, `uiautomationcore`, `userenv`, `ws2_32`). Test 273 fragt über PowerShells UIAutomationClient ab.
   - **5c:** macOS (Subclassing-Adapter an der View; Abfrage im Test braucht die Bedienungshilfen-Freigabe).
 - Wayland ist abgedeckt, weil AT-SPI nicht am Fenstersystem hängt.
 - **Tests (273, 274):** Baum anlegen/ändern/Fokus; danach vom Kindprozess abfragen: Windows über UIA

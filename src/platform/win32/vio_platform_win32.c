@@ -37,6 +37,7 @@
 #endif
 
 #include "../../../include/vio_platform.h"
+#include "../../vio_a11y.h"
 #include "../../../include/vio_constants.h"
 #include "../../vio_input.h"
 #include "../vio_shell.h"
@@ -368,6 +369,11 @@ static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_CLOSE:
             if (vio_input_close_request(w->input)) w->should_close = 1;
             return 0;
+        case WM_GETOBJECT: {   /* screen readers: the window's accessibility tree (vio_a11y.c) */
+            intptr_t r = 0;
+            if (w->input && vio_a11y_win32_getobject(w->input, (uintptr_t)wp, (intptr_t)lp, &r)) return (LRESULT)r;
+            break;
+        }
         case WM_SETFOCUS:
             vio_input_focus_event(w->input, 1);
             break;

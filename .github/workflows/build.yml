@@ -777,6 +777,20 @@ jobs:
           Copy-Item -Force "$hb\lib\harfbuzz.lib" deps\lib\
           Copy-Item -Force "$hb\bin\*.dll" deps\bin\
 
+      # AccessKit (vio_a11y_update): the accesskit-c release package, checked
+      # against its digest; only the static MSVC library is linked.
+      - name: Fetch AccessKit
+        shell: pwsh
+        env:
+          AK_VERSION: '0.23.1'
+          AK_SHA256: '35b7ca8a6f1e038b5da35e1e9e5a0adaed9bfcf21e1496d29598fbbadcc7043f'
+        run: |
+          $zip = "deps\accesskit.zip"
+          Invoke-WebRequest -Uri "https://github.com/AccessKit/accesskit-c/releases/download/$env:AK_VERSION/accesskit-c-$env:AK_VERSION.zip" -OutFile $zip
+          $sum = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($sum -ne $env:AK_SHA256) { throw "accesskit-c digest mismatch: $sum" }
+          Expand-Archive -Path $zip -DestinationPath deps -Force
+
       - name: Enable Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1
 
@@ -792,6 +806,7 @@ jobs:
             --with-spirv-cross=deps ^
             --with-ffmpeg=deps ^
             --with-harfbuzz=deps ^
+            --with-accesskit=deps\accesskit-c-0.23.1 ^
             --with-d3d11=yes ^
             --with-d3d12=yes ^
             --with-prefix=${{ steps.php-sdk.outputs.prefix }}
@@ -832,6 +847,7 @@ jobs:
           $env:NO_INTERACTION = "1"
           $env:REPORT_EXIT_STATUS = "1"
           $env:TEST_PHP_ARGS = "-n -d extension_dir=$dllDir -d extension=php_vio.dll"
+          $env:VIO_REQUIRE_A11Y = "1"   # AccessKit is built in: test 273 must reach UI Automation
           php -n run-tests.php -q --show-diff tests/
       # Run the Path B vertex-storage tests on the native Windows backends
       # (D3D11/D3D12 via WARP). Only the NTS variant: shivammathur/setup-php

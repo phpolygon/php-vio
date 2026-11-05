@@ -13,6 +13,7 @@
 #define VIO_A11Y_H
 
 #include "php.h"
+#include <stdint.h>
 
 struct _vio_input_state;
 
@@ -29,6 +30,9 @@ void vio_a11y_dispatch(struct _vio_input_state *in);
 
 /* The window gained / lost focus (from the input funnel). */
 void vio_a11y_focus(struct _vio_input_state *in, int focused);
+
+/* Win32 WndProc: answer WM_GETOBJECT for the window's tree. 1 = *result is the reply. */
+int  vio_a11y_win32_getobject(struct _vio_input_state *in, uintptr_t wparam, intptr_t lparam, intptr_t *result);
 
 /* Free the window's tree and adapter (before its platform window goes). */
 void vio_a11y_free(struct _vio_input_state *in);
