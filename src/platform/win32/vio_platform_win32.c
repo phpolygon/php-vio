@@ -1042,24 +1042,24 @@ static int w32_set_window_icon(vio_window_handle h, int count, const vio_platfor
 {
     vio_win32_window *w = (vio_win32_window *)h;
     if (!w) return 0;
-    HICON big = NULL, small = NULL;
+    HICON icon_b = NULL, icon_s = NULL;
     if (count > 0) {
         const vio_platform_image *b = &images[w32_pick_icon(count, images, GetSystemMetrics(SM_CXICON))];
         const vio_platform_image *s = &images[w32_pick_icon(count, images, GetSystemMetrics(SM_CXSMICON))];
-        big = w32_create_icon(b->rgba, b->width, b->height, 0, 0, TRUE);
-        small = w32_create_icon(s->rgba, s->width, s->height, 0, 0, TRUE);
-        if (!big || !small) {
-            if (big) DestroyIcon(big);
-            if (small) DestroyIcon(small);
+        icon_b = w32_create_icon(b->rgba, b->width, b->height, 0, 0, TRUE);
+        icon_s = w32_create_icon(s->rgba, s->width, s->height, 0, 0, TRUE);
+        if (!icon_b || !icon_s) {
+            if (icon_b) DestroyIcon(icon_b);
+            if (icon_s) DestroyIcon(icon_s);
             return 0;
         }
     }
-    SendMessageW(w->hwnd, WM_SETICON, ICON_BIG, (LPARAM)big);
-    SendMessageW(w->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small);
+    SendMessageW(w->hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon_b);
+    SendMessageW(w->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon_s);
     if (w->icon_big) DestroyIcon(w->icon_big);
     if (w->icon_small) DestroyIcon(w->icon_small);
-    w->icon_big = big;
-    w->icon_small = small;
+    w->icon_big = icon_b;
+    w->icon_small = icon_s;
     return 1;
 }
 
