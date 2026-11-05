@@ -1160,23 +1160,39 @@ static const GUID w32_IID_IFileSaveDialog  = { 0x84BCCD23, 0x5FDE, 0x4CDB, { 0xA
 static const GUID w32_IID_IShellItem       = { 0x43826D1E, 0xE718, 0x42EE, { 0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE } };
 
 /* VIO_TEST_DIALOG (tests only): a thread timer the dialog's modal loop
- * dispatches; it posts the chosen command to the dialog once it is up. */
+ * dispatches. A file dialog is closed through its own interface (Close for
+ * cancel, IDOK to the window IOleWindow names for accept); a message box gets
+ * the button's command. Each tick tries again until the dialog is gone. */
+static const GUID w32_IID_IOleWindow = { 0x00000114, 0x0000, 0x0000, { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
 static UINT w32_test_cmd;
+static int w32_test_cancel, w32_test_ticks;
 static UINT_PTR w32_test_timer;
+static IFileDialog *w32_test_fd;   /* the file dialog being shown, if any */
 static BOOL CALLBACK w32_find_dialog(HWND hwnd, LPARAM lp)
 {
     WCHAR cls[16];
-    if (IsWindowVisible(hwnd) && GetClassNameW(hwnd, cls, 16) && wcscmp(cls, L"#32770") == 0) { *(HWND *)lp = hwnd; return FALSE; }
+    if (GetClassNameW(hwnd, cls, 16) && wcscmp(cls, L"#32770") == 0) { *(HWND *)lp = hwnd; return FALSE; }
     return TRUE;
 }
 static VOID CALLBACK w32_test_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
 {
-    (void)hwnd; (void)msg; (void)time;
+    (void)hwnd; (void)msg; (void)id; (void)time;
+    w32_test_ticks++;
+    if (w32_test_fd) {
+        if (w32_test_cancel) { w32_test_fd->lpVtbl->Close(w32_test_fd, HRESULT_FROM_WIN32(ERROR_CANCELLED)); return; }
+        IOleWindow *ow = NULL;
+        HWND dlg = NULL;
+        if (SUCCEEDED(w32_test_fd->lpVtbl->QueryInterface(w32_test_fd, &w32_IID_IOleWindow, (void **)&ow)) && ow) {
+            ow->lpVtbl->GetWindow(ow, &dlg);
+            ow->lpVtbl->Release(ow);
+        }
+        if (dlg) PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+        if (w32_test_ticks > 20) w32_test_fd->lpVtbl->Close(w32_test_fd, HRESULT_FROM_WIN32(ERROR_CANCELLED));   /* never hang a test */
+        return;
+    }
     HWND dlg = NULL;
     EnumThreadWindows(GetCurrentThreadId(), w32_find_dialog, (LPARAM)&dlg);
-    if (!dlg) return;   /* not up yet: the timer fires again */
-    KillTimer(NULL, id);
-    w32_test_timer = 0;
+    if (!dlg) return;   /* not up yet */
     PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(w32_test_cmd, BN_CLICKED), 0);
 }
 static void w32_test_dialog_arm(UINT cmd_cancel, UINT cmd_accept, const UINT *buttons, int count)
@@ -1185,11 +1201,14 @@ static void w32_test_dialog_arm(UINT cmd_cancel, UINT cmd_accept, const UINT *bu
     if (!vio_platform_test_dialog(&ms, &action)) return;
     w32_test_cmd = action == -1 ? cmd_cancel : action == -2 ? cmd_accept
                  : (buttons && action >= 0 && action < count ? buttons[action] : cmd_cancel);
-    w32_test_timer = SetTimer(NULL, 0, (UINT)(ms > 0 ? ms : 1), w32_test_timer_proc);
+    w32_test_cancel = action == -1;
+    w32_test_ticks = 0;
+    w32_test_timer = SetTimer(NULL, 0, (UINT)(ms > 0 ? ms : 1), w32_test_timer_proc);   /* repeats until disarmed */
 }
 static void w32_test_dialog_disarm(void)
 {
     if (w32_test_timer) { KillTimer(NULL, w32_test_timer); w32_test_timer = 0; }
+    w32_test_fd = NULL;
 }
 
 static char *w32_utf8(const WCHAR *w)
@@ -1283,6 +1302,7 @@ static int w32_file_dialog(vio_window_handle h, const vio_file_dialog_desc *d, c
     }
 
     w32_test_dialog_arm(IDCANCEL, IDOK, NULL, 0);
+    if (w32_test_timer) w32_test_fd = fd;
     HRESULT hr = fd->lpVtbl->Show(fd, owner);
     w32_test_dialog_disarm();
     if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) { ok = 1; goto done; }
