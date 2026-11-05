@@ -1187,16 +1187,22 @@ static VOID CALLBACK w32_test_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD
     (void)hwnd; (void)msg; (void)id; (void)time;
     w32_test_ticks++;
     if (w32_test_fd) {
-        if (w32_test_cancel) {
-            HRESULT hr = w32_test_fd->lpVtbl->Close(w32_test_fd, HRESULT_FROM_WIN32(ERROR_CANCELLED));
-            w32_test_trace("file dialog close", (void *)w32_test_fd, (void *)(intptr_t)hr);
-            return;
-        }
         IOleWindow *ow = NULL;
         HWND dlg = NULL;
         if (SUCCEEDED(w32_test_fd->lpVtbl->QueryInterface(w32_test_fd, &w32_IID_IOleWindow, (void **)&ow)) && ow) {
             ow->lpVtbl->GetWindow(ow, &dlg);
             ow->lpVtbl->Release(ow);
+        }
+        if (!dlg) EnumThreadWindows(GetCurrentThreadId(), w32_find_dialog, (LPARAM)&dlg);
+        if (w32_test_cancel) {
+            /* Close alone reported success and left the dialog open on CI: the window gets the commands too */
+            HRESULT hr = w32_test_fd->lpVtbl->Close(w32_test_fd, HRESULT_FROM_WIN32(ERROR_CANCELLED));
+            w32_test_trace("file dialog cancel", (void *)dlg, (void *)(intptr_t)hr);
+            if (dlg) {
+                PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+                PostMessageW(dlg, WM_CLOSE, 0, 0);
+            }
+            return;
         }
         w32_test_trace("file dialog accept", (void *)w32_test_fd, (void *)dlg);
         if (dlg) PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
