@@ -148,6 +148,30 @@ static void cocoa_report_size(vio_cocoa_window *w)
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
 - (BOOL)wantsUpdateLayer { return YES; }
 
+/* File drops (NSDraggingDestination) */
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender
+{
+    return [sender.draggingPasteboard canReadObjectForClasses:@[[NSURL class]]
+                                                      options:@{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }]
+        ? NSDragOperationCopy : NSDragOperationNone;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender
+{
+    vio_cocoa_window *w = self.owner;
+    NSArray<NSURL *> *urls = [sender.draggingPasteboard readObjectsForClasses:@[[NSURL class]]
+                                                                      options:@{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }];
+    if (!w || urls.count == 0) return NO;
+    NSPoint p = [self convertPoint:sender.draggingLocation fromView:nil];   /* flipped: y from the top */
+    const char **paths = (const char **)calloc(urls.count, sizeof(char *));
+    if (!paths) return NO;
+    int n = 0;
+    for (NSURL *u in urls) if (u.fileSystemRepresentation) paths[n++] = u.fileSystemRepresentation;
+    vio_input_drop_event(w->input, n, paths, p.x, p.y);
+    free(paths);
+    return YES;
+}
+
 - (void)resetCursorRects
 {
     vio_cocoa_window *w = self.owner;
@@ -500,6 +524,7 @@ static vio_window_handle cocoa_create_window(vio_config *cfg, const char *backen
         win.acceptsMouseMovedEvents = YES;
         VioCocoaView *view = [[VioCocoaView alloc] initWithFrame:rect];
         view.owner = w;
+        [view registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
         view.wantsBestResolutionOpenGLSurface = YES;
         win.contentView = view;
         [win makeFirstResponder:view];
@@ -1286,6 +1311,7 @@ static const vio_platform vio_platform_cocoa = {
     .set_opacity          = cocoa_set_opacity,
     .open_url             = cocoa_open_url,
     .reveal_file          = cocoa_reveal_file,
+    .accepts_drops        = 1,
 };
 
 void vio_platform_cocoa_register(void)

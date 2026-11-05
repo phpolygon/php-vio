@@ -1154,6 +1154,40 @@ ZEND_FUNCTION(vio_on_focus)    { vio_set_window_callback(INTERNAL_FUNCTION_PARAM
 ZEND_FUNCTION(vio_on_minimize) { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_MINIMIZE); }
 ZEND_FUNCTION(vio_on_scale)    { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_SCALE); }
 ZEND_FUNCTION(vio_on_refresh)  { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_REFRESH); }
+ZEND_FUNCTION(vio_on_drop)     { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_DROP); }
+
+/* Files dropped through the same funnel as the platform's drop. */
+ZEND_FUNCTION(vio_inject_drop)
+{
+    zval *ctx_zval;
+    HashTable *list;
+    double x = 0.0, y = 0.0;
+    ZEND_PARSE_PARAMETERS_START(2, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(list)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_DOUBLE(x)
+        Z_PARAM_DOUBLE(y)
+    ZEND_PARSE_PARAMETERS_END();
+    uint32_t n = zend_hash_num_elements(list);
+    if (n == 0 || n > 4096) {
+        zend_argument_value_error(2, "must hold 1 to 4096 paths");
+        RETURN_THROWS();
+    }
+    const char **paths = (const char **)safe_emalloc(n, sizeof(char *), 0);
+    uint32_t i = 0;
+    zval *entry;
+    ZEND_HASH_FOREACH_VAL(list, entry) {
+        if (Z_TYPE_P(entry) != IS_STRING || !Z_STRLEN_P(entry) || memchr(Z_STRVAL_P(entry), 0, Z_STRLEN_P(entry))) {
+            efree(paths);
+            zend_argument_value_error(2, "must hold non-empty strings without NUL bytes");
+            RETURN_THROWS();
+        }
+        paths[i++] = Z_STRVAL_P(entry);
+    } ZEND_HASH_FOREACH_END();
+    vio_input_drop_event(&Z_VIO_CONTEXT_P(ctx_zval)->input, (int)n, paths, x, y);
+    efree(paths);
+}
 
 
 
@@ -15821,6 +15855,7 @@ ZEND_FUNCTION(vio_platform_info)
     add_assoc_bool(return_value, "opacity", p->set_opacity != NULL);
     add_assoc_bool(return_value, "open_url", p->open_url != NULL);
     add_assoc_bool(return_value, "reveal_file", p->reveal_file != NULL);
+    add_assoc_bool(return_value, "file_drop", p->accepts_drops != 0);
 }
 
 ZEND_FUNCTION(vio_set_cursor)

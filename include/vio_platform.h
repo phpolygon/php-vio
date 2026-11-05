@@ -201,6 +201,11 @@ typedef struct _vio_platform {
      * path: exists (checked by the caller). */
     int   (*open_url)(const char *utf8_url);
     int   (*reveal_file)(const char *utf8_path);
+
+    /* ── Desktop integration (DESKTOP-APP-PLAN Phase 2) ──────────────────
+     * File drops need no slot to start them: a platform that accepts them
+     * sets accepts_drops and reports each drop through vio_input_drop_event. */
+    int   accepts_drops;
 } vio_platform;
 
 /* Registry (src/vio_platform_registry.c): platforms register in MINIT; the

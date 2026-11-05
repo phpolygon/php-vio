@@ -50,6 +50,7 @@
 #include "../../../include/vio_constants.h"
 #include "../../vio_input.h"
 #include "../vio_shell.h"
+#include "../linux/vio_uri_list.h"
 #include <X11/cursorfont.h>
 
 /* ── Display, errors ──────────────────────────────────────────────── */
@@ -62,6 +63,10 @@ static XIM      x11_im;
 static int      x11_error_code;
 static Atom     x11_wm_delete, x11_wm_protocols, x11_net_wm_state, x11_net_fullscreen,
                 x11_net_max_h, x11_net_max_v, x11_motif_hints, x11_net_workarea, x11_net_active, x11_wm_state;
+/* XDND (file drops, protocol version 5) */
+static Atom     x11_xdnd_aware, x11_xdnd_enter, x11_xdnd_position, x11_xdnd_status, x11_xdnd_leave, x11_xdnd_drop,
+                x11_xdnd_finished, x11_xdnd_selection, x11_xdnd_type_list, x11_xdnd_copy, x11_uri_list;
+static struct { Window source; int version; int accept; double x, y; } x11_dnd;
 static Cursor   x11_blank_cursor;
 static int      x11_randr, x11_randr_event;
 
@@ -87,6 +92,17 @@ static int x11_open(void)
     x11_wm_delete      = XInternAtom(x11_dpy, "WM_DELETE_WINDOW", False);
     x11_wm_protocols   = XInternAtom(x11_dpy, "WM_PROTOCOLS", False);
     x11_wm_state       = XInternAtom(x11_dpy, "WM_STATE", False);
+    x11_xdnd_aware     = XInternAtom(x11_dpy, "XdndAware", False);
+    x11_xdnd_enter     = XInternAtom(x11_dpy, "XdndEnter", False);
+    x11_xdnd_position  = XInternAtom(x11_dpy, "XdndPosition", False);
+    x11_xdnd_status    = XInternAtom(x11_dpy, "XdndStatus", False);
+    x11_xdnd_leave     = XInternAtom(x11_dpy, "XdndLeave", False);
+    x11_xdnd_drop      = XInternAtom(x11_dpy, "XdndDrop", False);
+    x11_xdnd_finished  = XInternAtom(x11_dpy, "XdndFinished", False);
+    x11_xdnd_selection = XInternAtom(x11_dpy, "XdndSelection", False);
+    x11_xdnd_type_list = XInternAtom(x11_dpy, "XdndTypeList", False);
+    x11_xdnd_copy      = XInternAtom(x11_dpy, "XdndActionCopy", False);
+    x11_uri_list       = XInternAtom(x11_dpy, "text/uri-list", False);
     x11_net_wm_state   = XInternAtom(x11_dpy, "_NET_WM_STATE", False);
     x11_net_fullscreen = XInternAtom(x11_dpy, "_NET_WM_STATE_FULLSCREEN", False);
     x11_net_max_h      = XInternAtom(x11_dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
@@ -666,6 +682,10 @@ static vio_window_handle x11_create_window(vio_config *cfg, const char *backend_
     }
     XSaveContext(x11_dpy, w->win, x11_ctx, (XPointer)w);
     XSetWMProtocols(x11_dpy, w->win, &x11_wm_delete, 1);
+    {
+        Atom version = 5;   /* XdndAware: file drops */
+        XChangeProperty(x11_dpy, w->win, x11_xdnd_aware, XA_ATOM, 32, PropModeReplace, (unsigned char *)&version, 1);
+    }
     const char *title = cfg->title ? cfg->title : "php-vio";
     Xutf8SetWMProperties(x11_dpy, w->win, title, title, NULL, 0, NULL, NULL, NULL);
     if (!w->decorated) x11_set_decorations(w, 0);
@@ -872,6 +892,98 @@ static int x11_wm_state_of(Window win)
     return state;
 }
 
+/* A client message to the drag source (XdndStatus / XdndFinished). */
+static void x11_dnd_reply(vio_x11_window *w, Atom type, long l1, long l2, long l3, long l4)
+{
+    XEvent e;
+    memset(&e, 0, sizeof(e));
+    e.xclient.type = ClientMessage;
+    e.xclient.window = x11_dnd.source;
+    e.xclient.message_type = type;
+    e.xclient.format = 32;
+    e.xclient.data.l[0] = (long)w->win;
+    e.xclient.data.l[1] = l1;
+    e.xclient.data.l[2] = l2;
+    e.xclient.data.l[3] = l3;
+    e.xclient.data.l[4] = l4;
+    XSendEvent(x11_dpy, x11_dnd.source, False, NoEventMask, &e);
+    XFlush(x11_dpy);
+}
+
+/* XDND target side: 1 = the message was part of it. */
+static int x11_dnd_message(vio_x11_window *w, XClientMessageEvent *m)
+{
+    if (m->message_type == x11_xdnd_enter) {
+        x11_dnd.source = (Window)m->data.l[0];
+        x11_dnd.version = (int)((unsigned long)m->data.l[1] >> 24);
+        x11_dnd.accept = 0;
+        if (m->data.l[1] & 1) {   /* more than three types: read the list */
+            Atom type;
+            int format;
+            unsigned long n = 0, after = 0;
+            unsigned char *data = NULL;
+            if (XGetWindowProperty(x11_dpy, x11_dnd.source, x11_xdnd_type_list, 0, 1024, False, XA_ATOM,
+                                   &type, &format, &n, &after, &data) == Success && data) {
+                for (unsigned long i = 0; i < n; i++) x11_dnd.accept |= ((Atom *)data)[i] == x11_uri_list;
+            }
+            if (data) XFree(data);
+        } else {
+            for (int i = 2; i < 5; i++) x11_dnd.accept |= (Atom)m->data.l[i] == x11_uri_list;
+        }
+        return 1;
+    }
+    if (m->message_type == x11_xdnd_position) {
+        int rx = (int)(((unsigned long)m->data.l[2] >> 16) & 0xFFFF), ry = (int)(m->data.l[2] & 0xFFFF), x = 0, y = 0;
+        Window child;
+        XTranslateCoordinates(x11_dpy, x11_root, w->win, rx, ry, &x, &y, &child);
+        x11_dnd.x = x;
+        x11_dnd.y = y;
+        x11_dnd_reply(w, x11_xdnd_status, x11_dnd.accept ? 1 : 0, 0, 0, x11_dnd.accept ? (long)x11_xdnd_copy : 0);
+        return 1;
+    }
+    if (m->message_type == x11_xdnd_leave) {
+        x11_dnd.source = 0;
+        return 1;
+    }
+    if (m->message_type == x11_xdnd_drop) {
+        if (!x11_dnd.source) return 1;
+        if (!x11_dnd.accept) {
+            x11_dnd_reply(w, x11_xdnd_finished, 0, 0, 0, 0);
+            x11_dnd.source = 0;
+            return 1;
+        }
+        /* the data arrives as a SelectionNotify on this window */
+        XConvertSelection(x11_dpy, x11_xdnd_selection, x11_uri_list, x11_xdnd_selection, w->win,
+                          x11_dnd.version >= 1 ? (Time)m->data.l[2] : CurrentTime);
+        XFlush(x11_dpy);
+        return 1;
+    }
+    return 0;
+}
+
+static void x11_dnd_selection(vio_x11_window *w, XSelectionEvent *se)
+{
+    if (!x11_dnd.source || se->property != x11_xdnd_selection) return;
+    Atom type;
+    int format;
+    unsigned long n = 0, after = 0;
+    unsigned char *data = NULL;
+    int ok = 0;
+    if (XGetWindowProperty(x11_dpy, w->win, x11_xdnd_selection, 0, 1 << 22, True, AnyPropertyType,
+                           &type, &format, &n, &after, &data) == Success && data && format == 8) {
+        char **paths = NULL;
+        int count = vio_uri_list_paths((const char *)data, n, &paths);
+        if (count > 0) {
+            vio_input_drop_event(w->input, count, (const char *const *)paths, x11_dnd.x, x11_dnd.y);
+            ok = 1;
+        }
+        vio_uri_list_free(paths, count);
+    }
+    if (data) XFree(data);
+    if (x11_dnd.version >= 2) x11_dnd_reply(w, x11_xdnd_finished, ok, ok ? (long)x11_xdnd_copy : 0, 0, 0);
+    x11_dnd.source = 0;
+}
+
 static void x11_dispatch(XEvent *ev)
 {
     if (XFilterEvent(ev, None)) return;   /* input method */
@@ -894,6 +1006,10 @@ static void x11_dispatch(XEvent *ev)
         case ClientMessage:
             if (ev->xclient.message_type == x11_wm_protocols && (Atom)ev->xclient.data.l[0] == x11_wm_delete
                 && vio_input_close_request(w->input)) w->should_close = 1;
+            else x11_dnd_message(w, &ev->xclient);
+            break;
+        case SelectionNotify:
+            x11_dnd_selection(w, &ev->xselection);
             break;
         case FocusIn:
             if (w->ic) XSetICFocus(w->ic);
@@ -1675,6 +1791,7 @@ static const vio_platform vio_platform_x11 = {
     .set_opacity          = x11_set_opacity,
     .open_url             = vio_shell_open_url,
     .reveal_file          = vio_shell_reveal_file,
+    .accepts_drops        = 1,
 };
 
 void vio_platform_x11_register(void)

@@ -434,6 +434,30 @@ static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 return TRUE;
             }
             break;
+        case WM_DROPFILES: {
+            HDROP drop = (HDROP)wp;
+            UINT n = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+            char **paths = n ? (char **)calloc(n, sizeof(char *)) : NULL;
+            int got = 0;
+            for (UINT i = 0; paths && i < n; i++) {
+                UINT len = DragQueryFileW(drop, i, NULL, 0);
+                WCHAR *wpath = (WCHAR *)malloc(((size_t)len + 1) * sizeof(WCHAR));
+                if (!wpath) continue;
+                DragQueryFileW(drop, i, wpath, len + 1);
+                int bytes = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, NULL, 0, NULL, NULL);
+                char *u = bytes > 0 ? (char *)malloc((size_t)bytes) : NULL;
+                if (u && WideCharToMultiByte(CP_UTF8, 0, wpath, -1, u, bytes, NULL, NULL) > 0) paths[got++] = u;
+                else free(u);
+                free(wpath);
+            }
+            POINT pt = { 0, 0 };
+            DragQueryPoint(drop, &pt);   /* client coordinates */
+            DragFinish(drop);
+            vio_input_drop_event(w->input, got, (const char *const *)paths, (double)pt.x, (double)pt.y);
+            for (int i = 0; i < got; i++) free(paths[i]);
+            free(paths);
+            return 0;
+        }
         case WM_ERASEBKGND:
             return TRUE;
     }
@@ -796,6 +820,7 @@ static vio_window_handle w32_create_window(vio_config *cfg, const char *backend_
         return NULL;
     }
     SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, (LONG_PTR)w);
+    DragAcceptFiles(w->hwnd, TRUE);   /* WM_DROPFILES */
     w->hdc = GetDC(w->hwnd);
     if (cfg->headless) {
         /* A WS_POPUP has no minimum size: the client area is exactly the request. */
@@ -1512,6 +1537,7 @@ static const vio_platform vio_platform_win32 = {
     .set_opacity          = w32_set_opacity,
     .open_url             = vio_shell_open_url,
     .reveal_file          = vio_shell_reveal_file,
+    .accepts_drops        = 1,
 };
 
 void vio_platform_win32_register(void)
