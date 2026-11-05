@@ -358,6 +358,8 @@ typedef struct _vio_x11_window {
     Window           win;
     Colormap         cmap;
     XIC              ic;
+    int              ic_callbacks;   /* ic reports the composition (vio_on_preedit), else the IM draws it */
+    int              ic_wanted;      /* the app drew the composition when ic was made */
     x11_GLXContext   glrc;
     int              should_close;
     int              headless;
@@ -664,13 +666,21 @@ static void x11_pre_caret(XIC ic, XPointer data, XPointer call)
     x11_pre_report(w);
 }
 
-/* An input context with preedit callbacks when the input method offers
- * them (the app draws the composition), else one that composes on its own. */
+/* Whether the app draws the composition (vio_on_preedit). */
+static int x11_app_draws_preedit(vio_x11_window *w)
+{
+    return w->input && w->input->has_window_cb[VIO_WINDOW_CB_PREEDIT];
+}
+
+/* An input context with preedit callbacks when the app draws the composition
+ * and the input method offers them, else one where the input method shows it. */
 static XIC x11_create_ic(vio_x11_window *w)
 {
     XIMStyles *styles = NULL;
     int callbacks = 0;
-    if (!XGetIMValues(x11_im, XNQueryInputStyle, &styles, NULL) && styles) {
+    w->ic_callbacks = 0;
+    w->ic_wanted = x11_app_draws_preedit(w);
+    if (x11_app_draws_preedit(w) && !XGetIMValues(x11_im, XNQueryInputStyle, &styles, NULL) && styles) {
         for (int i = 0; i < styles->count_styles; i++)
             if (styles->supported_styles[i] == (XIMPreeditCallbacks | XIMStatusNothing)) callbacks = 1;
         XFree(styles);
@@ -685,7 +695,7 @@ static XIC x11_create_ic(vio_x11_window *w)
         XIC ic = XCreateIC(x11_im, XNInputStyle, XIMPreeditCallbacks | XIMStatusNothing, XNClientWindow, w->win,
                            XNFocusWindow, w->win, XNPreeditAttributes, attrs, NULL);
         XFree(attrs);
-        if (ic) return ic;
+        if (ic) { w->ic_callbacks = 1; return ic; }
     }
     return XCreateIC(x11_im, XNInputStyle, XIMPreeditNothing | XIMStatusNothing, XNClientWindow, w->win, XNFocusWindow, w->win, NULL);
 }
@@ -1124,6 +1134,14 @@ static void x11_dnd_selection(vio_x11_window *w, XSelectionEvent *se)
 static void x11_dispatch(XEvent *ev)
 {
     vio_x11_window *fw = NULL;
+    /* the app set or dropped vio_on_preedit: an input context of the other style */
+    if ((ev->type == KeyPress || ev->type == FocusIn) && x11_im && XFindContext(x11_dpy, ev->xany.window, x11_ctx, (XPointer *)&fw) == 0
+        && fw && fw->ic && x11_app_draws_preedit(fw) != fw->ic_wanted) {
+        XDestroyIC(fw->ic);
+        fw->ic = x11_create_ic(fw);
+        if (fw->ic) XSetICFocus(fw->ic);
+    }
+    fw = NULL;
     if ((ev->type == KeyPress || ev->type == KeyRelease) && XFindContext(x11_dpy, ev->xany.window, x11_ctx, (XPointer *)&fw) == 0
         && fw && fw->ime_off) {
         /* IME off (vio_ime_enable): the key goes straight to the game */

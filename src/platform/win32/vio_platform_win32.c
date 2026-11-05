@@ -359,6 +359,11 @@ static void w32_ime_place(vio_win32_window *w)
     ImmReleaseContext(w->hwnd, imc);
 }
 
+static int w32_app_draws_preedit(vio_win32_window *w)
+{
+    return w->input && w->input->has_window_cb[VIO_WINDOW_CB_PREEDIT];
+}
+
 static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     vio_win32_window *w = (vio_win32_window *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -490,12 +495,18 @@ static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 return 0;
             }
             break;
-        case WM_IME_SETCONTEXT:   /* the app draws the composition: no IME window of its own */
+        /* An app with vio_on_preedit draws the composition itself: no IME window
+         * of its own, the text comes as preedit events. Without it Windows shows
+         * the composition as before and commits through WM_IME_CHAR -> WM_CHAR. */
+        case WM_IME_SETCONTEXT:
+            if (!w32_app_draws_preedit(w)) break;
             return DefWindowProcW(hwnd, msg, wp, lp & ~ISC_SHOWUICOMPOSITIONWINDOW);
         case WM_IME_STARTCOMPOSITION:
             w32_ime_place(w);
+            if (!w32_app_draws_preedit(w)) break;
             return 0;
         case WM_IME_COMPOSITION: {
+            if (!w32_app_draws_preedit(w)) break;
             HIMC imc = ImmGetContext(hwnd);
             if (!imc) break;
             if (lp & GCS_RESULTSTR) {   /* committed: the text as chars, the composition gone */
@@ -513,6 +524,7 @@ static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;   /* not to DefWindowProc: it would send the result again as WM_IME_CHAR */
         }
         case WM_IME_ENDCOMPOSITION:
+            if (!w32_app_draws_preedit(w)) break;
             if (w->composing) { w->composing = 0; vio_input_preedit_event(w->input, "", 0, 0); }
             return 0;
         case WM_DROPFILES: {
