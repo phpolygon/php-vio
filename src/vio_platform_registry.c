@@ -162,7 +162,14 @@ void vio_platform_wait_wake_only(double timeout)
 
 int vio_platform_test_dialog(int *ms, int *action)
 {
+#ifdef _WIN32
+    /* PHP's putenv() reaches the process environment, not the CRT's copy that getenv() reads */
+    static char buf[64];
+    DWORD n = GetEnvironmentVariableA("VIO_TEST_DIALOG", buf, sizeof(buf));
+    const char *v = n > 0 && n < sizeof(buf) ? buf : NULL;
+#else
     const char *v = getenv("VIO_TEST_DIALOG");
+#endif
     if (!v || !*v) return 0;
     char *end = NULL;
     long t = strtol(v, &end, 10);
