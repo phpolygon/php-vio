@@ -15,6 +15,7 @@
 #include "php.h"
 #include "../../../include/vio_platform.h"
 #include "../../vio_input.h"
+#include "../vio_shell.h"
 
 #ifdef HAVE_GLFW
 
@@ -113,6 +114,14 @@ static void vio_place_window_on_cursor_monitor(GLFWwindow *window)
 }
 #endif
 
+static vio_platform vio_platform_glfw;   /* defined at the end; glfw_init adjusts it */
+
+/* Image cursors per window (glfwCreateCursor), freed with the window or
+ * when the window gets another cursor. Standard cursors are shared. */
+#define GLFW_VIO_CURSOR_WINDOWS 32
+static struct { GLFWwindow *win; GLFWcursor *cur; } glfw_image_cursor[GLFW_VIO_CURSOR_WINDOWS];
+static GLFWcursor *glfw_std_cursor[VIO_PLATFORM_SHAPE_COUNT];
+
 static int glfw_init(void)
 {
     if (glfw_initialized) {
@@ -131,12 +140,18 @@ static int glfw_init(void)
     }
 
     glfw_initialized = 1;
+    /* GLFW has no window icons on macOS and Wayland (GLFW_FEATURE_UNAVAILABLE) */
+    if (glfwGetPlatform() == GLFW_PLATFORM_COCOA || glfwGetPlatform() == GLFW_PLATFORM_WAYLAND) {
+        vio_platform_glfw.set_window_icon = NULL;
+    }
     return 1;
 }
 
 static void glfw_shutdown(void)
 {
     if (glfw_initialized) {
+        memset(glfw_std_cursor, 0, sizeof(glfw_std_cursor));   /* glfwTerminate frees them */
+        memset(glfw_image_cursor, 0, sizeof(glfw_image_cursor));
         glfwTerminate();
         glfw_initialized = 0;
     }
@@ -301,9 +316,23 @@ static vio_window_handle glfw_create_window(vio_config *cfg, const char *backend
     return window;
 }
 
+
+static void glfw_drop_image_cursor(GLFWwindow *win)
+{
+    for (int i = 0; i < GLFW_VIO_CURSOR_WINDOWS; i++) {
+        if (glfw_image_cursor[i].win != win) continue;
+        glfwDestroyCursor(glfw_image_cursor[i].cur);
+        glfw_image_cursor[i].win = NULL;
+        glfw_image_cursor[i].cur = NULL;
+    }
+}
+
 static void glfw_destroy_window(vio_window_handle w)
 {
-    if (w) glfwDestroyWindow((GLFWwindow *)w);
+    if (!w) return;
+    glfwSetCursor((GLFWwindow *)w, NULL);
+    glfw_drop_image_cursor((GLFWwindow *)w);
+    glfwDestroyWindow((GLFWwindow *)w);
 }
 
 static int glfw_should_close(vio_window_handle w)
@@ -430,6 +459,91 @@ static void glfw_maximize(vio_window_handle w)
 static void glfw_restore(vio_window_handle w)
 {
     if (w) glfwRestoreWindow((GLFWwindow *)w);
+}
+
+/* ── Window details (DESKTOP-APP-PLAN Phase 1) ────────────────────── */
+
+static int glfw_set_cursor_shape(vio_window_handle w, int shape)
+{
+    if (!w || shape < 0 || shape >= VIO_PLATFORM_SHAPE_COUNT) return 0;
+    static const int ids[VIO_PLATFORM_SHAPE_COUNT] = {
+        GLFW_ARROW_CURSOR, GLFW_IBEAM_CURSOR, GLFW_CROSSHAIR_CURSOR, GLFW_POINTING_HAND_CURSOR,
+        GLFW_RESIZE_EW_CURSOR, GLFW_RESIZE_NS_CURSOR, GLFW_RESIZE_NWSE_CURSOR, GLFW_RESIZE_NESW_CURSOR,
+        GLFW_RESIZE_ALL_CURSOR, GLFW_NOT_ALLOWED_CURSOR,
+    };
+    if (!glfw_std_cursor[shape]) {
+        GLFWerrorfun prev = glfwSetErrorCallback(NULL);   /* shapes the system lacks are an error, not a warning */
+        glfw_std_cursor[shape] = glfwCreateStandardCursor(ids[shape]);
+        if (!glfw_std_cursor[shape]) glfw_std_cursor[shape] = glfwCreateStandardCursor(GLFW_ARROW_CURSOR);
+        glfwSetErrorCallback(prev);
+    }
+    glfwSetCursor((GLFWwindow *)w, glfw_std_cursor[shape]);
+    glfw_drop_image_cursor((GLFWwindow *)w);
+    return 1;
+}
+
+static int glfw_set_cursor_image(vio_window_handle w, const unsigned char *rgba, int width, int height, int hot_x, int hot_y)
+{
+    if (!w) return 0;
+    GLFWimage img = { width, height, (unsigned char *)rgba };
+    GLFWcursor *c = glfwCreateCursor(&img, hot_x, hot_y);
+    if (!c) return 0;
+    glfwSetCursor((GLFWwindow *)w, c);
+    glfw_drop_image_cursor((GLFWwindow *)w);
+    for (int i = 0; i < GLFW_VIO_CURSOR_WINDOWS; i++) {
+        if (glfw_image_cursor[i].win) continue;
+        glfw_image_cursor[i].win = (GLFWwindow *)w;
+        glfw_image_cursor[i].cur = c;
+        return 1;
+    }
+    glfwSetCursor((GLFWwindow *)w, NULL);
+    glfwDestroyCursor(c);
+    return 0;
+}
+
+/* NULLed in glfw_init where GLFW has no icons (macOS, Wayland) */
+static int glfw_set_window_icon(vio_window_handle w, int count, const vio_platform_image *images)
+{
+    if (!w) return 0;
+    GLFWimage imgs[16];
+    if (count > 16) count = 16;
+    for (int i = 0; i < count; i++) {
+        imgs[i].width = images[i].width;
+        imgs[i].height = images[i].height;
+        imgs[i].pixels = (unsigned char *)images[i].rgba;
+    }
+    glfwSetWindowIcon((GLFWwindow *)w, count, count ? imgs : NULL);
+    return 1;
+}
+
+static int glfw_set_size_limits(vio_window_handle w, int min_w, int min_h, int max_w, int max_h)
+{
+    if (!w) return 0;
+    glfwSetWindowSizeLimits((GLFWwindow *)w, min_w > 0 ? min_w : GLFW_DONT_CARE, min_h > 0 ? min_h : GLFW_DONT_CARE,
+                            max_w > 0 ? max_w : GLFW_DONT_CARE, max_h > 0 ? max_h : GLFW_DONT_CARE);
+    return 1;
+}
+
+static int glfw_set_aspect_ratio(vio_window_handle w, int num, int den)
+{
+    if (!w) return 0;
+    if (num > 0 && den > 0) glfwSetWindowAspectRatio((GLFWwindow *)w, num, den);
+    else glfwSetWindowAspectRatio((GLFWwindow *)w, GLFW_DONT_CARE, GLFW_DONT_CARE);
+    return 1;
+}
+
+static int glfw_set_floating(vio_window_handle w, int floating)
+{
+    if (!w) return 0;
+    glfwSetWindowAttrib((GLFWwindow *)w, GLFW_FLOATING, floating ? GLFW_TRUE : GLFW_FALSE);
+    return 1;
+}
+
+static int glfw_set_opacity(vio_window_handle w, float opacity)
+{
+    if (!w) return 0;
+    glfwSetWindowOpacity((GLFWwindow *)w, opacity);
+    return 1;
 }
 
 static void glfw_set_cursor_mode(vio_window_handle w, int mode)
@@ -739,7 +853,7 @@ static int glfw_clipboard_set(const char *utf8)
     return 1;
 }
 
-static const vio_platform vio_platform_glfw = {
+static vio_platform vio_platform_glfw = {
     .name                 = "glfw",
     .init                 = glfw_init,
     .shutdown             = glfw_shutdown,
@@ -789,6 +903,15 @@ static const vio_platform vio_platform_glfw = {
     .clipboard_get        = glfw_clipboard_get,
     .clipboard_set        = glfw_clipboard_set,
     .key_name             = glfw_key_name,
+    .set_cursor_shape     = glfw_set_cursor_shape,
+    .set_cursor_image     = glfw_set_cursor_image,
+    .set_window_icon      = glfw_set_window_icon,
+    .set_size_limits      = glfw_set_size_limits,
+    .set_aspect_ratio     = glfw_set_aspect_ratio,
+    .set_floating         = glfw_set_floating,
+    .set_opacity          = glfw_set_opacity,
+    .open_url             = vio_shell_open_url,
+    .reveal_file          = vio_shell_reveal_file,
 };
 
 void vio_platform_glfw_register(void)

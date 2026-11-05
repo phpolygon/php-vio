@@ -15,7 +15,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
+extern char **environ;
 #endif
 #include "../include/vio_platform.h"
 #include "vio_window.h"
@@ -162,6 +165,43 @@ int vio_platform_timeout_ms(double timeout)
     if (timeout < 0.0) return -1;
     double ms = timeout * 1000.0 + 0.999;
     return ms > 2147483647.0 ? 2147483647 : (int)ms;
+}
+
+/* ── Opener (vio_open_url / vio_reveal_file on macOS and Linux) ───── */
+
+#ifndef _WIN32
+#define VIO_OPENER_MAX 32
+static pid_t vio_opener_pids[VIO_OPENER_MAX];
+
+static void vio_opener_reap(void)
+{
+    for (int i = 0; i < VIO_OPENER_MAX; i++) {
+        if (vio_opener_pids[i] > 0 && waitpid(vio_opener_pids[i], NULL, WNOHANG) != 0) vio_opener_pids[i] = 0;
+    }
+}
+#endif
+
+int vio_platform_spawn_opener(const char *default_cmd, const char *const *args, int nargs)
+{
+#ifdef _WIN32
+    (void)default_cmd; (void)args; (void)nargs;
+    return 0;
+#else
+    const char *cmd = getenv("VIO_OPEN_COMMAND");
+    if (!cmd || !*cmd) cmd = default_cmd;
+    if (nargs < 0 || nargs > 4) return 0;
+    char *argv[6];
+    argv[0] = (char *)cmd;
+    for (int i = 0; i < nargs; i++) argv[i + 1] = (char *)args[i];
+    argv[nargs + 1] = NULL;
+    vio_opener_reap();
+    pid_t pid;
+    /* argv straight to the program, no shell: a URL cannot inject a command */
+    if (posix_spawnp(&pid, cmd, NULL, NULL, argv, environ) != 0) return 0;
+    for (int i = 0; i < VIO_OPENER_MAX; i++) if (vio_opener_pids[i] <= 0) { vio_opener_pids[i] = pid; return 1; }
+    waitpid(pid, NULL, 0);   /* table full: wait for this one */
+    return 1;
+#endif
 }
 
 /* MINIT / MSHUTDOWN (declared in src/vio_window.h): the built-in platforms

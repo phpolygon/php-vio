@@ -1,6 +1,6 @@
 # Native Desktop-Anwendungen – Plan
 
-> **Status:** 🚧 Phase 0 umgesetzt (2026-11-05, Tests 261/262), Phasen 1–5 offen.
+> **Status:** 🚧 Phasen 0 und 1 umgesetzt (2026-11-05, Tests 261–264), Phasen 2–5 offen.
 > **Baut auf:** `NATIVE-PLATFORM-PLAN.md` (Win32, Cocoa, X11, Wayland hinter `vio_platform`, Tests 212–215) und
 > Zwischenablage/Tastennamen (239/240).
 > **Ziel:** Mit php-vio sollen sich Werkzeuge, Editoren und Launcher bauen lassen, nicht nur Spiele: sparsam im
@@ -72,10 +72,15 @@ vio_on_refresh($ctx, fn() => render());   // OS will neu gezeichnet haben (Expos
 - Cursor-Formen: `vio_set_cursor($ctx, VIO_CURSOR_ARROW|IBEAM|HAND|CROSSHAIR|RESIZE_EW|RESIZE_NS|RESIZE_NWSE|RESIZE_NESW|MOVE|NOT_ALLOWED|WAIT)`,
   eigene aus RGBA (`vio_cursor_create($rgba, $w, $h, $hotX, $hotY)`).
 - Fenster-Icon (`vio_set_window_icon`, mehrere Größen), Minimal-/Maximalgröße, Seitenverhältnis, „immer oben“,
-  Transparenz/Deckkraft, Fortschritt in Taskleiste/Dock (Win32 `ITaskbarList3`, Cocoa `dockTile`).
+  Transparenz/Deckkraft. Der Fortschritt in Taskleiste/Dock wandert nach Phase 2: unter Linux braucht er D-Bus.
 - `vio_open_url($url)` / `vio_reveal_file($path)`: `ShellExecuteW`, `NSWorkspace`, Portal `OpenURI` (Fallback `xdg-open`).
-- **Tests (263):** Cursor-Wechsel ändert den gemeldeten Cursor (Win32 `GetCursorInfo`, X11 `XFixesGetCursorImage`),
-  Größengrenzen halten bei `vio_set_window_size`.
+- **Umgesetzt:** `vio_set_cursor`, `vio_set_cursor_image`, `vio_set_window_icon`, `vio_set_window_size_limits`
+  (`vio_set_window_size` klemmt auf jeder Plattform), `vio_set_window_aspect_ratio`, `vio_set_window_floating`,
+  `vio_set_window_opacity`, `vio_open_url`, `vio_reveal_file`, `vio_platform_info()`. macOS hat keine Fenster-Icons
+  (das Bild wird das Dock-Icon), Wayland kein Icon, kein Seitenverhältnis, kein „oben“, keine Deckkraft. X11-Cursor und
+  -Bilder brauchen libXcursor (`dlopen`). Linux zeigt bei `vio_reveal_file` nur den Ordner.
+- **Tests (263, 264):** jede Fähigkeit wie von `vio_platform_info()` gemeldet, das Fenstersystem bestätigt sie per FFI
+  (Win32, X11, Cocoa); Opener über `VIO_OPEN_COMMAND` (macOS, Linux).
 
 ### Phase 2 – Native Integration
 
@@ -87,6 +92,7 @@ vio_on_refresh($ctx, fn() => render());   // OS will neu gezeichnet haben (Expos
 | Menüleiste: `vio_menu_bar($ctx, $tree, fn(string $id) => …)` | `HMENU` + `WM_COMMAND`, Tastenkürzel über Accelerator-Tabelle | `NSApp.mainMenu` inkl. App-Menü (Über, Beenden, Ausblenden) | `false`, die App zeichnet ihr Menü selbst |
 | Kontextmenü: `vio_popup_menu($ctx, $tree, $x, $y)` → `id\|null` | `TrackPopupMenuEx` | `popUpMenuPositioningItem` | `false` |
 | Tray: `vio_tray($icon, $tooltip, $menuTree, fn(string $id) => …)` → `VioTray` | `Shell_NotifyIconW` | `NSStatusItem` | `org.kde.StatusNotifierItem` über D-Bus (GNOME nur mit Erweiterung → `false`, wenn kein Watcher da ist) |
+| `vio_set_progress($ctx, ?float $value, $state)` (Taskleiste/Dock, aus Phase 1) | `ITaskbarList3` | `NSDockTile` mit Fortschrittsanzeige | Unity `LauncherEntry` über D-Bus, sonst `false` |
 | `vio_notify($title, $body, ['icon', 'id'])`, Klick über `vio_on_notification` | Toast (WinRT `ToastNotificationManager`, braucht AUMID; ohne: Tray-Balloon) | `UNUserNotificationCenter` (im App-Bundle; CLI-PHP zur Entwicklung: `false` mit Grund) | `org.freedesktop.Notifications` |
 
 - Menü-Baum als PHP-Array: `['id', 'label', 'shortcut' => 'Ctrl+S', 'checked', 'enabled', 'children', 'separator']`.

@@ -102,7 +102,8 @@ foreach ($results as $platform => $line) {
     $want = 'zero true | timeout true | wake true | wake forever true | wake taken true | wake kept true | idle true | os event ';
     if (!str_starts_with($line, $want) || !in_array(substr($line, strlen($want)), ['true', 'n/a'], true)) $bad[] = "$platform: $line";
 }
-echo isset($results['null']) && !$bad ? "OK\n" : "FAIL " . json_encode([$results, $bad], JSON_PRETTY_PRINT) . "\n";
+/* the null platform and the active one must answer: a crashed child has no line */
+echo isset($results['null'], $results[vio_platform()]) && !$bad ? "OK\n" : "FAIL " . json_encode([$results, $bad], JSON_PRETTY_PRINT) . "\n";
 ?>
 --EXPECT--
 OK

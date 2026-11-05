@@ -64,6 +64,25 @@ typedef struct _vio_monitor_desc {
     int   primary;
 } vio_monitor_desc;
 
+/* Cursor shapes (the VIO_CURSOR_SHAPE_* values, GLFW 3.4's standard cursors). */
+#define VIO_PLATFORM_SHAPE_ARROW        0
+#define VIO_PLATFORM_SHAPE_IBEAM        1
+#define VIO_PLATFORM_SHAPE_CROSSHAIR    2
+#define VIO_PLATFORM_SHAPE_HAND         3
+#define VIO_PLATFORM_SHAPE_RESIZE_EW    4
+#define VIO_PLATFORM_SHAPE_RESIZE_NS    5
+#define VIO_PLATFORM_SHAPE_RESIZE_NWSE  6
+#define VIO_PLATFORM_SHAPE_RESIZE_NESW  7
+#define VIO_PLATFORM_SHAPE_RESIZE_ALL   8
+#define VIO_PLATFORM_SHAPE_NOT_ALLOWED  9
+#define VIO_PLATFORM_SHAPE_COUNT        10
+
+/* An RGBA image (window icon), top row first. */
+typedef struct _vio_platform_image {
+    int width, height;
+    const unsigned char *rgba;
+} vio_platform_image;
+
 /* Joysticks: ids 0..VIO_PLATFORM_JOYSTICK_LAST (GLFW's 16 slots). */
 #define VIO_PLATFORM_JOYSTICK_LAST 15
 
@@ -164,6 +183,24 @@ typedef struct _vio_platform {
      * printable. NULL slot: the layout is unknown (vio_key_name -> null).
      * GLFW's glfwGetKeyName semantics. */
     const char *(*key_name)(int key);
+
+    /* ── Desktop window details (DESKTOP-APP-PLAN Phase 1) ─────────────
+     * NULL slot: the platform has no such thing (vio_platform_info says
+     * false, the PHP call returns false). Each returns 1 when applied.
+     * Sizes are in the platform's screen coordinates, -1 = no limit. */
+    int   (*set_cursor_shape)(vio_window_handle w, int shape);       /* VIO_PLATFORM_SHAPE_* */
+    /* RGBA, top row first; replaces the shape until the next set_cursor_shape. */
+    int   (*set_cursor_image)(vio_window_handle w, const unsigned char *rgba, int width, int height, int hot_x, int hot_y);
+    /* count 0: back to the default icon. macOS has no window icons: the Dock icon. */
+    int   (*set_window_icon)(vio_window_handle w, int count, const vio_platform_image *images);
+    int   (*set_size_limits)(vio_window_handle w, int min_w, int min_h, int max_w, int max_h);
+    int   (*set_aspect_ratio)(vio_window_handle w, int numerator, int denominator);   /* 0, 0: free */
+    int   (*set_floating)(vio_window_handle w, int floating);
+    int   (*set_opacity)(vio_window_handle w, float opacity);             /* 0..1 */
+    /* No window needed. url: has a scheme, never file: (checked by the caller).
+     * path: exists (checked by the caller). */
+    int   (*open_url)(const char *utf8_url);
+    int   (*reveal_file)(const char *utf8_path);
 } vio_platform;
 
 /* Registry (src/vio_platform_registry.c): platforms register in MINIT; the
@@ -192,6 +229,11 @@ int   vio_platform_wake_fd(void);
 void *vio_platform_wake_handle(void);
 int   vio_platform_timeout_ms(double timeout);
 void  vio_platform_wait_wake_only(double timeout);
+
+/* open_url / reveal_file by spawning an opener (src/vio_platform_registry.c,
+ * POSIX only): VIO_OPEN_COMMAND if set, else default_cmd; argv = cmd, args.
+ * Detached, no shell; children are reaped on later calls. 1 = started. */
+int   vio_platform_spawn_opener(const char *default_cmd, const char *const *args, int nargs);
 
 /* Implementations */
 void vio_platform_null_register(void);

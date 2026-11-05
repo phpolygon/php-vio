@@ -60,6 +60,7 @@
 
 #include "../../../include/vio_platform.h"
 #include "../../../include/vio_constants.h"
+#include "../vio_shell.h"
 #include "../../vio_input.h"
 #include "../linux/vio_evdev_gamepad.h"
 
@@ -135,6 +136,9 @@ struct _vio_wl_window {
     int                  monitor;
     int                  on_output[WL_MAX_OUTPUTS];
     int                  fb_w, fb_h;
+    struct wl_cursor    *shape;          /* vio_set_cursor, NULL = the default arrow */
+    struct wl_buffer    *image;          /* vio_set_cursor_image (owned), wins over shape */
+    int                  image_w, image_h, image_hx, image_hy;
     vio_input_state     *input;
 };
 
@@ -397,13 +401,95 @@ static void wl_set_cursor(vio_wl_window *w)
         wl_pointer_set_cursor(wl.pointer, wl.pointer_serial, NULL, 0, 0);
         return;
     }
-    struct wl_cursor_image *img = wl.cursor->images[0];
+    if (w->image) {
+        wl_pointer_set_cursor(wl.pointer, wl.pointer_serial, wl.cursor_surface, w->image_hx, w->image_hy);
+        wl_surface_attach(wl.cursor_surface, w->image, 0, 0);
+        wl_surface_damage(wl.cursor_surface, 0, 0, w->image_w, w->image_h);
+        wl_surface_commit(wl.cursor_surface);
+        return;
+    }
+    struct wl_cursor_image *img = (w->shape ? w->shape : wl.cursor)->images[0];
     struct wl_buffer *buf = wl_cursor_image_get_buffer(img);
     if (!buf) return;
     wl_pointer_set_cursor(wl.pointer, wl.pointer_serial, wl.cursor_surface, (int32_t)img->hotspot_x, (int32_t)img->hotspot_y);
     wl_surface_attach(wl.cursor_surface, buf, 0, 0);
     wl_surface_damage(wl.cursor_surface, 0, 0, (int32_t)img->width, (int32_t)img->height);
     wl_surface_commit(wl.cursor_surface);
+}
+
+/* ── Window details (DESKTOP-APP-PLAN Phase 1) ────────────────────── */
+
+static int wl_set_cursor_shape(vio_window_handle h, int shape)
+{
+    vio_wl_window *w = (vio_wl_window *)h;
+    if (!w || shape < 0 || shape >= VIO_PLATFORM_SHAPE_COUNT) return 0;
+    /* freedesktop cursor names, then the X11 core names older themes carry */
+    static const char *names[VIO_PLATFORM_SHAPE_COUNT][2] = {
+        { "default", "left_ptr" }, { "text", "xterm" }, { "crosshair", "cross" }, { "pointer", "hand2" },
+        { "ew-resize", "sb_h_double_arrow" }, { "ns-resize", "sb_v_double_arrow" }, { "nwse-resize", "bottom_right_corner" },
+        { "nesw-resize", "bottom_left_corner" }, { "all-scroll", "fleur" }, { "not-allowed", "crossed_circle" },
+    };
+    struct wl_cursor *c = NULL;
+    for (int i = 0; wl.cursor_theme && !c && i < 2; i++) c = wl_cursor_theme_get_cursor(wl.cursor_theme, names[shape][i]);
+    w->shape = c;   /* NULL: the theme lacks it, the arrow stays */
+    if (w->image) { wl_buffer_destroy(w->image); w->image = NULL; }
+    if (wl.pointer_focus == w) wl_set_cursor(w);
+    return 1;
+}
+
+/* An ARGB8888 shm buffer (premultiplied) in an unlinked file under XDG_RUNTIME_DIR. */
+static struct wl_buffer *wl_shm_image(const unsigned char *rgba, int width, int height)
+{
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    if (!wl.shm || !dir) return NULL;
+    size_t size = (size_t)width * (size_t)height * 4;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/vio-cursor-XXXXXX", dir);
+    int fd = mkstemp(path);
+    if (fd < 0) return NULL;
+    unlink(path);
+    if (ftruncate(fd, (off_t)size) != 0) { close(fd); return NULL; }
+    unsigned char *px = (unsigned char *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) { close(fd); return NULL; }
+    for (int i = 0; i < width * height; i++) {   /* little-endian ARGB = B, G, R, A */
+        unsigned int a = rgba[i * 4 + 3];
+        px[i * 4 + 0] = (unsigned char)(rgba[i * 4 + 2] * a / 255);
+        px[i * 4 + 1] = (unsigned char)(rgba[i * 4 + 1] * a / 255);
+        px[i * 4 + 2] = (unsigned char)(rgba[i * 4 + 0] * a / 255);
+        px[i * 4 + 3] = (unsigned char)a;
+    }
+    munmap(px, size);
+    struct wl_shm_pool *pool = wl_shm_create_pool(wl.shm, fd, (int32_t)size);
+    struct wl_buffer *buf = wl_shm_pool_create_buffer(pool, 0, width, height, width * 4, WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    return buf;
+}
+
+static int wl_set_cursor_image(vio_window_handle h, const unsigned char *rgba, int width, int height, int hot_x, int hot_y)
+{
+    vio_wl_window *w = (vio_wl_window *)h;
+    if (!w) return 0;
+    struct wl_buffer *buf = wl_shm_image(rgba, width, height);
+    if (!buf) return 0;
+    if (w->image) wl_buffer_destroy(w->image);
+    w->image = buf;
+    w->image_w = width;
+    w->image_h = height;
+    w->image_hx = hot_x;
+    w->image_hy = hot_y;
+    if (wl.pointer_focus == w) wl_set_cursor(w);
+    return 1;
+}
+
+static int wl_set_size_limits(vio_window_handle h, int min_w, int min_h, int max_w, int max_h)
+{
+    vio_wl_window *w = (vio_wl_window *)h;
+    if (!w || !w->toplevel) return 0;
+    xdg_toplevel_set_min_size(w->toplevel, min_w > 0 ? min_w : 0, min_h > 0 ? min_h : 0);
+    xdg_toplevel_set_max_size(w->toplevel, max_w > 0 ? max_w : 0, max_h > 0 ? max_h : 0);
+    wl_surface_commit(w->surface);
+    return 1;
 }
 
 static void wl_pointer_enter(void *data, struct wl_pointer *p, uint32_t serial, struct wl_surface *s, wl_fixed_t sx, wl_fixed_t sy)
@@ -844,6 +930,7 @@ static void wl_destroy_window(vio_window_handle h)
     vio_wl_window *w = (vio_wl_window *)h;
     if (!w) return;
     w->input = NULL;   /* no callbacks from the teardown (focus loss on destroy) */
+    if (w->image) { wl_buffer_destroy(w->image); w->image = NULL; }
     if (wl.keyboard_focus == w) wl.keyboard_focus = NULL;
     if (wl.pointer_focus == w) wl.pointer_focus = NULL;
     if (w->egl_context) {
@@ -1175,6 +1262,11 @@ static const vio_platform vio_platform_wayland = {
     .vk_create_surface      = wl_vk_create_surface,
 #endif
     .install_input        = wl_install_input,
+    .set_cursor_shape     = wl_set_cursor_shape,
+    .set_cursor_image     = wl_set_cursor_image,
+    .set_size_limits      = wl_set_size_limits,
+    .open_url             = vio_shell_open_url,
+    .reveal_file          = vio_shell_reveal_file,
 };
 
 void vio_platform_wayland_register(void)

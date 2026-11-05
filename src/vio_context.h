@@ -27,6 +27,8 @@ typedef struct _vio_context_object {
     vio_2d_state       state_2d;
     int                initialized;
     int                should_close;
+    /* vio_set_window_size_limits, logical pixels; 0 = no limit. vio_set_window_size clamps to them. */
+    int                size_min_w, size_min_h, size_max_w, size_max_h;
     int                in_frame;         /* 1 between begin/end */
     /* Currently bound pipeline shader (0 = use default) */
     unsigned int       bound_shader_program;

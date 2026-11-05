@@ -49,6 +49,8 @@
 #include "../../../include/vio_platform.h"
 #include "../../../include/vio_constants.h"
 #include "../../vio_input.h"
+#include "../vio_shell.h"
+#include <X11/cursorfont.h>
 
 /* ── Display, errors ──────────────────────────────────────────────── */
 
@@ -352,6 +354,9 @@ typedef struct _vio_x11_window {
     RRCrtc           saved_crtc;
     RRMode           saved_mode;
     unsigned char    keys_down[256];
+    Cursor           cursor;                 /* client cursor, 0 = parent's */
+    int              cursor_owned;           /* from an image: XFreeCursor */
+    int              min_w, min_h, max_w, max_h, aspect_num, aspect_den;   /* 0 = none */
     vio_input_state *input;
 } vio_x11_window;
 
@@ -555,6 +560,7 @@ static int x11_video_modes(int index, vio_video_mode *out, int max)
 /* ── Window lifecycle ─────────────────────────────────────────────── */
 
 static int x11_keytable_ready;
+static Cursor x11_shape_cursor[VIO_PLATFORM_SHAPE_COUNT];   /* shared standard cursors */
 
 static int x11_init(void)
 {
@@ -574,6 +580,7 @@ static void x11_shutdown(void)
     x11_clip_shutdown();
     if (x11_im) { XCloseIM(x11_im); x11_im = NULL; }
     if (x11_blank_cursor) { XFreeCursor(x11_dpy, x11_blank_cursor); x11_blank_cursor = 0; }
+    for (int i = 0; i < VIO_PLATFORM_SHAPE_COUNT; i++) if (x11_shape_cursor[i]) { XFreeCursor(x11_dpy, x11_shape_cursor[i]); x11_shape_cursor[i] = 0; }
     XCloseDisplay(x11_dpy);
     x11_dpy = NULL;
     x11_keytable_ready = 0;
@@ -753,6 +760,7 @@ static void x11_destroy_window(vio_window_handle h)
     }
     if (w->ic) XDestroyIC(w->ic);
     XDeleteContext(x11_dpy, w->win, x11_ctx);
+    if (w->cursor_owned && w->cursor) XFreeCursor(x11_dpy, w->cursor);
     XDestroyWindow(x11_dpy, w->win);
     XFreeColormap(x11_dpy, w->cmap);
     XFlush(x11_dpy);
@@ -1076,6 +1084,208 @@ static void x11_send_state(vio_x11_window *w, int add, Atom a, Atom b)
     XFlush(x11_dpy);
 }
 
+/* ── Window details (DESKTOP-APP-PLAN Phase 1) ────────────────────── */
+
+/* libXcursor (theme cursors and ARGB images), loaded at run time like libGL */
+typedef struct { unsigned int version, size, width, height, xhot, yhot, delay; unsigned int *pixels; } x11_XcursorImage;
+static struct {
+    int tried;
+    void *lib;
+    Cursor (*LibraryLoadCursor)(Display *, const char *);
+    x11_XcursorImage *(*ImageCreate)(int, int);
+    void (*ImageDestroy)(x11_XcursorImage *);
+    Cursor (*ImageLoadCursor)(Display *, const x11_XcursorImage *);
+} xcur;
+
+static int x11_xcursor(void)
+{
+    if (!xcur.tried) {
+        xcur.tried = 1;
+        xcur.lib = dlopen("libXcursor.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (xcur.lib) {
+            xcur.LibraryLoadCursor = (Cursor (*)(Display *, const char *))dlsym(xcur.lib, "XcursorLibraryLoadCursor");
+            xcur.ImageCreate = (x11_XcursorImage *(*)(int, int))dlsym(xcur.lib, "XcursorImageCreate");
+            xcur.ImageDestroy = (void (*)(x11_XcursorImage *))dlsym(xcur.lib, "XcursorImageDestroy");
+            xcur.ImageLoadCursor = (Cursor (*)(Display *, const x11_XcursorImage *))dlsym(xcur.lib, "XcursorImageLoadCursor");
+        }
+    }
+    return xcur.LibraryLoadCursor && xcur.ImageCreate && xcur.ImageDestroy && xcur.ImageLoadCursor;
+}
+
+static void x11_use_cursor(vio_x11_window *w, Cursor c, int owned)
+{
+    if (w->cursor_owned && w->cursor) XFreeCursor(x11_dpy, w->cursor);
+    w->cursor = c;
+    w->cursor_owned = owned;
+    if (w->cursor_mode == VIO_PLATFORM_CURSOR_NORMAL) XDefineCursor(x11_dpy, w->win, c);
+    XFlush(x11_dpy);
+}
+
+static int x11_set_cursor_shape(vio_window_handle h, int shape)
+{
+    vio_x11_window *w = (vio_x11_window *)h;
+    if (!w || !x11_dpy || shape < 0 || shape >= VIO_PLATFORM_SHAPE_COUNT) return 0;
+    /* theme names (freedesktop cursor spec), then the core cursor font */
+    static const char *names[VIO_PLATFORM_SHAPE_COUNT] = {
+        "default", "text", "crosshair", "pointer", "ew-resize", "ns-resize", "nwse-resize", "nesw-resize", "all-scroll", "not-allowed",
+    };
+    static const unsigned int fonts[VIO_PLATFORM_SHAPE_COUNT] = {
+        XC_left_ptr, XC_xterm, XC_crosshair, XC_hand2, XC_sb_h_double_arrow, XC_sb_v_double_arrow,
+        XC_bottom_right_corner, XC_bottom_left_corner, XC_fleur, XC_X_cursor,
+    };
+    if (!x11_shape_cursor[shape]) {
+        if (x11_xcursor()) x11_shape_cursor[shape] = xcur.LibraryLoadCursor(x11_dpy, names[shape]);
+        if (!x11_shape_cursor[shape]) x11_shape_cursor[shape] = XCreateFontCursor(x11_dpy, fonts[shape]);
+    }
+    if (!x11_shape_cursor[shape]) return 0;
+    x11_use_cursor(w, x11_shape_cursor[shape], 0);
+    return 1;
+}
+
+static int x11_set_cursor_image(vio_window_handle h, const unsigned char *rgba, int width, int height, int hot_x, int hot_y)
+{
+    vio_x11_window *w = (vio_x11_window *)h;
+    if (!w || !x11_dpy || !x11_xcursor()) return 0;
+    x11_XcursorImage *img = xcur.ImageCreate(width, height);
+    if (!img) return 0;
+    img->xhot = (unsigned int)hot_x;
+    img->yhot = (unsigned int)hot_y;
+    for (int i = 0; i < width * height; i++) {   /* premultiplied ARGB */
+        unsigned int a = rgba[i * 4 + 3];
+        img->pixels[i] = (a << 24) | ((rgba[i * 4 + 0] * a / 255) << 16) | ((rgba[i * 4 + 1] * a / 255) << 8) | (rgba[i * 4 + 2] * a / 255);
+    }
+    Cursor c = xcur.ImageLoadCursor(x11_dpy, img);
+    xcur.ImageDestroy(img);
+    if (!c) return 0;
+    x11_use_cursor(w, c, 1);
+    return 1;
+}
+
+/* _NET_WM_ICON: width, height, ARGB pixels (as longs) per image */
+static int x11_set_window_icon(vio_window_handle h, int count, const vio_platform_image *images)
+{
+    vio_x11_window *w = (vio_x11_window *)h;
+    if (!w || !x11_dpy) return 0;
+    Atom icon = XInternAtom(x11_dpy, "_NET_WM_ICON", False);
+    if (count <= 0) {
+        XDeleteProperty(x11_dpy, w->win, icon);
+        XFlush(x11_dpy);
+        return 1;
+    }
+    size_t n = 0;
+    for (int i = 0; i < count; i++) n += 2 + (size_t)images[i].width * (size_t)images[i].height;
+    long *data = (long *)malloc(n * sizeof(long));
+    if (!data) return 0;
+    long *t = data;
+    for (int i = 0; i < count; i++) {
+        *t++ = images[i].width;
+        *t++ = images[i].height;
+        const unsigned char *p = images[i].rgba;
+        for (int k = 0; k < images[i].width * images[i].height; k++, p += 4)
+            *t++ = (long)(((unsigned long)p[3] << 24) | ((unsigned long)p[0] << 16) | ((unsigned long)p[1] << 8) | p[2]);
+    }
+    XChangeProperty(x11_dpy, w->win, icon, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)data, (int)n);
+    free(data);
+    XFlush(x11_dpy);
+    return 1;
+}
+
+/* WM_NORMAL_HINTS from the stored limits and ratio, keeping what else is set */
+static void x11_update_size_hints(vio_x11_window *w)
+{
+    XSizeHints *hints = XAllocSizeHints();
+    if (!hints) return;
+    long supplied = 0;
+    XGetWMNormalHints(x11_dpy, w->win, hints, &supplied);
+    hints->flags &= ~(PMinSize | PMaxSize | PAspect);
+    if (w->min_w > 0 || w->min_h > 0) {
+        hints->flags |= PMinSize;
+        hints->min_width = w->min_w > 0 ? w->min_w : 1;
+        hints->min_height = w->min_h > 0 ? w->min_h : 1;
+    }
+    if (w->max_w > 0 || w->max_h > 0) {
+        hints->flags |= PMaxSize;
+        hints->max_width = w->max_w > 0 ? w->max_w : 32767;
+        hints->max_height = w->max_h > 0 ? w->max_h : 32767;
+    }
+    if (w->aspect_num > 0 && w->aspect_den > 0) {
+        hints->flags |= PAspect;
+        hints->min_aspect.x = hints->max_aspect.x = w->aspect_num;
+        hints->min_aspect.y = hints->max_aspect.y = w->aspect_den;
+    }
+    XSetWMNormalHints(x11_dpy, w->win, hints);
+    XFree(hints);
+    XFlush(x11_dpy);
+}
+
+static int x11_set_size_limits(vio_window_handle h, int min_w, int min_h, int max_w, int max_h)
+{
+    vio_x11_window *w = (vio_x11_window *)h;
+    if (!w || !x11_dpy) return 0;
+    w->min_w = min_w > 0 ? min_w : 0;
+    w->min_h = min_h > 0 ? min_h : 0;
+    w->max_w = max_w > 0 ? max_w : 0;
+    w->max_h = max_h > 0 ? max_h : 0;
+    x11_update_size_hints(w);
+    return 1;
+}
+
+static int x11_set_aspect_ratio(vio_window_handle h, int num, int den)
+{
+    vio_x11_window *w = (vio_x11_window *)h;
+    if (!w || !x11_dpy) return 0;
+    w->aspect_num = num > 0 && den > 0 ? num : 0;
+    w->aspect_den = num > 0 && den > 0 ? den : 0;
+    x11_update_size_hints(w);
+    return 1;
+}
+
+/* _NET_WM_STATE_ABOVE: a request to the window manager once mapped, the
+ * property itself before (EWMH: the WM reads it when the window maps). */
+static int x11_set_floating(vio_window_handle h, int floating)
+{
+    vio_x11_window *w = (vio_x11_window *)h;
+    if (!w || !x11_dpy) return 0;
+    Atom above = XInternAtom(x11_dpy, "_NET_WM_STATE_ABOVE", False);
+    XWindowAttributes wa;
+    if (XGetWindowAttributes(x11_dpy, w->win, &wa) && wa.map_state != IsUnmapped) {
+        x11_send_state(w, floating, above, 0);
+        return 1;
+    }
+    Atom *atoms = NULL, *keep = NULL;
+    Atom type;
+    int format;
+    unsigned long n = 0, after = 0, k = 0;
+    unsigned char *data = NULL;
+    if (XGetWindowProperty(x11_dpy, w->win, x11_net_wm_state, 0, 64, False, XA_ATOM, &type, &format, &n, &after, &data) == Success && data)
+        atoms = (Atom *)data;
+    keep = (Atom *)malloc((n + 1) * sizeof(Atom));
+    if (!keep) { if (data) XFree(data); return 0; }
+    for (unsigned long i = 0; i < n; i++) if (atoms[i] != above) keep[k++] = atoms[i];
+    if (floating) keep[k++] = above;
+    XChangeProperty(x11_dpy, w->win, x11_net_wm_state, XA_ATOM, 32, PropModeReplace, (unsigned char *)keep, (int)k);
+    free(keep);
+    if (data) XFree(data);
+    XFlush(x11_dpy);
+    return 1;
+}
+
+/* _NET_WM_WINDOW_OPACITY, read by the compositor */
+static int x11_set_opacity(vio_window_handle h, float opacity)
+{
+    vio_x11_window *w = (vio_x11_window *)h;
+    if (!w || !x11_dpy) return 0;
+    Atom a = XInternAtom(x11_dpy, "_NET_WM_WINDOW_OPACITY", False);
+    if (opacity >= 1.0f) {
+        XDeleteProperty(x11_dpy, w->win, a);
+    } else {
+        unsigned long v = (unsigned long)(opacity * 4294967295.0);
+        XChangeProperty(x11_dpy, w->win, a, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&v, 1);
+    }
+    XFlush(x11_dpy);
+    return 1;
+}
+
 static int x11_get_attrib(vio_window_handle h, vio_window_attrib a)
 {
     vio_x11_window *w = (vio_x11_window *)h;
@@ -1136,8 +1346,10 @@ static void x11_set_cursor_mode(vio_window_handle h, int mode)
     vio_x11_window *w = (vio_x11_window *)h;
     if (!w || w->cursor_mode == mode) return;
     if (w->cursor_mode == VIO_PLATFORM_CURSOR_DISABLED) XUngrabPointer(x11_dpy, CurrentTime);
-    if (mode == VIO_PLATFORM_CURSOR_NORMAL) XUndefineCursor(x11_dpy, w->win);
-    else XDefineCursor(x11_dpy, w->win, x11_blank_cursor);
+    if (mode == VIO_PLATFORM_CURSOR_NORMAL) {
+        if (w->cursor) XDefineCursor(x11_dpy, w->win, w->cursor);
+        else XUndefineCursor(x11_dpy, w->win);
+    } else XDefineCursor(x11_dpy, w->win, x11_blank_cursor);
     if (mode == VIO_PLATFORM_CURSOR_DISABLED) {
         double x = 0, y = 0;
         w->cursor_mode = VIO_PLATFORM_CURSOR_NORMAL;
@@ -1454,6 +1666,15 @@ static const vio_platform vio_platform_x11 = {
     .clipboard_get        = x11_clipboard_get,
     .clipboard_set        = x11_clipboard_set,
     .key_name             = x11_key_name,
+    .set_cursor_shape     = x11_set_cursor_shape,
+    .set_cursor_image     = x11_set_cursor_image,
+    .set_window_icon      = x11_set_window_icon,
+    .set_size_limits      = x11_set_size_limits,
+    .set_aspect_ratio     = x11_set_aspect_ratio,
+    .set_floating         = x11_set_floating,
+    .set_opacity          = x11_set_opacity,
+    .open_url             = vio_shell_open_url,
+    .reveal_file          = vio_shell_reveal_file,
 };
 
 void vio_platform_x11_register(void)

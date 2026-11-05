@@ -26,6 +26,8 @@
 #if defined(HAVE_COCOA) && !defined(HAVE_IOS)
 
 #import <Cocoa/Cocoa.h>
+#include <objc/message.h>
+#include <float.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <GameController/GameController.h>
 #include <dlfcn.h>
@@ -109,6 +111,7 @@ struct _vio_cocoa_window {
     CGDisplayModeRef saved_mode;
     NSRect           windowed_frame;
     unsigned char    keys_down[256];
+    void            *cursor;     /* NSCursor for the view, retained; NULL = arrow */
     vio_input_state *input;
 };
 
@@ -144,6 +147,13 @@ static void cocoa_report_size(vio_cocoa_window *w)
 - (BOOL)canBecomeKeyView { return YES; }
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
 - (BOOL)wantsUpdateLayer { return YES; }
+
+- (void)resetCursorRects
+{
+    vio_cocoa_window *w = self.owner;
+    NSCursor *c = (w && w->cursor) ? (__bridge NSCursor *)w->cursor : [NSCursor arrowCursor];
+    [self addCursorRect:self.bounds cursor:c];
+}
 
 - (void)keyDown:(NSEvent *)event
 {
@@ -555,6 +565,7 @@ static void cocoa_destroy_window(vio_window_handle h)
             CFRelease(w->glctx);
         }
         NSWindow *win = COCOA_WIN(w);
+        if (w->cursor) { CFRelease(w->cursor); w->cursor = NULL; }
         ((__bridge VioCocoaView *)w->view).owner = NULL;
         ((__bridge VioCocoaDelegate *)w->delegate).owner = NULL;
         win.delegate = nil;
@@ -785,6 +796,156 @@ static void cocoa_set_cursor_mode(vio_window_handle h, int mode)
         CGAssociateMouseAndMouseCursorPosition(true);
     }
     w->cursor_mode = mode;
+}
+
+/* ── Window details (DESKTOP-APP-PLAN Phase 1) ────────────────────── */
+
+static NSCursor *cocoa_private_cursor(const char *sel)
+{
+    /* GLFW's source for diagonal resize. Private: some releases answer
+     * respondsToSelector and still throw, so the call is guarded. */
+    SEL s = sel_registerName(sel);
+    if (![NSCursor respondsToSelector:s]) return nil;
+    @try {
+        id c = ((id (*)(id, SEL))objc_msgSend)([NSCursor class], s);
+        return [c isKindOfClass:[NSCursor class]] ? c : nil;
+    } @catch (NSException *e) {
+        (void)e;
+        return nil;
+    }
+}
+
+static void cocoa_apply_cursor(vio_cocoa_window *w, NSCursor *c)
+{
+    if (w->cursor) CFRelease(w->cursor);
+    w->cursor = c ? (void *)CFBridgingRetain(c) : NULL;
+    [COCOA_WIN(w) invalidateCursorRectsForView:COCOA_VIEW(w)];
+    /* the cursor rects only switch on the next mouse move: set it now when inside */
+    NSPoint p = [COCOA_WIN(w) mouseLocationOutsideOfEventStream];
+    if (w->cursor_mode == VIO_PLATFORM_CURSOR_NORMAL && NSPointInRect(p, [COCOA_VIEW(w) frame])) [(c ? c : [NSCursor arrowCursor]) set];
+}
+
+static int cocoa_set_cursor_shape(vio_window_handle h, int shape)
+{
+    vio_cocoa_window *w = (vio_cocoa_window *)h;
+    if (!w) return 0;
+    @autoreleasepool {
+        NSCursor *c = nil;
+        switch (shape) {
+            case VIO_PLATFORM_SHAPE_IBEAM:       c = [NSCursor IBeamCursor]; break;
+            case VIO_PLATFORM_SHAPE_CROSSHAIR:   c = [NSCursor crosshairCursor]; break;
+            case VIO_PLATFORM_SHAPE_HAND:        c = [NSCursor pointingHandCursor]; break;
+            case VIO_PLATFORM_SHAPE_RESIZE_EW:   c = [NSCursor resizeLeftRightCursor]; break;
+            case VIO_PLATFORM_SHAPE_RESIZE_NS:   c = [NSCursor resizeUpDownCursor]; break;
+            case VIO_PLATFORM_SHAPE_RESIZE_NWSE: c = cocoa_private_cursor("_windowResizeNorthWestSouthEastCursor"); break;
+            case VIO_PLATFORM_SHAPE_RESIZE_NESW: c = cocoa_private_cursor("_windowResizeNorthEastSouthWestCursor"); break;
+            case VIO_PLATFORM_SHAPE_RESIZE_ALL:  c = [NSCursor closedHandCursor]; break;
+            case VIO_PLATFORM_SHAPE_NOT_ALLOWED: c = [NSCursor operationNotAllowedCursor]; break;
+            default:                             c = [NSCursor arrowCursor]; break;
+        }
+        cocoa_apply_cursor(w, c ? c : [NSCursor arrowCursor]);
+    }
+    return 1;
+}
+
+static NSImage *cocoa_image(const unsigned char *rgba, int width, int height)
+{
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:width pixelsHigh:height
+        bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace
+        bitmapFormat:NSBitmapFormatAlphaNonpremultiplied bytesPerRow:width * 4 bitsPerPixel:32];
+    if (!rep) return nil;
+    memcpy(rep.bitmapData, rgba, (size_t)width * (size_t)height * 4);
+    NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(width, height)];
+    [img addRepresentation:rep];
+    return img;
+}
+
+static int cocoa_set_cursor_image(vio_window_handle h, const unsigned char *rgba, int width, int height, int hot_x, int hot_y)
+{
+    vio_cocoa_window *w = (vio_cocoa_window *)h;
+    if (!w) return 0;
+    @autoreleasepool {
+        NSImage *img = cocoa_image(rgba, width, height);
+        if (!img) return 0;
+        cocoa_apply_cursor(w, [[NSCursor alloc] initWithImage:img hotSpot:NSMakePoint(hot_x, hot_y)]);
+    }
+    return 1;
+}
+
+/* Windows have no icons on macOS: the image is the application's (Dock) icon. */
+static int cocoa_set_window_icon(vio_window_handle h, int count, const vio_platform_image *images)
+{
+    (void)h;
+    @autoreleasepool {
+        if (count <= 0) { [NSApp setApplicationIconImage:nil]; return 1; }
+        int best = 0;
+        for (int i = 1; i < count; i++) if (images[i].width > images[best].width) best = i;
+        NSImage *img = [[NSImage alloc] initWithSize:NSMakeSize(images[best].width, images[best].height)];
+        for (int i = 0; i < count; i++) {
+            NSImage *one = cocoa_image(images[i].rgba, images[i].width, images[i].height);
+            if (one) for (NSImageRep *r in one.representations) [img addRepresentation:r];
+        }
+        [NSApp setApplicationIconImage:img];
+    }
+    return 1;
+}
+
+static int cocoa_set_size_limits(vio_window_handle h, int min_w, int min_h, int max_w, int max_h)
+{
+    vio_cocoa_window *w = (vio_cocoa_window *)h;
+    if (!w) return 0;
+    NSWindow *win = COCOA_WIN(w);
+    win.contentMinSize = NSMakeSize(min_w > 0 ? min_w : 0, min_h > 0 ? min_h : 0);
+    win.contentMaxSize = NSMakeSize(max_w > 0 ? max_w : FLT_MAX, max_h > 0 ? max_h : FLT_MAX);
+    return 1;
+}
+
+static int cocoa_set_aspect_ratio(vio_window_handle h, int num, int den)
+{
+    vio_cocoa_window *w = (vio_cocoa_window *)h;
+    if (!w) return 0;
+    if (num > 0 && den > 0) COCOA_WIN(w).contentAspectRatio = NSMakeSize(num, den);
+    else COCOA_WIN(w).contentResizeIncrements = NSMakeSize(1.0, 1.0);   /* clears the ratio (as GLFW does) */
+    return 1;
+}
+
+static int cocoa_set_floating(vio_window_handle h, int floating)
+{
+    vio_cocoa_window *w = (vio_cocoa_window *)h;
+    if (!w) return 0;
+    COCOA_WIN(w).level = floating ? NSFloatingWindowLevel : NSNormalWindowLevel;
+    return 1;
+}
+
+static int cocoa_set_opacity(vio_window_handle h, float opacity)
+{
+    vio_cocoa_window *w = (vio_cocoa_window *)h;
+    if (!w) return 0;
+    COCOA_WIN(w).alphaValue = opacity;
+    COCOA_WIN(w).opaque = opacity >= 1.0f;
+    return 1;
+}
+
+/* VIO_OPEN_COMMAND replaces NSWorkspace with a program (`open` semantics: -R reveals). */
+static int cocoa_open_url(const char *url)
+{
+    if (getenv("VIO_OPEN_COMMAND")) { const char *a[1] = { url }; return vio_platform_spawn_opener("open", a, 1); }
+    @autoreleasepool {
+        NSURL *u = [NSURL URLWithString:[NSString stringWithUTF8String:url]];
+        if (!u) u = [NSURL URLWithString:[[NSString stringWithUTF8String:url]
+                         stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLFragmentAllowedCharacterSet]]];
+        return u && [[NSWorkspace sharedWorkspace] openURL:u] ? 1 : 0;
+    }
+}
+
+static int cocoa_reveal_file(const char *path)
+{
+    if (getenv("VIO_OPEN_COMMAND")) { const char *a[2] = { "-R", path }; return vio_platform_spawn_opener("open", a, 2); }
+    @autoreleasepool {
+        NSURL *u = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+        [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[u]];
+    }
+    return 1;
 }
 
 static int cocoa_window_monitor(vio_window_handle h)
@@ -1116,6 +1277,15 @@ static const vio_platform vio_platform_cocoa = {
     .clipboard_get        = cocoa_clipboard_get,
     .clipboard_set        = cocoa_clipboard_set,
     .key_name             = cocoa_key_name,
+    .set_cursor_shape     = cocoa_set_cursor_shape,
+    .set_cursor_image     = cocoa_set_cursor_image,
+    .set_window_icon      = cocoa_set_window_icon,
+    .set_size_limits      = cocoa_set_size_limits,
+    .set_aspect_ratio     = cocoa_set_aspect_ratio,
+    .set_floating         = cocoa_set_floating,
+    .set_opacity          = cocoa_set_opacity,
+    .open_url             = cocoa_open_url,
+    .reveal_file          = cocoa_reveal_file,
 };
 
 void vio_platform_cocoa_register(void)

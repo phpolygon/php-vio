@@ -38,6 +38,7 @@
 #include "../../../include/vio_platform.h"
 #include "../../../include/vio_constants.h"
 #include "../../vio_input.h"
+#include "../vio_shell.h"
 
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
@@ -64,6 +65,11 @@ typedef struct _vio_win32_window {
     int              monitor;                  /* fullscreen monitor index, -1 windowed */
     DEVMODEW         monitor_saved_mode;
     WCHAR            monitor_device[32];
+    HCURSOR          cursor;                   /* client-area cursor, NULL = arrow */
+    int              cursor_owned;             /* cursor from an image: DestroyCursor */
+    HICON            icon_big, icon_small;     /* vio_set_window_icon, owned */
+    int              min_w, min_h, max_w, max_h;   /* client size limits, 0 = none */
+    int              aspect_num, aspect_den;
     vio_input_state *input;
 } vio_win32_window;
 
@@ -275,6 +281,34 @@ static void w32_report_size(vio_win32_window *w)
     vio_input_resize_event(w->input, cw, ch);
 }
 
+/* Window size of a client size, for this window's style and DPI. */
+static void w32_frame(vio_win32_window *w, int *xo, int *yo)
+{
+    RECT f = { 0, 0, 0, 0 };
+    w32_adjust(&f, (DWORD)GetWindowLongW(w->hwnd, GWL_STYLE), w32_window_dpi(w->hwnd));
+    *xo = f.right - f.left;
+    *yo = f.bottom - f.top;
+}
+
+/* Keep the aspect ratio while the user drags an edge (GLFW's rule). */
+static void w32_apply_aspect(vio_win32_window *w, WPARAM edge, RECT *r)
+{
+    int xo, yo;
+    w32_frame(w, &xo, &yo);
+    double ratio = (double)w->aspect_num / (double)w->aspect_den;
+    switch (edge) {
+        case WMSZ_LEFT: case WMSZ_RIGHT: case WMSZ_BOTTOMLEFT: case WMSZ_BOTTOMRIGHT:
+            r->bottom = r->top + yo + (LONG)((double)(r->right - r->left - xo) / ratio);
+            break;
+        case WMSZ_TOPLEFT: case WMSZ_TOPRIGHT:
+            r->top = r->bottom - yo - (LONG)((double)(r->right - r->left - xo) / ratio);
+            break;
+        case WMSZ_TOP: case WMSZ_BOTTOM:
+            r->right = r->left + xo + (LONG)((double)(r->bottom - r->top - yo) * ratio);
+            break;
+    }
+}
+
 static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     vio_win32_window *w = (vio_win32_window *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -376,6 +410,27 @@ static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_SETCURSOR:
             if (LOWORD(lp) == HTCLIENT && w->cursor_mode != VIO_PLATFORM_CURSOR_NORMAL) {
                 SetCursor(NULL);
+                return TRUE;
+            }
+            if (LOWORD(lp) == HTCLIENT && w->cursor) {
+                SetCursor(w->cursor);
+                return TRUE;
+            }
+            break;
+        case WM_GETMINMAXINFO: {
+            if (!(w->min_w | w->min_h | w->max_w | w->max_h)) break;
+            MINMAXINFO *mmi = (MINMAXINFO *)lp;
+            int xo, yo;
+            w32_frame(w, &xo, &yo);
+            if (w->min_w > 0) mmi->ptMinTrackSize.x = w->min_w + xo;
+            if (w->min_h > 0) mmi->ptMinTrackSize.y = w->min_h + yo;
+            if (w->max_w > 0) mmi->ptMaxTrackSize.x = w->max_w + xo;
+            if (w->max_h > 0) mmi->ptMaxTrackSize.y = w->max_h + yo;
+            return 0;
+        }
+        case WM_SIZING:
+            if (w->aspect_num > 0 && w->aspect_den > 0) {
+                w32_apply_aspect(w, wp, (RECT *)lp);
                 return TRUE;
             }
             break;
@@ -798,6 +853,9 @@ static void w32_destroy_window(vio_window_handle h)
         SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, 0);
         DestroyWindow(w->hwnd);
     }
+    if (w->cursor_owned && w->cursor) DestroyCursor(w->cursor);
+    if (w->icon_big) DestroyIcon(w->icon_big);
+    if (w->icon_small) DestroyIcon(w->icon_small);
     free(w);
 }
 
@@ -893,6 +951,159 @@ static void w32_set_title(vio_window_handle h, const char *utf8)
 }
 
 /* Client-area size in pixels (GLFW's Win32 window size). */
+/* ── Window details (DESKTOP-APP-PLAN Phase 1) ────────────────────── */
+
+/* An icon or cursor from RGBA (GLFW's way: 32-bit top-down DIB with alpha + empty mask). */
+static HICON w32_create_icon(const unsigned char *rgba, int width, int height, int hot_x, int hot_y, BOOL icon)
+{
+    BITMAPV5HEADER bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = width;
+    bi.bV5Height = -height;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00ff0000;
+    bi.bV5GreenMask = 0x0000ff00;
+    bi.bV5BlueMask = 0x000000ff;
+    bi.bV5AlphaMask = 0xff000000;
+    unsigned char *px = NULL;
+    HDC dc = GetDC(NULL);
+    HBITMAP color = CreateDIBSection(dc, (BITMAPINFO *)&bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+    ReleaseDC(NULL, dc);
+    if (!color) return NULL;
+    HBITMAP mask = CreateBitmap(width, height, 1, 1, NULL);
+    if (!mask) { DeleteObject(color); return NULL; }
+    for (int i = 0; i < width * height; i++) {
+        px[i * 4 + 0] = rgba[i * 4 + 2];
+        px[i * 4 + 1] = rgba[i * 4 + 1];
+        px[i * 4 + 2] = rgba[i * 4 + 0];
+        px[i * 4 + 3] = rgba[i * 4 + 3];
+    }
+    ICONINFO ii;
+    ZeroMemory(&ii, sizeof(ii));
+    ii.fIcon = icon;
+    ii.xHotspot = (DWORD)hot_x;
+    ii.yHotspot = (DWORD)hot_y;
+    ii.hbmMask = mask;
+    ii.hbmColor = color;
+    HICON h = CreateIconIndirect(&ii);
+    DeleteObject(color);
+    DeleteObject(mask);
+    return h;
+}
+
+static void w32_use_cursor(vio_win32_window *w, HCURSOR c, int owned)
+{
+    if (w->cursor_owned && w->cursor) DestroyCursor(w->cursor);
+    w->cursor = c;
+    w->cursor_owned = owned;
+    POINT p;
+    if (w->cursor_mode == VIO_PLATFORM_CURSOR_NORMAL && GetCursorPos(&p) && WindowFromPoint(p) == w->hwnd) SetCursor(c);
+}
+
+static int w32_set_cursor_shape(vio_window_handle h, int shape)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w || shape < 0 || shape >= VIO_PLATFORM_SHAPE_COUNT) return 0;
+    static const WORD ids[VIO_PLATFORM_SHAPE_COUNT] = {
+        32512 /* ARROW */, 32513 /* IBEAM */, 32515 /* CROSS */, 32649 /* HAND */, 32644 /* SIZEWE */,
+        32645 /* SIZENS */, 32642 /* SIZENWSE */, 32643 /* SIZENESW */, 32646 /* SIZEALL */, 32648 /* NO */,
+    };
+    HCURSOR c = LoadCursorW(NULL, MAKEINTRESOURCEW(ids[shape]));   /* shared: never destroyed */
+    if (!c) return 0;
+    w32_use_cursor(w, c, 0);
+    return 1;
+}
+
+static int w32_set_cursor_image(vio_window_handle h, const unsigned char *rgba, int width, int height, int hot_x, int hot_y)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return 0;
+    HICON c = w32_create_icon(rgba, width, height, hot_x, hot_y, FALSE);
+    if (!c) return 0;
+    w32_use_cursor(w, (HCURSOR)c, 1);
+    return 1;
+}
+
+/* The image closest in area to the size the system draws. */
+static int w32_pick_icon(int count, const vio_platform_image *images, int want)
+{
+    int best = 0, best_d = 0x7fffffff;
+    for (int i = 0; i < count; i++) {
+        int d = abs(images[i].width * images[i].height - want * want);
+        if (d < best_d) { best = i; best_d = d; }
+    }
+    return best;
+}
+
+static int w32_set_window_icon(vio_window_handle h, int count, const vio_platform_image *images)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return 0;
+    HICON big = NULL, small = NULL;
+    if (count > 0) {
+        const vio_platform_image *b = &images[w32_pick_icon(count, images, GetSystemMetrics(SM_CXICON))];
+        const vio_platform_image *s = &images[w32_pick_icon(count, images, GetSystemMetrics(SM_CXSMICON))];
+        big = w32_create_icon(b->rgba, b->width, b->height, 0, 0, TRUE);
+        small = w32_create_icon(s->rgba, s->width, s->height, 0, 0, TRUE);
+        if (!big || !small) {
+            if (big) DestroyIcon(big);
+            if (small) DestroyIcon(small);
+            return 0;
+        }
+    }
+    SendMessageW(w->hwnd, WM_SETICON, ICON_BIG, (LPARAM)big);
+    SendMessageW(w->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small);
+    if (w->icon_big) DestroyIcon(w->icon_big);
+    if (w->icon_small) DestroyIcon(w->icon_small);
+    w->icon_big = big;
+    w->icon_small = small;
+    return 1;
+}
+
+static int w32_set_size_limits(vio_window_handle h, int min_w, int min_h, int max_w, int max_h)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return 0;
+    w->min_w = min_w > 0 ? min_w : 0;
+    w->min_h = min_h > 0 ? min_h : 0;
+    w->max_w = max_w > 0 ? max_w : 0;
+    w->max_h = max_h > 0 ? max_h : 0;
+    return 1;
+}
+
+static int w32_set_aspect_ratio(vio_window_handle h, int num, int den)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return 0;
+    w->aspect_num = num > 0 && den > 0 ? num : 0;
+    w->aspect_den = num > 0 && den > 0 ? den : 0;
+    return 1;
+}
+
+static int w32_set_floating(vio_window_handle h, int floating)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return 0;
+    return SetWindowPos(w->hwnd, floating ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) != 0;
+}
+
+static int w32_set_opacity(vio_window_handle h, float opacity)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return 0;
+    LONG ex = GetWindowLongW(w->hwnd, GWL_EXSTYLE);
+    if (opacity < 1.0f) {
+        SetWindowLongW(w->hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        return SetLayeredWindowAttributes(w->hwnd, 0, (BYTE)(opacity * 255.0f + 0.5f), LWA_ALPHA) != 0;
+    }
+    SetWindowLongW(w->hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+    return 1;
+}
+
 static void w32_set_window_size(vio_window_handle h, int cw, int ch)
 {
     vio_win32_window *w = (vio_win32_window *)h;
@@ -1292,6 +1503,15 @@ static const vio_platform vio_platform_win32 = {
     .clipboard_get        = w32_clipboard_get,
     .clipboard_set        = w32_clipboard_set,
     .key_name             = w32_key_name,
+    .set_cursor_shape     = w32_set_cursor_shape,
+    .set_cursor_image     = w32_set_cursor_image,
+    .set_window_icon      = w32_set_window_icon,
+    .set_size_limits      = w32_set_size_limits,
+    .set_aspect_ratio     = w32_set_aspect_ratio,
+    .set_floating         = w32_set_floating,
+    .set_opacity          = w32_set_opacity,
+    .open_url             = vio_shell_open_url,
+    .reveal_file          = vio_shell_reveal_file,
 };
 
 void vio_platform_win32_register(void)

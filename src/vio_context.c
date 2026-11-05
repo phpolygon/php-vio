@@ -17,6 +17,7 @@ static zend_object *vio_context_create_object(zend_class_entry *ce)
     ctx->window       = NULL;
     ctx->initialized  = 0;
     ctx->should_close = 0;
+    ctx->size_min_w = ctx->size_min_h = ctx->size_max_w = ctx->size_max_h = 0;
     ctx->in_frame     = 0;
     ctx->frame_present = -1;   /* VIO_PRESENT_AUTO */
     memset(&ctx->config, 0, sizeof(vio_config));
