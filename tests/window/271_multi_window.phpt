@@ -57,6 +57,30 @@ foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
     vio_inject_window_event($w, VIO_WINDOW_EVENT_CLOSE);
     if ($asked !== 1 || !vio_should_close($w) || vio_should_close($ctx)) $fail[] = 'close';
 
+    /* OpenGL: a visible window has its own context sharing the main one's objects and is presented by a blit */
+    if ($b === 'opengl') {
+        $v = vio_window($ctx, ['width' => 32, 'height' => 20, 'title' => 'Visible']);
+        if ($v instanceof VioWindow) {
+            for ($i = 0; $i < 3; $i++) {
+                vio_begin($ctx, ['window' => $v]);
+                vio_clear($ctx, 0.0, 1.0, 1.0, 1.0);
+                vio_sprite($ctx, $tex, ['x' => 0, 'y' => 0, 'width' => 32, 'height' => 10]);
+                vio_draw_2d($ctx);
+                vio_end($ctx);
+                vio_begin($ctx);
+                vio_clear($ctx, 0.0, 0.0, 0.0, 1.0);
+                vio_end($ctx);
+            }
+            [$fw, $fh] = vio_framebuffer_size($v);
+            $pv = vio_read_pixels($v);
+            if (strlen($pv) !== $fw * $fh * 4) $fail[] = 'visible length';
+            elseif (!$near($px($pv, $fw, intdiv($fw, 2), intdiv($fh, 4)), [255, 255, 0]) || !$near($px($pv, $fw, intdiv($fw, 2), intdiv($fh * 3, 4)), [0, 255, 255]))
+                $fail[] = 'visible ' . json_encode([$px($pv, $fw, intdiv($fw, 2), intdiv($fh, 4)), $px($pv, $fw, intdiv($fw, 2), intdiv($fh * 3, 4))]);
+            if (!$near($px(vio_read_pixels($ctx), 48, 24, 16), [0, 0, 0])) $fail[] = 'main after a visible window frame';
+            vio_destroy_window($v);
+        }
+    }
+
     /* a window belongs to its context (the null backend: one GPU context per backend and process) */
     $other = vio_create('null', ['width' => 16, 'height' => 16, 'headless' => true]);
     if ($other) {
