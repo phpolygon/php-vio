@@ -9,6 +9,8 @@ $dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'vio266-' . getmypid();
 $child = <<<'PHP'
 <?php
 [$dir] = array_slice($argv, 1);
+/* a platform that is not built in falls back to the default one: that one is run under its own name */
+if (vio_platform() !== getenv('VIO_PLATFORM')) { echo "skip\n"; exit; }
 $ctx = @vio_create('auto', ['width' => 64, 'height' => 48, 'headless' => true]) ?: vio_create('null', ['width' => 64, 'height' => 48]);
 $info = vio_platform_info();
 $err = function (callable $f) { try { $f(); return 'none'; } catch (ValueError $e) { return 'ValueError'; } };
@@ -63,9 +65,9 @@ foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
     stream_set_blocking($pipes[1], false);
     stream_set_blocking($pipes[2], false);
     $line = $errout = '';
-    $end = microtime(true) + 20;
+    $end = microtime(true) + 15;
     while (proc_get_status($p)['running'] && microtime(true) < $end) { $line .= stream_get_contents($pipes[1]); $errout .= stream_get_contents($pipes[2]); usleep(50000); }
-    if (proc_get_status($p)['running']) { proc_terminate($p, 9); $errout .= ' (killed after 20 s: the dialog stayed open)'; }
+    if (proc_get_status($p)['running']) { proc_terminate($p, 9); $errout .= ' (killed after 15 s: the dialog stayed open)'; }
     $line = trim($line . stream_get_contents($pipes[1]));
     $errout = trim($errout . stream_get_contents($pipes[2]));
     proc_close($p);
