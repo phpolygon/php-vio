@@ -60,17 +60,20 @@ foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
     $env['VIO_PLATFORM'] = $platform;
     $env['VIO_TEST_DIALOG_TRACE'] = '1';
     unset($env['DBUS_SESSION_BUS_ADDRESS']);   // a desktop's portal would open a real dialog (268 covers it with a fake)
-    $p = proc_open($cmd, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
-    /* a dialog the hook cannot dismiss must not hang the suite: 20 s, then kill */
-    stream_set_blocking($pipes[1], false);
-    stream_set_blocking($pipes[2], false);
-    $line = $errout = '';
+    /* files, not pipes: Windows pipes cannot be non-blocking, a read would wait for a hanging child */
+    $o = "$dir/out-$platform.txt";
+    $e = "$dir/err-$platform.txt";
+    $p = proc_open($cmd, [1 => ['file', $o, 'w'], 2 => ['file', $e, 'w']], $pipes, null, $env);
+    /* a dialog the hook cannot dismiss must not hang the suite: 15 s, then kill */
     $end = microtime(true) + 15;
-    while (proc_get_status($p)['running'] && microtime(true) < $end) { $line .= stream_get_contents($pipes[1]); $errout .= stream_get_contents($pipes[2]); usleep(50000); }
-    if (proc_get_status($p)['running']) { proc_terminate($p, 9); $errout .= ' (killed after 15 s: the dialog stayed open)'; }
-    $line = trim($line . stream_get_contents($pipes[1]));
-    $errout = trim($errout . stream_get_contents($pipes[2]));
+    while (proc_get_status($p)['running'] && microtime(true) < $end) usleep(50000);
+    $killed = proc_get_status($p)['running'];
+    if ($killed) proc_terminate($p, 9);
     proc_close($p);
+    $line = trim((string)@file_get_contents($o));
+    $errout = trim((string)@file_get_contents($e)) . ($killed ? ' (killed after 15 s: the dialog stayed open)' : '');
+    @unlink($o);
+    @unlink($e);
     $errs[$platform] = $errout !== '' ? " [stderr: $errout]" : '';
     if (str_starts_with($line, $platform . ' ')) $results[$platform] = substr($line, strlen($platform) + 1);
     elseif ($platform === 'null' || $platform === vio_platform()) $results[$platform] = "no result: $line $errout";
