@@ -108,6 +108,7 @@ typedef enum {
     VIO_WINDOW_CB_DROP,
     VIO_WINDOW_CB_MENU,
     VIO_WINDOW_CB_PREEDIT,
+    VIO_WINDOW_CB_A11Y,        /* vio_on_a11y_action */
     VIO_WINDOW_CB_COUNT
 } vio_window_cb;
 
@@ -132,6 +133,7 @@ typedef struct _vio_input_state {
     /* Modal children open over this window (vio_window 'modal'): keys, buttons,
      * scroll, text, drops, menus and close requests are dropped while > 0. */
     int    blocked;
+    void  *a11y;              /* vio_a11y.c: the window's accessibility tree, NULL until vio_a11y_update */
     float  win_scale_x, win_scale_y;
     char   char_buffer[256];
     int    char_buffer_len;

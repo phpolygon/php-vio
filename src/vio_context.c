@@ -3,6 +3,7 @@
  */
 
 #include "vio_context.h"
+#include "vio_a11y.h"
 #include "upscale/vio_upscaler.h"
 
 zend_class_entry *vio_context_ce = NULL;
@@ -120,6 +121,7 @@ void vio_window_object_close(vio_window_object *w)
         ctx->backend->destroy_swapchain(w->swapchain);
     }
     w->swapchain = NULL;
+    vio_a11y_free(&w->view.input);   /* its adapter is tied to the platform window */
     if (w->view.window) {
         vio_window_destroy(w->view.window);
         w->view.window = NULL;
@@ -182,6 +184,7 @@ static void vio_context_free_object(zend_object *obj)
             ctx->backend->shutdown();
         }
         if (ctx->window) {
+            vio_a11y_free(&ctx->input);
             vio_window_destroy(ctx->window);
             ctx->window = NULL;
         }

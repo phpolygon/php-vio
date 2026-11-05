@@ -232,6 +232,28 @@ function vio_tray_remove(): bool {}
 function vio_on_preedit(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
+ * The window's accessibility tree for screen readers (AccessKit). The first
+ * update needs the nodes ('root' defaults to the first one); later ones carry
+ * only what changed. A node: 'id', 'role' (button, label, text_input, ...),
+ * optional 'label', 'value' (string or number), 'description', 'bounds'
+ * [x, y, width, height] in window coordinates, 'children' (ids), 'actions'
+ * (click, focus, set_value, ...), 'checked' (bool or 'mixed'), 'disabled',
+ * 'range' [min, max]. Children and 'focus' must be nodes of the tree.
+ * false where vio_platform_info()['accessibility'] is false.
+ *
+ * @param array{root?: string, focus?: string, nodes?: list<array<string, mixed>>} $update
+ */
+function vio_a11y_update(VioContext|VioWindow $context, array $update): bool {}
+
+/**
+ * Called when assistive technology asks for an action on a node: its id, the
+ * action ('click', 'focus', 'set_value', ...) and its value (string, number or null).
+ *
+ * @param callable(string, string, mixed): void $callback
+ */
+function vio_on_a11y_action(VioContext|VioWindow $context, callable $callback): void {}
+
+/**
  * A composition through the same path as the platform's (tests). -1 = after
  * the text; start <= end <= the text's length in codepoints.
  */

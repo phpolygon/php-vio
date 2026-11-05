@@ -63,6 +63,16 @@ PHP_ARG_WITH([harfbuzz],
   [no],
   [no])
 
+dnl AccessKit (vio_a11y_update, DESKTOP-APP-PLAN Phase 5): the accesskit-c
+dnl release package (headers + static libraries per OS and architecture).
+dnl Opt-in: DIR is the unpacked package.
+PHP_ARG_WITH([accesskit],
+  [for AccessKit (screen reader) support],
+  [AS_HELP_STRING([--with-accesskit=DIR],
+    [Path to the unpacked accesskit-c release - enables vio_a11y_update. Opt-in: off unless requested.])],
+  [no],
+  [no])
+
 dnl AMD FidelityFX FSR 3.1 (vio_upscaler_*, TEMPORAL-S3): compiled against the
 dnl vendored ffx-api headers, the runtime library is loaded with dlopen - no
 dnl link dependency. OPT-IN here (default no): FidelityFX ships Windows
@@ -377,6 +387,35 @@ if test "$PHP_VIO" != "no"; then
     esac
   fi
 
+  dnl ── AccessKit (static library from the accesskit-c package) ────────
+  if test "$PHP_ACCESSKIT" != "no"; then
+    AC_MSG_CHECKING([for the AccessKit static library])
+    case "`uname -s`" in
+      Darwin) vio_ak_os=macos ;;
+      Linux)  vio_ak_os=linux ;;
+      *)      vio_ak_os=unknown ;;
+    esac
+    case "`uname -m`" in
+      arm64|aarch64) vio_ak_arch=arm64 ;;
+      x86_64|amd64)  vio_ak_arch=x86_64 ;;
+      i?86)          vio_ak_arch=x86 ;;
+      *)             vio_ak_arch=unknown ;;
+    esac
+    vio_ak_lib="$PHP_ACCESSKIT/lib/$vio_ak_os/$vio_ak_arch/static/libaccesskit.a"
+    if test -f "$PHP_ACCESSKIT/include/accesskit.h" && test -f "$vio_ak_lib"; then
+      AC_MSG_RESULT([$vio_ak_lib])
+      PHP_ADD_INCLUDE($PHP_ACCESSKIT/include)
+      VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD $vio_ak_lib"
+      if test "$vio_ak_os" = "linux"; then
+        VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD -lpthread -ldl -lm"
+      fi
+      AC_DEFINE(HAVE_ACCESSKIT, 1, [Whether AccessKit is available])
+    else
+      AC_MSG_RESULT([no])
+      AC_MSG_ERROR([AccessKit not found: need $PHP_ACCESSKIT/include/accesskit.h and $vio_ak_lib])
+    fi
+  fi
+
   dnl ── iOS-only framework additions ───────────────────────────────────
   dnl UIKit + Foundation replace the Cocoa / IOKit set used on macOS.
   if test "$PHP_IOS" = "yes"; then
@@ -447,6 +486,7 @@ if test "$PHP_VIO" != "no"; then
     src/platform/linux/vio_desktop_linux.c \
     src/vio_mesh.c \
     src/vio_input.c \
+    src/vio_a11y.c \
     src/vio_shader.c \
     src/vio_pipeline.c \
     src/vio_compute_pipeline.c \

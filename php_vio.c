@@ -15,6 +15,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_backend_registry.h"
 #include "src/vio_resource.h"
 #include "src/vio_window.h"
+#include "src/vio_a11y.h"
 #include "src/vio_input.h"
 #include "src/vio_backend_null.h"
 #include "src/vio_mesh.h"
@@ -998,6 +999,7 @@ ZEND_FUNCTION(vio_destroy)
 
     if (ctx->frame_window) vio_window_leave(ctx);
     vio_context_close_windows(ctx);
+    vio_a11y_free(&ctx->input);   /* its adapter is tied to the platform window */
     /* Release the draw-time bind table before the GPU objects behind it go away. */
     vio_pending_textures_clear(ctx);
     vio_context_bindless_clear(ctx);
@@ -1085,6 +1087,13 @@ ZEND_FUNCTION(vio_close)
     }
 }
 
+/* Actions from assistive technology, for the main window and every further one. */
+static void vio_a11y_dispatch_all(vio_context_object *ctx)
+{
+    vio_a11y_dispatch(&ctx->input);
+    for (int i = 0; i < ctx->window_count; i++) vio_a11y_dispatch(&ctx->windows[i]->view.input);
+}
+
 ZEND_FUNCTION(vio_poll_events)
 {
     zval *ctx_zval;
@@ -1107,6 +1116,7 @@ ZEND_FUNCTION(vio_poll_events)
     vio_input_drain_ime(&ctx->input);
 #endif
     vio_input_poll_end(&ctx->input);
+    vio_a11y_dispatch_all(ctx);
 }
 
 /* Like vio_poll_events, but blocks first until an event, the timeout (seconds,
@@ -1132,6 +1142,7 @@ ZEND_FUNCTION(vio_wait_events)
     vio_input_drain_ime(&ctx->input);
 #endif
     vio_input_poll_end(&ctx->input);
+    vio_a11y_dispatch_all(ctx);
 }
 
 /* Wake a vio_wait_events, from any thread; sticky until a wait takes it. */
@@ -1167,6 +1178,25 @@ ZEND_FUNCTION(vio_on_scale)    { vio_set_window_callback(INTERNAL_FUNCTION_PARAM
 ZEND_FUNCTION(vio_on_refresh)  { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_REFRESH); }
 ZEND_FUNCTION(vio_on_drop)     { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_DROP); }
 ZEND_FUNCTION(vio_on_preedit)  { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_PREEDIT); }
+ZEND_FUNCTION(vio_on_a11y_action) { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_A11Y); }
+
+/* vio_a11y_update($ctx | $window, ['root' => id, 'focus' => id, 'nodes' => [...]]): the
+ * window's accessibility tree (AccessKit); only what changed needs to be sent.
+ * false where there is no accessibility (vio_platform_info()['accessibility']). */
+ZEND_FUNCTION(vio_a11y_update)
+{
+    zval *ctx_zval;
+    HashTable *update;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT(ctx_zval)
+        Z_PARAM_ARRAY_HT(update)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
+    int r = vio_a11y_update(&ctx->input, ctx->window, update, 2);
+    if (r < 0) RETURN_THROWS();
+    RETURN_BOOL(r);
+}
 
 /* A composition through the same path as the platform's: start/end -1 = after the text. */
 ZEND_FUNCTION(vio_inject_preedit)
@@ -16185,6 +16215,7 @@ ZEND_FUNCTION(vio_platform_info)
     add_assoc_bool(return_value, "tray", vio_plat_can((const void *)p->set_tray, VIO_PLATFORM_FEATURE_TRAY));
     add_assoc_bool(return_value, "ime_preedit", p->ime_preedit != 0);
     add_assoc_bool(return_value, "window_parent", p->set_parent != NULL);
+    add_assoc_bool(return_value, "accessibility", vio_a11y_available() != 0);
 }
 
 ZEND_FUNCTION(vio_set_cursor)

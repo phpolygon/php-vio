@@ -241,6 +241,13 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_tray_remove, 0, 0, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_a11y_update, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
+	ZEND_ARG_TYPE_INFO(0, update, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+#define arginfo_vio_on_a11y_action arginfo_vio_on_preedit
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_preedit, 0, 2, IS_VOID, 0)
 	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
@@ -1404,6 +1411,8 @@ ZEND_FUNCTION(vio_ime_enable);
 ZEND_FUNCTION(vio_ime_rect);
 ZEND_FUNCTION(vio_inject_preedit);
 ZEND_FUNCTION(vio_on_preedit);
+ZEND_FUNCTION(vio_on_a11y_action);
+ZEND_FUNCTION(vio_a11y_update);
 ZEND_FUNCTION(vio_tray_remove);
 ZEND_FUNCTION(vio_tray);
 ZEND_FUNCTION(vio_set_progress);
@@ -1676,6 +1685,8 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_ime_rect, arginfo_vio_ime_rect)
 	ZEND_FE(vio_inject_preedit, arginfo_vio_inject_preedit)
 	ZEND_FE(vio_on_preedit, arginfo_vio_on_preedit)
+	ZEND_FE(vio_on_a11y_action, arginfo_vio_on_a11y_action)
+	ZEND_FE(vio_a11y_update, arginfo_vio_a11y_update)
 	ZEND_FE(vio_tray_remove, arginfo_vio_tray_remove)
 	ZEND_FE(vio_tray, arginfo_vio_tray)
 	ZEND_FE(vio_set_progress, arginfo_vio_set_progress)
