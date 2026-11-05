@@ -1153,24 +1153,38 @@ static BOOL CALLBACK w32_find_dialog(HWND hwnd, LPARAM lp)
     if (GetClassNameW(hwnd, cls, 16) && wcscmp(cls, L"#32770") == 0) { *(HWND *)lp = hwnd; return FALSE; }
     return TRUE;
 }
+/* VIO_TEST_DIALOG_TRACE=1: what the hook sees, on stderr (CI diagnosis) */
+static void w32_test_trace(const char *what, const void *a, const void *b)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("VIO_TEST_DIALOG_TRACE") != NULL;
+    if (on) { fprintf(stderr, "[vio dialog hook] %s tick=%d %p %p\n", what, w32_test_ticks, a, b); fflush(stderr); }
+}
+
 static VOID CALLBACK w32_test_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
 {
     (void)hwnd; (void)msg; (void)id; (void)time;
     w32_test_ticks++;
     if (w32_test_fd) {
-        if (w32_test_cancel) { w32_test_fd->lpVtbl->Close(w32_test_fd, HRESULT_FROM_WIN32(ERROR_CANCELLED)); return; }
+        if (w32_test_cancel) {
+            HRESULT hr = w32_test_fd->lpVtbl->Close(w32_test_fd, HRESULT_FROM_WIN32(ERROR_CANCELLED));
+            w32_test_trace("file dialog close", (void *)w32_test_fd, (void *)(intptr_t)hr);
+            return;
+        }
         IOleWindow *ow = NULL;
         HWND dlg = NULL;
         if (SUCCEEDED(w32_test_fd->lpVtbl->QueryInterface(w32_test_fd, &w32_IID_IOleWindow, (void **)&ow)) && ow) {
             ow->lpVtbl->GetWindow(ow, &dlg);
             ow->lpVtbl->Release(ow);
         }
+        w32_test_trace("file dialog accept", (void *)w32_test_fd, (void *)dlg);
         if (dlg) PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
         if (w32_test_ticks > 20) w32_test_fd->lpVtbl->Close(w32_test_fd, HRESULT_FROM_WIN32(ERROR_CANCELLED));   /* never hang a test */
         return;
     }
     HWND dlg = NULL;
     EnumThreadWindows(GetCurrentThreadId(), w32_find_dialog, (LPARAM)&dlg);
+    w32_test_trace("message box", (void *)dlg, (void *)(uintptr_t)w32_test_cmd);
     if (!dlg) return;   /* not up yet */
     PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(w32_test_cmd, BN_CLICKED), 0);
 }
@@ -1183,6 +1197,7 @@ static void w32_test_dialog_arm(UINT cmd_cancel, UINT cmd_accept, const UINT *bu
     w32_test_cancel = action == -1;
     w32_test_ticks = 0;
     w32_test_timer = SetTimer(NULL, 0, (UINT)(ms > 0 ? ms : 1), w32_test_timer_proc);   /* repeats until disarmed */
+    w32_test_trace("armed", (void *)w32_test_timer, NULL);
 }
 static void w32_test_dialog_disarm(void)
 {
@@ -1283,6 +1298,7 @@ static int w32_file_dialog(vio_window_handle h, const vio_file_dialog_desc *d, c
     w32_test_dialog_arm(IDCANCEL, IDOK, NULL, 0);
     if (w32_test_timer) w32_test_fd = fd;
     HRESULT hr = fd->lpVtbl->Show(fd, owner);
+    w32_test_trace("file dialog shown", (void *)fd, (void *)(intptr_t)hr);
     w32_test_dialog_disarm();
     if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) { ok = 1; goto done; }
     if (FAILED(hr)) goto done;

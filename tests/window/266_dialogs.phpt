@@ -24,6 +24,8 @@ $out[] = 'refused ' . implode(' ', [
     $err(fn() => vio_message_box($ctx, 'T', 'M', ['kind' => 'loud'])),
 ]);
 $run = function (string $action, callable $f) {
+    static $step = 0;
+    fwrite(STDERR, '[step ' . ++$step . " $action]\n");
     putenv("VIO_TEST_DIALOG=300:$action");
     $s = hrtime(true);
     $r = $f();
@@ -50,21 +52,23 @@ $results = [];
 foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
     if (PHP_OS_FAMILY === 'Linux' && in_array($platform, ['x11', 'glfw'], true) && !getenv('DISPLAY')) continue;
     if ($platform === 'wayland' && !getenv('WAYLAND_DISPLAY')) continue;
-    $cmd = escapeshellarg(PHP_BINARY) . ' -n -d extension_dir=' . escapeshellarg(ini_get('extension_dir'))
-         . ' -d extension=vio ' . escapeshellarg($file) . ' ' . escapeshellarg($dir);
+    /* an array: no shell in between, so terminating it ends PHP itself (cmd.exe on Windows would keep it) */
+    $cmd = [PHP_BINARY, '-n', '-d', 'extension_dir=' . ini_get('extension_dir'), '-d', 'extension=vio', $file, $dir];
     $env = getenv();
     $env['VIO_PLATFORM'] = $platform;
+    $env['VIO_TEST_DIALOG_TRACE'] = '1';
     $p = proc_open($cmd, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
     /* a dialog the hook cannot dismiss must not hang the suite: 30 s, then kill */
     stream_set_blocking($pipes[1], false);
     stream_set_blocking($pipes[2], false);
     $line = $errout = '';
-    $end = microtime(true) + 30;
+    $end = microtime(true) + 20;
     while (proc_get_status($p)['running'] && microtime(true) < $end) { $line .= stream_get_contents($pipes[1]); $errout .= stream_get_contents($pipes[2]); usleep(50000); }
-    if (proc_get_status($p)['running']) { proc_terminate($p, 9); $errout .= ' (killed after 30 s: the dialog stayed open)'; }
+    if (proc_get_status($p)['running']) { proc_terminate($p, 9); $errout .= ' (killed after 20 s: the dialog stayed open)'; }
     $line = trim($line . stream_get_contents($pipes[1]));
     $errout = trim($errout . stream_get_contents($pipes[2]));
     proc_close($p);
+    $errs[$platform] = $errout !== '' ? " [stderr: $errout]" : '';
     if (str_starts_with($line, $platform . ' ')) $results[$platform] = substr($line, strlen($platform) + 1);
     elseif ($platform === 'null' || $platform === vio_platform()) $results[$platform] = "no result: $line $errout";
 }
@@ -84,7 +88,7 @@ foreach ($results as $platform => $line) {
            'box cancel' => [false, true], 'box button 1' => [false, true], 'box button 0' => [false, true]];
     /* macOS may resolve /var -> /private/var in the panel's URL */
     if ($r && $platform === 'cocoa' && isset($r['save accept'][0][0])) $r['save accept'][0][0] = preg_replace('#^/private(/var/)#', '$1', $r['save accept'][0][0]);
-    if ($r !== $wantRun) $bad[] = "$platform: $line";
+    if ($r !== $wantRun) $bad[] = "$platform: $line" . ($errs[$platform] ?? '');
 }
 echo isset($results['null'], $results[vio_platform()]) && !$bad ? "OK\n" : "FAIL " . json_encode([$results, $bad], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
 ?>
