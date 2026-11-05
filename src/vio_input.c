@@ -33,6 +33,7 @@ void vio_input_init(vio_input_state *state)
         state->has_window_cb[i] = 0;
     }
     state->win_focused = -1;
+    ZVAL_UNDEF(&state->menu_ids);
     state->win_minimized = -1;
     state->win_scale_x = state->win_scale_y = 0.0f;
     state->char_buffer_len = 0;
@@ -139,6 +140,8 @@ void vio_input_shutdown(vio_input_state *state)
         ZVAL_UNDEF(&state->on_char_callback);
         state->has_char_callback = 0;
     }
+    zval_ptr_dtor(&state->menu_ids);
+    ZVAL_UNDEF(&state->menu_ids);
     for (int i = 0; i < VIO_WINDOW_CB_COUNT; i++) {
         if (!state->has_window_cb[i]) continue;
         zval_ptr_dtor(&state->window_cb[i]);
@@ -371,6 +374,18 @@ void vio_input_drop_event(vio_input_state *state, int count, const char *const *
     vio_window_cb_call(state, VIO_WINDOW_CB_DROP, 3, args, &retval);
     zval_ptr_dtor(&retval);
     zval_ptr_dtor(&args[0]);
+}
+
+void vio_input_menu_event(vio_input_state *state, int tag)
+{
+    if (!state || Z_TYPE(state->menu_ids) != IS_ARRAY) return;
+    zval *id = zend_hash_index_find(Z_ARRVAL(state->menu_ids), (zend_ulong)tag);
+    if (!id) return;
+    zval retval, arg;
+    ZVAL_COPY(&arg, id);
+    vio_window_cb_call(state, VIO_WINDOW_CB_MENU, 1, &arg, &retval);
+    zval_ptr_dtor(&retval);
+    zval_ptr_dtor(&arg);
 }
 
 /* ── Touch push API ─────────────────────────────────────────────────

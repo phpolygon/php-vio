@@ -156,6 +156,33 @@ function vio_file_dialog(VioContext $context, array $options = []): array|false|
 function vio_message_box(VioContext $context, string $title, string $message, array $options = []): int|false {}
 
 /**
+ * Set the window's menu bar (macOS: the application's, after the app menu
+ * vio adds - About, Hide, Quit; Quit asks vio_on_close). $menus is a list of
+ * ['label' => 'File', 'children' => [...]]; an item is ['id' => 'save',
+ * 'label' => 'Save', 'shortcut' => 'Primary+S', 'enabled' => bool,
+ * 'checked' => bool], a submenu ['label', 'children'], a separator
+ * ['separator' => true]. Primary is Cmd on macOS, Ctrl elsewhere. Ids are
+ * unique. $on_select gets the chosen id (from vio_poll_events). [] removes the
+ * menu bar. false where the platform has none (Linux: draw your own).
+ *
+ * @param callable(string): void $on_select
+ */
+function vio_menu_bar(VioContext $context, array $menus, callable $on_select): bool {}
+
+/**
+ * Choose a menu bar item through the same path as a click (tests); false when
+ * there is no such id or no menu bar.
+ */
+function vio_inject_menu(VioContext $context, string $id): bool {}
+
+/**
+ * Show a context menu (modal) at x, y in the cursor space of
+ * vio_mouse_position() and return the chosen id, null when dismissed, false
+ * where the platform has none. Items as in vio_menu_bar().
+ */
+function vio_popup_menu(VioContext $context, array $items, float $x, float $y): string|false|null {}
+
+/**
  * Like vio_poll_events(), but first blocks until an event arrives, $timeout
  * seconds pass (< 0: no timeout) or vio_wake() is called. An idle desktop app
  * loops on this instead of vio_poll_events() and renders only when something

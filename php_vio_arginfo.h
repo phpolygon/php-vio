@@ -195,6 +195,24 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_message_box, 0, 3, MAY_BE_LO
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_menu_bar, 0, 3, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, menus, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO(0, on_select, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_menu, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, id, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_popup_menu, 0, 4, MAY_BE_STRING|MAY_BE_FALSE|MAY_BE_NULL)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, items, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO(0, x, IS_DOUBLE, 0)
+	ZEND_ARG_TYPE_INFO(0, y, IS_DOUBLE, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor_mode, 0, 2, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, mode, IS_LONG, 0)
@@ -1329,6 +1347,9 @@ ZEND_FUNCTION(vio_destroy);
 ZEND_FUNCTION(vio_should_close);
 ZEND_FUNCTION(vio_close);
 ZEND_FUNCTION(vio_poll_events);
+ZEND_FUNCTION(vio_popup_menu);
+ZEND_FUNCTION(vio_inject_menu);
+ZEND_FUNCTION(vio_menu_bar);
 ZEND_FUNCTION(vio_message_box);
 ZEND_FUNCTION(vio_file_dialog);
 ZEND_FUNCTION(vio_inject_drop);
@@ -1588,6 +1609,9 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_should_close, arginfo_vio_should_close)
 	ZEND_FE(vio_close, arginfo_vio_close)
 	ZEND_FE(vio_poll_events, arginfo_vio_poll_events)
+	ZEND_FE(vio_popup_menu, arginfo_vio_popup_menu)
+	ZEND_FE(vio_inject_menu, arginfo_vio_inject_menu)
+	ZEND_FE(vio_menu_bar, arginfo_vio_menu_bar)
 	ZEND_FE(vio_message_box, arginfo_vio_message_box)
 	ZEND_FE(vio_file_dialog, arginfo_vio_file_dialog)
 	ZEND_FE(vio_inject_drop, arginfo_vio_inject_drop)

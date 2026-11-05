@@ -70,8 +70,12 @@ typedef struct _vio_win32_window {
     HICON            icon_big, icon_small;     /* vio_set_window_icon, owned */
     int              min_w, min_h, max_w, max_h;   /* client size limits, 0 = none */
     int              aspect_num, aspect_den;
+    HMENU            menu;                     /* vio_menu_bar, owned by the window once set */
+    HACCEL           accel;                    /* its shortcuts */
     vio_input_state *input;
 } vio_win32_window;
+
+#define W32_MENU_BASE 1000   /* WM_COMMAND id = W32_MENU_BASE + tag */
 
 static HINSTANCE        w32_instance;
 static ATOM             w32_class;
@@ -432,6 +436,12 @@ static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (w->aspect_num > 0 && w->aspect_den > 0) {
                 w32_apply_aspect(w, wp, (RECT *)lp);
                 return TRUE;
+            }
+            break;
+        case WM_COMMAND:
+            if (HIWORD(wp) <= 1 && lp == 0 && LOWORD(wp) >= W32_MENU_BASE) {   /* menu (0) or accelerator (1) */
+                vio_input_menu_event(w->input, (int)LOWORD(wp) - W32_MENU_BASE);
+                return 0;
             }
             break;
         case WM_DROPFILES: {
@@ -879,6 +889,7 @@ static void w32_destroy_window(vio_window_handle h)
         DestroyWindow(w->hwnd);
     }
     if (w->cursor_owned && w->cursor) DestroyCursor(w->cursor);
+    if (w->accel) DestroyAcceleratorTable(w->accel);
     if (w->icon_big) DestroyIcon(w->icon_big);
     if (w->icon_small) DestroyIcon(w->icon_small);
     free(w);
@@ -887,10 +898,20 @@ static void w32_destroy_window(vio_window_handle h)
 static int  w32_should_close(vio_window_handle h) { return h ? ((vio_win32_window *)h)->should_close : 1; }
 static void w32_set_should_close(vio_window_handle h, int v) { if (h) ((vio_win32_window *)h)->should_close = v; }
 
+/* The vio window a message belongs to (its top-level ancestor of our class). */
+static vio_win32_window *w32_window_of(HWND hwnd)
+{
+    HWND root = hwnd ? GetAncestor(hwnd, GA_ROOT) : NULL;
+    if (!root || (ATOM)GetClassLongPtrW(root, GCW_ATOM) != w32_class) return NULL;
+    return (vio_win32_window *)GetWindowLongPtrW(root, GWLP_USERDATA);
+}
+
 static void w32_poll_events(void)
 {
     MSG msg;
     while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        vio_win32_window *aw = w32_window_of(msg.hwnd);
+        if (aw && aw->accel && TranslateAcceleratorW(aw->hwnd, aw->accel, &msg)) continue;   /* menu shortcuts */
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -1354,6 +1375,133 @@ static int w32_message_box(vio_window_handle h, const vio_message_box_desc *d)
     return last;   /* IDCANCEL / closed */
 }
 
+/* ── Menus (DESKTOP-APP-PLAN Phase 2b) ────────────────────────────── */
+
+static WORD w32_menu_vk(int key)
+{
+    if (key >= VIO_KEY_A && key <= VIO_KEY_Z) return (WORD)('A' + key - VIO_KEY_A);
+    if (key >= VIO_KEY_0 && key <= VIO_KEY_9) return (WORD)('0' + key - VIO_KEY_0);
+    if (key >= VIO_KEY_F1 && key <= VIO_KEY_F1 + 23) return (WORD)(VK_F1 + key - VIO_KEY_F1);
+    switch (key) {
+        case VIO_KEY_ENTER: return VK_RETURN;     case VIO_KEY_ESCAPE: return VK_ESCAPE;   case VIO_KEY_TAB: return VK_TAB;
+        case VIO_KEY_SPACE: return VK_SPACE;      case VIO_KEY_BACKSPACE: return VK_BACK;  case VIO_KEY_DELETE: return VK_DELETE;
+        case VIO_KEY_INSERT: return VK_INSERT;    case VIO_KEY_HOME: return VK_HOME;       case VIO_KEY_END: return VK_END;
+        case VIO_KEY_PAGE_UP: return VK_PRIOR;    case VIO_KEY_PAGE_DOWN: return VK_NEXT;  case VIO_KEY_UP: return VK_UP;
+        case VIO_KEY_DOWN: return VK_DOWN;        case VIO_KEY_LEFT: return VK_LEFT;       case VIO_KEY_RIGHT: return VK_RIGHT;
+        case VIO_KEY_COMMA: return VK_OEM_COMMA;  case VIO_KEY_PERIOD: return VK_OEM_PERIOD; case VIO_KEY_MINUS: return VK_OEM_MINUS;
+        case VIO_KEY_SLASH: return VK_OEM_2;      case VIO_KEY_EQUAL: return VK_OEM_PLUS;
+    }
+    return 0;
+}
+
+/* "Ctrl+Shift+S" as Windows shows it after the tab */
+static void w32_shortcut_text(int key, int mods, char *buf, size_t size)
+{
+    char k[16] = "";
+    if (key >= VIO_KEY_A && key <= VIO_KEY_Z) snprintf(k, sizeof(k), "%c", 'A' + key - VIO_KEY_A);
+    else if (key >= VIO_KEY_0 && key <= VIO_KEY_9) snprintf(k, sizeof(k), "%c", '0' + key - VIO_KEY_0);
+    else if (key >= VIO_KEY_F1 && key <= VIO_KEY_F1 + 23) snprintf(k, sizeof(k), "F%d", key - VIO_KEY_F1 + 1);
+    else {
+        static const struct { int key; const char *name; } names[] = {
+            { VIO_KEY_ENTER, "Enter" }, { VIO_KEY_ESCAPE, "Esc" }, { VIO_KEY_TAB, "Tab" }, { VIO_KEY_SPACE, "Space" },
+            { VIO_KEY_BACKSPACE, "Backspace" }, { VIO_KEY_DELETE, "Del" }, { VIO_KEY_INSERT, "Ins" }, { VIO_KEY_HOME, "Home" },
+            { VIO_KEY_END, "End" }, { VIO_KEY_PAGE_UP, "PgUp" }, { VIO_KEY_PAGE_DOWN, "PgDn" }, { VIO_KEY_UP, "Up" },
+            { VIO_KEY_DOWN, "Down" }, { VIO_KEY_LEFT, "Left" }, { VIO_KEY_RIGHT, "Right" }, { VIO_KEY_COMMA, "," },
+            { VIO_KEY_PERIOD, "." }, { VIO_KEY_MINUS, "-" }, { VIO_KEY_SLASH, "/" }, { VIO_KEY_EQUAL, "=" },
+        };
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) if (names[i].key == key) snprintf(k, sizeof(k), "%s", names[i].name);
+    }
+    snprintf(buf, size, "%s%s%s%s%s", (mods & VIO_MOD_CONTROL) ? "Ctrl+" : "", (mods & VIO_MOD_SUPER) ? "Win+" : "",
+             (mods & VIO_MOD_ALT) ? "Alt+" : "", (mods & VIO_MOD_SHIFT) ? "Shift+" : "", k);
+}
+
+/* One menu level; accelerators collected on the way (accel may be NULL). */
+static HMENU w32_build_menu(const vio_menu_item *items, int n, int popup, ACCEL *accel, int *accel_n, int accel_cap)
+{
+    HMENU m = popup ? CreatePopupMenu() : CreateMenu();
+    if (!m) return NULL;
+    for (int i = 0; i < n; i++) {
+        const vio_menu_item *it = &items[i];
+        if (it->separator) { AppendMenuW(m, MF_SEPARATOR, 0, NULL); continue; }
+        char text[512];
+        if (!it->children && it->key) {
+            char sc[64];
+            w32_shortcut_text(it->key, it->mods, sc, sizeof(sc));
+            snprintf(text, sizeof(text), "%s\t%s", it->label, sc);
+        } else {
+            snprintf(text, sizeof(text), "%s", it->label);
+        }
+        WCHAR *wtext = vio_shell_wide(text);
+        UINT flags = MF_STRING | (it->enabled ? 0 : MF_GRAYED);
+        if (it->children) {
+            HMENU sub = w32_build_menu(it->children, it->child_count, 1, accel, accel_n, accel_cap);
+            AppendMenuW(m, flags | MF_POPUP, (UINT_PTR)sub, wtext ? wtext : L"?");
+        } else {
+            AppendMenuW(m, flags | (it->checked ? MF_CHECKED : 0), (UINT_PTR)(W32_MENU_BASE + it->tag), wtext ? wtext : L"?");
+            WORD vk = it->key ? w32_menu_vk(it->key) : 0;
+            /* the Windows key cannot be an accelerator: such a shortcut is only shown */
+            if (accel && vk && !(it->mods & VIO_MOD_SUPER) && *accel_n < accel_cap) {
+                ACCEL *a = &accel[(*accel_n)++];
+                a->fVirt = (BYTE)(FVIRTKEY | ((it->mods & VIO_MOD_CONTROL) ? FCONTROL : 0) | ((it->mods & VIO_MOD_SHIFT) ? FSHIFT : 0)
+                                  | ((it->mods & VIO_MOD_ALT) ? FALT : 0));
+                a->key = vk;
+                a->cmd = (WORD)(W32_MENU_BASE + it->tag);
+            }
+        }
+        free(wtext);
+    }
+    return m;
+}
+
+static int w32_set_menu_bar(vio_window_handle h, const vio_menu_item *menus, int count)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return 0;
+    HMENU bar = NULL;
+    HACCEL accel = NULL;
+    if (count > 0) {
+        ACCEL table[512];
+        int n = 0;
+        bar = w32_build_menu(menus, count, 0, table, &n, 512);
+        if (!bar) return 0;
+        if (n) accel = CreateAcceleratorTableW(table, n);
+    }
+    HMENU old = w->menu;
+    SetMenu(w->hwnd, bar);
+    DrawMenuBar(w->hwnd);
+    if (old) DestroyMenu(old);
+    if (w->accel) DestroyAcceleratorTable(w->accel);
+    w->menu = bar;
+    w->accel = accel;
+    return 1;
+}
+
+/* VIO_TEST_DIALOG for a context menu: EndMenu from a thread timer the menu loop dispatches */
+static VOID CALLBACK w32_test_menu_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
+{
+    (void)hwnd; (void)msg; (void)time;
+    KillTimer(NULL, id);
+    w32_test_timer = 0;
+    EndMenu();
+}
+
+static int w32_popup_menu(vio_window_handle h, const vio_menu_item *items, int count, double x, double y)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return -2;
+    HMENU m = w32_build_menu(items, count, 1, NULL, NULL, 0);
+    if (!m) return -2;
+    POINT p = { (LONG)x, (LONG)y };
+    ClientToScreen(w->hwnd, &p);
+    SetForegroundWindow(w->hwnd);   /* else the menu does not close when clicking elsewhere */
+    int ms = 0, action = 0;
+    if (vio_platform_test_dialog(&ms, &action)) w32_test_timer = SetTimer(NULL, 0, (UINT)(ms > 0 ? ms : 1), w32_test_menu_proc);
+    UINT cmd = (UINT)TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, p.x, p.y, w->hwnd, NULL);
+    w32_test_dialog_disarm();
+    DestroyMenu(m);
+    return cmd >= W32_MENU_BASE ? (int)cmd - W32_MENU_BASE : -1;
+}
+
 static void w32_set_window_size(vio_window_handle h, int cw, int ch)
 {
     vio_win32_window *w = (vio_win32_window *)h;
@@ -1765,6 +1913,8 @@ static const vio_platform vio_platform_win32 = {
     .accepts_drops        = 1,
     .file_dialog          = w32_file_dialog,
     .message_box          = w32_message_box,
+    .set_menu_bar         = w32_set_menu_bar,
+    .popup_menu           = w32_popup_menu,
 };
 
 void vio_platform_win32_register(void)

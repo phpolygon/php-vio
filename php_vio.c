@@ -15858,6 +15858,8 @@ ZEND_FUNCTION(vio_platform_info)
     add_assoc_bool(return_value, "file_drop", p->accepts_drops != 0);
     add_assoc_bool(return_value, "file_dialog", p->file_dialog != NULL);
     add_assoc_bool(return_value, "message_box", p->message_box != NULL);
+    add_assoc_bool(return_value, "menu_bar", p->set_menu_bar != NULL);
+    add_assoc_bool(return_value, "popup_menu", p->popup_menu != NULL);
 }
 
 ZEND_FUNCTION(vio_set_cursor)
@@ -16159,6 +16161,216 @@ ZEND_FUNCTION(vio_message_box)
     int r = vio_plat()->message_box(ctx->window, &d);
     if (r < 0) RETURN_FALSE;
     RETURN_LONG(r < d.button_count ? r : d.button_count - 1);
+}
+
+/* ── Menus (DESKTOP-APP-PLAN Phase 2b) ─────────────────────────────── */
+
+/* "Primary+Shift+S", "Ctrl+F5", "Alt+Enter": modifiers then one key.
+ * Primary is Cmd on macOS and Ctrl elsewhere. 0 = parsed, -1 = not. */
+static int vio_parse_shortcut(const char *s, int *key, int *mods)
+{
+    *key = 0;
+    *mods = 0;
+    char buf[64];
+    size_t len = strlen(s);
+    if (!len || len >= sizeof(buf)) return -1;
+    memcpy(buf, s, len + 1);
+    char *save = NULL;
+    for (char *tok = php_strtok_r(buf, "+", &save); tok; tok = php_strtok_r(NULL, "+", &save)) {
+        if (*key) return -1;   /* the key comes last */
+        if (!strcasecmp(tok, "Primary")) {
+#ifdef __APPLE__
+            *mods |= VIO_MOD_SUPER;
+#else
+            *mods |= VIO_MOD_CONTROL;
+#endif
+        } else if (!strcasecmp(tok, "Ctrl") || !strcasecmp(tok, "Control")) *mods |= VIO_MOD_CONTROL;
+        else if (!strcasecmp(tok, "Shift")) *mods |= VIO_MOD_SHIFT;
+        else if (!strcasecmp(tok, "Alt") || !strcasecmp(tok, "Option")) *mods |= VIO_MOD_ALT;
+        else if (!strcasecmp(tok, "Cmd") || !strcasecmp(tok, "Command") || !strcasecmp(tok, "Super") || !strcasecmp(tok, "Meta")) *mods |= VIO_MOD_SUPER;
+        else if (strlen(tok) == 1 && isalpha((unsigned char)tok[0])) *key = VIO_KEY_A + (toupper((unsigned char)tok[0]) - 'A');
+        else if (strlen(tok) == 1 && isdigit((unsigned char)tok[0])) *key = VIO_KEY_0 + (tok[0] - '0');
+        else if ((tok[0] == 'F' || tok[0] == 'f') && atoi(tok + 1) >= 1 && atoi(tok + 1) <= 24 && strspn(tok + 1, "0123456789") == strlen(tok + 1))
+            *key = VIO_KEY_F1 + atoi(tok + 1) - 1;
+        else {
+            static const struct { const char *name; int key; } named[] = {
+                { "Enter", VIO_KEY_ENTER }, { "Return", VIO_KEY_ENTER }, { "Escape", VIO_KEY_ESCAPE }, { "Esc", VIO_KEY_ESCAPE },
+                { "Tab", VIO_KEY_TAB }, { "Space", VIO_KEY_SPACE }, { "Backspace", VIO_KEY_BACKSPACE }, { "Delete", VIO_KEY_DELETE },
+                { "Del", VIO_KEY_DELETE }, { "Insert", VIO_KEY_INSERT }, { "Home", VIO_KEY_HOME }, { "End", VIO_KEY_END },
+                { "PageUp", VIO_KEY_PAGE_UP }, { "PageDown", VIO_KEY_PAGE_DOWN }, { "Up", VIO_KEY_UP }, { "Down", VIO_KEY_DOWN },
+                { "Left", VIO_KEY_LEFT }, { "Right", VIO_KEY_RIGHT }, { "Comma", VIO_KEY_COMMA }, { "Period", VIO_KEY_PERIOD },
+                { "Minus", VIO_KEY_MINUS }, { "Slash", VIO_KEY_SLASH }, { "Equal", VIO_KEY_EQUAL },
+            };
+            for (size_t i = 0; i < sizeof(named) / sizeof(named[0]) && !*key; i++) if (!strcasecmp(tok, named[i].name)) *key = named[i].key;
+            if (!*key) return -1;
+        }
+    }
+    return *key ? 0 : -1;
+}
+
+typedef struct {
+    void   **allocs;
+    int      alloc_n, alloc_cap;
+    zval     ids;      /* tag -> id */
+    HashTable seen;    /* id set */
+    int      total;
+} vio_menu_build;
+
+static void *vio_menu_alloc(vio_menu_build *b, size_t size)
+{
+    if (b->alloc_n == b->alloc_cap) {
+        b->alloc_cap = b->alloc_cap ? b->alloc_cap * 2 : 16;
+        b->allocs = (void **)erealloc(b->allocs, (size_t)b->alloc_cap * sizeof(void *));
+    }
+    return b->allocs[b->alloc_n++] = ecalloc(1, size);
+}
+
+static void vio_menu_build_free(vio_menu_build *b, int keep_ids)
+{
+    for (int i = 0; i < b->alloc_n; i++) efree(b->allocs[i]);
+    if (b->allocs) efree(b->allocs);
+    zend_hash_destroy(&b->seen);
+    if (!keep_ids) zval_ptr_dtor(&b->ids);
+}
+
+static const char *vio_menu_str(HashTable *h, const char *key)
+{
+    zval *z = zend_hash_str_find(h, key, strlen(key));
+    return z && Z_TYPE_P(z) == IS_STRING && Z_STRLEN_P(z) && !memchr(Z_STRVAL_P(z), 0, Z_STRLEN_P(z)) ? Z_STRVAL_P(z) : NULL;
+}
+
+/* One level of the tree; top = the menu bar (each entry a labelled submenu).
+ * 0 = fine, -1 = a ValueError has been thrown. */
+static int vio_menu_parse(vio_menu_build *b, HashTable *list, int top, int depth, vio_menu_item **out, int *count, uint32_t argn)
+{
+    uint32_t n = zend_hash_num_elements(list);
+    *out = NULL;
+    *count = 0;
+    if (depth > 8 || (b->total += (int)n) > 4096) {
+        zend_argument_value_error(argn, "must not nest deeper than 8 levels or hold more than 4096 items");
+        return -1;
+    }
+    if (!n) return 0;
+    vio_menu_item *items = (vio_menu_item *)vio_menu_alloc(b, n * sizeof(vio_menu_item));
+    int i = 0;
+    zval *e;
+    ZEND_HASH_FOREACH_VAL(list, e) {
+        vio_menu_item *it = &items[i++];
+        it->tag = -1;
+        it->enabled = 1;
+        if (Z_TYPE_P(e) != IS_ARRAY) { zend_argument_value_error(argn, "items must be arrays"); return -1; }
+        HashTable *h = Z_ARRVAL_P(e);
+        zval *sep = zend_hash_str_find(h, "separator", 9), *ch = zend_hash_str_find(h, "children", 8), *z;
+        if (!top && sep && zend_is_true(sep)) { it->separator = 1; continue; }
+        it->label = vio_menu_str(h, "label");
+        if (!it->label) { zend_argument_value_error(argn, "every item needs a non-empty 'label'"); return -1; }
+        if ((z = zend_hash_str_find(h, "enabled", 7))) it->enabled = zend_is_true(z);
+        if (ch || top) {
+            if (!ch || Z_TYPE_P(ch) != IS_ARRAY || !zend_hash_num_elements(Z_ARRVAL_P(ch))) {
+                zend_argument_value_error(argn, "menu '%s' needs non-empty 'children'", it->label);
+                return -1;
+            }
+            vio_menu_item *kids;
+            int kn;
+            if (vio_menu_parse(b, Z_ARRVAL_P(ch), 0, depth + 1, &kids, &kn, argn) < 0) return -1;
+            it->children = kids;
+            it->child_count = kn;
+            continue;
+        }
+        const char *id = vio_menu_str(h, "id");
+        if (!id) { zend_argument_value_error(argn, "item '%s' needs a non-empty 'id'", it->label); return -1; }
+        if (zend_hash_str_exists(&b->seen, id, strlen(id))) { zend_argument_value_error(argn, "id '%s' appears twice", id); return -1; }
+        zend_hash_str_add_empty_element(&b->seen, id, strlen(id));
+        it->tag = (int)zend_hash_num_elements(Z_ARRVAL(b->ids));
+        add_next_index_string(&b->ids, id);
+        if ((z = zend_hash_str_find(h, "checked", 7))) it->checked = zend_is_true(z);
+        const char *sc = vio_menu_str(h, "shortcut");
+        if (sc && vio_parse_shortcut(sc, &it->key, &it->mods) < 0) {
+            zend_argument_value_error(argn, "shortcut '%s' must be modifiers (Primary, Ctrl, Shift, Alt, Cmd) and one key", sc);
+            return -1;
+        }
+    } ZEND_HASH_FOREACH_END();
+    *out = items;
+    *count = (int)n;
+    return 0;
+}
+
+static void vio_menu_build_init(vio_menu_build *b)
+{
+    memset(b, 0, sizeof(*b));
+    array_init(&b->ids);
+    zend_hash_init(&b->seen, 8, NULL, NULL, 0);
+}
+
+ZEND_FUNCTION(vio_menu_bar)
+{
+    zval *ctx_zval, *callback;
+    HashTable *menus;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(menus)
+        Z_PARAM_ZVAL(callback)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_menu_build b;
+    vio_menu_build_init(&b);
+    vio_menu_item *items;
+    int n;
+    if (vio_menu_parse(&b, menus, 1, 0, &items, &n, 2) < 0) { vio_menu_build_free(&b, 0); RETURN_THROWS(); }
+    vio_input_set_window_cb(&ctx->input, VIO_WINDOW_CB_MENU, callback);
+    zval_ptr_dtor(&ctx->input.menu_ids);
+    if (n) ZVAL_COPY(&ctx->input.menu_ids, &b.ids);
+    else ZVAL_UNDEF(&ctx->input.menu_ids);
+    int ok = ctx->window && vio_plat()->set_menu_bar && vio_plat()->set_menu_bar(ctx->window, items, n);
+    vio_menu_build_free(&b, 0);
+    RETURN_BOOL(ok);
+}
+
+ZEND_FUNCTION(vio_inject_menu)
+{
+    zval *ctx_zval;
+    zend_string *id;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR(id)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->window || !vio_plat()->set_menu_bar || Z_TYPE(ctx->input.menu_ids) != IS_ARRAY) RETURN_FALSE;
+    zend_ulong tag;
+    zval *v;
+    ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL(ctx->input.menu_ids), tag, v) {
+        if (Z_TYPE_P(v) == IS_STRING && zend_string_equals(Z_STR_P(v), id)) {
+            vio_input_menu_event(&ctx->input, (int)tag);
+            RETURN_TRUE;
+        }
+    } ZEND_HASH_FOREACH_END();
+    RETURN_FALSE;
+}
+
+ZEND_FUNCTION(vio_popup_menu)
+{
+    zval *ctx_zval;
+    HashTable *list;
+    double x, y;
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(list)
+        Z_PARAM_DOUBLE(x)
+        Z_PARAM_DOUBLE(y)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!zend_hash_num_elements(list)) { zend_argument_value_error(2, "must hold at least one item"); RETURN_THROWS(); }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_menu_build b;
+    vio_menu_build_init(&b);
+    vio_menu_item *items;
+    int n;
+    if (vio_menu_parse(&b, list, 0, 0, &items, &n, 2) < 0) { vio_menu_build_free(&b, 0); RETURN_THROWS(); }
+    int tag = vio_plat()->popup_menu ? vio_plat()->popup_menu(ctx->window, items, n, x, y) : -2;
+    zval *id = tag >= 0 ? zend_hash_index_find(Z_ARRVAL(b.ids), (zend_ulong)tag) : NULL;
+    if (id) RETVAL_STR_COPY(Z_STR_P(id));
+    else if (tag == -2) RETVAL_FALSE;
+    else RETVAL_NULL();
+    vio_menu_build_free(&b, 0);
 }
 
 /* 1 when s holds a control character (also NUL inside the string). */
