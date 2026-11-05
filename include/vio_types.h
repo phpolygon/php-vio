@@ -449,6 +449,9 @@ typedef enum _vio_feature {
      * said explicitly, the same on every backend, instead of following where a
      * render target was bound (vio itself, every backend). */
     VIO_FEATURE_EXPLICIT_PRESENT = 72,
+    /* vio_window(): further windows on the context's device (DESKTOP-APP-PLAN
+     * Phase 4); the backend has create_swapchain and the platform has windows. */
+    VIO_FEATURE_MULTI_WINDOW = 73,
 } vio_feature;
 
 /* vio_begin 'present' (set_frame_present): no option = the backend's old rule. */

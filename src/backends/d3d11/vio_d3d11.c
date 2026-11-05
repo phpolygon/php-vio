@@ -366,6 +366,8 @@ static void d3d11_shutdown(void)
 
     d3d11_current_pipeline = NULL;
     memset(&vio_d3d11, 0, sizeof(vio_d3d11));
+    memset(&d3d11_main_sc, 0, sizeof(d3d11_main_sc));
+    d3d11_cur_sc = NULL;
 }
 
 /* ── Surface & Window ─────────────────────────────────────────────── */
@@ -481,6 +483,122 @@ static void d3d11_destroy_surface(void *surface)
         IDXGISwapChain1_Release(vio_d3d11.swapchain);
         vio_d3d11.swapchain = NULL;
     }
+}
+
+/* ── Further windows (DESKTOP-APP-PLAN Phase 4) ──────────────────────
+ * The swapchain fields of vio_d3d11, one record per window. set_swapchain
+ * stores the active window's fields into its record and loads the other's;
+ * everything else keeps reading vio_d3d11. */
+typedef struct _vio_d3d11_swapchain {
+    IDXGISwapChain1        *swapchain;
+    UINT                    swapchain_flags;
+    HANDLE                  frame_latency_waitable;
+    int                     frame_latency;
+    DXGI_FORMAT             swapchain_format;
+    int                     hdr_output;
+    float                   hdr_paper_white;
+    int                     present_failed_once;
+    ID3D11RenderTargetView *rtv;
+    ID3D11DepthStencilView *dsv;
+    ID3D11Texture2D        *depth_buffer;
+    ID3D11Texture2D        *readback_mirror;
+    ID3D11Texture2D        *readback_staging;
+    UINT                    readback_w, readback_h;
+    int                     width, height, vsync, latency_wait_skip;
+    void                   *platform_window;
+} vio_d3d11_swapchain;
+
+static vio_d3d11_swapchain  d3d11_main_sc;
+static vio_d3d11_swapchain *d3d11_cur_sc;   /* NULL: the main window's fields are loaded */
+
+static void d3d11_sc_store(vio_d3d11_swapchain *r)
+{
+    r->swapchain = vio_d3d11.swapchain;             r->swapchain_flags = vio_d3d11.swapchain_flags;
+    r->frame_latency_waitable = vio_d3d11.frame_latency_waitable; r->frame_latency = vio_d3d11.frame_latency;
+    r->swapchain_format = vio_d3d11.swapchain_format; r->hdr_output = vio_d3d11.hdr_output;
+    r->hdr_paper_white = vio_d3d11.hdr_paper_white; r->present_failed_once = vio_d3d11.present_failed_once;
+    r->rtv = vio_d3d11.rtv; r->dsv = vio_d3d11.dsv;  r->depth_buffer = vio_d3d11.depth_buffer;
+    r->readback_mirror = vio_d3d11.readback_mirror; r->readback_staging = vio_d3d11.readback_staging;
+    r->readback_w = vio_d3d11.readback_w;           r->readback_h = vio_d3d11.readback_h;
+    r->width = vio_d3d11.width; r->height = vio_d3d11.height; r->vsync = vio_d3d11.vsync;
+    r->latency_wait_skip = vio_d3d11.latency_wait_skip;
+    r->platform_window = vio_d3d11.platform_window;
+}
+
+static void d3d11_sc_load(const vio_d3d11_swapchain *r)
+{
+    vio_d3d11.swapchain = r->swapchain;             vio_d3d11.swapchain_flags = r->swapchain_flags;
+    vio_d3d11.frame_latency_waitable = r->frame_latency_waitable; vio_d3d11.frame_latency = r->frame_latency;
+    vio_d3d11.swapchain_format = r->swapchain_format; vio_d3d11.hdr_output = r->hdr_output;
+    vio_d3d11.hdr_paper_white = r->hdr_paper_white; vio_d3d11.present_failed_once = r->present_failed_once;
+    vio_d3d11.rtv = r->rtv; vio_d3d11.dsv = r->dsv;  vio_d3d11.depth_buffer = r->depth_buffer;
+    vio_d3d11.readback_mirror = r->readback_mirror; vio_d3d11.readback_staging = r->readback_staging;
+    vio_d3d11.readback_w = r->readback_w;           vio_d3d11.readback_h = r->readback_h;
+    vio_d3d11.width = r->width; vio_d3d11.height = r->height; vio_d3d11.vsync = r->vsync;
+    vio_d3d11.latency_wait_skip = r->latency_wait_skip;
+    vio_d3d11.platform_window = r->platform_window;
+    if (!vio_d3d11.current_bound_rt) {   /* between frames the current target is the swapchain's */
+        vio_d3d11.current_rtv = vio_d3d11.current_rtvs[0] = vio_d3d11.rtv;
+        vio_d3d11.current_rtv_count = 1;
+        vio_d3d11.current_dsv = vio_d3d11.dsv;
+        vio_d3d11.current_rt_width = vio_d3d11.width;
+        vio_d3d11.current_rt_height = vio_d3d11.height;
+    }
+}
+
+static void d3d11_set_swapchain(void *swapchain)
+{
+    vio_d3d11_swapchain *target = swapchain ? (vio_d3d11_swapchain *)swapchain : &d3d11_main_sc;
+    vio_d3d11_swapchain *cur = d3d11_cur_sc ? d3d11_cur_sc : &d3d11_main_sc;
+    if (target == cur) return;
+    d3d11_sc_store(cur);
+    d3d11_sc_load(target);
+    d3d11_cur_sc = target == &d3d11_main_sc ? NULL : target;
+}
+
+static void d3d11_destroy_swapchain(void *swapchain);
+
+static void *d3d11_create_swapchain(void *platform_window, const vio_config *cfg)
+{
+    if (!vio_d3d11.initialized || !vio_d3d11.device || !platform_window) return NULL;
+    vio_d3d11_swapchain *rec = (vio_d3d11_swapchain *)calloc(1, sizeof(*rec));
+    if (!rec) return NULL;
+    vio_d3d11_swapchain *prev = d3d11_cur_sc ? d3d11_cur_sc : &d3d11_main_sc;
+    d3d11_sc_store(prev);
+    vio_d3d11_swapchain blank;
+    memset(&blank, 0, sizeof(blank));
+    blank.platform_window = platform_window;
+    blank.vsync = cfg->vsync;
+    d3d11_sc_load(&blank);
+    vio_config c = *cfg;
+    void *ok = d3d11_create_surface(&c);
+    d3d11_sc_store(rec);
+    d3d11_sc_load(prev);
+    if (!ok) {
+        d3d11_destroy_swapchain(rec);
+        return NULL;
+    }
+    return rec;
+}
+
+static void d3d11_destroy_swapchain(void *swapchain)
+{
+    vio_d3d11_swapchain *rec = (vio_d3d11_swapchain *)swapchain;
+    if (!rec) return;
+    if (d3d11_cur_sc == rec) d3d11_set_swapchain(NULL);
+    if (vio_d3d11.context) {
+        /* nothing may stay bound to its views */
+        ID3D11DeviceContext_OMSetRenderTargets(vio_d3d11.context, 0, NULL, NULL);
+        ID3D11DeviceContext_Flush(vio_d3d11.context);
+    }
+    if (rec->rtv) ID3D11RenderTargetView_Release(rec->rtv);
+    if (rec->dsv) ID3D11DepthStencilView_Release(rec->dsv);
+    if (rec->depth_buffer) ID3D11Texture2D_Release(rec->depth_buffer);
+    if (rec->readback_mirror) ID3D11Texture2D_Release(rec->readback_mirror);
+    if (rec->readback_staging) ID3D11Texture2D_Release(rec->readback_staging);
+    if (rec->frame_latency_waitable) CloseHandle(rec->frame_latency_waitable);
+    if (rec->swapchain) IDXGISwapChain1_Release(rec->swapchain);
+    free(rec);
 }
 
 static void d3d11_resize(int width, int height)
@@ -4535,6 +4653,9 @@ static const vio_backend d3d11_backend = {
     .rt_origin_top     = 1,
     .clip_z_remap      = 1,
     .set_frame_present = d3d11_set_frame_present,
+    .create_swapchain  = d3d11_create_swapchain,
+    .set_swapchain     = d3d11_set_swapchain,
+    .destroy_swapchain = d3d11_destroy_swapchain,
 };
 
 void vio_backend_d3d11_register(void)

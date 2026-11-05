@@ -601,6 +601,16 @@ typedef struct _vio_backend {
     int   (*upscaler_prepare)(int provider, char *reason, size_t reason_len);
     int   (*upscaler_state)(int provider, char *reason, size_t reason_len);
     int   (*upscaler_timings)(int provider, struct _vio_upscale_timing *out, int max);
+
+    /* ── Further windows (vio_window, DESKTOP-APP-PLAN Phase 4) ─────────
+     * create_swapchain: a swapchain for another platform window on the same
+     * device (cfg: its size, headless, vsync); NULL = cannot. set_swapchain:
+     * the one the next frame, present and read_pixels use (NULL = the main
+     * window's); the frontend switches before vio_begin / read and back after.
+     * destroy_swapchain: frees it (never the active one; switch away first). */
+    void *(*create_swapchain)(void *platform_window, const vio_config *cfg);
+    void  (*set_swapchain)(void *swapchain);
+    void  (*destroy_swapchain)(void *swapchain);
 } vio_backend;
 
 #define VIO_MAX_FRAGMENT_STORAGE 4

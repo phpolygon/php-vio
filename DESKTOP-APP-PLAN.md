@@ -165,7 +165,21 @@ vio_key_pressed($tool, VIO_KEY_A);   // Eingabe-Funktionen nehmen VioContext|Vio
   zuletzt und mit Kennzeichnung in `vio_platform_info()`.
 - Unterfenster/Popups: `'parent'` (Win32 Owner, Cocoa `addChildWindow`, X11 `WM_TRANSIENT_FOR`, Wayland `xdg_popup`
   bzw. Child-Toplevel), `'modal' => true`.
-- Reihenfolge: Metal → D3D12 → D3D11 → Vulkan → OpenGL. Headless-Fenster bekommen dieselben Slots, damit die Tests
+- **Aufteilung nach der Bestandsaufnahme (2026-11-05):** D3D11 und Metal halten den Swapchain-Zustand als abgrenzbare
+  Feldgruppe im globalen Backend-Zustand. Ein Backend-Slot `set_swapchain` tauscht diese Gruppe je Fenster aus und wieder ein, die
+  vielen Lesestellen bleiben unverändert. Bei D3D12 ist der Frame-Slot der Back-Buffer-Index der Swapchain, und daran hängen
+  Allokatoren, Fences, Heap-Slices, Ringe und Freigaben. Bei Vulkan hängen Gerätewahl und Present-Queue an der ersten Surface,
+  Acquire-Semaphoren und Offscreen-Flags gehen von einer Swapchain aus. Bei OpenGL legt keine Plattform geteilte Kontexte an,
+  und VAOs/FBOs sind nicht teilbar.
+  - **4a ✅ (2026-11-05, Test 271):** Frontend (`VioWindow`, Input je Fenster, `VioContext|VioWindow`, Tausch von
+    Fenster/Größe/2D-Zustand um `vio_begin`/`vio_end` und `vio_read_pixels`), Metal, D3D11. `VioWindow` hält einen
+    Kontext-Datensatz (`view`) mit Fenster, Input, Schließ-Flag und Größen; die Fenster- und Input-Funktionen laufen
+    darauf unverändert. Nebenbefund Metal: der 2D-Batch schrieb jede Ausgabe in denselben Vertex-Puffer, ein späterer
+    Frame überschrieb die Daten eines noch laufenden (jetzt Per-Frame-Ring).
+  - **4b:** Vulkan (Surface/Swapchain/Acquire-Semaphoren je Fenster, Present-Support je Surface prüfen).
+  - **4c:** D3D12 (Frame-Slot vom Back-Buffer-Index trennen, RTV-Heap/Tiefe je Swapchain).
+  - **4d:** OpenGL (geteilte Kontexte in allen Plattformen, VAOs/FBOs je Kontext).
+  - Backends ohne Umbau melden `VIO_FEATURE_MULTI_WINDOW` = false, `vio_window` liefert dort `false`. Headless-Fenster bekommen dieselben Slots, damit die Tests
   ohne Bildschirm laufen.
 - **Tests (270–272):** zwei und drei Fenster in einem Frame-Zyklus, je Fenster eigener Clear/Draw und
   `vio_read_pixels($window)`; Resize eines Nebenfensters stört das Hauptfenster nicht; Schließen und Freigeben

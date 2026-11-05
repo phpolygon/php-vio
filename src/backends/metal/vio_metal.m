@@ -295,6 +295,7 @@ static int metal_supports_layered_vertex(void)
 }
 static void metal_ring_begin_frame(void);
 static void metal_ring_end_frame(id<MTLCommandBuffer> cb);
+static id<MTLBuffer> metal_ring_alloc(NSUInteger size, NSUInteger *out_offset);
 static void metal_3d_shutdown(void);
 static int  metal_clamp_sample_count(int requested);
 
@@ -768,6 +769,139 @@ int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
     return 0;
 }
 
+/* ── Further windows (DESKTOP-APP-PLAN Phase 4) ──────────────────────
+ * The swapchain fields of vio_mtl, one record per window. set_swapchain
+ * stores the active window's fields into its record and loads the other's
+ * (ARC assignments, field by field); everything else keeps reading vio_mtl. */
+typedef struct _vio_metal_swapchain {
+    CAMetalLayer             *metal_layer;
+    id<CAMetalDrawable>       current_drawable;
+    MTLRenderPassDescriptor  *render_pass_desc;
+    id<MTLTexture>            depth_texture, offscreen_texture, discard_texture, msaa_color, msaa_depth;
+    id<MTLTexture>            last_texture;
+    id<MTLCommandBuffer>      last_cmd_buf;
+    dispatch_semaphore_t      frame_semaphore;
+    int                       width, height, vsync, frame_semaphore_held;
+    void                     *platform_window;
+} vio_metal_swapchain;
+
+static vio_metal_swapchain  metal_main_sc;
+static vio_metal_swapchain *metal_cur_sc;   /* NULL: the main window's fields are loaded */
+
+static void metal_sc_store(vio_metal_swapchain *r)
+{
+    r->metal_layer = vio_mtl.metal_layer;            r->current_drawable = vio_mtl.current_drawable;
+    r->render_pass_desc = vio_mtl.render_pass_desc;  r->depth_texture = vio_mtl.depth_texture;
+    r->offscreen_texture = vio_mtl.offscreen_texture; r->discard_texture = vio_mtl.discard_texture;
+    r->msaa_color = vio_mtl.msaa_color;              r->msaa_depth = vio_mtl.msaa_depth;
+    r->last_texture = last_presented_texture;        r->last_cmd_buf = last_presented_cmd_buf;
+    r->frame_semaphore = vio_mtl.frame_semaphore;    r->frame_semaphore_held = vio_mtl.frame_semaphore_held;
+    r->width = vio_mtl.width; r->height = vio_mtl.height; r->vsync = vio_mtl.vsync;
+    r->platform_window = vio_mtl.platform_window;
+}
+
+static void metal_sc_load(vio_metal_swapchain *r)
+{
+    vio_mtl.metal_layer = r->metal_layer;            vio_mtl.current_drawable = r->current_drawable;
+    vio_mtl.render_pass_desc = r->render_pass_desc;  vio_mtl.depth_texture = r->depth_texture;
+    vio_mtl.offscreen_texture = r->offscreen_texture; vio_mtl.discard_texture = r->discard_texture;
+    vio_mtl.msaa_color = r->msaa_color;              vio_mtl.msaa_depth = r->msaa_depth;
+    last_presented_texture = r->last_texture;        last_presented_cmd_buf = r->last_cmd_buf;
+    vio_mtl.frame_semaphore = r->frame_semaphore;    vio_mtl.frame_semaphore_held = r->frame_semaphore_held;
+    vio_mtl.width = r->width; vio_mtl.height = r->height; vio_mtl.vsync = r->vsync;
+    vio_mtl.platform_window = r->platform_window;
+}
+
+static void metal_sc_clear(vio_metal_swapchain *r)
+{
+    r->metal_layer = nil; r->current_drawable = nil; r->render_pass_desc = nil; r->depth_texture = nil;
+    r->offscreen_texture = nil; r->discard_texture = nil; r->msaa_color = nil; r->msaa_depth = nil;
+    r->last_texture = nil; r->last_cmd_buf = nil; r->frame_semaphore = nil;
+}
+
+static void metal_set_swapchain(void *swapchain)
+{
+    vio_metal_swapchain *target = swapchain ? (vio_metal_swapchain *)swapchain : &metal_main_sc;
+    vio_metal_swapchain *cur = metal_cur_sc ? metal_cur_sc : &metal_main_sc;
+    if (target == cur) return;
+    metal_sc_store(cur);
+    metal_sc_load(target);
+    metal_cur_sc = target == &metal_main_sc ? NULL : target;
+}
+
+static void *metal_create_swapchain(void *platform_window, const vio_config *cfg)
+{
+#if TARGET_OS_OSX
+    if (!vio_mtl.initialized || !platform_window) return NULL;
+    @autoreleasepool {
+        NSWindow *ns_window = (__bridge NSWindow *)vio_plat()->native_handle(platform_window, VIO_NATIVE_NSWINDOW);
+        if (!ns_window) return NULL;
+        vio_metal_swapchain *rec = (vio_metal_swapchain *)calloc(1, sizeof(vio_metal_swapchain));
+        if (!rec) return NULL;
+        CAMetalLayer *layer = [CAMetalLayer layer];
+        NSView *view = [ns_window contentView];
+        [view setWantsLayer:YES];
+        [view setLayer:layer];
+        [view setLayerContentsRedrawPolicy:NSViewLayerContentsRedrawNever];
+        int w = 0, h = 0;
+        if (cfg->headless) vio_plat()->get_window_size(platform_window, &w, &h);   /* 1:1, as the main window */
+        else vio_plat()->get_framebuffer_size(platform_window, &w, &h);
+        if (w <= 0) w = cfg->width > 0 ? cfg->width : 1;
+        if (h <= 0) h = cfg->height > 0 ? cfg->height : 1;
+
+        /* build the window's fields in vio_mtl with the main setup's helpers, then park them in rec */
+        vio_metal_swapchain *prev = metal_cur_sc ? metal_cur_sc : &metal_main_sc;
+        metal_sc_store(prev);
+        vio_metal_swapchain blank;
+        memset(&blank, 0, sizeof(blank));
+        metal_sc_load(&blank);
+        layer.device = vio_mtl.device;
+        layer.pixelFormat = vio_mtl.swap_format;   /* the device's pipelines are built for it */
+        layer.framebufferOnly = NO;
+        layer.opaque = YES;
+        layer.displaySyncEnabled = cfg->vsync ? YES : NO;
+        layer.maximumDrawableCount = 3;
+        layer.drawableSize = CGSizeMake(w, h);
+        vio_mtl.metal_layer = layer;
+        vio_mtl.vsync = cfg->vsync;
+        vio_mtl.width = w;
+        vio_mtl.height = h;
+        vio_mtl.frame_semaphore = vio_mtl.frame_latency > 0 ? dispatch_semaphore_create(vio_mtl.frame_latency) : nil;
+        create_depth_texture(w, h);
+        metal_create_swapchain_msaa(w, h);
+        if (!cfg->vsync) {
+            MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:vio_mtl.swap_format
+                                                                                          width:w height:h mipmapped:NO];
+            od.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            od.storageMode = MTLStorageModePrivate;
+            vio_mtl.offscreen_texture = [vio_mtl.device newTextureWithDescriptor:od];
+        }
+        vio_mtl.render_pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
+        vio_mtl.render_pass_desc.depthAttachment.texture = vio_mtl.depth_texture;
+        vio_mtl.render_pass_desc.depthAttachment.loadAction = MTLLoadActionClear;
+        vio_mtl.render_pass_desc.depthAttachment.storeAction = MTLStoreActionDontCare;
+        vio_mtl.render_pass_desc.depthAttachment.clearDepth = 1.0;
+        vio_mtl.platform_window = cfg->headless ? NULL : platform_window;   /* as the main setup: headless keeps its 1:1 size */
+        metal_sc_store(rec);
+        metal_sc_load(prev);
+        return rec;
+    }
+#else
+    (void)platform_window; (void)cfg;
+    return NULL;
+#endif
+}
+
+static void metal_destroy_swapchain(void *swapchain)
+{
+    vio_metal_swapchain *rec = (vio_metal_swapchain *)swapchain;
+    if (!rec) return;
+    if (metal_cur_sc == rec) metal_set_swapchain(NULL);
+    if (rec->last_cmd_buf) [rec->last_cmd_buf waitUntilCompleted];   /* the GPU may still draw into its textures */
+    metal_sc_clear(rec);
+    free(rec);
+}
+
 void vio_metal_handle_resize(int width, int height)
 {
     if (!vio_mtl.initialized) return;
@@ -1099,7 +1233,14 @@ void vio_metal_2d_flush(vio_2d_state *state)
         if (!vio_mtl.current_encoder || !mtl_2d.initialized) return;
         if (state->item_count == 0) return;
 
-        /* Upload vertex data — grow Metal buffer if needed */
+        /* Vertex data into a slice of the frame's ring: a later flush or the
+         * next frame (another window's) must not overwrite what this one's
+         * command buffer has yet to read. The shared buffer only without a ring. */
+        NSUInteger vb_offset = 0;
+        id<MTLBuffer> vb = metal_ring_alloc(sizeof(vio_2d_vertex) * (NSUInteger)state->vertex_count, &vb_offset);
+        if (vb) {
+            memcpy((char *)[vb contents] + vb_offset, state->vertices, sizeof(vio_2d_vertex) * state->vertex_count);
+        } else {
         int needed = state->vertex_count;
         if (needed > mtl_2d.vb_capacity || !mtl_2d.vertex_buffer) {
             int new_cap = (needed > mtl_2d.vb_capacity * 2) ? needed : mtl_2d.vb_capacity * 2;
@@ -1111,6 +1252,8 @@ void vio_metal_2d_flush(vio_2d_state *state)
         }
         memcpy([mtl_2d.vertex_buffer contents], state->vertices,
                sizeof(vio_2d_vertex) * state->vertex_count);
+        vb = mtl_2d.vertex_buffer;
+        }
 
         /* Projection + output control: PQ-encode only what lands on an HDR10
          * swapchain - a render target keeps display-referred values, so 2D drawn
@@ -1129,7 +1272,7 @@ void vio_metal_2d_flush(vio_2d_state *state)
         [vio_mtl.current_encoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
 
         /* Bind vertex buffer and projection */
-        [vio_mtl.current_encoder setVertexBuffer:mtl_2d.vertex_buffer offset:0 atIndex:0];
+        [vio_mtl.current_encoder setVertexBuffer:vb offset:vb_offset atIndex:0];
         [vio_mtl.current_encoder setVertexBytes:ub length:sizeof(ub) atIndex:1];
         [vio_mtl.current_encoder setFragmentBytes:ub length:sizeof(ub) atIndex:1];
 
@@ -7352,6 +7495,9 @@ static const vio_backend metal_backend = {
     .rt_origin_top            = 1,
     .clip_z_remap             = 1,
     .set_frame_present        = metal_set_frame_present,
+    .create_swapchain         = metal_create_swapchain,
+    .set_swapchain            = metal_set_swapchain,
+    .destroy_swapchain        = metal_destroy_swapchain,
     .upscale_method           = metal_upscale_method,
     .upscale_native           = metal_upscale_native,
 };
