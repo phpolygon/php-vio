@@ -409,6 +409,9 @@ if test "$PHP_VIO" != "no"; then
       if test "$vio_ak_os" = "linux"; then
         VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD -lpthread -ldl -lm"
       fi
+      if test "$vio_ak_os" = "macos"; then
+        VIO_SHARED_LIBADD="$VIO_SHARED_LIBADD -Wl,-framework,AppKit -Wl,-framework,Foundation -Wl,-framework,CoreFoundation -lobjc -lc++"
+      fi
       AC_DEFINE(HAVE_ACCESSKIT, 1, [Whether AccessKit is available])
     else
       AC_MSG_RESULT([no])

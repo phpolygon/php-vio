@@ -148,6 +148,49 @@ PY;
              'php' => ['ready true', 'action save click null', 'updated']];
     $linux = $j === $want ? 'OK' : 'FAIL ' . $raw;
 }
+/* macOS: what VoiceOver sees, in-process through NSAccessibility on the content view
+ * (no Accessibility permission needed for the process's own elements) */
+$mac = 'n/a';
+if (PHP_OS_FAMILY === 'Darwin' && $avail && extension_loaded('ffi')) {
+    $ctx = vio_create('auto', ['width' => 200, 'height' => 100, 'headless' => true]);
+    $tree = fn(string $save) => ['focus' => 'name', 'nodes' => [
+        ['id' => 'root', 'role' => 'window', 'label' => 'vio a11y test', 'children' => ['save', 'name', 'agree']],
+        ['id' => 'save', 'role' => 'button', 'label' => $save, 'bounds' => [10, 10, 80, 24], 'actions' => ['click']],
+        ['id' => 'name', 'role' => 'text_input', 'label' => 'Name', 'value' => 'Hendrik', 'bounds' => [100, 10, 90, 24], 'actions' => ['focus', 'set_value']],
+        ['id' => 'agree', 'role' => 'check_box', 'label' => 'Zustimmen', 'checked' => true, 'bounds' => [10, 50, 80, 20], 'actions' => ['click']],
+    ]];
+    $got = [];
+    vio_on_a11y_action($ctx, function ($id, $action, $value) use (&$got) { $got[] = "$id $action " . json_encode($value); });
+    vio_a11y_update($ctx, $tree('Speichern'));
+    $lib = '/usr/lib/libobjc.A.dylib';
+    $o  = FFI::cdef('void *sel_registerName(const char *s); void *objc_msgSend(void *o, void *s);', $lib);
+    $oi = FFI::cdef('void *objc_msgSend(void *o, void *s, unsigned long i);', $lib);
+    $ou = FFI::cdef('unsigned long objc_msgSend(void *o, void *s);', $lib);
+    $os = FFI::cdef('const char *objc_msgSend(void *o, void *s);', $lib);
+    $m = fn($obj, string $sel) => $o->objc_msgSend($obj, $o->sel_registerName($sel));
+    $str = fn($ns) => $ns === null ? null : $os->objc_msgSend($m($ns, 'description'), $o->sel_registerName('UTF8String'));
+    $kids = function ($el) use ($m, $o, $oi, $ou) {
+        $c = $m($el, 'accessibilityChildren');
+        $n = $c === null ? 0 : $ou->objc_msgSend($c, $o->sel_registerName('count'));
+        $r = [];
+        for ($i = 0; $i < $n; $i++) $r[] = $oi->objc_msgSend($c, $o->sel_registerName('objectAtIndex:'), $i);
+        return $r;
+    };
+    $view = $m($o->cast('void *', vio_native_window_handle($ctx)), 'contentView');
+    $root = $kids($view)[0] ?? null;
+    $nodes = $root ? $kids($root) : [];
+    $desc = array_map(fn($e) => [$str($m($e, 'accessibilityRole')), $str($m($e, 'accessibilityTitle')), $str($m($e, 'accessibilityValue'))], $nodes);
+    $pressed = $nodes ? (bool)FFI::cdef('signed char objc_msgSend(void *o, void *s);', $lib)->objc_msgSend($nodes[0], $o->sel_registerName('accessibilityPerformPress')) : false;
+    vio_poll_events($ctx);
+    vio_a11y_update($ctx, ['nodes' => [$tree('Gespeichert')['nodes'][1]]]);
+    $after = $root ? $str($m($kids($root)[0], 'accessibilityTitle')) : null;
+    $want = [[['AXButton', 'Speichern', null], ['AXTextField', 'Name', 'Hendrik'], ['AXCheckBox', 'Zustimmen', '1']], true, ['save click null'], 'Gespeichert'];
+    $mac = [$desc, $pressed, $got, $after] === $want ? 'OK' : 'FAIL ' . json_encode([$desc, $pressed, $got, $after]);
+    vio_destroy($ctx);
+}
+if ($mac === 'n/a' && PHP_OS_FAMILY === 'Darwin' && getenv('VIO_REQUIRE_A11Y')) $mac = 'FAIL (required)';
+echo "macos $mac\n";
+
 /* Windows: what a screen reader sees, over UI Automation (PowerShell's UIAutomationClient) */
 $win = 'n/a';
 if (PHP_OS_FAMILY === 'Windows' && $avail) {
@@ -242,5 +285,6 @@ echo "linux $linux\n";
 contract ValueError ValueError ValueError ValueError ValueError ValueError TypeError TypeError TypeError
 update true
 refs ValueError ValueError ValueError none
+macos %r(OK|n.a)%r
 windows %r(OK|n.a)%r
 linux %r(OK|n.a)%r

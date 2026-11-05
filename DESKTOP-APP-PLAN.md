@@ -241,7 +241,10 @@ vio_key_pressed($tool, VIO_KEY_A);   // Eingabe-Funktionen nehmen VioContext|Vio
     Windows meldet `accessibility` = false. Die Wurzel trägt den Content-Scale als Transformation (AccessKit rechnet in
     Pixeln, vio logisch). `config.w32` `--with-accesskit=DIR` (statische MSVC-Bibliothek + `bcrypt`, `ntdll`, `propsys`,
     `runtimeobject`, `uiautomationcore`, `userenv`, `ws2_32`). Test 273 fragt über PowerShells UIAutomationClient ab.
-  - **5c:** macOS (Subclassing-Adapter an der View; Abfrage im Test braucht die Bedienungshilfen-Freigabe).
+  - **5c ✅:** macOS: `accesskit_macos_subclassing_adapter_for_window` am NSWindow (Cocoa und GLFW), Handler im
+    Main-Thread innerhalb der Event-Schleife; AccessKit gibt die Beschriftung als `accessibilityTitle` aus. Test 273 fragt
+    im eigenen Prozess über NSAccessibility ab (keine Bedienungshilfen-Freigabe nötig) und drückt per
+    `accessibilityPerformPress`. Gelinkt mit AppKit, Foundation, CoreFoundation, `objc`, `c++`.
 - Wayland ist abgedeckt, weil AT-SPI nicht am Fenstersystem hängt.
 - **Tests (273, 274):** Baum anlegen/ändern/Fokus; danach vom Kindprozess abfragen: Windows über UIA
   (`IUIAutomation::ElementFromHandle`, Name/Rolle der Kinder), macOS über `AXUIElementCreateApplication`
