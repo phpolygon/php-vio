@@ -1157,6 +1157,33 @@ ZEND_FUNCTION(vio_on_minimize) { vio_set_window_callback(INTERNAL_FUNCTION_PARAM
 ZEND_FUNCTION(vio_on_scale)    { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_SCALE); }
 ZEND_FUNCTION(vio_on_refresh)  { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_REFRESH); }
 ZEND_FUNCTION(vio_on_drop)     { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_DROP); }
+ZEND_FUNCTION(vio_on_preedit)  { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_PREEDIT); }
+
+/* A composition through the same path as the platform's: start/end -1 = after the text. */
+ZEND_FUNCTION(vio_inject_preedit)
+{
+    zval *ctx_zval;
+    zend_string *text;
+    zend_long start = -1, end = -1;
+    ZEND_PARSE_PARAMETERS_START(2, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR(text)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(start)
+        Z_PARAM_LONG(end)
+    ZEND_PARSE_PARAMETERS_END();
+    size_t cps = 0;
+    for (size_t i = 0; i < ZSTR_LEN(text); i++) if (((unsigned char)ZSTR_VAL(text)[i] & 0xC0) != 0x80) cps++;
+    if (memchr(ZSTR_VAL(text), 0, ZSTR_LEN(text))) { zend_argument_value_error(2, "must not hold NUL bytes"); RETURN_THROWS(); }
+    if (start < 0) start = (zend_long)cps;
+    if (end < 0) end = start;
+    if (start > (zend_long)cps || end > (zend_long)cps || end < start) {
+        zend_argument_value_error(3, "and argument #4 must lie within the text, start <= end");
+        RETURN_THROWS();
+    }
+    vio_input_preedit_event(&Z_VIO_CONTEXT_P(ctx_zval)->input, ZSTR_VAL(text), (int)start, (int)end);
+}
+
 
 /* Files dropped through the same funnel as the platform's drop. */
 ZEND_FUNCTION(vio_inject_drop)
@@ -15871,6 +15898,7 @@ ZEND_FUNCTION(vio_platform_info)
     add_assoc_bool(return_value, "notifications", vio_plat_can((const void *)p->notify, VIO_PLATFORM_FEATURE_NOTIFICATIONS));
     add_assoc_bool(return_value, "progress", vio_plat_can((const void *)p->set_progress, VIO_PLATFORM_FEATURE_PROGRESS));
     add_assoc_bool(return_value, "tray", vio_plat_can((const void *)p->set_tray, VIO_PLATFORM_FEATURE_TRAY));
+    add_assoc_bool(return_value, "ime_preedit", p->ime_preedit != 0);
 }
 
 ZEND_FUNCTION(vio_set_cursor)
@@ -16526,6 +16554,39 @@ ZEND_FUNCTION(vio_tray_remove)
     vio_tray_shown = 0;
     vio_tray_reset();
     RETURN_BOOL(was);
+}
+
+/* ── IME (DESKTOP-APP-PLAN Phase 3) ──────────────────────────────── */
+
+ZEND_FUNCTION(vio_ime_rect)
+{
+    zval *ctx_zval;
+    zend_long x, y, w, h;
+    ZEND_PARSE_PARAMETERS_START(5, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(x)
+        Z_PARAM_LONG(y)
+        Z_PARAM_LONG(w)
+        Z_PARAM_LONG(h)
+    ZEND_PARSE_PARAMETERS_END();
+    if (w < 0 || h < 0) { zend_argument_value_error(4, "and argument #5 must not be negative"); RETURN_THROWS(); }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    float fx, fy;
+    vio_ctx_screen_factor(ctx, &fx, &fy);
+    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_ime_rect, (int)((float)x * fx + 0.5f), (int)((float)y * fy + 0.5f),
+                              (int)((float)w * fx + 0.5f), (int)((float)h * fy + 0.5f)));
+}
+
+ZEND_FUNCTION(vio_ime_enable)
+{
+    zval *ctx_zval;
+    bool on;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_BOOL(on)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_ime_enabled, on ? 1 : 0));
 }
 
 /* 1 when s holds a control character (also NUL inside the string). */

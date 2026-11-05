@@ -115,6 +115,8 @@ struct _vio_cocoa_window {
     unsigned char    keys_down[256];
     void            *cursor;     /* NSCursor for the view, retained; NULL = arrow */
     void            *menu_target;   /* VioCocoaMenuTarget of the menu bar, retained */
+    int              ime_off;       /* vio_ime_enable(false): characters straight from the key event */
+    int              ime_x, ime_y, ime_w, ime_h;   /* vio_ime_rect, view points */
     vio_input_state *input;
 };
 
@@ -139,9 +141,37 @@ static void cocoa_report_size(vio_cocoa_window *w)
 
 /* ── View: keys, text, mouse ──────────────────────────────────────── */
 
-@interface VioCocoaView : NSView
+@interface VioCocoaView : NSView <NSTextInputClient>
 @property (nonatomic, assign) vio_cocoa_window *owner;
+@property (nonatomic, strong) NSString *marked;   /* the IME composition, nil = none */
 @end
+
+/* UTF-16 index -> codepoint index in s */
+static int cocoa_cp_index(NSString *s, NSUInteger utf16)
+{
+    int n = 0;
+    for (NSUInteger i = 0; i < utf16 && i < s.length; i++, n++) {
+        unichar c = [s characterAtIndex:i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) i++;
+    }
+    return n;
+}
+
+/* text -> chars, without control and function keys (as the key path) */
+static void cocoa_emit_text(vio_input_state *input, NSString *chars)
+{
+    NSUInteger n = chars.length;
+    for (NSUInteger i = 0; i < n; i++) {
+        unichar c = [chars characterAtIndex:i];
+        unsigned int cp = c;
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
+            unichar lo = [chars characterAtIndex:i + 1];
+            if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00); i++; }
+        }
+        if (cp < 32 || cp == 127 || (cp >= 0xF700 && cp <= 0xF8FF)) continue;
+        vio_input_emit_char(input, cp);
+    }
+}
 
 @implementation VioCocoaView
 
@@ -192,18 +222,50 @@ static void cocoa_report_size(vio_cocoa_window *w)
     if (kc < 256) w->keys_down[kc] = 1;
     vio_input_key_event(cocoa_input(w), key, action, cocoa_mods(event.modifierFlags));
     if (event.modifierFlags & NSEventModifierFlagCommand) return;   /* shortcuts carry no text */
-    NSString *chars = event.characters;
-    NSUInteger n = chars.length;
-    for (NSUInteger i = 0; i < n; i++) {
-        unichar c = [chars characterAtIndex:i];
-        unsigned int cp = c;
-        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
-            unichar lo = [chars characterAtIndex:i + 1];
-            if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00); i++; }
-        }
-        if (cp < 32 || cp == 127 || (cp >= 0xF700 && cp <= 0xF8FF)) continue;   /* control and function keys */
-        vio_input_emit_char(cocoa_input(w), cp);
-    }
+    /* the input method composes (IMEs, dead keys) and answers with insertText: / setMarkedText: */
+    if (!w->ime_off) { [self interpretKeyEvents:@[event]]; return; }
+    cocoa_emit_text(cocoa_input(w), event.characters);
+}
+
+/* ── NSTextInputClient (IME composition, DESKTOP-APP-PLAN Phase 3) ── */
+- (void)insertText:(id)string replacementRange:(NSRange)range
+{
+    (void)range;
+    vio_cocoa_window *w = self.owner;
+    if (!w) return;
+    NSString *s = [string isKindOfClass:[NSAttributedString class]] ? [(NSAttributedString *)string string] : (NSString *)string;
+    if (self.marked) { self.marked = nil; vio_input_preedit_event(w->input, "", 0, 0); }
+    cocoa_emit_text(cocoa_input(w), s);
+}
+- (void)doCommandBySelector:(SEL)selector { (void)selector; }   /* keys arrive as key events; no beep */
+- (void)setMarkedText:(id)string selectedRange:(NSRange)sel replacementRange:(NSRange)range
+{
+    (void)range;
+    vio_cocoa_window *w = self.owner;
+    NSString *s = [string isKindOfClass:[NSAttributedString class]] ? [(NSAttributedString *)string string] : (NSString *)string;
+    self.marked = s.length ? s : nil;
+    if (!w) return;
+    if (!s.length) { vio_input_preedit_event(w->input, "", 0, 0); return; }
+    vio_input_preedit_event(w->input, s.UTF8String, cocoa_cp_index(s, sel.location), cocoa_cp_index(s, NSMaxRange(sel)));
+}
+- (void)unmarkText
+{
+    if (!self.marked) return;
+    self.marked = nil;
+    if (self.owner) vio_input_preedit_event(self.owner->input, "", 0, 0);
+}
+- (BOOL)hasMarkedText { return self.marked != nil; }
+- (NSRange)markedRange { return self.marked ? NSMakeRange(0, self.marked.length) : NSMakeRange(NSNotFound, 0); }
+- (NSRange)selectedRange { return NSMakeRange(self.marked ? self.marked.length : 0, 0); }
+- (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText { return @[]; }
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actual { (void)range; (void)actual; return nil; }
+- (NSUInteger)characterIndexForPoint:(NSPoint)point { (void)point; return NSNotFound; }
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actual
+{
+    (void)range; (void)actual;
+    vio_cocoa_window *w = self.owner;
+    NSRect r = w ? NSMakeRect(w->ime_x, w->ime_y, w->ime_w, w->ime_h) : NSZeroRect;   /* flipped view: y from the top */
+    return [self.window convertRectToScreen:[self convertRect:r toView:nil]];
 }
 
 - (void)keyUp:(NSEvent *)event
@@ -1354,6 +1416,30 @@ static int cocoa_set_tray(const vio_tray_desc *d)
     return 1;
 }
 
+/* ── IME (DESKTOP-APP-PLAN Phase 3) ───────────────────────────────── */
+
+static int cocoa_set_ime_rect(vio_window_handle h, int x, int y, int width, int height)
+{
+    vio_cocoa_window *w = (vio_cocoa_window *)h;
+    if (!w) return 0;
+    w->ime_x = x; w->ime_y = y; w->ime_w = width; w->ime_h = height;
+    [COCOA_VIEW(w).inputContext invalidateCharacterCoordinates];
+    return 1;
+}
+
+static int cocoa_set_ime_enabled(vio_window_handle h, int enabled)
+{
+    vio_cocoa_window *w = (vio_cocoa_window *)h;
+    if (!w) return 0;
+    w->ime_off = !enabled;
+    if (!enabled) {
+        VioCocoaView *view = (__bridge VioCocoaView *)w->view;
+        [view.inputContext discardMarkedText];
+        [view unmarkText];
+    }
+    return 1;
+}
+
 static int cocoa_window_monitor(vio_window_handle h)
 {
     return h ? ((vio_cocoa_window *)h)->monitor : -1;
@@ -1701,6 +1787,9 @@ static const vio_platform vio_platform_cocoa = {
     .notify               = cocoa_notify,
     .set_progress         = cocoa_set_progress,
     .set_tray             = cocoa_set_tray,
+    .ime_preedit          = 1,
+    .set_ime_rect         = cocoa_set_ime_rect,
+    .set_ime_enabled      = cocoa_set_ime_enabled,
 };
 
 void vio_platform_cocoa_register(void)

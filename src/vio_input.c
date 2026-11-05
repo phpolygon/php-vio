@@ -388,6 +388,18 @@ void vio_input_menu_event(vio_input_state *state, int tag)
     zval_ptr_dtor(&arg);
 }
 
+void vio_input_preedit_event(vio_input_state *state, const char *utf8, int start, int end)
+{
+    if (!state) return;
+    zval retval, args[3];
+    ZVAL_STRING(&args[0], utf8 ? utf8 : "");
+    ZVAL_LONG(&args[1], start);
+    ZVAL_LONG(&args[2], end);
+    vio_window_cb_call(state, VIO_WINDOW_CB_PREEDIT, 3, args, &retval);
+    zval_ptr_dtor(&retval);
+    zval_ptr_dtor(&args[0]);
+}
+
 /* ── Touch push API ─────────────────────────────────────────────────
  *
  * Implementation notes:

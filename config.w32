@@ -291,6 +291,7 @@ if (PHP_VIO != "no") {
     CHECK_LIB("gdi32.lib", "vio");
     CHECK_LIB("user32.lib", "vio");
     CHECK_LIB("shell32.lib", "vio");
+    CHECK_LIB("imm32.lib", "vio");   // IME composition (vio_on_preedit)
     // ole32/winmm needed by miniaudio
     CHECK_LIB("ole32.lib", "vio");
     CHECK_LIB("winmm.lib", "vio");

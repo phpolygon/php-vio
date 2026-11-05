@@ -298,6 +298,16 @@ typedef struct _vio_platform {
      * arrive through vio_tray_click_event / vio_tray_menu_event (from the
      * event loop). 1 = shown. */
     int   (*set_tray)(const vio_tray_desc *d);
+
+    /* ── IME (DESKTOP-APP-PLAN Phase 3) ──────────────────────────────
+     * A platform that reports the composition text sets ime_preedit and
+     * calls vio_input_preedit_event; the committed text still comes as chars.
+     * set_ime_rect: where the text being composed is (screen coordinates of
+     * the window, like set_window_size), for the candidate window.
+     * set_ime_enabled: 0 hands keys straight to the game (no IME). */
+    int   ime_preedit;
+    int   (*set_ime_rect)(vio_window_handle w, int x, int y, int width, int height);
+    int   (*set_ime_enabled)(vio_window_handle w, int enabled);
 } vio_platform;
 
 /* Tray events, implemented in php_vio.c (PHP thread, inside poll/wait). */
