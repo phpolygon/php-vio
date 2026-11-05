@@ -79,7 +79,6 @@ foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
     elseif ($platform === 'null' || $platform === vio_platform()) $results[$platform] = "no result: $line $errout";
 }
 @unlink($file);
-@rmdir($dir);
 
 $save = $dir . DIRECTORY_SEPARATOR . 'saved file.txt';
 $bad = [];
@@ -92,10 +91,15 @@ foreach ($results as $platform => $line) {
            'box cancel' => [2, true], 'box button 1' => [1, true], 'box button 0' => [0, true]]
         : ['open cancel' => [false, true], 'folder cancel' => [false, true], 'save accept' => [false, true],
            'box cancel' => [false, true], 'box button 1' => [false, true], 'box button 0' => [false, true]];
-    /* macOS may resolve /var -> /private/var in the panel's URL */
-    if ($r && $platform === 'cocoa' && isset($r['save accept'][0][0])) $r['save accept'][0][0] = preg_replace('#^/private(/var/)#', '$1', $r['save accept'][0][0]);
+    /* the dialog may spell the folder differently (macOS /private/var, Windows long vs 8.3 names): compare it resolved */
+    if ($r && isset($r['save accept'][0][0])) {
+        $got = $r['save accept'][0][0];
+        $same = strcasecmp((string)realpath(dirname($got)), (string)realpath(dirname($save))) === 0 && basename($got) === basename($save);
+        if ($same) $r['save accept'][0][0] = $save;
+    }
     if ($r !== $wantRun) $bad[] = "$platform: $line" . ($errs[$platform] ?? '');
 }
+@rmdir($dir);
 echo isset($results['null'], $results[vio_platform()]) && !$bad ? "OK\n" : "FAIL " . json_encode([$results, $bad], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
 ?>
 --EXPECT--
