@@ -1375,6 +1375,32 @@ static int w32_message_box(vio_window_handle h, const vio_message_box_desc *d)
     return last;   /* IDCANCEL / closed */
 }
 
+/* ── Taskbar progress (DESKTOP-APP-PLAN Phase 2c) ─────────────────── */
+
+static const GUID w32_CLSID_TaskbarList = { 0x56FDF344, 0xFD6D, 0x11D0, { 0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90 } };
+static const GUID w32_IID_ITaskbarList3 = { 0xEA1AFB91, 0x9E28, 0x4B86, { 0x90, 0xE9, 0x9E, 0x9F, 0x8A, 0x5E, 0xEF, 0xAF } };
+static ITaskbarList3 *w32_taskbar;   /* process-wide, on this (the PHP) thread's apartment */
+
+static int w32_set_progress(vio_window_handle h, double value, int state)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return 0;
+    if (!w32_taskbar) {
+        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);   /* kept: the object lives on */
+        if (FAILED(CoCreateInstance(&w32_CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER, &w32_IID_ITaskbarList3, (void **)&w32_taskbar))
+            || !w32_taskbar) { w32_taskbar = NULL; return 0; }
+        if (FAILED(w32_taskbar->lpVtbl->HrInit(w32_taskbar))) { w32_taskbar->lpVtbl->Release(w32_taskbar); w32_taskbar = NULL; return 0; }
+    }
+    TBPFLAG flag = value < 0.0 && state != VIO_PLATFORM_PROGRESS_INDETERMINATE ? TBPF_NOPROGRESS
+                 : state == VIO_PLATFORM_PROGRESS_PAUSED ? TBPF_PAUSED
+                 : state == VIO_PLATFORM_PROGRESS_ERROR ? TBPF_ERROR
+                 : state == VIO_PLATFORM_PROGRESS_INDETERMINATE ? TBPF_INDETERMINATE : TBPF_NORMAL;
+    if (FAILED(w32_taskbar->lpVtbl->SetProgressState(w32_taskbar, w->hwnd, flag))) return 0;
+    if (value >= 0.0 && flag != TBPF_INDETERMINATE)
+        return SUCCEEDED(w32_taskbar->lpVtbl->SetProgressValue(w32_taskbar, w->hwnd, (ULONGLONG)(value * 10000.0 + 0.5), 10000));
+    return 1;
+}
+
 /* ── Menus (DESKTOP-APP-PLAN Phase 2b) ────────────────────────────── */
 
 static WORD w32_menu_vk(int key)
@@ -1915,6 +1941,7 @@ static const vio_platform vio_platform_win32 = {
     .message_box          = w32_message_box,
     .set_menu_bar         = w32_set_menu_bar,
     .popup_menu           = w32_popup_menu,
+    .set_progress         = w32_set_progress,
 };
 
 void vio_platform_win32_register(void)

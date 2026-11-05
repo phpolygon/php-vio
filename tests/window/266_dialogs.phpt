@@ -54,6 +54,7 @@ foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
          . ' -d extension=vio ' . escapeshellarg($file) . ' ' . escapeshellarg($dir);
     $env = getenv();
     $env['VIO_PLATFORM'] = $platform;
+    unset($env['DBUS_SESSION_BUS_ADDRESS']);   // a desktop's portal would open a real dialog (268 covers it with a fake)
     $p = proc_open($cmd, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
     $line = trim(stream_get_contents($pipes[1]));
     $errout = trim(stream_get_contents($pipes[2]));

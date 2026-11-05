@@ -1,6 +1,6 @@
 # Native Desktop-Anwendungen – Plan
 
-> **Status:** 🚧 Phasen 0, 1, 2a (Drop, Dialoge, Message-Box) und 2b (Menüs) umgesetzt (2026-11-05, Tests 261–267), 2c und 3–5 offen.
+> **Status:** 🚧 Phasen 0, 1, 2a (Drop, Dialoge, Message-Box) 2b (Menüs) und 2c-1 (D-Bus, Benachrichtigungen, Fortschritt, Portal) umgesetzt (2026-11-05, Tests 261–268), 2c-2 (Tray) und 3–5 offen.
 > **Baut auf:** `NATIVE-PLATFORM-PLAN.md` (Win32, Cocoa, X11, Wayland hinter `vio_platform`, Tests 212–215) und
 > Zwischenablage/Tastennamen (239/240).
 > **Ziel:** Mit php-vio sollen sich Werkzeuge, Editoren und Launcher bauen lassen, nicht nur Spiele: sparsam im
@@ -99,7 +99,11 @@ vio_on_refresh($ctx, fn() => render());   // OS will neu gezeichnet haben (Expos
   Der Linux-Datei-Dialog (Portal) kommt mit dem D-Bus-Helfer in 2c. Testbar über `VIO_TEST_DIALOG=<ms>:<aktion>`, das den
   echten Dialog nach einer Wartezeit schließt.
 - **2b umgesetzt** (Test 267): Menüleiste und Kontextmenü auf Win32 und Cocoa, Kürzel mit `Primary`; macOS bekommt ein
-  App-Menü, dessen Beenden `vio_on_close` fragt. **2c:** D-Bus-Helfer (`dlopen` libdbus), Portal-Dialoge, Tray, Benachrichtigungen,
+  App-Menü, dessen Beenden `vio_on_close` fragt.
+- **2c-1 umgesetzt** (Test 268): D-Bus-Helfer (libdbus per `dlopen`), Benachrichtigungen (Linux, macOS im Bundle),
+  Fortschritt (Win32 `ITaskbarList3`, macOS Dock-Kachel, Linux `LauncherEntry` mit `vio.app_id`), Portal-Dateidialog.
+  `vio_platform_info()` folgt der Sitzung (Slot `available`). **2c-2:** Tray (Win32, Cocoa, StatusNotifierItem) und
+  Windows-Benachrichtigungen über das Tray-Icon. Ursprünglich für **2c**: D-Bus-Helfer (`dlopen` libdbus), Portal-Dialoge, Tray, Benachrichtigungen,
   Fortschritt in Taskleiste/Dock.
 - Menü-Baum als PHP-Array: `['id', 'label', 'shortcut' => 'Ctrl+S', 'checked', 'enabled', 'children', 'separator']`.
   Kürzel plattformgerecht (`Ctrl` → `Cmd` auf macOS über `'shortcut' => 'Primary+S'`).

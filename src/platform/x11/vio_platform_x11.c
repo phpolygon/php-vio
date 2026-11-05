@@ -51,6 +51,7 @@
 #include "../../vio_input.h"
 #include "../vio_shell.h"
 #include "../linux/vio_uri_list.h"
+#include "../linux/vio_desktop_linux.h"
 #include <X11/cursorfont.h>
 
 /* ── Display, errors ──────────────────────────────────────────────── */
@@ -1402,6 +1403,11 @@ static int x11_set_opacity(vio_window_handle h, float opacity)
     return 1;
 }
 
+
+/* Linux desktop services over D-Bus (src/platform/linux/vio_desktop_linux.c) */
+static int lx_file_dialog(vio_window_handle w, const vio_file_dialog_desc *d, char ***out, int *n) { (void)w; return vio_linux_file_dialog(d, out, n); }
+static int lx_set_progress(vio_window_handle w, double value, int state) { (void)w; return vio_linux_set_progress(value, state); }
+
 static int x11_get_attrib(vio_window_handle h, vio_window_attrib a)
 {
     vio_x11_window *w = (vio_x11_window *)h;
@@ -1792,6 +1798,10 @@ static const vio_platform vio_platform_x11 = {
     .open_url             = vio_shell_open_url,
     .reveal_file          = vio_shell_reveal_file,
     .accepts_drops        = 1,
+    .available            = vio_linux_available,
+    .file_dialog          = lx_file_dialog,
+    .notify               = vio_linux_notify,
+    .set_progress         = lx_set_progress,
 };
 
 void vio_platform_x11_register(void)

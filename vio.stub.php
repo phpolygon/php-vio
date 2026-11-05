@@ -183,6 +183,24 @@ function vio_inject_menu(VioContext $context, string $id): bool {}
 function vio_popup_menu(VioContext $context, array $items, float $x, float $y): string|false|null {}
 
 /**
+ * Show a desktop notification. Options: 'icon' => path or theme icon name
+ * (Linux), 'id' => a key: a notification with the same id replaces the last
+ * one. false where there are none right now (vio_platform_info()
+ * ['notifications']): Linux needs a notification service on the session bus,
+ * macOS an app bundle. vio.app_id names the application on Linux.
+ *
+ * @param array{icon?: string, id?: string} $options
+ */
+function vio_notify(string $title, string $body = '', array $options = []): bool {}
+
+/**
+ * Progress on the window's taskbar button / the Dock icon / the launcher
+ * entry: 0.0 .. 1.0, null hides it. $state: 'normal', 'paused', 'error',
+ * 'indeterminate' (needs no value). Linux needs vio.app_id (the .desktop id).
+ */
+function vio_set_progress(VioContext $context, ?float $progress, string $state = 'normal'): bool {}
+
+/**
  * Like vio_poll_events(), but first blocks until an event arrives, $timeout
  * seconds pass (< 0: no timeout) or vio_wake() is called. An idle desktop app
  * loops on this instead of vio_poll_events() and renders only when something
