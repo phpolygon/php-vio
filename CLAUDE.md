@@ -1602,6 +1602,10 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
 - **`VULKAN-MODERN-PLAN.md` — ✅ umgesetzt (2026-10-08, A37 + A18).** Vulkan 1.2+/1.3-Kern: Timeline-Semaphore
   für alle Übergaben, Synchronization2-Barrieren, Dynamic Rendering statt Render-Pass-/Framebuffer-Objekten,
   darauf das Shading-Rate-Bild (Test 160 auf Vulkan, Test 206).
+- **`DESKTOP-APP-PLAN.md` — 📋 geplant (2026-11-05).** Native Desktop-Anwendungen über `vio_platform`: 0 Event-Loop
+  (`vio_wait_events`, `vio_wake`, Fenster-Ereignisse), 1 Cursor/Icon/Größengrenzen, 2 Dialoge, Drop, Menüs, Tray,
+  Benachrichtigungen, 3 IME-Preedit, 4 mehrere Fenster (`VioWindow`, Swapchain je Fenster), 5 Barrierefreiheit über
+  AccessKit. Linux ohne Portal/Dienst → `false`; macOS als App-Bundle, CLI nur zur Entwicklung.
 - `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
 - `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
 - **`METAL-GEOMETRY-PLAN.md` — ✅ umgesetzt (2026-10-05).** Geometry-Stage auf Metal per Compute-
