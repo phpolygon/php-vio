@@ -52,6 +52,7 @@
 
 typedef struct _vio_win32_window {
     HWND             hwnd;
+    HWND             modal_owner;   /* disabled while this modal window is open */
     HDC              hdc;
     HGLRC            glrc;
     int              should_close;
@@ -2163,6 +2164,30 @@ static int w32_clipboard_get(char **out_utf8)
     return 1;
 }
 
+/* vio_window 'parent' / 'modal': an owned window stays above its owner and goes
+ * with it; a modal one disables the owner (input, Alt+Tab) like a dialog. */
+static int w32_set_parent(vio_window_handle h, vio_window_handle ph, int modal)
+{
+    vio_win32_window *w = (vio_win32_window *)h, *p = (vio_win32_window *)ph;
+    if (!w || !w->hwnd) return 0;
+    if (!p) {
+        if (w->modal_owner) {   /* before the window goes, so activation returns to the owner */
+            EnableWindow(w->modal_owner, TRUE);
+            if (GetActiveWindow() == w->hwnd) SetActiveWindow(w->modal_owner);
+            w->modal_owner = NULL;
+        }
+        SetWindowLongPtrW(w->hwnd, GWLP_HWNDPARENT, 0);
+        return 1;
+    }
+    if (!p->hwnd) return 0;
+    SetWindowLongPtrW(w->hwnd, GWLP_HWNDPARENT, (LONG_PTR)p->hwnd);
+    if (modal) {
+        EnableWindow(p->hwnd, FALSE);
+        w->modal_owner = p->hwnd;
+    }
+    return 1;
+}
+
 static const vio_platform vio_platform_win32 = {
     .name                 = "win32",
     .init                 = w32_init,
@@ -2233,6 +2258,7 @@ static const vio_platform vio_platform_win32 = {
     .ime_preedit          = 1,
     .set_ime_rect         = w32_set_ime_rect,
     .set_ime_enabled      = w32_set_ime_enabled,
+    .set_parent           = w32_set_parent,
 };
 
 void vio_platform_win32_register(void)

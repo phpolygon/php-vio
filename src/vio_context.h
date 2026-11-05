@@ -106,6 +106,11 @@ typedef struct _vio_window_object {
     vio_context_object  view;
     zend_object        *owner;       /* the VioContext, referenced while the window lives */
     void               *swapchain;   /* backend->create_swapchain */
+    /* 'parent': another window of the context, or its main window (parent NULL,
+     * has_parent 1); closed before its parent. 'modal': the parent's input is
+     * blocked (input.blocked) while this window is open. */
+    struct _vio_window_object *parent;
+    int                 has_parent, modal;
     zend_object         std;
 } vio_window_object;
 

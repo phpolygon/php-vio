@@ -94,6 +94,22 @@ void vio_window_object_close(vio_window_object *w)
 {
     vio_context_object *ctx = vio_window_owner(w);
     if (!ctx) return;
+    /* children first: a window system takes owned windows down with their owner */
+    for (int i = ctx->window_count - 1; i >= 0; i--) {
+        if (i < ctx->window_count && ctx->windows[i] != w && ctx->windows[i]->has_parent && ctx->windows[i]->parent == w) {
+            vio_window_object_close(ctx->windows[i]);
+            i = ctx->window_count;   /* the list changed */
+        }
+    }
+    if (w->has_parent) {
+        if (w->modal) {
+            vio_input_state *pin = w->parent ? &w->parent->view.input : &ctx->input;
+            if (pin->blocked > 0) pin->blocked--;
+        }
+        if (w->view.window && vio_plat()->set_parent) vio_plat()->set_parent(w->view.window, NULL, 0);
+        w->has_parent = 0;
+        w->parent = NULL;
+    }
     for (int i = 0; i < ctx->window_count; i++) {
         if (ctx->windows[i] != w) continue;
         ctx->windows[i] = ctx->windows[--ctx->window_count];

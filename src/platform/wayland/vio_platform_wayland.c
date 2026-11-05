@@ -1474,6 +1474,18 @@ static void wl_install_input(vio_window_handle h, vio_input_state *state)
     if (w) w->input = state;
 }
 
+/* vio_window 'parent': xdg_toplevel.set_parent (the compositor keeps it above
+ * and may centre it); 'modal' is vio's input block alone. */
+static int wl_set_parent(vio_window_handle h, vio_window_handle ph, int modal)
+{
+    (void)modal;
+    vio_wl_window *w = (vio_wl_window *)h, *p = (vio_wl_window *)ph;
+    if (!w || !w->toplevel) return 0;
+    xdg_toplevel_set_parent(w->toplevel, p ? p->toplevel : NULL);
+    wl_display_flush(wl.display);
+    return 1;
+}
+
 static const vio_platform vio_platform_wayland = {
     .name                 = "wayland",
     .init                 = wl_init,
@@ -1535,6 +1547,7 @@ static const vio_platform vio_platform_wayland = {
     .ime_preedit          = 1,
     .set_ime_rect         = wl_set_ime_rect,
     .set_ime_enabled      = wl_set_ime_enabled,
+    .set_parent           = wl_set_parent,
 };
 
 void vio_platform_wayland_register(void)

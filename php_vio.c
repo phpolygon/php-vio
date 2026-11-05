@@ -1414,6 +1414,27 @@ ZEND_FUNCTION(vio_window)
         RETURN_THROWS();
     }
 
+    /* 'parent' => VioContext|VioWindow of this context, 'modal' => bool (needs a parent) */
+    vio_window_object *parent = NULL;
+    int has_parent = 0, modal = 0;
+    if (opts) {
+        zval *v = zend_hash_str_find(opts, "parent", sizeof("parent") - 1);
+        if (v && Z_TYPE_P(v) != IS_NULL) {
+            if (Z_TYPE_P(v) == IS_OBJECT && Z_OBJCE_P(v) == vio_context_ce) {
+                if (Z_VIO_CONTEXT_P(v) != ctx) { zend_argument_value_error(2, "option \"parent\" must be this context or one of its open windows"); RETURN_THROWS(); }
+            } else if (Z_TYPE_P(v) == IS_OBJECT && Z_OBJCE_P(v) == vio_window_ce) {
+                parent = Z_VIO_WINDOW_P(v);
+                if (parent->owner != &ctx->std) { zend_argument_value_error(2, "option \"parent\" must be this context or one of its open windows"); RETURN_THROWS(); }
+            } else {
+                zend_argument_type_error(2, "option \"parent\" must be of type VioContext|VioWindow|null, %s given", zend_zval_value_name(v));
+                RETURN_THROWS();
+            }
+            has_parent = 1;
+        }
+        if ((v = zend_hash_str_find(opts, "modal", sizeof("modal") - 1))) modal = zend_is_true(v);
+        if (modal && !has_parent) { zend_argument_value_error(2, "option \"modal\" needs a \"parent\""); RETURN_THROWS(); }
+    }
+
     /* OpenGL: a visible window gets a context sharing the main one's objects (its
      * frames are blitted into it), a headless one none at all (only an FBO). */
     int gl = ctx->backend->swapchain_fbo != NULL;
@@ -1439,6 +1460,13 @@ ZEND_FUNCTION(vio_window)
     GC_ADDREF(&ctx->std);
     vio_plat()->install_input(pw, &w->view.input);
     ctx->windows[ctx->window_count++] = w;
+    if (has_parent) {
+        w->has_parent = 1;
+        w->parent = parent;
+        w->modal = modal;
+        if (vio_plat()->set_parent) vio_plat()->set_parent(pw, parent ? parent->view.window : ctx->window, modal);
+        if (modal) (parent ? &parent->view.input : &ctx->input)->blocked++;
+    }
 }
 
 /* Close a window now (its swapchain and platform window); a closed VioWindow
@@ -16156,6 +16184,7 @@ ZEND_FUNCTION(vio_platform_info)
     add_assoc_bool(return_value, "progress", vio_plat_can((const void *)p->set_progress, VIO_PLATFORM_FEATURE_PROGRESS));
     add_assoc_bool(return_value, "tray", vio_plat_can((const void *)p->set_tray, VIO_PLATFORM_FEATURE_TRAY));
     add_assoc_bool(return_value, "ime_preedit", p->ime_preedit != 0);
+    add_assoc_bool(return_value, "window_parent", p->set_parent != NULL);
 }
 
 ZEND_FUNCTION(vio_set_cursor)

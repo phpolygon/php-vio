@@ -308,6 +308,14 @@ typedef struct _vio_platform {
     int   ime_preedit;
     int   (*set_ime_rect)(vio_window_handle w, int x, int y, int width, int height);
     int   (*set_ime_enabled)(vio_window_handle w, int enabled);
+
+    /* ── Window parent (vio_window 'parent' / 'modal', Phase 4) ──────
+     * Attach w to parent: it stays above it and goes with it (Win32 owner,
+     * Cocoa child window, X11 WM_TRANSIENT_FOR, Wayland xdg parent). modal
+     * also tells the window system it is a dialog of parent (Win32 disables
+     * parent, X11 _NET_WM_STATE_MODAL); vio itself drops parent's input.
+     * parent NULL detaches w again before it is destroyed. 1 = applied. */
+    int   (*set_parent)(vio_window_handle w, vio_window_handle parent, int modal);
 } vio_platform;
 
 /* Tray events, implemented in php_vio.c (PHP thread, inside poll/wait). */
