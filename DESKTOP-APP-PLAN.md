@@ -181,7 +181,10 @@ vio_key_pressed($tool, VIO_KEY_A);   // Eingabe-Funktionen nehmen VioContext|Vio
     eines Slots wartet die Übergabe des Frames, der mit ihr acquired hat). Ein Fenster, dessen Surface die Present-Queue
     nicht kann oder ein anderes Format als die Hauptswapchain bekommt (die 2D-Pipelines sind dafür gebaut), wird
     abgelehnt.
-  - **4c:** D3D12 (Frame-Slot vom Back-Buffer-Index trennen, RTV-Heap/Tiefe je Swapchain).
+  - **4c ✅ (2026-11-05):** D3D12. Der Frame-Slot (`frame_index`: Allokator, Fence, Heap-Slices, Ringe) rückt nach jedem
+    Present um eins weiter, der Back-Buffer ist ein eigenes Feld (`back_index`) der geladenen Swapchain. Swapchain,
+    Back-Buffer mit RTV-Heap, Tiefe mit DSV-Heap, Größen und Flags je Fenster. Mit HDR-Komposit (Ebene in der Größe des
+    Hauptfensters) und bei anderem Swapchain-Format lehnt `vio_window` ab.
   - **4d:** OpenGL (geteilte Kontexte in allen Plattformen, VAOs/FBOs je Kontext).
   - Backends ohne Umbau melden `VIO_FEATURE_MULTI_WINDOW` = false, `vio_window` liefert dort `false`. Headless-Fenster bekommen dieselben Slots, damit die Tests
   ohne Bildschirm laufen.

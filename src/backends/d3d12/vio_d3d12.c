@@ -2098,6 +2098,32 @@ init_fail:
     return -1;
 }
 
+/* ── Further windows (DESKTOP-APP-PLAN Phase 4) ──────────────────────
+ * The swapchain fields of vio_d3d12, one record per window: the swapchain, its
+ * back buffers with their RTV heap, depth buffer and DSV heap, sizes, flags and
+ * the back buffer index. Frame slots (allocators, fences, heap slices, rings)
+ * stay per device. set_swapchain stores the active window's fields into its
+ * record and loads the other's; everything else keeps reading vio_d3d12. */
+typedef struct _vio_d3d12_swapchain {
+    IDXGISwapChain3       *swapchain;
+    UINT                   swapchain_flags;
+    HANDLE                 frame_latency_waitable;
+    int                    frame_latency, latency_wait_skip;
+    DXGI_FORMAT            swapchain_format;
+    int                    hdr_output, hdr_composite;
+    float                  hdr_paper_white;
+    int                    width, height, vsync;
+    void                  *platform_window;
+    ID3D12DescriptorHeap  *rtv_heap, *dsv_heap;
+    ID3D12Resource        *depth_buffer;
+    ID3D12Resource        *render_target[VIO_D3D12_MAX_FRAME_COUNT];
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle[VIO_D3D12_MAX_FRAME_COUNT];
+    UINT                   back_index, last_presented_frame_idx;
+} vio_d3d12_swapchain;
+
+static vio_d3d12_swapchain  d3d12_main_sc;
+static vio_d3d12_swapchain *d3d12_cur_sc;   /* NULL: the main window's fields are loaded */
+
 static void d3d12_shutdown(void)
 {
     if (!vio_d3d12.initialized) return;
@@ -2210,6 +2236,8 @@ static void d3d12_shutdown(void)
     d3d12_current_pipeline = NULL;
     vio_d3d12.fb_bound = NULL;
     vio_d3d12.fb_null_gpu.ptr = 0;
+    memset(&d3d12_main_sc, 0, sizeof(d3d12_main_sc));
+    d3d12_cur_sc = NULL;
     memset(&vio_d3d12, 0, sizeof(vio_d3d12));
 }
 
@@ -2315,7 +2343,7 @@ static void *d3d12_create_surface(vio_config *cfg)
 
     vio_d3d12.width = cfg->width;
     vio_d3d12.height = cfg->height;
-    vio_d3d12.frame_index = IDXGISwapChain3_GetCurrentBackBufferIndex(vio_d3d12.swapchain);
+    vio_d3d12.back_index = IDXGISwapChain3_GetCurrentBackBufferIndex(vio_d3d12.swapchain);
 
     /* Create render target views for each frame */
     if (d3d12_create_render_targets() != 0) {
@@ -2346,6 +2374,104 @@ static void d3d12_destroy_surface(void *surface)
         IDXGISwapChain3_Release(vio_d3d12.swapchain);
         vio_d3d12.swapchain = NULL;
     }
+}
+
+#define D3D12_SC_FIELDS(X) \
+    X(swapchain) X(swapchain_flags) X(frame_latency_waitable) X(frame_latency) X(latency_wait_skip) \
+    X(swapchain_format) X(hdr_output) X(hdr_composite) X(hdr_paper_white) X(width) X(height) X(vsync) \
+    X(platform_window) X(rtv_heap) X(dsv_heap) X(depth_buffer) X(back_index) X(last_presented_frame_idx)
+
+static void d3d12_sc_store(vio_d3d12_swapchain *r)
+{
+#define X(f) r->f = vio_d3d12.f;
+    D3D12_SC_FIELDS(X)
+#undef X
+    for (int i = 0; i < VIO_D3D12_MAX_FRAME_COUNT; i++) {
+        r->render_target[i] = vio_d3d12.frames[i].render_target;
+        r->rtv_handle[i] = vio_d3d12.frames[i].rtv_handle;
+    }
+}
+
+static void d3d12_sc_load(const vio_d3d12_swapchain *r)
+{
+#define X(f) vio_d3d12.f = r->f;
+    D3D12_SC_FIELDS(X)
+#undef X
+    for (int i = 0; i < VIO_D3D12_MAX_FRAME_COUNT; i++) {
+        vio_d3d12.frames[i].render_target = r->render_target[i];
+        vio_d3d12.frames[i].rtv_handle = r->rtv_handle[i];
+    }
+}
+
+static void d3d12_set_swapchain(void *swapchain)
+{
+    vio_d3d12_swapchain *target = swapchain ? (vio_d3d12_swapchain *)swapchain : &d3d12_main_sc;
+    vio_d3d12_swapchain *cur = d3d12_cur_sc ? d3d12_cur_sc : &d3d12_main_sc;
+    if (target == cur) return;
+    d3d12_sc_store(cur);
+    d3d12_sc_load(target);
+    d3d12_cur_sc = target == &d3d12_main_sc ? NULL : target;
+}
+
+/* Release the loaded window's swapchain objects (the GPU is idle). */
+static void d3d12_sc_release_loaded(void)
+{
+    d3d12_release_render_targets();
+    if (vio_d3d12.depth_buffer) { ID3D12Resource_Release(vio_d3d12.depth_buffer); vio_d3d12.depth_buffer = NULL; }
+    if (vio_d3d12.rtv_heap) { ID3D12DescriptorHeap_Release(vio_d3d12.rtv_heap); vio_d3d12.rtv_heap = NULL; }
+    if (vio_d3d12.dsv_heap) { ID3D12DescriptorHeap_Release(vio_d3d12.dsv_heap); vio_d3d12.dsv_heap = NULL; }
+    if (vio_d3d12.frame_latency_waitable) { CloseHandle(vio_d3d12.frame_latency_waitable); vio_d3d12.frame_latency_waitable = NULL; }
+    if (vio_d3d12.swapchain) { IDXGISwapChain3_Release(vio_d3d12.swapchain); vio_d3d12.swapchain = NULL; }
+}
+
+static void *d3d12_create_swapchain(void *platform_window, const vio_config *cfg)
+{
+    /* the HDR composite's layer is sized and bound for the main window */
+    if (!vio_d3d12.initialized || !vio_d3d12.device || !platform_window || vio_d3d12.hdr_composite) return NULL;
+    vio_d3d12_swapchain *rec = (vio_d3d12_swapchain *)calloc(1, sizeof(*rec));
+    if (!rec) return NULL;
+    vio_d3d12_swapchain *prev = d3d12_cur_sc ? d3d12_cur_sc : &d3d12_main_sc;
+    d3d12_sc_store(prev);
+    vio_d3d12_swapchain blank;
+    memset(&blank, 0, sizeof(blank));
+    blank.platform_window = platform_window;
+    blank.vsync = cfg->vsync;
+    d3d12_sc_load(&blank);
+
+    vio_config c = *cfg;
+    c.hdr_composite = 0;
+    void *ok = NULL;
+    if (d3d12_create_descriptor_heap(&vio_d3d12.rtv_heap, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                                     vio_d3d12.frame_count, D3D12_DESCRIPTOR_HEAP_FLAG_NONE) == 0
+        && d3d12_create_descriptor_heap(&vio_d3d12.dsv_heap, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1,
+                                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE) == 0) {
+        ok = d3d12_create_surface(&c);
+    }
+    /* PSOs are built for the main swapchain's format */
+    if (ok && vio_d3d12.swapchain_format != d3d12_main_sc.swapchain_format) ok = NULL;
+    if (!ok) {
+        d3d12_sc_release_loaded();
+        d3d12_sc_load(prev);
+        free(rec);
+        return NULL;
+    }
+    d3d12_sc_store(rec);
+    d3d12_sc_load(prev);
+    return rec;
+}
+
+static void d3d12_destroy_swapchain(void *swapchain)
+{
+    vio_d3d12_swapchain *rec = (vio_d3d12_swapchain *)swapchain;
+    if (!rec) return;
+    if (d3d12_cur_sc == rec) d3d12_set_swapchain(NULL);
+    vio_d3d12_wait_for_gpu();   /* a frame in flight may still reference its back buffers */
+    vio_d3d12_swapchain *cur = d3d12_cur_sc ? d3d12_cur_sc : &d3d12_main_sc;
+    d3d12_sc_store(cur);
+    d3d12_sc_load(rec);
+    d3d12_sc_release_loaded();
+    d3d12_sc_load(cur);
+    free(rec);
 }
 
 static void d3d12_resize(int width, int height)
@@ -2428,8 +2554,8 @@ static void d3d12_resize(int width, int height)
 
     vio_d3d12.width = width;
     vio_d3d12.height = height;
-    vio_d3d12.frame_index = IDXGISwapChain3_GetCurrentBackBufferIndex(vio_d3d12.swapchain);
-    vio_d3d12.last_presented_frame_idx = 0;
+    vio_d3d12.back_index = IDXGISwapChain3_GetCurrentBackBufferIndex(vio_d3d12.swapchain);
+    vio_d3d12.last_presented_frame_idx = vio_d3d12.back_index;
 
     /* Cached backbuffer RTV/DSV handles and dimensions are now stale; the
      * recreated handles below replace them, and begin_frame() rebinds them.
@@ -5473,7 +5599,7 @@ static void d3d12_unbind_render_target(unsigned int default_fbo, int width, int 
     }
 
     /* Restore the swapchain target */
-    vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.frame_index];
+    vio_d3d12_frame *frame = &vio_d3d12.frames[vio_d3d12.back_index];
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.dsv_heap, &dsv_handle);
     D3D12_CPU_DESCRIPTOR_HANDLE screen_rtv = d3d12_screen_rtv(frame);
@@ -7420,7 +7546,7 @@ static void d3d12_begin_frame(void)
     if (!vio_d3d12.hdr_composite) {
         D3D12_RESOURCE_BARRIER barrier = {0};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = frame->render_target;
+        barrier.Transition.pResource = vio_d3d12.frames[vio_d3d12.back_index].render_target;
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -7430,7 +7556,7 @@ static void d3d12_begin_frame(void)
     /* Set render target */
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.dsv_heap, &dsv_handle);
-    D3D12_CPU_DESCRIPTOR_HANDLE screen_rtv = d3d12_screen_rtv(frame);
+    D3D12_CPU_DESCRIPTOR_HANDLE screen_rtv = d3d12_screen_rtv(&vio_d3d12.frames[vio_d3d12.back_index]);
     ID3D12GraphicsCommandList_OMSetRenderTargets(vio_d3d12.cmd_list, 1,
                                                   &screen_rtv, FALSE, &dsv_handle);
 
@@ -7609,12 +7735,12 @@ static void d3d12_end_frame(void)
     if (vio_d3d12.hdr_composite) {
         /* Layer -> PQ -> swapchain buffer (PRESENT afterwards). A frame that
          * ended on an offscreen target is not presented; nothing to encode. */
-        if (d3d12_frame_presents()) d3d12_hdr_encode(frame);
+        if (d3d12_frame_presents()) d3d12_hdr_encode(&vio_d3d12.frames[vio_d3d12.back_index]);
     } else {
         /* Transition render target: RENDER_TARGET -> PRESENT */
         D3D12_RESOURCE_BARRIER barrier = {0};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = frame->render_target;
+        barrier.Transition.pResource = vio_d3d12.frames[vio_d3d12.back_index].render_target;
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -7776,10 +7902,11 @@ static void d3d12_present(void)
     /* Record which buffer we just presented BEFORE rotating to the next one.
      * vio_read_pixels uses this to read the last-rendered frame instead of
      * the freshly-rotated (discarded) upcoming backbuffer. */
-    vio_d3d12.last_presented_frame_idx = vio_d3d12.frame_index;
+    vio_d3d12.last_presented_frame_idx = vio_d3d12.back_index;
 
-    /* Move to next frame */
-    vio_d3d12.frame_index = IDXGISwapChain3_GetCurrentBackBufferIndex(vio_d3d12.swapchain);
+    /* Move to the next frame slot and the swapchain's next back buffer */
+    vio_d3d12.frame_index = (vio_d3d12.frame_index + 1) % vio_d3d12.frame_count;
+    vio_d3d12.back_index = IDXGISwapChain3_GetCurrentBackBufferIndex(vio_d3d12.swapchain);
 }
 
 /* ── Frame capture (readback) ─────────────────────────────────────────
@@ -7810,7 +7937,7 @@ unsigned char *vio_d3d12_capture_frame(int *out_w, int *out_h, size_t *out_size)
     if (!vio_d3d12.initialized || !vio_d3d12.device) return NULL;
 
     int mid_frame = vio_d3d12.in_frame;
-    UINT read_idx = mid_frame ? vio_d3d12.frame_index
+    UINT read_idx = mid_frame ? vio_d3d12.back_index
                               : vio_d3d12.last_presented_frame_idx;
     vio_d3d12_frame *frame = &vio_d3d12.frames[read_idx];
     /* Mid-frame with the HDR composite the drawing lives in the layer (SDR
@@ -11138,6 +11265,9 @@ static const vio_backend d3d12_backend = {
     .rt_origin_top     = 1,
     .clip_z_remap      = 1,
     .shadow_sampler_base = VIO_SHADOW_SAMPLER_BASE,
+    .create_swapchain  = d3d12_create_swapchain,
+    .set_swapchain     = d3d12_set_swapchain,
+    .destroy_swapchain = d3d12_destroy_swapchain,
     .set_frame_present = d3d12_set_frame_present,
     .upscaler_supported             = d3d12_upscaler_supported,
     .upscaler_create                = d3d12_upscaler_create,
