@@ -281,8 +281,18 @@ static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (!w) return DefWindowProcW(hwnd, msg, wp, lp);
     switch (msg) {
         case WM_CLOSE:
-            w->should_close = 1;
+            if (vio_input_close_request(w->input)) w->should_close = 1;
             return 0;
+        case WM_SETFOCUS:
+            vio_input_focus_event(w->input, 1);
+            break;
+        case WM_KILLFOCUS:
+            vio_input_focus_event(w->input, 0);
+            break;
+        case WM_PAINT:
+            /* also from inside the modal move/size loop: the app can draw a frame there */
+            vio_input_refresh_event(w->input);
+            break;
         case WM_KEYDOWN: case WM_SYSKEYDOWN:
             w32_key_message(w, wp, lp, 1);
             if (msg == WM_SYSKEYDOWN && wp != VK_F4) return 0;   /* no menu beep on Alt+key; Alt+F4 still closes */
@@ -348,12 +358,15 @@ static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_SIZE:
             w32_report_size(w);
             w32_update_clip(w);
+            if (wp == SIZE_MINIMIZED) vio_input_minimize_event(w->input, 1);
+            else if (wp == SIZE_RESTORED || wp == SIZE_MAXIMIZED) vio_input_minimize_event(w->input, 0);
             break;
         case WM_ACTIVATE:
             w32_update_clip(w);
             if (LOWORD(wp) == WA_INACTIVE && w->monitor >= 0 && w->auto_iconify) ShowWindow(hwnd, SW_MINIMIZE);
             break;
         case WM_DPICHANGED:
+            if (!w->headless) vio_input_scale_event(w->input, (float)HIWORD(wp) / 96.0f, (float)HIWORD(wp) / 96.0f);
             if (!w->headless && w->monitor < 0) {
                 const RECT *s = (const RECT *)lp;
                 SetWindowPos(hwnd, NULL, s->left, s->top, s->right - s->left, s->bottom - s->top,
@@ -773,6 +786,7 @@ static void w32_destroy_window(vio_window_handle h)
 {
     vio_win32_window *w = (vio_win32_window *)h;
     if (!w) return;
+    w->input = NULL;   /* no callbacks from the teardown (focus loss on destroy) */
     w32_restore_display(w);
     if (w->cursor_mode == VIO_PLATFORM_CURSOR_DISABLED) ClipCursor(NULL);
     if (w->glrc) {
@@ -799,11 +813,19 @@ static void w32_poll_events(void)
     }
 }
 
-static void w32_wait_events(void)
+static void w32_wait_events(double timeout)
 {
-    WaitMessage();
+    if (!vio_platform_wake_take()) {
+        int ms = vio_platform_timeout_ms(timeout);
+        HANDLE h = (HANDLE)vio_platform_wake_handle();
+        MsgWaitForMultipleObjectsEx(h ? 1 : 0, h ? &h : NULL, ms < 0 ? INFINITE : (DWORD)ms,
+                                    QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        vio_platform_wake_take();
+    }
     w32_poll_events();
 }
+
+static void w32_wake(void) { vio_platform_wake_signal(); }
 
 static void w32_swap_buffers(vio_window_handle h)
 {
@@ -1230,6 +1252,7 @@ static const vio_platform vio_platform_win32 = {
     .set_should_close     = w32_set_should_close,
     .poll_events          = w32_poll_events,
     .wait_events          = w32_wait_events,
+    .wake                 = w32_wake,
     .swap_buffers         = w32_swap_buffers,
     .get_framebuffer_size = w32_get_framebuffer_size,
     .get_window_size      = w32_get_framebuffer_size,   /* client pixels, as GLFW's Win32 window size */

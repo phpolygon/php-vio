@@ -77,6 +77,46 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_touch_inject, 0, 3, _IS_BOOL
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, y, IS_DOUBLE, 0, "0.0")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_wait_events, 0, 1, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, timeout, IS_DOUBLE, 0, "-1.0")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_wake, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_close, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_focus, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_minimize, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_scale, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_refresh, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_window_event, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, event, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, a, IS_DOUBLE, 0, "0.0")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, b, IS_DOUBLE, 0, "0.0")
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor_mode, 0, 2, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, mode, IS_LONG, 0)
@@ -1211,6 +1251,14 @@ ZEND_FUNCTION(vio_destroy);
 ZEND_FUNCTION(vio_should_close);
 ZEND_FUNCTION(vio_close);
 ZEND_FUNCTION(vio_poll_events);
+ZEND_FUNCTION(vio_wait_events);
+ZEND_FUNCTION(vio_wake);
+ZEND_FUNCTION(vio_on_close);
+ZEND_FUNCTION(vio_on_focus);
+ZEND_FUNCTION(vio_on_minimize);
+ZEND_FUNCTION(vio_on_scale);
+ZEND_FUNCTION(vio_on_refresh);
+ZEND_FUNCTION(vio_inject_window_event);
 ZEND_FUNCTION(vio_begin);
 ZEND_FUNCTION(vio_end);
 ZEND_FUNCTION(vio_gpu_flush);
@@ -1448,6 +1496,14 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_should_close, arginfo_vio_should_close)
 	ZEND_FE(vio_close, arginfo_vio_close)
 	ZEND_FE(vio_poll_events, arginfo_vio_poll_events)
+	ZEND_FE(vio_wait_events, arginfo_vio_wait_events)
+	ZEND_FE(vio_wake, arginfo_vio_wake)
+	ZEND_FE(vio_on_close, arginfo_vio_on_close)
+	ZEND_FE(vio_on_focus, arginfo_vio_on_focus)
+	ZEND_FE(vio_on_minimize, arginfo_vio_on_minimize)
+	ZEND_FE(vio_on_scale, arginfo_vio_on_scale)
+	ZEND_FE(vio_on_refresh, arginfo_vio_on_refresh)
+	ZEND_FE(vio_inject_window_event, arginfo_vio_inject_window_event)
 	ZEND_FE(vio_begin, arginfo_vio_begin)
 	ZEND_FE(vio_end, arginfo_vio_end)
 	ZEND_FE(vio_gpu_flush, arginfo_vio_gpu_flush)

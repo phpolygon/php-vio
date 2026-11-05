@@ -1100,6 +1100,61 @@ ZEND_FUNCTION(vio_poll_events)
     vio_input_poll_end(&ctx->input);
 }
 
+/* Like vio_poll_events, but blocks first until an event, the timeout (seconds,
+ * < 0: none) or vio_wake. During a replay it does not block: the replay clock
+ * is the number of polls, and a blocked wait would stall it. */
+ZEND_FUNCTION(vio_wait_events)
+{
+    zval *ctx_zval;
+    double timeout = -1.0;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_DOUBLE(timeout)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+
+    vio_input_poll_begin(&ctx->input);
+    if (ctx->input.replaying) vio_window_poll_events();
+    else vio_window_wait_events(timeout);
+#ifdef HAVE_IOS
+    vio_input_drain_ime(&ctx->input);
+#endif
+    vio_input_poll_end(&ctx->input);
+}
+
+/* Wake a vio_wait_events, from any thread; sticky until a wait takes it. */
+ZEND_FUNCTION(vio_wake)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    vio_plat()->wake();
+}
+
+static void vio_set_window_callback(INTERNAL_FUNCTION_PARAMETERS, vio_window_cb which)
+{
+    zval *ctx_zval;
+    zval *callback;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ZVAL(callback)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!zend_is_callable(callback, 0, NULL)) {
+        zend_argument_type_error(2, "must be a valid callback");
+        RETURN_THROWS();
+    }
+    vio_input_set_window_cb(&Z_VIO_CONTEXT_P(ctx_zval)->input, which, callback);
+}
+
+ZEND_FUNCTION(vio_on_close)    { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_CLOSE); }
+ZEND_FUNCTION(vio_on_focus)    { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_FOCUS); }
+ZEND_FUNCTION(vio_on_minimize) { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_MINIMIZE); }
+ZEND_FUNCTION(vio_on_scale)    { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_SCALE); }
+ZEND_FUNCTION(vio_on_refresh)  { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_REFRESH); }
+
 
 
 
@@ -10182,6 +10237,47 @@ ZEND_FUNCTION(vio_inject_scroll)
     vio_input_scroll_event(&ctx->input, dx, dy);
 }
 
+/* A window event through the same funnel as the platform's: close (returns
+ * whether the window closes), focus / minimize ($a = 0 or 1), scale ($a, $b),
+ * refresh. */
+ZEND_FUNCTION(vio_inject_window_event)
+{
+    zval *ctx_zval;
+    zend_long event;
+    double a = 0.0, b = 0.0;
+
+    ZEND_PARSE_PARAMETERS_START(2, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(event)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_DOUBLE(a)
+        Z_PARAM_DOUBLE(b)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    switch (event) {
+        case VIO_WINDOW_EVENT_CLOSE:
+            if (!vio_input_close_request(&ctx->input)) RETURN_FALSE;
+            ctx->should_close = 1;
+            if (ctx->window) vio_window_set_should_close(ctx->window, 1);
+            RETURN_TRUE;
+        case VIO_WINDOW_EVENT_FOCUS:    vio_input_focus_event(&ctx->input, a != 0.0); break;
+        case VIO_WINDOW_EVENT_MINIMIZE: vio_input_minimize_event(&ctx->input, a != 0.0); break;
+        case VIO_WINDOW_EVENT_SCALE:
+            if (!(a > 0.0) || !(b > 0.0)) {
+                zend_argument_value_error(3, "and argument #4 must be greater than 0 for VIO_WINDOW_EVENT_SCALE");
+                RETURN_THROWS();
+            }
+            vio_input_scale_event(&ctx->input, (float)a, (float)b);
+            break;
+        case VIO_WINDOW_EVENT_REFRESH:  vio_input_refresh_event(&ctx->input); break;
+        default:
+            zend_argument_value_error(2, "must be one of the VIO_WINDOW_EVENT_* constants");
+            RETURN_THROWS();
+    }
+    RETURN_TRUE;
+}
+
 /* Decode one UTF-8 sequence starting at s[*i] (strict: no overlongs, no
  * surrogates, max U+10FFFF). Returns the codepoint and advances *i, or
  * returns -1 on malformed input. */
@@ -13369,6 +13465,11 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_RELEASE", VIO_RELEASE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_PRESS", VIO_PRESS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_REPEAT", VIO_REPEAT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_WINDOW_EVENT_CLOSE", VIO_WINDOW_EVENT_CLOSE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_WINDOW_EVENT_FOCUS", VIO_WINDOW_EVENT_FOCUS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_WINDOW_EVENT_MINIMIZE", VIO_WINDOW_EVENT_MINIMIZE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_WINDOW_EVENT_SCALE", VIO_WINDOW_EVENT_SCALE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_WINDOW_EVENT_REFRESH", VIO_WINDOW_EVENT_REFRESH, CONST_CS | CONST_PERSISTENT);
 
     /* Mouse buttons */
     REGISTER_LONG_CONSTANT("VIO_MOUSE_LEFT", VIO_MOUSE_LEFT, CONST_CS | CONST_PERSISTENT);

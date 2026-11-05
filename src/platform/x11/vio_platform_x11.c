@@ -34,6 +34,7 @@
 #include <linux/input.h>
 #include <locale.h>
 #include <math.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -58,7 +59,7 @@ static XContext x11_ctx;
 static XIM      x11_im;
 static int      x11_error_code;
 static Atom     x11_wm_delete, x11_wm_protocols, x11_net_wm_state, x11_net_fullscreen,
-                x11_net_max_h, x11_net_max_v, x11_motif_hints, x11_net_workarea, x11_net_active;
+                x11_net_max_h, x11_net_max_v, x11_motif_hints, x11_net_workarea, x11_net_active, x11_wm_state;
 static Cursor   x11_blank_cursor;
 static int      x11_randr, x11_randr_event;
 
@@ -83,6 +84,7 @@ static int x11_open(void)
     x11_ctx = XUniqueContext();
     x11_wm_delete      = XInternAtom(x11_dpy, "WM_DELETE_WINDOW", False);
     x11_wm_protocols   = XInternAtom(x11_dpy, "WM_PROTOCOLS", False);
+    x11_wm_state       = XInternAtom(x11_dpy, "WM_STATE", False);
     x11_net_wm_state   = XInternAtom(x11_dpy, "_NET_WM_STATE", False);
     x11_net_fullscreen = XInternAtom(x11_dpy, "_NET_WM_STATE_FULLSCREEN", False);
     x11_net_max_h      = XInternAtom(x11_dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
@@ -642,7 +644,8 @@ static vio_window_handle x11_create_window(vio_config *cfg, const char *backend_
     swa.colormap = w->cmap;
     swa.border_pixel = 0;
     swa.event_mask = StructureNotifyMask | KeyPressMask | KeyReleaseMask | PointerMotionMask | ButtonPressMask |
-                     ButtonReleaseMask | EnterWindowMask | LeaveWindowMask | FocusChangeMask | ExposureMask;
+                     ButtonReleaseMask | EnterWindowMask | LeaveWindowMask | FocusChangeMask | ExposureMask |
+                     PropertyChangeMask;
     x11_error_code = 0;
     w->win = XCreateWindow(x11_dpy, x11_root, 0, 0, (unsigned)width, (unsigned)height, 0, depth, InputOutput, visual,
                            CWBorderPixel | CWColormap | CWEventMask, &swa);
@@ -741,6 +744,7 @@ static void x11_destroy_window(vio_window_handle h)
 {
     vio_x11_window *w = (vio_x11_window *)h;
     if (!w || !x11_dpy) { free(w); return; }
+    w->input = NULL;   /* no callbacks from the teardown (focus loss on destroy) */
     x11_restore_mode(w);
     if (w->cursor_mode == VIO_PLATFORM_CURSOR_DISABLED) XUngrabPointer(x11_dpy, CurrentTime);
     if (w->glrc) {
@@ -846,6 +850,20 @@ static void x11_motion_event(vio_x11_window *w, XMotionEvent *me)
 
 static int x11_clip_event(XEvent *ev);
 
+/* ICCCM WM_STATE of a window: 1 normal, 3 iconic, -1 unknown. */
+static int x11_wm_state_of(Window win)
+{
+    Atom type;
+    int format;
+    unsigned long n = 0, after;
+    unsigned char *data = NULL;
+    int state = -1;
+    if (XGetWindowProperty(x11_dpy, win, x11_wm_state, 0, 2, False, x11_wm_state, &type, &format, &n, &after, &data) == Success
+        && data && format == 32 && n >= 1) state = (int)((long *)data)[0];
+    if (data) XFree(data);
+    return state;
+}
+
 static void x11_dispatch(XEvent *ev)
 {
     if (XFilterEvent(ev, None)) return;   /* input method */
@@ -866,15 +884,29 @@ static void x11_dispatch(XEvent *ev)
             }
             break;
         case ClientMessage:
-            if (ev->xclient.message_type == x11_wm_protocols && (Atom)ev->xclient.data.l[0] == x11_wm_delete) w->should_close = 1;
+            if (ev->xclient.message_type == x11_wm_protocols && (Atom)ev->xclient.data.l[0] == x11_wm_delete
+                && vio_input_close_request(w->input)) w->should_close = 1;
             break;
         case FocusIn:
             if (w->ic) XSetICFocus(w->ic);
             if (w->cursor_mode == VIO_PLATFORM_CURSOR_DISABLED) x11_warp_center(w);
+            /* keyboard grabs move the focus temporarily, as GLFW ignores them */
+            if (ev->xfocus.mode != NotifyGrab && ev->xfocus.mode != NotifyUngrab) vio_input_focus_event(w->input, 1);
             break;
         case FocusOut:
             if (w->ic) XUnsetICFocus(w->ic);
             if (w->monitor >= 0 && w->auto_iconify) XIconifyWindow(x11_dpy, w->win, x11_screen);
+            if (ev->xfocus.mode != NotifyGrab && ev->xfocus.mode != NotifyUngrab) vio_input_focus_event(w->input, 0);
+            break;
+        case Expose:
+            if (ev->xexpose.count == 0) vio_input_refresh_event(w->input);
+            break;
+        case PropertyNotify:
+            if (ev->xproperty.atom == x11_wm_state && ev->xproperty.state == PropertyNewValue) {
+                int state = x11_wm_state_of(w->win);
+                if (state == IconicState) vio_input_minimize_event(w->input, 1);
+                else if (state == NormalState) vio_input_minimize_event(w->input, 0);
+            }
             break;
         default:
             break;
@@ -895,14 +927,23 @@ static void x11_poll_events(void)
     }
 }
 
-static void x11_wait_events(void)
+static void x11_wait_events(double timeout)
 {
-    if (!x11_dpy) return;
-    XEvent ev;
-    XNextEvent(x11_dpy, &ev);
-    x11_dispatch(&ev);
+    if (!x11_dpy) { vio_platform_wait_wake_only(timeout); return; }
+    if (!vio_platform_wake_take()) {
+        XFlush(x11_dpy);
+        if (!XPending(x11_dpy)) {
+            struct pollfd fds[2] = { { .fd = ConnectionNumber(x11_dpy), .events = POLLIN },
+                                     { .fd = vio_platform_wake_fd(), .events = POLLIN } };
+            int n = fds[1].fd >= 0 ? 2 : 1, ms = vio_platform_timeout_ms(timeout);
+            while (poll(fds, (nfds_t)n, ms) < 0 && errno == EINTR) {}
+        }
+        vio_platform_wake_take();
+    }
     x11_poll_events();
 }
+
+static void x11_wake(void) { vio_platform_wake_signal(); }
 
 /* ── Sizes, GL ────────────────────────────────────────────────────── */
 
@@ -1373,6 +1414,7 @@ static const vio_platform vio_platform_x11 = {
     .set_should_close     = x11_set_should_close,
     .poll_events          = x11_poll_events,
     .wait_events          = x11_wait_events,
+    .wake                 = x11_wake,
     .swap_buffers         = x11_swap_buffers,
     .get_framebuffer_size = x11_get_size,
     .get_window_size      = x11_get_size,   /* pixels on X11, as with GLFW */

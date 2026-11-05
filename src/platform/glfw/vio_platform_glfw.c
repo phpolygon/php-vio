@@ -321,9 +321,22 @@ static void glfw_poll_events(void)
     if (glfw_initialized) glfwPollEvents();
 }
 
-static void glfw_wait_events(void)
+/* The sticky wake flag lives outside GLFW (glfwPollEvents would swallow its
+ * empty event); glfwPostEmptyEvent only ends a wait in progress. */
+static void glfw_wait_events(double timeout)
 {
-    if (glfw_initialized) glfwWaitEvents();
+    if (!glfw_initialized) { vio_platform_wait_wake_only(timeout); return; }
+    if (vio_platform_wake_take()) { glfwPollEvents(); return; }
+    if (timeout < 0.0) glfwWaitEvents();
+    else if (timeout == 0.0) glfwPollEvents();
+    else glfwWaitEventsTimeout(timeout);
+    vio_platform_wake_take();
+}
+
+static void glfw_wake(void)
+{
+    vio_platform_wake_signal();
+    if (glfw_initialized) glfwPostEmptyEvent();
 }
 
 static void glfw_swap_buffers(vio_window_handle w)
@@ -643,6 +656,31 @@ static void glfw_framebuffer_size_callback(GLFWwindow *window, int width, int he
     vio_input_resize_event((vio_input_state *)glfwGetWindowUserPointer(window), width, height);
 }
 
+static void glfw_close_callback(GLFWwindow *window)
+{
+    if (!vio_input_close_request((vio_input_state *)glfwGetWindowUserPointer(window))) glfwSetWindowShouldClose(window, GLFW_FALSE);
+}
+
+static void glfw_focus_callback(GLFWwindow *window, int focused)
+{
+    vio_input_focus_event((vio_input_state *)glfwGetWindowUserPointer(window), focused);
+}
+
+static void glfw_iconify_callback(GLFWwindow *window, int iconified)
+{
+    vio_input_minimize_event((vio_input_state *)glfwGetWindowUserPointer(window), iconified);
+}
+
+static void glfw_scale_callback(GLFWwindow *window, float sx, float sy)
+{
+    vio_input_scale_event((vio_input_state *)glfwGetWindowUserPointer(window), sx, sy);
+}
+
+static void glfw_refresh_callback(GLFWwindow *window)
+{
+    vio_input_refresh_event((vio_input_state *)glfwGetWindowUserPointer(window));
+}
+
 static void glfw_install_input(vio_window_handle w, vio_input_state *state)
 {
     GLFWwindow *window = (GLFWwindow *)w;
@@ -654,6 +692,11 @@ static void glfw_install_input(vio_window_handle w, vio_input_state *state)
     glfwSetMouseButtonCallback(window, glfw_mouse_button_callback);
     glfwSetScrollCallback(window, glfw_scroll_callback);
     glfwSetFramebufferSizeCallback(window, glfw_framebuffer_size_callback);
+    glfwSetWindowCloseCallback(window, glfw_close_callback);
+    glfwSetWindowFocusCallback(window, glfw_focus_callback);
+    glfwSetWindowIconifyCallback(window, glfw_iconify_callback);
+    glfwSetWindowContentScaleCallback(window, glfw_scale_callback);
+    glfwSetWindowRefreshCallback(window, glfw_refresh_callback);
 }
 
 /* GLFW reports an empty / non-text clipboard as an error; for the clipboard
@@ -706,6 +749,7 @@ static const vio_platform vio_platform_glfw = {
     .set_should_close     = glfw_set_should_close,
     .poll_events          = glfw_poll_events,
     .wait_events          = glfw_wait_events,
+    .wake                 = glfw_wake,
     .swap_buffers         = glfw_swap_buffers,
     .get_framebuffer_size = glfw_get_framebuffer_size,
     .get_window_size      = glfw_get_window_size,

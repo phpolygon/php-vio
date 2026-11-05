@@ -28,6 +28,13 @@ void vio_input_init(vio_input_state *state)
     state->has_key_callback = 0;
     state->has_resize_callback = 0;
     state->has_char_callback = 0;
+    for (int i = 0; i < VIO_WINDOW_CB_COUNT; i++) {
+        ZVAL_UNDEF(&state->window_cb[i]);
+        state->has_window_cb[i] = 0;
+    }
+    state->win_focused = -1;
+    state->win_minimized = -1;
+    state->win_scale_x = state->win_scale_y = 0.0f;
     state->char_buffer_len = 0;
     state->ime_cp_count = 0;
     state->ime_backspaces = 0;
@@ -131,6 +138,12 @@ void vio_input_shutdown(vio_input_state *state)
         zval_ptr_dtor(&state->on_char_callback);
         ZVAL_UNDEF(&state->on_char_callback);
         state->has_char_callback = 0;
+    }
+    for (int i = 0; i < VIO_WINDOW_CB_COUNT; i++) {
+        if (!state->has_window_cb[i]) continue;
+        zval_ptr_dtor(&state->window_cb[i]);
+        ZVAL_UNDEF(&state->window_cb[i]);
+        state->has_window_cb[i] = 0;
     }
 }
 
@@ -276,6 +289,75 @@ void vio_input_resize_event(vio_input_state *state, int width, int height)
     if (call_user_function(NULL, NULL, &state->on_resize_callback, &retval, 2, args) == SUCCESS) {
         zval_ptr_dtor(&retval);
     }
+}
+
+/* ── Window events ────────────────────────────────────────────────── */
+
+void vio_input_set_window_cb(vio_input_state *state, vio_window_cb which, zval *callback)
+{
+    if (state->has_window_cb[which]) zval_ptr_dtor(&state->window_cb[which]);
+    ZVAL_COPY(&state->window_cb[which], callback);
+    state->has_window_cb[which] = 1;
+}
+
+/* Call a window callback; retval is UNDEF when there is none or it threw. */
+static void vio_window_cb_call(vio_input_state *state, vio_window_cb which, int argc, zval *args, zval *retval)
+{
+    ZVAL_UNDEF(retval);
+    if (!state->has_window_cb[which]) return;
+    if (call_user_function(NULL, NULL, &state->window_cb[which], retval, argc, args) != SUCCESS) ZVAL_UNDEF(retval);
+}
+
+int vio_input_close_request(vio_input_state *state)
+{
+    if (!state || !state->has_window_cb[VIO_WINDOW_CB_CLOSE]) return 1;
+    zval retval;
+    vio_window_cb_call(state, VIO_WINDOW_CB_CLOSE, 0, NULL, &retval);
+    int accept = Z_TYPE(retval) != IS_FALSE;
+    zval_ptr_dtor(&retval);
+    return accept;
+}
+
+void vio_input_focus_event(vio_input_state *state, int focused)
+{
+    focused = focused ? 1 : 0;
+    if (!state || state->win_focused == focused) return;
+    state->win_focused = focused;
+    zval retval, arg;
+    ZVAL_BOOL(&arg, focused);
+    vio_window_cb_call(state, VIO_WINDOW_CB_FOCUS, 1, &arg, &retval);
+    zval_ptr_dtor(&retval);
+}
+
+void vio_input_minimize_event(vio_input_state *state, int minimized)
+{
+    minimized = minimized ? 1 : 0;
+    if (!state || state->win_minimized == minimized) return;
+    state->win_minimized = minimized;
+    zval retval, arg;
+    ZVAL_BOOL(&arg, minimized);
+    vio_window_cb_call(state, VIO_WINDOW_CB_MINIMIZE, 1, &arg, &retval);
+    zval_ptr_dtor(&retval);
+}
+
+void vio_input_scale_event(vio_input_state *state, float sx, float sy)
+{
+    if (!state || (state->win_scale_x == sx && state->win_scale_y == sy)) return;
+    state->win_scale_x = sx;
+    state->win_scale_y = sy;
+    zval retval, args[2];
+    ZVAL_DOUBLE(&args[0], sx);
+    ZVAL_DOUBLE(&args[1], sy);
+    vio_window_cb_call(state, VIO_WINDOW_CB_SCALE, 2, args, &retval);
+    zval_ptr_dtor(&retval);
+}
+
+void vio_input_refresh_event(vio_input_state *state)
+{
+    if (!state) return;
+    zval retval;
+    vio_window_cb_call(state, VIO_WINDOW_CB_REFRESH, 0, NULL, &retval);
+    zval_ptr_dtor(&retval);
 }
 
 /* ── Touch push API ─────────────────────────────────────────────────

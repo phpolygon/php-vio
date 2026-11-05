@@ -247,15 +247,43 @@ static void cocoa_report_size(vio_cocoa_window *w)
 @end
 
 @implementation VioCocoaDelegate
-- (BOOL)windowShouldClose:(id)sender { (void)sender; if (self.owner) self.owner->should_close = 1; return NO; }
-- (void)windowDidResize:(NSNotification *)n { (void)n; if (self.owner) cocoa_report_size(self.owner); }
-- (void)windowDidChangeBackingProperties:(NSNotification *)n { (void)n; if (self.owner) cocoa_report_size(self.owner); }
+- (BOOL)windowShouldClose:(id)sender
+{
+    (void)sender;
+    if (self.owner && vio_input_close_request(self.owner->input)) self.owner->should_close = 1;
+    return NO;
+}
+- (void)windowDidResize:(NSNotification *)n
+{
+    (void)n;
+    vio_cocoa_window *w = self.owner;
+    if (!w) return;
+    cocoa_report_size(w);
+    /* a live resize runs its own event loop: let the app draw from inside it */
+    if (COCOA_VIEW(w).inLiveResize) vio_input_refresh_event(w->input);
+}
+- (void)windowDidChangeBackingProperties:(NSNotification *)n
+{
+    (void)n;
+    vio_cocoa_window *w = self.owner;
+    if (!w) return;
+    cocoa_report_size(w);
+    if (!w->headless) {   /* headless contexts report scale 1 */
+        float s = (float)COCOA_WIN(w).backingScaleFactor;
+        vio_input_scale_event(w->input, s, s);
+    }
+}
+- (void)windowDidBecomeKey:(NSNotification *)n { (void)n; if (self.owner) vio_input_focus_event(self.owner->input, 1); }
 - (void)windowDidResignKey:(NSNotification *)n
 {
     (void)n;
     vio_cocoa_window *w = self.owner;
-    if (w && w->monitor >= 0 && w->auto_iconify) [COCOA_WIN(w) miniaturize:nil];
+    if (!w) return;
+    vio_input_focus_event(w->input, 0);
+    if (w->monitor >= 0 && w->auto_iconify) [COCOA_WIN(w) miniaturize:nil];
 }
+- (void)windowDidMiniaturize:(NSNotification *)n { (void)n; if (self.owner) vio_input_minimize_event(self.owner->input, 1); }
+- (void)windowDidDeminiaturize:(NSNotification *)n { (void)n; if (self.owner) vio_input_minimize_event(self.owner->input, 0); }
 @end
 
 /* ── Process lifecycle ────────────────────────────────────────────── */
@@ -513,6 +541,7 @@ static void cocoa_destroy_window(vio_window_handle h)
 {
     vio_cocoa_window *w = (vio_cocoa_window *)h;
     if (!w) return;
+    w->input = NULL;   /* no callbacks from the teardown (focus loss on destroy) */
     @autoreleasepool {
         cocoa_restore_mode(w);
         if (w->cursor_mode != VIO_PLATFORM_CURSOR_NORMAL) {
@@ -554,15 +583,31 @@ static void cocoa_poll_events(void)
     }
 }
 
-static void cocoa_wait_events(void)
+static void cocoa_wait_events(double timeout)
 {
-    if (!cocoa_initialized) return;
+    if (!cocoa_initialized) { vio_platform_wait_wake_only(timeout); return; }
+    if (vio_platform_wake_take()) { cocoa_poll_events(); return; }
     @autoreleasepool {
-        NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate distantFuture]
+        NSDate *until = timeout < 0.0 ? [NSDate distantFuture] : [NSDate dateWithTimeIntervalSinceNow:timeout];
+        NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until
                                             inMode:NSDefaultRunLoopMode dequeue:YES];
         if (ev) [NSApp sendEvent:ev];
     }
     cocoa_poll_events();
+    vio_platform_wake_take();
+}
+
+/* An empty application-defined event ends a nextEventMatchingMask wait. The
+ * sticky flag is separate: a poll dequeues this event but leaves the flag. */
+static void cocoa_wake(void)
+{
+    vio_platform_wake_signal();
+    if (!cocoa_initialized) return;
+    @autoreleasepool {
+        NSEvent *ev = [NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSMakePoint(0, 0)
+                                    modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0];
+        [NSApp postEvent:ev atStart:YES];
+    }
 }
 
 static void cocoa_swap_buffers(vio_window_handle h)
@@ -1031,6 +1076,7 @@ static const vio_platform vio_platform_cocoa = {
     .set_should_close     = cocoa_set_should_close,
     .poll_events          = cocoa_poll_events,
     .wait_events          = cocoa_wait_events,
+    .wake                 = cocoa_wake,
     .swap_buffers         = cocoa_swap_buffers,
     .get_framebuffer_size = cocoa_get_framebuffer_size,
     .get_window_size      = cocoa_get_window_size,

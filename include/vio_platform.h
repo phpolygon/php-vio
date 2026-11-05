@@ -86,7 +86,12 @@ typedef struct _vio_platform {
 
     /* ── Frame ────────────────────────────────────────────────────── */
     void  (*poll_events)(void);
-    void  (*wait_events)(void);                                       /* block until an event (minimised window) */
+    /* Block until an event arrives, timeout seconds pass (< 0: no timeout) or
+     * wake() was called, then dispatch what is queued like poll_events. A
+     * wake() while nobody waits makes the next wait return at once; a poll
+     * leaves it pending. Waits may end early on events vio ignores. */
+    void  (*wait_events)(double timeout);
+    void  (*wake)(void);                                              /* any thread */
     void  (*swap_buffers)(vio_window_handle w);                       /* GL */
     void  (*get_framebuffer_size)(vio_window_handle w, int *width, int *height);
     void  (*get_window_size)(vio_window_handle w, int *width, int *height);
@@ -173,6 +178,20 @@ void                vio_platform_set_active(const vio_platform *p);
 #define vio_plat() vio_platform_active()
 /* 0 when there is no window system (the null platform): no windows, offscreen only. */
 #define vio_platform_has_windows() (vio_platform_active()->create_window && strcmp(vio_platform_active()->name, "null") != 0)
+
+/* Wake helpers shared by the platforms (src/vio_platform_registry.c).
+ * wake_signal sets the sticky flag and makes the waitable ready (any thread);
+ * wake_take clears both and returns whether the flag was set. The waitable is
+ * wake_fd (POSIX, readable while set) or wake_handle (Windows HANDLE, signalled
+ * while set). timeout_ms rounds a wait_events timeout up to milliseconds,
+ * -1 for none. */
+void  vio_platform_wake_signal(void);
+int   vio_platform_wake_take(void);
+int   vio_platform_wake_pending(void);
+int   vio_platform_wake_fd(void);
+void *vio_platform_wake_handle(void);
+int   vio_platform_timeout_ms(double timeout);
+void  vio_platform_wait_wake_only(double timeout);
 
 /* Implementations */
 void vio_platform_null_register(void);

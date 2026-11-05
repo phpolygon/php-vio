@@ -1,6 +1,6 @@
 # Native Desktop-Anwendungen – Plan
 
-> **Status:** 📋 geplant (2026-11-05), noch kein Branch.
+> **Status:** 🚧 Phase 0 umgesetzt (2026-11-05, Tests 261/262), Phasen 1–5 offen.
 > **Baut auf:** `NATIVE-PLATFORM-PLAN.md` (Win32, Cocoa, X11, Wayland hinter `vio_platform`, Tests 212–215) und
 > Zwischenablage/Tastennamen (239/240).
 > **Ziel:** Mit php-vio sollen sich Werkzeuge, Editoren und Launcher bauen lassen, nicht nur Spiele: sparsam im
@@ -59,11 +59,13 @@ vio_on_refresh($ctx, fn() => render());   // OS will neu gezeichnet haben (Expos
 - **X11:** `poll()` auf `ConnectionNumber` + eine Self-Pipe für `vio_wake`. Timeout auch für Tasten-Wiederholung.
 - **Wayland:** `wl_display_prepare_read` + `poll()` auf Display-FD, Wiederhol-Timer (`timerfd`) und Self-Pipe.
 - **GLFW:** `glfwWaitEventsTimeout` / `glfwPostEmptyEvent`.
-- Nebenbei: `vio_begin` ohne sichtbare Änderung bleibt die Sache der App. Empfohlenes Muster im README:
-  `while (!vio_should_close($ctx)) { vio_wait_events($ctx); if ($dirty) render(); }`.
-- **Tests (261, 262):** `vio_wait_events` mit Timeout kehrt nach ±Toleranz zurück, ein `vio_wake` aus einem
-  Kindprozess bzw. einem Ereignis (`PostMessageW`/`XSendEvent`) weckt sofort; Schließen-Anfrage mit Veto, Fokus
-  und Minimieren über echte Fenster-Nachrichten. CPU-Zeit im Leerlauf über 1 s Warten < 10 ms.
+- Empfohlenes Muster: `while (!vio_should_close($ctx)) { vio_wait_events($ctx); if ($dirty) render(); }`.
+- **Umgesetzt:** `vio_wake` gilt prozessweit und klebt, bis eine Wartezeit ihn nimmt (`vio_poll_events` lässt ihn liegen);
+  ohne Display wartet jede Plattform nur auf ihn. Ereignisse feuern nur bei einer Änderung, nicht beim Anlegen des
+  Fensters. X11 meldet Minimieren über `WM_STATE` und keinen DPI-Wechsel, Wayland kein Minimieren.
+  `vio_inject_window_event` nimmt denselben Funnel wie die Plattformen.
+- **Tests (261, 262):** Timeout, Wecken (auch durch ein echtes Ereignis auf Win32/X11), CPU im Leerlauf < 50 ms über
+  0,5 s; Schließen mit Veto, Fokus, Minimieren, Neuzeichnen über echte Nachrichten (Win32, X11) und Injection.
 
 ### Phase 1 – Fenster-Details
 

@@ -531,6 +531,16 @@ typedef enum _vio_action {
     VIO_REPEAT  = 2,
 } vio_action;
 
+/* ── Window events (vio_inject_window_event) ─────────────────────── */
+
+typedef enum _vio_window_event {
+    VIO_WINDOW_EVENT_CLOSE    = 1,
+    VIO_WINDOW_EVENT_FOCUS    = 2,
+    VIO_WINDOW_EVENT_MINIMIZE = 3,
+    VIO_WINDOW_EVENT_SCALE    = 4,
+    VIO_WINDOW_EVENT_REFRESH  = 5,
+} vio_window_event;
+
 /* ── Mouse buttons ────────────────────────────────────────────────── */
 
 typedef enum _vio_mouse_button {

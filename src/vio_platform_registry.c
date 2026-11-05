@@ -9,6 +9,14 @@
 #include "php.h"   /* the build's HAVE_* switches (config.w32.h / php_config.h) */
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#endif
 #include "../include/vio_platform.h"
 #include "vio_window.h"
 
@@ -60,11 +68,108 @@ void vio_platform_set_active(const vio_platform *p)
     vio_platform_current = p;
 }
 
+/* ── Wake (vio_wake / wait_events) ────────────────────────────────────
+ * One process-wide sticky flag plus a waitable object (a pipe on POSIX, a
+ * manual-reset event on Windows) that is readable/signalled while the flag is
+ * set. Created in MINIT, before any thread could call vio_wake. */
+
+static volatile long vio_wake_flag;
+#ifdef _WIN32
+static HANDLE vio_wake_event;
+#else
+static int vio_wake_pipe[2] = { -1, -1 };
+#endif
+
+static void vio_platform_wake_create(void)
+{
+#ifdef _WIN32
+    if (!vio_wake_event) vio_wake_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+#else
+    if (vio_wake_pipe[0] >= 0) return;
+    if (pipe(vio_wake_pipe) != 0) { vio_wake_pipe[0] = vio_wake_pipe[1] = -1; return; }
+    for (int i = 0; i < 2; i++) {
+        fcntl(vio_wake_pipe[i], F_SETFL, fcntl(vio_wake_pipe[i], F_GETFL) | O_NONBLOCK);
+        fcntl(vio_wake_pipe[i], F_SETFD, FD_CLOEXEC);
+    }
+#endif
+}
+
+void vio_platform_wake_signal(void)
+{
+#ifdef _WIN32
+    if (InterlockedExchange(&vio_wake_flag, 1) == 0 && vio_wake_event) SetEvent(vio_wake_event);
+#else
+    if (__sync_lock_test_and_set(&vio_wake_flag, 1) == 0 && vio_wake_pipe[1] >= 0) {
+        char c = 1;
+        while (write(vio_wake_pipe[1], &c, 1) < 0 && errno == EINTR) {}
+    }
+#endif
+}
+
+int vio_platform_wake_take(void)
+{
+#ifdef _WIN32
+    if (InterlockedExchange(&vio_wake_flag, 0) == 0) return 0;
+    if (vio_wake_event) ResetEvent(vio_wake_event);
+#else
+    if (__sync_lock_test_and_set(&vio_wake_flag, 0) == 0) return 0;
+    char buf[64];
+    if (vio_wake_pipe[0] >= 0) while (read(vio_wake_pipe[0], buf, sizeof(buf)) > 0) {}
+#endif
+    return 1;
+}
+
+int vio_platform_wake_pending(void)
+{
+    return vio_wake_flag != 0;
+}
+
+void *vio_platform_wake_handle(void)
+{
+#ifdef _WIN32
+    return vio_wake_event;
+#else
+    return NULL;
+#endif
+}
+
+int vio_platform_wake_fd(void)
+{
+#ifdef _WIN32
+    return -1;
+#else
+    return vio_wake_pipe[0];
+#endif
+}
+
+/* A wait with no event source but vio_wake (null platform, no display). */
+void vio_platform_wait_wake_only(double timeout)
+{
+    if (vio_platform_wake_take()) return;
+    int ms = vio_platform_timeout_ms(timeout);
+#ifdef _WIN32
+    if (vio_wake_event) WaitForSingleObject(vio_wake_event, ms < 0 ? INFINITE : (DWORD)ms);
+    else if (ms > 0) Sleep((DWORD)ms);
+#else
+    struct pollfd p = { .fd = vio_wake_pipe[0], .events = POLLIN };
+    if (ms != 0) while (poll(&p, p.fd >= 0 ? 1 : 0, ms) < 0 && errno == EINTR) {}
+#endif
+    vio_platform_wake_take();
+}
+
+int vio_platform_timeout_ms(double timeout)
+{
+    if (timeout < 0.0) return -1;
+    double ms = timeout * 1000.0 + 0.999;
+    return ms > 2147483647.0 ? 2147483647 : (int)ms;
+}
+
 /* MINIT / MSHUTDOWN (declared in src/vio_window.h): the built-in platforms
  * register, the active one starts. Without any window system the null
  * platform is active and init succeeds. */
 int vio_window_init(void)
 {
+    vio_platform_wake_create();
     vio_platform_null_register();
 #ifdef HAVE_GLFW
     vio_platform_glfw_register();

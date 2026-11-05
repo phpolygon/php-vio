@@ -26,6 +26,11 @@ static void null_destroy_window(vio_window_handle w) { (void)w; }
 static int  null_should_close(vio_window_handle w) { (void)w; return 0; }
 static void null_set_should_close(vio_window_handle w, int v) { (void)w; (void)v; }
 static void null_poll_events(void) {}
+
+/* Nothing but vio_wake can arrive: wait for it or the timeout. */
+static void null_wait_events(double timeout) { vio_platform_wait_wake_only(timeout); }
+
+static void null_wake(void) { vio_platform_wake_signal(); }
 static void null_swap_buffers(vio_window_handle w) { (void)w; }
 static void null_size(vio_window_handle w, int *a, int *b) { (void)w; if (a) *a = 0; if (b) *b = 0; }
 static void null_content_scale(vio_window_handle w, float *sx, float *sy) { (void)w; if (sx) *sx = 1.0f; if (sy) *sy = 1.0f; }
@@ -62,7 +67,8 @@ static const vio_platform vio_platform_null = {
     .should_close         = null_should_close,
     .set_should_close     = null_set_should_close,
     .poll_events          = null_poll_events,
-    .wait_events          = null_poll_events,
+    .wait_events          = null_wait_events,
+    .wake                 = null_wake,
     .swap_buffers         = null_swap_buffers,
     .get_framebuffer_size = null_size,
     .get_window_size      = null_size,
