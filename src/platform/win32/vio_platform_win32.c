@@ -1213,7 +1213,11 @@ static VOID CALLBACK w32_test_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD
     EnumThreadWindows(GetCurrentThreadId(), w32_find_dialog, (LPARAM)&dlg);
     w32_test_trace("message box", (void *)dlg, (void *)(uintptr_t)w32_test_cmd);
     if (!dlg) return;   /* not up yet */
-    PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(w32_test_cmd, BN_CLICKED), 0);
+    /* click the button itself (a posted WM_COMMAND left an MB_OK box open on CI); WM_CLOSE as the last resort */
+    HWND btn = GetDlgItem(dlg, (int)w32_test_cmd);
+    if (btn) PostMessageW(btn, BM_CLICK, 0, 0);
+    else PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(w32_test_cmd, BN_CLICKED), 0);
+    if (w32_test_ticks > 3) PostMessageW(dlg, WM_CLOSE, 0, 0);
 }
 static void w32_test_dialog_arm(UINT cmd_cancel, UINT cmd_accept, const UINT *buttons, int count)
 {
