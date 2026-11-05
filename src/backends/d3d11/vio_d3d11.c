@@ -307,6 +307,29 @@ static int d3d11_init(vio_config *cfg)
 static void d3d11_dmip_release(void);
 static void d3d11_bundles_sweep(void);
 
+/* Swapchain fields per window (DESKTOP-APP-PLAN Phase 4), see d3d11_set_swapchain. */
+typedef struct _vio_d3d11_swapchain {
+    IDXGISwapChain1        *swapchain;
+    UINT                    swapchain_flags;
+    HANDLE                  frame_latency_waitable;
+    int                     frame_latency;
+    DXGI_FORMAT             swapchain_format;
+    int                     hdr_output;
+    float                   hdr_paper_white;
+    int                     present_failed_once;
+    ID3D11RenderTargetView *rtv;
+    ID3D11DepthStencilView *dsv;
+    ID3D11Texture2D        *depth_buffer;
+    ID3D11Texture2D        *readback_mirror;
+    ID3D11Texture2D        *readback_staging;
+    UINT                    readback_w, readback_h;
+    int                     width, height, vsync, latency_wait_skip;
+    void                   *platform_window;
+} vio_d3d11_swapchain;
+
+static vio_d3d11_swapchain  d3d11_main_sc;
+static vio_d3d11_swapchain *d3d11_cur_sc;   /* NULL: the main window's fields are loaded */
+
 static void d3d11_shutdown(void)
 {
     d3d11_bundles_sweep();
@@ -489,27 +512,6 @@ static void d3d11_destroy_surface(void *surface)
  * The swapchain fields of vio_d3d11, one record per window. set_swapchain
  * stores the active window's fields into its record and loads the other's;
  * everything else keeps reading vio_d3d11. */
-typedef struct _vio_d3d11_swapchain {
-    IDXGISwapChain1        *swapchain;
-    UINT                    swapchain_flags;
-    HANDLE                  frame_latency_waitable;
-    int                     frame_latency;
-    DXGI_FORMAT             swapchain_format;
-    int                     hdr_output;
-    float                   hdr_paper_white;
-    int                     present_failed_once;
-    ID3D11RenderTargetView *rtv;
-    ID3D11DepthStencilView *dsv;
-    ID3D11Texture2D        *depth_buffer;
-    ID3D11Texture2D        *readback_mirror;
-    ID3D11Texture2D        *readback_staging;
-    UINT                    readback_w, readback_h;
-    int                     width, height, vsync, latency_wait_skip;
-    void                   *platform_window;
-} vio_d3d11_swapchain;
-
-static vio_d3d11_swapchain  d3d11_main_sc;
-static vio_d3d11_swapchain *d3d11_cur_sc;   /* NULL: the main window's fields are loaded */
 
 static void d3d11_sc_store(vio_d3d11_swapchain *r)
 {
