@@ -4,8 +4,8 @@ Multiple windows (DESKTOP-APP-PLAN Phase 4): vio_window() opens a second window 
 vio
 --FILE--
 <?php
-/* converted in 4a; the others follow (4b Vulkan, 4c D3D12, 4d OpenGL) */
-$required = ['metal', 'd3d11'];
+/* converted in 4a (Metal, D3D11) and 4b (Vulkan); the others follow (4c D3D12, 4d OpenGL) */
+$required = ['metal', 'd3d11', 'vulkan'];
 $px = function (string $rgba, int $w, int $x, int $y) { $o = ($y * $w + $x) * 4; return [ord($rgba[$o]), ord($rgba[$o + 1]), ord($rgba[$o + 2])]; };
 $near = fn(array $a, array $b) => max(array_map(fn($i) => abs($a[$i] - $b[$i]), [0, 1, 2])) <= 8;
 $err = function (callable $f) { try { $f(); return 'none'; } catch (ValueError $e) { return 'ValueError'; } };
@@ -79,6 +79,6 @@ echo "DONE\n";
 opengl: %r(OK|unsupported|skip \(.*\))%r
 d3d11: %r(OK|skip \(.*\))%r
 d3d12: %r(OK|unsupported|skip \(.*\))%r
-vulkan: %r(OK|unsupported|skip \(.*\))%r
+vulkan: %r(OK|skip \(.*\))%r
 metal: %r(OK|skip \(.*\))%r
 DONE

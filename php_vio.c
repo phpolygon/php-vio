@@ -1333,6 +1333,20 @@ static void vio_window_enter(vio_context_object *ctx, vio_window_object *w)
     ctx->config.headless = w->view.config.headless;
     ctx->config.vsync = w->view.config.vsync;
     ctx->backend->set_swapchain(w->swapchain);
+
+    /* 2D projection in logical pixels, viewport in framebuffer pixels (headless: 1:1) */
+    int fb_w = w->view.config.width, fb_h = w->view.config.height;
+    float sx = 1.0f, sy = 1.0f;
+    if (!w->view.config.headless && w->view.window) {
+        vio_plat()->get_framebuffer_size(w->view.window, &fb_w, &fb_h);
+        vio_window_content_scale(w->view.window, &sx, &sy);
+        if (sx <= 0.0f) sx = 1.0f;
+        if (sy <= 0.0f) sy = 1.0f;
+    }
+    int lw = (int)((float)fb_w / sx + 0.5f), lh = (int)((float)fb_h / sy + 0.5f);
+    if (lw > 0 && lh > 0 && (lw != ctx->state_2d.width || lh != ctx->state_2d.height)) vio_2d_set_size(&ctx->state_2d, lw, lh);
+    ctx->state_2d.fb_width = fb_w;
+    ctx->state_2d.fb_height = fb_h;
 }
 
 static void vio_window_leave(vio_context_object *ctx)

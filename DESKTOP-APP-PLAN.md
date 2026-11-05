@@ -176,7 +176,11 @@ vio_key_pressed($tool, VIO_KEY_A);   // Eingabe-Funktionen nehmen VioContext|Vio
     Kontext-Datensatz (`view`) mit Fenster, Input, Schließ-Flag und Größen; die Fenster- und Input-Funktionen laufen
     darauf unverändert. Nebenbefund Metal: der 2D-Batch schrieb jede Ausgabe in denselben Vertex-Puffer, ein späterer
     Frame überschrieb die Daten eines noch laufenden (jetzt Per-Frame-Ring).
-  - **4b:** Vulkan (Surface/Swapchain/Acquire-Semaphoren je Fenster, Present-Support je Surface prüfen).
+  - **4b ✅ (2026-11-05):** Vulkan. Surface, Swapchain, Tiefe, `render_finished` je Bild und der Headless-Capture je
+    Fenster; Frame-Slots, Command-Buffer, Acquire-Semaphoren und die Timeline bleiben je Gerät (die Acquire-Semaphore
+    eines Slots wartet die Übergabe des Frames, der mit ihr acquired hat). Ein Fenster, dessen Surface die Present-Queue
+    nicht kann oder ein anderes Format als die Hauptswapchain bekommt (die 2D-Pipelines sind dafür gebaut), wird
+    abgelehnt.
   - **4c:** D3D12 (Frame-Slot vom Back-Buffer-Index trennen, RTV-Heap/Tiefe je Swapchain).
   - **4d:** OpenGL (geteilte Kontexte in allen Plattformen, VAOs/FBOs je Kontext).
   - Backends ohne Umbau melden `VIO_FEATURE_MULTI_WINDOW` = false, `vio_window` liefert dort `false`. Headless-Fenster bekommen dieselben Slots, damit die Tests
