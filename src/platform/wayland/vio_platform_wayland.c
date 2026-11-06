@@ -48,10 +48,12 @@
 #include "gen/xdg-decoration-unstable-v1-client-protocol.h"
 #include "gen/relative-pointer-unstable-v1-client-protocol.h"
 #include "gen/pointer-constraints-unstable-v1-client-protocol.h"
+#include "gen/text-input-unstable-v3-client-protocol.h"
 #include "gen/xdg-shell-protocol.c"
 #include "gen/xdg-decoration-unstable-v1-protocol.c"
 #include "gen/relative-pointer-unstable-v1-protocol.c"
 #include "gen/pointer-constraints-unstable-v1-protocol.c"
+#include "gen/text-input-unstable-v3-protocol.c"
 
 #ifdef HAVE_VULKAN
 #define VK_USE_PLATFORM_WAYLAND_KHR
@@ -92,6 +94,11 @@ static struct {
     struct xdg_wm_base   *wm_base;
     struct wl_seat       *seat;
     struct wl_data_device_manager *ddm;     /* file drops */
+    struct zwp_text_input_manager_v3 *tim;  /* IME (text-input-v3) */
+    struct zwp_text_input_v3 *ti;
+    vio_wl_window        *ti_window;        /* the surface the text input entered */
+    char                 *ti_pre, *ti_commit;   /* pending until done */
+    int                   ti_pre_begin, ti_pre_end;
     uint32_t              ddm_version;
     struct wl_data_device *data_device;
     struct wl_data_offer *dnd_offer, *sel_offer;
@@ -146,6 +153,7 @@ struct _vio_wl_window {
     int                  fb_w, fb_h;
     struct wl_cursor    *shape;          /* vio_set_cursor, NULL = the default arrow */
     struct wl_buffer    *image;          /* vio_set_cursor_image (owned), wins over shape */
+    int                  ime_off, ime_x, ime_y, ime_w, ime_h;
     int                  image_w, image_h, image_hx, image_hy;
     vio_input_state     *input;
 };
@@ -828,6 +836,104 @@ static const struct wl_data_device_listener wl_dd_listener = {
     wl_dd_data_offer, wl_dd_enter, wl_dd_leave, wl_dd_motion, wl_dd_drop, wl_dd_selection,
 };
 
+/* ── IME composition: zwp_text_input_v3 (DESKTOP-APP-PLAN Phase 3b) ──
+ * Events collect until done; then the commit goes out as chars and the
+ * preedit (byte offsets -> codepoints) through vio_on_preedit. */
+
+static int wl_ti_cp(const char *s, int bytes)
+{
+    int n = 0;
+    for (int i = 0; s && s[i] && i < bytes; i++) if (((unsigned char)s[i] & 0xC0) != 0x80) n++;
+    return n;
+}
+
+static void wl_ti_enable(int on)
+{
+    if (!wl.ti) return;
+    if (on) {
+        zwp_text_input_v3_enable(wl.ti);
+        zwp_text_input_v3_set_content_type(wl.ti, ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE, ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
+    } else {
+        zwp_text_input_v3_disable(wl.ti);
+    }
+    zwp_text_input_v3_commit(wl.ti);
+}
+
+static void wl_ti_enter(void *data, struct zwp_text_input_v3 *t, struct wl_surface *s)
+{
+    (void)data; (void)t;
+    wl.ti_window = s ? (vio_wl_window *)wl_surface_get_user_data(s) : NULL;
+    if (wl.ti_window && !wl.ti_window->ime_off) wl_ti_enable(1);
+}
+static void wl_ti_leave(void *data, struct zwp_text_input_v3 *t, struct wl_surface *s)
+{
+    (void)data; (void)t; (void)s;
+    wl_ti_enable(0);
+    wl.ti_window = NULL;
+}
+static void wl_ti_preedit(void *data, struct zwp_text_input_v3 *t, const char *text, int32_t begin, int32_t end)
+{
+    (void)data; (void)t;
+    free(wl.ti_pre);
+    wl.ti_pre = strdup(text ? text : "");
+    wl.ti_pre_begin = begin;
+    wl.ti_pre_end = end;
+}
+static void wl_ti_commit(void *data, struct zwp_text_input_v3 *t, const char *text)
+{
+    (void)data; (void)t;
+    free(wl.ti_commit);
+    wl.ti_commit = text ? strdup(text) : NULL;
+}
+static void wl_ti_delete(void *data, struct zwp_text_input_v3 *t, uint32_t before, uint32_t after) { (void)data; (void)t; (void)before; (void)after; }
+static void wl_ti_done(void *data, struct zwp_text_input_v3 *t, uint32_t serial)
+{
+    (void)data; (void)t; (void)serial;
+    vio_wl_window *w = wl.ti_window;
+    if (w && wl.ti_commit) {   /* committed text: chars (UTF-8 decoded) */
+        const unsigned char *p = (const unsigned char *)wl.ti_commit;
+        while (*p) {
+            unsigned int c = *p++;
+            int more = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+            c &= more == 3 ? 0x07 : more == 2 ? 0x0F : more == 1 ? 0x1F : 0x7F;
+            while (more-- > 0 && (*p & 0xC0) == 0x80) c = (c << 6) | (*p++ & 0x3F);
+            if (c >= 32 && c != 127) vio_input_emit_char(wl_input(w), c);
+        }
+    }
+    if (w) {
+        const char *pre = wl.ti_pre ? wl.ti_pre : "";
+        int b = wl.ti_pre_begin < 0 ? wl_ti_cp(pre, (int)strlen(pre)) : wl_ti_cp(pre, wl.ti_pre_begin);
+        int e = wl.ti_pre_end < 0 ? b : wl_ti_cp(pre, wl.ti_pre_end);
+        vio_input_preedit_event(w->input, pre, *pre ? b : 0, *pre ? e : 0);
+    }
+    free(wl.ti_pre); wl.ti_pre = NULL;
+    free(wl.ti_commit); wl.ti_commit = NULL;
+}
+static const struct zwp_text_input_v3_listener wl_ti_listener = {
+    wl_ti_enter, wl_ti_leave, wl_ti_preedit, wl_ti_commit, wl_ti_delete, wl_ti_done,
+};
+
+static int wl_set_ime_rect(vio_window_handle h, int x, int y, int width, int height)
+{
+    vio_wl_window *w = (vio_wl_window *)h;
+    if (!w) return 0;
+    if (wl.ti && wl.ti_window == w) {
+        zwp_text_input_v3_set_cursor_rectangle(wl.ti, x, y, width, height);
+        zwp_text_input_v3_commit(wl.ti);
+    }
+    w->ime_x = x; w->ime_y = y; w->ime_w = width; w->ime_h = height;
+    return 1;
+}
+
+static int wl_set_ime_enabled(vio_window_handle h, int enabled)
+{
+    vio_wl_window *w = (vio_wl_window *)h;
+    if (!w) return 0;
+    w->ime_off = !enabled;
+    if (wl.ti_window == w) wl_ti_enable(enabled);
+    return 1;
+}
+
 static void wl_registry_global(void *data, struct wl_registry *r, uint32_t id, const char *iface, uint32_t version)
 {
     (void)data;
@@ -838,6 +944,8 @@ static void wl_registry_global(void *data, struct wl_registry *r, uint32_t id, c
     } else if (strcmp(iface, xdg_wm_base_interface.name) == 0) {
         wl.wm_base = wl_registry_bind(r, id, &xdg_wm_base_interface, 1);
         xdg_wm_base_add_listener(wl.wm_base, &wl_wm_listener, NULL);
+    } else if (strcmp(iface, zwp_text_input_manager_v3_interface.name) == 0 && !wl.tim) {
+        wl.tim = wl_registry_bind(r, id, &zwp_text_input_manager_v3_interface, 1);
     } else if (strcmp(iface, wl_data_device_manager_interface.name) == 0 && !wl.ddm) {
         wl.ddm_version = version < 3 ? version : 3;
         wl.ddm = wl_registry_bind(r, id, &wl_data_device_manager_interface, wl.ddm_version);
@@ -888,6 +996,10 @@ static int wl_init(void)
         wl.data_device = wl_data_device_manager_get_data_device(wl.ddm, wl.seat);
         wl_data_device_add_listener(wl.data_device, &wl_dd_listener, NULL);
     }
+    if (wl.tim && wl.seat) {
+        wl.ti = zwp_text_input_manager_v3_get_text_input(wl.tim, wl.seat);
+        zwp_text_input_v3_add_listener(wl.ti, &wl_ti_listener, NULL);
+    }
     wl_display_roundtrip(wl.display);   /* seat capabilities, output modes, keymap */
     if (!wl.compositor || !wl.wm_base) {
         php_error_docref(NULL, E_WARNING, "Wayland: the compositor offers no %s", wl.compositor ? "xdg_wm_base" : "wl_compositor");
@@ -914,6 +1026,10 @@ static void wl_shutdown(void)
     wl_offer_destroy(wl.dnd_offer);
     wl_offer_destroy(wl.sel_offer);
     if (wl.data_device) wl_data_device_destroy(wl.data_device);
+    if (wl.ti) zwp_text_input_v3_destroy(wl.ti);
+    if (wl.tim) zwp_text_input_manager_v3_destroy(wl.tim);
+    free(wl.ti_pre);
+    free(wl.ti_commit);
     if (wl.ddm) wl_data_device_manager_destroy(wl.ddm);
     if (wl.cursor_surface) wl_surface_destroy(wl.cursor_surface);
     if (wl.cursor_theme) wl_cursor_theme_destroy(wl.cursor_theme);
@@ -1075,6 +1191,7 @@ static void wl_destroy_window(vio_window_handle h)
     if (wl.keyboard_focus == w) wl.keyboard_focus = NULL;
     if (wl.pointer_focus == w) wl.pointer_focus = NULL;
     if (wl.dnd_window == w) wl.dnd_window = NULL;
+    if (wl.ti_window == w) wl.ti_window = NULL;
     if (w->egl_context) {
         if (egl.GetCurrentContext && egl.GetCurrentContext() == w->egl_context) egl.MakeCurrent(wl_egl_display, NULL, NULL, NULL);
         egl.DestroyContext(wl_egl_display, w->egl_context);
@@ -1415,6 +1532,9 @@ static const vio_platform vio_platform_wayland = {
     .notify               = vio_linux_notify,
     .set_progress         = lx_set_progress,
     .set_tray             = vio_linux_set_tray,
+    .ime_preedit          = 1,
+    .set_ime_rect         = wl_set_ime_rect,
+    .set_ime_enabled      = wl_set_ime_enabled,
 };
 
 void vio_platform_wayland_register(void)

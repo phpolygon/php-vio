@@ -1,6 +1,6 @@
 # Native Desktop-Anwendungen – Plan
 
-> **Status:** 🚧 Phasen 0, 1, 2a (Drop, Dialoge, Message-Box) 2b (Menüs) und 2c (D-Bus, Benachrichtigungen, Fortschritt, Portal, Tray) und 3a (IME auf Win32/Cocoa) umgesetzt (2026-11-05, Tests 261–270), 3b (X11, Wayland) und 4–5 offen.
+> **Status:** 🚧 Phasen 0, 1, 2a (Drop, Dialoge, Message-Box) 2b (Menüs) und 2c (D-Bus, Benachrichtigungen, Fortschritt, Portal, Tray) und 3 (IME auf Win32, Cocoa, X11, Wayland) umgesetzt (2026-11-05, Tests 261–270), 4–5 offen.
 > **Baut auf:** `NATIVE-PLATFORM-PLAN.md` (Win32, Cocoa, X11, Wayland hinter `vio_platform`, Tests 212–215) und
 > Zwischenablage/Tastennamen (239/240).
 > **Ziel:** Mit php-vio sollen sich Werkzeuge, Editoren und Launcher bauen lassen, nicht nur Spiele: sparsam im
@@ -134,7 +134,9 @@ vio_ime_enable($ctx, bool $on);       // aus für Spielsteuerung, an für Textfe
   Protokoll-Glue über `wayland-scanner` wie die übrigen.
 - iOS: `UITextInput` `setMarkedText` auf dieselbe Callback-Form; `vio_ime_backspaces` bleibt.
 - **3a umgesetzt** (Test 270): Win32 (IMM32) und Cocoa (`NSTextInputClient`, Tasten über `interpretKeyEvents`). GLFW meldet keine
-  Komposition (`vio_platform_info()['ime_preedit']` false). **3b:** X11 und Wayland.
+  Komposition (`vio_platform_info()['ime_preedit']` false).
+- **3b umgesetzt:** X11 (XIM-Preedit-Callbacks, wenn die Eingabemethode sie anbietet) und Wayland (`text-input-v3`). Nur per
+  Injection geprüft: weder Xvfb noch der Test-weston haben eine Eingabemethode.
 - **Tests (ursprünglich 269):** `vio_inject_preedit` über denselben Pfad; Win32 zusätzlich echt per `ImmSetCompositionStringW` auf
   dem Kontext des Fensters (geht ohne installierte IME nur eingeschränkt, Skip mit Grund). X11/Wayland in der CI nicht
   echt prüfbar (kein IME-Server) – bewusst nur Injection.
