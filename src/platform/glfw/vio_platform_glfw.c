@@ -355,6 +355,9 @@ static void glfw_set_should_close(vio_window_handle w, int value)
 static void glfw_poll_events(void)
 {
     if (glfw_initialized) glfwPollEvents();
+#ifdef __linux__
+    vio_linux_dispatch();   /* tray calls; a wait only sees them with the next event or its timeout */
+#endif
 }
 
 /* The sticky wake flag lives outside GLFW (glfwPollEvents would swallow its
@@ -947,6 +950,7 @@ static vio_platform vio_platform_glfw = {
     .file_dialog          = lx_file_dialog,
     .notify               = vio_linux_notify,
     .set_progress         = lx_set_progress,
+    .set_tray             = vio_linux_set_tray,
 #endif
 };
 

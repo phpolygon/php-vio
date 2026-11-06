@@ -12,7 +12,7 @@ $child = <<<'PHP'
 $ctx = @vio_create('auto', ['width' => 64, 'height' => 48, 'headless' => true]) ?: vio_create('null', ['width' => 64, 'height' => 48]);
 $info = vio_platform_info();
 $p = vio_platform();
-$keys = ['name', 'wait_events', 'cursor_shapes', 'custom_cursor', 'window_icon', 'size_limits', 'aspect_ratio', 'floating', 'opacity', 'open_url', 'reveal_file', 'file_drop', 'file_dialog', 'message_box', 'menu_bar', 'popup_menu', 'notifications', 'progress'];
+$keys = ['name', 'wait_events', 'cursor_shapes', 'custom_cursor', 'window_icon', 'size_limits', 'aspect_ratio', 'floating', 'opacity', 'open_url', 'reveal_file', 'file_drop', 'file_dialog', 'message_box', 'menu_bar', 'popup_menu', 'notifications', 'progress', 'tray'];
 $out = [];
 $out[] = 'info ' . json_encode(array_keys($info) === $keys && $info['name'] === $p);
 $caps = implode('', array_map(fn($k) => $info[$k] ? '1' : '0', array_slice($keys, 1)));
@@ -165,15 +165,15 @@ foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
 }
 unlink($file);
 
-/* caps: wait_events cursor_shapes custom_cursor window_icon size_limits aspect_ratio floating opacity open_url reveal_file file_drop file_dialog message_box menu_bar popup_menu notifications progress;
+/* caps: wait_events cursor_shapes custom_cursor window_icon size_limits aspect_ratio floating opacity open_url reveal_file file_drop file_dialog message_box menu_bar popup_menu notifications progress tray;
  * file_dialog, notifications and progress depend on the session on Linux (D-Bus services), notifications on macOS on an app bundle */
 $wantCaps = [
-    'null'    => '/^10000000000000000$/',
-    'win32'   => '/^11111111111111101$/',
-    'cocoa'   => '/^111111111111111[01]1$/',
-    'x11'     => '/^11111111111[01]000[01][01]$/',
-    'wayland' => '/^11101000111[01]000[01][01]$/',
-    'glfw'    => '/^11[01]{8}1[01]000[01][01]$/',   // icon depends on what GLFW runs on (none on macOS and Wayland)
+    'null'    => '/^100000000000000000$/',
+    'win32'   => '/^111111111111111111$/',
+    'cocoa'   => '/^111111111111111[01]11$/',
+    'x11'     => '/^11111111111[01]000[01][01][01]$/',
+    'wayland' => '/^11101000111[01]000[01][01][01]$/',
+    'glfw'    => '/^11[01]{8}1[01]000[01][01][01]$/',   // icon depends on what GLFW runs on (none on macOS and Wayland)
 ];
 $wantOs = [
     'win32' => '{"ibeam":true,"icon":true,"min":[40,30],"max":[100,80],"topmost":true,"alpha":128}',

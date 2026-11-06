@@ -201,6 +201,26 @@ function vio_notify(string $title, string $body = '', array $options = []): bool
 function vio_set_progress(VioContext $context, ?float $progress, string $state = 'normal'): bool {}
 
 /**
+ * Show or update the process's tray icon (one per process). Options: 'icon' =>
+ * a list of RGBA images as in vio_set_window_icon (none: the platform's),
+ * 'tooltip' => string, 'menu' => items as in vio_popup_menu, 'on_select' =>
+ * callable(string $id) for a menu choice, 'on_click' => callable() for a
+ * click (Windows left click; macOS and Linux open the menu instead). Events
+ * arrive from vio_poll_events / vio_wait_events. false where there is no tray
+ * (Linux without a StatusNotifierWatcher, e.g. GNOME without an extension).
+ * The icon goes away with vio_tray_remove() or at the end of the request.
+ *
+ * @param array{icon?: list<array{data: string, width: int, height: int}>, tooltip?: string,
+ *              menu?: list<array>, on_select?: callable(string): void, on_click?: callable(): void} $options
+ */
+function vio_tray(array $options): bool {}
+
+/**
+ * Remove the tray icon; false when there was none.
+ */
+function vio_tray_remove(): bool {}
+
+/**
  * Like vio_poll_events(), but first blocks until an event arrives, $timeout
  * seconds pass (< 0: no timeout) or vio_wake() is called. An idle desktop app
  * loops on this instead of vio_poll_events() and renders only when something

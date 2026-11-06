@@ -1447,6 +1447,153 @@ static int w32_set_progress(vio_window_handle h, double value, int state)
     return 1;
 }
 
+/* ── Tray and notifications (DESKTOP-APP-PLAN Phase 2c-2) ─────────── */
+
+#define W32_TRAY_MSG   (WM_APP + 1)
+#define W32_TRAY_ID    1   /* vio_tray */
+#define W32_NOTE_ID    2   /* a temporary icon for vio_notify without a tray */
+static HWND   w32_tray_hwnd;   /* message-only window of class vio_tray */
+static HMENU  w32_tray_menu;
+static HICON  w32_tray_icon;
+static int    w32_tray_on, w32_note_on;
+static HMENU  w32_build_menu(const vio_menu_item *items, int n, int popup, ACCEL *accel, int *accel_n, int accel_cap);
+static HICON  w32_create_icon(const unsigned char *rgba, int width, int height, int hot_x, int hot_y, BOOL icon);
+static int    w32_pick_icon(int count, const vio_platform_image *images, int want);
+static VOID CALLBACK w32_test_menu_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time);
+
+static void w32_tray_show_menu(void)
+{
+    if (!w32_tray_menu) return;
+    POINT p;
+    GetCursorPos(&p);
+    SetForegroundWindow(w32_tray_hwnd);   /* else the menu stays open when clicking elsewhere */
+    int ms = 0, action = 0;
+    if (vio_platform_test_dialog(&ms, &action)) w32_test_timer = SetTimer(NULL, 0, (UINT)(ms > 0 ? ms : 1), w32_test_menu_proc);
+    UINT cmd = (UINT)TrackPopupMenuEx(w32_tray_menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, p.x, p.y, w32_tray_hwnd, NULL);
+    w32_test_dialog_disarm();
+    PostMessageW(w32_tray_hwnd, WM_NULL, 0, 0);
+    if (cmd >= W32_MENU_BASE) vio_tray_menu_event((int)cmd - W32_MENU_BASE);
+}
+
+static LRESULT CALLBACK w32_tray_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == W32_TRAY_MSG) {
+        UINT ev = LOWORD(lp), id = HIWORD(lp) ? HIWORD(lp) : (UINT)wp;   /* NOTIFYICON_VERSION_4 packs the id into lp */
+        if (id == W32_TRAY_ID) {
+            if (ev == WM_LBUTTONUP || ev == NIN_SELECT || ev == NIN_KEYSELECT) vio_tray_click_event();
+            else if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) w32_tray_show_menu();
+        } else if (id == W32_NOTE_ID && (ev == NIN_BALLOONTIMEOUT || ev == NIN_BALLOONUSERCLICK || ev == NIN_BALLOONHIDE)) {
+            NOTIFYICONDATAW nid;   /* the temporary icon goes once its notification is gone */
+            memset(&nid, 0, sizeof(nid));
+            nid.cbSize = sizeof(nid);
+            nid.hWnd = hwnd;
+            nid.uID = W32_NOTE_ID;
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            w32_note_on = 0;
+        }
+        return 0;
+    }
+    if (msg == WM_COMMAND && HIWORD(wp) == 0 && LOWORD(wp) >= W32_MENU_BASE) {   /* a menu choice sent to the window */
+        vio_tray_menu_event((int)LOWORD(wp) - W32_MENU_BASE);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static HWND w32_tray_window(void)
+{
+    if (w32_tray_hwnd) return w32_tray_hwnd;
+    WNDCLASSEXW wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = w32_tray_proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = L"vio_tray";
+    RegisterClassExW(&wc);   /* fails harmlessly when already registered */
+    w32_tray_hwnd = CreateWindowExW(0, L"vio_tray", L"vio tray", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL);
+    return w32_tray_hwnd;
+}
+
+static void w32_nid(NOTIFYICONDATAW *nid, UINT id)
+{
+    memset(nid, 0, sizeof(*nid));
+    nid->cbSize = sizeof(*nid);
+    nid->hWnd = w32_tray_hwnd;
+    nid->uID = id;
+    nid->uCallbackMessage = W32_TRAY_MSG;
+}
+
+static int w32_set_tray(const vio_tray_desc *d)
+{
+    if (!d) {
+        if (w32_tray_on) {
+            NOTIFYICONDATAW nid;
+            w32_nid(&nid, W32_TRAY_ID);
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+        }
+        w32_tray_on = 0;
+        if (w32_tray_menu) { DestroyMenu(w32_tray_menu); w32_tray_menu = NULL; }
+        if (w32_tray_icon) { DestroyIcon(w32_tray_icon); w32_tray_icon = NULL; }
+        return 1;
+    }
+    if (!w32_tray_window()) return 0;
+    HICON icon = NULL;
+    if (d->image_count > 0) {
+        const vio_platform_image *im = &d->images[w32_pick_icon(d->image_count, d->images, GetSystemMetrics(SM_CXSMICON))];
+        icon = w32_create_icon(im->rgba, im->width, im->height, 0, 0, TRUE);
+    }
+    HMENU menu = d->menu_count > 0 ? w32_build_menu(d->menu, d->menu_count, 1, NULL, NULL, 0) : NULL;
+    NOTIFYICONDATAW nid;
+    w32_nid(&nid, W32_TRAY_ID);
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    nid.hIcon = icon ? icon : LoadIconW(NULL, MAKEINTRESOURCEW(32512) /* IDI_APPLICATION */);
+    if (d->tooltip) {
+        WCHAR *tip = vio_shell_wide(d->tooltip);
+        if (tip) { wcsncpy(nid.szTip, tip, sizeof(nid.szTip) / sizeof(WCHAR) - 1); free(tip); }
+    }
+    BOOL ok = Shell_NotifyIconW(w32_tray_on ? NIM_MODIFY : NIM_ADD, &nid);
+    if (ok && !w32_tray_on) {
+        nid.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    }
+    if (!ok) {
+        if (icon) DestroyIcon(icon);
+        if (menu) DestroyMenu(menu);
+        return 0;
+    }
+    w32_tray_on = 1;
+    if (w32_tray_menu) DestroyMenu(w32_tray_menu);
+    if (w32_tray_icon) DestroyIcon(w32_tray_icon);
+    w32_tray_menu = menu;
+    w32_tray_icon = icon;
+    return 1;
+}
+
+/* A balloon from the tray icon (Windows 10/11 shows it as a toast); without
+ * a tray a temporary icon carries it and goes when the balloon does. */
+static int w32_notify(const char *title, const char *body, const char *icon, const char *key)
+{
+    (void)icon; (void)key;   /* one balloon at a time: a new one replaces the last */
+    if (!w32_tray_window()) return 0;
+    NOTIFYICONDATAW nid;
+    UINT id = w32_tray_on ? W32_TRAY_ID : W32_NOTE_ID;
+    w32_nid(&nid, id);
+    if (!w32_tray_on && !w32_note_on) {
+        nid.uFlags = NIF_MESSAGE | NIF_ICON;
+        nid.hIcon = LoadIconW(NULL, MAKEINTRESOURCEW(32512));
+        if (!Shell_NotifyIconW(NIM_ADD, &nid)) return 0;
+        nid.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        w32_note_on = 1;
+    }
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    WCHAR *t = vio_shell_wide(title), *b = vio_shell_wide(body && *body ? body : " ");
+    if (t) { wcsncpy(nid.szInfoTitle, t, sizeof(nid.szInfoTitle) / sizeof(WCHAR) - 1); free(t); }
+    if (b) { wcsncpy(nid.szInfo, b, sizeof(nid.szInfo) / sizeof(WCHAR) - 1); free(b); }
+    return Shell_NotifyIconW(NIM_MODIFY, &nid) != 0;
+}
+
 /* ── Menus (DESKTOP-APP-PLAN Phase 2b) ────────────────────────────── */
 
 static WORD w32_menu_vk(int key)
@@ -1988,6 +2135,8 @@ static const vio_platform vio_platform_win32 = {
     .set_menu_bar         = w32_set_menu_bar,
     .popup_menu           = w32_popup_menu,
     .set_progress         = w32_set_progress,
+    .notify               = w32_notify,
+    .set_tray             = w32_set_tray,
 };
 
 void vio_platform_win32_register(void)
