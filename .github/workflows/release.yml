@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
   issues: write
+  # @semantic-release/github comments "released in vX.Y.Z" on every PR the
+  # release contains; without this the step logs "Not allowed to add a
+  # comment to the issue/PR #N" for each merged PR.
+  pull-requests: write
   actions: write
 
 jobs:
