@@ -52,6 +52,7 @@ static NSString *cocoa_webview_bridge =
      "  if (window.vio) return;"
      "  var h = window.webkit.messageHandlers.vio;"
      "  window.vio = Object.freeze({ postMessage: function (v) { h.postMessage(JSON.stringify(v === undefined ? null : v)); } });"
+     "  Object.defineProperty(window, '__vioPost', { value: function (s) { h.postMessage(String(s)); } });"
      "})();";
 
 @implementation VioWebHandler
@@ -147,6 +148,26 @@ static NSString *cocoa_webview_bridge =
 
 #define COCOA_WK(wv) ((__bridge WKWebView *)(wv)->view)
 
+/* The bridge, then vio's own script (cookies), at every document start. */
+static void cocoa_webview_scripts(WKUserContentController *ucc, const char *extra)
+{
+    [ucc removeAllUserScripts];
+    Class cls = NSClassFromString(@"WKUserScript");
+    [ucc addUserScript:[[cls alloc] initWithSource:cocoa_webview_bridge injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                  forMainFrameOnly:YES]];
+    NSString *js = extra ? [NSString stringWithUTF8String:extra] : nil;
+    if (js.length) {
+        [ucc addUserScript:[[cls alloc] initWithSource:js injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                      forMainFrameOnly:YES]];
+    }
+}
+
+static int cocoa_webview_set_script(void *p, const char *js)
+{
+    @autoreleasepool { cocoa_webview_scripts(COCOA_WK((vio_cocoa_webview *)p).configuration.userContentController, js); }
+    return 1;
+}
+
 static void cocoa_webview_place(vio_cocoa_webview *wv, int has_bounds, int x, int y, int width, int height)
 {
     WKWebView *view = COCOA_WK(wv);
@@ -187,10 +208,7 @@ static void *cocoa_webview_create(vio_window_handle h, const vio_webview_desc *d
                 php_error_docref(NULL, E_WARNING, "vio_webview: WebKit refuses the scheme \"%s\"", d->schemes[i]);
             }
         }
-        WKUserScript *bridge = [[NSClassFromString(@"WKUserScript") alloc] initWithSource:cocoa_webview_bridge
-                                                                           injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                                                                        forMainFrameOnly:YES];
-        [config.userContentController addUserScript:bridge];
+        cocoa_webview_scripts(config.userContentController, d->script);
         [config.userContentController addScriptMessageHandler:handler name:@"vio"];
         if (d->devtools) [config.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
 

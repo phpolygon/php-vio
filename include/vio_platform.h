@@ -164,6 +164,7 @@ typedef struct _vio_webview_desc {
     int                devtools, transparent;
     const char *const *schemes;
     int                scheme_count;
+    const char        *script;           /* run at every document start after the bridge (webview_set_script replaces it) */
     void              *user;
 } vio_webview_desc;
 
@@ -348,12 +349,16 @@ typedef struct _vio_platform {
      * request stays open until reply_end, or until the engine cancels it
      * (vio_webview_cancel_event - replies to it are then ignored).
      * webview_destroy: before its window goes; pending requests die with it.
+ * Every engine defines window.vio.postMessage(v) (JSON.stringify(v) to
+ * vio_webview_message_event) and window.__vioPost(string) (the string as
+ * is - vio's own messages, which start with "\x01") at document start.
      * Availability (the engine library is there) through available(). */
     void *(*webview_create)(vio_window_handle w, const vio_webview_desc *d);
     void  (*webview_destroy)(void *wv);
     int   (*webview_navigate)(void *wv, const char *url);
     int   (*webview_eval)(void *wv, const char *js);
     int   (*webview_set_bounds)(void *wv, int has_bounds, int x, int y, int width, int height);
+    int   (*webview_set_script)(void *wv, const char *js);   /* for the next documents */
     int   (*webview_reply_head)(void *wv, uint64_t id, int status, const vio_webview_header *h, int count);
     int   (*webview_reply_data)(void *wv, uint64_t id, const void *data, size_t len);
     int   (*webview_reply_end)(void *wv, uint64_t id);

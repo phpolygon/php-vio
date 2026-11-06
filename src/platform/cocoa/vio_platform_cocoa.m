@@ -1823,6 +1823,7 @@ static const vio_platform vio_platform_cocoa = {
     .webview_navigate     = cocoa_webview_navigate,
     .webview_eval         = cocoa_webview_eval,
     .webview_set_bounds   = cocoa_webview_set_bounds,
+    .webview_set_script   = cocoa_webview_set_script,
     .webview_reply_head   = cocoa_webview_reply_head,
     .webview_reply_data   = cocoa_webview_reply_data,
     .webview_reply_end    = cocoa_webview_reply_end,

@@ -18,6 +18,10 @@
 
 #include "php.h"
 #include "zend_interfaces.h"
+#include "zend_smart_str.h"
+#include "ext/json/php_json.h"
+#include "ext/date/php_date.h"
+#include <time.h>
 #include "vio_webview.h"
 #include "vio_context.h"
 #include "../include/vio_platform.h"
@@ -32,7 +36,21 @@ typedef struct _vio_wv_stream {
     struct _vio_wv_stream *next;
 } vio_wv_stream;
 
+/* Cookie jar (WEBVIEW-PLAN decision 2): engines do not keep cookies for
+ * custom schemes (WKWebView keeps none at all), so vio does, the same on
+ * every engine: Set-Cookie of an answer goes here, not to the engine, and
+ * every request gets its Cookie header from here. Session-only. */
+typedef struct _vio_wv_cookie {
+    char    *name, *value, *host, *path;
+    double   expires;     /* unix time, 0 = session */
+    int      httponly;
+    uint64_t seq;         /* creation order */
+} vio_wv_cookie;
+
 typedef struct _vio_webview_object {
+    vio_wv_cookie *cookies;
+    int            cookie_count, cookie_cap;
+    uint64_t       cookie_seq;
     void          *handle;    /* platform webview; NULL once closed */
     void          *window;    /* its platform window */
     zend_object   *owner;     /* VioContext / VioWindow, referenced until the object goes */
@@ -161,6 +179,281 @@ static void wv_purge(vio_webview_object *wv)
     wv_queue_tail = last;
 }
 
+
+/* ── Cookie jar ───────────────────────────────────────────────────── */
+
+/* host (with port) and path of scheme://host/path?query */
+static void wv_url_parts(const char *url, char *host, size_t hcap, char *path, size_t pcap)
+{
+    const char *p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    size_t n = strcspn(p, "/?#");
+    snprintf(host, hcap, "%.*s", (int)n, p);
+    p += n;
+    size_t m = *p == '/' ? strcspn(p, "?#") : 0;
+    if (m) snprintf(path, pcap, "%.*s", (int)m, p);
+    else snprintf(path, pcap, "/");
+}
+
+static void wv_cookie_free(vio_wv_cookie *c)
+{
+    free(c->name); free(c->value); free(c->host); free(c->path);
+}
+
+static void wv_jar_clear(vio_webview_object *wv)
+{
+    for (int i = 0; i < wv->cookie_count; i++) wv_cookie_free(&wv->cookies[i]);
+    free(wv->cookies);
+    wv->cookies = NULL;
+    wv->cookie_count = wv->cookie_cap = 0;
+}
+
+static char *wv_trimdup(const char *s, size_t n)
+{
+    while (n && (*s == ' ' || *s == '\t')) { s++; n--; }
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
+    char *r = (char *)malloc(n + 1);
+    memcpy(r, s, n);
+    r[n] = '\0';
+    return r;
+}
+
+/* One Set-Cookie line (or a document.cookie assignment, from_js) for a
+ * request to host/path. 1 = the jar changed. */
+static int wv_jar_set(vio_webview_object *wv, const char *host, const char *req_path, const char *line, int from_js)
+{
+    size_t first = strcspn(line, ";");
+    const char *eq = memchr(line, '=', first);
+    if (!eq) return 0;
+    char *name = wv_trimdup(line, (size_t)(eq - line));
+    char *value = wv_trimdup(eq + 1, first - (size_t)(eq + 1 - line));
+    if (!*name) { free(name); free(value); return 0; }
+    char *path = NULL;
+    double expires = 0;
+    int httponly = 0, has_max_age = 0;
+    double now = (double)time(NULL);
+    const char *a = line + first;
+    while (*a == ';') {
+        a++;
+        size_t n = strcspn(a, ";");
+        const char *aeq = memchr(a, '=', n);
+        char *key = wv_trimdup(a, aeq ? (size_t)(aeq - a) : n);
+        char *val = aeq ? wv_trimdup(aeq + 1, n - (size_t)(aeq + 1 - a)) : strdup("");
+        if (strcasecmp(key, "path") == 0 && val[0] == '/') { free(path); path = strdup(val); }
+        else if (strcasecmp(key, "max-age") == 0 && *val) { has_max_age = 1; expires = now + strtod(val, NULL); if (expires <= now) expires = -1; }
+        else if (strcasecmp(key, "expires") == 0 && !has_max_age && *val) {
+            zend_long t = php_parse_date(val, NULL);
+            if (t != -1) expires = (double)t <= now ? -1 : (double)t;
+        }
+        else if (strcasecmp(key, "httponly") == 0) httponly = 1;
+        free(key);
+        free(val);
+        a += n;
+    }
+    if (!path) {   /* RFC 6265 5.1.4 default-path */
+        const char *slash = strrchr(req_path, '/');
+        path = slash && slash != req_path ? wv_trimdup(req_path, (size_t)(slash - req_path)) : strdup("/");
+    }
+    int changed = 0;
+    int found = -1;
+    for (int i = 0; i < wv->cookie_count; i++) {
+        vio_wv_cookie *c = &wv->cookies[i];
+        if (strcmp(c->name, name) == 0 && strcmp(c->host, host) == 0 && strcmp(c->path, path) == 0) { found = i; break; }
+    }
+    if (from_js && (httponly || (found >= 0 && wv->cookies[found].httponly))) goto done;   /* script cannot touch HttpOnly */
+    if (expires < 0) {
+        if (found >= 0) {
+            wv_cookie_free(&wv->cookies[found]);
+            wv->cookies[found] = wv->cookies[--wv->cookie_count];
+            changed = 1;
+        }
+        goto done;
+    }
+    if (found >= 0) {
+        vio_wv_cookie *c = &wv->cookies[found];
+        changed = strcmp(c->value, value) != 0 || c->httponly != httponly || c->expires != expires;
+        free(c->value);
+        c->value = value; value = NULL;
+        c->httponly = httponly;
+        c->expires = expires;
+        goto done;
+    }
+    if (wv->cookie_count == wv->cookie_cap) {
+        if (wv->cookie_cap >= 1024) goto done;
+        wv->cookie_cap = wv->cookie_cap ? wv->cookie_cap * 2 : 8;
+        wv->cookies = (vio_wv_cookie *)realloc(wv->cookies, (size_t)wv->cookie_cap * sizeof(vio_wv_cookie));
+    }
+    vio_wv_cookie *c = &wv->cookies[wv->cookie_count++];
+    c->name = name; name = NULL;
+    c->value = value; value = NULL;
+    c->host = strdup(host);
+    c->path = path; path = NULL;
+    c->expires = expires;
+    c->httponly = httponly;
+    c->seq = ++wv->cookie_seq;
+    changed = 1;
+done:
+    free(name); free(value); free(path);
+    return changed;
+}
+
+static int wv_path_match(const char *req, const char *cp)
+{
+    size_t n = strlen(cp);
+    if (strncmp(req, cp, n) != 0) return 0;
+    return req[n] == '\0' || cp[n - 1] == '/' || req[n] == '/';
+}
+
+static int wv_cookie_cmp(const void *a, const void *b)
+{
+    const vio_wv_cookie *x = *(vio_wv_cookie *const *)a, *y = *(vio_wv_cookie *const *)b;
+    size_t lx = strlen(x->path), ly = strlen(y->path);
+    if (lx != ly) return lx > ly ? -1 : 1;
+    return x->seq < y->seq ? -1 : x->seq > y->seq;
+}
+
+/* "a=1; b=2" for a request, NULL when no cookie applies (malloc'd) */
+static char *wv_jar_header(vio_webview_object *wv, const char *host, const char *path)
+{
+    if (!wv->cookie_count) return NULL;
+    double now = (double)time(NULL);
+    vio_wv_cookie **m = (vio_wv_cookie **)malloc((size_t)wv->cookie_count * sizeof(*m));
+    int n = 0;
+    for (int i = 0; i < wv->cookie_count; i++) {
+        vio_wv_cookie *c = &wv->cookies[i];
+        if (strcmp(c->host, host) != 0 || !wv_path_match(path, c->path)) continue;
+        if (c->expires > 0 && c->expires <= now) continue;
+        m[n++] = c;
+    }
+    char *out = NULL;
+    if (n) {
+        qsort(m, (size_t)n, sizeof(*m), wv_cookie_cmp);
+        smart_str s = {0};
+        for (int i = 0; i < n; i++) {
+            if (i) smart_str_appends(&s, "; ");
+            smart_str_appends(&s, m[i]->name);
+            smart_str_appendc(&s, '=');
+            smart_str_appends(&s, m[i]->value);
+        }
+        smart_str_0(&s);
+        out = strdup(ZSTR_VAL(s.s));
+        smart_str_free(&s);
+    }
+    free(m);
+    return out;
+}
+
+/* document.cookie on the custom-scheme pages: the cookies script may see
+ * (not HttpOnly), kept by the page and updated by vio; assignments go to the
+ * jar through window.__vioPost("\x01cookie:<url>\n<assignment>"). */
+static const char wv_cookie_shim[] =
+    "(function () {\n"
+    "  var schemes = %s, jar = %s;\n"
+    "  if (schemes.indexOf(location.protocol.slice(0, -1)) < 0 || !window.__vioPost) return;\n"
+    "  window.__vioCookies = function (j) { jar = j; };\n"
+    "  function match(c) {\n"
+    "    var p = location.pathname || '/';\n"
+    "    if (c.h !== location.host || (c.e && c.e * 1000 <= Date.now())) return false;\n"
+    "    return p === c.p || p.indexOf(c.p) === 0 && (c.p.slice(-1) === '/' || p.charAt(c.p.length) === '/');\n"
+    "  }\n"
+    "  Object.defineProperty(document, 'cookie', { configurable: true,\n"
+    "    get: function () {\n"
+    "      return jar.filter(match).sort(function (a, b) { return b.p.length - a.p.length || a.s - b.s; })\n"
+    "                .map(function (c) { return c.n + '=' + c.v; }).join('; ');\n"
+    "    },\n"
+    "    set: function (v) {\n"
+    "      v = String(v);\n"
+    "      var parts = v.split(';'), kv = parts[0], i = kv.indexOf('=');\n"
+    "      if (i < 0) return;\n"
+    "      var c = { n: kv.slice(0, i).trim(), v: kv.slice(i + 1).trim(), h: location.host, p: null, e: 0, s: Date.now() };\n"
+    "      var gone = false;\n"
+    "      for (var k = 1; k < parts.length; k++) {\n"
+    "        var a = parts[k], j = a.indexOf('='), key = (j < 0 ? a : a.slice(0, j)).trim().toLowerCase(), val = j < 0 ? '' : a.slice(j + 1).trim();\n"
+    "        if (key === 'httponly') return;\n"
+    "        if (key === 'path' && val.charAt(0) === '/') c.p = val;\n"
+    "        if (key === 'max-age' && val !== '') { var s = parseFloat(val); if (s <= 0) gone = true; else c.e = Date.now() / 1000 + s; }\n"
+    "        if (key === 'expires' && val !== '') { var t = Date.parse(val); if (!isNaN(t)) { if (t <= Date.now()) gone = true; else c.e = t / 1000; } }\n"
+    "      }\n"
+    "      if (!c.n) return;\n"
+    "      if (c.p === null) { var d = location.pathname || '/', l = d.lastIndexOf('/'); c.p = l > 0 ? d.slice(0, l) : '/'; }\n"
+    "      jar = jar.filter(function (o) { return !(o.n === c.n && o.h === c.h && o.p === c.p); });\n"
+    "      if (!gone) jar.push(c);\n"
+    "      window.__vioPost('\\u0001cookie:' + location.href + '\\n' + v);\n"
+    "    }\n"
+    "  });\n"
+    "})();\n";
+
+/* [{"n","v","h","p","e","s"}] of the cookies script may see */
+static zend_string *wv_jar_json(vio_webview_object *wv)
+{
+    zval arr;
+    array_init(&arr);
+    for (int i = 0; i < wv->cookie_count; i++) {
+        vio_wv_cookie *c = &wv->cookies[i];
+        if (c->httponly) continue;
+        zval o;
+        array_init(&o);
+        add_assoc_string(&o, "n", c->name);
+        add_assoc_string(&o, "v", c->value);
+        add_assoc_string(&o, "h", c->host);
+        add_assoc_string(&o, "p", c->path);
+        add_assoc_double(&o, "e", c->expires);
+        add_assoc_long(&o, "s", (zend_long)c->seq);
+        add_next_index_zval(&arr, &o);
+    }
+    smart_str buf = {0};
+    php_json_encode(&buf, &arr, PHP_JSON_UNESCAPED_SLASHES | PHP_JSON_HEX_TAG);
+    smart_str_0(&buf);
+    zval_ptr_dtor(&arr);
+    return buf.s;
+}
+
+static char *wv_shim_script(vio_webview_object *wv)
+{
+    zval names;
+    array_init(&names);
+    if (Z_TYPE(wv->schemes) == IS_ARRAY) {
+        zend_string *k;
+        ZEND_HASH_FOREACH_STR_KEY(Z_ARRVAL(wv->schemes), k) {
+            if (k) add_next_index_str(&names, zend_string_copy(k));
+        } ZEND_HASH_FOREACH_END();
+    }
+    smart_str sn = {0};
+    php_json_encode(&sn, &names, 0);
+    smart_str_0(&sn);
+    zval_ptr_dtor(&names);
+    zend_string *jar = wv_jar_json(wv);
+    size_t len = sizeof(wv_cookie_shim) + ZSTR_LEN(sn.s) + ZSTR_LEN(jar);
+    char *out = (char *)malloc(len);
+    snprintf(out, len, wv_cookie_shim, ZSTR_VAL(sn.s), ZSTR_VAL(jar));
+    smart_str_free(&sn);
+    zend_string_release(jar);
+    return out;
+}
+
+/* After the jar changed: the next documents start with it; live: the page too. */
+static void wv_jar_publish(vio_webview_object *wv, int live)
+{
+    if (!wv->handle) return;
+    const vio_platform *p = vio_plat();
+    if (p->webview_set_script) {
+        char *js = wv_shim_script(wv);
+        p->webview_set_script(wv->handle, js);
+        free(js);
+    }
+    if (live) {
+        zend_string *jar = wv_jar_json(wv);
+        smart_str s = {0};
+        smart_str_appends(&s, "window.__vioCookies && window.__vioCookies(");
+        smart_str_append(&s, jar);
+        smart_str_appends(&s, ");");
+        smart_str_0(&s);
+        p->webview_eval(wv->handle, ZSTR_VAL(s.s));
+        smart_str_free(&s);
+        zend_string_release(jar);
+    }
+}
+
 /* ── Object ───────────────────────────────────────────────────────── */
 
 static void wv_stream_free(vio_wv_stream *s)
@@ -203,6 +496,9 @@ static zend_object *vio_webview_create_object(zend_class_entry *ce)
 {
     vio_webview_object *wv = zend_object_alloc(sizeof(vio_webview_object), ce);
     wv->handle = wv->window = NULL;
+    wv->cookies = NULL;
+    wv->cookie_count = wv->cookie_cap = 0;
+    wv->cookie_seq = 0;
     wv->owner = NULL;
     wv->streams = NULL;
     wv->next = NULL;
@@ -220,6 +516,7 @@ static void vio_webview_free_object(zend_object *obj)
     vio_webview_object *wv = vio_webview_from_obj(obj);
     vio_webview_close(wv);
     wv_purge(wv);   /* events requeued after an exception may still name it */
+    wv_jar_clear(wv);
     zval_ptr_dtor(&wv->schemes);
     zval_ptr_dtor(&wv->on_message);
     zval_ptr_dtor(&wv->on_event);
@@ -289,7 +586,7 @@ static void wv_reply_simple(vio_webview_object *wv, uint64_t id, int status, con
 }
 
 /* The callback's answer: array (status, headers, body) or a string body. */
-static void wv_reply(vio_webview_object *wv, uint64_t id, zval *ret)
+static void wv_reply(vio_webview_object *wv, uint64_t id, zval *ret, const char *url)
 {
     const vio_platform *p = vio_plat();
     if (Z_TYPE_P(ret) == IS_STRING) {
@@ -319,9 +616,26 @@ static void wv_reply(vio_webview_object *wv, uint64_t id, zval *ret)
         keep = (zend_string **)ecalloc(cap * 2, sizeof(zend_string *));
         zend_string *name;
         zval *hv;
-        int kc = 0;
+        int kc = 0, jar_changed = 0;
+        char host[256], path[1024];
+        wv_url_parts(url, host, sizeof(host), path, sizeof(path));
         ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(v), name, hv) {
             if (!name) continue;
+            if (strcasecmp(ZSTR_VAL(name), "set-cookie") == 0) {   /* into vio's jar, not the engine's */
+                if (Z_TYPE_P(hv) == IS_ARRAY) {
+                    zval *one;
+                    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(hv), one) {
+                        zend_string *line = zval_get_string(one);
+                        jar_changed |= wv_jar_set(wv, host, path, ZSTR_VAL(line), 0);
+                        zend_string_release(line);
+                    } ZEND_HASH_FOREACH_END();
+                } else {
+                    zend_string *line = zval_get_string(hv);
+                    jar_changed |= wv_jar_set(wv, host, path, ZSTR_VAL(line), 0);
+                    zend_string_release(line);
+                }
+                continue;
+            }
             if (Z_TYPE_P(hv) == IS_ARRAY) {   /* several values: one header line each (Set-Cookie) */
                 zval *one;
                 ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(hv), one) {
@@ -338,6 +652,7 @@ static void wv_reply(vio_webview_object *wv, uint64_t id, zval *ret)
                 hs[hc++].value = ZSTR_VAL(s);
             }
         } ZEND_HASH_FOREACH_END();
+        if (jar_changed) wv_jar_publish(wv, 1);   /* before the answer: the page sees the cookies when it gets it */
         p->webview_reply_head(wv->handle, id, status, hs, hc);
         for (int i = 0; i < kc; i++) zend_string_release(keep[i]);
         efree(keep);
@@ -404,8 +719,13 @@ static void wv_deliver_request(vio_wv_event *e)
     for (int i = 0; i < e->header_count; i++) {
         const char *name = p; p += strlen(p) + 1;
         const char *value = p; p += strlen(p) + 1;
+        if (strcasecmp(name, "cookie") == 0) continue;   /* vio's jar answers for cookies */
         add_assoc_string(&headers, name, value);
     }
+    char host[256], path[1024];
+    wv_url_parts(e->url, host, sizeof(host), path, sizeof(path));
+    char *cookie = wv_jar_header(wv, host, path);
+    if (cookie) { add_assoc_string(&headers, "Cookie", cookie); free(cookie); }
     add_assoc_zval(&req, "headers", &headers);
     add_assoc_stringl(&req, "body", e->body, e->body_len);
 
@@ -415,7 +735,7 @@ static void wv_deliver_request(vio_wv_event *e)
     zval_ptr_dtor(&req);
     if (wv->handle) {
         if (EG(exception) || !ok) wv_reply_simple(wv, e->id, 500, "scheme callback failed");
-        else wv_reply(wv, e->id, &ret);
+        else wv_reply(wv, e->id, &ret, e->url);
     }
     zval_ptr_dtor(&ret);
     OBJ_RELEASE(&wv->std);
@@ -444,6 +764,21 @@ static void wv_deliver(vio_wv_event *e)
         wv_drop_stream(wv, e->id);
         break;
     case WV_EV_MESSAGE:
+        if (e->body_len >= 8 && memcmp(e->body, "\x01" "cookie:", 8) == 0) {   /* document.cookie = ... */
+            char *msg = (char *)malloc(e->body_len - 7);
+            memcpy(msg, e->body + 8, e->body_len - 8);
+            msg[e->body_len - 8] = '\0';
+            char *nl = strchr(msg, '\n');
+            if (nl) {
+                *nl = '\0';
+                char host[256], path[1024];
+                wv_url_parts(msg, host, sizeof(host), path, sizeof(path));
+                if (wv_jar_set(wv, host, path, nl + 1, 1)) wv_jar_publish(wv, 0);
+            }
+            free(msg);
+            break;
+        }
+        if (e->body_len && e->body[0] == '\x01') break;   /* other vio-internal messages */
         if (Z_TYPE(wv->on_message) != IS_UNDEF) {
             zval arg, ret;
             ZVAL_STRINGL(&arg, e->body, e->body_len);
@@ -690,7 +1025,10 @@ ZEND_FUNCTION(vio_webview)
     ZVAL_COPY_VALUE(&wv->schemes, &schemes);
     if (Z_TYPE(wv->schemes) == IS_UNDEF) array_init(&wv->schemes);
     d.user = wv;
+    char *script = wv_shim_script(wv);
+    d.script = script;
     wv->handle = vio_plat()->webview_create(ctx->window, &d);
+    free(script);
     if (!wv->handle) {
         zval_ptr_dtor(return_value);
         RETURN_FALSE;
