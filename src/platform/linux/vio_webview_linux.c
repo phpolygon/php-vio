@@ -39,8 +39,16 @@
 #include <unistd.h>
 #include <signal.h>
 
+#include <time.h>
+#include <sys/mman.h>
+#include <stdint.h>
+
 #ifdef HAVE_X11
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#endif
+#ifdef HAVE_WAYLAND
+#include <wayland-client.h>
 #endif
 
 /* ── Just enough GLib / GTK / WebKit to call them through pointers ── */
@@ -405,6 +413,23 @@ static void wvl_gtk_place(wvl_view *v, int x, int y, int w, int h)
     (void)x; (void)y;
 }
 
+#ifdef HAVE_X11
+/* The GTK window inside vio's is override-redirect: no window manager gives
+ * it the keyboard. A click into it takes it; a click into vio's window (see
+ * vio_wvl_x11_event) gives it back. */
+static gboolean wvl_gtk_pressed(void *widget, void *event, gpointer data)
+{
+    wvl_view *v = (wvl_view *)data;
+    (void)widget; (void)event;
+    Display *dpy = (Display *)vio_plat()->native_handle(v->win, VIO_NATIVE_XLIB_DISPLAY);
+    if (dpy && v->xid) {
+        XSetInputFocus(dpy, (Window)v->xid, RevertToParent, CurrentTime);
+        XFlush(dpy);
+    }
+    return 0;
+}
+#endif
+
 static int wvl_gtk_create(wvl_view *v, const vio_webview_desc *d)
 {
     v->view = gl.g_object_new(gl.webkit_web_view_get_type(), "web-context", v->ctx, "user-content-manager", v->ucm, NULL);
@@ -425,6 +450,7 @@ static int wvl_gtk_create(wvl_view *v, const vio_webview_desc *d)
             v->xid = gdk_x11_window_get_xid_p(gdkwin);
             XReparentWindow(dpy, (Window)v->xid, parent, 0, 0);
             XFlush(dpy);
+            gl.g_signal_connect_data(v->view, "button-press-event", (GCallback)wvl_gtk_pressed, v, NULL, 0);
         }
     }
 #endif
@@ -438,11 +464,13 @@ static void wvl_gtk_destroy(wvl_view *v)
     v->gtk_window = NULL;
 }
 
-/* ── Hosting: WPE (filled in below) ──────────────────────────────── */
+/* ── Hosting: WPE (below) ───────────────────────────────────────── */
 
 static int  wvl_wpe_create(wvl_view *v, const vio_webview_desc *d);
 static void wvl_wpe_destroy(wvl_view *v);
 static void wvl_wpe_place(wvl_view *v, int x, int y, int w, int h);
+static void wvl_wpe_frames(void);
+static int  wvl_wpe_frames_pending(void);
 
 /* ── Layout: bounds, or the client area ─────────────────────────── */
 
@@ -539,7 +567,7 @@ void vio_wvl_destroy(void *p)
     }
     if (wvl_engine == WVL_GTK) wvl_gtk_destroy(v);
     else wvl_wpe_destroy(v);
-    gl.g_object_unref(v->view);
+    if (v->view) gl.g_object_unref(v->view);
     gl.g_object_unref(v->ucm);
     gl.g_object_unref(v->ctx);
     free(v->title);
@@ -774,6 +802,7 @@ int vio_wvl_poll_begin(struct pollfd *fds, int n, int max, int *timeout_ms)
     }
     if (gtimeout >= 0 && (*timeout_ms < 0 || gtimeout < *timeout_ms)) *timeout_ms = gtimeout;
     if (wvl_pending_writes() && (*timeout_ms < 0 || *timeout_ms > 10)) *timeout_ms = 10;
+    if (wvl_wpe_frames_pending() && (*timeout_ms < 0 || *timeout_ms > 16)) *timeout_ms = 16;   /* acknowledge frames */
     return n;
 }
 
@@ -804,18 +833,559 @@ void vio_wvl_pump(void)
             else if (r->fd >= 0 && (r->len == 0 || wvl_flush(v, r)) && r->ended) wvl_req_free(v, r);
         }
     }
+    wvl_wpe_frames();
     wvl_gl_restore(&st);
 }
 
-/* ── WPE ────────────────────────────────────────────────────────── */
+/* ── WPE ────────────────────────────────────────────────────────────
+ * libWPEWebKit-2.0 with the WPEBackend-fdo "exportable" view backend in
+ * shared-memory mode: WebKit renders in its own process, every frame arrives
+ * here as a wl_shm buffer (export_shm_buffer). vio copies it and shows it -
+ * X11: a child window of vio's window (XPutImage), Wayland: a subsurface of
+ * vio's surface (wl_shm buffers of our own) - headless nowhere. Frames are
+ * acknowledged at the next pump, so WebKit renders at most as fast as the
+ * app polls. Input goes the other way: the platforms hand the events of the
+ * webview's window / surface to vio_wvl_x11_event / vio_wvl_wl_*, which pass
+ * them on as wpe_input_* events (keys as keysyms; WPE types the text). */
 
-static int wvl_load_wpe(void) { return 0; }   /* next step */
-static int  wvl_wpe_create(wvl_view *v, const vio_webview_desc *d) { (void)v; (void)d; return 0; }
-static void wvl_wpe_destroy(wvl_view *v) { (void)v; }
-static void wvl_wpe_place(wvl_view *v, int x, int y, int w, int h) { (void)v; (void)x; (void)y; (void)w; (void)h; }
+#define WVL_WPE_SYMS(X) \
+    X(void *, webkit_web_view_backend_new, (void *, GDestroyNotify, gpointer)) \
+    X(gboolean, wpe_loader_init, (const char *)) \
+    X(void, wpe_view_backend_dispatch_set_size, (void *, uint32_t, uint32_t)) \
+    X(void, wpe_view_backend_dispatch_set_device_scale_factor, (void *, float)) \
+    X(void, wpe_view_backend_add_activity_state, (void *, uint32_t)) \
+    X(void, wpe_view_backend_remove_activity_state, (void *, uint32_t)) \
+    X(void, wpe_view_backend_dispatch_keyboard_event, (void *, void *)) \
+    X(void, wpe_view_backend_dispatch_pointer_event, (void *, void *)) \
+    X(void, wpe_view_backend_dispatch_axis_event, (void *, void *))
+
+#define WVL_FDO_SYMS(X) \
+    X(gboolean, wpe_fdo_initialize_shm, (void)) \
+    X(void *, wpe_view_backend_exportable_fdo_create, (const void *, void *, uint32_t, uint32_t)) \
+    X(void, wpe_view_backend_exportable_fdo_destroy, (void *)) \
+    X(void *, wpe_view_backend_exportable_fdo_get_view_backend, (void *)) \
+    X(void, wpe_view_backend_exportable_fdo_dispatch_frame_complete, (void *)) \
+    X(void, wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer, (void *, void *)) \
+    X(void *, wpe_fdo_shm_exported_buffer_get_shm_buffer, (void *)) \
+    X(void, wl_shm_buffer_begin_access, (void *)) \
+    X(void, wl_shm_buffer_end_access, (void *)) \
+    X(void *, wl_shm_buffer_get_data, (void *)) \
+    X(int32_t, wl_shm_buffer_get_stride, (void *)) \
+    X(int32_t, wl_shm_buffer_get_width, (void *)) \
+    X(int32_t, wl_shm_buffer_get_height, (void *))
+
+static struct { WVL_WPE_SYMS(WVL_DECL) } wp;
+static struct { WVL_FDO_SYMS(WVL_DECL) } fdo;
+
+/* libwpe 1.x input structs and constants */
+typedef struct { uint32_t time, key_code, hardware_key_code; _Bool pressed; uint32_t modifiers; } wvl_wpe_key;
+typedef struct { int type; uint32_t time; int x, y; uint32_t button, state, modifiers; } wvl_wpe_pointer;
+typedef struct { int type; uint32_t time; int x, y; uint32_t axis; int32_t value; uint32_t modifiers; } wvl_wpe_axis;
+typedef struct { wvl_wpe_axis base; double x_axis, y_axis; } wvl_wpe_axis_2d;
+#define WVL_WPE_POINTER_MOTION 1
+#define WVL_WPE_POINTER_BUTTON 2
+#define WVL_WPE_AXIS_SMOOTH_2D (2 | (1 << 16))
+#define WVL_WPE_MOD_CONTROL (1u << 0)
+#define WVL_WPE_MOD_SHIFT   (1u << 1)
+#define WVL_WPE_MOD_ALT     (1u << 2)
+#define WVL_WPE_MOD_META    (1u << 3)
+#define WVL_WPE_MOD_BUTTON1 (1u << 20)
+#define WVL_WPE_VISIBLE   (1u << 0)
+#define WVL_WPE_FOCUSED   (1u << 1)
+#define WVL_WPE_IN_WINDOW (1u << 2)
+
+typedef struct {
+    void          *exportable, *backend;
+    unsigned char *pixels;            /* the last frame, BGRA premultiplied (WL_SHM_FORMAT_ARGB8888) */
+    int            pw, ph, pstride;
+    int            frame_pending;     /* acknowledge at the next pump */
+    int            scale;
+    int            focused;
+    uint32_t       buttons;           /* WVL_WPE_MOD_BUTTON* held */
+    int            px, py;            /* last pointer position, logical */
+#ifdef HAVE_X11
+    unsigned long  xwin;
+#endif
+#ifdef HAVE_WAYLAND
+    struct wl_surface    *surf;
+    struct wl_subsurface *sub;
+    struct { struct wl_buffer *buf; void *map; size_t size; int w, h, busy; } wb[2];
+#endif
+} wvl_wpe_host;
+
+#define WPE(v) ((wvl_wpe_host *)(v)->wpe)
+
+static int wvl_load_wpe(void)
+{
+    void *h = dlopen("libWPEWebKit-2.0.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!h) return 0;
+    void *f = dlopen("libWPEBackend-fdo-1.0.so.1", RTLD_NOW | RTLD_LOCAL);
+    int ok = f && wvl_load_common(h);
+#define WVL_BIND_WPE(ret, name, args) ok &= wvl_bind(h, #name, (void **)&wp.name);
+#define WVL_BIND_FDO(ret, name, args) ok &= wvl_bind(f, #name, (void **)&fdo.name);
+    if (ok) { WVL_WPE_SYMS(WVL_BIND_WPE) }
+    if (ok) { WVL_FDO_SYMS(WVL_BIND_FDO) }
+    if (ok) ok = wp.wpe_loader_init("libWPEBackend-fdo-1.0.so.1") && fdo.wpe_fdo_initialize_shm();
+    if (!ok) {
+        if (f) dlclose(f);
+        dlclose(h);
+        memset(&gl, 0, sizeof(gl));
+        return 0;
+    }
+    wvl_lib = h;
+    return 1;
+}
+
+static int wvl_is_wayland(void) { return strcmp(vio_plat()->name, "wayland") == 0; }
+
+#ifdef HAVE_WAYLAND
+/* our own globals on vio's connection: a subsurface and shm buffers of ours */
+static struct { struct wl_compositor *comp; struct wl_subcompositor *subcomp; struct wl_shm *shm; int bound; } wwl;
+
+static void wwl_global(void *data, struct wl_registry *r, uint32_t id, const char *iface, uint32_t version)
+{
+    (void)data;
+    if (strcmp(iface, wl_compositor_interface.name) == 0) wwl.comp = wl_registry_bind(r, id, &wl_compositor_interface, version < 4 ? version : 4);
+    else if (strcmp(iface, wl_subcompositor_interface.name) == 0) wwl.subcomp = wl_registry_bind(r, id, &wl_subcompositor_interface, 1);
+    else if (strcmp(iface, wl_shm_interface.name) == 0) wwl.shm = wl_registry_bind(r, id, &wl_shm_interface, 1);
+}
+static void wwl_global_remove(void *data, struct wl_registry *r, uint32_t id) { (void)data; (void)r; (void)id; }
+static const struct wl_registry_listener wwl_registry_listener = { wwl_global, wwl_global_remove };
+
+static void wwl_bind(struct wl_display *dpy)
+{
+    if (wwl.bound) return;
+    wwl.bound = 1;
+    struct wl_registry *r = wl_display_get_registry(dpy);
+    wl_registry_add_listener(r, &wwl_registry_listener, NULL);
+    wl_display_roundtrip(dpy);
+}
+
+static void wwl_release(void *data, struct wl_buffer *b)
+{
+    int *busy = (int *)data;
+    (void)b;
+    *busy = 0;
+}
+static const struct wl_buffer_listener wwl_buffer_listener = { wwl_release };
+
+static void wvl_wl_present(wvl_view *v)
+{
+    wvl_wpe_host *w = WPE(v);
+    if (!w->surf || !w->pixels || !wwl.shm) return;
+    int i = w->wb[0].busy ? (w->wb[1].busy ? -1 : 1) : 0;
+    if (i < 0) return;   /* both still with the compositor: the next frame shows it */
+    size_t size = (size_t)w->pstride * (size_t)w->ph;
+    if (!w->wb[i].buf || w->wb[i].w != w->pw || w->wb[i].h != w->ph) {
+        if (w->wb[i].buf) { wl_buffer_destroy(w->wb[i].buf); munmap(w->wb[i].map, w->wb[i].size); }
+        w->wb[i].buf = NULL;
+        int fd = memfd_create("vio-webview", MFD_CLOEXEC);
+        if (fd < 0 || ftruncate(fd, (off_t)size) != 0) { if (fd >= 0) close(fd); return; }
+        void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED) { close(fd); return; }
+        struct wl_shm_pool *pool = wl_shm_create_pool(wwl.shm, fd, (int32_t)size);
+        w->wb[i].buf = wl_shm_pool_create_buffer(pool, 0, w->pw, w->ph, w->pstride, WL_SHM_FORMAT_ARGB8888);
+        wl_shm_pool_destroy(pool);
+        close(fd);
+        wl_buffer_add_listener(w->wb[i].buf, &wwl_buffer_listener, &w->wb[i].busy);
+        w->wb[i].map = map;
+        w->wb[i].size = size;
+        w->wb[i].w = w->pw;
+        w->wb[i].h = w->ph;
+    }
+    memcpy(w->wb[i].map, w->pixels, size);
+    w->wb[i].busy = 1;
+    wl_surface_set_buffer_scale(w->surf, w->scale);
+    wl_surface_attach(w->surf, w->wb[i].buf, 0, 0);
+    wl_surface_damage(w->surf, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_commit(w->surf);
+    struct wl_surface *parent = (struct wl_surface *)vio_plat()->native_handle(v->win, VIO_NATIVE_WAYLAND_SURFACE);
+    if (parent) wl_surface_commit(parent);   /* a subsurface's position applies with its parent's commit */
+}
+#endif
 
 #ifdef HAVE_X11
-int vio_wvl_x11_event(void *xevent) { (void)xevent; return 0; }
+static void wvl_x11_present(wvl_view *v)
+{
+    wvl_wpe_host *w = WPE(v);
+    if (!w->xwin || !w->pixels) return;
+    Display *dpy = (Display *)vio_plat()->native_handle(v->win, VIO_NATIVE_XLIB_DISPLAY);
+    if (!dpy) return;
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, (Window)w->xwin, &wa)) return;
+    XImage *img = XCreateImage(dpy, wa.visual, (unsigned)wa.depth, ZPixmap, 0, (char *)w->pixels,
+                               (unsigned)w->pw, (unsigned)w->ph, 32, w->pstride);
+    if (!img) return;
+    GC gc = XCreateGC(dpy, (Window)w->xwin, 0, NULL);
+    XPutImage(dpy, (Window)w->xwin, gc, img, 0, 0, 0, 0, (unsigned)w->pw, (unsigned)w->ph);
+    XFreeGC(dpy, gc);
+    img->data = NULL;   /* ours */
+    XDestroyImage(img);
+    XFlush(dpy);
+}
+#endif
+
+static void wvl_wpe_present(wvl_view *v)
+{
+#ifdef HAVE_X11
+    if (!wvl_is_wayland()) wvl_x11_present(v);
+#endif
+#ifdef HAVE_WAYLAND
+    if (wvl_is_wayland()) wvl_wl_present(v);
+#endif
+    (void)v;
+}
+
+static void wvl_wpe_export_shm(void *data, void *exported)
+{
+    wvl_view *v = (wvl_view *)data;
+    wvl_wpe_host *w = WPE(v);
+    void *shm = fdo.wpe_fdo_shm_exported_buffer_get_shm_buffer(exported);
+    fdo.wl_shm_buffer_begin_access(shm);
+    int bw = fdo.wl_shm_buffer_get_width(shm), bh = fdo.wl_shm_buffer_get_height(shm), stride = fdo.wl_shm_buffer_get_stride(shm);
+    if (bw != w->pw || bh != w->ph || stride != w->pstride) {
+        free(w->pixels);
+        w->pixels = (unsigned char *)malloc((size_t)stride * (size_t)bh);
+        w->pw = bw; w->ph = bh; w->pstride = stride;
+    }
+    if (w->pixels) memcpy(w->pixels, fdo.wl_shm_buffer_get_data(shm), (size_t)stride * (size_t)bh);
+    fdo.wl_shm_buffer_end_access(shm);
+    fdo.wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(w->exportable, exported);
+    w->frame_pending = 1;
+    if (!v->headless) wvl_wpe_present(v);
+}
+
+static void wvl_wpe_export_resource(void *data, void *res) { (void)data; (void)res; }
+static void wvl_wpe_export_dmabuf(void *data, void *res) { (void)data; (void)res; }
+
+static const struct {
+    void (*export_buffer_resource)(void *, void *);
+    void (*export_dmabuf_resource)(void *, void *);
+    void (*export_shm_buffer)(void *, void *);
+    void (*reserved0)(void);
+    void (*reserved1)(void);
+} wvl_wpe_client = { wvl_wpe_export_resource, wvl_wpe_export_dmabuf, wvl_wpe_export_shm, NULL, NULL };
+
+static void wvl_wpe_backend_gone(gpointer data) { (void)data; }
+
+static int wvl_wpe_scale(wvl_view *v)
+{
+    float sx = 1.0f, sy = 1.0f;
+    if (!v->headless && vio_plat()->get_content_scale) vio_plat()->get_content_scale(v->win, &sx, &sy);
+    int s = (int)(sx + 0.5f);
+    return s < 1 ? 1 : s;
+}
+
+static int wvl_wpe_create(wvl_view *v, const vio_webview_desc *d)
+{
+    (void)d;
+    wvl_wpe_host *w = (wvl_wpe_host *)calloc(1, sizeof(wvl_wpe_host));
+    v->wpe = w;
+    w->scale = wvl_wpe_scale(v);
+    int lw = v->has_bounds ? v->w : 1, lh = v->has_bounds ? v->h : 1;
+    if (!v->has_bounds) vio_plat()->get_window_size(v->win, &lw, &lh);
+    if (lw < 1) lw = 1;
+    if (lh < 1) lh = 1;
+    w->exportable = fdo.wpe_view_backend_exportable_fdo_create(&wvl_wpe_client, v, (uint32_t)lw, (uint32_t)lh);
+    if (!w->exportable) { free(w); v->wpe = NULL; return 0; }
+    w->backend = fdo.wpe_view_backend_exportable_fdo_get_view_backend(w->exportable);
+    void *vb = wp.webkit_web_view_backend_new(w->backend, wvl_wpe_backend_gone, NULL);
+    v->view = gl.g_object_new(gl.webkit_web_view_get_type(), "backend", vb, "web-context", v->ctx,
+                              "user-content-manager", v->ucm, NULL);
+    if (!v->view) {
+        fdo.wpe_view_backend_exportable_fdo_destroy(w->exportable);
+        free(w);
+        v->wpe = NULL;
+        return 0;
+    }
+    wp.wpe_view_backend_dispatch_set_device_scale_factor(w->backend, (float)w->scale);
+    wp.wpe_view_backend_add_activity_state(w->backend, WVL_WPE_VISIBLE | WVL_WPE_IN_WINDOW);
+    if (v->headless) return 1;
+#ifdef HAVE_X11
+    if (!wvl_is_wayland()) {
+        Display *dpy = (Display *)vio_plat()->native_handle(v->win, VIO_NATIVE_XLIB_DISPLAY);
+        Window parent = (Window)(uintptr_t)vio_plat()->native_handle(v->win, VIO_NATIVE_XLIB_WINDOW);
+        if (dpy && parent) {
+            XSetWindowAttributes a;
+            a.event_mask = ButtonPressMask | ButtonReleaseMask | PointerMotionMask | KeyPressMask | KeyReleaseMask |
+                           ExposureMask | FocusChangeMask | EnterWindowMask | LeaveWindowMask;
+            a.background_pixel = 0;
+            w->xwin = XCreateWindow(dpy, parent, 0, 0, (unsigned)lw, (unsigned)lh, 0, CopyFromParent, InputOutput,
+                                    CopyFromParent, CWEventMask | CWBackPixel, &a);
+            XMapWindow(dpy, (Window)w->xwin);
+            XFlush(dpy);
+        }
+    }
+#endif
+#ifdef HAVE_WAYLAND
+    if (wvl_is_wayland()) {
+        struct wl_display *dpy = (struct wl_display *)vio_plat()->native_handle(v->win, VIO_NATIVE_WAYLAND_DISPLAY);
+        struct wl_surface *parent = (struct wl_surface *)vio_plat()->native_handle(v->win, VIO_NATIVE_WAYLAND_SURFACE);
+        if (dpy && parent) wwl_bind(dpy);
+        if (dpy && parent && wwl.comp && wwl.subcomp && wwl.shm) {
+            w->surf = wl_compositor_create_surface(wwl.comp);
+            wl_surface_set_user_data(w->surf, NULL);   /* the platform's listeners see "not a vio window" */
+            w->sub = wl_subcompositor_get_subsurface(wwl.subcomp, w->surf, parent);
+            wl_subsurface_set_desync(w->sub);
+            wl_subsurface_place_above(w->sub, parent);
+        }
+    }
+#endif
+    return 1;
+}
+
+static void wvl_wpe_destroy(wvl_view *v)
+{
+    wvl_wpe_host *w = WPE(v);
+    if (!w) return;
+#ifdef HAVE_X11
+    if (w->xwin) {
+        Display *dpy = (Display *)vio_plat()->native_handle(v->win, VIO_NATIVE_XLIB_DISPLAY);
+        if (dpy) { XDestroyWindow(dpy, (Window)w->xwin); XFlush(dpy); }
+    }
+#endif
+#ifdef HAVE_WAYLAND
+    for (int i = 0; i < 2; i++) if (w->wb[i].buf) { wl_buffer_destroy(w->wb[i].buf); munmap(w->wb[i].map, w->wb[i].size); }
+    if (w->sub) wl_subsurface_destroy(w->sub);
+    if (w->surf) wl_surface_destroy(w->surf);
+#endif
+    /* the view before the exportable: WebKit holds the backend until the view is finalized */
+    gl.g_object_unref(v->view);
+    v->view = NULL;
+    fdo.wpe_view_backend_exportable_fdo_destroy(w->exportable);
+    free(w->pixels);
+    free(w);
+    v->wpe = NULL;
+}
+
+static void wvl_wpe_place(wvl_view *v, int x, int y, int lw, int lh)
+{
+    wvl_wpe_host *w = WPE(v);
+    if (!w) return;
+    int s = wvl_wpe_scale(v);
+    if (s != w->scale) { w->scale = s; wp.wpe_view_backend_dispatch_set_device_scale_factor(w->backend, (float)s); }
+    wp.wpe_view_backend_dispatch_set_size(w->backend, (uint32_t)lw, (uint32_t)lh);
+#ifdef HAVE_X11
+    if (w->xwin) {
+        Display *dpy = (Display *)vio_plat()->native_handle(v->win, VIO_NATIVE_XLIB_DISPLAY);
+        if (dpy) { XMoveResizeWindow(dpy, (Window)w->xwin, x, y, (unsigned)lw, (unsigned)lh); XFlush(dpy); }
+    }
+#endif
+#ifdef HAVE_WAYLAND
+    if (w->sub) wl_subsurface_set_position(w->sub, x, y);
+#endif
+    (void)x; (void)y;
+}
+
+/* the pump acknowledges shown frames: WebKit draws the next one */
+static void wvl_wpe_frames(void)
+{
+    if (wvl_engine != WVL_WPE) return;
+    for (wvl_view *v = wvl_views; v; v = v->next) {
+        wvl_wpe_host *w = WPE(v);
+        if (w && w->frame_pending) {
+            w->frame_pending = 0;
+            fdo.wpe_view_backend_exportable_fdo_dispatch_frame_complete(w->exportable);
+        }
+    }
+}
+
+static int wvl_wpe_frames_pending(void)
+{
+    if (wvl_engine != WVL_WPE) return 0;
+    for (wvl_view *v = wvl_views; v; v = v->next) if (WPE(v) && WPE(v)->frame_pending) return 1;
+    return 0;
+}
+
+static uint32_t wvl_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+static void wvl_wpe_pointer_ev(wvl_view *v, int type, int x, int y, uint32_t button, int pressed, uint32_t mods)
+{
+    wvl_wpe_host *w = WPE(v);
+    if (type == WVL_WPE_POINTER_BUTTON && button == 1) {
+        if (pressed) w->buttons |= WVL_WPE_MOD_BUTTON1; else w->buttons &= ~WVL_WPE_MOD_BUTTON1;
+    }
+    w->px = x; w->py = y;
+    wvl_wpe_pointer e = { type, wvl_now_ms(), x, y, button, (uint32_t)pressed, mods | w->buttons };
+    wp.wpe_view_backend_dispatch_pointer_event(w->backend, &e);
+}
+
+static void wvl_wpe_scroll(wvl_view *v, double dx, double dy, uint32_t mods)
+{
+    wvl_wpe_host *w = WPE(v);
+    wvl_wpe_axis_2d e;
+    memset(&e, 0, sizeof(e));
+    e.base.type = WVL_WPE_AXIS_SMOOTH_2D;
+    e.base.time = wvl_now_ms();
+    e.base.x = w->px;
+    e.base.y = w->py;
+    e.base.modifiers = mods;
+    e.x_axis = dx;
+    e.y_axis = dy;
+    wp.wpe_view_backend_dispatch_axis_event(w->backend, &e);
+}
+
+static void wvl_wpe_key_ev(wvl_view *v, uint32_t keysym, uint32_t hw, int pressed, uint32_t mods)
+{
+    wvl_wpe_key e = { wvl_now_ms(), keysym, hw, pressed != 0, mods };
+    wp.wpe_view_backend_dispatch_keyboard_event(WPE(v)->backend, &e);
+}
+
+static void wvl_wpe_focus(wvl_view *v, int focused)
+{
+    wvl_wpe_host *w = WPE(v);
+    if (w->focused == focused) return;
+    w->focused = focused;
+    if (focused) wp.wpe_view_backend_add_activity_state(w->backend, WVL_WPE_FOCUSED);
+    else wp.wpe_view_backend_remove_activity_state(w->backend, WVL_WPE_FOCUSED);
+}
+
+#ifdef HAVE_X11
+static uint32_t wvl_x11_mods(unsigned int state)
+{
+    uint32_t m = 0;
+    if (state & ControlMask) m |= WVL_WPE_MOD_CONTROL;
+    if (state & ShiftMask) m |= WVL_WPE_MOD_SHIFT;
+    if (state & Mod1Mask) m |= WVL_WPE_MOD_ALT;
+    if (state & Mod4Mask) m |= WVL_WPE_MOD_META;
+    return m;
+}
+
+int vio_wvl_x11_event(void *xevent)
+{
+    XEvent *ev = (XEvent *)xevent;
+    if (wvl_engine == WVL_GTK && ev->type == ButtonPress) {
+        /* a click into vio's window takes the keyboard back from a GTK webview in it */
+        for (wvl_view *o = wvl_views; o; o = o->next) {
+            if (o->xid && (Window)(uintptr_t)vio_plat()->native_handle(o->win, VIO_NATIVE_XLIB_WINDOW) == ev->xany.window) {
+                XSetInputFocus(ev->xany.display, ev->xany.window, RevertToParent, CurrentTime);
+                break;
+            }
+        }
+        return 0;
+    }
+    if (wvl_engine != WVL_WPE) return 0;
+    wvl_view *v = wvl_views;
+    while (v && !(WPE(v) && WPE(v)->xwin == ev->xany.window)) v = v->next;
+    if (!v) {
+        /* a click into vio's own window takes the keyboard back from a webview */
+        if (ev->type == ButtonPress) {
+            for (wvl_view *o = wvl_views; o; o = o->next) {
+                if (!WPE(o) || !WPE(o)->focused) continue;
+                wvl_wpe_focus(o, 0);
+                XSetInputFocus(ev->xany.display, ev->xany.window, RevertToParent, CurrentTime);
+            }
+        }
+        return 0;
+    }
+    switch (ev->type) {
+    case Expose:
+        if (ev->xexpose.count == 0) wvl_x11_present(v);
+        break;
+    case MotionNotify:
+        wvl_wpe_pointer_ev(v, WVL_WPE_POINTER_MOTION, ev->xmotion.x, ev->xmotion.y, 0, 0, wvl_x11_mods(ev->xmotion.state));
+        break;
+    case ButtonPress:
+    case ButtonRelease: {
+        unsigned b = ev->xbutton.button;
+        uint32_t mods = wvl_x11_mods(ev->xbutton.state);
+        if (b >= 4 && b <= 7) {   /* wheels: one notch = one line of 40 pixels, positive down / right as Wayland */
+            if (ev->type == ButtonPress) wvl_wpe_scroll(v, b == 6 ? -40.0 : b == 7 ? 40.0 : 0.0, b == 4 ? -40.0 : b == 5 ? 40.0 : 0.0, mods);
+            break;
+        }
+        if (ev->type == ButtonPress) {
+            XSetInputFocus(ev->xany.display, (Window)WPE(v)->xwin, RevertToParent, CurrentTime);
+            wvl_wpe_focus(v, 1);
+        }
+        uint32_t wb = b == 1 ? 1 : b == 2 ? 3 : b == 3 ? 2 : b;   /* WPE: 1 left, 2 right, 3 middle */
+        wvl_wpe_pointer_ev(v, WVL_WPE_POINTER_BUTTON, ev->xbutton.x, ev->xbutton.y, wb, ev->type == ButtonPress, mods);
+        break;
+    }
+    case KeyPress:
+    case KeyRelease: {
+        KeySym sym = 0;
+        char buf[16];
+        XLookupString(&ev->xkey, buf, sizeof(buf), &sym, NULL);
+        wvl_wpe_key_ev(v, (uint32_t)sym, ev->xkey.keycode, ev->type == KeyPress, wvl_x11_mods(ev->xkey.state));
+        break;
+    }
+    case FocusIn: wvl_wpe_focus(v, 1); break;
+    case FocusOut: wvl_wpe_focus(v, 0); break;
+    }
+    return 1;
+}
+#endif
+
+#ifdef HAVE_WAYLAND
+static wvl_view *wvl_wl_pointer_view;   /* the webview surface under the pointer */
+
+static wvl_view *wvl_wl_view_of(struct wl_surface *s)
+{
+    if (wvl_engine != WVL_WPE || !s) return NULL;
+    for (wvl_view *v = wvl_views; v; v = v->next) if (WPE(v) && WPE(v)->surf == s) return v;
+    return NULL;
+}
+
+int vio_wvl_wl_pointer_enter(void *surface, double x, double y)
+{
+    wvl_wl_pointer_view = wvl_wl_view_of((struct wl_surface *)surface);
+    if (!wvl_wl_pointer_view) return 0;
+    wvl_wpe_pointer_ev(wvl_wl_pointer_view, WVL_WPE_POINTER_MOTION, (int)x, (int)y, 0, 0, 0);
+    return 1;
+}
+
+void vio_wvl_wl_pointer_leave(void)
+{
+    wvl_wl_pointer_view = NULL;
+}
+
+int vio_wvl_wl_pointer_motion(double x, double y, uint32_t mods)
+{
+    if (!wvl_wl_pointer_view) return 0;
+    wvl_wpe_pointer_ev(wvl_wl_pointer_view, WVL_WPE_POINTER_MOTION, (int)x, (int)y, 0, 0, mods);
+    return 1;
+}
+
+int vio_wvl_wl_pointer_button(uint32_t button, int pressed, uint32_t mods)
+{
+    if (!wvl_wl_pointer_view) {
+        /* a click into vio's surface takes the keyboard back */
+        if (pressed) for (wvl_view *o = wvl_views; o; o = o->next) if (WPE(o) && WPE(o)->focused) wvl_wpe_focus(o, 0);
+        return 0;
+    }
+    if (pressed) {
+        for (wvl_view *o = wvl_views; o; o = o->next) if (o != wvl_wl_pointer_view && WPE(o)) wvl_wpe_focus(o, 0);
+        wvl_wpe_focus(wvl_wl_pointer_view, 1);
+    }
+    uint32_t b = button >= 0x110 ? button - 0x110 + 1 : 0;   /* BTN_LEFT .. : 1 left, 2 right, 3 middle */
+    wvl_wpe_host *w = WPE(wvl_wl_pointer_view);
+    wvl_wpe_pointer_ev(wvl_wl_pointer_view, WVL_WPE_POINTER_BUTTON, w->px, w->py, b, pressed, mods);
+    return 1;
+}
+
+int vio_wvl_wl_pointer_axis(int vertical, double value, uint32_t mods)
+{
+    if (!wvl_wl_pointer_view) return 0;
+    wvl_wpe_scroll(wvl_wl_pointer_view, vertical ? 0.0 : value * 4.0, vertical ? value * 4.0 : 0.0, mods);
+    return 1;
+}
+
+int vio_wvl_wl_key(uint32_t keysym, uint32_t evdev_code, int pressed, uint32_t mods)
+{
+    if (wvl_engine != WVL_WPE) return 0;
+    for (wvl_view *v = wvl_views; v; v = v->next) {
+        if (WPE(v) && WPE(v)->focused) {
+            wvl_wpe_key_ev(v, keysym, evdev_code + 8, pressed, mods);
+            return 1;
+        }
+    }
+    return 0;
+}
 #endif
 
 #endif /* __linux__ */

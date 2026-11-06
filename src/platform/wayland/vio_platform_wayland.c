@@ -509,10 +509,21 @@ static int wl_set_size_limits(vio_window_handle h, int min_w, int min_h, int max
     return 1;
 }
 
+/* WPE modifier bits for the webview (vio_webview_linux.h) */
+static uint32_t wl_wpe_mods(void)
+{
+    int m = wl_mods();
+    return (m & VIO_MOD_CONTROL ? 1u : 0) | (m & VIO_MOD_SHIFT ? 2u : 0) | (m & VIO_MOD_ALT ? 4u : 0) | (m & VIO_MOD_SUPER ? 8u : 0);
+}
+
 static void wl_pointer_enter(void *data, struct wl_pointer *p, uint32_t serial, struct wl_surface *s, wl_fixed_t sx, wl_fixed_t sy)
 {
     (void)data; (void)p;
     wl.pointer_serial = serial;
+    if (vio_wvl_wl_pointer_enter(s, wl_fixed_to_double(sx), wl_fixed_to_double(sy))) {   /* a webview */
+        wl.pointer_focus = NULL;
+        return;
+    }
     vio_wl_window *w = s ? (vio_wl_window *)wl_surface_get_user_data(s) : NULL;
     wl.pointer_focus = w;
     if (!w) return;
@@ -528,11 +539,13 @@ static void wl_pointer_leave(void *data, struct wl_pointer *p, uint32_t serial, 
 {
     (void)data; (void)p; (void)serial; (void)s;
     wl.pointer_focus = NULL;
+    vio_wvl_wl_pointer_leave();
 }
 
 static void wl_pointer_motion(void *data, struct wl_pointer *p, uint32_t time, wl_fixed_t sx, wl_fixed_t sy)
 {
     (void)data; (void)p; (void)time;
+    if (vio_wvl_wl_pointer_motion(wl_fixed_to_double(sx), wl_fixed_to_double(sy), wl_wpe_mods())) return;
     vio_wl_window *w = wl.pointer_focus;
     if (!w || w->cursor_mode == VIO_PLATFORM_CURSOR_DISABLED) return;
     w->cursor_x = wl_fixed_to_double(sx);
@@ -544,6 +557,7 @@ static void wl_pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
 {
     (void)data; (void)p; (void)time;
     wl.pointer_serial = serial;
+    if (vio_wvl_wl_pointer_button(button, state == WL_POINTER_BUTTON_STATE_PRESSED, wl_wpe_mods())) return;
     vio_wl_window *w = wl.pointer_focus;
     if (!w) return;
     int b = button == BTN_LEFT ? 0 : button == BTN_RIGHT ? 1 : button == BTN_MIDDLE ? 2 : (int)(button - BTN_SIDE) + 3;
@@ -555,6 +569,7 @@ static void wl_pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
 static void wl_pointer_axis(void *data, struct wl_pointer *p, uint32_t time, uint32_t axis, wl_fixed_t value)
 {
     (void)data; (void)p; (void)time;
+    if (vio_wvl_wl_pointer_axis(axis == WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_to_double(value), wl_wpe_mods())) return;
     vio_wl_window *w = wl.pointer_focus;
     if (!w) return;
     double v = -wl_fixed_to_double(value) / 10.0;
@@ -632,6 +647,7 @@ static void wl_keyboard_key(void *data, struct wl_keyboard *k, uint32_t serial, 
     vio_wl_window *w = wl.keyboard_focus;
     if (!w) return;
     int press = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+    if (wl.xkb_state && vio_wvl_wl_key(xkb_state_key_get_one_sym(wl.xkb_state, key + 8), key, press, wl_wpe_mods())) return;   /* a clicked webview */
     wl_emit_key(w, key, press ? VIO_PRESS : VIO_RELEASE);
     if (press && wl.repeat_rate > 0 && wl.keymap && xkb_keymap_key_repeats(wl.keymap, key + 8)) {
         wl.repeat_key = key + 1;

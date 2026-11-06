@@ -37,6 +37,18 @@ void  vio_wvl_pump(void);   /* non-blocking: GLib sources, streamed answers, lay
 /* X11 events of the windows the webview put into vio's windows (WPE): 1 = taken */
 int   vio_wvl_x11_event(void *xevent);
 #endif
+#ifdef HAVE_WAYLAND
+/* Wayland input for a webview subsurface (WPE): 1 = it was the webview's.
+ * Keys go to the webview that was clicked last; a click on vio's own
+ * surface takes the keyboard back. mods: WPE modifier bits (ctrl 1, shift 2,
+ * alt 4, meta 8); axis value in Wayland units (10 per wheel notch). */
+int   vio_wvl_wl_pointer_enter(void *surface, double x, double y);
+void  vio_wvl_wl_pointer_leave(void);
+int   vio_wvl_wl_pointer_motion(double x, double y, uint32_t mods);
+int   vio_wvl_wl_pointer_button(uint32_t button, int pressed, uint32_t mods);
+int   vio_wvl_wl_pointer_axis(int vertical, double value, uint32_t mods);
+int   vio_wvl_wl_key(uint32_t keysym, uint32_t evdev_code, int pressed, uint32_t mods);
+#endif
 #endif
 
 #endif /* VIO_WEBVIEW_LINUX_H */
