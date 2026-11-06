@@ -6,6 +6,7 @@
 #include "config.h"
 #endif
 
+#include "vio_a11y.h"
 #include "vio_input.h"
 #include "../include/vio_platform.h"
 #include "../include/vio_types.h"
@@ -16,6 +17,7 @@ void vio_input_init(vio_input_state *state)
     memset(state->keys, 0, sizeof(state->keys));
     memset(state->keys_prev, 0, sizeof(state->keys_prev));
     state->blocked = 0;
+    state->a11y = NULL;
     state->mouse_x = 0.0;
     state->mouse_y = 0.0;
     state->mouse_prev_x = 0.0;
@@ -122,6 +124,7 @@ void vio_input_update(vio_input_state *state)
 
 void vio_input_shutdown(vio_input_state *state)
 {
+    vio_a11y_free(state);
     vio_input_replay_stop(state);
     state->recording = 0;
     vio_input_event_list_free(&state->record);
@@ -330,6 +333,7 @@ void vio_input_focus_event(vio_input_state *state, int focused)
     focused = focused ? 1 : 0;
     if (!state || state->win_focused == focused) return;
     state->win_focused = focused;
+    vio_a11y_focus(state, focused);
     zval retval, arg;
     ZVAL_BOOL(&arg, focused);
     vio_window_cb_call(state, VIO_WINDOW_CB_FOCUS, 1, &arg, &retval);

@@ -226,6 +226,19 @@ vio_key_pressed($tool, VIO_KEY_A);   // Eingabe-Funktionen nehmen VioContext|Vio
   String-IDs werden intern auf `accesskit_node_id` (u64) abgebildet. Der Baum wird erst gebaut, wenn ein Screenreader
   fragt (AccessKits Lazy-Init), sonst kostet die API nichts.
 - Abhängig von Phase 4 (Baum je `VioWindow`) und Phase 3 (Textfelder melden Preedit/Selektion).
+- **Aufteilung (2026-11-05):** accesskit-c 0.23.1 liefert statische Bibliotheken für macOS (arm64/x86_64), Windows
+  (MSVC/MinGW) und Linux x86/x86_64, nicht für Linux aarch64 (dort ohne AccessKit). `--with-accesskit=DIR` zeigt auf
+  das entpackte Paket; es gehört nicht unter den Build-Baum (`make clean` löscht jede `*.a`).
+  - **5a ✅ (Test 273):** Kern `src/vio_a11y.c`. Der Baum liegt je Fenster in `vio_input_state.a11y`, in C-Speicher
+    unter einem Mutex (AccessKit liest ihn unter Linux aus eigenem Thread). String-IDs → u64 in Vergabereihenfolge,
+    `vio_a11y_update` prüft Rollen, Aktionen, Bounds und dass Kinder, Wurzel und Fokus Knoten des Baums sind (ein
+    unbekannter Verweis bräche AccessKit über die FFI-Grenze ab) und gibt nur geänderte Knoten weiter. Aktionen kommen
+    in eine Warteschlange, `vio_poll_events` / `vio_wait_events` stellen sie zu (`vio_wake` weckt dafür). Linux: AT-SPI-
+    Adapter (`accesskit_unix_adapter`, unabhängig von X11/Wayland/GLFW), Fensterlage über `set_root_window_bounds`,
+    Fokus aus dem Input-Funnel. Ohne AccessKit wird der Vertrag geprüft und `false` geliefert.
+  - **5b:** Windows (UIA: `accesskit_windows_adapter`, `WM_GETOBJECT` und Fokus aus der WndProc, Bounds in physischen
+    Pixeln).
+  - **5c:** macOS (Subclassing-Adapter an der View; Abfrage im Test braucht die Bedienungshilfen-Freigabe).
 - Wayland ist abgedeckt, weil AT-SPI nicht am Fenstersystem hängt.
 - **Tests (273, 274):** Baum anlegen/ändern/Fokus; danach vom Kindprozess abfragen: Windows über UIA
   (`IUIAutomation::ElementFromHandle`, Name/Rolle der Kinder), macOS über `AXUIElementCreateApplication`

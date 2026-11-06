@@ -28,6 +28,7 @@ if (PHP_VIO != "no") {
         "src\\platform\\win32\\vio_platform_win32.c " +
         "src\\vio_mesh.c " +
         "src\\vio_input.c " +
+        "src\\vio_a11y.c " +
         "src\\vio_shader.c " +
         "src\\vio_pipeline.c " +
         "src\\vio_texture.c " +

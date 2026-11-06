@@ -50,7 +50,22 @@ jobs:
             libharfbuzz-dev \
             xvfb libgl1-mesa-dri libglx-mesa0 \
             mesa-vulkan-drivers vulkan-tools \
+            at-spi2-core dbus-daemon python3-gi gir1.2-atspi-2.0 \
             pkg-config
+
+      # AccessKit (vio_a11y_update): the accesskit-c release package, checked
+      # against its digest. No aarch64 Linux build exists, so only this job has it.
+      - name: Fetch AccessKit
+        env:
+          AK_VERSION: '0.23.1'
+          AK_SHA256: '35b7ca8a6f1e038b5da35e1e9e5a0adaed9bfcf21e1496d29598fbbadcc7043f'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/accesskit.zip" \
+            "https://github.com/AccessKit/accesskit-c/releases/download/${AK_VERSION}/accesskit-c-${AK_VERSION}.zip"
+          echo "${AK_SHA256}  $RUNNER_TEMP/accesskit.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/accesskit.zip" -d "$RUNNER_TEMP"
+          echo "VIO_ACCESSKIT_DIR=$RUNNER_TEMP/accesskit-c-${AK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Build extension
         run: |
@@ -62,7 +77,8 @@ jobs:
             --with-spirv-cross \
             --with-vulkan \
             --with-ffmpeg \
-            --with-harfbuzz
+            --with-harfbuzz \
+            --with-accesskit="$VIO_ACCESSKIT_DIR"
           make -j$(nproc)
 
       # Loading the freshly built module with eager symbol binding is the
@@ -91,6 +107,8 @@ jobs:
           # that pollute audio-test output. Route the default device to null so
           # miniaudio opens it silently.
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          # AccessKit is built in: test 273 must reach AT-SPI, not skip
+          export VIO_REQUIRE_A11Y=1
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
       - name: Run tests (Wayland, headless weston + Mesa software GL)
