@@ -1,5 +1,5 @@
 --TEST--
-System webview (WEBVIEW-PLAN W3), streamed and large answers: an iterable body reaches the page chunk by chunk (one per poll, the page reads them before the stream ends, the PHP loop keeps running), Server-Sent Events over the custom scheme, a generator that throws ends its stream; a 60 MB answer and a 20 MB POST body arrive whole
+System webview (WEBVIEW-PLAN W3), streamed and large answers: an iterable body reaches the page chunk by chunk (one per poll: the page reads the first while the generator waits for it, empty chunks keep the stream open, the PHP loop keeps running), Server-Sent Events over the custom scheme, a generator that throws ends its stream; a 60 MB answer and a 20 MB POST body arrive whole
 --EXTENSIONS--
 vio
 --SKIPIF--
@@ -48,14 +48,19 @@ window.addEventListener('load', async () => {
 HTML;
 $produced = 0;
 $polls = 0;
-$handler = function (array $req) use ($page, &$produced) {
+$asked = false;
+$handler = function (array $req) use ($page, &$produced, &$asked) {
     switch (parse_url($req['url'], PHP_URL_PATH)) {
     case '/': return ['headers' => ['Content-Type' => 'text/html'], 'body' => $page];
     case '/chunks':
-        return ['headers' => ['Content-Type' => 'text/plain'], 'body' => (function () use (&$produced) {
-            foreach (['a', 'b', 'c', 'd', 'e'] as $c) { $produced++; yield $c; }
+        /* the rest only after the page asked for /progress: the first chunk must have reached it by then */
+        return ['headers' => ['Content-Type' => 'text/plain'], 'body' => (function () use (&$produced, &$asked) {
+            $produced++;
+            yield 'a';
+            while (!$asked) yield '';   /* nothing to send, the stream stays open */
+            foreach (['b', 'c', 'd', 'e'] as $c) { $produced++; yield $c; }
         })()];
-    case '/progress': return (string)$produced;   /* answered while /chunks is still streaming */
+    case '/progress': $asked = true; return (string)$produced;   /* answered while /chunks is still streaming */
     case '/events':
         return ['headers' => ['Content-Type' => 'text/event-stream', 'Cache-Control' => 'no-cache'],
                 'body' => (function () { foreach (['one', 'two', 'three'] as $m) yield "data: $m\n\n"; })()];

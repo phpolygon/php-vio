@@ -487,6 +487,7 @@ if test "$PHP_VIO" != "no"; then
     src/platform/x11/vio_platform_x11.c \
     src/platform/wayland/vio_platform_wayland.c \
     src/platform/linux/vio_desktop_linux.c \
+    src/platform/linux/vio_webview_linux.c \
     src/vio_mesh.c \
     src/vio_input.c \
     src/vio_a11y.c \

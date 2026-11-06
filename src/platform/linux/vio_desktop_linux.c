@@ -25,6 +25,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "vio_desktop_linux.h"
+#include "vio_webview_linux.h"
 #include "vio_uri_list.h"
 
 /* ── libdbus, the parts used here ─────────────────────────────────── */
@@ -173,6 +174,7 @@ int vio_linux_available(int feature)
         case VIO_PLATFORM_FEATURE_NOTIFICATIONS: return db_has_owner("org.freedesktop.Notifications");
         case VIO_PLATFORM_FEATURE_PROGRESS:      return db_session() && vio_app_id();
         case VIO_PLATFORM_FEATURE_TRAY:          return db_has_owner("org.kde.StatusNotifierWatcher");
+        case VIO_PLATFORM_FEATURE_WEBVIEW:       return vio_wvl_available();
     }
     return 0;
 }

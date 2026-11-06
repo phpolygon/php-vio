@@ -65,6 +65,7 @@
 #include "../vio_shell.h"
 #include "../linux/vio_uri_list.h"
 #include "../linux/vio_desktop_linux.h"
+#include "../linux/vio_webview_linux.h"
 #include "../../vio_input.h"
 #include "../linux/vio_evdev_gamepad.h"
 
@@ -1049,10 +1050,12 @@ static void wl_dispatch(int timeout_ms)
     while (wl_display_prepare_read(wl.display) != 0) wl_display_dispatch_pending(wl.display);
     wl_display_flush(wl.display);
     /* the wake pipe ends a wait too (vio_wake) */
-    struct pollfd pfd[3] = { { wl_display_get_fd(wl.display), POLLIN, 0 }, { vio_platform_wake_fd(), POLLIN, 0 },
-                             { vio_linux_dbus_fd(), POLLIN, 0 } };   /* tray clicks */
-    int n = timeout_ms != 0 ? 3 : 1;
+    struct pollfd pfd[3 + 64] = { { wl_display_get_fd(wl.display), POLLIN, 0 }, { vio_platform_wake_fd(), POLLIN, 0 },
+                                  { vio_linux_dbus_fd(), POLLIN, 0 } };   /* tray clicks */
+    int n = timeout_ms != 0 ? 3 : 1, base = n;
+    if (timeout_ms != 0) n = vio_wvl_poll_begin(pfd, n, 3 + 64, &timeout_ms);   /* webview engine sockets */
     while (poll(pfd, (nfds_t)n, timeout_ms) < 0 && errno == EINTR) {}
+    if (timeout_ms != 0 || n != base) vio_wvl_poll_end(pfd, base, n);
     if (pfd[0].revents & POLLIN) wl_display_read_events(wl.display);
     else wl_display_cancel_read(wl.display);
     wl_display_dispatch_pending(wl.display);
@@ -1063,6 +1066,7 @@ static void wl_poll_events(void)
     wl_dispatch(0);
     wl_repeat_tick();
     vio_linux_dispatch();   /* tray calls on the session bus */
+    vio_wvl_pump();
 }
 
 static void wl_wait_events(double timeout)
@@ -1078,6 +1082,7 @@ static void wl_wait_events(double timeout)
     wl_dispatch(ms);
     wl_repeat_tick();
     vio_linux_dispatch();
+    vio_wvl_pump();
     vio_platform_wake_take();
 }
 
@@ -1486,6 +1491,11 @@ static int wl_set_parent(vio_window_handle h, vio_window_handle ph, int modal)
     return 1;
 }
 
+static void *wl_webview_create(vio_window_handle h, const vio_webview_desc *d)
+{
+    return h ? vio_wvl_create(h, d, ((vio_wl_window *)h)->headless) : NULL;
+}
+
 static const vio_platform vio_platform_wayland = {
     .name                 = "wayland",
     .init                 = wl_init,
@@ -1548,6 +1558,16 @@ static const vio_platform vio_platform_wayland = {
     .set_ime_rect         = wl_set_ime_rect,
     .set_ime_enabled      = wl_set_ime_enabled,
     .set_parent           = wl_set_parent,
+    .webview_create       = wl_webview_create,
+    .webview_destroy      = vio_wvl_destroy,
+    .webview_navigate     = vio_wvl_navigate,
+    .webview_eval         = vio_wvl_eval,
+    .webview_set_bounds   = vio_wvl_set_bounds,
+    .webview_set_script   = vio_wvl_set_script,
+    .webview_reply_head   = vio_wvl_reply_head,
+    .webview_reply_data   = vio_wvl_reply_data,
+    .webview_reply_end    = vio_wvl_reply_end,
+    .webview_reply_fail   = vio_wvl_reply_fail,
 };
 
 void vio_platform_wayland_register(void)
