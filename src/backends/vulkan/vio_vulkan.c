@@ -1926,6 +1926,134 @@ int vio_vulkan_recreate_swapchain(void)
     return create_swapchain();
 }
 
+/* ── Further windows (DESKTOP-APP-PLAN Phase 4) ──────────────────────
+ * The surface / swapchain fields of vio_vk, one record per window. Frame slots,
+ * command buffers, acquire semaphores and the timeline stay per device: a slot's
+ * acquire semaphore is waited by the submit of the frame that acquired with it,
+ * whichever swapchain that was. set_swapchain stores the active window's fields
+ * and loads the other's; everything else keeps reading vio_vk. */
+typedef struct _vio_vk_swapchain {
+    VkSurfaceKHR    surface;
+    VkSwapchainKHR  swapchain;
+    VkFormat        swapchain_format;
+    VkExtent2D      swapchain_extent;
+    VkImage        *swapchain_images;
+    VkImageView    *swapchain_image_views;
+    uint32_t        swapchain_image_count;
+    VkSemaphore    *render_finished_per_image;
+    VkImage         depth_image;
+    VkDeviceMemory  depth_memory;
+    VkImageView     depth_view;
+    uint32_t        current_image_index;
+    int             swapchain_needs_recreate, vsync, headless, swapchain_transfer_src;
+    int             hdr_request, hdr_output, hdr10_capable;
+    VkBuffer        capture_buf;
+    void           *capture_alloc;
+    VkDeviceSize    capture_size;
+    uint32_t        capture_w, capture_h;
+    int             capture_valid;
+    uint64_t        capture_value;
+    void           *platform_window;
+    int             framebuffer_width, framebuffer_height;
+} vio_vk_swapchain;
+
+static vio_vk_swapchain  vk_main_sc;
+static vio_vk_swapchain *vk_cur_sc;   /* NULL: the main window's fields are loaded */
+
+#define VK_SC_FIELDS(X) \
+    X(surface) X(swapchain) X(swapchain_format) X(swapchain_extent) X(swapchain_images) \
+    X(swapchain_image_views) X(swapchain_image_count) X(render_finished_per_image) X(depth_image) \
+    X(depth_memory) X(depth_view) X(current_image_index) X(swapchain_needs_recreate) X(vsync) X(headless) \
+    X(swapchain_transfer_src) X(hdr_request) X(hdr_output) X(hdr10_capable) X(capture_buf) X(capture_alloc) \
+    X(capture_size) X(capture_w) X(capture_h) X(capture_valid) X(capture_value) X(platform_window) \
+    X(framebuffer_width) X(framebuffer_height)
+
+static void vk_sc_store(vio_vk_swapchain *r)
+{
+#define X(f) r->f = vio_vk.f;
+    VK_SC_FIELDS(X)
+#undef X
+}
+
+static void vk_sc_load(const vio_vk_swapchain *r)
+{
+#define X(f) vio_vk.f = r->f;
+    VK_SC_FIELDS(X)
+#undef X
+}
+
+static void vulkan_set_swapchain(void *swapchain)
+{
+    vio_vk_swapchain *target = swapchain ? (vio_vk_swapchain *)swapchain : &vk_main_sc;
+    vio_vk_swapchain *cur = vk_cur_sc ? vk_cur_sc : &vk_main_sc;
+    if (target == cur) return;
+    vk_sc_store(cur);
+    vk_sc_load(target);
+    vk_cur_sc = target == &vk_main_sc ? NULL : target;
+}
+
+/* Tear down the loaded window's swapchain, capture buffer and surface. */
+static void vk_sc_destroy_loaded(void)
+{
+    cleanup_swapchain();
+    if (vio_vk.capture_buf && vio_vk.vma_allocator)
+        vio_vma_destroy_buffer(vio_vk.vma_allocator, vio_vk.capture_buf, vio_vk.capture_alloc);
+    vio_vk.capture_buf = VK_NULL_HANDLE;
+    vio_vk.capture_alloc = NULL;
+    if (vio_vk.surface) vkDestroySurfaceKHR(vio_vk.instance, vio_vk.surface, NULL);
+    vio_vk.surface = VK_NULL_HANDLE;
+}
+
+static void *vulkan_create_swapchain(void *platform_window, const vio_config *cfg)
+{
+    if (!vio_vk.initialized || !vio_vk.device || !platform_window || !vio_plat()->vk_create_surface) return NULL;
+    vio_vk_swapchain *rec = (vio_vk_swapchain *)calloc(1, sizeof(*rec));
+    if (!rec) return NULL;
+    vio_vk_swapchain *prev = vk_cur_sc ? vk_cur_sc : &vk_main_sc;
+    vk_sc_store(prev);
+    VkFormat main_format = vk_main_sc.swapchain_format;   /* stored just above when the main one is loaded */
+
+    vio_vk_swapchain blank;
+    memset(&blank, 0, sizeof(blank));
+    blank.platform_window = platform_window;
+    blank.vsync = cfg->vsync;
+    blank.headless = cfg->headless;
+    blank.hdr_request = prev->hdr_request;
+    vk_sc_load(&blank);
+
+    int ok = 0;
+    if (vio_plat()->vk_create_surface(platform_window, (void *)vio_vk.instance, (void *)&vio_vk.surface) == VK_SUCCESS) {
+        VkBool32 present = VK_FALSE;
+        vkGetPhysicalDeviceSurfaceSupportKHR(vio_vk.physical_device, vio_vk.present_family, vio_vk.surface, &present);
+        vio_plat()->get_framebuffer_size(platform_window, &vio_vk.framebuffer_width, &vio_vk.framebuffer_height);
+        /* the 2D pipelines are built for the main swapchain's format */
+        ok = present && create_swapchain() == 0 && vio_vk.swapchain_format == main_format;
+    }
+    if (!ok) {
+        vk_sc_destroy_loaded();
+        vk_sc_load(prev);
+        free(rec);
+        return NULL;
+    }
+    vk_sc_store(rec);
+    vk_sc_load(prev);
+    return rec;
+}
+
+static void vulkan_destroy_swapchain(void *swapchain)
+{
+    vio_vk_swapchain *rec = (vio_vk_swapchain *)swapchain;
+    if (!rec) return;
+    if (vk_cur_sc == rec) vulkan_set_swapchain(NULL);
+    vio_vk_swapchain *cur = vk_cur_sc ? vk_cur_sc : &vk_main_sc;
+    vkDeviceWaitIdle(vio_vk.device);   /* a frame in flight may still present or copy it */
+    vk_sc_store(cur);
+    vk_sc_load(rec);
+    vk_sc_destroy_loaded();
+    vk_sc_load(cur);
+    free(rec);
+}
+
 /* ── Full Vulkan setup ───────────────────────────────────────────── */
 
 int vio_vulkan_setup_context(void *platform_window, vio_config *cfg)
@@ -2251,6 +2379,8 @@ static void vulkan_shutdown(void)
 
     if (vio_vk.instance) vkDestroyInstance(vio_vk.instance, NULL);
 
+    memset(&vk_main_sc, 0, sizeof(vk_main_sc));
+    vk_cur_sc = NULL;
     memset(&vio_vk, 0, sizeof(vio_vk));
 }
 
@@ -5732,6 +5862,9 @@ static const vio_backend vulkan_backend = {
     .clip_z_remap      = 1,
     .shadow_sampler_base = VIO_SHADOW_SAMPLER_BASE,
     .set_frame_present = vulkan_set_frame_present,
+    .create_swapchain  = vulkan_create_swapchain,
+    .set_swapchain     = vulkan_set_swapchain,
+    .destroy_swapchain = vulkan_destroy_swapchain,
     .upscaler_supported           = vulkan_upscaler_supported,
     .upscaler_create              = vulkan_upscaler_create,
     .upscaler_dispatch            = vulkan_upscaler_dispatch,
