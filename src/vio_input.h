@@ -105,6 +105,7 @@ typedef enum {
     VIO_WINDOW_CB_MINIMIZE,
     VIO_WINDOW_CB_SCALE,
     VIO_WINDOW_CB_REFRESH,
+    VIO_WINDOW_CB_DROP,
     VIO_WINDOW_CB_COUNT
 } vio_window_cb;
 
@@ -228,6 +229,8 @@ void vio_input_focus_event(vio_input_state *state, int focused);
 void vio_input_minimize_event(vio_input_state *state, int minimized);
 void vio_input_scale_event(vio_input_state *state, float sx, float sy);
 void vio_input_refresh_event(vio_input_state *state);
+/* Files dropped on the window (UTF-8 paths) at x, y in cursor space. */
+void vio_input_drop_event(vio_input_state *state, int count, const char *const *paths, double x, double y);
 /* Set or replace a window event callback (callback must be callable). */
 void vio_input_set_window_cb(vio_input_state *state, vio_window_cb which, zval *callback);
 

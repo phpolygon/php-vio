@@ -77,6 +77,36 @@ typedef struct _vio_monitor_desc {
 #define VIO_PLATFORM_SHAPE_NOT_ALLOWED  9
 #define VIO_PLATFORM_SHAPE_COUNT        10
 
+/* vio_file_dialog (DESKTOP-APP-PLAN Phase 2). Patterns are bare extensions
+ * ("png"); the caller has checked them (no separators or wildcards). */
+#define VIO_PLATFORM_DIALOG_OPEN   0
+#define VIO_PLATFORM_DIALOG_SAVE   1
+#define VIO_PLATFORM_DIALOG_FOLDER 2
+typedef struct _vio_dialog_filter {
+    const char  *name;
+    const char **extensions;
+    int          count;
+} vio_dialog_filter;
+typedef struct _vio_file_dialog_desc {
+    int                      mode;
+    int                      multiple;
+    const char              *title;          /* NULL: the platform's */
+    const char              *default_path;   /* NULL, a folder, or (save) a file */
+    const vio_dialog_filter *filters;
+    int                      filter_count;
+} vio_file_dialog_desc;
+
+#define VIO_PLATFORM_MESSAGE_INFO     0
+#define VIO_PLATFORM_MESSAGE_WARNING  1
+#define VIO_PLATFORM_MESSAGE_ERROR    2
+#define VIO_PLATFORM_MESSAGE_QUESTION 3
+typedef struct _vio_message_box_desc {
+    const char  *title, *message;
+    const char **buttons;   /* 1..3; closing the box (Escape) picks the last */
+    int          button_count;
+    int          kind;
+} vio_message_box_desc;
+
 /* An RGBA image (window icon), top row first. */
 typedef struct _vio_platform_image {
     int width, height;
@@ -201,6 +231,17 @@ typedef struct _vio_platform {
      * path: exists (checked by the caller). */
     int   (*open_url)(const char *utf8_url);
     int   (*reveal_file)(const char *utf8_path);
+
+    /* ── Desktop integration (DESKTOP-APP-PLAN Phase 2) ──────────────────
+     * File drops need no slot to start them: a platform that accepts them
+     * sets accepts_drops and reports each drop through vio_input_drop_event. */
+    int   accepts_drops;
+    /* Modal. 1 = answered: *out_paths (malloc'd array of malloc'd UTF-8
+     * strings, caller frees) with *out_count entries, 0 entries = cancelled.
+     * 0 = could not show one. The window may be NULL (no window). */
+    int   (*file_dialog)(vio_window_handle w, const vio_file_dialog_desc *d, char ***out_paths, int *out_count);
+    /* Modal. The pressed button's index, -1 = could not show one. */
+    int   (*message_box)(vio_window_handle w, const vio_message_box_desc *d);
 } vio_platform;
 
 /* Registry (src/vio_platform_registry.c): platforms register in MINIT; the
@@ -234,6 +275,11 @@ void  vio_platform_wait_wake_only(double timeout);
  * POSIX only): VIO_OPEN_COMMAND if set, else default_cmd; argv = cmd, args.
  * Detached, no shell; children are reaped on later calls. 1 = started. */
 int   vio_platform_spawn_opener(const char *default_cmd, const char *const *args, int nargs);
+
+/* VIO_TEST_DIALOG="<ms>:<action>" (tests only): the platform dismisses its
+ * next dialog after ms - action "cancel", "accept" (save: the default name) or
+ * a button index. 1 = set, *ms and *action (cancel -1, accept -2, index) filled. */
+int   vio_platform_test_dialog(int *ms, int *action);
 
 /* Implementations */
 void vio_platform_null_register(void);

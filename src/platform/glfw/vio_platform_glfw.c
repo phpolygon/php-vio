@@ -807,6 +807,13 @@ static void glfw_refresh_callback(GLFWwindow *window)
     vio_input_refresh_event((vio_input_state *)glfwGetWindowUserPointer(window));
 }
 
+static void glfw_drop_callback(GLFWwindow *window, int count, const char **paths)
+{
+    double x = 0.0, y = 0.0;
+    glfwGetCursorPos(window, &x, &y);   /* GLFW reports no drop point: the cursor is on it */
+    vio_input_drop_event((vio_input_state *)glfwGetWindowUserPointer(window), count, paths, x, y);
+}
+
 static void glfw_install_input(vio_window_handle w, vio_input_state *state)
 {
     GLFWwindow *window = (GLFWwindow *)w;
@@ -823,6 +830,7 @@ static void glfw_install_input(vio_window_handle w, vio_input_state *state)
     glfwSetWindowIconifyCallback(window, glfw_iconify_callback);
     glfwSetWindowContentScaleCallback(window, glfw_scale_callback);
     glfwSetWindowRefreshCallback(window, glfw_refresh_callback);
+    glfwSetDropCallback(window, glfw_drop_callback);
 }
 
 /* GLFW reports an empty / non-text clipboard as an error; for the clipboard
@@ -924,6 +932,7 @@ static vio_platform vio_platform_glfw = {
     .set_opacity          = glfw_set_opacity,
     .open_url             = vio_shell_open_url,
     .reveal_file          = vio_shell_reveal_file,
+    .accepts_drops        = 1,
 };
 
 void vio_platform_glfw_register(void)

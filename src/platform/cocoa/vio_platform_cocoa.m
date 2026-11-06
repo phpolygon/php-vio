@@ -148,6 +148,30 @@ static void cocoa_report_size(vio_cocoa_window *w)
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
 - (BOOL)wantsUpdateLayer { return YES; }
 
+/* File drops (NSDraggingDestination) */
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender
+{
+    return [sender.draggingPasteboard canReadObjectForClasses:@[[NSURL class]]
+                                                      options:@{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }]
+        ? NSDragOperationCopy : NSDragOperationNone;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender
+{
+    vio_cocoa_window *w = self.owner;
+    NSArray<NSURL *> *urls = [sender.draggingPasteboard readObjectsForClasses:@[[NSURL class]]
+                                                                      options:@{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }];
+    if (!w || urls.count == 0) return NO;
+    NSPoint p = [self convertPoint:sender.draggingLocation fromView:nil];   /* flipped: y from the top */
+    const char **paths = (const char **)calloc(urls.count, sizeof(char *));
+    if (!paths) return NO;
+    int n = 0;
+    for (NSURL *u in urls) if (u.fileSystemRepresentation) paths[n++] = u.fileSystemRepresentation;
+    vio_input_drop_event(w->input, n, paths, p.x, p.y);
+    free(paths);
+    return YES;
+}
+
 - (void)resetCursorRects
 {
     vio_cocoa_window *w = self.owner;
@@ -500,6 +524,7 @@ static vio_window_handle cocoa_create_window(vio_config *cfg, const char *backen
         win.acceptsMouseMovedEvents = YES;
         VioCocoaView *view = [[VioCocoaView alloc] initWithFrame:rect];
         view.owner = w;
+        [view registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
         view.wantsBestResolutionOpenGLSurface = YES;
         win.contentView = view;
         [win makeFirstResponder:view];
@@ -948,6 +973,106 @@ static int cocoa_reveal_file(const char *path)
     return 1;
 }
 
+/* ── Dialogs (DESKTOP-APP-PLAN Phase 2) ───────────────────────────── */
+
+/* VIO_TEST_DIALOG: dismiss the modal window after a delay (tests only). The
+ * timer runs in the common modes, which include the modal panel mode. */
+static void cocoa_test_dismiss(void (^dismiss)(int action))
+{
+    int ms = 0, action = 0;
+    if (!vio_platform_test_dialog(&ms, &action)) return;
+    NSTimer *t = [NSTimer timerWithTimeInterval:ms / 1000.0 repeats:NO block:^(NSTimer *timer) { (void)timer; dismiss(action); }];
+    [[NSRunLoop currentRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+}
+
+static NSString *cocoa_str(const char *utf8)
+{
+    return utf8 ? [NSString stringWithUTF8String:utf8] : nil;
+}
+
+static int cocoa_file_dialog(vio_window_handle h, const vio_file_dialog_desc *d, char ***out_paths, int *out_count)
+{
+    (void)h;
+    *out_paths = NULL;
+    *out_count = 0;
+    if (!cocoa_initialized) return 0;
+    @autoreleasepool {
+        NSSavePanel *panel;
+        NSOpenPanel *open = nil;
+        if (d->mode == VIO_PLATFORM_DIALOG_SAVE) {
+            panel = [NSSavePanel savePanel];
+            panel.canCreateDirectories = YES;
+        } else {
+            open = [NSOpenPanel openPanel];
+            open.canChooseFiles = d->mode == VIO_PLATFORM_DIALOG_OPEN;
+            open.canChooseDirectories = d->mode == VIO_PLATFORM_DIALOG_FOLDER;
+            open.allowsMultipleSelection = d->multiple ? YES : NO;
+            open.canCreateDirectories = d->mode == VIO_PLATFORM_DIALOG_FOLDER;
+            panel = open;
+        }
+        if (d->title) { panel.title = cocoa_str(d->title); panel.message = cocoa_str(d->title); }
+        if (d->filter_count > 0 && d->mode != VIO_PLATFORM_DIALOG_FOLDER) {
+            NSMutableArray<NSString *> *types = [NSMutableArray array];
+            for (int i = 0; i < d->filter_count; i++)
+                for (int k = 0; k < d->filters[i].count; k++) [types addObject:cocoa_str(d->filters[i].extensions[k])];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            panel.allowedFileTypes = types;   /* UTType would need a framework the module does not link */
+#pragma clang diagnostic pop
+        }
+        if (d->default_path) {
+            NSString *p = cocoa_str(d->default_path);
+            BOOL dir = NO;
+            if ([[NSFileManager defaultManager] fileExistsAtPath:p isDirectory:&dir] && dir) {
+                panel.directoryURL = [NSURL fileURLWithPath:p isDirectory:YES];
+            } else {
+                panel.directoryURL = [NSURL fileURLWithPath:[p stringByDeletingLastPathComponent] isDirectory:YES];
+                if (d->mode == VIO_PLATFORM_DIALOG_SAVE) panel.nameFieldStringValue = [p lastPathComponent];
+            }
+        }
+        [NSApp activateIgnoringOtherApps:YES];
+        /* the panel runs out of process: -ok: does not reach it, ending the modal loop does */
+        cocoa_test_dismiss(^(int action) { [NSApp stopModalWithCode:action == -2 ? NSModalResponseOK : NSModalResponseCancel]; });
+        if ([panel runModal] != NSModalResponseOK) return 1;
+        NSArray<NSURL *> *urls = open ? open.URLs : (panel.URL ? @[panel.URL] : @[]);
+        if (urls.count == 0) return 1;
+        char **paths = (char **)calloc(urls.count, sizeof(char *));
+        if (!paths) return 0;
+        int n = 0;
+        for (NSURL *u in urls) {
+            const char *fs = u.fileSystemRepresentation;
+            if (fs && (paths[n] = strdup(fs))) n++;
+        }
+        *out_paths = paths;
+        *out_count = n;
+    }
+    return 1;
+}
+
+static int cocoa_message_box(vio_window_handle h, const vio_message_box_desc *d)
+{
+    (void)h;
+    if (!cocoa_initialized) return -1;
+    @autoreleasepool {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = cocoa_str(d->title) ?: @"";
+        alert.informativeText = cocoa_str(d->message) ?: @"";
+        alert.alertStyle = d->kind == VIO_PLATFORM_MESSAGE_ERROR ? NSAlertStyleCritical
+                         : d->kind == VIO_PLATFORM_MESSAGE_WARNING ? NSAlertStyleWarning : NSAlertStyleInformational;
+        for (int i = 0; i < d->button_count; i++) [alert addButtonWithTitle:cocoa_str(d->buttons[i]) ?: @"?"];
+        if (d->button_count > 1) alert.buttons.lastObject.keyEquivalent = @"\033";   /* Escape picks the last */
+        [NSApp activateIgnoringOtherApps:YES];
+        int last = d->button_count - 1;
+        cocoa_test_dismiss(^(int action) {
+            NSInteger i = action >= 0 && action <= last ? action : last;
+            [alert.buttons[(NSUInteger)i] performClick:nil];
+        });
+        NSModalResponse r = [alert runModal];
+        int idx = (int)(r - NSAlertFirstButtonReturn);
+        return idx >= 0 && idx < d->button_count ? idx : last;
+    }
+}
+
 static int cocoa_window_monitor(vio_window_handle h)
 {
     return h ? ((vio_cocoa_window *)h)->monitor : -1;
@@ -1286,6 +1411,9 @@ static const vio_platform vio_platform_cocoa = {
     .set_opacity          = cocoa_set_opacity,
     .open_url             = cocoa_open_url,
     .reveal_file          = cocoa_reveal_file,
+    .accepts_drops        = 1,
+    .file_dialog          = cocoa_file_dialog,
+    .message_box          = cocoa_message_box,
 };
 
 void vio_platform_cocoa_register(void)

@@ -61,6 +61,7 @@
 #include "../../../include/vio_platform.h"
 #include "../../../include/vio_constants.h"
 #include "../vio_shell.h"
+#include "../linux/vio_uri_list.h"
 #include "../../vio_input.h"
 #include "../linux/vio_evdev_gamepad.h"
 
@@ -89,6 +90,12 @@ static struct {
     struct wl_shm        *shm;
     struct xdg_wm_base   *wm_base;
     struct wl_seat       *seat;
+    struct wl_data_device_manager *ddm;     /* file drops */
+    uint32_t              ddm_version;
+    struct wl_data_device *data_device;
+    struct wl_data_offer *dnd_offer, *sel_offer;
+    vio_wl_window *dnd_window;
+    double                dnd_x, dnd_y;
     struct wl_keyboard   *keyboard;
     struct wl_pointer    *pointer;
     struct zxdg_decoration_manager_v1        *decoration_manager;
@@ -701,6 +708,120 @@ static void wl_output_scale(void *data, struct wl_output *o, int32_t factor) { (
 
 static const struct wl_output_listener wl_output_listener = { wl_output_geometry, wl_output_mode, wl_output_done, wl_output_scale };
 
+/* ── File drops (wl_data_device) ──────────────────────────────────── */
+
+/* Each offer carries a flag: does it offer text/uri-list? */
+static void wl_offer_offer(void *data, struct wl_data_offer *o, const char *mime)
+{
+    (void)o;
+    if (data && strcmp(mime, "text/uri-list") == 0) *(int *)data = 1;
+}
+static void wl_offer_source_actions(void *data, struct wl_data_offer *o, uint32_t a) { (void)data; (void)o; (void)a; }
+static void wl_offer_action(void *data, struct wl_data_offer *o, uint32_t a) { (void)data; (void)o; (void)a; }
+static const struct wl_data_offer_listener wl_offer_listener = { wl_offer_offer, wl_offer_source_actions, wl_offer_action };
+
+static void wl_offer_destroy(struct wl_data_offer *o)
+{
+    if (!o) return;
+    free(wl_data_offer_get_user_data(o));
+    wl_data_offer_destroy(o);
+}
+
+static int wl_offer_has_uris(struct wl_data_offer *o)
+{
+    int *flag = o ? (int *)wl_data_offer_get_user_data(o) : NULL;
+    return flag && *flag;
+}
+
+static void wl_dd_data_offer(void *data, struct wl_data_device *d, struct wl_data_offer *o)
+{
+    (void)data; (void)d;
+    wl_data_offer_add_listener(o, &wl_offer_listener, calloc(1, sizeof(int)));
+}
+
+static void wl_dd_enter(void *data, struct wl_data_device *d, uint32_t serial, struct wl_surface *s, wl_fixed_t x, wl_fixed_t y, struct wl_data_offer *o)
+{
+    (void)data; (void)d;
+    if (wl.dnd_offer && wl.dnd_offer != o) wl_offer_destroy(wl.dnd_offer);
+    wl.dnd_offer = o;
+    wl.dnd_window = s ? (vio_wl_window *)wl_surface_get_user_data(s) : NULL;
+    wl.dnd_x = wl_fixed_to_double(x);
+    wl.dnd_y = wl_fixed_to_double(y);
+    if (!o) return;
+    int ok = wl.dnd_window && wl_offer_has_uris(o);
+    wl_data_offer_accept(o, serial, ok ? "text/uri-list" : NULL);
+    if (wl.ddm_version >= 3) {
+        wl_data_offer_set_actions(o, ok ? WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY : 0, ok ? WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY : 0);
+    }
+}
+
+static void wl_dd_leave(void *data, struct wl_data_device *d)
+{
+    (void)data; (void)d;
+    wl_offer_destroy(wl.dnd_offer);
+    wl.dnd_offer = NULL;
+    wl.dnd_window = NULL;
+}
+
+static void wl_dd_motion(void *data, struct wl_data_device *d, uint32_t time, wl_fixed_t x, wl_fixed_t y)
+{
+    (void)data; (void)d; (void)time;
+    wl.dnd_x = wl_fixed_to_double(x);
+    wl.dnd_y = wl_fixed_to_double(y);
+}
+
+static void wl_dd_drop(void *data, struct wl_data_device *d)
+{
+    (void)data; (void)d;
+    struct wl_data_offer *o = wl.dnd_offer;
+    vio_wl_window *w = wl.dnd_window;
+    wl.dnd_offer = NULL;
+    wl.dnd_window = NULL;
+    if (!o) return;
+    int fds[2];
+    if (w && wl_offer_has_uris(o) && pipe(fds) == 0) {
+        wl_data_offer_receive(o, "text/uri-list", fds[1]);
+        close(fds[1]);
+        wl_display_flush(wl.display);
+        /* the source writes and closes its end; a second without data ends it */
+        char *buf = NULL;
+        size_t len = 0, cap = 0;
+        for (;;) {
+            struct pollfd p = { fds[0], POLLIN, 0 };
+            if (poll(&p, 1, 1000) <= 0) break;
+            if (len + 4096 > cap) {
+                char *grown = (char *)realloc(buf, cap ? cap * 2 : 8192);
+                if (!grown) break;
+                buf = grown;
+                cap = cap ? cap * 2 : 8192;
+            }
+            ssize_t r = read(fds[0], buf + len, cap - len);
+            if (r <= 0) break;
+            len += (size_t)r;
+        }
+        close(fds[0]);
+        char **paths = NULL;
+        int n = buf ? vio_uri_list_paths(buf, len, &paths) : 0;
+        if (n > 0) vio_input_drop_event(w->input, n, (const char *const *)paths, wl.dnd_x, wl.dnd_y);
+        vio_uri_list_free(paths, n);
+        free(buf);
+        if (wl.ddm_version >= 3) wl_data_offer_finish(o);
+    }
+    wl_offer_destroy(o);
+}
+
+/* the clipboard's offer: vio keeps no Wayland clipboard, only frees it */
+static void wl_dd_selection(void *data, struct wl_data_device *d, struct wl_data_offer *o)
+{
+    (void)data; (void)d;
+    if (wl.sel_offer && wl.sel_offer != o) wl_offer_destroy(wl.sel_offer);
+    wl.sel_offer = o;
+}
+
+static const struct wl_data_device_listener wl_dd_listener = {
+    wl_dd_data_offer, wl_dd_enter, wl_dd_leave, wl_dd_motion, wl_dd_drop, wl_dd_selection,
+};
+
 static void wl_registry_global(void *data, struct wl_registry *r, uint32_t id, const char *iface, uint32_t version)
 {
     (void)data;
@@ -711,6 +832,9 @@ static void wl_registry_global(void *data, struct wl_registry *r, uint32_t id, c
     } else if (strcmp(iface, xdg_wm_base_interface.name) == 0) {
         wl.wm_base = wl_registry_bind(r, id, &xdg_wm_base_interface, 1);
         xdg_wm_base_add_listener(wl.wm_base, &wl_wm_listener, NULL);
+    } else if (strcmp(iface, wl_data_device_manager_interface.name) == 0 && !wl.ddm) {
+        wl.ddm_version = version < 3 ? version : 3;
+        wl.ddm = wl_registry_bind(r, id, &wl_data_device_manager_interface, wl.ddm_version);
     } else if (strcmp(iface, wl_seat_interface.name) == 0 && !wl.seat) {
         wl.seat = wl_registry_bind(r, id, &wl_seat_interface, version < 5 ? version : 5);
         wl_seat_add_listener(wl.seat, &wl_seat_listener, NULL);
@@ -754,6 +878,10 @@ static int wl_init(void)
     wl.registry = wl_display_get_registry(wl.display);
     wl_registry_add_listener(wl.registry, &wl_registry_listener, NULL);
     wl_display_roundtrip(wl.display);   /* globals */
+    if (wl.ddm && wl.seat) {
+        wl.data_device = wl_data_device_manager_get_data_device(wl.ddm, wl.seat);
+        wl_data_device_add_listener(wl.data_device, &wl_dd_listener, NULL);
+    }
     wl_display_roundtrip(wl.display);   /* seat capabilities, output modes, keymap */
     if (!wl.compositor || !wl.wm_base) {
         php_error_docref(NULL, E_WARNING, "Wayland: the compositor offers no %s", wl.compositor ? "xdg_wm_base" : "wl_compositor");
@@ -777,6 +905,10 @@ static int wl_init(void)
 static void wl_shutdown(void)
 {
     if (!wl.initialized) return;
+    wl_offer_destroy(wl.dnd_offer);
+    wl_offer_destroy(wl.sel_offer);
+    if (wl.data_device) wl_data_device_destroy(wl.data_device);
+    if (wl.ddm) wl_data_device_manager_destroy(wl.ddm);
     if (wl.cursor_surface) wl_surface_destroy(wl.cursor_surface);
     if (wl.cursor_theme) wl_cursor_theme_destroy(wl.cursor_theme);
     if (wl.xkb_state) xkb_state_unref(wl.xkb_state);
@@ -933,6 +1065,7 @@ static void wl_destroy_window(vio_window_handle h)
     if (w->image) { wl_buffer_destroy(w->image); w->image = NULL; }
     if (wl.keyboard_focus == w) wl.keyboard_focus = NULL;
     if (wl.pointer_focus == w) wl.pointer_focus = NULL;
+    if (wl.dnd_window == w) wl.dnd_window = NULL;
     if (w->egl_context) {
         if (egl.GetCurrentContext && egl.GetCurrentContext() == w->egl_context) egl.MakeCurrent(wl_egl_display, NULL, NULL, NULL);
         egl.DestroyContext(wl_egl_display, w->egl_context);
@@ -1267,6 +1400,7 @@ static const vio_platform vio_platform_wayland = {
     .set_size_limits      = wl_set_size_limits,
     .open_url             = vio_shell_open_url,
     .reveal_file          = vio_shell_reveal_file,
+    .accepts_drops        = 1,
 };
 
 void vio_platform_wayland_register(void)

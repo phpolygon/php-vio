@@ -360,6 +360,19 @@ void vio_input_refresh_event(vio_input_state *state)
     zval_ptr_dtor(&retval);
 }
 
+void vio_input_drop_event(vio_input_state *state, int count, const char *const *paths, double x, double y)
+{
+    if (!state || count <= 0 || !state->has_window_cb[VIO_WINDOW_CB_DROP]) return;
+    zval retval, args[3];
+    array_init_size(&args[0], (uint32_t)count);
+    for (int i = 0; i < count; i++) add_next_index_string(&args[0], paths[i]);
+    ZVAL_DOUBLE(&args[1], x);
+    ZVAL_DOUBLE(&args[2], y);
+    vio_window_cb_call(state, VIO_WINDOW_CB_DROP, 3, args, &retval);
+    zval_ptr_dtor(&retval);
+    zval_ptr_dtor(&args[0]);
+}
+
 /* ── Touch push API ─────────────────────────────────────────────────
  *
  * Implementation notes:
