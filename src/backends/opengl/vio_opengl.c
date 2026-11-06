@@ -1534,23 +1534,20 @@ static int opengl_create_layered_render_target(vio_render_target_object *rt, int
 
 static int opengl_create_render_target_impl(void *rt_ptr, int width, int height, int hdr, int depth_only);
 
-/* Creating a target binds its FBO and clears it; a target created mid-frame
- * (another one bound) used to leave the default framebuffer bound, so the next
- * draws and clears missed the bound target. The caller's FBO binding, depth
- * write mask and clear colour are restored. */
+/* Creating a target binds its FBO, clears it and leaves framebuffer 0 bound.
+ * A target created mid-frame while another vio render target is bound lost
+ * that binding: the next draws and clears missed the bound target. When a
+ * target is bound (vio_gl.current_bound_rt), its FBO binding as it was before
+ * the creation (plain, MSAA or a layer) is put back. With no target bound the
+ * screen path stays as it was: framebuffer 0. */
 static int opengl_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
 {
     if (!vio_gl.initialized) return -1;
     GLint prev_fbo = 0;
-    GLboolean prev_depth_mask = GL_TRUE;
-    GLfloat prev_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
-    glGetBooleanv(GL_DEPTH_WRITEMASK, &prev_depth_mask);
-    glGetFloatv(GL_COLOR_CLEAR_VALUE, prev_clear);
+    void *bound = vio_gl.current_bound_rt;
+    if (bound) glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
     int r = opengl_create_render_target_impl(rt_ptr, width, height, hdr, depth_only);
-    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
-    glDepthMask(prev_depth_mask);
-    glClearColor(prev_clear[0], prev_clear[1], prev_clear[2], prev_clear[3]);
+    if (bound && vio_gl.current_bound_rt == bound) glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
     return r;
 }
 
