@@ -345,7 +345,11 @@ typedef struct _vio_d3d12_state {
     /* DXGI */
     IDXGISwapChain3           *swapchain;
     IDXGIFactory4             *factory;
-    UINT                       frame_index;
+    UINT                       frame_index;   /* frame slot: allocator, fence, heap slices, rings */
+    /* Back buffer of the loaded swapchain (frames[back_index].render_target / rtv_handle).
+     * Separate from the frame slot since a second window (vio_window) presents
+     * its own swapchain through the same slots. */
+    UINT                       back_index;
 
     /* Tearing support (DXGI flag contract + VRR). Same as the D3D11 backend.
      *
