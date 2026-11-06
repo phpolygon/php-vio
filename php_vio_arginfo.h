@@ -11,11 +11,11 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_destroy, 0, 1, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_should_close, 0, 1, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_close, 0, 1, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_poll_events, 0, 1, IS_VOID, 0)
@@ -46,7 +46,7 @@ ZEND_END_ARG_INFO()
 /* ── Input functions ──────────────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_key_pressed, 0, 2, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, key, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
@@ -54,23 +54,23 @@ ZEND_END_ARG_INFO()
 #define arginfo_vio_key_released arginfo_vio_key_pressed
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_mouse_position, 0, 1, IS_ARRAY, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 #define arginfo_vio_mouse_delta arginfo_vio_mouse_position
 #define arginfo_vio_mouse_scroll arginfo_vio_mouse_position
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_touch_count, 0, 1, IS_LONG, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_touch_get, 0, 2, IS_ARRAY, 1)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, index, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_touch_inject, 0, 3, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, id, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, phase, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, x, IS_DOUBLE, 0, "0.0")
@@ -82,36 +82,45 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_wait_events, 0, 1, IS_VOID, 
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, timeout, IS_DOUBLE, 0, "-1.0")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_window, 0, 1, VioWindow, MAY_BE_FALSE)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_destroy_window, 0, 1, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, window, VioWindow, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_wake, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_close, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_focus, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_minimize, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_scale, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_refresh, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_window_event, 0, 2, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, event, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, a, IS_DOUBLE, 0, "0.0")
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, b, IS_DOUBLE, 0, "0.0")
@@ -121,12 +130,12 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_platform_info, 0, 0, IS_ARRA
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor, 0, 2, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, shape, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor_image, 0, 4, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, rgba, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO(0, width, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, height, IS_LONG, 0)
@@ -135,12 +144,12 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor_image, 0, 4, _IS_
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_icon, 0, 2, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, images, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_size_limits, 0, 3, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, min_width, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, min_height, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, max_width, IS_LONG, 0, "-1")
@@ -148,18 +157,18 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_size_limits, 0, 3
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_aspect_ratio, 0, 3, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, numerator, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, denominator, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_floating, 0, 2, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, floating, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_opacity, 0, 2, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, opacity, IS_DOUBLE, 0)
 ZEND_END_ARG_INFO()
 
@@ -172,24 +181,24 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_reveal_file, 0, 1, _IS_BOOL,
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_drop, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_drop, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, paths, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, x, IS_DOUBLE, 0, "0.0")
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, y, IS_DOUBLE, 0, "0.0")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_file_dialog, 0, 1, MAY_BE_ARRAY|MAY_BE_FALSE|MAY_BE_NULL)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_message_box, 0, 3, MAY_BE_LONG|MAY_BE_FALSE)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, title, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO(0, message, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
@@ -220,7 +229,7 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_notify, 0, 1, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_progress, 0, 2, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, progress, IS_DOUBLE, 1)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, state, IS_STRING, 0, "\"normal\"")
 ZEND_END_ARG_INFO()
@@ -233,19 +242,19 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_tray_remove, 0, 0, _IS_BOOL,
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_preedit, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_preedit, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, text, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, start, IS_LONG, 0, "-1")
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, end, IS_LONG, 0, "-1")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_ime_rect, 0, 5, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, x, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, y, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, width, IS_LONG, 0)
@@ -253,41 +262,41 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_ime_rect, 0, 5, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_ime_enable, 0, 2, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, enabled, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor_mode, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, mode, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_mouse_button, 0, 2, _IS_BOOL, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, button, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_key, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_resize, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_char, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_chars_typed, 0, 1, IS_STRING, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_ime_backspaces, 0, 1, IS_LONG, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_clipboard_get, 0, 0, IS_STRING, 0)
@@ -314,7 +323,7 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_toggle_fullscreen, 0, 1, IS_
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_title, 0, 2, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, title, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
@@ -339,19 +348,19 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_get_auto_iconify, 0, 1, _IS_
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_window_size, 0, 1, IS_ARRAY, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_native_window_handle, 0, 1, IS_LONG, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_framebuffer_size, 0, 1, IS_ARRAY, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_content_scale, 0, 1, IS_ARRAY, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_monitor_info, 0, 1, IS_ARRAY, 0)
@@ -368,7 +377,7 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_video_modes, 0, 1, IS_ARRAY,
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_pixel_ratio, 0, 1, IS_DOUBLE, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 /* ── Mesh/Draw functions ──────────────────────────────────────────── */
@@ -1037,32 +1046,32 @@ ZEND_END_ARG_INFO()
 /* ── Input injection functions ────────────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_key, 0, 3, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, key, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, action, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, mods, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_mouse_move, 0, 3, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, x, IS_DOUBLE, 0)
 	ZEND_ARG_TYPE_INFO(0, y, IS_DOUBLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_mouse_button, 0, 3, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, button, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, action, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_scroll, 0, 3, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, dx, IS_DOUBLE, 0)
 	ZEND_ARG_TYPE_INFO(0, dy, IS_DOUBLE, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_char, 0, 2, IS_LONG, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_MASK(0, input, MAY_BE_LONG|MAY_BE_STRING, NULL)
 ZEND_END_ARG_INFO()
 
@@ -1109,7 +1118,7 @@ ZEND_END_ARG_INFO()
 /* ── Headless / Screenshot functions ─────────────────────────────── */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_vio_read_pixels, 0, 1, MAY_BE_STRING|MAY_BE_FALSE)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_save_screenshot, 0, 2, _IS_BOOL, 0)
@@ -1340,7 +1349,7 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_bind_cubemap, 0, 2, IS_VOID,
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_size, 0, 3, IS_VOID, 0)
-	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, width, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO(0, height, IS_LONG, 0)
 ZEND_END_ARG_INFO()
@@ -1418,6 +1427,8 @@ ZEND_FUNCTION(vio_open_url);
 ZEND_FUNCTION(vio_reveal_file);
 ZEND_FUNCTION(vio_wait_events);
 ZEND_FUNCTION(vio_wake);
+ZEND_FUNCTION(vio_window);
+ZEND_FUNCTION(vio_destroy_window);
 ZEND_FUNCTION(vio_on_close);
 ZEND_FUNCTION(vio_on_focus);
 ZEND_FUNCTION(vio_on_minimize);
@@ -1688,6 +1699,8 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_reveal_file, arginfo_vio_reveal_file)
 	ZEND_FE(vio_wait_events, arginfo_vio_wait_events)
 	ZEND_FE(vio_wake, arginfo_vio_wake)
+	ZEND_FE(vio_window, arginfo_vio_window)
+	ZEND_FE(vio_destroy_window, arginfo_vio_destroy_window)
 	ZEND_FE(vio_on_close, arginfo_vio_on_close)
 	ZEND_FE(vio_on_focus, arginfo_vio_on_focus)
 	ZEND_FE(vio_on_minimize, arginfo_vio_on_minimize)

@@ -84,8 +84,42 @@ typedef struct _vio_context_object {
     /* vio_upscale: passes, history and intermediates (php_vio.c), released
      * before the backend shuts down. */
     void              *upscale;
+    /* vio_window (DESKTOP-APP-PLAN Phase 4): the context's further windows
+     * (not referenced; each removes itself when freed), and the one the open
+     * frame / readback renders into with what it displaced (frame_saved_*). */
+#define VIO_MAX_WINDOWS 16
+    struct _vio_window_object *windows[VIO_MAX_WINDOWS];
+    int                window_count;
+    struct _vio_window_object *frame_window;
+    void              *frame_saved_window;
+    vio_config         frame_saved_config;
+    int                frame_saved_2d_w, frame_saved_2d_h, frame_saved_fb_w, frame_saved_fb_h;
     zend_object        std;
 } vio_context_object;
+
+/* VioWindow: a further window on a context's device. `view` is a context
+ * record holding only the window-side state (platform window, input, close
+ * flag, config sizes, backend pointer), so the window, input and size
+ * functions run on it unchanged; GPU state stays in the owner. */
+typedef struct _vio_window_object {
+    vio_context_object  view;
+    zend_object        *owner;       /* the VioContext, referenced while the window lives */
+    void               *swapchain;   /* backend->create_swapchain */
+    zend_object         std;
+} vio_window_object;
+
+extern zend_class_entry *vio_window_ce;
+
+static inline vio_window_object *vio_window_from_obj(zend_object *obj) {
+    return (vio_window_object *)((char *)obj - XtOffsetOf(vio_window_object, std));
+}
+
+#define Z_VIO_WINDOW_P(zv) vio_window_from_obj(Z_OBJ_P(zv))
+
+/* Close the window: swapchain, platform window, the owner's reference. Idempotent. */
+void vio_window_object_close(vio_window_object *w);
+/* vio_destroy: close every window of the context. */
+void vio_context_close_windows(vio_context_object *ctx);
 
 /* Drop the vio_texture_index() references (before the backend shuts down). */
 void vio_context_bindless_clear(vio_context_object *ctx);
@@ -101,5 +135,9 @@ static inline vio_context_object *vio_context_from_obj(zend_object *obj) {
 }
 
 #define Z_VIO_CONTEXT_P(zv) vio_context_from_obj(Z_OBJ_P(zv))
+
+static inline vio_context_object *vio_window_owner(vio_window_object *w) {
+    return w->owner ? vio_context_from_obj(w->owner) : NULL;
+}
 
 #endif /* VIO_CONTEXT_H */

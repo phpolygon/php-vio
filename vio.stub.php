@@ -48,12 +48,12 @@ function vio_destroy(VioContext $context): void {}
 /**
  * Check if the context window should close.
  */
-function vio_should_close(VioContext $context): bool {}
+function vio_should_close(VioContext|VioWindow $context): bool {}
 
 /**
  * Request the context window to close.
  */
-function vio_close(VioContext $context): void {}
+function vio_close(VioContext|VioWindow $context): void {}
 
 /**
  * Poll for pending window/input events.
@@ -75,13 +75,13 @@ function vio_platform_info(): array {}
  * Set the cursor over the window to a standard shape (VIO_CURSOR_SHAPE_*).
  * Anything else throws a ValueError.
  */
-function vio_set_cursor(VioContext $context, int $shape): bool {}
+function vio_set_cursor(VioContext|VioWindow $context, int $shape): bool {}
 
 /**
  * Set the cursor over the window to an RGBA image (top row first, 1..256
  * pixels a side) with its hot spot; vio_set_cursor() goes back to a shape.
  */
-function vio_set_cursor_image(VioContext $context, string $rgba, int $width, int $height, int $hot_x = 0, int $hot_y = 0): bool {}
+function vio_set_cursor_image(VioContext|VioWindow $context, string $rgba, int $width, int $height, int $hot_x = 0, int $hot_y = 0): bool {}
 
 /**
  * Set the window icon from RGBA images of several sizes; the platform picks
@@ -90,7 +90,7 @@ function vio_set_cursor_image(VioContext $context, string $rgba, int $width, int
  *
  * @param list<array{data: string, width: int, height: int}> $images
  */
-function vio_set_window_icon(VioContext $context, array $images): bool {}
+function vio_set_window_icon(VioContext|VioWindow $context, array $images): bool {}
 
 /**
  * Limit the window size (logical pixels as in vio_window_size, -1 = no limit).
@@ -98,22 +98,22 @@ function vio_set_window_icon(VioContext $context, array $images): bool {}
  * on every platform (the return value says whether the platform enforces them
  * for the user too).
  */
-function vio_set_window_size_limits(VioContext $context, int $min_width, int $min_height, int $max_width = -1, int $max_height = -1): bool {}
+function vio_set_window_size_limits(VioContext|VioWindow $context, int $min_width, int $min_height, int $max_width = -1, int $max_height = -1): bool {}
 
 /**
  * Keep the window's aspect ratio while the user resizes; 0, 0 frees it.
  */
-function vio_set_window_aspect_ratio(VioContext $context, int $numerator, int $denominator): bool {}
+function vio_set_window_aspect_ratio(VioContext|VioWindow $context, int $numerator, int $denominator): bool {}
 
 /**
  * Keep the window above other windows (tool palettes).
  */
-function vio_set_window_floating(VioContext $context, bool $floating): bool {}
+function vio_set_window_floating(VioContext|VioWindow $context, bool $floating): bool {}
 
 /**
  * Whole-window opacity 0.0 .. 1.0.
  */
-function vio_set_window_opacity(VioContext $context, float $opacity): bool {}
+function vio_set_window_opacity(VioContext|VioWindow $context, float $opacity): bool {}
 
 /**
  * Open a URL in its default application (browser, mail client). It needs a
@@ -143,7 +143,7 @@ function vio_reveal_file(string $path): bool {}
  *              filters?: list<array{name: string, extensions: list<string>}>} $options
  * @return list<string>|null|false
  */
-function vio_file_dialog(VioContext $context, array $options = []): array|false|null {}
+function vio_file_dialog(VioContext|VioWindow $context, array $options = []): array|false|null {}
 
 /**
  * Show a modal message box and return the index of the pressed button
@@ -153,7 +153,7 @@ function vio_file_dialog(VioContext $context, array $options = []): array|false|
  *
  * @param array{buttons?: list<string>, kind?: string} $options
  */
-function vio_message_box(VioContext $context, string $title, string $message, array $options = []): int|false {}
+function vio_message_box(VioContext|VioWindow $context, string $title, string $message, array $options = []): int|false {}
 
 /**
  * Set the window's menu bar (macOS: the application's, after the app menu
@@ -198,7 +198,7 @@ function vio_notify(string $title, string $body = '', array $options = []): bool
  * entry: 0.0 .. 1.0, null hides it. $state: 'normal', 'paused', 'error',
  * 'indeterminate' (needs no value). Linux needs vio.app_id (the .desktop id).
  */
-function vio_set_progress(VioContext $context, ?float $progress, string $state = 'normal'): bool {}
+function vio_set_progress(VioContext|VioWindow $context, ?float $progress, string $state = 'normal'): bool {}
 
 /**
  * Show or update the process's tray icon (one per process). Options: 'icon' =>
@@ -229,25 +229,25 @@ function vio_tray_remove(): bool {}
  *
  * @param callable(string, int, int): void $callback
  */
-function vio_on_preedit(VioContext $context, callable $callback): void {}
+function vio_on_preedit(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
  * A composition through the same path as the platform's (tests). -1 = after
  * the text; start <= end <= the text's length in codepoints.
  */
-function vio_inject_preedit(VioContext $context, string $text, int $start = -1, int $end = -1): void {}
+function vio_inject_preedit(VioContext|VioWindow $context, string $text, int $start = -1, int $end = -1): void {}
 
 /**
  * Where the text being composed is (window coordinates as vio_mouse_position),
  * so the IME puts its candidate window next to it.
  */
-function vio_ime_rect(VioContext $context, int $x, int $y, int $width, int $height): bool {}
+function vio_ime_rect(VioContext|VioWindow $context, int $x, int $y, int $width, int $height): bool {}
 
 /**
  * Turn the IME on (text fields) or off (game controls: keys go straight
  * through).
  */
-function vio_ime_enable(VioContext $context, bool $enabled): bool {}
+function vio_ime_enable(VioContext|VioWindow $context, bool $enabled): bool {}
 
 /**
  * Like vio_poll_events(), but first blocks until an event arrives, $timeout
@@ -265,20 +265,31 @@ function vio_wait_events(VioContext $context, float $timeout = -1.0): void {}
 function vio_wake(): void {}
 
 /**
+ * A further window on the context's device (VIO_FEATURE_MULTI_WINDOW, otherwise false).
+ * Render into it with vio_begin($context, ['window' => $window]); window, input and size
+ * functions take it in place of the context.
+ * @param array{width?: int, height?: int, title?: string, headless?: bool, vsync?: bool} $options
+ */
+function vio_window(VioContext $context, array $options = []): VioWindow|false {}
+
+/** Close a window now (swapchain and platform window). */
+function vio_destroy_window(VioWindow $window): bool {}
+
+/**
  * Called when the user asks to close the window (close button, Alt+F4, Cmd+Q
  * on the window). Return false to keep it open; anything else closes it
  * (vio_should_close() becomes true).
  *
  * @param callable(): (bool|null) $callback
  */
-function vio_on_close(VioContext $context, callable $callback): void {}
+function vio_on_close(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
  * Called when the window gains (true) or loses (false) keyboard focus.
  *
  * @param callable(bool): void $callback
  */
-function vio_on_focus(VioContext $context, callable $callback): void {}
+function vio_on_focus(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
  * Called when the window is minimized (true) or restored (false). Wayland
@@ -286,7 +297,7 @@ function vio_on_focus(VioContext $context, callable $callback): void {}
  *
  * @param callable(bool): void $callback
  */
-function vio_on_minimize(VioContext $context, callable $callback): void {}
+function vio_on_minimize(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
  * Called when the window's content scale changes (moved to a monitor with
@@ -294,7 +305,7 @@ function vio_on_minimize(VioContext $context, callable $callback): void {}
  *
  * @param callable(float, float): void $callback
  */
-function vio_on_scale(VioContext $context, callable $callback): void {}
+function vio_on_scale(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
  * Called when the OS wants the window's content drawn again (exposed, or
@@ -303,7 +314,7 @@ function vio_on_scale(VioContext $context, callable $callback): void {}
  *
  * @param callable(): void $callback
  */
-function vio_on_refresh(VioContext $context, callable $callback): void {}
+function vio_on_refresh(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
  * Called when files are dropped on the window: their paths (UTF-8) and the
@@ -312,7 +323,7 @@ function vio_on_refresh(VioContext $context, callable $callback): void {}
  *
  * @param callable(list<string>, float, float): void $callback
  */
-function vio_on_drop(VioContext $context, callable $callback): void {}
+function vio_on_drop(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
  * Begin a new frame. Must be paired with vio_end().
@@ -326,7 +337,10 @@ function vio_on_drop(VioContext $context, callable $callback): void {}
  * keeps its old rule: a target still bound at vio_end skips the present, and on
  * Vulkan a target bound before vio_begin does too (deprecated, E_DEPRECATED once).
  *
- * @param array{present?: bool} $options
+ * 'window' => VioWindow renders the frame into that window of the context
+ * (VIO_FEATURE_MULTI_WINDOW); vio_end presents it, the main window is untouched.
+ *
+ * @param array{present?: bool, window?: VioWindow|null} $options
  */
 function vio_begin(VioContext $context, array $options = []): void {}
 
@@ -352,50 +366,50 @@ function vio_clear(VioContext $context, float $r = 0.1, float $g = 0.1, float $b
 /**
  * Check if a key is currently held down.
  */
-function vio_key_pressed(VioContext $context, int $key): bool {}
+function vio_key_pressed(VioContext|VioWindow $context, int $key): bool {}
 
 /**
  * Check if a key was pressed this frame (not held from previous).
  */
-function vio_key_just_pressed(VioContext $context, int $key): bool {}
+function vio_key_just_pressed(VioContext|VioWindow $context, int $key): bool {}
 
 /**
  * Check if a key was released this frame.
  */
-function vio_key_released(VioContext $context, int $key): bool {}
+function vio_key_released(VioContext|VioWindow $context, int $key): bool {}
 
 /**
  * Get the current mouse position.
  *
  * @return array{0: float, 1: float}
  */
-function vio_mouse_position(VioContext $context): array {}
+function vio_mouse_position(VioContext|VioWindow $context): array {}
 
 /**
  * Get the mouse movement delta since last frame.
  *
  * @return array{0: float, 1: float}
  */
-function vio_mouse_delta(VioContext $context): array {}
+function vio_mouse_delta(VioContext|VioWindow $context): array {}
 
 /**
  * Check if a mouse button is currently pressed.
  */
-function vio_mouse_button(VioContext $context, int $button): bool {}
+function vio_mouse_button(VioContext|VioWindow $context, int $button): bool {}
 
 /**
  * Get the scroll wheel delta for this frame.
  *
  * @return array{0: float, 1: float}
  */
-function vio_mouse_scroll(VioContext $context): array {}
+function vio_mouse_scroll(VioContext|VioWindow $context): array {}
 
 /**
  * Number of active touches this frame. Always 0 on platforms without a
  * touch surface (macOS, Linux, Windows desktop). Driven by platform
  * backends on iOS / iPadOS, or by vio_touch_inject() for tests.
  */
-function vio_touch_count(VioContext $context): int {}
+function vio_touch_count(VioContext|VioWindow $context): int {}
 
 /**
  * Return the active touch at compacted index $idx (0..vio_touch_count-1),
@@ -408,7 +422,7 @@ function vio_touch_count(VioContext $context): int {}
  *
  * @return array{id: int, x: float, y: float, phase: int, delta_x: float, delta_y: float}|null
  */
-function vio_touch_get(VioContext $context, int $index): ?array {}
+function vio_touch_get(VioContext|VioWindow $context, int $index): ?array {}
 
 /**
  * Inject a synthetic touch event. Used by tests and headless replays;
@@ -419,45 +433,45 @@ function vio_touch_get(VioContext $context, int $index): ?array {}
  * Returns true on success; false when the touch array is full (BEGAN)
  * or the phase is unknown.
  */
-function vio_touch_inject(VioContext $context, int $id, int $phase, float $x = 0.0, float $y = 0.0): bool {}
+function vio_touch_inject(VioContext|VioWindow $context, int $id, int $phase, float $x = 0.0, float $y = 0.0): bool {}
 
 /**
  * Set cursor mode: VIO_CURSOR_NORMAL (0), VIO_CURSOR_DISABLED (1), VIO_CURSOR_HIDDEN (2).
  * Disabled mode hides the cursor, confines it, and enables raw mouse motion for FPS controls.
  */
-function vio_set_cursor_mode(VioContext $context, int $mode): void {}
+function vio_set_cursor_mode(VioContext|VioWindow $context, int $mode): void {}
 
 /**
  * Register a callback for key events.
  *
  * @param callable(int $key, int $action, int $mods): void $callback
  */
-function vio_on_key(VioContext $context, callable $callback): void {}
+function vio_on_key(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
  * Register a callback for window resize events.
  *
  * @param callable(int $width, int $height): void $callback
  */
-function vio_on_resize(VioContext $context, callable $callback): void {}
+function vio_on_resize(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
  * Register a callback for character input events (Unicode codepoints).
  *
  * @param callable(int $codepoint): void $callback
  */
-function vio_on_char(VioContext $context, callable $callback): void {}
+function vio_on_char(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
  * Get all characters typed this frame as a UTF-8 string.
  */
-function vio_chars_typed(VioContext $context): string {}
+function vio_chars_typed(VioContext|VioWindow $context): string {}
 
 /**
  * Number of on-screen-keyboard backspaces since the last call (read-and-clear).
  * Non-zero only on iOS; 0 on desktop (physical Backspace uses the key API).
  */
-function vio_ime_backspaces(VioContext $context): int {}
+function vio_ime_backspaces(VioContext|VioWindow $context): int {}
 
 /**
  * Read the clipboard as UTF-8 text. Process-wide, no context needed.
@@ -510,7 +524,7 @@ function vio_toggle_fullscreen(VioContext $context): void {}
 /**
  * Set the window title.
  */
-function vio_set_title(VioContext $context, string $title): void {}
+function vio_set_title(VioContext|VioWindow $context, string $title): void {}
 
 /**
  * Switch to borderless windowed mode (maximized, no decorations).
@@ -553,7 +567,7 @@ function vio_get_auto_iconify(VioContext $context): bool {}
  *
  * @return array{0: int, 1: int}
  */
-function vio_window_size(VioContext $context): array {}
+function vio_window_size(VioContext|VioWindow $context): array {}
 
 /**
  * Returns the platform-native window handle as an integer:
@@ -563,21 +577,21 @@ function vio_window_size(VioContext $context): array {}
  *
  * Returns 0 if no window exists or the platform is unsupported.
  */
-function vio_native_window_handle(VioContext $context): int {}
+function vio_native_window_handle(VioContext|VioWindow $context): int {}
 
 /**
  * Get the framebuffer size in pixels.
  *
  * @return array{0: int, 1: int}
  */
-function vio_framebuffer_size(VioContext $context): array {}
+function vio_framebuffer_size(VioContext|VioWindow $context): array {}
 
 /**
  * Get the window content scale (HiDPI).
  *
  * @return array{0: float, 1: float}
  */
-function vio_content_scale(VioContext $context): array {}
+function vio_content_scale(VioContext|VioWindow $context): array {}
 
 /**
  * Get information about the primary monitor: native video mode (physical
@@ -610,7 +624,7 @@ function vio_video_modes(VioContext $context, int $monitor = -1): array {}
 /**
  * Get the pixel ratio (framebuffer width / window width).
  */
-function vio_pixel_ratio(VioContext $context): float {}
+function vio_pixel_ratio(VioContext|VioWindow $context): float {}
 
 /**
  * Create a mesh from vertex data.
@@ -1795,7 +1809,7 @@ function vio_stream_stop(VioStream $stream): void {}
  * @param int $action VIO_PRESS, VIO_RELEASE or VIO_REPEAT (anything else throws a ValueError)
  * @param int $mods   VIO_MOD_* bitmask passed to the vio_on_key callback
  */
-function vio_inject_key(VioContext $context, int $key, int $action, int $mods = 0): void {}
+function vio_inject_key(VioContext|VioWindow $context, int $key, int $action, int $mods = 0): void {}
 
 /**
  * Inject a simulated cursor move.
@@ -1807,14 +1821,14 @@ function vio_inject_key(VioContext $context, int $key, int $action, int $mods = 
  * vio_content_scale()). vio_mouse_delta() is measured against the position at
  * the last vio_begin().
  */
-function vio_inject_mouse_move(VioContext $context, float $x, float $y): void {}
+function vio_inject_mouse_move(VioContext|VioWindow $context, float $x, float $y): void {}
 
 /**
  * Inject a simulated mouse button event.
  *
  * @param int $action VIO_PRESS or VIO_RELEASE (VIO_REPEAT counts as held; anything else throws a ValueError)
  */
-function vio_inject_mouse_button(VioContext $context, int $button, int $action): void {}
+function vio_inject_mouse_button(VioContext|VioWindow $context, int $button, int $action): void {}
 
 /**
  * Inject a simulated scroll-wheel event.
@@ -1822,7 +1836,7 @@ function vio_inject_mouse_button(VioContext $context, int $button, int $action):
  * Accumulates into vio_mouse_scroll() the way wheel events do; vio_begin()
  * resets it to zero, so inject before the game reads scroll for the frame.
  */
-function vio_inject_scroll(VioContext $context, float $dx, float $dy): void {}
+function vio_inject_scroll(VioContext|VioWindow $context, float $dx, float $dy): void {}
 
 /**
  * Inject a window event through the same path as the OS one.
@@ -1833,7 +1847,7 @@ function vio_inject_scroll(VioContext $context, float $dx, float $dy): void {}
  * VIO_WINDOW_EVENT_REFRESH runs vio_on_refresh. Focus, minimize and scale fire
  * their callback only on a change. Anything else throws a ValueError.
  */
-function vio_inject_window_event(VioContext $context, int $event, float $a = 0.0, float $b = 0.0): bool {}
+function vio_inject_window_event(VioContext|VioWindow $context, int $event, float $a = 0.0, float $b = 0.0): bool {}
 
 /**
  * Drop files on the window through the same path as a real drop
@@ -1841,7 +1855,7 @@ function vio_inject_window_event(VioContext $context, int $event, float $a = 0.0
  *
  * @param list<string> $paths
  */
-function vio_inject_drop(VioContext $context, array $paths, float $x = 0.0, float $y = 0.0): void {}
+function vio_inject_drop(VioContext|VioWindow $context, array $paths, float $x = 0.0, float $y = 0.0): void {}
 
 /**
  * Inject typed text.
@@ -1855,7 +1869,7 @@ function vio_inject_drop(VioContext $context, array $paths, float $x = 0.0, floa
  *
  * @return int Number of codepoints emitted
  */
-function vio_inject_char(VioContext $context, int|string $input): int {}
+function vio_inject_char(VioContext|VioWindow $context, int|string $input): int {}
 
 /**
  * Connect a virtual gamepad in slot $id (0-15), or reset the one already there.
@@ -1959,7 +1973,7 @@ function vio_input_replaying(VioContext $context): bool {}
  *
  * @return string|false RGBA pixel data (width * height * 4 bytes) or false on failure
  */
-function vio_read_pixels(VioContext $context): string|false {}
+function vio_read_pixels(VioContext|VioWindow $context): string|false {}
 
 /**
  * Save the current framebuffer as a PNG screenshot.
@@ -2499,7 +2513,7 @@ function vio_bind_cubemap(VioContext $context, VioCubemap $cubemap, int $slot = 
  * here reads back unchanged. On a scaled monitor that is not the same as the
  * platform's screen coordinates; the conversion happens internally.
  */
-function vio_set_window_size(VioContext $context, int $width, int $height): void {}
+function vio_set_window_size(VioContext|VioWindow $context, int $width, int $height): void {}
 
 /**
  * Diagnostics for the OpenGL backend (issue #3 part 3).

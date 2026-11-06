@@ -636,6 +636,9 @@ ZEND_FUNCTION(vio_benchmark_backends)
  * the attempt's warnings are suppressed; the last candidate reports normally. */
 #define VIO_CREATE_FAIL() do { if (vio_quiet) EG(error_reporting) = vio_saved_er; if (auto_pick && tried_n < 8) { tried[tried_n++] = backend; goto pick_backend; } RETURN_FALSE; } while (0)
 
+static vio_context_object *vio_ctx_target(zval *zv, uint32_t arg);
+static void vio_window_leave(vio_context_object *ctx);
+
 ZEND_FUNCTION(vio_create)
 {
     char *backend_name = NULL;
@@ -993,6 +996,8 @@ ZEND_FUNCTION(vio_destroy)
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
 
+    if (ctx->frame_window) vio_window_leave(ctx);
+    vio_context_close_windows(ctx);
     /* Release the draw-time bind table before the GPU objects behind it go away. */
     vio_pending_textures_clear(ctx);
     vio_context_bindless_clear(ctx);
@@ -1045,10 +1050,11 @@ ZEND_FUNCTION(vio_should_close)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     if (ctx->should_close) {
         RETURN_TRUE;
@@ -1067,10 +1073,11 @@ ZEND_FUNCTION(vio_close)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     ctx->should_close = 1;
 
     if (ctx->window) {
@@ -1140,15 +1147,17 @@ static void vio_set_window_callback(INTERNAL_FUNCTION_PARAMETERS, vio_window_cb 
     zval *callback;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_ZVAL(callback)
     ZEND_PARSE_PARAMETERS_END();
 
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     if (!zend_is_callable(callback, 0, NULL)) {
         zend_argument_type_error(2, "must be a valid callback");
         RETURN_THROWS();
     }
-    vio_input_set_window_cb(&Z_VIO_CONTEXT_P(ctx_zval)->input, which, callback);
+    vio_input_set_window_cb(&ctx->input, which, callback);
 }
 
 ZEND_FUNCTION(vio_on_close)    { vio_set_window_callback(INTERNAL_FUNCTION_PARAM_PASSTHRU, VIO_WINDOW_CB_CLOSE); }
@@ -1166,12 +1175,14 @@ ZEND_FUNCTION(vio_inject_preedit)
     zend_string *text;
     zend_long start = -1, end = -1;
     ZEND_PARSE_PARAMETERS_START(2, 4)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_STR(text)
         Z_PARAM_OPTIONAL
         Z_PARAM_LONG(start)
         Z_PARAM_LONG(end)
     ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *tctx = vio_ctx_target(ctx_zval, 1);
+    if (!tctx) RETURN_THROWS();
     size_t cps = 0;
     for (size_t i = 0; i < ZSTR_LEN(text); i++) if (((unsigned char)ZSTR_VAL(text)[i] & 0xC0) != 0x80) cps++;
     if (memchr(ZSTR_VAL(text), 0, ZSTR_LEN(text))) { zend_argument_value_error(2, "must not hold NUL bytes"); RETURN_THROWS(); }
@@ -1181,7 +1192,7 @@ ZEND_FUNCTION(vio_inject_preedit)
         zend_argument_value_error(3, "and argument #4 must lie within the text, start <= end");
         RETURN_THROWS();
     }
-    vio_input_preedit_event(&Z_VIO_CONTEXT_P(ctx_zval)->input, ZSTR_VAL(text), (int)start, (int)end);
+    vio_input_preedit_event(&tctx->input, ZSTR_VAL(text), (int)start, (int)end);
 }
 
 
@@ -1192,12 +1203,14 @@ ZEND_FUNCTION(vio_inject_drop)
     HashTable *list;
     double x = 0.0, y = 0.0;
     ZEND_PARSE_PARAMETERS_START(2, 4)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_ARRAY_HT(list)
         Z_PARAM_OPTIONAL
         Z_PARAM_DOUBLE(x)
         Z_PARAM_DOUBLE(y)
     ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *tctx = vio_ctx_target(ctx_zval, 1);
+    if (!tctx) RETURN_THROWS();
     uint32_t n = zend_hash_num_elements(list);
     if (n == 0 || n > 4096) {
         zend_argument_value_error(2, "must hold 1 to 4096 paths");
@@ -1214,7 +1227,7 @@ ZEND_FUNCTION(vio_inject_drop)
         }
         paths[i++] = Z_STRVAL_P(entry);
     } ZEND_HASH_FOREACH_END();
-    vio_input_drop_event(&Z_VIO_CONTEXT_P(ctx_zval)->input, (int)n, paths, x, y);
+    vio_input_drop_event(&tctx->input, (int)n, paths, x, y);
     efree(paths);
 }
 
@@ -1279,7 +1292,144 @@ static int vio_ctx_supports_feature(vio_context_object *ctx, int feature)
 {
     if (!ctx->backend) return 0;
     if (feature == VIO_FEATURE_EXPLICIT_PRESENT) return 1;
+    if (feature == VIO_FEATURE_MULTI_WINDOW) return ctx->backend->create_swapchain && ctx->window && vio_platform_has_windows();
     return ctx->backend->supports_feature && ctx->backend->supports_feature((vio_feature)feature) != 0;
+}
+
+/* ── Further windows (DESKTOP-APP-PLAN Phase 4) ─────────────────────── */
+
+/* A VioContext or VioWindow argument: the context record the window, input
+ * and size functions work on (for a window its view). NULL + exception when
+ * it is neither, or a closed window. */
+static vio_context_object *vio_ctx_target(zval *zv, uint32_t arg)
+{
+    if (Z_OBJCE_P(zv) == vio_context_ce) return Z_VIO_CONTEXT_P(zv);
+    if (Z_OBJCE_P(zv) == vio_window_ce) {
+        vio_window_object *w = Z_VIO_WINDOW_P(zv);
+        if (!w->owner) {
+            zend_argument_value_error(arg, "is a closed window");
+            return NULL;
+        }
+        return &w->view;
+    }
+    zend_argument_type_error(arg, "must be of type VioContext|VioWindow, %s given", zend_zval_value_name(zv));
+    return NULL;
+}
+
+/* Point the context at a window for a frame or a readback: its platform
+ * window, sizes and swapchain; the 2D projection follows in vio_begin. */
+static void vio_window_enter(vio_context_object *ctx, vio_window_object *w)
+{
+    ctx->frame_window = w;
+    ctx->frame_saved_window = ctx->window;
+    ctx->frame_saved_config = ctx->config;
+    ctx->frame_saved_2d_w = ctx->state_2d.width;
+    ctx->frame_saved_2d_h = ctx->state_2d.height;
+    ctx->frame_saved_fb_w = ctx->state_2d.fb_width;
+    ctx->frame_saved_fb_h = ctx->state_2d.fb_height;
+    ctx->window = w->view.window;
+    ctx->config.width = w->view.config.width;
+    ctx->config.height = w->view.config.height;
+    ctx->config.headless = w->view.config.headless;
+    ctx->config.vsync = w->view.config.vsync;
+    ctx->backend->set_swapchain(w->swapchain);
+}
+
+static void vio_window_leave(vio_context_object *ctx)
+{
+    if (!ctx->frame_window) return;
+    ctx->backend->set_swapchain(NULL);
+    ctx->window = ctx->frame_saved_window;
+    ctx->config = ctx->frame_saved_config;
+    if (ctx->frame_saved_2d_w > 0 && ctx->frame_saved_2d_h > 0
+        && (ctx->state_2d.width != ctx->frame_saved_2d_w || ctx->state_2d.height != ctx->frame_saved_2d_h)) {
+        vio_2d_set_size(&ctx->state_2d, ctx->frame_saved_2d_w, ctx->frame_saved_2d_h);
+    }
+    ctx->state_2d.fb_width = ctx->frame_saved_fb_w;
+    ctx->state_2d.fb_height = ctx->frame_saved_fb_h;
+    if (ctx->backend->set_viewport && ctx->frame_saved_fb_w > 0)
+        ctx->backend->set_viewport(0, 0, ctx->frame_saved_fb_w, ctx->frame_saved_fb_h);
+    ctx->frame_window = NULL;
+}
+
+/* vio_window($ctx, ['width', 'height', 'title', 'headless', 'vsync']): a further
+ * window on the context's device. false where the backend cannot (feature
+ * VIO_FEATURE_MULTI_WINDOW). */
+ZEND_FUNCTION(vio_window)
+{
+    zval *ctx_zval;
+    HashTable *opts = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !vio_ctx_supports_feature(ctx, VIO_FEATURE_MULTI_WINDOW)) RETURN_FALSE;
+    if (ctx->window_count >= VIO_MAX_WINDOWS) {
+        php_error_docref(NULL, E_WARNING, "vio_window: at most %d windows per context", VIO_MAX_WINDOWS);
+        RETURN_FALSE;
+    }
+
+    vio_config cfg = ctx->config;
+    cfg.width = 640;
+    cfg.height = 480;
+    cfg.title = "";
+    if (opts) {
+        zval *v;
+        if ((v = zend_hash_str_find(opts, "width", sizeof("width") - 1))) cfg.width = (int)zval_get_long(v);
+        if ((v = zend_hash_str_find(opts, "height", sizeof("height") - 1))) cfg.height = (int)zval_get_long(v);
+        if ((v = zend_hash_str_find(opts, "headless", sizeof("headless") - 1))) cfg.headless = zend_is_true(v);
+        if ((v = zend_hash_str_find(opts, "vsync", sizeof("vsync") - 1))) cfg.vsync = zend_is_true(v);
+        if ((v = zend_hash_str_find(opts, "title", sizeof("title") - 1))) {
+            if (Z_TYPE_P(v) != IS_STRING) { zend_argument_type_error(2, "option \"title\" must be a string"); RETURN_THROWS(); }
+            cfg.title = Z_STRVAL_P(v);
+        }
+    }
+    if (cfg.width <= 0 || cfg.height <= 0 || cfg.width > 16384 || cfg.height > 16384) {
+        zend_argument_value_error(2, "width and height must be between 1 and 16384");
+        RETURN_THROWS();
+    }
+
+    void *pw = vio_window_create(&cfg, ctx->backend->name);
+    if (!pw) RETURN_FALSE;
+    void *sc = ctx->backend->create_swapchain(pw, &cfg);
+    if (!sc) {
+        vio_window_destroy(pw);
+        RETURN_FALSE;
+    }
+
+    object_init_ex(return_value, vio_window_ce);
+    vio_window_object *w = Z_VIO_WINDOW_P(return_value);
+    w->view.backend = ctx->backend;
+    w->view.config = cfg;
+    w->view.config.title = NULL;
+    w->view.window = pw;
+    w->view.initialized = 1;
+    w->swapchain = sc;
+    w->owner = &ctx->std;
+    GC_ADDREF(&ctx->std);
+    vio_plat()->install_input(pw, &w->view.input);
+    ctx->windows[ctx->window_count++] = w;
+}
+
+/* Close a window now (its swapchain and platform window); a closed VioWindow
+ * is refused by every function. */
+ZEND_FUNCTION(vio_destroy_window)
+{
+    zval *wz;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(wz, vio_window_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_window_object *w = Z_VIO_WINDOW_P(wz);
+    vio_context_object *ctx = vio_window_owner(w);
+    if (ctx && ctx->frame_window == w) {
+        php_error_docref(NULL, E_WARNING, "vio_destroy_window: the window's frame is open (call vio_end first)");
+        RETURN_FALSE;
+    }
+    vio_window_object_close(w);
+    RETURN_TRUE;
 }
 
 ZEND_FUNCTION(vio_begin)
@@ -1305,6 +1455,24 @@ ZEND_FUNCTION(vio_begin)
         return;
     }
 
+    /* 'window' (VIO_FEATURE_MULTI_WINDOW): this frame renders into a VioWindow of the context. */
+    vio_window_object *frame_win = NULL;
+    if (opts) {
+        zval *wv = zend_hash_str_find(opts, "window", sizeof("window") - 1);
+        if (wv && Z_TYPE_P(wv) != IS_NULL) {
+            if (Z_TYPE_P(wv) != IS_OBJECT || Z_OBJCE_P(wv) != vio_window_ce) {
+                zend_argument_type_error(2, "option \"window\" must be a VioWindow or null");
+                RETURN_THROWS();
+            }
+            frame_win = Z_VIO_WINDOW_P(wv);
+            if (frame_win->owner != &ctx->std) {
+                zend_argument_value_error(2, "option \"window\" must be an open window of this context");
+                RETURN_THROWS();
+            }
+        }
+    }
+    if (frame_win) vio_window_enter(ctx, frame_win);
+
     /* 'present' (VIO_FEATURE_EXPLICIT_PRESENT): absent = the backend's old rule. */
     int present = VIO_PRESENT_AUTO;
     if (opts) {
@@ -1317,7 +1485,7 @@ ZEND_FUNCTION(vio_begin)
     ctx->frame_no++;
     vio_bindless_retire(ctx);
 
-    vio_input_update(&ctx->input);
+    vio_input_update(frame_win ? &frame_win->view.input : &ctx->input);
 
     /* Sync 2D projection and viewport to current window size.
      * Projection (state_2d.width/height) is in LOGICAL coords: framebuffer/scale.
@@ -1583,6 +1751,7 @@ ZEND_FUNCTION(vio_end)
 
     vio_pending_textures_clear(ctx);
     ctx->in_frame = 0;
+    vio_window_leave(ctx);
 }
 
 ZEND_FUNCTION(vio_gpu_flush)
@@ -1632,11 +1801,12 @@ ZEND_FUNCTION(vio_key_pressed)
     zend_long key;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(key)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     if (key >= 0 && key <= VIO_KEY_LAST) {
         RETURN_BOOL(ctx->input.keys[key]);
     }
@@ -1649,11 +1819,12 @@ ZEND_FUNCTION(vio_key_just_pressed)
     zend_long key;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(key)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     if (key >= 0 && key <= VIO_KEY_LAST) {
         RETURN_BOOL(ctx->input.keys[key] && !ctx->input.keys_prev[key]);
     }
@@ -1666,11 +1837,12 @@ ZEND_FUNCTION(vio_key_released)
     zend_long key;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(key)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     if (key >= 0 && key <= VIO_KEY_LAST) {
         RETURN_BOOL(!ctx->input.keys[key] && ctx->input.keys_prev[key]);
     }
@@ -1737,10 +1909,11 @@ ZEND_FUNCTION(vio_mouse_position)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     double sx = vio_input_logical_scale_x(ctx);
     double sy = vio_input_logical_scale_y(ctx);
     array_init(return_value);
@@ -1753,10 +1926,11 @@ ZEND_FUNCTION(vio_mouse_delta)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     double sx = vio_input_logical_scale_x(ctx);
     double sy = vio_input_logical_scale_y(ctx);
     array_init(return_value);
@@ -1770,11 +1944,12 @@ ZEND_FUNCTION(vio_mouse_button)
     zend_long button;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(button)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     if (button >= 0 && button <= VIO_MOUSE_LAST) {
         RETURN_BOOL(ctx->input.mouse_buttons[button]);
     }
@@ -1786,10 +1961,11 @@ ZEND_FUNCTION(vio_mouse_scroll)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     array_init(return_value);
     add_next_index_double(return_value, ctx->input.scroll_x);
     add_next_index_double(return_value, ctx->input.scroll_y);
@@ -1800,10 +1976,11 @@ ZEND_FUNCTION(vio_touch_count)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     RETURN_LONG((zend_long)ctx->input.touch_count);
 }
 
@@ -1826,13 +2003,14 @@ ZEND_FUNCTION(vio_touch_get)
     zend_long idx;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(idx)
     ZEND_PARSE_PARAMETERS_END();
 
     if (idx < 0) RETURN_NULL();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     /* Touch coordinates are stored in logical window points (the iOS view
      * delivers points; GLFW would deliver logical too), the same space as
@@ -1883,7 +2061,7 @@ ZEND_FUNCTION(vio_touch_inject)
     double x = 0.0, y = 0.0;
 
     ZEND_PARSE_PARAMETERS_START(3, 5)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(id)
         Z_PARAM_LONG(phase)
         Z_PARAM_OPTIONAL
@@ -1891,7 +2069,8 @@ ZEND_FUNCTION(vio_touch_inject)
         Z_PARAM_DOUBLE(y)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     unsigned long long uid = (unsigned long long)id;
 
     switch (phase) {
@@ -1917,11 +2096,12 @@ ZEND_FUNCTION(vio_set_cursor_mode)
     zend_long mode;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(mode)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     /* VIO_CURSOR_NORMAL (0) / DISABLED (1, raw motion where available) / HIDDEN (2) */
     if (ctx->window) {
@@ -1936,7 +2116,7 @@ ZEND_FUNCTION(vio_on_key)
     zval *callback;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_ZVAL(callback)
     ZEND_PARSE_PARAMETERS_END();
 
@@ -1945,7 +2125,8 @@ ZEND_FUNCTION(vio_on_key)
         return;
     }
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     if (ctx->input.has_key_callback) {
         zval_ptr_dtor(&ctx->input.on_key_callback);
@@ -1960,7 +2141,7 @@ ZEND_FUNCTION(vio_on_resize)
     zval *callback;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_ZVAL(callback)
     ZEND_PARSE_PARAMETERS_END();
 
@@ -1969,7 +2150,8 @@ ZEND_FUNCTION(vio_on_resize)
         return;
     }
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     if (ctx->input.has_resize_callback) {
         zval_ptr_dtor(&ctx->input.on_resize_callback);
@@ -1984,7 +2166,7 @@ ZEND_FUNCTION(vio_on_char)
     zval *callback;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_ZVAL(callback)
     ZEND_PARSE_PARAMETERS_END();
 
@@ -1993,7 +2175,8 @@ ZEND_FUNCTION(vio_on_char)
         return;
     }
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     if (ctx->input.has_char_callback) {
         zval_ptr_dtor(&ctx->input.on_char_callback);
@@ -2007,10 +2190,11 @@ ZEND_FUNCTION(vio_chars_typed)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     RETURN_STRINGL(ctx->input.char_buffer, ctx->input.char_buffer_len);
 }
@@ -2027,10 +2211,11 @@ ZEND_FUNCTION(vio_ime_backspaces)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     RETURN_LONG((zend_long) vio_input_take_ime_backspaces(&ctx->input));
 }
 
@@ -2189,11 +2374,12 @@ ZEND_FUNCTION(vio_set_title)
     zend_string *title;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_STR(title)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     if (!ctx->window) return;
 
     vio_plat()->set_title(ctx->window, ZSTR_VAL(title));
@@ -2345,10 +2531,11 @@ ZEND_FUNCTION(vio_window_size)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     array_init(return_value);
     if (ctx->window) {
@@ -2414,10 +2601,11 @@ ZEND_FUNCTION(vio_native_window_handle)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     if (!ctx->window) {
         RETURN_LONG(0);
     }
@@ -2480,10 +2668,11 @@ ZEND_FUNCTION(vio_framebuffer_size)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     int w = 0, h = 0;
     vio_surface_size(ctx, &w, &h);
@@ -2498,10 +2687,11 @@ ZEND_FUNCTION(vio_content_scale)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     array_init(return_value);
     /* Headless: the offscreen target is 1:1 with the logical size (see
@@ -2639,10 +2829,11 @@ ZEND_FUNCTION(vio_pixel_ratio)
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     if (ctx->window && !ctx->config.headless) {   /* headless targets are 1:1, see vio_framebuffer_size */
         int fb_w = 0, win_w = 0, fb_h = 0, win_h = 0;
@@ -10227,7 +10418,7 @@ ZEND_FUNCTION(vio_inject_key)
     zend_long key, action, mods = 0;
 
     ZEND_PARSE_PARAMETERS_START(3, 4)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(key)
         Z_PARAM_LONG(action)
         Z_PARAM_OPTIONAL
@@ -10238,7 +10429,8 @@ ZEND_FUNCTION(vio_inject_key)
         RETURN_THROWS();
     }
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     /* Unknown keys are dropped: GLFW reports those as VIO_KEY_UNKNOWN (-1),
      * which no key array slot holds and no caller can meaningfully inject. */
@@ -10253,12 +10445,13 @@ ZEND_FUNCTION(vio_inject_mouse_move)
     double x, y;
 
     ZEND_PARSE_PARAMETERS_START(3, 3)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_DOUBLE(x)
         Z_PARAM_DOUBLE(y)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     /* Raw cursor coordinates, exactly what the GLFW callback stores, so an
      * injected move goes through the same conversion as a real pointer
@@ -10272,7 +10465,7 @@ ZEND_FUNCTION(vio_inject_mouse_button)
     zend_long button, action;
 
     ZEND_PARSE_PARAMETERS_START(3, 3)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(button)
         Z_PARAM_LONG(action)
     ZEND_PARSE_PARAMETERS_END();
@@ -10281,7 +10474,8 @@ ZEND_FUNCTION(vio_inject_mouse_button)
         RETURN_THROWS();
     }
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     vio_input_button_event(&ctx->input, (int)button, (int)action);
 }
 
@@ -10291,12 +10485,13 @@ ZEND_FUNCTION(vio_inject_scroll)
     double dx, dy;
 
     ZEND_PARSE_PARAMETERS_START(3, 3)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_DOUBLE(dx)
         Z_PARAM_DOUBLE(dy)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     vio_input_scroll_event(&ctx->input, dx, dy);
 }
 
@@ -10310,14 +10505,15 @@ ZEND_FUNCTION(vio_inject_window_event)
     double a = 0.0, b = 0.0;
 
     ZEND_PARSE_PARAMETERS_START(2, 4)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(event)
         Z_PARAM_OPTIONAL
         Z_PARAM_DOUBLE(a)
         Z_PARAM_DOUBLE(b)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     switch (event) {
         case VIO_WINDOW_EVENT_CLOSE:
             if (!vio_input_close_request(&ctx->input)) RETURN_FALSE;
@@ -10385,11 +10581,12 @@ ZEND_FUNCTION(vio_inject_char)
     zend_long cp = 0;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_STR_OR_LONG(text, cp)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     if (!text) {
         if (!vio_inject_char_ok(cp)) {
@@ -10870,15 +11067,44 @@ static int vio_capture_rgba(vio_context_object *ctx, int w, int h, unsigned char
     return -1;
 }
 
+static void vio_read_pixels_impl(vio_context_object *ctx, zval *return_value);
+
+/* vio_read_pixels($ctx | $window): the last frame of the main window or of a VioWindow. */
 ZEND_FUNCTION(vio_read_pixels)
 {
     zval *ctx_zval;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
+    if (Z_OBJCE_P(ctx_zval) != vio_window_ce) {
+        if (ctx->frame_window) {
+            php_error_docref(NULL, E_WARNING, "vio_read_pixels: a window's frame is open, read it through the VioWindow");
+            RETURN_FALSE;
+        }
+        vio_read_pixels_impl(ctx, return_value);
+        return;
+    }
+    vio_window_object *w = Z_VIO_WINDOW_P(ctx_zval);
+    vio_context_object *owner = vio_window_owner(w);
+    if (owner->frame_window == w) {   /* inside the window's own frame */
+        vio_read_pixels_impl(owner, return_value);
+        return;
+    }
+    if (owner->in_frame) {
+        php_error_docref(NULL, E_WARNING, "vio_read_pixels: another window's frame is open");
+        RETURN_FALSE;
+    }
+    vio_window_enter(owner, w);
+    vio_read_pixels_impl(owner, return_value);
+    vio_window_leave(owner);
+}
+
+static void vio_read_pixels_impl(vio_context_object *ctx, zval *return_value)
+{
 
     if (!ctx->initialized) {
         php_error_docref(NULL, E_WARNING, "Context not initialized");
@@ -13475,6 +13701,7 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_FEATURE_UPSCALER_NATIVE", VIO_FEATURE_UPSCALER_NATIVE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_UPSCALER_PREPARE", VIO_FEATURE_UPSCALER_PREPARE, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_FEATURE_EXPLICIT_PRESENT", VIO_FEATURE_EXPLICIT_PRESENT, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_FEATURE_MULTI_WINDOW", VIO_FEATURE_MULTI_WINDOW, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALER_FSR3", VIO_UPSCALER_FSR3, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALER_DLSS", VIO_UPSCALER_DLSS, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_UPSCALER_XESS", VIO_UPSCALER_XESS, CONST_CS | CONST_PERSISTENT);
@@ -15833,12 +16060,13 @@ ZEND_FUNCTION(vio_set_window_size)
     zend_long width, height;
 
     ZEND_PARSE_PARAMETERS_START(3, 3)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(width)
         Z_PARAM_LONG(height)
     ZEND_PARSE_PARAMETERS_END();
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
 
     if (!ctx->initialized) {
         php_error_docref(NULL, E_WARNING, "Context is not initialized");
@@ -15906,14 +16134,15 @@ ZEND_FUNCTION(vio_set_cursor)
     zval *ctx_zval;
     zend_long shape;
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(shape)
     ZEND_PARSE_PARAMETERS_END();
     if (shape < 0 || shape >= VIO_PLATFORM_SHAPE_COUNT) {
         zend_argument_value_error(2, "must be one of the VIO_CURSOR_SHAPE_* constants");
         RETURN_THROWS();
     }
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     RETURN_BOOL(VIO_PLAT_CALL(ctx, set_cursor_shape, (int)shape));
 }
 
@@ -15923,7 +16152,7 @@ ZEND_FUNCTION(vio_set_cursor_image)
     zend_string *rgba;
     zend_long w, h, hx = 0, hy = 0;
     ZEND_PARSE_PARAMETERS_START(4, 6)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_STR(rgba)
         Z_PARAM_LONG(w)
         Z_PARAM_LONG(h)
@@ -15943,7 +16172,8 @@ ZEND_FUNCTION(vio_set_cursor_image)
         zend_argument_value_error(5, "and argument #6 must lie inside the image");
         RETURN_THROWS();
     }
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     RETURN_BOOL(VIO_PLAT_CALL(ctx, set_cursor_image, (const unsigned char *)ZSTR_VAL(rgba), (int)w, (int)h, (int)hx, (int)hy));
 }
 
@@ -15987,14 +16217,15 @@ ZEND_FUNCTION(vio_set_window_icon)
     zval *ctx_zval;
     HashTable *list;
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_ARRAY_HT(list)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_platform_image imgs[16];
     int n;
     if (vio_parse_images(list, imgs, &n, 2, "the list") < 0) RETURN_THROWS();
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     RETURN_BOOL(VIO_PLAT_CALL(ctx, set_window_icon, n, imgs));
 }
 
@@ -16003,7 +16234,7 @@ ZEND_FUNCTION(vio_set_window_size_limits)
     zval *ctx_zval;
     zend_long min_w, min_h, max_w = -1, max_h = -1;
     ZEND_PARSE_PARAMETERS_START(3, 5)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(min_w)
         Z_PARAM_LONG(min_h)
         Z_PARAM_OPTIONAL
@@ -16018,7 +16249,8 @@ ZEND_FUNCTION(vio_set_window_size_limits)
         zend_argument_value_error(2, "and argument #3 must not exceed the maximum size");
         RETURN_THROWS();
     }
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     ctx->size_min_w = (int)min_w; ctx->size_min_h = (int)min_h;
     ctx->size_max_w = (int)max_w; ctx->size_max_h = (int)max_h;
     float fx, fy;
@@ -16032,7 +16264,7 @@ ZEND_FUNCTION(vio_set_window_aspect_ratio)
     zval *ctx_zval;
     zend_long num, den;
     ZEND_PARSE_PARAMETERS_START(3, 3)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(num)
         Z_PARAM_LONG(den)
     ZEND_PARSE_PARAMETERS_END();
@@ -16040,7 +16272,8 @@ ZEND_FUNCTION(vio_set_window_aspect_ratio)
         zend_argument_value_error(2, "and argument #3 must both be 1..65535, or both 0 for a free ratio");
         RETURN_THROWS();
     }
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     RETURN_BOOL(VIO_PLAT_CALL(ctx, set_aspect_ratio, (int)num, (int)den));
 }
 
@@ -16049,10 +16282,11 @@ ZEND_FUNCTION(vio_set_window_floating)
     zval *ctx_zval;
     bool on;
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_BOOL(on)
     ZEND_PARSE_PARAMETERS_END();
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     RETURN_BOOL(VIO_PLAT_CALL(ctx, set_floating, on ? 1 : 0));
 }
 
@@ -16061,14 +16295,15 @@ ZEND_FUNCTION(vio_set_window_opacity)
     zval *ctx_zval;
     double a;
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_DOUBLE(a)
     ZEND_PARSE_PARAMETERS_END();
     if (!(a >= 0.0 && a <= 1.0)) {
         zend_argument_value_error(2, "must be between 0.0 and 1.0");
         RETURN_THROWS();
     }
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     RETURN_BOOL(VIO_PLAT_CALL(ctx, set_opacity, (float)a));
 }
 
@@ -16092,7 +16327,7 @@ ZEND_FUNCTION(vio_file_dialog)
     zval *ctx_zval;
     HashTable *opts = NULL;
     ZEND_PARSE_PARAMETERS_START(1, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_OPTIONAL
         Z_PARAM_ARRAY_HT(opts)
     ZEND_PARSE_PARAMETERS_END();
@@ -16149,7 +16384,8 @@ ZEND_FUNCTION(vio_file_dialog)
         d.filters = filters;
     }
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     if (!vio_plat_can((const void *)vio_plat()->file_dialog, VIO_PLATFORM_FEATURE_FILE_DIALOG)) RETURN_FALSE;
     char **paths = NULL;
     int n = 0;
@@ -16166,7 +16402,7 @@ ZEND_FUNCTION(vio_message_box)
     zend_string *title, *message;
     HashTable *opts = NULL;
     ZEND_PARSE_PARAMETERS_START(3, 4)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_STR(title)
         Z_PARAM_STR(message)
         Z_PARAM_OPTIONAL
@@ -16205,7 +16441,8 @@ ZEND_FUNCTION(vio_message_box)
     else if (strcmp(kind, "question") == 0) d.kind = VIO_PLATFORM_MESSAGE_QUESTION;
     else { zend_argument_value_error(4, "option 'kind' must be 'info', 'warning', 'error' or 'question'"); RETURN_THROWS(); }
 
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     if (!vio_plat()->message_box) RETURN_FALSE;
     int r = vio_plat()->message_box(ctx->window, &d);
     if (r < 0) RETURN_FALSE;
@@ -16452,7 +16689,7 @@ ZEND_FUNCTION(vio_set_progress)
     bool is_null = 1;
     zend_string *state = NULL;
     ZEND_PARSE_PARAMETERS_START(2, 3)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_DOUBLE_OR_NULL(value, is_null)
         Z_PARAM_OPTIONAL
         Z_PARAM_STR(state)
@@ -16466,7 +16703,8 @@ ZEND_FUNCTION(vio_set_progress)
         else { zend_argument_value_error(3, "must be 'normal', 'paused', 'error' or 'indeterminate'"); RETURN_THROWS(); }
     }
     if (!is_null && !(value >= 0.0 && value <= 1.0)) { zend_argument_value_error(2, "must be between 0.0 and 1.0, or null to hide"); RETURN_THROWS(); }
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     if (!vio_plat_can((const void *)vio_plat()->set_progress, VIO_PLATFORM_FEATURE_PROGRESS)) RETURN_FALSE;
     /* null hides, except that 'indeterminate' needs no value */
     RETURN_BOOL(vio_plat()->set_progress(ctx->window, is_null ? -1.0 : value, is_null && st != VIO_PLATFORM_PROGRESS_INDETERMINATE ? VIO_PLATFORM_PROGRESS_NORMAL : st));
@@ -16563,14 +16801,15 @@ ZEND_FUNCTION(vio_ime_rect)
     zval *ctx_zval;
     zend_long x, y, w, h;
     ZEND_PARSE_PARAMETERS_START(5, 5)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_LONG(x)
         Z_PARAM_LONG(y)
         Z_PARAM_LONG(w)
         Z_PARAM_LONG(h)
     ZEND_PARSE_PARAMETERS_END();
     if (w < 0 || h < 0) { zend_argument_value_error(4, "and argument #5 must not be negative"); RETURN_THROWS(); }
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     float fx, fy;
     vio_ctx_screen_factor(ctx, &fx, &fy);
     RETURN_BOOL(VIO_PLAT_CALL(ctx, set_ime_rect, (int)((float)x * fx + 0.5f), (int)((float)y * fy + 0.5f),
@@ -16582,10 +16821,11 @@ ZEND_FUNCTION(vio_ime_enable)
     zval *ctx_zval;
     bool on;
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT(ctx_zval)
         Z_PARAM_BOOL(on)
     ZEND_PARSE_PARAMETERS_END();
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_context_object *ctx = vio_ctx_target(ctx_zval, 1);
+    if (!ctx) RETURN_THROWS();
     RETURN_BOOL(VIO_PLAT_CALL(ctx, set_ime_enabled, on ? 1 : 0));
 }
 

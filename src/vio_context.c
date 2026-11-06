@@ -6,7 +6,9 @@
 #include "upscale/vio_upscaler.h"
 
 zend_class_entry *vio_context_ce = NULL;
+zend_class_entry *vio_window_ce = NULL;
 static zend_object_handlers vio_context_handlers;
+static zend_object_handlers vio_window_handlers;
 
 static zend_object *vio_context_create_object(zend_class_entry *ce)
 {
@@ -70,6 +72,62 @@ void vio_context_release_fragment_storage(vio_context_object *ctx)
         OBJ_RELEASE(ctx->fb_texture);
         ctx->fb_texture = NULL;
     }
+}
+
+/* ── VioWindow ─────────────────────────────────────────────────────── */
+
+static zend_object *vio_window_create_object(zend_class_entry *ce)
+{
+    vio_window_object *w = zend_object_alloc(sizeof(vio_window_object), ce);
+    memset(&w->view, 0, sizeof(w->view));
+    w->view.frame_present = -1;
+    vio_input_init(&w->view.input);
+    w->owner = NULL;
+    w->swapchain = NULL;
+    zend_object_std_init(&w->std, ce);
+    object_properties_init(&w->std, ce);
+    w->std.handlers = &vio_window_handlers;
+    return &w->std;
+}
+
+void vio_window_object_close(vio_window_object *w)
+{
+    vio_context_object *ctx = vio_window_owner(w);
+    if (!ctx) return;
+    for (int i = 0; i < ctx->window_count; i++) {
+        if (ctx->windows[i] != w) continue;
+        ctx->windows[i] = ctx->windows[--ctx->window_count];
+        ctx->windows[ctx->window_count] = NULL;
+        break;
+    }
+    if (w->swapchain && ctx->initialized && ctx->backend && ctx->backend->destroy_swapchain) {
+        ctx->backend->destroy_swapchain(w->swapchain);
+    }
+    w->swapchain = NULL;
+    if (w->view.window) {
+        vio_window_destroy(w->view.window);
+        w->view.window = NULL;
+    }
+    w->view.initialized = 0;
+    w->view.should_close = 1;
+    zend_object *owner = w->owner;
+    w->owner = NULL;
+    OBJ_RELEASE(owner);
+}
+
+void vio_context_close_windows(vio_context_object *ctx)
+{
+    while (ctx->window_count > 0) {
+        vio_window_object_close(ctx->windows[ctx->window_count - 1]);
+    }
+}
+
+static void vio_window_free_object(zend_object *obj)
+{
+    vio_window_object *w = vio_window_from_obj(obj);
+    vio_window_object_close(w);
+    vio_input_shutdown(&w->view.input);
+    zend_object_std_dtor(&w->std);
 }
 
 static void vio_context_free_object(zend_object *obj)
@@ -145,4 +203,14 @@ void vio_context_register(void)
     vio_context_handlers.offset   = XtOffsetOf(vio_context_object, std);
     vio_context_handlers.free_obj = vio_context_free_object;
     vio_context_handlers.clone_obj = NULL;
+
+    INIT_CLASS_ENTRY(ce, "VioWindow", NULL);
+    vio_window_ce = zend_register_internal_class(&ce);
+    vio_window_ce->ce_flags |= ZEND_ACC_FINAL | ZEND_ACC_NO_DYNAMIC_PROPERTIES | ZEND_ACC_NOT_SERIALIZABLE;
+    vio_window_ce->create_object = vio_window_create_object;
+
+    memcpy(&vio_window_handlers, &std_object_handlers, sizeof(zend_object_handlers));
+    vio_window_handlers.offset   = XtOffsetOf(vio_window_object, std);
+    vio_window_handlers.free_obj = vio_window_free_object;
+    vio_window_handlers.clone_obj = NULL;
 }
