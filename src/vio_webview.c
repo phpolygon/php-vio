@@ -74,7 +74,7 @@ static vio_webview_object *vio_webviews = NULL;   /* open webviews (handle != NU
 enum { WV_EV_REQUEST = 1, WV_EV_CANCEL, WV_EV_MESSAGE, WV_EV_NAV };
 
 typedef struct _vio_wv_event {
-    int                 kind, nav;
+    int                 kind, nav, navigation;
     vio_webview_object *wv;
     uint64_t            id;
     char               *method, *url, *text;
@@ -115,11 +115,12 @@ static vio_wv_event *wv_new(void *user, int kind)
 }
 
 void vio_webview_request_event(void *user, uint64_t id, const char *method, const char *url,
-                               const vio_webview_header *h, int count, const void *body, size_t len)
+                               const vio_webview_header *h, int count, const void *body, size_t len, int navigation)
 {
     vio_wv_event *e = wv_new(user, WV_EV_REQUEST);
     if (!e) return;
     e->id = id;
+    e->navigation = navigation;
     e->method = wv_strdup(method && *method ? method : "GET");
     e->url = wv_strdup(url);
     size_t total = 0;
@@ -703,7 +704,83 @@ static zval *wv_scheme_callback(vio_webview_object *wv, const char *url)
     return zend_hash_str_find(Z_ARRVAL(wv->schemes), url, (size_t)(colon - url));
 }
 
-static void wv_deliver_request(vio_wv_event *e)
+/* Set-Cookie lines of an answer's headers array into the jar; 1 = changed */
+static int wv_apply_set_cookies(vio_webview_object *wv, zval *headers, const char *url)
+{
+    if (!headers || Z_TYPE_P(headers) != IS_ARRAY) return 0;
+    char host[256], path[1024];
+    wv_url_parts(url, host, sizeof(host), path, sizeof(path));
+    int changed = 0;
+    zend_string *name;
+    zval *hv;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(headers), name, hv) {
+        if (!name || strcasecmp(ZSTR_VAL(name), "set-cookie") != 0) continue;
+        if (Z_TYPE_P(hv) == IS_ARRAY) {
+            zval *one;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(hv), one) {
+                zend_string *line = zval_get_string(one);
+                changed |= wv_jar_set(wv, host, path, ZSTR_VAL(line), 0);
+                zend_string_release(line);
+            } ZEND_HASH_FOREACH_END();
+        } else {
+            zend_string *line = zval_get_string(hv);
+            changed |= wv_jar_set(wv, host, path, ZSTR_VAL(line), 0);
+            zend_string_release(line);
+        }
+    } ZEND_HASH_FOREACH_END();
+    return changed;
+}
+
+/* Location of a redirect answer resolved against url (malloc'd), or NULL */
+static char *wv_redirect_target(zval *ret, const char *url, int *status)
+{
+    if (Z_TYPE_P(ret) != IS_ARRAY) return NULL;
+    zval *v = zend_hash_str_find(Z_ARRVAL_P(ret), "status", sizeof("status") - 1);
+    zend_long st = v ? zval_get_long(v) : 200;
+    if (st != 301 && st != 302 && st != 303 && st != 307 && st != 308) return NULL;
+    zval *headers = zend_hash_str_find(Z_ARRVAL_P(ret), "headers", sizeof("headers") - 1);
+    if (!headers || Z_TYPE_P(headers) != IS_ARRAY) return NULL;
+    zend_string *name;
+    zval *hv;
+    zend_string *loc = NULL;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(headers), name, hv) {
+        if (name && strcasecmp(ZSTR_VAL(name), "location") == 0 && Z_TYPE_P(hv) == IS_STRING) loc = Z_STR_P(hv);
+    } ZEND_HASH_FOREACH_END();
+    if (!loc || !ZSTR_LEN(loc)) return NULL;
+    *status = (int)st;
+    const char *l = ZSTR_VAL(loc);
+    const char *colon = strchr(url, ':');
+    size_t scheme_len = colon ? (size_t)(colon - url) : 0;
+    const char *authority = strstr(url, "://");
+    const char *path_start = authority ? authority + 3 + strcspn(authority + 3, "/?#") : url + strlen(url);
+    size_t n = strspn(l, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-");
+    smart_str s = {0};
+    if (n && l[n] == ':' && (l[0] | 0x20) >= 'a' && (l[0] | 0x20) <= 'z') {
+        smart_str_appends(&s, l);                                    /* absolute */
+    } else if (l[0] == '/' && l[1] == '/') {
+        smart_str_appendl(&s, url, scheme_len + 1);                  /* scheme-relative */
+        smart_str_appends(&s, l);
+    } else if (l[0] == '/') {
+        smart_str_appendl(&s, url, (size_t)(path_start - url));     /* host-relative */
+        smart_str_appends(&s, l);
+    } else {
+        size_t end = strcspn(path_start, "?#");                      /* path-relative */
+        size_t keep = (size_t)(path_start - url);
+        if (l[0] == '?') keep += end;
+        else for (size_t i = end; i > 0; i--) if (path_start[i - 1] == '/') { keep += i; break; }
+        smart_str_appendl(&s, url, keep);
+        if (l[0] != '?' && keep == (size_t)(path_start - url)) smart_str_appendc(&s, '/');
+        smart_str_appends(&s, l);
+    }
+    smart_str_0(&s);
+    char *out = strdup(ZSTR_VAL(s.s));
+    smart_str_free(&s);
+    return out;
+}
+
+#define WV_MAX_REDIRECTS 20   /* as fetch() */
+
+static void wv_deliver_request_depth(vio_wv_event *e, int depth)
 {
     vio_webview_object *wv = e->wv;
     zval *cb = wv_scheme_callback(wv, e->url);
@@ -733,12 +810,60 @@ static void wv_deliver_request(vio_wv_event *e)
     GC_ADDREF(&wv->std);   /* the callback may drop the last reference */
     int ok = call_user_function(NULL, NULL, cb, &ret, 1, &req) == SUCCESS;
     zval_ptr_dtor(&req);
-    if (wv->handle) {
-        if (EG(exception) || !ok) wv_reply_simple(wv, e->id, 500, "scheme callback failed");
-        else wv_reply(wv, e->id, &ret, e->url);
+    int status = 0;
+    char *target = NULL;
+    if (wv->handle && !EG(exception) && ok && (target = wv_redirect_target(&ret, e->url, &status)) && !wv_scheme_callback(wv, target)) {
+        free(target);   /* another scheme (https://...): the page gets the redirect answer as it is */
+        target = NULL;
     }
+    if (!wv->handle) {
+        /* closed by the callback */
+    } else if (EG(exception) || !ok) {
+        wv_reply_simple(wv, e->id, 500, "scheme callback failed");
+    } else if (target) {
+        /* Engines do not follow redirects of custom schemes (WKWebView hands fetch the raw 302 and shows a
+         * blank page after a redirected form POST), so vio does - cookies of the redirect first. A page
+         * load gets a page that replaces itself with the target (the address is right afterwards, the
+         * target is loaded with GET as after 303); a fetch gets the target's answer through the handler
+         * again, as GET after 301/302 POST and 303, as is after 307/308 (Response.url stays the first URL). */
+        zval *rh = zend_hash_str_find(Z_ARRVAL(ret), "headers", sizeof("headers") - 1);
+        if (wv_apply_set_cookies(wv, rh, e->url)) wv_jar_publish(wv, 1);
+        if (e->navigation) {
+            smart_str js = {0};
+            smart_str_appends(&js, "<!doctype html><script>location.replace(");
+            zval t;
+            ZVAL_STRING(&t, target);
+            php_json_encode(&js, &t, PHP_JSON_UNESCAPED_SLASHES | PHP_JSON_HEX_TAG);
+            zval_ptr_dtor(&t);
+            smart_str_appends(&js, ")</script>");
+            smart_str_0(&js);
+            vio_webview_header h = {"Content-Type", "text/html; charset=utf-8"};
+            vio_plat()->webview_reply_head(wv->handle, e->id, 200, &h, 1);
+            vio_plat()->webview_reply_data(wv->handle, e->id, ZSTR_VAL(js.s), ZSTR_LEN(js.s));
+            vio_plat()->webview_reply_end(wv->handle, e->id);
+            smart_str_free(&js);
+        } else if (depth >= WV_MAX_REDIRECTS) {
+            if (vio_plat()->webview_reply_fail) vio_plat()->webview_reply_fail(wv->handle, e->id);
+            else wv_reply_simple(wv, e->id, 508, "too many redirects");
+        } else {
+            int to_get = status == 303 || ((status == 301 || status == 302) && strcmp(e->method, "POST") == 0);
+            vio_wv_event next = *e;
+            next.url = target;
+            next.method = to_get ? (char *)"GET" : e->method;
+            if (to_get) next.body_len = 0;
+            wv_deliver_request_depth(&next, depth + 1);
+        }
+    } else {
+        wv_reply(wv, e->id, &ret, e->url);
+    }
+    free(target);
     zval_ptr_dtor(&ret);
     OBJ_RELEASE(&wv->std);
+}
+
+static void wv_deliver_request(vio_wv_event *e)
+{
+    wv_deliver_request_depth(e, 0);
 }
 
 static void wv_drop_stream(vio_webview_object *wv, uint64_t id)

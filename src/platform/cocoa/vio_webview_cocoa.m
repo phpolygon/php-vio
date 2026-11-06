@@ -84,8 +84,9 @@ static NSString *cocoa_webview_bridge =
         h[i].value = fields[name].UTF8String;
         i++;
     }
+    int navigation = req.mainDocumentURL && [req.mainDocumentURL isEqual:req.URL];   /* the page itself, not a fetch */
     vio_webview_request_event(wv->user, rid, req.HTTPMethod.UTF8String, req.URL.absoluteString.UTF8String,
-                              h, i, body.bytes, body.length);
+                              h, i, body.bytes, body.length, navigation);
     free(h);
     cocoa_webview_kick();
 }
@@ -307,6 +308,20 @@ static int cocoa_webview_reply_data(void *p, uint64_t rid, const void *data, siz
         id<WKURLSchemeTask> task = cocoa_webview_task((vio_cocoa_webview *)p, rid);
         if (!task) return 0;
         @try { [task didReceiveData:[NSData dataWithBytes:data length:len]]; } @catch (NSException *e) { return 0; }
+    }
+    return 1;
+}
+
+static int cocoa_webview_reply_fail(void *p, uint64_t rid)
+{
+    vio_cocoa_webview *wv = (vio_cocoa_webview *)p;
+    @autoreleasepool {
+        id<WKURLSchemeTask> task = cocoa_webview_task(wv, rid);
+        if (!task) return 0;
+        [(__bridge NSMutableDictionary *)wv->tasks removeObjectForKey:@(rid)];
+        @try {
+            [task didFailWithError:[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorHTTPTooManyRedirects userInfo:nil]];
+        } @catch (NSException *e) { return 0; }
     }
     return 1;
 }

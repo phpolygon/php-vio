@@ -362,12 +362,14 @@ typedef struct _vio_platform {
     int   (*webview_reply_head)(void *wv, uint64_t id, int status, const vio_webview_header *h, int count);
     int   (*webview_reply_data)(void *wv, uint64_t id, const void *data, size_t len);
     int   (*webview_reply_end)(void *wv, uint64_t id);
+    int   (*webview_reply_fail)(void *wv, uint64_t id);   /* a network error instead of an answer */
 } vio_platform;
 
 /* Webview events, implemented in src/vio_webview.c (PHP thread). They copy
  * what they get; user is vio_webview_desc.user. */
+/* navigation: the request loads the page itself (top frame), not a fetch / subresource */
 void vio_webview_request_event(void *user, uint64_t id, const char *method, const char *url,
-                               const vio_webview_header *h, int count, const void *body, size_t len);
+                               const vio_webview_header *h, int count, const void *body, size_t len, int navigation);
 void vio_webview_cancel_event(void *user, uint64_t id);
 void vio_webview_message_event(void *user, const char *json, size_t len);
 void vio_webview_nav_event(void *user, int kind, const char *text);

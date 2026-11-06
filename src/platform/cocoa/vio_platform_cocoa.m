@@ -1827,6 +1827,7 @@ static const vio_platform vio_platform_cocoa = {
     .webview_reply_head   = cocoa_webview_reply_head,
     .webview_reply_data   = cocoa_webview_reply_data,
     .webview_reply_end    = cocoa_webview_reply_end,
+    .webview_reply_fail   = cocoa_webview_reply_fail,
 };
 
 void vio_platform_cocoa_register(void)
