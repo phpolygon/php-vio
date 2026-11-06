@@ -93,7 +93,9 @@ foreach (['wpe', 'gtk'] as $engine) {
     $env = getenv();
     $env['VIO_WEBVIEW_ENGINE'] = $engine;
     $cmd = [PHP_BINARY, '-n', '-d', 'extension_dir=' . ini_get('extension_dir'), '-d', 'extension=vio'];
-    if (extension_loaded('ffi')) array_push($cmd, '-d', 'extension=ffi', '-d', 'ffi.enable=1');
+    $ffiSo = PHP_EXTENSION_DIR . '/ffi.so';   /* as test 214: the shared FFI of this PHP, if it has one */
+    if (extension_loaded('ffi')) array_push($cmd, '-d', 'ffi.enable=1');
+    elseif (is_file($ffiSo)) array_push($cmd, '-d', 'extension=' . $ffiSo, '-d', 'ffi.enable=1');
     $cmd[] = "$dir/child.php";
     $p = proc_open($cmd, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
     $o = trim(stream_get_contents($pipes[1]));
@@ -106,7 +108,9 @@ foreach (['wpe', 'gtk'] as $engine) {
 $want = '{"shown":["ff0000","0000ff","ff0000"],"page":["down","value:a","value:ab"],"vio keys":true}';
 $bad = array_filter($out, fn($o) => $o !== $want && !in_array($o, ['none', 'no ffi', 'no xtest'], true));
 $ran = array_filter($out, fn($o) => $o === $want);
-echo !$bad && ($ran || getenv('VIO_REQUIRE_WEBVIEW') === false) ? "OK\n" : 'FAIL ' . json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+/* VIO_REQUIRE_WEBVIEW: an engine must run here, unless the test cannot drive X at all (no FFI / libXtst) */
+$cannot = !array_diff($out, ['no ffi', 'no xtest']);
+echo !$bad && ($ran || $cannot || getenv('VIO_REQUIRE_WEBVIEW') === false) ? "OK\n" : 'FAIL ' . json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
 ?>
 --EXPECT--
 OK
