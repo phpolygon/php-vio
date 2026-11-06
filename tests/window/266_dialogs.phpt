@@ -59,6 +59,7 @@ foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
     $env = getenv();
     $env['VIO_PLATFORM'] = $platform;
     $env['VIO_TEST_DIALOG_TRACE'] = '1';
+    unset($env['DBUS_SESSION_BUS_ADDRESS']);   // a desktop's portal would open a real dialog (268 covers it with a fake)
     /* files, not pipes: Windows pipes cannot be non-blocking, a read would wait for a hanging child */
     $o = "$dir/out-$platform.txt";
     $e = "$dir/err-$platform.txt";

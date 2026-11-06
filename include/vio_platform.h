@@ -121,6 +121,17 @@ typedef struct _vio_menu_item {
     int         child_count;
 } vio_menu_item;
 
+/* Features whose availability depends on the session (available slot). */
+#define VIO_PLATFORM_FEATURE_FILE_DIALOG   1
+#define VIO_PLATFORM_FEATURE_NOTIFICATIONS 2
+#define VIO_PLATFORM_FEATURE_PROGRESS      3
+
+/* vio_set_progress states */
+#define VIO_PLATFORM_PROGRESS_NORMAL        0
+#define VIO_PLATFORM_PROGRESS_PAUSED        1
+#define VIO_PLATFORM_PROGRESS_ERROR         2
+#define VIO_PLATFORM_PROGRESS_INDETERMINATE 3
+
 /* An RGBA image (window icon), top row first. */
 typedef struct _vio_platform_image {
     int width, height;
@@ -263,6 +274,15 @@ typedef struct _vio_platform {
     /* Modal context menu at x, y (cursor space): the chosen tag, -1 = none,
      * -2 = could not show one. */
     int   (*popup_menu)(vio_window_handle w, const vio_menu_item *items, int count, double x, double y);
+
+    /* ── Desktop services (DESKTOP-APP-PLAN Phase 2c) ─────────────────
+     * available: whether a slot can work in this session (a D-Bus service,
+     * an app bundle); NULL = always when the slot is set. */
+    int   (*available)(int feature);   /* VIO_PLATFORM_FEATURE_* */
+    /* key: NULL, or a notification with the same key replaces the last one. */
+    int   (*notify)(const char *title, const char *body, const char *icon, const char *key);
+    /* Taskbar / Dock progress: value 0..1, < 0 = hide; state VIO_PLATFORM_PROGRESS_*. */
+    int   (*set_progress)(vio_window_handle w, double value, int state);
 } vio_platform;
 
 /* Registry (src/vio_platform_registry.c): platforms register in MINIT; the

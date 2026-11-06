@@ -16,6 +16,9 @@
 #include "../../../include/vio_platform.h"
 #include "../../vio_input.h"
 #include "../vio_shell.h"
+#ifdef __linux__
+#include "../linux/vio_desktop_linux.h"
+#endif
 
 #ifdef HAVE_GLFW
 
@@ -558,6 +561,12 @@ static int glfw_set_opacity(vio_window_handle w, float opacity)
     return 1;
 }
 
+#ifdef __linux__
+/* Linux desktop services over D-Bus (src/platform/linux/vio_desktop_linux.c) */
+static int lx_file_dialog(vio_window_handle w, const vio_file_dialog_desc *d, char ***out, int *n) { (void)w; return vio_linux_file_dialog(d, out, n); }
+static int lx_set_progress(vio_window_handle w, double value, int state) { (void)w; return vio_linux_set_progress(value, state); }
+#endif
+
 static void glfw_set_cursor_mode(vio_window_handle w, int mode)
 {
     if (!w) return;
@@ -933,6 +942,12 @@ static vio_platform vio_platform_glfw = {
     .open_url             = vio_shell_open_url,
     .reveal_file          = vio_shell_reveal_file,
     .accepts_drops        = 1,
+#ifdef __linux__
+    .available            = vio_linux_available,
+    .file_dialog          = lx_file_dialog,
+    .notify               = vio_linux_notify,
+    .set_progress         = lx_set_progress,
+#endif
 };
 
 void vio_platform_glfw_register(void)

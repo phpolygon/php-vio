@@ -113,6 +113,8 @@ PHP_INI_BEGIN()
     /* Where amd_fidelityfx_dx12.dll / amd_fidelityfx_vk.dll live (a directory or
      * the file itself); when set, the only place searched (vio_upscaler_*). */
     PHP_INI_ENTRY("vio.ffx_path", "", PHP_INI_ALL, NULL)
+    /* desktop file id (Linux launcher progress, notification app name), e.g. "org.example.Editor" */
+    PHP_INI_ENTRY("vio.app_id", "", PHP_INI_ALL, NULL)
     /* DLSS (TEMPORAL-S4) is a plugin (include/vio_upscale_plugin.h): where
      * vio_dlss.dll / libvio_dlss.so lives (a directory or the file; when set, the
      * only place searched - read on first use, a loaded plugin stays). The other
@@ -15836,6 +15838,12 @@ ZEND_FUNCTION(vio_set_window_size)
 
 /* ── Desktop window details (DESKTOP-APP-PLAN Phase 1) ─────────────── */
 
+/* A slot that depends on the session: set and available right now. */
+static int vio_plat_can(const void *slot, int feature)
+{
+    return slot && (!vio_plat()->available || vio_plat()->available(feature));
+}
+
 #define VIO_PLAT_CALL(ctx, slot, ...) \
     ((ctx)->window && vio_plat()->slot ? vio_plat()->slot((ctx)->window, __VA_ARGS__) != 0 : 0)
 
@@ -15856,10 +15864,12 @@ ZEND_FUNCTION(vio_platform_info)
     add_assoc_bool(return_value, "open_url", p->open_url != NULL);
     add_assoc_bool(return_value, "reveal_file", p->reveal_file != NULL);
     add_assoc_bool(return_value, "file_drop", p->accepts_drops != 0);
-    add_assoc_bool(return_value, "file_dialog", p->file_dialog != NULL);
+    add_assoc_bool(return_value, "file_dialog", vio_plat_can((const void *)p->file_dialog, VIO_PLATFORM_FEATURE_FILE_DIALOG));
     add_assoc_bool(return_value, "message_box", p->message_box != NULL);
     add_assoc_bool(return_value, "menu_bar", p->set_menu_bar != NULL);
     add_assoc_bool(return_value, "popup_menu", p->popup_menu != NULL);
+    add_assoc_bool(return_value, "notifications", vio_plat_can((const void *)p->notify, VIO_PLATFORM_FEATURE_NOTIFICATIONS));
+    add_assoc_bool(return_value, "progress", vio_plat_can((const void *)p->set_progress, VIO_PLATFORM_FEATURE_PROGRESS));
 }
 
 ZEND_FUNCTION(vio_set_cursor)
@@ -16101,7 +16111,7 @@ ZEND_FUNCTION(vio_file_dialog)
     }
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    if (!vio_plat()->file_dialog) RETURN_FALSE;
+    if (!vio_plat_can((const void *)vio_plat()->file_dialog, VIO_PLATFORM_FEATURE_FILE_DIALOG)) RETURN_FALSE;
     char **paths = NULL;
     int n = 0;
     if (!vio_plat()->file_dialog(ctx->window, &d, &paths, &n)) RETURN_FALSE;
@@ -16371,6 +16381,56 @@ ZEND_FUNCTION(vio_popup_menu)
     else if (tag == -2) RETVAL_FALSE;
     else RETVAL_NULL();
     vio_menu_build_free(&b, 0);
+}
+
+/* ── Notifications, progress (DESKTOP-APP-PLAN Phase 2c) ───────────── */
+
+ZEND_FUNCTION(vio_notify)
+{
+    zend_string *title, *body = NULL;
+    HashTable *opts = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_STR(title)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STR(body)
+        Z_PARAM_ARRAY_HT(opts)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!ZSTR_LEN(title) || memchr(ZSTR_VAL(title), 0, ZSTR_LEN(title)) || (body && memchr(ZSTR_VAL(body), 0, ZSTR_LEN(body)))) {
+        zend_argument_value_error(1, "must be a non-empty title, title and body without NUL bytes");
+        RETURN_THROWS();
+    }
+    const char *icon = NULL, *key = NULL;
+    if (vio_opt_string(opts, "icon", 3, &icon) < 0 || vio_opt_string(opts, "id", 3, &key) < 0) RETURN_THROWS();
+    if (key && (!*key || strlen(key) > 63)) { zend_argument_value_error(3, "option 'id' must be 1 to 63 bytes"); RETURN_THROWS(); }
+    if (!vio_plat_can((const void *)vio_plat()->notify, VIO_PLATFORM_FEATURE_NOTIFICATIONS)) RETURN_FALSE;
+    RETURN_BOOL(vio_plat()->notify(ZSTR_VAL(title), body ? ZSTR_VAL(body) : "", icon, key));
+}
+
+ZEND_FUNCTION(vio_set_progress)
+{
+    zval *ctx_zval;
+    double value = 0.0;
+    bool is_null = 1;
+    zend_string *state = NULL;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_DOUBLE_OR_NULL(value, is_null)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STR(state)
+    ZEND_PARSE_PARAMETERS_END();
+    int st = VIO_PLATFORM_PROGRESS_NORMAL;
+    if (state) {
+        if (zend_string_equals_literal(state, "normal")) st = VIO_PLATFORM_PROGRESS_NORMAL;
+        else if (zend_string_equals_literal(state, "paused")) st = VIO_PLATFORM_PROGRESS_PAUSED;
+        else if (zend_string_equals_literal(state, "error")) st = VIO_PLATFORM_PROGRESS_ERROR;
+        else if (zend_string_equals_literal(state, "indeterminate")) st = VIO_PLATFORM_PROGRESS_INDETERMINATE;
+        else { zend_argument_value_error(3, "must be 'normal', 'paused', 'error' or 'indeterminate'"); RETURN_THROWS(); }
+    }
+    if (!is_null && !(value >= 0.0 && value <= 1.0)) { zend_argument_value_error(2, "must be between 0.0 and 1.0, or null to hide"); RETURN_THROWS(); }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!vio_plat_can((const void *)vio_plat()->set_progress, VIO_PLATFORM_FEATURE_PROGRESS)) RETURN_FALSE;
+    /* null hides, except that 'indeterminate' needs no value */
+    RETURN_BOOL(vio_plat()->set_progress(ctx->window, is_null ? -1.0 : value, is_null && st != VIO_PLATFORM_PROGRESS_INDETERMINATE ? VIO_PLATFORM_PROGRESS_NORMAL : st));
 }
 
 /* 1 when s holds a control character (also NUL inside the string). */

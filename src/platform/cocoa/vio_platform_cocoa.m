@@ -27,6 +27,8 @@
 
 #import <Cocoa/Cocoa.h>
 #include <objc/message.h>
+#include <dlfcn.h>
+#import <UserNotifications/UserNotifications.h>   /* used through NSClassFromString: the module does not link it */
 #include <float.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <GameController/GameController.h>
@@ -1219,6 +1221,76 @@ static int cocoa_popup_menu(vio_window_handle h, const vio_menu_item *items, int
     }
 }
 
+/* ── Dock progress, notifications (DESKTOP-APP-PLAN Phase 2c) ─────── */
+
+static void *cocoa_dock_bar;   /* NSProgressIndicator on the Dock tile, retained */
+
+static int cocoa_set_progress(vio_window_handle h, double value, int state)
+{
+    (void)h;
+    if (!cocoa_initialized) return 0;
+    @autoreleasepool {
+        NSDockTile *tile = NSApp.dockTile;
+        if (value < 0.0 && state != VIO_PLATFORM_PROGRESS_INDETERMINATE) {
+            tile.contentView = nil;
+            [tile display];
+            if (cocoa_dock_bar) { CFRelease(cocoa_dock_bar); cocoa_dock_bar = NULL; }
+            return 1;
+        }
+        if (!cocoa_dock_bar) {
+            NSSize size = tile.size;
+            NSView *root = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, size.width, size.height)];
+            NSImageView *icon = [[NSImageView alloc] initWithFrame:root.bounds];
+            icon.image = NSApp.applicationIconImage;
+            [root addSubview:icon];
+            NSProgressIndicator *bar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(size.width * 0.1, size.height * 0.08, size.width * 0.8, 20)];
+            bar.style = NSProgressIndicatorStyleBar;
+            bar.minValue = 0;
+            bar.maxValue = 1;
+            [root addSubview:bar];
+            tile.contentView = root;
+            cocoa_dock_bar = (void *)CFBridgingRetain(bar);
+        }
+        NSProgressIndicator *bar = (__bridge NSProgressIndicator *)cocoa_dock_bar;
+        /* no paused / error colours in AppKit: the bar shows the value */
+        bar.indeterminate = state == VIO_PLATFORM_PROGRESS_INDETERMINATE;
+        if (bar.indeterminate) [bar startAnimation:nil]; else { [bar stopAnimation:nil]; bar.doubleValue = value; }
+        [tile display];
+    }
+    return 1;
+}
+
+/* UNUserNotificationCenter: only inside an app bundle (it throws without one). */
+static int cocoa_available(int feature)
+{
+    if (feature != VIO_PLATFORM_FEATURE_NOTIFICATIONS) return 1;
+    static int loaded = -1;
+    if (loaded < 0) loaded = dlopen("/System/Library/Frameworks/UserNotifications.framework/UserNotifications", RTLD_LAZY) != NULL;
+    return loaded && [NSBundle mainBundle].bundleIdentifier != nil && NSClassFromString(@"UNUserNotificationCenter") != nil;
+}
+
+static int cocoa_notify(const char *title, const char *body, const char *icon, const char *key)
+{
+    (void)icon;   /* a bundle's notifications carry its icon */
+    if (!cocoa_available(VIO_PLATFORM_FEATURE_NOTIFICATIONS)) return 0;
+    @autoreleasepool {
+        UNUserNotificationCenter *center = [NSClassFromString(@"UNUserNotificationCenter") currentNotificationCenter];
+        static int asked;
+        if (!asked) {   /* the first time macOS asks the user */
+            asked = 1;
+            [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
+                                  completionHandler:^(BOOL granted, NSError *error) { (void)granted; (void)error; }];
+        }
+        UNMutableNotificationContent *content = [[NSClassFromString(@"UNMutableNotificationContent") alloc] init];
+        content.title = cocoa_str(title) ?: @"";
+        content.body = cocoa_str(body) ?: @"";
+        NSString *ident = key ? cocoa_str(key) : [[NSUUID UUID] UUIDString];   /* same id: replaces */
+        UNNotificationRequest *req = [NSClassFromString(@"UNNotificationRequest") requestWithIdentifier:ident content:content trigger:nil];
+        [center addNotificationRequest:req withCompletionHandler:nil];
+    }
+    return 1;
+}
+
 static int cocoa_window_monitor(vio_window_handle h)
 {
     return h ? ((vio_cocoa_window *)h)->monitor : -1;
@@ -1562,6 +1634,9 @@ static const vio_platform vio_platform_cocoa = {
     .message_box          = cocoa_message_box,
     .set_menu_bar         = cocoa_set_menu_bar,
     .popup_menu           = cocoa_popup_menu,
+    .available            = cocoa_available,
+    .notify               = cocoa_notify,
+    .set_progress         = cocoa_set_progress,
 };
 
 void vio_platform_cocoa_register(void)
