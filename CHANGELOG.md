@@ -1,3 +1,12 @@
+## [2.41.1](https://github.com/phpolygon/php-vio/compare/v2.41.0...v2.41.1) (2026-11-06)
+
+
+### Bug Fixes
+
+* **d3d11:** instanced draws keep their instance buffer per device ([5bb20c5](https://github.com/phpolygon/php-vio/commit/5bb20c5e113232999b83f0d2adabe4d205b1bb0f))
+* **opengl:** creating a render target keeps the bound target bound ([330c14e](https://github.com/phpolygon/php-vio/commit/330c14e3ded0f247d0d2419da679763f4166d82a))
+* **opengl:** put back only a bound target's FBO after creating a render target ([dbc12b2](https://github.com/phpolygon/php-vio/commit/dbc12b2f12829716836073d8554628a9c8833fe8))
+
 # [2.41.0](https://github.com/phpolygon/php-vio/compare/v2.40.3...v2.41.0) (2026-11-06)
 
 
