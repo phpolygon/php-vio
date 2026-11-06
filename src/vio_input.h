@@ -106,6 +106,7 @@ typedef enum {
     VIO_WINDOW_CB_SCALE,
     VIO_WINDOW_CB_REFRESH,
     VIO_WINDOW_CB_DROP,
+    VIO_WINDOW_CB_MENU,
     VIO_WINDOW_CB_COUNT
 } vio_window_cb;
 
@@ -126,6 +127,7 @@ typedef struct _vio_input_state {
     int    has_window_cb[VIO_WINDOW_CB_COUNT];
     /* Last reported window state: the funnels fire only on a change. -1 = unknown. */
     int    win_focused, win_minimized;
+    zval   menu_ids;          /* vio_menu_bar: id string per tag (array), UNDEF = no menu */
     float  win_scale_x, win_scale_y;
     char   char_buffer[256];
     int    char_buffer_len;
@@ -231,6 +233,8 @@ void vio_input_scale_event(vio_input_state *state, float sx, float sy);
 void vio_input_refresh_event(vio_input_state *state);
 /* Files dropped on the window (UTF-8 paths) at x, y in cursor space. */
 void vio_input_drop_event(vio_input_state *state, int count, const char *const *paths, double x, double y);
+/* A menu bar item was chosen (its tag): the menu callback gets its id. */
+void vio_input_menu_event(vio_input_state *state, int tag);
 /* Set or replace a window event callback (callback must be callable). */
 void vio_input_set_window_cb(vio_input_state *state, vio_window_cb which, zval *callback);
 

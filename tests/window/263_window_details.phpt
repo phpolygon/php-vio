@@ -12,7 +12,7 @@ $child = <<<'PHP'
 $ctx = @vio_create('auto', ['width' => 64, 'height' => 48, 'headless' => true]) ?: vio_create('null', ['width' => 64, 'height' => 48]);
 $info = vio_platform_info();
 $p = vio_platform();
-$keys = ['name', 'wait_events', 'cursor_shapes', 'custom_cursor', 'window_icon', 'size_limits', 'aspect_ratio', 'floating', 'opacity', 'open_url', 'reveal_file', 'file_drop', 'file_dialog', 'message_box'];
+$keys = ['name', 'wait_events', 'cursor_shapes', 'custom_cursor', 'window_icon', 'size_limits', 'aspect_ratio', 'floating', 'opacity', 'open_url', 'reveal_file', 'file_drop', 'file_dialog', 'message_box', 'menu_bar', 'popup_menu'];
 $out = [];
 $out[] = 'info ' . json_encode(array_keys($info) === $keys && $info['name'] === $p);
 $caps = implode('', array_map(fn($k) => $info[$k] ? '1' : '0', array_slice($keys, 1)));
@@ -165,13 +165,13 @@ foreach (['win32', 'cocoa', 'x11', 'glfw', 'wayland', 'null'] as $platform) {
 }
 unlink($file);
 
-/* caps: wait_events cursor_shapes custom_cursor window_icon size_limits aspect_ratio floating opacity open_url reveal_file file_drop file_dialog message_box */
+/* caps: wait_events cursor_shapes custom_cursor window_icon size_limits aspect_ratio floating opacity open_url reveal_file file_drop file_dialog message_box menu_bar popup_menu */
 $wantCaps = [
-    'null'    => '1000000000000',
-    'win32'   => '1111111111111',
-    'cocoa'   => '1111111111111',
-    'x11'     => '1111111111100',
-    'wayland' => '1110100011100',
+    'null'    => '100000000000000',
+    'win32'   => '111111111111111',
+    'cocoa'   => '111111111111111',
+    'x11'     => '111111111110000',
+    'wayland' => '111010001110000',
     'glfw'    => null,   // icon depends on what GLFW runs on (none on macOS and Wayland)
 ];
 $wantOs = [
@@ -184,7 +184,7 @@ foreach ($results as $platform => $line) {
     $parts = explode(' | ', $line);
     $caps = substr($parts[1] ?? '', 5);
     $ok = ($parts[0] ?? '') === 'info true'
-        && ($wantCaps[$platform] === null ? preg_match('/^11[01]{8}100$/', $caps) : $caps === $wantCaps[$platform])
+        && ($wantCaps[$platform] === null ? preg_match('/^11[01]{8}10000$/', $caps) : $caps === $wantCaps[$platform])
         && array_slice($parts, 2, 8) === ['shapes true ValueError', 'cursor image true ValueError ValueError',
                                           'icon true ValueError ValueError', 'limits [true,[100,80],[40,30],[60,50]] ValueError',
                                           'aspect true ValueError', 'floating true', 'opacity true ValueError',

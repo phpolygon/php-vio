@@ -107,6 +107,20 @@ typedef struct _vio_message_box_desc {
     int          kind;
 } vio_message_box_desc;
 
+/* Menus (DESKTOP-APP-PLAN Phase 2b). A leaf has a tag (>= 0, its index in
+ * the caller's id table) and is what a selection reports; a submenu has
+ * children; a separator has neither. key/mods: VIO_KEY_* / VIO_MOD_* of the
+ * shortcut, key 0 = none. The platform copies what it keeps. */
+typedef struct _vio_menu_item {
+    const char *label;
+    int         tag;          /* -1 for submenus and separators */
+    int         separator;
+    int         enabled, checked;
+    int         key, mods;
+    const struct _vio_menu_item *children;
+    int         child_count;
+} vio_menu_item;
+
 /* An RGBA image (window icon), top row first. */
 typedef struct _vio_platform_image {
     int width, height;
@@ -242,6 +256,13 @@ typedef struct _vio_platform {
     int   (*file_dialog)(vio_window_handle w, const vio_file_dialog_desc *d, char ***out_paths, int *out_count);
     /* Modal. The pressed button's index, -1 = could not show one. */
     int   (*message_box)(vio_window_handle w, const vio_message_box_desc *d);
+    /* The window's menu bar (macOS: the application's, behind vio's app
+     * menu); count 0 removes it. Selections arrive as vio_input_menu_event
+     * with the item's tag. 1 = set. */
+    int   (*set_menu_bar)(vio_window_handle w, const vio_menu_item *menus, int count);
+    /* Modal context menu at x, y (cursor space): the chosen tag, -1 = none,
+     * -2 = could not show one. */
+    int   (*popup_menu)(vio_window_handle w, const vio_menu_item *items, int count, double x, double y);
 } vio_platform;
 
 /* Registry (src/vio_platform_registry.c): platforms register in MINIT; the

@@ -1,6 +1,6 @@
 # Native Desktop-Anwendungen – Plan
 
-> **Status:** 🚧 Phasen 0, 1 und 2a (Drop, Dialoge, Message-Box) umgesetzt (2026-11-05, Tests 261–266), 2b/2c und 3–5 offen.
+> **Status:** 🚧 Phasen 0, 1, 2a (Drop, Dialoge, Message-Box) und 2b (Menüs) umgesetzt (2026-11-05, Tests 261–267), 2c und 3–5 offen.
 > **Baut auf:** `NATIVE-PLATFORM-PLAN.md` (Win32, Cocoa, X11, Wayland hinter `vio_platform`, Tests 212–215) und
 > Zwischenablage/Tastennamen (239/240).
 > **Ziel:** Mit php-vio sollen sich Werkzeuge, Editoren und Launcher bauen lassen, nicht nur Spiele: sparsam im
@@ -98,7 +98,8 @@ vio_on_refresh($ctx, fn() => render());   // OS will neu gezeichnet haben (Expos
 - **2a umgesetzt** (Tests 265, 266): Datei-Drop auf allen Plattformen, Datei-Dialog und Message-Box auf Win32 und Cocoa.
   Der Linux-Datei-Dialog (Portal) kommt mit dem D-Bus-Helfer in 2c. Testbar über `VIO_TEST_DIALOG=<ms>:<aktion>`, das den
   echten Dialog nach einer Wartezeit schließt.
-- **2b:** Menüleiste und Kontextmenü. **2c:** D-Bus-Helfer (`dlopen` libdbus), Portal-Dialoge, Tray, Benachrichtigungen,
+- **2b umgesetzt** (Test 267): Menüleiste und Kontextmenü auf Win32 und Cocoa, Kürzel mit `Primary`; macOS bekommt ein
+  App-Menü, dessen Beenden `vio_on_close` fragt. **2c:** D-Bus-Helfer (`dlopen` libdbus), Portal-Dialoge, Tray, Benachrichtigungen,
   Fortschritt in Taskleiste/Dock.
 - Menü-Baum als PHP-Array: `['id', 'label', 'shortcut' => 'Ctrl+S', 'checked', 'enabled', 'children', 'separator']`.
   Kürzel plattformgerecht (`Ctrl` → `Cmd` auf macOS über `'shortcut' => 'Primary+S'`).

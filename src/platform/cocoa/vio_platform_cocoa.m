@@ -112,6 +112,7 @@ struct _vio_cocoa_window {
     NSRect           windowed_frame;
     unsigned char    keys_down[256];
     void            *cursor;     /* NSCursor for the view, retained; NULL = arrow */
+    void            *menu_target;   /* VioCocoaMenuTarget of the menu bar, retained */
     vio_input_state *input;
 };
 
@@ -274,6 +275,28 @@ static void cocoa_report_size(vio_cocoa_window *w)
     [super updateTrackingAreas];
 }
 
+@end
+
+/* Menu actions: an item's tag goes to the window's input state; Quit asks
+ * the window to close. Popups record the tag instead. */
+@interface VioCocoaMenuTarget : NSObject
+@property (nonatomic, assign) vio_cocoa_window *owner;
+@property (nonatomic, assign) NSInteger chosen;
+@property (nonatomic, assign) BOOL popup;
+@end
+
+@implementation VioCocoaMenuTarget
+- (void)vioMenu:(NSMenuItem *)item
+{
+    if (self.popup) { self.chosen = item.tag; return; }
+    if (self.owner) vio_input_menu_event(self.owner->input, (int)item.tag);
+}
+- (void)vioQuit:(id)sender
+{
+    (void)sender;
+    vio_cocoa_window *w = self.owner;
+    if (w && vio_input_close_request(w->input)) w->should_close = 1;
+}
 @end
 
 @interface VioCocoaDelegate : NSObject <NSWindowDelegate>
@@ -591,6 +614,11 @@ static void cocoa_destroy_window(vio_window_handle h)
         }
         NSWindow *win = COCOA_WIN(w);
         if (w->cursor) { CFRelease(w->cursor); w->cursor = NULL; }
+        if (w->menu_target) {
+            ((__bridge VioCocoaMenuTarget *)w->menu_target).owner = NULL;   /* the main menu may outlive the window */
+            CFRelease(w->menu_target);
+            w->menu_target = NULL;
+        }
         ((__bridge VioCocoaView *)w->view).owner = NULL;
         ((__bridge VioCocoaDelegate *)w->delegate).owner = NULL;
         win.delegate = nil;
@@ -1073,6 +1101,124 @@ static int cocoa_message_box(vio_window_handle h, const vio_message_box_desc *d)
     }
 }
 
+/* ── Menus (DESKTOP-APP-PLAN Phase 2b) ────────────────────────────── */
+
+static NSString *cocoa_key_equivalent(int key)
+{
+    unichar c = 0;
+    if (key >= VIO_KEY_A && key <= VIO_KEY_Z) c = (unichar)('a' + key - VIO_KEY_A);
+    else if (key >= VIO_KEY_0 && key <= VIO_KEY_9) c = (unichar)('0' + key - VIO_KEY_0);
+    else if (key >= VIO_KEY_F1 && key <= VIO_KEY_F1 + 23) c = (unichar)(NSF1FunctionKey + key - VIO_KEY_F1);
+    else switch (key) {
+        case VIO_KEY_ENTER: c = '\r'; break;           case VIO_KEY_ESCAPE: c = 0x1B; break;
+        case VIO_KEY_TAB: c = '\t'; break;             case VIO_KEY_SPACE: c = ' '; break;
+        case VIO_KEY_BACKSPACE: c = 0x08; break;        case VIO_KEY_DELETE: c = NSDeleteFunctionKey; break;
+        case VIO_KEY_INSERT: c = NSInsertFunctionKey; break; case VIO_KEY_HOME: c = NSHomeFunctionKey; break;
+        case VIO_KEY_END: c = NSEndFunctionKey; break;  case VIO_KEY_PAGE_UP: c = NSPageUpFunctionKey; break;
+        case VIO_KEY_PAGE_DOWN: c = NSPageDownFunctionKey; break; case VIO_KEY_UP: c = NSUpArrowFunctionKey; break;
+        case VIO_KEY_DOWN: c = NSDownArrowFunctionKey; break; case VIO_KEY_LEFT: c = NSLeftArrowFunctionKey; break;
+        case VIO_KEY_RIGHT: c = NSRightArrowFunctionKey; break; case VIO_KEY_COMMA: c = ','; break;
+        case VIO_KEY_PERIOD: c = '.'; break;            case VIO_KEY_MINUS: c = '-'; break;
+        case VIO_KEY_SLASH: c = '/'; break;             case VIO_KEY_EQUAL: c = '='; break;
+        default: return @"";
+    }
+    return [NSString stringWithCharacters:&c length:1];
+}
+
+static NSMenu *cocoa_build_menu(NSString *title, const vio_menu_item *items, int n, VioCocoaMenuTarget *target)
+{
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:title];
+    menu.autoenablesItems = NO;
+    for (int i = 0; i < n; i++) {
+        const vio_menu_item *it = &items[i];
+        if (it->separator) { [menu addItem:[NSMenuItem separatorItem]]; continue; }
+        NSString *label = cocoa_str(it->label) ?: @"?";
+        NSMenuItem *mi = [[NSMenuItem alloc] initWithTitle:label action:NULL keyEquivalent:@""];
+        mi.enabled = it->enabled ? YES : NO;
+        if (it->children) {
+            mi.submenu = cocoa_build_menu(label, it->children, it->child_count, target);
+        } else {
+            mi.target = target;
+            mi.action = @selector(vioMenu:);
+            mi.tag = it->tag;
+            mi.state = it->checked ? NSControlStateValueOn : NSControlStateValueOff;
+            if (it->key) {
+                mi.keyEquivalent = cocoa_key_equivalent(it->key);
+                NSEventModifierFlags m = 0;
+                if (it->mods & VIO_MOD_SUPER)   m |= NSEventModifierFlagCommand;
+                if (it->mods & VIO_MOD_CONTROL) m |= NSEventModifierFlagControl;
+                if (it->mods & VIO_MOD_ALT)     m |= NSEventModifierFlagOption;
+                if (it->mods & VIO_MOD_SHIFT)   m |= NSEventModifierFlagShift;
+                mi.keyEquivalentModifierMask = m;
+            }
+        }
+        [menu addItem:mi];
+    }
+    return menu;
+}
+
+/* About, Hide, Hide Others, Show All, Quit (asks vio_on_close) */
+static NSMenuItem *cocoa_app_menu(VioCocoaMenuTarget *target)
+{
+    NSString *name = [[NSProcessInfo processInfo] processName];
+    NSMenu *m = [[NSMenu alloc] initWithTitle:name];
+    [m addItemWithTitle:[@"About " stringByAppendingString:name] action:@selector(orderFrontStandardAboutPanel:) keyEquivalent:@""];
+    [m addItem:[NSMenuItem separatorItem]];
+    [m addItemWithTitle:[@"Hide " stringByAppendingString:name] action:@selector(hide:) keyEquivalent:@"h"];
+    NSMenuItem *others = [m addItemWithTitle:@"Hide Others" action:@selector(hideOtherApplications:) keyEquivalent:@"h"];
+    others.keyEquivalentModifierMask = NSEventModifierFlagOption | NSEventModifierFlagCommand;
+    [m addItemWithTitle:@"Show All" action:@selector(unhideAllApplications:) keyEquivalent:@""];
+    [m addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *quit = [m addItemWithTitle:[@"Quit " stringByAppendingString:name] action:@selector(vioQuit:) keyEquivalent:@"q"];
+    quit.target = target;
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:name action:NULL keyEquivalent:@""];
+    item.submenu = m;
+    return item;
+}
+
+static int cocoa_set_menu_bar(vio_window_handle h, const vio_menu_item *menus, int count)
+{
+    vio_cocoa_window *w = (vio_cocoa_window *)h;
+    if (!w) return 0;
+    @autoreleasepool {
+        if (!w->menu_target) {
+            VioCocoaMenuTarget *t = [[VioCocoaMenuTarget alloc] init];
+            t.owner = w;
+            w->menu_target = (void *)CFBridgingRetain(t);
+        }
+        VioCocoaMenuTarget *target = (__bridge VioCocoaMenuTarget *)w->menu_target;
+        NSMenu *bar = [[NSMenu alloc] initWithTitle:@""];
+        [bar addItem:cocoa_app_menu(target)];
+        for (int i = 0; i < count; i++) {
+            NSString *label = cocoa_str(menus[i].label) ?: @"?";
+            NSMenuItem *top = [[NSMenuItem alloc] initWithTitle:label action:NULL keyEquivalent:@""];
+            top.submenu = cocoa_build_menu(label, menus[i].children, menus[i].child_count, target);
+            [bar addItem:top];
+        }
+        [NSApp setMainMenu:bar];
+    }
+    return 1;
+}
+
+static int cocoa_popup_menu(vio_window_handle h, const vio_menu_item *items, int count, double x, double y)
+{
+    vio_cocoa_window *w = (vio_cocoa_window *)h;
+    if (!cocoa_initialized) return -2;
+    @autoreleasepool {
+        VioCocoaMenuTarget *target = [[VioCocoaMenuTarget alloc] init];
+        target.popup = YES;
+        target.chosen = -1;
+        NSMenu *menu = cocoa_build_menu(@"", items, count, target);
+        cocoa_test_dismiss(^(int action) { (void)action; [menu cancelTracking]; });
+        if (w && !w->headless) {
+            [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(x, y) inView:COCOA_VIEW(w)];   /* flipped: y from the top */
+        } else {
+            [menu popUpMenuPositioningItem:nil atLocation:[NSEvent mouseLocation] inView:nil];   /* no visible view: at the pointer */
+        }
+        return (int)target.chosen;
+    }
+}
+
 static int cocoa_window_monitor(vio_window_handle h)
 {
     return h ? ((vio_cocoa_window *)h)->monitor : -1;
@@ -1414,6 +1560,8 @@ static const vio_platform vio_platform_cocoa = {
     .accepts_drops        = 1,
     .file_dialog          = cocoa_file_dialog,
     .message_box          = cocoa_message_box,
+    .set_menu_bar         = cocoa_set_menu_bar,
+    .popup_menu           = cocoa_popup_menu,
 };
 
 void vio_platform_cocoa_register(void)
