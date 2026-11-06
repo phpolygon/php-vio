@@ -15,6 +15,7 @@ void vio_input_init(vio_input_state *state)
 {
     memset(state->keys, 0, sizeof(state->keys));
     memset(state->keys_prev, 0, sizeof(state->keys_prev));
+    state->blocked = 0;
     state->mouse_x = 0.0;
     state->mouse_y = 0.0;
     state->mouse_prev_x = 0.0;
@@ -183,7 +184,7 @@ static int vio_encode_utf8(unsigned int codepoint, char *out)
  * callback). */
 void vio_input_emit_char(vio_input_state *state, unsigned int codepoint)
 {
-    if (!state) return;
+    if (!state || state->blocked) return;
 
     vio_input_event ev = {0};
     ev.type = VIO_INPUT_EV_CHAR;
@@ -218,7 +219,9 @@ void vio_input_emit_char(vio_input_state *state, unsigned int codepoint)
 
 void vio_input_key_event(vio_input_state *state, int key, int action, int mods)
 {
-    if (!state) return;
+    /* A modal child blocks the window: presses are dropped, releases still
+     * arrive so nothing held before stays down. */
+    if (!state || (state->blocked && action != VIO_RELEASE)) return;
 
     vio_input_event ev = {0};
     ev.type = VIO_INPUT_EV_KEY;
@@ -256,7 +259,7 @@ void vio_input_cursor_event(vio_input_state *state, double x, double y)
 
 void vio_input_button_event(vio_input_state *state, int button, int action)
 {
-    if (!state) return;
+    if (!state || (state->blocked && action != VIO_RELEASE)) return;
 
     vio_input_event ev = {0};
     ev.type = VIO_INPUT_EV_BUTTON;
@@ -270,7 +273,7 @@ void vio_input_button_event(vio_input_state *state, int button, int action)
 
 void vio_input_scroll_event(vio_input_state *state, double dx, double dy)
 {
-    if (!state) return;
+    if (!state || state->blocked) return;
 
     vio_input_event ev = {0};
     ev.type = VIO_INPUT_EV_SCROLL;
@@ -313,6 +316,7 @@ static void vio_window_cb_call(vio_input_state *state, vio_window_cb which, int 
 
 int vio_input_close_request(vio_input_state *state)
 {
+    if (state && state->blocked) return 0;   /* the modal child answers first */
     if (!state || !state->has_window_cb[VIO_WINDOW_CB_CLOSE]) return 1;
     zval retval;
     vio_window_cb_call(state, VIO_WINDOW_CB_CLOSE, 0, NULL, &retval);
@@ -365,7 +369,7 @@ void vio_input_refresh_event(vio_input_state *state)
 
 void vio_input_drop_event(vio_input_state *state, int count, const char *const *paths, double x, double y)
 {
-    if (!state || count <= 0 || !state->has_window_cb[VIO_WINDOW_CB_DROP]) return;
+    if (!state || state->blocked || count <= 0 || !state->has_window_cb[VIO_WINDOW_CB_DROP]) return;
     zval retval, args[3];
     array_init_size(&args[0], (uint32_t)count);
     for (int i = 0; i < count; i++) add_next_index_string(&args[0], paths[i]);
@@ -378,7 +382,7 @@ void vio_input_drop_event(vio_input_state *state, int count, const char *const *
 
 void vio_input_menu_event(vio_input_state *state, int tag)
 {
-    if (!state || Z_TYPE(state->menu_ids) != IS_ARRAY) return;
+    if (!state || state->blocked || Z_TYPE(state->menu_ids) != IS_ARRAY) return;
     zval *id = zend_hash_index_find(Z_ARRVAL(state->menu_ids), (zend_ulong)tag);
     if (!id) return;
     zval retval, arg;
@@ -390,7 +394,7 @@ void vio_input_menu_event(vio_input_state *state, int tag)
 
 void vio_input_preedit_event(vio_input_state *state, const char *utf8, int start, int end)
 {
-    if (!state) return;
+    if (!state || state->blocked) return;
     zval retval, args[3];
     ZVAL_STRING(&args[0], utf8 ? utf8 : "");
     ZVAL_LONG(&args[1], start);

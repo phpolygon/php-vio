@@ -1720,6 +1720,28 @@ static int cocoa_clipboard_set(const char *utf8)
     }
 }
 
+/* vio_window 'parent' / 'modal': a child window moves with its parent and stays
+ * above it; 'modal' is vio's input block (an app-modal session would stop the
+ * PHP loop). */
+static int cocoa_set_parent(vio_window_handle h, vio_window_handle ph, int modal)
+{
+    (void)modal;
+    vio_cocoa_window *w = (vio_cocoa_window *)h, *p = (vio_cocoa_window *)ph;
+    if (!w || !w->window) return 0;
+    @autoreleasepool {
+        NSWindow *child = (__bridge NSWindow *)w->window;
+        if (!p) {
+            if (child.parentWindow) [child.parentWindow removeChildWindow:child];
+            return 1;
+        }
+        if (!p->window) return 0;
+        /* addChildWindow orders the child in: a headless (hidden) one stays apart */
+        if (w->headless) return 1;
+        [(__bridge NSWindow *)p->window addChildWindow:child ordered:NSWindowAbove];
+    }
+    return 1;
+}
+
 static const vio_platform vio_platform_cocoa = {
     .name                 = "cocoa",
     .init                 = cocoa_init,
@@ -1791,6 +1813,7 @@ static const vio_platform vio_platform_cocoa = {
     .ime_preedit          = 1,
     .set_ime_rect         = cocoa_set_ime_rect,
     .set_ime_enabled      = cocoa_set_ime_enabled,
+    .set_parent           = cocoa_set_parent,
 };
 
 void vio_platform_cocoa_register(void)

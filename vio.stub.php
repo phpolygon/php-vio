@@ -268,7 +268,9 @@ function vio_wake(): void {}
  * A further window on the context's device (VIO_FEATURE_MULTI_WINDOW, otherwise false).
  * Render into it with vio_begin($context, ['window' => $window]); window, input and size
  * functions take it in place of the context.
- * @param array{width?: int, height?: int, title?: string, headless?: bool, vsync?: bool} $options
+ * 'parent' (the context or one of its windows) keeps the window above it and closes it with it;
+ * 'modal' => true also blocks the parent's input while the window is open.
+ * @param array{width?: int, height?: int, title?: string, headless?: bool, vsync?: bool, parent?: VioContext|VioWindow|null, modal?: bool} $options
  */
 function vio_window(VioContext $context, array $options = []): VioWindow|false {}
 

@@ -191,7 +191,13 @@ vio_key_pressed($tool, VIO_KEY_A);   // Eingabe-Funktionen nehmen VioContext|Vio
     macht ihn aktuell, wartet per Fence-Sync auf den Hauptkontext, blittet den geteilten Renderbuffer in seinen
     Backbuffer, tauscht und macht den Hauptkontext wieder aktuell. Ein Headless-Fenster hat keinen Kontext.
     Geprüft auf Cocoa und GLFW (sichtbares Fenster, Bildschirmaufnahme); WGL, GLX und EGL nur headless in der CI.
-  - Offen: `'parent'` / `'modal'` für Unterfenster.
+  - **Unterfenster ✅ (2026-11-05, Test 272):** `vio_window($ctx, ['parent' => $ctx|$window, 'modal' => true])`. Plattform-Slot
+    `set_parent`: Win32 Owner (`GWLP_HWNDPARENT`, modal: Owner per `EnableWindow` aus, vor dem Schließen wieder an), Cocoa
+    `addChildWindow` (nur sichtbare Fenster, sonst würde das Kind eingeblendet), X11 `WM_TRANSIENT_FOR` +
+    `_NET_WM_STATE_MODAL` (Property vor dem Mappen, sonst Anfrage an den WM), Wayland `xdg_toplevel.set_parent`; GLFW
+    nichts (`vio_platform_info()['window_parent']` = false). Modal sperrt vio auf jeder Plattform im Input-Funnel
+    (`vio_input_state.blocked`): Tasten, Maustasten, Scrollen, Text, Drops, Menüs und Schließ-Anfragen des Elternfensters
+    fallen weg, Loslassen kommt durch. Ein Elternfenster schließt zuerst seine Kinder.
   - Backends ohne Umbau melden `VIO_FEATURE_MULTI_WINDOW` = false, `vio_window` liefert dort `false`. Headless-Fenster bekommen dieselben Slots, damit die Tests
   ohne Bildschirm laufen.
 - **Tests (270–272):** zwei und drei Fenster in einem Frame-Zyklus, je Fenster eigener Clear/Draw und

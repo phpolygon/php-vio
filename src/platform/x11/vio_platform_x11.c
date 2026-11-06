@@ -1898,6 +1898,31 @@ static const char *x11_key_name(int key)
     return name;
 }
 
+/* vio_window 'parent' / 'modal': WM_TRANSIENT_FOR and _NET_WM_STATE_MODAL (the
+ * property itself before the window is mapped, a request to the WM after). */
+static int x11_set_parent(vio_window_handle h, vio_window_handle ph, int modal)
+{
+    vio_x11_window *w = (vio_x11_window *)h, *p = (vio_x11_window *)ph;
+    if (!w || !w->win) return 0;
+    if (!p) {
+        XDeleteProperty(x11_dpy, w->win, XA_WM_TRANSIENT_FOR);
+        XFlush(x11_dpy);
+        return 1;
+    }
+    XSetTransientForHint(x11_dpy, w->win, p->win);
+    if (modal) {
+        Atom m = XInternAtom(x11_dpy, "_NET_WM_STATE_MODAL", False);
+        XWindowAttributes wa;
+        if (XGetWindowAttributes(x11_dpy, w->win, &wa) && wa.map_state == IsUnmapped) {
+            XChangeProperty(x11_dpy, w->win, x11_net_wm_state, XA_ATOM, 32, PropModeAppend, (unsigned char *)&m, 1);
+        } else {
+            x11_send_state(w, 1, m, 0);
+        }
+    }
+    XFlush(x11_dpy);
+    return 1;
+}
+
 static const vio_platform vio_platform_x11 = {
     .name                 = "x11",
     .init                 = x11_init,
@@ -1966,6 +1991,7 @@ static const vio_platform vio_platform_x11 = {
     .ime_preedit          = 1,
     .set_ime_rect         = x11_set_ime_rect,
     .set_ime_enabled      = x11_set_ime_enabled,
+    .set_parent           = x11_set_parent,
 };
 
 void vio_platform_x11_register(void)

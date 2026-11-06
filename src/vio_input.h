@@ -129,6 +129,9 @@ typedef struct _vio_input_state {
     /* Last reported window state: the funnels fire only on a change. -1 = unknown. */
     int    win_focused, win_minimized;
     zval   menu_ids;          /* vio_menu_bar: id string per tag (array), UNDEF = no menu */
+    /* Modal children open over this window (vio_window 'modal'): keys, buttons,
+     * scroll, text, drops, menus and close requests are dropped while > 0. */
+    int    blocked;
     float  win_scale_x, win_scale_y;
     char   char_buffer[256];
     int    char_buffer_len;
