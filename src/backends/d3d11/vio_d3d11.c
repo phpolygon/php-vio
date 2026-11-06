@@ -354,6 +354,11 @@ static void d3d11_shutdown(void)
         ID3D11Buffer_Release(vio_d3d11.identity_instance_buf);
         vio_d3d11.identity_instance_buf = NULL;
     }
+    if (vio_d3d11.draw_instance_buf) {
+        ID3D11Buffer_Release(vio_d3d11.draw_instance_buf);
+        vio_d3d11.draw_instance_buf = NULL;
+    }
+    vio_d3d11.draw_instance_buf_capacity = 0;
 
     /* Release cached constant buffers */
     for (int i = 0; i < VIO_D3D11_CB_CACHE_SLOTS; i++) {

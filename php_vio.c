@@ -14724,14 +14724,13 @@ ZEND_FUNCTION(vio_draw_instanced)
         if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
             UINT byte_size = (UINT)mat_size;
 
-            /* Reuse persistent DYNAMIC instance buffer (avoids CreateBuffer per frame) */
-            static ID3D11Buffer *s_instance_buf = NULL;
-            static UINT s_instance_buf_capacity = 0;
-
-            if (!s_instance_buf || s_instance_buf_capacity < byte_size) {
-                if (s_instance_buf) {
-                    ID3D11Buffer_Release(s_instance_buf);
-                    s_instance_buf = NULL;
+            /* Reuse the device's DYNAMIC instance buffer (avoids CreateBuffer per
+             * frame). It lives in vio_d3d11 and is released with the device; a
+             * function-static outlived the device and a second context drew nothing. */
+            if (!vio_d3d11.draw_instance_buf || vio_d3d11.draw_instance_buf_capacity < byte_size) {
+                if (vio_d3d11.draw_instance_buf) {
+                    ID3D11Buffer_Release(vio_d3d11.draw_instance_buf);
+                    vio_d3d11.draw_instance_buf = NULL;
                 }
 
                 D3D11_BUFFER_DESC bd = {0};
@@ -14740,25 +14739,25 @@ ZEND_FUNCTION(vio_draw_instanced)
                 bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
                 bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-                HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &bd, NULL, &s_instance_buf);
+                HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &bd, NULL, &vio_d3d11.draw_instance_buf);
                 if (FAILED(hr)) {
                     if (allocated) efree(allocated);
                     return;
                 }
-                s_instance_buf_capacity = byte_size;
+                vio_d3d11.draw_instance_buf_capacity = byte_size;
             }
 
             /* Upload via Map/Unmap WRITE_DISCARD */
             D3D11_MAPPED_SUBRESOURCE mapped = {0};
             HRESULT hr = ID3D11DeviceContext_Map(vio_d3d11.context,
-                (ID3D11Resource *)s_instance_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+                (ID3D11Resource *)vio_d3d11.draw_instance_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
             if (SUCCEEDED(hr)) {
                 memcpy(mapped.pData, mat_data, byte_size);
-                ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)s_instance_buf, 0);
+                ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)vio_d3d11.draw_instance_buf, 0);
 
                 /* Bind mesh VB to slot 0, instance VB to slot 1 */
                 vio_d3d11_buffer *vb = (vio_d3d11_buffer *)mesh->backend_vb;
-                ID3D11Buffer *buffers[2] = { vb->buffer, s_instance_buf };
+                ID3D11Buffer *buffers[2] = { vb->buffer, vio_d3d11.draw_instance_buf };
                 UINT strides[2] = { (UINT)mesh->stride, 64 };  /* 64 = sizeof(mat4) */
                 UINT offsets[2] = { 0, 0 };
                 ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 2, buffers, strides, offsets);
