@@ -127,7 +127,55 @@ einem Viewport im selben Fenster (`vio_read_pixels` sieht den GPU-Teil).
 - `vio.stub.php`, CLAUDE.md (API, Testtabelle, nächste freie Nummer), README, Phase 6 in `DESKTOP-APP-PLAN.md`.
 - Folge-Issues für die Lücken aus Abschnitt 5.
 
-## 5. Abgleich mit der NativePHP-API
+## 5. Übergabe Windows (WebView2) – Anweisungen für die nächste Sitzung
+
+Der Rest von W1. Alles andere (Kern, Cookies, Redirects, Streaming, Tests) steht; Windows liefert nur die Plattform-Slots.
+
+**Vorbild:** `src/platform/cocoa/vio_webview_cocoa.m` (ein Kindobjekt je Webview, Request-Tabelle id → Engine-Objekt) und
+`src/platform/linux/vio_webview_linux.c` (Antwort sammeln bis `reply_end`, sonst Stream). Vertrag der Slots:
+`include/vio_platform.h`, Abschnitt „System webview“.
+
+**Umsetzen** in `src/platform/win32/vio_webview_win32.c` (in `config.w32` neben `vio_platform_win32.c` eintragen), Slots in
+`vio_platform_win32` setzen (`webview_create` … `webview_reply_fail`, `webview_set_script`), `available(VIO_PLATFORM_FEATURE_WEBVIEW)`:
+1. **Kein SDK zur Build-Zeit** (Grundsatz 5): die nötigen COM-Interfaces als C-Vtables mit lokalen GUIDs in
+   `src/platform/win32/vio_webview2.h` (Environment, Environment-Options mit Custom-Scheme-Registrierung, Controller,
+   CoreWebView2, Settings, WebResourceRequested/-Response/-Deferral, WebMessageReceived, NavigationCompleted/-Starting,
+   DocumentTitleChanged, NewWindowRequested, AddScriptToExecuteOnDocumentCreated). Reihenfolge der Vtable-Einträge exakt wie
+   in `WebView2.h` des SDK (zum Abgleich herunterladen, nicht einchecken).
+2. **Runtime finden:** Version und Pfad der Evergreen-Runtime aus der Registry (EdgeUpdate `ClientState`,
+   `{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}`), `EmbeddedBrowserWebView.dll` per `LoadLibraryW`,
+   `CreateWebViewEnvironmentWithOptionsInternal`; Rückfall `WebView2Loader.dll` neben `php.exe`. Fehlt beides:
+   `available` = 0, kein Warning.
+3. **Custom Schemes** bei der Environment-Erzeugung registrieren (`ICoreWebView2EnvironmentOptions4`,
+   `TreatAsSecure`, `HasAuthorityComponent`, Allowed Origins = die eigenen Schemes) und `AddWebResourceRequestedFilter`
+   je Scheme. Im Handler: Deferral holen, Anfrage über `vio_webview_request_event` einreihen, offen halten.
+   `navigation` = 1, wenn `ResourceContext` == `DOCUMENT`. Antwort: `CreateWebResourceResponse` mit einem `IStream`;
+   Ende in einem Dispatch → `SHCreateMemStream`, sonst ein eigener IStream, der bei leerem Puffer `E_PENDING` liefert, bis
+   `reply_end`. Header als `"Name: Wert\r\n"`-Liste. `reply_fail`: Antwort mit Status 0 bzw. `Deferral.Complete` ohne Response.
+4. **Brücke:** `window.vio.postMessage(v)` → `window.chrome.webview.postMessage(JSON.stringify(v))`,
+   `window.__vioPost(s)` → `postMessage(String(s))`; ankommend `TryGetWebMessageAsString` → `vio_webview_message_event`.
+   `set_script`: altes Skript per id entfernen, neues hinzufügen (Bridge zuerst).
+5. **Ereignisse:** `NavigationStarting`/`ContentLoading` → navigated (URL), `DocumentTitleChanged` → title,
+   `NewWindowRequested` → new_window und `Handled = TRUE`. Devtools über `Settings.AreDevToolsEnabled`,
+   `transparent` über `DefaultBackgroundColor` (alpha 0).
+6. **Event-Schleife:** WebView2 braucht ein STA und den Nachrichten-Pump des Threads – beides gibt es
+   (`CoInitializeEx` in `vio_platform_win32.c`, `w32_poll_events`/`MsgWaitForMultipleObjectsEx`). Jeder Engine-Callback
+   weckt die Wartezeit wie `vio_wake`, ohne den klebrigen Weck-Zustand zu setzen (vgl. `cocoa_webview_kick`).
+   Environment und Controller entstehen asynchron: `webview_create` pumpt Nachrichten, bis der Controller da ist (Timeout 30 s).
+7. **Größe:** Controller-`Bounds` in Pixeln (logisch × DPI-Scale des Fensters), ohne Bounds der Client-Bereich, bei `WM_SIZE` nachführen.
+   Headless (`WS_POPUP`, unsichtbar): Controller trotzdem anlegen, `IsVisible = TRUE`.
+
+**Prüfen:** Tests 277–283 müssen grün sein (sie skippen bisher auf Windows), 263 erwartet für win32 `webview` = 1 oder 0 –
+nach der Umsetzung auf `1` festziehen (`tests/window/263`, Muster `'win32'`). Nach dem Muster von 284 einen Test für echte
+Eingabe auf Win32 (`SendInput`/`PostMessageW` per FFI an das Kindfenster des Controllers) als 285 ergänzen. Zusätzlich
+`examples/webview_laravel.php <app> --smoke`. Danach in der Windows-CI WebView2 (ist auf den Runnern installiert) über
+`VIO_REQUIRE_WEBVIEW=1` zur Pflicht machen, CLAUDE.md (Testtabelle, „nächste freie“) und diesen Plan nachziehen.
+
+**Gelernt auf macOS/Linux, auf Windows zuerst messen:** ob die Engine für eigene Schemes Cookies speichert (vio hält sie
+ohnehin selbst, `Cookie`-Header der Engine wird verworfen), ob sie Redirects folgt (vio folgt selbst; dann darf die Engine
+nicht zusätzlich), ob POST-Bodies vollständig ankommen, ob der erste Start des Webprozesses länger als 20 s dauert.
+
+## 6. Abgleich mit der NativePHP-API
 
 | NativePHP | vio heute | Folge |
 |---|---|---|
@@ -144,7 +192,7 @@ einem Viewport im selben Fenster (`vio_read_pixels` sieht den GPU-Teil).
 | MenuBar-App (Tray mit Fenster) | `vio_tray` | Issue: Lage des Tray-Icons, Fenster daran ausrichten |
 | ChildProcess, Settings, AutoUpdater | – | PHP-Paket |
 
-## 6. Abschluss
+## 7. Abschluss
 
 Wie im Desktop-Plan: Tests grün auf Linux (Xvfb + weston), macOS und Windows, `vio_platform_info()['webview']` stimmt
 überall, Stub/CLAUDE.md/README nachgezogen. Erster Anwender: `phpolygon/editor` ohne Electron.

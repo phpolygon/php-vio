@@ -1762,7 +1762,7 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   Offen: Linux aarch64 (kein AccessKit-Paket). Linux ohne Portal/Dienst → `false`; macOS als App-Bundle, CLI nur zur Entwicklung.
 - **`WEBVIEW-PLAN.md` — 🚧 macOS und Linux umgesetzt (2026-11-06, Issue #120).** System-Webview für NativePHP-Apps ohne
   Electron: WKWebView bzw. WPE WebKit / WebKitGTK, Custom Scheme → PHP im selben Prozess, Brücke, Streaming, Cookie-Speicher,
-  Redirects (Tests 277–284). Offen: Win32 (WebView2).
+  Redirects (Tests 277–284). Offen: Win32 (WebView2) – Anweisungen dafür in `WEBVIEW-PLAN.md` Abschnitt 5.
 - `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
 - `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
 - **`METAL-GEOMETRY-PLAN.md` — ✅ umgesetzt (2026-10-05).** Geometry-Stage auf Metal per Compute-
