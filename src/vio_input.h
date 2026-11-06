@@ -98,6 +98,16 @@ typedef struct _vio_input_event_list {
     size_t           cap;
 } vio_input_event_list;
 
+/* Window event callbacks (vio_on_close / _focus / _minimize / _scale / _refresh). */
+typedef enum {
+    VIO_WINDOW_CB_CLOSE = 0,
+    VIO_WINDOW_CB_FOCUS,
+    VIO_WINDOW_CB_MINIMIZE,
+    VIO_WINDOW_CB_SCALE,
+    VIO_WINDOW_CB_REFRESH,
+    VIO_WINDOW_CB_COUNT
+} vio_window_cb;
+
 typedef struct _vio_input_state {
     int    keys[VIO_KEY_LAST + 1];
     int    keys_prev[VIO_KEY_LAST + 1];
@@ -111,6 +121,11 @@ typedef struct _vio_input_state {
     int    has_key_callback;
     int    has_resize_callback;
     int    has_char_callback;
+    zval   window_cb[VIO_WINDOW_CB_COUNT];
+    int    has_window_cb[VIO_WINDOW_CB_COUNT];
+    /* Last reported window state: the funnels fire only on a change. -1 = unknown. */
+    int    win_focused, win_minimized;
+    float  win_scale_x, win_scale_y;
     char   char_buffer[256];
     int    char_buffer_len;
     /* iOS soft-keyboard input. The UIKeyInput view (UIKit main thread) enqueues
@@ -204,6 +219,17 @@ void vio_input_button_event(vio_input_state *state, int button, int action);
 void vio_input_scroll_event(vio_input_state *state, double dx, double dy);
 /* Framebuffer resized (platform layer): fires the on_resize callback. */
 void vio_input_resize_event(vio_input_state *state, int width, int height);
+/* Window events from the platform layer (and vio_inject_window_event). Each
+ * fires its callback only when the state changes. close_request returns 1 when
+ * the window may close (no callback, or the callback did not return false);
+ * the platform sets its should_close flag only then. Not recorded. */
+int  vio_input_close_request(vio_input_state *state);
+void vio_input_focus_event(vio_input_state *state, int focused);
+void vio_input_minimize_event(vio_input_state *state, int minimized);
+void vio_input_scale_event(vio_input_state *state, float sx, float sy);
+void vio_input_refresh_event(vio_input_state *state);
+/* Set or replace a window event callback (callback must be callable). */
+void vio_input_set_window_cb(vio_input_state *state, vio_window_cb which, zval *callback);
 
 /* ── Virtual gamepads (process-global) ─────────────────────────────── */
 

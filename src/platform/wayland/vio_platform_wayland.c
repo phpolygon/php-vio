@@ -36,6 +36,7 @@
 #include <wayland-cursor.h>
 #include <xkbcommon/xkbcommon.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
@@ -319,6 +320,7 @@ static void wl_apply_size(vio_wl_window *w)
     if (scale != w->scale) {
         w->scale = scale;
         wl_surface_set_buffer_scale(w->surface, scale);
+        if (!w->headless) vio_input_scale_event(w->input, (float)scale, (float)scale);
     }
     int fw = w->width * scale, fh = w->height * scale;
     if (w->egl_window) egl.window_resize(w->egl_window, fw, fh, 0, 0);
@@ -355,6 +357,7 @@ static void wl_xdg_surface_configure(void *data, struct xdg_surface *s, uint32_t
     xdg_surface_ack_configure(s, serial);
     w->configured = 1;
     wl_apply_size(w);
+    vio_input_refresh_event(w->input);   /* the compositor wants a frame in the configured state */
 }
 
 static const struct xdg_surface_listener wl_xdg_surface_listener = { wl_xdg_surface_configure };
@@ -372,7 +375,8 @@ static void wl_toplevel_configure(void *data, struct xdg_toplevel *t, int32_t wi
 static void wl_toplevel_close(void *data, struct xdg_toplevel *t)
 {
     (void)t;
-    ((vio_wl_window *)data)->should_close = 1;
+    vio_wl_window *w = (vio_wl_window *)data;
+    if (vio_input_close_request(w->input)) w->should_close = 1;
 }
 
 /* bound at version 1: configure_bounds / wm_capabilities (v4 / v5) never arrive */
@@ -506,6 +510,7 @@ static void wl_keyboard_enter(void *data, struct wl_keyboard *k, uint32_t serial
 {
     (void)data; (void)k; (void)serial; (void)keys;
     wl.keyboard_focus = s ? (vio_wl_window *)wl_surface_get_user_data(s) : NULL;
+    if (wl.keyboard_focus) vio_input_focus_event(wl.keyboard_focus->input, 1);
 }
 
 static void wl_keyboard_leave(void *data, struct wl_keyboard *k, uint32_t serial, struct wl_surface *s)
@@ -514,6 +519,7 @@ static void wl_keyboard_leave(void *data, struct wl_keyboard *k, uint32_t serial
     vio_wl_window *w = wl.keyboard_focus;
     wl.keyboard_focus = NULL;
     wl.repeat_key = 0;
+    if (w) vio_input_focus_event(w->input, 0);
     if (w && w->monitor >= 0 && w->auto_iconify) xdg_toplevel_set_minimized(w->toplevel);
 }
 
@@ -702,8 +708,11 @@ static void wl_dispatch(int timeout_ms)
     if (!wl.display) return;
     while (wl_display_prepare_read(wl.display) != 0) wl_display_dispatch_pending(wl.display);
     wl_display_flush(wl.display);
-    struct pollfd pfd = { wl_display_get_fd(wl.display), POLLIN, 0 };
-    if (poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN)) wl_display_read_events(wl.display);
+    /* the wake pipe ends a wait too (vio_wake) */
+    struct pollfd pfd[2] = { { wl_display_get_fd(wl.display), POLLIN, 0 }, { vio_platform_wake_fd(), POLLIN, 0 } };
+    int n = timeout_ms != 0 && pfd[1].fd >= 0 ? 2 : 1;
+    while (poll(pfd, (nfds_t)n, timeout_ms) < 0 && errno == EINTR) {}
+    if (pfd[0].revents & POLLIN) wl_display_read_events(wl.display);
     else wl_display_cancel_read(wl.display);
     wl_display_dispatch_pending(wl.display);
 }
@@ -714,16 +723,22 @@ static void wl_poll_events(void)
     wl_repeat_tick();
 }
 
-static void wl_wait_events(void)
+static void wl_wait_events(double timeout)
 {
-    int timeout = -1;
-    if (wl.repeat_key) {
-        double ms = (wl.repeat_next - wl_now()) * 1000.0;
-        timeout = ms > 0 ? (int)ms + 1 : 0;
+    if (!wl.display) { vio_platform_wait_wake_only(timeout); return; }
+    if (vio_platform_wake_take()) { wl_poll_events(); return; }
+    int ms = vio_platform_timeout_ms(timeout);
+    if (wl.repeat_key) {   /* key repeat is client side: wake for the next repeat */
+        double r = (wl.repeat_next - wl_now()) * 1000.0;
+        int rm = r > 0 ? (int)r + 1 : 0;
+        if (ms < 0 || rm < ms) ms = rm;
     }
-    wl_dispatch(timeout);
+    wl_dispatch(ms);
     wl_repeat_tick();
+    vio_platform_wake_take();
 }
+
+static void wl_wake(void) { vio_platform_wake_signal(); }
 
 /* ── Window lifecycle ─────────────────────────────────────────────── */
 
@@ -828,6 +843,7 @@ static void wl_destroy_window(vio_window_handle h)
 {
     vio_wl_window *w = (vio_wl_window *)h;
     if (!w) return;
+    w->input = NULL;   /* no callbacks from the teardown (focus loss on destroy) */
     if (wl.keyboard_focus == w) wl.keyboard_focus = NULL;
     if (wl.pointer_focus == w) wl.pointer_focus = NULL;
     if (w->egl_context) {
@@ -1122,6 +1138,7 @@ static const vio_platform vio_platform_wayland = {
     .set_should_close     = wl_set_should_close,
     .poll_events          = wl_poll_events,
     .wait_events          = wl_wait_events,
+    .wake                 = wl_wake,
     .swap_buffers         = wl_swap_buffers,
     .get_framebuffer_size = wl_get_framebuffer_size,
     .get_window_size      = wl_get_window_size,

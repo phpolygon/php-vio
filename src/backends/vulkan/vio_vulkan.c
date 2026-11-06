@@ -1915,7 +1915,7 @@ int vio_vulkan_recreate_swapchain(void)
         vio_plat()->get_framebuffer_size(vio_vk.platform_window, &w, &h);
         while (w == 0 || h == 0) {   /* minimised: wait until there is something to present into */
             vio_plat()->get_framebuffer_size(vio_vk.platform_window, &w, &h);
-            vio_plat()->wait_events();
+            vio_plat()->wait_events(-1.0);
         }
         vio_vk.framebuffer_width  = w;
         vio_vk.framebuffer_height = h;

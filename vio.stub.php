@@ -61,6 +61,62 @@ function vio_close(VioContext $context): void {}
 function vio_poll_events(VioContext $context): void {}
 
 /**
+ * Like vio_poll_events(), but first blocks until an event arrives, $timeout
+ * seconds pass (< 0: no timeout) or vio_wake() is called. An idle desktop app
+ * loops on this instead of vio_poll_events() and renders only when something
+ * changed. The wait may end early on OS events vio ignores. During an input
+ * replay it does not block.
+ */
+function vio_wait_events(VioContext $context, float $timeout = -1.0): void {}
+
+/**
+ * Wake a vio_wait_events() (from any thread). A wake while nobody waits makes
+ * the next vio_wait_events() return at once; vio_poll_events() leaves it pending.
+ */
+function vio_wake(): void {}
+
+/**
+ * Called when the user asks to close the window (close button, Alt+F4, Cmd+Q
+ * on the window). Return false to keep it open; anything else closes it
+ * (vio_should_close() becomes true).
+ *
+ * @param callable(): (bool|null) $callback
+ */
+function vio_on_close(VioContext $context, callable $callback): void {}
+
+/**
+ * Called when the window gains (true) or loses (false) keyboard focus.
+ *
+ * @param callable(bool): void $callback
+ */
+function vio_on_focus(VioContext $context, callable $callback): void {}
+
+/**
+ * Called when the window is minimized (true) or restored (false). Wayland
+ * reports no minimization.
+ *
+ * @param callable(bool): void $callback
+ */
+function vio_on_minimize(VioContext $context, callable $callback): void {}
+
+/**
+ * Called when the window's content scale changes (moved to a monitor with
+ * another DPI), with the new vio_content_scale() values.
+ *
+ * @param callable(float, float): void $callback
+ */
+function vio_on_scale(VioContext $context, callable $callback): void {}
+
+/**
+ * Called when the OS wants the window's content drawn again (exposed, or
+ * during a live resize, which blocks the event loop on Windows and macOS).
+ * Render a frame from the callback to keep the window filled while resizing.
+ *
+ * @param callable(): void $callback
+ */
+function vio_on_refresh(VioContext $context, callable $callback): void {}
+
+/**
  * Begin a new frame. Must be paired with vio_end().
  *
  * 'present' (VIO_FEATURE_EXPLICIT_PRESENT, every backend): true = vio_end puts
@@ -1569,6 +1625,17 @@ function vio_inject_mouse_button(VioContext $context, int $button, int $action):
  * resets it to zero, so inject before the game reads scroll for the frame.
  */
 function vio_inject_scroll(VioContext $context, float $dx, float $dy): void {}
+
+/**
+ * Inject a window event through the same path as the OS one.
+ *
+ * VIO_WINDOW_EVENT_CLOSE runs vio_on_close and returns whether the window
+ * closes; VIO_WINDOW_EVENT_FOCUS / _MINIMIZE take 1 or 0 in $a;
+ * VIO_WINDOW_EVENT_SCALE takes the new scale in $a and $b (> 0);
+ * VIO_WINDOW_EVENT_REFRESH runs vio_on_refresh. Focus, minimize and scale fire
+ * their callback only on a change. Anything else throws a ValueError.
+ */
+function vio_inject_window_event(VioContext $context, int $event, float $a = 0.0, float $b = 0.0): bool {}
 
 /**
  * Inject typed text.

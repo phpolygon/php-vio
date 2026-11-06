@@ -42,6 +42,11 @@ static inline void vio_window_poll_events(void)
     vio_plat()->poll_events();
 }
 
+static inline void vio_window_wait_events(double timeout)
+{
+    vio_plat()->wait_events(timeout);
+}
+
 static inline void vio_window_swap_buffers(vio_window_handle window)
 {
     vio_plat()->swap_buffers(window);
