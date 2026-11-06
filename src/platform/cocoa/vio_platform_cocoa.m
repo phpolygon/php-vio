@@ -425,6 +425,11 @@ static int cocoa_init(void)
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];   /* Regular once a window is shown */
         [NSApp finishLaunching];
+        /* Keys go through the input method (NSTextInputClient) since the IME
+         * work; with press-and-hold on, holding A, E, S, ... opened the accent
+         * picker over the game and stopped the character repeating. Off for this
+         * process only, as games and terminals do; dead keys and IMEs stay. */
+        [[NSUserDefaults standardUserDefaults] registerDefaults:@{ @"ApplePressAndHoldEnabled": @NO }];
         cocoa_keytable_init();
     }
     cocoa_initialized = 1;
