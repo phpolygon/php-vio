@@ -12,6 +12,7 @@ A PHP extension that brings GPU rendering, audio, video recording, streaming, an
 - **Video Recording** — H.264 encoding via FFmpeg (with VideoToolbox HW acceleration)
 - **Network Streaming** — RTMP and SRT via FFmpeg
 - **Input** — Keyboard, mouse, and gamepad support via GLFW
+- **System Webview** — WKWebView inside a vio window, served by PHP in the same process over a custom scheme (no HTTP server), JS ↔ PHP messages; runs Laravel apps (`examples/webview_laravel.php`). macOS (WKWebView) and Linux (WPE WebKit or WebKitGTK) today, Windows (WebView2) next
 - **Headless Mode** — Offscreen rendering for tests and visual regression testing
 - **Plugin System** — Extensible output/input/filter plugins
 - **Cross-Platform** — macOS, Linux, Windows
@@ -152,6 +153,7 @@ vio_destroy($ctx);
 | Streaming | `vio_stream`, `vio_stream_push`, `vio_stream_stop` |
 | Headless | `vio_read_pixels`, `vio_save_screenshot`, `vio_compare_images` |
 | Shaders | `vio_shader_reflect`, shader compilation via glslang |
+| Webview | `vio_webview`, `vio_webview_navigate`, `vio_webview_eval`, `vio_webview_on_message`, `vio_webview_on_event`, `vio_webview_bounds` |
 | Plugins | `vio_plugins`, `vio_plugin_info` |
 
 Full API documentation: see [vio.stub.php](vio.stub.php)

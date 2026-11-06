@@ -52,6 +52,7 @@
 #include "../vio_shell.h"
 #include "../linux/vio_uri_list.h"
 #include "../linux/vio_desktop_linux.h"
+#include "../linux/vio_webview_linux.h"
 #include <X11/cursorfont.h>
 
 /* ── Display, errors ──────────────────────────────────────────────── */
@@ -1206,9 +1207,11 @@ static void x11_poll_events(void)
     while (XPending(x11_dpy)) {
         XEvent ev;
         XNextEvent(x11_dpy, &ev);
+        if (vio_wvl_x11_event(&ev)) continue;   /* a webview's own window */
         x11_dispatch(&ev);
     }
     vio_linux_dispatch();   /* tray calls on the session bus */
+    vio_wvl_pump();
 }
 
 static void x11_wait_events(double timeout)
@@ -1217,11 +1220,13 @@ static void x11_wait_events(double timeout)
     if (!vio_platform_wake_take()) {
         XFlush(x11_dpy);
         if (!XPending(x11_dpy)) {
-            struct pollfd fds[3] = { { .fd = ConnectionNumber(x11_dpy), .events = POLLIN },
-                                     { .fd = vio_platform_wake_fd(), .events = POLLIN },
-                                     { .fd = vio_linux_dbus_fd(), .events = POLLIN } };   /* tray clicks */
-            int n = 3, ms = vio_platform_timeout_ms(timeout);
+            struct pollfd fds[3 + 64] = { { .fd = ConnectionNumber(x11_dpy), .events = POLLIN },
+                                          { .fd = vio_platform_wake_fd(), .events = POLLIN },
+                                          { .fd = vio_linux_dbus_fd(), .events = POLLIN } };   /* tray clicks */
+            int ms = vio_platform_timeout_ms(timeout);
+            int n = vio_wvl_poll_begin(fds, 3, 3 + 64, &ms);   /* webview engine sockets */
             while (poll(fds, (nfds_t)n, ms) < 0 && errno == EINTR) {}
+            vio_wvl_poll_end(fds, 3, n);
         }
         vio_platform_wake_take();
     }
@@ -1923,6 +1928,11 @@ static int x11_set_parent(vio_window_handle h, vio_window_handle ph, int modal)
     return 1;
 }
 
+static void *x11_webview_create(vio_window_handle h, const vio_webview_desc *d)
+{
+    return h ? vio_wvl_create(h, d, ((vio_x11_window *)h)->headless) : NULL;
+}
+
 static const vio_platform vio_platform_x11 = {
     .name                 = "x11",
     .init                 = x11_init,
@@ -1992,6 +2002,16 @@ static const vio_platform vio_platform_x11 = {
     .set_ime_rect         = x11_set_ime_rect,
     .set_ime_enabled      = x11_set_ime_enabled,
     .set_parent           = x11_set_parent,
+    .webview_create       = x11_webview_create,
+    .webview_destroy      = vio_wvl_destroy,
+    .webview_navigate     = vio_wvl_navigate,
+    .webview_eval         = vio_wvl_eval,
+    .webview_set_bounds   = vio_wvl_set_bounds,
+    .webview_set_script   = vio_wvl_set_script,
+    .webview_reply_head   = vio_wvl_reply_head,
+    .webview_reply_data   = vio_wvl_reply_data,
+    .webview_reply_end    = vio_wvl_reply_end,
+    .webview_reply_fail   = vio_wvl_reply_fail,
 };
 
 void vio_platform_x11_register(void)

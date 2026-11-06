@@ -51,6 +51,7 @@ jobs:
             xvfb libgl1-mesa-dri libglx-mesa0 \
             mesa-vulkan-drivers vulkan-tools \
             at-spi2-core dbus-daemon python3-gi gir1.2-atspi-2.0 \
+            libwebkit2gtk-4.1-0 libxtst6 \
             pkg-config
 
       # AccessKit (vio_a11y_update): the accesskit-c release package, checked
@@ -107,6 +108,9 @@ jobs:
           # that pollute audio-test output. Route the default device to null so
           # miniaudio opens it silently.
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          # WebKitGTK (the webview, tests 277-284): Ubuntu has no WPE; its user-namespace
+          # sandbox (bubblewrap) is blocked by the runner's AppArmor policy
+          export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 VIO_REQUIRE_WEBVIEW=1
           # AccessKit is built in: test 273 must reach AT-SPI, not skip
           export VIO_REQUIRE_A11Y=1
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
@@ -120,6 +124,9 @@ jobs:
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
           export VK_DRIVER_FILES=/nonexistent/vio-no-vulkan.json
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          # WebKitGTK (the webview, tests 277-284): Ubuntu has no WPE; its user-namespace
+          # sandbox (bubblewrap) is blocked by the runner's AppArmor policy
+          export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 VIO_REQUIRE_WEBVIEW=1
           export XDG_RUNTIME_DIR=$(mktemp -d)
           chmod 700 "$XDG_RUNTIME_DIR"
           (weston --backend=headless --renderer=pixman --socket=wayland-vio --idle-time=0 \
@@ -149,6 +156,9 @@ jobs:
           export VK_DRIVER_FILES
           echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          # WebKitGTK (the webview, tests 277-284): Ubuntu has no WPE; its user-namespace
+          # sandbox (bubblewrap) is blocked by the runner's AppArmor policy
+          export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 VIO_REQUIRE_WEBVIEW=1
           xvfb-run -a php -n -d extension_dir=$PWD/modules -d extension=vio.so -r '
             $c = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);
             if (!$c) { echo "GL: no context\n"; exit(0); }
@@ -302,6 +312,7 @@ jobs:
             libharfbuzz-dev \
             xvfb libgl1-mesa-dri libglx-mesa0 \
             mesa-vulkan-drivers vulkan-tools \
+            libwebkit2gtk-4.1-0 libxtst6 \
             pkg-config
 
       - name: Build extension
@@ -339,6 +350,9 @@ jobs:
           # that pollute audio-test output. Route the default device to null so
           # miniaudio opens it silently.
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          # WebKitGTK (the webview, tests 277-284): Ubuntu has no WPE; its user-namespace
+          # sandbox (bubblewrap) is blocked by the runner's AppArmor policy
+          export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 VIO_REQUIRE_WEBVIEW=1
           xvfb-run -a php -n run-tests.php -q --show-diff tests/
 
       - name: Run tests (Wayland, headless weston + Mesa software GL)
@@ -350,6 +364,9 @@ jobs:
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
           export VK_DRIVER_FILES=/nonexistent/vio-no-vulkan.json
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          # WebKitGTK (the webview, tests 277-284): Ubuntu has no WPE; its user-namespace
+          # sandbox (bubblewrap) is blocked by the runner's AppArmor policy
+          export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 VIO_REQUIRE_WEBVIEW=1
           export XDG_RUNTIME_DIR=$(mktemp -d)
           chmod 700 "$XDG_RUNTIME_DIR"
           (weston --backend=headless --renderer=pixman --socket=wayland-vio --idle-time=0 \
@@ -379,6 +396,9 @@ jobs:
           export VK_DRIVER_FILES
           echo "VK_DRIVER_FILES=$VK_DRIVER_FILES"
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
+          # WebKitGTK (the webview, tests 277-284): Ubuntu has no WPE; its user-namespace
+          # sandbox (bubblewrap) is blocked by the runner's AppArmor policy
+          export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 VIO_REQUIRE_WEBVIEW=1
           xvfb-run -a php -n -d extension_dir=$PWD/modules -d extension=vio.so -r '
             $c = vio_create("opengl", ["width" => 8, "height" => 8, "headless" => true]);
             if (!$c) { echo "GL: no context\n"; exit(0); }

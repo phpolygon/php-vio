@@ -22,8 +22,12 @@ static inline vio_window_handle vio_window_create(vio_config *cfg, const char *b
     return vio_plat()->create_window(cfg, backend_name);
 }
 
+/* src/vio_webview.c: webviews are child views of their window and go first. */
+void vio_webview_window_closing(vio_window_handle window);
+
 static inline void vio_window_destroy(vio_window_handle window)
 {
+    vio_webview_window_closing(window);
     vio_plat()->destroy_window(window);
 }
 

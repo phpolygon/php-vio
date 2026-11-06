@@ -65,6 +65,7 @@
 #include "../vio_shell.h"
 #include "../linux/vio_uri_list.h"
 #include "../linux/vio_desktop_linux.h"
+#include "../linux/vio_webview_linux.h"
 #include "../../vio_input.h"
 #include "../linux/vio_evdev_gamepad.h"
 
@@ -508,10 +509,21 @@ static int wl_set_size_limits(vio_window_handle h, int min_w, int min_h, int max
     return 1;
 }
 
+/* WPE modifier bits for the webview (vio_webview_linux.h) */
+static uint32_t wl_wpe_mods(void)
+{
+    int m = wl_mods();
+    return (m & VIO_MOD_CONTROL ? 1u : 0) | (m & VIO_MOD_SHIFT ? 2u : 0) | (m & VIO_MOD_ALT ? 4u : 0) | (m & VIO_MOD_SUPER ? 8u : 0);
+}
+
 static void wl_pointer_enter(void *data, struct wl_pointer *p, uint32_t serial, struct wl_surface *s, wl_fixed_t sx, wl_fixed_t sy)
 {
     (void)data; (void)p;
     wl.pointer_serial = serial;
+    if (vio_wvl_wl_pointer_enter(s, wl_fixed_to_double(sx), wl_fixed_to_double(sy))) {   /* a webview */
+        wl.pointer_focus = NULL;
+        return;
+    }
     vio_wl_window *w = s ? (vio_wl_window *)wl_surface_get_user_data(s) : NULL;
     wl.pointer_focus = w;
     if (!w) return;
@@ -527,11 +539,13 @@ static void wl_pointer_leave(void *data, struct wl_pointer *p, uint32_t serial, 
 {
     (void)data; (void)p; (void)serial; (void)s;
     wl.pointer_focus = NULL;
+    vio_wvl_wl_pointer_leave();
 }
 
 static void wl_pointer_motion(void *data, struct wl_pointer *p, uint32_t time, wl_fixed_t sx, wl_fixed_t sy)
 {
     (void)data; (void)p; (void)time;
+    if (vio_wvl_wl_pointer_motion(wl_fixed_to_double(sx), wl_fixed_to_double(sy), wl_wpe_mods())) return;
     vio_wl_window *w = wl.pointer_focus;
     if (!w || w->cursor_mode == VIO_PLATFORM_CURSOR_DISABLED) return;
     w->cursor_x = wl_fixed_to_double(sx);
@@ -543,6 +557,7 @@ static void wl_pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
 {
     (void)data; (void)p; (void)time;
     wl.pointer_serial = serial;
+    if (vio_wvl_wl_pointer_button(button, state == WL_POINTER_BUTTON_STATE_PRESSED, wl_wpe_mods())) return;
     vio_wl_window *w = wl.pointer_focus;
     if (!w) return;
     int b = button == BTN_LEFT ? 0 : button == BTN_RIGHT ? 1 : button == BTN_MIDDLE ? 2 : (int)(button - BTN_SIDE) + 3;
@@ -554,6 +569,7 @@ static void wl_pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
 static void wl_pointer_axis(void *data, struct wl_pointer *p, uint32_t time, uint32_t axis, wl_fixed_t value)
 {
     (void)data; (void)p; (void)time;
+    if (vio_wvl_wl_pointer_axis(axis == WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_to_double(value), wl_wpe_mods())) return;
     vio_wl_window *w = wl.pointer_focus;
     if (!w) return;
     double v = -wl_fixed_to_double(value) / 10.0;
@@ -631,6 +647,7 @@ static void wl_keyboard_key(void *data, struct wl_keyboard *k, uint32_t serial, 
     vio_wl_window *w = wl.keyboard_focus;
     if (!w) return;
     int press = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+    if (wl.xkb_state && vio_wvl_wl_key(xkb_state_key_get_one_sym(wl.xkb_state, key + 8), key, press, wl_wpe_mods())) return;   /* a clicked webview */
     wl_emit_key(w, key, press ? VIO_PRESS : VIO_RELEASE);
     if (press && wl.repeat_rate > 0 && wl.keymap && xkb_keymap_key_repeats(wl.keymap, key + 8)) {
         wl.repeat_key = key + 1;
@@ -1049,10 +1066,12 @@ static void wl_dispatch(int timeout_ms)
     while (wl_display_prepare_read(wl.display) != 0) wl_display_dispatch_pending(wl.display);
     wl_display_flush(wl.display);
     /* the wake pipe ends a wait too (vio_wake) */
-    struct pollfd pfd[3] = { { wl_display_get_fd(wl.display), POLLIN, 0 }, { vio_platform_wake_fd(), POLLIN, 0 },
-                             { vio_linux_dbus_fd(), POLLIN, 0 } };   /* tray clicks */
-    int n = timeout_ms != 0 ? 3 : 1;
+    struct pollfd pfd[3 + 64] = { { wl_display_get_fd(wl.display), POLLIN, 0 }, { vio_platform_wake_fd(), POLLIN, 0 },
+                                  { vio_linux_dbus_fd(), POLLIN, 0 } };   /* tray clicks */
+    int n = timeout_ms != 0 ? 3 : 1, base = n;
+    if (timeout_ms != 0) n = vio_wvl_poll_begin(pfd, n, 3 + 64, &timeout_ms);   /* webview engine sockets */
     while (poll(pfd, (nfds_t)n, timeout_ms) < 0 && errno == EINTR) {}
+    if (timeout_ms != 0 || n != base) vio_wvl_poll_end(pfd, base, n);
     if (pfd[0].revents & POLLIN) wl_display_read_events(wl.display);
     else wl_display_cancel_read(wl.display);
     wl_display_dispatch_pending(wl.display);
@@ -1063,6 +1082,7 @@ static void wl_poll_events(void)
     wl_dispatch(0);
     wl_repeat_tick();
     vio_linux_dispatch();   /* tray calls on the session bus */
+    vio_wvl_pump();
 }
 
 static void wl_wait_events(double timeout)
@@ -1078,6 +1098,7 @@ static void wl_wait_events(double timeout)
     wl_dispatch(ms);
     wl_repeat_tick();
     vio_linux_dispatch();
+    vio_wvl_pump();
     vio_platform_wake_take();
 }
 
@@ -1486,6 +1507,11 @@ static int wl_set_parent(vio_window_handle h, vio_window_handle ph, int modal)
     return 1;
 }
 
+static void *wl_webview_create(vio_window_handle h, const vio_webview_desc *d)
+{
+    return h ? vio_wvl_create(h, d, ((vio_wl_window *)h)->headless) : NULL;
+}
+
 static const vio_platform vio_platform_wayland = {
     .name                 = "wayland",
     .init                 = wl_init,
@@ -1548,6 +1574,16 @@ static const vio_platform vio_platform_wayland = {
     .set_ime_rect         = wl_set_ime_rect,
     .set_ime_enabled      = wl_set_ime_enabled,
     .set_parent           = wl_set_parent,
+    .webview_create       = wl_webview_create,
+    .webview_destroy      = vio_wvl_destroy,
+    .webview_navigate     = vio_wvl_navigate,
+    .webview_eval         = vio_wvl_eval,
+    .webview_set_bounds   = vio_wvl_set_bounds,
+    .webview_set_script   = vio_wvl_set_script,
+    .webview_reply_head   = vio_wvl_reply_head,
+    .webview_reply_data   = vio_wvl_reply_data,
+    .webview_reply_end    = vio_wvl_reply_end,
+    .webview_reply_fail   = vio_wvl_reply_fail,
 };
 
 void vio_platform_wayland_register(void)
