@@ -131,7 +131,8 @@ foreach ($results as $platform => $lines) {
     $wantHere = $platform === 'x11' ? 'false close, focus false, focus true, refresh' : $wantOs;
     if (!$ok || !in_array($os, ['n/a', $wantHere], true)) $bad[] = "$platform: " . implode(' / ', $lines);
 }
-echo isset($results['null']) && !$bad ? "OK\n" : "FAIL " . json_encode([$results, $bad], JSON_PRETTY_PRINT) . "\n";
+/* the null platform and the active one must answer: a crashed child has no line */
+echo isset($results['null'], $results[vio_platform()]) && !$bad ? "OK\n" : "FAIL " . json_encode([$results, $bad], JSON_PRETTY_PRINT) . "\n";
 ?>
 --EXPECT--
 OK

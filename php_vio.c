@@ -13302,6 +13302,16 @@ static void vio_register_constants(int module_number)
     REGISTER_LONG_CONSTANT("VIO_CURSOR_NORMAL", 0, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_CURSOR_DISABLED", 1, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("VIO_CURSOR_HIDDEN", 2, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_SHAPE_ARROW", VIO_PLATFORM_SHAPE_ARROW, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_SHAPE_IBEAM", VIO_PLATFORM_SHAPE_IBEAM, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_SHAPE_CROSSHAIR", VIO_PLATFORM_SHAPE_CROSSHAIR, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_SHAPE_HAND", VIO_PLATFORM_SHAPE_HAND, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_SHAPE_RESIZE_EW", VIO_PLATFORM_SHAPE_RESIZE_EW, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_SHAPE_RESIZE_NS", VIO_PLATFORM_SHAPE_RESIZE_NS, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_SHAPE_RESIZE_NWSE", VIO_PLATFORM_SHAPE_RESIZE_NWSE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_SHAPE_RESIZE_NESW", VIO_PLATFORM_SHAPE_RESIZE_NESW, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_SHAPE_RESIZE_ALL", VIO_PLATFORM_SHAPE_RESIZE_ALL, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("VIO_CURSOR_SHAPE_NOT_ALLOWED", VIO_PLATFORM_SHAPE_NOT_ALLOWED, CONST_CS | CONST_PERSISTENT);
 
     /* Touch phase (vio_touch_get/inject) */
     REGISTER_LONG_CONSTANT("VIO_TOUCH_BEGAN", VIO_TOUCH_BEGAN, CONST_CS | CONST_PERSISTENT);
@@ -15722,6 +15732,38 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
 #endif
 }
 
+/* Logical pixels (what vio_window_size reports) to the platform's screen
+ * coordinates. Headless windows are 1:1.
+ *
+ *   logical = framebuffer / contentScale          (vio_window_size)
+ *   screen  = logical * contentScale * (screen / framebuffer)
+ *
+ * The trailing ratio is what keeps this right everywhere rather than only
+ * where it was written. Windows and X11 hand out screen coordinates in
+ * physical pixels, so the ratio is 1 and the factor is the content scale;
+ * macOS hands out points against a 2x framebuffer, so the ratio is 0.5, the
+ * factor cancels to 1, and the request passes through untouched. Without the
+ * conversion a request for 1920x1080 on a 1.5x display read back as 1280x720. */
+static void vio_ctx_screen_factor(vio_context_object *ctx, float *fx, float *fy)
+{
+    *fx = *fy = 1.0f;
+    if (!ctx->window || ctx->config.headless) return;
+    int fb_w = 0, fb_h = 0, scr_w = 0, scr_h = 0;
+    float sx = 1.0f, sy = 1.0f;
+    vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
+    vio_plat()->get_window_size(ctx->window, &scr_w, &scr_h);
+    vio_window_content_scale(ctx->window, &sx, &sy);
+    if (sx <= 0.0f) sx = 1.0f;
+    if (sy <= 0.0f) sy = 1.0f;
+    *fx = sx * ((fb_w > 0 && scr_w > 0) ? (float)scr_w / (float)fb_w : 1.0f);
+    *fy = sy * ((fb_h > 0 && scr_h > 0) ? (float)scr_h / (float)fb_h : 1.0f);
+}
+
+static int vio_ctx_to_screen(int v, float f)
+{
+    return v <= 0 ? -1 : (int)((float)v * f + 0.5f);
+}
+
 ZEND_FUNCTION(vio_set_window_size)
 {
     zval *ctx_zval;
@@ -15740,47 +15782,256 @@ ZEND_FUNCTION(vio_set_window_size)
         return;
     }
 
-    if (ctx->window && !ctx->config.headless) {
-        /* The size is LOGICAL, matching what vio_window_size reports and what
-         * the create config takes. The platform speaks screen coordinates,
-         * which stop being the same thing once the monitor scales:
-         *
-         *   logical = framebuffer / contentScale          (vio_window_size)
-         *   screen  = logical * contentScale * (screen / framebuffer)
-         *
-         * The trailing ratio is what keeps this right everywhere rather than
-         * only where it was written. Windows and X11 hand out screen
-         * coordinates in physical pixels, so the ratio is 1 and the factor is
-         * the content scale; macOS hands out points against a 2x framebuffer,
-         * so the ratio is 0.5, the factor cancels to 1, and the request passes
-         * through untouched.
-         *
-         * Without the conversion a request for 1920x1080 on a 1.5x display read
-         * back as 1280x720 - a resolution picker sets a size, sees a smaller
-         * one, and looks to the player like it jumped back an entry. */
-        int fb_w = 0, fb_h = 0, scr_w = 0, scr_h = 0;
-        float sx = 1.0f, sy = 1.0f;
-        vio_plat()->get_framebuffer_size(ctx->window, &fb_w, &fb_h);
-        vio_plat()->get_window_size(ctx->window, &scr_w, &scr_h);
-        vio_window_content_scale(ctx->window, &sx, &sy);
-        if (sx <= 0.0f) sx = 1.0f;
-        if (sy <= 0.0f) sy = 1.0f;
+    /* vio_set_window_size_limits */
+    if (ctx->size_min_w > 0 && width  < ctx->size_min_w) width  = ctx->size_min_w;
+    if (ctx->size_min_h > 0 && height < ctx->size_min_h) height = ctx->size_min_h;
+    if (ctx->size_max_w > 0 && width  > ctx->size_max_w) width  = ctx->size_max_w;
+    if (ctx->size_max_h > 0 && height > ctx->size_max_h) height = ctx->size_max_h;
 
-        float rx = (fb_w > 0 && scr_w > 0) ? (float)scr_w / (float)fb_w : 1.0f;
-        float ry = (fb_h > 0 && scr_h > 0) ? (float)scr_h / (float)fb_h : 1.0f;
-
-        vio_plat()->set_window_size(ctx->window,
-                                    (int)((float)width  * sx * rx + 0.5f),
-                                    (int)((float)height * sy * ry + 0.5f));
-    } else if (ctx->window) {
-        /* Headless targets are 1:1 (see vio_window_size), so no conversion. */
-        vio_plat()->set_window_size(ctx->window, (int)width, (int)height);
+    if (ctx->window) {
+        float fx, fy;
+        vio_ctx_screen_factor(ctx, &fx, &fy);
+        vio_plat()->set_window_size(ctx->window, (int)((float)width * fx + 0.5f), (int)((float)height * fy + 0.5f));
     }
 
     /* Store the logical size: vio_window_size falls back to it when there is no
      * window, so it has to stay in the same space. */
     ctx->config.width  = (int)width;
     ctx->config.height = (int)height;
+}
+
+/* ── Desktop window details (DESKTOP-APP-PLAN Phase 1) ─────────────── */
+
+#define VIO_PLAT_CALL(ctx, slot, ...) \
+    ((ctx)->window && vio_plat()->slot ? vio_plat()->slot((ctx)->window, __VA_ARGS__) != 0 : 0)
+
+ZEND_FUNCTION(vio_platform_info)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    const vio_platform *p = vio_plat();
+    array_init(return_value);
+    add_assoc_string(return_value, "name", (char *)p->name);
+    add_assoc_bool(return_value, "wait_events", p->wait_events != NULL);
+    add_assoc_bool(return_value, "cursor_shapes", p->set_cursor_shape != NULL);
+    add_assoc_bool(return_value, "custom_cursor", p->set_cursor_image != NULL);
+    add_assoc_bool(return_value, "window_icon", p->set_window_icon != NULL);
+    add_assoc_bool(return_value, "size_limits", p->set_size_limits != NULL);
+    add_assoc_bool(return_value, "aspect_ratio", p->set_aspect_ratio != NULL);
+    add_assoc_bool(return_value, "floating", p->set_floating != NULL);
+    add_assoc_bool(return_value, "opacity", p->set_opacity != NULL);
+    add_assoc_bool(return_value, "open_url", p->open_url != NULL);
+    add_assoc_bool(return_value, "reveal_file", p->reveal_file != NULL);
+}
+
+ZEND_FUNCTION(vio_set_cursor)
+{
+    zval *ctx_zval;
+    zend_long shape;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(shape)
+    ZEND_PARSE_PARAMETERS_END();
+    if (shape < 0 || shape >= VIO_PLATFORM_SHAPE_COUNT) {
+        zend_argument_value_error(2, "must be one of the VIO_CURSOR_SHAPE_* constants");
+        RETURN_THROWS();
+    }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_cursor_shape, (int)shape));
+}
+
+ZEND_FUNCTION(vio_set_cursor_image)
+{
+    zval *ctx_zval;
+    zend_string *rgba;
+    zend_long w, h, hx = 0, hy = 0;
+    ZEND_PARSE_PARAMETERS_START(4, 6)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR(rgba)
+        Z_PARAM_LONG(w)
+        Z_PARAM_LONG(h)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(hx)
+        Z_PARAM_LONG(hy)
+    ZEND_PARSE_PARAMETERS_END();
+    if (w < 1 || h < 1 || w > 256 || h > 256) {
+        zend_argument_value_error(3, "and argument #4 must be between 1 and 256");
+        RETURN_THROWS();
+    }
+    if (ZSTR_LEN(rgba) != (size_t)(w * h * 4)) {
+        zend_argument_value_error(2, "must hold width * height * 4 bytes (RGBA)");
+        RETURN_THROWS();
+    }
+    if (hx < 0 || hy < 0 || hx >= w || hy >= h) {
+        zend_argument_value_error(5, "and argument #6 must lie inside the image");
+        RETURN_THROWS();
+    }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_cursor_image, (const unsigned char *)ZSTR_VAL(rgba), (int)w, (int)h, (int)hx, (int)hy));
+}
+
+ZEND_FUNCTION(vio_set_window_icon)
+{
+    zval *ctx_zval;
+    HashTable *list;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_ARRAY_HT(list)
+    ZEND_PARSE_PARAMETERS_END();
+
+    uint32_t n = zend_hash_num_elements(list);
+    if (n > 16) {
+        zend_argument_value_error(2, "must hold at most 16 images");
+        RETURN_THROWS();
+    }
+    vio_platform_image imgs[16];
+    uint32_t i = 0;
+    zval *entry;
+    ZEND_HASH_FOREACH_VAL(list, entry) {
+        zval *d, *wz, *hz;
+        if (Z_TYPE_P(entry) != IS_ARRAY
+            || !(d = zend_hash_str_find(Z_ARRVAL_P(entry), "data", 4)) || Z_TYPE_P(d) != IS_STRING
+            || !(wz = zend_hash_str_find(Z_ARRVAL_P(entry), "width", 5)) || Z_TYPE_P(wz) != IS_LONG
+            || !(hz = zend_hash_str_find(Z_ARRVAL_P(entry), "height", 6)) || Z_TYPE_P(hz) != IS_LONG) {
+            zend_argument_value_error(2, "entry %u must be ['data' => string, 'width' => int, 'height' => int]", i);
+            RETURN_THROWS();
+        }
+        zend_long iw = Z_LVAL_P(wz), ih = Z_LVAL_P(hz);
+        if (iw < 1 || ih < 1 || iw > 1024 || ih > 1024 || Z_STRLEN_P(d) != (size_t)(iw * ih * 4)) {
+            zend_argument_value_error(2, "entry %u must hold width * height * 4 bytes (RGBA), 1..1024 pixels a side", i);
+            RETURN_THROWS();
+        }
+        imgs[i].width = (int)iw;
+        imgs[i].height = (int)ih;
+        imgs[i].rgba = (const unsigned char *)Z_STRVAL_P(d);
+        i++;
+    } ZEND_HASH_FOREACH_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_window_icon, (int)n, imgs));
+}
+
+ZEND_FUNCTION(vio_set_window_size_limits)
+{
+    zval *ctx_zval;
+    zend_long min_w, min_h, max_w = -1, max_h = -1;
+    ZEND_PARSE_PARAMETERS_START(3, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(min_w)
+        Z_PARAM_LONG(min_h)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(max_w)
+        Z_PARAM_LONG(max_h)
+    ZEND_PARSE_PARAMETERS_END();
+    if (min_w < 1) min_w = 0;
+    if (min_h < 1) min_h = 0;
+    if (max_w < 1) max_w = 0;
+    if (max_h < 1) max_h = 0;
+    if ((max_w && min_w > max_w) || (max_h && min_h > max_h)) {
+        zend_argument_value_error(2, "and argument #3 must not exceed the maximum size");
+        RETURN_THROWS();
+    }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    ctx->size_min_w = (int)min_w; ctx->size_min_h = (int)min_h;
+    ctx->size_max_w = (int)max_w; ctx->size_max_h = (int)max_h;
+    float fx, fy;
+    vio_ctx_screen_factor(ctx, &fx, &fy);
+    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_size_limits, vio_ctx_to_screen((int)min_w, fx), vio_ctx_to_screen((int)min_h, fy),
+                                                  vio_ctx_to_screen((int)max_w, fx), vio_ctx_to_screen((int)max_h, fy)));
+}
+
+ZEND_FUNCTION(vio_set_window_aspect_ratio)
+{
+    zval *ctx_zval;
+    zend_long num, den;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_LONG(num)
+        Z_PARAM_LONG(den)
+    ZEND_PARSE_PARAMETERS_END();
+    if (num < 0 || den < 0 || (num == 0) != (den == 0) || num > 65535 || den > 65535) {
+        zend_argument_value_error(2, "and argument #3 must both be 1..65535, or both 0 for a free ratio");
+        RETURN_THROWS();
+    }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_aspect_ratio, (int)num, (int)den));
+}
+
+ZEND_FUNCTION(vio_set_window_floating)
+{
+    zval *ctx_zval;
+    bool on;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_BOOL(on)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_floating, on ? 1 : 0));
+}
+
+ZEND_FUNCTION(vio_set_window_opacity)
+{
+    zval *ctx_zval;
+    double a;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_DOUBLE(a)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!(a >= 0.0 && a <= 1.0)) {
+        zend_argument_value_error(2, "must be between 0.0 and 1.0");
+        RETURN_THROWS();
+    }
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    RETURN_BOOL(VIO_PLAT_CALL(ctx, set_opacity, (float)a));
+}
+
+/* 1 when s holds a control character (also NUL inside the string). */
+static int vio_has_control_chars(const zend_string *s)
+{
+    for (size_t i = 0; i < ZSTR_LEN(s); i++) {
+        unsigned char c = (unsigned char)ZSTR_VAL(s)[i];
+        if (c < 0x20 || c == 0x7F) return 1;
+    }
+    return 0;
+}
+
+ZEND_FUNCTION(vio_open_url)
+{
+    zend_string *url;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(url)
+    ZEND_PARSE_PARAMETERS_END();
+    /* a scheme (RFC 3986: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"), never file: -
+     * a file URL hands an executable to the shell; vio_reveal_file shows files */
+    const char *u = ZSTR_VAL(url);
+    size_t n = 0;
+    if (ZSTR_LEN(url) && isalpha((unsigned char)u[0])) {
+        n = 1;
+        while (n < ZSTR_LEN(url) && (isalnum((unsigned char)u[n]) || u[n] == '+' || u[n] == '-' || u[n] == '.')) n++;
+    }
+    if (!n || n >= ZSTR_LEN(url) || u[n] != ':' || vio_has_control_chars(url)) {
+        zend_argument_value_error(1, "must be a URL with a scheme and no control characters");
+        RETURN_THROWS();
+    }
+    if (n == 4 && zend_binary_strncasecmp(u, 4, "file", 4, 4) == 0) {
+        zend_argument_value_error(1, "must not be a file: URL (use vio_reveal_file)");
+        RETURN_THROWS();
+    }
+    RETURN_BOOL(vio_plat()->open_url && vio_plat()->open_url(u));
+}
+
+ZEND_FUNCTION(vio_reveal_file)
+{
+    zend_string *path;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(path)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!ZSTR_LEN(path) || vio_has_control_chars(path)) {
+        zend_argument_value_error(1, "must be a path without control characters");
+        RETURN_THROWS();
+    }
+    zend_stat_t st;
+    if (VCWD_STAT(ZSTR_VAL(path), &st) != 0) RETURN_FALSE;
+    RETURN_BOOL(vio_plat()->reveal_file && vio_plat()->reveal_file(ZSTR_VAL(path)));
 }
 
 /* ── Backend capability query ─────────────────────────────────────── */

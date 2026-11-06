@@ -61,6 +61,75 @@ function vio_close(VioContext $context): void {}
 function vio_poll_events(VioContext $context): void {}
 
 /**
+ * What the active window platform can do (DESKTOP-APP-PLAN):
+ * ['name' => 'cocoa', 'wait_events' => bool, 'cursor_shapes', 'custom_cursor',
+ *  'window_icon', 'size_limits', 'aspect_ratio', 'floating', 'opacity',
+ *  'open_url', 'reveal_file']. A false entry makes the matching call return
+ * false without a warning.
+ *
+ * @return array<string, string|bool>
+ */
+function vio_platform_info(): array {}
+
+/**
+ * Set the cursor over the window to a standard shape (VIO_CURSOR_SHAPE_*).
+ * Anything else throws a ValueError.
+ */
+function vio_set_cursor(VioContext $context, int $shape): bool {}
+
+/**
+ * Set the cursor over the window to an RGBA image (top row first, 1..256
+ * pixels a side) with its hot spot; vio_set_cursor() goes back to a shape.
+ */
+function vio_set_cursor_image(VioContext $context, string $rgba, int $width, int $height, int $hot_x = 0, int $hot_y = 0): bool {}
+
+/**
+ * Set the window icon from RGBA images of several sizes; the platform picks
+ * the best one per use. [] restores the default. On macOS this is the Dock
+ * icon (windows have none); Wayland has no icons.
+ *
+ * @param list<array{data: string, width: int, height: int}> $images
+ */
+function vio_set_window_icon(VioContext $context, array $images): bool {}
+
+/**
+ * Limit the window size (logical pixels as in vio_window_size, -1 = no limit).
+ * The user cannot resize past them, and vio_set_window_size() clamps to them
+ * on every platform (the return value says whether the platform enforces them
+ * for the user too).
+ */
+function vio_set_window_size_limits(VioContext $context, int $min_width, int $min_height, int $max_width = -1, int $max_height = -1): bool {}
+
+/**
+ * Keep the window's aspect ratio while the user resizes; 0, 0 frees it.
+ */
+function vio_set_window_aspect_ratio(VioContext $context, int $numerator, int $denominator): bool {}
+
+/**
+ * Keep the window above other windows (tool palettes).
+ */
+function vio_set_window_floating(VioContext $context, bool $floating): bool {}
+
+/**
+ * Whole-window opacity 0.0 .. 1.0.
+ */
+function vio_set_window_opacity(VioContext $context, float $opacity): bool {}
+
+/**
+ * Open a URL in its default application (browser, mail client). It needs a
+ * scheme and no control characters; file: URLs are refused (use
+ * vio_reveal_file), both with a ValueError. Returns whether the opener started.
+ * VIO_OPEN_COMMAND replaces the opener on macOS and Linux.
+ */
+function vio_open_url(string $url): bool {}
+
+/**
+ * Show a file in the file manager (Explorer and Finder select it, Linux opens
+ * its folder). false when the file does not exist.
+ */
+function vio_reveal_file(string $path): bool {}
+
+/**
  * Like vio_poll_events(), but first blocks until an event arrives, $timeout
  * seconds pass (< 0: no timeout) or vio_wake() is called. An idle desktop app
  * loops on this instead of vio_poll_events() and renders only when something

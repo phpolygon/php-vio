@@ -117,6 +117,60 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_inject_window_event, 0, 2, _
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, b, IS_DOUBLE, 0, "0.0")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_platform_info, 0, 0, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, shape, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor_image, 0, 4, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, rgba, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, width, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, height, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, hot_x, IS_LONG, 0, "0")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, hot_y, IS_LONG, 0, "0")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_icon, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, images, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_size_limits, 0, 3, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, min_width, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, min_height, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, max_width, IS_LONG, 0, "-1")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, max_height, IS_LONG, 0, "-1")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_aspect_ratio, 0, 3, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, numerator, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO(0, denominator, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_floating, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, floating, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_window_opacity, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+	ZEND_ARG_TYPE_INFO(0, opacity, IS_DOUBLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_open_url, 0, 1, _IS_BOOL, 0)
+	ZEND_ARG_TYPE_INFO(0, url, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_reveal_file, 0, 1, _IS_BOOL, 0)
+	ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_set_cursor_mode, 0, 2, IS_VOID, 0)
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 	ZEND_ARG_TYPE_INFO(0, mode, IS_LONG, 0)
@@ -1251,6 +1305,16 @@ ZEND_FUNCTION(vio_destroy);
 ZEND_FUNCTION(vio_should_close);
 ZEND_FUNCTION(vio_close);
 ZEND_FUNCTION(vio_poll_events);
+ZEND_FUNCTION(vio_platform_info);
+ZEND_FUNCTION(vio_set_cursor);
+ZEND_FUNCTION(vio_set_cursor_image);
+ZEND_FUNCTION(vio_set_window_icon);
+ZEND_FUNCTION(vio_set_window_size_limits);
+ZEND_FUNCTION(vio_set_window_aspect_ratio);
+ZEND_FUNCTION(vio_set_window_floating);
+ZEND_FUNCTION(vio_set_window_opacity);
+ZEND_FUNCTION(vio_open_url);
+ZEND_FUNCTION(vio_reveal_file);
 ZEND_FUNCTION(vio_wait_events);
 ZEND_FUNCTION(vio_wake);
 ZEND_FUNCTION(vio_on_close);
@@ -1496,6 +1560,16 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_should_close, arginfo_vio_should_close)
 	ZEND_FE(vio_close, arginfo_vio_close)
 	ZEND_FE(vio_poll_events, arginfo_vio_poll_events)
+	ZEND_FE(vio_platform_info, arginfo_vio_platform_info)
+	ZEND_FE(vio_set_cursor, arginfo_vio_set_cursor)
+	ZEND_FE(vio_set_cursor_image, arginfo_vio_set_cursor_image)
+	ZEND_FE(vio_set_window_icon, arginfo_vio_set_window_icon)
+	ZEND_FE(vio_set_window_size_limits, arginfo_vio_set_window_size_limits)
+	ZEND_FE(vio_set_window_aspect_ratio, arginfo_vio_set_window_aspect_ratio)
+	ZEND_FE(vio_set_window_floating, arginfo_vio_set_window_floating)
+	ZEND_FE(vio_set_window_opacity, arginfo_vio_set_window_opacity)
+	ZEND_FE(vio_open_url, arginfo_vio_open_url)
+	ZEND_FE(vio_reveal_file, arginfo_vio_reveal_file)
 	ZEND_FE(vio_wait_events, arginfo_vio_wait_events)
 	ZEND_FE(vio_wake, arginfo_vio_wake)
 	ZEND_FE(vio_on_close, arginfo_vio_on_close)
