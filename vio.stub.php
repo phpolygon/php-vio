@@ -254,6 +254,46 @@ function vio_a11y_update(VioContext|VioWindow $context, array $update): bool {}
 function vio_on_a11y_action(VioContext|VioWindow $context, callable $callback): void {}
 
 /**
+ * A system webview (WebView2, WKWebView, WPE WebKit) as a child view of the window, above its swapchain.
+ * Requests to the custom 'schemes' go to PHP in this process, from vio_poll_events / vio_wait_events:
+ * the callback gets ['id', 'method', 'url', 'headers', 'body'] and returns ['status', 'headers', 'body']
+ * (body: string, list of chunks or an iterable streamed one chunk per poll) or a string body.
+ * 'bounds' [x, y, width, height] in logical units, without: the whole client area, following resizes.
+ * false where vio_platform_info()['webview'] is false.
+ *
+ * @param array{url?: string, bounds?: array{int|float, int|float, int|float, int|float}|null, devtools?: bool, transparent?: bool, schemes?: array<string, callable(array): (array|string)>} $options
+ */
+function vio_webview(VioContext|VioWindow $window, array $options = []): VioWebview|false {}
+
+/** Load another URL. */
+function vio_webview_navigate(VioWebview $webview, string $url): bool {}
+
+/** Run script in the page (asynchronously; answer through window.vio.postMessage). */
+function vio_webview_eval(VioWebview $webview, string $js): bool {}
+
+/**
+ * Place the webview at [x, y, width, height] (logical units), or null for the whole client area.
+ * @param array{int|float, int|float, int|float, int|float}|null $bounds
+ */
+function vio_webview_bounds(VioWebview $webview, ?array $bounds): bool {}
+
+/**
+ * Called with the JSON of every window.vio.postMessage(value) of the page; null removes it.
+ * @param (callable(string): void)|null $callback
+ */
+function vio_webview_on_message(VioWebview $webview, ?callable $callback): void {}
+
+/**
+ * Called with 'navigated' ['url'], 'title' ['title'] and 'new_window' ['url'] (a page asked for a new
+ * window; the engine opens none). Without a callback, http(s) links for a new window open in the browser.
+ * @param (callable(string, array): void)|null $callback
+ */
+function vio_webview_on_event(VioWebview $webview, ?callable $callback): void {}
+
+/** Close the webview now; later calls on it throw. */
+function vio_webview_destroy(VioWebview $webview): void {}
+
+/**
  * A composition through the same path as the platform's (tests). -1 = after
  * the text; start <= end <= the text's length in codepoints.
  */

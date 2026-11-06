@@ -16,6 +16,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_resource.h"
 #include "src/vio_window.h"
 #include "src/vio_a11y.h"
+#include "src/vio_webview.h"
 #include "src/vio_input.h"
 #include "src/vio_backend_null.h"
 #include "src/vio_mesh.h"
@@ -1117,6 +1118,7 @@ ZEND_FUNCTION(vio_poll_events)
 #endif
     vio_input_poll_end(&ctx->input);
     vio_a11y_dispatch_all(ctx);
+    vio_webview_dispatch();
 }
 
 /* Like vio_poll_events, but blocks first until an event, the timeout (seconds,
@@ -1143,6 +1145,7 @@ ZEND_FUNCTION(vio_wait_events)
 #endif
     vio_input_poll_end(&ctx->input);
     vio_a11y_dispatch_all(ctx);
+    vio_webview_dispatch();
 }
 
 /* Wake a vio_wait_events, from any thread; sticky until a wait takes it. */
@@ -16215,6 +16218,7 @@ ZEND_FUNCTION(vio_platform_info)
     add_assoc_bool(return_value, "ime_preedit", p->ime_preedit != 0);
     add_assoc_bool(return_value, "window_parent", p->set_parent != NULL);
     add_assoc_bool(return_value, "accessibility", vio_a11y_available() != 0);
+    add_assoc_bool(return_value, "webview", vio_webview_available() != 0);
 }
 
 ZEND_FUNCTION(vio_set_cursor)
@@ -17282,6 +17286,7 @@ PHP_MINIT_FUNCTION(vio)
 #endif
     vio_resource_init();
     vio_context_register();
+    vio_webview_register();
     vio_mesh_register();
     vio_shader_register();
     vio_pipeline_register();
@@ -17316,6 +17321,7 @@ PHP_MSHUTDOWN_FUNCTION(vio)
     vio_plugin_registry_shutdown();
     vio_audio_engine_shutdown();
     vio_shader_compiler_shutdown();
+    vio_webview_shutdown();
     vio_window_shutdown();
     vio_clipboard_shutdown();
     vio_resource_shutdown();

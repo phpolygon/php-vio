@@ -1331,8 +1331,10 @@ static int cocoa_set_progress(vio_window_handle h, double value, int state)
 }
 
 /* UNUserNotificationCenter: only inside an app bundle (it throws without one). */
+static int cocoa_webkit_loaded(void);
 static int cocoa_available(int feature)
 {
+    if (feature == VIO_PLATFORM_FEATURE_WEBVIEW) return cocoa_webkit_loaded();
     if (feature != VIO_PLATFORM_FEATURE_NOTIFICATIONS) return 1;
     static int loaded = -1;
     if (loaded < 0) loaded = dlopen("/System/Library/Frameworks/UserNotifications.framework/UserNotifications", RTLD_LAZY) != NULL;
@@ -1742,6 +1744,8 @@ static int cocoa_set_parent(vio_window_handle h, vio_window_handle ph, int modal
     return 1;
 }
 
+#include "vio_webview_cocoa.m"
+
 static const vio_platform vio_platform_cocoa = {
     .name                 = "cocoa",
     .init                 = cocoa_init,
@@ -1814,6 +1818,14 @@ static const vio_platform vio_platform_cocoa = {
     .set_ime_rect         = cocoa_set_ime_rect,
     .set_ime_enabled      = cocoa_set_ime_enabled,
     .set_parent           = cocoa_set_parent,
+    .webview_create       = cocoa_webview_create,
+    .webview_destroy      = cocoa_webview_destroy,
+    .webview_navigate     = cocoa_webview_navigate,
+    .webview_eval         = cocoa_webview_eval,
+    .webview_set_bounds   = cocoa_webview_set_bounds,
+    .webview_reply_head   = cocoa_webview_reply_head,
+    .webview_reply_data   = cocoa_webview_reply_data,
+    .webview_reply_end    = cocoa_webview_reply_end,
 };
 
 void vio_platform_cocoa_register(void)

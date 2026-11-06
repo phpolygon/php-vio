@@ -126,6 +126,7 @@ typedef struct _vio_menu_item {
 #define VIO_PLATFORM_FEATURE_NOTIFICATIONS 2
 #define VIO_PLATFORM_FEATURE_PROGRESS      3
 #define VIO_PLATFORM_FEATURE_TRAY          4
+#define VIO_PLATFORM_FEATURE_WEBVIEW       5
 
 /* vio_set_progress states */
 #define VIO_PLATFORM_PROGRESS_NORMAL        0
@@ -148,6 +149,28 @@ struct _vio_platform_image {
     int width, height;
     const unsigned char *rgba;
 };
+
+/* System webview (WEBVIEW-PLAN). user: handed back in every event call.
+ * schemes: lower-case custom schemes whose requests go to PHP (checked by
+ * the caller, never http/https/file). Bounds in logical units from the top
+ * left of the client area; has_bounds 0 = fill it and follow resizes. */
+typedef struct _vio_webview_header {
+    const char *name, *value;
+} vio_webview_header;
+
+typedef struct _vio_webview_desc {
+    const char        *url;              /* NULL: about:blank */
+    int                has_bounds, x, y, width, height;
+    int                devtools, transparent;
+    const char *const *schemes;
+    int                scheme_count;
+    void              *user;
+} vio_webview_desc;
+
+/* Webview event kinds (vio_webview_nav_event) */
+#define VIO_WEBVIEW_EV_NAVIGATED  1   /* text: the URL now shown */
+#define VIO_WEBVIEW_EV_TITLE      2   /* text: the document title */
+#define VIO_WEBVIEW_EV_NEW_WINDOW 3   /* text: the URL a page wanted in a new window (not opened) */
 
 /* Joysticks: ids 0..VIO_PLATFORM_JOYSTICK_LAST (GLFW's 16 slots). */
 #define VIO_PLATFORM_JOYSTICK_LAST 15
@@ -316,7 +339,33 @@ typedef struct _vio_platform {
      * parent, X11 _NET_WM_STATE_MODAL); vio itself drops parent's input.
      * parent NULL detaches w again before it is destroyed. 1 = applied. */
     int   (*set_parent)(vio_window_handle w, vio_window_handle parent, int modal);
+
+    /* ── System webview (WEBVIEW-PLAN) ───────────────────────────────
+     * A child view of w above the swapchain. Engines call the
+     * vio_webview_*_event functions below on the PHP thread, inside
+     * poll_events / wait_events (and end a wait_events when they do);
+     * the PHP side answers later through the reply slots. A scheme
+     * request stays open until reply_end, or until the engine cancels it
+     * (vio_webview_cancel_event - replies to it are then ignored).
+     * webview_destroy: before its window goes; pending requests die with it.
+     * Availability (the engine library is there) through available(). */
+    void *(*webview_create)(vio_window_handle w, const vio_webview_desc *d);
+    void  (*webview_destroy)(void *wv);
+    int   (*webview_navigate)(void *wv, const char *url);
+    int   (*webview_eval)(void *wv, const char *js);
+    int   (*webview_set_bounds)(void *wv, int has_bounds, int x, int y, int width, int height);
+    int   (*webview_reply_head)(void *wv, uint64_t id, int status, const vio_webview_header *h, int count);
+    int   (*webview_reply_data)(void *wv, uint64_t id, const void *data, size_t len);
+    int   (*webview_reply_end)(void *wv, uint64_t id);
 } vio_platform;
+
+/* Webview events, implemented in src/vio_webview.c (PHP thread). They copy
+ * what they get; user is vio_webview_desc.user. */
+void vio_webview_request_event(void *user, uint64_t id, const char *method, const char *url,
+                               const vio_webview_header *h, int count, const void *body, size_t len);
+void vio_webview_cancel_event(void *user, uint64_t id);
+void vio_webview_message_event(void *user, const char *json, size_t len);
+void vio_webview_nav_event(void *user, int kind, const char *text);
 
 /* Tray events, implemented in php_vio.c (PHP thread, inside poll/wait). */
 void vio_tray_click_event(void);

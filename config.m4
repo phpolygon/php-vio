@@ -490,6 +490,7 @@ if test "$PHP_VIO" != "no"; then
     src/vio_mesh.c \
     src/vio_input.c \
     src/vio_a11y.c \
+    src/vio_webview.c \
     src/vio_shader.c \
     src/vio_pipeline.c \
     src/vio_compute_pipeline.c \
