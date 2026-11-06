@@ -536,6 +536,41 @@ int vio_a11y_win32_getobject(struct _vio_input_state *in, uintptr_t wparam, intp
 #define VIO_A11Y_HAS_ADAPTER 1
 #endif
 
+#if defined(__APPLE__) && !defined(VIO_A11Y_HAS_ADAPTER)
+/* macOS: the subclassing adapter on the window's content view (NSAccessibility).
+ * Its handlers run on the main thread, inside the event loop. */
+static void vio_a11y_raise(struct accesskit_macos_queued_events *ev)
+{
+    if (ev) accesskit_macos_queued_events_raise(ev);
+}
+
+static int vio_a11y_adapter_new(vio_a11y *t)
+{
+    void *window = vio_plat()->native_handle(t->platform_window, VIO_NATIVE_NSWINDOW);
+    if (!window) return 0;
+    t->adapter = accesskit_macos_subclassing_adapter_for_window(window, vio_a11y_activation, t, vio_a11y_action, t);
+    if (!t->adapter) return 0;
+    vio_a11y_raise(accesskit_macos_subclassing_adapter_update_view_focus_state(
+        (struct accesskit_macos_subclassing_adapter *)t->adapter, t->focused != 0));
+    return 1;
+}
+static void vio_a11y_adapter_update(vio_a11y *t)
+{
+    vio_a11y_raise(accesskit_macos_subclassing_adapter_update_if_active(
+        (struct accesskit_macos_subclassing_adapter *)t->adapter, vio_a11y_changes, t));
+}
+static void vio_a11y_adapter_focus(vio_a11y *t, int focused)
+{
+    vio_a11y_raise(accesskit_macos_subclassing_adapter_update_view_focus_state(
+        (struct accesskit_macos_subclassing_adapter *)t->adapter, focused != 0));
+}
+static void vio_a11y_adapter_free(vio_a11y *t)
+{
+    accesskit_macos_subclassing_adapter_free((struct accesskit_macos_subclassing_adapter *)t->adapter);
+}
+#define VIO_A11Y_HAS_ADAPTER 1
+#endif
+
 #ifndef VIO_A11Y_HAS_ADAPTER
 static int  vio_a11y_adapter_new(vio_a11y *t) { (void)t; return 0; }
 static void vio_a11y_adapter_update(vio_a11y *t) { (void)t; }
@@ -547,6 +582,8 @@ int vio_a11y_available(void)
 {
 #if defined(VIO_A11Y_HAS_ADAPTER) && defined(_WIN32)
     return strcmp(vio_plat()->name, "win32") == 0;   /* the WndProc answers WM_GETOBJECT */
+#elif defined(VIO_A11Y_HAS_ADAPTER) && defined(__APPLE__)
+    return strcmp(vio_plat()->name, "cocoa") == 0 || strcmp(vio_plat()->name, "glfw") == 0;   /* an NSWindow */
 #elif defined(VIO_A11Y_HAS_ADAPTER)
     return vio_platform_has_windows();
 #else

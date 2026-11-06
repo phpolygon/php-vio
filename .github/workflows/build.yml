@@ -541,6 +541,20 @@ jobs:
             exit 1
           fi
 
+      # AccessKit (vio_a11y_update): the accesskit-c release package, checked
+      # against its digest.
+      - name: Fetch AccessKit
+        env:
+          AK_VERSION: '0.23.1'
+          AK_SHA256: '35b7ca8a6f1e038b5da35e1e9e5a0adaed9bfcf21e1496d29598fbbadcc7043f'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/accesskit.zip" \
+            "https://github.com/AccessKit/accesskit-c/releases/download/${AK_VERSION}/accesskit-c-${AK_VERSION}.zip"
+          echo "${AK_SHA256}  $RUNNER_TEMP/accesskit.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/accesskit.zip" -d "$RUNNER_TEMP"
+          echo "VIO_ACCESSKIT_DIR=$RUNNER_TEMP/accesskit-c-${AK_VERSION}" >> "$GITHUB_ENV"
+
       - name: Build extension
         run: |
           phpize
@@ -552,7 +566,8 @@ jobs:
             --with-vulkan \
             --with-ffmpeg \
             --with-metal \
-            --with-harfbuzz
+            --with-harfbuzz \
+            --with-accesskit="$VIO_ACCESSKIT_DIR"
           make -j$(sysctl -n hw.ncpu)
 
       - name: Smoke test — extension loads (eager symbol binding)
@@ -569,6 +584,7 @@ jobs:
           # to each test's child process, so vio loads + ini stays clean.
           export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          export VIO_REQUIRE_A11Y=1   # AccessKit is built in: test 273 must reach NSAccessibility
           php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
@@ -630,6 +646,20 @@ jobs:
             exit 1
           fi
 
+      # AccessKit (vio_a11y_update): the accesskit-c release package, checked
+      # against its digest.
+      - name: Fetch AccessKit
+        env:
+          AK_VERSION: '0.23.1'
+          AK_SHA256: '35b7ca8a6f1e038b5da35e1e9e5a0adaed9bfcf21e1496d29598fbbadcc7043f'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/accesskit.zip" \
+            "https://github.com/AccessKit/accesskit-c/releases/download/${AK_VERSION}/accesskit-c-${AK_VERSION}.zip"
+          echo "${AK_SHA256}  $RUNNER_TEMP/accesskit.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/accesskit.zip" -d "$RUNNER_TEMP"
+          echo "VIO_ACCESSKIT_DIR=$RUNNER_TEMP/accesskit-c-${AK_VERSION}" >> "$GITHUB_ENV"
+
       - name: Build extension
         run: |
           phpize
@@ -641,7 +671,8 @@ jobs:
             --with-vulkan \
             --with-ffmpeg \
             --with-metal \
-            --with-harfbuzz
+            --with-harfbuzz \
+            --with-accesskit="$VIO_ACCESSKIT_DIR"
           make -j$(sysctl -n hw.ncpu)
 
       - name: Smoke test — extension loads (eager symbol binding)
@@ -658,6 +689,7 @@ jobs:
           # to each test's child process, so vio loads + ini stays clean.
           export NO_INTERACTION=1 REPORT_EXIT_STATUS=1
           export TEST_PHP_ARGS="-n -d extension_dir=$PWD/modules -d extension=vio.so"
+          export VIO_REQUIRE_A11Y=1   # AccessKit is built in: test 273 must reach NSAccessibility
           php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
