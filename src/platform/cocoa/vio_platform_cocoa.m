@@ -450,7 +450,7 @@ static void *cocoa_gl_get_proc_address(const char *name)
     return p;
 }
 
-static NSOpenGLContext *cocoa_gl_create(int samples)
+static NSOpenGLContext *cocoa_gl_create(int samples, NSOpenGLContext *share)
 {
     static const NSOpenGLPixelFormatAttribute profiles[] = { NSOpenGLProfileVersion4_1Core, NSOpenGLProfileVersion3_2Core };
     for (int p = 0; p < 2; p++) {
@@ -472,7 +472,7 @@ static NSOpenGLContext *cocoa_gl_create(int samples)
             attrs[n] = 0;
             NSOpenGLPixelFormat *pf = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
             if (!pf) continue;
-            NSOpenGLContext *ctx = [[NSOpenGLContext alloc] initWithFormat:pf shareContext:nil];
+            NSOpenGLContext *ctx = [[NSOpenGLContext alloc] initWithFormat:pf shareContext:share];
             if (ctx) return ctx;
         }
     }
@@ -630,7 +630,8 @@ static vio_window_handle cocoa_create_window(vio_config *cfg, const char *backen
         w->delegate = (void *)CFBridgingRetain(del);
 
         if (backend_name && strcmp(backend_name, "opengl") == 0) {
-            NSOpenGLContext *ctx = cocoa_gl_create(cfg->samples);
+            vio_cocoa_window *share_w = (vio_cocoa_window *)cfg->gl_share;
+            NSOpenGLContext *ctx = cocoa_gl_create(cfg->samples, share_w && share_w->glctx ? (__bridge NSOpenGLContext *)share_w->glctx : nil);
             if (!ctx) {
                 php_error_docref(NULL, E_WARNING, "Cocoa: no OpenGL context >= 3.2 core available");
                 win.delegate = nil;

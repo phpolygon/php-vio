@@ -185,7 +185,13 @@ vio_key_pressed($tool, VIO_KEY_A);   // Eingabe-Funktionen nehmen VioContext|Vio
     Present um eins weiter, der Back-Buffer ist ein eigenes Feld (`back_index`) der geladenen Swapchain. Swapchain,
     Back-Buffer mit RTV-Heap, Tiefe mit DSV-Heap, Größen und Flags je Fenster. Mit HDR-Komposit (Ebene in der Größe des
     Hauptfensters) und bei anderem Swapchain-Format lehnt `vio_window` ab.
-  - **4d:** OpenGL (geteilte Kontexte in allen Plattformen, VAOs/FBOs je Kontext).
+  - **4d ✅ (2026-11-05):** OpenGL. Ein Fenster-Frame rendert im Hauptkontext in ein FBO des Fensters (wie das
+    Headless-FBO), damit VAOs und FBOs nicht je Kontext entstehen müssen. Ein sichtbares Fenster bekommt einen Kontext, der
+    die Objekte des Hauptkontexts teilt (`vio_config.gl_share`: GLFW, Cocoa `shareContext`, WGL, GLX, EGL); `present`
+    macht ihn aktuell, wartet per Fence-Sync auf den Hauptkontext, blittet den geteilten Renderbuffer in seinen
+    Backbuffer, tauscht und macht den Hauptkontext wieder aktuell. Ein Headless-Fenster hat keinen Kontext.
+    Geprüft auf Cocoa und GLFW (sichtbares Fenster, Bildschirmaufnahme); WGL, GLX und EGL nur headless in der CI.
+  - Offen: `'parent'` / `'modal'` für Unterfenster.
   - Backends ohne Umbau melden `VIO_FEATURE_MULTI_WINDOW` = false, `vio_window` liefert dort `false`. Headless-Fenster bekommen dieselben Slots, damit die Tests
   ohne Bildschirm laufen.
 - **Tests (270–272):** zwei und drei Fenster in einem Frame-Zyklus, je Fenster eigener Clear/Draw und

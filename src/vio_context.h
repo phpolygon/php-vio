@@ -92,6 +92,7 @@ typedef struct _vio_context_object {
     int                window_count;
     struct _vio_window_object *frame_window;
     void              *frame_saved_window;
+    unsigned int       frame_saved_fbo;
     vio_config         frame_saved_config;
     int                frame_saved_2d_w, frame_saved_2d_h, frame_saved_fb_w, frame_saved_fb_h;
     zend_object        std;

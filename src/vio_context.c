@@ -107,6 +107,9 @@ void vio_window_object_close(vio_window_object *w)
     if (w->view.window) {
         vio_window_destroy(w->view.window);
         w->view.window = NULL;
+        /* OpenGL: destroying the window's context may have unbound the main one */
+        if (ctx->initialized && ctx->window && ctx->backend && ctx->backend->swapchain_fbo && vio_plat()->gl_make_current)
+            vio_plat()->gl_make_current(ctx->window);
     }
     w->view.initialized = 0;
     w->view.should_close = 1;

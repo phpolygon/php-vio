@@ -585,6 +585,9 @@ typedef struct _vio_config {
      * Without it alpha blending runs on PQ values (antialiased text thins out).
      * vio_swapchain_info()['hdr_composite'] says whether it is in use. */
     int         hdr_composite;
+    /* vio_window on OpenGL (DESKTOP-APP-PLAN Phase 4d): the platform window whose
+     * GL context the new window's context shares objects with; NULL = none. */
+    void       *gl_share;
     /* D3D12 shader model (GAP-PHASE5 Block 7): 6 compiles the SPIRV-Cross HLSL
      * with DXC to DXIL (dxcompiler.dll + dxil.dll must be loadable, the device
      * must report SM 6.0); 0 / 5 / 50..59 = FXC 5.1 as before. The profile is the

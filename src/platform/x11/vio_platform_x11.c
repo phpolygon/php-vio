@@ -856,12 +856,12 @@ static vio_window_handle x11_create_window(vio_config *cfg, const char *backend_
                     core ? X11_GLX_CONTEXT_PROFILE : None, X11_GLX_CONTEXT_CORE_BIT, None
                 };
                 x11_error_code = 0;
-                w->glrc = glx.CreateContextAttribsARB(x11_dpy, fbc, NULL, True, attrs);
+                w->glrc = glx.CreateContextAttribsARB(x11_dpy, fbc, cfg->gl_share ? ((vio_x11_window *)cfg->gl_share)->glrc : NULL, True, attrs);
                 XSync(x11_dpy, False);
                 if (x11_error_code && w->glrc) { glx.DestroyContext(x11_dpy, w->glrc); w->glrc = NULL; }
             }
         }
-        if (!w->glrc && glx.CreateNewContext) w->glrc = glx.CreateNewContext(x11_dpy, fbc, X11_GLX_RGBA_TYPE, NULL, True);
+        if (!w->glrc && glx.CreateNewContext) w->glrc = glx.CreateNewContext(x11_dpy, fbc, X11_GLX_RGBA_TYPE, cfg->gl_share ? ((vio_x11_window *)cfg->gl_share)->glrc : NULL, True);
         int ok = w->glrc && glx.MakeCurrent(x11_dpy, w->win, w->glrc);
         if (ok) {
             /* the floor is 3.0, like GLFW's ladder */

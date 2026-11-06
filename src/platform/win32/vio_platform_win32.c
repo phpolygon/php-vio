@@ -633,7 +633,7 @@ static void w32_wgl_probe(void)
 
 /* Pixel format + context on the real window: the newest of the version
  * ladder the driver gives (core profile from 3.2), else a legacy context. */
-static int w32_gl_create(vio_win32_window *w, int samples)
+static int w32_gl_create(vio_win32_window *w, int samples, HGLRC share)
 {
     w32_wgl_probe();
     int pf = 0;
@@ -676,10 +676,13 @@ static int w32_gl_create(vio_win32_window *w, int samples)
                 0
             };
             if (ladder[i][0] * 10 + ladder[i][1] < 32) attrs[4] = 0;   /* no profile before 3.2 */
-            w->glrc = w32_wglCreateContextAttribsARB(w->hdc, NULL, attrs);
+            w->glrc = w32_wglCreateContextAttribsARB(w->hdc, share, attrs);
         }
     }
-    if (!w->glrc) w->glrc = wglCreateContext(w->hdc);   /* legacy drivers: whatever the driver has */
+    if (!w->glrc) {
+        w->glrc = wglCreateContext(w->hdc);   /* legacy drivers: whatever the driver has */
+        if (w->glrc && share && !wglShareLists(share, w->glrc)) { wglDeleteContext(w->glrc); w->glrc = NULL; }
+    }
     if (!w->glrc) return -1;
     if (!wglMakeCurrent(w->hdc, w->glrc)) return -1;
     /* The floor is 3.0, like GLFW's ladder: a legacy context can be Microsoft's
@@ -921,7 +924,7 @@ static vio_window_handle w32_create_window(vio_config *cfg, const char *backend_
     }
 
     if (backend_name && strcmp(backend_name, "opengl") == 0) {
-        if (w32_gl_create(w, cfg->samples) != 0) {
+        if (w32_gl_create(w, cfg->samples, cfg->gl_share ? ((vio_win32_window *)cfg->gl_share)->glrc : NULL) != 0) {
             php_error_docref(NULL, E_WARNING, "Win32: no OpenGL context >= 3.0 available");
             ReleaseDC(w->hwnd, w->hdc);
             DestroyWindow(w->hwnd);

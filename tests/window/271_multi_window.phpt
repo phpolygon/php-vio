@@ -4,8 +4,8 @@ Multiple windows (DESKTOP-APP-PLAN Phase 4): vio_window() opens a second window 
 vio
 --FILE--
 <?php
-/* converted in 4a (Metal, D3D11), 4b (Vulkan) and 4c (D3D12); OpenGL follows (4d) */
-$required = ['metal', 'd3d11', 'vulkan', 'd3d12'];
+/* every backend: 4a Metal + D3D11, 4b Vulkan, 4c D3D12, 4d OpenGL */
+$required = ['opengl', 'metal', 'd3d11', 'vulkan', 'd3d12'];
 $px = function (string $rgba, int $w, int $x, int $y) { $o = ($y * $w + $x) * 4; return [ord($rgba[$o]), ord($rgba[$o + 1]), ord($rgba[$o + 2])]; };
 $near = fn(array $a, array $b) => max(array_map(fn($i) => abs($a[$i] - $b[$i]), [0, 1, 2])) <= 8;
 $err = function (callable $f) { try { $f(); return 'none'; } catch (ValueError $e) { return 'ValueError'; } };
@@ -57,6 +57,30 @@ foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
     vio_inject_window_event($w, VIO_WINDOW_EVENT_CLOSE);
     if ($asked !== 1 || !vio_should_close($w) || vio_should_close($ctx)) $fail[] = 'close';
 
+    /* OpenGL: a visible window has its own context sharing the main one's objects and is presented by a blit */
+    if ($b === 'opengl') {
+        $v = vio_window($ctx, ['width' => 32, 'height' => 20, 'title' => 'Visible']);
+        if ($v instanceof VioWindow) {
+            for ($i = 0; $i < 3; $i++) {
+                vio_begin($ctx, ['window' => $v]);
+                vio_clear($ctx, 0.0, 1.0, 1.0, 1.0);
+                vio_sprite($ctx, $tex, ['x' => 0, 'y' => 0, 'width' => 32, 'height' => 10]);
+                vio_draw_2d($ctx);
+                vio_end($ctx);
+                vio_begin($ctx);
+                vio_clear($ctx, 0.0, 0.0, 0.0, 1.0);
+                vio_end($ctx);
+            }
+            [$fw, $fh] = vio_framebuffer_size($v);
+            $pv = vio_read_pixels($v);
+            if (strlen($pv) !== $fw * $fh * 4) $fail[] = 'visible length';
+            elseif (!$near($px($pv, $fw, intdiv($fw, 2), intdiv($fh, 4)), [255, 255, 0]) || !$near($px($pv, $fw, intdiv($fw, 2), intdiv($fh * 3, 4)), [0, 255, 255]))
+                $fail[] = 'visible ' . json_encode([$px($pv, $fw, intdiv($fw, 2), intdiv($fh, 4)), $px($pv, $fw, intdiv($fw, 2), intdiv($fh * 3, 4))]);
+            if (!$near($px(vio_read_pixels($ctx), 48, 24, 16), [0, 0, 0])) $fail[] = 'main after a visible window frame';
+            vio_destroy_window($v);
+        }
+    }
+
     /* a window belongs to its context (the null backend: one GPU context per backend and process) */
     $other = vio_create('null', ['width' => 16, 'height' => 16, 'headless' => true]);
     if ($other) {
@@ -76,7 +100,7 @@ foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
 echo "DONE\n";
 ?>
 --EXPECTF--
-opengl: %r(OK|unsupported|skip \(.*\))%r
+opengl: %r(OK|skip \(.*\))%r
 d3d11: %r(OK|skip \(.*\))%r
 d3d12: %r(OK|skip \(.*\))%r
 vulkan: %r(OK|skip \(.*\))%r

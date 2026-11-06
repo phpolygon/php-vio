@@ -746,9 +746,129 @@ static void opengl_draw_indexed(vio_draw_indexed_cmd *cmd)
     (void)cmd;
 }
 
+/* ── Further windows (DESKTOP-APP-PLAN Phase 4d) ─────────────────────
+ * A window frame renders in the main context into the window's FBO (like the
+ * headless one). A visible window has a context sharing objects with the main
+ * one; present makes it current, blits the shared colour renderbuffer into its
+ * back buffer through an FBO of that context (FBOs are not shared), swaps and
+ * makes the main context current again. A headless window has no context. */
+typedef struct _vio_gl_swapchain {
+    void   *window, *main_window;
+    int     headless, vsync, interval_set;
+    int     width, height;           /* FBO size */
+    GLuint  fbo, color_rb;           /* main context */
+    GLuint  present_fbo, present_rb; /* window context */
+    unsigned int generation;
+} vio_gl_swapchain;
+
+static vio_gl_swapchain *gl_cur_sc;
+
+static unsigned int opengl_setup_headless(int width, int height, int samples);
+static void opengl_teardown_headless(unsigned int fbo);
+
+static void *opengl_create_swapchain(void *platform_window, const vio_config *cfg)
+{
+    if (!vio_gl.initialized || !platform_window) return NULL;
+    vio_gl_swapchain *sc = (vio_gl_swapchain *)calloc(1, sizeof(*sc));
+    if (!sc) return NULL;
+    sc->window = platform_window;
+    sc->main_window = cfg->gl_share;
+    sc->headless = cfg->headless;
+    sc->vsync = cfg->vsync;
+    sc->generation = gl_context_generation;
+    if (!sc->headless && (!sc->main_window || !vio_plat()->gl_make_current)) { free(sc); return NULL; }
+    return sc;
+}
+
+static void opengl_set_swapchain(void *swapchain)
+{
+    gl_cur_sc = (vio_gl_swapchain *)swapchain;
+}
+
+static unsigned int opengl_swapchain_fbo(void *swapchain)
+{
+    vio_gl_swapchain *sc = (vio_gl_swapchain *)swapchain;
+    if (!sc || !vio_gl.initialized) return 0;
+    int w = 0, h = 0;
+    if (sc->headless) vio_plat()->get_window_size(sc->window, &w, &h);
+    else vio_plat()->get_framebuffer_size(sc->window, &w, &h);
+    if (w <= 0 || h <= 0) return sc->fbo;   /* minimised: keep the old one */
+    if (sc->fbo && (w != sc->width || h != sc->height)) {
+        opengl_teardown_headless(sc->fbo);
+        sc->fbo = sc->color_rb = 0;
+    }
+    if (!sc->fbo) {
+        sc->fbo = opengl_setup_headless(w, h, 0);
+        if (!sc->fbo) return 0;
+        GLint rb = 0;
+        glBindFramebuffer(GL_FRAMEBUFFER, sc->fbo);
+        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &rb);
+        sc->color_rb = (GLuint)rb;
+        sc->width = w;
+        sc->height = h;
+    }
+    return sc->fbo;
+}
+
+static void opengl_window_present(vio_gl_swapchain *sc)
+{
+    if (sc->headless || !sc->fbo || !sc->color_rb) return;
+    /* The window context reads what this one rendered: a fence it waits for on
+     * the GPU (GL 3.2), glFinish below that. */
+    GLsync done = glFenceSync ? glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0) : NULL;
+    if (done) glFlush(); else glFinish();
+    if (vio_plat()->gl_make_current(sc->window) != 0) {   /* 0 = current */
+        vio_plat()->gl_make_current(sc->main_window);
+        if (done) glDeleteSync(done);
+        return;
+    }
+    if (done) {
+        glWaitSync(done, 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(done);
+    }
+    if (!sc->interval_set && vio_plat()->gl_swap_interval) {
+        vio_plat()->gl_swap_interval(sc->vsync ? 1 : 0);
+        sc->interval_set = 1;
+    }
+    if (sc->present_fbo && sc->present_rb != sc->color_rb) {
+        glDeleteFramebuffers(1, &sc->present_fbo);
+        sc->present_fbo = 0;
+    }
+    if (!sc->present_fbo) {
+        glGenFramebuffers(1, &sc->present_fbo);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, sc->present_fbo);
+        glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, sc->color_rb);
+        sc->present_rb = sc->color_rb;
+    }
+    int fw = 0, fh = 0;
+    vio_plat()->get_framebuffer_size(sc->window, &fw, &fh);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, sc->present_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, sc->width, sc->height, 0, 0, fw, fh, GL_COLOR_BUFFER_BIT,
+                      (fw == sc->width && fh == sc->height) ? GL_NEAREST : GL_LINEAR);
+    vio_plat()->swap_buffers(sc->window);
+    vio_plat()->gl_make_current(sc->main_window);
+}
+
+static void opengl_destroy_swapchain(void *swapchain)
+{
+    vio_gl_swapchain *sc = (vio_gl_swapchain *)swapchain;
+    if (!sc) return;
+    if (gl_cur_sc == sc) gl_cur_sc = NULL;
+    if (vio_gl.initialized && sc->generation == gl_context_generation) {
+        if (sc->present_fbo && vio_plat()->gl_make_current(sc->window) == 0) {
+            glDeleteFramebuffers(1, &sc->present_fbo);
+            vio_plat()->gl_make_current(sc->main_window);
+        }
+        if (sc->fbo) opengl_teardown_headless(sc->fbo);
+    }
+    free(sc);
+}
+
 static void opengl_present(void)
 {
-    /* Swap is handled by the window system (vio_end -> vio_window_swap_buffers) */
+    /* The main window swaps through the window system (vio_end -> vio_window_swap_buffers) */
+    if (gl_cur_sc) opengl_window_present(gl_cur_sc);
 }
 
 static void opengl_gpu_flush(void)
@@ -3363,6 +3483,10 @@ static const vio_backend opengl_backend = {
     .draw              = opengl_draw,
     .draw_indexed      = opengl_draw_indexed,
     .present           = opengl_present,
+    .create_swapchain  = opengl_create_swapchain,
+    .set_swapchain     = opengl_set_swapchain,
+    .destroy_swapchain = opengl_destroy_swapchain,
+    .swapchain_fbo     = opengl_swapchain_fbo,
     .bound_render_target = opengl_bound_render_target,
     .clear             = opengl_clear,
     .gpu_flush         = opengl_gpu_flush,

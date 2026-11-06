@@ -127,7 +127,7 @@ Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONO
 | Ordner | Inhalt |
 |---|---|
 | `tests/input/265` | Datei-Drop (DESKTOP-APP-PLAN Phase 2): `vio_on_drop` bekommt Pfade (UTF-8, Leerzeichen) und den Drop-Punkt im Cursor-Raum, `vio_inject_drop` nimmt denselben Pfad; echte Drops auf Win32 (`DROPFILES` per FFI als `WM_DROPFILES`) und X11 (XDND-Enter/Position/Drop aus einer zweiten Display-Verbindung, die `XdndSelection` besitzt und die `SelectionRequest` mit einer `text/uri-list` beantwortet – Prozent-Escapes, `localhost`, Kommentare –, danach `XdndFinished`). Cocoa und Wayland nur per Injection. |
-| `tests/window/271` | Mehrere Fenster (DESKTOP-APP-PLAN Phase 4a–4c, Metal, D3D11, D3D12, Vulkan): `vio_window` öffnet ein zweites Fenster auf dem Gerät des Kontexts, `vio_begin($ctx, ['window' => $w])` rendert hinein (Clear, 2D, eine Textur des Kontexts), Frames wechseln mit dem Hauptfenster, jedes behält seinen Inhalt (`vio_read_pixels($w)`), Größen, Tasten und Schließen sind je Fenster, ein Fenster eines anderen Kontexts → `ValueError`, das Hauptfenster rendert nach `vio_destroy_window` weiter; Backends ohne Umbau melden `VIO_FEATURE_MULTI_WINDOW` = false und `vio_window` `false`. |
+| `tests/window/271` | Mehrere Fenster (DESKTOP-APP-PLAN Phase 4, jedes Backend): `vio_window` öffnet ein zweites Fenster auf dem Gerät des Kontexts, `vio_begin($ctx, ['window' => $w])` rendert hinein (Clear, 2D, eine Textur des Kontexts), Frames wechseln mit dem Hauptfenster, jedes behält seinen Inhalt (`vio_read_pixels($w)`), Größen, Tasten und Schließen sind je Fenster, ein Fenster eines anderen Kontexts → `ValueError`, das Hauptfenster rendert nach `vio_destroy_window` weiter; ohne Fenstersystem (null-Plattform) meldet `VIO_FEATURE_MULTI_WINDOW` = false und `vio_window` liefert `false`. |
 | `tests/input/270` | IME-Komposition (DESKTOP-APP-PLAN Phase 3, Win32/Cocoa/X11/Wayland, nicht GLFW): `vio_on_preedit` bekommt Text und Auswahl in Codepoints (`''` am Ende), `vio_inject_preedit` nimmt denselben Pfad (Bereichsfehler → `ValueError`), `vio_ime_rect` / `vio_ime_enable` liefern, was die Plattform hat; auf Cocoa über die `NSTextInputClient`-Methoden der View per FFI (`setMarkedText` → Preedit mit UTF-16 → Codepoint, `insertText` → Zeichen + `''`, `firstRectForCharacterRange` → Größe aus `vio_ime_rect`, nur arm64). |
 | `tests/window/269` | Tray (DESKTOP-APP-PLAN Phase 2c-2): `vio_tray` / `vio_tray_remove` liefern, was `vio_platform_info()['tray']` meldet, Vertrag (Bild, Callback, Menü ohne id); Win32 über echte Nachrichten an das Fenster `vio_tray` (Linksklick → `on_click`, `WM_COMMAND` → `on_select`, Rechtsklick öffnet das Menü, per `VIO_TEST_DIALOG` abgebrochen) und `vio_notify` als Balloon; Linux als StatusNotifierItem gegen einen Fake-Watcher auf eigenem Bus (Registrierung, `GetAll` mit Id/Title/Menu/IconPixmap in ARGB32 big-endian, dbusmenu-`GetLayout` mit Trenner und Untermenü, `Event clicked` → `on_select`, `Activate` → `on_click`, während `vio_wait_events` wartet). |
 | `tests/window/268` | Benachrichtigungen und Fortschritt (DESKTOP-APP-PLAN Phase 2c): `vio_notify` / `vio_set_progress` liefern, was `vio_platform_info()` meldet (ohne Session-Bus wie in der CI), Vertrag überall, auf Cocoa trägt die Dock-Kachel den Balken (FFI). Linux gegen Fake-Dienste auf eigenem Bus (`dbus-run-session` + python3-dbus, sonst n/a): `Notify` mit `replaces_id` über dieselbe `id`, das `LauncherEntry`-Signal mit `application://<vio.app_id>.desktop`, das FileChooser-Portal (Öffnen mit Filtern und `multiple`, Speichern mit `current_name`/`current_folder`, Abbrechen → `null`). |
@@ -864,7 +864,7 @@ vio_on_focus($ctx, fn(bool $f) => …); vio_on_minimize($ctx, fn(bool $m) => …
 vio_on_scale($ctx, fn(float $sx, float $sy) => …); vio_on_refresh($ctx, fn() => render());   // auch im Live-Resize
 vio_inject_window_event($ctx, VIO_WINDOW_EVENT_CLOSE);  // Tests: derselbe Pfad wie das OS-Ereignis
 
-// Mehrere Fenster (VIO_FEATURE_MULTI_WINDOW: Metal, D3D11, D3D12, Vulkan): ein Gerät, Ressourcen gelten in jedem Fenster
+// Mehrere Fenster (VIO_FEATURE_MULTI_WINDOW: jedes Backend; OpenGL rendert in ein FBO und blittet über einen geteilten Kontext): ein Gerät, Ressourcen gelten in jedem Fenster
 $tool = vio_window($ctx, ['width' => 320, 'height' => 600, 'title' => 'Inspector']);   // false ohne Feature
 vio_begin($ctx, ['window' => $tool]); /* … */ vio_end($ctx);
 vio_key_pressed($tool, VIO_KEY_A); vio_should_close($tool); vio_read_pixels($tool);   // Fenster-/Input-Funktionen nehmen VioContext|VioWindow
@@ -1710,13 +1710,14 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
 - **`VULKAN-MODERN-PLAN.md` — ✅ umgesetzt (2026-10-08, A37 + A18).** Vulkan 1.2+/1.3-Kern: Timeline-Semaphore
   für alle Übergaben, Synchronization2-Barrieren, Dynamic Rendering statt Render-Pass-/Framebuffer-Objekten,
   darauf das Shading-Rate-Bild (Test 160 auf Vulkan, Test 206).
-- **`DESKTOP-APP-PLAN.md` — 🚧 Phasen 0–2 umgesetzt (2026-11-05).** Native Desktop-Anwendungen über `vio_platform`: 0 Event-Loop
+- **`DESKTOP-APP-PLAN.md` — 🚧 Phasen 0–4 umgesetzt (2026-11-05).** Native Desktop-Anwendungen über `vio_platform`: 0 Event-Loop
   (`vio_wait_events`, `vio_wake`, Fenster-Ereignisse; Tests 261/262), 1 Cursor/Icon/Größengrenzen/Oben/Deckkraft, URL öffnen,
   Datei zeigen (Tests 263/264), 2a Datei-Drop, Datei-Dialoge, Message-Box (Tests 265/266), 2b Menüleiste und
   Kontextmenü (Test 267), 2c-1 D-Bus-Dienste unter Linux, Benachrichtigungen, Fortschritt (Test 268), 2c-2 Tray (Test 269),
-  3 IME-Komposition auf Win32, Cocoa, X11 und Wayland (Test 270), 2 Dialoge, Drop, Menüs, Tray,
-  Benachrichtigungen, 3 IME-Preedit, 4 mehrere Fenster (`VioWindow`, Swapchain je Fenster), 5 Barrierefreiheit über
-  AccessKit. Linux ohne Portal/Dienst → `false`; macOS als App-Bundle, CLI nur zur Entwicklung.
+  3 IME-Komposition auf Win32, Cocoa, X11 und Wayland (Test 270), 4 mehrere Fenster auf jedem Backend (`VioWindow`,
+  Swapchain je Fenster über `create_swapchain`/`set_swapchain`; D3D12 trennt Frame-Slot und Back-Buffer, OpenGL rendert in
+  ein FBO und blittet über einen geteilten Kontext; Test 271). Offen: Unterfenster (`'parent'`, `'modal'`), 5 Barrierefreiheit
+  über AccessKit. Linux ohne Portal/Dienst → `false`; macOS als App-Bundle, CLI nur zur Entwicklung.
 - `TEXT-SHAPING-PLAN.md` — HarfBuzz + SheenBidi (siehe „Text Shaping" oben).
 - `VULKAN-2D-PLAN.md`, `v2-architecture.md`, `IMPLEMENTATION_PLAN.md` — Kontext.
 - **`METAL-GEOMETRY-PLAN.md` — ✅ umgesetzt (2026-10-05).** Geometry-Stage auf Metal per Compute-
