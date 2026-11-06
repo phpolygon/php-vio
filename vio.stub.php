@@ -221,6 +221,35 @@ function vio_tray(array $options): bool {}
 function vio_tray_remove(): bool {}
 
 /**
+ * Called while the IME composes text (Japanese, Chinese, Korean, dead keys):
+ * the composition and the selected range in codepoints (start == end: the
+ * caret); '' when it is committed or cancelled. Draw it at the text cursor;
+ * the committed text arrives through vio_on_char / vio_chars_typed as usual.
+ * vio_platform_info()['ime_preedit'] says whether the platform reports it.
+ *
+ * @param callable(string, int, int): void $callback
+ */
+function vio_on_preedit(VioContext $context, callable $callback): void {}
+
+/**
+ * A composition through the same path as the platform's (tests). -1 = after
+ * the text; start <= end <= the text's length in codepoints.
+ */
+function vio_inject_preedit(VioContext $context, string $text, int $start = -1, int $end = -1): void {}
+
+/**
+ * Where the text being composed is (window coordinates as vio_mouse_position),
+ * so the IME puts its candidate window next to it.
+ */
+function vio_ime_rect(VioContext $context, int $x, int $y, int $width, int $height): bool {}
+
+/**
+ * Turn the IME on (text fields) or off (game controls: keys go straight
+ * through).
+ */
+function vio_ime_enable(VioContext $context, bool $enabled): bool {}
+
+/**
  * Like vio_poll_events(), but first blocks until an event arrives, $timeout
  * seconds pass (< 0: no timeout) or vio_wake() is called. An idle desktop app
  * loops on this instead of vio_poll_events() and renders only when something

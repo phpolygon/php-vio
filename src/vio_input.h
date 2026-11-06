@@ -107,6 +107,7 @@ typedef enum {
     VIO_WINDOW_CB_REFRESH,
     VIO_WINDOW_CB_DROP,
     VIO_WINDOW_CB_MENU,
+    VIO_WINDOW_CB_PREEDIT,
     VIO_WINDOW_CB_COUNT
 } vio_window_cb;
 
@@ -235,6 +236,9 @@ void vio_input_refresh_event(vio_input_state *state);
 void vio_input_drop_event(vio_input_state *state, int count, const char *const *paths, double x, double y);
 /* A menu bar item was chosen (its tag): the menu callback gets its id. */
 void vio_input_menu_event(vio_input_state *state, int tag);
+/* The IME composition: UTF-8 text ('' = finished) and the selected range in
+ * codepoints (start == end: a caret). */
+void vio_input_preedit_event(vio_input_state *state, const char *utf8, int start, int end);
 /* Set or replace a window event callback (callback must be callable). */
 void vio_input_set_window_cb(vio_input_state *state, vio_window_cb which, zval *callback);
 

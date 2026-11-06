@@ -27,6 +27,7 @@
 #endif
 #include <windows.h>
 #include <windowsx.h>
+#include <imm.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -71,6 +72,8 @@ typedef struct _vio_win32_window {
     int              min_w, min_h, max_w, max_h;   /* client size limits, 0 = none */
     int              aspect_num, aspect_den;
     HMENU            menu;                     /* vio_menu_bar, owned by the window once set */
+    int              ime_x, ime_y, ime_w, ime_h;   /* vio_ime_rect, client pixels */
+    int              composing;
     HACCEL           accel;                    /* its shortcuts */
     vio_input_state *input;
 } vio_win32_window;
@@ -313,6 +316,54 @@ static void w32_apply_aspect(vio_win32_window *w, WPARAM edge, RECT *r)
     }
 }
 
+static char *w32_utf8(const WCHAR *w);
+
+/* The IME composition as UTF-8 + caret (codepoints) -> vio_on_preedit. */
+static void w32_ime_report(vio_win32_window *w, HIMC imc)
+{
+    LONG bytes = ImmGetCompositionStringW(imc, GCS_COMPSTR, NULL, 0);
+    WCHAR *text = (WCHAR *)calloc((size_t)(bytes > 0 ? bytes : 0) / sizeof(WCHAR) + 1, sizeof(WCHAR));
+    if (!text) return;
+    if (bytes > 0) ImmGetCompositionStringW(imc, GCS_COMPSTR, text, (DWORD)bytes);
+    LONG caret = ImmGetCompositionStringW(imc, GCS_CURSORPOS, NULL, 0);   /* UTF-16 units */
+    int cp = 0;
+    for (LONG i = 0; i < caret && text[i]; i++, cp++) if (text[i] >= 0xD800 && text[i] <= 0xDBFF && text[i + 1]) i++;
+    char *u = w32_utf8(text);
+    free(text);
+    w->composing = u && *u;
+    vio_input_preedit_event(w->input, u ? u : "", w->composing ? cp : 0, w->composing ? cp : 0);
+    free(u);
+}
+
+static void w32_ime_place(vio_win32_window *w)
+{
+    HIMC imc = ImmGetContext(w->hwnd);
+    if (!imc) return;
+    COMPOSITIONFORM cf;
+    memset(&cf, 0, sizeof(cf));
+    cf.dwStyle = CFS_POINT;
+    cf.ptCurrentPos.x = w->ime_x;
+    cf.ptCurrentPos.y = w->ime_y;
+    ImmSetCompositionWindow(imc, &cf);
+    CANDIDATEFORM cand;
+    memset(&cand, 0, sizeof(cand));
+    cand.dwIndex = 0;
+    cand.dwStyle = CFS_EXCLUDE;   /* below the text, never over it */
+    cand.ptCurrentPos.x = w->ime_x;
+    cand.ptCurrentPos.y = w->ime_y + w->ime_h;
+    cand.rcArea.left = w->ime_x;
+    cand.rcArea.top = w->ime_y;
+    cand.rcArea.right = w->ime_x + w->ime_w;
+    cand.rcArea.bottom = w->ime_y + w->ime_h;
+    ImmSetCandidateWindow(imc, &cand);
+    ImmReleaseContext(w->hwnd, imc);
+}
+
+static int w32_app_draws_preedit(vio_win32_window *w)
+{
+    return w->input && w->input->has_window_cb[VIO_WINDOW_CB_PREEDIT];
+}
+
 static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     vio_win32_window *w = (vio_win32_window *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -444,6 +495,38 @@ static LRESULT CALLBACK w32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 return 0;
             }
             break;
+        /* An app with vio_on_preedit draws the composition itself: no IME window
+         * of its own, the text comes as preedit events. Without it Windows shows
+         * the composition as before and commits through WM_IME_CHAR -> WM_CHAR. */
+        case WM_IME_SETCONTEXT:
+            if (!w32_app_draws_preedit(w)) break;
+            return DefWindowProcW(hwnd, msg, wp, lp & ~ISC_SHOWUICOMPOSITIONWINDOW);
+        case WM_IME_STARTCOMPOSITION:
+            w32_ime_place(w);
+            if (!w32_app_draws_preedit(w)) break;
+            return 0;
+        case WM_IME_COMPOSITION: {
+            if (!w32_app_draws_preedit(w)) break;
+            HIMC imc = ImmGetContext(hwnd);
+            if (!imc) break;
+            if (lp & GCS_RESULTSTR) {   /* committed: the text as chars, the composition gone */
+                LONG bytes = ImmGetCompositionStringW(imc, GCS_RESULTSTR, NULL, 0);
+                WCHAR *text = (WCHAR *)calloc((size_t)(bytes > 0 ? bytes : 0) / sizeof(WCHAR) + 1, sizeof(WCHAR));
+                if (text && bytes > 0) {
+                    ImmGetCompositionStringW(imc, GCS_RESULTSTR, text, (DWORD)bytes);
+                    for (WCHAR *t = text; *t; t++) w32_char_message(w, (WPARAM)*t);
+                }
+                free(text);
+                if (w->composing) { w->composing = 0; vio_input_preedit_event(w->input, "", 0, 0); }
+            }
+            if (lp & GCS_COMPSTR) w32_ime_report(w, imc);
+            ImmReleaseContext(hwnd, imc);
+            return 0;   /* not to DefWindowProc: it would send the result again as WM_IME_CHAR */
+        }
+        case WM_IME_ENDCOMPOSITION:
+            if (!w32_app_draws_preedit(w)) break;
+            if (w->composing) { w->composing = 0; vio_input_preedit_event(w->input, "", 0, 0); }
+            return 0;
         case WM_DROPFILES: {
             HDROP drop = (HDROP)wp;
             UINT n = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
@@ -1447,6 +1530,25 @@ static int w32_set_progress(vio_window_handle h, double value, int state)
     return 1;
 }
 
+/* ── IME (DESKTOP-APP-PLAN Phase 3) ───────────────────────────────── */
+
+static int w32_set_ime_rect(vio_window_handle h, int x, int y, int width, int height)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return 0;
+    w->ime_x = x; w->ime_y = y; w->ime_w = width; w->ime_h = height;
+    w32_ime_place(w);
+    return 1;
+}
+
+static int w32_set_ime_enabled(vio_window_handle h, int enabled)
+{
+    vio_win32_window *w = (vio_win32_window *)h;
+    if (!w) return 0;
+    if (!enabled && w->composing) { w->composing = 0; vio_input_preedit_event(w->input, "", 0, 0); }
+    return ImmAssociateContextEx(w->hwnd, NULL, enabled ? IACE_DEFAULT : 0) != 0;   /* 0 + NULL: no context, no IME */
+}
+
 /* ── Tray and notifications (DESKTOP-APP-PLAN Phase 2c-2) ─────────── */
 
 #define W32_TRAY_MSG   (WM_APP + 1)
@@ -2137,6 +2239,9 @@ static const vio_platform vio_platform_win32 = {
     .set_progress         = w32_set_progress,
     .notify               = w32_notify,
     .set_tray             = w32_set_tray,
+    .ime_preedit          = 1,
+    .set_ime_rect         = w32_set_ime_rect,
+    .set_ime_enabled      = w32_set_ime_enabled,
 };
 
 void vio_platform_win32_register(void)
