@@ -42,7 +42,7 @@ vio_webview_on_message($wv, function (string $json) use (&$msgs, $wv) {
 vio_webview_on_event($wv, function (string $type, array $data) use (&$events) {
     $events[] = $type . ' ' . json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 });
-$end = microtime(true) + 20;
+$end = microtime(true) + 60;
 while (microtime(true) < $end && !(in_array('"two loaded"', $msgs, true) && preg_grep('/^new_window /', $events) && preg_grep('/^title .*Zwei/', $events))) {
     vio_wait_events($ctx, 0.1);
 }

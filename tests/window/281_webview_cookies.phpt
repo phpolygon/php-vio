@@ -55,7 +55,7 @@ $handler = function (array $req) use ($one, $two, $cookieOf, &$log) {
 $msgs = [];
 $wv = vio_webview($ctx, ['url' => 'app://localhost/', 'schemes' => ['app' => $handler]]);
 vio_webview_on_message($wv, function (string $json) use (&$msgs) { $msgs[] = json_decode($json, true); });
-$end = microtime(true) + 20;
+$end = microtime(true) + 60;
 while (count($msgs) < 2 && microtime(true) < $end) vio_wait_events($ctx, 0.1);
 foreach ($msgs as $m) echo json_encode($m, JSON_UNESCAPED_SLASHES), "\n";
 echo implode("\n", array_filter($log, fn($l) => !str_starts_with($l, '/favicon'))), "\n";

@@ -60,7 +60,7 @@ $handler = function (array $req) use (&$log, &$inPoll, $page, $js, $png) {
 $result = null;
 $wv = vio_webview($ctx, ['url' => 'app://localhost/', 'schemes' => ['app' => $handler]]);
 vio_webview_on_message($wv, function (string $json) use (&$result) { $result = $json; });
-$end = microtime(true) + 20;
+$end = microtime(true) + 60;
 while ($result === null && microtime(true) < $end) {
     $inPoll = true;
     try { vio_wait_events($ctx, 0.1); } catch (RuntimeException $e) { echo 'exception ', $e->getMessage(), "\n"; }

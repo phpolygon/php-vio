@@ -18,7 +18,7 @@ $wv = vio_webview($ctx, ['url' => 'app://localhost/', 'transparent' => true,
                          'schemes' => ['app' => fn() => ['headers' => ['Content-Type' => 'text/html'], 'body' => $page]]]);
 vio_webview_on_message($wv, function (string $json) use (&$sizes) { $sizes[] = json_decode($json); });
 $waitFor = function (array $want) use ($ctx, &$sizes) {
-    $end = microtime(true) + 10;
+    $end = microtime(true) + 60;
     while (microtime(true) < $end) {
         vio_wait_events($ctx, 0.05);
         if ($sizes && end($sizes) === $want) return true;

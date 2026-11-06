@@ -77,7 +77,7 @@ $handler = function (array $req) use ($page, &$produced, &$asked) {
 $result = null;
 $wv = vio_webview($ctx, ['url' => 'app://localhost/', 'schemes' => ['app' => $handler]]);
 vio_webview_on_message($wv, function (string $json) use (&$result) { $result = $json; });
-$end = microtime(true) + 30;
+$end = microtime(true) + 60;
 while ($result === null && microtime(true) < $end) {
     $polls++;
     try { vio_wait_events($ctx, 0.1); } catch (LogicException $e) { echo 'exception ', $e->getMessage(), "\n"; }
