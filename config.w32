@@ -8,6 +8,7 @@ ARG_WITH("glslang", "for glslang (GLSL to SPIR-V compiler) support", "no");
 ARG_WITH("spirv-cross", "for SPIRV-Cross (shader reflection) support", "no");
 ARG_WITH("ffmpeg", "for FFmpeg (video recording) support", "no");
 ARG_WITH("harfbuzz", "for HarfBuzz (text shaping: Arabic, Thai, BiDi) support", "no");
+ARG_WITH("accesskit", "for AccessKit (screen readers, vio_a11y_update): path to the unpacked accesskit-c release", "no");
 ARG_WITH("d3d11", "for Direct3D 11 support", "yes");
 ARG_WITH("d3d12", "for Direct3D 12 support", "yes");
 ARG_WITH("ffx", "for the AMD FidelityFX FSR 3.1 upscaler (amd_fidelityfx_*.dll loaded at run time, no link dependency)", "yes");
@@ -293,6 +294,21 @@ if (PHP_VIO != "no") {
     CHECK_LIB("user32.lib", "vio");
     CHECK_LIB("shell32.lib", "vio");
     CHECK_LIB("imm32.lib", "vio");   // IME composition (vio_on_preedit)
+
+    // AccessKit (DESKTOP-APP-PLAN Phase 5): the static MSVC library of the
+    // accesskit-c release package and the system libraries the Rust code needs.
+    if (PHP_ACCESSKIT != "no") {
+        var ak_arch = X64 ? "x86_64" : "x86";
+        var ak_lib = PHP_ACCESSKIT + "\\lib\\windows\\" + ak_arch + "\\msvc\\static";
+        if (CHECK_HEADER_ADD_INCLUDE("accesskit.h", "CFLAGS_VIO", PHP_ACCESSKIT + "\\include")
+            && CHECK_LIB("accesskit.lib", "vio", ak_lib)) {
+            var ak_sys = ["bcrypt.lib", "ntdll.lib", "propsys.lib", "runtimeobject.lib", "uiautomationcore.lib", "userenv.lib", "ws2_32.lib", "oleaut32.lib", "ole32.lib"];
+            for (var i = 0; i < ak_sys.length; i++) CHECK_LIB(ak_sys[i], "vio");
+            AC_DEFINE("HAVE_ACCESSKIT", 1, "Whether AccessKit is available");
+        } else {
+            WARNING("AccessKit not found in " + PHP_ACCESSKIT + " (include\\accesskit.h, " + ak_lib + "\\accesskit.lib)");
+        }
+    }
     // ole32/winmm needed by miniaudio
     CHECK_LIB("ole32.lib", "vio");
     CHECK_LIB("winmm.lib", "vio");

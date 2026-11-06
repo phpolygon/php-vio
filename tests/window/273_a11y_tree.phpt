@@ -148,6 +148,93 @@ PY;
              'php' => ['ready true', 'action save click null', 'updated']];
     $linux = $j === $want ? 'OK' : 'FAIL ' . $raw;
 }
+/* Windows: what a screen reader sees, over UI Automation (PowerShell's UIAutomationClient) */
+$win = 'n/a';
+if (PHP_OS_FAMILY === 'Windows' && $avail) {
+    $dir = sys_get_temp_dir() . '\\vio273-' . getmypid();
+    @mkdir($dir);
+    $child = <<<'PHP'
+<?php
+$ctx = vio_create('auto', ['width' => 240, 'height' => 120, 'title' => 'vio a11y']);
+$tree = fn(string $save) => ['focus' => 'name', 'nodes' => [
+    ['id' => 'root', 'role' => 'window', 'label' => 'vio a11y test', 'children' => ['save', 'name', 'agree']],
+    ['id' => 'save', 'role' => 'button', 'label' => $save, 'bounds' => [10, 10, 80, 24], 'actions' => ['click']],
+    ['id' => 'name', 'role' => 'text_input', 'label' => 'Name', 'value' => 'Hendrik', 'bounds' => [100, 10, 90, 24], 'actions' => ['focus', 'set_value']],
+    ['id' => 'agree', 'role' => 'check_box', 'label' => 'Zustimmen', 'checked' => true, 'bounds' => [10, 50, 80, 20], 'actions' => ['click']],
+]];
+$clicked = false;
+vio_on_a11y_action($ctx, function ($id, $action, $value) use (&$clicked) {
+    echo "action $id $action " . json_encode($value) . "\n";
+    if ($id === 'save' && $action === 'click') $clicked = true;
+});
+echo 'ready ', json_encode(vio_a11y_update($ctx, $tree('Speichern'))), ' ', vio_native_window_handle($ctx), "\n";
+$t = microtime(true);
+$sent = false;
+while (microtime(true) - $t < 30 && !file_exists($argv[1])) {
+    vio_wait_events($ctx, 0.05);
+    if ($clicked && !$sent) { vio_a11y_update($ctx, ['nodes' => [$tree('Gespeichert')['nodes'][1]]]); $sent = true; echo "updated\n"; }
+}
+vio_destroy($ctx);
+PHP;
+    $ps = <<<'PS1'
+param([long]$hwnd)
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$A = [System.Windows.Automation.AutomationElement]
+$root = $A::FromHandle([IntPtr]$hwnd)
+$res = @()
+$kids = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+$list = @()
+foreach ($k in $kids) {
+    $c = $k.Current
+    if ($c.ControlType.ProgrammaticName -notin @('ControlType.Button', 'ControlType.Edit', 'ControlType.CheckBox')) { continue }
+    $v = $null; $t = $null
+    $p = $null
+    if ($k.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$p)) { $v = $p.Current.Value }
+    if ($k.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$p)) { $t = [string]$p.Current.ToggleState }
+    $list += ,@($c.Name, $c.ControlType.ProgrammaticName, $v, $t)
+}
+$res += ,$list
+$save = $kids | Where-Object { $_.Current.Name -eq 'Speichern' } | Select-Object -First 1
+$p = $null
+if ($save -and $save.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); $res += 'invoked' } else { $res += 'no invoke' }
+$name = $null
+for ($i = 0; $i -lt 100; $i++) {
+    Start-Sleep -Milliseconds 100
+    $now = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | Where-Object { $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' } | Select-Object -First 1
+    if ($now) { $name = $now.Current.Name }
+    if ($name -eq 'Gespeichert') { break }
+}
+$res += $name
+ConvertTo-Json -Compress -Depth 5 $res
+PS1;
+    file_put_contents("$dir\\child.php", $child);
+    file_put_contents("$dir\\q.ps1", $ps);
+    $out = "$dir\\out.txt";
+    $proc = proc_open([PHP_BINARY, '-n', '-d', 'extension_dir=' . ini_get('extension_dir'), '-d', 'extension=vio', "$dir\\child.php", "$dir\\stop"],
+                      [1 => ['file', $out, 'w'], 2 => ['file', "$dir\\err.txt", 'w']], $pipes);
+    $hwnd = 0;
+    for ($i = 0; $i < 200 && !$hwnd; $i++) {
+        usleep(50000);
+        if (preg_match('/^ready true (\d+)/m', (string)@file_get_contents($out), $m)) $hwnd = (int)$m[1];
+    }
+    $uia = $hwnd ? trim((string)shell_exec('powershell -NoProfile -ExecutionPolicy Bypass -File ' . escapeshellarg("$dir\\q.ps1") . ' ' . $hwnd . ' 2>&1')) : 'no window';
+    touch("$dir\\stop");
+    for ($i = 0; $i < 100 && proc_get_status($proc)['running']; $i++) usleep(100000);
+    if (proc_get_status($proc)['running']) proc_terminate($proc);
+    proc_close($proc);
+    $php = array_values(array_filter(array_map('trim', explode("\n", (string)@file_get_contents($out)))));
+    $php = array_map(fn($l) => preg_replace('/^(ready true) \d+$/', '$1', $l), $php);
+    array_map('unlink', glob("$dir\\*"));
+    @rmdir($dir);
+    $j = json_decode($uia, true);
+    $want = [[['Speichern', 'ControlType.Button', null, null], ['Name', 'ControlType.Edit', 'Hendrik', null], ['Zustimmen', 'ControlType.CheckBox', null, 'On']], 'invoked', 'Gespeichert'];
+    $php = array_values(array_filter($php, fn($l) => $l !== 'action save focus null'));   // UIA focuses before Invoke
+    $win = $j === $want && $php === ['ready true', 'action save click null', 'updated'] ? 'OK' : 'FAIL ' . json_encode([$uia, $php]);
+}
+if ($win === 'n/a' && PHP_OS_FAMILY === 'Windows' && getenv('VIO_REQUIRE_A11Y')) $win = 'FAIL (required)';
+echo "windows $win\n";
+
 /* VIO_REQUIRE_A11Y=1 (Linux CI with AccessKit and AT-SPI): no skip */
 if ($linux === 'n/a' && PHP_OS_FAMILY === 'Linux' && getenv('VIO_REQUIRE_A11Y')) $linux = 'FAIL (required: ' . json_encode(['accessibility' => $avail]) . ')';
 echo "linux $linux\n";
@@ -156,4 +243,5 @@ echo "linux $linux\n";
 contract ValueError ValueError ValueError ValueError ValueError ValueError TypeError TypeError TypeError
 update true
 refs ValueError ValueError ValueError none
+windows %r(OK|n.a)%r
 linux %r(OK|n.a)%r

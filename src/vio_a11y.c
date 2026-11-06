@@ -261,6 +261,7 @@ typedef struct _vio_a11y {
     void           *platform_window;
     void           *adapter;
     int             focused;
+    double          scale;       /* logical -> physical pixels (AccessKit's unit), on the root */
     vio_a11y_request *queue;     /* actions from assistive technology */
     int             queue_count, queue_cap;
 } vio_a11y;
@@ -339,9 +340,13 @@ static int vio_a11y_add(vio_a11y *t, const char *id)
 
 static char *vio_a11y_dup(zend_string *s) { return s ? strdup(ZSTR_VAL(s)) : NULL; }
 
-static struct accesskit_node *vio_a11y_build_node(const vio_a11y_node *n)
+static struct accesskit_node *vio_a11y_build_node(const vio_a11y *t, const vio_a11y_node *n)
 {
     struct accesskit_node *an = accesskit_node_new(vio_a11y_roles[n->role]);
+    if (n->nid == t->root && t->scale > 0.0 && t->scale != 1.0) {
+        struct accesskit_affine m = { { t->scale, 0.0, 0.0, t->scale, 0.0, 0.0 } };
+        accesskit_node_set_transform(an, m);
+    }
     if (n->label) accesskit_node_set_label(an, n->label);
     if (n->value) accesskit_node_set_value(an, n->value);
     if (n->description) accesskit_node_set_description(an, n->description);
@@ -376,7 +381,7 @@ static struct accesskit_tree_update *vio_a11y_build_update(vio_a11y *t, int full
         vio_a11y_node *n = &t->nodes[k];
         if (!full && !n->dirty) continue;
         n->dirty = 0;
-        accesskit_tree_update_push_node(u, n->nid, vio_a11y_build_node(n));
+        accesskit_tree_update_push_node(u, n->nid, vio_a11y_build_node(t, n));
         if (n->value && vio_a11y_is_text_input(n->role)) {
             struct accesskit_node *run = accesskit_node_new(ACCESSKIT_ROLE_TEXT_RUN);
             accesskit_node_set_value(run, n->value);
@@ -489,6 +494,48 @@ static void vio_a11y_adapter_free(vio_a11y *t)
 #define VIO_A11Y_HAS_ADAPTER 1
 #endif
 
+#if defined(_WIN32)
+static void vio_a11y_raise(struct accesskit_windows_queued_events *ev)
+{
+    if (ev) accesskit_windows_queued_events_raise(ev);
+}
+
+static int vio_a11y_adapter_new(vio_a11y *t)
+{
+    HWND hwnd = (HWND)vio_plat()->native_handle(t->platform_window, VIO_NATIVE_HWND);
+    if (!hwnd) return 0;
+    t->adapter = accesskit_windows_adapter_new(hwnd, t->focused != 0, vio_a11y_action, t);
+    if (!t->adapter) return 0;
+    /* tell UIA a tree is there: clients that asked before get it on their next request */
+    NotifyWinEvent(EVENT_OBJECT_CREATE, hwnd, OBJID_CLIENT, CHILDID_SELF);
+    return 1;
+}
+static void vio_a11y_adapter_update(vio_a11y *t)
+{
+    vio_a11y_raise(accesskit_windows_adapter_update_if_active((struct accesskit_windows_adapter *)t->adapter, vio_a11y_changes, t));
+}
+static void vio_a11y_adapter_focus(vio_a11y *t, int focused)
+{
+    vio_a11y_raise(accesskit_windows_adapter_update_window_focus_state((struct accesskit_windows_adapter *)t->adapter, focused != 0));
+}
+static void vio_a11y_adapter_free(vio_a11y *t)
+{
+    accesskit_windows_adapter_free((struct accesskit_windows_adapter *)t->adapter);
+}
+
+int vio_a11y_win32_getobject(struct _vio_input_state *in, uintptr_t wparam, intptr_t lparam, intptr_t *result)
+{
+    vio_a11y *t = in ? (vio_a11y *)in->a11y : NULL;
+    if (!t || !t->adapter) return 0;
+    struct accesskit_opt_lresult r = accesskit_windows_adapter_handle_wm_getobject(
+        (struct accesskit_windows_adapter *)t->adapter, (WPARAM)wparam, (LPARAM)lparam, vio_a11y_activation, t);
+    if (!r.has_value) return 0;
+    *result = (intptr_t)r.value;
+    return 1;
+}
+#define VIO_A11Y_HAS_ADAPTER 1
+#endif
+
 #ifndef VIO_A11Y_HAS_ADAPTER
 static int  vio_a11y_adapter_new(vio_a11y *t) { (void)t; return 0; }
 static void vio_a11y_adapter_update(vio_a11y *t) { (void)t; }
@@ -498,7 +545,9 @@ static void vio_a11y_adapter_free(vio_a11y *t) { (void)t; }
 
 int vio_a11y_available(void)
 {
-#ifdef VIO_A11Y_HAS_ADAPTER
+#if defined(VIO_A11Y_HAS_ADAPTER) && defined(_WIN32)
+    return strcmp(vio_plat()->name, "win32") == 0;   /* the WndProc answers WM_GETOBJECT */
+#elif defined(VIO_A11Y_HAS_ADAPTER)
     return vio_platform_has_windows();
 #else
     return 0;
@@ -525,6 +574,9 @@ int vio_a11y_update(vio_input_state *in, void *platform_window, HashTable *updat
     if (!vio_a11y_available() || !platform_window) { if (list) efree(list); return 0; }
 
     vio_a11y *t = vio_a11y_get(in, platform_window);
+    float sx = 1.0f, sy = 1.0f;
+    if (vio_plat()->get_content_scale) vio_plat()->get_content_scale(platform_window, &sx, &sy);
+    double scale = sx > 0.0f ? (double)sx : 1.0;
     VIO_A11Y_LOCK(&t->lock);
     /* references must resolve in the tree after this update (AccessKit aborts otherwise) */
     const char *bad = NULL;
@@ -594,6 +646,11 @@ int vio_a11y_update(vio_input_state *in, void *platform_window, HashTable *updat
         t->has_root = 1;
     }
     if (focus) t->focus = t->nodes[vio_a11y_find(t, ZSTR_VAL(focus))].nid;
+    if (scale != t->scale && t->has_root) {   /* the root carries the scale */
+        int k = vio_a11y_find_nid(t, t->root);
+        if (k >= 0) t->nodes[k].dirty = 1;
+    }
+    t->scale = scale;
     VIO_A11Y_UNLOCK(&t->lock);
     if (list) efree(list);
 
@@ -663,9 +720,23 @@ void vio_a11y_free(vio_input_state *in)
     free(t);
 }
 
+#if !defined(_WIN32)
+int vio_a11y_win32_getobject(struct _vio_input_state *in, uintptr_t wparam, intptr_t lparam, intptr_t *result)
+{
+    (void)in; (void)wparam; (void)lparam; (void)result;
+    return 0;
+}
+#endif
+
 #else /* !HAVE_ACCESSKIT */
 
 int vio_a11y_available(void) { return 0; }
+
+int vio_a11y_win32_getobject(struct _vio_input_state *in, uintptr_t wparam, intptr_t lparam, intptr_t *result)
+{
+    (void)in; (void)wparam; (void)lparam; (void)result;
+    return 0;
+}
 
 int vio_a11y_update(vio_input_state *in, void *platform_window, HashTable *update, uint32_t arg)
 {
