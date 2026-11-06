@@ -5,7 +5,7 @@
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
 für die PHPolygon Game Engine. Aktuell **v2.30.0**, 272 PHP-Funktionen, 19 Zend-Klassen,
-6 Backends, 277 PHPT-Tests. Releases laufen über semantic-release
+6 Backends, 279 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
 ## Build
@@ -122,7 +122,7 @@ SHADING_RATE_PRIMITIVE,SHADING_RATE_IMAGE,BINDLESS,MESH_SHADER,RAY_QUERY,RAYTRAC
 mit `-d vio.debug=1` (D3D12-Debug-Layer, Vulkan-Validation): mehrere Befunde zeigten sich nur dort. Die
 Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` setzen.
 
-277 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+279 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
@@ -158,6 +158,8 @@ Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONO
 | `tests/render3d/224` | Raw-Readback (`vio_read_render_target($rt, -1, $i, ['raw' => true])`, TEMPORAL-S0): sieben Attachments (RGBA16F, RG16F, R16F, R32F, RGBA8, R11G11B10F, RGB10A2) mit exakt darstellbaren Werten inner- und außerhalb [0, 1], obere Hälfte anders: Bytes bitgenau, oben zuerst wie beim RGBA8-Readback, RGBA8 überall in R, G, B, A. |
 | `tests/render3d/223` | Tiefe eines Farb-Targets sampeln (`vio_render_target_texture($rt, VIO_RT_DEPTH)`, `VIO_FEATURE_RENDER_TARGET_DEPTH_SAMPLE`, TEMPORAL-S0): gleich der Tiefe eines depth_only-Targets aus denselben Draws in derselben Bind-Kette (Farb-Target → MRT → Schatten), im Frame und danach; Re-Bind ohne Clear testet weiter gegen sie; das Schatten-Target bleibt unberührt; MSAA-Targets lehnen ab. |
 | `tests/render3d/222` | MRT mit mehr als vier Attachments (`VIO_MAX_COLOR_ATTACHMENTS` = 8, TEMPORAL-S0): 4 × RGBA16F + RG16F + R8 in einem Draw, Readback je Attachment, das sechste gesampelt; acht RGBA8-Attachments, ein neuntes wird abgelehnt. |
+| `tests/render3d/276` | Render-Target mitten im Frame anlegen, während ein anderes gebunden ist: das gebundene bleibt gebunden, der nächste `vio_clear` landet darin (depth-only 1×1 und Farbe 8×8). OpenGL band nach dem Anlegen des neuen FBO den Default-Framebuffer, der Clear ging auf den Bildschirm; `opengl_create_render_target` stellt jetzt FBO-Bindung, Tiefenmaske und Clear-Farbe des Aufrufers wieder her. Alle Backends. |
+| `tests/render3d/275` | `vio_draw_instanced` in mehreren Kontexten nacheinander (256, dann 1, dann 512 Instanzen, jeder Kontext zerstört): jeder zeichnet. D3D11 hielt den Instanzpuffer in einer Funktions-static, die das Gerät überlebte – der zweite Kontext zeichnete nichts, ein zweites WARP-Gerät ging verloren (`DXGI_ERROR_DEVICE_REMOVED`). Der Puffer liegt jetzt in `vio_d3d11.draw_instance_buf` und wird in `d3d11_shutdown` freigegeben. Alle Backends. |
 | `tests/render3d/260` | Sampler-Units wie auf OpenGL, auf jedem Backend: ein Sampler ohne `vio_set_uniform` liest Unit 0 bzw. sein `layout(binding)`, mehrere Sampler teilen sich eine Unit, eine Textur auf einer Unit, die kein Sampler liest, landet nirgends, ein auf eine andere Unit gesetzter Sampler verlässt die alte; beide Reihenfolgen von Bind und Uniform, je Fall ein frischer Kontext. Vorher lösten D3D11/D3D12/Vulkan Units statt Sampler auf: eine nie benannte Unit ging an den Sampler mit diesem *Index* (Textur auf Unit 0 → erster deklarierter Sampler), ein ungesetzter Sampler las, was sein Slot noch hielt (Code Rescue: FXAA ohne Bloom las die Szene als Bloom). |
 | `tests/render3d/259` | `vio_bind_cubemap` auf beliebiger Unit, auf jedem Backend: ein `samplerCube` neben einem `sampler2D` liest auf Unit 0, 1, 7, 10 und 15 seinen eigenen Cube (aus Face-Daten und aus einem Cube-Target), Bind vor und nach `vio_set_uniform`, je Fall ein frischer Kontext (ein noch gebundener Cube aus einem früheren Fall verdeckte den Fehler). Vulkan gab die rohe GL-Unit an seinen Bind-Slot, der wie bei `vio_bind_texture` den Sampler-Index erwartet: auf jeder anderen Unit las der Cube 0 (Code Rescue: Environment-IBL auf Vulkan schwarz, Unit 10). |
 | `tests/render3d/258` | `vio_clear` im Frame löscht nur das gebundene Ziel und wird nie zum Swapchain-Clear: eine vor `vio_begin` gemerkte Farbe löscht den Bildschirm, obwohl vorher Targets gebunden und weiß/grau gelöscht wurden, auch mit `'present' => true` und einem vor `vio_begin` gebundenen Target; Backends, die jeden Frame löschen (GL, Vulkan, Metal), behalten die gemerkte Farbe über Frames, D3D11/D3D12 löschen nur im Frame nach einem Clear außerhalb. Vorher merkten Vulkan, OpenGL und Metal auch den Clear eines Targets, der nächste Frame löschte den Bildschirm damit (Code Rescue: Schatten-Pass weiß → Bildschirm oben weiß). |
