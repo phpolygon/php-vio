@@ -231,6 +231,12 @@ typedef struct _vio_d3d11_state {
      * (typically off-screen or collapsed to the origin). */
     ID3D11Buffer *identity_instance_buf;
 
+    /* DYNAMIC per-instance matrices of vio_draw_instanced, grown on demand.
+     * Owned by the device: released in shutdown, so a later context never
+     * draws from (or binds) a buffer of a device that is gone. */
+    ID3D11Buffer *draw_instance_buf;
+    UINT          draw_instance_buf_capacity;
+
     /* Readback path for vio_read_pixels.
      *
      * FLIP_DISCARD swapchains lose backbuffer content after Present(), and D3D11
