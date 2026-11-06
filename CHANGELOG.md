@@ -1,3 +1,37 @@
+# [2.41.0](https://github.com/phpolygon/php-vio/compare/v2.40.3...v2.41.0) (2026-11-06)
+
+
+### Bug Fixes
+
+* **platform:** Accept the older AT-SPI name of the button role in the accessibility test ([9648c37](https://github.com/phpolygon/php-vio/commit/9648c3738a49db546fd3bddb553bcebd42548b52))
+* **platform:** Build with MSVC and GLFW 3.3 ([64c4bf4](https://github.com/phpolygon/php-vio/commit/64c4bf47c8908d0188f95855fb70a3e4646e4d27))
+* **platform:** Declare the D3D11 swapchain records before the shutdown uses them ([dd05ae7](https://github.com/phpolygon/php-vio/commit/dd05ae766096824bd3362308e6e9312662bd2684))
+* **platform:** Dismiss test dialogs reliably on Windows ([55b680a](https://github.com/phpolygon/php-vio/commit/55b680af6c1019ad9773b68a07284f9a8e13b7ad))
+* **platform:** Keep the Windows composition window for apps without vio_on_preedit ([0d6c55d](https://github.com/phpolygon/php-vio/commit/0d6c55d2c70e8c0b239bbb966bd331c9cdc3fc38))
+* **platform:** Let the X11 input method show the composition for apps without vio_on_preedit ([f1122ef](https://github.com/phpolygon/php-vio/commit/f1122ef770a4bb83c064bd0d62e06235dcfe61dc))
+* **platform:** Read VIO_TEST_DIALOG from the process environment on Windows ([9a0cc14](https://github.com/phpolygon/php-vio/commit/9a0cc145013fdc8a94c94e17941caab62d55142f))
+
+
+### Features
+
+* **platform:** Accept file drops ([2db0fd0](https://github.com/phpolygon/php-vio/commit/2db0fd007b8fe5a77fbf7d7f606e32fa7515eec8))
+* **platform:** Add an accessibility tree with AccessKit on Linux ([f898c77](https://github.com/phpolygon/php-vio/commit/f898c77f610e0fc66ff5256174889cf3431d2711))
+* **platform:** Add parent and modal windows ([bfce84e](https://github.com/phpolygon/php-vio/commit/bfce84e51ad6cd67130a1a8977d71a07c739652c))
+* **platform:** Cursor shapes, window icon, size limits, opacity, open URL ([ae64b88](https://github.com/phpolygon/php-vio/commit/ae64b88f3ee7916b33ba43309a2a3ecca0f48421))
+* **platform:** Expose the accessibility tree to UI Automation on Windows ([4a52a15](https://github.com/phpolygon/php-vio/commit/4a52a15c9f5c534f01e6b8f335392a5ae66e191a))
+* **platform:** Expose the accessibility tree to VoiceOver on macOS ([d6eda25](https://github.com/phpolygon/php-vio/commit/d6eda25ce401adcc6f47d952c1b17f1689bf2623))
+* **platform:** IME composition on Windows and macOS ([35bede0](https://github.com/phpolygon/php-vio/commit/35bede09dfc68f93da1eb220ae5365dacb83c158))
+* **platform:** IME composition on X11 and Wayland ([99edf6f](https://github.com/phpolygon/php-vio/commit/99edf6fdfd69e16b89a39fad7f7b5b784d97c540))
+* **platform:** Menu bar and context menus ([63fff9c](https://github.com/phpolygon/php-vio/commit/63fff9c1d839783cadc9d46a070f4a11ad68c246))
+* **platform:** Native file dialogs and message boxes ([d3c7af2](https://github.com/phpolygon/php-vio/commit/d3c7af2981f408351fdffe38c25875f26a48f529))
+* **platform:** Notifications, taskbar progress and the Linux file portal ([94cf94d](https://github.com/phpolygon/php-vio/commit/94cf94d097536c6a0c7d50a7ae5ed52a473446a1))
+* **platform:** Open further windows on D3D12 ([1f97010](https://github.com/phpolygon/php-vio/commit/1f970100143b7f0049787b907a7f79e38f985942))
+* **platform:** Open further windows on Metal and D3D11 ([d86431c](https://github.com/phpolygon/php-vio/commit/d86431c4a805731a4b15d2f9b62a8bbe918240d1))
+* **platform:** Open further windows on OpenGL ([511813d](https://github.com/phpolygon/php-vio/commit/511813d94ce524945f246438a999ad4d4ab104f8))
+* **platform:** Open further windows on Vulkan ([97831c4](https://github.com/phpolygon/php-vio/commit/97831c4405e7c47a5729990674be9d869f3baead))
+* **platform:** Tray icon, and notifications on Windows ([f96a9e1](https://github.com/phpolygon/php-vio/commit/f96a9e19900fafb0d79af009b3aed18f4b1cfbd2))
+* **platform:** Wait for events and report window events ([d6065e8](https://github.com/phpolygon/php-vio/commit/d6065e893696f22ac4461753c60c68edaa81945b))
+
 ## [2.40.3](https://github.com/phpolygon/php-vio/compare/v2.40.2...v2.40.3) (2026-11-02)
 
 
