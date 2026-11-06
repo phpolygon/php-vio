@@ -251,10 +251,10 @@ vio_key_pressed($tool, VIO_KEY_A);   // Eingabe-Funktionen nehmen VioContext|Vio
   (braucht Bedienungshilfen-Freigabe → Skip mit Grund), Linux über AT-SPI-D-Bus auf der CI (at-spi2-core installieren).
   Aktion vom Kindprozess (`Invoke`) ruft `vio_on_a11y_action`.
 
-### Phase 6 – System-Webview (Issue #120)
+### Phase 6 – System-Webview (Issue #120) – 🚧 macOS umgesetzt
 
 Webview als Kind eines `VioWindow` (WebView2, WKWebView, WPE WebKit), Custom Scheme → PHP im selben
-Prozess, JS ↔ PHP-Nachrichten; Grundlage für NativePHP-Apps ohne Electron. Plan, Phasen W0–W4 und Tests 277–282 in
+Prozess, JS ↔ PHP-Nachrichten; Grundlage für NativePHP-Apps ohne Electron. Plan, Phasen W0–W4 und Tests 277–283 in
 `WEBVIEW-PLAN.md`.
 
 ## 4. Entscheidungen

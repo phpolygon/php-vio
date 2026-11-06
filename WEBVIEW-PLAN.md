@@ -1,6 +1,6 @@
 # System-Webview – Plan
 
-> **Status:** 📋 geplant (2026-11-06), Issue #120.
+> **Status:** 🚧 W1, W3, W4 auf macOS umgesetzt (2026-11-06, Tests 277–283), Issue #120. Offen: Win32 (WebView2), Linux (WPE).
 > **Baut auf:** `DESKTOP-APP-PLAN.md` Phasen 0–5 (Event-Loop, mehrere Fenster, Menüs, Dialoge, Tray, IME, AccessKit).
 > **Ziel:** NativePHP-Apps (Laravel + Blade/Livewire/Inertia) laufen auf php-vio ohne Electron. php-vio liefert eine
 > System-Webview als Kind eines `VioWindow` und eine Brücke, die Anfragen der Webview im selben Prozess an PHP gibt –
@@ -22,7 +22,7 @@ vio_webview_navigate($wv, 'app://localhost/settings');
 vio_webview_eval($wv, 'window.dispatchEvent(new CustomEvent("native", {detail: 1}))');
 vio_webview_on_message($wv, fn(string $json) => …);          // JS: window.vio.postMessage(wert)
 vio_webview_on_event($wv, fn(string $type, array $data) => …); // navigated, title, new_window, closed
-vio_webview_bounds($wv, $x, $y, $w, $h);
+vio_webview_bounds($wv, [$x, $y, $w, $h]);                   // null: ganzer Client-Bereich
 vio_webview_destroy($wv);
 vio_platform_info()['webview'];                              // bool, mit Grund wie die D-Bus-Fähigkeiten
 ```
@@ -58,7 +58,7 @@ vio_platform_info()['webview'];                              // bool, mit Grund 
   `window.vio.postMessage(v)` → `JSON.stringify` → PHP-String.
 - **Devtools:** WebView2 `AreDevToolsEnabled`, WKWebView `isInspectable` (macOS 13.3+), WPE `enable-developer-extras`.
 
-## 3. Entscheidungen
+## 3. Entscheidungen und Befunde
 
 1. **Linux-Engine: WPE WebKit** (entschieden 2026-11-06). WebKitGTK braucht GTK und dessen Fenster; die X11-/Wayland-
    Plattformen von vio sind kein GTK, und ein GTK-Widget als Kind eines fremden Fensters geht nur unter X11 (GTK3
@@ -67,23 +67,30 @@ vio_platform_info()['webview'];                              // bool, mit Grund 
    auf X11 und Wayland, Webview über GPU-Inhalt ist eingebaut. Kosten: Eingabe-Weiterleitung, Cursor, Zwischenablage und
    Barrierefreiheit verdrahtet vio selbst; Paketlage je Distribution prüft W0. GMainContext wird in `wait_events`
    eingebunden (`g_main_context_query` → FDs in das vorhandene `poll()`, wie `vio_linux_dbus_fd`).
-2. **Herkunft und Cookies** (offen bis W0). Laravel braucht eine stabile, „sichere“ Herkunft für Cookies, `localStorage` und das
-   `XSRF-TOKEN`, das axios (Inertia) aus `document.cookie` liest. Custom Schemes verhalten sich je Engine anders
-   (WebView2 nur mit `TreatAsSecure` + `HasAuthorityComponent`; WKWebView speichert für eigene Schemes keine Cookies
-   im `WKHTTPCookieStore`). Empfehlung: in W0 messen; wo die Engine es nicht kann, führt vio einen Cookie-Speicher je
-   Webview (Set-Cookie der Antwort → Cookie der nächsten Anfrage) und spiegelt nicht-`HttpOnly`-Cookies per Skript in
-   `document.cookie`. WebView2 könnte stattdessen `https://app.localhost` abfangen – eine einheitliche URL über alle
-   Engines ist wichtiger, deshalb überall Custom Scheme.
+2. **Cookies hält vio** (gemessen 2026-11-06). WKWebView speichert für eigene Schemes gar keine Cookies, auch keine aus
+   `document.cookie`; `localStorage` geht. vio führt deshalb auf jeder Engine einen Cookie-Speicher je Webview (nur Sitzung):
+   Set-Cookie einer PHP-Antwort geht dorthin statt an die Engine, jede Anfrage bekommt ihren Cookie-Header von dort, und ein
+   Startskript (`webview_set_script`) stellt `document.cookie` für die nicht-HttpOnly-Cookies bereit (axios liest dort
+   `XSRF-TOKEN`); Zuweisungen aus JS kommen über die Brücke zurück. Überall gleich, auch wo eine Engine es selbst könnte.
+3. **Weiterleitungen folgt vio** (gemessen 2026-11-06). WKWebView gibt `fetch` am Custom Scheme die rohe 302 und zeigt nach
+   einem weitergeleiteten Form-POST eine leere Seite – Laravels Standardantwort auf Formulare. Die private Methode
+   `_willPerformRedirection:newRequest:completionHandler:` bestätigt bei `fetch` nie und bleibt ungenutzt. vio übernimmt die
+   Cookies der Weiterleitung; eine Navigation (die Plattform meldet sie) bekommt eine Seite mit `location.replace(ziel)` –
+   Adresse stimmt danach, Ziel per GET wie nach 303 –, ein `fetch` die Antwort des Ziels über den Handler (GET nach 303 und
+   weitergeleitetem POST, sonst wie gestellt; `Response.url` bleibt die erste URL), höchstens 20.
+4. **Weitere Befunde W0 (WKWebView):** POST-Bodies kommen bei `fetch` als `HTTPBodyStream`, nicht als `HTTPBody`;
+   Streaming und SSE funktionieren am Custom Scheme; 60 MB Antwort und 20 MB Upload gehen; die Webview läuft in einem
+   versteckten (headless) Fenster.
 
 ## 4. Phasen
 
-### W0 – Spike (je Engine ein Wegwerf-Programm)
+### W0 – Spike (je Engine ein Wegwerf-Programm) – ✅ WKWebView (Befunde in Abschnitt 3)
 Beantworten und hier festhalten: POST-Body am Scheme (WKWebView lieferte für `fetch` mit Body zeitweise `nil` →
 `HTTPBodyStream`), Cookies/`localStorage`/`document.cookie` am Custom Scheme, Streaming (mehrere Chunks, SSE),
 Bodies > 50 MB, Redirects (302 mit `Location`), Webview in einem versteckten/headless Fenster (für die CI), WebView2-
 Runtime auf den Windows-Runnern, WPE-Pakete und -Backend auf Ubuntu 24.04 (Xvfb und weston).
 
-### W1 – Win32 und Cocoa
+### W1 – Win32 und Cocoa – ✅ Cocoa
 `vio_webview`, `_navigate`, `_eval`, `_bounds`, `_destroy`, `'schemes'` (Antwort als String, Binärdaten), Nachrichten
 in beide Richtungen, Devtools, Resize folgt dem Fenster, Freigabe mit dem Fenster.
 **Tests:** 277 Vertrag (`vio_platform_info()['webview']`, `false` auf GLFW/null ohne Warnung, Argumentfehler →
@@ -95,14 +102,14 @@ Seite bestätigt). Skip mit Grund ohne Runtime.
 WPE auf X11 und Wayland: Puffer als Textur, Eingabe, Cursor, Zwischenablage und IME durchgereicht; dieselben Tests 277–279 (Xvfb + weston in der CI). Sandbox im Container
 prüfen (`WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS` nur im Test).
 
-### W3 – Laravel-tauglich
+### W3 – Laravel-tauglich – ✅ Cocoa (+ Test 283 Weiterleitungen)
 Streaming-Antworten (`body` als iterable: ein Chunk je Schleifendurchlauf, die Webview bleibt bedienbar), große
 Bodies ohne Komplettkopie, Cookies/Herkunft nach Entscheidung 2, `vio_webview_on_event` (navigated, title, new_window →
 Standard: `vio_open_url`), `'transparent' => true` über GPU-Inhalt.
 **Tests:** 280 Streaming + SSE, 281 Cookies/Session über zwei Anfragen und einen Neustart der Seite, 282 Webview neben
 einem Viewport im selben Fenster (`vio_read_pixels` sieht den GPU-Teil).
 
-### W4 – Beispiel, Doku, Lücken
+### W4 – Beispiel, Doku, Lücken – ✅ bis auf die Folge-Issues
 - `examples/webview_app.php` ohne Laravel (für die CI) und `examples/webview_laravel.php <pfad-zur-app>`: Laravel in
   einem Prozess (`$kernel->handle(Request::create(...))`), keine Laravel-Abhängigkeit im Repo.
 - `vio.stub.php`, CLAUDE.md (API, Testtabelle, nächste freie Nummer), README, Phase 6 in `DESKTOP-APP-PLAN.md`.
