@@ -12,7 +12,7 @@ A PHP extension that brings GPU rendering, audio, video recording, streaming, an
 - **Video Recording** — H.264 encoding via FFmpeg (with VideoToolbox HW acceleration)
 - **Network Streaming** — RTMP and SRT via FFmpeg
 - **Input** — Keyboard, mouse, and gamepad support via GLFW
-- **System Webview** — WKWebView inside a vio window, served by PHP in the same process over a custom scheme (no HTTP server), JS ↔ PHP messages; runs Laravel apps (`examples/webview_laravel.php`). macOS today, Windows (WebView2) and Linux (WPE) next
+- **System Webview** — WKWebView inside a vio window, served by PHP in the same process over a custom scheme (no HTTP server), JS ↔ PHP messages; runs Laravel apps (`examples/webview_laravel.php`). macOS (WKWebView) and Linux (WPE WebKit or WebKitGTK) today, Windows (WebView2) next
 - **Headless Mode** — Offscreen rendering for tests and visual regression testing
 - **Plugin System** — Extensible output/input/filter plugins
 - **Cross-Platform** — macOS, Linux, Windows

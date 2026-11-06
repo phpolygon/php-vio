@@ -1,6 +1,6 @@
 # System-Webview – Plan
 
-> **Status:** 🚧 W1, W3, W4 auf macOS umgesetzt (2026-11-06, Tests 277–283), Issue #120. Offen: Win32 (WebView2), Linux (WPE).
+> **Status:** 🚧 macOS und Linux umgesetzt (2026-11-06, Tests 277–284), Issue #120. Offen: Win32 (WebView2).
 > **Baut auf:** `DESKTOP-APP-PLAN.md` Phasen 0–5 (Event-Loop, mehrere Fenster, Menüs, Dialoge, Tray, IME, AccessKit).
 > **Ziel:** NativePHP-Apps (Laravel + Blade/Livewire/Inertia) laufen auf php-vio ohne Electron. php-vio liefert eine
 > System-Webview als Kind eines `VioWindow` und eine Brücke, die Anfragen der Webview im selben Prozess an PHP gibt –
@@ -46,7 +46,7 @@ vio_platform_info()['webview'];                              // bool, mit Grund 
 |---|---|---|---|
 | Win32 | WebView2 (Evergreen-Runtime) | eigener Loader: Runtime-Pfad aus der Registry (EdgeUpdate `ClientState`), `EmbeddedBrowserWebView.dll` per `LoadLibraryW`; Fallback `WebView2Loader.dll` neben `php.exe` | Controller als Kind des HWND, über der Swapchain |
 | Cocoa | WKWebView | `WebKit.framework` per `dlopen` + `NSClassFromString` (wie `UNUserNotificationCenter`) | Subview der Content-View, über der Metal-Layer-View |
-| X11 / Wayland | WPE WebKit | `libWPEWebKit` + Backend per `dlopen` | Puffer als Textur bzw. Subsurface, Eingaben von vio weitergereicht |
+| X11 / Wayland | WPE WebKit, sonst WebKitGTK 4.1 | `libWPEWebKit-2.0` + `libWPEBackend-fdo-1.0` bzw. `libwebkit2gtk-4.1` per `dlopen` | WPE: SHM-Frames als X11-Kindfenster / Wayland-Subsurface, Eingaben von vio weitergereicht. GTK: X11 umgehängtes GTK-Fenster, Wayland eigenes Fenster, headless `GtkOffscreenWindow` |
 | GLFW, null | – | – | `NULL` |
 
 - **WebView2 ohne SDK zur Build-Zeit** (Grundsatz 5): die benötigten COM-Interfaces (Environment, Controller,
@@ -60,7 +60,7 @@ vio_platform_info()['webview'];                              // bool, mit Grund 
 
 ## 3. Entscheidungen und Befunde
 
-1. **Linux-Engine: WPE WebKit** (entschieden 2026-11-06). WebKitGTK braucht GTK und dessen Fenster; die X11-/Wayland-
+1. **Linux-Engine: WPE WebKit, sonst WebKitGTK** (entschieden 2026-11-06; zuerst nur WPE, dann fiel auf, dass Ubuntu 24.04 und 25.10 kein WPE paketieren – Debian trixie hat beides). WebKitGTK braucht GTK und dessen Fenster; die X11-/Wayland-
    Plattformen von vio sind kein GTK, und ein GTK-Widget als Kind eines fremden Fensters geht nur unter X11 (GTK3
    `GtkPlug`/XEmbed), unter Wayland gar nicht. WPE (`libWPEWebKit` + WPE-Backend, per `dlopen`) rendert ohne Toolkit in
    EGL-/SHM-Puffer; vio zeigt sie als Textur (bzw. Subsurface) und reicht Maus, Tasten, Scrollen und IME durch. Gleich
@@ -98,9 +98,21 @@ in beide Richtungen, Devtools, Resize folgt dem Fenster, Freigabe mit dem Fenste
 Binär-Body, Header, Status 404/302), 279 Brücke (Seite meldet sich per `postMessage`, PHP antwortet per `eval`, die
 Seite bestätigt). Skip mit Grund ohne Runtime.
 
-### W2 – Linux
-WPE auf X11 und Wayland: Puffer als Textur, Eingabe, Cursor, Zwischenablage und IME durchgereicht; dieselben Tests 277–279 (Xvfb + weston in der CI). Sandbox im Container
-prüfen (`WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS` nur im Test).
+### W2 – Linux – ✅ WPE + WebKitGTK, X11 + Wayland
+`src/platform/linux/vio_webview_linux.c`, gemeinsam für X11 und Wayland. Beide Ports haben dieselbe `webkit_*`-API: Scheme,
+Brücke, Ereignisse und Streaming sind einmal geschrieben (eine `WebKitWebContext` je Webview, Schemes als sicher und
+CORS-fähig registriert). GLib hängt in den `poll()`-Schleifen der Plattformen; eine Antwort, die PHP bis zum nächsten Poll nicht
+beendet hat, läuft als Stream über ein Socket-Paar. Navigationen erkennt das Modul an `Upgrade-Insecure-Requests`.
+`VIO_WEBVIEW_ENGINE=wpe|gtk` wählt fest. Befunde:
+- GTK macht in unserem Prozess seinen eigenen GL-/EGL-Kontext aktuell; jede GLib-Auslieferung stellt vios Kontext wieder her.
+- JavaScriptCore übernimmt SIGUSR1 (PHPs Zend-Signals) und meldet das auf stderr; vio gibt das Signal vorher frei.
+- Ohne Barrierefreiheits-Bus bzw. ohne Seat (headless weston) warnt GTK; diese beiden Meldungen werden gefiltert.
+- GTK3 hört auf XInput2 und ignoriert per `XSendEvent` geschickte Core-Ereignisse; Test 284 nutzt deshalb XTest.
+- Ein umgehängtes Override-Redirect-Fenster bekommt keinen Tastaturfokus vom Fenstermanager: ein Klick in die Webview
+  nimmt ihn (beide Engines), ein Klick ins vio-Fenster gibt ihn zurück.
+- Der erste WebKit-Webprozess nach einem Build braucht im Container über 20 s; die Tests warten bis 60 s.
+Nicht automatisch geprüft: sichtbare Webviews unter Wayland (WPE-Subsurface, GTK-Fenster) und Wayland-Eingabe (headless weston
+hat keinen Seat). Tastenwiederholung in einer WPE-Webview unter Wayland fehlt (vios Wiederholung ist clientseitig).
 
 ### W3 – Laravel-tauglich – ✅ Cocoa (+ Test 283 Weiterleitungen)
 Streaming-Antworten (`body` als iterable: ein Chunk je Schleifendurchlauf, die Webview bleibt bedienbar), große
