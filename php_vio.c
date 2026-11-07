@@ -796,6 +796,28 @@ pick_backend:
         if ((val = zend_hash_str_find(options_ht, "headless_hardware", sizeof("headless_hardware") - 1)) != NULL) {
             ctx->config.headless_hardware = zend_is_true(val);
         }
+        /* Adapter choice: a string is part of the adapter's name, an int its position
+         * in vio_adapters()[backend] - resolved to that name through the backend's own
+         * listing, so both count the same way. */
+        if ((val = zend_hash_str_find(options_ht, "adapter", sizeof("adapter") - 1)) != NULL && Z_TYPE_P(val) != IS_NULL) {
+            if (Z_TYPE_P(val) == IS_LONG) {
+                vio_adapter_info *list = (vio_adapter_info *)ecalloc(VIO_MAX_ADAPTERS, sizeof(vio_adapter_info));
+                int n = ctx->backend->enumerate_adapters ? ctx->backend->enumerate_adapters(list, VIO_MAX_ADAPTERS) : 0;
+                zend_long idx = Z_LVAL_P(val);
+                if (idx < 0 || idx >= n) {
+                    efree(list);
+                    php_error_docref(NULL, E_WARNING, "vio_create: adapter %ld not found (%s lists %d)", (long)idx, ctx->backend->name, n);
+                    zval_ptr_dtor(&obj);
+                    VIO_CREATE_FAIL();
+                }
+                snprintf(ctx->config.adapter_name, sizeof(ctx->config.adapter_name), "%s", list[idx].name);
+                efree(list);
+            } else {
+                zend_string *s = zval_get_string(val);
+                snprintf(ctx->config.adapter_name, sizeof(ctx->config.adapter_name), "%s", ZSTR_VAL(s));
+                zend_string_release(s);
+            }
+        }
         /* On-disk shader / pipeline cache directory (GAP-PHASE5 Block 4): DXBC per
          * HLSL stage on D3D11/D3D12, GL program binaries, the Vulkan pipeline
          * cache. Process-wide; absent or '' keeps everything compiled per run. */

@@ -35,7 +35,12 @@
  *                       that runtime (ID3D12SDKConfiguration1::CreateDeviceFactory) instead of the OS
  *                       one - needed for work graphs / SM 6.8+ on most Windows builds;
  *                       agility_sdk_version => the SDK version D3D12Core.dll exports (default: read
- *                       from the DLL). Falls back to the OS runtime with a warning.)
+ *                       from the DLL). Falls back to the OS runtime with a warning,
+ *                       adapter => int|string: the adapter to open - its position in
+ *                       vio_adapters()[backend] or part of its name (case-insensitive, e.g. 'Intel').
+ *                       D3D11, D3D12 and Vulkan; an explicit choice also keeps headless D3D off WARP
+ *                       (choose the software adapter by name for WARP). No match = false with a
+ *                       warning. OpenGL and Metal use the system's device.)
  * @return VioContext|false Context object or false on failure
  */
 function vio_create(string $backend = "auto", array $options = []): VioContext|false {}

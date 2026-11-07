@@ -188,10 +188,35 @@ static int d3d11_init(vio_config *cfg)
     D3D_DRIVER_TYPE driver_type = cfg->headless && !cfg->headless_hardware && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)
         ? D3D_DRIVER_TYPE_WARP
         : D3D_DRIVER_TYPE_HARDWARE;
+    IDXGIAdapter1 *chosen = NULL;
+    if (cfg->adapter_name[0]) {
+        /* Explicit choice ('adapter' option): the first adapter whose name contains it. */
+        IDXGIFactory1 *f1 = NULL;
+        if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) {
+            for (UINT i = 0; IDXGIFactory1_EnumAdapters1(f1, i, &chosen) != DXGI_ERROR_NOT_FOUND; i++) {
+                DXGI_ADAPTER_DESC1 desc;
+                char name[256];
+                IDXGIAdapter1_GetDesc1(chosen, &desc);
+                if (WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, (int)sizeof(name), NULL, NULL) <= 0) name[0] = '\0';
+                if (vio_adapter_name_matches(name, cfg->adapter_name)) {
+                    if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) vio_d3d_load_warp();
+                    break;
+                }
+                IDXGIAdapter1_Release(chosen);
+                chosen = NULL;
+            }
+            IDXGIFactory1_Release(f1);
+        }
+        if (!chosen) {
+            php_error_docref(NULL, E_WARNING, "D3D11: adapter '%s' not found", cfg->adapter_name);
+            return -1;
+        }
+        driver_type = D3D_DRIVER_TYPE_UNKNOWN;
+    }
     if (driver_type == D3D_DRIVER_TYPE_WARP) vio_d3d_load_warp();
 
     hr = D3D11CreateDevice(
-        NULL,                           /* adapter (NULL = default) */
+        (IDXGIAdapter *)chosen,         /* adapter (NULL = default) */
         driver_type,
         NULL,                           /* software module */
         create_flags,
@@ -201,6 +226,7 @@ static int d3d11_init(vio_config *cfg)
         &vio_d3d11.feature_level,
         &vio_d3d11.context
     );
+    if (chosen) IDXGIAdapter1_Release(chosen);
 
     if (FAILED(hr)) {
         php_error_docref(NULL, E_WARNING, "D3D11: Failed to create device (0x%08lx)", hr);

@@ -254,6 +254,9 @@ static int vk_device_modern(VkPhysicalDevice dev)
     return core13 ? 1 : 2;
 }
 
+/* The 'adapter' option of the context being created (vulkan_init), empty = any. */
+static char vk_adapter_wanted[256];
+
 static int select_physical_device(void)
 {
     uint32_t count = 0;
@@ -269,6 +272,11 @@ static int select_physical_device(void)
     /* Pick the first device with the modern core and graphics + present queues */
     int modern_seen = 0;
     for (uint32_t i = 0; i < count; i++) {
+        if (vk_adapter_wanted[0]) {
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(devices[i], &props);
+            if (!vio_adapter_name_matches(props.deviceName, vk_adapter_wanted)) continue;
+        }
         int modern = vk_device_modern(devices[i]);
         if (!modern) continue;
         modern_seen = 1;
@@ -306,6 +314,10 @@ static int select_physical_device(void)
     }
 
     free(devices);
+    if (vk_adapter_wanted[0] && !modern_seen) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: adapter '%s' not found or not suitable", vk_adapter_wanted);
+        return -1;
+    }
     if (!modern_seen)
         php_error_docref(NULL, E_WARNING, "No suitable Vulkan GPU found: vio needs Vulkan 1.3, or 1.2 with "
                          "VK_KHR_dynamic_rendering and VK_KHR_synchronization2 (plus timeline semaphores)");
@@ -2150,7 +2162,7 @@ static void vkc_frame_submitted(void);
 
 static int vulkan_init(vio_config *cfg)
 {
-    (void)cfg;
+    snprintf(vk_adapter_wanted, sizeof(vk_adapter_wanted), "%s", cfg ? cfg->adapter_name : "");
     /* Actual init happens in vio_vulkan_setup_context after window creation */
     return 0;
 }

@@ -1481,7 +1481,27 @@ static int d3d12_init(vio_config *cfg)
      * sampler feedback, VRS tier 2). */
     IDXGIAdapter1 *adapter = NULL;
     const char *hw_env = getenv("VIO_D3D_HEADLESS_HARDWARE");
-    if (cfg->headless && !cfg->headless_hardware && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)) {
+    if (cfg->adapter_name[0]) {
+        /* Explicit choice ('adapter' option): the first adapter whose name contains it. */
+        for (UINT i = 0; IDXGIFactory4_EnumAdapters1(vio_d3d12.factory, i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+            DXGI_ADAPTER_DESC1 desc;
+            char name[256];
+            IDXGIAdapter1_GetDesc1(adapter, &desc);
+            if (WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, (int)sizeof(name), NULL, NULL) <= 0) name[0] = '\0';
+            if (vio_adapter_name_matches(name, cfg->adapter_name)
+                && SUCCEEDED(D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, NULL))) {
+                vio_d3d12.warp = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? 1 : 0;
+                if (vio_d3d12.warp) vio_d3d_load_warp();
+                break;
+            }
+            IDXGIAdapter1_Release(adapter);
+            adapter = NULL;
+        }
+        if (!adapter) {
+            php_error_docref(NULL, E_WARNING, "D3D12: adapter '%s' not found", cfg->adapter_name);
+            goto init_fail;
+        }
+    } else if (cfg->headless && !cfg->headless_hardware && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)) {
         vio_d3d_load_warp();
         vio_d3d12.warp = 1;
         hr = IDXGIFactory4_EnumWarpAdapter(vio_d3d12.factory, &IID_IDXGIAdapter1, (void **)&adapter);
