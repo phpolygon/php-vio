@@ -1,3 +1,13 @@
+# [2.42.0](https://github.com/phpolygon/php-vio/compare/v2.41.1...v2.42.0) (2026-11-07)
+
+
+### Features
+
+* **d3d12:** texture units from the binding tier and the compiler ([05d4ef5](https://github.com/phpolygon/php-vio/commit/05d4ef599ca590c6834e2c7db2f62878cfea978f))
+* **samplers:** sampler tables sized by the backend, any unit may compare ([40bb789](https://github.com/phpolygon/php-vio/commit/40bb789bae3cf99cfe9f961726a45d76c76223b0))
+* **samplers:** vio_texture_units() - the context's units without vio_backend_info's cost ([7698773](https://github.com/phpolygon/php-vio/commit/7698773d037b198045ac3d22e1f852a130bc014c))
+* **samplers:** Vulkan, OpenGL, D3D11 and Metal report their own texture limits ([920373f](https://github.com/phpolygon/php-vio/commit/920373fe26777603afab790c88211716baf4d5d2))
+
 ## [2.41.1](https://github.com/phpolygon/php-vio/compare/v2.41.0...v2.41.1) (2026-11-06)
 
 
