@@ -3674,6 +3674,12 @@ int vio_d3d12_sampler_combo(int filter, int wrap, int anisotropy)
 }
 
 /* SAMPLER-LIMITS-PLAN: the per-stage limits the device's binding tier gives. */
+/* A constant buffer view covers 4096 vec4 registers. */
+static int d3d12_uniform_block_limit(void)
+{
+    return D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+}
+
 static void d3d12_texture_limits(int *textures, int *samplers)
 {
     *textures = vio_d3d12.texture_limit > 0 ? vio_d3d12.texture_limit : 128;
@@ -11378,6 +11384,7 @@ static const vio_backend d3d12_backend = {
     .clip_z_remap      = 1,
     .bind_compare_sampler = d3d12_bind_compare_sampler,
     .texture_limits    = d3d12_texture_limits,
+    .uniform_block_limit = d3d12_uniform_block_limit,
     .create_swapchain  = d3d12_create_swapchain,
     .set_swapchain     = d3d12_set_swapchain,
     .destroy_swapchain = d3d12_destroy_swapchain,
