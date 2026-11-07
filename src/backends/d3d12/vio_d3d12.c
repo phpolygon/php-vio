@@ -725,7 +725,9 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
      * and comparison samplers in one sequence (SAMPLER-LIMITS-PLAN). */
     D3D12_DESCRIPTOR_RANGE srv_range = {0};
     srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srv_range.NumDescriptors = VIO_D3D12_SRV_TABLE_SIZE;
+    /* Tier 2/3: unbounded (each draw's block is as long as its shader needs);
+     * Tier 1: the 16 registers the hardware binds. */
+    srv_range.NumDescriptors = vio_d3d12.bindless ? UINT_MAX : (UINT)vio_d3d12.units;
     srv_range.BaseShaderRegister = 0;
     srv_range.RegisterSpace = 0;
     srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -749,7 +751,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
      * anisotropy / comparison are honoured like on D3D11. */
     D3D12_DESCRIPTOR_RANGE sampler_range = {0};
     sampler_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-    sampler_range.NumDescriptors = VIO_D3D12_SAMPLER_TABLE_SIZE;
+    sampler_range.NumDescriptors = vio_d3d12.bindless ? UINT_MAX : (UINT)vio_d3d12.units;
     sampler_range.BaseShaderRegister = 0;
     sampler_range.RegisterSpace = 0;
     sampler_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -1462,12 +1464,14 @@ static int d3d12_init(vio_config *cfg)
     const char *hw_env = getenv("VIO_D3D_HEADLESS_HARDWARE");
     if (cfg->headless && !cfg->headless_hardware && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)) {
         vio_d3d_load_warp();
+        vio_d3d12.warp = 1;
         hr = IDXGIFactory4_EnumWarpAdapter(vio_d3d12.factory, &IID_IDXGIAdapter1, (void **)&adapter);
         if (FAILED(hr)) {
             php_error_docref(NULL, E_WARNING, "D3D12: WARP adapter not available (0x%08lx)", hr);
             goto init_fail;
         }
     } else {
+        vio_d3d12.warp = 0;
         /* Pick first hardware adapter that supports D3D12 */
         for (UINT i = 0; IDXGIFactory4_EnumAdapters1(vio_d3d12.factory, i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
             DXGI_ADAPTER_DESC1 desc;
@@ -1807,7 +1811,35 @@ static int d3d12_init(vio_config *cfg)
         D3D12_FEATURE_DATA_D3D12_OPTIONS o0 = {0};
         if (SUCCEEDED(d3d12_check_feature(vio_d3d12.device, D3D12_FEATURE_D3D12_OPTIONS, &o0, sizeof(o0))))
             vio_d3d12.bindless = o0.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2;
+        /* Texture registers per draw (SAMPLER-LIMITS-PLAN), from the hardware:
+         * Tier 1 binds 16 samplers / 128 SRVs per stage; Tier 2/3 index the
+         * descriptor heaps, so a draw's sampler block is bounded by one frame's
+         * slice of the 2048-entry shader-visible sampler heap (D3D12's own
+         * limit; the rest of it holds bundle tables and the other frames). */
+        if (o0.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2) {
+            vio_d3d12.units = (int)((VIO_D3D12_SAMPLER_HEAP_CAPACITY - VIO_D3D12_BUNDLE_SAMPLER_RESERVE) / vio_d3d12.frame_count);
+            vio_d3d12.texture_limit = (int)(VIO_D3D12_MAX_SRV_DESCRIPTORS / vio_d3d12.frame_count);
+        } else {
+            vio_d3d12.units = D3D12_COMMONSHADER_SAMPLER_SLOT_COUNT;
+            vio_d3d12.texture_limit = D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+        }
     }
+    /* FXC (Shader Model 5.1) numbers sampler registers 0..15 only (X4510); DXC
+     * (Shader Model 6) indexes the heap - the compiler in use is part of the limit. */
+    if (vio_d3d12.shader_model != 6 && vio_d3d12.units > D3D12_COMMONSHADER_SAMPLER_SLOT_COUNT)
+        vio_d3d12.units = D3D12_COMMONSHADER_SAMPLER_SLOT_COUNT;
+    /* WARP reports Tier 3 but faults (access violation while executing the list)
+     * once a pixel shader reads more than 128 texture registers - unless the
+     * debug layer is on. Its working limit is the Tier 1 SRV count. */
+    if (vio_d3d12.warp && vio_d3d12.units > D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+        vio_d3d12.units = D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+        vio_d3d12.texture_limit = D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+    }
+    vio_d3d12.pending_srvs = calloc((size_t)vio_d3d12.units, sizeof(D3D12_CPU_DESCRIPTOR_HANDLE));
+    vio_d3d12.pending_srv_valid = calloc((size_t)vio_d3d12.units, sizeof(int));
+    vio_d3d12.pending_samplers = calloc((size_t)vio_d3d12.units, sizeof(int));
+    vio_d3d12.pending_high = 0;
+    if (!vio_d3d12.pending_srvs || !vio_d3d12.pending_srv_valid || !vio_d3d12.pending_samplers) goto init_fail;
 
     /* Sampler feedback: WriteSamplerFeedback is SM 6.5 (DXC), the feedback map
      * needs ID3D12Device8::CreateCommittedResource2 and Tier 0.9; root
@@ -1895,7 +1927,7 @@ static int d3d12_init(vio_config *cfg)
              * keep the LOWEST handle as the block start. */
             D3D12_CPU_DESCRIPTOR_HANDLE lowest = first_cpu;
             int ok = 1;
-            for (int i = 1; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
+            for (int i = 1; i < vio_d3d12.units; i++) {
                 D3D12_CPU_DESCRIPTOR_HANDLE c; D3D12_GPU_DESCRIPTOR_HANDLE g;
                 if (d3d12_alloc_srv_descriptor(&c, &g) == UINT_MAX) { ok = 0; break; }
                 if (c.ptr < lowest.ptr) lowest = c;
@@ -1906,7 +1938,7 @@ static int d3d12_init(vio_config *cfg)
                 null_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                 null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
                 null_srv.Texture2D.MipLevels = 1;
-                for (int i = 0; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
+                for (int i = 0; i < vio_d3d12.units; i++) {
                     D3D12_CPU_DESCRIPTOR_HANDLE h = { lowest.ptr + (SIZE_T)i * vio_d3d12.srv_heap.descriptor_size };
                     ID3D12Device_CreateShaderResourceView(vio_d3d12.device, NULL, &null_srv, h);
                 }
@@ -2118,6 +2150,13 @@ static vio_d3d12_swapchain *d3d12_cur_sc;   /* NULL: the main window's fields ar
 
 static void d3d12_shutdown(void)
 {
+    free(vio_d3d12.pending_srvs);
+    free(vio_d3d12.pending_srv_valid);
+    free(vio_d3d12.pending_samplers);
+    vio_d3d12.pending_srvs = NULL;
+    vio_d3d12.pending_srv_valid = NULL;
+    vio_d3d12.pending_samplers = NULL;
+    vio_d3d12.pending_high = 0;
     if (!vio_d3d12.initialized) return;
 
     /* Wait for GPU to finish all work */
@@ -3180,6 +3219,7 @@ static void *d3d12_create_pipeline(vio_pipeline_desc *desc)
     pipeline->has_gs = shader->gs_blob != NULL;
     pipeline->writes_shading_rate = shader->writes_shading_rate;
     pipeline->uses_bindless = shader->uses_bindless;
+    pipeline->tex_regs = shader->tex_regs;
     pipeline->uses_draw_params = shader->uses_draw_params;
     pipeline->uses_feedback = shader->uses_feedback;
     pipeline->has_hs = shader->hs_blob != NULL;
@@ -3633,23 +3673,29 @@ int vio_d3d12_sampler_combo(int filter, int wrap, int anisotropy)
     return (a * 3 + w) * 2 + f;
 }
 
+/* SAMPLER-LIMITS-PLAN: the per-stage limits the device's binding tier gives. */
+static void d3d12_texture_limits(int *textures, int *samplers)
+{
+    *textures = vio_d3d12.texture_limit > 0 ? vio_d3d12.texture_limit : 128;
+    *samplers = vio_d3d12.units > 0 ? vio_d3d12.units : 16;
+}
+
 /* A sampler*Shadow at `slot`: the comparison combo instead of the texture's own. */
 static void d3d12_bind_compare_sampler(void *texture, int slot)
 {
     (void)texture;
-    if (slot < 0 || slot >= VIO_D3D12_SAMPLER_TABLE_SIZE) return;
+    if (slot < 0 || slot >= vio_d3d12.units || !vio_d3d12.pending_samplers) return;
     vio_d3d12.pending_samplers[slot] = VIO_D3D12_SAMPLER_COMBO_COMPARE;
 }
 
 void vio_d3d12_bind_srv_slot(D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu, int slot, int sampler_index)
 {
-    if (slot < 0 || slot >= VIO_D3D12_SRV_TABLE_SIZE) return;
+    if (slot < 0 || slot >= vio_d3d12.units || !vio_d3d12.pending_srvs) return;
     vio_d3d12.pending_srvs[slot] = srv_cpu;
     vio_d3d12.pending_srv_valid[slot] = 1;
-    if (slot < VIO_D3D12_SAMPLER_TABLE_SIZE) {
-        if (sampler_index < 0 || sampler_index >= VIO_D3D12_SAMPLER_COMBOS) sampler_index = 0;
-        vio_d3d12.pending_samplers[slot] = sampler_index;
-    }
+    if (slot >= vio_d3d12.pending_high) vio_d3d12.pending_high = slot + 1;
+    if (sampler_index < 0 || sampler_index >= VIO_D3D12_SAMPLER_COMBOS) sampler_index = 0;
+    vio_d3d12.pending_samplers[slot] = sampler_index;
 }
 
 void vio_d3d12_bind_graphics_heaps(ID3D12GraphicsCommandList *list)
@@ -7203,6 +7249,14 @@ static void *d3d12_compile_shader(vio_shader_desc *desc)
 
     /* Bindless table: SPIRV-Cross keeps Set 1 in register space 1. */
     shader->uses_draw_params = hlsl_vs && strstr(hlsl_vs, "SPIRV_Cross_VertexInfo") != NULL;
+    /* Texture registers of the whole shader (one table for every stage):
+     * the highest planned register + 1 (SAMPLER-LIMITS-PLAN). */
+    {
+        const vio_sampler_plan *pl = vio_sampler_plan_current();
+        int regs = 0;
+        if (pl) for (int i = 0; i < pl->count; i++) if (pl->reg[i] + 1 > regs) regs = pl->reg[i] + 1;
+        shader->tex_regs = regs;
+    }
     shader->uses_bindless = (hlsl_vs && (strstr(hlsl_vs, "space1)") || strstr(hlsl_vs, "space3)") || strstr(hlsl_vs, "space4)")))
                          || (hlsl_ps && (strstr(hlsl_ps, "space1)") || strstr(hlsl_ps, "space3)") || strstr(hlsl_ps, "space4)")));
     shader->uses_feedback = hlsl_ps && strstr(hlsl_ps, "FeedbackTexture2D") != NULL;
@@ -7692,8 +7746,7 @@ static void d3d12_begin_frame(void)
     vio_d3d12.srv_frame_capacity = perframe_total / vio_d3d12.frame_count;
     vio_d3d12.srv_frame_base     = vio_d3d12.frame_index * vio_d3d12.srv_frame_capacity;
     vio_d3d12.srv_frame_offset   = vio_d3d12.srv_frame_base;
-    memset(vio_d3d12.pending_srv_valid, 0, sizeof(vio_d3d12.pending_srv_valid));
-    memset(vio_d3d12.pending_samplers, 0, sizeof(vio_d3d12.pending_samplers));
+    vio_d3d12_pending_reset();
     /* The per-frame SRV ring just rebased: last frame's cached descriptor block
      * lives in (possibly) the other in-flight frame's region, so its GPU handle
      * is stale. Force the first flush of THIS frame to rebuild. */
@@ -10597,7 +10650,7 @@ static void d3d12_set_uniform(const char *name, const void *data, int count, int
 
 static void d3d12_bind_texture(void *texture, int slot)
 {
-    if (!texture || slot < 0 || slot >= VIO_D3D12_SRV_TABLE_SIZE) return;
+    if (!texture || slot < 0 || slot >= vio_d3d12.units) return;
     vio_d3d12_texture *tex = (vio_d3d12_texture *)texture;
 
     /* Store pending binding (+ the texture's sampler combo for s<slot>) —
@@ -10634,15 +10687,63 @@ static void d3d12_set_sampler_tables(D3D12_GPU_DESCRIPTOR_HANDLE gpu)
     if (p->has_ds) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(vio_d3d12.cmd_list, VIO_D3D12_RP_DS_SAMPLER, gpu);
 }
 
-static void d3d12_flush_sampler_table(void)
+/* Length of the block the next draw needs: the bound pipeline's registers or the
+ * highest bound register, whichever is larger; a block of at most
+ * VIO_D3D12_SRV_TABLE_SIZE registers is always that size, so small shaders keep
+ * the deduplicated, cached path (SAMPLER-LIMITS-PLAN). */
+static int d3d12_table_len(void)
+{
+    int n = vio_d3d12.pending_high;
+    if (d3d12_current_pipeline && d3d12_current_pipeline->tex_regs > n) n = d3d12_current_pipeline->tex_regs;
+    if (n > vio_d3d12.units) n = vio_d3d12.units;
+    return n <= VIO_D3D12_SRV_TABLE_SIZE ? VIO_D3D12_SRV_TABLE_SIZE : n;
+}
+
+void vio_d3d12_pending_reset(void)
+{
+    if (vio_d3d12.pending_srv_valid) memset(vio_d3d12.pending_srv_valid, 0, (size_t)vio_d3d12.units * sizeof(int));
+    if (vio_d3d12.pending_samplers) memset(vio_d3d12.pending_samplers, 0, (size_t)vio_d3d12.units * sizeof(int));
+    vio_d3d12.pending_high = 0;
+}
+
+static void d3d12_flush_sampler_table(int len)
 {
     if (!vio_d3d12.sampler_heap || !vio_d3d12.sampler_combo_heap) return;
 
-    int combos[VIO_D3D12_SAMPLER_TABLE_SIZE];
-    for (int i = 0; i < VIO_D3D12_SAMPLER_TABLE_SIZE; i++) {
-        combos[i] = vio_d3d12.pending_srv_valid[i] ? vio_d3d12.pending_samplers[i] : 0;
+    if (len > VIO_D3D12_SAMPLER_TABLE_SIZE) {
+        /* A large shader: its own block, not cached, not recordable in a bundle. */
+        if (d3d12_brec) { d3d12_brec_fail(); return; }
+        UINT base = vio_d3d12.sampler_frame_offset;
+        UINT region_end = vio_d3d12.sampler_frame_base + vio_d3d12.sampler_frame_capacity;
+        if (base + (UINT)len > region_end) {
+            if (vio_d3d12.sampler_table_bound) d3d12_set_sampler_tables(vio_d3d12.sampler_table_gpu);
+            return;
+        }
+        vio_d3d12.sampler_frame_offset += (UINT)len;
+        D3D12_CPU_DESCRIPTOR_HANDLE dst_cpu, combo_base;
+        D3D12_GPU_DESCRIPTOR_HANDLE dst_gpu;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.sampler_heap, &dst_cpu);
+        ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.sampler_heap, &dst_gpu);
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.sampler_combo_heap, &combo_base);
+        dst_cpu.ptr += (SIZE_T)base * vio_d3d12.sampler_descriptor_size;
+        dst_gpu.ptr += (UINT64)base * vio_d3d12.sampler_descriptor_size;
+        for (int i = 0; i < len; i++) {
+            int combo = vio_d3d12.pending_srv_valid[i] ? vio_d3d12.pending_samplers[i] : 0;
+            D3D12_CPU_DESCRIPTOR_HANDLE src = { combo_base.ptr + (SIZE_T)combo * vio_d3d12.sampler_descriptor_size };
+            D3D12_CPU_DESCRIPTOR_HANDLE dst = { dst_cpu.ptr + (SIZE_T)i * vio_d3d12.sampler_descriptor_size };
+            ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, 1, dst, src, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        }
+        d3d12_set_sampler_tables(dst_gpu);
+        vio_d3d12.sampler_table_gpu = dst_gpu;
+        /* Not in the cache: the next small set must not match it. */
+        vio_d3d12.sampler_table_bound = 0;
+        return;
     }
 
+    int combos[VIO_D3D12_SAMPLER_TABLE_SIZE];
+    for (int i = 0; i < VIO_D3D12_SAMPLER_TABLE_SIZE; i++) {
+        combos[i] = (i < vio_d3d12.units && vio_d3d12.pending_srv_valid[i]) ? vio_d3d12.pending_samplers[i] : 0;
+    }
     /* Recording a bundle: a table outside the frame rings. */
     if (d3d12_brec) {
         D3D12_GPU_DESCRIPTOR_HANDLE g;
@@ -10719,14 +10820,19 @@ static void d3d12_flush_sampler_table(void)
 /* Flush pending texture bindings into a contiguous SRV descriptor block */
 void vio_d3d12_flush_srv_table(void)
 {
+    if (!vio_d3d12.pending_srv_valid) return;
     int any_bound = 0;
-    for (int i = 0; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
+    for (int i = 0; i < vio_d3d12.pending_high; i++) {
         if (vio_d3d12.pending_srv_valid[i]) { any_bound = 1; break; }
     }
     if (!any_bound) return; /* no textures — skip descriptor table binding entirely */
 
+    int n = d3d12_table_len();
+    int is_small = n <= VIO_D3D12_SRV_TABLE_SIZE;
+
     /* Samplers first: independent ring + cache, cheap when the set repeats. */
-    d3d12_flush_sampler_table();
+    d3d12_flush_sampler_table(n);
+    if (!is_small && d3d12_brec) return;   /* d3d12_brec_fail ran: a large set is not recordable */
 
     /* VIO_D3D12_NO_SRV_DEDUP=1 forces the per-draw rebuild (A/B diagnostic toggle,
      * probed once). Both paths are pixel-identical; this isolates the dedup's win. */
@@ -10745,11 +10851,12 @@ void vio_d3d12_flush_srv_table(void)
      * GPU handle and skip the 16-descriptor rebuild. Content-based, so it is
      * correct regardless of which caller populated pending_srvs (3D draw paths,
      * instanced path, or the 2D batch renderer writing pending_srvs directly). */
-    if (!s_dedup_disabled && vio_d3d12.srv_table_bound) {
+    if (!s_dedup_disabled && is_small && vio_d3d12.srv_table_bound) {
         int same = 1;
         for (int i = 0; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
-            if (vio_d3d12.pending_srv_valid[i] != vio_d3d12.srv_flushed_valid[i] ||
-                vio_d3d12.pending_srvs[i].ptr != vio_d3d12.srv_flushed[i].ptr) {
+            int pv = i < vio_d3d12.units ? vio_d3d12.pending_srv_valid[i] : 0;
+            if (pv != vio_d3d12.srv_flushed_valid[i] ||
+                (pv && vio_d3d12.pending_srvs[i].ptr != vio_d3d12.srv_flushed[i].ptr)) {
                 same = 0;
                 break;
             }
@@ -10765,11 +10872,11 @@ void vio_d3d12_flush_srv_table(void)
      * heap) so we can't bleed into another frame's slice. */
     UINT base_idx = vio_d3d12.srv_frame_offset;
     UINT region_end = vio_d3d12.srv_frame_base + vio_d3d12.srv_frame_capacity;
-    if (base_idx + VIO_D3D12_SRV_TABLE_SIZE > region_end) {   /* out of space in this frame's region */
+    if (base_idx + (UINT)n > region_end) {   /* out of space in this frame's region */
         if (d3d12_brec) d3d12_brec_fail();                      /* the bundle's range: record it again larger */
         return;
     }
-    vio_d3d12.srv_frame_offset += VIO_D3D12_SRV_TABLE_SIZE;
+    vio_d3d12.srv_frame_offset += (UINT)n;
 
     D3D12_CPU_DESCRIPTOR_HANDLE dst_cpu;
     D3D12_GPU_DESCRIPTOR_HANDLE dst_gpu;
@@ -10781,10 +10888,10 @@ void vio_d3d12_flush_srv_table(void)
     /* Null-initialise the block (one copy of the pre-built null block — GAP-PLAN
      * 4.3), then overwrite the bound slots. */
     if (vio_d3d12.null_srv_block_valid) {
-        ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, VIO_D3D12_SRV_TABLE_SIZE,
+        ID3D12Device_CopyDescriptorsSimple(vio_d3d12.device, (UINT)n,
             dst_cpu, vio_d3d12.null_srv_block, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     } else {
-        for (int i = 0; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
+        for (int i = 0; i < n; i++) {
             D3D12_CPU_DESCRIPTOR_HANDLE slot_cpu = dst_cpu;
             slot_cpu.ptr += i * vio_d3d12.srv_heap.descriptor_size;
             D3D12_SHADER_RESOURCE_VIEW_DESC null_srv = {0};
@@ -10797,7 +10904,7 @@ void vio_d3d12_flush_srv_table(void)
     }
 
     /* Overwrite bound slots with actual texture SRVs */
-    for (int i = 0; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
+    for (int i = 0; i < n && i < vio_d3d12.units; i++) {
         if (vio_d3d12.pending_srv_valid[i] && vio_d3d12.pending_srvs[i].ptr) {
             D3D12_CPU_DESCRIPTOR_HANDLE slot_cpu = dst_cpu;
             slot_cpu.ptr += i * vio_d3d12.srv_heap.descriptor_size;
@@ -10813,9 +10920,14 @@ void vio_d3d12_flush_srv_table(void)
      * fast-path above (valid until begin_frame rebases the ring or a pipeline
      * bind resets root param 2). */
     vio_d3d12.srv_table_gpu = dst_gpu;
-    memcpy(vio_d3d12.srv_flushed, vio_d3d12.pending_srvs, sizeof(vio_d3d12.srv_flushed));
-    memcpy(vio_d3d12.srv_flushed_valid, vio_d3d12.pending_srv_valid, sizeof(vio_d3d12.srv_flushed_valid));
-    vio_d3d12.srv_table_bound = 1;
+    if (is_small) {
+        for (int i = 0; i < VIO_D3D12_SRV_TABLE_SIZE; i++) {
+            int in = i < vio_d3d12.units;
+            vio_d3d12.srv_flushed[i] = in ? vio_d3d12.pending_srvs[i] : (D3D12_CPU_DESCRIPTOR_HANDLE){0};
+            vio_d3d12.srv_flushed_valid[i] = in ? vio_d3d12.pending_srv_valid[i] : 0;
+        }
+    }
+    vio_d3d12.srv_table_bound = is_small;
 }
 
 static void d3d12_set_viewport(int x, int y, int width, int height)
@@ -11265,6 +11377,7 @@ static const vio_backend d3d12_backend = {
     .rt_origin_top     = 1,
     .clip_z_remap      = 1,
     .bind_compare_sampler = d3d12_bind_compare_sampler,
+    .texture_limits    = d3d12_texture_limits,
     .create_swapchain  = d3d12_create_swapchain,
     .set_swapchain     = d3d12_set_swapchain,
     .destroy_swapchain = d3d12_destroy_swapchain,

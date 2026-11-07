@@ -653,7 +653,7 @@ void vio_2d_flush(vio_2d_state *state)
                 current_tex = item->backend_texture;
                 if (current_tex) {
                     vio_d3d12_texture *dtex = (vio_d3d12_texture *)current_tex;
-                    memset(vio_d3d12.pending_srv_valid, 0, sizeof(vio_d3d12.pending_srv_valid));
+                    vio_d3d12_pending_reset();
                     vio_d3d12_bind_srv_slot(dtex->srv_cpu, 0, dtex->sampler_index);
                     vio_d3d12_flush_srv_table();
                 }

@@ -16091,7 +16091,7 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
             if (idx >= 0) hlsl_slot = idx < sh->sampler_count ? sh->sampler_hlsl_reg[idx] : idx;
             if (idx >= 0 && idx < sh->sampler_count && sh->sampler_is_depth[idx]) cube_compare = 1;
         }
-        if (hlsl_slot < 0 || hlsl_slot >= VIO_D3D12_SRV_TABLE_SIZE) return;
+        if (hlsl_slot < 0 || hlsl_slot >= vio_d3d12.units) return;
         D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
         srv_cpu.ptr = cm->d3d12_srv_cpu;
         /* Cubemaps sample LINEAR / CLAMP (trilinear when mipmapped) like on

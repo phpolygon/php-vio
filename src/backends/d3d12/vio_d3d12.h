@@ -49,6 +49,11 @@
 #define VIO_D3D12_FRAME_COUNT_DEFAULT 2
 #define VIO_D3D12_MAX_SRV_DESCRIPTORS 32768
 
+/* Size of the SMALL per-draw table (SAMPLER-LIMITS-PLAN): a draw whose shader
+ * reads at most this many texture registers gets a block of exactly this size,
+ * deduplicated and cached like before; a larger shader gets a block of its own
+ * register count (up to vio_d3d12.units, the backend's real limit), uncached.
+ * Former meaning: */
 /* Size of the per-draw SRV descriptor table (root param [2], registers t0..tN-1).
  * Must cover the highest texture register any shader binds. The mesh shader uses
  * t0 (albedo) plus four sampler2DShadow at t4..t7 (SPIRV-Cross assigns depth
@@ -144,6 +149,7 @@ typedef struct _vio_d3d12_shader {
     int       uses_bindless;         /* reads the bindless table (register space 1, BINDLESS-PLAN.md) */
     int       uses_draw_params;      /* reads gl_BaseVertex / gl_BaseInstance from the b13 root constants */
     int       uses_feedback;         /* the pixel stage writes a FeedbackTexture2D (u0, space2) */
+    int       tex_regs;              /* texture registers the shader reads (highest + 1, sampler plan) */
 } vio_d3d12_shader;
 
 /* Pipeline = PSO + root signature reference */
@@ -176,6 +182,7 @@ typedef struct _vio_d3d12_pipeline {
     int                      uses_bindless;    /* the shader reads the bindless table */
     int                      uses_draw_params; /* the vertex stage reads the draw-parameter root constants */
     int                      uses_feedback;    /* the pixel stage writes sampler feedback */
+    int                      tex_regs;         /* from the shader: per-draw table length */
 } vio_d3d12_pipeline;
 
 /* Buffer wrapper */
@@ -585,11 +592,19 @@ typedef struct _vio_d3d12_state {
     int latency_wait_skip;  /* the last frame was not presented: no frame-latency wait */
 
     /* Pending texture bindings (flushed before each draw into a contiguous SRV block) */
-    D3D12_CPU_DESCRIPTOR_HANDLE pending_srvs[VIO_D3D12_SRV_TABLE_SIZE]; /* CPU handles of bound textures */
-    int                          pending_srv_valid[VIO_D3D12_SRV_TABLE_SIZE]; /* 1 if slot has a texture */
+    /* Texture registers one draw can use (SAMPLER-LIMITS-PLAN): Resource
+     * Binding Tier 1 = 16 (its sampler limit), Tier 2/3 = what one frame's slice
+     * of the 2048-entry shader-visible sampler heap holds. The pending tables
+     * have this many entries. */
+    int                          units;
+    int                          texture_limit; /* SRVs one stage can bind (vio_backend_info) */
+    int                          warp;          /* the device runs on WARP (software rasterizer) */
+    int                          pending_high;  /* highest bound register + 1 */
+    D3D12_CPU_DESCRIPTOR_HANDLE *pending_srvs;      /* CPU handles of bound textures */
+    int                         *pending_srv_valid; /* 1 if slot has a texture */
     /* Sampler combo index bound at register s0..s7 (parallel to pending_srvs
      * for t0..t7). Written by d3d12_bind_texture / vio_d3d12_bind_srv_slot. */
-    int                          pending_samplers[VIO_D3D12_SAMPLER_TABLE_SIZE];
+    int                         *pending_samplers;
 
     /* Sampler heaps (GAP-PLAN Phase 1). sampler_combo_heap is CPU-only and
      * holds every filter x wrap x anisotropy combination once; sampler_heap is
@@ -788,6 +803,8 @@ int  vio_d3d12_sampler_combo(int filter, int wrap, int anisotropy);
  * register `slot` for the next draw. The one entry point for every caller that
  * used to poke pending_srvs[] directly (cubemaps, the 2D batch). */
 void vio_d3d12_bind_srv_slot(D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu, int slot, int sampler_index);
+/* Clear the pending texture / sampler tables (frame start, the 2D batch). */
+void vio_d3d12_pending_reset(void);
 
 /* SetDescriptorHeaps with BOTH graphics heaps (CBV/SRV/UAV + sampler). Every
  * place that (re)binds the graphics root signature must use this — a
