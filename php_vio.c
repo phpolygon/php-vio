@@ -9325,6 +9325,20 @@ ZEND_FUNCTION(vio_pop_scissor)
     vio_2d_pop_scissor(&ctx->state_2d);
 }
 
+/* SAMPLER-LIMITS-PLAN: the context's texture units, cheap (no backend query). */
+ZEND_FUNCTION(vio_texture_units)
+{
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    array_init(return_value);
+    add_assoc_long(return_value, "units", ctx->texture_units);
+    add_assoc_long(return_value, "textures", ctx->texture_limit);
+    add_assoc_long(return_value, "sampler_states", ctx->sampler_limit);
+}
+
 ZEND_FUNCTION(vio_backend_name)
 {
     zval *ctx_zval;

@@ -1221,6 +1221,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_backend_name, 0, 1, IS_STRIN
 	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_texture_units, 0, 1, IS_ARRAY, 0)
+	ZEND_ARG_OBJ_INFO(0, context, VioContext, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_backend_count, 0, 0, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
@@ -1639,6 +1643,7 @@ ZEND_FUNCTION(vio_gamepad_buttons);
 ZEND_FUNCTION(vio_gamepad_axes);
 ZEND_FUNCTION(vio_gamepad_triggers);
 ZEND_FUNCTION(vio_backend_name);
+ZEND_FUNCTION(vio_texture_units);
 ZEND_FUNCTION(vio_backend_count);
 ZEND_FUNCTION(vio_backends);
 ZEND_FUNCTION(vio_platform);
@@ -1913,6 +1918,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_gamepad_axes, arginfo_vio_gamepad_axes)
 	ZEND_FE(vio_gamepad_triggers, arginfo_vio_gamepad_triggers)
 	ZEND_FE(vio_backend_name, arginfo_vio_backend_name)
+	ZEND_FE(vio_texture_units, arginfo_vio_texture_units)
 	ZEND_FE(vio_backend_count, arginfo_vio_backend_count)
 	ZEND_FE(vio_backends, arginfo_vio_backends)
 	ZEND_FE(vio_platform, arginfo_vio_platform)

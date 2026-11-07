@@ -1736,6 +1736,17 @@ function vio_upscaler_render_size(VioContext $context, int $provider, int $quali
 function vio_backend_name(VioContext $context): string {}
 
 /**
+ * Texture units of the context (SAMPLER-LIMITS-PLAN), without the cost of
+ * vio_backend_info(): ['units' => texture units one shader stage can bind (any
+ * of them may sample comparing), 'textures' => the backend's per-stage texture
+ * limit, 'sampler_states' => its per-stage sampler limit]. The same values as
+ * vio_backend_info()['samplers'].
+ *
+ * @return array{units: int, textures: int, sampler_states: int}
+ */
+function vio_texture_units(VioContext $context): array {}
+
+/**
  * Get the number of registered backends.
  */
 function vio_backend_count(): int {}

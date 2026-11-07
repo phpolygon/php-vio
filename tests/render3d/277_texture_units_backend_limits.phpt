@@ -30,6 +30,8 @@ function run_backend(string $name, array $opts = []): string {
     $s = vio_backend_info($ctx)['samplers'];
     $units = $s['total'];
     if ($units < 16 || $s['textures'] < $units || $s['sampler_states'] < $units) { vio_destroy($ctx); return "FAIL: limits " . json_encode($s); }
+    $tu = vio_texture_units($ctx);
+    if ($tu !== ['units' => $units, 'textures' => $s['textures'], 'sampler_states' => $s['sampler_states']]) { vio_destroy($ctx); return "FAIL: vio_texture_units " . json_encode($tu); }
     $n = min(40, $units);
     $fail = [];
 
