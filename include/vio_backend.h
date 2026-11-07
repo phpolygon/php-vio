@@ -535,10 +535,16 @@ typedef struct _vio_backend {
      * stage to the API's [0, w] (D3D, Vulkan, Metal since 2.40): the depth buffer
      * then holds (ndc_z + 1) / 2 on every backend, as on OpenGL. */
     int         clip_z_remap;
-    /* First register of the comparison samplers when the backend splits the 16
-     * per-stage samplers (VIO_SHADOW_SAMPLER_BASE on D3D12 and Vulkan), 0 when
-     * regular and comparison samplers share them. vio_backend_info()['samplers']. */
-    int         shadow_sampler_base;
+    /* Bind the comparison sampler state at `slot` for the texture just bound
+     * there (a sampler*Shadow in the shader). NULL when the backend picks it
+     * itself from the shader (Vulkan, Metal, OpenGL). SAMPLER-LIMITS-PLAN. */
+    void        (*bind_compare_sampler)(void *texture, int slot);
+    /* Textures and sampler states ONE shader stage can bind in the backend's
+     * binding model - the driver's / hardware's limits, not vio's
+     * (SAMPLER-LIMITS-PLAN). The context's texture units are the smaller of
+     * the two (the API couples a texture and its sampler per unit). NULL =
+     * 16 / 16. */
+    void        (*texture_limits)(int *textures, int *samplers);
     /* vio_begin(['present' => …]) (VIO_FEATURE_EXPLICIT_PRESENT), called right
      * before begin_frame: VIO_PRESENT_YES presents the swapchain at vio_end even
      * when a target was bound before vio_begin or is still bound at the end,

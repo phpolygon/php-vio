@@ -1354,29 +1354,14 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
         size_t sampled_count;
         spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
                                                    &sampled_images, &sampled_count);
-        /* Assign unique texture (t) and sampler (s) registers per combined image-sampler.
-         * For SM 5.1 (D3D12): depth/shadow samplers get registers
-         * VIO_SHADOW_SAMPLER_BASE+ so they map to comparison static samplers in the
-         * root signature. Regular samplers get 0+, up to 12 before the comparison
-         * range (it was 8, which left an engine mesh shader one free slot). MUST
-         * stay in sync with the replay in php_vio.c and the root-signature
-         * static-sampler layout in vio_d3d12.c. */
-        unsigned int regular_idx = 0;
-        unsigned int shadow_idx = VIO_SHADOW_SAMPLER_BASE; /* comparison static samplers */
+        /* Assign unique texture (t) and sampler (s) registers per combined
+         * image-sampler: one sequence 0.. for regular and comparison samplers
+         * (SAMPLER-LIMITS-PLAN) - a comparison sampler compares through the
+         * sampler state bound at its register. MUST stay in sync with the replay
+         * in php_vio.c and the Vulkan stage rewrite. */
+        unsigned int reg_idx = 0;
         for (size_t i = 0; i < sampled_count; i++) {
-            /* Check if this is a depth sampler (sampler2DShadow) */
-            int is_depth_sampler = 0;
-            if (shader_model >= 51) {
-                spvc_type sampled_type = spvc_compiler_get_type_handle(compiler, sampled_images[i].type_id);
-                if (sampled_type) {
-                    spvc_type img_type = spvc_compiler_get_type_handle(compiler,
-                        spvc_type_get_base_type_id(sampled_type));
-                    if (img_type && spvc_type_get_image_is_depth(img_type)) {
-                        is_depth_sampler = 1;
-                    }
-                }
-            }
-            unsigned int binding = is_depth_sampler ? shadow_idx++ : regular_idx++;
+            unsigned int binding = reg_idx++;
             int planned = shader_model >= 51 ? vio_sampler_plan_reg(sampled_images[i].name)
                                              : vio_sampler_plan_index(sampled_images[i].name);
             if (planned >= 0) binding = (unsigned int)planned;
@@ -1691,7 +1676,7 @@ int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*n
         spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &list, &count);
         for (size_t i = 0; i < count && n < max; i++) {
             if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) == 1) continue;
-            snprintf(names[n], 64, "%s", list[i].name ? list[i].name : "");
+            if (names) snprintf(names[n], 64, "%s", list[i].name ? list[i].name : "");
             n++;
         }
     }
@@ -1979,7 +1964,18 @@ static int vio_sampler_plan_find(const vio_sampler_plan *p, const char *name)
 
 static void vio_sampler_plan_add(vio_sampler_plan *p, const char *name, int reg, int is_depth)
 {
-    if (p->count >= VIO_SAMPLER_PLAN_MAX || reg < 0) return;
+    if (reg < 0) return;
+    if (p->count >= p->cap) {
+        int cap = p->cap > 0 ? p->cap * 2 : 16;
+        void *nn = realloc(p->names, (size_t)cap * sizeof(*p->names));
+        void *nr = nn ? realloc(p->reg, (size_t)cap * sizeof(int)) : NULL;
+        void *nd = nr ? realloc(p->is_depth, (size_t)cap * sizeof(int)) : NULL;
+        if (nn) p->names = nn;
+        if (nr) p->reg = nr;
+        if (!nd) return;
+        p->is_depth = nd;
+        p->cap = cap;
+    }
     snprintf(p->names[p->count], sizeof(p->names[0]), "%s", name ? name : "");
     p->reg[p->count] = reg;
     p->is_depth[p->count] = is_depth;
@@ -1997,8 +1993,20 @@ static int vio_sampler_plan_free_reg(const vio_sampler_plan *p, int lo, int hi)
     return -1;
 }
 
+void vio_sampler_plan_free(vio_sampler_plan *plan)
+{
+    free(plan->names);
+    free(plan->reg);
+    free(plan->is_depth);
+    plan->names = NULL;
+    plan->reg = NULL;
+    plan->is_depth = NULL;
+    plan->count = plan->cap = 0;
+}
+
 void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv, const size_t *size, int n)
 {
+    vio_sampler_plan_free(plan);
     memset(plan, 0, sizeof(*plan));
     for (int s = 0; s < n; s++) {
         if (!spirv[s] || !size[s]) continue;
@@ -2007,20 +2015,24 @@ void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv
         if (vio_spirv_reflect(spirv[s], size[s], &r, &err) != 0) { free(err); continue; }
         if (s == 0) {
             /* The fragment stage: the replay php_vio.c always did. */
-            int regular = 0, shadow = VIO_SHADOW_SAMPLER_BASE;
             for (int t = 0; t < r.texture_count; t++) {
                 int d = r.textures[t].is_depth ? 1 : 0;
-                vio_sampler_plan_add(plan, r.textures[t].name, d ? shadow++ : regular++, d);
+                vio_sampler_plan_add(plan, r.textures[t].name, t, d);
             }
-            char sep[VIO_SAMPLER_PLAN_MAX][64];
-            int nsep = vio_spirv_separate_images(spirv[s], size[s], sep, VIO_SAMPLER_PLAN_MAX);
-            for (int j = 0; j < nsep; j++) vio_sampler_plan_add(plan, sep[j], r.texture_count + j, 0);
+            int nsep = vio_spirv_separate_images(spirv[s], size[s], NULL, 1 << 30);
+            if (nsep > 0) {
+                char (*sep)[64] = malloc((size_t)nsep * sizeof(*sep));
+                if (sep) {
+                    nsep = vio_spirv_separate_images(spirv[s], size[s], sep, nsep);
+                    for (int j = 0; j < nsep; j++) vio_sampler_plan_add(plan, sep[j], r.texture_count + j, 0);
+                    free(sep);
+                }
+            }
         } else {
             for (int t = 0; t < r.texture_count; t++) {
                 if (vio_sampler_plan_find(plan, r.textures[t].name) >= 0) continue;
                 int d = r.textures[t].is_depth ? 1 : 0;
-                vio_sampler_plan_add(plan, r.textures[t].name, d ? vio_sampler_plan_free_reg(plan, VIO_SHADOW_SAMPLER_BASE, VIO_SHADOW_SAMPLER_END)
-                                                                 : vio_sampler_plan_free_reg(plan, 0, VIO_SHADOW_SAMPLER_BASE), d);
+                vio_sampler_plan_add(plan, r.textures[t].name, vio_sampler_plan_free_reg(plan, 0, 1 << 30), d);
             }
         }
         vio_reflect_free(&r);

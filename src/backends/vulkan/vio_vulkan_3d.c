@@ -60,14 +60,16 @@ static struct {
     VkBuffer            identity_buf; void *identity_alloc;
     /* bound state */
     vio_vk3d_pipeline          *pipeline;
-    vio_vulkan_texture         *tex[VK3D_MAX_SAMPLERS];
+    vio_vulkan_texture        **tex;        /* by sampler register; grows on bind */
+    int                         tex_cap;
     vio_vulkan_compute_buffer  *storage[VK3D_MAX_STORAGE];
     VkBuffer                    ubo_buf[VK3D_DYN_UBOS];   /* vk3d_dyn_index order: VS, FS, GS, TCS, TES */
     uint32_t                    ubo_off[VK3D_DYN_UBOS];
     /* descriptor set reuse for consecutive identical draws */
     VkDescriptorSet             last_set;
     vio_vk3d_shader            *last_shader;
-    vk3d_res                    last_res[VK3D_MAX_BINDINGS];
+    vk3d_res                   *last_res;   /* binding_count of the last set */
+    int                         last_res_cap;
 } vk3d;
 
 /* A recorded draw sequence (BUNDLE-PLAN phase 2): a secondary command buffer
@@ -382,7 +384,7 @@ int vio_vk3d_upload_bytes(const void *data, VkDeviceSize size, VkBuffer *out_buf
     return vk3d_upload(data, size, size, vk3d_ubo_align(), out_buf, out_off);
 }
 
-static VkDescriptorSet vk3d_alloc_set(VkDescriptorSetLayout layout)
+static VkDescriptorSet vk3d_alloc_set(VkDescriptorSetLayout layout, int samplers)
 {
     vk3d_frame *f = vk3d_cur_frame();
     for (;;) {
@@ -406,7 +408,9 @@ static VkDescriptorSet vk3d_alloc_set(VkDescriptorSetLayout layout)
         VkDescriptorPoolSize sizes[5] = {
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK3D_SETS_PER_POOL * VK3D_DYN_UBOS },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         VK3D_SETS_PER_POOL * VK3D_MAX_EXTRA_UBO },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK3D_SETS_PER_POOL * VK3D_MAX_SAMPLERS },
+            /* 16 per set on average; a pool also holds several sets of the
+             * largest shader seen (SAMPLER-LIMITS-PLAN). */
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (uint32_t)(VK3D_SETS_PER_POOL * 16 > samplers * 8 ? VK3D_SETS_PER_POOL * 16 : samplers * 8) },
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         VK3D_SETS_PER_POOL * VK3D_MAX_STORAGE },
             { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK3D_SETS_PER_POOL },
         };
@@ -575,6 +579,16 @@ static void vk3d_free_texture_now(vio_vulkan_texture *t)
     free(t);
 }
 
+/* Per-binding scratch of vk3d_descriptor_set, grown to the largest shader. */
+static struct {
+    int cap;
+    vk3d_res *res;
+    VkWriteDescriptorSet *w;
+    VkDescriptorBufferInfo *bi;
+    VkDescriptorImageInfo *ii;
+    VkWriteDescriptorSetAccelerationStructureKHR *ai;
+} vk3d_ds;
+
 void vio_vk3d_shutdown(void)
 {
     vk3d_bundles_sweep();
@@ -594,6 +608,10 @@ void vio_vk3d_shutdown(void)
         for (int i = 0; i < f->pool_count; i++) vkDestroyDescriptorPool(vio_vk.device, f->pools[i], NULL);
     }
     for (int i = 0; i < VK3D_DUMMY_COUNT; i++) vk3d_free_texture_now(vk3d.dummy[i]);
+    free(vk3d.tex);
+    free(vk3d.last_res);
+    free(vk3d_ds.res); free(vk3d_ds.w); free(vk3d_ds.bi); free(vk3d_ds.ii); free(vk3d_ds.ai);
+    memset(&vk3d_ds, 0, sizeof(vk3d_ds));
     if (vk3d.zero_buf)     vio_vma_destroy_buffer(vio_vk.vma_allocator, vk3d.zero_buf, vk3d.zero_alloc);
     if (vk3d.identity_buf) vio_vma_destroy_buffer(vio_vk.vma_allocator, vk3d.identity_buf, vk3d.identity_alloc);
     if (vk3d_scratch_buf) vio_vma_destroy_buffer(vio_vk.vma_allocator, vk3d_scratch_buf, vk3d_scratch_alloc);
@@ -606,7 +624,7 @@ void vio_vk3d_shutdown(void)
 
 void vio_vk3d_forget_texture(vio_vulkan_texture *tex)
 {
-    for (int i = 0; i < VK3D_MAX_SAMPLERS; i++) if (vk3d.tex[i] == tex) vk3d.tex[i] = NULL;
+    for (int i = 0; i < vk3d.tex_cap; i++) if (vk3d.tex[i] == tex) vk3d.tex[i] = NULL;
     vk3d.last_shader = NULL;
 }
 
@@ -631,12 +649,21 @@ void vio_vk3d_bind_pipeline(void *pipeline)
  * it addresses register `slot` directly, like D3D11/D3D12. */
 void vio_vk3d_bind_texture(void *texture, int slot)
 {
-    if (!texture || slot < 0 || slot >= VK3D_MAX_SAMPLERS) return;
+    if (!texture || slot < 0 || slot >= vio_vk3d_units()) return;
     vio_vk3d_shader *sh = vk3d.pipeline ? vk3d.pipeline->shader : NULL;
     int binding = (sh && slot < sh->fs_sampler_count && sh->fs_sampler_binding[slot] >= VK3D_B_SAMPLER0)
                 ? sh->fs_sampler_binding[slot] : VK3D_B_SAMPLER0 + slot;
     int idx = binding - VK3D_B_SAMPLER0;
-    if (idx < 0 || idx >= VK3D_MAX_SAMPLERS) return;
+    if (idx < 0) return;
+    if (idx >= vk3d.tex_cap) {
+        int cap = vk3d.tex_cap > 0 ? vk3d.tex_cap : 16;
+        while (cap <= idx) cap *= 2;
+        vio_vulkan_texture **nt = realloc(vk3d.tex, (size_t)cap * sizeof(*nt));
+        if (!nt) return;
+        for (int i = vk3d.tex_cap; i < cap; i++) nt[i] = NULL;
+        vk3d.tex = nt;
+        vk3d.tex_cap = cap;
+    }
     vk3d.tex[idx] = (vio_vulkan_texture *)texture;
 }
 
@@ -779,7 +806,8 @@ static void vk3d_resolve(vio_vk3d_shader *sh, vk3d_res *out)
                 break;
             }
             default: {
-                vio_vulkan_texture *t = vk3d.tex[(b->binding - VK3D_B_SAMPLER0) % VK3D_MAX_SAMPLERS];
+                int ti = (int)b->binding - VK3D_B_SAMPLER0;
+                vio_vulkan_texture *t = (ti >= 0 && ti < vk3d.tex_cap) ? vk3d.tex[ti] : NULL;
                 int vt = t ? (t->view_type ? t->view_type : VK_IMAGE_VIEW_TYPE_2D) : -1;
                 /* A slot still naming an image the open pass renders into (a
                  * target sampled by an earlier pass, bound for drawing again):
@@ -808,20 +836,39 @@ static void vk3d_resolve(vio_vk3d_shader *sh, vk3d_res *out)
     }
 }
 
+static int vk3d_ds_reserve(int n)
+{
+    if (n <= vk3d_ds.cap) return 1;
+    int cap = vk3d_ds.cap > 0 ? vk3d_ds.cap : 32;
+    while (cap < n) cap *= 2;
+    void *a = realloc(vk3d_ds.res, (size_t)cap * sizeof(*vk3d_ds.res)); if (!a) return 0; vk3d_ds.res = a;
+    a = realloc(vk3d_ds.w, (size_t)cap * sizeof(*vk3d_ds.w)); if (!a) return 0; vk3d_ds.w = a;
+    a = realloc(vk3d_ds.bi, (size_t)cap * sizeof(*vk3d_ds.bi)); if (!a) return 0; vk3d_ds.bi = a;
+    a = realloc(vk3d_ds.ii, (size_t)cap * sizeof(*vk3d_ds.ii)); if (!a) return 0; vk3d_ds.ii = a;
+    a = realloc(vk3d_ds.ai, (size_t)cap * sizeof(*vk3d_ds.ai)); if (!a) return 0; vk3d_ds.ai = a;
+    a = realloc(vk3d.last_res, (size_t)cap * sizeof(*vk3d.last_res)); if (!a) return 0; vk3d.last_res = a;
+    vk3d.last_res_cap = cap;
+    vk3d_ds.cap = cap;
+    return 1;
+}
+
 static VkDescriptorSet vk3d_descriptor_set(vio_vk3d_shader *sh)
 {
-    vk3d_res res[VK3D_MAX_BINDINGS];
+    if (!vk3d_ds_reserve(sh->binding_count > 0 ? sh->binding_count : 1)) return VK_NULL_HANDLE;
+    vk3d_res *res = vk3d_ds.res;
     vk3d_resolve(sh, res);
     if (vk3d.last_set && vk3d.last_shader == sh &&
         memcmp(res, vk3d.last_res, sizeof(vk3d_res) * (size_t)sh->binding_count) == 0) {
         return vk3d.last_set;
     }
-    VkDescriptorSet set = vk3d_alloc_set(sh->set_layout);
+    int nsamp = 0;
+    for (int i = 0; i < sh->binding_count; i++) if (sh->bindings[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) nsamp++;
+    VkDescriptorSet set = vk3d_alloc_set(sh->set_layout, nsamp);
     if (!set) return VK_NULL_HANDLE;
-    VkWriteDescriptorSet w[VK3D_MAX_BINDINGS];
-    VkDescriptorBufferInfo bi[VK3D_MAX_BINDINGS];
-    VkDescriptorImageInfo ii[VK3D_MAX_BINDINGS];
-    VkWriteDescriptorSetAccelerationStructureKHR ai[VK3D_MAX_BINDINGS];
+    VkWriteDescriptorSet *w = vk3d_ds.w;
+    VkDescriptorBufferInfo *bi = vk3d_ds.bi;
+    VkDescriptorImageInfo *ii = vk3d_ds.ii;
+    VkWriteDescriptorSetAccelerationStructureKHR *ai = vk3d_ds.ai;
     uint32_t n = 0;
     for (int i = 0; i < sh->binding_count; i++) {
         const vk3d_binding *b = &sh->bindings[i];

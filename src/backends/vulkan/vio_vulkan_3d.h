@@ -34,17 +34,17 @@
 #include <vulkan/vulkan.h>
 #include "vio_vulkan.h"
 
+/* Set 0 bindings. The samplers come last and count up from VK3D_B_SAMPLER0 as
+ * far as the shader needs - up to the device's limits (SAMPLER-LIMITS-PLAN). */
 #define VK3D_B_VS_UBO       0
 #define VK3D_B_FS_UBO       1
-#define VK3D_B_SAMPLER0     2
-#define VK3D_MAX_SAMPLERS   16
-#define VK3D_B_STORAGE0     18
+#define VK3D_B_STORAGE0     2
 #define VK3D_MAX_STORAGE    8
-#define VK3D_B_EXTRA_UBO0   26
+#define VK3D_B_EXTRA_UBO0   10
 #define VK3D_MAX_EXTRA_UBO  4
-#define VK3D_B_STAGE_UBO0   30   /* + VIO_EXTRA_STAGE_INDEX(stage): GS 30, TCS 31, TES 32 */
-#define VK3D_B_ACCEL        33   /* ray query: the acceleration structure (vio_bind_acceleration_structure) */
-#define VK3D_MAX_BINDINGS   34
+#define VK3D_B_STAGE_UBO0   14   /* + VIO_EXTRA_STAGE_INDEX(stage): GS 14, TCS 15, TES 16 */
+#define VK3D_B_ACCEL        17   /* ray query: the acceleration structure (vio_bind_acceleration_structure) */
+#define VK3D_B_SAMPLER0     18
 #define VK3D_DYN_UBOS       5    /* dynamic default blocks: VS, FS, GS, TCS, TES */
 #define VK3D_MAX_VARIANTS   12
 
@@ -72,13 +72,15 @@ typedef struct _vio_vk3d_shader {
     VkShaderModule        ts;
     VkDescriptorSetLayout set_layout;
     VkPipelineLayout      layout;
-    vk3d_binding          bindings[VK3D_MAX_BINDINGS];
+    vk3d_binding         *bindings;       /* grows with the shader (malloc) */
     int                   binding_count;
+    int                   binding_cap;
     /* Fragment samplers in the ORIGINAL SPIR-V reflection order - the order
      * php_vio.c's GL-unit -> sampler-index map uses. */
-    int                   fs_sampler_binding[VK3D_MAX_SAMPLERS];
-    int                   fs_sampler_depth[VK3D_MAX_SAMPLERS];
+    int                  *fs_sampler_binding;
+    int                  *fs_sampler_depth;
     int                   fs_sampler_count;
+    int                   fs_sampler_cap;
     int                   fs_needed_without_color; /* fragment stage discards or writes depth */
     int                   uses_bindless;           /* reads the bindless table (Set 1, BINDLESS-PLAN.md) */
     int                   writes_shading_rate;     /* the vertex stage writes gl_PrimitiveShadingRateEXT */
@@ -105,6 +107,9 @@ typedef struct _vio_vk3d_pipeline {
 } vio_vk3d_pipeline;
 
 /* vio_vulkan_3d_shader.c */
+void        vk3d_shader_free_arrays(vio_vk3d_shader *sh);
+/* Texture units one stage can bind: the device's descriptor limits (vio_vulkan.c). */
+int         vio_vk3d_units(void);
 void        vk3d_forget_pipeline(vio_vk3d_pipeline *p);
 void        vk3d_shader_release_gpu(vio_vk3d_shader *sh);
 void        vk3d_pipeline_release_gpu(vio_vk3d_pipeline *p);

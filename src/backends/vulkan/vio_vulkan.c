@@ -14,6 +14,7 @@
 
 #include "../../../include/vio_platform.h"
 #include "vio_vulkan.h"
+#include "vio_vulkan_3d.h"   /* VK3D_B_SAMPLER0: set-0 bindings before the samplers */
 #include "../../vio_cubemap.h"   /* bindless cube slots */
 #include "../../vio_shader_cache.h"
 #include "../../vio_texture.h"
@@ -543,6 +544,24 @@ static int create_logical_device(void)
         VkPhysicalDeviceProperties props = {0};
         vkGetPhysicalDeviceFeatures(vio_vk.physical_device, &avail);
         vkGetPhysicalDeviceProperties(vio_vk.physical_device, &props);
+        {
+            /* Texture units (SAMPLER-LIMITS-PLAN): what one stage and one set
+             * may hold of combined image samplers, minus the set-0 bindings that
+             * are not samplers (the per-stage resource budget counts all). */
+            const VkPhysicalDeviceLimits *lm = &props.limits;
+            uint64_t img = lm->maxPerStageDescriptorSampledImages < lm->maxDescriptorSetSampledImages
+                         ? lm->maxPerStageDescriptorSampledImages : lm->maxDescriptorSetSampledImages;
+            uint64_t smp = lm->maxPerStageDescriptorSamplers < lm->maxDescriptorSetSamplers
+                         ? lm->maxPerStageDescriptorSamplers : lm->maxDescriptorSetSamplers;
+            uint64_t res = lm->maxPerStageResources > VK3D_B_SAMPLER0 + 8 ? lm->maxPerStageResources - (VK3D_B_SAMPLER0 + 8) : 16;
+            if (img > INT_MAX) img = INT_MAX;
+            if (smp > INT_MAX) smp = INT_MAX;
+            vio_vk.tex_limit = (int)img;
+            vio_vk.smp_limit = (int)smp;
+            uint64_t u = img < smp ? img : smp;
+            if (u > res) u = res;
+            vio_vk.tex_units = u > INT_MAX ? INT_MAX : (int)(u < 1 ? 1 : u);
+        }
         if (avail.samplerAnisotropy) {
             features.samplerAnisotropy = VK_TRUE;
             vio_vk.anisotropy_supported = 1;
@@ -4059,6 +4078,18 @@ static void vulkan_destroy_font_atlas(void *font_ptr)
 }
 
 /* vio_begin(['present' => …]) (VIO_FEATURE_EXPLICIT_PRESENT). */
+/* SAMPLER-LIMITS-PLAN: the device's descriptor limits per stage. */
+static void vulkan_texture_limits(int *textures, int *samplers)
+{
+    *textures = vio_vk.tex_limit > 0 ? vio_vk.tex_limit : 16;
+    *samplers = vio_vk.tex_units > 0 ? vio_vk.tex_units : 16;
+}
+
+int vio_vk3d_units(void)
+{
+    return vio_vk.tex_units > 0 ? vio_vk.tex_units : 16;
+}
+
 static void vulkan_set_frame_present(int mode)
 {
     vio_vk.frame_present = mode;
@@ -5860,7 +5891,7 @@ static const vio_backend vulkan_backend = {
     .bundle_method     = vulkan_bundle_method,
     .rt_origin_top     = 1,
     .clip_z_remap      = 1,
-    .shadow_sampler_base = VIO_SHADOW_SAMPLER_BASE,
+    .texture_limits    = vulkan_texture_limits,
     .set_frame_present = vulkan_set_frame_present,
     .create_swapchain  = vulkan_create_swapchain,
     .set_swapchain     = vulkan_set_swapchain,
