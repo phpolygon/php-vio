@@ -126,8 +126,8 @@
 #define VIO_D3D12_RP_BINDLESS     25  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
 #define VIO_D3D12_RP_FEEDBACK     26  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
 #define VIO_D3D12_RP_COUNT        27
-/* Static samplers of the bindless table: s1..s4 and s7 in space 1 (vio_sampler .. vio_sampler_aniso). */
-#define VIO_D3D12_BINDLESS_SAMPLERS 5
+/* Static samplers of the bindless table: s1..s4, s7 and s8 in space 1 (vio_sampler .. vio_sampler_aniso_clamp). */
+#define VIO_D3D12_BINDLESS_SAMPLERS 6
 /* Storage buffers a vertex / mesh / task stage reads: binding 0 at [3], 1..3 at [22..24]. */
 #define VIO_D3D12_GRAPHICS_STORAGE 4
 

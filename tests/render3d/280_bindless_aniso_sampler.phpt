@@ -1,5 +1,5 @@
 --TEST--
-Bindless anisotropic sampler: set 1 binding 7 (vio_sampler_aniso) keeps detail along the short axis of a stretched footprint where the linear sampler blurs it
+Bindless anisotropic samplers: set 1 binding 7 (vio_sampler_aniso) keeps detail along the short axis of a stretched footprint where the linear sampler blurs it; binding 8 (vio_sampler_aniso_clamp) clamps where binding 7 repeats
 --EXTENSIONS--
 vio
 --FILE--
@@ -8,18 +8,24 @@ vio
  * chain, sampled with textureGrad at a 16:1 footprint (16 texels across u per pixel,
  * one texel along v) - a floor seen at a grazing angle. The linear sampler picks the
  * mip by the long axis: the stripes are averaged away (grey). vio_sampler_aniso
- * picks it by the short axis and averages along u only: the stripes stay. */
+ * picks it by the short axis and averages along u only: the stripes stay.
+ * Modes 2 / 3 read just past the top edge (v = 1 + half a texel) at mip 0: the
+ * repeating sampler wraps to row 0 (black), vio_sampler_aniso_clamp stays on row 63
+ * (white). */
 $VS = "#version 450\nlayout(location=0) in vec2 aPos;\nvoid main(){ gl_Position = vec4(aPos, 0.0, 1.0); }";
 $FS = "#version 450\n#extension GL_EXT_nonuniform_qualifier : require\nlayout(location=0) out vec4 o;\n"
     . "uniform int u_slot;\nuniform int u_mode;\n"
     . "layout(set = 1, binding = 0) uniform texture2D vio_textures[];\n"
     . "layout(set = 1, binding = 1) uniform sampler vio_sampler;\n"
     . "layout(set = 1, binding = 7) uniform sampler vio_sampler_aniso;\n"
+    . "layout(set = 1, binding = 8) uniform sampler vio_sampler_aniso_clamp;\n"
     . "void main(){\n"
     . "  vec2 uv = vec2(gl_FragCoord.x / 64.0, (floor(gl_FragCoord.y) + 0.5) / 64.0);\n"
     . "  vec2 dx = vec2(16.0 / 64.0, 0.0), dy = vec2(0.0, 1.0 / 64.0);\n"
     . "  if (u_mode == 0) o = textureGrad(sampler2D(vio_textures[nonuniformEXT(u_slot)], vio_sampler), uv, dx, dy);\n"
-    . "  else             o = textureGrad(sampler2D(vio_textures[nonuniformEXT(u_slot)], vio_sampler_aniso), uv, dx, dy);\n"
+    . "  else if (u_mode == 1) o = textureGrad(sampler2D(vio_textures[nonuniformEXT(u_slot)], vio_sampler_aniso), uv, dx, dy);\n"
+    . "  else if (u_mode == 2) o = textureGrad(sampler2D(vio_textures[nonuniformEXT(u_slot)], vio_sampler_aniso), vec2(0.5, 1.0 + 0.5 / 64.0), vec2(1.0 / 64.0, 0.0), vec2(0.0, 1.0 / 64.0));\n"
+    . "  else o = textureGrad(sampler2D(vio_textures[nonuniformEXT(u_slot)], vio_sampler_aniso_clamp), vec2(0.5, 1.0 + 0.5 / 64.0), vec2(1.0 / 64.0, 0.0), vec2(0.0, 1.0 / 64.0));\n"
     . "}";
 $require = array_map('trim', explode(',', getenv('VIO_REQUIRE_BINDLESS') ?: ''));
 
@@ -50,18 +56,23 @@ function run_backend(string $name, array $extra = []): string {
     $tex = vio_texture($ctx, ['data' => $data, 'width' => 64, 'height' => 64, 'mipmaps' => true]);
     $slot = vio_texture_index($ctx, $tex);
     $c = [];
-    foreach ([0, 1] as $mode) {
+    $edge = [];
+    foreach ([0, 1, 2, 3] as $mode) {
         vio_begin($ctx);
         vio_bind_pipeline($ctx, $pipe);
         vio_set_uniforms($ctx, ['u_slot' => $slot, 'u_mode' => $mode]);
         vio_draw($ctx, $quad);
         vio_end($ctx);
-        $c[$mode] = stripe_contrast(vio_read_pixels($ctx));
+        $px = vio_read_pixels($ctx);
+        $c[$mode] = stripe_contrast($px);
+        $edge[$mode] = ord($px[(32 * 64 + 32) * 4]);
     }
     vio_destroy($ctx);
     $err = [];
     if ($c[0] > 60) $err[] = sprintf('linear keeps the stripes (contrast %.0f), the footprint test is not anisotropic', $c[0]);
     if ($c[1] < 120) $err[] = sprintf('vio_sampler_aniso blurs the stripes (contrast %.0f, linear %.0f)', $c[1], $c[0]);
+    if ($edge[2] > 60) $err[] = "vio_sampler_aniso past the edge reads {$edge[2]}, want the wrapped black row";
+    if ($edge[3] < 195) $err[] = "vio_sampler_aniso_clamp past the edge reads {$edge[3]}, want the clamped white row";
     return $err ? "FAIL\n  " . implode("\n  ", $err) : "OK";
 }
 

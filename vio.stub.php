@@ -944,6 +944,7 @@ function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width
  *   layout(set = 1, binding = 5) uniform textureCube vio_cubes[];             // VioCubemap slots
  *   layout(set = 1, binding = 6) uniform texture2DArray vio_texture_arrays[]; // layered VioTexture slots
  *   layout(set = 1, binding = 7) uniform sampler vio_sampler_aniso;           // optional: linear, repeat, 16x anisotropic
+ *   layout(set = 1, binding = 8) uniform sampler vio_sampler_aniso_clamp;     // optional: the same, clamped to the edge
  * and index it with nonuniformEXT (GL_EXT_nonuniform_qualifier). The first call adds
  * the texture and keeps it alive until vio_texture_release_index or vio_destroy; later
  * calls return the same slot. 2D textures, texture arrays and cubemaps share the

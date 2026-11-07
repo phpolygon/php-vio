@@ -362,7 +362,7 @@ static int metal_msl_bindless(spvc_compiler compiler, spvc_resources resources, 
         for (size_t i = 0; i < count; i++) {
             if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 1) continue;
             /* Bindings 1..4: vio_sampler (linear, repeat), vio_sampler_nearest,
-             * vio_sampler_clamp, vio_sampler_nearest_clamp; 7: vio_sampler_aniso
+             * vio_sampler_clamp, vio_sampler_nearest_clamp; 7 / 8: vio_sampler_aniso(_clamp)
              * (BINDLESS-PLAN). Mip filtering like the D3D12 / Vulkan samplers. */
             unsigned b = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
             unsigned v = (b >= 1 && b <= 4) ? b - 1 : 0;
@@ -373,9 +373,10 @@ static int metal_msl_bindless(spvc_compiler compiler, spvc_resources resources, 
             cs.mip_filter = (v & 1) ? SPVC_MSL_SAMPLER_MIP_FILTER_NEAREST : SPVC_MSL_SAMPLER_MIP_FILTER_LINEAR;
             cs.s_address  = (v & 2) ? SPVC_MSL_SAMPLER_ADDRESS_CLAMP_TO_EDGE : SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
             cs.t_address  = cs.s_address;
-            if (b == 7) {
+            if (b == 7 || b == 8) {
                 cs.anisotropy_enable = SPVC_TRUE;
                 cs.max_anisotropy = 16;
+                cs.s_address = cs.t_address = b == 8 ? SPVC_MSL_SAMPLER_ADDRESS_CLAMP_TO_EDGE : SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
             }
             spvc_compiler_msl_remap_constexpr_sampler(compiler, list[i].id, &cs);
         }

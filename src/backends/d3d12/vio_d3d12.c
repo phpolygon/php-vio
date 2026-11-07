@@ -648,7 +648,7 @@ static UINT d3d12_alloc_srv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE *out_cpu,
 
 /* The bindless table's samplers, s1..s4 and s7 in space 1 (BINDLESS-PLAN): vio_sampler
  * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp,
- * vio_sampler_aniso (s7: anisotropic 16x, repeat). Graphics and compute root signatures
+ * vio_sampler_aniso (s7: anisotropic 16x, repeat), vio_sampler_aniso_clamp (s8). Graphics and compute root signatures
  * carry the same five. */
 static void d3d12_bindless_static_samplers(D3D12_STATIC_SAMPLER_DESC out[VIO_D3D12_BINDLESS_SAMPLERS])
 {
@@ -663,11 +663,13 @@ static void d3d12_bindless_static_samplers(D3D12_STATIC_SAMPLER_DESC out[VIO_D3D
         s->ShaderRegister = 1 + (UINT)v;
         s->RegisterSpace = 1;
         s->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        if (v == 4) {
+        if (v >= 4) {
+            /* s7 vio_sampler_aniso (repeat), s8 vio_sampler_aniso_clamp. */
             s->Filter = D3D12_FILTER_ANISOTROPIC;
-            s->AddressU = s->AddressV = s->AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            am = v == 5 ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            s->AddressU = s->AddressV = s->AddressW = am;
             s->MaxAnisotropy = 16;
-            s->ShaderRegister = 7;   /* GLSL set 1, binding 7 */
+            s->ShaderRegister = (UINT)(3 + v);   /* GLSL set 1, binding 7 / 8 */
         }
     }
 }
