@@ -743,7 +743,17 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     /* Mesh variant: space 2 (vio_shader_reflect.c moves mesh / task storage
      * buffers there), since the mesh stage also sees the SRV table at t0. */
     params[3].Descriptor.RegisterSpace = 2;   /* vertex / mesh storage buffers live in space 2 (A28) */
-    params[3].ShaderVisibility = mesh ? D3D12_SHADER_VISIBILITY_MESH : D3D12_SHADER_VISIBILITY_VERTEX;
+    /* Mesh variant: every stage, so the task (amplification) stage reads the same
+     * buffers as the mesh stage. */
+    params[3].ShaderVisibility = mesh ? D3D12_SHADER_VISIBILITY_ALL : D3D12_SHADER_VISIBILITY_VERTEX;
+    /* [22..24] storage buffers 1..3 of the same stages (t1..t3, space 2). */
+    for (int i = 1; i < VIO_D3D12_GRAPHICS_STORAGE; i++) {
+        D3D12_ROOT_PARAMETER *sp = &params[VIO_D3D12_RP_STORAGE_MORE + i - 1];
+        sp->ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        sp->Descriptor.ShaderRegister = (UINT)i;
+        sp->Descriptor.RegisterSpace = 2;
+        sp->ShaderVisibility = params[3].ShaderVisibility;
+    }
 
     /* [4] Sampler table s0.. — one per texture register (GAP-PLAN Phase 1,
      * SAMPLER-LIMITS-PLAN). Filled per draw from each bound texture's sampler
@@ -10216,19 +10226,21 @@ static int d3d12_supports_feature(vio_feature feature)
 
 /* ── Graphics-stage storage buffers (Path B: readback-free instancing) ──── */
 
-/* Bind a storage buffer to the vertex stage as root SRV param [3] (register t0,
- * VERTEX visibility). No explicit resource barrier: the compute UAV output lives
+/* Bind a storage buffer to the vertex / mesh / task stages: binding 0 as root SRV
+ * param [3] (register t0, space 2), bindings 1..3 at [22..24] (t1..t3). No explicit resource barrier: the compute UAV output lives
  * in / decays to COMMON after its (fenced, transient-list) dispatch, and a D3D12
  * buffer in COMMON is implicitly promoted to a shader-resource state on the
  * vertex-stage read — so the root SRV set here is sufficient. */
 static void d3d12_bind_storage_buffer(void *backend_buffer, int binding, int access,
                                       int element_count, int stride)
 {
-    (void)binding; (void)access; (void)element_count; (void)stride;
+    (void)access; (void)element_count; (void)stride;
     if (!vio_d3d12.initialized || !vio_d3d12.cmd_list || !backend_buffer) return;
+    if (binding < 0 || binding >= VIO_D3D12_GRAPHICS_STORAGE) return;
     vio_d3d12_buffer *buf = (vio_d3d12_buffer *)backend_buffer;
     if (!buf->resource || !buf->gpu_address) return;
-    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(vio_d3d12.cmd_list, 3, buf->gpu_address);
+    UINT param = binding == 0 ? VIO_D3D12_RP_VS_STORAGE : (UINT)(VIO_D3D12_RP_STORAGE_MORE + binding - 1);
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(vio_d3d12.cmd_list, param, buf->gpu_address);
 }
 
 /* Instanced draw pulling per-instance data from the bound storage buffer

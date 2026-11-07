@@ -1274,6 +1274,8 @@ function vio_draw_2d(VioContext $context): void {}
  * 'vertex' (giving both is refused), 'task' => optional task (amplification / object) stage; draw them
  * with vio_draw_mesh_tasks() / vio_draw_mesh_tasks_indirect(), not vio_draw(). The mesh stage's
  * uniforms are set with vio_set_uniform() like vertex uniforms (a task stage shares that block).
+ * Both stages read `readonly` storage buffers at bindings 0..3 (vio_bind_storage_buffer), the
+ * same buffer under the same binding in task and mesh stage (D3D12: root SRVs t0..t3, space 2).
  * Without the feature 'mesh' returns false with a warning.
  * Portable geometry shaders read input positions from a user varying (`layout(location = N) in vec4 vPos[]`
  * exported by the vertex stage), not from gl_in[].gl_Position, which D3D cannot translate.
