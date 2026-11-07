@@ -7148,6 +7148,14 @@ static void *d3d12_compile_mesh_shader(vio_shader_desc *desc, vio_d3d12_shader *
         fprintf(stderr, "==== D3D12 MS HLSL ====\n%s\n==== D3D12 PS HLSL ====\n%s\n==== end ====\n", ms, ps);
         fflush(stderr);
     }
+    /* The bindless table (space 1 / 3 / 4) in any stage: d3d12_apply_bindless points
+     * its root table at every dispatch, as for vertex pipelines. */
+    {
+        const char *st[3] = { ms, ps, as };
+        for (int i = 0; i < 3; i++) {
+            if (st[i] && (strstr(st[i], "space1)") || strstr(st[i], "space3)") || strstr(st[i], "space4)"))) shader->uses_bindless = 1;
+        }
+    }
     /* "xs_5_1" profiles become xs_6_<minor> under Shader Model 6. */
     if (FAILED(d3d12_compile_cached(ms, "MS", "ms_5_1", shader->compile_flags, &shader->vs_blob))) goto fail;
     if (FAILED(d3d12_compile_cached(ps, "PS", "ps_5_1", shader->compile_flags, &shader->ps_blob))) goto fail;
@@ -10580,6 +10588,7 @@ static void d3d12_draw_mesh_tasks(uint32_t x, uint32_t y, uint32_t z)
     ID3D12GraphicsCommandList6 *cl6 = d3d12_cmd_list6();
     if (!cl6) return;
     vio_d3d12_flush_srv_table();
+    d3d12_apply_bindless();   /* the table of a fragment (or mesh) stage reading vio_textures[] */
     d3d12_apply_view_mask();
     ID3D12GraphicsCommandList6_DispatchMesh(cl6, x, y, z);
 }
@@ -10615,6 +10624,7 @@ static void d3d12_draw_mesh_tasks_indirect(void *args_buffer, int max_draws, siz
         b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
         ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 2, b);
     }
+    d3d12_apply_bindless();
     d3d12_apply_view_mask();
     ID3D12GraphicsCommandList_ExecuteIndirect(vio_d3d12.cmd_list, vio_d3d12.cmdsig_mesh, (UINT)max_draws,
                                               args->resource, (UINT64)offset, NULL, 0);
