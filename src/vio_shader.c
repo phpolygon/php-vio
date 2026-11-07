@@ -21,7 +21,6 @@ static zend_object *vio_shader_create_object(zend_class_entry *ce)
     memset(shader, 0, XtOffsetOf(vio_shader_object, std));
 
     shader->format = VIO_SHADER_AUTO;
-    for (int i = 0; i < 16; i++) shader->gl_to_hlsl_sampler[i] = -1;
 
     zend_object_std_init(&shader->std, ce);
     object_properties_init(&shader->std, ce);
@@ -132,6 +131,32 @@ char *vio_glsl_multiview_forward(const char *src, int stage)
     }
 }
 
+void vio_shader_sampler_reserve(vio_shader_object *shader, int n)
+{
+    if (n <= shader->sampler_cap) return;
+    int cap = shader->sampler_cap > 0 ? shader->sampler_cap : 16;
+    while (cap < n) cap *= 2;
+    shader->sampler_names = erealloc(shader->sampler_names, (size_t)cap * sizeof(*shader->sampler_names));
+    shader->sampler_is_depth = erealloc(shader->sampler_is_depth, (size_t)cap * sizeof(int));
+    shader->sampler_hlsl_reg = erealloc(shader->sampler_hlsl_reg, (size_t)cap * sizeof(int));
+    shader->sampler_unit = erealloc(shader->sampler_unit, (size_t)cap * sizeof(int));
+    for (int i = shader->sampler_cap; i < cap; i++) {
+        shader->sampler_names[i][0] = '\0';
+        shader->sampler_is_depth[i] = 0;
+        shader->sampler_hlsl_reg[i] = 0;
+        shader->sampler_unit[i] = 0;
+    }
+    shader->sampler_cap = cap;
+}
+
+void vio_shader_units_init(vio_shader_object *shader, int units)
+{
+    if (units < 1) units = 1;
+    shader->gl_to_hlsl_sampler = erealloc(shader->gl_to_hlsl_sampler, (size_t)units * sizeof(int));
+    for (int i = 0; i < units; i++) shader->gl_to_hlsl_sampler[i] = -1;
+    shader->unit_count = units;
+}
+
 static void vio_shader_free_object(zend_object *obj)
 {
     vio_shader_object *shader = vio_shader_from_obj(obj);
@@ -142,6 +167,14 @@ static void vio_shader_free_object(zend_object *obj)
             be->destroy_shader_obj(shader);
         }
     }
+
+    if (shader->sampler_names) { efree(shader->sampler_names); shader->sampler_names = NULL; }
+    if (shader->sampler_is_depth) { efree(shader->sampler_is_depth); shader->sampler_is_depth = NULL; }
+    if (shader->sampler_hlsl_reg) { efree(shader->sampler_hlsl_reg); shader->sampler_hlsl_reg = NULL; }
+    if (shader->sampler_unit) { efree(shader->sampler_unit); shader->sampler_unit = NULL; }
+    if (shader->gl_to_hlsl_sampler) { efree(shader->gl_to_hlsl_sampler); shader->gl_to_hlsl_sampler = NULL; }
+    vio_sampler_plan_free(&shader->sampler_plan);
+    shader->sampler_count = shader->sampler_cap = shader->unit_count = 0;
 
     free(shader->mv_src[0]);
     free(shader->mv_src[1]);

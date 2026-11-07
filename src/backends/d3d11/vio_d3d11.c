@@ -4582,6 +4582,14 @@ int vio_d3d11_setup_context(void *platform_window, vio_config *cfg)
 
 /* ── Backend registration ─────────────────────────────────────────── */
 
+/* A sampler*Shadow at `slot`: the texture's comparison sampler (SAMPLER-LIMITS-PLAN). */
+static void d3d11_bind_compare_sampler(void *texture, int slot)
+{
+    vio_d3d11_texture *t = (vio_d3d11_texture *)texture;
+    if (!t || !t->sampler_cmp || slot < 0 || slot >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) return;
+    ID3D11DeviceContext_PSSetSamplers(vio_d3d11.context, (UINT)slot, 1, &t->sampler_cmp);
+}
+
 static const vio_backend d3d11_backend = {
     .name              = "d3d11",
     .api_version       = VIO_BACKEND_API_VERSION,
@@ -4659,6 +4667,7 @@ static const vio_backend d3d11_backend = {
     .encode_copy_frame       = d3d11_encode_copy_frame,
     .rt_origin_top     = 1,
     .clip_z_remap      = 1,
+    .bind_compare_sampler = d3d11_bind_compare_sampler,
     .set_frame_present = d3d11_set_frame_present,
     .create_swapchain  = d3d11_create_swapchain,
     .set_swapchain     = d3d11_set_swapchain,

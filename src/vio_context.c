@@ -41,6 +41,28 @@ static zend_object *vio_context_create_object(zend_class_entry *ce)
     return &ctx->std;
 }
 
+void vio_context_texture_units_free(vio_context_object *ctx)
+{
+    if (ctx->pending_tex_obj) { efree(ctx->pending_tex_obj); ctx->pending_tex_obj = NULL; }
+    if (ctx->pending_tex_kind) { efree(ctx->pending_tex_kind); ctx->pending_tex_kind = NULL; }
+    ctx->pending_tex_high = 0;
+    ctx->texture_units = 0;
+}
+
+void vio_context_texture_units_init(vio_context_object *ctx)
+{
+    int textures = 16, samplers = 16;
+    if (ctx->backend && ctx->backend->texture_limits) ctx->backend->texture_limits(&textures, &samplers);
+    if (textures < 1) textures = 1;
+    if (samplers < 1) samplers = 1;
+    vio_context_texture_units_free(ctx);
+    ctx->texture_limit = textures;
+    ctx->sampler_limit = samplers;
+    ctx->texture_units = textures < samplers ? textures : samplers;
+    ctx->pending_tex_obj = ecalloc((size_t)ctx->texture_units, sizeof(void *));
+    ctx->pending_tex_kind = ecalloc((size_t)ctx->texture_units, sizeof(int));
+}
+
 void vio_context_bindless_clear(vio_context_object *ctx)
 {
     if (!ctx->bindless) return;
@@ -158,6 +180,7 @@ static void vio_context_free_object(zend_object *obj)
     vio_upscale_release(ctx);
     /* The table's textures free their GPU objects through the backend: before it shuts down. */
     vio_context_bindless_clear(ctx);
+    vio_context_texture_units_free(ctx);
     if (ctx->candidates) {
         if (GC_DELREF(ctx->candidates) == 0) zend_array_destroy(ctx->candidates);
         ctx->candidates = NULL;

@@ -219,9 +219,9 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
     const spvc_reflected_resource *sep_list = NULL;
     size_t sep_n = 0;
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, &sep_list, &sep_n);
-    /* Samplers: regular 0.., shadow VIO_SHADOW_SAMPLER_BASE.. (the D3D12 register replay in php_vio.c). */
+    /* Samplers: one register sequence 0.. (the register replay in php_vio.c). */
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, &list, &n);
-    int regular = 0, shadow = VIO_SHADOW_SAMPLER_BASE;
+    int next_reg = 0;
     size_t own = 0;   /* combined samplers the shader declared itself */
     for (size_t i = 0; i < n; i++) {
         int combined = 0;
@@ -247,7 +247,7 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
         if (!from_separate) own_seen++;
         int is_depth = 0;
         VkImageViewType dim = vk3d_sampler_dim(c, list[i].type_id, &is_depth);
-        int reg = is_depth ? shadow++ : regular++;
+        int reg = next_reg++;
         int planned = vio_sampler_plan_reg(list[i].name);   /* shader-wide by name (A30) */
         if (planned >= 0) reg = planned;
         if (reg >= VK3D_MAX_SAMPLERS) continue;
@@ -423,8 +423,16 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     uint64_t key = vio_shader_cache_hash(tag, spirv, spirv_bytes);
     key = vio_shader_cache_hash_more(key, &upstream, sizeof(upstream));
     key = vio_shader_cache_hash_more(key, &is_last, sizeof(is_last));
-    if (vio_sampler_plan_current())   /* sampler bindings come from the whole shader */
-        key = vio_shader_cache_hash_more(key, vio_sampler_plan_current(), sizeof(vio_sampler_plan));
+    if (vio_sampler_plan_current()) {   /* sampler bindings come from the whole shader */
+        const vio_sampler_plan *pl = vio_sampler_plan_current();
+        key = vio_shader_cache_hash_more(key, &pl->count, sizeof(pl->count));
+        key = vio_shader_cache_hash_more(key, &pl->gs_writes_primid, sizeof(pl->gs_writes_primid));
+        if (pl->count > 0) {
+            key = vio_shader_cache_hash_more(key, pl->names, (size_t)pl->count * sizeof(*pl->names));
+            key = vio_shader_cache_hash_more(key, pl->reg, (size_t)pl->count * sizeof(int));
+            key = vio_shader_cache_hash_more(key, pl->is_depth, (size_t)pl->count * sizeof(int));
+        }
+    }
     if (vio_shader_cache_dir()) {
         size_t len = 0;
         void *data = vio_shader_cache_load(key, "vkspv", &len);

@@ -721,10 +721,8 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     params[1].Descriptor.RegisterSpace = 0;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    /* [2] SRV table t0..t(N-1). Regular textures occupy t0-t11, shadow/depth
-     * samplers t12-t15 (SPIRV-Cross assigns depth samplers from
-     * VIO_SHADOW_SAMPLER_BASE — see vio_shader_reflect.h). Sized to VIO_D3D12_SRV_TABLE_SIZE so high shadow
-     * registers are always covered by the table and never dropped at bind. */
+    /* [2] SRV table t0..t(N-1): every texture register of the shader, regular
+     * and comparison samplers in one sequence (SAMPLER-LIMITS-PLAN). */
     D3D12_DESCRIPTOR_RANGE srv_range = {0};
     srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     srv_range.NumDescriptors = VIO_D3D12_SRV_TABLE_SIZE;
@@ -745,9 +743,10 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     params[3].Descriptor.RegisterSpace = 2;   /* vertex / mesh storage buffers live in space 2 (A28) */
     params[3].ShaderVisibility = mesh ? D3D12_SHADER_VISIBILITY_MESH : D3D12_SHADER_VISIBILITY_VERTEX;
 
-    /* [4] Sampler table s0..s7 — one per regular texture register (GAP-PLAN
-     * Phase 1). Filled per draw from each bound texture's sampler combo, so
-     * filter / wrap / anisotropy are honoured like on D3D11. */
+    /* [4] Sampler table s0.. — one per texture register (GAP-PLAN Phase 1,
+     * SAMPLER-LIMITS-PLAN). Filled per draw from each bound texture's sampler
+     * combo (the comparison combo for a sampler*Shadow), so filter / wrap /
+     * anisotropy / comparison are honoured like on D3D11. */
     D3D12_DESCRIPTOR_RANGE sampler_range = {0};
     sampler_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
     sampler_range.NumDescriptors = VIO_D3D12_SAMPLER_TABLE_SIZE;
@@ -798,24 +797,8 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
         }
     }
 
-    /* Static samplers: s12-s15 = comparison (shadow maps with sampler2DShadow).
-     * SPIRV-Cross assigns shadow samplers to s12+ and regular to s0+ (see
-     * vio_shader_reflect.c, VIO_SHADOW_SAMPLER_BASE — 12 regular samplers fit in
-     * the table above). Static and table samplers may share a root signature as
-     * long as their registers do not overlap. */
-    D3D12_STATIC_SAMPLER_DESC static_samplers[VIO_SHADOW_SAMPLER_END - VIO_SHADOW_SAMPLER_BASE] = {0};
-    for (int s = 0; s < VIO_SHADOW_SAMPLER_END - VIO_SHADOW_SAMPLER_BASE; s++) {
-        static_samplers[s].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
-        static_samplers[s].AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        static_samplers[s].AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        static_samplers[s].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        static_samplers[s].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-        static_samplers[s].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
-        static_samplers[s].MaxLOD = D3D12_FLOAT32_MAX;
-        static_samplers[s].ShaderRegister = VIO_SHADOW_SAMPLER_BASE + s;
-        static_samplers[s].RegisterSpace = 0;
-        static_samplers[s].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;   /* shadow samplers in every stage */
-    }
+    /* No static samplers in space 0: comparison samplers come from the sampler
+     * table like every other sampler (SAMPLER-LIMITS-PLAN). */
 
     /* [14] root SRV t0, space9: the ray-query acceleration structure (vio_shader_reflect.c
      * moves every RaytracingAccelerationStructure there), visible to every stage. */
@@ -839,9 +822,8 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     params[VIO_D3D12_RP_BINDLESS].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     /* The bindless table's samplers, s1..s4 in space 1 (BINDLESS-PLAN): vio_sampler
      * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp. */
-    D3D12_STATIC_SAMPLER_DESC all_samplers[8];
-    memcpy(all_samplers, static_samplers, sizeof(static_samplers));
-    d3d12_bindless_static_samplers(&all_samplers[4]);
+    D3D12_STATIC_SAMPLER_DESC all_samplers[4];
+    d3d12_bindless_static_samplers(all_samplers);
 
     /* [20] / [21] Vertex textures (A28): the SRV and sampler tables for the
      * vertex stage (its storage buffer moved to t0, space2 for that). */
@@ -893,8 +875,8 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     rs_desc.NumParameters = vio_d3d12.sampler_feedback ? VIO_D3D12_RP_COUNT
                           : vio_d3d12.bindless ? VIO_D3D12_RP_FEEDBACK : VIO_D3D12_RP_BINDLESS;
     rs_desc.pParameters = params;
-    rs_desc.NumStaticSamplers = vio_d3d12.bindless ? 8 : 4;
-    rs_desc.pStaticSamplers = all_samplers;
+    rs_desc.NumStaticSamplers = vio_d3d12.bindless ? 4 : 0;
+    rs_desc.pStaticSamplers = vio_d3d12.bindless ? all_samplers : NULL;
     rs_desc.Flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     ID3DBlob *signature_blob = NULL;
@@ -1976,6 +1958,16 @@ static int d3d12_init(vio_config *cfg)
                 }
             }
         }
+        /* The comparison sampler for sampler*Shadow (formerly static s12..s15). */
+        D3D12_SAMPLER_DESC cd = {0};
+        cd.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        cd.AddressU = cd.AddressV = cd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        cd.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        cd.BorderColor[0] = cd.BorderColor[1] = cd.BorderColor[2] = cd.BorderColor[3] = 1.0f;
+        cd.MaxAnisotropy = 1;
+        cd.MaxLOD = D3D12_FLOAT32_MAX;
+        D3D12_CPU_DESCRIPTOR_HANDLE ch = { base.ptr + (SIZE_T)VIO_D3D12_SAMPLER_COMBO_COMPARE * vio_d3d12.sampler_descriptor_size };
+        ID3D12Device_CreateSampler(vio_d3d12.device, &cd, ch);
     }
     vio_d3d12.sampler_frame_capacity = 0;
     vio_d3d12.sampler_frame_base = 0;
@@ -3639,6 +3631,14 @@ int vio_d3d12_sampler_combo(int filter, int wrap, int anisotropy)
     else if (anisotropy >= 4) a = 2;
     else if (anisotropy >= 2) a = 1;
     return (a * 3 + w) * 2 + f;
+}
+
+/* A sampler*Shadow at `slot`: the comparison combo instead of the texture's own. */
+static void d3d12_bind_compare_sampler(void *texture, int slot)
+{
+    (void)texture;
+    if (slot < 0 || slot >= VIO_D3D12_SAMPLER_TABLE_SIZE) return;
+    vio_d3d12.pending_samplers[slot] = VIO_D3D12_SAMPLER_COMBO_COMPARE;
 }
 
 void vio_d3d12_bind_srv_slot(D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu, int slot, int sampler_index)
@@ -11264,7 +11264,7 @@ static const vio_backend d3d12_backend = {
     .bundle_method                  = d3d12_bundle_method,
     .rt_origin_top     = 1,
     .clip_z_remap      = 1,
-    .shadow_sampler_base = VIO_SHADOW_SAMPLER_BASE,
+    .bind_compare_sampler = d3d12_bind_compare_sampler,
     .create_swapchain  = d3d12_create_swapchain,
     .set_swapchain     = d3d12_set_swapchain,
     .destroy_swapchain = d3d12_destroy_swapchain,

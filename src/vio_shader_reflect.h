@@ -156,7 +156,7 @@ int vio_spvc_combine_separate(void *compiler);
 
 /* Names of the separate textures in set 0, in reflection order (the order the
  * HLSL translation gives them t-registers after the combined samplers).
- * Returns the count (<= max). */
+ * Returns the count (<= max); names may be NULL to only count them. */
 int vio_spirv_separate_images(const uint32_t *spirv, size_t spirv_size, char (*names)[64], int max);
 
 /* Entries of gl_ClipDistance a stage writes through its outputs (the array
@@ -173,26 +173,23 @@ int vio_spirv_uses_clip_distance(const uint32_t *spirv, size_t spirv_size);
  * lists them in SPIR-V id order, i.e. glslang's order of first use, not the
  * declaration order. The plan walks the stages in the sampler-map order of
  * php_vio.c (fragment, geometry, tess control, tess eval, mesh, task): the
- * fragment stage keeps its replayed registers (regular 0.., depth VIO_SHADOW_SAMPLER_BASE..,
- * separate textures after the combined ones), every later name takes the lowest
- * free register of its kind. vio_spirv_to_hlsl and the Vulkan stage rewrite
+ * fragment stage keeps its replayed registers (one sequence 0.. for regular and
+ * comparison samplers, separate textures after the combined ones), every later
+ * name takes the lowest free register. vio_spirv_to_hlsl and the Vulkan stage rewrite
  * look names up while a plan is in use (vio_sampler_plan_use around the
  * backend's compile_shader / create_pipeline); names outside it keep the
  * per-stage counter. */
-#define VIO_SAMPLER_PLAN_MAX 32
-/* Register split of a stage's combined samplers on the register backends
- * (D3D12 SM 5.1+, Vulkan, which mirrors it): regular samplers take
- * 0..VIO_SHADOW_SAMPLER_BASE-1 (the D3D12 sampler table), comparison samplers
- * (sampler*Shadow) VIO_SHADOW_SAMPLER_BASE..VIO_SHADOW_SAMPLER_END-1 (the D3D12
- * static comparison samplers). 16 in all: D3D11 and Metal bind at most 16
- * samplers per stage. vio_backend_info()['samplers'] reports the split. */
-#define VIO_SHADOW_SAMPLER_BASE 12
-#define VIO_SHADOW_SAMPLER_END  16
+/* Registers of a stage's combined samplers: ONE sequence for regular and
+ * comparison samplers (SAMPLER-LIMITS-PLAN). Whether a unit compares comes from
+ * its sampler state (the D3D12 comparison combo, the Vulkan / Metal / D3D11
+ * comparison sampler), not from a register range. */
+/* Entries grow with the shader (SAMPLER-LIMITS-PLAN): no fixed maximum. */
 typedef struct _vio_sampler_plan {
     int  count;
-    char names[VIO_SAMPLER_PLAN_MAX][64];
-    int  reg[VIO_SAMPLER_PLAN_MAX];
-    int  is_depth[VIO_SAMPLER_PLAN_MAX];
+    int  cap;
+    char (*names)[64];
+    int  *reg;
+    int  *is_depth;
     /* The geometry stage writes gl_PrimitiveID (A28): it travels to the fragment
      * stage as a flat int varying at VIO_PRIMID_LOCATION (D3D, Metal). */
     int  gs_writes_primid;
@@ -212,6 +209,8 @@ uint32_t *vio_spirv_flatten_io_blocks(const uint32_t *spirv, size_t words, size_
 
 /* spirv[0] is the fragment stage; NULL entries are skipped. */
 void vio_sampler_plan_build(vio_sampler_plan *plan, const uint32_t *const *spirv, const size_t *size, int n);
+/* Release the plan's entries (the struct itself stays, emptied). */
+void vio_sampler_plan_free(vio_sampler_plan *plan);
 void vio_sampler_plan_use(const vio_sampler_plan *plan);   /* NULL ends it */
 const vio_sampler_plan *vio_sampler_plan_current(void);
 int  vio_sampler_plan_reg(const char *name);   /* -1: no plan in use or name not listed */

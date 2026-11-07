@@ -5860,7 +5860,6 @@ static const vio_backend vulkan_backend = {
     .bundle_method     = vulkan_bundle_method,
     .rt_origin_top     = 1,
     .clip_z_remap      = 1,
-    .shadow_sampler_base = VIO_SHADOW_SAMPLER_BASE,
     .set_frame_present = vulkan_set_frame_present,
     .create_swapchain  = vulkan_create_swapchain,
     .set_swapchain     = vulkan_set_swapchain,

@@ -15,7 +15,6 @@
 
 #define VIO_MAX_UNIFORMS 256
 #define VIO_CBUFFER_SIZE 4096
-#define VIO_MAX_SAMPLERS 16
 
 typedef struct _vio_uniform_entry {
     char    name[64];
@@ -103,19 +102,23 @@ typedef struct _vio_shader_object {
      * from the buffer bound at that binding (OPEN-ITEMS-PLAN A32). */
     int               block_binding;
     int               frag_block_binding;
-    /* Sampler binding map: sampler_names[i] -> hlsl register i */
-    char              sampler_names[VIO_MAX_SAMPLERS][64];
-    int               sampler_is_depth[VIO_MAX_SAMPLERS]; /* 1 if sampler2DShadow */
-    int               sampler_hlsl_reg[VIO_MAX_SAMPLERS];  /* actual HLSL t-register assigned by the
-                                                            * cross-compiler (regular: 0,1,2..; depth: 4,5,6..)
-                                                            * — mirrors vio_shader_reflect.c emit logic */
+    /* Sampler binding map: sampler_names[i] -> hlsl register i. Sized by the
+     * shader's reflection (vio_shader_sampler_reserve), no fixed limit: the
+     * context's texture units bound it (SAMPLER-LIMITS-PLAN). */
+    char            (*sampler_names)[64];
+    int              *sampler_is_depth;   /* 1 if sampler2DShadow */
+    int              *sampler_hlsl_reg;   /* actual HLSL t-register assigned by the cross-compiler
+                                           * — mirrors vio_shader_reflect.c emit logic */
     int               sampler_count;
-    /* Runtime GL-slot to HLSL-binding remap: gl_to_hlsl[gl_slot] = hlsl_binding (-1 = unmapped) */
-    int               gl_to_hlsl_sampler[16];
+    int               sampler_cap;
+    /* Runtime GL-unit to sampler remap: gl_to_hlsl[unit] = sampler index (-1 =
+     * unmapped), unit_count entries (the context's texture units). */
+    int              *gl_to_hlsl_sampler;
+    int               unit_count;
     /* GL texture unit each sampler reads, as on OpenGL: the layout(binding)
      * (0 without one) until vio_set_uniform(name, unit) sets it. The typed-
      * register backends bind every sampler from its unit at draw time. */
-    int               sampler_unit[VIO_MAX_SAMPLERS];
+    int              *sampler_unit;
     /* Lazily-built name -> (stage,offset,size) map for O(1) uniform lookup on the
      * hot draw path (replaces a linear strcmp scan run for every uniform set).
      * NULL until first use; freed in vio_shader_free_object. */
@@ -127,6 +130,16 @@ typedef struct _vio_shader_object {
 } vio_shader_object;
 
 extern zend_class_entry *vio_shader_ce;
+/* Grow the sampler tables to hold at least n samplers (SAMPLER-LIMITS-PLAN). */
+void vio_shader_sampler_reserve(vio_shader_object *shader, int n);
+/* Size the GL-unit remap for `units` texture units, every entry unmapped. */
+void vio_shader_units_init(vio_shader_object *shader, int units);
+/* Sampler index a GL unit is remapped to, -1 when none or out of range. */
+static inline int vio_shader_unit_map(const vio_shader_object *shader, long unit)
+{
+    return (shader->gl_to_hlsl_sampler && unit >= 0 && unit < shader->unit_count)
+        ? shader->gl_to_hlsl_sampler[unit] : -1;
+}
 
 void vio_shader_register(void);
 

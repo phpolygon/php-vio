@@ -57,11 +57,10 @@
  * shadow registers, so no shadow SRV is ever dropped at bind time. */
 #define VIO_D3D12_SRV_TABLE_SIZE 16
 
-/* Per-draw SAMPLER descriptor table (root param [4], registers s0..s11). One
- * sampler per regular texture register t0..t11; the comparison samplers for
- * shadow maps stay STATIC at s12..s15 (SPIRV-Cross assigns depth samplers from
- * VIO_SHADOW_SAMPLER_BASE = 12 — see vio_shader_reflect.h). Until 2.40 the
- * split was 8 / 8..11.
+/* Per-draw SAMPLER descriptor table (root param [4], registers s0..): one
+ * sampler per texture register, regular or comparing - a comparison sampler
+ * (sampler*Shadow) gets VIO_D3D12_SAMPLER_COMBO_COMPARE at its register
+ * (SAMPLER-LIMITS-PLAN; until then s12..s15 were static comparison samplers).
  *
  * Before the GAP-PLAN (Phase 1) s0..s7 were static LINEAR/WRAP samplers, so a
  * texture's filter / wrap / anisotropy were silently ignored on D3D12 (NEAREST
@@ -69,9 +68,12 @@
  * a pre-built sampler combination (filter x wrap x anisotropy) in a CPU-only
  * "combo" heap and the per-draw flush copies the eight bound combos into a
  * shader-visible per-frame ring, exactly like the SRV table. */
-#define VIO_D3D12_SAMPLER_TABLE_SIZE  12   /* == VIO_SHADOW_SAMPLER_BASE */
+#define VIO_D3D12_SAMPLER_TABLE_SIZE  VIO_D3D12_SRV_TABLE_SIZE
 #define VIO_D3D12_SAMPLER_ANISO_LEVELS 5     /* 1, 2, 4, 8, 16 */
-#define VIO_D3D12_SAMPLER_COMBOS      (2 * 3 * VIO_D3D12_SAMPLER_ANISO_LEVELS)
+/* filter x wrap x anisotropy, then one comparison sampler (LESS_EQUAL, linear,
+ * border white - the former static shadow sampler). */
+#define VIO_D3D12_SAMPLER_COMBO_COMPARE (2 * 3 * VIO_D3D12_SAMPLER_ANISO_LEVELS)
+#define VIO_D3D12_SAMPLER_COMBOS      (VIO_D3D12_SAMPLER_COMBO_COMPARE + 1)
 /* Shader-visible sampler heaps are capped at 2048 descriptors by D3D12. */
 #define VIO_D3D12_SAMPLER_HEAP_CAPACITY 2048
 /* Distinct sampler sets remembered per frame (each set = one 8-descriptor
