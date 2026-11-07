@@ -23,13 +23,13 @@ static inline void vio_d3d_check_override_cbuffer(ID3DBlob *blob, const void *gl
                                                   const char *backend, const char *label)
 {
     if (!blob || !glsl_spirv || spirv_size < 20) return;
-    vio_uniform_entry entries[VIO_MAX_UNIFORMS];
+    vio_uniform_entry *entries = NULL;
     int total = 0;
-    int count = vio_spirv_get_uniform_offsets((const uint32_t *)glsl_spirv, spirv_size, entries, VIO_MAX_UNIFORMS, &total);
-    if (count <= 0) return;
+    int count = vio_spirv_get_uniform_offsets((const uint32_t *)glsl_spirv, spirv_size, &entries, &total);
+    if (count <= 0) { if (entries) efree(entries); return; }
     ID3D11ShaderReflection *refl = NULL;
     if (FAILED(D3DReflect(ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob),
-                          &IID_ID3D11ShaderReflection, (void **)&refl)) || !refl) return;
+                          &IID_ID3D11ShaderReflection, (void **)&refl)) || !refl) { efree(entries); return; }
     ID3D11ShaderReflectionConstantBuffer *cb = NULL;
     D3D11_SHADER_DESC sd;
     if (SUCCEEDED(refl->lpVtbl->GetDesc(refl, &sd))) {
@@ -54,6 +54,7 @@ static inline void vio_d3d_check_override_cbuffer(ID3DBlob *blob, const void *gl
         }
     }
     refl->lpVtbl->Release(refl);
+    efree(entries);
 }
 
 #endif

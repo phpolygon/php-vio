@@ -561,6 +561,7 @@ static int create_logical_device(void)
             uint64_t u = img < smp ? img : smp;
             if (u > res) u = res;
             vio_vk.tex_units = u > INT_MAX ? INT_MAX : (int)(u < 1 ? 1 : u);
+            vio_vk.ubo_limit = lm->maxUniformBufferRange > INT_MAX ? INT_MAX : (int)lm->maxUniformBufferRange;
         }
         if (avail.samplerAnisotropy) {
             features.samplerAnisotropy = VK_TRUE;
@@ -4085,6 +4086,12 @@ static void vulkan_texture_limits(int *textures, int *samplers)
     *samplers = vio_vk.tex_units > 0 ? vio_vk.tex_units : 16;
 }
 
+/* The default uniform block is a uniform buffer: maxUniformBufferRange. */
+static int vulkan_uniform_block_limit(void)
+{
+    return vio_vk.ubo_limit;
+}
+
 int vio_vk3d_units(void)
 {
     return vio_vk.tex_units > 0 ? vio_vk.tex_units : 16;
@@ -5892,6 +5899,7 @@ static const vio_backend vulkan_backend = {
     .rt_origin_top     = 1,
     .clip_z_remap      = 1,
     .texture_limits    = vulkan_texture_limits,
+    .uniform_block_limit = vulkan_uniform_block_limit,
     .set_frame_present = vulkan_set_frame_present,
     .create_swapchain  = vulkan_create_swapchain,
     .set_swapchain     = vulkan_set_swapchain,

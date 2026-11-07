@@ -135,11 +135,11 @@ struct _vio_uniform_entry;
 typedef struct _vio_uniform_entry vio_uniform_entry;
 
 /* Extract uniform member offsets from a SPIR-V module's UBO/push constant block.
- * Fills entries[] with name/offset/size. Returns number of entries found.
- * total_size is set to the aligned total size of the constant buffer. */
+ * *entries (NULL or an earlier table, emalloc'd) is grown to hold every member -
+ * no fixed count; the caller efrees it. Returns the number of entries. total_size
+ * is the block's declared size (not the last reflected member's end), aligned to 16. */
 int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
-                                   vio_uniform_entry *entries, int max_entries,
-                                   int *total_size);
+                                   vio_uniform_entry **entries, int *total_size);
 
 /* Binding of the uniform block vio_spirv_get_uniform_offsets reads (the first
  * one) when it is a named block; -1 for loose uniforms (glslang's default

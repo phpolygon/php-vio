@@ -13,8 +13,14 @@
 #include "../include/vio_types.h"
 #include "vio_shader_reflect.h"
 
-#define VIO_MAX_UNIFORMS 256
-#define VIO_CBUFFER_SIZE 4096
+/* Uniform tables and constant shadows are sized by each stage's reflection; the
+ * backend's constant-buffer size (vio_backend::uniform_block_limit) is the only
+ * limit. The name lookup packs (stage, offset, size) into one zend_long. */
+#define VIO_UNIFORM_ENC(stage, offset, size) ((zend_long)1 << 62 | (zend_long)(stage) << 58 \
+    | ((zend_long)(offset) & 0x1FFFFFFF) << 29 | ((zend_long)(size) & 0x1FFFFFFF))
+#define VIO_UNIFORM_STAGE(e)  ((int)(((e) >> 58) & 0xF))
+#define VIO_UNIFORM_OFFSET(e) ((int)(((e) >> 29) & 0x1FFFFFFF))
+#define VIO_UNIFORM_SIZE(e)   ((int)((e) & 0x1FFFFFFF))
 
 typedef struct _vio_uniform_entry {
     char    name[64];
@@ -42,8 +48,8 @@ struct _vio_backend;
  * Same layout/lifecycle as the vertex cbuffer fields below; allocated only
  * when the stage exists so the common VS+FS shader object stays small. */
 typedef struct _vio_shader_stage_cb {
-    unsigned char     data[VIO_CBUFFER_SIZE];
-    vio_uniform_entry uniforms[VIO_MAX_UNIFORMS];
+    unsigned char    *data;      /* constant shadow, total_size bytes (emalloc) */
+    vio_uniform_entry *uniforms;  /* uniform_count entries (emalloc) */
     int               uniform_count;
     int               total_size;
     void             *backend;   /* backend constant buffer (create_buffer) */
@@ -84,15 +90,15 @@ typedef struct _vio_shader_object {
     size_t            task_spirv_size;
     void             *backend_shader; /* Backend-specific compiled shader (D3D11/D3D12/Vulkan) */
     /* Uniform buffer for D3D constant buffer mapping — vertex stage */
-    unsigned char     cbuffer_data[VIO_CBUFFER_SIZE];
-    vio_uniform_entry uniforms[VIO_MAX_UNIFORMS];
+    unsigned char    *cbuffer_data;   /* cbuffer_total_size bytes (emalloc) */
+    vio_uniform_entry *uniforms;      /* uniform_count entries (emalloc) */
     int               uniform_count;
     int               cbuffer_total_size;
     void             *cbuffer_backend;  /* Backend constant buffer (vertex) */
     int               cbuffer_dirty;    /* 1 if data changed since last upload */
     /* Fragment stage constant buffer */
-    unsigned char     frag_cbuffer_data[VIO_CBUFFER_SIZE];
-    vio_uniform_entry frag_uniforms[VIO_MAX_UNIFORMS];
+    unsigned char    *frag_cbuffer_data;   /* frag_cbuffer_total_size bytes (emalloc) */
+    vio_uniform_entry *frag_uniforms;      /* frag_uniform_count entries (emalloc) */
     int               frag_uniform_count;
     int               frag_cbuffer_total_size;
     void             *frag_cbuffer_backend;

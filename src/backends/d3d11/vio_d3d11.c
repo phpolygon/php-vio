@@ -4582,6 +4582,12 @@ int vio_d3d11_setup_context(void *platform_window, vio_config *cfg)
 
 /* ── Backend registration ─────────────────────────────────────────── */
 
+/* A constant buffer holds 4096 vec4 registers. */
+static int d3d11_uniform_block_limit(void)
+{
+    return D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+}
+
 /* SAMPLER-LIMITS-PLAN: D3D11's binding model, 128 SRVs / 16 samplers per stage. */
 static void d3d11_texture_limits(int *textures, int *samplers)
 {
@@ -4676,6 +4682,7 @@ static const vio_backend d3d11_backend = {
     .clip_z_remap      = 1,
     .bind_compare_sampler = d3d11_bind_compare_sampler,
     .texture_limits    = d3d11_texture_limits,
+    .uniform_block_limit = d3d11_uniform_block_limit,
     .set_frame_present = d3d11_set_frame_present,
     .create_swapchain  = d3d11_create_swapchain,
     .set_swapchain     = d3d11_set_swapchain,

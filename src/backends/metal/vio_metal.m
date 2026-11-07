@@ -3752,7 +3752,8 @@ static id<MTLBuffer> metal_identity_instance = nil;
 /* Constant blocks of the tessellation stages for the next draw, copied by
  * bind_stage_constants (vio_push_extra_stage_constants runs right before every
  * draw). The TCS kernel takes them via setBytes, the TES as a ring slice. */
-static unsigned char metal_stage_const[VIO_EXTRA_STAGE_COUNT][VIO_CBUFFER_SIZE];
+static unsigned char *metal_stage_const[VIO_EXTRA_STAGE_COUNT];
+static size_t        metal_stage_const_cap[VIO_EXTRA_STAGE_COUNT];
 static size_t        metal_stage_const_size[VIO_EXTRA_STAGE_COUNT];
 
 static void metal_bind_stage_constants(int stage, void *backend_buffer, const void *data, size_t size)
@@ -3760,11 +3761,51 @@ static void metal_bind_stage_constants(int stage, void *backend_buffer, const vo
     (void)backend_buffer;
     int i = VIO_EXTRA_STAGE_INDEX(stage);
     if (i < 0 || i >= VIO_EXTRA_STAGE_COUNT || !data) return;
-    if (size > VIO_CBUFFER_SIZE) size = VIO_CBUFFER_SIZE;
-    memcpy(metal_stage_const[i], data, size);
     /* MSL structs round up to 16 bytes; the tail stays zero. */
-    if (size < VIO_CBUFFER_SIZE) memset(metal_stage_const[i] + size, 0, ((size + 15) & ~(size_t)15) - size);
-    metal_stage_const_size[i] = (size + 15) & ~(size_t)15;
+    size_t padded = (size + 15) & ~(size_t)15;
+    if (padded > metal_stage_const_cap[i]) {
+        unsigned char *p = realloc(metal_stage_const[i], padded);
+        if (!p) return;
+        metal_stage_const[i] = p;
+        metal_stage_const_cap[i] = padded;
+    }
+    memcpy(metal_stage_const[i], data, size);
+    if (padded > size) memset(metal_stage_const[i] + size, 0, padded - size);
+    metal_stage_const_size[i] = padded;
+}
+
+/* setBytes takes at most 4 KB (Metal's limit); a larger stage block goes
+ * through a ring slice, or a buffer of its own outside a frame. */
+#define VIO_METAL_SET_BYTES_MAX 4096
+static id<MTLBuffer> metal_stage_const_buffer(int i, NSUInteger *off)
+{
+    size_t n = metal_stage_const_size[i];
+    *off = 0;
+    id<MTLBuffer> rb = metal_ring_alloc(n, off);
+    if (rb) { memcpy((char *)[rb contents] + *off, metal_stage_const[i], n); return rb; }
+    return [vio_mtl.device newBufferWithBytes:metal_stage_const[i] length:n options:MTLResourceStorageModeShared];
+}
+
+static void metal_stage_const_vertex(id<MTLRenderCommandEncoder> e, int i, NSUInteger index)
+{
+    if (metal_stage_const_size[i] <= VIO_METAL_SET_BYTES_MAX) {
+        [e setVertexBytes:metal_stage_const[i] length:metal_stage_const_size[i] atIndex:index];
+        return;
+    }
+    NSUInteger off = 0;
+    id<MTLBuffer> b = metal_stage_const_buffer(i, &off);
+    if (b) [e setVertexBuffer:b offset:off atIndex:index];
+}
+
+static void metal_stage_const_compute(id<MTLComputeCommandEncoder> e, int i, NSUInteger index)
+{
+    if (metal_stage_const_size[i] <= VIO_METAL_SET_BYTES_MAX) {
+        [e setBytes:metal_stage_const[i] length:metal_stage_const_size[i] atIndex:index];
+        return;
+    }
+    NSUInteger off = 0;
+    id<MTLBuffer> b = metal_stage_const_buffer(i, &off);
+    if (b) [e setBuffer:b offset:off atIndex:index];
 }
 
 static MTLPrimitiveTopologyClass metal_topology_class(MTLPrimitiveType t)
@@ -4988,7 +5029,7 @@ static void metal_tess_emul_draw(vio_metal_shader *sh, id<MTLCommandBuffer> kcb,
     [ce setVertexBuffer:cap offset:cap_off atIndex:VIO_METAL_TESS_EMUL_CAP_INDEX];
     int ti = VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_EVAL);
     if (sh->tes.cbuffer_index >= 0 && metal_stage_const_size[ti] > 0) {
-        [ce setVertexBytes:metal_stage_const[ti] length:metal_stage_const_size[ti] atIndex:(NSUInteger)sh->tes.cbuffer_index];
+        metal_stage_const_vertex(ce, ti, (NSUInteger)sh->tes.cbuffer_index);
     }
     [ce setTessellationFactorBuffer:hw offset:hw_off instanceStride:0];
     [ce drawPatches:out_cp patchStart:0 patchCount:patches patchIndexBuffer:nil patchIndexBufferOffset:0
@@ -5159,8 +5200,7 @@ static void metal_draw_tess(vio_metal_buffer *vb, int stride, int first_vertex, 
         [ce setBytes:params length:sizeof(params) atIndex:VIO_METAL_TESS_PARAMS_INDEX];
         int tc = VIO_EXTRA_STAGE_INDEX(VIO_STAGE_TESS_CONTROL);
         if (sh->tcs.cbuffer_index >= 0 && metal_stage_const_size[tc] > 0) {
-            [ce setBytes:metal_stage_const[tc] length:metal_stage_const_size[tc]
-                 atIndex:(NSUInteger)sh->tcs.cbuffer_index];
+            metal_stage_const_compute(ce, tc, (NSUInteger)sh->tcs.cbuffer_index);
         }
         [ce dispatchThreadgroups:MTLSizeMake(patches, 1, 1) threadsPerThreadgroup:MTLSizeMake(out_cp, 1, 1)];
         [ce endEncoding];
@@ -5400,7 +5440,7 @@ static void metal_draw_gs(vio_metal_buffer *vb, int stride, int first_vertex, in
         if (sh->gs_gs_cb >= 0) {
             int gi = VIO_EXTRA_STAGE_INDEX(VIO_STAGE_GEOMETRY);
             if (metal_stage_const_size[gi] > 0) {
-                [ce setBytes:metal_stage_const[gi] length:metal_stage_const_size[gi] atIndex:(NSUInteger)sh->gs_gs_cb];
+                metal_stage_const_compute(ce, gi, (NSUInteger)sh->gs_gs_cb);
             } else {
                 [ce setBytes:zero_block length:sizeof(zero_block) atIndex:(NSUInteger)sh->gs_gs_cb];
             }
