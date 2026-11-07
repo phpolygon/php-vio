@@ -646,12 +646,13 @@ static UINT d3d12_alloc_srv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE *out_cpu,
 
 /* ── Root Signature ───────────────────────────────────────────────── */
 
-/* The bindless table's samplers, s1..s4 in space 1 (BINDLESS-PLAN): vio_sampler
- * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp.
- * Graphics and compute root signatures carry the same four. */
-static void d3d12_bindless_static_samplers(D3D12_STATIC_SAMPLER_DESC out[4])
+/* The bindless table's samplers, s1..s4 and s7 in space 1 (BINDLESS-PLAN): vio_sampler
+ * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp,
+ * vio_sampler_aniso (s7: anisotropic 16x, repeat). Graphics and compute root signatures
+ * carry the same five. */
+static void d3d12_bindless_static_samplers(D3D12_STATIC_SAMPLER_DESC out[VIO_D3D12_BINDLESS_SAMPLERS])
 {
-    for (int v = 0; v < 4; v++) {
+    for (int v = 0; v < VIO_D3D12_BINDLESS_SAMPLERS; v++) {
         D3D12_STATIC_SAMPLER_DESC *s = &out[v];
         D3D12_TEXTURE_ADDRESS_MODE am = (v & 2) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         memset(s, 0, sizeof(*s));
@@ -662,6 +663,12 @@ static void d3d12_bindless_static_samplers(D3D12_STATIC_SAMPLER_DESC out[4])
         s->ShaderRegister = 1 + (UINT)v;
         s->RegisterSpace = 1;
         s->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        if (v == 4) {
+            s->Filter = D3D12_FILTER_ANISOTROPIC;
+            s->AddressU = s->AddressV = s->AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            s->MaxAnisotropy = 16;
+            s->ShaderRegister = 7;   /* GLSL set 1, binding 7 */
+        }
     }
 }
 
@@ -834,7 +841,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     params[VIO_D3D12_RP_BINDLESS].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     /* The bindless table's samplers, s1..s4 in space 1 (BINDLESS-PLAN): vio_sampler
      * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp. */
-    D3D12_STATIC_SAMPLER_DESC all_samplers[4];
+    D3D12_STATIC_SAMPLER_DESC all_samplers[VIO_D3D12_BINDLESS_SAMPLERS];
     d3d12_bindless_static_samplers(all_samplers);
 
     /* [20] / [21] Vertex textures (A28): the SRV and sampler tables for the
@@ -887,7 +894,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     rs_desc.NumParameters = vio_d3d12.sampler_feedback ? VIO_D3D12_RP_COUNT
                           : vio_d3d12.bindless ? VIO_D3D12_RP_FEEDBACK : VIO_D3D12_RP_BINDLESS;
     rs_desc.pParameters = params;
-    rs_desc.NumStaticSamplers = vio_d3d12.bindless ? 4 : 0;
+    rs_desc.NumStaticSamplers = vio_d3d12.bindless ? VIO_D3D12_BINDLESS_SAMPLERS : 0;
     rs_desc.pStaticSamplers = vio_d3d12.bindless ? all_samplers : NULL;
     rs_desc.Flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -8243,7 +8250,7 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
     params[4].DescriptorTable.NumDescriptorRanges = 3;
     params[4].DescriptorTable.pDescriptorRanges = bindless_ranges;
     params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_STATIC_SAMPLER_DESC bindless_samplers[4];
+    D3D12_STATIC_SAMPLER_DESC bindless_samplers[VIO_D3D12_BINDLESS_SAMPLERS];
     d3d12_bindless_static_samplers(bindless_samplers);
 
     /* [3] root SRV t0, space9 — the ray-query acceleration structure, when used. */
@@ -8274,7 +8281,7 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
     rs_desc.NumParameters = cp->uses_bindless ? 5 : cp->uses_accel ? 4 : 3;
     rs_desc.pParameters = params;
-    rs_desc.NumStaticSamplers = cp->uses_bindless ? 4 : 0;
+    rs_desc.NumStaticSamplers = cp->uses_bindless ? VIO_D3D12_BINDLESS_SAMPLERS : 0;
     rs_desc.pStaticSamplers = cp->uses_bindless ? bindless_samplers : NULL;
     rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE; /* NO input-assembler flag */
 

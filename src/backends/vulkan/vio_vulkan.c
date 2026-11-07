@@ -2180,7 +2180,17 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void)
         vi.addressModeU = vi.addressModeV = vi.addressModeW = clamp ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
         if (vkCreateSampler(vio_vk.device, &vi, NULL, &vio_vk.bindless_sampler_variants[v]) != VK_SUCCESS) return VK_NULL_HANDLE;
     }
-    VkDescriptorSetLayoutBinding b[7];
+    /* Binding 7: vio_sampler_aniso - linear, repeat, up to 16x anisotropic (the
+     * device limit; plain linear where the device has no anisotropy). */
+    {
+        VkSamplerCreateInfo ai = sci;
+        if (vio_vk.anisotropy_supported) {
+            ai.anisotropyEnable = VK_TRUE;
+            ai.maxAnisotropy = vio_vk.max_anisotropy < 16.0f ? vio_vk.max_anisotropy : 16.0f;
+        }
+        if (vkCreateSampler(vio_vk.device, &ai, NULL, &vio_vk.bindless_sampler_variants[3]) != VK_SUCCESS) return VK_NULL_HANDLE;
+    }
+    VkDescriptorSetLayoutBinding b[8];
     memset(b, 0, sizeof(b));
     b[0].binding            = 0;
     b[0].descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -2201,25 +2211,28 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void)
     b[5].binding = 5;
     b[6] = b[0];
     b[6].binding = 6;
-    VkDescriptorBindingFlagsEXT flags[7] = {
+    b[7] = b[1];
+    b[7].binding = 7;
+    b[7].pImmutableSamplers = &vio_vk.bindless_sampler_variants[3];
+    VkDescriptorBindingFlagsEXT flags[8] = {
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT, 0, 0, 0, 0,
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT,
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT };
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT, 0 };
     VkDescriptorSetLayoutBindingFlagsCreateInfoEXT bf = {0};
     bf.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT;
-    bf.bindingCount  = 7;
+    bf.bindingCount  = 8;
     bf.pBindingFlags = flags;
     VkDescriptorSetLayoutCreateInfo li = {0};
     li.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     li.pNext        = &bf;
     li.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT_EXT;
-    li.bindingCount = 7;
+    li.bindingCount = 8;
     li.pBindings    = b;
     if (vkCreateDescriptorSetLayout(vio_vk.device, &li, NULL, &vio_vk.bindless_layout) != VK_SUCCESS) {
         vio_vk.bindless_layout = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * VIO_BINDLESS_MAX }, { VK_DESCRIPTOR_TYPE_SAMPLER, 4 } };
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * VIO_BINDLESS_MAX }, { VK_DESCRIPTOR_TYPE_SAMPLER, 5 } };
     VkDescriptorPoolCreateInfo pi = {0};
     pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pi.flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT_EXT;
@@ -2366,7 +2379,7 @@ static void vulkan_shutdown(void)
         if (vio_vk.bindless_pool)    { vkDestroyDescriptorPool(vio_vk.device, vio_vk.bindless_pool, NULL); vio_vk.bindless_pool = VK_NULL_HANDLE; }
         if (vio_vk.bindless_layout)  { vkDestroyDescriptorSetLayout(vio_vk.device, vio_vk.bindless_layout, NULL); vio_vk.bindless_layout = VK_NULL_HANDLE; }
         if (vio_vk.bindless_sampler) { vkDestroySampler(vio_vk.device, vio_vk.bindless_sampler, NULL); vio_vk.bindless_sampler = VK_NULL_HANDLE; }
-        for (int v = 0; v < 3; v++) {
+        for (int v = 0; v < 4; v++) {
             if (vio_vk.bindless_sampler_variants[v]) { vkDestroySampler(vio_vk.device, vio_vk.bindless_sampler_variants[v], NULL); vio_vk.bindless_sampler_variants[v] = VK_NULL_HANDLE; }
         }
         vio_vk.bindless_set = VK_NULL_HANDLE;
