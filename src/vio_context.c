@@ -46,6 +46,7 @@ void vio_context_texture_units_free(vio_context_object *ctx)
     if (ctx->pending_tex_obj) { efree(ctx->pending_tex_obj); ctx->pending_tex_obj = NULL; }
     if (ctx->pending_tex_kind) { efree(ctx->pending_tex_kind); ctx->pending_tex_kind = NULL; }
     ctx->pending_tex_high = 0;
+    ctx->pending_tex_cap = 0;
     ctx->texture_units = 0;
 }
 
@@ -59,8 +60,7 @@ void vio_context_texture_units_init(vio_context_object *ctx)
     ctx->texture_limit = textures;
     ctx->sampler_limit = samplers;
     ctx->texture_units = textures < samplers ? textures : samplers;
-    ctx->pending_tex_obj = ecalloc((size_t)ctx->texture_units, sizeof(void *));
-    ctx->pending_tex_kind = ecalloc((size_t)ctx->texture_units, sizeof(int));
+    /* The pending table grows on use (vio_pending_texture_set). */
 }
 
 void vio_context_bindless_clear(vio_context_object *ctx)

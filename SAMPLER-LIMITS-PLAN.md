@@ -1,6 +1,6 @@
 # SAMPLER-LIMITS-PLAN – Backend-Grenzen statt eigener Textur-/Sampler-Grenzen
 
-Stand: 2026-11-07, Branch `feat/backend-sampler-limits`.
+Stand: 2026-11-07, Branch `feat/backend-sampler-limits`. Phasen 1–6 umgesetzt (Suite grün, Test 257 erweitert, Test 277 neu); Phase 7 (Metal Argument Buffers) offen. Befunde: FXC begrenzt Sampler-Register auf 16 (D3D12 ohne Shader Model 6), WARP stürzt ab 129 Texturen pro Stufe ab (ohne Debug-Layer) und bekommt 128.
 
 ## Ziel
 

@@ -4582,6 +4582,13 @@ int vio_d3d11_setup_context(void *platform_window, vio_config *cfg)
 
 /* ── Backend registration ─────────────────────────────────────────── */
 
+/* SAMPLER-LIMITS-PLAN: D3D11's binding model, 128 SRVs / 16 samplers per stage. */
+static void d3d11_texture_limits(int *textures, int *samplers)
+{
+    *textures = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+    *samplers = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;
+}
+
 /* A sampler*Shadow at `slot`: the texture's comparison sampler (SAMPLER-LIMITS-PLAN). */
 static void d3d11_bind_compare_sampler(void *texture, int slot)
 {
@@ -4668,6 +4675,7 @@ static const vio_backend d3d11_backend = {
     .rt_origin_top     = 1,
     .clip_z_remap      = 1,
     .bind_compare_sampler = d3d11_bind_compare_sampler,
+    .texture_limits    = d3d11_texture_limits,
     .set_frame_present = d3d11_set_frame_present,
     .create_swapchain  = d3d11_create_swapchain,
     .set_swapchain     = d3d11_set_swapchain,

@@ -766,11 +766,15 @@ function vio_swapchain_info(VioContext $context): array {}
  * 'clip_z_remap' => bool (vio maps the GLSL clip z [-w, w] to the API's [0, w]:
  * D3D, Vulkan, and Metal since 2.40), 'depth_stored' => '(ndc_z + 1) / 2' (what
  * the depth buffer holds for GLSL clip z on every backend - no per-backend
- * conversion)]. 'samplers' => ['total' => 16 per stage, 'regular' => how many
- * non-comparison samplers fit (12 on D3D12 / Vulkan, 16 elsewhere), 'comparison'
- * => sampler*Shadow slots (4 on D3D12 / Vulkan; elsewhere they share the 16),
- * 'comparison_base' => their first register (12, 0 = no split)]; up to 2.39 the
- * D3D12 / Vulkan split was 8 / 8. Absent keys = an older vio.
+ * conversion)]. 'samplers' => ['total' => texture units per stage - the
+ * backend's own limit (OpenGL GL_MAX_TEXTURE_IMAGE_UNITS, D3D11 / Metal 16,
+ * D3D12 16 with FXC and up to one frame's slice of the sampler heap with
+ * 'shader_model' => 6, 128 on WARP, Vulkan the device's descriptor limits),
+ * 'regular' / 'comparison' => the same (any unit may compare), 'comparison_base'
+ * => 0, 'textures' / 'sampler_states' => the raw per-stage limits]. A shader
+ * reading more units than 'total' fails with a warning. Until
+ * SAMPLER-LIMITS-PLAN: 16 in all, D3D12 / Vulkan split 12 regular + 4
+ * comparison (8 / 8 up to 2.39). Absent keys = an older vio.
  */
 function vio_backend_info(VioContext $context): array|false {}
 

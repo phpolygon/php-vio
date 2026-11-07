@@ -2373,13 +2373,29 @@ static int opengl_update_font_atlas(void *font_obj, const unsigned char *r8, int
  * white border. The units are released after the draw so the 2D batch and
  * later draws sample them normally. */
 #define GL_SHADOW_CACHE_SIZE 64
-#define GL_SHADOW_MAX_LOCS   16
 
 typedef struct {
     GLuint program;                    /* 0 = empty slot */
     int    count;                      /* shadow sampler locations (array elements expanded) */
-    GLint  locs[GL_SHADOW_MAX_LOCS];
+    int    cap;
+    GLint *locs;                       /* grows with the program (SAMPLER-LIMITS-PLAN) */
 } gl_shadow_entry;
+
+/* Units the comparison sampler is bound to during the current draw. */
+static GLint *gl_shadow_bound;
+static int    gl_shadow_bound_cap;
+
+static void gl_shadow_add_loc(gl_shadow_entry *e, GLint loc)
+{
+    if (e->count >= e->cap) {
+        int cap = e->cap > 0 ? e->cap * 2 : 16;
+        GLint *nl = realloc(e->locs, (size_t)cap * sizeof(GLint));
+        if (!nl) return;
+        e->locs = nl;
+        e->cap = cap;
+    }
+    e->locs[e->count++] = loc;
+}
 
 static gl_shadow_entry gl_shadow_cache[GL_SHADOW_CACHE_SIZE];
 static GLuint   gl_cmp_sampler;
@@ -2418,7 +2434,7 @@ static const gl_shadow_entry *gl_shadow_entry_for(GLuint program)
     e->count = 0;
     GLint active = 0;
     glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &active);
-    for (GLint u = 0; u < active && e->count < GL_SHADOW_MAX_LOCS; u++) {
+    for (GLint u = 0; u < active; u++) {
         char name[128];
         GLint size = 0;
         GLenum type = 0;
@@ -2427,19 +2443,20 @@ static const gl_shadow_entry *gl_shadow_entry_for(GLuint program)
         /* Array elements may not have consecutive locations: query each one. */
         char *bracket = strchr(name, '[');
         if (bracket) *bracket = '\0';
-        for (GLint k = 0; k < size && e->count < GL_SHADOW_MAX_LOCS; k++) {
+        for (GLint k = 0; k < size; k++) {
             char elem[160];
             if (size > 1) snprintf(elem, sizeof(elem), "%s[%d]", name, (int)k);
             else snprintf(elem, sizeof(elem), "%s", name);
             GLint loc = glGetUniformLocation(program, elem);
-            if (loc >= 0) e->locs[e->count++] = loc;
+            if (loc >= 0) gl_shadow_add_loc(e, loc);
         }
     }
     return e;
 }
 
 /* Bind the comparison sampler to every unit the current program's shadow
- * samplers read; returns the bound units as a bit mask for gl_shadow_end(). */
+ * samplers read; returns how many units it bound (gl_shadow_bound) for
+ * gl_shadow_end(). */
 /* ── Multiview (GL_OVR_multiview2) ────────────────────────────────────
  * A program compiled with 'view_count' draws every view into one layer of the
  * target bound with VIO_RT_ALL_LAYERS: its attachments become multiview
@@ -2588,23 +2605,41 @@ static unsigned gl_shadow_begin(void)
         glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_BORDER);
         glSamplerParameterfv(gl_cmp_sampler, GL_TEXTURE_BORDER_COLOR, white);
     }
-    unsigned mask = 0;
+    if (e->count > gl_shadow_bound_cap) {
+        GLint *nb = realloc(gl_shadow_bound, (size_t)e->count * sizeof(GLint));
+        if (!nb) return 0;
+        gl_shadow_bound = nb;
+        gl_shadow_bound_cap = e->count;
+    }
+    unsigned n = 0;
     for (int i = 0; i < e->count; i++) {
         GLint unit = 0;
         glGetUniformiv((GLuint)program, e->locs[i], &unit);
-        if (unit < 0 || unit >= 32 || (mask & (1u << unit))) continue;
+        if (unit < 0) continue;
+        int seen = 0;
+        for (unsigned k = 0; k < n && !seen; k++) seen = gl_shadow_bound[k] == unit;
+        if (seen) continue;
         glBindSampler((GLuint)unit, gl_cmp_sampler);
-        mask |= 1u << unit;
+        gl_shadow_bound[n++] = unit;
     }
-    return mask;
+    return n;
 }
 
-static void gl_shadow_end(unsigned mask)
+static void gl_shadow_end(unsigned bound)
 {
     gl_clip_end();
-    for (GLuint unit = 0; mask; unit++, mask >>= 1) {
-        if (mask & 1u) glBindSampler(unit, 0);
-    }
+    for (unsigned k = 0; k < bound; k++) glBindSampler((GLuint)gl_shadow_bound[k], 0);
+}
+
+/* SAMPLER-LIMITS-PLAN: the driver's texture image units of one stage (a GL
+ * unit couples a texture and its sampler). */
+static void opengl_texture_limits(int *textures, int *samplers)
+{
+    GLint n = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &n);
+    if (n < 16) n = 16;   /* the GL 4.1 minimum */
+    *textures = (int)n;
+    *samplers = (int)n;
 }
 
 static void opengl_draw_mesh(void *mesh_obj)
@@ -3481,6 +3516,7 @@ static int opengl_supports_feature(vio_feature feature)
 
 static const vio_backend opengl_backend = {
     .name              = "opengl",
+    .texture_limits = opengl_texture_limits,
     .api_version       = VIO_BACKEND_API_VERSION,
     .init              = opengl_init,
     .shutdown          = opengl_shutdown,

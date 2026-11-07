@@ -1831,9 +1831,9 @@ static int d3d12_init(vio_config *cfg)
     /* WARP reports Tier 3 but faults (access violation while executing the list)
      * once a pixel shader reads more than 128 texture registers - unless the
      * debug layer is on. Its working limit is the Tier 1 SRV count. */
-    if (vio_d3d12.warp && vio_d3d12.units > D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
-        vio_d3d12.units = D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
-        vio_d3d12.texture_limit = D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+    if (vio_d3d12.warp) {
+        if (vio_d3d12.units > D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) vio_d3d12.units = D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+        if (vio_d3d12.texture_limit > D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) vio_d3d12.texture_limit = D3D12_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
     }
     vio_d3d12.pending_srvs = calloc((size_t)vio_d3d12.units, sizeof(D3D12_CPU_DESCRIPTOR_HANDLE));
     vio_d3d12.pending_srv_valid = calloc((size_t)vio_d3d12.units, sizeof(int));

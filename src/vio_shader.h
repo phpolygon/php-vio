@@ -112,8 +112,11 @@ typedef struct _vio_shader_object {
     int               sampler_count;
     int               sampler_cap;
     /* Runtime GL-unit to sampler remap: gl_to_hlsl[unit] = sampler index (-1 =
-     * unmapped), unit_count entries (the context's texture units). */
+     * unmapped). unit_count is the context's texture units (the limit); the
+     * table grows to the highest unit set (gl_to_hlsl_cap), so a backend with a
+     * million units costs nothing until they are used. */
     int              *gl_to_hlsl_sampler;
+    int               gl_to_hlsl_cap;
     int               unit_count;
     /* GL texture unit each sampler reads, as on OpenGL: the layout(binding)
      * (0 without one) until vio_set_uniform(name, unit) sets it. The typed-
@@ -132,12 +135,14 @@ typedef struct _vio_shader_object {
 extern zend_class_entry *vio_shader_ce;
 /* Grow the sampler tables to hold at least n samplers (SAMPLER-LIMITS-PLAN). */
 void vio_shader_sampler_reserve(vio_shader_object *shader, int n);
-/* Size the GL-unit remap for `units` texture units, every entry unmapped. */
+/* Set the texture-unit limit of the GL-unit remap (the table grows on use). */
 void vio_shader_units_init(vio_shader_object *shader, int units);
+/* Grow the GL-unit remap to hold unit `n - 1` (new entries unmapped). */
+void vio_shader_unit_reserve(vio_shader_object *shader, int n);
 /* Sampler index a GL unit is remapped to, -1 when none or out of range. */
 static inline int vio_shader_unit_map(const vio_shader_object *shader, long unit)
 {
-    return (shader->gl_to_hlsl_sampler && unit >= 0 && unit < shader->unit_count)
+    return (shader->gl_to_hlsl_sampler && unit >= 0 && unit < shader->gl_to_hlsl_cap)
         ? shader->gl_to_hlsl_sampler[unit] : -1;
 }
 

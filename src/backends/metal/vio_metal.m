@@ -289,6 +289,17 @@ static void metal_apply_viewports(void)
 
 /* Vertex-stage [[render_target_array_index]] / [[viewport_array_index]] and
  * setViewports:count: (layered rendering, multiple viewports). */
+/* SAMPLER-LIMITS-PLAN: Metal's argument tables per stage (without argument
+ * buffers): 16 samplers; 128 textures on Apple GPU families 6+ and Mac2, 31
+ * before. The units are the samplers. */
+static void metal_texture_limits(int *textures, int *samplers)
+{
+    int t = 31;
+    if (vio_mtl.device && ([vio_mtl.device supportsFamily:MTLGPUFamilyApple6] || [vio_mtl.device supportsFamily:MTLGPUFamilyMac2])) t = 128;
+    *textures = t;
+    *samplers = 16;
+}
+
 static int metal_supports_layered_vertex(void)
 {
     return vio_mtl.device ? vio_mtl.caps.layered_vertex : 0;
@@ -7494,6 +7505,7 @@ static const vio_backend metal_backend = {
     .read_buffer              = metal_read_buffer,
     .rt_origin_top            = 1,
     .clip_z_remap             = 1,
+    .texture_limits           = metal_texture_limits,
     .set_frame_present        = metal_set_frame_present,
     .create_swapchain         = metal_create_swapchain,
     .set_swapchain            = metal_set_swapchain,

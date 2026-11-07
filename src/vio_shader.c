@@ -151,10 +151,19 @@ void vio_shader_sampler_reserve(vio_shader_object *shader, int n)
 
 void vio_shader_units_init(vio_shader_object *shader, int units)
 {
-    if (units < 1) units = 1;
-    shader->gl_to_hlsl_sampler = erealloc(shader->gl_to_hlsl_sampler, (size_t)units * sizeof(int));
-    for (int i = 0; i < units; i++) shader->gl_to_hlsl_sampler[i] = -1;
-    shader->unit_count = units;
+    shader->unit_count = units < 1 ? 1 : units;
+}
+
+void vio_shader_unit_reserve(vio_shader_object *shader, int n)
+{
+    if (n > shader->unit_count) n = shader->unit_count;
+    if (n <= shader->gl_to_hlsl_cap) return;
+    int cap = shader->gl_to_hlsl_cap > 0 ? shader->gl_to_hlsl_cap : 16;
+    while (cap < n) cap *= 2;
+    if (cap > shader->unit_count) cap = shader->unit_count;
+    shader->gl_to_hlsl_sampler = erealloc(shader->gl_to_hlsl_sampler, (size_t)cap * sizeof(int));
+    for (int i = shader->gl_to_hlsl_cap; i < cap; i++) shader->gl_to_hlsl_sampler[i] = -1;
+    shader->gl_to_hlsl_cap = cap;
 }
 
 static void vio_shader_free_object(zend_object *obj)
@@ -174,7 +183,7 @@ static void vio_shader_free_object(zend_object *obj)
     if (shader->sampler_unit) { efree(shader->sampler_unit); shader->sampler_unit = NULL; }
     if (shader->gl_to_hlsl_sampler) { efree(shader->gl_to_hlsl_sampler); shader->gl_to_hlsl_sampler = NULL; }
     vio_sampler_plan_free(&shader->sampler_plan);
-    shader->sampler_count = shader->sampler_cap = shader->unit_count = 0;
+    shader->sampler_count = shader->sampler_cap = shader->unit_count = shader->gl_to_hlsl_cap = 0;
 
     free(shader->mv_src[0]);
     free(shader->mv_src[1]);

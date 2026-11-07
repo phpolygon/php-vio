@@ -55,7 +55,13 @@ static void vk3d_add_binding(vio_vk3d_shader *sh, uint32_t binding, VkDescriptor
             return;
         }
     }
-    if (sh->binding_count >= VK3D_MAX_BINDINGS) return;
+    if (sh->binding_count >= sh->binding_cap) {
+        int cap = sh->binding_cap > 0 ? sh->binding_cap * 2 : 32;
+        vk3d_binding *nb = realloc(sh->bindings, (size_t)cap * sizeof(*nb));
+        if (!nb) return;
+        sh->bindings = nb;
+        sh->binding_cap = cap;
+    }
     vk3d_binding *b = &sh->bindings[sh->binding_count++];
     b->binding  = binding;
     b->type     = type;
@@ -63,6 +69,37 @@ static void vk3d_add_binding(vio_vk3d_shader *sh, uint32_t binding, VkDescriptor
     b->dim      = dim;
     b->is_depth = is_depth;
     b->size     = size;
+}
+
+/* Fragment-order sampler entry `fi` (the GL-unit map's index): its binding. */
+static void vk3d_fs_put(vio_vk3d_shader *sh, int fi, int binding, int depth)
+{
+    if (fi < 0) return;
+    if (fi >= sh->fs_sampler_cap) {
+        int cap = sh->fs_sampler_cap > 0 ? sh->fs_sampler_cap : 16;
+        while (cap <= fi) cap *= 2;
+        int *nb = realloc(sh->fs_sampler_binding, (size_t)cap * sizeof(int));
+        if (!nb) return;
+        sh->fs_sampler_binding = nb;
+        int *nd = realloc(sh->fs_sampler_depth, (size_t)cap * sizeof(int));
+        if (!nd) return;
+        sh->fs_sampler_depth = nd;
+        for (int i = sh->fs_sampler_cap; i < cap; i++) { sh->fs_sampler_binding[i] = -1; sh->fs_sampler_depth[i] = 0; }
+        sh->fs_sampler_cap = cap;
+    }
+    sh->fs_sampler_binding[fi] = binding;
+    sh->fs_sampler_depth[fi] = depth;
+    if (fi + 1 > sh->fs_sampler_count) sh->fs_sampler_count = fi + 1;
+}
+
+void vk3d_shader_free_arrays(vio_vk3d_shader *sh)
+{
+    free(sh->bindings);
+    free(sh->fs_sampler_binding);
+    free(sh->fs_sampler_depth);
+    sh->bindings = NULL;
+    sh->fs_sampler_binding = sh->fs_sampler_depth = NULL;
+    sh->binding_count = sh->binding_cap = sh->fs_sampler_count = sh->fs_sampler_cap = 0;
 }
 
 static VkImageViewType vk3d_sampler_dim(spvc_compiler c, spvc_type_id type_id, int *is_depth)
@@ -140,11 +177,39 @@ static void vk3d_assign_locations(spvc_compiler c, spvc_resources res, spvc_reso
  * fragment stage lacks join the GL-unit map after the fragment ones (the order
  * vio_shader_merge_stage_samplers in php_vio.c appends them in). */
 typedef struct _vk3d_stage_samplers {
-    char names[VK3D_MAX_SAMPLERS][64];
-    int  binding[VK3D_MAX_SAMPLERS];
-    int  depth[VK3D_MAX_SAMPLERS];
+    char (*names)[64];
+    int  *binding;
+    int  *depth;
     int  count;
+    int  cap;
 } vk3d_stage_samplers;
+
+static void vk3d_stage_samplers_add(vk3d_stage_samplers *s, const char *name, int binding, int depth)
+{
+    if (s->count >= s->cap) {
+        int cap = s->cap > 0 ? s->cap * 2 : 16;
+        void *nn = realloc(s->names, (size_t)cap * sizeof(*s->names));
+        if (!nn) return;
+        s->names = nn;
+        void *nb = realloc(s->binding, (size_t)cap * sizeof(int));
+        if (!nb) return;
+        s->binding = nb;
+        void *nd = realloc(s->depth, (size_t)cap * sizeof(int));
+        if (!nd) return;
+        s->depth = nd;
+        s->cap = cap;
+    }
+    snprintf(s->names[s->count], sizeof(s->names[0]), "%s", name ? name : "");
+    s->binding[s->count] = binding;
+    s->depth[s->count] = depth;
+    s->count++;
+}
+
+static void vk3d_stage_samplers_free(vk3d_stage_samplers *s)
+{
+    free(s->names); free(s->binding); free(s->depth);
+    memset(s, 0, sizeof(*s));
+}
 
 static VkShaderStageFlags vk3d_stage_bit(int stage)
 {
@@ -241,7 +306,7 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
                 if (sep_list[q].id == cis[k].image_id) { at = j; break; }
                 j++;
             }
-            fi = at == (size_t)-1 ? (size_t)VK3D_MAX_SAMPLERS : own + at;
+            fi = at == (size_t)-1 ? (size_t)-1 : own + at;
             break;
         }
         if (!from_separate) own_seen++;
@@ -250,22 +315,13 @@ static int vk3d_remap_stage(spvc_compiler c, int stage_id, vio_vk3d_shader *sh,
         int reg = next_reg++;
         int planned = vio_sampler_plan_reg(list[i].name);   /* shader-wide by name (A30) */
         if (planned >= 0) reg = planned;
-        if (reg >= VK3D_MAX_SAMPLERS) continue;
+        if (reg >= vio_vk3d_units()) continue;
         uint32_t binding = (uint32_t)(VK3D_B_SAMPLER0 + reg);
         spvc_compiler_set_decoration(c, list[i].id, SpvDecorationDescriptorSet, 0);
         spvc_compiler_set_decoration(c, list[i].id, SpvDecorationBinding, binding);
         vk3d_add_binding(sh, binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, dim, is_depth, 0);
-        if (is_fragment && fi < VK3D_MAX_SAMPLERS) {
-            sh->fs_sampler_binding[fi] = (int)binding;
-            sh->fs_sampler_depth[fi] = is_depth;
-            if ((int)fi + 1 > sh->fs_sampler_count) sh->fs_sampler_count = (int)fi + 1;
-        }
-        if (smp && smp->count < VK3D_MAX_SAMPLERS) {
-            snprintf(smp->names[smp->count], sizeof(smp->names[0]), "%s", list[i].name ? list[i].name : "");
-            smp->binding[smp->count] = (int)binding;
-            smp->depth[smp->count] = is_depth;
-            smp->count++;
-        }
+        if (is_fragment && fi != (size_t)-1) vk3d_fs_put(sh, (int)fi, (int)binding, is_depth);
+        if (smp) vk3d_stage_samplers_add(smp, list[i].name, (int)binding, is_depth);
     }
 
     spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_STORAGE_BUFFER, &list, &n);
@@ -419,7 +475,7 @@ static uint32_t *vk3d_stage(const uint32_t *spirv, size_t spirv_bytes, int stage
     }
 
     char tag[24];
-    snprintf(tag, sizeof(tag), "vk3d-%s-4", stage_name);   /* -4: point_mode TES write gl_PointSize */
+    snprintf(tag, sizeof(tag), "vk3d-%s-5", stage_name);   /* -5: samplers last in set 0 (SAMPLER-LIMITS-PLAN) */
     uint64_t key = vio_shader_cache_hash(tag, spirv, spirv_bytes);
     key = vio_shader_cache_hash_more(key, &upstream, sizeof(upstream));
     key = vio_shader_cache_hash_more(key, &is_last, sizeof(is_last));
@@ -616,7 +672,9 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
         cur ^= 1;
     }
     if (!ok) {
+        for (int i = 0; i < 6; i++) vk3d_stage_samplers_free(&smp[i]);
         vk3d_shader_release_gpu(sh);
+        vk3d_shader_free_arrays(sh);
         free(sh);
         return NULL;
     }
@@ -629,7 +687,7 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
         int merge_count = 5;
         for (int k = 0; k < merge_count; k++) {
             const vk3d_stage_samplers *s = &smp[merge_order[k]];
-            for (int j = 0; j < s->count && sh->fs_sampler_count < VK3D_MAX_SAMPLERS; j++) {
+            for (int j = 0; j < s->count; j++) {
                 int known = 0;
                 for (int f = 0; f < smp[5].count && !known; f++) known = strcmp(smp[5].names[f], s->names[j]) == 0;
                 for (int q = 0; q < k && !known; q++) {
@@ -638,12 +696,11 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
                 }
                 for (int f = 0; f < j && !known; f++) known = strcmp(s->names[f], s->names[j]) == 0;
                 if (known) continue;
-                sh->fs_sampler_binding[sh->fs_sampler_count] = s->binding[j];
-                sh->fs_sampler_depth[sh->fs_sampler_count] = s->depth[j];
-                sh->fs_sampler_count++;
+                vk3d_fs_put(sh, sh->fs_sampler_count, s->binding[j], s->depth[j]);
             }
         }
     }
+    for (int i = 0; i < 6; i++) vk3d_stage_samplers_free(&smp[i]);
 
     /* Bindings ascending: dynamic offsets are consumed in binding order. */
     for (int i = 1; i < sh->binding_count; i++) {
@@ -652,8 +709,7 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
         while (j >= 0 && sh->bindings[j].binding > tmp.binding) { sh->bindings[j + 1] = sh->bindings[j]; j--; }
         sh->bindings[j + 1] = tmp;
     }
-    VkDescriptorSetLayoutBinding lb[VK3D_MAX_BINDINGS];
-    memset(lb, 0, sizeof(lb));
+    VkDescriptorSetLayoutBinding *lb = calloc((size_t)(sh->binding_count > 0 ? sh->binding_count : 1), sizeof(*lb));
     for (int i = 0; i < sh->binding_count; i++) {
         lb[i].binding         = sh->bindings[i].binding;
         lb[i].descriptorType  = sh->bindings[i].type;
@@ -664,8 +720,9 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
     dsl.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dsl.bindingCount = (uint32_t)sh->binding_count;
     dsl.pBindings    = lb;
-    ok = sh->vs && sh->fs &&
+    ok = lb && sh->vs && sh->fs &&
          vkCreateDescriptorSetLayout(vio_vk.device, &dsl, NULL, &sh->set_layout) == VK_SUCCESS;
+    free(lb);
     if (ok) {
         VkPipelineLayoutCreateInfo pl = {0};
         VkDescriptorSetLayout sets[2] = { sh->set_layout, VK_NULL_HANDLE };
@@ -683,6 +740,7 @@ void *vio_vk3d_compile_shader(vio_shader_desc *desc)
     if (!ok) {
         php_error_docref(NULL, E_WARNING, "Vulkan: shader module / descriptor layout creation failed");
         vk3d_shader_release_gpu(sh);
+        vk3d_shader_free_arrays(sh);
         free(sh);
         return NULL;
     }
@@ -699,6 +757,7 @@ void vio_vk3d_destroy_shader_obj(void *shader_obj)
     if (!so || !so->backend_shader) return;
     vio_vk3d_shader *sh = (vio_vk3d_shader *)so->backend_shader;
     vk3d_shader_release_gpu(sh);
+    vk3d_shader_free_arrays(sh);
     free(sh);
     so->backend_shader = NULL;
 }

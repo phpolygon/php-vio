@@ -4210,6 +4210,20 @@ ZEND_FUNCTION(vio_shader)
             vio_sampler_plan_build(&shader->sampler_plan, ps, sz, 6);
             shader->sampler_plan.gs_writes_primid = ps[1] && vio_spirv_writes_builtin(ps[1], sz[1], 7);
         }
+        /* More texture units than the backend binds per stage: say so instead of
+         * silently dropping samplers (SAMPLER-LIMITS-PLAN). */
+        {
+            int regs = 0;
+            for (int i = 0; i < shader->sampler_plan.count; i++)
+                if (shader->sampler_plan.reg[i] + 1 > regs) regs = shader->sampler_plan.reg[i] + 1;
+            if (ctx->texture_units > 0 && regs > ctx->texture_units) {
+                php_error_docref(NULL, E_WARNING,
+                    "vio_shader: the shader reads %d texture units, the %s backend binds at most %d per stage "
+                    "(vio_backend_info()['samplers']['total'])", regs, ctx->backend->name, ctx->texture_units);
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
+        }
         vio_sampler_plan_use(&shader->sampler_plan);
         shader->backend_shader = ctx->backend->compile_shader(&desc);
         vio_sampler_plan_use(NULL);
@@ -4283,7 +4297,7 @@ ZEND_FUNCTION(vio_shader)
                 if (vio_spirv_reflect(shader->frag_spirv, shader->frag_spirv_size, &frag_reflect, &err) == 0) {
                     shader->sampler_count = frag_reflect.texture_count < shader->unit_count
                                           ? frag_reflect.texture_count : shader->unit_count;
-                    vio_shader_sampler_reserve(shader, shader->unit_count);
+                    vio_shader_sampler_reserve(shader, shader->sampler_count);
                     /* Recompute the HLSL t-register the cross-compiler assigned to each
                      * sampler. The reflection list here is the SAME sampled_images list,
                      * in the SAME order, that vio_spirv_to_hlsl walks when it assigns
@@ -4302,8 +4316,10 @@ ZEND_FUNCTION(vio_shader)
                     /* Separate textures (texture(sampler2D(u_tex, u_smp), uv), OPEN-ITEMS-PLAN
                      * A23) follow, in reflection order: HLSL gives them t{sampled count + j},
                      * Vulkan and Metal put them at the same list positions. */
-                    char (*sep)[64] = emalloc((size_t)shader->unit_count * sizeof(*sep));
-                    int nsep = vio_spirv_separate_images(shader->frag_spirv, shader->frag_spirv_size, sep, shader->unit_count);
+                    int nsep = vio_spirv_separate_images(shader->frag_spirv, shader->frag_spirv_size, NULL, shader->unit_count);
+                    char (*sep)[64] = emalloc((size_t)(nsep > 0 ? nsep : 1) * sizeof(*sep));
+                    nsep = vio_spirv_separate_images(shader->frag_spirv, shader->frag_spirv_size, sep, nsep);
+                    vio_shader_sampler_reserve(shader, shader->sampler_count + nsep);
                     for (int j = 0; j < nsep && shader->sampler_count < shader->unit_count; j++) {
                         int s = shader->sampler_count++;
                         snprintf(shader->sampler_names[s], sizeof(shader->sampler_names[s]), "%s", sep[j]);
@@ -5516,7 +5532,16 @@ static void vio_pending_textures_clear(vio_context_object *ctx)
 
 static void vio_pending_texture_set(vio_context_object *ctx, zend_long slot, int kind, void *obj)
 {
-    if (!ctx->pending_tex_obj || slot < 0 || slot >= ctx->texture_units) return;
+    if (slot < 0 || slot >= ctx->texture_units) return;
+    if (slot >= ctx->pending_tex_cap) {
+        int cap = ctx->pending_tex_cap > 0 ? ctx->pending_tex_cap : 16;
+        while (cap <= slot) cap *= 2;
+        if (cap > ctx->texture_units) cap = ctx->texture_units;
+        ctx->pending_tex_obj = erealloc(ctx->pending_tex_obj, (size_t)cap * sizeof(void *));
+        ctx->pending_tex_kind = erealloc(ctx->pending_tex_kind, (size_t)cap * sizeof(int));
+        for (int i = ctx->pending_tex_cap; i < cap; i++) { ctx->pending_tex_obj[i] = NULL; ctx->pending_tex_kind[i] = 0; }
+        ctx->pending_tex_cap = cap;
+    }
     /* The table OWNS a reference to what it points at. Engines bind temporaries
      * (`vio_bind_texture($ctx, vio_render_target_texture($rt), 6)`): the PHP
      * object dies as soon as the call returns, and the allocator hands its
@@ -6718,10 +6743,11 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
             int gl_slot = (int)Z_LVAL_P(value_zval);
             for (int s = 0; s < sh->sampler_count; s++) {
                 if (strcmp(sh->sampler_names[s], name) == 0) {
-                    if (gl_slot >= 0 && gl_slot < sh->unit_count && sh->gl_to_hlsl_sampler) {
+                    if (gl_slot >= 0 && gl_slot < sh->unit_count) {
+                        vio_shader_unit_reserve(sh, gl_slot + 1);
                         /* The sampler leaves its old unit (a stale entry routed that
                          * unit's texture into this sampler after a move). */
-                        for (int u = 0; u < sh->unit_count; u++) if (sh->gl_to_hlsl_sampler[u] == s) sh->gl_to_hlsl_sampler[u] = -1;
+                        for (int u = 0; u < sh->gl_to_hlsl_cap; u++) if (sh->gl_to_hlsl_sampler[u] == s) sh->gl_to_hlsl_sampler[u] = -1;
                         sh->gl_to_hlsl_sampler[gl_slot] = s;  /* HLSL binding = index */
                         sh->sampler_unit[s] = gl_slot;
                     }

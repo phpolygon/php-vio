@@ -47,6 +47,7 @@ typedef struct _vio_context_object {
     void             **pending_tex_obj;      /* texture_units entries */
     int               *pending_tex_kind;     /* 0 none, 1 VioTexture, 2 VioCubemap */
     int                pending_tex_high;     /* highest bound unit + 1 (flush loops stop there) */
+    int                pending_tex_cap;      /* entries allocated (grows to the highest unit bound) */
     /* Per-stage limits of the backend (vio_backend.texture_limits) and the
      * texture units the API offers: min(textures, samplers). */
     int                texture_limit;
