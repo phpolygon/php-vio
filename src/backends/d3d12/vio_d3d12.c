@@ -8459,6 +8459,7 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
      * long vectors and fails on them). */
     char *hlsl = desc->compute_hlsl ? strdup(desc->compute_hlsl)
                                     : vio_spirv_to_hlsl(spirv, spirv_size, d3d12_hlsl_target(), &err);
+    int raw_buffers = desc->compute_hlsl ? 0 : 1;
     hlsl = d3d12_hlsl_post(hlsl);
     if (free_spirv) free(spirv);
     if (!hlsl) {
@@ -8486,6 +8487,7 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
     cp->cbv_register = cbv_register;
     cp->srv_base_reg = srv_base_reg;
     cp->uav_base_reg = uav_base_reg;
+    cp->raw_buffers  = raw_buffers;
     cp->uses_accel   = strstr(hlsl, "RaytracingAccelerationStructure") != NULL;
     cp->uses_bindless = vio_d3d12.bindless && vio_d3d12.bindless_cpu_heap
                      && (strstr(hlsl, "space1)") || strstr(hlsl, "space3)") || strstr(hlsl, "space4)"));
@@ -9067,18 +9069,20 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     const int  srv_reg_base = cp->srv_base_reg >= 0 ? cp->srv_base_reg : 0;
     const int  uav_reg_base = cp->uav_base_reg >= 0 ? cp->uav_base_reg : 0;
 
-    /* SRVs. spirv-cross transpiles GLSL std430 `buffer { float x[]; }` to an HLSL
-     * ByteAddressBuffer (raw), NOT a StructuredBuffer — confirmed via the debug
-     * layer. So a stride of 4 (raw/default) builds a RAW view (R32_TYPELESS +
-     * FLAG_RAW, NumElements counted in 4-byte words). A stride > 4 builds a true
-     * structured view (StructuredBuffer<T> in HLSL). */
+    /* SRVs. spirv-cross transpiles every GLSL std430 `buffer { T x[]; }` to an HLSL
+     * (RW)ByteAddressBuffer (raw) - whatever T is - so a GLSL kernel always gets RAW
+     * views (R32_TYPELESS + FLAG_RAW, NumElements in 4-byte words). A structured view
+     * there made a raw Load4 at byte 16 address element 16 of a 16-byte-stride view:
+     * out of range, 0 on hardware (WARP did not check), so vec4 arrays read only
+     * element 0. Only a caller's own 'hlsl' kernel may use StructuredBuffer<T>, and
+     * gets a structured view when the buffer's stride is > 4. */
     for (int i = 0; i < cp->srv_count; i++) {
         vio_d3d12_compute_binding *b = &cp->srvs[i];
         if (!b->buffer || !b->buffer->resource) continue;
         int rel = b->slot - srv_reg_base;        /* heap-offset within the SRV region */
         if (rel < 0 || rel >= VIO_D3D12_COMPUTE_MAX_BINDINGS) continue;
         UINT idx = SRV_BASE + (UINT)rel;
-        int raw = (b->stride <= 4);
+        int raw = cp->raw_buffers || (b->stride <= 4);
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
         sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -9106,7 +9110,7 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
         int rel = b->slot - uav_reg_base;        /* heap-offset within the UAV region */
         if (rel < 0 || rel >= VIO_D3D12_COMPUTE_MAX_BINDINGS) continue;
         UINT idx = UAV_BASE + (UINT)rel;
-        int raw = (b->stride <= 4);
+        int raw = cp->raw_buffers || (b->stride <= 4);
         D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
         ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
         ud.Buffer.FirstElement = 0;

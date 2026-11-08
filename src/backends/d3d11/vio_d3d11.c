@@ -1025,18 +1025,15 @@ static void *d3d11_create_buffer(vio_buffer_desc *desc)
             bd.ByteWidth = (bd.ByteWidth + 15) & ~15;
             break;
         case VIO_BUFFER_STORAGE:
-            /* Data-driven raw vs structured view, mirroring the D3D12 path.
-             * spirv-cross transpiles GLSL `buffer { float x[]; }` to a (RW)Byte-
-             * AddressBuffer — a RAW view — NOT a StructuredBuffer. So stride <= 4
-             * (the default for the SDF baker) requests ALLOW_RAW_VIEWS and the
-             * SRV/UAV are built as BUFFEREX/BUFFER raw views in dispatch_compute.
-             * stride > 4 keeps the legacy structured view. Both bindable as SRV
-             * (input) and UAV (output) so one path covers read+write buffers. */
+            /* Always raw: spirv-cross transpiles every GLSL `buffer { T x[]; }` to a
+             * (RW)ByteAddressBuffer, in every stage, so the SRV/UAV are raw
+             * BUFFEREX/BUFFER views. A structured buffer (the former choice for a
+             * stride > 4) cannot take a raw view, and a structured view made raw
+             * loads past element 0 read 0 on hardware - vec4 arrays came back as
+             * their first element only. (A caller's own HLSL StructuredBuffer<T>
+             * with a stride > 4 is D3D12 only.) Bindable as SRV and UAV. */
             bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-            if (desc->stride > 4) {
-                bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-                bd.StructureByteStride = (UINT)desc->stride;
-            } else {
+            {
                 /* Raw byte-address view: ByteWidth must be a multiple of 4. */
                 bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
                 /* vio_draw_indirect() argument buffer (raw only — D3D11 forbids the
@@ -3337,7 +3334,7 @@ static void d3d11_bind_storage_buffer(void *backend_buffer, int binding, int acc
     d3d11_release_vs_storage_srv();
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sd = {0};
-    int raw = (stride <= 4);
+    int raw = 1; /* storage buffers are raw on D3D11 */
     if (raw) {
         sd.Format = DXGI_FORMAT_R32_TYPELESS;
         sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
@@ -3764,7 +3761,7 @@ static ID3D11ShaderResourceView *d3d11_compute_make_srv(vio_d3d11_compute_bindin
 {
     if (!b->buffer || !b->buffer->buffer) return NULL;
     D3D11_SHADER_RESOURCE_VIEW_DESC sd = {0};
-    int raw = (b->stride <= 4);
+    int raw = 1; /* storage buffers are raw on D3D11 */
     if (raw) {
         sd.Format = DXGI_FORMAT_R32_TYPELESS;
         sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
@@ -3794,7 +3791,7 @@ static ID3D11UnorderedAccessView *d3d11_compute_make_uav(vio_d3d11_compute_bindi
     D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {0};
     ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
     ud.Buffer.FirstElement = 0;
-    int raw = (b->stride <= 4);
+    int raw = 1; /* storage buffers are raw on D3D11 */
     if (raw) {
         ud.Format = DXGI_FORMAT_R32_TYPELESS;
         ud.Buffer.NumElements = (UINT)(b->buffer->size / 4);

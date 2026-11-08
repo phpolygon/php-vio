@@ -266,6 +266,7 @@ typedef struct _vio_d3d12_compute_pipeline {
     int                 uav_base_reg;
     int                 uses_accel;   /* the kernel queries an acceleration structure: root SRV [3] t0, space9 */
     int                 uses_bindless; /* reads the bindless table (spaces 1 / 3 / 4): root table [4] */
+    int                 raw_buffers;   /* GLSL kernel: SPIRV-Cross emits (RW)ByteAddressBuffer, so every storage view is raw */
     /* Params constant block. An UPLOAD-heap buffer, persistently re-mapped by
      * compute_set_uniforms (256-byte aligned per the CB requirement). Bound to
      * the reflected cbv_register. */
