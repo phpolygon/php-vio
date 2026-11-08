@@ -129,6 +129,7 @@ typedef struct _vio_metal_state {
 static vio_metal_state vio_mtl = {0};
 static void metal_bindless_release(void);
 static void metal_bindless_bind(id<MTLRenderCommandEncoder> enc, int vertex, int fragment);
+static void metal_bindless_bind_mesh(id<MTLRenderCommandEncoder> enc, int object, int mesh, int fragment);
 
 /* Keep reference to last presented frame for read_pixels/screenshot */
 static id<MTLTexture>       last_presented_texture = nil;
@@ -3755,6 +3756,10 @@ static vio_metal_buffer *metal_current_fs_cb = NULL;
 /* Vertex-stage storage buffer staged by bind_storage_buffer (Path B). */
 static vio_metal_buffer *metal_pending_storage = NULL;
 static int               metal_pending_storage_binding = -1;
+/* The same buffers by binding (0..3), for the task and mesh stages of a mesh
+ * pipeline, which may read several (D3D12 root SRVs t0..t3 space2, Vulkan set 0). */
+#define VIO_METAL_GRAPHICS_STORAGE 4
+static vio_metal_buffer *metal_graphics_storage[VIO_METAL_GRAPHICS_STORAGE];
 
 /* One identity mat4 bound at VIO_METAL_VB_INSTANCE for non-instanced draws of
  * shaders that declare location 3..6 — otherwise the vertex fetch reads an
@@ -4568,6 +4573,24 @@ static int metal_prepare_draw(int stride)
         vio_metal_buffer *fcb = metal_current_fs_cb ? metal_current_fs_cb : NULL;
         if (fcb) metal_bind_uniform_slice(fcb, -1, sh->fs.cbuffer_index);
         else if (mcb && sh->fs.cbuffer_index >= 0) metal_bind_uniform_slice(mcb, -1, sh->fs.cbuffer_index);
+        /* The bindless table for the task, mesh and fragment stages that read it
+         * (the vertex path below binds it for vertex + fragment). */
+        metal_bindless_bind_mesh(enc, sh->object_fn ? sh->obj.uses_bindless : 0, sh->vs.uses_bindless, sh->fs.uses_bindless);
+        /* Storage buffers of the task and mesh stages, by their GLSL binding. */
+        if (@available(macOS 13.0, iOS 16.0, *)) {
+            for (int stage = 0; stage < 2; stage++) {
+                const vio_metal_stage_res *res = stage == 0 ? &sh->vs : &sh->obj;
+                if (stage == 1 && !sh->object_fn) break;
+                for (int i = 0; i < res->buffer_count; i++) {
+                    const vio_metal_res_buffer *rb = &res->buffers[i];
+                    if (rb->kind != 1 || rb->binding < 0 || rb->binding >= VIO_METAL_GRAPHICS_STORAGE) continue;
+                    vio_metal_buffer *b = metal_graphics_storage[rb->binding];
+                    if (!b || !b->buffer) continue;
+                    if (stage == 0) [enc setMeshBuffer:(__bridge id<MTLBuffer>)b->buffer offset:0 atIndex:(NSUInteger)rb->msl_index];
+                    else            [enc setObjectBuffer:(__bridge id<MTLBuffer>)b->buffer offset:0 atIndex:(NSUInteger)rb->msl_index];
+                }
+            }
+        }
         return 1;
     }
     if (sh->tess) {
@@ -4690,6 +4713,25 @@ static void metal_bindless_bind(id<MTLRenderCommandEncoder> enc, int vertex, int
     if (metal_bindless_live_count > 0) {
         MTLRenderStages stages = (vertex ? MTLRenderStageVertex : 0) | (fragment ? MTLRenderStageFragment : 0);
         [enc useResources:metal_bindless_live count:(NSUInteger)metal_bindless_live_count usage:MTLResourceUsageRead stages:stages];
+    }
+}
+
+/* The same for a mesh pipeline: object (task) and mesh stages instead of vertex. */
+static void metal_bindless_bind_mesh(id<MTLRenderCommandEncoder> enc, int object, int mesh, int fragment)
+{
+    if (!object && !mesh && !fragment) return;
+    if (@available(macOS 13.0, iOS 16.0, *)) {
+        for (int k = 0; k < 3; k++) {
+            if (!metal_bindless_bufs[k]) continue;
+            if (object)   [enc setObjectBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+            if (mesh)     [enc setMeshBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+            if (fragment) [enc setFragmentBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+        }
+        if (metal_bindless_live_count > 0) {
+            MTLRenderStages stages = (object ? MTLRenderStageObject : 0) | (mesh ? MTLRenderStageMesh : 0)
+                                   | (fragment ? MTLRenderStageFragment : 0);
+            [enc useResources:metal_bindless_live count:(NSUInteger)metal_bindless_live_count usage:MTLResourceUsageRead stages:stages];
+        }
     }
 }
 
@@ -5614,6 +5656,7 @@ static void metal_bind_storage_buffer(void *backend_buffer, int binding, int acc
     (void)access; (void)element_count; (void)stride;
     metal_pending_storage = (vio_metal_buffer *)backend_buffer;
     metal_pending_storage_binding = binding;
+    if (binding >= 0 && binding < VIO_METAL_GRAPHICS_STORAGE) metal_graphics_storage[binding] = (vio_metal_buffer *)backend_buffer;
 }
 
 /* Indirect draw (GAP-PHASE5 Block 8): Metal's indirect argument structs share the
@@ -6418,6 +6461,7 @@ static void metal_3d_shutdown(void)
     metal_current_fs_cb = NULL;
     metal_pending_storage = NULL;
     metal_pending_storage_binding = -1;
+    for (int i = 0; i < VIO_METAL_GRAPHICS_STORAGE; i++) metal_graphics_storage[i] = NULL;
 }
 
 /* ── GPU compute primitive (SDF voxelization) ─────────────────────────
