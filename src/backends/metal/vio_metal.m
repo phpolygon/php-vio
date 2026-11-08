@@ -5972,12 +5972,16 @@ static void metal_bind_texture(void *texture, int slot)
                                         (__bridge id<MTLSamplerState>)t->sampler, metal_texture_cmp_sampler(t));
         int is_depth = 0;
         int idx = metal_resolve_fs_texture(slot, &is_depth);
-        if (idx < 0 || idx > 30) return;
-        id<MTLSamplerState> s = is_depth ? metal_texture_cmp_sampler(t)
-                                         : (__bridge id<MTLSamplerState>)t->sampler;
-        [vio_mtl.current_encoder setFragmentTexture:(__bridge id<MTLTexture>)t->tex atIndex:(NSUInteger)idx];
-        if (s) [vio_mtl.current_encoder setFragmentSamplerState:s atIndex:(NSUInteger)idx];
-        metal_fs_shadow_set(idx, (__bridge id<MTLTexture>)t->tex, s);
+        if (idx >= 0 && idx <= 30) {
+            id<MTLSamplerState> s = is_depth ? metal_texture_cmp_sampler(t)
+                                             : (__bridge id<MTLSamplerState>)t->sampler;
+            [vio_mtl.current_encoder setFragmentTexture:(__bridge id<MTLTexture>)t->tex atIndex:(NSUInteger)idx];
+            if (s) [vio_mtl.current_encoder setFragmentSamplerState:s atIndex:(NSUInteger)idx];
+            metal_fs_shadow_set(idx, (__bridge id<MTLTexture>)t->tex, s);
+        }
+        /* A mesh pipeline's task / mesh stage may read a slot the fragment stage does
+         * not declare (a mask only the task stage reads, an array only the mesh
+         * stage samples): bind it there regardless of the fragment lookup. */
         if (metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->mesh)
             metal_bind_mesh_stage_texture(slot, (__bridge id<MTLTexture>)t->tex,
                                           (__bridge id<MTLSamplerState>)t->sampler, metal_texture_cmp_sampler(t));
@@ -6349,7 +6353,6 @@ void vio_metal_bind_cubemap(void *cubemap_obj, int slot)
     @autoreleasepool {
         int is_depth = 0;
         int idx = metal_resolve_fs_texture(slot, &is_depth);
-        if (idx < 0 || idx > 30) return;
         id<MTLTexture> ctex = (__bridge id<MTLTexture>)cm->metal_texture;
         id<MTLSamplerState> csmp = cm->metal_sampler ? (__bridge id<MTLSamplerState>)cm->metal_sampler : nil;
         if (is_depth) {
@@ -6357,9 +6360,12 @@ void vio_metal_bind_cubemap(void *cubemap_obj, int slot)
             if (!cube_cmp) cube_cmp = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, 0, 1, 1);
             csmp = cube_cmp;
         }
-        [vio_mtl.current_encoder setFragmentTexture:ctex atIndex:(NSUInteger)idx];
-        if (csmp) [vio_mtl.current_encoder setFragmentSamplerState:csmp atIndex:(NSUInteger)idx];
-        metal_fs_shadow_set(idx, ctex, csmp);
+        if (idx >= 0 && idx <= 30) {
+            [vio_mtl.current_encoder setFragmentTexture:ctex atIndex:(NSUInteger)idx];
+            if (csmp) [vio_mtl.current_encoder setFragmentSamplerState:csmp atIndex:(NSUInteger)idx];
+            metal_fs_shadow_set(idx, ctex, csmp);
+        }
+        /* Task / mesh stages may read a slot the fragment stage does not declare. */
         metal_bind_mesh_stage_texture(slot, ctex, csmp, csmp);
     }
 }
