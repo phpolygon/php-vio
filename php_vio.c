@@ -8595,13 +8595,15 @@ ZEND_FUNCTION(vio_font)
     size_t path_len;
     double size = 24.0;
     double scale = 1.0;
+    HashTable *opts_ht = NULL;
 
-    ZEND_PARSE_PARAMETERS_START(2, 4)
+    ZEND_PARSE_PARAMETERS_START(2, 5)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_STRING(path, path_len)
         Z_PARAM_OPTIONAL
         Z_PARAM_DOUBLE(size)
         Z_PARAM_DOUBLE(scale)
+        Z_PARAM_ARRAY_HT_OR_NULL(opts_ht)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
@@ -8639,12 +8641,28 @@ ZEND_FUNCTION(vio_font)
     font->render_scale = (float)scale;
     font->font_size = (float)(size * scale);
     font->backend   = ctx->backend;
+    if (opts_ht) {
+        /* 'sdf' => true | spread in atlas px: a signed-distance-field atlas (glyph
+         * edges stay sharp when a transform magnifies the text). Needs the shaping
+         * atlas; without HarfBuzz the font stays a coverage atlas. */
+        zval *val = zend_hash_str_find(opts_ht, "sdf", sizeof("sdf") - 1);
+        if (val && zend_is_true(val)) {
+            int spread = (Z_TYPE_P(val) == IS_LONG || Z_TYPE_P(val) == IS_DOUBLE) ? (int)zval_get_long(val) : 0;
+            if (spread <= 0) spread = (int)(font->font_size * 0.125f + 0.5f);
+            if (spread < 2) spread = 2;
+            if (spread > 32) spread = 32;
+            font->sdf_spread = spread;
+        }
+    }
     font->ttf_len = ZSTR_LEN(contents);
     font->ttf_data = emalloc(font->ttf_len);
     memcpy(font->ttf_data, ZSTR_VAL(contents), font->ttf_len);
     zend_string_release(contents);
 
     int shaping_active = 0;
+#ifndef HAVE_HARFBUZZ
+    font->sdf_spread = 0;
+#endif
 #ifdef HAVE_HARFBUZZ
     /* Preferred path: build the glyph-index atlas + HarfBuzz font. This packs
      * every glyph (by index) and uploads once, so the atlas handle is stable
@@ -8654,6 +8672,7 @@ ZEND_FUNCTION(vio_font)
 #endif
 
     if (!shaping_active) {
+        font->sdf_spread = 0;   /* the legacy pack is coverage only */
         /* Legacy path: multi-range atlas packing (Latin, Cyrillic, Greek, CJK,
          * Hangul, ...), dynamically sized to this font's glyph set. */
         unsigned char *atlas_bitmap = NULL;
@@ -9123,6 +9142,7 @@ ZEND_FUNCTION(vio_font_info)
     add_assoc_long(return_value, "rasterized", rasterized);
     add_assoc_long(return_value, "atlas_size", side);
     add_assoc_bool(return_value, "lazy", lazy);
+    add_assoc_long(return_value, "sdf", font->sdf_spread);
 }
 
 ZEND_FUNCTION(vio_font_has_glyph)

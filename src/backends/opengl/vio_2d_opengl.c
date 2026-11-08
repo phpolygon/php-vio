@@ -28,6 +28,9 @@ int vio_2d_opengl_init(vio_2d_opengl_state *state, int vertex_capacity)
         php_error_docref(NULL, E_WARNING, "Failed to compile 2D shaders");
         return -1;
     }
+    /* SDF glyphs; without the program they draw as coverage text. */
+    state->shader_text_sdf = vio_opengl_compile_shader_source(
+        vio_2d_vertex_shader, vio_2d_fragment_shader_text_sdf);
 
     glGenVertexArrays(1, &state->vao);
     glGenBuffers(1, &state->vbo);
@@ -58,6 +61,8 @@ void vio_2d_opengl_shutdown(vio_2d_opengl_state *state)
 {
     if (state->shader_shapes)  glDeleteProgram(state->shader_shapes);
     if (state->shader_sprites) glDeleteProgram(state->shader_sprites);
+    if (state->shader_text_sdf) glDeleteProgram(state->shader_text_sdf);
+    state->shader_text_sdf = 0;
     if (state->vbo) glDeleteBuffers(1, &state->vbo);
     if (state->vao) glDeleteVertexArrays(1, &state->vao);
     state->shader_shapes  = 0;
@@ -122,8 +127,9 @@ void vio_2d_opengl_flush(vio_2d_state *state)
             scissor_active = 0;
         }
 
-        unsigned int wanted_shader = (item->texture_id > 0)
-            ? gl->shader_sprites : gl->shader_shapes;
+        unsigned int wanted_shader = (item->type == VIO_2D_TEXT_SDF && gl->shader_text_sdf)
+            ? gl->shader_text_sdf
+            : ((item->texture_id > 0) ? gl->shader_sprites : gl->shader_shapes);
 
         if (wanted_shader != current_shader) {
             current_shader = wanted_shader;

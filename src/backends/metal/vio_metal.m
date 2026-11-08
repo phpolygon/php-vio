@@ -159,6 +159,7 @@ typedef struct _vio_metal_2d_variant {
     int                        has_stencil;
     id<MTLRenderPipelineState> shapes;
     id<MTLRenderPipelineState> sprites;
+    id<MTLRenderPipelineState> text_sdf;      /* distance-field glyphs (vio_font 'sdf'); nil = sprites */
 } vio_metal_2d_variant;
 
 typedef struct _vio_metal_2d {
@@ -167,6 +168,7 @@ typedef struct _vio_metal_2d {
     id<MTLFunction>            vertex_fn;
     id<MTLFunction>            frag_shapes_fn;
     id<MTLFunction>            frag_sprites_fn;
+    id<MTLFunction>            frag_text_sdf_fn;
     MTLVertexDescriptor       *vertex_desc;
     vio_metal_2d_variant       variants[VIO_METAL_2D_VARIANTS];
     int                        variant_count;
@@ -1010,11 +1012,13 @@ void vio_metal_shutdown_context(void)
             for (int i = 0; i < mtl_2d.variant_count; i++) {
                 mtl_2d.variants[i].shapes  = nil;
                 mtl_2d.variants[i].sprites = nil;
+                mtl_2d.variants[i].text_sdf = nil;
             }
             mtl_2d.variant_count    = 0;
             mtl_2d.vertex_fn        = nil;
             mtl_2d.frag_shapes_fn   = nil;
             mtl_2d.frag_sprites_fn  = nil;
+            mtl_2d.frag_text_sdf_fn = nil;
             mtl_2d.vertex_desc      = nil;
             mtl_2d.sampler          = nil;
             mtl_2d.vertex_buffer    = nil;
@@ -1128,6 +1132,11 @@ static vio_metal_2d_variant *metal_2d_variant(const vio_metal_target_desc *t)
                 [[error localizedDescription] UTF8String]);
             return NULL;
         }
+        id<MTLRenderPipelineState> text_sdf = nil;
+        if (mtl_2d.frag_text_sdf_fn) {
+            pipeDesc.fragmentFunction = mtl_2d.frag_text_sdf_fn;
+            text_sdf = [vio_mtl.device newRenderPipelineStateWithDescriptor:pipeDesc error:&error];
+        }
 
         vio_metal_2d_variant *v = &mtl_2d.variants[mtl_2d.variant_count++];
         v->pixel_format = (int)fmt;
@@ -1138,6 +1147,7 @@ static vio_metal_2d_variant *metal_2d_variant(const vio_metal_target_desc *t)
         v->has_stencil  = has_stencil;
         v->shapes       = shapes;
         v->sprites      = sprites;
+        v->text_sdf     = text_sdf;
         return v;
     }
 }
@@ -1190,6 +1200,7 @@ int vio_metal_2d_init(int width, int height)
         mtl_2d.vertex_fn       = vertexFunc;
         mtl_2d.frag_shapes_fn  = fragShapes;
         mtl_2d.frag_sprites_fn = fragSprites;
+        mtl_2d.frag_text_sdf_fn = [library newFunctionWithName:@"vio_2d_fragment_text_sdf"];
         mtl_2d.vertex_desc     = vertDesc;
         mtl_2d.variant_count   = 0;
 
@@ -1335,7 +1346,8 @@ void vio_metal_2d_flush(vio_2d_state *state)
 
             /* Select pipeline */
             id<MTLRenderPipelineState> wanted =
-                (item->texture_id > 0) ? variant->sprites : variant->shapes;
+                (item->type == VIO_2D_TEXT_SDF && item->texture_id > 0 && variant->text_sdf) ? variant->text_sdf
+                : (item->texture_id > 0) ? variant->sprites : variant->shapes;
             if (wanted != current_pipeline) {
                 current_pipeline = wanted;
                 [vio_mtl.current_encoder setRenderPipelineState:current_pipeline];

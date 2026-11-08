@@ -17,6 +17,7 @@
 typedef struct _vio_2d_opengl_state {
     unsigned int  shader_shapes;
     unsigned int  shader_sprites;
+    unsigned int  shader_text_sdf;   /* distance-field glyphs (vio_font 'sdf'); 0 = draw as sprites */
     unsigned int  vao;
     unsigned int  vbo;
     int           vbo_capacity;   /* current GPU buffer size in vertices */

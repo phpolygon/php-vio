@@ -31,6 +31,7 @@ typedef enum _vio_2d_item_type {
     VIO_2D_TEXT,
     VIO_2D_ROUNDED_RECT,
     VIO_2D_ROUNDED_RECT_OUTLINE,
+    VIO_2D_TEXT_SDF,       /* glyphs from a signed-distance-field atlas (vio_font 'sdf') */
 } vio_2d_item_type;
 
 /* Single 2D vertex: position (2), texcoord (2), color (4) */

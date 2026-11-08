@@ -1133,9 +1133,18 @@ function vio_sprite(VioContext $context, VioTexture $texture, ?array $options = 
  * magnification) so text stays crisp when a transform magnifies it. $scale < 1
  * is clamped to 1.0.
  *
+ * Options:
+ *   'sdf' => true | int  Signed-distance-field atlas: glyph edges stay sharp at any
+ *                        magnification (2D transforms, zoomed UI). An int sets the
+ *                        spread in atlas pixels (default size*scale/8, 2..32).
+ *                        Needs the HarfBuzz build; vio_font_info()['sdf'] reports the
+ *                        spread in use (0 = coverage atlas). Rasterize an SDF font
+ *                        at 24 px or more: below that, thin strokes come out
+ *                        narrower than the coverage glyphs.
+ *
  * @return VioFont|false Font object or false on failure
  */
-function vio_font(VioContext $context, string $path, float $size = 24.0, float $scale = 1.0): VioFont|false {}
+function vio_font(VioContext $context, string $path, float $size = 24.0, float $scale = 1.0, ?array $options = null): VioFont|false {}
 
 /**
  * Draw text using a loaded font.
@@ -1182,7 +1191,8 @@ function vio_font_has_glyph(VioFont $font, int $codepoint): bool {}
 /**
  * Glyph atlas of a font: ['glyphs' => int (glyphs in the face; legacy path: packed
  * codepoints), 'rasterized' => int (glyphs in the atlas so far), 'atlas_size' =>
- * int (side in px), 'lazy' => bool]. With HarfBuzz the atlas fills on demand on
+ * int (side in px), 'lazy' => bool, 'sdf' => int (distance-field spread in atlas px,
+ * 0 = coverage atlas)]. With HarfBuzz the atlas fills on demand on
  * every backend: vio_text rasterizes new glyphs and uploads only the rectangle
  * they dirtied; vio_text_measure rasterizes nothing. False for an invalid font.
  */

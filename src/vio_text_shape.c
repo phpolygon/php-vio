@@ -49,6 +49,7 @@ typedef struct {
     stbtt_fontinfo info;   /* over font->ttf_data (lives as long as the font) */
     float     scale;
     int       side, num_glyphs, rasterized, lazy;
+    int       pad;         /* SDF spread in atlas px (0 = coverage atlas) */
     stbrp_context packer;
     stbrp_node   *nodes;
     unsigned char *shadow; /* side * side R8 copy of the atlas (lazy only) */
@@ -71,8 +72,10 @@ static vio_glyph_slot *shape_slot_metrics(vio_shape_atlas *a, unsigned int gid)
     if (ix1 - ix0 <= 0 || iy1 - iy0 <= 0) {
         slot.state = VIO_GLYPH_READY;            /* blank (space, control) */
     } else {
-        slot.w = (unsigned short)(ix1 - ix0);
-        slot.h = (unsigned short)(iy1 - iy0);
+        slot.w = (unsigned short)(ix1 - ix0 + 2 * a->pad);
+        slot.h = (unsigned short)(iy1 - iy0 + 2 * a->pad);
+        slot.bearing_x = (short)(ix0 - a->pad);
+        slot.bearing_y = (short)(iy0 - a->pad);
         slot.state = VIO_GLYPH_METRICS;
     }
     zval zv;
@@ -96,7 +99,19 @@ static const vio_glyph_slot *shape_slot_raster(vio_shape_atlas *a, unsigned int 
         s->w = s->h = 0;                     /* atlas full: drop (no retry), lookups still hit */
         return s;
     }
-    stbtt_MakeGlyphBitmap(&a->info, bmp + (size_t)r.y * a->side + r.x, s->w, s->h, a->side, a->scale, a->scale, (int)gid);
+    if (a->pad > 0) {
+        /* Distance field: 128 on the outline, +-128 at `pad` px inside / outside. */
+        int sw = 0, sh = 0, sxo = 0, syo = 0;
+        unsigned char *sdf = stbtt_GetGlyphSDF(&a->info, a->scale, (int)gid, a->pad, 128, 128.0f / (float)a->pad, &sw, &sh, &sxo, &syo);
+        if (sdf) {
+            int cw = sw < s->w ? sw : s->w, ch = sh < s->h ? sh : s->h;
+            for (int row = 0; row < ch; row++)
+                memcpy(bmp + (size_t)(r.y + row) * a->side + r.x, sdf + (size_t)row * sw, (size_t)cw);
+            stbtt_FreeSDF(sdf, NULL);
+        }
+    } else {
+        stbtt_MakeGlyphBitmap(&a->info, bmp + (size_t)r.y * a->side + r.x, s->w, s->h, a->side, a->scale, a->scale, (int)gid);
+    }
     s->x = (unsigned short)r.x;
     s->y = (unsigned short)r.y;
     a->rasterized++;
@@ -135,9 +150,9 @@ void vio_text_shape_stats(const vio_font_object *font, int *glyphs, int *rasteri
 
 /* Choose the smallest power-of-two atlas side (>=512, <=4096) that comfortably
  * holds `num_glyphs` glyphs at `size` px. Mirrors the legacy dynamic sizing. */
-static int shape_atlas_side(int num_glyphs, float size)
+static int shape_atlas_side(int num_glyphs, float size, int pad)
 {
-    double need = (double)num_glyphs * ((double)size + 2.0) * ((double)size + 2.0);
+    double need = (double)num_glyphs * ((double)size + 2.0 + 2.0 * pad) * ((double)size + 2.0 + 2.0 * pad);
     int side = 512;
     while ((double)side * (double)side < need && side < 4096) side <<= 1;
     return side;
@@ -177,7 +192,8 @@ int vio_text_shape_init_font(vio_font_object *font)
     }
     float scale = stbtt_ScaleForPixelHeight(&a->info, font->font_size);
     int num_glyphs = a->info.numGlyphs > 0 ? a->info.numGlyphs : 1;
-    int side = shape_atlas_side(num_glyphs, font->font_size);
+    a->pad = font->sdf_spread > 0 ? font->sdf_spread : 0;
+    int side = shape_atlas_side(num_glyphs, font->font_size, a->pad);
     a->scale = scale;
     a->side = side;
     a->num_glyphs = num_glyphs;
@@ -546,7 +562,7 @@ static void draw_glyph_at(vio_draw_ctx *d, unsigned int gid, float ox, float oy)
     int start = vio_2d_push_vertices(&d->ctx->state_2d, verts, 6);
     if (start >= 0) {
         GC_ADDREF(&d->font->std);   /* the batch keeps the font (atlas) alive until it is drawn */
-        vio_2d_push_item_owned(&d->ctx->state_2d, VIO_2D_TEXT, d->z,
+        vio_2d_push_item_owned(&d->ctx->state_2d, d->atlas->pad > 0 ? VIO_2D_TEXT_SDF : VIO_2D_TEXT, d->z,
                                d->font->atlas_texture, d->font->atlas_backend_texture,
                                start, 6, &d->font->std);
     }
@@ -707,8 +723,9 @@ static void measure_emit(void *user, unsigned int gid, float pen_x, float y_off)
      * bearing_y, bottom = bearing_y + h. */
     const vio_glyph_slot *s = shape_slot_metrics(m->atlas, gid);
     if (!s) return;
-    float top = (float)s->bearing_y;
-    float bot = (float)s->bearing_y + (float)s->h;
+    if (s->w == 0 && s->h == 0) return;
+    float top = (float)(s->bearing_y + m->atlas->pad);
+    float bot = (float)(s->bearing_y + s->h - m->atlas->pad);
     if (top < m->min_y) m->min_y = top;
     if (bot > m->max_y) m->max_y = bot;
 }
