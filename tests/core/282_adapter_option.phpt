@@ -5,8 +5,9 @@ vio
 --FILE--
 <?php
 foreach (['d3d11', 'd3d12', 'vulkan'] as $b) {
-    $list = vio_adapters($b)[$b] ?? [];
-    if (!$list || !in_array($b, vio_backends(), true)) { echo "$b: skip (unavailable)\n"; continue; }
+    // vio_adapters() rejects a backend this build does not register (d3d11 on macOS).
+    $list = in_array($b, vio_backends(), true) ? (vio_adapters($b)[$b] ?? []) : [];
+    if (!$list) { echo "$b: skip (unavailable)\n"; continue; }
     $err = [];
     $opened = 0;
     foreach ($list as $i => $a) {
