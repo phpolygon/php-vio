@@ -624,6 +624,11 @@ static d3d12_srv_retired_slot *d3d12_srv_retired;
 static int d3d12_srv_retired_count, d3d12_srv_retired_cap;
 static UINT *d3d12_srv_reusable;
 static int d3d12_srv_reusable_count, d3d12_srv_reusable_cap;
+/* Bumped each time the SRV heap is created. Objects record it when they take a
+ * slot; a texture freed after its context (and heap) is gone carries an older
+ * generation, and its index must not enter the new heap's free list, where it
+ * would hand a live texture's descriptor to the next allocation. */
+static UINT d3d12_srv_generation;
 
 static void d3d12_srv_reclaim(void)
 {
@@ -647,9 +652,11 @@ static void d3d12_srv_reclaim(void)
     d3d12_srv_retired_count = keep;
 }
 
-/* Give back a static SRV descriptor (its staging-heap CPU handle). */
-static void d3d12_free_srv_descriptor(UINT64 cpu_ptr)
+/* Give back a static SRV descriptor (its staging-heap CPU handle), taken from
+ * the heap of generation gen. */
+static void d3d12_free_srv_descriptor(UINT64 cpu_ptr, UINT gen)
 {
+    if (gen != d3d12_srv_generation) return;
     if (!cpu_ptr || !vio_d3d12.srv_staging_heap || !vio_d3d12.srv_heap.descriptor_size) return;
     D3D12_CPU_DESCRIPTOR_HANDLE start;
     ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &start);
@@ -1976,6 +1983,10 @@ static int d3d12_init(vio_config *cfg)
         vio_d3d12.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     vio_d3d12.srv_heap.capacity = VIO_D3D12_MAX_SRV_DESCRIPTORS;
     vio_d3d12.srv_heap.count = 0;
+    /* A new heap: slots freed into the previous one mean nothing here. */
+    d3d12_srv_generation++;
+    d3d12_srv_retired_count = 0;
+    d3d12_srv_reusable_count = 0;
     if (vio_d3d12.bindless) {
         /* The top VIO_BINDLESS_MAX descriptors are the bindless table: static
          * SRVs grow down below them, the per-frame region stays under those.
@@ -4701,6 +4712,7 @@ static void *d3d12_create_texture_ex(vio_texture_desc *desc)
         srv_desc.Texture2D.MipLevels = (UINT)mips;
     }
     d3d12_alloc_srv_descriptor(&tex->srv_cpu, &tex->srv_gpu);
+    tex->srv_gen = d3d12_srv_generation;
     ID3D12Device_CreateShaderResourceView(vio_d3d12.device, tex->resource, &srv_desc, tex->srv_cpu);
 
     if (gen && mips > 1) {
@@ -4779,6 +4791,7 @@ static void *d3d12_create_texture(vio_texture_desc *desc)
     srv_desc.Texture2D.MipLevels = (UINT)tex->mip_levels;
 
     d3d12_alloc_srv_descriptor(&tex->srv_cpu, &tex->srv_gpu);
+    tex->srv_gen = d3d12_srv_generation;
     ID3D12Device_CreateShaderResourceView(vio_d3d12.device, tex->resource,
                                            &srv_desc, tex->srv_cpu);
 
@@ -4844,6 +4857,7 @@ static void *d3d12_create_texture_3d(vio_texture_desc *desc)
     srv_desc.Texture3D.MipLevels = 1;
 
     d3d12_alloc_srv_descriptor(&tex->srv_cpu, &tex->srv_gpu);
+    tex->srv_gen = d3d12_srv_generation;
     ID3D12Device_CreateShaderResourceView(vio_d3d12.device, tex->resource,
                                            &srv_desc, tex->srv_cpu);
 
@@ -4860,7 +4874,7 @@ static void d3d12_destroy_texture(void *texture_ptr)
     if (tex->upload_resource) d3d12_release_when_idle((IUnknown *)tex->upload_resource);
     if (tex->resource) d3d12_release_when_idle((IUnknown *)tex->resource);
     /* Back to the free list (reused after the fence of this frame). */
-    d3d12_free_srv_descriptor(tex->srv_cpu.ptr);
+    d3d12_free_srv_descriptor(tex->srv_cpu.ptr, tex->srv_gen);
     free(tex);
 }
 
@@ -4940,6 +4954,7 @@ static int d3d12_upload_cubemap(void *cm_obj, int width, int height, const void 
 
     cm->d3d12_resource = res;
     cm->d3d12_srv_cpu  = srv_cpu.ptr;
+    cm->d3d12_srv_gen  = d3d12_srv_generation;
     cm->d3d12_srv_gpu  = srv_gpu.ptr;
     cm->resolution     = width;
     cm->mipmaps        = levels > 1;
@@ -5359,7 +5374,7 @@ static void d3d12_destroy_cubemap(void *cm_ptr)
         cm->d3d12_resource = NULL;
     }
     if (cm->d3d12_srv_cpu) {
-        d3d12_free_srv_descriptor(cm->d3d12_srv_cpu);
+        d3d12_free_srv_descriptor(cm->d3d12_srv_cpu, cm->d3d12_srv_gen);
         cm->d3d12_srv_cpu = 0;
     }
 }
@@ -5442,11 +5457,11 @@ static void d3d12_destroy_render_target(void *rt_ptr)
     }
     /* The target's static SRVs (one per colour attachment, the depth view). */
     for (int i = 0; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
-        if (rt->d3d12_color_srv_cpus[i]) d3d12_free_srv_descriptor(rt->d3d12_color_srv_cpus[i]);
+        if (rt->d3d12_color_srv_cpus[i]) d3d12_free_srv_descriptor(rt->d3d12_color_srv_cpus[i], rt->d3d12_srv_gen);
         rt->d3d12_color_srv_cpus[i] = 0;
     }
     rt->d3d12_color_srv_cpu = 0;
-    if (rt->d3d12_depth_srv_cpu) d3d12_free_srv_descriptor(rt->d3d12_depth_srv_cpu);
+    if (rt->d3d12_depth_srv_cpu) d3d12_free_srv_descriptor(rt->d3d12_depth_srv_cpu, rt->d3d12_srv_gen);
     rt->d3d12_depth_srv_cpu = 0;
 }
 
@@ -5834,6 +5849,7 @@ static int d3d12_rt_alloc_srv(uint64_t *out_cpu, uint64_t *out_gpu)
 static int d3d12_create_render_target(void *rt_ptr, int width, int height, int hdr, int depth_only)
 {
     vio_render_target_object *rt = (vio_render_target_object *)rt_ptr;
+    rt->d3d12_srv_gen = d3d12_srv_generation;
     (void)hdr;   /* rt->formats[0] already encodes it */
     if (!rt || !vio_d3d12.initialized || width <= 0 || height <= 0) return -1;
     HRESULT hr;

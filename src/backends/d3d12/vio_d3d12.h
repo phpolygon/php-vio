@@ -291,6 +291,7 @@ typedef struct _vio_d3d12_texture {
     ID3D12Resource          *upload_resource;
     D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
     D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu;
+    UINT srv_gen;   /* SRV heap generation srv_cpu was taken from */
     int width;
     int height;
     int depth;   /* > 0 for 3D / volume textures */
