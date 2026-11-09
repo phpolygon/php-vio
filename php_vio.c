@@ -796,6 +796,28 @@ pick_backend:
         if ((val = zend_hash_str_find(options_ht, "headless_hardware", sizeof("headless_hardware") - 1)) != NULL) {
             ctx->config.headless_hardware = zend_is_true(val);
         }
+        /* Adapter choice: a string is part of the adapter's name, an int its position
+         * in vio_adapters()[backend] - resolved to that name through the backend's own
+         * listing, so both count the same way. */
+        if ((val = zend_hash_str_find(options_ht, "adapter", sizeof("adapter") - 1)) != NULL && Z_TYPE_P(val) != IS_NULL) {
+            if (Z_TYPE_P(val) == IS_LONG) {
+                vio_adapter_info *list = (vio_adapter_info *)ecalloc(VIO_MAX_ADAPTERS, sizeof(vio_adapter_info));
+                int n = ctx->backend->enumerate_adapters ? ctx->backend->enumerate_adapters(list, VIO_MAX_ADAPTERS) : 0;
+                zend_long idx = Z_LVAL_P(val);
+                if (idx < 0 || idx >= n) {
+                    efree(list);
+                    php_error_docref(NULL, E_WARNING, "vio_create: adapter %ld not found (%s lists %d)", (long)idx, ctx->backend->name, n);
+                    zval_ptr_dtor(&obj);
+                    VIO_CREATE_FAIL();
+                }
+                snprintf(ctx->config.adapter_name, sizeof(ctx->config.adapter_name), "%s", list[idx].name);
+                efree(list);
+            } else {
+                zend_string *s = zval_get_string(val);
+                snprintf(ctx->config.adapter_name, sizeof(ctx->config.adapter_name), "%s", ZSTR_VAL(s));
+                zend_string_release(s);
+            }
+        }
         /* On-disk shader / pipeline cache directory (GAP-PHASE5 Block 4): DXBC per
          * HLSL stage on D3D11/D3D12, GL program binaries, the Vulkan pipeline
          * cache. Process-wide; absent or '' keeps everything compiled per run. */
@@ -8573,13 +8595,15 @@ ZEND_FUNCTION(vio_font)
     size_t path_len;
     double size = 24.0;
     double scale = 1.0;
+    HashTable *opts_ht = NULL;
 
-    ZEND_PARSE_PARAMETERS_START(2, 4)
+    ZEND_PARSE_PARAMETERS_START(2, 5)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_STRING(path, path_len)
         Z_PARAM_OPTIONAL
         Z_PARAM_DOUBLE(size)
         Z_PARAM_DOUBLE(scale)
+        Z_PARAM_ARRAY_HT_OR_NULL(opts_ht)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
@@ -8617,12 +8641,28 @@ ZEND_FUNCTION(vio_font)
     font->render_scale = (float)scale;
     font->font_size = (float)(size * scale);
     font->backend   = ctx->backend;
+    if (opts_ht) {
+        /* 'sdf' => true | spread in atlas px: a signed-distance-field atlas (glyph
+         * edges stay sharp when a transform magnifies the text). Needs the shaping
+         * atlas; without HarfBuzz the font stays a coverage atlas. */
+        zval *val = zend_hash_str_find(opts_ht, "sdf", sizeof("sdf") - 1);
+        if (val && zend_is_true(val)) {
+            int spread = (Z_TYPE_P(val) == IS_LONG || Z_TYPE_P(val) == IS_DOUBLE) ? (int)zval_get_long(val) : 0;
+            if (spread <= 0) spread = (int)(font->font_size * 0.125f + 0.5f);
+            if (spread < 2) spread = 2;
+            if (spread > 32) spread = 32;
+            font->sdf_spread = spread;
+        }
+    }
     font->ttf_len = ZSTR_LEN(contents);
     font->ttf_data = emalloc(font->ttf_len);
     memcpy(font->ttf_data, ZSTR_VAL(contents), font->ttf_len);
     zend_string_release(contents);
 
     int shaping_active = 0;
+#ifndef HAVE_HARFBUZZ
+    font->sdf_spread = 0;
+#endif
 #ifdef HAVE_HARFBUZZ
     /* Preferred path: build the glyph-index atlas + HarfBuzz font. This packs
      * every glyph (by index) and uploads once, so the atlas handle is stable
@@ -8632,6 +8672,7 @@ ZEND_FUNCTION(vio_font)
 #endif
 
     if (!shaping_active) {
+        font->sdf_spread = 0;   /* the legacy pack is coverage only */
         /* Legacy path: multi-range atlas packing (Latin, Cyrillic, Greek, CJK,
          * Hangul, ...), dynamically sized to this font's glyph set. */
         unsigned char *atlas_bitmap = NULL;
@@ -9101,6 +9142,7 @@ ZEND_FUNCTION(vio_font_info)
     add_assoc_long(return_value, "rasterized", rasterized);
     add_assoc_long(return_value, "atlas_size", side);
     add_assoc_bool(return_value, "lazy", lazy);
+    add_assoc_long(return_value, "sdf", font->sdf_spread);
 }
 
 ZEND_FUNCTION(vio_font_has_glyph)

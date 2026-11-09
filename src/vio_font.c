@@ -30,6 +30,7 @@ static zend_object *vio_font_create_object(zend_class_entry *ce)
     font->ttf_len               = 0;
     font->valid                 = 0;
     font->backend               = NULL;
+    font->sdf_spread            = 0;
 #ifdef HAVE_HARFBUZZ
     font->hb_font               = NULL;
     font->shape_atlas           = NULL;

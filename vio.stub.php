@@ -35,7 +35,12 @@
  *                       that runtime (ID3D12SDKConfiguration1::CreateDeviceFactory) instead of the OS
  *                       one - needed for work graphs / SM 6.8+ on most Windows builds;
  *                       agility_sdk_version => the SDK version D3D12Core.dll exports (default: read
- *                       from the DLL). Falls back to the OS runtime with a warning.)
+ *                       from the DLL). Falls back to the OS runtime with a warning,
+ *                       adapter => int|string: the adapter to open - its position in
+ *                       vio_adapters()[backend] or part of its name (case-insensitive, e.g. 'Intel').
+ *                       D3D11, D3D12 and Vulkan; an explicit choice also keeps headless D3D off WARP
+ *                       (choose the software adapter by name for WARP). No match = false with a
+ *                       warning. OpenGL and Metal use the system's device.)
  * @return VioContext|false Context object or false on failure
  */
 function vio_create(string $backend = "auto", array $options = []): VioContext|false {}
@@ -943,6 +948,8 @@ function vio_trace_rays(VioContext $context, VioRtPipeline $pipeline, int $width
  *   layout(set = 1, binding = 4) uniform sampler vio_sampler_nearest_clamp;   // optional
  *   layout(set = 1, binding = 5) uniform textureCube vio_cubes[];             // VioCubemap slots
  *   layout(set = 1, binding = 6) uniform texture2DArray vio_texture_arrays[]; // layered VioTexture slots
+ *   layout(set = 1, binding = 7) uniform sampler vio_sampler_aniso;           // optional: linear, repeat, 16x anisotropic
+ *   layout(set = 1, binding = 8) uniform sampler vio_sampler_aniso_clamp;     // optional: the same, clamped to the edge
  * and index it with nonuniformEXT (GL_EXT_nonuniform_qualifier). The first call adds
  * the texture and keeps it alive until vio_texture_release_index or vio_destroy; later
  * calls return the same slot. 2D textures, texture arrays and cubemaps share the
@@ -1126,9 +1133,18 @@ function vio_sprite(VioContext $context, VioTexture $texture, ?array $options = 
  * magnification) so text stays crisp when a transform magnifies it. $scale < 1
  * is clamped to 1.0.
  *
+ * Options:
+ *   'sdf' => true | int  Signed-distance-field atlas: glyph edges stay sharp at any
+ *                        magnification (2D transforms, zoomed UI). An int sets the
+ *                        spread in atlas pixels (default size*scale/8, 2..32).
+ *                        Needs the HarfBuzz build; vio_font_info()['sdf'] reports the
+ *                        spread in use (0 = coverage atlas). Rasterize an SDF font
+ *                        at 24 px or more: below that, thin strokes come out
+ *                        narrower than the coverage glyphs.
+ *
  * @return VioFont|false Font object or false on failure
  */
-function vio_font(VioContext $context, string $path, float $size = 24.0, float $scale = 1.0): VioFont|false {}
+function vio_font(VioContext $context, string $path, float $size = 24.0, float $scale = 1.0, ?array $options = null): VioFont|false {}
 
 /**
  * Draw text using a loaded font.
@@ -1175,7 +1191,8 @@ function vio_font_has_glyph(VioFont $font, int $codepoint): bool {}
 /**
  * Glyph atlas of a font: ['glyphs' => int (glyphs in the face; legacy path: packed
  * codepoints), 'rasterized' => int (glyphs in the atlas so far), 'atlas_size' =>
- * int (side in px), 'lazy' => bool]. With HarfBuzz the atlas fills on demand on
+ * int (side in px), 'lazy' => bool, 'sdf' => int (distance-field spread in atlas px,
+ * 0 = coverage atlas)]. With HarfBuzz the atlas fills on demand on
  * every backend: vio_text rasterizes new glyphs and uploads only the rectangle
  * they dirtied; vio_text_measure rasterizes nothing. False for an invalid font.
  */
@@ -1274,6 +1291,8 @@ function vio_draw_2d(VioContext $context): void {}
  * 'vertex' (giving both is refused), 'task' => optional task (amplification / object) stage; draw them
  * with vio_draw_mesh_tasks() / vio_draw_mesh_tasks_indirect(), not vio_draw(). The mesh stage's
  * uniforms are set with vio_set_uniform() like vertex uniforms (a task stage shares that block).
+ * Both stages read `readonly` storage buffers at bindings 0..3 (vio_bind_storage_buffer), the
+ * same buffer under the same binding in task and mesh stage (D3D12: root SRVs t0..t3, space 2).
  * Without the feature 'mesh' returns false with a warning.
  * Portable geometry shaders read input positions from a user varying (`layout(location = N) in vec4 vPos[]`
  * exported by the vertex stage), not from gl_in[].gl_Position, which D3D cannot translate.

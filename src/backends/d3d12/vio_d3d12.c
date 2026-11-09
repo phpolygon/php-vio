@@ -616,9 +616,76 @@ static int d3d12_create_descriptor_heap(ID3D12DescriptorHeap **out, D3D12_DESCRI
  * land in any frame's per-frame region — fixing the previous bug where lazy
  * texture loads (e.g. menu icons) had their freshly-created SRVs immediately
  * stomped by flush_srv_table's null-init sweep on the very next bound draw. */
+/* Freed static SRV descriptors (textures and render targets destroyed). A slot
+ * is reused only after the GPU passed the fence of the frame that may still read
+ * it through a table copied from it; until then it waits in d3d12_srv_retired. */
+typedef struct { UINT idx; UINT64 fence; } d3d12_srv_retired_slot;
+static d3d12_srv_retired_slot *d3d12_srv_retired;
+static int d3d12_srv_retired_count, d3d12_srv_retired_cap;
+static UINT *d3d12_srv_reusable;
+static int d3d12_srv_reusable_count, d3d12_srv_reusable_cap;
+
+static void d3d12_srv_reclaim(void)
+{
+    if (!d3d12_srv_retired_count || !vio_d3d12.fence) return;
+    UINT64 done = ID3D12Fence_GetCompletedValue(vio_d3d12.fence);
+    int keep = 0;
+    for (int i = 0; i < d3d12_srv_retired_count; i++) {
+        if (d3d12_srv_retired[i].fence <= done) {
+            if (d3d12_srv_reusable_count == d3d12_srv_reusable_cap) {
+                int cap = d3d12_srv_reusable_cap ? d3d12_srv_reusable_cap * 2 : 256;
+                UINT *grown = realloc(d3d12_srv_reusable, (size_t)cap * sizeof(UINT));
+                if (!grown) { d3d12_srv_retired[keep++] = d3d12_srv_retired[i]; continue; }
+                d3d12_srv_reusable = grown;
+                d3d12_srv_reusable_cap = cap;
+            }
+            d3d12_srv_reusable[d3d12_srv_reusable_count++] = d3d12_srv_retired[i].idx;
+        } else {
+            d3d12_srv_retired[keep++] = d3d12_srv_retired[i];
+        }
+    }
+    d3d12_srv_retired_count = keep;
+}
+
+/* Give back a static SRV descriptor (its staging-heap CPU handle). */
+static void d3d12_free_srv_descriptor(UINT64 cpu_ptr)
+{
+    if (!cpu_ptr || !vio_d3d12.srv_staging_heap || !vio_d3d12.srv_heap.descriptor_size) return;
+    D3D12_CPU_DESCRIPTOR_HANDLE start;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &start);
+    if (cpu_ptr < start.ptr) return;
+    UINT64 idx = (cpu_ptr - start.ptr) / vio_d3d12.srv_heap.descriptor_size;
+    /* Only the static region (top of the heap, below the bindless reserve) is ours to free. */
+    if (idx >= vio_d3d12.srv_heap.capacity || idx < vio_d3d12.srv_heap.capacity - vio_d3d12.srv_heap.count) return;
+    if (idx >= vio_d3d12.srv_heap.capacity - VIO_BINDLESS_MAX) return;
+    if (d3d12_srv_retired_count == d3d12_srv_retired_cap) {
+        int cap = d3d12_srv_retired_cap ? d3d12_srv_retired_cap * 2 : 256;
+        d3d12_srv_retired_slot *grown = realloc(d3d12_srv_retired, (size_t)cap * sizeof(*grown));
+        if (!grown) return;   /* leak the slot rather than reuse it early */
+        d3d12_srv_retired = grown;
+        d3d12_srv_retired_cap = cap;
+    }
+    /* fence_value is the last value signalled: work recorded from now on is
+     * covered by the next one. */
+    d3d12_srv_retired[d3d12_srv_retired_count].idx = (UINT)idx;
+    d3d12_srv_retired[d3d12_srv_retired_count].fence = vio_d3d12.fence_value + 1;
+    d3d12_srv_retired_count++;
+}
+
 static UINT d3d12_alloc_srv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE *out_cpu,
                                         D3D12_GPU_DESCRIPTOR_HANDLE *out_gpu)
 {
+    d3d12_srv_reclaim();
+    if (d3d12_srv_reusable_count > 0) {
+        UINT idx = d3d12_srv_reusable[--d3d12_srv_reusable_count];
+        D3D12_CPU_DESCRIPTOR_HANDLE staging_start;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu_start;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &staging_start);
+        ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &gpu_start);
+        out_cpu->ptr = staging_start.ptr + (SIZE_T)idx * vio_d3d12.srv_heap.descriptor_size;
+        out_gpu->ptr = gpu_start.ptr + (UINT64)idx * vio_d3d12.srv_heap.descriptor_size;
+        return idx;
+    }
     if (vio_d3d12.srv_heap.count >= vio_d3d12.srv_heap.capacity) {
         php_error_docref(NULL, E_WARNING, "D3D12: SRV descriptor heap full (%u/%u)",
                           vio_d3d12.srv_heap.count, vio_d3d12.srv_heap.capacity);
@@ -646,12 +713,13 @@ static UINT d3d12_alloc_srv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE *out_cpu,
 
 /* ── Root Signature ───────────────────────────────────────────────── */
 
-/* The bindless table's samplers, s1..s4 in space 1 (BINDLESS-PLAN): vio_sampler
- * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp.
- * Graphics and compute root signatures carry the same four. */
-static void d3d12_bindless_static_samplers(D3D12_STATIC_SAMPLER_DESC out[4])
+/* The bindless table's samplers, s1..s4 and s7 in space 1 (BINDLESS-PLAN): vio_sampler
+ * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp,
+ * vio_sampler_aniso (s7: anisotropic 16x, repeat), vio_sampler_aniso_clamp (s8). Graphics and compute root signatures
+ * carry the same five. */
+static void d3d12_bindless_static_samplers(D3D12_STATIC_SAMPLER_DESC out[VIO_D3D12_BINDLESS_SAMPLERS])
 {
-    for (int v = 0; v < 4; v++) {
+    for (int v = 0; v < VIO_D3D12_BINDLESS_SAMPLERS; v++) {
         D3D12_STATIC_SAMPLER_DESC *s = &out[v];
         D3D12_TEXTURE_ADDRESS_MODE am = (v & 2) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         memset(s, 0, sizeof(*s));
@@ -662,6 +730,14 @@ static void d3d12_bindless_static_samplers(D3D12_STATIC_SAMPLER_DESC out[4])
         s->ShaderRegister = 1 + (UINT)v;
         s->RegisterSpace = 1;
         s->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        if (v >= 4) {
+            /* s7 vio_sampler_aniso (repeat), s8 vio_sampler_aniso_clamp. */
+            s->Filter = D3D12_FILTER_ANISOTROPIC;
+            am = v == 5 ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            s->AddressU = s->AddressV = s->AddressW = am;
+            s->MaxAnisotropy = 16;
+            s->ShaderRegister = (UINT)(3 + v);   /* GLSL set 1, binding 7 / 8 */
+        }
     }
 }
 
@@ -743,7 +819,17 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     /* Mesh variant: space 2 (vio_shader_reflect.c moves mesh / task storage
      * buffers there), since the mesh stage also sees the SRV table at t0. */
     params[3].Descriptor.RegisterSpace = 2;   /* vertex / mesh storage buffers live in space 2 (A28) */
-    params[3].ShaderVisibility = mesh ? D3D12_SHADER_VISIBILITY_MESH : D3D12_SHADER_VISIBILITY_VERTEX;
+    /* Mesh variant: every stage, so the task (amplification) stage reads the same
+     * buffers as the mesh stage. */
+    params[3].ShaderVisibility = mesh ? D3D12_SHADER_VISIBILITY_ALL : D3D12_SHADER_VISIBILITY_VERTEX;
+    /* [22..24] storage buffers 1..3 of the same stages (t1..t3, space 2). */
+    for (int i = 1; i < VIO_D3D12_GRAPHICS_STORAGE; i++) {
+        D3D12_ROOT_PARAMETER *sp = &params[VIO_D3D12_RP_STORAGE_MORE + i - 1];
+        sp->ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        sp->Descriptor.ShaderRegister = (UINT)i;
+        sp->Descriptor.RegisterSpace = 2;
+        sp->ShaderVisibility = params[3].ShaderVisibility;
+    }
 
     /* [4] Sampler table s0.. — one per texture register (GAP-PLAN Phase 1,
      * SAMPLER-LIMITS-PLAN). Filled per draw from each bound texture's sampler
@@ -824,7 +910,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     params[VIO_D3D12_RP_BINDLESS].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     /* The bindless table's samplers, s1..s4 in space 1 (BINDLESS-PLAN): vio_sampler
      * (linear, repeat), vio_sampler_nearest, vio_sampler_clamp, vio_sampler_nearest_clamp. */
-    D3D12_STATIC_SAMPLER_DESC all_samplers[4];
+    D3D12_STATIC_SAMPLER_DESC all_samplers[VIO_D3D12_BINDLESS_SAMPLERS];
     d3d12_bindless_static_samplers(all_samplers);
 
     /* [20] / [21] Vertex textures (A28): the SRV and sampler tables for the
@@ -877,7 +963,7 @@ static int d3d12_build_root_signature(int mesh, ID3D12RootSignature **out)
     rs_desc.NumParameters = vio_d3d12.sampler_feedback ? VIO_D3D12_RP_COUNT
                           : vio_d3d12.bindless ? VIO_D3D12_RP_FEEDBACK : VIO_D3D12_RP_BINDLESS;
     rs_desc.pParameters = params;
-    rs_desc.NumStaticSamplers = vio_d3d12.bindless ? 4 : 0;
+    rs_desc.NumStaticSamplers = vio_d3d12.bindless ? VIO_D3D12_BINDLESS_SAMPLERS : 0;
     rs_desc.pStaticSamplers = vio_d3d12.bindless ? all_samplers : NULL;
     rs_desc.Flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -1462,7 +1548,27 @@ static int d3d12_init(vio_config *cfg)
      * sampler feedback, VRS tier 2). */
     IDXGIAdapter1 *adapter = NULL;
     const char *hw_env = getenv("VIO_D3D_HEADLESS_HARDWARE");
-    if (cfg->headless && !cfg->headless_hardware && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)) {
+    if (cfg->adapter_name[0]) {
+        /* Explicit choice ('adapter' option): the first adapter whose name contains it. */
+        for (UINT i = 0; IDXGIFactory4_EnumAdapters1(vio_d3d12.factory, i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+            DXGI_ADAPTER_DESC1 desc;
+            char name[256];
+            IDXGIAdapter1_GetDesc1(adapter, &desc);
+            if (WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, (int)sizeof(name), NULL, NULL) <= 0) name[0] = '\0';
+            if (vio_adapter_name_matches(name, cfg->adapter_name)
+                && SUCCEEDED(D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, NULL))) {
+                vio_d3d12.warp = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? 1 : 0;
+                if (vio_d3d12.warp) vio_d3d_load_warp();
+                break;
+            }
+            IDXGIAdapter1_Release(adapter);
+            adapter = NULL;
+        }
+        if (!adapter) {
+            php_error_docref(NULL, E_WARNING, "D3D12: adapter '%s' not found", cfg->adapter_name);
+            goto init_fail;
+        }
+    } else if (cfg->headless && !cfg->headless_hardware && !(hw_env && *hw_env && strcmp(hw_env, "0") != 0)) {
         vio_d3d_load_warp();
         vio_d3d12.warp = 1;
         hr = IDXGIFactory4_EnumWarpAdapter(vio_d3d12.factory, &IID_IDXGIAdapter1, (void **)&adapter);
@@ -4753,8 +4859,8 @@ static void d3d12_destroy_texture(void *texture_ptr)
     if (tex->fb_decoded) d3d12_release_when_idle((IUnknown *)tex->fb_decoded);
     if (tex->upload_resource) d3d12_release_when_idle((IUnknown *)tex->upload_resource);
     if (tex->resource) d3d12_release_when_idle((IUnknown *)tex->resource);
-    /* Note: descriptor in SRV heap is leaked (linear allocator doesn't support free).
-     * A proper free-list allocator would reclaim the slot. */
+    /* Back to the free list (reused after the fence of this frame). */
+    d3d12_free_srv_descriptor(tex->srv_cpu.ptr);
     free(tex);
 }
 
@@ -5252,6 +5358,21 @@ static void d3d12_destroy_cubemap(void *cm_ptr)
         d3d12_release_when_idle((IUnknown *)cm->d3d12_resource);
         cm->d3d12_resource = NULL;
     }
+    if (cm->d3d12_srv_cpu) {
+        d3d12_free_srv_descriptor(cm->d3d12_srv_cpu);
+        cm->d3d12_srv_cpu = 0;
+    }
+}
+
+/* VioTexture free handler: the texture's resource and SRV go back (a texture a
+ * render target or cache lends out is borrowed and stays with its owner). */
+static void d3d12_destroy_texture_obj(void *tex_obj_ptr)
+{
+    vio_texture_object *tex_obj = (vio_texture_object *)tex_obj_ptr;
+    if (tex_obj->backend_texture && !tex_obj->borrowed) {
+        d3d12_destroy_texture(tex_obj->backend_texture);
+    }
+    tex_obj->backend_texture = NULL;
 }
 
 static void d3d12_destroy_font_atlas(void *font_ptr)
@@ -5319,6 +5440,14 @@ static void d3d12_destroy_render_target(void *rt_ptr)
         d3d12_release_when_idle((IUnknown *)rt->d3d12_dsv_heap);
         rt->d3d12_dsv_heap = NULL;
     }
+    /* The target's static SRVs (one per colour attachment, the depth view). */
+    for (int i = 0; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
+        if (rt->d3d12_color_srv_cpus[i]) d3d12_free_srv_descriptor(rt->d3d12_color_srv_cpus[i]);
+        rt->d3d12_color_srv_cpus[i] = 0;
+    }
+    rt->d3d12_color_srv_cpu = 0;
+    if (rt->d3d12_depth_srv_cpu) d3d12_free_srv_descriptor(rt->d3d12_depth_srv_cpu);
+    rt->d3d12_depth_srv_cpu = 0;
 }
 
 /* ── Render targets (GAP-PLAN Phase 2: moved out of php_vio.c) ──────
@@ -7131,6 +7260,14 @@ static void *d3d12_compile_mesh_shader(vio_shader_desc *desc, vio_d3d12_shader *
         fprintf(stderr, "==== D3D12 MS HLSL ====\n%s\n==== D3D12 PS HLSL ====\n%s\n==== end ====\n", ms, ps);
         fflush(stderr);
     }
+    /* The bindless table (space 1 / 3 / 4) in any stage: d3d12_apply_bindless points
+     * its root table at every dispatch, as for vertex pipelines. */
+    {
+        const char *st[3] = { ms, ps, as };
+        for (int i = 0; i < 3; i++) {
+            if (st[i] && (strstr(st[i], "space1)") || strstr(st[i], "space3)") || strstr(st[i], "space4)"))) shader->uses_bindless = 1;
+        }
+    }
     /* "xs_5_1" profiles become xs_6_<minor> under Shader Model 6. */
     if (FAILED(d3d12_compile_cached(ms, "MS", "ms_5_1", shader->compile_flags, &shader->vs_blob))) goto fail;
     if (FAILED(d3d12_compile_cached(ps, "PS", "ps_5_1", shader->compile_flags, &shader->ps_blob))) goto fail;
@@ -8233,7 +8370,7 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
     params[4].DescriptorTable.NumDescriptorRanges = 3;
     params[4].DescriptorTable.pDescriptorRanges = bindless_ranges;
     params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_STATIC_SAMPLER_DESC bindless_samplers[4];
+    D3D12_STATIC_SAMPLER_DESC bindless_samplers[VIO_D3D12_BINDLESS_SAMPLERS];
     d3d12_bindless_static_samplers(bindless_samplers);
 
     /* [3] root SRV t0, space9 — the ray-query acceleration structure, when used. */
@@ -8264,7 +8401,7 @@ static int d3d12_build_compute_root_signature(vio_d3d12_compute_pipeline *cp)
     D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
     rs_desc.NumParameters = cp->uses_bindless ? 5 : cp->uses_accel ? 4 : 3;
     rs_desc.pParameters = params;
-    rs_desc.NumStaticSamplers = cp->uses_bindless ? 4 : 0;
+    rs_desc.NumStaticSamplers = cp->uses_bindless ? VIO_D3D12_BINDLESS_SAMPLERS : 0;
     rs_desc.pStaticSamplers = cp->uses_bindless ? bindless_samplers : NULL;
     rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE; /* NO input-assembler flag */
 
@@ -8412,6 +8549,7 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
      * long vectors and fails on them). */
     char *hlsl = desc->compute_hlsl ? strdup(desc->compute_hlsl)
                                     : vio_spirv_to_hlsl(spirv, spirv_size, d3d12_hlsl_target(), &err);
+    int raw_buffers = desc->compute_hlsl ? 0 : 1;
     hlsl = d3d12_hlsl_post(hlsl);
     if (free_spirv) free(spirv);
     if (!hlsl) {
@@ -8439,6 +8577,7 @@ static void *d3d12_create_compute_pipeline(vio_shader_desc *desc)
     cp->cbv_register = cbv_register;
     cp->srv_base_reg = srv_base_reg;
     cp->uav_base_reg = uav_base_reg;
+    cp->raw_buffers  = raw_buffers;
     cp->uses_accel   = strstr(hlsl, "RaytracingAccelerationStructure") != NULL;
     cp->uses_bindless = vio_d3d12.bindless && vio_d3d12.bindless_cpu_heap
                      && (strstr(hlsl, "space1)") || strstr(hlsl, "space3)") || strstr(hlsl, "space4)"));
@@ -9020,18 +9159,20 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
     const int  srv_reg_base = cp->srv_base_reg >= 0 ? cp->srv_base_reg : 0;
     const int  uav_reg_base = cp->uav_base_reg >= 0 ? cp->uav_base_reg : 0;
 
-    /* SRVs. spirv-cross transpiles GLSL std430 `buffer { float x[]; }` to an HLSL
-     * ByteAddressBuffer (raw), NOT a StructuredBuffer — confirmed via the debug
-     * layer. So a stride of 4 (raw/default) builds a RAW view (R32_TYPELESS +
-     * FLAG_RAW, NumElements counted in 4-byte words). A stride > 4 builds a true
-     * structured view (StructuredBuffer<T> in HLSL). */
+    /* SRVs. spirv-cross transpiles every GLSL std430 `buffer { T x[]; }` to an HLSL
+     * (RW)ByteAddressBuffer (raw) - whatever T is - so a GLSL kernel always gets RAW
+     * views (R32_TYPELESS + FLAG_RAW, NumElements in 4-byte words). A structured view
+     * there made a raw Load4 at byte 16 address element 16 of a 16-byte-stride view:
+     * out of range, 0 on hardware (WARP did not check), so vec4 arrays read only
+     * element 0. Only a caller's own 'hlsl' kernel may use StructuredBuffer<T>, and
+     * gets a structured view when the buffer's stride is > 4. */
     for (int i = 0; i < cp->srv_count; i++) {
         vio_d3d12_compute_binding *b = &cp->srvs[i];
         if (!b->buffer || !b->buffer->resource) continue;
         int rel = b->slot - srv_reg_base;        /* heap-offset within the SRV region */
         if (rel < 0 || rel >= VIO_D3D12_COMPUTE_MAX_BINDINGS) continue;
         UINT idx = SRV_BASE + (UINT)rel;
-        int raw = (b->stride <= 4);
+        int raw = cp->raw_buffers || (b->stride <= 4);
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
         sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -9059,7 +9200,7 @@ static void d3d12_dispatch_compute(vio_compute_cmd *cmd)
         int rel = b->slot - uav_reg_base;        /* heap-offset within the UAV region */
         if (rel < 0 || rel >= VIO_D3D12_COMPUTE_MAX_BINDINGS) continue;
         UINT idx = UAV_BASE + (UINT)rel;
-        int raw = (b->stride <= 4);
+        int raw = cp->raw_buffers || (b->stride <= 4);
         D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
         ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
         ud.Buffer.FirstElement = 0;
@@ -10216,19 +10357,21 @@ static int d3d12_supports_feature(vio_feature feature)
 
 /* ── Graphics-stage storage buffers (Path B: readback-free instancing) ──── */
 
-/* Bind a storage buffer to the vertex stage as root SRV param [3] (register t0,
- * VERTEX visibility). No explicit resource barrier: the compute UAV output lives
+/* Bind a storage buffer to the vertex / mesh / task stages: binding 0 as root SRV
+ * param [3] (register t0, space 2), bindings 1..3 at [22..24] (t1..t3). No explicit resource barrier: the compute UAV output lives
  * in / decays to COMMON after its (fenced, transient-list) dispatch, and a D3D12
  * buffer in COMMON is implicitly promoted to a shader-resource state on the
  * vertex-stage read — so the root SRV set here is sufficient. */
 static void d3d12_bind_storage_buffer(void *backend_buffer, int binding, int access,
                                       int element_count, int stride)
 {
-    (void)binding; (void)access; (void)element_count; (void)stride;
+    (void)access; (void)element_count; (void)stride;
     if (!vio_d3d12.initialized || !vio_d3d12.cmd_list || !backend_buffer) return;
+    if (binding < 0 || binding >= VIO_D3D12_GRAPHICS_STORAGE) return;
     vio_d3d12_buffer *buf = (vio_d3d12_buffer *)backend_buffer;
     if (!buf->resource || !buf->gpu_address) return;
-    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(vio_d3d12.cmd_list, 3, buf->gpu_address);
+    UINT param = binding == 0 ? VIO_D3D12_RP_VS_STORAGE : (UINT)(VIO_D3D12_RP_STORAGE_MORE + binding - 1);
+    ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(vio_d3d12.cmd_list, param, buf->gpu_address);
 }
 
 /* Instanced draw pulling per-instance data from the bound storage buffer
@@ -10252,6 +10395,11 @@ static void d3d12_draw_instanced_from_storage(void *mesh_obj, int instance_count
     vbvs[1].SizeInBytes = 64;
     vbvs[1].StrideInBytes = 64;
     ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 2, vbvs);
+
+    /* The texture table like every draw path: without it the root table points at
+     * whatever an earlier draw left (or nothing), and a shader that samples removes
+     * the device. */
+    vio_d3d12_flush_srv_table();
 
     if (mesh->index_count > 0 && mesh->backend_ib) {
         vio_d3d12_buffer *ib = (vio_d3d12_buffer *)mesh->backend_ib;
@@ -10483,6 +10631,10 @@ static void d3d12_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
         ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
     }
 
+    /* The texture table, as in d3d12_draw: a shader that samples (a shadow map, a
+     * material texture) otherwise reads an unset table and removes the device. */
+    vio_d3d12_flush_srv_table();
+
     /* A buffer an async dispatch wrote on this frame's list sits in UNORDERED_ACCESS;
      * ExecuteIndirect needs INDIRECT_ARGUMENT (COMMON / GENERIC_READ promote by
      * themselves). Flush the UAV writes, transition, draw, transition back. */
@@ -10561,6 +10713,7 @@ static void d3d12_draw_mesh_tasks(uint32_t x, uint32_t y, uint32_t z)
     ID3D12GraphicsCommandList6 *cl6 = d3d12_cmd_list6();
     if (!cl6) return;
     vio_d3d12_flush_srv_table();
+    d3d12_apply_bindless();   /* the table of a fragment (or mesh) stage reading vio_textures[] */
     d3d12_apply_view_mask();
     ID3D12GraphicsCommandList6_DispatchMesh(cl6, x, y, z);
 }
@@ -10596,6 +10749,7 @@ static void d3d12_draw_mesh_tasks_indirect(void *args_buffer, int max_draws, siz
         b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
         ID3D12GraphicsCommandList_ResourceBarrier(vio_d3d12.cmd_list, 2, b);
     }
+    d3d12_apply_bindless();
     d3d12_apply_view_mask();
     ID3D12GraphicsCommandList_ExecuteIndirect(vio_d3d12.cmd_list, vio_d3d12.cmdsig_mesh, (UINT)max_draws,
                                               args->resource, (UINT64)offset, NULL, 0);
@@ -10879,7 +11033,18 @@ void vio_d3d12_flush_srv_table(void)
     UINT base_idx = vio_d3d12.srv_frame_offset;
     UINT region_end = vio_d3d12.srv_frame_base + vio_d3d12.srv_frame_capacity;
     if (base_idx + (UINT)n > region_end) {   /* out of space in this frame's region */
-        if (d3d12_brec) d3d12_brec_fail();                      /* the bundle's range: record it again larger */
+        if (d3d12_brec) {
+            d3d12_brec_fail();                      /* the bundle's range: record it again larger */
+            return;
+        }
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            php_error_docref(NULL, E_WARNING,
+                "D3D12: the frame's %u SRV table descriptors are used up (%u static views); "
+                "the following draws reuse the last bound table and may sample the wrong textures",
+                vio_d3d12.srv_frame_capacity, vio_d3d12.srv_heap.count);
+        }
         return;
     }
     vio_d3d12.srv_frame_offset += (UINT)n;
@@ -11302,6 +11467,7 @@ static const vio_backend d3d12_backend = {
     .create_texture    = d3d12_create_texture,
     .create_texture_3d = d3d12_create_texture_3d,
     .destroy_texture   = d3d12_destroy_texture,
+    .destroy_texture_obj = d3d12_destroy_texture_obj,
     .compile_shader    = d3d12_compile_shader,
     .destroy_shader    = d3d12_destroy_shader,
     .begin_frame       = d3d12_begin_frame,

@@ -47,7 +47,12 @@
 #define VIO_D3D12_MIN_FRAME_COUNT     2
 #define VIO_D3D12_MAX_FRAME_COUNT     3
 #define VIO_D3D12_FRAME_COUNT_DEFAULT 2
-#define VIO_D3D12_MAX_SRV_DESCRIPTORS 32768
+/* Shader-visible CBV/SRV/UAV heap: static views from the top, the per-frame table
+ * rings below them (one slice per frame in flight). Every draw that binds a new
+ * texture set takes VIO_D3D12_SRV_TABLE_SIZE descriptors from its frame's slice, so a
+ * frame with a mirrored second scene pass needs well over 30k. 262144 x 32 bytes
+ * per heap (staging + shader-visible) = 16 MB; resource binding tier 1 allows 1M. */
+#define VIO_D3D12_MAX_SRV_DESCRIPTORS 262144
 
 /* Size of the SMALL per-draw table (SAMPLER-LIMITS-PLAN): a draw whose shader
  * reads at most this many texture registers gets a block of exactly this size,
@@ -122,9 +127,14 @@
 #define VIO_D3D12_RP_PS_UAV       16  /* [16..19] root UAVs u4..u7 (PIXEL): fragment storage buffers 0..3 (A15) */
 #define VIO_D3D12_RP_VS_SRV       20  /* SRV table t0.. (VERTEX): vertex textures (A28) */
 #define VIO_D3D12_RP_VS_SAMPLER   21  /* sampler table s0.. (VERTEX) */
-#define VIO_D3D12_RP_BINDLESS     22  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
-#define VIO_D3D12_RP_FEEDBACK     23  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
-#define VIO_D3D12_RP_COUNT        24
+#define VIO_D3D12_RP_STORAGE_MORE 22  /* [22..24] root SRVs t1..t3 space2: graphics storage buffers 1..3 (vertex / mesh + task) */
+#define VIO_D3D12_RP_BINDLESS     25  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
+#define VIO_D3D12_RP_FEEDBACK     26  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
+#define VIO_D3D12_RP_COUNT        27
+/* Static samplers of the bindless table: s1..s4, s7 and s8 in space 1 (vio_sampler .. vio_sampler_aniso_clamp). */
+#define VIO_D3D12_BINDLESS_SAMPLERS 6
+/* Storage buffers a vertex / mesh / task stage reads: binding 0 at [3], 1..3 at [22..24]. */
+#define VIO_D3D12_GRAPHICS_STORAGE 4
 
 /* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
  * bytecode (NULL when the vio_shader has no such stage). */
@@ -261,6 +271,7 @@ typedef struct _vio_d3d12_compute_pipeline {
     int                 uav_base_reg;
     int                 uses_accel;   /* the kernel queries an acceleration structure: root SRV [3] t0, space9 */
     int                 uses_bindless; /* reads the bindless table (spaces 1 / 3 / 4): root table [4] */
+    int                 raw_buffers;   /* GLSL kernel: SPIRV-Cross emits (RW)ByteAddressBuffer, so every storage view is raw */
     /* Params constant block. An UPLOAD-heap buffer, persistently re-mapped by
      * compute_set_uniforms (256-byte aligned per the CB requirement). Bound to
      * the reflected cbv_register. */

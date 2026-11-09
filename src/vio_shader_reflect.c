@@ -1431,8 +1431,9 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
                 for (size_t i = 0; i < ssbo_count; i++) {
                     unsigned b = spvc_compiler_get_decoration(compiler, ssbos[i].id, SpvDecorationBinding);
                     if (shader_model >= 51) {
+                        /* t<binding>, space 2: the D3D12 root SRVs of storage buffers 0..3. */
                         spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationDescriptorSet, 2);
-                        spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, (unsigned int)i);
+                        spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, b);
                     } else {
                         spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, 16 + b);
                     }
@@ -1443,8 +1444,11 @@ char *vio_spirv_to_hlsl_hooked(const uint32_t *spirv, size_t word_count, int sha
                 size_t ssbo_count;
                 spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STORAGE_BUFFER, &ssbos, &ssbo_count);
                 for (size_t i = 0; i < ssbo_count; i++) {
+                    /* Keep the GLSL binding: task and mesh stage then name the same
+                     * buffer t<binding> (the root SRVs of bindings 0..3). */
+                    unsigned b = spvc_compiler_get_decoration(compiler, ssbos[i].id, SpvDecorationBinding);
                     spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationDescriptorSet, 2);
-                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, (unsigned int)i);
+                    spvc_compiler_set_decoration(compiler, ssbos[i].id, SpvDecorationBinding, b);
                 }
             }
         }

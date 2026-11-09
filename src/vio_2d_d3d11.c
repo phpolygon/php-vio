@@ -100,6 +100,20 @@ int vio_2d_d3d11_init(vio_2d_d3d11_state *state)
         NULL, &state->ps_text);
     if (FAILED(hr)) goto fail;
 
+    {   /* SDF glyphs (vio_font 'sdf'); without the shader they draw as coverage text */
+        char *sdf_src = vio_2d_hlsl_with_cb(vio_2d_hlsl_ps_text_sdf);
+        ID3DBlob *sdf_blob = NULL, *sdf_err = NULL;
+        if (sdf_src && SUCCEEDED(D3DCompile(sdf_src, strlen(sdf_src), "vio_2d_ps_text_sdf",
+                NULL, NULL, "main", "ps_5_0", flags, 0, &sdf_blob, &sdf_err))) {
+            ID3D11Device_CreatePixelShader(vio_d3d11.device,
+                ID3D10Blob_GetBufferPointer(sdf_blob), ID3D10Blob_GetBufferSize(sdf_blob),
+                NULL, &state->ps_text_sdf);
+            ID3D10Blob_Release(sdf_blob);
+        }
+        if (sdf_err) ID3D10Blob_Release(sdf_err);
+        free(sdf_src);
+    }
+
     /* ── Input layout (matches vio_2d_vertex) ────────────────────── */
     D3D11_INPUT_ELEMENT_DESC layout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,    0, offsetof(vio_2d_vertex, x), D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -206,6 +220,7 @@ void vio_2d_d3d11_shutdown(vio_2d_d3d11_state *state)
     if (state->cb)                 ID3D11Buffer_Release(state->cb);
     if (state->vbo)                ID3D11Buffer_Release(state->vbo);
     if (state->ps_text)            ID3D11PixelShader_Release(state->ps_text);
+    if (state->ps_text_sdf)        ID3D11PixelShader_Release(state->ps_text_sdf);
     if (state->ps_sprites)         ID3D11PixelShader_Release(state->ps_sprites);
     if (state->ps_shapes)          ID3D11PixelShader_Release(state->ps_shapes);
     if (state->vs)                 ID3D11VertexShader_Release(state->vs);

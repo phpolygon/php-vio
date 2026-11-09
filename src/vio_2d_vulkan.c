@@ -252,6 +252,11 @@ int vio_2d_vulkan_init(vio_2d_vulkan_state *state)
         vio_2d_vulkan_shutdown(state);
         return -1;
     }
+    /* SDF glyphs; without the pipeline they draw as coverage text. */
+    state->fs_text_sdf_module = vio_2d_vk_make_module(vio_2d_vk_fs_text_sdf, 1);
+    if (state->fs_text_sdf_module) {
+        state->pipeline_text_sdf = vio_2d_vk_make_pipeline(state, state->fs_text_sdf_module);
+    }
 
     /* 5. Streaming VBO ring (HOST_VISIBLE|HOST_COHERENT, persistently mapped).
      *    One slice per frame-in-flight; reuse is gated by the in_flight fence
@@ -398,10 +403,12 @@ void vio_2d_vulkan_shutdown(vio_2d_vulkan_state *state)
         vio_vma_destroy_buffer(vio_vk.vma_allocator, state->vbo, state->vbo_allocation);
     }
     if (state->pipeline_sprites) vkDestroyPipeline(vio_vk.device, state->pipeline_sprites, NULL);
+    if (state->pipeline_text_sdf) vkDestroyPipeline(vio_vk.device, state->pipeline_text_sdf, NULL);
     if (state->pipeline_shapes)  vkDestroyPipeline(vio_vk.device, state->pipeline_shapes, NULL);
     if (state->pipeline_layout)  vkDestroyPipelineLayout(vio_vk.device, state->pipeline_layout, NULL);
     if (state->set_layout)       vkDestroyDescriptorSetLayout(vio_vk.device, state->set_layout, NULL);
     if (state->fs_sprites_module) vkDestroyShaderModule(vio_vk.device, state->fs_sprites_module, NULL);
+    if (state->fs_text_sdf_module) vkDestroyShaderModule(vio_vk.device, state->fs_text_sdf_module, NULL);
     if (state->fs_shapes_module)  vkDestroyShaderModule(vio_vk.device, state->fs_shapes_module, NULL);
     if (state->vs_module)         vkDestroyShaderModule(vio_vk.device, state->vs_module, NULL);
 

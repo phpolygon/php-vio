@@ -129,6 +129,7 @@ typedef struct _vio_metal_state {
 static vio_metal_state vio_mtl = {0};
 static void metal_bindless_release(void);
 static void metal_bindless_bind(id<MTLRenderCommandEncoder> enc, int vertex, int fragment);
+static void metal_bindless_bind_mesh(id<MTLRenderCommandEncoder> enc, int object, int mesh, int fragment);
 
 /* Keep reference to last presented frame for read_pixels/screenshot */
 static id<MTLTexture>       last_presented_texture = nil;
@@ -159,6 +160,7 @@ typedef struct _vio_metal_2d_variant {
     int                        has_stencil;
     id<MTLRenderPipelineState> shapes;
     id<MTLRenderPipelineState> sprites;
+    id<MTLRenderPipelineState> text_sdf;      /* distance-field glyphs (vio_font 'sdf'); nil = sprites */
 } vio_metal_2d_variant;
 
 typedef struct _vio_metal_2d {
@@ -167,6 +169,7 @@ typedef struct _vio_metal_2d {
     id<MTLFunction>            vertex_fn;
     id<MTLFunction>            frag_shapes_fn;
     id<MTLFunction>            frag_sprites_fn;
+    id<MTLFunction>            frag_text_sdf_fn;
     MTLVertexDescriptor       *vertex_desc;
     vio_metal_2d_variant       variants[VIO_METAL_2D_VARIANTS];
     int                        variant_count;
@@ -1010,11 +1013,13 @@ void vio_metal_shutdown_context(void)
             for (int i = 0; i < mtl_2d.variant_count; i++) {
                 mtl_2d.variants[i].shapes  = nil;
                 mtl_2d.variants[i].sprites = nil;
+                mtl_2d.variants[i].text_sdf = nil;
             }
             mtl_2d.variant_count    = 0;
             mtl_2d.vertex_fn        = nil;
             mtl_2d.frag_shapes_fn   = nil;
             mtl_2d.frag_sprites_fn  = nil;
+            mtl_2d.frag_text_sdf_fn = nil;
             mtl_2d.vertex_desc      = nil;
             mtl_2d.sampler          = nil;
             mtl_2d.vertex_buffer    = nil;
@@ -1128,6 +1133,11 @@ static vio_metal_2d_variant *metal_2d_variant(const vio_metal_target_desc *t)
                 [[error localizedDescription] UTF8String]);
             return NULL;
         }
+        id<MTLRenderPipelineState> text_sdf = nil;
+        if (mtl_2d.frag_text_sdf_fn) {
+            pipeDesc.fragmentFunction = mtl_2d.frag_text_sdf_fn;
+            text_sdf = [vio_mtl.device newRenderPipelineStateWithDescriptor:pipeDesc error:&error];
+        }
 
         vio_metal_2d_variant *v = &mtl_2d.variants[mtl_2d.variant_count++];
         v->pixel_format = (int)fmt;
@@ -1138,6 +1148,7 @@ static vio_metal_2d_variant *metal_2d_variant(const vio_metal_target_desc *t)
         v->has_stencil  = has_stencil;
         v->shapes       = shapes;
         v->sprites      = sprites;
+        v->text_sdf     = text_sdf;
         return v;
     }
 }
@@ -1190,6 +1201,7 @@ int vio_metal_2d_init(int width, int height)
         mtl_2d.vertex_fn       = vertexFunc;
         mtl_2d.frag_shapes_fn  = fragShapes;
         mtl_2d.frag_sprites_fn = fragSprites;
+        mtl_2d.frag_text_sdf_fn = [library newFunctionWithName:@"vio_2d_fragment_text_sdf"];
         mtl_2d.vertex_desc     = vertDesc;
         mtl_2d.variant_count   = 0;
 
@@ -1335,7 +1347,8 @@ void vio_metal_2d_flush(vio_2d_state *state)
 
             /* Select pipeline */
             id<MTLRenderPipelineState> wanted =
-                (item->texture_id > 0) ? variant->sprites : variant->shapes;
+                (item->type == VIO_2D_TEXT_SDF && item->texture_id > 0 && variant->text_sdf) ? variant->text_sdf
+                : (item->texture_id > 0) ? variant->sprites : variant->shapes;
             if (wanted != current_pipeline) {
                 current_pipeline = wanted;
                 [vio_mtl.current_encoder setRenderPipelineState:current_pipeline];
@@ -3743,6 +3756,10 @@ static vio_metal_buffer *metal_current_fs_cb = NULL;
 /* Vertex-stage storage buffer staged by bind_storage_buffer (Path B). */
 static vio_metal_buffer *metal_pending_storage = NULL;
 static int               metal_pending_storage_binding = -1;
+/* The same buffers by binding (0..3), for the task and mesh stages of a mesh
+ * pipeline, which may read several (D3D12 root SRVs t0..t3 space2, Vulkan set 0). */
+#define VIO_METAL_GRAPHICS_STORAGE 4
+static vio_metal_buffer *metal_graphics_storage[VIO_METAL_GRAPHICS_STORAGE];
 
 /* One identity mat4 bound at VIO_METAL_VB_INSTANCE for non-instanced draws of
  * shaders that declare location 3..6 — otherwise the vertex fetch reads an
@@ -4556,6 +4573,24 @@ static int metal_prepare_draw(int stride)
         vio_metal_buffer *fcb = metal_current_fs_cb ? metal_current_fs_cb : NULL;
         if (fcb) metal_bind_uniform_slice(fcb, -1, sh->fs.cbuffer_index);
         else if (mcb && sh->fs.cbuffer_index >= 0) metal_bind_uniform_slice(mcb, -1, sh->fs.cbuffer_index);
+        /* The bindless table for the task, mesh and fragment stages that read it
+         * (the vertex path below binds it for vertex + fragment). */
+        metal_bindless_bind_mesh(enc, sh->object_fn ? sh->obj.uses_bindless : 0, sh->vs.uses_bindless, sh->fs.uses_bindless);
+        /* Storage buffers of the task and mesh stages, by their GLSL binding. */
+        if (@available(macOS 13.0, iOS 16.0, *)) {
+            for (int stage = 0; stage < 2; stage++) {
+                const vio_metal_stage_res *res = stage == 0 ? &sh->vs : &sh->obj;
+                if (stage == 1 && !sh->object_fn) break;
+                for (int i = 0; i < res->buffer_count; i++) {
+                    const vio_metal_res_buffer *rb = &res->buffers[i];
+                    if (rb->kind != 1 || rb->binding < 0 || rb->binding >= VIO_METAL_GRAPHICS_STORAGE) continue;
+                    vio_metal_buffer *b = metal_graphics_storage[rb->binding];
+                    if (!b || !b->buffer) continue;
+                    if (stage == 0) [enc setMeshBuffer:(__bridge id<MTLBuffer>)b->buffer offset:0 atIndex:(NSUInteger)rb->msl_index];
+                    else            [enc setObjectBuffer:(__bridge id<MTLBuffer>)b->buffer offset:0 atIndex:(NSUInteger)rb->msl_index];
+                }
+            }
+        }
         return 1;
     }
     if (sh->tess) {
@@ -4678,6 +4713,25 @@ static void metal_bindless_bind(id<MTLRenderCommandEncoder> enc, int vertex, int
     if (metal_bindless_live_count > 0) {
         MTLRenderStages stages = (vertex ? MTLRenderStageVertex : 0) | (fragment ? MTLRenderStageFragment : 0);
         [enc useResources:metal_bindless_live count:(NSUInteger)metal_bindless_live_count usage:MTLResourceUsageRead stages:stages];
+    }
+}
+
+/* The same for a mesh pipeline: object (task) and mesh stages instead of vertex. */
+static void metal_bindless_bind_mesh(id<MTLRenderCommandEncoder> enc, int object, int mesh, int fragment)
+{
+    if (!object && !mesh && !fragment) return;
+    if (@available(macOS 13.0, iOS 16.0, *)) {
+        for (int k = 0; k < 3; k++) {
+            if (!metal_bindless_bufs[k]) continue;
+            if (object)   [enc setObjectBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+            if (mesh)     [enc setMeshBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+            if (fragment) [enc setFragmentBuffer:metal_bindless_bufs[k] offset:0 atIndex:metal_bindless_index[k]];
+        }
+        if (metal_bindless_live_count > 0) {
+            MTLRenderStages stages = (object ? MTLRenderStageObject : 0) | (mesh ? MTLRenderStageMesh : 0)
+                                   | (fragment ? MTLRenderStageFragment : 0);
+            [enc useResources:metal_bindless_live count:(NSUInteger)metal_bindless_live_count usage:MTLResourceUsageRead stages:stages];
+        }
     }
 }
 
@@ -5602,6 +5656,7 @@ static void metal_bind_storage_buffer(void *backend_buffer, int binding, int acc
     (void)access; (void)element_count; (void)stride;
     metal_pending_storage = (vio_metal_buffer *)backend_buffer;
     metal_pending_storage_binding = binding;
+    if (binding >= 0 && binding < VIO_METAL_GRAPHICS_STORAGE) metal_graphics_storage[binding] = (vio_metal_buffer *)backend_buffer;
 }
 
 /* Indirect draw (GAP-PHASE5 Block 8): Metal's indirect argument structs share the
@@ -5917,12 +5972,16 @@ static void metal_bind_texture(void *texture, int slot)
                                         (__bridge id<MTLSamplerState>)t->sampler, metal_texture_cmp_sampler(t));
         int is_depth = 0;
         int idx = metal_resolve_fs_texture(slot, &is_depth);
-        if (idx < 0 || idx > 30) return;
-        id<MTLSamplerState> s = is_depth ? metal_texture_cmp_sampler(t)
-                                         : (__bridge id<MTLSamplerState>)t->sampler;
-        [vio_mtl.current_encoder setFragmentTexture:(__bridge id<MTLTexture>)t->tex atIndex:(NSUInteger)idx];
-        if (s) [vio_mtl.current_encoder setFragmentSamplerState:s atIndex:(NSUInteger)idx];
-        metal_fs_shadow_set(idx, (__bridge id<MTLTexture>)t->tex, s);
+        if (idx >= 0 && idx <= 30) {
+            id<MTLSamplerState> s = is_depth ? metal_texture_cmp_sampler(t)
+                                             : (__bridge id<MTLSamplerState>)t->sampler;
+            [vio_mtl.current_encoder setFragmentTexture:(__bridge id<MTLTexture>)t->tex atIndex:(NSUInteger)idx];
+            if (s) [vio_mtl.current_encoder setFragmentSamplerState:s atIndex:(NSUInteger)idx];
+            metal_fs_shadow_set(idx, (__bridge id<MTLTexture>)t->tex, s);
+        }
+        /* A mesh pipeline's task / mesh stage may read a slot the fragment stage does
+         * not declare (a mask only the task stage reads, an array only the mesh
+         * stage samples): bind it there regardless of the fragment lookup. */
         if (metal_current_pipeline && metal_current_pipeline->shader && metal_current_pipeline->shader->mesh)
             metal_bind_mesh_stage_texture(slot, (__bridge id<MTLTexture>)t->tex,
                                           (__bridge id<MTLSamplerState>)t->sampler, metal_texture_cmp_sampler(t));
@@ -6294,7 +6353,6 @@ void vio_metal_bind_cubemap(void *cubemap_obj, int slot)
     @autoreleasepool {
         int is_depth = 0;
         int idx = metal_resolve_fs_texture(slot, &is_depth);
-        if (idx < 0 || idx > 30) return;
         id<MTLTexture> ctex = (__bridge id<MTLTexture>)cm->metal_texture;
         id<MTLSamplerState> csmp = cm->metal_sampler ? (__bridge id<MTLSamplerState>)cm->metal_sampler : nil;
         if (is_depth) {
@@ -6302,9 +6360,12 @@ void vio_metal_bind_cubemap(void *cubemap_obj, int slot)
             if (!cube_cmp) cube_cmp = metal_make_sampler(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, 0, 1, 1);
             csmp = cube_cmp;
         }
-        [vio_mtl.current_encoder setFragmentTexture:ctex atIndex:(NSUInteger)idx];
-        if (csmp) [vio_mtl.current_encoder setFragmentSamplerState:csmp atIndex:(NSUInteger)idx];
-        metal_fs_shadow_set(idx, ctex, csmp);
+        if (idx >= 0 && idx <= 30) {
+            [vio_mtl.current_encoder setFragmentTexture:ctex atIndex:(NSUInteger)idx];
+            if (csmp) [vio_mtl.current_encoder setFragmentSamplerState:csmp atIndex:(NSUInteger)idx];
+            metal_fs_shadow_set(idx, ctex, csmp);
+        }
+        /* Task / mesh stages may read a slot the fragment stage does not declare. */
         metal_bind_mesh_stage_texture(slot, ctex, csmp, csmp);
     }
 }
@@ -6406,6 +6467,7 @@ static void metal_3d_shutdown(void)
     metal_current_fs_cb = NULL;
     metal_pending_storage = NULL;
     metal_pending_storage_binding = -1;
+    for (int i = 0; i < VIO_METAL_GRAPHICS_STORAGE; i++) metal_graphics_storage[i] = NULL;
 }
 
 /* ── GPU compute primitive (SDF voxelization) ─────────────────────────
