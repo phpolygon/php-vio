@@ -47,7 +47,12 @@
 #define VIO_D3D12_MIN_FRAME_COUNT     2
 #define VIO_D3D12_MAX_FRAME_COUNT     3
 #define VIO_D3D12_FRAME_COUNT_DEFAULT 2
-#define VIO_D3D12_MAX_SRV_DESCRIPTORS 32768
+/* Shader-visible CBV/SRV/UAV heap: static views from the top, the per-frame table
+ * rings below them (one slice per frame in flight). Every draw that binds a new
+ * texture set takes VIO_D3D12_SRV_TABLE_SIZE descriptors from its frame's slice, so a
+ * frame with a mirrored second scene pass needs well over 30k. 262144 x 32 bytes
+ * per heap (staging + shader-visible) = 16 MB; resource binding tier 1 allows 1M. */
+#define VIO_D3D12_MAX_SRV_DESCRIPTORS 262144
 
 /* Size of the SMALL per-draw table (SAMPLER-LIMITS-PLAN): a draw whose shader
  * reads at most this many texture registers gets a block of exactly this size,

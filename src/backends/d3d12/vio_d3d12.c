@@ -616,9 +616,76 @@ static int d3d12_create_descriptor_heap(ID3D12DescriptorHeap **out, D3D12_DESCRI
  * land in any frame's per-frame region — fixing the previous bug where lazy
  * texture loads (e.g. menu icons) had their freshly-created SRVs immediately
  * stomped by flush_srv_table's null-init sweep on the very next bound draw. */
+/* Freed static SRV descriptors (textures and render targets destroyed). A slot
+ * is reused only after the GPU passed the fence of the frame that may still read
+ * it through a table copied from it; until then it waits in d3d12_srv_retired. */
+typedef struct { UINT idx; UINT64 fence; } d3d12_srv_retired_slot;
+static d3d12_srv_retired_slot *d3d12_srv_retired;
+static int d3d12_srv_retired_count, d3d12_srv_retired_cap;
+static UINT *d3d12_srv_reusable;
+static int d3d12_srv_reusable_count, d3d12_srv_reusable_cap;
+
+static void d3d12_srv_reclaim(void)
+{
+    if (!d3d12_srv_retired_count || !vio_d3d12.fence) return;
+    UINT64 done = ID3D12Fence_GetCompletedValue(vio_d3d12.fence);
+    int keep = 0;
+    for (int i = 0; i < d3d12_srv_retired_count; i++) {
+        if (d3d12_srv_retired[i].fence <= done) {
+            if (d3d12_srv_reusable_count == d3d12_srv_reusable_cap) {
+                int cap = d3d12_srv_reusable_cap ? d3d12_srv_reusable_cap * 2 : 256;
+                UINT *grown = realloc(d3d12_srv_reusable, (size_t)cap * sizeof(UINT));
+                if (!grown) { d3d12_srv_retired[keep++] = d3d12_srv_retired[i]; continue; }
+                d3d12_srv_reusable = grown;
+                d3d12_srv_reusable_cap = cap;
+            }
+            d3d12_srv_reusable[d3d12_srv_reusable_count++] = d3d12_srv_retired[i].idx;
+        } else {
+            d3d12_srv_retired[keep++] = d3d12_srv_retired[i];
+        }
+    }
+    d3d12_srv_retired_count = keep;
+}
+
+/* Give back a static SRV descriptor (its staging-heap CPU handle). */
+static void d3d12_free_srv_descriptor(UINT64 cpu_ptr)
+{
+    if (!cpu_ptr || !vio_d3d12.srv_staging_heap || !vio_d3d12.srv_heap.descriptor_size) return;
+    D3D12_CPU_DESCRIPTOR_HANDLE start;
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &start);
+    if (cpu_ptr < start.ptr) return;
+    UINT64 idx = (cpu_ptr - start.ptr) / vio_d3d12.srv_heap.descriptor_size;
+    /* Only the static region (top of the heap, below the bindless reserve) is ours to free. */
+    if (idx >= vio_d3d12.srv_heap.capacity || idx < vio_d3d12.srv_heap.capacity - vio_d3d12.srv_heap.count) return;
+    if (idx >= vio_d3d12.srv_heap.capacity - VIO_BINDLESS_MAX) return;
+    if (d3d12_srv_retired_count == d3d12_srv_retired_cap) {
+        int cap = d3d12_srv_retired_cap ? d3d12_srv_retired_cap * 2 : 256;
+        d3d12_srv_retired_slot *grown = realloc(d3d12_srv_retired, (size_t)cap * sizeof(*grown));
+        if (!grown) return;   /* leak the slot rather than reuse it early */
+        d3d12_srv_retired = grown;
+        d3d12_srv_retired_cap = cap;
+    }
+    /* fence_value is the last value signalled: work recorded from now on is
+     * covered by the next one. */
+    d3d12_srv_retired[d3d12_srv_retired_count].idx = (UINT)idx;
+    d3d12_srv_retired[d3d12_srv_retired_count].fence = vio_d3d12.fence_value + 1;
+    d3d12_srv_retired_count++;
+}
+
 static UINT d3d12_alloc_srv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE *out_cpu,
                                         D3D12_GPU_DESCRIPTOR_HANDLE *out_gpu)
 {
+    d3d12_srv_reclaim();
+    if (d3d12_srv_reusable_count > 0) {
+        UINT idx = d3d12_srv_reusable[--d3d12_srv_reusable_count];
+        D3D12_CPU_DESCRIPTOR_HANDLE staging_start;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu_start;
+        ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(vio_d3d12.srv_staging_heap, &staging_start);
+        ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(vio_d3d12.srv_heap.heap, &gpu_start);
+        out_cpu->ptr = staging_start.ptr + (SIZE_T)idx * vio_d3d12.srv_heap.descriptor_size;
+        out_gpu->ptr = gpu_start.ptr + (UINT64)idx * vio_d3d12.srv_heap.descriptor_size;
+        return idx;
+    }
     if (vio_d3d12.srv_heap.count >= vio_d3d12.srv_heap.capacity) {
         php_error_docref(NULL, E_WARNING, "D3D12: SRV descriptor heap full (%u/%u)",
                           vio_d3d12.srv_heap.count, vio_d3d12.srv_heap.capacity);
@@ -4792,8 +4859,8 @@ static void d3d12_destroy_texture(void *texture_ptr)
     if (tex->fb_decoded) d3d12_release_when_idle((IUnknown *)tex->fb_decoded);
     if (tex->upload_resource) d3d12_release_when_idle((IUnknown *)tex->upload_resource);
     if (tex->resource) d3d12_release_when_idle((IUnknown *)tex->resource);
-    /* Note: descriptor in SRV heap is leaked (linear allocator doesn't support free).
-     * A proper free-list allocator would reclaim the slot. */
+    /* Back to the free list (reused after the fence of this frame). */
+    d3d12_free_srv_descriptor(tex->srv_cpu.ptr);
     free(tex);
 }
 
@@ -5291,6 +5358,21 @@ static void d3d12_destroy_cubemap(void *cm_ptr)
         d3d12_release_when_idle((IUnknown *)cm->d3d12_resource);
         cm->d3d12_resource = NULL;
     }
+    if (cm->d3d12_srv_cpu) {
+        d3d12_free_srv_descriptor(cm->d3d12_srv_cpu);
+        cm->d3d12_srv_cpu = 0;
+    }
+}
+
+/* VioTexture free handler: the texture's resource and SRV go back (a texture a
+ * render target or cache lends out is borrowed and stays with its owner). */
+static void d3d12_destroy_texture_obj(void *tex_obj_ptr)
+{
+    vio_texture_object *tex_obj = (vio_texture_object *)tex_obj_ptr;
+    if (tex_obj->backend_texture && !tex_obj->borrowed) {
+        d3d12_destroy_texture(tex_obj->backend_texture);
+    }
+    tex_obj->backend_texture = NULL;
 }
 
 static void d3d12_destroy_font_atlas(void *font_ptr)
@@ -5358,6 +5440,14 @@ static void d3d12_destroy_render_target(void *rt_ptr)
         d3d12_release_when_idle((IUnknown *)rt->d3d12_dsv_heap);
         rt->d3d12_dsv_heap = NULL;
     }
+    /* The target's static SRVs (one per colour attachment, the depth view). */
+    for (int i = 0; i < VIO_MAX_COLOR_ATTACHMENTS; i++) {
+        if (rt->d3d12_color_srv_cpus[i]) d3d12_free_srv_descriptor(rt->d3d12_color_srv_cpus[i]);
+        rt->d3d12_color_srv_cpus[i] = 0;
+    }
+    rt->d3d12_color_srv_cpu = 0;
+    if (rt->d3d12_depth_srv_cpu) d3d12_free_srv_descriptor(rt->d3d12_depth_srv_cpu);
+    rt->d3d12_depth_srv_cpu = 0;
 }
 
 /* ── Render targets (GAP-PLAN Phase 2: moved out of php_vio.c) ──────
@@ -10934,7 +11024,18 @@ void vio_d3d12_flush_srv_table(void)
     UINT base_idx = vio_d3d12.srv_frame_offset;
     UINT region_end = vio_d3d12.srv_frame_base + vio_d3d12.srv_frame_capacity;
     if (base_idx + (UINT)n > region_end) {   /* out of space in this frame's region */
-        if (d3d12_brec) d3d12_brec_fail();                      /* the bundle's range: record it again larger */
+        if (d3d12_brec) {
+            d3d12_brec_fail();                      /* the bundle's range: record it again larger */
+            return;
+        }
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            php_error_docref(NULL, E_WARNING,
+                "D3D12: the frame's %u SRV table descriptors are used up (%u static views); "
+                "the following draws reuse the last bound table and may sample the wrong textures",
+                vio_d3d12.srv_frame_capacity, vio_d3d12.srv_heap.count);
+        }
         return;
     }
     vio_d3d12.srv_frame_offset += (UINT)n;
@@ -11357,6 +11458,7 @@ static const vio_backend d3d12_backend = {
     .create_texture    = d3d12_create_texture,
     .create_texture_3d = d3d12_create_texture_3d,
     .destroy_texture   = d3d12_destroy_texture,
+    .destroy_texture_obj = d3d12_destroy_texture_obj,
     .compile_shader    = d3d12_compile_shader,
     .destroy_shader    = d3d12_destroy_shader,
     .begin_frame       = d3d12_begin_frame,
