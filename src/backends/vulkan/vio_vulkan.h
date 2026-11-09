@@ -316,6 +316,7 @@ typedef struct _vio_vulkan_state {
     /* Per-stage texture limits (SAMPLER-LIMITS-PLAN): sampled images / samplers
      * one stage and one set can take, and the units = the smaller. */
     int                      tex_limit;
+    int                      ubo_limit;   /* maxUniformBufferRange (uniform_block_limit) */
     int                      smp_limit;
     int                      tex_units;
     VkViewport               cur_vp[16];

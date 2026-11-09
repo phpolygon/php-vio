@@ -210,10 +210,18 @@ static void vio_shader_free_object(zend_object *obj)
         if (shader->stage_cb[i]) {
             /* The backend constant buffer follows the vertex/fragment cbuffer
              * ownership rule (backend-owned, see below). */
+            if (shader->stage_cb[i]->data) efree(shader->stage_cb[i]->data);
+            if (shader->stage_cb[i]->uniforms) efree(shader->stage_cb[i]->uniforms);
             free(shader->stage_cb[i]);
             shader->stage_cb[i] = NULL;
         }
     }
+
+    if (shader->uniforms) { efree(shader->uniforms); shader->uniforms = NULL; }
+    if (shader->frag_uniforms) { efree(shader->frag_uniforms); shader->frag_uniforms = NULL; }
+    if (shader->cbuffer_data) { efree(shader->cbuffer_data); shader->cbuffer_data = NULL; }
+    if (shader->frag_cbuffer_data) { efree(shader->frag_cbuffer_data); shader->frag_cbuffer_data = NULL; }
+    shader->uniform_count = shader->frag_uniform_count = 0;
 
     if (shader->uniform_lookup) {
         zend_hash_destroy(shader->uniform_lookup);

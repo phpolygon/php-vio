@@ -545,6 +545,12 @@ typedef struct _vio_backend {
      * the two (the API couples a texture and its sampler per unit). NULL =
      * 16 / 16. */
     void        (*texture_limits)(int *textures, int *samplers);
+    /* Bytes ONE stage's default uniform block may hold in the backend's constant
+     * buffers - the API's limit, not vio's (D3D: 4096 x 16, Vulkan:
+     * maxUniformBufferRange). A larger block fails vio_shader with a warning. NULL
+     * or 0 = no limit vio knows of (OpenGL sets uniforms one by one, Metal binds a
+     * buffer). */
+    int         (*uniform_block_limit)(void);
     /* vio_begin(['present' => …]) (VIO_FEATURE_EXPLICIT_PRESENT), called right
      * before begin_frame: VIO_PRESENT_YES presents the swapchain at vio_end even
      * when a target was bound before vio_begin or is still bound at the end,

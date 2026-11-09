@@ -135,11 +135,15 @@ static int gl_uloc_suffix_scan(GLuint program, const char *name, size_t len, GLi
     size_t nlen = gl_uloc_normalize(name, norm, sizeof(norm));
     GLint count = 0;
     glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
-    char buf[256], full[512];
+    char raw[256], buf[256], full[512];
     int found = 0;
     for (GLint i = 0; i < count && found < max; i++) {
-        GLsizei n = 0; GLint size = 0; GLenum type = 0;
-        glGetActiveUniform(program, (GLuint)i, (GLsizei)sizeof(buf), &n, &size, &type, buf);
+        GLsizei rn = 0; GLint size = 0; GLenum type = 0;
+        glGetActiveUniform(program, (GLuint)i, (GLsizei)sizeof(raw), &rn, &size, &type, raw);
+        /* Both sides normalised: an array of structs lists every element it uses
+         * ("u_l[7].c"), not only [0], so the element asked for may be active while
+         * u_l[0].c is not. */
+        GLsizei n = (GLsizei)gl_uloc_normalize(raw, buf, sizeof(buf));
         /* active name = "<prefix>.<norm>" ? */
         if (n <= (GLsizei)nlen + 1 || buf[n - nlen - 1] != '.' || strcmp(buf + n - nlen, norm) != 0) continue;
         size_t plen = (size_t)n - nlen - 1;
@@ -148,7 +152,9 @@ static int gl_uloc_suffix_scan(GLuint program, const char *name, size_t len, GLi
         full[plen] = '.';
         memcpy(full + plen + 1, name, len + 1);
         GLint loc = glGetUniformLocation(program, full);   /* exact element (or element 0 for a bare array name) */
-        if (loc >= 0) out[found++] = loc;
+        int seen = 0;
+        for (int k = 0; k < found; k++) if (out[k] == loc) seen = 1;
+        if (loc >= 0 && !seen) out[found++] = loc;
     }
     return found;
 }

@@ -3489,7 +3489,6 @@ static void vio_apply_ubo_stage(vio_context_object *ctx, int binding, const vio_
     if (!buf->shadow) return;
     if (cb) {
         size_t len = buf->size < (size_t)cb_size ? buf->size : (size_t)cb_size;
-        if (len > VIO_CBUFFER_SIZE) len = VIO_CBUFFER_SIZE;
         if (len && memcmp(cb, buf->shadow, len) != 0) { memcpy(cb, buf->shadow, len); *dirty = 1; }
     } else if (ctx->backend->set_uniform) {
         vio_gl_block_from_bytes(ctx, ents, n, buf->shadow, buf->size);
@@ -3714,6 +3713,27 @@ static void vio_shader_reflect_stage_add(zval *return_value, const char *key, co
     add_assoc_zval(&stage_arr, "storage_buffers", &ssbo_arr);
     add_assoc_zval(return_value, key, &stage_arr);
     vio_reflect_free(&result);
+}
+
+/* Uniform table and constant shadow of one stage, sized by its reflection - no vio
+ * limit. False (with a warning) when the block outgrows the backend's constant
+ * buffers. data == NULL: table only (OpenGL sets uniforms one by one). */
+static int vio_reflect_stage_uniforms(vio_context_object *ctx, const uint32_t *spirv, size_t size, const char *stage,
+                                      vio_uniform_entry **entries, int *count, int *total, unsigned char **data)
+{
+    *count = vio_spirv_get_uniform_offsets(spirv, size, entries, total);
+    int limit = ctx->backend->uniform_block_limit ? ctx->backend->uniform_block_limit() : 0;
+    if (limit > 0 && *total > limit) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_shader: the %s stage declares %d bytes of uniforms, the %s backend's constant buffers hold at most %d",
+            stage, *total, ctx->backend->name, limit);
+        return 0;
+    }
+    if (data) {
+        if (*data) efree(*data);
+        *data = ecalloc((size_t)(*total > 0 ? *total : 16), 1);
+    }
+    return 1;
 }
 
 ZEND_FUNCTION(vio_shader)
@@ -4238,9 +4258,13 @@ ZEND_FUNCTION(vio_shader)
             if (!shader->stage_spirv[i]) continue;
             vio_shader_stage_cb *cb = calloc(1, sizeof(*cb));
             if (!cb) continue;
-            cb->uniform_count = vio_spirv_get_uniform_offsets(
-                shader->stage_spirv[i], shader->stage_spirv_size[i],
-                cb->uniforms, VIO_MAX_UNIFORMS, &cb->total_size);
+            shader->stage_cb[i] = cb;
+            static const char *const stage_names[VIO_EXTRA_STAGE_COUNT] = { "geometry", "tessellation control", "tessellation evaluation" };
+            if (!vio_reflect_stage_uniforms(ctx, shader->stage_spirv[i], shader->stage_spirv_size[i], stage_names[i],
+                                            &cb->uniforms, &cb->uniform_count, &cb->total_size, &cb->data)) {
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
             if (cb->total_size > 0 && ctx->backend->create_buffer) {
                 vio_buffer_desc cb_desc = {0};
                 cb_desc.type = VIO_BUFFER_UNIFORM;
@@ -4254,11 +4278,11 @@ ZEND_FUNCTION(vio_shader)
 
         /* Extract uniform offsets from SPIRV for constant buffer mapping */
         if (shader->vert_spirv) {
-            shader->uniform_count = vio_spirv_get_uniform_offsets(
-                shader->vert_spirv, shader->vert_spirv_size,
-                shader->uniforms, VIO_MAX_UNIFORMS,
-                &shader->cbuffer_total_size);
-            memset(shader->cbuffer_data, 0, sizeof(shader->cbuffer_data));
+            if (!vio_reflect_stage_uniforms(ctx, shader->vert_spirv, shader->vert_spirv_size, shader->is_mesh ? "mesh" : "vertex",
+                                            &shader->uniforms, &shader->uniform_count, &shader->cbuffer_total_size, &shader->cbuffer_data)) {
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
 
 
             /* Create backend constant buffer for vertex stage */
@@ -4274,11 +4298,11 @@ ZEND_FUNCTION(vio_shader)
 
         /* Extract fragment shader uniforms */
         if (shader->frag_spirv) {
-            shader->frag_uniform_count = vio_spirv_get_uniform_offsets(
-                shader->frag_spirv, shader->frag_spirv_size,
-                shader->frag_uniforms, VIO_MAX_UNIFORMS,
-                &shader->frag_cbuffer_total_size);
-            memset(shader->frag_cbuffer_data, 0, sizeof(shader->frag_cbuffer_data));
+            if (!vio_reflect_stage_uniforms(ctx, shader->frag_spirv, shader->frag_spirv_size, "fragment",
+                                            &shader->frag_uniforms, &shader->frag_uniform_count, &shader->frag_cbuffer_total_size, &shader->frag_cbuffer_data)) {
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
             /* Create backend constant buffer for fragment stage */
             if (shader->frag_cbuffer_total_size > 0 && ctx->backend->create_buffer) {
                 vio_buffer_desc cb_desc = {0};
@@ -4372,11 +4396,11 @@ ZEND_FUNCTION(vio_shader)
     }
     if (!shader->backend_shader) {
         if (shader->vert_spirv && shader->block_binding >= 0)
-            shader->uniform_count = vio_spirv_get_uniform_offsets(shader->vert_spirv, shader->vert_spirv_size,
-                shader->uniforms, VIO_MAX_UNIFORMS, &shader->cbuffer_total_size);
+            vio_reflect_stage_uniforms(ctx, shader->vert_spirv, shader->vert_spirv_size, "vertex",
+                &shader->uniforms, &shader->uniform_count, &shader->cbuffer_total_size, NULL);
         if (shader->frag_spirv && shader->frag_block_binding >= 0)
-            shader->frag_uniform_count = vio_spirv_get_uniform_offsets(shader->frag_spirv, shader->frag_spirv_size,
-                shader->frag_uniforms, VIO_MAX_UNIFORMS, &shader->frag_cbuffer_total_size);
+            vio_reflect_stage_uniforms(ctx, shader->frag_spirv, shader->frag_spirv_size, "fragment",
+                &shader->frag_uniforms, &shader->frag_uniform_count, &shader->frag_cbuffer_total_size, NULL);
     }
 
     shader->valid = 1;
@@ -6616,18 +6640,14 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
                        sh->uniform_count + sh->frag_uniform_count + 1, NULL, NULL, 0);
         /* Vertex first so it wins on a name collision (add-if-absent), matching
          * the original vertex-before-fragment scan order; the optional stages
-         * follow. Bits 40..43 carry the vio_shader_stage. */
+         * follow. VIO_UNIFORM_ENC packs the vio_shader_stage, offset and size. */
         for (int u = 0; u < sh->uniform_count; u++) {
-            zend_long enc = (1LL << 48)
-                | ((zend_long)(sh->uniforms[u].offset & 0xFFFF) << 16)
-                | (zend_long)(sh->uniforms[u].size & 0xFFFF);
+            zend_long enc = VIO_UNIFORM_ENC(VIO_STAGE_VERTEX, sh->uniforms[u].offset, sh->uniforms[u].size);
             zend_hash_str_add_ptr(sh->uniform_lookup, sh->uniforms[u].name,
                                   strlen(sh->uniforms[u].name), (void *)(intptr_t)enc);
         }
         for (int u = 0; u < sh->frag_uniform_count; u++) {
-            zend_long enc = (1LL << 48) | ((zend_long)VIO_STAGE_FRAGMENT << 40)
-                | ((zend_long)(sh->frag_uniforms[u].offset & 0xFFFF) << 16)
-                | (zend_long)(sh->frag_uniforms[u].size & 0xFFFF);
+            zend_long enc = VIO_UNIFORM_ENC(VIO_STAGE_FRAGMENT, sh->frag_uniforms[u].offset, sh->frag_uniforms[u].size);
             zend_hash_str_add_ptr(sh->uniform_lookup, sh->frag_uniforms[u].name,
                                   strlen(sh->frag_uniforms[u].name), (void *)(intptr_t)enc);
         }
@@ -6635,9 +6655,7 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
             vio_shader_stage_cb *cb = sh->stage_cb[i];
             if (!cb) continue;
             for (int u = 0; u < cb->uniform_count; u++) {
-                zend_long enc = (1LL << 48) | ((zend_long)(VIO_STAGE_GEOMETRY + i) << 40)
-                    | ((zend_long)(cb->uniforms[u].offset & 0xFFFF) << 16)
-                    | (zend_long)(cb->uniforms[u].size & 0xFFFF);
+                zend_long enc = VIO_UNIFORM_ENC(VIO_STAGE_GEOMETRY + i, cb->uniforms[u].offset, cb->uniforms[u].size);
                 zend_hash_str_add_ptr(sh->uniform_lookup, cb->uniforms[u].name,
                                       strlen(cb->uniforms[u].name), (void *)(intptr_t)enc);
             }
@@ -6670,9 +6688,7 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
             if (strlen(cb->uniforms[u].name) == base_len && !strncmp(cb->uniforms[u].name, name, base_len)) { e = &cb->uniforms[u]; stage = VIO_STAGE_GEOMETRY + i; }
     }
     if (!e || e->stride <= 0 || (index + 1) * (long)e->stride > e->size) return 0;
-    zend_long enc = (1LL << 48) | ((zend_long)stage << 40)
-        | ((zend_long)((e->offset + index * e->stride) & 0xFFFF) << 16)
-        | (zend_long)(e->stride & 0xFFFF);
+    zend_long enc = VIO_UNIFORM_ENC(stage, e->offset + index * e->stride, e->stride);
     zend_hash_str_add_ptr(sh->uniform_lookup, name, len, (void *)(intptr_t)enc);
     return enc;
 }
@@ -6764,15 +6780,19 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
 
         zend_long enc = vio_uniform_lookup(sh, name);
         if (enc) {
-            stage = (int)((enc >> 40) & 0xF);
-            int offset = (int)((enc >> 16) & 0xFFFF);
-            max_size = (int)(enc & 0xFFFF);
-            if (offset >= 0 && offset + max_size <= VIO_CBUFFER_SIZE) {
-                if (stage == VIO_STAGE_VERTEX)        dst = sh->cbuffer_data + offset;
-                else if (stage == VIO_STAGE_FRAGMENT) dst = sh->frag_cbuffer_data + offset;
-                else if (sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)])
-                    dst = sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]->data + offset;
+            stage = VIO_UNIFORM_STAGE(enc);
+            int offset = VIO_UNIFORM_OFFSET(enc);
+            max_size = VIO_UNIFORM_SIZE(enc);
+            unsigned char *base = NULL;
+            int cap = 0;
+            if (stage == VIO_STAGE_VERTEX)        { base = sh->cbuffer_data; cap = sh->cbuffer_total_size; }
+            else if (stage == VIO_STAGE_FRAGMENT) { base = sh->frag_cbuffer_data; cap = sh->frag_cbuffer_total_size; }
+            else if (stage >= VIO_STAGE_GEOMETRY && VIO_EXTRA_STAGE_INDEX(stage) < VIO_EXTRA_STAGE_COUNT
+                     && sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]) {
+                base = sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]->data;
+                cap = sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]->total_size;
             }
+            if (base && offset >= 0 && offset + max_size <= cap) dst = base + offset;
         }
 
         if (dst) {

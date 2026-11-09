@@ -1709,15 +1709,28 @@ int vio_spirv_uniform_block_binding(const uint32_t *spirv, size_t spirv_size)
     return binding;
 }
 
+/* Next free entry of a growing uniform table (zeroed). */
+static vio_uniform_entry *vio_uniform_slot(vio_uniform_entry **entries, int *cap, int count)
+{
+    if (count >= *cap) {
+        *cap = *cap > 0 ? *cap * 2 : 64;
+        *entries = erealloc(*entries, (size_t)*cap * sizeof(**entries));
+    }
+    memset(&(*entries)[count], 0, sizeof(**entries));
+    return &(*entries)[count];
+}
+
 int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
-                                   vio_uniform_entry *entries, int max_entries,
-                                   int *total_size)
+                                   vio_uniform_entry **entries, int *total_size)
 {
     spvc_context ctx = NULL;
     spvc_parsed_ir ir = NULL;
     spvc_compiler compiler = NULL;
     spvc_resources resources = NULL;
     int count = 0;
+    int cap = 0;
+    if (*entries) efree(*entries);
+    *entries = NULL;
 
     *total_size = 0;
 
@@ -1763,9 +1776,12 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
     if (type_id) {
         spvc_type type = spvc_compiler_get_type_handle(compiler, type_id);
         unsigned int member_count = spvc_type_get_num_member_types(type);
+        /* The whole block, as the shader declares it: a draw copies this much. */
+        size_t block_size = 0;
+        if (spvc_compiler_get_declared_struct_size(compiler, type, &block_size) == SPVC_SUCCESS)
+            *total_size = (int)block_size;
 
-
-        for (unsigned int i = 0; i < member_count && count < max_entries; i++) {
+        for (unsigned int i = 0; i < member_count; i++) {
             const char *name = spvc_compiler_get_member_name(compiler, type_id, i);
             unsigned int base_offset = 0;
             size_t member_size = 0;
@@ -1802,8 +1818,8 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
                     array_stride = (unsigned int)(member_size / array_size);
                 }
 
-                for (unsigned int ai = 0; ai < array_size && count < max_entries; ai++) {
-                    for (unsigned int si = 0; si < num_struct_members && count < max_entries; si++) {
+                for (unsigned int ai = 0; ai < array_size; ai++) {
+                    for (unsigned int si = 0; si < num_struct_members; si++) {
                         const char *field = spvc_compiler_get_member_name(compiler, elem_type_id, si);
                         unsigned int field_offset = 0;
                         size_t field_size = 0;
@@ -1811,13 +1827,13 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
                         spvc_compiler_get_declared_struct_member_size(compiler, elem_type, si, &field_size);
 
                         if (field && field[0]) {
-                            snprintf(entries[count].name, sizeof(entries[count].name),
-                                     "%s[%u].%s", name, ai, field);
-                            entries[count].offset = (int)(base_offset + ai * array_stride + field_offset);
-                            entries[count].size = (int)field_size;
-                            entries[count].stride = 0;
-                            vio_entry_set_type(compiler, spvc_type_get_member_type(elem_type, si), &entries[count]);
-                            int end = entries[count].offset + (int)field_size;
+                            vio_uniform_entry *e = vio_uniform_slot(entries, &cap, count);
+                            snprintf(e->name, sizeof(e->name), "%s[%u].%s", name, ai, field);
+                            e->offset = (int)(base_offset + ai * array_stride + field_offset);
+                            e->size = (int)field_size;
+                            e->stride = 0;
+                            vio_entry_set_type(compiler, spvc_type_get_member_type(elem_type, si), e);
+                            int end = e->offset + (int)field_size;
                             if (end > *total_size) *total_size = end;
                             count++;
                         }
@@ -1825,16 +1841,17 @@ int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
                 }
             } else {
                 /* Simple scalar/vector/matrix member, or an array of them */
-                strncpy(entries[count].name, name, sizeof(entries[count].name) - 1);
-                entries[count].name[sizeof(entries[count].name) - 1] = '\0';
-                entries[count].offset = (int)base_offset;
-                entries[count].size = (int)member_size;
-                entries[count].stride = 0;
-                vio_entry_set_type(compiler, member_type_id, &entries[count]);
+                vio_uniform_entry *e = vio_uniform_slot(entries, &cap, count);
+                strncpy(e->name, name, sizeof(e->name) - 1);
+                e->name[sizeof(e->name) - 1] = '\0';
+                e->offset = (int)base_offset;
+                e->size = (int)member_size;
+                e->stride = 0;
+                vio_entry_set_type(compiler, member_type_id, e);
                 if (num_array_dims > 0) {
                     unsigned int array_stride = 0;
                     spvc_compiler_type_struct_member_array_stride(compiler, type, i, &array_stride);
-                    entries[count].stride = (int)array_stride;
+                    e->stride = (int)array_stride;
                 }
                 int end = (int)(base_offset + member_size);
                 if (end > *total_size) *total_size = end;
@@ -1905,10 +1922,9 @@ void vio_reflect_free(vio_reflect_result *result) {
 }
 
 int vio_spirv_get_uniform_offsets(const uint32_t *spirv, size_t spirv_size,
-                                   vio_uniform_entry *entries, int max_entries,
-                                   int *total_size)
+                                   vio_uniform_entry **entries, int *total_size)
 {
-    (void)spirv; (void)spirv_size; (void)entries; (void)max_entries;
+    (void)spirv; (void)spirv_size; (void)entries;
     if (total_size) *total_size = 0;
     return 0;
 }
