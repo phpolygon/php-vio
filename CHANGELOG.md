@@ -1,3 +1,11 @@
+## [2.43.1](https://github.com/phpolygon/php-vio/compare/v2.43.0...v2.43.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* **cache:** shader cache keys include the php-vio version ([db49d63](https://github.com/phpolygon/php-vio/commit/db49d6321e9a884f4080915cf955f85bcc6ca684))
+* **d3d12:** SRV slots belong to the heap they came from ([28dbf3e](https://github.com/phpolygon/php-vio/commit/28dbf3ec4b3bbc63a950e709128d434d7c2ebf7d))
+
 # [2.43.0](https://github.com/phpolygon/php-vio/compare/v2.42.1...v2.43.0) (2026-11-09)
 
 
