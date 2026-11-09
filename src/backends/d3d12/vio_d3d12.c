@@ -10396,6 +10396,11 @@ static void d3d12_draw_instanced_from_storage(void *mesh_obj, int instance_count
     vbvs[1].StrideInBytes = 64;
     ID3D12GraphicsCommandList_IASetVertexBuffers(vio_d3d12.cmd_list, 0, 2, vbvs);
 
+    /* The texture table like every draw path: without it the root table points at
+     * whatever an earlier draw left (or nothing), and a shader that samples removes
+     * the device. */
+    vio_d3d12_flush_srv_table();
+
     if (mesh->index_count > 0 && mesh->backend_ib) {
         vio_d3d12_buffer *ib = (vio_d3d12_buffer *)mesh->backend_ib;
         D3D12_INDEX_BUFFER_VIEW ibv = {0};
@@ -10625,6 +10630,10 @@ static void d3d12_draw_indirect(void *mesh_obj, void *args_buffer, int max_draws
         ibv.Format = mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
         ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
     }
+
+    /* The texture table, as in d3d12_draw: a shader that samples (a shadow map, a
+     * material texture) otherwise reads an unset table and removes the device. */
+    vio_d3d12_flush_srv_table();
 
     /* A buffer an async dispatch wrote on this frame's list sits in UNORDERED_ACCESS;
      * ExecuteIndirect needs INDIRECT_ARGUMENT (COMMON / GENERIC_READ promote by
