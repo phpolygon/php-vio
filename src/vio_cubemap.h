@@ -22,6 +22,7 @@ typedef struct _vio_cubemap_object {
     void        *d3d12_resource;  /* ID3D12Resource* (DepthOrArraySize=6) */
     uint64_t     d3d12_srv_gpu;   /* D3D12_GPU_DESCRIPTOR_HANDLE.ptr */
     uint64_t     d3d12_srv_cpu;   /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
+    uint32_t     d3d12_srv_gen;   /* SRV heap generation of d3d12_srv_cpu */
     void        *metal_texture; /* id<MTLTexture> (CFRetained), MTLTextureTypeCube */
     void        *metal_sampler; /* id<MTLSamplerState> (CFRetained) */
     void        *vulkan_texture; /* vio_vulkan_texture* (cube view), owned unless borrowed */

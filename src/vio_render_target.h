@@ -155,6 +155,7 @@ typedef struct _vio_render_target_object {
     /* D3D12 cached SRV for shadow map sampling (allocated once at RT creation) */
     uint64_t     d3d12_depth_srv_gpu; /* D3D12_GPU_DESCRIPTOR_HANDLE.ptr */
     uint64_t     d3d12_depth_srv_cpu; /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
+    uint32_t     d3d12_srv_gen;       /* SRV heap generation of all the target's static SRVs */
     uint64_t     d3d12_color_srv_gpu; /* D3D12_GPU_DESCRIPTOR_HANDLE.ptr */
     uint64_t     d3d12_color_srv_cpu; /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
     /* Cached vio_d3d12_texture wrapper, same lifecycle as the D3D11 pair. */
