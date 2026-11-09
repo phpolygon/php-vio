@@ -1,3 +1,11 @@
+## [2.42.1](https://github.com/phpolygon/php-vio/compare/v2.42.0...v2.42.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* **opengl:** find any element of a uniform struct array ([d2c83d3](https://github.com/phpolygon/php-vio/commit/d2c83d36919836055b410c445f9fd4755fbbb7d5))
+* **shaders:** size uniform tables and constant buffers by reflection ([025b0c5](https://github.com/phpolygon/php-vio/commit/025b0c5f7a0d1b6045c421a0e7a3e9e5166296b2))
+
 # [2.42.0](https://github.com/phpolygon/php-vio/compare/v2.41.1...v2.42.0) (2026-11-07)
 
 
