@@ -500,7 +500,9 @@ jobs:
 
   # ── macOS x86_64 ──────────────────────────────────────────────────
   macos-x86_64:
-    runs-on: macos-15
+    # Intel image: macos-15 is Apple silicon, so this job built (and shipped as
+    # x86_64) an arm64 binary.
+    runs-on: macos-15-intel
     strategy:
       matrix:
         php: ['8.5']
@@ -569,6 +571,11 @@ jobs:
             --with-harfbuzz \
             --with-accesskit="$VIO_ACCESSKIT_DIR"
           make -j$(sysctl -n hw.ncpu)
+
+      - name: Check architecture (x86_64)
+        run: |
+          file modules/vio.so
+          lipo -archs modules/vio.so | grep -qw x86_64 || { echo "::error::modules/vio.so is not x86_64"; exit 1; }
 
       - name: Smoke test — extension loads (eager symbol binding)
         run: |
@@ -674,6 +681,11 @@ jobs:
             --with-harfbuzz \
             --with-accesskit="$VIO_ACCESSKIT_DIR"
           make -j$(sysctl -n hw.ncpu)
+
+      - name: Check architecture (arm64)
+        run: |
+          file modules/vio.so
+          lipo -archs modules/vio.so | grep -qw arm64 || { echo "::error::modules/vio.so is not arm64"; exit 1; }
 
       - name: Smoke test — extension loads (eager symbol binding)
         run: |
