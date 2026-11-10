@@ -31,6 +31,9 @@ function run_backend(string $name, string $dir): string {
     $ctx = @vio_create($name, $opts);
     if (!$ctx) return "skip (unavailable)";
     $has3d = vio_supports_feature($ctx, VIO_FEATURE_3D_PIPELINE);
+    /* Metal without MTLBinaryArchive (Mac1-only GPU, e.g. the Apple Paravirtual
+     * device): nothing to store, like OpenGL below 4.1. */
+    $noArchive = $name === 'metal' && (vio_backend_info($ctx)['caps']['binary_archive'] ?? true) === false;
     $fmt = $name === 'opengl' ? VIO_SHADER_GLSL_RAW : VIO_SHADER_GLSL;
     $vs = "#version 330 core\nlayout(location=0) in vec3 aPos;\nvoid main(){ gl_Position = vec4(aPos, 1.0); }";
     $fs = "#version 330 core\nlayout(location=0) out vec4 o;\nvoid main(){ o = vec4(0.0, 0.0, 1.0, 1.0); }";
@@ -59,7 +62,7 @@ function run_backend(string $name, string $dir): string {
     $files1 = files($dir);
 
     /* GL < 4.1: program binaries unavailable — nothing stored, and that is fine. */
-    $glNoBinary = $name === 'opengl' && $mid['stores'] === $before['stores'];
+    $glNoBinary = ($name === 'opengl' && $mid['stores'] === $before['stores']) || $noArchive;
     if ($has3d && !$glNoBinary && $mid['stores'] <= $before['stores']) $fail[] = "first context stored nothing";
     if ($has3d && !$glNoBinary && $files1 <= $files0) $fail[] = "no cache files written";
     if (!$has3d && $files1 <= $files0) $fail[] = "pipeline cache file not written on destroy";
@@ -73,7 +76,8 @@ function run_backend(string $name, string $dir): string {
         if ($after['hits'] <= $mid['hits']) $fail[] = "second context did not hit the cache (hits {$mid['hits']} -> {$after['hits']})";
         vio_destroy($ctx);
     }
-    return $fail ? "FAIL\n  " . implode("\n  ", $fail) : ($glNoBinary ? "OK (no program binaries below GL 4.1)" : "OK");
+    return $fail ? "FAIL\n  " . implode("\n  ", $fail)
+                 : ($noArchive ? "OK (no binary archives on this GPU)" : ($glNoBinary ? "OK (no program binaries below GL 4.1)" : "OK"));
 }
 
 foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
