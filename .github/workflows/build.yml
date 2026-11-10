@@ -222,6 +222,7 @@ jobs:
             tests/render3d/196_msaa_depth_only_all_backends.phpt \
             tests/render3d/197_mesh_task_textures_all_backends.phpt \
             tests/render3d/198_tess_varyings_all_backends.phpt \
+            tests/render3d/290_tessellation_levels_from_control_points.phpt \
             tests/render3d/199_acceleration_structure_update_all_backends.phpt \
             tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt \
             tests/render3d/201_rt_pipeline_textures_all_backends.phpt \
@@ -452,6 +453,7 @@ jobs:
             tests/render3d/196_msaa_depth_only_all_backends.phpt \
             tests/render3d/197_mesh_task_textures_all_backends.phpt \
             tests/render3d/198_tess_varyings_all_backends.phpt \
+            tests/render3d/290_tessellation_levels_from_control_points.phpt \
             tests/render3d/199_acceleration_structure_update_all_backends.phpt \
             tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt \
             tests/render3d/201_rt_pipeline_textures_all_backends.phpt \
@@ -1069,6 +1071,7 @@ jobs:
             tests/render3d/196_msaa_depth_only_all_backends.phpt `
             tests/render3d/197_mesh_task_textures_all_backends.phpt `
             tests/render3d/198_tess_varyings_all_backends.phpt `
+            tests/render3d/290_tessellation_levels_from_control_points.phpt `
             tests/render3d/199_acceleration_structure_update_all_backends.phpt `
             tests/render3d/200_rt_pipeline_groups_records_all_backends.phpt `
             tests/render3d/201_rt_pipeline_textures_all_backends.phpt `
