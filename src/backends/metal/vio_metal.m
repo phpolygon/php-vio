@@ -698,8 +698,25 @@ int vio_metal_setup_context_native(void *cf_metal_layer, int width, int height,
             setenv("METAL_ERROR_MODE", "3", 0);   /* log validation errors instead of aborting */
         }
 
-        /* Create Metal device */
-        vio_mtl.device = MTLCreateSystemDefaultDevice();
+        /* Create Metal device: vio_create(['adapter' => ...]) or VIO_METAL_ADAPTER
+         * (part of the name, e.g. "Intel" / "AMD" on a dual-GPU MacBook Pro),
+         * else the system default. */
+        vio_mtl.device = nil;
+#if TARGET_OS_OSX
+        {
+            const char *want = cfg->adapter_name[0] ? cfg->adapter_name : getenv("VIO_METAL_ADAPTER");
+            if (want && *want) {
+                for (id<MTLDevice> dev in MTLCopyAllDevices()) {
+                    if (dev.name && vio_adapter_name_matches(dev.name.UTF8String, want)) { vio_mtl.device = dev; break; }
+                }
+                if (!vio_mtl.device) {
+                    php_error_docref(NULL, E_WARNING, "Metal: adapter '%s' not found", want);
+                    return -1;
+                }
+            }
+        }
+#endif
+        if (!vio_mtl.device) vio_mtl.device = MTLCreateSystemDefaultDevice();
         if (!vio_mtl.device) {
             php_error_docref(NULL, E_WARNING, "Metal: no GPU device found");
             return -1;
