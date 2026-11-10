@@ -511,6 +511,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Homebrew has no bottles for Intel macOS (Tier 3): php, the dependencies
+      # below and everything they depend on (cmake, python, openssl, the ffmpeg
+      # codecs, ...) were built from source in every run, about 3.5 hours.
+      # The kegs this job builds are kept in a cache and put back before brew
+      # runs, so brew only builds what got a newer version since. A keg is a
+      # Cellar/<name>/<version> directory the runner image did not ship.
+      - name: Homebrew kegs - snapshot of the image
+        run: |
+          export LC_ALL=C
+          mkdir -p "$RUNNER_TEMP/brew-kegs"
+          cd "$(brew --cellar)"
+          { ls -d */* 2>/dev/null || true; } | sort > "$RUNNER_TEMP/brew-image-kegs.txt"
+          echo "$(wc -l < "$RUNNER_TEMP/brew-image-kegs.txt") kegs in the image"
+
+      - name: Homebrew kegs - restore
+        id: brew-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/brew-kegs
+          # never an exact hit: the newest cache with the prefix is taken
+          key: brew-kegs-macos-15-intel-v1-none
+          restore-keys: |
+            brew-kegs-macos-15-intel-v1-
+
+      - name: Homebrew kegs - unpack and link
+        run: |
+          export LC_ALL=C
+          dir="$RUNNER_TEMP/brew-kegs"
+          if [ ! -f "$dir/kegs.tar" ]; then
+            echo "no cached kegs: everything is built from source (hours)"
+            exit 0
+          fi
+          prefix="$(brew --prefix)"
+          names=$(sed -n 's|^Cellar/\([^/]*\)/.*|\1|p' "$dir/kegs.txt" | sort -u)
+          # the image's own (older) version of a cached formula goes, as it did
+          # when brew upgraded it in the run that built the keg
+          for name in $names; do
+            if [ -d "$prefix/Cellar/$name" ]; then
+              brew unlink "$name" >/dev/null 2>&1 || true
+              rm -rf "$prefix/Cellar/$name"
+            fi
+          done
+          tar -C "$prefix" -xf "$dir/kegs.tar"
+          rm -f "$dir/kegs.tar"
+          # the archive brings Cellar and opt; bin, lib, include and pkgconfig
+          # are links brew makes (keg-only formulae are refused and stay in opt)
+          for name in $names; do
+            brew link --overwrite "$name" >/dev/null 2>&1 || echo "not linked (keg-only or conflict): $name"
+          done
+          echo "restored $(wc -l < "$dir/kegs.txt") kegs from ${{ steps.brew-restore.outputs.cache-matched-key }}"
+
       - name: Setup PHP (Homebrew)
         run: |
           # shivammathur/setup-php stopped installing PHP 8.5 on the macOS runners
@@ -558,6 +609,42 @@ jobs:
           echo "${AK_SHA256}  $RUNNER_TEMP/accesskit.zip" | shasum -a 256 -c -
           unzip -q "$RUNNER_TEMP/accesskit.zip" -d "$RUNNER_TEMP"
           echo "VIO_ACCESSKIT_DIR=$RUNNER_TEMP/accesskit-c-${AK_VERSION}" >> "$GITHUB_ENV"
+
+      # Saved before the build and the tests, so a failing test does not throw
+      # away hours of compiling. The key is the set of kegs: an unchanged set
+      # saves nothing.
+      - name: Homebrew kegs - collect
+        id: brew-collect
+        run: |
+          export LC_ALL=C
+          dir="$RUNNER_TEMP/brew-kegs"
+          prefix="$(brew --prefix)"
+          cd "$prefix"
+          (cd Cellar && ls -d */*) | sort | comm -23 - "$RUNNER_TEMP/brew-image-kegs.txt" | sed 's|^|Cellar/|' > "$dir/kegs.txt"
+          # opt links (names and aliases) that point into those kegs
+          for link in opt/*; do
+            [ -L "$link" ] || continue
+            target="$(readlink "$link")"
+            target="${target#../}"
+            target="${target#$prefix/}"
+            if grep -qxF "$target" "$dir/kegs.txt"; then echo "$link"; fi
+          done > "$dir/opt.txt"
+          key="brew-kegs-macos-15-intel-v1-$(shasum -a 256 "$dir/kegs.txt" | cut -c1-16)"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "$(wc -l < "$dir/kegs.txt") kegs, key $key (restored: ${{ steps.brew-restore.outputs.cache-matched-key || 'none' }})"
+          if [ "$key" = "${{ steps.brew-restore.outputs.cache-matched-key }}" ] || [ ! -s "$dir/kegs.txt" ]; then
+            exit 0
+          fi
+          cat "$dir/kegs.txt" "$dir/opt.txt" > "$RUNNER_TEMP/brew-kegs-files.txt"
+          tar -cf "$dir/kegs.tar" -T "$RUNNER_TEMP/brew-kegs-files.txt"
+          ls -lh "$dir/kegs.tar"
+
+      - name: Homebrew kegs - save
+        if: steps.brew-collect.outputs.key != steps.brew-restore.outputs.cache-matched-key
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/brew-kegs
+          key: ${{ steps.brew-collect.outputs.key }}
 
       - name: Build extension
         run: |
