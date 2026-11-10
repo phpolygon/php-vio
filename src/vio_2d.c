@@ -523,7 +523,9 @@ void vio_2d_flush(vio_2d_state *state)
             /* Select pixel shader. Glyphs (VIO_2D_TEXT) sample an R8 coverage
              * atlas via ps_text; image sprites use ps_sprites; untextured
              * shapes use ps_shapes. */
-            ID3D11PixelShader *wanted_ps = (item->type == VIO_2D_TEXT)
+            ID3D11PixelShader *wanted_ps = (item->type == VIO_2D_TEXT_SDF && d3d->ps_text_sdf)
+                ? d3d->ps_text_sdf
+                : (item->type == VIO_2D_TEXT || item->type == VIO_2D_TEXT_SDF)
                 ? d3d->ps_text
                 : (item->backend_texture ? d3d->ps_sprites : d3d->ps_shapes);
             if (wanted_ps != current_ps) {
@@ -640,7 +642,10 @@ void vio_2d_flush(vio_2d_state *state)
 
             /* Select PSO (format of the bound target: swapchain vs RGBA8 offscreen) */
             int rgba8_target = d3d->pso_shapes_rgba8 && vio_d3d12.current_rt_format != vio_d3d12.swapchain_format;
-            ID3D12PipelineState *wanted_pso = (item->backend_texture)
+            ID3D12PipelineState *sdf_pso = rgba8_target ? d3d->pso_text_sdf_rgba8 : d3d->pso_text_sdf;
+            ID3D12PipelineState *wanted_pso = (item->type == VIO_2D_TEXT_SDF && sdf_pso)
+                ? sdf_pso
+                : (item->backend_texture)
                 ? (rgba8_target ? d3d->pso_sprites_rgba8 : d3d->pso_sprites)
                 : (rgba8_target ? d3d->pso_shapes_rgba8 : d3d->pso_shapes);
             if (wanted_pso != current_pso) {
@@ -653,7 +658,7 @@ void vio_2d_flush(vio_2d_state *state)
                 current_tex = item->backend_texture;
                 if (current_tex) {
                     vio_d3d12_texture *dtex = (vio_d3d12_texture *)current_tex;
-                    memset(vio_d3d12.pending_srv_valid, 0, sizeof(vio_d3d12.pending_srv_valid));
+                    vio_d3d12_pending_reset();
                     vio_d3d12_bind_srv_slot(dtex->srv_cpu, 0, dtex->sampler_index);
                     vio_d3d12_flush_srv_table();
                 }
@@ -798,7 +803,9 @@ void vio_2d_flush(vio_2d_state *state)
              * shapes (ignores the descriptor) otherwise. Both share the pipeline
              * layout, so the descriptor set stays bound across a shapes draw —
              * harmless because the shapes shader never samples binding 0. */
-            VkPipeline wanted = textured ? vk->pipeline_sprites : vk->pipeline_shapes;
+            VkPipeline wanted = (textured && item->type == VIO_2D_TEXT_SDF && vk->pipeline_text_sdf)
+                ? vk->pipeline_text_sdf
+                : (textured ? vk->pipeline_sprites : vk->pipeline_shapes);
             if (wanted != current_pipeline) {
                 current_pipeline = wanted;
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, current_pipeline);

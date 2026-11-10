@@ -85,6 +85,7 @@ typedef struct _vio_font_object {
     void              *shape_atlas;  /* vio_shape_atlas* */
 #endif
     unsigned int gl_generation;   /* OpenGL: context generation that owns the GL names (vio_opengl.c) */
+    int                sdf_spread;    /* > 0: the atlas holds signed distance fields with this spread (atlas px) */
     zend_object        std;
 } vio_font_object;
 

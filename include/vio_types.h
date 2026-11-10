@@ -563,6 +563,11 @@ typedef struct _vio_config {
     int         debug;      /* Validation Layers / Debug Output */
     int         headless;   /* Offscreen rendering, no visible window */
     int         headless_hardware; /* D3D11 / D3D12: headless on the GPU instead of WARP */
+    /* Adapter choice ('adapter' option): part of the adapter's name, case-insensitive,
+     * as vio_adapters() lists it; empty = backend default. D3D11, D3D12 and Vulkan
+     * honour it (an explicit choice also keeps headless D3D off WARP); OpenGL and
+     * Metal use the system's device. */
+    char        adapter_name[256];
     /* Backbuffers == how many frames the CPU may run ahead of the GPU.
      * 0 = backend default. Currently only D3D12 honours it (2 or 3); other
      * backends ignore it. See VIO_D3D12_FRAME_COUNT_DEFAULT. */
@@ -676,6 +681,25 @@ typedef struct _vio_adapter_info {
     uint64_t    vram_bytes;
     vio_feature_set features;
 } vio_adapter_info;
+
+/* Whether an adapter name contains `wanted` (ASCII case-insensitive); an empty
+ * `wanted` matches every adapter. Used by the 'adapter' option of vio_create. */
+static inline int vio_adapter_name_matches(const char *name, const char *wanted)
+{
+    if (!wanted || !*wanted) return 1;
+    for (const char *s = name; *s; s++) {
+        const char *a = s, *b = wanted;
+        while (*a && *b) {
+            char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+            char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+            if (ca != cb) break;
+            a++;
+            b++;
+        }
+        if (!*b) return 1;
+    }
+    return 0;
+}
 
 /* Depth mip reduction (A26). */
 #define VIO_DEPTH_REDUCE_MAX 0

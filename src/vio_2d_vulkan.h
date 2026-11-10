@@ -22,6 +22,7 @@ typedef struct _vio_2d_vulkan_state {
     VkShaderModule         vs_module;
     VkShaderModule         fs_shapes_module;
     VkShaderModule         fs_sprites_module;
+    VkShaderModule         fs_text_sdf_module;   /* distance-field glyphs (vio_font 'sdf') */
 
     /* Layout: set 0 = { binding 0: combined image sampler (fragment) }.
      * Projection mat4 is a vertex-stage push constant (64 bytes). Both
@@ -32,6 +33,7 @@ typedef struct _vio_2d_vulkan_state {
     /* Two pipelines for the swapchain's attachment formats (dynamic rendering). */
     VkPipeline             pipeline_shapes;
     VkPipeline             pipeline_sprites;
+    VkPipeline             pipeline_text_sdf;    /* VK_NULL_HANDLE = draw as sprites */
 
     /* Streaming vertex buffer: HOST_VISIBLE|HOST_COHERENT, persistently
      * mapped, sized for VIO_VK_MAX_FRAMES_IN_FLIGHT slices. The per-frame

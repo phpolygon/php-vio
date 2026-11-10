@@ -7,6 +7,7 @@
 #endif
 
 #include "vio_shader_cache.h"
+#include "../php_vio.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,11 @@ uint64_t vio_shader_cache_hash_more(uint64_t h, const void *data, size_t len)
 uint64_t vio_shader_cache_hash(const char *tag, const void *data, size_t len)
 {
     uint64_t h = 1469598103934665603ULL;
+    /* The key covers what the backend hashes (source, profile, flags), not how this
+     * php-vio translates and compiles it (SPIRV-Cross options, root signature,
+     * stage plumbing). A release changes that freely, so its blobs are its own. */
+    h = vio_shader_cache_hash_more(h, PHP_VIO_VERSION, strlen(PHP_VIO_VERSION));
+    h = vio_shader_cache_hash_more(h, "|", 1);
     if (tag) h = vio_shader_cache_hash_more(h, tag, strlen(tag));
     h = vio_shader_cache_hash_more(h, "|", 1);
     return vio_shader_cache_hash_more(h, data, len);

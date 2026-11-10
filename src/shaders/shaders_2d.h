@@ -42,6 +42,25 @@ static const char *vio_2d_fragment_shader_sprites =
     "    FragColor = texture(uTexture, vTexCoord) * vColor;\n"
     "}\n";
 
+/* Signed-distance-field glyphs (vio_font 'sdf'): the atlas holds distance, 0.5 on
+ * the outline; the edge is antialiased over the screen-space rate of change, so it
+ * stays sharp at any magnification. min(r, a) reads both atlas layouts: swizzled
+ * (1,1,1,d) and plain R8 (d,0,0,1). */
+static const char *vio_2d_fragment_shader_text_sdf =
+    "#version 330 core\n"
+    "in vec2 vTexCoord;\n"
+    "in vec4 vColor;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D uTexture;\n"
+    "void main() {\n"
+    "    vec4 s = texture(uTexture, vTexCoord);\n"
+    "    float d = min(s.r, s.a);\n"
+    "    float w = max(fwidth(d) * 0.75, 1e-4);\n"
+    "    float a = smoothstep(0.5 - w, 0.5 + w, d);\n"
+    "    FragColor = vec4(vColor.rgb, vColor.a * a);\n"
+    "}\n"
+    ;
+
 /* ── HLSL versions (D3D11 SM 5.0 / D3D12 SM 5.1) ──────────────── */
 
 /* Shared 2D constant buffer: projection + output control. uOutput.x = 1 when the
@@ -92,6 +111,20 @@ static const char *vio_2d_hlsl_ps_text =
     "    float a = uTexture.Sample(uSampler, i.uv).r;\n"
     "    return vio_out(float4(i.col.rgb, i.col.a * a));\n"
     "}\n";
+
+/* SDF glyphs (see vio_2d_fragment_shader_text_sdf). */
+static const char *vio_2d_hlsl_ps_text_sdf =
+    "Texture2D    uTexture : register(t0);\n"
+    "SamplerState uSampler : register(s0);\n"
+    "struct PS_IN { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };\n"
+    "float4 main(PS_IN i) : SV_TARGET {\n"
+    "    float4 s = uTexture.Sample(uSampler, i.uv);\n"
+    "    float d = min(s.r, s.a);\n"
+    "    float w = max(fwidth(d) * 0.75, 1e-4);\n"
+    "    float a = smoothstep(0.5 - w, 0.5 + w, d);\n"
+    "    return vio_out(float4(i.col.rgb, i.col.a * a));\n"
+    "}\n"
+    ;
 
 /* ── Vulkan GLSL variants (explicit bindings → SPIR-V) ───────────────
  *
@@ -153,6 +186,22 @@ static const char *vio_2d_vk_fs_sprites =
     "    FragColor = vio_out(texture(uTexture, vTexCoord) * vColor);\n"
     "}\n";
 
+static const char *vio_2d_vk_fs_text_sdf =
+    "#version 450\n"
+    "layout(location = 0) in vec2 vTexCoord;\n"
+    "layout(location = 1) in vec4 vColor;\n"
+    "layout(location = 0) out vec4 FragColor;\n"
+    "layout(set = 0, binding = 0) uniform sampler2D uTexture;\n"
+    VIO_2D_VK_PQ
+    "void main() {\n"
+    "    vec4 s = texture(uTexture, vTexCoord);\n"
+    "    float d = min(s.r, s.a);\n"
+    "    float w = max(fwidth(d) * 0.75, 1e-4);\n"
+    "    float a = smoothstep(0.5 - w, 0.5 + w, d);\n"
+    "    FragColor = vio_out(vec4(vColor.rgb, vColor.a * a));\n"
+    "}\n"
+    ;
+
 /* ── Metal Shading Language (MSL) equivalents ────────────────────── */
 
 #ifdef HAVE_METAL
@@ -211,6 +260,19 @@ static const char *vio_2d_metal_shader_source =
     "    sampler s [[sampler(0)]])\n"
     "{\n"
     "    return vio_out(tex.sample(s, in.texcoord) * in.color, uniforms);\n"
+    "}\n"
+    "\n"
+    "fragment float4 vio_2d_fragment_text_sdf(\n"
+    "    VertexOut in [[stage_in]],\n"
+    "    constant Uniforms &uniforms [[buffer(1)]],\n"
+    "    texture2d<float> tex [[texture(0)]],\n"
+    "    sampler s [[sampler(0)]])\n"
+    "{\n"
+    "    float4 t = tex.sample(s, in.texcoord);\n"
+    "    float d = min(t.r, t.a);\n"
+    "    float w = max(fwidth(d) * 0.75, 1e-4);\n"
+    "    float a = smoothstep(0.5 - w, 0.5 + w, d);\n"
+    "    return vio_out(float4(in.color.rgb, in.color.a * a), uniforms);\n"
     "}\n";
 
 #endif /* HAVE_METAL */

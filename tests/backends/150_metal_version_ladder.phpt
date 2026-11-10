@@ -25,6 +25,9 @@ const CAP_MIN = [
     'raytracing' => 23, 'function_pointers' => 23, 'raytracing_from_render' => 24, 'cooperative_matrix' => 31,
     'mesh_shaders' => 30, 'atomic64' => 31, 'tensors' => 40, 'bindless' => 30,
     'rasterization_rate_map' => 0, 'bc_texture_compression' => 0, 'unified_memory' => 0,
+    /* Mac2 / Apple features whose absence selects a fallback (test 291) */
+    'texture_swizzle' => 0, 'renderless_pass' => 0, 'msaa_array' => 0, 'binary_archive' => 0,
+    'half_arithmetic' => 0,
 ];
 $fail = [];
 $opts = ["width" => 16, "height" => 16, "headless" => true];

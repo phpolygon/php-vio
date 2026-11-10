@@ -1,3 +1,60 @@
+## [2.43.1](https://github.com/phpolygon/php-vio/compare/v2.43.0...v2.43.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* **cache:** shader cache keys include the php-vio version ([db49d63](https://github.com/phpolygon/php-vio/commit/db49d6321e9a884f4080915cf955f85bcc6ca684))
+* **d3d12:** SRV slots belong to the heap they came from ([28dbf3e](https://github.com/phpolygon/php-vio/commit/28dbf3ec4b3bbc63a950e709128d434d7c2ebf7d))
+
+# [2.43.0](https://github.com/phpolygon/php-vio/compare/v2.42.1...v2.43.0) (2026-11-09)
+
+
+### Bug Fixes
+
+* **d3d12:** bindless table in mesh pipelines ([9b82901](https://github.com/phpolygon/php-vio/commit/9b82901332bc4e2eea9d4ac790265ae22e3474db))
+* **d3d12:** four storage buffers for vertex, mesh and task stages ([6c21dc8](https://github.com/phpolygon/php-vio/commit/6c21dc88d76371d4451f5da54780c705eb585226))
+* **d3d12:** free SRV descriptors and keep a frame's table space ([cc3b389](https://github.com/phpolygon/php-vio/commit/cc3b389de92a7ed9a645f43f3bac064779aed7e4))
+* **d3d12:** indirect and storage-instanced draws bind their texture table ([babb9c7](https://github.com/phpolygon/php-vio/commit/babb9c7fe6ade4d4397acb35376a1170fa8f0667))
+* **d3d:** raw views for every GLSL storage buffer ([69282e4](https://github.com/phpolygon/php-vio/commit/69282e4ae98030b927b320441e0df008369b5206))
+* **metal:** bindless table and storage buffers in mesh pipelines ([4f53120](https://github.com/phpolygon/php-vio/commit/4f5312068b88c20bf59529daef0f8d33cff57367))
+* **metal:** count MSL texture and buffer indices per argument table ([cb285c2](https://github.com/phpolygon/php-vio/commit/cb285c2b910f56f4304e27f68e9528538e4a1daa))
+* **metal:** textures for task / mesh stages the fragment stage does not declare ([e3694c2](https://github.com/phpolygon/php-vio/commit/e3694c2447790209e5d4fc39851c85acbb3d9980))
+
+
+### Features
+
+* **bindless:** anisotropic sampler vio_sampler_aniso at set 1 binding 7 ([b91bb1e](https://github.com/phpolygon/php-vio/commit/b91bb1e329b9883ed5db0ad6484d368d10b918b2))
+* **bindless:** clamped anisotropic sampler vio_sampler_aniso_clamp at set 1 binding 8 ([026f766](https://github.com/phpolygon/php-vio/commit/026f766c1c1a2280ee64485d92538d01182cc6ec))
+* **core:** choose the adapter in vio_create ([f5579ac](https://github.com/phpolygon/php-vio/commit/f5579ac9289de0aa39768eba12fb3da12e243d7c))
+* **text:** signed-distance-field font atlas (vio_font 'sdf') ([f1fbb7b](https://github.com/phpolygon/php-vio/commit/f1fbb7b69f27166293cabc3e0d9d4af1ed8527f1))
+
+## [2.42.1](https://github.com/phpolygon/php-vio/compare/v2.42.0...v2.42.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* **opengl:** find any element of a uniform struct array ([d2c83d3](https://github.com/phpolygon/php-vio/commit/d2c83d36919836055b410c445f9fd4755fbbb7d5))
+* **shaders:** size uniform tables and constant buffers by reflection ([025b0c5](https://github.com/phpolygon/php-vio/commit/025b0c5f7a0d1b6045c421a0e7a3e9e5166296b2))
+
+# [2.42.0](https://github.com/phpolygon/php-vio/compare/v2.41.1...v2.42.0) (2026-11-07)
+
+
+### Features
+
+* **d3d12:** texture units from the binding tier and the compiler ([05d4ef5](https://github.com/phpolygon/php-vio/commit/05d4ef599ca590c6834e2c7db2f62878cfea978f))
+* **samplers:** sampler tables sized by the backend, any unit may compare ([40bb789](https://github.com/phpolygon/php-vio/commit/40bb789bae3cf99cfe9f961726a45d76c76223b0))
+* **samplers:** vio_texture_units() - the context's units without vio_backend_info's cost ([7698773](https://github.com/phpolygon/php-vio/commit/7698773d037b198045ac3d22e1f852a130bc014c))
+* **samplers:** Vulkan, OpenGL, D3D11 and Metal report their own texture limits ([920373f](https://github.com/phpolygon/php-vio/commit/920373fe26777603afab790c88211716baf4d5d2))
+
+## [2.41.1](https://github.com/phpolygon/php-vio/compare/v2.41.0...v2.41.1) (2026-11-06)
+
+
+### Bug Fixes
+
+* **d3d11:** instanced draws keep their instance buffer per device ([5bb20c5](https://github.com/phpolygon/php-vio/commit/5bb20c5e113232999b83f0d2adabe4d205b1bb0f))
+* **opengl:** creating a render target keeps the bound target bound ([330c14e](https://github.com/phpolygon/php-vio/commit/330c14e3ded0f247d0d2419da679763f4166d82a))
+* **opengl:** put back only a bound target's FBO after creating a render target ([dbc12b2](https://github.com/phpolygon/php-vio/commit/dbc12b2f12829716836073d8554628a9c8833fe8))
+
 # [2.41.0](https://github.com/phpolygon/php-vio/compare/v2.40.3...v2.41.0) (2026-11-06)
 
 

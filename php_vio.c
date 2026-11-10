@@ -796,6 +796,28 @@ pick_backend:
         if ((val = zend_hash_str_find(options_ht, "headless_hardware", sizeof("headless_hardware") - 1)) != NULL) {
             ctx->config.headless_hardware = zend_is_true(val);
         }
+        /* Adapter choice: a string is part of the adapter's name, an int its position
+         * in vio_adapters()[backend] - resolved to that name through the backend's own
+         * listing, so both count the same way. */
+        if ((val = zend_hash_str_find(options_ht, "adapter", sizeof("adapter") - 1)) != NULL && Z_TYPE_P(val) != IS_NULL) {
+            if (Z_TYPE_P(val) == IS_LONG) {
+                vio_adapter_info *list = (vio_adapter_info *)ecalloc(VIO_MAX_ADAPTERS, sizeof(vio_adapter_info));
+                int n = ctx->backend->enumerate_adapters ? ctx->backend->enumerate_adapters(list, VIO_MAX_ADAPTERS) : 0;
+                zend_long idx = Z_LVAL_P(val);
+                if (idx < 0 || idx >= n) {
+                    efree(list);
+                    php_error_docref(NULL, E_WARNING, "vio_create: adapter %ld not found (%s lists %d)", (long)idx, ctx->backend->name, n);
+                    zval_ptr_dtor(&obj);
+                    VIO_CREATE_FAIL();
+                }
+                snprintf(ctx->config.adapter_name, sizeof(ctx->config.adapter_name), "%s", list[idx].name);
+                efree(list);
+            } else {
+                zend_string *s = zval_get_string(val);
+                snprintf(ctx->config.adapter_name, sizeof(ctx->config.adapter_name), "%s", ZSTR_VAL(s));
+                zend_string_release(s);
+            }
+        }
         /* On-disk shader / pipeline cache directory (GAP-PHASE5 Block 4): DXBC per
          * HLSL stage on D3D11/D3D12, GL program binaries, the Vulkan pipeline
          * cache. Process-wide; absent or '' keeps everything compiled per run. */
@@ -967,6 +989,7 @@ pick_backend:
 #endif
 
     ctx->initialized = 1;
+    vio_context_texture_units_init(ctx);
     /* A required feature the ranking could not see before the device opened
      * (OpenGL, shader-toolchain flags): next candidate. */
     for (int f = 0; scored && f < VIO_FEATURE_SET_MAX; f++) {
@@ -1002,6 +1025,7 @@ ZEND_FUNCTION(vio_destroy)
     vio_a11y_free(&ctx->input);   /* its adapter is tied to the platform window */
     /* Release the draw-time bind table before the GPU objects behind it go away. */
     vio_pending_textures_clear(ctx);
+    vio_context_texture_units_free(ctx);
     vio_context_bindless_clear(ctx);
     vio_context_release_fragment_storage(ctx);
     vio_upscale_release(ctx);
@@ -3487,7 +3511,6 @@ static void vio_apply_ubo_stage(vio_context_object *ctx, int binding, const vio_
     if (!buf->shadow) return;
     if (cb) {
         size_t len = buf->size < (size_t)cb_size ? buf->size : (size_t)cb_size;
-        if (len > VIO_CBUFFER_SIZE) len = VIO_CBUFFER_SIZE;
         if (len && memcmp(cb, buf->shadow, len) != 0) { memcpy(cb, buf->shadow, len); *dirty = 1; }
     } else if (ctx->backend->set_uniform) {
         vio_gl_block_from_bytes(ctx, ents, n, buf->shadow, buf->size);
@@ -3617,7 +3640,7 @@ static int vio_shader_compile_extra_stages(vio_shader_object *shader, zval **ext
 
 /* Add the sampled images of one optional stage to the shader's sampler map
  * (names not yet present only). Registers follow the same per-stage replay
- * scheme as the fragment stage (vio_spirv_to_hlsl: regular 0.., depth VIO_SHADOW_SAMPLER_BASE..). */
+ * scheme as the fragment stage (vio_spirv_to_hlsl: one sequence 0..). */
 static void vio_shader_merge_stage_samplers(vio_shader_object *shader, const uint32_t *spirv, size_t size)
 {
     vio_reflect_result r = {0};
@@ -3626,21 +3649,21 @@ static void vio_shader_merge_stage_samplers(vio_shader_object *shader, const uin
         if (err) free(err);
         return;
     }
-    int regular_reg = 0, shadow_reg = VIO_SHADOW_SAMPLER_BASE;
     for (int t = 0; t < r.texture_count; t++) {
         int is_depth = r.textures[t].is_depth ? 1 : 0;
-        int reg = is_depth ? shadow_reg++ : regular_reg++;
+        int reg = t;
         int known = 0;
         for (int s = 0; s < shader->sampler_count; s++) {
             if (strcmp(shader->sampler_names[s], r.textures[t].name) == 0) { known = 1; break; }
         }
-        if (known || shader->sampler_count >= VIO_MAX_SAMPLERS) continue;
+        if (known || shader->sampler_count >= shader->unit_count) continue;
+        vio_shader_sampler_reserve(shader, shader->sampler_count + 1);
         int s = shader->sampler_count++;
         strncpy(shader->sampler_names[s], r.textures[t].name, sizeof(shader->sampler_names[s]) - 1);
         shader->sampler_names[s][sizeof(shader->sampler_names[s]) - 1] = '\0';
         shader->sampler_is_depth[s] = is_depth;
         shader->sampler_hlsl_reg[s] = reg;
-        shader->sampler_unit[s] = r.textures[t].binding < 16 ? (int)r.textures[t].binding : 0;
+        shader->sampler_unit[s] = (int)r.textures[t].binding < shader->unit_count ? (int)r.textures[t].binding : 0;
     }
     vio_reflect_free(&r);
 }
@@ -3712,6 +3735,27 @@ static void vio_shader_reflect_stage_add(zval *return_value, const char *key, co
     add_assoc_zval(&stage_arr, "storage_buffers", &ssbo_arr);
     add_assoc_zval(return_value, key, &stage_arr);
     vio_reflect_free(&result);
+}
+
+/* Uniform table and constant shadow of one stage, sized by its reflection - no vio
+ * limit. False (with a warning) when the block outgrows the backend's constant
+ * buffers. data == NULL: table only (OpenGL sets uniforms one by one). */
+static int vio_reflect_stage_uniforms(vio_context_object *ctx, const uint32_t *spirv, size_t size, const char *stage,
+                                      vio_uniform_entry **entries, int *count, int *total, unsigned char **data)
+{
+    *count = vio_spirv_get_uniform_offsets(spirv, size, entries, total);
+    int limit = ctx->backend->uniform_block_limit ? ctx->backend->uniform_block_limit() : 0;
+    if (limit > 0 && *total > limit) {
+        php_error_docref(NULL, E_WARNING,
+            "vio_shader: the %s stage declares %d bytes of uniforms, the %s backend's constant buffers hold at most %d",
+            stage, *total, ctx->backend->name, limit);
+        return 0;
+    }
+    if (data) {
+        if (*data) efree(*data);
+        *data = ecalloc((size_t)(*total > 0 ? *total : 16), 1);
+    }
+    return 1;
 }
 
 ZEND_FUNCTION(vio_shader)
@@ -3933,6 +3977,7 @@ ZEND_FUNCTION(vio_shader)
     vio_shader_object *shader = Z_VIO_SHADER_P(&shader_zval);
     shader->format  = format;
     shader->backend = ctx->backend;
+    vio_shader_units_init(shader, ctx->texture_units > 0 ? ctx->texture_units : 16);
     shader->has_geometry     = want_geometry;
     shader->has_tessellation = want_tess;
     shader->view_count = view_count;
@@ -4207,6 +4252,20 @@ ZEND_FUNCTION(vio_shader)
             vio_sampler_plan_build(&shader->sampler_plan, ps, sz, 6);
             shader->sampler_plan.gs_writes_primid = ps[1] && vio_spirv_writes_builtin(ps[1], sz[1], 7);
         }
+        /* More texture units than the backend binds per stage: say so instead of
+         * silently dropping samplers (SAMPLER-LIMITS-PLAN). */
+        {
+            int regs = 0;
+            for (int i = 0; i < shader->sampler_plan.count; i++)
+                if (shader->sampler_plan.reg[i] + 1 > regs) regs = shader->sampler_plan.reg[i] + 1;
+            if (ctx->texture_units > 0 && regs > ctx->texture_units) {
+                php_error_docref(NULL, E_WARNING,
+                    "vio_shader: the shader reads %d texture units, the %s backend binds at most %d per stage "
+                    "(vio_backend_info()['samplers']['total'])", regs, ctx->backend->name, ctx->texture_units);
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
+        }
         vio_sampler_plan_use(&shader->sampler_plan);
         shader->backend_shader = ctx->backend->compile_shader(&desc);
         vio_sampler_plan_use(NULL);
@@ -4221,9 +4280,13 @@ ZEND_FUNCTION(vio_shader)
             if (!shader->stage_spirv[i]) continue;
             vio_shader_stage_cb *cb = calloc(1, sizeof(*cb));
             if (!cb) continue;
-            cb->uniform_count = vio_spirv_get_uniform_offsets(
-                shader->stage_spirv[i], shader->stage_spirv_size[i],
-                cb->uniforms, VIO_MAX_UNIFORMS, &cb->total_size);
+            shader->stage_cb[i] = cb;
+            static const char *const stage_names[VIO_EXTRA_STAGE_COUNT] = { "geometry", "tessellation control", "tessellation evaluation" };
+            if (!vio_reflect_stage_uniforms(ctx, shader->stage_spirv[i], shader->stage_spirv_size[i], stage_names[i],
+                                            &cb->uniforms, &cb->uniform_count, &cb->total_size, &cb->data)) {
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
             if (cb->total_size > 0 && ctx->backend->create_buffer) {
                 vio_buffer_desc cb_desc = {0};
                 cb_desc.type = VIO_BUFFER_UNIFORM;
@@ -4237,11 +4300,11 @@ ZEND_FUNCTION(vio_shader)
 
         /* Extract uniform offsets from SPIRV for constant buffer mapping */
         if (shader->vert_spirv) {
-            shader->uniform_count = vio_spirv_get_uniform_offsets(
-                shader->vert_spirv, shader->vert_spirv_size,
-                shader->uniforms, VIO_MAX_UNIFORMS,
-                &shader->cbuffer_total_size);
-            memset(shader->cbuffer_data, 0, sizeof(shader->cbuffer_data));
+            if (!vio_reflect_stage_uniforms(ctx, shader->vert_spirv, shader->vert_spirv_size, shader->is_mesh ? "mesh" : "vertex",
+                                            &shader->uniforms, &shader->uniform_count, &shader->cbuffer_total_size, &shader->cbuffer_data)) {
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
 
 
             /* Create backend constant buffer for vertex stage */
@@ -4257,11 +4320,11 @@ ZEND_FUNCTION(vio_shader)
 
         /* Extract fragment shader uniforms */
         if (shader->frag_spirv) {
-            shader->frag_uniform_count = vio_spirv_get_uniform_offsets(
-                shader->frag_spirv, shader->frag_spirv_size,
-                shader->frag_uniforms, VIO_MAX_UNIFORMS,
-                &shader->frag_cbuffer_total_size);
-            memset(shader->frag_cbuffer_data, 0, sizeof(shader->frag_cbuffer_data));
+            if (!vio_reflect_stage_uniforms(ctx, shader->frag_spirv, shader->frag_spirv_size, "fragment",
+                                            &shader->frag_uniforms, &shader->frag_uniform_count, &shader->frag_cbuffer_total_size, &shader->frag_cbuffer_data)) {
+                zval_ptr_dtor(&shader_zval);
+                RETURN_FALSE;
+            }
             /* Create backend constant buffer for fragment stage */
             if (shader->frag_cbuffer_total_size > 0 && ctx->backend->create_buffer) {
                 vio_buffer_desc cb_desc = {0};
@@ -4278,42 +4341,43 @@ ZEND_FUNCTION(vio_shader)
                 vio_reflect_result frag_reflect = {0};
                 char *err = NULL;
                 if (vio_spirv_reflect(shader->frag_spirv, shader->frag_spirv_size, &frag_reflect, &err) == 0) {
-                    shader->sampler_count = frag_reflect.texture_count < VIO_MAX_SAMPLERS
-                                          ? frag_reflect.texture_count : VIO_MAX_SAMPLERS;
+                    shader->sampler_count = frag_reflect.texture_count < shader->unit_count
+                                          ? frag_reflect.texture_count : shader->unit_count;
+                    vio_shader_sampler_reserve(shader, shader->sampler_count);
                     /* Recompute the HLSL t-register the cross-compiler assigned to each
                      * sampler. The reflection list here is the SAME sampled_images list,
                      * in the SAME order, that vio_spirv_to_hlsl walks when it assigns
-                     * SpvDecorationBinding (vio_shader_reflect.c): regular samplers get
-                     * 0,1,2..; depth/shadow samplers get VIO_SHADOW_SAMPLER_BASE.. So we can
+                     * SpvDecorationBinding (vio_shader_reflect.c): one sequence 0,1,2.. for
+                     * regular and comparison samplers. So we can
                      * reproduce the exact register by replaying that counter scheme. This is
                      * correct by construction and replaces the fragile "reflection index + 4" guess. */
-                    int regular_reg = 0;
-                    int shadow_reg = VIO_SHADOW_SAMPLER_BASE;
                     for (int s = 0; s < shader->sampler_count; s++) {
                         strncpy(shader->sampler_names[s], frag_reflect.textures[s].name,
                                 sizeof(shader->sampler_names[s]) - 1);
                         int is_depth = frag_reflect.textures[s].is_depth ? 1 : 0;
                         shader->sampler_is_depth[s] = is_depth;
-                        shader->sampler_hlsl_reg[s] = is_depth ? shadow_reg++ : regular_reg++;
-                        shader->sampler_unit[s] = frag_reflect.textures[s].binding < 16 ? (int)frag_reflect.textures[s].binding : 0;
+                        shader->sampler_hlsl_reg[s] = s;
+                        shader->sampler_unit[s] = (int)frag_reflect.textures[s].binding < shader->unit_count ? (int)frag_reflect.textures[s].binding : 0;
                     }
                     /* Separate textures (texture(sampler2D(u_tex, u_smp), uv), OPEN-ITEMS-PLAN
                      * A23) follow, in reflection order: HLSL gives them t{sampled count + j},
                      * Vulkan and Metal put them at the same list positions. */
-                    char sep[VIO_MAX_SAMPLERS][64];
-                    int nsep = vio_spirv_separate_images(shader->frag_spirv, shader->frag_spirv_size, sep, VIO_MAX_SAMPLERS);
-                    for (int j = 0; j < nsep && shader->sampler_count < VIO_MAX_SAMPLERS; j++) {
+                    int nsep = vio_spirv_separate_images(shader->frag_spirv, shader->frag_spirv_size, NULL, shader->unit_count);
+                    char (*sep)[64] = emalloc((size_t)(nsep > 0 ? nsep : 1) * sizeof(*sep));
+                    nsep = vio_spirv_separate_images(shader->frag_spirv, shader->frag_spirv_size, sep, nsep);
+                    vio_shader_sampler_reserve(shader, shader->sampler_count + nsep);
+                    for (int j = 0; j < nsep && shader->sampler_count < shader->unit_count; j++) {
                         int s = shader->sampler_count++;
                         snprintf(shader->sampler_names[s], sizeof(shader->sampler_names[s]), "%s", sep[j]);
                         shader->sampler_is_depth[s] = 0;
                         shader->sampler_hlsl_reg[s] = frag_reflect.texture_count + j;
                         shader->sampler_unit[s] = 0;
                     }
+                    efree(sep);
                     vio_reflect_free(&frag_reflect);
                 }
                 if (err) free(err);
-                /* Init remap table to identity (no remapping) */
-                for (int s = 0; s < 16; s++) shader->gl_to_hlsl_sampler[s] = -1;
+                /* The remap table starts unmapped (vio_shader_units_init). */
             }
         }
 
@@ -4354,11 +4418,11 @@ ZEND_FUNCTION(vio_shader)
     }
     if (!shader->backend_shader) {
         if (shader->vert_spirv && shader->block_binding >= 0)
-            shader->uniform_count = vio_spirv_get_uniform_offsets(shader->vert_spirv, shader->vert_spirv_size,
-                shader->uniforms, VIO_MAX_UNIFORMS, &shader->cbuffer_total_size);
+            vio_reflect_stage_uniforms(ctx, shader->vert_spirv, shader->vert_spirv_size, "vertex",
+                &shader->uniforms, &shader->uniform_count, &shader->cbuffer_total_size, NULL);
         if (shader->frag_spirv && shader->frag_block_binding >= 0)
-            shader->frag_uniform_count = vio_spirv_get_uniform_offsets(shader->frag_spirv, shader->frag_spirv_size,
-                shader->frag_uniforms, VIO_MAX_UNIFORMS, &shader->frag_cbuffer_total_size);
+            vio_reflect_stage_uniforms(ctx, shader->frag_spirv, shader->frag_spirv_size, "fragment",
+                &shader->frag_uniforms, &shader->frag_uniform_count, &shader->frag_cbuffer_total_size, NULL);
     }
 
     shader->valid = 1;
@@ -5459,8 +5523,8 @@ static int vio_resolve_sampler_slot(vio_context_object *ctx, zend_long slot, int
     *wants_depth = 0;
     if (ctx->bound_shader_object) {
         vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
-        if (slot >= 0 && slot < 16 && sh->gl_to_hlsl_sampler[slot] >= 0) {
-            sampler_idx = sh->gl_to_hlsl_sampler[slot];
+        if (vio_shader_unit_map(sh, (long)slot) >= 0) {
+            sampler_idx = vio_shader_unit_map(sh, (long)slot);
             hlsl_slot = sampler_idx;
             if (sampler_idx < sh->sampler_count) {
                 *wants_depth = sh->sampler_is_depth[sampler_idx];
@@ -5479,7 +5543,7 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
 static int vio_unit_sampler(vio_shader_object *sh, zend_long slot, int sidx)
 {
     if (sidx >= 0) return sidx;
-    return (slot >= 0 && slot < 16) ? sh->gl_to_hlsl_sampler[slot] : -1;
+    return vio_shader_unit_map(sh, (long)slot);
 }
 
 /* The typed-register backends (D3D11 / D3D12 / Metal / Vulkan) translate the GL
@@ -5502,17 +5566,28 @@ static zend_object *vio_pending_texture_zobj(int kind, void *obj)
  * references the table holds. */
 static void vio_pending_textures_clear(vio_context_object *ctx)
 {
-    for (int slot = 0; slot < 16; slot++) {
+    if (!ctx->pending_tex_obj) return;
+    for (int slot = 0; slot < ctx->pending_tex_high; slot++) {
         zend_object *z = vio_pending_texture_zobj(ctx->pending_tex_kind[slot], ctx->pending_tex_obj[slot]);
         ctx->pending_tex_obj[slot] = NULL;
         ctx->pending_tex_kind[slot] = 0;
         if (z) OBJ_RELEASE(z);
     }
+    ctx->pending_tex_high = 0;
 }
 
 static void vio_pending_texture_set(vio_context_object *ctx, zend_long slot, int kind, void *obj)
 {
-    if (slot < 0 || slot >= 16) return;
+    if (slot < 0 || slot >= ctx->texture_units) return;
+    if (slot >= ctx->pending_tex_cap) {
+        int cap = ctx->pending_tex_cap > 0 ? ctx->pending_tex_cap : 16;
+        while (cap <= slot) cap *= 2;
+        if (cap > ctx->texture_units) cap = ctx->texture_units;
+        ctx->pending_tex_obj = erealloc(ctx->pending_tex_obj, (size_t)cap * sizeof(void *));
+        ctx->pending_tex_kind = erealloc(ctx->pending_tex_kind, (size_t)cap * sizeof(int));
+        for (int i = ctx->pending_tex_cap; i < cap; i++) { ctx->pending_tex_obj[i] = NULL; ctx->pending_tex_kind[i] = 0; }
+        ctx->pending_tex_cap = cap;
+    }
     /* The table OWNS a reference to what it points at. Engines bind temporaries
      * (`vio_bind_texture($ctx, vio_render_target_texture($rt), 6)`): the PHP
      * object dies as soon as the call returns, and the allocator hands its
@@ -5524,12 +5599,13 @@ static void vio_pending_texture_set(vio_context_object *ctx, zend_long slot, int
     if (nz) GC_ADDREF(nz);
     ctx->pending_tex_obj[slot] = obj;
     ctx->pending_tex_kind[slot] = kind;
+    if (obj && slot >= ctx->pending_tex_high) ctx->pending_tex_high = (int)slot + 1;
     if (oz) OBJ_RELEASE(oz);
 }
 
 static void vio_flush_pending_textures(vio_context_object *ctx)
 {
-    if (strcmp(ctx->backend->name, "opengl") == 0) return;
+    if (strcmp(ctx->backend->name, "opengl") == 0 || !ctx->pending_tex_obj) return;
     vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
     if (sh && sh->sampler_count > 0) {
         /* GL semantics: every sampler reads the texture on ITS unit (layout
@@ -5540,7 +5616,7 @@ static void vio_flush_pending_textures(vio_context_object *ctx)
          * sampler without vio_set_uniform read whatever its slot held. */
         for (int s = 0; s < sh->sampler_count; s++) {
             int unit = sh->sampler_unit[s];
-            if (unit < 0 || unit >= 16) continue;
+            if (unit < 0 || unit >= ctx->pending_tex_high) continue;
             int kind = ctx->pending_tex_kind[unit];
             if (!kind || !ctx->pending_tex_obj[unit]) continue;
             if (kind == 1) {
@@ -5551,7 +5627,7 @@ static void vio_flush_pending_textures(vio_context_object *ctx)
         }
         return;
     }
-    for (int slot = 0; slot < 16; slot++) {
+    for (int slot = 0; slot < ctx->pending_tex_high; slot++) {
         int kind = ctx->pending_tex_kind[slot];
         if (!kind || !ctx->pending_tex_obj[slot]) continue;
         if (kind == 1) {
@@ -5632,15 +5708,11 @@ static void vio_bind_texture_now(vio_context_object *ctx, vio_texture_object *te
 
         ctx->backend->bind_texture(tex->backend_texture, hlsl_slot);
 
-#ifdef HAVE_D3D11
-        /* If the shader uses sampler2DShadow, bind the comparison sampler instead */
-        if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized && shader_wants_depth) {
-            vio_d3d11_texture *d3d_tex = (vio_d3d11_texture *)tex->backend_texture;
-            if (d3d_tex->sampler_cmp) {
-                ID3D11DeviceContext_PSSetSamplers(vio_d3d11.context, (UINT)hlsl_slot, 1, &d3d_tex->sampler_cmp);
-            }
+        /* A comparison sampler (sampler*Shadow) compares through the sampler
+         * state at its register: the backend swaps in its comparison sampler. */
+        if (shader_wants_depth && ctx->backend->bind_compare_sampler) {
+            ctx->backend->bind_compare_sampler(tex->backend_texture, hlsl_slot);
         }
-#endif
     }
 }
 
@@ -6590,18 +6662,14 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
                        sh->uniform_count + sh->frag_uniform_count + 1, NULL, NULL, 0);
         /* Vertex first so it wins on a name collision (add-if-absent), matching
          * the original vertex-before-fragment scan order; the optional stages
-         * follow. Bits 40..43 carry the vio_shader_stage. */
+         * follow. VIO_UNIFORM_ENC packs the vio_shader_stage, offset and size. */
         for (int u = 0; u < sh->uniform_count; u++) {
-            zend_long enc = (1LL << 48)
-                | ((zend_long)(sh->uniforms[u].offset & 0xFFFF) << 16)
-                | (zend_long)(sh->uniforms[u].size & 0xFFFF);
+            zend_long enc = VIO_UNIFORM_ENC(VIO_STAGE_VERTEX, sh->uniforms[u].offset, sh->uniforms[u].size);
             zend_hash_str_add_ptr(sh->uniform_lookup, sh->uniforms[u].name,
                                   strlen(sh->uniforms[u].name), (void *)(intptr_t)enc);
         }
         for (int u = 0; u < sh->frag_uniform_count; u++) {
-            zend_long enc = (1LL << 48) | ((zend_long)VIO_STAGE_FRAGMENT << 40)
-                | ((zend_long)(sh->frag_uniforms[u].offset & 0xFFFF) << 16)
-                | (zend_long)(sh->frag_uniforms[u].size & 0xFFFF);
+            zend_long enc = VIO_UNIFORM_ENC(VIO_STAGE_FRAGMENT, sh->frag_uniforms[u].offset, sh->frag_uniforms[u].size);
             zend_hash_str_add_ptr(sh->uniform_lookup, sh->frag_uniforms[u].name,
                                   strlen(sh->frag_uniforms[u].name), (void *)(intptr_t)enc);
         }
@@ -6609,9 +6677,7 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
             vio_shader_stage_cb *cb = sh->stage_cb[i];
             if (!cb) continue;
             for (int u = 0; u < cb->uniform_count; u++) {
-                zend_long enc = (1LL << 48) | ((zend_long)(VIO_STAGE_GEOMETRY + i) << 40)
-                    | ((zend_long)(cb->uniforms[u].offset & 0xFFFF) << 16)
-                    | (zend_long)(cb->uniforms[u].size & 0xFFFF);
+                zend_long enc = VIO_UNIFORM_ENC(VIO_STAGE_GEOMETRY + i, cb->uniforms[u].offset, cb->uniforms[u].size);
                 zend_hash_str_add_ptr(sh->uniform_lookup, cb->uniforms[u].name,
                                       strlen(cb->uniforms[u].name), (void *)(intptr_t)enc);
             }
@@ -6644,9 +6710,7 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
             if (strlen(cb->uniforms[u].name) == base_len && !strncmp(cb->uniforms[u].name, name, base_len)) { e = &cb->uniforms[u]; stage = VIO_STAGE_GEOMETRY + i; }
     }
     if (!e || e->stride <= 0 || (index + 1) * (long)e->stride > e->size) return 0;
-    zend_long enc = (1LL << 48) | ((zend_long)stage << 40)
-        | ((zend_long)((e->offset + index * e->stride) & 0xFFFF) << 16)
-        | (zend_long)(e->stride & 0xFFFF);
+    zend_long enc = VIO_UNIFORM_ENC(stage, e->offset + index * e->stride, e->stride);
     zend_hash_str_add_ptr(sh->uniform_lookup, name, len, (void *)(intptr_t)enc);
     return enc;
 }
@@ -6717,10 +6781,11 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
             int gl_slot = (int)Z_LVAL_P(value_zval);
             for (int s = 0; s < sh->sampler_count; s++) {
                 if (strcmp(sh->sampler_names[s], name) == 0) {
-                    if (gl_slot >= 0 && gl_slot < 16) {
+                    if (gl_slot >= 0 && gl_slot < sh->unit_count) {
+                        vio_shader_unit_reserve(sh, gl_slot + 1);
                         /* The sampler leaves its old unit (a stale entry routed that
                          * unit's texture into this sampler after a move). */
-                        for (int u = 0; u < 16; u++) if (sh->gl_to_hlsl_sampler[u] == s) sh->gl_to_hlsl_sampler[u] = -1;
+                        for (int u = 0; u < sh->gl_to_hlsl_cap; u++) if (sh->gl_to_hlsl_sampler[u] == s) sh->gl_to_hlsl_sampler[u] = -1;
                         sh->gl_to_hlsl_sampler[gl_slot] = s;  /* HLSL binding = index */
                         sh->sampler_unit[s] = gl_slot;
                     }
@@ -6737,15 +6802,19 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
 
         zend_long enc = vio_uniform_lookup(sh, name);
         if (enc) {
-            stage = (int)((enc >> 40) & 0xF);
-            int offset = (int)((enc >> 16) & 0xFFFF);
-            max_size = (int)(enc & 0xFFFF);
-            if (offset >= 0 && offset + max_size <= VIO_CBUFFER_SIZE) {
-                if (stage == VIO_STAGE_VERTEX)        dst = sh->cbuffer_data + offset;
-                else if (stage == VIO_STAGE_FRAGMENT) dst = sh->frag_cbuffer_data + offset;
-                else if (sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)])
-                    dst = sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]->data + offset;
+            stage = VIO_UNIFORM_STAGE(enc);
+            int offset = VIO_UNIFORM_OFFSET(enc);
+            max_size = VIO_UNIFORM_SIZE(enc);
+            unsigned char *base = NULL;
+            int cap = 0;
+            if (stage == VIO_STAGE_VERTEX)        { base = sh->cbuffer_data; cap = sh->cbuffer_total_size; }
+            else if (stage == VIO_STAGE_FRAGMENT) { base = sh->frag_cbuffer_data; cap = sh->frag_cbuffer_total_size; }
+            else if (stage >= VIO_STAGE_GEOMETRY && VIO_EXTRA_STAGE_INDEX(stage) < VIO_EXTRA_STAGE_COUNT
+                     && sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]) {
+                base = sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]->data;
+                cap = sh->stage_cb[VIO_EXTRA_STAGE_INDEX(stage)]->total_size;
             }
+            if (base && offset >= 0 && offset + max_size <= cap) dst = base + offset;
         }
 
         if (dst) {
@@ -8526,13 +8595,15 @@ ZEND_FUNCTION(vio_font)
     size_t path_len;
     double size = 24.0;
     double scale = 1.0;
+    HashTable *opts_ht = NULL;
 
-    ZEND_PARSE_PARAMETERS_START(2, 4)
+    ZEND_PARSE_PARAMETERS_START(2, 5)
         Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
         Z_PARAM_STRING(path, path_len)
         Z_PARAM_OPTIONAL
         Z_PARAM_DOUBLE(size)
         Z_PARAM_DOUBLE(scale)
+        Z_PARAM_ARRAY_HT_OR_NULL(opts_ht)
     ZEND_PARSE_PARAMETERS_END();
 
     vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
@@ -8570,12 +8641,28 @@ ZEND_FUNCTION(vio_font)
     font->render_scale = (float)scale;
     font->font_size = (float)(size * scale);
     font->backend   = ctx->backend;
+    if (opts_ht) {
+        /* 'sdf' => true | spread in atlas px: a signed-distance-field atlas (glyph
+         * edges stay sharp when a transform magnifies the text). Needs the shaping
+         * atlas; without HarfBuzz the font stays a coverage atlas. */
+        zval *val = zend_hash_str_find(opts_ht, "sdf", sizeof("sdf") - 1);
+        if (val && zend_is_true(val)) {
+            int spread = (Z_TYPE_P(val) == IS_LONG || Z_TYPE_P(val) == IS_DOUBLE) ? (int)zval_get_long(val) : 0;
+            if (spread <= 0) spread = (int)(font->font_size * 0.125f + 0.5f);
+            if (spread < 2) spread = 2;
+            if (spread > 32) spread = 32;
+            font->sdf_spread = spread;
+        }
+    }
     font->ttf_len = ZSTR_LEN(contents);
     font->ttf_data = emalloc(font->ttf_len);
     memcpy(font->ttf_data, ZSTR_VAL(contents), font->ttf_len);
     zend_string_release(contents);
 
     int shaping_active = 0;
+#ifndef HAVE_HARFBUZZ
+    font->sdf_spread = 0;
+#endif
 #ifdef HAVE_HARFBUZZ
     /* Preferred path: build the glyph-index atlas + HarfBuzz font. This packs
      * every glyph (by index) and uploads once, so the atlas handle is stable
@@ -8585,6 +8672,7 @@ ZEND_FUNCTION(vio_font)
 #endif
 
     if (!shaping_active) {
+        font->sdf_spread = 0;   /* the legacy pack is coverage only */
         /* Legacy path: multi-range atlas packing (Latin, Cyrillic, Greek, CJK,
          * Hangul, ...), dynamically sized to this font's glyph set. */
         unsigned char *atlas_bitmap = NULL;
@@ -9054,6 +9142,7 @@ ZEND_FUNCTION(vio_font_info)
     add_assoc_long(return_value, "rasterized", rasterized);
     add_assoc_long(return_value, "atlas_size", side);
     add_assoc_bool(return_value, "lazy", lazy);
+    add_assoc_long(return_value, "sdf", font->sdf_spread);
 }
 
 ZEND_FUNCTION(vio_font_has_glyph)
@@ -9296,6 +9385,20 @@ ZEND_FUNCTION(vio_pop_scissor)
     }
 
     vio_2d_pop_scissor(&ctx->state_2d);
+}
+
+/* SAMPLER-LIMITS-PLAN: the context's texture units, cheap (no backend query). */
+ZEND_FUNCTION(vio_texture_units)
+{
+    zval *ctx_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    array_init(return_value);
+    add_assoc_long(return_value, "units", ctx->texture_units);
+    add_assoc_long(return_value, "textures", ctx->texture_limit);
+    add_assoc_long(return_value, "sampler_states", ctx->sampler_limit);
 }
 
 ZEND_FUNCTION(vio_backend_name)
@@ -11991,15 +12094,17 @@ ZEND_FUNCTION(vio_backend_info)
     add_assoc_bool(&conv, "clip_z_remap", ctx->backend->clip_z_remap ? 1 : 0);
     add_assoc_string(&conv, "depth_stored", "(ndc_z + 1) / 2");
     add_assoc_zval(return_value, "conventions", &conv);
-    /* Samplers per stage: 16 in all (the D3D11 / Metal limit, GL's minimum);
-     * a split backend keeps the comparison ones from shadow_sampler_base on. */
+    /* Texture units per stage (SAMPLER-LIMITS-PLAN): the backend's own limits,
+     * every unit may sample regular or comparing. 'textures' / 'sampler_states'
+     * are the raw per-stage limits, 'total' the units (the smaller of the two). */
     zval smp;
     array_init(&smp);
-    int sbase = ctx->backend->shadow_sampler_base;
-    add_assoc_long(&smp, "total", VIO_SHADOW_SAMPLER_END);
-    add_assoc_long(&smp, "regular", sbase > 0 ? sbase : VIO_SHADOW_SAMPLER_END);
-    add_assoc_long(&smp, "comparison", sbase > 0 ? VIO_SHADOW_SAMPLER_END - sbase : VIO_SHADOW_SAMPLER_END);
-    add_assoc_long(&smp, "comparison_base", sbase);
+    add_assoc_long(&smp, "total", ctx->texture_units);
+    add_assoc_long(&smp, "regular", ctx->texture_units);
+    add_assoc_long(&smp, "comparison", ctx->texture_units);
+    add_assoc_long(&smp, "comparison_base", 0);
+    add_assoc_long(&smp, "textures", ctx->texture_limit);
+    add_assoc_long(&smp, "sampler_states", ctx->sampler_limit);
     add_assoc_zval(return_value, "samplers", &smp);
     add_assoc_string(return_value, "selected_by", (char *)(ctx->selected_by ? ctx->selected_by : "explicit"));
     zval cand;
@@ -14724,14 +14829,13 @@ ZEND_FUNCTION(vio_draw_instanced)
         if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
             UINT byte_size = (UINT)mat_size;
 
-            /* Reuse persistent DYNAMIC instance buffer (avoids CreateBuffer per frame) */
-            static ID3D11Buffer *s_instance_buf = NULL;
-            static UINT s_instance_buf_capacity = 0;
-
-            if (!s_instance_buf || s_instance_buf_capacity < byte_size) {
-                if (s_instance_buf) {
-                    ID3D11Buffer_Release(s_instance_buf);
-                    s_instance_buf = NULL;
+            /* Reuse the device's DYNAMIC instance buffer (avoids CreateBuffer per
+             * frame). It lives in vio_d3d11 and is released with the device; a
+             * function-static outlived the device and a second context drew nothing. */
+            if (!vio_d3d11.draw_instance_buf || vio_d3d11.draw_instance_buf_capacity < byte_size) {
+                if (vio_d3d11.draw_instance_buf) {
+                    ID3D11Buffer_Release(vio_d3d11.draw_instance_buf);
+                    vio_d3d11.draw_instance_buf = NULL;
                 }
 
                 D3D11_BUFFER_DESC bd = {0};
@@ -14740,25 +14844,25 @@ ZEND_FUNCTION(vio_draw_instanced)
                 bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
                 bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-                HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &bd, NULL, &s_instance_buf);
+                HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &bd, NULL, &vio_d3d11.draw_instance_buf);
                 if (FAILED(hr)) {
                     if (allocated) efree(allocated);
                     return;
                 }
-                s_instance_buf_capacity = byte_size;
+                vio_d3d11.draw_instance_buf_capacity = byte_size;
             }
 
             /* Upload via Map/Unmap WRITE_DISCARD */
             D3D11_MAPPED_SUBRESOURCE mapped = {0};
             HRESULT hr = ID3D11DeviceContext_Map(vio_d3d11.context,
-                (ID3D11Resource *)s_instance_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+                (ID3D11Resource *)vio_d3d11.draw_instance_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
             if (SUCCEEDED(hr)) {
                 memcpy(mapped.pData, mat_data, byte_size);
-                ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)s_instance_buf, 0);
+                ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)vio_d3d11.draw_instance_buf, 0);
 
                 /* Bind mesh VB to slot 0, instance VB to slot 1 */
                 vio_d3d11_buffer *vb = (vio_d3d11_buffer *)mesh->backend_vb;
-                ID3D11Buffer *buffers[2] = { vb->buffer, s_instance_buf };
+                ID3D11Buffer *buffers[2] = { vb->buffer, vio_d3d11.draw_instance_buf };
                 UINT strides[2] = { (UINT)mesh->stride, 64 };  /* 64 = sizeof(mat4) */
                 UINT offsets[2] = { 0, 0 };
                 ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 2, buffers, strides, offsets);
@@ -16081,19 +16185,21 @@ static void vio_bind_cubemap_now(vio_context_object *ctx, vio_cubemap_object *cm
     if (strcmp(ctx->backend->name, "d3d12") == 0 && vio_d3d12.initialized &&
         cm->d3d12_srv_gpu) {
         int hlsl_slot = (int)slot;
+        int cube_compare = 0;
         if (ctx->bound_shader_object) {
-            /* Same register recomputation as vio_bind_texture_now (regular 0.., shadow VIO_SHADOW_SAMPLER_BASE..). */
+            /* Same register recomputation as vio_bind_texture_now (one sequence 0..). */
             vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
             int idx = vio_unit_sampler(sh, slot, sidx);
             if (idx >= 0) hlsl_slot = idx < sh->sampler_count ? sh->sampler_hlsl_reg[idx] : idx;
+            if (idx >= 0 && idx < sh->sampler_count && sh->sampler_is_depth[idx]) cube_compare = 1;
         }
-        if (hlsl_slot < 0 || hlsl_slot >= VIO_D3D12_SRV_TABLE_SIZE) return;
+        if (hlsl_slot < 0 || hlsl_slot >= vio_d3d12.units) return;
         D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
         srv_cpu.ptr = cm->d3d12_srv_cpu;
         /* Cubemaps sample LINEAR / CLAMP (trilinear when mipmapped) like on
          * D3D11 / OpenGL. */
-        vio_d3d12_bind_srv_slot(srv_cpu, hlsl_slot,
-                                vio_d3d12_sampler_combo(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, 1));
+        vio_d3d12_bind_srv_slot(srv_cpu, hlsl_slot, cube_compare ? VIO_D3D12_SAMPLER_COMBO_COMPARE
+                                : vio_d3d12_sampler_combo(VIO_FILTER_LINEAR, VIO_WRAP_CLAMP, 1));
     }
 #endif
 

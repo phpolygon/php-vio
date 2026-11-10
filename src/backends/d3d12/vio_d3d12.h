@@ -47,8 +47,18 @@
 #define VIO_D3D12_MIN_FRAME_COUNT     2
 #define VIO_D3D12_MAX_FRAME_COUNT     3
 #define VIO_D3D12_FRAME_COUNT_DEFAULT 2
-#define VIO_D3D12_MAX_SRV_DESCRIPTORS 32768
+/* Shader-visible CBV/SRV/UAV heap: static views from the top, the per-frame table
+ * rings below them (one slice per frame in flight). Every draw that binds a new
+ * texture set takes VIO_D3D12_SRV_TABLE_SIZE descriptors from its frame's slice, so a
+ * frame with a mirrored second scene pass needs well over 30k. 262144 x 32 bytes
+ * per heap (staging + shader-visible) = 16 MB; resource binding tier 1 allows 1M. */
+#define VIO_D3D12_MAX_SRV_DESCRIPTORS 262144
 
+/* Size of the SMALL per-draw table (SAMPLER-LIMITS-PLAN): a draw whose shader
+ * reads at most this many texture registers gets a block of exactly this size,
+ * deduplicated and cached like before; a larger shader gets a block of its own
+ * register count (up to vio_d3d12.units, the backend's real limit), uncached.
+ * Former meaning: */
 /* Size of the per-draw SRV descriptor table (root param [2], registers t0..tN-1).
  * Must cover the highest texture register any shader binds. The mesh shader uses
  * t0 (albedo) plus four sampler2DShadow at t4..t7 (SPIRV-Cross assigns depth
@@ -57,11 +67,10 @@
  * shadow registers, so no shadow SRV is ever dropped at bind time. */
 #define VIO_D3D12_SRV_TABLE_SIZE 16
 
-/* Per-draw SAMPLER descriptor table (root param [4], registers s0..s11). One
- * sampler per regular texture register t0..t11; the comparison samplers for
- * shadow maps stay STATIC at s12..s15 (SPIRV-Cross assigns depth samplers from
- * VIO_SHADOW_SAMPLER_BASE = 12 — see vio_shader_reflect.h). Until 2.40 the
- * split was 8 / 8..11.
+/* Per-draw SAMPLER descriptor table (root param [4], registers s0..): one
+ * sampler per texture register, regular or comparing - a comparison sampler
+ * (sampler*Shadow) gets VIO_D3D12_SAMPLER_COMBO_COMPARE at its register
+ * (SAMPLER-LIMITS-PLAN; until then s12..s15 were static comparison samplers).
  *
  * Before the GAP-PLAN (Phase 1) s0..s7 were static LINEAR/WRAP samplers, so a
  * texture's filter / wrap / anisotropy were silently ignored on D3D12 (NEAREST
@@ -69,9 +78,12 @@
  * a pre-built sampler combination (filter x wrap x anisotropy) in a CPU-only
  * "combo" heap and the per-draw flush copies the eight bound combos into a
  * shader-visible per-frame ring, exactly like the SRV table. */
-#define VIO_D3D12_SAMPLER_TABLE_SIZE  12   /* == VIO_SHADOW_SAMPLER_BASE */
+#define VIO_D3D12_SAMPLER_TABLE_SIZE  VIO_D3D12_SRV_TABLE_SIZE
 #define VIO_D3D12_SAMPLER_ANISO_LEVELS 5     /* 1, 2, 4, 8, 16 */
-#define VIO_D3D12_SAMPLER_COMBOS      (2 * 3 * VIO_D3D12_SAMPLER_ANISO_LEVELS)
+/* filter x wrap x anisotropy, then one comparison sampler (LESS_EQUAL, linear,
+ * border white - the former static shadow sampler). */
+#define VIO_D3D12_SAMPLER_COMBO_COMPARE (2 * 3 * VIO_D3D12_SAMPLER_ANISO_LEVELS)
+#define VIO_D3D12_SAMPLER_COMBOS      (VIO_D3D12_SAMPLER_COMBO_COMPARE + 1)
 /* Shader-visible sampler heaps are capped at 2048 descriptors by D3D12. */
 #define VIO_D3D12_SAMPLER_HEAP_CAPACITY 2048
 /* Distinct sampler sets remembered per frame (each set = one 8-descriptor
@@ -115,9 +127,14 @@
 #define VIO_D3D12_RP_PS_UAV       16  /* [16..19] root UAVs u4..u7 (PIXEL): fragment storage buffers 0..3 (A15) */
 #define VIO_D3D12_RP_VS_SRV       20  /* SRV table t0.. (VERTEX): vertex textures (A28) */
 #define VIO_D3D12_RP_VS_SAMPLER   21  /* sampler table s0.. (VERTEX) */
-#define VIO_D3D12_RP_BINDLESS     22  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
-#define VIO_D3D12_RP_FEEDBACK     23  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
-#define VIO_D3D12_RP_COUNT        24
+#define VIO_D3D12_RP_STORAGE_MORE 22  /* [22..24] root SRVs t1..t3 space2: graphics storage buffers 1..3 (vertex / mesh + task) */
+#define VIO_D3D12_RP_BINDLESS     25  /* SRV table t0.. space1 (unbounded): vio_texture_index (Tier 2+) */
+#define VIO_D3D12_RP_FEEDBACK     26  /* UAV table u0 space2 (PIXEL): sampler feedback map (only with the feature) */
+#define VIO_D3D12_RP_COUNT        27
+/* Static samplers of the bindless table: s1..s4, s7 and s8 in space 1 (vio_sampler .. vio_sampler_aniso_clamp). */
+#define VIO_D3D12_BINDLESS_SAMPLERS 6
+/* Storage buffers a vertex / mesh / task stage reads: binding 0 at [3], 1..3 at [22..24]. */
+#define VIO_D3D12_GRAPHICS_STORAGE 4
 
 /* Compiled shader set: vertex + pixel, plus optional geometry / hull / domain
  * bytecode (NULL when the vio_shader has no such stage). */
@@ -142,6 +159,7 @@ typedef struct _vio_d3d12_shader {
     int       uses_bindless;         /* reads the bindless table (register space 1, BINDLESS-PLAN.md) */
     int       uses_draw_params;      /* reads gl_BaseVertex / gl_BaseInstance from the b13 root constants */
     int       uses_feedback;         /* the pixel stage writes a FeedbackTexture2D (u0, space2) */
+    int       tex_regs;              /* texture registers the shader reads (highest + 1, sampler plan) */
 } vio_d3d12_shader;
 
 /* Pipeline = PSO + root signature reference */
@@ -174,6 +192,7 @@ typedef struct _vio_d3d12_pipeline {
     int                      uses_bindless;    /* the shader reads the bindless table */
     int                      uses_draw_params; /* the vertex stage reads the draw-parameter root constants */
     int                      uses_feedback;    /* the pixel stage writes sampler feedback */
+    int                      tex_regs;         /* from the shader: per-draw table length */
 } vio_d3d12_pipeline;
 
 /* Buffer wrapper */
@@ -252,6 +271,7 @@ typedef struct _vio_d3d12_compute_pipeline {
     int                 uav_base_reg;
     int                 uses_accel;   /* the kernel queries an acceleration structure: root SRV [3] t0, space9 */
     int                 uses_bindless; /* reads the bindless table (spaces 1 / 3 / 4): root table [4] */
+    int                 raw_buffers;   /* GLSL kernel: SPIRV-Cross emits (RW)ByteAddressBuffer, so every storage view is raw */
     /* Params constant block. An UPLOAD-heap buffer, persistently re-mapped by
      * compute_set_uniforms (256-byte aligned per the CB requirement). Bound to
      * the reflected cbv_register. */
@@ -271,6 +291,7 @@ typedef struct _vio_d3d12_texture {
     ID3D12Resource          *upload_resource;
     D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu;
     D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu;
+    UINT srv_gen;   /* SRV heap generation srv_cpu was taken from */
     int width;
     int height;
     int depth;   /* > 0 for 3D / volume textures */
@@ -583,11 +604,19 @@ typedef struct _vio_d3d12_state {
     int latency_wait_skip;  /* the last frame was not presented: no frame-latency wait */
 
     /* Pending texture bindings (flushed before each draw into a contiguous SRV block) */
-    D3D12_CPU_DESCRIPTOR_HANDLE pending_srvs[VIO_D3D12_SRV_TABLE_SIZE]; /* CPU handles of bound textures */
-    int                          pending_srv_valid[VIO_D3D12_SRV_TABLE_SIZE]; /* 1 if slot has a texture */
+    /* Texture registers one draw can use (SAMPLER-LIMITS-PLAN): Resource
+     * Binding Tier 1 = 16 (its sampler limit), Tier 2/3 = what one frame's slice
+     * of the 2048-entry shader-visible sampler heap holds. The pending tables
+     * have this many entries. */
+    int                          units;
+    int                          texture_limit; /* SRVs one stage can bind (vio_backend_info) */
+    int                          warp;          /* the device runs on WARP (software rasterizer) */
+    int                          pending_high;  /* highest bound register + 1 */
+    D3D12_CPU_DESCRIPTOR_HANDLE *pending_srvs;      /* CPU handles of bound textures */
+    int                         *pending_srv_valid; /* 1 if slot has a texture */
     /* Sampler combo index bound at register s0..s7 (parallel to pending_srvs
      * for t0..t7). Written by d3d12_bind_texture / vio_d3d12_bind_srv_slot. */
-    int                          pending_samplers[VIO_D3D12_SAMPLER_TABLE_SIZE];
+    int                         *pending_samplers;
 
     /* Sampler heaps (GAP-PLAN Phase 1). sampler_combo_heap is CPU-only and
      * holds every filter x wrap x anisotropy combination once; sampler_heap is
@@ -786,6 +815,8 @@ int  vio_d3d12_sampler_combo(int filter, int wrap, int anisotropy);
  * register `slot` for the next draw. The one entry point for every caller that
  * used to poke pending_srvs[] directly (cubemaps, the 2D batch). */
 void vio_d3d12_bind_srv_slot(D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu, int slot, int sampler_index);
+/* Clear the pending texture / sampler tables (frame start, the 2D batch). */
+void vio_d3d12_pending_reset(void);
 
 /* SetDescriptorHeaps with BOTH graphics heaps (CBV/SRV/UAV + sampler). Every
  * place that (re)binds the graphics root signature must use this — a

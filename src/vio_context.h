@@ -44,8 +44,15 @@ typedef struct _vio_context_object {
      * may precede vio_set_uniform('u_sampler', unit) and pipeline switches, the
      * way it does on OpenGL/D3D. Raw pointers — cleared by vio_begin/vio_end,
      * valid within one frame only. */
-    void              *pending_tex_obj[16];
-    int                pending_tex_kind[16];  /* 0 none, 1 VioTexture, 2 VioCubemap */
+    void             **pending_tex_obj;      /* texture_units entries */
+    int               *pending_tex_kind;     /* 0 none, 1 VioTexture, 2 VioCubemap */
+    int                pending_tex_high;     /* highest bound unit + 1 (flush loops stop there) */
+    int                pending_tex_cap;      /* entries allocated (grows to the highest unit bound) */
+    /* Per-stage limits of the backend (vio_backend.texture_limits) and the
+     * texture units the API offers: min(textures, samplers). */
+    int                texture_limit;
+    int                sampler_limit;
+    int                texture_units;
     /* Backend-supplied offscreen render surface (OpenGL = FBO handle; other
      * backends leave 0 and use the swapchain backbuffer directly). */
     unsigned int       headless_fbo;
@@ -129,6 +136,11 @@ void vio_context_close_windows(vio_context_object *ctx);
 
 /* Drop the vio_texture_index() references (before the backend shuts down). */
 void vio_context_bindless_clear(vio_context_object *ctx);
+/* Query the backend's texture / sampler limits and size the per-unit tables
+ * (after the backend initialised). */
+void vio_context_texture_units_init(vio_context_object *ctx);
+/* Free the per-unit tables (the caller released the references they hold). */
+void vio_context_texture_units_free(vio_context_object *ctx);
 void vio_context_release_fragment_storage(vio_context_object *ctx);
 void vio_upscale_release(vio_context_object *ctx);
 
