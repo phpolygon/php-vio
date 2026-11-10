@@ -19,6 +19,11 @@
  *      that loads the output patch and runs the body for every invocation,
  *      plus a control point function that runs it for its own invocation.
  *
+ * Under Shader Model 6 the statics and functions of the translated body
+ * become members of a struct the hull shader's entry points keep as a local
+ * (see tess_wrap_state): DXC leaves statics of a hull shader as module
+ * globals, and drivers abort on those (Intel UHD 630, D3D12).
+ *
  * Varyings are lists of fields (OPEN-ITEMS-PLAN A29): a plain varying is one
  * field, an interface block or struct varying one field per member (its
  * location), matrices take one location per column. gl_ClipDistance travels
@@ -628,6 +633,8 @@ typedef struct {
     const tess_module *tcs;         /* layout source */
     const tess_module *tes;         /* domain / spacing / winding source */
     uint32_t        output_points, input_points;
+    int             shader_model;   /* 50 / 51 / 60..69 */
+    const char     *sp;             /* prefix of the body's statics in the entry points: "" or "vio_s." */
 } tess_ctx;
 
 static const char *tess_builtin_name(int builtin)
@@ -783,25 +790,146 @@ static void tess_hs_input_copies(tess_sb *b, const tess_ctx *t)
     const tess_module *c = t->tcs;
     const tess_var *v;
     if ((v = tess_find(c, SPV_STORAGE_INPUT, TV_BUILTIN, SPV_BUILTIN_PRIMITIVE_ID, 0)))
-        sb_printf(b, "    %s = int(vio_prim);\n", v->name);
+        sb_printf(b, "    %s%s = int(vio_prim);\n", t->sp, v->name);
     if ((v = tess_find(c, SPV_STORAGE_INPUT, TV_BUILTIN, SPV_BUILTIN_PATCH_VERTICES, 0)))
-        sb_printf(b, "    %s = %u;\n", v->name, t->input_points);
+        sb_printf(b, "    %s%s = %u;\n", t->sp, v->name, t->input_points);
     tess_fref fr[TESS_MAX_FIELDS];
     int n = tess_sorted_fields(c, SPV_STORAGE_INPUT, 0, fr);
     const tess_var *pv = tess_find(c, SPV_STORAGE_INPUT, TV_PERVERTEX, 0, 0);
     if (!n && !(pv && (pv->pv_pos >= 0 || pv->clip_used))) return;
     sb_printf(b, "    for (int i = 0; i < %u; i++)\n    {\n", t->input_points);
     for (int i = 0; i < n; i++)
-        sb_printf(b, "        %s[i]%s = stage_input[i].vio_l%d;\n", fr[i].v->name, fr[i].f->access, fr[i].f->location);
-    if (pv && pv->pv_pos >= 0) sb_printf(b, "        %s[i].vio_Position = stage_input[i].vio_pos;\n", pv->name);
+        sb_printf(b, "        %s%s[i]%s = stage_input[i].vio_l%d;\n", t->sp, fr[i].v->name, fr[i].f->access, fr[i].f->location);
+    if (pv && pv->pv_pos >= 0) sb_printf(b, "        %s%s[i].vio_Position = stage_input[i].vio_pos;\n", t->sp, pv->name);
     if (pv && pv->clip_used) {
         for (int k = 0; k < pv->clip_len; k++) {
             char ref[24];
             tess_clip_ref(ref, sizeof(ref), pv->clip_len, k);
-            sb_printf(b, "        %s[i].vio_m%d[%d] = stage_input[i].%s;\n", pv->name, pv->clip_member, k, ref);
+            sb_printf(b, "        %s%s[i].vio_m%d[%d] = stage_input[i].%s;\n", t->sp, pv->name, pv->clip_member, k, ref);
         }
     }
     sb_cat(b, "    }\n");
+}
+
+/* ── Hull shader state (Shader Model 6) ──────────────────────────── */
+
+/* A hull shader has two entry functions, and DXC keeps the statics of such a
+ * module as DXIL globals instead of turning them into locals of each entry.
+ * The Intel UHD 630 D3D12 driver aborts the process when it compiles a hull
+ * shader that computes from those globals (tessellation levels from control
+ * point data). Moving the mutable statics and every function of the
+ * translated body into a struct that each entry point holds as a
+ * zero-initialised local keeps the code and its semantics (per-invocation
+ * state, zero-initialised like statics) and leaves no globals behind. FXC
+ * (Shader Model 5) cannot index member arrays dynamically and lowers statics
+ * itself, so it keeps the plain statics. */
+
+static const char *tess_line_end(const char *p)
+{
+    const char *e = strchr(p, '\n');
+    return e ? e : p + strlen(p);
+}
+
+static int tess_starts(const char *p, const char *prefix)
+{
+    return strncmp(p, prefix, strlen(prefix)) == 0;
+}
+
+/* Whether the line p..e, without trailing blanks, is exactly s. */
+static int tess_line_eq(const char *p, const char *e, const char *s)
+{
+    while (e > p && (e[-1] == ' ' || e[-1] == '\r' || e[-1] == '\t')) e--;
+    return (size_t)(e - p) == strlen(s) && strncmp(p, s, (size_t)(e - p)) == 0;
+}
+
+static int tess_brace_delta(const char *p, const char *e)
+{
+    int d = 0;
+    for (; p < e; p++) d += *p == '{' ? 1 : *p == '}' ? -1 : 0;
+    return d;
+}
+
+/* Whether `text` has `name` as a whole identifier. */
+static int tess_has_ident(const char *text, const char *name)
+{
+    size_t l = strlen(name);
+    for (const char *p = text; (p = strstr(p, name)) != NULL; p += l) {
+        char before = p == text ? ' ' : p[-1], after = p[l];
+        int ident_before = before == '_' || (before >= '0' && before <= '9') || (before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z');
+        int ident_after = after == '_' || (after >= '0' && after <= '9') || (after >= 'a' && after <= 'z') || (after >= 'A' && after <= 'Z');
+        if (!ident_before && !ident_after) return 1;
+    }
+    return 0;
+}
+
+/* The body (everything SPIRV-Cross wrote before main) with its mutable statics
+ * and its functions as members of struct VIO_TessState. NULL when the body has
+ * a shape this does not handle; the caller then keeps the statics. */
+static char *tess_wrap_state(const char *body, const tess_ctx *t)
+{
+    tess_sb outside = { NULL, 0, 0, 0 }, members = { NULL, 0, 0, 0 }, funcs = { NULL, 0, 0, 0 };
+    int depth = 0, ok = 1;
+    sb_cat(&outside, "");
+    sb_cat(&members, "");
+    sb_cat(&funcs, "");
+    for (const char *p = body; *p && ok; ) {
+        const char *e = tess_line_end(p);
+        const char *next = *e ? e + 1 : e;
+        size_t len = (size_t)(e - p);
+        if (depth == 0 && tess_starts(p, "static ") && !tess_starts(p, "static const ")) {
+            /* A mutable static, "static <type> <name><dims>;". One with an
+             * initialiser cannot be a member: keep the statics. */
+            const char *semi = (const char *)memchr(p, ';', len);
+            if (!semi || memchr(p, '=', len) || memchr(p, '(', len) || memchr(p, '{', len)) { ok = 0; break; }
+            sb_printf(&members, "    %.*s\n", (int)(semi + 1 - (p + 7)), p + 7);
+            p = next;
+            continue;
+        }
+        if (depth == 0 && len && memchr(p, '(', len) && !tess_starts(p, "struct ") && !tess_starts(p, "cbuffer ")
+            && !tess_starts(p, "#") && !tess_starts(p, "static ") && !tess_starts(p, "typedef ")
+            && !tess_starts(p, "//") && *next && tess_line_eq(next, tess_line_end(next), "{")) {
+            /* A function ("<signature>" then "{" on its own line): up to its closing brace. */
+            int fd = 0;
+            const char *q = p;
+            do {
+                const char *qe = tess_line_end(q);
+                sb_printf(&funcs, "    %.*s\n", (int)(qe - q), q);
+                fd += tess_brace_delta(q, qe);
+                q = *qe ? qe + 1 : qe;
+            } while (*q && (fd > 0 || q == next));
+            if (fd != 0) ok = 0;
+            sb_cat(&funcs, "\n");
+            p = q;
+            continue;
+        }
+        sb_printf(&outside, "%.*s\n", (int)len, p);
+        depth += tess_brace_delta(p, e);
+        if (depth < 0) ok = 0;
+        p = next;
+    }
+    /* Every stage variable the body declares must have become a member. */
+    for (int i = 0; ok && i < t->tcs->var_count; i++) {
+        const char *nm = t->tcs->vars[i].name;
+        if (tess_has_ident(outside.s ? outside.s : "", nm) || tess_has_ident(funcs.s ? funcs.s : "", nm))
+            if (!tess_has_ident(members.s ? members.s : "", nm)) ok = 0;
+    }
+    if (ok && (!members.s || !members.s[0] || !funcs.s || !strstr(funcs.s, "void vert_main()"))) ok = 0;
+    char *result = NULL;
+    if (ok && !outside.oom && !members.oom && !funcs.oom) {
+        tess_sb b = { NULL, 0, 0, 0 };
+        sb_cat(&b, outside.s);
+        sb_cat(&b, "struct VIO_TessState\n{\n");
+        sb_cat(&b, members.s);
+        sb_cat(&b, "\n");
+        sb_cat(&b, funcs.s);
+        sb_cat(&b, "};\n");
+        if (b.oom) free(b.s);
+        else result = b.s;
+    }
+    free(outside.s);
+    free(members.s);
+    free(funcs.s);
+    return result;
 }
 
 static char *tess_finish_hull(spvc_compiler compiler, char *hlsl, char **error_msg, tess_ctx *t)
@@ -828,7 +956,12 @@ static char *tess_finish_hull(spvc_compiler compiler, char *hlsl, char **error_m
 
     tess_sb b = { NULL, 0, 0, 0 };
     *body_main = '\0';
-    sb_cat(&b, hlsl);
+    char *wrapped = t->shader_model >= 60 ? tess_wrap_state(hlsl, t) : NULL;
+    const char *sp = wrapped ? "vio_s." : "";
+    const char *state = wrapped ? "    VIO_TessState vio_s = (VIO_TessState)0;\n" : "";
+    t->sp = sp;
+    sb_cat(&b, wrapped ? wrapped : hlsl);
+    free(wrapped);
     sb_cat(&b, "\n");
     tess_emit_structs(&b, t);
 
@@ -839,46 +972,47 @@ static char *tess_finish_hull(spvc_compiler compiler, char *hlsl, char **error_m
     if (cp_outputs) sb_printf(&b, ", const OutputPatch<VIO_ControlPoint, %u> stage_output", t->output_points);
     if (prim) sb_cat(&b, ", uint vio_prim : SV_PrimitiveID");
     sb_cat(&b, ")\n{\n");
+    sb_cat(&b, state);
     tess_hs_input_copies(&b, t);
     if (cp_outputs) {
         sb_printf(&b, "    for (int j = 0; j < %u; j++)\n    {\n", t->output_points);
         tess_fref fr[TESS_MAX_FIELDS];
         int nf = tess_sorted_fields(c, SPV_STORAGE_OUTPUT, 0, fr);
         for (int i = 0; i < nf; i++)
-            sb_printf(&b, "        %s[j]%s = stage_output[j].vio_l%d;\n", fr[i].v->name, fr[i].f->access, fr[i].f->location);
+            sb_printf(&b, "        %s%s[j]%s = stage_output[j].vio_l%d;\n", sp, fr[i].v->name, fr[i].f->access, fr[i].f->location);
         const tess_var *pvo = tess_find(c, SPV_STORAGE_OUTPUT, TV_PERVERTEX, 0, 0);
-        if (pvo && pvo->pv_pos >= 0) sb_printf(&b, "        %s[j].vio_Position = stage_output[j].vio_pos;\n", pvo->name);
+        if (pvo && pvo->pv_pos >= 0) sb_printf(&b, "        %s%s[j].vio_Position = stage_output[j].vio_pos;\n", sp, pvo->name);
         if (pvo && pvo->clip_used) {
             for (int k = 0; k < pvo->clip_len; k++) {
                 char ref[24];
                 tess_clip_ref(ref, sizeof(ref), pvo->clip_len, k);
-                sb_printf(&b, "        %s[j].vio_m%d[%d] = stage_output[j].%s;\n", pvo->name, pvo->clip_member, k, ref);
+                sb_printf(&b, "        %s%s[j].vio_m%d[%d] = stage_output[j].%s;\n", sp, pvo->name, pvo->clip_member, k, ref);
             }
         }
         sb_cat(&b, "    }\n");
     }
     sb_printf(&b, "    for (int vio_invocation = 0; vio_invocation < %u; vio_invocation++)\n    {\n", t->output_points);
-    if (inv) sb_printf(&b, "        %s = vio_invocation;\n", inv->name);
-    sb_cat(&b, "        vert_main();\n    }\n");
+    if (inv) sb_printf(&b, "        %s%s = vio_invocation;\n", sp, inv->name);
+    sb_printf(&b, "        %svert_main();\n    }\n", sp);
     sb_cat(&b, "    VIO_PatchConstant patch_output;\n");
     for (int k = 0; k < tess_outer_count(e->domain); k++) {
-        if (outer) sb_printf(&b, "    patch_output.vio_outer[%d] = %s[%d];\n", k, outer->name, k);
+        if (outer) sb_printf(&b, "    patch_output.vio_outer[%d] = %s%s[%d];\n", k, sp, outer->name, k);
         else sb_printf(&b, "    patch_output.vio_outer[%d] = 0.0f;\n", k);
     }
     if (e->domain == TESS_DOMAIN_QUAD) {
         for (int k = 0; k < 2; k++) {
-            if (inner) sb_printf(&b, "    patch_output.vio_inner[%d] = %s[%d];\n", k, inner->name, k);
+            if (inner) sb_printf(&b, "    patch_output.vio_inner[%d] = %s%s[%d];\n", k, sp, inner->name, k);
             else sb_printf(&b, "    patch_output.vio_inner[%d] = 0.0f;\n", k);
         }
     } else if (e->domain == TESS_DOMAIN_TRI) {
-        if (inner) sb_printf(&b, "    patch_output.vio_inner = %s[0];\n", inner->name);
+        if (inner) sb_printf(&b, "    patch_output.vio_inner = %s%s[0];\n", sp, inner->name);
         else sb_cat(&b, "    patch_output.vio_inner = 0.0f;\n");
     }
     {
         tess_fref fr[TESS_MAX_FIELDS];
         int nf = tess_sorted_fields(c, SPV_STORAGE_OUTPUT, 1, fr);
         for (int i = 0; i < nf; i++)
-            sb_printf(&b, "    patch_output.vio_p%d = %s%s;\n", fr[i].f->location, fr[i].v->name, fr[i].f->access);
+            sb_printf(&b, "    patch_output.vio_p%d = %s%s%s;\n", fr[i].f->location, sp, fr[i].v->name, fr[i].f->access);
     }
     sb_cat(&b, "    return patch_output;\n}\n\n");
 
@@ -890,6 +1024,7 @@ static char *tess_finish_hull(spvc_compiler compiler, char *hlsl, char **error_m
               cp_outputs ? "VIO_ControlPoint" : "void", t->input_points);
     if (prim) sb_cat(&b, ", uint vio_prim : SV_PrimitiveID");
     sb_cat(&b, ")\n{\n");
+    sb_cat(&b, state);
     tess_hs_input_copies(&b, t);
     if (c->barriers > 0) {
         /* barrier(): a control point may read what other invocations wrote
@@ -897,25 +1032,25 @@ static char *tess_finish_hull(spvc_compiler compiler, char *hlsl, char **error_m
          * pass sees all writes of the one before - then keep this one's. */
         sb_printf(&b, "    for (int vio_pass = 0; vio_pass <= %d; vio_pass++)\n", c->barriers);
         sb_printf(&b, "        for (int vio_invocation = 0; vio_invocation < %u; vio_invocation++)\n        {\n", t->output_points);
-        if (inv) sb_printf(&b, "            %s = vio_invocation;\n", inv->name);
-        sb_cat(&b, "            vert_main();\n        }\n");
+        if (inv) sb_printf(&b, "            %s%s = vio_invocation;\n", sp, inv->name);
+        sb_printf(&b, "            %svert_main();\n        }\n", sp);
     } else {
-        if (inv) sb_printf(&b, "    %s = int(vio_cp);\n", inv->name);
-        sb_cat(&b, "    vert_main();\n");
+        if (inv) sb_printf(&b, "    %s%s = int(vio_cp);\n", sp, inv->name);
+        sb_printf(&b, "    %svert_main();\n", sp);
     }
     if (cp_outputs) {
         sb_cat(&b, "    VIO_ControlPoint stage_output;\n");
         tess_fref fr[TESS_MAX_FIELDS];
         int nf = tess_sorted_fields(c, SPV_STORAGE_OUTPUT, 0, fr);
         for (int i = 0; i < nf; i++)
-            sb_printf(&b, "    stage_output.vio_l%d = %s[vio_cp]%s;\n", fr[i].f->location, fr[i].v->name, fr[i].f->access);
+            sb_printf(&b, "    stage_output.vio_l%d = %s%s[vio_cp]%s;\n", fr[i].f->location, sp, fr[i].v->name, fr[i].f->access);
         const tess_var *pvo = tess_find(c, SPV_STORAGE_OUTPUT, TV_PERVERTEX, 0, 0);
-        if (pvo && pvo->pv_pos >= 0) sb_printf(&b, "    stage_output.vio_pos = %s[vio_cp].vio_Position;\n", pvo->name);
+        if (pvo && pvo->pv_pos >= 0) sb_printf(&b, "    stage_output.vio_pos = %s%s[vio_cp].vio_Position;\n", sp, pvo->name);
         if (pvo && pvo->clip_used) {
             for (int k = 0; k < pvo->clip_len; k++) {
                 char ref[24];
                 tess_clip_ref(ref, sizeof(ref), pvo->clip_len, k);
-                sb_printf(&b, "    stage_output.%s = %s[vio_cp].vio_m%d[%d];\n", ref, pvo->name, pvo->clip_member, k);
+                sb_printf(&b, "    stage_output.%s = %s%s[vio_cp].vio_m%d[%d];\n", ref, sp, pvo->name, pvo->clip_member, k);
             }
         }
         sb_cat(&b, "    return stage_output;\n");
@@ -1069,6 +1204,8 @@ char *vio_tess_to_hlsl(int stage, const vio_tess_hlsl_desc *desc, char **error_m
         t.tes = &tes;
         t.output_points = tcs.output_vertices;
         t.input_points = desc->input_points ? desc->input_points : tcs.output_vertices;
+        t.shader_model = desc->shader_model;
+        t.sp = "";
         size_t words = 0;
         uint32_t *rewritten = tess_rewrite(t.self, &words);
         if (!rewritten) tess_error(error_msg, "out of memory");
