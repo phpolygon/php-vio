@@ -584,6 +584,15 @@ jobs:
           DYLD_BIND_AT_LAUNCH=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
             -r 'exit((int) !extension_loaded("vio"));'
 
+      - name: Metal device (GPU families and capabilities the suite runs on)
+        run: |
+          php -n -d extension_dir="$PWD/modules" -d extension=vio.so -r '
+            $c = @vio_create("metal", ["width" => 8, "height" => 8, "headless" => true]);
+            if (!$c) { echo "no Metal device\n"; exit; }
+            $i = vio_backend_info($c);
+            echo $i["device"], " (", $i["api"], ", MSL ", $i["shading_language_version"], "): ", implode(" ", $i["families"]), "\n";
+            foreach ($i["caps"] as $k => $v) echo "  $k = ", $v ? "yes" : "no", "\n";'
+
       - name: Run tests
         run: |
           # -n ignores the runner's system php.ini (which enables dozens of
@@ -693,6 +702,15 @@ jobs:
         run: |
           DYLD_BIND_AT_LAUNCH=1 php -n -d extension_dir="$PWD/modules" -d extension=vio.so \
             -r 'exit((int) !extension_loaded("vio"));'
+
+      - name: Metal device (GPU families and capabilities the suite runs on)
+        run: |
+          php -n -d extension_dir="$PWD/modules" -d extension=vio.so -r '
+            $c = @vio_create("metal", ["width" => 8, "height" => 8, "headless" => true]);
+            if (!$c) { echo "no Metal device\n"; exit; }
+            $i = vio_backend_info($c);
+            echo $i["device"], " (", $i["api"], ", MSL ", $i["shading_language_version"], "): ", implode(" ", $i["families"]), "\n";
+            foreach ($i["caps"] as $k => $v) echo "  $k = ", $v ? "yes" : "no", "\n";'
 
       - name: Run tests
         run: |

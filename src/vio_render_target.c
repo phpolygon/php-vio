@@ -41,6 +41,9 @@ static zend_object *vio_render_target_create_object(zend_class_entry *ce)
     rt->metal_depth_backend_texture = NULL;
     rt->metal_msaa_color_texture = NULL;
     rt->metal_msaa_depth_texture = NULL;
+    rt->metal_msaa_layer_colors = NULL;
+    rt->metal_msaa_layer_depths = NULL;
+    rt->metal_cube_resolve_view = NULL;
     rt->vulkan_rt           = NULL;
     rt->width         = 0;
     rt->height        = 0;

@@ -102,6 +102,14 @@ typedef struct _vio_render_target_object {
      * metal_color_texture is then the single-sample RESOLVE texture. */
     void        *metal_msaa_color_texture; /* id<MTLTexture> 2DMultisample (CFRetained) */
     void        *metal_msaa_depth_texture; /* id<MTLTexture> 2DMultisample (CFRetained) */
+    /* Cube / array MSAA on a device without 2DMultisampleArray: one 2DMultisample
+     * colour / depth texture per layer (NSArray, CFRetained); the two above are
+     * then layer 0's. */
+    void        *metal_msaa_layer_colors;
+    void        *metal_msaa_layer_depths;
+    /* MSAA cube: the 6-slice 2DArray holding the faces (resolve target of a
+     * face); metal_color_texture is a cube view of it. */
+    void        *metal_cube_resolve_view;
 
     /* Vulkan: vio_vk_rt* (src/backends/vulkan/vio_vulkan.h) - attachments, MSAA
      * images, render passes, framebuffers (per cube face / level), sampler and the

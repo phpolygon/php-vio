@@ -1,10 +1,10 @@
 --TEST--
-vio_create 'adapter' option: a position in vio_adapters()[backend] or part of an adapter's name opens exactly that adapter (D3D11, D3D12, Vulkan); an unknown choice fails
+vio_create 'adapter' option: a position in vio_adapters()[backend] or part of an adapter's name opens exactly that adapter (D3D11, D3D12, Vulkan, Metal); an unknown choice fails
 --EXTENSIONS--
 vio
 --FILE--
 <?php
-foreach (['d3d11', 'd3d12', 'vulkan'] as $b) {
+foreach (['d3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
     // vio_adapters() rejects a backend this build does not register (d3d11 on macOS).
     $list = in_array($b, vio_backends(), true) ? (vio_adapters($b)[$b] ?? []) : [];
     if (!$list) { echo "$b: skip (unavailable)\n"; continue; }
@@ -37,4 +37,5 @@ echo "DONE\n";
 d3d11: %r(OK|skip \(.*\))%r
 d3d12: %r(OK|skip \(.*\))%r
 vulkan: %r(OK|skip \(.*\))%r
+metal: %r(OK|skip \(.*\))%r
 DONE
