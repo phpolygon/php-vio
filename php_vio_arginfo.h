@@ -248,6 +248,38 @@ ZEND_END_ARG_INFO()
 
 #define arginfo_vio_on_a11y_action arginfo_vio_on_preedit
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_TYPE_MASK_EX(arginfo_vio_webview, 0, 1, VioWebview, MAY_BE_FALSE)
+	ZEND_ARG_OBJ_TYPE_MASK(0, window, VioContext|VioWindow, 0, NULL)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_webview_navigate, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, webview, VioWebview, 0)
+	ZEND_ARG_TYPE_INFO(0, url, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_webview_eval, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, webview, VioWebview, 0)
+	ZEND_ARG_TYPE_INFO(0, js, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_webview_bounds, 0, 2, _IS_BOOL, 0)
+	ZEND_ARG_OBJ_INFO(0, webview, VioWebview, 0)
+	ZEND_ARG_TYPE_INFO(0, bounds, IS_ARRAY, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_webview_on_message, 0, 2, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, webview, VioWebview, 0)
+	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 1)
+ZEND_END_ARG_INFO()
+
+#define arginfo_vio_webview_on_event arginfo_vio_webview_on_message
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_webview_destroy, 0, 1, IS_VOID, 0)
+	ZEND_ARG_OBJ_INFO(0, webview, VioWebview, 0)
+ZEND_END_ARG_INFO()
+
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_on_preedit, 0, 2, IS_VOID, 0)
 	ZEND_ARG_OBJ_TYPE_MASK(0, context, VioContext|VioWindow, 0, NULL)
 	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
@@ -1418,6 +1450,13 @@ ZEND_FUNCTION(vio_inject_preedit);
 ZEND_FUNCTION(vio_on_preedit);
 ZEND_FUNCTION(vio_on_a11y_action);
 ZEND_FUNCTION(vio_a11y_update);
+ZEND_FUNCTION(vio_webview);
+ZEND_FUNCTION(vio_webview_navigate);
+ZEND_FUNCTION(vio_webview_eval);
+ZEND_FUNCTION(vio_webview_bounds);
+ZEND_FUNCTION(vio_webview_on_message);
+ZEND_FUNCTION(vio_webview_on_event);
+ZEND_FUNCTION(vio_webview_destroy);
 ZEND_FUNCTION(vio_tray_remove);
 ZEND_FUNCTION(vio_tray);
 ZEND_FUNCTION(vio_set_progress);
@@ -1693,6 +1732,13 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(vio_on_preedit, arginfo_vio_on_preedit)
 	ZEND_FE(vio_on_a11y_action, arginfo_vio_on_a11y_action)
 	ZEND_FE(vio_a11y_update, arginfo_vio_a11y_update)
+	ZEND_FE(vio_webview, arginfo_vio_webview)
+	ZEND_FE(vio_webview_navigate, arginfo_vio_webview_navigate)
+	ZEND_FE(vio_webview_eval, arginfo_vio_webview_eval)
+	ZEND_FE(vio_webview_bounds, arginfo_vio_webview_bounds)
+	ZEND_FE(vio_webview_on_message, arginfo_vio_webview_on_message)
+	ZEND_FE(vio_webview_on_event, arginfo_vio_webview_on_event)
+	ZEND_FE(vio_webview_destroy, arginfo_vio_webview_destroy)
 	ZEND_FE(vio_tray_remove, arginfo_vio_tray_remove)
 	ZEND_FE(vio_tray, arginfo_vio_tray)
 	ZEND_FE(vio_set_progress, arginfo_vio_set_progress)

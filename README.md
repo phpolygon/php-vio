@@ -20,6 +20,7 @@ A PHP extension that brings GPU rendering, audio, video recording, streaming, an
 - **Audio** — playback via miniaudio (MP3, WAV, FLAC, Ogg Vorbis, Ogg Opus), Opus / Vorbis encoding and decoding, 3D audio with live pitch / pan, distance attenuation models, Doppler, cones, 2D / 3D switch per sound, offline rendering
 - **Video recording** — H.264 via FFmpeg with the platform's hardware encoders (NVENC, AMF, QSV, Media Foundation, VideoToolbox) and libx264 as the fallback
 - **Network streaming** — RTMP and SRT via FFmpeg
+- **System Webview** — WKWebView inside a vio window, served by PHP in the same process over a custom scheme (no HTTP server), JS ↔ PHP messages; runs Laravel apps (`examples/webview_laravel.php`). macOS (WKWebView) and Linux (WPE WebKit or WebKitGTK) today, Windows (WebView2) next
 - **Headless mode** — offscreen rendering, pixel readback, screenshots and image comparison for visual regression tests
 - **Plugin system** — output / input / filter plugins and a versioned C ABI for upscaler plugins
 - **Cross-platform** — Windows, macOS, Linux (X11 and Wayland) with native window layers; GLFW is optional
@@ -192,6 +193,7 @@ More scripts are in [`examples/`](examples): a window, a triangle, input, a cust
 | Headless | `vio_read_pixels`, `vio_save_screenshot`, `vio_compare_images`, `vio_save_diff_image` |
 | Shaders | `vio_shader_reflect`, `vio_shader_cache_stats`, shader compilation via glslang |
 | Introspection | `vio_backends`, `vio_backend_name`, `vio_backend_info`, `vio_adapters`, `vio_rank_backends`, `vio_supports_feature`, `vio_feature_info`, `vio_gpu_info`, `vio_gpu_frame_time` |
+| Webview | `vio_webview`, `vio_webview_navigate`, `vio_webview_eval`, `vio_webview_on_message`, `vio_webview_on_event`, `vio_webview_bounds` |
 | Plugins | `vio_plugins`, `vio_plugin_info` |
 
 Every signature with its options is in [vio.stub.php](vio.stub.php); guides and the API reference are on the [documentation site](https://phpolygon.github.io/php-vio-docs/).
