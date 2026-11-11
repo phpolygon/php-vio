@@ -4,8 +4,8 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.30.0**, 272 PHP-Funktionen, 20 Zend-Klassen,
-6 Backends, 302 PHPT-Tests. Releases laufen über semantic-release
+für die PHPolygon Game Engine. Aktuell **v2.30.0**, 280 PHP-Funktionen, 21 Zend-Klassen,
+6 Backends, 304 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
 ## Build
@@ -122,7 +122,7 @@ SHADING_RATE_PRIMITIVE,SHADING_RATE_IMAGE,BINDLESS,MESH_SHADER,RAY_QUERY,RAYTRAC
 mit `-d vio.debug=1` (D3D12-Debug-Layer, Vulkan-Validation): mehrere Befunde zeigten sich nur dort. Die
 Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` setzen.
 
-302 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+304 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
@@ -135,6 +135,7 @@ Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONO
 | `tests/window/296` | Cookies am Custom Scheme: vios Cookie-Speicher je Webview (WKWebView speichert dort keine), Set-Cookie → Cookie bei `fetch` und Navigation, `document.cookie` zeigt nicht-HttpOnly-Cookies (XSRF-TOKEN), eine Zuweisung aus JS erreicht PHP, abgelaufene sind weg, `localStorage` überlebt eine Navigation. |
 | `tests/window/297` | Webview neben GPU-Inhalt im selben Fenster: Frames laufen weiter (`vio_read_pixels` exakt, liest nur die Swapchain), die Webview füllt den Client-Bereich und folgt `vio_set_window_size`, `'bounds'` / `vio_webview_bounds` platzieren sie (die Seite misst ihren Viewport), `transparent`. |
 | `tests/window/298` | Weiterleitungen am Custom Scheme (Engines folgen dort keiner): `fetch` folgt 302/303 als GET und 307 mit Methode und Body, eine Schleife endet nach 20 mit Netzwerkfehler, ein `Location` auf ein anderes Scheme wird nicht verfolgt; ein weitergeleiteter Form-POST zeigt die Zielseite (`location.href`, GET), ein Cookie der Weiterleitung kommt am Ziel an. |
+| `tests/input/274` | Cocoa: `ApplePressAndHoldEnabled` ist für den Prozess ausdrücklich aus (über `NSUserDefaults objectForKey:`, ein fehlender Schlüssel hieße „an“). Seit die Tasten durch die Eingabemethode laufen (Phase 3), hätte Halten von A, E, S, … sonst den Akzent-Wähler über dem Spiel geöffnet und die Zeichenwiederholung gestoppt. |
 | `tests/window/273` | Barrierefreiheit (DESKTOP-APP-PLAN Phase 5a, AccessKit): `vio_a11y_update` liefert, was `vio_platform_info()['accessibility']` verspricht; Vertrag überall (Rolle, Aktion, id, Bounds, doppelte ids, Typen), Verweise (Kinder, Wurzel, Fokus) gegen den Baum. macOS im eigenen Prozess über NSAccessibility (`accessibilityRole`/`Title`/`Value`, `accessibilityPerformPress`; ohne Bedienungshilfen-Freigabe), Windows über UI Automation (PowerShell `System.Windows.Automation`: Name, Control-Typ, ValuePattern, TogglePattern, Invoke), Linux in eigener D-Bus-Sitzung über AT-SPI (python3-gi `Atspi`): Namen, Rollen, Wert und `checked` der Knoten, ein Klick aus AT-SPI erreicht `vio_on_a11y_action`, ein späteres Update (neues Label) erreicht AT-SPI; `VIO_REQUIRE_A11Y=1` macht den Teil der Plattform Pflicht (CI Linux x86_64, Windows, macOS). |
 | `tests/window/272` | Unterfenster (DESKTOP-APP-PLAN Phase 4, je Plattform in eigenem Prozess): `vio_window(['parent' => $ctx\|$window, 'modal' => true])`; ein modales Fenster sperrt Tasten, Maustasten, Text und Schließ-Anfragen des Elternfensters (Loslassen kommt durch), verschachtelt je Ebene, nach dem Schließen wieder frei; ein Elternfenster schließt zuerst seine Kinder; Vertrag (`modal` ohne `parent`, falscher Typ, fremder Kontext). Per FFI: Win32 Owner + deaktiviertes Elternfenster, X11 `WM_TRANSIENT_FOR` + `_NET_WM_STATE_MODAL`, Cocoa `parentWindow`. |
 | `tests/window/271` | Mehrere Fenster (DESKTOP-APP-PLAN Phase 4, jedes Backend): `vio_window` öffnet ein zweites Fenster auf dem Gerät des Kontexts, `vio_begin($ctx, ['window' => $w])` rendert hinein (Clear, 2D, eine Textur des Kontexts), Frames wechseln mit dem Hauptfenster, jedes behält seinen Inhalt (`vio_read_pixels($w)`), Größen, Tasten und Schließen sind je Fenster, ein Fenster eines anderen Kontexts → `ValueError`, das Hauptfenster rendert nach `vio_destroy_window` weiter; ohne Fenstersystem (null-Plattform) meldet `VIO_FEATURE_MULTI_WINDOW` = false und `vio_window` liefert `false`. |
@@ -293,6 +294,7 @@ Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONO
 | `tests/render3d/113` | Stencil: ein Markierungs-Pass (Farbe maskiert, REPLACE ref 1) auf der linken Hälfte, dann EQUAL-/NOTEQUAL-Passes – links grün, rechts rot, keine Farbe aus dem Markierungs-Pass. |
 | `tests/render3d/111` | Draw-time-Bind-Tabelle haelt Referenzen: eine als Temporary gebundene RT-Textur (`vio_bind_texture(\, vio_render_target_texture(\), 6)`) ueberlebt bis zum Draw, auch wenn danach weitere Texturobjekte entstehen (D3D11/D3D12/Metal; Regression aus 2.9: recycelter Objektspeicher legte die AO-Karte auf das Schatten-Register). |
 | `tests/render3d/096–098` | Storage-Images + 2D-Dispatch (API-Roadmap R2/R7), Multiple Render Targets (R1), Async-Compute im Frame (R7) |
+| `tests/backends/300` | Lose Uniforms in Vertex- **und** Fragment-Stage desselben Shaders linken und bekommen ihre Werte auf jedem Backend, egal welche SPIR-V-Ids die Stages bekommen (Padding-Anweisungen verschieben die Ids beider Stages, bis sie sich treffen). OpenGL nannte den abgeflachten Block jeder Stage nach seiner SPIR-V-Id (`uniform … _16;`): bei gleicher Id in beiden Stages ein Uniform mit zwei Struct-Typen, „struct fields mismatch“ beim Linken. `vio_spirv_to_glsl` benennt namenlose Blöcke jetzt je Stage (`vio_vs_u0`, `vio_fs_u0`). |
 | `tests/backends/108` | OpenGL: `vio_set_uniform()` erreicht UBO-Block-Member, Default-Block-Uniforms und Array-Elemente von SPIR-V-Pfad-Shadern (SPIRV-Cross flacht sie zu `uniform Matrices _19;` ab → GL-Name `_19.uProjection`). |
 | `tests/backends/291` | Metal auf Mac1-only-GPUs (`VIO_METAL_GPU_FAMILY=mac1`, die Klasse des Apple Paravirtual device der Intel-CI-Runner): ohne Swizzle, attachment-lose Passes, `2DMultisampleArray`, Binary-Archive und Blit-Mips rendern die Ersatzwege Text (Atlas bei Bedarf), Mip-Ketten, Cube-/Array-MSAA und den Tessellations-Capture-Pass wie der Device-Pfad; die Caps melden die Ersatzwege, `SHADER_FLOAT16` folgt der `half_arithmetic`-Probe. |
 | `tests/backends/289` | OpenGL-Caches je Programm (Schatten-Sampler-Orte, Uniform-Orte) überleben ihren Kontext nicht: ein Programm, dessen VioShader über `vio_destroy` hinaus gehalten wird, hinterließ seine Einträge, und der nächste Kontext vergibt dieselbe Programm-ID neu. Kontext 2 (Ort 5 = `sampler2D`) bekam den Vergleichs-Sampler (CLAMP_TO_BORDER, weiß statt Rot bei REPEAT), Kontext 3 (Ort 5 = `mat4`) starb in `glGetUniformiv` (16 Werte in ein GLint, Access Violation in `opengl_draw_mesh`). Einträge tragen jetzt `gl_context_generation`, `opengl_shutdown` leert auch den Schatten-Cache, „forget“ nur für Programme des lebenden Kontexts. |
@@ -711,7 +713,7 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   Command-Buffer jedes Frames beim Abschluss signalisiert; `vio_swapchain_info()` meldet beides.
 - Tests: `tests/backends/089_metal_3d_pipeline.phpt` (Pixel-Kontrakt), `088` läuft jetzt auch auf Metal.
 
-### Zend-Objekte (20 Klassen)
+### Zend-Objekte (21 Klassen)
 
 | Klasse | Header | Zweck |
 |--------|--------|-------|
@@ -731,6 +733,8 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
 | VioWorkGraph | src/vio_work_graph.h | Work Graph (D3D12, SM 6.8): State Object + Backing Memory, gebundene Storage-Buffer (`vio_work_graph`) |
 | VioUpscaler | src/upscale/vio_upscaler.h | Natives Upscaler-Kontext (FSR 3.1): Provider-Kontext + Beschreibung, Live-Liste (vor dem Geräte-Shutdown abgeräumt) |
 | VioFont | src/vio_font.h | TTF-Font (stb_truetype Atlas, glyph-index-keyed mit HarfBuzz) |
+| VioFontFace | src/vio_font.h | Font-Datei ohne Kontext und Atlas für `vio_text_bitmap` (`vio_font_face`) |
+| VioBundle | src/vio_bundle.h | Aufgezeichnete Draw-Folge (`vio_bundle` / `vio_draw_bundle`): hält die Objekte seiner Records, native Aufnahme je Attachment-Signatur |
 | VioSound | src/vio_audio.h | Audio-Quelle (miniaudio) |
 | VioRecorder | src/vio_recorder.h | Video-Encoder (FFmpeg) |
 | VioStream | src/vio_stream.h | Network-Stream (FFmpeg RTMP/SRT) |
@@ -743,7 +747,7 @@ Alle folgen dem gleichen Muster: `zend_object std` als letztes Feld, `Z_VIO_*_P(
 php_vio.c                   # Alle PHP-Funktionen (~9000 Zeilen, monolithisch)
 php_vio.h                   # Module-Globals (default_backend, debug, vsync)
 php_vio_arginfo.h           # Arginfo + Funktionstabelle (generiert aus vio.stub.php)
-vio.stub.php                # PHP-Stubs für IDE-Support (207 Funktionen)
+vio.stub.php                # PHP-Stubs für IDE-Support (280 Funktionen)
 config.m4 / config.w32      # Autotools- bzw. Windows-Build-Konfiguration
 configure.ac                # PHP-freier Autotools-Einstieg (CI-Permutationen)
 CMakeLists.txt              # IDE-Support (CLion/PhpStorm), kein Release-Build
@@ -870,7 +874,7 @@ static-php-cli vios `vendor/*`-Quellen streicht, die php-glfw auch mitbringt. Fe
 Build, scheitert der Link an `vio_ma_*` statt still umzubinden; `vio_audio_engine_init()`
 prüft zusätzlich `ma_version()` gegen den Header und verweigert Audio bei Abweichung.
 
-## PHP API (272 Funktionen)
+## PHP API (280 Funktionen)
 
 Vollständige Signaturen in `vio.stub.php`. Die Beispiele hier zeigen die Gruppen.
 
@@ -1626,7 +1630,7 @@ gibt beim späten Freigeben nicht mehr die Textur des nächsten Kontexts frei (T
 - **Konstanten**: `VIO_` Prefix, SCREAMING_CASE.
 - **Zend-Objekte**: `vio_*_object` Struct, `Z_VIO_*_P()` Accessor-Macro.
 - **Bedingte Kompilierung**: `#ifdef HAVE_GLFW`, `HAVE_VULKAN`, `HAVE_METAL`, `HAVE_D3D11`, `HAVE_D3D12`, `HAVE_IOS`, `HAVE_FFMPEG`, `HAVE_GLSLANG`, `HAVE_SPIRV_CROSS`, `HAVE_HARFBUZZ`
-- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 300 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess, 184 `vio_backend_info` auf allen Backends, 185 `vio_adapters`, 186 Scoring für `auto`, 187 Kalibrierlauf, 188 Readback des neuesten Frames, 189 Glyph-Atlas bei Bedarf, 190 KTX2-Cubemaps/-3D, 191 ASTC, 192 Vertikaltext, 193 Tiefen-Mips, 194 MSAA-MRT, 195 MSAA-Cube/-Array, 196 MSAA-Depth-only, 197 Texturen in Mesh-/Task-Stages, 198 Tess-Varyings, 199 TLAS-Update, 200 RT-Gruppen + Records, 201 RT-Texturen, 202 Trace im Frame, 203 Fragment-Storage, 204 Sampler-Feedback aus GLSL, 205 Lücken der Geometry-Stage, 206 Pass-Wechsel / Vulkan-Kern, 212 Audit-Gate Plattformschicht, 213 Win32-Plattform, 214 X11-Plattform, 215 Wayland-Plattform, 216 Long Vectors, 217 RT-Wechsel ohne Unbind, 218 Float16-Sonderwerte, 219 SER, 220 Opacity Micromaps, 221 D3D12-Capture mitten im Frame, 222 MRT mit 8 Attachments, 223 Tiefe eines Farb-Targets, 224 Raw-Readback, 225 RT als Storage-Image, 226 Upscaler ohne Laufzeit, 227 FSR-3.1-Konvergenz, 228 Upscaler-Lebenszyklus, 229 DLSS ohne Laufzeit, 230/231/233 DLSS-Konvergenz/-Lebenszyklus/-Preset (jetzt im Repo php-vio-dlss), 232 Vulkan: kein Sampler auf einem Anhang des offenen Passes, 234 Upscaler-Plugin fehlt, 235 Plugin-ABI abgelehnt, 236 Test-Plugin Ende zu Ende, 237 viele Compute-Dispatches pro Frame, 238 viele Mipmap-Erzeugungen pro Frame, 246 Audit-Gate miniaudio-Namensraum, 247 Stub-Parität + Keypad-Konstanten, 250 viele `vio_update_buffer` pro Frame, 251 HDR-Komposit, 252 Micromap-Baker, 253 Freigabe im laufenden Frame, 254 Upscaler-Vorbereitung auf dem Worker, 255 UTF-8-Pfade der Upscaler, 256 ausdrückliches Präsentieren, 257 Sampler-Aufteilung, 258 Clear im Frame merkt keine Farbe, 259 Cubemap auf beliebiger Unit, 260 Sampler-Units wie GL, 261 `vio_wait_events`/`vio_wake`, 262 Fenster-Ereignisse, 263 Fenster-Details, 264 URL öffnen / Datei zeigen, 265 Datei-Drop, 266 Dialoge, 267 Menüs, 268 Benachrichtigungen/Fortschritt/Portal, 269 Tray, 270 IME-Komposition, 271 mehrere Fenster, 272 Unterfenster, 273 Barrierefreiheit, 278 Uniform-Blöcke über den alten Grenzen, 279 Storage-Buffer in Mesh-/Task-Stages, 280 anisotroper Bindless-Sampler, 281 Bindless in Mesh-Pipelines, 282 `adapter`-Option, 283 Storage-vec4-Arrays auf D3D-Hardware, 284 SDF-Font, 285 Buffer + 13 Sampler (Metal-Tabellen), 286 D3D12-SRV-Deskriptoren: Freigabe und volle Frames, 287 Texturtabelle bei Indirect- und Storage-Draws, 292–299 System-Webview)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
+- **Tests**: PHPT-Format, `tests/<thema>/NNN_name.phpt` (Nummern fortlaufend über alle Ordner, nächste freie: 301 (109 Geometry-Stage, 110 Tessellation, 111 Bind-Tabelle, 112 Blend je Attachment, 113 Stencil, 114 uint16-Indices, 115 GPU-Zeit, 116 Shader-Cache, 117 Frame-Latenz, 118 HDR10, 119 Shader Model 6, 120 Indirect Draw, 121 Texture-Arrays/BC/KTX2, 122 Variable Rate Shading, 123 Vulkan-3D-Konventionen, 124 MRT-Formate + Textur-Mips, 125 Compute-Buffer: beschreibbare data-Buffer, Slot-Rebind, Update mit Offset, 126 Async-Compute: Params je Dispatch, 127 Text-Bitmap über VioFontFace, 128 Währungs-Glyphen im Font-Atlas, 129 Fenstergröße-Round-Trip, 130 gepackte Uniforms, 131 Input-Injection über den OS-Eventpfad, 132 virtuelle Gamepads, 133 Input-Record/Replay, 134 Replay verwirft OS-Input, 135 GS/Tess auf allen Draw-Pfaden + Cache, 136 Layered Render-Targets, 137 Layered Rendering, 138 mehrere Viewports, 139 GS-Instancing + Adjacency, 140 HLSL-Stage-Override, 141 Vergleichs-Sampler, 142 RT-Rebind behält Inhalt, 143 GS mit `gl_in`/`gl_InvocationID`, 144 Tessellations-Konventionen, 145 Mipmaps im Frame, 146 Uniform-Array-Elemente, 147 Stencil in Layered/depth_only-RTs, 148 point_mode + Fractional-Isolines, 149 Subgroup-Operationen, 150 Metal-Versionsleiter, 151 Rendering je MSL-Stufe, 152 Quad-Operationen, 153 Barycentrics, 154 64-Bit-Atomics, 155 Float16, 156 Draw-Parameter, 157 Compute-Derivate, 158 Multiview, 159 Shading-Rate pro Primitiv, 160 Shading-Rate-Bild, 161 Bindless, 162 Mesh-Shader, 163 Ray Query, 164 Raytracing-Pipeline, 165 Sampler Feedback, 166 Work Graphs, 167 kooperative Matrizen, 169 `vio_submit_batch`-Parität, 170 Shader Model festlegen, 171 nativ/emuliert je Feature, 172 benannte GPU-Zeitmarken, 173 Pipeline über die Frame-Grenze, 174 Input-Layout aus dem Mesh, 175 Uniform-Buffer für Grafik-Shader, 176 Bindless-Slot freigeben, 177 Bindless-Sampler-Varianten, 178 Bindless-Cubes/-Arrays, 179 Bindless in Compute, 180 getrennte Texturen/Sampler, 181 Draw-Parameter unter SM 6.8, 182 Multiview per Instancing, 183 Multiview mit GS/Tess, 184 `vio_backend_info` auf allen Backends, 185 `vio_adapters`, 186 Scoring für `auto`, 187 Kalibrierlauf, 188 Readback des neuesten Frames, 189 Glyph-Atlas bei Bedarf, 190 KTX2-Cubemaps/-3D, 191 ASTC, 192 Vertikaltext, 193 Tiefen-Mips, 194 MSAA-MRT, 195 MSAA-Cube/-Array, 196 MSAA-Depth-only, 197 Texturen in Mesh-/Task-Stages, 198 Tess-Varyings, 199 TLAS-Update, 200 RT-Gruppen + Records, 201 RT-Texturen, 202 Trace im Frame, 203 Fragment-Storage, 204 Sampler-Feedback aus GLSL, 205 Lücken der Geometry-Stage, 206 Pass-Wechsel / Vulkan-Kern, 212 Audit-Gate Plattformschicht, 213 Win32-Plattform, 214 X11-Plattform, 215 Wayland-Plattform, 216 Long Vectors, 217 RT-Wechsel ohne Unbind, 218 Float16-Sonderwerte, 219 SER, 220 Opacity Micromaps, 221 D3D12-Capture mitten im Frame, 222 MRT mit 8 Attachments, 223 Tiefe eines Farb-Targets, 224 Raw-Readback, 225 RT als Storage-Image, 226 Upscaler ohne Laufzeit, 227 FSR-3.1-Konvergenz, 228 Upscaler-Lebenszyklus, 229 DLSS ohne Laufzeit, 230/231/233 DLSS-Konvergenz/-Lebenszyklus/-Preset (jetzt im Repo php-vio-dlss), 232 Vulkan: kein Sampler auf einem Anhang des offenen Passes, 234 Upscaler-Plugin fehlt, 235 Plugin-ABI abgelehnt, 236 Test-Plugin Ende zu Ende, 237 viele Compute-Dispatches pro Frame, 238 viele Mipmap-Erzeugungen pro Frame, 246 Audit-Gate miniaudio-Namensraum, 247 Stub-Parität + Keypad-Konstanten, 250 viele `vio_update_buffer` pro Frame, 251 HDR-Komposit, 252 Micromap-Baker, 253 Freigabe im laufenden Frame, 254 Upscaler-Vorbereitung auf dem Worker, 255 UTF-8-Pfade der Upscaler, 256 ausdrückliches Präsentieren, 257 Sampler-Aufteilung, 258 Clear im Frame merkt keine Farbe, 259 Cubemap auf beliebiger Unit, 260 Sampler-Units wie GL, 261 `vio_wait_events`/`vio_wake`, 262 Fenster-Ereignisse, 263 Fenster-Details, 264 URL öffnen / Datei zeigen, 265 Datei-Drop, 266 Dialoge, 267 Menüs, 268 Benachrichtigungen/Fortschritt/Portal, 269 Tray, 270 IME-Komposition, 271 mehrere Fenster, 272 Unterfenster, 273 Barrierefreiheit, 274 Cocoa ohne Akzent-Wähler beim Halten, 275 Instanzpuffer je Gerät, 276 RT-Anlegen im Frame, 277 Textur-Units nach den Grenzen des Backends, 278 Uniform-Blöcke über den alten Grenzen, 279 Storage-Buffer in Mesh-/Task-Stages, 280 anisotroper Bindless-Sampler, 281 Bindless in Mesh-Pipelines, 282 `adapter`-Option, 283 Storage-vec4-Arrays auf D3D-Hardware, 284 SDF-Font, 285 Buffer + 13 Sampler (Metal-Tabellen), 286 D3D12-SRV-Deskriptoren: Freigabe und volle Frames, 287 Texturtabelle bei Indirect- und Storage-Draws, 292–299 System-Webview, 300 lose Uniforms je Stage)), headless OpenGL für GPU-Tests (`../skipif_gl.inc`), Backend-spezifische Tests skippen sauber wenn das Backend fehlt.
 - **Audit-Gate**: `tests/core/070_audit_gate_no_gl_outside_backend.phpt` — kein `glXxx()`/`GL_*` außerhalb `src/backends/opengl/`.
 - **Audit-Gate Plattform**: `tests/core/212_audit_gate_no_glfw_outside_platform.phpt` — kein `glfwXxx`/`GLFW_*` außerhalb
   `src/platform/glfw/`. Fenster, Input, Monitore, Gamepads, GL-Kontext und Vulkan-Surface laufen über die
@@ -1672,7 +1676,7 @@ gibt beim späten Freigeben nicht mehr die Textur des nächsten Kontexts frei (T
   weston (Wayland, pixman).
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
-- **2D Farben**: ARGB als uint32 (0xAARRGGBB), z.B. `0xFF0000FF` = rot, alpha=FF.
+- **2D Farben**: ARGB als uint32 (0xAARRGGBB), z.B. `0xFFFF0000` = rot, alpha=FF (`0xFF0000FF` ist deckendes Blau, `0x00FF00FF` unsichtbar).
 
 ## Pläne & Roadmap
 
@@ -1719,7 +1723,7 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   Device (Test 238). Gemessen (Headless, 256²-Texturen, Median): RTX 2080 21/48/96 Aufrufe 0,47–0,57/0,91–1,16/1,70–2,16 ms
   pro Frame, im Rauschen gleich wie vorher; WARP linear ~0,15 ms je Aufruf.
 - **Sampler-Aufteilung, ausdrückliches Präsentieren, Clip-Z auf Metal (Anforderung aus Code Rescue, 2026-11-02).**
-  (1) Normale Sampler 0..11, Vergleichs-Sampler 12..15 (`VIO_SHADOW_SAMPLER_BASE`/`_END` in `vio_shader_reflect.h`;
+  (1) **Überholt seit 2.42 (SAMPLER-LIMITS-PLAN):** die feste Aufteilung gibt es nicht mehr, jede Unit sampelt normal oder vergleichend, die Zahl der Units kommt vom Backend (`vio_texture_units`); `vio_backend_info()['samplers']` meldet `total` = `regular` = `comparison`, `comparison_base` = 0, dazu `textures` und `sampler_states`. Damals: normale Sampler 0..11, Vergleichs-Sampler 12..15 (`VIO_SHADOW_SAMPLER_BASE`/`_END` in `vio_shader_reflect.h`;
   HLSL-Register, Sampler-Plan, Replay in `php_vio.c`, Vulkan-Bindings, D3D12-Sampler-Table + statische Sampler). 16 bleibt
   die Obergrenze, weil D3D11 und Metal je Stage nur 16 Sampler binden; `vio_backend_info()['samplers']` meldet `total`,
   `regular`, `comparison`, `comparison_base` (Vtable `shadow_sampler_base`). Test 257.
@@ -1871,8 +1875,8 @@ Aufrufer geändert hat:
   `generate_mipmaps`, `read_render_target`, `upload_cubemap`, `update_texture`).
 - **D3D12-Sampler**: `filter`/`wrap`/`anisotropy` einer Textur werden honoriert (vorher 8
   statische LINEAR/WRAP-Sampler). Root-Param [4] ist eine Sampler-Table s0–s11, gefüllt aus
-  einem Kombi-Heap (`vio_d3d12_sampler_combo()`), Shadow-Comparison-Sampler bleiben statisch
-  auf s12–s15 (`VIO_SHADOW_SAMPLER_BASE`, bis 2.39: s0–s7 / s8–s11). Wer `pending_srvs` schreibt, nimmt `vio_d3d12_bind_srv_slot()`; wer Heaps
+  einem Kombi-Heap (`vio_d3d12_sampler_combo()`), Shadow-Comparison-Sampler blieben bis 2.41 statisch
+  auf s12–s15 (bis 2.39: s0–s7 / s8–s11); seit 2.42 kommt auch der Vergleichs-Sampler aus dem Kombi-Heap, statische Sampler in Space 0 gibt es nicht mehr (SAMPLER-LIMITS-PLAN). Wer `pending_srvs` schreibt, nimmt `vio_d3d12_bind_srv_slot()`; wer Heaps
   bindet, nimmt `vio_d3d12_bind_graphics_heaps()`.
 - **`vio_texture(['anisotropy' => 1..16])`** auf D3D11, D3D12, Vulkan (`samplerAnisotropy`
   wird aktiviert, wenn vorhanden), OpenGL (`GL_TEXTURE_MAX_ANISOTROPY`) und Metal
@@ -2011,8 +2015,8 @@ Aufrufer geändert hat:
 - VideoToolbox-Encoder kann in headless fehlschlagen → Fallback auf libx264
 - `php_vio.c` ist monolithisch (~9050 Zeilen) — alle PHP-Funktionen in einer Datei; Audit-Gate
   `099` hält die Zahl der Backend-Zweige darin auf dem heutigen Stand oder darunter.
-- SPIRV-Cross hat keine Homebrew-Formel; ohne `--with-spirv-cross` kann Metal kein
-  GLSL→MSL übersetzen und jeder Shader scheitert (`Makefile.macos` baut es aus `.deps/`).
+- Ohne `--with-spirv-cross` kann Metal kein
+  GLSL→MSL übersetzen und jeder Shader scheitert (Homebrew-Formel `spirv-cross` wie in der CI, oder lokal aus `.deps/` über `Makefile.macos`).
 - SPIRV-Cross vor `vulkan-sdk-1.4.363.0` hat den Struct-Array-Stride-Bug im MSL-Backend
   (siehe Build); Test 094 schlägt dort auf Metal fehl. Seit Homebrew `spirv-cross` 1.4.363.0
   läuft 094 in der macOS-CI wieder mit (der frühere Skip `VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST`

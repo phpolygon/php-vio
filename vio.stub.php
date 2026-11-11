@@ -8,15 +8,16 @@
 /**
  * Create a new VIO rendering context.
  *
- * @param string $backend Backend name ("auto", "opengl", "vulkan", "metal", "null")
+ * @param string $backend Backend name ("auto", "opengl", "vulkan", "metal", "d3d11", "d3d12", "null")
  * @param array $options Configuration options (width, height, title, vsync, samples, debug,
  *                       headless, frame_count, shader_cache => directory for the on-disk shader /
  *                       pipeline cache: DXBC per HLSL stage on D3D11/D3D12, OpenGL >= 4.1 program
  *                       binaries, the Vulkan pipeline cache — a warm start skips the compiles,
  *                       frame_latency => 1..16: waitable swapchain capping the CPU's run-ahead,
- *                       1 = lowest input latency; D3D11 / D3D12, 0 / absent = driver default,
- *                       hdr_output => true|1|2: HDR10 backbuffer (RGB10A2, ST 2084) on D3D11 / D3D12 when the
- *                       display is in HDR mode (2 = force); the 2D batch PQ-encodes its output,
+ *                       1 = lowest input latency; D3D11 / D3D12 and Metal (1..3 frames in flight),
+ *                       0 / absent = driver default,
+ *                       hdr_output => true|1|2: HDR10 backbuffer (RGB10A2, ST 2084) on D3D11 / D3D12 / Vulkan /
+ *                       Metal when the display is in HDR mode (2 = force); the 2D batch PQ-encodes its output,
  *                       hdr_paper_white => nits that display white maps to (default 200),
  *                       hdr_composite => true: with HDR10 active (D3D12), draws to the screen blend in an
  *                       SDR layer that vio_end PQ-encodes once, so alpha blending (antialiased text) looks
@@ -39,8 +40,9 @@
  *                       adapter => int|string: the adapter to open - its position in
  *                       vio_adapters()[backend] or part of its name (case-insensitive, e.g. 'Intel').
  *                       D3D11, D3D12 and Vulkan; an explicit choice also keeps headless D3D off WARP
- *                       (choose the software adapter by name for WARP). No match = false with a
- *                       warning. OpenGL and Metal use the system's device.)
+ *                       (choose the software adapter by name for WARP). Metal takes part of the
+ *                       device name (or VIO_METAL_ADAPTER) on Macs with two GPUs. No match = false
+ *                       with a warning. OpenGL uses the system's device.)
  * @return VioContext|false Context object or false on failure
  */
 function vio_create(string $backend = "auto", array $options = []): VioContext|false {}
@@ -69,8 +71,10 @@ function vio_poll_events(VioContext $context): void {}
  * What the active window platform can do (DESKTOP-APP-PLAN):
  * ['name' => 'cocoa', 'wait_events' => bool, 'cursor_shapes', 'custom_cursor',
  *  'window_icon', 'size_limits', 'aspect_ratio', 'floating', 'opacity',
- *  'open_url', 'reveal_file']. A false entry makes the matching call return
- * false without a warning.
+ *  'open_url', 'reveal_file', 'file_drop', 'file_dialog', 'message_box',
+ *  'menu_bar', 'popup_menu', 'notifications', 'progress', 'tray', 'ime_preedit',
+ *  'window_parent', 'accessibility']. A false entry makes the matching call
+ * return false without a warning.
  *
  * @return array<string, string|bool>
  */
@@ -137,7 +141,7 @@ function vio_reveal_file(string $path): bool {}
 /**
  * Show the system's file dialog (modal) and return the chosen paths, null when
  * the user cancels, false when the platform has none (vio_platform_info()
- * ['file_dialog']; Linux comes with the portal in a later phase).
+ * ['file_dialog']; Linux needs the FileChooser portal on the session bus).
  *
  * Options: 'mode' => 'open' (default) | 'save' | 'folder', 'multiple' => bool
  * (open/folder), 'title' => string, 'default_path' => a folder or (save) a
@@ -1819,7 +1823,7 @@ function vio_backends(): array {}
 
 /**
  * The window system vio runs on (OPEN-ITEMS A1, NATIVE-PLATFORM-PLAN): "glfw", a native
- * layer ("win32", "cocoa", "x11") or "null" (no window system: headless / offscreen only).
+ * layer ("win32", "cocoa", "x11", "wayland") or "null" (no window system: headless / offscreen only).
  * VIO_PLATFORM=<name> in the environment picks one of the built-in platforms.
  */
 function vio_platform(): string {}

@@ -438,6 +438,37 @@ char *vio_spirv_to_glsl(const uint32_t *spirv, size_t spirv_size, int version, c
     /* GLSL for OpenGL has no separate textures / samplers. */
     vio_spvc_combine_separate(compiler);
 
+    /* A flattened block without an instance name (glslang's gl_DefaultUniformBlock,
+     * `uniform Block { ... };`) becomes `uniform <Struct> _<id>;`, named after its
+     * SPIR-V id. Two stages whose ids happen to coincide then declare the same
+     * uniform with different struct types and the program does not link ("struct
+     * fields mismatch between shaders for uniform (named _16)"). Name them per
+     * stage; opengl_set_uniform resolves members by their `.name` suffix. */
+    {
+        const char *tag;
+        switch (spvc_compiler_get_execution_model(compiler)) {
+            case SpvExecutionModelVertex:                 tag = "vs";  break;
+            case SpvExecutionModelTessellationControl:    tag = "tcs"; break;
+            case SpvExecutionModelTessellationEvaluation: tag = "tes"; break;
+            case SpvExecutionModelGeometry:               tag = "gs";  break;
+            case SpvExecutionModelFragment:               tag = "fs";  break;
+            default:                                      tag = "st";  break;
+        }
+        spvc_resources res = NULL;
+        const spvc_reflected_resource *ubos = NULL;
+        size_t ubo_count = 0;
+        if (spvc_compiler_create_shader_resources(compiler, &res) == SPVC_SUCCESS &&
+            spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, &ubos, &ubo_count) == SPVC_SUCCESS) {
+            for (size_t i = 0; i < ubo_count; i++) {
+                const char *inst = spvc_compiler_get_name(compiler, ubos[i].id);
+                if (inst && inst[0]) continue;   /* the shader named the instance itself */
+                char unique[48];
+                snprintf(unique, sizeof(unique), "vio_%s_u%u", tag, (unsigned)i);
+                spvc_compiler_set_name(compiler, ubos[i].id, unique);
+            }
+        }
+    }
+
     if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS) {
         if (error_msg) *error_msg = strdup(spvc_context_get_last_error_string(ctx));
         spvc_context_destroy(ctx);
