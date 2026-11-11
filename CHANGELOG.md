@@ -1,3 +1,24 @@
+## [2.44.1](https://github.com/phpolygon/php-vio/compare/v2.44.0...v2.44.1) (2026-11-11)
+
+
+### Bug Fixes
+
+* **d3d12:** hull shaders from GLSL keep their state local under Shader Model 6 ([1fde331](https://github.com/phpolygon/php-vio/commit/1fde33108b827e444b14ef827296923afb424507))
+* **metal:** tessellation control points keep the writer's layout without gl_in reads ([5de414b](https://github.com/phpolygon/php-vio/commit/5de414bc26e1be42caad6681f520be4fdd1d68a0))
+
+# [2.44.0](https://github.com/phpolygon/php-vio/compare/v2.43.1...v2.44.0) (2026-11-10)
+
+
+### Bug Fixes
+
+* **metal:** run on Mac1-only GPUs and around Intel Mac driver faults ([74d4e6b](https://github.com/phpolygon/php-vio/commit/74d4e6b25812886e6200b01fd78f3717d23e8949))
+* **opengl:** per-program caches do not outlive their context ([6519688](https://github.com/phpolygon/php-vio/commit/6519688f447a2cc1c580323e6566e8b960aa8c3e))
+
+
+### Features
+
+* **metal:** choose the adapter with 'adapter' / VIO_METAL_ADAPTER ([bccc674](https://github.com/phpolygon/php-vio/commit/bccc674a21dd6392c3b815bab7570a17ba75593f))
+
 ## [2.43.1](https://github.com/phpolygon/php-vio/compare/v2.43.0...v2.43.1) (2026-11-09)
 
 

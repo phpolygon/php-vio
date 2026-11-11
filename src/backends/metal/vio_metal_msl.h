@@ -166,6 +166,11 @@ typedef struct _vio_metal_tess_info {
     size_t cp_stride;        /* one TCS output control point */
     size_t patch_stride;     /* one TCS patch record */
     size_t tes_out_stride;   /* one TES output vertex (isolines / point_mode capture) */
+    /* Set while translating the VS kernel and then the TCS, read by the next
+     * stage: whether the writer has gl_Position in its record, and one past
+     * its highest per-vertex output location. */
+    int    prev_writes_position;
+    int    prev_out_locations;
 } vio_metal_tess_info;
 
 #ifdef HAVE_SPIRV_CROSS
@@ -225,6 +230,33 @@ static size_t metal_varying_bytes(spvc_compiler compiler, spvc_type_id type_id, 
         elem = column * (columns > 0 ? columns : 1);
     }
     return elem * count;
+}
+
+/* One past the highest location the per-vertex outputs of a VS kernel / TCS
+ * take (matrices one location per column, arrays one per element; `arrayed`
+ * strips the per-control-point array of the TCS outputs). */
+static int metal_output_locations(spvc_compiler compiler, spvc_resources resources, int arrayed)
+{
+    const spvc_reflected_resource *list = NULL;
+    size_t count = 0;
+    int end = 0;
+    spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STAGE_OUTPUT, &list, &count);
+    for (size_t i = 0; i < count; i++) {
+        if (spvc_compiler_has_decoration(compiler, list[i].id, SpvDecorationPatch)) continue;
+        if (!spvc_compiler_has_decoration(compiler, list[i].id, SpvDecorationLocation)) continue;
+        spvc_type type = spvc_compiler_get_type_handle(compiler, list[i].type_id);
+        unsigned dims = spvc_type_get_num_array_dimensions(type);
+        int n = (int)(spvc_type_get_columns(type) > 0 ? spvc_type_get_columns(type) : 1);
+        /* SPIRV-Cross lists array dimensions innermost first. */
+        for (unsigned d = 0; d < dims; d++) {
+            if (arrayed && d == dims - 1) continue;
+            SpvId len = spvc_type_get_array_dimension(type, d);
+            if (spvc_type_array_dimension_is_literal(type, d) && len > 0) n *= (int)len;
+        }
+        int loc = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationLocation) + n;
+        if (loc > end) end = loc;
+    }
+    return end;
 }
 
 /* Upper bound of one output record of a VS kernel / TCS: the stage outputs
@@ -755,6 +787,32 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
                 vl->vertex_stride += in->components * in->columns * (int)sizeof(float);
             }
         }
+    }
+
+    if (stage == VIO_MSL_TESS_CONTROL || stage == VIO_MSL_TESS_EVAL) {
+        /* The control points arrive as structs in a buffer, laid out from the
+         * inputs this stage uses; the previous stage's record has gl_Position
+         * behind its varyings. A stage that does not read gl_in[].gl_Position
+         * gets a 16-byte pad at that place, so its struct has the writer's size
+         * (test 290: the TES read every control point but the first from the
+         * wrong offset and drew nothing). */
+        spvc_compiler_update_active_builtins(compiler);
+        if (tess->prev_writes_position &&
+            !spvc_compiler_has_active_builtin(compiler, SpvBuiltInPosition, SpvStorageClassInput)) {
+            spvc_msl_shader_interface_var_2 pad;
+            spvc_msl_shader_interface_var_init_2(&pad);
+            pad.location = (unsigned)tess->prev_out_locations;
+            pad.format   = SPVC_MSL_SHADER_VARIABLE_FORMAT_ANY32;
+            pad.vecsize  = 4;
+            pad.rate     = SPVC_MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+            spvc_compiler_msl_add_shader_input_2(compiler, &pad);
+        }
+    }
+    if (stage == VIO_MSL_VERTEX_TESS || stage == VIO_MSL_TESS_CONTROL) {
+        /* What the next stage's input struct has to match (see above). */
+        spvc_compiler_update_active_builtins(compiler);
+        tess->prev_writes_position = spvc_compiler_has_active_builtin(compiler, SpvBuiltInPosition, SpvStorageClassOutput) ? 1 : 0;
+        tess->prev_out_locations = metal_output_locations(compiler, resources, stage == VIO_MSL_TESS_CONTROL);
     }
 
     if (stage == VIO_MSL_VERTEX_TESS) {
