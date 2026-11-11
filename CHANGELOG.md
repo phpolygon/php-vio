@@ -1,3 +1,19 @@
+# [2.45.0](https://github.com/phpolygon/php-vio/compare/v2.44.2...v2.45.0) (2026-11-11)
+
+
+### Bug Fixes
+
+* **webview:** stream bodies may close their webview, queries start no engine ([579f952](https://github.com/phpolygon/php-vio/commit/579f952b3e47179d379886823f2b040f7b0fd2a9))
+
+
+### Features
+
+* **desktop:** Add a system webview with a PHP scheme handler on macOS ([97e1794](https://github.com/phpolygon/php-vio/commit/97e1794e4791abb75830551f9275337abaa67e9c)), closes [#120](https://github.com/phpolygon/php-vio/issues/120)
+* **desktop:** Add the Linux webview on WebKitGTK ([20630ad](https://github.com/phpolygon/php-vio/commit/20630ad79af60085fce746388879fc05ae13f02b)), closes [#120](https://github.com/phpolygon/php-vio/issues/120)
+* **desktop:** Add WPE WebKit to the Linux webview, test X11 input ([8b53f40](https://github.com/phpolygon/php-vio/commit/8b53f40bc8f574181b2774624b2cf809fd73f051)), closes [#120](https://github.com/phpolygon/php-vio/issues/120)
+* **desktop:** Follow redirects on webview schemes, add webview examples ([67ae04a](https://github.com/phpolygon/php-vio/commit/67ae04ad8dc138dc7689d1fabf6979d691273079)), closes [#120](https://github.com/phpolygon/php-vio/issues/120)
+* **desktop:** Keep webview cookies in vio and test streaming and layout ([f45122e](https://github.com/phpolygon/php-vio/commit/f45122e926286648d98a26c27588b49f78f0512f)), closes [#120](https://github.com/phpolygon/php-vio/issues/120)
+
 ## [2.44.2](https://github.com/phpolygon/php-vio/compare/v2.44.1...v2.44.2) (2026-11-11)
 
 
