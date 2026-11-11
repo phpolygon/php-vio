@@ -4,8 +4,8 @@
 
 Eine PHP C-Extension die GPU-Rendering (OpenGL 3.0–4.6, Vulkan, Metal, Direct3D 11/12),
 Audio, Video-Recording, Streaming und Input in PHP verfügbar macht. Basis-Infrastruktur
-für die PHPolygon Game Engine. Aktuell **v2.30.0**, 272 PHP-Funktionen, 19 Zend-Klassen,
-6 Backends, 293 PHPT-Tests. Releases laufen über semantic-release
+für die PHPolygon Game Engine. Aktuell **v2.30.0**, 273 PHP-Funktionen, 20 Zend-Klassen,
+6 Backends, 294 PHPT-Tests. Releases laufen über semantic-release
 (`.github/workflows/release.yml`, Conventional Commits → `CHANGELOG.md`).
 
 ## Build
@@ -122,7 +122,7 @@ SHADING_RATE_PRIMITIVE,SHADING_RATE_IMAGE,BINDLESS,MESH_SHADER,RAY_QUERY,RAYTRAC
 mit `-d vio.debug=1` (D3D12-Debug-Layer, Vulkan-Validation): mehrere Befunde zeigten sich nur dort. Die
 Vulkan-Synchronisations-Validierung ist im Layer standardmäßig aus: `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` setzen.
 
-293 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
+294 PHPT-Tests, nach Themen in Unterordnern (`run-tests.php` rekursiert):
 
 | Ordner | Inhalt |
 |---|---|
@@ -703,7 +703,7 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
   Command-Buffer jedes Frames beim Abschluss signalisiert; `vio_swapchain_info()` meldet beides.
 - Tests: `tests/backends/089_metal_3d_pipeline.phpt` (Pixel-Kontrakt), `088` läuft jetzt auch auf Metal.
 
-### Zend-Objekte (19 Klassen)
+### Zend-Objekte (20 Klassen)
 
 | Klasse | Header | Zweck |
 |--------|--------|-------|
@@ -722,6 +722,8 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
 | VioWorkGraph | src/vio_work_graph.h | Work Graph (D3D12, SM 6.8): State Object + Backing Memory, gebundene Storage-Buffer (`vio_work_graph`) |
 | VioUpscaler | src/upscale/vio_upscaler.h | Natives Upscaler-Kontext (FSR 3.1): Provider-Kontext + Beschreibung, Live-Liste (vor dem Geräte-Shutdown abgeräumt) |
 | VioFont | src/vio_font.h | TTF-Font (stb_truetype Atlas, glyph-index-keyed mit HarfBuzz) |
+| VioFontFace | src/vio_font.h | Font-Datei ohne Kontext und Atlas für `vio_text_bitmap` (`vio_font_face`) |
+| VioBundle | src/vio_bundle.h | Aufgezeichnete Draw-Folge (`vio_bundle` / `vio_draw_bundle`): hält die Objekte seiner Records, native Aufnahme je Attachment-Signatur |
 | VioSound | src/vio_audio.h | Audio-Quelle (miniaudio) |
 | VioRecorder | src/vio_recorder.h | Video-Encoder (FFmpeg) |
 | VioStream | src/vio_stream.h | Network-Stream (FFmpeg RTMP/SRT) |
@@ -734,7 +736,7 @@ Alle folgen dem gleichen Muster: `zend_object std` als letztes Feld, `Z_VIO_*_P(
 php_vio.c                   # Alle PHP-Funktionen (~9000 Zeilen, monolithisch)
 php_vio.h                   # Module-Globals (default_backend, debug, vsync)
 php_vio_arginfo.h           # Arginfo + Funktionstabelle (generiert aus vio.stub.php)
-vio.stub.php                # PHP-Stubs für IDE-Support (207 Funktionen)
+vio.stub.php                # PHP-Stubs für IDE-Support (273 Funktionen)
 config.m4 / config.w32      # Autotools- bzw. Windows-Build-Konfiguration
 configure.ac                # PHP-freier Autotools-Einstieg (CI-Permutationen)
 CMakeLists.txt              # IDE-Support (CLion/PhpStorm), kein Release-Build
@@ -860,7 +862,7 @@ static-php-cli vios `vendor/*`-Quellen streicht, die php-glfw auch mitbringt. Fe
 Build, scheitert der Link an `vio_ma_*` statt still umzubinden; `vio_audio_engine_init()`
 prüft zusätzlich `ma_version()` gegen den Header und verweigert Audio bei Abweichung.
 
-## PHP API (272 Funktionen)
+## PHP API (273 Funktionen)
 
 Vollständige Signaturen in `vio.stub.php`. Die Beispiele hier zeigen die Gruppen.
 
@@ -1642,7 +1644,7 @@ gibt beim späten Freigeben nicht mehr die Textur des nächsten Kontexts frei (T
   weston (Wayland, pixman).
 - **Metal-Objekte in C-Structs**: als `CFBridgingRetain`'d `void *` halten, in den destroy-Hooks `CFRelease`n (ARC trackt keine Refs in C-Structs).
 - **Commits**: Conventional Commits (`feat(scope):`, `fix(scope):`, …) — semantic-release leitet daraus Version + CHANGELOG ab.
-- **2D Farben**: ARGB als uint32 (0xAARRGGBB), z.B. `0xFF0000FF` = rot, alpha=FF.
+- **2D Farben**: ARGB als uint32 (0xAARRGGBB), z.B. `0xFFFF0000` = rot, alpha=FF (`0xFF0000FF` ist deckendes Blau, `0x00FF00FF` unsichtbar).
 
 ## Pläne & Roadmap
 
@@ -1689,7 +1691,7 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   Device (Test 238). Gemessen (Headless, 256²-Texturen, Median): RTX 2080 21/48/96 Aufrufe 0,47–0,57/0,91–1,16/1,70–2,16 ms
   pro Frame, im Rauschen gleich wie vorher; WARP linear ~0,15 ms je Aufruf.
 - **Sampler-Aufteilung, ausdrückliches Präsentieren, Clip-Z auf Metal (Anforderung aus Code Rescue, 2026-11-02).**
-  (1) Normale Sampler 0..11, Vergleichs-Sampler 12..15 (`VIO_SHADOW_SAMPLER_BASE`/`_END` in `vio_shader_reflect.h`;
+  (1) **Überholt seit 2.42 (SAMPLER-LIMITS-PLAN):** die feste Aufteilung gibt es nicht mehr, jede Unit sampelt normal oder vergleichend, die Zahl der Units kommt vom Backend (`vio_texture_units`); `vio_backend_info()['samplers']` meldet `total` = `regular` = `comparison`, `comparison_base` = 0, dazu `textures` und `sampler_states`. Damals: normale Sampler 0..11, Vergleichs-Sampler 12..15 (`VIO_SHADOW_SAMPLER_BASE`/`_END` in `vio_shader_reflect.h`;
   HLSL-Register, Sampler-Plan, Replay in `php_vio.c`, Vulkan-Bindings, D3D12-Sampler-Table + statische Sampler). 16 bleibt
   die Obergrenze, weil D3D11 und Metal je Stage nur 16 Sampler binden; `vio_backend_info()['samplers']` meldet `total`,
   `regular`, `comparison`, `comparison_base` (Vtable `shadow_sampler_base`). Test 257.
@@ -1838,8 +1840,8 @@ Aufrufer geändert hat:
   `generate_mipmaps`, `read_render_target`, `upload_cubemap`, `update_texture`).
 - **D3D12-Sampler**: `filter`/`wrap`/`anisotropy` einer Textur werden honoriert (vorher 8
   statische LINEAR/WRAP-Sampler). Root-Param [4] ist eine Sampler-Table s0–s11, gefüllt aus
-  einem Kombi-Heap (`vio_d3d12_sampler_combo()`), Shadow-Comparison-Sampler bleiben statisch
-  auf s12–s15 (`VIO_SHADOW_SAMPLER_BASE`, bis 2.39: s0–s7 / s8–s11). Wer `pending_srvs` schreibt, nimmt `vio_d3d12_bind_srv_slot()`; wer Heaps
+  einem Kombi-Heap (`vio_d3d12_sampler_combo()`), Shadow-Comparison-Sampler blieben bis 2.41 statisch
+  auf s12–s15 (bis 2.39: s0–s7 / s8–s11); seit 2.42 kommt auch der Vergleichs-Sampler aus dem Kombi-Heap, statische Sampler in Space 0 gibt es nicht mehr (SAMPLER-LIMITS-PLAN). Wer `pending_srvs` schreibt, nimmt `vio_d3d12_bind_srv_slot()`; wer Heaps
   bindet, nimmt `vio_d3d12_bind_graphics_heaps()`.
 - **`vio_texture(['anisotropy' => 1..16])`** auf D3D11, D3D12, Vulkan (`samplerAnisotropy`
   wird aktiviert, wenn vorhanden), OpenGL (`GL_TEXTURE_MAX_ANISOTROPY`) und Metal
@@ -1978,8 +1980,8 @@ Aufrufer geändert hat:
 - VideoToolbox-Encoder kann in headless fehlschlagen → Fallback auf libx264
 - `php_vio.c` ist monolithisch (~9050 Zeilen) — alle PHP-Funktionen in einer Datei; Audit-Gate
   `099` hält die Zahl der Backend-Zweige darin auf dem heutigen Stand oder darunter.
-- SPIRV-Cross hat keine Homebrew-Formel; ohne `--with-spirv-cross` kann Metal kein
-  GLSL→MSL übersetzen und jeder Shader scheitert (`Makefile.macos` baut es aus `.deps/`).
+- Ohne `--with-spirv-cross` kann Metal kein
+  GLSL→MSL übersetzen und jeder Shader scheitert (Homebrew-Formel `spirv-cross` wie in der CI, oder lokal aus `.deps/` über `Makefile.macos`).
 - SPIRV-Cross vor `vulkan-sdk-1.4.363.0` hat den Struct-Array-Stride-Bug im MSL-Backend
   (siehe Build); Test 094 schlägt dort auf Metal fehl. Seit Homebrew `spirv-cross` 1.4.363.0
   läuft 094 in der macOS-CI wieder mit (der frühere Skip `VIO_SKIP_SPIRV_CROSS_LAYOUT_TEST`
