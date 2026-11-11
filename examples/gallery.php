@@ -1244,5 +1244,522 @@ HLSL;
     vio_save_screenshot($ctx, $out);
 }, ['shader_model' => 6]);
 
+/* ── Helpers of the scenes below ────────────────────────────────────── */
+/* Pipeline from #version 450 GLSL that goes through SPIR-V on every backend
+ * (pipe() hands the source to the driver as it is on OpenGL). */
+function pipe_spv(VioContext $ctx, array $stages, array $opts = []): VioPipeline {
+    $sh = vio_shader($ctx, $stages);
+    if (!$sh) throw new RuntimeException('shader failed');
+    $p = vio_pipeline($ctx, ['shader' => $sh] + $opts + ['depth_test' => false, 'cull_mode' => VIO_CULL_NONE]);
+    if (!$p) throw new RuntimeException('pipeline failed');
+    return $p;
+}
+/* A render target's pixels as an opaque, nearest-filtered texture, so a sprite
+ * can show them magnified pixel by pixel. vio_read_render_target() returns the
+ * top row first on every backend. */
+function rt_snapshot(VioContext $ctx, VioRenderTarget $rt, int $w, int $h, int $layer = -1): VioTexture {
+    $px = vio_read_render_target($rt, $layer);
+    if (!is_string($px) || strlen($px) !== $w * $h * 4) throw new RuntimeException('render target readback');
+    $px |= str_repeat("\x00\x00\x00\xFF", $w * $h);
+    return vio_texture($ctx, ['data' => $px, 'width' => $w, 'height' => $h, 'filter' => VIO_FILTER_NEAREST]);
+}
+function hue_rgb(float $h, float $s = 1.0, float $v = 1.0): array {
+    $c = [];
+    foreach ([0.0, 2 / 3, 1 / 3] as $o) {
+        $k = abs(fmod($h + $o, 1.0) * 6.0 - 3.0) - 1.0;
+        $c[] = $v * (1.0 - $s + $s * max(0.0, min(1.0, $k)));
+    }
+    return $c;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Upscaling — the same picture from half the resolution
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('upscaling', [VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_RENDER_TARGET, VIO_FEATURE_RENDER_TARGET_HDR], function (VioContext $ctx, string $out) {
+    $LW = 38; $LH = 76; $HW = 76; $HH = 152;   // source and display size; the panels show the display size 2x
+    /* An analytic picture (from NDC, so every resolution samples the same one)
+     * with detail finer than the source grid: rings, spokes, thin lines. */
+    $vs = "#version 450\nlayout(location=0) in vec2 aPos;\nlayout(location=0) out vec2 ndc;\nuniform vec2 u_jitter;\n"
+        . "void main(){ ndc = aPos; gl_Position = vec4(aPos + u_jitter, 0.0, 1.0); }";
+    $fs = <<<'GLSL'
+#version 450
+layout(location=0) in vec2 ndc;
+layout(location=0) out vec4 o;
+void main() {
+    vec2 p = ndc * vec2(0.5, 1.0);
+    vec3 c = mix(vec3(0.07, 0.09, 0.16), vec3(0.13, 0.17, 0.28), step(0.5, fract((p.x - p.y) * 2.5)));
+    float line = abs(fract((p.x * 0.6 + p.y) * 7.0) - 0.5);
+    c = mix(c, vec3(0.35, 0.90, 0.70), step(line, 0.09));
+    vec2 q = p - vec2(0.0, 0.52);
+    float r = length(q);
+    if (r < 0.40) c = mix(vec3(0.10, 0.12, 0.20), vec3(0.98, 0.86, 0.32), step(0.5, fract(r * r * 20.0)));
+    q = p - vec2(0.0, -0.50);
+    if (length(q) < 0.40) c = mix(vec3(0.90, 0.24, 0.20), vec3(0.97), step(0.5, fract(atan(q.y, q.x) * 18.0 / 6.2831853)));
+    o = vec4(c, 1.0);
+}
+GLSL;
+    /* bilinear baseline, addressed like vio_upscale (storage row r <- row r) */
+    $fsBi = "#version 450\nlayout(location=0) in vec2 ndc;\nlayout(location=0) out vec4 o;\nuniform sampler2D u_tex;\nuniform vec2 u_dst;\n"
+          . "vec4 t(ivec2 p) { ivec2 s = textureSize(u_tex, 0); return texelFetch(u_tex, clamp(p, ivec2(0), s - 1), 0); }\n"
+          . "void main(){ vec2 p = gl_FragCoord.xy / u_dst * vec2(textureSize(u_tex, 0)) - 0.5; vec2 f = fract(p); ivec2 b = ivec2(floor(p));\n"
+          . "  o = mix(mix(t(b), t(b + ivec2(1, 0)), f.x), mix(t(b + ivec2(0, 1)), t(b + ivec2(1, 1)), f.x), f.y); }";
+    $scene = pipe_spv($ctx, ['vertex' => $vs, 'fragment' => $fs]);
+    $bi = pipe_spv($ctx, ['vertex' => $vs, 'fragment' => $fsBi]);
+    $quad = vio_mesh($ctx, ['vertices' => [-1,-1, 1,-1, 1,1, -1,1], 'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT2]]);
+    $lo = vio_render_target($ctx, ['width' => $LW, 'height' => $LH]);
+    $hi = vio_render_target($ctx, ['width' => $HW, 'height' => $HH]);
+    $draw = function ($rt, int $w, int $h, array $jitter = [0.0, 0.0]) use ($ctx, $scene, $quad) {
+        vio_bind_render_target($ctx, $rt);
+        vio_viewport($ctx, 0, 0, $w, $h);
+        vio_clear($ctx, 0, 0, 0, 1);
+        vio_bind_pipeline($ctx, $scene);
+        vio_set_uniform($ctx, 'u_jitter', [2.0 * $jitter[0] / $w, 2.0 * $jitter[1] / $h]);
+        vio_draw($ctx, $quad);
+    };
+    $frame = function (callable $body) use ($ctx) { vio_begin($ctx); $body(); vio_unbind_render_target($ctx); vio_end($ctx); };
+    $snap = fn() => rt_snapshot($ctx, $hi, $HW, $HH);
+    $panels = [];
+
+    $frame(function () use ($ctx, $draw, $lo, $hi, $bi, $quad, $LW, $LH, $HW, $HH) {
+        $draw($lo, $LW, $LH);
+        vio_bind_render_target($ctx, $hi);
+        vio_viewport($ctx, 0, 0, $HW, $HH);
+        vio_bind_pipeline($ctx, $bi);
+        vio_bind_texture($ctx, vio_render_target_texture($lo), 0);
+        vio_set_uniform($ctx, 'u_tex', 0);
+        vio_set_uniform($ctx, 'u_dst', [(float)$HW, (float)$HH]);
+        vio_set_uniform($ctx, 'u_jitter', [0.0, 0.0]);
+        vio_draw($ctx, $quad);
+    });
+    $panels[] = [$snap(), 'bilinear'];
+
+    $frame(function () use ($ctx, $draw, $lo, $hi, $LW, $LH) {
+        $draw($lo, $LW, $LH);
+        if (!vio_upscale($ctx, $lo, $hi, ['native' => false])) throw new RuntimeException('vio_upscale (spatial)');
+    });
+    $panels[] = [$snap(), 'spatial'];
+
+    $frames = 32;
+    for ($f = 0; $f < $frames; $f++) {
+        $j = vio_upscale_jitter($f, 8);
+        $frame(function () use ($ctx, $draw, $lo, $hi, $LW, $LH, $j, $f) {
+            $draw($lo, $LW, $LH, $j);
+            if (!vio_upscale($ctx, $lo, $hi, ['mode' => VIO_UPSCALE_TEMPORAL, 'jitter' => $j, 'sharpness' => 0.0, 'reset' => $f === 0]))
+                throw new RuntimeException('vio_upscale (temporal)');
+        });
+    }
+    $panels[] = [$snap(), "temporal, $frames frames"];
+
+    $frame(fn() => $draw($hi, $HW, $HH));
+    $panels[] = [$snap(), "rendered at {$HW}x{$HH}"];
+
+    vio_begin($ctx);
+    vio_viewport($ctx, 0, 0, W, H);
+    vio_clear($ctx, 0.05, 0.06, 0.08, 1);
+    foreach ($panels as $i => [$tex, $name]) {
+        $x = 7 + $i * 158;
+        vio_sprite($ctx, $tex, ['x' => $x, 'y' => 48, 'width' => $HW * 2, 'height' => $HH * 2]);
+        label($ctx, $name, $x + 2, 378, $i === 3 ? 0xFFB0BCC8 : 0xFFFFFFFF, 15);
+    }
+    label($ctx, "vio_upscale — a {$LW}x{$LH} source brought to {$HW}x{$HH} (shown 2x)", 12, 30, 0xFFFFFFFF, 16);
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    if (!vio_save_screenshot($ctx, $out)) throw new RuntimeException('screenshot');
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Draw bundle — a static draw sequence recorded once, replayed per frame
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('draw_bundle', [VIO_FEATURE_3D_PIPELINE], function (VioContext $ctx, string $out) {
+    $p = pipe($ctx, VS_LIT, FS_LIT_TEX, ['depth_test' => true]);
+    $cube = mesh_cube($ctx); $sphere = mesh_sphere($ctx, 10, 16);
+    $brick = tex_brick($ctx); $check = tex_checker($ctx, 64, 4, [245, 245, 245], [170, 170, 180], ['mipmaps' => true]);
+    $eye = [0.0, 7.5, 10.5]; $light = [4.0, 9.0, 6.0];
+    $vp = m_mul(m_perspective(deg2rad(40), W / H, 0.1, 60), m_lookat($eye, [0, -0.4, 0], [0, 1, 0]));
+    $records = [];
+    for ($ring = 0; $ring < 10; $ring++) {
+        $n = 16 + $ring * 10; $radius = 1.0 + $ring * 0.62;
+        for ($k = 0; $k < $n; $k++) {
+            $a = 2 * M_PI * $k / $n + $ring * 0.21;
+            $y = 0.35 * sin($a * 3 + $ring * 0.9) - 0.4;
+            $s = 0.20 + 0.06 * sin($k * 1.7 + $ring);
+            $ball = ($k + $ring) % 3 === 0;
+            $m = m_mul(m_translate($radius * cos($a), $y, $radius * sin($a)), m_mul(m_rot_y(-$a), m_scale($ball ? $s * 0.8 : $s * 1.3)));
+            /* every record sets every uniform it relies on (the bundle contract) */
+            $records[] = ['mesh' => $ball ? $sphere : $cube, 'pipeline' => $p, 'textures' => [0 => $ball ? $check : $brick],
+                          'uniforms' => ['u_mvp' => m_mul($vp, $m), 'u_model' => $m, 'u_light' => $light, 'u_eye' => $eye,
+                                         'u_tint' => $ball ? hue_rgb($k / $n + $ring * 0.07, 0.75) : [1.0, 1.0, 1.0], 'u_tex' => 0]];
+        }
+    }
+    $bundle = vio_bundle($ctx, $records);
+    if (!$bundle) throw new RuntimeException('vio_bundle failed');
+    $oneByOne = function () use ($ctx, $records) {
+        foreach ($records as $r) {
+            vio_bind_pipeline($ctx, $r['pipeline']);
+            foreach ($r['textures'] as $slot => $t) vio_bind_texture($ctx, $t, $slot);
+            vio_set_uniforms($ctx, $r['uniforms']);
+            vio_draw($ctx, $r['mesh']);
+        }
+    };
+    /* CPU time of the submit, best of a few frames each (the first bundle frame records) */
+    $time = function (callable $body) use ($ctx): float {
+        $best = INF;
+        for ($f = 0; $f < 6; $f++) {
+            vio_begin($ctx);
+            vio_clear($ctx, 0.06, 0.07, 0.10, 1.0);
+            $t = hrtime(true); $body(); $best = min($best, (hrtime(true) - $t) / 1e6);
+            vio_end($ctx);
+        }
+        return $best;
+    };
+    $msSingle = $time($oneByOne);
+    $msBundle = $time(function () use ($ctx, $bundle) { if (!vio_draw_bundle($ctx, $bundle)) throw new RuntimeException('vio_draw_bundle failed'); });
+    $info = vio_bundle_info($bundle);
+    vio_begin($ctx);
+    vio_clear($ctx, 0.06, 0.07, 0.10, 1.0);
+    vio_draw_bundle($ctx, $bundle);
+    label($ctx, sprintf("vio_bundle + vio_draw_bundle — %d draws recorded once, method '%s'", $info['draws'], $info['method']), 12, 28, 0xFFFFFFFF, 16);
+    label($ctx, sprintf('CPU per frame: %.2f ms replayed, %.2f ms issued one by one', $msBundle, $msSingle), 12, 50, 0xFFB0BCC8, 14);
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    if (!vio_save_screenshot($ctx, $out)) throw new RuntimeException('screenshot');
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Mesh shader — a terrain generated meshlet by meshlet, a task stage culls
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('mesh_shader', [VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_MESH_SHADER], function (VioContext $ctx, string $out) {
+    $N = 14;   // meshlets per side; each is a 6x6-quad patch built in the mesh stage
+    $head = "#version 450\n#extension GL_EXT_mesh_shader : require\nlayout(local_size_x = 1) in;\n"
+          . "struct Payload { uint id; };\ntaskPayloadSharedEXT Payload pl;\nconst uint N = {$N}u;\n";
+    $task = $head . <<<'GLSL'
+void main() {
+    uint id = gl_WorkGroupID.x;
+    pl.id = id;
+    vec2 c = (vec2(float(id % N), float(id / N)) + 0.5) / float(N) * 2.0 - 1.0;
+    bool culled = length(c - vec2(0.30, 0.10)) < 0.36;      // the task stage launches no mesh group here
+    EmitMeshTasksEXT(culled ? 0u : 1u, 1u, 1u);
+}
+GLSL;
+    $mesh = $head . <<<'GLSL'
+layout(triangles, max_vertices = 49, max_primitives = 72) out;
+layout(location = 0) out vec4 vcol[];
+layout(location = 1) perprimitiveEXT flat out vec4 pcol[];
+uniform mat4 u_mvp;
+float height(vec2 g) { return 0.34 * sin(g.x * 3.6 + 0.4) * cos(g.y * 3.1) + 0.10 * sin(g.x * 9.0 + g.y * 7.0); }
+vec3 hue(float h) { return clamp(abs(fract(h + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0); }
+void main() {
+    uint id = pl.id;
+    vec2 cell = vec2(float(id % N), float(id / N));
+    SetMeshOutputsEXT(49u, 72u);
+    vec3 P[49];
+    for (int j = 0; j < 7; j++) for (int i = 0; i < 7; i++) {
+        int v = j * 7 + i;
+        vec2 g = (cell + vec2(float(i), float(j)) / 6.0) / float(N) * 2.0 - 1.0;
+        P[v] = vec3(g.x * 2.4, height(g), g.y * 2.4);
+        gl_MeshVerticesEXT[v].gl_Position = u_mvp * vec4(P[v], 1.0);
+        vcol[v] = vec4(vec3(0.72 + 0.8 * P[v].y), 1.0);
+    }
+    vec3 base = mix(vec3(1.0), hue(fract(float(id) * 0.6180339)), 0.8);
+    for (int j = 0; j < 6; j++) for (int i = 0; i < 6; i++) {
+        int v = j * 7 + i; int k = (j * 6 + i) * 2;
+        gl_PrimitiveTriangleIndicesEXT[k] = uvec3(v, v + 7, v + 1);
+        gl_PrimitiveTriangleIndicesEXT[k + 1] = uvec3(v + 1, v + 7, v + 8);
+        /* one colour per primitive: the meshlet's hue, flat-shaded with the face normal */
+        vec3 n0 = normalize(cross(P[v + 7] - P[v], P[v + 1] - P[v]));
+        vec3 n1 = normalize(cross(P[v + 7] - P[v + 1], P[v + 8] - P[v + 1]));
+        vec3 sun = normalize(vec3(0.5, 0.8, 0.3));
+        pcol[k] = vec4(base * (0.30 + 0.70 * abs(dot(n0, sun))), 1.0);
+        pcol[k + 1] = vec4(base * (0.22 + 0.62 * abs(dot(n1, sun))), 1.0);   // the second triangle of a quad a little darker
+    }
+}
+GLSL;
+    $fs = "#version 450\n#extension GL_EXT_mesh_shader : require\n"
+        . "layout(location = 0) in vec4 vcol;\nlayout(location = 1) perprimitiveEXT flat in vec4 pcol;\n"
+        . "layout(location = 0) out vec4 o;\nvoid main(){ o = vec4(pcol.rgb * vcol.rgb, 1.0); }";
+    $p = pipe_spv($ctx, ['task' => $task, 'mesh' => $mesh, 'fragment' => $fs], ['depth_test' => true]);
+    $vp = m_mul(m_perspective(deg2rad(40), W / H, 0.1, 50), m_lookat([2.6, 3.6, 5.2], [0.1, -0.35, 0], [0, 1, 0]));
+    vio_begin($ctx);
+    vio_clear($ctx, 0.06, 0.07, 0.10, 1.0);
+    vio_bind_pipeline($ctx, $p);
+    vio_set_uniform($ctx, 'u_mvp', $vp);
+    vio_draw_mesh_tasks($ctx, $N * $N);
+    label($ctx, sprintf('vio_draw_mesh_tasks — %d task groups, no vertex buffer', $N * $N), 12, 28, 0xFFFFFFFF, 16);
+    label($ctx, 'the mesh stage emits a 72-triangle meshlet per group (one hue each, shaded per primitive);', 12, 50, 0xFFB0BCC8, 13);
+    label($ctx, 'the task stage launches none inside the hole', 12, 68, 0xFFB0BCC8, 13);
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    if (!vio_save_screenshot($ctx, $out)) throw new RuntimeException('screenshot');
+}, ['shader_model' => 6]);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Multiview — every draw lands in four layers, one camera per view
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('multiview', [VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_MULTIVIEW, VIO_FEATURE_RENDER_TARGET_LAYERED], function (VioContext $ctx, string $out) {
+    $VW = 316; $VH = 176;
+    $vs = <<<'GLSL'
+#version 450
+#extension GL_EXT_multiview : require
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=2) in vec2 aUv;
+uniform mat4 u_vp[4];
+uniform mat4 u_model;
+uniform vec4 u_tint;      // rgb, a = checker cells
+layout(location=0) out vec3 vN;
+layout(location=1) out vec3 vW;
+layout(location=2) out vec2 vUv;
+layout(location=3) flat out vec4 vTint;
+void main() {
+    vec4 w = u_model * vec4(aPos, 1.0);
+    vW = w.xyz; vN = mat3(u_model) * aNormal; vUv = aUv; vTint = u_tint;
+    gl_Position = u_vp[gl_ViewIndex] * w;
+}
+GLSL;
+    $fs = <<<'GLSL'
+#version 450
+layout(location=0) in vec3 vN;
+layout(location=1) in vec3 vW;
+layout(location=2) in vec2 vUv;
+layout(location=3) flat in vec4 vTint;
+layout(location=0) out vec4 o;
+void main() {
+    vec2 c = floor(vUv * vTint.a);
+    float k = mix(0.72, 1.0, mod(c.x + c.y, 2.0));
+    float d = max(dot(normalize(vN), normalize(vec3(3.0, 5.0, 2.0) - vW)), 0.0);
+    o = vec4(vTint.rgb * k * (0.25 + 0.75 * d), 1.0);
+}
+GLSL;
+    /* All uniforms sit in the vertex stage: with loose uniforms in both stages of this pair the
+     * OpenGL program does not link (both default-uniform structs come out of SPIRV-Cross as "_16"). */
+    $p = pipe_spv($ctx, ['vertex' => $vs, 'fragment' => $fs, 'view_count' => 4], ['depth_test' => true]);
+    $rt = vio_render_target($ctx, ['width' => $VW, 'height' => $VH, 'layers' => 4]);
+    if (!$rt) throw new RuntimeException('layered render target failed');
+    $cube = mesh_cube($ctx); $sphere = mesh_sphere($ctx); $plane = mesh_plane($ctx, 6);
+    $aspect = $VW / $VH; $o = 2.1;
+    $views = [
+        ['perspective',  m_mul(m_perspective(deg2rad(42), $aspect, 0.1, 50), m_lookat([3.4, 2.6, 4.2], [0, 0.2, 0], [0, 1, 0]))],
+        ['top',          m_mul(m_ortho(-$o * $aspect, $o * $aspect, -$o, $o, 0.1, 50), m_lookat([0, 10, 0], [0, 0, 0], [0, 0, -1]))],
+        ['front',        m_mul(m_ortho(-$o * $aspect, $o * $aspect, -$o + 0.6, $o + 0.6, 0.1, 50), m_lookat([0, 0.2, 10], [0, 0.2, 0], [0, 1, 0]))],
+        ['side',         m_mul(m_ortho(-$o * $aspect, $o * $aspect, -$o + 0.6, $o + 0.6, 0.1, 50), m_lookat([10, 0.2, 0], [0, 0.2, 0], [0, 1, 0]))],
+    ];
+    $objects = [
+        [$plane,  m_translate(0, -0.5, 0), [0.62, 0.64, 0.70], 12.0],
+        [$cube,   m_mul(m_translate(-1.3, 0.0, 0.3), m_rot_y(0.5)), [0.90, 0.36, 0.26], 4.0],
+        [$sphere, m_mul(m_translate(0.9, 0.2, -0.5), m_scale(0.7)), [0.30, 0.62, 0.95], 12.0],
+        [$cube,   m_mul(m_translate(0.5, -0.2, 1.3), m_mul(m_rot_y(-0.3), m_scale(0.6))), [0.95, 0.80, 0.30], 4.0],
+        [$sphere, m_mul(m_translate(-0.6, -0.15, -1.5), m_scale(0.35)), [0.45, 0.85, 0.50], 12.0],
+    ];
+    vio_begin($ctx);
+    for ($l = 0; $l < 4; $l++) { vio_bind_render_target($ctx, $rt, $l); vio_clear($ctx, 0.09, 0.10, 0.14, 1.0); }
+    vio_bind_render_target($ctx, $rt, VIO_RT_ALL_LAYERS);
+    vio_viewport($ctx, 0, 0, $VW, $VH);
+    vio_bind_pipeline($ctx, $p);
+    foreach ($objects as [$mesh, $model, $tint, $cells]) {   // one draw per object, four views each
+        foreach ($views as $i => [, $m]) vio_set_uniform($ctx, "u_vp[$i]", $m);
+        vio_set_uniform($ctx, 'u_model', $model);
+        vio_set_uniform($ctx, 'u_tint', [$tint[0], $tint[1], $tint[2], $cells]);
+        vio_draw($ctx, $mesh);
+    }
+    vio_unbind_render_target($ctx);
+    vio_end($ctx);
+    $layers = [];
+    for ($l = 0; $l < 4; $l++) $layers[] = rt_snapshot($ctx, $rt, $VW, $VH, $l);
+
+    vio_begin($ctx);
+    vio_viewport($ctx, 0, 0, W, H);
+    vio_clear($ctx, 0.03, 0.03, 0.05, 1);
+    foreach ($layers as $l => $tex) {
+        $x = 3 + ($l % 2) * ($VW + 2); $y = 42 + intdiv($l, 2) * ($VH + 2);
+        vio_sprite($ctx, $tex, ['x' => $x, 'y' => $y]);
+        vio_rect($ctx, $x, $y, 232, 26, ['color' => 0xC0101218, 'z' => 50]);
+        label($ctx, "layer $l — gl_ViewIndex $l, {$views[$l][0]}", $x + 8, $y + 18, 0xFFFFFFFF, 14);
+    }
+    label($ctx, "vio_shader(['view_count' => 4]) + VIO_RT_ALL_LAYERS — " . count($objects) . ' draws, four views each', 12, 28, 0xFFFFFFFF, 15);
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    if (!vio_save_screenshot($ctx, $out)) throw new RuntimeException('screenshot');
+}, ['shader_model' => 6]);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Variable rate shading — one fragment-shader run per 1x1 / 2x2 / 4x4 block
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('variable_rate_shading', [VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_SHADING_RATE, VIO_FEATURE_RENDER_TARGET], function (VioContext $ctx, string $out) {
+    $RW = 320; $RH = 180;   // rendered small and shown 2x, so the shading blocks can be seen
+    $vs = "#version 450\nlayout(location=0) in vec3 aPos;\nlayout(location=1) in vec2 aUv;\nlayout(location=0) out vec2 vUv;\n"
+        . "void main(){ vUv = aUv; gl_Position = vec4(aPos, 1.0); }";
+    /* uv in pixels of the strip: rings, thin diagonals and a smooth ramp */
+    $fs = <<<'GLSL'
+#version 450
+layout(location=0) in vec2 vUv;
+layout(location=0) out vec4 o;
+uniform vec2 u_centre;
+void main() {
+    vec2 p = vUv - u_centre;
+    float r = length(p);
+    vec3 c = mix(vec3(0.08, 0.10, 0.18), vec3(0.16, 0.30, 0.52), smoothstep(0.0, 110.0, vUv.y));
+    c = mix(c, vec3(0.98, 0.80, 0.30), smoothstep(0.25, 0.75, abs(fract(r / 7.0) - 0.5) * 2.0) * step(r, 40.0));
+    float d = abs(fract((vUv.x + vUv.y) / 9.0) - 0.5) * 9.0;
+    if (r > 44.0) c = mix(c, vec3(0.92, 0.95, 1.0), 1.0 - smoothstep(0.6, 1.4, d));
+    o = vec4(c, 1.0);
+}
+GLSL;
+    $p = pipe_spv($ctx, ['vertex' => $vs, 'fragment' => $fs]);
+    $rt = vio_render_target($ctx, ['width' => $RW, 'height' => $RH]);
+    /* a quad over the pixel rectangle (x, y, w, h) of the target, uv = pixels from its top-left corner */
+    $rect = function (float $x, float $y, float $w, float $h) use ($ctx, $RW, $RH): VioMesh {
+        $x0 = $x / $RW * 2 - 1; $x1 = ($x + $w) / $RW * 2 - 1; $y0 = 1 - $y / $RH * 2; $y1 = 1 - ($y + $h) / $RH * 2;
+        return vio_mesh($ctx, ['vertices' => [$x0,$y1,0, 0,$h,  $x1,$y1,0, $w,$h,  $x1,$y0,0, $w,0,  $x0,$y0,0, 0,0],
+                               'indices' => [0,1,2, 0,2,3], 'layout' => [VIO_FLOAT3, VIO_FLOAT2]]);
+    };
+    $image = vio_supports_feature($ctx, VIO_FEATURE_SHADING_RATE_IMAGE);
+    $stripH = $image ? 88 : $RH; $stripW = 106;
+    $strips = [[VIO_SHADING_RATE_1X1, '1x1'], [VIO_SHADING_RATE_2X2, '2x2'], [VIO_SHADING_RATE_4X4, '4x4']];
+    $notes = [];
+    vio_begin($ctx);
+    vio_bind_render_target($ctx, $rt);
+    vio_viewport($ctx, 0, 0, $RW, $RH);
+    vio_clear($ctx, 0.03, 0.03, 0.05, 1);
+    vio_bind_pipeline($ctx, $p);
+    foreach ($strips as $i => [$rate, $name]) {
+        $ok = vio_set_shading_rate($ctx, $rate);
+        if (!$ok) vio_set_shading_rate($ctx, VIO_SHADING_RATE_2X2);   // 4x4 needs the device's additional rates
+        $notes[$i] = $ok ? $name : "$name not offered: 2x2";
+        vio_set_uniform($ctx, 'u_centre', [$stripW / 2, $stripH / 2]);
+        vio_draw($ctx, $rect($i * 107, 0, $stripW, $stripH));
+    }
+    vio_set_shading_rate($ctx, VIO_SHADING_RATE_1X1);
+    vio_unbind_render_target($ctx);
+    vio_end($ctx);
+    if ($image) {
+        /* One draw under a shading-rate image: full rate in the middle, coarser towards the sides. */
+        $tile = vio_shading_rate_tile_size($ctx);
+        $tx = intdiv($RW + $tile - 1, $tile); $ty = intdiv($RH + $tile - 1, $tile);
+        $rates = '';
+        for ($y = 0; $y < $ty; $y++) for ($x = 0; $x < $tx; $x++) {
+            $d = abs(($x + 0.5) * $tile - $RW / 2) / ($RW / 2);
+            $rates .= chr($d < 0.3 ? VIO_SHADING_RATE_1X1 : ($d < 0.65 ? VIO_SHADING_RATE_2X2 : VIO_SHADING_RATE_4X4));
+        }
+        if (!@vio_set_shading_rate_image($ctx, $rates, $tx, $ty)) {   // without 4x4
+            $rates = strtr($rates, chr(VIO_SHADING_RATE_4X4), chr(VIO_SHADING_RATE_2X2));
+            if (!vio_set_shading_rate_image($ctx, $rates, $tx, $ty)) throw new RuntimeException('vio_set_shading_rate_image failed');
+        }
+        vio_begin($ctx);
+        vio_bind_render_target($ctx, $rt);      // binding keeps the content
+        vio_viewport($ctx, 0, 0, $RW, $RH);
+        vio_bind_pipeline($ctx, $p);
+        vio_set_shading_rate($ctx, VIO_SHADING_RATE_1X1);
+        vio_set_uniform($ctx, 'u_centre', [$RW / 2, 44.0]);
+        vio_draw($ctx, $rect(0, 92, $RW, 88));
+        vio_unbind_render_target($ctx);
+        vio_end($ctx);
+        vio_set_shading_rate_image($ctx, null);
+    }
+    $tex = rt_snapshot($ctx, $rt, $RW, $RH);
+    vio_begin($ctx);
+    vio_viewport($ctx, 0, 0, W, H);
+    vio_clear($ctx, 0.03, 0.03, 0.05, 1);
+    vio_sprite($ctx, $tex, ['x' => 0, 'y' => 40, 'width' => $RW * 2, 'height' => $RH * 2]);
+    foreach ($notes as $i => $n) {
+        vio_rect($ctx, $i * 214, 40, strlen($n) > 3 ? 190 : 46, 26, ['color' => 0xD0101218, 'z' => 50]);
+        label($ctx, $n, $i * 214 + 8, 59, 0xFFFFFFFF, 15);
+    }
+    if ($image) {
+        vio_rect($ctx, 0, 224, 500, 26, ['color' => 0xD0101218, 'z' => 50]);
+        label($ctx, 'vio_set_shading_rate_image — one draw, tiles 4x4 | 2x2 | 1x1 | 2x2 | 4x4', 8, 243, 0xFFFFFFFF, 15);
+    }
+    label($ctx, 'vio_set_shading_rate — the fragment shader runs once per pixel block (shown 2x)', 12, 28, 0xFFFFFFFF, 16);
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    if (!vio_save_screenshot($ctx, $out)) throw new RuntimeException('screenshot');
+}, ['shader_model' => 6]);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Bindless textures — one draw samples 84 textures through the texture table
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('bindless_textures', [VIO_FEATURE_3D_PIPELINE, VIO_FEATURE_BINDLESS], function (VioContext $ctx, string $out) {
+    $vs = "#version 450\nlayout(location=0) in vec3 aPos;\nlayout(location=1) in vec2 aUv;\nlayout(location=2) in float aSlot;\n"
+        . "layout(location=0) out vec2 vUv;\nlayout(location=1) flat out int vSlot;\n"
+        . "void main(){ vUv = aUv; vSlot = int(aSlot + 0.5); gl_Position = vec4(aPos, 1.0); }";
+    $fs = "#version 450\n#extension GL_EXT_nonuniform_qualifier : require\n"
+        . "layout(location=0) in vec2 vUv;\nlayout(location=1) flat in int vSlot;\nlayout(location=0) out vec4 o;\n"
+        . "layout(set = 1, binding = 0) uniform texture2D vio_textures[];\n"
+        . "layout(set = 1, binding = 1) uniform sampler vio_sampler;\n"
+        . "void main(){ o = vec4(texture(sampler2D(vio_textures[nonuniformEXT(vSlot)], vio_sampler), vUv).rgb, 1.0); }";
+    $p = pipe_spv($ctx, ['vertex' => $vs, 'fragment' => $fs]);
+    $COLS = 12; $ROWS = 7; $T = 48;
+    /* every tile gets its own texture: one of six patterns in its own two colours */
+    $make = function (int $i) use ($ctx, $T): VioTexture {
+        $a = hue_rgb($i * 0.137, 0.75, 0.95); $b = hue_rgb($i * 0.137 + 0.45, 0.6, 0.30);
+        $d = '';
+        for ($y = 0; $y < $T; $y++) for ($x = 0; $x < $T; $x++) {
+            $u = $x - $T / 2 + 0.5; $v = $y - $T / 2 + 0.5;
+            $on = match (($i * 5 + intdiv($i, 12) * 2) % 6) {
+                0 => (intdiv($x, 8) + intdiv($y, 8)) % 2 === 0,
+                1 => ($x + $y) % 12 < 6,
+                2 => fmod(sqrt($u * $u + $v * $v), 8.0) < 4.0,
+                3 => (($x % 12) - 6) ** 2 + (($y % 12) - 6) ** 2 < 14,
+                4 => $y % 8 < 4,
+                default => abs($u) + abs($v) < 16 || $x % 12 < 2,
+            };
+            $c = $on ? $a : $b;
+            if ($x < 1 || $y < 1 || $x >= $T - 1 || $y >= $T - 1) $c = [0.9, 0.9, 0.9];
+            $d .= chr((int)($c[0] * 255)) . chr((int)($c[1] * 255)) . chr((int)($c[2] * 255)) . "\xFF";
+        }
+        return vio_texture($ctx, ['data' => $d, 'width' => $T, 'height' => $T]);
+    };
+    $v = [];
+    for ($i = 0; $i < $COLS * $ROWS; $i++) {
+        $slot = vio_texture_index($ctx, $make($i));       // the table keeps the texture alive
+        if ($slot === false) throw new RuntimeException('vio_texture_index failed');
+        $px = 10 + ($i % $COLS) * 52; $py = 40 + intdiv($i, $COLS) * 51;
+        $x0 = $px / W * 2 - 1; $x1 = ($px + $T) / W * 2 - 1; $y0 = 1 - $py / H * 2; $y1 = 1 - ($py + $T) / H * 2;
+        foreach ([[$x0,$y1,0,1], [$x1,$y1,1,1], [$x1,$y0,1,0], [$x0,$y1,0,1], [$x1,$y0,1,0], [$x0,$y0,0,0]] as [$x, $y, $s, $t])
+            array_push($v, $x, $y, 0.0, $s, $t, (float)$slot);
+    }
+    $mesh = vio_mesh($ctx, ['vertices' => $v, 'layout' => [VIO_FLOAT3, VIO_FLOAT2, VIO_FLOAT1]]);
+    vio_begin($ctx);
+    vio_clear($ctx, 0.05, 0.06, 0.08, 1);
+    vio_bind_pipeline($ctx, $p);
+    vio_draw($ctx, $mesh);
+    label($ctx, 'vio_texture_index — ' . ($COLS * $ROWS) . ' textures, one draw: vio_textures[nonuniformEXT(slot)]', 12, 28, 0xFFFFFFFF, 16);
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    if (!vio_save_screenshot($ctx, $out)) throw new RuntimeException('screenshot');
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * SDF text — a distance-field atlas stays sharp under magnification
+ * ═══════════════════════════════════════════════════════════════════════ */
+scene('sdf_text', [VIO_FEATURE_NATIVE_2D_BATCH], function (VioContext $ctx, string $out) {
+    $path = null;
+    foreach (['C:/Windows/Fonts/segoeui.ttf', 'C:/Windows/Fonts/arial.ttf', '/System/Library/Fonts/Supplemental/Arial.ttf',
+              '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'] as $c) if (is_file($c)) { $path = $c; break; }
+    if (!$path) throw new RuntimeException('no system font');
+    $bmp = vio_font($ctx, $path, 24.0);
+    $sdf = vio_font($ctx, $path, 24.0, 1.0, ['sdf' => true]);
+    if (!$bmp || !$sdf) throw new RuntimeException('font failed');
+    $spread = vio_font_info($sdf)['sdf'];
+    if ($spread === 0) throw new RuntimeException("the 'sdf' option needs the HarfBuzz build");
+    /* both fonts are rasterised at 24 px; a 2D transform magnifies the text */
+    $rows = [[2.0, 'magnified 2x', 104], [4.0, 'Sharp', 196], [7.0, 'Ag', 352]];
+    vio_begin($ctx);
+    vio_clear($ctx, 0.06, 0.07, 0.10, 1.0);
+    vio_rect($ctx, 319, 44, 2, 356, ['color' => 0xFF303848]);
+    foreach ([[$bmp, 12, 0xFFE8D0B0], [$sdf, 332, 0xFFB0E8D0]] as [$font, $x, $color]) {
+        foreach ($rows as [$s, $text, $baseline]) {
+            vio_push_transform($ctx, $s, 0, 0, $s, $x, $baseline);
+            vio_text($ctx, $font, $text, 0, 0, ['color' => $color]);
+            vio_pop_transform($ctx);
+        }
+    }
+    label($ctx, 'coverage atlas', 12, 58, 0xFFB0BCC8, 13);
+    label($ctx, "['sdf' => true], spread $spread px", 332, 58, 0xFFB0BCC8, 13);
+    label($ctx, "vio_font(…, ['sdf' => true]) — a 24 px atlas under a 2x / 4x / 7x transform", 12, 28, 0xFFFFFFFF, 16);
+    vio_draw_2d($ctx);
+    vio_end($ctx);
+    if (!vio_save_screenshot($ctx, $out)) throw new RuntimeException('screenshot');
+});
+
 foreach ($results as $name => $r) echo str_pad($name, 28), " ", $r, "\n";
 echo "output: $outdir\n";

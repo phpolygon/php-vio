@@ -43,12 +43,17 @@ They double as a smoke test of each feature path on a real backend.
 | ![3D texture](docs/gallery/texture_3d_volume.png) `vio_texture_3d` ray-marched via `sampler3D` | ![Shadow map](docs/gallery/shadow_map.png) Depth-only render target → PCF shadows |
 | ![HDR tone mapping](docs/gallery/hdr_tonemap.png) `['hdr' => true]` RGBA16F target + ACES | ![Geometry shader](docs/gallery/geometry_shader.png) `vio_shader(['geometry' => …])`: one vertex per point, the GS emits sprite quads |
 | ![Tessellation](docs/gallery/tessellation.png) `tess_control` + `tess_eval`, `VIO_PATCHES`: quad patches displaced in the evaluation stage, level 2 vs 18 | ![Ray query shadows](docs/gallery/ray_query_shadows.png) `vio_acceleration_structure` + `rayQueryEXT`: one shadow ray per pixel |
-| ![Opacity micromaps](docs/gallery/opacity_micromap.png) `vio_opacity_micromap_bake`: what rays learn from an alpha texture without running a shader | |
+| ![Opacity micromaps](docs/gallery/opacity_micromap.png) `vio_opacity_micromap_bake`: what rays learn from an alpha texture without running a shader | ![Upscaling](docs/gallery/upscaling.png) `vio_upscale`: half-resolution source, bilinear vs. spatial vs. temporal (32 jittered frames) vs. rendered at full size |
+| ![Draw bundle](docs/gallery/draw_bundle.png) `vio_bundle` + `vio_draw_bundle`: 610 draws recorded once, replayed per frame | ![Mesh shader](docs/gallery/mesh_shader.png) `vio_shader(['task' => …, 'mesh' => …])` + `vio_draw_mesh_tasks`: meshlets generated on the GPU, the task stage culls a hole |
+| ![Multiview](docs/gallery/multiview.png) `['view_count' => 4]` + `VIO_RT_ALL_LAYERS`: every draw lands in four layers, one camera per `gl_ViewIndex` | ![Variable rate shading](docs/gallery/variable_rate_shading.png) `vio_set_shading_rate` 1x1 / 2x2 / 4x4 and `vio_set_shading_rate_image` (shown 2x) |
+| ![Bindless textures](docs/gallery/bindless_textures.png) `vio_texture_index`: 84 textures in one draw through `vio_textures[]` | ![SDF text](docs/gallery/sdf_text.png) `vio_font(…, ['sdf' => true])`: a 24 px atlas magnified, coverage vs. distance field |
 
 `php examples/gallery.php [backend] [outdir] [scene,…]` renders all scenes or a comma-separated selection. A scene whose feature the
-backend does not report is skipped (ray queries and opacity micromaps need Direct3D 12 or Vulkan with a GPU and driver that support them).
-The gallery covers rendering only: upscaling, draw bundles, mesh shaders, multiview and the desktop-application APIs (windows, menus,
-dialogs, tray) have no scene yet.
+backend does not report is skipped: ray queries, mesh shaders and bindless textures need Direct3D 12, Vulkan or Metal with a GPU and driver
+that support them, variable rate shading Direct3D 12 or Vulkan, opacity micromaps Vulkan or Direct3D 12 with the Agility SDK
+(`VIO_D3D12_AGILITY_SDK`) and DXC (`VIO_DXC_DIR`).
+The gallery covers rendering only: the native upscalers (FSR 3.1, DLSS), the remaining ray-tracing features, work graphs, audio, video
+and the desktop-application APIs (windows, menus, dialogs, tray) have no scene yet.
 
 ## Requirements
 
