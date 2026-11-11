@@ -1789,6 +1789,12 @@ festgehalten (deutsch, phasiert, mit Audit-Gate-/Test-Kontrakt). Bestehende:
   Windows testet die D3D-Backends auf **WARP** – einmal auf dem System-WARP (SM 6.2, Untergrenze) und
   einmal die ganze Suite auf **NuGet-WARP 1.0.21 + Agility SDK 1.619.6 + DXC 1.9** (SM 6.9, FL 12.2, DXR 1.2)
   mit `VIO_REQUIRE_*=d3d12` für alles, was dort gemeldet wird (Subgroups … Work Graphs, Long Vectors, SER, OMM).
+- **macOS x86_64 (`macos-15-intel`)**: Homebrew hat für Intel-macOS keine Bottles mehr (Tier 3) – `php`, ffmpeg & Co.
+  samt Abhängigkeiten wurden je Lauf aus dem Quelltext gebaut (~3,5 h). Der Job sichert deshalb die selbst gebauten Kegs
+  (`Cellar/<name>/<version>`, die das Runner-Image nicht mitbringt, plus ihre `opt`-Links) als `actions/cache`
+  (`brew-kegs-macos-15-intel-v1-<hash der Keg-Liste>`), spielt sie vor `brew install` zurück und linkt sie; brew baut dann
+  nur, was seither eine neuere Version hat. Caches eines PRs gelten nur für diesen PR, die von `main` für alle – nach
+  einem Formel-Update ist der erste Lauf auf `main` der langsame. Cache verwerfen: `v1` im Schlüssel hochzählen.
 - `.github/workflows/release.yml` — semantic-release auf `main`: ruft build.yml als
   Gate, taggt, schreibt CHANGELOG.md, triggert den Release-Build der Binaries.
 - `configure.ac` erlaubt einen PHP-freien Autotools-Durchlauf, um die „kompiliert ohne
