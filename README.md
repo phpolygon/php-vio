@@ -219,7 +219,7 @@ Features differ per backend and GPU — for example variable rate shading, ray t
 
 ## Performance
 
-`examples/bench_backends.php` draws the same five scenes on every backend the build can open: 1280x720, headless, vsync off, 600 frames after 60 warm-up frames. The tables give the frame time from `vio_begin()` to the return of `vio_end()` in microseconds, as median / 99th percentile. Measured with php-vio 2.44.1 and PHP 8.5.
+`examples/bench_backends.php` draws the same five scenes on every backend the build can open: 1280x720, headless, vsync off, 600 frames after 60 warm-up frames. The Mac tables give the frame time from `vio_begin()` to the return of `vio_end()` in microseconds, as median / 99th percentile. Measured with php-vio 2.44.1 and PHP 8.5.
 
 **Apple M5 (macOS 27.2)**
 
@@ -241,7 +241,16 @@ Features differ per backend and GPU — for example variable rate shading, ray t
 | 3D: 1000 draws, 2 uniforms each | 574 / 800 | 703 / 877 | 1194 / 1496 |
 | 3D: 10 000 instances, 1 draw | 170 / 273 | 743 / 842 | 1290 / 1429 |
 
-Metal is the faster backend on both Macs in most scenes and has the steadier frame times; OpenGL is ahead in two cells (10 000 instances on the M5 by the median, the text-heavy 2D scene on the Intel Mac). These numbers are CPU-side frame times of small scenes: they compare the cost of issuing draws, not GPU throughput. Run the script on your own machine before choosing a backend:
+**Windows 11, NVIDIA GeForce RTX 2080** — here the table gives the time to issue the frame (`vio_begin()` to `vio_draw_2d()`), median in microseconds. Headless Vulkan and OpenGL contexts copy every presented frame back to the host, which makes their `vio_end()` take longer than on Direct3D, so the frame time would not compare the backends.
+
+| Scene | Direct3D 12 | Direct3D 11 | Vulkan 1.3 | OpenGL 4.6 |
+|---|---:|---:|---:|---:|
+| 2D: 500 rects | 139 | 126 | 180 | 672 |
+| 2D: 200 rects + 200 rounded rects + 50 texts | 491 | 453 | 669 | 941 |
+| 2D: 1000 rects + 100 texts | 634 | 601 | 825 | 986 |
+| 3D: 1000 draws, 2 uniforms each | 831 | 434 | 1146 | 1028 |
+| 3D: 10 000 instances, 1 draw | 44 | 123 | 122 | 92 |
+On both Macs Metal is the faster backend in most scenes and has the steadier frame times; OpenGL is ahead in two cells (10 000 instances on the M5 by the median, the text-heavy 2D scene on the Intel Mac). On the RTX 2080 Direct3D 11 issues a frame fastest in four of the five scenes and Direct3D 12 when one draw covers 10 000 instances; Vulkan and OpenGL spend more CPU time per frame. These numbers are CPU-side times of small scenes, each from one run on a desktop machine: they compare the cost of issuing draws, not GPU throughput. Run the script on your own machine before choosing a backend:
 
 ```bash
 php -d extension=vio examples/bench_backends.php            # every backend
