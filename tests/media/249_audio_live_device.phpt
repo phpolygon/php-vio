@@ -32,7 +32,8 @@ vio_audio_direction($m, 0.0, 0.0, 1.0);
 vio_audio_doppler($m, 0.0);
 vio_audio_attenuation($m, 'exponential', 2.0, 50.0, 1.5);
 vio_audio_cone($m, M_PI / 2, M_PI, 0.3);
-usleep(50000);
+// The null device runs on its own real-time clock; a loaded CI runner can take longer than 50 ms to advance it.
+for ($i = 0; $i < 60 && vio_audio_state($m)['cursor'] <= 0.0; $i++) usleep(50000);
 $st = vio_audio_state($m);
 echo json_encode([$st['playing'], $st['looping'], $st['spatial'], $st['pitch'], $st['pan'], $st['velocity'],
     $st['direction'], $st['doppler'], $st['attenuation'], $st['min_distance'], $st['max_distance'], $st['rolloff'],
