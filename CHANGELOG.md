@@ -1,3 +1,11 @@
+## [2.44.1](https://github.com/phpolygon/php-vio/compare/v2.44.0...v2.44.1) (2026-11-11)
+
+
+### Bug Fixes
+
+* **d3d12:** hull shaders from GLSL keep their state local under Shader Model 6 ([1fde331](https://github.com/phpolygon/php-vio/commit/1fde33108b827e444b14ef827296923afb424507))
+* **metal:** tessellation control points keep the writer's layout without gl_in reads ([5de414b](https://github.com/phpolygon/php-vio/commit/5de414bc26e1be42caad6681f520be4fdd1d68a0))
+
 # [2.44.0](https://github.com/phpolygon/php-vio/compare/v2.43.1...v2.44.0) (2026-11-10)
 
 
