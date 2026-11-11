@@ -14,6 +14,7 @@
 
 #include "../../../include/vio_platform.h"
 #include "vio_vulkan.h"
+#include "vio_vulkan_3d.h"   /* VK3D_B_SAMPLER0: set-0 bindings before the samplers */
 #include "../../vio_cubemap.h"   /* bindless cube slots */
 #include "../../vio_shader_cache.h"
 #include "../../vio_texture.h"
@@ -253,6 +254,9 @@ static int vk_device_modern(VkPhysicalDevice dev)
     return core13 ? 1 : 2;
 }
 
+/* The 'adapter' option of the context being created (vulkan_init), empty = any. */
+static char vk_adapter_wanted[256];
+
 static int select_physical_device(void)
 {
     uint32_t count = 0;
@@ -268,6 +272,11 @@ static int select_physical_device(void)
     /* Pick the first device with the modern core and graphics + present queues */
     int modern_seen = 0;
     for (uint32_t i = 0; i < count; i++) {
+        if (vk_adapter_wanted[0]) {
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(devices[i], &props);
+            if (!vio_adapter_name_matches(props.deviceName, vk_adapter_wanted)) continue;
+        }
         int modern = vk_device_modern(devices[i]);
         if (!modern) continue;
         modern_seen = 1;
@@ -305,6 +314,10 @@ static int select_physical_device(void)
     }
 
     free(devices);
+    if (vk_adapter_wanted[0] && !modern_seen) {
+        php_error_docref(NULL, E_WARNING, "Vulkan: adapter '%s' not found or not suitable", vk_adapter_wanted);
+        return -1;
+    }
     if (!modern_seen)
         php_error_docref(NULL, E_WARNING, "No suitable Vulkan GPU found: vio needs Vulkan 1.3, or 1.2 with "
                          "VK_KHR_dynamic_rendering and VK_KHR_synchronization2 (plus timeline semaphores)");
@@ -543,6 +556,25 @@ static int create_logical_device(void)
         VkPhysicalDeviceProperties props = {0};
         vkGetPhysicalDeviceFeatures(vio_vk.physical_device, &avail);
         vkGetPhysicalDeviceProperties(vio_vk.physical_device, &props);
+        {
+            /* Texture units (SAMPLER-LIMITS-PLAN): what one stage and one set
+             * may hold of combined image samplers, minus the set-0 bindings that
+             * are not samplers (the per-stage resource budget counts all). */
+            const VkPhysicalDeviceLimits *lm = &props.limits;
+            uint64_t img = lm->maxPerStageDescriptorSampledImages < lm->maxDescriptorSetSampledImages
+                         ? lm->maxPerStageDescriptorSampledImages : lm->maxDescriptorSetSampledImages;
+            uint64_t smp = lm->maxPerStageDescriptorSamplers < lm->maxDescriptorSetSamplers
+                         ? lm->maxPerStageDescriptorSamplers : lm->maxDescriptorSetSamplers;
+            uint64_t res = lm->maxPerStageResources > VK3D_B_SAMPLER0 + 8 ? lm->maxPerStageResources - (VK3D_B_SAMPLER0 + 8) : 16;
+            if (img > INT_MAX) img = INT_MAX;
+            if (smp > INT_MAX) smp = INT_MAX;
+            vio_vk.tex_limit = (int)img;
+            vio_vk.smp_limit = (int)smp;
+            uint64_t u = img < smp ? img : smp;
+            if (u > res) u = res;
+            vio_vk.tex_units = u > INT_MAX ? INT_MAX : (int)(u < 1 ? 1 : u);
+            vio_vk.ubo_limit = lm->maxUniformBufferRange > INT_MAX ? INT_MAX : (int)lm->maxUniformBufferRange;
+        }
         if (avail.samplerAnisotropy) {
             features.samplerAnisotropy = VK_TRUE;
             vio_vk.anisotropy_supported = 1;
@@ -2130,7 +2162,7 @@ static void vkc_frame_submitted(void);
 
 static int vulkan_init(vio_config *cfg)
 {
-    (void)cfg;
+    snprintf(vk_adapter_wanted, sizeof(vk_adapter_wanted), "%s", cfg ? cfg->adapter_name : "");
     /* Actual init happens in vio_vulkan_setup_context after window creation */
     return 0;
 }
@@ -2160,7 +2192,20 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void)
         vi.addressModeU = vi.addressModeV = vi.addressModeW = clamp ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
         if (vkCreateSampler(vio_vk.device, &vi, NULL, &vio_vk.bindless_sampler_variants[v]) != VK_SUCCESS) return VK_NULL_HANDLE;
     }
-    VkDescriptorSetLayoutBinding b[7];
+    /* Binding 7: vio_sampler_aniso - linear, repeat, up to 16x anisotropic (the
+     * device limit; plain linear where the device has no anisotropy). */
+    {
+        VkSamplerCreateInfo ai = sci;
+        if (vio_vk.anisotropy_supported) {
+            ai.anisotropyEnable = VK_TRUE;
+            ai.maxAnisotropy = vio_vk.max_anisotropy < 16.0f ? vio_vk.max_anisotropy : 16.0f;
+        }
+        if (vkCreateSampler(vio_vk.device, &ai, NULL, &vio_vk.bindless_sampler_variants[3]) != VK_SUCCESS) return VK_NULL_HANDLE;
+        /* Binding 8: vio_sampler_aniso_clamp - the same, clamped to the edge. */
+        ai.addressModeU = ai.addressModeV = ai.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (vkCreateSampler(vio_vk.device, &ai, NULL, &vio_vk.bindless_sampler_variants[4]) != VK_SUCCESS) return VK_NULL_HANDLE;
+    }
+    VkDescriptorSetLayoutBinding b[9];
     memset(b, 0, sizeof(b));
     b[0].binding            = 0;
     b[0].descriptorType     = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -2181,25 +2226,31 @@ VkDescriptorSetLayout vio_vk_bindless_layout(void)
     b[5].binding = 5;
     b[6] = b[0];
     b[6].binding = 6;
-    VkDescriptorBindingFlagsEXT flags[7] = {
+    b[7] = b[1];
+    b[7].binding = 7;
+    b[7].pImmutableSamplers = &vio_vk.bindless_sampler_variants[3];
+    b[8] = b[1];
+    b[8].binding = 8;
+    b[8].pImmutableSamplers = &vio_vk.bindless_sampler_variants[4];
+    VkDescriptorBindingFlagsEXT flags[9] = {
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT, 0, 0, 0, 0,
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT,
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT };
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT, 0, 0 };
     VkDescriptorSetLayoutBindingFlagsCreateInfoEXT bf = {0};
     bf.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT;
-    bf.bindingCount  = 7;
+    bf.bindingCount  = 9;
     bf.pBindingFlags = flags;
     VkDescriptorSetLayoutCreateInfo li = {0};
     li.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     li.pNext        = &bf;
     li.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT_EXT;
-    li.bindingCount = 7;
+    li.bindingCount = 9;
     li.pBindings    = b;
     if (vkCreateDescriptorSetLayout(vio_vk.device, &li, NULL, &vio_vk.bindless_layout) != VK_SUCCESS) {
         vio_vk.bindless_layout = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * VIO_BINDLESS_MAX }, { VK_DESCRIPTOR_TYPE_SAMPLER, 4 } };
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * VIO_BINDLESS_MAX }, { VK_DESCRIPTOR_TYPE_SAMPLER, 6 } };
     VkDescriptorPoolCreateInfo pi = {0};
     pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pi.flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT_EXT;
@@ -2346,7 +2397,7 @@ static void vulkan_shutdown(void)
         if (vio_vk.bindless_pool)    { vkDestroyDescriptorPool(vio_vk.device, vio_vk.bindless_pool, NULL); vio_vk.bindless_pool = VK_NULL_HANDLE; }
         if (vio_vk.bindless_layout)  { vkDestroyDescriptorSetLayout(vio_vk.device, vio_vk.bindless_layout, NULL); vio_vk.bindless_layout = VK_NULL_HANDLE; }
         if (vio_vk.bindless_sampler) { vkDestroySampler(vio_vk.device, vio_vk.bindless_sampler, NULL); vio_vk.bindless_sampler = VK_NULL_HANDLE; }
-        for (int v = 0; v < 3; v++) {
+        for (int v = 0; v < 5; v++) {
             if (vio_vk.bindless_sampler_variants[v]) { vkDestroySampler(vio_vk.device, vio_vk.bindless_sampler_variants[v], NULL); vio_vk.bindless_sampler_variants[v] = VK_NULL_HANDLE; }
         }
         vio_vk.bindless_set = VK_NULL_HANDLE;
@@ -4059,6 +4110,24 @@ static void vulkan_destroy_font_atlas(void *font_ptr)
 }
 
 /* vio_begin(['present' => …]) (VIO_FEATURE_EXPLICIT_PRESENT). */
+/* SAMPLER-LIMITS-PLAN: the device's descriptor limits per stage. */
+static void vulkan_texture_limits(int *textures, int *samplers)
+{
+    *textures = vio_vk.tex_limit > 0 ? vio_vk.tex_limit : 16;
+    *samplers = vio_vk.tex_units > 0 ? vio_vk.tex_units : 16;
+}
+
+/* The default uniform block is a uniform buffer: maxUniformBufferRange. */
+static int vulkan_uniform_block_limit(void)
+{
+    return vio_vk.ubo_limit;
+}
+
+int vio_vk3d_units(void)
+{
+    return vio_vk.tex_units > 0 ? vio_vk.tex_units : 16;
+}
+
 static void vulkan_set_frame_present(int mode)
 {
     vio_vk.frame_present = mode;
@@ -5860,7 +5929,8 @@ static const vio_backend vulkan_backend = {
     .bundle_method     = vulkan_bundle_method,
     .rt_origin_top     = 1,
     .clip_z_remap      = 1,
-    .shadow_sampler_base = VIO_SHADOW_SAMPLER_BASE,
+    .texture_limits    = vulkan_texture_limits,
+    .uniform_block_limit = vulkan_uniform_block_limit,
     .set_frame_present = vulkan_set_frame_present,
     .create_swapchain  = vulkan_create_swapchain,
     .set_swapchain     = vulkan_set_swapchain,

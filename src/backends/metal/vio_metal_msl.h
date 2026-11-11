@@ -166,6 +166,11 @@ typedef struct _vio_metal_tess_info {
     size_t cp_stride;        /* one TCS output control point */
     size_t patch_stride;     /* one TCS patch record */
     size_t tes_out_stride;   /* one TES output vertex (isolines / point_mode capture) */
+    /* Set while translating the VS kernel and then the TCS, read by the next
+     * stage: whether the writer has gl_Position in its record, and one past
+     * its highest per-vertex output location. */
+    int    prev_writes_position;
+    int    prev_out_locations;
 } vio_metal_tess_info;
 
 #ifdef HAVE_SPIRV_CROSS
@@ -225,6 +230,33 @@ static size_t metal_varying_bytes(spvc_compiler compiler, spvc_type_id type_id, 
         elem = column * (columns > 0 ? columns : 1);
     }
     return elem * count;
+}
+
+/* One past the highest location the per-vertex outputs of a VS kernel / TCS
+ * take (matrices one location per column, arrays one per element; `arrayed`
+ * strips the per-control-point array of the TCS outputs). */
+static int metal_output_locations(spvc_compiler compiler, spvc_resources resources, int arrayed)
+{
+    const spvc_reflected_resource *list = NULL;
+    size_t count = 0;
+    int end = 0;
+    spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STAGE_OUTPUT, &list, &count);
+    for (size_t i = 0; i < count; i++) {
+        if (spvc_compiler_has_decoration(compiler, list[i].id, SpvDecorationPatch)) continue;
+        if (!spvc_compiler_has_decoration(compiler, list[i].id, SpvDecorationLocation)) continue;
+        spvc_type type = spvc_compiler_get_type_handle(compiler, list[i].type_id);
+        unsigned dims = spvc_type_get_num_array_dimensions(type);
+        int n = (int)(spvc_type_get_columns(type) > 0 ? spvc_type_get_columns(type) : 1);
+        /* SPIRV-Cross lists array dimensions innermost first. */
+        for (unsigned d = 0; d < dims; d++) {
+            if (arrayed && d == dims - 1) continue;
+            SpvId len = spvc_type_get_array_dimension(type, d);
+            if (spvc_type_array_dimension_is_literal(type, d) && len > 0) n *= (int)len;
+        }
+        int loc = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationLocation) + n;
+        if (loc > end) end = loc;
+    }
+    return end;
 }
 
 /* Upper bound of one output record of a VS kernel / TCS: the stage outputs
@@ -362,15 +394,22 @@ static int metal_msl_bindless(spvc_compiler compiler, spvc_resources resources, 
         for (size_t i = 0; i < count; i++) {
             if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 1) continue;
             /* Bindings 1..4: vio_sampler (linear, repeat), vio_sampler_nearest,
-             * vio_sampler_clamp, vio_sampler_nearest_clamp (BINDLESS-PLAN). */
-            unsigned v = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
-            v = (v >= 1 && v <= 4) ? v - 1 : 0;
+             * vio_sampler_clamp, vio_sampler_nearest_clamp; 7 / 8: vio_sampler_aniso(_clamp)
+             * (BINDLESS-PLAN). Mip filtering like the D3D12 / Vulkan samplers. */
+            unsigned b = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            unsigned v = (b >= 1 && b <= 4) ? b - 1 : 0;
             spvc_msl_constexpr_sampler cs;
             spvc_msl_constexpr_sampler_init(&cs);
             cs.min_filter = (v & 1) ? SPVC_MSL_SAMPLER_FILTER_NEAREST : SPVC_MSL_SAMPLER_FILTER_LINEAR;
             cs.mag_filter = cs.min_filter;
+            cs.mip_filter = (v & 1) ? SPVC_MSL_SAMPLER_MIP_FILTER_NEAREST : SPVC_MSL_SAMPLER_MIP_FILTER_LINEAR;
             cs.s_address  = (v & 2) ? SPVC_MSL_SAMPLER_ADDRESS_CLAMP_TO_EDGE : SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
             cs.t_address  = cs.s_address;
+            if (b == 7 || b == 8) {
+                cs.anisotropy_enable = SPVC_TRUE;
+                cs.max_anisotropy = 16;
+                cs.s_address = cs.t_address = b == 8 ? SPVC_MSL_SAMPLER_ADDRESS_CLAMP_TO_EDGE : SPVC_MSL_SAMPLER_ADDRESS_REPEAT;
+            }
             spvc_compiler_msl_remap_constexpr_sampler(compiler, list[i].id, &cs);
         }
     }
@@ -599,7 +638,14 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
     }
 
     SpvExecutionModel em = spvc_compiler_get_execution_model(compiler);
+    /* `next` keeps the SPIR-V bindings unique (one resource per (set 0, binding));
+     * the MSL indices count per argument table, as Metal has one table for buffers
+     * (31) and one for textures and samplers (16 samplers). With one shared count a
+     * fragment stage with a UBO, three storage buffers and 13 samplers asked for
+     * [[sampler(16)]] and did not compile. */
     unsigned next = 0;
+    unsigned next_buf = 0;
+    unsigned next_tex = 0;
 
     res->uses_bindless = metal_msl_bindless(compiler, resources, em);
 
@@ -619,19 +665,20 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
             b->kind      = buffer_kinds[k].kind;
             b->set       = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet);
             b->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
-            b->msl_index = (int)next;
+            b->msl_index = (int)next_buf;
             if (b->kind == 2) {
                 metal_gfx_add_binding(compiler, em, SPVC_MSL_PUSH_CONSTANT_DESC_SET,
-                                      SPVC_MSL_PUSH_CONSTANT_BINDING, next);
+                                      SPVC_MSL_PUSH_CONSTANT_BINDING, next_buf);
             } else {
                 spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
                 spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
-                metal_gfx_add_binding(compiler, em, 0, next, next);
+                metal_gfx_add_binding(compiler, em, 0, next, next_buf);
             }
             if (res->cbuffer_index < 0 && b->kind != 1) {
-                res->cbuffer_index = (int)next;
+                res->cbuffer_index = (int)next_buf;
             }
             next++;
+            next_buf++;
         }
     }
 
@@ -643,7 +690,7 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
         for (size_t i = 0; i < count && res->texture_count < VIO_METAL_MAX_RES; i++) {
             vio_metal_res_texture *t = &res->textures[res->texture_count++];
             t->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
-            t->msl_index = (int)next;
+            t->msl_index = (int)next_tex;
             snprintf(t->name, sizeof(t->name), "%s", list[i].name ? list[i].name : "");
             spvc_type type = spvc_compiler_get_type_handle(compiler, list[i].type_id);
             spvc_type image = type ? spvc_compiler_get_type_handle(compiler, spvc_type_get_base_type_id(type)) : NULL;
@@ -653,8 +700,9 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
             }
             spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
             spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
-            metal_gfx_add_binding(compiler, em, 0, next, next);
+            metal_gfx_add_binding(compiler, em, 0, next, next_tex);
             next++;
+            next_tex++;
         }
     }
 
@@ -671,7 +719,7 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
             if (spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet) != 0) continue;
             vio_metal_res_texture *t = &res->textures[res->texture_count++];
             t->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
-            t->msl_index = (int)next;
+            t->msl_index = (int)next_tex;
             snprintf(t->name, sizeof(t->name), "%s", list[i].name ? list[i].name : "");
             spvc_type image = spvc_compiler_get_type_handle(compiler, list[i].type_id);
             if (image) {
@@ -680,8 +728,9 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
             }
             spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
             spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
-            metal_gfx_add_binding(compiler, em, 0, next, next);
+            metal_gfx_add_binding(compiler, em, 0, next, next_tex);
             next++;
+            next_tex++;
         }
         spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS, &list, &count);
         for (size_t i = 0; i < count; i++) {
@@ -705,11 +754,12 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
             b->kind      = 3;
             b->set       = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet);
             b->binding   = (int)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
-            b->msl_index = (int)next;
+            b->msl_index = (int)next_buf;
             spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationDescriptorSet, 0);
             spvc_compiler_set_decoration(compiler, list[i].id, SpvDecorationBinding, next);
-            metal_gfx_add_binding(compiler, em, 0, next, next);
+            metal_gfx_add_binding(compiler, em, 0, next, next_buf);
             next++;
+            next_buf++;
         }
     }
 
@@ -737,6 +787,32 @@ static char *metal_gfx_spirv_to_msl(const uint32_t *spirv, size_t spirv_size, vi
                 vl->vertex_stride += in->components * in->columns * (int)sizeof(float);
             }
         }
+    }
+
+    if (stage == VIO_MSL_TESS_CONTROL || stage == VIO_MSL_TESS_EVAL) {
+        /* The control points arrive as structs in a buffer, laid out from the
+         * inputs this stage uses; the previous stage's record has gl_Position
+         * behind its varyings. A stage that does not read gl_in[].gl_Position
+         * gets a 16-byte pad at that place, so its struct has the writer's size
+         * (test 290: the TES read every control point but the first from the
+         * wrong offset and drew nothing). */
+        spvc_compiler_update_active_builtins(compiler);
+        if (tess->prev_writes_position &&
+            !spvc_compiler_has_active_builtin(compiler, SpvBuiltInPosition, SpvStorageClassInput)) {
+            spvc_msl_shader_interface_var_2 pad;
+            spvc_msl_shader_interface_var_init_2(&pad);
+            pad.location = (unsigned)tess->prev_out_locations;
+            pad.format   = SPVC_MSL_SHADER_VARIABLE_FORMAT_ANY32;
+            pad.vecsize  = 4;
+            pad.rate     = SPVC_MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+            spvc_compiler_msl_add_shader_input_2(compiler, &pad);
+        }
+    }
+    if (stage == VIO_MSL_VERTEX_TESS || stage == VIO_MSL_TESS_CONTROL) {
+        /* What the next stage's input struct has to match (see above). */
+        spvc_compiler_update_active_builtins(compiler);
+        tess->prev_writes_position = spvc_compiler_has_active_builtin(compiler, SpvBuiltInPosition, SpvStorageClassOutput) ? 1 : 0;
+        tess->prev_out_locations = metal_output_locations(compiler, resources, stage == VIO_MSL_TESS_CONTROL);
     }
 
     if (stage == VIO_MSL_VERTEX_TESS) {

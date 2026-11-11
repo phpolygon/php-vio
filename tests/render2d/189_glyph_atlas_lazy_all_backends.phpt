@@ -39,7 +39,7 @@ foreach (['opengl', 'd3d11', 'd3d12', 'vulkan', 'metal'] as $b) {
     $fail = [];
     $font = vio_font($ctx, $fontPath, 32.0);
     $i = vio_font_info($font);
-    if (array_keys($i) !== ['glyphs', 'rasterized', 'atlas_size', 'lazy']) $fail[] = "keys " . json_encode(array_keys($i));
+    if (array_keys($i) !== ['glyphs', 'rasterized', 'atlas_size', 'lazy', 'sdf']) $fail[] = "keys " . json_encode(array_keys($i));
     if (!$i['lazy'] || $i['rasterized'] !== 0 || $i['glyphs'] < 100) $fail[] = "after vio_font " . json_encode($i);
     vio_text_measure($font, "Measured only: XYZ");
     if (vio_font_info($font)['rasterized'] !== 0) $fail[] = "measure rasterized";

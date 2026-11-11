@@ -102,6 +102,14 @@ typedef struct _vio_render_target_object {
      * metal_color_texture is then the single-sample RESOLVE texture. */
     void        *metal_msaa_color_texture; /* id<MTLTexture> 2DMultisample (CFRetained) */
     void        *metal_msaa_depth_texture; /* id<MTLTexture> 2DMultisample (CFRetained) */
+    /* Cube / array MSAA on a device without 2DMultisampleArray: one 2DMultisample
+     * colour / depth texture per layer (NSArray, CFRetained); the two above are
+     * then layer 0's. */
+    void        *metal_msaa_layer_colors;
+    void        *metal_msaa_layer_depths;
+    /* MSAA cube: the 6-slice 2DArray holding the faces (resolve target of a
+     * face); metal_color_texture is a cube view of it. */
+    void        *metal_cube_resolve_view;
 
     /* Vulkan: vio_vk_rt* (src/backends/vulkan/vio_vulkan.h) - attachments, MSAA
      * images, render passes, framebuffers (per cube face / level), sampler and the
@@ -155,6 +163,7 @@ typedef struct _vio_render_target_object {
     /* D3D12 cached SRV for shadow map sampling (allocated once at RT creation) */
     uint64_t     d3d12_depth_srv_gpu; /* D3D12_GPU_DESCRIPTOR_HANDLE.ptr */
     uint64_t     d3d12_depth_srv_cpu; /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
+    uint32_t     d3d12_srv_gen;       /* SRV heap generation of all the target's static SRVs */
     uint64_t     d3d12_color_srv_gpu; /* D3D12_GPU_DESCRIPTOR_HANDLE.ptr */
     uint64_t     d3d12_color_srv_cpu; /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
     /* Cached vio_d3d12_texture wrapper, same lifecycle as the D3D11 pair. */

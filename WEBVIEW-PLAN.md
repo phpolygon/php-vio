@@ -1,6 +1,6 @@
 # System-Webview – Plan
 
-> **Status:** 🚧 macOS und Linux umgesetzt (2026-11-06, Tests 277–284), Issue #120. Offen: Win32 (WebView2).
+> **Status:** 🚧 macOS und Linux umgesetzt (2026-11-06, Tests 292–299), Issue #120. Offen: Win32 (WebView2).
 > **Baut auf:** `DESKTOP-APP-PLAN.md` Phasen 0–5 (Event-Loop, mehrere Fenster, Menüs, Dialoge, Tray, IME, AccessKit).
 > **Ziel:** NativePHP-Apps (Laravel + Blade/Livewire/Inertia) laufen auf php-vio ohne Electron. php-vio liefert eine
 > System-Webview als Kind eines `VioWindow` und eine Brücke, die Anfragen der Webview im selben Prozess an PHP gibt –
@@ -93,9 +93,9 @@ Runtime auf den Windows-Runnern, WPE-Pakete und -Backend auf Ubuntu 24.04 (Xvfb 
 ### W1 – Win32 und Cocoa – ✅ Cocoa
 `vio_webview`, `_navigate`, `_eval`, `_bounds`, `_destroy`, `'schemes'` (Antwort als String, Binärdaten), Nachrichten
 in beide Richtungen, Devtools, Resize folgt dem Fenster, Freigabe mit dem Fenster.
-**Tests:** 277 Vertrag (`vio_platform_info()['webview']`, `false` auf GLFW/null ohne Warnung, Argumentfehler →
-`ValueError`, Freigabe vor/nach dem Fenster), 278 Scheme (HTML + JS + CSS + PNG aus PHP, `fetch` POST mit JSON- und
-Binär-Body, Header, Status 404/302), 279 Brücke (Seite meldet sich per `postMessage`, PHP antwortet per `eval`, die
+**Tests:** 292 Vertrag (`vio_platform_info()['webview']`, `false` auf GLFW/null ohne Warnung, Argumentfehler →
+`ValueError`, Freigabe vor/nach dem Fenster), 293 Scheme (HTML + JS + CSS + PNG aus PHP, `fetch` POST mit JSON- und
+Binär-Body, Header, Status 404/302), 294 Brücke (Seite meldet sich per `postMessage`, PHP antwortet per `eval`, die
 Seite bestätigt). Skip mit Grund ohne Runtime.
 
 ### W2 – Linux – ✅ WPE + WebKitGTK, X11 + Wayland
@@ -107,18 +107,18 @@ beendet hat, läuft als Stream über ein Socket-Paar. Navigationen erkennt das M
 - GTK macht in unserem Prozess seinen eigenen GL-/EGL-Kontext aktuell; jede GLib-Auslieferung stellt vios Kontext wieder her.
 - JavaScriptCore übernimmt SIGUSR1 (PHPs Zend-Signals) und meldet das auf stderr; vio gibt das Signal vorher frei.
 - Ohne Barrierefreiheits-Bus bzw. ohne Seat (headless weston) warnt GTK; diese beiden Meldungen werden gefiltert.
-- GTK3 hört auf XInput2 und ignoriert per `XSendEvent` geschickte Core-Ereignisse; Test 284 nutzt deshalb XTest.
+- GTK3 hört auf XInput2 und ignoriert per `XSendEvent` geschickte Core-Ereignisse; Test 299 nutzt deshalb XTest.
 - Ein umgehängtes Override-Redirect-Fenster bekommt keinen Tastaturfokus vom Fenstermanager: ein Klick in die Webview
   nimmt ihn (beide Engines), ein Klick ins vio-Fenster gibt ihn zurück.
 - Der erste WebKit-Webprozess nach einem Build braucht im Container über 20 s; die Tests warten bis 60 s.
 Nicht automatisch geprüft: sichtbare Webviews unter Wayland (WPE-Subsurface, GTK-Fenster) und Wayland-Eingabe (headless weston
 hat keinen Seat). Tastenwiederholung in einer WPE-Webview unter Wayland fehlt (vios Wiederholung ist clientseitig).
 
-### W3 – Laravel-tauglich – ✅ Cocoa (+ Test 283 Weiterleitungen)
+### W3 – Laravel-tauglich – ✅ Cocoa (+ Test 298 Weiterleitungen)
 Streaming-Antworten (`body` als iterable: ein Chunk je Schleifendurchlauf, die Webview bleibt bedienbar), große
 Bodies ohne Komplettkopie, Cookies/Herkunft nach Entscheidung 2, `vio_webview_on_event` (navigated, title, new_window →
 Standard: `vio_open_url`), `'transparent' => true` über GPU-Inhalt.
-**Tests:** 280 Streaming + SSE, 281 Cookies/Session über zwei Anfragen und einen Neustart der Seite, 282 Webview neben
+**Tests:** 295 Streaming + SSE, 296 Cookies/Session über zwei Anfragen und einen Neustart der Seite, 297 Webview neben
 einem Viewport im selben Fenster (`vio_read_pixels` sieht den GPU-Teil).
 
 ### W4 – Beispiel, Doku, Lücken – ✅ bis auf die Folge-Issues
@@ -165,8 +165,8 @@ Der Rest von W1. Alles andere (Kern, Cookies, Redirects, Streaming, Tests) steht
 7. **Größe:** Controller-`Bounds` in Pixeln (logisch × DPI-Scale des Fensters), ohne Bounds der Client-Bereich, bei `WM_SIZE` nachführen.
    Headless (`WS_POPUP`, unsichtbar): Controller trotzdem anlegen, `IsVisible = TRUE`.
 
-**Prüfen:** Tests 277–283 müssen grün sein (sie skippen bisher auf Windows), 263 erwartet für win32 `webview` = 1 oder 0 –
-nach der Umsetzung auf `1` festziehen (`tests/window/263`, Muster `'win32'`). Nach dem Muster von 284 einen Test für echte
+**Prüfen:** Tests 292–298 müssen grün sein (sie skippen bisher auf Windows), 263 erwartet für win32 `webview` = 1 oder 0 –
+nach der Umsetzung auf `1` festziehen (`tests/window/263`, Muster `'win32'`). Nach dem Muster von 299 einen Test für echte
 Eingabe auf Win32 (`SendInput`/`PostMessageW` per FFI an das Kindfenster des Controllers) als 285 ergänzen. Zusätzlich
 `examples/webview_laravel.php <app> --smoke`. Danach in der Windows-CI WebView2 (ist auf den Runnern installiert) über
 `VIO_REQUIRE_WEBVIEW=1` zur Pflicht machen, CLAUDE.md (Testtabelle, „nächste freie“) und diesen Plan nachziehen.

@@ -8,7 +8,7 @@ if (!extension_loaded('vio') || vio_platform() !== 'x11' || !getenv('DISPLAY')) 
 ?>
 --FILE--
 <?php
-$dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'vio284-' . getmypid();
+$dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'vio299-' . getmypid();
 @mkdir($dir);
 $child = <<<'PHP'
 <?php
@@ -23,7 +23,7 @@ try {
         XImage *XGetImage(void *, Window, int, int, unsigned, unsigned, unsigned long, int); unsigned long XGetPixel(XImage *, int, int);', 'libX11.so.6');
     $t = FFI::cdef('int XTestFakeButtonEvent(void *, unsigned, int, unsigned long); int XTestFakeKeyEvent(void *, unsigned, int, unsigned long);', 'libXtst.so.6');
 } catch (FFI\Exception $e) { echo "no xtest\n"; exit; }
-$ctx = vio_create('auto', ['width' => 200, 'height' => 150, 'title' => 'vio284']);
+$ctx = vio_create('auto', ['width' => 200, 'height' => 150, 'title' => 'vio299']);
 $page = '<!doctype html><body style="margin:0;background:rgb(0,0,255)"><input id="i" style="position:absolute;left:0;top:0;width:80px;height:30px"><script>'
       . 'const i = document.getElementById("i");'
       . 'i.addEventListener("mousedown", () => window.vio.postMessage("down"));'

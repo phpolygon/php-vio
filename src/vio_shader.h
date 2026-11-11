@@ -13,9 +13,14 @@
 #include "../include/vio_types.h"
 #include "vio_shader_reflect.h"
 
-#define VIO_MAX_UNIFORMS 256
-#define VIO_CBUFFER_SIZE 4096
-#define VIO_MAX_SAMPLERS 16
+/* Uniform tables and constant shadows are sized by each stage's reflection; the
+ * backend's constant-buffer size (vio_backend::uniform_block_limit) is the only
+ * limit. The name lookup packs (stage, offset, size) into one zend_long. */
+#define VIO_UNIFORM_ENC(stage, offset, size) ((zend_long)1 << 62 | (zend_long)(stage) << 58 \
+    | ((zend_long)(offset) & 0x1FFFFFFF) << 29 | ((zend_long)(size) & 0x1FFFFFFF))
+#define VIO_UNIFORM_STAGE(e)  ((int)(((e) >> 58) & 0xF))
+#define VIO_UNIFORM_OFFSET(e) ((int)(((e) >> 29) & 0x1FFFFFFF))
+#define VIO_UNIFORM_SIZE(e)   ((int)((e) & 0x1FFFFFFF))
 
 typedef struct _vio_uniform_entry {
     char    name[64];
@@ -43,8 +48,8 @@ struct _vio_backend;
  * Same layout/lifecycle as the vertex cbuffer fields below; allocated only
  * when the stage exists so the common VS+FS shader object stays small. */
 typedef struct _vio_shader_stage_cb {
-    unsigned char     data[VIO_CBUFFER_SIZE];
-    vio_uniform_entry uniforms[VIO_MAX_UNIFORMS];
+    unsigned char    *data;      /* constant shadow, total_size bytes (emalloc) */
+    vio_uniform_entry *uniforms;  /* uniform_count entries (emalloc) */
     int               uniform_count;
     int               total_size;
     void             *backend;   /* backend constant buffer (create_buffer) */
@@ -85,15 +90,15 @@ typedef struct _vio_shader_object {
     size_t            task_spirv_size;
     void             *backend_shader; /* Backend-specific compiled shader (D3D11/D3D12/Vulkan) */
     /* Uniform buffer for D3D constant buffer mapping — vertex stage */
-    unsigned char     cbuffer_data[VIO_CBUFFER_SIZE];
-    vio_uniform_entry uniforms[VIO_MAX_UNIFORMS];
+    unsigned char    *cbuffer_data;   /* cbuffer_total_size bytes (emalloc) */
+    vio_uniform_entry *uniforms;      /* uniform_count entries (emalloc) */
     int               uniform_count;
     int               cbuffer_total_size;
     void             *cbuffer_backend;  /* Backend constant buffer (vertex) */
     int               cbuffer_dirty;    /* 1 if data changed since last upload */
     /* Fragment stage constant buffer */
-    unsigned char     frag_cbuffer_data[VIO_CBUFFER_SIZE];
-    vio_uniform_entry frag_uniforms[VIO_MAX_UNIFORMS];
+    unsigned char    *frag_cbuffer_data;   /* frag_cbuffer_total_size bytes (emalloc) */
+    vio_uniform_entry *frag_uniforms;      /* frag_uniform_count entries (emalloc) */
     int               frag_uniform_count;
     int               frag_cbuffer_total_size;
     void             *frag_cbuffer_backend;
@@ -103,19 +108,26 @@ typedef struct _vio_shader_object {
      * from the buffer bound at that binding (OPEN-ITEMS-PLAN A32). */
     int               block_binding;
     int               frag_block_binding;
-    /* Sampler binding map: sampler_names[i] -> hlsl register i */
-    char              sampler_names[VIO_MAX_SAMPLERS][64];
-    int               sampler_is_depth[VIO_MAX_SAMPLERS]; /* 1 if sampler2DShadow */
-    int               sampler_hlsl_reg[VIO_MAX_SAMPLERS];  /* actual HLSL t-register assigned by the
-                                                            * cross-compiler (regular: 0,1,2..; depth: 4,5,6..)
-                                                            * — mirrors vio_shader_reflect.c emit logic */
+    /* Sampler binding map: sampler_names[i] -> hlsl register i. Sized by the
+     * shader's reflection (vio_shader_sampler_reserve), no fixed limit: the
+     * context's texture units bound it (SAMPLER-LIMITS-PLAN). */
+    char            (*sampler_names)[64];
+    int              *sampler_is_depth;   /* 1 if sampler2DShadow */
+    int              *sampler_hlsl_reg;   /* actual HLSL t-register assigned by the cross-compiler
+                                           * — mirrors vio_shader_reflect.c emit logic */
     int               sampler_count;
-    /* Runtime GL-slot to HLSL-binding remap: gl_to_hlsl[gl_slot] = hlsl_binding (-1 = unmapped) */
-    int               gl_to_hlsl_sampler[16];
+    int               sampler_cap;
+    /* Runtime GL-unit to sampler remap: gl_to_hlsl[unit] = sampler index (-1 =
+     * unmapped). unit_count is the context's texture units (the limit); the
+     * table grows to the highest unit set (gl_to_hlsl_cap), so a backend with a
+     * million units costs nothing until they are used. */
+    int              *gl_to_hlsl_sampler;
+    int               gl_to_hlsl_cap;
+    int               unit_count;
     /* GL texture unit each sampler reads, as on OpenGL: the layout(binding)
      * (0 without one) until vio_set_uniform(name, unit) sets it. The typed-
      * register backends bind every sampler from its unit at draw time. */
-    int               sampler_unit[VIO_MAX_SAMPLERS];
+    int              *sampler_unit;
     /* Lazily-built name -> (stage,offset,size) map for O(1) uniform lookup on the
      * hot draw path (replaces a linear strcmp scan run for every uniform set).
      * NULL until first use; freed in vio_shader_free_object. */
@@ -127,6 +139,18 @@ typedef struct _vio_shader_object {
 } vio_shader_object;
 
 extern zend_class_entry *vio_shader_ce;
+/* Grow the sampler tables to hold at least n samplers (SAMPLER-LIMITS-PLAN). */
+void vio_shader_sampler_reserve(vio_shader_object *shader, int n);
+/* Set the texture-unit limit of the GL-unit remap (the table grows on use). */
+void vio_shader_units_init(vio_shader_object *shader, int units);
+/* Grow the GL-unit remap to hold unit `n - 1` (new entries unmapped). */
+void vio_shader_unit_reserve(vio_shader_object *shader, int n);
+/* Sampler index a GL unit is remapped to, -1 when none or out of range. */
+static inline int vio_shader_unit_map(const vio_shader_object *shader, long unit)
+{
+    return (shader->gl_to_hlsl_sampler && unit >= 0 && unit < shader->gl_to_hlsl_cap)
+        ? shader->gl_to_hlsl_sampler[unit] : -1;
+}
 
 void vio_shader_register(void);
 

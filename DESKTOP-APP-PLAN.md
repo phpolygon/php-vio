@@ -254,7 +254,7 @@ vio_key_pressed($tool, VIO_KEY_A);   // Eingabe-Funktionen nehmen VioContext|Vio
 ### Phase 6 – System-Webview (Issue #120) – 🚧 macOS und Linux umgesetzt
 
 Webview als Kind eines `VioWindow` (WebView2, WKWebView, WPE WebKit), Custom Scheme → PHP im selben
-Prozess, JS ↔ PHP-Nachrichten; Grundlage für NativePHP-Apps ohne Electron. Plan, Phasen W0–W4 und Tests 277–284 in
+Prozess, JS ↔ PHP-Nachrichten; Grundlage für NativePHP-Apps ohne Electron. Plan, Phasen W0–W4 und Tests 292–299 in
 `WEBVIEW-PLAN.md`.
 
 ## 4. Entscheidungen

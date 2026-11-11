@@ -71,7 +71,10 @@ static int gl_owned_by_live_context(unsigned int gen)
  * `<struct>.name[0]` for arrays, whose location covers the whole array) suffix
  * among the program's active uniforms. Lookups are cached per (program, name);
  * entries are dropped when their program is deleted, because GL reuses program
- * ids. */
+ * ids. Every entry also carries the context generation it was made in: the next
+ * context hands out the same program ids again, and a program that outlived its
+ * context (a VioShader still referenced at vio_destroy) never had its entries
+ * dropped. */
 #define GL_ULOC_CACHE_SIZE 1024
 #define GL_ULOC_NAME_MAX   56
 
@@ -85,6 +88,7 @@ static int gl_owned_by_live_context(unsigned int gen)
 
 typedef struct {
     GLuint program;   /* 0 = empty slot */
+    unsigned int gen; /* gl_context_generation the entry belongs to */
     GLint  loc;
     GLint  alt[GL_ULOC_ALT_MAX];
     char   name[GL_ULOC_NAME_MAX];
@@ -100,10 +104,15 @@ static unsigned gl_uloc_hash(GLuint program, const char *name)
 }
 
 static void gl_shadow_forget_program(GLuint program);
+static void gl_shadow_cache_reset(void);
 
-static void gl_uloc_forget_program(GLuint program)
+/* Drop the cached lookups of a program that is being deleted. `gen` is the
+ * context generation the program was created in: a program of a dead context
+ * must not touch the caches, its id may already name a program of the live
+ * context. */
+static void gl_uloc_forget_program(GLuint program, unsigned int gen)
 {
-    if (!program) return;
+    if (!program || !gl_owned_by_live_context(gen)) return;
     for (int i = 0; i < GL_ULOC_CACHE_SIZE; i++) {
         if (gl_uloc_cache[i].program == program) gl_uloc_cache[i].program = 0;
     }
@@ -135,11 +144,15 @@ static int gl_uloc_suffix_scan(GLuint program, const char *name, size_t len, GLi
     size_t nlen = gl_uloc_normalize(name, norm, sizeof(norm));
     GLint count = 0;
     glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
-    char buf[256], full[512];
+    char raw[256], buf[256], full[512];
     int found = 0;
     for (GLint i = 0; i < count && found < max; i++) {
-        GLsizei n = 0; GLint size = 0; GLenum type = 0;
-        glGetActiveUniform(program, (GLuint)i, (GLsizei)sizeof(buf), &n, &size, &type, buf);
+        GLsizei rn = 0; GLint size = 0; GLenum type = 0;
+        glGetActiveUniform(program, (GLuint)i, (GLsizei)sizeof(raw), &rn, &size, &type, raw);
+        /* Both sides normalised: an array of structs lists every element it uses
+         * ("u_l[7].c"), not only [0], so the element asked for may be active while
+         * u_l[0].c is not. */
+        GLsizei n = (GLsizei)gl_uloc_normalize(raw, buf, sizeof(buf));
         /* active name = "<prefix>.<norm>" ? */
         if (n <= (GLsizei)nlen + 1 || buf[n - nlen - 1] != '.' || strcmp(buf + n - nlen, norm) != 0) continue;
         size_t plen = (size_t)n - nlen - 1;
@@ -148,7 +161,9 @@ static int gl_uloc_suffix_scan(GLuint program, const char *name, size_t len, GLi
         full[plen] = '.';
         memcpy(full + plen + 1, name, len + 1);
         GLint loc = glGetUniformLocation(program, full);   /* exact element (or element 0 for a bare array name) */
-        if (loc >= 0) out[found++] = loc;
+        int seen = 0;
+        for (int k = 0; k < found; k++) if (out[k] == loc) seen = 1;
+        if (loc >= 0 && !seen) out[found++] = loc;
     }
     return found;
 }
@@ -164,11 +179,12 @@ static GLint gl_uniform_location_all(GLuint program, const char *name, GLint *al
     if (cacheable) {
         for (int probe = 0; probe < 8; probe++) {
             gl_uloc_entry *e = &gl_uloc_cache[(idx + probe) % GL_ULOC_CACHE_SIZE];
-            if (e->program == program && strcmp(e->name, name) == 0) {
+            int live = e->program != 0 && e->gen == gl_context_generation;
+            if (live && e->program == program && strcmp(e->name, name) == 0) {
                 if (alt) memcpy(alt, e->alt, sizeof(e->alt));
                 return e->loc;
             }
-            if (e->program == 0 && !slot) slot = e;
+            if (!live && !slot) slot = e;
         }
         if (!slot) slot = &gl_uloc_cache[idx];   /* window full: evict */
     }
@@ -184,6 +200,7 @@ static GLint gl_uniform_location_all(GLuint program, const char *name, GLint *al
 
     if (slot) {
         slot->program = program;
+        slot->gen = gl_context_generation;
         slot->loc = loc;
         memcpy(slot->alt, found + 1, sizeof(slot->alt));
         memcpy(slot->name, name, len + 1);
@@ -335,10 +352,11 @@ unsigned int vio_opengl_compile_program(const char *vert_src, const char *frag_s
     return program;
 }
 
+/* Deletes a program of the live context (no-op without one). */
 void vio_opengl_delete_program(unsigned int program)
 {
-    if (program) {
-        gl_uloc_forget_program(program);
+    if (program && vio_gl.initialized) {
+        gl_uloc_forget_program(program, gl_context_generation);
         glDeleteProgram(program);
     }
 }
@@ -485,6 +503,7 @@ static void opengl_shutdown(void)
     if (vio_gl.renderer) { free(vio_gl.renderer); vio_gl.renderer = NULL; }
     if (vio_gl.vendor)   { free(vio_gl.vendor);   vio_gl.vendor   = NULL; }
     memset(gl_uloc_cache, 0, sizeof(gl_uloc_cache));   /* program ids die with the context */
+    gl_shadow_cache_reset();
     vio_gl.initialized = 0;
 }
 
@@ -647,8 +666,8 @@ static void *opengl_compile_shader(vio_shader_desc *desc)
 static void opengl_destroy_shader(void *shader)
 {
     unsigned int program = (unsigned int)(uintptr_t)shader;
-    if (program) {
-        gl_uloc_forget_program(program);
+    if (program && vio_gl.initialized) {
+        gl_uloc_forget_program(program, gl_context_generation);
         glDeleteProgram(program);
     }
 }
@@ -1240,7 +1259,7 @@ static void opengl_destroy_shader_obj(void *shader_obj)
 {
     vio_shader_object *sh = (vio_shader_object *)shader_obj;
     if (sh->program) {
-        gl_uloc_forget_program(sh->program);
+        gl_uloc_forget_program(sh->program, sh->gl_generation);
         if (gl_owned_by_live_context(sh->gl_generation)) glDeleteProgram(sh->program);
         sh->program = 0;
     }
@@ -2373,13 +2392,30 @@ static int opengl_update_font_atlas(void *font_obj, const unsigned char *r8, int
  * white border. The units are released after the draw so the 2D batch and
  * later draws sample them normally. */
 #define GL_SHADOW_CACHE_SIZE 64
-#define GL_SHADOW_MAX_LOCS   16
 
 typedef struct {
     GLuint program;                    /* 0 = empty slot */
+    unsigned int gen;                  /* gl_context_generation the entry belongs to */
     int    count;                      /* shadow sampler locations (array elements expanded) */
-    GLint  locs[GL_SHADOW_MAX_LOCS];
+    int    cap;
+    GLint *locs;                       /* grows with the program (SAMPLER-LIMITS-PLAN) */
 } gl_shadow_entry;
+
+/* Units the comparison sampler is bound to during the current draw. */
+static GLint *gl_shadow_bound;
+static int    gl_shadow_bound_cap;
+
+static void gl_shadow_add_loc(gl_shadow_entry *e, GLint loc)
+{
+    if (e->count >= e->cap) {
+        int cap = e->cap > 0 ? e->cap * 2 : 16;
+        GLint *nl = realloc(e->locs, (size_t)cap * sizeof(GLint));
+        if (!nl) return;
+        e->locs = nl;
+        e->cap = cap;
+    }
+    e->locs[e->count++] = loc;
+}
 
 static gl_shadow_entry gl_shadow_cache[GL_SHADOW_CACHE_SIZE];
 static GLuint   gl_cmp_sampler;
@@ -2389,6 +2425,16 @@ static void gl_shadow_forget_program(GLuint program)
 {
     for (int i = 0; i < GL_SHADOW_CACHE_SIZE; i++) {
         if (gl_shadow_cache[i].program == program) gl_shadow_cache[i].program = 0;
+    }
+}
+
+/* Program ids die with the context (opengl_shutdown); the location buffers are
+ * kept for the next one. */
+static void gl_shadow_cache_reset(void)
+{
+    for (int i = 0; i < GL_SHADOW_CACHE_SIZE; i++) {
+        gl_shadow_cache[i].program = 0;
+        gl_shadow_cache[i].count = 0;
     }
 }
 
@@ -2413,12 +2459,15 @@ static const gl_shadow_entry *gl_shadow_entry_for(GLuint program)
 {
     unsigned slot = (program * 2654435761u) % GL_SHADOW_CACHE_SIZE;
     gl_shadow_entry *e = &gl_shadow_cache[slot];
-    if (e->program == program) return e;
+    /* A stale entry (same id, earlier context) lists locations of another
+     * program: never reuse it. */
+    if (e->program == program && e->gen == gl_context_generation) return e;
     e->program = program;
+    e->gen = gl_context_generation;
     e->count = 0;
     GLint active = 0;
     glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &active);
-    for (GLint u = 0; u < active && e->count < GL_SHADOW_MAX_LOCS; u++) {
+    for (GLint u = 0; u < active; u++) {
         char name[128];
         GLint size = 0;
         GLenum type = 0;
@@ -2427,19 +2476,20 @@ static const gl_shadow_entry *gl_shadow_entry_for(GLuint program)
         /* Array elements may not have consecutive locations: query each one. */
         char *bracket = strchr(name, '[');
         if (bracket) *bracket = '\0';
-        for (GLint k = 0; k < size && e->count < GL_SHADOW_MAX_LOCS; k++) {
+        for (GLint k = 0; k < size; k++) {
             char elem[160];
             if (size > 1) snprintf(elem, sizeof(elem), "%s[%d]", name, (int)k);
             else snprintf(elem, sizeof(elem), "%s", name);
             GLint loc = glGetUniformLocation(program, elem);
-            if (loc >= 0) e->locs[e->count++] = loc;
+            if (loc >= 0) gl_shadow_add_loc(e, loc);
         }
     }
     return e;
 }
 
 /* Bind the comparison sampler to every unit the current program's shadow
- * samplers read; returns the bound units as a bit mask for gl_shadow_end(). */
+ * samplers read; returns how many units it bound (gl_shadow_bound) for
+ * gl_shadow_end(). */
 /* ── Multiview (GL_OVR_multiview2) ────────────────────────────────────
  * A program compiled with 'view_count' draws every view into one layer of the
  * target bound with VIO_RT_ALL_LAYERS: its attachments become multiview
@@ -2588,23 +2638,45 @@ static unsigned gl_shadow_begin(void)
         glSamplerParameteri(gl_cmp_sampler, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_BORDER);
         glSamplerParameterfv(gl_cmp_sampler, GL_TEXTURE_BORDER_COLOR, white);
     }
-    unsigned mask = 0;
-    for (int i = 0; i < e->count; i++) {
-        GLint unit = 0;
-        glGetUniformiv((GLuint)program, e->locs[i], &unit);
-        if (unit < 0 || unit >= 32 || (mask & (1u << unit))) continue;
-        glBindSampler((GLuint)unit, gl_cmp_sampler);
-        mask |= 1u << unit;
+    if (e->count > gl_shadow_bound_cap) {
+        GLint *nb = realloc(gl_shadow_bound, (size_t)e->count * sizeof(GLint));
+        if (!nb) return 0;
+        gl_shadow_bound = nb;
+        gl_shadow_bound_cap = e->count;
     }
-    return mask;
+    unsigned n = 0;
+    for (int i = 0; i < e->count; i++) {
+        /* glGetUniformiv writes every component of the uniform at the location
+         * (16 for a mat4/dmat4); a sampler has one, but never hand the driver a
+         * buffer smaller than any uniform could need. */
+        GLint value[16] = { 0 };
+        glGetUniformiv((GLuint)program, e->locs[i], value);
+        GLint unit = value[0];
+        if (unit < 0) continue;
+        int seen = 0;
+        for (unsigned k = 0; k < n && !seen; k++) seen = gl_shadow_bound[k] == unit;
+        if (seen) continue;
+        glBindSampler((GLuint)unit, gl_cmp_sampler);
+        gl_shadow_bound[n++] = unit;
+    }
+    return n;
 }
 
-static void gl_shadow_end(unsigned mask)
+static void gl_shadow_end(unsigned bound)
 {
     gl_clip_end();
-    for (GLuint unit = 0; mask; unit++, mask >>= 1) {
-        if (mask & 1u) glBindSampler(unit, 0);
-    }
+    for (unsigned k = 0; k < bound; k++) glBindSampler((GLuint)gl_shadow_bound[k], 0);
+}
+
+/* SAMPLER-LIMITS-PLAN: the driver's texture image units of one stage (a GL
+ * unit couples a texture and its sampler). */
+static void opengl_texture_limits(int *textures, int *samplers)
+{
+    GLint n = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &n);
+    if (n < 16) n = 16;   /* the GL 4.1 minimum */
+    *textures = (int)n;
+    *samplers = (int)n;
 }
 
 static void opengl_draw_mesh(void *mesh_obj)
@@ -3481,6 +3553,7 @@ static int opengl_supports_feature(vio_feature feature)
 
 static const vio_backend opengl_backend = {
     .name              = "opengl",
+    .texture_limits = opengl_texture_limits,
     .api_version       = VIO_BACKEND_API_VERSION,
     .init              = opengl_init,
     .shutdown          = opengl_shutdown,

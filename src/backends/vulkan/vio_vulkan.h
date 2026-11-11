@@ -313,6 +313,12 @@ typedef struct _vio_vulkan_state {
     /* Viewports of the open pass (vio_viewports). 3D pipelines are built with
      * max_viewports viewports; vk3d_prepare sets every one before a draw. */
     uint32_t                 max_viewports;         /* 1, or min(16, maxViewports) with multiViewport */
+    /* Per-stage texture limits (SAMPLER-LIMITS-PLAN): sampled images / samplers
+     * one stage and one set can take, and the units = the smaller. */
+    int                      tex_limit;
+    int                      ubo_limit;   /* maxUniformBufferRange (uniform_block_limit) */
+    int                      smp_limit;
+    int                      tex_units;
     VkViewport               cur_vp[16];
     VkRect2D                 cur_sc[16];
     uint32_t                 cur_vp_count;
@@ -380,7 +386,7 @@ typedef struct _vio_vulkan_state {
     VkDescriptorPool         bindless_pool;
     VkDescriptorSet          bindless_set;
     VkSampler                bindless_sampler;
-    VkSampler                bindless_sampler_variants[3];   /* nearest, clamp, nearest + clamp (bindings 2..4) */
+    VkSampler                bindless_sampler_variants[5];   /* nearest, clamp, nearest + clamp (bindings 2..4), anisotropic repeat / clamp (bindings 7 / 8) */
     int                      vrs_rates;            /* bit (1 << VIO_SHADING_RATE_*) per supported size */
     int                      shading_rate;         /* sticky VIO_SHADING_RATE_* for 3D draws */
     void                    *vrs_cmd_set;          /* vkCmdSetFragmentShadingRateKHR via vkGetDeviceProcAddr */

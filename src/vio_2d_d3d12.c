@@ -129,6 +129,21 @@ int vio_2d_d3d12_init(vio_2d_d3d12_state *state)
         state->pso_sprites_rgba8 = vio_2d_d3d12_create_pso(vs_blob, ps_sprites_blob, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
     }
 
+    {   /* SDF glyphs (vio_font 'sdf'); without the PSO they draw as coverage text */
+        char *sdf_src = vio_2d_hlsl_with_cb(vio_2d_hlsl_ps_text_sdf);
+        ID3DBlob *sdf_blob = NULL, *sdf_err = NULL;
+        if (sdf_src && SUCCEEDED(D3DCompile(sdf_src, strlen(sdf_src), "vio_2d_ps_text_sdf",
+                NULL, NULL, "main", "ps_5_1", 0, 0, &sdf_blob, &sdf_err))) {
+            state->pso_text_sdf = vio_2d_d3d12_create_pso(vs_blob, sdf_blob, 1, sc_fmt);
+            if (sc_fmt != DXGI_FORMAT_R8G8B8A8_UNORM) {
+                state->pso_text_sdf_rgba8 = vio_2d_d3d12_create_pso(vs_blob, sdf_blob, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+            }
+            ID3D10Blob_Release(sdf_blob);
+        }
+        if (sdf_err) ID3D10Blob_Release(sdf_err);
+        free(sdf_src);
+    }
+
     ID3D10Blob_Release(vs_blob);
     ID3D10Blob_Release(ps_shapes_blob);
     ID3D10Blob_Release(ps_sprites_blob);
@@ -199,6 +214,8 @@ void vio_2d_d3d12_shutdown(vio_2d_d3d12_state *state)
     if (state->pso_shapes)  ID3D12PipelineState_Release(state->pso_shapes);
     if (state->pso_sprites_rgba8) ID3D12PipelineState_Release(state->pso_sprites_rgba8);
     if (state->pso_shapes_rgba8)  ID3D12PipelineState_Release(state->pso_shapes_rgba8);
+    if (state->pso_text_sdf)      ID3D12PipelineState_Release(state->pso_text_sdf);
+    if (state->pso_text_sdf_rgba8) ID3D12PipelineState_Release(state->pso_text_sdf_rgba8);
     memset(state, 0, sizeof(vio_2d_d3d12_state));
 }
 
