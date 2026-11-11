@@ -944,39 +944,75 @@ static void wv_deliver(vio_wv_event *e)
 /* One chunk of every open stream; 1 = some are left. */
 static int wv_pump_streams(void)
 {
+    /* A stream body is user code: it may close its webview or the window, drop
+     * the last reference to any webview, or poll events again. So every webview
+     * is held for the whole pass, and a stream is off its webview's list while
+     * its iterator runs - vio_webview_close() then cannot free it underneath. */
+    static int pumping = 0;
+    if (pumping) return 1;
+
+    size_t n = 0;
+    for (vio_webview_object *wv = vio_webviews; wv; wv = wv->next) n++;
+    if (!n) return 0;
+    vio_webview_object **held = (vio_webview_object **)emalloc(n * sizeof(*held));
+    n = 0;
+    for (vio_webview_object *wv = vio_webviews; wv; wv = wv->next) { held[n++] = wv; GC_ADDREF(&wv->std); }
+
+    pumping = 1;
     int left = 0;
-    for (vio_webview_object *wv = vio_webviews; wv && !EG(exception); wv = wv->next) {
-        vio_wv_stream **pp = &wv->streams;
-        while (*pp && !EG(exception)) {
-            vio_wv_stream *s = *pp;
-            zend_object_iterator *it = s->it;
-            if (!s->started) {
-                s->started = 1;
-                if (it->funcs->rewind) it->funcs->rewind(it);
-            } else {
-                it->funcs->move_forward(it);
-            }
-            int done = EG(exception) || it->funcs->valid(it) != SUCCESS;
-            if (!done) {
-                zval *cur = it->funcs->get_current_data(it);
-                if (EG(exception) || !cur) {
-                    done = 1;
-                } else {
-                    zend_string *str = zval_get_string(cur);
-                    if (ZSTR_LEN(str)) vio_plat()->webview_reply_data(wv->handle, s->id, ZSTR_VAL(str), ZSTR_LEN(str));
-                    zend_string_release(str);
-                }
-            }
-            if (done) {
-                vio_plat()->webview_reply_end(wv->handle, s->id);
-                *pp = s->next;
+    for (size_t i = 0; i < n && !EG(exception); i++) {
+        vio_webview_object *wv = held[i];
+        if (!wv->handle || !wv->streams) continue;
+        vio_wv_stream *todo = wv->streams, *kept = NULL, **kept_tail = &kept;
+        wv->streams = NULL;
+        while (todo) {
+            vio_wv_stream *s = todo;
+            todo = s->next;
+            s->next = NULL;
+            int done = 0;
+            if (!wv->handle) {              /* closed by an earlier stream of this pass */
                 wv_stream_free(s);
                 continue;
             }
-            left = 1;
-            pp = &s->next;
+            if (!EG(exception)) {
+                zend_object_iterator *it = s->it;
+                if (!s->started) {
+                    s->started = 1;
+                    if (it->funcs->rewind) it->funcs->rewind(it);
+                } else {
+                    it->funcs->move_forward(it);
+                }
+                done = EG(exception) || it->funcs->valid(it) != SUCCESS;
+                if (!done) {
+                    zval *cur = it->funcs->get_current_data(it);
+                    if (EG(exception) || !cur) {
+                        done = 1;
+                    } else {
+                        zend_string *str = zval_get_string(cur);
+                        if (wv->handle && ZSTR_LEN(str))
+                            vio_plat()->webview_reply_data(wv->handle, s->id, ZSTR_VAL(str), ZSTR_LEN(str));
+                        zend_string_release(str);
+                    }
+                }
+            }
+            if (!wv->handle) {              /* the body closed the webview: nothing to answer */
+                wv_stream_free(s);
+            } else if (done) {
+                vio_plat()->webview_reply_end(wv->handle, s->id);
+                wv_stream_free(s);
+            } else {
+                *kept_tail = s;
+                kept_tail = &s->next;
+                left = 1;
+            }
         }
+        /* streams that arrived during the pass go behind the ones kept */
+        *kept_tail = wv->streams;
+        wv->streams = kept;
     }
+    pumping = 0;
+    for (size_t i = 0; i < n; i++) OBJ_RELEASE(&held[i]->std);
+    efree(held);
     return left;
 }
 

@@ -223,9 +223,24 @@ static int wvl_probe(void)
     return wvl_engine;
 }
 
+/* A query (vio_platform_info) must not start an engine: wvl_probe() initialises GTK,
+ * pins the GDK backend and takes SIGUSR1 from PHP. Until the first webview is
+ * made, "available" only means that an engine library is installed; if the
+ * engine then fails to start, vio_webview() returns false and this follows. */
 int vio_wvl_available(void)
 {
-    return wvl_probe() != WVL_NONE;
+    static int present = -1;
+    if (wvl_engine >= 0) return wvl_engine != WVL_NONE;
+    if (present < 0) {
+        const char *want = getenv("VIO_WEBVIEW_ENGINE");
+        int try_wpe = !want || !*want || strcmp(want, "wpe") == 0;
+        int try_gtk = !want || !*want || strcmp(want, "gtk") == 0;
+        /* the handles stay open: the probe opens the same libraries again */
+        present = (try_wpe && dlopen("libWPEWebKit-2.0.so.1", RTLD_LAZY | RTLD_LOCAL)
+                           && dlopen("libWPEBackend-fdo-1.0.so.1", RTLD_LAZY | RTLD_LOCAL))
+               || (try_gtk && dlopen("libwebkit2gtk-4.1.so.0", RTLD_LAZY | RTLD_LOCAL));
+    }
+    return present;
 }
 
 /* ── Views and open requests ─────────────────────────────────────── */

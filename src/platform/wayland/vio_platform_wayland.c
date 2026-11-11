@@ -1069,9 +1069,12 @@ static void wl_dispatch(int timeout_ms)
     struct pollfd pfd[3 + 64] = { { wl_display_get_fd(wl.display), POLLIN, 0 }, { vio_platform_wake_fd(), POLLIN, 0 },
                                   { vio_linux_dbus_fd(), POLLIN, 0 } };   /* tray clicks */
     int n = timeout_ms != 0 ? 3 : 1, base = n;
-    if (timeout_ms != 0) n = vio_wvl_poll_begin(pfd, n, 3 + 64, &timeout_ms);   /* webview engine sockets */
+    /* poll_begin may shorten the timeout to 0 and add no descriptor: remember that it ran,
+     * or the GLib context it acquired is never released */
+    int engine_poll = timeout_ms != 0;
+    if (engine_poll) n = vio_wvl_poll_begin(pfd, n, 3 + 64, &timeout_ms);   /* webview engine sockets */
     while (poll(pfd, (nfds_t)n, timeout_ms) < 0 && errno == EINTR) {}
-    if (timeout_ms != 0 || n != base) vio_wvl_poll_end(pfd, base, n);
+    if (engine_poll) vio_wvl_poll_end(pfd, base, n);
     if (pfd[0].revents & POLLIN) wl_display_read_events(wl.display);
     else wl_display_cancel_read(wl.display);
     wl_display_dispatch_pending(wl.display);
