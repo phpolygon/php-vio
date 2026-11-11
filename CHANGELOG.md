@@ -1,3 +1,11 @@
+## [2.44.2](https://github.com/phpolygon/php-vio/compare/v2.44.1...v2.44.2) (2026-11-11)
+
+
+### Bug Fixes
+
+* **opengl:** flattened uniform blocks are named per stage ([52b7fb0](https://github.com/phpolygon/php-vio/commit/52b7fb0eb48bc605e01935765f239c08cfb1e54b))
+* **platform:** Keep key repeat on macOS instead of the accent picker ([70372e5](https://github.com/phpolygon/php-vio/commit/70372e56fbafbc3dc01776c7a78fcaf5eab0da14))
+
 ## [2.44.1](https://github.com/phpolygon/php-vio/compare/v2.44.0...v2.44.1) (2026-11-11)
 
 
