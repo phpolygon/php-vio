@@ -4,17 +4,27 @@ A PHP extension that brings GPU rendering, audio, video recording, streaming, an
 
 ## Features
 
-- **Multi-Backend GPU Rendering** — Direct3D 12, Direct3D 11, Metal, Vulkan (MoltenVK), OpenGL 4.1
-- **2D Batch Renderer** — Rects, circles, lines, sprites, text (z-sorted, up to 4096 items)
-- **3D Pipeline** — Meshes, shaders, pipelines, textures, uniform/storage buffers
-- **Shader Toolchain** — GLSL to SPIR-V compilation, reflection, cross-compilation
-- **Audio** — Playback via miniaudio (MP3, WAV, FLAC, Ogg Vorbis/Opus), 3D audio with live pitch/pan, distance attenuation models, Doppler, cones, 2D/3D switch per sound, offline rendering
-- **Video Recording** — H.264 encoding via FFmpeg (with VideoToolbox HW acceleration)
-- **Network Streaming** — RTMP and SRT via FFmpeg
-- **Input** — Keyboard, mouse, and gamepad support via GLFW
-- **Headless Mode** — Offscreen rendering for tests and visual regression testing
-- **Plugin System** — Extensible output/input/filter plugins
-- **Cross-Platform** — macOS, Linux, Windows
+- **Multi-backend GPU rendering** — Direct3D 12, Direct3D 11, Metal, Vulkan, OpenGL 3.0–4.6; `vio_create('auto')` picks one per platform or ranks the adapters (`prefer`, `require`, optional calibration run)
+- **2D batch renderer** — rects, rounded rects, circles, lines, sprites, text; z-sorted, transform and scissor stacks, the batch grows on demand
+- **Text** — TrueType atlas filled on demand, HarfBuzz + SheenBidi shaping (Arabic, Thai, ligatures, bidirectional text), word wrap, vertical text
+- **3D pipeline** — meshes, GLSL shaders, pipelines with blend / depth / stencil state, instancing, indirect draws, recorded draw sequences (`vio_bundle`)
+- **Shader stages** — vertex, fragment, geometry, tessellation, mesh and task shaders, compute; multiview; HLSL and MSL overrides per stage
+- **Render targets** — HDR, depth-only, MSAA, up to 8 colour attachments, cube and array targets, mip chains, readback in the target's own format
+- **Textures** — 2D, 3D, arrays, cubemaps, BC and ASTC compression, KTX2, a bindless texture table
+- **Compute** — storage buffers and storage images, dispatch inside the frame, vertex and fragment stages reading storage buffers
+- **Ray tracing** — acceleration structures, inline ray queries, ray tracing pipelines, opacity micromaps (Direct3D 12, Vulkan; ray queries also on Metal)
+- **Upscaling** — portable spatial and temporal upscaler (`vio_upscale`), AMD FSR 3.1 and, through a plugin, NVIDIA DLSS (`vio_upscaler_*`; Direct3D 12 and Vulkan)
+- **Shader toolchain** — GLSL to SPIR-V (glslang), reflection and translation to HLSL / MSL / GLSL (SPIRV-Cross), on-disk shader cache
+- **Desktop applications** — several windows, child and modal windows, menu bar and context menus, file dialogs, message boxes, notifications, tray icon, taskbar progress, file drop, IME composition, cursors, screen-reader support (AccessKit), an event loop that waits instead of polling
+- **Input** — keyboard, mouse, gamepads, touch, clipboard; injection, virtual gamepads and record / replay for tests
+- **Audio** — playback via miniaudio (MP3, WAV, FLAC, Ogg Vorbis, Ogg Opus), Opus / Vorbis encoding and decoding, 3D audio with live pitch / pan, distance attenuation models, Doppler, cones, 2D / 3D switch per sound, offline rendering
+- **Video recording** — H.264 via FFmpeg with the platform's hardware encoders (NVENC, AMF, QSV, Media Foundation, VideoToolbox) and libx264 as the fallback
+- **Network streaming** — RTMP and SRT via FFmpeg
+- **Headless mode** — offscreen rendering, pixel readback, screenshots and image comparison for visual regression tests
+- **Plugin system** — output / input / filter plugins and a versioned C ABI for upscaler plugins
+- **Cross-platform** — Windows, macOS, Linux (X11 and Wayland) with native window layers; GLFW is optional
+
+Which of these a context has depends on the backend, the GPU and the libraries the extension was built with. Ask at run time: `vio_supports_feature($ctx, VIO_FEATURE_*)`, `vio_feature_info()`, `vio_backend_info()` and, for the window system, `vio_platform_info()`.
 
 ## Gallery
 
@@ -35,6 +45,11 @@ They double as a smoke test of each feature path on a real backend.
 | ![Tessellation](docs/gallery/tessellation.png) `tess_control` + `tess_eval`, `VIO_PATCHES`: quad patches displaced in the evaluation stage, level 2 vs 18 | ![Ray query shadows](docs/gallery/ray_query_shadows.png) `vio_acceleration_structure` + `rayQueryEXT`: one shadow ray per pixel |
 | ![Opacity micromaps](docs/gallery/opacity_micromap.png) `vio_opacity_micromap_bake`: what rays learn from an alpha texture without running a shader | |
 
+`php examples/gallery.php [backend] [outdir] [scene,…]` renders all scenes or a comma-separated selection. A scene whose feature the
+backend does not report is skipped (ray queries and opacity micromaps need Direct3D 12 or Vulkan with a GPU and driver that support them).
+The gallery covers rendering only: upscaling, draw bundles, mesh shaders, multiview and the desktop-application APIs (windows, menus,
+dialogs, tray) have no scene yet.
+
 ## Requirements
 
 - PHP >= 8.5
@@ -43,14 +58,21 @@ All native libraries are optional — the extension compiles and runs without th
 
 | Library | Feature | Build Flag |
 |---------|---------|------------|
-| [GLFW](https://www.glfw.org/) 3.4 | Windowing, input, gamepad | `--with-glfw` |
+| [GLFW](https://www.glfw.org/) 3.4 | Windowing, input, gamepad where no native window layer is built (optional on Windows, macOS, X11, Wayland) | `--with-glfw` |
+| Xlib + XRandR | X11 window layer (Linux) | `--with-x11` (on by default when found) |
+| wayland-client, wayland-cursor, xkbcommon, wayland-scanner, wayland-protocols | Wayland window layer (Linux) | `--with-wayland` (on by default when found) |
 | [glslang](https://github.com/KhronosGroup/glslang) | GLSL to SPIR-V compilation | `--with-glslang` |
-| [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | Shader reflection & transpilation | `--with-spirv-cross` |
-| [Vulkan SDK](https://vulkan.lunarg.com/) | Vulkan backend | `--with-vulkan` |
+| [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | Shader reflection & translation (required for shaders on Direct3D, Metal and Vulkan) | `--with-spirv-cross` |
+| [Vulkan SDK](https://vulkan.lunarg.com/) | Vulkan backend (Vulkan 1.3, or 1.2 with dynamic rendering and synchronization2) | `--with-vulkan` |
 | [FFmpeg](https://ffmpeg.org/) | Video recording & streaming | `--with-ffmpeg` |
+| [HarfBuzz](https://harfbuzz.github.io/) | Text shaping (Arabic, Thai, ligatures, vertical text); `VIO_HAS_SHAPING` | `--with-harfbuzz` |
+| [AccessKit](https://github.com/AccessKit/accesskit-c) (C release package) | Screen readers (`vio_a11y_update`) | `--with-accesskit=DIR` |
 | Metal (macOS framework) | Metal backend | `--with-metal` |
 | Direct3D 11 (Windows SDK) | Direct3D 11 backend | `--with-d3d11` (Windows, on by default) |
 | Direct3D 12 (Windows SDK) | Direct3D 12 backend | `--with-d3d12` (Windows, on by default) |
+| AMD FidelityFX API headers (vendored) | FSR 3.1 upscaler; the FidelityFX DLLs are loaded at run time, not linked | `--with-ffx` (on by default on Windows) |
+
+Vendored and always built: GLAD, stb, Vulkan Memory Allocator, miniaudio, SheenBidi, libopus / libogg / opusfile / libvorbis.
 
 ## Installation
 
@@ -71,14 +93,16 @@ Download platform-specific binaries from the [Releases](https://github.com/phpol
 ### From Source (macOS)
 
 ```bash
-brew install glfw glslang spirv-cross ffmpeg
+brew install php glfw glslang spirv-cross ffmpeg harfbuzz vulkan-loader vulkan-headers molten-vk
 
 phpize
 ./configure --enable-vio --with-glfw --with-glslang --with-spirv-cross \
-  --with-vulkan --with-ffmpeg --with-metal
+  --with-vulkan --with-ffmpeg --with-metal --with-harfbuzz
 make -j$(sysctl -n hw.ncpu)
 sudo make install
 ```
+
+Use SPIRV-Cross `vulkan-sdk-1.4.363.0` or newer: older versions lay out arrays of structs in a uniform block with the wrong stride on Metal.
 
 ### From Source (Linux)
 
@@ -86,11 +110,12 @@ sudo make install
 # Ubuntu/Debian
 sudo apt install php-dev libglfw3-dev glslang-dev libvulkan-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-  spirv-cross libspirv-cross-c-shared-dev
+  spirv-cross libspirv-cross-c-shared-dev libharfbuzz-dev libx11-dev libxrandr-dev \
+  libwayland-dev wayland-protocols libxkbcommon-dev
 
 phpize
 ./configure --enable-vio --with-glfw --with-glslang --with-spirv-cross \
-  --with-vulkan --with-ffmpeg
+  --with-vulkan --with-ffmpeg --with-harfbuzz
 make -j$(nproc)
 sudo make install
 ```
@@ -103,6 +128,8 @@ On Windows, no build toolchain is needed — PHP extensions are distributed as p
 2. Add `extension=vio` to your `php.ini`
 3. Restart PHP / your web server
 
+To build it yourself, use the PHP SDK with the Visual Studio 2022 build tools; `config.w32` takes `--with-glfw`, `--with-vulkan`, `--with-glslang`, `--with-spirv-cross`, `--with-ffmpeg`, `--with-harfbuzz` and `--with-accesskit` with the directory of each dependency.
+
 All backends use conditional compilation (`#ifdef HAVE_*`), so builds without certain dependencies compile fine — those features are simply unavailable at runtime.
 
 ## Quick Start
@@ -110,8 +137,8 @@ All backends use conditional compilation (`#ifdef HAVE_*`), so builds without ce
 ```php
 <?php
 
-// Create a window with OpenGL backend
-$ctx = vio_create("opengl", [
+// Open a window on the platform's preferred backend
+$ctx = vio_create("auto", [
     "width"  => 800,
     "height" => 600,
     "title"  => "Hello VIO",
@@ -121,9 +148,9 @@ while (!vio_should_close($ctx)) {
     vio_begin($ctx);
     vio_clear($ctx, 0.1, 0.1, 0.1);
 
-    // 2D drawing
-    vio_rect($ctx, 50, 50, 200, 100, ["color" => 0xFF0000FF]);
-    vio_circle($ctx, 400, 300, 60, ["color" => 0x00FF00FF]);
+    // 2D drawing; colours are 0xAARRGGBB
+    vio_rect($ctx, 50, 50, 200, 100, ["color" => 0xFFFF0000]);
+    vio_circle($ctx, 400, 300, 60, ["color" => 0xFF00FF00]);
     vio_draw_2d($ctx);
 
     vio_end($ctx);
@@ -134,27 +161,35 @@ vio_close($ctx);
 vio_destroy($ctx);
 ```
 
+More scripts are in [`examples/`](examples): a window, a triangle, input, a custom shader, 2D drawing, the gallery renderer and two benchmarks.
+
 ## API Overview
 
-71 functions across these categories:
+273 functions and 20 classes. A selection by category:
 
 | Category | Functions |
 |----------|-----------|
-| Context | `vio_create`, `vio_begin`, `vio_end`, `vio_clear`, `vio_close`, `vio_destroy` |
-| Input | `vio_key_pressed`, `vio_mouse_position`, `vio_mouse_button`, `vio_on_key` |
-| 2D | `vio_rect`, `vio_circle`, `vio_line`, `vio_sprite`, `vio_text`, `vio_draw_2d` |
-| 3D | `vio_mesh`, `vio_shader`, `vio_pipeline`, `vio_bind_pipeline`, `vio_draw` |
-| Textures | `vio_texture`, `vio_bind_texture`, `vio_texture_load_async` |
-| Fonts | `vio_font`, `vio_text`, `vio_text_measure`, `vio_font_load_async` |
-| Buffers | `vio_uniform_buffer`, `vio_update_buffer` |
-| Audio | `vio_audio_load`, `vio_audio_play`, `vio_audio_pause`, `vio_audio_stop`, `vio_audio_pitch`, `vio_audio_pan`, `vio_audio_spatial`, `vio_audio_attenuation`, `vio_audio_velocity`, `vio_audio_doppler`, `vio_audio_listener`, `vio_audio_render` |
-| Recording | `vio_recorder`, `vio_recorder_capture`, `vio_recorder_stop` |
+| Context | `vio_create`, `vio_begin`, `vio_end`, `vio_clear`, `vio_close`, `vio_destroy`, `vio_poll_events`, `vio_wait_events`, `vio_wake` |
+| Window | `vio_window_size`, `vio_framebuffer_size`, `vio_set_title`, `vio_set_window_size`, `vio_set_fullscreen`, `vio_set_borderless`, `vio_monitors`, `vio_on_resize`, `vio_on_close`, `vio_on_focus`, `vio_on_refresh` |
+| Desktop | `vio_window`, `vio_menu_bar`, `vio_popup_menu`, `vio_file_dialog`, `vio_message_box`, `vio_notify`, `vio_tray`, `vio_set_progress`, `vio_on_drop`, `vio_set_cursor`, `vio_set_window_icon`, `vio_open_url`, `vio_a11y_update`, `vio_platform_info` |
+| Input | `vio_key_pressed`, `vio_mouse_position`, `vio_mouse_button`, `vio_on_key`, `vio_on_char`, `vio_on_preedit`, `vio_gamepads`, `vio_touch_count`, `vio_clipboard_get`, `vio_inject_key`, `vio_input_replay` |
+| 2D | `vio_rect`, `vio_rounded_rect`, `vio_circle`, `vio_line`, `vio_sprite`, `vio_text`, `vio_push_transform`, `vio_push_scissor`, `vio_draw_2d` |
+| 3D | `vio_mesh`, `vio_shader`, `vio_pipeline`, `vio_bind_pipeline`, `vio_set_uniform`, `vio_draw`, `vio_draw_instanced`, `vio_draw_indirect`, `vio_submit_batch`, `vio_bundle`, `vio_draw_mesh_tasks` |
+| Render targets | `vio_render_target`, `vio_bind_render_target`, `vio_render_target_texture`, `vio_read_render_target`, `vio_generate_mipmaps`, `vio_viewports` |
+| Textures | `vio_texture`, `vio_texture_3d`, `vio_texture_ktx2`, `vio_cubemap`, `vio_bind_texture`, `vio_texture_update`, `vio_texture_index`, `vio_texture_load_async` |
+| Fonts | `vio_font`, `vio_text`, `vio_text_measure`, `vio_font_has_glyph`, `vio_font_load_async` |
+| Buffers & compute | `vio_uniform_buffer`, `vio_storage_buffer`, `vio_update_buffer`, `vio_compute_pipeline`, `vio_compute_dispatch`, `vio_storage_buffer_read` |
+| Ray tracing | `vio_acceleration_structure`, `vio_rt_pipeline`, `vio_trace_rays`, `vio_opacity_micromap_bake` |
+| Upscaling | `vio_upscale`, `vio_upscale_jitter`, `vio_upscaler_create`, `vio_upscaler_dispatch`, `vio_upscaler_prepare` |
+| Audio | `vio_audio_load`, `vio_audio_play`, `vio_audio_pause`, `vio_audio_stop`, `vio_audio_pitch`, `vio_audio_pan`, `vio_audio_spatial`, `vio_audio_attenuation`, `vio_audio_velocity`, `vio_audio_doppler`, `vio_audio_listener`, `vio_audio_encode`, `vio_audio_decode`, `vio_audio_render` |
+| Recording | `vio_recorder`, `vio_recorder_capture`, `vio_recorder_info`, `vio_recorder_stop`, `vio_video_info`, `vio_video_frame` |
 | Streaming | `vio_stream`, `vio_stream_push`, `vio_stream_stop` |
-| Headless | `vio_read_pixels`, `vio_save_screenshot`, `vio_compare_images` |
-| Shaders | `vio_shader_reflect`, shader compilation via glslang |
+| Headless | `vio_read_pixels`, `vio_save_screenshot`, `vio_compare_images`, `vio_save_diff_image` |
+| Shaders | `vio_shader_reflect`, `vio_shader_cache_stats`, shader compilation via glslang |
+| Introspection | `vio_backends`, `vio_backend_name`, `vio_backend_info`, `vio_adapters`, `vio_rank_backends`, `vio_supports_feature`, `vio_feature_info`, `vio_gpu_info`, `vio_gpu_frame_time` |
 | Plugins | `vio_plugins`, `vio_plugin_info` |
 
-Full API documentation: see [vio.stub.php](vio.stub.php)
+Every signature with its options is in [vio.stub.php](vio.stub.php); guides and the API reference are on the [documentation site](https://phpolygon.github.io/php-vio-docs/).
 
 ## Backends
 
@@ -163,8 +198,8 @@ Full API documentation: see [vio.stub.php](vio.stub.php)
 | Direct3D 12 | Stable | Windows only |
 | Direct3D 11 | Stable | Windows only |
 | Metal | Stable | macOS only |
-| OpenGL 4.1 | Stable | macOS, Linux, Windows |
-| Vulkan | Experimental | macOS (MoltenVK), Linux, Windows |
+| OpenGL 3.0–4.6 | Stable | macOS (up to 4.1), Linux, Windows |
+| Vulkan | Stable | Linux, Windows, macOS (MoltenVK, opt-in) |
 | Null | Stable | All (for unit testing) |
 
 Backend auto-selection is platform-specific:
@@ -173,7 +208,9 @@ Backend auto-selection is platform-specific:
 - **macOS:** Metal → OpenGL  (Vulkan via MoltenVK is opt-in, not auto)
 - **Linux:** Vulkan → OpenGL
 
-`Null` is never auto-selected; request it explicitly with `vio_create("null")` for headless tests. Override auto-selection per call (`vio_create("d3d11")`) or globally via the `vio.default_backend` INI setting.
+`Null` is never auto-selected; request it explicitly with `vio_create("null")` for headless tests. Override auto-selection per call (`vio_create("d3d11")`) or globally via the `vio.default_backend` INI setting. With `vio_create('auto', ['prefer' => 'performance' | 'quality' | 'compat', 'require' => [VIO_FEATURE_*, …]])` the choice follows a ranking of the installed adapters instead (`vio_rank_backends()`, `vio_adapters()`); `vio_backend_info($ctx)['selected_by']` tells how the backend was chosen.
+
+Features differ per backend and GPU — for example variable rate shading, ray tracing pipelines and the native upscalers exist on Direct3D 12 and Vulkan only, and geometry shaders run through compute emulation on Metal. Check `vio_supports_feature()` before relying on one.
 
 ## Performance: Metal vs OpenGL
 
@@ -201,7 +238,9 @@ NO_INTERACTION=1 TEST_PHP_EXECUTABLE=$(which php) \
   php run-tests.php -d extension=$PWD/modules/vio.so tests/
 ```
 
-93 PHPT tests, grouped by topic under `tests/` (`core/`, `backends/`, `render3d/`, `render2d/`, `input/`, `window/`, `media/`) — headless rendering with pixel verification, 2D/3D pipelines, shaders, compute, audio, input, and the per-backend capability matrix. `run-tests.php` recurses into the folders; pass a single folder to run one area.
+`run-tests.php` is placed in the build directory by `phpize`.
+
+294 PHPT tests, grouped by topic under `tests/` (`core/`, `backends/`, `render3d/`, `render2d/`, `input/`, `window/`, `media/`) — headless rendering with pixel verification, 2D/3D pipelines, shaders, compute, ray tracing, upscaling, audio, input, windows and desktop APIs, and the per-backend capability matrix. `run-tests.php` recurses into the folders; pass a single folder to run one area.
 
 ## License
 
