@@ -81,7 +81,7 @@ void vio_bundle_register(void)
     vio_bundle_ce->create_object = vio_bundle_create_object;
 
     memcpy(&vio_bundle_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_bundle_handlers.offset    = XtOffsetOf(vio_bundle_object, std);
+    vio_bundle_handlers.offset    = offsetof(vio_bundle_object, std);
     vio_bundle_handlers.free_obj  = vio_bundle_free_object;
     vio_bundle_handlers.get_gc    = vio_bundle_get_gc;
     vio_bundle_handlers.clone_obj = NULL;

@@ -66,7 +66,7 @@ void vio_rt_pipeline_register(void)
     vio_rt_pipeline_ce->create_object = vio_rt_pipeline_create_object;
 
     memcpy(&vio_rt_pipeline_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_rt_pipeline_handlers.offset    = XtOffsetOf(vio_rt_pipeline_object, std);
+    vio_rt_pipeline_handlers.offset    = offsetof(vio_rt_pipeline_object, std);
     vio_rt_pipeline_handlers.free_obj  = vio_rt_pipeline_free_object;
     vio_rt_pipeline_handlers.get_gc    = vio_rt_pipeline_get_gc;
     vio_rt_pipeline_handlers.clone_obj = NULL;

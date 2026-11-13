@@ -60,7 +60,7 @@ void vio_mesh_register(void)
     vio_mesh_ce->create_object = vio_mesh_create_object;
 
     memcpy(&vio_mesh_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_mesh_handlers.offset   = XtOffsetOf(vio_mesh_object, std);
+    vio_mesh_handlers.offset   = offsetof(vio_mesh_object, std);
     vio_mesh_handlers.free_obj = vio_mesh_free_object;
     vio_mesh_handlers.clone_obj = NULL;
 }

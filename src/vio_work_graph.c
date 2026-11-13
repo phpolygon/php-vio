@@ -62,7 +62,7 @@ void vio_work_graph_register(void)
     vio_work_graph_ce->create_object = vio_work_graph_create_object;
 
     memcpy(&vio_work_graph_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_work_graph_handlers.offset    = XtOffsetOf(vio_work_graph_object, std);
+    vio_work_graph_handlers.offset    = offsetof(vio_work_graph_object, std);
     vio_work_graph_handlers.free_obj  = vio_work_graph_free_object;
     vio_work_graph_handlers.clone_obj = NULL;
 }

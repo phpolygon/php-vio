@@ -36,7 +36,7 @@ void vio_upscaler_sweep(const void *backend);
 int  vio_upscaler_live_count(const void *backend);
 
 static inline vio_upscaler_object *vio_upscaler_from_obj(zend_object *obj) {
-    return (vio_upscaler_object *)((char *)obj - XtOffsetOf(vio_upscaler_object, std));
+    return (vio_upscaler_object *)((char *)obj - offsetof(vio_upscaler_object, std));
 }
 
 #define Z_VIO_UPSCALER_P(zv) vio_upscaler_from_obj(Z_OBJ_P(zv))

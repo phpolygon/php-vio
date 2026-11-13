@@ -63,7 +63,7 @@ typedef struct _vio_webview_object {
 
 static inline vio_webview_object *vio_webview_from_obj(zend_object *obj)
 {
-    return (vio_webview_object *)((char *)obj - XtOffsetOf(vio_webview_object, std));
+    return (vio_webview_object *)((char *)obj - offsetof(vio_webview_object, std));
 }
 #define Z_VIO_WEBVIEW_P(zv) vio_webview_from_obj(Z_OBJ_P(zv))
 
@@ -552,7 +552,7 @@ void vio_webview_register(void)
     vio_webview_ce->ce_flags |= ZEND_ACC_FINAL | ZEND_ACC_NO_DYNAMIC_PROPERTIES | ZEND_ACC_NOT_SERIALIZABLE;
     vio_webview_ce->create_object = vio_webview_create_object;
     memcpy(&vio_webview_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_webview_handlers.offset = XtOffsetOf(vio_webview_object, std);
+    vio_webview_handlers.offset = offsetof(vio_webview_object, std);
     vio_webview_handlers.free_obj = vio_webview_free_object;
     vio_webview_handlers.get_gc = vio_webview_get_gc;
     vio_webview_handlers.clone_obj = NULL;

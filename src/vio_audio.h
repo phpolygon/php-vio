@@ -32,7 +32,7 @@ extern zend_class_entry *vio_sound_ce;
 void vio_sound_register(void);
 
 static inline vio_sound_object *vio_sound_from_obj(zend_object *obj) {
-    return (vio_sound_object *)((char *)obj - XtOffsetOf(vio_sound_object, std));
+    return (vio_sound_object *)((char *)obj - offsetof(vio_sound_object, std));
 }
 
 #define Z_VIO_SOUND_P(zv) vio_sound_from_obj(Z_OBJ_P(zv))

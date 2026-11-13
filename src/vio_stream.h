@@ -41,7 +41,7 @@ extern zend_class_entry *vio_stream_ce;
 void vio_stream_register(void);
 
 static inline vio_stream_object *vio_stream_from_obj(zend_object *obj) {
-    return (vio_stream_object *)((char *)obj - XtOffsetOf(vio_stream_object, std));
+    return (vio_stream_object *)((char *)obj - offsetof(vio_stream_object, std));
 }
 
 #define Z_VIO_STREAM_P(zv) vio_stream_from_obj(Z_OBJ_P(zv))
