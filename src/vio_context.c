@@ -245,7 +245,7 @@ void vio_context_register(void)
     vio_context_ce->create_object = vio_context_create_object;
 
     memcpy(&vio_context_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_context_handlers.offset   = XtOffsetOf(vio_context_object, std);
+    vio_context_handlers.offset   = offsetof(vio_context_object, std);
     vio_context_handlers.free_obj = vio_context_free_object;
     vio_context_handlers.clone_obj = NULL;
 
@@ -255,7 +255,7 @@ void vio_context_register(void)
     vio_window_ce->create_object = vio_window_create_object;
 
     memcpy(&vio_window_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_window_handlers.offset   = XtOffsetOf(vio_window_object, std);
+    vio_window_handlers.offset   = offsetof(vio_window_object, std);
     vio_window_handlers.free_obj = vio_window_free_object;
     vio_window_handlers.clone_obj = NULL;
 }

@@ -54,7 +54,7 @@ void vio_compute_pipeline_register(void)
     vio_compute_pipeline_ce->create_object = vio_compute_pipeline_create_object;
 
     memcpy(&vio_compute_pipeline_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_compute_pipeline_handlers.offset    = XtOffsetOf(vio_compute_pipeline_object, std);
+    vio_compute_pipeline_handlers.offset    = offsetof(vio_compute_pipeline_object, std);
     vio_compute_pipeline_handlers.free_obj  = vio_compute_pipeline_free_object;
     vio_compute_pipeline_handlers.clone_obj = NULL;
 }

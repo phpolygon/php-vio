@@ -48,7 +48,7 @@ void vio_bundle_register(void);
 void vio_bundle_clear(vio_bundle_object *b);
 
 static inline vio_bundle_object *vio_bundle_from_obj(zend_object *obj) {
-    return (vio_bundle_object *)((char *)obj - XtOffsetOf(vio_bundle_object, std));
+    return (vio_bundle_object *)((char *)obj - offsetof(vio_bundle_object, std));
 }
 
 #define Z_VIO_BUNDLE_P(zv) vio_bundle_from_obj(Z_OBJ_P(zv))

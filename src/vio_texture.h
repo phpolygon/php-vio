@@ -47,7 +47,7 @@ extern zend_class_entry *vio_texture_ce;
 void vio_texture_register(void);
 
 static inline vio_texture_object *vio_texture_from_obj(zend_object *obj) {
-    return (vio_texture_object *)((char *)obj - XtOffsetOf(vio_texture_object, std));
+    return (vio_texture_object *)((char *)obj - offsetof(vio_texture_object, std));
 }
 
 #define Z_VIO_TEXTURE_P(zv) vio_texture_from_obj(Z_OBJ_P(zv))

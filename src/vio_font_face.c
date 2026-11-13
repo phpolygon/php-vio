@@ -78,7 +78,7 @@ void vio_font_face_register(void)
     vio_font_face_ce->create_object = vio_font_face_create_object;
 
     memcpy(&vio_font_face_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_font_face_handlers.offset    = XtOffsetOf(vio_font_face_object, std);
+    vio_font_face_handlers.offset    = offsetof(vio_font_face_object, std);
     vio_font_face_handlers.free_obj  = vio_font_face_free_object;
     vio_font_face_handlers.clone_obj = NULL;
 }

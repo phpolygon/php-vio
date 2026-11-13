@@ -42,7 +42,7 @@ extern zend_class_entry *vio_mesh_ce;
 void vio_mesh_register(void);
 
 static inline vio_mesh_object *vio_mesh_from_obj(zend_object *obj) {
-    return (vio_mesh_object *)((char *)obj - XtOffsetOf(vio_mesh_object, std));
+    return (vio_mesh_object *)((char *)obj - offsetof(vio_mesh_object, std));
 }
 
 #define Z_VIO_MESH_P(zv) vio_mesh_from_obj(Z_OBJ_P(zv))

@@ -62,7 +62,7 @@ void vio_texture_register(void)
     vio_texture_ce->create_object = vio_texture_create_object;
 
     memcpy(&vio_texture_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_texture_handlers.offset   = XtOffsetOf(vio_texture_object, std);
+    vio_texture_handlers.offset   = offsetof(vio_texture_object, std);
     vio_texture_handlers.free_obj = vio_texture_free_object;
     vio_texture_handlers.clone_obj = NULL;
 }

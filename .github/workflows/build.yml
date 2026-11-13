@@ -851,9 +851,22 @@ jobs:
   windows-x64:
     runs-on: windows-2022
     strategy:
+      fail-fast: false
       matrix:
         php: ['8.5']
         ts: ['nts', 'ts']
+        experimental: [false]
+        include:
+          # PHP 8.6 dry run (RC, not yet GA): allowed to fail, not part of the
+          # required gate. windows.php.net's releases.json may not list an RC
+          # yet — if the devel-pack download step fails, that is the "not
+          # published yet" signal, not necessarily a vio regression. Source
+          # already carries the PHP 8.6 fix (XtOffsetOf was removed upstream
+          # in 8.6; vio now uses offsetof() directly, see UPGRADING.INTERNALS).
+          - php: '8.6'
+            ts: 'nts'
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 

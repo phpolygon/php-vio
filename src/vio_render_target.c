@@ -239,7 +239,7 @@ void vio_render_target_register(void)
     vio_render_target_ce->create_object = vio_render_target_create_object;
 
     memcpy(&vio_render_target_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_render_target_handlers.offset   = XtOffsetOf(vio_render_target_object, std);
+    vio_render_target_handlers.offset   = offsetof(vio_render_target_object, std);
     vio_render_target_handlers.free_obj = vio_render_target_free_object;
     vio_render_target_handlers.clone_obj = NULL;
 }

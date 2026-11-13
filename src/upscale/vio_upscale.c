@@ -1054,7 +1054,7 @@ void vio_upscaler_register(void)
     vio_upscaler_ce->create_object = vio_upscaler_create_object;
 
     memcpy(&vio_upscaler_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_upscaler_handlers.offset    = XtOffsetOf(vio_upscaler_object, std);
+    vio_upscaler_handlers.offset    = offsetof(vio_upscaler_object, std);
     vio_upscaler_handlers.free_obj  = vio_upscaler_free_object;
     vio_upscaler_handlers.clone_obj = NULL;
 }

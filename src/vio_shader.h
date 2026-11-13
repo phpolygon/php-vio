@@ -167,7 +167,7 @@ char *vio_glsl_multiview_instancing(const char *src, int fragment, int views);
 char *vio_glsl_multiview_forward(const char *src, int stage);
 
 static inline vio_shader_object *vio_shader_from_obj(zend_object *obj) {
-    return (vio_shader_object *)((char *)obj - XtOffsetOf(vio_shader_object, std));
+    return (vio_shader_object *)((char *)obj - offsetof(vio_shader_object, std));
 }
 
 #define Z_VIO_SHADER_P(zv) vio_shader_from_obj(Z_OBJ_P(zv))

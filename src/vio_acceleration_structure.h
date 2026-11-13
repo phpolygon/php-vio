@@ -33,7 +33,7 @@ void vio_acceleration_structure_keep(vio_acceleration_structure_object *as, zend
                                      const int *inst_geo, int instance_count);
 
 static inline vio_acceleration_structure_object *vio_acceleration_structure_from_obj(zend_object *obj) {
-    return (vio_acceleration_structure_object *)((char *)obj - XtOffsetOf(vio_acceleration_structure_object, std));
+    return (vio_acceleration_structure_object *)((char *)obj - offsetof(vio_acceleration_structure_object, std));
 }
 
 #define Z_VIO_ACCELERATION_STRUCTURE_P(zv) vio_acceleration_structure_from_obj(Z_OBJ_P(zv))
