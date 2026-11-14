@@ -752,6 +752,7 @@ läuft ebenfalls compute-basiert (siehe „Metal-3D-Pipeline").
 | VioUpscaler | src/upscale/vio_upscaler.h | Natives Upscaler-Kontext (FSR 3.1): Provider-Kontext + Beschreibung, Live-Liste (vor dem Geräte-Shutdown abgeräumt) |
 | VioFont | src/vio_font.h | TTF-Font (stb_truetype Atlas, glyph-index-keyed mit HarfBuzz) |
 | VioFontFace | src/vio_font.h | Font-Datei ohne Kontext und Atlas für `vio_text_bitmap` (`vio_font_face`) |
+| VioInstanceBuffer | src/vio_instance_buffer.h | Persistenter Instanzpuffer (`vio_instance_buffer`): GPU-lokaler Vertex-Buffer (D3D11/D3D12) oder CPU-Kopie, 64 Byte je Instanz |
 | VioBundle | src/vio_bundle.h | Aufgezeichnete Draw-Folge (`vio_bundle` / `vio_draw_bundle`): hält die Objekte seiner Records, native Aufnahme je Attachment-Signatur |
 | VioSound | src/vio_audio.h | Audio-Quelle (miniaudio) |
 | VioRecorder | src/vio_recorder.h | Video-Encoder (FFmpeg) |
@@ -765,7 +766,7 @@ Alle folgen dem gleichen Muster: `zend_object std` als letztes Feld, `Z_VIO_*_P(
 php_vio.c                   # Alle PHP-Funktionen (~9000 Zeilen, monolithisch)
 php_vio.h                   # Module-Globals (default_backend, debug, vsync)
 php_vio_arginfo.h           # Arginfo + Funktionstabelle (generiert aus vio.stub.php)
-vio.stub.php                # PHP-Stubs für IDE-Support (280 Funktionen)
+vio.stub.php                # PHP-Stubs für IDE-Support (284 Funktionen)
 config.m4 / config.w32      # Autotools- bzw. Windows-Build-Konfiguration
 configure.ac                # PHP-freier Autotools-Einstieg (CI-Permutationen)
 CMakeLists.txt              # IDE-Support (CLion/PhpStorm), kein Release-Build
@@ -892,7 +893,7 @@ static-php-cli vios `vendor/*`-Quellen streicht, die php-glfw auch mitbringt. Fe
 Build, scheitert der Link an `vio_ma_*` statt still umzubinden; `vio_audio_engine_init()`
 prüft zusätzlich `ma_version()` gegen den Header und verweigert Audio bei Abweichung.
 
-## PHP API (280 Funktionen)
+## PHP API (284 Funktionen)
 
 Vollständige Signaturen in `vio.stub.php`. Die Beispiele hier zeigen die Gruppen.
 
@@ -1149,7 +1150,10 @@ vio_set_uniform($ctx, "u_model", $mat4);   // int|float|array; vio_set_uniforms(
 vio_viewport($ctx, 0, 0, $w, $h);
 vio_draw($ctx, $mesh);
 vio_draw_instanced($ctx, $mesh, $matrices /* array|packed string */, $count);
-vio_submit_batch($ctx, $draws);            // mehrere Draws in einem Call
+vio_submit_batch($ctx, $draws);            // mehrere Draws in einem Call; Record mit 'instances' => string|VioInstanceBuffer
+$ib = vio_instance_buffer($ctx, $packedMat4s [, $capacity]);   // persistente Instanzen (64 B je Instanz) auf der GPU
+vio_instance_buffer_update($ib, $bytes, $byteOffset);          // in place ändern; vio_instance_buffer_info($ib)
+vio_draw_instanced_buffer($ctx, $mesh, $ib, $count, $first);   // ohne Kopie der Instanzbytes je Draw
 vio_draw_3d($ctx);                          // flush_draw_state nach dem 3D-Pass
 
 // Render Targets (Objekt-API + Stack)
