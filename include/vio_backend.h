@@ -626,6 +626,11 @@ typedef struct _vio_backend {
     /* OpenGL: the framebuffer a window frame renders into (the frontend binds it
      * like the headless FBO), resized to the window first. 0 = none. */
     unsigned int (*swapchain_fbo)(void *swapchain);
+
+    /* 1 = the frontend (vio_mesh_free_object) releases a mesh's backend_vb /
+     * backend_ib through destroy_buffer when the mesh is freed (backends whose
+     * meshes are plain create_buffer buffers and have no destroy_mesh slot). */
+    int   release_mesh_buffers;
 } vio_backend;
 
 #define VIO_MAX_FRAGMENT_STORAGE 4

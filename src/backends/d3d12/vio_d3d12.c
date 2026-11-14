@@ -11570,6 +11570,7 @@ static const vio_backend d3d12_backend = {
     .create_swapchain  = d3d12_create_swapchain,
     .set_swapchain     = d3d12_set_swapchain,
     .destroy_swapchain = d3d12_destroy_swapchain,
+    .release_mesh_buffers = 1,
     .set_frame_present = d3d12_set_frame_present,
     .upscaler_supported             = d3d12_upscaler_supported,
     .upscaler_create                = d3d12_upscaler_create,

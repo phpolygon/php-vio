@@ -4710,6 +4710,7 @@ static const vio_backend d3d11_backend = {
     .create_swapchain  = d3d11_create_swapchain,
     .set_swapchain     = d3d11_set_swapchain,
     .destroy_swapchain = d3d11_destroy_swapchain,
+    .release_mesh_buffers = 1,
 };
 
 void vio_backend_d3d11_register(void)

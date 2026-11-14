@@ -43,6 +43,15 @@ static void vio_mesh_free_object(zend_object *obj)
 
     if (mesh->backend && mesh->backend->destroy_mesh) {
         mesh->backend->destroy_mesh(mesh);
+    } else if (mesh->backend && mesh->backend->release_mesh_buffers && mesh->backend->destroy_buffer) {
+        /* D3D11 / D3D12: vio_mesh created the vertex / index buffers through the
+         * create_buffer slot and nothing else owns them - without this every freed
+         * mesh leaked its GPU memory (streamed cells that unload, rebuilt meshes). The
+         * backend parks the resources until the GPU is done with the frames in flight. */
+        if (mesh->backend_vb) mesh->backend->destroy_buffer(mesh->backend_vb);
+        if (mesh->backend_ib) mesh->backend->destroy_buffer(mesh->backend_ib);
+        mesh->backend_vb = NULL;
+        mesh->backend_ib = NULL;
     }
     if (mesh->rt_positions) efree(mesh->rt_positions);
     if (mesh->rt_indices) efree(mesh->rt_indices);
