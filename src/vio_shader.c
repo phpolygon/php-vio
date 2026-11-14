@@ -220,6 +220,7 @@ static void vio_shader_free_object(zend_object *obj)
     if (shader->uniforms) { efree(shader->uniforms); shader->uniforms = NULL; }
     if (shader->frag_uniforms) { efree(shader->frag_uniforms); shader->frag_uniforms = NULL; }
     if (shader->cbuffer_data) { efree(shader->cbuffer_data); shader->cbuffer_data = NULL; }
+    for (int s = 0; s < 2; s++) { if (shader->cb_slice[s].bytes) { efree(shader->cb_slice[s].bytes); shader->cb_slice[s].bytes = NULL; } }
     if (shader->frag_cbuffer_data) { efree(shader->frag_cbuffer_data); shader->frag_cbuffer_data = NULL; }
     shader->uniform_count = shader->frag_uniform_count = 0;
 

@@ -28,6 +28,7 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #include "src/vio_compute_pipeline.h"
 #include "src/vio_acceleration_structure.h"
 #include "src/vio_bundle.h"
+#include "src/vio_instance_buffer.h"
 #include "src/vio_rt_pipeline.h"
 #include "src/vio_work_graph.h"
 #include "src/vio_font_face.h"
@@ -3072,13 +3073,27 @@ ZEND_FUNCTION(vio_mesh)
 
     /* Get vertices array */
     zval *vertices_zval = zend_hash_str_find(config_ht, "vertices", sizeof("vertices") - 1);
-    if (!vertices_zval || Z_TYPE_P(vertices_zval) != IS_ARRAY) {
-        php_error_docref(NULL, E_WARNING, "vio_mesh requires 'vertices' array");
+    /* 'vertices' is a PHP float array, or a raw string of packed little-endian
+     * float32 (pack('g*', ...) / a baked cell buffer): the string path reads the
+     * bytes in place, no PHP array and no per-element conversion. */
+    int raw_vertices = vertices_zval && Z_TYPE_P(vertices_zval) == IS_STRING;
+    if (!vertices_zval || (Z_TYPE_P(vertices_zval) != IS_ARRAY && !raw_vertices)) {
+        php_error_docref(NULL, E_WARNING, "vio_mesh requires 'vertices' array or packed float32 string");
         RETURN_FALSE;
     }
 
-    HashTable *vertices_ht = Z_ARRVAL_P(vertices_zval);
-    int vertex_data_count = zend_hash_num_elements(vertices_ht);
+    HashTable *vertices_ht = raw_vertices ? NULL : Z_ARRVAL_P(vertices_zval);
+    zend_long vertex_data_count_l = raw_vertices ? (zend_long)(Z_STRLEN_P(vertices_zval) / sizeof(float))
+                                                 : (zend_long)zend_hash_num_elements(vertices_ht);
+    if (raw_vertices && Z_STRLEN_P(vertices_zval) % sizeof(float) != 0) {
+        php_error_docref(NULL, E_WARNING, "vio_mesh: raw 'vertices' string length %zu is not a multiple of 4 (float32)", Z_STRLEN_P(vertices_zval));
+        RETURN_FALSE;
+    }
+    if (vertex_data_count_l > INT_MAX / 4) {
+        php_error_docref(NULL, E_WARNING, "vio_mesh: vertex data too large");
+        RETURN_FALSE;
+    }
+    int vertex_data_count = (int)vertex_data_count_l;
 
     if (vertex_data_count == 0) {
         php_error_docref(NULL, E_WARNING, "Vertices array is empty");
@@ -3186,20 +3201,35 @@ ZEND_FUNCTION(vio_mesh)
         }
     }
 
+    if (raw_vertices && (floats_per_vertex <= 0 || vertex_data_count % floats_per_vertex != 0)) {
+        php_error_docref(NULL, E_WARNING, "vio_mesh: raw 'vertices' hold %d floats, not a multiple of the layout's %d floats per vertex",
+                         vertex_data_count, floats_per_vertex);
+        RETURN_FALSE;
+    }
     int vertex_count = vertex_data_count / floats_per_vertex;
 
-    /* Convert PHP array to float array */
-    float *data = emalloc(sizeof(float) * vertex_data_count);
-    int i = 0;
+    /* Float array: converted into a temporary; raw string: used in place (the
+     * backends copy it into GPU memory, nothing keeps the pointer). */
+    float *data;
     zval *val;
-    ZEND_HASH_FOREACH_VAL(vertices_ht, val) {
-        data[i++] = (float)zval_get_double(val);
-    } ZEND_HASH_FOREACH_END();
+    if (raw_vertices) {
+        data = (float *)Z_STRVAL_P(vertices_zval);
+    } else {
+        data = emalloc(sizeof(float) * vertex_data_count);
+        int i = 0;
+        ZEND_HASH_FOREACH_VAL(vertices_ht, val) {
+            data[i++] = (float)zval_get_double(val);
+        } ZEND_HASH_FOREACH_END();
+    }
 
-    /* Get optional indices */
+    /* Get optional indices: a PHP int array, or a raw string of packed
+     * little-endian uint16 / uint32 ('index_type' => VIO_INDEX_UINT16 | VIO_INDEX_UINT32,
+     * default uint32 for a string - the bytes are taken exactly as packed). */
     zval *indices_zval = zend_hash_str_find(config_ht, "indices", sizeof("indices") - 1);
     unsigned int *indices = NULL;
     int index_count = 0;
+    const void *raw_index_bytes = NULL;     /* string indices, used in place when no widening is needed */
+    int raw_index_width = 0;
 
     if (indices_zval && Z_TYPE_P(indices_zval) == IS_ARRAY) {
         HashTable *indices_ht = Z_ARRVAL_P(indices_zval);
@@ -3209,6 +3239,48 @@ ZEND_FUNCTION(vio_mesh)
         ZEND_HASH_FOREACH_VAL(indices_ht, val) {
             indices[j++] = (unsigned int)zval_get_long(val);
         } ZEND_HASH_FOREACH_END();
+    } else if (indices_zval && Z_TYPE_P(indices_zval) == IS_STRING) {
+        zval *itz = zend_hash_str_find(config_ht, "index_type", sizeof("index_type") - 1);
+        raw_index_width = itz ? (int)zval_get_long(itz) : 4;
+        if (raw_index_width != 2 && raw_index_width != 4) {
+            php_error_docref(NULL, E_WARNING, "vio_mesh: a raw 'indices' string needs 'index_type' VIO_INDEX_UINT16 or VIO_INDEX_UINT32");
+            if (!raw_vertices) efree(data);
+            RETURN_FALSE;
+        }
+        if (Z_STRLEN_P(indices_zval) % (size_t)raw_index_width != 0 || Z_STRLEN_P(indices_zval) / (size_t)raw_index_width > (size_t)INT_MAX / 4) {
+            php_error_docref(NULL, E_WARNING, "vio_mesh: raw 'indices' length %zu is not a multiple of %d", Z_STRLEN_P(indices_zval), raw_index_width);
+            if (!raw_vertices) efree(data);
+            RETURN_FALSE;
+        }
+        index_count = (int)(Z_STRLEN_P(indices_zval) / (size_t)raw_index_width);
+        /* range check once: an out-of-range index would read past the vertex buffer on the GPU */
+        {
+            const unsigned char *rb = (const unsigned char *)Z_STRVAL_P(indices_zval);
+            for (int k = 0; k < index_count; k++) {
+                unsigned int v;
+                if (raw_index_width == 2) { uint16_t t; memcpy(&t, rb + (size_t)k * 2, 2); v = t; }
+                else { memcpy(&v, rb + (size_t)k * 4, 4); }
+                if (v >= (unsigned int)vertex_count) {
+                    php_error_docref(NULL, E_WARNING, "vio_mesh: raw index %u at position %d is out of range (%d vertices)", v, k, vertex_count);
+                    if (!raw_vertices) efree(data);
+                    RETURN_FALSE;
+                }
+            }
+        }
+        raw_index_bytes = Z_STRVAL_P(indices_zval);
+        /* Adjacency and ray tracing work on a uint32 copy; widen only then. */
+        zval *adj_probe = zend_hash_str_find(config_ht, "adjacency", sizeof("adjacency") - 1);
+        int needs_u32 = (adj_probe && zend_is_true(adj_probe))
+            || (floats_per_vertex >= 3 && vertex_count > 0 && ctx->backend->supports_feature
+                && (ctx->backend->supports_feature(VIO_FEATURE_RAY_QUERY) || ctx->backend->supports_feature(VIO_FEATURE_RAYTRACING)));
+        if (needs_u32) {
+            indices = emalloc(sizeof(unsigned int) * (size_t)index_count);
+            for (int k = 0; k < index_count; k++) {
+                if (raw_index_width == 2) { uint16_t t; memcpy(&t, (const char *)raw_index_bytes + (size_t)k * 2, 2); indices[k] = t; }
+                else memcpy(&indices[k], (const char *)raw_index_bytes + (size_t)k * 4, 4);
+            }
+            raw_index_bytes = NULL;
+        }
     }
 
     zval *adj_zval = zend_hash_str_find(config_ht, "adjacency", sizeof("adjacency") - 1);
@@ -3216,7 +3288,7 @@ ZEND_FUNCTION(vio_mesh)
         unsigned int *adj = vio_mesh_build_adjacency(data, floats_per_vertex, vertex_count, indices, index_count);
         if (!adj) {
             php_error_docref(NULL, E_WARNING, "vio_mesh: 'adjacency' needs a triangle list (3 indices / vertices per triangle, in range)");
-            efree(data);
+            if (!raw_vertices) efree(data);
             if (indices) efree(indices);
             RETURN_FALSE;
         }
@@ -3231,12 +3303,16 @@ ZEND_FUNCTION(vio_mesh)
     int index_bytes = 0;
     uint16_t *indices16 = NULL;
     const void *index_data = indices;
-    if (indices && index_count > 0) {
+    if (raw_index_bytes && index_count > 0) {
+        index_bytes = raw_index_width;
+        index_data = raw_index_bytes;
+    } else if (indices && index_count > 0) {
         index_bytes = 4;
         unsigned int max_index = 0;
         for (int k = 0; k < index_count; k++) if (indices[k] > max_index) max_index = indices[k];
         zval *it = zend_hash_str_find(config_ht, "index_type", sizeof("index_type") - 1);
         int forced = it ? (int)zval_get_long(it) : 0;
+        if (raw_index_width == 4) forced = 4;   /* a raw uint32 string keeps its declared width when widened for adjacency / ray tracing */
         if (forced != 4 && max_index < 65536) {
             indices16 = emalloc(sizeof(uint16_t) * index_count);
             for (int k = 0; k < index_count; k++) indices16[k] = (uint16_t)indices[k];
@@ -3323,7 +3399,7 @@ ZEND_FUNCTION(vio_mesh)
         mesh->backend_vb = ctx->backend->create_buffer(&vb_desc);
 
         /* Index buffer */
-        if (indices && index_count > 0) {
+        if ((indices || raw_index_bytes) && index_count > 0) {
             vio_buffer_desc ib_desc = {0};
             ib_desc.type = VIO_BUFFER_INDEX;
             ib_desc.data = index_data;
@@ -3332,7 +3408,7 @@ ZEND_FUNCTION(vio_mesh)
         }
     }
 
-    efree(data);
+    if (!raw_vertices) efree(data);
     if (indices) {
         efree(indices);
     }
@@ -3354,6 +3430,67 @@ ZEND_FUNCTION(vio_mesh_index_bytes)
     vio_mesh_object *mesh = Z_VIO_MESH_P(mesh_zval);
     RETURN_LONG(mesh->index_count > 0 ? mesh->index_bytes : 0);
 }
+
+/* ── Submit-path profiling (debug build only: -DVIO_PROFILE_SUBMIT) ──────────
+ * QueryPerformanceCounter sections around the pieces of the draw path, summed
+ * per category and exposed as vio_profile_submit() (returns and resets them).
+ * The timers cost ~25 ns each, so the absolute numbers are inflated against an
+ * un-instrumented build; use them for the RELATIVE split. Not compiled by default. */
+#ifdef VIO_PROFILE_SUBMIT
+enum {
+    VIO_PROF_DI_TOTAL, VIO_PROF_DI_TEX, VIO_PROF_DI_LAYOUT, VIO_PROF_DI_RESOLVE, VIO_PROF_DI_COPY,
+    VIO_PROF_DI_CB, VIO_PROF_DI_IA, VIO_PROF_DI_SRV, VIO_PROF_DI_DRAW,
+    VIO_PROF_D_TOTAL, VIO_PROF_D_TEX, VIO_PROF_D_LAYOUT, VIO_PROF_D_CB, VIO_PROF_D_DRAW,
+    VIO_PROF_UNIFORM, VIO_PROF_BIND_PIPE, VIO_PROF_BIND_TEX,
+    VIO_PROF_COUNT
+};
+static const char *const vio_prof_names[VIO_PROF_COUNT] = {
+    "draw_instanced.total", "draw_instanced.flush_textures", "draw_instanced.mesh_layout", "draw_instanced.resolve",
+    "draw_instanced.instance_copy", "draw_instanced.cbuffer_slices", "draw_instanced.ia_binds",
+    "draw_instanced.srv_flush", "draw_instanced.draw_call",
+    "draw.total", "draw.flush_textures", "draw.mesh_layout", "draw.cbuffer_push", "draw.backend_draw",
+    "set_uniform.apply", "bind_pipeline", "bind_texture",
+};
+static double vio_prof_ns[VIO_PROF_COUNT];
+static uint64_t vio_prof_calls[VIO_PROF_COUNT];
+static uint64_t vio_prof_bytes_copied;
+static inline int64_t vio_prof_now(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (int64_t)c.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#endif
+}
+static inline double vio_prof_to_ns(int64_t ticks)
+{
+#ifdef _WIN32
+    static double scale = 0.0;
+    if (scale == 0.0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); scale = 1e9 / (double)f.QuadPart; }
+    return (double)ticks * scale;
+#else
+    return (double)ticks;
+#endif
+}
+#define VIO_PROF_BEGIN(var) int64_t var = vio_prof_now()
+#define VIO_PROF_END(var, cat) do { vio_prof_ns[cat] += vio_prof_to_ns(vio_prof_now() - (var)); vio_prof_calls[cat]++; } while (0)
+#else
+#define VIO_PROF_BEGIN(var) ((void)0)
+#define VIO_PROF_END(var, cat) ((void)0)
+#endif
+
+/* Instanced draw entry points defined next to vio_draw_instanced; the batch
+ * submit (further up) records 'instances' draws through them. */
+static void vio_draw_instanced_core(vio_context_object *ctx, vio_mesh_object *mesh,
+                                    const float *mat_data, size_t mat_size, zend_long instance_count,
+                                    vio_instance_buffer_object *inst, size_t ib_offset);
+static void vio_draw_instanced_from_ib(vio_context_object *ctx, vio_mesh_object *mesh,
+                                       vio_instance_buffer_object *ibuf, zend_long first, zend_long count, const char *fn);
+static int vio_bound_shader_is_mesh(vio_context_object *ctx, const char *fn);
 
 /* Shared draw core: record ONE mesh draw onto the open frame command list.
  * Extracted from vio_draw so the single-draw entry point AND vio_submit_batch
@@ -3390,6 +3527,44 @@ static void vio_push_extra_stage_constants(vio_context_object *ctx, vio_shader_o
         }
     }
 }
+
+#ifdef HAVE_D3D12
+/* Point root CBV `stage` (0 = vertex block, 1 = fragment block) at this draw's
+ * constant block. Every draw needs its own slice only when the bytes changed:
+ * when the block equals what this shader pushed last (same allocator epoch, so
+ * that slice still holds it) the root CBV is re-pointed at the old slice -
+ * no ring space, no copy into write-combined memory. The SetGraphicsRoot call
+ * itself always runs (a 2D flush or compute pass between draws may have dropped
+ * the root arguments). The bytes of every slice are identical to the former
+ * per-draw copy. */
+static void vio_d3d12_push_stage_cbuffer(vio_shader_object *sh, int stage, const unsigned char *data, int size)
+{
+    if (size <= 0 || !data || !vio_d3d12.cbuffer_heap_mapped) return;
+    vio_cb_slice_cache *cache = &sh->cb_slice[stage];
+    if (cache->bytes && cache->size == size && cache->epoch == vio_d3d12.cbuffer_epoch
+        && memcmp(cache->bytes, data, (size_t)size) == 0) {
+        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(vio_d3d12.cmd_list, (UINT)stage, (D3D12_GPU_VIRTUAL_ADDRESS)cache->gpu);
+        return;
+    }
+    UINT aligned = ((UINT)size + 255u) & ~255u;
+    UINT offset = vio_d3d12.cbuffer_heap_offset;
+    /* Bound against THIS frame's slice, not the heap: spilling past it would
+     * overwrite the root CBVs of the other frame in flight. */
+    if (offset + aligned > vio_d3d12.cbuffer_frame_end) return;
+    memcpy(vio_d3d12.cbuffer_heap_mapped + offset, data, (size_t)size);
+    D3D12_GPU_VIRTUAL_ADDRESS gpu = vio_d3d12.cbuffer_heap_gpu + offset;
+    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(vio_d3d12.cmd_list, (UINT)stage, gpu);
+    vio_d3d12.cbuffer_heap_offset = offset + aligned;
+    if (cache->size != size || !cache->bytes) {
+        if (cache->bytes) efree(cache->bytes);
+        cache->bytes = emalloc((size_t)size);
+        cache->size = size;
+    }
+    memcpy(cache->bytes, data, (size_t)size);
+    cache->gpu = (uint64_t)gpu;
+    cache->epoch = vio_d3d12.cbuffer_epoch;
+}
+#endif
 
 static void vio_push_shader_cbuffers(vio_context_object *ctx)
 {
@@ -3438,30 +3613,8 @@ static void vio_push_shader_cbuffers(vio_context_object *ctx)
             /* Allocate per-draw cbuffer slices from the linear allocator.
              * Each draw gets its own 256-byte-aligned slice so previous
              * draw data isn't overwritten (D3D12 has no buffer renaming). */
-            if (sh->cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
-                UINT aligned = (sh->cbuffer_total_size + 255) & ~255;
-                UINT offset = vio_d3d12.cbuffer_heap_offset;
-                if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
-                    memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
-                           sh->cbuffer_data, sh->cbuffer_total_size);
-                    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
-                        vio_d3d12.cmd_list, 0,
-                        vio_d3d12.cbuffer_heap_gpu + offset);
-                    vio_d3d12.cbuffer_heap_offset = offset + aligned;
-                }
-            }
-            if (sh->frag_cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
-                UINT aligned = (sh->frag_cbuffer_total_size + 255) & ~255;
-                UINT offset = vio_d3d12.cbuffer_heap_offset;
-                if (offset + aligned <= vio_d3d12.cbuffer_heap_capacity) {
-                    memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
-                           sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
-                    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
-                        vio_d3d12.cmd_list, 1,
-                        vio_d3d12.cbuffer_heap_gpu + offset);
-                    vio_d3d12.cbuffer_heap_offset = offset + aligned;
-                }
-            }
+            vio_d3d12_push_stage_cbuffer(sh, 0, sh->cbuffer_data, sh->cbuffer_total_size);
+            vio_d3d12_push_stage_cbuffer(sh, 1, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
         }
 #endif
     }
@@ -3552,16 +3705,24 @@ static void vio_apply_mesh_layout(vio_context_object *ctx, vio_mesh_object *mesh
 
 static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
 {
+    VIO_PROF_BEGIN(prof_total);
     if (vio_bound_shader_is_mesh(ctx, "vio_draw")) return;
+    VIO_PROF_BEGIN(prof_a);
     vio_flush_pending_textures(ctx);
+    VIO_PROF_END(prof_a, VIO_PROF_D_TEX);
+    VIO_PROF_BEGIN(prof_b);
     vio_apply_mesh_layout(ctx, mesh);
+    VIO_PROF_END(prof_b, VIO_PROF_D_LAYOUT);
     if (ctx->backend->draw_mesh) {
         ctx->backend->draw_mesh(mesh);
     }
 
     /* Backend draw (D3D11/D3D12/Vulkan) */
     if (strcmp(ctx->backend->name, "opengl") != 0) {
+        VIO_PROF_BEGIN(prof_c);
         vio_push_shader_cbuffers(ctx);
+        VIO_PROF_END(prof_c, VIO_PROF_D_CB);
+        VIO_PROF_BEGIN(prof_d);
         if (mesh->index_count > 0 && mesh->backend_ib && ctx->backend->draw_indexed) {
             vio_draw_indexed_cmd cmd = {0};
             cmd.vertex_buffer = mesh->backend_vb;
@@ -3582,7 +3743,9 @@ static void vio_submit_one(vio_context_object *ctx, vio_mesh_object *mesh)
             cmd.vertex_stride = mesh->stride;
             ctx->backend->draw(&cmd);
         }
+        VIO_PROF_END(prof_d, VIO_PROF_D_DRAW);
     }
+    VIO_PROF_END(prof_total, VIO_PROF_D_TOTAL);
 }
 
 ZEND_FUNCTION(vio_draw)
@@ -4926,6 +5089,7 @@ ZEND_FUNCTION(vio_pipeline)
  * does (Metal: the shader's cbuffers, found missing by test 169 on the CI). */
 static void vio_bind_pipeline_core(vio_context_object *ctx, vio_pipeline_object *pipe)
 {
+    VIO_PROF_BEGIN(prof_bp);
     /* Track bound shader in context for vio_draw() and uniform cbuffer */
     ctx->bound_shader_program = pipe->shader_program;
     ctx->bound_shader_object = pipe->shader_ref;
@@ -4950,6 +5114,7 @@ static void vio_bind_pipeline_core(vio_context_object *ctx, vio_pipeline_object 
         vio_metal_set_shader_cbuffers(msh->cbuffer_backend, msh->frag_cbuffer_backend);
     }
 #endif
+    VIO_PROF_END(prof_bp, VIO_PROF_BIND_PIPE);
 }
 
 ZEND_FUNCTION(vio_bind_pipeline)
@@ -6724,6 +6889,7 @@ static zend_long vio_uniform_lookup(vio_shader_object *sh, const char *name)
  * byte-identical state. Caller guarantees ctx is initialized + in_frame. */
 static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *value_zval)
 {
+    VIO_PROF_BEGIN(prof_u);
     /* Marshal zval -> typed (data, count, type) once, then dispatch via the
      * backend's set_uniform slot. OpenGL uses it to do the glGetUniformLocation
      * + glUniform* dance; D3D/Vulkan/Metal also implement set_uniform but with
@@ -6873,6 +7039,7 @@ static void vio_apply_uniform(vio_context_object *ctx, const char *name, zval *v
             }
         }
     }
+    VIO_PROF_END(prof_u, VIO_PROF_UNIFORM);
 }
 
 ZEND_FUNCTION(vio_set_uniform)
@@ -7046,7 +7213,42 @@ ZEND_FUNCTION(vio_submit_batch)
         if (mz && Z_TYPE_P(mz) == IS_OBJECT &&
             instanceof_function(Z_OBJCE_P(mz), vio_mesh_ce)) {
             vio_mesh_object *mesh = Z_VIO_MESH_P(mz);
-            vio_submit_one(ctx, mesh);
+            zval *iz = zend_hash_str_find(r, "instances", sizeof("instances") - 1);
+            if (iz) {
+                /* Instanced record: 'instances' is packed mat4 bytes (string) or a
+                 * VioInstanceBuffer; 'instance_count' (default: all of them from
+                 * 'first_instance', default 0) selects how many are drawn. */
+                zval *cz = zend_hash_str_find(r, "instance_count", sizeof("instance_count") - 1);
+                zval *fz = zend_hash_str_find(r, "first_instance", sizeof("first_instance") - 1);
+                zend_long first = fz ? zval_get_long(fz) : 0;
+                if (vio_bound_shader_is_mesh(ctx, "vio_submit_batch")) continue;
+                if (Z_TYPE_P(iz) == IS_STRING) {
+                    size_t avail = Z_STRLEN_P(iz) / VIO_INSTANCE_STRIDE;
+                    if (first < 0 || (size_t)first > avail) {
+                        zend_value_error("vio_submit_batch(): 'first_instance' %ld is outside the 'instances' string (%zu instances)", (long)first, avail);
+                        break;
+                    }
+                    zend_long count = cz ? zval_get_long(cz) : (zend_long)(avail - (size_t)first);
+                    if (count <= 0) continue;
+                    if ((size_t)first + (size_t)count > avail) {
+                        zend_value_error("vio_submit_batch(): 'instances' holds %zu instances, the record needs %ld", avail, (long)(first + count));
+                        break;
+                    }
+                    vio_draw_instanced_core(ctx, mesh, (const float *)(Z_STRVAL_P(iz) + (size_t)first * VIO_INSTANCE_STRIDE),
+                                            (size_t)count * VIO_INSTANCE_STRIDE, count, NULL, 0);
+                } else if (Z_TYPE_P(iz) == IS_OBJECT && instanceof_function(Z_OBJCE_P(iz), vio_instance_buffer_ce)) {
+                    vio_instance_buffer_object *ibuf = Z_VIO_INSTANCE_BUFFER_P(iz);
+                    zend_long total = (zend_long)(ibuf->size / VIO_INSTANCE_STRIDE);
+                    zend_long count = cz ? zval_get_long(cz) : total - first;
+                    vio_draw_instanced_from_ib(ctx, mesh, ibuf, first, count, "vio_submit_batch");
+                    if (EG(exception)) break;   /* a range outside the buffer: the records before it were drawn, stop here */
+                } else {
+                    zend_type_error("vio_submit_batch(): 'instances' must be a packed string or a VioInstanceBuffer, %s given", zend_zval_type_name(iz));
+                    break;
+                }
+            } else {
+                vio_submit_one(ctx, mesh);
+            }
         }
         /* -------------------------------------------------------------------- */
     } ZEND_HASH_FOREACH_END();
@@ -7067,6 +7269,10 @@ static int vio_bundle_parse_record(vio_bundle_record *r, zval *rec, zend_ulong i
     zval *mz = zend_hash_str_find(h, "mesh", sizeof("mesh") - 1);
     if (!mz || Z_TYPE_P(mz) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(mz), vio_mesh_ce)) {
         zend_value_error("vio_bundle(): record %lu needs a VioMesh under 'mesh'", (unsigned long)index);
+        return -1;
+    }
+    if (zend_hash_str_exists(h, "instances", sizeof("instances") - 1)) {
+        zend_value_error("vio_bundle(): record %lu: instanced records ('instances') are only supported by vio_submit_batch", (unsigned long)index);
         return -1;
     }
     zval *pz = zend_hash_str_find(h, "pipeline", sizeof("pipeline") - 1);
@@ -14780,43 +14986,25 @@ static int vio_resolve_instance_data(zval *matrices_zval, zend_long instance_cou
     return -1;
 }
 
-ZEND_FUNCTION(vio_draw_instanced)
+/* Instanced draw core shared by vio_draw_instanced, vio_draw_instanced_buffer and
+ * the 'instances' records of vio_submit_batch. The instance bytes are either
+ * mat_data/mat_size (copied into the backend's per-frame ring) or, when ib is
+ * given as inst, already on the GPU in the persistent buffer (VioInstanceBuffer,
+ * native backends only): ib_offset is the byte offset of the first instance and
+ * mat_size the bytes this draw reads. Caller guarantees an initialized in-frame
+ * context, instance_count > 0, mat_size == instance_count * 64 and that the
+ * bound pipeline is not a mesh pipeline. */
+static void vio_draw_instanced_core(vio_context_object *ctx, vio_mesh_object *mesh,
+                                    const float *mat_data, size_t mat_size, zend_long instance_count,
+                                    vio_instance_buffer_object *inst, size_t ib_offset)
 {
-    zval *ctx_zval;
-    zval *mesh_zval;
-    zval *matrices_zval;
-    zend_long instance_count;
-
-    ZEND_PARSE_PARAMETERS_START(4, 4)
-        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
-        Z_PARAM_OBJECT_OF_CLASS(mesh_zval, vio_mesh_ce)
-        Z_PARAM_ZVAL(matrices_zval)
-        Z_PARAM_LONG(instance_count)
-    ZEND_PARSE_PARAMETERS_END();
-
-    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
-    vio_mesh_object *mesh = Z_VIO_MESH_P(mesh_zval);
-
-    if (!ctx->initialized || !ctx->in_frame) {
-        php_error_docref(NULL, E_WARNING, "Must call vio_draw_instanced between vio_begin and vio_end");
-        return;
-    }
-    if (vio_bound_shader_is_mesh(ctx, "vio_draw_instanced")) return;
-
-    if (instance_count <= 0) {
-        return;
-    }
+    VIO_PROF_BEGIN(prof_total);
+    VIO_PROF_BEGIN(prof_a);
     vio_flush_pending_textures(ctx);
+    VIO_PROF_END(prof_a, VIO_PROF_DI_TEX);
+    VIO_PROF_BEGIN(prof_b);
     vio_apply_mesh_layout(ctx, mesh);
-
-    /* Resolve matrix data (fast binary or slow array path) */
-    const float *mat_data = NULL;
-    size_t mat_size = 0;
-    float *allocated = NULL;
-
-    if (vio_resolve_instance_data(matrices_zval, instance_count, &mat_data, &mat_size, &allocated) != 0) {
-        return;
-    }
+    VIO_PROF_END(prof_b, VIO_PROF_DI_LAYOUT);
 
     if (ctx->backend->draw_mesh_instanced) {
         if (ctx->backend->push_cbuffers) vio_push_shader_cbuffers(ctx);   /* Vulkan: per-draw uniform upload */
@@ -14831,11 +15019,13 @@ ZEND_FUNCTION(vio_draw_instanced)
 #ifdef HAVE_D3D11
         if (strcmp(ctx->backend->name, "d3d11") == 0 && vio_d3d11.initialized) {
             UINT byte_size = (UINT)mat_size;
+            /* A persistent buffer is bound as is: no per-frame ring, no copy. */
+            ID3D11Buffer *persistent_vb = inst ? ((vio_d3d11_buffer *)inst->backend_buffer)->buffer : NULL;
 
             /* Reuse the device's DYNAMIC instance buffer (avoids CreateBuffer per
              * frame). It lives in vio_d3d11 and is released with the device; a
              * function-static outlived the device and a second context drew nothing. */
-            if (!vio_d3d11.draw_instance_buf || vio_d3d11.draw_instance_buf_capacity < byte_size) {
+            if (!persistent_vb && (!vio_d3d11.draw_instance_buf || vio_d3d11.draw_instance_buf_capacity < byte_size)) {
                 if (vio_d3d11.draw_instance_buf) {
                     ID3D11Buffer_Release(vio_d3d11.draw_instance_buf);
                     vio_d3d11.draw_instance_buf = NULL;
@@ -14849,25 +15039,28 @@ ZEND_FUNCTION(vio_draw_instanced)
 
                 HRESULT hr = ID3D11Device_CreateBuffer(vio_d3d11.device, &bd, NULL, &vio_d3d11.draw_instance_buf);
                 if (FAILED(hr)) {
-                    if (allocated) efree(allocated);
                     return;
                 }
                 vio_d3d11.draw_instance_buf_capacity = byte_size;
             }
 
-            /* Upload via Map/Unmap WRITE_DISCARD */
+            /* Upload via Map/Unmap WRITE_DISCARD (not for a persistent buffer) */
             D3D11_MAPPED_SUBRESOURCE mapped = {0};
-            HRESULT hr = ID3D11DeviceContext_Map(vio_d3d11.context,
-                (ID3D11Resource *)vio_d3d11.draw_instance_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+            HRESULT hr = S_OK;
+            if (!persistent_vb) {
+                hr = ID3D11DeviceContext_Map(vio_d3d11.context,
+                    (ID3D11Resource *)vio_d3d11.draw_instance_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+                if (SUCCEEDED(hr)) {
+                    memcpy(mapped.pData, mat_data, byte_size);
+                    ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)vio_d3d11.draw_instance_buf, 0);
+                }
+            }
             if (SUCCEEDED(hr)) {
-                memcpy(mapped.pData, mat_data, byte_size);
-                ID3D11DeviceContext_Unmap(vio_d3d11.context, (ID3D11Resource *)vio_d3d11.draw_instance_buf, 0);
-
                 /* Bind mesh VB to slot 0, instance VB to slot 1 */
                 vio_d3d11_buffer *vb = (vio_d3d11_buffer *)mesh->backend_vb;
-                ID3D11Buffer *buffers[2] = { vb->buffer, vio_d3d11.draw_instance_buf };
+                ID3D11Buffer *buffers[2] = { vb->buffer, persistent_vb ? persistent_vb : vio_d3d11.draw_instance_buf };
                 UINT strides[2] = { (UINT)mesh->stride, 64 };  /* 64 = sizeof(mat4) */
-                UINT offsets[2] = { 0, 0 };
+                UINT offsets[2] = { 0, persistent_vb ? (UINT)ib_offset : 0 };
                 ID3D11DeviceContext_IASetVertexBuffers(vio_d3d11.context, 0, 2, buffers, strides, offsets);
 
                 /* Flush cbuffers */
@@ -14926,7 +15119,12 @@ ZEND_FUNCTION(vio_draw_instanced)
              * overflow just skips this draw (the grow happens at next
              * begin_frame, after a full GPU sync). */
             D3D12_GPU_VIRTUAL_ADDRESS instance_gpu = 0;
-            if (vio_d3d12.instance_heap_mapped && byte_size > 0) {
+            VIO_PROF_BEGIN(prof_copy);
+            if (inst) {
+                /* Persistent buffer: the matrices are already in GPU memory, the
+                 * VBV just points into them. Nothing is copied or allocated. */
+                instance_gpu = ((vio_d3d12_buffer *)inst->backend_buffer)->gpu_address + ib_offset;
+            } else if (vio_d3d12.instance_heap_mapped && byte_size > 0) {
                 UINT aligned = (byte_size + 255u) & ~255u;
                 UINT offset = vio_d3d12.instance_heap_offset;
                 /* Never spill past this frame's slice — the bytes beyond it
@@ -14935,16 +15133,20 @@ ZEND_FUNCTION(vio_draw_instanced)
                     memcpy(vio_d3d12.instance_heap_mapped + offset, mat_data, byte_size);
                     instance_gpu = vio_d3d12.instance_heap_gpu + offset;
                     vio_d3d12.instance_heap_offset = offset + aligned;
+#ifdef VIO_PROFILE_SUBMIT
+                    vio_prof_bytes_copied += byte_size;
+#endif
                 }
             }
+            VIO_PROF_END(prof_copy, VIO_PROF_DI_COPY);
             if (instance_gpu == 0) {
                 /* Slice exhausted (or heap unavailable): skip rather than draw
                  * with another draw's matrices. Heap grows at next begin_frame. */
-                if (allocated) efree(allocated);
                 return;
             }
 
             /* Flush cbuffers */
+            VIO_PROF_BEGIN(prof_cb);
             if (ctx->bound_shader_object) {
                 vio_shader_object *sh = (vio_shader_object *)ctx->bound_shader_object;
                 if (sh->cbuffer_dirty && sh->cbuffer_backend && ctx->backend->update_buffer) {
@@ -14956,39 +15158,18 @@ ZEND_FUNCTION(vio_draw_instanced)
                     sh->frag_cbuffer_dirty = 0;
                 }
                 vio_push_extra_stage_constants(ctx, sh);
-                /* Allocate per-draw cbuffer slices from linear allocator.
-                 * Bound against THIS frame's slice end (cbuffer_frame_end), not
-                 * heap capacity — spilling past the slice would clobber the
-                 * other in-flight frame's root CBVs (same aliasing class). */
-                if (sh->cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
-                    UINT aligned = (sh->cbuffer_total_size + 255) & ~255;
-                    UINT offset = vio_d3d12.cbuffer_heap_offset;
-                    if (offset + aligned <= vio_d3d12.cbuffer_frame_end) {
-                        memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
-                               sh->cbuffer_data, sh->cbuffer_total_size);
-                        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
-                            vio_d3d12.cmd_list, 0,
-                            vio_d3d12.cbuffer_heap_gpu + offset);
-                        vio_d3d12.cbuffer_heap_offset = offset + aligned;
-                    }
-                }
-                if (sh->frag_cbuffer_total_size > 0 && vio_d3d12.cbuffer_heap_mapped) {
-                    UINT aligned = (sh->frag_cbuffer_total_size + 255) & ~255;
-                    UINT offset = vio_d3d12.cbuffer_heap_offset;
-                    if (offset + aligned <= vio_d3d12.cbuffer_frame_end) {
-                        memcpy(vio_d3d12.cbuffer_heap_mapped + offset,
-                               sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
-                        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
-                            vio_d3d12.cmd_list, 1,
-                            vio_d3d12.cbuffer_heap_gpu + offset);
-                        vio_d3d12.cbuffer_heap_offset = offset + aligned;
-                    }
-                }
+                /* Per-draw cbuffer slices from the linear allocator (re-pointed at the
+                 * previous slice when the block did not change), bounded by THIS
+                 * frame's slice end. */
+                vio_d3d12_push_stage_cbuffer(sh, 0, sh->cbuffer_data, sh->cbuffer_total_size);
+                vio_d3d12_push_stage_cbuffer(sh, 1, sh->frag_cbuffer_data, sh->frag_cbuffer_total_size);
             }
+            VIO_PROF_END(prof_cb, VIO_PROF_DI_CB);
 
             /* Bind vertex buffers: slot 0 = mesh, slot 1 = instances.
              * instance_gpu is this draw's OWN slice in the per-frame ring,
              * stable until the command list executes at Present. */
+            VIO_PROF_BEGIN(prof_ia);
             vio_d3d12_buffer *vb = (vio_d3d12_buffer *)mesh->backend_vb;
             D3D12_VERTEX_BUFFER_VIEW vbvs[2];
             vbvs[0].BufferLocation = vb->gpu_address;
@@ -15007,9 +15188,14 @@ ZEND_FUNCTION(vio_draw_instanced)
                 ibv.SizeInBytes = (UINT)ib->size;
                 ibv.Format = mesh->index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
                 ID3D12GraphicsCommandList_IASetIndexBuffer(vio_d3d12.cmd_list, &ibv);
+                VIO_PROF_END(prof_ia, VIO_PROF_DI_IA);
+                VIO_PROF_BEGIN(prof_srv);
                 vio_d3d12_flush_srv_table();
+                VIO_PROF_END(prof_srv, VIO_PROF_DI_SRV);
+                VIO_PROF_BEGIN(prof_draw);
                 ID3D12GraphicsCommandList_DrawIndexedInstanced(vio_d3d12.cmd_list,
                     mesh->index_count, (UINT)instance_count, 0, 0, 0);
+                VIO_PROF_END(prof_draw, VIO_PROF_DI_DRAW);
             } else {
                 vio_d3d12_flush_srv_table();
                 ID3D12GraphicsCommandList_DrawInstanced(vio_d3d12.cmd_list,
@@ -15060,7 +15246,218 @@ ZEND_FUNCTION(vio_draw_instanced)
 
     }
 
+    VIO_PROF_END(prof_total, VIO_PROF_DI_TOTAL);
+}
+
+ZEND_FUNCTION(vio_draw_instanced)
+{
+    zval *ctx_zval;
+    zval *mesh_zval;
+    zval *matrices_zval;
+    zend_long instance_count;
+
+    ZEND_PARSE_PARAMETERS_START(4, 4)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(mesh_zval, vio_mesh_ce)
+        Z_PARAM_ZVAL(matrices_zval)
+        Z_PARAM_LONG(instance_count)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    vio_mesh_object *mesh = Z_VIO_MESH_P(mesh_zval);
+
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_draw_instanced between vio_begin and vio_end");
+        return;
+    }
+    if (vio_bound_shader_is_mesh(ctx, "vio_draw_instanced")) return;
+
+    if (instance_count <= 0) {
+        return;
+    }
+
+    /* Resolve matrix data (fast binary or slow array path) */
+    const float *mat_data = NULL;
+    size_t mat_size = 0;
+    float *allocated = NULL;
+
+    VIO_PROF_BEGIN(prof_c);
+    if (vio_resolve_instance_data(matrices_zval, instance_count, &mat_data, &mat_size, &allocated) != 0) {
+        return;
+    }
+    VIO_PROF_END(prof_c, VIO_PROF_DI_RESOLVE);
+
+    vio_draw_instanced_core(ctx, mesh, mat_data, mat_size, instance_count, NULL, 0);
     if (allocated) efree(allocated);
+}
+
+/* Draw from a VioInstanceBuffer: persistent instance data, drawn many times.
+ * $firstInstance / $instanceCount address 64-byte instances inside the buffer. */
+static void vio_draw_instanced_from_ib(vio_context_object *ctx, vio_mesh_object *mesh,
+                                       vio_instance_buffer_object *ibuf, zend_long first, zend_long count, const char *fn)
+{
+    if (count <= 0) return;
+    if (first < 0 || (size_t)first + (size_t)count > ibuf->size / VIO_INSTANCE_STRIDE) {
+        zend_value_error("%s(): instances %ld..%ld are outside the buffer (%zu instances)",
+                         fn, (long)first, (long)(first + count), ibuf->size / VIO_INSTANCE_STRIDE);
+        return;
+    }
+    if (ibuf->backend != ctx->backend) {
+        php_error_docref(NULL, E_WARNING, "%s: the instance buffer belongs to another context's backend", fn);
+        return;
+    }
+    size_t byte_off = (size_t)first * VIO_INSTANCE_STRIDE;
+    size_t bytes = (size_t)count * VIO_INSTANCE_STRIDE;
+    if (ibuf->backend_buffer) {
+        vio_draw_instanced_core(ctx, mesh, NULL, bytes, count, ibuf, byte_off);
+    } else {
+        /* No native path on this backend: draw from the CPU copy. */
+        vio_draw_instanced_core(ctx, mesh, (const float *)(ibuf->shadow + byte_off), bytes, count, NULL, 0);
+    }
+}
+
+ZEND_FUNCTION(vio_draw_instanced_buffer)
+{
+    zval *ctx_zval, *mesh_zval, *buf_zval;
+    zend_long count, first = 0;
+
+    ZEND_PARSE_PARAMETERS_START(4, 5)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_OBJECT_OF_CLASS(mesh_zval, vio_mesh_ce)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_instance_buffer_ce)
+        Z_PARAM_LONG(count)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(first)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized || !ctx->in_frame) {
+        php_error_docref(NULL, E_WARNING, "Must call vio_draw_instanced_buffer between vio_begin and vio_end");
+        return;
+    }
+    if (vio_bound_shader_is_mesh(ctx, "vio_draw_instanced_buffer")) return;
+    vio_draw_instanced_from_ib(ctx, Z_VIO_MESH_P(mesh_zval), Z_VIO_INSTANCE_BUFFER_P(buf_zval), first, count, "vio_draw_instanced_buffer");
+}
+
+/* vio_instance_buffer($ctx, $data): persistent instance buffer holding packed
+ * mat4 instances (64 bytes each). Created once, drawn with
+ * vio_draw_instanced_buffer / a batch record 'instances' => $buffer, updated in
+ * place with vio_instance_buffer_update. */
+ZEND_FUNCTION(vio_instance_buffer)
+{
+    zval *ctx_zval;
+    zend_string *data;
+    zend_long capacity = 0;
+
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_OBJECT_OF_CLASS(ctx_zval, vio_context_ce)
+        Z_PARAM_STR(data)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(capacity)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_context_object *ctx = Z_VIO_CONTEXT_P(ctx_zval);
+    if (!ctx->initialized) {
+        php_error_docref(NULL, E_WARNING, "Context is not initialized");
+        RETURN_FALSE;
+    }
+    if (ZSTR_LEN(data) == 0 || ZSTR_LEN(data) % VIO_INSTANCE_STRIDE != 0) {
+        zend_argument_value_error(2, "must be a non-empty multiple of %d bytes (packed mat4 instances)", VIO_INSTANCE_STRIDE);
+        RETURN_THROWS();
+    }
+    if (capacity != 0 && (capacity < (zend_long)ZSTR_LEN(data) || capacity % VIO_INSTANCE_STRIDE != 0)) {
+        zend_argument_value_error(3, "must be 0 or a multiple of %d that is at least the length of $data", VIO_INSTANCE_STRIDE);
+        RETURN_THROWS();
+    }
+    size_t size = capacity > 0 ? (size_t)capacity : ZSTR_LEN(data);
+    if (size > (size_t)INT_MAX) {
+        zend_argument_value_error(2, "is too large");
+        RETURN_THROWS();
+    }
+
+    /* Capacity beyond the data: the rest starts zeroed. */
+    unsigned char *padded = NULL;
+    const void *init = ZSTR_VAL(data);
+    if (size > ZSTR_LEN(data)) {
+        padded = ecalloc(1, size);
+        memcpy(padded, ZSTR_VAL(data), ZSTR_LEN(data));
+        init = padded;
+    }
+
+    void *native = NULL;
+    unsigned char *shadow = NULL;
+    if (ctx->backend->persistent_instance_buffers && ctx->backend->create_buffer) {
+        vio_buffer_desc desc = {0};
+        desc.type = VIO_BUFFER_VERTEX;
+        desc.data = init;
+        desc.size = size;
+        native = ctx->backend->create_buffer(&desc);
+        if (padded) efree(padded);
+        if (!native) RETURN_FALSE;
+    } else if (padded) {
+        shadow = padded;            /* already the zero-padded copy */
+    } else {
+        shadow = emalloc(size);
+        memcpy(shadow, ZSTR_VAL(data), size);
+    }
+    object_init_ex(return_value, vio_instance_buffer_ce);
+    vio_instance_buffer_object *b = Z_VIO_INSTANCE_BUFFER_P(return_value);
+    b->size = size;
+    b->backend = ctx->backend;
+    b->backend_buffer = native;
+    b->shadow = shadow;
+}
+
+/* Overwrite instances in place: $data replaces the bytes at $offset (a multiple
+ * of 64; both must lie inside the buffer). Draws recorded after the call see
+ * the new data, draws recorded before it keep the old (ordered on the GPU). */
+ZEND_FUNCTION(vio_instance_buffer_update)
+{
+    zval *buf_zval;
+    zend_string *data;
+    zend_long offset = 0;
+
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_instance_buffer_ce)
+        Z_PARAM_STR(data)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(offset)
+    ZEND_PARSE_PARAMETERS_END();
+
+    vio_instance_buffer_object *b = Z_VIO_INSTANCE_BUFFER_P(buf_zval);
+    if (offset < 0 || offset % VIO_INSTANCE_STRIDE != 0) {
+        zend_argument_value_error(3, "must be a non-negative multiple of %d", VIO_INSTANCE_STRIDE);
+        RETURN_THROWS();
+    }
+    if (ZSTR_LEN(data) == 0 || ZSTR_LEN(data) % VIO_INSTANCE_STRIDE != 0) {
+        zend_argument_value_error(2, "must be a non-empty multiple of %d bytes", VIO_INSTANCE_STRIDE);
+        RETURN_THROWS();
+    }
+    if ((size_t)offset + ZSTR_LEN(data) > b->size) {
+        zend_argument_value_error(2, "does not fit: %zu bytes at offset %ld, the buffer holds %zu", ZSTR_LEN(data), (long)offset, b->size);
+        RETURN_THROWS();
+    }
+    if (b->backend_buffer) {
+        const vio_backend *be = (const vio_backend *)b->backend;
+        be->update_buffer(b->backend_buffer, ZSTR_VAL(data), ZSTR_LEN(data), (size_t)offset);
+    } else {
+        memcpy(b->shadow + offset, ZSTR_VAL(data), ZSTR_LEN(data));
+    }
+    RETURN_TRUE;
+}
+
+/* ['bytes' => int, 'instances' => int, 'native' => bool] */
+ZEND_FUNCTION(vio_instance_buffer_info)
+{
+    zval *buf_zval;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJECT_OF_CLASS(buf_zval, vio_instance_buffer_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    vio_instance_buffer_object *b = Z_VIO_INSTANCE_BUFFER_P(buf_zval);
+    array_init(return_value);
+    add_assoc_long(return_value, "bytes", (zend_long)b->size);
+    add_assoc_long(return_value, "instances", (zend_long)(b->size / VIO_INSTANCE_STRIDE));
+    add_assoc_bool(return_value, "native", b->backend_buffer != NULL);
 }
 
 ZEND_FUNCTION(vio_render_target)
@@ -17366,11 +17763,43 @@ ZEND_FUNCTION(vio_pop_render_target)
     zval_ptr_dtor(&result);
 }
 
+#ifdef VIO_PROFILE_SUBMIT
+/* vio_profile_submit(): ['section' => ['calls' => int, 'total_ms' => float, 'avg_ns' => float], ...,
+ * 'instance_bytes_copied' => int]; resets the counters. Debug builds only. */
+ZEND_FUNCTION(vio_profile_submit)
+{
+    array_init(return_value);
+    for (int i = 0; i < VIO_PROF_COUNT; i++) {
+        zval s;
+        array_init(&s);
+        add_assoc_long(&s, "calls", (zend_long)vio_prof_calls[i]);
+        add_assoc_double(&s, "total_ms", vio_prof_ns[i] / 1e6);
+        add_assoc_double(&s, "avg_ns", vio_prof_calls[i] ? vio_prof_ns[i] / (double)vio_prof_calls[i] : 0.0);
+        add_assoc_zval(return_value, vio_prof_names[i], &s);
+        vio_prof_ns[i] = 0.0;
+        vio_prof_calls[i] = 0;
+    }
+    add_assoc_long(return_value, "instance_bytes_copied", (zend_long)vio_prof_bytes_copied);
+    vio_prof_bytes_copied = 0;
+}
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_vio_profile_submit, 0, 0, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+static const zend_function_entry vio_profile_functions[] = {
+    ZEND_FE(vio_profile_submit, arginfo_vio_profile_submit)
+    ZEND_FE_END
+};
+#endif
+
 /* ── Module lifecycle ─────────────────────────────────────────────── */
 
 PHP_MINIT_FUNCTION(vio)
 {
     REGISTER_INI_ENTRIES();
+#ifdef VIO_PROFILE_SUBMIT
+    zend_register_functions(NULL, vio_profile_functions, NULL, type);
+#endif
     le_vio_async_load = zend_register_list_destructors_ex(vio_async_load_dtor, NULL, "vio_async_load", module_number);
     le_vio_async_font = zend_register_list_destructors_ex(vio_async_font_dtor, NULL, "vio_async_font", module_number);
     vio_plugin_registry_init();
@@ -17402,6 +17831,7 @@ PHP_MINIT_FUNCTION(vio)
     vio_compute_pipeline_register();
     vio_acceleration_structure_register();
     vio_bundle_register();
+    vio_instance_buffer_register();
     vio_rt_pipeline_register();
     vio_work_graph_register();
     vio_upscaler_register();

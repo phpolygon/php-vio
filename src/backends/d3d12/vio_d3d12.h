@@ -729,6 +729,10 @@ typedef struct _vio_d3d12_state {
     D3D12_GPU_VIRTUAL_ADDRESS  cbuffer_heap_gpu;
     unsigned char             *cbuffer_heap_mapped;    /* persistently mapped */
     UINT                       cbuffer_heap_offset;    /* current allocation offset */
+    /* Bumped whenever the allocator restarts or changes heap (begin_frame, heap
+     * regrow, a bundle recording starting / stopping): a root-CBV slice cached
+     * under an older epoch no longer holds what it held (php_vio.c, per-shader cache). */
+    uint32_t                   cbuffer_epoch;
     UINT                       cbuffer_heap_capacity;  /* total size */
     UINT                       cbuffer_frame_base;     /* base of THIS frame's slice */
     UINT                       cbuffer_frame_end;      /* end of THIS frame's slice */

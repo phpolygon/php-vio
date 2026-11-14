@@ -57,6 +57,14 @@ typedef struct _vio_shader_stage_cb {
     int               block_binding;   /* binding of its named uniform block, -1 = none */
 } vio_shader_stage_cb;
 
+/* A constant-buffer slice a draw pushed: its bytes, GPU address and allocator epoch (D3D12). */
+typedef struct _vio_cb_slice_cache {
+    unsigned char *bytes;
+    int            size;
+    uint64_t       gpu;
+    uint32_t       epoch;
+} vio_cb_slice_cache;
+
 typedef struct _vio_shader_object {
     unsigned int      program;       /* GL program ID (0 if not OpenGL) */
     vio_shader_format format;
@@ -98,6 +106,10 @@ typedef struct _vio_shader_object {
     int               cbuffer_dirty;    /* 1 if data changed since last upload */
     /* Fragment stage constant buffer */
     unsigned char    *frag_cbuffer_data;   /* frag_cbuffer_total_size bytes (emalloc) */
+    /* D3D12: the constant-buffer slice the last draw pushed for each stage (a copy of
+     * its bytes, where it lives and in which allocator epoch). A draw whose block did not
+     * change points the root CBV at that slice again instead of copying a new one. */
+    vio_cb_slice_cache cb_slice[2];
     vio_uniform_entry *frag_uniforms;      /* frag_uniform_count entries (emalloc) */
     int               frag_uniform_count;
     int               frag_cbuffer_total_size;

@@ -627,6 +627,13 @@ typedef struct _vio_backend {
      * like the headless FBO), resized to the window first. 0 = none. */
     unsigned int (*swapchain_fbo)(void *swapchain);
 
+    /* ── Persistent instance buffers (vio_instance_buffer) ───────────────
+     * 1 = the backend draws vio_draw_instanced_buffer / batch 'instances' =>
+     * VioInstanceBuffer straight from a GPU vertex buffer created through the
+     * create_buffer slot (type VIO_BUFFER_VERTEX with data, updated through
+     * update_buffer). 0 = the frontend keeps a CPU copy and draws from it like
+     * vio_draw_instanced (correct everywhere, no upload saving). */
+    int   persistent_instance_buffers;
     /* 1 = the frontend (vio_mesh_free_object) releases a mesh's backend_vb /
      * backend_ib through destroy_buffer when the mesh is freed (backends whose
      * meshes are plain create_buffer buffers and have no destroy_mesh slot). */

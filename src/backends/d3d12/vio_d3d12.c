@@ -2163,6 +2163,7 @@ static int d3d12_init(vio_config *cfg)
             vio_d3d12.cbuffer_frame_base = 0;
             vio_d3d12.cbuffer_frame_end = heap_size / vio_d3d12.frame_count;
             vio_d3d12.cbuffer_heap_offset = 0;
+            vio_d3d12.cbuffer_epoch++;
             /* Persistently map (never unmap — valid for UPLOAD heaps in D3D12) */
             D3D12_RANGE rr = {0, 0};
             ID3D12Resource_Map(vio_d3d12.cbuffer_heap, 0, &rr, (void **)&vio_d3d12.cbuffer_heap_mapped);
@@ -7895,6 +7896,7 @@ static void d3d12_begin_frame(void)
     vio_d3d12.cbuffer_frame_base = vio_d3d12.frame_index * cb_slice;
     vio_d3d12.cbuffer_frame_end  = vio_d3d12.cbuffer_frame_base + cb_slice;
     vio_d3d12.cbuffer_heap_offset = vio_d3d12.cbuffer_frame_base;
+    vio_d3d12.cbuffer_epoch++;
     /* Rebase the instance allocator into THIS frame's slice (same as cbuffer). */
     UINT inst_slice = vio_d3d12.instance_heap_capacity / vio_d3d12.frame_count;
     vio_d3d12.instance_frame_base = vio_d3d12.frame_index * inst_slice;
@@ -11313,6 +11315,7 @@ static void d3d12_bundle_stop(void)
     vio_d3d12.cbuffer_heap_mapped   = d3d12_brec_saved.cb_mapped;
     vio_d3d12.cbuffer_heap_gpu      = d3d12_brec_saved.cb_gpu;
     vio_d3d12.cbuffer_heap_offset   = d3d12_brec_saved.cb_offset;
+    vio_d3d12.cbuffer_epoch++;
     vio_d3d12.cbuffer_heap_capacity = d3d12_brec_saved.cb_capacity;
     vio_d3d12.cbuffer_frame_base    = d3d12_brec_saved.cb_base;
     vio_d3d12.cbuffer_frame_end     = d3d12_brec_saved.cb_end;
@@ -11380,6 +11383,7 @@ static void *d3d12_begin_bundle(void)
     vio_d3d12.cbuffer_heap_mapped   = b->cb_mapped;
     vio_d3d12.cbuffer_heap_gpu      = b->cb_gpu;
     vio_d3d12.cbuffer_heap_offset   = 0;
+    vio_d3d12.cbuffer_epoch++;
     vio_d3d12.cbuffer_heap_capacity = b->cb_size;
     vio_d3d12.cbuffer_frame_base    = 0;
     vio_d3d12.cbuffer_frame_end     = b->cb_size;
@@ -11570,6 +11574,7 @@ static const vio_backend d3d12_backend = {
     .create_swapchain  = d3d12_create_swapchain,
     .set_swapchain     = d3d12_set_swapchain,
     .destroy_swapchain = d3d12_destroy_swapchain,
+    .persistent_instance_buffers = 1,
     .release_mesh_buffers = 1,
     .set_frame_present = d3d12_set_frame_present,
     .upscaler_supported             = d3d12_upscaler_supported,
