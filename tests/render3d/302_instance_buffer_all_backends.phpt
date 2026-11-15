@@ -162,8 +162,8 @@ echo "DONE\n";
 --EXPECTF--
 opengl: %r(OK|skip \(.*\))%r
 d3d11: %r(OK|skip \(.*\))%r
-d3d12: %r(OK|skip \(.*\))%r
+d3d12: %r(?:\[d3d12\] [^\r\n]*\r?\n)*(?:OK|skip \(.*\))%r
 metal: %r(OK|skip \(.*\))%r
 vulkan: %r(OK|skip \(.*\))%r
-d3d12_hw: %r(OK|skip \(.*\))%r
+d3d12_hw: %r(?:\[d3d12\] [^\r\n]*\r?\n)*(?:OK|skip \(.*\))%r
 DONE

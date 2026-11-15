@@ -97,8 +97,8 @@ opengl call: %r(OK|skip \(.*\))%r
 opengl batch: %r(OK|skip \(.*\))%r
 d3d11 call: %r(OK|skip \(.*\))%r
 d3d11 batch: %r(OK|skip \(.*\))%r
-d3d12 call: %r(OK|skip \(.*\))%r
-d3d12 batch: %r(OK|skip \(.*\))%r
+d3d12 call: %r(?:\[d3d12\] [^\r\n]*\r?\n)*(?:OK|skip \(.*\))%r
+d3d12 batch: %r(?:\[d3d12\] [^\r\n]*\r?\n)*(?:OK|skip \(.*\))%r
 metal call: %r(OK|skip \(.*\))%r
 metal batch: %r(OK|skip \(.*\))%r
 vulkan call: %r(OK|skip \(.*\))%r
