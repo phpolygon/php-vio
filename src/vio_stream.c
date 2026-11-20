@@ -57,7 +57,7 @@ void vio_stream_register(void)
     vio_stream_ce->create_object = vio_stream_create_object;
 
     memcpy(&vio_stream_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_stream_handlers.offset   = XtOffsetOf(vio_stream_object, std);
+    vio_stream_handlers.offset   = offsetof(vio_stream_object, std);
     vio_stream_handlers.free_obj = vio_stream_free_object;
     vio_stream_handlers.clone_obj = NULL;
 }

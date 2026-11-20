@@ -42,7 +42,7 @@ extern zend_class_entry *vio_cubemap_ce;
 void vio_cubemap_register(void);
 
 static inline vio_cubemap_object *vio_cubemap_from_obj(zend_object *obj) {
-    return (vio_cubemap_object *)((char *)obj - XtOffsetOf(vio_cubemap_object, std));
+    return (vio_cubemap_object *)((char *)obj - offsetof(vio_cubemap_object, std));
 }
 
 #define Z_VIO_CUBEMAP_P(zv) vio_cubemap_from_obj(Z_OBJ_P(zv))

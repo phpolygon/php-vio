@@ -50,7 +50,7 @@ extern zend_class_entry *vio_recorder_ce;
 void vio_recorder_register(void);
 
 static inline vio_recorder_object *vio_recorder_from_obj(zend_object *obj) {
-    return (vio_recorder_object *)((char *)obj - XtOffsetOf(vio_recorder_object, std));
+    return (vio_recorder_object *)((char *)obj - offsetof(vio_recorder_object, std));
 }
 
 #define Z_VIO_RECORDER_P(zv) vio_recorder_from_obj(Z_OBJ_P(zv))

@@ -20,8 +20,15 @@ jobs:
   linux-x86_64:
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         php: ['8.5']
+        experimental: [false]
+        include:
+          # PHP 8.6 dry run: allowed to fail, not part of the required gate.
+          - php: '8.6'
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 
@@ -283,8 +290,15 @@ jobs:
   linux-aarch64:
     runs-on: ubuntu-24.04-arm
     strategy:
+      fail-fast: false
       matrix:
         php: ['8.5']
+        experimental: [false]
+        include:
+          # PHP 8.6 dry run: allowed to fail, not part of the required gate.
+          - php: '8.6'
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 
@@ -526,8 +540,15 @@ jobs:
     # x86_64) an arm64 binary.
     runs-on: macos-15-intel
     strategy:
+      fail-fast: false
       matrix:
         php: ['8.5']
+        experimental: [false]
+        include:
+          # PHP 8.6 dry run: allowed to fail, not part of the required gate.
+          - php: '8.6'
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 
@@ -551,9 +572,9 @@ jobs:
         with:
           path: ${{ runner.temp }}/brew-kegs
           # never an exact hit: the newest cache with the prefix is taken
-          key: brew-kegs-macos-15-intel-v1-none
+          key: ${{ matrix.php == '8.5' && 'brew-kegs-macos-15-intel-v1' || format('brew-kegs-php{0}-macos-15-intel-v1', matrix.php) }}-none
           restore-keys: |
-            brew-kegs-macos-15-intel-v1-
+            ${{ matrix.php == '8.5' && 'brew-kegs-macos-15-intel-v1' || format('brew-kegs-php{0}-macos-15-intel-v1', matrix.php) }}-
 
       - name: Homebrew kegs - unpack and link
         run: |
@@ -582,7 +603,17 @@ jobs:
           done
           echo "restored $(wc -l < "$dir/kegs.txt") kegs from ${{ steps.brew-restore.outputs.cache-matched-key }}"
 
+      # Homebrew only ships PHP 8.5 (formula php); other versions come from
+      # shivammathur/setup-php.
+      - name: Setup PHP (setup-php, not 8.5)
+        if: matrix.php != '8.5'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: phpize, php-config
+
       - name: Setup PHP (Homebrew)
+        if: matrix.php == '8.5'
         run: |
           # shivammathur/setup-php stopped installing PHP 8.5 on the macOS runners
           # (2026-10-08: "php: command not found" right after its install step).
@@ -649,7 +680,7 @@ jobs:
             target="${target#$prefix/}"
             if grep -qxF "$target" "$dir/kegs.txt"; then echo "$link"; fi
           done > "$dir/opt.txt"
-          key="brew-kegs-macos-15-intel-v1-$(shasum -a 256 "$dir/kegs.txt" | cut -c1-16)"
+          key="${{ matrix.php == '8.5' && 'brew-kegs-macos-15-intel-v1' || format('brew-kegs-php{0}-macos-15-intel-v1', matrix.php) }}-$(shasum -a 256 "$dir/kegs.txt" | cut -c1-16)"
           echo "key=$key" >> "$GITHUB_OUTPUT"
           echo "$(wc -l < "$dir/kegs.txt") kegs, key $key (restored: ${{ steps.brew-restore.outputs.cache-matched-key || 'none' }})"
           if [ "$key" = "${{ steps.brew-restore.outputs.cache-matched-key }}" ] || [ ! -s "$dir/kegs.txt" ]; then
@@ -730,14 +761,36 @@ jobs:
 
   # ── macOS arm64 ───────────────────────────────────────────────────
   macos-arm64:
-    runs-on: macos-15
+    runs-on: ${{ matrix.runner || 'macos-15' }}
     strategy:
+      fail-fast: false
       matrix:
         php: ['8.5']
+        experimental: [false]
+        include:
+          # PHP 8.6 dry run: allowed to fail, not part of the required gate.
+          - php: '8.6'
+            experimental: true
+          # Newest macOS image GitHub offers (macOS 27 has no runner yet, 14 is
+          # retired). Same build and tests, not packaged (the macOS 15 job ships).
+          - php: '8.5'
+            runner: 'macos-26'
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 
+      # Homebrew only ships PHP 8.5 (formula php); other versions come from
+      # shivammathur/setup-php.
+      - name: Setup PHP (setup-php, not 8.5)
+        if: matrix.php != '8.5'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: phpize, php-config
+
       - name: Setup PHP (Homebrew)
+        if: matrix.php == '8.5'
         run: |
           # shivammathur/setup-php stopped installing PHP 8.5 on the macOS runners
           # (2026-10-08: "php: command not found" right after its install step).
@@ -832,6 +885,7 @@ jobs:
           php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
+        if: matrix.runner != 'macos-26'
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
           VERSION="${VERSION//\//-}"
@@ -843,17 +897,41 @@ jobs:
           zip "${BASENAME}.zip" vio.so
 
       - uses: actions/upload-artifact@v4
+        if: matrix.runner != 'macos-26'
         with:
           name: vio-macos-arm64-php${{ matrix.php }}
           path: php_vio-*_php${{ matrix.php }}-arm64-darwin-bsdlibc.zip
 
   # ── Windows x64 ──────────────────────────────────────────────────
   windows-x64:
-    runs-on: windows-2022
+    runs-on: ${{ matrix.runner || 'windows-2022' }}
     strategy:
+      fail-fast: false
       matrix:
         php: ['8.5']
         ts: ['nts', 'ts']
+        experimental: [false]
+        vs: ['vs17']
+        include:
+          # PHP 8.6 dry run (RC, not yet GA): allowed to fail, not part of the
+          # required gate. windows.php.net's releases.json may not list an RC
+          # yet — if the devel-pack download step fails, that is the "not
+          # published yet" signal, not necessarily a vio regression. Source
+          # already carries the PHP 8.6 fix (XtOffsetOf was removed upstream
+          # in 8.6; vio now uses offsetof() directly, see UPGRADING.INTERNALS).
+          # PHP 8.6 Windows builds use VS 18 (devel pack "...-vs18-x64"), hence
+          # the VS 2026 runner image.
+          - php: '8.6'
+            ts: 'nts'
+            vs: 'vs18'
+            runner: 'windows-2025-vs2026'
+            experimental: true
+          - php: '8.6'
+            ts: 'ts'
+            vs: 'vs18'
+            runner: 'windows-2025-vs2026'
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 
@@ -878,21 +956,45 @@ jobs:
           if (-not $revision) { throw "no Windows release for PHP ${{ matrix.php }}" }
           $tspart = if ("${{ matrix.ts }}" -eq "nts") { "nts-Win32" } else { "Win32" }
           $zip = "$env:RUNNER_TEMP\php-devel.zip"
-          Invoke-WebRequest "$base/php-devel-pack-$revision-$tspart-vs17-x64.zip" -OutFile $zip
+          Invoke-WebRequest "$base/php-devel-pack-$revision-$tspart-${{ matrix.vs }}-x64.zip" -OutFile $zip
           $out = "$env:RUNNER_TEMP\php-devel"
           Expand-Archive $zip $out
-          $dir = Get-ChildItem $out -Directory | Where-Object Name -like "php-*-devel-vs17-x64" | Select-Object -First 1
+          $dir = Get-ChildItem $out -Directory | Where-Object Name -like "php-*-devel-${{ matrix.vs }}-x64" | Select-Object -First 1
           if (-not $dir) { throw "devel pack folder not found in $(Get-ChildItem $out | Out-String)" }
           Move-Item $dir.FullName "php-dev"
           Write-Output "devel pack $revision -> php-dev ($($dir.Name))"
 
       - name: Setup PHP SDK
-        id: php-sdk
+        if: matrix.vs == 'vs17'
         uses: php/setup-php-sdk@v0.12
         with:
           version: ${{ matrix.php }}
           arch: x64
           ts: ${{ matrix.ts }}
+
+      # php/setup-php-sdk v0.12 (archived) only knows PHP up to 8.5. For vs18
+      # builds (PHP 8.6) do what it does ourselves: PHP SDK binary tools, the
+      # PHP binaries (the devel pack is already in php-dev) and the PATH.
+      - name: Setup PHP SDK (vs18, setup-php-sdk has no 8.6)
+        if: matrix.vs != 'vs17'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $base = "https://downloads.php.net/~windows/releases"
+          $revision = (Invoke-RestMethod -Uri "$base/releases.json" -UseBasicParsing)."${{ matrix.php }}".version
+          $tspart = if ("${{ matrix.ts }}" -eq "nts") { "nts-Win32" } else { "Win32" }
+          $sdk = "$env:RUNNER_TEMP\php-sdk.zip"
+          Invoke-WebRequest "https://github.com/php/php-sdk-binary-tools/releases/download/php-sdk-2.3.0/php-sdk-binary-tools-php-sdk-2.3.0.zip" -OutFile $sdk
+          Expand-Archive $sdk "."
+          Rename-Item "php-sdk-binary-tools-php-sdk-2.3.0" "php-sdk"
+          $bin = "$env:RUNNER_TEMP\php-bin.zip"
+          Invoke-WebRequest "$base/php-$revision-$tspart-${{ matrix.vs }}-x64.zip" -OutFile $bin
+          Expand-Archive $bin "php-bin"
+          Add-Content $Env:GITHUB_PATH "$pwd\php-sdk\bin"
+          Add-Content $Env:GITHUB_PATH "$pwd\php-sdk\msys2\usr\bin"
+          Add-Content $Env:GITHUB_PATH "$pwd\php-bin"
+          Add-Content $Env:GITHUB_PATH "$pwd\php-dev"
 
       - name: Download GLFW
         shell: cmd
@@ -980,7 +1082,7 @@ jobs:
             --with-accesskit=deps\accesskit-c-0.23.1 ^
             --with-d3d11=yes ^
             --with-d3d12=yes ^
-            --with-prefix=${{ steps.php-sdk.outputs.prefix }}
+            --with-prefix=${{ github.workspace }}\php-bin
           nmake
 
       # SM69-PLAN 0d: the OS WARP of this runner stops at Shader Model 6.2. The
@@ -1253,6 +1355,10 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      # PHP 8.6 builds are a dry run, never part of a release.
+      - name: Drop PHP 8.6 dry-run artifacts
+        run: rm -f artifacts/*_php8.6-* artifacts/*-8.6-nts-* artifacts/*-8.6-ts-*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

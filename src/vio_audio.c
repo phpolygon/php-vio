@@ -228,7 +228,7 @@ void vio_sound_register(void)
     vio_sound_ce->create_object = vio_sound_create_object;
 
     memcpy(&vio_sound_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_sound_handlers.offset   = XtOffsetOf(vio_sound_object, std);
+    vio_sound_handlers.offset   = offsetof(vio_sound_object, std);
     vio_sound_handlers.free_obj = vio_sound_free_object;
     vio_sound_handlers.clone_obj = NULL;
 }

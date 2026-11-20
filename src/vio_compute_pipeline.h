@@ -24,7 +24,7 @@ extern zend_class_entry *vio_compute_pipeline_ce;
 void vio_compute_pipeline_register(void);
 
 static inline vio_compute_pipeline_object *vio_compute_pipeline_from_obj(zend_object *obj) {
-    return (vio_compute_pipeline_object *)((char *)obj - XtOffsetOf(vio_compute_pipeline_object, std));
+    return (vio_compute_pipeline_object *)((char *)obj - offsetof(vio_compute_pipeline_object, std));
 }
 
 #define Z_VIO_COMPUTE_PIPELINE_P(zv) vio_compute_pipeline_from_obj(Z_OBJ_P(zv))

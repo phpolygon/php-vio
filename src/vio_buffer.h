@@ -34,7 +34,7 @@ extern zend_class_entry *vio_buffer_ce;
 void vio_buffer_register(void);
 
 static inline vio_buffer_object *vio_buffer_from_obj(zend_object *obj) {
-    return (vio_buffer_object *)((char *)obj - XtOffsetOf(vio_buffer_object, std));
+    return (vio_buffer_object *)((char *)obj - offsetof(vio_buffer_object, std));
 }
 
 #define Z_VIO_BUFFER_P(zv) vio_buffer_from_obj(Z_OBJ_P(zv))
