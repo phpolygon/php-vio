@@ -20,6 +20,7 @@ jobs:
   linux-x86_64:
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         php: ['8.5']
         experimental: [false]
@@ -289,6 +290,7 @@ jobs:
   linux-aarch64:
     runs-on: ubuntu-24.04-arm
     strategy:
+      fail-fast: false
       matrix:
         php: ['8.5']
         experimental: [false]
@@ -538,6 +540,7 @@ jobs:
     # x86_64) an arm64 binary.
     runs-on: macos-15-intel
     strategy:
+      fail-fast: false
       matrix:
         php: ['8.5']
         experimental: [false]
@@ -569,9 +572,9 @@ jobs:
         with:
           path: ${{ runner.temp }}/brew-kegs
           # never an exact hit: the newest cache with the prefix is taken
-          key: brew-kegs-macos-15-intel-v1-none
+          key: ${{ matrix.php == '8.5' && 'brew-kegs-macos-15-intel-v1' || format('brew-kegs-php{0}-macos-15-intel-v1', matrix.php) }}-none
           restore-keys: |
-            brew-kegs-macos-15-intel-v1-
+            ${{ matrix.php == '8.5' && 'brew-kegs-macos-15-intel-v1' || format('brew-kegs-php{0}-macos-15-intel-v1', matrix.php) }}-
 
       - name: Homebrew kegs - unpack and link
         run: |
@@ -677,7 +680,7 @@ jobs:
             target="${target#$prefix/}"
             if grep -qxF "$target" "$dir/kegs.txt"; then echo "$link"; fi
           done > "$dir/opt.txt"
-          key="brew-kegs-macos-15-intel-v1-$(shasum -a 256 "$dir/kegs.txt" | cut -c1-16)"
+          key="${{ matrix.php == '8.5' && 'brew-kegs-macos-15-intel-v1' || format('brew-kegs-php{0}-macos-15-intel-v1', matrix.php) }}-$(shasum -a 256 "$dir/kegs.txt" | cut -c1-16)"
           echo "key=$key" >> "$GITHUB_OUTPUT"
           echo "$(wc -l < "$dir/kegs.txt") kegs, key $key (restored: ${{ steps.brew-restore.outputs.cache-matched-key || 'none' }})"
           if [ "$key" = "${{ steps.brew-restore.outputs.cache-matched-key }}" ] || [ ! -s "$dir/kegs.txt" ]; then
@@ -760,6 +763,7 @@ jobs:
   macos-arm64:
     runs-on: macos-15
     strategy:
+      fail-fast: false
       matrix:
         php: ['8.5']
         experimental: [false]
