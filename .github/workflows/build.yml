@@ -22,6 +22,12 @@ jobs:
     strategy:
       matrix:
         php: ['8.5']
+        experimental: [false]
+        include:
+          # PHP 8.6 dry run: allowed to fail, not part of the required gate.
+          - php: '8.6'
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 
@@ -285,6 +291,12 @@ jobs:
     strategy:
       matrix:
         php: ['8.5']
+        experimental: [false]
+        include:
+          # PHP 8.6 dry run: allowed to fail, not part of the required gate.
+          - php: '8.6'
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 
@@ -528,6 +540,12 @@ jobs:
     strategy:
       matrix:
         php: ['8.5']
+        experimental: [false]
+        include:
+          # PHP 8.6 dry run: allowed to fail, not part of the required gate.
+          - php: '8.6'
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 
@@ -582,7 +600,17 @@ jobs:
           done
           echo "restored $(wc -l < "$dir/kegs.txt") kegs from ${{ steps.brew-restore.outputs.cache-matched-key }}"
 
+      # Homebrew only ships PHP 8.5 (formula php); other versions come from
+      # shivammathur/setup-php.
+      - name: Setup PHP (setup-php, not 8.5)
+        if: matrix.php != '8.5'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: phpize, php-config
+
       - name: Setup PHP (Homebrew)
+        if: matrix.php == '8.5'
         run: |
           # shivammathur/setup-php stopped installing PHP 8.5 on the macOS runners
           # (2026-10-08: "php: command not found" right after its install step).
@@ -734,10 +762,26 @@ jobs:
     strategy:
       matrix:
         php: ['8.5']
+        experimental: [false]
+        include:
+          # PHP 8.6 dry run: allowed to fail, not part of the required gate.
+          - php: '8.6'
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 
+      # Homebrew only ships PHP 8.5 (formula php); other versions come from
+      # shivammathur/setup-php.
+      - name: Setup PHP (setup-php, not 8.5)
+        if: matrix.php != '8.5'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: phpize, php-config
+
       - name: Setup PHP (Homebrew)
+        if: matrix.php == '8.5'
         run: |
           # shivammathur/setup-php stopped installing PHP 8.5 on the macOS runners
           # (2026-10-08: "php: command not found" right after its install step).
@@ -1300,6 +1344,10 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      # PHP 8.6 builds are a dry run, never part of a release.
+      - name: Drop PHP 8.6 dry-run artifacts
+        run: rm -f artifacts/*_php8.6-* artifacts/*-8.6-nts-* artifacts/*-8.6-ts-*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
