@@ -761,7 +761,7 @@ jobs:
 
   # ── macOS arm64 ───────────────────────────────────────────────────
   macos-arm64:
-    runs-on: macos-15
+    runs-on: ${{ matrix.runner || 'macos-15' }}
     strategy:
       fail-fast: false
       matrix:
@@ -770,6 +770,11 @@ jobs:
         include:
           # PHP 8.6 dry run: allowed to fail, not part of the required gate.
           - php: '8.6'
+            experimental: true
+          # Newest macOS image GitHub offers (macOS 27 has no runner yet, 14 is
+          # retired). Same build and tests, not packaged (the macOS 15 job ships).
+          - php: '8.5'
+            runner: 'macos-26'
             experimental: true
     continue-on-error: ${{ matrix.experimental }}
     steps:
@@ -880,6 +885,7 @@ jobs:
           php -n run-tests.php -q --show-diff tests/
 
       - name: Package binary
+        if: matrix.runner != 'macos-26'
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
           VERSION="${VERSION//\//-}"
@@ -891,6 +897,7 @@ jobs:
           zip "${BASENAME}.zip" vio.so
 
       - uses: actions/upload-artifact@v4
+        if: matrix.runner != 'macos-26'
         with:
           name: vio-macos-arm64-php${{ matrix.php }}
           path: php_vio-*_php${{ matrix.php }}-arm64-darwin-bsdlibc.zip
