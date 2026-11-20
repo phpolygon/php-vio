@@ -849,13 +849,14 @@ jobs:
 
   # ── Windows x64 ──────────────────────────────────────────────────
   windows-x64:
-    runs-on: windows-2022
+    runs-on: ${{ matrix.runner || 'windows-2022' }}
     strategy:
       fail-fast: false
       matrix:
         php: ['8.5']
         ts: ['nts', 'ts']
         experimental: [false]
+        vs: ['vs17']
         include:
           # PHP 8.6 dry run (RC, not yet GA): allowed to fail, not part of the
           # required gate. windows.php.net's releases.json may not list an RC
@@ -863,8 +864,17 @@ jobs:
           # published yet" signal, not necessarily a vio regression. Source
           # already carries the PHP 8.6 fix (XtOffsetOf was removed upstream
           # in 8.6; vio now uses offsetof() directly, see UPGRADING.INTERNALS).
+          # PHP 8.6 Windows builds use VS 18 (devel pack "...-vs18-x64"), hence
+          # the VS 2026 runner image.
           - php: '8.6'
             ts: 'nts'
+            vs: 'vs18'
+            runner: 'windows-2025-vs2026'
+            experimental: true
+          - php: '8.6'
+            ts: 'ts'
+            vs: 'vs18'
+            runner: 'windows-2025-vs2026'
             experimental: true
     continue-on-error: ${{ matrix.experimental }}
     steps:
@@ -891,10 +901,10 @@ jobs:
           if (-not $revision) { throw "no Windows release for PHP ${{ matrix.php }}" }
           $tspart = if ("${{ matrix.ts }}" -eq "nts") { "nts-Win32" } else { "Win32" }
           $zip = "$env:RUNNER_TEMP\php-devel.zip"
-          Invoke-WebRequest "$base/php-devel-pack-$revision-$tspart-vs17-x64.zip" -OutFile $zip
+          Invoke-WebRequest "$base/php-devel-pack-$revision-$tspart-${{ matrix.vs }}-x64.zip" -OutFile $zip
           $out = "$env:RUNNER_TEMP\php-devel"
           Expand-Archive $zip $out
-          $dir = Get-ChildItem $out -Directory | Where-Object Name -like "php-*-devel-vs17-x64" | Select-Object -First 1
+          $dir = Get-ChildItem $out -Directory | Where-Object Name -like "php-*-devel-${{ matrix.vs }}-x64" | Select-Object -First 1
           if (-not $dir) { throw "devel pack folder not found in $(Get-ChildItem $out | Out-String)" }
           Move-Item $dir.FullName "php-dev"
           Write-Output "devel pack $revision -> php-dev ($($dir.Name))"
