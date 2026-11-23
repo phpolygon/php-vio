@@ -622,9 +622,12 @@ jobs:
           # The runner image links openssl@1.1 into /opt/homebrew/bin; installing php
           # upgrades openssl@3, whose link step then fails and fails the install.
           brew unlink openssl@1.1 2>/dev/null || true
-          brew install php || true
+          # Homebrew's unversioned php follows the newest release (8.6 since GA);
+          # 8.5 lives in php@8.5.
+          if [ "${{ matrix.php }}" = "8.5" ]; then formula=php@8.5; else formula=php; fi
+          brew install "$formula" || true
           brew link --overwrite openssl@3 || true
-          brew link --overwrite php || true   # "already linked" exits 1
+          brew link --overwrite --force "$formula" || true   # "already linked" exits 1
           php -v
           have=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
           if [ "$have" != "${{ matrix.php }}" ]; then
@@ -799,9 +802,12 @@ jobs:
           # The runner image links openssl@1.1 into /opt/homebrew/bin; installing php
           # upgrades openssl@3, whose link step then fails and fails the install.
           brew unlink openssl@1.1 2>/dev/null || true
-          brew install php || true
+          # Homebrew's unversioned php follows the newest release (8.6 since GA);
+          # 8.5 lives in php@8.5.
+          if [ "${{ matrix.php }}" = "8.5" ]; then formula=php@8.5; else formula=php; fi
+          brew install "$formula" || true
           brew link --overwrite openssl@3 || true
-          brew link --overwrite php || true   # "already linked" exits 1
+          brew link --overwrite --force "$formula" || true   # "already linked" exits 1
           php -v
           have=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
           if [ "$have" != "${{ matrix.php }}" ]; then
