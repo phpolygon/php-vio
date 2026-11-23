@@ -1,3 +1,10 @@
+## [2.45.1](https://github.com/phpolygon/php-vio/compare/v2.45.0...v2.45.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **core:** replace removed XtOffsetOf with offsetof for PHP 8.6 ([07d5d39](https://github.com/phpolygon/php-vio/commit/07d5d39c61f24674324407e7b9c5a17f7c5ca479))
+
 # [2.45.0](https://github.com/phpolygon/php-vio/compare/v2.44.2...v2.45.0) (2026-11-11)
 
 
