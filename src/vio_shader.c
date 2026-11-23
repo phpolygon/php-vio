@@ -18,7 +18,7 @@ static zend_object *vio_shader_create_object(zend_class_entry *ce)
     vio_shader_object *shader = zend_object_alloc(sizeof(vio_shader_object), ce);
 
     /* Zero everything before std (which is at the end of the struct) */
-    memset(shader, 0, XtOffsetOf(vio_shader_object, std));
+    memset(shader, 0, offsetof(vio_shader_object, std));
 
     shader->format = VIO_SHADER_AUTO;
 
@@ -245,7 +245,7 @@ void vio_shader_register(void)
     vio_shader_ce->create_object = vio_shader_create_object;
 
     memcpy(&vio_shader_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_shader_handlers.offset   = XtOffsetOf(vio_shader_object, std);
+    vio_shader_handlers.offset   = offsetof(vio_shader_object, std);
     vio_shader_handlers.free_obj = vio_shader_free_object;
     vio_shader_handlers.clone_obj = NULL;
 }

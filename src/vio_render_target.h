@@ -227,7 +227,7 @@ extern zend_class_entry *vio_render_target_ce;
 void vio_render_target_register(void);
 
 static inline vio_render_target_object *vio_render_target_from_obj(zend_object *obj) {
-    return (vio_render_target_object *)((char *)obj - XtOffsetOf(vio_render_target_object, std));
+    return (vio_render_target_object *)((char *)obj - offsetof(vio_render_target_object, std));
 }
 
 #define Z_VIO_RENDER_TARGET_P(zv) vio_render_target_from_obj(Z_OBJ_P(zv))

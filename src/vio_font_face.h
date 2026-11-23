@@ -56,7 +56,7 @@ int vio_font_face_render_text(vio_font_face_object **faces, int face_count,
                               int want_data, vio_text_bitmap_result *out);
 
 static inline vio_font_face_object *vio_font_face_from_obj(zend_object *obj) {
-    return (vio_font_face_object *)((char *)obj - XtOffsetOf(vio_font_face_object, std));
+    return (vio_font_face_object *)((char *)obj - offsetof(vio_font_face_object, std));
 }
 
 #define Z_VIO_FONT_FACE_P(zv) vio_font_face_from_obj(Z_OBJ_P(zv))

@@ -57,7 +57,7 @@ void vio_buffer_register(void)
     vio_buffer_ce->create_object = vio_buffer_create_object;
 
     memcpy(&vio_buffer_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_buffer_handlers.offset   = XtOffsetOf(vio_buffer_object, std);
+    vio_buffer_handlers.offset   = offsetof(vio_buffer_object, std);
     vio_buffer_handlers.free_obj = vio_buffer_free_object;
     vio_buffer_handlers.clone_obj = NULL;
 }

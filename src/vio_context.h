@@ -124,7 +124,7 @@ typedef struct _vio_window_object {
 extern zend_class_entry *vio_window_ce;
 
 static inline vio_window_object *vio_window_from_obj(zend_object *obj) {
-    return (vio_window_object *)((char *)obj - XtOffsetOf(vio_window_object, std));
+    return (vio_window_object *)((char *)obj - offsetof(vio_window_object, std));
 }
 
 #define Z_VIO_WINDOW_P(zv) vio_window_from_obj(Z_OBJ_P(zv))
@@ -149,7 +149,7 @@ extern zend_class_entry *vio_context_ce;
 void vio_context_register(void);
 
 static inline vio_context_object *vio_context_from_obj(zend_object *obj) {
-    return (vio_context_object *)((char *)obj - XtOffsetOf(vio_context_object, std));
+    return (vio_context_object *)((char *)obj - offsetof(vio_context_object, std));
 }
 
 #define Z_VIO_CONTEXT_P(zv) vio_context_from_obj(Z_OBJ_P(zv))

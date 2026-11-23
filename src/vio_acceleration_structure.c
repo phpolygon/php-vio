@@ -85,7 +85,7 @@ void vio_acceleration_structure_register(void)
     vio_acceleration_structure_ce->create_object = vio_acceleration_structure_create_object;
 
     memcpy(&vio_acceleration_structure_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_acceleration_structure_handlers.offset    = XtOffsetOf(vio_acceleration_structure_object, std);
+    vio_acceleration_structure_handlers.offset    = offsetof(vio_acceleration_structure_object, std);
     vio_acceleration_structure_handlers.free_obj  = vio_acceleration_structure_free_object;
     vio_acceleration_structure_handlers.get_gc    = vio_acceleration_structure_get_gc;
     vio_acceleration_structure_handlers.clone_obj = NULL;

@@ -73,7 +73,7 @@ void vio_recorder_register(void)
     vio_recorder_ce->create_object = vio_recorder_create_object;
 
     memcpy(&vio_recorder_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_recorder_handlers.offset   = XtOffsetOf(vio_recorder_object, std);
+    vio_recorder_handlers.offset   = offsetof(vio_recorder_object, std);
     vio_recorder_handlers.free_obj = vio_recorder_free_object;
     vio_recorder_handlers.clone_obj = NULL;
 }

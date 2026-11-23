@@ -22,7 +22,7 @@ function px(string $p, int $x, int $y, int $w): array {
     $o = ($y * $w + $x) * 4;
     return [ord($p[$o]), ord($p[$o + 1]), ord($p[$o + 2])];
 }
-function is(array $px, array $want): bool {
+function px_is(array $px, array $want): bool {
     return abs($px[0] - $want[0]) <= 2 && abs($px[1] - $want[1]) <= 2 && abs($px[2] - $want[2]) <= 2;
 }
 $I = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
@@ -61,7 +61,7 @@ vio_bind_pipeline($ctx, $p_white);
 vio_draw($ctx, $tri);
 vio_end($ctx);
 $p = vio_read_pixels($ctx);
-echo "triangle: ", (is(px($p, 32, 32, $W), [255,255,255]) && is(px($p, 1, 1, $W), [0,0,0])) ? "OK" : "FAIL", "\n";
+echo "triangle: ", (px_is(px($p, 32, 32, $W), [255,255,255]) && px_is(px($p, 1, 1, $W), [0,0,0])) ? "OK" : "FAIL", "\n";
 
 // 2. Uniforms are per-draw: two quads with different u_model / u_color in one frame.
 $T = $I; $T[12] = 0.5;
@@ -71,7 +71,7 @@ vio_set_uniform($ctx, 'u_model', $I); vio_set_uniform($ctx, 'u_color', [1, 0, 0,
 vio_set_uniform($ctx, 'u_model', $T); vio_set_uniform($ctx, 'u_color', [0, 0, 1, 1]); vio_draw($ctx, $quad);
 vio_end($ctx);
 $p = vio_read_pixels($ctx);
-echo "per-draw uniforms: ", (is(px($p, 20, 32, $W), [255,0,0]) && is(px($p, 58, 32, $W), [0,0,255])) ? "OK" : "FAIL", "\n";
+echo "per-draw uniforms: ", (px_is(px($p, 20, 32, $W), [255,0,0]) && px_is(px($p, 58, 32, $W), [0,0,255])) ? "OK" : "FAIL", "\n";
 
 // 3. Texture sampling (2x2 green RGBA8 via create_texture).
 $tex = vio_texture($ctx, ['data' => str_repeat("\x00\xFF\x00\xFF", 4), 'width' => 2, 'height' => 2]);
@@ -82,7 +82,7 @@ vio_bind_texture($ctx, $tex, 0);
 vio_draw($ctx, $quad_uv);
 vio_end($ctx);
 $p = vio_read_pixels($ctx);
-echo "texture: ", is(px($p, 32, 32, $W), [0,255,0]) ? "OK" : "FAIL", "\n";
+echo "texture: ", px_is(px($p, 32, 32, $W), [0,255,0]) ? "OK" : "FAIL", "\n";
 
 // 4. Instancing: per-instance mat4 at locations 3..6, two instances left/right.
 $m1 = $I; $m1[12] = -0.6;
@@ -92,8 +92,8 @@ vio_bind_pipeline($ctx, $p_inst);
 vio_draw_instanced($ctx, $small, array_merge($m1, $m2), 2);
 vio_end($ctx);
 $p = vio_read_pixels($ctx);
-echo "instanced: ", (is(px($p, 13, 32, $W), [255,255,255]) && is(px($p, 51, 32, $W), [255,255,255])
-                  && is(px($p, 32, 32, $W), [0,0,0])) ? "OK" : "FAIL", "\n";
+echo "instanced: ", (px_is(px($p, 13, 32, $W), [255,255,255]) && px_is(px($p, 51, 32, $W), [255,255,255])
+                  && px_is(px($p, 32, 32, $W), [0,0,0])) ? "OK" : "FAIL", "\n";
 
 // 5. Render target: 3D draw into the RT, then sample it in the SAME frame.
 $rt = vio_render_target($ctx, ['width' => 32, 'height' => 32]);
@@ -110,7 +110,7 @@ vio_bind_texture($ctx, $rt_tex, 0);
 vio_draw($ctx, $quad_uv);
 vio_end($ctx);
 $p = vio_read_pixels($ctx);
-echo "render target: ", (is(px($p, 32, 32, $W), [255,255,0]) && is(px($p, 2, 2, $W), [0,0,0])) ? "OK" : "FAIL", "\n";
+echo "render target: ", (px_is(px($p, 32, 32, $W), [255,255,0]) && px_is(px($p, 2, 2, $W), [0,0,0])) ? "OK" : "FAIL", "\n";
 
 // 6. Depth-only RT (shadow-map shape): draws must not fail without a colour attachment.
 $rt_depth = vio_render_target($ctx, ['width' => 32, 'height' => 32, 'depth_only' => true]);
@@ -137,7 +137,7 @@ vio_bind_cubemap($ctx, $cm, 0);
 vio_draw($ctx, $tri);
 vio_end($ctx);
 $p = vio_read_pixels($ctx);
-echo "cubemap: ", ($cm instanceof VioCubemap && is(px($p, 32, 40, $W), [255,0,255])) ? "OK" : "FAIL", "\n";
+echo "cubemap: ", ($cm instanceof VioCubemap && px_is(px($p, 32, 40, $W), [255,0,255])) ? "OK" : "FAIL", "\n";
 
 // 8. 2D batch still renders correctly after 3D state (cull / depth bias reset).
 vio_begin($ctx);
@@ -147,7 +147,7 @@ vio_rect($ctx, 0, 0, 10, 10, ["color" => 0xFF00FF00]);
 vio_draw_2d($ctx);
 vio_end($ctx);
 $p = vio_read_pixels($ctx);
-echo "2d after 3d: ", is(px($p, 5, 5, $W), [0,255,0]) ? "OK" : "FAIL", "\n";
+echo "2d after 3d: ", px_is(px($p, 5, 5, $W), [0,255,0]) ? "OK" : "FAIL", "\n";
 
 // 9. Eager vio_clear (D3D11 semantics): clears the bound target immediately,
 //    on the swapchain and inside a bound RT.
@@ -156,14 +156,14 @@ vio_bind_pipeline($ctx, $p_white); vio_draw($ctx, $tri);
 vio_clear($ctx, 0, 0, 1, 1);
 vio_end($ctx);
 $p = vio_read_pixels($ctx);
-$swap_ok = is(px($p, 32, 32, $W), [0,0,255]);
+$swap_ok = px_is(px($p, 32, 32, $W), [0,0,255]);
 vio_begin($ctx);
 vio_bind_render_target($ctx, $rt); vio_clear($ctx, 0, 1, 0, 1); vio_unbind_render_target($ctx);
 vio_clear($ctx, 0, 0, 0, 1);
 vio_bind_pipeline($ctx, $p_tex); vio_set_uniform($ctx, 'u_tex', 0); vio_bind_texture($ctx, $rt_tex, 0); vio_draw($ctx, $quad_uv);
 vio_end($ctx);
 $p = vio_read_pixels($ctx);
-echo "eager clear: ", ($swap_ok && is(px($p, 32, 32, $W), [0,255,0])) ? "OK" : "FAIL", "\n";
+echo "eager clear: ", ($swap_ok && px_is(px($p, 32, 32, $W), [0,255,0])) ? "OK" : "FAIL", "\n";
 
 // 10. MSAA RT: the resolved edge of a triangle has partial coverage; a
 //     single-sample RT has none. 2D draws land in the MSAA target too.
@@ -186,7 +186,7 @@ foreach ([1, 4] as $smp) {
     $edge[$smp] = $mid;
     // RT texture V is flipped when sampled with GL-style UVs: the 2D rect at
     // (2..8, 2..8) shows up at the bottom-left.
-    $rect_ok = is(px($p, 4, 59, $W), [255,0,0]);
+    $rect_ok = px_is(px($p, 4, 59, $W), [255,0,0]);
     if (!$rect_ok) echo "msaa x$smp: 2D rect missing\n";
 }
 echo "msaa: ", ($edge[1] === 0 && $edge[4] > 0) ? "OK" : "FAIL ({$edge[1]} / {$edge[4]})", "\n";
@@ -208,7 +208,7 @@ $dt = vio_render_target_texture($rtd);
 vio_bind_pipeline($ctx, $p_sh); vio_set_uniform($ctx, 'u_shadow', 0); vio_bind_texture($ctx, $dt, 0); vio_draw($ctx, $quad_uv);
 vio_end($ctx);
 $p = vio_read_pixels($ctx);
-echo "depth-only discard: ", (is(px($p, 10, 32, $W), [255,255,255]) && is(px($p, 54, 32, $W), [0,0,0])) ? "OK" : "FAIL", "\n";
+echo "depth-only discard: ", (px_is(px($p, 10, 32, $W), [255,255,255]) && px_is(px($p, 54, 32, $W), [0,0,0])) ? "OK" : "FAIL", "\n";
 
 vio_destroy($ctx);
 
@@ -223,7 +223,7 @@ vio_end($c4);
 $p = vio_read_pixels($c4);
 $mid = 0;
 for ($i = 0; $i < strlen($p); $i += 4) { $r = ord($p[$i]); if ($r > 10 && $r < 245) $mid++; }
-echo "swapchain msaa: ", ($mid > 0 && is(px($p, 4, 4, $W), [255,0,0]) && is(px($p, 32, 40, $W), [255,255,255])) ? "OK" : "FAIL ($mid)", "\n";
+echo "swapchain msaa: ", ($mid > 0 && px_is(px($p, 4, 4, $W), [255,0,0]) && px_is(px($p, 32, 40, $W), [255,255,255])) ? "OK" : "FAIL ($mid)", "\n";
 $gi = vio_gpu_info();
 echo "gpu info: ", (is_array($gi) && $gi['name'] !== '' && $gi['vram_bytes'] > 0) ? "OK" : "FAIL", "\n";
 $rec = @vio_recorder($c4, ['path' => sys_get_temp_dir() . '/vio_089_metal.mp4', 'fps' => 30]);

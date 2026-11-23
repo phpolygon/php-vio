@@ -63,7 +63,7 @@ void vio_cubemap_register(void)
     vio_cubemap_ce->create_object = vio_cubemap_create_object;
 
     memcpy(&vio_cubemap_handlers, &std_object_handlers, sizeof(zend_object_handlers));
-    vio_cubemap_handlers.offset   = XtOffsetOf(vio_cubemap_object, std);
+    vio_cubemap_handlers.offset   = offsetof(vio_cubemap_object, std);
     vio_cubemap_handlers.free_obj = vio_cubemap_free_object;
     vio_cubemap_handlers.clone_obj = NULL;
 }

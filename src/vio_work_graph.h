@@ -29,7 +29,7 @@ extern zend_class_entry *vio_work_graph_ce;
 void vio_work_graph_register(void);
 
 static inline vio_work_graph_object *vio_work_graph_from_obj(zend_object *obj) {
-    return (vio_work_graph_object *)((char *)obj - XtOffsetOf(vio_work_graph_object, std));
+    return (vio_work_graph_object *)((char *)obj - offsetof(vio_work_graph_object, std));
 }
 
 #define Z_VIO_WORK_GRAPH_P(zv) vio_work_graph_from_obj(Z_OBJ_P(zv))

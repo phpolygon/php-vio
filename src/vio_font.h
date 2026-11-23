@@ -148,7 +148,7 @@ void vio_font_finalize_glyphs(vio_font_object *font,
                               const vio_font_packed_glyph *glyphs, int count);
 
 static inline vio_font_object *vio_font_from_obj(zend_object *obj) {
-    return (vio_font_object *)((char *)obj - XtOffsetOf(vio_font_object, std));
+    return (vio_font_object *)((char *)obj - offsetof(vio_font_object, std));
 }
 
 #define Z_VIO_FONT_P(zv) vio_font_from_obj(Z_OBJ_P(zv))

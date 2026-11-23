@@ -65,7 +65,7 @@ extern zend_class_entry *vio_pipeline_ce;
 void vio_pipeline_register(void);
 
 static inline vio_pipeline_object *vio_pipeline_from_obj(zend_object *obj) {
-    return (vio_pipeline_object *)((char *)obj - XtOffsetOf(vio_pipeline_object, std));
+    return (vio_pipeline_object *)((char *)obj - offsetof(vio_pipeline_object, std));
 }
 
 #define Z_VIO_PIPELINE_P(zv) vio_pipeline_from_obj(Z_OBJ_P(zv))
