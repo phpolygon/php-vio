@@ -728,11 +728,18 @@ function vio_pixel_ratio(VioContext|VioWindow $context): float {}
  * If no layout is provided, defaults to position-only (vec3, location 0).
  *
  * @param array $config Mesh configuration:
- *   - 'vertices' (float[]) - flat interleaved vertex data (required)
+ *   - 'vertices' (float[]|string) - flat interleaved vertex data (required). A string is the
+ *     RAW form: packed little-endian float32 (pack('g*', ...) or a baked buffer), used in place -
+ *     no PHP array (~600 bytes per triangle) and no per-element conversion; its float count must be
+ *     a multiple of the layout's floats per vertex. Attributes are float32 (the 'layout' components).
  *   - 'layout' (array) - vertex attribute layout (optional, see above)
- *   - 'indices' (int[]) - index buffer (optional). Stored as uint16 when every index
- *     is < 65536 (half the index bandwidth), else uint32.
- *   - 'index_type' (int, optional) - VIO_INDEX_UINT32 forces 32-bit indices
+ *   - 'indices' (int[]|string) - index buffer (optional). An int array is stored as uint16 when
+ *     every index is < 65536 (half the index bandwidth), else uint32. A string is the RAW form:
+ *     packed little-endian indices whose width 'index_type' declares (VIO_INDEX_UINT16 or
+ *     VIO_INDEX_UINT32, default uint32); the bytes are uploaded as they are, every index is
+ *     range-checked against the vertex count (false + warning on a bad one).
+ *   - 'index_type' (int, optional) - VIO_INDEX_UINT32 forces 32-bit indices (array form); for a
+ *     raw index string it declares the packed width (VIO_INDEX_UINT16 / VIO_INDEX_UINT32)
  * @return VioMesh|false Mesh object or false on failure
  */
 function vio_mesh(VioContext $context, array $config): VioMesh|false {}
@@ -1598,6 +1605,13 @@ function vio_set_uniforms(VioContext $context, array $uniforms): void {}
  *     'pipeline' => VioPipeline,             // optional; bound only on change
  *     'textures' => [ slot => VioTexture ],  // optional; GL slot => texture
  *     'uniforms' => [ 'u_name' => value ],   // optional; per-draw uniform deltas
+ *     // Instanced record (replaces the vio_draw_instanced call; every backend):
+ *     'instances'      => string|VioInstanceBuffer, // packed mat4 bytes (64 per instance) or a
+ *                                            // persistent buffer (vio_instance_buffer)
+ *     'instance_count' => int,               // optional; default: all instances from first_instance
+ *     'first_instance' => int,               // optional; default 0 (index into 'instances')
+ *                                            // a range outside 'instances' throws a ValueError; the
+ *                                            // records before it have been drawn
  *   ]
  *
  * Records are applied strictly in array order, so the bound shader's sticky
@@ -1607,6 +1621,41 @@ function vio_set_uniforms(VioContext $context, array $uniforms): void {}
  * of a heavy opaque submit into one, which is the main CPU/submit bottleneck.
  */
 function vio_submit_batch(VioContext $context, array $draws): void {}
+
+/**
+ * Persistent instance buffer: packed mat4 instances (64 bytes each, like the matrices string of
+ * vio_draw_instanced) that live on the GPU. Create it once from $data, change parts of it with
+ * vio_instance_buffer_update(), draw it as often as needed with vio_draw_instanced_buffer() or a
+ * vio_submit_batch record ('instances' => $buffer) - the instance bytes are NOT copied again per
+ * draw / per frame (vio_draw_instanced copies every call's bytes into a per-frame ring: ~10 MB per
+ * frame for a dense street). Native on D3D11 / D3D12 (a GPU-local vertex buffer); the other backends
+ * keep a CPU copy and draw from it (same result, no upload saving; vio_instance_buffer_info()['native']
+ * tells). $data must be a non-empty multiple of 64 bytes; $capacity (0 or a multiple of 64 at least
+ * strlen($data)) reserves a larger buffer whose tail starts zeroed, for buffers that grow by appending
+ * (fill it later with vio_instance_buffer_update). Returns false when the backend cannot allocate it.
+ */
+function vio_instance_buffer(VioContext $context, string $data, int $capacity = 0): VioInstanceBuffer|false {}
+
+/**
+ * Overwrite part of a persistent instance buffer: $data (a multiple of 64 bytes) replaces the bytes
+ * at byte $offset (a multiple of 64); the range must lie inside the buffer (ValueError otherwise).
+ * Order: on D3D12/D3D11 the copy is ordered before the frame being recorded, so update a region
+ * before the first draw of the frame that reads it (outside vio_begin/vio_end is fine); on the
+ * CPU-copy backends it takes effect for the draws recorded after the call.
+ */
+function vio_instance_buffer_update(VioInstanceBuffer $buffer, string $data, int $offset = 0): bool {}
+
+/**
+ * ['bytes' => int, 'instances' => int, 'native' => bool] - native: the instances live in GPU memory.
+ */
+function vio_instance_buffer_info(VioInstanceBuffer $buffer): array {}
+
+/**
+ * vio_draw_instanced() from a persistent instance buffer: draws $instanceCount instances starting at
+ * instance $firstInstance of $buffer with the bound pipeline. No instance bytes cross the PHP/C
+ * boundary and none are copied. A range outside the buffer throws a ValueError.
+ */
+function vio_draw_instanced_buffer(VioContext $context, VioMesh $mesh, VioInstanceBuffer $buffer, int $instanceCount, int $firstInstance = 0): void {}
 
 /**
  * Record a static draw sequence once (OPEN-ITEMS A38, BUNDLE-PLAN.md). $records
