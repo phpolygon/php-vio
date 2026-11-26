@@ -2369,6 +2369,8 @@ static void d3d12_shutdown(void)
     if (vio_d3d12.srv_staging_heap) ID3D12DescriptorHeap_Release(vio_d3d12.srv_staging_heap);
     if (vio_d3d12.sampler_combo_heap) ID3D12DescriptorHeap_Release(vio_d3d12.sampler_combo_heap);
     if (vio_d3d12.sampler_heap)   ID3D12DescriptorHeap_Release(vio_d3d12.sampler_heap);
+    free(vio_d3d12.sampler_big_pool);
+    vio_d3d12.sampler_big_pool = NULL;
     if (vio_d3d12.frame_latency_waitable) CloseHandle(vio_d3d12.frame_latency_waitable);
     if (vio_d3d12.fb_null_map)    ID3D12Resource_Release(vio_d3d12.fb_null_map);
     if (vio_d3d12.fb_null_tex)    ID3D12Resource_Release(vio_d3d12.fb_null_tex);
@@ -7915,6 +7917,8 @@ static void d3d12_begin_frame(void)
     vio_d3d12.sampler_frame_base     = vio_d3d12.frame_index * vio_d3d12.sampler_frame_capacity;
     vio_d3d12.sampler_frame_offset   = vio_d3d12.sampler_frame_base;
     vio_d3d12.sampler_set_count      = 0;
+    vio_d3d12.sampler_big_count      = 0;
+    vio_d3d12.sampler_big_last       = -1;
     vio_d3d12.sampler_table_bound    = 0;
 
     /* Set viewport and scissor */
@@ -10882,16 +10886,63 @@ void vio_d3d12_pending_reset(void)
     vio_d3d12.pending_high = 0;
 }
 
+/* The frame's slice of the sampler ring is used up: the draws that follow keep the
+ * block that was bound last, so they may sample with the wrong filter / wrap /
+ * comparison state (the SRV ring warns the same way). */
+static void d3d12_warn_sampler_ring_exhausted(void)
+{
+    if (vio_d3d12.sampler_exhausted_warned) return;
+    vio_d3d12.sampler_exhausted_warned = 1;
+    php_error_docref(NULL, E_WARNING,
+        "D3D12: the frame's %u sampler table descriptors are used up; "
+        "the following draws reuse the last bound sampler table and may sample with the wrong filter or wrap mode",
+        vio_d3d12.sampler_frame_capacity);
+}
+
 static void d3d12_flush_sampler_table(int len)
 {
     if (!vio_d3d12.sampler_heap || !vio_d3d12.sampler_combo_heap) return;
 
     if (len > VIO_D3D12_SAMPLER_TABLE_SIZE) {
-        /* A large shader: its own block, not cached, not recordable in a bundle. */
+        /* A large shader: a block of its own length, deduplicated per frame like the
+         * small sets (SAMPLER-LIMITS-PLAN), not recordable in a bundle. */
         if (d3d12_brec) { d3d12_brec_fail(); return; }
+        int *pool = vio_d3d12.sampler_big_pool;
+        if (!pool && vio_d3d12.units > 0) {
+            pool = (int *)calloc((size_t)(VIO_D3D12_SAMPLER_BIG_CACHE + 1) * (size_t)vio_d3d12.units, sizeof(int));
+            vio_d3d12.sampler_big_pool = pool;
+        }
+        int *cur = pool ? pool + (size_t)VIO_D3D12_SAMPLER_BIG_CACHE * (size_t)vio_d3d12.units : NULL;
+        if (cur) {
+            for (int i = 0; i < len; i++) {
+                cur[i] = vio_d3d12.pending_srv_valid[i] ? vio_d3d12.pending_samplers[i] : 0;
+            }
+            /* Built earlier THIS frame? Re-point at it without consuming ring space. */
+            int hit = -1;
+            int last = vio_d3d12.sampler_big_last;
+            if (last >= 0 && last < vio_d3d12.sampler_big_count && vio_d3d12.sampler_big_cache[last].len == len &&
+                memcmp(cur, pool + (size_t)last * (size_t)vio_d3d12.units, (size_t)len * sizeof(int)) == 0) {
+                hit = last;
+            }
+            for (int k = 0; hit < 0 && k < vio_d3d12.sampler_big_count; k++) {
+                if (vio_d3d12.sampler_big_cache[k].len == len &&
+                    memcmp(cur, pool + (size_t)k * (size_t)vio_d3d12.units, (size_t)len * sizeof(int)) == 0) {
+                    hit = k;
+                }
+            }
+            if (hit >= 0) {
+                vio_d3d12.sampler_big_cache[hit].stamp = ++vio_d3d12.sampler_big_clock;
+                vio_d3d12.sampler_big_last = hit;
+                vio_d3d12.sampler_table_gpu = vio_d3d12.sampler_big_cache[hit].gpu;
+                d3d12_set_sampler_tables(vio_d3d12.sampler_table_gpu);
+                vio_d3d12.sampler_table_bound = 0;   /* a large block is no small-cache entry */
+                return;
+            }
+        }
         UINT base = vio_d3d12.sampler_frame_offset;
         UINT region_end = vio_d3d12.sampler_frame_base + vio_d3d12.sampler_frame_capacity;
         if (base + (UINT)len > region_end) {
+            d3d12_warn_sampler_ring_exhausted();
             if (vio_d3d12.sampler_table_bound) d3d12_set_sampler_tables(vio_d3d12.sampler_table_gpu);
             return;
         }
@@ -10911,11 +10962,27 @@ static void d3d12_flush_sampler_table(int len)
         }
         d3d12_set_sampler_tables(dst_gpu);
         vio_d3d12.sampler_table_gpu = dst_gpu;
-        /* Not in the cache: the next small set must not match it. */
+        /* Not a small-cache entry: the next small set must not match it. */
         vio_d3d12.sampler_table_bound = 0;
+        if (cur) {
+            /* Remember it: a free slot, else evict the least recently used. */
+            int slot = vio_d3d12.sampler_big_count;
+            if (slot >= VIO_D3D12_SAMPLER_BIG_CACHE) {
+                slot = 0;
+                for (int k = 1; k < VIO_D3D12_SAMPLER_BIG_CACHE; k++) {
+                    if (vio_d3d12.sampler_big_cache[k].stamp < vio_d3d12.sampler_big_cache[slot].stamp) slot = k;
+                }
+            } else {
+                vio_d3d12.sampler_big_count++;
+            }
+            memcpy(pool + (size_t)slot * (size_t)vio_d3d12.units, cur, (size_t)len * sizeof(int));
+            vio_d3d12.sampler_big_cache[slot].len = len;
+            vio_d3d12.sampler_big_cache[slot].gpu = dst_gpu;
+            vio_d3d12.sampler_big_cache[slot].stamp = ++vio_d3d12.sampler_big_clock;
+            vio_d3d12.sampler_big_last = slot;
+        }
         return;
     }
-
     int combos[VIO_D3D12_SAMPLER_TABLE_SIZE];
     for (int i = 0; i < VIO_D3D12_SAMPLER_TABLE_SIZE; i++) {
         combos[i] = (i < vio_d3d12.units && vio_d3d12.pending_srv_valid[i]) ? vio_d3d12.pending_samplers[i] : 0;
@@ -10955,8 +11022,9 @@ static void d3d12_flush_sampler_table(int len)
     UINT base = vio_d3d12.sampler_frame_offset;
     UINT region_end = vio_d3d12.sampler_frame_base + vio_d3d12.sampler_frame_capacity;
     if (base + VIO_D3D12_SAMPLER_TABLE_SIZE > region_end) {
-        /* Ring exhausted (hundreds of distinct sampler sets in one frame):
+        /* Ring exhausted (more distinct sampler sets in one frame than the slice holds):
          * keep whatever block is bound rather than drop the draw. */
+        d3d12_warn_sampler_ring_exhausted();
         if (vio_d3d12.sampler_table_bound) {
             d3d12_set_sampler_tables(vio_d3d12.sampler_table_gpu);
         }
