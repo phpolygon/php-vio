@@ -89,6 +89,12 @@
 /* Distinct sampler sets remembered per frame (each set = one 8-descriptor
  * block); the ring is only advanced for a set not seen this frame. */
 #define VIO_D3D12_SAMPLER_SET_CACHE    64
+/* Distinct LARGE sampler sets (a shader reading more than VIO_D3D12_SAMPLER_TABLE_SIZE
+ * registers) remembered per frame. A large block is as long as the shader's highest
+ * register (e.g. 18), so one frame's ring slice holds only a few dozen of them: without
+ * this cache every draw of such a shader took a fresh block, the ring ran dry after
+ * ~40 draws and every later draw - whatever its shader - kept the last block built. */
+#define VIO_D3D12_SAMPLER_BIG_CACHE    16
 
 /* Upload queue (GAP-PLAN 4.1): allocators in flight before a submit has to
  * wait for its own previous upload. */
@@ -635,6 +641,18 @@ typedef struct _vio_d3d12_state {
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
     }                          sampler_set_cache[VIO_D3D12_SAMPLER_SET_CACHE];
     int                        sampler_set_count;
+    /* Large sets of this frame: slot k of sampler_big_pool (units ints each, slot
+     * VIO_D3D12_SAMPLER_BIG_CACHE is the scratch for the set being looked up). */
+    int                       *sampler_big_pool;
+    struct {
+        int                         len;
+        UINT64                      stamp;      /* last use, for eviction */
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    }                          sampler_big_cache[VIO_D3D12_SAMPLER_BIG_CACHE];
+    int                        sampler_big_count;
+    int                        sampler_big_last;   /* slot hit by the previous large draw, -1 none */
+    UINT64                     sampler_big_clock;
+    int                        sampler_exhausted_warned;
     D3D12_GPU_DESCRIPTOR_HANDLE sampler_table_gpu;      /* block bound at root param 4 */
     int                         sampler_table_bound;    /* 1 => sampler_table_gpu is current */
 
