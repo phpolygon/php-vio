@@ -1,3 +1,10 @@
+## [2.45.2](https://github.com/phpolygon/php-vio/compare/v2.45.1...v2.45.2) (2026-11-26)
+
+
+### Bug Fixes
+
+* **d3d12:** deduplicate the sampler tables of shaders over 16 registers per frame ([963f17e](https://github.com/phpolygon/php-vio/commit/963f17e3005ac420d81acf4227251dc0b1271d03))
+
 ## [2.45.1](https://github.com/phpolygon/php-vio/compare/v2.45.0...v2.45.1) (2026-11-23)
 
 
