@@ -1,3 +1,10 @@
+## [2.45.3](https://github.com/phpolygon/php-vio/compare/v2.45.2...v2.45.3) (2026-11-28)
+
+
+### Bug Fixes
+
+* **font:** refuse files that are not TrueType or OpenType fonts ([42964f9](https://github.com/phpolygon/php-vio/commit/42964f91cbdb533b3b9c7a6efd4444876739ac73))
+
 ## [2.45.2](https://github.com/phpolygon/php-vio/compare/v2.45.1...v2.45.2) (2026-11-26)
 
 
