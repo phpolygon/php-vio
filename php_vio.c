@@ -8636,6 +8636,12 @@ ZEND_FUNCTION(vio_font)
         RETURN_FALSE;
     }
 
+    if (!vio_font_data_is_font((const unsigned char *)ZSTR_VAL(contents))) {
+        zend_string_release(contents);
+        php_error_docref(NULL, E_WARNING, "Not a TrueType/OpenType font file: %s", path);
+        RETURN_FALSE;
+    }
+
     /* Create VioFont object */
     zval font_zval;
     object_init_ex(&font_zval, vio_font_ce);
