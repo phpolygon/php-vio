@@ -90,6 +90,10 @@ int vio_font_pack_atlas_raw(const unsigned char *ttf_data, float font_size,
     *out_glyphs = NULL;
     *out_count  = 0;
 
+    if (stbtt_GetFontOffsetForIndex(ttf_data, 0) < 0) {
+        return 0; /* not a TrueType/OpenType font, see vio_font_pack_atlas_dynamic() */
+    }
+
     stbtt_pack_context spc;
     if (!stbtt_PackBegin(&spc, atlas_bitmap, atlas_size, atlas_size, 0, 1, NULL)) {
         return 0;
@@ -171,6 +175,11 @@ void vio_font_finalize_glyphs(vio_font_object *font,
     }
 }
 
+int vio_font_data_is_font(const unsigned char *ttf_data)
+{
+    return ttf_data != NULL && stbtt_GetFontOffsetForIndex(ttf_data, 0) >= 0;
+}
+
 int vio_font_pack_atlas_dynamic(const unsigned char *ttf_data, float font_size,
                                 unsigned char **out_bitmap, int *out_side,
                                 vio_font_packed_glyph **out_glyphs, int *out_count)
@@ -184,7 +193,14 @@ int vio_font_pack_atlas_dynamic(const unsigned char *ttf_data, float font_size,
      * accordingly. */
     int side;
     stbtt_fontinfo info;
-    int has_font = stbtt_InitFont(&info, ttf_data, stbtt_GetFontOffsetForIndex(ttf_data, 0));
+    /* stbtt_GetFontOffsetForIndex() is -1 for data that is not a TrueType/OpenType font
+     * (an empty file, a Git LFS pointer, HTML from a failed download). stb then reads far
+     * outside the buffer, so refuse the file here: the caller sees a NULL bitmap. */
+    int font_offset = stbtt_GetFontOffsetForIndex(ttf_data, 0);
+    if (font_offset < 0) {
+        return 0;
+    }
+    int has_font = stbtt_InitFont(&info, ttf_data, font_offset);
     int is_cjk = has_font && (stbtt_FindGlyphIndex(&info, 0x4E00) != 0   /* 一 */
                            || stbtt_FindGlyphIndex(&info, 0xAC00) != 0); /* 가 */
 

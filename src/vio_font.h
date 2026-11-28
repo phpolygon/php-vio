@@ -132,6 +132,11 @@ int vio_font_pack_atlas_raw(const unsigned char *ttf_data, float font_size,
                             unsigned char *atlas_bitmap, int atlas_size,
                             vio_font_packed_glyph **out_glyphs, int *out_count);
 
+
+/* 1 if the data starts like a TrueType/OpenType font, 0 for anything else (an empty file, a
+ * Git LFS pointer, an HTML error page). Check before handing data to stb_truetype. */
+int vio_font_data_is_font(const unsigned char *ttf_data);
+
 /* Like vio_font_pack_atlas_raw(), but sizes the atlas dynamically to the font's
  * actual present-glyph set instead of a fixed VIO_FONT_ATLAS_SIZE². Allocates
  * *out_bitmap (malloc, *out_side × *out_side R8 bytes) and *out_glyphs (malloc);

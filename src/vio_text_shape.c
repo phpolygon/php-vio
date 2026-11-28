@@ -184,8 +184,8 @@ int vio_text_shape_init_font(vio_font_object *font)
     hb_font_set_scale(hbf, px64, px64);
 
     vio_shape_atlas *a = (vio_shape_atlas *)ecalloc(1, sizeof(vio_shape_atlas));
-    if (!stbtt_InitFont(&a->info, font->ttf_data,
-                        stbtt_GetFontOffsetForIndex(font->ttf_data, 0))) {
+    int font_offset = stbtt_GetFontOffsetForIndex(font->ttf_data, 0);
+    if (font_offset < 0 || !stbtt_InitFont(&a->info, font->ttf_data, font_offset)) {
         efree(a);
         hb_font_destroy(hbf);
         return 0;
